@@ -5,7 +5,8 @@
 > `PROSPER_DET_CLOCK=1` (fixed `1/PROSPER_DET_FPS`, default 60, per flip). Before the first flip the
 > monotonic clock follows host time so initialization can progress; afterward it intentionally pauses
 > between flips. Realtime/RTC clocks remain tied to host time. `PROSPER_PAD_SCRIPT=@path` loads newline-
-> separated routes with comments and explicit time/flip ranges. `PROSPER_PAD_RECORD=path` records the
+> separated routes with comments, explicit time/flip ranges, and full-deflection stick directions such
+> as `left-stick-left`. `PROSPER_PAD_RECORD=path` records the
 > final button stream on that same flip axis; `prosper-app --record path` exposes it interactively.
 > `PROSPER_PAD_SCRIPT_LOG=1` logs state transitions as the game observes them at pad polls.
 > `PROSPER_PAD_SCRIPT_RELOAD=1` live-reloads an `@file` route after a changed file remains
@@ -35,8 +36,10 @@ We already have the seed: **`PROSPER_PAD_SCRIPT` (#202)** — a scripted `PadBac
 
 ## What exists today (`PROSPER_PAD_SCRIPT`, #202)
 
-- Format: `;`-separated `<seconds>:<button>[+button…]`, e.g. `3:start;9:start;16:cross;31:up+cross`.
-- Each entry holds its button(s) for `PROSPER_PAD_HOLD` ms (default 300) starting at `<seconds>`.
+- Format: `;`-separated `<seconds>:<action>[+action…]`, e.g. `3:start;9:cross;16:left-stick-left+cross`.
+- Actions are button names or full-deflection `left-stick-{left,right,up,down}` and
+  `right-stick-{left,right,up,down}` directions. Each entry holds its actions for
+  `PROSPER_PAD_HOLD` ms (default 300) starting at `<seconds>`.
 - **Anchored to the first pad poll** (t=0 = "the game first read the controller" ≈ menu appeared) — robust to asset-load time.
 - Pad reports CONNECTED whenever a script is set. Parse + time-eval are pure and unit-tested in `pad.cpp`.
 - Explicit wall-clock ranges are sampled only when the game polls the pad. A short range can fall
@@ -54,7 +57,8 @@ Good bones. Two gaps for reaching deep states reliably: the clock is **wall-time
 ### 1. Frame-anchored, file-loadable scripts (core) - implemented
 - **Anchor to game frames, not wall-time.** Keep the "first pad poll" origin (robust to load time), but measure progress in **flips since first poll** (game logic frames), not elapsed seconds. The Messenger is a fixed-timestep platformer, so wall-time drifts vs game frames on slow llvmpipe vs a fast GPU — frame anchoring makes `f300:cross` reproduce everywhere. Add an `f<frame>:` entry syntax alongside the existing `<seconds>:` (kept for back-compat).
 - **Load from a file.** `PROSPER_PAD_SCRIPT=@path` reads a multi-line script file, so long routes live in the repo, not an env string.
-- **Richer input.** Per-entry hold length, analog stick directions, not just a 300 ms button tap.
+- **Richer input.** Explicit ranges and full-deflection analog stick directions are implemented;
+  proportional axis values remain future work.
 
 ### 2. Record mode in `prosper-app` - implemented
 `prosper-app --dump <app0> --record <file>`: capture the human's keyboard/gamepad input **stamped by flip count**, writing a script file. This is how checkpoint scripts get *created* — play to the point once, get a reusable, committable route. (The app already snapshots keyboard state per frame; recording is writing that stream out, anchored to `present_count`.)

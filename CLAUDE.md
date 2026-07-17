@@ -304,10 +304,13 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
 - **Use independent review where risk justifies it.** Complex or high-risk changes—such as shader/recompiler
   control flow, memory safety or untrusted bounds, synchronization, ABI-sensitive interfaces, persistent data,
   shared renderer/executor format, size, or indexing semantics, or changes whose failure can silently corrupt
-  results—require an independent code review before merge. Judge the failure modes, not merely the diff size.
-  Routine, well-bounded, low-risk changes do not require an independent reviewer. The reviewer inspects the
-  assumptions, code, risks, and tests, including whether each regression test would fail without the fix, but
-  does not duplicate the author's builds, tests, snapshots, or CI jobs. Once the author is satisfied and the PR
+  results—require an independent code review before merge. Review is also required when the validation itself
+  is easy to get wrong: for example, a regression test with another path that can produce the expected result,
+  or a snapshot route or baseline update that needs judgment to confirm it exercises the intended behavior.
+  Judge both implementation risk and verification risk, not merely the diff size. Routine, well-bounded,
+  low-risk changes do not require an independent reviewer. The reviewer inspects the assumptions, code, risks,
+  and tests, including whether each regression test would fail without the fix, but does not duplicate the
+  author's builds, tests, snapshots, or CI jobs. Once the author is satisfied and the PR
   is published, run author verification and any required review; the author posts exact-head evidence and the
   reviewer posts approval on the corrected exact head. Address every blocking finding and re-review authored
   corrections, then merge only after the merge agent separately confirms author verification, reviewer approval

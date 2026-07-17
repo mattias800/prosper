@@ -29,8 +29,9 @@ no-graphics diagnostics with isolated saves and the same semantic gameplay selec
   warmup. Repeated Cross windows survive multi-second gaps between pad polls,
   then Circle remains held through 300 seconds because synchronous rendering
   has made `PARSEALL` take from about 60 to more than 160 seconds across measured
-  builds. The reviewed snapshot guard uses the 190-239 second window; repeated
-  verification reaches the controllable Primary weapon tutorial with complete
+  builds. A late left-stick hold anchors timing-dependent tutorial landings before
+  the reviewed snapshot guard's 245-289 second window; repeated verification reaches
+  the controllable Primary weapon tutorial with complete
   world and HUD layers. Post-#766 native-Windows
   validation executes and publishes every retained submit, completes `PARSEALL`, and first matches the
   sustained gameplay semantic selector at 104.81 seconds. #723 is closed; the route remains much slower
