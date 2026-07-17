@@ -97,6 +97,16 @@ int main() {
                           compute_cfg_dispatch_dead_descriptor.size(), 0, 0,
                           &dispatch_rt).empty(),
           "unreachable dispatcher writes cannot invalidate a live direct descriptor");
+    std::vector<uint32_t> compute_cfg_dispatch_live_vopc_write = {
+        0x7C0400F9u, 0x06068800u, // v_cmp_eq_f32_sdwa s8, v0, v0 (writes s[8:9])
+    };
+    compute_cfg_dispatch_live_vopc_write.insert(
+        compute_cfg_dispatch_live_vopc_write.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + sizeof(compute_cfg_dispatch)/sizeof(compute_cfg_dispatch[0]));
+    CHECK(recompile_valu(compute_cfg_dispatch_live_vopc_write.data(),
+                         compute_cfg_dispatch_live_vopc_write.size(), 0, 0,
+                         &dispatch_rt).empty(),
+          "reachable dispatcher VOPC pair writes invalidate a direct descriptor");
     // UE4 also recycles a physical v_writelane slot: first as ordinary scalar data, then as an
     // EXEC-mask spill. Force a dispatcher block boundary after each lifetime so both typed views
     // must survive the Function-variable state round trip. Consumers remain statically typed.

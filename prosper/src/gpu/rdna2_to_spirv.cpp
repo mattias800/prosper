@@ -2422,13 +2422,29 @@ uint32_t scalar_write_width(const Rdna2Inst& in) {
     }
 }
 
-void record_scalar_write(RegState& rs, const Rdna2Inst& in) {
+// Visit every explicit scalar-register write performed by one supported instruction. Most scalar
+// instructions use `dst`, but VOPC SDWAB/e64 compares can write an SGPR mask pair through `dst`, and
+// VOP3B arithmetic writes its carry mask through the independent `sdst` field. Keeping this as the
+// single writer inventory prevents provenance/data-flow users from silently missing secondary dsts.
+template <typename Visitor>
+void for_each_scalar_write(const Rdna2Inst& in, Visitor&& visit) {
     const uint32_t width = scalar_write_width(in);
-    for (uint32_t word = 0; word < width; ++word) {
-        const int reg = in.dst.value + static_cast<int>(word);
-        rs.sreg_written.insert(reg);
-        rs.sreg_input.erase(reg);
-    }
+    if (width) visit(in.dst.value, width);
+    if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
+        in.dst.kind == OperandKind::SGPR && in.dst.value <= 105)
+        visit(in.dst.value, 2);
+    if (in.fmt == Rdna2Format::VOP3 && in.sdst.kind == OperandKind::SGPR)
+        visit(in.sdst.value, 2);
+}
+
+void record_scalar_write(RegState& rs, const Rdna2Inst& in) {
+    for_each_scalar_write(in, [&](int base, uint32_t width) {
+        for (uint32_t word = 0; word < width; ++word) {
+            const int reg = base + static_cast<int>(word);
+            rs.sreg_written.insert(reg);
+            rs.sreg_input.erase(reg);
+        }
+    });
 }
 
 } // namespace
@@ -4964,8 +4980,11 @@ const Rdna2Inst* last_scalar_writer(const std::vector<Rdna2Inst>& ins, uint32_t 
     const Rdna2Inst* result = nullptr;
     for (const auto& in : ins) {
         if (in.is_end || in.pc >= before_pc) break;
-        const uint32_t width = scalar_write_width(in);
-        if (width && reg >= in.dst.value && reg < in.dst.value + static_cast<int>(width)) result = &in;
+        bool writes_reg = false;
+        for_each_scalar_write(in, [&](int base, uint32_t width) {
+            writes_reg |= reg >= base && reg < base + static_cast<int>(width);
+        });
+        if (writes_reg) result = &in;
     }
     return result;
 }
@@ -5393,9 +5412,10 @@ bool emit_compute_cfg_state_machine(
         const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
         for (const auto& in : ins) {
             if (in.pc < lo || in.pc >= hi) continue;
-            const uint32_t width = scalar_write_width(in);
-            for (uint32_t word = 0; word < width; ++word)
-                scalar_writes[block].insert(in.dst.value + static_cast<int>(word));
+            for_each_scalar_write(in, [&](int base, uint32_t width) {
+                for (uint32_t word = 0; word < width; ++word)
+                    scalar_writes[block].insert(base + static_cast<int>(word));
+            });
         }
 
         const Rdna2Inst* terminator = nullptr;
@@ -6120,10 +6140,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             bool side_effect_free = true;
             for (const auto& candidate : ins) {
                 if (candidate.pc <= branch.pc || candidate.pc >= target) continue;
-                const uint32_t scalar_width = scalar_write_width(candidate);
-                const bool clobbers_guard_mask = scalar_width &&
-                    candidate.dst.value < saveexec.dst.value + 2 &&
-                    saveexec.dst.value < candidate.dst.value + static_cast<int>(scalar_width);
+                bool clobbers_guard_mask = false;
+                for_each_scalar_write(candidate, [&](int base, uint32_t width) {
+                    clobbers_guard_mask |= base < saveexec.dst.value + 2 &&
+                        saveexec.dst.value < base + static_cast<int>(width);
+                });
                 if (candidate.fmt == Rdna2Format::EXP || candidate.fmt == Rdna2Format::DS ||
                     candidate.fmt == Rdna2Format::MUBUF || candidate.fmt == Rdna2Format::MTBUF ||
                     candidate.fmt == Rdna2Format::MIMG || candidate.fmt == Rdna2Format::FLAT ||

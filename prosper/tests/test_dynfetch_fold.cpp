@@ -196,6 +196,27 @@ int main() {
                          1, 1, &packed_entry_table).empty(),
           "structured joins preserve erased SRSRC write provenance from either arm");
 
+    // Vector instructions can also have explicit scalar-pair destinations. Both encodings overwrite
+    // s[20:21], so neither may leave the entry-time packed V# usable by the following format fetch.
+    // Round-tripped with llvm-mc gfx1030.
+    const uint32_t vopc_srsrc[] = {
+        0x7C0400F9u, 0x06069400u, // v_cmp_eq_f32_sdwa s20, v0, v0 (SDST pair)
+        0xE00C2000u, 0x80050100u,
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(vopc_srsrc, sizeof(vopc_srsrc)/sizeof(vopc_srsrc[0]),
+                         1, 1, &packed_entry_table).empty(),
+          "explicit VOPC SGPR-pair writes invalidate a direct packed V#");
+    const uint32_t vop3_carry_srsrc[] = {
+        0xD5761401u, 0x040A0100u, // v_mad_u64_u32 v[1:2], s20, v0, v0, v[2:3]
+        0xE00C2000u, 0x80050100u,
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(vop3_carry_srsrc,
+                         sizeof(vop3_carry_srsrc)/sizeof(vop3_carry_srsrc[0]),
+                         4, 1, &packed_entry_table).empty(),
+          "VOP3 carry-out SGPR-pair writes invalidate a direct packed V#");
+
     // Kernel 5: descriptor-TABLE uses (#294). s[8:9] = a pointer to a host-memory table; the shader
     // s_loads an 8-dword T# (imm 0x40) + a 4-dword S#/V# (imm 0x80), consumes them via image_sample
     // (SRSRC/SSAMP) and s_buffer_load (SBASE). Each use must be reported with the load immediate as
