@@ -2068,6 +2068,21 @@ void arm_hwbp_this_thread() {
 
 uint64_t stub_addr(uint64_t idx) { return g_stub_base + idx * g_stub_size; }
 
+uint64_t hle_guest_return_address(uint64_t entry_rsp) {
+    if (!entry_rsp) return 0;
+    const uint64_t immediate = *(const uint64_t*)(uintptr_t)entry_rsp;
+#if defined(__linux__)
+    // Only the Linux guest-FS path CALLS the HLE handler. At handler entry its frame is:
+    //   +0x00 return-to-stub, +0x08..0x18 forwarded args 7..9, +0x20 alignment pad,
+    //   +0x28 saved guest FS, +0x30 original guest return address.
+    // The host-context and macOS paths tail-jump, so their immediate return is not in the table.
+    const bool from_stub = g_stub_size && immediate >= g_stub_base &&
+                           (immediate - g_stub_base) / g_stub_size < g_nstubs;
+    if (from_stub) return *(const uint64_t*)(uintptr_t)(entry_rsp + 0x30);
+#endif
+    return immediate;
+}
+
 uint64_t invoke_stub(uint64_t idx) {
     auto fn = (uint64_t(*)())(stub_addr(idx));
     return fn();
