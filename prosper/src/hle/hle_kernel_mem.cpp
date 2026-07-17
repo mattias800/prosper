@@ -1367,6 +1367,13 @@ namespace {
         return PAGE_NOACCESS;
     }
     constexpr uint64_t kWinAllocationGranularity = 0x10000;
+    // PS5 libc accepts caller-supplied mspace storage in two virtual-address apertures. Keep
+    // automatically placed guest mappings in the low aperture and above the fixed module/direct
+    // ranges. Letting Windows choose from its full user VA space can land a valid mapping in the
+    // rejected 1-8 TiB gap (Astro observed 0x2d980000000), after which sceLibcMspaceCreate returns
+    // null even though the pages are accessible.
+    constexpr uint64_t kGuestAutoVaMin = 0x2000000000ull;   // 128 GiB
+    constexpr uint64_t kGuestAutoVaMax = 0xfbffffffffull;  // inclusive; one byte below a 64 KiB boundary
 
     // One sparse paging-file section is the Windows equivalent of the POSIX direct-memory memfd.
     // SEC_RESERVE avoids charging 16 GiB of host commit up front; each view commits only its guest span.
@@ -1428,6 +1435,10 @@ namespace {
             align < kWinAllocationGranularity || (align & (align - 1))) return nullptr;
 
         MEM_ADDRESS_REQUIREMENTS requirements{};
+        requirements.LowestStartingAddress =
+            reinterpret_cast<void*>(static_cast<uintptr_t>(kGuestAutoVaMin));
+        requirements.HighestEndingAddress =
+            reinterpret_cast<void*>(static_cast<uintptr_t>(kGuestAutoVaMax));
         requirements.Alignment = static_cast<SIZE_T>(align);
         MEM_EXTENDED_PARAMETER parameter{};
         parameter.Type = MemExtendedParameterAddressRequirements;
@@ -1476,9 +1487,12 @@ namespace {
         // MapViewOfFileEx only chooses a 64 KiB-aligned base. A zero-hint title requesting a
         // larger alignment needs a placeholder reservation with explicit address requirements.
         // Keep the SEC_RESERVE pages uncommitted here; first CPU/GPU access materializes 16 KiB.
-        if (!hint && requested_align > kWinAllocationGranularity &&
-            (delta & (requested_align - 1)) == 0) {
-            view = map_sparse_aligned_section_view(section, file_off, view_size, requested_align);
+        if (!hint &&
+            (requested_align <= kWinAllocationGranularity ||
+             (delta & (requested_align - 1)) == 0)) {
+            const uint64_t view_align = std::max<uint64_t>(
+                requested_align, kWinAllocationGranularity);
+            view = map_sparse_aligned_section_view(section, file_off, view_size, view_align);
             sparse = view != nullptr;
         }
         if (!view) {
