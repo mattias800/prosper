@@ -348,10 +348,12 @@ the game live instead of dumping screenshots) now **builds and runs on macOS** u
   `%fs` TLS wall** as `boot_trace` — so the harness is complete and will show live gameplay the moment
   that frontier is solved, exactly like the Linux app.
 - **MoltenVK renders correctly**, not just presents: with `PROSPER_MACOS_MOLTENVK` set, the offscreen
-  GPU tests run on macOS and **90/91 pass** (SPIR-V recompile → MoltenVK → readback → CRC). The one
-  failure, `rdna2_to_spirv_exec`, is a genuine Metal semantics gap — `v_cvt_i32_f32` NaN→0 /
-  INT_MIN/MAX saturation differs from Vulkan/RDNA2 (Metal's out-of-range float→int is undefined). All
-  compute values match (`mismatches=0`); only that saturation subcase diverges. Tracked as an issue.
+  GPU tests run on macOS. The original bring-up passed **90/91**; its sole gap was
+  `v_cvt_i32_f32` saturation because Metal's signed float-to-int conversion is undefined near the
+  limits (#686). The recompiler now avoids that operation: it converts a bounded absolute magnitude
+  through the defined unsigned path, restores two's-complement sign, and selects the saturation
+  endpoints explicitly. `rdna2_to_spirv_exec` checks both the boundary results and the absence of
+  `OpConvertFToS` in this lowering.
 
 Build recipe (see the CMake `PROSPER_MACOS_MOLTENVK` override and `scripts/fetch-macos-vulkan.sh`):
 ```bash
