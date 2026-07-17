@@ -82,6 +82,21 @@ int main() {
                           sizeof(compute_cfg_dispatch)/sizeof(compute_cfg_dispatch[0]), 0, 0,
                           &dispatch_rt).empty(),
           "a nested varying-VCC compute CFG preserves spilled EXEC and lowers through the dispatcher");
+    // The dispatcher includes branch-target/fallthrough blocks even when no entry path can reach
+    // them. This dead block overwrites half of direct V# s[8:11] and then targets the live entry;
+    // provenance at the reachable fetch must not include a write hardware can never execute.
+    std::vector<uint32_t> compute_cfg_dispatch_dead_descriptor = {
+        0xBF820002u, // entry: s_branch live (skip the next two instructions)
+        0xBE880432u, // dead: s_mov_b64 s[8:9], s[50:51]
+        0xBF820000u, // dead: s_branch live
+    };
+    compute_cfg_dispatch_dead_descriptor.insert(
+        compute_cfg_dispatch_dead_descriptor.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + sizeof(compute_cfg_dispatch)/sizeof(compute_cfg_dispatch[0]));
+    CHECK(!recompile_valu(compute_cfg_dispatch_dead_descriptor.data(),
+                          compute_cfg_dispatch_dead_descriptor.size(), 0, 0,
+                          &dispatch_rt).empty(),
+          "unreachable dispatcher writes cannot invalidate a live direct descriptor");
     // UE4 also recycles a physical v_writelane slot: first as ordinary scalar data, then as an
     // EXEC-mask spill. Force a dispatcher block boundary after each lifetime so both typed views
     // must survive the Function-variable state round trip. Consumers remain statically typed.

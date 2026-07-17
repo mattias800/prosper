@@ -5382,9 +5382,10 @@ bool emit_compute_cfg_state_machine(
 
     // The dispatcher reloads scalar values from Function variables, so map membership cannot say
     // whether shader code has overwritten an entry-time descriptor. Compute a forward MAY-write set
-    // for every basic-block entry instead. MAY is intentional: if one predecessor overwrote the
-    // descriptor, falling back to entry metadata after the join would be wrong on that path. Backedges
-    // participate in the fixed point, preventing a stale fallback on later loop iterations.
+    // for every reachable basic-block entry instead. MAY is intentional: if one reachable predecessor
+    // overwrote the descriptor, falling back to entry metadata after the join would be wrong on that
+    // path. Entry-rooted reachability excludes writes in dead blocks, while backedges participate in
+    // the fixed point and prevent stale fallback on later loop iterations.
     std::vector<std::unordered_set<int>> scalar_writes(starts.size());
     std::vector<std::vector<uint32_t>> successors(starts.size());
     for (uint32_t block = 0; block < starts.size(); ++block) {
@@ -5420,14 +5421,23 @@ bool emit_compute_cfg_state_machine(
         }
     }
     std::vector<std::unordered_set<int>> scalar_may_write_in(starts.size());
-    if (!scalar_may_write_in.empty()) scalar_may_write_in.front() = initial.sreg_written;
+    std::vector<bool> scalar_reachable(starts.size(), false);
+    if (!scalar_may_write_in.empty()) {
+        scalar_may_write_in.front() = initial.sreg_written;
+        scalar_reachable.front() = true;
+    }
     bool provenance_changed = true;
     while (provenance_changed) {
         provenance_changed = false;
         for (uint32_t block = 0; block < starts.size(); ++block) {
+            if (!scalar_reachable[block]) continue;
             std::unordered_set<int> out = scalar_may_write_in[block];
             out.insert(scalar_writes[block].begin(), scalar_writes[block].end());
             for (uint32_t successor : successors[block]) {
+                if (!scalar_reachable[successor]) {
+                    scalar_reachable[successor] = true;
+                    provenance_changed = true;
+                }
                 const size_t before = scalar_may_write_in[successor].size();
                 scalar_may_write_in[successor].insert(out.begin(), out.end());
                 provenance_changed |= scalar_may_write_in[successor].size() != before;
