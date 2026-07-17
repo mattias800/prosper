@@ -3,6 +3,7 @@
 #include "../src/gpu/tile.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -213,7 +214,7 @@ int main() {
           "writer rejects an out-of-bounds DCC metadata reference");
     CHECK(serialize_gpu_capture(volume_capture, volume_bytes, error),
           "recreated valid v12 DCC bytes after malformed-reference check");
-    volume_bytes.resize(volume_bytes.size() - 24); // v12 count plus one 20-byte reference
+    volume_bytes.resize(volume_bytes.size() - 28); // v14 zero-DMA count + v12 count/reference
     volume_bytes[8] = 11; volume_bytes[9] = volume_bytes[10] = volume_bytes[11] = 0;
     CHECK(deserialize_gpu_capture(volume_bytes, volume_loaded, error) &&
           volume_loaded.draws[0].vrt.resources[0].metadata_size == 128 * 1024 &&
@@ -407,6 +408,86 @@ int main() {
     CHECK(mixed_draw_bytes[0] == repeated[0],
           "compute copy-on-write cannot create a false alias between equal resource versions");
 
+    // --- v14: ordered DMA mutates the shared replay instance between exact consumers. ---
+    std::array<uint8_t, 32> ordered_memory{};
+    ordered_memory[0] = 0x11; ordered_memory[16] = 0xa1;
+    auto ordered_reader = [&](uint64_t addr, uint8_t* dst, size_t n) -> size_t {
+        if (addr < 0x5000 || addr >= 0x5000 + ordered_memory.size()) return 0;
+        const size_t offset = static_cast<size_t>(addr - 0x5000);
+        const size_t take = std::min(n, ordered_memory.size() - offset);
+        std::memcpy(dst, ordered_memory.data() + offset, take);
+        return take;
+    };
+    auto ordered_table = std::make_shared<ShaderResourceTable>();
+    ShaderResource ordered_resource{};
+    ordered_resource.cls = ResourceClass::ConstantBuffer;
+    ordered_resource.gpu_addr = 0x5000; ordered_resource.size = 4;
+    ordered_table->resources = {ordered_resource};
+    DrawItem before_dma, after_dma;
+    before_dma.vs = after_dma.vs = {0x07230203, 71};
+    before_dma.fs = after_dma.fs = {0x07230203, 72};
+    before_dma.vrt = after_dma.vrt = ordered_table;
+    before_dma.draw_index = 100; before_dma.command_order = 10;
+    after_dma.draw_index = 101; after_dma.command_order = 30;
+    ComputeItem after_dma_compute;
+    after_dma_compute.spirv = {0x07230203, 73};
+    after_dma_compute.resources = ordered_table;
+    after_dma_compute.dispatch_index = 200; after_dma_compute.command_order = 40;
+    GpuState::DmaCopy ordered_copy{0x5000, 0x5010, 4, 0, 20, 0xabc0};
+    std::vector<SubmitOperation> ordered_operations = {
+        {SubmitOperationKind::Draw, 100, 10},
+        {SubmitOperationKind::DmaCopy, 0, 20},
+        {SubmitOperationKind::Draw, 101, 30},
+        {SubmitOperationKind::Dispatch, 200, 40},
+    };
+    GpuCaptureFile ordered_capture;
+    CHECK(capture_submit_items({before_dma, after_dma}, {after_dma_compute},
+                               ordered_operations, meta, ordered_reader, ordered_capture, error,
+                               {}, {}, {ordered_copy}) &&
+          ordered_capture.dma_copies.size() == 1 && ordered_capture.blobs.size() == 2 &&
+          ordered_capture.operations[1].kind == SubmitOperationKind::DmaCopy,
+          "v14 capture closes over ordered DMA source/destination versions");
+    std::vector<uint8_t> ordered_bytes;
+    GpuCaptureFile ordered_loaded;
+    GpuReplayFrame ordered_replay;
+    CHECK(serialize_gpu_capture(ordered_capture, ordered_bytes, error) &&
+          deserialize_gpu_capture(ordered_bytes, ordered_loaded, error) &&
+          materialize_gpu_replay(ordered_loaded, ordered_replay, error) &&
+          ordered_replay.dma_copies.size() == 1 &&
+          ordered_replay.dma_copies[0].source_data &&
+          ordered_replay.dma_copies[0].destination_data,
+          "v14 DMA records and endpoint bindings round-trip into owned replay storage");
+    std::vector<SubmitOperation> replay_operations;
+    for (const auto& operation : ordered_replay.operations)
+        if (operation.realized)
+            replay_operations.push_back({operation.kind,
+                                         static_cast<size_t>(operation.source_index),
+                                         operation.command_order});
+    std::vector<uint8_t> draw_observations, compute_observations;
+    std::vector<std::pair<uint64_t, uint64_t>> invalidations;
+    set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+        invalidations.emplace_back(addr, size);
+    });
+    execute_ordered_items(
+        replay_operations, ordered_replay.items, ordered_replay.computes,
+        ordered_replay.dma_copies,
+        [&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+            for (const auto& item : items)
+                draw_observations.push_back(item.vrt->resources[0].host_data[0]);
+            return RenderedFrame{};
+        },
+        [&](const std::vector<ComputeItem>& items) {
+            compute_observations.push_back(items[0].resources->resources[0].host_data[0]);
+            return true;
+        }, 1, 1);
+    set_guest_gpu_write_observer({});
+    CHECK(draw_observations == std::vector<uint8_t>({0x11, 0xa1}),
+          "draw -> DMA -> draw replay observes pre-copy then post-copy destination bytes");
+    CHECK(compute_observations == std::vector<uint8_t>({0xa1}),
+          "DMA -> compute replay observes the copied bytes at exact command order");
+    CHECK((invalidations == std::vector<std::pair<uint64_t, uint64_t>>({{0x5000, 4}})),
+          "replay DMA invalidates renderer caches by captured guest destination identity");
+
     GpuState failed_state;
     set_pgm(failed_state, P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES, kDiagnosticVs);
     set_pgm(failed_state, P::SPI_SHADER_PGM_LO_PS, P::SPI_SHADER_PGM_HI_PS, kDiagnosticBadPs);
@@ -444,28 +525,35 @@ int main() {
               reinterpret_cast<const uint8_t*>(kDiagnosticBadPs), sizeof(kDiagnosticBadPs)),
           "failed stage retains the exact content-addressed raw stream through s_endpgm");
 
+    std::array<uint8_t, 32> dma_memory{};
+    for (size_t i = 0; i < 16; ++i) dma_memory[16 + i] = static_cast<uint8_t>(0xa0 + i);
     GpuState dma_state;
-    dma_state.dma_copies.push_back({0x200000, 0x100000000ull, 16, 0, 55, 0});
-    GpuCaptureFile unsupported_capture;
+    dma_state.dma_copies.push_back({reinterpret_cast<uint64_t>(dma_memory.data()),
+                                    reinterpret_cast<uint64_t>(dma_memory.data() + 16),
+                                    16, 0, 55, 0x12345678});
+    GpuCaptureFile dma_capture;
     error.clear();
-    CHECK(!capture_gpustate_submit(
-              dma_state, 100, 640, 360, meta, unsupported_capture, error) &&
-          error.find("cannot represent 1 ordered DMA_DATA") != std::string::npos,
-          "central GpuState capture rejects an incomplete ordered-DMA artifact");
-    error.clear();
-    CHECK(!capture_gpustate_target_submit(
-              dma_state, 100, 640, 360, 640, 360, meta, unsupported_capture, error) &&
-          error.find("capture would be incomplete") != std::string::npos,
-          "target-selected capture cannot bypass ordered-DMA rejection");
+    CHECK(capture_gpustate_submit(dma_state, 100, 640, 360, meta, dma_capture, error) &&
+          dma_capture.dma_copies.size() == 1 && dma_capture.operations.size() == 1 &&
+          dma_capture.operations[0].kind == SubmitOperationKind::DmaCopy &&
+          dma_capture.operations[0].realized && dma_capture.blobs.size() == 1 &&
+          dma_capture.dma_copies[0].source_blob_offset == 16,
+          "central GpuState capture retains ordered DMA endpoints and backing closure");
+    GpuCaptureFile target_dma_capture;
+    CHECK(capture_gpustate_target_submit(
+              dma_state, 100, 640, 360, 640, 360, meta, target_dma_capture, error) &&
+          target_dma_capture.dma_copies.size() == 1 &&
+          target_dma_capture.operations[0].kind == SubmitOperationKind::DmaCopy,
+          "target-selected capture preserves ordered DMA instead of bypassing it");
 
-    // A selected unsupported live capture must consume the selector match. Otherwise AT=0 silently
-    // shifts to the next ordinary submit and writes an artifact for the wrong requested operation.
-    set_test_env("PROSPER_GPU_CAPTURE", "unsupported-dma-selector.prgcap");
+    // A selected live DMA capture consumes exactly one selector match and cannot silently retarget.
+    set_test_env("PROSPER_GPU_CAPTURE", "ordered-dma-selector.prgcap");
     set_test_env("PROSPER_GPU_CAPTURE_AT", "0");
-    const auto unsupported_pending = begin_requested_gpu_capture({}, {}, {}, 1, 1, true);
-    const auto retargeted_pending = begin_requested_gpu_capture({}, {}, {}, 1, 1, false);
-    CHECK(!unsupported_pending && !retargeted_pending,
-          "unsupported selected DMA capture fails once and cannot retarget a later submit");
+    const auto dma_pending = begin_requested_gpu_capture({}, {}, {}, 1, 1,
+                                                         &dma_state, 100, 0);
+    const auto retargeted_pending = begin_requested_gpu_capture({}, {}, {}, 1, 1);
+    CHECK(dma_pending && !retargeted_pending && dma_pending->capture.dma_copies.size() == 1,
+          "selected DMA capture succeeds once and cannot retarget a later submit");
     set_test_env("PROSPER_GPU_CAPTURE_AT", nullptr);
     set_test_env("PROSPER_GPU_CAPTURE", nullptr);
 
@@ -501,11 +589,25 @@ int main() {
 
     GpuCaptureFile legacy_source = captured; legacy_source.ds_seeds.clear();
     std::vector<uint8_t> legacy_bytes;
-    CHECK(serialize_gpu_capture(legacy_source, legacy_bytes, error) && legacy_bytes.size() >= 28,
-          "created a diagnostic-free v13 payload for legacy-reader fixtures");
-    if (legacy_bytes.size() >= 28) {
+    CHECK(serialize_gpu_capture(legacy_source, legacy_bytes, error) && legacy_bytes.size() >= 32,
+          "created a diagnostic-free v14 payload for legacy-reader fixtures");
+    std::vector<uint8_t> v13_bytes = legacy_bytes;
+    if (v13_bytes.size() >= 16) {
+        v13_bytes.resize(v13_bytes.size() - 4);
+        v13_bytes[8] = 13; v13_bytes[9] = v13_bytes[10] = v13_bytes[11] = 0;
+    }
+    GpuCaptureFile v13_loaded;
+    CHECK(deserialize_gpu_capture(v13_bytes, v13_loaded, error) &&
+          v13_loaded.dma_copies.empty() &&
+          std::none_of(v13_loaded.operations.begin(), v13_loaded.operations.end(),
+                       [](const auto& operation) {
+                           return operation.kind == SubmitOperationKind::DmaCopy;
+                       }),
+          "v13 readers remain backward-compatible without inventing DMA operations");
+    if (legacy_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        legacy_bytes.resize(legacy_bytes.size() - 4); // remove v14 zero-DMA count
         // Remove the v12 DCC metadata-reference tail: count + 20-byte reference per resource.
         legacy_bytes.resize(legacy_bytes.size() - (4 + 20 * legacy_resource_count));
         // Remove the v11 DCC tail: count + 17-byte state record per resource.
@@ -545,9 +647,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 14;
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 15;
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 14",
+          error == "unsupported capture version 15",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

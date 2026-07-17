@@ -74,7 +74,7 @@ semantics, draw isolation, resource/shader extraction, and the distinction betwe
 
 The summary reports duration, submit/present/draw/dispatch counts, rates, target extents, and whether
 an incomplete final record was discarded. `--records` prints the globally ordered submit/present
-index plus v6 target spans. `--signatures DRAWS DISPATCHES` groups target-span sequences for candidate
+index, v6 target spans, and exact v8 ordered DMA records. `--signatures DRAWS DISPATCHES` groups target-span sequences for candidate
 submit-count ranges; each range accepts `N` or `MIN:MAX`. `--select WxH DRAW_INDEX DRAWS DISPATCHES` applies
 the same semantic predicate as live capture, reports its first/last match and total, and exits nonzero when no
 submit matches. It reports an inconclusive error instead of treating a truncated target signature as a negative.
@@ -106,6 +106,12 @@ positive and nearby negative `.prgtl` samples when timing can move the endpoint.
 
 ## Current boundary
 
+Version 8 reads version-1 through version-7 indexes. It appends exact ordered `DMA_DATA` records to each
+submit: source and destination guest identities, byte count, selectors, PM4 command order, and packet address.
+Older indexes retain their historical count/incomplete signal and do not invent individual DMA operations.
+Detailed current-version capture v14 also closes both DMA endpoint ranges into content-addressed blobs so
+standalone replay can execute draw-to-DMA-to-draw or DMA-to-compute sequences at their original order.
+
 Version 6 reads version-1 through version-5 indexes. It adds run-length encoded color-target extent spans over
 the semantic draw sequence, excluding run-local addresses, so scene predicates can be discovered and tested
 offline before a detailed rerun. Span storage is bounded and an incomplete signature is marked truncated.
@@ -136,7 +142,7 @@ including inputs that are not overwritten later in the selected submit. Set
 the consumer submit/operation/range, the in-submit future writer, and either the matched prior graphics
 submit/draw/PM4 order/target extent or an explicit unresolved result.
 
-Version 2 added exactly one bounded detailed submit per run. The linked version-8 `.prgcap` contains
+Version 2 added exactly one bounded detailed submit per run. The linked current-version `.prgcap` contains
 content-hashed/deduplicated shaders and resource
 bytes, graphics and compute items, complete raw depth-surface programming, and the original mixed PM4 operation
 order. An operation whose shader

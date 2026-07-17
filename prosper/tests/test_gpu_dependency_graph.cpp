@@ -59,9 +59,13 @@ int main() {
 
     replay.items = {producer, consumer};
     replay.computes = {compute};
+    ReplayDmaCopy dma;
+    dma.src = 0x6000; dma.dst = 0x4000; dma.bytes = 0x40; dma.command_order = 25;
+    replay.dma_copies = {dma};
     replay.operations = {
         {SubmitOperationKind::Draw, 0, 10, true},
         {SubmitOperationKind::Dispatch, 2, 20, true},
+        {SubmitOperationKind::DmaCopy, 0, 25, true},
         {SubmitOperationKind::Draw, 1, 30, true},
         {SubmitOperationKind::Draw, 9, 40, false},
     };
@@ -69,24 +73,26 @@ int main() {
     GpuDependencyGraph graph;
     std::string error;
     CHECK(build_gpu_dependency_graph(replay, graph, error), "mixed operation graph builds");
-    CHECK(graph.nodes.size() == 4 && !graph.nodes[3].realized,
+    CHECK(graph.nodes.size() == 5 && graph.nodes[2].kind == SubmitOperationKind::DmaCopy &&
+          !graph.nodes[4].realized,
           "all semantic operations remain visible, including missing work");
-    CHECK(graph.edges.size() == 2 && graph.edges[0].producer_operation == 0 &&
-          graph.edges[0].consumer_operation == 2 && graph.edges[1].producer_operation == 1 &&
-          graph.edges[1].consumer_operation == 2,
-          "consumer resolves latest overlapping MRT1 and compute writers");
+    CHECK(graph.edges.size() == 3 && graph.edges[0].producer_operation == 0 &&
+          graph.edges[0].consumer_operation == 3 && graph.edges[1].producer_operation == 1 &&
+          graph.edges[1].consumer_operation == 3 && graph.edges[2].producer_operation == 2 &&
+          graph.edges[2].consumer_operation == 3,
+          "consumer resolves latest overlapping MRT1, compute, and DMA writers");
     CHECK(graph.external_leaves.size() == 3,
           "resources with no earlier in-capsule writer remain explicit external leaves");
     CHECK(graph.external_leaves[0].access.addr == 0x1000 &&
           graph.external_leaves[1].access.addr == 0x3000 &&
-          graph.external_leaves[2].access.addr == 0x4000 &&
+          graph.external_leaves[2].access.addr == 0x6000 &&
           graph.external_leaves[0].consumer_operations[0] == 0,
           "external leaf identities preserve operation order");
     CHECK(graph.external_leaves[0].first_future_writer == UINT32_MAX &&
           graph.external_leaves[1].first_future_writer == 1,
           "read-before-write leaves identify the first in-capsule future writer");
 
-    replay.operations[3].realized = true;
+    replay.operations[4].realized = true;
     CHECK(!build_gpu_dependency_graph(replay, graph, error) &&
           error.find("no materialized item") != std::string::npos,
           "graph rejects a falsely realized operation");

@@ -408,6 +408,12 @@ int main(int argc, char** argv) {
                             static_cast<unsigned long long>(s.last_command_order),
                             static_cast<unsigned long long>(s.color0_base),
                             s.color0_width, s.color0_height);
+                for (const auto& copy : s.dma_copies)
+                    std::printf("  dma order=%llu src=%016llx dst=%016llx bytes=%u sels=%08x packet=%016llx\n",
+                                static_cast<unsigned long long>(copy.command_order),
+                                static_cast<unsigned long long>(copy.src),
+                                static_cast<unsigned long long>(copy.dst), copy.bytes, copy.sels,
+                                static_cast<unsigned long long>(copy.packet_addr));
                 for (const auto& depth : s.depth_surfaces)
                     std::printf("  depth z=%016llx/%016llx s=%016llx/%016llx htile=%016llx "
                                 "target=%ux%u draws=%u tests=%u writes=%u clears=%u compare-mask=%08x\n",

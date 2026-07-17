@@ -77,7 +77,7 @@ bool build_gpu_dependency_graph(const GpuReplayFrame& replay,
             if (draw.color1_base && draw.color1_width && draw.color1_height)
                 writes.push_back({draw.color1_base,
                                   static_cast<uint64_t>(draw.color1_width) * draw.color1_height * 4});
-        } else {
+        } else if (operation.kind == SubmitOperationKind::Dispatch) {
             auto it = computes.find(operation.source_index);
             if (it == computes.end()) {
                 error = "realized dispatch operation has no materialized item";
@@ -85,6 +85,15 @@ bool build_gpu_dependency_graph(const GpuReplayFrame& replay,
             }
             append_accesses(it->second->resources.get(), "cs", reads);
             for (const auto& access : reads) writes.push_back({access.addr, access.size});
+        } else {
+            if (operation.source_index >= replay.dma_copies.size()) {
+                error = "realized DMA operation has no materialized copy";
+                return false;
+            }
+            const ReplayDmaCopy& copy = replay.dma_copies[operation.source_index];
+            reads.push_back({copy.src, copy.bytes, 0, 0, 0,
+                             ResourceClass::ConstantBuffer, "dma-src"});
+            writes.push_back({copy.dst, copy.bytes});
         }
 
         for (const auto& access : reads) {

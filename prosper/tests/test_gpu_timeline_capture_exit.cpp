@@ -1,7 +1,9 @@
 #include "../src/gpu/gpu_timeline.hpp"
+#include "../src/gpu/gpu_capture.hpp"
 
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #ifndef _WIN32
 #include <sys/wait.h>
@@ -35,7 +37,7 @@ static int run_child() {
     endpoint.command_order = 20;
     begin_gpu_timeline_submit(2);
     record_gpu_timeline_submit(endpoint, 2);
-    return 0; // EXIT_AFTER_CAPTURE must have terminated with status 2 before this point.
+    return 3; // EXIT_AFTER_CAPTURE must have terminated successfully before this point.
 }
 
 int main(int argc, char** argv) {
@@ -47,10 +49,22 @@ int main(int argc, char** argv) {
 #else
     const int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 #endif
-    if (exit_code != 2) {
-        std::fprintf(stderr, "expected child exit 2 after predecessor capture failure, got %d\n",
+    if (exit_code != 0) {
+        std::fprintf(stderr, "expected child exit 0 after ordered-DMA capture, got %d\n",
                      exit_code);
         return 1;
     }
+    GpuCaptureFile predecessor;
+    std::string error;
+    if (!read_gpu_capture("timeline-capture-predecessor.prgcap", predecessor, error) ||
+        predecessor.dma_copies.size() != 1 || predecessor.operations.size() != 1 ||
+        predecessor.operations[0].kind != SubmitOperationKind::DmaCopy) {
+        std::fprintf(stderr, "ordered-DMA predecessor capture is incomplete: %s\n", error.c_str());
+        return 1;
+    }
+    std::error_code ec;
+    std::filesystem::remove("timeline-capture-exit.prgtl", ec);
+    std::filesystem::remove("timeline-capture-endpoint.prgcap", ec);
+    std::filesystem::remove("timeline-capture-predecessor.prgcap", ec);
     return 0;
 }
