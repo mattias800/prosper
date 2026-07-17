@@ -81,6 +81,11 @@ struct GpuState {
         uint64_t packet_addr = 0;
     };
     std::vector<DmaCopy> dma_copies;
+    // Some PM4 consumers (indirect register arrays, waits, and jump/predication memory) are still
+    // folded eagerly. If one follows a retained DMA, or WAIT_DEFER owns either copy dependency,
+    // executing the submit would consume stale bytes. Preserve the DMA record for diagnostics and
+    // capture truthfulness, but reject backend execution of the whole submit.
+    bool dma_execution_rejected = false;
     // Once a submit retains an address-backed DMA, later modeled memory effects must remain beside
     // it instead of entering the asynchronous completion FIFO and overtaking it. Own WRITE_DATA's
     // inline payload because the command buffer may be recycled before ordered execution.

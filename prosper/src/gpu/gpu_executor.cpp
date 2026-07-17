@@ -2391,8 +2391,9 @@ bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
     GuestReadableSubmitScope guest_readable_scope;
     const OrderedSubmitResult result = execute_ordered_gpustate(
         st, 0, 0, submit_no, {}, g_compute);
-    return result.compute_executed || !st.dma_copies.empty() ||
-           !st.ordered_memory_effects.empty();
+    return !st.dma_execution_rejected &&
+           (result.compute_executed || !st.dma_copies.empty() ||
+            !st.ordered_memory_effects.empty());
 }
 
 void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no) {
@@ -2826,6 +2827,14 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                                                      const LiveRenderFn& render,
                                                      const LiveComputeFn& compute) {
     GuestGpuWriteSubmitScope guest_gpu_write_scope;
+    if (st.dma_execution_rejected) {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 24)
+            std::fprintf(stderr,
+                         "[agc] ordered DMA submit not executed: unsupported eager/deferred "
+                         "guest-memory dependency\n");
+        return {};
+    }
     std::vector<RetainedSubmitOperation> executable;
     executable.reserve(st.draws.size() + st.dispatches.size() + st.dma_copies.size() +
                        st.ordered_memory_effects.size());
@@ -2858,17 +2867,19 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     const float scale_x = full_width ? static_cast<float>(width) / full_width : 1.0f;
     const float scale_y = full_height ? static_cast<float>(height) / full_height : 1.0f;
     OrderedSubmitResult result;
+    bool final_callback_sent = false;
     std::vector<DrawItem> span;
     auto flush_span = [&](bool authoritative_readback = false) {
         if (span.empty() || !render) return;
         LiveRenderPhase saved = g_live_phase;
-        g_live_phase = {result.render_spans == 0, result.render_spans + 1 == total_spans,
-                        authoritative_readback};
+        const bool final_span = result.render_spans + 1 == total_spans;
+        g_live_phase = {result.render_spans == 0, final_span, authoritative_readback};
         RenderedFrame rendered = render(span, width, height);
         g_live_phase = saved;
         if (!rendered.empty()) result.frame = std::move(rendered);
         span.clear();
         ++result.render_spans;
+        final_callback_sent |= final_span;
     };
 
     for (const auto& operation : executable) {
@@ -2914,6 +2925,17 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
         }
     }
     flush_span();
+    // A semantic draw record can fail only when lazily realized at its ordered position. If that
+    // record was counted as a later span, the last successful callback was intentionally marked
+    // intermediate. Send an empty terminal callback so the frontend can recover cached scanout,
+    // close timing state, and publish exactly once without re-rendering any draw.
+    if (render && result.render_spans && !final_callback_sent) {
+        LiveRenderPhase saved = g_live_phase;
+        g_live_phase = {false, true, false};
+        RenderedFrame rendered = render({}, width, height);
+        g_live_phase = saved;
+        if (!rendered.empty()) result.frame = std::move(rendered);
+    }
     return result;
 }
 

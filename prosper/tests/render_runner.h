@@ -780,6 +780,116 @@ inline bool submit_persistent_ds_transfer(const RenderVkCtx& ctx, VkImage image,
     return true;
 }
 
+// Materialize a valid GPU-only color target on demand. Ordered DMA may consume a target in a later
+// submit, which the producing render callback cannot predict; keeping the fast no-readback path and
+// synchronizing only at that consumer preserves both the persistent-target contract and DMA versioning.
+inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32_t height,
+                                             VkFormat format, std::vector<uint8_t>& output,
+                                             std::string& error) {
+    output.clear(); error.clear();
+    format = backend_color_format(format);
+    PersistentColorTargetImage* target = find_persistent_color_target(
+        id, width, height, format);
+    if (!target || !target->image || target->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+        error = "persistent color target is unavailable";
+        return false;
+    }
+    target->last_use = ++persistent_color_target_generation();
+    const uint64_t texels = static_cast<uint64_t>(width) * height;
+    const uint64_t bpp = backend_color_bytes_per_pixel(format);
+    if (!width || !height || !bpp || texels > UINT64_MAX / bpp || texels * bpp > SIZE_MAX) {
+        error = "persistent color target byte size is invalid";
+        return false;
+    }
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(texels * bpp);
+    const RenderVkCtx& ctx = render_vk_ctx();
+    if (!ctx.ok) { error = "Vulkan renderer is unavailable"; return false; }
+
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    if (!persistent_ds_transfer_buffer(ctx, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                       buffer, memory, error)) {
+        error = "cannot allocate persistent color target readback buffer";
+        return false;
+    }
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    auto cleanup = [&] {
+        if (fence) vkDestroyFence(ctx.dev, fence, nullptr);
+        if (pool) vkDestroyCommandPool(ctx.dev, pool, nullptr);
+        if (buffer) vkDestroyBuffer(ctx.dev, buffer, nullptr);
+        if (memory) vkFreeMemory(ctx.dev, memory, nullptr);
+    };
+    VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pool_info.queueFamilyIndex = ctx.qfi;
+    if (vkCreateCommandPool(ctx.dev, &pool_info, nullptr, &pool) != VK_SUCCESS) {
+        cleanup(); error = "cannot create persistent color target readback command pool"; return false;
+    }
+    VkCommandBufferAllocateInfo command_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    command_info.commandPool = pool;
+    command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    command_info.commandBufferCount = 1;
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkAllocateCommandBuffers(ctx.dev, &command_info, &command) != VK_SUCCESS ||
+        vkBeginCommandBuffer(command, &begin) != VK_SUCCESS) {
+        cleanup(); error = "cannot begin persistent color target readback command"; return false;
+    }
+
+    const VkImageLayout saved_layout = target->layout;
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.oldLayout = saved_layout;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = target->image;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                            VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                         0, nullptr, 0, nullptr, 1, &barrier);
+    VkBufferImageCopy copy{};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageExtent = {width, height, 1};
+    vkCmdCopyImageToBuffer(command, target->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           buffer, 1, &copy);
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.newLayout = saved_layout;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                         0, nullptr, 0, nullptr, 1, &barrier);
+
+    VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    const bool recorded = vkEndCommandBuffer(command) == VK_SUCCESS;
+    const bool fenced = recorded &&
+        vkCreateFence(ctx.dev, &fence_info, nullptr, &fence) == VK_SUCCESS;
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1; submit.pCommandBuffers = &command;
+    const bool submitted = fenced && vkQueueSubmit(ctx.queue, 1, &submit, fence) == VK_SUCCESS;
+    bool finished = submitted &&
+        vkWaitForFences(ctx.dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000) == VK_SUCCESS;
+    if (submitted && !finished) finished = vkQueueWaitIdle(ctx.queue) == VK_SUCCESS;
+    if (!finished) {
+        cleanup(); error = "persistent color target readback did not complete"; return false;
+    }
+    void* mapped = nullptr;
+    if (vkMapMemory(ctx.dev, memory, 0, bytes, 0, &mapped) != VK_SUCCESS || !mapped) {
+        cleanup(); error = "cannot map persistent color target readback"; return false;
+    }
+    const auto* first = static_cast<const uint8_t*>(mapped);
+    output.assign(first, first + static_cast<size_t>(bytes));
+    vkUnmapMemory(ctx.dev, memory);
+    ++backend_color_target_stats_storage().readbacks;
+    cleanup();
+    return true;
+}
+
 inline bool snapshot_persistent_ds_images(std::vector<prosper::gpu::GpuCaptureDsSeed>& seeds,
                                           std::string& error) {
     error.clear(); seeds.clear();

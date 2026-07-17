@@ -212,9 +212,47 @@ int main() {
         stream[7] = (uint32_t)dst; stream[8] = (uint32_t)(dst >> 32);
         stream[9] = (uint32_t)src; stream[10] = (uint32_t)(src >> 32);
         stream[11] = sizeof(source); stream[12] = 0;
+        bool source_invalidated = false;
+        set_guest_gpu_write_observer([&](uint64_t addr, uint64_t) {
+            if (addr == src) source_invalidated = true;
+        });
+        set_live_target_byte_range_reader(
+            [&](uint64_t addr, uint32_t bytes, std::vector<uint8_t>& output) {
+                if (addr != src || bytes != sizeof(source))
+                    return LiveTargetByteReadResult::NotFound;
+                if (source_invalidated) return LiveTargetByteReadResult::NotFound;
+                const uint32_t stale = 0xAAAAAAAAu;
+                const auto* begin = reinterpret_cast<const uint8_t*>(&stale);
+                output.assign(begin, begin + sizeof(stale));
+                return LiveTargetByteReadResult::Success;
+            });
         GpuState st; run_cb(stream, 13, st);
-        CHECK(source == 0x13579BDFu && target == source,
-              "WRITE_DATA prefix lands before a later address DMA in a non-render submit");
+        set_live_target_byte_range_reader({});
+        set_guest_gpu_write_observer({});
+        CHECK(source_invalidated && source == 0x13579BDFu && target == source,
+              "WRITE_DATA prefix invalidates a renderer-owned source before later address DMA");
+    }
+
+    // Guest-memory consumers that are folded eagerly cannot observe a preceding retained DMA.
+    // Preserve the DMA in diagnostics, but reject the entire submit instead of snapshotting stale
+    // indirect registers and then executing a misleading partial timeline.
+    {
+        ShaderReg source_reg{0x44, 0xA1B2C3D4u};
+        ShaderReg target_reg{0x44, 0x11111111u};
+        const uint64_t src = (uint64_t)(uintptr_t)&source_reg;
+        const uint64_t dst = (uint64_t)(uintptr_t)&target_reg;
+        uint32_t stream[11] = {};
+        stream[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        stream[1] = (uint32_t)dst; stream[2] = (uint32_t)(dst >> 32);
+        stream[3] = (uint32_t)src; stream[4] = (uint32_t)(src >> 32);
+        stream[5] = sizeof(source_reg); stream[6] = 0;
+        stream[7] = PM4(4, IT_NOP, R_SH_REGS_INDIRECT);
+        stream[8] = 1; stream[9] = (uint32_t)dst; stream[10] = (uint32_t)(dst >> 32);
+        GpuState st; run_cb(stream, 11, st);
+        CHECK(st.dma_copies.size() == 1 && st.dma_execution_rejected,
+              "DMA before indirect registers is retained and rejected fail-closed");
+        CHECK(target_reg.value == 0x11111111u && st.sh.find(0x44) == st.sh.end(),
+              "rejected DMA/indirect submit executes neither copy nor stale register fold");
     }
 
     // Conversely, a later immediate DMA fill must not enter the completion FIFO and overtake an

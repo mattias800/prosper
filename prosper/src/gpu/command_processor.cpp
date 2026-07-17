@@ -711,6 +711,7 @@ static void honor_eop_write(const Pm4Command& c) {
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc]   EOP write [0x%llx] data_sel=%u value=0x%llx\n",
                 (unsigned long long)c.rel_addr, c.rel_data_sel, (unsigned long long)c.rel_value);
+    notify_guest_gpu_write(c.rel_addr, c.rel_data_sel == 1 ? 4 : 8);
     wake_on_label(c.rel_addr);   // wake any sync_on_address futex waiter on this completion label
 }
 
@@ -734,6 +735,7 @@ static void honor_event_write(const Pm4Command& c) {
     }
     uint64_t v = gpu_clock64();
     memcpy((void*)(uintptr_t)c.event_addr, &v, sizeof v);
+    notify_guest_gpu_write(c.event_addr, sizeof v);
     ring_record(c.event_addr, v, 8, 2, pkt_addr(c));
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc]   EventWrite [0x%llx] event_type=%u -> clock 0x%llx\n",
@@ -838,11 +840,11 @@ static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
         memmove(dst, authoritative_source ? authoritative_source
                                           : (const uint8_t*)(uintptr_t)c.dd_src,
                 c.dd_bytes);
-        notify_guest_gpu_write(c.dd_dst, c.dd_bytes);
         if (getenv("PROSPER_GFXLOG"))
             fprintf(stderr, "[agc]   DmaData copy [0x%llx] <- [0x%llx] (%u bytes)\n",
                     (unsigned long long)c.dd_dst, (unsigned long long)c.dd_src, c.dd_bytes);
     }
+    notify_guest_gpu_write(c.dd_dst, c.dd_bytes);
     ring_record(c.dd_dst, c.dd_src, (uint8_t)(c.dd_bytes > 255 ? 255 : c.dd_bytes), 4, packet_addr);
     if (writer_provenance_enabled() && c.dd_bytes >= 256)
         record_guest_write(GuestWriterKind::DmaData, c.dd_dst, c.dd_bytes,
@@ -885,6 +887,7 @@ static void honor_write_data(const Pm4Command& c) {
         forge_trip("WDATA", c.wd_addr, pre, c.wd_data[0], 4, pkt_addr(c));   // #312 session-10 tripwire
     }
     memcpy((void*)(uintptr_t)c.wd_addr, c.wd_data, (size_t)c.wd_num * 4);
+    notify_guest_gpu_write(c.wd_addr, static_cast<uint64_t>(c.wd_num) * 4);
     ring_record(c.wd_addr, c.wd_data[0], (uint8_t)(c.wd_num * 4 > 255 ? 255 : c.wd_num * 4), 3, pkt_addr(c));
     poolshift_check("WDATA", c.wd_addr, (uint64_t)c.wd_num * 4, c.wd_num ? c.wd_data[0] : 0, pkt_addr(c));
     if (getenv("PROSPER_GFXLOG"))
@@ -1279,11 +1282,6 @@ void apply_deferred_effect(const Pm4Command& c) {
 
 void execute_ordered_memory_effect(const GpuState::MemoryEffect& effect) {
     apply_deferred_effect(effect.cmd);
-    uint64_t addr = 0, bytes = 0;
-    effect_span(effect.cmd, &addr, &bytes);
-    // Invalidating after a guarded no-op is conservative; retaining a stale renderer-owned image
-    // after a real write would make a later consumer observe the wrong storage version.
-    if (addr && bytes) notify_guest_gpu_write(addr, bytes);
 }
 
 bool last_fold_deferred() { return g_fold_deferring; }
@@ -1396,6 +1394,16 @@ void GpuState::apply(const Pm4Command& c) {
     command_order = c.stream_order ? c.stream_order : command_order + 1;
     switch (c.kind) {
         case K::SetRegsIndirect: {
+            if (!dma_copies.empty()) {
+                dma_execution_rejected = true;
+                static std::atomic<int> warned{0};
+                if (warned.fetch_add(1) < 24)
+                    fprintf(stderr,
+                            "[agc] ordered DMA submit rejected: SetRegsIndirect reads guest memory "
+                            "after retained DMA (order=%llu)\n",
+                            (unsigned long long)command_order);
+                break;
+            }
             if (c.regs_vaddr == 0 || c.num_regs == 0 || c.num_regs > kMaxRegsPerPacket) return;
             auto* regs = reinterpret_cast<const ShaderReg*>(static_cast<uintptr_t>(c.regs_vaddr));
             auto& file = (c.reg_class == RegClass::Cx) ? cx
@@ -1546,9 +1554,24 @@ void GpuState::apply(const Pm4Command& c) {
             // dispatches so the ordered executor exposes old bytes to earlier consumers and copied
             // bytes to later consumers (#189). Immediate fills keep their established completion-
             // FIFO behavior until a general copy appears; its suffix joins the ordered timeline.
-            if (defer_gate(c)) { defer_push(c); break; }
             if (c.dd_src > UINT32_MAX) {
                 if (!c.dd_valid) { report_invalid_dma_data(c); break; }
+                const bool gated_destination = defer_gate(c);
+                const bool gated_source = !g_deferred.empty() && addr_gated(c.dd_src, c.dd_bytes);
+                if (gated_destination || gated_source) {
+                    dma_copies.push_back({c.dd_dst, c.dd_src, c.dd_bytes, c.dd_sels,
+                                          command_order, pkt_addr(c)});
+                    dma_execution_rejected = true;
+                    static std::atomic<int> warned{0};
+                    if (warned.fetch_add(1) < 24)
+                        fprintf(stderr,
+                                "[agc] ordered DMA submit rejected: WAIT_DEFER owns %s dependency "
+                                "(src=0x%llx dst=0x%llx bytes=%u order=%llu)\n",
+                                gated_source ? "source" : "destination/stream",
+                                (unsigned long long)c.dd_src, (unsigned long long)c.dd_dst,
+                                c.dd_bytes, (unsigned long long)command_order);
+                    break;
+                }
                 // Everything queued before the first general copy is its ordered prefix. Land that
                 // prefix now; subsequent effects are retained below and cannot overtake the copy.
                 if (dma_copies.empty()) prosper_gpu_drain_completion_writes();
@@ -1556,6 +1579,7 @@ void GpuState::apply(const Pm4Command& c) {
                                       command_order, pkt_addr(c)});
                 break;
             }
+            if (defer_gate(c)) { defer_push(c); break; }
             if (!dma_copies.empty()) {
                 ordered_memory_effects.emplace_back(c, command_order);
                 break;
@@ -1563,6 +1587,16 @@ void GpuState::apply(const Pm4Command& c) {
             if (eop_write_sync()) honor_dma_data(c); else pend_enqueue(c);
             break;
         case K::WaitRegMem:
+            if (!dma_copies.empty()) {
+                dma_execution_rejected = true;
+                static std::atomic<int> warned{0};
+                if (warned.fetch_add(1) < 24)
+                    fprintf(stderr,
+                            "[agc] ordered DMA submit rejected: WAIT_REG_MEM reads guest memory "
+                            "after retained DMA (order=%llu)\n",
+                            (unsigned long long)command_order);
+                break;
+            }
             // Real WAIT_REG_MEM semantics (#312): an unsatisfied wait PAUSES this queue — the
             // stream's remaining memory effects are deferred until the condition holds (flushed
             // at subsequent submits by flush_deferred_streams; loud timeout fallback preserves
@@ -1648,6 +1682,16 @@ void GpuState::apply(const Pm4Command& c) {
             // title frame REQUIRES the composite every frame on real hardware, and the condition
             // memory reads 0 throughout the title steady state, so 0 must mean "execute" here
             // ("skip when non-zero", matching PM4 SET_PREDICATION's draw-discard-on-set model).
+            if (!dma_copies.empty()) {
+                dma_execution_rejected = true;
+                static std::atomic<int> warned{0};
+                if (warned.fetch_add(1) < 24)
+                    fprintf(stderr,
+                            "[agc] ordered DMA submit rejected: Jump reads target/predication "
+                            "memory after retained DMA (order=%llu)\n",
+                            (unsigned long long)command_order);
+                break;
+            }
             if (!c.jump_valid || !c.jump_addr || (c.jump_addr & 3) || !c.jump_dwords) break;
             // PROSPER_NO_JUMP=1: diagnostic A/B — reproduce the pre-#319 behavior (jump ignored).
             static const bool no_jump = [] { const char* e = getenv("PROSPER_NO_JUMP"); return e && e[0] == '1'; }();

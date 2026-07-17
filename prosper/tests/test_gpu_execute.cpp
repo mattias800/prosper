@@ -412,6 +412,50 @@ int main() {
               "DMA-backed index buffer is realized after the ordered copy in the production path");
     }
 
+    // Lazy realization can drop a semantic draw only after earlier spans have already executed.
+    // If the dropped record was counted as the final span, send an empty terminal callback so the
+    // renderer finalizes cached scanout rather than losing the successful work or hanging timing.
+    for (bool failed_first : {false, true}) {
+        uint8_t source = 0x7A, target = 0;
+        GpuState ordered = st;
+        ordered.draws.clear();
+        ordered.dma_copies.clear();
+        GpuState::Draw good{3};
+        GpuState::Draw bad{0};
+        if (failed_first) {
+            bad.command_order = 100;
+            good.command_order = 300;
+            ordered.draws = {bad, good};
+        } else {
+            good.command_order = 100;
+            bad.command_order = 300;
+            ordered.draws = {good, bad};
+        }
+        ordered.dma_copies.push_back({
+            (uint64_t)(uintptr_t)&target, (uint64_t)(uintptr_t)&source,
+            sizeof(target), 0, 200, 0});
+        std::vector<LiveRenderPhase> phases;
+        size_t realized_callbacks = 0, terminal_callbacks = 0;
+        set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+            phases.push_back(live_render_phase());
+            if (items.empty()) {
+                terminal_callbacks++;
+                return RenderedFrame(std::vector<uint8_t>(4, 0x5A));
+            }
+            realized_callbacks++;
+            return RenderedFrame{};
+        });
+        execute_ordered_and_present(ordered, 1, 1, 78 + failed_first, /*publish=*/false);
+        set_submit_renderer({});
+        CHECK(realized_callbacks == 1 && terminal_callbacks == 1 && phases.size() == 2,
+              failed_first
+                  ? "failed leading span still finalizes the later successful span"
+                  : "failed trailing span still finalizes the earlier successful span");
+        CHECK(phases[0].first_span && !phases[0].final_span &&
+              !phases[1].first_span && phases[1].final_span,
+              "lazy-span terminal callback closes the submit exactly once");
+    }
+
     CHECK(!have_submit_renderer(), "no live renderer registered by default (game path stays inert)");
     CHECK(!execute_and_present(st, W, H), "execute_and_present is a no-op with no renderer registered");
     std::shared_ptr<const std::vector<uint8_t>> live_storage;

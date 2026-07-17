@@ -18,6 +18,7 @@
 //      guest polling a gated label can wait at most one timeout.
 //   6. A SATISFIED wait is a pass-through no-op (the fast path every healthy frame takes).
 #include "../src/gpu/command_processor.hpp"
+#include "../src/gpu/gpu_execute.hpp"
 #include "../src/gpu/pm4_decode.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -52,6 +53,12 @@ static void emit_wait_eq(uint32_t* buf, uint64_t addr, uint64_t ref) {
     buf[3] = 0xffffffffu; buf[4] = 0;               // mask (low 32)
     buf[5] = (uint32_t)ref; buf[6] = (uint32_t)(ref >> 32);
     buf[7] = 3;                                     // compare function: ==
+}
+static void emit_dma_copy(uint32_t* buf, uint64_t dst, uint64_t src, uint32_t bytes) {
+    buf[0] = PM4(7, IT_NOP, R_DMA_DATA);
+    buf[1] = (uint32_t)dst; buf[2] = (uint32_t)(dst >> 32);
+    buf[3] = (uint32_t)src; buf[4] = (uint32_t)(src >> 32);
+    buf[5] = bytes; buf[6] = 0;
 }
 
 // Fold + drain the pipe-drain queue (upstream effects become guest-visible at a drain point).
@@ -183,6 +190,50 @@ int main() {
         CHECK(!last_fold_deferred(), "satisfied wait does not pause the stream");
         CHECK(!deferred_pending(), "no deferred stream created");
         CHECK(label == 1, "downstream effect flushed promptly");
+    }
+
+    // Address DMA cannot be released through the legacy deferred-effect path: that would drop it
+    // from ordered execution/capture metadata and bypass authoritative renderer source reads.
+    {
+        volatile uint64_t cond = 0;
+        uint64_t source = 0x123456789ABCDEF0ull;
+        uint64_t target = 0;
+        uint32_t stream[8 + 7];
+        emit_wait_eq(stream, (uint64_t)(uintptr_t)&cond, 1);
+        emit_dma_copy(stream + 8, (uint64_t)(uintptr_t)&target,
+                      (uint64_t)(uintptr_t)&source, sizeof(source));
+        GpuState st;
+        run_cb(stream, 15, st);
+        CHECK(st.dma_copies.size() == 1 && st.dma_execution_rejected,
+              "WAIT_DEFER-gated address DMA remains visible and rejects execution");
+        cond = 1;
+        flush_deferred_streams();
+        execute_nonrender_submit_work(st);
+        CHECK(target == 0,
+              "gated address DMA never escapes through the unordered legacy deferred path");
+    }
+
+    // A copy also depends on its source. A prior gated producer to S must prevent a later
+    // address DMA(S->D) from reading stale S even when D itself is in an unrelated domain.
+    {
+        volatile uint64_t cond = 0;
+        uint64_t source = 0, target = 0;
+        uint32_t producer[8 + 7];
+        emit_wait_eq(producer, (uint64_t)(uintptr_t)&cond, 1);
+        emit_release(producer + 8, (uint64_t)(uintptr_t)&source, 0x55AAu);
+        GpuState producer_state;
+        run_cb(producer, 15, producer_state);
+
+        uint32_t copy[7];
+        emit_dma_copy(copy, (uint64_t)(uintptr_t)&target,
+                      (uint64_t)(uintptr_t)&source, sizeof(source));
+        GpuState copy_state;
+        run_cb(copy, 7, copy_state);
+        CHECK(copy_state.dma_copies.size() == 1 && copy_state.dma_execution_rejected,
+              "address DMA rejects a dependency on a previously gated source range");
+        CHECK(target == 0, "source-dependent DMA cannot overtake the gated producer");
+        cond = 1;
+        flush_deferred_streams();
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

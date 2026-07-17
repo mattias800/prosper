@@ -254,6 +254,7 @@ struct RuntimeDetailRequest {
     bool valid = false;
     std::atomic<bool> claimed{false};
     std::atomic<bool> predecessor_claimed{false};
+    std::atomic<bool> predecessor_failed{false};
     bool bundle_start_reached = false;
 
     RuntimeDetailRequest() {
@@ -1542,6 +1543,7 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
         if (!capture_gpustate_submit(state, submit_no, metadata.width, metadata.height,
                                      metadata, predecessor, error) ||
             !write_gpu_capture(request.predecessor_path, predecessor, error)) {
+            request.predecessor_failed.store(true);
             std::fprintf(stderr, "[timeline] predecessor submit %llu capture failed: %s\n",
                          static_cast<unsigned long long>(submit_no), error.c_str());
         } else {
@@ -1691,7 +1693,10 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
                      static_cast<unsigned long long>(submit_no), error.c_str());
         error.clear();
     }
-    bool requested_artifacts_written = true;
+    const bool predecessor_requested = !request.select_target_width &&
+        !request.predecessor_path.empty() && request.submit_no > 1;
+    bool requested_artifacts_written = !predecessor_requested ||
+        (request.predecessor_claimed.load() && !request.predecessor_failed.load());
     if (!request.bundle_path.empty()) {
         RuntimeCaptureBundle& state = runtime_capture_bundle();
         GpuCaptureBundle& bundle = state.bundle;
@@ -1738,11 +1743,13 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
     }
     log_capture_detail(detail);
     history.remember(state, submit_no);
-    if (request.exit_after_capture && requested_artifacts_written) {
-        std::fprintf(stderr, "[timeline] selected capture complete; exiting as requested\n");
+    if (request.exit_after_capture) {
+        std::fprintf(stderr, requested_artifacts_written
+            ? "[timeline] selected capture complete; exiting as requested\n"
+            : "[timeline] one or more requested capture artifacts failed; exiting nonzero\n");
         close_gpu_timeline();
         std::fflush(nullptr);
-        std::exit(0);
+        std::exit(requested_artifacts_written ? 0 : 2);
     }
 }
 

@@ -252,11 +252,17 @@ int main() {
         std::vector<uint8_t> deferred = prosper::test::render_draws_rgba(
             {add_green}, W, H, nullptr, nullptr, false, &deferred_target);
         const auto deferred_stats = prosper::test::backend_color_target_stats();
+        std::vector<uint8_t> materialized;
+        std::string materialize_error;
+        const bool materialized_ok = prosper::test::readback_persistent_color_target(
+            target_id, W, H, VK_FORMAT_R8G8B8A8_UNORM, materialized, materialize_error);
         std::vector<uint8_t> deferred_sample = prosper::test::render_draws_rgba(
             {gpu_sample}, W, H);
         CHECK(deferred.empty() && deferred_stats.write_hits == 1 &&
                   deferred_stats.readbacks == 0,
               "persistent LOAD pass can complete without allocating a CPU readback");
+        CHECK(materialized_ok && materialized == cpu_accumulated,
+              "GPU-only persistent target can be materialized on demand for an ordered consumer");
         CHECK(!deferred_sample.empty() && deferred_sample == cpu_accumulated_sample,
               "deferred-readback accumulation matches the CPU reference after sampling");
 
