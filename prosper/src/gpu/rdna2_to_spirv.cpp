@@ -2499,10 +2499,6 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
         case OperandKind::SGPR: {
             auto it = rs.sreg.find(o.value);
             if (it != rs.sreg.end()) return it->second;
-            if (rs.sreg_written.count(o.value)) {
-                if (ok) *ok = false;
-                return b.uconst(0);
-            }
             auto input = rs.sreg_input.find(o.value);
             return input == rs.sreg_input.end() ? b.uconst(0) : input->second;
         }
@@ -5643,6 +5639,7 @@ bool emit_compute_cfg_state_machine(
         b.emit_label(labels[block]);
         RegState state = load_state();
         state.sreg_written = scalar_may_write_in[block];
+        for (int reg : state.sreg_written) state.sreg_input.erase(reg);
         if (!direct_descriptor_sregs.empty()) {
             for (int reg : direct_descriptor_sregs)
                 if (!state.sreg_written.count(reg)) state.sreg.erase(reg);
@@ -6219,6 +6216,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 rs.exec = b.emit_phi_2way(b.t_bool, then_exec, then_block, rs.exec, else_block);
             rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
             rs.sreg_written.insert(then_written.begin(), then_written.end());
+            for (int reg : then_written) rs.sreg_input.erase(reg);
             if (then_bool != rs.sreg_bool) {
                 if (getenv("PROSPER_DBG"))
                     fprintf(stderr, "[recompile-reject] counted-loop prelude changes mask domain\n");
@@ -6600,6 +6598,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     if (then_exec != rs.exec) rs.exec = b.emit_phi_2way(b.t_bool, then_exec, thenEnd, rs.exec, elseEnd);
                     rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
                     rs.sreg_written.insert(then_written.begin(), then_written.end());
+                    for (int reg : then_written) rs.sreg_input.erase(reg);
                     // Merge the UNION of mask keys. A mask created in only one arm is false in the
                     // other arm; leaving that arm-local SSA id live after the merge is invalid SPIR-V.
                     std::set<int> bool_keys;
