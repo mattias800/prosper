@@ -101,8 +101,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                         const ShaderResourceTable* rt,
                                         const ComputeShaderConfig& config);
 
-// Recompile a pixel/fragment shader to a fragment SPIR-V module: run the VALU, and on EXP to an MRT
-// target write vec4(src0..3) to the location-0 color output. Returns {} if unsupported / no export.
+// Recompile a pixel/fragment shader to a fragment SPIR-V module: run the VALU, and on EXP to MRT0/1
+// write vec4(src0..3) to the matching color output. NULL-only shaders retain discard/EXEC effects and
+// intentionally expose no color output. Returns {} if unsupported / no implemented export.
 // An optional ShaderResourceTable enables memory ops (SMEM/MUBUF) with resolved bindings.
 std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          const ShaderResourceTable* rt = nullptr,

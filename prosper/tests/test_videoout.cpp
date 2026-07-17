@@ -49,6 +49,7 @@ int main() {
     // immediate calls land in the same period; a > one-period sleep must advance the count.
     uint8_t vb[0x28];
     vbl(0x1001, (uint64_t)(uintptr_t)vb, 0, 0, 0, 0); uint64_t c0 = *(uint64_t*)vb;
+    CHECK(c0 > 0, "first vblank query reports a live non-zero counter");
     vbl(0x1001, (uint64_t)(uintptr_t)vb, 0, 0, 0, 0); uint64_t c1 = *(uint64_t*)vb;
     CHECK(c1 - c0 <= 1, "vblank counter does NOT tick per poll (immediate re-poll ~same period)");
     std::this_thread::sleep_for(std::chrono::milliseconds(40));   // > 2 vblank periods

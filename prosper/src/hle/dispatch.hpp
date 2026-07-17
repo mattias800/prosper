@@ -83,6 +83,10 @@ std::vector<std::string> savedata0_list_dirs();   // existing save dirs under th
 void register_service_hle();
 // libSceHttp local URI helpers; called by register_builtin_hle().
 void register_http_hle();
+// libSceFont/libSceFontFt opaque lifecycle and deterministic metrics; called by register_builtin_hle().
+void register_font_hle();
+// libSceFiber cooperative guest-stack switching; called by register_builtin_hle().
+void register_fiber_hle();
 // libScePad game-controller input (real host controller via input/pad.cpp); called by register_builtin_hle().
 void register_pad_hle();
 // Headless graphics bring-up (libSceAgc/libSceVideoOut placeholders); see hle_graphics.cpp.
@@ -146,10 +150,9 @@ void tls_dtv_purge_current_thread();
 // regression test assert that thread exit really purged — i.e. no per-thread-churn leak).
 size_t tls_dtv_thread_count();
 
-// Guest initial-exec TLS (Linux; GATED behind PROSPER_GUEST_FS, default off). Backs guest %fs-relative
-// static thread-locals by giving each guest thread its own guest TCB + Variant-II static TLS and running
-// guest code with %fs = guest TP; import stubs swap %fs back to the host TCB for HLE calls. See
-// guest_tls.cpp. Call set_templates with the SAME descs as set_tls_modules (after images are mapped).
+// Guest initial-exec TLS. Enabled by default on Linux/Windows (PROSPER_NO_GUEST_FS opts out); macOS
+// trap emulation is opt-in with PROSPER_GUEST_FS. Backs guest %fs-relative static thread-locals with a
+// guest TCB + Variant-II static TLS; Linux import stubs swap %fs back for HLE calls. See guest_tls.cpp.
 void guest_tls_set_templates(const TlsModuleDesc* descs, size_t count);
 bool guest_tls_enabled();
 uint64_t guest_tls_activate_thread();   // per guest thread at entry; returns guest TP (0 if disabled)

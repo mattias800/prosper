@@ -29,7 +29,8 @@ static void make_vsharp(uint32_t v[4], uint64_t base, uint32_t stride, uint32_t 
 // Width5-1 split over word1[31:30] (lo) + word2[11:0] (hi), Height5-1 @word2[27:14], TileMode
 // @word3[24:20], Type @word3[31:28]. Mirrors decode_image_descriptor / Kyty's Gen5 getters.
 static void make_tsharp(uint32_t t[8], uint64_t base, uint32_t w, uint32_t h, uint32_t fmt,
-                        uint32_t tile_mode, uint32_t type, uint32_t depth = 1) {
+                        uint32_t tile_mode, uint32_t type, uint32_t depth = 1,
+                        uint32_t base_array = 0) {
     memset(t, 0, 8 * sizeof(uint32_t));
     uint64_t b = base >> 8;                       // 256-byte-aligned base, stored >>8
     t[0] = (uint32_t)(b & 0xffffffffu);
@@ -37,6 +38,8 @@ static void make_tsharp(uint32_t t[8], uint64_t base, uint32_t w, uint32_t h, ui
     t[2] = (((w - 1) >> 2) & 0xfffu) | (((h - 1) & 0x3fffu) << 14);
     t[3] = ((tile_mode & 0x1fu) << 20) | ((type & 0xfu) << 28);
     if (type == 10) t[4] = (depth - 1) & 0x1fffu;
+    if (type == 11 || type == 12 || type == 13 || type == 15)
+        t[4] = (base_array << 16) | ((base_array + depth - 1) & 0x1fffu);
 }
 
 int main() {
@@ -100,6 +103,17 @@ int main() {
         const DecodedImageDescriptor d3d = decode_image_descriptor(t3d);
         CHECK(d3d.width == 32 && d3d.height == 16 && d3d.depth == 8,
               "3D T# word4 DEPTH decodes as depth-minus-one");
+
+        uint32_t tarray[8];
+        make_tsharp(tarray, 0x13000000ull, 32, 16, /*fmt*/56, /*tile*/0,
+                    /*type 2D array*/13, /*depth*/4, /*base array*/4);
+        const DecodedImageDescriptor darray = decode_image_descriptor(tarray);
+        CHECK(darray.base_array == 4 && darray.depth == 4,
+              "array T# derives layer count from LAST_ARRAY minus BASE_ARRAY");
+        Gen5ImageFormatInfo array_format;
+        CHECK(gen5_image_format(56, &array_format) &&
+              !image_base_level_view(darray, array_format).supported,
+              "nonzero BASE_ARRAY fails closed until slice-offset layout is modeled");
         CHECK(d3d.compression_enabled && d3d.write_compress_enabled && d3d.meta_pipe_aligned &&
               d3d.alpha_is_on_msb && d3d.color_transform &&
               d3d.max_uncompressed_block_size == 2 && d3d.max_compressed_block_size == 1 &&
@@ -125,6 +139,14 @@ int main() {
         CHECK(vmip1.base == 0x18000000ull + 827392 && vmip1.width == 1024 &&
                   vmip1.height == 576 && vmip1.mip_offset == 827392,
               "non-tail base-level view applies its proven offset and dimensions");
+        tmip[3] = (tmip[3] & ~(0xfu << 12)) | (7u << 12); // BASE_LEVEL 7, first packed-tail mip
+        const DecodedImageDescriptor dmip7 = decode_image_descriptor(tmip);
+        const DecodedImageView vmip7 = image_base_level_view(dmip7, mip_format);
+        CHECK(vmip7.supported && vmip7.in_mip_tail && vmip7.base == 0x18000000ull &&
+                  vmip7.width == 16 && vmip7.height == 9 && vmip7.mip_offset == 2048 &&
+                  vmip7.mip_tail_bytes == 4096 && vmip7.mip_tail_x == 4 &&
+                  vmip7.mip_tail_y == 0,
+              "packed-tail base level keeps the shared block base and exact in-block origin");
         uint32_t tmip_cube[8]; memcpy(tmip_cube, tmip, sizeof tmip_cube);
         tmip_cube[3] = (tmip_cube[3] & ~(0xfu << 28)) | (11u << 28); // CUBE
         const DecodedImageDescriptor dmip_cube = decode_image_descriptor(tmip_cube);
@@ -132,11 +154,29 @@ int main() {
         CHECK(!vmip_cube.supported && vmip_cube.base == dmip_cube.base &&
                   vmip_cube.mip_offset == 0,
               "nonzero cube mip view is rejected until its slice/tail layout is modeled");
-        tmip[3] &= ~(0x1fu << 20); // linear layout: offset is not modeled by the tiled helper
+        tmip[3] &= ~(0x1fu << 20); // SW_MODE 0: AddrLib linear mip chain
         const DecodedImageDescriptor dlinear = decode_image_descriptor(tmip);
         const DecodedImageView vlinear = image_base_level_view(dlinear, mip_format);
-        CHECK(!vlinear.supported && vlinear.base == dlinear.base && vlinear.mip_offset == 0,
-              "unmodeled nonzero linear mip view is rejected instead of sampling level zero");
+        CHECK(vlinear.supported && !vlinear.in_mip_tail &&
+                  vlinear.base == dlinear.base + 2048 && vlinear.mip_offset == 2048 &&
+                  vlinear.width == 16 && vlinear.height == 9,
+              "linear mip view uses AddrLib's reverse, 256-byte-pitch-aligned placement");
+
+        // Exact Astro final-pyramid storage T#. PS5 AGC encodes BASE=LAST=MAX_MIP+1 for this final
+        // view; accept that single observed extension and derive the level-6 tail geometry.
+        const uint32_t astro_tail_tsharp[8] = {
+            0x05600400u, 0xc4700000u, 0x010dc1dfu, 0x91b66facu,
+            0x00000000u, 0x00700050u, 0x00000000u, 0x00000000u,
+        };
+        const DecodedImageDescriptor dastro = decode_image_descriptor(astro_tail_tsharp);
+        Gen5ImageFormatInfo astro_format;
+        CHECK(gen5_image_format(dastro.format, &astro_format),
+              "Astro final-pyramid storage format is mapped");
+        const DecodedImageView vastro = image_base_level_view(dastro, astro_format);
+        CHECK(dastro.base_level == 6 && dastro.last_level == 6 && dastro.max_mip == 5 &&
+                  vastro.supported && vastro.in_mip_tail && vastro.width == 30 &&
+                  vastro.height == 16 && vastro.base == dastro.base,
+              "PS5 final-pyramid BASE=LAST=MAX_MIP+1 descriptor resolves to its packed tail view");
     }
 
     // A shifted thin-2D mip emits the selected extent and a matching backing span. Allocation-level
@@ -159,14 +199,32 @@ int main() {
         CHECK(mip && mip->gpu_addr == 0x18000000ull + 827392 && mip->width == 1024 &&
                   mip->height == 576 && mip->size == 1024u * 576u * 4u,
               "shifted mip resource uses selected address, extent, and backing span");
+        CHECK(mip && !mip->in_mip_tail && mip->mip_tail_offset == 0 &&
+                  mip->mip_tail_bytes == 0 && mip->mip_tail_x == 0 && mip->mip_tail_y == 0,
+              "ordinary shifted mip does not leak its allocation offset into packed-tail state");
         CHECK(mip && !mip->compression_enabled && !mip->write_compress_enabled &&
                   !mip->meta_pipe_aligned && mip->metadata_addr == 0,
               "shifted mip resource does not pair texels with unshifted DCC metadata");
 
-        sg[3] &= ~(0x1fu << 20); // same nonzero BASE_LEVEL, now an unsupported linear chain
-        const ShaderResourceTable unsupported = build_shader_resources(sh, sg, 8);
-        CHECK(!unsupported.by_sgpr_base(0),
-              "resource builder rejects an unmodeled nonzero mip view instead of binding level zero");
+        sg[3] = (sg[3] & ~(0xfu << 12)) | (7u << 12);
+        const ShaderResourceTable tail_resources = build_shader_resources(sh, sg, 8);
+        const ShaderResource* tail = tail_resources.by_sgpr_base(0);
+        CHECK(tail && tail->gpu_addr == 0x18000000ull && tail->width == 16 &&
+                  tail->height == 9 && tail->size == 16u * 9u * 4u &&
+                  tail->in_mip_tail && tail->mip_tail_offset == 2048 &&
+                  tail->mip_tail_bytes == 4096 && tail->mip_tail_x == 4 &&
+                  tail->mip_tail_y == 0,
+              "packed-tail resource retains the shared base and exact swizzled level coordinate");
+        CHECK(tail && !tail->compression_enabled && tail->metadata_addr == 0,
+              "packed-tail resource cannot reuse allocation-level DCC metadata");
+
+        sg[3] &= ~(0x1fu << 20); // same BASE_LEVEL 7, now an AddrLib linear chain
+        const ShaderResourceTable linear_resources = build_shader_resources(sh, sg, 8);
+        const ShaderResource* linear = linear_resources.by_sgpr_base(0);
+        CHECK(linear && linear->gpu_addr == 0x18000000ull + 2048 &&
+                  linear->width == 16 && linear->height == 9 && !linear->in_mip_tail &&
+                  linear->mip_tail_offset == 0 && linear->mip_tail_bytes == 0,
+              "resource builder exposes a shifted linear mip view instead of dropping it");
     }
 
     // --- AGC semantic metadata -> SPI_PS_INPUT_CNTL wiring ------------------------------------

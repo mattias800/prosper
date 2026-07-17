@@ -1082,14 +1082,25 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     for (const auto& d : draws) {
         if (!d.ps) continue;
         if (d.ps->depth_test_enable || d.ps->depth_clear_enable) { use_depth = true;
-            // An ALWAYS-compare draw passes regardless of the depth clear, so it must NOT dictate it.
-            // The Messenger menu primes depth with an ALWAYS+write draw (its compare-op default clear is
-            // 1.0), then draws the real UI with GEQUAL (default clear 0.0). Latching 1.0 off the ALWAYS
-            // draw made every GEQUAL fragment fail (z >= 1.0) -> the whole menu went black (#508). Latch
-            // the clear from the first draw whose compare actually depends on it (skip ALWAYS/NEVER).
-            if (!got_depth_clear && d.ps->depth_compare_op != VK_COMPARE_OP_ALWAYS
-                                 && d.ps->depth_compare_op != VK_COMPARE_OP_NEVER) {
-                depth_clear = d.ps->depth_clear_value; got_depth_clear = true; } }
+            // DB_DEPTH_CLEAR is only consumed when DB_RENDER_CONTROL requests an actual clear. Merely
+            // programming the register does not initialize a newly-created host depth image: it is
+            // commonly stale state, and Astro Bot even leaves the packed 1920x1080 max coordinates
+            // (0x0437077f) there. Interpreting those bits as a float initialized every LEQUAL surface
+            // to 2.15e-36 and rejected the entire scene. Without an explicit clear, approximate the
+            // unavailable guest depth contents with the compare-appropriate far value (#371).
+            //
+            // An explicit clear wins even on ALWAYS/NEVER. Otherwise those compare modes do not depend
+            // on the initial value and must not poison the first later meaningful draw (#508).
+            if (!got_depth_clear && d.ps->depth_clear_enable) {
+                depth_clear = d.ps->depth_clear_value;
+                got_depth_clear = true;
+            } else if (!got_depth_clear && d.ps->depth_compare_op != VK_COMPARE_OP_ALWAYS
+                                            && d.ps->depth_compare_op != VK_COMPARE_OP_NEVER) {
+                depth_clear = (d.ps->depth_compare_op == VK_COMPARE_OP_GREATER ||
+                               d.ps->depth_compare_op == VK_COMPARE_OP_GREATER_OR_EQUAL)
+                    ? 0.0f : 1.0f;
+                got_depth_clear = true;
+            } }
         if (d.ps->stencil_enable || d.ps->stencil_clear_enable) { use_stencil = true;
             if (!got_stencil_clear) {
                 stencil_clear = d.ps->stencil_clear_value; got_stencil_clear = true;

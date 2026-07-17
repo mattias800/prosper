@@ -30,6 +30,8 @@ int main() {
     // 1. Commit a range via MapFlexible at hint=0 (kernel picks a free VA), write a sentinel.
     uint64_t va = 0;
     CHECK(flexible(U(&va), LEN, 0x2 /*RW*/, 0, U("live"), 0) == 0 && va, "MapFlexible(hint=0) succeeds");
+    CHECK(va >= 0x2000000000ull && va < 0x40000000000ull,
+          "automatic flexible mapping stays in the guest user-VA range");
     volatile uint32_t* cell = (volatile uint32_t*)(uintptr_t)va;
     *cell = 0xC0FFEE42u;
 

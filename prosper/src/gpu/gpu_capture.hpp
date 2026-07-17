@@ -272,6 +272,10 @@ void set_gpu_replay_rtt_seed_writer(ReplayRttSeedWriter writer);
 bool restore_gpu_replay_rtt_seeds(const std::vector<GpuCaptureRttSeed>& seeds, std::string& error);
 void set_gpu_capture_ds_seed_snapshot_reader(CaptureDsSeedSnapshotReader reader);
 bool read_all_gpu_capture_ds_seeds(std::vector<GpuCaptureDsSeed>& seeds, std::string& error);
+bool gpu_capture_ds_seed_snapshot_available();
+// Add only live depth/stencil checkpoints referenced by this capsule's realized draws. Standalone
+// pre-render captures otherwise replay a read-only depth pass against a newly-cleared attachment.
+bool capture_referenced_gpu_ds_seeds(GpuCaptureFile& capture, std::string& error);
 void set_gpu_replay_ds_seed_writer(ReplayDsSeedWriter writer);
 bool restore_gpu_replay_ds_seeds(const std::vector<GpuCaptureDsSeed>& seeds, std::string& error);
 uint64_t gpu_capture_hash(const uint8_t* data, size_t size);

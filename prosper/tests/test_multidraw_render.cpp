@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -200,6 +201,41 @@ int main() {
         const uint8_t* c = center(initialized);
         CHECK(c && c[1] > 0xC0 && c[0] < 0x40,
               "stencil-only initialization does not poison a later reverse-Z depth plane");
+    }
+
+    // Programming DB_DEPTH_CLEAR only updates clear state; it does not clear a depth allocation until
+    // DB_RENDER_CONTROL enables the clear. Treating a stale programmed word as the implicit contents of
+    // a newly-created host image can reject every fragment. Astro Bot exposes this with 0x0437077f --
+    // its packed 1919x1079 surface maxima, interpreted as the tiny float 2.15e-36 -- under LEQUAL.
+    {
+        std::vector<uint32_t> mid_depth_vs = ref_vs_with_depth(vs, 0x3f000000u); // 0.5f
+        CHECK(!mid_depth_vs.empty(), "fullscreen VS can expose stale depth-clear initialization");
+
+        ResolvedPipelineState stale = opaque;
+        stale.depth_test_enable = true;
+        stale.depth_compare_op = 3; // LEQUAL
+        stale.has_depth_clear = true;
+        uint32_t packed_extent = 0x0437077fu;
+        std::memcpy(&stale.depth_clear_value, &packed_extent, sizeof(packed_extent));
+        stale.depth_read_base = stale.depth_write_base = 0x77770000;
+
+        prosper::test::BackendDraw s;
+        s.vs = mid_depth_vs; s.fs = green; s.ps = &stale; s.vcount = 3;
+        std::vector<uint8_t> implicit =
+            prosper::test::render_draws_rgba({s}, W, H, nullptr, nullptr, true);
+        const uint8_t* ic = center(implicit);
+        CHECK(ic && ic[1] > 0xC0 && ic[0] < 0x40,
+              "stale DB_DEPTH_CLEAR does not initialize an uncleared LEQUAL surface");
+
+        ResolvedPipelineState explicit_clear = stale;
+        explicit_clear.depth_clear_enable = true;
+        explicit_clear.depth_read_base = explicit_clear.depth_write_base = 0x88880000;
+        prosper::test::BackendDraw e = s; e.ps = &explicit_clear;
+        std::vector<uint8_t> explicitly_rejected =
+            prosper::test::render_draws_rgba({e}, W, H, nullptr, nullptr, true);
+        const uint8_t* ec = center(explicitly_rejected);
+        CHECK(ec && ec[1] < 0x80,
+              "explicit DB_RENDER_CONTROL clear still consumes the programmed depth value");
     }
 
     // UE4 can emit its reverse-Z depth prepass and EQUAL base pass from different shaders. Their

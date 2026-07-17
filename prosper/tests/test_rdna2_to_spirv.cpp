@@ -13,6 +13,7 @@
 #include "../src/gpu/agc_shader_layout.hpp"
 #include "../src/gpu/shader_resources.hpp"
 #include "compute_runner.h"
+#include <bit>
 #include <cstdio>
 #include <cmath>
 #include <cstring>
@@ -456,6 +457,77 @@ int main() {
     CHECK(got17d.size()==N && bad17d==0,
           "CFG dispatcher emulates a 64-lane wave across narrower Vulkan subgroups");
 
+    // Kernel 17d2: Astro's mask-priority sequence compares a VOPC-produced SGPR pair against zero,
+    // then uses that wave-uniform SCC in s_cselect_b64.  Keep the irreducible prefix so this exercises
+    // the generic dispatcher.  Wave 0's mask is empty and selects all lanes; wave 1 has one set bit in
+    // lane 63 (outside a narrow host subgroup) and must select none.
+    const uint32_t code17d2[] = {
+        0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u,
+        0x7d840100u, 0xbf870001u, 0xbf82fffdu,
+        0x7c020300u,              // v_cmp_lt_f32 vcc, v0, v1
+        0xbe82046au,              // s_mov_b64 s[2:3], vcc
+        0xbf128002u,              // s_cmp_eq_u64 s[2:3], 0
+        0x858480c1u,              // s_cselect_b64 s[4:5], -1, 0
+        0xbefe0404u,              // s_mov_b64 exec, s[4:5]
+        0x7e040287u,              // v_mov_b32 v2, 7 (predicated by selected wave mask)
+        0xbefe04c1u,              // s_mov_b64 exec, -1
+        0x7e040d02u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv17d2 = recompile_valu(
+        code17d2, std::size(code17d2), 2, /*out_vgpr*/2);
+    CHECK(!spv17d2.empty(), "#825: recompiled CFG wave-mask u64 compare/cselect -> SPIR-V");
+    std::vector<float> got17d2 = prosper::test::run_compute(spv17d2, in17d, N, N);
+    uint32_t bad17d2 = 0;
+    for (uint32_t i = 0; i < N && got17d2.size() == N; ++i) {
+        const float expected = i < 64 ? 7.0f : 1.0f;
+        if (got17d2[i] != expected) ++bad17d2;
+    }
+    CHECK(got17d2.size() == N && bad17d2 == 0,
+          "#825: dispatcher reduces mask==0 across the full emulated wave64");
+
+    // Kernel 17e: the same irreducible-for-the-narrow-structurizer CFG followed by MBCNT. The
+    // cross-lane pair must execute in the dispatcher's uniform common phase rather than beneath a
+    // switch case, where OpControlBarrier would be invalid and could deadlock a real Vulkan driver.
+    const uint32_t code17e[] = {
+        0x7e040280u,              // v_mov_b32 v2, 0
+        0x7c020300u,              // v_cmp_lt_f32 vcc, v0, v1
+        0xbf860001u,              // s_cbranch_vccz +1
+        0x7e040281u,              // v_mov_b32 v2, 1
+        0x7d840100u,              // v_cmp_eq_u32 vcc, v0, v0
+        0xbf870001u,              // s_cbranch_vccnz +1
+        0xbf82fffdu,              // s_branch -3
+        0xd7650003u, 0x0001007eu, // v_mbcnt_lo_u32_b32 v3, exec_lo, 0
+        0xd7660003u, 0x0002067fu, // v_mbcnt_hi_u32_b32 v3, exec_hi, v3
+        0x7e060d03u,              // v_cvt_f32_u32 v3, v3
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv17e = recompile_valu(
+        code17e, std::size(code17e), 2, /*out_vgpr*/3);
+    CHECK(!spv17e.empty(), "#825: recompiled CFG-dispatch MBCNT kernel -> SPIR-V");
+    std::vector<float> got17e = prosper::test::run_compute(spv17e, in17d, N, N);
+    uint32_t bad17e = 0;
+    for (uint32_t i = 0; i < N && got17e.size() == N; ++i)
+        if (std::fabs(got17e[i] - static_cast<float>(i % 64)) > 1e-3f) ++bad17e;
+    CHECK(got17e.size() == N && bad17e == 0,
+          "#825: CFG dispatcher synchronizes MBCNT across each emulated wave64");
+
+    // Kernel 17f: DS_APPEND in the same generic dispatcher. The LDS initial value is intentionally
+    // unspecified; this test verifies that the generated module executes to completion with the
+    // append atomic/barriers in uniform control flow. Exact append values are checked by kernel 32b5.
+    const uint32_t code17f[] = {
+        0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u,
+        0x7d840100u, 0xbf870001u, 0xbf82fffdu,
+        0xbefc0380u,                          // s_mov_b32 m0, 0
+        0xd8fa0008u, 0x03000000u,           // ds_append v3 offset:8
+        0x7e060d03u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv17f = recompile_valu(
+        code17f, std::size(code17f), 2, /*out_vgpr*/3);
+    CHECK(!spv17f.empty(), "#825: recompiled CFG-dispatch DS_APPEND kernel -> SPIR-V");
+    std::vector<float> got17f = prosper::test::run_compute(spv17f, in17d, N, N);
+    CHECK(got17f.size() == N,
+          "#825: Vulkan executes dispatcher DS_APPEND with uniform barriers");
+
     // Kernel 18: the REAL if-then idiom with a forward branch. v3=7; vcc=(u0>u1);
     // s_and_saveexec_b64 s[0:1],vcc (save exec, exec=vcc); s_cbranch_execz skip (forward -> no-op);
     // v_add v3=u0+u1 (predicated); skip: s_mov_b64 exec,s[0:1] (restore); cvt+store. Same result as
@@ -477,6 +549,28 @@ int main() {
     for (uint32_t i=0;i<N&&got18.size()==N;i++){ if (std::fabs(got18[i]-exp18[i])>1e-3f) bad18++; if((i%17)>(i%13)) act18++; }
     printf("  kernel18 mismatches=%u (active=%u, out[1]=%g exp=%g)\n", bad18, act18, got18.size()==N?got18[1]:-1, exp18[1]);
     CHECK(got18.size()==N && bad18==0, "recompiled kernel 18 (real saveexec+cbranch_execz if-then) correct");
+
+    // Astro's exact inverse-mask form: save EXEC in s[22:23], then EXEC &= ~VCC. The guarded add
+    // therefore runs for u0<=u1, after which the original EXEC mask is restored from s[22:23].
+    const uint32_t code18b[] = {
+        0x7e000f00u, 0x7e020f01u, 0x7e060287u, 0x7d880300u,
+        0xbe96376au, 0xbf880001u, 0x4a060300u, 0xbefe0416u,
+        0x7e060d03u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv18b = recompile_valu(
+        code18b, sizeof(code18b)/sizeof(code18b[0]), 2, /*out_vgpr*/3);
+    CHECK(!spv18b.empty(), "recompiled kernel 18b (Astro s_andn1_saveexec_b64) -> SPIR-V");
+    std::vector<float> exp18b(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        const uint32_t u0 = i % 17, u1 = i % 13;
+        exp18b[i] = (u0 <= u1) ? (float)(u0 + u1) : 7.0f;
+    }
+    std::vector<float> got18b = prosper::test::run_compute(spv18b, in18, N, N);
+    uint32_t bad18b = 0;
+    for (uint32_t i=0;i<N&&got18b.size()==N;i++)
+        if (std::fabs(got18b[i]-exp18b[i])>1e-3f) ++bad18b;
+    CHECK(got18b.size()==N && bad18b==0,
+          "kernel 18b saves EXEC, applies ~VCC, and restores the original mask");
 
     // Kernel 19: scalar s_bfe_u32. s0=0xF0; s1=bfe_u(s0, off=4,width=4)=(0xF0>>4)&0xF=0xF=15;
     // v2=(float)s1; out = a0 + 15. Proves scalar bitfield-extract (a top real-shader blocker).
@@ -1045,6 +1139,130 @@ int main() {
     CHECK(got32b.size()==1 && std::fabs(got32b[0]-10.0f)<1e-3f,
           "kernel 32b wide LDS stores and loads preserve both dwords of both VGPR pairs");
 
+    // Kernel 32b2: Astro Bot's loading-surface producer uses DS_READ2_B32 twice, first with
+    // offset0/1=(0,1) and then (16,17). Populate those exact LDS locations with integers 1..4,
+    // execute the two live instruction words, and make both return pairs observable as sum=10.
+    const uint32_t code32b2[] = {
+        0x7e000280u, 0x7e020281u, 0x7e040282u, 0x7e060283u, 0x7e080284u,
+        0xd9340000u, 0x00000100u, 0xd9340040u, 0x00000300u, 0xbf8a0000u,
+        0xd8dc0100u, 0x05000000u, 0xd8dc1110u, 0x07000000u,
+        0x7e0a0d05u, 0x7e0c0d06u, 0x7e0e0d07u, 0x7e100d08u,
+        0x060a0d05u, 0x060a0f05u, 0x060a1105u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32b2 = recompile_valu(code32b2, std::size(code32b2), 0, 5);
+    CHECK(!spv32b2.empty(), "recompiled kernel 32b2 (Astro DS_READ2_B32 words) -> SPIR-V");
+    std::vector<float> got32b2 = prosper::test::run_compute(spv32b2, std::vector<float>(1), 1, 1);
+    CHECK(got32b2.size()==1 && std::fabs(got32b2[0]-10.0f)<1e-3f,
+          "kernel 32b2 DS_READ2_B32 applies both packed dword offsets exactly");
+
+    // Kernel 32b3: three other exact words from Astro's loading compute shaders. V_MUL_U32_U24
+    // must mask both operands to 24 bits, while V_CVT_FLR_I32_F32 must round negative values toward
+    // -infinity (not toward zero). Add the converted results: (64 * 3) + floor(-2.25) = 189.
+    const uint32_t code32b3[] = {
+        0x7e000f00u,               // v_cvt_u32_f32 v0, v0
+        0x160600c0u,               // live: v_mul_u32_u24 v3, 64, v0
+        0x7e060d03u,               // v_cvt_f32_u32 v3, v3
+        0x7e681b01u,               // live: v_cvt_flr_i32_f32 v52, v1
+        0x7e680b34u,               // v_cvt_f32_i32 v52, v52
+        0x06686903u,               // v_add_f32 v52, v3, v52
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32b3 = recompile_valu(code32b3, std::size(code32b3), 2, 52);
+    CHECK(!spv32b3.empty(), "recompiled kernel 32b3 (Astro U24 multiply + floor-convert words) -> SPIR-V");
+    std::vector<float> got32b3 = prosper::test::run_compute(spv32b3, {3.0f, -2.25f}, 1, 1);
+    CHECK(got32b3.size()==1 && std::fabs(got32b3[0]-189.0f)<1e-3f,
+          "kernel 32b3 masks U24 multiplication and floors negative f32 before i32 conversion");
+
+    // Kernel 32b4: exact DS_WRITE_B96/B128 and DS_READ_B96/B128 forms from Astro. Store 1,2,3 at
+    // byte 0x510 and 4,5,6,7 at byte 0, read both vectors back, and sum all seven dwords to 28.
+    const uint32_t code32b4[] = {
+        0x7e000284u, 0x7e020285u, 0x7e040286u, 0x7e060287u,
+        0x7e080281u, 0x7e0a0282u, 0x7e0c0283u, 0x7e0e0280u,
+        0xdb780510u, 0x00000407u,   // live: ds_write_b96  v7, v[4:6] offset:0x510
+        0xdb7c0000u, 0x00000007u,   // live: ds_write_b128 v7, v[0:3]
+        0xbf8a0000u,
+        0xdbfc0000u, 0x08000007u,   // live form: ds_read_b128 v[8:11], v7
+        0xdbf80510u, 0x0c000007u,   // live form: ds_read_b96 v[12:14], v7 offset:0x510
+        0x7e100d08u, 0x7e120d09u, 0x7e140d0au, 0x7e160d0bu,
+        0x7e180d0cu, 0x7e1a0d0du, 0x7e1c0d0eu,
+        0x06101308u, 0x06101508u, 0x06101708u,
+        0x06101908u, 0x06101b08u, 0x06101d08u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32b4 = recompile_valu(code32b4, std::size(code32b4), 0, 8);
+    CHECK(!spv32b4.empty(), "recompiled kernel 32b4 (Astro wide LDS read/write words) -> SPIR-V");
+    std::vector<float> got32b4 = prosper::test::run_compute(spv32b4, std::vector<float>(1), 1, 1);
+    CHECK(got32b4.size()==1 && std::fabs(got32b4[0]-28.0f)<1e-3f,
+          "kernel 32b4 wide LDS reads/writes preserve all three/four consecutive dwords");
+
+    // Kernel 32b5: Astro's exact DS_APPEND word. Initialize the LDS counter to 10, narrow EXEC to
+    // the first 32 lanes, then append. Hardware performs one atomic +32 and broadcasts old=10 only
+    // to active lanes; inactive lanes preserve their old v8=99. Reading the new counter (42) makes
+    // both effects observable: active output=52, inactive output=141.
+    const uint32_t code32b5[] = {
+        0x7e000f00u,               // v_cvt_u32_f32 v0, v0 (lane number input)
+        0x7e04028au, 0x7e060280u,  // v2=10, v3=byte address 0
+        0x7e1002ffu, 0x00000063u,  // v8=99 fallback for inactive lanes
+        0xbefc0380u,               // s_mov_b32 m0, 0
+        0x7da40080u,               // v_cmpx_eq_u32 0, v0 (lane zero initializes)
+        0xd8340010u, 0x00000203u,  // ds_write_b32 v3, v2 offset:0x10
+        0xbefe04c1u, 0xbf8a0000u,  // restore EXEC; barrier
+        0x7e0202a0u, 0x7da20300u,  // v1=32; v_cmpx_lt_u32 v0,v1
+        0xd8fa0010u, 0x08000000u,  // live: ds_append v8 offset:0x10
+        0xbefe04c1u, 0xbf8a0000u,  // restore EXEC; barrier
+        0xd8d80010u, 0x09000003u,  // ds_read_b32 v9, v3 offset:0x10
+        0x7e100d08u, 0x7e120d09u, 0x06101308u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32b5 = recompile_valu(code32b5, std::size(code32b5), 1, 8);
+    CHECK(!spv32b5.empty(), "recompiled kernel 32b5 (Astro DS_APPEND word) -> SPIR-V");
+    std::vector<float> in32b5(WG); for (uint32_t i = 0; i < WG; ++i) in32b5[i] = (float)i;
+    std::vector<float> got32b5 = prosper::test::run_compute(spv32b5, in32b5, WG, WG);
+    uint32_t bad32b5 = 0;
+    for (uint32_t i = 0; i < WG && got32b5.size() == WG; ++i) {
+        const float expected = i < 32 ? 52.0f : 141.0f;
+        if (std::fabs(got32b5[i] - expected) > 1e-3f) ++bad32b5;
+    }
+    printf("  kernel32b5 output count=%zu", got32b5.size());
+    if (got32b5.size() == WG)
+        printf("  kernel32b5 mismatches=%u out[0/31/32/63]=%g/%g/%g/%g expect=52/52/141/141\n",
+               bad32b5, got32b5[0], got32b5[31], got32b5[32], got32b5[63]);
+    else
+        printf("\n");
+    CHECK(got32b5.size()==WG && bad32b5==0,
+          "kernel 32b5 atomically adds popcount(EXEC), broadcasts old counter, and predicates VDST");
+
+    // Kernel 32b6: Astro's exact DS_CONSUME word is the inverse operation. Start at 50, make the
+    // first 16 lanes valid, and consume once. Active lanes observe old=50 and all lanes read the new
+    // counter=34, while inactive lanes preserve their fallback destination value of 99.
+    const uint32_t code32b6[] = {
+        0x7e000f00u,                         // v_cvt_u32_f32 v0, v0 (lane number input)
+        0x7e0402ffu, 0x00000032u,            // v2=50
+        0x7e060280u,                         // v3=byte address 0
+        0x7e1802ffu, 0x00000063u,            // v12=99 fallback for inactive lanes
+        0xbefc0380u,                         // s_mov_b32 m0, 0
+        0x7da40080u,                         // v_cmpx_eq_u32 0, v0 (lane zero initializes)
+        0xd8340004u, 0x00000203u,            // ds_write_b32 v3, v2 offset:4
+        0xbefe04c1u, 0xbf8a0000u,            // restore EXEC; barrier
+        0x7e020290u, 0x7da20300u,            // v1=16; v_cmpx_lt_u32 v0,v1
+        0xd8f60004u, 0x0c000000u,            // live: ds_consume v12 offset:4
+        0xbefe04c1u, 0xbf8a0000u,            // restore EXEC; barrier
+        0xd8d80004u, 0x0d000003u,            // ds_read_b32 v13, v3 offset:4
+        0x7e180d0cu, 0x7e1a0d0du,            // uint -> float
+        0x06181b0cu, 0xbf810000u,             // v12 += v13; end
+    };
+    std::vector<uint32_t> spv32b6 = recompile_valu(code32b6, std::size(code32b6), 1, 12);
+    CHECK(!spv32b6.empty(), "recompiled kernel 32b6 (Astro DS_CONSUME word) -> SPIR-V");
+    std::vector<float> got32b6 = prosper::test::run_compute(spv32b6, in32b5, WG, WG);
+    uint32_t bad32b6 = 0;
+    for (uint32_t i = 0; i < WG && got32b6.size() == WG; ++i) {
+        const float expected = i < 16 ? 84.0f : 133.0f;
+        if (std::fabs(got32b6[i] - expected) > 1e-3f) ++bad32b6;
+    }
+    if (got32b6.size() == WG)
+        printf("  kernel32b6 mismatches=%u out[0/15/16/63]=%g/%g/%g/%g expect=84/84/133/133\n",
+               bad32b6, got32b6[0], got32b6[15], got32b6[16], got32b6[63]);
+    CHECK(got32b6.size()==WG && bad32b6==0,
+          "kernel 32b6 atomically subtracts popcount(EXEC), broadcasts old counter, and predicates VDST");
+
     // Kernel 32c: the same UE4 producer uses non-returning unsigned LDS min/max atomics. Start at
     // 10, min with 3, then max with 7; a read and uint->float conversion must report 7.
     const uint32_t code32c[] = {
@@ -1080,6 +1298,57 @@ int main() {
            bad32c2, got32c2.size()==WG ? got32c2[0] : -1.0f);
     CHECK(got32c2.size()==WG && bad32c2==0,
           "kernel 32c2 returns old LDS and atomically stores the sum");
+
+    // Kernel 32c3: exact Astro DS_ADD_U32 form. Give every lane its own dword, initialize it to 10,
+    // add 1 atomically without a return value, then read back 11.
+    const uint32_t code32c3[] = {
+        0x7e02028au,                              // v1 = 10
+        0xd8340514u, 0x00000100u, 0xbf8a0000u,  // ds_write_b32 v0, v1 offset:0x514; barrier
+        0x7e020281u,                              // v1 = 1
+        0xd8000514u, 0x00000100u, 0xbf8a0000u,  // live: ds_add_u32 v0, v1 offset:0x514; barrier
+        0xd8d80514u, 0x02000000u,                 // ds_read_b32 v2, v0 offset:0x514
+        0x7e040d02u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32c3 = recompile_valu(
+        code32c3, std::size(code32c3), 1, 2);
+    CHECK(!spv32c3.empty(), "recompiled kernel 32c3 (Astro DS_ADD_U32 word) -> SPIR-V");
+    std::vector<float> in32c3(WG);
+    for (uint32_t i = 0; i < WG; ++i) {
+        const uint32_t addr = 4u * i;
+        std::memcpy(&in32c3[i], &addr, sizeof(addr));
+    }
+    std::vector<float> got32c3 = prosper::test::run_compute(spv32c3, in32c3, WG, WG);
+    uint32_t bad32c3 = 0;
+    for (uint32_t i = 0; i < WG && got32c3.size() == WG; ++i)
+        if (std::fabs(got32c3[i] - 11.0f) > 1e-3f) ++bad32c3;
+    CHECK(got32c3.size() == WG && bad32c3 == 0,
+          "kernel 32c3 atomically adds DATA0 to each LDS dword");
+
+    // Kernel 32c4: exact Astro DS_WRXCHG_RTN_B32 form. Swap 20 over 10 and observe both the
+    // returned old value and the new LDS value: 10 + 20 = 30.
+    const uint32_t code32c4[] = {
+        0x7e02028au,
+        0xd8340510u, 0x00000100u, 0xbf8a0000u,
+        0x7e0402ffu, 0x00000014u,
+        0xd8b40510u, 0x03000200u, 0xbf8a0000u,
+        0xd8d80510u, 0x04000000u,
+        0x7e060d03u, 0x7e080d04u, 0x06060903u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32c4 = recompile_valu(
+        code32c4, std::size(code32c4), 1, 3);
+    CHECK(!spv32c4.empty(),
+          "recompiled kernel 32c4 (Astro DS_WRXCHG_RTN_B32 word) -> SPIR-V");
+    std::vector<float> in32c4(WG);
+    for (uint32_t i = 0; i < WG; ++i) {
+        const uint32_t addr = 4u * i;
+        std::memcpy(&in32c4[i], &addr, sizeof(addr));
+    }
+    std::vector<float> got32c4 = prosper::test::run_compute(spv32c4, in32c4, WG, WG);
+    uint32_t bad32c4 = 0;
+    for (uint32_t i = 0; i < WG && got32c4.size() == WG; ++i)
+        if (std::fabs(got32c4[i] - 30.0f) > 1e-3f) ++bad32c4;
+    CHECK(got32c4.size() == WG && bad32c4 == 0,
+          "kernel 32c4 atomically exchanges LDS and returns the previous dword");
 
     // Kernel 32d: SDWA f16->f32 conversion selects WORD_1 before applying source negate. The packed
     // high half is -2, so `-WORD_1` converts to +2 (not a negation of the packed 32-bit payload).
@@ -1353,6 +1622,22 @@ int main() {
     uint32_t bad37 = 0; for (uint32_t i=0;i<N&&got37.size()==N;i++) if (std::fabs(got37[i]-exp37[i])>1e-3f) bad37++;
     printf("  kernel37 mismatches=%u (out[5]=%g expect=%g)\n", bad37, got37.size()==N?got37[5]:-1, exp37[5]);
     CHECK(got37.size()==N && bad37==0, "recompiled kernel 37 (s_movk_i32 -100) computes a0-100");
+
+    // Astro Bot's loading composite starts with s_brev_b32 s16,1 to construct 0x80000000.
+    // AMD ISA 70648 also specifies that S_BREV does not set SCC. Seed SCC=true, reverse bit 0,
+    // then select the reversed value through SCC so the test covers both contracts.
+    const uint32_t code37b[] = {
+        0xBE800381u, 0xBF068100u, 0xBE800B00u, 0x85018900u, 0x7E000C01u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv37b = recompile_valu(
+        code37b, sizeof(code37b)/sizeof(code37b[0]), 1, 0);
+    CHECK(!spv37b.empty(), "recompiled kernel 37b (s_brev_b32) -> SPIR-V");
+    std::vector<float> got37b = prosper::test::run_compute(spv37b, in37, N, N);
+    uint32_t bad37b = 0;
+    for (uint32_t i=0;i<N&&got37b.size()==N;i++)
+        if (got37b[i] != 2147483648.0f) bad37b++;
+    CHECK(got37b.size()==N && bad37b==0,
+          "kernel 37b reverses scalar bit 0 into bit 31 without changing SCC");
 
     // Kernel 38: s_cselect_b64 (SOP2 0x0b) — mask-domain select. s_cmp_eq_u32 5,5 sets SCC=1, then
     //   s_cselect_b64 vcc, exec, 0 => vcc = SCC ? exec : 0 = exec (all lanes on). v_cndmask v0,v1(42),
@@ -1874,6 +2159,31 @@ int main() {
            got66b.size()==N?got66b[3]:-1, 500u + 2u*3u + 1u);
     CHECK(got66b.size()==N && bad66b==0, "kernel 66b (idxen+offen): addr = idx*stride + byteoffset (both applied)");
 
+    // Astro Bot's visibility kernel uses raw buffer_load_ubyte at arbitrary byte offsets. Exercise
+    // all four byte positions in each dword through the same SRSRC-provenance binding as kernel 66.
+    const uint32_t code66c[] = {
+        0x7e000f00u,               // v_cvt_u32_f32 v0, v0
+        0xe0201000u, 0x80020000u,  // buffer_load_ubyte v0, v0, s[8:11], 0 offen
+        0x7e000d00u,               // v_cvt_f32_u32 v0, v0
+        0xbf810000u,
+    };
+    ShaderResourceTable rt66c;
+    { ShaderResource rb{}; rb.cls = ResourceClass::ConstantBuffer; rb.format = DataFormat::Uint32;
+      rb.num_components = 1; rb.binding = 3; rb.sgpr_base = 8; rt66c.resources.push_back(rb); }
+    std::vector<uint32_t> spv66c = recompile_valu(
+        code66c, sizeof(code66c)/sizeof(code66c[0]), 1, 0, &rt66c);
+    CHECK(!spv66c.empty(), "recompiled kernel 66c (raw buffer_load_ubyte) -> SPIR-V");
+    std::vector<uint32_t> bytes66c((N + 3) / 4, 0u), decoy66c(bytes66c.size(), 0u);
+    for (uint32_t i = 0; i < N; ++i)
+        bytes66c[i / 4] |= ((i * 3u + 7u) & 0xFFu) << ((i & 3u) * 8u);
+    std::vector<float> got66c = prosper::test::run_compute(
+        spv66c, in66, N, N, decoy66c, bytes66c);
+    uint32_t bad66c = 0;
+    for (uint32_t i=0;i<N&&got66c.size()==N;i++)
+        if (got66c[i] != (float)((i * 3u + 7u) & 0xFFu)) ++bad66c;
+    CHECK(got66c.size()==N && bad66c==0,
+          "kernel 66c extracts raw unsigned bytes at every in-dword position");
+
     // Kernel 67: RAW MUBUF UNRESOLVABLE SRSRC -> REJECT (#91). Same code, but the table's only
     // resource lives at sgpr_base 4 — SRSRC s[8:11] resolves to nothing. With a table present the
     // recompiler must reject (empty SPIR-V), never silently fall back to binding 2.
@@ -2284,6 +2594,117 @@ int main() {
     uint32_t badT11 = 0; for (uint32_t i=0;i<N&&gotT11.size()==N;i++) if (gotT11[i]!=expT11[i]) badT11++;
     CHECK(gotT11.size()==N && badT11==0, "T11: v_cmp_gt_f32_sdwa applies |src0| before comparing");
 
+    // Astro Bot's exact visibility-kernel compare: move the input bits to v63, compare integer 1
+    // against its zero-extended low byte, then materialize the VCC result as float 0/1.
+    const uint32_t codeT11b[] = {
+        0x7e7e0300u,               // v_mov_b32 v63, v0
+        0x7d8a7ef9u, 0x00860081u,  // v_cmp_ne_u32 vcc, 1, v63 src1_sel:BYTE_0
+        0xd5010000u, 0x01a9e480u,  // v_cndmask_b32_e64 v0, 0.0, 1.0, vcc
+        0xBF810000u,
+    };
+    std::vector<uint32_t> spvT11b = recompile_valu(codeT11b, sizeof(codeT11b)/4, 1, 0);
+    CHECK(!spvT11b.empty(), "recompiled T11b (Astro integer VOPC SDWA BYTE_0) -> SPIR-V");
+    std::vector<float> gotT11b = prosper::test::run_compute(spvT11b, inX, N, N);
+    uint32_t badT11b = 0;
+    for (uint32_t i = 0; i < N && gotT11b.size() == N; ++i)
+        if (gotT11b[i] != (((bits_of(inX[i]) & 0xFFu) != 1u) ? 1.0f : 0.0f)) ++badT11b;
+    CHECK(gotT11b.size()==N && badT11b==0,
+          "T11b: unsigned SDWA compare zero-extends the selected source byte");
+
+    // Its later paired form selects WORD_1 and updates EXEC instead of VCC. Exact live words;
+    // compilation proves the CMPX opcode family is normalized before the integer SDWA admission.
+    const uint32_t codeT11c[] = {
+        0x7e7e0300u,               // v_mov_b32 v63, v0
+        0x7daa7ef9u, 0x05860081u,  // v_cmpx_ne_u32 1, v63 src1_sel:WORD_1
+        0x7e0002f2u,               // v_mov_b32 v0, 1.0 (EXEC-predicated)
+        0xBF810000u,
+    };
+    std::vector<uint32_t> spvT11c = recompile_valu(codeT11c, sizeof(codeT11c)/4, 1, 0);
+    CHECK(!spvT11c.empty(), "recompiled T11c (Astro CMPX SDWA WORD_1) -> SPIR-V");
+    std::vector<float> gotT11c = prosper::test::run_compute(spvT11c, inX, N, N);
+    uint32_t badT11c = 0;
+    for (uint32_t i = 0; i < N && gotT11c.size() == N; ++i) {
+        const bool active = ((bits_of(inX[i]) >> 16) & 0xFFFFu) != 1u;
+        if (gotT11c[i] != (active ? 1.0f : inX[i])) ++badT11c;
+    }
+    CHECK(gotT11c.size()==N && badT11c==0,
+          "T11c: CMPX compares the zero-extended high word and predicates the following write");
+
+    // Exact Astro visibility-kernel word. Both unwritten sources are architectural undefined on
+    // hardware but initialize to zero in the test shell, so XNOR(0,0) must produce all one bits.
+    const uint32_t codeT11d[] = { 0x3cc0c18du, 0xbf810000u }; // v_xnor_b32 v96, v141, v96
+    std::vector<uint32_t> spvT11d = recompile_valu(
+        codeT11d, sizeof(codeT11d)/sizeof(codeT11d[0]), 1, /*out_vgpr*/96);
+    CHECK(!spvT11d.empty(), "recompiled T11d (Astro v_xnor_b32 word) -> SPIR-V");
+    std::vector<float> gotT11d = prosper::test::run_compute(spvT11d, inX, N, N);
+    uint32_t badT11d = 0;
+    for (uint32_t i=0;i<N&&gotT11d.size()==N;i++)
+        if (bits_of(gotT11d[i]) != 0xFFFFFFFFu) ++badT11d;
+    CHECK(gotT11d.size()==N && badT11d==0,
+          "T11d: v_xnor_b32 is the bitwise complement of XOR");
+
+    // Exact Astro V_BCNT packet: copy the input bits to v97, then popcount into v98 with addend 0.
+    const uint32_t codeT11e[] = {
+        0x7ec20300u,               // v_mov_b32 v97, v0
+        0xd7640062u, 0x00010161u,  // v_bcnt_u32_b32 v98, v97, 0
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvT11e = recompile_valu(
+        codeT11e, sizeof(codeT11e)/sizeof(codeT11e[0]), 1, /*out_vgpr*/98);
+    CHECK(!spvT11e.empty(), "recompiled T11e (Astro v_bcnt_u32_b32 word) -> SPIR-V");
+    std::vector<float> gotT11e = prosper::test::run_compute(spvT11e, inX, N, N);
+    uint32_t badT11e = 0;
+    for (uint32_t i=0;i<N&&gotT11e.size()==N;i++)
+        if (bits_of(gotT11e[i]) != std::popcount(bits_of(inX[i]))) ++badT11e;
+    CHECK(gotT11e.size()==N && badT11e==0,
+          "T11e: v_bcnt_u32_b32 adds the exact 32-bit population count");
+
+    // Astro's next blocker is VOP3B v_mad_u64_u32. Exercise all three architectural
+    // outputs with an overflowing case:
+    //   0xffffffff*2 + 0xffffffffffffffff = carry:1, hi:1, lo:0xfffffffd.
+    // XOR the low word to zero, convert hi to 1.0, and select 41.0 through carry => 42.0.
+    const uint32_t codeT11f[] = {
+        0x7eb80282u,                         // v_mov_b32 v92, 2
+        0x7e0e02c1u, 0x7e1002c1u,           // v_mov_b32 v7/v8, -1
+        0xd5766a05u, 0x041eb8c1u,           // v_mad_u64_u32 v[5:6],vcc,-1,v92,v[7:8]
+        0x3a0a0ac3u,                         // v_xor_b32 v5, -3, v5 (validates low)
+        0x7e0a0d05u, 0x7e0c0d06u,           // v_cvt_f32_u32 v5/v6, v5/v6
+        0x7e1402ffu, 0x42240000u,            // v_mov_b32 v10, 41.0
+        0x7e160280u,                         // v_mov_b32 v11, 0
+        0x0214150bu,                         // v_cndmask_b32 v10, v11, v10, vcc
+        0x06000d05u, 0x06001500u,           // v0 = v5 + v6 + v10
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvT11f = recompile_valu(
+        codeT11f, sizeof(codeT11f)/sizeof(codeT11f[0]), 1, 0);
+    CHECK(!spvT11f.empty(), "recompiled T11f (Astro v_mad_u64_u32 VOP3B) -> SPIR-V");
+    std::vector<float> gotT11f = prosper::test::run_compute(spvT11f, inX, N, N);
+    uint32_t badT11f = 0;
+    for (uint32_t i=0;i<N&&gotT11f.size()==N;i++)
+        if (gotT11f[i] != 42.0f) ++badT11f;
+    CHECK(gotT11f.size()==N && badT11f==0,
+          "T11f: v_mad_u64_u32 writes exact low/high words and carry-out");
+
+    // Astro's SSAO pixel shader carries dead `s_and_b64 vcc,s[0:1],vcc` operations between
+    // comparisons; s[0:1] is a T# descriptor, not a wave-mask value available to SPIR-V. Prove that
+    // the dead write is removed while the following, observable comparison still controls cndmask.
+    const uint32_t codeT11g[] = {
+        0x7c080300u,              // v_cmp_gt_f32 vcc, v0, v1
+        0x87ea6a00u,              // s_and_b64 vcc, s[0:1], vcc (dead before the next compare)
+        0x7c020300u,              // v_cmp_lt_f32 vcc, v0, v1
+        0x02000101u,              // v_cndmask_b32 v0, v1, v0, vcc => min(v0,v1)
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvT11g = recompile_valu(
+        codeT11g, sizeof(codeT11g)/sizeof(codeT11g[0]), 2, 0);
+    CHECK(!spvT11g.empty(), "recompiled T11g (dead Astro scalar-pair mask write) -> SPIR-V");
+    std::vector<float> gotT11g = prosper::test::run_compute(spvT11g, in6, N, N);
+    uint32_t badT11g = 0;
+    for (uint32_t i=0;i<N&&gotT11g.size()==N;i++)
+        if (gotT11g[i] != std::min(in6[i*2], in6[i*2+1])) ++badT11g;
+    CHECK(gotT11g.size()==N && badT11g==0,
+          "T11g: dead mask removal preserves the following VCC compare result");
+
     // Kernel T12: PC-RELATIVE EMBEDDED TABLE (#273 — DOLL's dither PS idiom). The shader builds a
     // V# with s_getpc_b64 + adds and buffer_loads from a constant table appended AFTER s_endpgm in
     // the code blob. The recompiler folds the load to a compile-time lookup.
@@ -2313,6 +2734,54 @@ int main() {
     uint32_t badT12 = 0; for (uint32_t i=0;i<N&&gotT12.size()==N;i++) if (gotT12[i]!=expT12[i]) badT12++;
     printf("  T12(pcrel table) mismatches=%u (out[2]=%g expect=%g)\n", badT12, gotT12.size()==N?gotT12[2]:-1, expT12[2]);
     CHECK(gotT12.size()==N && badT12==0, "T12: buffer_load through a getpc-built V# reads the embedded table");
+
+    // Astro Bot emits the same proven V# shape with s_movk_i32 for num_records. Keep that descriptor
+    // construction equivalent to s_mov_b32; otherwise s_getpc_b64 is rejected even though all loads
+    // remain bounded to the embedded table.
+    const uint32_t codeT12movk[] = {
+        0xb0060010u,               // s_movk_i32 s6, 16
+        0xbe841f00u,               // s_getpc_b64 s[4:5]
+        0x800404acu,               // s_add_u32 s4, 44, s4 (table = next-PC byte 8 + 44)
+        0x82050580u,               // s_addc_u32 s5, 0, s5
+        0xbe8703ffu, 0x10005004u,  // s_mov_b32 s7, 0x10005004
+        0x7e020f00u,               // v_cvt_u32_f32 v1, v0
+        0x34020282u,               // v_lshlrev_b32 v1, 2, v1
+        0xe0301000u, 0x80010101u,  // buffer_load_dword v1, v1, s[4:7], 0 offen
+        0xbf8c3f70u,               // s_waitcnt vmcnt(0)
+        0x7e000d01u,               // v_cvt_f32_u32 v0, v1
+        0xBF810000u,               // s_endpgm
+        7u, 11u, 13u, 17u,
+    };
+    std::vector<uint32_t> spvT12movk = recompile_valu(
+        codeT12movk, sizeof(codeT12movk)/4, 1, 0);
+    CHECK(!spvT12movk.empty(), "recompiled T12 movk V# (Astro Bot descriptor shape) -> SPIR-V");
+    std::vector<float> gotT12movk = prosper::test::run_compute(spvT12movk, inT12, N, N);
+    uint32_t badT12movk = 0;
+    for (uint32_t i=0;i<N&&gotT12movk.size()==N;i++)
+        if (gotT12movk[i]!=expT12[i]) badT12movk++;
+    CHECK(gotT12movk.size()==N && badT12movk==0,
+          "T12 movk: getpc-built V# reads the embedded table");
+
+    // A PC-relative table belongs to the shader itself, not to the runtime resource table. Astro
+    // Bot's loading-screen VS has no external resources and loads its position from exactly this
+    // shape. The graphics-stage gate must therefore accept the proven MUBUF before requiring `rt`.
+    const uint32_t codeT12vertex[] = {
+        0xb0020010u,               // s_movk_i32 s2, 16 bytes
+        0xbe8303ffu, 0x10005004u,  // s_mov_b32 s3, V# config
+        0xbe801f00u,               // s_getpc_b64 s[0:1] (next PC byte = 16)
+        0x800000ffu, 0x00000028u,  // s_add_u32 s0, 40, s0 (table byte = 56)
+        0x82010180u,               // s_addc_u32 s1, 0, s1
+        0x7e080280u,               // v_mov_b32 v4, 0 (table byte offset)
+        0xe0381000u, 0x80000004u,  // buffer_load_dwordx4 v[0:3], v4, s[0:3], 0 offen
+        0xbf8c3f70u,               // s_waitcnt vmcnt(0)
+        0xf80008cfu, 0x03020100u,  // exp pos0, v0, v1, v2, v3
+        0xbf810000u,               // s_endpgm
+        0xbf800000u, 0xbf800000u, 0u, 0x3f800000u,
+    };
+    std::vector<uint32_t> spvT12vertex = recompile_vertex(
+        codeT12vertex, sizeof(codeT12vertex)/4, nullptr);
+    CHECK(!spvT12vertex.empty(),
+          "T12 vertex: resource-free stage accepts a proven embedded-table MUBUF");
 
     // Kernel T13: UINT8x1 vertex fetch (#273 — DOLL's skinned scene VS bone-index attribute class).
     // buffer_load_format_x of a Uint8 element delivers the RAW integer (no normalization) in the VGPR.
@@ -2477,6 +2946,28 @@ int main() {
     printf("  T20(bitcmp1) mismatches=%u (out[2]=%g expect=100)\n", badT20, gotT20.size()==8?gotT20[2]:-1);
     CHECK(gotT20.size()==8 && badT20==0, "T20: s_bitcmp1_b32 sets SCC from the selected bit");
 
+    // Kernel T20b: Astro's exact s_cmp_eq_u64 s[2:3], 0 form. Exercise both the equal pair and a
+    // value whose low half is zero but high half is one, proving that SCC uses both encoded dwords.
+    const uint32_t codeT20b_eq[] = {
+        0xbe820380u, 0xbe830380u, 0xbf128002u,
+        0x850580ffu, 0x00000064u, 0x7e000c05u, 0xbf810000u,
+    };
+    const uint32_t codeT20b_ne[] = {
+        0xbe820380u, 0xbe830381u, 0xbf128002u,
+        0x850580ffu, 0x00000064u, 0x7e000c05u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spvT20b_eq = recompile_valu(codeT20b_eq, std::size(codeT20b_eq), 0, 0);
+    std::vector<uint32_t> spvT20b_ne = recompile_valu(codeT20b_ne, std::size(codeT20b_ne), 0, 0);
+    CHECK(!spvT20b_eq.empty() && !spvT20b_ne.empty(),
+          "recompiled T20b (Astro s_cmp_eq_u64 word) -> SPIR-V");
+    std::vector<float> gotT20b_eq = prosper::test::run_compute(spvT20b_eq, inT20, 8, 8);
+    std::vector<float> gotT20b_ne = prosper::test::run_compute(spvT20b_ne, inT20, 8, 8);
+    uint32_t badT20b = 0;
+    for (uint32_t i = 0; i < 8 && gotT20b_eq.size() == 8 && gotT20b_ne.size() == 8; ++i)
+        if (gotT20b_eq[i] != 100.0f || gotT20b_ne[i] != 0.0f) ++badT20b;
+    CHECK(gotT20b_eq.size()==8 && gotT20b_ne.size()==8 && badT20b==0,
+          "T20b: u64 equality compares both SGPR halves and drives SCC exactly");
+
     // Kernel T23: v_cube{id,sc,tc,ma}_f32 (#273 — DOLL's reflection-probe cube math). Direction
     // (x,y,z) = (1.0, 0.5, -2.0): |z| is the major axis and z<0, so per the GL cube table
     // id=5, sc=-x=-1, tc=-y=-0.5, ma=2z=-4. out = id*100 + sc*10 + tc + ma/1024
@@ -2574,6 +3065,165 @@ int main() {
            gotT24.size()==16?gotT24[7]:-9.f, gotT24.size()==16?gotT24[8]:-9.f);
     CHECK(gotT24.size()==16 && badT24==0,
           "T24: signed i4 values convert to f32 multiples of 1/16 exactly");
+
+    // T25: Astro Bot's compute blur uses v_mov_b32_dpp quad permutations to exchange values inside
+    // each 2x2 quad. These are subgroup quad swaps, not screen-space derivatives (the fragment-only
+    // lowering). Exercise the exact live DPP controls: 0xb1 = lane^1 (horizontal), 0x4e = lane^2
+    // (vertical), 0x1b = lane^3 (diagonal).
+    const uint32_t dpp_controls[] = {0xff08b100u, 0xff084e00u, 0xff081b00u};
+    const uint32_t dpp_xor[] = {1u, 2u, 3u};
+    for (uint32_t k = 0; k < 3; ++k) {
+        const uint32_t codeT25[] = {0x7e0002fau, dpp_controls[k], 0xbf810000u};
+        std::vector<uint32_t> spvT25 = recompile_valu(codeT25, sizeof(codeT25)/4, 1, 0);
+        CHECK(!spvT25.empty(), "recompiled T25 (compute DPP16 quad swap) -> SPIR-V");
+        std::vector<float> inT25(128), expT25(128);
+        for (uint32_t i = 0; i < 128; ++i) inT25[i] = (float)i;
+        for (uint32_t i = 0; i < 128; ++i) expT25[i] = inT25[i ^ dpp_xor[k]];
+        std::vector<float> gotT25 = prosper::test::run_compute(spvT25, inT25, 128, 128);
+        uint32_t badT25 = 0;
+        for (uint32_t i = 0; i < 128 && gotT25.size() == 128; ++i)
+            if (gotT25[i] != expT25[i]) ++badT25;
+        CHECK(gotT25.size() == 128 && badT25 == 0,
+              "T25: compute DPP16 returns the selected neighbor from each quad");
+    }
+
+    // T26: Astro title-ship VS exact VOP3 opcode word for v_cvt_pknorm_u16_f32. The high half is
+    // fixed at 0.5; the low half exercises clamping and round-to-nearest-even across [0,1].
+    const uint32_t codeT26[] = {
+        0xd7690002u, 0x0001e100u, // v_cvt_pknorm_u16_f32 v2, v0, 0.5
+        0x7e000302u,              // v_mov_b32 v0, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvT26 = recompile_valu(codeT26, std::size(codeT26), 1, 0);
+    CHECK(!spvT26.empty(), "recompiled T26 (Astro v_cvt_pknorm_u16_f32 word) -> SPIR-V");
+    std::vector<float> inT26 = {-1.0f, 0.0f, 0.25f, 0.5f, 0.75f, 1.0f, 2.0f, 0.1f};
+    std::vector<float> expT26(inT26.size());
+    for (size_t i = 0; i < inT26.size(); ++i) {
+        const float clamped = std::max(0.0f, std::min(1.0f, inT26[i]));
+        const uint32_t lo = static_cast<uint32_t>(std::nearbyint(clamped * 65535.0f));
+        const uint32_t packed = (32768u << 16) | lo;
+        std::memcpy(&expT26[i], &packed, sizeof(packed));
+    }
+    std::vector<float> gotT26 = prosper::test::run_compute(spvT26, inT26, 8, 8);
+    uint32_t badT26 = 0;
+    for (size_t i = 0; i < expT26.size() && gotT26.size() == expT26.size(); ++i)
+        if (gotT26[i] != expT26[i]) ++badT26;
+    printf("  T26(pknorm u16) mismatches=%u (got[2]=%.0f expect=%.0f, got[3]=%.0f expect=%.0f)\n",
+           badT26, gotT26.size()==8?gotT26[2]:-1.f, expT26[2],
+           gotT26.size()==8?gotT26[3]:-1.f, expT26[3]);
+    CHECK(gotT26.size() == expT26.size() && badT26 == 0,
+          "T26: PKNORM_U16 clamps, rounds, and packs both normalized halves exactly");
+
+    // T27: the title PS's exact SDWA operation, reduced only from v11/v5 to v0/v0 so the compute
+    // harness can feed it. BYTE_0 is zero-extended before the unsigned-int-to-float conversion.
+    const uint32_t codeT27[] = {0x7e000cf9u, 0x00001600u, 0xbf810000u};
+    std::vector<uint32_t> spvT27 = recompile_valu(codeT27, std::size(codeT27), 1, 0);
+    CHECK(!spvT27.empty(), "recompiled T27 (Astro v_cvt_f32_u32 SDWA BYTE_0) -> SPIR-V");
+    const uint32_t rawT27[] = {0u, 1u, 0xffu, 0x12345678u, 0xabcdef80u, 0xffffff00u, 0x100u, 0x7fu};
+    std::vector<float> inT27(std::size(rawT27)), expT27(std::size(rawT27));
+    for (size_t i = 0; i < std::size(rawT27); ++i) {
+        std::memcpy(&inT27[i], &rawT27[i], sizeof(uint32_t));
+        expT27[i] = static_cast<float>(rawT27[i] & 0xffu);
+    }
+    std::vector<float> gotT27 = prosper::test::run_compute(spvT27, inT27, 8, 8);
+    CHECK(gotT27 == expT27,
+          "T27: SDWA BYTE_0 conversion produces the exact zero-extended byte value");
+
+    // T28: Astro title compute exact rejected word from the live trace. DPP applies only to src0
+    // (v3); src1 (v15) stays in the current lane. With quad_perm [1,0,3,2], every lane receives its
+    // horizontal neighbour plus itself.
+    const uint32_t codeT28[] = {
+        0x7e060300u,                         // v_mov_b32 v3, v0
+        0x7e1e0300u,                         // v_mov_b32 v15, v0
+        0x061e1efau, 0xff08b103u,            // exact v_add_f32_dpp v15,v3,v15 quad_perm:[1,0,3,2]
+        0x7e00030fu,                         // v_mov_b32 v0, v15
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvT28 = recompile_valu(codeT28, std::size(codeT28), 1, 0);
+    CHECK(!spvT28.empty(), "recompiled T28 (Astro compute VOP2 DPP add) -> SPIR-V");
+    std::vector<float> inT28(128), expT28(128);
+    for (uint32_t i = 0; i < 128; ++i) inT28[i] = (float)i;
+    for (uint32_t i = 0; i < 128; ++i) expT28[i] = inT28[i] + inT28[i ^ 1u];
+    std::vector<float> gotT28 = prosper::test::run_compute(spvT28, inT28, 128, 128);
+    uint32_t badT28 = 0;
+    for (uint32_t i = 0; i < 128 && gotT28.size() == 128; ++i)
+        if (gotT28[i] != expT28[i]) ++badT28;
+    CHECK(gotT28.size() == 128 && badT28 == 0,
+          "T28: VOP2 DPP permutes only src0 and adds current-lane src1");
+
+    // T29: exact S_BFM_B64 word from Astro's title reduction shader.  It creates VCC with the low
+    // 32 lanes set, then saveexec predicates a write.  The operation repeats independently in each
+    // architectural wave64 even when the Vulkan workgroup contains two waves.
+    const uint32_t codeT29[] = {
+        0x7e0602ffu, 0x40e00000u,            // v_mov_b32 v3, 7.0
+        0x92ea80a0u,                         // exact s_bfm_b64 vcc, 32, 0
+        0xbe80246au,                         // s_and_saveexec_b64 s[0:1], vcc
+        0x7e0602ffu, 0x42280000u,            // v_mov_b32 v3, 42.0 (low 32 lanes)
+        0xbefe0400u,                         // s_mov_b64 exec, s[0:1]
+        0x7e000303u,                         // v_mov_b32 v0, v3
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvT29 = recompile_valu(codeT29, std::size(codeT29), 1, 0);
+    CHECK(!spvT29.empty(), "recompiled T29 (Astro S_BFM_B64 VCC mask) -> SPIR-V");
+    std::vector<float> inT29(128, 0.0f), expT29(128);
+    for (uint32_t i = 0; i < 128; ++i) expT29[i] = (i % 64u) < 32u ? 42.0f : 7.0f;
+    std::vector<float> gotT29 = prosper::test::run_compute(spvT29, inT29, 128, 128);
+    CHECK(gotT29 == expT29,
+          "T29: S_BFM_B64 sets exactly the requested lanes in every wave64");
+
+    // T30: Astro's exact final reduction word narrows EXEC with inline mask 15 (lanes 0..3).
+    const uint32_t codeT30[] = {
+        0x7e0602ffu, 0x40e00000u,            // v_mov_b32 v3, 7.0
+        0xbeea248fu,                         // exact s_and_saveexec_b64 vcc, 15
+        0x7e0602ffu, 0x42280000u,            // v_mov_b32 v3, 42.0
+        0xbefe046au,                         // s_mov_b64 exec, vcc (saved original EXEC)
+        0x7e000303u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spvT30 = recompile_valu(codeT30, std::size(codeT30), 1, 0);
+    CHECK(!spvT30.empty(), "recompiled T30 (Astro inline B64 lane mask 15) -> SPIR-V");
+    std::vector<float> inT30(128, 0.0f), expT30(128);
+    for (uint32_t i = 0; i < 128; ++i) expT30[i] = (i % 64u) < 4u ? 42.0f : 7.0f;
+    std::vector<float> gotT30 = prosper::test::run_compute(spvT30, inT30, 128, 128);
+    CHECK(gotT30 == expT30,
+          "T30: inline B64 mask 15 activates exactly four lanes per wave64");
+
+    // T31: Astro's exact title-PS SDWA controls, reduced only to v0. WORD_1 is sign-extended before
+    // v_cvt_f32_i32, so both positive and negative int16 values must survive the conversion.
+    const uint32_t codeT31[] = {0x7e000af9u, 0x000d0600u, 0xbf810000u};
+    std::vector<uint32_t> spvT31 = recompile_valu(codeT31, std::size(codeT31), 1, 0);
+    CHECK(!spvT31.empty(), "recompiled T31 (Astro v_cvt_f32_i32 SDWA WORD_1+SEXT) -> SPIR-V");
+    const uint32_t rawT31[] = {0x00011234u, 0x7fff0000u, 0x80000000u, 0xfffe1234u,
+                               0x00000000u, 0xffffaaaau, 0x12340000u, 0xfedc0000u};
+    std::vector<float> inT31(std::size(rawT31)), expT31(std::size(rawT31));
+    for (size_t i = 0; i < std::size(rawT31); ++i) {
+        std::memcpy(&inT31[i], &rawT31[i], sizeof(uint32_t));
+        expT31[i] = static_cast<float>(static_cast<int16_t>(rawT31[i] >> 16));
+    }
+    std::vector<float> gotT31 = prosper::test::run_compute(spvT31, inT31, 8, 8);
+    CHECK(gotT31 == expT31,
+          "T31: signed SDWA conversion sign-extends the selected high word exactly");
+
+    // T32: Astro visibility-reduction BUFFER_ATOMIC_UMAX packet. The operation targets byte offset 4,
+    // returns the old u32 in VDATA, and atomically replaces memory with max(old, VDATA).
+    const uint32_t codeT32[] = {
+        0xe0e00004u, 0x80000000u,            // exact buffer_atomic_umax v0, v0, s[0:3], 0 offset:4
+        0x7e000d00u,                         // v_cvt_f32_u32 v0, v0 (returned old value)
+        0xbf810000u,
+    };
+    ShaderResourceTable rtT32;
+    { ShaderResource rb{}; rb.cls = ResourceClass::ConstantBuffer; rb.format = DataFormat::Uint32;
+      rb.num_components = 1; rb.binding = 3; rb.sgpr_base = 0; rtT32.resources.push_back(rb); }
+    std::vector<uint32_t> spvT32 = recompile_valu(codeT32, std::size(codeT32), 1, 0, &rtT32);
+    CHECK(!spvT32.empty(), "recompiled T32 (Astro buffer_atomic_umax) -> SPIR-V");
+    uint32_t forty_two = 42u; float raw_input = 0.0f;
+    std::memcpy(&raw_input, &forty_two, sizeof(forty_two));
+    std::vector<uint32_t> atomic_buf = {0u, 17u}, atomic_out;
+    std::vector<float> gotT32 = prosper::test::run_compute(
+        spvT32, {raw_input}, 1, 1, /*binding2*/{}, /*binding3*/atomic_buf, &atomic_out);
+    printf("  T32 atomic got=%g memory=%u (expect 17/42)\n",
+           gotT32.empty() ? -1.0f : gotT32[0], atomic_out.size() < 2 ? 0u : atomic_out[1]);
+    CHECK(gotT32.size() == 1 && gotT32[0] == 17.0f && atomic_out.size() == 2 && atomic_out[1] == 42u,
+          "T32: buffer_atomic_umax returns old memory and stores the unsigned maximum");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

@@ -4,12 +4,14 @@
 // game gets consistent values instead of uninitialized memory.
 // (Game-controller input — libScePad — moved to hle_pad.cpp with a real host backend.)
 #include "dispatch.hpp"
+#include "hle_json2.hpp"
 #include "nid.hpp"
 #include "callback_fs.hpp"
 #include "platform_ui.hpp"
 #include "video_backend.hpp"   // sceAvPlayer -> host hardware-decode backend (#705)
 #include "../host/posix_shim.hpp"   // Darwin process_vm_readv shim + asm portability
 #include <cinttypes>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -36,6 +38,11 @@
 #endif
 
 namespace prosper {
+
+#ifdef _WIN32
+extern "C" uint64_t prosper_call_guest_sysv4(uint64_t fn, uint64_t a0, uint64_t a1,
+                                               uint64_t a2, uint64_t a3);
+#endif
 
 #define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5)
@@ -135,12 +142,19 @@ struct AvpInitData {                 // sceAvPlayerInit
     AvpMemAllocator memory; AvpFileReplace file; AvpEventReplace event;
     uint32_t debug_level; uint32_t base_priority; int32_t num_fb; uint8_t auto_start; uint8_t rsv[3]; const char* default_language;
 };
+struct AvpThreadInfo {
+    uint32_t priority, stack_size; uint64_t affinity; uint8_t reserved[32];
+};
 struct AvpInitDataEx {               // sceAvPlayerInitEx (note: this_size first)
     uint64_t this_size; AvpMemAllocator memory; AvpFileReplace file; AvpEventReplace event;
-    const char* default_language; uint32_t debug_level;
-    uint32_t a_prio,a_aff,v_prio,v_aff,d_prio,d_aff,c_prio,c_aff,h_prio,h_aff,f_prio,f_aff;
-    int32_t num_fb; uint8_t auto_start; uint8_t rsv[3];
+    const char* default_language; uint32_t debug_level; uint8_t auto_start; uint8_t rsv[3];
+    AvpThreadInfo audio_decoder, video_decoder, demuxer, event_thread, call_queue;
+    AvpThreadInfo http_command_processor, http_segment_manager, http_streamlist, file_streaming;
+    int32_t num_fb; uint8_t rsv2[4];
 };
+static_assert(sizeof(AvpThreadInfo) == 48 && sizeof(AvpInitDataEx) == 560 &&
+              offsetof(AvpInitDataEx, auto_start) == 116 &&
+              offsetof(AvpInitDataEx, num_fb) == 552, "AvPlayerInitDataEx ABI");
 struct AvpUri           { const char* name; uint32_t length; };
 struct AvpSourceDetails { AvpUri uri; uint8_t rsv1[64]; uint32_t source_type; uint8_t rsv2[44]; };
 struct AvpFrameInfo {                // sceAvPlayerGetVideoData / GetAudioData out-param
@@ -148,38 +162,105 @@ struct AvpFrameInfo {                // sceAvPlayerGetVideoData / GetAudioData o
     uint32_t d0, d1, d2, d3;         // AvPlayerStreamDetails union (16B): video={width,height,aspect,lang}
 };
 struct AvpVideoEx {                  // AvPlayerVideoEx (in the 80B details union)
-    uint32_t width, height; float aspect; uint8_t lang[4];
-    uint32_t framerate, crop_l, crop_r, crop_t, crop_b, pitch;
-    uint8_t luma_bd, chroma_bd, full_range, rsv[37];
+    uint32_t width, height; float aspect; uint8_t lang[4]; uint8_t reserved0[4];
+    uint32_t crop_l, crop_r, crop_t, crop_b, pitch;
+    uint8_t luma_bd, chroma_bd, full_range, reserved1[5];
+    double framerate; uint32_t colour_primaries, transfer_characteristics; uint8_t reserved2[16];
 };
+static_assert(sizeof(AvpVideoEx) == 80 && offsetof(AvpVideoEx, pitch) == 36 &&
+              offsetof(AvpVideoEx, framerate) == 48, "AvPlayerVideoEx ABI");
 struct AvpFrameInfoEx {              // sceAvPlayerGetVideoDataEx out-param (larger details union)
     void* p_data; uint8_t reserved[4]; uint64_t timestamp;
     union { AvpVideoEx video; uint8_t raw[80]; } details;
 };
+struct AvpVideo { uint32_t width, height; float aspect; uint8_t lang[4]; };
+struct AvpAudio { uint16_t channels; uint8_t reserved[2]; uint32_t sample_rate, size; uint8_t lang[4]; };
+struct AvpAudioEx {
+    uint16_t channels; uint8_t reserved[2]; uint32_t sample_rate, size; uint8_t lang[4];
+    uint8_t reserved1[64];
+};
+static_assert(sizeof(AvpAudio) == 16 && sizeof(AvpAudioEx) == 80, "AvPlayerAudio ABI");
+struct AvpStreamInfo {
+    uint32_t type; uint8_t reserved[4];
+    union { AvpVideo video; AvpAudio audio; uint8_t raw[16]; } details; uint64_t duration;
+};
+struct AvpStreamInfoEx {
+    uint64_t this_size; uint32_t type; uint8_t reserved[4];
+    union { AvpVideoEx video; AvpAudioEx audio; uint8_t raw[80]; } details; uint64_t duration;
+};
+static_assert(sizeof(AvpStreamInfo) == 32 && offsetof(AvpStreamInfo, duration) == 24,
+              "AvPlayerStreamInfo ABI");
+static_assert(sizeof(AvpStreamInfoEx) == 104 && offsetof(AvpStreamInfoEx, duration) == 96,
+              "AvPlayerStreamInfoEx ABI");
 
 struct AvpPlayer {
     void* ev_obj = nullptr; AvpEventCb ev_cb = nullptr;
-    bool auto_start = false, have_source = false, playing = false, stop_fired = false;
+    bool auto_start = false, have_source = false, playing = false, paused = false, stop_fired = false;
     std::string guest_path;
     int backend_id = -1;             // >=0 when a host backend is decoding
     uint32_t width = 1920, height = 1080;
-    uint64_t poll = 0;               // synthetic-timeline frame counter (headless, no backend)
+    uint64_t poll = 0;               // synthetic frames delivered through GetVideoData[Ex]
+    uint64_t audio_poll = 0;
+    uint64_t active_poll = 0;        // independent progress for IsActive-only playback loops
     std::vector<uint8_t> frame;      // synthetic black NV12 buffer (kept alive across GetVideoData)
+    std::vector<int16_t> audio;      // synthetic silent stereo PCM
 };
 std::mutex g_avp_mx;
 std::unordered_map<uint64_t, AvpPlayer> g_avp;
 
 uint64_t avp_synth_frames() { static uint64_t n = []{ const char* e = getenv("PROSPER_AVP_SYNTH_FRAMES"); return e ? strtoull(e, nullptr, 0) : 120ull; }(); return n; }
+uint64_t avp_synth_duration_ms() {
+    static uint64_t n = [] {
+        const char* e = getenv("PROSPER_AVP_DURATION_MS");
+        return e ? strtoull(e, nullptr, 0) : avp_synth_frames() * 33;
+    }();
+    return n;
+}
+bool avp_log() { static const bool enabled = getenv("PROSPER_AVPLOG") != nullptr; return enabled; }
+
+#if defined(__linux__)
+// Linux import stubs swap the guest %fs to the host TCB before entering an HLE handler.  AvPlayer
+// event callbacks go the other way and are guest code, so they must run with the caller's guest TCB.
+// The entry shims below recover that TCB from the import-stub frame and publish it only for the
+// dynamic extent of the HLE call.  Nested AvPlayer calls from the callback preserve the outer value.
+thread_local uint64_t t_avp_callback_guest_fs = 0;
+struct AvpEntryGuestFsScope {
+    uint64_t previous;
+    explicit AvpEntryGuestFsScope(uint64_t guest_fs)
+        : previous(t_avp_callback_guest_fs) { t_avp_callback_guest_fs = guest_fs; }
+    ~AvpEntryGuestFsScope() { t_avp_callback_guest_fs = previous; }
+};
+struct AvpCallbackGuestFsScope {
+    uint64_t saved = 0;
+    bool active = false;
+    explicit AvpCallbackGuestFsScope(uint64_t guest_fs) {
+        if (guest_fs) {
+            __asm__ volatile("rdfsbase %0" : "=r"(saved));
+            __asm__ volatile("wrfsbase %0" : : "r"(guest_fs));
+            active = true;
+        }
+    }
+    ~AvpCallbackGuestFsScope() {
+        if (active) __asm__ volatile("wrfsbase %0" : : "r"(saved));
+    }
+};
+#endif
 
 // Fire the guest event callback. Caller MUST NOT hold g_avp_mx (the callback re-enters AvPlayer HLE).
 void avp_fire(void* obj, AvpEventCb cb, uint32_t ev) {
     if (!cb) return;
-    if (svclog()) fprintf(stderr, "[avp] -> event 0x%02x\n", ev);
+    if (svclog() || avp_log()) fprintf(stderr, "[avp] -> event 0x%02x\n", ev);
 #if defined(_WIN32)
-    // TODO(#705): Windows host ABI != guest SysV; route through a 4-arg prosper_call_guest_sysv
-    // trampoline. Milestone 1 targets Linux headless; the direct call is correct there.
-#endif
+    prosper_call_guest_sysv4((uint64_t)(uintptr_t)cb, (uint64_t)(uintptr_t)obj, ev, 0, 0);
+#elif defined(__linux__)
+    {
+        AvpCallbackGuestFsScope guest_fs(t_avp_callback_guest_fs);
+        cb(obj, ev, 0, nullptr);
+    }
+#else
     cb(obj, ev, 0, nullptr);
+#endif
+    if (avp_log()) fprintf(stderr, "[avp] <- event 0x%02x\n", ev);
 }
 } // namespace
 
@@ -211,10 +292,11 @@ HLE(s_avplayer_isactive) {   // bool sceAvPlayerIsActive(AvPlayerHandle)
         auto it = g_avp.find(a0); if (it == g_avp.end()) return 0;
         AvpPlayer& p = it->second;
         if (p.playing) {
-            p.poll++;
+            if (p.paused) return 1;
+            p.active_poll++;
             bool still = (p.backend_id >= 0 && prosper::video::backend())
                              ? !prosper::video::backend()->eof(p.backend_id)
-                             : (p.poll < avp_synth_frames());
+                             : (p.active_poll < avp_synth_frames());
             if (still) { active = 1; }
             else if (!p.stop_fired) { p.playing = false; p.stop_fired = true; fire_stop = true; obj = p.ev_obj; cb = p.ev_cb; }
         }
@@ -224,6 +306,52 @@ HLE(s_avplayer_isactive) {   // bool sceAvPlayerIsActive(AvPlayerHandle)
 }
 HLE(s_avp_postinit)   { svc_log("sceAvPlayerPostInit", a0,a1,a2,a3,a4,a5); return 0; }
 HLE(s_avp_setlogcb)   { svc_log("sceAvPlayerSetLogCallback", a0,a1,a2,a3,a4,a5); return 0; }
+HLE(s_avp_streamcount) {   // s32 sceAvPlayerStreamCount(handle)
+    svc_log("sceAvPlayerStreamCount", a0,a1,a2,a3,a4,a5);
+    std::lock_guard<std::mutex> lk(g_avp_mx);
+    auto it = g_avp.find(a0);
+    int count = it != g_avp.end() && it->second.have_source ? 2 : 0;
+    if (avp_log()) fprintf(stderr, "[avp] stream-count handle=0x%llx -> %d\n",
+                           (unsigned long long)a0, count);
+    return count; // MP4-shaped synthetic source: video + audio
+}
+HLE(s_avp_getstreaminfo) { // s32 sceAvPlayerGetStreamInfo(handle, stream_id, out)
+    svc_log("sceAvPlayerGetStreamInfo", a0,a1,a2,a3,a4,a5);
+    auto* out = (AvpStreamInfo*)PW(a2); if (!out || a1 > 1) return 0x806a0001ull;
+    std::lock_guard<std::mutex> lk(g_avp_mx);
+    auto it = g_avp.find(a0); if (it == g_avp.end() || !it->second.have_source) return 0x806a0001ull;
+    const AvpPlayer& p = it->second;
+    *out = {}; out->type = a1 == 0 ? 1u : 2u;
+    if (a1 == 0) {
+        out->details.video.width = p.width; out->details.video.height = p.height;
+        out->details.video.aspect = (float)p.width / (float)p.height;
+    } else {
+        out->details.audio.channels = 2; out->details.audio.sample_rate = 48000;
+        out->details.audio.size = 1024 * 2 * sizeof(int16_t);
+    }
+    out->duration = avp_synth_duration_ms();
+    return 0;
+}
+HLE(s_avp_getstreaminfoex) { // s32 sceAvPlayerGetStreamInfoEx(handle, stream_id, out)
+    svc_log("sceAvPlayerGetStreamInfoEx", a0,a1,a2,a3,a4,a5);
+    auto* out = (AvpStreamInfoEx*)PW(a2); if (!out || a1 > 1) return 0x806a0001ull;
+    std::lock_guard<std::mutex> lk(g_avp_mx);
+    auto it = g_avp.find(a0); if (it == g_avp.end() || !it->second.have_source) return 0x806a0001ull;
+    const AvpPlayer& p = it->second; const uint64_t caller_size = out->this_size;
+    *out = {}; out->this_size = caller_size; out->type = a1 == 0 ? 1u : 2u;
+    if (a1 == 0) {
+        out->details.video.width = p.width; out->details.video.height = p.height;
+        out->details.video.aspect = (float)p.width / (float)p.height; out->details.video.pitch = p.width;
+        out->details.video.luma_bd = 8; out->details.video.chroma_bd = 8;
+        out->details.video.framerate = 30.0;
+    } else {
+        out->details.audio.channels = 2; out->details.audio.sample_rate = 48000;
+        out->details.audio.size = 1024 * 2 * sizeof(int16_t);
+    }
+    out->duration = avp_synth_duration_ms();
+    return 0;
+}
+HLE(s_avp_stream_ok) { svc_log("sceAvPlayerStreamControl", a0,a1,a2,a3,a4,a5); return 0; }
 // Begin a source: resolve/open it, fire READY, and (auto_start) begin playback with PLAY.
 static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
     void* obj = nullptr; AvpEventCb cb = nullptr; bool ready = false, play = false;
@@ -233,12 +361,15 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
         AvpPlayer& p = it->second;
         if (guest_path) p.guest_path = guest_path;
         p.have_source = true;
+        p.poll = 0; p.audio_poll = 0; p.active_poll = 0; p.paused = false; p.stop_fired = false;
         if (auto* b = prosper::video::backend()) p.backend_id = b->open(p.guest_path);  // TODO(#705): guest->host path resolve for real backend
         obj = p.ev_obj; cb = p.ev_cb; ready = true;
         if (p.auto_start) { p.playing = true; play = true; }
     }
     if (ready) avp_fire(obj, cb, AVP_READY);
     if (play)  avp_fire(obj, cb, AVP_PLAY);
+    if (avp_log()) fprintf(stderr, "[avp] add source handle=0x%llx path=%s auto_start=%d\n",
+                           (unsigned long long)handle, guest_path ? guest_path : "", (int)play);
     return 0;
 }
 HLE(s_avp_addsource)   {   // s32 sceAvPlayerAddSource(handle, const char* filename)
@@ -258,64 +389,144 @@ HLE(s_avp_start) {   // s32 sceAvPlayerStart(handle) — used when auto_start is
         std::lock_guard<std::mutex> lk(g_avp_mx);
         auto it = g_avp.find(a0); if (it == g_avp.end()) return 0x80000000ull;
         AvpPlayer& p = it->second;
-        if (p.have_source && !p.playing && !p.stop_fired) { p.playing = true; play = true; obj = p.ev_obj; cb = p.ev_cb; }
+        if (p.have_source && !p.playing && !p.stop_fired) {
+            p.playing = true; p.paused = false; play = true; obj = p.ev_obj; cb = p.ev_cb;
+        }
     }
     if (play) avp_fire(obj, cb, AVP_PLAY);
+    return 0;
+}
+HLE(s_avp_pause) {   // s32 sceAvPlayerPause(handle)
+    svc_log("sceAvPlayerPause", a0,a1,a2,a3,a4,a5);
+    void* obj = nullptr; AvpEventCb cb = nullptr; bool notify = false;
+    {
+        std::lock_guard<std::mutex> lk(g_avp_mx);
+        auto it = g_avp.find(a0); if (it == g_avp.end()) return 0x806a0001ull;
+        if (it->second.playing && !it->second.paused) {
+            it->second.paused = true;
+            obj = it->second.ev_obj; cb = it->second.ev_cb; notify = true;
+        }
+    }
+    if (notify) avp_fire(obj, cb, AVP_PAUSE);
+    return 0;
+}
+HLE(s_avp_resume) {   // s32 sceAvPlayerResume(handle)
+    svc_log("sceAvPlayerResume", a0,a1,a2,a3,a4,a5);
+    void* obj = nullptr; AvpEventCb cb = nullptr; bool notify = false;
+    {
+        std::lock_guard<std::mutex> lk(g_avp_mx);
+        auto it = g_avp.find(a0); if (it == g_avp.end()) return 0x806a0001ull;
+        if (it->second.playing && it->second.paused) {
+            it->second.paused = false;
+            obj = it->second.ev_obj; cb = it->second.ev_cb; notify = true;
+        }
+    }
+    if (notify) avp_fire(obj, cb, AVP_PLAY);
     return 0;
 }
 // bool sceAvPlayerGetVideoData(handle, AvPlayerFrameInfo*) — deliver the next decoded frame (NV12).
 HLE(s_avp_getvideodata) {
     svc_log("sceAvPlayerGetVideoData", a0,a1,a2,a3,a4,a5);
     auto* fi = (AvpFrameInfo*)PW(a1); if (!fi) return 0;
-    std::lock_guard<std::mutex> lk(g_avp_mx);
-    auto it = g_avp.find(a0); if (it == g_avp.end() || !it->second.playing) return 0;
-    AvpPlayer& p = it->second;
-    if (auto* b = prosper::video::backend(); b && p.backend_id >= 0) {
-        prosper::video::VideoFrame vf;
-        if (!b->next_video(p.backend_id, vf)) return 0;
-        fi->p_data = const_cast<uint8_t*>(vf.y); fi->timestamp = vf.pts_us * 1000;
-        fi->d0 = vf.width; fi->d1 = vf.height; fi->d2 = 0; fi->d3 = 0;
-        return 1;
+    void* obj = nullptr; AvpEventCb cb = nullptr; bool fire_stop = false; uint64_t result = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_avp_mx);
+        auto it = g_avp.find(a0);
+        if (it == g_avp.end() || !it->second.playing || it->second.paused) return 0;
+        AvpPlayer& p = it->second;
+        if (auto* b = prosper::video::backend(); b && p.backend_id >= 0) {
+            prosper::video::VideoFrame vf;
+            if (b->next_video(p.backend_id, vf)) {
+                fi->p_data = const_cast<uint8_t*>(vf.y); fi->timestamp = vf.pts_us / 1000;
+                fi->d0 = vf.width; fi->d1 = vf.height; fi->d2 = 0; fi->d3 = 0;
+                result = 1;
+            } else if (b->eof(p.backend_id) && !p.stop_fired) {
+                p.playing = false; p.stop_fired = true; fire_stop = true; obj = p.ev_obj; cb = p.ev_cb;
+            }
+        } else if (p.poll < avp_synth_frames()) {
+            // Synthetic (headless): a black NV12 frame at the default dimensions.  Advance on
+            // frame delivery: Astro Bot never polls IsActive, so an IsActive-only counter made EOF
+            // and the STOP event unreachable even though it continuously pulled video frames.
+            size_t need = (size_t)p.width * p.height * 3 / 2;
+            if (p.frame.size() != need) p.frame.assign(need, 0);
+            fi->p_data = p.frame.data(); fi->timestamp = p.poll * 33ull; // ~30fps PTS (ms)
+            fi->d0 = p.width; fi->d1 = p.height; fi->d2 = 0; fi->d3 = 0;
+            p.poll++; result = 1;
+        } else if (!p.stop_fired) {
+            p.playing = false; p.stop_fired = true; fire_stop = true; obj = p.ev_obj; cb = p.ev_cb;
+        }
     }
-    // Synthetic (headless): a black NV12 frame at the default dimensions.
-    size_t need = (size_t)p.width * p.height * 3 / 2;
-    if (p.frame.size() != need) p.frame.assign(need, 0);
-    fi->p_data = p.frame.data(); fi->timestamp = p.poll * 33'000'000ull;   // ~30fps pts (ns)
-    fi->d0 = p.width; fi->d1 = p.height; fi->d2 = 0; fi->d3 = 0;
-    return 1;
+    if (fire_stop) avp_fire(obj, cb, AVP_STOP);
+    if (avp_log()) fprintf(stderr, "[avp] video handle=0x%llx result=%llu stop=%d\n",
+                           (unsigned long long)a0, (unsigned long long)result, (int)fire_stop);
+    return result;
 }
 // bool sceAvPlayerGetVideoDataEx(handle, AvPlayerFrameInfoEx*) — the game uses this Ex variant.
 HLE(s_avp_getvideodataex) {
     svc_log("sceAvPlayerGetVideoDataEx", a0,a1,a2,a3,a4,a5);
     auto* fi = (AvpFrameInfoEx*)PW(a1); if (!fi) return 0;
-    std::lock_guard<std::mutex> lk(g_avp_mx);
-    auto it = g_avp.find(a0); if (it == g_avp.end() || !it->second.playing) return 0;
-    AvpPlayer& p = it->second;
-    if (auto* b = prosper::video::backend(); b && p.backend_id >= 0) {
-        prosper::video::VideoFrame vf;
-        if (!b->next_video(p.backend_id, vf)) return 0;
-        fi->p_data = const_cast<uint8_t*>(vf.y); fi->timestamp = vf.pts_us * 1000;
-        fi->details.video = {}; fi->details.video.width = vf.width; fi->details.video.height = vf.height;
-        fi->details.video.pitch = vf.y_stride ? vf.y_stride : vf.width; fi->details.video.framerate = 30;
-        return 1;
+    void* obj = nullptr; AvpEventCb cb = nullptr; bool fire_stop = false; uint64_t result = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_avp_mx);
+        auto it = g_avp.find(a0);
+        if (it == g_avp.end() || !it->second.playing || it->second.paused) return 0;
+        AvpPlayer& p = it->second;
+        if (auto* b = prosper::video::backend(); b && p.backend_id >= 0) {
+            prosper::video::VideoFrame vf;
+            if (b->next_video(p.backend_id, vf)) {
+                fi->p_data = const_cast<uint8_t*>(vf.y); fi->timestamp = vf.pts_us / 1000;
+                fi->details.video = {}; fi->details.video.width = vf.width; fi->details.video.height = vf.height;
+                fi->details.video.aspect = vf.height ? (float)vf.width / (float)vf.height : 0.0f;
+                fi->details.video.pitch = vf.y_stride ? vf.y_stride : vf.width;
+                fi->details.video.luma_bd = 8; fi->details.video.chroma_bd = 8;
+                fi->details.video.framerate = 30.0;
+                result = 1;
+            } else if (b->eof(p.backend_id) && !p.stop_fired) {
+                p.playing = false; p.stop_fired = true; fire_stop = true; obj = p.ev_obj; cb = p.ev_cb;
+            }
+        } else if (p.poll < avp_synth_frames()) {
+            size_t need = (size_t)p.width * p.height * 3 / 2;        // synthetic black NV12
+            if (p.frame.size() != need) p.frame.assign(need, 0);
+            fi->p_data = p.frame.data(); fi->timestamp = p.poll * 33ull;
+            fi->details.video = {}; fi->details.video.width = p.width; fi->details.video.height = p.height;
+            fi->details.video.aspect = (float)p.width / (float)p.height; fi->details.video.pitch = p.width;
+            fi->details.video.luma_bd = 8; fi->details.video.chroma_bd = 8;
+            fi->details.video.framerate = 30.0;
+            p.poll++; result = 1;
+        } else if (!p.stop_fired) {
+            p.playing = false; p.stop_fired = true; fire_stop = true; obj = p.ev_obj; cb = p.ev_cb;
+        }
     }
-    size_t need = (size_t)p.width * p.height * 3 / 2;        // synthetic black NV12
-    if (p.frame.size() != need) p.frame.assign(need, 0);
-    fi->p_data = p.frame.data(); fi->timestamp = p.poll * 33'000'000ull;
-    fi->details.video = {}; fi->details.video.width = p.width; fi->details.video.height = p.height;
-    fi->details.video.pitch = p.width; fi->details.video.framerate = 30;
-    return 1;
+    if (fire_stop) avp_fire(obj, cb, AVP_STOP);
+    if (avp_log()) fprintf(stderr, "[avp] video-ex handle=0x%llx result=%llu stop=%d\n",
+                           (unsigned long long)a0, (unsigned long long)result, (int)fire_stop);
+    return result;
 }
 HLE(s_avp_getaudiodata)   {   // bool sceAvPlayerGetAudioData(handle, AvPlayerFrameInfo*)
     svc_log("sceAvPlayerGetAudioData", a0,a1,a2,a3,a4,a5);
     auto* b = prosper::video::backend();
-    if (!b) return 0;   // synthetic: no audio frames (silent intro); playback still ends via IsActive
     std::lock_guard<std::mutex> lk(g_avp_mx);
-    auto it = g_avp.find(a0); if (it == g_avp.end() || it->second.backend_id < 0 || !it->second.playing) return 0;
+    auto it = g_avp.find(a0);
+    if (it == g_avp.end() || !it->second.playing || it->second.paused) return 0;
     auto* fi = (AvpFrameInfo*)PW(a1); if (!fi) return 0;
-    prosper::video::AudioFrame af;
-    if (!b->next_audio(it->second.backend_id, af)) return 0;
-    fi->p_data = (uint8_t*)const_cast<int16_t*>(af.pcm); fi->timestamp = af.pts_us * 1000; return 1;
+    AvpPlayer& p = it->second;
+    if (b && p.backend_id >= 0) {
+        prosper::video::AudioFrame af;
+        if (!b->next_audio(p.backend_id, af)) return 0;
+        fi->p_data = (uint8_t*)const_cast<int16_t*>(af.pcm); fi->timestamp = af.pts_us / 1000;
+        return 1;
+    }
+    if (p.audio_poll >= avp_synth_frames()) return 0;
+    constexpr uint32_t samples = 1024, channels = 2;
+    if (p.audio.size() != samples * channels) p.audio.assign(samples * channels, 0);
+    fi->p_data = (uint8_t*)p.audio.data();
+    fi->timestamp = p.audio_poll * 21ull; // 1024/48 kHz, milliseconds
+    AvpAudio details{2, {}, 48000, samples * channels * sizeof(int16_t), {}};
+    memcpy(&fi->d0, &details, sizeof(details));
+    p.audio_poll++;
+    if (avp_log()) fprintf(stderr, "[avp] audio handle=0x%llx result=1 poll=%llu\n",
+                           (unsigned long long)a0, (unsigned long long)p.audio_poll);
+    return 1;
 }
 HLE(s_avp_stop) {   // s32 sceAvPlayerStop(handle)
     svc_log("sceAvPlayerStop", a0,a1,a2,a3,a4,a5);
@@ -324,7 +535,10 @@ HLE(s_avp_stop) {   // s32 sceAvPlayerStop(handle)
         std::lock_guard<std::mutex> lk(g_avp_mx);
         auto it = g_avp.find(a0); if (it == g_avp.end()) return 0;
         AvpPlayer& p = it->second;
-        if (p.playing && !p.stop_fired) { p.playing = false; p.stop_fired = true; fire_stop = true; obj = p.ev_obj; cb = p.ev_cb; }
+        if (p.playing && !p.stop_fired) {
+            p.playing = false; p.paused = false; p.stop_fired = true;
+            fire_stop = true; obj = p.ev_obj; cb = p.ev_cb;
+        }
     }
     if (fire_stop) avp_fire(obj, cb, AVP_STOP);
     return 0;
@@ -339,6 +553,48 @@ HLE(s_avp_close) {   // s32 sceAvPlayerClose(handle)
     }
     return 0;
 }
+
+#ifndef _WIN32
+// Pass the HLE-entry stack pointer to callback-producing AvPlayer handlers.  On Linux it identifies
+// the guest TCB saved by the import stub; on macOS callback_guest_fs_from_entry_stack() fails closed
+// to zero because guest TLS uses trap emulation rather than a hardware %fs switch.
+#define AVP_CALLBACK_ENTRY(entry, target, handler) \
+    extern "C" uint64_t target(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t); \
+    PROSPER_ASM_TRAMPOLINE(entry, target) \
+    extern "C" void entry(); \
+    extern "C" uint64_t target(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, \
+                                uint64_t a4, uint64_t a5, uint64_t entry_rsp) { \
+        const uint64_t guest_fs = callback_guest_fs_from_entry_stack(entry_rsp); \
+        if (avp_log() && guest_fs) { \
+            const uint64_t guest_ra = *(const uint64_t*)(uintptr_t)(entry_rsp + 0x30); \
+            fprintf(stderr, "[avp] call %s guest_ra=0x%llx guest_fs=1\n", #handler, \
+                    (unsigned long long)guest_ra); \
+        } \
+        (void)guest_fs; \
+        /* Only Linux swaps hardware %fs at the import boundary. */ \
+        PROSPER_AVP_ENTRY_SCOPE(guest_fs) \
+        return handler(a0, a1, a2, a3, a4, a5); \
+    }
+
+#if defined(__linux__)
+#define PROSPER_AVP_ENTRY_SCOPE(guest_fs) AvpEntryGuestFsScope avp_entry_guest_fs_scope(guest_fs);
+#else
+#define PROSPER_AVP_ENTRY_SCOPE(guest_fs)
+#endif
+
+AVP_CALLBACK_ENTRY(s_avp_addsource_entry, s_avp_addsource_entry_c, s_avp_addsource)
+AVP_CALLBACK_ENTRY(s_avp_addsourceex_entry, s_avp_addsourceex_entry_c, s_avp_addsourceex)
+AVP_CALLBACK_ENTRY(s_avp_start_entry, s_avp_start_entry_c, s_avp_start)
+AVP_CALLBACK_ENTRY(s_avplayer_isactive_entry, s_avplayer_isactive_entry_c, s_avplayer_isactive)
+AVP_CALLBACK_ENTRY(s_avp_getvideodata_entry, s_avp_getvideodata_entry_c, s_avp_getvideodata)
+AVP_CALLBACK_ENTRY(s_avp_getvideodataex_entry, s_avp_getvideodataex_entry_c, s_avp_getvideodataex)
+AVP_CALLBACK_ENTRY(s_avp_stop_entry, s_avp_stop_entry_c, s_avp_stop)
+AVP_CALLBACK_ENTRY(s_avp_pause_entry, s_avp_pause_entry_c, s_avp_pause)
+AVP_CALLBACK_ENTRY(s_avp_resume_entry, s_avp_resume_entry_c, s_avp_resume)
+
+#undef PROSPER_AVP_ENTRY_SCOPE
+#undef AVP_CALLBACK_ENTRY
+#endif
 // sceUserServiceGetGamePresets(userId, presets): MUST return success (0). The Unity engine's
 // per-controller connection check (eboot 0x14707e0, reached from the pad "reset" path 0x1470ca0)
 // calls this and treats ANY non-zero user-service return as "controller invalid" — it then clears the
@@ -1305,6 +1561,7 @@ HLE(s_syss_noticeskip) {
 }
 
 void register_service_hle() {
+    register_json2_hle();
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
 #ifndef _WIN32
     // NetCtl offline-console state delivery — default ON since #306 (see block comment above).
@@ -1427,15 +1684,46 @@ void register_service_hle() {
     R("sceAvPlayerInitEx",         s_avplayer_initex);
     R("sceAvPlayerPostInit",       s_avp_postinit);
     R("sceAvPlayerSetLogCallback", s_avp_setlogcb);
+#ifdef _WIN32
     R("sceAvPlayerAddSource",      s_avp_addsource);
     R("sceAvPlayerAddSourceEx",    s_avp_addsourceex);
     R("sceAvPlayerStart",          s_avp_start);
     R("sceAvPlayerIsActive",       s_avplayer_isactive);
     R("sceAvPlayerGetVideoData",   s_avp_getvideodata);
     R("sceAvPlayerGetVideoDataEx", s_avp_getvideodataex);
+#else
+    R("sceAvPlayerAddSource",      s_avp_addsource_entry);
+    R("sceAvPlayerAddSourceEx",    s_avp_addsourceex_entry);
+    R("sceAvPlayerStart",          s_avp_start_entry);
+    R("sceAvPlayerIsActive",       s_avplayer_isactive_entry);
+    R("sceAvPlayerGetVideoData",   s_avp_getvideodata_entry);
+    R("sceAvPlayerGetVideoDataEx", s_avp_getvideodataex_entry);
+#endif
     R("sceAvPlayerGetAudioData",   s_avp_getaudiodata);
+#ifdef _WIN32
     R("sceAvPlayerStop",           s_avp_stop);
+#else
+    R("sceAvPlayerStop",           s_avp_stop_entry);
+#endif
     R("sceAvPlayerClose",          s_avp_close);
+    // PS5 raw NIDs verified against the 3.20 import stubs. Astro Bot enumerates streams before it
+    // consumes GetVideoDataEx; returning the generic unresolved-import zero meant "no streams" and
+    // left its logo movie state machine permanently resident even after synthetic EOF.
+    Hle::register_fn("hdTyRzCXQeQ", (HleFn)s_avp_streamcount,   "sceAvPlayerStreamCount");
+    Hle::register_fn("d8FcbzfAdQw", (HleFn)s_avp_getstreaminfo, "sceAvPlayerGetStreamInfo");
+    Hle::register_fn("ctTAcF5DiKQ", (HleFn)s_avp_getstreaminfoex, "sceAvPlayerGetStreamInfoEx");
+    Hle::register_fn("ODJK2sn9w4A", (HleFn)s_avp_stream_ok, "sceAvPlayerEnableStream");
+    Hle::register_fn("BOVKAzRmuTQ", (HleFn)s_avp_stream_ok, "sceAvPlayerDisableStream");
+    Hle::register_fn("buMCiJftcfw", (HleFn)s_avp_stream_ok, "sceAvPlayerChangeStream");
+#ifdef _WIN32
+    Hle::register_fn("9y5v+fGN4Wk", (HleFn)s_avp_pause, "sceAvPlayerPause");
+    Hle::register_fn("w5moABNwnRY", (HleFn)s_avp_resume, "sceAvPlayerResume");
+#else
+    Hle::register_fn("9y5v+fGN4Wk", (HleFn)s_avp_pause_entry, "sceAvPlayerPause");
+    Hle::register_fn("w5moABNwnRY", (HleFn)s_avp_resume_entry, "sceAvPlayerResume");
+#endif
+    Hle::register_fn("k-q+xOxdc3E", (HleFn)s_avp_stream_ok, "sceAvPlayerSetAvSyncMode");
+    Hle::register_fn("OVths0xGfho", (HleFn)s_avp_stream_ok, "sceAvPlayerSetLooping");
     R("sceSystemServiceGetStatus", s_syss_getstatus);
     R("sceSystemServiceReceiveEvent", s_sysservice_receiveevent);   // NO_EVENT, don't leave the struct garbage
     // sceSystemServiceGetDisplaySafeAreaInfo (1n37q1Bvc5Y) — fill ratio=1.0 (see s_syss_safearea).

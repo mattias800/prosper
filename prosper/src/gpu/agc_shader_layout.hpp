@@ -124,6 +124,7 @@ DecodedBufferDescriptor decode_buffer_descriptor(const uint32_t v[4]);
 struct DecodedImageDescriptor {
     uint64_t base = 0;
     uint32_t width = 0, height = 0, depth = 1;
+    uint32_t base_array = 0;
     uint32_t format = 0;      // Gen5 surface-format enum (fields[1] bits 20..28)
     uint32_t tile_mode = 0;   // 0 = linear
     uint8_t  base_level = 0;  // WORD3[15:12]
@@ -172,6 +173,11 @@ struct DecodedImageView {
     uint64_t base = 0;
     uint32_t width = 0, height = 0;
     size_t mip_offset = 0;
+    // Packed-tail views keep `base` at the allocation's first shared macroblock. mip_offset is the
+    // byte origin inside that block and must be applied by the tail-aware detile/writeback helpers.
+    bool in_mip_tail = false;
+    uint32_t mip_tail_bytes = 0;
+    uint32_t mip_tail_x = 0, mip_tail_y = 0;
     // False when BASE_LEVEL selects a mip whose layout this helper cannot prove. Callers must reject
     // the binding instead of silently sampling the allocation's base level with the wrong dimensions.
     bool supported = true;

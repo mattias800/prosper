@@ -144,6 +144,21 @@ int main() {
     CHECK(f11_to_float(0x7BF) == 65024.0f, "f11 0x7BF = max finite (65024)");
     { float inf = f11_to_float(0x7C0); CHECK(inf > 3.4e38f && inf == inf * 2, "f11 0x7C0 = +inf"); }
     { float nan = f10_to_float(0x3E1); CHECK(nan != nan, "f10 0x3E1 = NaN"); }
+    CHECK(float_to_f11(1.0f) == 0x3C0 && float_to_f10(1.0f) == 0x1E0,
+          "1.0 packs to the exact f11/f10 exponent fields");
+    CHECK(float_to_f11(-1.0f) == 0 && float_to_f10(-0.5f) == 0,
+          "negative unsigned-small-float values clamp to zero");
+    CHECK(float_to_f11(1.0078125f) == 0x3C0 && float_to_f11(1.0234375f) == 0x3C2,
+          "f11 halfway cases round to an even mantissa");
+    CHECK(float_to_f11(65024.0f) == 0x7BF && float_to_f10(64512.0f) == 0x3DF,
+          "maximum finite f11/f10 values pack without overflowing");
+    uint32_t bad_small_float_roundtrip = 0;
+    for (uint16_t v = 0; v <= 0x7BF; ++v)
+        if (float_to_f11(f11_to_float(v)) != v) ++bad_small_float_roundtrip;
+    for (uint16_t v = 0; v <= 0x3DF; ++v)
+        if (float_to_f10(f10_to_float(v)) != v) ++bad_small_float_roundtrip;
+    CHECK(bad_small_float_roundtrip == 0,
+          "every finite f11/f10 code survives unpack then repack exactly");
     CHECK(data_format_bytes(DataFormat::Float10_11_11) == 0,
           "Float10_11_11 is packed: per-component bytes = 0 (texel size lives in bytes_per_block)");
     CHECK(data_format_bytes(DataFormat::Unorm2_10_10_10) == 0,

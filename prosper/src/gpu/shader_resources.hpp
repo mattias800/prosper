@@ -69,6 +69,8 @@ uint16_t float_to_half(float f);
 // widening (subnormals scale identically, inf/NaN preserved). Pure + testable.
 float f11_to_float(uint16_t v);   // low 11 bits used
 float f10_to_float(uint16_t v);   // low 10 bits used
+uint16_t float_to_f11(float f);   // negative clamps to zero; round-to-nearest-even
+uint16_t float_to_f10(float f);   // negative clamps to zero; round-to-nearest-even
 
 // GFX10_FORMAT_2_10_10_10_UNORM packed texel -> RGBA8, with nearest UNORM scaling. Pure + testable.
 void unorm2_10_10_10_to_rgba8(uint32_t packed, uint8_t rgba[4]);
@@ -126,6 +128,13 @@ struct ShaderResource {
     uint32_t      height            = 0;
     uint32_t      depth             = 1;
     uint32_t      tile_mode         = 0;                  // T# GFX10 TileMode; drives auto-detile of a sampled surface
+    // A packed mip-tail view shares the allocation's first 4/64 KiB block. gpu_addr remains the
+    // shared block base; the backend applies mip_tail_offset and preserves sibling levels on writes.
+    bool          in_mip_tail       = false;
+    uint32_t      mip_tail_offset   = 0;
+    uint32_t      mip_tail_bytes    = 0;
+    uint32_t      mip_tail_x        = 0;
+    uint32_t      mip_tail_y        = 0;
     bool          srgb              = false;              // T# is a gamma-encoded (sRGB) surface — sample with sRGB->linear (#263)
     uint32_t      sampler_sgpr_base = 0xFFFFFFFFu;
 
@@ -162,6 +171,7 @@ struct ShaderResource {
     float         lod_bias          = 0.0f;
     uint32_t      max_aniso_ratio   = 0;
     uint32_t      depth_compare_func = 0;
+    bool          depth_compare      = false;  // MIMG IMAGE_SAMPLE_C* use
     uint32_t      unnormalized      = 0;
 
     // T# DST_SEL channel swizzle (SQ_SEL enum per channel: 0=0,1=1,4=R,5=G,6=B,7=A). Applied as a Vulkan
