@@ -720,6 +720,7 @@ StageTablePhaseStats stage_table_phase_stats() {
 namespace {
 
 struct GuestReadableCacheState {
+    bool enabled = getenv("PROSPER_NO_GUEST_READ_CACHE") == nullptr;
     bool active = false;
     host::GuestReadableRangeCache persistent_ranges;
     host::GuestReadableRangeCache submit_ranges;
@@ -728,6 +729,7 @@ struct GuestReadableCacheState {
 thread_local GuestReadableCacheState g_guest_readable_cache;
 
 bool guest_range_cache_hit(uint64_t begin, uint64_t end) {
+    if (!g_guest_readable_cache.enabled) return false;
     if (g_guest_readable_cache.active) ++g_guest_readable_cache.calls;
 
     // Completion-label writes are folded on the guest draw thread before/after a renderer submit
@@ -753,7 +755,7 @@ bool guest_range_cache_hit(uint64_t begin, uint64_t end) {
 
 void cache_guest_readable_range(uint64_t begin, uint64_t end,
                                 uint64_t query_begin, uint64_t query_end) {
-    if (!g_guest_readable_cache.active || begin >= end) return;
+    if (!g_guest_readable_cache.enabled || !g_guest_readable_cache.active || begin >= end) return;
     g_guest_readable_cache.submit_ranges.insert(begin, end);
     host::GuestReadableRange mapping{};
     if (host::guest_readable_mapping_containing(query_begin, query_end, mapping))
@@ -762,7 +764,7 @@ void cache_guest_readable_range(uint64_t begin, uint64_t end,
 
 struct GuestReadableSubmitScope {
     GuestReadableSubmitScope() {
-        g_guest_readable_cache.active = getenv("PROSPER_NO_GUEST_READ_CACHE") == nullptr;
+        g_guest_readable_cache.active = g_guest_readable_cache.enabled;
         g_guest_readable_cache.calls = 0;
         g_guest_readable_cache.hits = 0;
         g_guest_readable_cache.os_probes = 0;

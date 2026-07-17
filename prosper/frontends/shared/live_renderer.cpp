@@ -226,7 +226,10 @@ struct PersistentDecodedTexture {
 
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
     static RttCache g_rtt;   // render-to-texture cache (#167)
-    register_live_compute();
+    // Match boot_trace's progression-diagnostic contract: callers may register the graphics
+    // renderer while deliberately leaving compute unregistered. This keeps semantic dispatches
+    // visible without letting screenshot/prosper-app registration silently undo the A/B.
+    if (!getenv("PROSPER_NO_COMPUTE")) register_live_compute();
     const char* ds_invalidate = getenv("PROSPER_DS_GUEST_WRITE_INVALIDATE");
     const bool invalidate_ds = !ds_invalidate || strcmp(ds_invalidate, "0");
     prosper::gpu::set_guest_gpu_write_observer(

@@ -368,6 +368,12 @@ HLE(s_avp_stream_ok) { svc_log("sceAvPlayerStreamControl", a0,a1,a2,a3,a4,a5); r
 static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
     if (!guest_path || !*guest_path) return 0x806a0001ull;
 
+    if (avp_log()) {
+        fprintf(stderr, "[avp] add source request handle=0x%llx guest='%s'\n",
+                (unsigned long long)handle, guest_path);
+        fflush(stderr);
+    }
+
     prosper::video::VideoBackend* old_backend = nullptr;
     int old_backend_id = -1;
     {
@@ -383,6 +389,11 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
 
     const std::string host_path = resolve_guest_path(guest_path);
     auto* selected_backend = prosper::video::backend();
+    if (avp_log()) {
+        fprintf(stderr, "[avp] opening source host='%s' backend=%d\n",
+                host_path.c_str(), selected_backend != nullptr);
+        fflush(stderr);
+    }
     prosper::video::StreamInfo stream{};
     int backend_id = selected_backend ? selected_backend->open(host_path) : -1;
     if (backend_id >= 0 && !selected_backend->info(backend_id, stream)) {
@@ -639,8 +650,11 @@ HLE(s_avp_close) {   // s32 sceAvPlayerClose(handle)
         const uint64_t guest_fs = callback_guest_fs_from_entry_stack(entry_rsp); \
         if (avp_log() && guest_fs) { \
             const uint64_t guest_ra = *(const uint64_t*)(uintptr_t)(entry_rsp + 0x30); \
-            fprintf(stderr, "[avp] call %s guest_ra=0x%llx guest_fs=1\n", #handler, \
-                    (unsigned long long)guest_ra); \
+            /* The title-facing AvPlayer adapters use a frame pointer plus two saved registers; */ \
+            /* retain their caller as a diagnostic without changing normal logging or behavior. */ \
+            const uint64_t guest_caller = *(const uint64_t*)(uintptr_t)(entry_rsp + 0x50); \
+            fprintf(stderr, "[avp] call %s guest_ra=0x%llx guest_caller=0x%llx guest_fs=1\n", \
+                    #handler, (unsigned long long)guest_ra, (unsigned long long)guest_caller); \
         } \
         (void)guest_fs; \
         /* Only Linux swaps hardware %fs at the import boundary. */ \

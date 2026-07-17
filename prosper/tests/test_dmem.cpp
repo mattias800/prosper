@@ -29,6 +29,10 @@ static int fails = 0;
 static constexpr uint64_t kBase  = 0x10000000ull;
 static constexpr uint64_t kTotal = 16ull * 1024 * 1024 * 1024;
 static constexpr uint64_t kEnd   = kBase + kTotal;
+#ifdef _WIN32
+static constexpr uint64_t kGuestAutoVaMin = 0x2000000000ull;
+static constexpr uint64_t kGuestAutoVaMax = 0xfbffffffffull;
+#endif
 
 int main() {
     printf("== test_dmem ==\n");
@@ -68,6 +72,10 @@ int main() {
           "allocate one 64 KiB direct-memory page");
     CHECK(map((uint64_t)(uintptr_t)&va1, dlen, 0x2, 0, phys, dlen) == 0 && va1,
           "map first direct-memory view");
+#ifdef _WIN32
+    CHECK(va1 >= kGuestAutoVaMin && va1 <= kGuestAutoVaMax - dlen + 1,
+          "automatic direct view lands in PS5 libc's valid low VA aperture");
+#endif
     CHECK(map((uint64_t)(uintptr_t)&va2, dlen, 0x2, 0, phys, dlen) == 0 && va2 && va2 != va1,
           "map second direct-memory view");
     if (va1 && va2) {

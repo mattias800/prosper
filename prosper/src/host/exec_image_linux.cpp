@@ -1212,6 +1212,7 @@ namespace {
                 else if (!strcmp(r,"rdx")) base = (uint64_t)gr[REG_RDX];
                 else if (!strcmp(r,"rdi")) base = rdi;
                 else if (!strcmp(r,"rsi")) base = rsi;
+                else if (!strcmp(r,"r12")) base = (uint64_t)gr[REG_R12];
                 else if (!strcmp(r,"r14")) base = r14;
                 else if (!strcmp(r,"r15")) base = r15;
                 else if (!strcmp(r,"rbp")) base = (uint64_t)gr[REG_RBP];
@@ -1930,16 +1931,16 @@ void install_trap_handler() {
         }
         ensure_probe_pipe();   // DUMPAT uses probe_readable(); the readability probe now backs on a pipe (master #61)
     }
-    // PROSPER_BP=0xOFFSET installs an int3 code-breakpoint-logger at guest VA 0x400000000+offset.
+    // PROSPER_BP=0xOFFSET installs an int3 code-breakpoint logger relative to the mapped eboot.
     if (const char* bp = getenv("PROSPER_BP")) {
-        g_bp_addr = 0x400000000ull + strtoull(bp, nullptr, 0);
+        g_bp_addr = g_base + strtoull(bp, nullptr, 0);
         if (const char* m = getenv("PROSPER_BP_MAX")) g_bp_max = (int)strtoul(m, nullptr, 0);
         ensure_probe_pipe();
         g_bp_on = true;   // the actual 0xCC is written after the image is mapped (arm_bp below)
     }
-    // PROSPER_HWBP=0xOFFSET installs a race-free hardware execute breakpoint at guest VA 0x400000000+off.
+    // PROSPER_HWBP=0xOFFSET installs a race-free hardware execute breakpoint relative to the eboot.
     if (const char* hb = getenv("PROSPER_HWBP")) {
-        g_hwbp_addr = 0x400000000ull + strtoull(hb, nullptr, 0);
+        g_hwbp_addr = g_base + strtoull(hb, nullptr, 0);
         if (const char* m = getenv("PROSPER_HWBP_MAX")) g_hwbp_max = (int)strtoul(m, nullptr, 0);
         if (const char* c = getenv("PROSPER_HWBP_R15")) { g_hwbp_r15 = strtoull(c, nullptr, 0); g_hwbp_r15_on = true; }
         if (const char* c = getenv("PROSPER_HWBP_RET")) { g_hwbp_ret = strtoull(c, nullptr, 0); g_hwbp_ret_on = true; }
@@ -2006,7 +2007,7 @@ void arm_bp() {
     bp_write_byte(g_bp_addr, 0xCC);
     char b[96];
     int n = snprintf(b, sizeof b, "[bp] armed int3 at eboot+0x%llx (orig=0x%02x)\n",
-                     (unsigned long long)(g_bp_addr - 0x400000000ull), g_bp_orig);
+                     (unsigned long long)(g_bp_addr - g_base), g_bp_orig);
     syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
 }
 
@@ -2018,7 +2019,7 @@ void arm_hwbp() {
     char b[160];
     if (fd < 0) {
         int n = snprintf(b, sizeof b, "[hwbp] perf_event_open FAILED for eboot+0x%llx (errno=%d) — HW bp disabled\n",
-                         (unsigned long long)(g_hwbp_addr - 0x400000000ull), errno);
+                         (unsigned long long)(g_hwbp_addr - g_base), errno);
         syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */ g_hwbp_on = false; return;
     }
     g_hwbp_fd = (int)fd;
@@ -2035,7 +2036,7 @@ void arm_hwbp() {
     ioctl(g_hwbp_fd, PERF_EVENT_IOC_ENABLE, 0);
     t_hwbp_fd = g_hwbp_fd;   // main thread uses the same fd for its per-thread stepping state
     int n = snprintf(b, sizeof b, "[hwbp] armed HW execute bp at eboot+0x%llx (fd=%d tid=%ld)\n",
-                     (unsigned long long)(g_hwbp_addr - 0x400000000ull), g_hwbp_fd, (long)prosper_gettid());
+                     (unsigned long long)(g_hwbp_addr - g_base), g_hwbp_fd, (long)prosper_gettid());
     syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
 }
 

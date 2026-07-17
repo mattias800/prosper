@@ -480,8 +480,12 @@ namespace {
             if (ep->ExceptionRecord->ExceptionInformation[0] == 1 &&
                 host::guest_write_watch_handle_fault(a))
                 return EXCEPTION_CONTINUE_EXECUTION;
-            if (a >= 0x1000000000ull &&
-                prosper_try_commit_dmem(
+            // Direct-memory views are allowed below the historical 64 GiB GPU-VA window. Astro's
+            // texture-streaming allocator, for example, receives a sparse view near 12 GiB and can
+            // place a libc heap object across a 16 KiB page boundary there. The helper performs the
+            // strict tracked-view/protection checks, so an address floor would only reject a valid
+            // first touch and turn it into an unhandled access violation.
+            if (prosper_try_commit_dmem(
                     a, 1, ep->ExceptionRecord->ExceptionInformation[0] == 1))
                 return EXCEPTION_CONTINUE_EXECUTION;
             if (a >= 0x1000000000ull && prosper_reserved_range_state(a) == 1) {

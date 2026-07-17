@@ -28,6 +28,9 @@
 #include "gpu/gpu_timeline.hpp"
 #include "live_renderer.hpp"           // register_live_renderer (frontends/shared)
 #include "capture_manifest.hpp"
+#ifdef PROSPER_VIDEO_MF
+#include "media_foundation_backend.hpp" // native Windows AvPlayer demux + hardware decode
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -503,7 +506,12 @@ int main(int argc, char** argv) {
     // guest on its own thread while this thread samples the present layer.
     prosper::frontend::register_live_renderer(".", /*dump_bmps=*/false);
     Program prog; std::string err;
-    if (!boot_program(dump, prog, &err)) { fprintf(stderr, "screenshot: boot failed: %s\n", err.c_str()); return 1; }
+    if (!boot_program(dump, prog, &err, [&]{
+#ifdef PROSPER_VIDEO_MF
+        if (!prosper::video::install_media_foundation_backend())
+            fprintf(stderr, "[avp] Media Foundation backend unavailable\n");
+#endif
+    })) { fprintf(stderr, "screenshot: boot failed: %s\n", err.c_str()); return 1; }
     std::thread guest([&prog] {
         const BootResult result = run_entry(prog.imgs[0]);
         fprintf(stderr,
