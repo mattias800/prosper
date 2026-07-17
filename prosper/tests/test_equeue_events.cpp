@@ -108,8 +108,13 @@ int main() {
         iout = -1;
         uint64_t rf = wait(eq, 0, 1, (uint64_t)(uintptr_t)&iout,
                            (uint64_t)(uintptr_t)&icap, 0);
-        CHECK((uint32_t)rf == 0x8002000eu && iout == 0,
-              "WaitEqueue null event array returns EFAULT with 0 events");
+        CHECK((uint32_t)rf == 0x8002000eu && iout == -1,
+              "WaitEqueue null event array returns EFAULT without changing out");
+        iout = -2;
+        rf = wait(eq, 0, 0, (uint64_t)(uintptr_t)&iout,
+                  (uint64_t)(uintptr_t)&icap, 0);
+        CHECK((uint32_t)rf == 0x8002000eu && iout == -2,
+              "null event array takes EFAULT precedence over an invalid count");
         rv = wait(eq, (uint64_t)(uintptr_t)&iev, 1,
                   (uint64_t)(uintptr_t)&iout, (uint64_t)(uintptr_t)&icap, 0);
         CHECK(rv == 0 && iout == 1 && iev.udata == 0x4444,
@@ -124,9 +129,11 @@ int main() {
         uint64_t r = wait(eq, (uint64_t)(uintptr_t)&xev, 1, (uint64_t)(uintptr_t)&xout,
                           (uint64_t)(uintptr_t)&xcap, 0);
         CHECK((uint32_t)r == 0x8002003Cu && xout == 0, "timed empty wait returns ETIMEDOUT with 0 events");
-        uint64_t rb = wait(0xDEAD0000ull, (uint64_t)(uintptr_t)&xev, 1, (uint64_t)(uintptr_t)&xout,
+        xout = -1;
+        uint64_t rb = wait(0xDEAD0000ull, 0, 0, (uint64_t)(uintptr_t)&xout,
                            (uint64_t)(uintptr_t)&xcap, 0);
-        CHECK((uint32_t)rb == 0x80020009u, "unknown equeue handle returns EBADF");
+        CHECK((uint32_t)rb == 0x80020009u && xout == 0,
+              "unknown equeue handle takes EBADF precedence and reports 0 events");
     }
 
     // --- kqueue coalescing (#67): two triggers of the SAME (ident, filter) update one pending
