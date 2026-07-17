@@ -78,6 +78,27 @@ FMOD, and IoStore paths, and flag any value inside `prosper_fixed_map_hits_host_
 handed pointer is found, the fix is to back that buffer with real guest/heap memory (outside the image)
 instead of a host global, so guest writes cannot reach the equeue cluster.
 
+## Candidate fix (implemented, NOT yet verified)
+
+Since the corruptor cannot be attributed on this platform, the fix mirrors what already keeps Linux
+alive: keep the crash-critical equeue mutex **out of the corrupted `__DATA` range**. On macOS `g_eq_mx`
+is now a trivial `.bss` forwarder to a heap `std::mutex` that is allocated once at static init (never
+`new`/`malloc` on a lock path — the `%fs` SIGSEGV handler also takes this lock, and malloc there
+deadlocks). `.bss` is not touched by the corruptor (round-2 evidence), so the mutex sig survives and
+`vblank_pump` no longer hits `EINVAL`. Linux is unchanged (`std::mutex`, already `.bss`).
+
+**Status: compiles cleanly; UNVERIFIED.** During this investigation an earlier (buggy) variant of this
+mitigation deadlocked and left the machine's Rosetta runtime wedged (uninterruptible `U`-state
+processes), so no x86-64 binary can run until the host is **rebooted**. After a reboot, verify by
+running the reproduce recipe below and confirming `g_eq_mx` is no longer reported by SIGWATCH and the
+route reaches sustained gameplay. **Caveat:** the corruptor zeroes a *region*, so if it also reaches
+`g_eqs`/the reg vectors (extent unconfirmed), those must be relocated the same way — watch for the crash
+merely moving rather than disappearing.
+
+The only path to a true *root* fix (identifying the writer) is a platform where hardware watchpoints
+work: a real x86-64 Mac or a Linux/x86 VM. A write-watchpoint on `g_eq_mx` there names the writer in one
+run.
+
 ## Diagnostics on this branch (env-gated, `PROSPER_EQ_*`)
 
 - `PROSPER_EQ_SIGWATCH=1|repair|taint` — 200 µs poller over the cluster sig words; `taint` pre-fills
