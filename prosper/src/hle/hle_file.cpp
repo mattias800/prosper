@@ -57,32 +57,38 @@ namespace {
     std::map<int, std::string> g_filelog_fd_paths;
 
 #ifdef _WIN32
-    // Host I/O stages through committed memory so it can discover the real short-read byte count.
-    // Its subsequent host memcpy still bypasses the guest VEH, so materialize sparse direct-memory
-    // or tracked reserved pages before publishing those bytes into the guest destination.
-    bool windows_prepare_guest_write(uint64_t dst, uint64_t bytes) {
-        if (!bytes) return true;
-        if (!dst || dst + bytes < dst) return false;
+    // Return the writable prefix of a guest destination, materializing sparse direct-memory or
+    // tracked reserved pages as the guest VEH would on first touch.  Host I/O bypasses that VEH, so
+    // every byte handed to _read/ReadFile must already be committed and writable.  Reporting a
+    // prefix (rather than a boolean) is important for sequential reads: a valid committed prefix may
+    // precede an inaccessible tail, and the file offset must advance only by bytes actually delivered.
+    uint64_t windows_prepare_guest_write_prefix(uint64_t dst, uint64_t bytes) {
+        if (!bytes) return 0;
+        if (!dst || dst + bytes < dst) return 0;
         prosper_try_commit_dmem(dst, bytes, 1);
         const uint64_t end = dst + bytes;
         for (uint64_t p = dst; p < end;) {
             MEMORY_BASIC_INFORMATION mbi{};
-            if (!VirtualQuery((const void*)(uintptr_t)p, &mbi, sizeof mbi)) return false;
+            if (!VirtualQuery((const void*)(uintptr_t)p, &mbi, sizeof mbi)) return p - dst;
             if (mbi.State == MEM_RESERVE && prosper_reserved_range_state(p) == 1) {
                 const uint64_t page = p & ~uint64_t{0x3fff};
                 if (!VirtualAlloc((void*)(uintptr_t)page, 0x4000, MEM_COMMIT, PAGE_READWRITE))
-                    return false;
+                    return p - dst;
                 continue;
             }
             const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY |
                                    PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
             if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) ||
-                !(mbi.Protect & writable)) return false;
+                !(mbi.Protect & writable)) return p - dst;
             const uint64_t region_end = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-            if (region_end <= p) return false;
+            if (region_end <= p) return p - dst;
             p = region_end < end ? region_end : end;
         }
-        return true;
+        return bytes;
+    }
+
+    bool windows_prepare_guest_write(uint64_t dst, uint64_t bytes) {
+        return !bytes || windows_prepare_guest_write_prefix(dst, bytes) == bytes;
     }
 #endif
 
@@ -523,37 +529,36 @@ HLE(f_read)  { int fd = (int)a0; int64_t off = -1;
                // Full sequential read (loop) — same full-count contract as read_full: a short ::read
                // would leave Unity's asset cache block partially filled and deserialize corrupt data.
                // Windows validates the entire destination range before _read discovers a short EOF.
-               // Guest allocators can leave later pages reserved for lazy commit, so Unity's normal
-               // 64 KiB read from a small boot.config otherwise fails with EINVAL. Stage through
-               // committed host memory and copy only the bytes the file actually supplied. For a
-               // seekable regular file, cap each chunk to the exact remaining bytes before validating
-               // the destination. For a non-seekable descriptor, validate the whole requested chunk
-               // first: no path may consume bytes that were not delivered to the guest.
-               { size_t done = 0, cnt = (size_t)a2; char* b = (char*)P(a1);
-                 constexpr size_t kBounceSize = 0x10000;
-                 std::vector<char> bounce(cnt < kBounceSize ? cnt : kBounceSize);
-                 while (done < cnt) {
-                     size_t left = cnt - done;
-                     unsigned want = (unsigned)(left < bounce.size() ? left : bounce.size());
-                     const __int64 pos = ::_lseeki64((int)a0, 0, SEEK_CUR);
-                     struct _stat64 st{};
-                     if (pos >= 0 && ::_fstat64((int)a0, &st) == 0 &&
-                         (st.st_mode & _S_IFMT) == _S_IFREG) {
-                         const uint64_t len = st.st_size > 0 ? (uint64_t)st.st_size : 0;
-                         const uint64_t remaining = (uint64_t)pos < len
-                             ? len - (uint64_t)pos : 0;
-                         if (!remaining) break;
-                         if (remaining < want) want = (unsigned)remaining;
-                     }
-                     if (!windows_prepare_guest_write(
-                             (uint64_t)(uintptr_t)(b + done), want)) {
+               // Guest allocators can leave later pages reserved for lazy commit, so asking _read for
+               // the whole range can fail even when the available file prefix fits in committed pages.
+               // Validate the largest writable prefix first and read directly into it.  A normal
+               // multi-megabyte asset allocation is one committed region, so this is one validation
+               // and one host read instead of hundreds of 64 KiB bounce-buffer cycles.  An inaccessible
+               // tail still limits the request before any file bytes are consumed, preserving partial
+               // read and retry-offset behavior.
+               { size_t done = 0, cnt = (size_t)a2, readable = cnt; char* b = (char*)P(a1);
+                 const __int64 pos = ::_lseeki64((int)a0, 0, SEEK_CUR);
+                 struct _stat64 st{};
+                 if (pos >= 0 && ::_fstat64((int)a0, &st) == 0 &&
+                     (st.st_mode & _S_IFMT) == _S_IFREG) {
+                     const uint64_t len = st.st_size > 0 ? (uint64_t)st.st_size : 0;
+                     const uint64_t remaining = (uint64_t)pos < len
+                         ? len - (uint64_t)pos : 0;
+                     if (remaining < readable) readable = (size_t)remaining;
+                 }
+                 while (done < readable) {
+                     size_t left = readable - done;
+                     const size_t request = left < 0x40000000u ? left : 0x40000000u;
+                     const uint64_t prefix = windows_prepare_guest_write_prefix(
+                         (uint64_t)(uintptr_t)(b + done), request);
+                     if (!prefix) {
                          errno = EFAULT;
                          return logged_return(done ? (int64_t)done : (int64_t)-1);
                      }
-                     int r = ::read((int)a0, bounce.data(), want);
+                     const unsigned want = (unsigned)prefix;
+                     int r = ::read((int)a0, b + done, want);
                      if (r < 0) return logged_return(done ? (int64_t)done : (int64_t)-1);
                      if (r == 0) break;   // EOF
-                     memcpy(b + done, bounce.data(), (size_t)r);
                      done += (size_t)r;
                  }
                  return logged_return((int64_t)done); }
