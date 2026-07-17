@@ -188,6 +188,20 @@ void set_unwind_modules(const UnwindModuleDesc* descs, size_t count);
 void trace_guest_stack_query(uint64_t target, bool found, void* base, size_t size);
 void trace_guest_thread_lifecycle(bool starting, uint64_t pthread_id, uint64_t native_id,
                                   void* stack_base, size_t stack_size);
+struct GuestThreadSnapshot {
+    uint32_t native_id = 0;
+    uint64_t pthread_id = 0;
+    uintptr_t stack_base = 0;
+    size_t stack_size = 0;
+};
+// Lock-free view of one lifecycle registration. The payload is returned only when both publication
+// reads observe the same generation token. Other hosts return false.
+bool snapshot_guest_thread_registration(uint32_t native_id, GuestThreadSnapshot& snapshot);
+// True only for a committed executable Windows page. Other hosts return false.
+bool guest_trace_page_executable(uintptr_t address);
+// Deterministic test seam at the sampler's handle-pinned, pre-suspend boundary. Production leaves it null.
+using GuestThreadTraceTestHook = void (*)(uint32_t native_id, void* opaque);
+void set_guest_thread_trace_test_hook(GuestThreadTraceTestHook hook, void* opaque = nullptr);
 // Windows cooperative exception checkpoint used when a target was woken from a registered HLE wait.
 // Other hosts provide an empty implementation.
 void dispatch_pending_guest_exception();
@@ -195,6 +209,8 @@ void dispatch_pending_guest_exception();
 // Exposed for diagnostics and lifetime/withdrawal regression tests.
 uint32_t pending_guest_exception_count();
 void dump_guest_exception_trace();
+// Windows-only snapshot of live guest-thread instruction/stack pointers. Other hosts are a no-op.
+void dump_guest_thread_trace(const char* path = nullptr, uint64_t pthread_filter = 0);
 
 // Register the linked program's global export table (NID -> absolute guest address) so
 // sceKernelDlsym can resolve exported symbols by name. Unity's native-plugin loader dlsym's

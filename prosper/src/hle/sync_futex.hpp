@@ -4,10 +4,18 @@
 // never silently diverge from the blocking primitive it must pair with (a future non-futex port —
 // e.g. Windows WaitOnAddress — changes both sides together).
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <pthread.h>
 
 namespace prosper {
+
+enum class GuestWaitKind : uint32_t { None, Address, ConditionSequence, EventFlag, Semaphore };
+struct GuestWaitSnapshot {
+    GuestWaitKind kind = GuestWaitKind::None;
+    uintptr_t object = 0;
+    uintptr_t source = 0;
+};
 
 // Bracket a blocking guest futex wait: enter before FUTEX_WAIT, exit after it returns. Lets
 // wake_label_waiters skip its wake syscalls entirely while no thread is blocked.
@@ -17,9 +25,13 @@ void futex_wait_exit(WaitRegistration registration);
 
 // Register pthread condition waits that may need interruption for asynchronous guest exception
 // delivery on Windows. Other hosts call pthread directly through these wrappers.
-int interruptible_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex);
+int interruptible_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex,
+                            GuestWaitKind kind = GuestWaitKind::ConditionSequence,
+                            uintptr_t source = 0);
 int interruptible_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
-                                 const timespec* deadline);
+                                 const timespec* deadline,
+                                 GuestWaitKind kind = GuestWaitKind::ConditionSequence,
+                                 uintptr_t source = 0);
 int interruptible_cond_signal(pthread_cond_t* cond);
 int interruptible_cond_broadcast(pthread_cond_t* cond);
 int interruptible_mutex_lock(pthread_mutex_t* mutex);
@@ -28,6 +40,15 @@ int interruptible_mutex_lock(pthread_mutex_t* mutex);
 // registered WaitOnAddress or pthread-condition wait so it can enter its redirected context.
 // Returns true when a registered wait was found and woken.
 bool interrupt_guest_wait(uint64_t thread);
+
+// Read every Windows interruptible wait currently registered by a guest thread. Nested exception
+// delivery can retain more than one; callers must not claim an arbitrary slot is the current wait.
+// Returns the total validated count and stores up to capacity entries. Other hosts return zero.
+size_t snapshot_guest_waits(uint64_t windows_tid, GuestWaitSnapshot* snapshots, size_t capacity);
+// Convenience for callers that require exactly one active wait. Returns false for zero or nested waits.
+bool snapshot_guest_wait(uint64_t windows_tid, GuestWaitSnapshot& snapshot);
+void snapshot_guest_wait_registry(size_t& condition_slots_used,
+                                  size_t& condition_slots_capacity);
 
 // FUTEX_WAKE up to n waiters blocked on the 32-bit word at addr. No-op when addr==0 or non-Linux.
 void futex_wake(uint64_t addr, int n);

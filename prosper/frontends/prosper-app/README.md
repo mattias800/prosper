@@ -81,3 +81,21 @@ These switches isolate frontend-specific behavior without requiring a separate b
   flip-boundary stop is a documented follow-up).
 - `PROSPER_APP_STALL_DUMP_MS=<milliseconds>` prints the recent Windows guest-exception ring when no new
   presented frame arrives within that interval. It is an unattended-run diagnostic, disabled by default.
+- `PROSPER_APP_GUEST_DUMP_MS=<milliseconds>` prints that ring plus the live Windows guest-thread
+  instruction/stack pointers once after the app loop has run for the requested time, even while frames
+  continue. Use it for guest progression stalls that are not render stalls; it is disabled by default.
+  `PROSPER_APP_GUEST_DUMP_INTERVAL_MS` repeats the sample at that interval, and
+  `PROSPER_APP_GUEST_DUMP_PATH` writes thread samples to a dedicated append-only file so other trace
+  streams cannot interleave with them. `PROSPER_APP_GUEST_DUMP_PTHREAD=<id>` limits each sample to
+  one guest pthread (for example `0x2` for a title's main thread) to reduce observer overhead.
+  On Windows, each enabled sample briefly uses `SuspendThread`/`GetThreadContext`/`ResumeThread` for
+  every selected live guest thread, captures all of its active registered waits in the same suspension
+  window (nested waits are listed rather than reduced to an arbitrary slot), and
+  reads at most 16 KiB of its registered stack. This perturbs scheduling and is a diagnostic checkpoint,
+  not a profiler. The registry supports 1,024 live guest
+  threads and uses unique generation-token publication, so a sampler never consumes a partially published
+  or reused slot. Each registration pins its actual Windows thread handle; the sampler duplicates that
+  handle and revalidates the same generation after suspension, so a recycled numeric thread ID cannot
+  redirect a checkpoint to an unrelated thread. Lifecycle registration runs only at thread start/exit.
+  Wait kind/source metadata is published on the existing Windows interruptible-wait path even when
+  timed sampling is disabled; the sampler only reads it when one of these checkpoints is requested.
