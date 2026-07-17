@@ -411,6 +411,12 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   their code, types, comments, prose, or tests. Re-derive behavior in prosper's own architecture and add
   project-owned evidence/tests. Never weaken behavior demonstrated by a live boot to match a secondary
   reference, and mark unresolved evidence with `CONFIDENCE: HIGH/MED/LOW`.
+- **AMD RDNA 2 shader ISA reference:** ["RDNA 2" Instruction Set Architecture: Reference Guide
+  (document 70648)](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture). Consult it
+  for instruction encodings, operand and condition-code semantics, wave behavior, and memory-instruction
+  details when working on the shader recompiler or GPU diagnostics. Treat it as the primary published RDNA 2
+  architecture reference; PS5-specific extensions, encodings, and AGC behavior still require prosper's live
+  title evidence and focused tests.
 - **PS5 3.20 firmware library reference — the definitive NID↔name database (`../PS5-3.20_Libs/`).**
   A `genstub.py`-generated dump of **all 275 PS5 3.20 system libraries**, one `libSceXxx.c` per library.
   Each file lists **every exported function AND its exact NID**: the loader lines read
