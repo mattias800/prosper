@@ -35,6 +35,16 @@ static uint16_t f32_to_f16_exact(float f) {
 }
 static uint32_t bits_of(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 static uint32_t bitrev32(uint32_t v) { uint32_t r = 0; for (int i = 0; i < 32; i++) { r = (r << 1) | (v & 1u); v >>= 1; } return r; }
+static size_t count_spirv_opcode(const std::vector<uint32_t>& spv, uint16_t opcode) {
+    size_t matches = 0;
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        if (!count || word + count > spv.size()) return 0;
+        if ((spv[word] & 0xFFFFu) == opcode) ++matches;
+        word += count;
+    }
+    return matches;
+}
 
 int main() {
     printf("== test_rdna2_to_spirv ==\n");
@@ -1831,8 +1841,10 @@ int main() {
     std::vector<uint32_t> spvS2 = recompile_valu(codeS2, sizeof(codeS2)/sizeof(codeS2[0]), 1, 0);
     CHECK(!spvS1.empty(), "recompiled kernel S1 (v_cvt_u32_f32 saturating) -> SPIR-V");
     CHECK(!spvS2.empty(), "recompiled kernel S2 (v_cvt_i32_f32 saturating) -> SPIR-V");
+    CHECK(count_spirv_opcode(spvS2, 110) == 0 && count_spirv_opcode(spvS2, 109) != 0,
+          "v_cvt_i32_f32 avoids Metal's undefined signed float-conversion path");
     const float satIn[] = { 3.7f, 0.0f, -0.5f, -5.5f, 255.9f, -1e10f, 1e10f, 4294967040.0f,
-                            2147483520.0f, std::nanf(""), INFINITY, -INFINITY };
+                            2147483520.0f, -2147483520.0f, std::nanf(""), INFINITY, -INFINITY };
     const uint32_t NSAT = sizeof(satIn)/sizeof(satIn[0]);
     auto sat_u32 = [](float x) -> uint32_t {
         if (std::isnan(x)) return 0u;
@@ -1859,9 +1871,9 @@ int main() {
     for (uint32_t i = 0; i < N && gotS2.size() == N; i++)
         if (std::fabs(gotS2[i] - expS2[i]) > 1e-3f + 1e-6f*std::fabs(expS2[i])) badS2++;
     printf("  kernelS1(u32 sat) mismatches=%u (nan->%g, -5.5->%g, 1e10->%g expect 0,0,%g)\n", badS1,
-           gotS1.size()==N?gotS1[9]:-1, gotS1.size()==N?gotS1[3]:-1, gotS1.size()==N?gotS1[6]:-1, expS1[6]);
+           gotS1.size()==N?gotS1[10]:-1, gotS1.size()==N?gotS1[3]:-1, gotS1.size()==N?gotS1[6]:-1, expS1[6]);
     printf("  kernelS2(i32 sat) mismatches=%u (nan->%g, -1e10->%g, 1e10->%g expect 0,%g,%g)\n", badS2,
-           gotS2.size()==N?gotS2[9]:-1, gotS2.size()==N?gotS2[5]:-1, gotS2.size()==N?gotS2[6]:-1, expS2[5], expS2[6]);
+           gotS2.size()==N?gotS2[10]:-1, gotS2.size()==N?gotS2[5]:-1, gotS2.size()==N?gotS2[6]:-1, expS2[5], expS2[6]);
     CHECK(gotS1.size()==N && badS1==0, "v_cvt_u32_f32 saturates (NaN/neg -> 0, >=2^32 -> UINT_MAX)");
     CHECK(gotS2.size()==N && badS2==0, "v_cvt_i32_f32 saturates (NaN -> 0, clamps to INT_MIN/INT_MAX)");
 
