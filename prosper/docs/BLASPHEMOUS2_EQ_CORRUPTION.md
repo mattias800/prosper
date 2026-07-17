@@ -111,13 +111,33 @@ closes the doc's own earlier caveat that moving `g_eq_mx` alone would merely *re
 the APR mutex. `hle_file.cpp`'s separate APR-registry `g_apr_mx` (`image+0x16f630`, just below the
 cluster) is also heap-backed as defense-in-depth against the corruptor's run-to-run-variable extent.
 
-**Verification status.** Linux `ctest` is green (regression check on the primary platform; the `#else`
-branch is a plain `std::mutex`). The macOS `__APPLE__` branch **compiles and links** (build-mac-app,
-x86-64) and `nm` confirms both `g_apr_mx` moved to `.bss` (`0x100ab74a0`, `0x100ab8768`). It is **not
-runtime-verified on macOS**: an earlier buggy mitigation attempt deadlocked and wedged this host's
-Rosetta runtime — even a trivial x86-64 hello-world now hangs, so *no* x86-64 binary runs until the
-host is **rebooted**. After a reboot, run the reproduce recipe below and confirm SIGWATCH no longer
-reports `g_eq_mx`/`g_apr_mx` and the route reaches sustained gameplay.
+**Verification status: RUNTIME-VERIFIED on macOS (2026-07-17).** The earlier Rosetta wedge cleared on
+its own (the deadlocked processes were eventually reaped), so the reproduce recipe was run four times
+against the fixed `build-mac-app/boot_trace`:
+
+| run | max frame | corruptor fired? | `g_eq_mx`/`g_apr_mx` hit | equeue crash | exit |
+|-----|-----------|------------------|--------------------------|--------------|------|
+| 1 | 110 | — | 0 | none | worker-fault (unrelated, see below) |
+| 2 | 350 | **yes** | **0** | none | 0 (clean) |
+| 3 | 350 | — | 0 | none | 0 (clean) |
+| 4 | 350 | **yes** | **0** | none | 0 (clean) |
+
+Runs 2 and 4 are a **direct causal proof**: SIGWATCH caught the corruptor zeroing a real pthread mutex
+sig in `__DATA` — `g_det_clock.mutex off=0..3: a7 ab aa 32 → 00`, i.e. the macOS `_MUTEX_SIG`
+`0x32AAABA7` wiped to zero — plus the decoys, in the same event that used to crash the process. Yet
+`g_eq_mx`/`g_apr_mx` were hit **zero** times (relocated to `.bss` at `0x100cdd765`/`0x100cdd768`) and
+both runs ran on to frame 350 and exited cleanly. Before this fix the same corruptor event crashed
+50–80% of runs at `vblank_pump`. `g_det_clock.mutex` being zeroed is harmless because it is cold
+(locked only under `PROSPER_DET_CLOCK`). Zero equeue-corruption crashes across all four runs.
+
+(Linux `ctest` is green as the regression check; the `#else` branch is a plain `std::mutex`. `nm`
+confirms both `g_apr_mx` in `.bss`.)
+
+**A separate, unrelated fault remains** (run 1): an intermittent (~1 in 4) guest worker-thread
+`ret`-to-`0x0` during Unity asset load — control flow into non-executable Rosetta memory
+(`rip=0x7ff8_xxxxxxxx`, `ret@[rsp]=0x0`), terminating via `_exit(90)` in the worker-fault path of
+`exec_image_linux.cpp`. It is macOS-specific (this route reaches gameplay on Linux) and is NOT the
+equeue corruption. Tracked separately.
 
 **Residual risk (documented, not fixed).** If the crash *relocates again* rather than disappearing, the
 corruptor's extent reaches beyond the confirmed cluster. The next candidates — other hot `std::mutex`
