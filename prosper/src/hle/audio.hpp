@@ -30,6 +30,11 @@ inline int audio_grain_bytes(const AudioPortInfo& p) { return p.grain * audio_fr
 // SceAudioOutParamFormat enum; higher bits are attributes (ignored here). Unknown -> S16 stereo.
 void audio_decode_format(uint32_t param, int& channels, AudioFmt& fmt);
 
+// Sony's volume array is channel-indexed even when `mask` is sparse: bit i selects vols[i], not
+// the next compacted element. Shared helpers keep the HLE cache and concrete sinks on that contract.
+void audio_apply_channel_volumes(int dst[8], uint32_t mask, const int* vols);
+int audio_peak_channel_volume(uint32_t mask, const int* vols);
+
 // Pluggable audio backend. All calls arrive on the guest's audio thread; output() MAY block to
 // pace it (as real hardware does — sceAudioOutOutput blocks until the ring has room).
 struct AudioSink {
@@ -38,8 +43,8 @@ struct AudioSink {
     virtual bool open(int port, const AudioPortInfo& info) { (void)port; (void)info; return true; }
     // Deliver one grain (info.grain frames) of interleaved PCM. `pcm` is host-readable, non-owning.
     virtual void output(int port, const void* pcm, int frames) = 0;
-    // Per-channel volume in [0, 32768] (SCE_AUDIO_VOLUME_0DB). `mask` selects which channels
-    // `vols` covers (bit i -> channel i); `vols` is a host-readable array of set bits' values.
+    // Per-channel volume in [0, 32768] (SCE_AUDIO_VOLUME_0DB). `mask` selects which channels;
+    // `vols` is a host-readable eight-element channel-indexed array (bit i applies vols[i]).
     virtual void set_volume(int port, uint32_t mask, const int* vols) { (void)port; (void)mask; (void)vols; }
     virtual void close(int port) { (void)port; }
 };

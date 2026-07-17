@@ -105,14 +105,20 @@ int main() {
     CHECK(call("sceAudioOutOutput", (uint64_t)h, 0) == 0);
     CHECK(sink.outs.size() == 1);
 
-    // --- 4. set volume forwards mask + values -----------------------------------------------
-    int vols[2] = { 20000, 15000 };
-    CHECK(call("sceAudioOutSetVolume", (uint64_t)h, 0x3 /*ch0|ch1*/, PTR(vols)) == 0);
+    // --- 4. sparse volume masks use Sony's channel-indexed array, not compacted values -------
+    int vols[8] = {1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000};
+    constexpr uint32_t sparse_mask = (1u << 4) | (1u << 7);
+    int cached[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    audio_apply_channel_volumes(cached, sparse_mask, vols);
+    CHECK(cached[4] == 5000); CHECK(cached[7] == 8000);
+    CHECK(cached[0] == -1); CHECK(cached[6] == -1);
+    CHECK(audio_peak_channel_volume(sparse_mask, vols) == 8000);
+    CHECK(call("sceAudioOutSetVolume", (uint64_t)h, sparse_mask, PTR(vols)) == 0);
     CHECK(sink.vols_.size() == 1);
     if (!sink.vols_.empty()) {
-        CHECK(sink.vols_[0].mask == 0x3);
+        CHECK(sink.vols_[0].mask == sparse_mask);
         CHECK(sink.vols_[0].vols.size() == 2);
-        CHECK(sink.vols_[0].vols[0] == 20000); CHECK(sink.vols_[0].vols[1] == 15000);
+        CHECK(sink.vols_[0].vols[0] == 5000); CHECK(sink.vols_[0].vols[1] == 8000);
     }
 
     // --- 5. get port state fills the struct --------------------------------------------------

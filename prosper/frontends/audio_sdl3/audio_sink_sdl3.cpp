@@ -70,8 +70,7 @@ public:
     void set_volume(int port, uint32_t mask, const int* vols) override {
         if (port < 1 || port > kMaxPorts || !vols) return;
         // Approximate the PS5 per-channel volumes as a single stream gain (0..1) from the loudest set channel.
-        int maxv = 0, vi = 0;
-        for (int c = 0; c < 8; c++) if (mask & (1u << c)) { if (vols[vi] > maxv) maxv = vols[vi]; vi++; }
+        int maxv = audio_peak_channel_volume(mask, vols);
         float gain = maxv / 32768.0f;                     // SCE_AUDIO_VOLUME_0DB == 32768
         std::lock_guard<std::mutex> lk(mx_);
         if (SDL_AudioStream* st = slots_[port - 1].stream) SDL_SetAudioStreamGain(st, gain);

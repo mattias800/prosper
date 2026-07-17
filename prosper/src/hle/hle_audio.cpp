@@ -109,6 +109,20 @@ void audio_decode_format(uint32_t param, int& channels, AudioFmt& fmt) {
     }
 }
 
+void audio_apply_channel_volumes(int dst[8], uint32_t mask, const int* vols) {
+    if (!dst || !vols) return;
+    for (int c = 0; c < 8; c++)
+        if (mask & (1u << c)) dst[c] = vols[c];
+}
+
+int audio_peak_channel_volume(uint32_t mask, const int* vols) {
+    if (!vols) return 0;
+    int peak = 0;
+    for (int c = 0; c < 8; c++)
+        if ((mask & (1u << c)) && vols[c] > peak) peak = vols[c];
+    return peak;
+}
+
 void audio_reset() {
     AudioSink* s = audio_sink();
     std::lock_guard<std::mutex> lk(g_mx);
@@ -183,7 +197,7 @@ HLE(audio_set_volume) {
     const int* vols = (const int*)P(a2);
     { std::lock_guard<std::mutex> lk(g_mx);
       Port* p = port_of((int)a0); if (!p) return kAudioErrInvalidPort;
-      if (vols) { int vi = 0; for (int c = 0; c < 8; c++) if (mask & (1u << c)) p->vol[c] = vols[vi++]; } }
+      audio_apply_channel_volumes(p->vol, mask, vols); }
     if (auto* s = audio_sink()) s->set_volume((int)a0, mask, vols);
     return 0;
 }
