@@ -465,6 +465,16 @@ int main() {
                                          operation.command_order});
     std::vector<uint8_t> draw_observations, compute_observations;
     std::vector<std::pair<uint64_t, uint64_t>> invalidations;
+    bool producer_rendered = false;
+    const std::vector<uint8_t> current_render_target = {0xe1, 0xe2, 0xe3, 0xe4};
+    set_live_target_byte_range_reader(
+        [&](uint64_t addr, uint32_t bytes, std::vector<uint8_t>& output) {
+            if (addr != ordered_copy.src) return LiveTargetByteReadResult::NotFound;
+            if (!producer_rendered || bytes != current_render_target.size())
+                return LiveTargetByteReadResult::InvalidRange;
+            output = current_render_target;
+            return LiveTargetByteReadResult::Success;
+        });
     set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
         invalidations.emplace_back(addr, size);
     });
@@ -474,6 +484,7 @@ int main() {
         [&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
             for (const auto& item : items)
                 draw_observations.push_back(item.vrt->resources[0].host_data[0]);
+            producer_rendered = true;
             return RenderedFrame{};
         },
         [&](const std::vector<ComputeItem>& items) {
@@ -481,10 +492,11 @@ int main() {
             return true;
         }, 1, 1);
     set_guest_gpu_write_observer({});
-    CHECK(draw_observations == std::vector<uint8_t>({0x11, 0xa1}),
-          "draw -> DMA -> draw replay observes pre-copy then post-copy destination bytes");
-    CHECK(compute_observations == std::vector<uint8_t>({0xa1}),
-          "DMA -> compute replay observes the copied bytes at exact command order");
+    set_live_target_byte_range_reader({});
+    CHECK(draw_observations == std::vector<uint8_t>({0x11, 0xe1}),
+          "draw -> DMA -> draw replay copies the current producer target, not its stale blob");
+    CHECK(compute_observations == std::vector<uint8_t>({0xe1}),
+          "DMA -> compute replay observes the current producer bytes at exact command order");
     CHECK((invalidations == std::vector<std::pair<uint64_t, uint64_t>>({{0x5000, 4}})),
           "replay DMA invalidates renderer caches by captured guest destination identity");
 

@@ -307,6 +307,37 @@ int main() {
           std::memcmp(copied_target, ordered_range.data(), sizeof copied_target) == 0,
           "ordered DMA copies current bytes produced by the preceding live-render span");
 
+    DrawItem replay_producer = producer;
+    replay_producer.color0_base = 0x100400000ull;
+    replay_producer.draw_index = 0;
+    replay_producer.command_order = 100;
+    const uint64_t replay_center = replay_producer.color0_base +
+        (static_cast<uint64_t>(replay_producer.color0_width) +
+         replay_producer.color0_width / 2u) * 4u;
+    uint8_t stale_captured_source[4] = {0x5a, 0x5a, 0x5a, 0x5a};
+    uint8_t replay_copied_target[4] = {};
+    ReplayDmaCopy replay_copy;
+    replay_copy.dst = reinterpret_cast<uint64_t>(replay_copied_target);
+    replay_copy.src = replay_center;
+    replay_copy.bytes = sizeof replay_copied_target;
+    replay_copy.command_order = 200;
+    replay_copy.destination_data = replay_copied_target;
+    replay_copy.destination_size = sizeof replay_copied_target;
+    replay_copy.source_data = stale_captured_source;
+    replay_copy.source_size = sizeof stale_captured_source;
+    execute_ordered_items(
+        {{SubmitOperationKind::Draw, 0, 100}, {SubmitOperationKind::DmaCopy, 0, 200}},
+        {replay_producer}, {}, {replay_copy}, ordered_render, {}, W, H);
+    std::vector<uint8_t> replay_range;
+    const bool replay_source_read = read_live_render_target_bytes(
+        replay_center, sizeof replay_copied_target, replay_range) ==
+        LiveTargetByteReadResult::Success;
+    CHECK(replay_source_read && replay_range.size() == sizeof replay_copied_target &&
+          std::memcmp(replay_copied_target, replay_range.data(), sizeof replay_copied_target) == 0 &&
+          std::memcmp(replay_copied_target, stale_captured_source,
+                      sizeof replay_copied_target) != 0,
+          "offline DMA replay prefers the preceding draw's live target over its captured blob");
+
     std::vector<uint8_t> cross_submit = render_submit_items({consumer}, W, H);
     CHECK(cross_submit.size() == static_cast<size_t>(16) * 16 * 4,
           "renderer retains a producer target across separate replay submits");

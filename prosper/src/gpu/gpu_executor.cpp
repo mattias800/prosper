@@ -2801,10 +2801,25 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
     return execute_ordered_items_impl(
         operations, draws, computes, dma_copies, render, compute, width, height,
         [](const ReplayDmaCopy& copy) {
-            if (!copy.destination_data || !copy.source_data ||
-                copy.bytes > copy.destination_size || copy.bytes > copy.source_size)
+            std::vector<uint8_t> current_source;
+            const LiveTargetByteReadResult source_result = read_live_render_target_bytes(
+                copy.src, copy.bytes, current_source);
+            if (source_result == LiveTargetByteReadResult::InvalidRange) {
+                static std::atomic<int> warned{0};
+                if (warned.fetch_add(1) < 24)
+                    std::fprintf(stderr,
+                                 "[gpu_replay] DMA_DATA live-target source range invalid: src=0x%llx bytes=%u\n",
+                                 static_cast<unsigned long long>(copy.src), copy.bytes);
                 return;
-            std::memmove(copy.destination_data, copy.source_data, copy.bytes);
+            }
+            const uint8_t* source = source_result == LiveTargetByteReadResult::Success
+                ? current_source.data() : copy.source_data;
+            const uint64_t source_size = source_result == LiveTargetByteReadResult::Success
+                ? current_source.size() : copy.source_size;
+            if (!copy.destination_data || !source ||
+                copy.bytes > copy.destination_size || copy.bytes > source_size)
+                return;
+            std::memmove(copy.destination_data, source, copy.bytes);
             notify_guest_gpu_write(copy.dst, copy.bytes);
         });
 }
