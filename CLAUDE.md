@@ -293,7 +293,9 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
 - **PR verification and merging.** Keep each PR description self-contained: link the issue or goal, explain the
   failure scenario and behavioral contract, summarize the approach and important invariants, identify affected
   and deliberately unaffected behavior, record risks, and list the exact build/test/snapshot commands and
-  results. Run the strongest relevant local checks and wait for every applicable required CI check. Before
+  results. PRs that advance a game's visible progression must attach representative screenshots and identify
+  the title, platform, and reached checkpoint; black or diagnostic-only captures are not progression evidence.
+  Run the strongest relevant local checks and wait for every applicable required CI check. Before
   merging, synchronize with the live target branch when needed, inspect the resulting diff, run `diff --check`,
   and address every known correctness concern. An agent may merge only when the user or task explicitly
   authorizes it. The PR author owns verification; prefer `powershell -File prosper/tools/verify-pr.ps1 core` or,

@@ -836,6 +836,13 @@ if(WIN32 AND TARGET prosper_core)
     target_link_libraries(boot_trace PRIVATE prosper_video_mf)
     target_compile_definitions(boot_trace PRIVATE PROSPER_VIDEO_MF=1)
   endif()
+
+  # The capture frontend must boot with the same real decoder as boot_trace and prosper-app;
+  # otherwise video-gated titles never reach the frames that the tool is meant to preserve.
+  if(TARGET screenshot)
+    target_link_libraries(screenshot PRIVATE prosper_video_mf)
+    target_compile_definitions(screenshot PRIVATE PROSPER_VIDEO_MF=1)
+  endif()
 endif()
 
 # Linux native AvPlayer backend (#841): FFmpeg provides MP4 demux/audio conversion and drives a
