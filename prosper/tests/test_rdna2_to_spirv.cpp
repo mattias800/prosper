@@ -2159,30 +2159,47 @@ int main() {
            got66b.size()==N?got66b[3]:-1, 500u + 2u*3u + 1u);
     CHECK(got66b.size()==N && bad66b==0, "kernel 66b (idxen+offen): addr = idx*stride + byteoffset (both applied)");
 
-    // Astro Bot's visibility kernel uses raw buffer_load_ubyte at arbitrary byte offsets. Exercise
-    // all four byte positions in each dword through the same SRSRC-provenance binding as kernel 66.
-    const uint32_t code66c[] = {
-        0x7e000f00u,               // v_cvt_u32_f32 v0, v0
-        0xe0201000u, 0x80020000u,  // buffer_load_ubyte v0, v0, s[8:11], 0 offen
-        0x7e000d00u,               // v_cvt_f32_u32 v0, v0
-        0xbf810000u,
-    };
+    // Raw byte/short MUBUF loads use a per-lane byte address and zero/sign-extend into one VGPR.
+    // Exercise every in-dword position, including a 16-bit load beginning at byte 3 and crossing
+    // into the next dword. Encodings round-tripped with llvm-mc gfx1030.
     ShaderResourceTable rt66c;
     { ShaderResource rb{}; rb.cls = ResourceClass::ConstantBuffer; rb.format = DataFormat::Uint32;
       rb.num_components = 1; rb.binding = 3; rb.sgpr_base = 8; rt66c.resources.push_back(rb); }
-    std::vector<uint32_t> spv66c = recompile_valu(
-        code66c, sizeof(code66c)/sizeof(code66c[0]), 1, 0, &rt66c);
-    CHECK(!spv66c.empty(), "recompiled kernel 66c (raw buffer_load_ubyte) -> SPIR-V");
-    std::vector<uint32_t> bytes66c((N + 3) / 4, 0u), decoy66c(bytes66c.size(), 0u);
-    for (uint32_t i = 0; i < N; ++i)
-        bytes66c[i / 4] |= ((i * 3u + 7u) & 0xFFu) << ((i & 3u) * 8u);
-    std::vector<float> got66c = prosper::test::run_compute(
-        spv66c, in66, N, N, decoy66c, bytes66c);
-    uint32_t bad66c = 0;
-    for (uint32_t i=0;i<N&&got66c.size()==N;i++)
-        if (got66c[i] != (float)((i * 3u + 7u) & 0xFFu)) ++bad66c;
-    CHECK(got66c.size()==N && bad66c==0,
-          "kernel 66c extracts raw unsigned bytes at every in-dword position");
+    std::vector<uint8_t> raw66c(N + 1);
+    for (uint32_t i = 0; i <= N; ++i) raw66c[i] = static_cast<uint8_t>(i * 73u + 0x51u);
+    std::vector<uint32_t> bytes66c((raw66c.size() + 3) / 4, 0u), decoy66c(bytes66c.size(), 0u);
+    for (uint32_t i = 0; i < raw66c.size(); ++i)
+        bytes66c[i / 4] |= static_cast<uint32_t>(raw66c[i]) << ((i & 3u) * 8u);
+    auto raw_subword_ok = [&](uint32_t mubuf_word, uint32_t bits, bool is_signed) {
+        const uint32_t code66c[] = {
+            0x7e000f00u, mubuf_word, 0x80020000u,
+            is_signed ? 0x7e000b00u : 0x7e000d00u, 0xbf810000u,
+        };
+        std::vector<uint32_t> spv66c = recompile_valu(code66c, std::size(code66c), 1, 0, &rt66c);
+        if (spv66c.empty()) return false;
+        std::vector<float> got66c = prosper::test::run_compute(
+            spv66c, in66, N, N, decoy66c, bytes66c);
+        uint32_t bad66c = 0;
+        for (uint32_t i = 0; i < N && got66c.size() == N; ++i) {
+            const uint32_t raw = bits == 8 ? raw66c[i]
+                : static_cast<uint32_t>(raw66c[i]) |
+                  (static_cast<uint32_t>(raw66c[i + 1]) << 8u);
+            const float expected = is_signed
+                ? static_cast<float>(bits == 8 ? static_cast<int8_t>(raw)
+                                               : static_cast<int16_t>(raw))
+                : static_cast<float>(raw);
+            if (got66c[i] != expected) ++bad66c;
+        }
+        return got66c.size() == N && bad66c == 0;
+    };
+    CHECK(raw_subword_ok(0xe0201000u, 8, false),
+          "buffer_load_ubyte zero-extends every byte position");
+    CHECK(raw_subword_ok(0xe0241000u, 8, true),
+          "buffer_load_sbyte sign-extends every byte position");
+    CHECK(raw_subword_ok(0xe0281000u, 16, false),
+          "buffer_load_ushort zero-extends aligned, unaligned, and cross-dword values");
+    CHECK(raw_subword_ok(0xe02c1000u, 16, true),
+          "buffer_load_sshort sign-extends aligned, unaligned, and cross-dword values");
 
     // Kernel 67: RAW MUBUF UNRESOLVABLE SRSRC -> REJECT (#91). Same code, but the table's only
     // resource lives at sgpr_base 4 — SRSRC s[8:11] resolves to nothing. With a table present the
