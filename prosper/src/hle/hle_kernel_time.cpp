@@ -2,6 +2,7 @@
 // libkernel stubs the engine needs during init. Cross-platform (chrono + pthread).
 #include "dispatch.hpp"
 #include "nid.hpp"
+#include "heap_mutex.hpp"   // #707: keep hot equeue/APR mutexes off macOS __DATA
 #include "sync_futex.hpp"
 #include <pthread.h>
 #include <chrono>
@@ -400,7 +401,7 @@ namespace {
     // the state while k_eq_wait sat in cv.wait on it). Delete marks `deleted` and wakes waiters; the
     // object dies when the last reference drops.
     struct EqState { std::mutex m; std::condition_variable cv; std::deque<SceKEvent> ready; bool deleted = false; };
-    std::mutex g_eq_mx;
+    PROSPER_HEAP_MUTEX(g_eq_mx);   // #707: heap-backed on macOS (std::mutex would land in the corrupted __DATA cluster)
     std::unordered_map<uint64_t, std::shared_ptr<EqState>> g_eqs;   // guest eq handle -> state
     struct FlipReg { uint64_t eq; int64_t ident; uint64_t udata; };
     std::vector<FlipReg> g_flip_regs, g_vblank_regs;
@@ -423,7 +424,7 @@ namespace {
     std::atomic<bool> g_pump_started{false};
 
     std::shared_ptr<EqState> eq_find(uint64_t eq) {
-        std::lock_guard<std::mutex> lk(g_eq_mx);
+        std::lock_guard lk(g_eq_mx);
         auto it = g_eqs.find(eq);
         return it == g_eqs.end() ? nullptr : it->second;
     }
@@ -460,7 +461,7 @@ namespace {
             struct timespec ts{ 0, 16666667 }; nanosleep(&ts, nullptr);   // ~60 Hz
             frame++;
             std::vector<FlipReg> vr;
-            { std::lock_guard<std::mutex> lk(g_eq_mx); vr = g_vblank_regs; }
+            { std::lock_guard lk(g_eq_mx); vr = g_vblank_regs; }
             // Vblank ticks are periodic by nature — pump them. FLIP events are NOT pumped: a flip
             // event fires when a submitted flip completes (prosper_eq_trigger_flip below), carrying
             // that flip's flipArg in `data`. The old timer-driven flip event carried a frame counter
@@ -473,7 +474,7 @@ namespace {
             // to signal work; if the producer path isn't reached, that thread starves and the game idles.
             // Firing it each vblank tests whether waking that consumer lets the game progress to real draws.
             if (getenv("PROSPER_PUMP_USEREV")) {
-                std::vector<UserReg> ur; { std::lock_guard<std::mutex> lk(g_eq_mx); ur = g_user_regs; }
+                std::vector<UserReg> ur; { std::lock_guard lk(g_eq_mx); ur = g_user_regs; }
                 for (auto& r : ur) { SceKEvent e{}; e.ident = r.id; e.filter = -11 /*EVFILT_USER*/; e.udata = r.udata; eq_post(r.eq, e); }
             }
         }
@@ -483,7 +484,7 @@ namespace {
 
 // Exposed to hle_graphics.cpp (sceVideoOut* flip/vblank event registration).
 void prosper_eq_add_flip(uint64_t eq, int64_t ident, uint64_t udata) {
-    { std::lock_guard<std::mutex> lk(g_eq_mx); g_flip_regs.push_back({ eq, ident, udata }); }
+    { std::lock_guard lk(g_eq_mx); g_flip_regs.push_back({ eq, ident, udata }); }
     ensure_pump();
 }
 // Fire the flip-completion event on every registered flip equeue — called by BOTH flip paths
@@ -491,7 +492,7 @@ void prosper_eq_add_flip(uint64_t eq, int64_t ident, uint64_t udata) {
 // flip_event_trigger_func: ident=VIDEO_OUT_EVENT_FLIP, data=the completed flip's flipArg.
 void prosper_eq_trigger_flip(int64_t flip_arg) {
     std::vector<FlipReg> regs;
-    { std::lock_guard<std::mutex> lk(g_eq_mx); regs = g_flip_regs; }
+    { std::lock_guard lk(g_eq_mx); regs = g_flip_regs; }
     for (auto& r : regs) {
         SceKEvent e{}; e.ident = VIDEO_OUT_EVENT_FLIP; e.filter = EVFILT_VIDEO_OUT;
         e.fflags = 1; e.data = flip_arg; e.udata = r.udata;
@@ -499,12 +500,12 @@ void prosper_eq_trigger_flip(int64_t flip_arg) {
     }
 }
 void prosper_eq_add_vblank(uint64_t eq, int64_t ident, uint64_t udata) {
-    { std::lock_guard<std::mutex> lk(g_eq_mx); g_vblank_regs.push_back({ eq, ident, udata }); }
+    { std::lock_guard lk(g_eq_mx); g_vblank_regs.push_back({ eq, ident, udata }); }
     ensure_pump();
 }
 // Exposed to the AGC submit path (hle_agc.cpp). Register a GPU EOP event source (sceGnmAddEqEvent).
 void prosper_eq_add_eop(uint64_t eq, int64_t id, uint64_t udata) {
-    std::lock_guard<std::mutex> lk(g_eq_mx); g_eop_regs.push_back({ eq, id, udata });
+    std::lock_guard lk(g_eq_mx); g_eop_regs.push_back({ eq, id, udata });
 }
 // Fire the registered EOP events — called when a submit completes. Posts TriggerEvent(ident=id,
 // filter=GraphicsCore, data=id, udata) to each registered equeue, matching shadPS4's IRQ handler.
@@ -527,7 +528,7 @@ namespace {
         // is a discrete count, never a level. PROSPER_EOP_COALESCE restores the old behavior.
         static const bool coalesce = getenv("PROSPER_EOP_COALESCE") != nullptr;
         std::vector<FlipReg> regs;
-        { std::lock_guard<std::mutex> lk(g_eq_mx); regs = g_eop_regs; }
+        { std::lock_guard lk(g_eq_mx); regs = g_eop_regs; }
         for (auto& r : regs) {
             SceKEvent e{}; e.ident = r.ident; e.filter = EVFILT_GRAPHICS_CORE; e.data = r.ident; e.udata = r.udata;
             eq_post(r.eq, e, coalesce);
@@ -587,7 +588,7 @@ void prosper_eq_trigger_eop() {
 HLE(k_eq_create) {
     auto s = std::make_shared<EqState>();
     if (a0) *(void**)P(a0) = (void*)s.get();   // the guest's opaque SceKernelEqueue handle IS our state ptr
-    { std::lock_guard<std::mutex> lk(g_eq_mx); g_eqs[(uint64_t)(uintptr_t)s.get()] = s; }
+    { std::lock_guard lk(g_eq_mx); g_eqs[(uint64_t)(uintptr_t)s.get()] = s; }
     if (evlog()) fprintf(stderr, "[ev] CreateEqueue -> eq=%p name=%s\n", (void*)s.get(), a1 ? (const char*)P(a1) : "");
     return 0;
 }
@@ -595,7 +596,7 @@ HLE(k_eq_delete) {
     if (!a0) return 0;
     std::shared_ptr<EqState> s;
     {
-        std::lock_guard<std::mutex> lk(g_eq_mx);
+        std::lock_guard lk(g_eq_mx);
         auto it = g_eqs.find(a0);
         if (it != g_eqs.end()) { s = std::move(it->second); g_eqs.erase(it); }
         // Purge every registration pointing at this queue (#67). Without this, a later heap
@@ -756,7 +757,7 @@ namespace {
     constexpr int16_t EVFILT_AMPR_MODELED = -24;   // guest never reads filter; distinct on purpose
     struct AprEqReg { uint64_t eq; int64_t id; };
     // Own mutex (NOT g_eq_mx): the post path calls eq_post/eq_find, which lock g_eq_mx themselves.
-    std::mutex g_apr_mx;
+    PROSPER_HEAP_MUTEX(g_apr_mx);   // #707: heap-backed on macOS (hot APR mutex in the corrupted __DATA cluster)
     std::vector<AprEqReg> g_apr_eq_regs;               // guarded by g_apr_mx (registration log)
     uint64_t g_apr_ring_seq[64] = {};                  // per-ring counters for prosper-issued tokens
     uint64_t g_apr_tag_hwm[64] = {};                   // per-ring highest tag counter posted (guarded)
@@ -834,7 +835,7 @@ void prosper_eq_post_apr_token(uint64_t eq, int64_t id, uint64_t token) {
     unsigned ring = (unsigned)(token >> 58) & 0x3f;
     uint64_t cnt = token & ((1ull << 58) - 1);
     {
-        std::lock_guard<std::mutex> lk(g_apr_mx);
+        std::lock_guard lk(g_apr_mx);
         if (cnt > g_apr_tag_hwm[ring]) g_apr_tag_hwm[ring] = cnt;
     }
     if (evlog()) fprintf(stderr, "[ev] AprTagComplete token=0x%llx (ring=%u) -> eq=0x%llx scheduled\n",
@@ -843,7 +844,7 @@ void prosper_eq_post_apr_token(uint64_t eq, int64_t id, uint64_t token) {
         struct timespec ts{ 0, 2000000 };   // 2 ms
         nanosleep(&ts, nullptr);
         uint64_t hwm;
-        { std::lock_guard<std::mutex> lk(g_apr_mx); hwm = g_apr_tag_hwm[ring]; }
+        { std::lock_guard lk(g_apr_mx); hwm = g_apr_tag_hwm[ring]; }
         AprEqReg r{ eq, id };
         apr_post(r, ring, ((uint64_t)ring << 58) | hwm);
     }).detach();
@@ -853,7 +854,7 @@ void prosper_eq_post_apr_token(uint64_t eq, int64_t id, uint64_t token) {
 // event is ever posted for these — see the block comment above).
 uint64_t prosper_apr_next_token(unsigned ring) {
     ring &= 0x3f;
-    std::lock_guard<std::mutex> lk(g_apr_mx);
+    std::lock_guard lk(g_apr_mx);
     uint64_t seq = ++g_apr_ring_seq[ring];
     return ((uint64_t)ring << 58) | (seq & ((1ull << 58) - 1));
 }
@@ -863,7 +864,7 @@ uint64_t prosper_apr_next_token(unsigned ring) {
 // ctor-seeded per-ring last-processed (see the block comment above; the pre-#208 replay was the
 // root cause of the #180 range-walk fault).
 void prosper_eq_add_apr(uint64_t eq, int64_t id) {
-    std::lock_guard<std::mutex> lk(g_apr_mx);
+    std::lock_guard lk(g_apr_mx);
     for (auto& r : g_apr_eq_regs)
         if (r.eq == eq && r.id == id) return;   // idempotent
     g_apr_eq_regs.push_back({ eq, id });
@@ -891,14 +892,14 @@ namespace {
     // (UserReg / g_user_regs are declared above, before the vblank pump.)
 }
 HLE(k_add_user_event) {   // (eq, id, udata?) — register a user event source on the equeue
-    { std::lock_guard<std::mutex> lk(g_eq_mx); g_user_regs.push_back({ a0, (int64_t)a1, a2 }); }
+    { std::lock_guard lk(g_eq_mx); g_user_regs.push_back({ a0, (int64_t)a1, a2 }); }
     if (evlog()) fprintf(stderr, "[ev] AddUserEvent eq=0x%llx id=%lld udata=0x%llx\n",
         (unsigned long long)a0, (long long)a1, (unsigned long long)a2);
     return 0;
 }
 HLE(k_trigger_user_event) {   // (eq, id, udata) — fire the user event: post it to the equeue
     uint64_t udata = a2;
-    { std::lock_guard<std::mutex> lk(g_eq_mx);
+    { std::lock_guard lk(g_eq_mx);
       for (auto& r : g_user_regs) if (r.eq == a0 && r.id == (int64_t)a1) { if (!udata) udata = r.udata; break; } }
     SceKEvent e{}; e.ident = (int64_t)a1; e.filter = EVFILT_USER; e.udata = udata;
     eq_post(a0, e);
@@ -919,7 +920,7 @@ HLE(k_trigger_user_event) {   // (eq, id, udata) — fire the user event: post i
 static void post_after(uint64_t eq, int64_t id, uint64_t udata, uint64_t usec, int16_t filter, bool periodic) {
     auto cancelled = std::make_shared<std::atomic<bool>>(false);
     {
-        std::lock_guard<std::mutex> lk(g_eq_mx);
+        std::lock_guard lk(g_eq_mx);
         auto key = std::make_pair(eq, id);
         auto it = g_timers.find(key);
         if (it != g_timers.end()) it->second.cancelled->store(true);   // re-arm replaces the pending shot
@@ -938,7 +939,7 @@ static void post_after(uint64_t eq, int64_t id, uint64_t udata, uint64_t usec, i
             eq_post(eq, e);
         } while (periodic && !cancelled->load());
         // forget the registration once we stop firing (only if it is still OUR token, not a re-arm's)
-        std::lock_guard<std::mutex> lk(g_eq_mx);
+        std::lock_guard lk(g_eq_mx);
         auto it = g_timers.find(std::make_pair(eq, id));
         if (it != g_timers.end() && it->second.cancelled == cancelled) g_timers.erase(it);
     }).detach();
@@ -947,7 +948,7 @@ static void post_after(uint64_t eq, int64_t id, uint64_t udata, uint64_t usec, i
 HLE(k_del_timer_event) {   // (eq, id)
     bool cancelled = false;
     {
-        std::lock_guard<std::mutex> lk(g_eq_mx);
+        std::lock_guard lk(g_eq_mx);
         auto it = g_timers.find(std::make_pair(a0, (int64_t)a1));
         if (it != g_timers.end()) { it->second.cancelled->store(true); g_timers.erase(it); cancelled = true; }
     }
@@ -958,7 +959,7 @@ HLE(k_del_timer_event) {   // (eq, id)
 // Remove a registered user-event source (previously a no-op: a deleted source kept receiving
 // TriggerUserEvent posts and diagnostic-pump heartbeats).
 HLE(k_del_user_event) {   // (eq, id)
-    std::lock_guard<std::mutex> lk(g_eq_mx);
+    std::lock_guard lk(g_eq_mx);
     g_user_regs.erase(std::remove_if(g_user_regs.begin(), g_user_regs.end(),
                       [&](const UserReg& r){ return r.eq == a0 && r.id == (int64_t)a1; }), g_user_regs.end());
     if (evlog()) fprintf(stderr, "[ev] DeleteUserEvent eq=0x%llx id=%lld\n", (unsigned long long)a0, (long long)a1);

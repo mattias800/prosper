@@ -6,6 +6,7 @@
 #endif
 #include "dispatch.hpp"
 #include "nid.hpp"
+#include "heap_mutex.hpp"   // #707: keep the APR mutex off macOS __DATA
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -868,20 +869,20 @@ HLE(f_rename){ std::string from = translate(CS(a0)), to = translate(CS(a1));
 // id->host-path so the read path can pread by id. CONFIDENCE: MED (arg roles from live capture;
 // outFlags semantics unknown -> 0).
 namespace {
-    std::mutex g_apr_mx;
+    PROSPER_HEAP_MUTEX(g_apr_mx);   // #707: heap-backed on macOS (APR registry mutex near the corrupted __DATA cluster)
     struct AprFile { std::string path; uint64_t size; };
     std::vector<AprFile> g_apr_files;   // id (1-based index) -> {host path, size}
 }
 // Exposed to the read path (Ampr page-read) to map an APR id back to its host file.
 std::string prosper_apr_path_for_id(uint32_t id) {
-    std::lock_guard<std::mutex> lk(g_apr_mx);
+    std::lock_guard lk(g_apr_mx);
     return (id >= 1 && id <= g_apr_files.size()) ? g_apr_files[id - 1].path : std::string();
 }
 // Register a resolved container and return its stable 1-based id. Re-resolving the same host path
 // returns the existing id (updated size) instead of a duplicate entry — a duplicate would make
 // every size-keyed read of that file look ambiguous. Exposed (not static) for the unit test.
 uint32_t prosper_apr_register(const std::string& path, uint64_t size) {
-    std::lock_guard<std::mutex> lk(g_apr_mx);
+    std::lock_guard lk(g_apr_mx);
     for (size_t i = 0; i < g_apr_files.size(); i++)
         if (g_apr_files[i].path == path) { g_apr_files[i].size = size; return (uint32_t)(i + 1); }
     g_apr_files.push_back({ path, size });
@@ -889,7 +890,7 @@ uint32_t prosper_apr_register(const std::string& path, uint64_t size) {
 }
 // Test hook: drop all registered containers (the registry is process-global).
 void prosper_apr_reset_for_test() {
-    std::lock_guard<std::mutex> lk(g_apr_mx);
+    std::lock_guard lk(g_apr_mx);
     g_apr_files.clear();
 }
 // Find resolved host paths whose TOTAL size equals `size`. Returns the match count and sets
@@ -898,7 +899,7 @@ void prosper_apr_reset_for_test() {
 // legible in the captured request layout (docs/UE4_APR_IOSTORE_BRINGUP.md field map, +0x00..+0x40),
 // so size is the only correlation currently available. Exposed (not static) for the unit test.
 int prosper_apr_match_by_size(uint64_t size, std::string* out_path) {
-    std::lock_guard<std::mutex> lk(g_apr_mx);
+    std::lock_guard lk(g_apr_mx);
     int n = 0;
     for (auto& f : g_apr_files)
         if (f.size == size) { if (n++ == 0 && out_path) *out_path = f.path; }
