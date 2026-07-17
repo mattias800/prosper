@@ -258,7 +258,7 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   So drive **git** (fetch/checkout/commit/push/worktree/status) from **PowerShell**, and use **WSL
   only for cmake/build/run**. Don't mix the two on one repo (it also avoids CRLF/filemode index churn).
 - **Build/run in WSL Ubuntu-24.04 as root.** Build dir `prosper/build-linux` (Linux, primary),
-  `prosper/build-win` (Windows/MinGW, secondary). Game dump at
+  `prosper/build-windows` (Windows/MinGW, secondary). Game dump at
   `/mnt/c/Users/matti/repos/ps5ys/PPSA24651-app0` (gitignored — **never commit it**).
   ```bash
   cd /mnt/c/Users/matti/repos/ps5ys/prosper/build-linux
@@ -294,13 +294,16 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   the current PR head contains changes designed, debugged, authored, co-authored, implemented, or materially
   modified by an agent, regardless of who opened the branch or PR. An agent taking over an existing PR must
   arrange the same review before merging. The implementing agent must never merge immediately after coding,
-  even when its tests pass. Once the implementation and author-side verification are ready, push the branch,
-  open or update the PR, and spawn a fresh, independent code-review sub-agent. Correctness is priority 1;
-  style and convenience never outweigh behavioral correctness.
-  - Before requesting review, make the PR description self-contained: link the issue/goal; explain the failure
+  even when its tests pass. Once the author is satisfied with the implementation, push the branch and open or
+  update the PR first. Then start two separate gates in parallel: spawn a fresh, independent code-review
+  sub-agent, while the author runs the applicable verification against the pushed PR head. Correctness is
+  priority 1; style and convenience never outweigh behavioral correctness.
+  - Before starting those gates, make the PR description self-contained: link the issue/goal; explain the failure
     scenario and violated contract; describe the approach and important invariants; identify affected and
     deliberately unaffected behavior; list risks, uncertainty, and compatibility concerns; and give exact
-    author-side build/test/snapshot commands and results. A reviewer should not need private chat context.
+    planned author-side build/test/snapshot commands. A reviewer should not need private chat context. Post the
+    actual results afterward in the author-verification comment described below; do not delay opening the PR just
+    to finish verification that should run alongside review.
   - Reviewer independence covers participation in producing the entire implementation under review: the
     reviewer must not have privately designed/debugged the solution with the author, authored or edited the
     patch, committed any part of it, or otherwise materially co-produced it. Spawn it with fresh context,
@@ -327,27 +330,49 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
     ownership and lifetimes, concurrency and ordering, bounds/overflow, error and cleanup paths, malformed
     inputs, platform differences, compatibility with old captures/state, and whether diagnostics themselves
     are race-safe and truthful. Inspect tests for meaningful failure coverage; passing tests are evidence, not
-    proof. For renderer/recompiler/detile/present changes, the mandatory snapshot gate remains part of review.
-  - The reviewer runs the strongest relevant focused builds/tests and required integration or snapshot checks.
-    Every applicable required check must be present, completed, and successful before merge. Only an explicit,
-    task-specific maintainer instruction may waive waiting for named CI checks (for example, on a docs-only
-    change), and the authorization and exact skipped checks must be recorded on the PR. Such an exception never
-    waives mandatory local, integration, or snapshot verification. If any other required check cannot run, the
-    reviewer posts the exact blocker and does not approve. It posts every finding on the PR with severity, exact
-    location, a concrete failing scenario, the violated contract, and the expected fix or regression test. New
-    regressions in the PR are blockers; pre-existing or out-of-scope bugs follow the issue-tracking rules below.
+    proof. For renderer/recompiler/detile/present changes, the mandatory snapshot gate remains part of the
+    author-side verification.
+  - **Unpublished desktop-app parity is not a merge requirement.** A Linux-, Windows-, or macOS-specific app
+    improvement may be proposed and merged without implementing the same enhancement in every other frontend,
+    unless the issue/PR explicitly promises parity or a shared public contract requires it. The unaffected
+    platforms must still build and pass their applicable regression checks, and the PR must accurately state
+    its affected and deliberately unaffected behavior. Track desirable parity separately; do not refuse to open
+    a PR or block its merge merely because another unpublished app lacks the new improvement. This does not
+    relax correctness, safety, existing-behavior regression, or required-CI standards.
+  - **The author owns verification; the reviewer does not duplicate it.** After opening or updating the PR, the
+    author runs the strongest relevant focused builds/tests and required integration or snapshot checks against
+    the pushed head. Prefer `powershell -File prosper/tools/verify-pr.ps1 core` or, for render-affecting work,
+    `powershell -File prosper/tools/verify-pr.ps1 renderer -Snapshot <name>` so the commands, immutable head, and
+    results are captured consistently. The author then posts an `AUTHOR VERIFICATION` PR comment tied to the exact
+    head SHA, listing every applicable command and result; append `-Pr <N>` to either command to post the generated
+    comment automatically. The reviewer inspects whether the planned coverage is sufficient and may read any
+    available evidence, but does not wait for verification to finish as a condition of code approval and must not
+    rerun the author's builds, tests, snapshots, or CI jobs. If coverage is missing or a result is unclear, the
+    reviewer posts a finding and asks the author to run the additional check. This separation makes reviewer
+    approval and successful author verification independent, parallel merge gates instead of serial duplicate
+    work; the merge agent, not the reviewer, confirms that both completed successfully.
+  - Every applicable required check must be present, completed, and successful before merge. Only an explicit,
+    task-specific maintainer instruction may waive waiting for named CI or local checks (for example, on a
+    docs-only change), and the authorization and exact skipped checks must be recorded on the PR. If a required
+    author-side check cannot run, the author posts the exact blocker and the PR does not merge. The reviewer posts
+    every finding on the PR with severity, exact location, a concrete failing scenario, the violated contract,
+    and the expected fix or regression test. New regressions in the PR are blockers; pre-existing or out-of-scope
+    bugs follow the issue-tracking rules below.
   - The author addresses every finding on the PR by either pushing a fix with appropriate regression coverage
     or posting a concrete, evidence-based rebuttal. Correctness outranks reviewer authority: never implement a
     harmful request merely to obtain approval. The reviewer must explicitly accept the fix or withdraw/accept
     the rebuttal; otherwise the finding remains open and approval is withheld. The same reviewer then re-reads
-    the complete updated diff and re-runs affected verification. If unavailable, a replacement independent
-    reviewer must read the whole review record and perform the same full review.
+    the complete updated diff, while the author reruns the affected verification and posts updated evidence. If
+    the reviewer is unavailable, a replacement independent reviewer must read the whole review record and perform
+    the same full code review without duplicating author verification.
   - Continue until the reviewer explicitly posts either
     `APPROVED FOR MERGE <head-repo>:<head-ref>@<head-SHA> into <base-repo>:<base-ref>@<base-SHA> with tree <tree-SHA>`
     or `NOT APPROVED`, with remaining concerns. Approval covers the PR's reviewed authored change. Any later
     authored change to code, tests, workflows, fixtures, assets, generated files, configuration, docs, or
-    metadata invalidates approval and requires review of the updated change. Re-review is proportional to the
-    delta; do not repeat unrelated inspection or verification when the impact is clearly bounded.
+    metadata invalidates approval and requires review of the updated change. It also invalidates affected
+    author-verification evidence; the author may explicitly reuse unaffected evidence when the intervening diff
+    cannot affect that check. Re-review and re-verification are proportional to the delta; do not repeat unrelated
+    inspection or verification when the impact is clearly bounded.
   - **Synchronizing an approved PR with its target branch does not invalidate approval and does not require an
     external reviewer.** This includes rebasing onto the target, merging the target into the PR, or integrating
     a target tip that moved after approval. The PR author owns this synchronization. Fetch both refs directly,
@@ -380,10 +405,11 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
     live state and repeat base-sync validation or obtain review for new authored changes, as applicable. A normal
     `gh pr merge` head-only guard is not
     sufficient for this multi-agent repository.
-  - Never merge with an unresolved correctness finding; an applicable required check that is absent, pending,
-    or unsuccessful; an unrecorded/overbroad verification exception; unreviewed authored PR content; an
-    author-unvalidated live base/integration tree; or a merge mechanism that cannot atomically preserve the
-    transaction.
+  - Never merge with an unresolved correctness finding; a missing or stale SHA-bound reviewer approval; an
+    applicable author-side check that is absent, pending, unsuccessful, or not recorded in the current
+    `AUTHOR VERIFICATION` comment; an applicable CI job that is absent, pending, or unsuccessful; an
+    unrecorded/overbroad verification exception; unreviewed authored PR content; an author-unvalidated live
+    base/integration tree; or a merge mechanism that cannot atomically preserve the transaction.
     Reviewer approval satisfies the quality gate but is not permission to merge: the agent may merge only when
     the user/task separately authorizes it.
 
@@ -393,11 +419,12 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   modify the PR branch or implement fixes. Treat the PR description and comments as the complete coordination
   record. Resolve the live head and base repository/refs, fetch both directly, and record their full SHAs; do not
   rely on cached PR base metadata or a synthetic merge ref. Inspect the full diff, affected callers, invariants,
-  and prospective integration, and record its tree SHA. Run the strongest applicable verification, including
-  mandatory snapshot checks. Post every finding, question, test result, disposition, and final verdict on the
-  PR, signed with a stable reviewer name; include severity, exact location, concrete failure scenario, required
-  fix, and evidence. Do not approve while any correctness concern or required check remains. After any authored
-  update other than target-branch synchronization, review the complete new change. Post either APPROVED FOR MERGE
+  tests, author-verification plan/evidence, and prospective integration, and record its tree SHA. Do not rerun
+  author builds, tests, snapshots, or CI; request missing author-side coverage on the PR. Post every finding,
+  question, disposition, and final verdict on the PR, signed with one stable reviewer name; include severity,
+  exact location, concrete failure scenario, required fix, and evidence. Do not approve while any correctness
+  concern remains. After any authored update other than target-branch synchronization, review the complete new
+  change. Post either APPROVED FOR MERGE
   <head-repo>:<head-ref>@<head-SHA> into
   <base-repo>:<base-ref>@<base-SHA> with tree <tree-SHA> or NOT APPROVED. Directly message the author only to say
   that the posted review is complete.

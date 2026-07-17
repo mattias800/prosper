@@ -3,6 +3,11 @@
 Developer/agent tooling. These are debugging and verification aids, not part of
 the shipped runtime. Build them from `build-linux/` like everything else.
 
+- **`verify-pr.ps1`** - author-owned PR verification orchestrator for the Windows+WSL development
+  environment. Run it only from a clean, pushed PR head: `docs` records the diff check, `core` adds
+  Linux and Windows build+ctest, and `renderer -Snapshot NAME` also runs the selected real-game guard.
+  `-Pr N` posts the generated SHA-bound `AUTHOR VERIFICATION` record. Reviewers inspect its coverage
+  but do not rerun it; see the mandatory merge policy in the root `CLAUDE.md`.
 - **`snapshot/`** - routed, multi-frame **rendering regression guard**. Run
   `python3 tools/snapshot/snapshot.py check` after any change that can affect
   rendered output (recompiler, AGC decode, render state, detile, present). It
