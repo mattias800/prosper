@@ -18,10 +18,18 @@ function Assert-True {
 function Invoke-Verifier {
     param([string[]] $Arguments)
 
-    $Output = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $Verifier @Arguments 2>&1 |
-        ForEach-Object { $_.ToString() })
+    $PreviousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $Output = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $Verifier @Arguments 2>&1 |
+            ForEach-Object { $_.ToString() })
+        $ExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $PreviousErrorAction
+    }
     return [pscustomobject]@{
-        ExitCode = $LASTEXITCODE
+        ExitCode = $ExitCode
         Output = $Output -join [Environment]::NewLine
     }
 }
