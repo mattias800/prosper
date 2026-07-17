@@ -737,7 +737,11 @@ bool MediaFoundationBackend::eof(int id) {
     auto session = impl_->get(id);
     if (!session) return true;
     std::lock_guard<std::mutex> lock(session->mutex);
-    return session->decode_done && session->video_queue.empty() && session->audio_queue.empty();
+    // The guest may route or disable audio without ever pulling it from AvPlayer. The bounded
+    // audio queue intentionally does not stall decode, so it must not stall playback completion
+    // after the final video frame either. Queued/last audio storage remains owned by the session
+    // until close, preserving successful-pull pointer lifetime.
+    return session->decode_done && session->video_queue.empty();
 }
 
 void MediaFoundationBackend::close(int id) {

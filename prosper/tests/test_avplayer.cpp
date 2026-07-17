@@ -42,18 +42,21 @@ class FakeVideoBackend final : public video::VideoBackend {
 public:
     bool fail_open = false;
     bool delivered = false;
+    bool audio_delivered = false;
     int close_count = 0;
     std::string opened_path;
     std::vector<uint8_t> nv12 = std::vector<uint8_t>(640 * 360 * 3 / 2, 0x40);
+    std::vector<int16_t> pcm = std::vector<int16_t>(2 * 128, 0x20);
 
     int open(const std::string& host_path) override {
-        opened_path = host_path; delivered = false;
+        opened_path = host_path; delivered = false; audio_delivered = false;
         return fail_open ? -1 : 17;
     }
     bool info(int id, video::StreamInfo& out) override {
         if (id != 17) return false;
         out.width = 640; out.height = 360; out.fps = 60.0f;
-        out.has_audio = false; out.duration_us = 2'000'000;
+        out.has_audio = true; out.audio_channels = 2; out.audio_rate = 48'000;
+        out.duration_us = 2'000'000;
         return true;
     }
     bool next_video(int id, video::VideoFrame& out) override {
@@ -63,7 +66,13 @@ public:
         out.pts_us = 16'667; delivered = true;
         return true;
     }
-    bool next_audio(int, video::AudioFrame&) override { return false; }
+    bool next_audio(int id, video::AudioFrame& out) override {
+        if (id != 17 || audio_delivered) return false;
+        out.pcm = pcm.data(); out.channels = 2; out.samples = 128; out.sample_rate = 48'000;
+        out.pts_us = 0; audio_delivered = true;
+        return true;
+    }
+    // Video completion must not wait for an audio packet that the guest never requests.
     bool eof(int id) override { return id != 17 || delivered; }
     void close(int id) override { if (id == 17) ++close_count; }
 };
@@ -163,14 +172,16 @@ int main() {
           "native source opens through the registered backend");
     CHECK(fake.opened_path == "C:/prosper-test-app0/movie.mp4",
           "native backend receives the resolved host path, not raw /app0");
-    CHECK(streams(native_handle, 0, 0, 0, 0, 0) == 1,
-          "native video-only source enumerates one stream");
+    CHECK(streams(native_handle, 0, 0, 0, 0, 0) == 2,
+          "native audio-bearing source enumerates video and audio streams");
     AvpStreamInfoEx native_info{}; native_info.size = sizeof(native_info);
     CHECK(infoex(native_handle, 0, (uint64_t)(uintptr_t)&native_info, 0, 0, 0) == 0 &&
               native_info.type == 1 && native_info.duration == 2000,
           "native stream metadata and duration come from the backend");
-    CHECK(infoex(native_handle, 1, (uint64_t)(uintptr_t)&native_info, 0, 0, 0) != 0,
-          "video-only source rejects a fabricated audio stream");
+    native_info = {}; native_info.size = sizeof(native_info);
+    CHECK(infoex(native_handle, 1, (uint64_t)(uintptr_t)&native_info, 0, 0, 0) == 0 &&
+              native_info.type == 2,
+          "native audio stream metadata comes from the backend");
     CHECK(start(native_handle, 0, 0, 0, 0, 0) == 0 && event_count == 2 &&
               events[0] == 2 && events[1] == 3,
           "native playback fires READY then PLAY");
@@ -185,8 +196,12 @@ int main() {
     CHECK(native_width == 640 && native_height == 360 && native_fps == 60.0,
           "native frame details preserve backend dimensions and frame rate");
     CHECK(video(native_handle, (uint64_t)(uintptr_t)&native_frame, 0, 0, 0, 0) == 0 &&
-              event_count == 3 && events[2] == 1,
-          "native EOF fires one STOP callback");
+              event_count == 3 && events[2] == 1 && !fake.audio_delivered,
+          "video-only consumption of an audio-bearing source reaches EOF and fires one STOP");
+    CHECK(active(native_handle, 0, 0, 0, 0, 0) == 0 &&
+              video(native_handle, (uint64_t)(uintptr_t)&native_frame, 0, 0, 0, 0) == 0 &&
+              event_count == 3,
+          "completed audio-bearing playback stays inactive without repeating STOP");
     close(native_handle, 0, 0, 0, 0, 0);
     CHECK(fake.close_count == 1, "Close releases the native decode session");
     prosper::video::set_backend(nullptr);

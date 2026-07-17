@@ -46,7 +46,9 @@ public:
     // Successful pull pointers remain valid until the next pull of that media type for this id.
     virtual bool next_video(int id, VideoFrame& out) = 0;  // false if no frame ready yet
     virtual bool next_audio(int id, AudioFrame& out) = 0;  // false if no audio ready yet
-    virtual bool eof(int id) = 0;                          // true once fully played out
+    // AvPlayer video completion is driven by the video stream. Queued audio must not keep a
+    // video-only consumer active after decode has ended and the final video frame was delivered.
+    virtual bool eof(int id) = 0;
     virtual void close(int id) = 0;
 };
 

@@ -60,6 +60,20 @@ int main(int argc, char** argv) {
                 CHECK(video_frames >= 3, "Media Foundation delivers multiple real video frames");
                 if (stream.has_audio)
                     CHECK(audio_frames > 0, "Media Foundation delivers real audio samples");
+                if (stream.has_audio && video_frames >= 3) {
+                    // Stop consuming audio and drain only video. A bounded queue may still contain
+                    // PCM at stream end, but that must not keep video-only playback active forever.
+                    const auto eof_deadline =
+                        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+                    while (std::chrono::steady_clock::now() < eof_deadline &&
+                           !backend()->eof(id)) {
+                        VideoFrame video{};
+                        if (backend()->next_video(id, video)) ++video_frames;
+                        else std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                    CHECK(backend()->eof(id),
+                          "video-only consumption reaches EOF despite queued audio");
+                }
                 backend()->close(id);
             }
         }
