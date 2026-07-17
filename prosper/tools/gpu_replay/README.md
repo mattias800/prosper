@@ -1,8 +1,8 @@
 # GPU replay
 
 `gpu_replay` inspects, validates, graphs, and renders a local `.prgcap` without booting the guest.
-Capsules contain title-derived shaders, resource bytes, addresses, optional rendered RTT pixels, and optional
-exact persistent Vulkan depth/stencil checkpoint planes.
+Capsules contain title-derived shaders, resource bytes, addresses, ordered DMA endpoints, optional rendered RTT
+pixels, and optional exact persistent Vulkan depth/stencil checkpoint planes.
 They are gitignored local artifacts and must never be committed or shared as project fixtures.
 
 Normal capture preflights merged resource ranges and rejects plans above 512 MiB before allocating.
@@ -147,10 +147,10 @@ realized item's `draw_index`, never treat them as offsets into the compact draw 
 other graphics draws. This isolates geometry whose vertex/indirect buffers are produced earlier in the same
 submit without losing those producers. Plain `--draw` intentionally remains the cheaper graphics-only path.
 
-`--through-operation N` executes the inclusive mixed graphics/compute prefix `0..N`, preserving operation
+`--through-operation N` executes the inclusive mixed graphics/compute/DMA prefix `0..N`, preserving operation
 order and all earlier work. Prefix output uses the last executed draw target's native dimensions. Use it with
 a hash-verified seeded final capsule for fast composition bisection; unlike `--draw`, it does not discard
-compute dispatches or earlier draws.
+DMA copies, compute dispatches, or earlier draws.
 
 `--prepend` materializes and executes one earlier capsule in the same renderer instance before the consumer.
 Its rendered targets take precedence over consumer RTT seeds at matching addresses; unrelated seeds are still
@@ -188,6 +188,10 @@ block-size fields, and metadata address. Version 12 captures the exact DCC contr
 validated single-sample/base-level SW_64KB_R_X layout; metadata-only and older capsules keep their absence
 explicit. Version 13 tags every temporal color RTT seed as `rgba8` or `rgba16f`, preserving its native byte
 width through standalone replay while reading v1..v12 seeds as the historical RGBA8 default.
+Version 14 appends address-backed `DMA_DATA` records with exact source and destination guest identities, byte
+counts, PM4 order, and content-addressed endpoint blob references. Replay mutates the same owned resource
+instances used by later draws and dispatches and invalidates renderer caches for the guest destination range;
+v1..v13 capsules remain readable and do not invent DMA operations.
 `--inspect-only` reports the RTT format and the planned/captured byte counts, non-zero and unique-byte counts,
 first control word, and content hash. A software DCC decode is still not inferred. The capsule's standalone
 output must match the bundle's final hash before using it for fast `--draw`, operation-prefix, resource, or

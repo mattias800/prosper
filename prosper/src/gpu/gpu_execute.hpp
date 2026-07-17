@@ -189,11 +189,25 @@ struct ComputeItem {
     uint64_t command_order = 0;
 };
 
-enum class SubmitOperationKind : uint8_t { Draw, Dispatch };
+enum class SubmitOperationKind : uint8_t { Draw, Dispatch, DmaCopy };
 struct SubmitOperation {
     SubmitOperationKind kind = SubmitOperationKind::Draw;
     size_t index = 0;
     uint64_t command_order = 0;
+};
+
+// Offline captures keep guest addresses as stable identities while their bytes live in owned host
+// storage. This replay-facing DMA item binds both views so ordered execution can mutate the exact
+// resource instances consumed by later draws/dispatches and invalidate renderer caches by guest VA.
+struct ReplayDmaCopy {
+    uint64_t dst = 0, src = 0;
+    uint32_t bytes = 0, sels = 0;
+    uint64_t command_order = 0;
+    uint64_t packet_addr = 0;
+    uint8_t* destination_data = nullptr;
+    const uint8_t* source_data = nullptr;
+    uint64_t destination_size = 0;
+    uint64_t source_size = 0;
 };
 
 enum class ShaderProgramStage : uint8_t { Vertex, Fragment, Compute };
@@ -1010,6 +1024,13 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
                                           const std::vector<DrawItem>& draws,
                                           const std::vector<ComputeItem>& computes,
                                           const std::vector<GpuState::DmaCopy>& dma_copies,
+                                          const LiveRenderFn& render,
+                                          const LiveComputeFn& compute,
+                                          uint32_t width, uint32_t height);
+OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& operations,
+                                          const std::vector<DrawItem>& draws,
+                                          const std::vector<ComputeItem>& computes,
+                                          const std::vector<ReplayDmaCopy>& dma_copies,
                                           const LiveRenderFn& render,
                                           const LiveComputeFn& compute,
                                           uint32_t width, uint32_t height);
