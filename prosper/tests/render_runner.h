@@ -58,9 +58,9 @@ inline bool dump_bmp(const char* path, const std::vector<uint8_t>& px, uint32_t 
 struct TexDesc { uint32_t binding; uint32_t w; uint32_t h; const uint8_t* rgba;
                  uint32_t max_aniso_ratio = 0; };   // #275: S# anisotropy ratio (0 = isotropic)
 
-// One resource for the general N-binding path (render_triangle_rgba's `gres`): either a storage buffer
-// (dwords non-empty, tex_rgba null) or a combined image sampler (tex_rgba set) at `binding`. Lets a
-// real game shader that declares several constant/vertex buffers + textures have each bound distinctly.
+// One resource for the general N-binding path (render_triangle_rgba's `gres`): a storage buffer
+// (dwords non-empty, tex_rgba null), combined image sampler, or storage image at `binding`. Lets a
+// real game shader that declares several buffers and images have each bound distinctly.
 struct FrameResource {
     uint32_t binding = 0;
     uint32_t set = 0;               // descriptor set: VS resources -> 0, PS resources -> 1 (they must not
@@ -73,6 +73,10 @@ struct FrameResource {
     // Renderer-owned RTTs keep their native format between producer and consumer. Guest-backed
     // textures still arrive through the existing RGBA8 decoder unless explicitly tagged otherwise.
     VkFormat texture_format = VK_FORMAT_R8G8B8A8_UNORM;
+    // StorageImage is a distinct Vulkan descriptor contract: no sampler, STORAGE usage, and GENERAL
+    // layout. Keep the flag independent of tex_rgba because both sampled and storage images upload
+    // decoded pixels through that pointer.
+    bool is_storage_image = false;
     // Sampler state (Texture only). Defaults = LINEAR + clamp-to-edge — the harness's prior fixed
     // sampler — so render tests that build FrameResources directly stay byte-identical. The live path
     // fills these from the decoded S# (shader_resources.hpp). filter: 0=nearest, 1=linear; addr = Gen5
@@ -334,6 +338,13 @@ inline const RenderVkCtx& render_vk_ctx() {
         r.aniso_enabled = supported.samplerAnisotropy;
         r.max_aniso_limit = phys_props.limits.maxSamplerAnisotropy;
         if (r.aniso_enabled) feats.samplerAnisotropy = VK_TRUE;
+        // Storage-image shaders declare the format-free read/write capabilities. Enable every
+        // corresponding core feature advertised by the device; fragment/vertex stores additionally
+        // need their pipeline-stage store features.
+        feats.shaderStorageImageReadWithoutFormat = supported.shaderStorageImageReadWithoutFormat;
+        feats.shaderStorageImageWriteWithoutFormat = supported.shaderStorageImageWriteWithoutFormat;
+        feats.vertexPipelineStoresAndAtomics = supported.vertexPipelineStoresAndAtomics;
+        feats.fragmentStoresAndAtomics = supported.fragmentStoresAndAtomics;
         // robustImageAccess (VK_EXT_image_robustness): OpImageRead OOB must return zero (#131). Guarded.
         // Device extensions accumulate into a vector so the (optional) image-robustness and (macOS)
         // portability-subset extensions coexist.
@@ -1403,10 +1414,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         uint32_t width = 0, height = 0, depth = 1;
         uint32_t img_dim = 1;
         VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+        bool storage_image = false;
         bool operator==(const TextureUploadKey& other) const {
             return pixels == other.pixels && render_target_id == other.render_target_id &&
                    width == other.width && height == other.height && depth == other.depth &&
-                   img_dim == other.img_dim && format == other.format;
+                   img_dim == other.img_dim && format == other.format &&
+                   storage_image == other.storage_image;
         }
     };
     struct TextureUploadKeyHash {
@@ -1418,6 +1431,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             h ^= static_cast<size_t>(key.depth) + 0x9e3779b9u + (h << 6) + (h >> 2);
             h ^= static_cast<size_t>(key.img_dim) + 0x9e3779b9u + (h << 6) + (h >> 2);
             h ^= static_cast<size_t>(key.format) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            h ^= static_cast<size_t>(key.storage_image) + 0x9e3779b9u + (h << 6) + (h >> 2);
             return h;
         }
     };
@@ -1669,13 +1683,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             std::vector<VkDescriptorBufferInfo> dbi(R.size());
             std::vector<VkDescriptorImageInfo> dii(R.size());
             std::vector<VkWriteDescriptorSet> wr(R.size());
-            uint32_t n_storage = 0, n_sampler = 0;
+            uint32_t n_storage_buffer = 0, n_sampler = 0, n_storage_image = 0;
             for (size_t i = 0; i < R.size(); i++) {
                 const FrameResource& r = R[i];
                 lb[i] = {}; lb[i].binding = r.binding; lb[i].descriptorCount = 1;
                 if (r.is_texture()) {
-                    n_sampler++;
-                    lb[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                    if (r.is_storage_image) n_storage_image++; else n_sampler++;
+                    lb[i].descriptorType = r.is_storage_image
+                        ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                        : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
                     // A set-0 texture belongs to the VERTEX shader (build_R tags VS resources into set 0,
                     // PS into set 1). stageFlags must include every stage that reads the binding, so a
                     // vertex texture fetch (displacement/heightmap, GPU vertex animation) needs
@@ -1687,7 +1703,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     texture_references++;
                     const TextureUploadKey texture_key{
                         r.tex_rgba, r.persistent_render_target_id, r.tw, r.th, r.td, r.img_dim,
-                        backend_color_format(r.texture_format)};
+                        backend_color_format(r.texture_format), r.is_storage_image};
                     size_t upload_index = SIZE_MAX;
                     if (share_texture_uploads) {
                         auto found = texture_upload_indices.find(texture_key);
@@ -1702,7 +1718,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
 
                         const bool target_feedback = persistent_color &&
                             r.persistent_render_target_id == color_target->persistent_id;
-                        if (persistent_color_targets_enabled && !target_feedback &&
+                        if (!r.is_storage_image && persistent_color_targets_enabled && !target_feedback &&
                             r.persistent_render_target_id && r.img_dim == 1) {
                             if (auto* target = find_persistent_color_target(
                                     r.persistent_render_target_id, r.tw, r.th,
@@ -1714,11 +1730,11 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                 ++color_target_stats.sampled_hits;
                             }
                         }
-                        upload.persistent_id = r.persistent_texture_id;
+                        upload.persistent_id = r.is_storage_image ? 0 : r.persistent_texture_id;
                         const PersistentTextureKey persistent_key{
                             r.persistent_texture_id, r.tw, r.th, r.td, r.img_dim,
                             backend_color_format(r.texture_format)};
-                        if (!upload.borrowed_target && persistent_textures_enabled &&
+                        if (!r.is_storage_image && !upload.borrowed_target && persistent_textures_enabled &&
                             r.persistent_texture_id) {
                             auto cached = persistent_texture_images.find(persistent_key);
                             if (cached != persistent_texture_images.end()) {
@@ -1740,7 +1756,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                             tci.extent = {r.tw, r.th, r.td};
                             tci.mipLevels = 1; tci.arrayLayers = 1;
                             tci.samples = VK_SAMPLE_COUNT_1_BIT; tci.tiling = VK_IMAGE_TILING_OPTIMAL;
-                            tci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                            tci.usage = (r.is_storage_image ? VK_IMAGE_USAGE_STORAGE_BIT
+                                                          : VK_IMAGE_USAGE_SAMPLED_BIT) |
+                                        VK_IMAGE_USAGE_TRANSFER_DST_BIT;
                             vkCreateImage(dev, &tci, nullptr, &upload.image);
                             VkMemoryRequirements tr;
                             vkGetImageMemoryRequirements(dev, upload.image, &tr);
@@ -1748,7 +1766,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                             VkMemoryAllocateInfo tai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
                             tai.allocationSize = tr.size;
                             tai.memoryTypeIndex = pick(tr.memoryTypeBits, 0);
-                            const bool retain = persistent_textures_enabled && upload.persistent_id &&
+                            const bool retain = !r.is_storage_image && persistent_textures_enabled &&
+                                                upload.persistent_id &&
                                                 tr.size <= persistent_texture_limit;
                             if (retain && vkAllocateMemory(dev, &tai, nullptr, &upload.memory) == VK_SUCCESS)
                                 upload.direct_memory = true;
@@ -1810,7 +1829,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                             default: return VK_COMPONENT_SWIZZLE_IDENTITY;
                         }
                     };
-                    if (!getenv("PROSPER_NO_SWIZZLE"))
+                    // Vulkan component mappings do not apply to storage-image accesses.
+                    if (!r.is_storage_image && !getenv("PROSPER_NO_SWIZZLE"))
                         tvci.components = {vkswz(r.swizzle[0]), vkswz(r.swizzle[1]), vkswz(r.swizzle[2]), vkswz(r.swizzle[3])};
                     tvci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}; vkCreateImageView(dev, &tvci, nullptr, &v.tview[i]);
                     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -1856,12 +1876,14 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                         default: sci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK; break;
                     }
                     sci.minLod = r.min_lod; sci.maxLod = r.max_lod; sci.mipLodBias = r.lod_bias;
-                    vkCreateSampler(dev, &sci, nullptr, &v.tsamp[i]);
-                    dii[i] = {v.tsamp[i], v.tview[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                    if (!r.is_storage_image) vkCreateSampler(dev, &sci, nullptr, &v.tsamp[i]);
+                    const VkImageLayout image_layout = r.is_storage_image
+                        ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    dii[i] = {v.tsamp[i], v.tview[i], image_layout};
                     wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr[i].dstBinding = r.binding; wr[i].descriptorCount = 1;
-                    wr[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wr[i].pImageInfo = &dii[i];
+                    wr[i].descriptorType = lb[i].descriptorType; wr[i].pImageInfo = &dii[i];
                 } else {
-                    n_storage++;
+                    n_storage_buffer++;
                     lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; lb[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
                     VkDeviceSize sz = r.dwords.empty() ? 4 : (VkDeviceSize)r.dwords.size() * 4;
                     VkBufferCreateInfo sbci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; sbci.size = sz; sbci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
@@ -1887,10 +1909,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 dslci.bindingCount = (uint32_t)slb.size(); dslci.pBindings = slb.data();
                 vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &v.dsls[s]);
             }
-            VkDescriptorPoolSize psz[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, n_storage ? n_storage : 1},
-                                           {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, n_sampler ? n_sampler : 1}};
+            VkDescriptorPoolSize psz[3] = {
+                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, n_storage_buffer ? n_storage_buffer : 1},
+                {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, n_sampler ? n_sampler : 1},
+                {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, n_storage_image ? n_storage_image : 1}};
             VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-            dpci.maxSets = v.n_sets; dpci.poolSizeCount = n_sampler ? 2 : 1; dpci.pPoolSizes = psz; vkCreateDescriptorPool(dev, &dpci, nullptr, &v.dpool);
+            dpci.maxSets = v.n_sets; dpci.poolSizeCount = 3; dpci.pPoolSizes = psz; vkCreateDescriptorPool(dev, &dpci, nullptr, &v.dpool);
             VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
             dsai.descriptorPool = v.dpool; dsai.descriptorSetCount = v.n_sets; dsai.pSetLayouts = v.dsls.data();
             vkAllocateDescriptorSets(dev, &dsai, v.dsets.data());
@@ -1955,9 +1979,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 append(static_cast<uint32_t>(R.size()));
                 for (size_t i = 0; i < R.size(); ++i) {
                     const bool texture = R[i].is_texture();
-                    const VkDescriptorType descriptor_type = texture
-                        ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-                        : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    const VkDescriptorType descriptor_type = !texture
+                        ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                        : (R[i].is_storage_image ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                                 : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
                     const VkShaderStageFlags stage_flags = !texture || R[i].set == 0
                         ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
                         : VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -2201,9 +2226,13 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         vkCmdCopyBufferToImage(cmd, upload.staging, upload.image,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &tc);
         VkImageMemoryBarrier b1{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        b1.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b1.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b1.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b1.newLayout = upload.key.storage_image
+            ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         b1.image = upload.image; b1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        b1.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b1.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        b1.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b1.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+            (upload.key.storage_image ? VK_ACCESS_SHADER_WRITE_BIT : 0);
         // The dst stage must cover EVERY stage that samples this image. #376 made set-0 textures
         // VS-visible (stageFlags VERTEX|FRAGMENT), so a vertex texture fetch reads it in the VERTEX
         // stage — a FRAGMENT-only barrier leaves the transfer-write→shader-read dependency unordered

@@ -674,6 +674,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     bool resource_persistent_miss = false;
                     bool resource_persistent_invalidation = false;
                     prosper::test::FrameResource fr; fr.binding = r.binding; fr.set = set;
+                    fr.is_storage_image = r.cls == RC::StorageImage;
                     // Captured replays preserve the logical guest address for RT identity but provide
                     // owned bytes here. Production resources leave host_data null and use guest memory.
                     auto copy_resource = [&](uint8_t* dst, uint64_t addr, size_t n) -> size_t {
@@ -719,7 +720,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const bool has_cpu_live_rtt = r.img_dim == 1u && live_rtt != g_rtt.end() &&
                             live_rtt->second.w && live_rtt->second.h && live_rtt->second.rgba &&
                             !live_rtt->second.rgba->empty();
-                        const bool has_gpu_live_rtt = live_gpu_targets && r.img_dim == 1u &&
+                        // A retained render target was created for color-attachment + sampled usage,
+                        // not storage usage. Storage images therefore take the decoded/upload path.
+                        const bool has_gpu_live_rtt = !fr.is_storage_image && live_gpu_targets &&
+                            r.img_dim == 1u &&
                             live_rtt != g_rtt.end() && live_rtt->second.gpu_valid &&
                             live_rtt->second.w == tw && live_rtt->second.h == th &&
                             r.gpu_addr != draw.color0_base &&
@@ -742,7 +746,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             persistent_rgba_texture &&
                             !prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
                             (!getenv("PROSPER_DETILE") || atoi(getenv("PROSPER_DETILE")) == 0);
-                        const bool persistent_cache_eligible =
+                        const bool persistent_cache_eligible = !fr.is_storage_image &&
                             !getenv("PROSPER_NO_TEXTURE_DECODE_CACHE") &&
                             !r.compression_enabled &&
                             persistent_decode_limit &&
@@ -1687,10 +1691,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     size_t count = 0;
                     for (const auto& r : resources) if (r.set == set && r.binding == d.binding) ++count;
                     const bool wants_buffer = d.kind == prosper::gpu::SpirvDescriptorKind::StorageBuffer;
+                    const bool wants_storage_image =
+                        d.kind == prosper::gpu::SpirvDescriptorKind::StorageImage;
                     const uint64_t available = first == resources.end() ? 0 :
                         (first->is_texture() ? (uint64_t)first->tw * first->th * first->td * 4
                                              : first->dwords.size() * 4);
-                    const bool wrong_type = first != resources.end() && (first->is_texture() == wants_buffer);
+                    const bool wrong_type = first != resources.end() &&
+                        (wants_buffer ? first->is_texture()
+                                      : (!first->is_texture() ||
+                                         first->is_storage_image != wants_storage_image));
                     const bool undersized = wants_buffer && available < std::max<uint64_t>(d.required_bytes, 4);
                     resources.erase(std::remove_if(resources.begin(), resources.end(), [&](const auto& r) {
                         return r.set == set && r.binding == d.binding;
@@ -1703,6 +1712,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         replacement.dwords.assign(words, 0x7FC0CDCDu);
                     } else {
                         replacement.tex_rgba = poison_tex; replacement.tw = 2; replacement.th = 2;
+                        replacement.is_storage_image = wants_storage_image;
                         replacement.mag_filter = replacement.min_filter = 0;
                     }
                     fprintf(stderr, "[descriptor] poison set=%u binding=%u type=%s reason=%s%s%s%s\n",
