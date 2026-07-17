@@ -623,6 +623,16 @@ int recovery_thunk_call_rsp_mod16() {
 void arm_hwbp_this_thread() {}
 
 uint64_t stub_addr(uint64_t idx) { return g_stub_base + idx * g_stub_size; }
+uint64_t hle_guest_return_address(uint64_t entry_rsp) {
+    if (!entry_rsp) return 0;
+    const uint64_t immediate = *(const uint64_t*)(uintptr_t)entry_rsp;
+    const bool from_stub = g_stub_size && immediate >= g_stub_base &&
+                           (immediate - g_stub_base) / g_stub_size < g_nstubs;
+    // The SysV-to-MS bridge reserves 0x48 bytes and CALLS the HLE handler. Including that call's
+    // return slot, the original guest return address is 0x50 bytes above the handler-entry RSP.
+    if (from_stub) return *(const uint64_t*)(uintptr_t)(entry_rsp + 0x50);
+    return immediate;
+}
 uint64_t invoke_stub(uint64_t idx) {
     if (idx >= g_nstubs) return 0;
     return ((HleFn)(uintptr_t)stub_addr(idx))(0, 0, 0, 0, 0, 0);

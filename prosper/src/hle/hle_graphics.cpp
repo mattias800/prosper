@@ -12,6 +12,7 @@
 // Sony libs, so they're registered by raw NID with a note on the observed role.
 #include "dispatch.hpp"
 #include "nid.hpp"
+#include "host/exec_image.hpp"
 #include "gpu/videoout_present.hpp"
 #include "gpu/gpu_execute.hpp"      // guest_readable (safe pointer probe for the diagnostic dumps)
 #include <cstdlib>
@@ -333,10 +334,11 @@ HLE(g_vo_set_window_mode_margins) { vo_argtrace("SetWindowModeMargins", a0,a1,a2
 // the real AGC->Vulkan work (M4/M5), NOT faked output.
 //
 // Per-NID identification: each NID is bound to a distinct template thunk `glog_thunk<I>` that knows
-// its own name (kAgcNids[I]). The guest reaches the thunk via our stub's tail-jump, so at thunk entry
-// [rsp] is the guest return address into eboot (base 0x400000000) — __builtin_return_address(0) gives
-// the exact callsite. Result: `PROSPER_GFXLOG=1 boot_trace <dump>` emits a self-describing dataset
-// (NID + callsite + args per call) — everything needed to RE the AGC object model.
+// its own name (kAgcNids[I]). Plain POSIX stubs tail-jump into the thunk, while Linux guest-FS and
+// Windows ABI bridge stubs CALL it. Capture the thunk's pre-prologue stack and unwrap either shape so
+// the trace always reports the original guest return address, never the generated-stub return site.
+// Result: `PROSPER_GFXLOG=1 boot_trace <dump>` emits a self-describing dataset (NID + guest callsite +
+// args per call) — everything needed to RE the AGC object model.
 namespace {
 // The libSceAgc/AgcDriver NIDs the game calls (observed via boot_trace's unimplemented log). The
 // first four are AgcDriver; the rest are libSceAgc functions used during GfxDevicePS5SharedData init
@@ -490,7 +492,9 @@ uint64_t glog_impl(const char* nid, void* ra,
 template <size_t I>
 __attribute__((noinline)) PROSPER_SYSV_ABI uint64_t glog_thunk(uint64_t a0, uint64_t a1, uint64_t a2,
                                               uint64_t a3, uint64_t a4, uint64_t a5) {
-    return glog_impl(kAgcNids[I], __builtin_return_address(0), a0, a1, a2, a3, a4, a5);
+    const uint64_t entry_rsp = (uint64_t)(uintptr_t)__builtin_frame_address(0) + sizeof(uint64_t);
+    const uint64_t guest_ra = hle_guest_return_address(entry_rsp);
+    return glog_impl(kAgcNids[I], (void*)(uintptr_t)guest_ra, a0, a1, a2, a3, a4, a5);
 }
 template <size_t Offset, size_t... Is>
 void register_agc_tracers(std::index_sequence<Is...>) {

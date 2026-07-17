@@ -38,6 +38,13 @@ void install_sigaltstack();
 // Address of the idx-th import's stub (for tests/bring-up).
 uint64_t stub_addr(uint64_t idx);
 
+// Recover the original caller from an HLE handler's entry stack. Plain POSIX import stubs
+// tail-jump, so [entry_rsp] is already the guest return address. Linux guest-FS and Windows ABI
+// bridge stubs call the handler and leave a generated-stub return address at [entry_rsp]; this
+// unwraps the bridge-specific frame to the guest return address saved behind it.
+// `entry_rsp` must be captured before the handler's compiler prologue.
+uint64_t hle_guest_return_address(uint64_t entry_rsp);
+
 // Test/bring-up: call the idx-th import's stub as the guest would; returns its result.
 uint64_t invoke_stub(uint64_t idx);
 

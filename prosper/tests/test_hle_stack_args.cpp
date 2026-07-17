@@ -23,13 +23,18 @@ constexpr uint64_t kReturn = 0xabcddcba01234567ull;
 uint64_t g_seen[9] = {};
 extern "C" {
 uint64_t prosper_test_hle_entry_rsp_mod16 = ~uint64_t{0};
+uint64_t prosper_test_hle_entry_rsp = 0;
 }
+uint64_t g_immediate_return = 0;
+uint64_t g_guest_return = 0;
 
 extern "C" uint64_t prosper_test_hle9_handler(
     uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
     uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8) {
     const uint64_t args[9] = {a0, a1, a2, a3, a4, a5, a6, a7, a8};
     for (int i = 0; i < 9; ++i) g_seen[i] = args[i];
+    g_immediate_return = *(const uint64_t*)(uintptr_t)prosper_test_hle_entry_rsp;
+    g_guest_return = hle_guest_return_address(prosper_test_hle_entry_rsp);
     return kReturn;
 }
 
@@ -50,6 +55,7 @@ __asm__(
     ".p2align 4\n"
     ".globl " PROSPER_ASM_SYMBOL(prosper_test_hle9_entry) "\n"
     PROSPER_ASM_SYMBOL(prosper_test_hle9_entry) ":\n"
+    "    movq %rsp, " PROSPER_ASM_SYMBOL(prosper_test_hle_entry_rsp) "(%rip)\n"
     "    movq %rsp, %r10\n"
     "    andq $15, %r10\n"
     "    movq %r10, " PROSPER_ASM_SYMBOL(prosper_test_hle_entry_rsp_mod16) "(%rip)\n"
@@ -128,8 +134,14 @@ int main(int argc, char** argv) {
 #endif
 
     auto call = reinterpret_cast<GuestHle9>(static_cast<uintptr_t>(stub_addr(1)));
+    const uint64_t callsite_begin = (uint64_t)(uintptr_t)&&before_hle_call;
+    const uint64_t callsite_end = (uint64_t)(uintptr_t)&&after_hle_call;
+before_hle_call:
+    asm volatile("" ::: "memory");
     const uint64_t result = call(kArgs[0], kArgs[1], kArgs[2], kArgs[3], kArgs[4],
                                  kArgs[5], kArgs[6], kArgs[7], kArgs[8]);
+    asm volatile("" ::: "memory");
+after_hle_call:
 
 #if defined(__linux__)
     if (guest_fs_active) guest_fs_enter_host_for_signal();
@@ -138,6 +150,27 @@ int main(int argc, char** argv) {
     CHECK(!guest_fs || guest_fs_active, "activated a guest FS base for the call");
     CHECK(result == kReturn, "return value crossed the import ABI bridge");
     CHECK(prosper_test_hle_entry_rsp_mod16 == 8, "host handler entered with RSP%16 == 8");
+    const bool called_bridge =
+#if defined(_WIN32)
+        true;
+#elif defined(__linux__)
+        guest_fs;
+#else
+        false;
+#endif
+    const uint64_t stub_begin = stub_addr(1);
+    const uint64_t stub_end = stub_begin + 96;
+    if (called_bridge) {
+        CHECK(g_immediate_return >= stub_begin && g_immediate_return < stub_end,
+              "bridge handler's immediate return points into its generated stub");
+    } else {
+        CHECK(g_immediate_return == g_guest_return,
+              "tail-jump handler uses its immediate return as the guest callsite");
+    }
+    const uint64_t callsite_lo = callsite_begin < callsite_end ? callsite_begin : callsite_end;
+    const uint64_t callsite_hi = callsite_begin < callsite_end ? callsite_end : callsite_begin;
+    CHECK(g_guest_return >= callsite_lo && g_guest_return <= callsite_hi,
+          "recovered HLE caller points to the real import callsite, not the generated stub");
     for (int i = 0; i < 9; ++i) {
         char what[96];
         std::snprintf(what, sizeof what, "argument %d preserved (0x%016llx)", i + 1,
