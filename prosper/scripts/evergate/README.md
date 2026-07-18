@@ -31,17 +31,23 @@ python3 tools/snapshot/snapshot.py check evergate-title
 
 ## Realtime harness
 
+Realtime and performance runs must render every submit at the guest's native resolution. The
+`--render-every 500` and `PROSPER_RENDER_SCALE=4` settings above are snapshot-only acceleration:
+carrying them into `prosper-app` skips visible updates during the opening and renders Evergate's
+1920x1080 output at 480x270 before scaling it to the window.
+
 ```sh
 PROSPER_GUEST_FS=1 \
 PROSPER_GUEST_ARGS=-force-gfx-direct \
-PROSPER_RENDER_EVERY=500 \
-PROSPER_RENDER_EVERY_FOR_MS=90000 \
-PROSPER_RENDER_SCALE=4 \
+PROSPER_RENDER_EVERY=1 \
+PROSPER_RENDER_SCALE=1 \
 PROSPER_PAD_SCRIPT=@scripts/evergate/reach-first-gameplay.pad \
   ./build-linux-app/prosper-app --dump /path/to/PPSA01885-app0
 ```
 
 Use the equivalent environment variables with `prosper-app.exe` on Windows. The scripted input is
 composed with the normal SDL keyboard/controller backend, so the window remains interactive after
-the route reaches gameplay. Set `PROSPER_APP_DUMP_FRAMES=1` and `PROSPER_FRAME_DIR=/path/to/frames`
-to retain the exact composited frames consumed by the realtime harness.
+the route reaches gameplay. Ensure `PROSPER_RENDER_EVERY_FOR_MS` is unset if the process inherits a
+shell used for snapshot capture. Set `PROSPER_APP_DUMP_FRAMES=1` and
+`PROSPER_FRAME_DIR=/path/to/frames` to retain the exact composited frames consumed by the realtime
+harness.

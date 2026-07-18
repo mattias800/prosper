@@ -287,6 +287,10 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
 - **Reaching the running frame loop** needs two gated switches (off by default, so the default boot stays
   stable): `PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct`. Add `PROSPER_RENDER=1` to run the
   live renderer, `PROSPER_GFXLOG=1` for graphics diagnostics.
+- **Do not reuse snapshot acceleration for interactive or performance runs.** `PROSPER_RENDER_SCALE>1`,
+  `PROSPER_RENDER_EVERY>1`, and `PROSPER_RENDER_EVERY_FOR_MS` deliberately reduce resolution or skip
+  graphics submits. Keep the defaults (`PROSPER_RENDER_SCALE=1`, `PROSPER_RENDER_EVERY=1`, and no timed
+  sampling window) unless the run is explicitly a headless capture or sampling experiment.
 - **Correctness-first:** implement real behavior from primary evidence: live captures/traces, guest
   disassembly, published platform contracts, firmware symbol data, and focused tests. Do not ship shims
   that fake output. Mark genuinely uncertain code with `CONFIDENCE: HIGH/MED/LOW`.
