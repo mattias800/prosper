@@ -184,6 +184,44 @@ int main() {
     if (dup2_target >= 0 && close_fn) close_fn((uint64_t)dup2_target, 0, 0, 0, 0, 0);
 
 #ifdef _WIN32
+    // UCRT reports invalid descriptors through its invalid-parameter handler before returning -1.
+    // Guest inputs must not reach the default terminating handler, and a failed dup2 must not close
+    // or replace its valid target.
+    int64_t invalid_duplicate = kernel_dup_fn
+        ? (int64_t)kernel_dup_fn(~uint64_t{0}, 0, 0, 0, 0, 0)
+        : 0;
+    CHECK(invalid_duplicate == -1, "sceKernelDup safely rejects an invalid source descriptor");
+    int64_t preserved_target = open_fn
+        ? (int64_t)open_fn((uint64_t)(uintptr_t)path, 0, 0, 0, 0, 0)
+        : -1;
+    constexpr int64_t preserved_offset = 137;
+    int64_t preserved_seek = preserved_target >= 0 && lseek_fn
+        ? (int64_t)lseek_fn((uint64_t)preserved_target, preserved_offset, SEEK_SET, 0, 0, 0)
+        : -1;
+    int64_t invalid_dup2 = preserved_target >= 0 && kernel_dup2_fn
+        ? (int64_t)kernel_dup2_fn(~uint64_t{0}, (uint64_t)preserved_target, 0, 0, 0, 0)
+        : 0;
+    int64_t preserved_position = preserved_target >= 0 && lseek_fn
+        ? (int64_t)lseek_fn((uint64_t)preserved_target, 0, SEEK_CUR, 0, 0, 0)
+        : -1;
+    std::array<uint8_t, 16> preserved_chunk{};
+    int64_t preserved_n = preserved_target >= 0 && read_fn
+        ? (int64_t)read_fn((uint64_t)preserved_target,
+                           (uint64_t)(uintptr_t)preserved_chunk.data(), preserved_chunk.size(),
+                           0, 0, 0)
+        : -1;
+    CHECK(preserved_seek == preserved_offset, "position the invalid-dup2 target");
+    CHECK(invalid_dup2 == -1, "sceKernelDup2 safely rejects an invalid source descriptor");
+    CHECK(preserved_position == preserved_offset &&
+              preserved_n == (int64_t)preserved_chunk.size() &&
+              std::memcmp(preserved_chunk.data(), expected.data() + preserved_offset,
+                          preserved_chunk.size()) == 0,
+          "failed sceKernelDup2 leaves the target descriptor unchanged");
+    if (preserved_target >= 0 && close_fn)
+        close_fn((uint64_t)preserved_target, 0, 0, 0, 0, 0);
+#endif
+
+#ifdef _WIN32
     // Unity asks for a whole 64 KiB cache block even when boot.config is only a few hundred bytes.
     // Guest allocators may leave later pages reserved until first touch. Windows _read validates the
     // entire requested destination range before discovering EOF, so a direct host read fails EINVAL;
