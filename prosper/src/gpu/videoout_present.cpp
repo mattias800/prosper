@@ -10,7 +10,6 @@
 
 namespace prosper::gpu {
 namespace {
-std::atomic<int>      g_front{-1};
 std::atomic<uint64_t> g_present_count{0};
 std::atomic<uint64_t> g_frame_seq{0};   // # of rendered frames handed in via present_write_frame
 
@@ -22,9 +21,8 @@ uint32_t             g_frame_w = 0, g_frame_h = 0;
 std::atomic<bool>    g_have_frame{false};
 
 bool current_scanout(VideoOutBufferSnapshot& out, int* index = nullptr) {
-    const int front = g_front.load(std::memory_order_relaxed);
-    if (front >= 0 && videoout_buffer_snapshot(front, out)) {
-        if (index) *index = front;
+    if (videoout_front_snapshot(out)) {
+        if (index) *index = out.buffer_index;
         return true;
     }
     if (index) *index = -1;
@@ -58,9 +56,7 @@ void present_flip(int buffer_index, int64_t flip_arg) {
     // Only accept a buffer the game actually registered; otherwise leave the front unchanged (an
     // invalid index shouldn't corrupt scanout state).
     VideoOutBufferSnapshot selected;
-    if (videoout_buffer_snapshot(buffer_index, selected))
-        g_front.store(buffer_index, std::memory_order_relaxed);
-    else
+    if (!videoout_select_buffer(buffer_index, selected))
         current_scanout(selected);
     uint64_t n = g_present_count.fetch_add(1, std::memory_order_relaxed);
     record_gpu_timeline_present(n + 1, buffer_index, flip_arg,
@@ -70,22 +66,19 @@ void present_flip(int buffer_index, int64_t flip_arg) {
     // Written as raw w*h*4 bytes; convert offline. This reveals whether the game's real display holds the
     // title/scene even when the captured draws are a no-op composite.
     if (const char* dir = getenv("PROSPER_DUMP_SCANOUT"); dir && (n < 8 || n % 60 == 0)) {
-        int idx = -1;
-        VideoOutBufferSnapshot scanout;
-        if (videoout_buffer_snapshot(buffer_index, scanout)) idx = buffer_index;
-        else current_scanout(scanout, &idx);
-        if (scanout.address && scanout.width && scanout.height) {
-            char fn[512]; snprintf(fn, sizeof fn, "%s/scanout_%04llu_buf%d.rgba", dir, (unsigned long long)n, idx);
+        std::vector<uint8_t> raw;
+        if (videoout_copy_buffer(selected, raw)) {
+            char fn[512]; snprintf(fn, sizeof fn, "%s/scanout_%04llu_buf%d.rgba", dir,
+                                   (unsigned long long)n, selected.buffer_index);
             if (FILE* f = fopen(fn, "wb")) {
-                fwrite((const void*)(uintptr_t)scanout.address, 1,
-                       (size_t)scanout.width * scanout.height * 4, f);
+                fwrite(raw.data(), 1, raw.size(), f);
                 fclose(f);
             }
         }
     }
 }
 
-int      present_front_index() { return g_front.load(std::memory_order_relaxed); }
+int      present_front_index() { return videoout_front_index(); }
 uint64_t present_count()       { return g_present_count.load(std::memory_order_relaxed); }
 uint32_t present_width()       { VideoOutBufferSnapshot s; return current_scanout(s) ? s.width : 0; }
 uint32_t present_height()      { VideoOutBufferSnapshot s; return current_scanout(s) ? s.height : 0; }
@@ -109,15 +102,7 @@ size_t present_readback(void* dst, size_t dst_cap) {
         return 0;
     }
     // Fallback: scan out the raw guest display buffer (contents are whatever the guest put there).
-    int front = g_front.load(std::memory_order_relaxed);
-    if (front < 0) return 0;
-    VideoOutBufferSnapshot scanout;
-    if (!videoout_buffer_snapshot(front, scanout) || !scanout.address ||
-        !scanout.width || !scanout.height) return 0;
-    size_t bytes = (size_t)scanout.width * scanout.height * 4;
-    if (dst_cap < bytes) return 0;
-    std::memcpy(dst, (const void*)(uintptr_t)scanout.address, bytes);
-    return bytes;
+    return videoout_copy_front_buffer(dst, dst_cap);
 }
 
 bool present_acquire_rendered_frame(PresentFrameLease& out) {
@@ -143,34 +128,27 @@ bool present_snapshot(PresentSnapshot& out) {
         out.frame_seq = g_frame_seq.load(std::memory_order_relaxed);
         out.source_seq = out.frame_seq;
         out.present_count = g_present_count.load(std::memory_order_relaxed);
-        out.front_index = g_front.load(std::memory_order_relaxed);
+        out.front_index = videoout_front_index();
         out.width = g_frame_w;
         out.height = g_frame_h;
         out.rgba = *g_frame;
         return true;
     }
 
-    const int front = g_front.load(std::memory_order_relaxed);
-    if (front < 0) return false;
     VideoOutBufferSnapshot scanout;
-    if (!videoout_buffer_snapshot(front, scanout) || !scanout.address ||
-        !scanout.width || !scanout.height) return false;
-    const size_t bytes = static_cast<size_t>(scanout.width) * scanout.height * 4;
+    if (!videoout_copy_front_buffer(out.rgba, scanout)) return false;
     out.source = PresentSource::RawScanout;
     out.present_count = g_present_count.load(std::memory_order_relaxed);
     out.source_seq = out.present_count;
     out.frame_seq = g_frame_seq.load(std::memory_order_relaxed);
-    out.front_index = front;
+    out.front_index = scanout.buffer_index;
     out.width = scanout.width;
     out.height = scanout.height;
-    out.rgba.resize(bytes);
-    std::memcpy(out.rgba.data(),
-                reinterpret_cast<const void*>(static_cast<uintptr_t>(scanout.address)), bytes);
     return true;
 }
 
 void present_reset() {
-    g_front.store(-1, std::memory_order_relaxed);
+    videoout_reset_front();
     g_present_count.store(0, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(g_frame_mx);
     g_frame.reset(); g_frame_w = g_frame_h = 0;

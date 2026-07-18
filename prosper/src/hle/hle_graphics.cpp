@@ -112,6 +112,10 @@ namespace {
         int      buffer_num = 0;
         uint64_t buffer_addr[16] = {0};   // guest GPU-VA of each registered framebuffer
         uint8_t  buffer_set[16] = {0};    // set_index + 1; zero means the slot is unregistered
+        uint64_t buffer_generation[16] = {0};
+        uint64_t next_generation = 0;
+        int      front_index = -1;
+        uint64_t front_generation = 0;
         bool     configured = false;
     };
     DisplayConfig g_display;
@@ -140,9 +144,9 @@ extern "C" uint64_t prosper_vo_buffer_addr(int i) {
     return (i >= 0 && i < g_display.buffer_num) ? g_display.buffer_addr[i] : 0;
 }
 
-bool videoout_buffer_snapshot(int buffer_index, VideoOutBufferSnapshot& out) {
+namespace {
+bool videoout_buffer_snapshot_locked(int buffer_index, VideoOutBufferSnapshot& out) {
     out = {};
-    std::lock_guard<std::mutex> lk(g_display_mx);
     if (buffer_index < 0 || buffer_index >= 16) return false;
     const uint8_t tag = g_display.buffer_set[buffer_index];
     if (tag == 0) return false;
@@ -150,10 +154,43 @@ bool videoout_buffer_snapshot(int buffer_index, VideoOutBufferSnapshot& out) {
     if (!config.registered) return false;
     out.address = g_display.buffer_addr[buffer_index];
     out.pixel_format = config.pixel_format;
+    out.generation = g_display.buffer_generation[buffer_index];
+    out.buffer_index = buffer_index;
     out.width = config.width;
     out.height = config.height;
     out.tiling_mode = config.tiling_mode;
     return true;
+}
+
+bool videoout_front_snapshot_locked(VideoOutBufferSnapshot& out) {
+    if (!videoout_buffer_snapshot_locked(g_display.front_index, out) ||
+        out.generation != g_display.front_generation) {
+        out = {};
+        return false;
+    }
+    return true;
+}
+
+bool videoout_buffer_bytes(const VideoOutBufferSnapshot& buffer, size_t& bytes) {
+    if (!buffer.address || !buffer.width || !buffer.height) return false;
+    const uint64_t pixels = (uint64_t)buffer.width * buffer.height;
+    if (pixels > SIZE_MAX / 4) return false;
+    bytes = (size_t)pixels * 4;
+    return true;
+}
+} // namespace
+
+bool videoout_select_buffer(int buffer_index, VideoOutBufferSnapshot& out) {
+    std::lock_guard<std::mutex> lk(g_display_mx);
+    if (!videoout_buffer_snapshot_locked(buffer_index, out)) return false;
+    g_display.front_index = buffer_index;
+    g_display.front_generation = out.generation;
+    return true;
+}
+
+bool videoout_front_snapshot(VideoOutBufferSnapshot& out) {
+    std::lock_guard<std::mutex> lk(g_display_mx);
+    return videoout_front_snapshot_locked(out);
 }
 
 bool videoout_display_snapshot(VideoOutBufferSnapshot& out) {
@@ -165,6 +202,52 @@ bool videoout_display_snapshot(VideoOutBufferSnapshot& out) {
     out.height = g_display.height;
     out.tiling_mode = g_display.tiling_mode;
     return true;
+}
+
+int videoout_front_index() {
+    std::lock_guard<std::mutex> lk(g_display_mx);
+    VideoOutBufferSnapshot out;
+    return videoout_front_snapshot_locked(out) ? out.buffer_index : -1;
+}
+
+void videoout_reset_front() {
+    std::lock_guard<std::mutex> lk(g_display_mx);
+    g_display.front_index = -1;
+    g_display.front_generation = 0;
+}
+
+bool videoout_copy_buffer(const VideoOutBufferSnapshot& expected, std::vector<uint8_t>& out) {
+    std::lock_guard<std::mutex> lk(g_display_mx);
+    VideoOutBufferSnapshot current;
+    if (!videoout_buffer_snapshot_locked(expected.buffer_index, current) ||
+        current.generation != expected.generation) return false;
+    size_t bytes = 0;
+    if (!videoout_buffer_bytes(current, bytes)) return false;
+    out.resize(bytes);
+    std::memcpy(out.data(), reinterpret_cast<const void*>((uintptr_t)current.address), bytes);
+    return true;
+}
+
+bool videoout_copy_front_buffer(std::vector<uint8_t>& out, VideoOutBufferSnapshot& metadata) {
+    std::lock_guard<std::mutex> lk(g_display_mx);
+    if (!videoout_front_snapshot_locked(metadata)) return false;
+    size_t bytes = 0;
+    if (!videoout_buffer_bytes(metadata, bytes)) return false;
+    out.resize(bytes);
+    std::memcpy(out.data(), reinterpret_cast<const void*>((uintptr_t)metadata.address), bytes);
+    return true;
+}
+
+size_t videoout_copy_front_buffer(void* dst, size_t dst_cap, VideoOutBufferSnapshot* metadata) {
+    if (!dst) return 0;
+    std::lock_guard<std::mutex> lk(g_display_mx);
+    VideoOutBufferSnapshot current;
+    if (!videoout_front_snapshot_locked(current)) return 0;
+    size_t bytes = 0;
+    if (!videoout_buffer_bytes(current, bytes) || dst_cap < bytes) return 0;
+    std::memcpy(dst, reinterpret_cast<const void*>((uintptr_t)current.address), bytes);
+    if (metadata) *metadata = current;
+    return bytes;
 }
 namespace { bool evlog() { static int v = getenv("PROSPER_EVLOG") ? 1 : 0; return v; } }
 // Implemented in hle_kernel_time.cpp (the equeue backend). Register a flip/vblank event source so the
@@ -334,6 +417,9 @@ HLE(g_vo_register_buffers2) {  // a0=handle a1=set_index a2=buffer_index_start a
     for (int i = 0; i < num; i++) {
         g_display.buffer_addr[start + i] = (uint64_t)(uintptr_t)bufs[i].data;
         g_display.buffer_set[start + i] = (uint8_t)(set + 1);
+        uint64_t generation = ++g_display.next_generation;
+        if (generation == 0) generation = ++g_display.next_generation;
+        g_display.buffer_generation[start + i] = generation;
     }
     if (g_display.buffer_num < start + num) g_display.buffer_num = start + num;
     g_display.configured = true;
@@ -358,8 +444,14 @@ HLE(g_vo_unregister_buffers) {
     for (int i = 0; i < 16; ++i) {
         if (g_display.buffer_set[i] != tag) continue;
         found = true;
+        if (g_display.front_index == i &&
+            g_display.front_generation == g_display.buffer_generation[i]) {
+            g_display.front_index = -1;
+            g_display.front_generation = 0;
+        }
         g_display.buffer_set[i] = 0;
         g_display.buffer_addr[i] = 0;
+        g_display.buffer_generation[i] = 0;
     }
     if (!found)
         return (uint64_t)(int64_t)(int32_t)0x8029000a;  // SCE_VIDEO_OUT_ERROR_INVALID_INDEX

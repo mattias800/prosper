@@ -24,9 +24,10 @@ int main() {
 
     auto setba2 = Hle::lookup("PjS5uASwcV8");   // SetBufferAttribute2
     auto regb2  = Hle::lookup("rKBUtgRrtbk");   // RegisterBuffers2
+    auto unreg  = Hle::lookup("N5KDtkIjjJ4");   // UnregisterBuffers
     auto flip   = Hle::lookup(nid_hash("sceVideoOutSubmitFlip"));
-    CHECK(setba2 && regb2 && flip, "VideoOut functions registered");
-    if (!(setba2 && regb2 && flip)) { printf("== FAIL ==\n"); return 1; }
+    CHECK(setba2 && regb2 && unreg && flip, "VideoOut functions registered");
+    if (!(setba2 && regb2 && unreg && flip)) { printf("== FAIL ==\n"); return 1; }
 
     // A small surface so the test framebuffers are cheap: 16x8 BGRA (512 bytes each), triple-buffered.
     const uint32_t W = 16, H = 8;
@@ -93,6 +94,31 @@ int main() {
     CHECK(gpu::present_width() == SMALL_W && gpu::present_height() == SMALL_H &&
           got == SMALL_BYTES && small_out.front() == 0x66 && small_out.back() == 0x66,
           "set 1 flip reads its 4x2 buffer with matching geometry");
+
+    // Unregister invalidates the front identity under the same registry lock. Reusing the numeric
+    // slot receives a new generation and must not present its new backing until another guest flip.
+    CHECK(unreg(0x1001, 1 /*set*/, 0, 0, 0, 0) == 0 &&
+          gpu::present_front_index() == -1,
+          "unregistering the front set atomically clears the front identity");
+    std::vector<uint8_t> fb4_reused(SMALL_BYTES, 0x88), fb5_reused(SMALL_BYTES, 0x99);
+    VOB reused_buffers[2] = {
+        {fb4_reused.data(),0,{0,0}}, {fb5_reused.data(),0,{0,0}}
+    };
+    CHECK(regb2(0x1001, 1 /*same set*/, 4 /*same start*/,
+                (uint64_t)(uintptr_t)reused_buffers, 2,
+                (uint64_t)(uintptr_t)small_attr) == 0,
+          "re-registered the same slots with new backing");
+    std::fill(small_out.begin(), small_out.end(), 0xEE);
+    gpu::PresentSnapshot no_flip_snap;
+    CHECK(gpu::present_front_index() == -1 &&
+          gpu::present_readback(small_out.data(), small_out.size()) == 0 &&
+          !gpu::present_snapshot(no_flip_snap),
+          "re-registering a numeric slot does not present new backing without a flip");
+    flip(0x1001, 4, 0, 0, 0, 0);
+    got = gpu::present_readback(small_out.data(), small_out.size());
+    CHECK(got == SMALL_BYTES && small_out.front() == 0x88 && small_out.back() == 0x88,
+          "a new flip presents the re-registered generation");
+
     flip(0x1001, 1, 0, 0, 0, 0);
     std::fill(out.begin(), out.end(), 0xEE);
     got = gpu::present_readback(out.data(), out.size());
