@@ -34,15 +34,16 @@ int main() {
     auto cap    = Hle::lookup(nid_hash("sceVideoOutGetDeviceCapabilityInfo"));
     auto issup  = Hle::lookup("Nv8c-Kb+DUM");   // IsOutputSupported
     auto setba  = Hle::lookup(nid_hash("sceVideoOutSetBufferAttribute"));
+    auto regb   = Hle::lookup(nid_hash("sceVideoOutRegisterBuffers"));
     auto setba2 = Hle::lookup("PjS5uASwcV8");   // SetBufferAttribute2
     auto regb2  = Hle::lookup("rKBUtgRrtbk");   // RegisterBuffers2
     auto unreg  = Hle::lookup("N5KDtkIjjJ4");   // UnregisterBuffers
     auto cfg    = Hle::lookup("w0hLuNarQxY");   // ConfigureOutput
     auto flip   = Hle::lookup(nid_hash("sceVideoOutSubmitFlip"));
     auto fstat  = Hle::lookup(nid_hash("sceVideoOutGetFlipStatus"));
-    CHECK(res && vbl && cap && issup && setba && setba2 && regb2 && unreg && cfg && flip && fstat,
+    CHECK(res && vbl && cap && issup && setba && regb && setba2 && regb2 && unreg && cfg && flip && fstat,
           "VideoOut functions registered");
-    if (!(res && vbl && cap && issup && setba && setba2 && regb2 && unreg && cfg && flip && fstat)) {
+    if (!(res && vbl && cap && issup && setba && regb && setba2 && regb2 && unreg && cfg && flip && fstat)) {
         printf("== FAIL ==\n"); return 1;
     }
 
@@ -117,6 +118,30 @@ int main() {
         legacy_canary_untouched &= legacy_attr[i] == 0xEE;
     CHECK(legacy_canary_untouched,
           "SetBufferAttribute writes exactly its 0x28-byte ABI struct");
+
+    // #394 F1: legacy registration consumes a flat address array, assigns the lowest free group,
+    // and records its non-zero slot range using the Gen4 attribute layout.
+    uint8_t legacy_fb2[16], legacy_fb3[16];
+    const void* legacy_buffers[2] = {legacy_fb2, legacy_fb3};
+    CHECK((uint32_t)regb(0x1001, 15, (uint64_t)(uintptr_t)legacy_buffers, 2,
+                         (uint64_t)(uintptr_t)legacy_attr, 0) == 0x80290001u,
+          "legacy RegisterBuffers rejects a range past slot 15");
+    uint64_t legacy_group = regb(0x1001, 2, (uint64_t)(uintptr_t)legacy_buffers, 2,
+                                 (uint64_t)(uintptr_t)legacy_attr, 0);
+    CHECK(legacy_group == 0, "legacy RegisterBuffers returns the lowest free attribute group");
+    CHECK(prosper_vo_buffer_count() == 4 &&
+          prosper_vo_buffer_addr(2) == (uint64_t)(uintptr_t)legacy_fb2 &&
+          prosper_vo_buffer_addr(3) == (uint64_t)(uintptr_t)legacy_fb3,
+          "legacy RegisterBuffers records the flat framebuffer array at the requested slots");
+    CHECK(prosper_vo_display_width() == 1280 && prosper_vo_display_height() == 720 &&
+          prosper_vo_display_format() == 0x80002200u,
+          "legacy RegisterBuffers records Gen4 surface geometry and format");
+    CHECK((uint32_t)regb(0x1001, 3, (uint64_t)(uintptr_t)legacy_buffers, 2,
+                         (uint64_t)(uintptr_t)legacy_attr, 0) == 0x80290010u,
+          "legacy RegisterBuffers rejects an overlapping slot range");
+    CHECK(unreg(0x1001, legacy_group, 0, 0, 0, 0) == 0 &&
+          prosper_vo_buffer_count() == 0 && prosper_vo_display_width() == 0,
+          "legacy buffer group unregisters cleanly before Gen5 registration");
 
     // SetBufferAttribute2 fills the 0x50 attribute struct from (fmt, tiling, w, h, option).
     uint8_t attr[0x50]; memset(attr, 0xEE, sizeof attr);
