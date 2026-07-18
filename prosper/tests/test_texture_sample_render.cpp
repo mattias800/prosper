@@ -96,11 +96,23 @@ int main() {
         prosper::test::BackendDraw swizzled_draw = draw;
         swizzled_draw.R = {swizzled_resource};
 
+        std::vector<uint8_t> same_binding =
+            prosper::test::render_draws_rgba({draw, draw}, W, H);
+        const auto same_binding_stats = prosper::test::backend_resource_reuse_stats();
+        CHECK(!same_binding.empty() &&
+                  same_binding_stats.texture_binding_references == 2 &&
+                  same_binding_stats.unique_texture_bindings == 1,
+              "identical texture view and sampler contracts share one Vulkan binding pair");
+
         std::vector<uint8_t> shared =
             prosper::test::render_draws_rgba({draw, swizzled_draw}, W, H);
         const auto shared_stats = prosper::test::backend_texture_upload_stats();
+        const auto shared_resource_stats = prosper::test::backend_resource_reuse_stats();
         CHECK(shared_stats.references == 2 && shared_stats.unique_uploads == 1,
               "draws with separate views over shared pixels produce one backend texture upload");
+        CHECK(shared_resource_stats.texture_binding_references == 2 &&
+                  shared_resource_stats.unique_texture_bindings == 2,
+              "different component swizzles retain distinct Vulkan image views");
 
 #ifdef _WIN32
         _putenv_s("PROSPER_NO_BACKEND_TEXTURE_SHARE", "1");

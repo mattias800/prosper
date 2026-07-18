@@ -124,6 +124,54 @@ int main() {
               "pipeline-cache disable A/B bypasses every lookup");
     }
 
+    // Hundreds of Evergate draws repeat identical constant/vertex payloads and descriptor contracts.
+    // A synchronous backend call may share those immutable objects after exact comparison, while the
+    // disable switch provides a byte-identical one-object-per-reference control.
+    {
+        prosper::test::FrameResource buffer;
+        buffer.binding = 2;
+        buffer.set = 0;
+        buffer.buffer_identity = 0x7020000000000002ull;
+        buffer.dwords.assign(64, 0x3f800000u);
+        prosper::test::BackendDraw d0;
+        d0.vs = vs; d0.fs = red; d0.ps = &opaque; d0.vcount = 3; d0.R = {buffer};
+        prosper::test::BackendDraw d1;
+        d1.vs = vs; d1.fs = green; d1.ps = &additive; d1.vcount = 3; d1.R = {buffer};
+
+        const std::vector<uint8_t> shared =
+            prosper::test::render_draws_rgba({d0, d1}, W, H);
+        const auto shared_stats = prosper::test::backend_resource_reuse_stats();
+        CHECK(shared_stats.buffer_references == 2 && shared_stats.unique_buffers == 1,
+              "identical guest-buffer payloads share one Vulkan upload");
+        CHECK(shared_stats.descriptor_set_layout_references == 2 &&
+                  shared_stats.unique_descriptor_set_layouts == 1 &&
+                  shared_stats.pipeline_layout_references == 2 &&
+                  shared_stats.unique_pipeline_layouts == 1 &&
+                  shared_stats.descriptor_pools == 1,
+              "identical draw contracts share layouts and one call-wide descriptor pool");
+
+        prosper::test::BackendDraw distinct = d1;
+        distinct.R[0].buffer_identity++;
+        const std::vector<uint8_t> distinct_output =
+            prosper::test::render_draws_rgba({d0, distinct}, W, H);
+        const auto distinct_stats = prosper::test::backend_resource_reuse_stats();
+        CHECK(distinct_stats.buffer_references == 2 && distinct_stats.unique_buffers == 2 &&
+                  distinct_output == shared,
+              "equal bytes at different guest buffer identities remain distinct");
+
+        set_env("PROSPER_NO_BACKEND_RESOURCE_SHARE", "1");
+        const std::vector<uint8_t> unshared =
+            prosper::test::render_draws_rgba({d0, d1}, W, H);
+        const auto unshared_stats = prosper::test::backend_resource_reuse_stats();
+        set_env("PROSPER_NO_BACKEND_RESOURCE_SHARE", nullptr);
+        CHECK(unshared_stats.buffer_references == 2 && unshared_stats.unique_buffers == 2 &&
+                  unshared_stats.unique_descriptor_set_layouts == 2 &&
+                  unshared_stats.unique_pipeline_layouts == 2,
+              "resource-share disable switch restores distinct per-draw immutable objects");
+        CHECK(!shared.empty() && shared == unshared,
+              "shared and unshared per-draw resources render byte-identically");
+    }
+
     // #531: a guest scissor must constrain a color-disabled stencil writer. The following full-target
     // reader shades only where stencil==2, proving both the dynamic draw scissor and its exclusive
     // right/bottom edges affect the depth/stencil attachment rather than only color output.

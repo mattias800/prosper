@@ -207,16 +207,12 @@ this preserves one parseable line per target without paying a Windows console wr
 
 Ordered graphics/compute submits retain a bounded journal of exact guest-memory ranges written by the
 compute backend. A persistent texture validated in an earlier graphics span can therefore skip its repeated
-full-byte scan when no later write overlaps it. On Windows, cross-submit reuse also protects every writable
-virtual alias of the texture's physical guest pages and handles the first CPU write through the process VEH.
-An unchanged registration proves that the bytes were not written; a fault, host physical write, mapping
-change, incomplete alias set, or unsupported platform uses the exact byte-comparison fallback. Resources
-written on consecutive uses automatically stop using page faults and retain exact validation. Timing output
-reports `watch_reuse`, `watch_dirty`, `watch_unknown`, `watch_disabled`, registration/fault counts, and the
-remaining exact validation bytes. Set `PROSPER_NO_CROSS_SUBMIT_TEXTURE_WRITE_WATCH=1` for an exact-only A/B,
-or `PROSPER_AUDIT_CROSS_SUBMIT_TEXTURE_WRITE_WATCH=1` to perform the exact comparison behind every proposed
-cross-submit shortcut and log any disagreement. `PROSPER_WRITE_WATCH_LOG=1` prints capped registration failure
-details. Non-Windows builds keep exact cross-submit validation. For the same-submit A/B control, set
+full-byte scan when no later write overlaps it. Cross-submit texture validation currently uses exact byte
+comparison on every platform. Windows protection-fault watches are deliberately unsupported: the Windows
+exception dispatcher writes below the interrupted stack pointer before a vectored handler runs, which can
+corrupt the guest's valid SysV red-zone locals. Timing therefore reports those watch attempts as `unknown`
+and the remaining exact validation bytes; do not re-enable page-fault watches without an exception-delivery
+mechanism that preserves all 128 guest red-zone bytes. For the same-submit A/B control, set
 `PROSPER_NO_SUBMIT_TEXTURE_VALIDATION_REUSE=1`. Set
 `PROSPER_AUDIT_SUBMIT_TEXTURE_VALIDATION_REUSE=1` to keep every comparison while checking and logging any
 disagreement with the journal's unchanged decision; use that audit before extending writer coverage.
@@ -244,6 +240,15 @@ and budget-driven discards. The default budget is 512 MiB; override it with
 `PROSPER_MEMORY_POOL_MB=<MiB>`, or set `PROSPER_NO_MEMORY_POOL=1` for an A/B run against direct
 `vkAllocateMemory`/`vkFreeMemory`. The pool retains only allocation objects: images, buffers, views,
 descriptors, and their layout/content rules keep their existing per-call lifetimes.
+
+Within one already-synchronous backend call, identical immutable Vulkan contracts share objects instead of
+recreating them for every draw. Storage buffers require the same nonzero guest address, size, and complete
+captured bytes; synthetic resources with no identity remain distinct. Texture image views and samplers use
+their complete image/view/swizzle/filter/address/LOD contract. Descriptor-set layouts and pipeline layouts
+use their complete binding/layout contracts, and all sets allocate from one call-wide descriptor pool. Every
+object remains call-local and is destroyed after the existing fence wait, so this adds no cross-submit
+freshness assumption. Set `PROSPER_NO_BACKEND_RESOURCE_SHARE=1` to disable the keyed object reuse for an
+A/B; the safe call-wide descriptor-pool consolidation remains enabled in both modes.
 
 The persistent compute device has the same exact-requirements allocation pool with a separate 256 MiB
 default budget (`PROSPER_COMPUTE_MEMORY_POOL_MB=<MiB>`). `PROSPER_NO_MEMORY_POOL=1` disables both
@@ -314,12 +319,12 @@ every fold. Set `PROSPER_NO_GUEST_READ_CACHE=1` for the uncached A/B path. The c
 referenced by a synchronous GPU submit remains mapped until that submit returns, which was already
 required before the cross-submit reuse was added.
 
-Large-alignment Windows direct-memory views can be sparse section mappings. They are deliberately
-excluded from cross-submit readability reuse because guest-visible committed pages may still be host-
-reserved until first access. CPU faults, GPU readability guards, and the live renderer materialize the
-required 16 KiB pages through the memory HLE, which validates the complete guest mapping and its current
-protection first. This preserves untouched-zero and alias behavior without eagerly committing a title's
-entire arena. `PROSPER_MEMLOG=1` reports `map_dmem sparse aligned view` when this path is active.
+Windows direct memory uses a delete-on-close sparse temporary file as its shared physical backing.
+Mapped views are ordinary `MEM_COMMIT` file pages and can participate in cross-submit readability reuse;
+the kernel demand-pages untouched storage without delivering a user-mode first-touch exception. This keeps
+large logical arenas sparse and physical aliases coherent without letting Windows exception dispatch
+overwrite guest SysV red-zone locals. If sparse backing cannot be created, direct-memory mapping fails
+closed instead of silently returning to the unsafe `SEC_RESERVE` exception path.
 
 The current renderer remains a deterministic readback-based implementation. It retains CPU-visible pixels
 for screenshots and temporal RTT composition, so it is not the final zero-copy architecture. Issue #702

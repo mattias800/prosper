@@ -1617,6 +1617,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // level appears with this, the alpha channel (decode or DST_SEL swizzle) is the bug (#300).
                         if (getenv("PROSPER_ALPHA1")) fr.swizzle[3] = 1;
                     } else {
+                        fr.buffer_identity = r.gpu_addr;
                         uint32_t nb = std::min(r.size ? r.size : 256u, 1u << 20) & ~3u;   // cap 1 MB, dword-aligned
                         if (nb >= 4) {
                             std::vector<uint8_t> tmp(nb, 0);
