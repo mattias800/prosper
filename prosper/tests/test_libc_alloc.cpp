@@ -40,8 +40,17 @@ int main(int argc, char** argv) {
             Hle::lookup(nid_hash("_Znwm"))(std::numeric_limits<uint64_t>::max(), 0, 0, 0, 0, 0);
             return 0;
         }
+        if (!strcmp(argv[1], "throwing-new-array")) {
+            Hle::lookup(nid_hash("_Znam"))(std::numeric_limits<uint64_t>::max(), 0, 0, 0, 0, 0);
+            return 0;
+        }
         if (!strcmp(argv[1], "throwing-aligned-new")) {
             Hle::lookup(nid_hash("_ZnwmSt11align_val_t"))(
+                std::numeric_limits<uint64_t>::max(), 64, 0, 0, 0, 0);
+            return 0;
+        }
+        if (!strcmp(argv[1], "throwing-aligned-new-array")) {
+            Hle::lookup(nid_hash("_ZnamSt11align_val_t"))(
                 std::numeric_limits<uint64_t>::max(), 64, 0, 0, 0, 0);
             return 0;
         }
@@ -56,12 +65,17 @@ int main(int argc, char** argv) {
     auto posix_memalign_fn = Hle::lookup(nid_hash("posix_memalign"));
     auto new_fn = Hle::lookup(nid_hash("_Znwm"));
     auto new_nothrow_fn = Hle::lookup(nid_hash("_ZnwmRKSt9nothrow_t"));
+    auto new_array_fn = Hle::lookup(nid_hash("_Znam"));
+    auto new_array_nothrow_fn = Hle::lookup(nid_hash("_ZnamRKSt9nothrow_t"));
     auto aligned_new_fn = Hle::lookup(nid_hash("_ZnwmSt11align_val_t"));
     auto aligned_new_nothrow_fn = Hle::lookup(nid_hash("_ZnwmSt11align_val_tRKSt9nothrow_t"));
+    auto aligned_new_array_fn = Hle::lookup(nid_hash("_ZnamSt11align_val_t"));
+    auto aligned_new_array_nothrow_fn = Hle::lookup(nid_hash("_ZnamSt11align_val_tRKSt9nothrow_t"));
     auto aligned_delete_fn = Hle::lookup(nid_hash("_ZdlPvSt11align_val_t"));
     CHECK(malloc_fn && calloc_fn && realloc_fn && free_fn && memalign_fn &&
-              posix_memalign_fn && new_fn && new_nothrow_fn && aligned_new_fn &&
-              aligned_new_nothrow_fn && aligned_delete_fn,
+              posix_memalign_fn && new_fn && new_nothrow_fn && new_array_fn &&
+              new_array_nothrow_fn && aligned_new_fn && aligned_new_nothrow_fn &&
+              aligned_new_array_fn && aligned_new_array_nothrow_fn && aligned_delete_fn,
           "allocation HLE functions registered");
     if (fails) return 1;
 
@@ -88,17 +102,29 @@ int main(int argc, char** argv) {
 
     CHECK(new_nothrow_fn(std::numeric_limits<uint64_t>::max(), 0, 0, 0, 0, 0) == 0,
           "nothrow operator new returns null on allocation failure");
+    CHECK(new_array_nothrow_fn(std::numeric_limits<uint64_t>::max(), 0, 0, 0, 0, 0) == 0,
+          "nothrow operator new[] returns null on allocation failure");
     CHECK(aligned_new_nothrow_fn(std::numeric_limits<uint64_t>::max(), 64, 0, 0, 0, 0) == 0,
           "aligned nothrow operator new returns null on allocation failure");
+    CHECK(aligned_new_array_nothrow_fn(
+              std::numeric_limits<uint64_t>::max(), 64, 0, 0, 0, 0) == 0,
+          "aligned nothrow operator new[] returns null on allocation failure");
     CHECK(run_self(argv[0], "probe") == 0, "allocation death-test child launches successfully");
     CHECK(run_self(argv[0], "throwing-new") != 0,
           "throwing operator new never returns null on allocation failure");
+    CHECK(run_self(argv[0], "throwing-new-array") != 0,
+          "throwing operator new[] never returns null on allocation failure");
     CHECK(run_self(argv[0], "throwing-aligned-new") != 0,
           "throwing aligned operator new never returns null on allocation failure");
+    CHECK(run_self(argv[0], "throwing-aligned-new-array") != 0,
+          "throwing aligned operator new[] never returns null on allocation failure");
 
     void* cpp_plain = (void*)(uintptr_t)new_fn(333, 0, 0, 0, 0, 0);
     CHECK(cpp_plain != nullptr, "throwing operator new still returns storage on success");
     free_fn(U(cpp_plain), 0, 0, 0, 0, 0);
+    void* cpp_array = (void*)(uintptr_t)new_array_fn(444, 0, 0, 0, 0, 0);
+    CHECK(cpp_array != nullptr, "throwing operator new[] still returns storage on success");
+    free_fn(U(cpp_array), 0, 0, 0, 0, 0);
 
     auto* aligned = (uint8_t*)(uintptr_t)memalign_fn(256, 513, 0, 0, 0, 0);
     CHECK(aligned != nullptr && ((uintptr_t)aligned & 255) == 0,
@@ -122,6 +148,12 @@ int main(int argc, char** argv) {
     CHECK(cpp && ((uintptr_t)cpp & 1023) == 0,
           "aligned operator new honors its alignment");
     aligned_delete_fn(U(cpp), 1024, 0, 0, 0, 0);
+
+    void* cpp_aligned_array =
+        (void*)(uintptr_t)aligned_new_array_fn(555, 128, 0, 0, 0, 0);
+    CHECK(cpp_aligned_array && ((uintptr_t)cpp_aligned_array & 127) == 0,
+          "aligned operator new[] honors its alignment");
+    aligned_delete_fn(U(cpp_aligned_array), 128, 0, 0, 0, 0);
 
     if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }
     printf("== PASS ==\n");
