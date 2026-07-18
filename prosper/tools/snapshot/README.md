@@ -113,6 +113,8 @@ inspection unless they fail.
 
 - `messenger-scene`: reviewed first-level gameplay guard with a late recovery
   sequence for cold full-render processes that miss early menu pad polls.
+- `evergate-title`: reviewed animated title-screen guard using a neutral
+  connected-controller route to retain the complete logo, prompt, and scene composition.
 - `dead-cells-gameplay`: reviewed full-render guard for the controllable
   Prisoners' Quarters Primary weapon tutorial.
 - `blasphemous2-gameplay`: reviewed native-resolution fresh-save guard for

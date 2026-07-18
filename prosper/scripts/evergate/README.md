@@ -23,6 +23,12 @@ the `HOLD X TO JUMP HIGHER` prompt. The luminous orb over white terrain is part 
 and is not gameplay. `--render-every` only accelerates the opening; normal per-submit rendering
 resumes after 90 seconds.
 
+The reviewed title-screen regression guard uses the neutral route:
+
+```sh
+python3 tools/snapshot/snapshot.py check evergate-title
+```
+
 ## Realtime harness
 
 ```sh
