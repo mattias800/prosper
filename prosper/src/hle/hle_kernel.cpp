@@ -148,11 +148,20 @@ namespace prosper {
 #define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5)
 
-// --- mutex attributes (opaque; we back with host pthread_mutexattr_t) ---
+// --- mutex attributes (opaque; retain Sony type identity beside the host attribute) ---
+// Type 4 intentionally maps to host ERRORCHECK for FreeBSD-compatible self-lock behavior, so the
+// host attribute alone cannot distinguish it from Sony type 1 when Gettype reads it back.
+struct GuestMutexAttr {
+    pthread_mutexattr_t host;
+    int sony_type;
+};
+
 HLE(k_mutexattr_init) {
     if (!a0) return 0x16; // EINVAL-ish
-    auto* at = (pthread_mutexattr_t*)calloc(1, sizeof(pthread_mutexattr_t));
-    pthread_mutexattr_init(at);
+    auto* at = (GuestMutexAttr*)calloc(1, sizeof(GuestMutexAttr));
+    if (!at) return 0x0c; // ENOMEM
+    int result = pthread_mutexattr_init(&at->host);
+    if (result != 0) { free(at); return (uint64_t)(unsigned)result; }
     // A FRESH attr's type must be the FreeBSD/Sony DEFAULT — ERRORCHECK — not the host default
     // (glibc: NORMAL). Kyty's PthreadMutexattrInit does exactly this (settype(1) on init). The
     // #183 change covered the no-attr init path but left attr-without-settype at glibc NORMAL,
@@ -162,7 +171,9 @@ HLE(k_mutexattr_init) {
     // — with a NORMAL mutex the relock BLOCKS forever instead of returning EDEADLK (live-verified:
     // single-thread wedge in k_mutex_lock, mutex __owner == self, ~10 s into the DOLL boot).
     // CONFIDENCE: HIGH (FreeBSD contract + Kyty + live wedge disassembly).
-    pthread_mutexattr_settype(at, PTHREAD_MUTEX_ERRORCHECK);
+    result = pthread_mutexattr_settype(&at->host, PTHREAD_MUTEX_ERRORCHECK);
+    if (result != 0) { pthread_mutexattr_destroy(&at->host); free(at); return (uint64_t)(unsigned)result; }
+    at->sony_type = 1;
     *(void**)a0 = at;                     // store handle through caller's slot
     return 0;
 }
@@ -180,6 +191,7 @@ HLE(k_mutexattr_init) {
 // the platform contract. CONFIDENCE: HIGH (FreeBSD source + the live wedge -> unwedge flip).
 HLE(k_mutexattr_settype) {
     if (!a0 || !*(void**)a0) return 0x16;
+    auto* at = (GuestMutexAttr*)*(void**)a0;
     int host;
     switch ((int)a1) {
         case 1: host = PTHREAD_MUTEX_ERRORCHECK; break;
@@ -190,19 +202,19 @@ HLE(k_mutexattr_settype) {
     }
     static const bool mtxlog = getenv("PROSPER_MUTEXLOG") != nullptr;
     if (mtxlog) fprintf(stderr, "[mtx] settype attr=%p type=%d\n", *(void**)a0, (int)a1);
-    pthread_mutexattr_settype((pthread_mutexattr_t*)*(void**)a0, host);
+    int result = pthread_mutexattr_settype(&at->host, host);
+    if (result != 0) return (uint64_t)(unsigned)result;
+    at->sony_type = (int)a1;
     return 0;
 }
 // scePthreadMutexattrGettype: the read-back inverse of settype. Was MISSING -> the generic stub
 // returned 0 while leaving the caller's `int* type` (a1) unwritten, so the guest read stack garbage as
-// the mutex type (the harmful-Get-stub class the affinity/sched paths already guard against). Translate
-// host type -> Sony (ERRORCHECK->1, RECURSIVE->2, NORMAL->3), the inverse of k_mutexattr_settype above.
+// the mutex type (the harmful-Get-stub class the affinity/sched paths already guard against). Preserve
+// the original Sony type because host ERRORCHECK represents both Sony ERRORCHECK(1) and ADAPTIVE_NP(4).
 HLE(k_mutexattr_gettype) {
     if (!a0 || !*(void**)a0 || !a1) return 0x16;   // EINVAL
-    int host = PTHREAD_MUTEX_NORMAL;
-    pthread_mutexattr_gettype((pthread_mutexattr_t*)*(void**)a0, &host);
-    int sony = (host == PTHREAD_MUTEX_ERRORCHECK) ? 1 : (host == PTHREAD_MUTEX_RECURSIVE) ? 2 : 3;
-    *(int*)(uintptr_t)a1 = sony;
+    auto* at = (GuestMutexAttr*)*(void**)a0;
+    *(int*)(uintptr_t)a1 = at->sony_type;
     return 0;
 }
 HLE(k_mutexattr_setprotocol) { return 0; }
@@ -222,7 +234,8 @@ HLE(k_stack_chk_fail) {
     return 0;
 }
 HLE(k_mutexattr_setpshared)  { return 0; }
-HLE(k_mutexattr_destroy)     { if (a0 && *(void**)a0) { free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
+HLE(k_mutexattr_destroy)     { if (a0 && *(void**)a0) { auto* at = (GuestMutexAttr*)*(void**)a0;
+                               pthread_mutexattr_destroy(&at->host); free(at); *(void**)a0 = nullptr; } return 0; }
 
 // --- mutexes ---
 // FreeBSD/PS5 pthread objects are POINTERS, and a STATICALLY-INITIALIZED object is a small
@@ -369,7 +382,8 @@ namespace {
 HLE(k_mutex_init) {
     if (!a0) return 0x16;
     auto* m = (pthread_mutex_t*)calloc(1, sizeof(pthread_mutex_t));
-    pthread_mutexattr_t* at = (a1 && !pt_static_sentinel(*(void**)a1)) ? (pthread_mutexattr_t*)*(void**)a1 : nullptr;
+    GuestMutexAttr* guest_at = (a1 && !pt_static_sentinel(*(void**)a1)) ? (GuestMutexAttr*)*(void**)a1 : nullptr;
+    pthread_mutexattr_t* at = guest_at ? &guest_at->host : nullptr;
     pthread_mutexattr_t def;
     if (!at) { pthread_mutexattr_init(&def); pthread_mutexattr_settype(&def, PTHREAD_MUTEX_ERRORCHECK); at = &def; }
     int host_type = PTHREAD_MUTEX_NORMAL;
