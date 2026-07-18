@@ -33,6 +33,12 @@ namespace prosper {
 
 #define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5)
+#define HLE8(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
+                                       uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, \
+                                       uint64_t a7)
+#define HLE10(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
+                                       uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, \
+                                       uint64_t a7, uint64_t a8, uint64_t a9)
 #define P(x) ((void*)(uintptr_t)(x))
 
 namespace {
@@ -504,7 +510,83 @@ namespace {
     // matching the AudioOut error constants above rather than leaving the upper half zeroed.
     constexpr uint64_t AJM_ERR_INVALID_CONTEXT   = (uint64_t)(int64_t)(int32_t)0x80930002u;
     constexpr uint64_t AJM_ERR_INVALID_INSTANCE  = (uint64_t)(int64_t)(int32_t)0x80930003u;
+    constexpr uint64_t AJM_ERR_INVALID_BATCH     = (uint64_t)(int64_t)(int32_t)0x80930004u;
     constexpr uint64_t AJM_ERR_INVALID_PARAMETER = (uint64_t)(int64_t)(int32_t)0x80930005u;
+
+    // The four pointer-returning builder exports serialize a batch from 8/16-byte chunks. These
+    // layout values are shared by Sony's PS4-inherited AJM ABI and the PS5 3.20 export surface.
+    enum : uint32_t {
+        AJM_IDENT_JOB = 0,
+        AJM_IDENT_INPUT_RUN = 1,
+        AJM_IDENT_INPUT_CONTROL = 2,
+        AJM_IDENT_CONTROL_FLAGS = 3,
+        AJM_IDENT_RUN_FLAGS = 4,
+        AJM_IDENT_RETURN_ADDRESS = 6,
+        AJM_IDENT_INLINE = 7,
+        AJM_IDENT_OUTPUT_RUN = 17,
+        AJM_IDENT_OUTPUT_CONTROL = 18,
+    };
+    constexpr uint32_t AJM_INSTANCE_STATISTICS = 0x80000;
+    constexpr uint64_t AJM_CONTROL_FLAGS_MASK = 0x000060000000e7ffull;
+    constexpr uint64_t AJM_STATISTICS_FLAGS_MASK = 0x00000000c0018007ull;
+    constexpr uint64_t AJM_RUN_FLAGS_MASK = 0x0000e00000001fffull;
+    constexpr size_t AJM_MAX_BUILDER_BYTES = 64u * 1024u * 1024u;
+
+    struct AjmJobChunk {
+        uint32_t header;
+        uint32_t size;
+    };
+    struct AjmFlagsChunk {
+        uint32_t header;
+        uint32_t flags_low;
+    };
+    struct AjmBufferChunk {
+        uint32_t header;
+        uint32_t size;
+        uint64_t address;
+    };
+    struct AjmGuestBuffer {
+        uint64_t address;
+        uint64_t size;
+    };
+    static_assert(sizeof(AjmJobChunk) == 8);
+    static_assert(sizeof(AjmFlagsChunk) == 8);
+    static_assert(sizeof(AjmBufferChunk) == 16);
+    static_assert(sizeof(AjmGuestBuffer) == 16);
+
+    uint32_t ajm_chunk_header(uint32_t ident, uint32_t payload = 0) {
+        return (ident & 0x3fu) | ((payload & 0xfffffu) << 6u);
+    }
+
+    template <typename T>
+    void ajm_append(std::vector<uint8_t>& bytes, const T& value) {
+        const size_t offset = bytes.size();
+        bytes.resize(offset + sizeof(value));
+        std::memcpy(bytes.data() + offset, &value, sizeof(value));
+    }
+
+    void ajm_append_buffer(std::vector<uint8_t>& bytes, uint32_t ident,
+                           uint64_t address, uint32_t size) {
+        ajm_append(bytes, AjmBufferChunk{ajm_chunk_header(ident), size, address});
+    }
+
+    void ajm_append_flags(std::vector<uint8_t>& bytes, uint32_t ident, uint64_t flags) {
+        ajm_append(bytes, AjmFlagsChunk{ajm_chunk_header(ident, (uint32_t)(flags >> 32)),
+                                        (uint32_t)flags});
+    }
+
+    uint64_t ajm_write_job(uint64_t destination, uint32_t instance,
+                           const std::vector<uint8_t>& payload) {
+        if (!destination || payload.size() > UINT32_MAX ||
+            payload.size() + sizeof(AjmJobChunk) > AJM_MAX_BUILDER_BYTES) return 0;
+        std::vector<uint8_t> job;
+        job.reserve(sizeof(AjmJobChunk) + payload.size());
+        ajm_append(job, AjmJobChunk{ajm_chunk_header(AJM_IDENT_JOB, instance),
+                                    (uint32_t)payload.size()});
+        job.insert(job.end(), payload.begin(), payload.end());
+        return audio_store_bytes(destination, job.data(), job.size())
+            ? destination + job.size() : 0;
+    }
 }
 // sceAjmInitialize(s64 reserved, u32* out_context): create a context. Filling out_context is the point.
 HLE(ajm_initialize) {
@@ -539,7 +621,82 @@ HLE(ajm_batch_start) {
     return 0;
 }
 HLE(ajm_batch_wait)       { return a0 ? 0 : AJM_ERR_INVALID_CONTEXT; }   // batch completed
+HLE(ajm_batch_cancel) {
+    if (!a0) return AJM_ERR_INVALID_CONTEXT;
+    if (!a1) return AJM_ERR_INVALID_BATCH;
+    return 0;
+}
 HLE(ajm_batch_errordump)  { return 0; }
+
+// Build one control job and return the next free byte in the caller's batch buffer. Returning zero
+// here is not a harmless stub result: the guest chains the returned cursor into its next builder.
+HLE8(ajm_batch_job_control_buffer_ra) {
+    if (a4 > UINT32_MAX || a6 > UINT32_MAX) return 0;
+    std::vector<uint8_t> payload;
+    payload.reserve(a7 ? 56 : 40);
+    if (a7) ajm_append_buffer(payload, AJM_IDENT_RETURN_ADDRESS, a7, 0);
+    ajm_append_buffer(payload, AJM_IDENT_INPUT_CONTROL, a3, (uint32_t)a4);
+    const uint64_t mask = (uint32_t)a1 == AJM_INSTANCE_STATISTICS
+        ? AJM_STATISTICS_FLAGS_MASK : AJM_CONTROL_FLAGS_MASK;
+    ajm_append_flags(payload, AJM_IDENT_CONTROL_FLAGS, a2 & mask);
+    ajm_append_buffer(payload, AJM_IDENT_OUTPUT_CONTROL, a5, (uint32_t)a6);
+    return ajm_write_job(a0, (uint32_t)a1, payload);
+}
+
+// Store caller data inline after an AJM inline header. The reported batch address points at the
+// copied payload; the next cursor is rounded up to AJM's required 8-byte boundary.
+HLE(ajm_batch_job_inline_buffer) {
+    if (!a0 || !a3 || a2 > UINT32_MAX || a2 > AJM_MAX_BUILDER_BYTES - sizeof(AjmJobChunk))
+        return 0;
+    const size_t data_size = (size_t)a2;
+    const size_t aligned_size = (data_size + 7u) & ~size_t{7u};
+    std::vector<uint8_t> bytes(sizeof(AjmJobChunk) + aligned_size, 0);
+    const AjmJobChunk header{ajm_chunk_header(AJM_IDENT_INLINE), (uint32_t)aligned_size};
+    std::memcpy(bytes.data(), &header, sizeof(header));
+    if (data_size && !audio_read_bytes(a1, bytes.data() + sizeof(header), data_size)) return 0;
+    if (!audio_store_bytes(a0, bytes.data(), bytes.size()) ||
+        !a2_store_u64(a3, a0 + sizeof(AjmJobChunk))) return 0;
+    return a0 + bytes.size();
+}
+
+HLE10(ajm_batch_job_run_buffer_ra) {
+    if (a4 > UINT32_MAX || a6 > UINT32_MAX || a8 > UINT32_MAX) return 0;
+    std::vector<uint8_t> payload;
+    payload.reserve(a9 ? 72 : 56);
+    if (a9) ajm_append_buffer(payload, AJM_IDENT_RETURN_ADDRESS, a9, 0);
+    ajm_append_buffer(payload, AJM_IDENT_INPUT_RUN, a3, (uint32_t)a4);
+    ajm_append_flags(payload, AJM_IDENT_RUN_FLAGS, a2 & AJM_RUN_FLAGS_MASK);
+    ajm_append_buffer(payload, AJM_IDENT_OUTPUT_RUN, a5, (uint32_t)a6);
+    ajm_append_buffer(payload, AJM_IDENT_OUTPUT_CONTROL, a7, (uint32_t)a8);
+    return ajm_write_job(a0, (uint32_t)a1, payload);
+}
+
+HLE10(ajm_batch_job_run_split_buffer_ra) {
+    if (a4 > UINT32_MAX || a6 > UINT32_MAX || a8 > UINT32_MAX) return 0;
+    const uint64_t chunk_count = a4 + a6 + 2u + (a9 ? 1u : 0u);
+    if (chunk_count > (AJM_MAX_BUILDER_BYTES - sizeof(AjmJobChunk)) /
+                      sizeof(AjmBufferChunk)) return 0;
+    if ((a4 && !a3) || (a6 && !a5)) return 0;
+
+    std::vector<uint8_t> payload;
+    payload.reserve((size_t)chunk_count * sizeof(AjmBufferChunk));
+    if (a9) ajm_append_buffer(payload, AJM_IDENT_RETURN_ADDRESS, a9, 0);
+    for (uint64_t i = 0; i < a4; ++i) {
+        AjmGuestBuffer buffer{};
+        if (!audio_read_bytes(a3 + i * sizeof(buffer), &buffer, sizeof(buffer)) ||
+            buffer.size > UINT32_MAX) return 0;
+        ajm_append_buffer(payload, AJM_IDENT_INPUT_RUN, buffer.address, (uint32_t)buffer.size);
+    }
+    ajm_append_flags(payload, AJM_IDENT_RUN_FLAGS, a2 & AJM_RUN_FLAGS_MASK);
+    for (uint64_t i = 0; i < a6; ++i) {
+        AjmGuestBuffer buffer{};
+        if (!audio_read_bytes(a5 + i * sizeof(buffer), &buffer, sizeof(buffer)) ||
+            buffer.size > UINT32_MAX) return 0;
+        ajm_append_buffer(payload, AJM_IDENT_OUTPUT_RUN, buffer.address, (uint32_t)buffer.size);
+    }
+    ajm_append_buffer(payload, AJM_IDENT_OUTPUT_CONTROL, a7, (uint32_t)a8);
+    return ajm_write_job(a0, (uint32_t)a1, payload);
+}
 
 // --- libSceNgs2 silent lifecycle ---------------------------------------------------------------
 // Dead Cells is the first title to exercise NGS2. PROSPER_NGS2_TRACE preserves and logs all six
@@ -783,6 +940,11 @@ void register_audio_hle() {
     R("sceAjmModuleRegister", ajm_module_register);   R("sceAjmModuleUnregister", ajm_module_unregister);
     R("sceAjmInstanceCreate", ajm_instance_create);   R("sceAjmInstanceDestroy", ajm_instance_destroy);
     R("sceAjmBatchStartBuffer", ajm_batch_start);     R("sceAjmBatchWait", ajm_batch_wait);
+    R("sceAjmBatchCancel", ajm_batch_cancel);
+    R("sceAjmBatchJobControlBufferRa", ajm_batch_job_control_buffer_ra);
+    R("sceAjmBatchJobInlineBuffer", ajm_batch_job_inline_buffer);
+    R("sceAjmBatchJobRunBufferRa", ajm_batch_job_run_buffer_ra);
+    R("sceAjmBatchJobRunSplitBufferRa", ajm_batch_job_run_split_buffer_ra);
     R("sceAjmBatchErrorDump", ajm_batch_errordump);
     Hle::register_fn("pgFAiLR5qT4", ngs2_system_query_buffer, "sceNgs2SystemQueryBufferSize");
     Hle::register_fn("koBbCMvOKWw", ngs2_system_create, "sceNgs2SystemCreate");

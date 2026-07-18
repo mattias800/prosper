@@ -1755,44 +1755,42 @@ namespace {
     // it checks a magic at [fs+0x108] that marks OUR guest TCB (guest_tls.cpp). If present (guest thread),
     // it swaps %fs to the stashed host TCB [fs+0x100] for the handler call, then restores the guest %fs.
     // If absent (a host-context thread, or the main thread during pre-entry init), it just tail-calls the
-    // handler on the current fs — exactly the old behavior. Uses FSGSBASE. Clobbers only rax/r11 (never
-    // the arg regs rdi..r9).
+    // handler on the current fs — exactly the old behavior. Uses FSGSBASE. Clobbers only
+    // caller-saved rax/r10/r11 (never the argument registers rdi..r9).
     //
     // STACK-ARG FORWARDING: the guest path interposes a call between the guest caller and handler.
-    // Re-push args 9,8,7 so fixed-arity handlers receive the normal SysV layout ([rsp+8]=arg7,
-    // [rsp+16]=arg8, [rsp+24]=arg9). The saved r11 plus an 8-byte pad remain behind those arguments.
-    // Alignment: entry rsp is 8 mod 16; five qwords of storage make the call site 0 mod 16 and the
-    // handler entry 8 mod 16. Keep offsets/magic in sync with guest_tls.cpp.
+    // Re-push args 10,9,8,7 so fixed-arity handlers receive the normal SysV layout ([rsp+8]=arg7
+    // through [rsp+32]=arg10). Saved r11 remains behind those arguments. Alignment: entry rsp is
+    // 8 mod 16; five qwords of storage make the call site 0 mod 16 and the handler entry 8 mod 16.
+    // Keep offsets/magic in sync with guest_tls.cpp.
     size_t emit_swap_stub(uint8_t* p, uint32_t idx, uint64_t fn, bool unimpl) {
         uint8_t* s = p;
-        auto mid = [&](uint8_t*& q) {   // per-variant: unimpl loads its slot index into edi first
-            if (unimpl) { *q++ = 0xBF; memcpy(q, &idx, 4); q += 4; }         // mov edi, idx
-            *q++ = 0x48; *q++ = 0xB8; memcpy(q, &fn, 8); q += 8;            // movabs rax, fn
-        };
+        // Keep the target in caller-saved r10 across the FS probe/swap. Loading it once avoids
+        // duplicating a movabs in both branches and leaves room for the fourth guest stack arg.
+        if (unimpl) { *p++ = 0xBF; memcpy(p, &idx, 4); p += 4; }             // mov edi, idx
+        *p++ = 0x49; *p++ = 0xBA; memcpy(p, &fn, 8); p += 8;                // movabs r10, fn
         // rdfsbase r11 ; cmp dword [r11+0x108], MAGIC ; jne .host
         *p++=0xF3; *p++=0x49; *p++=0x0F; *p++=0xAE; *p++=0xC3;
         *p++=0x41; *p++=0x81; *p++=0xBB; uint32_t mo=0x108; memcpy(p,&mo,4); p+=4;
         uint32_t magic=0x50524F53u; memcpy(p,&magic,4); p+=4;
         *p++=0x75; uint8_t* jne_rel = p++;                                  // jne rel8 (patched below)
-        // .guest: push r11 ; push rax (alignment pad) ; push [rsp+0x28] (arg9/8/7) x3 ; mov rax,[r11+0x100] ;
-        //         wrfsbase rax ; <mid> ; call rax ; add rsp,0x20 ; pop r11 ; wrfsbase r11 ; ret
-        *p++=0x41; *p++=0x53;
-        *p++=0x50;                                                          // push rax (alignment pad)
+        // .guest: save r11, then re-push original args 10/9/8/7. Each source remains at rsp+0x28
+        // as the stack moves. Five qwords put the handler call site at the required alignment.
+        *p++=0x41; *p++=0x53;                                               // push r11
+        *p++=0xFF; *p++=0x74; *p++=0x24; *p++=0x28;                         // push original arg10
         *p++=0xFF; *p++=0x74; *p++=0x24; *p++=0x28;                         // push original arg9
         *p++=0xFF; *p++=0x74; *p++=0x24; *p++=0x28;                         // push original arg8
         *p++=0xFF; *p++=0x74; *p++=0x24; *p++=0x28;                         // push original arg7
         *p++=0x49; *p++=0x8B; *p++=0x83; uint32_t ho=0x100; memcpy(p,&ho,4); p+=4;
-        *p++=0xF3; *p++=0x48; *p++=0x0F; *p++=0xAE; *p++=0xD0;
-        mid(p);
-        *p++=0xFF; *p++=0xD0;                                               // call rax
-        *p++=0x48; *p++=0x83; *p++=0xC4; *p++=0x20;                         // discard arg copies + pad
+        *p++=0xF3; *p++=0x48; *p++=0x0F; *p++=0xAE; *p++=0xD0;              // wrfsbase host FS
+        *p++=0x41; *p++=0xFF; *p++=0xD2;                                    // call r10
+        *p++=0x48; *p++=0x83; *p++=0xC4; *p++=0x20;                         // discard arg copies
         *p++=0x41; *p++=0x5B;                                               // pop r11
-        *p++=0xF3; *p++=0x49; *p++=0x0F; *p++=0xAE; *p++=0xD3;              // wrfsbase r11
+        *p++=0xF3; *p++=0x49; *p++=0x0F; *p++=0xAE; *p++=0xD3;              // restore guest FS
         *p++=0xC3;                                                          // ret
-        // .host: <mid> ; jmp rax   (host-context: no swap, tail-call as before)
+        // .host: no FS swap is needed; tail-call the already loaded target.
         *jne_rel = (uint8_t)(p - (jne_rel + 1));
-        mid(p);
-        *p++=0xFF; *p++=0xE0;                                               // jmp rax
+        *p++=0x41; *p++=0xFF; *p++=0xE2;                                    // jmp r10
         return static_cast<size_t>(p - s);
     }
     size_t emit_impl_swap(uint8_t* p, uint64_t fn)                 { return emit_swap_stub(p, 0,   fn, false); }
