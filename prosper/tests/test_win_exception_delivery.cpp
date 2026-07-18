@@ -294,6 +294,7 @@ static void test_sse4a_fastpath() {
     constexpr size_t chain_code_offset = 0x300;
     constexpr size_t chain_sse4a_offset = chain_code_offset + 28;
     constexpr size_t chain_second_wrapper_offset = 0x380;
+    constexpr size_t false_candidate_offset = 0x500;
     constexpr size_t data_offset = 0x100;
     const uint8_t code[code_size] = {
         0x48,0x83,0xec,0x18,                         // sub rsp,0x18
@@ -354,12 +355,23 @@ static void test_sse4a_fastpath() {
         0xf3,0x0f,0x6f,0x50,0x20,                    // movdqu xmm2,[rax+0x20]
         0xe9, 0,0,0,0                                // jmp chained second EXTRQ
     };
+    const uint8_t false_candidate[] = {
+        // The EXTRQ-looking bytes begin inside movabs's immediate. A blind executable-byte scan
+        // also sees a whitelisted five-byte VEX successor crossing the next instruction boundary.
+        0x48,0xb8, 0x66,0x0f,0x79,0xc0,0xc4,0xe1,0x79,0x6f,
+        0xc0,0xc0,0x01,                                // rol al,1 (not part of the immediate)
+        0xc3
+    };
     LoadedImage image;
     image.base = base;
     image.min_vaddr = 0;
     image.max_vaddr = 0x1000;
     image.mem.assign(0x1000, 0xcc);
     image.prot.push_back({0, 0x1000, true, false, true});
+    image.verified_sse4a_sites = {
+        sse4a_offset, short_sse4a_offset,
+        chain_sse4a_offset, chain_sse4a_offset + 4,
+    };
     memcpy(image.mem.data(), code, sizeof(code));
     memcpy(image.mem.data() + short_code_offset, short_code, sizeof(short_code));
     memcpy(image.mem.data() + short_successor_wrapper_offset, short_successor_wrapper,
@@ -367,6 +379,8 @@ static void test_sse4a_fastpath() {
     memcpy(image.mem.data() + chain_code_offset, chain_code, sizeof(chain_code));
     memcpy(image.mem.data() + chain_second_wrapper_offset, chain_second_wrapper,
            sizeof(chain_second_wrapper));
+    memcpy(image.mem.data() + false_candidate_offset, false_candidate,
+           sizeof(false_candidate));
     const uint64_t data_address = base + data_offset;
     memcpy(image.mem.data() + 27, &data_address, sizeof(data_address));
     memcpy(image.mem.data() + short_code_offset + 2, &data_address, sizeof(data_address));
@@ -400,6 +414,8 @@ static void test_sse4a_fastpath() {
     const uint64_t after_map = sse4a_fastpath_patch_count();
     CHECK(after_map >= before_map + 8,
           "EXTRQ and relocated-successor entry points exist before guest entry");
+    CHECK(*(const uint8_t*)(uintptr_t)(base + false_candidate_offset + 2) == 0x66,
+          "an EXTRQ byte pattern inside another instruction is never load-time patched");
     install_trap_handler();
     using GuestFn = uint64_t (*)();
     const GuestFn function = (GuestFn)(uintptr_t)base;

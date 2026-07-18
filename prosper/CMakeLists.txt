@@ -65,7 +65,7 @@ if(PROSPER_SRC)
   # Windows: the guest futex HLE (sceKernelWaitOnAddress/WakeByAddress) is backed by the native Win32
   # WaitOnAddress/WakeByAddressSingle/All, which live in the Synchronization import lib (not kernel32).
   if(WIN32)
-    target_link_libraries(prosper_core PUBLIC synchronization)
+    target_link_libraries(prosper_core PUBLIC synchronization bcrypt)
   endif()
 endif()
 

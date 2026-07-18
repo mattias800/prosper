@@ -103,6 +103,11 @@ struct LoadedImage {
     uint64_t entry = 0;                // guest entry address (base + e_entry)
     uint32_t tls_modid = 0;            // TLS module id (assigned by the linker; 0 = none)
 
+    // ELF-relative instruction boundaries independently verified for load-time Windows SSE4a
+    // translation. Empty by default: the host must never infer boundaries by scanning arbitrary
+    // executable bytes. Tests and exact-module manifests may populate this before map_image().
+    std::vector<uint64_t> verified_sse4a_sites;
+
     // stub binding: import sym_index -> assigned guest address (trap stub)
     std::map<uint32_t, uint64_t> import_addr;
 

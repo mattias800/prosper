@@ -24,12 +24,15 @@
 #include "../hle/dispatch.hpp"
 
 #include <windows.h>
+#include <bcrypt.h>
 #include <pthread.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
 #include <csetjmp>
+#include <algorithm>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <limits>
@@ -196,6 +199,39 @@ namespace {
     uint64_t g_sse4a_fastpath_sites[kSse4aFastpathMaxPatches]{};
     volatile LONG g_sse4a_fastpath_count = 0;
     volatile LONG g_sse4a_fastpath_lock = 0;
+
+    // Astro Bot PPSA21564's EXTRQs live in two unwind-described vector-unpack functions. GNU objdump
+    // independently confirms every address below as an instruction boundary. The exact function
+    // digests prevent these offsets from ever being applied to another build: load-time x86 rewriting
+    // must use a verified manifest, never a byte-pattern scan through arbitrary executable data.
+    // CONFIDENCE: HIGH (exact guest disassembly + SHA-256 identity + live first-level execution).
+    constexpr uint64_t kAstroSse4aSites[] = {
+        0x82e6, 0x82ef, 0x82f4, 0x830b, 0x8348, 0x838f, 0x83e1, 0x83e6,
+        0x8405, 0x841d, 0x842e, 0x8480, 0x849b, 0x84b1, 0x84ba, 0x8516,
+        0x88b3, 0x88b8, 0x88d1, 0x88e0, 0x8917, 0x891c, 0x8963, 0x8968,
+        0x899c, 0x89a1, 0x89cd, 0x89de, 0x89e8, 0x8a10, 0x8a45, 0x8a50,
+        0x8a5b, 0x8aa5, 0x8ab0, 0x8aed, 0x8af8, 0x8b05, 0x8b1f, 0x8b42,
+        0x8b58, 0x8b77, 0x8b7c, 0x8b9d, 0x8ba8, 0x8bd4, 0x8be2, 0x8c0e,
+        0xacbb, 0xacc6, 0xacd7, 0xad02, 0xad3a, 0xad6f, 0xad9a, 0xade2,
+        0xae00, 0xae0e, 0xae17, 0xae25, 0xae37, 0xae66, 0xaeb1, 0xaee8,
+        0xb15c, 0xb167, 0xb187, 0xb196, 0xb1c8, 0xb1cc, 0xb20f, 0xb213,
+        0xb23d, 0xb251, 0xb265, 0xb278, 0xb280, 0xb2ab, 0xb2b6, 0xb2cf,
+        0xb4d2, 0xb4db, 0xb4e4, 0xb4e9, 0xb4f8, 0xb50c, 0xb52d, 0xb531,
+        0xb549, 0xb557, 0xb55c, 0xb565, 0xb56e, 0xb577, 0xb57c, 0xb593,
+    };
+    struct Sse4aManifestRange {
+        uint64_t vaddr;
+        size_t size;
+        uint8_t sha256[32];
+    };
+    constexpr Sse4aManifestRange kAstroSse4aRanges[] = {
+        {0x76e0, 0x1bd0,
+         {0x52,0xc9,0x9c,0xad,0x71,0xe4,0xd1,0xa5,0xdb,0x75,0xfd,0x76,0x0c,0x6f,0x0b,0x41,
+          0xe6,0x41,0xb4,0x52,0x5f,0xea,0x6f,0x86,0x8d,0xaa,0x7d,0x47,0x24,0x5d,0x0b,0x63}},
+        {0xa250, 0x1680,
+         {0xf8,0x2a,0x12,0x11,0x03,0x76,0x4b,0x6d,0x19,0x2f,0xa6,0x10,0x7e,0x25,0x4a,0xc4,
+          0x85,0x8a,0x4c,0x6b,0x01,0xb6,0x82,0x45,0x4b,0x1b,0x32,0x79,0x7e,0x7b,0x15,0xbd}},
+    };
 
     // Thread-stack registry (portable; mirrors the Linux one) so GC/thread code gets real bounds.
     std::map<uint64_t, std::pair<uint64_t, uint64_t>> g_stacks;
@@ -675,40 +711,91 @@ namespace {
         return true;
     }
 
+    bool sha256_matches(const uint8_t* data, size_t size, const uint8_t expected[32]) {
+        if (!data || size > std::numeric_limits<ULONG>::max()) return false;
+        BCRYPT_ALG_HANDLE algorithm = nullptr;
+        if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM,
+                                        nullptr, 0) < 0)
+            return false;
+        uint8_t digest[32]{};
+        const NTSTATUS status = BCryptHash(
+            algorithm, nullptr, 0, const_cast<PUCHAR>(data), (ULONG)size,
+            digest, (ULONG)sizeof(digest));
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return status >= 0 && memcmp(digest, expected, sizeof(digest)) == 0;
+    }
+
+    bool astrobot_sse4a_manifest(const LoadedImage& img,
+                                 std::vector<uint64_t>& sites) {
+        for (const Sse4aManifestRange& range : kAstroSse4aRanges) {
+            if (range.vaddr < img.min_vaddr || range.vaddr > img.max_vaddr ||
+                range.size > img.max_vaddr - range.vaddr)
+                return false;
+            const uint8_t* bytes = img.at(img.base + range.vaddr);
+            if (!sha256_matches(bytes, range.size, range.sha256)) return false;
+        }
+        sites.assign(std::begin(kAstroSse4aSites), std::end(kAstroSse4aSites));
+        return true;
+    }
+
+    uint64_t executable_end_for(const LoadedImage& img, uint64_t vaddr) {
+        for (const LoadedImage::Prot& protection : img.prot) {
+            if (!protection.x || protection.vaddr >= img.max_vaddr) continue;
+            const uint64_t remaining = img.max_vaddr - protection.vaddr;
+            const uint64_t protection_end = protection.size > remaining
+                ? img.max_vaddr : protection.vaddr + protection.size;
+            if (vaddr < protection.vaddr || vaddr >= protection_end)
+                continue;
+            return protection_end;
+        }
+        return 0;
+    }
+
     // Windows constructs an exception-dispatch frame below the interrupted RSP. PS5 code follows
     // the SysV ABI and may keep live values in the 128-byte red zone there, so discovering SSE4a
-    // through a live #UD can corrupt guest locals before VEH is entered. Translate the narrowly
-    // recognized register-form EXTRQ sequences while the primary image is still single-threaded.
-    // Five-byte forms are self-contained. Four-byte forms are accepted only when the fail-closed
-    // successor decoder reaches a final instruction large enough to close an all-near-jump chain.
-    size_t prepatch_sse4a(const LoadedImage& img) {
+    // through a live #UD can corrupt guest locals before VEH is entered. Translate only instruction
+    // boundaries supplied by an independently verified exact-module manifest while the primary image
+    // is still single-threaded. Five-byte forms are self-contained. Four-byte forms are accepted only
+    // when the fail-closed successor decoder closes an all-near-jump chain.
+    size_t prepatch_sse4a(const LoadedImage& img,
+                          const std::vector<uint64_t>& verified_sites) {
+        if (verified_sites.empty()) return 0;
         const LONG before = InterlockedCompareExchange(&g_sse4a_fastpath_count, 0, 0);
-        size_t patched = 0;
-        for (const LoadedImage::Prot& protection : img.prot) {
-            if (!protection.x || !protection.size) continue;
-            const uint64_t mapped_begin = img.base + img.min_vaddr;
-            const uint64_t mapped_end = mapped_begin + img.mem.size();
-            uint64_t begin = img.base + protection.vaddr;
-            uint64_t end = begin + protection.size;
-            if (begin < mapped_begin) begin = mapped_begin;
-            if (end > mapped_end) end = mapped_end;
-            if (end <= begin || end - begin < 5) continue;
-            for (uint64_t site = begin; site + 5 <= end; ++site) {
-                if (!sse4a_fastpath_candidate_bytes(
-                        (const uint8_t*)(uintptr_t)site))
-                    continue;
-                const Sse4aPatchPlan plan = sse4a_patch_plan(site);
-                if (!plan.count || site + plan.span > end || !emit_sse4a_fastpath(plan))
-                    continue;
-                patched += plan.extrq_count;
-                site += plan.span - 1;
+        // Validate the complete manifest before modifying a byte. This also makes a stale manifest
+        // fail closed if a title update changes one instruction or executable-segment boundary.
+        if (!std::is_sorted(verified_sites.begin(), verified_sites.end()) ||
+            std::adjacent_find(verified_sites.begin(), verified_sites.end()) !=
+                verified_sites.end())
+            return 0;
+        for (uint64_t vaddr : verified_sites) {
+            if (vaddr < img.min_vaddr) return 0;
+            const uint64_t executable_end = executable_end_for(img, vaddr);
+            if (!executable_end) return 0;
+            const uint64_t site = img.base + vaddr;
+            const Sse4aPatchPlan plan = sse4a_patch_plan(site);
+            if (!plan.count || plan.span > executable_end - vaddr) return 0;
+            for (size_t i = 0; i < plan.count; ++i) {
+                if (!plan.insns[i].extrq) continue;
+                const uint64_t consumed_vaddr = plan.insns[i].site - img.base;
+                if (!std::binary_search(verified_sites.begin(), verified_sites.end(),
+                                        consumed_vaddr))
+                    return 0;
             }
+        }
+
+        size_t patched = 0;
+        for (uint64_t vaddr : verified_sites) {
+            const uint64_t site = img.base + vaddr;
+            if (sse4a_fastpath_site(site)) continue; // consumed by an earlier verified chain
+            const Sse4aPatchPlan plan = sse4a_patch_plan(site);
+            if (!plan.count || !emit_sse4a_fastpath(plan)) continue;
+            patched += plan.extrq_count;
         }
         const size_t sites = (size_t)(
             InterlockedCompareExchange(&g_sse4a_fastpath_count, 0, 0) - before);
         if (sites || getenv("PROSPER_SSE4A_LOG"))
             fprintf(stderr,
-                    "[sse4a] prepatched %zu entry points for %zu EXTRQ instructions before guest entry\n",
+                    "[sse4a] prepatched %zu verified entry points for %zu EXTRQ instructions before guest entry\n",
                     sites, patched);
         return sites;
     }
@@ -970,7 +1057,12 @@ bool map_image(const LoadedImage& img, std::string* err) {
                         (unsigned long)allocation_error);
             }
         }
-        prepatch_sse4a(img);
+        std::vector<uint64_t> verified_sites = img.verified_sse4a_sites;
+        if (verified_sites.empty() && astrobot_sse4a_manifest(img, verified_sites))
+            fprintf(stderr,
+                    "[sse4a] matched Astro Bot's exact verified EXTRQ manifest (%zu sites)\n",
+                    verified_sites.size());
+        prepatch_sse4a(img, verified_sites);
     }
     return true;
 }
