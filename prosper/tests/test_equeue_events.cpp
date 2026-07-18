@@ -32,8 +32,12 @@ int main() {
     auto trigger = Hle::lookup(nid_hash("sceKernelTriggerUserEvent"));
     auto addhrt  = Hle::lookup(nid_hash("sceKernelAddHRTimerEvent"));
     auto wait    = Hle::lookup(nid_hash("sceKernelWaitEqueue"));
-    CHECK(create && adduser && trigger && addhrt && wait, "all equeue event fns registered");
-    if (!(create && adduser && trigger && addhrt && wait)) { printf("== FAIL ==\n"); return 1; }
+    auto getcount = Hle::lookup(nid_hash("sceKernelGetEventCount"));
+    CHECK(create && adduser && trigger && addhrt && wait && getcount,
+          "all equeue event fns registered");
+    if (!(create && adduser && trigger && addhrt && wait && getcount)) {
+        printf("== FAIL ==\n"); return 1;
+    }
 
     // Create an equeue: the handle is written to *arg0.
     uint64_t eq = 0;
@@ -97,7 +101,15 @@ int main() {
         constexpr uint64_t kFlipArg = 0x8000000000001234ull;
         constexpr uint64_t kFlipUdata = 0xFACEB00Cull;
         addflip(eq, 0x1001, kFlipUdata, 0, 0, 0);
+        CHECK((uint32_t)submitflp(0x1001, (uint64_t)(int64_t)-2, 0, kFlipArg, 0, 0) ==
+                  0x8029000au && getcount(eq, 0, 0, 0, 0, 0) == 0,
+              "invalid low flip index does not post a VideoOut completion event");
+        CHECK((uint32_t)submitflp(0x1001, 16, 0, kFlipArg, 0, 0) == 0x8029000au &&
+                  getcount(eq, 0, 0, 0, 0, 0) == 0,
+              "invalid high flip index does not post a VideoOut completion event");
         submitflp(0x1001, 0, 0, kFlipArg, 0, 0);
+        CHECK(getcount(eq, 0, 0, 0, 0, 0) == 1,
+              "valid flip posts one VideoOut completion event");
 
         KEvent fev{}; int32_t fout = -1; uint32_t fcap = 50000;
         wait(eq, (uint64_t)(uintptr_t)&fev, 1, (uint64_t)(uintptr_t)&fout,

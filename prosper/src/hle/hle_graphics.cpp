@@ -329,8 +329,11 @@ HLE(g_vo_set_flip_rate) {
 HLE(g_vo_submitflip)  {
     if (evlog()) fprintf(stderr, "[ev] SubmitFlip handle=0x%llx bufidx=%lld flipmode=0x%llx fl013arg=0x%llx\n",
         (unsigned long long)a0, (long long)(int32_t)a1, (unsigned long long)a2, (unsigned long long)a3);
-    flip_advance((int32_t)a1, (int64_t)a3);
-    gpu::present_flip((int)(int32_t)a1, (int64_t)a3);   // present the buffer (scanout front + count)
+    const int32_t buffer_index = (int32_t)a1;
+    if (buffer_index < -1 || buffer_index > 15)
+        return (uint64_t)(int64_t)(int32_t)0x8029000a;  // SCE_VIDEO_OUT_ERROR_INVALID_INDEX
+    flip_advance(buffer_index, (int64_t)a3);
+    gpu::present_flip(buffer_index, (int64_t)a3);   // present the buffer (scanout front + count)
     prosper_eq_trigger_flip((int64_t)a3);   // flip completed (synchronous): fire the flip event
     return 0;
 }

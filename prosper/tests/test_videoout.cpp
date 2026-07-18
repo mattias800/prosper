@@ -17,6 +17,7 @@ extern "C" uint32_t prosper_vo_display_width();
 extern "C" uint32_t prosper_vo_display_height();
 extern "C" uint64_t prosper_vo_display_format();
 extern "C" uint64_t prosper_vo_buffer_addr(int i);
+extern "C" uint64_t prosper_vo_flip_count();
 extern "C" int prosper_vo_flip_rate();
 extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx,
                                            uint32_t flip_mode, int64_t flip_arg);
@@ -97,6 +98,16 @@ int main() {
     for (size_t i = 0x40; i < sizeof initial_fs; ++i)
         initial_tail_untouched &= initial_fs[i] == 0xEE;
     CHECK(initial_tail_untouched, "GetFlipStatus writes exactly its 0x40-byte ABI struct");
+
+    // #394 F10 (SubmitFlip index scope): reject values outside -1..15 before any completion
+    // bookkeeping. An invalid call must not advance either VideoOut status or present state.
+    const uint64_t initial_present_count = gpu::present_count();
+    CHECK((uint32_t)flip(0x1001, (uint64_t)(int64_t)-2, 0, 0xBAD, 0, 0) == 0x8029000au,
+          "SubmitFlip rejects an index below the -1 special slot");
+    CHECK((uint32_t)flip(0x1001, 16, 0, 0xBAD, 0, 0) == 0x8029000au,
+          "SubmitFlip rejects an index above slot 15");
+    CHECK(prosper_vo_flip_count() == 0 && gpu::present_count() == initial_present_count,
+          "rejected flips do not advance status or present state");
 
     // Resolution: real 1080p @ 59.94Hz (refresh enum 3), not zeroed. The ABI struct is 0x30
     // bytes: flags/reserved0 at 0x1c and reserved1[3] at 0x20 must not retain caller garbage.
@@ -308,6 +319,11 @@ int main() {
               prosper_vo_buffer_count() == 0 && prosper_vo_buffer_addr(0) == 0 &&
               prosper_vo_display_width() == 0 && prosper_vo_display_height() == 0,
           "unregistering the remaining set clears the registry and geometry");
+
+    const uint64_t before_blank_flip = prosper_vo_flip_count();
+    CHECK(flip(0x1001, (uint64_t)(int64_t)-1, 0, 0, 0, 0) == 0 &&
+              prosper_vo_flip_count() == before_blank_flip + 1,
+          "SubmitFlip accepts the documented -1 blank-buffer special index");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
