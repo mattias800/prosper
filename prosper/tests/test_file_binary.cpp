@@ -36,6 +36,7 @@ static constexpr uint64_t kGuestFSetFl = 4;
 static constexpr uint64_t kGuestFdCloExec = 1;
 static constexpr uint64_t kGuestONonblock = 0x0004;
 static constexpr uint64_t kGuestOAppend = 0x0008;
+static constexpr uint64_t kGuestOSync = 0x0080;
 
 int main() {
     std::printf("== test_file_binary ==\n");
@@ -206,6 +207,17 @@ int main() {
         : -1;
     CHECK(rewind_dir == 0 && rewound_bytes > 0,
           "Windows directory descriptors can be rewound and enumerated again");
+    errno = 0;
+    int64_t clear_dir_cloexec = dir_fd >= 0 && fcntl_fn
+        ? (int64_t)fcntl_fn((uint64_t)dir_fd, kGuestFSetFd, 0, 0, 0, 0)
+        : 0;
+    int clear_dir_errno = errno;
+    uint64_t dir_fd_flags = dir_fd >= 0 && fcntl_fn
+        ? fcntl_fn((uint64_t)dir_fd, kGuestFGetFd, 0, 0, 0, 0)
+        : 0;
+    CHECK(clear_dir_cloexec == -1 && clear_dir_errno == ENOTSUP &&
+              dir_fd_flags == kGuestFdCloExec,
+          "Windows directory fcntl rejects an unrepresentable close-on-exec change");
 #endif
 
     // Darwin's getdents compatibility path owns a duplicated descriptor behind DIR*. A raw
@@ -258,6 +270,17 @@ int main() {
     CHECK((changed_flags & (3 | kGuestONonblock | kGuestOAppend)) ==
               (kGuestONonblock | kGuestOAppend),
           "sceKernelFcntl F_GETFL returns translated non-blocking and append bits");
+    errno = 0;
+    int64_t unsupported_sync_change = fcntl_fn && fd >= 0
+        ? (int64_t)fcntl_fn((uint64_t)fd, kGuestFSetFl,
+                            changed_flags | kGuestOSync, 0, 0, 0)
+        : 0;
+    uint64_t flags_after_sync_change = fcntl_fn && fd >= 0
+        ? fcntl_fn((uint64_t)fd, kGuestFGetFl, 0, 0, 0, 0)
+        : ~uint64_t{0};
+    CHECK(unsupported_sync_change == -1 && errno == ENOTSUP &&
+              (flags_after_sync_change & kGuestOSync) == 0,
+          "fcntl rejects an unsupported O_SYNC change instead of reporting false success");
 #else
     // UCRT exposes neither F_GETFL nor F_SETFL. Until the secondary Windows host grows an
     // equivalent descriptor-status layer, report that limitation instead of fake success.

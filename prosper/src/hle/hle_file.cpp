@@ -845,7 +845,13 @@ HLE(f_fcntl) {
             return (uint64_t)-1;
         }
 #ifdef _WIN32
-        if (windows_directory_path(fd, nullptr)) return 0;
+        if (windows_directory_path(fd, nullptr)) {
+            // Synthetic directory descriptors never escape to a child process. Their fixed
+            // CLOEXEC state cannot be cleared without introducing descriptor inheritance.
+            if (a2 & kGuestFdCloExec) return 0;
+            errno = ENOTSUP;
+            return (uint64_t)-1;
+        }
         {
             ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
             const intptr_t raw = ::_get_osfhandle(fd);
@@ -884,6 +890,14 @@ HLE(f_fcntl) {
         {
             const int old_flags = ::fcntl(fd, F_GETFL);
             if (old_flags < 0) return (uint64_t)-1;
+            const uint64_t old_guest_flags = guest_status_flags_from_host(old_flags);
+            // FreeBSD permits O_SYNC in F_SETFL, but Linux and Darwin do not reliably change it
+            // after open. Reject a requested transition instead of claiming success while the
+            // host descriptor remains unchanged.
+            if ((old_guest_flags ^ a2) & kGuestOSync) {
+                errno = ENOTSUP;
+                return (uint64_t)-1;
+            }
             const int new_flags = (old_flags & ~host_settable_status_mask()) |
                                   host_settable_status_flags(a2);
             return (uint64_t)(int64_t)::fcntl(fd, F_SETFL, new_flags);
