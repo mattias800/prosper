@@ -74,9 +74,35 @@ int main() {
           raw_snap.width == W && raw_snap.height == H && raw_snap.rgba[0] == 0x44,
           "raw snapshot identifies and copies the selected guest scanout");
 
+    // Register a second set with different dimensions. Flipping between the sets must select one
+    // coherent address + geometry snapshot; otherwise the raw copy would use the latest set's size
+    // with the older set's address (or vice versa).
+    const uint32_t SMALL_W = 4, SMALL_H = 2;
+    const size_t SMALL_BYTES = (size_t)SMALL_W * SMALL_H * 4;
+    std::vector<uint8_t> fb4(SMALL_BYTES, 0x66), fb5(SMALL_BYTES, 0x77);
+    uint8_t small_attr[0x50]; memset(small_attr, 0, sizeof small_attr);
+    setba2((uint64_t)(uintptr_t)small_attr, 0x8000000000000000ull,
+           0 /*tiling*/, SMALL_W, SMALL_H, 0 /*option*/);
+    VOB small_buffers[2] = { {fb4.data(),0,{0,0}}, {fb5.data(),0,{0,0}} };
+    rc = regb2(0x1001, 1 /*set*/, 4 /*start*/, (uint64_t)(uintptr_t)small_buffers, 2,
+               (uint64_t)(uintptr_t)small_attr);
+    CHECK(rc == 0, "registered a second 2-buffer 4x2 surface");
+    flip(0x1001, 4, 0, 0, 0, 0);
+    std::vector<uint8_t> small_out(SMALL_BYTES, 0xEE);
+    got = gpu::present_readback(small_out.data(), small_out.size());
+    CHECK(gpu::present_width() == SMALL_W && gpu::present_height() == SMALL_H &&
+          got == SMALL_BYTES && small_out.front() == 0x66 && small_out.back() == 0x66,
+          "set 1 flip reads its 4x2 buffer with matching geometry");
+    flip(0x1001, 1, 0, 0, 0, 0);
+    std::fill(out.begin(), out.end(), 0xEE);
+    got = gpu::present_readback(out.data(), out.size());
+    CHECK(gpu::present_width() == W && gpu::present_height() == H &&
+          got == FB_BYTES && out.front() == 0x22 && out.back() == 0x22,
+          "set 0 flip restores its 16x8 buffer with matching geometry");
+
     // Out-of-range flip index leaves the front buffer unchanged (but still counts as a flip).
     flip(0x1001, 99, 0, 0, 0, 0);
-    CHECK(gpu::present_front_index() == 2, "out-of-range flip index does not corrupt the front buffer");
+    CHECK(gpu::present_front_index() == 1, "out-of-range flip index does not corrupt the front buffer");
 
     // Receiving side: the renderer hands a finished frame -> present_readback returns THOSE pixels
     // (the real rendered frame), not the raw guest buffer. This is shader->render->present->readback.

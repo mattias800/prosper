@@ -16,6 +16,24 @@
 #include <memory>
 #include <vector>
 
+namespace prosper {
+
+// One lock-coherent view of a registered guest scanout buffer and the attributes of its owning
+// VideoOut set. The HLE registry supplies these snapshots to the present layer so an unregister or
+// another set's registration cannot pair one buffer address with unrelated dimensions.
+struct VideoOutBufferSnapshot {
+    uint64_t address = 0;
+    uint64_t pixel_format = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t tiling_mode = 0;
+};
+
+bool videoout_buffer_snapshot(int buffer_index, VideoOutBufferSnapshot& out);
+bool videoout_display_snapshot(VideoOutBufferSnapshot& out);
+
+} // namespace prosper
+
 namespace prosper::gpu {
 
 enum class PresentSource : uint8_t { None, Rendered, RawScanout };

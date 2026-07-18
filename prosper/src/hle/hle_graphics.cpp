@@ -115,6 +115,7 @@ namespace {
         bool     configured = false;
     };
     DisplayConfig g_display;
+    std::mutex g_display_mx;
     struct VideoOutBuffers { const void* data; const void* metadata; const void* reserved[2]; };
 }
 
@@ -122,12 +123,48 @@ namespace {
 // prosper_vo_flip_count: total flips so far (either flip path) — read by the PROSPER_PROGRESS
 // heartbeat in hle_agc.cpp as a cheap forward-progress signal for long diagnostic runs.
 extern "C" uint64_t prosper_vo_flip_count() { std::lock_guard<std::mutex> lk(g_flip_mx); return g_flip_count; }
-extern "C" int      prosper_vo_buffer_count()   { return g_display.buffer_num; }
-extern "C" uint32_t prosper_vo_display_width()  { return g_display.width; }
-extern "C" uint32_t prosper_vo_display_height() { return g_display.height; }
-extern "C" uint64_t prosper_vo_display_format() { return g_display.pixel_format; }
+extern "C" int prosper_vo_buffer_count() {
+    std::lock_guard<std::mutex> lk(g_display_mx); return g_display.buffer_num;
+}
+extern "C" uint32_t prosper_vo_display_width() {
+    std::lock_guard<std::mutex> lk(g_display_mx); return g_display.width;
+}
+extern "C" uint32_t prosper_vo_display_height() {
+    std::lock_guard<std::mutex> lk(g_display_mx); return g_display.height;
+}
+extern "C" uint64_t prosper_vo_display_format() {
+    std::lock_guard<std::mutex> lk(g_display_mx); return g_display.pixel_format;
+}
 extern "C" uint64_t prosper_vo_buffer_addr(int i) {
+    std::lock_guard<std::mutex> lk(g_display_mx);
     return (i >= 0 && i < g_display.buffer_num) ? g_display.buffer_addr[i] : 0;
+}
+
+bool videoout_buffer_snapshot(int buffer_index, VideoOutBufferSnapshot& out) {
+    out = {};
+    std::lock_guard<std::mutex> lk(g_display_mx);
+    if (buffer_index < 0 || buffer_index >= 16) return false;
+    const uint8_t tag = g_display.buffer_set[buffer_index];
+    if (tag == 0) return false;
+    const auto& config = g_display.sets[tag - 1];
+    if (!config.registered) return false;
+    out.address = g_display.buffer_addr[buffer_index];
+    out.pixel_format = config.pixel_format;
+    out.width = config.width;
+    out.height = config.height;
+    out.tiling_mode = config.tiling_mode;
+    return true;
+}
+
+bool videoout_display_snapshot(VideoOutBufferSnapshot& out) {
+    out = {};
+    std::lock_guard<std::mutex> lk(g_display_mx);
+    if (!g_display.configured) return false;
+    out.pixel_format = g_display.pixel_format;
+    out.width = g_display.width;
+    out.height = g_display.height;
+    out.tiling_mode = g_display.tiling_mode;
+    return true;
 }
 namespace { bool evlog() { static int v = getenv("PROSPER_EVLOG") ? 1 : 0; return v; } }
 // Implemented in hle_kernel_time.cpp (the equeue backend). Register a flip/vblank event source so the
@@ -277,14 +314,24 @@ HLE(g_vo_register_buffers2) {  // a0=handle a1=set_index a2=buffer_index_start a
     // Record the display surface (swapchain scaffolding). attribute is the 0x50-byte
     // VideoOutBufferAttribute2 we fill in SetBufferAttribute2: width@0x0c, height@0x10, format@0x20.
     const uint8_t* attr = (const uint8_t*)(uintptr_t)a5;
-    g_display.width        = *(const uint32_t*)(attr + 0x0c);
-    g_display.height       = *(const uint32_t*)(attr + 0x10);
-    g_display.pixel_format = *(const uint64_t*)(attr + 0x20);
-    g_display.tiling_mode  = *(const uint32_t*)(attr + 0x04);
-    g_display.sets[set] = {g_display.width, g_display.height, g_display.pixel_format,
-                           g_display.tiling_mode, true};
+    const DisplayConfig::SetConfig config = {
+        *(const uint32_t*)(attr + 0x0c), *(const uint32_t*)(attr + 0x10),
+        *(const uint64_t*)(attr + 0x20), *(const uint32_t*)(attr + 0x04), true
+    };
     const auto* bufs = (const VideoOutBuffers*)(uintptr_t)a3;
-    for (int i = 0; i < num && start + i < 16; i++) {
+    std::lock_guard<std::mutex> lk(g_display_mx);
+    if (g_display.sets[set].registered)
+        return (uint64_t)(int64_t)(int32_t)0x8029000a;  // SCE_VIDEO_OUT_ERROR_INVALID_INDEX
+    for (int i = 0; i < num; ++i) {
+        if (g_display.buffer_set[start + i] != 0)
+            return (uint64_t)(int64_t)(int32_t)0x80290010;  // SCE_VIDEO_OUT_ERROR_SLOT_OCCUPIED
+    }
+    g_display.width = config.width;
+    g_display.height = config.height;
+    g_display.pixel_format = config.pixel_format;
+    g_display.tiling_mode = config.tiling_mode;
+    g_display.sets[set] = config;
+    for (int i = 0; i < num; i++) {
         g_display.buffer_addr[start + i] = (uint64_t)(uintptr_t)bufs[i].data;
         g_display.buffer_set[start + i] = (uint8_t)(set + 1);
     }
@@ -305,6 +352,7 @@ HLE(g_vo_unregister_buffers) {
     if (set < 0 || set > 3)
         return (uint64_t)(int64_t)(int32_t)0x8029000a;  // SCE_VIDEO_OUT_ERROR_INVALID_INDEX
 
+    std::lock_guard<std::mutex> lk(g_display_mx);
     const uint8_t tag = (uint8_t)(set + 1);
     bool found = false;
     for (int i = 0; i < 16; ++i) {
