@@ -164,6 +164,24 @@ namespace {
         return hash ? hash : 1;
     }
 
+    int windows_directory_errno(DWORD error) {
+        switch (error) {
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND:
+        case ERROR_INVALID_NAME:
+        case ERROR_DIRECTORY:
+            return ENOENT;
+        case ERROR_ACCESS_DENIED:
+        case ERROR_SHARING_VIOLATION:
+            return EACCES;
+        case ERROR_NOT_ENOUGH_MEMORY:
+        case ERROR_OUTOFMEMORY:
+            return ENOMEM;
+        default:
+            return EIO;
+        }
+    }
+
     int windows_open_directory(const std::string& path) {
         WindowsDirState state;
         state.path = path;
@@ -174,17 +192,30 @@ namespace {
         WIN32_FIND_DATAA data{};
         HANDLE search = FindFirstFileA(pattern.c_str(), &data);
         if (search != INVALID_HANDLE_VALUE) {
-            do {
+            DWORD enumeration_error = ERROR_SUCCESS;
+            for (;;) {
                 WindowsDirEntry entry;
                 entry.name = data.cFileName;
                 entry.ino = windows_dir_ino(entry.name);
                 entry.type = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 4 : 8;
                 state.entries.push_back(std::move(entry));
-            } while (FindNextFileA(search, &data));
+                if (FindNextFileA(search, &data)) continue;
+                enumeration_error = GetLastError();
+                break;
+            }
             FindClose(search);
-        } else if (GetLastError() != ERROR_FILE_NOT_FOUND) {
-            errno = EACCES;
-            return -1;
+            if (enumeration_error != ERROR_NO_MORE_FILES) {
+                errno = windows_directory_errno(enumeration_error);
+                return -1;
+            }
+        } else {
+            const DWORD enumeration_error = GetLastError();
+            // With a directory already established by GetFileAttributesA, no wildcard match is
+            // the normal representation of an empty directory. Every other failure is real.
+            if (enumeration_error != ERROR_FILE_NOT_FOUND) {
+                errno = windows_directory_errno(enumeration_error);
+                return -1;
+            }
         }
 
         std::lock_guard<std::mutex> lk(g_windows_dir_mx);
