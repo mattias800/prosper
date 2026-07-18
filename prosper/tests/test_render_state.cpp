@@ -11,6 +11,12 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <string>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 using namespace prosper;
 using namespace prosper::gpu;
@@ -19,6 +25,52 @@ namespace P = prosper::agc::Pm4;
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
+
+#ifdef _WIN32
+static int test_fileno(FILE* stream) { return _fileno(stream); }
+static int test_dup(int fd) { return _dup(fd); }
+static int test_dup2(int from, int to) { return _dup2(from, to); }
+static int test_close(int fd) { return _close(fd); }
+#else
+static int test_fileno(FILE* stream) { return fileno(stream); }
+static int test_dup(int fd) { return dup(fd); }
+static int test_dup2(int from, int to) { return dup2(from, to); }
+static int test_close(int fd) { return close(fd); }
+#endif
+
+template <typename Fn>
+static std::string capture_stderr(Fn&& fn) {
+    FILE* capture = tmpfile();
+    if (!capture) return {};
+    const int stderr_fd = test_fileno(stderr);
+    const int saved_fd = test_dup(stderr_fd);
+    if (saved_fd < 0) { fclose(capture); return {}; }
+    fflush(stderr);
+    if (test_dup2(test_fileno(capture), stderr_fd) < 0) {
+        test_close(saved_fd);
+        fclose(capture);
+        return {};
+    }
+    fn();
+    fflush(stderr);
+    test_dup2(saved_fd, stderr_fd);
+    test_close(saved_fd);
+    rewind(capture);
+    std::string output;
+    char buffer[256];
+    while (size_t n = fread(buffer, 1, sizeof buffer, capture))
+        output.append(buffer, n);
+    fclose(capture);
+    return output;
+}
+
+static size_t occurrence_count(const std::string& text, const char* needle) {
+    size_t count = 0;
+    for (size_t pos = 0; (pos = text.find(needle, pos)) != std::string::npos;
+         pos += strlen(needle))
+        ++count;
+    return count;
+}
 #define CHECK_NEAR(a, b, m) CHECK(std::fabs((a) - (b)) < 1e-4f, m)
 
 // Mirror of render_state.cpp's sRGB->linear (VkClearColorValue floats are linear for sRGB targets).
@@ -320,10 +372,23 @@ int main() {
     CHECK(rs.blend1_enable && rs.color1_src_blend == 1u && rs.color1_dst_blend == 5u,
           "CB_BLEND1_CONTROL decodes independently from MRT0");
     CHECK(vk_blend_factor(0x08u) == 4u, "RDNA2 DstColor(8) -> VK DST_COLOR(4) (non-identity)");
-    CHECK(vk_blend_factor(0x0bu) == 0u && vk_blend_factor(0x0cu) == 0u,
+    uint32_t both_src_alpha = UINT32_MAX, both_src_alpha_duplicate = UINT32_MAX;
+    uint32_t both_inv_src_alpha = UINT32_MAX, unknown_blend = UINT32_MAX;
+    const std::string blend_diagnostics = capture_stderr([&] {
+        both_src_alpha = vk_blend_factor(0x0bu);
+        both_src_alpha_duplicate = vk_blend_factor(0x0bu);
+        both_inv_src_alpha = vk_blend_factor(0x0cu);
+        unknown_blend = vk_blend_factor(0x7fu);
+    });
+    CHECK(both_src_alpha == 0u && both_src_alpha_duplicate == 0u &&
+              both_inv_src_alpha == 0u,
           "unsupported RDNA2 dual-output blend factors retain the fail-visible ZERO fallback");
-    CHECK(vk_blend_factor(0x7fu) == 0u,
+    CHECK(unknown_blend == 0u,
           "unknown RDNA2 blend factor retains the fail-visible ZERO fallback");
+    CHECK(occurrence_count(blend_diagnostics, "factor=0xb ") == 1u &&
+              occurrence_count(blend_diagnostics, "factor=0xc ") == 1u &&
+              occurrence_count(blend_diagnostics, "factor=0x7f ") == 1u,
+          "unsupported blend diagnostics emit once per distinct factor");
     CHECK(vk_blend_op(2u) == 3u, "RDNA2 comb Min(2) -> VK MIN(3) (non-identity)");
 
     // #381: separate alpha blend. The extractor's rs (bit 29 clear) mirrors color into alpha on resolve;
