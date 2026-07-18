@@ -798,6 +798,8 @@ HLE(f_rmdir) { std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::rm
 // ReadDirR -> GetDirectoryEntryFullPath) opens+closes many directories, reusing fd numbers, so a stale
 // DIR* returns a consumed/closed directory -> a garbage DirectoryEntry -> strcmp on a bad name pointer,
 // crashing scene load (the macOS Blasphemous 2 first-level wall). File-scope so f_close can invalidate.
+// The mutex covers both the map and every DIR* operation: invalidation must not closedir a stream
+// while getdents is using it, and two reads of one stream must not race its cursor (#847).
 static std::mutex g_getdents_mx;
 static std::map<int, DIR*> g_getdents_dirs;
 void getdents_forget_fd(int fd) {
@@ -812,18 +814,18 @@ HLE(f_getdents) {
     // Darwin has no getdents-on-fd (getdirentries is unavailable with 64-bit inodes). Keep the
     // per-fd kernel cursor by caching one DIR* per directory fd (fdopendir owns a dup, so the
     // guest's fd number stays valid); seekdir puts back the first entry that doesn't fit.
-    // CONFIDENCE: MED — a guest that closes the fd and gets the number reused for a different
-    // directory would see a stale cursor; not exercised by current titles.
+    // Hold the cache mutex through the complete read so f_close cannot invalidate/free dp
+    // underneath us; this also serializes concurrent reads of the same cursor.
+    std::lock_guard<std::mutex> lk(g_getdents_mx);
     DIR* dp = nullptr;
-    { std::lock_guard<std::mutex> lk(g_getdents_mx);
-      auto it = g_getdents_dirs.find((int)a0);
-      if (it != g_getdents_dirs.end()) dp = it->second;
-      else {
-          int d2 = dup((int)a0);
-          dp = d2 >= 0 ? fdopendir(d2) : nullptr;
-          if (!dp) { if (d2 >= 0) ::close(d2); return 0x80020000ull | (uint64_t)(errno & 0xff); }
-          g_getdents_dirs[(int)a0] = dp;
-      } }
+    auto it = g_getdents_dirs.find((int)a0);
+    if (it != g_getdents_dirs.end()) dp = it->second;
+    else {
+        int d2 = dup((int)a0);
+        dp = d2 >= 0 ? fdopendir(d2) : nullptr;
+        if (!dp) { if (d2 >= 0) ::close(d2); return 0x80020000ull | (uint64_t)(errno & 0xff); }
+        g_getdents_dirs[(int)a0] = dp;
+    }
     uint8_t* out = (uint8_t*)P(a1);
     size_t w = 0;
     for (;;) {
