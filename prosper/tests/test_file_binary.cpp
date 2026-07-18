@@ -56,6 +56,7 @@ int main() {
     }
 
     register_file_hle();
+    HleFn posix_open_fn = Hle::lookup(nid_hash("open"));
     HleFn open_fn = Hle::lookup(nid_hash("sceKernelOpen"));
     HleFn read_fn = Hle::lookup(nid_hash("sceKernelRead"));
     HleFn lseek_fn = Hle::lookup(nid_hash("sceKernelLseek"));
@@ -73,7 +74,7 @@ int main() {
     HleFn fstat_fn = Hle::lookup(nid_hash("sceKernelFstat"));
     HleFn fcntl_fn = Hle::lookup(nid_hash("fcntl"));
     HleFn kernel_fcntl_fn = Hle::lookup(nid_hash("sceKernelFcntl"));
-    CHECK(open_fn && read_fn && lseek_fn && close_fn && dup_fn && kernel_dup_fn &&
+    CHECK(posix_open_fn && open_fn && read_fn && lseek_fn && close_fn && dup_fn && kernel_dup_fn &&
               dup2_fn && kernel_dup2_fn && mkdir_fn && kernel_mkdir_fn && getdents_fn &&
               kernel_getdents_fn && getdirentries_fn && kernel_getdirentries_fn && fstat_fn &&
               fcntl_fn && kernel_fcntl_fn,
@@ -248,6 +249,32 @@ int main() {
     std::filesystem::remove_all(dents_path, remove_error);
 
     std::array<uint8_t, 512> actual{};
+    const char* missing_path = "prosper-test-file-binary-missing.tmp";
+    std::error_code missing_remove_error;
+    std::filesystem::remove(missing_path, missing_remove_error);
+    errno = 0;
+    int64_t posix_missing = posix_open_fn
+        ? (int64_t)posix_open_fn((uint64_t)(uintptr_t)missing_path, 0, 0, 0, 0, 0)
+        : 0;
+    int posix_missing_errno = errno;
+    uint64_t kernel_missing = open_fn
+        ? open_fn((uint64_t)(uintptr_t)missing_path, 0, 0, 0, 0, 0)
+        : 0;
+    CHECK(posix_missing == -1 && posix_missing_errno == ENOENT,
+          "libc open retains the -1 plus errno contract");
+    CHECK((uint32_t)kernel_missing == 0x80020002u,
+          "sceKernelOpen returns SCE_KERNEL_ERROR_ENOENT directly");
+
+    constexpr uint64_t kGuestOWriteOnly = 0x0001;
+    constexpr uint64_t kGuestOCreate = 0x0200;
+    constexpr uint64_t kGuestOExclusive = 0x0800;
+    uint64_t kernel_existing = open_fn
+        ? open_fn((uint64_t)(uintptr_t)path,
+                  kGuestOWriteOnly | kGuestOCreate | kGuestOExclusive, 0600, 0, 0, 0)
+        : 0;
+    CHECK((uint32_t)kernel_existing == 0x80020011u,
+          "sceKernelOpen translates an exclusive-create collision to EEXIST");
+
     int64_t fd = open_fn ? (int64_t)open_fn((uint64_t)(uintptr_t)path, 0, 0, 0, 0, 0) : -1;
     CHECK(fd >= 0, "open fixture through guest fd HLE");
 
