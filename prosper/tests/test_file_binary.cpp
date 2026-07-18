@@ -76,6 +76,7 @@ int main() {
     HleFn pwritev_fn = Hle::lookup(nid_hash("sceKernelPwritev"));
     HleFn posix_lseek_fn = Hle::lookup(nid_hash("lseek"));
     HleFn lseek_fn = Hle::lookup(nid_hash("sceKernelLseek"));
+    HleFn posix_close_fn = Hle::lookup(nid_hash("close"));
     HleFn close_fn = Hle::lookup(nid_hash("sceKernelClose"));
     HleFn dup_fn = Hle::lookup(nid_hash("dup"));
     HleFn kernel_dup_fn = Hle::lookup(nid_hash("sceKernelDup"));
@@ -94,7 +95,7 @@ int main() {
               posix_pread_fn && pread_fn && posix_pwrite_fn && pwrite_fn && posix_lseek_fn &&
               posix_readv_fn && readv_fn && posix_writev_fn && writev_fn &&
               posix_preadv_fn && preadv_fn && posix_pwritev_fn && pwritev_fn &&
-              lseek_fn && close_fn && dup_fn && kernel_dup_fn &&
+              lseek_fn && posix_close_fn && close_fn && dup_fn && kernel_dup_fn &&
               dup2_fn && kernel_dup2_fn && mkdir_fn && kernel_mkdir_fn && getdents_fn &&
               kernel_getdents_fn && getdirentries_fn && kernel_getdirentries_fn && fstat_fn &&
               fcntl_fn && kernel_fcntl_fn,
@@ -488,6 +489,20 @@ int main() {
                           (uint64_t)(uintptr_t)&io_vector, 1, 0);
     check_bad_fd_contract("Pwritev", posix_pwritev_fn, pwritev_fn,
                           (uint64_t)(uintptr_t)&io_vector, 1, 0);
+    errno = 0;
+    int64_t libc_close_result = posix_close_fn
+        ? (int64_t)posix_close_fn(closed_io_fd, 0, 0, 0, 0, 0)
+        : 0;
+    const int libc_close_error = errno;
+    uint64_t kernel_close_result = close_fn
+        ? close_fn(closed_io_fd, 0, 0, 0, 0, 0)
+        : 0;
+    CHECK(libc_close_result == -1 && libc_close_error == EBADF,
+          "libc close retains -1 plus EBADF");
+    CHECK(kernel_close_result == 0x80020009u,
+          "sceKernelClose returns SCE_KERNEL_ERROR_EBADF directly");
+    CHECK(close_fn && close_fn(0, 0, 0, 0, 0, 0) == 0,
+          "sceKernelClose preserves reserved stdio descriptors as no-op success");
 
     // A duplicate is a distinct descriptor for the same open file description: it shares the
     // current offset and remains usable after the original descriptor is closed.

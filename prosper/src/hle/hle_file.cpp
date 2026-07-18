@@ -766,6 +766,7 @@ HLE(f_close) { if (a0 < 3) { preadlog("close-lo-ignored", a0, 0, 0); return 0; }
 #ifdef __APPLE__
                int r = getdents_close_fd(fd);
 #elif defined(_WIN32)
+               ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
                int r = -1;
                if (!windows_close_directory(fd, &r)) r = ::close(fd);
 #else
@@ -774,7 +775,11 @@ HLE(f_close) { if (a0 < 3) { preadlog("close-lo-ignored", a0, 0, 0); return 0; }
                int err = r < 0 ? errno : 0;
                filelog_fd_io("close", fd, 0, 0, r, err);
                if (r == 0) filelog_forget_fd(fd);
+               else errno = err;
                return (uint64_t)(int64_t)r; }
+HLE(k_close) { uint64_t result = f_close(a0, a1, a2, a3, a4, a5);
+               int error = errno;
+               return (int64_t)result < 0 ? file_sce_error(error) : result; }
 // dup/dup2 were MISSING -> the return-0 stub handed back fd 0 (a valid-looking descriptor that is actually
 // stdin), so the guest read/closed stdin thinking it was its duplicate -> the fd-0 hazard this file guards
 // against elsewhere. Back with host dup/dup2; dup keeps the result above fd 2 (same as f_open).
@@ -2058,7 +2063,7 @@ void register_file_hle() {
     R("fgetc", f_fgetc);   R("getc", f_fgetc);
     R("open", f_open);     R("close", f_close);   R("read", f_read);     R("write", f_write);
     R("lseek", f_lseek);   R("stat", f_stat);     R("fstat", f_fstat);   R("access", f_access);
-    R("sceKernelOpen", k_open);  R("sceKernelClose", f_close); R("sceKernelRead", k_read);
+    R("sceKernelOpen", k_open);  R("sceKernelClose", k_close); R("sceKernelRead", k_read);
     R("sceKernelWrite", k_write); R("sceKernelLseek", k_lseek); R("sceKernelStat", f_stat);
     R("sceKernelFtruncate", f_ftruncate);   // real resize (was fake-success -> corrupt saves)
     R("lstat", f_lstat);   R("sceKernelLstat", f_lstat);     // was MISSING -> uninitialized stat buffer
