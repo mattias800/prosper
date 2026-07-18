@@ -289,7 +289,7 @@ static void test_sse4a_fastpath() {
     constexpr size_t code_size = 85;
     constexpr size_t sse4a_offset = 45;
     constexpr size_t short_code_offset = 0x200;
-    constexpr size_t short_sse4a_offset = short_code_offset + 19;
+    constexpr size_t short_sse4a_offset = short_code_offset + 34;
     constexpr size_t short_successor_wrapper_offset = 0x3c0;
     constexpr size_t chain_code_offset = 0x300;
     constexpr size_t chain_sse4a_offset = chain_code_offset + 28;
@@ -315,15 +315,25 @@ static void test_sse4a_fastpath() {
     };
     const uint8_t short_code[] = {
         0x48,0xb8, 0,0,0,0,0,0,0,0,                 // movabs rax,data
+        0x48,0xba, 0xef,0xcd,0xab,0x89,0x67,0x45,0x23,0x01, // movabs rdx,red-zone sentinel
+        0x48,0x89,0x54,0x24,0xf8,                    // mov [rsp-8],rdx
         0xf3,0x0f,0x6f,0x00,                          // movdqu xmm0,[rax] (control)
         0xf3,0x0f,0x6f,0x48,0x10,                     // movdqu xmm1,[rax+0x10] (value)
         0x66,0x0f,0x79,0xc8,                           // extrq xmm1,xmm0 (four-byte form)
-        0xc5,0xf9,0x6f,0xd1,                           // vmovdqa xmm2,xmm1 (stolen instruction)
-        0x66,0x48,0x0f,0x7e,0xd0,                     // movq rax,xmm2
+        0xc5,0xf9,0x6f,0xd1,                           // vmovdqa xmm2,xmm1 (four-byte successor)
+        0xc5,0xf9,0x6f,0xda,                           // vmovdqa xmm3,xmm2 (four-byte successor)
+        0xc5,0xf9,0x6f,0xe3,                           // vmovdqa xmm4,xmm3 (four-byte successor)
+        0xc4,0xe1,0x79,0x6f,0xec,                      // vmovdqa xmm5,xmm4 (five-byte terminator)
+        0x66,0x48,0x0f,0x7e,0xe8,                     // movq rax,xmm5
+        0x48,0x39,0x54,0x24,0xf8,                     // cmp [rsp-8],rdx
+        0x74,0x07,                                     // je .red_zone_ok
+        0x48,0xc7,0xc0,0xff,0xff,0xff,0xff,           // mov rax,-1
         0xc3
     };
     const uint8_t short_successor_wrapper[] = {
         0x48,0xb8, 0,0,0,0,0,0,0,0,                 // movabs rax,data
+        0x48,0xba, 0xef,0xcd,0xab,0x89,0x67,0x45,0x23,0x01, // movabs rdx,red-zone sentinel
+        0x48,0x89,0x54,0x24,0xf8,                    // mov [rsp-8],rdx
         0xf3,0x0f,0x6f,0x48,0x10,                    // movdqu xmm1,[rax+0x10]
         0xe9, 0,0,0,0                                // jmp consumed VEX successor
     };
@@ -368,7 +378,7 @@ static void test_sse4a_fastpath() {
     const int32_t short_successor_delta = static_cast<int32_t>(
         short_sse4a_offset + 4 -
         (short_successor_wrapper_offset + sizeof(short_successor_wrapper)));
-    memcpy(image.mem.data() + short_successor_wrapper_offset + 16, &short_successor_delta,
+    memcpy(image.mem.data() + short_successor_wrapper_offset + 31, &short_successor_delta,
            sizeof(short_successor_delta));
     const int32_t chain_second_delta = static_cast<int32_t>(
         chain_sse4a_offset + 4 -
@@ -388,7 +398,7 @@ static void test_sse4a_fastpath() {
     CHECK(map_image(image, &error), "map synthetic SSE4a guest image");
     if (!error.empty()) std::printf("  map detail: %s\n", error.c_str());
     const uint64_t after_map = sse4a_fastpath_patch_count();
-    CHECK(after_map >= before_map + 5,
+    CHECK(after_map >= before_map + 8,
           "EXTRQ and relocated-successor entry points exist before guest entry");
     install_trap_handler();
     using GuestFn = uint64_t (*)();
@@ -418,11 +428,16 @@ static void test_sse4a_fastpath() {
           "four-byte EXTRQ does not enter the live exception patcher");
     CHECK(*(const uint8_t*)(uintptr_t)(base + short_sse4a_offset) == 0xe9,
           "four-byte EXTRQ and validated VEX successor are translated before entry");
+    CHECK(*(const uint8_t*)(uintptr_t)(base + short_sse4a_offset + 4) == 0xe9 &&
+              *(const uint8_t*)(uintptr_t)(base + short_sse4a_offset + 8) == 0xe9 &&
+              *(const uint8_t*)(uintptr_t)(base + short_sse4a_offset + 12) == 0xe9 &&
+              *(const uint8_t*)(uintptr_t)(base + short_sse4a_offset + 16) == 0xe9,
+          "every consumed VEX boundary starts an exception-free near jump");
     const GuestFn short_successor_function =
         (GuestFn)(uintptr_t)(base + short_successor_wrapper_offset);
     const uint64_t short_successor_result = short_successor_function();
     CHECK(short_successor_result == 0xab00,
-          "a direct branch to the consumed VEX instruction uses its secondary expansion");
+          "direct consumed-VEX entry preserves its result and the guest red zone");
 
     const GuestFn chain_function = (GuestFn)(uintptr_t)(base + chain_code_offset);
     const uint64_t chain_first = chain_function();

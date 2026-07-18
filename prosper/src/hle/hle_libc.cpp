@@ -17,9 +17,6 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
-#ifdef _WIN32
-#include <malloc.h>   // _aligned_malloc
-#endif
 
 // setjmp/longjmp — the guest's Boehm GC calls setjmp to flush callee-saved registers to a
 // buffer so it can scan them as GC roots (and the runtime uses it for exception unwinding).
@@ -74,14 +71,66 @@ extern "C" void     prosper_longjmp(void*, uint64_t) {}
 #endif
 
 namespace prosper {
-// Keep every guest allocation in one compatible allocator family. Windows requires pointers from
-// _aligned_malloc to be released with _aligned_free; mixing them with plain free corrupts the CRT
-// heap once a guest deletes an aligned C++/mesh allocation. Use the aligned family for ordinary
-// guest allocations there as well, so `free` and `realloc` can accept pointers returned by any of
-// the guest-facing allocation entry points without a side registry.
+#ifdef _WIN32
+// Keep every Windows guest allocation in one self-describing family. The Microsoft CRT documents
+// changing an `_aligned_realloc` block's alignment as an error, so a fixed-alignment realloc cannot
+// safely accept memalign/posix_memalign/aligned-new pointers. Store the original alignment and size
+// immediately before the payload; realloc can then preserve both without a process-global registry.
+struct alignas(std::max_align_t) GuestAllocHeader {
+    uint64_t magic;
+    void* raw;
+    size_t size;
+    size_t alignment;
+};
+constexpr uint64_t kGuestAllocMagic = 0x50523559414c4c4full; // "PR5YALLO"
+
+static GuestAllocHeader* guest_windows_header(void* p) {
+    return (GuestAllocHeader*)((uint8_t*)p - sizeof(GuestAllocHeader));
+}
+
+static void* guest_windows_alloc(size_t alignment, size_t size) {
+    if (alignment < alignof(std::max_align_t)) alignment = alignof(std::max_align_t);
+    if (alignment & (alignment - 1)) {
+        errno = EINVAL;
+        return nullptr;
+    }
+    const size_t payload = size ? size : 1;
+    const size_t maximum = std::numeric_limits<size_t>::max();
+    if (alignment > maximum - sizeof(GuestAllocHeader) + 1) {
+        errno = ENOMEM;
+        return nullptr;
+    }
+    const size_t overhead = sizeof(GuestAllocHeader) + alignment - 1;
+    if (payload > maximum - overhead) {
+        errno = ENOMEM;
+        return nullptr;
+    }
+    void* raw = malloc(payload + overhead);
+    if (!raw) return nullptr;
+    const uintptr_t start = (uintptr_t)raw + sizeof(GuestAllocHeader);
+    const uintptr_t aligned = (start + alignment - 1) & ~(uintptr_t)(alignment - 1);
+    auto* header = (GuestAllocHeader*)(aligned - sizeof(GuestAllocHeader));
+    *header = {kGuestAllocMagic, raw, size, alignment};
+    return (void*)aligned;
+}
+
+static bool guest_windows_free(void* p) {
+    if (!p) return true;
+    GuestAllocHeader* header = guest_windows_header(p);
+    if (header->magic != kGuestAllocMagic) {
+        errno = EINVAL;
+        return false;
+    }
+    void* raw = header->raw;
+    header->magic = 0;
+    free(raw);
+    return true;
+}
+#endif
+
 static void* aligned_alloc_portable(size_t align, size_t size) {
 #ifdef _WIN32
-    return _aligned_malloc(size, align);
+    return guest_windows_alloc(align, size);
 #else
     void* p = nullptr;
     return posix_memalign(&p, align, size) == 0 ? p : nullptr;
@@ -90,7 +139,7 @@ static void* aligned_alloc_portable(size_t align, size_t size) {
 
 static void* guest_malloc_portable(size_t size) {
 #ifdef _WIN32
-    return _aligned_malloc(size, alignof(std::max_align_t));
+    return guest_windows_alloc(alignof(std::max_align_t), size);
 #else
     return malloc(size);
 #endif
@@ -109,7 +158,23 @@ static void* guest_calloc_portable(size_t count, size_t size) {
 
 static void* guest_realloc_portable(void* p, size_t size) {
 #ifdef _WIN32
-    return _aligned_realloc(p, size, alignof(std::max_align_t));
+    if (!p) return guest_malloc_portable(size);
+    GuestAllocHeader* header = guest_windows_header(p);
+    if (header->magic != kGuestAllocMagic) {
+        errno = EINVAL;
+        return nullptr;
+    }
+    if (!size) {
+        guest_windows_free(p);
+        return nullptr;
+    }
+    const size_t old_size = header->size;
+    const size_t alignment = header->alignment;
+    void* replacement = guest_windows_alloc(alignment, size);
+    if (!replacement) return nullptr;
+    memcpy(replacement, p, old_size < size ? old_size : size);
+    guest_windows_free(p);
+    return replacement;
 #else
     return realloc(p, size);
 #endif
@@ -117,7 +182,7 @@ static void* guest_realloc_portable(void* p, size_t size) {
 
 static void guest_free_portable(void* p) {
 #ifdef _WIN32
-    _aligned_free(p);
+    guest_windows_free(p);
 #else
     free(p);
 #endif
@@ -181,7 +246,12 @@ HLE(h_free)    { guest_free_portable(P(a0)); return 0; }
 // power-of-two >= sizeof(void*) for posix_memalign.
 HLE(h_memalign) {
     uint64_t al = a0 < sizeof(void*) ? sizeof(void*) : a0;
-    if (al & (al - 1)) { uint64_t p = sizeof(void*); while (p < al) p <<= 1; al = p; } // round up to pow2
+    if (al & (al - 1)) {
+        if (al > (uint64_t{1} << 63)) { errno = EINVAL; return 0; }
+        uint64_t p = sizeof(void*);
+        while (p < al) p <<= 1;
+        al = p;
+    }
     return (uint64_t)(uintptr_t)aligned_alloc_portable(al, a1);
 }
 HLE(h_posix_memalign) {

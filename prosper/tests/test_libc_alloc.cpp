@@ -52,6 +52,8 @@ int main() {
     free_fn(U(zeroed), 0, 0, 0, 0, 0);
     CHECK(calloc_fn(std::numeric_limits<uint64_t>::max(), 2, 0, 0, 0, 0) == 0,
           "calloc rejects multiplication overflow");
+    CHECK(memalign_fn(std::numeric_limits<uint64_t>::max(), 1, 0, 0, 0, 0) == 0,
+          "memalign rejects an alignment that cannot be rounded to a power of two");
 
     auto* aligned = (uint8_t*)(uintptr_t)memalign_fn(256, 513, 0, 0, 0, 0);
     CHECK(aligned != nullptr && ((uintptr_t)aligned & 255) == 0,
@@ -61,7 +63,8 @@ int main() {
         (uint8_t*)(uintptr_t)realloc_fn(U(aligned), 1027, 0, 0, 0, 0);
     preserved = aligned_grown != nullptr;
     for (size_t i = 0; preserved && i < 513; ++i) preserved = aligned_grown[i] == 0xa5;
-    CHECK(preserved, "realloc accepts and preserves a memalign allocation");
+    CHECK(preserved && ((uintptr_t)aligned_grown & 255) == 0,
+          "realloc preserves a memalign allocation's contents and original alignment");
     free_fn(U(aligned_grown), 0, 0, 0, 0, 0);
 
     void* posix = nullptr;

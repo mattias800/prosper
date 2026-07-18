@@ -623,7 +623,8 @@ HLE(s_avp_getaudiodata)   {   // bool sceAvPlayerGetAudioData(handle, AvPlayerFr
     if (auto* b = p.backend; b && p.backend_id >= 0) {
         prosper::video::AudioFrame af;
         if (!b->next_audio(p.backend_id, af)) return 0;
-        if (!af.pcm || af.channels == 0 || af.samples > SIZE_MAX / af.channels) return 0;
+        if (!af.pcm || af.channels == 0 || af.samples == 0 ||
+            af.samples > SIZE_MAX / af.channels) return 0;
         const size_t sample_count = static_cast<size_t>(af.samples) * af.channels;
         if (sample_count > SIZE_MAX / sizeof(int16_t)) return 0;
         p.audio.resize(sample_count);
