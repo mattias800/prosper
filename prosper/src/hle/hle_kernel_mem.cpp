@@ -286,13 +286,16 @@ namespace {
     // collision can skip directly past them instead of probing every 64 KiB page.
     constexpr uint64_t kGuestAutoMapBase  = 0x2000000000ull;
     constexpr uint64_t kGuestAutoMapLimit = 0x40000000000ull;
-    void* map_guest_auto(uint64_t len, int prot, uint64_t align) {
+    void* map_guest_from(uint64_t start, uint64_t len, int prot, uint64_t align) {
         const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
         if (align < page) align = page;
-        if (!len || (align & (align - 1)) != 0 || len > kGuestAutoMapLimit - kGuestAutoMapBase)
+        if (!len || (align & (align - 1)) != 0 ||
+            start > UINT64_MAX - (align - 1))
             return nullptr;
         const uint64_t step = align > 0x10000 ? align : 0x10000;
-        uint64_t cand = align_up(kGuestAutoMapBase, align);
+        uint64_t cand = align_up(start, align);
+        if (cand >= kGuestAutoMapLimit || len > kGuestAutoMapLimit - cand)
+            return nullptr;
         while (cand <= kGuestAutoMapLimit - len) {
             void* p = prosper_mmap_noreplace((void*)cand, len, prot,
                                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -314,6 +317,10 @@ namespace {
             cand = next;
         }
         return nullptr;
+    }
+
+    void* map_guest_auto(uint64_t len, int prot, uint64_t align) {
+        return map_guest_from(kGuestAutoMapBase, len, prot, align);
     }
 
     void* map_at(uint64_t hint, uint64_t len, int prot) {
@@ -516,7 +523,11 @@ HLE(k_reserve_vrange) {
 // sceKernelMapNamedFlexibleMemory(void** addrInOut, size_t len, int prot, int flags, const char* name)
 HLE(k_map_flexible) {
     uint64_t hint = a0 ? *(uint64_t*)a0 : 0;
+    const bool fixed = (a3 & 0x10) != 0;   // SCE_KERNEL_MAP_FIXED
+    if (fixed && !hint) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
     void* p = map_at(hint, a1, host_prot(a2));
+    if (!p && hint && !fixed)
+        p = map_guest_from(hint, a1, host_prot(a2), 0x4000);
     if (!p) { MLOG("mapflexible hint=0x%llx len=0x%llx FAILED\n", (unsigned long long)hint, (unsigned long long)a1); return 0x8002000cull; } // ENOMEM
     if (a0) *(uint64_t*)a0 = (uint64_t)p;
     track((uint64_t)p, a1, host_prot(a2), true, a4 ? (const char*)a4 : "flexible");
@@ -2253,6 +2264,75 @@ namespace {
         return result;
     }
 
+    enum class FlexibleHintState { Unavailable, Free, GuestReservation };
+
+    bool hle_reservation_covers(uint64_t begin, uint64_t end) {
+        if (begin >= end) return false;
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            uint64_t cursor = begin;
+            while (cursor < end) {
+                const Mapping* cover = nullptr;
+                for (const auto& m : g_maps) {
+                    if (cursor < m.base || cursor >= m.base + m.size) continue;
+                    if (!cover || m.base > cover->base) cover = &m;
+                }
+                if (!cover || cover->committed) break;
+                cursor = std::min<uint64_t>(end, cover->base + cover->size);
+            }
+            if (cursor == end) return true;
+        }
+        std::lock_guard<std::mutex> lk(g_dview_mx);
+        if (private_placeholder_view_containing_locked(begin, end)) return true;
+        for (const PlaceholderSpan& span : g_guest_placeholders)
+            if (begin >= span.base && end <= span.base + span.size) return true;
+        // A partial direct-memory unmap returns its hole to the HLE-owned free-placeholder
+        // registry. Flexible memory may claim that exact hole just like direct memory can.
+        for (const PlaceholderSpan& span : g_free_placeholders)
+            if (begin >= span.base && end <= span.base + span.size) return true;
+        return false;
+    }
+
+    // Classify an exact flexible-memory hint without treating arbitrary host reservations as guest
+    // storage. In particular, VirtualAlloc(..., MEM_COMMIT) succeeds on already committed pages;
+    // checking only the HLE tracker would therefore let an untracked image/host allocation be
+    // adopted. MEM_RESERVE is eligible only when the guest owns the reservation or placeholder.
+    FlexibleHintState flexible_hint_state(uint64_t base, uint64_t len) {
+        if (!len || base > UINT64_MAX - len) return FlexibleHintState::Unavailable;
+        const uint64_t end = base + len;
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            for (const auto& m : g_maps)
+                if (m.committed && m.base < end && m.base + m.size > base)
+                    return FlexibleHintState::Unavailable;
+        }
+
+        bool saw_reservation = false;
+        uint64_t cursor = base;
+        while (cursor < end) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(cursor)),
+                              &mbi, sizeof(mbi)))
+                return FlexibleHintState::Unavailable;
+            const uint64_t region_base =
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mbi.BaseAddress));
+            const uint64_t region_end =
+                region_base > UINT64_MAX - mbi.RegionSize
+                    ? UINT64_MAX
+                    : region_base + static_cast<uint64_t>(mbi.RegionSize);
+            if (region_end <= cursor || mbi.State == MEM_COMMIT)
+                return FlexibleHintState::Unavailable;
+            if (mbi.State == MEM_RESERVE) {
+                if (!hle_reservation_covers(cursor, std::min<uint64_t>(end, region_end)))
+                    return FlexibleHintState::Unavailable;
+                saw_reservation = true;
+            }
+            cursor = std::min<uint64_t>(end, region_end);
+        }
+        return saw_reservation ? FlexibleHintState::GuestReservation
+                               : FlexibleHintState::Free;
+    }
+
     // Commit `len` at `hint` (0 = OS chooses). Placeholder-backed guest reservations and holes
     // are replaced with ordinary private pages so the same 16 KiB address can later be reused by
     // either flexible or direct memory. Legacy VirtualAlloc reservations retain their old path.
@@ -2328,6 +2408,90 @@ namespace {
             host::guest_write_watch_notify_direct_mapping_added(
                 (uint64_t)(uintptr_t)result, len, (uint64_t)(uintptr_t)result, pp);
         return result;
+    }
+
+    void* win_commit_flexible_exact(uint64_t hint, uint64_t len, int hp) {
+        const FlexibleHintState state = flexible_hint_state(hint, len);
+        if (state == FlexibleHintState::GuestReservation)
+            return win_commit(hint, len, hp);
+        if (state != FlexibleHintState::Free) return nullptr;
+
+        const DWORD pp = win_page_prot(hp);
+        void* result = nullptr;
+        {
+            // VirtualAlloc reservations round a free address down to 64 KiB. Use the placeholder
+            // splitter first so a fixed 16 KiB-aligned guest hint is either mapped exactly or not
+            // at all; the retained prefix/suffix become reusable HLE-owned placeholders.
+            std::lock_guard<std::mutex> lk(g_dview_mx);
+            AcquiredPlaceholder acquired =
+                acquire_placeholder_locked(hint, len, 0x4000, false);
+            if (acquired.address ==
+                reinterpret_cast<void*>(static_cast<uintptr_t>(hint)))
+                result = replace_placeholder_with_private_locked(
+                    hint, len, hp, acquired.owner);
+            else if (acquired.address)
+                restore_placeholder_owner_locked(
+                    acquired.owner,
+                    static_cast<uint64_t>(reinterpret_cast<uintptr_t>(acquired.address)), len);
+        }
+        if (!result && (hint & (kWinAllocationGranularity - 1)) == 0)
+            result = VirtualAlloc(
+                reinterpret_cast<void*>(static_cast<uintptr_t>(hint)),
+                static_cast<SIZE_T>(len), MEM_RESERVE | MEM_COMMIT, pp);
+        if (result)
+            host::guest_write_watch_notify_direct_mapping_added(
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(result)), len,
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(result)), pp);
+        return result;
+    }
+
+    // Map flexible memory at the first host-free address at or above a guest hint. Windows'
+    // default VirtualAlloc(nullptr, ...) placement is not a search-from-hint operation and may
+    // also land in the 1-8 TiB aperture rejected by Sony libc. Probe the valid low guest aperture
+    // explicitly; VirtualAlloc at the selected candidate makes each probe race-safe.
+    void* win_commit_from(uint64_t start, uint64_t len, int hp) {
+        if (!len || len > kGuestAutoVaMax - kGuestAutoVaMin + 1)
+            return nullptr;
+        const uint64_t first = std::max<uint64_t>(start, kGuestAutoVaMin);
+        if (first > UINT64_MAX - (kWinAllocationGranularity - 1))
+            return nullptr;
+        uint64_t cursor = align_up(first, kWinAllocationGranularity);
+        const uint64_t last = kGuestAutoVaMax - len + 1;
+        const DWORD pp = win_page_prot(hp);
+        while (cursor <= last) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(cursor)),
+                              &mbi, sizeof(mbi)))
+                return nullptr;
+            const uint64_t region_base =
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mbi.BaseAddress));
+            const uint64_t region_end =
+                region_base > UINT64_MAX - mbi.RegionSize
+                    ? UINT64_MAX
+                    : region_base + static_cast<uint64_t>(mbi.RegionSize);
+            if (mbi.State == MEM_FREE) {
+                const uint64_t candidate = align_up(std::max(cursor, region_base),
+                                                    kWinAllocationGranularity);
+                if (candidate <= last && candidate <= region_end &&
+                    len <= region_end - candidate) {
+                    if (void* result = VirtualAlloc(
+                            reinterpret_cast<void*>(static_cast<uintptr_t>(candidate)),
+                            static_cast<SIZE_T>(len), MEM_RESERVE | MEM_COMMIT, pp)) {
+                        host::guest_write_watch_notify_direct_mapping_added(
+                            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(result)), len,
+                            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(result)), pp);
+                        return result;
+                    }
+                }
+            }
+            uint64_t next = region_end > cursor
+                ? region_end
+                : cursor + kWinAllocationGranularity;
+            if (next <= cursor || next > UINT64_MAX - (kWinAllocationGranularity - 1))
+                return nullptr;
+            cursor = align_up(next, kWinAllocationGranularity);
+        }
+        return nullptr;
     }
     void* win_map_phys(uint64_t hint, uint64_t len, int hp, uint64_t phys, uint64_t align,
                        bool fixed) {
@@ -3080,7 +3244,11 @@ HLE(k_reserve_vrange) {
 // sceKernelMapNamedFlexibleMemory(void** addrInOut, size_t len, int prot, int flags, const char* name)
 HLE(k_map_flexible) {
     uint64_t hint = a0 ? *(uint64_t*)a0 : 0;
-    void* p = win_commit(hint, a1, host_prot(a2));
+    const bool fixed = (a3 & 0x10) != 0;   // SCE_KERNEL_MAP_FIXED
+    if (fixed && !hint) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
+    void* p = hint ? win_commit_flexible_exact(hint, a1, host_prot(a2)) : nullptr;
+    if (!p && !fixed)
+        p = win_commit_from(hint ? hint : kGuestAutoVaMin, a1, host_prot(a2));
     if (!p) { MLOG("mapflexible hint=0x%llx len=0x%llx FAILED\n",
                    (unsigned long long)hint, (unsigned long long)a1); return 0x8002000cull; }
     if (a0) *(uint64_t*)a0 = (uint64_t)p;

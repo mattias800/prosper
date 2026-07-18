@@ -19,6 +19,30 @@ static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
+#ifdef _WIN32
+static uint64_t find_free_guest_span(uint64_t len) {
+    constexpr uint64_t kGranule = 0x10000;
+    constexpr uint64_t kGuestVaBegin = 0x2000000000ull;
+    constexpr uint64_t kGuestVaEnd = 0xfc00000000ull;
+    uint64_t cursor = kGuestVaBegin;
+    while (cursor <= kGuestVaEnd - len) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery((void*)(uintptr_t)cursor, &mbi, sizeof(mbi))) break;
+        const uint64_t region_base = (uint64_t)(uintptr_t)mbi.BaseAddress;
+        const uint64_t region_end = region_base + (uint64_t)mbi.RegionSize;
+        if (mbi.State == MEM_FREE) {
+            uint64_t candidate = cursor > region_base ? cursor : region_base;
+            candidate = (candidate + kGranule - 1) & ~(kGranule - 1);
+            if (candidate <= kGuestVaEnd - len && candidate + len <= region_end)
+                return candidate;
+        }
+        if (region_end <= cursor) break;
+        cursor = (region_end + kGranule - 1) & ~(kGranule - 1);
+    }
+    return 0;
+}
+#endif
+
 int main() {
     printf("== test_retrack_reservation ==\n");
     register_builtin_hle();
@@ -28,12 +52,112 @@ int main() {
     auto batch    = Hle::lookup(nid_hash("sceKernelBatchMap"));
     auto query    = Hle::lookup(nid_hash("sceKernelVirtualQuery"));
     auto flexible = Hle::lookup(nid_hash("sceKernelMapNamedFlexibleMemory"));
+    auto flexible_noname = Hle::lookup(nid_hash("sceKernelMapFlexibleMemory"));
     auto unmap    = Hle::lookup(nid_hash("sceKernelMunmap"));
-    CHECK(reserve && protect && mtypeprotect && batch && query && flexible && unmap,
+    CHECK(reserve && protect && mtypeprotect && batch && query && flexible &&
+              flexible_noname && unmap,
           "memory HLE functions registered");
     if (fails) return 1;
 
     constexpr uint64_t page = 0x10000;
+
+    // #387 F6: without MAP_FIXED a nonzero address is a search hint. An occupied hint must
+    // relocate forward without clobbering the existing mapping; MAP_FIXED retains exact-address
+    // behavior and cannot be combined with a null address.
+    uint64_t null_fixed = 0;
+    CHECK((uint32_t)flexible((uint64_t)(uintptr_t)&null_fixed, page, 0x2,
+                             0x10 /* SCE_KERNEL_MAP_FIXED */,
+                             (uint64_t)(uintptr_t)"null-fixed", 0) == 0x80020016u &&
+              null_fixed == 0,
+          "MapFlexible rejects MAP_FIXED with a null address");
+
+#ifdef _WIN32
+    const uint64_t free_cover = find_free_guest_span(page * 2);
+    uint64_t unaligned_fixed = free_cover ? free_cover + 0x4000 : 0;
+    const bool unaligned_fixed_mapped = unaligned_fixed &&
+        flexible((uint64_t)(uintptr_t)&unaligned_fixed, page, 0x2,
+                 0x10 /* SCE_KERNEL_MAP_FIXED */,
+                 (uint64_t)(uintptr_t)"unaligned-fixed", 0) == 0 &&
+        unaligned_fixed == free_cover + 0x4000;
+    CHECK(unaligned_fixed_mapped,
+          "fixed free 16 KiB hint maps exactly instead of rounding down to 64 KiB");
+    if (unaligned_fixed_mapped)
+        CHECK(unmap(unaligned_fixed, page, 0, 0, 0, 0) == 0,
+              "fixed 16 KiB flexible mapping unmaps cleanly");
+#endif
+
+    uint64_t first_flexible = 0;
+    const bool first_flexible_mapped =
+        flexible((uint64_t)(uintptr_t)&first_flexible, page, 0x2, 0,
+                 (uint64_t)(uintptr_t)"flexible-hint-first", 0) == 0 &&
+        first_flexible;
+    CHECK(first_flexible_mapped, "map an automatic flexible page for hint collision");
+    if (first_flexible_mapped) {
+        volatile uint32_t* first_cell =
+            (volatile uint32_t*)(uintptr_t)first_flexible;
+        *first_cell = 0x387F6001u;
+
+        uint64_t relocated = first_flexible;
+        const bool relocated_mapped =
+            flexible_noname((uint64_t)(uintptr_t)&relocated, page, 0x2, 0, 0, 0) == 0 &&
+            relocated > first_flexible;
+        CHECK(relocated_mapped,
+              "non-fixed occupied flexible-memory hint relocates forward");
+        CHECK(*first_cell == 0x387F6001u,
+              "relocated flexible mapping preserves the occupied hint");
+
+        uint64_t fixed_collision = first_flexible;
+        CHECK(flexible_noname((uint64_t)(uintptr_t)&fixed_collision, page, 0x2,
+                              0x10 /* SCE_KERNEL_MAP_FIXED */, 0, 0) != 0 &&
+                  fixed_collision == first_flexible && *first_cell == 0x387F6001u,
+              "fixed occupied flexible-memory hint fails without clobbering it");
+
+        if (relocated_mapped)
+            CHECK(unmap(relocated, page, 0, 0, 0, 0) == 0,
+                  "relocated flexible page unmaps cleanly");
+        CHECK(unmap(first_flexible, page, 0, 0, 0, 0) == 0,
+              "original flexible page unmaps cleanly");
+    }
+
+#ifdef _WIN32
+    // A loaded image or host allocation is not represented in the HLE mapping tracker. Windows
+    // nevertheless lets VirtualAlloc(MEM_COMMIT) succeed on an already committed range, so the
+    // exact-hint path must consult host VA state before it adopts and tracks an address.
+    const uint64_t foreign_base = find_free_guest_span(page);
+    void* foreign_page = foreign_base
+        ? VirtualAlloc((void*)(uintptr_t)foreign_base, page,
+                       MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        : nullptr;
+    CHECK(foreign_page != nullptr,
+          "create an untracked committed page in the guest VA aperture");
+    if (foreign_page) {
+        auto* foreign_cell = (volatile uint32_t*)foreign_page;
+        *foreign_cell = 0x387F60F1u;
+        const uint64_t foreign_address = (uint64_t)(uintptr_t)foreign_page;
+
+        uint64_t relocated = foreign_address;
+        const bool foreign_relocated =
+            flexible_noname((uint64_t)(uintptr_t)&relocated, page, 0x2, 0, 0, 0) == 0 &&
+            relocated > foreign_address;
+        CHECK(foreign_relocated,
+              "non-fixed untracked committed hint relocates forward");
+        CHECK(*foreign_cell == 0x387F60F1u,
+              "relocation preserves the untracked committed page");
+
+        uint64_t fixed_foreign = foreign_address;
+        CHECK(flexible_noname((uint64_t)(uintptr_t)&fixed_foreign, page, 0x2,
+                              0x10 /* SCE_KERNEL_MAP_FIXED */, 0, 0) != 0 &&
+                  fixed_foreign == foreign_address && *foreign_cell == 0x387F60F1u,
+              "fixed untracked committed hint fails without adopting it");
+
+        if (foreign_relocated)
+            CHECK(unmap(relocated, page, 0, 0, 0, 0) == 0,
+                  "mapping relocated from an untracked page unmaps cleanly");
+        CHECK(VirtualFree(foreign_page, 0, MEM_RELEASE) != 0,
+              "untracked committed page releases cleanly");
+    }
+#endif
+
     constexpr uint64_t len = page * 3;
     uint64_t base = 0;
     CHECK(reserve((uint64_t)(uintptr_t)&base, len, 0, page, 0, 0) == 0 && base,
@@ -59,18 +183,23 @@ int main() {
           "failed mprotect leaves reservation tracking unchanged");
 
 #ifdef _WIN32
-    // #926: MEM_COMMIT says that a host allocation exists, not that it belongs to the guest. Put
-    // one tracked guest page and one unrelated host-committed page in a single host reservation so
-    // the boundary-crossing failure is deterministic regardless of the process address layout.
+    // #926: MEM_COMMIT says that a host allocation exists, not that it belongs to the guest. Keep
+    // both pages in ONE host reservation, then use BatchMap's exact flexible operation to commit
+    // and track only the first page. This makes a boundary-crossing ownership failure independent
+    // of Windows' separate-allocation VirtualProtect restriction.
     void* host_reservation = VirtualAlloc(nullptr, page * 2, MEM_RESERVE, PAGE_NOACCESS);
     CHECK(host_reservation != nullptr, "reserve deterministic guest/host ownership test span");
     if (host_reservation) {
         const uint64_t host_base = (uint64_t)(uintptr_t)host_reservation;
-        uint64_t guest_page = host_base;
-        const bool guest_map_succeeded =
-            flexible((uint64_t)(uintptr_t)&guest_page, page, 0x2, 0,
-                     (uint64_t)(uintptr_t)"mprotect-ownership", 0) == 0 && guest_page;
-        const bool guest_mapped = guest_map_succeeded && guest_page == host_base;
+        alignas(8) uint8_t map_entry[0x20]{};
+        *(uint64_t*)(map_entry + 0x00) = host_base;
+        *(uint64_t*)(map_entry + 0x10) = page;
+        map_entry[0x18] = 0x2;
+        *(int32_t*)(map_entry + 0x1c) = 3; // MAP_FLEXIBLE
+        int32_t map_done = -1;
+        const bool guest_mapped =
+            batch((uint64_t)(uintptr_t)map_entry, 1,
+                  (uint64_t)(uintptr_t)&map_done, 0, 0, 0) == 0 && map_done == 1;
         CHECK(guest_mapped, "commit and track the first page as guest memory");
 
         void* foreign_page = nullptr;
@@ -120,8 +249,8 @@ int main() {
                   "failed protection calls leave unrelated host memory unchanged");
         }
 
-        if (guest_map_succeeded)
-            CHECK(unmap(guest_page, page, 0, 0, 0, 0) == 0,
+        if (guest_mapped)
+            CHECK(unmap(host_base, page, 0, 0, 0, 0) == 0,
                   "tracked ownership-test page unmaps cleanly");
         CHECK(VirtualFree(host_reservation, 0, MEM_RELEASE) != 0,
               "ownership-test host reservation releases cleanly");
