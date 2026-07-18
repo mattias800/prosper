@@ -278,13 +278,19 @@ void decode_operands(Rdna2Inst& i) {
             // Applied to the float result in the recompiler (rdna2_to_spirv VOP3 float ops).
             i.clamp = ((w >> 15) & 1u) != 0;
             i.omod  = (uint8_t)((d1 >> 27) & 3u);
-            // VOP3B carry ops (v_add/sub/subrev_co_ci_u32 = 0x128/0x129/0x12A): dword0[14:8] is a scalar
-            // carry-OUT dst, not abs modifiers — decode it and clear the mis-read abs/clamp bits.
-            if (i.opcode == 0x128u || i.opcode == 0x129u || i.opcode == 0x12Au ||
-                i.opcode == 0x176u) {
-                i.sdst = sgpr((w >> 8) & 0x7Fu);
-                i.src_abs[0] = i.src_abs[1] = i.src_abs[2] = false;
-                i.clamp = false;
+            // VOP3B (sec 13.3.4 — the complete opcode list: v_add/sub/subrev_co_ci_u32
+            // 0x128/0x129/0x12A, v_div_scale_f32/f64 0x16D/0x16E, v_mad_u64_u32/v_mad_i64_i32
+            // 0x176/0x177, v_add/sub/subrev_co_u32 0x30F/0x310/0x319): dword0[14:8] is a scalar
+            // carry/flag dst (SDST), not abs modifiers — decode it and clear the mis-read abs
+            // bits. CLMP (bit 15) IS architecturally valid in VOP3B and is kept so stage 2 can
+            // reject unmodeled integer saturation instead of silently dropping it.
+            switch (i.opcode) {
+                case 0x128u: case 0x129u: case 0x12Au: case 0x16Du: case 0x16Eu:
+                case 0x176u: case 0x177u: case 0x30Fu: case 0x310u: case 0x319u:
+                    i.sdst = sgpr((w >> 8) & 0x7Fu);
+                    i.src_abs[0] = i.src_abs[1] = i.src_abs[2] = false;
+                    break;
+                default: break;
             }
             // v_fma_f16 VOP3: OPSEL[2:0] selects each packed source half and OPSEL[3]
             // selects the destination half. Reuse the packed-op selector field for this family.
@@ -368,11 +374,15 @@ void decode_operands(Rdna2Inst& i) {
             i.n_src = 2; break;
         }
         case Rdna2Format::MUBUF: {
-            // Untyped buffer op. opcode[24:18]; VDATA (dest/src VGPR) d1[15:8]; VADDR d1[7:0];
+            // Untyped buffer op. opcode[25:18] (8 bits — Table 98; a 7-bit mask aliased the D16
+            // format ops 128-135 onto the 32-bit format ops 0-7, silently translating the wrong
+            // data layout); VDATA (dest/src VGPR) d1[15:8]; VADDR d1[7:0];
             // SRSRC (V# descriptor base SGPR, field ×4) d1[20:16]; SOFFSET d1[31:24]. 12-bit inst
             // offset d0[11:0] + offen d0[12] + idxen d0[13] packed into `literal`.
             const uint32_t d1 = i.words[1];
-            i.opcode = (w >> 18) & 0x7Fu;
+            i.opcode = (w >> 18) & 0xFFu;
+            i.mubuf_glc = ((w >> 14) & 1u) != 0;   // atomics: return pre-op value to VGPR
+            i.mubuf_lds = ((w >> 16) & 1u) != 0;   // buffer<->LDS transfer (rejected in stage 2)
             i.dst    = vgpr(d1 >> 8);                          // VDATA
             i.src[0] = vgpr(d1);                              // VADDR
             i.src[1] = sgpr(((d1 >> 16) & 0x1Fu) << 2);       // SRSRC (descriptor base)
@@ -384,11 +394,14 @@ void decode_operands(Rdna2Inst& i) {
             i.n_src = 3; break;
         }
         case Rdna2Format::MIMG: {
-            // Image op. opcode[24:18]; dmask[11:8]; unorm[12]; dim[5:3]. dword1: VADDR base[7:0];
-            // VDATA base[15:8]; SRSRC (T# base SGPR, ×4)[20:16]; SSAMP (S# base SGPR, ×4)[25:21].
+            // Image op. opcode is 8 bits: MSB in dword0 bit 0, low 7 bits in [24:18] (Table 100:
+            // "combine bits zero and 18-24" — dropping bit 0 aliased IMAGE_MSAA_LOAD (128) onto
+            // IMAGE_LOAD (0) and the _G16/BVH families onto wrong identities); dmask[11:8];
+            // unorm[12]; dim[5:3]. dword1: VADDR base[7:0]; VDATA base[15:8]; SRSRC (T# base
+            // SGPR, ×4)[20:16]; SSAMP (S# base SGPR, ×4)[25:21].
             // image_sample = opcode 0x20, image_load = 0x00. (Bit layout verified via llvm-mc gfx1030.)
             const uint32_t d1 = i.words[1];
-            i.opcode     = (w >> 18) & 0x7Fu;
+            i.opcode     = ((w & 1u) << 7) | ((w >> 18) & 0x7Fu);
             i.mimg_dmask = (w >> 8)  & 0xFu;
             i.mimg_unorm = (w >> 12) & 0x1u;
             i.mimg_dim   = (w >> 3)  & 0x7u;
@@ -404,6 +417,11 @@ void decode_operands(Rdna2Inst& i) {
             // ds_read_b32=0x36, ds_write_b64=0x4d, ds_write2_b64=0x4e.)
             const uint32_t d1 = i.words[1];
             i.opcode  = (w >> 18) & 0xFFu;
+            // GDS flag: llvm-mc gfx1030 places it at bit 17 (ds_add_u32 gds = 0xd8020000 vs
+            // 0xd8000000; ds_append gds = 0xd8fa0000 vs plain 0xd8f80000 — Table 94's "GDS [16]"
+            // is a GFX9 carryover). Capture bit 16 too so an unknown flag rejects fail-visibly
+            // instead of running a device-global op against workgroup LDS.
+            i.ds_gds  = ((w >> 16) & 0x3u) != 0;
             i.literal = w & 0xFFFFu;                 // byte offset (offset0:offset1)
             i.src[0]  = vgpr(d1 & 0xFFu);            // ADDR (byte offset into LDS)
             i.src[1]  = vgpr((d1 >> 8) & 0xFFu);     // DATA0 (store source)
@@ -457,6 +475,7 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
         const bool modifier = (src0 == 0xF9u || src0 == 0xFAu || src0 == 0xE9u || src0 == 0xEAu);
         if (modifier) {
             i.fmt = vf; i.has_modifier = true;
+            i.has_sdwa = (src0 == 0xF9u);
             i.len_dwords = (max_dwords >= 2) ? 2 : 1;
             if (max_dwords >= 2) i.words[1] = code[1];
             // DPP16 (src0 == 0xFA) QUAD_PERM subset (#273): dword1 = SRC0[7:0], DPP_CTRL[16:8]
@@ -476,12 +495,14 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
                 }
             }
         } else {
-            // The four K-carrying VOP2 mul-adds embed a mandatory 32-bit literal K: v_madmk_f32 (0x20),
-            // v_madak_f32 (0x21), v_fmamk_f32 (0x2C), v_fmaak_f32 (0x2D). Miss it and K mis-decodes as a
-            // phantom instruction, desyncing the stream. (Verified opcodes via round-trip llvm-mc gfx1010.)
+            // The six K-carrying VOP2 mul-adds embed a mandatory 32-bit literal K: v_madmk_f32 (0x20),
+            // v_madak_f32 (0x21), v_fmamk_f32 (0x2C), v_fmaak_f32 (0x2D), v_fmamk_f16 (0x37),
+            // v_fmaak_f16 (0x38 — Table 75 ops 55/56). Miss one and K mis-decodes as a phantom
+            // instruction, desyncing the stream. (f32 opcodes verified via round-trip llvm-mc gfx1010.)
             bool lit = (src0 == 0xFFu);
             if (vf == Rdna2Format::VOP2) { uint32_t op = (w >> 25) & 0x3Fu;
-                if (op == 0x20u || op == 0x21u || op == 0x2Cu || op == 0x2Du) lit = true; }
+                if (op == 0x20u || op == 0x21u || op == 0x2Cu || op == 0x2Du ||
+                    op == 0x37u || op == 0x38u) lit = true; }
             one_plus_lit(vf, lit);
         }
     } else if ((w & 0xC0000000u) == 0x80000000u) {
@@ -490,7 +511,11 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
                                                      i.is_end = (w == S_ENDPGM); }
         else if ((w & 0xFF800000u) == 0xBF000000u) one_plus_lit(Rdna2Format::SOPC, sop_has_literal(w, 2));
         else if ((w & 0xFF800000u) == 0xBE800000u) one_plus_lit(Rdna2Format::SOP1, sop_has_literal(w, 1));
-        else if ((w & 0xF0000000u) == 0xB0000000u) { i.fmt = Rdna2Format::SOPK; i.len_dwords = 1; }
+        else if ((w & 0xF0000000u) == 0xB0000000u)
+            // SOPK is 1 dword except S_SETREG_IMM32_B32 (opcode 21), whose 32-bit register data
+            // trails as a mandatory literal (Table 66 "SOPK*") — miss it and the data dword
+            // re-decodes as a phantom instruction, desyncing every later pc/branch target.
+            one_plus_lit(Rdna2Format::SOPK, ((w >> 23) & 0x1Fu) == 21u);
         else                                       one_plus_lit(Rdna2Format::SOP2, sop_has_literal(w, 2));
     } else {
         switch (w >> 26u) {
