@@ -3,9 +3,11 @@
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -41,7 +43,32 @@ int main() {
     HleFn read_fn = Hle::lookup(nid_hash("sceKernelRead"));
     HleFn lseek_fn = Hle::lookup(nid_hash("sceKernelLseek"));
     HleFn close_fn = Hle::lookup(nid_hash("sceKernelClose"));
-    CHECK(open_fn && read_fn && lseek_fn && close_fn, "file HLE functions registered");
+    HleFn mkdir_fn = Hle::lookup(nid_hash("mkdir"));
+    HleFn kernel_mkdir_fn = Hle::lookup(nid_hash("sceKernelMkdir"));
+    CHECK(open_fn && read_fn && lseek_fn && close_fn && mkdir_fn && kernel_mkdir_fn,
+          "file HLE functions registered");
+
+    // Creating an existing directory is a failure, not an idempotent success. Linux previously
+    // suppressed EEXIST while Windows propagated it, so save-directory control flow differed by host.
+    const char* dir_path = "prosper-test-mkdir-eexist.tmp";
+    std::error_code remove_error;
+    std::filesystem::remove_all(dir_path, remove_error);
+    int64_t mkdir_first = mkdir_fn
+        ? (int64_t)mkdir_fn((uint64_t)(uintptr_t)dir_path, 0777, 0, 0, 0, 0)
+        : -1;
+    errno = 0;
+    int64_t mkdir_duplicate = mkdir_fn
+        ? (int64_t)mkdir_fn((uint64_t)(uintptr_t)dir_path, 0777, 0, 0, 0, 0)
+        : 0;
+    int duplicate_errno = errno;
+    int64_t kernel_mkdir_duplicate = kernel_mkdir_fn
+        ? (int64_t)kernel_mkdir_fn((uint64_t)(uintptr_t)dir_path, 0777, 0, 0, 0, 0)
+        : 0;
+    CHECK(mkdir_first == 0, "mkdir creates a new directory");
+    CHECK(mkdir_duplicate == -1, "mkdir reports an existing directory as failure");
+    CHECK(duplicate_errno == EEXIST, "mkdir preserves EEXIST for the caller");
+    CHECK(kernel_mkdir_duplicate != 0, "sceKernelMkdir does not report false success on EEXIST");
+    std::filesystem::remove_all(dir_path, remove_error);
 
     std::array<uint8_t, 512> actual{};
     int64_t fd = open_fn ? (int64_t)open_fn((uint64_t)(uintptr_t)path, 0, 0, 0, 0, 0) : -1;

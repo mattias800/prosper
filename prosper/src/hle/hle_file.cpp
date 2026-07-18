@@ -781,8 +781,7 @@ HLE(f_mkdir) { std::string h = translate(CS(a0));   // sceKernelMkdir(path, mode
 #ifdef _WIN32
     return (uint64_t)(int64_t)::_mkdir(h.c_str());
 #else
-    int r = ::mkdir(h.c_str(), (mode_t)(a1 ? a1 : 0777));
-    return (uint64_t)(int64_t)(r == 0 || errno == EEXIST ? 0 : r);   // treat "already exists" as success
+    return (uint64_t)(int64_t)::mkdir(h.c_str(), (mode_t)(a1 ? a1 : 0777));
 #endif
 }
 HLE(f_rmdir) { std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::rmdir(h.c_str()); }
