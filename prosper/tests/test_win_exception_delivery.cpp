@@ -288,9 +288,6 @@ static void test_sse4a_fastpath() {
     constexpr uint64_t base = 0x410000000ull;
     constexpr size_t code_size = 85;
     constexpr size_t sse4a_offset = 45;
-    constexpr size_t short_code_offset = 0x200;
-    constexpr size_t short_sse4a_offset = short_code_offset + 19;
-    constexpr size_t short_successor_wrapper_offset = 0x3c0;
     constexpr size_t chain_code_offset = 0x300;
     constexpr size_t chain_sse4a_offset = chain_code_offset + 28;
     constexpr size_t chain_second_wrapper_offset = 0x380;
@@ -312,20 +309,6 @@ static void test_sse4a_fastpath() {
         0xf3,0x44,0x0f,0x6f,0x04,0x24,               // restore xmm8
         0x48,0x83,0xc4,0x18,                         // add rsp,0x18
         0xc3                                           // ret
-    };
-    const uint8_t short_code[] = {
-        0x48,0xb8, 0,0,0,0,0,0,0,0,                 // movabs rax,data
-        0xf3,0x0f,0x6f,0x00,                          // movdqu xmm0,[rax] (control)
-        0xf3,0x0f,0x6f,0x48,0x10,                     // movdqu xmm1,[rax+0x10] (value)
-        0x66,0x0f,0x79,0xc8,                           // extrq xmm1,xmm0 (four-byte form)
-        0xc5,0xf9,0x6f,0xd1,                           // vmovdqa xmm2,xmm1 (stolen instruction)
-        0x66,0x48,0x0f,0x7e,0xd0,                     // movq rax,xmm2
-        0xc3
-    };
-    const uint8_t short_successor_wrapper[] = {
-        0x48,0xb8, 0,0,0,0,0,0,0,0,                 // movabs rax,data
-        0xf3,0x0f,0x6f,0x48,0x10,                    // movdqu xmm1,[rax+0x10]
-        0xe9, 0,0,0,0                                // jmp consumed VEX successor
     };
     const uint8_t chain_code[] = {
         0x48,0xb8, 0,0,0,0,0,0,0,0,                 // movabs rax,data
@@ -351,25 +334,14 @@ static void test_sse4a_fastpath() {
     image.mem.assign(0x1000, 0xcc);
     image.prot.push_back({0, 0x1000, true, false, true});
     memcpy(image.mem.data(), code, sizeof(code));
-    memcpy(image.mem.data() + short_code_offset, short_code, sizeof(short_code));
-    memcpy(image.mem.data() + short_successor_wrapper_offset, short_successor_wrapper,
-           sizeof(short_successor_wrapper));
     memcpy(image.mem.data() + chain_code_offset, chain_code, sizeof(chain_code));
     memcpy(image.mem.data() + chain_second_wrapper_offset, chain_second_wrapper,
            sizeof(chain_second_wrapper));
     const uint64_t data_address = base + data_offset;
     memcpy(image.mem.data() + 27, &data_address, sizeof(data_address));
-    memcpy(image.mem.data() + short_code_offset + 2, &data_address, sizeof(data_address));
-    memcpy(image.mem.data() + short_successor_wrapper_offset + 2, &data_address,
-           sizeof(data_address));
     memcpy(image.mem.data() + chain_code_offset + 2, &data_address, sizeof(data_address));
     memcpy(image.mem.data() + chain_second_wrapper_offset + 2, &data_address,
            sizeof(data_address));
-    const int32_t short_successor_delta = static_cast<int32_t>(
-        short_sse4a_offset + 4 -
-        (short_successor_wrapper_offset + sizeof(short_successor_wrapper)));
-    memcpy(image.mem.data() + short_successor_wrapper_offset + 16, &short_successor_delta,
-           sizeof(short_successor_delta));
     const int32_t chain_second_delta = static_cast<int32_t>(
         chain_sse4a_offset + 4 -
         (chain_second_wrapper_offset + sizeof(chain_second_wrapper)));
@@ -388,7 +360,7 @@ static void test_sse4a_fastpath() {
     CHECK(map_image(image, &error), "map synthetic SSE4a guest image");
     if (!error.empty()) std::printf("  map detail: %s\n", error.c_str());
     const uint64_t after_map = sse4a_fastpath_patch_count();
-    CHECK(after_map >= before_map + 5,
+    CHECK(after_map >= before_map + 3,
           "all executable EXTRQs are translated before guest entry");
     install_trap_handler();
     using GuestFn = uint64_t (*)();
@@ -408,22 +380,6 @@ static void test_sse4a_fastpath() {
     CHECK(*(const uint8_t*)(uintptr_t)(base + sse4a_offset) == 0xe9,
           "five-byte EXTRQ is a near-jump before it can fault on an Intel host");
 
-    const GuestFn short_function = (GuestFn)(uintptr_t)(base + short_code_offset);
-    const uint64_t short_first = short_function();
-    const uint64_t short_second = short_function();
-    const uint64_t short_after_second = sse4a_fastpath_patch_count();
-    CHECK(short_first == 0xab && short_second == 0xab,
-          "four-byte EXTRQ and its copied VEX successor preserve their result");
-    CHECK(short_after_second == after_map,
-          "four-byte EXTRQ does not enter the live exception patcher");
-    CHECK(*(const uint8_t*)(uintptr_t)(base + short_sse4a_offset) == 0xe9,
-          "four-byte EXTRQ and validated VEX successor are translated before entry");
-    const GuestFn short_successor_function =
-        (GuestFn)(uintptr_t)(base + short_successor_wrapper_offset);
-    const uint64_t short_successor_result = short_successor_function();
-    CHECK(short_successor_result == 0xab00,
-          "a direct branch to the consumed VEX instruction uses its secondary expansion");
-
     const GuestFn chain_function = (GuestFn)(uintptr_t)(base + chain_code_offset);
     const uint64_t chain_first = chain_function();
     const uint64_t chain_second = chain_function();
@@ -439,7 +395,7 @@ static void test_sse4a_fastpath() {
     CHECK(chain_second_function() == 0xcd,
           "direct entry to the chained EXTRQ uses its overlapping near jump");
 
-    bool randomized_exact = true, randomized_short = true, randomized_chain = true;
+    bool randomized_exact = true, randomized_chain = true;
     uint64_t random = 0x9e3779b97f4a7c15ull;
     auto next_random = [&] {
         random ^= random << 13; random ^= random >> 7; random ^= random << 17;
@@ -462,12 +418,9 @@ static void test_sse4a_fastpath() {
         const uint64_t expected_second =
             sse4a_extrq(randomized_second, length, index);
         randomized_exact &= function() == expected_value;
-        randomized_short &= short_function() == expected_value;
         randomized_chain &= chain_function() == expected_second;
     }
     CHECK(randomized_exact, "five-byte EXTRQ fast path matches randomized AMD fields");
-    CHECK(randomized_short,
-          "four-byte EXTRQ plus copied VEX successor matches randomized AMD fields");
     CHECK(randomized_chain,
           "adjacent EXTRQ expansions match randomized AMD fields");
 

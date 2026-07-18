@@ -183,23 +183,18 @@ namespace {
     // Astro contains 48 EXTRQs per iteration. More importantly, Windows builds the #UD dispatch
     // frame below the interrupted RSP and can overwrite the guest's SysV red zone before VEH runs.
     // Translate register-form EXTRQs into a nearby code cache before guest entry. Five-byte forms
-    // detour directly; four-byte forms consume only a fail-closed decoded successor or an adjacent
-    // five-byte EXTRQ so every overwritten byte has an equivalent secondary entry.
+    // detour directly. Astro also has a few adjacent four- plus five-byte EXTRQs; those use two
+    // overlapping near jumps so either original instruction remains a valid entry point.
     constexpr size_t kSse4aFastpathCacheSize = 4 * 1024 * 1024;
     constexpr size_t kSse4aFastpathSlotSize = 256;
     constexpr size_t kSse4aSecondaryOffset = 160;
     constexpr size_t kSse4aFastpathMaxPatches = 8192;
     uint8_t* g_sse4a_fastpath_cache = nullptr;
     size_t g_sse4a_fastpath_used = 0;
-    uint8_t* g_sse4a_successor_cache = nullptr;
-    size_t g_sse4a_successor_used = 0;
     uint8_t* g_sse4a_chain_cache = nullptr;
     size_t g_sse4a_chain_used = 0;
     uint64_t g_sse4a_fastpath_sites[kSse4aFastpathMaxPatches]{};
     volatile LONG g_sse4a_fastpath_count = 0;
-    struct Sse4aSecondaryRedirect { uint64_t marker = 0, target = 0; };
-    Sse4aSecondaryRedirect g_sse4a_secondary_redirects[kSse4aFastpathMaxPatches]{};
-    volatile LONG g_sse4a_secondary_count = 0;
     volatile LONG g_sse4a_fastpath_lock = 0;
 
     // Thread-stack registry (portable; mirrors the Linux one) so GC/thread code gets real bounds.
@@ -392,9 +387,8 @@ namespace {
         else {
             int dr = (op == 0x78) ? rm : reg;
             set(dr, sse4a_extrq(lo(dr), len, idx));
-            // AMD documents EXTRQ's upper qword as undefined. Preserve it: that matches the AMD CPU
-            // model used by QEMU and the behavior prosper's established trap emulators exposed to
-            // guests. Astro's packed-vector kernels keep live data in the neighboring lane.
+            // AMD documents EXTRQ's upper qword as undefined. Preserve prosper's established trap
+            // behavior; Astro's packed-vector kernels keep live data in the neighboring lane.
         }
         c->Rip += i;
         if (decoded_size) *decoded_size = i;
@@ -423,49 +417,15 @@ namespace {
         return sse4a_fastpath_candidate_bytes((const uint8_t*)(uintptr_t)site);
     }
 
-    // Minimal fail-closed decoder for the location-independent AVX instruction immediately after
-    // a four-byte EXTRQ. It accepts only the register/stack-memory VEX forms exercised by the guest
-    // unpack kernels; RIP-relative memory, branches, and unknown opcodes cannot be stolen.
-    size_t patchable_vex_length(uint64_t site) {
-        if (!addr_readable(site) || !addr_readable(site + 14)) return 0;
-        const uint8_t* p = (const uint8_t*)(uintptr_t)site;
-        size_t i = 0;
-        if (p[0] == 0xc5) i = 2;
-        else if (p[0] == 0xc4) i = 3;
-        else return 0;
-        const uint8_t opcode = p[i++];
-        switch (opcode) {
-            case 0x62: case 0x6a: case 0x6f: case 0x73: case 0x7f: case 0xf3: break;
-            default: return 0;
-        }
-        const uint8_t modrm = p[i++];
-        const unsigned mod = modrm >> 6;
-        const unsigned rm = modrm & 7;
-        if (mod != 3) {
-            if (mod == 0 && rm == 5) return 0; // RIP-relative: copying would change its address
-            if (rm == 4) {
-                const uint8_t sib = p[i++];
-                if (mod == 0 && (sib & 7) == 5) i += 4;
-            }
-            if (mod == 1) ++i;
-            else if (mod == 2) i += 4;
-        }
-        if (opcode == 0x73) ++i;
-        return i <= 15 ? i : 0;
-    }
-
     bool emit_sse4a_fastpath(uint64_t site, size_t instruction_size,
-                             const uint8_t* stolen = nullptr, size_t stolen_size = 0,
                              const uint8_t* second_sse4a = nullptr,
                              size_t second_sse4a_size = 0) {
         const bool chains_sse4a = instruction_size == 4 && second_sse4a_size;
-        const bool consumes_vex = instruction_size == 4 && stolen_size;
-        const bool consumes_successor = chains_sse4a || consumes_vex;
-        uint8_t* selected_cache = chains_sse4a ? g_sse4a_chain_cache :
-            (consumes_vex ? g_sse4a_successor_cache : g_sse4a_fastpath_cache);
-        size_t& selected_used = chains_sse4a ? g_sse4a_chain_used :
-            (consumes_vex ? g_sse4a_successor_used : g_sse4a_fastpath_used);
-        const LONG records_needed = consumes_successor ? 2 : 1;
+        uint8_t* selected_cache = chains_sse4a ? g_sse4a_chain_cache
+                                               : g_sse4a_fastpath_cache;
+        size_t& selected_used = chains_sse4a ? g_sse4a_chain_used
+                                             : g_sse4a_fastpath_used;
+        const LONG records_needed = chains_sse4a ? 2 : 1;
         if (!selected_cache ||
             selected_used + kSse4aFastpathSlotSize > kSse4aFastpathCacheSize ||
             InterlockedCompareExchange(&g_sse4a_fastpath_count, 0, 0) >
@@ -483,6 +443,12 @@ namespace {
                             &old_cache_protection))
             return false;
         selected_used += kSse4aFastpathSlotSize;
+        auto abandon_slot = [&] {
+            selected_used -= kSse4aFastpathSlotSize;
+            DWORD ignored = 0;
+            VirtualProtect((void*)cache_page, 0x1000, old_cache_protection, &ignored);
+            return false;
+        };
         uint8_t* code = main_code;
         size_t o = 0;
         auto byte = [&](uint8_t value) { code[o++] = value; };
@@ -491,8 +457,8 @@ namespace {
             byte(0x0f); byte(0x7e); byte((uint8_t)(0xc0 | ((xmm & 7) << 3) | gpr));
         };
         auto pinsrq_gpr_to_xmm = [&](unsigned xmm, unsigned gpr) {
-            // PINSRQ replaces only qword 0. Legacy MOVQ would clear qword 1, unlike the AMD CPU
-            // model and prosper's established trap-emulation behavior.
+            // PINSRQ replaces only qword 0. Legacy MOVQ would clear qword 1, unlike prosper's
+            // established trap-emulation behavior.
             byte(0x66); byte((uint8_t)(0x48 | (xmm >= 8 ? 4 : 0) | (gpr >= 8 ? 1 : 0)));
             byte(0x0f); byte(0x3a); byte(0x22);
             byte((uint8_t)(0xc0 | ((xmm & 7) << 3) | (gpr & 7)));
@@ -540,12 +506,8 @@ namespace {
         emit_prologue();
         emit_extract(destination, control);
         emit_epilogue();
-        if (stolen && stolen_size) {
-            memcpy(code + o, stolen, stolen_size);
-            o += stolen_size;
-        }
         byte(0xe9);
-        const size_t replaced_size = instruction_size + stolen_size + second_sse4a_size;
+        const size_t replaced_size = instruction_size + second_sse4a_size;
         const uint64_t main_target = second_sse4a_size
             ? (uint64_t)(uintptr_t)(main_code + kSse4aSecondaryOffset)
             : site + replaced_size;
@@ -553,59 +515,53 @@ namespace {
                                    (int64_t)((uint64_t)(uintptr_t)code + o + 4);
         if (back_delta < std::numeric_limits<int32_t>::min() ||
             back_delta > std::numeric_limits<int32_t>::max())
-            return false;
+            return abandon_slot();
         const int32_t back_rel = (int32_t)back_delta;
         memcpy(code + o, &back_rel, sizeof(back_rel)); o += sizeof(back_rel);
         const size_t main_size = o;
         uint8_t* secondary_code = nullptr;
         size_t secondary_size = 0;
-        if (consumes_successor) {
-            if (main_size > kSse4aSecondaryOffset) return false;
+        if (chains_sse4a) {
+            if (main_size > kSse4aSecondaryOffset) return abandon_slot();
             secondary_code = main_code + kSse4aSecondaryOffset;
             code = secondary_code;
             o = 0;
-            if (second_sse4a_size) {
-                emit_prologue();
-                emit_extract(second_destination, second_control);
-                emit_epilogue();
-            } else {
-                memcpy(code + o, stolen, stolen_size);
-                o += stolen_size;
-            }
+            emit_prologue();
+            emit_extract(second_destination, second_control);
+            emit_epilogue();
             byte(0xe9);
             const int64_t secondary_back_delta = (int64_t)(site + replaced_size) -
                 (int64_t)((uint64_t)(uintptr_t)code + o + 4);
             if (secondary_back_delta < std::numeric_limits<int32_t>::min() ||
                 secondary_back_delta > std::numeric_limits<int32_t>::max())
-                return false;
+                return abandon_slot();
             const int32_t secondary_back_rel = (int32_t)secondary_back_delta;
             memcpy(code + o, &secondary_back_rel, sizeof(secondary_back_rel));
             o += sizeof(secondary_back_rel);
             secondary_size = o;
             if (kSse4aSecondaryOffset + secondary_size > kSse4aFastpathSlotSize)
-                return false;
+                return abandon_slot();
         } else if (main_size > kSse4aFastpathSlotSize) {
-            return false;
+            return abandon_slot();
         }
 
         const int64_t detour_delta =
             (int64_t)(uint64_t)(uintptr_t)main_code - (int64_t)(site + 5);
         if (detour_delta < std::numeric_limits<int32_t>::min() ||
             detour_delta > std::numeric_limits<int32_t>::max())
-            return false;
+            return abandon_slot();
         const int32_t detour_rel = (int32_t)detour_delta;
         // The high displacement byte is also the instruction at site+4. Chained SSE uses E9 plus
-        // the following four bytes as a second near jump. A copied VEX successor uses EB to reach
-        // its permanent secondary-entry marker inside the shorter consumed span.
-        const uint8_t overlap_opcode = chains_sse4a ? 0xe9 : 0xeb;
-        if (consumes_successor && ((uint32_t)detour_rel >> 24) != overlap_opcode) return false;
+        // the following four bytes as a second near jump.
+        if (chains_sse4a && ((uint32_t)detour_rel >> 24) != 0xe9)
+            return abandon_slot();
         int32_t secondary_detour_rel = 0;
         if (chains_sse4a) {
             const int64_t secondary_detour_delta =
                 (int64_t)(uint64_t)(uintptr_t)secondary_code - (int64_t)(site + 9);
             if (secondary_detour_delta < std::numeric_limits<int32_t>::min() ||
                 secondary_detour_delta > std::numeric_limits<int32_t>::max())
-                return false;
+                return abandon_slot();
             secondary_detour_rel = (int32_t)secondary_detour_delta;
         }
         FlushInstructionCache(GetCurrentProcess(), main_code, main_size);
@@ -619,21 +575,13 @@ namespace {
             InterlockedIncrement(&g_sse4a_fastpath_count);
         };
         record_site(site);
-        if (consumes_successor) {
+        if (chains_sse4a) {
             record_site(site + instruction_size);
-            if (consumes_vex) {
-                const LONG redirect =
-                    InterlockedCompareExchange(&g_sse4a_secondary_count, 0, 0);
-                g_sse4a_secondary_redirects[redirect] =
-                    {site + 6, (uint64_t)(uintptr_t)secondary_code};
-                MemoryBarrier();
-                InterlockedIncrement(&g_sse4a_secondary_count);
-            }
         }
 
         // An INT3 gate prevents another core from observing a half-written near jump. A thread that
         // arrives during these stores waits in the VEH breakpoint path below, then replays the site.
-        if (consumes_successor) {
+        if (chains_sse4a) {
             *(volatile uint8_t*)(uintptr_t)(site + instruction_size) = 0xcc;
             FlushInstructionCache(GetCurrentProcess(),
                                   (const void*)(uintptr_t)(site + instruction_size), 1);
@@ -647,15 +595,6 @@ namespace {
             memcpy((void*)(uintptr_t)(site + 5), &secondary_detour_rel,
                    sizeof(secondary_detour_rel));
             *(volatile uint8_t*)(uintptr_t)(site + instruction_size) = 0xe9;
-        } else if (consumes_vex) {
-            // E9 <low 24 bits> EB is the main near jump. Entry at +4 executes `EB 00`, reaches the
-            // permanent INT3 marker at +6, and VEH redirects to the second-only expansion.
-            memcpy((void*)(uintptr_t)(site + 1), &detour_rel, 3);
-            *(volatile uint8_t*)(uintptr_t)(site + 5) = 0x00;
-            *(volatile uint8_t*)(uintptr_t)(site + 6) = 0xcc;
-            for (size_t i = 7; i < replaced_size; ++i)
-                *(volatile uint8_t*)(uintptr_t)(site + i) = 0x90;
-            *(volatile uint8_t*)(uintptr_t)(site + instruction_size) = 0xeb;
         } else {
             memcpy((void*)(uintptr_t)(site + 1), &detour_rel, sizeof(detour_rel));
             for (size_t i = 5; i < replaced_size; ++i)
@@ -665,8 +604,12 @@ namespace {
         FlushInstructionCache(GetCurrentProcess(), (const void*)(uintptr_t)site, replaced_size);
         DWORD ignored_cache_protection = 0;
         if (!VirtualProtect((void*)cache_page, 0x1000, PAGE_EXECUTE_READ,
-                            &ignored_cache_protection))
-            return false;
+                            &ignored_cache_protection)) {
+            // The guest detour is already live and the cache is still executable RWX. Report the
+            // hardening failure, but keep the installed-patch state internally consistent.
+            fprintf(stderr, "[sse4a] warning: code cache remained writable (error=%lu)\n",
+                    (unsigned long)GetLastError());
+        }
         if (getenv("PROSPER_SSE4A_LOG"))
             fprintf(stderr, "[sse4a] fastpath eboot+0x%llx xmm%u,xmm%u span=%zu cache=%p\n",
                     (unsigned long long)(site - g_base), destination, control,
@@ -675,15 +618,6 @@ namespace {
     }
 
     bool try_handle_sse4a_fastpath_breakpoint(CONTEXT* c, uint64_t exception_address) {
-        uint64_t breakpoint = exception_address;
-        const LONG redirects = InterlockedCompareExchange(&g_sse4a_secondary_count, 0, 0);
-        for (LONG i = 0; i < redirects; ++i) {
-            const Sse4aSecondaryRedirect& redirect = g_sse4a_secondary_redirects[i];
-            if (breakpoint != redirect.marker && (!c->Rip || c->Rip - 1 != redirect.marker))
-                continue;
-            c->Rip = redirect.target;
-            return true;
-        }
         uint64_t site = exception_address;
         if (!sse4a_fastpath_site(site) && c->Rip && sse4a_fastpath_site(c->Rip - 1))
             site = c->Rip - 1;
@@ -697,10 +631,10 @@ namespace {
     // the SysV ABI and may keep live values in the 128-byte red zone there, so discovering SSE4a
     // through a live #UD can corrupt guest locals before VEH is entered. Translate the narrowly
     // recognized register-form EXTRQ sequences while the primary image is still single-threaded.
-    // Five-byte forms are self-contained. Four-byte forms are accepted only when the already
-    // fail-closed successor decoder can preserve the instruction that supplies the fifth detour byte.
+    // Five-byte forms are self-contained. Four-byte forms are accepted only when immediately
+    // followed by a five-byte EXTRQ, allowing two overlapping near jumps with no stolen instruction.
     size_t prepatch_sse4a(const LoadedImage& img) {
-        size_t patched = 0;
+        const LONG before = InterlockedCompareExchange(&g_sse4a_fastpath_count, 0, 0);
         for (const LoadedImage::Prot& protection : img.prot) {
             if (!protection.x || !protection.size) continue;
             const uint64_t mapped_begin = img.base + img.min_vaddr;
@@ -719,32 +653,25 @@ namespace {
                 if (instruction_size == 5) {
                     emitted = emit_sse4a_fastpath(site, instruction_size);
                 } else {
-                    const size_t stolen_size = patchable_vex_length(site + instruction_size);
-                    const size_t chained_size = !stolen_size &&
-                        site + instruction_size + 5 <= end &&
+                    const size_t chained_size = site + instruction_size + 5 <= end &&
                         sse4a_fastpath_candidate_bytes(
                             (const uint8_t*)(uintptr_t)(site + instruction_size)) == 5 ? 5 : 0;
-                    if (stolen_size) {
+                    if (chained_size) {
                         emitted = emit_sse4a_fastpath(
                             site, instruction_size,
-                            (const uint8_t*)(uintptr_t)(site + instruction_size),
-                            stolen_size);
-                        consumed += stolen_size;
-                    } else if (chained_size) {
-                        emitted = emit_sse4a_fastpath(
-                            site, instruction_size, nullptr, 0,
                             (const uint8_t*)(uintptr_t)(site + instruction_size),
                             chained_size);
                         consumed += chained_size;
                     }
                 }
                 if (!emitted) continue;
-                ++patched;
                 site += consumed - 1;
             }
         }
+        const size_t patched = (size_t)(
+            InterlockedCompareExchange(&g_sse4a_fastpath_count, 0, 0) - before);
         if (patched || getenv("PROSPER_SSE4A_LOG"))
-            fprintf(stderr, "[sse4a] prepatched %zu EXTRQ sequences before guest entry\n",
+            fprintf(stderr, "[sse4a] prepatched %zu EXTRQ sites before guest entry\n",
                     patched);
         return patched;
     }
@@ -851,14 +778,11 @@ namespace {
         if (code == EXCEPTION_ILLEGAL_INSTRUCTION) {
             const uint64_t site = c->Rip;
             size_t candidate_size = sse4a_fastpath_candidate(site);
-            size_t stolen_size = 0;
             size_t chained_sse4a_size = 0;
             if (candidate_size == 4)
-                stolen_size = patchable_vex_length(site + candidate_size);
-            if (candidate_size == 4 && !stolen_size)
                 chained_sse4a_size =
                     sse4a_fastpath_candidate(site + candidate_size) == 5 ? 5 : 0;
-            if (candidate_size == 5 || stolen_size || chained_sse4a_size ||
+            if (candidate_size == 5 || chained_sse4a_size ||
                 sse4a_fastpath_site(site)) {
                 while (InterlockedCompareExchange(&g_sse4a_fastpath_lock, 1, 0) != 0)
                     YieldProcessor();
@@ -869,22 +793,12 @@ namespace {
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
                 candidate_size = sse4a_fastpath_candidate(site);
-                stolen_size = candidate_size == 4
-                    ? patchable_vex_length(site + candidate_size) : 0;
-                chained_sse4a_size = candidate_size == 4 && !stolen_size &&
+                chained_sse4a_size = candidate_size == 4 &&
                     sse4a_fastpath_candidate(site + candidate_size) == 5 ? 5 : 0;
                 bool emulated = false;
-                if (candidate_size == 4 && stolen_size &&
-                    emit_sse4a_fastpath(site, candidate_size,
-                                        (const uint8_t*)(uintptr_t)(site + candidate_size),
-                                        stolen_size)) {
-                    // The detour expansion performs both the EXTRQ and copied successor. Replay it
-                    // from the untouched fault context; resuming at site+4 would land inside E9.
-                    c->Rip = site;
-                    emulated = true;
-                } else if (candidate_size == 4 && chained_sse4a_size &&
+                if (candidate_size == 4 && chained_sse4a_size &&
                            emit_sse4a_fastpath(
-                               site, candidate_size, nullptr, 0,
+                               site, candidate_size,
                                (const uint8_t*)(uintptr_t)(site + candidate_size),
                                chained_sse4a_size)) {
                     // Keep the two validated single-EXTRQ expansions separate. The first jumps to
@@ -1021,22 +935,8 @@ bool map_image(const LoadedImage& img, std::string* err) {
             g_sse4a_fastpath_cache = nullptr;
             fprintf(stderr, "[sse4a] trap-free cache unavailable; using VEH emulation\n");
         }
-        // Four-byte EXTRQ needs to consume its successor to make room for a five-byte detour.
-        // Put successor-consuming expansions where the detour's high displacement byte is 0xEB.
-        // That byte doubles as a short-jump entry for a direct branch to the consumed successor;
-        // see the secondary-entry marker installed by emit_sse4a_fastpath.
-        if (img.base > 0x14800000ull) {
-            const uint64_t successor_cache_address =
-                (img.base - 0x14800000ull) & ~0xffffull;
-            g_sse4a_successor_cache = (uint8_t*)VirtualAlloc(
-                (void*)(uintptr_t)successor_cache_address, kSse4aFastpathCacheSize,
-                MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-            if (g_sse4a_successor_cache != (void*)(uintptr_t)successor_cache_address) {
-                if (g_sse4a_successor_cache)
-                    VirtualFree(g_sse4a_successor_cache, 0, MEM_RELEASE);
-                g_sse4a_successor_cache = nullptr;
-            }
-        }
+        // Adjacent four- plus five-byte EXTRQs need two overlapping near jumps. Locate their cache
+        // so the first jump's high displacement byte is itself the second E9 opcode.
         if (img.base > 0x16800000ull) {
             const uint64_t chain_cache_address =
                 (img.base - 0x16800000ull) & ~0xffffull;

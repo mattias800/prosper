@@ -1,6 +1,6 @@
 // test_sse4a — golden vectors for the AMD SSE4a INSERTQ/EXTRQ emulation used by the SIGILL handler
-// in exec_image_linux.cpp (PS5 Zen2 guest code #UDs these on Intel hosts). Values hand-computed
-// from the Intel SDM bitfield semantics; this locks the arithmetic independently of the signal path.
+// in exec_image_linux.cpp (PS5 Zen2 guest code #UDs these on Intel hosts). Values are derived from
+// AMD64 Architecture Programmer's Manual Volume 4 (publication 26568), independent of the signal path.
 #include "../src/host/sse4a.hpp"
 #include <cstdio>
 #include <cstdint>
