@@ -19,6 +19,30 @@ static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
+#ifdef _WIN32
+static uint64_t find_free_guest_span(uint64_t len) {
+    constexpr uint64_t kGranule = 0x10000;
+    constexpr uint64_t kGuestVaBegin = 0x2000000000ull;
+    constexpr uint64_t kGuestVaEnd = 0xfc00000000ull;
+    uint64_t cursor = kGuestVaBegin;
+    while (cursor <= kGuestVaEnd - len) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery((void*)(uintptr_t)cursor, &mbi, sizeof(mbi))) break;
+        const uint64_t region_base = (uint64_t)(uintptr_t)mbi.BaseAddress;
+        const uint64_t region_end = region_base + (uint64_t)mbi.RegionSize;
+        if (mbi.State == MEM_FREE) {
+            uint64_t candidate = cursor > region_base ? cursor : region_base;
+            candidate = (candidate + kGranule - 1) & ~(kGranule - 1);
+            if (candidate <= kGuestVaEnd - len && candidate + len <= region_end)
+                return candidate;
+        }
+        if (region_end <= cursor) break;
+        cursor = (region_end + kGranule - 1) & ~(kGranule - 1);
+    }
+    return 0;
+}
+#endif
+
 int main() {
     printf("== test_retrack_reservation ==\n");
     register_builtin_hle();
@@ -80,6 +104,45 @@ int main() {
               "original flexible page unmaps cleanly");
     }
 
+#ifdef _WIN32
+    // A loaded image or host allocation is not represented in the HLE mapping tracker. Windows
+    // nevertheless lets VirtualAlloc(MEM_COMMIT) succeed on an already committed range, so the
+    // exact-hint path must consult host VA state before it adopts and tracks an address.
+    const uint64_t foreign_base = find_free_guest_span(page);
+    void* foreign_page = foreign_base
+        ? VirtualAlloc((void*)(uintptr_t)foreign_base, page,
+                       MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        : nullptr;
+    CHECK(foreign_page != nullptr,
+          "create an untracked committed page in the guest VA aperture");
+    if (foreign_page) {
+        auto* foreign_cell = (volatile uint32_t*)foreign_page;
+        *foreign_cell = 0x387F60F1u;
+        const uint64_t foreign_address = (uint64_t)(uintptr_t)foreign_page;
+
+        uint64_t relocated = foreign_address;
+        const bool foreign_relocated =
+            flexible_noname((uint64_t)(uintptr_t)&relocated, page, 0x2, 0, 0, 0) == 0 &&
+            relocated > foreign_address;
+        CHECK(foreign_relocated,
+              "non-fixed untracked committed hint relocates forward");
+        CHECK(*foreign_cell == 0x387F60F1u,
+              "relocation preserves the untracked committed page");
+
+        uint64_t fixed_foreign = foreign_address;
+        CHECK(flexible_noname((uint64_t)(uintptr_t)&fixed_foreign, page, 0x2,
+                              0x10 /* SCE_KERNEL_MAP_FIXED */, 0, 0) != 0 &&
+                  fixed_foreign == foreign_address && *foreign_cell == 0x387F60F1u,
+              "fixed untracked committed hint fails without adopting it");
+
+        if (foreign_relocated)
+            CHECK(unmap(relocated, page, 0, 0, 0, 0) == 0,
+                  "mapping relocated from an untracked page unmaps cleanly");
+        CHECK(VirtualFree(foreign_page, 0, MEM_RELEASE) != 0,
+              "untracked committed page releases cleanly");
+    }
+#endif
+
     constexpr uint64_t len = page * 3;
     uint64_t base = 0;
     CHECK(reserve((uint64_t)(uintptr_t)&base, len, 0, page, 0, 0) == 0 && base,
@@ -108,13 +171,13 @@ int main() {
     // #926: MEM_COMMIT says that a host allocation exists, not that it belongs to the guest. Put
     // one tracked guest page and one unrelated host-committed page in a single host reservation so
     // the boundary-crossing failure is deterministic regardless of the process address layout.
-    void* host_reservation = VirtualAlloc(nullptr, page * 2, MEM_RESERVE, PAGE_NOACCESS);
-    CHECK(host_reservation != nullptr, "reserve deterministic guest/host ownership test span");
-    if (host_reservation) {
-        const uint64_t host_base = (uint64_t)(uintptr_t)host_reservation;
+    const uint64_t host_base = find_free_guest_span(page * 2);
+    CHECK(host_base != 0, "find deterministic guest/host ownership test span");
+    if (host_base) {
         uint64_t guest_page = host_base;
         const bool guest_map_succeeded =
-            flexible((uint64_t)(uintptr_t)&guest_page, page, 0x2, 0,
+            flexible((uint64_t)(uintptr_t)&guest_page, page, 0x2,
+                     0x10 /* SCE_KERNEL_MAP_FIXED */,
                      (uint64_t)(uintptr_t)"mprotect-ownership", 0) == 0 && guest_page;
         const bool guest_mapped = guest_map_succeeded && guest_page == host_base;
         CHECK(guest_mapped, "commit and track the first page as guest memory");
@@ -122,7 +185,7 @@ int main() {
         void* foreign_page = nullptr;
         if (guest_mapped) {
             foreign_page = VirtualAlloc((void*)(uintptr_t)(host_base + page), page,
-                                        MEM_COMMIT, PAGE_READWRITE);
+                                        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         }
         CHECK(foreign_page == (void*)(uintptr_t)(host_base + page),
               "commit the adjacent page outside the guest tracker");
@@ -169,8 +232,9 @@ int main() {
         if (guest_map_succeeded)
             CHECK(unmap(guest_page, page, 0, 0, 0, 0) == 0,
                   "tracked ownership-test page unmaps cleanly");
-        CHECK(VirtualFree(host_reservation, 0, MEM_RELEASE) != 0,
-              "ownership-test host reservation releases cleanly");
+        if (foreign_page)
+            CHECK(VirtualFree(foreign_page, 0, MEM_RELEASE) != 0,
+                  "ownership-test foreign page releases cleanly");
     }
 #endif
 

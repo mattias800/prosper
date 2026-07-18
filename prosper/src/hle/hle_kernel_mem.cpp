@@ -1493,15 +1493,6 @@ namespace {
                 if (!best || m.base > best->base) best = &m;
         return best;
     }
-    bool committed_mapping_overlaps(uint64_t base, uint64_t len) {
-        if (!len || base > UINT64_MAX - len) return true;
-        const uint64_t end = base + len;
-        std::lock_guard<std::mutex> lk(g_mx);
-        for (const auto& m : g_maps)
-            if (m.committed && m.base < end && m.base + m.size > base)
-                return true;
-        return false;
-    }
     uint64_t next_base(uint64_t addr) {
         std::lock_guard<std::mutex> lk(g_mx);
         uint64_t n = 0;
@@ -2273,6 +2264,71 @@ namespace {
         return result;
     }
 
+    enum class FlexibleHintState { Unavailable, Free, GuestReservation };
+
+    bool guest_reservation_covers(uint64_t begin, uint64_t end) {
+        if (begin >= end) return false;
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            uint64_t cursor = begin;
+            while (cursor < end) {
+                const Mapping* cover = nullptr;
+                for (const auto& m : g_maps) {
+                    if (cursor < m.base || cursor >= m.base + m.size) continue;
+                    if (!cover || m.base > cover->base) cover = &m;
+                }
+                if (!cover || cover->committed) break;
+                cursor = std::min<uint64_t>(end, cover->base + cover->size);
+            }
+            if (cursor == end) return true;
+        }
+        std::lock_guard<std::mutex> lk(g_dview_mx);
+        if (private_placeholder_view_containing_locked(begin, end)) return true;
+        for (const PlaceholderSpan& span : g_guest_placeholders)
+            if (begin >= span.base && end <= span.base + span.size) return true;
+        return false;
+    }
+
+    // Classify an exact flexible-memory hint without treating arbitrary host reservations as guest
+    // storage. In particular, VirtualAlloc(..., MEM_COMMIT) succeeds on already committed pages;
+    // checking only the HLE tracker would therefore let an untracked image/host allocation be
+    // adopted. MEM_RESERVE is eligible only when the guest owns the reservation or placeholder.
+    FlexibleHintState flexible_hint_state(uint64_t base, uint64_t len) {
+        if (!len || base > UINT64_MAX - len) return FlexibleHintState::Unavailable;
+        const uint64_t end = base + len;
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            for (const auto& m : g_maps)
+                if (m.committed && m.base < end && m.base + m.size > base)
+                    return FlexibleHintState::Unavailable;
+        }
+
+        bool saw_reservation = false;
+        uint64_t cursor = base;
+        while (cursor < end) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(cursor)),
+                              &mbi, sizeof(mbi)))
+                return FlexibleHintState::Unavailable;
+            const uint64_t region_base =
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mbi.BaseAddress));
+            const uint64_t region_end =
+                region_base > UINT64_MAX - mbi.RegionSize
+                    ? UINT64_MAX
+                    : region_base + static_cast<uint64_t>(mbi.RegionSize);
+            if (region_end <= cursor || mbi.State == MEM_COMMIT)
+                return FlexibleHintState::Unavailable;
+            if (mbi.State == MEM_RESERVE) {
+                if (!guest_reservation_covers(cursor, std::min<uint64_t>(end, region_end)))
+                    return FlexibleHintState::Unavailable;
+                saw_reservation = true;
+            }
+            cursor = std::min<uint64_t>(end, region_end);
+        }
+        return saw_reservation ? FlexibleHintState::GuestReservation
+                               : FlexibleHintState::Free;
+    }
+
     // Commit `len` at `hint` (0 = OS chooses). Placeholder-backed guest reservations and holes
     // are replaced with ordinary private pages so the same 16 KiB address can later be reused by
     // either flexible or direct memory. Legacy VirtualAlloc reservations retain their old path.
@@ -2347,6 +2403,23 @@ namespace {
         if (result)
             host::guest_write_watch_notify_direct_mapping_added(
                 (uint64_t)(uintptr_t)result, len, (uint64_t)(uintptr_t)result, pp);
+        return result;
+    }
+
+    void* win_commit_flexible_exact(uint64_t hint, uint64_t len, int hp) {
+        const FlexibleHintState state = flexible_hint_state(hint, len);
+        if (state == FlexibleHintState::GuestReservation)
+            return win_commit(hint, len, hp);
+        if (state != FlexibleHintState::Free) return nullptr;
+
+        const DWORD pp = win_page_prot(hp);
+        void* result = VirtualAlloc(
+            reinterpret_cast<void*>(static_cast<uintptr_t>(hint)),
+            static_cast<SIZE_T>(len), MEM_RESERVE | MEM_COMMIT, pp);
+        if (result)
+            host::guest_write_watch_notify_direct_mapping_added(
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(result)), len,
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(result)), pp);
         return result;
     }
 
@@ -3151,12 +3224,7 @@ HLE(k_map_flexible) {
     uint64_t hint = a0 ? *(uint64_t*)a0 : 0;
     const bool fixed = (a3 & 0x10) != 0;   // SCE_KERNEL_MAP_FIXED
     if (fixed && !hint) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
-    // win_commit() deliberately recommits/reprotects an existing private placeholder view for
-    // partial-unmap support. That is correct for a hole or uncommitted reservation, but a new map
-    // must not mistake an already committed guest mapping for available space.
-    void* p = hint && !committed_mapping_overlaps(hint, a1)
-        ? win_commit(hint, a1, host_prot(a2))
-        : nullptr;
+    void* p = hint ? win_commit_flexible_exact(hint, a1, host_prot(a2)) : nullptr;
     if (!p && !fixed)
         p = win_commit_from(hint ? hint : kGuestAutoVaMin, a1, host_prot(a2));
     if (!p) { MLOG("mapflexible hint=0x%llx len=0x%llx FAILED\n",
