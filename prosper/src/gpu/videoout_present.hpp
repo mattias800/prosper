@@ -16,6 +16,39 @@
 #include <memory>
 #include <vector>
 
+namespace prosper {
+
+// One lock-coherent view of a registered guest scanout buffer and the attributes of its owning
+// VideoOut set. The HLE registry supplies these snapshots to the present layer so an unregister or
+// another set's registration cannot pair one buffer address with unrelated dimensions.
+struct VideoOutBufferSnapshot {
+    uint64_t address = 0;
+    uint64_t pixel_format = 0;
+    uint64_t generation = 0;
+    int buffer_index = -1;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t tiling_mode = 0;
+};
+
+// Front-buffer selection and invalidation live under the registry mutex. A generation distinguishes
+// a newly registered buffer from an older registration that occupied the same numeric slot.
+bool videoout_select_buffer(int buffer_index, VideoOutBufferSnapshot& out);
+bool videoout_front_snapshot(VideoOutBufferSnapshot& out);
+bool videoout_display_snapshot(VideoOutBufferSnapshot& out);
+int videoout_front_index();
+void videoout_reset_front();
+
+// Copy while holding the registry lease so UnregisterBuffers cannot return (and let the guest reuse
+// the backing allocation) until the raw read completes. The expected-snapshot overload additionally
+// rejects unregister/re-register ABA by checking the registration generation.
+bool videoout_copy_buffer(const VideoOutBufferSnapshot& expected, std::vector<uint8_t>& out);
+bool videoout_copy_front_buffer(std::vector<uint8_t>& out, VideoOutBufferSnapshot& metadata);
+size_t videoout_copy_front_buffer(void* dst, size_t dst_cap,
+                                  VideoOutBufferSnapshot* metadata = nullptr);
+
+} // namespace prosper
+
 namespace prosper::gpu {
 
 enum class PresentSource : uint8_t { None, Rendered, RawScanout };
