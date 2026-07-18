@@ -2776,8 +2776,12 @@ namespace {
 
                 size_t private_unmapped = 0;
                 for (const PrivateUnmapTarget& target : private_targets) {
+                    // The notification API invalidates every overlapping AliasRange rather than
+                    // splitting one. Remove the complete private allocation deliberately, then
+                    // rebuild retained tracked slices after a successful partial decommit (or the
+                    // complete allocation if the host operation fails).
                     host::guest_write_watch_notify_direct_mapping_removed(
-                        target.cut_base, target.cut_size);
+                        target.view.base, target.view.size);
                     const bool released = target.whole
                         ? VirtualFree(
                               reinterpret_cast<void*>(
@@ -2798,15 +2802,23 @@ namespace {
                                          "[memhle] fatal: partial private-placeholder unmap\n");
                             std::abort();
                         }
-                        notify_private_watch_added(
-                            {target.cut_base, target.cut_size});
+                        notify_private_watch_added(target.view);
                         rollback_guest();
                         rollback_views();
                         return false;
                     }
-                    if (target.whole)
+                    if (target.whole) {
                         remember_free_placeholder_locked(
                             target.view.base, target.view.size);
+                    } else {
+                        if (target.view.base < target.cut_base)
+                            notify_private_watch_added(
+                                {target.view.base, target.cut_base - target.view.base});
+                        const uint64_t cut_end = target.cut_base + target.cut_size;
+                        const uint64_t view_end = target.view.base + target.view.size;
+                        if (cut_end < view_end)
+                            notify_private_watch_added({cut_end, view_end - cut_end});
+                    }
                     ++private_unmapped;
                 }
 

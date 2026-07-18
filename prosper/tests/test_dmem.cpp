@@ -9,6 +9,7 @@
 #ifdef _WIN32
 #include "../src/host/exec_image.hpp"
 #include "../src/host/guest_memory_map.hpp"
+#include "../src/host/guest_write_watch.hpp"
 #include "../src/gpu/gpu_execute.hpp"
 #include <windows.h>
 extern "C" int prosper_try_commit_dmem(uint64_t addr, uint64_t len, int write);
@@ -111,6 +112,13 @@ int main() {
               *(volatile uint64_t*)(uintptr_t)(flexible_base + 0xc100) ==
                   0x5555eeeeffff6666ull,
               "partial flexible unmap preserves neighboring contents");
+        auto flexible_prefix_watch = host::GuestWriteWatch::create(flexible_base, 0x4000);
+        auto flexible_suffix_watch = host::GuestWriteWatch::create(
+            flexible_base + 0xc000, 0x4000);
+        CHECK(flexible_prefix_watch && flexible_suffix_watch &&
+                  flexible_prefix_watch.query() == host::GuestWriteWatchQuery::Unchanged &&
+                  flexible_suffix_watch.query() == host::GuestWriteWatchQuery::Unchanged,
+              "partial flexible unmap rebuilds retained write-watch aliases");
         uint64_t flexible_hole = flexible_base + 0x4000;
         const bool flexible_hole_mapped =
             flexible((uint64_t)(uintptr_t)&flexible_hole, 0x4000, 0x2, 0,
