@@ -157,14 +157,15 @@ int main() {
               scalar_capture.computes[0].resources.resources.empty(),
           "#636: capture ignores unconsumed descriptor-looking scalar arguments");
 
-    // v17 appends scissor state without changing the legacy pipeline prefix. Removing this one-draw,
-    // zero-failure tail produces a byte-exact v16 capture whose missing state means full target.
+    // v17 appends scissor state without changing the legacy pipeline prefix. Remove v18's one-draw
+    // geometry index first, then the v17 tail, to recover a byte-exact v16 capture.
     std::vector<uint8_t> v16_scissor_bytes;
     GpuCaptureFile v16_scissor_loaded;
     CHECK(serialize_gpu_capture(captured, v16_scissor_bytes, error) &&
               v16_scissor_bytes.size() >= 25,
           "v17 capture serializes effective guest scissor state");
     if (v16_scissor_bytes.size() >= 25) {
+        v16_scissor_bytes.resize(v16_scissor_bytes.size() - 8); // v18 draw count + no-GS sentinel
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 25);
         v16_scissor_bytes[8] = 16;
         v16_scissor_bytes[9] = v16_scissor_bytes[10] = v16_scissor_bytes[11] = 0;
@@ -306,6 +307,7 @@ int main() {
           "writer rejects an out-of-bounds DCC metadata reference");
     CHECK(serialize_gpu_capture(volume_capture, volume_bytes, error),
           "recreated valid v12 DCC bytes after malformed-reference check");
+    volume_bytes.resize(volume_bytes.size() - 8); // v18 draw count + no-GS sentinel
     volume_bytes.resize(volume_bytes.size() - 25); // v17 one-draw scissor tail, zero failures
     volume_bytes.resize(volume_bytes.size() - 21); // v16 count plus one 17-byte mip-tail state
     volume_bytes.resize(volume_bytes.size() - 5); // v15 count plus one depth-compare flag
@@ -709,11 +711,12 @@ int main() {
     GpuCaptureFile legacy_source = captured; legacy_source.ds_seeds.clear();
     std::vector<uint8_t> legacy_bytes;
     CHECK(serialize_gpu_capture(legacy_source, legacy_bytes, error) && legacy_bytes.size() >= 32,
-          "created a diagnostic-free v17 payload for legacy-reader fixtures");
+          "created a diagnostic-free v18 payload for legacy-reader fixtures");
     std::vector<uint8_t> v13_bytes = legacy_bytes;
     if (v13_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        v13_bytes.resize(v13_bytes.size() - 8); // v18 draw count + no-GS sentinel
         v13_bytes.resize(v13_bytes.size() - 25); // v17 one-draw scissor tail, zero failures
         v13_bytes.resize(v13_bytes.size() - (4 + 17 * legacy_resource_count));
         v13_bytes.resize(v13_bytes.size() - (4 + legacy_resource_count));
@@ -731,6 +734,7 @@ int main() {
     if (legacy_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        legacy_bytes.resize(legacy_bytes.size() - 8); // v18 draw count + no-GS sentinel
         legacy_bytes.resize(legacy_bytes.size() - 25); // v17 one-draw scissor tail, zero failures
         legacy_bytes.resize(legacy_bytes.size() - (4 + 17 * legacy_resource_count));
         legacy_bytes.resize(legacy_bytes.size() - (4 + legacy_resource_count));
@@ -774,9 +778,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 18;
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 19;
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 18",
+          error == "unsupported capture version 19",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

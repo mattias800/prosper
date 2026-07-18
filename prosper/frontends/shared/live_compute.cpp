@@ -17,6 +17,7 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -35,6 +36,7 @@ uint8_t storage_pack_unorm8(uint32_t float_bits) {
 namespace {
 
 constexpr VkDeviceSize kMaxComputeImageBytes = 256ull << 20;
+constexpr size_t kMaxCachedComputePipelines = 4096;
 
 struct ComputeMemoryKey {
     VkDeviceSize bytes = 0;
@@ -70,6 +72,13 @@ struct ComputeMemoryPoolStats {
     uint64_t discarded = 0;
 };
 
+struct CachedComputePipeline {
+    VkDescriptorSetLayout descriptor_layout = VK_NULL_HANDLE;
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+};
+
 bool compute_memory_pool_enabled() {
     static const bool enabled = std::getenv("PROSPER_NO_MEMORY_POOL") == nullptr;
     return enabled;
@@ -90,6 +99,8 @@ struct VulkanComputeContext {
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
+    VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
+    std::unordered_map<std::string, CachedComputePipeline> pipelines;
     uint32_t queue_family = UINT32_MAX;
     VkPhysicalDeviceMemoryProperties memory{};
     ComputeMemoryPool memory_pool;
@@ -101,6 +112,16 @@ struct VulkanComputeContext {
 
     ~VulkanComputeContext() {
         release_cached_memory();
+        for (const auto& [key, cached] : pipelines) {
+            (void)key;
+            if (cached.pipeline) vkDestroyPipeline(device, cached.pipeline, nullptr);
+            if (cached.pipeline_layout)
+                vkDestroyPipelineLayout(device, cached.pipeline_layout, nullptr);
+            if (cached.shader) vkDestroyShaderModule(device, cached.shader, nullptr);
+            if (cached.descriptor_layout)
+                vkDestroyDescriptorSetLayout(device, cached.descriptor_layout, nullptr);
+        }
+        if (pipeline_cache) vkDestroyPipelineCache(device, pipeline_cache, nullptr);
         if (device) vkDestroyDevice(device, nullptr);
         if (instance) vkDestroyInstance(instance, nullptr);
     }
@@ -252,6 +273,9 @@ struct VulkanComputeContext {
 #endif
         if (vkCreateDevice(physical, &dci, nullptr, &device) != VK_SUCCESS) return false;
         vkGetDeviceQueue(device, queue_family, 0, &queue);
+        VkPipelineCacheCreateInfo pcci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        if (vkCreatePipelineCache(device, &pcci, nullptr, &pipeline_cache) != VK_SUCCESS)
+            return false;
         vkGetPhysicalDeviceMemoryProperties(physical, &memory);
         return true;
     }
@@ -461,6 +485,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     VkShaderModule shader = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    bool pipeline_cached = false;
+    std::string pipeline_key;
     VkCommandPool command_pool = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     bool ok = false;
@@ -479,11 +505,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     auto cleanup = [&] {
         if (fence) vkDestroyFence(ctx.device, fence, nullptr);
         if (command_pool) vkDestroyCommandPool(ctx.device, command_pool, nullptr);
-        if (pipeline) vkDestroyPipeline(ctx.device, pipeline, nullptr);
-        if (pipeline_layout) vkDestroyPipelineLayout(ctx.device, pipeline_layout, nullptr);
-        if (shader) vkDestroyShaderModule(ctx.device, shader, nullptr);
+        if (!pipeline_cached) {
+            if (pipeline) vkDestroyPipeline(ctx.device, pipeline, nullptr);
+            if (pipeline_layout) vkDestroyPipelineLayout(ctx.device, pipeline_layout, nullptr);
+            if (shader) vkDestroyShaderModule(ctx.device, shader, nullptr);
+            if (descriptor_layout)
+                vkDestroyDescriptorSetLayout(ctx.device, descriptor_layout, nullptr);
+        }
         if (descriptor_pool) vkDestroyDescriptorPool(ctx.device, descriptor_pool, nullptr);
-        if (descriptor_layout) vkDestroyDescriptorSetLayout(ctx.device, descriptor_layout, nullptr);
         for (auto& buffer : buffers) {
             if (buffer.alias_of != SIZE_MAX) continue;
             if (buffer.buffer) vkDestroyBuffer(ctx.device, buffer.buffer, nullptr);
@@ -1219,11 +1248,34 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             b.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
             layout_bindings.push_back(b);
         }
-        VkDescriptorSetLayoutCreateInfo dlci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        dlci.bindingCount = static_cast<uint32_t>(layout_bindings.size());
-        dlci.pBindings = layout_bindings.data();
-        if (!vk_ok(vkCreateDescriptorSetLayout(ctx.device, &dlci, nullptr, &descriptor_layout),
-                   "descriptor-layout")) break;
+        pipeline_key.clear();
+        auto append_pipeline_key_u32 = [&](uint32_t value) {
+            pipeline_key.append(reinterpret_cast<const char*>(&value), sizeof(value));
+        };
+        append_pipeline_key_u32(static_cast<uint32_t>(item.spirv.size()));
+        pipeline_key.append(reinterpret_cast<const char*>(item.spirv.data()),
+                            item.spirv.size() * sizeof(uint32_t));
+        append_pipeline_key_u32(static_cast<uint32_t>(item.user_sgprs.size()));
+        append_pipeline_key_u32(static_cast<uint32_t>(layout_bindings.size()));
+        for (const auto& binding : layout_bindings) {
+            append_pipeline_key_u32(binding.binding);
+            append_pipeline_key_u32(static_cast<uint32_t>(binding.descriptorType));
+            append_pipeline_key_u32(binding.descriptorCount);
+            append_pipeline_key_u32(binding.stageFlags);
+        }
+        if (const auto found = ctx.pipelines.find(pipeline_key); found != ctx.pipelines.end()) {
+            descriptor_layout = found->second.descriptor_layout;
+            shader = found->second.shader;
+            pipeline_layout = found->second.pipeline_layout;
+            pipeline = found->second.pipeline;
+            pipeline_cached = true;
+        } else {
+            VkDescriptorSetLayoutCreateInfo dlci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            dlci.bindingCount = static_cast<uint32_t>(layout_bindings.size());
+            dlci.pBindings = layout_bindings.data();
+            if (!vk_ok(vkCreateDescriptorSetLayout(ctx.device, &dlci, nullptr, &descriptor_layout),
+                       "descriptor-layout")) break;
+        }
         uint32_t sampled_count = 0, storage_image_count = 0;
         for (const auto& im : images) (im.storage ? storage_image_count : sampled_count)++;
         VkDescriptorPoolSize pool_sizes[3]; uint32_t pool_size_count = 0;
@@ -1272,25 +1324,40 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
         vkUpdateDescriptorSets(ctx.device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
-        VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        smci.codeSize = item.spirv.size() * sizeof(uint32_t);
-        smci.pCode = item.spirv.data();
-        if (!vk_ok(vkCreateShaderModule(ctx.device, &smci, nullptr, &shader), "shader-module")) break;
-        VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        plci.setLayoutCount = 1;
-        plci.pSetLayouts = &descriptor_layout;
-        if (!vk_ok(vkCreatePipelineLayout(ctx.device, &plci, nullptr, &pipeline_layout),
-                   "pipeline-layout")) break;
-        VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        cpci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        cpci.stage.module = shader;
-        cpci.stage.pName = "main";
-        cpci.layout = pipeline_layout;
-        if (trace) std::fprintf(stderr, "[compute]   creating compute pipeline\n");
-        if (!vk_ok(vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeline),
-                   "compute-pipeline")) break;
-        if (trace) std::fprintf(stderr, "[compute]   compute pipeline ready\n");
+        if (!pipeline_cached) {
+            VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            smci.codeSize = item.spirv.size() * sizeof(uint32_t);
+            smci.pCode = item.spirv.data();
+            if (!vk_ok(vkCreateShaderModule(ctx.device, &smci, nullptr, &shader), "shader-module"))
+                break;
+            VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            plci.setLayoutCount = 1;
+            plci.pSetLayouts = &descriptor_layout;
+            VkPushConstantRange push_range{};
+            if (!item.user_sgprs.empty()) {
+                push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+                push_range.size = static_cast<uint32_t>(item.user_sgprs.size() * sizeof(uint32_t));
+                plci.pushConstantRangeCount = 1;
+                plci.pPushConstantRanges = &push_range;
+            }
+            if (!vk_ok(vkCreatePipelineLayout(ctx.device, &plci, nullptr, &pipeline_layout),
+                       "pipeline-layout")) break;
+            VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            cpci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            cpci.stage.module = shader;
+            cpci.stage.pName = "main";
+            cpci.layout = pipeline_layout;
+            if (trace) std::fprintf(stderr, "[compute]   creating compute pipeline\n");
+            if (!vk_ok(vkCreateComputePipelines(ctx.device, ctx.pipeline_cache, 1, &cpci, nullptr,
+                                                &pipeline), "compute-pipeline")) break;
+            if (trace) std::fprintf(stderr, "[compute]   compute pipeline ready\n");
+            if (ctx.pipelines.size() < kMaxCachedComputePipelines) {
+                ctx.pipelines.emplace(std::move(pipeline_key), CachedComputePipeline{
+                    descriptor_layout, shader, pipeline_layout, pipeline});
+                pipeline_cached = true;
+            }
+        }
         phase_pipeline = ComputeClock::now();
 
         VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -1341,6 +1408,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout,
                                 0, 1, &descriptor_set, 0, nullptr);
+        if (!item.user_sgprs.empty())
+            vkCmdPushConstants(command, pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                               static_cast<uint32_t>(item.user_sgprs.size() * sizeof(uint32_t)),
+                               item.user_sgprs.data());
         vkCmdDispatch(command, item.launch.groups_x, item.launch.groups_y, item.launch.groups_z);
         // Storage images: copy the written texels back into the staging buffer for guest writeback.
         for (size_t i = 0; i < images.size(); i++) {

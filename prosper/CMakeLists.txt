@@ -882,6 +882,13 @@ if(UNIX AND NOT APPLE AND PROSPER_VIDEO_VAAPI AND TARGET prosper_core)
       target_link_libraries(boot_trace PRIVATE prosper_video_vaapi)
       target_compile_definitions(boot_trace PRIVATE PROSPER_VIDEO_VAAPI=1)
     endif()
+
+    # Match boot_trace and prosper-app: headless captures must install the real Linux decoder too,
+    # otherwise video-gated titles only expose an empty scanout to the screenshot frontend.
+    if(TARGET screenshot)
+      target_link_libraries(screenshot PRIVATE prosper_video_vaapi)
+      target_compile_definitions(screenshot PRIVATE PROSPER_VIDEO_VAAPI=1)
+    endif()
   else()
     message(WARNING "FFmpeg/libva development packages not found - Linux AvPlayer video disabled")
   endif()

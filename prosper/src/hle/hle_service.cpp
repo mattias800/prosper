@@ -133,9 +133,19 @@ HLE(s_ok)             { return 0; }
 namespace {
 // Guest event callback: void(void* object_ptr, uint32_t event, int32_t source_id, void* data).
 using AvpEventCb = void (PROSPER_SYSV_ABI *)(void*, uint32_t, int32_t, void*);
+// Guest memory callbacks use the PS5/SysV ABI even when the emulator host is Windows.  Keep their
+// types explicit here; calling them as native Windows functions corrupts the argument registers.
+using AvpAllocateCb = void* (PROSPER_SYSV_ABI *)(void*, uint32_t, uint32_t);
+using AvpDeallocateCb = void (PROSPER_SYSV_ABI *)(void*, void*);
 enum : uint32_t { AVP_STOP = 0x01, AVP_READY = 0x02, AVP_PLAY = 0x03, AVP_PAUSE = 0x04, AVP_BUFFERING = 0x05 };
 
-struct AvpMemAllocator  { void* obj; void* allocate; void* deallocate; void* allocate_texture; void* deallocate_texture; };
+struct AvpMemAllocator {
+    void* obj;
+    AvpAllocateCb allocate;
+    AvpDeallocateCb deallocate;
+    AvpAllocateCb allocate_texture;
+    AvpDeallocateCb deallocate_texture;
+};
 struct AvpFileReplace   { void* obj; void* open; void* close; void* read_offset; void* size; };
 struct AvpEventReplace  { void* obj; void* event_callback; };
 struct AvpInitData {                 // sceAvPlayerInit
@@ -155,6 +165,9 @@ struct AvpInitDataEx {               // sceAvPlayerInitEx (note: this_size first
 static_assert(sizeof(AvpThreadInfo) == 48 && sizeof(AvpInitDataEx) == 560 &&
               offsetof(AvpInitDataEx, auto_start) == 116 &&
               offsetof(AvpInitDataEx, num_fb) == 552, "AvPlayerInitDataEx ABI");
+static_assert(sizeof(AvpMemAllocator) == 40 && offsetof(AvpInitData, num_fb) == 104 &&
+              offsetof(AvpInitData, default_language) == 112 && sizeof(AvpInitData) == 120,
+              "AvPlayerInitData ABI");
 struct AvpUri           { const char* name; uint32_t length; };
 struct AvpSourceDetails { AvpUri uri; uint8_t rsv1[64]; uint32_t source_type; uint8_t rsv2[44]; };
 struct AvpFrameInfo {                // sceAvPlayerGetVideoData / GetAudioData out-param
@@ -195,6 +208,8 @@ static_assert(sizeof(AvpStreamInfoEx) == 104 && offsetof(AvpStreamInfoEx, durati
 
 struct AvpPlayer {
     void* ev_obj = nullptr; AvpEventCb ev_cb = nullptr;
+    AvpMemAllocator memory{};
+    int32_t num_fb = 0;
     bool auto_start = false, have_source = false, synthetic = false;
     bool playing = false, paused = false, stop_fired = false;
     std::string guest_path;
@@ -208,18 +223,31 @@ struct AvpPlayer {
     uint64_t poll = 0;               // synthetic frames delivered through GetVideoData[Ex]
     uint64_t audio_poll = 0;
     uint64_t active_poll = 0;        // independent progress for IsActive-only playback loops
-    std::vector<uint8_t> frame;      // synthetic black NV12 buffer (kept alive across GetVideoData)
+    // When the title supplies its AvPlayer texture allocator, decoded NV12 must be written into those
+    // guest-visible buffers.  A host vector is invisible to the title's pre-wired texture descriptors.
+    std::vector<uint8_t*> texture_frames;
+    size_t texture_frame_bytes = 0;
+    size_t next_texture_frame = 0;
+    std::vector<uint8_t> frame;      // fallback for tests/titles with no texture callbacks
     std::vector<int16_t> audio;      // synthetic silent stereo PCM
 };
 std::mutex g_avp_mx;
 std::unordered_map<uint64_t, AvpPlayer> g_avp;
 
-// Native decoders own their dequeue storage and may move or recycle it on the next pull. Never
-// expose that backend lifetime directly to guest code: Astro submits the returned pointer to host
-// memcpy/GPU work that can outlive the backend packet. Keep one size-stable, player-owned staging
-// allocation instead. Its address remains valid until the next pull updates or resizes that
-// player's staging buffer, matching the transient-buffer contract without a dangling backend
-// pointer.
+bool avp_nv12_bytes(uint32_t width, uint32_t height, size_t& bytes) {
+    if (!width || !height || width > SIZE_MAX / height) return false;
+    const size_t y_bytes = static_cast<size_t>(width) * height;
+    const size_t uv_rows = (static_cast<size_t>(height) + 1) / 2;
+    if (width > SIZE_MAX / uv_rows) return false;
+    const size_t uv_bytes = static_cast<size_t>(width) * uv_rows;
+    if (uv_bytes > SIZE_MAX - y_bytes) return false;
+    bytes = y_bytes + uv_bytes;
+    return true;
+}
+
+// Native decoders own their dequeue storage and may move or recycle it on the next pull. Copy the
+// visible NV12 rows into a guest texture buffer when one exists.  The host-vector fallback preserves
+// the old lifetime guarantee for native tests and titles that omit the replacement callbacks.
 bool avp_stage_video(AvpPlayer& player, const prosper::video::VideoFrame& frame,
                      uint8_t*& data, uint32_t& pitch) {
     if (!frame.y || !frame.uv || frame.width == 0 || frame.height == 0) return false;
@@ -227,6 +255,23 @@ bool avp_stage_video(AvpPlayer& player, const prosper::video::VideoFrame& frame,
     const size_t uv_stride = frame.uv_stride ? frame.uv_stride : frame.width;
     if (y_stride < frame.width || uv_stride < frame.width) return false;
     const size_t uv_rows = (static_cast<size_t>(frame.height) + 1) / 2;
+    if (!player.texture_frames.empty()) {
+        size_t bytes = 0;
+        if (!avp_nv12_bytes(frame.width, frame.height, bytes) ||
+            bytes > player.texture_frame_bytes) return false;
+        uint8_t* dst = player.texture_frames[player.next_texture_frame++ %
+                                              player.texture_frames.size()];
+        if (!dst) return false;
+        for (uint32_t row = 0; row < frame.height; ++row)
+            memcpy(dst + static_cast<size_t>(row) * frame.width,
+                   frame.y + static_cast<size_t>(row) * y_stride, frame.width);
+        uint8_t* dst_uv = dst + static_cast<size_t>(frame.width) * frame.height;
+        for (size_t row = 0; row < uv_rows; ++row)
+            memcpy(dst_uv + row * frame.width, frame.uv + row * uv_stride, frame.width);
+        data = dst;
+        pitch = frame.width;
+        return true;
+    }
     if (y_stride > SIZE_MAX / frame.height || uv_stride > SIZE_MAX / uv_rows) return false;
     const size_t y_bytes = y_stride * frame.height;
     const size_t uv_bytes = uv_stride * uv_rows;
@@ -237,6 +282,21 @@ bool avp_stage_video(AvpPlayer& player, const prosper::video::VideoFrame& frame,
     memcpy(player.frame.data() + y_bytes, frame.uv, uv_bytes);
     data = player.frame.data();
     pitch = static_cast<uint32_t>(y_stride);
+    return true;
+}
+
+bool avp_stage_synthetic(AvpPlayer& player, uint8_t*& data) {
+    size_t need = 0;
+    if (!avp_nv12_bytes(player.width, player.height, need)) return false;
+    if (!player.texture_frames.empty()) {
+        if (need > player.texture_frame_bytes) return false;
+        data = player.texture_frames[player.next_texture_frame++ % player.texture_frames.size()];
+        if (!data) return false;
+        memset(data, 0, need);
+        return true;
+    }
+    if (player.frame.size() != need) player.frame.assign(need, 0);
+    data = player.frame.data();
     return true;
 }
 
@@ -279,6 +339,74 @@ struct AvpCallbackGuestFsScope {
 };
 #endif
 
+void* avp_allocate_texture(const AvpMemAllocator& memory, uint32_t align, uint32_t size) {
+    if (!memory.allocate_texture) return nullptr;
+#if defined(_WIN32)
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(prosper_call_guest_sysv4(
+        reinterpret_cast<uint64_t>(memory.allocate_texture),
+        reinterpret_cast<uint64_t>(memory.obj), align, size, 0)));
+#elif defined(__linux__)
+    AvpCallbackGuestFsScope guest_fs(t_avp_callback_guest_fs);
+    return memory.allocate_texture(memory.obj, align, size);
+#else
+    return memory.allocate_texture(memory.obj, align, size);
+#endif
+}
+
+void avp_deallocate_texture(const AvpMemAllocator& memory, void* allocation) {
+    if (!memory.deallocate_texture || !allocation) return;
+#if defined(_WIN32)
+    prosper_call_guest_sysv4(reinterpret_cast<uint64_t>(memory.deallocate_texture),
+                             reinterpret_cast<uint64_t>(memory.obj),
+                             reinterpret_cast<uint64_t>(allocation), 0, 0);
+#elif defined(__linux__)
+    AvpCallbackGuestFsScope guest_fs(t_avp_callback_guest_fs);
+    memory.deallocate_texture(memory.obj, allocation);
+#else
+    memory.deallocate_texture(memory.obj, allocation);
+#endif
+}
+
+void avp_release_textures(const AvpMemAllocator& memory,
+                          const std::vector<uint8_t*>& textures) {
+    for (auto* texture : textures) avp_deallocate_texture(memory, texture);
+}
+
+bool avp_build_textures(const AvpMemAllocator& memory, int32_t requested,
+                        uint32_t width, uint32_t height,
+                        std::vector<uint8_t*>& textures, size_t& texture_bytes) {
+    const bool have_allocate = memory.allocate_texture != nullptr;
+    const bool have_deallocate = memory.deallocate_texture != nullptr;
+    if (!have_allocate && !have_deallocate) return true; // legacy/test fallback
+    if (!have_allocate || !have_deallocate ||
+        !avp_nv12_bytes(width, height, texture_bytes) || texture_bytes > UINT32_MAX)
+        return false;
+
+    // The public API permits a caller-selected framebuffer count.  Zero requests the normal double
+    // buffer; bound hostile values so a malformed guest structure cannot fan out allocations.
+    const int count = std::clamp(requested > 0 ? requested : 2, 2, 16);
+    constexpr uint32_t alignment = 0x100;
+    textures.reserve(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        void* allocation = avp_allocate_texture(memory, alignment,
+                                                static_cast<uint32_t>(texture_bytes));
+        if (!allocation) {
+            avp_release_textures(memory, textures);
+            textures.clear();
+            texture_bytes = 0;
+            return false;
+        }
+        textures.push_back(static_cast<uint8_t*>(allocation));
+    }
+    if (avp_log()) {
+        fprintf(stderr,
+                "[avp] guest texture buffers requested=%d allocated=%d align=%u bytes=%zu first=%p\n",
+                requested, count, alignment, texture_bytes,
+                textures.empty() ? nullptr : textures.front());
+    }
+    return true;
+}
+
 // Fire the guest event callback. Caller MUST NOT hold g_avp_mx (the callback re-enters AvPlayer HLE).
 void avp_fire(void* obj, AvpEventCb cb, uint32_t ev) {
     if (!cb) return;
@@ -301,7 +429,16 @@ HLE(s_avplayer_init) {   // AvPlayerHandle sceAvPlayerInit(AvPlayerInitData*)
     svc_log("sceAvPlayerInit", a0,a1,a2,a3,a4,a5);
     uint64_t h = g_handle.fetch_add(1);
     AvpPlayer p;
-    if (auto* d = (const AvpInitData*)PW(a0)) { p.ev_obj = d->event.obj; p.ev_cb = (AvpEventCb)d->event.event_callback; p.auto_start = d->auto_start != 0; }
+    if (auto* d = (const AvpInitData*)PW(a0)) {
+        p.memory = d->memory; p.num_fb = d->num_fb;
+        p.ev_obj = d->event.obj; p.ev_cb = (AvpEventCb)d->event.event_callback;
+        p.auto_start = d->auto_start != 0;
+        if (avp_log()) fprintf(stderr,
+            "[avp] init memory=%p alloc=%p free=%p texture=%p texture-free=%p num-fb=%d auto=%d\n",
+            p.memory.obj, (void*)p.memory.allocate, (void*)p.memory.deallocate,
+            (void*)p.memory.allocate_texture, (void*)p.memory.deallocate_texture,
+            p.num_fb, (int)p.auto_start);
+    }
     { std::lock_guard<std::mutex> lk(g_avp_mx); g_avp[h] = std::move(p); }
     return h;   // non-NULL SceAvPlayerHandle
 }
@@ -312,7 +449,16 @@ HLE(s_avplayer_initex) {   // s32 sceAvPlayerInitEx(const AvPlayerInitDataEx*, A
     svc_log("sceAvPlayerInitEx", a0,a1,a2,a3,a4,a5);
     uint64_t h = g_handle.fetch_add(1);
     AvpPlayer p;
-    if (auto* d = (const AvpInitDataEx*)PW(a0)) { p.ev_obj = d->event.obj; p.ev_cb = (AvpEventCb)d->event.event_callback; p.auto_start = d->auto_start != 0; }
+    if (auto* d = (const AvpInitDataEx*)PW(a0)) {
+        p.memory = d->memory; p.num_fb = d->num_fb;
+        p.ev_obj = d->event.obj; p.ev_cb = (AvpEventCb)d->event.event_callback;
+        p.auto_start = d->auto_start != 0;
+        if (avp_log()) fprintf(stderr,
+            "[avp] init-ex memory=%p alloc=%p free=%p texture=%p texture-free=%p num-fb=%d auto=%d\n",
+            p.memory.obj, (void*)p.memory.allocate, (void*)p.memory.deallocate,
+            (void*)p.memory.allocate_texture, (void*)p.memory.deallocate_texture,
+            p.num_fb, (int)p.auto_start);
+    }
     { std::lock_guard<std::mutex> lk(g_avp_mx); g_avp[h] = std::move(p); }
     if (a1) *(uint64_t*)PW(a1) = h;
     return 0;
@@ -402,16 +548,25 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
 
     prosper::video::VideoBackend* old_backend = nullptr;
     int old_backend_id = -1;
+    AvpMemAllocator memory{};
+    int32_t requested_textures = 0;
+    std::vector<uint8_t*> old_textures;
     {
         std::lock_guard<std::mutex> lk(g_avp_mx);
         auto it = g_avp.find(handle); if (it == g_avp.end()) return 0x80000000ull;
         AvpPlayer& p = it->second;
         old_backend = p.backend;
         old_backend_id = p.backend_id;
+        memory = p.memory;
+        requested_textures = p.num_fb;
+        old_textures = std::move(p.texture_frames);
+        p.texture_frame_bytes = 0;
+        p.next_texture_frame = 0;
         p.have_source = false; p.synthetic = false; p.playing = false; p.paused = false;
         p.backend = nullptr; p.backend_id = -1;
     }
     if (old_backend && old_backend_id >= 0) old_backend->close(old_backend_id);
+    avp_release_textures(memory, old_textures);
 
     const std::string host_path = resolve_guest_path(guest_path);
     auto* selected_backend = prosper::video::backend();
@@ -433,6 +588,19 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
         return 0x806a0001ull;
     }
 
+    const uint32_t video_width = synthetic ? 1920u : stream.width;
+    const uint32_t video_height = synthetic ? 1080u : stream.height;
+    std::vector<uint8_t*> textures;
+    size_t texture_bytes = 0;
+    if (!avp_build_textures(memory, requested_textures, video_width, video_height,
+                            textures, texture_bytes)) {
+        if (backend_id >= 0) selected_backend->close(backend_id);
+        if (avp_log()) fprintf(stderr,
+            "[avp] source rejected: guest texture allocation failed (%ux%u num-fb=%d)\n",
+            video_width, video_height, requested_textures);
+        return 0x806a0001ull;
+    }
+
     void* obj = nullptr; AvpEventCb cb = nullptr; bool play = false, player_missing = false;
     {
         std::lock_guard<std::mutex> lk(g_avp_mx);
@@ -444,6 +612,9 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
             p.guest_path = guest_path;
             p.have_source = true; p.synthetic = synthetic;
             p.poll = 0; p.audio_poll = 0; p.active_poll = 0; p.paused = false; p.stop_fired = false;
+            p.texture_frames = std::move(textures);
+            p.texture_frame_bytes = texture_bytes;
+            p.next_texture_frame = 0;
             p.backend = backend_id >= 0 ? selected_backend : nullptr;
             p.backend_id = backend_id;
             if (synthetic) {
@@ -461,6 +632,7 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
     }
     if (player_missing) {
         if (backend_id >= 0) selected_backend->close(backend_id);
+        avp_release_textures(memory, textures);
         return 0x80000000ull;
     }
     avp_fire(obj, cb, AVP_READY);
@@ -551,11 +723,12 @@ HLE(s_avp_getvideodata) {
             // Synthetic (headless): a black NV12 frame at the default dimensions.  Advance on
             // frame delivery: Astro Bot never polls IsActive, so an IsActive-only counter made EOF
             // and the STOP event unreachable even though it continuously pulled video frames.
-            size_t need = (size_t)p.width * p.height * 3 / 2;
-            if (p.frame.size() != need) p.frame.assign(need, 0);
-            fi->p_data = p.frame.data(); fi->timestamp = p.poll * 33ull; // ~30fps PTS (ms)
-            fi->d0 = p.width; fi->d1 = p.height; fi->d2 = 0; fi->d3 = 0;
-            p.poll++; result = 1;
+            uint8_t* staged = nullptr;
+            if (avp_stage_synthetic(p, staged)) {
+                fi->p_data = staged; fi->timestamp = p.poll * 33ull; // ~30fps PTS (ms)
+                fi->d0 = p.width; fi->d1 = p.height; fi->d2 = 0; fi->d3 = 0;
+                p.poll++; result = 1;
+            }
         } else if (!p.stop_fired) {
             p.playing = false; p.stop_fired = true; fire_stop = true; obj = p.ev_obj; cb = p.ev_cb;
         }
@@ -595,14 +768,15 @@ HLE(s_avp_getvideodataex) {
                 p.playing = false; p.stop_fired = true; fire_stop = true; obj = p.ev_obj; cb = p.ev_cb;
             }
         } else if (p.synthetic && p.poll < avp_synth_frames()) {
-            size_t need = (size_t)p.width * p.height * 3 / 2;        // synthetic black NV12
-            if (p.frame.size() != need) p.frame.assign(need, 0);
-            fi->p_data = p.frame.data(); fi->timestamp = p.poll * 33ull;
-            fi->details.video = {}; fi->details.video.width = p.width; fi->details.video.height = p.height;
-            fi->details.video.aspect = (float)p.width / (float)p.height; fi->details.video.pitch = p.width;
-            fi->details.video.luma_bd = 8; fi->details.video.chroma_bd = 8;
-            fi->details.video.framerate = p.fps;
-            p.poll++; result = 1;
+            uint8_t* staged = nullptr;
+            if (avp_stage_synthetic(p, staged)) {
+                fi->p_data = staged; fi->timestamp = p.poll * 33ull;
+                fi->details.video = {}; fi->details.video.width = p.width; fi->details.video.height = p.height;
+                fi->details.video.aspect = (float)p.width / (float)p.height; fi->details.video.pitch = p.width;
+                fi->details.video.luma_bd = 8; fi->details.video.chroma_bd = 8;
+                fi->details.video.framerate = p.fps;
+                p.poll++; result = 1;
+            }
         } else if (!p.stop_fired) {
             p.playing = false; p.stop_fired = true; fire_stop = true; obj = p.ev_obj; cb = p.ev_cb;
         }
@@ -651,11 +825,16 @@ HLE(s_avp_stop) {   // s32 sceAvPlayerStop(handle)
     svc_log("sceAvPlayerStop", a0,a1,a2,a3,a4,a5);
     void* obj = nullptr; AvpEventCb cb = nullptr; bool fire_stop = false;
     prosper::video::VideoBackend* backend = nullptr; int backend_id = -1;
+    AvpMemAllocator memory{};
+    std::vector<uint8_t*> textures;
     {
         std::lock_guard<std::mutex> lk(g_avp_mx);
         auto it = g_avp.find(a0); if (it == g_avp.end()) return 0;
         AvpPlayer& p = it->second;
         backend = p.backend; backend_id = p.backend_id;
+        memory = p.memory;
+        textures = std::move(p.texture_frames);
+        p.texture_frame_bytes = 0; p.next_texture_frame = 0;
         p.backend = nullptr; p.backend_id = -1; p.have_source = false; p.synthetic = false;
         if (p.playing && !p.stop_fired) {
             p.playing = false; p.paused = false; p.stop_fired = true;
@@ -663,21 +842,27 @@ HLE(s_avp_stop) {   // s32 sceAvPlayerStop(handle)
         }
     }
     if (backend && backend_id >= 0) backend->close(backend_id);
+    avp_release_textures(memory, textures);
     if (fire_stop) avp_fire(obj, cb, AVP_STOP);
     return 0;
 }
 HLE(s_avp_close) {   // s32 sceAvPlayerClose(handle)
     svc_log("sceAvPlayerClose", a0,a1,a2,a3,a4,a5);
     prosper::video::VideoBackend* backend = nullptr; int backend_id = -1;
+    AvpMemAllocator memory{};
+    std::vector<uint8_t*> textures;
     {
         std::lock_guard<std::mutex> lk(g_avp_mx);
         auto it = g_avp.find(a0);
         if (it != g_avp.end()) {
             backend = it->second.backend; backend_id = it->second.backend_id;
+            memory = it->second.memory;
+            textures = std::move(it->second.texture_frames);
             g_avp.erase(it);
         }
     }
     if (backend && backend_id >= 0) backend->close(backend_id);
+    avp_release_textures(memory, textures);
     return 0;
 }
 
@@ -719,6 +904,7 @@ AVP_CALLBACK_ENTRY(s_avplayer_isactive_entry, s_avplayer_isactive_entry_c, s_avp
 AVP_CALLBACK_ENTRY(s_avp_getvideodata_entry, s_avp_getvideodata_entry_c, s_avp_getvideodata)
 AVP_CALLBACK_ENTRY(s_avp_getvideodataex_entry, s_avp_getvideodataex_entry_c, s_avp_getvideodataex)
 AVP_CALLBACK_ENTRY(s_avp_stop_entry, s_avp_stop_entry_c, s_avp_stop)
+AVP_CALLBACK_ENTRY(s_avp_close_entry, s_avp_close_entry_c, s_avp_close)
 AVP_CALLBACK_ENTRY(s_avp_pause_entry, s_avp_pause_entry_c, s_avp_pause)
 AVP_CALLBACK_ENTRY(s_avp_resume_entry, s_avp_resume_entry_c, s_avp_resume)
 
@@ -1868,10 +2054,11 @@ void register_service_hle() {
     R("sceAvPlayerGetAudioData",   s_avp_getaudiodata);
 #ifdef _WIN32
     R("sceAvPlayerStop",           s_avp_stop);
+    R("sceAvPlayerClose",          s_avp_close);
 #else
     R("sceAvPlayerStop",           s_avp_stop_entry);
+    R("sceAvPlayerClose",          s_avp_close_entry);
 #endif
-    R("sceAvPlayerClose",          s_avp_close);
     // PS5 raw NIDs verified against the 3.20 import stubs. Astro Bot enumerates streams before it
     // consumes GetVideoDataEx; returning the generic unresolved-import zero meant "no streams" and
     // left its logo movie state machine permanently resident even after synthetic EOF.

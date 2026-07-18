@@ -41,6 +41,50 @@ int main() {
     CHECK(c[1] > 0x80 && c[0] < 0x40 && c[2] < 0x40, "center pixel is GREEN (from the recompiled shader)");
     CHECK(k[2] > 0x80 && k[0] < 0x40 && k[1] < 0x40, "corner pixel is the BLUE clear");
 
+    // Astro Bot's early foreground pass exports only R/G (EN=0x3). AMD's EXP contract preserves
+    // disabled destination components; the live executor therefore intersects EN with the Vulkan
+    // pipeline write mask. Prove both the exact rejected shader now recompiles and a partial draw
+    // changes R/G while retaining the BLUE clear's B/A channels.
+    const uint32_t astro_partial_ps[] = {
+        0x7E000280u, 0xF8001803u, 0x00000000u, 0xBF810000u,
+    };
+    CHECK(fragment_color_export_mask(astro_partial_ps, std::size(astro_partial_ps)) == 0x3u,
+          "#825: decoded Astro Bot's MRT0 R/G export-enable mask");
+    CHECK(!recompile_fragment(astro_partial_ps, std::size(astro_partial_ps)).empty(),
+          "#825: recompiled Astro Bot's partial-EN fragment shader");
+
+    const uint32_t astro_ngg_vs[] = {
+        0xBFA00001u, 0x93EAFF03u, 0x00080008u, 0x876BFF03u, 0x000000FFu,
+        0x8F6A8C6Au, 0x887C6A6Bu, 0xBF800000u, 0xBF900009u, 0x906A8803u,
+        0x81EA6A80u, 0x90FE6AC1u, 0xF8000941u, 0x00000000u, 0x81EA0380u,
+        0xBF8CFF0Fu, 0x90FE6AC1u, 0x34040A81u, 0x36060AC2u, 0x7E000280u,
+        0x7E0202F2u, 0x36040482u, 0x4A0606C1u, 0x4A0404C1u, 0x7E060B03u,
+        0x7E040B02u, 0xF80000D4u, 0x00080000u, 0xF80008CFu, 0x01000302u,
+        0xBF810000u,
+    };
+    std::vector<uint32_t> astro_vert = recompile_vertex(astro_ngg_vs, std::size(astro_ngg_vs));
+    CHECK(!astro_vert.empty(),
+          "#825: recompiled Astro Bot NGG shader with ancillary POS1 before mandatory POS0");
+
+    const uint32_t preserve_ps[] = {
+        0x7E0002F2u, 0x7E020280u, // v0=1.0 (R), v1=0.0 (G)
+        0xF8001803u, 0x00000100u, 0xBF810000u,
+    };
+    std::vector<uint32_t> preserve_frag = recompile_fragment(preserve_ps, std::size(preserve_ps));
+    ResolvedPipelineState preserve_state;
+    preserve_state.topology = 3; // VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+    preserve_state.color_write_mask = fragment_color_export_mask(preserve_ps, std::size(preserve_ps));
+    std::vector<uint8_t> preserve_px = prosper::test::render_triangle_rgba(
+        vert, preserve_frag, W, H, &preserve_state);
+    CHECK(preserve_px.size() == (size_t)W * H * 4,
+          "#825: rendered partial-EN fragment shader with its attachment mask");
+    if (preserve_px.size() == (size_t)W * H * 4) {
+        const uint8_t* pc = &preserve_px[((size_t)(H/2) * W + W/2) * 4];
+        printf("  partial-EN center=(%u,%u,%u,%u)\n", pc[0], pc[1], pc[2], pc[3]);
+        CHECK(pc[0] > 0x80 && pc[1] < 0x40 && pc[2] > 0x80 && pc[3] > 0x80,
+              "#825: partial R/G export preserves destination B/A components");
+    }
+
     // DOLL's volume-sampling PS uses ENA=ADDR=0x702: perspective-center occupies v0:v1 and
     // POS_X/Y/Z_FLOAT occupy v2:v4. Export v2 as red; a real FragCoord.x saturates the UNORM target
     // while the old undefined-register fallback exported zero and left the triangle black.

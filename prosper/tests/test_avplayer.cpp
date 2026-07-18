@@ -10,6 +10,7 @@
 #include "../src/hle/nid.hpp"
 #include "../src/hle/video_backend.hpp"
 #include <cstdio>
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -88,11 +89,41 @@ static void set_synthetic_frames(const char* value) {
 
 static uint32_t events[8]{};
 static int event_count = 0;
+static int texture_alloc_count = 0, texture_free_count = 0;
+static uint32_t texture_last_align = 0, texture_last_size = 0;
+static void* texture_expected_object = nullptr;
+static std::vector<void*> texture_allocations;
+
+static void* texture_allocate_host(void* object, uint32_t align, uint32_t size) {
+    if (object != texture_expected_object) return nullptr;
+    void* result = malloc(size);
+    if (!result) return nullptr;
+    memset(result, 0xcc, size);
+    texture_alloc_count++;
+    texture_last_align = align;
+    texture_last_size = size;
+    texture_allocations.push_back(result);
+    return result;
+}
+static void texture_deallocate_host(void* object, void* allocation) {
+    if (object != texture_expected_object || !allocation) return;
+    texture_free_count++;
+    free(allocation);
+}
+
 #ifdef _WIN32
 extern "C" void on_avplayer_event_host(uint32_t event) {
     if (event_count < 8) events[event_count++] = event;
 }
 extern "C" void on_avplayer_event();
+extern "C" void* on_avplayer_texture_allocate_host(void* object, uint32_t align, uint32_t size) {
+    return texture_allocate_host(object, align, size);
+}
+extern "C" void on_avplayer_texture_deallocate_host(void* object, void* allocation) {
+    texture_deallocate_host(object, allocation);
+}
+extern "C" void on_avplayer_texture_allocate();
+extern "C" void on_avplayer_texture_deallocate();
 // Production callbacks are guest SysV functions even in a Windows build.  Keep the test honest by
 // accepting event in SysV RSI, then bridge the one value into a normal Microsoft-x64 C++ helper.
 __asm__(
@@ -104,9 +135,37 @@ __asm__(
     "  callq on_avplayer_event_host\n"
     "  addq $40, %rsp\n"
     "  retq\n");
+// Texture allocation arrives as SysV (RDI object, RSI alignment, RDX size) and is forwarded to the
+// Windows host helper (RCX, RDX, R8).  Deallocation similarly forwards RDI/RSI to RCX/RDX.
+__asm__(
+    ".text\n"
+    ".globl on_avplayer_texture_allocate\n"
+    "on_avplayer_texture_allocate:\n"
+    "  movq %rdx, %r8\n"
+    "  movl %esi, %edx\n"
+    "  movq %rdi, %rcx\n"
+    "  subq $40, %rsp\n"
+    "  callq on_avplayer_texture_allocate_host\n"
+    "  addq $40, %rsp\n"
+    "  retq\n"
+    ".globl on_avplayer_texture_deallocate\n"
+    "on_avplayer_texture_deallocate:\n"
+    "  movq %rsi, %rdx\n"
+    "  movq %rdi, %rcx\n"
+    "  subq $40, %rsp\n"
+    "  callq on_avplayer_texture_deallocate_host\n"
+    "  addq $40, %rsp\n"
+    "  retq\n");
 #else
 static void PROSPER_SYSV_ABI on_avplayer_event(void*, uint32_t event, int32_t, void*) {
     if (event_count < 8) events[event_count++] = event;
+}
+static void* PROSPER_SYSV_ABI on_avplayer_texture_allocate(void* object, uint32_t align,
+                                                           uint32_t size) {
+    return texture_allocate_host(object, align, size);
+}
+static void PROSPER_SYSV_ABI on_avplayer_texture_deallocate(void* object, void* allocation) {
+    texture_deallocate_host(object, allocation);
 }
 #endif
 
@@ -170,10 +229,22 @@ int main() {
 
     fake.fail_open = false;
     event_count = 0;
-    uint64_t native_handle = init((uint64_t)(uintptr_t)&data, 0, 0, 0, 0, 0);
+    texture_alloc_count = texture_free_count = 0;
+    texture_allocations.clear();
+    int texture_object = 0x1234;
+    texture_expected_object = &texture_object;
+    AvpInitData texture_data = data;
+    texture_data.memory.obj = texture_expected_object;
+    texture_data.memory.allocate_texture = (void*)&on_avplayer_texture_allocate;
+    texture_data.memory.deallocate_texture = (void*)&on_avplayer_texture_deallocate;
+    texture_data.num_fb = 3;
+    uint64_t native_handle = init((uint64_t)(uintptr_t)&texture_data, 0, 0, 0, 0, 0);
     const char native_source[] = "movie.mp4";
     CHECK(add(native_handle, (uint64_t)(uintptr_t)native_source, 0, 0, 0, 0) == 0,
           "native source opens through the registered backend");
+    CHECK(texture_alloc_count == 3 && texture_last_align == 0x100 &&
+              texture_last_size == fake.nv12.size(),
+          "native source allocates the requested guest NV12 texture ring");
     CHECK(fake.opened_path == "C:/prosper-test-app0/movie.mp4",
           "native backend receives the resolved host path, not the raw relative guest path");
     CHECK(streams(native_handle, 0, 0, 0, 0, 0) == 2,
@@ -192,9 +263,11 @@ int main() {
     AvpFrameInfoEx native_frame{};
     CHECK(video(native_handle, (uint64_t)(uintptr_t)&native_frame, 0, 0, 0, 0) == 1 &&
               native_frame.data && native_frame.data != fake.nv12.data() &&
+              std::find(texture_allocations.begin(), texture_allocations.end(), native_frame.data) !=
+                  texture_allocations.end() &&
               native_frame.timestamp == 16 &&
               memcmp(native_frame.data, fake.nv12.data(), fake.nv12.size()) == 0,
-          "native decoded NV12 frame is copied into player-owned guest staging");
+          "native decoded NV12 frame is copied into caller-owned guest texture staging");
     fake.nv12[0] = 0x7f;
     CHECK(static_cast<const uint8_t*>(native_frame.data)[0] == 0x40,
           "guest frame storage remains independent when the backend recycles its packet");
@@ -212,7 +285,8 @@ int main() {
               event_count == 3,
           "completed audio-bearing playback stays inactive without repeating STOP");
     close(native_handle, 0, 0, 0, 0, 0);
-    CHECK(fake.close_count == 1, "Close releases the native decode session");
+    CHECK(fake.close_count == 1 && texture_free_count == 3,
+          "Close releases the native decode session and every guest texture");
     prosper::video::set_backend(nullptr);
 
     // One delivered synthetic frame, then EOF on the next pull. Astro Bot follows this path and does

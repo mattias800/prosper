@@ -59,6 +59,7 @@ struct GpuCapturedTable {
 
 struct GpuCapturedDraw {
     std::vector<uint32_t> vs;
+    std::vector<uint32_t> gs;
     std::vector<uint32_t> fs;
     ResolvedPipelineState ps;
     GpuCapturedTable vrt;

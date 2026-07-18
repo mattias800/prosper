@@ -1803,6 +1803,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     const auto& it = *itp;
                     prosper::test::BackendDraw bd;
                     bd.vs     = refvs ? refvs_spv : it.vs;
+                    bd.gs     = refvs ? std::vector<uint32_t>{} : it.gs;
                     // File and synthetic overrides have independent exact-match gates.
                     bool fs_ov = !ps_override.empty();
                     if (fs_ov && ps_override_is_file) {
@@ -2020,10 +2021,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             for (const auto* src : pass) {
                                 adjusted.push_back(*src);
                                 auto& item = adjusted.back();
-                                if (item.ps.has_viewport) {
-                                    item.ps.viewport_x *= ax; item.ps.viewport_w *= ax;
-                                    item.ps.viewport_y *= ay; item.ps.viewport_h *= ay;
-                                }
+                                prosper::gpu::scale_resolved_render_area(item.ps, ax, ay);
                                 render_pass.push_back(&item);
                             }
                         }

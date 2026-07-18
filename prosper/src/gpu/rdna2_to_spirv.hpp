@@ -75,6 +75,35 @@ struct PixelSystemInputMapping {
     bool operator==(const PixelSystemInputMapping&) const = default;
 };
 
+// Portable lowering contract for GFX10's explicit pixel-interpolation parameters. AMD hardware can
+// expose P0/P10/P20 directly to v_interp_mov; Vulkan only has an equivalent fragment extension on a
+// subset of devices. When `requires_geometry` is true, the renderer inserts the generated geometry
+// stage returned by recompile_interpolation_geometry(). It passes ordinary smooth attributes through
+// and publishes P0, P10=(P1-P0), P20=(P2-P0), plus any requested barycentric system inputs, as a
+// packed interface understood by recompile_fragment(). Locations are capped at Vulkan's portable
+// 128-component fragment-input minimum (32 vec4 locations); `valid == false` keeps overflow visible.
+struct FragmentInterpolationLayout {
+    static constexpr uint32_t kUnusedLocation = UINT32_MAX;
+    std::array<std::array<uint32_t, 3>, 32> parameter_locations{}; // [attr][0=P10,1=P20,2=P0]
+    std::array<uint32_t, 7> system_locations{};                    // PS system fields 0..6
+    uint32_t attribute_mask = 0;                                  // attributes consumed by VINTRP
+    uint32_t smooth_mask = 0;                                     // attributes consumed by P1/P2
+    bool requires_geometry = false;
+    bool valid = true;
+
+    FragmentInterpolationLayout();
+};
+
+FragmentInterpolationLayout fragment_interpolation_layout(
+    const uint32_t* code, size_t dwords,
+    const PixelSystemInputMapping* system_inputs = nullptr);
+
+// Generate the descriptor-free triangle geometry stage described above. Returns {} when no fallback
+// is required or the packed interface is invalid. Triangle lists, strips, fans, and the RectList
+// triangle-strip lowering all feed Vulkan's `Triangles` geometry input primitive.
+std::vector<uint32_t> recompile_interpolation_geometry(
+    const FragmentInterpolationLayout& layout);
+
 // Translate a straight-line float-VALU RDNA2 stream to a compute-shader SPIR-V module.
 // Returns {} if the stream contains an opcode/format this stage does not yet handle. An optional
 // ShaderResourceTable routes SMEM constant-buffer loads to distinct bindings via descriptor provenance.
@@ -85,8 +114,8 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
                                      uint32_t num_inputs, uint32_t out_vgpr,
                                      const ShaderResourceTable* rt = nullptr, uint32_t lds_bytes = 0);
 
-// Register and launch state for a real compute program. User SGPR values are baked into the module
-// for one retained dispatch; enabled system SGPRs follow them in hardware order. TIDIG_COMP_CNT
+// Register and launch state for a real compute program. User SGPR values are supplied as one
+// push-constant dword per register; enabled system SGPRs follow them in hardware order. TIDIG_COMP_CNT
 // controls whether local IDs seed v0 only (0), v0-v1 (1), or v0-v2 (2+).
 struct ComputeShaderConfig {
     std::vector<uint32_t> user_sgprs;
@@ -116,7 +145,14 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
 std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          const ShaderResourceTable* rt = nullptr,
                                          const PixelSystemInputMapping* system_inputs = nullptr,
-                                         uint32_t pcrel_dispatch_target = UINT32_MAX);
+                                         uint32_t pcrel_dispatch_target = UINT32_MAX,
+                                         const FragmentInterpolationLayout* interpolation = nullptr);
+
+// Packed RGBA component-enable nibbles for the first realized color export to MRT0/MRT1. EXP.EN is
+// an attachment write mask, not a request to source disabled VGPRs; callers intersect this with the
+// fixed-function CB_TARGET_MASK/CB_SHADER_MASK before creating the Vulkan pipeline. This preserves
+// destination channels disabled by a partial export exactly as RDNA2 does.
+uint32_t fragment_color_export_mask(const uint32_t* code, size_t dwords);
 
 // Recompile a vertex shader to a vertex SPIR-V module: v0 = gl_VertexIndex, run the VALU, and on EXP
 // to a POS target write vec4(src0..3) to gl_Position. Returns {} if unsupported / no position export.

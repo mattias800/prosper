@@ -1,6 +1,8 @@
 #include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/gpu_execute.hpp"
 #include "../src/gpu/rdna2_to_spirv.hpp"
+#include "../src/gpu/videoout_present.hpp"
+#include "../src/hle/dispatch.hpp"
 #include "../frontends/shared/live_renderer.hpp"
 
 #include <algorithm>
@@ -46,6 +48,37 @@ static void unset_env(const char* name) {
 int main() {
     std::printf("== test_gpu_capture_render ==\n");
     constexpr uint32_t W = 64, H = 64;
+
+    // Give the renderer a 128x128 guest presentation surface while rendering at 64x64. DrawItems
+    // entering the live callback have therefore already had viewport/scissor coordinates scaled by
+    // one half, exactly like a PROSPER_RENDER_SCALE=2 game run.
+    prosper::register_builtin_hle();
+    present_reset();
+    auto open = prosper::Hle::lookup(prosper::nid_hash("sceVideoOutOpen"));
+    auto setba2 = prosper::Hle::lookup("PjS5uASwcV8");
+    auto regb2 = prosper::Hle::lookup("rKBUtgRrtbk");
+    constexpr uint32_t PRESENT_W = 128, PRESENT_H = 128;
+    std::vector<uint8_t> scanout0(PRESENT_W * PRESENT_H * 4u);
+    std::vector<uint8_t> scanout1(PRESENT_W * PRESENT_H * 4u);
+    std::vector<uint8_t> scanout2(PRESENT_W * PRESENT_H * 4u);
+    uint8_t scanout_attr[0x50]{};
+    struct VideoBuffer { const void* data; const void* metadata; const void* reserved[2]; };
+    VideoBuffer scanouts[3] = {
+        {scanout0.data(), nullptr, {nullptr, nullptr}},
+        {scanout1.data(), nullptr, {nullptr, nullptr}},
+        {scanout2.data(), nullptr, {nullptr, nullptr}},
+    };
+    const uint64_t video_handle = open ? open(0, 0, 0, 0, 0, 0) : 0;
+    if (setba2)
+        setba2(reinterpret_cast<uint64_t>(scanout_attr), 0x8000000000000000ull,
+               0, PRESENT_W, PRESENT_H, 0);
+    const uint64_t register_result = regb2
+        ? regb2(video_handle, 0, 0, reinterpret_cast<uint64_t>(scanouts), 3,
+                reinterpret_cast<uint64_t>(scanout_attr))
+        : UINT64_MAX;
+    CHECK(open && setba2 && regb2 && register_result == 0 &&
+              present_width() == PRESENT_W && present_height() == PRESENT_H,
+          "live-render test configures a reduced-resolution presentation surface");
 
     const uint32_t vs_rdna[] = {
         0x36020081u, 0x2C040081u, 0x7E020D01u, 0x7E040D02u, 0x7E0A02F6u, 0x7E0C02F2u, 0x10020B01u,
@@ -226,6 +259,29 @@ int main() {
         CHECK(center[0] > 0xC0 && center[1] < 0x40 && center[2] < 0x40,
               "later pass samples pixels cached from the 32x2 producer target");
     }
+
+    // A native 32x32 offscreen target receives a scissor that was globally scaled from 32 to 16
+    // for the 128->64 presentation reduction above. The pass-local target correction must undo that
+    // scale for scissors as well as viewports. Otherwise only the target's top-left 16x16 quadrant is
+    // rendered (the exact collapse caught by the Dead Cells gameplay snapshot at render scale 4).
+    DrawItem native_scissor = replay.items[0];
+    native_scissor.color0_base = 0x4f0000;
+    native_scissor.color0_width = 32;
+    native_scissor.color0_height = 32;
+    native_scissor.ps.has_scissor = true;
+    native_scissor.ps.scissor_left = 0;
+    native_scissor.ps.scissor_top = 0;
+    native_scissor.ps.scissor_right = 16;
+    native_scissor.ps.scissor_bottom = 16;
+    std::vector<uint8_t> scissored = render_submit_items({native_scissor}, W, H);
+    bool native_scissor_reaches_lower_right = scissored.size() == 32u * 32u * 4u;
+    if (native_scissor_reaches_lower_right) {
+        const uint8_t* lower_right = &scissored[(24u * 32u + 24u) * 4u];
+        native_scissor_reaches_lower_right =
+            lower_right[0] > 0xc0 && lower_right[1] < 0x40 && lower_right[2] < 0x40;
+    }
+    CHECK(native_scissor_reaches_lower_right,
+          "native offscreen pass undoes the global scale for its guest scissor");
 
     // A simultaneous MRT producer must publish its second attachment under CB_COLOR1_BASE so a later
     // pass can sample it in the same submit. This is DOLL's missing temporal scene dependency (#719).
