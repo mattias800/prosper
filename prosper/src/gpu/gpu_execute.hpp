@@ -202,6 +202,7 @@ ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& dispatc
 
 struct ComputeItem {
     std::vector<uint32_t> spirv;
+    std::vector<uint32_t> user_sgprs;
     std::shared_ptr<ShaderResourceTable> resources;
     ComputeLaunchDimensions launch;
     uint64_t code_addr = 0;

@@ -295,6 +295,8 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   and deliberately unaffected behavior, record risks, and list the exact build/test/snapshot commands and
   results. PRs that advance a game's visible progression must attach representative screenshots and identify
   the title, platform, and reached checkpoint; black or diagnostic-only captures are not progression evidence.
+  Use direct, unmodified frontend captures and name the frontend plus the run route in each caption; output
+  produced by forced guest-state diagnostics may illustrate an investigation but is not acceptance evidence.
   Run the strongest relevant local checks and wait for every applicable required CI check. Before
   merging, synchronize with the live target branch when needed, inspect the resulting diff, run `diff --check`,
   and address every known correctness concern. An agent may merge only when the user or task explicitly

@@ -114,8 +114,8 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
                                      uint32_t num_inputs, uint32_t out_vgpr,
                                      const ShaderResourceTable* rt = nullptr, uint32_t lds_bytes = 0);
 
-// Register and launch state for a real compute program. User SGPR values are baked into the module
-// for one retained dispatch; enabled system SGPRs follow them in hardware order. TIDIG_COMP_CNT
+// Register and launch state for a real compute program. User SGPR values are supplied as one
+// push-constant dword per register; enabled system SGPRs follow them in hardware order. TIDIG_COMP_CNT
 // controls whether local IDs seed v0 only (0), v0-v1 (1), or v0-v2 (2+).
 struct ComputeShaderConfig {
     std::vector<uint32_t> user_sgprs;

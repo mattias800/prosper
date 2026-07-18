@@ -2581,6 +2581,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
         ComputeItem item;
         item.spirv = recompile_compute((const uint32_t*)(uintptr_t)code_addr, 0x10000,
                                        table.get(), config);
+        item.user_sgprs = config.user_sgprs;
         if (!item.spirv.empty() && getenv("PROSPER_SHADER_DUMP_SUCCESS")) {
             const ShaderCompileKey dump_key = make_shader_compile_key(
                 ShaderProgramStage::Compute,

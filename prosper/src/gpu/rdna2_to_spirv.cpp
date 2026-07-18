@@ -68,7 +68,8 @@ enum : uint32_t {
     Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Geometry=3, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17, EM_Triangles=22,
     EM_OutputVertices=26, EM_OutputTriangleStrip=29,
-    SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_Function=7, SC_StorageBuffer=12, FC_None=0,
+    SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_Function=7, SC_PushConstant=9,
+    SC_StorageBuffer=12, FC_None=0,
     Dim_1D=0, Dim_2D=1, Dim_3D=2,   // SPIR-V Dim. (2D coincides with the SQ_RSRC 2D dim value, but distinct.)
     Cap_Sampled1D=43, Cap_Image1D=44,   // Dim=1D needs Sampled1D; a 1D STORAGE image (read/write) also needs Image1D
     Cap_StorageImageMultisample=27,      // MS=1 storage image (read/write a multisampled image)
@@ -118,6 +119,7 @@ struct SpirvCompute {
     uint32_t v_gid=0, v_groupid=0, v_in=0, v_out=0, gidx=0, f_main=0, glsl=0, bconst_false=0;
     uint32_t globalid_comp[3] = {0, 0, 0}, groupid[3] = {0, 0, 0}, localid_comp[3] = {0, 0, 0};
     uint32_t invocation_guard_merge = 0;
+    uint32_t v_push_constants = 0, t_ptr_push_u32 = 0;
     uint32_t linear_localid = 0, local_count = 64, wave_size = 64;
     uint32_t v_cbuf=0, v_cbuf1=0, t_ptr_sb_u32=0;   // scalar-memory constant buffers (bindings 2 and 3)
     std::map<uint32_t, uint32_t> cbuf_var;          // binding -> storage-buffer var (N-buffer model; 2/3 map to v_cbuf/v_cbuf1)
@@ -1057,13 +1059,21 @@ struct SpirvCompute {
         put(code, Op_Store, {p, sel});
     }
     uint32_t btrue() { uint32_t r = id(); put(types, Op_ConstantTrue, {t_bool, r}); return r; }
+    uint32_t load_push_constant(uint32_t index) {
+        uint32_t pointer = id();
+        put(code, Op_AccessChain,
+            {t_ptr_push_u32, pointer, v_push_constants, uconst(0), uconst(index)});
+        uint32_t value = id();
+        put(code, Op_Load, {t_u32, value, pointer});
+        return value;
+    }
     // Logical AND / OR of two bools (EXEC narrowing / saveexec).
     uint32_t land(uint32_t a, uint32_t b_) { uint32_t r = id(); put(code, Op_LogicalAnd, {t_bool, r, a, b_}); return r; }
     uint32_t lor(uint32_t a, uint32_t b_)  { uint32_t r = id(); put(code, Op_LogicalOr,  {t_bool, r, a, b_}); return r; }
 
     void begin(uint32_t input_stride, const ShaderResourceTable* rt = nullptr,
                uint32_t local_x = 64, uint32_t local_y = 1, uint32_t local_z = 1,
-               uint32_t hardware_wave_size = 64) {
+               uint32_t hardware_wave_size = 64, uint32_t push_constant_dwords = 0) {
         stride = input_stride;
         local_count = local_x * local_y * local_z;
         wave_size = hardware_wave_size;
@@ -1096,6 +1106,23 @@ struct SpirvCompute {
         put(types, Op_TypeVector, {t_v3u, t_u32, 3});
         put(types, Op_TypeVector, {t_v4f, t_f32, 4});
         put(types, Op_TypeBool, {t_bool});
+        if (push_constant_dwords) {
+            const uint32_t count = id();
+            put(types, Op_Constant, {t_u32, count, push_constant_dwords});
+            const uint32_t array = id();
+            put(types, Op_TypeArray, {array, t_u32, count});
+            put(deco, Op_Decorate, {array, Dec_ArrayStride, 4});
+            const uint32_t block = id();
+            put(types, Op_TypeStruct, {block, array});
+            put(deco, Op_MemberDecorate, {block, 0, Dec_Offset, 0});
+            put(deco, Op_Decorate, {block, Dec_Block});
+            const uint32_t block_pointer = id();
+            put(types, Op_TypePointer, {block_pointer, SC_PushConstant, block});
+            t_ptr_push_u32 = id();
+            put(types, Op_TypePointer, {t_ptr_push_u32, SC_PushConstant, t_u32});
+            v_push_constants = id();
+            put(types, Op_Variable, {block_pointer, v_push_constants, SC_PushConstant});
+        }
         put(types, Op_TypePointer, {t_ptr_in_v3u, SC_Input, t_v3u});
         put(types, Op_Variable, {t_ptr_in_v3u, v_gid, SC_Input});
         put(types, Op_Variable, {t_ptr_in_v3u, v_groupid, SC_Input});
@@ -7407,7 +7434,8 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const uint32_t local_y = std::max(1u, config.local_y);
     const uint32_t local_z = std::max(1u, config.local_z);
     const uint32_t wave_size = config.wave_size == 32 ? 32u : 64u;
-    b.begin(1, rt, local_x, local_y, local_z, wave_size);
+    b.begin(1, rt, local_x, local_y, local_z, wave_size,
+            static_cast<uint32_t>(config.user_sgprs.size()));
     const bool has_partial_workgroup = config.threads_x % local_x != 0 ||
                                        config.threads_y % local_y != 0 ||
                                        config.threads_z % local_z != 0;
@@ -7432,7 +7460,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
         }
     }
     for (size_t i = 0; i < config.user_sgprs.size(); i++) {
-        const uint32_t value = b.uconst(config.user_sgprs[i]);
+        const uint32_t value = b.load_push_constant(static_cast<uint32_t>(i));
         if (descriptor_sgprs.count(static_cast<uint32_t>(i)))
             rs.sreg_input[static_cast<int>(i)] = value;
         else

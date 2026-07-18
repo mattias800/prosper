@@ -105,6 +105,11 @@ int main() {
         code, sizeof(code) / sizeof(code[0]), &rt, config);
     CHECK(!spirv.empty(), "real Dead Cells compute kernel recompiles");
     if (spirv.empty()) return 1;
+    ComputeShaderConfig alternate_config = config;
+    alternate_config.user_sgprs[4] ^= 0xffffffffu;
+    alternate_config.user_sgprs[7] ^= 0x13579bdfu;
+    CHECK(recompile_compute(code, sizeof(code) / sizeof(code[0]), &rt, alternate_config) == spirv,
+          "per-dispatch user SGPR values do not specialize the reusable SPIR-V module");
 
     auto report = validate_spirv_descriptor_interface(
         spirv, &rt, 0, SpirvShaderStage::Compute);
@@ -119,6 +124,7 @@ int main() {
 
     ComputeItem item;
     item.spirv = spirv;
+    item.user_sgprs = config.user_sgprs;
     item.resources = std::make_shared<ShaderResourceTable>(rt);
     item.launch.threads_x = records;
     item.launch.local_x = 64;
@@ -152,6 +158,22 @@ int main() {
             padded_lanes_untouched &= result[record * 4 + component] == 0xcccccccc;
     CHECK(padded_lanes_untouched,
           "partial workgroup suppresses all 62 padded invocations without a guest bounds check");
+
+    std::fill(result.begin(), result.end(), 0xeeeeeeee);
+    item.user_sgprs = alternate_config.user_sgprs;
+    CHECK(prosper::frontend::execute_live_compute_items({item}),
+          "cached compute pipeline executes with updated user SGPR push constants");
+    const uint32_t alternate_expected[4] = {
+        alternate_config.user_sgprs[4], alternate_config.user_sgprs[5],
+        alternate_config.user_sgprs[6], alternate_config.user_sgprs[7],
+    };
+    bool alternate_filled = true;
+    for (uint32_t record = 0; record < records && alternate_filled; ++record)
+        for (uint32_t component = 0; component < 4; ++component)
+            alternate_filled &= result[record * 4 + component] == alternate_expected[component];
+    CHECK(alternate_filled,
+          "cached compute pipeline observes per-dispatch user SGPR values");
+    item.user_sgprs = config.user_sgprs;
 
     std::vector<uint32_t> replay_owned(launched_records * 4, 0xdddddddd);
     ShaderResource replay_buffer = buffer;
