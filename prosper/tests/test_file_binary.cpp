@@ -58,7 +58,15 @@ int main() {
     register_file_hle();
     HleFn posix_open_fn = Hle::lookup(nid_hash("open"));
     HleFn open_fn = Hle::lookup(nid_hash("sceKernelOpen"));
+    HleFn posix_read_fn = Hle::lookup(nid_hash("read"));
     HleFn read_fn = Hle::lookup(nid_hash("sceKernelRead"));
+    HleFn posix_write_fn = Hle::lookup(nid_hash("write"));
+    HleFn write_fn = Hle::lookup(nid_hash("sceKernelWrite"));
+    HleFn posix_pread_fn = Hle::lookup(nid_hash("pread"));
+    HleFn pread_fn = Hle::lookup(nid_hash("sceKernelPread"));
+    HleFn posix_pwrite_fn = Hle::lookup(nid_hash("pwrite"));
+    HleFn pwrite_fn = Hle::lookup(nid_hash("sceKernelPwrite"));
+    HleFn posix_lseek_fn = Hle::lookup(nid_hash("lseek"));
     HleFn lseek_fn = Hle::lookup(nid_hash("sceKernelLseek"));
     HleFn close_fn = Hle::lookup(nid_hash("sceKernelClose"));
     HleFn dup_fn = Hle::lookup(nid_hash("dup"));
@@ -74,7 +82,9 @@ int main() {
     HleFn fstat_fn = Hle::lookup(nid_hash("sceKernelFstat"));
     HleFn fcntl_fn = Hle::lookup(nid_hash("fcntl"));
     HleFn kernel_fcntl_fn = Hle::lookup(nid_hash("sceKernelFcntl"));
-    CHECK(posix_open_fn && open_fn && read_fn && lseek_fn && close_fn && dup_fn && kernel_dup_fn &&
+    CHECK(posix_open_fn && open_fn && posix_read_fn && read_fn && posix_write_fn && write_fn &&
+              posix_pread_fn && pread_fn && posix_pwrite_fn && pwrite_fn && posix_lseek_fn &&
+              lseek_fn && close_fn && dup_fn && kernel_dup_fn &&
               dup2_fn && kernel_dup2_fn && mkdir_fn && kernel_mkdir_fn && getdents_fn &&
               kernel_getdents_fn && getdirentries_fn && kernel_getdirentries_fn && fstat_fn &&
               fcntl_fn && kernel_fcntl_fn,
@@ -427,6 +437,38 @@ int main() {
           "read preserves binary bytes including CRLF");
     if (fd >= 0 && close_fn) close_fn((uint64_t)fd, 0, 0, 0, 0, 0);
 
+    // libc descriptor I/O reports -1 and errno; the sceKernel siblings return the translated
+    // error directly in their signed 64-bit result. A closed descriptor exercises the same EBADF
+    // contract deterministically on Linux and the secondary Windows host without touching buffers.
+    const uint64_t closed_io_fd = (uint64_t)fd;
+    std::array<uint8_t, 1> io_byte{{0x5a}};
+    auto check_bad_fd_contract = [&](const char* operation, HleFn libc_fn, HleFn kernel_fn,
+                                     uint64_t arg1, uint64_t arg2, uint64_t arg3) {
+        errno = 0;
+        uint64_t libc_result = libc_fn
+            ? libc_fn(closed_io_fd, arg1, arg2, arg3, 0, 0)
+            : 0;
+        const int libc_error = errno;
+        uint64_t kernel_result = kernel_fn
+            ? kernel_fn(closed_io_fd, arg1, arg2, arg3, 0, 0)
+            : 0;
+        const std::string libc_message = std::string("libc ") + operation +
+                                         " retains -1 plus EBADF";
+        const std::string kernel_message = std::string("sceKernel") + operation +
+                                           " returns sign-extended SCE_KERNEL_ERROR_EBADF";
+        CHECK((int64_t)libc_result == -1 && libc_error == EBADF, libc_message.c_str());
+        CHECK(kernel_result == 0xffffffff80020009ull, kernel_message.c_str());
+    };
+    check_bad_fd_contract("Read", posix_read_fn, read_fn,
+                          (uint64_t)(uintptr_t)io_byte.data(), io_byte.size(), 0);
+    check_bad_fd_contract("Write", posix_write_fn, write_fn,
+                          (uint64_t)(uintptr_t)io_byte.data(), io_byte.size(), 0);
+    check_bad_fd_contract("Pread", posix_pread_fn, pread_fn,
+                          (uint64_t)(uintptr_t)io_byte.data(), io_byte.size(), 0);
+    check_bad_fd_contract("Pwrite", posix_pwrite_fn, pwrite_fn,
+                          (uint64_t)(uintptr_t)io_byte.data(), io_byte.size(), 0);
+    check_bad_fd_contract("Lseek", posix_lseek_fn, lseek_fn, 0, SEEK_SET, 0);
+
     // A duplicate is a distinct descriptor for the same open file description: it shares the
     // current offset and remains usable after the original descriptor is closed.
     int64_t dup_source = open_fn
@@ -619,7 +661,8 @@ int main() {
     int64_t invalid_pos = invalid_fd >= 0 && lseek_fn
         ? (int64_t)lseek_fn((uint64_t)invalid_fd, 0, SEEK_CUR, 0, 0, 0)
         : -1;
-    CHECK(invalid_n == -1, "invalid first destination chunk returns EFAULT");
+    CHECK((uint64_t)invalid_n == 0xffffffff8002000eull,
+          "invalid first destination chunk returns SCE_KERNEL_ERROR_EFAULT");
     CHECK(invalid_pos == 0, "failed first destination chunk consumes no file bytes");
     if (invalid_fd >= 0 && close_fn) close_fn((uint64_t)invalid_fd, 0, 0, 0, 0, 0);
     if (invalid_first) VirtualFree(invalid_first, 0, MEM_RELEASE);

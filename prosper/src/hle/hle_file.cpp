@@ -671,11 +671,11 @@ static int host_open_flags(uint64_t f) {
     return h;
 }
 
-// sceKernelOpen returns a FreeBSD/Orbis errno directly, while libc open returns -1 and
-// leaves the host errno for libc to expose.  Most common errno values coincide, but the
-// values after ERANGE diverge on Linux (for example ELOOP and ENAMETOOLONG), so translate
-// the errors open(2) can report instead of copying the host number into an SCE result.
-static uint64_t open_sce_error(int error) {
+// sceKernel filesystem calls return a FreeBSD/Orbis errno directly, while their libc siblings
+// return -1 and leave the host errno for libc to expose. Most common errno values coincide, but
+// the values after ERANGE diverge on Linux (for example ELOOP and ENAMETOOLONG), so translate
+// host errors instead of copying their numbers into an SCE result.
+static uint32_t file_sce_error(int error) {
     int guest_error = 5;  // EIO is the conservative fallback for an unmapped host failure.
     if (error == EPERM) guest_error = 1;
     else if (error == ENOENT) guest_error = 2;
@@ -701,6 +701,7 @@ static uint64_t open_sce_error(int error) {
 #endif
     else if (error == EFBIG) guest_error = 27;
     else if (error == ENOSPC) guest_error = 28;
+    else if (error == ESPIPE) guest_error = 29;
     else if (error == EROFS) guest_error = 30;
     else if (error == EMLINK) guest_error = 31;
     else if (error == EPIPE) guest_error = 32;
@@ -720,7 +721,7 @@ static uint64_t open_sce_error(int error) {
 #ifdef EOVERFLOW
     else if (error == EOVERFLOW) guest_error = 84;
 #endif
-    return 0x80020000ull | (uint64_t)guest_error;
+    return 0x80020000u | (uint32_t)guest_error;
 }
 
 HLE(f_open)  { std::string h = translate(CS(a0)); int host_flags = host_open_flags(a1);
@@ -755,7 +756,7 @@ HLE(f_open)  { std::string h = translate(CS(a0)); int host_flags = host_open_fla
                else errno = err;
                return (uint64_t)(int64_t)fd; }
 HLE(k_open)  { uint64_t result = f_open(a0, a1, a2, a3, a4, a5);
-               return (int64_t)result < 0 ? open_sce_error(errno) : result; }
+               return (int64_t)result < 0 ? file_sce_error(errno) : result; }
 #ifdef __APPLE__
 int getdents_close_fd(int fd);   // #843/#847: atomic cache invalidation + host close
 #endif
@@ -1020,10 +1021,15 @@ static int64_t write_full(int fd, const void* buf, size_t count, bool positioned
 }
 #endif
 HLE(f_read)  { int fd = (int)a0; int64_t off = -1;
+#ifdef _WIN32
+               ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
+#endif
                if (filelog() || fdlog_on()) off = (int64_t)::lseek(fd, 0, SEEK_CUR);
                if (fdlog_on()) preadlog("read", a0, (uint64_t)off, a2);
                auto logged_return = [&](int64_t r) -> uint64_t {
-                   filelog_fd_io("read", fd, off, a2, r, r < 0 ? errno : 0);
+                   const int error = r < 0 ? errno : 0;
+                   filelog_fd_io("read", fd, off, a2, r, error);
+                   if (r < 0) errno = error;
                    return (uint64_t)r;
                };
 #ifndef _WIN32
@@ -1071,11 +1077,13 @@ HLE(f_write) {
 #ifndef _WIN32
                return (uint64_t)write_full((int)a0, P(a1), (size_t)a2, false, 0);
 #else
+               ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
                return (uint64_t)(int64_t)::write((int)a0, P(a1), (size_t)a2);
 #endif
              }
 HLE(f_lseek) { if (fdlog_on() && ((int)a2 != SEEK_CUR || a1 != 0)) preadlog("lseek", a0, a1, (uint64_t)a2);
 #ifdef _WIN32
+               ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
                int64_t directory_result = -1;
                if (windows_seek_directory((int)a0, (int64_t)a1, (int)a2, &directory_result))
                    return (uint64_t)directory_result;
@@ -1083,7 +1091,10 @@ HLE(f_lseek) { if (fdlog_on() && ((int)a2 != SEEK_CUR || a1 != 0)) preadlog("lse
                return (uint64_t)(int64_t)::lseek((int)a0, (off_t)a1, (int)a2); }
 #ifndef _WIN32
 HLE(f_pread)  { preadlog("pread", a0, a3, a2); int64_t r = read_full((int)a0, P(a1), (size_t)a2, true, (off_t)a3);
-                filelog_fd_io("pread", (int)a0, (int64_t)a3, a2, r, r < 0 ? errno : 0); return (uint64_t)r; }
+                const int error = r < 0 ? errno : 0;
+                filelog_fd_io("pread", (int)a0, (int64_t)a3, a2, r, error);
+                if (r < 0) errno = error;
+                return (uint64_t)r; }
 HLE(f_pwrite) { return (uint64_t)write_full((int)a0, P(a1), (size_t)a2, true, (off_t)a3); }
 // Vectored IO — OrbisKernelIovec == host iovec { void* iov_base; size_t iov_len }, and guest pointers are
 // identity-mapped, so the guest iovec array and its buffers pass straight to host (p)readv/(p)writev.
@@ -1102,9 +1113,33 @@ HLE(f_pwritev){ return (uint64_t)(int64_t)::pwritev((int)a0, (const struct iovec
 // position). Full-read/write loop to honor the PS5 regular-file full-count contract (a short read
 // leaves Unity's 64 KB cache block partially filled -> corrupt deserialization). CONFIDENCE: HIGH.
 namespace {
+int windows_io_errno(DWORD error) {
+    switch (error) {
+    case ERROR_INVALID_HANDLE:      return EBADF;
+    case ERROR_ACCESS_DENIED:
+    case ERROR_SHARING_VIOLATION:
+    case ERROR_LOCK_VIOLATION:      return EACCES;
+    case ERROR_INVALID_PARAMETER:
+    case ERROR_INVALID_USER_BUFFER: return EINVAL;
+    case ERROR_NOT_ENOUGH_MEMORY:
+    case ERROR_OUTOFMEMORY:         return ENOMEM;
+    case ERROR_DISK_FULL:
+    case ERROR_HANDLE_DISK_FULL:    return ENOSPC;
+    case ERROR_WRITE_PROTECT:       return EROFS;
+    case ERROR_BROKEN_PIPE:
+    case ERROR_NO_DATA:             return EPIPE;
+    case ERROR_OPERATION_ABORTED:   return EINTR;
+    default:                        return EIO;
+    }
+}
+
 int64_t win_pio(int fd, void* buf, size_t count, uint64_t off, bool write) {
+    ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
     HANDLE h = (HANDLE)(intptr_t)_get_osfhandle(fd);
-    if (h == INVALID_HANDLE_VALUE) return -1;
+    if (h == INVALID_HANDLE_VALUE) {
+        errno = EBADF;
+        return -1;
+    }
     size_t done = 0;
     while (done < count) {
         OVERLAPPED ov; memset(&ov, 0, sizeof ov);
@@ -1115,7 +1150,9 @@ int64_t win_pio(int fd, void* buf, size_t count, uint64_t off, bool write) {
         BOOL ok = write ? WriteFile(h, (const char*)buf + done, want, &n, &ov)
                         : ReadFile(h, (char*)buf + done, want, &n, &ov);
         if (!ok) {
-            if (!write && GetLastError() == ERROR_HANDLE_EOF) break;   // read past EOF -> partial
+            const DWORD error = GetLastError();
+            if (!write && error == ERROR_HANDLE_EOF) break;   // read past EOF -> partial
+            errno = windows_io_errno(error);
             return done ? (int64_t)done : -1;
         }
         if (n == 0) break;   // EOF (read) / no progress (write)
@@ -1127,8 +1164,10 @@ int64_t win_pio(int fd, void* buf, size_t count, uint64_t off, bool write) {
 struct GIovec { void* base; size_t len; };
 } // namespace
 HLE(f_pread)  { int64_t r = win_pio((int)a0, P(a1), (size_t)a2, (uint64_t)a3, false);
-                int err = r < 0 ? (int)GetLastError() : 0;
-                filelog_fd_io("pread", (int)a0, (int64_t)a3, a2, r, err); return (uint64_t)r; }
+                const int error = r < 0 ? errno : 0;
+                filelog_fd_io("pread", (int)a0, (int64_t)a3, a2, r, error);
+                if (r < 0) errno = error;
+                return (uint64_t)r; }
 HLE(f_pwrite) { return (uint64_t)win_pio((int)a0, P(a1), (size_t)a2, (uint64_t)a3, true); }
 HLE(f_readv)  { auto* v = (GIovec*)P(a1); int nc = (int)a2; int64_t tot = 0;
                 for (int i = 0; i < nc; i++) { int64_t r = (int64_t)(int)::read((int)a0, v[i].base, (unsigned)v[i].len);
@@ -1147,6 +1186,20 @@ HLE(f_pwritev){ auto* v = (GIovec*)P(a1); int nc = (int)a2; uint64_t off = (uint
                     if (w < 0) return tot ? (uint64_t)tot : (uint64_t)-1; tot += w; if ((size_t)w < v[i].len) break; }
                 return (uint64_t)tot; }
 #endif
+
+// The ssize_t/off_t-returning sceKernel exports sign-extend their 32-bit SCE error values to 64
+// bits. Their libc siblings retain -1 + errno. Keep separate wrappers so successful byte counts
+// and offsets pass through unchanged while failures preserve the guest ABI on every host.
+static uint64_t kernel_io_result(uint64_t result, int error) {
+    if ((int64_t)result >= 0) return result;
+    return (uint64_t)(int64_t)(int32_t)file_sce_error(error);
+}
+
+HLE(k_read)   { uint64_t r = f_read(a0, a1, a2, a3, a4, a5);   int e = errno; return kernel_io_result(r, e); }
+HLE(k_write)  { uint64_t r = f_write(a0, a1, a2, a3, a4, a5);  int e = errno; return kernel_io_result(r, e); }
+HLE(k_lseek)  { uint64_t r = f_lseek(a0, a1, a2, a3, a4, a5);  int e = errno; return kernel_io_result(r, e); }
+HLE(k_pread)  { uint64_t r = f_pread(a0, a1, a2, a3, a4, a5);  int e = errno; return kernel_io_result(r, e); }
+HLE(k_pwrite) { uint64_t r = f_pwrite(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_io_result(r, e); }
 
 // sceKernelFtruncate(fd, length): resize an open file. Was MISSING -> the return-0 stub faked success
 // without truncating, so the near-universal save idiom "overwrite with fewer bytes, then ftruncate to
@@ -1999,8 +2052,8 @@ void register_file_hle() {
     R("fgetc", f_fgetc);   R("getc", f_fgetc);
     R("open", f_open);     R("close", f_close);   R("read", f_read);     R("write", f_write);
     R("lseek", f_lseek);   R("stat", f_stat);     R("fstat", f_fstat);   R("access", f_access);
-    R("sceKernelOpen", k_open);   R("sceKernelClose", f_close);  R("sceKernelRead", f_read);
-    R("sceKernelWrite", f_write); R("sceKernelLseek", f_lseek);  R("sceKernelStat", f_stat);
+    R("sceKernelOpen", k_open);  R("sceKernelClose", f_close); R("sceKernelRead", k_read);
+    R("sceKernelWrite", k_write); R("sceKernelLseek", k_lseek); R("sceKernelStat", f_stat);
     R("sceKernelFtruncate", f_ftruncate);   // real resize (was fake-success -> corrupt saves)
     R("lstat", f_lstat);   R("sceKernelLstat", f_lstat);     // was MISSING -> uninitialized stat buffer
     R("fsync", f_fsync);   R("sceKernelFsync", f_fsync);     // was fake-success -> no durability
@@ -2013,8 +2066,8 @@ void register_file_hle() {
     R("_lseek", f_lseek);  R("_stat", f_stat);    R("_fstat", f_fstat);  R("_access", f_access);
     R("_pread", f_pread);  R("_pwrite", f_pwrite);
     // directory / unlink (real host ops, /app0-translated)
-    R("pread", f_pread);          R("sceKernelPread", f_pread);
-    R("pwrite", f_pwrite);        R("sceKernelPwrite", f_pwrite);
+    R("pread", f_pread);          R("sceKernelPread", k_pread);
+    R("pwrite", f_pwrite);        R("sceKernelPwrite", k_pwrite);
     R("mkdir", f_mkdir);          R("sceKernelMkdir", f_mkdir);
     R("rmdir", f_rmdir);          R("sceKernelRmdir", f_rmdir);
     R("unlink", f_unlink);        R("sceKernelUnlink", f_unlink);
