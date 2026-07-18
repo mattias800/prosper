@@ -339,6 +339,22 @@ bool audio_store_bytes(uint64_t dst, const void* src, size_t n) {
            written == n;
 #endif
 }
+
+// Fault-safe read from guest memory. Both platform paths require the complete range so callers
+// never consume a partially copied guest structure after an inaccessible-range failure.
+bool audio_read_bytes(uint64_t src, void* dst, size_t n) {
+    if (!src || (!dst && n)) return false;
+    if (!n) return true;
+#ifndef _WIN32
+    struct iovec l { dst, n }, r { (void*)(uintptr_t)src, n };
+    return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)n;
+#else
+    SIZE_T read = 0;
+    return ReadProcessMemory(GetCurrentProcess(), (const void*)(uintptr_t)src, dst, n, &read) &&
+           read == n;
+#endif
+}
+
 bool a2_store_u32(uint64_t dst, uint32_t v) { return audio_store_bytes(dst, &v, sizeof v); }
 bool a2_store_u64(uint64_t dst, uint64_t v) { return audio_store_bytes(dst, &v, sizeof v); }
 bool a2_store_zeros(uint64_t dst, size_t n) {
@@ -569,41 +585,20 @@ std::mutex g_ngs2_zero_mx;
 std::vector<uint8_t> g_ngs2_zeros;
 
 bool ngs2_read_u32(uint64_t src, uint32_t& value) {
-#ifndef _WIN32
-    struct iovec l { &value, sizeof value }, r { (void*)(uintptr_t)src, sizeof value };
-    return src && process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof value;
-#else
-    if (!src) return false;
-    value = *(const uint32_t*)(uintptr_t)src;
-    return true;
-#endif
+    return audio_read_bytes(src, &value, sizeof value);
 }
 
 bool ngs2_read_bytes(uint64_t src, void* dst, size_t size) {
-#ifndef _WIN32
-    struct iovec l { dst, size }, r { (void*)(uintptr_t)src, size };
-    return src && process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size;
-#else
-    if (!src) return false;
-    memcpy(dst, (const void*)(uintptr_t)src, size);
-    return true;
-#endif
+    return audio_read_bytes(src, dst, size);
 }
 
 bool ngs2_zero_bytes(uint64_t dst, size_t size) {
-#ifndef _WIN32
     // Do not use thread_local here: guest execution swaps %fs, and adding host TLS to prosper_core
     // perturbs Messenger before its first syscall. Process-global zero storage is sufficient because
     // NGS2 rendering is serialized by its audio thread; the lock also makes that contract explicit.
     std::lock_guard<std::mutex> lock(g_ngs2_zero_mx);
     if (g_ngs2_zeros.size() < size) g_ngs2_zeros.resize(size, 0);
-    struct iovec l { g_ngs2_zeros.data(), size }, r { (void*)(uintptr_t)dst, size };
-    return dst && process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size;
-#else
-    if (!dst) return false;
-    memset((void*)(uintptr_t)dst, 0, size);
-    return true;
-#endif
+    return audio_store_bytes(dst, g_ngs2_zeros.data(), size);
 }
 
 uint32_t ngs2_max_voices(uint64_t option) {
