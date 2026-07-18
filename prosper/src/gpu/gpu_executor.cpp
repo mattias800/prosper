@@ -1096,6 +1096,15 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         v = val[(size_t)r];
         return true;
     };
+    auto unchanged_seed_range = [&](int first, int count) {
+        if (!untouched_seed_range(first, count)) return false;
+        for (int r = first; r < first + count; ++r) {
+            uint32_t current = 0;
+            if (!known(r, current) ||
+                current != user_sgprs[r - (int)user_sgpr_base]) return false;
+        }
+        return true;
+    };
     // Resolve an ALU source operand to a concrete value (SGPR / inline int / literal / a vcc Special).
     // vcc_lo/hi (106/107) are written by ALU dsts as SGPR 106/107 but read back as Special operands with
     // the same field value, so map them onto the same val[] keys. Other Specials (EXEC/M0/...) stay unknown.
@@ -1442,40 +1451,58 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 break;
             }
             case Rdna2Format::MUBUF: {
-                // Descriptor-table V# use (#273 — the title post-chain PSes' per-lane structured-buffer
-                // fetches): a buffer_load_format_* / buffer_load_dword* whose SRSRC V# was s_loaded from
-                // a keyed table slot. Report it as a kind-1 (buffer) use so the consuming instruction
-                // resolves via its sreg_srt tag -> by_srt_offset — the same key model the s_buffer_loads
-                // use. (The VS vertex-fetch path below is unchanged: by_fetch_pc still wins there.)
+                // Buffer stores, raw loads/stores, and supported atomics need a kind-1 resource use.
+                // Format loads are intentionally handled only by DynFetch below: it snapshots the V#
+                // live at the instruction and resolves by exact pc, avoiding a duplicate stale SRT use.
                 const bool raw_buffer_use =
                     (in.opcode >= 0x08 && in.opcode <= 0x0F) ||
                     (in.opcode >= 0x1C && in.opcode <= 0x1E);
-                if (srt_uses && (in.opcode <= 3 || raw_buffer_use)) {
-                    int srsrc = in.src[1].value;
-                    if (valid_reg(srsrc) && descr_known.test((size_t)srsrc)) {
-                        // Key-less snapshots (an s_buffer_load-fetched V# — a structured-buffer
-                        // descriptor stored INSIDE a constant buffer, DOLL's title post PSes) carry
-                        // the consuming instruction's pc instead; the recompiler resolves those via
-                        // ShaderResource::fetch_pc with the faithful (non-vertex-index) address path.
-                        SrtUse u; u.kind = 1; u.v4 = descr[(size_t)srsrc];
-                        u.key = descr_key_known.test((size_t)srsrc)
-                            ? descr_key[(size_t)srsrc] : 0xFFFFFFFFu;
-                        u.use_pc = in.pc;
-                        srt_uses->push_back(u);
-                    } else if (raw_buffer_use && untouched_seed_range(srsrc, 4)) {
-                        // Direct RAW V#: an untyped MUBUF can consume a V# placed in the initial
-                        // user-data SGPRs without any preceding s_load. This is not a vertex-format
-                        // fetch, so the dyn_vb path below never reports it. Preserve the exact V# as
-                        // a pc-keyed buffer view; treating the same eight SGPRs as a plausible T# can
-                        // otherwise make raw MUBUF resolve to a texture (stride 0), dropping idxen.
-                        SrtUse u; u.kind = 1; u.key = 0xFFFFFFFFu; u.use_pc = in.pc;
-                        for (int k = 0; k < 4; ++k)
-                            u.v4[k] = user_sgprs[srsrc - (int)user_sgpr_base + k];
+                const bool format_store_use = in.opcode >= 0x04 && in.opcode <= 0x07;
+                const bool atomic_buffer_use = in.opcode == 0x38; // buffer_atomic_umax
+                if (srt_uses && (format_store_use || raw_buffer_use || atomic_buffer_use)) {
+                    const int srsrc = in.src[1].value;
+                    std::array<uint32_t, 4> current{};
+                    bool current_known = true;
+                    for (int k = 0; k < 4; ++k)
+                        current_known &= known(srsrc + k, current[(size_t)k]);
+                    const bool loaded_provenance = valid_reg(srsrc) &&
+                                                   descr_known.test((size_t)srsrc);
+                    const bool direct_provenance = unchanged_seed_range(srsrc, 4);
+                    if (current_known && (loaded_provenance || direct_provenance)) {
+                        // Publish the four values LIVE at the consumer. A modeled scalar patch is
+                        // exact; an unmodeled/incompatible write becomes unknown and fails closed
+                        // instead of resurrecting the load-time descriptor snapshot.
+                        SrtUse u; u.kind = 1; u.v4 = current; u.key = 0xFFFFFFFFu; u.use_pc = in.pc;
+                        if (loaded_provenance) {
+                            uint32_t common_key = 0;
+                            bool have_common_key = true;
+                            for (int k = 0; k < 4; ++k) {
+                                const size_t r = (size_t)(srsrc + k);
+                                if (!valid_reg(srsrc + k) || !val_srt_key_known.test(r)) {
+                                    have_common_key = false;
+                                    break;
+                                }
+                                if (k == 0) common_key = val_srt_key[r];
+                                else if (val_srt_key[r] != common_key) {
+                                    have_common_key = false;
+                                    break;
+                                }
+                            }
+                            // Rewrites clear the recompiler's complete sreg_srt tag, so the live V#
+                            // must then resolve through this consuming instruction's exact pc.
+                            if (have_common_key) u.key = common_key;
+                        }
                         DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
+                        const bool format_supported = !format_store_use ||
+                            (d.format != DataFormat::Unknown && d.num_components != 0 &&
+                             !d.forbid_unknown_fallback);
+                        // Byte-addressed raw/atomic V#s validly use stride zero: NUM_RECORDS is bytes.
+                        // Typed format stores retain the strided record requirement.
+                        const bool stride_supported = !format_store_use || d.stride != 0;
                         if (d.base > 0x10000 && d.size_bytes != 0 &&
-                            d.size_bytes <= 0x10000000u && d.stride != 0) {
+                            d.size_bytes <= 0x10000000u && stride_supported && format_supported) {
                             if (trc) fprintf(stderr,
-                                             "[dyntrace] raw MUBUF pc=%u direct V# s%d base=0x%llx "
+                                             "[dyntrace] MUBUF pc=%u live V# s%d base=0x%llx "
                                              "stride=%u size=%u\n",
                                              in.pc, srsrc, (unsigned long long)d.base,
                                              d.stride, d.size_bytes);
@@ -1535,7 +1562,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                 in.pc, desc_v3);
                             return;
                         }
-                        out.push_back({ in.pc, srsrc, with_off(d), desc_v3, from_seed });
+                        DynFetch fetch{ in.pc, srsrc, with_off(d), desc_v3, from_seed };
+                        fetch.unshifted_desc = d;
+                        out.push_back(fetch);
                     };
                     if (trc) fprintf(stderr, "[dyntrace] MUBUF fetch pc=%u op=0x%x SRSRC=s%d patched=%d (k=%d%d%d%d v3=0x%x) have_descr=%d off=+0x%x soff_known=%d\n",
                                      in.pc, in.opcode, srsrc, patched, k0, k1, k2, k3,
@@ -1636,6 +1665,83 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             std::chrono::duration<double, std::milli>(decode_done - fold_start).count(),
             guest_probe_ms);
     return out;
+}
+
+std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
+                                                 const uint32_t* code, size_t dwords,
+                                                 const uint32_t* user_sgprs, uint32_t nsgpr) {
+    std::vector<SrtUse> srt_uses;
+    const std::vector<DynFetch> direct_fetches = resolve_dynamic_fetch(
+        code, dwords, user_sgprs, nsgpr, /*user_sgpr_base*/0, &srt_uses);
+
+    // A format-load resource has one identity: the descriptor live at its exact instruction pc.
+    // Keep its original base because the compute ConstantBuffer address path applies the MUBUF
+    // OFFSET/SOFFSET itself; `fetch.desc` is shifted for graphics' special vertex-index path.
+    for (const auto& fetch : direct_fetches) {
+        const DecodedBufferDescriptor& d = fetch.unshifted_desc;
+        if (d.base <= 0x10000 || d.size_bytes == 0 || d.size_bytes > 0x10000000u ||
+            d.format == DataFormat::Unknown || !d.num_components || d.forbid_unknown_fallback)
+            continue;
+        bool mapped = false;
+        for (auto& r0 : table.resources) {
+            if (r0.cls != ResourceClass::ConstantBuffer || r0.gpu_addr != d.base ||
+                r0.size != d.size_bytes || r0.stride != d.stride || r0.format != d.format ||
+                r0.num_components != d.num_components)
+                continue;
+            if (r0.fetch_pc == 0xFFFFFFFFu) r0.fetch_pc = fetch.fetch_pc;
+            if (r0.fetch_pc == fetch.fetch_pc) { mapped = true; break; }
+        }
+        if (mapped) continue;
+        ShaderResource r;
+        r.cls = ResourceClass::ConstantBuffer;
+        r.format = d.format;
+        r.num_components = d.num_components;
+        r.gpu_addr = d.base;
+        r.size = d.size_bytes;
+        r.stride = d.stride;
+        r.fetch_pc = fetch.fetch_pc;
+        table.resources.push_back(r);
+    }
+
+    std::set<uint64_t> seen;
+    for (const auto& u : srt_uses) {
+        if (u.kind != 1) continue;
+        // Keyed buffer uses dedupe by table offset; key-less live descriptors dedupe by consumer pc.
+        const uint64_t dk = u.key == 0xFFFFFFFFu
+            ? (0x8000000100000000ull | u.use_pc)
+            : (0x0000000100000000ull | u.key);
+        if (!seen.insert(dk).second) continue;
+        bool clash = u.key == 0xFFFFFFFFu;
+        if (!clash)
+            for (const auto& r0 : table.resources)
+                if (r0.srt_offset == u.key) { clash = true; break; }
+
+        const DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
+        if (d.base <= 0x10000 || d.size_bytes == 0 || d.size_bytes > 0x10000000u) continue;
+        if (clash) {
+            bool piggybacked = false;
+            for (auto& r0 : table.resources) {
+                if (r0.cls != ResourceClass::ConstantBuffer || r0.gpu_addr != d.base ||
+                    r0.size != d.size_bytes)
+                    continue;
+                if (r0.fetch_pc == 0xFFFFFFFFu) r0.fetch_pc = u.use_pc;
+                piggybacked = r0.fetch_pc == u.use_pc;
+                if (piggybacked) break;
+            }
+            if (piggybacked) continue;
+        }
+        ShaderResource r;
+        r.cls = ResourceClass::ConstantBuffer;
+        r.format = d.format;
+        r.num_components = d.num_components ? d.num_components : 1;
+        r.gpu_addr = d.base;
+        r.size = d.size_bytes;
+        r.stride = d.stride;
+        r.srt_offset = clash ? 0xFFFFFFFFu : u.key;
+        if (clash) r.fetch_pc = u.use_pc;
+        table.resources.push_back(r);
+    }
+    return srt_uses;
 }
 
 namespace { constexpr uint32_t kPsBindingBase = 32; }
@@ -2302,43 +2408,20 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // (the recompiler's storage path requires ResourceClass::StorageImage), a sampled use a
         // Texture. Never shadow an existing resource at the same srt_offset (first-match-wins).
         {
-            std::vector<SrtUse> srt_uses;
-            resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
-                                  sgprs, kUserSgprs, /*user_sgpr_base*/0, &srt_uses);
+            const std::vector<SrtUse> srt_uses = add_compute_buffer_resources(
+                *table, (const uint32_t*)(uintptr_t)code_addr, shader_dwords,
+                sgprs, kUserSgprs);
             std::set<uint64_t> srt_seen;
             for (const auto& u : srt_uses) {
-                // Dedupe: keyed cbuf uses per key; texture/storage and key-less uses per consuming pc
-                // (distinct namespaces so pc keys never collide with byte-offset keys).
-                uint64_t dk = (u.kind == 0 || u.key == 0xFFFFFFFFu)
-                                  ? (0x8000000000000000ull | ((uint64_t)(uint32_t)u.kind << 32) | u.use_pc)
-                                  : ((uint64_t)(uint32_t)u.kind << 32) | u.key;
+                if (u.kind != 0) continue;                 // buffers were materialized by the shared helper
+                // Texture/storage uses are instruction-specific even when their table keys repeat.
+                const uint64_t dk = 0x8000000000000000ull | u.use_pc;
                 if (!srt_seen.insert(dk).second) continue;
                 bool clash = u.key == 0xFFFFFFFFu;
                 if (!clash)
                     for (const auto& r0 : table->resources)
                         if (r0.srt_offset == u.key) { clash = true; break; }
-                if (u.kind == 1) {                       // constant/structured-buffer V#
-                    DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
-                    if (d.base <= 0x10000 || d.size_bytes == 0 || d.size_bytes > 0x10000000u) continue;
-                    if (clash) {
-                        bool piggybacked = false;
-                        for (auto& r0 : table->resources)
-                            if (r0.cls == ResourceClass::ConstantBuffer &&
-                                r0.gpu_addr == d.base && r0.size == d.size_bytes) {
-                                if (r0.fetch_pc == 0xFFFFFFFFu) r0.fetch_pc = u.use_pc;
-                                piggybacked = r0.fetch_pc == u.use_pc;
-                                if (piggybacked) break;
-                            }
-                        if (piggybacked) continue;
-                    }
-                    ShaderResource r;
-                    r.cls = ResourceClass::ConstantBuffer;
-                    r.format = d.format; r.num_components = d.num_components ? d.num_components : 1;
-                    r.gpu_addr = d.base; r.size = d.size_bytes; r.stride = d.stride;
-                    r.srt_offset = clash ? 0xFFFFFFFFu : u.key;
-                    if (clash) r.fetch_pc = u.use_pc;    // pc-only provenance (key-less/collided V#)
-                    table->resources.push_back(r);
-                } else {                                  // T# — storage image (store) or sampled texture
+                {                                         // T# — storage image (store) or sampled texture
                     DecodedImageDescriptor d = decode_image_descriptor(u.t8.data());
                     if (d.base == 0 || d.width == 0 || d.height == 0 || d.depth == 0 ||
                         d.base_array != 0 ||

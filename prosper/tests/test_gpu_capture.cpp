@@ -1,4 +1,5 @@
 #include "../src/gpu/gpu_capture.hpp"
+#include "../src/gpu/agc_shader_layout.hpp"
 #include "../src/gpu/pm4_registers.hpp"
 #include "../src/gpu/tile.hpp"
 
@@ -118,6 +119,43 @@ int main() {
     CHECK(captured.shader_versions.size() == 2 && captured.operations.size() == 1 &&
           captured.operations[0].source_index == 7 && captured.operations[0].realized,
           "capture indexes unique shaders and retains operation provenance");
+
+    // #636: a descriptor-looking scalar quartet with no matching MUBUF instruction is not a compute
+    // resource. The capture path must therefore neither probe its guest address nor retain a blob.
+    uint32_t scalar_sgprs[32] = {};
+    scalar_sgprs[0] = 0x00100000u;
+    scalar_sgprs[2] = 16u;
+    scalar_sgprs[3] = (2u << 12) | 0xFACu;
+    AgcShaderUserData scalar_user_data{};
+    AgcShaderHeader scalar_header{};
+    scalar_header.file_header = 0x34333231u;
+    scalar_header.version = 0x18;
+    scalar_header.type = 0;
+    scalar_header.user_data = &scalar_user_data;
+    auto scalar_table = std::make_shared<ShaderResourceTable>(
+        build_shader_resources(scalar_header, scalar_sgprs, 32));
+    CHECK(scalar_table->resources.empty(),
+          "#636: scalar-only compute user data produces no capture-table resource");
+    ComputeItem scalar_compute;
+    scalar_compute.spirv = {0x07230203u};
+    scalar_compute.resources = scalar_table;
+    scalar_compute.dispatch_index = 636;
+    scalar_compute.command_order = 636;
+    const std::vector<SubmitOperation> scalar_operations = {
+        {SubmitOperationKind::Dispatch, 636, 636},
+    };
+    size_t scalar_reader_calls = 0;
+    auto scalar_reader = [&](uint64_t, uint8_t*, size_t) -> size_t {
+        ++scalar_reader_calls;
+        return 0;
+    };
+    GpuCaptureFile scalar_capture;
+    CHECK(capture_submit_items({}, {scalar_compute}, scalar_operations, meta,
+                               scalar_reader, scalar_capture, error) &&
+              scalar_reader_calls == 0 && scalar_capture.blobs.empty() &&
+              scalar_capture.computes.size() == 1 &&
+              scalar_capture.computes[0].resources.resources.empty(),
+          "#636: capture ignores unconsumed descriptor-looking scalar arguments");
 
     // v17 appends scissor state without changing the legacy pipeline prefix. Removing this one-draw,
     // zero-failure tail produces a byte-exact v16 capture whose missing state means full target.

@@ -522,6 +522,84 @@ int main() {
           direct_v_uses[0].v4[1] == seed5v[1] && direct_v_uses[0].v4[2] == seed5v[2],
           "direct raw-MUBUF V# preserves base/stride/record dwords");
 
+    // #636: Dead Cells' format-copy compute places its declared source V# at s0 and its otherwise
+    // undeclared destination V# at s4. Resource discovery must follow the two actual MUBUF uses:
+    // the load arrives through DynFetch and the store through a pc-keyed SrtUse. No all-SGPR scan is
+    // needed, and rewriting any destination dword before the store invalidates the seed descriptor.
+    const uint32_t direct_copy[] = {
+        0xE00C2000u, 0x80000100u,   // buffer_load_format_xyzw v[1:4], v0, s[0:3], 0 idxen
+        0xE01C2000u, 0x80010101u,   // buffer_store_format_xyzw v[1:4], v1, s[4:7], 0 idxen
+        0xBF810000u,
+    };
+    const uint32_t direct_copy_seed[8] = {
+        0x00020000u, 0x00040000u, 16u, (2u << 12) | 0xFACu,
+        0x00030000u, 0x00040000u, 16u, (2u << 12) | 0xFACu,
+    };
+    std::vector<SrtUse> direct_copy_uses;
+    const std::vector<DynFetch> direct_copy_fetches = resolve_dynamic_fetch(
+        direct_copy, sizeof(direct_copy) / sizeof(direct_copy[0]),
+        direct_copy_seed, 8, 0, &direct_copy_uses);
+    CHECK(direct_copy_fetches.size() == 1 && direct_copy_fetches[0].fetch_pc == 0 &&
+          direct_copy_fetches[0].srsrc == 0 && direct_copy_fetches[0].desc.base == 0x20000,
+          "#636: direct format-copy source resolves only at its load instruction");
+    CHECK(direct_copy_uses.size() == 1 && direct_copy_uses[0].kind == 1 &&
+          direct_copy_uses[0].key == 0xFFFFFFFFu && direct_copy_uses[0].use_pc == 2 &&
+          direct_copy_uses[0].v4[0] == direct_copy_seed[4],
+          "#636: Dead Cells s4 destination resolves only at its format-store instruction");
+
+    ShaderResourceTable direct_copy_table;
+    add_compute_buffer_resources(direct_copy_table, direct_copy,
+                                 sizeof(direct_copy) / sizeof(direct_copy[0]),
+                                 direct_copy_seed, 8);
+    assign_convention_bindings(direct_copy_table, 2);
+    CHECK(direct_copy_table.resources.size() == 2 &&
+          direct_copy_table.by_fetch_pc(0) && direct_copy_table.by_fetch_pc(2) &&
+          direct_copy_table.by_fetch_pc(0)->binding == 2 &&
+          direct_copy_table.by_fetch_pc(2)->binding == 3,
+          "#636: production compute discovery emits exactly the used source and destination");
+    ComputeShaderConfig direct_copy_config;
+    direct_copy_config.user_sgprs.assign(direct_copy_seed, direct_copy_seed + 8);
+    direct_copy_config.local_x = direct_copy_config.local_y = direct_copy_config.local_z = 1;
+    CHECK(!recompile_compute(direct_copy, sizeof(direct_copy) / sizeof(direct_copy[0]),
+                             &direct_copy_table, direct_copy_config).empty(),
+          "#636: instruction-provenance table keeps the Dead Cells format-copy dispatch realizable");
+
+    // DynFetch shifts graphics vertex descriptors by a constant instruction offset because their
+    // special address path drops the original OFFSET/SOFFSET. Compute resources use ConstantBuffer's
+    // faithful MUBUF path instead, so the production helper must retain base B and let that path add
+    // offset 16 once (not bind B+16 and then index another 16 bytes).
+    const uint32_t offset_format_load[] = {
+        0xE00C2010u, 0x80000100u,   // buffer_load_format_xyzw ..., s[0:3], offset:16 idxen
+        0xBF810000u,
+    };
+    const std::vector<DynFetch> offset_fetches = resolve_dynamic_fetch(
+        offset_format_load, std::size(offset_format_load), direct_copy_seed, 4, 0);
+    CHECK(offset_fetches.size() == 1 && offset_fetches[0].desc.base == 0x20010u &&
+          offset_fetches[0].unshifted_desc.base == 0x20000u,
+          "#636: DynFetch retains both shifted graphics and original compute descriptor bases");
+    ShaderResourceTable offset_compute_table;
+    add_compute_buffer_resources(offset_compute_table, offset_format_load,
+                                 std::size(offset_format_load), direct_copy_seed, 4);
+    assign_convention_bindings(offset_compute_table, 2);
+    CHECK(offset_compute_table.resources.size() == 1 &&
+          offset_compute_table.resources[0].gpu_addr == 0x20000u &&
+          offset_compute_table.resources[0].fetch_pc == 0 &&
+          !recompile_compute(offset_format_load, std::size(offset_format_load),
+                             &offset_compute_table, direct_copy_config).empty(),
+          "#636: compute format-load keeps base B and applies nonzero instruction offset once");
+
+    const uint32_t rewritten_copy_dest[] = {
+        0xBE840380u,                // s_mov_b32 s4, 0 (seed destination is no longer live)
+        0xE01C2000u, 0x80010101u,   // buffer_store_format_xyzw v[1:4], v1, s[4:7], 0 idxen
+        0xBF810000u,
+    };
+    std::vector<SrtUse> rewritten_copy_uses;
+    resolve_dynamic_fetch(rewritten_copy_dest,
+                          sizeof(rewritten_copy_dest) / sizeof(rewritten_copy_dest[0]),
+                          direct_copy_seed, 8, 0, &rewritten_copy_uses);
+    CHECK(rewritten_copy_uses.empty(),
+          "#636: rewritten direct destination cannot resurrect its entry-time V#");
+
     // Astro Bot's compact compute dispatcher s_loads output V#s from a table, then consumes them
     // with buffer_store_dword/dwordx2/dwordx3. Stores need the same descriptor provenance as raw
     // loads or the compute resource front-half never creates their writable storage-buffer binding.
@@ -550,6 +628,110 @@ int main() {
     CHECK(store_uses.size() == 1 && store_uses[0].v4[0] == store_table[4] &&
           store_uses[0].v4[1] == store_table[5] && store_uses[0].v4[2] == 16u,
           "raw buffer-store V# preserves the table-loaded descriptor dwords");
+
+    // A scalar patch after the table load changes the descriptor that the store actually consumes.
+    // The table key is no longer live as a complete four-dword provenance tag, so publish the current
+    // V# by exact store pc rather than retaining the pre-patch output range.
+    static uint32_t rewritten_store_output[16];
+    static uint32_t rewritten_store_table[4];
+    const uint64_t rewritten_output_base = (uint64_t)(uintptr_t)rewritten_store_output;
+    rewritten_store_table[0] = store_table[4];
+    rewritten_store_table[1] = store_table[5] | (4u << 16);
+    rewritten_store_table[2] = store_table[6];
+    rewritten_store_table[3] = (2u << 12) | 0xFACu;
+    const uint64_t rewritten_table_base = (uint64_t)(uintptr_t)rewritten_store_table;
+    const uint32_t rewritten_table_store[] = {
+        0xF4080104u, 0xFA000000u,                       // s_load_dwordx4 s[4:7], s[8:9], 0
+        0xBE8403FFu, (uint32_t)rewritten_output_base,   // s_mov_b32 s4, literal (live base patch)
+        0xE01C2000u, 0x80010101u,                       // buffer_store_format_xyzw ..., s[4:7]
+        0xBF810000u,
+    };
+    const uint32_t rewritten_table_seed[2] = {
+        (uint32_t)rewritten_table_base, (uint32_t)(rewritten_table_base >> 32),
+    };
+    uint32_t rewritten_compute_seed[10] = {};
+    rewritten_compute_seed[8] = rewritten_table_seed[0];
+    rewritten_compute_seed[9] = rewritten_table_seed[1];
+    std::vector<SrtUse> rewritten_table_uses;
+    resolve_dynamic_fetch(rewritten_table_store, std::size(rewritten_table_store),
+                          rewritten_table_seed, 2, 8, &rewritten_table_uses);
+    CHECK(rewritten_table_uses.size() == 1 && rewritten_table_uses[0].use_pc == 4 &&
+          rewritten_table_uses[0].key == 0xFFFFFFFFu &&
+          rewritten_table_uses[0].v4[0] == (uint32_t)rewritten_output_base,
+          "#636: table-loaded format store uses its live patched V# by exact pc");
+
+    // The analogous format LOAD must materialize only DynFetch's live pc-keyed descriptor. Before
+    // #636 it also produced an SrtUse from the old table snapshot, duplicating the binding and capture
+    // range. Exercise the same helper called by realize_compute_dispatches, including binding assignment.
+    const uint32_t rewritten_table_load[] = {
+        0xF4080104u, 0xFA000000u,                       // s_load_dwordx4 s[4:7], s[8:9], 0
+        0xBE8403FFu, (uint32_t)rewritten_output_base,   // s_mov_b32 s4, literal
+        0xE00C2000u, 0x80010100u,                       // buffer_load_format_xyzw ..., s[4:7]
+        0xBF810000u,
+    };
+    ShaderResourceTable rewritten_load_table;
+    const std::vector<SrtUse> rewritten_load_uses = add_compute_buffer_resources(
+        rewritten_load_table, rewritten_table_load, std::size(rewritten_table_load),
+        rewritten_compute_seed, 10);
+    assign_convention_bindings(rewritten_load_table, 2);
+    CHECK(rewritten_load_uses.empty() && rewritten_load_table.resources.size() == 1,
+          "#636: table-loaded format load has one production-path resource identity");
+    CHECK(rewritten_load_table.resources.size() == 1 &&
+          rewritten_load_table.resources[0].gpu_addr == rewritten_output_base &&
+          rewritten_load_table.resources[0].fetch_pc == 4 &&
+          rewritten_load_table.resources[0].srt_offset == 0xFFFFFFFFu &&
+          rewritten_load_table.resources[0].binding == 2,
+          "#636: format-load resource uses the live range, pc provenance, and assigned binding");
+
+    // Raw byte-addressed descriptors use stride zero, and the recompiler's supported atomic_umax is
+    // an external-buffer consumer too. Both were accepted before the catch-all scan was removed and
+    // must remain discoverable through instruction provenance.
+    static uint32_t atomic_output[16];
+    const uint64_t atomic_output_base = (uint64_t)(uintptr_t)atomic_output;
+    const uint32_t atomic_seed[4] = {
+        (uint32_t)atomic_output_base,
+        (uint32_t)(atomic_output_base >> 32) & 0xFFFFu,
+        sizeof(atomic_output), 0u,
+    };
+    const uint32_t stride_zero_raw[] = {
+        0xE0300000u, 0x80000000u, // buffer_load_dword v0, off, s[0:3], 0
+        0xBF810000u,
+    };
+    std::vector<SrtUse> stride_zero_raw_uses;
+    resolve_dynamic_fetch(stride_zero_raw, std::size(stride_zero_raw), atomic_seed, 4, 0,
+                          &stride_zero_raw_uses);
+    ShaderResourceTable stride_zero_raw_table;
+    add_compute_buffer_resources(stride_zero_raw_table, stride_zero_raw,
+                                 std::size(stride_zero_raw), atomic_seed, 4);
+    assign_convention_bindings(stride_zero_raw_table, 2);
+    ComputeShaderConfig raw_config;
+    raw_config.user_sgprs.assign(atomic_seed, atomic_seed + 4);
+    raw_config.local_x = raw_config.local_y = raw_config.local_z = 1;
+    CHECK(stride_zero_raw_uses.size() == 1 && stride_zero_raw_table.resources.size() == 1 &&
+          stride_zero_raw_table.resources[0].stride == 0 &&
+          !recompile_compute(stride_zero_raw, std::size(stride_zero_raw),
+                             &stride_zero_raw_table, raw_config).empty(),
+          "#636: direct stride-zero raw buffer remains discovered and realizable");
+    const uint32_t atomic_umax[] = {
+        0xE0E00004u, 0x80000000u, // buffer_atomic_umax v0, v0, s[0:3], offset:4
+        0xBF810000u,
+    };
+    std::vector<SrtUse> atomic_uses;
+    resolve_dynamic_fetch(atomic_umax, std::size(atomic_umax), atomic_seed, 4, 0,
+                          &atomic_uses);
+    CHECK(atomic_uses.size() == 1 && atomic_uses[0].use_pc == 0 &&
+          atomic_uses[0].v4[2] == sizeof(atomic_output),
+          "#636: direct stride-zero buffer_atomic_umax retains its exact resource use");
+    ShaderResourceTable atomic_table;
+    add_compute_buffer_resources(atomic_table, atomic_umax, std::size(atomic_umax), atomic_seed, 4);
+    assign_convention_bindings(atomic_table, 2);
+    ComputeShaderConfig atomic_config;
+    atomic_config.user_sgprs.assign(atomic_seed, atomic_seed + 4);
+    atomic_config.local_x = atomic_config.local_y = atomic_config.local_z = 1;
+    CHECK(atomic_table.resources.size() == 1 && atomic_table.resources[0].stride == 0 &&
+          !recompile_compute(atomic_umax, std::size(atomic_umax),
+                             &atomic_table, atomic_config).empty(),
+          "#636: production resource table keeps stride-zero supported atomic realizable");
 
     // Kernel 5dr: once any T# SGPR is reloaded, the initial sharp is stale. An unresolved reload must
     // not silently resurrect it and fabricate a texture mapping for the later image operation.

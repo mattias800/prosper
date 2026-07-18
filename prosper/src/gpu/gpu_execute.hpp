@@ -95,6 +95,10 @@ struct DynFetch {
     // patched V#s fold their in-record offset into the base), while a single direct V# needs the
     // faithful VADDR/inst-offset address — shadowing it collapses every attribute onto offset 0.
     bool from_seed = false;
+    // Descriptor before the instruction's constant OFFSET/SOFFSET is folded into `desc.base`.
+    // Graphics VertexBuffers need the shifted descriptor for their special vertex-index path;
+    // compute ConstantBuffers keep this original descriptor and apply those terms exactly once.
+    DecodedBufferDescriptor unshifted_desc;
 };
 
 // One descriptor-TABLE use recovered by the same const-fold (#294): UE4 shaders load their T#/S#/V#
@@ -135,6 +139,14 @@ std::vector<DynFetch> resolve_dynamic_fetch(const uint32_t* code, size_t dwords,
                                             uint32_t user_sgpr_base,
                                             std::vector<SrtUse>* srt_uses = nullptr,
                                             uint32_t pcrel_dispatch_target = UINT32_MAX);
+
+// Add instruction-provenance compute buffer resources to a metadata-built table. This is the exact
+// buffer-discovery path used by realize_compute_dispatches; it is exposed so tests can assert the
+// final resource identities instead of manually rebuilding a lookalike table. Returned SrtUses also
+// contain image uses, which the production caller materializes with image-specific view handling.
+std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
+                                                 const uint32_t* code, size_t dwords,
+                                                 const uint32_t* user_sgprs, uint32_t nsgpr);
 
 // The dynamic descriptor fold and shader-cache key builder both walk immutable shader instructions
 // on every draw. Cache only the decoded instructions, validating the complete consumed byte range on

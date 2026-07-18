@@ -1,3 +1,4 @@
+#include "../src/gpu/agc_shader_layout.hpp"
 #include "../src/gpu/gpu_dependency_graph.hpp"
 
 #include <cstdio>
@@ -91,6 +92,34 @@ int main() {
     CHECK(graph.external_leaves[0].first_future_writer == UINT32_MAX &&
           graph.external_leaves[1].first_future_writer == 1,
           "read-before-write leaves identify the first in-capsule future writer");
+
+    // #636: dependency analysis consumes the realized resource table, so descriptor-looking scalar
+    // user data must never appear as a read/write access unless an instruction actually uses it.
+    uint32_t scalar_sgprs[32] = {};
+    scalar_sgprs[0] = 0x00100000u;
+    scalar_sgprs[2] = 16u;
+    scalar_sgprs[3] = (2u << 12) | 0xFACu;
+    AgcShaderUserData scalar_user_data{};
+    AgcShaderHeader scalar_header{};
+    scalar_header.file_header = 0x34333231u;
+    scalar_header.version = 0x18;
+    scalar_header.type = 0;
+    scalar_header.user_data = &scalar_user_data;
+    ComputeItem scalar_compute;
+    scalar_compute.dispatch_index = 636;
+    scalar_compute.command_order = 636;
+    scalar_compute.resources = std::make_shared<ShaderResourceTable>(
+        build_shader_resources(scalar_header, scalar_sgprs, 32));
+    GpuReplayFrame scalar_replay;
+    scalar_replay.computes = {scalar_compute};
+    scalar_replay.operations = {
+        {SubmitOperationKind::Dispatch, 636, 636, true},
+    };
+    GpuDependencyGraph scalar_graph;
+    CHECK(build_gpu_dependency_graph(scalar_replay, scalar_graph, error) &&
+              scalar_compute.resources->resources.empty() && scalar_graph.edges.empty() &&
+              scalar_graph.external_leaves.empty(),
+          "#636: dependency graph ignores unconsumed descriptor-looking scalar arguments");
 
     replay.operations[4].realized = true;
     CHECK(!build_gpu_dependency_graph(replay, graph, error) &&
