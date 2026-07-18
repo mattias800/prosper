@@ -2287,7 +2287,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 dsc.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
             dsc.clearValue.depthStencil = {ps->depth_clear_value, ps->stencil_clear_value};
             VkClearRect rect{v.scissor, 0, 1};
-            if (dsc.aspectMask) vkCmdClearAttachments(cmd, 1, &dsc, 1, &rect);
+            // A fully clipped draw legitimately has a zero-area dynamic scissor, but Vulkan requires
+            // vkCmdClearAttachments rectangles to have non-zero width and height (VUID 02682/02683).
+            if (dsc.aspectMask && rect.rect.extent.width && rect.rect.extent.height)
+                vkCmdClearAttachments(cmd, 1, &dsc, 1, &rect);
         }
         if (!v.ok) continue;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);

@@ -145,9 +145,19 @@ int main() {
         reader.stencil_ref[0] = reader.stencil_ref[1] = 2;
         reader.stencil_compare_mask[0] = reader.stencil_compare_mask[1] = 0xff;
 
+        ResolvedPipelineState off_target_clear = opaque;
+        off_target_clear.color_write_mask = 0;
+        off_target_clear.stencil_clear_enable = true;
+        off_target_clear.stencil_clear_value = 0;
+        off_target_clear.has_scissor = true;
+        off_target_clear.scissor_left = 100; off_target_clear.scissor_top = 100;
+        off_target_clear.scissor_right = 120; off_target_clear.scissor_bottom = 120;
+
         prosper::test::BackendDraw w; w.vs = vs; w.fs = red; w.ps = &writer; w.vcount = 3;
+        prosper::test::BackendDraw c;
+        c.vs = vs; c.fs = red; c.ps = &off_target_clear; c.vcount = 3;
         prosper::test::BackendDraw r; r.vs = vs; r.fs = green; r.ps = &reader; r.vcount = 3;
-        const std::vector<uint8_t> px = prosper::test::render_draws_rgba({w, r}, W, H);
+        const std::vector<uint8_t> px = prosper::test::render_draws_rgba({w, c, r}, W, H);
         auto green_at = [&](uint32_t x, uint32_t y) {
             const uint8_t* p = px.empty() ? nullptr : &px[((size_t)y * W + x) * 4];
             return p && p[1] > 0xC0 && p[0] < 0x40 && p[2] < 0x40;
@@ -156,6 +166,8 @@ int main() {
               "scissored stencil writer includes its left/top and last interior samples");
         CHECK(!green_at(15, 12) && !green_at(48, 12) && !green_at(16, 44),
               "scissored stencil writer excludes outside and right/bottom boundary samples");
+        CHECK(green_at(32, 32),
+              "fully off-target explicit clear is skipped without erasing the scissored stencil");
     }
 
     // A guest depth/stencil surface survives renderer calls. The first call writes stencil=2 with no
