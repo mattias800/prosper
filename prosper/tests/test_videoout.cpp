@@ -51,12 +51,20 @@ int main() {
         initial_tail_untouched &= initial_fs[i] == 0xEE;
     CHECK(initial_tail_untouched, "GetFlipStatus writes exactly its 0x40-byte ABI struct");
 
-    // Resolution: real 1080p @ 59.94Hz (refresh enum 3), not zeroed.
-    uint8_t rs[0x20]; memset(rs, 0xEE, sizeof rs);
+    // Resolution: real 1080p @ 59.94Hz (refresh enum 3), not zeroed. The ABI struct is 0x30
+    // bytes: flags/reserved0 at 0x1c and reserved1[3] at 0x20 must not retain caller garbage.
+    uint8_t rs[0x38]; memset(rs, 0xEE, sizeof rs);
     res(0x1001, (uint64_t)(uintptr_t)rs, 0, 0, 0, 0);
     CHECK(*(uint32_t*)(rs + 0x00) == 1920 && *(uint32_t*)(rs + 0x04) == 1080, "resolution 1920x1080 (full)");
     CHECK(*(uint32_t*)(rs + 0x08) == 1920 && *(uint32_t*)(rs + 0x0c) == 1080, "resolution 1920x1080 (pane)");
     CHECK(*(uint64_t*)(rs + 0x10) == 3, "refresh rate = 59.94Hz (enum 3)");
+    bool resolution_reserved_zero = true;
+    for (size_t i = 0x1c; i < 0x30; ++i) resolution_reserved_zero &= rs[i] == 0;
+    CHECK(resolution_reserved_zero, "resolution flags and reserved tail are initialized");
+    bool resolution_canary_untouched = true;
+    for (size_t i = 0x30; i < sizeof rs; ++i) resolution_canary_untouched &= rs[i] == 0xEE;
+    CHECK(resolution_canary_untouched,
+          "GetResolutionStatus writes exactly its 0x30-byte ABI struct");
 
     // Vblank counter advances with TIME (one tick per ~16.68 ms vblank period), not per poll —
     // the old ++-per-call behavior made every poll look like a fresh vblank (issue #82). Two
