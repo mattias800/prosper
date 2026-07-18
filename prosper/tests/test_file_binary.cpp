@@ -9,6 +9,8 @@
 #include <cstring>
 #include <filesystem>
 #ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -43,9 +45,14 @@ int main() {
     HleFn read_fn = Hle::lookup(nid_hash("sceKernelRead"));
     HleFn lseek_fn = Hle::lookup(nid_hash("sceKernelLseek"));
     HleFn close_fn = Hle::lookup(nid_hash("sceKernelClose"));
+    HleFn dup_fn = Hle::lookup(nid_hash("dup"));
+    HleFn kernel_dup_fn = Hle::lookup(nid_hash("sceKernelDup"));
+    HleFn dup2_fn = Hle::lookup(nid_hash("dup2"));
+    HleFn kernel_dup2_fn = Hle::lookup(nid_hash("sceKernelDup2"));
     HleFn mkdir_fn = Hle::lookup(nid_hash("mkdir"));
     HleFn kernel_mkdir_fn = Hle::lookup(nid_hash("sceKernelMkdir"));
-    CHECK(open_fn && read_fn && lseek_fn && close_fn && mkdir_fn && kernel_mkdir_fn,
+    CHECK(open_fn && read_fn && lseek_fn && close_fn && dup_fn && kernel_dup_fn &&
+              dup2_fn && kernel_dup2_fn && mkdir_fn && kernel_mkdir_fn,
           "file HLE functions registered");
 
     // Creating an existing directory is a failure, not an idempotent success. Linux previously
@@ -80,6 +87,139 @@ int main() {
     CHECK(n == (int64_t)expected.size() && actual == expected,
           "read preserves binary bytes including CRLF");
     if (fd >= 0 && close_fn) close_fn((uint64_t)fd, 0, 0, 0, 0, 0);
+
+    // A duplicate is a distinct descriptor for the same open file description: it shares the
+    // current offset and remains usable after the original descriptor is closed.
+    int64_t dup_source = open_fn
+        ? (int64_t)open_fn((uint64_t)(uintptr_t)path, 0, 0, 0, 0, 0)
+        : -1;
+    int64_t duplicated = dup_source >= 0 && kernel_dup_fn
+        ? (int64_t)kernel_dup_fn((uint64_t)dup_source, 0, 0, 0, 0, 0)
+        : -1;
+    CHECK(duplicated >= 3 && duplicated != dup_source,
+          "sceKernelDup returns a distinct non-stdio descriptor");
+    std::array<uint8_t, 16> first_chunk{};
+    std::array<uint8_t, 16> second_chunk{};
+    int64_t first_n = dup_source >= 0 && read_fn
+        ? (int64_t)read_fn((uint64_t)dup_source,
+                           (uint64_t)(uintptr_t)first_chunk.data(), first_chunk.size(), 0, 0, 0)
+        : -1;
+    int64_t second_n = duplicated >= 0 && read_fn
+        ? (int64_t)read_fn((uint64_t)duplicated,
+                           (uint64_t)(uintptr_t)second_chunk.data(), second_chunk.size(), 0, 0, 0)
+        : -1;
+    CHECK(first_n == (int64_t)first_chunk.size() &&
+              std::memcmp(first_chunk.data(), expected.data(), first_chunk.size()) == 0,
+          "original descriptor reads the first chunk");
+    CHECK(second_n == (int64_t)second_chunk.size() &&
+              std::memcmp(second_chunk.data(), expected.data() + first_chunk.size(),
+                          second_chunk.size()) == 0,
+          "sceKernelDup shares the original file offset");
+    if (dup_source >= 0 && close_fn) close_fn((uint64_t)dup_source, 0, 0, 0, 0, 0);
+    int64_t duplicate_seek = duplicated >= 0 && lseek_fn
+        ? (int64_t)lseek_fn((uint64_t)duplicated, 0, SEEK_SET, 0, 0, 0)
+        : -1;
+    CHECK(duplicate_seek == 0, "duplicate remains usable after closing the original");
+    if (duplicated >= 0 && close_fn) close_fn((uint64_t)duplicated, 0, 0, 0, 0, 0);
+
+#ifdef _WIN32
+    // Force fd 0 free while duplicating an already-open guest file. _dup chooses the lowest free
+    // CRT descriptor, so the wrapper must hold that temporary result and return one above stdio.
+    int saved_stdin = ::_dup(0);
+    int stdin_filler = -1;
+    if (saved_stdin < 0) stdin_filler = ::_open("NUL", _O_RDONLY | _O_BINARY);
+    CHECK(saved_stdin >= 0 || stdin_filler == 0, "occupy fd 0 before low-slot dup test");
+    int64_t low_slot_source = open_fn
+        ? (int64_t)open_fn((uint64_t)(uintptr_t)path, 0, 0, 0, 0, 0)
+        : -1;
+    CHECK(low_slot_source >= 3, "open dup source outside the stdio range");
+    CHECK(::_close(0) == 0, "free fd 0 for deterministic dup reuse");
+    int64_t low_slot_duplicate = low_slot_source >= 0 && kernel_dup_fn
+        ? (int64_t)kernel_dup_fn((uint64_t)low_slot_source, 0, 0, 0, 0, 0)
+        : -1;
+    CHECK(low_slot_duplicate >= 3,
+          "sceKernelDup lifts a recycled Windows stdio descriptor");
+    if (low_slot_duplicate >= 0 && close_fn)
+        close_fn((uint64_t)low_slot_duplicate, 0, 0, 0, 0, 0);
+    if (low_slot_source >= 0 && close_fn)
+        close_fn((uint64_t)low_slot_source, 0, 0, 0, 0, 0);
+    if (saved_stdin >= 0) {
+        CHECK(::_dup2(saved_stdin, 0) == 0, "restore fd 0 after low-slot dup test");
+        ::_close(saved_stdin);
+    }
+#endif
+
+    // dup2 must replace an already-open target, share the source offset, and return the target
+    // descriptor. The Windows CRT returns zero on success, so this catches a missing ABI translation.
+    int64_t dup2_source = open_fn
+        ? (int64_t)open_fn((uint64_t)(uintptr_t)path, 0, 0, 0, 0, 0)
+        : -1;
+    int64_t dup2_target = open_fn
+        ? (int64_t)open_fn((uint64_t)(uintptr_t)path, 0, 0, 0, 0, 0)
+        : -1;
+    constexpr int64_t source_offset = 73;
+    constexpr int64_t old_target_offset = 211;
+    int64_t source_seek = dup2_source >= 0 && lseek_fn
+        ? (int64_t)lseek_fn((uint64_t)dup2_source, source_offset, SEEK_SET, 0, 0, 0)
+        : -1;
+    int64_t target_seek = dup2_target >= 0 && lseek_fn
+        ? (int64_t)lseek_fn((uint64_t)dup2_target, old_target_offset, SEEK_SET, 0, 0, 0)
+        : -1;
+    int64_t dup2_result = dup2_source >= 0 && dup2_target >= 0 && kernel_dup2_fn
+        ? (int64_t)kernel_dup2_fn((uint64_t)dup2_source, (uint64_t)dup2_target, 0, 0, 0, 0)
+        : -1;
+    CHECK(source_seek == source_offset && target_seek == old_target_offset,
+          "position dup2 source and old target independently");
+    CHECK(dup2_result == dup2_target, "sceKernelDup2 returns the replaced target descriptor");
+    if (dup2_source >= 0 && close_fn) close_fn((uint64_t)dup2_source, 0, 0, 0, 0, 0);
+    std::array<uint8_t, 16> dup2_chunk{};
+    int64_t dup2_n = dup2_target >= 0 && read_fn
+        ? (int64_t)read_fn((uint64_t)dup2_target,
+                           (uint64_t)(uintptr_t)dup2_chunk.data(), dup2_chunk.size(), 0, 0, 0)
+        : -1;
+    CHECK(dup2_n == (int64_t)dup2_chunk.size() &&
+              std::memcmp(dup2_chunk.data(), expected.data() + source_offset,
+                          dup2_chunk.size()) == 0,
+          "sceKernelDup2 replaces the target and shares the source offset");
+    if (dup2_target >= 0 && close_fn) close_fn((uint64_t)dup2_target, 0, 0, 0, 0, 0);
+
+#ifdef _WIN32
+    // UCRT reports invalid descriptors through its invalid-parameter handler before returning -1.
+    // Guest inputs must not reach the default terminating handler, and a failed dup2 must not close
+    // or replace its valid target.
+    int64_t invalid_duplicate = kernel_dup_fn
+        ? (int64_t)kernel_dup_fn(~uint64_t{0}, 0, 0, 0, 0, 0)
+        : 0;
+    CHECK(invalid_duplicate == -1, "sceKernelDup safely rejects an invalid source descriptor");
+    int64_t preserved_target = open_fn
+        ? (int64_t)open_fn((uint64_t)(uintptr_t)path, 0, 0, 0, 0, 0)
+        : -1;
+    constexpr int64_t preserved_offset = 137;
+    int64_t preserved_seek = preserved_target >= 0 && lseek_fn
+        ? (int64_t)lseek_fn((uint64_t)preserved_target, preserved_offset, SEEK_SET, 0, 0, 0)
+        : -1;
+    int64_t invalid_dup2 = preserved_target >= 0 && kernel_dup2_fn
+        ? (int64_t)kernel_dup2_fn(~uint64_t{0}, (uint64_t)preserved_target, 0, 0, 0, 0)
+        : 0;
+    int64_t preserved_position = preserved_target >= 0 && lseek_fn
+        ? (int64_t)lseek_fn((uint64_t)preserved_target, 0, SEEK_CUR, 0, 0, 0)
+        : -1;
+    std::array<uint8_t, 16> preserved_chunk{};
+    int64_t preserved_n = preserved_target >= 0 && read_fn
+        ? (int64_t)read_fn((uint64_t)preserved_target,
+                           (uint64_t)(uintptr_t)preserved_chunk.data(), preserved_chunk.size(),
+                           0, 0, 0)
+        : -1;
+    CHECK(preserved_seek == preserved_offset, "position the invalid-dup2 target");
+    CHECK(invalid_dup2 == -1, "sceKernelDup2 safely rejects an invalid source descriptor");
+    CHECK(preserved_position == preserved_offset &&
+              preserved_n == (int64_t)preserved_chunk.size() &&
+              std::memcmp(preserved_chunk.data(), expected.data() + preserved_offset,
+                          preserved_chunk.size()) == 0,
+          "failed sceKernelDup2 leaves the target descriptor unchanged");
+    if (preserved_target >= 0 && close_fn)
+        close_fn((uint64_t)preserved_target, 0, 0, 0, 0, 0);
+#endif
 
 #ifdef _WIN32
     // Unity asks for a whole 64 KiB cache block even when boot.config is only a few hundred bytes.
