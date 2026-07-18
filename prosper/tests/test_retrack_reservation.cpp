@@ -7,6 +7,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 using namespace prosper;
 
@@ -21,10 +24,13 @@ int main() {
     register_builtin_hle();
     auto reserve  = Hle::lookup(nid_hash("sceKernelReserveVirtualRange"));
     auto protect  = Hle::lookup(nid_hash("sceKernelMprotect"));
+    auto mtypeprotect = Hle::lookup(nid_hash("sceKernelMtypeprotect"));
+    auto batch    = Hle::lookup(nid_hash("sceKernelBatchMap"));
     auto query    = Hle::lookup(nid_hash("sceKernelVirtualQuery"));
     auto flexible = Hle::lookup(nid_hash("sceKernelMapNamedFlexibleMemory"));
     auto unmap    = Hle::lookup(nid_hash("sceKernelMunmap"));
-    CHECK(reserve && protect && query && flexible && unmap, "memory HLE functions registered");
+    CHECK(reserve && protect && mtypeprotect && batch && query && flexible && unmap,
+          "memory HLE functions registered");
     if (fails) return 1;
 
     constexpr uint64_t page = 0x10000;
@@ -51,6 +57,76 @@ int main() {
               *(uint64_t*)(failed_info + 0x08) == base + len &&
               *(uint32_t*)(failed_info + 0x20) == 0,
           "failed mprotect leaves reservation tracking unchanged");
+
+#ifdef _WIN32
+    // #926: MEM_COMMIT says that a host allocation exists, not that it belongs to the guest. Put
+    // one tracked guest page and one unrelated host-committed page in a single host reservation so
+    // the boundary-crossing failure is deterministic regardless of the process address layout.
+    void* host_reservation = VirtualAlloc(nullptr, page * 2, MEM_RESERVE, PAGE_NOACCESS);
+    CHECK(host_reservation != nullptr, "reserve deterministic guest/host ownership test span");
+    if (host_reservation) {
+        const uint64_t host_base = (uint64_t)(uintptr_t)host_reservation;
+        uint64_t guest_page = host_base;
+        const bool guest_map_succeeded =
+            flexible((uint64_t)(uintptr_t)&guest_page, page, 0x2, 0,
+                     (uint64_t)(uintptr_t)"mprotect-ownership", 0) == 0 && guest_page;
+        const bool guest_mapped = guest_map_succeeded && guest_page == host_base;
+        CHECK(guest_mapped, "commit and track the first page as guest memory");
+
+        void* foreign_page = nullptr;
+        if (guest_mapped) {
+            foreign_page = VirtualAlloc((void*)(uintptr_t)(host_base + page), page,
+                                        MEM_COMMIT, PAGE_READWRITE);
+        }
+        CHECK(foreign_page == (void*)(uintptr_t)(host_base + page),
+              "commit the adjacent page outside the guest tracker");
+
+        if (guest_mapped && foreign_page) {
+            volatile uint32_t* guest_cell =
+                (volatile uint32_t*)(uintptr_t)(host_base + page / 4);
+            volatile uint32_t* foreign_cell =
+                (volatile uint32_t*)(uintptr_t)(host_base + page + page / 4);
+            *guest_cell = 0x9260A11Cu;
+            *foreign_cell = 0x9260F012u;
+
+            const uint64_t crossing = host_base + page / 2;
+            CHECK((uint32_t)protect(crossing, page, 0x1, 0, 0, 0) == 0x80020016u,
+                  "mprotect rejects a committed tail outside guest ownership");
+            CHECK((uint32_t)mtypeprotect(crossing, page, 0, 0x1, 0, 0) == 0x80020016u,
+                  "mtypeprotect rejects the same unowned committed tail");
+
+            alignas(8) uint8_t entry[0x20]{};
+            *(uint64_t*)(entry + 0x00) = crossing;
+            *(uint64_t*)(entry + 0x10) = page;
+            entry[0x18] = 0x1;
+            *(int32_t*)(entry + 0x1c) = 2; // PROTECT
+            int32_t done = -1;
+            CHECK((uint32_t)batch((uint64_t)(uintptr_t)entry, 1,
+                                  (uint64_t)(uintptr_t)&done, 0, 0, 0) == 0x80020016u &&
+                      done == 0,
+                  "BatchMap protection failure is not counted or retracked");
+
+            MEMORY_BASIC_INFORMATION guest_mbi{}, foreign_mbi{};
+            VirtualQuery((const void*)(uintptr_t)host_base, &guest_mbi, sizeof(guest_mbi));
+            VirtualQuery((const void*)(uintptr_t)(host_base + page), &foreign_mbi,
+                         sizeof(foreign_mbi));
+            CHECK(guest_mbi.State == MEM_COMMIT &&
+                      (guest_mbi.Protect & 0xffu) == PAGE_READWRITE &&
+                      *guest_cell == 0x9260A11Cu,
+                  "failed protection calls leave the guest page unchanged");
+            CHECK(foreign_mbi.State == MEM_COMMIT &&
+                      (foreign_mbi.Protect & 0xffu) == PAGE_READWRITE &&
+                      *foreign_cell == 0x9260F012u,
+                  "failed protection calls leave unrelated host memory unchanged");
+        }
+
+        if (guest_map_succeeded)
+            CHECK(unmap(guest_page, page, 0, 0, 0, 0) == 0,
+                  "tracked ownership-test page unmaps cleanly");
+        CHECK(VirtualFree(host_reservation, 0, MEM_RELEASE) != 0,
+              "ownership-test host reservation releases cleanly");
+    }
+#endif
 
     const uint64_t middle = base + page;
     CHECK(protect(middle, page, 0x2 /* SCE_KERNEL_PROT_CPU_RW */, 0, 0, 0) == 0,
