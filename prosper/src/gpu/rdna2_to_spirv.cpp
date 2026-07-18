@@ -6176,7 +6176,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // scalar loop for every invocation while narrowed EXEC predicates vector writes; inactive
         // lanes retain their old VGPRs until the exact restore. Reject stores/exports/barriers and
         // unclassified memory so this never becomes a general branch-linearization escape hatch.
-        for (size_t branch_index = 0; branch_index < ins.size(); ++branch_index) {
+        // Scan inside-out so an already-proven nested guard may contribute its balanced save/restore
+        // pair without making an otherwise-safe outer guarded loop look like it leaks narrowed EXEC.
+        struct GuardedExecRegion { uint32_t save_pc, restore_pc; };
+        std::vector<GuardedExecRegion> guarded_exec_regions;
+        for (size_t branch_index = ins.size(); branch_index-- > 0;) {
             const Rdna2Inst& branch = ins[branch_index];
             if (branch.fmt != Rdna2Format::SOPP || branch.opcode != 0x08 || branch.simm16 <= 0)
                 continue;
@@ -6203,10 +6207,19 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     clobbers_guard_mask |= base < saveexec.dst.value + 2 &&
                         saveexec.dst.value < base + static_cast<int>(width);
                 });
+                bool balanced_nested_exec = false;
+                for (const auto& nested : guarded_exec_regions) {
+                    if (nested.save_pc > branch.pc && nested.restore_pc < target &&
+                        (candidate.pc == nested.save_pc || candidate.pc == nested.restore_pc)) {
+                        balanced_nested_exec = true;
+                        break;
+                    }
+                }
                 if (candidate.fmt == Rdna2Format::EXP || candidate.fmt == Rdna2Format::DS ||
                     candidate.fmt == Rdna2Format::MUBUF || candidate.fmt == Rdna2Format::MTBUF ||
                     candidate.fmt == Rdna2Format::MIMG || candidate.fmt == Rdna2Format::FLAT ||
-                    instruction_may_change_exec(candidate) || clobbers_guard_mask ||
+                    (instruction_may_change_exec(candidate) && !balanced_nested_exec) ||
+                    clobbers_guard_mask ||
                     (candidate.fmt == Rdna2Format::SOPP && candidate.opcode == 0x0a)) {
                     side_effect_free = false;
                     break;
@@ -6214,6 +6227,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             }
             if (!side_effect_free) continue;
             effective_safe.insert(branch.pc);
+            guarded_exec_regions.push_back({saveexec.pc, target});
             if (branch.pc < L.header_pc && target >= L.exit_pc) guarded_narrow_entry = true;
         }
         // 1. Pre-loop body. A compiler may place one ordinary uniform if/else before the canonical
