@@ -29,6 +29,10 @@ void install_trap_handler();
 // Test diagnostic: RSP&15 immediately before the recovery thunk calls its compiled MS-x64 helper.
 // A valid Microsoft-x64 call site is 0; -1 means the thunk has not run yet.
 int recovery_thunk_call_rsp_mod16();
+
+// Number of five-byte AMD SSE4a instructions replaced by the Windows trap-free code cache.
+// Zero is valid on an AMD host, where the guest instructions execute natively.
+uint64_t sse4a_fastpath_patch_count();
 #endif
 
 // Install a per-thread alternate signal stack (so the fault handler survives a guest stack overflow).

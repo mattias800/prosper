@@ -3,11 +3,14 @@
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
 #include "../src/hle/sync_futex.hpp"
+#include "../src/host/exec_image.hpp"
+#include "../src/host/sse4a.hpp"
 #include <pthread.h>
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 using namespace prosper;
 
@@ -281,8 +284,251 @@ static void reset_delivery_state() {
     memset(avx_observed, 0, sizeof avx_observed);
 }
 
+static void test_sse4a_fastpath() {
+    constexpr uint64_t base = 0x410000000ull;
+    constexpr size_t code_size = 85;
+    constexpr size_t sse4a_offset = 45;
+    constexpr size_t short_code_offset = 0x200;
+    constexpr size_t short_sse4a_offset = short_code_offset + 19;
+    constexpr size_t short_successor_wrapper_offset = 0x3c0;
+    constexpr size_t chain_code_offset = 0x300;
+    constexpr size_t chain_sse4a_offset = chain_code_offset + 28;
+    constexpr size_t chain_second_wrapper_offset = 0x380;
+    constexpr size_t data_offset = 0x100;
+    const uint8_t code[code_size] = {
+        0x48,0x83,0xec,0x18,                         // sub rsp,0x18
+        0xf3,0x44,0x0f,0x7f,0x04,0x24,               // save nonvolatile xmm8
+        0x48,0xba, 0xef,0xcd,0xab,0x89,0x67,0x45,0x23,0x01, // movabs rdx,red-zone sentinel
+        0x48,0x89,0x54,0x24,0xf8,                    // mov [rsp-8],rdx
+        0x48,0xb8, 0,0,0,0,0,0,0,0,                 // movabs rax,data
+        0xf3,0x44,0x0f,0x6f,0x00,                    // movdqu xmm8,[rax] (control)
+        0xf3,0x0f,0x6f,0x48,0x10,                    // movdqu xmm1,[rax+0x10] (value)
+        0x66,0x41,0x0f,0x79,0xc8,                    // extrq xmm1,xmm8 (five-byte form)
+        0xf3,0x0f,0x7f,0x48,0x30,                    // movdqu [rax+0x30],xmm1
+        0x66,0x48,0x0f,0x7e,0xc8,                    // movq rax,xmm1
+        0x48,0x39,0x54,0x24,0xf8,                    // cmp [rsp-8],rdx
+        0x74,0x07,                                    // je .red_zone_ok
+        0x48,0xc7,0xc0,0xff,0xff,0xff,0xff,          // mov rax,-1
+        0xf3,0x44,0x0f,0x6f,0x04,0x24,               // restore xmm8
+        0x48,0x83,0xc4,0x18,                         // add rsp,0x18
+        0xc3                                           // ret
+    };
+    const uint8_t short_code[] = {
+        0x48,0xb8, 0,0,0,0,0,0,0,0,                 // movabs rax,data
+        0xf3,0x0f,0x6f,0x00,                          // movdqu xmm0,[rax] (control)
+        0xf3,0x0f,0x6f,0x48,0x10,                     // movdqu xmm1,[rax+0x10] (value)
+        0x66,0x0f,0x79,0xc8,                           // extrq xmm1,xmm0 (four-byte form)
+        0xc5,0xf9,0x6f,0xd1,                           // vmovdqa xmm2,xmm1 (stolen instruction)
+        0x66,0x48,0x0f,0x7e,0xd0,                     // movq rax,xmm2
+        0xc3
+    };
+    const uint8_t short_successor_wrapper[] = {
+        0x48,0xb8, 0,0,0,0,0,0,0,0,                 // movabs rax,data
+        0xf3,0x0f,0x6f,0x48,0x10,                    // movdqu xmm1,[rax+0x10]
+        0xe9, 0,0,0,0                                // jmp consumed VEX successor
+    };
+    const uint8_t chain_code[] = {
+        0x48,0xb8, 0,0,0,0,0,0,0,0,                 // movabs rax,data
+        0xf3,0x0f,0x6f,0x00,                          // movdqu xmm0,[rax] (control)
+        0xf3,0x0f,0x6f,0x18,                          // movdqu xmm3,[rax] (control)
+        0xf3,0x0f,0x6f,0x48,0x10,                    // movdqu xmm1,[rax+0x10]
+        0xf3,0x0f,0x6f,0x50,0x20,                    // movdqu xmm2,[rax+0x20]
+        0x66,0x0f,0x79,0xc8,                          // extrq xmm1,xmm0
+        0x66,0x48,0x0f,0x79,0xd3,                    // extrq xmm2,xmm3 (five-byte form)
+        0x66,0x48,0x0f,0x7e,0xd0,                    // movq rax,xmm2
+        0xc3
+    };
+    const uint8_t chain_second_wrapper[] = {
+        0x48,0xb8, 0,0,0,0,0,0,0,0,                 // movabs rax,data
+        0xf3,0x0f,0x6f,0x18,                          // movdqu xmm3,[rax] (control)
+        0xf3,0x0f,0x6f,0x50,0x20,                    // movdqu xmm2,[rax+0x20]
+        0xe9, 0,0,0,0                                // jmp chained second EXTRQ
+    };
+    LoadedImage image;
+    image.base = base;
+    image.min_vaddr = 0;
+    image.max_vaddr = 0x1000;
+    image.mem.assign(0x1000, 0xcc);
+    image.prot.push_back({0, 0x1000, true, false, true});
+    memcpy(image.mem.data(), code, sizeof(code));
+    memcpy(image.mem.data() + short_code_offset, short_code, sizeof(short_code));
+    memcpy(image.mem.data() + short_successor_wrapper_offset, short_successor_wrapper,
+           sizeof(short_successor_wrapper));
+    memcpy(image.mem.data() + chain_code_offset, chain_code, sizeof(chain_code));
+    memcpy(image.mem.data() + chain_second_wrapper_offset, chain_second_wrapper,
+           sizeof(chain_second_wrapper));
+    const uint64_t data_address = base + data_offset;
+    memcpy(image.mem.data() + 27, &data_address, sizeof(data_address));
+    memcpy(image.mem.data() + short_code_offset + 2, &data_address, sizeof(data_address));
+    memcpy(image.mem.data() + short_successor_wrapper_offset + 2, &data_address,
+           sizeof(data_address));
+    memcpy(image.mem.data() + chain_code_offset + 2, &data_address, sizeof(data_address));
+    memcpy(image.mem.data() + chain_second_wrapper_offset + 2, &data_address,
+           sizeof(data_address));
+    const int32_t short_successor_delta = static_cast<int32_t>(
+        short_sse4a_offset + 4 -
+        (short_successor_wrapper_offset + sizeof(short_successor_wrapper)));
+    memcpy(image.mem.data() + short_successor_wrapper_offset + 16, &short_successor_delta,
+           sizeof(short_successor_delta));
+    const int32_t chain_second_delta = static_cast<int32_t>(
+        chain_sse4a_offset + 4 -
+        (chain_second_wrapper_offset + sizeof(chain_second_wrapper)));
+    memcpy(image.mem.data() + chain_second_wrapper_offset + 20, &chain_second_delta,
+           sizeof(chain_second_delta));
+    const uint64_t control = 0x0808;  // length=8, index=8
+    const uint64_t value = 0xab00;
+    const uint64_t upper_value = 0x0123456789abcdefull;
+    const uint64_t chained_value = 0xcd00;
+    memcpy(image.mem.data() + data_offset, &control, sizeof(control));
+    memcpy(image.mem.data() + data_offset + 16, &value, sizeof(value));
+    memcpy(image.mem.data() + data_offset + 24, &upper_value, sizeof(upper_value));
+    memcpy(image.mem.data() + data_offset + 32, &chained_value, sizeof(chained_value));
+    const uint64_t before_map = sse4a_fastpath_patch_count();
+    std::string error;
+    CHECK(map_image(image, &error), "map synthetic SSE4a guest image");
+    if (!error.empty()) std::printf("  map detail: %s\n", error.c_str());
+    const uint64_t after_map = sse4a_fastpath_patch_count();
+    CHECK(after_map >= before_map + 5,
+          "all executable EXTRQs are translated before guest entry");
+    install_trap_handler();
+    using GuestFn = uint64_t (*)();
+    const GuestFn function = (GuestFn)(uintptr_t)base;
+    const uint64_t first = function();
+    const uint64_t second = function();
+    const uint64_t after_second = sse4a_fastpath_patch_count();
+    CHECK(first == 0xab && second == 0xab,
+          "EXTRQ returns the AMD-defined field without overwriting the guest red zone");
+    uint64_t staged_upper = 0;
+    memcpy(&staged_upper, (const void*)(uintptr_t)(base + data_offset + 56),
+           sizeof(staged_upper));
+    CHECK(staged_upper == upper_value,
+          "EXTRQ fast and trapped paths preserve the neighboring qword like the AMD CPU model");
+    CHECK(after_second == after_map,
+          "executing EXTRQ does not enter the live exception patcher");
+    CHECK(*(const uint8_t*)(uintptr_t)(base + sse4a_offset) == 0xe9,
+          "five-byte EXTRQ is a near-jump before it can fault on an Intel host");
+
+    const GuestFn short_function = (GuestFn)(uintptr_t)(base + short_code_offset);
+    const uint64_t short_first = short_function();
+    const uint64_t short_second = short_function();
+    const uint64_t short_after_second = sse4a_fastpath_patch_count();
+    CHECK(short_first == 0xab && short_second == 0xab,
+          "four-byte EXTRQ and its copied VEX successor preserve their result");
+    CHECK(short_after_second == after_map,
+          "four-byte EXTRQ does not enter the live exception patcher");
+    CHECK(*(const uint8_t*)(uintptr_t)(base + short_sse4a_offset) == 0xe9,
+          "four-byte EXTRQ and validated VEX successor are translated before entry");
+    const GuestFn short_successor_function =
+        (GuestFn)(uintptr_t)(base + short_successor_wrapper_offset);
+    const uint64_t short_successor_result = short_successor_function();
+    CHECK(short_successor_result == 0xab00,
+          "a direct branch to the consumed VEX instruction uses its secondary expansion");
+
+    const GuestFn chain_function = (GuestFn)(uintptr_t)(base + chain_code_offset);
+    const uint64_t chain_first = chain_function();
+    const uint64_t chain_second = chain_function();
+    const uint64_t chain_after_second = sse4a_fastpath_patch_count();
+    CHECK(chain_first == 0xcd && chain_second == 0xcd,
+          "adjacent EXTRQs run through separate chained expansions");
+    CHECK(chain_after_second == after_map,
+          "chained EXTRQs do not enter the live exception patcher");
+    CHECK(*(const uint8_t*)(uintptr_t)(base + chain_sse4a_offset) == 0xe9,
+          "adjacent EXTRQs are translated before either instruction can fault");
+    const GuestFn chain_second_function =
+        (GuestFn)(uintptr_t)(base + chain_second_wrapper_offset);
+    CHECK(chain_second_function() == 0xcd,
+          "direct entry to the chained EXTRQ uses its overlapping near jump");
+
+    bool randomized_exact = true, randomized_short = true, randomized_chain = true;
+    uint64_t random = 0x9e3779b97f4a7c15ull;
+    auto next_random = [&] {
+        random ^= random << 13; random ^= random >> 7; random ^= random << 17;
+        return random;
+    };
+    for (unsigned i = 0; i < 4096; ++i) {
+        const uint32_t length = (uint32_t)(next_random() & 63);
+        const uint32_t index = (uint32_t)(next_random() & 63);
+        const uint64_t randomized_control = length | ((uint64_t)index << 8);
+        const uint64_t randomized_value = next_random();
+        const uint64_t randomized_second = next_random();
+        memcpy((void*)(uintptr_t)(base + data_offset), &randomized_control,
+               sizeof(randomized_control));
+        memcpy((void*)(uintptr_t)(base + data_offset + 16), &randomized_value,
+               sizeof(randomized_value));
+        memcpy((void*)(uintptr_t)(base + data_offset + 32), &randomized_second,
+               sizeof(randomized_second));
+        const uint64_t expected_value =
+            sse4a_extrq(randomized_value, length, index);
+        const uint64_t expected_second =
+            sse4a_extrq(randomized_second, length, index);
+        randomized_exact &= function() == expected_value;
+        randomized_short &= short_function() == expected_value;
+        randomized_chain &= chain_function() == expected_second;
+    }
+    CHECK(randomized_exact, "five-byte EXTRQ fast path matches randomized AMD fields");
+    CHECK(randomized_short,
+          "four-byte EXTRQ plus copied VEX successor matches randomized AMD fields");
+    CHECK(randomized_chain,
+          "adjacent EXTRQ expansions match randomized AMD fields");
+
+}
+
+static void test_condition_slot_lifecycle() {
+    size_t used_before = 0;
+    size_t capacity = 0;
+    snapshot_guest_wait_registry(used_before, capacity);
+    CHECK(capacity > used_before, "condition wait registry reports reusable capacity");
+
+    std::vector<pthread_cond_t> conditions(capacity - used_before);
+    size_t initialized = 0;
+    bool filled = true;
+    for (pthread_cond_t& condition : conditions) {
+        if (pthread_cond_init(&condition, nullptr) != 0) {
+            filled = false;
+            break;
+        }
+        ++initialized;
+        if (interruptible_cond_signal(&condition) != 0) {
+            filled = false;
+            break;
+        }
+    }
+
+    size_t used_full = 0;
+    size_t capacity_full = 0;
+    snapshot_guest_wait_registry(used_full, capacity_full);
+    CHECK(filled && initialized == conditions.size() && used_full == capacity,
+          "condition wait registry can use every advertised slot");
+
+    bool destroyed = true;
+    for (size_t i = 0; i < initialized; ++i) {
+        destroyed &= pthread_cond_destroy(&conditions[i]) == 0;
+        interruptible_cond_forget(&conditions[i]);
+    }
+    size_t used_after = 0;
+    size_t capacity_after = 0;
+    snapshot_guest_wait_registry(used_after, capacity_after);
+    CHECK(destroyed && capacity_after == capacity && used_after == used_before,
+          "destroyed condition variables release their wait registry slots");
+
+    pthread_cond_t replacement{};
+    const bool replacement_initialized = pthread_cond_init(&replacement, nullptr) == 0;
+    const bool replacement_registered = replacement_initialized &&
+                                        interruptible_cond_signal(&replacement) == 0;
+    bool replacement_destroyed = false;
+    if (replacement_initialized) {
+        replacement_destroyed = pthread_cond_destroy(&replacement) == 0;
+        interruptible_cond_forget(&replacement);
+    }
+    CHECK(replacement_registered && replacement_destroyed,
+          "a fresh condition variable reuses a retired registry slot");
+}
+
 int main() {
     std::printf("== test_win_exception_delivery ==\n");
+
+    test_sse4a_fastpath();
+    test_condition_slot_lifecycle();
     // Exercise the forced-CONTEXT compatibility path first; production Windows runs use cooperative
     // safe points by default. The final cases below remove this override.
     _putenv_s("PROSPER_WIN_LEGACY_EXC", "1");

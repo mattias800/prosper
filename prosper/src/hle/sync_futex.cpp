@@ -43,6 +43,7 @@ struct CondSlot {
     std::atomic<uint32_t> sequence{0};
 };
 std::array<CondSlot, 4096> g_cond_slots;
+constexpr uintptr_t kCondSlotRetiring = UINTPTR_MAX;
 
 CondSlot* cond_slot_for(pthread_cond_t* cond) {
     const uintptr_t key = (uintptr_t)cond;
@@ -232,6 +233,27 @@ int interruptible_cond_broadcast(pthread_cond_t* cond) {
     return 0;
 #else
     return pthread_cond_broadcast(cond);
+#endif
+}
+
+void interruptible_cond_forget(pthread_cond_t* cond) {
+#ifdef _WIN32
+    const uintptr_t key = (uintptr_t)cond;
+    if (!key) return;
+    for (CondSlot& slot : g_cond_slots) {
+        uintptr_t owner = key;
+        // Retire through a sentinel so a concurrent allocator cannot claim the slot between
+        // clearing its owner and resetting the generation. Destroying a condvar with live users is
+        // already invalid; this only closes reuse races between successive valid lifetimes.
+        if (!slot.cond.compare_exchange_strong(owner, kCondSlotRetiring,
+                                               std::memory_order_acq_rel))
+            continue;
+        slot.sequence.store(0, std::memory_order_relaxed);
+        slot.cond.store(0, std::memory_order_release);
+        return;
+    }
+#else
+    (void)cond;
 #endif
 }
 

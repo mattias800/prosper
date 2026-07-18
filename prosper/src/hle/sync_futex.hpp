@@ -34,6 +34,9 @@ int interruptible_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
                                  uintptr_t source = 0);
 int interruptible_cond_signal(pthread_cond_t* cond);
 int interruptible_cond_broadcast(pthread_cond_t* cond);
+// Release the Windows WaitOnAddress registry entry after a condition variable is destroyed.
+// No-op on native POSIX hosts.
+void interruptible_cond_forget(pthread_cond_t* cond);
 int interruptible_mutex_lock(pthread_mutex_t* mutex);
 
 // Windows applies SetThreadContext only after a blocked syscall returns. Wake the target's exact

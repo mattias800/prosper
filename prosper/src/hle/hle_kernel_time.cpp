@@ -373,7 +373,7 @@ HLE(m_cnd_init)   { if (a0) { auto* c = (pthread_cond_t*)calloc(1, sizeof(pthrea
 HLE(m_cnd_signal) { if (a0 && *(void**)P(a0)) interruptible_cond_signal((pthread_cond_t*)*(void**)P(a0)); return 0; }
 HLE(m_cnd_broadcast){ if (a0 && *(void**)P(a0)) interruptible_cond_broadcast((pthread_cond_t*)*(void**)P(a0)); return 0; }
 HLE(m_cnd_wait)   { if (a0 && *(void**)P(a0) && a1 && *(void**)P(a1)) interruptible_cond_wait((pthread_cond_t*)*(void**)P(a0), (pthread_mutex_t*)*(void**)P(a1)); return 0; }
-HLE(m_cnd_destroy){ if (a0 && *(void**)P(a0)) { pthread_cond_destroy((pthread_cond_t*)*(void**)P(a0)); free(*(void**)P(a0)); } return 0; }
+HLE(m_cnd_destroy){ if (a0 && *(void**)P(a0)) { auto* c = (pthread_cond_t*)*(void**)P(a0); pthread_cond_destroy(c); interruptible_cond_forget(c); free(c); } return 0; }
 
 // --- event queue (sceKernelEqueue): kqueue-like event mechanism the engine uses for vsync/flip
 // and async I/O completion. Headless: give a valid queue object; WaitEqueue yields briefly and
