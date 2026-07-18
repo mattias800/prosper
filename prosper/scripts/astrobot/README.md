@@ -32,3 +32,32 @@ Linux host, omit `PROSPER_AVP_SYNTH_FRAMES`; on Windows, the Media Foundation
 backend decodes the real H.264 stream. Keep `PROSPER_PAD_SCRIPT_LOG=1` enabled
 when validating a new frontend because the flip and wall-time recovery windows
 can overlap.
+
+## Native Windows
+
+Use `reach-first-level-windows.pad` for native Windows hardware-decode runs.
+Without full-resolution frame dumping, the unskipped reference DXVA path reaches
+`title_controller_ship` between about 167 and 273 seconds depending on decoder
+throughput, then finishes loading `worldmap` about 13-17 seconds later. The route waits until 80 seconds—after the
+hardware decoder has delivered its first frame—then repeats released
+Cross/Cross/Options pulses across the logo/title transition. A second recovery
+sequence covers the late unskipped-movie window because native Windows pad
+polling becomes sparse once the world-map load is idle. Long Cross holds after
+720 seconds cover screenshot runs where writing 3840x2160 frame dumps reduces
+guest pad polling to roughly 1-2 Hz. The route also retains the validated
+flip-anchored Linux sequence:
+
+```powershell
+$env:PROSPER_GUEST_FS = '1'
+$env:PROSPER_GUEST_ARGS = '-force-gfx-direct'
+$env:PROSPER_NO_COMPUTE = '1'
+$env:PROSPER_PAD_SCRIPT = '@C:/path/to/prosper/scripts/astrobot/reach-first-level-windows.pad'
+$env:PROSPER_PAD_SCRIPT_LOG = '1'
+prosper/build-mingw-app/boot_trace.exe C:\path\to\PPSA21564-app0
+```
+
+Do not set `PROSPER_AVP_SYNTH_FRAMES` for Windows acceptance. The log must report
+`decoder=hardware DXVA MFT` before the title/first-level state markers. The
+earlier 60-second mixed-clock route exposed the backend-frame lifetime bug
+tracked in #855; this Windows route begins later so the log retains direct DXVA
+evidence before it skips the remainder of the movie.
