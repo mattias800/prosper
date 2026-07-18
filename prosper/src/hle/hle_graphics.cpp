@@ -24,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <unordered_set>
 #include <utility>
 
 namespace prosper {
@@ -66,7 +67,26 @@ HLE(g_agc_regdefs_int) { gfx_tick(); return (uint64_t)(uintptr_t)prosper_agc_reg
 // window/surface exists. All output-struct writes are size-exact — over-writing smashes the guest's
 // stack canary (cf. the historical f_fstat bug).
 namespace {
-    int      g_vo_handle = 0;
+    constexpr uint64_t kVoErrorInvalidHandle =
+        (uint64_t)(int64_t)(int32_t)0x8029000b;  // SCE_VIDEO_OUT_ERROR_INVALID_HANDLE
+    int32_t g_vo_handle = 0;
+    std::mutex g_vo_handle_mx;
+    std::unordered_set<int32_t> g_vo_handles;
+
+    // Keep a live handle pinned until the HLE operation finishes. This makes validation and close
+    // atomic with respect to each other: a concurrent Close cannot retire a handle after a caller
+    // validates it but before that caller mutates flip, event, or buffer-registration state.
+    class VideoOutHandleGuard {
+    public:
+        explicit VideoOutHandleGuard(uint64_t raw_handle)
+            : lock_(g_vo_handle_mx),
+              valid_(g_vo_handles.find((int32_t)raw_handle) != g_vo_handles.end()) {}
+        bool valid() const { return valid_; }
+
+    private:
+        std::unique_lock<std::mutex> lock_;
+        bool valid_;
+    };
     // Flip bookkeeping (#82): count/flipArg/currentBuffer are written by TWO paths — SubmitFlip on
     // any guest thread and prosper_vo_flip_from_gpu on the submit thread — and read by GetFlipStatus
     // on Unity's pacer thread. They must move as ONE unit under a mutex: an unsynchronized reader
@@ -293,16 +313,30 @@ HLE(g_agc_add_eq_event) {   // (eq, id, udata, ...)
     prosper_eq_add_eop(a0, (int64_t)a1, a2);
     return 0;
 }
-HLE(g_vo_open)        { gfx_tick(); return (uint64_t)(int64_t)(++g_vo_handle + 0x1000); }  // positive handle
-HLE(g_vo_close)       { return 0; }
+HLE(g_vo_open) {
+    gfx_tick();
+    std::lock_guard<std::mutex> lk(g_vo_handle_mx);
+    const int32_t handle = ++g_vo_handle + 0x1000;
+    g_vo_handles.insert(handle);
+    return (uint64_t)(int64_t)handle;
+}
+HLE(g_vo_close) {
+    std::lock_guard<std::mutex> lk(g_vo_handle_mx);
+    if (g_vo_handles.erase((int32_t)a0) != 1) return kVoErrorInvalidHandle;
+    return 0;
+}
 // sceVideoOutAddFlipEvent(eq, handle, udata): register a flip-completion event source on an equeue.
 HLE(g_vo_addflipevent) {
+    VideoOutHandleGuard handle(a1);
+    if (!handle.valid()) return kVoErrorInvalidHandle;
     if (evlog()) fprintf(stderr, "[ev] AddFlipEvent eq=0x%llx handle=0x%llx udata=0x%llx\n",
         (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2);
     prosper_eq_add_flip(a0, (int64_t)(int32_t)a1, a2);
     return 0;
 }
 HLE(g_vo_addvblankevent) {
+    VideoOutHandleGuard handle(a1);
+    if (!handle.valid()) return kVoErrorInvalidHandle;
     if (evlog()) fprintf(stderr, "[ev] AddVblankEvent eq=0x%llx handle=0x%llx udata=0x%llx\n",
         (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2);
     prosper_eq_add_vblank(a0, (int64_t)(int32_t)a1, a2);
@@ -313,12 +347,16 @@ HLE(g_vo_addvblankevent) {
 HLE(g_vo_get_buffer_label_address) {
     if (!a1)
         return (uint64_t)(int64_t)(int32_t)0x80290002;  // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
+    VideoOutHandleGuard handle(a0);
+    if (!handle.valid()) return kVoErrorInvalidHandle;
     *(uintptr_t*)(uintptr_t)a1 = (uintptr_t)g_buffer_labels;
     return 16;
 }
 // sceVideoOutSetFlipRate (CBiu4mCE1DA): remember the port's requested divisor. Presentation is
 // synchronous today, but callers must still observe the documented validation/state contract.
 HLE(g_vo_set_flip_rate) {
+    VideoOutHandleGuard handle(a0);
+    if (!handle.valid()) return kVoErrorInvalidHandle;
     const int32_t rate = (int32_t)a1;
     if (rate < 0 || rate > 2)
         return (uint64_t)(int64_t)(int32_t)0x80290001;  // SCE_VIDEO_OUT_ERROR_INVALID_VALUE
@@ -327,6 +365,8 @@ HLE(g_vo_set_flip_rate) {
     return 0;
 }
 HLE(g_vo_submitflip)  {
+    VideoOutHandleGuard handle(a0);
+    if (!handle.valid()) return kVoErrorInvalidHandle;
     if (evlog()) fprintf(stderr, "[ev] SubmitFlip handle=0x%llx bufidx=%lld flipmode=0x%llx fl013arg=0x%llx\n",
         (unsigned long long)a0, (long long)(int32_t)a1, (unsigned long long)a2, (unsigned long long)a3);
     const int32_t buffer_index = (int32_t)a1;
@@ -344,17 +384,26 @@ HLE(g_vo_submitflip)  {
 // Unity's frame pacer polls for its submitted flipArg to complete before building the next frame, so
 // dropping this packet stalls the game at one rendered frame forever.
 extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32_t flip_mode, int64_t flip_arg) {
+    VideoOutHandleGuard live_handle(handle);
+    if (!live_handle.valid()) return;
     if (evlog()) fprintf(stderr, "[ev] GpuFlip handle=0x%x bufidx=%d mode=0x%x fliparg=0x%llx\n",
                          handle, bufidx, flip_mode, (unsigned long long)flip_arg);
     flip_advance(bufidx, flip_arg);
     gpu::present_flip(bufidx, flip_arg);   // scanout bookkeeping, same as the API flip
     prosper_eq_trigger_flip(flip_arg);     // flip completed (synchronous): fire the flip event
 }
-HLE(g_vo_flippending) { if (evlog()) fprintf(stderr, "[ev] IsFlipPending\n"); return 0; }        // never pending
+HLE(g_vo_flippending) {
+    VideoOutHandleGuard handle(a0);
+    if (!handle.valid()) return kVoErrorInvalidHandle;
+    if (evlog()) fprintf(stderr, "[ev] IsFlipPending\n");
+    return 0;  // never pending in the synchronous present model
+}
 HLE(g_vo_flipstatus)  { // (handle, SceVideoOutFlipStatus* status): report our simulated flip count.
     // SceVideoOutFlipStatus is exactly 0x40 bytes — writing more smashes the caller's stack canary!
     if (!a1)
         return (uint64_t)(int64_t)(int32_t)0x80290002;  // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
+    VideoOutHandleGuard handle(a0);
+    if (!handle.valid()) return kVoErrorInvalidHandle;
     uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x40);
     uint64_t cnt; int64_t arg; int32_t buf;
     { std::lock_guard<std::mutex> lk(g_flip_mx);   // consistent snapshot of the flip triple
@@ -369,6 +418,8 @@ HLE(g_vo_flipstatus)  { // (handle, SceVideoOutFlipStatus* status): report our s
 HLE(g_vo_resstatus)   {
     if (!a1)
         return (uint64_t)(int64_t)(int32_t)0x80290002;  // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
+    VideoOutHandleGuard handle(a0);
+    if (!handle.valid()) return kVoErrorInvalidHandle;
     uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x30);
     *(uint32_t*)(s + 0x00) = kDispW;   *(uint32_t*)(s + 0x04) = kDispH;   // full w/h
     *(uint32_t*)(s + 0x08) = kDispW;   *(uint32_t*)(s + 0x0c) = kDispH;   // pane w/h
@@ -385,6 +436,8 @@ HLE(g_vo_resstatus)   {
 HLE(g_vo_vblankstatus) {
     if (!a1)
         return (uint64_t)(int64_t)(int32_t)0x80290002;  // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
+    VideoOutHandleGuard handle(a0);
+    if (!handle.valid()) return kVoErrorInvalidHandle;
     uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x28);
     uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                       std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -404,13 +457,20 @@ HLE(g_vo_vblankstatus) {
 HLE(g_vo_devcap) {
     if (!a1)
         return (uint64_t)(int64_t)(int32_t)0x80290002;  // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
+    VideoOutHandleGuard handle(a0);
+    if (!handle.valid()) return kVoErrorInvalidHandle;
     *(uint64_t*)(uintptr_t)a1 = 0;
     return 0;
 }
 
-// sceVideoOutIsOutputSupported (Nv8c-Kb+DUM): (port_type, mode/feature) -> bool. A standard main-bus
+// sceVideoOutIsOutputSupported (Nv8c-Kb+DUM): (handle, mode/feature) -> bool. A standard main-bus
 // output supports the queried mode → 1.
-HLE(g_vo_is_output_supported) { vo_argtrace("IsOutputSupported", a0,a1,a2,a3,a4,a5); return 1; }
+HLE(g_vo_is_output_supported) {
+    VideoOutHandleGuard handle(a0);
+    if (!handle.valid()) return kVoErrorInvalidHandle;
+    vo_argtrace("IsOutputSupported", a0,a1,a2,a3,a4,a5);
+    return 1;
+}
 
 // sceVideoOutSetBufferAttribute (i6-sR91Wt-4): initialize the legacy/Gen4 BufferAttribute from
 // (attr, pixel_format, tiling_mode, aspect_ratio, width, height, pitch_in_pixel). The ABI object is
@@ -450,6 +510,8 @@ HLE(g_vo_set_buffer_attribute2) {  // a0=attr* a1=pixel_format a2=tiling a3=widt
 // offset 0; the remaining surface fields share the Gen5 offsets used by the present registry.
 HLE(g_vo_register_buffers) {  // a0=handle a1=start a2=addresses a3=buffer_num a4=attribute
     vo_argtrace("RegisterBuffers", a0,a1,a2,a3,a4,a5);
+    VideoOutHandleGuard handle(a0);
+    if (!handle.valid()) return kVoErrorInvalidHandle;
     const int start = (int)a1, num = (int)a3;
     if (!a2 || !a4)
         return (uint64_t)(int64_t)(int32_t)0x80290002;  // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
@@ -500,6 +562,8 @@ HLE(g_vo_register_buffers) {  // a0=handle a1=start a2=addresses a3=buffer_num a
 // succeeds so the game proceeds to flips.
 HLE(g_vo_register_buffers2) {  // a0=handle a1=set_index a2=buffer_index_start a3=buffers a4=buffer_num a5=attribute
     vo_argtrace("RegisterBuffers2", a0,a1,a2,a3,a4,a5);
+    VideoOutHandleGuard handle(a0);
+    if (!handle.valid()) return kVoErrorInvalidHandle;
     int set = (int)a1, start = (int)a2, num = (int)a4;
     if (!a3 || !a5) return (uint64_t)(int64_t)-1;
     if (set < 0 || set > 3 || start < 0 || start > 15 || num < 1 || num > 16 || start + num > 16)
@@ -548,6 +612,8 @@ HLE(g_vo_register_buffers2) {  // a0=handle a1=set_index a2=buffer_index_start a
 // recompute the highest visible slot instead of clearing the entire display unconditionally.
 HLE(g_vo_unregister_buffers) {
     vo_argtrace("UnregisterBuffers", a0,a1,a2,a3,a4,a5);
+    VideoOutHandleGuard handle(a0);
+    if (!handle.valid()) return kVoErrorInvalidHandle;
     const int set = (int)a1;
     if (set < 0 || set > 3)
         return (uint64_t)(int64_t)(int32_t)0x8029000a;  // SCE_VIDEO_OUT_ERROR_INVALID_INDEX
@@ -600,7 +666,12 @@ HLE(g_vo_unregister_buffers) {
 
 // sceVideoOutConfigureOutput (w0hLuNarQxY): set the output mode (resolution/refresh/format). We only
 // advertise one mode (1080p60), so accept the configuration.
-HLE(g_vo_configure_output) { vo_argtrace("ConfigureOutput", a0,a1,a2,a3,a4,a5); return 0; }
+HLE(g_vo_configure_output) {
+    VideoOutHandleGuard handle(a0);
+    if (!handle.valid()) return kVoErrorInvalidHandle;
+    vo_argtrace("ConfigureOutput", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
 
 // sceVideoOutGetOutputStatus (utPrVdxio-8): (handle, status*). The full out-struct layout has NO
 // reference (Kyty predates it, shadPS4 only stubs the name), but the ONE consumer in the wild is
@@ -618,6 +689,8 @@ HLE(g_vo_get_output_status) {
     vo_argtrace("GetOutputStatus", a0,a1,a2,a3,a4,a5);
     if (!a1)
         return (uint64_t)(int64_t)(int32_t)0x80290002;  // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
+    VideoOutHandleGuard handle(a0);
+    if (!handle.valid()) return kVoErrorInvalidHandle;
     if (a1 > 0xffffull) {
         *(uint32_t*)(uintptr_t)a1       = 0;   // +0x00: output state (0 = the boring/default state)
         *(uint32_t*)(uintptr_t)(a1 + 4) = 0;   // +0x04: dynamic-range mode (2 = HDR; 0 = SDR)
@@ -659,7 +732,12 @@ HLE(g_vo_get_event_data) {
 // sceVideoOutSetWindowModeMargins (MTxxrOCeSig — same brute-force naming): windowed-mode margin
 // hint for the system compositor. No compositor here — accept and ignore. CONFIDENCE: HIGH (pure
 // cosmetic setter; success unblocks the caller).
-HLE(g_vo_set_window_mode_margins) { vo_argtrace("SetWindowModeMargins", a0,a1,a2,a3,a4,a5); return 0; }
+HLE(g_vo_set_window_mode_margins) {
+    VideoOutHandleGuard handle(a0);
+    if (!handle.valid()) return kVoErrorInvalidHandle;
+    vo_argtrace("SetWindowModeMargins", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
 
 // Diagnostic tracer for the (undocumented) libSceAgc / libSceAgcDriver calls: logs the NID, the guest
 // callsite, and all six args (gated on PROSPER_GFXLOG). Behaviour is identical to the unimplemented

@@ -122,18 +122,21 @@ int main() {
     // GetFlipStatus's count/flipArg/currentBuffer are what Unity's frame pacer polls before building
     // the next frame; a dropped in-stream flip stalls the game at one rendered frame.
     {
+        auto open       = Hle::lookup(nid_hash("sceVideoOutOpen"));
         auto setflip    = Hle::lookup("YUeqkyT7mEQ");                            // sceAgcDcbSetFlip
         auto flipstatus = Hle::lookup(nid_hash("sceVideoOutGetFlipStatus"));
-        CHECK(setflip && flipstatus, "SetFlip builder + GetFlipStatus registered");
-        if (setflip && flipstatus) {
+        CHECK(open && setflip && flipstatus,
+              "VideoOutOpen + SetFlip builder + GetFlipStatus registered");
+        if (open && setflip && flipstatus) {
+            const uint64_t handle = open(0, 0, 0, 0, 0, 0);
             uint8_t st_before[0x40], st_after[0x40];
-            flipstatus(0x1001, (uint64_t)(uintptr_t)st_before, 0, 0, 0, 0);
+            flipstatus(handle, (uint64_t)(uintptr_t)st_before, 0, 0, 0, 0);
             uint32_t fbuf[64]; memset(fbuf, 0, sizeof fbuf);
             Dcb fd{}; fd.bottom = fbuf; fd.top = fbuf + 64; fd.cursor_up = fbuf; fd.cursor_down = fbuf + 64;
-            setflip((uint64_t)(uintptr_t)&fd, 0x1001, 1, 2, 0x1234567890abcdefull, 0);
+            setflip((uint64_t)(uintptr_t)&fd, handle, 1, 2, 0x1234567890abcdefull, 0);
             GpuState s3;
             run_cb(fbuf, 64, s3);
-            flipstatus(0x1001, (uint64_t)(uintptr_t)st_after, 0, 0, 0, 0);
+            flipstatus(handle, (uint64_t)(uintptr_t)st_after, 0, 0, 0, 0);
             uint64_t cnt_b = *(uint64_t*)(st_before + 0x00), cnt_a = *(uint64_t*)(st_after + 0x00);
             int64_t  arg_a = *(int64_t*)(st_after + 0x18);
             int32_t  buf_a = *(int32_t*)(st_after + 0x38);
