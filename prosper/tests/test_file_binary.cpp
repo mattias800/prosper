@@ -51,8 +51,13 @@ int main() {
     HleFn kernel_dup2_fn = Hle::lookup(nid_hash("sceKernelDup2"));
     HleFn mkdir_fn = Hle::lookup(nid_hash("mkdir"));
     HleFn kernel_mkdir_fn = Hle::lookup(nid_hash("sceKernelMkdir"));
+    HleFn getdents_fn = Hle::lookup(nid_hash("getdents"));
+    HleFn kernel_getdents_fn = Hle::lookup(nid_hash("sceKernelGetdents"));
+    HleFn getdirentries_fn = Hle::lookup(nid_hash("getdirentries"));
+    HleFn kernel_getdirentries_fn = Hle::lookup(nid_hash("sceKernelGetdirentries"));
     CHECK(open_fn && read_fn && lseek_fn && close_fn && dup_fn && kernel_dup_fn &&
-              dup2_fn && kernel_dup2_fn && mkdir_fn && kernel_mkdir_fn,
+              dup2_fn && kernel_dup2_fn && mkdir_fn && kernel_mkdir_fn && getdents_fn &&
+              kernel_getdents_fn && getdirentries_fn && kernel_getdirentries_fn,
           "file HLE functions registered");
 
     // Creating an existing directory is a failure, not an idempotent success. Linux previously
@@ -80,6 +85,40 @@ int main() {
     std::array<uint8_t, 512> actual{};
     int64_t fd = open_fn ? (int64_t)open_fn((uint64_t)(uintptr_t)path, 0, 0, 0, 0, 0) : -1;
     CHECK(fd >= 0, "open fixture through guest fd HLE");
+
+    // libc and sceKernel expose the same enumeration operation with different error conventions.
+    // The old shared handler returned a positive-looking SCE error to libc; Windows returned false
+    // EOF for every call. Exercise both invalid arguments and a valid non-directory descriptor.
+    std::array<uint8_t, 64> dir_buffer{};
+    int64_t base = 0x12345678;
+    errno = 0;
+    int64_t libc_bad_buffer = getdents_fn
+        ? (int64_t)getdents_fn((uint64_t)fd, 0, dir_buffer.size(), 0, 0, 0)
+        : 0;
+    int libc_bad_buffer_errno = errno;
+    uint64_t kernel_bad_buffer = kernel_getdents_fn
+        ? kernel_getdents_fn((uint64_t)fd, 0, dir_buffer.size(), 0, 0, 0)
+        : 0;
+    CHECK(libc_bad_buffer == -1 && libc_bad_buffer_errno == EINVAL,
+          "libc getdents returns -1 with EINVAL for an invalid buffer");
+    CHECK((uint32_t)kernel_bad_buffer == 0x80020016u,
+          "sceKernelGetdents returns SCE_KERNEL_ERROR_EINVAL directly");
+
+    errno = 0;
+    int64_t libc_not_directory = getdirentries_fn
+        ? (int64_t)getdirentries_fn((uint64_t)fd, (uint64_t)(uintptr_t)dir_buffer.data(),
+                                   dir_buffer.size(), (uint64_t)(uintptr_t)&base, 0, 0)
+        : 0;
+    int libc_not_directory_errno = errno;
+    uint64_t kernel_not_directory = kernel_getdirentries_fn
+        ? kernel_getdirentries_fn((uint64_t)fd, (uint64_t)(uintptr_t)dir_buffer.data(),
+                                  dir_buffer.size(), (uint64_t)(uintptr_t)&base, 0, 0)
+        : 0;
+    CHECK(libc_not_directory == -1 && libc_not_directory_errno == ENOTDIR,
+          "libc getdirentries returns -1 with ENOTDIR for a regular file");
+    CHECK((uint32_t)kernel_not_directory == 0x80020014u,
+          "sceKernelGetdirentries returns SCE_KERNEL_ERROR_ENOTDIR directly");
+
     int64_t n = fd >= 0 && read_fn
         ? (int64_t)read_fn((uint64_t)fd, (uint64_t)(uintptr_t)actual.data(), actual.size(), 0, 0, 0)
         : -1;
