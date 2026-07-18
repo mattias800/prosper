@@ -53,13 +53,42 @@ resolution. Its key includes a copy of the decoded shader bytes, so same-address
 detected. It is bounded to 64 MiB by default and can be disabled with
 `PROSPER_NO_SHADER_DECODE_CACHE=1`.
 
-The persistent texture cache covers only guest-backed tiled `Unorm8x4` sampled textures. It excludes
-render targets, storage images, and unsupported formats. Every hit copies and compares the complete
-padded source before reusing decoded pixels, so address reuse and in-place mutation invalidate the
-entry. In the measured scene it produced 42 persistent hits and 14 callback-local hits out of 57
-texture uses, retained 101 entries / about 75 MiB, and observed no invalidation. Disable it with
-`PROSPER_NO_TEXTURE_DECODE_CACHE=1`; its default 256 MiB budget is controlled by
+The persistent texture cache now covers guest-backed linear/tiled 2D sampled `Unorm8` textures with
+1-4 components and BC1-BC7 textures. It excludes render targets, storage images, cube/volume and DCC
+surfaces, captured host backing, and unsupported formats. Every hit validates the complete native,
+padded-tiled, or compressed-block source range, so address reuse and in-place mutation invalidate the
+entry. Its default 1 GiB budget covers Evergate's measured 835 MiB decoded working set. Disable it with
+`PROSPER_NO_TEXTURE_DECODE_CACHE=1`; the budget is controlled by
 `PROSPER_TEXTURE_DECODE_CACHE_MB`.
+
+## Evergate native-render transition (2026-07-18)
+
+Evergate's title screen and new-game transition exercise roughly 1,000 sampled-texture references and
+470-490 draws per native 1920x1080 submit. On Windows / RTX 4090, full cadence and a fresh save, the
+original 256 MiB `Unorm8x4`-only cache repeatedly decoded large BC atlases and fell to about 0.9 FPS.
+BC/narrow-format coverage plus the 1 GiB default retains about 835 MiB of decoded pixels, removes
+steady-transition decode misses, and reduces frontend resource construction from about 421 ms to
+38-40 ms.
+
+After texture decoding stopped dominating, per-draw immutable shader analysis was the next hotspot.
+Shader code span, PC-relative dispatch metadata, and fragment interpolation layout are now shared from
+a 64 MiB cache only after exact validation of the complete instruction/embedded-table byte span.
+Concrete SGPRs, descriptor tables, addresses, and backing bytes are still rebuilt for every draw.
+
+Matched dense windows were:
+
+| Measurement | Texture cache only | + immutable shader analysis |
+|---|---:|---:|
+| Draws / submit | 469-474 | 470-488 |
+| Core submit | 572-579 ms | 426-449 ms |
+| Draw realization | 222-223 ms | 55-61 ms |
+| Stage tables | 93-94 ms | 20-22 ms |
+| Shader lookup/analysis | 110 ms | 17-19 ms |
+| App rate at the dense transition | 1.7-1.9 FPS | 2.1 FPS |
+
+The following lower-draw intro windows reached 2.6 FPS. Backend execution remains about 360-388 ms in
+the dense scene and is now the dominant cost. `PROSPER_NO_SHADER_ANALYSIS_CACHE=1` restores direct
+analysis for comparison; `PROSPER_SHADER_ANALYSIS_CACHE_MB=<MiB>` changes the analysis budget.
 
 ## Dead Cells backend upload duplication (2026-07-15)
 

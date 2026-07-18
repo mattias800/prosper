@@ -4,6 +4,7 @@
 #include "../src/gpu/videoout_present.hpp"
 #include "../src/hle/dispatch.hpp"
 #include "../frontends/shared/live_renderer.hpp"
+#include "render_runner.h"
 
 #include <algorithm>
 #include <chrono>
@@ -231,6 +232,77 @@ int main() {
         CHECK(packed_red,
               "reused scratch converts and uploads the current packed R10G10B10A2 texture");
     }
+
+#if defined(_WIN32) || defined(__linux__)
+    // Evergate's dominant sampled resources are guest-backed BC textures. The frontend must retain
+    // their decoded pixels under an exact source-content version so the backend can retain the
+    // uploaded image too. A second unchanged callback previously decoded and uploaded BC again.
+    {
+        auto map_flexible = prosper::Hle::lookup(
+            prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
+        auto unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
+        constexpr uint64_t source_mapping_size = 0x10000;
+        uint64_t source_va = 0;
+        const uint64_t source_name = reinterpret_cast<uint64_t>("bc-cache-test");
+        CHECK(map_flexible && unmap &&
+                  map_flexible(reinterpret_cast<uint64_t>(&source_va), source_mapping_size,
+                               0x2 /* RW */, 0, source_name, 0) == 0 && source_va,
+              "persistent BC test maps guest-readable source memory");
+        if (source_va) {
+            const uint8_t bc3_red[16] = {
+                0xff, 0x00, 0x88, 0xc6, 0xfa, 0x88, 0xc6, 0xfa,
+                0x00, 0xf8, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x00,
+            };
+            std::memcpy(reinterpret_cast<void*>(source_va), bc3_red, sizeof(bc3_red));
+
+            DrawItem bc_draw = replay.items[0];
+            bc_draw.color0_base = 0xd60000;
+            auto bc_table = std::make_shared<ShaderResourceTable>(*bc_draw.prt);
+            ShaderResource& bc_resource = bc_table->resources[0];
+            bc_resource.gpu_addr = source_va;
+            bc_resource.host_data = nullptr;
+            bc_resource.host_data_size = 0;
+            bc_resource.size = sizeof(bc3_red);
+            bc_resource.width = bc_resource.height = 4;
+            bc_resource.depth = 1;
+            bc_resource.img_dim = 1;
+            bc_resource.tile_mode = 0;
+            bc_resource.format = DataFormat::Bc3;
+            bc_resource.num_components = 4;
+            bc_resource.compression_enabled = false;
+            bc_draw.prt = std::move(bc_table);
+
+            const std::vector<uint8_t> first_bc = render_submit_items({bc_draw}, W, H);
+            const auto first_bc_stats = prosper::test::backend_texture_upload_stats();
+            const std::vector<uint8_t> reused_bc = render_submit_items({bc_draw}, W, H);
+            const auto reused_bc_stats = prosper::test::backend_texture_upload_stats();
+            CHECK(first_bc_stats.persistent_misses == 1 &&
+                      first_bc_stats.unique_uploads == 1,
+                  "first exact-validated BC version enters the persistent backend cache");
+            CHECK(reused_bc_stats.persistent_hits == 1 &&
+                      reused_bc_stats.unique_uploads == 0 && reused_bc_stats.upload_bytes == 0,
+                  "unchanged guest-backed BC texture skips its next decode/upload callback");
+            CHECK(!first_bc.empty() && first_bc == reused_bc,
+                  "persistent BC reuse remains pixel-identical to the initial decode");
+#ifdef __linux__
+            // The cache write-watch may protect this page after the first validation. A real guest
+            // write must fault/rearm normally, invalidate the content version, and upload new pixels.
+            auto* mutable_bc = reinterpret_cast<uint8_t*>(source_va);
+            mutable_bc[8] = 0xe0;
+            mutable_bc[9] = 0x07;  // BC3 color endpoint 0: red -> green
+            const std::vector<uint8_t> changed_bc = render_submit_items({bc_draw}, W, H);
+            const auto changed_bc_stats = prosper::test::backend_texture_upload_stats();
+            CHECK(changed_bc_stats.persistent_misses == 1 &&
+                      changed_bc_stats.unique_uploads == 1,
+                  "guest BC mutation invalidates the decoded and uploaded content version");
+            CHECK(!changed_bc.empty() && changed_bc != reused_bc,
+                  "guest BC mutation publishes newly decoded pixels instead of stale cache data");
+#endif
+            CHECK(unmap(source_va, source_mapping_size, 0, 0, 0, 0) == 0,
+                  "persistent BC test unmaps its guest source");
+        }
+    }
+#endif
 
     // A non-VideoOut producer must render at CB_COLOR0_ATTRIB2's extent, be cached under its
     // target address, and feed a later pass. Before #526 both passes used the global 64x64 extent.

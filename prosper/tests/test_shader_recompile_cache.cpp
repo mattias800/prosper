@@ -47,6 +47,7 @@ static const uint32_t kPs[] = {
 int main() {
     std::printf("== test_shader_recompile_cache ==\n");
     clear_shader_recompile_cache();
+    clear_shader_analysis_cache();
 
     ShaderResource resource;
     resource.cls = ResourceClass::VertexBuffer;
@@ -90,6 +91,10 @@ int main() {
           "identical code and descriptor semantics hit the cache");
     CHECK(first_identity != 0 && repeated_identity == first_identity,
           "shader cache hits preserve a non-zero compiled-shader identity");
+    auto analysis_stats = shader_analysis_cache_stats();
+    CHECK(analysis_stats.misses == 1 && analysis_stats.hits == 1 &&
+              analysis_stats.entries == 1,
+          "repeated recompilation reuses byte-validated immutable shader analysis");
     CHECK(count_extension(dump_directory, ".bin") == 1 &&
               count_extension(dump_directory, ".spv") == 1,
           "successful shader diagnostics deduplicate cache hits");
@@ -284,6 +289,21 @@ int main() {
         &identity_after_clear);
     CHECK(identity_after_clear > identity_before_clear,
           "cache reset never recycles compiled-shader identities");
+
+    clear_shader_recompile_cache();
+    clear_shader_analysis_cache();
+    std::vector<uint32_t> mutable_ps(kPs, kPs + std::size(kPs));
+    (void)recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, mutable_ps.data(), mutable_ps.size(), nullptr);
+    (void)recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, mutable_ps.data(), mutable_ps.size(), nullptr);
+    mutable_ps[0] ^= 1u;  // same allocation, changed instruction bytes
+    (void)recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, mutable_ps.data(), mutable_ps.size(), nullptr);
+    analysis_stats = shader_analysis_cache_stats();
+    CHECK(analysis_stats.hits == 1 && analysis_stats.misses == 2 &&
+              analysis_stats.invalidations == 1,
+          "same-address shader mutation invalidates immutable analysis before reuse");
 
     if (failures) {
         std::printf("== FAIL: %d ==\n", failures);
