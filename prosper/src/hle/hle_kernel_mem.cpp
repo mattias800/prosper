@@ -2269,7 +2269,9 @@ HLE(k_wait_on_address) {
     ULONGLONG deadline = 0;   // 0 = infinite
     if (a2 && honor_timeout) {
         uint32_t us = *(volatile uint32_t*)(uintptr_t)a2;
-        ULONGLONG ms = us == 0 ? 1 : (ULONGLONG)((us + 999) / 1000);   // us -> ms, round up; 0 == poll
+        // Widen before rounding. UINT32_MAX is a common "effectively infinite" bounded wait;
+        // adding 999 in uint32_t wrapped it to 998 and turned a ~71-minute wait into 1 ms.
+        ULONGLONG ms = us == 0 ? 1 : ((ULONGLONG)us + 999) / 1000;   // us -> ms, round up; 0 == poll
         deadline = GetTickCount64() + ms;
     }
     volatile uint32_t* wa = (volatile uint32_t*)(uintptr_t)a0;
