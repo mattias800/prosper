@@ -73,6 +73,64 @@ int main() {
     CHECK(*cell == 0x6310CAFEu, "first touch commits one guest page and preserves the write");
     CHECK(unmap(va, len, 0, 0, 0, 0) == 0, "reserved page unmaps cleanly");
 
+    // Placeholder-backed flexible memory must retain the old VirtualAlloc partial-unmap
+    // semantics: decommit only the requested guest page, preserve neighboring data, and allow
+    // the hole to be committed again in place.
+    constexpr uint64_t flexible_len = 0x10000;
+    uint64_t flexible_base = 0;
+    CHECK(reserve((uint64_t)(uintptr_t)&flexible_base, flexible_len, 0, 0x4000, 0, 0) == 0 &&
+              flexible_base,
+          "reserve a multi-page placeholder-backed flexible range");
+    uint64_t flexible_full = flexible_base;
+    const bool flexible_full_mapped = flexible_base &&
+        flexible((uint64_t)(uintptr_t)&flexible_full, flexible_len, 0x2, 0,
+                 (uint64_t)(uintptr_t)"partial-flexible", 0) == 0 &&
+        flexible_full == flexible_base;
+    CHECK(flexible_full_mapped,
+          "commit the full placeholder-backed flexible range");
+    if (flexible_full_mapped) {
+        *(volatile uint64_t*)(uintptr_t)(flexible_base + 0x0100) = 0x1111aaaabbbb2222ull;
+        *(volatile uint64_t*)(uintptr_t)(flexible_base + 0x4100) = 0x3333ccccdddd4444ull;
+        *(volatile uint64_t*)(uintptr_t)(flexible_base + 0xc100) = 0x5555eeeeffff6666ull;
+        CHECK(unmap(flexible_base + 0x4000, 0x4000, 0, 0, 0, 0) == 0,
+              "partial unmap decommits one page of a placeholder-backed flexible mapping");
+        MEMORY_BASIC_INFORMATION flexible_hole_info{}, flexible_prefix_info{},
+                                 flexible_suffix_info{};
+        VirtualQuery((void*)(uintptr_t)(flexible_base + 0x4000), &flexible_hole_info,
+                     sizeof(flexible_hole_info));
+        VirtualQuery((void*)(uintptr_t)flexible_base, &flexible_prefix_info,
+                     sizeof(flexible_prefix_info));
+        VirtualQuery((void*)(uintptr_t)(flexible_base + 0xc000), &flexible_suffix_info,
+                     sizeof(flexible_suffix_info));
+        CHECK(flexible_hole_info.State == MEM_RESERVE &&
+                  flexible_prefix_info.State == MEM_COMMIT &&
+                  flexible_suffix_info.State == MEM_COMMIT,
+              "partial flexible unmap preserves committed prefix and suffix pages");
+        CHECK(*(volatile uint64_t*)(uintptr_t)(flexible_base + 0x0100) ==
+                  0x1111aaaabbbb2222ull &&
+              *(volatile uint64_t*)(uintptr_t)(flexible_base + 0xc100) ==
+                  0x5555eeeeffff6666ull,
+              "partial flexible unmap preserves neighboring contents");
+        uint64_t flexible_hole = flexible_base + 0x4000;
+        const bool flexible_hole_mapped =
+            flexible((uint64_t)(uintptr_t)&flexible_hole, 0x4000, 0x2, 0,
+                     (uint64_t)(uintptr_t)"partial-flexible-hole", 0) == 0 &&
+            flexible_hole == flexible_base + 0x4000;
+        CHECK(flexible_hole_mapped,
+              "MapFlexible recommits the decommitted private page in place");
+        if (flexible_hole_mapped) {
+            *(volatile uint64_t*)(uintptr_t)(flexible_hole + 0x100) =
+                0x7777000011118888ull;
+            CHECK(*(volatile uint64_t*)(uintptr_t)(flexible_hole + 0x100) ==
+                      0x7777000011118888ull,
+                  "recommitted flexible page is writable");
+        }
+        CHECK(unmap(flexible_base, flexible_len, 0, 0, 0, 0) == 0,
+              "partially unmapped flexible allocation releases cleanly as one range");
+    } else if (flexible_base) {
+        unmap(flexible_base, flexible_len, 0, 0, 0, 0);
+    }
+
     alignas(8) uint8_t invalid_unmap[0x20]{};
     *(uint64_t*)(invalid_unmap + 0x00) = 0x30000020000ull;
     *(uint64_t*)(invalid_unmap + 0x10) = len;
@@ -213,14 +271,34 @@ int main() {
                   (writable_after.Protect & 0xff) == PAGE_READWRITE,
               "mprotect updates an existing sparse host page");
     }
-    CHECK(map((uint64_t)(uintptr_t)&sparse_va2, sparse_len, 0x2, 0,
+    CHECK(map((uint64_t)(uintptr_t)&sparse_va2, sparse_len, 0x1, 0,
               sparse_phys, sparse_align) == 0 && sparse_va2 && sparse_va2 != sparse_va1,
-          "map a second sparse view of the same physical range");
+          "map a second read-only sparse view of the same physical range");
     if (sparse_va1 && sparse_va2) {
         *(volatile uint64_t*)(uintptr_t)(sparse_va1 + 0x5120) = 0x5A17C0DE6310CAFEull;
         CHECK(*(volatile uint64_t*)(uintptr_t)(sparse_va2 + 0x5120) ==
                   0x5A17C0DE6310CAFEull,
               "sparse views retain physical alias coherence");
+
+        constexpr uint64_t late_commit_offset = 0x01800000;
+        MEMORY_BASIC_INFORMATION late_rw_before{}, late_ro_before{};
+        VirtualQuery((void*)(uintptr_t)(sparse_va1 + late_commit_offset),
+                     &late_rw_before, sizeof(late_rw_before));
+        VirtualQuery((void*)(uintptr_t)(sparse_va2 + late_commit_offset),
+                     &late_ro_before, sizeof(late_ro_before));
+        CHECK(late_rw_before.State == MEM_RESERVE && late_ro_before.State == MEM_RESERVE,
+              "inverse-order alias test starts with the physical page untouched");
+        *(volatile uint64_t*)(uintptr_t)(sparse_va1 + late_commit_offset + 0x120) =
+            0x1a7ec0de6310cafeull;
+        MEMORY_BASIC_INFORMATION late_ro_after{};
+        VirtualQuery((void*)(uintptr_t)(sparse_va2 + late_commit_offset),
+                     &late_ro_after, sizeof(late_ro_after));
+        CHECK(late_ro_after.State == MEM_COMMIT &&
+                  (late_ro_after.Protect & 0xff) == PAGE_READONLY,
+              "late physical commit reapplies the untouched alias's read-only protection");
+        CHECK(*(volatile uint64_t*)(uintptr_t)(sparse_va2 + late_commit_offset + 0x120) ==
+                  0x1a7ec0de6310cafeull,
+              "late-committed read-only alias remains physically coherent");
     }
     if (sparse_va1) CHECK(unmap(sparse_va1, sparse_len, 0, 0, 0, 0) == 0,
                           "unmap first sparse direct-memory view");

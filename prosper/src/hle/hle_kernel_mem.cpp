@@ -1941,6 +1941,50 @@ namespace {
         return true;
     }
 
+    bool tracked_mapping_protection(uint64_t begin, uint64_t end, int& hp) {
+        if (begin >= end) return false;
+        std::lock_guard<std::mutex> lk(g_mx);
+        const Mapping* best = nullptr;
+        for (const Mapping& mapping : g_maps) {
+            if (!mapping.committed || begin < mapping.base ||
+                begin >= mapping.base + mapping.size) continue;
+            if (!best || mapping.base > best->base) best = &mapping;
+        }
+        if (!best || end > best->base + best->size) return false;
+        hp = best->prot;
+        return true;
+    }
+
+    // SEC_RESERVE commitment is shared by every view of the physical page, but each view keeps
+    // its own protection contract. A page first committed through an RW alias can therefore make
+    // an untouched RO alias committed too; immediately apply every alias's tracked protection.
+    bool apply_dmem_page_protections_locked(uint64_t phys_page) {
+        if (phys_page > UINT64_MAX - 0x4000) return false;
+        const uint64_t generation = host::guest_mapping_generation();
+        for (DmemView& view : g_dviews) {
+            if (!view.sparse || phys_page < view.phys ||
+                phys_page + 0x4000 > view.phys + view.guest_size) continue;
+            const uint64_t alias_page = view.guest_base + (phys_page - view.phys);
+            int hp = 0;
+            if (!tracked_mapping_protection(alias_page, alias_page + 0x4000, hp)) return false;
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(alias_page)),
+                              &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
+            DWORD old = 0;
+            if (!VirtualProtect(reinterpret_cast<void*>(static_cast<uintptr_t>(alias_page)),
+                                0x4000, win_page_prot(hp), &old)) return false;
+
+            if (view.page_cache_generation != generation) {
+                std::fill(view.committed_pages.begin(), view.committed_pages.end(), 0);
+                view.page_cache_generation = generation;
+            }
+            const uint64_t index = (alias_page - view.guest_base) / 0x4000;
+            if (index / 64 >= view.committed_pages.size()) return false;
+            view.committed_pages[index / 64] |= 1ull << (index & 63);
+        }
+        return true;
+    }
+
     int commit_sparse_dmem(uint64_t addr, uint64_t len, bool write) {
         if (!len || addr > UINT64_MAX - len ||
             !sparse_dmem_view_contains(addr, addr + len)) return 0;
@@ -1986,7 +2030,8 @@ namespace {
                         if ((mbi.Protect & blocked) || !(mbi.Protect & readable) ||
                             (write && !(mbi.Protect & writable))) return 0;
                     }
-                    selected->committed_pages[index / 64] |= mask;
+                    const uint64_t phys_page = selected->phys + (page - selected->guest_base);
+                    if (!apply_dmem_page_protections_locked(phys_page)) return 0;
                 }
                 if (page == last) break;
             }
@@ -2012,11 +2057,18 @@ namespace {
                                        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
                 if ((mbi.Protect & blocked) || !(mbi.Protect & readable) ||
                     (write && !(mbi.Protect & writable))) return 0;
-                const uint64_t region_end = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-                if (region_end > last) break;
-                if (region_end <= page) return 0;
-                page = (region_end + 0x3fff) & ~0x3fffull;
-                continue;
+            }
+            {
+                std::lock_guard<std::mutex> lk(g_dview_mx);
+                DmemView* selected = nullptr;
+                for (DmemView& view : g_dviews) {
+                    if (!view.sparse || page < view.guest_base ||
+                        page + 0x4000 > view.guest_base + view.guest_size) continue;
+                    selected = &view;
+                    break;
+                }
+                if (!selected || !apply_dmem_page_protections_locked(
+                        selected->phys + (page - selected->guest_base))) return 0;
             }
             if (page == last) break;
             page += 0x4000;
@@ -2056,6 +2108,19 @@ namespace {
         uint8_t* bytes = (uint8_t*)view + delta;
         if (VirtualAlloc(bytes, (SIZE_T)len, MEM_COMMIT, PAGE_READWRITE)) {
             memset(bytes, 0, (size_t)len);
+            bool protections_ok = true;
+            {
+                std::lock_guard<std::mutex> lk(g_dview_mx);
+                for (uint64_t page = phys; page < phys + len; page += 0x4000) {
+                    if (!apply_dmem_page_protections_locked(page)) {
+                        protections_ok = false;
+                        break;
+                    }
+                }
+            }
+            if (!protections_ok)
+                MLOG("dmem zero could not restore alias protections phys=0x%llx len=0x%llx\n",
+                     (unsigned long long)phys, (unsigned long long)len);
         } else {
             MLOG("dmem zero commit phys=0x%llx len=0x%llx failed error=%lu\n",
                  (unsigned long long)phys, (unsigned long long)len, GetLastError());
@@ -2136,10 +2201,32 @@ namespace {
                 std::lock_guard<std::mutex> lk(g_dview_mx);
                 if (private_placeholder_view_containing_locked(hint, hint + len)) {
                     placeholder_owned = true;
-                    DWORD old = 0;
-                    if (VirtualProtect(reinterpret_cast<void*>(static_cast<uintptr_t>(hint)),
-                                       static_cast<SIZE_T>(len), pp, &old))
-                        result = reinterpret_cast<void*>(static_cast<uintptr_t>(hint));
+                    bool needs_commit = false;
+                    uint64_t cursor = hint;
+                    while (cursor < hint + len) {
+                        MEMORY_BASIC_INFORMATION mbi{};
+                        if (!VirtualQuery(
+                                reinterpret_cast<void*>(static_cast<uintptr_t>(cursor)),
+                                &mbi, sizeof(mbi)) || mbi.State == MEM_FREE) break;
+                        if (mbi.State == MEM_RESERVE) needs_commit = true;
+                        const uint64_t region_end = std::min<uint64_t>(
+                            hint + len,
+                            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mbi.BaseAddress)) +
+                                mbi.RegionSize);
+                        if (region_end <= cursor) break;
+                        cursor = region_end;
+                    }
+                    if (cursor == hint + len) {
+                        if (!needs_commit || VirtualAlloc(
+                                reinterpret_cast<void*>(static_cast<uintptr_t>(hint)),
+                                static_cast<SIZE_T>(len), MEM_COMMIT, pp)) {
+                            DWORD old = 0;
+                            if (VirtualProtect(
+                                    reinterpret_cast<void*>(static_cast<uintptr_t>(hint)),
+                                    static_cast<SIZE_T>(len), pp, &old))
+                                result = reinterpret_cast<void*>(static_cast<uintptr_t>(hint));
+                        }
+                    }
                 } else {
                     PlaceholderOwner owner = PlaceholderOwner::Guest;
                     void* placeholder = take_guest_placeholder_locked(hint, len, 0x1000);
@@ -2548,15 +2635,20 @@ namespace {
     // untouched prefix/suffix with views of their original physical offsets, and retain the hole as
     // an inaccessible free placeholder for an exact future remap.
     bool win_unmap(uint64_t addr, uint64_t len) {
-        if (!addr || !len || (addr & 0xfff) || (len & 0xfff) ||
-            addr > UINT64_MAX - len) return false;
+        if (!addr || !len || addr > UINT64_MAX - len) return false;
         const uint64_t end = addr + len;
         std::vector<DmemView> added;
         bool special_overlap = false;
         {
             std::lock_guard<std::mutex> lk(g_dview_mx);
+            struct PrivateUnmapTarget {
+                PrivatePlaceholderView view;
+                uint64_t cut_base;
+                uint64_t cut_size;
+                bool whole;
+            };
             std::vector<DmemView> targets;
-            std::vector<PrivatePlaceholderView> private_targets;
+            std::vector<PrivateUnmapTarget> private_targets;
             std::vector<PlaceholderSpan> guest_cuts;
             std::vector<PlaceholderSpan> covered;
             for (const DmemView& view : g_dviews) {
@@ -2573,10 +2665,15 @@ namespace {
                 const uint64_t cut_begin = std::max(addr, view.base);
                 const uint64_t cut_end = std::min(end, view.base + view.size);
                 if (cut_begin >= cut_end) continue;
-                // Returning a private replacement to a placeholder releases the whole allocation.
-                // Refuse partial cuts instead of discarding retained bytes.
-                if (cut_begin != view.base || cut_end != view.base + view.size) return false;
-                private_targets.push_back(view);
+                const bool whole = cut_begin == view.base &&
+                                   cut_end == view.base + view.size;
+                // A whole replacement returns to a reusable placeholder. A partial unmap retains
+                // the private reservation and decommits only the requested guest pages, matching
+                // the former VirtualAlloc path without discarding prefix/suffix contents.
+                if (!whole && ((cut_begin & 0x3fff) || ((cut_end - cut_begin) & 0x3fff)))
+                    return false;
+                private_targets.push_back(
+                    {view, cut_begin, cut_end - cut_begin, whole});
                 covered.push_back({cut_begin, cut_end - cut_begin});
             }
             for (const PlaceholderSpan& span : g_guest_placeholders) {
@@ -2678,28 +2775,38 @@ namespace {
                 }
 
                 size_t private_unmapped = 0;
-                for (const PrivatePlaceholderView& view : private_targets) {
+                for (const PrivateUnmapTarget& target : private_targets) {
                     host::guest_write_watch_notify_direct_mapping_removed(
-                        view.base, view.size);
-                    if (!VirtualFree(
-                            reinterpret_cast<void*>(static_cast<uintptr_t>(view.base)),
-                            static_cast<SIZE_T>(view.size),
-                            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+                        target.cut_base, target.cut_size);
+                    const bool released = target.whole
+                        ? VirtualFree(
+                              reinterpret_cast<void*>(
+                                  static_cast<uintptr_t>(target.view.base)),
+                              static_cast<SIZE_T>(target.view.size),
+                              MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0
+                        : VirtualFree(
+                              reinterpret_cast<void*>(
+                                  static_cast<uintptr_t>(target.cut_base)),
+                              static_cast<SIZE_T>(target.cut_size), MEM_DECOMMIT) != 0;
+                    if (!released) {
                         MLOG("private placeholder release va=0x%llx len=0x%llx failed "
                              "error=%lu\n",
-                             (unsigned long long)view.base,
-                             (unsigned long long)view.size, GetLastError());
+                             (unsigned long long)target.cut_base,
+                             (unsigned long long)target.cut_size, GetLastError());
                         if (private_unmapped) {
                             std::fprintf(stderr,
                                          "[memhle] fatal: partial private-placeholder unmap\n");
                             std::abort();
                         }
-                        notify_private_watch_added(view);
+                        notify_private_watch_added(
+                            {target.cut_base, target.cut_size});
                         rollback_guest();
                         rollback_views();
                         return false;
                     }
-                    remember_free_placeholder_locked(view.base, view.size);
+                    if (target.whole)
+                        remember_free_placeholder_locked(
+                            target.view.base, target.view.size);
                     ++private_unmapped;
                 }
 
@@ -2718,12 +2825,14 @@ namespace {
                         g_dviews.push_back(replacement);
                     }
                 }
-                for (const PrivatePlaceholderView& target : private_targets) {
+                for (const PrivateUnmapTarget& target : private_targets) {
+                    if (!target.whole) continue;
                     auto it = std::find_if(
                         g_private_placeholder_views.begin(),
                         g_private_placeholder_views.end(),
                         [&](const PrivatePlaceholderView& view) {
-                            return view.base == target.base && view.size == target.size;
+                            return view.base == target.view.base &&
+                                   view.size == target.view.size;
                         });
                     if (it != g_private_placeholder_views.end())
                         g_private_placeholder_views.erase(it);
