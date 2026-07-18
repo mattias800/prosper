@@ -1283,10 +1283,11 @@ void register_kernel_mem_hle() {
 // What DIFFERS: the OS primitives. Linux uses mmap over a shared memfd so a phys offset can be
 // mapped at two VAs that ALIAS the same bytes (unified-physical-memory contract). One sparse
 // paging-file section backs the entire pool, matching the POSIX memfd implementation. Windows
-// file views require 64 KiB-aligned offsets and bases, so an unaligned guest physical offset is
-// represented by a view of the containing 64 KiB block plus an in-view delta. Exact hinted maps
-// whose VA/physical deltas are incompatible with that host constraint retain the old private
-// fallback; ordinary zero-hint allocations and congruent fixed maps preserve aliasing.
+// ordinary file views require 64 KiB-aligned offsets and bases. Modern placeholder replacement
+// removes that restriction: MapViewOfFile3 accepts page-aligned offsets/bases when replacing an
+// exact placeholder, so every 16 KiB guest mapping can preserve physical aliasing. The legacy
+// MapViewOfFileEx path remains for systems without the modern APIs, but never fakes a fixed direct
+// mapping with private memory.
 // ============================================================================================
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -1536,20 +1537,25 @@ namespace {
         void* view_base;
         uint64_t view_size;
         bool sparse;
+        bool placeholder;
         uint64_t page_cache_generation = 0;
         std::vector<uint64_t> committed_pages;
     };
+    struct PlaceholderSpan { uint64_t base, size; };
     std::mutex g_dview_mx;
     std::vector<DmemView> g_dviews;
+    std::vector<PlaceholderSpan> g_free_placeholders;
 
     using VirtualAlloc2Fn = PVOID (WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG,
                                             MEM_EXTENDED_PARAMETER*, ULONG);
     using MapViewOfFile3Fn = PVOID (WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T,
                                              ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
+    using UnmapViewOfFile2Fn = BOOL (WINAPI*)(HANDLE, PVOID, ULONG);
 
     struct PlaceholderApis {
         VirtualAlloc2Fn virtual_alloc2 = nullptr;
         MapViewOfFile3Fn map_view_of_file3 = nullptr;
+        UnmapViewOfFile2Fn unmap_view_of_file2 = nullptr;
     };
 
     const PlaceholderApis& placeholder_apis() {
@@ -1562,41 +1568,137 @@ namespace {
                     GetProcAddress(module, "VirtualAlloc2"));
                 out.map_view_of_file3 = reinterpret_cast<MapViewOfFile3Fn>(
                     GetProcAddress(module, "MapViewOfFile3"));
+                out.unmap_view_of_file2 = reinterpret_cast<UnmapViewOfFile2Fn>(
+                    GetProcAddress(module, "UnmapViewOfFile2"));
             }
             return out;
         }();
         return apis;
     }
 
-    void* map_sparse_aligned_section_view(HANDLE section, uint64_t file_off,
-                                          uint64_t view_size, uint64_t align) {
+    // g_free_placeholders describes exact Windows placeholder regions. These ranges are reserved
+    // in the host but free in the guest tracker; retaining a 16 KiB hole is what lets a later fixed
+    // direct map replace it even when adjacent guest pages occupy the same 64 KiB host granule.
+    void remember_free_placeholder_locked(uint64_t base, uint64_t size) {
+        if (!size) return;
+        g_free_placeholders.push_back({base, size});
+        std::sort(g_free_placeholders.begin(), g_free_placeholders.end(),
+                  [](const PlaceholderSpan& a, const PlaceholderSpan& b) {
+                      return a.base < b.base;
+                  });
+        for (size_t i = 1; i < g_free_placeholders.size();) {
+            PlaceholderSpan& left = g_free_placeholders[i - 1];
+            const PlaceholderSpan right = g_free_placeholders[i];
+            if (left.base + left.size != right.base) { ++i; continue; }
+            if (VirtualFree(reinterpret_cast<void*>(static_cast<uintptr_t>(left.base)),
+                            static_cast<SIZE_T>(left.size + right.size),
+                            MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)) {
+                left.size += right.size;
+                g_free_placeholders.erase(g_free_placeholders.begin() + i);
+            } else {
+                ++i;
+            }
+        }
+    }
+
+    // Remove one exact page-aligned subrange from a free placeholder. VirtualFree with
+    // MEM_PRESERVE_PLACEHOLDER splits the Windows placeholder without releasing either side.
+    void* take_free_placeholder_locked(uint64_t hint, uint64_t len, uint64_t align) {
+        if (!len) return nullptr;
+        const uint64_t requested_align = align ? align : 0x1000;
+        for (size_t i = 0; i < g_free_placeholders.size(); ++i) {
+            const PlaceholderSpan span = g_free_placeholders[i];
+            uint64_t base = hint ? hint : align_up(span.base, requested_align);
+            if ((base & (requested_align - 1)) || base < span.base ||
+                base > UINT64_MAX - len ||
+                base + len > span.base + span.size) continue;
+            if (!hint && (base < kGuestAutoVaMin ||
+                          base + len - 1 > kGuestAutoVaMax)) continue;
+
+            const uint64_t prefix = base - span.base;
+            const uint64_t suffix = span.base + span.size - (base + len);
+            g_free_placeholders.erase(g_free_placeholders.begin() + i);
+            if (prefix && !VirtualFree(
+                    reinterpret_cast<void*>(static_cast<uintptr_t>(span.base)),
+                    static_cast<SIZE_T>(prefix),
+                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+                remember_free_placeholder_locked(span.base, span.size);
+                return nullptr;
+            }
+            if (suffix && !VirtualFree(
+                    reinterpret_cast<void*>(static_cast<uintptr_t>(base)),
+                    static_cast<SIZE_T>(len),
+                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+                if (prefix) {
+                    remember_free_placeholder_locked(span.base, prefix);
+                    remember_free_placeholder_locked(base, len + suffix);
+                } else {
+                    remember_free_placeholder_locked(span.base, span.size);
+                }
+                return nullptr;
+            }
+            if (prefix) remember_free_placeholder_locked(span.base, prefix);
+            if (suffix) remember_free_placeholder_locked(base + len, suffix);
+            return reinterpret_cast<void*>(static_cast<uintptr_t>(base));
+        }
+        return nullptr;
+    }
+
+    void* acquire_placeholder_locked(uint64_t hint, uint64_t len, uint64_t align) {
         const PlaceholderApis& apis = placeholder_apis();
         if (!apis.virtual_alloc2 || !apis.map_view_of_file3 ||
-            align < kWinAllocationGranularity || (align & (align - 1))) return nullptr;
+            !apis.unmap_view_of_file2 || !len || (len & 0xfff) ||
+            (align && (align & (align - 1)))) return nullptr;
+
+        if (void* recycled = take_free_placeholder_locked(hint, len, align)) return recycled;
+
+        if (hint) {
+            if (hint & 0xfff) return nullptr;
+            const uint64_t cover_base = hint & ~(kWinAllocationGranularity - 1);
+            const uint64_t end = hint + len;
+            if (end < hint) return nullptr;
+            const uint64_t cover_end = align_up(end, kWinAllocationGranularity);
+            void* cover = apis.virtual_alloc2(
+                GetCurrentProcess(),
+                reinterpret_cast<void*>(static_cast<uintptr_t>(cover_base)),
+                static_cast<SIZE_T>(cover_end - cover_base),
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+            if (!cover) return nullptr;
+            remember_free_placeholder_locked(cover_base, cover_end - cover_base);
+            return take_free_placeholder_locked(hint, len, align);
+        }
 
         MEM_ADDRESS_REQUIREMENTS requirements{};
         requirements.LowestStartingAddress =
             reinterpret_cast<void*>(static_cast<uintptr_t>(kGuestAutoVaMin));
         requirements.HighestEndingAddress =
             reinterpret_cast<void*>(static_cast<uintptr_t>(kGuestAutoVaMax));
-        requirements.Alignment = static_cast<SIZE_T>(align);
+        requirements.Alignment = static_cast<SIZE_T>(
+            std::max<uint64_t>(align ? align : 0x4000, kWinAllocationGranularity));
         MEM_EXTENDED_PARAMETER parameter{};
         parameter.Type = MemExtendedParameterAddressRequirements;
         parameter.Pointer = &requirements;
-        void* placeholder = apis.virtual_alloc2(
-            GetCurrentProcess(), nullptr, static_cast<SIZE_T>(view_size),
+        return apis.virtual_alloc2(
+            GetCurrentProcess(), nullptr, static_cast<SIZE_T>(len),
             MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, &parameter, 1);
-        if (!placeholder) return nullptr;
+    }
 
+    void* map_placeholder_section_view(HANDLE section, uint64_t hint, uint64_t rel,
+                                       uint64_t len, uint64_t align) {
+        const PlaceholderApis& apis = placeholder_apis();
+        if (!apis.map_view_of_file3 || (rel & 0xfff)) return nullptr;
+        std::lock_guard<std::mutex> lk(g_dview_mx);
+        void* placeholder = acquire_placeholder_locked(hint, len, align);
+        if (!placeholder) return nullptr;
         void* view = apis.map_view_of_file3(
-            section, GetCurrentProcess(), placeholder, file_off,
-            static_cast<SIZE_T>(view_size), MEM_REPLACE_PLACEHOLDER,
+            section, GetCurrentProcess(), placeholder, rel,
+            static_cast<SIZE_T>(len), MEM_REPLACE_PLACEHOLDER,
             PAGE_READWRITE, nullptr, 0);
         if (!view) {
             const DWORD error = GetLastError();
-            VirtualFree(placeholder, 0, MEM_RELEASE);
+            remember_free_placeholder_locked(
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(placeholder)), len);
             SetLastError(error);
-            return nullptr;
         }
         return view;
     }
@@ -1609,39 +1711,34 @@ namespace {
         const uint64_t rel = phys - kDmemBase;
         const uint64_t file_off = rel & ~(kWinAllocationGranularity - 1);
         const uint64_t delta = rel - file_off;
-        const uint64_t view_size = align_up(delta + len, kWinAllocationGranularity);
-        void* requested = nullptr;
-        if (hint) {
-            if (hint < delta || ((hint - delta) & (kWinAllocationGranularity - 1)) != 0) {
-                MLOG("section map incompatible hint=0x%llx phys=0x%llx delta=0x%llx\n",
-                     (unsigned long long)hint, (unsigned long long)phys,
-                     (unsigned long long)delta);
-                return nullptr;
-            }
-            requested = (void*)(uintptr_t)(hint - delta);
-        }
-
+        uint64_t view_size = align_up(delta + len, kWinAllocationGranularity);
         const uint64_t requested_align = align ? align : 0x4000;
         bool sparse = false;
+        bool placeholder = false;
         void* view = nullptr;
-        // MapViewOfFileEx only chooses a 64 KiB-aligned base. A zero-hint title requesting a
-        // larger alignment needs a placeholder reservation with explicit address requirements.
-        // Keep the SEC_RESERVE pages uncommitted here; first CPU/GPU access materializes 16 KiB.
-        if (!hint &&
-            (requested_align <= kWinAllocationGranularity ||
-             (delta & (requested_align - 1)) == 0)) {
-            const uint64_t view_align = std::max<uint64_t>(
-                requested_align, kWinAllocationGranularity);
-            view = map_sparse_aligned_section_view(section, file_off, view_size, view_align);
-            sparse = view != nullptr;
-        }
+        // Placeholder replacement is page-granular, unlike MapViewOfFileEx. Map the guest range
+        // directly at its physical-section offset, with no 64 KiB congruence requirement.
+        view = map_placeholder_section_view(section, hint, rel, len, requested_align);
+        sparse = placeholder = view != nullptr;
         if (!view) {
+            void* requested = nullptr;
+            if (hint) {
+                if (hint < delta || ((hint - delta) & (kWinAllocationGranularity - 1)) != 0) {
+                    MLOG("section map incompatible hint=0x%llx phys=0x%llx delta=0x%llx\n",
+                         (unsigned long long)hint, (unsigned long long)phys,
+                         (unsigned long long)delta);
+                    return nullptr;
+                }
+                requested = (void*)(uintptr_t)(hint - delta);
+            }
             view = MapViewOfFileEx(section, FILE_MAP_ALL_ACCESS,
                                    (DWORD)(file_off >> 32), (DWORD)(file_off & 0xffffffffu),
                                    (SIZE_T)view_size, requested);
         }
         if (!view) return nullptr;
-        uint8_t* guest = (uint8_t*)view + delta;
+        uint8_t* guest = placeholder ? static_cast<uint8_t*>(view)
+                                     : static_cast<uint8_t*>(view) + delta;
+        if (placeholder) view_size = len;
 
         if (!hint && requested_align &&
             ((uint64_t)(uintptr_t)guest & (requested_align - 1)) != 0) {
@@ -1664,7 +1761,7 @@ namespace {
         {
             std::lock_guard<std::mutex> lk(g_dview_mx);
             DmemView tracked{
-                (uint64_t)(uintptr_t)guest, len, phys, view, view_size, sparse
+                (uint64_t)(uintptr_t)guest, len, phys, view, view_size, sparse, placeholder
             };
             if (sparse) {
                 const uint64_t pages = (len + 0x3fff) / 0x4000;
@@ -1676,7 +1773,7 @@ namespace {
         host::guest_write_watch_notify_direct_mapping_added(
             (uint64_t)(uintptr_t)guest, len, phys, win_page_prot(hp));
         if (sparse)
-            MLOG("map_dmem sparse aligned view va=0x%llx len=0x%llx phys=0x%llx align=0x%llx\n",
+            MLOG("map_dmem sparse placeholder view va=0x%llx len=0x%llx phys=0x%llx align=0x%llx\n",
                  (unsigned long long)(uintptr_t)guest, (unsigned long long)len,
                  (unsigned long long)phys, (unsigned long long)requested_align);
         return guest;
@@ -1919,6 +2016,9 @@ namespace {
         if (hint && !fixed) {
             if (void* p = map_section_view(0, len, hp, phys, align)) return p;
         }
+        // A private fixed mapping would report success while severing the physical alias contract.
+        // Older Windows versions without placeholder replacement fail visibly instead.
+        if (fixed) return nullptr;
         MLOG("map_dmem private fallback hint=0x%llx len=0x%llx phys=0x%llx align=0x%llx error=%lu\n",
              (unsigned long long)hint, (unsigned long long)len,
              (unsigned long long)phys, (unsigned long long)align, GetLastError());
@@ -2011,28 +2111,335 @@ namespace {
         }
         return true;
     }
-    // Shared section views must be released with UnmapViewOfFile. Anonymous/private mappings keep
-    // the old partial-safe decommit behavior.
-    void win_unmap(uint64_t addr, uint64_t len) {
-        if (!addr || !len) return;
-        void* section_view = nullptr;
+    struct ProtectionSlice { uint64_t base, size; int prot; };
+
+    std::vector<ProtectionSlice> tracked_protection_slices(uint64_t begin, uint64_t end) {
+        std::vector<ProtectionSlice> slices;
+        std::lock_guard<std::mutex> lk(g_mx);
+        for (const Mapping& mapping : g_maps) {
+            const uint64_t mapping_end = mapping.base + mapping.size;
+            const uint64_t overlap_begin = std::max(begin, mapping.base);
+            const uint64_t overlap_end = std::min(end, mapping_end);
+            if (overlap_begin < overlap_end && mapping.committed)
+                slices.push_back({overlap_begin, overlap_end - overlap_begin, mapping.prot});
+        }
+        std::sort(slices.begin(), slices.end(),
+                  [](const ProtectionSlice& a, const ProtectionSlice& b) {
+                      return a.base < b.base;
+                  });
+        return slices;
+    }
+
+    bool restore_view_protections(const DmemView& view) {
+        const auto slices = tracked_protection_slices(
+            view.guest_base, view.guest_base + view.guest_size);
+        for (const ProtectionSlice& slice : slices) {
+            uint64_t cursor = slice.base;
+            const uint64_t end = slice.base + slice.size;
+            while (cursor < end) {
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (!VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(cursor)),
+                                  &mbi, sizeof(mbi))) {
+                    MLOG("partial-unmap VirtualQuery failed va=0x%llx error=%lu\n",
+                         (unsigned long long)cursor, GetLastError());
+                    return false;
+                }
+                const uint64_t region_end = std::min<uint64_t>(
+                    end, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mbi.BaseAddress)) +
+                             mbi.RegionSize);
+                if (region_end <= cursor || mbi.State == MEM_FREE) return false;
+                if (mbi.State == MEM_COMMIT) {
+                    DWORD old = 0;
+                    if (!VirtualProtect(
+                            reinterpret_cast<void*>(static_cast<uintptr_t>(cursor)),
+                            static_cast<SIZE_T>(region_end - cursor),
+                            win_page_prot(slice.prot), &old)) {
+                        MLOG("partial-unmap VirtualProtect failed va=0x%llx len=0x%llx error=%lu\n",
+                             (unsigned long long)cursor,
+                             (unsigned long long)(region_end - cursor), GetLastError());
+                        return false;
+                    }
+                }
+                cursor = region_end;
+            }
+        }
+        return true;
+    }
+
+    void notify_view_watch_added(const DmemView& view) {
+        const auto slices = tracked_protection_slices(
+            view.guest_base, view.guest_base + view.guest_size);
+        for (const ProtectionSlice& slice : slices) {
+            host::guest_write_watch_notify_direct_mapping_added(
+                slice.base, slice.size,
+                view.phys + (slice.base - view.guest_base), win_page_prot(slice.prot));
+        }
+    }
+
+    bool replace_free_placeholder_with_view_locked(uint64_t base, uint64_t size, uint64_t phys,
+                                                   DmemView& out) {
+        const PlaceholderApis& apis = placeholder_apis();
+        HANDLE section = dmem_section();
+        if (!apis.map_view_of_file3 || !section || phys < kDmemBase) return false;
+        void* placeholder = take_free_placeholder_locked(base, size, 0x1000);
+        if (!placeholder) return false;
+        void* mapped = apis.map_view_of_file3(
+            section, GetCurrentProcess(), placeholder, phys - kDmemBase,
+            static_cast<SIZE_T>(size), MEM_REPLACE_PLACEHOLDER,
+            PAGE_READWRITE, nullptr, 0);
+        if (!mapped) {
+            remember_free_placeholder_locked(base, size);
+            return false;
+        }
+        out = DmemView{base, size, phys, mapped, size, true, true};
+        const uint64_t pages = (size + 0x3fff) / 0x4000;
+        out.committed_pages.resize((pages + 63) / 64);
+        out.page_cache_generation = host::guest_mapping_generation();
+        return true;
+    }
+
+    void invalidate_view_page_cache_locked(const DmemView& original) {
+        for (DmemView& view : g_dviews) {
+            if (view.view_base != original.view_base ||
+                view.guest_base != original.guest_base ||
+                view.guest_size != original.guest_size || view.phys != original.phys) continue;
+            std::fill(view.committed_pages.begin(), view.committed_pages.end(), 0);
+            view.page_cache_generation = 0;
+            return;
+        }
+    }
+
+    bool restore_legacy_view_locked(const DmemView& original) {
+        HANDLE section = dmem_section();
+        if (!section || original.phys < kDmemBase) return false;
+        const uint64_t rel = original.phys - kDmemBase;
+        const uint64_t file_off = rel & ~(kWinAllocationGranularity - 1);
+        void* mapped = MapViewOfFileEx(
+            section, FILE_MAP_ALL_ACCESS,
+            static_cast<DWORD>(file_off >> 32), static_cast<DWORD>(file_off & 0xffffffffu),
+            static_cast<SIZE_T>(original.view_size), original.view_base);
+        if (!mapped || mapped != original.view_base) {
+            if (mapped) UnmapViewOfFile(mapped);
+            return false;
+        }
+        if (!VirtualAlloc(reinterpret_cast<void*>(static_cast<uintptr_t>(original.guest_base)),
+                          static_cast<SIZE_T>(original.guest_size), MEM_COMMIT,
+                          PAGE_READWRITE) ||
+            !restore_view_protections(original)) {
+            UnmapViewOfFile(mapped);
+            return false;
+        }
+        return true;
+    }
+
+    struct UnmapChange {
+        DmemView original;
+        std::vector<DmemView> replacements;
+    };
+
+    bool rollback_unmap_change_locked(const UnmapChange& change) {
+        const PlaceholderApis& apis = placeholder_apis();
+        for (auto it = change.replacements.rbegin(); it != change.replacements.rend(); ++it) {
+            if (!apis.unmap_view_of_file2 ||
+                !apis.unmap_view_of_file2(GetCurrentProcess(), it->view_base,
+                                          MEM_PRESERVE_PLACEHOLDER)) return false;
+            remember_free_placeholder_locked(it->guest_base, it->guest_size);
+        }
+
+        bool restored = false;
+        if (change.original.placeholder) {
+            DmemView replacement;
+            restored = replace_free_placeholder_with_view_locked(
+                           change.original.guest_base, change.original.guest_size,
+                           change.original.phys, replacement) &&
+                       restore_view_protections(replacement);
+        } else {
+            restored = restore_legacy_view_locked(change.original);
+        }
+        if (restored) invalidate_view_page_cache_locked(change.original);
+        return restored;
+    }
+
+    bool split_placeholder_view_locked(const DmemView& old, uint64_t hole_begin,
+                                       uint64_t hole_end,
+                                       std::vector<DmemView>& replacements) {
+        const PlaceholderApis& apis = placeholder_apis();
+        if (!old.placeholder || !apis.unmap_view_of_file2 ||
+            !apis.unmap_view_of_file2(GetCurrentProcess(), old.view_base,
+                                      MEM_PRESERVE_PLACEHOLDER)) return false;
+        remember_free_placeholder_locked(old.guest_base, old.guest_size);
+
+        auto rollback = [&]() {
+            UnmapChange change{old, replacements};
+            const bool restored = rollback_unmap_change_locked(change);
+            replacements.clear();
+            if (!restored) {
+                std::fprintf(stderr,
+                             "[memhle] fatal: could not restore direct-memory view after "
+                             "partial-unmap failure\n");
+                std::abort();
+            }
+        };
+
+        const uint64_t left_size = hole_begin - old.guest_base;
+        const uint64_t right_size = old.guest_base + old.guest_size - hole_end;
+        if (left_size) {
+            DmemView left;
+            if (!replace_free_placeholder_with_view_locked(
+                    old.guest_base, left_size, old.phys, left)) {
+                rollback();
+                return false;
+            }
+            replacements.push_back(std::move(left));
+        }
+        if (right_size) {
+            DmemView right;
+            if (!replace_free_placeholder_with_view_locked(
+                    hole_end, right_size, old.phys + (hole_end - old.guest_base), right)) {
+                rollback();
+                return false;
+            }
+            replacements.push_back(std::move(right));
+        }
+        for (const DmemView& replacement : replacements) {
+            if (!restore_view_protections(replacement)) {
+                rollback();
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool tracked_mappings_covered_by_views(uint64_t begin, uint64_t end,
+                                           const std::vector<DmemView>& views) {
+        std::vector<PlaceholderSpan> covered;
+        for (const DmemView& view : views) {
+            const uint64_t overlap_begin = std::max(begin, view.guest_base);
+            const uint64_t overlap_end = std::min(end, view.guest_base + view.guest_size);
+            if (overlap_begin < overlap_end)
+                covered.push_back({overlap_begin, overlap_end - overlap_begin});
+        }
+        std::sort(covered.begin(), covered.end(),
+                  [](const PlaceholderSpan& a, const PlaceholderSpan& b) {
+                      return a.base < b.base;
+                  });
+
+        std::lock_guard<std::mutex> lk(g_mx);
+        for (const Mapping& mapping : g_maps) {
+            const uint64_t overlap_begin = std::max(begin, mapping.base);
+            const uint64_t overlap_end = std::min(end, mapping.base + mapping.size);
+            if (overlap_begin >= overlap_end) continue;
+            uint64_t cursor = overlap_begin;
+            for (const PlaceholderSpan& span : covered) {
+                if (span.base + span.size <= cursor) continue;
+                if (span.base > cursor) break;
+                cursor = std::min(overlap_end, span.base + span.size);
+                if (cursor == overlap_end) break;
+            }
+            if (cursor != overlap_end) return false;
+        }
+        return true;
+    }
+
+    // Shared section views must be released with the view APIs. Placeholder-backed views can be
+    // split at the guest's 16 KiB boundary: unmap the old view back to a placeholder, replace the
+    // untouched prefix/suffix with views of their original physical offsets, and retain the hole as
+    // an inaccessible free placeholder for an exact future remap.
+    bool win_unmap(uint64_t addr, uint64_t len) {
+        if (!addr || !len || addr > UINT64_MAX - len) return false;
+        const uint64_t end = addr + len;
+        std::vector<DmemView> added;
+        bool section_overlap = false;
         {
             std::lock_guard<std::mutex> lk(g_dview_mx);
-            for (auto it = g_dviews.begin(); it != g_dviews.end(); ++it) {
-                if (it->guest_base == addr && it->guest_size == len) {
-                    section_view = it->view_base;
-                    g_dviews.erase(it);
-                    break;
+            std::vector<DmemView> targets;
+            for (const DmemView& view : g_dviews) {
+                if (addr < view.guest_base + view.guest_size && end > view.guest_base) {
+                    targets.push_back(view);
+                    const uint64_t cut_begin = std::max(addr, view.guest_base);
+                    const uint64_t cut_end = std::min(end, view.guest_base + view.guest_size);
+                    if ((cut_begin != view.guest_base || cut_end != view.guest_base + view.guest_size) &&
+                        !view.placeholder) return false;
+                }
+            }
+            std::sort(targets.begin(), targets.end(),
+                      [](const DmemView& a, const DmemView& b) {
+                          return a.guest_base < b.guest_base;
+                      });
+            section_overlap = !targets.empty();
+            if (section_overlap && !tracked_mappings_covered_by_views(addr, end, targets))
+                return false;
+
+            // Disarm any active physical write watch while every old alias is still mapped. On
+            // failure, the transaction restores both the views and their alias registrations.
+            for (const DmemView& target : targets)
+                host::guest_write_watch_notify_direct_mapping_removed(
+                    target.guest_base, target.guest_size);
+
+            std::vector<UnmapChange> changes;
+            changes.reserve(targets.size());
+            auto rollback = [&]() {
+                for (auto it = changes.rbegin(); it != changes.rend(); ++it) {
+                    if (!rollback_unmap_change_locked(*it)) {
+                        std::fprintf(stderr,
+                                     "[memhle] fatal: could not roll back direct-memory unmap\n");
+                        std::abort();
+                    }
+                }
+                for (const DmemView& target : targets) notify_view_watch_added(target);
+            };
+
+            for (const DmemView& target : targets) {
+                const uint64_t cut_begin = std::max(addr, target.guest_base);
+                const uint64_t cut_end = std::min(end, target.guest_base + target.guest_size);
+                UnmapChange change{target, {}};
+                bool ok = false;
+                if (cut_begin == target.guest_base &&
+                    cut_end == target.guest_base + target.guest_size) {
+                    if (target.placeholder) {
+                        const PlaceholderApis& apis = placeholder_apis();
+                        ok = apis.unmap_view_of_file2 &&
+                             apis.unmap_view_of_file2(GetCurrentProcess(), target.view_base,
+                                                     MEM_PRESERVE_PLACEHOLDER);
+                        if (ok) remember_free_placeholder_locked(
+                            target.guest_base, target.guest_size);
+                    } else {
+                        ok = UnmapViewOfFile(target.view_base) != 0;
+                    }
+                } else {
+                    ok = split_placeholder_view_locked(
+                        target, cut_begin, cut_end, change.replacements);
+                }
+                if (!ok) {
+                    rollback();
+                    return false;
+                }
+                changes.push_back(std::move(change));
+            }
+
+            for (const UnmapChange& change : changes) {
+                const DmemView& target = change.original;
+                auto it = std::find_if(g_dviews.begin(), g_dviews.end(),
+                    [&](const DmemView& view) {
+                        return view.view_base == target.view_base &&
+                               view.guest_base == target.guest_base &&
+                               view.guest_size == target.guest_size &&
+                               view.phys == target.phys;
+                    });
+                if (it != g_dviews.end()) g_dviews.erase(it);
+                for (const DmemView& replacement : change.replacements) {
+                    added.push_back(replacement);
+                    g_dviews.push_back(replacement);
                 }
             }
         }
-        if (section_view) {
+        if (!section_overlap) {
             host::guest_write_watch_notify_direct_mapping_removed(addr, len);
-            UnmapViewOfFile(section_view);
-            return;
+            return VirtualFree(reinterpret_cast<void*>(static_cast<uintptr_t>(addr)),
+                               static_cast<SIZE_T>(len), MEM_DECOMMIT) != 0;
         }
-        host::guest_write_watch_notify_direct_mapping_removed(addr, len);
-        VirtualFree((void*)addr, (SIZE_T)len, MEM_DECOMMIT);
+        for (const DmemView& view : added) notify_view_watch_added(view);
+        return true;
     }
 } // namespace
 
@@ -2184,7 +2591,9 @@ HLE7(k_map_dmem2) {
 }
 
 HLE(k_munmap)   { if (!a1) return 0x80020016ull;
-                  if (a0) { win_unmap(a0, a1); untrack(a0, a1); } return 0; }
+                  if (a0 && !win_unmap(a0, a1)) return 0x80020016ull;
+                  if (a0) untrack(a0, a1);
+                  return 0; }
 static uint64_t sce_win_mprotect_error(DWORD error) {
     switch (error) {
         case ERROR_ACCESS_DENIED:
@@ -2256,7 +2665,11 @@ HLE(k_batch_map) {
                 if (ok) track((uint64_t)p, len, host_prot(prot), true, "batch-flex");
                 break;
             }
-            case 1: if (start) { win_unmap(start, len); untrack(start, len); } break;   // UNMAP
+            case 1: {                               // UNMAP
+                ok = !start || win_unmap(start, len);
+                if (ok && start) untrack(start, len);
+                break;
+            }
             case 2: case 4:                                                              // PROTECT / TYPE_PROTECT
                 if (start) { win_protect(start, len, host_prot(prot));
                              retrack_prot(start, len, host_prot(prot), "batch-prot"); } break;

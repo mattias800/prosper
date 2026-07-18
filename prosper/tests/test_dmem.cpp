@@ -52,9 +52,11 @@ int main() {
     auto protect = Hle::lookup(nid_hash("sceKernelMprotect"));
     auto release = Hle::lookup(nid_hash("sceKernelReleaseDirectMemory"));
     auto query   = Hle::lookup(nid_hash("sceKernelVirtualQuery"));
+    auto batch   = Hle::lookup(nid_hash("sceKernelBatchMap"));
     CHECK(nid_hash("sceKernelMapDirectMemory2") == "BQQniolj9tQ",
           "sceKernelMapDirectMemory2 hashes to the PS5 3.20 import NID");
-    CHECK(reserve && unmap && alloc && alloc_main && map && map2 && protect && release && query,
+    CHECK(reserve && unmap && alloc && alloc_main && map && map2 && protect && release && query &&
+              batch,
           "memory HLE functions registered");
     if (fails) return 1;
 
@@ -69,6 +71,15 @@ int main() {
     *cell = 0x6310CAFEu;
     CHECK(*cell == 0x6310CAFEu, "first touch commits one guest page and preserves the write");
     CHECK(unmap(va, len, 0, 0, 0, 0) == 0, "reserved page unmaps cleanly");
+
+    alignas(8) uint8_t invalid_unmap[0x20]{};
+    *(uint64_t*)(invalid_unmap + 0x00) = 0x30000020000ull;
+    *(uint64_t*)(invalid_unmap + 0x10) = len;
+    *(int32_t*)(invalid_unmap + 0x1c) = 1; // UNMAP
+    int32_t batch_done = -1;
+    CHECK(batch((uint64_t)(uintptr_t)invalid_unmap, 1,
+                (uint64_t)(uintptr_t)&batch_done, 0, 0, 0) != 0 && batch_done == 0,
+          "BatchMap reports an invalid host unmap instead of counting it as complete");
 
     // Direct memory is one physical pool, not private memory per virtual mapping. Dead Cells
     // releases and reuses small physical ranges aggressively; independent Windows allocations
@@ -215,6 +226,94 @@ int main() {
     if (sparse_va2) CHECK(unmap(sparse_va2, sparse_len, 0, 0, 0, 0) == 0,
                           "unmap second sparse direct-memory view");
     if (sparse_phys) release(sparse_phys, sparse_len, 0, 0, 0, 0);
+
+    // MapViewOfFileEx requires the virtual base and physical offset to have the same 64 KiB
+    // remainder. Placeholder replacement is page-granular, so an exact 16 KiB fixed mapping with
+    // incompatible remainders must still be a real shared section view. Partially unmapping its
+    // middle page must preserve both neighboring aliases and permit an exact remap of the hole.
+    constexpr uint64_t fixed_len = 0x10000;
+    constexpr uint64_t fixed_base = 0x30000104000ull; // 16 KiB into a free 64 KiB host granule
+    uint64_t fixed_phys = 0, fixed_va = fixed_base, fixed_alias = 0;
+    bool fixed_mapped = false, hole_remapped = false;
+    CHECK(alloc(0, kEnd, fixed_len, 0x4000, 0,
+                (uint64_t)(uintptr_t)&fixed_phys) == 0 && fixed_phys,
+          "allocate physical range for incompatible fixed mapping");
+    fixed_mapped = map((uint64_t)(uintptr_t)&fixed_va, fixed_len, 0x2,
+                       0x10 /* SCE_KERNEL_MAP_FIXED */, fixed_phys, 0x4000) == 0 &&
+                   fixed_va == fixed_base;
+    CHECK(fixed_mapped,
+          "fixed 16 KiB placement ignores the host 64 KiB VA/physical delta restriction");
+    CHECK(map((uint64_t)(uintptr_t)&fixed_alias, fixed_len, 0x2, 0,
+              fixed_phys, 0x4000) == 0 && fixed_alias,
+          "map ordinary alias for incompatible fixed view");
+    if (fixed_mapped && fixed_alias) {
+        *(volatile uint64_t*)(uintptr_t)(fixed_va + 0x0100) = 0x1111222233334444ull;
+        *(volatile uint64_t*)(uintptr_t)(fixed_va + 0x4100) = 0x5555666677778888ull;
+        *(volatile uint64_t*)(uintptr_t)(fixed_va + 0xc100) = 0x9999aaaabbbbccccull;
+        CHECK(*(volatile uint64_t*)(uintptr_t)(fixed_alias + 0x0100) ==
+                  0x1111222233334444ull &&
+              *(volatile uint64_t*)(uintptr_t)(fixed_alias + 0x4100) ==
+                  0x5555666677778888ull &&
+              *(volatile uint64_t*)(uintptr_t)(fixed_alias + 0xc100) ==
+                  0x9999aaaabbbbccccull,
+              "incompatible fixed view preserves physical alias coherence");
+
+        CHECK((uint32_t)unmap(fixed_va + 0x4000, 0x4001, 0, 0, 0, 0) == 0x80020016u,
+              "invalid partial unmap fails after restoring the original shared view");
+        CHECK(*(volatile uint64_t*)(uintptr_t)(fixed_va + 0x0100) ==
+                  0x1111222233334444ull &&
+              *(volatile uint64_t*)(uintptr_t)(fixed_va + 0x4100) ==
+                  0x5555666677778888ull &&
+              *(volatile uint64_t*)(uintptr_t)(fixed_alias + 0xc100) ==
+                  0x9999aaaabbbbccccull,
+              "failed partial-unmap transaction preserves data and physical aliases");
+
+        CHECK(protect(fixed_va, 0x4000, 0x1, 0, 0, 0) == 0,
+              "make fixed-view prefix read-only before partial unmap");
+
+        const uint64_t hole = fixed_va + 0x4000;
+        CHECK(unmap(hole, 0x4000, 0, 0, 0, 0) == 0,
+              "partial unmap removes one page from a shared section view");
+        MEMORY_BASIC_INFORMATION hole_info{};
+        VirtualQuery((void*)(uintptr_t)hole, &hole_info, sizeof(hole_info));
+        CHECK(hole_info.State == MEM_RESERVE &&
+                  !prosper_try_commit_dmem(hole, 0x4000, 0),
+              "partially unmapped page is an inaccessible, untracked placeholder");
+        MEMORY_BASIC_INFORMATION prefix_info{};
+        VirtualQuery((void*)(uintptr_t)fixed_va, &prefix_info, sizeof(prefix_info));
+        CHECK(prefix_info.State == MEM_COMMIT &&
+                  (prefix_info.Protect & 0xff) == PAGE_READONLY,
+              "partial unmap preserves the retained prefix protection");
+        CHECK(*(volatile uint64_t*)(uintptr_t)(fixed_va + 0x0100) ==
+                  0x1111222233334444ull &&
+              *(volatile uint64_t*)(uintptr_t)(fixed_va + 0xc100) ==
+                  0x9999aaaabbbbccccull,
+              "partial unmap preserves the prefix and suffix views");
+
+        uint64_t remapped_hole = hole;
+        hole_remapped = map((uint64_t)(uintptr_t)&remapped_hole, 0x4000, 0x2,
+                            0x10 /* SCE_KERNEL_MAP_FIXED */,
+                            fixed_phys + 0x4000, 0x4000) == 0 &&
+                        remapped_hole == hole;
+        CHECK(hole_remapped,
+              "fixed direct mapping replaces the exact 16 KiB placeholder hole");
+        if (hole_remapped) {
+            CHECK(*(volatile uint64_t*)(uintptr_t)(remapped_hole + 0x100) ==
+                      0x5555666677778888ull,
+                  "partial unmap/remap retains the physical page contents");
+            *(volatile uint64_t*)(uintptr_t)(remapped_hole + 0x100) =
+                0xd00df00dcafef00dull;
+            CHECK(*(volatile uint64_t*)(uintptr_t)(fixed_alias + 0x4100) ==
+                      0xd00df00dcafef00dull,
+                  "remapped placeholder hole remains coherent with its physical alias");
+        }
+    }
+    if (fixed_mapped)
+        CHECK(unmap(fixed_va, fixed_len, 0, 0, 0, 0) == 0,
+              "split fixed mapping unmaps cleanly as one guest range");
+    if (fixed_alias) CHECK(unmap(fixed_alias, fixed_len, 0, 0, 0, 0) == 0,
+                           "unmap incompatible-view alias");
+    if (fixed_phys) release(fixed_phys, fixed_len, 0, 0, 0, 0);
 
     if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }
     printf("== PASS ==\n");
