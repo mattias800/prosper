@@ -796,13 +796,16 @@ HLE(s_appcontent_int) { if (a1) *(int32_t*)PW(a1) = ((int32_t)a0 == 0) ? 3 : 0; 
 // value 0 = SCE_SYSTEM_PARAM_LANG_JAPANESE, so games localise their UI/text to Japanese. Default to
 // US English (SCE_SYSTEM_PARAM_LANG_ENGLISH_US = 1) instead. Configurable via PROSPER_SYS_LANG, which
 // takes the Sony SCE_SYSTEM_PARAM_LANG_* enum (0=ja, 1=en-US, 2=fr, 4=de, 5=it, 9=ko, 18=en-GB, …).
-// Date/time-format params (2/3) default to the US convention (0 = MM/DD/YYYY, 12-hour).
+// Date/time-format params (2/3) default to the US convention: date enum 2 = MM/DD/YYYY and
+// time enum 0 = 12-hour. Date enum 0 is YYYYMMDD, despite the old comment claiming it was US.
 HLE(s_syss_param_int) {
     int32_t paramId = (int32_t)a0;           // a0 = paramId, a1 = int32_t* value out (matches s_appcontent_int)
     int32_t val = 0;
     if (paramId == 1) {                      // SCE_SYSTEM_SERVICE_PARAM_ID_LANG
         val = 1;                             // SCE_SYSTEM_PARAM_LANG_ENGLISH_US
         if (const char* e = getenv("PROSPER_SYS_LANG")) val = (int32_t)strtol(e, nullptr, 0);
+    } else if (paramId == 2) {               // SCE_SYSTEM_SERVICE_PARAM_ID_DATE_FORMAT
+        val = 2;                             // SCE_SYSTEM_PARAM_DATE_FORMAT_MMDDYYYY
     } else if (paramId == 1000) {            // SCE_SYSTEM_SERVICE_PARAM_ID_ENTER_BUTTON_ASSIGN
         // Cross = confirm (Western default). Previously fell through to val=0 = Circle, which inverts
         // ✕/○ confirm/cancel and on-screen button prompts relative to the en-US locale we present.
