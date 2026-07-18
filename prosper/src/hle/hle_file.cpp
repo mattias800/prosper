@@ -1169,11 +1169,13 @@ HLE(f_pread)  { int64_t r = win_pio((int)a0, P(a1), (size_t)a2, (uint64_t)a3, fa
                 if (r < 0) errno = error;
                 return (uint64_t)r; }
 HLE(f_pwrite) { return (uint64_t)win_pio((int)a0, P(a1), (size_t)a2, (uint64_t)a3, true); }
-HLE(f_readv)  { auto* v = (GIovec*)P(a1); int nc = (int)a2; int64_t tot = 0;
+HLE(f_readv)  { ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
+                auto* v = (GIovec*)P(a1); int nc = (int)a2; int64_t tot = 0;
                 for (int i = 0; i < nc; i++) { int64_t r = (int64_t)(int)::read((int)a0, v[i].base, (unsigned)v[i].len);
                     if (r < 0) return tot ? (uint64_t)tot : (uint64_t)-1; tot += r; if ((size_t)r < v[i].len) break; }
                 return (uint64_t)tot; }
-HLE(f_writev) { auto* v = (GIovec*)P(a1); int nc = (int)a2; int64_t tot = 0;
+HLE(f_writev) { ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
+                auto* v = (GIovec*)P(a1); int nc = (int)a2; int64_t tot = 0;
                 for (int i = 0; i < nc; i++) { int64_t w = (int64_t)(int)::write((int)a0, v[i].base, (unsigned)v[i].len);
                     if (w < 0) return tot ? (uint64_t)tot : (uint64_t)-1; tot += w; if ((size_t)w < v[i].len) break; }
                 return (uint64_t)tot; }
@@ -1200,6 +1202,10 @@ HLE(k_write)  { uint64_t r = f_write(a0, a1, a2, a3, a4, a5);  int e = errno; re
 HLE(k_lseek)  { uint64_t r = f_lseek(a0, a1, a2, a3, a4, a5);  int e = errno; return kernel_io_result(r, e); }
 HLE(k_pread)  { uint64_t r = f_pread(a0, a1, a2, a3, a4, a5);  int e = errno; return kernel_io_result(r, e); }
 HLE(k_pwrite) { uint64_t r = f_pwrite(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_io_result(r, e); }
+HLE(k_readv)  { uint64_t r = f_readv(a0, a1, a2, a3, a4, a5);  int e = errno; return kernel_io_result(r, e); }
+HLE(k_writev) { uint64_t r = f_writev(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_io_result(r, e); }
+HLE(k_preadv) { uint64_t r = f_preadv(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_io_result(r, e); }
+HLE(k_pwritev){ uint64_t r = f_pwritev(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_io_result(r, e); }
 
 // sceKernelFtruncate(fd, length): resize an open file. Was MISSING -> the return-0 stub faked success
 // without truncating, so the near-universal save idiom "overwrite with fewer bytes, then ftruncate to
@@ -2076,10 +2082,10 @@ void register_file_hle() {
     R("fcntl", f_fcntl);          R("sceKernelFcntl", f_fcntl);       // FreeBSD commands/flags need translation
     R("sceKernelGetdents", k_getdents); R("getdents", f_getdents);
     // vectored IO + getdirentries — real host ops (were MISSING -> silent-EOF / empty-dir corruption trap)
-    R("sceKernelReadv", f_readv);       R("readv", f_readv);
-    R("sceKernelWritev", f_writev);     R("writev", f_writev);
-    R("sceKernelPreadv", f_preadv);     R("preadv", f_preadv);
-    R("sceKernelPwritev", f_pwritev);   R("pwritev", f_pwritev);
+    R("sceKernelReadv", k_readv);       R("readv", f_readv);
+    R("sceKernelWritev", k_writev);     R("writev", f_writev);
+    R("sceKernelPreadv", k_preadv);     R("preadv", f_preadv);
+    R("sceKernelPwritev", k_pwritev);   R("pwritev", f_pwritev);
     R("sceKernelGetdirentries", k_getdirentries); R("getdirentries", f_getdirentries);
     // sceKernelAio* (issue #312): NIDs verified identical in shadPS4's PS4 registration table and
     // the PS5 3.20 libkernel stub dump. Raw-NID registration (names not in our NidDb).
