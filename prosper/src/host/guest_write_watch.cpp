@@ -262,83 +262,13 @@ GuestWriteWatch& GuestWriteWatch::operator=(GuestWriteWatch&& other) noexcept {
 
 GuestWriteWatch GuestWriteWatch::create(uint64_t addr, uint64_t size) {
     stats().create_attempts.fetch_add(1, std::memory_order_relaxed);
-    if (!addr || !size || addr > UINT64_MAX - size) return {};
-    const uint64_t begin = addr & ~(kPageSize - 1);
-    const uint64_t range_end = addr + size;
-    if (range_end > UINT64_MAX - (kPageSize - 1)) return {};
-    const uint64_t end = (range_end + kPageSize - 1) & ~(kPageSize - 1);
-    if (end <= begin) return {};
-
-    WatchState& watch = state();
-    std::lock_guard lock(watch.mutex);
-
-    Registration registration;
-    registration.pages.reserve(static_cast<size_t>((end - begin) / kPageSize));
-    auto rollback = [&] {
-        for (auto it = registration.pages.rbegin(); it != registration.pages.rend(); ++it) {
-            WatchedPage* page = it->page;
-            if (!page || !page->references || --page->references) continue;
-            if (page->armed) restore_page(*page);
-            for (const PageAlias& alias : page->aliases) watch.pages_by_addr.erase(alias.addr);
-            watch.pages_by_phys.erase(page->phys);
-        }
-        registration.pages.clear();
-    };
-    for (uint64_t page_addr = begin; page_addr < end; page_addr += kPageSize) {
-        const AliasRange* source = alias_at(watch, page_addr);
-        if (!source) {
-            stats().create_no_mapping.fetch_add(1, std::memory_order_relaxed);
-            log_create_failure("no-mapping", addr, size, page_addr);
-            rollback();
-            return {};
-        }
-        const uint64_t phys = source->phys + (page_addr - source->addr);
-        auto found = watch.pages_by_phys.find(phys);
-        WatchedPage* page = found == watch.pages_by_phys.end() ? nullptr : found->second.get();
-        if (!page) {
-            auto owned = std::make_unique<WatchedPage>();
-            owned->phys = phys;
-            if (!collect_aliases(watch, phys, owned->aliases)) {
-                stats().create_incomplete_aliases.fetch_add(1, std::memory_order_relaxed);
-                log_create_failure("incomplete-aliases", addr, size, page_addr);
-                rollback();
-                return {};
-            }
-            const bool source_alias_present = std::any_of(
-                owned->aliases.begin(), owned->aliases.end(),
-                [&](const PageAlias& alias) { return alias.addr == page_addr; });
-            if (!source_alias_present) {
-                stats().create_incomplete_aliases.fetch_add(1, std::memory_order_relaxed);
-                log_create_failure("source-alias-missing", addr, size, page_addr);
-                rollback();
-                return {};
-            }
-            page = owned.get();
-            watch.pages_by_phys.emplace(phys, std::move(owned));
-            for (const PageAlias& alias : page->aliases)
-                watch.pages_by_addr[alias.addr] = page;
-        }
-        ++page->references;
-        registration.pages.push_back({page, page->generation});
-    }
-
-    std::vector<WatchedPage*> pages;
-    pages.reserve(registration.pages.size());
-    for (const RegistrationPage& registered : registration.pages)
-        pages.push_back(registered.page);
-    if (!set_pages_armed(pages, true)) {
-        stats().create_protect_failures.fetch_add(1, std::memory_order_relaxed);
-        log_create_failure("protect", addr, size, begin);
-        rollback();
-        return {};
-    }
-
-    uint64_t id = ++watch.next_id;
-    if (!id) id = ++watch.next_id;
-    watch.registrations.emplace(id, std::move(registration));
-    stats().registrations.fetch_add(1, std::memory_order_relaxed);
-    stats().registered_pages.fetch_add((end - begin) / kPageSize, std::memory_order_relaxed);
-    return GuestWriteWatch(id);
+    (void)addr;
+    (void)size;
+    // Windows constructs an exception-dispatch frame below the interrupted RSP before a vectored
+    // handler can restore a watched page. Guest code follows the SysV ABI and may keep live locals
+    // in that 128-byte red zone, so page-protection write watches can silently corrupt the guest.
+    // Report unsupported and let renderer callers use their exact byte-comparison fallback.
+    return {};
 }
 
 GuestWriteWatchQuery GuestWriteWatch::query() const {
@@ -366,22 +296,7 @@ GuestWriteWatchQuery GuestWriteWatch::query() const {
 }
 
 bool GuestWriteWatch::rearm() {
-    if (!id_) return false;
-    WatchState& watch = state();
-    std::lock_guard lock(watch.mutex);
-    auto found = watch.registrations.find(id_);
-    if (found == watch.registrations.end()) return false;
-    std::vector<WatchedPage*> pages;
-    pages.reserve(found->second.pages.size());
-    for (const RegistrationPage& registered : found->second.pages)
-        pages.push_back(registered.page);
-    if (!set_pages_armed(pages, true)) return false;
-    for (RegistrationPage& registered : found->second.pages) {
-        if (!registered.page) return false;
-        registered.generation = registered.page->generation;
-    }
-    stats().rearms.fetch_add(1, std::memory_order_relaxed);
-    return true;
+    return false;
 }
 
 void GuestWriteWatch::reset() {
@@ -487,16 +402,8 @@ void guest_write_watch_invalidate_all() {
 }
 
 bool guest_write_watch_handle_fault(uint64_t addr) {
-    WatchState& watch = state();
-    std::lock_guard lock(watch.mutex);
-    const uint64_t page_addr = addr & ~(kPageSize - 1);
-    auto found = watch.pages_by_addr.find(page_addr);
-    if (found == watch.pages_by_addr.end() || !found->second || !found->second->armed) return false;
-    WatchedPage& page = *found->second;
-    ++page.generation;
-    restore_page(page);
-    stats().faults.fetch_add(1, std::memory_order_relaxed);
-    return true;
+    (void)addr;
+    return false;
 }
 
 } // namespace prosper::host

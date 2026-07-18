@@ -27,11 +27,10 @@ struct GuestWriteWatchStats {
     uint64_t rearms = 0;
 };
 
-// Windows direct memory is section-backed so MEM_WRITE_WATCH cannot observe it. This registration
-// instead makes every writable alias of the covered physical pages read-only. The process VEH marks
-// the page dirty and restores its original protection on the first write. Unsupported platforms,
-// incomplete aliases and mapping changes report Unknown so callers retain their exact byte-comparison
-// fallback. Private mappings are tracked with their virtual page as their unique physical identity.
+// Windows direct memory is section-backed so MEM_WRITE_WATCH cannot observe it. Page-protection
+// watches are deliberately unsupported: Windows writes its exception-dispatch frame into the guest
+// SysV red zone before a vectored handler can restore the page, corrupting valid guest locals.
+// Callers receive Unknown and retain their exact byte-comparison fallback.
 class GuestWriteWatch {
 public:
     GuestWriteWatch() = default;
@@ -64,7 +63,8 @@ void guest_write_watch_notify_direct_mapping_protection(uint64_t addr, uint64_t 
 void guest_write_watch_notify_physical_write(uint64_t phys, uint64_t size);
 void guest_write_watch_invalidate_all();
 
-// Called first from the Windows vectored exception handler for write access violations.
+// Retained for the platform-neutral VEH interface; Windows currently returns false because
+// page-fault write watches are unsafe for SysV guest code.
 bool guest_write_watch_handle_fault(uint64_t addr);
 
 } // namespace prosper::host

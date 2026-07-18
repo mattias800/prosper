@@ -115,10 +115,10 @@ int main() {
         auto flexible_prefix_watch = host::GuestWriteWatch::create(flexible_base, 0x4000);
         auto flexible_suffix_watch = host::GuestWriteWatch::create(
             flexible_base + 0xc000, 0x4000);
-        CHECK(flexible_prefix_watch && flexible_suffix_watch &&
-                  flexible_prefix_watch.query() == host::GuestWriteWatchQuery::Unchanged &&
-                  flexible_suffix_watch.query() == host::GuestWriteWatchQuery::Unchanged,
-              "partial flexible unmap rebuilds retained write-watch aliases");
+        CHECK(!flexible_prefix_watch && !flexible_suffix_watch &&
+                  flexible_prefix_watch.query() == host::GuestWriteWatchQuery::Unknown &&
+                  flexible_suffix_watch.query() == host::GuestWriteWatchQuery::Unknown,
+              "partial flexible unmap retains the safe exact-comparison fallback");
         uint64_t flexible_hole = flexible_base + 0x4000;
         const bool flexible_hole_mapped =
             flexible((uint64_t)(uintptr_t)&flexible_hole, 0x4000, 0x2, 0,
@@ -206,10 +206,10 @@ int main() {
     if (hinted) CHECK(unmap(hinted, dlen, 0, 0, 0, 0) == 0, "unmap relocated direct-memory view");
     if (reused_phys) release(reused_phys, dlen, 0, 0, 0, 0);
 
-    // Large zero-hint alignments use a placeholder-backed SEC_RESERVE view. Dead Cells requests
-    // one 3 GiB mapping at 2 MiB alignment; committing that whole range made private memory exceed
-    // 4.5 GiB. Prove that placement is aligned, untouched pages remain sparse, host GPU reads
-    // materialize exactly their range, and a second VA still aliases the same physical bytes.
+    // Large zero-hint alignments use a placeholder-backed sparse-file view. Dead Cells requests
+    // one 3 GiB mapping at 2 MiB alignment; a paging-file mapping would charge that whole range as
+    // private commit. File-backed demand paging keeps untouched storage sparse without guest-time
+    // access violations, and a second VA must still alias the same physical bytes.
     constexpr uint64_t sparse_len = 0x02000000;
     constexpr uint64_t sparse_align = 0x00200000;
     constexpr uint64_t sparse_window = kBase + 0x10000000;
@@ -229,24 +229,24 @@ int main() {
                   *(uint32_t*)(guest_query + 0x20) == 0x10,
               "guest VirtualQuery reports the sparse direct view as committed");
         host::GuestReadableRange persistent_range{};
-        CHECK(!host::guest_readable_mapping_containing(
+        CHECK(host::guest_readable_mapping_containing(
                   sparse_va1 + 0x4000, sparse_va1 + 0x8000, persistent_range),
-              "sparse view is excluded from cross-submit host-readability reuse");
+              "file-backed direct view supports cross-submit host-readability reuse");
         VirtualQuery((void*)(uintptr_t)(sparse_va1 + 0x4000), &near_before,
                      sizeof(near_before));
         VirtualQuery((void*)(uintptr_t)(sparse_va1 + 0x01000000), &far_before,
                      sizeof(far_before));
-        CHECK(near_before.State == MEM_RESERVE && far_before.State == MEM_RESERVE,
-              "untouched sparse direct pages carry no host commit");
+        CHECK(near_before.State == MEM_COMMIT && far_before.State == MEM_COMMIT,
+              "untouched direct pages need no guest-time lazy-commit fault");
         CHECK(gpu::guest_readable(sparse_va1 + 0x4000, 0x4000),
-              "GPU guest-read guard materializes an untouched zero page");
+              "GPU guest-read guard accepts an untouched file-backed zero page");
         MEMORY_BASIC_INFORMATION near_after{}, far_after{};
         VirtualQuery((void*)(uintptr_t)(sparse_va1 + 0x4000), &near_after,
                      sizeof(near_after));
         VirtualQuery((void*)(uintptr_t)(sparse_va1 + 0x01000000), &far_after,
                      sizeof(far_after));
-        CHECK(near_after.State == MEM_COMMIT && far_after.State == MEM_RESERVE,
-              "host read commits only the requested 16 KiB guest page");
+        CHECK(near_after.State == MEM_COMMIT && far_after.State == MEM_COMMIT,
+              "host read leaves the fault-free direct mapping committed");
         CHECK(*(volatile uint32_t*)(uintptr_t)(sparse_va1 + 0x4120) == 0,
               "virgin sparse direct-memory page reads as zero");
 
@@ -256,22 +256,17 @@ int main() {
         MEMORY_BASIC_INFORMATION protected_before{};
         VirtualQuery((void*)(uintptr_t)protected_page, &protected_before,
                      sizeof(protected_before));
-        CHECK(protected_before.State == MEM_RESERVE,
-              "mprotect does not materialize an untouched sparse page");
-        CHECK(!prosper_try_commit_dmem(protected_page, 0x4000, 1),
-              "read-only sparse mapping rejects host write materialization");
-        CHECK(prosper_try_commit_dmem(protected_page, 0x4000, 0),
-              "read-only sparse mapping permits host read materialization");
+        CHECK(protected_before.State == MEM_COMMIT &&
+                  (protected_before.Protect & 0xff) == PAGE_READONLY,
+              "mprotect updates an untouched file-backed page without materialization");
         MEMORY_BASIC_INFORMATION protected_after{};
         VirtualQuery((void*)(uintptr_t)protected_page, &protected_after,
                      sizeof(protected_after));
         CHECK(protected_after.State == MEM_COMMIT &&
                   (protected_after.Protect & 0xff) == PAGE_READONLY,
-              "first touch applies the tracked read-only protection");
+              "read-only protection remains visible without a first-touch fault");
         CHECK(protect(protected_page, 0x4000, 0x2, 0, 0, 0) == 0,
               "mprotect restores read/write on a materialized sparse page");
-        CHECK(prosper_try_commit_dmem(protected_page, 0x4000, 1),
-              "mapping-generation invalidation permits a cached sparse-page write");
         MEMORY_BASIC_INFORMATION writable_after{};
         VirtualQuery((void*)(uintptr_t)protected_page, &writable_after,
                      sizeof(writable_after));
@@ -294,8 +289,8 @@ int main() {
                      &late_rw_before, sizeof(late_rw_before));
         VirtualQuery((void*)(uintptr_t)(sparse_va2 + late_commit_offset),
                      &late_ro_before, sizeof(late_ro_before));
-        CHECK(late_rw_before.State == MEM_RESERVE && late_ro_before.State == MEM_RESERVE,
-              "inverse-order alias test starts with the physical page untouched");
+        CHECK(late_rw_before.State == MEM_COMMIT && late_ro_before.State == MEM_COMMIT,
+              "inverse-order alias test starts with fault-free mapped pages");
         *(volatile uint64_t*)(uintptr_t)(sparse_va1 + late_commit_offset + 0x120) =
             0x1a7ec0de6310cafeull;
         MEMORY_BASIC_INFORMATION late_ro_after{};
@@ -303,7 +298,7 @@ int main() {
                      &late_ro_after, sizeof(late_ro_after));
         CHECK(late_ro_after.State == MEM_COMMIT &&
                   (late_ro_after.Protect & 0xff) == PAGE_READONLY,
-              "late physical commit reapplies the untouched alias's read-only protection");
+              "write through one alias preserves the other alias's read-only protection");
         CHECK(*(volatile uint64_t*)(uintptr_t)(sparse_va2 + late_commit_offset + 0x120) ==
                   0x1a7ec0de6310cafeull,
               "late-committed read-only alias remains physically coherent");
