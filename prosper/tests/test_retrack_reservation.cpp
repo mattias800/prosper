@@ -28,12 +28,58 @@ int main() {
     auto batch    = Hle::lookup(nid_hash("sceKernelBatchMap"));
     auto query    = Hle::lookup(nid_hash("sceKernelVirtualQuery"));
     auto flexible = Hle::lookup(nid_hash("sceKernelMapNamedFlexibleMemory"));
+    auto flexible_noname = Hle::lookup(nid_hash("sceKernelMapFlexibleMemory"));
     auto unmap    = Hle::lookup(nid_hash("sceKernelMunmap"));
-    CHECK(reserve && protect && mtypeprotect && batch && query && flexible && unmap,
+    CHECK(reserve && protect && mtypeprotect && batch && query && flexible &&
+              flexible_noname && unmap,
           "memory HLE functions registered");
     if (fails) return 1;
 
     constexpr uint64_t page = 0x10000;
+
+    // #387 F6: without MAP_FIXED a nonzero address is a search hint. An occupied hint must
+    // relocate forward without clobbering the existing mapping; MAP_FIXED retains exact-address
+    // behavior and cannot be combined with a null address.
+    uint64_t null_fixed = 0;
+    CHECK((uint32_t)flexible((uint64_t)(uintptr_t)&null_fixed, page, 0x2,
+                             0x10 /* SCE_KERNEL_MAP_FIXED */,
+                             (uint64_t)(uintptr_t)"null-fixed", 0) == 0x80020016u &&
+              null_fixed == 0,
+          "MapFlexible rejects MAP_FIXED with a null address");
+
+    uint64_t first_flexible = 0;
+    const bool first_flexible_mapped =
+        flexible((uint64_t)(uintptr_t)&first_flexible, page, 0x2, 0,
+                 (uint64_t)(uintptr_t)"flexible-hint-first", 0) == 0 &&
+        first_flexible;
+    CHECK(first_flexible_mapped, "map an automatic flexible page for hint collision");
+    if (first_flexible_mapped) {
+        volatile uint32_t* first_cell =
+            (volatile uint32_t*)(uintptr_t)first_flexible;
+        *first_cell = 0x387F6001u;
+
+        uint64_t relocated = first_flexible;
+        const bool relocated_mapped =
+            flexible_noname((uint64_t)(uintptr_t)&relocated, page, 0x2, 0, 0, 0) == 0 &&
+            relocated > first_flexible;
+        CHECK(relocated_mapped,
+              "non-fixed occupied flexible-memory hint relocates forward");
+        CHECK(*first_cell == 0x387F6001u,
+              "relocated flexible mapping preserves the occupied hint");
+
+        uint64_t fixed_collision = first_flexible;
+        CHECK(flexible_noname((uint64_t)(uintptr_t)&fixed_collision, page, 0x2,
+                              0x10 /* SCE_KERNEL_MAP_FIXED */, 0, 0) != 0 &&
+                  fixed_collision == first_flexible && *first_cell == 0x387F6001u,
+              "fixed occupied flexible-memory hint fails without clobbering it");
+
+        if (relocated_mapped)
+            CHECK(unmap(relocated, page, 0, 0, 0, 0) == 0,
+                  "relocated flexible page unmaps cleanly");
+        CHECK(unmap(first_flexible, page, 0, 0, 0, 0) == 0,
+              "original flexible page unmaps cleanly");
+    }
+
     constexpr uint64_t len = page * 3;
     uint64_t base = 0;
     CHECK(reserve((uint64_t)(uintptr_t)&base, len, 0, page, 0, 0) == 0 && base,
