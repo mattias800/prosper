@@ -18,6 +18,14 @@
 #ifndef _WIN32
 #include <sys/uio.h>
 #include <unistd.h>
+#else
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 #include "../host/posix_shim.hpp"   // Darwin: process_vm_readv/writev
 
@@ -225,9 +233,11 @@ HLE(audio_get_port_state) {
         memset(st, 0, 0x20);
         *(int16_t*)(st + 4) = 127;   // volume (Kyty AudioOutGetPortState reports 127)
         switch (type) {              // output/channel are port-type dependent (Kyty :432-448)
-            case 3: case 127: /* output=0, channel=0 */ break;
-            case 4:  *(uint16_t*)(st + 0) = 4; st[2] = 1; break;                          // pad speaker
-            default: *(uint16_t*)(st + 0) = 1; st[2] = (uint8_t)(channels > 2 ? 2 : channels); break;
+            case 2: case 3: *(uint16_t*)(st + 0) = 0x40; st[2] = 1; break;                // voice/personal -> headphone
+            case 4:         *(uint16_t*)(st + 0) = 0x04; st[2] = 1; break;                // pad speaker
+            case 127:       *(uint16_t*)(st + 0) = 0x80; break;                           // aux -> external
+            default:        *(uint16_t*)(st + 0) = 0x01;
+                            st[2] = (uint8_t)(channels > 2 ? 2 : channels); break;          // main/bgm -> primary
         }
     }
     return 0;
@@ -314,26 +324,42 @@ std::mutex g_a2_mx;
 A2Context  g_a2_ctx[4];
 uint32_t   g_a2_users = 0, g_a2_ports = 0;
 
-// Fault-safe u64 store to a guest out-pointer (same rationale as apr_write_guest_dst: a bad
-// pointer must fail the call, not SIGSEGV inside the HLE).
-bool a2_store_u64(uint64_t dst, uint64_t v) {
+// Fault-safe store to a guest out-pointer (same rationale as apr_write_guest_dst: a bad pointer
+// must fail the call, not SIGSEGV inside the HLE). WriteProcessMemory validates the complete
+// destination range before copying, matching the all-or-fail process_vm_writev contract here.
+bool audio_store_bytes(uint64_t dst, const void* src, size_t n) {
+    if (!dst || (!src && n)) return false;
+    if (!n) return true;
 #ifndef _WIN32
-    struct iovec l { &v, sizeof v }, r { (void*)(uintptr_t)dst, sizeof v };
-    return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof v;
-#else
-    if (!dst) return false;
-    *(uint64_t*)(uintptr_t)dst = v; return true;
-#endif
-}
-bool a2_store_zeros(uint64_t dst, size_t n) {
-#ifndef _WIN32
-    std::vector<uint8_t> z(n, 0);
-    struct iovec l { z.data(), n }, r { (void*)(uintptr_t)dst, n };
+    struct iovec l { const_cast<void*>(src), n }, r { (void*)(uintptr_t)dst, n };
     return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)n;
 #else
-    if (!dst) return false;
-    memset((void*)(uintptr_t)dst, 0, n); return true;
+    SIZE_T written = 0;
+    return WriteProcessMemory(GetCurrentProcess(), (void*)(uintptr_t)dst, src, n, &written) &&
+           written == n;
 #endif
+}
+
+// Fault-safe read from guest memory. Both platform paths require the complete range so callers
+// never consume a partially copied guest structure after an inaccessible-range failure.
+bool audio_read_bytes(uint64_t src, void* dst, size_t n) {
+    if (!src || (!dst && n)) return false;
+    if (!n) return true;
+#ifndef _WIN32
+    struct iovec l { dst, n }, r { (void*)(uintptr_t)src, n };
+    return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)n;
+#else
+    SIZE_T read = 0;
+    return ReadProcessMemory(GetCurrentProcess(), (const void*)(uintptr_t)src, dst, n, &read) &&
+           read == n;
+#endif
+}
+
+bool a2_store_u32(uint64_t dst, uint32_t v) { return audio_store_bytes(dst, &v, sizeof v); }
+bool a2_store_u64(uint64_t dst, uint64_t v) { return audio_store_bytes(dst, &v, sizeof v); }
+bool a2_store_zeros(uint64_t dst, size_t n) {
+    std::vector<uint8_t> z(n, 0);
+    return audio_store_bytes(dst, z.data(), n);
 }
 
 constexpr uint64_t kA2ErrInvalid = (uint64_t)(int64_t)(int32_t)0x80260003;   // AudioOut error space
@@ -480,8 +506,8 @@ namespace {
 }
 // sceAjmInitialize(s64 reserved, u32* out_context): create a context. Filling out_context is the point.
 HLE(ajm_initialize) {
-    if (!a1) return AJM_ERR_INVALID_PARAMETER;
-    *(uint32_t*)P(a1) = g_ajm_next.fetch_add(1);
+    if (a0 != 0 || !a1) return AJM_ERR_INVALID_PARAMETER;
+    if (!a2_store_u32(a1, g_ajm_next.fetch_add(1))) return AJM_ERR_INVALID_PARAMETER;
     return 0;
 }
 HLE(ajm_finalize)         { return 0; }
@@ -492,7 +518,7 @@ HLE(ajm_module_unregister){ return 0; }
 HLE(ajm_instance_create) {
     if (!a0) return AJM_ERR_INVALID_CONTEXT;
     if (!a3) return AJM_ERR_INVALID_PARAMETER;
-    *(uint32_t*)P(a3) = g_ajm_next.fetch_add(1);
+    if (!a2_store_u32(a3, g_ajm_next.fetch_add(1))) return AJM_ERR_INVALID_PARAMETER;
     return 0;
 }
 // sceAjmInstanceDestroy(u32 context, u32 instance).
@@ -507,7 +533,7 @@ HLE(ajm_instance_destroy) {
 HLE(ajm_batch_start) {
     if (!a0) return AJM_ERR_INVALID_CONTEXT;
     if (!a5) return AJM_ERR_INVALID_PARAMETER;
-    *(uint32_t*)P(a5) = g_ajm_next.fetch_add(1);
+    if (!a2_store_u32(a5, g_ajm_next.fetch_add(1))) return AJM_ERR_INVALID_PARAMETER;
     return 0;
 }
 HLE(ajm_batch_wait)       { return a0 ? 0 : AJM_ERR_INVALID_CONTEXT; }   // batch completed
@@ -559,41 +585,20 @@ std::mutex g_ngs2_zero_mx;
 std::vector<uint8_t> g_ngs2_zeros;
 
 bool ngs2_read_u32(uint64_t src, uint32_t& value) {
-#ifndef _WIN32
-    struct iovec l { &value, sizeof value }, r { (void*)(uintptr_t)src, sizeof value };
-    return src && process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof value;
-#else
-    if (!src) return false;
-    value = *(const uint32_t*)(uintptr_t)src;
-    return true;
-#endif
+    return audio_read_bytes(src, &value, sizeof value);
 }
 
 bool ngs2_read_bytes(uint64_t src, void* dst, size_t size) {
-#ifndef _WIN32
-    struct iovec l { dst, size }, r { (void*)(uintptr_t)src, size };
-    return src && process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size;
-#else
-    if (!src) return false;
-    memcpy(dst, (const void*)(uintptr_t)src, size);
-    return true;
-#endif
+    return audio_read_bytes(src, dst, size);
 }
 
 bool ngs2_zero_bytes(uint64_t dst, size_t size) {
-#ifndef _WIN32
     // Do not use thread_local here: guest execution swaps %fs, and adding host TLS to prosper_core
     // perturbs Messenger before its first syscall. Process-global zero storage is sufficient because
     // NGS2 rendering is serialized by its audio thread; the lock also makes that contract explicit.
     std::lock_guard<std::mutex> lock(g_ngs2_zero_mx);
     if (g_ngs2_zeros.size() < size) g_ngs2_zeros.resize(size, 0);
-    struct iovec l { g_ngs2_zeros.data(), size }, r { (void*)(uintptr_t)dst, size };
-    return dst && process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size;
-#else
-    if (!dst) return false;
-    memset((void*)(uintptr_t)dst, 0, size);
-    return true;
-#endif
+    return audio_store_bytes(dst, g_ngs2_zeros.data(), size);
 }
 
 uint32_t ngs2_max_voices(uint64_t option) {

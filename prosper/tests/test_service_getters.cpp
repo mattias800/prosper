@@ -163,6 +163,11 @@ int main() {
         if (HleFn f = Hle::lookup(nid_hash("sceSystemServiceParamGetInt"))) {
             int32_t out = (int32_t)0xDEAD; f(1 /*LANG*/, (uint64_t)(uintptr_t)&out, 0, 0, 0, 0);
             CHECK(out == 1, "ParamGetInt(LANG) -> en-US(1), not the uninitialized/Japanese default");
+
+            out = (int32_t)0xDEAD;
+            f(2 /*DATE_FORMAT*/, (uint64_t)(uintptr_t)&out, 0, 0, 0, 0);
+            CHECK(out == 2,
+                  "ParamGetInt(DATE_FORMAT) -> MM/DD/YYYY(2), matching the en-US default");
         } else CHECK(false, "sceSystemServiceParamGetInt registered");
 
         // sceSystemServiceGetStatus(status*) -> fills 12 bytes, byte[6] (isCpuMode7CpuNormal)=1, and

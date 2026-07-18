@@ -301,16 +301,25 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   authorizes it. The PR author owns verification; prefer `powershell -File prosper/tools/verify-pr.ps1 core` or,
   for renderer changes, `powershell -File prosper/tools/verify-pr.ps1 renderer -Snapshot <name>`, and post the
   exact-head results.
-- **Use independent review where risk justifies it.** Complex or high-risk changes—such as shader/recompiler
+- **Use independent review whenever it can materially improve confidence.** Treat review as a correctness
+  tool, not merely a gate for large diffs: behavioral code changes involving non-obvious judgment, unfamiliar
+  code, cross-platform behavior, reverse-engineered semantics, or meaningful failure paths should normally be
+  reviewed even when the patch is small and the author verification is green. Complex or high-risk changes—such
+  as shader/recompiler
   control flow, memory safety or untrusted bounds, synchronization, ABI-sensitive interfaces, persistent data,
   shared renderer/executor format, size, or indexing semantics, or changes whose failure can silently corrupt
   results—require an independent code review before merge. Review is also required when the validation itself
   is easy to get wrong: for example, a regression test with another path that can produce the expected result,
   or a snapshot route or baseline update that needs judgment to confirm it exercises the intended behavior.
-  Judge both implementation risk and verification risk, not merely the diff size. Routine, well-bounded,
-  low-risk changes do not require an independent reviewer. The reviewer inspects the assumptions, code, risks,
-  and tests, including whether each regression test would fail without the fix, but does not duplicate the
-  author's builds, tests, snapshots, or CI jobs. Once the author is satisfied and the PR
+  Judge both implementation risk and verification risk, not merely the diff size. Skip independent review only
+  for genuinely routine, mechanical, well-bounded low-risk work where another reader is unlikely to uncover a
+  correctness problem; when in doubt, review. Passing author verification does not substitute for
+  review where review is warranted: verification demonstrates observed behavior, while review challenges the
+  contract assumptions, untested paths, and whether the regression actually proves the intended behavior.
+  When uncertain, favor review for reverse-engineered API semantics and other changes where an independent
+  reader can materially challenge the reasoning, even when the patch is small. The reviewer inspects the
+  assumptions, code, risks, and tests, including whether each regression test would fail without the fix, but
+  does not duplicate the author's builds, tests, snapshots, or CI jobs. Once the author is satisfied and the PR
   is published, run author verification and any required review; the author posts exact-head evidence and the
   reviewer posts approval on the corrected exact head. Address every blocking finding and re-review authored
   corrections, then merge only after the merge agent separately confirms author verification, reviewer approval

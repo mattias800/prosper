@@ -839,13 +839,16 @@ HLE(s_appcontent_int) { if (a1) *(int32_t*)PW(a1) = ((int32_t)a0 == 0) ? 3 : 0; 
 // value 0 = SCE_SYSTEM_PARAM_LANG_JAPANESE, so games localise their UI/text to Japanese. Default to
 // US English (SCE_SYSTEM_PARAM_LANG_ENGLISH_US = 1) instead. Configurable via PROSPER_SYS_LANG, which
 // takes the Sony SCE_SYSTEM_PARAM_LANG_* enum (0=ja, 1=en-US, 2=fr, 4=de, 5=it, 9=ko, 18=en-GB, …).
-// Date/time-format params (2/3) default to the US convention (0 = MM/DD/YYYY, 12-hour).
+// Date/time-format params (2/3) default to the US convention: date enum 2 = MM/DD/YYYY and
+// time enum 0 = 12-hour. Date enum 0 is YYYYMMDD, despite the old comment claiming it was US.
 HLE(s_syss_param_int) {
     int32_t paramId = (int32_t)a0;           // a0 = paramId, a1 = int32_t* value out (matches s_appcontent_int)
     int32_t val = 0;
     if (paramId == 1) {                      // SCE_SYSTEM_SERVICE_PARAM_ID_LANG
         val = 1;                             // SCE_SYSTEM_PARAM_LANG_ENGLISH_US
         if (const char* e = getenv("PROSPER_SYS_LANG")) val = (int32_t)strtol(e, nullptr, 0);
+    } else if (paramId == 2) {               // SCE_SYSTEM_SERVICE_PARAM_ID_DATE_FORMAT
+        val = 2;                             // SCE_SYSTEM_PARAM_DATE_FORMAT_MMDDYYYY
     } else if (paramId == 1000) {            // SCE_SYSTEM_SERVICE_PARAM_ID_ENTER_BUTTON_ASSIGN
         // Cross = confirm (Western default). Previously fell through to val=0 = Circle, which inverts
         // ✕/○ confirm/cancel and on-screen button prompts relative to the en-US locale we present.
@@ -1204,6 +1207,27 @@ namespace {
     template <class T> T ld(uint64_t base, size_t off) {   // read a guest struct field at byte offset
         T v; memcpy(&v, (const uint8_t*)PW(base) + off, sizeof(T)); return v;
     }
+    uint64_t savemem_setup_block(int32_t userId, uint32_t slotId, uint64_t memSize) {
+        uint64_t existed = 0;
+        std::lock_guard<std::mutex> lk(g_savemem_mx);
+        auto& buf = g_savemem[savemem_key(userId, slotId)];
+        if (buf.empty()) buf = savemem_load(userId, slotId);
+        existed = buf.size();
+        if (memSize > buf.size()) buf.resize(memSize, 0);
+        return existed;
+    }
+    void savemem_write_range(std::vector<uint8_t>& dst, uint64_t guestBuf, uint64_t guestSize,
+                             int64_t offset) {
+        if (!guestBuf || offset < 0 || (uint64_t)offset >= dst.size()) return;
+        uint64_t n = std::min<uint64_t>(guestSize, dst.size() - (uint64_t)offset);
+        memcpy(dst.data() + offset, PW(guestBuf), n);
+    }
+    void savemem_read_range(const std::vector<uint8_t>& src, uint64_t guestBuf, uint64_t guestSize,
+                            int64_t offset) {
+        if (!guestBuf || offset < 0 || (uint64_t)offset >= src.size()) return;
+        uint64_t n = std::min<uint64_t>(guestSize, src.size() - (uint64_t)offset);
+        memcpy(PW(guestBuf), src.data() + offset, n);
+    }
     constexpr uint64_t SD_ERR_PARAMETER      = 0x809F0000ull;
     constexpr uint64_t SD_ERR_MEMORY_NOTREADY = 0x809F0012ull;   // Set/Get before a successful Setup
 }
@@ -1216,14 +1240,7 @@ HLE(s_savemem_setup) {
     int32_t  userId  = ld<int32_t>(a0, 4);
     uint64_t memSize = ld<uint64_t>(a0, 8);
     uint32_t slotId  = ld<uint32_t>(a0, 40);
-    uint64_t existed = 0;
-    {
-        std::lock_guard<std::mutex> lk(g_savemem_mx);
-        auto& buf = g_savemem[savemem_key(userId, slotId)];
-        if (buf.empty()) buf = savemem_load(userId, slotId);       // reload a prior session's save from disk
-        existed = buf.size();                                       // -> existedMemorySize is truthful across restarts
-        if (memSize > buf.size()) buf.resize(memSize, 0);          // grow only; never drop live data
-    }
+    uint64_t existed = savemem_setup_block(userId, slotId, memSize);
     if (a1) *(uint64_t*)PW(a1) = existed;                          // result->existedMemorySize
     return 0;
 }
@@ -1245,9 +1262,7 @@ HLE(s_savemem_set) {
         uint64_t gbuf  = ld<uint64_t>(d, 0);
         uint64_t gsize = ld<uint64_t>(d, 8);
         int64_t  off   = ld<int64_t>(d, 16);
-        if (!gbuf || off < 0 || (uint64_t)off >= buf.size()) continue;
-        uint64_t n = std::min<uint64_t>(gsize, buf.size() - (uint64_t)off);
-        memcpy(buf.data() + off, PW(gbuf), n);
+        savemem_write_range(buf, gbuf, gsize, off);
     }
     return 0;
 }
@@ -1267,11 +1282,32 @@ HLE(s_savemem_get) {
         uint64_t gbuf  = ld<uint64_t>(dataPtr, 0);
         uint64_t gsize = ld<uint64_t>(dataPtr, 8);
         int64_t  off   = ld<int64_t>(dataPtr, 16);
-        if (gbuf && off >= 0 && (uint64_t)off < buf.size()) {
-            uint64_t n = std::min<uint64_t>(gsize, buf.size() - (uint64_t)off);
-            memcpy(PW(gbuf), buf.data() + off, n);
-        }
+        savemem_read_range(buf, gbuf, gsize, off);
     }
+    return 0;
+}
+// The original SaveDataMemory API passes scalar arguments and always addresses slot 0. These PS4-
+// inherited exports are still present in the PS5 3.20 table; route them through the same backing
+// store as the struct-based *2 API so callers do not receive fake success with no data transfer.
+HLE(s_savemem_setup_v1) {
+    svc_log("sceSaveDataSetupSaveDataMemory", a0,a1,a2,a3,a4,a5);
+    savemem_setup_block((int32_t)a0, 0, a1);
+    return 0;
+}
+HLE(s_savemem_set_v1) {
+    svc_log("sceSaveDataSetSaveDataMemory", a0,a1,a2,a3,a4,a5);
+    std::lock_guard<std::mutex> lk(g_savemem_mx);
+    auto it = g_savemem.find(savemem_key((int32_t)a0, 0));
+    if (it == g_savemem.end()) return SD_ERR_MEMORY_NOTREADY;
+    savemem_write_range(it->second, a1, a2, (int64_t)a3);
+    return 0;
+}
+HLE(s_savemem_get_v1) {
+    svc_log("sceSaveDataGetSaveDataMemory", a0,a1,a2,a3,a4,a5);
+    std::lock_guard<std::mutex> lk(g_savemem_mx);
+    auto it = g_savemem.find(savemem_key((int32_t)a0, 0));
+    if (it == g_savemem.end()) return SD_ERR_MEMORY_NOTREADY;
+    savemem_read_range(it->second, a1, a2, (int64_t)a3);
     return 0;
 }
 // sceSaveDataSyncSaveDataMemory(sync*): commit the slot's block. A session's Set is already visible to a
@@ -1881,6 +1917,9 @@ void register_service_hle() {
     Hle::register_fn("oQySEUfgXRA", (HleFn)s_savemem_setup, "sceSaveDataSetupSaveDataMemory2");
     Hle::register_fn("cduy9v4YmT4", (HleFn)s_savemem_set,   "sceSaveDataSetSaveDataMemory2");
     Hle::register_fn("QwOO7vegnV8", (HleFn)s_savemem_get,   "sceSaveDataGetSaveDataMemory2");
+    Hle::register_fn("v7AAAMo0Lz4", (HleFn)s_savemem_setup_v1, "sceSaveDataSetupSaveDataMemory");
+    Hle::register_fn("h3YURzXGSVQ", (HleFn)s_savemem_set_v1,   "sceSaveDataSetSaveDataMemory");
+    Hle::register_fn("7Bt5pBC-Aco", (HleFn)s_savemem_get_v1,   "sceSaveDataGetSaveDataMemory");
     Hle::register_fn("wiT9jeC7xPw", (HleFn)s_savemem_sync,  "sceSaveDataSyncSaveDataMemory");
     Hle::register_fn("yKDy8S5yLA0", (HleFn)s_savedata_term,      "sceSaveDataTerminate");
     Hle::register_fn("gjRZNnw0JPE", (HleFn)s_savedata_txres,     "sceSaveDataCreateTransactionResource");

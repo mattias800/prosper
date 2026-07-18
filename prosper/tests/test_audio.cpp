@@ -74,6 +74,11 @@ int main() {
         CHECK(ch == t.ch); CHECK(f == t.fmt);
     }
 
+    // AudioOut2 shares the guest-store primitive with AJM. Inaccessible outputs must report an
+    // error instead of faulting the host; these cover both fixed-size zero-fill and u64 stores.
+    CHECK((int32_t)call("sceAudioOut2ContextResetParam", 1) == (int32_t)0x80260003);
+    CHECK((int32_t)call("sceAudioOut2ContextQueryMemory", 0, 1) == (int32_t)0x80260003);
+
     // --- 2. open -> handle + backend.open with decoded params --------------------------------
     audio_reset();
     CapturingSink sink; audio_set_sink(&sink);
@@ -129,6 +134,21 @@ int main() {
     CHECK(*(uint8_t*)(state + 2) == 2);                   // channel (u8, capped at 2 for main port)
     CHECK(*(int16_t*)(state + 4) == 127);                 // volume (Kyty reports 127)
     CHECK(*(uint64_t*)(state + 8) == 0);                  // flag must NOT carry a bogus volume
+
+    // Port routing is independent of the requested PCM channel count. Voice and Personal report
+    // a mono headphone route, Aux reports the external route, and PadSpk reports its mono route.
+    struct PortRoute { uint32_t type; uint16_t output; uint8_t channel; } routes[] = {
+        {1, 0x01, 2}, {2, 0x40, 1}, {3, 0x40, 1}, {4, 0x04, 1}, {127, 0x80, 0},
+    };
+    for (const auto& route : routes) {
+        int64_t route_h = call("sceAudioOutOpen", 1, route.type, 0, 256, 48000, 2 /* S16 8ch */);
+        CHECK(route_h >= 1);
+        uint8_t route_state[0x20]; memset(route_state, 0xEE, sizeof route_state);
+        CHECK(call("sceAudioOutGetPortState", (uint64_t)route_h, PTR(route_state)) == 0);
+        CHECK(*(uint16_t*)(route_state + 0) == route.output);
+        CHECK(route_state[2] == route.channel);
+        CHECK(call("sceAudioOutClose", (uint64_t)route_h) == 0);
+    }
 
     // --- 6. error paths: the real SCE codes (Kyty Errno.h), not a generic -1 -----------------
     CHECK((int32_t)call("sceAudioOutOutput", 999, PTR(pcm.data())) == (int32_t)0x80260003);  // INVALID_PORT
@@ -188,6 +208,10 @@ int main() {
     CHECK(call_raw("koBbCMvOKWw", 0, PTR(&sys_info), PTR(&system)) == 0); // SystemCreate
     CHECK(system != 0 && system != 0xDEADBEEFDEADBEEFull);
 
+    BufferInfo fallback_info; memset(&fallback_info, 0xDD, sizeof fallback_info);
+    CHECK(call_raw("0eFLVCfWVds", 0x2001, 1, PTR(&fallback_info)) == 0);
+    CHECK(fallback_info.host_buffer == 0 && fallback_info.host_buffer_size == 0x2000);
+
     RackOption rack_opt{}; rack_opt.size = sizeof rack_opt; rack_opt.max_voices = 2;
     memcpy(rack_opt.name, "test", 5);
     BufferInfo rack_info; memset(&rack_info, 0xDD, sizeof rack_info);
@@ -215,6 +239,10 @@ int main() {
     CHECK(call_raw("i0VnXM-C9fc", system, PTR(&render), 1) == 0);
     for (uint8_t b : ngs_pcm) CHECK(b == 0);               // silent backend produces silence
     CHECK((int32_t)call_raw("i0VnXM-C9fc", 0, PTR(&render), 1) == (int32_t)0x804A0230);
+    CHECK((int32_t)call_raw("i0VnXM-C9fc", system, 1, 1) == (int32_t)0x804A0053);
+    RenderInfo inaccessible_output{1, 16, 0, 2};
+    CHECK((int32_t)call_raw("i0VnXM-C9fc", system, PTR(&inaccessible_output), 1) ==
+          (int32_t)0x804A0053);
 
     uint8_t source[0xA8], listener[0xA0], listener_work[0x60];
     memset(source, 0xBB, sizeof source); memset(listener, 0xBB, sizeof listener);

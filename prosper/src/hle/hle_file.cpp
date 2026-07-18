@@ -6,6 +6,7 @@
 #endif
 #include "dispatch.hpp"
 #include "nid.hpp"
+#include "heap_mutex.hpp"   // #707: keep the APR mutex off macOS __DATA
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -37,6 +38,12 @@
 #include <windows.h>   // ReadFile/WriteFile + OVERLAPPED for positioned IO (pread/pwrite equivalents)
 #endif
 #include "../host/posix_shim.hpp"   // Darwin: process_vm_*, pthread_getattr_np, st_*tim, prosper_mincore
+
+#if defined(_WIN32) && defined(__MINGW32__)
+// MinGW's UCRT import library exposes this API, but its current headers omit the declaration.
+extern "C" _invalid_parameter_handler __cdecl
+_set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
+#endif
 
 namespace prosper {
 
@@ -89,6 +96,41 @@ namespace {
 
     bool windows_prepare_guest_write(uint64_t dst, uint64_t bytes) {
         return !bytes || windows_prepare_guest_write_prefix(dst, bytes) == bytes;
+    }
+
+    void __cdecl ignore_crt_invalid_parameter(const wchar_t*, const wchar_t*, const wchar_t*,
+                                               unsigned int, uintptr_t) {}
+
+    class ScopedCrtInvalidParameterHandler {
+    public:
+        ScopedCrtInvalidParameterHandler()
+            : previous_(_set_thread_local_invalid_parameter_handler(
+                  ignore_crt_invalid_parameter)) {}
+        ~ScopedCrtInvalidParameterHandler() {
+            _set_thread_local_invalid_parameter_handler(previous_);
+        }
+        ScopedCrtInvalidParameterHandler(const ScopedCrtInvalidParameterHandler&) = delete;
+        ScopedCrtInvalidParameterHandler& operator=(const ScopedCrtInvalidParameterHandler&) = delete;
+
+    private:
+        _invalid_parameter_handler previous_;
+    };
+
+    int windows_duplicate_above_stdio(int source_fd) {
+        ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
+        int fd = ::_dup(source_fd);
+        int low_fds[3]{};
+        size_t low_count = 0;
+        // Windows has no F_DUPFD. Keep recycled stdio slots occupied until _dup reaches the
+        // guest-visible range, then release the temporary descriptors.
+        while (fd >= 0 && fd < 3) {
+            low_fds[low_count++] = fd;
+            fd = ::_dup(source_fd);
+        }
+        int duplicate_errno = fd < 0 ? errno : 0;
+        for (size_t i = 0; i < low_count; ++i) ::_close(low_fds[i]);
+        if (fd < 0) errno = duplicate_errno;
+        return fd;
     }
 #endif
 
@@ -466,7 +508,15 @@ static int host_open_flags(uint64_t f) {
 }
 HLE(f_open)  { std::string h = translate(CS(a0)); int host_flags = host_open_flags(a1);
                int fd = (int)::open(h.c_str(), host_flags, (mode_t)a2);
-#ifndef _WIN32
+#ifdef _WIN32
+               if (fd >= 0 && fd < 3) {
+                   int low_fd = fd;
+                   fd = windows_duplicate_above_stdio(low_fd);
+                   int duplicate_errno = fd < 0 ? errno : 0;
+                   ::_close(low_fd);
+                   if (fd < 0) errno = duplicate_errno;
+               }
+#else
                while (fd >= 0 && fd < 3) { int nfd = fcntl(fd, F_DUPFD, 3); ::close(fd); fd = nfd; }
 #endif
                int err = fd < 0 ? errno : 0;
@@ -475,9 +525,18 @@ HLE(f_open)  { std::string h = translate(CS(a0)); int host_flags = host_open_fla
                    "[file] open-result host='%s' guest-flags=0x%llx host-flags=0x%x -> fd=%d error=%d\n",
                    h.c_str(), (unsigned long long)a1, host_flags, fd, err);
                if (fd >= 0) preadlog("open", (uint64_t)fd, 0, 0); return (uint64_t)(int64_t)fd; }
+#ifdef __APPLE__
+int getdents_close_fd(int fd);   // #843/#847: atomic cache invalidation + host close
+#endif
 HLE(f_close) { if (a0 < 3) { preadlog("close-lo-ignored", a0, 0, 0); return 0; }
                preadlog("close", a0, 0, 0);
-               int fd = (int)a0; int r = ::close(fd); int err = r < 0 ? errno : 0;
+               int fd = (int)a0;
+#ifdef __APPLE__
+               int r = getdents_close_fd(fd);
+#else
+               int r = ::close(fd);
+#endif
+               int err = r < 0 ? errno : 0;
                filelog_fd_io("close", fd, 0, 0, r, err);
                if (r == 0) filelog_forget_fd(fd);
                return (uint64_t)(int64_t)r; }
@@ -488,8 +547,14 @@ HLE(f_close) { if (a0 < 3) { preadlog("close-lo-ignored", a0, 0, 0); return 0; }
 HLE(f_dup)  { int fd = ::dup((int)a0); while (fd >= 0 && fd < 3) { int n = fcntl(fd, F_DUPFD, 3); ::close(fd); fd = n; } return (uint64_t)(int64_t)fd; }
 HLE(f_dup2) { return (uint64_t)(int64_t)::dup2((int)a0, (int)a1); }
 #else
-HLE(f_dup)  { return (uint64_t)-1; }
-HLE(f_dup2) { return (uint64_t)-1; }
+HLE(f_dup)  { return (uint64_t)(int64_t)windows_duplicate_above_stdio((int)a0); }
+HLE(f_dup2) {
+    ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
+    int r = ::_dup2((int)a0, (int)a1);
+    // The Windows CRT reports success as zero; the guest/POSIX contract returns the
+    // destination descriptor.
+    return (uint64_t)(int64_t)(r < 0 ? -1 : (int)a1);
+}
 #endif
 #ifndef _WIN32
 // FULL read: loop until `count` bytes are read (or EOF/error). POSIX read()/pread() may return FEWER
@@ -771,8 +836,7 @@ HLE(f_mkdir) { std::string h = translate(CS(a0));   // sceKernelMkdir(path, mode
 #ifdef _WIN32
     return (uint64_t)(int64_t)::_mkdir(h.c_str());
 #else
-    int r = ::mkdir(h.c_str(), (mode_t)(a1 ? a1 : 0777));
-    return (uint64_t)(int64_t)(r == 0 || errno == EEXIST ? 0 : r);   // treat "already exists" as success
+    return (uint64_t)(int64_t)::mkdir(h.c_str(), (mode_t)(a1 ? a1 : 0777));
 #endif
 }
 HLE(f_rmdir) { std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::rmdir(h.c_str()); }
@@ -783,25 +847,44 @@ HLE(f_rmdir) { std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::rm
 // getdents64 on the SAME fd so the kernel keeps the directory cursor; Linux and BSD DT_* type
 // values match. Returns bytes written (0 = end of directory), or an SCE error. UE4 (PPSA17942)
 // enumerates its pak directory with this during IO-stack init.
+#ifdef __APPLE__
+// #843: sceKernelGetdents caches one DIR* per directory fd (Darwin has no getdents-on-fd). The cache
+// MUST be dropped when the guest closes that fd — otherwise a reused fd number hands back a STALE DIR*
+// for a previously-enumerated directory. .NET's Interop.Sys.EnumerateFilesRecursively (OpenDir ->
+// ReadDirR -> GetDirectoryEntryFullPath) opens+closes many directories, reusing fd numbers, so a stale
+// DIR* returns a consumed/closed directory -> a garbage DirectoryEntry -> strcmp on a bad name pointer,
+// crashing scene load (the macOS Blasphemous 2 first-level wall). File-scope so f_close can invalidate.
+// The mutex covers both the map and every DIR* operation: invalidation must not closedir a stream
+// while getdents is using it, and two reads of one stream must not race its cursor (#847).
+static std::mutex g_getdents_mx;
+static std::map<int, DIR*> g_getdents_dirs;
+int getdents_close_fd(int fd) {
+    std::lock_guard<std::mutex> lk(g_getdents_mx);
+    auto it = g_getdents_dirs.find(fd);
+    if (it != g_getdents_dirs.end()) { if (it->second) closedir(it->second); g_getdents_dirs.erase(it); }
+    // Keep the guest-fd close under the same guard. Otherwise getdents can repopulate this key
+    // after erase but before close, leaving the replacement DIR* stale when the fd is reused.
+    return ::close(fd);
+}
+#endif
 HLE(f_getdents) {
     if (!a1 || a2 < 32) return 0x80020016ull;   // EINVAL
 #ifdef __APPLE__
     // Darwin has no getdents-on-fd (getdirentries is unavailable with 64-bit inodes). Keep the
     // per-fd kernel cursor by caching one DIR* per directory fd (fdopendir owns a dup, so the
     // guest's fd number stays valid); seekdir puts back the first entry that doesn't fit.
-    // CONFIDENCE: MED — a guest that closes the fd and gets the number reused for a different
-    // directory would see a stale cursor; not exercised by current titles.
-    static std::mutex dirmx; static std::map<int, DIR*> dirs;
+    // Hold the cache mutex through the complete read so f_close cannot invalidate/free dp
+    // underneath us; this also serializes concurrent reads of the same cursor.
+    std::lock_guard<std::mutex> lk(g_getdents_mx);
     DIR* dp = nullptr;
-    { std::lock_guard<std::mutex> lk(dirmx);
-      auto it = dirs.find((int)a0);
-      if (it != dirs.end()) dp = it->second;
-      else {
-          int d2 = dup((int)a0);
-          dp = d2 >= 0 ? fdopendir(d2) : nullptr;
-          if (!dp) { if (d2 >= 0) ::close(d2); return 0x80020000ull | (uint64_t)(errno & 0xff); }
-          dirs[(int)a0] = dp;
-      } }
+    auto it = g_getdents_dirs.find((int)a0);
+    if (it != g_getdents_dirs.end()) dp = it->second;
+    else {
+        int d2 = dup((int)a0);
+        dp = d2 >= 0 ? fdopendir(d2) : nullptr;
+        if (!dp) { if (d2 >= 0) ::close(d2); return 0x80020000ull | (uint64_t)(errno & 0xff); }
+        g_getdents_dirs[(int)a0] = dp;
+    }
     uint8_t* out = (uint8_t*)P(a1);
     size_t w = 0;
     for (;;) {
@@ -884,20 +967,20 @@ HLE(f_rename){ std::string from = translate(CS(a0)), to = translate(CS(a1));
 // id->host-path so the read path can pread by id. CONFIDENCE: MED (arg roles from live capture;
 // outFlags semantics unknown -> 0).
 namespace {
-    std::mutex g_apr_mx;
+    PROSPER_HEAP_MUTEX(g_apr_mx);   // #707: heap-backed on macOS (APR registry mutex near the corrupted __DATA cluster)
     struct AprFile { std::string path; uint64_t size; };
     std::vector<AprFile> g_apr_files;   // id (1-based index) -> {host path, size}
 }
 // Exposed to the read path (Ampr page-read) to map an APR id back to its host file.
 std::string prosper_apr_path_for_id(uint32_t id) {
-    std::lock_guard<std::mutex> lk(g_apr_mx);
+    std::lock_guard lk(g_apr_mx);
     return (id >= 1 && id <= g_apr_files.size()) ? g_apr_files[id - 1].path : std::string();
 }
 // Register a resolved container and return its stable 1-based id. Re-resolving the same host path
 // returns the existing id (updated size) instead of a duplicate entry — a duplicate would make
 // every size-keyed read of that file look ambiguous. Exposed (not static) for the unit test.
 uint32_t prosper_apr_register(const std::string& path, uint64_t size) {
-    std::lock_guard<std::mutex> lk(g_apr_mx);
+    std::lock_guard lk(g_apr_mx);
     for (size_t i = 0; i < g_apr_files.size(); i++)
         if (g_apr_files[i].path == path) { g_apr_files[i].size = size; return (uint32_t)(i + 1); }
     g_apr_files.push_back({ path, size });
@@ -905,7 +988,7 @@ uint32_t prosper_apr_register(const std::string& path, uint64_t size) {
 }
 // Test hook: drop all registered containers (the registry is process-global).
 void prosper_apr_reset_for_test() {
-    std::lock_guard<std::mutex> lk(g_apr_mx);
+    std::lock_guard lk(g_apr_mx);
     g_apr_files.clear();
 }
 // Find resolved host paths whose TOTAL size equals `size`. Returns the match count and sets
@@ -914,7 +997,7 @@ void prosper_apr_reset_for_test() {
 // legible in the captured request layout (docs/UE4_APR_IOSTORE_BRINGUP.md field map, +0x00..+0x40),
 // so size is the only correlation currently available. Exposed (not static) for the unit test.
 int prosper_apr_match_by_size(uint64_t size, std::string* out_path) {
-    std::lock_guard<std::mutex> lk(g_apr_mx);
+    std::lock_guard lk(g_apr_mx);
     int n = 0;
     for (auto& f : g_apr_files)
         if (f.size == size) { if (n++ == 0 && out_path) *out_path = f.path; }

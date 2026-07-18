@@ -1662,6 +1662,61 @@ namespace {
                 rdb(g_fault_rip+4), rdb(g_fault_rip+5), rdb(g_fault_rip+6), rdb(g_fault_rip+7),
                 (unsigned long long)(probe_readable(g_rsp) ? *(const uint64_t*)g_rsp : 0));
             syscall(SYS_write, 2,ib, m);
+            // #694: guest control-flow backtrace at the worker fault. When the fault is an intermittent
+            // bad-pointer jump (e.g. the Blasphemous 2 asset-load worker reaching non-exec Rosetta memory
+            // with ret@[rsp]=0x0), rip is uninformative garbage; the only way to attribute it to a guest
+            // call site is the return-address chain. Two async-signal-safe passes (probe_readable + raw
+            // SYS_write, no malloc): a frame-pointer chain walk from rbp, and a bounded stack scan flagging
+            // qwords that fall in the main guest module band [g_base, g_base+4 GiB) (rsp may be a host
+            // pthread stack, so non-guest words are filtered out).
+            {
+                char lb[160]; int ln;
+                ln = snprintf(lb, sizeof lb, "[prosper]   guest fp-chain (rbp=0x%llx):\n", (unsigned long long)g_rbp);
+                if (ln > 0) syscall(SYS_write, 2, lb, (size_t)ln);
+                uint64_t fp = g_rbp;
+                for (int depth = 0; depth < 16; depth++) {
+                    if (!probe_readable(fp) || !probe_readable(fp + 8)) break;
+                    uint64_t ra  = *(const uint64_t*)(uintptr_t)(fp + 8);
+                    uint64_t nfp = *(const uint64_t*)(uintptr_t)fp;
+                    if (g_base && ra >= g_base && ra < g_base + 0x100000000ull)
+                        ln = snprintf(lb, sizeof lb, "[prosper]     #%d ra=0x%llx (eboot+0x%llx)\n",
+                                      depth, (unsigned long long)ra, (unsigned long long)(ra - g_base));
+                    else
+                        ln = snprintf(lb, sizeof lb, "[prosper]     #%d ra=0x%llx\n", depth, (unsigned long long)ra);
+                    if (ln > 0) syscall(SYS_write, 2, lb, (size_t)ln);
+                    if (nfp <= fp || nfp - fp > 0x200000ull) break;   // non-increasing / implausible frame: stop
+                    fp = nfp;
+                }
+                ln = snprintf(lb, sizeof lb, "[prosper]   guest ret-addr scan (rsp=0x%llx, 64 qwords):\n",
+                              (unsigned long long)g_rsp);
+                if (ln > 0) syscall(SYS_write, 2, lb, (size_t)ln);
+                for (int i = 0, shown = 0; i < 64 && shown < 16; i++) {
+                    uint64_t sa = g_rsp + (uint64_t)i * 8;
+                    if (!probe_readable(sa)) continue;
+                    uint64_t q = *(const uint64_t*)(uintptr_t)sa;
+                    if (g_base && q >= g_base && q < g_base + 0x100000000ull) {
+                        ln = snprintf(lb, sizeof lb, "[prosper]     rsp+0x%03x = 0x%llx (eboot+0x%llx)\n",
+                                      i * 8, (unsigned long long)q, (unsigned long long)(q - g_base));
+                        if (ln > 0) syscall(SYS_write, 2, lb, (size_t)ln);
+                        shown++;
+                    }
+                }
+                // Register-band scan: when the stack is empty (a thread that faulted at/near its entry,
+                // e.g. #694's asset-load worker: rbp unreadable, rsp at the guard page), the only guest
+                // code lead is whichever GPR still holds a guest-module pointer. Flag them eboot-relative.
+                const struct { const char* nm; uint64_t v; } gregs[] = {
+                    {"rax",g_rax},{"rbx",g_rbx},{"rcx",g_rcx},{"rdx",g_rdx},{"rsi",g_rsi},{"rdi",g_rdi},
+                    {"r8",g_r8},{"r9",g_r9},{"r10",g_r10},{"r11",g_r11},{"r12",g_r12},{"r13",g_r13},
+                    {"r14",g_r14},{"r15",g_r15},{"rbp",g_rbp},
+                };
+                for (const auto& r : gregs) {
+                    if (g_base && r.v >= g_base && r.v < g_base + 0x100000000ull) {
+                        ln = snprintf(lb, sizeof lb, "[prosper]     %-3s = 0x%llx (eboot+0x%llx)\n",
+                                      r.nm, (unsigned long long)r.v, (unsigned long long)(r.v - g_base));
+                        if (ln > 0) syscall(SYS_write, 2, lb, (size_t)ln);
+                    }
+                }
+            }
             // #312: full register + heap-window + GPU-write-ring dump at the worker fault too (the
             // MallocBinned3 freelist-pop faults — e.g. rcx=0x20015f00 at eboot+0x2316acf — land here,
             // not on the nullpage path). Reuses the async-signal-safe nullpage attribution dump.
