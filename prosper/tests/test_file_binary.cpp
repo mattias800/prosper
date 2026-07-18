@@ -88,7 +88,12 @@ int main() {
     HleFn kernel_getdents_fn = Hle::lookup(nid_hash("sceKernelGetdents"));
     HleFn getdirentries_fn = Hle::lookup(nid_hash("getdirentries"));
     HleFn kernel_getdirentries_fn = Hle::lookup(nid_hash("sceKernelGetdirentries"));
-    HleFn fstat_fn = Hle::lookup(nid_hash("sceKernelFstat"));
+    HleFn stat_fn = Hle::lookup(nid_hash("stat"));
+    HleFn kernel_stat_fn = Hle::lookup(nid_hash("sceKernelStat"));
+    HleFn fstat_fn = Hle::lookup(nid_hash("fstat"));
+    HleFn kernel_fstat_fn = Hle::lookup(nid_hash("sceKernelFstat"));
+    HleFn lstat_fn = Hle::lookup(nid_hash("lstat"));
+    HleFn kernel_lstat_fn = Hle::lookup(nid_hash("sceKernelLstat"));
     HleFn fcntl_fn = Hle::lookup(nid_hash("fcntl"));
     HleFn kernel_fcntl_fn = Hle::lookup(nid_hash("sceKernelFcntl"));
     CHECK(posix_open_fn && open_fn && posix_read_fn && read_fn && posix_write_fn && write_fn &&
@@ -97,7 +102,8 @@ int main() {
               posix_preadv_fn && preadv_fn && posix_pwritev_fn && pwritev_fn &&
               lseek_fn && posix_close_fn && close_fn && dup_fn && kernel_dup_fn &&
               dup2_fn && kernel_dup2_fn && mkdir_fn && kernel_mkdir_fn && getdents_fn &&
-              kernel_getdents_fn && getdirentries_fn && kernel_getdirentries_fn && fstat_fn &&
+              kernel_getdents_fn && getdirentries_fn && kernel_getdirentries_fn && stat_fn &&
+              kernel_stat_fn && fstat_fn && kernel_fstat_fn && lstat_fn && kernel_lstat_fn &&
               fcntl_fn && kernel_fcntl_fn,
           "file HLE functions registered");
     std::array<uint8_t, 64> dir_buffer{};
@@ -212,8 +218,9 @@ int main() {
     CHECK(dents_eof == 0, "getdents preserves its per-open end cursor");
 
     std::array<uint8_t, 0x78> dir_stat{};
-    int64_t dir_stat_result = dir_fd >= 0 && fstat_fn
-        ? (int64_t)fstat_fn((uint64_t)dir_fd, (uint64_t)(uintptr_t)dir_stat.data(), 0, 0, 0, 0)
+    int64_t dir_stat_result = dir_fd >= 0 && kernel_fstat_fn
+        ? (int64_t)kernel_fstat_fn((uint64_t)dir_fd, (uint64_t)(uintptr_t)dir_stat.data(),
+                                   0, 0, 0, 0)
         : -1;
     CHECK(dir_stat_result == 0 &&
               ((*(const uint16_t*)(dir_stat.data() + 8)) & 0xf000u) == 0x4000u,
@@ -285,6 +292,38 @@ int main() {
           "libc open retains the -1 plus errno contract");
     CHECK((uint32_t)kernel_missing == 0x80020002u,
           "sceKernelOpen returns SCE_KERNEL_ERROR_ENOENT directly");
+
+    // The stat-family libc names preserve -1 plus errno, while their kernel siblings return
+    // a 32-bit SCE error directly. Neither contract may overwrite the guest buffer on failure.
+    auto check_missing_stat_contract = [&](const char* operation, HleFn libc_fn,
+                                           HleFn kernel_fn) {
+        std::array<uint8_t, 0x78> libc_buffer;
+        std::array<uint8_t, 0x78> kernel_buffer;
+        libc_buffer.fill(0x5a);
+        kernel_buffer.fill(0x5a);
+        const auto untouched = libc_buffer;
+        errno = 0;
+        uint64_t libc_result = libc_fn
+            ? libc_fn((uint64_t)(uintptr_t)missing_path,
+                      (uint64_t)(uintptr_t)libc_buffer.data(), 0, 0, 0, 0)
+            : 0;
+        const int libc_error = errno;
+        uint64_t kernel_result = kernel_fn
+            ? kernel_fn((uint64_t)(uintptr_t)missing_path,
+                        (uint64_t)(uintptr_t)kernel_buffer.data(), 0, 0, 0, 0)
+            : 0;
+        const std::string libc_message = std::string("libc ") + operation +
+                                         " retains -1 plus ENOENT";
+        const std::string kernel_message = std::string("sceKernel") + operation +
+                                           " returns SCE_KERNEL_ERROR_ENOENT directly";
+        const std::string buffer_message = std::string(operation) +
+                                            " failure leaves stat buffers untouched";
+        CHECK((int64_t)libc_result == -1 && libc_error == ENOENT, libc_message.c_str());
+        CHECK(kernel_result == 0x80020002u, kernel_message.c_str());
+        CHECK(libc_buffer == untouched && kernel_buffer == untouched, buffer_message.c_str());
+    };
+    check_missing_stat_contract("Stat", stat_fn, kernel_stat_fn);
+    check_missing_stat_contract("Lstat", lstat_fn, kernel_lstat_fn);
 
     constexpr uint64_t kGuestOWriteOnly = 0x0001;
     constexpr uint64_t kGuestOCreate = 0x0200;
@@ -503,6 +542,28 @@ int main() {
           "sceKernelClose returns SCE_KERNEL_ERROR_EBADF directly");
     CHECK(close_fn && close_fn(0, 0, 0, 0, 0, 0) == 0,
           "sceKernelClose preserves reserved stdio descriptors as no-op success");
+
+    std::array<uint8_t, 0x78> libc_fstat_buffer;
+    std::array<uint8_t, 0x78> kernel_fstat_buffer;
+    libc_fstat_buffer.fill(0xa5);
+    kernel_fstat_buffer.fill(0xa5);
+    const auto untouched_fstat = libc_fstat_buffer;
+    errno = 0;
+    int64_t libc_fstat_result = fstat_fn
+        ? (int64_t)fstat_fn(closed_io_fd, (uint64_t)(uintptr_t)libc_fstat_buffer.data(),
+                            0, 0, 0, 0)
+        : 0;
+    const int libc_fstat_error = errno;
+    uint64_t kernel_fstat_result = kernel_fstat_fn
+        ? kernel_fstat_fn(closed_io_fd, (uint64_t)(uintptr_t)kernel_fstat_buffer.data(),
+                          0, 0, 0, 0)
+        : 0;
+    CHECK(libc_fstat_result == -1 && libc_fstat_error == EBADF,
+          "libc fstat retains -1 plus EBADF");
+    CHECK(kernel_fstat_result == 0x80020009u,
+          "sceKernelFstat returns SCE_KERNEL_ERROR_EBADF directly");
+    CHECK(libc_fstat_buffer == untouched_fstat && kernel_fstat_buffer == untouched_fstat,
+          "fstat failure leaves stat buffers untouched");
 
     // A duplicate is a distinct descriptor for the same open file description: it shares the
     // current offset and remains usable after the original descriptor is closed.

@@ -1313,7 +1313,9 @@ HLE(k_aio_cancel) {  // (id, s32* state): nothing is in flight to cancel — rep
 HLE(f_stat)  { std::string h = translate(CS(a0)); struct stat st; int r = ::stat(h.c_str(), &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
 HLE(f_fstat) { struct stat st; int r = ::fstat((int)a0, &st); int err = r < 0 ? errno : 0;
                if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1));
-               filelog_fd_stat((int)a0, r, err, r == 0 ? (int64_t)st.st_size : -1); return (uint64_t)(int64_t)r; }
+               filelog_fd_stat((int)a0, r, err, r == 0 ? (int64_t)st.st_size : -1);
+               if (r < 0) errno = err;
+               return (uint64_t)(int64_t)r; }
 // lstat: was MISSING -> the return-0 stub reported success while leaving the caller's stat buffer as
 // uninitialized garbage (wrong file type/size). We have no symlinks in the dump, so ::lstat == ::stat, but
 // the key fix is WRITING the buffer. fsync: was fake-success; flush for real save durability.
@@ -1322,15 +1324,28 @@ HLE(f_fsync) { return (uint64_t)(int64_t)::fsync((int)a0); }
 #else
 HLE(f_stat)  { std::string h = translate(CS(a0)); struct _stat64 st; int r = ::_stat64(h.c_str(), &st); if (r == 0 && a1) to_sce_stat64(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
 HLE(f_fstat) { struct _stat64 st; std::string directory_path;
+               ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
                int r = windows_directory_path((int)a0, &directory_path)
                      ? ::_stat64(directory_path.c_str(), &st)
                      : ::_fstat64((int)a0, &st);
                int err = r < 0 ? errno : 0;
                if (r == 0 && a1) to_sce_stat64(st, (uint8_t*)P(a1));
-               filelog_fd_stat((int)a0, r, err, r == 0 ? (int64_t)st.st_size : -1); return (uint64_t)(int64_t)r; }
+               filelog_fd_stat((int)a0, r, err, r == 0 ? (int64_t)st.st_size : -1);
+               if (r < 0) errno = err;
+               return (uint64_t)(int64_t)r; }
 HLE(f_lstat) { return f_stat(a0,a1,a2,a3,a4,a5); }
 HLE(f_fsync) { return 0; }
 #endif
+
+// The stat family has a signed 32-bit result. Kernel exports return the translated SCE error
+// directly, while the libc names retain -1 plus errno. Successful calls and output translation
+// remain shared so both namespaces keep the same guest stat layout.
+static uint64_t kernel_stat_result(uint64_t result, int error) {
+    return (int64_t)result < 0 ? file_sce_error(error) : result;
+}
+HLE(k_stat)  { uint64_t r = f_stat(a0, a1, a2, a3, a4, a5);  int e = errno; return kernel_stat_result(r, e); }
+HLE(k_fstat) { uint64_t r = f_fstat(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_stat_result(r, e); }
+HLE(k_lstat) { uint64_t r = f_lstat(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_stat_result(r, e); }
 HLE(f_access){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::access(h.c_str(), (int)a1); }
 HLE(f_mkdir) { std::string h = translate(CS(a0));   // sceKernelMkdir(path, mode)
 #ifdef _WIN32
@@ -2064,12 +2079,12 @@ void register_file_hle() {
     R("open", f_open);     R("close", f_close);   R("read", f_read);     R("write", f_write);
     R("lseek", f_lseek);   R("stat", f_stat);     R("fstat", f_fstat);   R("access", f_access);
     R("sceKernelOpen", k_open);  R("sceKernelClose", k_close); R("sceKernelRead", k_read);
-    R("sceKernelWrite", k_write); R("sceKernelLseek", k_lseek); R("sceKernelStat", f_stat);
+    R("sceKernelWrite", k_write); R("sceKernelLseek", k_lseek); R("sceKernelStat", k_stat);
     R("sceKernelFtruncate", f_ftruncate);   // real resize (was fake-success -> corrupt saves)
-    R("lstat", f_lstat);   R("sceKernelLstat", f_lstat);     // was MISSING -> uninitialized stat buffer
+    R("lstat", f_lstat);   R("sceKernelLstat", k_lstat);     // was MISSING -> uninitialized stat buffer
     R("fsync", f_fsync);   R("sceKernelFsync", f_fsync);     // was fake-success -> no durability
     R("sceKernelTruncate", f_truncate);      // path-based sibling (same corruption class)
-    R("sceKernelFstat", f_fstat);
+    R("sceKernelFstat", k_fstat);
     // Low-level POSIX wrappers with the internal leading-underscore names. Real libc.prx implements
     // its stdio/file layer (fopen/fwrite/...) on top of these, so they MUST be real (were stubbed to
     // 0). Same handlers/host-fd space as the unprefixed ones, so libc's fds stay consistent.
