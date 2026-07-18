@@ -115,6 +115,23 @@ namespace {
     private:
         _invalid_parameter_handler previous_;
     };
+
+    int windows_duplicate_above_stdio(int source_fd) {
+        ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
+        int fd = ::_dup(source_fd);
+        int low_fds[3]{};
+        size_t low_count = 0;
+        // Windows has no F_DUPFD. Keep recycled stdio slots occupied until _dup reaches the
+        // guest-visible range, then release the temporary descriptors.
+        while (fd >= 0 && fd < 3) {
+            low_fds[low_count++] = fd;
+            fd = ::_dup(source_fd);
+        }
+        int duplicate_errno = fd < 0 ? errno : 0;
+        for (size_t i = 0; i < low_count; ++i) ::_close(low_fds[i]);
+        if (fd < 0) errno = duplicate_errno;
+        return fd;
+    }
 #endif
 
     void filelog_remember_fd(int fd, const std::string& path) {
@@ -491,7 +508,15 @@ static int host_open_flags(uint64_t f) {
 }
 HLE(f_open)  { std::string h = translate(CS(a0)); int host_flags = host_open_flags(a1);
                int fd = (int)::open(h.c_str(), host_flags, (mode_t)a2);
-#ifndef _WIN32
+#ifdef _WIN32
+               if (fd >= 0 && fd < 3) {
+                   int low_fd = fd;
+                   fd = windows_duplicate_above_stdio(low_fd);
+                   int duplicate_errno = fd < 0 ? errno : 0;
+                   ::_close(low_fd);
+                   if (fd < 0) errno = duplicate_errno;
+               }
+#else
                while (fd >= 0 && fd < 3) { int nfd = fcntl(fd, F_DUPFD, 3); ::close(fd); fd = nfd; }
 #endif
                int err = fd < 0 ? errno : 0;
@@ -522,20 +547,7 @@ HLE(f_close) { if (a0 < 3) { preadlog("close-lo-ignored", a0, 0, 0); return 0; }
 HLE(f_dup)  { int fd = ::dup((int)a0); while (fd >= 0 && fd < 3) { int n = fcntl(fd, F_DUPFD, 3); ::close(fd); fd = n; } return (uint64_t)(int64_t)fd; }
 HLE(f_dup2) { return (uint64_t)(int64_t)::dup2((int)a0, (int)a1); }
 #else
-HLE(f_dup)  {
-    ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
-    int fd = ::_dup((int)a0);
-    int low_fds[3]{};
-    size_t low_count = 0;
-    // Windows has no F_DUPFD. Keep recycled stdio slots occupied until _dup reaches the
-    // guest-visible range, then release the temporary descriptors.
-    while (fd >= 0 && fd < 3) {
-        low_fds[low_count++] = fd;
-        fd = ::_dup((int)a0);
-    }
-    for (size_t i = 0; i < low_count; ++i) ::_close(low_fds[i]);
-    return (uint64_t)(int64_t)fd;
-}
+HLE(f_dup)  { return (uint64_t)(int64_t)windows_duplicate_above_stdio((int)a0); }
 HLE(f_dup2) {
     ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
     int r = ::_dup2((int)a0, (int)a1);
