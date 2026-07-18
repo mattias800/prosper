@@ -8,6 +8,9 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <map>
+#include <set>
+#include <string>
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
@@ -55,9 +58,10 @@ int main() {
     HleFn kernel_getdents_fn = Hle::lookup(nid_hash("sceKernelGetdents"));
     HleFn getdirentries_fn = Hle::lookup(nid_hash("getdirentries"));
     HleFn kernel_getdirentries_fn = Hle::lookup(nid_hash("sceKernelGetdirentries"));
+    HleFn fstat_fn = Hle::lookup(nid_hash("sceKernelFstat"));
     CHECK(open_fn && read_fn && lseek_fn && close_fn && dup_fn && kernel_dup_fn &&
               dup2_fn && kernel_dup2_fn && mkdir_fn && kernel_mkdir_fn && getdents_fn &&
-              kernel_getdents_fn && getdirentries_fn && kernel_getdirentries_fn,
+              kernel_getdents_fn && getdirentries_fn && kernel_getdirentries_fn && fstat_fn,
           "file HLE functions registered");
     std::array<uint8_t, 64> dir_buffer{};
 
@@ -115,6 +119,107 @@ int main() {
     if (pipe_fds[1] >= 0) ::_close(pipe_fds[1]);
 #endif
     std::filesystem::remove_all(dir_path, remove_error);
+
+    // PS5 directory enumeration uses the ordinary open/getdents/close descriptor flow. The
+    // Windows CRT refuses to open a directory at all, so the HLE must retain an emulator-owned
+    // directory cursor instead of reporting a successful empty enumeration. Astro Bot discovers
+    // each intro cinematic sublevel through this exact contract.
+    const std::filesystem::path dents_path = "prosper-test-getdents.tmp";
+    std::filesystem::remove_all(dents_path, remove_error);
+    std::filesystem::create_directories(dents_path / "c01");
+    std::filesystem::create_directories(dents_path / "c02b");
+    FILE* dents_file = std::fopen((dents_path / "cinematics.cx").string().c_str(), "wb");
+    CHECK(dents_file != nullptr, "create getdents file fixture");
+    if (dents_file) { std::fputc(0x5a, dents_file); std::fclose(dents_file); }
+
+    const std::string dents_string = dents_path.string();
+    constexpr uint64_t kGuestDirectory = 0x00020000ull;
+    int64_t dir_fd = open_fn
+        ? (int64_t)open_fn((uint64_t)(uintptr_t)dents_string.c_str(),
+                           kGuestDirectory, 0, 0, 0, 0)
+        : -1;
+    CHECK(dir_fd >= 3, "sceKernelOpen returns a guest directory descriptor");
+    std::array<uint8_t, 4096> dents{};
+    int64_t dent_bytes = dir_fd >= 0 && kernel_getdents_fn
+        ? (int64_t)kernel_getdents_fn((uint64_t)dir_fd, (uint64_t)(uintptr_t)dents.data(),
+                                      dents.size(), 0, 0, 0)
+        : -1;
+    CHECK(dent_bytes > 0, "sceKernelGetdents returns directory records");
+    std::set<std::string> dent_names;
+    std::map<std::string, uint8_t> dent_types;
+    bool valid_records = dent_bytes > 0 && dent_bytes <= (int64_t)dents.size();
+    for (size_t offset = 0; valid_records && offset < (size_t)dent_bytes;) {
+        const uint16_t record_size = *(const uint16_t*)(dents.data() + offset + 4);
+        const uint8_t name_size = dents[offset + 7];
+        if (record_size < 8 || offset + record_size > (size_t)dent_bytes ||
+            name_size + 9 > record_size) {
+            valid_records = false;
+            break;
+        }
+        std::string name((const char*)dents.data() + offset + 8, name_size);
+        dent_names.insert(name);
+        dent_types[name] = dents[offset + 6];
+        offset += record_size;
+    }
+    CHECK(valid_records, "getdents records use bounded FreeBSD layout");
+    CHECK(dent_names.count("c01") && dent_names.count("c02b") &&
+              dent_names.count("cinematics.cx"),
+          "getdents exposes cinematic directories and files");
+    CHECK(dent_types["c01"] == 4 && dent_types["c02b"] == 4 &&
+              dent_types["cinematics.cx"] == 8,
+          "getdents reports directory/file d_type values");
+    int64_t dents_eof = dir_fd >= 0 && kernel_getdents_fn
+        ? (int64_t)kernel_getdents_fn((uint64_t)dir_fd, (uint64_t)(uintptr_t)dents.data(),
+                                      dents.size(), 0, 0, 0)
+        : -1;
+    CHECK(dents_eof == 0, "getdents preserves its per-open end cursor");
+
+    std::array<uint8_t, 0x78> dir_stat{};
+    int64_t dir_stat_result = dir_fd >= 0 && fstat_fn
+        ? (int64_t)fstat_fn((uint64_t)dir_fd, (uint64_t)(uintptr_t)dir_stat.data(), 0, 0, 0, 0)
+        : -1;
+    CHECK(dir_stat_result == 0 &&
+              ((*(const uint16_t*)(dir_stat.data() + 8)) & 0xf000u) == 0x4000u,
+          "sceKernelFstat identifies an open directory descriptor");
+
+#ifdef _WIN32
+    int64_t rewind_dir = dir_fd >= 0 && lseek_fn
+        ? (int64_t)lseek_fn((uint64_t)dir_fd, 0, SEEK_SET, 0, 0, 0)
+        : -1;
+    int64_t rewound_bytes = dir_fd >= 0 && kernel_getdents_fn
+        ? (int64_t)kernel_getdents_fn((uint64_t)dir_fd,
+                                      (uint64_t)(uintptr_t)dents.data(), dents.size(), 0, 0, 0)
+        : -1;
+    CHECK(rewind_dir == 0 && rewound_bytes > 0,
+          "Windows directory descriptors can be rewound and enumerated again");
+#endif
+
+    // Darwin's getdents compatibility path owns a duplicated descriptor behind DIR*. A raw
+    // lseek on the original descriptor cannot portably rewind that cached stream, so exercise
+    // getdirentries from a fresh open while retaining the Windows synthetic-cursor rewind check.
+    int64_t direntries_fd = open_fn
+        ? (int64_t)open_fn((uint64_t)(uintptr_t)dents_string.c_str(),
+                           kGuestDirectory, 0, 0, 0, 0)
+        : -1;
+    CHECK(direntries_fd >= 3, "open a fresh directory cursor for getdirentries");
+    int64_t directory_cursor_base = -1;
+    int64_t entry_bytes = direntries_fd >= 0 && kernel_getdirentries_fn
+        ? (int64_t)kernel_getdirentries_fn(
+              (uint64_t)direntries_fd, (uint64_t)(uintptr_t)dents.data(), dents.size(),
+              (uint64_t)(uintptr_t)&directory_cursor_base, 0, 0)
+        : -1;
+    CHECK(entry_bytes > 0 && directory_cursor_base == 0,
+          "getdirentries reports and advances a fresh directory cursor");
+    if (direntries_fd >= 0 && close_fn)
+        close_fn((uint64_t)direntries_fd, 0, 0, 0, 0, 0);
+    if (dir_fd >= 0 && close_fn) close_fn((uint64_t)dir_fd, 0, 0, 0, 0, 0);
+    uint64_t closed_dents = kernel_getdents_fn
+        ? kernel_getdents_fn((uint64_t)dir_fd, (uint64_t)(uintptr_t)dents.data(),
+                             dents.size(), 0, 0, 0)
+        : 0;
+    CHECK((uint32_t)closed_dents == 0x80020009u,
+          "closed directory descriptor returns EBADF instead of silent EOF");
+    std::filesystem::remove_all(dents_path, remove_error);
 
     std::array<uint8_t, 512> actual{};
     int64_t fd = open_fn ? (int64_t)open_fn((uint64_t)(uintptr_t)path, 0, 0, 0, 0, 0) : -1;
