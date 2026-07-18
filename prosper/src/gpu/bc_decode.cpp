@@ -90,8 +90,8 @@ void decode_bc4_channel(const uint8_t* blk, uint8_t vals[16]) {
 // Per-mode endpoint component precision: [0] = RGB bits, [1] = alpha bits (0 = opaque mode).
 static const uint8_t kBc7ColorBits[8] = { 4, 6, 5, 7, 5, 7, 7, 5 };
 static const uint8_t kBc7AlphaBits[8] = { 0, 0, 0, 0, 6, 8, 7, 5 };
-// Modes with a per-endpoint p-bit (0,3,6,7) — mode 1 has per-SUBSET shared p-bits, handled separately.
-static const uint8_t kBc7ModeHasPBits = 0xCB;   // 0b11001011
+// Modes with a per-endpoint p-bit (0,3,6,7). Mode 1's per-subset shared p-bits are handled separately.
+static const uint8_t kBc7ModeHasEndpointPBits = 0xC9;   // 0b11001001
 
 // Partition/anchor table (spec constants; anchor texels flagged with +128, subset id in low bits).
 static const uint8_t kBc7PartitionSets[2][64][4][4] = {
@@ -285,7 +285,7 @@ void decode_bc7_block(const uint8_t* blk, uint8_t out[16][4]) {
         for (int e = 0; e < num_endpoints; e++) ep[e][3] = bs.get(kBc7AlphaBits[mode]);
 
     // P-bits: appended as the endpoint's LSB (all components share the bit).
-    const bool per_ep_pbit = (kBc7ModeHasPBits >> mode) & 1;
+    const bool per_ep_pbit = (kBc7ModeHasEndpointPBits >> mode) & 1;
     if (mode == 1) {                            // shared per-subset p-bits
         uint32_t p0 = bs.get1(), p1 = bs.get1();
         for (int e = 0; e < 4; e++)
@@ -399,7 +399,11 @@ static int bc6h__bitstream_read_bits_r(bc6h__bitstream_t* bstream, int numBits) 
 
 
 static int bc6h__extend_sign(int val, int bits) {
-    return (val << (32 - bits)) >> (32 - bits);
+    // `val` is an unsigned `bits`-wide field. The usual signed-shift idiom has undefined behavior
+    // when the left shift overflows `int`; subtracting the modulus expresses the same two's-complement
+    // sign extension without depending on compiler behavior.
+    const int sign = 1 << (bits - 1);
+    return (val & sign) ? val - (1 << bits) : val;
 }
 
 static int bc6h__transform_inverse(int val, int a0, int bits, int isSigned) {

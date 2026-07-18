@@ -24,7 +24,7 @@ uint32_t bc_block_bytes(DataFormat f);
 // Decode a block-compressed surface `src` (bc_block_bytes(fmt) per 4x4 block, blocks row-major over a
 // ceil(w/4) x ceil(h/4) grid) into `dst` as W*H*4 RGBA8. `dst` must hold width*height*4 bytes.
 // `src_bytes` bounds the read (a short/absent source leaves the unreachable texels transparent-black).
-// Returns true if `fmt` is a supported block format (BC1/BC2/BC3/BC4/BC5/BC7), false otherwise
+// Returns true if `fmt` is a supported block format (BC1/BC2/BC3/BC4/BC5/BC6H/BC7), false otherwise
 // (dst untouched). BC4 decodes to (R,0,0,255), BC5 to (R,G,0,255) — the hardware channel rule; the
 // T# DST_SEL swizzle routes them. UNORM only (SNORM BC4/BC5 variants are kept skipped upstream).
 bool bc_decode_surface(uint8_t* dst, const uint8_t* src, size_t src_bytes,
