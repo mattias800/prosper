@@ -20,6 +20,7 @@
 #include "exec_image.hpp"
 #include "guest_write_watch.hpp"
 #include "sse4a.hpp"
+#include "x86_read_decode.hpp"
 #include "../hle/nid.hpp"
 #include "../hle/dispatch.hpp"
 
@@ -148,6 +149,13 @@ using GuestInitFn = PROSPER_SYSV_ABI void (*)(uint64_t argc, uint64_t argp);
 
 namespace {
     uint64_t g_base = 0, g_stub_base = 0, g_stub_size = 0, g_nstubs = 0;
+    uint64_t g_image_end = 0;   // g_base + max_vaddr: end of the guest module's mapped range
+    // PROSPER_NULL_PAGE: back low-address null-field READS with zero (parity with the Linux SIGSEGV
+    // handler). Windows reserves the bottom 64 KiB [0,0x10000) as the null dead-zone and VirtualAlloc
+    // cannot map it, so instead of committing a zero page we emulate the faulting read (zero the
+    // destination register, advance past the instruction). Set once; default off, matching Linux.
+    const bool g_null_page = getenv("PROSPER_NULL_PAGE") != nullptr;
+    volatile long g_null_page_count = 0;
     NidDb*   g_nid_db = nullptr;
 
     // Per-thread recovery point. A guest fault on the armed thread is turned into a longjmp back to
@@ -384,12 +392,70 @@ namespace {
         }
     }
     std::string trap_detail() {
-        char b[160];
-        snprintf(b, sizeof b, "%s at addr=0x%llx  rip=0x%llx (image+0x%llx)",
-                 g_trap_kind == 3 ? "ILLEGAL-INSN" : "ACCESS-VIOLATION",
-                 (unsigned long long)g_fault_addr, (unsigned long long)g_fault_rip,
-                 (unsigned long long)(g_base && g_fault_rip >= g_base ? g_fault_rip - g_base : g_fault_rip));
+        char b[256];
+        const char* knd = g_trap_kind == 3 ? "ILLEGAL-INSN" : "ACCESS-VIOLATION";
+        // Attribute the fault rip. A rip inside the guest module maps to eboot+off; a rip OUTSIDE it is
+        // host code (an HLE handler / renderer callback the guest called into) — resolve it against its
+        // own loaded module so the offset is addr2line-able (guest-base subtraction would be nonsense).
+        if (g_base && g_fault_rip >= g_base && (!g_image_end || g_fault_rip < g_image_end)) {
+            snprintf(b, sizeof b, "%s at addr=0x%llx  rip=0x%llx (eboot+0x%llx)", knd,
+                     (unsigned long long)g_fault_addr, (unsigned long long)g_fault_rip,
+                     (unsigned long long)(g_fault_rip - g_base));
+        } else {
+            HMODULE hmod = nullptr;
+            char modname[MAX_PATH] = {0};
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCSTR)(uintptr_t)g_fault_rip, &hmod) && hmod) {
+                char full[MAX_PATH] = {0};
+                if (GetModuleFileNameA(hmod, full, sizeof full)) {
+                    const char* bn = strrchr(full, '\\');
+                    snprintf(modname, sizeof modname, "%s", bn ? bn + 1 : full);
+                }
+                snprintf(b, sizeof b, "%s at addr=0x%llx  rip=0x%llx (host %s+0x%llx)", knd,
+                         (unsigned long long)g_fault_addr, (unsigned long long)g_fault_rip,
+                         modname[0] ? modname : "?", (unsigned long long)(g_fault_rip - (uintptr_t)hmod));
+            } else {
+                snprintf(b, sizeof b, "%s at addr=0x%llx  rip=0x%llx (host, unresolved)", knd,
+                         (unsigned long long)g_fault_addr, (unsigned long long)g_fault_rip);
+            }
+        }
         return b;
+    }
+
+    // PROSPER_NULL_PAGE (Windows): emulate a low-address (<64 KiB) DATA READ as returning zero, so the
+    // guest's null-terminated chain walks (e.g. UE's frame-pointer backtrace / init parse loops that
+    // read [null+off] and test for 0) proceed exactly as they do on Linux with a mmap'd zero page.
+    // Windows cannot map the reserved null dead-zone, so we decode the faulting instruction and zero its
+    // destination register instead. Handles ONLY the forms where writing the FULL destination to zero is
+    // provably correct: `mov r32/r64, [mem]` (0x8B, 32-bit zero-extends, 64-bit with REX.W) and
+    // movzx/movsx r, r/m8|16 (0F B6/B7/BE/BF — always full-width dest). 16-bit (0x66) and 8-bit (0x8A)
+    // partial-register forms, writes, execute-at-null, and any unrecognized opcode fall through to the
+    // normal fault path — so a genuine wild read is never silently masked. Returns true if it emulated.
+    bool try_emulate_null_read(CONTEXT* c, uint64_t fault_addr, ULONG access_type) {
+        if (!g_null_page) return false;
+        if (access_type != 0) return false;               // reads only (1=write, 8=execute must still fault)
+        if (fault_addr >= 0x10000ull) return false;       // only the 16 low pages, like Linux
+        if (fault_addr == c->Rip) return false;           // instruction fetch at null is a real endpoint
+        const uint8_t* p = (const uint8_t*)(uintptr_t)c->Rip;
+        if (!addr_readable((uint64_t)(uintptr_t)p)) return false;
+        int reg = 0, insn_len = 0;
+        // Decode via the shared, unit-tested x86 read decoder (only forms where zeroing the full dest is
+        // correct for a zero source). 15 = max x86-64 instruction length; Rip is executable so it is mapped.
+        if (!decode_low_read_dest(p, 15, &reg, &insn_len)) return false;
+        // Zero the full destination register (correct for REX.W/32-bit mov and movzx/movsx of a 0 source).
+        DWORD64* creg[16] = { &c->Rax, &c->Rcx, &c->Rdx, &c->Rbx, &c->Rsp, &c->Rbp, &c->Rsi, &c->Rdi,
+                              &c->R8, &c->R9, &c->R10, &c->R11, &c->R12, &c->R13, &c->R14, &c->R15 };
+        *creg[reg] = 0;
+        c->Rip += (uint64_t)insn_len;
+        long n = InterlockedIncrement(&g_null_page_count);
+        if (getenv("PROSPER_NULL_PAGE_LOG") && n <= 64) {
+            uint64_t off = (g_base && c->Rip >= g_base && (!g_image_end || c->Rip < g_image_end))
+                         ? c->Rip - g_base : 0;
+            fprintf(stderr, "[nullpage] #%ld addr=0x%llx rip=eboot+0x%llx (read->0)\n",
+                    n, (unsigned long long)fault_addr, (unsigned long long)off);
+        }
+        return true;
     }
 
     // AMD SSE4a INSERTQ/EXTRQ emulation (used by the PS5 guest; #UD on Intel hosts and the Intel ISA
@@ -916,6 +982,10 @@ namespace {
         if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2 &&
             ep->ExceptionRecord->ExceptionInformation[0] != 8) {
             uint64_t a = (uint64_t)ep->ExceptionRecord->ExceptionInformation[1];
+            // PROSPER_NULL_PAGE parity: a low-address null-field read returns zero (emulated). Kept before
+            // the other handlers because it is cheap and strictly scoped to reads below 64 KiB.
+            if (try_emulate_null_read(c, a, (ULONG)ep->ExceptionRecord->ExceptionInformation[0]))
+                return EXCEPTION_CONTINUE_EXECUTION;
             if (ep->ExceptionRecord->ExceptionInformation[0] == 1 &&
                 host::guest_write_watch_handle_fault(a))
                 return EXCEPTION_CONTINUE_EXECUTION;
@@ -1014,6 +1084,7 @@ bool map_image(const LoadedImage& img, std::string* err) {
     memcpy(got, img.mem.data(), sz);
     if (!g_base) {
         g_base = img.base;
+        g_image_end = img.base + img.max_vaddr;   // guest module extent, for host-vs-guest fault attribution
         const uint64_t cache_address =
             (img.base + img.max_vaddr + 0xffffull) & ~0xffffull;
         g_sse4a_fastpath_cache = (uint8_t*)VirtualAlloc(
