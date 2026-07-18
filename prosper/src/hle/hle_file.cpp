@@ -1223,7 +1223,10 @@ HLE(f_ftruncate) { return (uint64_t)(int64_t)::ftruncate((int)a0, (off_t)a1); }
 // corruption class (NID WlyEA-sLDf0, reached via libc.prx). Translate the path through the mount layer.
 HLE(f_truncate)  { std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::truncate(h.c_str(), (off_t)a1); }
 #else
-HLE(f_ftruncate) { return (uint64_t)-1; }
+HLE(f_ftruncate) { ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
+                    int error = ::_chsize_s((int)a0, (__int64)a1);
+                    if (error) { errno = error; return (uint64_t)(int64_t)-1; }
+                    return 0; }
 HLE(f_truncate)  { std::string h = translate(CS(a0));
                     ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
                     int fd = ::_open(h.c_str(), _O_RDWR | _O_BINARY);
@@ -1341,7 +1344,8 @@ HLE(f_fstat) { struct _stat64 st; std::string directory_path;
                if (r < 0) errno = err;
                return (uint64_t)(int64_t)r; }
 HLE(f_lstat) { return f_stat(a0,a1,a2,a3,a4,a5); }
-HLE(f_fsync) { return 0; }
+HLE(f_fsync) { ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
+               return (uint64_t)(int64_t)::_commit((int)a0); }
 #endif
 
 // These file APIs have signed 32-bit results. Kernel exports return the translated SCE error
@@ -1354,6 +1358,8 @@ HLE(k_stat)     { uint64_t r = f_stat(a0, a1, a2, a3, a4, a5);     int e = errno
 HLE(k_fstat)    { uint64_t r = f_fstat(a0, a1, a2, a3, a4, a5);    int e = errno; return kernel_file_result32(r, e); }
 HLE(k_lstat)    { uint64_t r = f_lstat(a0, a1, a2, a3, a4, a5);    int e = errno; return kernel_file_result32(r, e); }
 HLE(k_truncate) { uint64_t r = f_truncate(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
+HLE(k_ftruncate){ uint64_t r = f_ftruncate(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
+HLE(k_fsync)    { uint64_t r = f_fsync(a0, a1, a2, a3, a4, a5);    int e = errno; return kernel_file_result32(r, e); }
 HLE(f_access){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::access(h.c_str(), (int)a1); }
 HLE(f_mkdir) { std::string h = translate(CS(a0));   // sceKernelMkdir(path, mode)
 #ifdef _WIN32
@@ -2092,9 +2098,9 @@ void register_file_hle() {
     R("lseek", f_lseek);   R("stat", f_stat);     R("fstat", f_fstat);   R("access", f_access);
     R("sceKernelOpen", k_open);  R("sceKernelClose", k_close); R("sceKernelRead", k_read);
     R("sceKernelWrite", k_write); R("sceKernelLseek", k_lseek); R("sceKernelStat", k_stat);
-    R("sceKernelFtruncate", f_ftruncate);   // real resize (was fake-success -> corrupt saves)
+    R("sceKernelFtruncate", k_ftruncate);   // real resize (was fake-success -> corrupt saves)
     R("lstat", f_lstat);   R("sceKernelLstat", k_lstat);     // was MISSING -> uninitialized stat buffer
-    R("fsync", f_fsync);   R("sceKernelFsync", f_fsync);     // was fake-success -> no durability
+    R("fsync", f_fsync);   R("sceKernelFsync", k_fsync);     // was fake-success -> no durability
     R("sceKernelTruncate", k_truncate);      // path-based sibling (same corruption class)
     R("sceKernelFstat", k_fstat);
     // Low-level POSIX wrappers with the internal leading-underscore names. Real libc.prx implements
