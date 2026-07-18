@@ -208,6 +208,10 @@ int main() {
     CHECK(call_raw("koBbCMvOKWw", 0, PTR(&sys_info), PTR(&system)) == 0); // SystemCreate
     CHECK(system != 0 && system != 0xDEADBEEFDEADBEEFull);
 
+    BufferInfo fallback_info; memset(&fallback_info, 0xDD, sizeof fallback_info);
+    CHECK(call_raw("0eFLVCfWVds", 0x2001, 1, PTR(&fallback_info)) == 0);
+    CHECK(fallback_info.host_buffer == 0 && fallback_info.host_buffer_size == 0x2000);
+
     RackOption rack_opt{}; rack_opt.size = sizeof rack_opt; rack_opt.max_voices = 2;
     memcpy(rack_opt.name, "test", 5);
     BufferInfo rack_info; memset(&rack_info, 0xDD, sizeof rack_info);
@@ -235,6 +239,10 @@ int main() {
     CHECK(call_raw("i0VnXM-C9fc", system, PTR(&render), 1) == 0);
     for (uint8_t b : ngs_pcm) CHECK(b == 0);               // silent backend produces silence
     CHECK((int32_t)call_raw("i0VnXM-C9fc", 0, PTR(&render), 1) == (int32_t)0x804A0230);
+    CHECK((int32_t)call_raw("i0VnXM-C9fc", system, 1, 1) == (int32_t)0x804A0053);
+    RenderInfo inaccessible_output{1, 16, 0, 2};
+    CHECK((int32_t)call_raw("i0VnXM-C9fc", system, PTR(&inaccessible_output), 1) ==
+          (int32_t)0x804A0053);
 
     uint8_t source[0xA8], listener[0xA0], listener_work[0x60];
     memset(source, 0xBB, sizeof source); memset(listener, 0xBB, sizeof listener);
