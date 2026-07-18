@@ -2266,7 +2266,7 @@ namespace {
 
     enum class FlexibleHintState { Unavailable, Free, GuestReservation };
 
-    bool guest_reservation_covers(uint64_t begin, uint64_t end) {
+    bool hle_reservation_covers(uint64_t begin, uint64_t end) {
         if (begin >= end) return false;
         {
             std::lock_guard<std::mutex> lk(g_mx);
@@ -2285,6 +2285,10 @@ namespace {
         std::lock_guard<std::mutex> lk(g_dview_mx);
         if (private_placeholder_view_containing_locked(begin, end)) return true;
         for (const PlaceholderSpan& span : g_guest_placeholders)
+            if (begin >= span.base && end <= span.base + span.size) return true;
+        // A partial direct-memory unmap returns its hole to the HLE-owned free-placeholder
+        // registry. Flexible memory may claim that exact hole just like direct memory can.
+        for (const PlaceholderSpan& span : g_free_placeholders)
             if (begin >= span.base && end <= span.base + span.size) return true;
         return false;
     }
@@ -2319,7 +2323,7 @@ namespace {
             if (region_end <= cursor || mbi.State == MEM_COMMIT)
                 return FlexibleHintState::Unavailable;
             if (mbi.State == MEM_RESERVE) {
-                if (!guest_reservation_covers(cursor, std::min<uint64_t>(end, region_end)))
+                if (!hle_reservation_covers(cursor, std::min<uint64_t>(end, region_end)))
                     return FlexibleHintState::Unavailable;
                 saw_reservation = true;
             }
@@ -2413,9 +2417,27 @@ namespace {
         if (state != FlexibleHintState::Free) return nullptr;
 
         const DWORD pp = win_page_prot(hp);
-        void* result = VirtualAlloc(
-            reinterpret_cast<void*>(static_cast<uintptr_t>(hint)),
-            static_cast<SIZE_T>(len), MEM_RESERVE | MEM_COMMIT, pp);
+        void* result = nullptr;
+        {
+            // VirtualAlloc reservations round a free address down to 64 KiB. Use the placeholder
+            // splitter first so a fixed 16 KiB-aligned guest hint is either mapped exactly or not
+            // at all; the retained prefix/suffix become reusable HLE-owned placeholders.
+            std::lock_guard<std::mutex> lk(g_dview_mx);
+            AcquiredPlaceholder acquired =
+                acquire_placeholder_locked(hint, len, 0x4000, false);
+            if (acquired.address ==
+                reinterpret_cast<void*>(static_cast<uintptr_t>(hint)))
+                result = replace_placeholder_with_private_locked(
+                    hint, len, hp, acquired.owner);
+            else if (acquired.address)
+                restore_placeholder_owner_locked(
+                    acquired.owner,
+                    static_cast<uint64_t>(reinterpret_cast<uintptr_t>(acquired.address)), len);
+        }
+        if (!result && (hint & (kWinAllocationGranularity - 1)) == 0)
+            result = VirtualAlloc(
+                reinterpret_cast<void*>(static_cast<uintptr_t>(hint)),
+                static_cast<SIZE_T>(len), MEM_RESERVE | MEM_COMMIT, pp);
         if (result)
             host::guest_write_watch_notify_direct_mapping_added(
                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(result)), len,

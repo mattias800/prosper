@@ -71,6 +71,21 @@ int main() {
               null_fixed == 0,
           "MapFlexible rejects MAP_FIXED with a null address");
 
+#ifdef _WIN32
+    const uint64_t free_cover = find_free_guest_span(page * 2);
+    uint64_t unaligned_fixed = free_cover ? free_cover + 0x4000 : 0;
+    const bool unaligned_fixed_mapped = unaligned_fixed &&
+        flexible((uint64_t)(uintptr_t)&unaligned_fixed, page, 0x2,
+                 0x10 /* SCE_KERNEL_MAP_FIXED */,
+                 (uint64_t)(uintptr_t)"unaligned-fixed", 0) == 0 &&
+        unaligned_fixed == free_cover + 0x4000;
+    CHECK(unaligned_fixed_mapped,
+          "fixed free 16 KiB hint maps exactly instead of rounding down to 64 KiB");
+    if (unaligned_fixed_mapped)
+        CHECK(unmap(unaligned_fixed, page, 0, 0, 0, 0) == 0,
+              "fixed 16 KiB flexible mapping unmaps cleanly");
+#endif
+
     uint64_t first_flexible = 0;
     const bool first_flexible_mapped =
         flexible((uint64_t)(uintptr_t)&first_flexible, page, 0x2, 0,
@@ -168,24 +183,29 @@ int main() {
           "failed mprotect leaves reservation tracking unchanged");
 
 #ifdef _WIN32
-    // #926: MEM_COMMIT says that a host allocation exists, not that it belongs to the guest. Put
-    // one tracked guest page and one unrelated host-committed page in a single host reservation so
-    // the boundary-crossing failure is deterministic regardless of the process address layout.
-    const uint64_t host_base = find_free_guest_span(page * 2);
-    CHECK(host_base != 0, "find deterministic guest/host ownership test span");
-    if (host_base) {
-        uint64_t guest_page = host_base;
-        const bool guest_map_succeeded =
-            flexible((uint64_t)(uintptr_t)&guest_page, page, 0x2,
-                     0x10 /* SCE_KERNEL_MAP_FIXED */,
-                     (uint64_t)(uintptr_t)"mprotect-ownership", 0) == 0 && guest_page;
-        const bool guest_mapped = guest_map_succeeded && guest_page == host_base;
+    // #926: MEM_COMMIT says that a host allocation exists, not that it belongs to the guest. Keep
+    // both pages in ONE host reservation, then use BatchMap's exact flexible operation to commit
+    // and track only the first page. This makes a boundary-crossing ownership failure independent
+    // of Windows' separate-allocation VirtualProtect restriction.
+    void* host_reservation = VirtualAlloc(nullptr, page * 2, MEM_RESERVE, PAGE_NOACCESS);
+    CHECK(host_reservation != nullptr, "reserve deterministic guest/host ownership test span");
+    if (host_reservation) {
+        const uint64_t host_base = (uint64_t)(uintptr_t)host_reservation;
+        alignas(8) uint8_t map_entry[0x20]{};
+        *(uint64_t*)(map_entry + 0x00) = host_base;
+        *(uint64_t*)(map_entry + 0x10) = page;
+        map_entry[0x18] = 0x2;
+        *(int32_t*)(map_entry + 0x1c) = 3; // MAP_FLEXIBLE
+        int32_t map_done = -1;
+        const bool guest_mapped =
+            batch((uint64_t)(uintptr_t)map_entry, 1,
+                  (uint64_t)(uintptr_t)&map_done, 0, 0, 0) == 0 && map_done == 1;
         CHECK(guest_mapped, "commit and track the first page as guest memory");
 
         void* foreign_page = nullptr;
         if (guest_mapped) {
             foreign_page = VirtualAlloc((void*)(uintptr_t)(host_base + page), page,
-                                        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                                        MEM_COMMIT, PAGE_READWRITE);
         }
         CHECK(foreign_page == (void*)(uintptr_t)(host_base + page),
               "commit the adjacent page outside the guest tracker");
@@ -229,12 +249,11 @@ int main() {
                   "failed protection calls leave unrelated host memory unchanged");
         }
 
-        if (guest_map_succeeded)
-            CHECK(unmap(guest_page, page, 0, 0, 0, 0) == 0,
+        if (guest_mapped)
+            CHECK(unmap(host_base, page, 0, 0, 0, 0) == 0,
                   "tracked ownership-test page unmaps cleanly");
-        if (foreign_page)
-            CHECK(VirtualFree(foreign_page, 0, MEM_RELEASE) != 0,
-                  "ownership-test foreign page releases cleanly");
+        CHECK(VirtualFree(host_reservation, 0, MEM_RELEASE) != 0,
+              "ownership-test host reservation releases cleanly");
     }
 #endif
 
