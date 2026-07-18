@@ -741,7 +741,21 @@ HLE(k_wake_by_address) {
 
 HLE(k_munmap)   { if (!a1) return 0x80020016ull;   // EINVAL: a zero-length unmap (shadPS4 sceKernelMunmap)
                   if (a0) { munmap((void*)a0, a1); untrack(a0, a1); } return 0; }
-HLE(k_mprotect) { if (a0) { mprotect((void*)a0, a1, host_prot(a2)); retrack_prot(a0, a1, host_prot(a2), "mprotect"); } return 0; }
+static uint64_t sce_mprotect_error(int error) {
+    switch (error) {
+        case EACCES: return 0x8002000dull;
+        case ENOMEM: return 0x8002000cull;
+        case EINVAL:
+        default:     return 0x80020016ull;
+    }
+}
+HLE(k_mprotect) {
+    if (!a0) return 0x80020016ull;
+    const int prot = host_prot(a2);
+    if (mprotect((void*)a0, a1, prot) != 0) return sce_mprotect_error(errno);
+    retrack_prot(a0, a1, prot, "mprotect");
+    return 0;
+}
 // sceKernelMtypeprotect(addr, size, mtype, prot): apply the CPU protection (arg a3) then set the direct-
 // memory type (a2). Was MISSING -> the stub returned success without applying EITHER, so a later access
 // under the wrong protection faults (write to a still-RO page / exec of a still-NX page) -- the same class
@@ -1916,43 +1930,72 @@ namespace {
         if (!raw) return nullptr;
         return (void*)(((uint64_t)raw + (align - 1)) & ~(align - 1));
     }
-    bool win_protect(uint64_t addr, uint64_t len, int hp) {
-        // Update the alias registry before changing the OS protection so an overlapping watch first
+    bool tracked_reservation_covers(uint64_t begin, uint64_t end) {
+        std::lock_guard<std::mutex> lk(g_mx);
+        uint64_t cursor = begin;
+        while (cursor < end) {
+            const Mapping* best = nullptr;
+            for (const auto& mapping : g_maps) {
+                if (cursor < mapping.base || cursor >= mapping.base + mapping.size) continue;
+                if (!best || mapping.base > best->base) best = &mapping;
+            }
+            if (!best || best->committed) return false;
+            cursor = std::min<uint64_t>(end, best->base + best->size);
+        }
+        return true;
+    }
+    bool win_protect(uint64_t addr, uint64_t len, int hp, DWORD* error_out = nullptr) {
+        if (error_out) *error_out = ERROR_SUCCESS;
+        if (!addr || !len || addr > UINT64_MAX - len) {
+            if (error_out) *error_out = ERROR_INVALID_PARAMETER;
+            return false;
+        }
+
+        // Validate the complete span before changing either host protection or write-watch state.
+        // Reserved (uncommitted) pages accept a tracking-only protection change, matching the POSIX
+        // PROT_NONE reservation path; MEM_FREE makes the whole operation fail (#387 F3).
+        struct CommittedRegion { uint64_t base, size; };
+        std::vector<CommittedRegion> committed;
+        const uint64_t end = addr + len;
+        uint64_t cursor = addr;
+        while (cursor < end) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery((const void*)(uintptr_t)cursor, &mbi, sizeof(mbi))) {
+                if (error_out) *error_out = GetLastError();
+                return false;
+            }
+            const uint64_t region_end = std::min<uint64_t>(
+                end, (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize);
+            if (region_end <= cursor || mbi.State == MEM_FREE) {
+                if (error_out) *error_out = ERROR_INVALID_ADDRESS;
+                return false;
+            }
+            if (mbi.State == MEM_RESERVE &&
+                !tracked_reservation_covers(cursor, region_end) &&
+                !sparse_dmem_view_contains(cursor, region_end)) {
+                if (error_out) *error_out = ERROR_INVALID_ADDRESS;
+                return false;
+            }
+            if (mbi.State == MEM_COMMIT)
+                committed.push_back({cursor, region_end - cursor});
+            cursor = region_end;
+        }
+
+        // Update the alias registry before changing committed pages so an overlapping watch first
         // restores its old writable pages. Unrelated mappings leave existing watches armed.
         host::guest_write_watch_notify_direct_mapping_protection(
             addr, len, win_page_prot(hp));
-        if (len && addr <= UINT64_MAX - len && sparse_dmem_view_overlaps(addr, addr + len)) {
-            const uint64_t end = addr + len;
-            uint64_t cursor = addr;
-            while (cursor < end) {
-                MEMORY_BASIC_INFORMATION mbi{};
-                if (!VirtualQuery((const void*)(uintptr_t)cursor, &mbi, sizeof(mbi))) {
-                    host::guest_write_watch_notify_direct_mapping_removed(addr, len);
-                    return false;
-                }
-                const uint64_t region_end = std::min<uint64_t>(
-                    end, (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize);
-                if (region_end <= cursor || mbi.State == MEM_FREE) {
-                    host::guest_write_watch_notify_direct_mapping_removed(addr, len);
-                    return false;
-                }
-                if (mbi.State == MEM_COMMIT) {
-                    DWORD old = 0;
-                    if (!VirtualProtect((void*)(uintptr_t)cursor,
-                                        (SIZE_T)(region_end - cursor),
-                                        win_page_prot(hp), &old)) {
-                        host::guest_write_watch_notify_direct_mapping_removed(addr, len);
-                        return false;
-                    }
-                }
-                cursor = region_end;
+        for (const auto& region : committed) {
+            DWORD old = 0;
+            if (!VirtualProtect((void*)(uintptr_t)region.base, (SIZE_T)region.size,
+                                win_page_prot(hp), &old)) {
+                const DWORD error = GetLastError();
+                host::guest_write_watch_notify_direct_mapping_removed(addr, len);
+                if (error_out) *error_out = error;
+                return false;
             }
-            return true;
         }
-        DWORD old = 0;
-        const bool ok = VirtualProtect((void*)addr, (SIZE_T)len, win_page_prot(hp), &old) != 0;
-        if (!ok) host::guest_write_watch_notify_direct_mapping_removed(addr, len);
-        return ok;
+        return true;
     }
     // Shared section views must be released with UnmapViewOfFile. Anonymous/private mappings keep
     // the old partial-safe decommit behavior.
@@ -2120,7 +2163,23 @@ HLE(k_map_dmem) {
 
 HLE(k_munmap)   { if (!a1) return 0x80020016ull;
                   if (a0) { win_unmap(a0, a1); untrack(a0, a1); } return 0; }
-HLE(k_mprotect) { if (a0) { win_protect(a0, a1, host_prot(a2)); retrack_prot(a0, a1, host_prot(a2), "mprotect"); } return 0; }
+static uint64_t sce_win_mprotect_error(DWORD error) {
+    switch (error) {
+        case ERROR_ACCESS_DENIED:
+        case ERROR_NOACCESS:          return 0x8002000dull;
+        case ERROR_NOT_ENOUGH_MEMORY:
+        case ERROR_OUTOFMEMORY:       return 0x8002000cull;
+        default:                      return 0x80020016ull;
+    }
+}
+HLE(k_mprotect) {
+    if (!a0) return 0x80020016ull;
+    const int prot = host_prot(a2);
+    DWORD error = ERROR_SUCCESS;
+    if (!win_protect(a0, a1, prot, &error)) return sce_win_mprotect_error(error);
+    retrack_prot(a0, a1, prot, "mprotect");
+    return 0;
+}
 HLE(k_mtypeprotect) { if (a0) { win_protect(a0, a1, host_prot(a3)); retrack_prot(a0, a1, host_prot(a3), "mtypeprotect"); } return 0; }
 HLE(k_dmem_size){ return kDmemTotal; }
 // sceKernelAvailableDirectMemorySize(searchStart, searchEnd, align, off_t* physOut, size_t* sizeOut)
