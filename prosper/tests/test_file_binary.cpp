@@ -26,6 +26,17 @@ static int fails = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { std::printf("  [FAIL] %s\n", msg); fails++; } \
                               else        { std::printf("  [ok]   %s\n", msg); } } while (0)
 
+// FreeBSD/Orbis fcntl ABI values. Host constants are deliberately not used here: Linux and
+// Windows assign different bits to several status flags even when command numbers coincide.
+static constexpr uint64_t kGuestFDupFd = 0;
+static constexpr uint64_t kGuestFGetFd = 1;
+static constexpr uint64_t kGuestFSetFd = 2;
+static constexpr uint64_t kGuestFGetFl = 3;
+static constexpr uint64_t kGuestFSetFl = 4;
+static constexpr uint64_t kGuestFdCloExec = 1;
+static constexpr uint64_t kGuestONonblock = 0x0004;
+static constexpr uint64_t kGuestOAppend = 0x0008;
+
 int main() {
     std::printf("== test_file_binary ==\n");
     const char* path = "prosper-test-file-binary.tmp";
@@ -59,9 +70,12 @@ int main() {
     HleFn getdirentries_fn = Hle::lookup(nid_hash("getdirentries"));
     HleFn kernel_getdirentries_fn = Hle::lookup(nid_hash("sceKernelGetdirentries"));
     HleFn fstat_fn = Hle::lookup(nid_hash("sceKernelFstat"));
+    HleFn fcntl_fn = Hle::lookup(nid_hash("fcntl"));
+    HleFn kernel_fcntl_fn = Hle::lookup(nid_hash("sceKernelFcntl"));
     CHECK(open_fn && read_fn && lseek_fn && close_fn && dup_fn && kernel_dup_fn &&
               dup2_fn && kernel_dup2_fn && mkdir_fn && kernel_mkdir_fn && getdents_fn &&
-              kernel_getdents_fn && getdirentries_fn && kernel_getdirentries_fn && fstat_fn,
+              kernel_getdents_fn && getdirentries_fn && kernel_getdirentries_fn && fstat_fn &&
+              fcntl_fn && kernel_fcntl_fn,
           "file HLE functions registered");
     std::array<uint8_t, 64> dir_buffer{};
 
@@ -224,6 +238,66 @@ int main() {
     std::array<uint8_t, 512> actual{};
     int64_t fd = open_fn ? (int64_t)open_fn((uint64_t)(uintptr_t)path, 0, 0, 0, 0, 0) : -1;
     CHECK(fd >= 0, "open fixture through guest fd HLE");
+
+    // fcntl was unregistered, so the generic missing-import path returned false success (zero).
+    // Exercise descriptor discovery and status updates with guest values that catch raw Linux
+    // passthrough: O_NONBLOCK is 0x4 on FreeBSD/Orbis, but 0x800 on Linux.
+#ifndef _WIN32
+    uint64_t guest_flags = fcntl_fn && fd >= 0
+        ? fcntl_fn((uint64_t)fd, kGuestFGetFl, 0, 0, 0, 0)
+        : ~uint64_t{0};
+    CHECK(guest_flags == 0, "fcntl F_GETFL reports guest O_RDONLY flags");
+    int64_t set_flags = fcntl_fn && fd >= 0
+        ? (int64_t)fcntl_fn((uint64_t)fd, kGuestFSetFl,
+                            kGuestONonblock | kGuestOAppend, 0, 0, 0)
+        : -1;
+    uint64_t changed_flags = kernel_fcntl_fn && fd >= 0
+        ? kernel_fcntl_fn((uint64_t)fd, kGuestFGetFl, 0, 0, 0, 0)
+        : ~uint64_t{0};
+    CHECK(set_flags == 0, "fcntl F_SETFL accepts translated guest status flags");
+    CHECK((changed_flags & (3 | kGuestONonblock | kGuestOAppend)) ==
+              (kGuestONonblock | kGuestOAppend),
+          "sceKernelFcntl F_GETFL returns translated non-blocking and append bits");
+#else
+    // UCRT exposes neither F_GETFL nor F_SETFL. Until the secondary Windows host grows an
+    // equivalent descriptor-status layer, report that limitation instead of fake success.
+    errno = 0;
+    int64_t guest_flags = fcntl_fn && fd >= 0
+        ? (int64_t)fcntl_fn((uint64_t)fd, kGuestFGetFl, 0, 0, 0, 0)
+        : 0;
+    int getfl_errno = errno;
+    errno = 0;
+    int64_t set_flags = kernel_fcntl_fn && fd >= 0
+        ? (int64_t)kernel_fcntl_fn((uint64_t)fd, kGuestFSetFl,
+                                   kGuestONonblock | kGuestOAppend, 0, 0, 0)
+        : 0;
+    CHECK(guest_flags == -1 && getfl_errno == ENOTSUP &&
+              set_flags == -1 && errno == ENOTSUP,
+          "Windows fcntl status commands fail explicitly instead of returning false success");
+#endif
+
+    int64_t set_fd_flags = fcntl_fn && fd >= 0
+        ? (int64_t)fcntl_fn((uint64_t)fd, kGuestFSetFd, kGuestFdCloExec, 0, 0, 0)
+        : -1;
+    uint64_t fd_flags = fcntl_fn && fd >= 0
+        ? fcntl_fn((uint64_t)fd, kGuestFGetFd, 0, 0, 0, 0)
+        : ~uint64_t{0};
+    CHECK(set_fd_flags == 0 && fd_flags == kGuestFdCloExec,
+          "fcntl translates the close-on-exec descriptor flag");
+
+    int64_t fcntl_duplicate = fcntl_fn && fd >= 0
+        ? (int64_t)fcntl_fn((uint64_t)fd, kGuestFDupFd, 8, 0, 0, 0)
+        : -1;
+    CHECK(fcntl_duplicate >= 8, "fcntl F_DUPFD honors the guest minimum descriptor");
+    if (fcntl_duplicate >= 0 && close_fn)
+        close_fn((uint64_t)fcntl_duplicate, 0, 0, 0, 0, 0);
+
+    errno = 0;
+    int64_t unsupported_fcntl = fcntl_fn && fd >= 0
+        ? (int64_t)fcntl_fn((uint64_t)fd, 0x7fffffff, 0, 0, 0, 0)
+        : 0;
+    CHECK(unsupported_fcntl == -1 && errno == EINVAL,
+          "fcntl rejects unsupported guest commands instead of returning false success");
 
     // libc and sceKernel expose the same enumeration operation with different error conventions.
     // The old shared handler returned a positive-looking SCE error to libc; Windows returned false

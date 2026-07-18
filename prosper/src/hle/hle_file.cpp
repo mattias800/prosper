@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <climits>
 #include <string>
 #include <mutex>
 #include <atomic>        // sceKernelAio* submit-id/state table
@@ -117,21 +118,28 @@ namespace {
         _invalid_parameter_handler previous_;
     };
 
-    int windows_duplicate_above_stdio(int source_fd) {
+    int windows_duplicate_at_least(int source_fd, int minimum_fd) {
+        if (minimum_fd < 0) {
+            errno = EINVAL;
+            return -1;
+        }
         ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
         int fd = ::_dup(source_fd);
-        int low_fds[3]{};
-        size_t low_count = 0;
-        // Windows has no F_DUPFD. Keep recycled stdio slots occupied until _dup reaches the
-        // guest-visible range, then release the temporary descriptors.
-        while (fd >= 0 && fd < 3) {
-            low_fds[low_count++] = fd;
+        std::vector<int> low_fds;
+        // Windows has no F_DUPFD. Keep lower recycled slots occupied until _dup reaches the
+        // requested guest-visible range, then release the temporary descriptors.
+        while (fd >= 0 && fd < minimum_fd) {
+            low_fds.push_back(fd);
             fd = ::_dup(source_fd);
         }
         int duplicate_errno = fd < 0 ? errno : 0;
-        for (size_t i = 0; i < low_count; ++i) ::_close(low_fds[i]);
+        for (int low_fd : low_fds) ::_close(low_fd);
         if (fd < 0) errno = duplicate_errno;
         return fd;
+    }
+
+    int windows_duplicate_above_stdio(int source_fd) {
+        return windows_duplicate_at_least(source_fd, 3);
     }
 
     // The Windows CRT refuses to open directories as file descriptors. PS5 guests nevertheless
@@ -722,6 +730,185 @@ HLE(f_dup2) {
     return (uint64_t)(int64_t)(r < 0 ? -1 : (int)a1);
 }
 #endif
+
+namespace {
+constexpr uint64_t kGuestFDupFd = 0;
+constexpr uint64_t kGuestFGetFd = 1;
+constexpr uint64_t kGuestFSetFd = 2;
+constexpr uint64_t kGuestFGetFl = 3;
+constexpr uint64_t kGuestFSetFl = 4;
+constexpr uint64_t kGuestFGetOwn = 5;
+constexpr uint64_t kGuestFSetOwn = 6;
+constexpr uint64_t kGuestFdCloExec = 1;
+constexpr uint64_t kGuestONonblock = 0x0004;
+constexpr uint64_t kGuestOAppend = 0x0008;
+constexpr uint64_t kGuestOAsync = 0x0040;
+constexpr uint64_t kGuestOSync = 0x0080;
+constexpr uint64_t kGuestODirect = 0x00010000;
+
+#ifndef _WIN32
+uint64_t guest_status_flags_from_host(int flags) {
+    uint64_t guest = (uint64_t)(flags & O_ACCMODE);
+    if (flags & O_NONBLOCK) guest |= kGuestONonblock;
+    if (flags & O_APPEND) guest |= kGuestOAppend;
+#ifdef O_ASYNC
+    if (flags & O_ASYNC) guest |= kGuestOAsync;
+#endif
+#ifdef O_SYNC
+    if ((flags & O_SYNC) == O_SYNC) guest |= kGuestOSync;
+#endif
+#ifdef O_DIRECT
+    if (flags & O_DIRECT) guest |= kGuestODirect;
+#endif
+    return guest;
+}
+
+int host_settable_status_flags(uint64_t guest) {
+    int host = 0;
+    if (guest & kGuestONonblock) host |= O_NONBLOCK;
+    if (guest & kGuestOAppend) host |= O_APPEND;
+#ifdef O_ASYNC
+    if (guest & kGuestOAsync) host |= O_ASYNC;
+#endif
+#ifdef O_DIRECT
+    if (guest & kGuestODirect) host |= O_DIRECT;
+#endif
+    return host;
+}
+
+int host_settable_status_mask() {
+    int host = O_NONBLOCK | O_APPEND;
+#ifdef O_ASYNC
+    host |= O_ASYNC;
+#endif
+#ifdef O_DIRECT
+    host |= O_DIRECT;
+#endif
+    return host;
+}
+#endif
+} // namespace
+
+// FreeBSD/Orbis and host fcntl ABIs only coincide for a subset of commands, and their O_* status
+// bits differ substantially on Linux. Translate the descriptor/status operations used by libc and
+// game runtimes; reject record-lock commands until their FreeBSD flock layout is translated too.
+HLE(f_fcntl) {
+    if (a0 > INT_MAX) {
+        errno = EBADF;
+        return (uint64_t)-1;
+    }
+    const int fd = (int)a0;
+    switch (a1) {
+    case kGuestFDupFd: {
+        if (a2 > INT_MAX) {
+            errno = EINVAL;
+            return (uint64_t)-1;
+        }
+        const int minimum = (int)a2 < 3 ? 3 : (int)a2;
+#ifdef _WIN32
+        if (windows_directory_path(fd, nullptr)) {
+            errno = ENOTSUP;
+            return (uint64_t)-1;
+        }
+        return (uint64_t)(int64_t)windows_duplicate_at_least(fd, minimum);
+#else
+        return (uint64_t)(int64_t)::fcntl(fd, F_DUPFD, minimum);
+#endif
+    }
+    case kGuestFGetFd:
+#ifdef _WIN32
+        if (windows_directory_path(fd, nullptr)) return kGuestFdCloExec;
+        {
+            ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
+            const intptr_t raw = ::_get_osfhandle(fd);
+            if (raw == -1) {
+                errno = EBADF;
+                return (uint64_t)-1;
+            }
+            DWORD flags = 0;
+            if (!GetHandleInformation((HANDLE)raw, &flags)) {
+                errno = GetLastError() == ERROR_INVALID_HANDLE ? EBADF : EACCES;
+                return (uint64_t)-1;
+            }
+            return (flags & HANDLE_FLAG_INHERIT) ? 0 : kGuestFdCloExec;
+        }
+#else
+        {
+            const int flags = ::fcntl(fd, F_GETFD);
+            return flags < 0 ? (uint64_t)-1
+                             : (uint64_t)((flags & FD_CLOEXEC) ? kGuestFdCloExec : 0);
+        }
+#endif
+    case kGuestFSetFd:
+        if (a2 & ~kGuestFdCloExec) {
+            errno = EINVAL;
+            return (uint64_t)-1;
+        }
+#ifdef _WIN32
+        if (windows_directory_path(fd, nullptr)) return 0;
+        {
+            ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
+            const intptr_t raw = ::_get_osfhandle(fd);
+            if (raw == -1) {
+                errno = EBADF;
+                return (uint64_t)-1;
+            }
+            const DWORD inherit = (a2 & kGuestFdCloExec) ? 0 : HANDLE_FLAG_INHERIT;
+            if (!SetHandleInformation((HANDLE)raw, HANDLE_FLAG_INHERIT, inherit)) {
+                errno = GetLastError() == ERROR_INVALID_HANDLE ? EBADF : EACCES;
+                return (uint64_t)-1;
+            }
+            return 0;
+        }
+#else
+        return (uint64_t)(int64_t)::fcntl(
+            fd, F_SETFD, (a2 & kGuestFdCloExec) ? FD_CLOEXEC : 0);
+#endif
+    case kGuestFGetFl:
+#ifdef _WIN32
+        // UCRT has no status-flag query. Do not preserve the old missing-import false success.
+        errno = ENOTSUP;
+        return (uint64_t)-1;
+#else
+        {
+            const int flags = ::fcntl(fd, F_GETFL);
+            return flags < 0 ? (uint64_t)-1 : guest_status_flags_from_host(flags);
+        }
+#endif
+    case kGuestFSetFl:
+#ifdef _WIN32
+        // Likewise, UCRT cannot update O_NONBLOCK/O_APPEND on an existing descriptor.
+        errno = ENOTSUP;
+        return (uint64_t)-1;
+#else
+        {
+            const int old_flags = ::fcntl(fd, F_GETFL);
+            if (old_flags < 0) return (uint64_t)-1;
+            const int new_flags = (old_flags & ~host_settable_status_mask()) |
+                                  host_settable_status_flags(a2);
+            return (uint64_t)(int64_t)::fcntl(fd, F_SETFL, new_flags);
+        }
+#endif
+    case kGuestFGetOwn:
+#ifdef _WIN32
+        errno = ENOTSUP;
+        return (uint64_t)-1;
+#else
+        return (uint64_t)(int64_t)::fcntl(fd, F_GETOWN);
+#endif
+    case kGuestFSetOwn:
+#ifdef _WIN32
+        errno = ENOTSUP;
+        return (uint64_t)-1;
+#else
+        return (uint64_t)(int64_t)::fcntl(fd, F_SETOWN, (int)a2);
+#endif
+    default:
+        errno = EINVAL;
+        return (uint64_t)-1;
+    }
+}
+
 #ifndef _WIN32
 // FULL read: loop until `count` bytes are read (or EOF/error). POSIX read()/pread() may return FEWER
 // bytes than requested (a "short read") for a perfectly valid regular file — at internal buffer
@@ -1759,6 +1946,7 @@ void register_file_hle() {
     R("unlink", f_unlink);        R("sceKernelUnlink", f_unlink);
     R("rename", f_rename);        R("sceKernelRename", f_rename);   // real move (was fake-success -> lost atomic saves)
     R("dup", f_dup);   R("sceKernelDup", f_dup);   R("dup2", f_dup2);   R("sceKernelDup2", f_dup2);   // were 0 = stdin
+    R("fcntl", f_fcntl);          R("sceKernelFcntl", f_fcntl);       // FreeBSD commands/flags need translation
     R("sceKernelGetdents", k_getdents); R("getdents", f_getdents);
     // vectored IO + getdirentries — real host ops (were MISSING -> silent-EOF / empty-dir corruption trap)
     R("sceKernelReadv", f_readv);       R("readv", f_readv);
