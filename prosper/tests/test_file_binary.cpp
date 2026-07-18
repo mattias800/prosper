@@ -143,8 +143,29 @@ int main() {
         close_fn((uint64_t)low_slot_duplicate, 0, 0, 0, 0, 0);
     if (low_slot_source >= 0 && close_fn)
         close_fn((uint64_t)low_slot_source, 0, 0, 0, 0, 0);
+
+    // With fd 0 still free, the Windows CRT will allocate it for the next open. The HLE must move
+    // that live file into the guest-visible range before returning it, without losing its contents.
+    int64_t low_slot_open = open_fn
+        ? (int64_t)open_fn((uint64_t)(uintptr_t)path, 0, 0, 0, 0, 0)
+        : -1;
+    CHECK(low_slot_open >= 3, "sceKernelOpen lifts a recycled Windows stdio descriptor");
+    std::array<uint8_t, 16> low_slot_open_chunk{};
+    int64_t low_slot_open_n = low_slot_open >= 0 && read_fn
+        ? (int64_t)read_fn((uint64_t)low_slot_open,
+                           (uint64_t)(uintptr_t)low_slot_open_chunk.data(),
+                           low_slot_open_chunk.size(), 0, 0, 0)
+        : -1;
+    CHECK(low_slot_open_n == (int64_t)low_slot_open_chunk.size() &&
+              std::memcmp(low_slot_open_chunk.data(), expected.data(),
+                          low_slot_open_chunk.size()) == 0,
+          "lifted sceKernelOpen descriptor reads the original file");
+    if (low_slot_open >= 3 && close_fn)
+        close_fn((uint64_t)low_slot_open, 0, 0, 0, 0, 0);
+    else if (low_slot_open >= 0)
+        ::_close((int)low_slot_open);
     if (saved_stdin >= 0) {
-        CHECK(::_dup2(saved_stdin, 0) == 0, "restore fd 0 after low-slot dup test");
+        CHECK(::_dup2(saved_stdin, 0) == 0, "restore fd 0 after low-slot descriptor tests");
         ::_close(saved_stdin);
     }
 #endif
