@@ -2312,7 +2312,20 @@ namespace {
         if (!raw) return nullptr;
         return (void*)(((uint64_t)raw + (align - 1)) & ~(align - 1));
     }
-    bool tracked_reservation_covers(uint64_t begin, uint64_t end) {
+    struct TrackedMappingSlice {
+        uint64_t base;
+        uint64_t size;
+        int prot;
+        bool committed;
+    };
+
+    // Snapshot the tracker coverage for a protection transaction. VirtualQuery describes every
+    // committed host allocation in the process, including allocations that do not belong to the
+    // guest. A host MEM_COMMIT result therefore cannot prove that sceKernelMprotect owns the span.
+    bool tracked_mapping_slices(uint64_t begin, uint64_t end,
+                                std::vector<TrackedMappingSlice>& slices) {
+        slices.clear();
+        if (begin >= end) return false;
         std::lock_guard<std::mutex> lk(g_mx);
         uint64_t cursor = begin;
         while (cursor < end) {
@@ -2321,11 +2334,44 @@ namespace {
                 if (cursor < mapping.base || cursor >= mapping.base + mapping.size) continue;
                 if (!best || mapping.base > best->base) best = &mapping;
             }
-            if (!best || best->committed) return false;
-            cursor = std::min<uint64_t>(end, best->base + best->size);
+            if (!best) return false;
+            const uint64_t slice_end = std::min<uint64_t>(end, best->base + best->size);
+            slices.push_back({cursor, slice_end - cursor, best->prot, best->committed});
+            cursor = slice_end;
         }
         return true;
     }
+
+    bool tracked_slices_have_commit_state(const std::vector<TrackedMappingSlice>& slices,
+                                          uint64_t begin, uint64_t end, bool committed) {
+        uint64_t cursor = begin;
+        for (const TrackedMappingSlice& slice : slices) {
+            const uint64_t slice_end = slice.base + slice.size;
+            if (slice_end <= cursor || slice.base >= end) continue;
+            if (slice.base > cursor || slice.committed != committed) return false;
+            cursor = std::min<uint64_t>(end, slice_end);
+            if (cursor == end) return true;
+        }
+        return false;
+    }
+
+    bool tracked_slices_back_host_reservation(
+        const std::vector<TrackedMappingSlice>& slices, uint64_t begin, uint64_t end) {
+        uint64_t cursor = begin;
+        for (const TrackedMappingSlice& slice : slices) {
+            const uint64_t slice_end = slice.base + slice.size;
+            if (slice_end <= cursor || slice.base >= end) continue;
+            if (slice.base > cursor) return false;
+            const uint64_t overlap_end = std::min<uint64_t>(end, slice_end);
+            // A committed tracker entry may still be MEM_RESERVE when it is a sparse section view;
+            // every other committed entry must have committed host pages.
+            if (slice.committed && !sparse_dmem_view_contains(cursor, overlap_end)) return false;
+            cursor = overlap_end;
+            if (cursor == end) return true;
+        }
+        return false;
+    }
+
     bool win_protect(uint64_t addr, uint64_t len, int hp, DWORD* error_out = nullptr) {
         if (error_out) *error_out = ERROR_SUCCESS;
         if (!addr || !len || addr > UINT64_MAX - len) {
@@ -2336,9 +2382,15 @@ namespace {
         // Validate the complete span before changing either host protection or write-watch state.
         // Reserved (uncommitted) pages accept a tracking-only protection change, matching the POSIX
         // PROT_NONE reservation path; MEM_FREE makes the whole operation fail (#387 F3).
-        struct CommittedRegion { uint64_t base, size; };
-        std::vector<CommittedRegion> committed;
         const uint64_t end = addr + len;
+        std::vector<TrackedMappingSlice> tracked;
+        if (!tracked_mapping_slices(addr, end, tracked)) {
+            if (error_out) *error_out = ERROR_INVALID_ADDRESS;
+            return false;
+        }
+
+        struct CommittedRegion { uint64_t base, size; DWORD old_protection; };
+        std::vector<CommittedRegion> committed;
         uint64_t cursor = addr;
         while (cursor < end) {
             MEMORY_BASIC_INFORMATION mbi{};
@@ -2352,14 +2404,26 @@ namespace {
                 if (error_out) *error_out = ERROR_INVALID_ADDRESS;
                 return false;
             }
-            if (mbi.State == MEM_RESERVE &&
-                !tracked_reservation_covers(cursor, region_end) &&
-                !sparse_dmem_view_contains(cursor, region_end)) {
-                if (error_out) *error_out = ERROR_INVALID_ADDRESS;
-                return false;
+            if (mbi.State == MEM_RESERVE) {
+                if (!tracked_slices_back_host_reservation(tracked, cursor, region_end)) {
+                    if (error_out) *error_out = ERROR_INVALID_ADDRESS;
+                    return false;
+                }
+            } else if (mbi.State == MEM_COMMIT) {
+                if (!tracked_slices_have_commit_state(tracked, cursor, region_end, true)) {
+                    if (error_out) *error_out = ERROR_INVALID_ADDRESS;
+                    return false;
+                }
+                // Split at tracker boundaries so rollback restores the guest protection recorded
+                // before write-watch temporarily made any pages read-only.
+                for (const TrackedMappingSlice& slice : tracked) {
+                    const uint64_t overlap_begin = std::max(cursor, slice.base);
+                    const uint64_t overlap_end = std::min(region_end, slice.base + slice.size);
+                    if (overlap_begin < overlap_end)
+                        committed.push_back({overlap_begin, overlap_end - overlap_begin,
+                                             win_page_prot(slice.prot)});
+                }
             }
-            if (mbi.State == MEM_COMMIT)
-                committed.push_back({cursor, region_end - cursor});
             cursor = region_end;
         }
 
@@ -2367,15 +2431,32 @@ namespace {
         // restores its old writable pages. Unrelated mappings leave existing watches armed.
         host::guest_write_watch_notify_direct_mapping_protection(
             addr, len, win_page_prot(hp));
+        size_t changed = 0;
         for (const auto& region : committed) {
             DWORD old = 0;
             if (!VirtualProtect((void*)(uintptr_t)region.base, (SIZE_T)region.size,
                                 win_page_prot(hp), &old)) {
                 const DWORD error = GetLastError();
-                host::guest_write_watch_notify_direct_mapping_removed(addr, len);
+                for (size_t i = changed; i > 0; --i) {
+                    const CommittedRegion& prior = committed[i - 1];
+                    DWORD ignored = 0;
+                    if (!VirtualProtect((void*)(uintptr_t)prior.base,
+                                        (SIZE_T)prior.size, prior.old_protection, &ignored)) {
+                        std::fprintf(stderr,
+                                     "[memhle] fatal: could not roll back mprotect at 0x%llx\n",
+                                     (unsigned long long)prior.base);
+                        std::abort();
+                    }
+                }
+                for (const TrackedMappingSlice& slice : tracked) {
+                    if (slice.committed)
+                        host::guest_write_watch_notify_direct_mapping_protection(
+                            slice.base, slice.size, win_page_prot(slice.prot));
+                }
                 if (error_out) *error_out = error;
                 return false;
             }
+            changed++;
         }
         return true;
     }
@@ -3041,7 +3122,14 @@ HLE(k_mprotect) {
     retrack_prot(a0, a1, prot, "mprotect");
     return 0;
 }
-HLE(k_mtypeprotect) { if (a0) { win_protect(a0, a1, host_prot(a3)); retrack_prot(a0, a1, host_prot(a3), "mtypeprotect"); } return 0; }
+HLE(k_mtypeprotect) {
+    if (!a0) return 0x80020016ull;
+    const int prot = host_prot(a3);
+    DWORD error = ERROR_SUCCESS;
+    if (!win_protect(a0, a1, prot, &error)) return sce_win_mprotect_error(error);
+    retrack_prot(a0, a1, prot, "mtypeprotect");
+    return 0;
+}
 HLE(k_dmem_size){ return kDmemTotal; }
 // sceKernelAvailableDirectMemorySize(searchStart, searchEnd, align, off_t* physOut, size_t* sizeOut)
 HLE(k_avail_dmem) {
@@ -3100,9 +3188,17 @@ HLE(k_batch_map) {
                 if (ok && start) untrack(start, len);
                 break;
             }
-            case 2: case 4:                                                              // PROTECT / TYPE_PROTECT
-                if (start) { win_protect(start, len, host_prot(prot));
-                             retrack_prot(start, len, host_prot(prot), "batch-prot"); } break;
+            case 2: case 4: {                                                            // PROTECT / TYPE_PROTECT
+                if (start) {
+                    DWORD error = ERROR_SUCCESS;
+                    ok = win_protect(start, len, host_prot(prot), &error);
+                    if (ok)
+                        retrack_prot(start, len, host_prot(prot), "batch-prot");
+                    else
+                        ret = sce_win_mprotect_error(error);
+                }
+                break;
+            }
             default: ok = false; ret = 0x80020016ull; break;
         }
         if (!ok) { if (!ret) ret = 0x8002000Cull; break; }
