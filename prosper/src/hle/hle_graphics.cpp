@@ -202,10 +202,10 @@ HLE(g_vo_flipstatus)  { // (handle, SceVideoOutFlipStatus* status): report our s
               *(int32_t*) (s + 0x38) = buf; }  // currentBuffer
     return 0;
 }
-// SceVideoOutResolutionStatus (0x20 bytes, Kyty VideoOutResolutionStatus): report a real 1080p60
-// panel instead of the previous all-zero (which advertised a 0x0 display).
+// SceVideoOutResolutionStatus (0x30 bytes): report a real 1080p60 panel instead of the previous
+// all-zero display, and initialize flags/reserved0/reserved1 rather than leaking caller garbage.
 HLE(g_vo_resstatus)   {
-    if (a1) { uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x20);
+    if (a1) { uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x30);
               *(uint32_t*)(s + 0x00) = kDispW;   *(uint32_t*)(s + 0x04) = kDispH;   // full w/h
               *(uint32_t*)(s + 0x08) = kDispW;   *(uint32_t*)(s + 0x0c) = kDispH;   // pane w/h
               *(uint64_t*)(s + 0x10) = kRefresh5994;
