@@ -125,8 +125,12 @@ VkFormat vk_color_format(uint32_t format, uint32_t number_type, uint32_t comp_sw
                           case 7: return VkFormat::R32G32B32A32_SFLOAT; }
             break;
         case 0x10u:  // COLOR_5_6_5
-            if (nt == 0u) return std_swap ? VkFormat::R5G6B5_UNORM_PACK16
-                        : alt_swap        ? VkFormat::B5G6R5_UNORM_PACK16 : VkFormat::Undefined;
+            // SWAP_STD places R at the LOW end (the convention proven by the live-verified 0xA row —
+            // STD -> R8G8B8A8, R at byte 0 — and the 0x9 row — STD -> A2B10G10R10, R in bits [9:0]).
+            // For a 565 packed word R-at-low is Vulkan B5G6R5_UNORM_PACK16 (R in bits [4:0]); the STD
+            // and ALT arms were previously reversed, swapping red/blue on any 565 surface (#913).
+            if (nt == 0u) return std_swap ? VkFormat::B5G6R5_UNORM_PACK16
+                        : alt_swap        ? VkFormat::R5G6B5_UNORM_PACK16 : VkFormat::Undefined;
             break;
         default: break;
     }

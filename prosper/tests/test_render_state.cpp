@@ -182,7 +182,10 @@ int main() {
     CHECK(vk_color_format(0x6u, 7u, 0u) == VkFormat::B10G11R11_UFLOAT_PACK32, "0x6 (alias of 0x7)/FLOAT -> B10G11R11");
     CHECK(vk_color_format(0x8u, 0u, 0u) == VkFormat::A2B10G10R10_UNORM_PACK32, "0x8 (alias of 0x9)/UNORM/STD -> A2B10G10R10");
     CHECK(vk_color_format(0x8u, 0u, 1u) == VkFormat::A2R10G10B10_UNORM_PACK32, "0x8 (alias of 0x9)/UNORM/ALT -> A2R10G10B10");
-    CHECK(vk_color_format(0x10u, 0u, 0u) == VkFormat::R5G6B5_UNORM_PACK16, "0x10/UNORM -> R5G6B5 (4)");
+    // #913: SWAP_STD places R at the low end (proven by the live-verified 0xA STD->R8G8B8A8 and the
+    // 0x9 STD->A2B10G10R10 rows above). For a 565 word R-at-low is B5G6R5; STD/ALT were reversed here.
+    CHECK(vk_color_format(0x10u, 0u, 0u) == VkFormat::B5G6R5_UNORM_PACK16, "0x10/UNORM/STD -> B5G6R5 (R low)");
+    CHECK(vk_color_format(0x10u, 0u, 1u) == VkFormat::R5G6B5_UNORM_PACK16, "0x10/UNORM/ALT -> R5G6B5 (R high)");
     CHECK(vk_color_format(0x1u, 0u, 0u) == VkFormat::R8_UNORM,   "0x1/UNORM -> R8_UNORM (9, Kyty's R8Unorm row)");
     CHECK(vk_color_format(0x4u, 7u, 0u) == VkFormat::R32_SFLOAT, "0x4/FLOAT -> R32_SFLOAT (100)");
     CHECK(vk_color_format(0x5u, 7u, 0u) == VkFormat::R16G16_SFLOAT, "0x5/FLOAT -> R16G16_SFLOAT (83)");
