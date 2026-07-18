@@ -850,11 +850,15 @@ static uint64_t directory_sce_error(int error) {
     return 0x80020000ull | (uint64_t)(error & 0xff);
 }
 
+static bool directory_result_is_error(uint64_t result) {
+    return (result & ~0xffull) == 0x80020000ull;
+}
+
 // libc's getdents/getdirentries use the POSIX -1 + errno contract, while their sceKernel siblings
 // return an SCE_KERNEL_ERROR value directly. They used to share the kernel handler, so libc saw a
 // large positive byte count on failure and could walk an untouched directory buffer as valid data.
 static uint64_t directory_result_to_posix(uint64_t result) {
-    if ((result & ~0xffull) != 0x80020000ull) return result;
+    if (!directory_result_is_error(result)) return result;
     errno = (int)(result & 0xff);
     return (uint64_t)(int64_t)-1;
 }
@@ -952,7 +956,7 @@ HLE(k_getdents) {
 HLE(k_getdirentries) {
     off_t base = ::lseek((int)a0, 0, SEEK_CUR);
     uint64_t r = k_getdents(a0, a1, a2, 0, 0, 0);
-    if (a3) *(int64_t*)P(a3) = (int64_t)base;
+    if (!directory_result_is_error(r) && a3) *(int64_t*)P(a3) = (int64_t)base;
     return r;
 }
 #else
@@ -961,13 +965,18 @@ HLE(k_getdents) {
     ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
     intptr_t handle = ::_get_osfhandle((int)a0);
     if (handle == -1) return directory_sce_error(EBADF);
+    if (GetFileType((HANDLE)handle) != FILE_TYPE_DISK) return directory_sce_error(ENOTDIR);
     BY_HANDLE_FILE_INFORMATION info{};
-    if (!GetFileInformationByHandle((HANDLE)handle, &info)) return directory_sce_error(EBADF);
+    if (!GetFileInformationByHandle((HANDLE)handle, &info)) return directory_sce_error(ENOTDIR);
     if (!(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) return directory_sce_error(ENOTDIR);
     // Directory descriptors are not currently produced by the Windows CRT-backed open path.
     return 0;
 }
-HLE(k_getdirentries) { return k_getdents(a0, a1, a2, a3, a4, a5); }
+HLE(k_getdirentries) {
+    uint64_t r = k_getdents(a0, a1, a2, a3, a4, a5);
+    if (!directory_result_is_error(r) && a3) *(int64_t*)P(a3) = 0;
+    return r;
+}
 #endif
 HLE(f_getdents) {
     return directory_result_to_posix(k_getdents(a0, a1, a2, a3, a4, a5));
