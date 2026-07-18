@@ -667,6 +667,59 @@ static int host_open_flags(uint64_t f) {
 #endif
     return h;
 }
+
+// sceKernelOpen returns a FreeBSD/Orbis errno directly, while libc open returns -1 and
+// leaves the host errno for libc to expose.  Most common errno values coincide, but the
+// values after ERANGE diverge on Linux (for example ELOOP and ENAMETOOLONG), so translate
+// the errors open(2) can report instead of copying the host number into an SCE result.
+static uint64_t open_sce_error(int error) {
+    int guest_error = 5;  // EIO is the conservative fallback for an unmapped host failure.
+    if (error == EPERM) guest_error = 1;
+    else if (error == ENOENT) guest_error = 2;
+    else if (error == EINTR) guest_error = 4;
+    else if (error == EIO) guest_error = 5;
+    else if (error == ENXIO) guest_error = 6;
+    else if (error == EBADF) guest_error = 9;
+    else if (error == ENOMEM) guest_error = 12;
+    else if (error == EACCES) guest_error = 13;
+    else if (error == EFAULT) guest_error = 14;
+    else if (error == EBUSY) guest_error = 16;
+    else if (error == EEXIST) guest_error = 17;
+    else if (error == EXDEV) guest_error = 18;
+    else if (error == ENODEV) guest_error = 19;
+    else if (error == ENOTDIR) guest_error = 20;
+    else if (error == EISDIR) guest_error = 21;
+    else if (error == EINVAL) guest_error = 22;
+    else if (error == ENFILE) guest_error = 23;
+    else if (error == EMFILE) guest_error = 24;
+    else if (error == ENOTTY) guest_error = 25;
+#ifdef ETXTBSY
+    else if (error == ETXTBSY) guest_error = 26;
+#endif
+    else if (error == EFBIG) guest_error = 27;
+    else if (error == ENOSPC) guest_error = 28;
+    else if (error == EROFS) guest_error = 30;
+    else if (error == EMLINK) guest_error = 31;
+    else if (error == EPIPE) guest_error = 32;
+    else if (error == EAGAIN) guest_error = 35;
+#ifdef EWOULDBLOCK
+    else if (error == EWOULDBLOCK) guest_error = 35;
+#endif
+#ifdef ELOOP
+    else if (error == ELOOP) guest_error = 62;
+#endif
+#ifdef ENAMETOOLONG
+    else if (error == ENAMETOOLONG) guest_error = 63;
+#endif
+#ifdef EDQUOT
+    else if (error == EDQUOT) guest_error = 69;
+#endif
+#ifdef EOVERFLOW
+    else if (error == EOVERFLOW) guest_error = 84;
+#endif
+    return 0x80020000ull | (uint64_t)guest_error;
+}
+
 HLE(f_open)  { std::string h = translate(CS(a0)); int host_flags = host_open_flags(a1);
 #ifdef _WIN32
                int fd;
@@ -695,7 +748,11 @@ HLE(f_open)  { std::string h = translate(CS(a0)); int host_flags = host_open_fla
                if (filelog()) fprintf(stderr,
                    "[file] open-result host='%s' guest-flags=0x%llx host-flags=0x%x -> fd=%d error=%d\n",
                    h.c_str(), (unsigned long long)a1, host_flags, fd, err);
-               if (fd >= 0) preadlog("open", (uint64_t)fd, 0, 0); return (uint64_t)(int64_t)fd; }
+               if (fd >= 0) preadlog("open", (uint64_t)fd, 0, 0);
+               else errno = err;
+               return (uint64_t)(int64_t)fd; }
+HLE(k_open)  { uint64_t result = f_open(a0, a1, a2, a3, a4, a5);
+               return (int64_t)result < 0 ? open_sce_error(errno) : result; }
 #ifdef __APPLE__
 int getdents_close_fd(int fd);   // #843/#847: atomic cache invalidation + host close
 #endif
@@ -1939,7 +1996,7 @@ void register_file_hle() {
     R("fgetc", f_fgetc);   R("getc", f_fgetc);
     R("open", f_open);     R("close", f_close);   R("read", f_read);     R("write", f_write);
     R("lseek", f_lseek);   R("stat", f_stat);     R("fstat", f_fstat);   R("access", f_access);
-    R("sceKernelOpen", f_open);   R("sceKernelClose", f_close);  R("sceKernelRead", f_read);
+    R("sceKernelOpen", k_open);   R("sceKernelClose", f_close);  R("sceKernelRead", f_read);
     R("sceKernelWrite", f_write); R("sceKernelLseek", f_lseek);  R("sceKernelStat", f_stat);
     R("sceKernelFtruncate", f_ftruncate);   // real resize (was fake-success -> corrupt saves)
     R("lstat", f_lstat);   R("sceKernelLstat", f_lstat);     // was MISSING -> uninitialized stat buffer
