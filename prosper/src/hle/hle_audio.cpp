@@ -500,9 +500,11 @@ A2_PROBE(audio2_mastering_get_state, "sceAudioOut2MasteringGetState")
 // the no-decode behavior is intentional, not a guess.
 namespace {
     std::atomic<uint32_t> g_ajm_next{1};   // one non-zero counter for context/instance/batch handles
-    constexpr uint64_t AJM_ERR_INVALID_CONTEXT   = 0x80930002ull;
-    constexpr uint64_t AJM_ERR_INVALID_INSTANCE  = 0x80930003ull;
-    constexpr uint64_t AJM_ERR_INVALID_PARAMETER = 0x80930005ull;
+    // AJM returns signed 32-bit SCE errors. Preserve that ABI in the full HLE return register,
+    // matching the AudioOut error constants above rather than leaving the upper half zeroed.
+    constexpr uint64_t AJM_ERR_INVALID_CONTEXT   = (uint64_t)(int64_t)(int32_t)0x80930002u;
+    constexpr uint64_t AJM_ERR_INVALID_INSTANCE  = (uint64_t)(int64_t)(int32_t)0x80930003u;
+    constexpr uint64_t AJM_ERR_INVALID_PARAMETER = (uint64_t)(int64_t)(int32_t)0x80930005u;
 }
 // sceAjmInitialize(s64 reserved, u32* out_context): create a context. Filling out_context is the point.
 HLE(ajm_initialize) {
