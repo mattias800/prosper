@@ -477,15 +477,17 @@ HLE(f_open)  { std::string h = translate(CS(a0)); int host_flags = host_open_fla
                    h.c_str(), (unsigned long long)a1, host_flags, fd, err);
                if (fd >= 0) preadlog("open", (uint64_t)fd, 0, 0); return (uint64_t)(int64_t)fd; }
 #ifdef __APPLE__
-void getdents_forget_fd(int fd);   // #843: cache invalidator, defined with f_getdents below
+int getdents_close_fd(int fd);   // #843/#847: atomic cache invalidation + host close
 #endif
 HLE(f_close) { if (a0 < 3) { preadlog("close-lo-ignored", a0, 0, 0); return 0; }
                preadlog("close", a0, 0, 0);
                int fd = (int)a0;
 #ifdef __APPLE__
-               getdents_forget_fd(fd);   // #843: drop any cached DIR* before this fd is closed/reused
+               int r = getdents_close_fd(fd);
+#else
+               int r = ::close(fd);
 #endif
-               int r = ::close(fd); int err = r < 0 ? errno : 0;
+               int err = r < 0 ? errno : 0;
                filelog_fd_io("close", fd, 0, 0, r, err);
                if (r == 0) filelog_forget_fd(fd);
                return (uint64_t)(int64_t)r; }
@@ -802,10 +804,13 @@ HLE(f_rmdir) { std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::rm
 // while getdents is using it, and two reads of one stream must not race its cursor (#847).
 static std::mutex g_getdents_mx;
 static std::map<int, DIR*> g_getdents_dirs;
-void getdents_forget_fd(int fd) {
+int getdents_close_fd(int fd) {
     std::lock_guard<std::mutex> lk(g_getdents_mx);
     auto it = g_getdents_dirs.find(fd);
     if (it != g_getdents_dirs.end()) { if (it->second) closedir(it->second); g_getdents_dirs.erase(it); }
+    // Keep the guest-fd close under the same guard. Otherwise getdents can repopulate this key
+    // after erase but before close, leaving the replacement DIR* stale when the fd is reused.
+    return ::close(fd);
 }
 #endif
 HLE(f_getdents) {
