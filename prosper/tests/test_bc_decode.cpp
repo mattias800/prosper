@@ -13,6 +13,23 @@ static int fails = 0;
 
 static void put16(uint8_t* p, uint16_t v) { p[0] = (uint8_t)(v & 0xFF); p[1] = (uint8_t)(v >> 8); }
 
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static bool parse_hex(const char* text, uint8_t* out, size_t out_size) {
+    if (std::strlen(text) != out_size * 2) return false;
+    for (size_t i = 0; i < out_size; i++) {
+        const int hi = hex_nibble(text[i * 2]), lo = hex_nibble(text[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return true;
+}
+
 // RGB565 constants
 static const uint16_t RED565 = 0xF800, BLUE565 = 0x001F, GREEN565 = 0x07E0, BLACK565 = 0x0000;
 
@@ -22,6 +39,41 @@ int main() {
     CHECK(bc_block_bytes(DataFormat::Bc1) == 8, "BC1 block = 8 bytes");
     CHECK(bc_block_bytes(DataFormat::Bc3) == 16, "BC3 block = 16 bytes");
     CHECK(bc_block_bytes(DataFormat::Float32) == 0, "non-BC format -> 0 block bytes");
+
+    // Complete 4x4 known-block outputs for the S3TC/RGTC families. These exercise every decoded
+    // texel, byte order, direct-alpha nibble, and both independent BC5 channel streams.
+    struct KnownBlock {
+        DataFormat format;
+        const char* name;
+        const char* block;
+        const char* rgba;
+    };
+    static const KnownBlock kKnownBlocks[] = {
+        {DataFormat::Bc1, "BC1",
+         "00f81f0000000000",
+         "ff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ff"},
+        {DataFormat::Bc2, "BC2",
+         "1032547698badcfe00f81f0000000000",
+         "ff000000ff000011ff000022ff000033ff000044ff000055ff000066ff000077ff000088ff000099ff0000aaff0000bbff0000ccff0000ddff0000eeff0000ff"},
+        {DataFormat::Bc3, "BC3",
+         "ff0088c6fa88c6fa00f81f0000000000",
+         "ff0000ffff000000ff0000daff0000b6ff000091ff00006dff000048ff000024ff0000ffff000000ff0000daff0000b6ff000091ff00006dff000048ff000024"},
+        {DataFormat::Bc4, "BC4",
+         "ff0088c6fa88c6fa",
+         "ff0000ff000000ffda0000ffb60000ff910000ff6d0000ff480000ff240000ffff0000ff000000ffda0000ffb60000ff910000ff6d0000ff480000ff240000ff"},
+        {DataFormat::Bc5, "BC5",
+         "ff0088c6fa88c6fa00ff773905773905",
+         "ffff00ff000000ffdacc00ffb69900ff916600ff6d3300ff48ff00ff240000ffffff00ff000000ffdacc00ffb69900ff916600ff6d3300ff48ff00ff240000ff"},
+    };
+    for (const KnownBlock& v : kKnownBlocks) {
+        const size_t block_size = bc_block_bytes(v.format);
+        uint8_t block[16] = {}, expected[64] = {}, out[64] = {};
+        const bool parsed = parse_hex(v.block, block, block_size) && parse_hex(v.rgba, expected, sizeof expected);
+        const bool decoded = parsed && bc_decode_surface(out, block, block_size, 4, 4, v.format);
+        char label[64];
+        std::snprintf(label, sizeof label, "%s known block is bit-exact", v.name);
+        CHECK(decoded && std::memcmp(out, expected, sizeof out) == 0, label);
+    }
 
     // --- BC1: solid red 4x4 (c0>c1, all indices 0) ---
     {
@@ -213,6 +265,60 @@ int main() {
         const uint8_t* p5 = out + ((size_t)1 * 4 + 1) * 4;   // interior texel, same expectation
         CHECK(out[0] == 255 && out[1] == 0 && out[2] == 0 && out[3] == 255, "BC6H mode-11 endpoint0 -> (255,0,0,255)");
         CHECK(p5[0] == 255 && p5[1] == 0 && p5[2] == 0, "BC6H mode-11 constant across the block");
+    }
+
+    // One complete, non-trivial output vector for every valid BC6H and BC7 mode. Expected RGBA bytes
+    // were derived from the Khronos equations and are stored directly in this dependency-free test.
+    struct ModeVector { const char* block; const char* rgba; };
+    static const ModeVector kBc6Modes[] = {
+        {"14b4e30a3b7cc0c9f00f126eca237600", "33721dff34731cff377519ff36741aff2e761cff35741bff34731cff3a7816ff2d711eff2d741dff2f791aff387618ff2e761cff2c6e1fff2c6e1fff2c6e1fff"},
+        {"f9e5d64cd79bbf08fb2710c0bd27716f", "181005ff150f08ff181005ff0e9501ff0a093bff0c0b29ff08085cffc20603ff0f0d11ff110e0cff110e0cff531102ff0f0d11ff08085cff0c0b29ff165a02ff"},
+        {"a251afa5675eb8f29ad15ca9cf07b9c8", "0844ebff0845eeff0844eaff0844edff0845eeff0945f1ff0843f1ff084adbff0844ebff0942f4ff0844edff0849dfff0848e2ff0942f4ff0843f1ff0846eaff"},
+        {"065ccca5372efb01cd9bcc93aac173fb", "1378e9ff1377eaff1474edff1377eaff1377eaff1379e8ff1376ebff148ddeff127be7ff1377eaff1474edff1480dcff1378e9ff1378e9ff1494dfff147cdbff"},
+        {"0a6feb5246104585c02c9bccb46e706a", "5a0129ff5b0129ff5b0129ff59012aff570124ff58012bff56012cff5a0129ff5a0127ff57012bff5b0129ff5c0128ff560123ff580126ff5a0129ff59012aff"},
+        {"2e58693dcdc4a586f9a4c5b932fd505e", "1a3b07ff174f08ff184608ff165e0aff165609ff193f07ff165e0aff174f08ff253a04ff283f04ff192105ff1f3104ff1b2605ff253a04ff1d2b05ff192105ff"},
+        {"d24735e43a7cb4d9706bb31093105443", "023c77ff02434dff01ba40ff01cb35ff023e69ff0770eaff03838fff02473eff023c77ff02a857ff01cb35ff02405bff0579bdff0770eaff023c77ff02405bff"},
+        {"d629b5b51abaa9e32b6ca4053d31c94e", "064711ff065513ff076315ff022431ff063c10ff078319ff030611ff030f1dff063c10ff076315ff031b29ff031b29ff079f1bff030815ff022431ff022431ff"},
+        {"ba8eb5c1a26d2e3d3659e9b7ddb2c437", "743218ff3f1b11ff391710ff4b1e13ff4b1e13ff4b1e13ff672b16ff4a1c03ff823919ff4a1c03ff5e1d02ff5e1d02ff361b04ff311b04ff361b04ff671d02ff"},
+        {"bec04793d9cd132fa933870e352fa50a", "010301ff000200ffff371eff6c0d04ff080fffffff371effff7056ffff1b0cff7356ffffff371effff1b0cff080601ff3031ffffffff0eff080601ff000200ff"},
+        {"032c1e3302ee2032a078561c5fe9f3bf", "0dff03ff341100ff272b00ff213e00ff1e6201ff1aa101ff3f0700ff0fff02ff650200ff1aa101ff2d1c00ff590300ff14ff01ff650200ff650200ff3a0c00ff"},
+        {"077be5bd7ccdb119fe39e25ec9768ba7", "a97806ff6b3f08ff966a07ffd3ab05ffddb905ff704408ff704408ffbf8f06ff966a07ff7b5407ffb37f06ffa97806ff805b07ff9f7106ffa97806ff896207ff"},
+        {"ab5dfdc956b78a0ddf338f5fb8264501", "5602b5ff5203bfff5902aeff5902aeff5003c3ff5502b7ff5003c3ff5702b1ff5502b7ff5302bcff5602b3ff5902acff5702b1ff5802b0ff5a02aaff5b02a9ff"},
+        {"0fb6bef14b8b1de0d69d6d0034c353d8", "397f01ff397e01ff397e01ff397e01ff397e01ff397e01ff397f01ff397f01ff397f01ff397f01ff397f01ff397e01ff397f01ff397f01ff397e01ff397e01ff"},
+    };
+    static const ModeVector kBc7Modes[] = {
+        {"214880b50892e1613d4cec85fecac5a7", "1851d5ff4a4a08ff096ad9ff2100b5ff324d6dff424b2aff0094e7ff133ecaff3a4c4bffb85845ffbb7636ff1c15bcffb1235effad086bffb85845ffbf912aff"},
+        {"8ae51b52a7e59533c9299ed40697d48e", "a680b4ff807e68ff9b93c5ff618f3eff599334ffb76299ff877a72ff959dcdffbd5891ff78825effa08abcff78825eff618f3effb26ba2ff718654ffac75aaff"},
+        {"dc367f8a9c8a7203be67ee70ae43d41d", "e18ae4ffe465d9ffe465d9ffe742ceffdeadefff7bcee7ff6eaec1ffdeadefff5f8b99ff31a6cbff2100c6ff526b73ff6eaec1ff39f7ceff2951c9ff7bcee7ff"},
+        {"f8215576b71ab586d9ea8669e42ebc15", "7da996ff91d56dffe7af3fffdc60a6ffe18773ff5450eaff687cc1ffecd60cffecd60cff5450eaff5450eaffe18773ffe7af3fffe7af3fff7da996ff91d56dff"},
+        {"90f65ec7c601a9a55de310851b9b82b6", "b5bd631cb7a84e28ba923828b7a84e41b5bd6335bd73181cbc7d2328b5bd6341b89e4335b89e4341b7a84e35b6b35835b5bd6328bb882d1cbb882d41bb882d28"},
+        {"e0a7c7f888c7b5fcec00857c4d548a13", "3eb52dc73eb53fc71e8f2d703eb533c74ec72df14ec733f14ec733f12ea1339a2ea1399a4ec739f14ec72df13eb539c72ea13f9a1e8f2d701e8f33702ea12d9a"},
+        {"402a6c5be6d4a5eb50f89eba2327ec61", "a9b739a591bd73b582c197bf60caead665c9dfd37ec2a2c278c4b0c673c5bbc99abb5daf9fba52ac87c08cbc9fba52ac6fc6c6cc65c9dfd3a4b844a88bbf81b9"},
+        {"80347cb328fcb019510e86d9e88bfc2c", "8655341c75918da328c392617dc71c6575918da375918da38655341c837a2c344dab8f817dc71c657dc71c6575918da380a2244d837a2c3475918da39a798ac3"},
+    };
+    auto check_modes = [&](DataFormat format, const char* family, const ModeVector* vectors, size_t count) {
+        for (size_t mode = 0; mode < count; mode++) {
+            uint8_t block[16] = {}, expected[64] = {}, out[64] = {};
+            const bool parsed = parse_hex(vectors[mode].block, block, sizeof block) &&
+                                parse_hex(vectors[mode].rgba, expected, sizeof expected);
+            const bool decoded = parsed && bc_decode_surface(out, block, sizeof block, 4, 4, format);
+            char label[64];
+            std::snprintf(label, sizeof label, "%s mode %zu known block is bit-exact", family, mode);
+            CHECK(decoded && std::memcmp(out, expected, sizeof out) == 0, label);
+        }
+    };
+    check_modes(DataFormat::Bc6, "BC6H", kBc6Modes, sizeof kBc6Modes / sizeof kBc6Modes[0]);
+    check_modes(DataFormat::Bc7, "BC7", kBc7Modes, sizeof kBc7Modes / sizeof kBc7Modes[0]);
+
+    // The upload adapter accepts byte storage, which does not promise uint64_t alignment. Keep a
+    // known BC6H block one byte off an explicitly aligned base to catch typed-load regressions.
+    {
+        alignas(uint64_t) uint8_t storage[17] = {}, expected[64] = {}, out[64] = {};
+        const bool parsed = parse_hex(kBc6Modes[0].block, storage + 1, 16) &&
+                            parse_hex(kBc6Modes[0].rgba, expected, sizeof expected);
+        const bool decoded = parsed && bc_decode_surface(out, storage + 1, 16, 4, 4, DataFormat::Bc6);
+        CHECK(decoded && std::memcmp(out, expected, sizeof out) == 0,
+              "BC6H known block decodes from intentionally misaligned byte storage");
     }
 
     // --- larger surface: 8x8 BC1, second block a distinct solid color; verify block placement ---

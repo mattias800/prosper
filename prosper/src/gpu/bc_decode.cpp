@@ -1,5 +1,6 @@
 // bc_decode.cpp — see bc_decode.hpp. Reference S3TC/DXTn decode (Khronos data-format spec §18-19).
 #include "bc_decode.hpp"
+#include <bit>
 #include <cstring>
 
 namespace prosper::gpu {
@@ -84,14 +85,13 @@ void decode_bc4_channel(const uint8_t* blk, uint8_t vals[16]) {
 // Constant tables (mode field widths, partition/anchor assignments, interpolation weights) are the
 // published spec constants, taken verbatim from bcdec (MIT/Unlicense, Sergii Kudlai) — the partition
 // table entries carry the anchor ("fix-up") flag in bit 7 (128+subset), exactly as bcdec encodes them.
-// Decode logic written against the spec and fuzz-validated byte-exact vs texture2ddecoder (see
-// tests/test_bc_decode.cpp for the hand vectors; the random-block cross-check ran pre-merge).
+// Decode logic written against the spec; checked-in known blocks cover every mode.
 
 // Per-mode endpoint component precision: [0] = RGB bits, [1] = alpha bits (0 = opaque mode).
 static const uint8_t kBc7ColorBits[8] = { 4, 6, 5, 7, 5, 7, 7, 5 };
 static const uint8_t kBc7AlphaBits[8] = { 0, 0, 0, 0, 6, 8, 7, 5 };
-// Modes with a per-endpoint p-bit (0,3,6,7) — mode 1 has per-SUBSET shared p-bits, handled separately.
-static const uint8_t kBc7ModeHasPBits = 0xCB;   // 0b11001011
+// Modes with a per-endpoint p-bit (0,3,6,7). Mode 1's per-subset shared p-bits are handled separately.
+static const uint8_t kBc7ModeHasEndpointPBits = 0xC9;   // 0b11001001
 
 // Partition/anchor table (spec constants; anchor texels flagged with +128, subset id in low bits).
 static const uint8_t kBc7PartitionSets[2][64][4][4] = {
@@ -285,7 +285,7 @@ void decode_bc7_block(const uint8_t* blk, uint8_t out[16][4]) {
         for (int e = 0; e < num_endpoints; e++) ep[e][3] = bs.get(kBc7AlphaBits[mode]);
 
     // P-bits: appended as the endpoint's LSB (all components share the bit).
-    const bool per_ep_pbit = (kBc7ModeHasPBits >> mode) & 1;
+    const bool per_ep_pbit = (kBc7ModeHasEndpointPBits >> mode) & 1;
     if (mode == 1) {                            // shared per-subset p-bits
         uint32_t p0 = bs.get1(), p1 = bs.get1();
         for (int e = 0; e < 4; e++)
@@ -399,7 +399,11 @@ static int bc6h__bitstream_read_bits_r(bc6h__bitstream_t* bstream, int numBits) 
 
 
 static int bc6h__extend_sign(int val, int bits) {
-    return (val << (32 - bits)) >> (32 - bits);
+    // `val` is an unsigned `bits`-wide field. The usual signed-shift idiom has undefined behavior
+    // when the left shift overflows `int`; subtracting the modulus expresses the same two's-complement
+    // sign extension without depending on compiler behavior.
+    const int sign = 1 << (bits - 1);
+    return (val & sign) ? val - (1 << bits) : val;
 }
 
 static int bc6h__transform_inverse(int val, int a0, int bits, int isSigned) {
@@ -473,30 +477,22 @@ static unsigned short bc6h__finish_unquantize(int val, int isSigned) {
 
 /* modified half_to_float_fast4 from https://gist.github.com/rygorous/2144712 */
 static float bc6h__half_to_float_quick(unsigned short half) {
-    typedef union {
-        unsigned int u;
-        float f;
-    } FP32;
-
-    static const FP32 magic = { 113 << 23 };
-    static const unsigned int shifted_exp = 0x7c00 << 13;   /* exponent mask after shift */
-    FP32 o;
-    unsigned int exp;
-
-    o.u = (half & 0x7fff) << 13;                            /* exponent/mantissa bits */
-    exp = shifted_exp & o.u;                                /* just the exponent */
-    o.u += (127 - 15) << 23;                                /* exponent adjust */
+    constexpr uint32_t shifted_exp = 0x7c00u << 13;         /* exponent mask after shift */
+    constexpr float magic = std::bit_cast<float>(113u << 23);
+    uint32_t bits = (static_cast<uint32_t>(half) & 0x7fffu) << 13; /* exponent/mantissa bits */
+    const uint32_t exp = shifted_exp & bits;                 /* just the exponent */
+    bits += (127u - 15u) << 23;                              /* exponent adjust */
 
     /* handle exponent special cases */
     if (exp == shifted_exp) {                               /* Inf/NaN? */
-        o.u += (128 - 16) << 23;                            /* extra exp adjust */
+        bits += (128u - 16u) << 23;                         /* extra exp adjust */
     } else if (exp == 0) {                                  /* Zero/Denormal? */
-        o.u += 1 << 23;                                     /* extra exp adjust */
-        o.f -= magic.f;                                     /* renormalize */
+        bits += 1u << 23;                                   /* extra exp adjust */
+        bits = std::bit_cast<uint32_t>(std::bit_cast<float>(bits) - magic); /* renormalize */
     }
 
-    o.u |= (half & 0x8000) << 16;                           /* sign bit */
-    return o.f;
+    bits |= (static_cast<uint32_t>(half) & 0x8000u) << 16;  /* sign bit */
+    return std::bit_cast<float>(bits);
 }
 
 static void bc6h__decode_block_half(const void* compressedBlock, void* decompressedBlock, int destinationPitch, int isSigned) {
@@ -556,8 +552,9 @@ static void bc6h__decode_block_half(const void* compressedBlock, void* decompres
 
     decompressed = (unsigned short*)decompressedBlock;
 
-    bstream.low = ((unsigned long long*)compressedBlock)[0];
-    bstream.high = ((unsigned long long*)compressedBlock)[1];
+    const auto* compressed_bytes = static_cast<const uint8_t*>(compressedBlock);
+    std::memcpy(&bstream.low, compressed_bytes, sizeof bstream.low);
+    std::memcpy(&bstream.high, compressed_bytes + sizeof bstream.low, sizeof bstream.high);
 
     r[0] = r[1] = r[2] = r[3] = 0;
     g[0] = g[1] = g[2] = g[3] = 0;
