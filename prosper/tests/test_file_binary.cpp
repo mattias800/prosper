@@ -182,17 +182,36 @@ int main() {
               ((*(const uint16_t*)(dir_stat.data() + 8)) & 0xf000u) == 0x4000u,
           "sceKernelFstat identifies an open directory descriptor");
 
+#ifdef _WIN32
     int64_t rewind_dir = dir_fd >= 0 && lseek_fn
         ? (int64_t)lseek_fn((uint64_t)dir_fd, 0, SEEK_SET, 0, 0, 0)
         : -1;
+    int64_t rewound_bytes = dir_fd >= 0 && kernel_getdents_fn
+        ? (int64_t)kernel_getdents_fn((uint64_t)dir_fd,
+                                      (uint64_t)(uintptr_t)dents.data(), dents.size(), 0, 0, 0)
+        : -1;
+    CHECK(rewind_dir == 0 && rewound_bytes > 0,
+          "Windows directory descriptors can be rewound and enumerated again");
+#endif
+
+    // Darwin's getdents compatibility path owns a duplicated descriptor behind DIR*. A raw
+    // lseek on the original descriptor cannot portably rewind that cached stream, so exercise
+    // getdirentries from a fresh open while retaining the Windows synthetic-cursor rewind check.
+    int64_t direntries_fd = open_fn
+        ? (int64_t)open_fn((uint64_t)(uintptr_t)dents_string.c_str(),
+                           kGuestDirectory, 0, 0, 0, 0)
+        : -1;
+    CHECK(direntries_fd >= 3, "open a fresh directory cursor for getdirentries");
     int64_t directory_cursor_base = -1;
-    int64_t entry_bytes = dir_fd >= 0 && kernel_getdirentries_fn
+    int64_t entry_bytes = direntries_fd >= 0 && kernel_getdirentries_fn
         ? (int64_t)kernel_getdirentries_fn(
-              (uint64_t)dir_fd, (uint64_t)(uintptr_t)dents.data(), dents.size(),
+              (uint64_t)direntries_fd, (uint64_t)(uintptr_t)dents.data(), dents.size(),
               (uint64_t)(uintptr_t)&directory_cursor_base, 0, 0)
         : -1;
-    CHECK(rewind_dir == 0 && entry_bytes > 0 && directory_cursor_base == 0,
-          "getdirentries reports and advances the rewound directory cursor");
+    CHECK(entry_bytes > 0 && directory_cursor_base == 0,
+          "getdirentries reports and advances a fresh directory cursor");
+    if (direntries_fd >= 0 && close_fn)
+        close_fn((uint64_t)direntries_fd, 0, 0, 0, 0, 0);
     if (dir_fd >= 0 && close_fn) close_fn((uint64_t)dir_fd, 0, 0, 0, 0, 0);
     uint64_t closed_dents = kernel_getdents_fn
         ? kernel_getdents_fn((uint64_t)dir_fd, (uint64_t)(uintptr_t)dents.data(),
