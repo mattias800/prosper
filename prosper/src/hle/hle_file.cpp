@@ -15,6 +15,7 @@
 #include <mutex>
 #include <atomic>        // sceKernelAio* submit-id/state table
 #include <map>
+#include <utility>
 #include <vector>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -131,6 +132,127 @@ namespace {
         for (size_t i = 0; i < low_count; ++i) ::_close(low_fds[i]);
         if (fd < 0) errno = duplicate_errno;
         return fd;
+    }
+
+    // The Windows CRT refuses to open directories as file descriptors. PS5 guests nevertheless
+    // use the normal open/getdents/close sequence, so represent directory opens with emulator-owned
+    // descriptors and a per-open cursor. Enumerating eagerly gives each descriptor an immutable
+    // snapshot and keeps getdents deterministic and thread-safe without retaining Win32 search
+    // handles. The descriptor range is far above UCRT's file table and remains positive to guests.
+    struct WindowsDirEntry {
+        std::string name;
+        uint32_t ino = 0;
+        uint8_t type = 0;
+    };
+    struct WindowsDirState {
+        std::string path;
+        std::vector<WindowsDirEntry> entries;
+        size_t cursor = 0;
+    };
+    std::mutex g_windows_dir_mx;
+    std::map<int, WindowsDirState> g_windows_dirs;
+    std::atomic<int> g_windows_next_dir_fd{0x40000000};
+
+    bool windows_host_path_is_directory(const std::string& path) {
+        const DWORD attrs = GetFileAttributesA(path.c_str());
+        return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    }
+
+    uint32_t windows_dir_ino(const std::string& name) {
+        uint32_t hash = 2166136261u;
+        for (unsigned char c : name) hash = (hash ^ c) * 16777619u;
+        return hash ? hash : 1;
+    }
+
+    int windows_open_directory(const std::string& path) {
+        WindowsDirState state;
+        state.path = path;
+        std::string pattern = path;
+        if (!pattern.empty() && pattern.back() != '/' && pattern.back() != '\\') pattern += '\\';
+        pattern += '*';
+
+        WIN32_FIND_DATAA data{};
+        HANDLE search = FindFirstFileA(pattern.c_str(), &data);
+        if (search != INVALID_HANDLE_VALUE) {
+            do {
+                WindowsDirEntry entry;
+                entry.name = data.cFileName;
+                entry.ino = windows_dir_ino(entry.name);
+                entry.type = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 4 : 8;
+                state.entries.push_back(std::move(entry));
+            } while (FindNextFileA(search, &data));
+            FindClose(search);
+        } else if (GetLastError() != ERROR_FILE_NOT_FOUND) {
+            errno = EACCES;
+            return -1;
+        }
+
+        std::lock_guard<std::mutex> lk(g_windows_dir_mx);
+        int fd = g_windows_next_dir_fd.fetch_add(1);
+        while (fd < 3 || g_windows_dirs.count(fd)) fd = g_windows_next_dir_fd.fetch_add(1);
+        g_windows_dirs.emplace(fd, std::move(state));
+        return fd;
+    }
+
+    bool windows_close_directory(int fd, int* result) {
+        std::lock_guard<std::mutex> lk(g_windows_dir_mx);
+        auto it = g_windows_dirs.find(fd);
+        if (it == g_windows_dirs.end()) return false;
+        g_windows_dirs.erase(it);
+        if (result) *result = 0;
+        return true;
+    }
+
+    bool windows_directory_path(int fd, std::string* path) {
+        std::lock_guard<std::mutex> lk(g_windows_dir_mx);
+        auto it = g_windows_dirs.find(fd);
+        if (it == g_windows_dirs.end()) return false;
+        if (path) *path = it->second.path;
+        return true;
+    }
+
+    bool windows_seek_directory(int fd, int64_t offset, int whence, int64_t* result) {
+        std::lock_guard<std::mutex> lk(g_windows_dir_mx);
+        auto it = g_windows_dirs.find(fd);
+        if (it == g_windows_dirs.end()) return false;
+        int64_t base = whence == SEEK_SET ? 0
+                     : whence == SEEK_CUR ? (int64_t)it->second.cursor
+                     : whence == SEEK_END ? (int64_t)it->second.entries.size() : -1;
+        if (base < 0 || offset < -base || offset > (int64_t)it->second.entries.size() - base) {
+            errno = EINVAL;
+            if (result) *result = -1;
+            return true;
+        }
+        it->second.cursor = (size_t)(base + offset);
+        if (result) *result = (int64_t)it->second.cursor;
+        return true;
+    }
+
+    uint64_t windows_getdents(int fd, uint64_t guest_buffer, uint64_t capacity) {
+        if (!guest_buffer || capacity < 32) return 0x80020016ull;
+        if (!windows_prepare_guest_write(guest_buffer, capacity)) return 0x8002000eull;
+        std::lock_guard<std::mutex> lk(g_windows_dir_mx);
+        auto it = g_windows_dirs.find(fd);
+        if (it == g_windows_dirs.end()) return 0x80020009ull;
+
+        uint8_t* out = (uint8_t*)(uintptr_t)guest_buffer;
+        size_t written = 0;
+        while (it->second.cursor < it->second.entries.size()) {
+            const WindowsDirEntry& entry = it->second.entries[it->second.cursor];
+            const size_t name_len = entry.name.size();
+            const size_t record_size = (8 + name_len + 1 + 3) & ~(size_t)3;
+            if (written + record_size > capacity) break;
+            uint8_t* record = out + written;
+            memset(record, 0, record_size);
+            *(uint32_t*)(record + 0) = entry.ino;
+            *(uint16_t*)(record + 4) = (uint16_t)record_size;
+            record[6] = entry.type;
+            record[7] = (uint8_t)name_len;
+            memcpy(record + 8, entry.name.c_str(), name_len + 1);
+            written += record_size;
+            it->second.cursor++;
+        }
+        return written;
     }
 #endif
 
@@ -507,7 +629,17 @@ static int host_open_flags(uint64_t f) {
     return h;
 }
 HLE(f_open)  { std::string h = translate(CS(a0)); int host_flags = host_open_flags(a1);
+#ifdef _WIN32
+               int fd;
+               if (windows_host_path_is_directory(h)) {
+                   if ((a1 & 3) != 0) { errno = EISDIR; fd = -1; }
+                   else fd = windows_open_directory(h);
+               } else {
+                   fd = (int)::open(h.c_str(), host_flags, (mode_t)a2);
+               }
+#else
                int fd = (int)::open(h.c_str(), host_flags, (mode_t)a2);
+#endif
 #ifdef _WIN32
                if (fd >= 0 && fd < 3) {
                    int low_fd = fd;
@@ -533,6 +665,9 @@ HLE(f_close) { if (a0 < 3) { preadlog("close-lo-ignored", a0, 0, 0); return 0; }
                int fd = (int)a0;
 #ifdef __APPLE__
                int r = getdents_close_fd(fd);
+#elif defined(_WIN32)
+               int r = -1;
+               if (!windows_close_directory(fd, &r)) r = ::close(fd);
 #else
                int r = ::close(fd);
 #endif
@@ -648,6 +783,11 @@ HLE(f_write) {
 #endif
              }
 HLE(f_lseek) { if (fdlog_on() && ((int)a2 != SEEK_CUR || a1 != 0)) preadlog("lseek", a0, a1, (uint64_t)a2);
+#ifdef _WIN32
+               int64_t directory_result = -1;
+               if (windows_seek_directory((int)a0, (int64_t)a1, (int)a2, &directory_result))
+                   return (uint64_t)directory_result;
+#endif
                return (uint64_t)(int64_t)::lseek((int)a0, (off_t)a1, (int)a2); }
 #ifndef _WIN32
 HLE(f_pread)  { preadlog("pread", a0, a3, a2); int64_t r = read_full((int)a0, P(a1), (size_t)a2, true, (off_t)a3);
@@ -825,7 +965,11 @@ HLE(f_lstat) { std::string h = translate(CS(a0)); struct stat st; int r = ::lsta
 HLE(f_fsync) { return (uint64_t)(int64_t)::fsync((int)a0); }
 #else
 HLE(f_stat)  { std::string h = translate(CS(a0)); struct _stat64 st; int r = ::_stat64(h.c_str(), &st); if (r == 0 && a1) to_sce_stat64(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
-HLE(f_fstat) { struct _stat64 st; int r = ::_fstat64((int)a0, &st); int err = r < 0 ? errno : 0;
+HLE(f_fstat) { struct _stat64 st; std::string directory_path;
+               int r = windows_directory_path((int)a0, &directory_path)
+                     ? ::_stat64(directory_path.c_str(), &st)
+                     : ::_fstat64((int)a0, &st);
+               int err = r < 0 ? errno : 0;
                if (r == 0 && a1) to_sce_stat64(st, (uint8_t*)P(a1));
                filelog_fd_stat((int)a0, r, err, r == 0 ? (int64_t)st.st_size : -1); return (uint64_t)(int64_t)r; }
 HLE(f_lstat) { return f_stat(a0,a1,a2,a3,a4,a5); }
@@ -962,6 +1106,12 @@ HLE(k_getdirentries) {
 #else
 HLE(k_getdents) {
     if (!a1 || a2 < 32) return directory_sce_error(EINVAL);
+    if (windows_directory_path((int)a0, nullptr))
+        return windows_getdents((int)a0, a1, a2);
+
+    // Preserve support for directory HANDLEs attached to CRT descriptors by callers outside the
+    // normal guest open path. Guest opens use the emulator-owned descriptor table above because
+    // UCRT itself refuses to create such descriptors.
     ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
     intptr_t handle = ::_get_osfhandle((int)a0);
     if (handle == -1) return directory_sce_error(EBADF);
@@ -973,9 +1123,22 @@ HLE(k_getdents) {
     return 0;
 }
 HLE(k_getdirentries) {
-    uint64_t r = k_getdents(a0, a1, a2, a3, a4, a5);
-    if (!directory_result_is_error(r) && a3) *(int64_t*)P(a3) = 0;
-    return r;
+    int64_t base = -1;
+    if (windows_seek_directory((int)a0, 0, SEEK_CUR, &base)) {
+        if (a3 && !windows_prepare_guest_write(a3, sizeof(int64_t)))
+            return directory_sce_error(EFAULT);
+        uint64_t result = windows_getdents((int)a0, a1, a2);
+        if (!directory_result_is_error(result) && a3)
+            *(int64_t*)(uintptr_t)a3 = base;
+        return result;
+    }
+
+    uint64_t result = k_getdents(a0, a1, a2, a3, a4, a5);
+    if (directory_result_is_error(result)) return result;
+    if (a3 && !windows_prepare_guest_write(a3, sizeof(int64_t)))
+        return directory_sce_error(EFAULT);
+    if (a3) *(int64_t*)(uintptr_t)a3 = 0;
+    return result;
 }
 #endif
 HLE(f_getdents) {
