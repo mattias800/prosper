@@ -2181,9 +2181,14 @@ ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& d) {
         auto it = ds->sh.find(off);
         return it == ds->sh.end() ? 0u : it->second;
     };
-    out.local_x = reg(P::COMPUTE_NUM_THREAD_X);
-    out.local_y = reg(P::COMPUTE_NUM_THREAD_Y);
-    out.local_z = reg(P::COMPUTE_NUM_THREAD_Z);
+    // The workgroup local size is the NUM_THREAD_FULL field [15:0]; masking prevents a nonzero
+    // NUM_THREAD_PARTIAL ([31:16]) from being folded into the dimension (#911).
+    auto num_thread = [&](uint32_t off) {
+        return (reg(off) >> P::COMPUTE_NUM_THREAD_FULL_SHIFT) & P::COMPUTE_NUM_THREAD_FULL_MASK;
+    };
+    out.local_x = num_thread(P::COMPUTE_NUM_THREAD_X);
+    out.local_y = num_thread(P::COMPUTE_NUM_THREAD_Y);
+    out.local_z = num_thread(P::COMPUTE_NUM_THREAD_Z);
     if (!out.local_x) out.local_x = 1;
     if (!out.local_y) out.local_y = 1;
     if (!out.local_z) out.local_z = 1;
