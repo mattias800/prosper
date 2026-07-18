@@ -17,6 +17,7 @@ extern "C" uint32_t prosper_vo_display_width();
 extern "C" uint32_t prosper_vo_display_height();
 extern "C" uint64_t prosper_vo_display_format();
 extern "C" uint64_t prosper_vo_buffer_addr(int i);
+extern "C" int prosper_vo_flip_rate();
 extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx,
                                            uint32_t flip_mode, int64_t flip_arg);
 
@@ -41,16 +42,33 @@ int main() {
     auto regb2  = Hle::lookup("rKBUtgRrtbk");   // RegisterBuffers2
     auto unreg  = Hle::lookup("N5KDtkIjjJ4");   // UnregisterBuffers
     auto labels = Hle::lookup("OcQybQejHEY");   // GetBufferLabelAddress
+    auto setrate = Hle::lookup(nid_hash("sceVideoOutSetFlipRate"));
     auto cfg    = Hle::lookup("w0hLuNarQxY");   // ConfigureOutput
     auto flip   = Hle::lookup(nid_hash("sceVideoOutSubmitFlip"));
     auto fstat  = Hle::lookup(nid_hash("sceVideoOutGetFlipStatus"));
     CHECK(res && vbl && cap && issup && setba && regb && setba2 && regb2 && unreg && labels &&
-              cfg && flip && fstat,
+              setrate && cfg && flip && fstat,
           "VideoOut functions registered");
     if (!(res && vbl && cap && issup && setba && regb && setba2 && regb2 && unreg && labels &&
-          cfg && flip && fstat)) {
+          setrate && cfg && flip && fstat)) {
         printf("== FAIL ==\n"); return 1;
     }
+
+    // #394 F7: the rate selector is per-port state rather than a success-returning no-op. All
+    // documented rates are accepted; invalid values leave the last valid selection unchanged.
+    CHECK(prosper_vo_flip_rate() == 0, "flip rate defaults to 60 Hz");
+    CHECK(setrate(0x1001, 1, 0, 0, 0, 0) == 0 && prosper_vo_flip_rate() == 1,
+          "SetFlipRate stores the 30 Hz selector");
+    CHECK(setrate(0x1001, 2, 0, 0, 0, 0) == 0 && prosper_vo_flip_rate() == 2,
+          "SetFlipRate stores the 20 Hz selector");
+    CHECK((uint32_t)setrate(0x1001, (uint64_t)(int64_t)-1, 0, 0, 0, 0) == 0x80290001u &&
+              prosper_vo_flip_rate() == 2,
+          "SetFlipRate rejects -1 without changing the selected rate");
+    CHECK((uint32_t)setrate(0x1001, 3, 0, 0, 0, 0) == 0x80290001u &&
+              prosper_vo_flip_rate() == 2,
+          "SetFlipRate rejects values above 2 without changing the selected rate");
+    CHECK(setrate(0x1001, 0, 0, 0, 0, 0) == 0 && prosper_vo_flip_rate() == 0,
+          "SetFlipRate restores the 60 Hz selector");
 
     // #394 F4: the query must initialize its output with stable, guest-writable storage for all
     // 16 buffer labels. A missing handler returned success without touching this pointer.

@@ -74,6 +74,7 @@ namespace {
     // believe a flip completed with the wrong arg; concurrent flips could lose an increment.
     std::mutex g_flip_mx;
     uint64_t g_flip_count = 0;      // incremented per flip so GetFlipStatus shows progress
+    int32_t  g_flip_rate = 0;       // 0=60 Hz, 1=30 Hz, 2=20 Hz (stored for future pacing)
     // The VideoOut ABI uses -1 for both fields until the first completed flip. Zero is a valid
     // buffer index/argument, so exposing zero early can fool a frame pacer into consuming a flip
     // that never happened (#394 F3).
@@ -137,6 +138,7 @@ namespace {
 // prosper_vo_flip_count: total flips so far (either flip path) — read by the PROSPER_PROGRESS
 // heartbeat in hle_agc.cpp as a cheap forward-progress signal for long diagnostic runs.
 extern "C" uint64_t prosper_vo_flip_count() { std::lock_guard<std::mutex> lk(g_flip_mx); return g_flip_count; }
+extern "C" int prosper_vo_flip_rate() { std::lock_guard<std::mutex> lk(g_flip_mx); return g_flip_rate; }
 extern "C" int prosper_vo_buffer_count() {
     std::lock_guard<std::mutex> lk(g_display_mx); return g_display.buffer_num;
 }
@@ -313,6 +315,16 @@ HLE(g_vo_get_buffer_label_address) {
         return (uint64_t)(int64_t)(int32_t)0x80290002;  // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
     *(uintptr_t*)(uintptr_t)a1 = (uintptr_t)g_buffer_labels;
     return 16;
+}
+// sceVideoOutSetFlipRate (CBiu4mCE1DA): remember the port's requested divisor. Presentation is
+// synchronous today, but callers must still observe the documented validation/state contract.
+HLE(g_vo_set_flip_rate) {
+    const int32_t rate = (int32_t)a1;
+    if (rate < 0 || rate > 2)
+        return (uint64_t)(int64_t)(int32_t)0x80290001;  // SCE_VIDEO_OUT_ERROR_INVALID_VALUE
+    std::lock_guard<std::mutex> lk(g_flip_mx);
+    g_flip_rate = rate;
+    return 0;
 }
 HLE(g_vo_submitflip)  {
     if (evlog()) fprintf(stderr, "[ev] SubmitFlip handle=0x%llx bufidx=%lld flipmode=0x%llx fl013arg=0x%llx\n",
@@ -829,7 +841,7 @@ void register_graphics_hle() {
     // libSceVideoOut display / flip
     R("sceVideoOutOpen", g_vo_open);            R("sceVideoOutClose", g_vo_close);
     R("sceVideoOutSubmitFlip", g_vo_submitflip);R("sceVideoOutIsFlipPending", g_vo_flippending);
-    R("sceVideoOutSetFlipRate", g_vo_close);    R("sceVideoOutAddFlipEvent", g_vo_addflipevent);
+    R("sceVideoOutSetFlipRate", g_vo_set_flip_rate); R("sceVideoOutAddFlipEvent", g_vo_addflipevent);
     R("sceVideoOutAddVblankEvent", g_vo_addvblankevent);
     R("sceVideoOutGetFlipStatus", g_vo_flipstatus);
     R("sceVideoOutGetResolutionStatus", g_vo_resstatus);
