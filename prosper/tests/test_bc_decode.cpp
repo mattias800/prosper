@@ -267,10 +267,8 @@ int main() {
         CHECK(p5[0] == 255 && p5[1] == 0 && p5[2] == 0, "BC6H mode-11 constant across the block");
     }
 
-    // One complete, non-trivial output vector for every valid BC6H and BC7 mode. The encoded blocks
-    // were generated locally with a fixed seed; expected RGBA bytes were derived from the Khronos
-    // equations and independently cross-checked with DirectXTex. No external implementation is linked
-    // into the test suite.
+    // One complete, non-trivial output vector for every valid BC6H and BC7 mode. Expected RGBA bytes
+    // were derived from the Khronos equations and are stored directly in this dependency-free test.
     struct ModeVector { const char* block; const char* rgba; };
     static const ModeVector kBc6Modes[] = {
         {"14b4e30a3b7cc0c9f00f126eca237600", "33721dff34731cff377519ff36741aff2e761cff35741bff34731cff3a7816ff2d711eff2d741dff2f791aff387618ff2e761cff2c6e1fff2c6e1fff2c6e1fff"},
@@ -311,6 +309,17 @@ int main() {
     };
     check_modes(DataFormat::Bc6, "BC6H", kBc6Modes, sizeof kBc6Modes / sizeof kBc6Modes[0]);
     check_modes(DataFormat::Bc7, "BC7", kBc7Modes, sizeof kBc7Modes / sizeof kBc7Modes[0]);
+
+    // The upload adapter accepts byte storage, which does not promise uint64_t alignment. Keep a
+    // known BC6H block one byte off an explicitly aligned base to catch typed-load regressions.
+    {
+        alignas(uint64_t) uint8_t storage[17] = {}, expected[64] = {}, out[64] = {};
+        const bool parsed = parse_hex(kBc6Modes[0].block, storage + 1, 16) &&
+                            parse_hex(kBc6Modes[0].rgba, expected, sizeof expected);
+        const bool decoded = parsed && bc_decode_surface(out, storage + 1, 16, 4, 4, DataFormat::Bc6);
+        CHECK(decoded && std::memcmp(out, expected, sizeof out) == 0,
+              "BC6H known block decodes from intentionally misaligned byte storage");
+    }
 
     // --- larger surface: 8x8 BC1, second block a distinct solid color; verify block placement ---
     {
