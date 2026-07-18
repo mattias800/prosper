@@ -699,7 +699,8 @@ namespace {
     //   INSERTQ (F2 0F 78 /r ib ib  and  F2 0F 79 /r): insert low `len` bits of src into dst at bit `idx`.
     //   EXTRQ   (66 0F 78 /0 ib ib  and  66 0F 79 /r): extract `len` bits at `idx`, zero-extend into low 64.
     // Control for the /78 imm forms is the two trailing imm8s; for the /79 reg forms it comes from the
-    // source xmm (EXTRQ: rm[13:0]; INSERTQ: rm[77:64]).  len==0 means 64. CONFIDENCE: HIGH (Intel SDM).
+    // source xmm (EXTRQ: rm[13:0]; INSERTQ: rm[77:64]). len==0 means 64. CONFIDENCE: HIGH
+    // (AMD64 Architecture Programmer's Manual, Volume 4, publication 26568).
     volatile unsigned long g_sse4a_emulated = 0;
     const bool g_sse4a_stat = getenv("PROSPER_SSE4A_STAT") != nullptr;
 #ifdef __APPLE__
@@ -791,6 +792,8 @@ namespace {
         else {                                          // EXTRQ: imm form in-place on rm, reg form on reg
             int dr = (op == 0x78) ? rm : reg;
             set(dr, sse4a_extrq(lo(dr), len, idx));
+            // AMD documents the upper qword as undefined. Preserve it to match the AMD CPU model
+            // and prosper's established guest-visible trap-emulation behavior.
         }
         g[REG_RIP] = (greg_t)(rip + i);
         g_sse4a_emulated++;

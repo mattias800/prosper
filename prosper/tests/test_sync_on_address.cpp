@@ -1,6 +1,7 @@
 // test_sync_on_address -- basic behavior for the raw wait/wake-by-address HLE NIDs.
 #include "../src/hle/dispatch.hpp"
 #include <atomic>
+#include <climits>
 #include <chrono>
 #include <cstdio>
 #include <thread>
@@ -59,6 +60,27 @@ int main() {
                            std::chrono::steady_clock::now() - t0).count();
         CHECK(rc == 0x80020060ull, "timed wait returns SCE ETIMEDOUT (0x80020060), not 0/blocked-forever");
         CHECK(elapsed >= 20 && elapsed < 2000, "timed wait actually waited ~the timeout (not the old 5 s cap / forever)");
+    }
+
+    // Windows rounds microseconds to milliseconds. The addition used for that rounding must happen
+    // after widening: UINT32_MAX otherwise wraps to 998 and times out in 1 ms instead of remaining
+    // blocked until this explicit wake.
+    {
+        alignas(4) uint32_t tw = 9;
+        uint32_t timeout_us = UINT32_MAX;
+        std::atomic<uint64_t> result{~uint64_t{0}};
+        std::thread waiter([&] {
+            result.store(wait((uint64_t)(uintptr_t)&tw, 9,
+                              (uint64_t)(uintptr_t)&timeout_us, 0, 0, 0),
+                         std::memory_order_release);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        std::atomic_ref<uint32_t> tw_atomic(tw);
+        tw_atomic.store(10, std::memory_order_release);
+        wake((uint64_t)(uintptr_t)&tw, 1, 0, 0, 0, 0);
+        waiter.join();
+        CHECK(result.load(std::memory_order_acquire) == 0,
+              "maximum uint32 timeout remains blocked until an explicit wake");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

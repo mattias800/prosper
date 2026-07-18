@@ -24,14 +24,18 @@
 #include "../hle/dispatch.hpp"
 
 #include <windows.h>
+#include <bcrypt.h>
 #include <pthread.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
 #include <csetjmp>
+#include <algorithm>
+#include <iterator>
 #include <map>
 #include <mutex>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -178,6 +182,56 @@ namespace {
     bool g_diag_bp_repeat = false;
     thread_local WinDiagBreakpoint* t_diag_bp_rearm = nullptr;
 
+    // Intel hosts raise #UD for every AMD SSE4a instruction. A dense animation-unpack loop in
+    // Astro contains 48 EXTRQs per iteration. More importantly, Windows builds the #UD dispatch
+    // frame below the interrupted RSP and can overwrite the guest's SysV red zone before VEH runs.
+    // Translate register-form EXTRQs into a nearby code cache before guest entry. Five-byte forms
+    // detour directly; four-byte forms consume a bounded fail-closed VEX/EXTRQ suffix and give every
+    // overwritten instruction boundary its own exception-free near-jump entry.
+    constexpr size_t kSse4aFastpathCacheSize = 4 * 1024 * 1024;
+    constexpr size_t kSse4aFastpathSlotSize = 1024;
+    constexpr size_t kSse4aFastpathMaxPatches = 8192;
+    constexpr size_t kSse4aFastpathMaxChain = 8;
+    uint8_t* g_sse4a_fastpath_cache = nullptr;
+    size_t g_sse4a_fastpath_used = 0;
+    uint8_t* g_sse4a_chain_cache = nullptr;
+    size_t g_sse4a_chain_used = 0;
+    uint64_t g_sse4a_fastpath_sites[kSse4aFastpathMaxPatches]{};
+    volatile LONG g_sse4a_fastpath_count = 0;
+
+    // Astro Bot PPSA21564's EXTRQs live in two unwind-described vector-unpack functions. GNU objdump
+    // independently confirms every address below as an instruction boundary. The exact function
+    // digests prevent these offsets from ever being applied to another build: load-time x86 rewriting
+    // must use a verified manifest, never a byte-pattern scan through arbitrary executable data.
+    // CONFIDENCE: HIGH (exact guest disassembly + SHA-256 identity + live first-level execution).
+    constexpr uint64_t kAstroSse4aSites[] = {
+        0x82e6, 0x82ef, 0x82f4, 0x830b, 0x8348, 0x838f, 0x83e1, 0x83e6,
+        0x8405, 0x841d, 0x842e, 0x8480, 0x849b, 0x84b1, 0x84ba, 0x8516,
+        0x88b3, 0x88b8, 0x88d1, 0x88e0, 0x8917, 0x891c, 0x8963, 0x8968,
+        0x899c, 0x89a1, 0x89cd, 0x89de, 0x89e8, 0x8a10, 0x8a45, 0x8a50,
+        0x8a5b, 0x8aa5, 0x8ab0, 0x8aed, 0x8af8, 0x8b05, 0x8b1f, 0x8b42,
+        0x8b58, 0x8b77, 0x8b7c, 0x8b9d, 0x8ba8, 0x8bd4, 0x8be2, 0x8c0e,
+        0xacbb, 0xacc6, 0xacd7, 0xad02, 0xad3a, 0xad6f, 0xad9a, 0xade2,
+        0xae00, 0xae0e, 0xae17, 0xae25, 0xae37, 0xae66, 0xaeb1, 0xaee8,
+        0xb15c, 0xb167, 0xb187, 0xb196, 0xb1c8, 0xb1cc, 0xb20f, 0xb213,
+        0xb23d, 0xb251, 0xb265, 0xb278, 0xb280, 0xb2ab, 0xb2b6, 0xb2cf,
+        0xb4d2, 0xb4db, 0xb4e4, 0xb4e9, 0xb4f8, 0xb50c, 0xb52d, 0xb531,
+        0xb549, 0xb557, 0xb55c, 0xb565, 0xb56e, 0xb577, 0xb57c, 0xb593,
+    };
+    struct Sse4aManifestRange {
+        uint64_t vaddr;
+        size_t size;
+        uint8_t sha256[32];
+    };
+    constexpr Sse4aManifestRange kAstroSse4aRanges[] = {
+        {0x76e0, 0x1bd0,
+         {0x52,0xc9,0x9c,0xad,0x71,0xe4,0xd1,0xa5,0xdb,0x75,0xfd,0x76,0x0c,0x6f,0x0b,0x41,
+          0xe6,0x41,0xb4,0x52,0x5f,0xea,0x6f,0x86,0x8d,0xaa,0x7d,0x47,0x24,0x5d,0x0b,0x63}},
+        {0xa250, 0x1680,
+         {0xf8,0x2a,0x12,0x11,0x03,0x76,0x4b,0x6d,0x19,0x2f,0xa6,0x10,0x7e,0x25,0x4a,0xc4,
+          0x85,0x8a,0x4c,0x6b,0x01,0xb6,0x82,0x45,0x4b,0x1b,0x32,0x79,0x7e,0x7b,0x15,0xbd}},
+    };
+
     // Thread-stack registry (portable; mirrors the Linux one) so GC/thread code gets real bounds.
     std::map<uint64_t, std::pair<uint64_t, uint64_t>> g_stacks;
     std::mutex g_smx;
@@ -307,6 +361,7 @@ namespace {
         return protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ ||
                protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
     }
+
     // Does the instruction at p carry an %fs segment-override prefix (0x64)? Scans the legacy
     // prefixes and REX; stops at the opcode. Used to tell a drifted-guest-%fs fault (Windows zeroed
     // the FS base at a kernel transition) apart from a genuine fault, so we only retry fs accesses.
@@ -337,10 +392,11 @@ namespace {
         return b;
     }
 
-    // AMD SSE4a INSERTQ/EXTRQ emulation (Zen2-only; #UD on the Intel ISA Rosetta/native Intel expose,
-    // and generally on the host). Decode from Rip, mutate the xmm regs in CONTEXT, advance Rip.
-    // Mirrors the Linux try_emulate_sse4a but reads/writes CONTEXT.Xmm* instead of fpregs.
-    bool try_emulate_sse4a(CONTEXT* c) {
+    // AMD SSE4a INSERTQ/EXTRQ emulation (used by the PS5 guest; #UD on Intel hosts and the Intel ISA
+    // exposed by Rosetta). Decode from Rip, mutate the xmm regs in CONTEXT, advance Rip. Mirrors the
+    // Linux emulator but reads/writes CONTEXT.Xmm* instead of fpregs. The load-time EXTRQ translator
+    // below avoids this live-exception path for primary-image sites on Windows.
+    bool try_emulate_sse4a(CONTEXT* c, size_t* decoded_size = nullptr) {
         const uint8_t* p = (const uint8_t*)(uintptr_t)c->Rip;
         if (!addr_readable(c->Rip)) return false;
         size_t i = 0; uint8_t pfx = 0, rex = 0;
@@ -363,9 +419,384 @@ namespace {
         else              { uint64_t cc = (uint64_t)xmm[rm].Low;  len = (uint32_t)(cc & 0x3f); idx = (uint32_t)((cc >> 8) & 0x3f); }
         len &= 0x3f; idx &= 0x3f;
         if (insertq) set(reg, sse4a_insertq(lo(reg), lo(rm), len, idx));
-        else { int dr = (op == 0x78) ? rm : reg; set(dr, sse4a_extrq(lo(dr), len, idx)); }
+        else {
+            int dr = (op == 0x78) ? rm : reg;
+            set(dr, sse4a_extrq(lo(dr), len, idx));
+            // AMD documents EXTRQ's upper qword as undefined. Preserve prosper's established trap
+            // behavior; Astro's packed-vector kernels keep live data in the neighboring lane.
+        }
         c->Rip += i;
+        if (decoded_size) *decoded_size = i;
         return true;
+    }
+
+    bool sse4a_fastpath_site(uint64_t site) {
+        const LONG count = InterlockedCompareExchange(&g_sse4a_fastpath_count, 0, 0);
+        for (LONG i = 0; i < count; ++i)
+            if (g_sse4a_fastpath_sites[i] == site) return true;
+        return false;
+    }
+
+    // Return the exact register-form EXTRQ length that the code-cache expansion implements. The
+    // instruction has a mandatory 66 prefix, an optional REX byte, 0F 79, and register-only ModRM.
+    // Immediate forms and INSERTQ stay in the VEH emulator.
+    size_t sse4a_fastpath_candidate_bytes(const uint8_t* p) {
+        if (p[0] != 0x66) return 0;
+        if ((p[1] & 0xf0) == 0x40)
+            return p[2] == 0x0f && p[3] == 0x79 && (p[4] >> 6) == 3 ? 5 : 0;
+        return p[1] == 0x0f && p[2] == 0x79 && (p[3] >> 6) == 3 ? 4 : 0;
+    }
+
+    size_t sse4a_fastpath_candidate(uint64_t site) {
+        if (!addr_readable(site) || !addr_readable(site + 4)) return 0;
+        return sse4a_fastpath_candidate_bytes((const uint8_t*)(uintptr_t)site);
+    }
+
+    // Minimal fail-closed decoder for the location-independent AVX instructions immediately after
+    // a four-byte EXTRQ. It accepts only the register/stack-memory VEX forms exercised by the guest
+    // unpack kernels; RIP-relative memory, branches, and unknown opcodes cannot be relocated.
+    size_t patchable_vex_length(uint64_t site) {
+        if (!addr_readable(site) || !addr_readable(site + 14)) return 0;
+        const uint8_t* p = (const uint8_t*)(uintptr_t)site;
+        size_t i = 0;
+        if (p[0] == 0xc5) i = 2;
+        else if (p[0] == 0xc4) i = 3;
+        else return 0;
+        const uint8_t opcode = p[i++];
+        switch (opcode) {
+            case 0x62: case 0x6a: case 0x6f: case 0x72: case 0x73: case 0x7f:
+            case 0xf3: break;
+            default: return 0;
+        }
+        const uint8_t modrm = p[i++];
+        const unsigned mod = modrm >> 6;
+        const unsigned rm = modrm & 7;
+        if (mod != 3) {
+            if (mod == 0 && rm == 5) return 0; // RIP-relative: copying would change its address
+            if (rm == 4) {
+                const uint8_t sib = p[i++];
+                if (mod == 0 && (sib & 7) == 5) i += 4;
+            }
+            if (mod == 1) ++i;
+            else if (mod == 2) i += 4;
+        }
+        if (opcode == 0x72 || opcode == 0x73) ++i;
+        return i <= 15 ? i : 0;
+    }
+
+    struct Sse4aPatchInsn {
+        uint64_t site = 0;
+        size_t size = 0;
+        bool extrq = false;
+    };
+    struct Sse4aPatchPlan {
+        Sse4aPatchInsn insns[kSse4aFastpathMaxChain]{};
+        size_t count = 0;
+        size_t span = 0;
+        size_t extrq_count = 0;
+    };
+
+    // A four-byte instruction cannot hold a five-byte near detour by itself. Build a bounded suffix
+    // chain until the final instruction is at least five bytes. Every four-byte boundary becomes the
+    // high E9 byte of the preceding rel32 and simultaneously starts its own full near jump. Thus a
+    // direct branch to any consumed successor remains exception-free; no permanent INT3/VEH redirect
+    // can recreate the Windows exception-frame red-zone corruption this translation exists to avoid.
+    Sse4aPatchPlan sse4a_patch_plan(uint64_t site) {
+        Sse4aPatchPlan plan{};
+        uint64_t cursor = site;
+        size_t size = sse4a_fastpath_candidate(cursor);
+        bool extrq = size != 0;
+        if (!extrq) return plan;
+        for (;;) {
+            if (plan.count == kSse4aFastpathMaxChain) return {};
+            plan.insns[plan.count++] = {cursor, size, extrq};
+            plan.span += size;
+            plan.extrq_count += extrq;
+            if (size >= 5) return plan;
+            if (size != 4) return {};
+            cursor += size;
+            size = sse4a_fastpath_candidate(cursor);
+            extrq = size != 0;
+            if (!size) {
+                size = patchable_vex_length(cursor);
+                extrq = false;
+            }
+            if (!size) return {};
+        }
+    }
+
+    bool emit_sse4a_fastpath(const Sse4aPatchPlan& plan) {
+        if (!plan.count || !plan.span) return false;
+        const bool consumes_successors = plan.count > 1;
+        uint8_t* selected_cache = consumes_successors
+            ? g_sse4a_chain_cache : g_sse4a_fastpath_cache;
+        size_t& selected_used = consumes_successors
+            ? g_sse4a_chain_used : g_sse4a_fastpath_used;
+        const size_t cache_bytes = plan.count * kSse4aFastpathSlotSize;
+        if (!selected_cache || selected_used + cache_bytes > kSse4aFastpathCacheSize ||
+            InterlockedCompareExchange(&g_sse4a_fastpath_count, 0, 0) >
+                (LONG)kSse4aFastpathMaxPatches - (LONG)plan.count)
+            return false;
+
+        uint8_t* first_code = selected_cache + selected_used;
+        const uintptr_t cache_begin = (uintptr_t)first_code & ~(uintptr_t)0xfff;
+        const uintptr_t cache_end = ((uintptr_t)first_code + cache_bytes + 0xfff) &
+                                    ~(uintptr_t)0xfff;
+        const size_t cache_protect_size = cache_end - cache_begin;
+        DWORD old_cache_protection = 0;
+        if (!VirtualProtect((void*)cache_begin, cache_protect_size, PAGE_EXECUTE_READWRITE,
+                            &old_cache_protection))
+            return false;
+        selected_used += cache_bytes;
+        auto abandon_slots = [&] {
+            selected_used -= cache_bytes;
+            DWORD ignored = 0;
+            VirtualProtect((void*)cache_begin, cache_protect_size,
+                           old_cache_protection, &ignored);
+            return false;
+        };
+
+        size_t entry_sizes[kSse4aFastpathMaxChain]{};
+        int32_t detours[kSse4aFastpathMaxChain]{};
+        const uint64_t resume = plan.insns[0].site + plan.span;
+        for (size_t entry = 0; entry < plan.count; ++entry) {
+            uint8_t* code = first_code + entry * kSse4aFastpathSlotSize;
+            size_t o = 0;
+            bool overflow = false;
+            auto byte = [&](uint8_t value) {
+                if (o < kSse4aFastpathSlotSize) code[o] = value;
+                else overflow = true;
+                ++o;
+            };
+            auto movq_xmm_to_gpr = [&](unsigned xmm, unsigned gpr) {
+                byte(0x66); byte((uint8_t)(0x48 | (xmm >= 8 ? 4 : 0)));
+                byte(0x0f); byte(0x7e);
+                byte((uint8_t)(0xc0 | ((xmm & 7) << 3) | gpr));
+            };
+            auto pinsrq_gpr_to_xmm = [&](unsigned xmm, unsigned gpr) {
+                byte(0x66);
+                byte((uint8_t)(0x48 | (xmm >= 8 ? 4 : 0) | (gpr >= 8 ? 1 : 0)));
+                byte(0x0f); byte(0x3a); byte(0x22);
+                byte((uint8_t)(0xc0 | ((xmm & 7) << 3) | (gpr & 7)));
+                byte(0x00);
+            };
+            auto emit_extract = [&](unsigned value_xmm, unsigned control_xmm) {
+                movq_xmm_to_gpr(value_xmm, 0);
+                movq_xmm_to_gpr(control_xmm, 1);
+                byte(0x89); byte(0xca);
+                byte(0xc1); byte(0xe9); byte(0x08);
+                byte(0x83); byte(0xe1); byte(0x3f);
+                byte(0x48); byte(0xd3); byte(0xe8);
+                byte(0x83); byte(0xe2); byte(0x3f);
+                byte(0x85); byte(0xd2);
+                byte(0x74); const size_t no_mask_jump = o++; // jz .no_mask
+                byte(0x89); byte(0xd1);
+                byte(0x48); byte(0xc7); byte(0xc2);
+                byte(0xff); byte(0xff); byte(0xff); byte(0xff);
+                byte(0x48); byte(0xd3); byte(0xe2);
+                byte(0x48); byte(0xf7); byte(0xd2);
+                byte(0x48); byte(0x21); byte(0xd0);
+                if (no_mask_jump < kSse4aFastpathSlotSize)
+                    code[no_mask_jump] = (uint8_t)(o - (no_mask_jump + 1));
+                pinsrq_gpr_to_xmm(value_xmm, 0);
+            };
+            auto emit_prologue = [&] {
+                byte(0x48); byte(0x8d); byte(0x64); byte(0x24); byte(0x80);
+                byte(0x9c); byte(0x50); byte(0x51); byte(0x52);
+            };
+            auto emit_epilogue = [&] {
+                byte(0x5a); byte(0x59); byte(0x58); byte(0x9d);
+                byte(0x48); byte(0x8d); byte(0xa4); byte(0x24);
+                byte(0x80); byte(0x00); byte(0x00); byte(0x00);
+            };
+
+            for (size_t i = entry; i < plan.count; ++i) {
+                const Sse4aPatchInsn& insn = plan.insns[i];
+                const uint8_t* bytes = (const uint8_t*)(uintptr_t)insn.site;
+                if (!insn.extrq) {
+                    if (o + insn.size > kSse4aFastpathSlotSize)
+                        return abandon_slots();
+                    memcpy(code + o, bytes, insn.size);
+                    o += insn.size;
+                    continue;
+                }
+                const uint8_t rex = insn.size == 5 ? bytes[1] : 0;
+                const uint8_t modrm = bytes[insn.size - 1];
+                const unsigned destination =
+                    ((modrm >> 3) & 7u) | ((rex & 4u) ? 8u : 0u);
+                const unsigned control = (modrm & 7u) | ((rex & 1u) ? 8u : 0u);
+                emit_prologue();
+                emit_extract(destination, control);
+                emit_epilogue();
+            }
+            byte(0xe9);
+            const int64_t back_delta = (int64_t)resume -
+                (int64_t)((uint64_t)(uintptr_t)code + o + 4);
+            if (overflow || o + sizeof(int32_t) > kSse4aFastpathSlotSize ||
+                back_delta < std::numeric_limits<int32_t>::min() ||
+                back_delta > std::numeric_limits<int32_t>::max())
+                return abandon_slots();
+            const int32_t back_rel = (int32_t)back_delta;
+            memcpy(code + o, &back_rel, sizeof(back_rel));
+            o += sizeof(back_rel);
+            entry_sizes[entry] = o;
+
+            const uint64_t source = plan.insns[entry].site;
+            const int64_t detour_delta =
+                (int64_t)(uint64_t)(uintptr_t)code - (int64_t)(source + 5);
+            if (detour_delta < std::numeric_limits<int32_t>::min() ||
+                detour_delta > std::numeric_limits<int32_t>::max())
+                return abandon_slots();
+            detours[entry] = (int32_t)detour_delta;
+            if (entry + 1 < plan.count &&
+                (plan.insns[entry].size != 4 ||
+                 plan.insns[entry + 1].site != source + 4 ||
+                 ((uint32_t)detours[entry] >> 24) != 0xe9))
+                return abandon_slots();
+        }
+
+        for (size_t i = 0; i < plan.count; ++i)
+            FlushInstructionCache(GetCurrentProcess(),
+                                  first_code + i * kSse4aFastpathSlotSize,
+                                  entry_sizes[i]);
+        for (size_t i = 0; i < plan.count; ++i) {
+            const LONG record =
+                InterlockedCompareExchange(&g_sse4a_fastpath_count, 0, 0);
+            g_sse4a_fastpath_sites[record] = plan.insns[i].site;
+            MemoryBarrier();
+            InterlockedIncrement(&g_sse4a_fastpath_count);
+        }
+
+        // Gate every entry before touching overlapping rel32 bytes. Install from the final entry
+        // backwards: writing an earlier detour's high E9 byte can then only rewrite an already-live
+        // successor opcode with the same value, never expose a half-written successor jump.
+        for (size_t i = 0; i < plan.count; ++i) {
+            *(volatile uint8_t*)(uintptr_t)plan.insns[i].site = 0xcc;
+            FlushInstructionCache(GetCurrentProcess(),
+                                  (const void*)(uintptr_t)plan.insns[i].site, 1);
+        }
+        const Sse4aPatchInsn& final = plan.insns[plan.count - 1];
+        for (size_t i = 5; i < final.size; ++i)
+            *(volatile uint8_t*)(uintptr_t)(final.site + i) = 0x90;
+        for (size_t i = plan.count; i-- > 0;) {
+            memcpy((void*)(uintptr_t)(plan.insns[i].site + 1), &detours[i],
+                   sizeof(detours[i]));
+            *(volatile uint8_t*)(uintptr_t)plan.insns[i].site = 0xe9;
+        }
+        FlushInstructionCache(GetCurrentProcess(),
+                              (const void*)(uintptr_t)plan.insns[0].site, plan.span);
+
+        DWORD ignored_cache_protection = 0;
+        if (!VirtualProtect((void*)cache_begin, cache_protect_size, PAGE_EXECUTE_READ,
+                            &ignored_cache_protection)) {
+            fprintf(stderr, "[sse4a] warning: code cache remained writable (error=%lu)\n",
+                    (unsigned long)GetLastError());
+        }
+        if (getenv("PROSPER_SSE4A_LOG"))
+            fprintf(stderr,
+                    "[sse4a] fastpath eboot+0x%llx span=%zu entries=%zu extrq=%zu cache=%p\n",
+                    (unsigned long long)(plan.insns[0].site - g_base), plan.span,
+                    plan.count, plan.extrq_count, first_code);
+        return true;
+    }
+
+    bool try_handle_sse4a_fastpath_breakpoint(CONTEXT* c, uint64_t exception_address) {
+        uint64_t site = exception_address;
+        if (!sse4a_fastpath_site(site) && c->Rip && sse4a_fastpath_site(c->Rip - 1))
+            site = c->Rip - 1;
+        if (!sse4a_fastpath_site(site)) return false;
+        while (*(volatile uint8_t*)(uintptr_t)site == 0xcc) YieldProcessor();
+        c->Rip = site;
+        return true;
+    }
+
+    bool sha256_matches(const uint8_t* data, size_t size, const uint8_t expected[32]) {
+        if (!data || size > std::numeric_limits<ULONG>::max()) return false;
+        BCRYPT_ALG_HANDLE algorithm = nullptr;
+        if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM,
+                                        nullptr, 0) < 0)
+            return false;
+        uint8_t digest[32]{};
+        const NTSTATUS status = BCryptHash(
+            algorithm, nullptr, 0, const_cast<PUCHAR>(data), (ULONG)size,
+            digest, (ULONG)sizeof(digest));
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return status >= 0 && memcmp(digest, expected, sizeof(digest)) == 0;
+    }
+
+    bool astrobot_sse4a_manifest(const LoadedImage& img,
+                                 std::vector<uint64_t>& sites) {
+        for (const Sse4aManifestRange& range : kAstroSse4aRanges) {
+            if (range.vaddr < img.min_vaddr || range.vaddr > img.max_vaddr ||
+                range.size > img.max_vaddr - range.vaddr)
+                return false;
+            const uint8_t* bytes = img.at(img.base + range.vaddr);
+            if (!sha256_matches(bytes, range.size, range.sha256)) return false;
+        }
+        sites.assign(std::begin(kAstroSse4aSites), std::end(kAstroSse4aSites));
+        return true;
+    }
+
+    uint64_t executable_end_for(const LoadedImage& img, uint64_t vaddr) {
+        for (const LoadedImage::Prot& protection : img.prot) {
+            if (!protection.x || protection.vaddr >= img.max_vaddr) continue;
+            const uint64_t remaining = img.max_vaddr - protection.vaddr;
+            const uint64_t protection_end = protection.size > remaining
+                ? img.max_vaddr : protection.vaddr + protection.size;
+            if (vaddr < protection.vaddr || vaddr >= protection_end)
+                continue;
+            return protection_end;
+        }
+        return 0;
+    }
+
+    // Windows constructs an exception-dispatch frame below the interrupted RSP. PS5 code follows
+    // the SysV ABI and may keep live values in the 128-byte red zone there, so discovering SSE4a
+    // through a live #UD can corrupt guest locals before VEH is entered. Translate only instruction
+    // boundaries supplied by an independently verified exact-module manifest while the primary image
+    // is still single-threaded. Five-byte forms are self-contained. Four-byte forms are accepted only
+    // when the fail-closed successor decoder closes an all-near-jump chain.
+    size_t prepatch_sse4a(const LoadedImage& img,
+                          const std::vector<uint64_t>& verified_sites) {
+        if (verified_sites.empty()) return 0;
+        const LONG before = InterlockedCompareExchange(&g_sse4a_fastpath_count, 0, 0);
+        // Validate the complete manifest before modifying a byte. This also makes a stale manifest
+        // fail closed if a title update changes one instruction or executable-segment boundary.
+        if (!std::is_sorted(verified_sites.begin(), verified_sites.end()) ||
+            std::adjacent_find(verified_sites.begin(), verified_sites.end()) !=
+                verified_sites.end())
+            return 0;
+        for (uint64_t vaddr : verified_sites) {
+            if (vaddr < img.min_vaddr) return 0;
+            const uint64_t executable_end = executable_end_for(img, vaddr);
+            if (!executable_end) return 0;
+            const uint64_t site = img.base + vaddr;
+            const Sse4aPatchPlan plan = sse4a_patch_plan(site);
+            if (!plan.count || plan.span > executable_end - vaddr) return 0;
+            for (size_t i = 0; i < plan.count; ++i) {
+                if (!plan.insns[i].extrq) continue;
+                const uint64_t consumed_vaddr = plan.insns[i].site - img.base;
+                if (!std::binary_search(verified_sites.begin(), verified_sites.end(),
+                                        consumed_vaddr))
+                    return 0;
+            }
+        }
+
+        size_t patched = 0;
+        for (uint64_t vaddr : verified_sites) {
+            const uint64_t site = img.base + vaddr;
+            if (sse4a_fastpath_site(site)) continue; // consumed by an earlier verified chain
+            const Sse4aPatchPlan plan = sse4a_patch_plan(site);
+            if (!plan.count || !emit_sse4a_fastpath(plan)) continue;
+            patched += plan.extrq_count;
+        }
+        const size_t sites = (size_t)(
+            InterlockedCompareExchange(&g_sse4a_fastpath_count, 0, 0) - before);
+        if (sites || getenv("PROSPER_SSE4A_LOG"))
+            fprintf(stderr,
+                    "[sse4a] prepatched %zu verified entry points for %zu EXTRQ instructions before guest entry\n",
+                    sites, patched);
+        return sites;
     }
 
     // The VEH resumes at this assembly thunk instead of entering a compiled function directly. Its
@@ -413,6 +844,9 @@ namespace {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if (code == EXCEPTION_BREAKPOINT) {
+            if (try_handle_sse4a_fastpath_breakpoint(
+                    c, (uint64_t)(uintptr_t)ep->ExceptionRecord->ExceptionAddress))
+                return EXCEPTION_CONTINUE_EXECUTION;
             for (size_t i = 0; i < g_diag_bp_count; ++i) {
                 WinDiagBreakpoint& bp = g_diag_bps[i];
                 if ((c->Rip != bp.addr && c->Rip != bp.addr + 1) ||
@@ -464,8 +898,12 @@ namespace {
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
-        if (code == EXCEPTION_ILLEGAL_INSTRUCTION && try_emulate_sse4a(c))
-            return EXCEPTION_CONTINUE_EXECUTION;
+        if (code == EXCEPTION_ILLEGAL_INSTRUCTION) {
+            // Only exact, independently verified load-time manifests may rewrite executable bytes.
+            // An unmanifested EXTRQ remains a one-shot CONTEXT emulation on every execution; never
+            // turn an arbitrary #UD address into a permanent detour based on bytes alone.
+            if (try_emulate_sse4a(c)) return EXCEPTION_CONTINUE_EXECUTION;
+        }
         // Lazy-commit inside a guest-RESERVED range — parity with the Linux SIGSEGV handler. The guest
         // reserves a virtual range then touches pages it believes committed (its binned allocator relies
         // on a commit protocol real HW satisfies but our HLE doesn't fully replicate). If the faulting
@@ -571,7 +1009,44 @@ bool map_image(const LoadedImage& img, std::string* err) {
     void* got = VirtualAlloc(want, sz, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     if (!got || got != want) return fail("VirtualAlloc image at guest base failed");
     memcpy(got, img.mem.data(), sz);
-    if (!g_base) g_base = img.base;
+    if (!g_base) {
+        g_base = img.base;
+        const uint64_t cache_address =
+            (img.base + img.max_vaddr + 0xffffull) & ~0xffffull;
+        g_sse4a_fastpath_cache = (uint8_t*)VirtualAlloc(
+            (void*)(uintptr_t)cache_address, kSse4aFastpathCacheSize,
+            MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (g_sse4a_fastpath_cache != (void*)(uintptr_t)cache_address) {
+            if (g_sse4a_fastpath_cache)
+                VirtualFree(g_sse4a_fastpath_cache, 0, MEM_RELEASE);
+            g_sse4a_fastpath_cache = nullptr;
+            fprintf(stderr, "[sse4a] trap-free cache unavailable; using VEH emulation\n");
+        }
+        // Four-byte instructions overlap the following entry's E9 opcode with the high byte of the
+        // preceding rel32. This fixed-distance cache gives those detours the required 0xE9 high byte.
+        if (img.base > 0x16800000ull) {
+            const uint64_t chain_cache_address =
+                (img.base - 0x16800000ull) & ~0xffffull;
+            g_sse4a_chain_cache = (uint8_t*)VirtualAlloc(
+                (void*)(uintptr_t)chain_cache_address, kSse4aFastpathCacheSize,
+                MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+            if (g_sse4a_chain_cache != (void*)(uintptr_t)chain_cache_address) {
+                const DWORD allocation_error = GetLastError();
+                if (g_sse4a_chain_cache)
+                    VirtualFree(g_sse4a_chain_cache, 0, MEM_RELEASE);
+                g_sse4a_chain_cache = nullptr;
+                fprintf(stderr, "[sse4a] chain cache unavailable at 0x%llx (error=%lu)\n",
+                        (unsigned long long)chain_cache_address,
+                        (unsigned long)allocation_error);
+            }
+        }
+        std::vector<uint64_t> verified_sites = img.verified_sse4a_sites;
+        if (verified_sites.empty() && astrobot_sse4a_manifest(img, verified_sites))
+            fprintf(stderr,
+                    "[sse4a] matched Astro Bot's exact verified EXTRQ manifest (%zu sites)\n",
+                    verified_sites.size());
+        prepatch_sse4a(img, verified_sites);
+    }
     return true;
 }
 
@@ -621,6 +1096,10 @@ void install_trap_handler() {
 int recovery_thunk_call_rsp_mod16() {
     return prosper_veh_recover_call_rsp_mod16 == ~uint64_t{0}
          ? -1 : (int)prosper_veh_recover_call_rsp_mod16;
+}
+
+uint64_t sse4a_fastpath_patch_count() {
+    return (uint64_t)InterlockedCompareExchange(&g_sse4a_fastpath_count, 0, 0);
 }
 
 // Diagnostics that need Linux perf_event / int3 patching are unavailable on Windows.

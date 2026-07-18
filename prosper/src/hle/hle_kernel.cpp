@@ -448,7 +448,7 @@ HLE(k_mutex_unlock)  {
 HLE(k_condattr_init)    { if (a0) { auto* c = (pthread_condattr_t*)calloc(1, sizeof(pthread_condattr_t)); pthread_condattr_init(c); *(void**)a0 = c; } return 0; }
 HLE(k_condattr_destroy) { if (a0 && *(void**)a0) { free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
 HLE(k_cond_init)      { if (!a0) return 0x16; auto* c = (pthread_cond_t*)calloc(1, sizeof(pthread_cond_t)); pthread_cond_init(c, nullptr); *(void**)a0 = c; return 0; }
-HLE(k_cond_destroy)   { if (a0 && !pt_static_sentinel(*(void**)a0)) { pthread_cond_destroy((pthread_cond_t*)*(void**)a0); free(*(void**)a0); } if (a0) *(void**)a0 = nullptr; return 0; }
+HLE(k_cond_destroy)   { if (a0 && !pt_static_sentinel(*(void**)a0)) { auto* c = (pthread_cond_t*)*(void**)a0; pthread_cond_destroy(c); interruptible_cond_forget(c); free(c); } if (a0) *(void**)a0 = nullptr; return 0; }
 HLE(k_cond_signal)    { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.signal    cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) interruptible_cond_signal(c); return 0; }
 HLE(k_cond_broadcast) { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.broadcast cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) interruptible_cond_broadcast(c); return 0; }
 HLE(k_cond_wait)      { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.wait.ent  cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0);
@@ -1185,7 +1185,12 @@ namespace {
     bool evf_match(uint64_t bits, uint64_t pat, uint32_t mode) {
         return (mode & 0x1) ? ((bits & pat) == pat) : ((bits & pat) != 0);  // AND vs OR
     }
-    void ef_destroy(EventFlag* e) { pthread_mutex_destroy(&e->m); pthread_cond_destroy(&e->c); free(e); }
+    void ef_destroy(EventFlag* e) {
+        pthread_mutex_destroy(&e->m);
+        pthread_cond_destroy(&e->c);
+        interruptible_cond_forget(&e->c);
+        free(e);
+    }
 }
 HLE(k_ef_create) {   // (ef*, name, attr, initPattern, opt)
     auto* e = (EventFlag*)calloc(1, sizeof(EventFlag));
@@ -1328,7 +1333,12 @@ HLE(k_ef_poll)    { // (ef, pattern, waitMode, resultPat*)
 // waiter would otherwise free the mutex/condvar out from under it — UAF).
 namespace {
     struct Sema { pthread_mutex_t m; pthread_cond_t c; int64_t count; bool deleted; int waiters; };
-    void sema_destroy(Sema* s) { pthread_mutex_destroy(&s->m); pthread_cond_destroy(&s->c); free(s); }
+    void sema_destroy(Sema* s) {
+        pthread_mutex_destroy(&s->m);
+        pthread_cond_destroy(&s->c);
+        interruptible_cond_forget(&s->c);
+        free(s);
+    }
 }
 HLE(k_sema_create) { // (sema*, name, attr, initCount, maxCount, opt)
     auto* s = (Sema*)calloc(1, sizeof(Sema));

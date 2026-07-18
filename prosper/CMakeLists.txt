@@ -65,7 +65,7 @@ if(PROSPER_SRC)
   # Windows: the guest futex HLE (sceKernelWaitOnAddress/WakeByAddress) is backed by the native Win32
   # WaitOnAddress/WakeByAddressSingle/All, which live in the Synchronization import lib (not kernel32).
   if(WIN32)
-    target_link_libraries(prosper_core PUBLIC synchronization)
+    target_link_libraries(prosper_core PUBLIC synchronization bcrypt)
   endif()
 endif()
 
@@ -190,6 +190,13 @@ if(TARGET prosper_core)
   add_executable(test_printf tests/test_printf.cpp)
   target_link_libraries(test_printf PRIVATE prosper_core)
   add_test(NAME printf_varargs COMMAND test_printf)
+
+  # Windows' aligned allocator family must remain paired end-to-end. Mixing _aligned_malloc with
+  # plain free corrupts the heap under aligned game-buffer churn; ordinary and aligned guest
+  # allocations intentionally share one compatible family on that host.
+  add_executable(test_libc_alloc tests/test_libc_alloc.cpp)
+  target_link_libraries(test_libc_alloc PRIVATE prosper_core)
+  add_test(NAME libc_alloc COMMAND test_libc_alloc)
 
   # EventFlag/Sema delete-under-waiter safety (issue #104): delete wakes parked waiters with EACCES
   # and defers the free to the last one out, instead of free()ing the object under a live wait (UAF).

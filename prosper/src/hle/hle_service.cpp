@@ -214,6 +214,32 @@ struct AvpPlayer {
 std::mutex g_avp_mx;
 std::unordered_map<uint64_t, AvpPlayer> g_avp;
 
+// Native decoders own their dequeue storage and may move or recycle it on the next pull. Never
+// expose that backend lifetime directly to guest code: Astro submits the returned pointer to host
+// memcpy/GPU work that can outlive the backend packet. Keep one size-stable, player-owned staging
+// allocation instead. Its address remains valid until the next pull updates or resizes that
+// player's staging buffer, matching the transient-buffer contract without a dangling backend
+// pointer.
+bool avp_stage_video(AvpPlayer& player, const prosper::video::VideoFrame& frame,
+                     uint8_t*& data, uint32_t& pitch) {
+    if (!frame.y || !frame.uv || frame.width == 0 || frame.height == 0) return false;
+    const size_t y_stride = frame.y_stride ? frame.y_stride : frame.width;
+    const size_t uv_stride = frame.uv_stride ? frame.uv_stride : frame.width;
+    if (y_stride < frame.width || uv_stride < frame.width) return false;
+    const size_t uv_rows = (static_cast<size_t>(frame.height) + 1) / 2;
+    if (y_stride > SIZE_MAX / frame.height || uv_stride > SIZE_MAX / uv_rows) return false;
+    const size_t y_bytes = y_stride * frame.height;
+    const size_t uv_bytes = uv_stride * uv_rows;
+    if (uv_bytes > SIZE_MAX - y_bytes) return false;
+    const size_t bytes = y_bytes + uv_bytes;
+    if (player.frame.size() != bytes) player.frame.resize(bytes);
+    memcpy(player.frame.data(), frame.y, y_bytes);
+    memcpy(player.frame.data() + y_bytes, frame.uv, uv_bytes);
+    data = player.frame.data();
+    pitch = static_cast<uint32_t>(y_stride);
+    return true;
+}
+
 bool avp_synth_enabled() { return getenv("PROSPER_AVP_SYNTH_FRAMES") != nullptr; }
 uint64_t avp_synth_frames() {
     const char* value = getenv("PROSPER_AVP_SYNTH_FRAMES");
@@ -510,9 +536,14 @@ HLE(s_avp_getvideodata) {
         if (auto* b = p.backend; b && p.backend_id >= 0) {
             prosper::video::VideoFrame vf;
             if (b->next_video(p.backend_id, vf)) {
-                fi->p_data = const_cast<uint8_t*>(vf.y); fi->timestamp = vf.pts_us / 1000;
-                fi->d0 = vf.width; fi->d1 = vf.height; fi->d2 = 0; fi->d3 = 0;
-                result = 1;
+                uint8_t* staged = nullptr;
+                uint32_t pitch = 0;
+                if (avp_stage_video(p, vf, staged, pitch)) {
+                    fi->p_data = staged;
+                    fi->timestamp = vf.pts_us / 1000;
+                    fi->d0 = vf.width; fi->d1 = vf.height; fi->d2 = 0; fi->d3 = 0;
+                    result = 1;
+                }
             } else if (b->eof(p.backend_id) && !p.stop_fired) {
                 p.playing = false; p.stop_fired = true; fire_stop = true; obj = p.ev_obj; cb = p.ev_cb;
             }
@@ -530,8 +561,9 @@ HLE(s_avp_getvideodata) {
         }
     }
     if (fire_stop) avp_fire(obj, cb, AVP_STOP);
-    if (avp_log()) fprintf(stderr, "[avp] video handle=0x%llx result=%llu stop=%d\n",
-                           (unsigned long long)a0, (unsigned long long)result, (int)fire_stop);
+    if (avp_log()) fprintf(stderr, "[avp] video handle=0x%llx result=%llu data=%p stop=%d\n",
+                           (unsigned long long)a0, (unsigned long long)result,
+                           result ? fi->p_data : nullptr, (int)fire_stop);
     return result;
 }
 // bool sceAvPlayerGetVideoDataEx(handle, AvPlayerFrameInfoEx*) — the game uses this Ex variant.
@@ -547,13 +579,18 @@ HLE(s_avp_getvideodataex) {
         if (auto* b = p.backend; b && p.backend_id >= 0) {
             prosper::video::VideoFrame vf;
             if (b->next_video(p.backend_id, vf)) {
-                fi->p_data = const_cast<uint8_t*>(vf.y); fi->timestamp = vf.pts_us / 1000;
-                fi->details.video = {}; fi->details.video.width = vf.width; fi->details.video.height = vf.height;
-                fi->details.video.aspect = vf.height ? (float)vf.width / (float)vf.height : 0.0f;
-                fi->details.video.pitch = vf.y_stride ? vf.y_stride : vf.width;
-                fi->details.video.luma_bd = 8; fi->details.video.chroma_bd = 8;
-                fi->details.video.framerate = p.fps;
-                result = 1;
+                uint8_t* staged = nullptr;
+                uint32_t pitch = 0;
+                if (avp_stage_video(p, vf, staged, pitch)) {
+                    fi->p_data = staged;
+                    fi->timestamp = vf.pts_us / 1000;
+                    fi->details.video = {}; fi->details.video.width = vf.width; fi->details.video.height = vf.height;
+                    fi->details.video.aspect = vf.height ? (float)vf.width / (float)vf.height : 0.0f;
+                    fi->details.video.pitch = pitch;
+                    fi->details.video.luma_bd = 8; fi->details.video.chroma_bd = 8;
+                    fi->details.video.framerate = p.fps;
+                    result = 1;
+                }
             } else if (b->eof(p.backend_id) && !p.stop_fired) {
                 p.playing = false; p.stop_fired = true; fire_stop = true; obj = p.ev_obj; cb = p.ev_cb;
             }
@@ -571,8 +608,9 @@ HLE(s_avp_getvideodataex) {
         }
     }
     if (fire_stop) avp_fire(obj, cb, AVP_STOP);
-    if (avp_log()) fprintf(stderr, "[avp] video-ex handle=0x%llx result=%llu stop=%d\n",
-                           (unsigned long long)a0, (unsigned long long)result, (int)fire_stop);
+    if (avp_log()) fprintf(stderr, "[avp] video-ex handle=0x%llx result=%llu data=%p stop=%d\n",
+                           (unsigned long long)a0, (unsigned long long)result,
+                           result ? fi->p_data : nullptr, (int)fire_stop);
     return result;
 }
 HLE(s_avp_getaudiodata)   {   // bool sceAvPlayerGetAudioData(handle, AvPlayerFrameInfo*)
@@ -585,7 +623,13 @@ HLE(s_avp_getaudiodata)   {   // bool sceAvPlayerGetAudioData(handle, AvPlayerFr
     if (auto* b = p.backend; b && p.backend_id >= 0) {
         prosper::video::AudioFrame af;
         if (!b->next_audio(p.backend_id, af)) return 0;
-        fi->p_data = (uint8_t*)const_cast<int16_t*>(af.pcm); fi->timestamp = af.pts_us / 1000;
+        if (!af.pcm || af.channels == 0 || af.samples == 0 ||
+            af.samples > SIZE_MAX / af.channels) return 0;
+        const size_t sample_count = static_cast<size_t>(af.samples) * af.channels;
+        if (sample_count > SIZE_MAX / sizeof(int16_t)) return 0;
+        p.audio.resize(sample_count);
+        memcpy(p.audio.data(), af.pcm, sample_count * sizeof(int16_t));
+        fi->p_data = reinterpret_cast<uint8_t*>(p.audio.data()); fi->timestamp = af.pts_us / 1000;
         AvpAudio details{(uint16_t)af.channels, {}, af.sample_rate,
                          (uint32_t)(af.samples * af.channels * sizeof(int16_t)), {}};
         memcpy(&fi->d0, &details, sizeof(details));
