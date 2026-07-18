@@ -51,9 +51,15 @@ int main() {
     HleFn kernel_dup2_fn = Hle::lookup(nid_hash("sceKernelDup2"));
     HleFn mkdir_fn = Hle::lookup(nid_hash("mkdir"));
     HleFn kernel_mkdir_fn = Hle::lookup(nid_hash("sceKernelMkdir"));
+    HleFn getdents_fn = Hle::lookup(nid_hash("getdents"));
+    HleFn kernel_getdents_fn = Hle::lookup(nid_hash("sceKernelGetdents"));
+    HleFn getdirentries_fn = Hle::lookup(nid_hash("getdirentries"));
+    HleFn kernel_getdirentries_fn = Hle::lookup(nid_hash("sceKernelGetdirentries"));
     CHECK(open_fn && read_fn && lseek_fn && close_fn && dup_fn && kernel_dup_fn &&
-              dup2_fn && kernel_dup2_fn && mkdir_fn && kernel_mkdir_fn,
+              dup2_fn && kernel_dup2_fn && mkdir_fn && kernel_mkdir_fn && getdents_fn &&
+              kernel_getdents_fn && getdirentries_fn && kernel_getdirentries_fn,
           "file HLE functions registered");
+    std::array<uint8_t, 64> dir_buffer{};
 
     // Creating an existing directory is a failure, not an idempotent success. Linux previously
     // suppressed EEXIST while Windows propagated it, so save-directory control flow differed by host.
@@ -75,11 +81,96 @@ int main() {
     CHECK(mkdir_duplicate == -1, "mkdir reports an existing directory as failure");
     CHECK(duplicate_errno == EEXIST, "mkdir preserves EEXIST for the caller");
     CHECK(kernel_mkdir_duplicate != 0, "sceKernelMkdir does not report false success on EEXIST");
+#ifdef _WIN32
+    // Windows has no CRT directory-open API, but a directory HANDLE can be attached to a CRT fd.
+    // The zero-entry stub must still publish the defined starting offset through basep.
+    HANDLE directory_handle = CreateFileA(dir_path, GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    int directory_fd = directory_handle != INVALID_HANDLE_VALUE
+        ? ::_open_osfhandle((intptr_t)directory_handle, _O_RDONLY | _O_BINARY)
+        : -1;
+    int64_t directory_base = 0x12345678;
+    uint64_t directory_result = directory_fd >= 0 && kernel_getdirentries_fn
+        ? kernel_getdirentries_fn((uint64_t)directory_fd,
+                                  (uint64_t)(uintptr_t)dir_buffer.data(), dir_buffer.size(),
+                                  (uint64_t)(uintptr_t)&directory_base, 0, 0)
+        : ~uint64_t{0};
+    CHECK(directory_result == 0 && directory_base == 0,
+          "Windows sceKernelGetdirentries initializes basep on success");
+    if (directory_fd >= 0) ::_close(directory_fd);
+    else if (directory_handle != INVALID_HANDLE_VALUE) CloseHandle(directory_handle);
+
+    // A pipe is a valid CRT descriptor, but not a directory. Do not conflate an unsupported
+    // handle type with EBADF after _get_osfhandle has established descriptor validity.
+    int pipe_fds[2]{-1, -1};
+    int pipe_result = ::_pipe(pipe_fds, 256, _O_BINARY);
+    uint64_t pipe_getdents = pipe_result == 0 && kernel_getdents_fn
+        ? kernel_getdents_fn((uint64_t)pipe_fds[0], (uint64_t)(uintptr_t)dir_buffer.data(),
+                             dir_buffer.size(), 0, 0, 0)
+        : 0;
+    CHECK(pipe_result == 0 && (uint32_t)pipe_getdents == 0x80020014u,
+          "Windows valid non-directory handles return SCE_KERNEL_ERROR_ENOTDIR");
+    if (pipe_fds[0] >= 0) ::_close(pipe_fds[0]);
+    if (pipe_fds[1] >= 0) ::_close(pipe_fds[1]);
+#endif
     std::filesystem::remove_all(dir_path, remove_error);
 
     std::array<uint8_t, 512> actual{};
     int64_t fd = open_fn ? (int64_t)open_fn((uint64_t)(uintptr_t)path, 0, 0, 0, 0, 0) : -1;
     CHECK(fd >= 0, "open fixture through guest fd HLE");
+
+    // libc and sceKernel expose the same enumeration operation with different error conventions.
+    // The old shared handler returned a positive-looking SCE error to libc; Windows returned false
+    // EOF for every call. Exercise both invalid arguments and a valid non-directory descriptor.
+    int64_t base = 0x12345678;
+    errno = 0;
+    int64_t libc_bad_buffer = getdents_fn
+        ? (int64_t)getdents_fn((uint64_t)fd, 0, dir_buffer.size(), 0, 0, 0)
+        : 0;
+    int libc_bad_buffer_errno = errno;
+    uint64_t kernel_bad_buffer = kernel_getdents_fn
+        ? kernel_getdents_fn((uint64_t)fd, 0, dir_buffer.size(), 0, 0, 0)
+        : 0;
+    CHECK(libc_bad_buffer == -1 && libc_bad_buffer_errno == EINVAL,
+          "libc getdents returns -1 with EINVAL for an invalid buffer");
+    CHECK((uint32_t)kernel_bad_buffer == 0x80020016u,
+          "sceKernelGetdents returns SCE_KERNEL_ERROR_EINVAL directly");
+
+    errno = 0;
+    int64_t libc_not_directory = getdirentries_fn
+        ? (int64_t)getdirentries_fn((uint64_t)fd, (uint64_t)(uintptr_t)dir_buffer.data(),
+                                   dir_buffer.size(), (uint64_t)(uintptr_t)&base, 0, 0)
+        : 0;
+    int libc_not_directory_errno = errno;
+    uint64_t kernel_not_directory = kernel_getdirentries_fn
+        ? kernel_getdirentries_fn((uint64_t)fd, (uint64_t)(uintptr_t)dir_buffer.data(),
+                                  dir_buffer.size(), (uint64_t)(uintptr_t)&base, 0, 0)
+        : 0;
+    CHECK(libc_not_directory == -1 && libc_not_directory_errno == ENOTDIR,
+          "libc getdirentries returns -1 with ENOTDIR for a regular file");
+    CHECK((uint32_t)kernel_not_directory == 0x80020014u,
+          "sceKernelGetdirentries returns SCE_KERNEL_ERROR_ENOTDIR directly");
+    CHECK(base == 0x12345678,
+          "failed getdirentries calls leave basep untouched");
+
+    // A failure must be determined before touching basep. Address 1 is deliberately inaccessible;
+    // this also exercises Windows' guarded _get_osfhandle invalid-descriptor path.
+    errno = 0;
+    int64_t libc_bad_fd = getdirentries_fn
+        ? (int64_t)getdirentries_fn(~uint64_t{0}, (uint64_t)(uintptr_t)dir_buffer.data(),
+                                   dir_buffer.size(), 1, 0, 0)
+        : 0;
+    int libc_bad_fd_errno = errno;
+    uint64_t kernel_bad_fd = kernel_getdirentries_fn
+        ? kernel_getdirentries_fn(~uint64_t{0}, (uint64_t)(uintptr_t)dir_buffer.data(),
+                                  dir_buffer.size(), 1, 0, 0)
+        : 0;
+    CHECK(libc_bad_fd == -1 && libc_bad_fd_errno == EBADF,
+          "libc getdirentries rejects an invalid descriptor without touching basep");
+    CHECK((uint32_t)kernel_bad_fd == 0x80020009u,
+          "sceKernelGetdirentries returns EBADF without touching basep");
+
     int64_t n = fd >= 0 && read_fn
         ? (int64_t)read_fn((uint64_t)fd, (uint64_t)(uintptr_t)actual.data(), actual.size(), 0, 0, 0)
         : -1;

@@ -841,12 +841,29 @@ HLE(f_mkdir) { std::string h = translate(CS(a0));   // sceKernelMkdir(path, mode
 }
 HLE(f_rmdir) { std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::rmdir(h.c_str()); }
 
-#ifndef _WIN32
 // sceKernelGetdents(int fd, char* buf, size_t nbytes) — fill FreeBSD dirent records
 // {u32 fileno; u16 reclen; u8 type; u8 namlen; char name[]} (4-aligned). Backed by the host's
 // getdents64 on the SAME fd so the kernel keeps the directory cursor; Linux and BSD DT_* type
 // values match. Returns bytes written (0 = end of directory), or an SCE error. UE4 (PPSA17942)
 // enumerates its pak directory with this during IO-stack init.
+static uint64_t directory_sce_error(int error) {
+    return 0x80020000ull | (uint64_t)(error & 0xff);
+}
+
+static bool directory_result_is_error(uint64_t result) {
+    return (result & ~0xffull) == 0x80020000ull;
+}
+
+// libc's getdents/getdirentries use the POSIX -1 + errno contract, while their sceKernel siblings
+// return an SCE_KERNEL_ERROR value directly. They used to share the kernel handler, so libc saw a
+// large positive byte count on failure and could walk an untouched directory buffer as valid data.
+static uint64_t directory_result_to_posix(uint64_t result) {
+    if (!directory_result_is_error(result)) return result;
+    errno = (int)(result & 0xff);
+    return (uint64_t)(int64_t)-1;
+}
+
+#ifndef _WIN32
 #ifdef __APPLE__
 // #843: sceKernelGetdents caches one DIR* per directory fd (Darwin has no getdents-on-fd). The cache
 // MUST be dropped when the guest closes that fd — otherwise a reused fd number hands back a STALE DIR*
@@ -867,7 +884,7 @@ int getdents_close_fd(int fd) {
     return ::close(fd);
 }
 #endif
-HLE(f_getdents) {
+HLE(k_getdents) {
     if (!a1 || a2 < 32) return 0x80020016ull;   // EINVAL
 #ifdef __APPLE__
     // Darwin has no getdents-on-fd (getdirentries is unavailable with 64-bit inodes). Keep the
@@ -882,7 +899,11 @@ HLE(f_getdents) {
     else {
         int d2 = dup((int)a0);
         dp = d2 >= 0 ? fdopendir(d2) : nullptr;
-        if (!dp) { if (d2 >= 0) ::close(d2); return 0x80020000ull | (uint64_t)(errno & 0xff); }
+        if (!dp) {
+            int error = errno;
+            if (d2 >= 0) ::close(d2);
+            return directory_sce_error(error);
+        }
         g_getdents_dirs[(int)a0] = dp;
     }
     uint8_t* out = (uint8_t*)P(a1);
@@ -908,7 +929,7 @@ HLE(f_getdents) {
     uint8_t tmp[4096];
     size_t want = a2 < sizeof tmp ? (size_t)a2 : sizeof tmp;
     long n = syscall(SYS_getdents64, (int)a0, tmp, (unsigned)want);
-    if (n < 0)  return 0x80020000ull | (uint64_t)(errno & 0xff);
+    if (n < 0)  return directory_sce_error(errno);
     if (n == 0) return 0;
     uint8_t* out = (uint8_t*)P(a1);
     size_t o = 0, w = 0;
@@ -932,16 +953,37 @@ HLE(f_getdents) {
 // sceKernelGetdirentries(fd, buf, nbytes, long* basep): like getdents but also writes the pre-call
 // directory offset to *basep. Was MISSING -> returned 0 = "empty directory". Delegate to f_getdents and
 // stamp basep with the cursor position captured before the read.
-HLE(f_getdirentries) {
+HLE(k_getdirentries) {
     off_t base = ::lseek((int)a0, 0, SEEK_CUR);
-    uint64_t r = f_getdents(a0, a1, a2, 0, 0, 0);
-    if (a3) *(int64_t*)P(a3) = (int64_t)base;
+    uint64_t r = k_getdents(a0, a1, a2, 0, 0, 0);
+    if (!directory_result_is_error(r) && a3) *(int64_t*)P(a3) = (int64_t)base;
     return r;
 }
 #else
-HLE(f_getdents) { return 0; }
-HLE(f_getdirentries) { return 0; }
+HLE(k_getdents) {
+    if (!a1 || a2 < 32) return directory_sce_error(EINVAL);
+    ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
+    intptr_t handle = ::_get_osfhandle((int)a0);
+    if (handle == -1) return directory_sce_error(EBADF);
+    if (GetFileType((HANDLE)handle) != FILE_TYPE_DISK) return directory_sce_error(ENOTDIR);
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle((HANDLE)handle, &info)) return directory_sce_error(ENOTDIR);
+    if (!(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) return directory_sce_error(ENOTDIR);
+    // Directory descriptors are not currently produced by the Windows CRT-backed open path.
+    return 0;
+}
+HLE(k_getdirentries) {
+    uint64_t r = k_getdents(a0, a1, a2, a3, a4, a5);
+    if (!directory_result_is_error(r) && a3) *(int64_t*)P(a3) = 0;
+    return r;
+}
 #endif
+HLE(f_getdents) {
+    return directory_result_to_posix(k_getdents(a0, a1, a2, a3, a4, a5));
+}
+HLE(f_getdirentries) {
+    return directory_result_to_posix(k_getdirentries(a0, a1, a2, a3, a4, a5));
+}
 HLE(f_unlink){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::
 #ifdef _WIN32
     _unlink
@@ -1523,13 +1565,13 @@ void register_file_hle() {
     R("unlink", f_unlink);        R("sceKernelUnlink", f_unlink);
     R("rename", f_rename);        R("sceKernelRename", f_rename);   // real move (was fake-success -> lost atomic saves)
     R("dup", f_dup);   R("sceKernelDup", f_dup);   R("dup2", f_dup2);   R("sceKernelDup2", f_dup2);   // were 0 = stdin
-    R("sceKernelGetdents", f_getdents); R("getdents", f_getdents);
+    R("sceKernelGetdents", k_getdents); R("getdents", f_getdents);
     // vectored IO + getdirentries — real host ops (were MISSING -> silent-EOF / empty-dir corruption trap)
     R("sceKernelReadv", f_readv);       R("readv", f_readv);
     R("sceKernelWritev", f_writev);     R("writev", f_writev);
     R("sceKernelPreadv", f_preadv);     R("preadv", f_preadv);
     R("sceKernelPwritev", f_pwritev);   R("pwritev", f_pwritev);
-    R("sceKernelGetdirentries", f_getdirentries); R("getdirentries", f_getdirentries);
+    R("sceKernelGetdirentries", k_getdirentries); R("getdirentries", f_getdirentries);
     // sceKernelAio* (issue #312): NIDs verified identical in shadPS4's PS4 registration table and
     // the PS5 3.20 libkernel stub dump. Raw-NID registration (names not in our NidDb).
     Hle::register_fn("vYU8P9Td2Zo", (HleFn)k_aio_init,         "sceKernelAioInitializeImpl");
