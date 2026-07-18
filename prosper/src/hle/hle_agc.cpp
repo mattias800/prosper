@@ -1273,14 +1273,38 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
         // Dump each packet's kind + first payload dwords so we can see whether the game embeds a
         // completion-label write (WriteData/ReleaseMem/EventWrite) or a GPU-side wait in the stream.
         std::vector<gpu::Pm4Command> ops; gpu::decode_pm4(p->addr, p->dw_num, ops);
-        static const char* kKindName[] = {"DrawReset","WaitFlipDone","SetRegDirect","SetRegsIndirect",
-            "SetIndexType","DrawIndex","DrawIndexAuto","EventWrite","AcquireMem","WriteData","WaitRegMem",
-            "Flip","ReleaseMem","DispatchDirect","SetIndexBase","SetIndexCount","DrawIndexOffset",
-            "Jump","SetPredication","DmaData","Unknown"};
+        auto kind_name = [](gpu::Pm4Command::Kind kind) {
+            using K = gpu::Pm4Command::Kind;
+            switch (kind) {
+                case K::DrawReset:       return "DrawReset";
+                case K::WaitFlipDone:    return "WaitFlipDone";
+                case K::PushMarker:      return "PushMarker";
+                case K::PopMarker:       return "PopMarker";
+                case K::SetRegDirect:    return "SetRegDirect";
+                case K::SetRegsIndirect: return "SetRegsIndirect";
+                case K::SetIndexType:    return "SetIndexType";
+                case K::DrawIndex:       return "DrawIndex";
+                case K::DrawIndexAuto:   return "DrawIndexAuto";
+                case K::EventWrite:      return "EventWrite";
+                case K::AcquireMem:      return "AcquireMem";
+                case K::WriteData:       return "WriteData";
+                case K::WaitRegMem:      return "WaitRegMem";
+                case K::Flip:            return "Flip";
+                case K::ReleaseMem:      return "ReleaseMem";
+                case K::DispatchDirect:  return "DispatchDirect";
+                case K::SetIndexBase:    return "SetIndexBase";
+                case K::SetIndexCount:   return "SetIndexCount";
+                case K::DrawIndexOffset: return "DrawIndexOffset";
+                case K::Jump:            return "Jump";
+                case K::SetPredication:  return "SetPredication";
+                case K::DmaData:         return "DmaData";
+                case K::Unknown:         return "Unknown";
+            }
+            return "?";
+        };
         for (auto& c : ops) {
-            uint32_t k = (uint32_t)c.kind; const char* nm = k < 21 ? kKindName[k] : "?";
             fprintf(stderr, "[agc]   pkt op=0x%02x r=0x%02x len=%u kind=%s pl0=0x%08x pl1=0x%08x pl2=0x%08x\n",
-                    c.op, c.r, c.len, nm,
+                    c.op, c.r, c.len, kind_name(c.kind),
                     c.len > 1 ? c.payload[0] : 0, c.len > 2 ? c.payload[1] : 0, c.len > 3 ? c.payload[2] : 0);
         }
     }
