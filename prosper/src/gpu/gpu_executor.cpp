@@ -369,6 +369,7 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
                                      instruction.fmt == Rdna2Format::SOP2 ||
                                      instruction.fmt == Rdna2Format::SOPC ||
                                      instruction.fmt == Rdna2Format::SOPK ||
+                                     instruction.fmt == Rdna2Format::SOPP ||
                                      instruction.fmt == Rdna2Format::SMEM ||
                                      instruction.fmt == Rdna2Format::MIMG ||
                                      instruction.fmt == Rdna2Format::MUBUF;
@@ -451,6 +452,57 @@ uint64_t shader_cache_entry_bytes(const ShaderCompileKey& key, const std::vector
            static_cast<uint64_t>(spirv.size()) * sizeof(uint32_t);
 }
 
+struct PcrelDispatchSelection {
+    PcrelDispatchInfo dispatch;
+    const ShaderResource* resource = nullptr;
+    uint32_t raw_selector = 0;
+    uint32_t target = UINT32_MAX;
+    bool readable = false;
+};
+
+PcrelDispatchSelection select_pcrel_dispatch(const uint32_t* code, size_t dwords,
+                                              const ShaderResourceTable* resources) {
+    PcrelDispatchSelection selection;
+    if (!code || !dwords || !resources) return selection;
+    selection.dispatch = rdna2_pcrel_dispatch_info(code, dwords);
+    if (!selection.dispatch.valid) return selection;
+
+    selection.resource = resources->by_sgpr_base_cls(
+        selection.dispatch.selector_sgpr_base, ResourceClass::ConstantBuffer);
+    if (!selection.resource ||
+        selection.dispatch.selector_byte_offset > selection.resource->size ||
+        selection.resource->size - selection.dispatch.selector_byte_offset <
+            sizeof(selection.raw_selector)) return selection;
+
+    if (selection.resource->host_data &&
+        selection.dispatch.selector_byte_offset <= selection.resource->host_data_size &&
+        selection.resource->host_data_size - selection.dispatch.selector_byte_offset >=
+            sizeof(selection.raw_selector)) {
+        memcpy(&selection.raw_selector,
+               selection.resource->host_data + selection.dispatch.selector_byte_offset,
+               sizeof(selection.raw_selector));
+        selection.readable = true;
+    } else if (selection.resource->gpu_addr <=
+               UINT64_MAX - selection.dispatch.selector_byte_offset) {
+        const uint64_t address =
+            selection.resource->gpu_addr + selection.dispatch.selector_byte_offset;
+        if (guest_readable(address, sizeof(selection.raw_selector))) {
+            memcpy(&selection.raw_selector,
+                   reinterpret_cast<const void*>(static_cast<uintptr_t>(address)),
+                   sizeof(selection.raw_selector));
+            selection.readable = true;
+        }
+    }
+    if (!selection.readable) return selection;
+
+    const uint32_t adjusted = selection.raw_selector +
+                              static_cast<uint32_t>(selection.dispatch.selector_addend);
+    const uint32_t index = std::min(adjusted, selection.dispatch.selector_max);
+    if (index < selection.dispatch.target_pcs.size())
+        selection.target = selection.dispatch.target_pcs[index];
+    return selection;
+}
+
 ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_t* code, size_t dwords,
                                          const ShaderResourceTable* resources,
                                          const PixelInputMapping* pixel_inputs,
@@ -464,35 +516,12 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
     key.has_system_inputs = stage == ShaderProgramStage::Fragment && system_inputs != nullptr;
     if (key.has_system_inputs) key.system_inputs = *system_inputs;
     if (stage == ShaderProgramStage::Fragment && code && dwords && resources) {
-        const PcrelDispatchInfo dispatch = rdna2_pcrel_dispatch_info(code, dwords);
+        const PcrelDispatchSelection selection = select_pcrel_dispatch(code, dwords, resources);
+        const PcrelDispatchInfo& dispatch = selection.dispatch;
         if (dispatch.valid) {
-            const ShaderResource* resource = resources->by_sgpr_base_cls(
-                dispatch.selector_sgpr_base, ResourceClass::ConstantBuffer);
-            uint32_t raw_selector = 0;
-            bool readable = false;
-            if (resource && dispatch.selector_byte_offset <= resource->size &&
-                resource->size - dispatch.selector_byte_offset >= sizeof(raw_selector)) {
-                if (resource->host_data && dispatch.selector_byte_offset <= resource->host_data_size &&
-                    resource->host_data_size - dispatch.selector_byte_offset >= sizeof(raw_selector)) {
-                    memcpy(&raw_selector, resource->host_data + dispatch.selector_byte_offset,
-                           sizeof(raw_selector));
-                    readable = true;
-                } else if (resource->gpu_addr <= UINT64_MAX - dispatch.selector_byte_offset) {
-                    const uint64_t address = resource->gpu_addr + dispatch.selector_byte_offset;
-                    if (guest_readable(address, sizeof(raw_selector))) {
-                        memcpy(&raw_selector, reinterpret_cast<const void*>(static_cast<uintptr_t>(address)),
-                               sizeof(raw_selector));
-                        readable = true;
-                    }
-                }
-            }
-            if (readable) {
-                const uint32_t adjusted = raw_selector + static_cast<uint32_t>(dispatch.selector_addend);
-                const uint32_t index = std::min(adjusted, dispatch.selector_max);
-                if (index < dispatch.target_pcs.size()) {
-                    key.has_pcrel_dispatch = true;
-                    key.pcrel_dispatch_target = dispatch.target_pcs[index];
-                }
+            if (selection.target != UINT32_MAX) {
+                key.has_pcrel_dispatch = true;
+                key.pcrel_dispatch_target = selection.target;
             }
             if (getenv("PROSPER_DBG")) {
                 static std::mutex dispatch_log_mutex;
@@ -503,8 +532,10 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                             "[pcrel-dispatch] code=%p selector=s%u+0x%x resource=%s readable=%u "
                             "raw=%u target=%u resources=%zu\n",
                             static_cast<const void*>(code), dispatch.selector_sgpr_base,
-                            dispatch.selector_byte_offset, resource ? "found" : "missing", readable,
-                            raw_selector, key.pcrel_dispatch_target, resources->resources.size());
+                            dispatch.selector_byte_offset,
+                            selection.resource ? "found" : "missing", selection.readable,
+                            selection.raw_selector, key.pcrel_dispatch_target,
+                            resources->resources.size());
                     for (const auto& candidate : resources->resources)
                         fprintf(stderr,
                                 "[pcrel-dispatch]   cls=%u binding=%u sgpr=%u srt=%u addr=%llx "
@@ -958,7 +989,8 @@ size_t registered_shader_dwords(const AgcShaderHeader& header, uint64_t code_add
 // External linkage (DynFetch + declaration in gpu_execute.hpp) so the fold is unit-testable.
 std::vector<DynFetch>
 resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_sgprs, uint32_t nsgpr,
-                      uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses) {
+                      uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses,
+                      uint32_t pcrel_dispatch_target) {
     using FoldClock = std::chrono::steady_clock;
     static const bool profile_fold = std::getenv("PROSPER_STAGE_FOLD_PROFILE") != nullptr;
     const auto fold_start = profile_fold ? FoldClock::now() : FoldClock::time_point{};
@@ -968,7 +1000,20 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     std::vector<DynFetch> out;
     const auto decoded = decode_shader_cached(code, dwords);
     const auto decode_done = profile_fold ? FoldClock::now() : FoldClock::time_point{};
-    const auto& ins = decoded->instructions;
+    std::vector<Rdna2Inst> specialized;
+    const std::vector<Rdna2Inst>* fold_instructions = &decoded->instructions;
+    if (pcrel_dispatch_target != UINT32_MAX) {
+        specialized = decoded->instructions;
+        const PcrelDispatchInfo dispatch = rdna2_pcrel_dispatch_info(code, dwords);
+        if (!rdna2_specialize_pcrel_dispatch(specialized, dispatch,
+                                             pcrel_dispatch_target)) {
+            // The fragment recompiler will reject the same unprovable specialization. Do not walk all
+            // alternatives here: doing so would fabricate resource provenance for code that cannot run.
+            specialized.clear();
+        }
+        fold_instructions = &specialized;
+    }
+    const auto& ins = *fold_instructions;
 
     auto readable = [&](uint64_t addr, uint32_t bytes) {
         if (!profile_fold) return guest_readable(addr, bytes);
@@ -1721,17 +1766,28 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     // becomes the resource's srt_offset (the recompiler's by_srt_offset provenance).
     std::vector<DynFetch> dyn_vb;
     std::vector<SrtUse> srt_uses;
+    // Build the primary metadata table before dynamic folding so a proven PS dispatch can read its
+    // direct selector resource. The fold then follows the same selected arm as recompilation.
+    const uint32_t user_sgpr_base = is_ps ? 0u : 8u;
+    uint32_t primary_sgprs[kUserSgprs];
+    read_user_sgprs(st.sh, bases[0] + range_start, primary_sgprs);
+    ShaderResourceTable primary_resources =
+        build_shader_resources(*hdr, primary_sgprs, kUserSgprs, user_sgpr_base);
+    PcrelDispatchSelection dispatch_selection;
+    if (is_ps) {
+        dispatch_selection = select_pcrel_dispatch(
+            (const uint32_t*)(uintptr_t)code_addr, shader_dwords, &primary_resources);
+    }
     const auto metadata_done = phase_timing ? StageClock::now() : StageClock::time_point{};
     if (is_ps) {
-        uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, bases[0] + range_start, sgprs);
         dyn_vb = resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
-                                       sgprs, kUserSgprs, 0, &srt_uses);
+                                       primary_sgprs, kUserSgprs, 0, &srt_uses,
+                                       dispatch_selection.target);
     } else {
-        uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, bases[0] + range_start, sgprs);
         // NGG merged VS/GS: s0..s7 are system SGPRs, user data starts at s8 (confirmed by matching the
         // shader's s[8:11]/s[24:25] descriptor pointers to the register file at GS_0+offset).
         dyn_vb = resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
-                                       sgprs, kUserSgprs, 8, &srt_uses);
+                                       primary_sgprs, kUserSgprs, 8, &srt_uses);
         if (getenv("PROSPER_GFXLOG") || getenv("PROSPER_RESDUMP")) {
             fprintf(stderr, "[dynvb] VS resolved %zu dynamic vertex-fetch descriptor(s):\n", dyn_vb.size());
             for (auto& kv : dyn_vb) {
@@ -1768,10 +1824,16 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
 
     // NGG VS/GS loads user data at shader s8 (s0..s7 = system SGPRs); PS at s0. The resource sgpr_base
     // (an s_buffer_load/image_sample's SBASE/SRSRC register) is in that shader-SGPR space.
-    const uint32_t user_sgpr_base = is_ps ? 0u : 8u;
-    for (uint32_t base : bases) {
-        uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, base + range_start, sgprs);
-        ShaderResourceTable t = build_shader_resources(*hdr, sgprs, kUserSgprs, user_sgpr_base);
+    for (size_t base_index = 0; base_index < std::size(bases); ++base_index) {
+        const uint32_t base = bases[base_index];
+        ShaderResourceTable t;
+        if (base_index == 0) {
+            t = std::move(primary_resources);
+        } else {
+            uint32_t sgprs[kUserSgprs];
+            read_user_sgprs(st.sh, base + range_start, sgprs);
+            t = build_shader_resources(*hdr, sgprs, kUserSgprs, user_sgpr_base);
+        }
         // Add the const-fold-resolved dynamic buffers, keyed by their SRSRC SGPR so the
         // recompiler's by_sgpr_base() resolves each buffer_load_format. The V#'s data format is patched
         // at runtime by the fetch shader (so the load-time snapshot reads Unknown) — default to Float32

@@ -5598,6 +5598,12 @@ bool specialize_pcrel_dispatch(std::vector<Rdna2Inst>& ins, const PcrelDispatchI
 
 } // namespace
 
+bool rdna2_specialize_pcrel_dispatch(std::vector<Rdna2Inst>& instructions,
+                                     const PcrelDispatchInfo& info,
+                                     uint32_t selected_target) {
+    return specialize_pcrel_dispatch(instructions, info, selected_target);
+}
+
 PcrelDispatchInfo rdna2_pcrel_dispatch_info(const uint32_t* code, size_t dwords) {
     PcrelDispatchInfo out;
     if (!code || !dwords) return out;

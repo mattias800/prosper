@@ -423,6 +423,85 @@ int main() {
           direct_uses[0].s4[0] == seed5d[8] && direct_uses[0].s4[3] == seed5d[11],
           "direct user-SGPR T#/S# dwords are preserved");
 
+    // Evergate's title PS uses a bounded PC-relative dispatch. An omitted alternative reloads the
+    // same T# SGPRs that the selected arm consumes directly; a linear fold used to walk that reload
+    // and attach the alternative texture to the selected image_sample's pc. Specialize the fold to
+    // target pc19, exactly as the fragment recompiler specializes the executable instruction stream.
+    static uint32_t dispatch_selector[5] = {0, 0, 0, 0, 1}; // add -1 -> table index 0 -> pc19
+    static uint32_t alternative_t8[8];
+    for (uint32_t i = 0; i < 8; ++i) alternative_t8[i] = seed5d[i];
+    alternative_t8[0] ^= 0x10000000u; // distinguish the omitted arm's T# from the direct selected T#
+
+    uint32_t dispatch_sgprs[32]{};
+    for (uint32_t i = 0; i < 12; ++i) dispatch_sgprs[i] = seed5d[i];
+    const uint64_t selector_base = (uint64_t)(uintptr_t)dispatch_selector;
+    dispatch_sgprs[24] = (uint32_t)selector_base;
+    dispatch_sgprs[25] = (uint32_t)(selector_base >> 32) & 0xFFFFu;
+    dispatch_sgprs[26] = 5u;
+    dispatch_sgprs[27] = 4u << 12;
+    const uint64_t alternative_base = (uint64_t)(uintptr_t)alternative_t8;
+    dispatch_sgprs[28] = (uint32_t)alternative_base;
+    dispatch_sgprs[29] = (uint32_t)(alternative_base >> 32) & 0xFFFFu;
+    dispatch_sgprs[30] = 8u;
+    dispatch_sgprs[31] = 4u << 12;
+
+    const uint32_t pcrel_texture_dispatch[] = {
+        0xF4201A8Cu, 0xFA000010u, // pc0:  s_buffer_load_dword s106, s[24:27], 0x10
+        0x816AC16Au,              // pc2:  s_add_i32 s106, s106, -1
+        0x83EA826Au,              // pc3:  s_min_u32 s106, s106, 2
+        0x8F6A836Au,              // pc4:  s_lshl_b32 s106, s106, 3
+        0xBEA01F00u,              // pc5:  s_getpc_b64 s[32:33]
+        0x802020FFu, 80u,         // pc6:  table starts at aligned pc26
+        0x82212180u,              // pc8:  s_addc_u32 s33, 0, s33
+        0xF4040890u, 0xD4000000u, // pc9:  s_load_dwordx2 s[34:35], s[32:33], s106
+        0xBEA81F00u,              // pc11: s_getpc_b64 s[40:41]
+        0x80282228u,              // pc12: s_add_u32 s40, s40, s34
+        0x82292329u,              // pc13: s_addc_u32 s41, s41, s35
+        0xBE802028u,              // pc14: s_setpc_b64 s[40:41]
+        0xF42C000Eu, 0xFA000000u, // pc15: omitted s_buffer_load_dwordx8 s[0:7], s[28:31], 0
+        0xBF8CC07Fu,              // pc17: s_waitcnt
+        0xBF820003u,              // pc18: s_branch merge at pc22
+        0xF0800F08u, 0x00400000u, // pc19: selected image_sample ..., s[0:7], s[8:11]
+        0xBF820000u,              // pc21: s_branch merge at pc22
+        0xF800180Fu, 0x00000000u, // pc22: common exp mrt0
+        0xBF810000u,              // pc24: s_endpgm
+        0u,                       // pc25: qword alignment
+        28u, 0u,                  // pc26: target pc19, relative to pc12
+        12u, 0u,                  // pc28: target pc15
+        40u, 0u,                  // pc30: merge pc22
+    };
+    const PcrelDispatchInfo texture_dispatch = rdna2_pcrel_dispatch_info(
+        pcrel_texture_dispatch,
+        sizeof(pcrel_texture_dispatch) / sizeof(pcrel_texture_dispatch[0]));
+    CHECK(texture_dispatch.valid && texture_dispatch.target_pcs.size() == 3 &&
+          texture_dispatch.target_pcs[0] == 19,
+          "texture dispatch fixture proves selected target pc19");
+
+    std::vector<SrtUse> unspecialized_dispatch_uses;
+    resolve_dynamic_fetch(pcrel_texture_dispatch,
+                          sizeof(pcrel_texture_dispatch) / sizeof(pcrel_texture_dispatch[0]),
+                          dispatch_sgprs, 32, 0, &unspecialized_dispatch_uses);
+    bool unspecialized_contaminated = false;
+    for (const auto& use : unspecialized_dispatch_uses)
+        if (use.kind == 0 && use.use_pc == 19 && use.t8[0] == alternative_t8[0])
+            unspecialized_contaminated = true;
+    CHECK(unspecialized_contaminated,
+          "linear fixture demonstrates omitted-arm texture contamination");
+
+    std::vector<SrtUse> specialized_dispatch_uses;
+    resolve_dynamic_fetch(pcrel_texture_dispatch,
+                          sizeof(pcrel_texture_dispatch) / sizeof(pcrel_texture_dispatch[0]),
+                          dispatch_sgprs, 32, 0, &specialized_dispatch_uses, 19);
+    bool selected_uses_direct_texture = false;
+    bool selected_uses_alternative_texture = false;
+    for (const auto& use : specialized_dispatch_uses) {
+        if (use.kind != 0 || use.use_pc != 19) continue;
+        selected_uses_direct_texture |= use.t8[0] == seed5d[0] && use.t8[7] == seed5d[7];
+        selected_uses_alternative_texture |= use.t8[0] == alternative_t8[0];
+    }
+    CHECK(selected_uses_direct_texture && !selected_uses_alternative_texture,
+          "selected dispatch arm keeps direct texture provenance at image_sample pc19");
+
     // DOLL scene VS: an untyped buffer_load_dwordx3 uses a V# placed directly in user-data
     // s[8:11]. There is no preceding s_load and it is not a format/vertex fetch, so it needs its
     // own pc-keyed buffer use. The same eight seed SGPRs may also happen to decode as a plausible
