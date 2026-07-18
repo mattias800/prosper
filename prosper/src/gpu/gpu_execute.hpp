@@ -95,6 +95,10 @@ struct DynFetch {
     // patched V#s fold their in-record offset into the base), while a single direct V# needs the
     // faithful VADDR/inst-offset address — shadowing it collapses every attribute onto offset 0.
     bool from_seed = false;
+    // Descriptor before the instruction's constant OFFSET/SOFFSET is folded into `desc.base`.
+    // Graphics VertexBuffers need the shifted descriptor for their special vertex-index path;
+    // compute ConstantBuffers keep this original descriptor and apply those terms exactly once.
+    DecodedBufferDescriptor unshifted_desc;
 };
 
 // One descriptor-TABLE use recovered by the same const-fold (#294): UE4 shaders load their T#/S#/V#

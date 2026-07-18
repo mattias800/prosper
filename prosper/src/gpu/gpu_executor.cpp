@@ -1562,7 +1562,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                 in.pc, desc_v3);
                             return;
                         }
-                        out.push_back({ in.pc, srsrc, with_off(d), desc_v3, from_seed });
+                        DynFetch fetch{ in.pc, srsrc, with_off(d), desc_v3, from_seed };
+                        fetch.unshifted_desc = d;
+                        out.push_back(fetch);
                     };
                     if (trc) fprintf(stderr, "[dyntrace] MUBUF fetch pc=%u op=0x%x SRSRC=s%d patched=%d (k=%d%d%d%d v3=0x%x) have_descr=%d off=+0x%x soff_known=%d\n",
                                      in.pc, in.opcode, srsrc, patched, k0, k1, k2, k3,
@@ -1673,8 +1675,10 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         code, dwords, user_sgprs, nsgpr, /*user_sgpr_base*/0, &srt_uses);
 
     // A format-load resource has one identity: the descriptor live at its exact instruction pc.
+    // Keep its original base because the compute ConstantBuffer address path applies the MUBUF
+    // OFFSET/SOFFSET itself; `fetch.desc` is shifted for graphics' special vertex-index path.
     for (const auto& fetch : direct_fetches) {
-        const DecodedBufferDescriptor& d = fetch.desc;
+        const DecodedBufferDescriptor& d = fetch.unshifted_desc;
         if (d.base <= 0x10000 || d.size_bytes == 0 || d.size_bytes > 0x10000000u ||
             d.format == DataFormat::Unknown || !d.num_components || d.forbid_unknown_fallback)
             continue;

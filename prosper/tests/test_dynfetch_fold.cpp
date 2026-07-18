@@ -564,6 +564,30 @@ int main() {
                              &direct_copy_table, direct_copy_config).empty(),
           "#636: instruction-provenance table keeps the Dead Cells format-copy dispatch realizable");
 
+    // DynFetch shifts graphics vertex descriptors by a constant instruction offset because their
+    // special address path drops the original OFFSET/SOFFSET. Compute resources use ConstantBuffer's
+    // faithful MUBUF path instead, so the production helper must retain base B and let that path add
+    // offset 16 once (not bind B+16 and then index another 16 bytes).
+    const uint32_t offset_format_load[] = {
+        0xE00C2010u, 0x80000100u,   // buffer_load_format_xyzw ..., s[0:3], offset:16 idxen
+        0xBF810000u,
+    };
+    const std::vector<DynFetch> offset_fetches = resolve_dynamic_fetch(
+        offset_format_load, std::size(offset_format_load), direct_copy_seed, 4, 0);
+    CHECK(offset_fetches.size() == 1 && offset_fetches[0].desc.base == 0x20010u &&
+          offset_fetches[0].unshifted_desc.base == 0x20000u,
+          "#636: DynFetch retains both shifted graphics and original compute descriptor bases");
+    ShaderResourceTable offset_compute_table;
+    add_compute_buffer_resources(offset_compute_table, offset_format_load,
+                                 std::size(offset_format_load), direct_copy_seed, 4);
+    assign_convention_bindings(offset_compute_table, 2);
+    CHECK(offset_compute_table.resources.size() == 1 &&
+          offset_compute_table.resources[0].gpu_addr == 0x20000u &&
+          offset_compute_table.resources[0].fetch_pc == 0 &&
+          !recompile_compute(offset_format_load, std::size(offset_format_load),
+                             &offset_compute_table, direct_copy_config).empty(),
+          "#636: compute format-load keeps base B and applies nonzero instruction offset once");
+
     const uint32_t rewritten_copy_dest[] = {
         0xBE840380u,                // s_mov_b32 s4, 0 (seed destination is no longer live)
         0xE01C2000u, 0x80010101u,   // buffer_store_format_xyzw v[1:4], v1, s[4:7], 0 idxen
