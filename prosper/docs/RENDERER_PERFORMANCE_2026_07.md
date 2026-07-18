@@ -90,6 +90,40 @@ The following lower-draw intro windows reached 2.6 FPS. Backend execution remain
 the dense scene and is now the dominant cost. `PROSPER_NO_SHADER_ANALYSIS_CACHE=1` restores direct
 analysis for comparison; `PROSPER_SHADER_ANALYSIS_CACHE_MB=<MiB>` changes the analysis budget.
 
+## Evergate call-local Vulkan resource sharing (2026-07-19)
+
+After the Windows direct-memory red-zone fix made the fresh-save route deterministic, the transition
+showed that a single 1080p pass recreated Vulkan buffers, image views, samplers, descriptor pools, and
+layouts for roughly 450 draws. The backend already waits for a fence before returning, so immutable
+objects with complete equal contracts can safely share one call-local lifetime without changing ordered
+graphics/compute boundaries or adding cross-submit freshness assumptions.
+
+Storage-buffer sharing requires the same nonzero guest address, captured size, and every captured byte.
+Equal bytes at different guest addresses remain distinct because a shader-visible storage resource may be
+writable. Texture bindings include the image, view type/format/swizzle, and complete sampler state.
+Descriptor-set and pipeline layouts include their complete binding/layout contracts, while one descriptor
+pool supplies all sets in the call. `PROSPER_NO_BACKEND_RESOURCE_SHARE=1` restores distinct keyed objects
+for A/B; the call-wide descriptor pool remains in both modes.
+
+Native Windows / RTX 4090, one RelWithDebInfo binary, fresh saves, native scale/cadence, the documented
+Evergate route, and submit-aligned 25-submit windows produced the following matched late-transition result:
+
+| Measurement | Keyed sharing disabled | Call-local sharing |
+|---|---:|---:|
+| Draws / submit | 475.2 | 472.0 |
+| Whole submit | 409.1 ms | 354.1 ms |
+| Backend execution | 285.8 ms | 218.7 ms |
+| Backend resource setup | 84.0 ms | 64.6 ms |
+| Pipeline-layout work | 16.9 ms | 2.0 ms |
+| Backend cleanup | 103.4 ms | 72.7 ms |
+| Observed transition rate | about 2.4 FPS | about 2.7 FPS |
+
+The heaviest nearby 486-488-draw windows improved by about 23%, but the conservative matched result above
+is the planning baseline. An additional experiment hashed and shared index buffers and complete descriptor
+bundles. Evergate's instances were mostly unique, so hashing/key construction cost more than the avoided
+objects and regressed a 476-draw window to 483.9 ms; that tranche was removed. The remaining major cost is
+still structural GPU submission/fence/readback ownership, not another broad exact-hash cache.
+
 ## Dead Cells backend upload duplication (2026-07-15)
 
 Dead Cells exposed a second duplication layer after the frontend decode caches. The frontend correctly
@@ -548,35 +582,17 @@ resource-ownership scheduling rather than reordering by operation type.
 
 ## Windows cross-submit texture write watch
 
-Windows direct memory is backed by shared sections, so `MEM_WRITE_WATCH` cannot observe writes through its
-aliases. The renderer now registers the physical 4 KiB pages behind an eligible cached texture, finds every
-writable virtual alias known to the HLE memory layer, and temporarily makes those aliases read-only. The
-existing vectored exception handler consumes the first write fault, marks the physical page generation dirty,
-and restores the original protection on every alias. Temporary host aliases used to zero recycled direct
-memory report their physical write explicitly. Mapping and protection changes invalidate affected watches.
+The protection-fault implementation described in earlier revisions of this handoff is retired. Windows builds
+an exception-dispatch frame below the interrupted stack pointer before a vectored handler runs. Unmodified PS5
+code follows the SysV ABI and may keep live values anywhere in that 128-byte red zone, so even a successfully
+handled read-only-page fault can silently overwrite guest locals. Evergate exposed this by saving valid output
+pointers in the red zone, taking several direct-memory first-touch faults, and later reloading a null pointer.
 
-The shortcut is deliberately proof-based. A complete armed registration may return unchanged; a fault,
-incomplete mapping, protection failure, topology change, unsupported platform, or host notification falls back
-to the exact comparison. `PROSPER_AUDIT_CROSS_SUBMIT_TEXTURE_WRITE_WATCH=1` retains that comparison behind
-unchanged decisions. More than 10,000 audited decisions in the Dead Cells full-render loading route produced
-zero disagreements. A focused Windows test maps one section through two aliases and proves that writes through
-either alias, a host physical write, and an alias removal are all observed. Non-Windows builds use the exact
-path unchanged.
-
-The first live implementation exposed a separate performance trap: two textures are rewritten through nearly
-every watched page on every post-parse submit, even when some writes reproduce identical bytes. Re-arming them
-generated about 490,000 handled faults in 180 seconds. The final policy disables page protection after two
-consecutive dirty observations and preserves that decision when changed content replaces the cache entry;
-exact comparison remains authoritative for those dynamic resources. In the final 144-second run, registrations
-stopped at 26 and faults plateaued at 17,821 after the workload transition instead of growing every submit.
-
-The stable four-span window reduced exact validation from roughly 145 MiB per submit after the same-submit
-journal to 3.3 MiB per submit. Post-transition process memory remained bounded at 1.60-1.68 GiB private and
-3.62-3.68 GiB working set. The run still remained on the Prisoners' Quarters loading screen, so this result is
-a renderer performance/correctness improvement, not evidence that the separate progression stall is fixed.
-With persistent pipelines and write-aware validation in place, the measured heavy path is now dominated by
-resource construction plus roughly ten synchronous Vulkan target calls, fence waits, and readbacks per guest
-submit. That boundary/lifetime architecture is the next performance target.
+Windows `GuestWriteWatch` therefore reports unsupported and every cross-submit texture lookup uses the exact
+byte-comparison fallback. The prior audit evidence remains useful evidence that the dirty-page algorithm was
+logically sound, but it cannot make Windows exception delivery ABI-safe. Re-enable protection watches only if
+fault delivery itself preserves all guest red-zone bytes. Direct memory now uses a delete-on-close sparse file,
+so the kernel demand-pages mapped file data without the unsafe user-mode `SEC_RESERVE` first-touch exceptions.
 
 ## Separate unresolved risk
 

@@ -6,6 +6,7 @@
 #include <vulkan/vulkan.h>
 #include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/render_state.hpp"
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -67,6 +68,10 @@ struct FrameResource {
                                     // share a set — both stages number bindings from 2, so one set would
                                     // collide binding 2/3 between stages and make the layout invalid).
     std::vector<uint32_t> dwords;   // storage-buffer contents (empty -> a 1-dword zero buffer)
+    // Exact guest resource identity for a storage buffer. The backend may share an immutable upload
+    // within one synchronous call only when both this identity and the complete captured bytes match;
+    // zero keeps synthetic/replay resources conservatively distinct.
+    uint64_t buffer_identity = 0;
     const uint8_t* tex_rgba = nullptr;   // non-null => a texture; then tw/th are its dimensions
     uint32_t tw = 0, th = 0, td = 1;
     uint32_t img_dim = 1;             // ShaderResource/MIMG dim (1=2D, 2=3D); depth-1 3D stays 3D
@@ -188,6 +193,30 @@ inline BackendTextureUploadStats& backend_texture_upload_stats_storage() {
 
 inline BackendTextureUploadStats backend_texture_upload_stats() {
     return backend_texture_upload_stats_storage();
+}
+
+// Per-call Vulkan objects that can be shared only when their complete immutable contracts match.
+// These counters make the optimization auditable without exposing backend implementation details to
+// the live renderer.
+struct BackendResourceReuseStats {
+    size_t buffer_references = 0;
+    size_t unique_buffers = 0;
+    size_t texture_binding_references = 0;
+    size_t unique_texture_bindings = 0;
+    size_t descriptor_set_layout_references = 0;
+    size_t unique_descriptor_set_layouts = 0;
+    size_t pipeline_layout_references = 0;
+    size_t unique_pipeline_layouts = 0;
+    size_t descriptor_pools = 0;
+};
+
+inline BackendResourceReuseStats& backend_resource_reuse_stats_storage() {
+    static thread_local BackendResourceReuseStats stats;
+    return stats;
+}
+
+inline BackendResourceReuseStats backend_resource_reuse_stats() {
+    return backend_resource_reuse_stats_storage();
 }
 
 struct BackendPipelineCacheStats {
@@ -1044,6 +1073,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     if (timing_enabled) backend_render_timing_stats_storage() = {};
     BackendColorTargetStats& color_target_stats = backend_color_target_stats_storage();
     color_target_stats = {};
+    BackendResourceReuseStats& resource_reuse_stats = backend_resource_reuse_stats_storage();
+    resource_reuse_stats = {};
     std::vector<uint8_t> out;
     if (out_rgba1) out_rgba1->clear();
     if (draws.empty()) return out;
@@ -1403,8 +1434,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         VkShaderModule vs = VK_NULL_HANDLE, gs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
         std::vector<FrameResource> R;
         std::vector<VkDescriptorSetLayout> dsls; std::vector<VkDescriptorSet> dsets;
-        VkDescriptorPool dpool = VK_NULL_HANDLE;
-        std::vector<VkBuffer> sbuf; std::vector<VkDeviceMemory> sbmem;
+        std::vector<VkBuffer> sbuf;
         std::vector<size_t> texture_upload;
         std::vector<VkImageView> tview; std::vector<VkSampler> tsamp;
         VkPipelineLayout layout = VK_NULL_HANDLE; VkPipeline pipe = VK_NULL_HANDLE;
@@ -1489,6 +1519,81 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
         return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
     }();
+    const bool share_backend_resources =
+        getenv("PROSPER_NO_BACKEND_RESOURCE_SHARE") == nullptr;
+    struct SharedBufferKey {
+        const uint32_t* words = nullptr;
+        size_t count = 0;
+        uint64_t identity = 0;
+        uint64_t hash = 0;
+        uint64_t unique_tag = 0;
+        bool operator==(const SharedBufferKey& other) const {
+            return identity == other.identity && hash == other.hash &&
+                   unique_tag == other.unique_tag &&
+                   count == other.count &&
+                   (!count || std::memcmp(words, other.words, count * sizeof(uint32_t)) == 0);
+        }
+    };
+    struct SharedBufferKeyHash {
+        size_t operator()(const SharedBufferKey& key) const {
+            return static_cast<size_t>(key.hash ^ key.identity ^
+                (key.unique_tag * 0x9e3779b97f4a7c15ull));
+        }
+    };
+    struct SharedBufferUpload {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+    };
+    struct TextureBindingKey {
+        std::array<uint64_t, 22> words{};
+        bool operator==(const TextureBindingKey&) const = default;
+    };
+    struct TextureBindingKeyHash {
+        size_t operator()(const TextureBindingKey& key) const {
+            uint64_t hash = 1469598103934665603ull;
+            for (uint64_t word : key.words) {
+                hash ^= word;
+                hash *= 1099511628211ull;
+            }
+            return static_cast<size_t>(hash);
+        }
+    };
+    struct SharedTextureBinding {
+        VkImageView view = VK_NULL_HANDLE;
+        VkSampler sampler = VK_NULL_HANDLE;
+    };
+    struct WordVectorHash {
+        size_t operator()(const std::vector<uint64_t>& words) const {
+            uint64_t hash = 1469598103934665603ull;
+            for (uint64_t word : words) {
+                hash ^= word;
+                hash *= 1099511628211ull;
+            }
+            return static_cast<size_t>(hash);
+        }
+    };
+    std::vector<SharedBufferUpload> shared_buffers;
+    std::unordered_map<SharedBufferKey, size_t, SharedBufferKeyHash> shared_buffer_indices;
+    std::vector<SharedTextureBinding> shared_texture_bindings;
+    std::unordered_map<TextureBindingKey, size_t, TextureBindingKeyHash>
+        shared_texture_binding_indices;
+    std::unordered_map<std::vector<uint64_t>, VkDescriptorSetLayout, WordVectorHash>
+        shared_descriptor_set_layouts;
+    std::unordered_map<std::vector<uint64_t>, VkPipelineLayout, WordVectorHash>
+        shared_pipeline_layouts;
+    uint64_t resource_unique_tag = 0;
+    const uint32_t zero_buffer_word = 0;
+    auto handle_bits = [](auto handle) {
+        uint64_t bits = 0;
+        static_assert(sizeof(handle) <= sizeof(bits));
+        std::memcpy(&bits, &handle, sizeof(handle));
+        return bits;
+    };
+    auto float_bits = [](float value) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
+    };
     std::vector<DV> dv(draws.size());
     std::vector<SharedTextureUpload> texture_uploads;
     std::unordered_map<TextureUploadKey, size_t, TextureUploadKeyHash> texture_upload_indices;
@@ -1522,6 +1627,44 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         ++pipeline_stats.evictions;
         return true;
     };
+    uint64_t descriptor_sets = 0;
+    uint64_t storage_buffers = 0;
+    uint64_t sampled_images = 0;
+    uint64_t storage_images = 0;
+    for (const BackendDraw& draw : draws) {
+        if (draw.R.empty()) continue;
+        uint32_t set_count = 1;
+        for (const FrameResource& resource : draw.R) {
+            set_count = std::max(set_count, resource.set + 1);
+            if (!resource.is_texture()) {
+                ++storage_buffers;
+            } else if (resource.is_storage_image) {
+                ++storage_images;
+            } else {
+                ++sampled_images;
+            }
+        }
+        descriptor_sets += set_count;
+    }
+    VkDescriptorPool shared_descriptor_pool = VK_NULL_HANDLE;
+    if (descriptor_sets) {
+        VkDescriptorPoolSize sizes[3] = {
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+             static_cast<uint32_t>(std::max<uint64_t>(storage_buffers, 1))},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+             static_cast<uint32_t>(std::max<uint64_t>(sampled_images, 1))},
+            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+             static_cast<uint32_t>(std::max<uint64_t>(storage_images, 1))},
+        };
+        VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pool_info.maxSets = static_cast<uint32_t>(descriptor_sets);
+        pool_info.poolSizeCount = 3;
+        pool_info.pPoolSizes = sizes;
+        if (vkCreateDescriptorPool(dev, &pool_info, nullptr, &shared_descriptor_pool) ==
+            VK_SUCCESS) {
+            resource_reuse_stats.descriptor_pools = 1;
+        }
+    }
     // Pass 1: create each draw's shader modules, descriptors (with texture staging upload), and pipeline.
     const bool backend_trace = getenv("PROSPER_BACKEND_TRACE") != nullptr;
     for (size_t di = 0; di < draws.size(); di++) {
@@ -1701,7 +1844,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         v.use_desc = !R.empty();
         for (auto& r : R) v.n_sets = std::max(v.n_sets, r.set + 1);
         v.dsls.assign(v.n_sets, VK_NULL_HANDLE); v.dsets.assign(v.n_sets, VK_NULL_HANDLE);
-        v.sbuf.assign(R.size(), VK_NULL_HANDLE); v.sbmem.assign(R.size(), VK_NULL_HANDLE);
+        v.sbuf.assign(R.size(), VK_NULL_HANDLE);
         v.texture_upload.assign(R.size(), SIZE_MAX);
         v.tview.assign(R.size(), VK_NULL_HANDLE); v.tsamp.assign(R.size(), VK_NULL_HANDLE);
         if (v.use_desc) {
@@ -1709,12 +1852,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             std::vector<VkDescriptorBufferInfo> dbi(R.size());
             std::vector<VkDescriptorImageInfo> dii(R.size());
             std::vector<VkWriteDescriptorSet> wr(R.size());
-            uint32_t n_storage_buffer = 0, n_sampler = 0, n_storage_image = 0;
             for (size_t i = 0; i < R.size(); i++) {
                 const FrameResource& r = R[i];
                 lb[i] = {}; lb[i].binding = r.binding; lb[i].descriptorCount = 1;
                 if (r.is_texture()) {
-                    if (r.is_storage_image) n_storage_image++; else n_sampler++;
                     lb[i].descriptorType = r.is_storage_image
                         ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
                         : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -1858,7 +1999,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     // Vulkan component mappings do not apply to storage-image accesses.
                     if (!r.is_storage_image && !getenv("PROSPER_NO_SWIZZLE"))
                         tvci.components = {vkswz(r.swizzle[0]), vkswz(r.swizzle[1]), vkswz(r.swizzle[2]), vkswz(r.swizzle[3])};
-                    tvci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}; vkCreateImageView(dev, &tvci, nullptr, &v.tview[i]);
+                    tvci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
                     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
                     // Honor the game's decoded S# (r.mag/min/mip_filter, r.addr_uvw) instead of a fixed
                     // LINEAR/clamp sampler — point-sampled art (pixel-art titles) no longer gets a blurred
@@ -1902,27 +2043,95 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                         default: sci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK; break;
                     }
                     sci.minLod = r.min_lod; sci.maxLod = r.max_lod; sci.mipLodBias = r.lod_bias;
-                    if (!r.is_storage_image) vkCreateSampler(dev, &sci, nullptr, &v.tsamp[i]);
+                    TextureBindingKey binding_key;
+                    binding_key.words = {
+                        handle_bits(upload.image), static_cast<uint64_t>(tvci.viewType),
+                        static_cast<uint64_t>(tvci.format),
+                        static_cast<uint64_t>(tvci.components.r),
+                        static_cast<uint64_t>(tvci.components.g),
+                        static_cast<uint64_t>(tvci.components.b),
+                        static_cast<uint64_t>(tvci.components.a),
+                        static_cast<uint64_t>(r.is_storage_image),
+                        static_cast<uint64_t>(sci.magFilter),
+                        static_cast<uint64_t>(sci.minFilter),
+                        static_cast<uint64_t>(sci.mipmapMode),
+                        static_cast<uint64_t>(sci.addressModeU),
+                        static_cast<uint64_t>(sci.addressModeV),
+                        static_cast<uint64_t>(sci.addressModeW),
+                        static_cast<uint64_t>(sci.borderColor),
+                        static_cast<uint64_t>(float_bits(sci.minLod)),
+                        static_cast<uint64_t>(float_bits(sci.maxLod)),
+                        static_cast<uint64_t>(float_bits(sci.mipLodBias)),
+                        static_cast<uint64_t>(sci.anisotropyEnable),
+                        static_cast<uint64_t>(float_bits(sci.maxAnisotropy)),
+                        0,
+                        share_backend_resources ? 0 : ++resource_unique_tag,
+                    };
+                    ++resource_reuse_stats.texture_binding_references;
+                    size_t binding_index = SIZE_MAX;
+                    auto binding_found = shared_texture_binding_indices.find(binding_key);
+                    if (binding_found != shared_texture_binding_indices.end()) {
+                        binding_index = binding_found->second;
+                    } else {
+                        binding_index = shared_texture_bindings.size();
+                        SharedTextureBinding binding;
+                        vkCreateImageView(dev, &tvci, nullptr, &binding.view);
+                        if (!r.is_storage_image)
+                            vkCreateSampler(dev, &sci, nullptr, &binding.sampler);
+                        shared_texture_bindings.push_back(binding);
+                        shared_texture_binding_indices.emplace(binding_key, binding_index);
+                        ++resource_reuse_stats.unique_texture_bindings;
+                    }
+                    v.tview[i] = shared_texture_bindings[binding_index].view;
+                    v.tsamp[i] = shared_texture_bindings[binding_index].sampler;
                     const VkImageLayout image_layout = r.is_storage_image
                         ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                     dii[i] = {v.tsamp[i], v.tview[i], image_layout};
                     wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr[i].dstBinding = r.binding; wr[i].descriptorCount = 1;
                     wr[i].descriptorType = lb[i].descriptorType; wr[i].pImageInfo = &dii[i];
                 } else {
-                    n_storage_buffer++;
                     lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; lb[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-                    VkDeviceSize sz = r.dwords.empty() ? 4 : (VkDeviceSize)r.dwords.size() * 4;
-                    VkBufferCreateInfo sbci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; sbci.size = sz; sbci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-                    vkCreateBuffer(dev, &sbci, nullptr, &v.sbuf[i]);
-                    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, v.sbuf[i], &mr);
-                    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; mai.allocationSize = mr.size;
-                    mai.memoryTypeIndex = pick(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                    v.sbmem[i] = allocate_transient_render_memory(dev, mai.allocationSize,
-                                                                  mai.memoryTypeIndex);
-                    vkBindBufferMemory(dev, v.sbuf[i], v.sbmem[i], 0);
-                    void* p = nullptr; vkMapMemory(dev, v.sbmem[i], 0, sz, 0, &p);
-                    if (r.dwords.empty()) ((uint32_t*)p)[0] = 0; else std::memcpy(p, r.dwords.data(), r.dwords.size() * 4);
-                    vkUnmapMemory(dev, v.sbmem[i]);
+                    const uint32_t* words = r.dwords.empty() ? &zero_buffer_word : r.dwords.data();
+                    const size_t word_count = r.dwords.empty() ? 1 : r.dwords.size();
+                    uint64_t content_hash = 1469598103934665603ull;
+                    for (size_t word = 0; word < word_count; ++word) {
+                        content_hash ^= words[word];
+                        content_hash *= 1099511628211ull;
+                    }
+                    SharedBufferKey buffer_key{
+                        words, word_count, r.buffer_identity, content_hash,
+                        share_backend_resources && r.buffer_identity ? 0 : ++resource_unique_tag};
+                    ++resource_reuse_stats.buffer_references;
+                    size_t buffer_index = SIZE_MAX;
+                    auto buffer_found = shared_buffer_indices.find(buffer_key);
+                    if (buffer_found != shared_buffer_indices.end()) {
+                        buffer_index = buffer_found->second;
+                    } else {
+                        buffer_index = shared_buffers.size();
+                        SharedBufferUpload upload;
+                        const VkDeviceSize bytes = static_cast<VkDeviceSize>(word_count) * 4;
+                        VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+                        buffer_info.size = bytes;
+                        buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+                        vkCreateBuffer(dev, &buffer_info, nullptr, &upload.buffer);
+                        VkMemoryRequirements requirements;
+                        vkGetBufferMemoryRequirements(dev, upload.buffer, &requirements);
+                        const uint32_t memory_type = pick(
+                            requirements.memoryTypeBits,
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                        upload.memory = allocate_transient_render_memory(
+                            dev, requirements.size, memory_type);
+                        vkBindBufferMemory(dev, upload.buffer, upload.memory, 0);
+                        void* mapped = nullptr;
+                        vkMapMemory(dev, upload.memory, 0, bytes, 0, &mapped);
+                        std::memcpy(mapped, words, static_cast<size_t>(bytes));
+                        vkUnmapMemory(dev, upload.memory);
+                        shared_buffers.push_back(upload);
+                        shared_buffer_indices.emplace(buffer_key, buffer_index);
+                        ++resource_reuse_stats.unique_buffers;
+                    }
+                    v.sbuf[i] = shared_buffers[buffer_index].buffer;
                     dbi[i] = {v.sbuf[i], 0, VK_WHOLE_SIZE};
                     wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr[i].dstBinding = r.binding; wr[i].descriptorCount = 1;
                     wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[i].pBufferInfo = &dbi[i];
@@ -1931,27 +2140,64 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             for (uint32_t s = 0; s < v.n_sets; s++) {
                 std::vector<VkDescriptorSetLayoutBinding> slb;
                 for (size_t i = 0; i < R.size(); i++) if (R[i].set == s) slb.push_back(lb[i]);
-                VkDescriptorSetLayoutCreateInfo dslci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-                dslci.bindingCount = (uint32_t)slb.size(); dslci.pBindings = slb.data();
-                vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &v.dsls[s]);
+                std::sort(slb.begin(), slb.end(), [](const auto& left, const auto& right) {
+                    return left.binding < right.binding;
+                });
+                std::vector<uint64_t> layout_key;
+                layout_key.reserve(1 + slb.size() * 4);
+                layout_key.push_back(share_backend_resources ? 0 : ++resource_unique_tag);
+                for (const auto& binding : slb) {
+                    layout_key.push_back(binding.binding);
+                    layout_key.push_back(binding.descriptorType);
+                    layout_key.push_back(binding.descriptorCount);
+                    layout_key.push_back(binding.stageFlags);
+                }
+                ++resource_reuse_stats.descriptor_set_layout_references;
+                auto layout_found = shared_descriptor_set_layouts.find(layout_key);
+                if (layout_found != shared_descriptor_set_layouts.end()) {
+                    v.dsls[s] = layout_found->second;
+                } else {
+                    VkDescriptorSetLayoutCreateInfo layout_info{
+                        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+                    layout_info.bindingCount = static_cast<uint32_t>(slb.size());
+                    layout_info.pBindings = slb.data();
+                    vkCreateDescriptorSetLayout(dev, &layout_info, nullptr, &v.dsls[s]);
+                    shared_descriptor_set_layouts.emplace(std::move(layout_key), v.dsls[s]);
+                    ++resource_reuse_stats.unique_descriptor_set_layouts;
+                }
             }
-            VkDescriptorPoolSize psz[3] = {
-                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, n_storage_buffer ? n_storage_buffer : 1},
-                {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, n_sampler ? n_sampler : 1},
-                {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, n_storage_image ? n_storage_image : 1}};
-            VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-            dpci.maxSets = v.n_sets; dpci.poolSizeCount = 3; dpci.pPoolSizes = psz; vkCreateDescriptorPool(dev, &dpci, nullptr, &v.dpool);
-            VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-            dsai.descriptorPool = v.dpool; dsai.descriptorSetCount = v.n_sets; dsai.pSetLayouts = v.dsls.data();
-            vkAllocateDescriptorSets(dev, &dsai, v.dsets.data());
-            for (size_t i = 0; i < R.size(); i++) wr[i].dstSet = v.dsets[R[i].set];
-            vkUpdateDescriptorSets(dev, (uint32_t)wr.size(), wr.data(), 0, nullptr);
+            VkDescriptorSetAllocateInfo allocate_info{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            allocate_info.descriptorPool = shared_descriptor_pool;
+            allocate_info.descriptorSetCount = v.n_sets;
+            allocate_info.pSetLayouts = v.dsls.data();
+            vkAllocateDescriptorSets(dev, &allocate_info, v.dsets.data());
+            for (size_t i = 0; i < R.size(); i++)
+                wr[i].dstSet = v.dsets[R[i].set];
+            vkUpdateDescriptorSets(dev, static_cast<uint32_t>(wr.size()), wr.data(), 0, nullptr);
         }
         const auto setup_resources_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         if (timing_enabled) setup_resources_ms += setup_elapsed_ms(setup_fixed_ready, setup_resources_ready);
-        VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        if (v.use_desc) { plci.setLayoutCount = v.n_sets; plci.pSetLayouts = v.dsls.data(); }
-        vkCreatePipelineLayout(dev, &plci, nullptr, &v.layout);
+        std::vector<uint64_t> pipeline_layout_key;
+        pipeline_layout_key.reserve(1 + (v.use_desc ? v.dsls.size() : 0));
+        pipeline_layout_key.push_back(share_backend_resources ? 0 : ++resource_unique_tag);
+        if (v.use_desc)
+            for (VkDescriptorSetLayout layout : v.dsls)
+                pipeline_layout_key.push_back(handle_bits(layout));
+        ++resource_reuse_stats.pipeline_layout_references;
+        auto pipeline_layout_found = shared_pipeline_layouts.find(pipeline_layout_key);
+        if (pipeline_layout_found != shared_pipeline_layouts.end()) {
+            v.layout = pipeline_layout_found->second;
+        } else {
+            VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            if (v.use_desc) {
+                layout_info.setLayoutCount = v.n_sets;
+                layout_info.pSetLayouts = v.dsls.data();
+            }
+            vkCreatePipelineLayout(dev, &layout_info, nullptr, &v.layout);
+            shared_pipeline_layouts.emplace(std::move(pipeline_layout_key), v.layout);
+            ++resource_reuse_stats.unique_pipeline_layouts;
+        }
         VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         gp.stageCount = bd.gs.empty() ? 2u : 3u; gp.pStages = st;
         gp.pVertexInputState = &vin; gp.pInputAssemblyState = &ia;
@@ -2486,20 +2732,25 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     vkDestroyFence(dev, fence, nullptr); vkDestroyCommandPool(dev, pool, nullptr);
     for (auto& v : dv) {   // per-draw objects
         if (v.pipe && !v.pipeline_cached) vkDestroyPipeline(dev, v.pipe, nullptr);
-        if (v.layout) vkDestroyPipelineLayout(dev, v.layout, nullptr);
         if (v.ibuf)   vkDestroyBuffer(dev, v.ibuf, nullptr);
         if (v.ibmem)  release_transient_render_memory(dev, v.ibmem);
         if (v.vs)     vkDestroyShaderModule(dev, v.vs, nullptr);
         if (v.gs)     vkDestroyShaderModule(dev, v.gs, nullptr);
         if (v.fs)     vkDestroyShaderModule(dev, v.fs, nullptr);
-        if (v.dpool)  vkDestroyDescriptorPool(dev, v.dpool, nullptr);
-        for (auto d : v.dsls) if (d) vkDestroyDescriptorSetLayout(dev, d, nullptr);
-        for (size_t i = 0; i < v.R.size(); i++) {
-            if (v.sbuf[i])     vkDestroyBuffer(dev, v.sbuf[i], nullptr);
-            if (v.sbmem[i])    release_transient_render_memory(dev, v.sbmem[i]);
-            if (v.tsamp[i])    vkDestroySampler(dev, v.tsamp[i], nullptr);
-            if (v.tview[i])    vkDestroyImageView(dev, v.tview[i], nullptr);
-        }
+    }
+    if (shared_descriptor_pool)
+        vkDestroyDescriptorPool(dev, shared_descriptor_pool, nullptr);
+    for (const auto& [key, layout] : shared_pipeline_layouts)
+        if (layout) vkDestroyPipelineLayout(dev, layout, nullptr);
+    for (const auto& [key, layout] : shared_descriptor_set_layouts)
+        if (layout) vkDestroyDescriptorSetLayout(dev, layout, nullptr);
+    for (const SharedTextureBinding& binding : shared_texture_bindings) {
+        if (binding.sampler) vkDestroySampler(dev, binding.sampler, nullptr);
+        if (binding.view) vkDestroyImageView(dev, binding.view, nullptr);
+    }
+    for (const SharedBufferUpload& upload : shared_buffers) {
+        if (upload.buffer) vkDestroyBuffer(dev, upload.buffer, nullptr);
+        if (upload.memory) release_transient_render_memory(dev, upload.memory);
     }
     auto evict_persistent_texture = [&]() {
         auto victim = persistent_texture_images.end();
