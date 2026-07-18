@@ -1405,6 +1405,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         std::vector<VkImageView> tview; std::vector<VkSampler> tsamp;
         VkPipelineLayout layout = VK_NULL_HANDLE; VkPipeline pipe = VK_NULL_HANDLE;
         VkBuffer ibuf = VK_NULL_HANDLE; VkDeviceMemory ibmem = VK_NULL_HANDLE;   // index buffer (indexed draws)
+        VkRect2D scissor{};
         uint32_t n_sets = 1, vcount = 3, icount = 0;
         bool use_desc = false, ok = false, pipeline_cached = false;
     };
@@ -1537,6 +1538,16 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         const auto setup_shaders_ready = setup_begin;
         const prosper::gpu::ResolvedPipelineState* ps = bd.ps;
         v.vcount = bd.vcount;
+        v.scissor = {{0, 0}, {W, H}};
+        if (ps && ps->has_scissor) {
+            const int64_t left = std::clamp<int64_t>(ps->scissor_left, 0, W);
+            const int64_t top = std::clamp<int64_t>(ps->scissor_top, 0, H);
+            const int64_t right = std::clamp<int64_t>(ps->scissor_right, left, W);
+            const int64_t bottom = std::clamp<int64_t>(ps->scissor_bottom, top, H);
+            v.scissor.offset = {static_cast<int32_t>(left), static_cast<int32_t>(top)};
+            v.scissor.extent = {static_cast<uint32_t>(right - left),
+                                static_cast<uint32_t>(bottom - top)};
+        }
         // Indexed draw: upload the 32-bit index data to a host-visible VkIndexBuffer now; the record
         // pass binds it and issues vkCmdDrawIndexed instead of vkCmdDraw.
         if (!bd.indices.empty()) {
@@ -1574,6 +1585,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             vp = {ps->viewport_x, ps->viewport_y, ps->viewport_w, ps->viewport_h, ps->min_depth, ps->max_depth};
         VkPipelineViewportStateCreateInfo vpst{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
         vpst.viewportCount = 1; vpst.pViewports = &vp; vpst.scissorCount = 1; vpst.pScissors = &sc;
+        const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynamic_state{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dynamic_state.dynamicStateCount = 1; dynamic_state.pDynamicStates = dynamic_states;
         VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
         rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
         // Honor the guest's PA_SU_SC_MODE_CNTL cull/front-face/polygon mode (#456). Resolve encodes these
@@ -1929,7 +1943,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         gp.stageCount = 2; gp.pStages = st; gp.pVertexInputState = &vin; gp.pInputAssemblyState = &ia;
         gp.pViewportState = &vpst; gp.pRasterizationState = &rs; gp.pMultisampleState = &ms;
-        gp.pColorBlendState = &cb; gp.layout = v.layout; gp.renderPass = rp; gp.subpass = 0;
+        gp.pColorBlendState = &cb; gp.pDynamicState = &dynamic_state;
+        gp.layout = v.layout; gp.renderPass = rp; gp.subpass = 0;
         if (ps && (ps->depth_test_enable || ps->stencil_enable)) gp.pDepthStencilState = &dss;
         ++pipeline_stats.references;
         bool create_pipeline = true;
@@ -1950,7 +1965,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 memcpy(&word, &value, sizeof word);
                 append(word);
             };
-            append(3); // key schema version
+            append(4); // key schema version (scissor is dynamic per draw)
             append(W); append(H); append(color_count); append(static_cast<uint32_t>(FMT));
             append(static_cast<uint32_t>(FMT1)); append(use_ds); append(static_cast<uint32_t>(DFMT));
             const bool exact_shader_identities = bd.vs_identity && bd.fs_identity;
@@ -1993,8 +2008,6 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             append(ia.topology); append(ia.primitiveRestartEnable);
             append_float(vp.x); append_float(vp.y); append_float(vp.width); append_float(vp.height);
             append_float(vp.minDepth); append_float(vp.maxDepth);
-            append(static_cast<uint32_t>(sc.offset.x)); append(static_cast<uint32_t>(sc.offset.y));
-            append(sc.extent.width); append(sc.extent.height);
             append(rs.polygonMode); append(rs.cullMode); append(rs.frontFace); append_float(rs.lineWidth);
             for (uint32_t attachment = 0; attachment < color_count; ++attachment) {
                 append(cba[attachment].blendEnable); append(cba[attachment].srcColorBlendFactor);
@@ -2273,11 +2286,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             if (ps->stencil_clear_enable && format_has_stencil)
                 dsc.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
             dsc.clearValue.depthStencil = {ps->depth_clear_value, ps->stencil_clear_value};
-            VkClearRect rect{{{0, 0}, {W, H}}, 0, 1};
+            VkClearRect rect{v.scissor, 0, 1};
             if (dsc.aspectMask) vkCmdClearAttachments(cmd, 1, &dsc, 1, &rect);
         }
         if (!v.ok) continue;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
+        vkCmdSetScissor(cmd, 0, 1, &v.scissor);
         if (v.use_desc) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
         if (v.icount) {
             vkCmdBindIndexBuffer(cmd, v.ibuf, 0, VK_INDEX_TYPE_UINT32);

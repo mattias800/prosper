@@ -137,6 +137,13 @@ struct RenderState {
     float vport_xscale = 0, vport_xoffset = 0;
     float vport_yscale = 0, vport_yoffset = 0;
     float vport_zscale = 0, vport_zoffset = 0;
+
+    // Effective guest scissor after intersecting screen, window, generic, and (when enabled)
+    // viewport scissors. Coordinates follow the hardware convention: left/top inclusive and
+    // right/bottom exclusive. `has_scissor` is false only when none of the relevant registers was
+    // programmed, preserving the backend's full-target default for synthetic/legacy state.
+    bool has_scissor = false;
+    int32_t scissor_left = 0, scissor_top = 0, scissor_right = 0, scissor_bottom = 0;
 };
 
 // Extract the render-state from a folded GpuState (pure; reads register files only).
@@ -232,6 +239,11 @@ struct ResolvedPipelineState {
     uint32_t src_color_blend_factor1 = 0, dst_color_blend_factor1 = 0, color_blend_op1 = 0;
     uint32_t src_alpha_blend_factor1 = 0, dst_alpha_blend_factor1 = 0, alpha_blend_op1 = 0;
     uint32_t color1_write_mask = 0; // MRT1 nibble of CB_TARGET_MASK
+
+    // Effective guest scissor in framebuffer coordinates. Appended so legacy capture prefixes and
+    // aggregate initializers retain their existing layout/default behavior.
+    bool has_scissor = false;
+    int32_t scissor_left = 0, scissor_top = 0, scissor_right = 0, scissor_bottom = 0;
 };
 
 // A color-disabled draw must still execute when it can change the depth/stencil attachment consumed
@@ -248,5 +260,9 @@ inline bool has_depth_stencil_side_effect(const ResolvedPipelineState& ps) {
 
 // Translate a RenderState's RDNA2 register semantics into Vulkan-ready pipeline state (pure).
 ResolvedPipelineState resolve_pipeline_state(const RenderState& rs);
+
+// Apply the renderer's reduced-resolution scale to both viewport and scissor state. Scissor outer
+// bounds round outward so resolution scaling never discards a guest-covered sample.
+void scale_resolved_render_area(ResolvedPipelineState& ps, float scale_x, float scale_y);
 
 } // namespace prosper::gpu

@@ -37,7 +37,7 @@ namespace prosper::gpu {
 namespace {
 
 constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
-constexpr uint32_t kVersion = 16;
+constexpr uint32_t kVersion = 17;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -233,6 +233,27 @@ bool read_mrt1_pipeline(Reader& r, ResolvedPipelineState& p) {
            r.u32(p.color_blend_op1) && r.u32(p.src_alpha_blend_factor1) &&
            r.u32(p.dst_alpha_blend_factor1) && r.u32(p.alpha_blend_op1) &&
            r.u32(p.color1_write_mask);
+}
+
+void write_scissor_pipeline(Writer& w, const ResolvedPipelineState& p) {
+    w.u8(p.has_scissor);
+    w.u32(std::bit_cast<uint32_t>(p.scissor_left));
+    w.u32(std::bit_cast<uint32_t>(p.scissor_top));
+    w.u32(std::bit_cast<uint32_t>(p.scissor_right));
+    w.u32(std::bit_cast<uint32_t>(p.scissor_bottom));
+}
+
+bool read_scissor_pipeline(Reader& r, ResolvedPipelineState& p) {
+    uint8_t enabled = 0;
+    uint32_t left = 0, top = 0, right = 0, bottom = 0;
+    if (!r.u8(enabled) || enabled > 1 || !r.u32(left) || !r.u32(top) ||
+        !r.u32(right) || !r.u32(bottom)) return false;
+    p.has_scissor = enabled != 0;
+    p.scissor_left = std::bit_cast<int32_t>(left);
+    p.scissor_top = std::bit_cast<int32_t>(top);
+    p.scissor_right = std::bit_cast<int32_t>(right);
+    p.scissor_bottom = std::bit_cast<int32_t>(bottom);
+    return true;
 }
 
 void write_resource(Writer& w, const GpuCapturedResource& c) {
@@ -1346,6 +1367,14 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     for (size_t compute_index = 0; compute_index < c.computes.size(); ++compute_index)
         if (!write_mip_tail(c.computes[compute_index].resources, "compute", compute_index))
             return false;
+    // v17 appends the effective guest scissor for each realized/failed draw pipeline. Keeping this
+    // state in a deterministic tail preserves the byte-exact v1-v16 pipeline prefix and lets old
+    // captures materialize with the historical full-target default.
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws) write_scissor_pipeline(w, draw.ps);
+    w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
+    for (const auto& diagnostic : c.failure_diagnostics)
+        if (diagnostic.pipeline_present) write_scissor_pipeline(w, diagnostic.pipeline);
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -1799,6 +1828,21 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             if (!read_mip_tail(draw.vrt) || !read_mip_tail(draw.prt)) return false;
         for (auto& compute : c.computes)
             if (!read_mip_tail(compute.resources)) return false;
+    }
+    if (version >= 17) {
+        uint32_t draw_count = 0;
+        if (!r.u32(draw_count) || draw_count != c.draws.size()) {
+            error = "invalid scissor draw-state count"; return false;
+        }
+        for (auto& draw : c.draws)
+            if (!read_scissor_pipeline(r, draw.ps)) return false;
+        uint32_t failure_count = 0;
+        if (!r.u32(failure_count) || failure_count != c.failure_diagnostics.size()) {
+            error = "invalid scissor failure-state count"; return false;
+        }
+        for (auto& diagnostic : c.failure_diagnostics)
+            if (diagnostic.pipeline_present && !read_scissor_pipeline(r, diagnostic.pipeline))
+                return false;
     }
     if (r.left) { error = "capture has trailing data"; return false; }
     return true;

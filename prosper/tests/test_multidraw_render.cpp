@@ -124,6 +124,40 @@ int main() {
               "pipeline-cache disable A/B bypasses every lookup");
     }
 
+    // #531: a guest scissor must constrain a color-disabled stencil writer. The following full-target
+    // reader shades only where stencil==2, proving both the dynamic draw scissor and its exclusive
+    // right/bottom edges affect the depth/stencil attachment rather than only color output.
+    {
+        ResolvedPipelineState writer = opaque;
+        writer.color_write_mask = 0;
+        writer.has_scissor = true;
+        writer.scissor_left = 16; writer.scissor_top = 12;
+        writer.scissor_right = 48; writer.scissor_bottom = 44;
+        writer.stencil_enable = true;
+        writer.stencil_compare_op[0] = writer.stencil_compare_op[1] = 7; // ALWAYS
+        writer.stencil_pass_op[0] = writer.stencil_pass_op[1] = 2;       // REPLACE
+        writer.stencil_op_val[0] = writer.stencil_op_val[1] = 2;
+        writer.stencil_write_mask[0] = writer.stencil_write_mask[1] = 0xff;
+
+        ResolvedPipelineState reader = opaque;
+        reader.stencil_enable = true;
+        reader.stencil_compare_op[0] = reader.stencil_compare_op[1] = 2; // EQUAL
+        reader.stencil_ref[0] = reader.stencil_ref[1] = 2;
+        reader.stencil_compare_mask[0] = reader.stencil_compare_mask[1] = 0xff;
+
+        prosper::test::BackendDraw w; w.vs = vs; w.fs = red; w.ps = &writer; w.vcount = 3;
+        prosper::test::BackendDraw r; r.vs = vs; r.fs = green; r.ps = &reader; r.vcount = 3;
+        const std::vector<uint8_t> px = prosper::test::render_draws_rgba({w, r}, W, H);
+        auto green_at = [&](uint32_t x, uint32_t y) {
+            const uint8_t* p = px.empty() ? nullptr : &px[((size_t)y * W + x) * 4];
+            return p && p[1] > 0xC0 && p[0] < 0x40 && p[2] < 0x40;
+        };
+        CHECK(green_at(16, 12) && green_at(47, 43),
+              "scissored stencil writer includes its left/top and last interior samples");
+        CHECK(!green_at(15, 12) && !green_at(48, 12) && !green_at(16, 44),
+              "scissored stencil writer excludes outside and right/bottom boundary samples");
+    }
+
     // A guest depth/stencil surface survives renderer calls. The first call writes stencil=2 with no
     // color; the second call LOADs the same guest-identified attachment and an EQUAL-2 draw turns green.
     // A different identity starts cleared and fails, while an explicit clear on the persisted identity
