@@ -9,6 +9,7 @@
 #ifdef _WIN32
 #include "../src/host/exec_image.hpp"
 #include "../src/host/guest_memory_map.hpp"
+#include "../src/host/guest_write_watch.hpp"
 #include "../src/gpu/gpu_execute.hpp"
 #include <windows.h>
 extern "C" int prosper_try_commit_dmem(uint64_t addr, uint64_t len, int write);
@@ -43,6 +44,7 @@ int main() {
     // granularity span. The latter crosses this reservation and fails with ERROR_INVALID_ADDRESS.
     register_builtin_hle();
     auto reserve = Hle::lookup(nid_hash("sceKernelReserveVirtualRange"));
+    auto flexible = Hle::lookup(nid_hash("sceKernelMapNamedFlexibleMemory"));
     auto unmap   = Hle::lookup(nid_hash("sceKernelMunmap"));
     auto alloc   = Hle::lookup(nid_hash("sceKernelAllocateDirectMemory"));
     auto alloc_main = Hle::lookup(nid_hash("sceKernelAllocateMainDirectMemory"));
@@ -52,9 +54,11 @@ int main() {
     auto protect = Hle::lookup(nid_hash("sceKernelMprotect"));
     auto release = Hle::lookup(nid_hash("sceKernelReleaseDirectMemory"));
     auto query   = Hle::lookup(nid_hash("sceKernelVirtualQuery"));
+    auto batch   = Hle::lookup(nid_hash("sceKernelBatchMap"));
     CHECK(nid_hash("sceKernelMapDirectMemory2") == "BQQniolj9tQ",
           "sceKernelMapDirectMemory2 hashes to the PS5 3.20 import NID");
-    CHECK(reserve && unmap && alloc && alloc_main && map && map2 && protect && release && query,
+    CHECK(reserve && flexible && unmap && alloc && alloc_main && map && map2 && protect &&
+              release && query && batch,
           "memory HLE functions registered");
     if (fails) return 1;
 
@@ -69,6 +73,80 @@ int main() {
     *cell = 0x6310CAFEu;
     CHECK(*cell == 0x6310CAFEu, "first touch commits one guest page and preserves the write");
     CHECK(unmap(va, len, 0, 0, 0, 0) == 0, "reserved page unmaps cleanly");
+
+    // Placeholder-backed flexible memory must retain the old VirtualAlloc partial-unmap
+    // semantics: decommit only the requested guest page, preserve neighboring data, and allow
+    // the hole to be committed again in place.
+    constexpr uint64_t flexible_len = 0x10000;
+    uint64_t flexible_base = 0;
+    CHECK(reserve((uint64_t)(uintptr_t)&flexible_base, flexible_len, 0, 0x4000, 0, 0) == 0 &&
+              flexible_base,
+          "reserve a multi-page placeholder-backed flexible range");
+    uint64_t flexible_full = flexible_base;
+    const bool flexible_full_mapped = flexible_base &&
+        flexible((uint64_t)(uintptr_t)&flexible_full, flexible_len, 0x2, 0,
+                 (uint64_t)(uintptr_t)"partial-flexible", 0) == 0 &&
+        flexible_full == flexible_base;
+    CHECK(flexible_full_mapped,
+          "commit the full placeholder-backed flexible range");
+    if (flexible_full_mapped) {
+        *(volatile uint64_t*)(uintptr_t)(flexible_base + 0x0100) = 0x1111aaaabbbb2222ull;
+        *(volatile uint64_t*)(uintptr_t)(flexible_base + 0x4100) = 0x3333ccccdddd4444ull;
+        *(volatile uint64_t*)(uintptr_t)(flexible_base + 0xc100) = 0x5555eeeeffff6666ull;
+        CHECK(unmap(flexible_base + 0x4000, 0x4000, 0, 0, 0, 0) == 0,
+              "partial unmap decommits one page of a placeholder-backed flexible mapping");
+        MEMORY_BASIC_INFORMATION flexible_hole_info{}, flexible_prefix_info{},
+                                 flexible_suffix_info{};
+        VirtualQuery((void*)(uintptr_t)(flexible_base + 0x4000), &flexible_hole_info,
+                     sizeof(flexible_hole_info));
+        VirtualQuery((void*)(uintptr_t)flexible_base, &flexible_prefix_info,
+                     sizeof(flexible_prefix_info));
+        VirtualQuery((void*)(uintptr_t)(flexible_base + 0xc000), &flexible_suffix_info,
+                     sizeof(flexible_suffix_info));
+        CHECK(flexible_hole_info.State == MEM_RESERVE &&
+                  flexible_prefix_info.State == MEM_COMMIT &&
+                  flexible_suffix_info.State == MEM_COMMIT,
+              "partial flexible unmap preserves committed prefix and suffix pages");
+        CHECK(*(volatile uint64_t*)(uintptr_t)(flexible_base + 0x0100) ==
+                  0x1111aaaabbbb2222ull &&
+              *(volatile uint64_t*)(uintptr_t)(flexible_base + 0xc100) ==
+                  0x5555eeeeffff6666ull,
+              "partial flexible unmap preserves neighboring contents");
+        auto flexible_prefix_watch = host::GuestWriteWatch::create(flexible_base, 0x4000);
+        auto flexible_suffix_watch = host::GuestWriteWatch::create(
+            flexible_base + 0xc000, 0x4000);
+        CHECK(flexible_prefix_watch && flexible_suffix_watch &&
+                  flexible_prefix_watch.query() == host::GuestWriteWatchQuery::Unchanged &&
+                  flexible_suffix_watch.query() == host::GuestWriteWatchQuery::Unchanged,
+              "partial flexible unmap rebuilds retained write-watch aliases");
+        uint64_t flexible_hole = flexible_base + 0x4000;
+        const bool flexible_hole_mapped =
+            flexible((uint64_t)(uintptr_t)&flexible_hole, 0x4000, 0x2, 0,
+                     (uint64_t)(uintptr_t)"partial-flexible-hole", 0) == 0 &&
+            flexible_hole == flexible_base + 0x4000;
+        CHECK(flexible_hole_mapped,
+              "MapFlexible recommits the decommitted private page in place");
+        if (flexible_hole_mapped) {
+            *(volatile uint64_t*)(uintptr_t)(flexible_hole + 0x100) =
+                0x7777000011118888ull;
+            CHECK(*(volatile uint64_t*)(uintptr_t)(flexible_hole + 0x100) ==
+                      0x7777000011118888ull,
+                  "recommitted flexible page is writable");
+        }
+        CHECK(unmap(flexible_base, flexible_len, 0, 0, 0, 0) == 0,
+              "partially unmapped flexible allocation releases cleanly as one range");
+    } else if (flexible_base) {
+        unmap(flexible_base, flexible_len, 0, 0, 0, 0);
+    }
+
+    alignas(8) uint8_t invalid_unmap[0x20]{};
+    *(uint64_t*)(invalid_unmap + 0x00) = 0x30000020000ull;
+    *(uint64_t*)(invalid_unmap + 0x10) = len;
+    *(int32_t*)(invalid_unmap + 0x1c) = 1; // UNMAP
+    int32_t batch_done = -1;
+    CHECK(batch((uint64_t)(uintptr_t)invalid_unmap, 1,
+                (uint64_t)(uintptr_t)&batch_done, 0, 0, 0) != 0 && batch_done == 0,
+          "BatchMap reports an invalid host unmap instead of counting it as complete");
 
     // Direct memory is one physical pool, not private memory per virtual mapping. Dead Cells
     // releases and reuses small physical ranges aggressively; independent Windows allocations
@@ -201,20 +279,178 @@ int main() {
                   (writable_after.Protect & 0xff) == PAGE_READWRITE,
               "mprotect updates an existing sparse host page");
     }
-    CHECK(map((uint64_t)(uintptr_t)&sparse_va2, sparse_len, 0x2, 0,
+    CHECK(map((uint64_t)(uintptr_t)&sparse_va2, sparse_len, 0x1, 0,
               sparse_phys, sparse_align) == 0 && sparse_va2 && sparse_va2 != sparse_va1,
-          "map a second sparse view of the same physical range");
+          "map a second read-only sparse view of the same physical range");
     if (sparse_va1 && sparse_va2) {
         *(volatile uint64_t*)(uintptr_t)(sparse_va1 + 0x5120) = 0x5A17C0DE6310CAFEull;
         CHECK(*(volatile uint64_t*)(uintptr_t)(sparse_va2 + 0x5120) ==
                   0x5A17C0DE6310CAFEull,
               "sparse views retain physical alias coherence");
+
+        constexpr uint64_t late_commit_offset = 0x01800000;
+        MEMORY_BASIC_INFORMATION late_rw_before{}, late_ro_before{};
+        VirtualQuery((void*)(uintptr_t)(sparse_va1 + late_commit_offset),
+                     &late_rw_before, sizeof(late_rw_before));
+        VirtualQuery((void*)(uintptr_t)(sparse_va2 + late_commit_offset),
+                     &late_ro_before, sizeof(late_ro_before));
+        CHECK(late_rw_before.State == MEM_RESERVE && late_ro_before.State == MEM_RESERVE,
+              "inverse-order alias test starts with the physical page untouched");
+        *(volatile uint64_t*)(uintptr_t)(sparse_va1 + late_commit_offset + 0x120) =
+            0x1a7ec0de6310cafeull;
+        MEMORY_BASIC_INFORMATION late_ro_after{};
+        VirtualQuery((void*)(uintptr_t)(sparse_va2 + late_commit_offset),
+                     &late_ro_after, sizeof(late_ro_after));
+        CHECK(late_ro_after.State == MEM_COMMIT &&
+                  (late_ro_after.Protect & 0xff) == PAGE_READONLY,
+              "late physical commit reapplies the untouched alias's read-only protection");
+        CHECK(*(volatile uint64_t*)(uintptr_t)(sparse_va2 + late_commit_offset + 0x120) ==
+                  0x1a7ec0de6310cafeull,
+              "late-committed read-only alias remains physically coherent");
     }
     if (sparse_va1) CHECK(unmap(sparse_va1, sparse_len, 0, 0, 0, 0) == 0,
                           "unmap first sparse direct-memory view");
     if (sparse_va2) CHECK(unmap(sparse_va2, sparse_len, 0, 0, 0, 0) == 0,
                           "unmap second sparse direct-memory view");
     if (sparse_phys) release(sparse_phys, sparse_len, 0, 0, 0, 0);
+
+    // MapViewOfFileEx requires the virtual base and physical offset to have the same 64 KiB
+    // remainder. Placeholder replacement is page-granular, so an exact 16 KiB fixed mapping with
+    // incompatible remainders must still be a real shared section view. Partially unmapping its
+    // middle page must preserve both neighboring aliases and permit an exact remap of the hole.
+    constexpr uint64_t fixed_len = 0x10000;
+    constexpr uint64_t fixed_base = 0x30000104000ull; // 16 KiB into a free 64 KiB host granule
+    constexpr uint64_t readonly_base = 0x30000304000ull;
+    uint64_t fixed_phys = 0, fixed_va = fixed_base, fixed_alias = 0;
+    uint64_t readonly_va = readonly_base;
+    bool fixed_mapped = false, hole_remapped = false;
+    CHECK(alloc(0, kEnd, fixed_len, 0x4000, 0,
+                (uint64_t)(uintptr_t)&fixed_phys) == 0 && fixed_phys,
+          "allocate physical range for incompatible fixed mapping");
+    CHECK(reserve((uint64_t)(uintptr_t)&fixed_va, fixed_len,
+                  0x10 /* SCE_KERNEL_MAP_FIXED */, 0x4000, 0, 0) == 0 &&
+              fixed_va == fixed_base,
+          "reserve the exact range used by a fixed direct mapping");
+    fixed_mapped = map((uint64_t)(uintptr_t)&fixed_va, fixed_len, 0x2,
+                       0x10 /* SCE_KERNEL_MAP_FIXED */, fixed_phys, 0x4000) == 0 &&
+                   fixed_va == fixed_base;
+    CHECK(fixed_mapped,
+          "fixed direct mapping replaces its own reservation at 16 KiB granularity");
+    CHECK(map((uint64_t)(uintptr_t)&fixed_alias, fixed_len, 0x2, 0,
+              fixed_phys, 0x4000) == 0 && fixed_alias,
+          "map ordinary alias for incompatible fixed view");
+    if (fixed_mapped && fixed_alias) {
+        *(volatile uint64_t*)(uintptr_t)(fixed_va + 0x0100) = 0x1111222233334444ull;
+        *(volatile uint64_t*)(uintptr_t)(fixed_va + 0x4100) = 0x5555666677778888ull;
+        *(volatile uint64_t*)(uintptr_t)(fixed_va + 0xc100) = 0x9999aaaabbbbccccull;
+        CHECK(*(volatile uint64_t*)(uintptr_t)(fixed_alias + 0x0100) ==
+                  0x1111222233334444ull &&
+              *(volatile uint64_t*)(uintptr_t)(fixed_alias + 0x4100) ==
+                  0x5555666677778888ull &&
+              *(volatile uint64_t*)(uintptr_t)(fixed_alias + 0xc100) ==
+                  0x9999aaaabbbbccccull,
+              "incompatible fixed view preserves physical alias coherence");
+
+        CHECK(reserve((uint64_t)(uintptr_t)&readonly_va, fixed_len,
+                      0x10 /* SCE_KERNEL_MAP_FIXED */, 0x4000, 0, 0) == 0 &&
+                  readonly_va == readonly_base,
+              "reserve an exact range for a read-only physical alias");
+        const bool readonly_mapped =
+            map((uint64_t)(uintptr_t)&readonly_va, fixed_len, 0x1,
+                0x10 /* SCE_KERNEL_MAP_FIXED */, fixed_phys, 0x4000) == 0 &&
+            readonly_va == readonly_base;
+        CHECK(readonly_mapped,
+              "map a fixed read-only alias after the physical pages are committed");
+        if (readonly_mapped) {
+            MEMORY_BASIC_INFORMATION readonly_info{};
+            VirtualQuery((void*)(uintptr_t)readonly_va, &readonly_info,
+                         sizeof(readonly_info));
+            CHECK(readonly_info.State == MEM_COMMIT &&
+                      (readonly_info.Protect & 0xff) == PAGE_READONLY,
+                  "new sparse alias applies its requested protection to existing pages");
+            CHECK(*(volatile uint64_t*)(uintptr_t)(readonly_va + 0x4100) ==
+                      0x5555666677778888ull,
+                  "read-only fixed alias sees the precommitted physical contents");
+            CHECK(unmap(readonly_va, fixed_len, 0, 0, 0, 0) == 0,
+                  "unmap the fixed read-only alias");
+            readonly_va = 0;
+        }
+
+        CHECK((uint32_t)unmap(fixed_va + 0x4000, 0x4001, 0, 0, 0, 0) == 0x80020016u,
+              "invalid partial unmap fails after restoring the original shared view");
+        CHECK(*(volatile uint64_t*)(uintptr_t)(fixed_va + 0x0100) ==
+                  0x1111222233334444ull &&
+              *(volatile uint64_t*)(uintptr_t)(fixed_va + 0x4100) ==
+                  0x5555666677778888ull &&
+              *(volatile uint64_t*)(uintptr_t)(fixed_alias + 0xc100) ==
+                  0x9999aaaabbbbccccull,
+              "failed partial-unmap transaction preserves data and physical aliases");
+
+        CHECK(protect(fixed_va, 0x4000, 0x1, 0, 0, 0) == 0,
+              "make fixed-view prefix read-only before partial unmap");
+
+        const uint64_t hole = fixed_va + 0x4000;
+        CHECK(unmap(hole, 0x4000, 0, 0, 0, 0) == 0,
+              "partial unmap removes one page from a shared section view");
+        MEMORY_BASIC_INFORMATION hole_info{};
+        VirtualQuery((void*)(uintptr_t)hole, &hole_info, sizeof(hole_info));
+        CHECK(hole_info.State == MEM_RESERVE &&
+                  !prosper_try_commit_dmem(hole, 0x4000, 0),
+              "partially unmapped page is an inaccessible, untracked placeholder");
+        MEMORY_BASIC_INFORMATION prefix_info{};
+        VirtualQuery((void*)(uintptr_t)fixed_va, &prefix_info, sizeof(prefix_info));
+        CHECK(prefix_info.State == MEM_COMMIT &&
+                  (prefix_info.Protect & 0xff) == PAGE_READONLY,
+              "partial unmap preserves the retained prefix protection");
+        CHECK(*(volatile uint64_t*)(uintptr_t)(fixed_va + 0x0100) ==
+                  0x1111222233334444ull &&
+              *(volatile uint64_t*)(uintptr_t)(fixed_va + 0xc100) ==
+                  0x9999aaaabbbbccccull,
+              "partial unmap preserves the prefix and suffix views");
+
+        uint64_t flexible_hole = hole;
+        const bool flexible_mapped =
+            flexible((uint64_t)(uintptr_t)&flexible_hole, 0x4000, 0x2, 0,
+                     (uint64_t)(uintptr_t)"placeholder-hole", 0) == 0 &&
+            flexible_hole == hole;
+        CHECK(flexible_mapped,
+              "flexible memory replaces a 16 KiB hole left by partial direct unmap");
+        if (flexible_mapped) {
+            *(volatile uint64_t*)(uintptr_t)(flexible_hole + 0x100) =
+                0xf1e81b1ecafebeefull;
+            CHECK(*(volatile uint64_t*)(uintptr_t)(fixed_alias + 0x4100) ==
+                      0x5555666677778888ull,
+                  "private reuse of the hole does not overwrite its physical page");
+            CHECK(unmap(flexible_hole, 0x4000, 0, 0, 0, 0) == 0,
+                  "flexible hole returns to an exact replaceable placeholder");
+        }
+
+        uint64_t remapped_hole = hole;
+        hole_remapped = map((uint64_t)(uintptr_t)&remapped_hole, 0x4000, 0x2,
+                            0x10 /* SCE_KERNEL_MAP_FIXED */,
+                            fixed_phys + 0x4000, 0x4000) == 0 &&
+                        remapped_hole == hole;
+        CHECK(hole_remapped,
+              "fixed direct mapping replaces the exact 16 KiB placeholder hole");
+        if (hole_remapped) {
+            CHECK(*(volatile uint64_t*)(uintptr_t)(remapped_hole + 0x100) ==
+                      0x5555666677778888ull,
+                  "partial unmap/remap retains the physical page contents");
+            *(volatile uint64_t*)(uintptr_t)(remapped_hole + 0x100) =
+                0xd00df00dcafef00dull;
+            CHECK(*(volatile uint64_t*)(uintptr_t)(fixed_alias + 0x4100) ==
+                      0xd00df00dcafef00dull,
+                  "remapped placeholder hole remains coherent with its physical alias");
+        }
+    }
+    if (fixed_mapped)
+        CHECK(unmap(fixed_va, fixed_len, 0, 0, 0, 0) == 0,
+              "split fixed mapping unmaps cleanly as one guest range");
+    if (fixed_alias) CHECK(unmap(fixed_alias, fixed_len, 0, 0, 0, 0) == 0,
+                           "unmap incompatible-view alias");
+    if (readonly_va) CHECK(unmap(readonly_va, fixed_len, 0, 0, 0, 0) == 0,
+                           "clean up reserved read-only alias range");
+    if (fixed_phys) release(fixed_phys, fixed_len, 0, 0, 0, 0);
 
     if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }
     printf("== PASS ==\n");

@@ -830,6 +830,7 @@ namespace {
     // 0 = untracked/gap, 1 = reserved, 2 = committed, 3 = sparse direct-memory page.
     extern "C" int prosper_reserved_range_state(uint64_t addr);
     extern "C" int prosper_try_commit_dmem(uint64_t addr, uint64_t len, int write);
+    extern "C" int prosper_try_commit_reserved_placeholder(uint64_t addr, uint64_t len);
 
     LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
         CONTEXT* c = ep->ContextRecord;
@@ -928,7 +929,9 @@ namespace {
                 return EXCEPTION_CONTINUE_EXECUTION;
             if (a >= 0x1000000000ull && prosper_reserved_range_state(a) == 1) {
                 void* page = (void*)(uintptr_t)(a & ~(uint64_t)0x3fff);
-                if (VirtualAlloc(page, 0x4000, MEM_COMMIT, PAGE_READWRITE))
+                if (prosper_try_commit_reserved_placeholder(
+                        (uint64_t)(uintptr_t)page, 0x4000) ||
+                    VirtualAlloc(page, 0x4000, MEM_COMMIT, PAGE_READWRITE))
                     return EXCEPTION_CONTINUE_EXECUTION;   // re-execute against the now-committed page
             }
         }

@@ -52,6 +52,7 @@ namespace prosper {
 #ifdef _WIN32
 extern "C" int prosper_reserved_range_state(uint64_t addr);
 extern "C" int prosper_try_commit_dmem(uint64_t addr, uint64_t len, int write);
+extern "C" int prosper_try_commit_reserved_placeholder(uint64_t addr, uint64_t len);
 #endif
 
 #define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
@@ -81,7 +82,9 @@ namespace {
             if (!VirtualQuery((const void*)(uintptr_t)p, &mbi, sizeof mbi)) return p - dst;
             if (mbi.State == MEM_RESERVE && prosper_reserved_range_state(p) == 1) {
                 const uint64_t page = p & ~uint64_t{0x3fff};
-                if (!VirtualAlloc((void*)(uintptr_t)page, 0x4000, MEM_COMMIT, PAGE_READWRITE))
+                if (!prosper_try_commit_reserved_placeholder(page, 0x4000) &&
+                    !VirtualAlloc((void*)(uintptr_t)page, 0x4000,
+                                  MEM_COMMIT, PAGE_READWRITE))
                     return p - dst;
                 continue;
             }
