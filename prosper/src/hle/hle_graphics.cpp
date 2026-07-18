@@ -529,17 +529,24 @@ HLE(g_vo_unregister_buffers) {
     std::lock_guard<std::mutex> lk(g_display_mx);
     const uint8_t tag = (uint8_t)(set + 1);
     bool found = false;
-    for (int i = 0; i < 16; ++i) {
-        if (g_display.buffer_set[i] != tag) continue;
-        found = true;
-        if (g_display.front_index == i &&
-            g_display.front_generation == g_display.buffer_generation[i]) {
-            g_display.front_index = -1;
-            g_display.front_generation = 0;
+    {
+        std::lock_guard<std::mutex> flip_lk(g_flip_mx);
+        for (int i = 0; i < 16; ++i) {
+            if (g_display.buffer_set[i] != tag) continue;
+            found = true;
+            if (g_display.front_index == i &&
+                g_display.front_generation == g_display.buffer_generation[i]) {
+                g_display.front_index = -1;
+                g_display.front_generation = 0;
+            }
+            // A numeric slot can be registered again with a different backing surface. Retire the
+            // old label identity now so a later flip cannot clear the new registration's label.
+            g_buffer_labels[i] = 0;
+            if (g_previous_buffer == i) g_previous_buffer = -1;
+            g_display.buffer_set[i] = 0;
+            g_display.buffer_addr[i] = 0;
+            g_display.buffer_generation[i] = 0;
         }
-        g_display.buffer_set[i] = 0;
-        g_display.buffer_addr[i] = 0;
-        g_display.buffer_generation[i] = 0;
     }
     if (!found)
         return (uint64_t)(int64_t)(int32_t)0x8029000a;  // SCE_VIDEO_OUT_ERROR_INVALID_INDEX

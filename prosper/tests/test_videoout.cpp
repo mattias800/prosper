@@ -269,7 +269,21 @@ int main() {
               prosper_vo_buffer_addr(2) == (uint64_t)(uintptr_t)fb2 &&
               prosper_vo_display_width() == 1920 && prosper_vo_display_height() == 1080,
           "unregistering one set restores the remaining set's range and geometry");
+    CHECK(regb2(0x1001, 1 /*reused set*/, 4 /*reused start*/,
+                (uint64_t)(uintptr_t)high_buffers, 2,
+                (uint64_t)(uintptr_t)high_attr) == 0,
+          "an unregistered buffer range can be registered again");
+    buffer_labels[4] = 1;
+    flip(0x1001, 4 /*new registration in reused slot*/, 0, 0, 0, 0);
+    CHECK(buffer_labels[4] == 1,
+          "first flip of a reused slot retains the new registration's current label");
+    CHECK(unreg(0x1001, 1 /*reused set*/, 0, 0, 0, 0) == 0 &&
+              buffer_labels[4] == 0,
+          "unregistering a displayed slot retires its label identity");
+    buffer_labels[2] = 1;
     flip(0x1001, 2 /*remaining set 0 buffer*/, 0, 0, 0, 0);
+    CHECK(buffer_labels[2] == 1,
+          "first flip after the previous slot is unregistered retains the current label");
     CHECK(gpu::present_width() == 1920 && gpu::present_height() == 1080,
           "present continues with the surviving set after unregister");
     CHECK(unreg(0x1001, 0 /*set*/, 0, 0, 0, 0) == 0 &&
