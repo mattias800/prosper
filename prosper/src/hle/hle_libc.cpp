@@ -12,6 +12,8 @@
 #include <cmath>
 #include <cwchar>
 #include <cerrno>
+#include <cstddef>
+#include <limits>
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
@@ -72,15 +74,52 @@ extern "C" void     prosper_longjmp(void*, uint64_t) {}
 #endif
 
 namespace prosper {
-// Portable aligned allocation (POSIX posix_memalign / Windows _aligned_malloc).
-// NOTE: on Windows these need _aligned_free; the guest doesn't run on Windows yet,
-// so h_free's plain free() is fine for now (Linux is the runtime target).
+// Keep every guest allocation in one compatible allocator family. Windows requires pointers from
+// _aligned_malloc to be released with _aligned_free; mixing them with plain free corrupts the CRT
+// heap once a guest deletes an aligned C++/mesh allocation. Use the aligned family for ordinary
+// guest allocations there as well, so `free` and `realloc` can accept pointers returned by any of
+// the guest-facing allocation entry points without a side registry.
 static void* aligned_alloc_portable(size_t align, size_t size) {
 #ifdef _WIN32
     return _aligned_malloc(size, align);
 #else
     void* p = nullptr;
     return posix_memalign(&p, align, size) == 0 ? p : nullptr;
+#endif
+}
+
+static void* guest_malloc_portable(size_t size) {
+#ifdef _WIN32
+    return _aligned_malloc(size, alignof(std::max_align_t));
+#else
+    return malloc(size);
+#endif
+}
+
+static void* guest_calloc_portable(size_t count, size_t size) {
+    if (size && count > std::numeric_limits<size_t>::max() / size) {
+        errno = ENOMEM;
+        return nullptr;
+    }
+    const size_t bytes = count * size;
+    void* p = guest_malloc_portable(bytes);
+    if (p) memset(p, 0, bytes);
+    return p;
+}
+
+static void* guest_realloc_portable(void* p, size_t size) {
+#ifdef _WIN32
+    return _aligned_realloc(p, size, alignof(std::max_align_t));
+#else
+    return realloc(p, size);
+#endif
+}
+
+static void guest_free_portable(void* p) {
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    free(p);
 #endif
 }
 } // namespace prosper
@@ -134,10 +173,10 @@ HLE(h_strncpy_s) { char* d=(char*)P(a0); const char* s=CS(a2); size_t ds=a1,n=a3
 HLE(h_strcat_s)  { char* d=(char*)P(a0); const char* s=CS(a2); size_t ds=a1,dl=strnlen(d,ds),i=0; if (dl<ds){ while(dl+i<ds-1&&s[i]){d[dl+i]=s[i];i++;} d[dl+i]=0; } return 0; }
 HLE(h_strncat_s) { char* d=(char*)P(a0); const char* s=CS(a2); size_t ds=a1,n=a3,dl=strnlen(d,ds),i=0; if (dl<ds){ while(dl+i<ds-1&&i<n&&s[i]){d[dl+i]=s[i];i++;} d[dl+i]=0; } return 0; }
 
-HLE(h_malloc)  { return (uint64_t)(uintptr_t)malloc(a0); }
-HLE(h_calloc)  { return (uint64_t)(uintptr_t)calloc(a0, a1); }
-HLE(h_realloc) { return (uint64_t)(uintptr_t)realloc(P(a0), a1); }
-HLE(h_free)    { free(P(a0)); return 0; }
+HLE(h_malloc)  { return (uint64_t)(uintptr_t)guest_malloc_portable(a0); }
+HLE(h_calloc)  { return (uint64_t)(uintptr_t)guest_calloc_portable(a0, a1); }
+HLE(h_realloc) { return (uint64_t)(uintptr_t)guest_realloc_portable(P(a0), a1); }
+HLE(h_free)    { guest_free_portable(P(a0)); return 0; }
 // memalign(alignment, size): aligned allocation. Normalize alignment to a valid
 // power-of-two >= sizeof(void*) for posix_memalign.
 HLE(h_memalign) {
@@ -158,9 +197,9 @@ HLE(h_posix_memalign) {
 HLE(h_aligned_alloc)  { return (uint64_t)(uintptr_t)aligned_alloc_portable(a0, a1); }
 // C++ operators new/delete (the whole IL2CPP game is C++). new -> malloc; the aligned
 // forms take (size, align); nothrow forms take an extra tag arg we ignore.
-HLE(h_new)         { return (uint64_t)(uintptr_t)malloc(a0 ? a0 : 1); }
+HLE(h_new)         { return (uint64_t)(uintptr_t)guest_malloc_portable(a0 ? a0 : 1); }
 HLE(h_new_align)   { return (uint64_t)(uintptr_t)aligned_alloc_portable(a1 ? a1 : 16, a0 ? a0 : 1); }
-HLE(h_delete)      { free(P(a0)); return 0; }
+HLE(h_delete)      { guest_free_portable(P(a0)); return 0; }
 
 // --- stdio ---
 // v*printf receive a guest-built va_list (a pointer to __va_list_tag under the SysV
@@ -198,7 +237,7 @@ static int prosper_rand_r(unsigned* seed) {
 HLE(h_rand_r)   { return (uint64_t)(int64_t)prosper_rand_r((unsigned*)P(a0)); }
 // qsort: the comparator is a guest fn ptr; SysV ABI matches host, callable directly (cf. h_bsearch).
 HLE(h_qsort)    { qsort(P(a0), a1, a2, (int (*)(const void*, const void*))(uintptr_t)a3); return 0; }
-HLE(h_strdup)   { const char* s = CS(a0); size_t n = strlen(s) + 1; void* p = malloc(n); if (p) memcpy(p, s, n); return (uint64_t)(uintptr_t)p; }
+HLE(h_strdup)   { const char* s = CS(a0); size_t n = strlen(s) + 1; void* p = guest_malloc_portable(n); if (p) memcpy(p, s, n); return (uint64_t)(uintptr_t)p; }
 HLE(h_strtok)   { return (uint64_t)(uintptr_t)strtok((char*)P(a0), CS(a1)); }
 HLE(h_strspn)   { return (uint64_t)strspn(CS(a0), CS(a1)); }
 HLE(h_strcspn)  { return (uint64_t)strcspn(CS(a0), CS(a1)); }
