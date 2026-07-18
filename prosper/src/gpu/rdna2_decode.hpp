@@ -55,6 +55,11 @@ struct Rdna2Inst {
     bool        has_modifier = false;  // VOP SDWA/DPP form (2nd dword is a control word, not a literal);
                                        // decoded for correct length, but the recompiler rejects it
                                        // (sub-dword select / cross-lane semantics are not modeled)
+    // True whenever an SDWA control word was present (src0 field 0xF9), including the modeled
+    // subsets that clear has_modifier. Stage 2 needs this to distinguish the plain e32 encoding
+    // (dst_sel defaults to DWORD=6, hardware PRESERVES the unwritten f16 half) from the SDWA
+    // DWORD+UNUSED_PAD form (same field values, hardware ZERO-fills) — ISA Table 88 DST_U.
+    bool        has_sdwa = false;
     // DPP16 QUAD_PERM (#273): a full-quad permute (ctrl < 0x100, row/bank masks 0xf, no neg/abs/FI) —
     // the manual-ddx/ddy idiom. The recompiler lowers it via screen-space derivatives (fragment only);
     // src[0] holds the REAL source VGPR (dword1[7:0]) and dpp_ctrl the 8-bit lane selector.
@@ -95,7 +100,15 @@ struct Rdna2Inst {
     uint32_t exp_en = 0;
     bool     exp_compr = false;     // COMPR: the 4 channels are two f16x2 pairs in src[0] (r,g) / src[1] (b,a)
 
-    // MIMG-only: destination component mask (dmask), image dimensionality (SQ_RSRC_IMG dim: 1D=0,
+    // MUBUF-only flags (ISA Table 98): GLC (bit 14) — for atomics, "return pre-op value to VGPR";
+    // LDS (bit 16) — transfer between LDS and memory instead of VGPRs (rejected until modeled).
+    bool     mubuf_glc = false;
+    bool     mubuf_lds = false;
+    // DS-only: GDS flag. llvm-mc gfx1030 round-trip places it at dword0 bit 17 (ds_add_u32 gds =
+    // 0xd8020000 vs 0xd8000000; Table 94's "GDS [16]" is a GFX9-era erratum — it also misplaces
+    // OP). Bit 16 is likewise captured so an unknown flag rejects rather than silently running
+    // against workgroup LDS with device-global (GDS) semantics expected.
+    bool     ds_gds = false;
     // 2D=1, 3D=2, Cube=3, 1D_ARRAY=4, 2D_ARRAY=5, ...), and the unnormalized-coordinate flag. VDATA is
     // in `dst`, VADDR in src[0], SRSRC (T# base SGPR) in src[1], SSAMP (S# base SGPR) in src[2].
     uint32_t mimg_dmask = 0;

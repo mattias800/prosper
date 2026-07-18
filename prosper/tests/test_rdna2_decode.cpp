@@ -210,6 +210,59 @@ int main() {
     CHECK(rdna2_sload_required_bytes(sload_range, 3, 8) == 0u,
           "s_load range inference ignores a different SBASE pair");
 
+    // --- 2026-07 ISA-audit decode fixes (#878/#882) ---
+    // MUBUF opcode is 8 bits [25:18]: buffer_load_format_d16_x (op 128) must NOT alias onto
+    // buffer_load_format_x (op 0). llvm-mc gfx1030: 0xe2000000 0x80000000.
+    const uint32_t mubuf_d16[] = { 0xe2000000u, 0x80000000u };
+    Rdna2Inst md = rdna2_decode_one(mubuf_d16, 2);
+    CHECK(md.fmt == Rdna2Format::MUBUF && md.opcode == 128u,
+          "MUBUF 8-bit opcode: buffer_load_format_d16_x decodes as 128, not 0");
+    // MUBUF GLC (bit 14): buffer_atomic_umax ... glc = 0xe0e04004 (plain live word is 0xe0e00004).
+    const uint32_t mubuf_glc[] = { 0xe0e04004u, 0x80000000u };
+    const uint32_t mubuf_noglc[] = { 0xe0e00004u, 0x80000000u };
+    CHECK(rdna2_decode_one(mubuf_glc, 2).mubuf_glc && !rdna2_decode_one(mubuf_noglc, 2).mubuf_glc,
+          "MUBUF GLC bit 14 decodes (atomics: return pre-op value)");
+    // MUBUF LDS (bit 16): hand-set on the plain dword load (llvm-mc gfx1030 rejects the syntax,
+    // but the field is architectural — Table 98).
+    const uint32_t mubuf_lds[] = { 0xe0310000u, 0x80000000u };
+    CHECK(rdna2_decode_one(mubuf_lds, 2).mubuf_lds && !rdna2_decode_one(mubuf_noglc, 2).mubuf_lds,
+          "MUBUF LDS bit 16 decodes (buffer<->LDS transfer flag)");
+    // MIMG opcode combines dword0 bit 0 with [24:18]: image_msaa_load (op 128) must NOT alias
+    // onto image_load (op 0). llvm-mc gfx1030: 0xf0000f31 0x00000000.
+    const uint32_t mimg_msaa[] = { 0xf0000f31u, 0x00000000u };
+    Rdna2Inst mm = rdna2_decode_one(mimg_msaa, 2);
+    CHECK(mm.fmt == Rdna2Format::MIMG && mm.opcode == 128u,
+          "MIMG 8-bit opcode: image_msaa_load decodes as 128, not 0 (image_load)");
+    // v_fmamk_f16 (0x37) / v_fmaak_f16 (0x38) carry a mandatory 32-bit literal K: 2 dwords, or the
+    // K re-decodes as a phantom instruction and desyncs the walk. llvm-mc gfx1030.
+    const uint32_t fmamk16[] = { 0x6e000501u, 0x00001234u };
+    const uint32_t fmaak16[] = { 0x70000501u, 0x00001234u };
+    CHECK(rdna2_decode_one(fmamk16, 2).len_dwords == 2 && rdna2_decode_one(fmamk16, 2).has_literal &&
+          rdna2_decode_one(fmaak16, 2).len_dwords == 2,
+          "v_fmamk_f16/v_fmaak_f16 count their mandatory literal K (2 dwords)");
+    // SOPK s_setreg_imm32_b32 (op 21) trails a 32-bit literal: 2 dwords. llvm-mc gfx1030.
+    const uint32_t setreg32[] = { 0xba80f801u, 0x12345678u };
+    Rdna2Inst sk = rdna2_decode_one(setreg32, 2);
+    CHECK(sk.fmt == Rdna2Format::SOPK && sk.len_dwords == 2 && sk.has_literal && sk.literal == 0x12345678u,
+          "s_setreg_imm32_b32 counts its trailing data literal (2 dwords)");
+    const uint32_t movk[] = { 0xb0040005u };
+    CHECK(rdna2_decode_one(movk, 1).len_dwords == 1, "plain SOPK (s_movk_i32) stays 1 dword");
+    // VOP3B carve-out covers the whole family (sec 13.3.4): v_add_co_u32 e64 (0x30F) decodes its
+    // SDST from dword0[14:8] instead of misreading it as ABS bits. (Hand-built word: the VOP3B
+    // field layout is the one llvm-mc round-trips for 0x128 v_add_co_ci_u32.)
+    const uint32_t addco[] = { 0xd70f0000u | (4u << 8), 0x00020501u };
+    Rdna2Inst ac = rdna2_decode_one(addco, 2);
+    CHECK(ac.fmt == Rdna2Format::VOP3 && ac.opcode == 0x30Fu &&
+          ac.sdst.kind == OperandKind::SGPR && ac.sdst.value == 4 &&
+          !ac.src_abs[0] && !ac.src_abs[1] && !ac.src_abs[2],
+          "VOP3B v_add_co_u32 (0x30F) decodes SDST s4 and clears the mis-read abs bits");
+    // DS GDS flag is dword0 bit 17 (llvm-mc gfx1030: ds_add_u32 gds = 0xd8020000 vs 0xd8000000;
+    // ds_append gds = 0xd8fa0000 vs plain 0xd8f80000).
+    const uint32_t ds_plain[] = { 0xd8000000u, 0x00000201u };
+    const uint32_t ds_gds[]   = { 0xd8020000u, 0x00000201u };
+    CHECK(!rdna2_decode_one(ds_plain, 2).ds_gds && rdna2_decode_one(ds_gds, 2).ds_gds,
+          "DS GDS flag (bit 17) decodes: ds_add_u32 vs ds_add_u32 gds");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

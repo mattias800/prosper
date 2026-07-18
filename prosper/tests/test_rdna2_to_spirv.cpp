@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -2457,10 +2458,11 @@ int main() {
     }
     CHECK(gotT5.size()==N && badT5==0, "T5: s_min_u32(7,3)=3 + s_max_i32(-2,5)=5");
 
-    // Kernel T5b (#397): s_max SCC on a TIE. s_max_i32 s2,5,5 -> SCC=(5>=5)=1 per RDNA2 ISA (the
-    // asymmetric min/max split: min uses strict `<`, max uses non-strict `>=`). s_cselect_b32 s3 =
-    // SCC ? 11 : 4, then v1 = a0 + s3. Locks SCC=1 on equality: out bits = bits(a0) + 11. The old
-    // strict `>` set SCC=0 on the tie -> s3=4 -> bits(a0)+4, which this catches. (llvm-mc gfx1010.)
+    // Kernel T5b (#397 -> corrected by the #879 ISA audit): s_max SCC on a TIE. The RDNA2 ISA
+    // pseudocode is STRICT in both directions (S_MAX_I32: "D.i = (S0.i > S1.i) ? S0.i : S1.i;
+    // SCC = (S0.i > S1.i)", doc 70648 sec 12.1 op 8) — #397's non-strict `>=` quoted a line that
+    // is not in the actual document. s_max_i32 s2,5,5 -> SCC=(5>5)=0; s_cselect_b32 s3 =
+    // SCC ? 11 : 4 picks 4, then v1 = a0 + s3: out bits = bits(a0) + 4. (llvm-mc gfx1010.)
     const uint32_t codeT5b[] = { 0x84028585u, 0x8503848bu, 0x4a020003u, 0xBF810000u };
     std::vector<uint32_t> spvT5b = recompile_valu(codeT5b, sizeof(codeT5b)/4, 1, 1);
     CHECK(!spvT5b.empty(), "recompiled T5b (s_max_i32 SCC on a tie + s_cselect) -> SPIR-V");
@@ -2468,9 +2470,9 @@ int main() {
     uint32_t badT5b = 0;
     for (uint32_t i = 0; i < N && gotT5b.size() == N; i++) {
         uint32_t gb; std::memcpy(&gb, &gotT5b[i], 4);
-        if (gb != bits_of(inX[i]) + 11u) badT5b++;
+        if (gb != bits_of(inX[i]) + 4u) badT5b++;
     }
-    CHECK(gotT5b.size()==N && badT5b==0, "T5b: s_max_i32(5,5) sets SCC=1 (>=), s_cselect picks 11 not 4");
+    CHECK(gotT5b.size()==N && badT5b==0, "T5b: s_max_i32(5,5) sets SCC=0 (strict >), s_cselect picks 4");
 
     // Kernel T5c (#462): s_mul_hi_i32 is gfx10 SOP2 opcode 0x36 (was mapped to the invalid 0x37, so the
     // handler was dead and the op rejected -> shader dropped). s1=0x10000; s_mul_hi_i32 s2,-1,s1 = the
@@ -3220,27 +3222,172 @@ int main() {
     CHECK(gotT31 == expT31,
           "T31: signed SDWA conversion sign-extends the selected high word exactly");
 
-    // T32: Astro visibility-reduction BUFFER_ATOMIC_UMAX packet. The operation targets byte offset 4,
-    // returns the old u32 in VDATA, and atomically replaces memory with max(old, VDATA).
+    // T32: Astro visibility-reduction BUFFER_ATOMIC_UMAX packet — the exact live word, which has
+    // GLC=0. ISA 8.1/Table 98: for atomics GLC gates "return pre-op value to VGPR"; with GLC=0
+    // the memory update happens but VDATA is NOT written (it still holds the DATA operand, 42).
+    // The old unconditional pre-op return silently clobbered VDATA on this live path (#882).
     const uint32_t codeT32[] = {
-        0xe0e00004u, 0x80000000u,            // exact buffer_atomic_umax v0, v0, s[0:3], 0 offset:4
-        0x7e000d00u,                         // v_cvt_f32_u32 v0, v0 (returned old value)
+        0xe0e00004u, 0x80000000u,            // exact buffer_atomic_umax v0, v0, s[0:3], 0 offset:4 (GLC=0)
+        0x7e000d00u,                         // v_cvt_f32_u32 v0, v0 (VDATA: still the DATA operand)
         0xbf810000u,
     };
     ShaderResourceTable rtT32;
     { ShaderResource rb{}; rb.cls = ResourceClass::ConstantBuffer; rb.format = DataFormat::Uint32;
       rb.num_components = 1; rb.binding = 3; rb.sgpr_base = 0; rtT32.resources.push_back(rb); }
     std::vector<uint32_t> spvT32 = recompile_valu(codeT32, std::size(codeT32), 1, 0, &rtT32);
-    CHECK(!spvT32.empty(), "recompiled T32 (Astro buffer_atomic_umax) -> SPIR-V");
+    CHECK(!spvT32.empty(), "recompiled T32 (Astro buffer_atomic_umax GLC=0) -> SPIR-V");
     uint32_t forty_two = 42u; float raw_input = 0.0f;
     std::memcpy(&raw_input, &forty_two, sizeof(forty_two));
     std::vector<uint32_t> atomic_buf = {0u, 17u}, atomic_out;
     std::vector<float> gotT32 = prosper::test::run_compute(
         spvT32, {raw_input}, 1, 1, /*binding2*/{}, /*binding3*/atomic_buf, &atomic_out);
-    printf("  T32 atomic got=%g memory=%u (expect 17/42)\n",
+    printf("  T32 atomic got=%g memory=%u (expect 42/42)\n",
            gotT32.empty() ? -1.0f : gotT32[0], atomic_out.size() < 2 ? 0u : atomic_out[1]);
-    CHECK(gotT32.size() == 1 && gotT32[0] == 17.0f && atomic_out.size() == 2 && atomic_out[1] == 42u,
-          "T32: buffer_atomic_umax returns old memory and stores the unsigned maximum");
+    CHECK(gotT32.size() == 1 && gotT32[0] == 42.0f && atomic_out.size() == 2 && atomic_out[1] == 42u,
+          "T32: GLC=0 buffer_atomic_umax stores the max and leaves VDATA untouched");
+
+    // T32b: the same packet with GLC=1 (bit 14 set): the pre-op memory value (17) IS returned to
+    // VDATA while memory still becomes max(17, 42) = 42.
+    const uint32_t codeT32b[] = {
+        0xe0e04004u, 0x80000000u,            // buffer_atomic_umax v0, v0, s[0:3], 0 offset:4 glc
+        0x7e000d00u,                         // v_cvt_f32_u32 v0, v0 (returned pre-op value)
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvT32b = recompile_valu(codeT32b, std::size(codeT32b), 1, 0, &rtT32);
+    CHECK(!spvT32b.empty(), "recompiled T32b (buffer_atomic_umax glc) -> SPIR-V");
+    std::vector<uint32_t> atomic_buf_b = {0u, 17u}, atomic_out_b;
+    std::vector<float> gotT32b = prosper::test::run_compute(
+        spvT32b, {raw_input}, 1, 1, /*binding2*/{}, /*binding3*/atomic_buf_b, &atomic_out_b);
+    printf("  T32b atomic got=%g memory=%u (expect 17/42)\n",
+           gotT32b.empty() ? -1.0f : gotT32b[0], atomic_out_b.size() < 2 ? 0u : atomic_out_b[1]);
+    CHECK(gotT32b.size() == 1 && gotT32b[0] == 17.0f && atomic_out_b.size() == 2 && atomic_out_b[1] == 42u,
+          "T32b: GLC=1 buffer_atomic_umax returns the pre-op value and stores the maximum");
+
+    // --- 2026-07 ISA-audit semantic fixes (#879/#880) — execution kernels ---
+
+    // A1 (#879): s_not_b32 writes SCC=(result!=0). ~0 = all-ones -> SCC=1 -> cselect 11;
+    // ~(-1) = 0 -> SCC=0 -> cselect 4. out = bits(a0) + 11 + 4. (llvm-mc gfx1030 encodings.)
+    const uint32_t codeA1[] = { 0xbe810380u, 0xbe820701u, 0x8503848bu,
+                                0xbe8103c1u, 0xbe820701u, 0x8504848bu,
+                                0x4a020003u, 0x4a020204u, 0xBF810000u };
+    std::vector<uint32_t> spvA1 = recompile_valu(codeA1, std::size(codeA1), 1, 1);
+    CHECK(!spvA1.empty(), "recompiled A1 (s_not_b32 SCC) -> SPIR-V");
+    std::vector<float> gotA1 = prosper::test::run_compute(spvA1, inX, N, N);
+    uint32_t badA1 = 0;
+    for (uint32_t i = 0; i < N && gotA1.size() == N; i++) {
+        uint32_t gb; std::memcpy(&gb, &gotA1[i], 4);
+        if (gb != bits_of(inX[i]) + 15u) badA1++;
+    }
+    CHECK(gotA1.size()==N && badA1==0, "A1: s_not_b32 sets SCC=(D!=0) (1 then 0 -> +11+4)");
+
+    // A2 (#879): s_lshl4_add_u32 writes SCC = 64-bit unsigned carry-out. 0x10000000<<4 wraps
+    // (sum 0x100000001 >= 2^32) -> SCC=1 -> 11; 2<<4+1=33 in range -> SCC=0 -> 4. out = bits+15.
+    const uint32_t codeA2[] = { 0xbe8103ffu, 0x10000000u, 0x98828101u, 0x8503848bu,
+                                0xbe810382u, 0x98828101u, 0x8504848bu,
+                                0x4a020003u, 0x4a020204u, 0xBF810000u };
+    std::vector<uint32_t> spvA2 = recompile_valu(codeA2, std::size(codeA2), 1, 1);
+    CHECK(!spvA2.empty(), "recompiled A2 (s_lshl4_add_u32 carry SCC) -> SPIR-V");
+    std::vector<float> gotA2 = prosper::test::run_compute(spvA2, inX, N, N);
+    uint32_t badA2 = 0;
+    for (uint32_t i = 0; i < N && gotA2.size() == N; i++) {
+        uint32_t gb; std::memcpy(&gb, &gotA2[i], 4);
+        if (gb != bits_of(inX[i]) + 15u) badA2++;
+    }
+    CHECK(gotA2.size()==N && badA2==0, "A2: s_lshl4_add_u32 SCC = full 64-bit carry (1 then 0)");
+
+    // A3 (#880): the NEG modifier is a sign-bit toggle: neg(+0.0) = -0.0. v_add_f32_e64
+    // v1, -v0, -v0 with v0=+0.0 must produce -0.0 (bits 0x80000000); the old FSub(0,x)
+    // lowering produced +0.0. (llvm-mc gfx1010: 0xd5030001 0x60020100.)
+    const uint32_t codeA3[] = { 0xd5030001u, 0x60020100u, 0xBF810000u };
+    std::vector<uint32_t> spvA3 = recompile_valu(codeA3, std::size(codeA3), 1, 1);
+    CHECK(!spvA3.empty(), "recompiled A3 (VOP3 neg modifier) -> SPIR-V");
+    std::vector<float> gotA3 = prosper::test::run_compute(spvA3, {0.0f}, 1, 1);
+    uint32_t a3bits = 0; if (gotA3.size() == 1) std::memcpy(&a3bits, &gotA3[0], 4);
+    CHECK(gotA3.size() == 1 && a3bits == 0x80000000u,
+          "A3: neg(+0.0) + neg(+0.0) = -0.0 (sign-bit-exact negation)");
+
+    // A4 (#880): v_max_f32 returns the OTHER operand when one input is NaN (NMax). With v0=NaN,
+    // v_max_f32 v1, 0.5, v0 must be 0.5 — the old FMax was NaN-undefined (llvmpipe returned NaN).
+    const uint32_t codeA4[] = { 0x200200f0u, 0xBF810000u };
+    std::vector<uint32_t> spvA4 = recompile_valu(codeA4, std::size(codeA4), 1, 1);
+    CHECK(!spvA4.empty(), "recompiled A4 (v_max_f32 NaN rule) -> SPIR-V");
+    const float qnan = std::numeric_limits<float>::quiet_NaN();
+    std::vector<float> gotA4 = prosper::test::run_compute(spvA4, {qnan}, 1, 1);
+    CHECK(gotA4.size() == 1 && gotA4[0] == 0.5f,
+          "A4: v_max_f32(0.5, NaN) returns the non-NaN operand");
+
+    // A5 (#880): the CLAMP modifier maps a NaN result to 0 (DX10_CLAMP). NaN+NaN clamp -> +0.0.
+    const uint32_t codeA5[] = { 0xd5038001u, 0x00020100u, 0xBF810000u };
+    std::vector<uint32_t> spvA5 = recompile_valu(codeA5, std::size(codeA5), 1, 1);
+    CHECK(!spvA5.empty(), "recompiled A5 (clamp NaN->0) -> SPIR-V");
+    std::vector<float> gotA5 = prosper::test::run_compute(spvA5, {qnan}, 1, 1);
+    uint32_t a5bits = 0xdeadbeefu; if (gotA5.size() == 1) std::memcpy(&a5bits, &gotA5[0], 4);
+    CHECK(gotA5.size() == 1 && a5bits == 0u,
+          "A5: v_add_f32 clamp of a NaN result clamps to +0.0 (DX10_CLAMP)");
+
+    // A6 (#880): a PLAIN (non-SDWA) e32 f16 op writes [15:0] and PRESERVES [31:16]. v1's live
+    // high half 0x1111 must survive v_add_f16_e32 v1, v0, v0 (f16 1.0+1.0=2.0 -> low 0x4000).
+    // The old lowering zero-filled the high half.
+    const uint32_t codeA6[] = { 0x7e0202ffu, 0x11110000u, 0x64020100u, 0xBF810000u };
+    std::vector<uint32_t> spvA6 = recompile_valu(codeA6, std::size(codeA6), 1, 1);
+    CHECK(!spvA6.empty(), "recompiled A6 (plain e32 f16 high-half preserve) -> SPIR-V");
+    float a6in = 0.0f; { const uint32_t one_f16 = 0x00003C00u; std::memcpy(&a6in, &one_f16, 4); }
+    std::vector<float> gotA6 = prosper::test::run_compute(spvA6, {a6in}, 1, 1);
+    uint32_t a6bits = 0; if (gotA6.size() == 1) std::memcpy(&a6bits, &gotA6[0], 4);
+    CHECK(gotA6.size() == 1 && a6bits == 0x11114000u,
+          "A6: plain v_add_f16 preserves the destination's high 16 bits");
+
+    // A7 (#879): s_bfe_u64 with an encoded WIDTH of 0 produces the architectural 0 (the old
+    // lowering emitted a shift-by-64, undefined in SPIR-V). s[0:1]=~0, s4 = offset 16, width 0.
+    const uint32_t codeA7[] = { 0xbe8003c1u, 0xbe8103c1u, 0xbe840390u, 0x94820400u,
+                                0x4a020002u, 0xBF810000u };
+    std::vector<uint32_t> spvA7 = recompile_valu(codeA7, std::size(codeA7), 1, 1);
+    CHECK(!spvA7.empty(), "recompiled A7 (s_bfe_u64 width 0) -> SPIR-V");
+    std::vector<float> gotA7 = prosper::test::run_compute(spvA7, inX, N, N);
+    uint32_t badA7 = 0;
+    for (uint32_t i = 0; i < N && gotA7.size() == N; i++) {
+        uint32_t gb; std::memcpy(&gb, &gotA7[i], 4);
+        if (gb != bits_of(inX[i])) badA7++;
+    }
+    CHECK(gotA7.size()==N && badA7==0, "A7: s_bfe_u64 width 0 extracts 0 (defined result)");
+
+    // A8 (#880): an inline float constant in a 16-bit operand supplies the f16 encoding.
+    // v_cvt_f32_f16_e32 v1, 1.0 must produce 1.0f (the old raw-f32-pattern unpack gave 0.0).
+    const uint32_t codeA8[] = { 0x7e0216f2u, 0xBF810000u };
+    std::vector<uint32_t> spvA8 = recompile_valu(codeA8, std::size(codeA8), 1, 1);
+    CHECK(!spvA8.empty(), "recompiled A8 (v_cvt_f32_f16 inline 1.0) -> SPIR-V");
+    std::vector<float> gotA8 = prosper::test::run_compute(spvA8, {0.0f}, 1, 1);
+    CHECK(gotA8.size() == 1 && gotA8[0] == 1.0f,
+          "A8: v_cvt_f32_f16 of inline 1.0 reads the f16 pattern 0x3C00 -> 1.0f");
+
+    // A9 (#879): SCC POISON. A 64-bit mask op (s_and_b64 s[0:1],vcc,vcc) writes SCC = a cross-lane
+    // reduction the per-invocation model cannot form, so it poisons rs.scc. A NON-ADJACENT SCC
+    // consumer (s_cselect_b32, separated by an s_mov_b32 that does not touch SCC) must then reject
+    // the whole shader fail-visibly instead of silently selecting on the value the (absent) earlier
+    // s_cmp would have left. Recompile returns empty. (llvm-mc gfx1030 encodings.)
+    const uint32_t codeA9[] = {
+        0x87806a6au,   // s_and_b64 s[0:1], vcc, vcc  (poisons SCC)
+        0xbe820385u,   // s_mov_b32 s2, 5             (non-adjacent filler; no SCC write)
+        0x8503848bu,   // s_cselect_b32 s3, 11, 4     (reads poisoned SCC -> reject)
+        0x4a020203u,   // v_add_nc_u32 v1, s3, v1
+        0xBF810000u,
+    };
+    std::vector<uint32_t> spvA9 = recompile_valu(codeA9, std::size(codeA9), 1, 1);
+    CHECK(spvA9.empty(),
+          "A9: a non-adjacent SCC consumer after a 64-bit mask op is REJECTED (SCC poison)");
+
+    // A9b: the SAME consumer after a real s_cmp (which re-arms SCC) still recompiles — the poison
+    // only rejects when the last SCC writer was an unrepresentable mask op, not in general.
+    const uint32_t codeA9b[] = {
+        0x87806a6au,   // s_and_b64 s[0:1], vcc, vcc  (poisons SCC)
+        0xbf068000u,   // s_cmp_eq_u32 s0, 0          (re-arms SCC with a representable value)
+        0x8503848bu,   // s_cselect_b32 s3, 11, 4     (reads the fresh SCC -> OK)
+        0x4a020203u,   // v_add_nc_u32 v1, s3, v1
+        0xBF810000u,
+    };
+    std::vector<uint32_t> spvA9b = recompile_valu(codeA9b, std::size(codeA9b), 1, 1);
+    CHECK(!spvA9b.empty(),
+          "A9b: a real s_cmp between the mask op and the consumer re-arms SCC (recompiles)");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

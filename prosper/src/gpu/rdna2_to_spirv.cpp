@@ -53,12 +53,13 @@ enum : uint32_t {
 enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Glsl_Ceil=9, Glsl_Fract=10, Glsl_Sin=13, Glsl_Cos=14,
                   Glsl_Exp2=29, Glsl_Log2=30,
                   Glsl_Sqrt=31, Glsl_InverseSqrt=32, Glsl_FMin=37, Glsl_UMin=38, Glsl_SMin=39, Glsl_FMax=40,
-                  Glsl_UMax=41, Glsl_SMax=42, Glsl_PackHalf2x16=58, Glsl_UnpackHalf2x16=62 };
+                  Glsl_UMax=41, Glsl_SMax=42, Glsl_PackHalf2x16=58, Glsl_UnpackHalf2x16=62,
+                  Glsl_NMin=79, Glsl_NMax=80 };   // NaN-aware min/max: one-NaN operand -> the other operand
 enum : uint32_t {
     Cap_Shader=1, Cap_Int64=11, Cap_GroupNonUniform=61, Cap_GroupNonUniformVote=62,
     Cap_GroupNonUniformQuad=68,
     Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Fragment=4, Exec_GLCompute=5,
-    EM_OriginUpperLeft=7, EM_LocalSize=17,
+    EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17,
     SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_Function=7, SC_StorageBuffer=12, FC_None=0,
     Dim_1D=0, Dim_2D=1, Dim_3D=2,   // SPIR-V Dim. (2D coincides with the SQ_RSRC 2D dim value, but distinct.)
     Cap_Sampled1D=43, Cap_Image1D=44,   // Dim=1D needs Sampled1D; a 1D STORAGE image (read/write) also needs Image1D
@@ -75,11 +76,26 @@ enum : uint32_t {
     MemSem_UniformAcqRel=0x48, MemSem_WGAcqRel=0x108,   // storage/LDS AcquireRelease memory semantics
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_Flat=14, Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35,
-    BI_Position=0, BI_FragCoord=15, BI_WorkgroupId=26, BI_LocalInvocationId=27,
+    BI_Position=0, BI_FragCoord=15, BI_FragDepth=22, BI_WorkgroupId=26, BI_LocalInvocationId=27,
     BI_GlobalInvocationId=28, BI_VertexIndex=42, BI_InstanceIndex=43,
 };
 
 uint32_t fbits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+
+// The f16 bit pattern an inline float constant supplies in a 16-bit operand position (ISA Table 10
+// lists per-width encodings: "0.5 ... half: 0x3800" etc.). Only 1/(2*pi) (code 248, 0x3118) differs
+// from rounding the f32 value — the f32 table entry 0.15915494 would round to a different last bit
+// than the documented operand, so 16-bit consumers must use these bits, not the f32 constant.
+uint32_t inline_float_f16_bits(int code) {
+    switch (code) {
+        case 240: return 0x3800u; case 241: return 0xB800u;   // +/-0.5
+        case 242: return 0x3C00u; case 243: return 0xBC00u;   // +/-1.0
+        case 244: return 0x4000u; case 245: return 0xC000u;   // +/-2.0
+        case 246: return 0x4400u; case 247: return 0xC400u;   // +/-4.0
+        case 248: return 0x3118u;                             // 1/(2*pi)
+        default:  return 0;
+    }
+}
 
 // A compute-shader SPIR-V builder specialized for "load N floats -> compute over SSA floats ->
 // store 1 float", with helpers the VALU translator drives.
@@ -149,6 +165,19 @@ struct SpirvCompute {
     uint32_t fext1(uint32_t inst, uint32_t a) { uint32_t r = id(); putv(code, Op_ExtInst, {t_f32, r, glsl, inst, bcf(a)}); return bcu(r); }
     uint32_t fext2(uint32_t inst, uint32_t a, uint32_t b) { uint32_t r = id(); putv(code, Op_ExtInst, {t_f32, r, glsl, inst, bcf(a), bcf(b)}); return bcu(r); }
     uint32_t frcp(uint32_t a) { uint32_t rf = id(); put(code, Op_FDiv, {t_f32, rf, fconstf(1.0f), bcf(a)}); return bcu(rf); }
+    // The NEG source modifier is a floating-point negation = raw sign-bit toggle (ISA sec 6.2:
+    // "Negate input"). Lowering it as 0.0f - x lost the sign of zero (FSub(+0,+0) = +0 where
+    // hardware yields -0, observable via v_rcp -> wrong-signed Inf, packed sign bits, min/max +-0
+    // ordering) and did not deterministically flip NaN signs. A bit-XOR is exact for every input
+    // (+-0, NaN, denormals) on every driver, unlike OpFNegate which lacks that guarantee without
+    // SignedZeroInfNanPreserve. The unpacked-f16 paths run in the f32 domain, so this applies there too.
+    uint32_t fneg(uint32_t a) { return ibin(Op_BitwiseXor, a, uconst(0x80000000u)); }
+    // CLAMP-modifier saturate to [0,1] with the hardware's DX10_CLAMP NaN rule: a NaN result clamps
+    // to 0 (graphics shaders run with MODE.DX10_CLAMP set). NMax(NaN, 0) = 0 then NMin(0, 1) = 0
+    // gives that for free; the previous FMin/FMax chain left a NaN result driver-defined.
+    uint32_t clamp01(uint32_t x) {
+        return fext2(Glsl_NMin, fext2(Glsl_NMax, x, bcu(fconstf(0.0f))), bcu(fconstf(1.0f)));
+    }
     uint32_t cvt_u2f(uint32_t u) { uint32_t rf = id(); put(code, Op_ConvertUToF, {t_f32, rf, u}); return bcu(rf); }   // uint -> float bits
     // v_cvt_u32_f32 SATURATES: NaN -> 0, negative -> 0, >= 2^32 -> 0xFFFFFFFF. A bare OpConvertFToU
     // has an undefined result out of range (#135), so clamp first. FMin/FMax are themselves
@@ -321,14 +350,21 @@ struct SpirvCompute {
     }
     uint32_t bfe_u64(uint32_t base64, uint32_t off, uint32_t cnt) {   // 64-bit unsigned bitfield extract
         // res = (base << (64-off-cnt)) >> (64-cnt), all logical u64 (portable — OpBitFieldUExtract on a
-        // 64-bit base isn't reliably supported, e.g. llvmpipe returns 0). Valid for off+cnt<=64, cnt in [1,64].
-        uint32_t total = ibin(Op_IAdd, off, cnt);
+        // 64-bit base isn't reliably supported, e.g. llvmpipe returns 0). The 7-bit width field
+        // legally encodes 0 and values past the register end; SPIR-V shifts >= 64 are undefined
+        // VALUES, so clamp like the 32-bit helper (#455): effective cnt = min(cnt, 64-off) (bits
+        // past bit 63 read as 0), and a zero width selects the architectural result 0 explicitly.
+        // Requires off <= 63 (both callers mask offset to [5:0]).
+        uint32_t cnt_c = uext2(Glsl_UMin, cnt, ibin(Op_ISub, uconst(64), off));
+        uint32_t total = ibin(Op_IAdd, off, cnt_c);
         uint32_t lsh32 = ibin(Op_ISub, uconst(64), total);
-        uint32_t rsh32 = ibin(Op_ISub, uconst(64), cnt);
+        uint32_t rsh32 = ibin(Op_ISub, uconst(64), cnt_c);
         uint32_t lsh = id(); put(code, Op_UConvert, {t_u64(), lsh, lsh32});
         uint32_t rsh = id(); put(code, Op_UConvert, {t_u64(), rsh, rsh32});
         uint32_t sl  = id(); put(code, Op_ShiftLeftLogical,  {t_u64(), sl, base64, lsh});
-        uint32_t r   = id(); put(code, Op_ShiftRightLogical, {t_u64(), r, sl, rsh}); return r; }
+        uint32_t r   = id(); put(code, Op_ShiftRightLogical, {t_u64(), r, sl, rsh});
+        uint32_t nz  = ucmp(Op_INotEqual, cnt, uconst(0));
+        uint32_t rs  = id(); put(code, Op_Select, {t_u64(), rs, nz, r, uconst64(0)}); return rs; }
     uint32_t u64_lo(uint32_t v64) { uint32_t r = id(); put(code, Op_UConvert, {t_u32, r, v64}); return r; }  // truncate low 32
     uint32_t u64_hi(uint32_t v64) { uint32_t s = id(); put(code, Op_ShiftRightLogical, {t_u64(), s, v64, uconst64(32)});
         uint32_t r = id(); put(code, Op_UConvert, {t_u32, r, s}); return r; }
@@ -1141,6 +1177,21 @@ struct SpirvCompute {
         uint32_t v = id(); putv(code, Op_CompositeConstruct, {t_v4f, v, bcf(r), bcf(g), bcf(bl), bcf(a)});
         put(code, Op_Store, {v_color[mrt], v});
     }
+    // Fragment depth export (EXP target 8 = MRTZ) — a lazily declared BuiltIn FragDepth output.
+    // Writing FragDepth requires ExecutionMode DepthReplacing (fixed-function Z is replaced by the
+    // shader's exported value, matching the hardware's shader-Z path). Silently DROPPING the
+    // target-8 export left occlusion to interpolated Z — wrong for any depth-writing shader.
+    uint32_t v_fragdepth = 0;
+    void export_depth(uint32_t z_bits) {
+        if (!v_fragdepth) {
+            uint32_t t_ptr = id(); put(types, Op_TypePointer, {t_ptr, SC_Output, t_f32});
+            v_fragdepth = id(); put(types, Op_Variable, {t_ptr, v_fragdepth, SC_Output});
+            put(deco, Op_Decorate, {v_fragdepth, Dec_BuiltIn, BI_FragDepth});
+            put(exec, Op_ExecutionMode, {f_main, EM_DepthReplacing});
+            iface.push_back(v_fragdepth);
+        }
+        put(code, Op_Store, {v_fragdepth, bcf(z_bits)});
+    }
 
     // --- Vertex-shader shell: draw inputs + gl_Position (member 0 of a gl_PerVertex Block). ---
     uint32_t v_vid = 0, v_iid = 0, v_pos = 0, t_ptr_out_v4f = 0;
@@ -1383,16 +1434,38 @@ uint32_t inline_int_mask_bit(SpirvCompute& b, int value) {
         b.uconst(0));
 }
 
+// V_MBCNT_HI positions its 32-bit S0 at lanes 32..63 (ISA ops 869/870: HI tests S0 bit i against
+// ThreadMask[32+i]) — S0 is an independent 32-bit value, NOT the high dword of a 64-bit-extended
+// operand. Lanes < 32 never contribute to the HI window, so their bit is 0.
+uint32_t inline_int_mask_bit_hi(SpirvCompute& b, int value) {
+    if (value == 0) return b.bfalse();
+    const uint32_t lane = b.ibin(Op_BitwiseAnd, b.linear_localid, b.uconst(b.wave_size - 1));
+    const uint32_t high = b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32));
+    const uint32_t bit  = b.ibin(Op_BitwiseAnd, lane, b.uconst(31));   // lane-32 for lanes >= 32
+    const uint32_t isset = b.ucmp(Op_INotEqual,
+        b.ibin(Op_BitwiseAnd,
+               b.ibin(Op_ShiftRightLogical, b.uconst(static_cast<uint32_t>(value)), bit),
+               b.uconst(1)),
+        b.uconst(0));
+    return b.bsel(high, isset, b.bfalse());
+}
+
 // Per-invocation bit of a 64-bit mask consumed by V_MBCNT. The HI instruction names the odd SGPR
 // of an aligned scalar pair (for example s7 for s[6:7]), while our bool-domain mask is keyed by the
 // pair's low register. Accept the exact key first for unusual compiler allocations, then the aligned
-// low half. VCC/EXEC are represented directly rather than through the scalar-data register file.
+// low half. VCC/EXEC are represented directly rather than through the scalar-data register file —
+// but only in the canonical pairing (LO with the low half, HI with the high half); a cross-pairing
+// (e.g. v_mbcnt_lo with exec_hi) reads OTHER lanes' bits, which the per-invocation model cannot
+// represent, so it returns the 0 reject sentinel.
 uint32_t mbcnt_source_bit(SpirvCompute& b, const RegState& rs, const Operand& source,
                           bool high_half) {
-    if (source.value == 126 || source.value == 127) return rs.exec;
-    if (source.value == 106 || source.value == 107) return rs.vcc;
+    if (source.value == 126 || source.value == 127)
+        return (source.value == (high_half ? 127 : 126)) ? rs.exec : 0;
+    if (source.value == 106 || source.value == 107)
+        return (source.value == (high_half ? 107 : 106)) ? rs.vcc : 0;
     if (source.kind == OperandKind::InlineInt)
-        return inline_int_mask_bit(b, source.value);
+        return high_half ? inline_int_mask_bit_hi(b, source.value)
+                         : inline_int_mask_bit(b, source.value);
     if (source.kind != OperandKind::SGPR) return 0;
     auto found = rs.sreg_bool.find(source.value);
     if (found != rs.sreg_bool.end()) return found->second;
@@ -1418,6 +1491,8 @@ bool sopp_is_noop(const Rdna2Inst& in) {
             return false;
     }
 }
+
+bool vopc_is_cmpx(uint32_t opcode);   // defined below (register-lifetime helpers)
 
 // Is SGPR `R` provably DEAD at pc `target` — i.e. redefined before any read on the fall-through, so a
 // write to it inside a divergent (execz) block linearized before `target` cannot be observed by later
@@ -1485,14 +1560,19 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                 // A VOP3B carry-out (sdst) is a 64-bit mask write — reads none of R beyond its sources.
                 if (in.sdst.kind == OperandKind::SGPR &&
                     (in.sdst.value == R || in.sdst.value + 1 == R)) return !entered_between(in.pc);   // redefined (pair)
-                // A VOPC e32 compare writes the whole VCC pair — kills both halves.
-                if (in.fmt == Rdna2Format::VOPC &&
+                // A non-X VOPC e32 compare writes the whole VCC pair — kills both halves. V_CMPX
+                // writes EXEC ONLY on RDNA2 (ISA 12.9: "EXEC[threadId] = ..."; no VCC/SDST dest),
+                // so it must NOT count as a VCC kill — miscounting it let safe_execz linearize a
+                // block whose vcc scratch-write hardware would have skipped.
+                if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
                     (in.dst.value == 106 || in.dst.value == 107) && (R == 106 || R == 107))
                     return !entered_between(in.pc);
                 // A redefinition kills R for a plain numbered SGPR dst (s0..s105) — and now also for
                 // VCC_LO/HI (106/107), whose implicit readers are enumerated above. EXEC/M0
-                // (124/126/127) still can't be proven dead (implicit reads everywhere).
-                if (in.dst.kind == OperandKind::SGPR && in.dst.value == R && R <= 107)
+                // (124/126/127) still can't be proven dead (implicit reads everywhere). A cmpx
+                // SDWAB's decoded SGPR dst is excluded for the same reason as above (EXEC only).
+                if (in.dst.kind == OperandKind::SGPR && in.dst.value == R && R <= 107 &&
+                    !(in.fmt == Rdna2Format::VOPC && vopc_is_cmpx(in.opcode)))
                     return !entered_between(in.pc);
                 break;
             default:
@@ -1536,11 +1616,13 @@ std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& i
             // effects (emit_alu writes rs.sreg/rs.vcc/rs.sreg_bool for them, and predicate_write only
             // covers VGPRs) — on hardware the skipped block would have preserved VCC/the SGPR:
             //   VOP1 0x02 v_readfirstlane_b32 (writes an SGPR), VOP2 0x28-0x2A carry ops (write VCC),
-            //   VOP3B 0x128-0x12A (write the carry-out SGPR pair/VCC).
+            //   VOP3B 0x128-0x12A (write the carry-out SGPR pair/VCC), and VOP3B v_mad_u64_u32
+            //   0x176 (its 65th-bit carry mask also lands in VCC/an SGPR pair unpredicated).
             const bool scalar_side_effect =
                 (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02) ||
                 (in.fmt == Rdna2Format::VOP2 && in.opcode >= 0x28 && in.opcode <= 0x2A) ||
-                (in.fmt == Rdna2Format::VOP3 && in.opcode >= 0x128 && in.opcode <= 0x12A);
+                (in.fmt == Rdna2Format::VOP3 &&
+                 ((in.opcode >= 0x128 && in.opcode <= 0x12A) || in.opcode == 0x176));
             if (!scalar_side_effect &&
                 (in.fmt == Rdna2Format::VOP1 || in.fmt == Rdna2Format::VOP2 || in.fmt == Rdna2Format::VOP3 ||
                  in.fmt == Rdna2Format::MIMG || in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::DS ||
@@ -1871,11 +1953,20 @@ uint32_t vgpr_write_count(const Rdna2Inst& in) {
         case Rdna2Format::VOP2: case Rdna2Format::VOP3P:
             return 1;
         case Rdna2Format::VOP3:
-            return in.opcode == 0x176 ? 2 : 1;                 // v_mad_u64_u32 writes a VGPR pair
+            // 64-bit VGPR results: v_mad_u64_u32 (0x176), v_mad_i64_i32 (0x177), v_div_scale_f64
+            // (0x16E) — ISA opcodes 374/375/366 (the latter two are unimplemented in emit_alu but
+            // must count correctly the day they land).
+            return (in.opcode == 0x176 || in.opcode == 0x177 || in.opcode == 0x16E) ? 2 : 1;
         case Rdna2Format::DS:
-            if (in.opcode == 0x36 || in.opcode == 0x3d || in.opcode == 0x3e || in.opcode == 0xb1) return 1;
+            // Keep in sync with the DS opcodes the emitter accepts: the rtn atomics ds_add_rtn_u32
+            // (0x20) / ds_wrxchg_rtn_b32 (0x2d) write VDST, ds_read_b96/b128 (0xfe/0xff) write 3/4
+            // VGPRs — returning 0 for them hid their definitions from loop-header phi collection
+            // and from the #615 uniformity proof's defining-write scan.
+            if (in.opcode == 0x36 || in.opcode == 0x3d || in.opcode == 0x3e || in.opcode == 0xb1 ||
+                in.opcode == 0x20 || in.opcode == 0x2d) return 1;
             if (in.opcode == 0x37 || in.opcode == 0x76) return 2;
-            if (in.opcode == 0x77) return 4;
+            if (in.opcode == 0xfe) return 3;
+            if (in.opcode == 0x77 || in.opcode == 0xff) return 4;
             return 0;
         case Rdna2Format::MUBUF:
             switch (in.opcode) {
@@ -1890,6 +1981,8 @@ uint32_t vgpr_write_count(const Rdna2Inst& in) {
             for (uint32_t c = 0; c < 4; ++c) n += (in.mimg_dmask >> c) & 1u;
             return n ? n : 4;                                     // unknown/empty mask: reject conservatively
         }
+        case Rdna2Format::VINTRP:
+            return 1;   // v_interp_p1/p2/mov write VDST (per-lane interpolated data — inherently divergent)
         default:
             return 0;
     }
@@ -1951,6 +2044,10 @@ static bool cannot_write_vcc(const Rdna2Inst& in) {
             if (in.opcode == 0x360) return sgpr_dst_misses_vcc(1);
             if (in.opcode == 0x176)
                 return in.sdst.value != 106 && in.sdst.value != 107; // v_mad_u64_u32 carry-out
+            // The remaining VOP3B ops inside the plain-VALU window — v_div_scale_f32/f64 (0x16D/
+            // 0x16E) and v_mad_i64_i32 (0x177) — write a scalar carry/flag SDST that may be VCC;
+            // their VGPR dst would otherwise satisfy sgpr_dst_misses_vcc. Stop the walk for them.
+            if (in.opcode == 0x16D || in.opcode == 0x16E || in.opcode == 0x177) return false;
             return in.opcode >= 0x140 && in.opcode < 0x300 &&
                    sgpr_dst_misses_vcc(1);                         // plain-VALU window only
         case Rdna2Format::SOP1: case Rdna2Format::SOP2: case Rdna2Format::SOPK:
@@ -2574,7 +2671,12 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
         case OperandKind::Literal:     return b.uconst(in.literal);
         case OperandKind::Special:
             if (o.value == 125) return b.uconst(0);   // SGPR_NULL: the one Special whose data value IS 0
-            if (o.value == 253) return b.sel(rs.scc, b.uconst(1), b.uconst(0)); // SCC scalar source
+            if (o.value == 253) {                     // SCC scalar source
+                // rs.scc == 0 marks SCC poisoned by a 64-bit mask op (its SCC is a cross-lane
+                // reduction this model cannot form) — reject rather than read a stale condition.
+                if (!rs.scc) { if (ok) *ok = false; return b.uconst(0); }
+                return b.sel(rs.scc, b.uconst(1), b.uconst(0));
+            }
             // VCC_LO/HI (106/107), ttmp0..15 (108..123) and M0 (124) double as plain scalar SCRATCH
             // in compiled code — the NGG preamble does `s_bfe_u32 vcc_lo, s3, ...` then reads vcc
             // back as data, and DOLL's skinned VS round-trips M0 (`s_mov m0, s4 … s_mov s36, m0`,
@@ -2591,6 +2693,15 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
             if (ok) *ok = false;
             return b.uconst(0);
     }
+}
+
+// A 64-bit mask write architecturally overwrites the destination SGPR pair ("D = ..." in every
+// ISA mask-op description): any tracked data-domain SSA value or descriptor-provenance tag for
+// those registers is stale afterwards. Erase both so a later data read / SRSRC resolution cannot
+// alias the pre-mask-op value (the mask itself lives in sreg_bool / rs.vcc / rs.exec).
+inline void mask_write_clobbers_pair(RegState& rs, int dst) {
+    rs.sreg.erase(dst); rs.sreg.erase(dst + 1);
+    rs.sreg_srt.erase(dst); rs.sreg_srt.erase(dst + 1);
 }
 
 // Emit one ALU instruction (VOP1/2/C/3 or SOP1/2) into `b`, updating `rs`. Returns true if `in` is an
@@ -2611,6 +2722,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // in sreg_bool. These implement divergent control flow (if/endif via saveexec + restore).
             if (in.opcode == 0x04 || in.opcode == 0x08 || in.opcode == 0x0a ||
                 in.opcode == 0x24 || in.opcode == 0x25 || in.opcode == 0x37) {
+                // ISA: every op here EXCEPT s_mov_b64 writes SCC=(result!=0) — a cross-lane
+                // reduction the per-invocation model cannot form. POISON the tracked SCC (SSA id 0)
+                // so a later consumer (s_cselect/s_addc/SCC-source/scc-branch emission) rejects
+                // fail-visibly instead of silently evaluating the value an OLDER s_cmp produced.
+                // Any real SCC writer re-arms it. Branches the mask_test/waterfall linearizers
+                // claim never read rs.scc, so the exercised adjacent shapes are unaffected.
+                if (in.opcode != 0x04) rs.scc = 0;
                 auto is_exec = [](const Operand& o){ return o.value == 126 || o.value == 127; };
                 auto src_mask = [&](const Operand& o) -> uint32_t {
                     if (o.value == 106 || o.value == 107) return rs.vcc;    // VCC
@@ -2631,8 +2749,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // no-op (leave exec AND its narrowed flag untouched — so a later forward s_cbranch_execz
                     // is not spuriously rejected); replacing exec with a *different* mask may narrow it, so
                     // set exec_narrowed conservatively (else inactive-lane writes would escape predication).
-                    // SCC = (mask != 0) is a CROSS-lane reduction our per-lane model can't form, so — like
-                    // every mask op here (s_mov_b64/saveexec) — we intentionally do not write rs.scc.
+                    // SCC = (mask != 0) is a CROSS-lane reduction our per-lane model can't form —
+                    // rs.scc was POISONED above so later SCC consumers reject instead of misreading.
                     uint32_t m = src_mask(in.src[0]);
                     if (!m) { ok = false; return true; }
                     if (is_exec(in.dst)) {
@@ -2640,7 +2758,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         else if (in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
                             rs.exec = b.btrue(); rs.exec_narrowed = false;      // exec = all lanes on
                         } else { rs.exec = m; rs.exec_narrowed = true; }        // replaced by a (maybe narrowed) mask
-                    } else { rs.sreg_bool[in.dst.value] = m; rs.sreg_bool_narrowed[in.dst.value] = true; }  // conservative: WQM widens
+                    } else { rs.sreg_bool[in.dst.value] = m; rs.sreg_bool_narrowed[in.dst.value] = true;
+                             mask_write_clobbers_pair(rs, in.dst.value); }  // conservative: WQM widens
                     return true;
                 }
                 // Narrowed-state carried alongside a saved mask: restoring EXEC from a mask that was saved
@@ -2665,9 +2784,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         rs.vcc = inverted;
                         rs.sreg_bool[in.dst.value] = inverted;
                         rs.sreg_bool_narrowed[in.dst.value] = true;
+                        mask_write_clobbers_pair(rs, in.dst.value);
                     } else {
                         rs.sreg_bool[in.dst.value] = inverted;
                         rs.sreg_bool_narrowed[in.dst.value] = true;
+                        mask_write_clobbers_pair(rs, in.dst.value);
                     }
                     return true;
                 }
@@ -2720,11 +2841,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         if (data_copied && !m) {   // data-only move: drop any stale saved-mask alias
                             rs.sreg_bool.erase(in.dst.value); rs.sreg_bool_narrowed.erase(in.dst.value);
                         }
+                        // Mask-only source (EXEC/a saved bool with no data half): the pair was still
+                        // architecturally overwritten — stale data/descriptor entries must not survive.
+                        if (m && !data_copied) mask_write_clobbers_pair(rs, in.dst.value);
                         if (!m && !data_copied) ok = false;
                     }
                 } else {                                    // s_and/or/andn1_saveexec_b64 sDST, src
                     rs.sreg_bool[in.dst.value] = rs.exec;   // save current EXEC to the dest SGPR pair
                     rs.sreg_bool_narrowed[in.dst.value] = rs.exec_narrowed;   // ...and its narrowed-state
+                    mask_write_clobbers_pair(rs, in.dst.value);
                     uint32_t m = src_mask(in.src[0]);
                     if (!m) ok = false;
                     else { rs.exec = in.opcode == 0x24 ? b.land(rs.exec, m)
@@ -2744,6 +2869,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             }
+            // A 32-bit scalar DATA write into an EXEC half would leave the live per-lane mask
+            // (rs.exec) stale — hardware updates EXEC (and EXECZ) immediately. No exercised title
+            // writes EXEC halves via b32 scalar ops (wave64 compilers use the b64 forms), so
+            // reject rather than model it. VCC_LO/HI (106/107) and M0 stay accepted as the
+            // documented data-scratch round-trip (NGG preamble s_bfe_u32 vcc_lo, DOLL M0 moves).
+            if (in.dst.value == 126 || in.dst.value == 127) { ok = false; return true; }
             uint32_t a = val(in.src[0]); uint32_t& d = rs.sreg[in.dst.value];
             switch (in.opcode) {
                 case 0x03: {                                // s_mov_b32
@@ -2763,7 +2894,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     break;
                 }
                 case 0x07:                                  // s_not_b32 changes the descriptor word
-                    d = b.iun(Op_Not, a); rs.sreg_srt.erase(in.dst.value); break;
+                    // ISA op 7: "D = ~S0; SCC = (D != 0)". (s_brev_b32 below has NO SCC write.)
+                    d = b.iun(Op_Not, a); rs.sreg_srt.erase(in.dst.value);
+                    rs.scc = b.ucmp(Op_INotEqual, d, b.uconst(0)); break;
                 case 0x0b:                                  // s_brev_b32
                     d = b.iun(Op_BitReverse, a); rs.sreg_srt.erase(in.dst.value); break;
                 default: ok = false;
@@ -2790,9 +2923,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 } else if (in.dst.value == 106 || in.dst.value == 107) {
                     rs.vcc = r;
                     rs.sreg_bool_narrowed[in.dst.value] = true;
+                    mask_write_clobbers_pair(rs, in.dst.value);
                 } else {
                     rs.sreg_bool[in.dst.value] = r;
                     rs.sreg_bool_narrowed[in.dst.value] = true;
+                    mask_write_clobbers_pair(rs, in.dst.value);
                 }
                 return true;
             }
@@ -2810,19 +2945,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return 0;   // not a recognizable mask
                 };
                 uint32_t m0 = mask(in.src[0]), m1 = mask(in.src[1]);
-                if (!m0 || !m1) { ok = false; return true; }
+                if (!m0 || !m1 || !rs.scc) { ok = false; return true; }   // !rs.scc: SCC poisoned by a mask op
                 uint32_t r = b.bsel(rs.scc, m0, m1);
                 if (is_exec(in.dst)) { rs.exec = r; rs.exec_narrowed = true; }
-                else if (in.dst.value == 106 || in.dst.value == 107) { rs.vcc = r; rs.sreg_bool_narrowed[in.dst.value] = true; }
-                else { rs.sreg_bool[in.dst.value] = r; rs.sreg_bool_narrowed[in.dst.value] = true; }  // conservative flag
+                else if (in.dst.value == 106 || in.dst.value == 107) { rs.vcc = r; rs.sreg_bool_narrowed[in.dst.value] = true;
+                                                                       mask_write_clobbers_pair(rs, in.dst.value); }
+                else { rs.sreg_bool[in.dst.value] = r; rs.sreg_bool_narrowed[in.dst.value] = true;   // conservative flag
+                       mask_write_clobbers_pair(rs, in.dst.value); }
                 return true;
             }
             if (in.opcode == 0x0f || in.opcode == 0x11 || in.opcode == 0x13 || in.opcode == 0x15 ||
                 in.opcode == 0x17 || in.opcode == 0x19 || in.opcode == 0x1b || in.opcode == 0x1d) {
                 // 64-bit wave-mask LOGICAL ops on per-lane bools: AND/OR/XOR/ANDN2 plus the
                 // complementary ORN2/NAND/NOR/XNOR family. Used for lane-mask arithmetic around
-                // divergent control flow / ballot. SCC=(result!=0) is a cross-lane reduction we can't form
-                // per-lane, so (like every mask op) we don't write SCC. Same mask-resolution as s_cselect_b64.
+                // divergent control flow / ballot. SCC=(result!=0) is a cross-lane reduction we can't
+                // form per-lane — POISON rs.scc so a later consumer rejects instead of silently
+                // reading an older s_cmp's value (the adjacent scc-branch shapes are claimed by the
+                // mask_test/waterfall linearizers and never read rs.scc). Same mask-resolution as
+                // s_cselect_b64.
                 auto is_exec = [](const Operand& o){ return o.value == 126 || o.value == 127; };
                 auto mask = [&](const Operand& o) -> uint32_t {
                     if (o.value == 106 || o.value == 107) return rs.vcc;
@@ -2835,6 +2975,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 };
                 uint32_t m0 = mask(in.src[0]), m1 = mask(in.src[1]);
                 if (!m0 || !m1) { ok = false; return true; }
+                rs.scc = 0;   // poison: hardware SCC=(result!=0) is unrepresentable per-lane
                 const uint32_t n0 = b.logical_not(m0), n1 = b.logical_not(m1);
                 const uint32_t x = b.bsel(m0, n1, m1);               // xor = m0 ? !m1 : m1
                 uint32_t r = in.opcode == 0x0f ? b.land(m0, m1)      // and
@@ -2846,8 +2987,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                            : in.opcode == 0x1b ? b.land(n0, n1)      // nor
                            : b.logical_not(x);                        // xnor
                 if (is_exec(in.dst)) { rs.exec = r; rs.exec_narrowed = true; }
-                else if (in.dst.value == 106 || in.dst.value == 107) { rs.vcc = r; rs.sreg_bool_narrowed[in.dst.value] = true; }
-                else { rs.sreg_bool[in.dst.value] = r; rs.sreg_bool_narrowed[in.dst.value] = true; }
+                else if (in.dst.value == 106 || in.dst.value == 107) { rs.vcc = r; rs.sreg_bool_narrowed[in.dst.value] = true;
+                                                                       mask_write_clobbers_pair(rs, in.dst.value); }
+                else { rs.sreg_bool[in.dst.value] = r; rs.sreg_bool_narrowed[in.dst.value] = true;
+                       mask_write_clobbers_pair(rs, in.dst.value); }
                 return true;
             }
             // s_lshr_b64 — only the NGG wave-packing form (dst = EXEC) is modeled: it sets EXEC to
@@ -2857,8 +3000,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // invalid SPIR-V (and an NVIDIA Windows driver crash during pipeline creation).
             if (in.opcode == 0x21) {
                 if (in.dst.value != 126 && in.dst.value != 127) ok = false;
+                rs.scc = 0;   // poison: hardware SCC=(result!=0) over the packed mask is cross-lane
                 return true;
             }
+            // 32-bit scalar DATA writes into EXEC halves are rejected (see the SOP1 uint path).
+            if (in.dst.value == 126 || in.dst.value == 127) { ok = false; return true; }
             uint32_t a = val(in.src[0]), c = val(in.src[1]); uint32_t& d = rs.sreg[in.dst.value];
             auto scc_nz = [&](uint32_t v){ rs.scc = b.ucmp(Op_INotEqual, v, b.uconst(0)); };  // SCC = (result != 0)
             switch (in.opcode) {
@@ -2878,6 +3024,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x04: {   // s_addc_u32: dst = src0 + src1 + SCC(carry-in); SCC = carry-out. The high
                                // half of a 64-bit add (pairs with s_add_u32's SCC). Round-trip llvm-mc
                                // gfx1010: 0x82252580 → s_addc_u32 s37, 0, s37. CONFIDENCE: HIGH.
+                    if (!rs.scc) { ok = false; break; }   // SCC poisoned by a mask op: carry-in unknown
                     uint32_t cin = b.sel(rs.scc, b.uconst(1), b.uconst(0));
                     uint32_t s1 = b.ibin(Op_IAdd, a, c);
                     uint32_t k1 = b.ucmp(Op_ULessThan, s1, a);        // wrap in a+c
@@ -2886,18 +3033,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     rs.scc = b.bsel(k1, b.btrue(), k2); break;
                 }
                 // s_min/max (0x06 min_i32, 0x07 min_u32, 0x08 max_i32, 0x09 max_u32): SCC = "src0 was
-                // selected". The RDNA2 ISA min/max SCC split is intentionally ASYMMETRIC so a min/max
-                // pair partitions ties consistently: S_MIN uses strict `S0 < S1`, S_MAX uses non-strict
-                // `S0 >= S1` (S_MAX_I32: D=(S0>=S1)?S0:S1, SCC=(S0>=S1)). Using strict `>` for max set
-                // SCC=0 on exact-equality operands where hardware sets 1 (#397) — D is unaffected (SMax
-                // returns the equal value either way), so it was purely an SCC-flag defect that could
-                // mis-step a downstream s_cbranch_scc/s_cselect on a tie. Round-trip llvm-mc gfx1010:
-                // 0x83000201/0x83800201/0x84000201/0x84800201. CONFIDENCE: HIGH.
-                case 0x06: rs.scc = b.scmp(Op_SLessThan, a, c);         d = b.sext2(Glsl_SMin, a, c); break;
-                case 0x07: rs.scc = b.ucmp(Op_ULessThan, a, c);         d = b.uext2(Glsl_UMin, a, c); break;
-                case 0x08: rs.scc = b.scmp(Op_SGreaterThanEqual, a, c); d = b.sext2(Glsl_SMax, a, c); break;
-                case 0x09: rs.scc = b.ucmp(Op_UGreaterThanEqual, a, c); d = b.uext2(Glsl_UMax, a, c); break;
-                case 0x0A: d = b.sel(rs.scc, a, c); break;           // s_cselect_b32: SCC ? src0 : src1
+                // selected", STRICT in both directions per the ISA pseudocode (S_MIN: SCC = S0 < S1;
+                // S_MAX_I32: "D.i = (S0.i > S1.i) ? S0.i : S1.i; SCC = (S0.i > S1.i)", doc 70648
+                // sec 12.1 ops 6-9) — on a tie SCC = 0 for both min and max. An earlier change (#397)
+                // flipped max to non-strict `>=` quoting a pseudocode line that is not in the actual
+                // document; the 2026-07 ISA audit (#879) re-derived the strict form from the PDF.
+                // D is unaffected either way (the tie value is identical). Round-trip llvm-mc
+                // gfx1010: 0x83000201/0x83800201/0x84000201/0x84800201. CONFIDENCE: HIGH.
+                case 0x06: rs.scc = b.scmp(Op_SLessThan, a, c);    d = b.sext2(Glsl_SMin, a, c); break;
+                case 0x07: rs.scc = b.ucmp(Op_ULessThan, a, c);    d = b.uext2(Glsl_UMin, a, c); break;
+                case 0x08: rs.scc = b.scmp(Op_SGreaterThan, a, c); d = b.sext2(Glsl_SMax, a, c); break;
+                case 0x09: rs.scc = b.ucmp(Op_UGreaterThan, a, c); d = b.uext2(Glsl_UMax, a, c); break;
+                case 0x0A:   // s_cselect_b32: SCC ? src0 : src1 (reads SCC, writes none)
+                    if (!rs.scc) { ok = false; break; }   // SCC poisoned by a mask op
+                    d = b.sel(rs.scc, a, c); break;
                 case 0x0E: d = b.ibin(Op_BitwiseAnd, a, c); scc_nz(d); break;   // s_and_b32
                 case 0x10: d = b.ibin(Op_BitwiseOr,  a, c); scc_nz(d); break;   // s_or_b32
                 case 0x12: d = b.ibin(Op_BitwiseXor, a, c); scc_nz(d); break;   // s_xor_b32
@@ -2912,7 +3061,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x22: { uint32_t sh = b.ibin(Op_BitwiseAnd, c, b.uconst(31));   // s_ashr_i32
                              d = b.sbin(Op_ShiftRightArithmetic, a, sh); scc_nz(d); break; }  // dst = src0 >>a (src1 & 31)
                 case 0x26: d = b.ibin(Op_IMul, a, c); break;         // s_mul_i32 (low 32 bits; no SCC)
-                case 0x31: d = b.ibin(Op_IAdd, b.ibin(Op_ShiftLeftLogical, a, b.uconst(4)), c); break;  // s_lshl4_add_u32 = (src0<<4)+src1
+                case 0x31: {   // s_lshl4_add_u32 = (src0<<4)+src1; SCC = unsigned carry-out of the
+                               // FULL 64-bit sum (ISA op 49: ((u64)S0<<4)+S1 >= 2^32). If S0[31:28]
+                               // is nonzero the shifted value alone reaches 2^32; otherwise the
+                               // shift is exact and overflow reduces to 32-bit add wrap (d < S1).
+                    uint32_t shifted = b.ibin(Op_ShiftLeftLogical, a, b.uconst(4));
+                    d = b.ibin(Op_IAdd, shifted, c);
+                    uint32_t shifted_out = b.ucmp(Op_INotEqual,
+                        b.ibin(Op_ShiftRightLogical, a, b.uconst(28)), b.uconst(0));
+                    uint32_t wrapped = b.ucmp(Op_ULessThan, d, c);
+                    rs.scc = b.bsel(shifted_out, b.btrue(), wrapped); break;
+                }
                 case 0x35: d = b.umul_hi(a, c); break;               // s_mul_hi_u32 (high 32 bits; no SCC)
                 case 0x36: d = b.smul_hi(a, c); break;               // s_mul_hi_i32 (high 32 bits; no SCC).
                                                                      // gfx10 SOP2 opcode is 0x36 (llvm-mc:
@@ -2951,27 +3110,30 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t old_d = vreg_old(b, rs, in.dst.value);
                 auto half = [&](int source, bool high_result) -> uint32_t {
                     uint32_t v = val(in.src[source]);
-                    // Inline float constants already arrive as full f32 values; register operands
-                    // contain two packed halves selected independently for each result half.
-                    if (in.src[source].kind == OperandKind::InlineInt) {
-                        v = b.uconst(fbits(static_cast<float>(in.src[source].value)));
-                    } else if (in.src[source].kind != OperandKind::InlineFloat) {
-                        const uint8_t selectors = high_result ? in.vop3p_opsel_hi : in.vop3p_opsel;
+                    const uint8_t selectors = high_result ? in.vop3p_opsel_hi : in.vop3p_opsel;
+                    if (in.src[source].kind == OperandKind::InlineFloat) {
+                        // A 16-bit operand receives the f16 encoding of the constant (replicated to
+                        // both halves, so the half select is a no-op) — exact even for 1/(2*pi).
+                        v = b.unpack_half(b.uconst(inline_float_f16_bits(in.src[source].value)), 0);
+                    } else if (in.src[source].kind == OperandKind::InlineInt) {
+                        // Integer inline constants are raw two's-complement bits at operand width
+                        // (ISA sec 6.2): the packed operand's halves are the low/high 16 bits of the
+                        // sign-extended value — inline 1 reads as the f16 denormal 0x0001, NOT 1.0.
+                        v = b.unpack_half(b.uconst(static_cast<uint32_t>(in.src[source].value)),
+                                          (selectors >> source) & 1u);
+                    } else {
                         v = b.unpack_half(v, (selectors >> source) & 1u);
                     }
                     const bool negate = high_result
                         ? ((in.vop3p_neg_hi >> source) & 1u) != 0
                         : in.src_neg[source];
-                    return negate ? b.fbin(Op_FSub, b.uconst(0), v) : v;
+                    return negate ? b.fneg(v) : v;
                 };
                 auto operation = [&](bool high) {
                     uint32_t r = in.opcode == 0x0F
                         ? b.fbin(Op_FAdd, half(0, high), half(1, high))
                         : b.fbin(Op_FMul, half(0, high), half(1, high));
-                    if (in.clamp)
-                        r = b.fext2(Glsl_FMax,
-                                    b.fext2(Glsl_FMin, r, b.uconst(fbits(1.0f))),
-                                    b.uconst(fbits(0.0f)));
+                    if (in.clamp) r = b.clamp01(r);
                     return r;
                 };
                 const uint32_t lo = b.pack_half_lo(operation(false));
@@ -2995,14 +3157,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             auto mixv = [&](int k) -> uint32_t {
                 uint32_t v = val(in.src[k]);
                 const bool half = (in.vop3p_opsel_hi >> k) & 1u;
-                if (half && in.src[k].kind != OperandKind::InlineFloat && in.src[k].kind != OperandKind::InlineInt)
-                    v = b.unpack_half(v, (in.vop3p_opsel >> k) & 1u);
+                if (half) {
+                    if (in.src[k].kind == OperandKind::InlineFloat)
+                        // f16-half read of an inline float: the exact documented f16 encoding.
+                        v = b.unpack_half(b.uconst(inline_float_f16_bits(in.src[k].value)), 0);
+                    else if (in.src[k].kind == OperandKind::InlineInt)
+                        // Raw two's-complement bits at operand width: the selected half of the
+                        // sign-extended value (inline 1 -> f16 denormal, not 1.0).
+                        v = b.unpack_half(b.uconst(static_cast<uint32_t>(in.src[k].value)),
+                                          (in.vop3p_opsel >> k) & 1u);
+                    else
+                        v = b.unpack_half(v, (in.vop3p_opsel >> k) & 1u);
+                }
                 if (in.src_abs[k]) v = b.fext1(Glsl_FAbs, v);
-                if (in.src_neg[k]) v = b.fbin(Op_FSub, b.uconst(0), v);
+                if (in.src_neg[k]) v = b.fneg(v);
                 return v;
             };
             uint32_t r = b.fbin(Op_FAdd, b.fbin(Op_FMul, mixv(0), mixv(1)), mixv(2));
-            if (in.clamp) r = b.fext2(Glsl_FMax, b.fext2(Glsl_FMin, r, b.uconst(fbits(1.0f))), b.uconst(fbits(0.0f)));
+            if (in.clamp) r = b.clamp01(r);
             uint32_t& d = rs.vreg[in.dst.value];
             if (in.opcode == 0x20) d = r;
             else if (in.opcode == 0x21)
@@ -3054,7 +3226,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         }
                         if (o.kind == OperandKind::InlineInt)
                             return b.uconst(o.value < 0 ? UINT32_MAX : 0);
-                        if (o.kind == OperandKind::Literal || o.kind == OperandKind::InlineFloat ||
+                        // An inline FLOAT in a 64-bit operand supplies the DOUBLE bit pattern
+                        // (significant bits in the HIGH dword — e.g. 1.0 -> 0x3FF00000_00000000,
+                        // 1/(2*pi) -> 0x3fc45f30_6dc9c882), which val() cannot model (it returned
+                        // the f32 pattern as the LOW dword). Never observed live — reject.
+                        if (o.kind == OperandKind::InlineFloat) { ok = false; return b.uconst(0); }
+                        if (o.kind == OperandKind::Literal ||
                             (o.kind == OperandKind::Special && o.value == 125))
                             return b.uconst(0);
                         ok = false;
@@ -3162,7 +3339,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // insert while preserving the opposite destination half. Trig input is in revolutions.
             if ((in.opcode == 0x54 || in.opcode == 0x55 || in.opcode == 0x61) &&
                 in.sdwa_dst_sel != 6) {
-                uint32_t x = b.unpack_half(a, in.sdwa_src0_sel == 5 ? 1 : 0);
+                uint32_t raw = a;   // inline constants: f16-width encoding, not the f32 pattern
+                if (in.src[0].kind == OperandKind::InlineFloat)
+                    raw = b.uconst(inline_float_f16_bits(in.src[0].value)
+                                   << (in.sdwa_src0_sel == 5 ? 16 : 0));
+                else if (in.src[0].kind == OperandKind::InlineInt)
+                    raw = b.uconst(static_cast<uint32_t>(in.src[0].value));
+                uint32_t x = b.unpack_half(raw, in.sdwa_src0_sel == 5 ? 1 : 0);
                 uint32_t result = in.opcode == 0x54 ? b.frcp(x)
                                 : in.opcode == 0x55 ? b.fext1(Glsl_Sqrt, x)
                                 : b.fext1(Glsl_Cos,
@@ -3197,11 +3380,29 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // f16<->f32 converts (#273 — DOLL's title post PSes carry f16 intermediates):
                 // v_cvt_f16_f32 packs into the LOW half (high bits zero); v_cvt_f32_f16 unpacks the
                 // low half. VERIFIED(round-trip llvm-mc gfx1030: 0x0a/0x0b).
-                case 0x0A: d = b.pack_half_lo(a); break;              // v_cvt_f16_f32
+                case 0x0A:
+                    // Plain-form 16-bit results write D.f16_lo and PRESERVE bits [31:16] (the gfx10
+                    // 16-bit-VALU contract; zero-fill is only the SDWA DWORD+UNUSED_PAD behavior,
+                    // which the decoder marks with has_sdwa — the accepted cvt SDWA subsets all use
+                    // WORD dsts and take the preserve branch above, so has_sdwa here means PAD).
+                    d = in.has_sdwa
+                        ? b.pack_half_lo(a)
+                        : b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)),
+                                 b.pack_half_lo(a));
+                    break;                                          // v_cvt_f16_f32
                 case 0x0B: {                                        // v_cvt_f32_f16 (SDWA may select high half)
-                    d = b.unpack_half(a, in.sdwa_src0_sel == 5 ? 1 : 0);
+                    // An inline constant in a 16-bit operand position supplies its f16-width
+                    // encoding (float) or raw two's-complement bits (int) — NOT the f32 pattern
+                    // val() materializes (unpacking THAT low half turned inline 1.0 into 0.0).
+                    uint32_t raw = a;
+                    if (in.src[0].kind == OperandKind::InlineFloat)
+                        raw = b.uconst(inline_float_f16_bits(in.src[0].value)
+                                       << (in.sdwa_src0_sel == 5 ? 16 : 0));
+                    else if (in.src[0].kind == OperandKind::InlineInt)
+                        raw = b.uconst(static_cast<uint32_t>(in.src[0].value));
+                    d = b.unpack_half(raw, in.sdwa_src0_sel == 5 ? 1 : 0);
                     if (in.src_abs[0]) d = b.fext1(Glsl_FAbs, d);
-                    if (in.src_neg[0]) d = b.fbin(Op_FSub, b.uconst(0), d);
+                    if (in.src_neg[0]) d = b.fneg(d);
                     break;
                 }
                 case 0x0D:                                          // v_cvt_flr_i32_f32
@@ -3271,7 +3472,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if      (in.omod == 1) d = b.fbin(Op_FMul, d, b.uconst(fbits(2.0f)));
                     else if (in.omod == 2) d = b.fbin(Op_FMul, d, b.uconst(fbits(4.0f)));
                     else if (in.omod == 3) d = b.fbin(Op_FMul, d, b.uconst(fbits(0.5f)));
-                    if (in.clamp) d = b.fext2(Glsl_FMax, b.fext2(Glsl_FMin, d, b.uconst(fbits(1.0f))), b.uconst(fbits(0.0f)));
+                    if (in.clamp) d = b.clamp01(d);
                     break;
                 default: ok = false; break;
             }
@@ -3307,9 +3508,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                     in.opcode == 0x39 || in.opcode == 0x3A;
             if (!packed_f16) {
                 if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
-                if (in.src_neg[0]) a = b.fbin(Op_FSub, b.uconst(0), a);
+                if (in.src_neg[0]) a = b.fneg(a);
                 if (in.src_abs[1]) c = b.fext1(Glsl_FAbs, c);
-                if (in.src_neg[1]) c = b.fbin(Op_FSub, b.uconst(0), c);
+                if (in.src_neg[1]) c = b.fneg(c);
             }
             uint32_t& d = vreg[in.dst.value];
             switch (in.opcode) {
@@ -3339,8 +3540,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                           b.ibin(Op_BitwiseAnd, c, mask));
                     break;
                 }
-                case 0x0F: d = b.fext2(Glsl_FMin, a, c); break;       // v_min_f32
-                case 0x10: d = b.fext2(Glsl_FMax, a, c); break;       // v_max_f32
+                // v_min/v_max: hardware returns the OTHER operand when exactly one input is NaN
+                // (ISA 12.7 ops 15/16: "if (S0 == NaN) D = S1; ..."), which is GLSL NMin/NMax.
+                // Plain FMin/FMax are NaN-UNDEFINED — llvmpipe propagates a second-operand NaN, so
+                // the ubiquitous max(min(x,K),lo) clamp idiom could yield NaN pixels where hardware
+                // yields the bound.
+                case 0x0F: d = b.fext2(Glsl_NMin, a, c); break;       // v_min_f32
+                case 0x10: d = b.fext2(Glsl_NMax, a, c); break;       // v_max_f32
                 case 0x11: d = b.sext2(Glsl_SMin, a, c); break;       // v_min_i32
                 case 0x12: d = b.sext2(Glsl_SMax, a, c); break;       // v_max_i32
                 case 0x13: d = b.uext2(Glsl_UMin, a, c); break;       // v_min_u32
@@ -3362,16 +3568,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // v_sub_co_ci(0x29)/v_subrev_co_ci(0x2a). Mirrors the VOP3B 0x128/129/12A logic with VCC.
                 case 0x28: case 0x29: case 0x2A: {
                     uint32_t cin = b.sel(vcc, b.uconst(1), b.uconst(0));
+                    uint32_t carry;
                     if (in.opcode == 0x28) {                          // (a + c) + cin
                         uint32_t s1 = b.ibin(Op_IAdd, a, c); uint32_t k1 = b.ucmp(Op_ULessThan, s1, a);
                         d = b.ibin(Op_IAdd, s1, cin); uint32_t k2 = b.ucmp(Op_ULessThan, d, s1);
-                        vcc = b.bsel(k1, b.btrue(), k2);
+                        carry = b.bsel(k1, b.btrue(), k2);
                     } else {                                          // (x - y) - cin  (subrev swaps)
                         uint32_t x = in.opcode == 0x29 ? a : c, y = in.opcode == 0x29 ? c : a;
                         uint32_t s1 = b.ibin(Op_ISub, x, y); uint32_t k1 = b.ucmp(Op_ULessThan, x, y);
                         d = b.ibin(Op_ISub, s1, cin); uint32_t k2 = b.ucmp(Op_ULessThan, s1, cin);
-                        vcc = b.bsel(k1, b.btrue(), k2);
+                        carry = b.bsel(k1, b.btrue(), k2);
                     }
+                    // Carry-out masks follow ISA 3.9 like compare results: an EXEC-inactive lane's
+                    // VCC bit is written 0, not its raw carry (wave votes must not see phantom bits).
+                    vcc = rs.exec_narrowed ? b.land(rs.exec, carry) : carry;
                     break;
                 }
                 // v_mac_f32 (0x1f) / v_fmac_f32 (0x2b): dst = src0*src1 + dst (accumulate into the dest).
@@ -3405,14 +3615,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // (dst_sel WORD_1 for the SDWA pack idiom; DWORD/WORD_0 = the plain e32 form's
                     // "write [15:0], preserve [31:16]" gfx10 f16-VOP2 contract). #273 (DOLL box-blur).
                     auto source = [&](uint32_t raw, const Operand& operand, uint8_t sel, int k) {
-                        // Inline float constants already carry the numeric f32 value. Register/scalar
-                        // operands carry packed halves and must be selected before abs/neg.
-                        uint32_t v = operand.kind == OperandKind::InlineFloat ? raw
+                        // An inline constant in a 16-bit operand carries its f16-width encoding
+                        // (float — exact even for 1/(2*pi)) or raw two's-complement bits (int:
+                        // inline 1 is the f16 denormal 0x0001, never 1.0). Register/scalar operands
+                        // carry packed halves and must be selected before abs/neg.
+                        uint32_t v = operand.kind == OperandKind::InlineFloat
+                                       ? b.unpack_half(b.uconst(inline_float_f16_bits(operand.value)), 0)
                                    : operand.kind == OperandKind::InlineInt
-                                       ? b.uconst(fbits(static_cast<float>(operand.value)))
+                                       ? b.unpack_half(b.uconst(static_cast<uint32_t>(operand.value)),
+                                                       sel == 5 ? 1 : 0)
                                        : b.unpack_half(raw, sel == 5 ? 1 : 0);
                         if (in.src_abs[k]) v = b.fext1(Glsl_FAbs, v);
-                        if (in.src_neg[k]) v = b.fbin(Op_FSub, b.uconst(0), v);
+                        if (in.src_neg[k]) v = b.fneg(v);
                         return v;
                     };
                     uint32_t x = source(a, in.src[0], in.sdwa_src0_sel, 0);
@@ -3420,14 +3634,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     uint32_t p = in.opcode == 0x32 ? b.fbin(Op_FAdd, x, y)
                                : in.opcode == 0x33 ? b.fbin(Op_FSub, x, y)
                                : in.opcode == 0x35 ? b.fbin(Op_FMul, x, y)
-                               : in.opcode == 0x39 ? b.fext2(Glsl_FMax, x, y)
-                                                   : b.fext2(Glsl_FMin, x, y);
-                    if (in.clamp)
-                        p = b.fext2(Glsl_FMax,
-                                    b.fext2(Glsl_FMin, p, b.uconst(fbits(1.0f))),
-                                    b.uconst(fbits(0.0f)));
+                               : in.opcode == 0x39 ? b.fext2(Glsl_NMax, x, y)   // NaN -> other operand
+                                                   : b.fext2(Glsl_NMin, x, y);
+                    if (in.clamp) p = b.clamp01(p);
                     uint32_t r16 = b.pack_half_lo(p);
-                    d = in.sdwa_dst_sel == 6 ? r16
+                    // dst_sel==6 covers TWO encodings the decoder now distinguishes: the SDWA
+                    // DWORD+UNUSED_PAD form (zero-fill, has_sdwa) and the plain e32 form, whose
+                    // gfx10 contract writes [15:0] and PRESERVES [31:16] (the comment above always
+                    // said so; the code zero-filled both, corrupting live packed high halves).
+                    d = in.sdwa_dst_sel == 6
+                        ? (in.has_sdwa
+                               ? r16
+                               : b.ibin(Op_BitwiseOr,
+                                        b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), r16))
                       : (in.sdwa_dst_sel == 5)
                         ? b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
                                  b.ibin(Op_ShiftLeftLogical, r16, b.uconst(16)))
@@ -3444,7 +3663,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if      (in.omod == 1) d = b.fbin(Op_FMul, d, b.uconst(fbits(2.0f)));
                     else if (in.omod == 2) d = b.fbin(Op_FMul, d, b.uconst(fbits(4.0f)));
                     else if (in.omod == 3) d = b.fbin(Op_FMul, d, b.uconst(fbits(0.5f)));
-                    if (in.clamp) d = b.fext2(Glsl_FMax, b.fext2(Glsl_FMin, d, b.uconst(fbits(1.0f))), b.uconst(fbits(0.0f)));
+                    if (in.clamp) d = b.clamp01(d);
                     break;
                 // A non-float-result opcode carrying a modifier (e.g. an INTEGER SDWA op with CLAMP =
                 // integer saturation) is not modeled by the float-domain omod/clamp above, so applying
@@ -3462,9 +3681,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // Float source modifiers (abs then neg — hardware order), set only on FLOAT compares by the
             // assembler (VOP3-encoded e64 or SDWA forms; e.g. DOLL's `v_cmp_gt_f32_sdwa vcc, |v5|, s4`).
             if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
-            if (in.src_neg[0]) a = b.fbin(Op_FSub, b.uconst(0), a);
+            if (in.src_neg[0]) a = b.fneg(a);
             if (in.src_abs[1]) c = b.fext1(Glsl_FAbs, c);
-            if (in.src_neg[1]) c = b.fbin(Op_FSub, b.uconst(0), c);
+            if (in.src_neg[1]) c = b.fneg(c);
             // v_cmpx_* shares each type's compare set at base+0x10 (f32 0x10-0x1f, i32 0x90-0x9f,
             // u32 0xd0-0xdf); it writes EXEC in addition to VCC. Map to the base compare, then narrow.
             uint32_t op = in.opcode;
@@ -3518,13 +3737,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // modifiers are applied after conversion (equivalent, conversion is monotone/exact).
                 case 0xC9: case 0xCA: case 0xCB: case 0xCC: case 0xCD: case 0xCE: {
                     auto f16v = [&](int k, uint32_t raw) -> uint32_t {
-                        uint32_t v = (in.src[k].kind == OperandKind::InlineFloat ||
-                                      in.src[k].kind == OperandKind::InlineInt)
-                                         ? raw                       // inline: already a full-width value
+                        // Inline constants supply their 16-bit operand encoding: floats the f16
+                        // pattern (0x3C00 for 1.0), ints raw two's-complement low bits (1 -> the
+                        // f16 denormal 0x0001). Reading the raw f32-pattern (float) or the value as
+                        // full-width f32 BITS (int) modeled a different number than hardware.
+                        uint32_t v = in.src[k].kind == OperandKind::InlineFloat
+                                         ? b.unpack_half(b.uconst(inline_float_f16_bits(in.src[k].value)), 0)
+                                   : in.src[k].kind == OperandKind::InlineInt
+                                         ? b.unpack_half(b.uconst(static_cast<uint32_t>(in.src[k].value)), 0)
                                          : b.unpack_half(raw, in.sdwa_src0_sel == 5u && k == 0 ? 1u :
                                                               in.sdwa_src1_sel == 5u && k == 1 ? 1u : 0u);
                         if (in.src_abs[k]) v = b.fext1(Glsl_FAbs, v);
-                        if (in.src_neg[k]) v = b.fbin(Op_FSub, b.uconst(0), v);
+                        if (in.src_neg[k]) v = b.fneg(v);
                         return v;
                     };
                     uint32_t ha = f16v(0, ra), hc = f16v(1, rc);
@@ -3550,10 +3774,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // clobbering a VCC value kept live ACROSS the cmpx, so a later v_cndmask/s_cbranch_vccz/
                     // v_add_co_ci reading VCC got the compare mask instead of the real predicate (#464).
                     rs.exec = b.land(rs.exec, cmp); rs.exec_narrowed = true;
-                } else if (in.dst.kind == OperandKind::SGPR && in.dst.value <= 105) {
-                    rs.sreg_bool[in.dst.value] = cmp; rs.sreg_bool_narrowed[in.dst.value] = true;
                 } else {
-                    vcc = cmp; rs.sreg_bool_narrowed[106] = true; rs.sreg_bool_narrowed[107] = true;
+                    // ISA 3.9: "VCC[n] = EXEC[n] & (test passed for thread n)" — a lane inactive in
+                    // EXEC gets its mask bit forced to 0, never the raw test result. Masking at the
+                    // write keeps wave reductions (vccz votes, mbcnt publications, v_writelane mask
+                    // spills) from seeing phantom bits from inactive lanes. No-op when EXEC is full.
+                    const uint32_t masked = rs.exec_narrowed ? b.land(rs.exec, cmp) : cmp;
+                    if (in.dst.kind == OperandKind::SGPR && in.dst.value <= 105) {
+                        rs.sreg_bool[in.dst.value] = masked; rs.sreg_bool_narrowed[in.dst.value] = true;
+                    } else {
+                        vcc = masked; rs.sreg_bool_narrowed[106] = true; rs.sreg_bool_narrowed[107] = true;
+                    }
                 }
             }
             return true;
@@ -3635,34 +3866,44 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 return true;
             }
             uint32_t old_d = vreg_old(b, rs, in.dst.value);
-            // Float source with its VOP3 modifiers applied: OpFAbs then OpFNegate (hardware order neg(abs(x))).
-            // Returns raw bits (fbin/fext re-bitcast), so it's a drop-in for val() in the FLOAT ops only —
-            // integer VOP3 ops keep val() (modifiers are float-domain; assemblers don't set them on int ops).
+            // Float source with its VOP3 modifiers applied: abs then a sign-bit-exact negate
+            // (hardware order neg(abs(x))). Returns raw bits (fbin/fext re-bitcast), so it's a
+            // drop-in for val() in the FLOAT ops only — integer VOP3 ops keep val() (modifiers are
+            // float-domain; assemblers don't set them on int ops).
             auto fv = [&](int k) -> uint32_t {
                 uint32_t bits = val(in.src[k]);
                 if (in.src_abs[k]) bits = b.fext1(Glsl_FAbs, bits);
-                if (in.src_neg[k]) bits = b.fbin(Op_FSub, b.uconst(0), bits);   // 0.0 - x = -x
+                if (in.src_neg[k]) bits = b.fneg(bits);
                 return bits;
             };
             // Output modifiers on a FLOAT result: OMOD scale (×2/×4/×0.5) then CLAMP saturate to [0,1]
-            // (hardware order: clamp(omod(x))). Wrap each float op's result through this.
+            // (hardware order: clamp(omod(x))). Wrap each float op's result through this. Opcodes
+            // that route through it mark the CLAMP bit consumed; a set CLAMP on any opcode that
+            // does NOT (integer ops, cndmask, the pack family) means unmodeled INTEGER saturation
+            // (ISA 6.5) or an unhandled combination — the dispatch tail rejects it fail-visibly
+            // instead of silently dropping the saturation.
+            bool clamp_routed = false;
             auto fresult = [&](uint32_t bits) -> uint32_t {
+                clamp_routed = true;
                 if (in.omod == 1)      bits = b.fbin(Op_FMul, bits, b.uconst(fbits(2.0f)));
                 else if (in.omod == 2) bits = b.fbin(Op_FMul, bits, b.uconst(fbits(4.0f)));
                 else if (in.omod == 3) bits = b.fbin(Op_FMul, bits, b.uconst(fbits(0.5f)));
-                if (in.clamp) bits = b.fext2(Glsl_FMax, b.fext2(Glsl_FMin, bits, b.uconst(fbits(1.0f))), b.uconst(fbits(0.0f)));
+                if (in.clamp) bits = b.clamp01(bits);
                 return bits;
             };
             if (in.opcode == 0x34B) {                                // v_fma_f16: one selected packed half
                 auto f16src = [&](int k) {
                     const Operand& operand = in.src[k];
                     uint32_t raw = val(operand);
-                    uint32_t value = operand.kind == OperandKind::InlineFloat ? raw
+                    // Inline constants supply their 16-bit operand encoding (see the VOP2 f16 path).
+                    uint32_t value = operand.kind == OperandKind::InlineFloat
+                                       ? b.unpack_half(b.uconst(inline_float_f16_bits(operand.value)), 0)
                                    : operand.kind == OperandKind::InlineInt
-                                       ? b.uconst(fbits(static_cast<float>(operand.value)))
+                                       ? b.unpack_half(b.uconst(static_cast<uint32_t>(operand.value)),
+                                                       (in.vop3p_opsel >> k) & 1u)
                                        : b.unpack_half(raw, (in.vop3p_opsel >> k) & 1u);
                     if (in.src_abs[k]) value = b.fext1(Glsl_FAbs, value);
-                    if (in.src_neg[k]) value = b.fbin(Op_FSub, b.uconst(0), value);
+                    if (in.src_neg[k]) value = b.fneg(value);
                     return value;
                 };
                 uint32_t result = fresult(
@@ -3690,8 +3931,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     auto high_half = [&](const Operand& operand) -> uint32_t {
                         if (operand.kind == OperandKind::InlineInt)
                             return b.uconst(operand.value < 0 ? 0xFFFFFFFFu : 0u);
-                        if (operand.kind == OperandKind::Literal ||
-                            operand.kind == OperandKind::InlineFloat)
+                        // An inline FLOAT 64-bit addend supplies the DOUBLE bit pattern (high dword
+                        // carries the exponent/mantissa; 1/(2*pi) has a nonzero LOW dword too) —
+                        // the previous {f32-bits, 0} model was wrong in both halves. No compiler
+                        // emits a float inline as an integer-mad addend: reject, stay fail-visible.
+                        if (operand.kind == OperandKind::InlineFloat) { ok = false; return b.uconst(0); }
+                        if (operand.kind == OperandKind::Literal)
                             return b.uconst(0);
                         if (operand.kind == OperandKind::Special && operand.value == 125)
                             return b.uconst(0);                       // null pair
@@ -3725,8 +3970,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     vreg[in.dst.value] = result_lo;
                     vreg[hi_dst] = result_hi;
                     predicate_write(b, rs, hi_dst, old_hi);
-                    if (in.sdst.value == 106 || in.sdst.value == 107) rs.vcc = carry_out;
-                    else if (in.sdst.kind == OperandKind::SGPR) rs.sreg_bool[in.sdst.value] = carry_out;
+                    // ISA 3.9 carry-mask rule: an EXEC-inactive lane's bit is written 0, never the
+                    // raw carry (wave votes/spills must not see phantom bits from inactive lanes).
+                    const uint32_t carry_masked =
+                        rs.exec_narrowed ? b.land(rs.exec, carry_out) : carry_out;
+                    if (in.sdst.value == 106 || in.sdst.value == 107) rs.vcc = carry_masked;
+                    else if (in.sdst.kind == OperandKind::SGPR) rs.sreg_bool[in.sdst.value] = carry_masked;
                     else ok = false;
                 }
             } else if (in.opcode == 0x169) {                          // v_mul_lo_u32
@@ -3736,13 +3985,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else if (in.opcode == 0x16c) {                          // v_mul_hi_i32 (high 32 bits, signed)
                 vreg[in.dst.value] = b.smul_hi(val(in.src[0]), val(in.src[1]));
             } else if (in.opcode == 0x157) {                          // v_med3_f32 = median(s0,s1,s2)
+                // ISA op 343: "if (isNan(S0) || isNan(S1) || isNan(S2)) D = V_MIN3_F32(S0,S1,S2)".
+                // The min/max legs use the NaN-aware NMin/NMax (return-the-other-operand), and the
+                // any-NaN case selects min3 explicitly — the plain max(min(...)) formula does not
+                // reproduce the documented NaN fallback on its own.
                 uint32_t s0 = fv(0), s1 = fv(1), s2 = fv(2);
-                uint32_t mn = b.fext2(Glsl_FMin, s0, s1), mx = b.fext2(Glsl_FMax, s0, s1);
-                vreg[in.dst.value] = fresult(b.fext2(Glsl_FMax, mn, b.fext2(Glsl_FMin, mx, s2)));
+                uint32_t mn = b.fext2(Glsl_NMin, s0, s1), mx = b.fext2(Glsl_NMax, s0, s1);
+                uint32_t med = b.fext2(Glsl_NMax, mn, b.fext2(Glsl_NMin, mx, s2));
+                uint32_t min3 = b.fext2(Glsl_NMin, mn, s2);
+                uint32_t nan_any = b.lor(b.fcmp(Op_FUnordNotEqual, s0, s0),
+                                         b.lor(b.fcmp(Op_FUnordNotEqual, s1, s1),
+                                               b.fcmp(Op_FUnordNotEqual, s2, s2)));
+                vreg[in.dst.value] = fresult(b.sel(nan_any, min3, med));
             } else if (in.opcode == 0x151 || in.opcode == 0x154) {    // v_min3_f32 / v_max3_f32
                 // min/max of three floats (DOLL's AA-clamp PS). VERIFIED(round-trip llvm-mc gfx1010:
-                // VOP3 0x151 = v_min3_f32, 0x154 = v_max3_f32 — 0xd551…/0xd554…). CONFIDENCE: HIGH.
-                uint32_t op = in.opcode == 0x151 ? (uint32_t)Glsl_FMin : (uint32_t)Glsl_FMax;
+                // VOP3 0x151 = v_min3_f32, 0x154 = v_max3_f32 — 0xd551…/0xd554…). NaN-aware NMin/
+                // NMax per the ISA one-NaN rule. CONFIDENCE: HIGH.
+                uint32_t op = in.opcode == 0x151 ? (uint32_t)Glsl_NMin : (uint32_t)Glsl_NMax;
                 vreg[in.dst.value] = fresult(b.fext2(op, b.fext2(op, fv(0), fv(1)), fv(2)));
             } else if (in.opcode == 0x368 || in.opcode == 0x369) {    // v_cvt_pknorm_{i16,u16}_f32
                 // Clamp and normalize two f32 values, then pack src0 in bits[15:0] and src1 in
@@ -3876,9 +4135,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         cout = b.bsel(b1, b.btrue(), b2);
                     }
                     vreg[in.dst.value] = res;
-                    // carry-out -> sdst mask (VCC or a saved SGPR-pair bool).
-                    if (in.sdst.value == 106 || in.sdst.value == 107) rs.vcc = cout;
-                    else if (in.sdst.kind == OperandKind::SGPR) rs.sreg_bool[in.sdst.value] = cout;
+                    // carry-out -> sdst mask (VCC or a saved SGPR-pair bool). ISA 3.9: an
+                    // EXEC-inactive lane's mask bit is written 0, never its raw carry.
+                    const uint32_t cout_masked = rs.exec_narrowed ? b.land(rs.exec, cout) : cout;
+                    if (in.sdst.value == 106 || in.sdst.value == 107) rs.vcc = cout_masked;
+                    else if (in.sdst.kind == OperandKind::SGPR) rs.sreg_bool[in.sdst.value] = cout_masked;
                 }
             } else if ((in.opcode == 0x365 || in.opcode == 0x366) && allow_wave && b.is_compute) {
                 // v_mbcnt_lo/hi_u32_b32 (cross-lane): dst = src1 + count of lanes below this one whose mask
@@ -3901,10 +4162,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 vreg[in.dst.value] = fresult(b.fbin(Op_FSub, fv(1), fv(0)));
             } else if (in.opcode == 0x108) {                          // v_mul_f32 (VOP3 form)
                 vreg[in.dst.value] = fresult(b.fbin(Op_FMul, fv(0), fv(1)));
-            } else if (in.opcode == 0x10F) {                          // v_min_f32 (VOP3 form)
-                vreg[in.dst.value] = fresult(b.fext2(Glsl_FMin, fv(0), fv(1)));
-            } else if (in.opcode == 0x110) {                          // v_max_f32 (VOP3 form)
-                vreg[in.dst.value] = fresult(b.fext2(Glsl_FMax, fv(0), fv(1)));
+            } else if (in.opcode == 0x10F) {                          // v_min_f32 (VOP3 form; NaN -> other operand)
+                vreg[in.dst.value] = fresult(b.fext2(Glsl_NMin, fv(0), fv(1)));
+            } else if (in.opcode == 0x110) {                          // v_max_f32 (VOP3 form; NaN -> other operand)
+                vreg[in.dst.value] = fresult(b.fext2(Glsl_NMax, fv(0), fv(1)));
             } else if (in.opcode == 0x107) {                          // v_mul_legacy_f32: DX9 multiply —
                 // 0 * x == 0 for ALL x including ±Inf/NaN (that guarantee is WHY compilers emit it,
                 // e.g. attenuation=0 times 1/dist). Plain IEEE FMul gives NaN for 0*Inf, so emit
@@ -3927,6 +4188,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // modifier (round-trip: `llvm-mc -mcpu=gfx1010` of 0xd51f020a → v_mac_f32_e64 v10,v28,-|v10|).
                 vreg[in.dst.value] = fresult(b.fbin(Op_FAdd, b.fbin(Op_FMul, fv(0), fv(1)), old_d));
             } else ok = false;
+            // A set CLAMP bit on an opcode that does not route through fresult means unmodeled
+            // INTEGER saturation (ISA 6.5: "for integer operations, it clamps the result to the
+            // largest and smallest representable value") or an unhandled pack/select combination
+            // (v_cvt_pkrtz, v_cndmask_e64, the VOP3B carry ops) — reject fail-visibly rather than
+            // silently emitting the wrapping/unclamped result. OMOD on integer results is
+            // architecturally ignored, so only CLAMP gates here.
+            if (ok && in.clamp && !clamp_routed) ok = false;
             if (ok) predicate_write(b, rs, in.dst.value, old_d);
             return true;
         }
@@ -4098,6 +4366,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // per-lane load from the bound constant buffer: byte addr = (offen ? VADDR : 0) + SOFFSET
             // + inst-offset; index = addr>>2; N dwords -> VDATA..+N-1. Descriptor (SRSRC), idxen*stride,
             // and the format-converting buffer_load_format_* variants are deferred. Compute-only (cbuf).
+            // LDS bit set = transfer between LDS and memory instead of VGPRs (ISA Table 98). The
+            // VDATA VGPRs stay untouched on hardware and the data lands in LDS — translating it as
+            // a VGPR load would clobber a live register AND drop the LDS write. Reject until a
+            // buffer->LDS model exists.
+            if (in.mubuf_lds) { ok = false; return true; }
             uint32_t n = 0; bool is_format = false, is_store = false, is_atomic = false;
             bool raw_subword = false, raw_signed = false;
             uint32_t raw_bits = 32;
@@ -4369,8 +4642,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t old = vreg_old(b, rs, d);
                 const auto it = rs.vreg.find(d);
                 const uint32_t value = it == rs.vreg.end() ? b.uconst(0) : it->second;
-                rs.vreg[d] = b.cbuf_atomic_rtn(Op_AtomicUMax, idx, value, binding,
-                                               rs.exec_narrowed, rs.exec, old);
+                const uint32_t pre = b.cbuf_atomic_rtn(Op_AtomicUMax, idx, value, binding,
+                                                       rs.exec_narrowed, rs.exec, old);
+                // ISA 8.1 / Table 98: for atomics GLC means "return pre-op value to VGPR". With
+                // GLC=0 hardware leaves VDATA untouched (it still holds the DATA operand) — the
+                // unconditional write clobbered it (the exercised Astro packet 0xe0e00004 is GLC=0).
+                if (in.mubuf_glc) rs.vreg[d] = pre;
                 return true;
             }
             if (is_store) {
@@ -4638,6 +4915,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                  !is_sample_c_lz && !is_gather_lz &&
                  !is_gather_lz_o && !is_sample_lz_o) || (!dim2d && !dim3d && !dimcube)) { ok = false; return true; }
             if (res->cls != ResourceClass::Texture) { ok = false; return true; }
+            // UNRM=1 supplies unnormalized (texel-space) coordinates (Table 100). Compilers set it
+            // only on loads/stores/atomics — and our fetch paths are already texel-space — but a
+            // SAMPLER op with UNRM set would treat texel coords as normalized and sample a wildly
+            // wrong location. Reject the sampler forms until a live title exercises one.
+            if (in.mimg_unorm && !is_load) { ok = false; return true; }
             // coords (normalized float for sample, integer texel for load). Non-NSA: consecutive from VADDR.
             // NSA (len>2): coord0 = VADDR, coord k>=1 = byte (k-1) of the extra address dwords words[2..3].
             const bool nsa = in.len_dwords > 2;
@@ -4677,16 +4959,28 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 else                b.image_sample_lod_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)),
                                                           b.uconst(0), out);   // _lz: base level
             } else if (is_sample_c_lz) {
-                // Astro Bot shadow/visibility packet (exact live opcode 0x2f, dim 2D_ARRAY,
-                // NSA vaddr=[u,v,layer,dref]). Integer views and non-array dimensions are not
-                // legal for this lowering; reject rather than silently turning a comparison
-                // sample into an ordinary color read.
+                // Astro Bot shadow/visibility packet (opcode 0x2f, dim 2D_ARRAY, NSA). ISA 8.2.5
+                // vaddr order is "{offset}{bias}{z-compare}{derivative}{body}" — the z-compare
+                // reference PRECEDES the coordinates, so SAMPLE_C_LZ 2D_ARRAY reads
+                // [dref, u, v, slice] (the same modifier-first rule the _b/_o paths already use).
+                // The earlier [u,v,layer,dref] mapping rotated every operand (#883).
+                // EVIDENCE: no rendered-frame validation exists for either order — Astro crashes
+                // in engine init before it reaches shadow rendering (#825), and the prior
+                // "[u,v,layer,dref]" comment was an un-round-tripped interpretation of the packet,
+                // not a captured/disassembled fact. This order is grounded in the ISA plus an
+                // llvm-mc gfx1030 round-trip of a canonical c_lz 2D_ARRAY NSA packet
+                // (image_sample_c_lz v5, [v10,v11,v12,v13], ... = 0xf0bc012a 0x0040050a 0x000d0c0b:
+                // four consecutive address VGPRs, dref at slot 0 per 8.2.5) and LLVM's own
+                // llvm.amdgcn.image.sample.c.lz lowering (dref before coords). CONFIDENCE: MED —
+                // the #825 lane must re-validate against a real rendered shadow once it lights up.
+                // Integer views and non-array dimensions are not legal for this lowering; reject
+                // rather than silently turning a comparison sample into an ordinary color read.
                 if (in.mimg_dim != 5u || uint_texture || !res->depth_compare) {
                     ok = false; return true;
                 }
                 b.declare_texture(res->binding, Dim_2D, false, true, true);
                 b.image_sample_dref_lz_2d_array(
-                    res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), vread(cvg(3)), out);
+                    res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(3)), vread(cvg(0)), out);
             } else if (is_gather_lz || is_gather_lz_o) {
                 // gather4 dmask selects ONE channel (must be a single bit); the result is always the
                 // four texels of that channel -> 4 consecutive VDATA VGPRs, gather order preserved.
@@ -4735,6 +5029,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             return true;
         }
         case Rdna2Format::DS: {
+            // GDS=1 targets the device-global data share, not workgroup LDS — running it against
+            // our LDS model would silently give per-workgroup semantics. Reject — EXCEPT
+            // ds_append/ds_consume (0x3e/0x3d): Astro Bot's live counter words carry GDS=1
+            // (0xd8fa/0xd8f6 — llvm-mc gfx1030 round-trip: plain append is 0xd8f8), and the
+            // existing wave_append model was landed and live-validated against exactly those
+            // packets (#554/#580). Kept as a documented per-workgroup approximation of the
+            // device-global counter (exact for the exercised dispatch shapes). CONFIDENCE: MED.
+            if (in.ds_gds && in.opcode != 0x3d && in.opcode != 0x3e) { ok = false; return true; }
             // ds_write_addtid_b32 (0xb0) / ds_read_addtid_b32 (0xb1) in a GRAPHICS stage (#273):
             // a per-lane VGPR spill through LDS (addr = M0 + offset + tid*4) — DOLL's title post
             // PSes spill v15 before their accumulation loop and reload it after. Per-invocation the
@@ -4889,6 +5191,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // deliver the interpolated attribute component from the matching Input varying. Fragment-only.
             if (!b.is_fragment) { ok = false; return true; }
             if (in.opcode == 0) return true;   // p1: no-op (p2/mov produce the value)
+            // v_interp_mov_f32's VSRC selects WHICH parameter to load: 0=P10 (v1-v0 delta),
+            // 1=P20 (v2-v0 delta), 2=P0 (provoking-vertex value). Only P0 maps to our
+            // rasterizer-interpolated flat varying; the per-vertex deltas are not recoverable
+            // from it, so a P10/P20 load must reject, not silently return the attribute value.
+            if (in.opcode == 2 && in.src[0].value != 2) { ok = false; return true; }
             uint32_t old = vreg_old(b, rs, in.dst.value);
             rs.vreg[in.dst.value] = b.interp_read(in.vintrp_attr, in.vintrp_chan);
             predicate_write(b, rs, in.dst.value, old);
@@ -5672,7 +5979,9 @@ bool emit_compute_cfg_state_machine(
             }
             b.store_function(kv.second, value);
         }
-        b.store_function(scc_var, state.scc);
+        // A poisoned (0) SCC degrades to bfalse at the block boundary: the same-block consumers
+        // reject on the sentinel; cross-block staleness matches the pre-poison model.
+        b.store_function(scc_var, state.scc ? state.scc : b.bfalse());
         b.store_function(vcc_var, state.vcc);
         b.store_function(exec_var, state.exec);
     };
@@ -5831,8 +6140,13 @@ bool emit_compute_cfg_state_machine(
         } else {
             uint32_t condition = 0;
             switch (terminator->opcode) {
-                case 0x04: condition = b.logical_not(state.scc); break; // s_cbranch_scc0
-                case 0x05: condition = state.scc; break;
+                // state.scc == 0 marks SCC poisoned by a 64-bit mask op inside this block (its
+                // hardware SCC is a cross-lane reduction) — reject rather than branch on a stale
+                // value an older s_cmp produced.
+                case 0x04: if (!state.scc) return false;
+                           condition = b.logical_not(state.scc); break; // s_cbranch_scc0
+                case 0x05: if (!state.scc) return false;
+                           condition = state.scc; break;
                 case 0x06: case 0x07: case 0x08: case 0x09: break;
                 default: return false;
             }
@@ -6281,6 +6595,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (!emit_range(0, F.branch_pc)) return false;
             if (idx >= ins.size() || ins[idx].pc != F.branch_pc) return false;
             ++idx; // consume the conditional branch
+            // An scc-conditioned forward-if with a POISONED SCC (rs.scc == 0: a 64-bit mask op was
+            // the last architectural SCC writer, unrepresentable per-lane) must reject — this is
+            // exactly the non-adjacent stale-SCC consumer from the ISA audit (#879).
+            if (!F.on_exec && !F.on_vcc && !rs.scc) return false;
             uint32_t condition = F.on_exec ? rs.exec : (F.on_vcc ? rs.vcc : rs.scc);
             condition = F.on_scc0 ? condition : b.logical_not(condition);
             const RegState before = rs;
@@ -6324,7 +6642,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         b.t_u32, then_s[reg], then_block, else_value, else_block);
             }
             if (then_scc != rs.scc)
-                rs.scc = b.emit_phi_2way(b.t_bool, then_scc, then_block, rs.scc, else_block);
+                // A poisoned (0) input degrades to bfalse across the merge — no invalid SPIR-V and
+                // no stricter rejection than the pre-poison behavior; straight-line consumers of a
+                // poisoned SCC are still rejected at their own sites.
+                rs.scc = b.emit_phi_2way(b.t_bool, then_scc ? then_scc : b.bfalse(), then_block,
+                                         rs.scc ? rs.scc : b.bfalse(), else_block);
             if (then_vcc != rs.vcc)
                 rs.vcc = b.emit_phi_2way(b.t_bool, then_vcc, then_block, rs.vcc, else_block);
             if (then_exec != rs.exec)
@@ -6361,7 +6683,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         std::vector<PhiRec> phis;
         for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
         for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
-        { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc, preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
+        // A poisoned (0) SCC live-in degrades to bfalse — the loop shapes re-produce SCC via their
+        // in-loop s_cmp before any read, so the phi seed is dead in practice; 0 would be invalid SSA.
+        { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc ? rs.scc : b.bfalse(), preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
         { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.vcc, preheader, p); rs.vcc = ph; phis.push_back({0, 3, ph, p}); }
         // The header executes again after the back-edge. A direct/SRT descriptor overwritten
         // anywhere in the loop is therefore not an invariant entry descriptor at header compile
@@ -6370,6 +6694,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         b.emit_loopmerge(merge, cont); b.emit_branch(check); b.emit_label(check);
         // 3. Condition block: emit [header, exit_branch); the SCC exit becomes OpBranchConditional.
         if (!emit_range(L.header_pc, L.exit_branch_pc)) return false;
+        if (!rs.scc) return false;   // condition region left SCC poisoned: the exit test is unknowable
         // Snapshot condition-region register values (these dominate the merge — see defect A above).
         std::unordered_map<int,uint32_t> condv_val, conds_val;
         for (int r : condv) condv_val[r] = vget(r);
@@ -6392,6 +6717,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         b.emit_branch(cont); b.emit_label(cont);
         for (auto& pr : phis) {
             uint32_t nv = pr.dom == 0 ? vget(pr.reg) : pr.dom == 1 ? sget(pr.reg) : pr.dom == 2 ? rs.scc : rs.vcc;
+            if (!nv && pr.dom == 2) nv = b.bfalse();   // poisoned SCC back-edge value: bfalse (dead in practice)
             b.patch_phi(pr.patch, nv, cont);
         }
         b.emit_branch(hdr);
@@ -6552,7 +6878,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             std::vector<PhiRec> phis;
             for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
             for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
-            { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc, preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
+            // A poisoned (0) SCC live-in degrades to bfalse (invalid as an SSA phi input; dead in
+            // practice — the loop shapes re-produce SCC before any read).
+            { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc ? rs.scc : b.bfalse(), preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
             { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.vcc, preheader, p); rs.vcc = ph; phis.push_back({0, 3, ph, p}); }
             { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.exec, preheader, p); rs.exec = ph; phis.push_back({0, 4, ph, p}); }
             std::vector<int> mask_keys;                        // saved masks live at entry: loop-carried bools
@@ -6589,6 +6917,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                             : pr.dom == 3 ? rs.vcc
                             : pr.dom == 4 ? rs.exec
                             : (rs.sreg_bool.count(pr.reg) ? rs.sreg_bool[pr.reg] : pr.phi);
+                if (!nv && pr.dom == 2) nv = b.bfalse();   // poisoned SCC back-edge value
                 b.patch_phi(pr.patch, nv, cont);
             }
             b.emit_branch(hdr);
@@ -6634,6 +6963,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 // scc0/vccz/execz: branch (skip block) taken when the flag==0 → the block runs when
                 // flag!=0; scc1/vccnz are the inverse. Compute execz first reduces the per-invocation
                 // EXEC bool to the architecture's wave-wide "any lane active" predicate.
+                // A poisoned SCC (0: last written by a 64-bit mask op) cannot condition a real
+                // structured if — reject (the ISA-audit #879 stale-SCC consumer).
+                if (!F.on_exec && !F.on_vcc && !rs.scc) return false;
                 uint32_t cond_reg = F.on_exec
                     ? (b.is_compute ? b.subgroup_any(rs.exec) : rs.exec)
                     : (F.on_vcc ? rs.vcc : rs.scc);
@@ -6661,7 +6993,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     b.emit_branch(mergeL); b.emit_label(mergeL);
                     for (int r : ifv) rs.vreg[r] = b.emit_phi_2way(b.t_u32,  pre_v[r], preblock, then_v[r], thenEnd);
                     for (int r : ifs) rs.sreg[r] = b.emit_phi_2way(b.t_u32,  pre_s[r], preblock, then_s[r], thenEnd);
-                    if (then_scc != pre_scc) rs.scc = b.emit_phi_2way(b.t_bool, pre_scc, preblock, then_scc, thenEnd);
+                    if (then_scc != pre_scc)   // poisoned (0) inputs degrade to bfalse across the merge
+                        rs.scc = b.emit_phi_2way(b.t_bool, pre_scc ? pre_scc : b.bfalse(), preblock,
+                                                 then_scc ? then_scc : b.bfalse(), thenEnd);
                     if (then_vcc != pre_vcc) rs.vcc = b.emit_phi_2way(b.t_bool, pre_vcc, preblock, then_vcc, thenEnd);
                     // EXEC changed inside the arm (saveexec / v_cmpx / restore): merge it like any value.
                     // Narrowed-ness is sticky (either edge narrowed → post-merge writes stay predicated).
@@ -6715,7 +7049,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         if (then_v[r] != ev) rs.vreg[r] = b.emit_phi_2way(b.t_u32, then_v[r], thenEnd, ev, elseEnd); }
                     for (int r : ws) { uint32_t es = sget(r);
                         if (then_s[r] != es) rs.sreg[r] = b.emit_phi_2way(b.t_u32, then_s[r], thenEnd, es, elseEnd); }
-                    if (then_scc != rs.scc) rs.scc = b.emit_phi_2way(b.t_bool, then_scc, thenEnd, rs.scc, elseEnd);
+                    if (then_scc != rs.scc)   // poisoned (0) inputs degrade to bfalse across the merge
+                        rs.scc = b.emit_phi_2way(b.t_bool, then_scc ? then_scc : b.bfalse(), thenEnd,
+                                                 rs.scc ? rs.scc : b.bfalse(), elseEnd);
                     if (then_vcc != rs.vcc) rs.vcc = b.emit_phi_2way(b.t_bool, then_vcc, thenEnd, rs.vcc, elseEnd);
                     if (then_exec != rs.exec) rs.exec = b.emit_phi_2way(b.t_bool, then_exec, thenEnd, rs.exec, elseEnd);
                     rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
@@ -7004,7 +7340,25 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
         // exec,saved -> shade -> export): the surviving lanes are the ones that passed the test. (When EXEC
         // was never narrowed this is a no-op — the common sRGB/tonemap restore-then-export path.)
         if (rs.exec_narrowed) { b.discard_unless(rs.exec); rs.exec = b.btrue(); rs.exec_narrowed = false; }
+        // MRTZ (target 8): the shader-exported depth. EN bit 0 enables the Z VGPR (compilers emit
+        // EN=0x1); COMPR depth is unmodeled. Previously this export was silently DROPPED, leaving
+        // fixed-function interpolated Z where hardware uses the shader's value (#883).
+        if (in.exp_target == 8) {
+            if (in.exp_compr || !(in.exp_en & 1u)) return false;
+            bool eok = true;
+            const uint32_t z = operand_bits(b, rs, in, in.src[0], &eok);
+            if (!eok) return false;
+            b.export_depth(z);
+            return true;
+        }
         if (in.exp_target < exported.size() && !exported[in.exp_target]) {
+            // EN (Table 56) selects which VSRC channels the export sends; hardware does not update
+            // disabled components. EN=0 sends nothing; a PARTIAL mask cannot be expressed against
+            // our full-RGBA attachments (the old code exported stale VGPR data in the disabled
+            // channels) — reject fail-visibly until partial-EN MRT exports are modeled with the
+            // export-format machinery. All exercised titles export EN=0xF.
+            if (in.exp_en == 0) return true;
+            if (in.exp_en != 0xFu) return false;
             bool eok = true;   // a Special (wave-mask) source has no data value — reject, don't export 0 (#134)
             if (in.exp_compr) {
                 // COMPR: the 4 channels are two f16x2 pairs — src[0] holds (r,g), src[1] holds (b,a).
@@ -7072,6 +7426,11 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
     bool exported = false;
     auto exp_fn = [&](const Rdna2Inst& in) -> bool {         // EXP POS0..3 -> gl_Position; PARAM -> varyings
         bool eok = true;   // a Special (wave-mask) source has no data value — reject, don't export 0 (#134)
+        // COMPR pos/param exports carry two packed f16x2 pairs, not four f32 fields — reading the
+        // VSRCs as full floats would pass packed-half bit patterns as x/y and stale registers as
+        // z/w. Never observed in a vertex stage (compilers export positions/params at 32 bits);
+        // reject fail-visibly until a live title exercises one.
+        if (in.exp_compr) return false;
         // v_cmpx is now allowed in the vertex shell (allow_exec_update=true below): a divergent block
         // (v_cmpx … s_mov_b64 exec, saved — DOLL's per-vertex lighting/fog attenuation) predicates its
         // VGPR writes like compute. A vertex MUST still export from full EXEC — the compiled shape
@@ -7079,15 +7438,21 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
         // (fail-visibly) rather than export possibly-inactive-lane values.
         if (rs.exec_narrowed && (in.exp_target >= 32 || (in.exp_target >= 12 && in.exp_target <= 15))) return false;
         if (in.exp_target >= 12 && in.exp_target <= 15 && !exported) {
+            // A position export must supply all four components (EN=0xF); a partial position is
+            // not meaningfully completable, so reject rather than invent components.
+            if (in.exp_en != 0xFu) return false;
             b.export_position(operand_bits(b, rs, in, in.src[0], &eok), operand_bits(b, rs, in, in.src[1], &eok),
                               operand_bits(b, rs, in, in.src[2], &eok), operand_bits(b, rs, in, in.src[3], &eok));
             exported = true;
         } else if (in.exp_target >= 32) {                    // PARAM0.. -> remapped PS input varying
             const uint32_t source = in.exp_target - 32;
-            const uint32_t x = operand_bits(b, rs, in, in.src[0], &eok);
-            const uint32_t y = operand_bits(b, rs, in, in.src[1], &eok);
-            const uint32_t z = operand_bits(b, rs, in, in.src[2], &eok);
-            const uint32_t w = operand_bits(b, rs, in, in.src[3], &eok);
+            // EN gates which channels the export sends (vec2/vec3 varyings use EN=0x3/0x7):
+            // hardware leaves disabled channels unwritten (undefined for the PS). Substitute a
+            // deterministic 0.0 for them instead of exporting stale VGPR data.
+            const uint32_t x = (in.exp_en & 1u) ? operand_bits(b, rs, in, in.src[0], &eok) : b.uconst(0);
+            const uint32_t y = (in.exp_en & 2u) ? operand_bits(b, rs, in, in.src[1], &eok) : b.uconst(0);
+            const uint32_t z = (in.exp_en & 4u) ? operand_bits(b, rs, in, in.src[2], &eok) : b.uconst(0);
+            const uint32_t w = (in.exp_en & 8u) ? operand_bits(b, rs, in, in.src[3], &eok) : b.uconst(0);
             if (!pixel_inputs || source >= 32 || !(pixel_inputs->valid_mask & (1u << source)))
                 b.export_param(source, x, y, z, w);           // absent control retains identity wiring
             if (pixel_inputs) {
