@@ -198,7 +198,6 @@ namespace {
     size_t g_sse4a_chain_used = 0;
     uint64_t g_sse4a_fastpath_sites[kSse4aFastpathMaxPatches]{};
     volatile LONG g_sse4a_fastpath_count = 0;
-    volatile LONG g_sse4a_fastpath_lock = 0;
 
     // Astro Bot PPSA21564's EXTRQs live in two unwind-described vector-unpack functions. GNU objdump
     // independently confirms every address below as an instruction boundary. The exact function
@@ -900,25 +899,9 @@ namespace {
             }
         }
         if (code == EXCEPTION_ILLEGAL_INSTRUCTION) {
-            const uint64_t site = c->Rip;
-            Sse4aPatchPlan plan = sse4a_patch_plan(site);
-            if (plan.count || sse4a_fastpath_site(site)) {
-                while (InterlockedCompareExchange(&g_sse4a_fastpath_lock, 1, 0) != 0)
-                    YieldProcessor();
-                // Another faulting thread may have installed this detour while we waited. Replay the
-                // now-patched site with the original register context instead of emulating it twice.
-                if (sse4a_fastpath_site(site)) {
-                    InterlockedExchange(&g_sse4a_fastpath_lock, 0);
-                    return EXCEPTION_CONTINUE_EXECUTION;
-                }
-                plan = sse4a_patch_plan(site);
-                const bool installed = plan.count && emit_sse4a_fastpath(plan);
-                InterlockedExchange(&g_sse4a_fastpath_lock, 0);
-                if (installed) {
-                    c->Rip = site;
-                    return EXCEPTION_CONTINUE_EXECUTION;
-                }
-            }
+            // Only exact, independently verified load-time manifests may rewrite executable bytes.
+            // An unmanifested EXTRQ remains a one-shot CONTEXT emulation on every execution; never
+            // turn an arbitrary #UD address into a permanent detour based on bytes alone.
             if (try_emulate_sse4a(c)) return EXCEPTION_CONTINUE_EXECUTION;
         }
         // Lazy-commit inside a guest-RESERVED range — parity with the Linux SIGSEGV handler. The guest

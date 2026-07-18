@@ -295,6 +295,8 @@ static void test_sse4a_fastpath() {
     constexpr size_t chain_sse4a_offset = chain_code_offset + 28;
     constexpr size_t chain_second_wrapper_offset = 0x380;
     constexpr size_t false_candidate_offset = 0x500;
+    constexpr size_t unverified_code_offset = 0x600;
+    constexpr size_t unverified_sse4a_offset = unverified_code_offset + 19;
     constexpr size_t data_offset = 0x100;
     const uint8_t code[code_size] = {
         0x48,0x83,0xec,0x18,                         // sub rsp,0x18
@@ -362,6 +364,14 @@ static void test_sse4a_fastpath() {
         0xc0,0xc0,0x01,                                // rol al,1 (not part of the immediate)
         0xc3
     };
+    const uint8_t unverified_code[] = {
+        0x48,0xb8, 0,0,0,0,0,0,0,0,                 // movabs rax,data
+        0xf3,0x0f,0x6f,0x00,                          // movdqu xmm0,[rax] (control)
+        0xf3,0x0f,0x6f,0x48,0x10,                    // movdqu xmm1,[rax+0x10] (value)
+        0x66,0x48,0x0f,0x79,0xc8,                    // unmanifested extrq xmm1,xmm0
+        0x66,0x48,0x0f,0x7e,0xc8,                    // movq rax,xmm1
+        0xc3
+    };
     LoadedImage image;
     image.base = base;
     image.min_vaddr = 0;
@@ -381,6 +391,8 @@ static void test_sse4a_fastpath() {
            sizeof(chain_second_wrapper));
     memcpy(image.mem.data() + false_candidate_offset, false_candidate,
            sizeof(false_candidate));
+    memcpy(image.mem.data() + unverified_code_offset, unverified_code,
+           sizeof(unverified_code));
     const uint64_t data_address = base + data_offset;
     memcpy(image.mem.data() + 27, &data_address, sizeof(data_address));
     memcpy(image.mem.data() + short_code_offset + 2, &data_address, sizeof(data_address));
@@ -388,6 +400,8 @@ static void test_sse4a_fastpath() {
            sizeof(data_address));
     memcpy(image.mem.data() + chain_code_offset + 2, &data_address, sizeof(data_address));
     memcpy(image.mem.data() + chain_second_wrapper_offset + 2, &data_address,
+           sizeof(data_address));
+    memcpy(image.mem.data() + unverified_code_offset + 2, &data_address,
            sizeof(data_address));
     const int32_t short_successor_delta = static_cast<int32_t>(
         short_sse4a_offset + 4 -
@@ -418,6 +432,13 @@ static void test_sse4a_fastpath() {
           "an EXTRQ byte pattern inside another instruction is never load-time patched");
     install_trap_handler();
     using GuestFn = uint64_t (*)();
+    const GuestFn unverified_function =
+        (GuestFn)(uintptr_t)(base + unverified_code_offset);
+    const uint64_t before_unverified = sse4a_fastpath_patch_count();
+    CHECK(unverified_function() == 0xab &&
+              sse4a_fastpath_patch_count() == before_unverified &&
+              *(const uint8_t*)(uintptr_t)(base + unverified_sse4a_offset) == 0x66,
+          "an executed unverified EXTRQ is emulated without rewriting guest code");
     const GuestFn function = (GuestFn)(uintptr_t)base;
     const uint64_t first = function();
     const uint64_t second = function();
