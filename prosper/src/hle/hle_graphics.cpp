@@ -30,6 +30,8 @@ namespace prosper {
 
 #define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5)
+#define HLE7(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
+                                       uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 
 namespace {
 // Optional fork-safe counter bumped when the guest calls into the graphics libs (libSceAgc /
@@ -367,6 +369,23 @@ HLE(g_vo_devcap) { if (a1) *(uint64_t*)(uintptr_t)a1 = 0; return 0; }
 // sceVideoOutIsOutputSupported (Nv8c-Kb+DUM): (port_type, mode/feature) -> bool. A standard main-bus
 // output supports the queried mode → 1.
 HLE(g_vo_is_output_supported) { vo_argtrace("IsOutputSupported", a0,a1,a2,a3,a4,a5); return 1; }
+
+// sceVideoOutSetBufferAttribute (i6-sR91Wt-4): initialize the legacy/Gen4 BufferAttribute from
+// (attr, pixel_format, tiling_mode, aspect_ratio, width, height, pitch_in_pixel). The ABI object is
+// 0x28 bytes: seven u32 fields followed by reserved u32/u64 storage. Size-exact initialization keeps
+// reserved bytes deterministic without touching the caller's following object.
+HLE7(g_vo_set_buffer_attribute) {
+    if (!a0) return 0;
+    uint8_t* p = (uint8_t*)(uintptr_t)a0;
+    memset(p, 0, 0x28);
+    *(uint32_t*)(p + 0x00) = (uint32_t)a1;   // pixel_format
+    *(uint32_t*)(p + 0x04) = (uint32_t)a2;   // tiling_mode
+    *(uint32_t*)(p + 0x08) = (uint32_t)a3;   // aspect_ratio
+    *(uint32_t*)(p + 0x0c) = (uint32_t)a4;   // width
+    *(uint32_t*)(p + 0x10) = (uint32_t)a5;   // height
+    *(uint32_t*)(p + 0x14) = (uint32_t)a6;   // pitch_in_pixel
+    return 0;
+}
 
 // sceVideoOutSetBufferAttribute2 (PjS5uASwcV8): fill the caller's VideoOutBufferAttribute2 (0x50
 // bytes, Kyty layout) from (attr, pixel_format, tiling_mode, width, height, option, [dcc_control,
@@ -726,7 +745,7 @@ void register_graphics_hle() {
     R("sceVideoOutGetResolutionStatus", g_vo_resstatus);
     R("sceVideoOutGetVblankStatus", g_vo_vblankstatus);
     R("sceVideoOutGetDeviceCapabilityInfo", g_vo_devcap);
-    R("sceVideoOutRegisterBuffers", g_vo_close);R("sceVideoOutSetBufferAttribute", g_vo_close);
+    R("sceVideoOutRegisterBuffers", g_vo_close);R("sceVideoOutSetBufferAttribute", g_vo_set_buffer_attribute);
     // PS5 "2"/query variants — the 5 previously-unimplemented VideoOut NIDs (resolved via shadPS4
     // aerolib + Kyty VideoOut.cpp). Registered by raw NID (PS5-specific, not in our name DB).
     RN("Nv8c-Kb+DUM", g_vo_is_output_supported);   // sceVideoOutIsOutputSupported
