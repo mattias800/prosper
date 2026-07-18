@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace prosper::gpu {
 
@@ -28,6 +29,20 @@ float flt(uint32_t bits) {
     float f;
     std::memcpy(&f, &bits, sizeof f);
     return f;
+}
+
+int32_t add_scissor_offset(uint32_t coordinate, int32_t offset, bool disabled) {
+    const int64_t value = static_cast<int64_t>(coordinate) + (disabled ? 0 : offset);
+    return static_cast<int32_t>(std::clamp<int64_t>(
+        value, std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::max()));
+}
+
+int32_t scale_scissor_boundary(int32_t value, float scale, bool lower) {
+    const double scaled = static_cast<double>(value) * static_cast<double>(scale);
+    const double rounded = lower ? std::floor(scaled) : std::ceil(scaled);
+    return static_cast<int32_t>(std::clamp(
+        rounded, static_cast<double>(std::numeric_limits<int32_t>::min()),
+        static_cast<double>(std::numeric_limits<int32_t>::max())));
 }
 
 // sRGB (gamma-encoded) 8-bit sample -> linear [0,1]. VkClearColorValue's float channels are LINEAR
@@ -215,6 +230,80 @@ RenderState extract_render_state(const GpuState& st) {
     rs.vport_zscale  = flt(rd(st.cx, P::PA_CL_VPORT_ZSCALE));
     rs.vport_zoffset = flt(rd(st.cx, P::PA_CL_VPORT_ZOFFSET));
 
+    // AMD's rasterization contract intersects screen, window, generic, and optionally viewport
+    // scissors. Window-space rectangles apply PA_SC_WINDOW_OFFSET independently unless their own
+    // WINDOW_OFFSET_DISABLE bit is set. AGC initializes every rectangle to [0,16384), so missing
+    // members of a partially-programmed state use that published driver default rather than zero.
+    const uint32_t scissor_registers[] = {
+        P::PA_SC_SCREEN_SCISSOR_TL, P::PA_SC_SCREEN_SCISSOR_BR,
+        P::PA_SC_WINDOW_OFFSET, P::PA_SC_WINDOW_SCISSOR_TL, P::PA_SC_WINDOW_SCISSOR_BR,
+        P::PA_SC_GENERIC_SCISSOR_TL, P::PA_SC_GENERIC_SCISSOR_BR,
+        P::PA_SC_VPORT_SCISSOR_0_TL, P::PA_SC_VPORT_SCISSOR_0_BR, P::PA_SC_MODE_CNTL_0,
+    };
+    rs.has_scissor = std::any_of(std::begin(scissor_registers), std::end(scissor_registers),
+                                 [&](uint32_t reg) { return st.cx.count(reg) != 0; });
+    if (rs.has_scissor) {
+        const uint32_t screen_tl = st.cx.count(P::PA_SC_SCREEN_SCISSOR_TL)
+            ? rd(st.cx, P::PA_SC_SCREEN_SCISSOR_TL) : 0u;
+        const uint32_t screen_br = st.cx.count(P::PA_SC_SCREEN_SCISSOR_BR)
+            ? rd(st.cx, P::PA_SC_SCREEN_SCISSOR_BR) : 0x40004000u;
+        const uint32_t window_offset = st.cx.count(P::PA_SC_WINDOW_OFFSET)
+            ? rd(st.cx, P::PA_SC_WINDOW_OFFSET) : 0u;
+        const uint32_t window_tl = st.cx.count(P::PA_SC_WINDOW_SCISSOR_TL)
+            ? rd(st.cx, P::PA_SC_WINDOW_SCISSOR_TL) : 0x80000000u;
+        const uint32_t window_br = st.cx.count(P::PA_SC_WINDOW_SCISSOR_BR)
+            ? rd(st.cx, P::PA_SC_WINDOW_SCISSOR_BR) : 0x40004000u;
+        const uint32_t generic_tl = st.cx.count(P::PA_SC_GENERIC_SCISSOR_TL)
+            ? rd(st.cx, P::PA_SC_GENERIC_SCISSOR_TL) : 0x80000000u;
+        const uint32_t generic_br = st.cx.count(P::PA_SC_GENERIC_SCISSOR_BR)
+            ? rd(st.cx, P::PA_SC_GENERIC_SCISSOR_BR) : 0x40004000u;
+        const uint32_t viewport_tl = st.cx.count(P::PA_SC_VPORT_SCISSOR_0_TL)
+            ? rd(st.cx, P::PA_SC_VPORT_SCISSOR_0_TL) : 0x80000000u;
+        const uint32_t viewport_br = st.cx.count(P::PA_SC_VPORT_SCISSOR_0_BR)
+            ? rd(st.cx, P::PA_SC_VPORT_SCISSOR_0_BR) : 0x40004000u;
+        const uint32_t mode = st.cx.count(P::PA_SC_MODE_CNTL_0)
+            ? rd(st.cx, P::PA_SC_MODE_CNTL_0) : 0x2u;
+
+        const int32_t offset_x = static_cast<int16_t>(PM4_FIELD(
+            window_offset, PA_SC_WINDOW_OFFSET, WINDOW_X_OFFSET));
+        const int32_t offset_y = static_cast<int16_t>(PM4_FIELD(
+            window_offset, PA_SC_WINDOW_OFFSET, WINDOW_Y_OFFSET));
+        const auto screen = [](uint32_t value) {
+            return std::max<int32_t>(0, static_cast<int16_t>(value));
+        };
+
+        int32_t left = screen(PM4_FIELD(screen_tl, PA_SC_SCREEN_SCISSOR_TL, TL_X));
+        int32_t top = screen(PM4_FIELD(screen_tl, PA_SC_SCREEN_SCISSOR_TL, TL_Y));
+        int32_t right = screen(PM4_FIELD(screen_br, PA_SC_SCREEN_SCISSOR_BR, BR_X));
+        int32_t bottom = screen(PM4_FIELD(screen_br, PA_SC_SCREEN_SCISSOR_BR, BR_Y));
+        auto intersect = [&](uint32_t tl_x, uint32_t tl_y, uint32_t br_x, uint32_t br_y,
+                             bool offset_disabled) {
+            left = std::max(left, add_scissor_offset(tl_x, offset_x, offset_disabled));
+            top = std::max(top, add_scissor_offset(tl_y, offset_y, offset_disabled));
+            right = std::min(right, add_scissor_offset(br_x, offset_x, offset_disabled));
+            bottom = std::min(bottom, add_scissor_offset(br_y, offset_y, offset_disabled));
+        };
+        intersect(PM4_FIELD(window_tl, PA_SC_WINDOW_SCISSOR_TL, TL_X),
+                  PM4_FIELD(window_tl, PA_SC_WINDOW_SCISSOR_TL, TL_Y),
+                  PM4_FIELD(window_br, PA_SC_WINDOW_SCISSOR_BR, BR_X),
+                  PM4_FIELD(window_br, PA_SC_WINDOW_SCISSOR_BR, BR_Y),
+                  PM4_FIELD(window_tl, PA_SC_WINDOW_SCISSOR_TL, WINDOW_OFFSET_DISABLE) != 0);
+        intersect(PM4_FIELD(generic_tl, PA_SC_GENERIC_SCISSOR_TL, TL_X),
+                  PM4_FIELD(generic_tl, PA_SC_GENERIC_SCISSOR_TL, TL_Y),
+                  PM4_FIELD(generic_br, PA_SC_GENERIC_SCISSOR_BR, BR_X),
+                  PM4_FIELD(generic_br, PA_SC_GENERIC_SCISSOR_BR, BR_Y),
+                  PM4_FIELD(generic_tl, PA_SC_GENERIC_SCISSOR_TL, WINDOW_OFFSET_DISABLE) != 0);
+        if (PM4_FIELD(mode, PA_SC_MODE_CNTL_0, VPORT_SCISSOR_ENABLE))
+            intersect(PM4_FIELD(viewport_tl, PA_SC_VPORT_SCISSOR_0_TL, TL_X),
+                      PM4_FIELD(viewport_tl, PA_SC_VPORT_SCISSOR_0_TL, TL_Y),
+                      PM4_FIELD(viewport_br, PA_SC_VPORT_SCISSOR_0_BR, BR_X),
+                      PM4_FIELD(viewport_br, PA_SC_VPORT_SCISSOR_0_BR, BR_Y),
+                      PM4_FIELD(viewport_tl, PA_SC_VPORT_SCISSOR_0_TL,
+                                WINDOW_OFFSET_DISABLE) != 0);
+        rs.scissor_left = left; rs.scissor_top = top;
+        rs.scissor_right = right; rs.scissor_bottom = bottom;
+    }
+
     return rs;
 }
 
@@ -389,6 +478,14 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
         }
     }
 
+    ps.has_scissor = rs.has_scissor;
+    if (rs.has_scissor) {
+        ps.scissor_left = rs.scissor_left;
+        ps.scissor_top = rs.scissor_top;
+        ps.scissor_right = std::max(rs.scissor_right, rs.scissor_left);
+        ps.scissor_bottom = std::max(rs.scissor_bottom, rs.scissor_top);
+    }
+
     // Rasterizer cull/front-face/polygon mode from PA_SU_SC_MODE_CNTL (#456). CULL_FRONT[0]/CULL_BACK[1]
     // -> VkCullModeFlags (FRONT_BIT=1, BACK_BIT=2). AMD FACE[2] and VkFrontFace have the same encoding:
     // 0 = CCW is front, 1 = CW is front. The guest's negative Y scale is already represented by the
@@ -410,6 +507,21 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     }
 
     return ps;
+}
+
+void scale_resolved_render_area(ResolvedPipelineState& ps, float scale_x, float scale_y) {
+    if (ps.has_viewport) {
+        ps.viewport_x *= scale_x; ps.viewport_w *= scale_x;
+        ps.viewport_y *= scale_y; ps.viewport_h *= scale_y;
+    }
+    if (ps.has_scissor) {
+        ps.scissor_left = scale_scissor_boundary(ps.scissor_left, scale_x, true);
+        ps.scissor_top = scale_scissor_boundary(ps.scissor_top, scale_y, true);
+        ps.scissor_right = scale_scissor_boundary(ps.scissor_right, scale_x, false);
+        ps.scissor_bottom = scale_scissor_boundary(ps.scissor_bottom, scale_y, false);
+        ps.scissor_right = std::max(ps.scissor_right, ps.scissor_left);
+        ps.scissor_bottom = std::max(ps.scissor_bottom, ps.scissor_top);
+    }
 }
 
 } // namespace prosper::gpu

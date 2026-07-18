@@ -975,14 +975,11 @@ inline std::vector<DrawItem> realize_gpustate_draws(const GpuState& st,
                                        it.vertex_count, it.indices.size(), it.ps.topology, it.ps.color_write_mask);
         fprintf(stderr, "\n"); fflush(stderr); }
     if (items.empty()) return {};
-    // Scale each item's guest viewport to the actual (possibly reduced-resolution) framebuffer. Skip if
-    // 1.0 (full-res) or if this draw has no guest viewport (the backend then uses the full-target default).
+    // Scale each item's guest viewport and scissor to the actual (possibly reduced-resolution)
+    // framebuffer. State that was never programmed keeps the backend's full-target defaults.
     if (vp_scale_x != 1.0f || vp_scale_y != 1.0f)
         for (auto& it : items)
-            if (it.ps.has_viewport) {
-                it.ps.viewport_x *= vp_scale_x; it.ps.viewport_w *= vp_scale_x;
-                it.ps.viewport_y *= vp_scale_y; it.ps.viewport_h *= vp_scale_y;
-            }
+            scale_resolved_render_area(it.ps, vp_scale_x, vp_scale_y);
     if (log) fprintf(stderr, "[exec] rendering %zu draw item(s) (of %zu draws)\n", items.size(), st.draws.size());
     return items;
 }

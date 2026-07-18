@@ -83,6 +83,18 @@ int main() {
         { P::SPI_PS_INPUT_CNTL_0 + 1u, 0x00000320u }, // PS input 1 <- DEFAULT_VAL 1111
         { P::SPI_PS_INPUT_ENA, 0x00000303u }, // perspective sample/center + float position X/Y
         { P::SPI_PS_INPUT_ADDR, 0x000003CFu }, // reserve disabled centroid/pull-model slots
+        // #531: effective scissor is the intersection of screen/window/generic/viewport. Window and
+        // viewport apply (-10,+5); generic disables the offset. Right/bottom are exclusive.
+        { P::PA_SC_SCREEN_SCISSOR_TL, 0xFFFDFFFCu }, // (-4,-3), hardware clamps negative to zero
+        { P::PA_SC_SCREEN_SCISSOR_BR, 0x005A0064u }, // (100,90)
+        { P::PA_SC_WINDOW_OFFSET, 0x0005FFF6u },     // (-10,+5)
+        { P::PA_SC_WINDOW_SCISSOR_TL, 0x000A0014u }, // (20,10), offset enabled -> (10,15)
+        { P::PA_SC_WINDOW_SCISSOR_BR, 0x0050005Au }, // (90,80), offset -> (80,85)
+        { P::PA_SC_GENERIC_SCISSOR_TL, 0x8012000Cu },// (12,18), offset disabled
+        { P::PA_SC_GENERIC_SCISSOR_BR, 0x004B0046u },// (70,75)
+        { P::PA_SC_VPORT_SCISSOR_0_TL, 0x000E000Fu },// (15,14), offset -> (5,19)
+        { P::PA_SC_VPORT_SCISSOR_0_BR, 0x00460050u },// (80,70), offset -> (70,75)
+        { P::PA_SC_MODE_CNTL_0, 0x00000002u },       // VPORT_SCISSOR_ENABLE
     };
     // Shader-stage program addresses.
     ShaderReg sh_regs[] = {
@@ -110,6 +122,40 @@ int main() {
           "programmed SPI_PS_INPUT_CNTL words and presence mask are retained");
     CHECK(rs.ps_input_ena == 0x00000303u && rs.ps_input_addr == 0x000003CFu,
           "SPI_PS_INPUT_ENA/ADDR system-value VGPR controls are retained");
+    CHECK(rs.has_scissor && rs.scissor_left == 12 && rs.scissor_top == 19 &&
+          rs.scissor_right == 70 && rs.scissor_bottom == 75,
+          "screen/window/generic/enabled-viewport scissors intersect with per-rectangle offsets");
+    {
+        ResolvedPipelineState sc = resolve_pipeline_state(rs);
+        CHECK(sc.has_scissor && sc.scissor_left == 12 && sc.scissor_top == 19 &&
+              sc.scissor_right == 70 && sc.scissor_bottom == 75,
+              "resolved pipeline retains the effective exclusive scissor rectangle");
+
+        GpuState no_viewport_scissor = st;
+        no_viewport_scissor.cx[P::PA_SC_MODE_CNTL_0] = 0;
+        const RenderState no_vport = extract_render_state(no_viewport_scissor);
+        CHECK(no_vport.scissor_left == 12 && no_vport.scissor_top == 18 &&
+              no_vport.scissor_right == 70 && no_vport.scissor_bottom == 75,
+              "disabled VPORT_SCISSOR_ENABLE excludes the viewport rectangle");
+
+        CHECK(!extract_render_state(GpuState{}).has_scissor,
+              "completely absent guest scissor state preserves the full-target backend default");
+
+        RenderState empty{}; empty.has_scissor = true;
+        empty.scissor_left = 10; empty.scissor_top = 20;
+        empty.scissor_right = 5; empty.scissor_bottom = 15;
+        const ResolvedPipelineState normalized = resolve_pipeline_state(empty);
+        CHECK(normalized.scissor_right == 10 && normalized.scissor_bottom == 20,
+              "empty guest intersections normalize to a safe zero-area rectangle");
+
+        ResolvedPipelineState scaled{}; scaled.has_scissor = true;
+        scaled.scissor_left = -3; scaled.scissor_top = 5;
+        scaled.scissor_right = 7; scaled.scissor_bottom = 9;
+        scale_resolved_render_area(scaled, 0.5f, 0.5f);
+        CHECK(scaled.scissor_left == -2 && scaled.scissor_top == 2 &&
+              scaled.scissor_right == 4 && scaled.scissor_bottom == 5,
+              "reduced-resolution scissors round outward without losing guest coverage");
+    }
 
     CHECK(rs.color0_base == rdna2_addr(0x00100000u, 0x12u), "color0_base = (BASE<<8)|(EXT<<40)");
     CHECK(rs.color0_format == 0x0Au, "color0_format = 0x0A (FORMAT field)");

@@ -3031,10 +3031,8 @@ bool realize_retained_draw(const GpuState& st, size_t index, float scale_x, floa
     if (!realize_draw_item(draw_state, &draw, draw.index_count, 0x10000, log, item)) return false;
     item.draw_index = index;
     item.command_order = draw.command_order;
-    if ((scale_x != 1.0f || scale_y != 1.0f) && item.ps.has_viewport) {
-        item.ps.viewport_x *= scale_x; item.ps.viewport_w *= scale_x;
-        item.ps.viewport_y *= scale_y; item.ps.viewport_h *= scale_y;
-    }
+    if (scale_x != 1.0f || scale_y != 1.0f)
+        scale_resolved_render_area(item.ps, scale_x, scale_y);
     return true;
 }
 
