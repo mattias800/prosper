@@ -133,7 +133,8 @@ struct SrtUse {
 std::vector<DynFetch> resolve_dynamic_fetch(const uint32_t* code, size_t dwords,
                                             const uint32_t* user_sgprs, uint32_t nsgpr,
                                             uint32_t user_sgpr_base,
-                                            std::vector<SrtUse>* srt_uses = nullptr);
+                                            std::vector<SrtUse>* srt_uses = nullptr,
+                                            uint32_t pcrel_dispatch_target = UINT32_MAX);
 
 // The dynamic descriptor fold and shader-cache key builder both walk immutable shader instructions
 // on every draw. Cache only the decoded instructions, validating the complete consumed byte range on

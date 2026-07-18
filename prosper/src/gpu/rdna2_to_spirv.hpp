@@ -19,6 +19,7 @@
 namespace prosper::gpu {
 
 struct ShaderResourceTable;   // resource-binding contract (shader_resources.hpp); optional to recompile_valu
+struct Rdna2Inst;
 
 // A narrowly-proven compiler-generated scalar jump table. The shader loads a uniform selector from a
 // direct constant buffer, bounds it, scales it by the 64-bit table-entry size, loads a PC-relative
@@ -38,6 +39,13 @@ struct PcrelDispatchInfo {
 };
 
 PcrelDispatchInfo rdna2_pcrel_dispatch_info(const uint32_t* code, size_t dwords);
+
+// Retain only the selected arm of a proven compiler-generated PC-relative dispatch. The fragment
+// recompiler and the live descriptor fold must specialize the same instruction stream: otherwise
+// descriptor loads in omitted alternatives can contaminate the selected arm's resource provenance.
+bool rdna2_specialize_pcrel_dispatch(std::vector<Rdna2Inst>& instructions,
+                                     const PcrelDispatchInfo& info,
+                                     uint32_t selected_target);
 
 // Return the portion of a raw shader blob that participates in recompilation. This normally ends at
 // S_ENDPGM, but compiler-generated PC-relative lookup tables may live immediately after the program and
