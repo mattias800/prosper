@@ -100,11 +100,18 @@ namespace {
     // back-half present path turns each into a swapchain image; SubmitFlip picks by buffer index.
     // Recorded now so that surface is ready even before real presentation exists.
     struct DisplayConfig {
+        struct SetConfig {
+            uint32_t width = 0, height = 0;
+            uint64_t pixel_format = 0;
+            uint32_t tiling_mode = 0;
+            bool registered = false;
+        } sets[4];
         uint32_t width = 0, height = 0;
         uint64_t pixel_format = 0;
         uint32_t tiling_mode = 0;
         int      buffer_num = 0;
         uint64_t buffer_addr[16] = {0};   // guest GPU-VA of each registered framebuffer
+        uint8_t  buffer_set[16] = {0};    // set_index + 1; zero means the slot is unregistered
         bool     configured = false;
     };
     DisplayConfig g_display;
@@ -263,9 +270,10 @@ HLE(g_vo_set_buffer_attribute2) {  // a0=attr* a1=pixel_format a2=tiling a3=widt
 // succeeds so the game proceeds to flips.
 HLE(g_vo_register_buffers2) {  // a0=handle a1=set_index a2=buffer_index_start a3=buffers a4=buffer_num a5=attribute
     vo_argtrace("RegisterBuffers2", a0,a1,a2,a3,a4,a5);
-    int start = (int)a2, num = (int)a4;
+    int set = (int)a1, start = (int)a2, num = (int)a4;
     if (!a3 || !a5) return (uint64_t)(int64_t)-1;
-    if (start < 0 || start > 15 || num < 1 || num > 16 || start + num > 16) return (uint64_t)(int64_t)-1;
+    if (set < 0 || set > 3 || start < 0 || start > 15 || num < 1 || num > 16 || start + num > 16)
+        return (uint64_t)(int64_t)-1;
     // Record the display surface (swapchain scaffolding). attribute is the 0x50-byte
     // VideoOutBufferAttribute2 we fill in SetBufferAttribute2: width@0x0c, height@0x10, format@0x20.
     const uint8_t* attr = (const uint8_t*)(uintptr_t)a5;
@@ -273,14 +281,59 @@ HLE(g_vo_register_buffers2) {  // a0=handle a1=set_index a2=buffer_index_start a
     g_display.height       = *(const uint32_t*)(attr + 0x10);
     g_display.pixel_format = *(const uint64_t*)(attr + 0x20);
     g_display.tiling_mode  = *(const uint32_t*)(attr + 0x04);
+    g_display.sets[set] = {g_display.width, g_display.height, g_display.pixel_format,
+                           g_display.tiling_mode, true};
     const auto* bufs = (const VideoOutBuffers*)(uintptr_t)a3;
-    for (int i = 0; i < num && start + i < 16; i++)
+    for (int i = 0; i < num && start + i < 16; i++) {
         g_display.buffer_addr[start + i] = (uint64_t)(uintptr_t)bufs[i].data;
+        g_display.buffer_set[start + i] = (uint8_t)(set + 1);
+    }
     if (g_display.buffer_num < start + num) g_display.buffer_num = start + num;
     g_display.configured = true;
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[vo] display surface: %ux%u fmt=0x%llx %d buffers registered\n",
                 g_display.width, g_display.height, (unsigned long long)g_display.pixel_format, num);
+    return 0;
+}
+
+// sceVideoOutUnregisterBuffers (N5KDtkIjjJ4): release every slot owned by one attribute set.
+// RegisterBuffers2 may place independent sets in disjoint ranges, so retain the other sets and
+// recompute the highest visible slot instead of clearing the entire display unconditionally.
+HLE(g_vo_unregister_buffers) {
+    vo_argtrace("UnregisterBuffers", a0,a1,a2,a3,a4,a5);
+    const int set = (int)a1;
+    if (set < 0 || set > 3)
+        return (uint64_t)(int64_t)(int32_t)0x8029000a;  // SCE_VIDEO_OUT_ERROR_INVALID_INDEX
+
+    const uint8_t tag = (uint8_t)(set + 1);
+    bool found = false;
+    for (int i = 0; i < 16; ++i) {
+        if (g_display.buffer_set[i] != tag) continue;
+        found = true;
+        g_display.buffer_set[i] = 0;
+        g_display.buffer_addr[i] = 0;
+    }
+    if (!found)
+        return (uint64_t)(int64_t)(int32_t)0x8029000a;  // SCE_VIDEO_OUT_ERROR_INVALID_INDEX
+    g_display.sets[set] = {};
+
+    int remaining = 16;
+    while (remaining > 0 && g_display.buffer_set[remaining - 1] == 0) --remaining;
+    g_display.buffer_num = remaining;
+    g_display.configured = remaining != 0;
+    if (!g_display.configured) {
+        g_display.width = 0;
+        g_display.height = 0;
+        g_display.pixel_format = 0;
+        g_display.tiling_mode = 0;
+    } else {
+        const int remaining_set = (int)g_display.buffer_set[remaining - 1] - 1;
+        const auto& config = g_display.sets[remaining_set];
+        g_display.width = config.width;
+        g_display.height = config.height;
+        g_display.pixel_format = config.pixel_format;
+        g_display.tiling_mode = config.tiling_mode;
+    }
     return 0;
 }
 
@@ -539,6 +592,7 @@ void register_graphics_hle() {
     RN("Nv8c-Kb+DUM", g_vo_is_output_supported);   // sceVideoOutIsOutputSupported
     RN("PjS5uASwcV8", g_vo_set_buffer_attribute2);  // sceVideoOutSetBufferAttribute2
     RN("rKBUtgRrtbk", g_vo_register_buffers2);       // sceVideoOutRegisterBuffers2
+    RN("N5KDtkIjjJ4", g_vo_unregister_buffers);      // sceVideoOutUnregisterBuffers
     RN("utPrVdxio-8", g_vo_get_output_status);        // sceVideoOutGetOutputStatus
     RN("w0hLuNarQxY", g_vo_configure_output);          // sceVideoOutConfigureOutput
     RN("U2JJtSqNKZI", g_vo_get_event_id);              // sceVideoOutGetEventId (#210)

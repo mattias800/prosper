@@ -31,11 +31,15 @@ int main() {
     auto issup  = Hle::lookup("Nv8c-Kb+DUM");   // IsOutputSupported
     auto setba2 = Hle::lookup("PjS5uASwcV8");   // SetBufferAttribute2
     auto regb2  = Hle::lookup("rKBUtgRrtbk");   // RegisterBuffers2
+    auto unreg  = Hle::lookup("N5KDtkIjjJ4");   // UnregisterBuffers
     auto cfg    = Hle::lookup("w0hLuNarQxY");   // ConfigureOutput
     auto flip   = Hle::lookup(nid_hash("sceVideoOutSubmitFlip"));
     auto fstat  = Hle::lookup(nid_hash("sceVideoOutGetFlipStatus"));
-    CHECK(res && vbl && cap && issup && setba2 && regb2 && cfg && flip && fstat, "VideoOut functions registered");
-    if (!(res && vbl && cap && issup && setba2 && regb2 && cfg && flip && fstat)) { printf("== FAIL ==\n"); return 1; }
+    CHECK(res && vbl && cap && issup && setba2 && regb2 && unreg && cfg && flip && fstat,
+          "VideoOut functions registered");
+    if (!(res && vbl && cap && issup && setba2 && regb2 && unreg && cfg && flip && fstat)) {
+        printf("== FAIL ==\n"); return 1;
+    }
 
     // #394 F3: before any completed flip, -1 is the ABI's "none yet" sentinel for both the argument
     // and current buffer. Zero is valid and used to make a frame pacer advance prematurely.
@@ -133,6 +137,41 @@ int main() {
     // Range validation: out-of-range buffer counts are rejected.
     CHECK(regb2(0x1001, 0, 0, (uint64_t)(uintptr_t)buffers, 99, (uint64_t)(uintptr_t)attr) != 0,
           "RegisterBuffers2 rejects an out-of-range buffer_num");
+
+    CHECK((uint32_t)unreg(0x1001, 3 /*unregistered set*/, 0, 0, 0, 0) == 0x8029000au,
+          "UnregisterBuffers rejects an absent set without changing registration");
+    CHECK(prosper_vo_buffer_count() == 3 &&
+              prosper_vo_buffer_addr(0) == (uint64_t)(uintptr_t)fb0,
+          "failed unregistration preserves the active buffer set");
+    CHECK(unreg(0x1001, 0 /*set*/, 0, 0, 0, 0) == 0,
+          "UnregisterBuffers releases the active set");
+    CHECK(prosper_vo_buffer_count() == 0 && prosper_vo_buffer_addr(0) == 0 &&
+              prosper_vo_display_width() == 0 && prosper_vo_display_height() == 0,
+          "releasing the last set clears the display registration");
+
+    rc = regb2(0x1001, 0 /*set*/, 0 /*start*/, (uint64_t)(uintptr_t)buffers, 3,
+               (uint64_t)(uintptr_t)attr);
+    uint8_t high_attr[0x50];
+    memcpy(high_attr, attr, sizeof high_attr);
+    *(uint32_t*)(high_attr + 0x0c) = 1280;
+    *(uint32_t*)(high_attr + 0x10) = 720;
+    uint8_t fb4[16], fb5[16];
+    VOB high_buffers[2] = { {fb4,0,{0,0}}, {fb5,0,{0,0}} };
+    uint64_t high_rc = regb2(0x1001, 1 /*set*/, 4 /*start*/,
+                             (uint64_t)(uintptr_t)high_buffers, 2,
+                             (uint64_t)(uintptr_t)high_attr);
+    CHECK(rc == 0 && high_rc == 0 && prosper_vo_buffer_count() == 6 &&
+              prosper_vo_display_width() == 1280 && prosper_vo_display_height() == 720,
+          "registry tracks two independently owned buffer sets");
+    CHECK(unreg(0x1001, 1 /*set*/, 0, 0, 0, 0) == 0 &&
+              prosper_vo_buffer_count() == 3 &&
+              prosper_vo_buffer_addr(0) == (uint64_t)(uintptr_t)fb0 &&
+              prosper_vo_buffer_addr(2) == (uint64_t)(uintptr_t)fb2 &&
+              prosper_vo_display_width() == 1920 && prosper_vo_display_height() == 1080,
+          "unregistering one set restores the remaining set's range and geometry");
+    CHECK(unreg(0x1001, 0 /*set*/, 0, 0, 0, 0) == 0 &&
+              prosper_vo_buffer_count() == 0,
+          "unregistering the remaining set clears the registry");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
