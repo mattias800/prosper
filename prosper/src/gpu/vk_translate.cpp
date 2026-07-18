@@ -175,8 +175,22 @@ uint32_t vk_blend_factor(uint32_t f) {
         case 0x12: return 18;  // InvSrc1Alpha      -> ONE_MINUS_SRC1_ALPHA
         case 0x13: return 12;  // ConstantAlpha     -> CONSTANT_ALPHA
         case 0x14: return 13;  // OneMinusConstAlpha-> ONE_MINUS_CONSTANT_ALPHA
-        default:   return 0;   // ZERO
+        default: break;
     }
+    // BOTH_SRC_ALPHA/BOTH_INV_SRC_ALPHA (0x0b/0x0c) program the paired source and destination
+    // factors on RDNA2 and have no single VkBlendFactor equivalent. Keep the established ZERO
+    // fallback until the pipeline grows a dual-output path, but never make that mis-render silent.
+    // Log arbitrary unknown values through the same path so corrupt register state is diagnosable
+    // without flooding this per-draw translation.
+    static std::set<uint32_t> logged;
+    static std::mutex logged_mu;
+    {
+        std::lock_guard<std::mutex> lk(logged_mu);
+        if (logged.insert(f).second)
+            fprintf(stderr, "[gpu] vk_blend_factor: unsupported RDNA2 factor=0x%x "
+                            "-> VK_BLEND_FACTOR_ZERO\n", f);
+    }
+    return 0;
 }
 
 uint32_t vk_blend_op(uint32_t comb_fcn) {

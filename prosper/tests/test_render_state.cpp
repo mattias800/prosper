@@ -320,6 +320,10 @@ int main() {
     CHECK(rs.blend1_enable && rs.color1_src_blend == 1u && rs.color1_dst_blend == 5u,
           "CB_BLEND1_CONTROL decodes independently from MRT0");
     CHECK(vk_blend_factor(0x08u) == 4u, "RDNA2 DstColor(8) -> VK DST_COLOR(4) (non-identity)");
+    CHECK(vk_blend_factor(0x0bu) == 0u && vk_blend_factor(0x0cu) == 0u,
+          "unsupported RDNA2 dual-output blend factors retain the fail-visible ZERO fallback");
+    CHECK(vk_blend_factor(0x7fu) == 0u,
+          "unknown RDNA2 blend factor retains the fail-visible ZERO fallback");
     CHECK(vk_blend_op(2u) == 3u, "RDNA2 comb Min(2) -> VK MIN(3) (non-identity)");
 
     // #381: separate alpha blend. The extractor's rs (bit 29 clear) mirrors color into alpha on resolve;
