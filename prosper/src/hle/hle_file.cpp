@@ -1224,7 +1224,14 @@ HLE(f_ftruncate) { return (uint64_t)(int64_t)::ftruncate((int)a0, (off_t)a1); }
 HLE(f_truncate)  { std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::truncate(h.c_str(), (off_t)a1); }
 #else
 HLE(f_ftruncate) { return (uint64_t)-1; }
-HLE(f_truncate)  { return (uint64_t)-1; }
+HLE(f_truncate)  { std::string h = translate(CS(a0));
+                    ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
+                    int fd = ::_open(h.c_str(), _O_RDWR | _O_BINARY);
+                    if (fd < 0) return (uint64_t)(int64_t)-1;
+                    int resize_error = ::_chsize_s(fd, (__int64)a1);
+                    int close_result = ::_close(fd);
+                    if (resize_error) { errno = resize_error; return (uint64_t)(int64_t)-1; }
+                    return (uint64_t)(int64_t)close_result; }
 #endif
 
 // --- sceKernelAio* — the kernel async-IO command API (issue #312 suspect list). -----------------
@@ -1337,15 +1344,16 @@ HLE(f_lstat) { return f_stat(a0,a1,a2,a3,a4,a5); }
 HLE(f_fsync) { return 0; }
 #endif
 
-// The stat family has a signed 32-bit result. Kernel exports return the translated SCE error
-// directly, while the libc names retain -1 plus errno. Successful calls and output translation
-// remain shared so both namespaces keep the same guest stat layout.
-static uint64_t kernel_stat_result(uint64_t result, int error) {
+// These file APIs have signed 32-bit results. Kernel exports return the translated SCE error
+// directly, while the libc names retain -1 plus errno. Keep the base host operation shared so
+// successful behavior stays identical across both namespaces.
+static uint64_t kernel_file_result32(uint64_t result, int error) {
     return (int64_t)result < 0 ? file_sce_error(error) : result;
 }
-HLE(k_stat)  { uint64_t r = f_stat(a0, a1, a2, a3, a4, a5);  int e = errno; return kernel_stat_result(r, e); }
-HLE(k_fstat) { uint64_t r = f_fstat(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_stat_result(r, e); }
-HLE(k_lstat) { uint64_t r = f_lstat(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_stat_result(r, e); }
+HLE(k_stat)     { uint64_t r = f_stat(a0, a1, a2, a3, a4, a5);     int e = errno; return kernel_file_result32(r, e); }
+HLE(k_fstat)    { uint64_t r = f_fstat(a0, a1, a2, a3, a4, a5);    int e = errno; return kernel_file_result32(r, e); }
+HLE(k_lstat)    { uint64_t r = f_lstat(a0, a1, a2, a3, a4, a5);    int e = errno; return kernel_file_result32(r, e); }
+HLE(k_truncate) { uint64_t r = f_truncate(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
 HLE(f_access){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::access(h.c_str(), (int)a1); }
 HLE(f_mkdir) { std::string h = translate(CS(a0));   // sceKernelMkdir(path, mode)
 #ifdef _WIN32
@@ -1355,6 +1363,8 @@ HLE(f_mkdir) { std::string h = translate(CS(a0));   // sceKernelMkdir(path, mode
 #endif
 }
 HLE(f_rmdir) { std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::rmdir(h.c_str()); }
+HLE(k_mkdir) { uint64_t r = f_mkdir(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
+HLE(k_rmdir) { uint64_t r = f_rmdir(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
 
 // sceKernelGetdents(int fd, char* buf, size_t nbytes) — fill FreeBSD dirent records
 // {u32 fileno; u16 reclen; u8 type; u8 namlen; char name[]} (4-aligned). Backed by the host's
@@ -1532,6 +1542,8 @@ HLE(f_unlink){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::
 // NID 52NcYU9+lEo, reached via libc.prx. ::rename is standard C (Windows + Linux).
 HLE(f_rename){ std::string from = translate(CS(a0)), to = translate(CS(a1));
                return (uint64_t)(int64_t)::rename(from.c_str(), to.c_str()); }
+HLE(k_unlink){ uint64_t r = f_unlink(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
+HLE(k_rename){ uint64_t r = f_rename(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
 
 // --- APR (Async Page Read) file resolution -----------------------------------------------------
 // sceKernelAprResolveFilepathsToIdsAndFileSizes(const char** paths, int count, uint32_t* outIds,
@@ -2083,7 +2095,7 @@ void register_file_hle() {
     R("sceKernelFtruncate", f_ftruncate);   // real resize (was fake-success -> corrupt saves)
     R("lstat", f_lstat);   R("sceKernelLstat", k_lstat);     // was MISSING -> uninitialized stat buffer
     R("fsync", f_fsync);   R("sceKernelFsync", f_fsync);     // was fake-success -> no durability
-    R("sceKernelTruncate", f_truncate);      // path-based sibling (same corruption class)
+    R("sceKernelTruncate", k_truncate);      // path-based sibling (same corruption class)
     R("sceKernelFstat", k_fstat);
     // Low-level POSIX wrappers with the internal leading-underscore names. Real libc.prx implements
     // its stdio/file layer (fopen/fwrite/...) on top of these, so they MUST be real (were stubbed to
@@ -2094,10 +2106,10 @@ void register_file_hle() {
     // directory / unlink (real host ops, /app0-translated)
     R("pread", f_pread);          R("sceKernelPread", k_pread);
     R("pwrite", f_pwrite);        R("sceKernelPwrite", k_pwrite);
-    R("mkdir", f_mkdir);          R("sceKernelMkdir", f_mkdir);
-    R("rmdir", f_rmdir);          R("sceKernelRmdir", f_rmdir);
-    R("unlink", f_unlink);        R("sceKernelUnlink", f_unlink);
-    R("rename", f_rename);        R("sceKernelRename", f_rename);   // real move (was fake-success -> lost atomic saves)
+    R("mkdir", f_mkdir);          R("sceKernelMkdir", k_mkdir);
+    R("rmdir", f_rmdir);          R("sceKernelRmdir", k_rmdir);
+    R("unlink", f_unlink);        R("sceKernelUnlink", k_unlink);
+    R("rename", f_rename);        R("sceKernelRename", k_rename);   // real move (was fake-success -> lost atomic saves)
     R("dup", f_dup);   R("sceKernelDup", f_dup);   R("dup2", f_dup2);   R("sceKernelDup2", f_dup2);   // were 0 = stdin
     R("fcntl", f_fcntl);          R("sceKernelFcntl", f_fcntl);       // FreeBSD commands/flags need translation
     R("sceKernelGetdents", k_getdents); R("getdents", f_getdents);

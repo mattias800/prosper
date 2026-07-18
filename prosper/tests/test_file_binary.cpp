@@ -84,6 +84,13 @@ int main() {
     HleFn kernel_dup2_fn = Hle::lookup(nid_hash("sceKernelDup2"));
     HleFn mkdir_fn = Hle::lookup(nid_hash("mkdir"));
     HleFn kernel_mkdir_fn = Hle::lookup(nid_hash("sceKernelMkdir"));
+    HleFn rmdir_fn = Hle::lookup(nid_hash("rmdir"));
+    HleFn kernel_rmdir_fn = Hle::lookup(nid_hash("sceKernelRmdir"));
+    HleFn unlink_fn = Hle::lookup(nid_hash("unlink"));
+    HleFn kernel_unlink_fn = Hle::lookup(nid_hash("sceKernelUnlink"));
+    HleFn rename_fn = Hle::lookup(nid_hash("rename"));
+    HleFn kernel_rename_fn = Hle::lookup(nid_hash("sceKernelRename"));
+    HleFn kernel_truncate_fn = Hle::lookup(nid_hash("sceKernelTruncate"));
     HleFn getdents_fn = Hle::lookup(nid_hash("getdents"));
     HleFn kernel_getdents_fn = Hle::lookup(nid_hash("sceKernelGetdents"));
     HleFn getdirentries_fn = Hle::lookup(nid_hash("getdirentries"));
@@ -101,7 +108,9 @@ int main() {
               posix_readv_fn && readv_fn && posix_writev_fn && writev_fn &&
               posix_preadv_fn && preadv_fn && posix_pwritev_fn && pwritev_fn &&
               lseek_fn && posix_close_fn && close_fn && dup_fn && kernel_dup_fn &&
-              dup2_fn && kernel_dup2_fn && mkdir_fn && kernel_mkdir_fn && getdents_fn &&
+              dup2_fn && kernel_dup2_fn && mkdir_fn && kernel_mkdir_fn && rmdir_fn &&
+              kernel_rmdir_fn && unlink_fn && kernel_unlink_fn && rename_fn &&
+              kernel_rename_fn && kernel_truncate_fn && getdents_fn &&
               kernel_getdents_fn && getdirentries_fn && kernel_getdirentries_fn && stat_fn &&
               kernel_stat_fn && fstat_fn && kernel_fstat_fn && lstat_fn && kernel_lstat_fn &&
               fcntl_fn && kernel_fcntl_fn,
@@ -121,13 +130,14 @@ int main() {
         ? (int64_t)mkdir_fn((uint64_t)(uintptr_t)dir_path, 0777, 0, 0, 0, 0)
         : 0;
     int duplicate_errno = errno;
-    int64_t kernel_mkdir_duplicate = kernel_mkdir_fn
-        ? (int64_t)kernel_mkdir_fn((uint64_t)(uintptr_t)dir_path, 0777, 0, 0, 0, 0)
+    uint64_t kernel_mkdir_duplicate = kernel_mkdir_fn
+        ? kernel_mkdir_fn((uint64_t)(uintptr_t)dir_path, 0777, 0, 0, 0, 0)
         : 0;
     CHECK(mkdir_first == 0, "mkdir creates a new directory");
     CHECK(mkdir_duplicate == -1, "mkdir reports an existing directory as failure");
     CHECK(duplicate_errno == EEXIST, "mkdir preserves EEXIST for the caller");
-    CHECK(kernel_mkdir_duplicate != 0, "sceKernelMkdir does not report false success on EEXIST");
+    CHECK(kernel_mkdir_duplicate == 0x80020011u,
+          "sceKernelMkdir returns SCE_KERNEL_ERROR_EEXIST directly");
 #ifdef _WIN32
     // Windows has no CRT directory-open API, but a directory HANDLE can be attached to a CRT fd.
     // The zero-entry stub must still publish the defined starting offset through basep.
@@ -324,6 +334,70 @@ int main() {
     };
     check_missing_stat_contract("Stat", stat_fn, kernel_stat_fn);
     check_missing_stat_contract("Lstat", lstat_fn, kernel_lstat_fn);
+
+    auto check_missing_path_contract = [&](const char* operation, HleFn libc_fn,
+                                           HleFn kernel_fn) {
+        errno = 0;
+        uint64_t libc_result = libc_fn
+            ? libc_fn((uint64_t)(uintptr_t)missing_path, 0, 0, 0, 0, 0)
+            : 0;
+        const int libc_error = errno;
+        uint64_t kernel_result = kernel_fn
+            ? kernel_fn((uint64_t)(uintptr_t)missing_path, 0, 0, 0, 0, 0)
+            : 0;
+        const std::string libc_message = std::string("libc ") + operation +
+                                         " retains -1 plus ENOENT";
+        const std::string kernel_message = std::string("sceKernel") + operation +
+                                           " returns SCE_KERNEL_ERROR_ENOENT directly";
+        CHECK((int64_t)libc_result == -1 && libc_error == ENOENT, libc_message.c_str());
+        CHECK(kernel_result == 0x80020002u, kernel_message.c_str());
+    };
+    check_missing_path_contract("Rmdir", rmdir_fn, kernel_rmdir_fn);
+    check_missing_path_contract("Unlink", unlink_fn, kernel_unlink_fn);
+
+    const char* missing_rename_target = "prosper-test-file-binary-missing-renamed.tmp";
+    std::filesystem::remove(missing_rename_target, missing_remove_error);
+    errno = 0;
+    int64_t libc_missing_rename = rename_fn
+        ? (int64_t)rename_fn((uint64_t)(uintptr_t)missing_path,
+                             (uint64_t)(uintptr_t)missing_rename_target, 0, 0, 0, 0)
+        : 0;
+    const int libc_missing_rename_error = errno;
+    uint64_t kernel_missing_rename = kernel_rename_fn
+        ? kernel_rename_fn((uint64_t)(uintptr_t)missing_path,
+                           (uint64_t)(uintptr_t)missing_rename_target, 0, 0, 0, 0)
+        : 0;
+    CHECK(libc_missing_rename == -1 && libc_missing_rename_error == ENOENT,
+          "libc rename retains -1 plus ENOENT");
+    CHECK(kernel_missing_rename == 0x80020002u,
+          "sceKernelRename returns SCE_KERNEL_ERROR_ENOENT directly");
+
+    uint64_t kernel_missing_truncate = kernel_truncate_fn
+        ? kernel_truncate_fn((uint64_t)(uintptr_t)missing_path, 3, 0, 0, 0, 0)
+        : 0;
+    CHECK(kernel_missing_truncate == 0x80020002u,
+          "sceKernelTruncate returns SCE_KERNEL_ERROR_ENOENT directly");
+
+    const char* truncate_path = "prosper-test-kernel-truncate.tmp";
+    std::filesystem::remove(truncate_path, missing_remove_error);
+    FILE* truncate_out = std::fopen(truncate_path, "wb");
+    bool truncate_fixture_written = false;
+    if (truncate_out) {
+        const std::array<uint8_t, 8> truncate_bytes{{0, 1, 2, 3, 4, 5, 6, 7}};
+        truncate_fixture_written =
+            std::fwrite(truncate_bytes.data(), 1, truncate_bytes.size(), truncate_out) ==
+            truncate_bytes.size();
+        std::fclose(truncate_out);
+    }
+    uint64_t kernel_truncate_result = truncate_fixture_written && kernel_truncate_fn
+        ? kernel_truncate_fn((uint64_t)(uintptr_t)truncate_path, 3, 0, 0, 0, 0)
+        : ~uint64_t{0};
+    std::error_code truncate_size_error;
+    uintmax_t truncated_size = std::filesystem::file_size(truncate_path, truncate_size_error);
+    CHECK(truncate_fixture_written && kernel_truncate_result == 0 && !truncate_size_error &&
+              truncated_size == 3,
+          "sceKernelTruncate resizes a path on both hosts");
+    std::filesystem::remove(truncate_path, missing_remove_error);
 
     constexpr uint64_t kGuestOWriteOnly = 0x0001;
     constexpr uint64_t kGuestOCreate = 0x0200;
