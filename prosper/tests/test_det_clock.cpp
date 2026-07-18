@@ -28,9 +28,14 @@ int main() {
     setenv("PROSPER_DET_FPS", "60", 1);
 #endif
     register_builtin_hle();
+    auto videoout_open = Hle::lookup(nid_hash("sceVideoOutOpen"));
     auto ptc = Hle::lookup(nid_hash("sceKernelGetProcessTimeCounter"));
     auto clock_gettime_fn = Hle::lookup(nid_hash("sceKernelClockGettime"));
-    CHECK(ptc && clock_gettime_fn, "monotonic and realtime entry points registered");
+    CHECK(videoout_open && ptc && clock_gettime_fn,
+          "VideoOut and monotonic/realtime entry points registered");
+    if (fails) return 1;
+    const uint64_t handle = videoout_open(0, 0, 0, 0, 0, 0);
+    CHECK((int64_t)handle > 0, "opened a live VideoOut handle for flip pacing");
     if (fails) return 1;
 
     uint64_t pre0 = ptc(0, 0, 0, 0, 0, 0);
@@ -38,7 +43,7 @@ int main() {
     uint64_t pre1 = ptc(0, 0, 0, 0, 0, 0);
     CHECK(pre1 > pre0, "real monotonic time advances before the first flip");
 
-    prosper_vo_flip_from_gpu(0, 0, 0, 1);
+    prosper_vo_flip_from_gpu((uint32_t)handle, 0, 0, 1);
     constexpr size_t kThreads = 16;
     std::atomic<size_t> ready{0};
     std::atomic<bool> go{false};
@@ -73,7 +78,7 @@ int main() {
     int64_t wall_delta = (rt1[0] - rt0[0]) * 1000000000ll + (rt1[1] - rt0[1]);
     CHECK(wall_delta >= 10000000ll, "CLOCK_REALTIME continues advancing while monotonic time is paused");
 
-    prosper_vo_flip_from_gpu(0, 0, 0, 2);
+    prosper_vo_flip_from_gpu((uint32_t)handle, 0, 0, 2);
     uint64_t next = ptc(0, 0, 0, 0, 0, 0);
     CHECK(next - held == 1000000000ull / 60ull, "one flip advances monotonic time by exactly 1/60 second");
 
