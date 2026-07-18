@@ -130,6 +130,21 @@ int main() {
     CHECK(*(int16_t*)(state + 4) == 127);                 // volume (Kyty reports 127)
     CHECK(*(uint64_t*)(state + 8) == 0);                  // flag must NOT carry a bogus volume
 
+    // Port routing is independent of the requested PCM channel count. Voice and Personal report
+    // a mono headphone route, Aux reports the external route, and PadSpk reports its mono route.
+    struct PortRoute { uint32_t type; uint16_t output; uint8_t channel; } routes[] = {
+        {1, 0x01, 2}, {2, 0x40, 1}, {3, 0x40, 1}, {4, 0x04, 1}, {127, 0x80, 0},
+    };
+    for (const auto& route : routes) {
+        int64_t route_h = call("sceAudioOutOpen", 1, route.type, 0, 256, 48000, 2 /* S16 8ch */);
+        CHECK(route_h >= 1);
+        uint8_t route_state[0x20]; memset(route_state, 0xEE, sizeof route_state);
+        CHECK(call("sceAudioOutGetPortState", (uint64_t)route_h, PTR(route_state)) == 0);
+        CHECK(*(uint16_t*)(route_state + 0) == route.output);
+        CHECK(route_state[2] == route.channel);
+        CHECK(call("sceAudioOutClose", (uint64_t)route_h) == 0);
+    }
+
     // --- 6. error paths: the real SCE codes (Kyty Errno.h), not a generic -1 -----------------
     CHECK((int32_t)call("sceAudioOutOutput", 999, PTR(pcm.data())) == (int32_t)0x80260003);  // INVALID_PORT
     CHECK((int32_t)call("sceAudioOutSetVolume", 999, 0x1, PTR(vols)) == (int32_t)0x80260003);
