@@ -43,6 +43,7 @@ int main() {
     // granularity span. The latter crosses this reservation and fails with ERROR_INVALID_ADDRESS.
     register_builtin_hle();
     auto reserve = Hle::lookup(nid_hash("sceKernelReserveVirtualRange"));
+    auto flexible = Hle::lookup(nid_hash("sceKernelMapNamedFlexibleMemory"));
     auto unmap   = Hle::lookup(nid_hash("sceKernelMunmap"));
     auto alloc   = Hle::lookup(nid_hash("sceKernelAllocateDirectMemory"));
     auto alloc_main = Hle::lookup(nid_hash("sceKernelAllocateMainDirectMemory"));
@@ -55,8 +56,8 @@ int main() {
     auto batch   = Hle::lookup(nid_hash("sceKernelBatchMap"));
     CHECK(nid_hash("sceKernelMapDirectMemory2") == "BQQniolj9tQ",
           "sceKernelMapDirectMemory2 hashes to the PS5 3.20 import NID");
-    CHECK(reserve && unmap && alloc && alloc_main && map && map2 && protect && release && query &&
-              batch,
+    CHECK(reserve && flexible && unmap && alloc && alloc_main && map && map2 && protect &&
+              release && query && batch,
           "memory HLE functions registered");
     if (fails) return 1;
 
@@ -233,16 +234,22 @@ int main() {
     // middle page must preserve both neighboring aliases and permit an exact remap of the hole.
     constexpr uint64_t fixed_len = 0x10000;
     constexpr uint64_t fixed_base = 0x30000104000ull; // 16 KiB into a free 64 KiB host granule
+    constexpr uint64_t readonly_base = 0x30000304000ull;
     uint64_t fixed_phys = 0, fixed_va = fixed_base, fixed_alias = 0;
+    uint64_t readonly_va = readonly_base;
     bool fixed_mapped = false, hole_remapped = false;
     CHECK(alloc(0, kEnd, fixed_len, 0x4000, 0,
                 (uint64_t)(uintptr_t)&fixed_phys) == 0 && fixed_phys,
           "allocate physical range for incompatible fixed mapping");
+    CHECK(reserve((uint64_t)(uintptr_t)&fixed_va, fixed_len,
+                  0x10 /* SCE_KERNEL_MAP_FIXED */, 0x4000, 0, 0) == 0 &&
+              fixed_va == fixed_base,
+          "reserve the exact range used by a fixed direct mapping");
     fixed_mapped = map((uint64_t)(uintptr_t)&fixed_va, fixed_len, 0x2,
                        0x10 /* SCE_KERNEL_MAP_FIXED */, fixed_phys, 0x4000) == 0 &&
                    fixed_va == fixed_base;
     CHECK(fixed_mapped,
-          "fixed 16 KiB placement ignores the host 64 KiB VA/physical delta restriction");
+          "fixed direct mapping replaces its own reservation at 16 KiB granularity");
     CHECK(map((uint64_t)(uintptr_t)&fixed_alias, fixed_len, 0x2, 0,
               fixed_phys, 0x4000) == 0 && fixed_alias,
           "map ordinary alias for incompatible fixed view");
@@ -257,6 +264,31 @@ int main() {
               *(volatile uint64_t*)(uintptr_t)(fixed_alias + 0xc100) ==
                   0x9999aaaabbbbccccull,
               "incompatible fixed view preserves physical alias coherence");
+
+        CHECK(reserve((uint64_t)(uintptr_t)&readonly_va, fixed_len,
+                      0x10 /* SCE_KERNEL_MAP_FIXED */, 0x4000, 0, 0) == 0 &&
+                  readonly_va == readonly_base,
+              "reserve an exact range for a read-only physical alias");
+        const bool readonly_mapped =
+            map((uint64_t)(uintptr_t)&readonly_va, fixed_len, 0x1,
+                0x10 /* SCE_KERNEL_MAP_FIXED */, fixed_phys, 0x4000) == 0 &&
+            readonly_va == readonly_base;
+        CHECK(readonly_mapped,
+              "map a fixed read-only alias after the physical pages are committed");
+        if (readonly_mapped) {
+            MEMORY_BASIC_INFORMATION readonly_info{};
+            VirtualQuery((void*)(uintptr_t)readonly_va, &readonly_info,
+                         sizeof(readonly_info));
+            CHECK(readonly_info.State == MEM_COMMIT &&
+                      (readonly_info.Protect & 0xff) == PAGE_READONLY,
+                  "new sparse alias applies its requested protection to existing pages");
+            CHECK(*(volatile uint64_t*)(uintptr_t)(readonly_va + 0x4100) ==
+                      0x5555666677778888ull,
+                  "read-only fixed alias sees the precommitted physical contents");
+            CHECK(unmap(readonly_va, fixed_len, 0, 0, 0, 0) == 0,
+                  "unmap the fixed read-only alias");
+            readonly_va = 0;
+        }
 
         CHECK((uint32_t)unmap(fixed_va + 0x4000, 0x4001, 0, 0, 0, 0) == 0x80020016u,
               "invalid partial unmap fails after restoring the original shared view");
@@ -290,6 +322,23 @@ int main() {
                   0x9999aaaabbbbccccull,
               "partial unmap preserves the prefix and suffix views");
 
+        uint64_t flexible_hole = hole;
+        const bool flexible_mapped =
+            flexible((uint64_t)(uintptr_t)&flexible_hole, 0x4000, 0x2, 0,
+                     (uint64_t)(uintptr_t)"placeholder-hole", 0) == 0 &&
+            flexible_hole == hole;
+        CHECK(flexible_mapped,
+              "flexible memory replaces a 16 KiB hole left by partial direct unmap");
+        if (flexible_mapped) {
+            *(volatile uint64_t*)(uintptr_t)(flexible_hole + 0x100) =
+                0xf1e81b1ecafebeefull;
+            CHECK(*(volatile uint64_t*)(uintptr_t)(fixed_alias + 0x4100) ==
+                      0x5555666677778888ull,
+                  "private reuse of the hole does not overwrite its physical page");
+            CHECK(unmap(flexible_hole, 0x4000, 0, 0, 0, 0) == 0,
+                  "flexible hole returns to an exact replaceable placeholder");
+        }
+
         uint64_t remapped_hole = hole;
         hole_remapped = map((uint64_t)(uintptr_t)&remapped_hole, 0x4000, 0x2,
                             0x10 /* SCE_KERNEL_MAP_FIXED */,
@@ -313,6 +362,8 @@ int main() {
               "split fixed mapping unmaps cleanly as one guest range");
     if (fixed_alias) CHECK(unmap(fixed_alias, fixed_len, 0, 0, 0, 0) == 0,
                            "unmap incompatible-view alias");
+    if (readonly_va) CHECK(unmap(readonly_va, fixed_len, 0, 0, 0, 0) == 0,
+                           "clean up reserved read-only alias range");
     if (fixed_phys) release(fixed_phys, fixed_len, 0, 0, 0, 0);
 
     if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }

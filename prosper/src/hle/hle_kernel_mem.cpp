@@ -1542,9 +1542,22 @@ namespace {
         std::vector<uint64_t> committed_pages;
     };
     struct PlaceholderSpan { uint64_t base, size; };
+    struct PrivatePlaceholderView { uint64_t base, size; };
+    enum class PlaceholderOwner { Free, Guest };
+    struct AcquiredPlaceholder {
+        void* address = nullptr;
+        PlaceholderOwner owner = PlaceholderOwner::Free;
+    };
     std::mutex g_dview_mx;
     std::vector<DmemView> g_dviews;
     std::vector<PlaceholderSpan> g_free_placeholders;
+    // Host placeholders owned by an uncommitted guest reservation. Keeping these separate from
+    // guest-free placeholders prevents a zero-hint map from consuming another allocation while
+    // still allowing a fixed map to replace its own reservation.
+    std::vector<PlaceholderSpan> g_guest_placeholders;
+    // Private allocations created with MEM_REPLACE_PLACEHOLDER must be returned to placeholders
+    // on unmap; VirtualFree(..., MEM_DECOMMIT) would leave a non-replaceable private reservation.
+    std::vector<PrivatePlaceholderView> g_private_placeholder_views;
 
     using VirtualAlloc2Fn = PVOID (WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG,
                                             MEM_EXTENDED_PARAMETER*, ULONG);
@@ -1576,38 +1589,48 @@ namespace {
         return apis;
     }
 
-    // g_free_placeholders describes exact Windows placeholder regions. These ranges are reserved
-    // in the host but free in the guest tracker; retaining a 16 KiB hole is what lets a later fixed
-    // direct map replace it even when adjacent guest pages occupy the same 64 KiB host granule.
-    void remember_free_placeholder_locked(uint64_t base, uint64_t size) {
+    // Store one exact Windows placeholder and coalesce only adjacent spans with the same guest
+    // ownership. Coalescing free and guest-reserved spans together would lose the boundary needed
+    // to stop an automatic map from consuming someone else's reservation.
+    void remember_placeholder_locked(std::vector<PlaceholderSpan>& spans,
+                                     uint64_t base, uint64_t size) {
         if (!size) return;
-        g_free_placeholders.push_back({base, size});
-        std::sort(g_free_placeholders.begin(), g_free_placeholders.end(),
+        spans.push_back({base, size});
+        std::sort(spans.begin(), spans.end(),
                   [](const PlaceholderSpan& a, const PlaceholderSpan& b) {
                       return a.base < b.base;
                   });
-        for (size_t i = 1; i < g_free_placeholders.size();) {
-            PlaceholderSpan& left = g_free_placeholders[i - 1];
-            const PlaceholderSpan right = g_free_placeholders[i];
+        for (size_t i = 1; i < spans.size();) {
+            PlaceholderSpan& left = spans[i - 1];
+            const PlaceholderSpan right = spans[i];
             if (left.base + left.size != right.base) { ++i; continue; }
             if (VirtualFree(reinterpret_cast<void*>(static_cast<uintptr_t>(left.base)),
                             static_cast<SIZE_T>(left.size + right.size),
                             MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)) {
                 left.size += right.size;
-                g_free_placeholders.erase(g_free_placeholders.begin() + i);
+                spans.erase(spans.begin() + i);
             } else {
                 ++i;
             }
         }
     }
 
+    void remember_free_placeholder_locked(uint64_t base, uint64_t size) {
+        remember_placeholder_locked(g_free_placeholders, base, size);
+    }
+
+    void remember_guest_placeholder_locked(uint64_t base, uint64_t size) {
+        remember_placeholder_locked(g_guest_placeholders, base, size);
+    }
+
     // Remove one exact page-aligned subrange from a free placeholder. VirtualFree with
     // MEM_PRESERVE_PLACEHOLDER splits the Windows placeholder without releasing either side.
-    void* take_free_placeholder_locked(uint64_t hint, uint64_t len, uint64_t align) {
+    void* take_placeholder_locked(std::vector<PlaceholderSpan>& spans,
+                                  uint64_t hint, uint64_t len, uint64_t align) {
         if (!len) return nullptr;
         const uint64_t requested_align = align ? align : 0x1000;
-        for (size_t i = 0; i < g_free_placeholders.size(); ++i) {
-            const PlaceholderSpan span = g_free_placeholders[i];
+        for (size_t i = 0; i < spans.size(); ++i) {
+            const PlaceholderSpan span = spans[i];
             uint64_t base = hint ? hint : align_up(span.base, requested_align);
             if ((base & (requested_align - 1)) || base < span.base ||
                 base > UINT64_MAX - len ||
@@ -1617,12 +1640,12 @@ namespace {
 
             const uint64_t prefix = base - span.base;
             const uint64_t suffix = span.base + span.size - (base + len);
-            g_free_placeholders.erase(g_free_placeholders.begin() + i);
+            spans.erase(spans.begin() + i);
             if (prefix && !VirtualFree(
                     reinterpret_cast<void*>(static_cast<uintptr_t>(span.base)),
                     static_cast<SIZE_T>(prefix),
                     MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
-                remember_free_placeholder_locked(span.base, span.size);
+                remember_placeholder_locked(spans, span.base, span.size);
                 return nullptr;
             }
             if (suffix && !VirtualFree(
@@ -1630,42 +1653,63 @@ namespace {
                     static_cast<SIZE_T>(len),
                     MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
                 if (prefix) {
-                    remember_free_placeholder_locked(span.base, prefix);
-                    remember_free_placeholder_locked(base, len + suffix);
+                    remember_placeholder_locked(spans, span.base, prefix);
+                    remember_placeholder_locked(spans, base, len + suffix);
                 } else {
-                    remember_free_placeholder_locked(span.base, span.size);
+                    remember_placeholder_locked(spans, span.base, span.size);
                 }
                 return nullptr;
             }
-            if (prefix) remember_free_placeholder_locked(span.base, prefix);
-            if (suffix) remember_free_placeholder_locked(base + len, suffix);
+            if (prefix) remember_placeholder_locked(spans, span.base, prefix);
+            if (suffix) remember_placeholder_locked(spans, base + len, suffix);
             return reinterpret_cast<void*>(static_cast<uintptr_t>(base));
         }
         return nullptr;
     }
 
-    void* acquire_placeholder_locked(uint64_t hint, uint64_t len, uint64_t align) {
+    void* take_free_placeholder_locked(uint64_t hint, uint64_t len, uint64_t align) {
+        return take_placeholder_locked(g_free_placeholders, hint, len, align);
+    }
+
+    void* take_guest_placeholder_locked(uint64_t hint, uint64_t len, uint64_t align) {
+        return take_placeholder_locked(g_guest_placeholders, hint, len, align);
+    }
+
+    void restore_placeholder_owner_locked(PlaceholderOwner owner, uint64_t base, uint64_t size) {
+        if (owner == PlaceholderOwner::Guest)
+            remember_guest_placeholder_locked(base, size);
+        else
+            remember_free_placeholder_locked(base, size);
+    }
+
+    AcquiredPlaceholder acquire_placeholder_locked(uint64_t hint, uint64_t len,
+                                                   uint64_t align, bool allow_guest) {
         const PlaceholderApis& apis = placeholder_apis();
         if (!apis.virtual_alloc2 || !apis.map_view_of_file3 ||
             !apis.unmap_view_of_file2 || !len || (len & 0xfff) ||
-            (align && (align & (align - 1)))) return nullptr;
+            (align && (align & (align - 1)))) return {};
 
-        if (void* recycled = take_free_placeholder_locked(hint, len, align)) return recycled;
+        if (void* recycled = take_free_placeholder_locked(hint, len, align))
+            return {recycled, PlaceholderOwner::Free};
+        if (hint && allow_guest) {
+            if (void* reserved = take_guest_placeholder_locked(hint, len, align))
+                return {reserved, PlaceholderOwner::Guest};
+        }
 
         if (hint) {
-            if (hint & 0xfff) return nullptr;
+            if (hint & 0xfff) return {};
             const uint64_t cover_base = hint & ~(kWinAllocationGranularity - 1);
             const uint64_t end = hint + len;
-            if (end < hint) return nullptr;
+            if (end < hint) return {};
             const uint64_t cover_end = align_up(end, kWinAllocationGranularity);
             void* cover = apis.virtual_alloc2(
                 GetCurrentProcess(),
                 reinterpret_cast<void*>(static_cast<uintptr_t>(cover_base)),
                 static_cast<SIZE_T>(cover_end - cover_base),
                 MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
-            if (!cover) return nullptr;
+            if (!cover) return {};
             remember_free_placeholder_locked(cover_base, cover_end - cover_base);
-            return take_free_placeholder_locked(hint, len, align);
+            return {take_free_placeholder_locked(hint, len, align), PlaceholderOwner::Free};
         }
 
         MEM_ADDRESS_REQUIREMENTS requirements{};
@@ -1678,27 +1722,73 @@ namespace {
         MEM_EXTENDED_PARAMETER parameter{};
         parameter.Type = MemExtendedParameterAddressRequirements;
         parameter.Pointer = &requirements;
-        return apis.virtual_alloc2(
-            GetCurrentProcess(), nullptr, static_cast<SIZE_T>(len),
+        if (len > UINT64_MAX - (kWinAllocationGranularity - 1)) return {};
+        const uint64_t cover_size = align_up(len, kWinAllocationGranularity);
+        void* cover = apis.virtual_alloc2(
+            GetCurrentProcess(), nullptr, static_cast<SIZE_T>(cover_size),
             MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, &parameter, 1);
+        if (!cover) return {};
+        const uint64_t base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cover));
+        remember_free_placeholder_locked(base, cover_size);
+        return {take_free_placeholder_locked(base, len, align), PlaceholderOwner::Free};
+    }
+
+    bool protect_committed_regions(uint64_t base, uint64_t len, int hp) {
+        if (!len || base > UINT64_MAX - len) return false;
+        const uint64_t end = base + len;
+        uint64_t cursor = base;
+        while (cursor < end) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(cursor)),
+                              &mbi, sizeof(mbi))) return false;
+            const uint64_t region_end = std::min<uint64_t>(
+                end, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mbi.BaseAddress)) +
+                         mbi.RegionSize);
+            if (region_end <= cursor || mbi.State == MEM_FREE) return false;
+            if (mbi.State == MEM_COMMIT) {
+                DWORD old = 0;
+                if (!VirtualProtect(reinterpret_cast<void*>(static_cast<uintptr_t>(cursor)),
+                                    static_cast<SIZE_T>(region_end - cursor),
+                                    win_page_prot(hp), &old)) return false;
+            }
+            cursor = region_end;
+        }
+        return true;
     }
 
     void* map_placeholder_section_view(HANDLE section, uint64_t hint, uint64_t rel,
-                                       uint64_t len, uint64_t align) {
+                                       uint64_t len, uint64_t align, int hp) {
         const PlaceholderApis& apis = placeholder_apis();
         if (!apis.map_view_of_file3 || (rel & 0xfff)) return nullptr;
         std::lock_guard<std::mutex> lk(g_dview_mx);
-        void* placeholder = acquire_placeholder_locked(hint, len, align);
-        if (!placeholder) return nullptr;
+        const AcquiredPlaceholder acquired =
+            acquire_placeholder_locked(hint, len, align, true);
+        if (!acquired.address) return nullptr;
         void* view = apis.map_view_of_file3(
-            section, GetCurrentProcess(), placeholder, rel,
+            section, GetCurrentProcess(), acquired.address, rel,
             static_cast<SIZE_T>(len), MEM_REPLACE_PLACEHOLDER,
             PAGE_READWRITE, nullptr, 0);
         if (!view) {
             const DWORD error = GetLastError();
-            remember_free_placeholder_locked(
-                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(placeholder)), len);
+            restore_placeholder_owner_locked(
+                acquired.owner,
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(acquired.address)), len);
             SetLastError(error);
+            return nullptr;
+        }
+        const uint64_t base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(view));
+        if (!protect_committed_regions(base, len, hp)) {
+            const DWORD error = GetLastError();
+            if (!apis.unmap_view_of_file2(GetCurrentProcess(), view,
+                                          MEM_PRESERVE_PLACEHOLDER)) {
+                std::fprintf(stderr,
+                             "[memhle] fatal: could not restore placeholder after protection "
+                             "failure\n");
+                std::abort();
+            }
+            restore_placeholder_owner_locked(acquired.owner, base, len);
+            SetLastError(error);
+            return nullptr;
         }
         return view;
     }
@@ -1718,7 +1808,7 @@ namespace {
         void* view = nullptr;
         // Placeholder replacement is page-granular, unlike MapViewOfFileEx. Map the guest range
         // directly at its physical-section offset, with no 64 KiB congruence requirement.
-        view = map_placeholder_section_view(section, hint, rel, len, requested_align);
+        view = map_placeholder_section_view(section, hint, rel, len, requested_align, hp);
         sparse = placeholder = view != nullptr;
         if (!view) {
             void* requested = nullptr;
@@ -1742,7 +1832,22 @@ namespace {
 
         if (!hint && requested_align &&
             ((uint64_t)(uintptr_t)guest & (requested_align - 1)) != 0) {
-            UnmapViewOfFile(view);
+            if (placeholder) {
+                const PlaceholderApis& apis = placeholder_apis();
+                if (!apis.unmap_view_of_file2 ||
+                    !apis.unmap_view_of_file2(GetCurrentProcess(), view,
+                                              MEM_PRESERVE_PLACEHOLDER)) {
+                    std::fprintf(stderr,
+                                 "[memhle] fatal: could not restore misaligned placeholder "
+                                 "view\n");
+                    std::abort();
+                }
+                std::lock_guard<std::mutex> lk(g_dview_mx);
+                remember_free_placeholder_locked(
+                    static_cast<uint64_t>(reinterpret_cast<uintptr_t>(view)), len);
+            } else {
+                UnmapViewOfFile(view);
+            }
             return nullptr;
         }
         if (!sparse && !VirtualAlloc(guest, (SIZE_T)len, MEM_COMMIT, PAGE_READWRITE)) {
@@ -1989,18 +2094,81 @@ namespace {
         if (reused) dmem_zero(phys, len);
     }
 
-    // Commit `len` at `hint` (0 = OS chooses). Handles BOTH the guest's reserve-then-commit flow
-    // (ReserveVirtualRange did MEM_RESERVE; commit within it) AND a fresh map, by trying MEM_COMMIT
-    // first (succeeds only over an existing reservation) then MEM_RESERVE|MEM_COMMIT.
+    PrivatePlaceholderView* private_placeholder_view_containing_locked(uint64_t begin,
+                                                                       uint64_t end) {
+        for (PrivatePlaceholderView& view : g_private_placeholder_views) {
+            if (begin >= view.base && end >= begin && end <= view.base + view.size)
+                return &view;
+        }
+        return nullptr;
+    }
+
+    void* replace_placeholder_with_private_locked(uint64_t base, uint64_t len, int hp,
+                                                  PlaceholderOwner owner) {
+        const PlaceholderApis& apis = placeholder_apis();
+        if (!apis.virtual_alloc2) return nullptr;
+        void* result = apis.virtual_alloc2(
+            GetCurrentProcess(),
+            reinterpret_cast<void*>(static_cast<uintptr_t>(base)),
+            static_cast<SIZE_T>(len),
+            MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+            win_page_prot(hp), nullptr, 0);
+        if (!result) {
+            restore_placeholder_owner_locked(owner, base, len);
+            return nullptr;
+        }
+        g_private_placeholder_views.push_back({base, len});
+        return result;
+    }
+
+    // Commit `len` at `hint` (0 = OS chooses). Placeholder-backed guest reservations and holes
+    // are replaced with ordinary private pages so the same 16 KiB address can later be reused by
+    // either flexible or direct memory. Legacy VirtualAlloc reservations retain their old path.
     void* win_commit(uint64_t hint, uint64_t len, int hp) {
         DWORD pp = win_page_prot(hp);
         void* result = nullptr;
         if (!hint) {
             result = VirtualAlloc(nullptr, (SIZE_T)len, MEM_RESERVE | MEM_COMMIT, pp);
         } else {
-            result = VirtualAlloc((void*)hint, (SIZE_T)len, MEM_COMMIT, pp);
-            if (!result)
-                result = VirtualAlloc((void*)hint, (SIZE_T)len, MEM_RESERVE | MEM_COMMIT, pp);
+            bool placeholder_owned = false;
+            bool direct_collision = false;
+            if (hint <= UINT64_MAX - len) {
+                std::lock_guard<std::mutex> lk(g_dview_mx);
+                if (private_placeholder_view_containing_locked(hint, hint + len)) {
+                    placeholder_owned = true;
+                    DWORD old = 0;
+                    if (VirtualProtect(reinterpret_cast<void*>(static_cast<uintptr_t>(hint)),
+                                       static_cast<SIZE_T>(len), pp, &old))
+                        result = reinterpret_cast<void*>(static_cast<uintptr_t>(hint));
+                } else {
+                    PlaceholderOwner owner = PlaceholderOwner::Guest;
+                    void* placeholder = take_guest_placeholder_locked(hint, len, 0x1000);
+                    if (!placeholder) {
+                        owner = PlaceholderOwner::Free;
+                        placeholder = take_free_placeholder_locked(hint, len, 0x1000);
+                    }
+                    if (placeholder) {
+                        placeholder_owned = true;
+                        result = replace_placeholder_with_private_locked(hint, len, hp, owner);
+                    } else {
+                        for (const DmemView& view : g_dviews) {
+                            if (hint < view.guest_base + view.guest_size &&
+                                hint + len > view.guest_base) {
+                                direct_collision = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if (!result && !placeholder_owned && !direct_collision) {
+                result = VirtualAlloc(reinterpret_cast<void*>(static_cast<uintptr_t>(hint)),
+                                      static_cast<SIZE_T>(len), MEM_COMMIT, pp);
+                if (!result)
+                    result = VirtualAlloc(reinterpret_cast<void*>(static_cast<uintptr_t>(hint)),
+                                          static_cast<SIZE_T>(len),
+                                          MEM_RESERVE | MEM_COMMIT, pp);
+            }
         }
         if (result)
             host::guest_write_watch_notify_direct_mapping_added(
@@ -2024,9 +2192,22 @@ namespace {
              (unsigned long long)phys, (unsigned long long)align, GetLastError());
         return win_commit(fixed ? hint : 0, len, hp);
     }
-    // Reserve (no commit). VirtualAlloc reservations are 64 KiB-aligned, satisfying guest aligns
-    // up to 64 KiB; larger alignment is logged and left to the OS base (follow-up).
+    // Reserve (no commit). Modern Windows placeholders can be partitioned at the guest's 16 KiB
+    // page boundary and later replaced by either a section view or private pages.
     void* win_reserve(uint64_t hint, uint64_t len, bool fixed, uint64_t align) {
+        {
+            std::lock_guard<std::mutex> lk(g_dview_mx);
+            AcquiredPlaceholder acquired =
+                acquire_placeholder_locked(hint, len, align, false);
+            if (!acquired.address && hint && !fixed)
+                acquired = acquire_placeholder_locked(0, len, align, false);
+            if (acquired.address) {
+                const uint64_t base = static_cast<uint64_t>(
+                    reinterpret_cast<uintptr_t>(acquired.address));
+                remember_guest_placeholder_locked(base, len);
+                return acquired.address;
+            }
+        }
         if (hint) {
             if (void* p = VirtualAlloc((void*)hint, (SIZE_T)len, MEM_RESERVE, PAGE_NOACCESS)) return p;
             if (fixed) return nullptr;   // SCE_KERNEL_MAP_FIXED: must be exactly this address
@@ -2176,6 +2357,14 @@ namespace {
         }
     }
 
+    void notify_private_watch_added(const PrivatePlaceholderView& view) {
+        const auto slices = tracked_protection_slices(view.base, view.base + view.size);
+        for (const ProtectionSlice& slice : slices) {
+            host::guest_write_watch_notify_direct_mapping_added(
+                slice.base, slice.size, slice.base, win_page_prot(slice.prot));
+        }
+    }
+
     bool replace_free_placeholder_with_view_locked(uint64_t base, uint64_t size, uint64_t phys,
                                                    DmemView& out) {
         const PlaceholderApis& apis = placeholder_apis();
@@ -2310,33 +2499,46 @@ namespace {
         return true;
     }
 
-    bool tracked_mappings_covered_by_views(uint64_t begin, uint64_t end,
-                                           const std::vector<DmemView>& views) {
-        std::vector<PlaceholderSpan> covered;
-        for (const DmemView& view : views) {
-            const uint64_t overlap_begin = std::max(begin, view.guest_base);
-            const uint64_t overlap_end = std::min(end, view.guest_base + view.guest_size);
-            if (overlap_begin < overlap_end)
-                covered.push_back({overlap_begin, overlap_end - overlap_begin});
-        }
-        std::sort(covered.begin(), covered.end(),
+    void normalize_spans(std::vector<PlaceholderSpan>& spans) {
+        std::sort(spans.begin(), spans.end(),
                   [](const PlaceholderSpan& a, const PlaceholderSpan& b) {
                       return a.base < b.base;
                   });
+        size_t out = 0;
+        for (const PlaceholderSpan& span : spans) {
+            if (!span.size) continue;
+            if (!out || spans[out - 1].base + spans[out - 1].size < span.base) {
+                spans[out++] = span;
+                continue;
+            }
+            const uint64_t merged_end = std::max(
+                spans[out - 1].base + spans[out - 1].size, span.base + span.size);
+            spans[out - 1].size = merged_end - spans[out - 1].base;
+        }
+        spans.resize(out);
+    }
 
+    bool span_is_covered(uint64_t begin, uint64_t end,
+                         const std::vector<PlaceholderSpan>& covered) {
+        if (begin >= end) return false;
+        uint64_t cursor = begin;
+        for (const PlaceholderSpan& span : covered) {
+            if (span.base + span.size <= cursor) continue;
+            if (span.base > cursor) break;
+            cursor = std::min(end, span.base + span.size);
+            if (cursor == end) return true;
+        }
+        return false;
+    }
+
+    bool tracked_mappings_covered_by_spans(uint64_t begin, uint64_t end,
+                                           const std::vector<PlaceholderSpan>& covered) {
         std::lock_guard<std::mutex> lk(g_mx);
         for (const Mapping& mapping : g_maps) {
             const uint64_t overlap_begin = std::max(begin, mapping.base);
             const uint64_t overlap_end = std::min(end, mapping.base + mapping.size);
             if (overlap_begin >= overlap_end) continue;
-            uint64_t cursor = overlap_begin;
-            for (const PlaceholderSpan& span : covered) {
-                if (span.base + span.size <= cursor) continue;
-                if (span.base > cursor) break;
-                cursor = std::min(overlap_end, span.base + span.size);
-                if (cursor == overlap_end) break;
-            }
-            if (cursor != overlap_end) return false;
+            if (!span_is_covered(overlap_begin, overlap_end, covered)) return false;
         }
         return true;
     }
@@ -2346,94 +2548,189 @@ namespace {
     // untouched prefix/suffix with views of their original physical offsets, and retain the hole as
     // an inaccessible free placeholder for an exact future remap.
     bool win_unmap(uint64_t addr, uint64_t len) {
-        if (!addr || !len || addr > UINT64_MAX - len) return false;
+        if (!addr || !len || (addr & 0xfff) || (len & 0xfff) ||
+            addr > UINT64_MAX - len) return false;
         const uint64_t end = addr + len;
         std::vector<DmemView> added;
-        bool section_overlap = false;
+        bool special_overlap = false;
         {
             std::lock_guard<std::mutex> lk(g_dview_mx);
             std::vector<DmemView> targets;
+            std::vector<PrivatePlaceholderView> private_targets;
+            std::vector<PlaceholderSpan> guest_cuts;
+            std::vector<PlaceholderSpan> covered;
             for (const DmemView& view : g_dviews) {
                 if (addr < view.guest_base + view.guest_size && end > view.guest_base) {
                     targets.push_back(view);
                     const uint64_t cut_begin = std::max(addr, view.guest_base);
                     const uint64_t cut_end = std::min(end, view.guest_base + view.guest_size);
+                    covered.push_back({cut_begin, cut_end - cut_begin});
                     if ((cut_begin != view.guest_base || cut_end != view.guest_base + view.guest_size) &&
                         !view.placeholder) return false;
                 }
+            }
+            for (const PrivatePlaceholderView& view : g_private_placeholder_views) {
+                const uint64_t cut_begin = std::max(addr, view.base);
+                const uint64_t cut_end = std::min(end, view.base + view.size);
+                if (cut_begin >= cut_end) continue;
+                // Returning a private replacement to a placeholder releases the whole allocation.
+                // Refuse partial cuts instead of discarding retained bytes.
+                if (cut_begin != view.base || cut_end != view.base + view.size) return false;
+                private_targets.push_back(view);
+                covered.push_back({cut_begin, cut_end - cut_begin});
+            }
+            for (const PlaceholderSpan& span : g_guest_placeholders) {
+                const uint64_t cut_begin = std::max(addr, span.base);
+                const uint64_t cut_end = std::min(end, span.base + span.size);
+                if (cut_begin >= cut_end) continue;
+                guest_cuts.push_back({cut_begin, cut_end - cut_begin});
+                covered.push_back({cut_begin, cut_end - cut_begin});
+            }
+            for (const PlaceholderSpan& span : g_free_placeholders) {
+                const uint64_t cut_begin = std::max(addr, span.base);
+                const uint64_t cut_end = std::min(end, span.base + span.size);
+                if (cut_begin < cut_end)
+                    covered.push_back({cut_begin, cut_end - cut_begin});
             }
             std::sort(targets.begin(), targets.end(),
                       [](const DmemView& a, const DmemView& b) {
                           return a.guest_base < b.guest_base;
                       });
-            section_overlap = !targets.empty();
-            if (section_overlap && !tracked_mappings_covered_by_views(addr, end, targets))
-                return false;
+            normalize_spans(covered);
+            special_overlap = !covered.empty();
+            if (special_overlap &&
+                (!span_is_covered(addr, end, covered) ||
+                 !tracked_mappings_covered_by_spans(addr, end, covered))) return false;
+            if (!special_overlap) {
+                // No placeholder-owned range participates; retain the legacy private allocation
+                // path outside the registry lock.
+            } else {
 
-            // Disarm any active physical write watch while every old alias is still mapped. On
-            // failure, the transaction restores both the views and their alias registrations.
-            for (const DmemView& target : targets)
-                host::guest_write_watch_notify_direct_mapping_removed(
-                    target.guest_base, target.guest_size);
+                // Disarm active physical write watches while every old direct alias is still
+                // mapped. On failure, the transaction restores views and alias registrations.
+                for (const DmemView& target : targets)
+                    host::guest_write_watch_notify_direct_mapping_removed(
+                        target.guest_base, target.guest_size);
 
-            std::vector<UnmapChange> changes;
-            changes.reserve(targets.size());
-            auto rollback = [&]() {
-                for (auto it = changes.rbegin(); it != changes.rend(); ++it) {
-                    if (!rollback_unmap_change_locked(*it)) {
-                        std::fprintf(stderr,
-                                     "[memhle] fatal: could not roll back direct-memory unmap\n");
-                        std::abort();
+                std::vector<UnmapChange> changes;
+                changes.reserve(targets.size());
+                auto rollback_views = [&]() {
+                    for (auto it = changes.rbegin(); it != changes.rend(); ++it) {
+                        if (!rollback_unmap_change_locked(*it)) {
+                            std::fprintf(stderr,
+                                         "[memhle] fatal: could not roll back direct-memory "
+                                         "unmap\n");
+                            std::abort();
+                        }
                     }
-                }
-                for (const DmemView& target : targets) notify_view_watch_added(target);
-            };
+                    for (const DmemView& target : targets) notify_view_watch_added(target);
+                };
 
-            for (const DmemView& target : targets) {
-                const uint64_t cut_begin = std::max(addr, target.guest_base);
-                const uint64_t cut_end = std::min(end, target.guest_base + target.guest_size);
-                UnmapChange change{target, {}};
-                bool ok = false;
-                if (cut_begin == target.guest_base &&
-                    cut_end == target.guest_base + target.guest_size) {
-                    if (target.placeholder) {
-                        const PlaceholderApis& apis = placeholder_apis();
-                        ok = apis.unmap_view_of_file2 &&
-                             apis.unmap_view_of_file2(GetCurrentProcess(), target.view_base,
-                                                     MEM_PRESERVE_PLACEHOLDER);
-                        if (ok) remember_free_placeholder_locked(
-                            target.guest_base, target.guest_size);
+                for (const DmemView& target : targets) {
+                    const uint64_t cut_begin = std::max(addr, target.guest_base);
+                    const uint64_t cut_end = std::min(end, target.guest_base + target.guest_size);
+                    UnmapChange change{target, {}};
+                    bool ok = false;
+                    if (cut_begin == target.guest_base &&
+                        cut_end == target.guest_base + target.guest_size) {
+                        if (target.placeholder) {
+                            const PlaceholderApis& apis = placeholder_apis();
+                            ok = apis.unmap_view_of_file2 &&
+                                 apis.unmap_view_of_file2(GetCurrentProcess(), target.view_base,
+                                                         MEM_PRESERVE_PLACEHOLDER);
+                            if (ok) remember_free_placeholder_locked(
+                                target.guest_base, target.guest_size);
+                        } else {
+                            ok = UnmapViewOfFile(target.view_base) != 0;
+                        }
                     } else {
-                        ok = UnmapViewOfFile(target.view_base) != 0;
+                        ok = split_placeholder_view_locked(
+                            target, cut_begin, cut_end, change.replacements);
                     }
-                } else {
-                    ok = split_placeholder_view_locked(
-                        target, cut_begin, cut_end, change.replacements);
+                    if (!ok) {
+                        rollback_views();
+                        return false;
+                    }
+                    changes.push_back(std::move(change));
                 }
-                if (!ok) {
-                    rollback();
-                    return false;
-                }
-                changes.push_back(std::move(change));
-            }
 
-            for (const UnmapChange& change : changes) {
-                const DmemView& target = change.original;
-                auto it = std::find_if(g_dviews.begin(), g_dviews.end(),
-                    [&](const DmemView& view) {
-                        return view.view_base == target.view_base &&
-                               view.guest_base == target.guest_base &&
-                               view.guest_size == target.guest_size &&
-                               view.phys == target.phys;
-                    });
-                if (it != g_dviews.end()) g_dviews.erase(it);
-                for (const DmemView& replacement : change.replacements) {
-                    added.push_back(replacement);
-                    g_dviews.push_back(replacement);
+                std::vector<PlaceholderSpan> converted_guest;
+                auto rollback_guest = [&]() {
+                    for (auto it = converted_guest.rbegin();
+                         it != converted_guest.rend(); ++it) {
+                        if (!take_free_placeholder_locked(it->base, it->size, 0x1000)) {
+                            std::fprintf(stderr,
+                                         "[memhle] fatal: could not restore guest placeholder "
+                                         "ownership\n");
+                            std::abort();
+                        }
+                        remember_guest_placeholder_locked(it->base, it->size);
+                    }
+                };
+                for (const PlaceholderSpan& cut : guest_cuts) {
+                    if (!take_guest_placeholder_locked(cut.base, cut.size, 0x1000)) {
+                        rollback_guest();
+                        rollback_views();
+                        return false;
+                    }
+                    remember_free_placeholder_locked(cut.base, cut.size);
+                    converted_guest.push_back(cut);
+                }
+
+                size_t private_unmapped = 0;
+                for (const PrivatePlaceholderView& view : private_targets) {
+                    host::guest_write_watch_notify_direct_mapping_removed(
+                        view.base, view.size);
+                    if (!VirtualFree(
+                            reinterpret_cast<void*>(static_cast<uintptr_t>(view.base)),
+                            static_cast<SIZE_T>(view.size),
+                            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+                        MLOG("private placeholder release va=0x%llx len=0x%llx failed "
+                             "error=%lu\n",
+                             (unsigned long long)view.base,
+                             (unsigned long long)view.size, GetLastError());
+                        if (private_unmapped) {
+                            std::fprintf(stderr,
+                                         "[memhle] fatal: partial private-placeholder unmap\n");
+                            std::abort();
+                        }
+                        notify_private_watch_added(view);
+                        rollback_guest();
+                        rollback_views();
+                        return false;
+                    }
+                    remember_free_placeholder_locked(view.base, view.size);
+                    ++private_unmapped;
+                }
+
+                for (const UnmapChange& change : changes) {
+                    const DmemView& target = change.original;
+                    auto it = std::find_if(g_dviews.begin(), g_dviews.end(),
+                        [&](const DmemView& view) {
+                            return view.view_base == target.view_base &&
+                                   view.guest_base == target.guest_base &&
+                                   view.guest_size == target.guest_size &&
+                                   view.phys == target.phys;
+                        });
+                    if (it != g_dviews.end()) g_dviews.erase(it);
+                    for (const DmemView& replacement : change.replacements) {
+                        added.push_back(replacement);
+                        g_dviews.push_back(replacement);
+                    }
+                }
+                for (const PrivatePlaceholderView& target : private_targets) {
+                    auto it = std::find_if(
+                        g_private_placeholder_views.begin(),
+                        g_private_placeholder_views.end(),
+                        [&](const PrivatePlaceholderView& view) {
+                            return view.base == target.base && view.size == target.size;
+                        });
+                    if (it != g_private_placeholder_views.end())
+                        g_private_placeholder_views.erase(it);
                 }
             }
         }
-        if (!section_overlap) {
+        if (!special_overlap) {
             host::guest_write_watch_notify_direct_mapping_removed(addr, len);
             return VirtualFree(reinterpret_cast<void*>(static_cast<uintptr_t>(addr)),
                                static_cast<SIZE_T>(len), MEM_DECOMMIT) != 0;
@@ -2447,6 +2744,18 @@ namespace {
 // Returns 0 for an unrelated, inaccessible, or invalid range so callers retain their normal guard.
 extern "C" int prosper_try_commit_dmem(uint64_t addr, uint64_t len, int write) {
     return commit_sparse_dmem(addr, len, write != 0);
+}
+
+// Materialize one page of an uncommitted guest reservation on first touch. The legacy VEH path
+// still handles ordinary VirtualAlloc reservations; this helper owns only modern placeholders.
+extern "C" int prosper_try_commit_reserved_placeholder(uint64_t addr, uint64_t len) {
+    if (!len || (addr & 0xfff) || (len & 0xfff) || addr > UINT64_MAX - len) return 0;
+    std::lock_guard<std::mutex> lk(g_dview_mx);
+    if (private_placeholder_view_containing_locked(addr, addr + len)) return 1;
+    void* placeholder = take_guest_placeholder_locked(addr, len, 0x1000);
+    if (!placeholder) return 0;
+    return replace_placeholder_with_private_locked(
+               addr, len, HP_R | HP_W, PlaceholderOwner::Guest) != nullptr;
 }
 
 // Fault-handler lazy-commit probe parity (Linux exports this for its SIGSEGV handler). The Windows
