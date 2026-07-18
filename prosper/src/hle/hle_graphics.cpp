@@ -353,23 +353,27 @@ extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32
 HLE(g_vo_flippending) { if (evlog()) fprintf(stderr, "[ev] IsFlipPending\n"); return 0; }        // never pending
 HLE(g_vo_flipstatus)  { // (handle, SceVideoOutFlipStatus* status): report our simulated flip count.
     // SceVideoOutFlipStatus is exactly 0x40 bytes — writing more smashes the caller's stack canary!
-    if (a1) { uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x40);
-              uint64_t cnt; int64_t arg; int32_t buf;
-              { std::lock_guard<std::mutex> lk(g_flip_mx);   // consistent snapshot of the flip triple
-                cnt = g_flip_count; arg = g_last_flip_arg; buf = g_current_buffer; }
-              *(uint64_t*)(s + 0x00) = cnt;    // count
-              *(int64_t*) (s + 0x18) = arg;    // flipArg
-              *(int32_t*) (s + 0x38) = buf; }  // currentBuffer
+    if (!a1)
+        return (uint64_t)(int64_t)(int32_t)0x80290002;  // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
+    uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x40);
+    uint64_t cnt; int64_t arg; int32_t buf;
+    { std::lock_guard<std::mutex> lk(g_flip_mx);   // consistent snapshot of the flip triple
+      cnt = g_flip_count; arg = g_last_flip_arg; buf = g_current_buffer; }
+    *(uint64_t*)(s + 0x00) = cnt;    // count
+    *(int64_t*) (s + 0x18) = arg;    // flipArg
+    *(int32_t*) (s + 0x38) = buf;    // currentBuffer
     return 0;
 }
 // SceVideoOutResolutionStatus (0x30 bytes): report a real 1080p60 panel instead of the previous
 // all-zero display, and initialize flags/reserved0/reserved1 rather than leaking caller garbage.
 HLE(g_vo_resstatus)   {
-    if (a1) { uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x30);
-              *(uint32_t*)(s + 0x00) = kDispW;   *(uint32_t*)(s + 0x04) = kDispH;   // full w/h
-              *(uint32_t*)(s + 0x08) = kDispW;   *(uint32_t*)(s + 0x0c) = kDispH;   // pane w/h
-              *(uint64_t*)(s + 0x10) = kRefresh5994;
-              *(float*)   (s + 0x18) = 50.0f; }                                     // screen size (inch)
+    if (!a1)
+        return (uint64_t)(int64_t)(int32_t)0x80290002;  // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
+    uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x30);
+    *(uint32_t*)(s + 0x00) = kDispW;   *(uint32_t*)(s + 0x04) = kDispH;   // full w/h
+    *(uint32_t*)(s + 0x08) = kDispW;   *(uint32_t*)(s + 0x0c) = kDispH;   // pane w/h
+    *(uint64_t*)(s + 0x10) = kRefresh5994;
+    *(float*)   (s + 0x18) = 50.0f;                                      // screen size (inch)
     return 0;
 }
 
@@ -379,23 +383,30 @@ HLE(g_vo_resstatus)   {
 // advanced once per CALL, so a poll loop saw a "vblank" on every poll (uncapped pacing) and the
 // counter disagreed arbitrarily with the real 60 Hz equeue vblank pump.
 HLE(g_vo_vblankstatus) {
-    if (a1) { uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x28);
-              uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                std::chrono::steady_clock::now().time_since_epoch()).count();
-              static const uint64_t t0 = ns;                       // process-relative, first-call anchored
-              constexpr uint64_t kVblankNs = 16683350;             // 59.94 Hz period
-              // A live VideoOut handle has already observed at least one vblank. Returning zero on
-              // the first query made Astro Bot compute a frame-rate sample as
-              // `(frames * refresh) / (count - previous_count)` with both counts zero and trap on
-              // IDIV. Keep the time-based behavior, but number the first process-relative vblank 1.
-              *(uint64_t*)(s + 0x00) = 1 + (ns - t0) / kVblankNs;  // count: one tick per vblank period
-              *(uint64_t*)(s + 0x08) = (ns - t0) / 1000;           // processTime (µs)
-              *(uint64_t*)(s + 0x10) = ns; }                       // tsc (monotonic ns; matches ReadTsc's unit)
+    if (!a1)
+        return (uint64_t)(int64_t)(int32_t)0x80290002;  // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
+    uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x28);
+    uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch()).count();
+    static const uint64_t t0 = ns;                       // process-relative, first-call anchored
+    constexpr uint64_t kVblankNs = 16683350;             // 59.94 Hz period
+    // A live VideoOut handle has already observed at least one vblank. Returning zero on
+    // the first query made Astro Bot compute a frame-rate sample as
+    // `(frames * refresh) / (count - previous_count)` with both counts zero and trap on
+    // IDIV. Keep the time-based behavior, but number the first process-relative vblank 1.
+    *(uint64_t*)(s + 0x00) = 1 + (ns - t0) / kVblankNs;  // count: one tick per vblank period
+    *(uint64_t*)(s + 0x08) = (ns - t0) / 1000;           // processTime (µs)
+    *(uint64_t*)(s + 0x10) = ns;                         // tsc (monotonic ns; matches ReadTsc's unit)
     return 0;
 }
 // sceVideoOutGetDeviceCapabilityInfo (SceVideoOutDeviceCapabilityInfo: single u64 capability).
 // Advertise a plain SDR display (no HDR/BT2020) — capability 0.
-HLE(g_vo_devcap) { if (a1) *(uint64_t*)(uintptr_t)a1 = 0; return 0; }
+HLE(g_vo_devcap) {
+    if (!a1)
+        return (uint64_t)(int64_t)(int32_t)0x80290002;  // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
+    *(uint64_t*)(uintptr_t)a1 = 0;
+    return 0;
+}
 
 // sceVideoOutIsOutputSupported (Nv8c-Kb+DUM): (port_type, mode/feature) -> bool. A standard main-bus
 // output supports the queried mode → 1.
@@ -605,6 +616,8 @@ HLE(g_vo_configure_output) { vo_argtrace("ConfigureOutput", a0,a1,a2,a3,a4,a5); 
 // field semantics (single consumer, unambiguous read), HIGH that a defined write beats garbage.
 HLE(g_vo_get_output_status) {
     vo_argtrace("GetOutputStatus", a0,a1,a2,a3,a4,a5);
+    if (!a1)
+        return (uint64_t)(int64_t)(int32_t)0x80290002;  // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
     if (a1 > 0xffffull) {
         *(uint32_t*)(uintptr_t)a1       = 0;   // +0x00: output state (0 = the boring/default state)
         *(uint32_t*)(uintptr_t)(a1 + 4) = 0;   // +0x04: dynamic-range mode (2 = HDR; 0 = SDR)

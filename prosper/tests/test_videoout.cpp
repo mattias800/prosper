@@ -45,15 +45,30 @@ int main() {
     auto labels = Hle::lookup("OcQybQejHEY");   // GetBufferLabelAddress
     auto setrate = Hle::lookup(nid_hash("sceVideoOutSetFlipRate"));
     auto cfg    = Hle::lookup("w0hLuNarQxY");   // ConfigureOutput
+    auto outstat = Hle::lookup("utPrVdxio-8");  // GetOutputStatus
     auto flip   = Hle::lookup(nid_hash("sceVideoOutSubmitFlip"));
     auto fstat  = Hle::lookup(nid_hash("sceVideoOutGetFlipStatus"));
     CHECK(res && vbl && cap && issup && setba && regb && setba2 && regb2 && unreg && labels &&
-              setrate && cfg && flip && fstat,
+              setrate && cfg && outstat && flip && fstat,
           "VideoOut functions registered");
     if (!(res && vbl && cap && issup && setba && regb && setba2 && regb2 && unreg && labels &&
-          setrate && cfg && flip && fstat)) {
+          setrate && cfg && outstat && flip && fstat)) {
         printf("== FAIL ==\n"); return 1;
     }
+
+    // #394 F10 (status-query output scope): a null result is an invalid address, not a successful
+    // query that silently leaves the caller without status data.
+    constexpr uint32_t kInvalidAddress = 0x80290002u;
+    CHECK((uint32_t)fstat(0x1001, 0, 0, 0, 0, 0) == kInvalidAddress,
+          "GetFlipStatus rejects a null output pointer");
+    CHECK((uint32_t)res(0x1001, 0, 0, 0, 0, 0) == kInvalidAddress,
+          "GetResolutionStatus rejects a null output pointer");
+    CHECK((uint32_t)vbl(0x1001, 0, 0, 0, 0, 0) == kInvalidAddress,
+          "GetVblankStatus rejects a null output pointer");
+    CHECK((uint32_t)cap(0x1001, 0, 0, 0, 0, 0) == kInvalidAddress,
+          "GetDeviceCapabilityInfo rejects a null output pointer");
+    CHECK((uint32_t)outstat(0x1001, 0, 0, 0, 0, 0) == kInvalidAddress,
+          "GetOutputStatus rejects a null output pointer");
 
     // #394 F7: the rate selector is per-port state rather than a success-returning no-op. All
     // documented rates are accepted; invalid values leave the last valid selection unchanged.
