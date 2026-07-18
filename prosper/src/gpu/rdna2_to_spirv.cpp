@@ -4959,11 +4959,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 else                b.image_sample_lod_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)),
                                                           b.uconst(0), out);   // _lz: base level
             } else if (is_sample_c_lz) {
-                // Astro Bot shadow/visibility packet (exact live opcode 0x2f, dim 2D_ARRAY, NSA).
-                // ISA 8.2.5 vaddr order: "{offset}{bias}{z-compare}{derivative}{body}" — the
-                // z-compare reference PRECEDES the coordinates, so SAMPLE_C_LZ 2D_ARRAY is
-                // [dref, u, v, slice] (the same modifier-first rule the _b/_o paths follow).
+                // Astro Bot shadow/visibility packet (opcode 0x2f, dim 2D_ARRAY, NSA). ISA 8.2.5
+                // vaddr order is "{offset}{bias}{z-compare}{derivative}{body}" — the z-compare
+                // reference PRECEDES the coordinates, so SAMPLE_C_LZ 2D_ARRAY reads
+                // [dref, u, v, slice] (the same modifier-first rule the _b/_o paths already use).
                 // The earlier [u,v,layer,dref] mapping rotated every operand (#883).
+                // EVIDENCE: no rendered-frame validation exists for either order — Astro crashes
+                // in engine init before it reaches shadow rendering (#825), and the prior
+                // "[u,v,layer,dref]" comment was an un-round-tripped interpretation of the packet,
+                // not a captured/disassembled fact. This order is grounded in the ISA plus an
+                // llvm-mc gfx1030 round-trip of a canonical c_lz 2D_ARRAY NSA packet
+                // (image_sample_c_lz v5, [v10,v11,v12,v13], ... = 0xf0bc012a 0x0040050a 0x000d0c0b:
+                // four consecutive address VGPRs, dref at slot 0 per 8.2.5) and LLVM's own
+                // llvm.amdgcn.image.sample.c.lz lowering (dref before coords). CONFIDENCE: MED —
+                // the #825 lane must re-validate against a real rendered shadow once it lights up.
                 // Integer views and non-array dimensions are not legal for this lowering; reject
                 // rather than silently turning a comparison sample into an ordinary color read.
                 if (in.mimg_dim != 5u || uint_texture || !res->depth_compare) {

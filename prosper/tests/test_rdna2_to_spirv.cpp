@@ -3360,6 +3360,35 @@ int main() {
     CHECK(gotA8.size() == 1 && gotA8[0] == 1.0f,
           "A8: v_cvt_f32_f16 of inline 1.0 reads the f16 pattern 0x3C00 -> 1.0f");
 
+    // A9 (#879): SCC POISON. A 64-bit mask op (s_and_b64 s[0:1],vcc,vcc) writes SCC = a cross-lane
+    // reduction the per-invocation model cannot form, so it poisons rs.scc. A NON-ADJACENT SCC
+    // consumer (s_cselect_b32, separated by an s_mov_b32 that does not touch SCC) must then reject
+    // the whole shader fail-visibly instead of silently selecting on the value the (absent) earlier
+    // s_cmp would have left. Recompile returns empty. (llvm-mc gfx1030 encodings.)
+    const uint32_t codeA9[] = {
+        0x87806a6au,   // s_and_b64 s[0:1], vcc, vcc  (poisons SCC)
+        0xbe820385u,   // s_mov_b32 s2, 5             (non-adjacent filler; no SCC write)
+        0x8503848bu,   // s_cselect_b32 s3, 11, 4     (reads poisoned SCC -> reject)
+        0x4a020203u,   // v_add_nc_u32 v1, s3, v1
+        0xBF810000u,
+    };
+    std::vector<uint32_t> spvA9 = recompile_valu(codeA9, std::size(codeA9), 1, 1);
+    CHECK(spvA9.empty(),
+          "A9: a non-adjacent SCC consumer after a 64-bit mask op is REJECTED (SCC poison)");
+
+    // A9b: the SAME consumer after a real s_cmp (which re-arms SCC) still recompiles — the poison
+    // only rejects when the last SCC writer was an unrepresentable mask op, not in general.
+    const uint32_t codeA9b[] = {
+        0x87806a6au,   // s_and_b64 s[0:1], vcc, vcc  (poisons SCC)
+        0xbf068000u,   // s_cmp_eq_u32 s0, 0          (re-arms SCC with a representable value)
+        0x8503848bu,   // s_cselect_b32 s3, 11, 4     (reads the fresh SCC -> OK)
+        0x4a020203u,   // v_add_nc_u32 v1, s3, v1
+        0xBF810000u,
+    };
+    std::vector<uint32_t> spvA9b = recompile_valu(codeA9b, std::size(codeA9b), 1, 1);
+    CHECK(!spvA9b.empty(),
+          "A9b: a real s_cmp between the mask op and the consumer re-arms SCC (recompiles)");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
