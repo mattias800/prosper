@@ -22,12 +22,15 @@ int main() {
     register_builtin_hle();
     gpu::present_reset();
 
+    auto open   = Hle::lookup(nid_hash("sceVideoOutOpen"));
     auto setba2 = Hle::lookup("PjS5uASwcV8");   // SetBufferAttribute2
     auto regb2  = Hle::lookup("rKBUtgRrtbk");   // RegisterBuffers2
     auto unreg  = Hle::lookup("N5KDtkIjjJ4");   // UnregisterBuffers
     auto flip   = Hle::lookup(nid_hash("sceVideoOutSubmitFlip"));
-    CHECK(setba2 && regb2 && unreg && flip, "VideoOut functions registered");
-    if (!(setba2 && regb2 && unreg && flip)) { printf("== FAIL ==\n"); return 1; }
+    CHECK(open && setba2 && regb2 && unreg && flip, "VideoOut functions registered");
+    if (!(open && setba2 && regb2 && unreg && flip)) { printf("== FAIL ==\n"); return 1; }
+    const uint64_t handle = open(0, 0, 0, 0, 0, 0);
+    CHECK((int64_t)handle > 0, "opened a live VideoOut handle");
 
     // A small surface so the test framebuffers are cheap: 16x8 BGRA (512 bytes each), triple-buffered.
     const uint32_t W = 16, H = 8;
@@ -40,7 +43,7 @@ int main() {
     setba2((uint64_t)(uintptr_t)attr, 0x8000000000000000ull /*fmt*/, 0 /*tiling*/, W, H, 0 /*option*/);
     struct VOB { const void* data; const void* metadata; const void* reserved[2]; };
     VOB buffers[3] = { {fb0.data(),0,{0,0}}, {fb1.data(),0,{0,0}}, {fb2.data(),0,{0,0}} };
-    uint64_t rc = regb2(0x1001, 0, 0, (uint64_t)(uintptr_t)buffers, 3, (uint64_t)(uintptr_t)attr);
+    uint64_t rc = regb2(handle, 0, 0, (uint64_t)(uintptr_t)buffers, 3, (uint64_t)(uintptr_t)attr);
     CHECK(rc == 0, "registered a 3-buffer 16x8 surface");
     CHECK(gpu::present_width() == W && gpu::present_height() == H, "present layer sees the surface dimensions");
 
@@ -51,7 +54,7 @@ int main() {
 
     // Flip buffer 1 -> it becomes the presented (scanned-out) frame.
     uint64_t base_count = gpu::present_count();
-    flip(0x1001, 1 /*buffer*/, 0 /*mode*/, 0xABCD /*flipArg*/, 0, 0);
+    flip(handle, 1 /*buffer*/, 0 /*mode*/, 0xABCD /*flipArg*/, 0, 0);
     CHECK(gpu::present_front_index() == 1, "flip selected buffer 1 as front");
     CHECK(gpu::present_count() == base_count + 1, "present count incremented");
     size_t got = gpu::present_readback(out.data(), out.size());
@@ -59,14 +62,14 @@ int main() {
     CHECK(out[0] == 0x22 && out[FB_BYTES - 1] == 0x22, "presented frame is buffer 1's pixels");
 
     // Flip buffer 2 -> scanout follows.
-    flip(0x1001, 2, 0, 0, 0, 0);
+    flip(handle, 2, 0, 0, 0, 0);
     CHECK(gpu::present_front_index() == 2, "flip selected buffer 2 as front");
     gpu::present_readback(out.data(), out.size());
     CHECK(out[0] == 0x33, "presented frame now buffer 2's pixels");
 
     // Update buffer 2's contents (as a renderer would) and re-present: readback reflects live memory.
     for (size_t i = 0; i < FB_BYTES; i++) fb2[i] = 0x44;
-    flip(0x1001, 2, 0, 0, 0, 0);
+    flip(handle, 2, 0, 0, 0, 0);
     gpu::present_readback(out.data(), out.size());
     CHECK(out[0] == 0x44 && out[100] == 0x44, "readback reflects updated framebuffer memory");
     gpu::PresentSnapshot raw_snap;
@@ -85,10 +88,10 @@ int main() {
     setba2((uint64_t)(uintptr_t)small_attr, 0x8000000000000000ull,
            0 /*tiling*/, SMALL_W, SMALL_H, 0 /*option*/);
     VOB small_buffers[2] = { {fb4.data(),0,{0,0}}, {fb5.data(),0,{0,0}} };
-    rc = regb2(0x1001, 1 /*set*/, 4 /*start*/, (uint64_t)(uintptr_t)small_buffers, 2,
+    rc = regb2(handle, 1 /*set*/, 4 /*start*/, (uint64_t)(uintptr_t)small_buffers, 2,
                (uint64_t)(uintptr_t)small_attr);
     CHECK(rc == 0, "registered a second 2-buffer 4x2 surface");
-    flip(0x1001, 4, 0, 0, 0, 0);
+    flip(handle, 4, 0, 0, 0, 0);
     std::vector<uint8_t> small_out(SMALL_BYTES, 0xEE);
     got = gpu::present_readback(small_out.data(), small_out.size());
     CHECK(gpu::present_width() == SMALL_W && gpu::present_height() == SMALL_H &&
@@ -97,14 +100,14 @@ int main() {
 
     // Unregister invalidates the front identity under the same registry lock. Reusing the numeric
     // slot receives a new generation and must not present its new backing until another guest flip.
-    CHECK(unreg(0x1001, 1 /*set*/, 0, 0, 0, 0) == 0 &&
+    CHECK(unreg(handle, 1 /*set*/, 0, 0, 0, 0) == 0 &&
           gpu::present_front_index() == -1,
           "unregistering the front set atomically clears the front identity");
     std::vector<uint8_t> fb4_reused(SMALL_BYTES, 0x88), fb5_reused(SMALL_BYTES, 0x99);
     VOB reused_buffers[2] = {
         {fb4_reused.data(),0,{0,0}}, {fb5_reused.data(),0,{0,0}}
     };
-    CHECK(regb2(0x1001, 1 /*same set*/, 4 /*same start*/,
+    CHECK(regb2(handle, 1 /*same set*/, 4 /*same start*/,
                 (uint64_t)(uintptr_t)reused_buffers, 2,
                 (uint64_t)(uintptr_t)small_attr) == 0,
           "re-registered the same slots with new backing");
@@ -114,20 +117,20 @@ int main() {
           gpu::present_readback(small_out.data(), small_out.size()) == 0 &&
           !gpu::present_snapshot(no_flip_snap),
           "re-registering a numeric slot does not present new backing without a flip");
-    flip(0x1001, 4, 0, 0, 0, 0);
+    flip(handle, 4, 0, 0, 0, 0);
     got = gpu::present_readback(small_out.data(), small_out.size());
     CHECK(got == SMALL_BYTES && small_out.front() == 0x88 && small_out.back() == 0x88,
           "a new flip presents the re-registered generation");
 
-    flip(0x1001, 1, 0, 0, 0, 0);
+    flip(handle, 1, 0, 0, 0, 0);
     std::fill(out.begin(), out.end(), 0xEE);
     got = gpu::present_readback(out.data(), out.size());
     CHECK(gpu::present_width() == W && gpu::present_height() == H &&
           got == FB_BYTES && out.front() == 0x22 && out.back() == 0x22,
           "set 0 flip restores its 16x8 buffer with matching geometry");
 
-    // Out-of-range flip index leaves the front buffer unchanged (but still counts as a flip).
-    flip(0x1001, 99, 0, 0, 0, 0);
+    // Out-of-range flip index leaves the front buffer unchanged.
+    flip(handle, 99, 0, 0, 0, 0);
     CHECK(gpu::present_front_index() == 1, "out-of-range flip index does not corrupt the front buffer");
 
     // Receiving side: the renderer hands a finished frame -> present_readback returns THOSE pixels
@@ -164,7 +167,7 @@ int main() {
           *lease.rgba == rendered,
           "rendered-frame lease remains valid after a newer publication");
     // The rendered frame wins over the raw guest buffer even across flips.
-    flip(0x1001, 0, 0, 0, 0, 0);
+    flip(handle, 0, 0, 0, 0, 0);
     gpu::present_readback(out.data(), out.size());
     CHECK(memcmp(out.data(), replacement.data(), FB_BYTES) == 0,
           "latest rendered frame takes precedence over the flipped guest buffer");

@@ -91,23 +91,25 @@ int main() {
 
     // VideoOut flip event accessor (#394 F5): the producer stores the submitted flipArg raw in
     // kevent.data, so GetEventData must preserve all 64 bits rather than decode a packed value.
+    auto vo_open   = Hle::lookup(nid_hash("sceVideoOutOpen"));
     auto addflip   = Hle::lookup(nid_hash("sceVideoOutAddFlipEvent"));
     auto submitflp = Hle::lookup(nid_hash("sceVideoOutSubmitFlip"));
     auto vo_evid   = Hle::lookup("U2JJtSqNKZI");
     auto vo_evdata = Hle::lookup("rWUTcKdkUzQ");
-    CHECK(addflip && submitflp && vo_evid && vo_evdata,
+    CHECK(vo_open && addflip && submitflp && vo_evid && vo_evdata,
           "VideoOut flip event producer and accessors registered");
-    if (addflip && submitflp && vo_evid && vo_evdata) {
+    if (vo_open && addflip && submitflp && vo_evid && vo_evdata) {
+        const uint64_t handle = vo_open(0, 0, 0, 0, 0, 0);
         constexpr uint64_t kFlipArg = 0x8000000000001234ull;
         constexpr uint64_t kFlipUdata = 0xFACEB00Cull;
-        addflip(eq, 0x1001, kFlipUdata, 0, 0, 0);
-        CHECK((uint32_t)submitflp(0x1001, (uint64_t)(int64_t)-2, 0, kFlipArg, 0, 0) ==
+        addflip(eq, handle, kFlipUdata, 0, 0, 0);
+        CHECK((uint32_t)submitflp(handle, (uint64_t)(int64_t)-2, 0, kFlipArg, 0, 0) ==
                   0x8029000au && getcount(eq, 0, 0, 0, 0, 0) == 0,
               "invalid low flip index does not post a VideoOut completion event");
-        CHECK((uint32_t)submitflp(0x1001, 16, 0, kFlipArg, 0, 0) == 0x8029000au &&
+        CHECK((uint32_t)submitflp(handle, 16, 0, kFlipArg, 0, 0) == 0x8029000au &&
                   getcount(eq, 0, 0, 0, 0, 0) == 0,
               "invalid high flip index does not post a VideoOut completion event");
-        submitflp(0x1001, 0, 0, kFlipArg, 0, 0);
+        submitflp(handle, 0, 0, kFlipArg, 0, 0);
         CHECK(getcount(eq, 0, 0, 0, 0, 0) == 1,
               "valid flip posts one VideoOut completion event");
 
