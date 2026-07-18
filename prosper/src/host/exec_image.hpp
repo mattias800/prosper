@@ -30,7 +30,8 @@ void install_trap_handler();
 // A valid Microsoft-x64 call site is 0; -1 means the thunk has not run yet.
 int recovery_thunk_call_rsp_mod16();
 
-// Number of AMD SSE4a instruction sites replaced by the Windows trap-free code cache.
+// Number of valid guest entry points preserved by the Windows SSE4a code cache. Successor-consuming
+// detours contribute both their EXTRQ entry and the relocated successor entry.
 uint64_t sse4a_fastpath_patch_count();
 #endif
 
