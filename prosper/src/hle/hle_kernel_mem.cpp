@@ -537,6 +537,7 @@ HLE(k_avail_flexible) { if (!a0) return 0x80020016ull; *(uint64_t*)(uintptr_t)a0
 
 // sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t align, int memType, off_t* physOut)
 HLE(k_alloc_dmem) {   // (searchStart, searchEnd, len, alignment, memoryType, physAddrOut)
+    if (!a5) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL: required physAddrOut
     uint64_t align = a3 ? a3 : 0x4000;
     uint64_t sz = align_up(a2, align);
     uint64_t off;
@@ -560,6 +561,7 @@ HLE(k_alloc_dmem) {   // (searchStart, searchEnd, len, alignment, memoryType, ph
 // DIFFERENT signature (4 args) from AllocateDirectMemory: physOut is arg3, not arg5. Aliasing them
 // to one handler wrote the result through arg5 (uninitialized garbage, e.g. 0xa) -> crash.
 HLE(k_alloc_main_dmem) {
+    if (!a3) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL: required physAddrOut
     uint64_t align = a1 ? a1 : 0x4000;
     uint64_t sz = align_up(a0, align);
     uint64_t off;
@@ -2050,6 +2052,7 @@ HLE(k_avail_flexible) { if (!a0) return 0x80020016ull; *(uint64_t*)(uintptr_t)a0
 
 // sceKernelAllocateDirectMemory(start, end, len, align, memType, off_t* physOut)
 HLE(k_alloc_dmem) {
+    if (!a5) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL: required physAddrOut
     uint64_t align = a3 ? a3 : 0x4000;
     uint64_t sz = align_up(a2, align);
     uint64_t off;
@@ -2065,6 +2068,7 @@ HLE(k_alloc_dmem) {
 }
 // sceKernelAllocateMainDirectMemory(len, align, memType, off_t* physOut) — physOut at arg3.
 HLE(k_alloc_main_dmem) {
+    if (!a3) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL: required physAddrOut
     uint64_t align = a1 ? a1 : 0x4000;
     uint64_t sz = align_up(a0, align);
     uint64_t off;

@@ -43,11 +43,12 @@ int main() {
     auto reserve = Hle::lookup(nid_hash("sceKernelReserveVirtualRange"));
     auto unmap   = Hle::lookup(nid_hash("sceKernelMunmap"));
     auto alloc   = Hle::lookup(nid_hash("sceKernelAllocateDirectMemory"));
+    auto alloc_main = Hle::lookup(nid_hash("sceKernelAllocateMainDirectMemory"));
     auto map     = Hle::lookup(nid_hash("sceKernelMapDirectMemory"));
     auto protect = Hle::lookup(nid_hash("sceKernelMprotect"));
     auto release = Hle::lookup(nid_hash("sceKernelReleaseDirectMemory"));
     auto query   = Hle::lookup(nid_hash("sceKernelVirtualQuery"));
-    CHECK(reserve && unmap && alloc && map && protect && release && query,
+    CHECK(reserve && unmap && alloc && alloc_main && map && protect && release && query,
           "memory HLE functions registered");
     if (fails) return 1;
 
@@ -67,6 +68,10 @@ int main() {
     // releases and reuses small physical ranges aggressively; independent Windows allocations
     // let its allocator observe different metadata through two aliases and corrupt adjacent VA.
     constexpr uint64_t dlen = 0x10000;
+    CHECK((uint32_t)alloc(0, kEnd, dlen, dlen, 0, 0) == 0x80020016u,
+          "AllocateDirectMemory(null physAddrOut) -> EINVAL");
+    CHECK((uint32_t)alloc_main(dlen, dlen, 0, 0, 0, 0) == 0x80020016u,
+          "AllocateMainDirectMemory(null physAddrOut) -> EINVAL");
     uint64_t phys = 0, va1 = 0, va2 = 0;
     CHECK(alloc(0, kEnd, dlen, dlen, 0, (uint64_t)(uintptr_t)&phys) == 0 && phys == kBase,
           "allocate one 64 KiB direct-memory page");
@@ -210,10 +215,18 @@ int main() {
 
     auto avail   = Hle::lookup(nid_hash("sceKernelAvailableDirectMemorySize"));
     auto alloc   = Hle::lookup(nid_hash("sceKernelAllocateDirectMemory"));
+    auto alloc_main = Hle::lookup(nid_hash("sceKernelAllocateMainDirectMemory"));
     auto map     = Hle::lookup(nid_hash("sceKernelMapDirectMemory"));
     auto release = Hle::lookup(nid_hash("sceKernelReleaseDirectMemory"));
-    CHECK(avail && alloc && map && release, "dmem fns registered");
-    if (!(avail && alloc && map && release)) { printf("== FAIL ==\n"); return 1; }
+    CHECK(avail && alloc && alloc_main && map && release, "dmem fns registered");
+    if (!(avail && alloc && alloc_main && map && release)) { printf("== FAIL ==\n"); return 1; }
+
+    // Both allocation APIs require their physical-address output. Reject before taking from
+    // the pool so an unobservable allocation cannot leak capacity.
+    CHECK((uint32_t)alloc(0, kEnd, 0x4000, 0x4000, 0, 0) == 0x80020016u,
+          "AllocateDirectMemory(null physAddrOut) -> EINVAL");
+    CHECK((uint32_t)alloc_main(0x4000, 0x4000, 0, 0, 0, 0) == 0x80020016u,
+          "AllocateMainDirectMemory(null physAddrOut) -> EINVAL");
 
     // Fresh pool: the largest free block is the whole pool, and BOTH out-params are written.
     uint64_t phys = 0xdead, size = 0xdead;
