@@ -522,6 +522,77 @@ int main() {
           direct_v_uses[0].v4[1] == seed5v[1] && direct_v_uses[0].v4[2] == seed5v[2],
           "direct raw-MUBUF V# preserves base/stride/record dwords");
 
+    // #636: Dead Cells' format-copy compute places its declared source V# at s0 and its otherwise
+    // undeclared destination V# at s4. Resource discovery must follow the two actual MUBUF uses:
+    // the load arrives through DynFetch and the store through a pc-keyed SrtUse. No all-SGPR scan is
+    // needed, and rewriting any destination dword before the store invalidates the seed descriptor.
+    const uint32_t direct_copy[] = {
+        0xE00C2000u, 0x80000100u,   // buffer_load_format_xyzw v[1:4], v0, s[0:3], 0 idxen
+        0xE01C2000u, 0x80010101u,   // buffer_store_format_xyzw v[1:4], v1, s[4:7], 0 idxen
+        0xBF810000u,
+    };
+    const uint32_t direct_copy_seed[8] = {
+        0x00020000u, 0x00040000u, 16u, (2u << 12) | 0xFACu,
+        0x00030000u, 0x00040000u, 16u, (2u << 12) | 0xFACu,
+    };
+    std::vector<SrtUse> direct_copy_uses;
+    const std::vector<DynFetch> direct_copy_fetches = resolve_dynamic_fetch(
+        direct_copy, sizeof(direct_copy) / sizeof(direct_copy[0]),
+        direct_copy_seed, 8, 0, &direct_copy_uses);
+    CHECK(direct_copy_fetches.size() == 1 && direct_copy_fetches[0].fetch_pc == 0 &&
+          direct_copy_fetches[0].srsrc == 0 && direct_copy_fetches[0].desc.base == 0x20000,
+          "#636: direct format-copy source resolves only at its load instruction");
+    CHECK(direct_copy_uses.size() == 1 && direct_copy_uses[0].kind == 1 &&
+          direct_copy_uses[0].key == 0xFFFFFFFFu && direct_copy_uses[0].use_pc == 2 &&
+          direct_copy_uses[0].v4[0] == direct_copy_seed[4],
+          "#636: Dead Cells s4 destination resolves only at its format-store instruction");
+
+    ShaderResourceTable direct_copy_table;
+    if (direct_copy_fetches.size() == 1) {
+        ShaderResource source{};
+        source.cls = ResourceClass::ConstantBuffer;
+        source.format = direct_copy_fetches[0].desc.format;
+        source.num_components = direct_copy_fetches[0].desc.num_components;
+        source.binding = 2;
+        source.gpu_addr = direct_copy_fetches[0].desc.base;
+        source.size = direct_copy_fetches[0].desc.size_bytes;
+        source.stride = direct_copy_fetches[0].desc.stride;
+        source.fetch_pc = direct_copy_fetches[0].fetch_pc;
+        direct_copy_table.resources.push_back(source);
+    }
+    if (direct_copy_uses.size() == 1) {
+        const DecodedBufferDescriptor destination =
+            decode_buffer_descriptor(direct_copy_uses[0].v4.data());
+        ShaderResource dest{};
+        dest.cls = ResourceClass::ConstantBuffer;
+        dest.format = destination.format;
+        dest.num_components = destination.num_components;
+        dest.binding = 3;
+        dest.gpu_addr = destination.base;
+        dest.size = destination.size_bytes;
+        dest.stride = destination.stride;
+        dest.fetch_pc = direct_copy_uses[0].use_pc;
+        direct_copy_table.resources.push_back(dest);
+    }
+    ComputeShaderConfig direct_copy_config;
+    direct_copy_config.user_sgprs.assign(direct_copy_seed, direct_copy_seed + 8);
+    direct_copy_config.local_x = direct_copy_config.local_y = direct_copy_config.local_z = 1;
+    CHECK(!recompile_compute(direct_copy, sizeof(direct_copy) / sizeof(direct_copy[0]),
+                             &direct_copy_table, direct_copy_config).empty(),
+          "#636: instruction-provenance table keeps the Dead Cells format-copy dispatch realizable");
+
+    const uint32_t rewritten_copy_dest[] = {
+        0xBE840380u,                // s_mov_b32 s4, 0 (seed destination is no longer live)
+        0xE01C2000u, 0x80010101u,   // buffer_store_format_xyzw v[1:4], v1, s[4:7], 0 idxen
+        0xBF810000u,
+    };
+    std::vector<SrtUse> rewritten_copy_uses;
+    resolve_dynamic_fetch(rewritten_copy_dest,
+                          sizeof(rewritten_copy_dest) / sizeof(rewritten_copy_dest[0]),
+                          direct_copy_seed, 8, 0, &rewritten_copy_uses);
+    CHECK(rewritten_copy_uses.empty(),
+          "#636: rewritten direct destination cannot resurrect its entry-time V#");
+
     // Astro Bot's compact compute dispatcher s_loads output V#s from a table, then consumes them
     // with buffer_store_dword/dwordx2/dwordx3. Stores need the same descriptor provenance as raw
     // loads or the compute resource front-half never creates their writable storage-buffer binding.

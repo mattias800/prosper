@@ -793,43 +793,10 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
         }
     }
 
-    // Additional directly-placed COMPUTE buffers (#566). Gen5 compute shaders put buffer V#s straight
-    // in the user-SGPR block and reference them by SRSRC, but the shader's resource-usage metadata only
-    // declares the FIRST (direct_resource_offset type 1 -> reg 0, handled above). A format-copy compute
-    // — Dead Cells: `buffer_load_format_xyzw v, vIDX, s[0:3]` then `buffer_store_format_xyzw v, vIDX,
-    // s[4:7]` — therefore had its STORE destination V# (at s4) absent from the table, so the store's
-    // SRSRC resolved to nothing and the whole shader was rejected (`[mubuf-unresolved] srsrc=s4`). Its
-    // dispatch was then dropped, losing the scene-composition pass. Expose every remaining 4-dword-
-    // aligned user-SGPR slot that decodes to a plausible buffer V#, keyed by sgpr_base, so the recompiler
-    // resolves the SRSRC via by_sgpr_base. The SAME plausibility guard used for the type-1/vertex buffers
-    // rejects leftover non-descriptor SGPRs: a real V# has a mapped base and a sane size, while stale
-    // registers decode as base 0 or the ~0xFFFFFFFF max size. In the exercised Dead Cells frame this
-    // emits ONLY the real copy destinations; every other compute shader's trailing slots are filtered.
-    // An unreferenced extra resource is harmless — the recompiler binds only the SRSRCs it actually uses.
-    // CONFIDENCE: HIGH (live-verified: dispatch 0x401aec800 realizes and the dropped pass returns).
-    if (shdr.type == 0) {
-        for (uint32_t reg = 0; reg + 4 <= num_user_sgprs; reg += 4) {
-            const uint32_t sgpr = user_sgpr_base + reg;
-            bool covered = false;
-            for (const ShaderResource& e : table.resources)
-                if (e.sgpr_base == sgpr) { covered = true; break; }
-            if (covered) continue;
-            DecodedBufferDescriptor d = decode_buffer_descriptor(&user_sgprs[reg]);
-            if (d.base <= 0x10000 || d.size_bytes == 0 || d.size_bytes > 0x10000000u ||
-                d.format == DataFormat::Unknown || !d.num_components) continue;
-            ShaderResource r;
-            r.cls            = ResourceClass::ConstantBuffer;   // storage buffer (readable + writable)
-            r.format         = d.format;
-            r.num_components  = d.num_components;
-            r.binding        = binding++;
-            r.gpu_addr       = d.base;
-            r.size           = d.size_bytes;
-            r.stride         = d.stride;
-            r.sgpr_base      = sgpr;
-            r.srt_offset     = 0xFFFFFFFFu;      // direct (not s_loaded)
-            table.resources.push_back(r);
-        }
-    }
+    // Do not guess additional compute buffers by scanning arbitrary user-SGPR quartets. Scalar
+    // arguments can decode as plausible V#s and would then leak into capture/dependency tooling even
+    // when no instruction consumes them. Undeclared direct compute V#s are recovered at their actual
+    // MUBUF uses by resolve_dynamic_fetch, with exact instruction provenance and reload invalidation.
     return table;
 }
 

@@ -1096,6 +1096,15 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         v = val[(size_t)r];
         return true;
     };
+    auto unchanged_seed_range = [&](int first, int count) {
+        if (!untouched_seed_range(first, count)) return false;
+        for (int r = first; r < first + count; ++r) {
+            uint32_t current = 0;
+            if (!known(r, current) ||
+                current != user_sgprs[r - (int)user_sgpr_base]) return false;
+        }
+        return true;
+    };
     // Resolve an ALU source operand to a concrete value (SGPR / inline int / literal / a vcc Special).
     // vcc_lo/hi (106/107) are written by ALU dsts as SGPR 106/107 but read back as Special operands with
     // the same field value, so map them onto the same val[] keys. Other Specials (EXEC/M0/...) stay unknown.
@@ -1450,7 +1459,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 const bool raw_buffer_use =
                     (in.opcode >= 0x08 && in.opcode <= 0x0F) ||
                     (in.opcode >= 0x1C && in.opcode <= 0x1E);
-                if (srt_uses && (in.opcode <= 3 || raw_buffer_use)) {
+                const bool format_store_use = in.opcode >= 0x04 && in.opcode <= 0x07;
+                if (srt_uses && (in.opcode <= 3 || format_store_use || raw_buffer_use)) {
                     int srsrc = in.src[1].value;
                     if (valid_reg(srsrc) && descr_known.test((size_t)srsrc)) {
                         // Key-less snapshots (an s_buffer_load-fetched V# — a structured-buffer
@@ -1462,20 +1472,26 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             ? descr_key[(size_t)srsrc] : 0xFFFFFFFFu;
                         u.use_pc = in.pc;
                         srt_uses->push_back(u);
-                    } else if (raw_buffer_use && untouched_seed_range(srsrc, 4)) {
-                        // Direct RAW V#: an untyped MUBUF can consume a V# placed in the initial
-                        // user-data SGPRs without any preceding s_load. This is not a vertex-format
-                        // fetch, so the dyn_vb path below never reports it. Preserve the exact V# as
-                        // a pc-keyed buffer view; treating the same eight SGPRs as a plausible T# can
-                        // otherwise make raw MUBUF resolve to a texture (stride 0), dropping idxen.
+                    } else if ((format_store_use || raw_buffer_use) &&
+                               unchanged_seed_range(srsrc, 4)) {
+                        // Direct V#: a raw or format-store MUBUF can consume a V# placed in the
+                        // initial user-data SGPRs without any preceding s_load. Preserve it only for
+                        // the exact consuming instruction and only while all four seed values remain
+                        // current; guessing every descriptor-looking user-data quartet invents
+                        // capture/dependency resources, while accepting a rewritten seed resurrects
+                        // stale provenance.
                         SrtUse u; u.kind = 1; u.key = 0xFFFFFFFFu; u.use_pc = in.pc;
                         for (int k = 0; k < 4; ++k)
                             u.v4[k] = user_sgprs[srsrc - (int)user_sgpr_base + k];
                         DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
+                        const bool format_supported = !format_store_use ||
+                            (d.format != DataFormat::Unknown && d.num_components != 0 &&
+                             !d.forbid_unknown_fallback);
                         if (d.base > 0x10000 && d.size_bytes != 0 &&
-                            d.size_bytes <= 0x10000000u && d.stride != 0) {
+                            d.size_bytes <= 0x10000000u && d.stride != 0 &&
+                            format_supported) {
                             if (trc) fprintf(stderr,
-                                             "[dyntrace] raw MUBUF pc=%u direct V# s%d base=0x%llx "
+                                             "[dyntrace] direct MUBUF pc=%u direct V# s%d base=0x%llx "
                                              "stride=%u size=%u\n",
                                              in.pc, srsrc, (unsigned long long)d.base,
                                              d.stride, d.size_bytes);
@@ -2303,8 +2319,36 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // Texture. Never shadow an existing resource at the same srt_offset (first-match-wins).
         {
             std::vector<SrtUse> srt_uses;
-            resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
-                                  sgprs, kUserSgprs, /*user_sgpr_base*/0, &srt_uses);
+            const std::vector<DynFetch> direct_fetches = resolve_dynamic_fetch(
+                (const uint32_t*)(uintptr_t)code_addr, shader_dwords,
+                sgprs, kUserSgprs, /*user_sgpr_base*/0, &srt_uses);
+            // Format-load V#s use resolve_dynamic_fetch's exact fetch-pc result. This covers direct
+            // compute sources that metadata omits without reviving the old all-SGPR scan.
+            for (const auto& fetch : direct_fetches) {
+                const DecodedBufferDescriptor& d = fetch.desc;
+                if (d.base <= 0x10000 || d.size_bytes == 0 ||
+                    d.size_bytes > 0x10000000u || d.format == DataFormat::Unknown ||
+                    !d.num_components || d.forbid_unknown_fallback) continue;
+                bool mapped = false;
+                for (auto& r0 : table->resources) {
+                    if (r0.cls != ResourceClass::ConstantBuffer ||
+                        r0.gpu_addr != d.base || r0.size != d.size_bytes ||
+                        r0.stride != d.stride || r0.format != d.format ||
+                        r0.num_components != d.num_components) continue;
+                    if (r0.fetch_pc == 0xFFFFFFFFu) r0.fetch_pc = fetch.fetch_pc;
+                    if (r0.fetch_pc == fetch.fetch_pc) { mapped = true; break; }
+                }
+                if (mapped) continue;
+                ShaderResource r;
+                r.cls = ResourceClass::ConstantBuffer;
+                r.format = d.format;
+                r.num_components = d.num_components;
+                r.gpu_addr = d.base;
+                r.size = d.size_bytes;
+                r.stride = d.stride;
+                r.fetch_pc = fetch.fetch_pc;
+                table->resources.push_back(r);
+            }
             std::set<uint64_t> srt_seen;
             for (const auto& u : srt_uses) {
                 // Dedupe: keyed cbuf uses per key; texture/storage and key-less uses per consuming pc
