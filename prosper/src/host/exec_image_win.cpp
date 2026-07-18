@@ -258,21 +258,21 @@ namespace {
     // Import-stub machine code. Unlike Linux (where host ABI == guest SysV, so the stub is a bare
     // tail-jump with args intact), Windows handlers are Microsoft x64, so the stub is a TRAMPOLINE
     // that converts the guest's SysV integer arguments to MS x64 before calling the handler:
-    //   SysV in: rdi rsi rdx rcx r8 r9 [guest rsp+8] [guest rsp+16] [guest rsp+24] (a0..a8)
-    //   MS out:  rcx rdx r8 r9 [rsp+20]...[rsp+40] (+32B shadow, stack args a4..a8)
+    //   SysV in: rdi rsi rdx rcx r8 r9 [guest rsp+8]...[guest rsp+32] (a0..a9)
+    //   MS out:  rcx rdx r8 r9 [rsp+20]...[rsp+48] (+32B shadow, stack args a4..a9)
     // Return value is rax in both ABIs. This handles integer/pointer args (the whole HleFn surface);
     // XMM/float args (e.g. some libc formatters) are NOT converted yet — see docs/PORTING.md.
-    // The 0x48-byte outgoing area is 8 mod 16, so a normally-entered stub (RSP%16==8) has the required
-    // RSP%16==0 at its handler call site. The ABI conformance test verifies args 1-9 and alignment.
+    // The pad + four copied guest stack args + 0x30-byte outgoing area consume 0x58 bytes (8 mod 16),
+    // so a normally-entered stub (RSP%16==8) has RSP%16==0 at its handler call site. The ABI
+    // conformance test verifies args 1-10 and alignment.
     size_t emit_sysv_to_ms_prologue(uint8_t* p) {
         static const uint8_t seq[] = {
-            0x48,0x83,0xEC,0x48,              // sub rsp,0x48   (shadow + a4..a8; call rsp%16==0)
-            0x48,0x8B,0x44,0x24,0x50,         // mov rax,[rsp+0x50]   ; guest a6 at original rsp+8
-            0x48,0x89,0x44,0x24,0x30,         // mov [rsp+0x30],rax  ; MS 7th arg = a6
-            0x48,0x8B,0x44,0x24,0x58,         // mov rax,[rsp+0x58]   ; guest a7 at original rsp+16
-            0x48,0x89,0x44,0x24,0x38,         // mov [rsp+0x38],rax  ; MS 8th arg = a7
-            0x48,0x8B,0x44,0x24,0x60,         // mov rax,[rsp+0x60]   ; guest a8 at original rsp+24
-            0x48,0x89,0x44,0x24,0x40,         // mov [rsp+0x40],rax  ; MS 9th arg = a8
+            0x50,                              // push rax             ; alignment pad
+            0xFF,0x74,0x24,0x28,              // push [rsp+0x28]      ; original guest a9
+            0xFF,0x74,0x24,0x28,              // push [rsp+0x28]      ; original guest a8
+            0xFF,0x74,0x24,0x28,              // push [rsp+0x28]      ; original guest a7
+            0xFF,0x74,0x24,0x28,              // push [rsp+0x28]      ; original guest a6
+            0x48,0x83,0xEC,0x30,              // sub rsp,0x30         ; shadow + a4/a5
             0x4C,0x89,0x44,0x24,0x20,         // mov [rsp+0x20],r8    ; MS 5th arg = a4
             0x4C,0x89,0x4C,0x24,0x28,         // mov [rsp+0x28],r9    ; MS 6th arg = a5
             0x49,0x89,0xC9,                   // mov r9,rcx           ; MS 4th = a3  (save before rcx clobbered)
@@ -299,7 +299,7 @@ namespace {
         p[o++] = 0x48; p[o++] = 0xB8; memcpy(p + o, &fn, 8); o += 8;   // movabs rax,fn
         p[o++] = 0xFF; p[o++] = 0xD0;                                  // call rax
         o += emit_hle_return_checkpoint(p + o);
-        p[o++] = 0x48; p[o++] = 0x83; p[o++] = 0xC4; p[o++] = 0x48;    // add rsp,0x48
+        p[o++] = 0x48; p[o++] = 0x83; p[o++] = 0xC4; p[o++] = 0x58;    // discard outgoing args + pad
         p[o++] = 0xC3;                                                 // ret
     }
     void emit_unimpl(uint8_t* p, uint32_t idx, uint64_t fn) {
@@ -1111,9 +1111,9 @@ uint64_t hle_guest_return_address(uint64_t entry_rsp) {
     const uint64_t immediate = *(const uint64_t*)(uintptr_t)entry_rsp;
     const bool from_stub = g_stub_size && immediate >= g_stub_base &&
                            (immediate - g_stub_base) / g_stub_size < g_nstubs;
-    // The SysV-to-MS bridge reserves 0x48 bytes and CALLS the HLE handler. Including that call's
-    // return slot, the original guest return address is 0x50 bytes above the handler-entry RSP.
-    if (from_stub) return *(const uint64_t*)(uintptr_t)(entry_rsp + 0x50);
+    // The SysV-to-MS bridge consumes 0x58 bytes and CALLS the HLE handler. Including that call's
+    // return slot, the original guest return address is 0x60 bytes above the handler-entry RSP.
+    if (from_stub) return *(const uint64_t*)(uintptr_t)(entry_rsp + 0x60);
     return immediate;
 }
 uint64_t invoke_stub(uint64_t idx) {

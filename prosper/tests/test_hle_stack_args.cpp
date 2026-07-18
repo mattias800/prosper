@@ -1,6 +1,6 @@
 // test_hle_stack_args - the generated import stub must preserve the guest's complete fixed-arity
 // SysV call across the host ABI boundary. Windows needs a SysV->Microsoft-x64 conversion; Linux's
-// guest-FS path interposes a call while swapping FS. Both paths must forward stack args 7-9.
+// guest-FS path interposes a call while swapping FS. Both paths must forward stack args 7-10.
 #include "../src/host/exec_image.hpp"
 #include "../src/hle/dispatch.hpp"
 
@@ -14,13 +14,14 @@ using namespace prosper;
 
 namespace {
 
-constexpr uint64_t kArgs[9] = {
+constexpr uint64_t kArgs[10] = {
     0x1111111111111111ull, 0x2222222222222222ull, 0x3333333333333333ull,
     0x4444444444444444ull, 0x5555555555555555ull, 0x6666666666666666ull,
     0x7777777777777777ull, 0x8888888888888888ull, 0x9999999999999999ull,
+    0xaaaaaaaaaaaaaaaaull,
 };
 constexpr uint64_t kReturn = 0xabcddcba01234567ull;
-uint64_t g_seen[9] = {};
+uint64_t g_seen[10] = {};
 extern "C" {
 uint64_t prosper_test_hle_entry_rsp_mod16 = ~uint64_t{0};
 uint64_t prosper_test_hle_entry_rsp = 0;
@@ -28,17 +29,17 @@ uint64_t prosper_test_hle_entry_rsp = 0;
 uint64_t g_immediate_return = 0;
 uint64_t g_guest_return = 0;
 
-extern "C" uint64_t prosper_test_hle9_handler(
+extern "C" uint64_t prosper_test_hle10_handler(
     uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
-    uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8) {
-    const uint64_t args[9] = {a0, a1, a2, a3, a4, a5, a6, a7, a8};
-    for (int i = 0; i < 9; ++i) g_seen[i] = args[i];
+    uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8, uint64_t a9) {
+    const uint64_t args[10] = {a0, a1, a2, a3, a4, a5, a6, a7, a8, a9};
+    for (int i = 0; i < 10; ++i) g_seen[i] = args[i];
     g_immediate_return = *(const uint64_t*)(uintptr_t)prosper_test_hle_entry_rsp;
     g_guest_return = hle_guest_return_address(prosper_test_hle_entry_rsp);
     return kReturn;
 }
 
-extern "C" void prosper_test_hle9_entry();
+extern "C" void prosper_test_hle10_entry();
 
 #define PROSPER_STRINGIFY_INNER(x) #x
 #define PROSPER_STRINGIFY(x) PROSPER_STRINGIFY_INNER(x)
@@ -53,23 +54,23 @@ extern "C" void prosper_test_hle9_entry();
 __asm__(
     ".text\n"
     ".p2align 4\n"
-    ".globl " PROSPER_ASM_SYMBOL(prosper_test_hle9_entry) "\n"
-    PROSPER_ASM_SYMBOL(prosper_test_hle9_entry) ":\n"
+    ".globl " PROSPER_ASM_SYMBOL(prosper_test_hle10_entry) "\n"
+    PROSPER_ASM_SYMBOL(prosper_test_hle10_entry) ":\n"
     "    movq %rsp, " PROSPER_ASM_SYMBOL(prosper_test_hle_entry_rsp) "(%rip)\n"
     "    movq %rsp, %r10\n"
     "    andq $15, %r10\n"
     "    movq %r10, " PROSPER_ASM_SYMBOL(prosper_test_hle_entry_rsp_mod16) "(%rip)\n"
-    "    jmp " PROSPER_ASM_SYMBOL(prosper_test_hle9_handler) "\n"
+    "    jmp " PROSPER_ASM_SYMBOL(prosper_test_hle10_handler) "\n"
 );
 
 #ifdef _WIN32
-using GuestHle9 = uint64_t (__attribute__((sysv_abi)) *)(
+using GuestHle10 = uint64_t (__attribute__((sysv_abi)) *)(
     uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
-    uint64_t, uint64_t, uint64_t, uint64_t);
+    uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 #else
-using GuestHle9 = uint64_t (*)(
+using GuestHle10 = uint64_t (*)(
     uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
-    uint64_t, uint64_t, uint64_t, uint64_t);
+    uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 #endif
 
 int fails = 0;
@@ -96,8 +97,8 @@ int main(int argc, char** argv) {
 #endif
 
     constexpr const char* kNid = "test.hle.stack.args";
-    Hle::register_fn(kNid, reinterpret_cast<HleFn>(&prosper_test_hle9_entry),
-                     "prosper_test_hle9_entry");
+    Hle::register_fn(kNid, reinterpret_cast<HleFn>(&prosper_test_hle10_entry),
+                     "prosper_test_hle10_entry");
     // Keep an unresolved import immediately before the implemented one. The largest Linux guest-FS
     // variant is the unresolved stub; it must fit its fixed 96-byte slot without corrupting its
     // neighbour.
@@ -108,7 +109,8 @@ int main(int argc, char** argv) {
 #if defined(__linux__)
     if (guest_fs) {
         const auto* second = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(stub_addr(1)));
-        CHECK(second[0] == 0xF3, "unresolved guest-FS stub stayed within its 96-byte slot");
+        CHECK(second[0] == 0x49 && second[1] == 0xBA,
+              "unresolved guest-FS stub stayed within its 96-byte slot");
     }
 #endif
     if (fails) {
@@ -119,9 +121,9 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     _putenv_s("PROSPER_UNIMPL_STACK", "1");
 #endif
-    auto unresolved = reinterpret_cast<GuestHle9>(static_cast<uintptr_t>(stub_addr(0)));
+    auto unresolved = reinterpret_cast<GuestHle10>(static_cast<uintptr_t>(stub_addr(0)));
     CHECK(unresolved(kArgs[0], kArgs[1], kArgs[2], kArgs[3], kArgs[4],
-                     kArgs[5], kArgs[6], kArgs[7], kArgs[8]) == 0,
+                     kArgs[5], kArgs[6], kArgs[7], kArgs[8], kArgs[9]) == 0,
           "unresolved import stub returned the generic result");
     CHECK(call_order().size() == 1 && call_order()[0] == 0,
           "unresolved import stub preserved its dispatch index");
@@ -133,13 +135,13 @@ int main(int argc, char** argv) {
     if (guest_fs) guest_fs_active = guest_tls_activate_thread() != 0;
 #endif
 
-    auto call = reinterpret_cast<GuestHle9>(static_cast<uintptr_t>(stub_addr(1)));
+    auto call = reinterpret_cast<GuestHle10>(static_cast<uintptr_t>(stub_addr(1)));
     const uint64_t callsite_begin = (uint64_t)(uintptr_t)&&before_hle_call;
     const uint64_t callsite_end = (uint64_t)(uintptr_t)&&after_hle_call;
 before_hle_call:
     asm volatile("" ::: "memory");
     const uint64_t result = call(kArgs[0], kArgs[1], kArgs[2], kArgs[3], kArgs[4],
-                                 kArgs[5], kArgs[6], kArgs[7], kArgs[8]);
+                                 kArgs[5], kArgs[6], kArgs[7], kArgs[8], kArgs[9]);
     asm volatile("" ::: "memory");
 after_hle_call:
 
@@ -171,7 +173,7 @@ after_hle_call:
     const uint64_t callsite_hi = callsite_begin < callsite_end ? callsite_end : callsite_begin;
     CHECK(g_guest_return >= callsite_lo && g_guest_return <= callsite_hi,
           "recovered HLE caller points to the real import callsite, not the generated stub");
-    for (int i = 0; i < 9; ++i) {
+    for (int i = 0; i < 10; ++i) {
         char what[96];
         std::snprintf(what, sizeof what, "argument %d preserved (0x%016llx)", i + 1,
                       static_cast<unsigned long long>(kArgs[i]));
