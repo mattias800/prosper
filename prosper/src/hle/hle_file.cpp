@@ -701,6 +701,10 @@ static uint64_t open_sce_error(int error) {
     else if (error == EROFS) guest_error = 30;
     else if (error == EMLINK) guest_error = 31;
     else if (error == EPIPE) guest_error = 32;
+    else if (error == EAGAIN) guest_error = 35;
+#ifdef EWOULDBLOCK
+    else if (error == EWOULDBLOCK) guest_error = 35;
+#endif
 #ifdef ELOOP
     else if (error == ELOOP) guest_error = 62;
 #endif

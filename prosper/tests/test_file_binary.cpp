@@ -275,6 +275,25 @@ int main() {
     CHECK((uint32_t)kernel_existing == 0x80020011u,
           "sceKernelOpen translates an exclusive-create collision to EEXIST");
 
+#ifndef _WIN32
+    // Linux ELOOP is 40, while FreeBSD/Orbis ELOOP is 62. A real symlink cycle guards
+    // against accidentally embedding the host errno in a kernel result.
+    const char* loop_a = "prosper-test-open-loop-a.tmp";
+    const char* loop_b = "prosper-test-open-loop-b.tmp";
+    std::error_code symlink_error;
+    std::filesystem::remove(loop_a, symlink_error);
+    std::filesystem::remove(loop_b, symlink_error);
+    std::filesystem::create_symlink(loop_b, loop_a, symlink_error);
+    if (!symlink_error) std::filesystem::create_symlink(loop_a, loop_b, symlink_error);
+    uint64_t kernel_loop = !symlink_error && open_fn
+        ? open_fn((uint64_t)(uintptr_t)loop_a, 0, 0, 0, 0, 0)
+        : 0;
+    CHECK(!symlink_error && (uint32_t)kernel_loop == 0x8002003eu,
+          "sceKernelOpen translates host ELOOP to the divergent Orbis value");
+    std::filesystem::remove(loop_a, symlink_error);
+    std::filesystem::remove(loop_b, symlink_error);
+#endif
+
     int64_t fd = open_fn ? (int64_t)open_fn((uint64_t)(uintptr_t)path, 0, 0, 0, 0, 0) : -1;
     CHECK(fd >= 0, "open fixture through guest fd HLE");
 
