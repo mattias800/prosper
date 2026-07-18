@@ -55,7 +55,8 @@ namespace {
 
 // --- PM4 encoding (Kyty Pm4.h) ---------------------------------------------------------------
 constexpr uint32_t IT_NOP = 0x10, IT_INDEX_TYPE = 0x2A, IT_NUM_INSTANCES = 0x2F,
-                   IT_EVENT_WRITE = 0x46, IT_SET_SH_REG = 0x76;
+                   IT_EVENT_WRITE = 0x46, IT_SET_CONTEXT_REG = 0x69,
+                   IT_SET_SH_REG = 0x76, IT_SET_UCONFIG_REG = 0x79;
 // Custom sub-opcodes carried inside IT_NOP:
 constexpr uint32_t R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET = 0x05, R_WAIT_FLIP_DONE = 0x06,
                    R_PUSH_MARKER = 0x0b, R_POP_MARKER = 0x0c,
@@ -164,11 +165,18 @@ HLE(agc_dcb_wait_safe_for_rendering) {  // (buf, video_out_handle, display_buffe
     cmd[1] = (uint32_t)a1; cmd[2] = (uint32_t)a2; cmd[3] = cmd[4] = cmd[5] = cmd[6] = 0;
     return (uint64_t)(uintptr_t)cmd;
 }
-HLE(agc_dcb_set_sh_register_direct) {  // (buf, ShaderRegister reg)  reg packed in a1: offset|value<<32
-    uint32_t* cmd; if (!begin_packet(a0, 3, IT_SET_SH_REG, 0, &cmd)) return 0;
-    cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
+static uint64_t set_register_direct(uint64_t buf, uint64_t packed_reg, uint32_t opcode) {
+    uint32_t* cmd; if (!begin_packet(buf, 3, opcode, 0, &cmd)) return 0;
+    cmd[1] = (uint32_t)(packed_reg & 0xffffffffu);
+    cmd[2] = (uint32_t)(packed_reg >> 32u);
     return (uint64_t)(uintptr_t)cmd;
 }
+// ShaderRegister is passed by value as {uint32_t offset, uint32_t value}, packed into a1 by the
+// SysV ABI. These are real hardware SET_*_REG packets; keeping the register class in the opcode lets
+// the command processor update the correct persistent register file before the next draw (#395 F5).
+HLE(agc_dcb_set_cx_register_direct) { return set_register_direct(a0, a1, IT_SET_CONTEXT_REG); }
+HLE(agc_dcb_set_sh_register_direct) { return set_register_direct(a0, a1, IT_SET_SH_REG); }
+HLE(agc_dcb_set_uc_register_direct) { return set_register_direct(a0, a1, IT_SET_UCONFIG_REG); }
 static uint64_t set_regs_indirect(uint64_t buf, uint64_t regs, uint64_t num_regs, uint32_t r) {
     uint32_t* cmd; if (!begin_packet(buf, 4, IT_NOP, r, &cmd)) return 0;
     cmd[1] = (uint32_t)num_regs; cmd[2] = (uint32_t)(regs & 0xffffffffu); cmd[3] = (uint32_t)(regs >> 32u);
@@ -1265,7 +1273,7 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
         // Dump each packet's kind + first payload dwords so we can see whether the game embeds a
         // completion-label write (WriteData/ReleaseMem/EventWrite) or a GPU-side wait in the stream.
         std::vector<gpu::Pm4Command> ops; gpu::decode_pm4(p->addr, p->dw_num, ops);
-        static const char* kKindName[] = {"DrawReset","WaitFlipDone","SetShRegDirect","SetRegsIndirect",
+        static const char* kKindName[] = {"DrawReset","WaitFlipDone","SetRegDirect","SetRegsIndirect",
             "SetIndexType","DrawIndex","DrawIndexAuto","EventWrite","AcquireMem","WriteData","WaitRegMem",
             "Flip","ReleaseMem","DispatchDirect","SetIndexBase","SetIndexCount","DrawIndexOffset",
             "Jump","SetPredication","DmaData","Unknown"};
@@ -1445,6 +1453,9 @@ void register_agc_hle() {
     RN("H7uZqCoNuWk", agc_dcb_pop_marker);
     RN("tSBxhAPyytQ", agc_dcb_set_num_instances);
     RN("MWiElSNE8j8", agc_dcb_wait_safe_for_rendering);
+    RN("LHFXRrlTPD8", agc_dcb_set_cx_register_direct);
+    RN("pFLArOT53+w", agc_dcb_set_sh_register_direct);
+    RN("w4-d0n60hdo", agc_dcb_set_uc_register_direct);
     RN("ZvwO9euwYzc", agc_dcb_set_cx_regs_indirect);
     RN("-HOOCn0JY48", agc_dcb_set_sh_regs_indirect);
     RN("hvUfkUIQcOE", agc_dcb_set_uc_regs_indirect);

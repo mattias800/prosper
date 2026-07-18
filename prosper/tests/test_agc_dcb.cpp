@@ -24,7 +24,8 @@ struct Dcb {
 static uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
     return 0xC0000000u | (((len - 2u) & 0x3fffu) << 16u) | ((op & 0xffu) << 8u) | ((r & 0x3fu) << 2u);
 }
-constexpr uint32_t IT_NOP = 0x10, IT_NUM_INSTANCES = 0x2F, IT_SET_SH_REG = 0x76,
+constexpr uint32_t IT_NOP = 0x10, IT_NUM_INSTANCES = 0x2F, IT_SET_CONTEXT_REG = 0x69,
+                   IT_SET_SH_REG = 0x76, IT_SET_UCONFIG_REG = 0x79,
                    R_DRAW_RESET = 0x05, R_PUSH_MARKER = 0x0b, R_POP_MARKER = 0x0c,
                    R_CX_REGS_INDIRECT = 0x12, R_DMA_DATA = 0x19;
 
@@ -39,9 +40,14 @@ int main() {
     auto p_add  = Hle::lookup("d-6uF9sZDIU");   // SetCxRegIndirectPatchAddRegisters
     auto p_addr = Hle::lookup("vcmNN+AAXnY");   // SetCxRegIndirectPatchSetAddress
     auto p_dma_src = Hle::lookup("cdDRpqcFGbU"); // DmaDataPatchSetSrcAddressOrOffsetOrImmediate
-    CHECK(reset && setcx && p_add && p_addr && p_dma_src,
+    auto setcx_direct = Hle::lookup("LHFXRrlTPD8"); // sceAgcDcbSetCxRegisterDirect
+    auto setsh_direct = Hle::lookup("pFLArOT53+w"); // sceAgcDcbSetShRegisterDirect
+    auto setuc_direct = Hle::lookup("w4-d0n60hdo"); // sceAgcDcbSetUcRegisterDirect
+    CHECK(reset && setcx && p_add && p_addr && p_dma_src &&
+          setcx_direct && setsh_direct && setuc_direct,
           "AGC Dcb functions registered (override the glog stubs)");
-    if (!(reset && setcx && p_add && p_addr && p_dma_src)) { printf("== FAIL ==\n"); return 1; }
+    if (!(reset && setcx && p_add && p_addr && p_dma_src &&
+          setcx_direct && setsh_direct && setuc_direct)) { printf("== FAIL ==\n"); return 1; }
 
     uint32_t buffer[256];
     memset(buffer, 0xEE, sizeof buffer);
@@ -72,6 +78,31 @@ int main() {
     CHECK(cmd[1] == 8, "PatchAddRegisters did cmd[1] += 5 (3 -> 8)");
     p_addr(rc, 0xAABBCCDD00112233ull, 0, 0, 0, 0);
     CHECK(cmd[2] == 0x00112233u && cmd[3] == 0xAABBCCDDu, "PatchSetAddress rewrote cmd[2]/cmd[3]");
+
+    // #395 F5: all three single-register direct NIDs append the native packet opcode and preserve
+    // the by-value ShaderRegister's offset/value halves. Previously SH was dead code and Cx/Uc fell
+    // through to unimplemented-success without advancing the DCB at all.
+    uint32_t* direct_before = dcb.cursor_up;
+    auto pack_reg = [](uint32_t offset, uint32_t value) {
+        return (uint64_t)offset | ((uint64_t)value << 32u);
+    };
+    auto* cx_direct = (uint32_t*)(uintptr_t)setcx_direct(D, pack_reg(0x123, 0x11111111), 0, 0, 0, 0);
+    auto* sh_direct = (uint32_t*)(uintptr_t)setsh_direct(D, pack_reg(0x234, 0x22222222), 0, 0, 0, 0);
+    auto* uc_direct = (uint32_t*)(uintptr_t)setuc_direct(D, pack_reg(0x345, 0x33333333), 0, 0, 0, 0);
+    CHECK(cx_direct == direct_before &&
+          cx_direct[0] == PM4(3, IT_SET_CONTEXT_REG, 0) &&
+          cx_direct[1] == 0x123 && cx_direct[2] == 0x11111111,
+          "SetCxRegisterDirect appends one context-register packet");
+    CHECK(sh_direct == direct_before + 3 &&
+          sh_direct[0] == PM4(3, IT_SET_SH_REG, 0) &&
+          sh_direct[1] == 0x234 && sh_direct[2] == 0x22222222,
+          "SetShRegisterDirect appends one shader-register packet");
+    CHECK(uc_direct == direct_before + 6 &&
+          uc_direct[0] == PM4(3, IT_SET_UCONFIG_REG, 0) &&
+          uc_direct[1] == 0x345 && uc_direct[2] == 0x33333333,
+          "SetUcRegisterDirect appends one user-config-register packet");
+    CHECK(dcb.cursor_up == direct_before + 9,
+          "single-register direct writers advance the DCB by all three packets");
 
     // sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate (#189): patch only the source qword of
     // a verified DMA_DATA packet. A wrong packet kind must remain untouched.

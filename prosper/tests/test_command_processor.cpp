@@ -42,8 +42,13 @@ int main() {
     auto setsh = Hle::lookup("-HOOCn0JY48");   // SetShRegistersIndirect
     auto draw  = Hle::lookup("Yw0jKSqop+E");   // DrawIndexAuto
     auto dispatch = Hle::lookup("k3GhuSNmBLU"); // DispatchDirect
-    CHECK(reset && idx && setcx && setsh && draw && dispatch, "AGC Dcb builders registered");
-    if (!(reset && idx && setcx && setsh && draw && dispatch)) { printf("== FAIL ==\n"); return 1; }
+    auto setcx_direct = Hle::lookup("LHFXRrlTPD8"); // SetCxRegisterDirect (#395 F5)
+    auto setsh_direct = Hle::lookup("pFLArOT53+w"); // SetShRegisterDirect (#395 F5)
+    auto setuc_direct = Hle::lookup("w4-d0n60hdo"); // SetUcRegisterDirect (#395 F5)
+    CHECK(reset && idx && setcx && setsh && draw && dispatch &&
+          setcx_direct && setsh_direct && setuc_direct, "AGC Dcb builders registered");
+    if (!(reset && idx && setcx && setsh && draw && dispatch &&
+          setcx_direct && setsh_direct && setuc_direct)) { printf("== FAIL ==\n"); return 1; }
 
     uint32_t buffer[256];
     memset(buffer, 0, sizeof buffer);
@@ -60,6 +65,12 @@ int main() {
     idx(D, 2, 0, 0, 0, 0);
     setcx(D, (uint64_t)(uintptr_t)cx_regs, 3, 0, 0, 0);
     setsh(D, (uint64_t)(uintptr_t)sh_regs, 2, 0, 0, 0);
+    auto pack_reg = [](uint32_t offset, uint32_t value) {
+        return (uint64_t)offset | ((uint64_t)value << 32u);
+    };
+    setcx_direct(D, pack_reg(0xA318u, 0xCCCCCCCCu), 0, 0, 0, 0);
+    setsh_direct(D, pack_reg(0x2C0Du, 0xDDDDDDDDu), 0, 0, 0, 0);
+    setuc_direct(D, pack_reg(0x0123u, 0xEEEEEEEEu), 0, 0, 0, 0);
     draw(D, 0x0300, 0, 0, 0, 0);
     draw(D, 0x0006, 0, 0, 0, 0);
 
@@ -69,15 +80,18 @@ int main() {
 
     // Cx register file: the three offsets set to their values.
     CHECK(st.cx.size() == 3, "cx file has 3 registers");
-    CHECK(st.cx.count(0xA318u) && st.cx[0xA318u] == 0x11111111u, "cx[0xA318] = 0x11111111");
+    CHECK(st.cx.count(0xA318u) && st.cx[0xA318u] == 0xCCCCCCCCu,
+          "direct Cx write overrides cx[0xA318]");
     CHECK(st.cx.count(0x00C0u) && st.cx[0x00C0u] == 0x22222222u, "cx[0x00C0] = 0x22222222");
     CHECK(st.cx.count(0x02DEu) && st.cx[0x02DEu] == 0x33333333u, "cx[0x02DE] = 0x33333333");
 
     // Sh register file: two registers; must NOT leak into cx/uc.
     CHECK(st.sh.size() == 2, "sh file has 2 registers");
     CHECK(st.sh.count(0x2C0Cu) && st.sh[0x2C0Cu] == 0xAAAAAAAAu, "sh[0x2C0C] = 0xAAAAAAAA");
-    CHECK(st.sh.count(0x2C0Du) && st.sh[0x2C0Du] == 0xBBBBBBBBu, "sh[0x2C0D] = 0xBBBBBBBB");
-    CHECK(st.uc.empty(), "uc file untouched");
+    CHECK(st.sh.count(0x2C0Du) && st.sh[0x2C0Du] == 0xDDDDDDDDu,
+          "direct Sh write overrides sh[0x2C0D]");
+    CHECK(st.uc.size() == 1 && st.uc.count(0x0123u) && st.uc[0x0123u] == 0xEEEEEEEEu,
+          "direct Uc write reaches only the user-config register file");
 
     CHECK(st.index_type == 2, "index_type = 2 (from SetIndexSize)");
 

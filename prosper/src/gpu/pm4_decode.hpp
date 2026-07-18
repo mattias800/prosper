@@ -17,7 +17,8 @@ namespace prosper::gpu {
 
 // IT_* opcodes and the R_* sub-opcodes carried inside IT_NOP (mirror hle_agc.cpp).
 enum : uint32_t {
-    IT_NOP = 0x10, IT_INDEX_TYPE = 0x2A, IT_EVENT_WRITE = 0x46, IT_SET_SH_REG = 0x76,
+    IT_NOP = 0x10, IT_INDEX_TYPE = 0x2A, IT_EVENT_WRITE = 0x46,
+    IT_SET_CONTEXT_REG = 0x69, IT_SET_SH_REG = 0x76, IT_SET_UCONFIG_REG = 0x79,
 };
 enum : uint32_t {
     R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET = 0x05, R_WAIT_FLIP_DONE = 0x06,
@@ -47,7 +48,7 @@ enum class RegClass { Cx, Sh, Uc };
 // the header), so unknown packets are still walkable and inspectable.
 struct Pm4Command {
     enum class Kind {
-        DrawReset, WaitFlipDone, PushMarker, PopMarker, SetShRegDirect, SetRegsIndirect, SetIndexType,
+        DrawReset, WaitFlipDone, PushMarker, PopMarker, SetRegDirect, SetRegsIndirect, SetIndexType,
         DrawIndex, DrawIndexAuto, EventWrite, AcquireMem, WriteData, WaitRegMem, Flip, ReleaseMem,
         DispatchDirect, SetIndexBase, SetIndexCount, DrawIndexOffset, Jump, SetPredication,
         DmaData, Unknown,
@@ -63,7 +64,7 @@ struct Pm4Command {
     const char* marker_label = nullptr;
 
     // Decoded operands (only the ones relevant to `kind` are meaningful):
-    RegClass reg_class = RegClass::Cx;   // SetRegsIndirect
+    RegClass reg_class = RegClass::Cx;   // SetRegDirect / SetRegsIndirect
     uint32_t num_regs = 0;               // SetRegsIndirect
     uint64_t regs_vaddr = 0;             // SetRegsIndirect: guest addr of the register array
     uint32_t index_count = 0;            // DrawIndexAuto / DrawIndex
@@ -98,9 +99,9 @@ struct Pm4Command {
     uint32_t index_offset = 0;           // DrawIndexOffset: first index (start location)
     uint32_t event_type = 0;             // EventWrite
     uint64_t event_addr = 0;             // EventWrite: destination address (0 = address-less sync event) (#132)
-    uint32_t sh_reg_offset = 0, sh_reg_value = 0;  // SetShRegDirect (sh_reg_value = first value)
-    uint32_t sh_reg_count = 0;                 // SetShRegDirect: # of consecutive registers this packet sets
-    const uint32_t* sh_reg_data = nullptr;     // SetShRegDirect: -> the value dwords (count of them) in-packet
+    uint32_t reg_offset = 0, reg_value = 0;  // SetRegDirect (reg_value = first value)
+    uint32_t reg_count = 0;                  // SetRegDirect: # of consecutive registers this packet sets
+    const uint32_t* reg_data = nullptr;      // SetRegDirect: -> the value dwords (count of them) in-packet
 
     // ReleaseMem (EOP fence) — laid out by hle_agc.cpp agc_cb_release_mem, whose args are now pinned to the
     // AGC ABI sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, cache_policy, address, data_sel, data, …)
