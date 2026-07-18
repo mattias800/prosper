@@ -56,16 +56,16 @@ the `NUM_THREAD_FULL` field [15:0]** — `src/gpu/gpu_executor.cpp:2184`.
 
 ### Refuted (documented, not changed)
 
-**`VGT_INDEX_TYPE` consumer treats any nonzero index type as 32-bit** — `command_processor.cpp:1499`,
-`uint32_t elem = index_type ? 4u : 2u`. The reviewer correctly noted that per the reference
-(`VGT_INDEX_TYPE_MODE`: 16-bit=0, 32-bit=1, 8-bit=2) an 8-bit index type would resolve to 4 bytes
-instead of 1, and the low `INDEX_TYPE` bits [1:0] are not masked off the swap-mode bits [3:2].
-**Refuted as unreachable:** prosper's `index_type` comes from its own `IT_INDEX_TYPE` payload, which
-the exercised titles set only to 16-bit (0) or 32-bit (1); no 8-bit index buffer or swap-mode bit is
-produced on any reached path, so no wrong render result occurs. Recorded here so a future title using
-8-bit indices re-examines this line (a defensive `elem = (index_type & 3) == 1 ? 4 : (index_type & 3) == 2 ? 1 : 2`
-would harden it, but is deliberately not applied absent an exercising case, per the audit's
-cleanly-unreachable exclusion rule).
+**Index-size consumer treats any nonzero index type as 32-bit** — `command_processor.cpp:1499`,
+`uint32_t elem = index_type ? 4u : 2u`. In hardware terms an 8-bit index (`VGT_INDEX_TYPE_MODE`:
+16-bit=0, 32-bit=1, 8-bit=2) would resolve to 4 bytes instead of 1. **Refuted as unreachable BY
+CONSTRUCTION:** `index_type` here is NOT a decoded `VGT_INDEX_TYPE` hardware register field — it is
+`c.index_size = pl[0]` of the AGC `IT_INDEX_TYPE` packet, i.e. the argument to `sceAgc*SetIndexSize`
+(the Gnm/AGC `IndexSize` enum), which exposes only 16-bit (0) and 32-bit (1). There is no 8-bit
+`IndexSize` in the AGC path at all, so no reached — indeed no *representable* — value hits the wrong
+branch. The `elem = index_type ? 4u : 2u` form is therefore correct for every value the AGC API can
+produce; a defensive remap would be dead code. (Recorded so that if prosper ever decodes the raw
+hardware `VGT_INDEX_TYPE` register directly, this branch is revisited.)
 
 ## Per-group coverage (all verified clean)
 
