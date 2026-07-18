@@ -97,6 +97,24 @@ int main() {
         CHECK(set(0,0,0,0,0,0) == 0x809F0000ull, "Set(NULL) -> PARAMETER error (no wild deref)");
     }
 
+    // The original scalar-argument API uses slot 0 and must share the same backing behavior as *2.
+    HleFn setup_v1 = Hle::lookup("v7AAAMo0Lz4"), set_v1 = Hle::lookup("h3YURzXGSVQ"),
+          get_v1 = Hle::lookup("7Bt5pBC-Aco");
+    CHECK(setup_v1 && set_v1 && get_v1, "SaveData memory v1 functions registered");
+    if (setup_v1 && set_v1 && get_v1) {
+        constexpr uint64_t user = 0x392;
+        CHECK(setup_v1(user, 64, 0, 0, 0, 0) == 0, "SetupSaveDataMemory(v1) -> OK");
+        uint8_t src[8] = {0x39, 0x20, 0x17, 0x07, 0x18, 0x01, 0x08, 0x00};
+        CHECK(set_v1(user, (uint64_t)(uintptr_t)src, sizeof src, 11, 0, 0) == 0,
+              "SetSaveDataMemory(v1) -> OK");
+        uint8_t dst[8]{};
+        CHECK(get_v1(user, (uint64_t)(uintptr_t)dst, sizeof dst, 11, 0, 0) == 0,
+              "GetSaveDataMemory(v1) -> OK");
+        CHECK(memcmp(src, dst, sizeof src) == 0, "v1 Set -> Get round-trips bytes through slot 0");
+        CHECK(get_v1(user + 1, (uint64_t)(uintptr_t)dst, sizeof dst, 0, 0, 0) == 0x809F0012ull,
+              "v1 Get before Setup -> MEMORY_NOT_READY");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
