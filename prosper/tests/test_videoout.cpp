@@ -22,6 +22,9 @@ static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
+using Hle7Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t,
+                            uint64_t, uint64_t, uint64_t);
+
 int main() {
     printf("== test_videoout ==\n");
     register_builtin_hle();
@@ -30,15 +33,16 @@ int main() {
     auto vbl    = Hle::lookup(nid_hash("sceVideoOutGetVblankStatus"));
     auto cap    = Hle::lookup(nid_hash("sceVideoOutGetDeviceCapabilityInfo"));
     auto issup  = Hle::lookup("Nv8c-Kb+DUM");   // IsOutputSupported
+    auto setba  = Hle::lookup(nid_hash("sceVideoOutSetBufferAttribute"));
     auto setba2 = Hle::lookup("PjS5uASwcV8");   // SetBufferAttribute2
     auto regb2  = Hle::lookup("rKBUtgRrtbk");   // RegisterBuffers2
     auto unreg  = Hle::lookup("N5KDtkIjjJ4");   // UnregisterBuffers
     auto cfg    = Hle::lookup("w0hLuNarQxY");   // ConfigureOutput
     auto flip   = Hle::lookup(nid_hash("sceVideoOutSubmitFlip"));
     auto fstat  = Hle::lookup(nid_hash("sceVideoOutGetFlipStatus"));
-    CHECK(res && vbl && cap && issup && setba2 && regb2 && unreg && cfg && flip && fstat,
+    CHECK(res && vbl && cap && issup && setba && setba2 && regb2 && unreg && cfg && flip && fstat,
           "VideoOut functions registered");
-    if (!(res && vbl && cap && issup && setba2 && regb2 && unreg && cfg && flip && fstat)) {
+    if (!(res && vbl && cap && issup && setba && setba2 && regb2 && unreg && cfg && flip && fstat)) {
         printf("== FAIL ==\n"); return 1;
     }
 
@@ -91,6 +95,28 @@ int main() {
 
     // IsOutputSupported → supported.
     CHECK(issup(0x1001, 0xd000000a, 0, 0, 0, 0) == 1, "IsOutputSupported returns 1");
+
+    // #394 F2: the legacy setter is an output function, not a success-returning no-op. It fills
+    // the seven public fields, zeros option/reserved storage, and writes exactly 0x28 bytes.
+    uint8_t legacy_attr[0x30]; memset(legacy_attr, 0xEE, sizeof legacy_attr);
+    auto setba7 = reinterpret_cast<Hle7Fn>(setba);
+    setba7((uint64_t)(uintptr_t)legacy_attr, 0x80002200u, 1, 2, 1280, 720, 1344);
+    CHECK(*(uint32_t*)(legacy_attr + 0x00) == 0x80002200u &&
+          *(uint32_t*)(legacy_attr + 0x04) == 1 &&
+          *(uint32_t*)(legacy_attr + 0x08) == 2,
+          "legacy attribute format, tiling, and aspect set");
+    CHECK(*(uint32_t*)(legacy_attr + 0x0c) == 1280 &&
+          *(uint32_t*)(legacy_attr + 0x10) == 720 &&
+          *(uint32_t*)(legacy_attr + 0x14) == 1344,
+          "legacy attribute dimensions and pitch set");
+    bool legacy_reserved_zero = true;
+    for (size_t i = 0x18; i < 0x28; ++i) legacy_reserved_zero &= legacy_attr[i] == 0;
+    CHECK(legacy_reserved_zero, "legacy attribute option and reserved fields initialized");
+    bool legacy_canary_untouched = true;
+    for (size_t i = 0x28; i < sizeof legacy_attr; ++i)
+        legacy_canary_untouched &= legacy_attr[i] == 0xEE;
+    CHECK(legacy_canary_untouched,
+          "SetBufferAttribute writes exactly its 0x28-byte ABI struct");
 
     // SetBufferAttribute2 fills the 0x50 attribute struct from (fmt, tiling, w, h, option).
     uint8_t attr[0x50]; memset(attr, 0xEE, sizeof attr);
