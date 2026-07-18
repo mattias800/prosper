@@ -498,8 +498,25 @@ HLE(f_close) { if (a0 < 3) { preadlog("close-lo-ignored", a0, 0, 0); return 0; }
 HLE(f_dup)  { int fd = ::dup((int)a0); while (fd >= 0 && fd < 3) { int n = fcntl(fd, F_DUPFD, 3); ::close(fd); fd = n; } return (uint64_t)(int64_t)fd; }
 HLE(f_dup2) { return (uint64_t)(int64_t)::dup2((int)a0, (int)a1); }
 #else
-HLE(f_dup)  { return (uint64_t)-1; }
-HLE(f_dup2) { return (uint64_t)-1; }
+HLE(f_dup)  {
+    int fd = ::_dup((int)a0);
+    int low_fds[3]{};
+    size_t low_count = 0;
+    // Windows has no F_DUPFD. Keep recycled stdio slots occupied until _dup reaches the
+    // guest-visible range, then release the temporary descriptors.
+    while (fd >= 0 && fd < 3) {
+        low_fds[low_count++] = fd;
+        fd = ::_dup((int)a0);
+    }
+    for (size_t i = 0; i < low_count; ++i) ::_close(low_fds[i]);
+    return (uint64_t)(int64_t)fd;
+}
+HLE(f_dup2) {
+    int r = ::_dup2((int)a0, (int)a1);
+    // The Windows CRT reports success as zero; the guest/POSIX contract returns the
+    // destination descriptor.
+    return (uint64_t)(int64_t)(r < 0 ? -1 : (int)a1);
+}
 #endif
 #ifndef _WIN32
 // FULL read: loop until `count` bytes are read (or EOF/error). POSIX read()/pread() may return FEWER
