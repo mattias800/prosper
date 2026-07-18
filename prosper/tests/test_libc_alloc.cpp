@@ -6,8 +6,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
 
 using namespace prosper;
 
@@ -17,9 +19,34 @@ static int fails = 0;
 
 static uint64_t U(const void* p) { return (uint64_t)(uintptr_t)p; }
 
-int main() {
+static int run_self(const char* executable, const char* mode) {
+    std::string command = "\"";
+    command += executable;
+    command += "\" ";
+    command += mode;
+    return std::system(command.c_str());
+}
+
+int main(int argc, char** argv) {
     printf("== test_libc_alloc ==\n");
     register_builtin_hle();
+
+    // Child modes return normally only if a throwing allocation handler violates its contract.
+    // The parent first proves that the quoted self-launch works, then requires these modes to
+    // terminate before returning from the HLE call.
+    if (argc == 2) {
+        if (!strcmp(argv[1], "probe")) return 0;
+        if (!strcmp(argv[1], "throwing-new")) {
+            Hle::lookup(nid_hash("_Znwm"))(std::numeric_limits<uint64_t>::max(), 0, 0, 0, 0, 0);
+            return 0;
+        }
+        if (!strcmp(argv[1], "throwing-aligned-new")) {
+            Hle::lookup(nid_hash("_ZnwmSt11align_val_t"))(
+                std::numeric_limits<uint64_t>::max(), 64, 0, 0, 0, 0);
+            return 0;
+        }
+        return 2;
+    }
 
     auto malloc_fn = Hle::lookup(nid_hash("malloc"));
     auto calloc_fn = Hle::lookup(nid_hash("calloc"));
@@ -27,10 +54,14 @@ int main() {
     auto free_fn = Hle::lookup(nid_hash("free"));
     auto memalign_fn = Hle::lookup(nid_hash("memalign"));
     auto posix_memalign_fn = Hle::lookup(nid_hash("posix_memalign"));
+    auto new_fn = Hle::lookup(nid_hash("_Znwm"));
+    auto new_nothrow_fn = Hle::lookup(nid_hash("_ZnwmRKSt9nothrow_t"));
     auto aligned_new_fn = Hle::lookup(nid_hash("_ZnwmSt11align_val_t"));
+    auto aligned_new_nothrow_fn = Hle::lookup(nid_hash("_ZnwmSt11align_val_tRKSt9nothrow_t"));
     auto aligned_delete_fn = Hle::lookup(nid_hash("_ZdlPvSt11align_val_t"));
     CHECK(malloc_fn && calloc_fn && realloc_fn && free_fn && memalign_fn &&
-              posix_memalign_fn && aligned_new_fn && aligned_delete_fn,
+              posix_memalign_fn && new_fn && new_nothrow_fn && aligned_new_fn &&
+              aligned_new_nothrow_fn && aligned_delete_fn,
           "allocation HLE functions registered");
     if (fails) return 1;
 
@@ -54,6 +85,20 @@ int main() {
           "calloc rejects multiplication overflow");
     CHECK(memalign_fn(std::numeric_limits<uint64_t>::max(), 1, 0, 0, 0, 0) == 0,
           "memalign rejects an alignment that cannot be rounded to a power of two");
+
+    CHECK(new_nothrow_fn(std::numeric_limits<uint64_t>::max(), 0, 0, 0, 0, 0) == 0,
+          "nothrow operator new returns null on allocation failure");
+    CHECK(aligned_new_nothrow_fn(std::numeric_limits<uint64_t>::max(), 64, 0, 0, 0, 0) == 0,
+          "aligned nothrow operator new returns null on allocation failure");
+    CHECK(run_self(argv[0], "probe") == 0, "allocation death-test child launches successfully");
+    CHECK(run_self(argv[0], "throwing-new") != 0,
+          "throwing operator new never returns null on allocation failure");
+    CHECK(run_self(argv[0], "throwing-aligned-new") != 0,
+          "throwing aligned operator new never returns null on allocation failure");
+
+    void* cpp_plain = (void*)(uintptr_t)new_fn(333, 0, 0, 0, 0, 0);
+    CHECK(cpp_plain != nullptr, "throwing operator new still returns storage on success");
+    free_fn(U(cpp_plain), 0, 0, 0, 0, 0);
 
     auto* aligned = (uint8_t*)(uintptr_t)memalign_fn(256, 513, 0, 0, 0, 0);
     CHECK(aligned != nullptr && ((uintptr_t)aligned & 255) == 0,
