@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdint>
+#include <iterator>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -57,6 +58,53 @@ int main() {
     printf("  red range [%u..%u]  max(green,blue)=%u\n", rmin, rmax, max_gb);
     CHECK(rmax - rmin > 40, "the interpolated attribute forms a red GRADIENT across the viewport");
     CHECK(max_gb < 0x20, "green/blue stay ~0 (output is the interpolated attribute, not garbage)");
+
+    // AMD's explicit-parameter form reconstructs that same smooth value from
+    //   Final = P0 + P10*I + P20*J
+    // (official GFX10/RDNA2 ISA). Linux llvmpipe exposes no fragment-barycentric extension, so the
+    // generated geometry stage publishes P0/P10/P20 plus perspective-center I/J. This is the exact
+    // mechanism Astro Bot's title composite needs; verify it with a real Vulkan pipeline and pixels.
+    const uint32_t explicit_ps[] = {
+        0xc80e0000u, 0xc8120001u, 0xc8160002u,       // v3=P10, v4=P20, v5=P0, attr0.x
+        0xd54b0003u, 0x04160103u,                    // v3 = P10*I + P0
+        0xd54b0003u, 0x040e0304u,                    // v3 = P20*J + v3
+        0x7e080280u, 0x7e0a0280u, 0x7e0c02f2u,       // G=B=0, A=1
+        0xf800000fu, 0x06050403u, 0xbf810000u,
+    };
+    PixelSystemInputMapping perspective_center{1u << 1, 1u << 1};
+    FragmentInterpolationLayout explicit_layout = fragment_interpolation_layout(
+        explicit_ps, std::size(explicit_ps), &perspective_center);
+    std::vector<uint32_t> explicit_frag = recompile_fragment(
+        explicit_ps, std::size(explicit_ps), nullptr, &perspective_center,
+        UINT32_MAX, &explicit_layout);
+    std::vector<uint32_t> explicit_geom = recompile_interpolation_geometry(explicit_layout);
+    CHECK(explicit_layout.valid && explicit_layout.requires_geometry &&
+          !explicit_frag.empty() && !explicit_geom.empty(),
+          "P0/P10/P20 + perspective-center barycentrics generate portable SPIR-V stages");
+    ResolvedPipelineState explicit_state;
+    explicit_state.topology = 3; // VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+    prosper::test::BackendDraw explicit_draw;
+    explicit_draw.vs = vert; explicit_draw.gs = explicit_geom; explicit_draw.fs = explicit_frag;
+    explicit_draw.ps = &explicit_state;
+    std::vector<prosper::test::BackendDraw> explicit_draws;
+    explicit_draws.push_back(std::move(explicit_draw));
+    std::vector<uint8_t> explicit_px = prosper::test::render_draws_rgba(explicit_draws, W, H);
+    CHECK(explicit_px.size() == (size_t)W * H * 4,
+          "Vulkan links and renders the generated interpolation geometry stage");
+    if (explicit_px.size() == (size_t)W * H * 4) {
+        uint8_t explicit_min = 255, explicit_max = 0;
+        uint32_t explicit_max_gb = 0;
+        for (uint32_t y = 2; y < H - 2; y += 4) for (uint32_t x = 2; x < W - 2; x += 4) {
+            const uint8_t* p = &explicit_px[((size_t)y * W + x) * 4];
+            explicit_min = std::min(explicit_min, p[0]);
+            explicit_max = std::max(explicit_max, p[0]);
+            explicit_max_gb = std::max<uint32_t>(explicit_max_gb, std::max(p[1], p[2]));
+        }
+        printf("  explicit-parameter red range [%u..%u] max(green,blue)=%u\n",
+               explicit_min, explicit_max, explicit_max_gb);
+        CHECK(explicit_max - explicit_min > 40 && explicit_max_gb < 0x20,
+              "P0 + P10*I + P20*J reconstructs the original smooth red gradient");
+    }
 
     // DOLL's live linkage shape is non-identity: PS input 1 consumes producer PARAM3. Exercise the
     // generic form here by moving this fixture's export from PARAM0 to PARAM3, then remapping logical

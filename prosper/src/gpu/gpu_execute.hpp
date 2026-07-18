@@ -39,7 +39,7 @@ struct ShaderResourceTable;   // fwd (shader_resources.hpp); passed to the backe
 // — e.g. Unity's background + composite, whose per-draw masks/blends/shaders differ — composites
 // correctly instead of collapsing onto a single draw. The tables may be null (color-only shaders).
 struct DrawItem {
-    std::vector<uint32_t> vs, fs;                     // recompiled SPIR-V
+    std::vector<uint32_t> vs, gs, fs;                 // recompiled/generated SPIR-V
     uint64_t vs_guest_addr = 0, fs_guest_addr = 0;    // diagnostic/source identity in guest VA space
     // Process-unique identities supplied by the exact shader-recompile cache. Zero means the
     // shader came from an external/replay path, so persistent backend caches must compare words.
@@ -545,6 +545,10 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     PixelSystemInputMapping system_inputs{rs.ps_input_ena, rs.ps_input_addr};
     const PixelSystemInputMapping* system_input_ptr =
         (system_inputs.ena || system_inputs.addr) ? &system_inputs : nullptr;
+    const ResolvedPipelineState resolved_pipeline = resolve_pipeline_state(rs);
+    const FragmentInterpolationLayout interpolation = fragment_interpolation_layout(
+        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.ps_addr)),
+        max_shader_dwords, system_input_ptr);
     uint64_t vs_identity = 0, fs_identity = 0;
     std::vector<uint32_t> vs = recompile_graphics_shader_cached(
         ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)rs.es_addr,
@@ -552,6 +556,14 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     std::vector<uint32_t> fs = recompile_graphics_shader_cached(
         ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
         max_shader_dwords, prt.get(), nullptr, system_input_ptr, &fs_identity);
+    std::vector<uint32_t> gs;
+    if (interpolation.requires_geometry && interpolation.valid) {
+        // Geometry `Triangles` accepts list, strip, and fan input assembly. Points/lines cannot
+        // provide the three AMD vertex parameters and remain fail-visible.
+        const bool triangle_topology = resolved_pipeline.topology >= 3u &&
+                                       resolved_pipeline.topology <= 5u;
+        if (triangle_topology) gs = recompile_interpolation_geometry(interpolation);
+    }
     if (phase_timing) {
         const auto shader_done = std::chrono::steady_clock::now();
         record_draw_realization_phases(
@@ -574,7 +586,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             nd++;
         }
     }
-    if (vs.empty() || fs.empty()) {
+    if (vs.empty() || fs.empty() || (interpolation.requires_geometry && gs.empty())) {
         if (failure) failure->reason = RealizationFailureReason::ShaderRecompile;
         // PROSPER_DYNTRACE_FAIL=1: replay the FAILED vertex stage's resource build with the
         // dynamic-fetch walk trace + user-data block dump forced on (once per distinct VS), so the
@@ -601,9 +613,11 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             }
         }
         if (getenv("PROSPER_DBG"))
-            fprintf(stderr, "[exec-recompile-reject] es=0x%llx ps=0x%llx vs=%zu fs=%zu order=%llu\n",
+            fprintf(stderr, "[exec-recompile-reject] es=0x%llx ps=0x%llx vs=%zu gs=%zu fs=%zu "
+                            "prim=%u topo=%u ena=%08x addr=%08x order=%llu\n",
                     (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
-                    vs.size(), fs.size(),
+                    vs.size(), gs.size(), fs.size(), rs.prim_type, resolved_pipeline.topology,
+                    rs.ps_input_ena, rs.ps_input_addr,
                     (unsigned long long)(draw ? draw->command_order : 0));
         if (const char* dd = getenv("PROSPER_SHADER_DUMP")) {
             for (auto [tag, addr] : {std::pair{"vs", rs.es_addr}, std::pair{"ps", rs.ps_addr}}) {
@@ -623,11 +637,11 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             }
         }
         if (log) {
-            fprintf(stderr, "[exec] skip draw: recompile failed (vs=%zu fs=%zu; order=%llu "
+            fprintf(stderr, "[exec] skip draw: recompile failed (vs=%zu gs=%zu fs=%zu; order=%llu "
                             "es=0x%llx ps=0x%llx color0=0x%llx/%ux%u "
                             "depth=%d/%d/op%u clear=%d/%g base=0x%llx/0x%llx "
                             "stencil=%d clear=%d/%u base=0x%llx/0x%llx)\n",
-                    vs.size(), fs.size(),
+                    vs.size(), gs.size(), fs.size(),
                     (unsigned long long)(draw ? draw->command_order : 0),
                     (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
                     (unsigned long long)rs.color0_base, rs.color0_width, rs.color0_height,
@@ -656,7 +670,14 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                          (unsigned long long)rs.color0_base);
         return false;
     }
-    ResolvedPipelineState ps = resolve_pipeline_state(rs);
+    ResolvedPipelineState ps = resolved_pipeline;
+    // EXP.EN is the final per-component gate after CB_TARGET_MASK and CB_SHADER_MASK. Vulkan exposes
+    // the same preservation semantics through colorWriteMask: disabled attachment components retain
+    // their old values even though the fragment output itself is a full vec4.
+    const uint32_t exp_mask = fragment_color_export_mask(
+        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.ps_addr)), max_shader_dwords);
+    ps.color_write_mask &= exp_mask & 0xFu;
+    ps.color1_write_mask &= (exp_mask >> 4) & 0xFu;
     // Color-disabled draws are not necessarily no-ops. Depth prepasses and stencil mask writers
     // deliberately set CB_TARGET_MASK=0, then later color draws consume their DS result. Dropping
     // those writers made The Messenger clear stencil to 0 and then test for bits 1/2 that could never
@@ -677,9 +698,11 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // cutscene caption text: small indexed quads, bottom viewport, blended, sampling a font atlas).
     if (getenv("PROSPER_DRAWDIAG")) {
         uint32_t ic = (draw && draw->indexed) ? draw->index_count : vcount_hint;
-        fprintf(stderr, "[draw] idx=%u vp=%d y=%.0f h=%.0f blend=%d cwm=0x%x es=0x%llx", ic,
+        fprintf(stderr, "[draw] idx=%u vp=%d y=%.0f h=%.0f blend=%d cwm=0x%x "
+                        "target=0x%x shader=0x%x exp=0x%x es=0x%llx ps=0x%llx", ic,
                 ps.has_viewport, ps.viewport_y, ps.viewport_h, ps.blend_enable, ps.color_write_mask,
-                (unsigned long long)rs.es_addr);
+                rs.cb_target_mask, rs.cb_shader_mask, exp_mask,
+                (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr);
         if (prt) for (const auto& r : prt->resources)
             if (r.cls == ResourceClass::Texture)
                 fprintf(stderr, " tex=0x%llx(%ux%u f%u)", (unsigned long long)r.gpu_addr, r.width, r.height, (unsigned)r.format);
@@ -885,7 +908,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             }
         }
     }
-    out.vs = std::move(vs); out.fs = std::move(fs);
+    out.vs = std::move(vs); out.gs = std::move(gs); out.fs = std::move(fs);
     out.vs_guest_addr = rs.es_addr; out.fs_guest_addr = rs.ps_addr;
     out.vs_identity = vs_identity; out.fs_identity = fs_identity; out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;

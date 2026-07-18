@@ -14,6 +14,12 @@
 #include <vector>
 
 namespace prosper::gpu {
+
+FragmentInterpolationLayout::FragmentInterpolationLayout() {
+    for (auto& locations : parameter_locations) locations.fill(kUnusedLocation);
+    system_locations.fill(kUnusedLocation);
+}
+
 namespace {
 
 enum : uint32_t {
@@ -46,6 +52,7 @@ enum : uint32_t {
     Op_DPdx=207, Op_DPdy=208,   // screen-space derivatives (Fragment; plain Shader capability)
     Op_Phi=245, Op_LoopMerge=246,
     Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Switch=251,
+    Op_EmitVertex=218, Op_EndPrimitive=219,
     Op_Kill=252, Op_Return=253, Op_GroupNonUniformAny=335,
     Op_GroupNonUniformQuadSwap=366,
 };
@@ -56,10 +63,11 @@ enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Gls
                   Glsl_UMax=41, Glsl_SMax=42, Glsl_PackHalf2x16=58, Glsl_UnpackHalf2x16=62,
                   Glsl_NMin=79, Glsl_NMax=80 };   // NaN-aware min/max: one-NaN operand -> the other operand
 enum : uint32_t {
-    Cap_Shader=1, Cap_Int64=11, Cap_GroupNonUniform=61, Cap_GroupNonUniformVote=62,
+    Cap_Shader=1, Cap_Geometry=2, Cap_Int64=11, Cap_GroupNonUniform=61, Cap_GroupNonUniformVote=62,
     Cap_GroupNonUniformQuad=68,
-    Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Fragment=4, Exec_GLCompute=5,
-    EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17,
+    Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Geometry=3, Exec_Fragment=4, Exec_GLCompute=5,
+    EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17, EM_Triangles=22,
+    EM_OutputVertices=26, EM_OutputTriangleStrip=29,
     SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_Function=7, SC_StorageBuffer=12, FC_None=0,
     Dim_1D=0, Dim_2D=1, Dim_3D=2,   // SPIR-V Dim. (2D coincides with the SQ_RSRC 2D dim value, but distinct.)
     Cap_Sampled1D=43, Cap_Image1D=44,   // Dim=1D needs Sampled1D; a 1D STORAGE image (read/write) also needs Image1D
@@ -74,7 +82,8 @@ enum : uint32_t {
     ImgOp_Bias=1, ImgOp_Lod=2, ImgOp_Sample=0x40,   // ImageOperands bits: LOD bias / explicit LOD / MSAA Sample index.
     SC_Workgroup=4, Scope_Device=1, Scope_Workgroup=2, Scope_Subgroup=3,
     MemSem_UniformAcqRel=0x48, MemSem_WGAcqRel=0x108,   // storage/LDS AcquireRelease memory semantics
-    Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_Flat=14, Dec_Location=30, Dec_Binding=33,
+    Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_NoPerspective=13, Dec_Flat=14,
+    Dec_Centroid=16, Dec_Sample=17, Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35,
     BI_Position=0, BI_FragCoord=15, BI_FragDepth=22, BI_WorkgroupId=26, BI_LocalInvocationId=27,
     BI_GlobalInvocationId=28, BI_VertexIndex=42, BI_InstanceIndex=43,
@@ -1244,6 +1253,7 @@ struct SpirvCompute {
     // --- Interpolated I/O varyings: VS EXP PARAM_n (output) <-> FS v_interp attribute (input) ---
     std::unordered_map<uint32_t, uint32_t> in_varying, out_varying;
     uint32_t t_ptr_in_v4f = 0;
+    const FragmentInterpolationLayout* fragment_interpolation = nullptr;
     // Attributes read via v_interp_mov (a raw per-vertex / provoking-vertex value, NOT rasterizer-
     // interpolated) — their FS Input varying is decorated Flat so the driver delivers the provoking
     // vertex value instead of a smooth blend of the three (#152). Populated by recompile_fragment's
@@ -1264,6 +1274,56 @@ struct SpirvCompute {
         uint32_t v = frag_input(attr);
         uint32_t vec = id(); put(code, Op_Load, {t_v4f, vec, v});
         uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, vec, chan}); return bcu(e);
+    }
+    // AMD v_interp_mov selects one of the triangle coefficients directly: P10, P20, or P0. On the
+    // portable geometry fallback each selected coefficient has a packed Flat vec4 input. The legacy
+    // P0-only path remains the ordinary Flat attribute at Location=attr and needs no extra stage.
+    uint32_t interp_parameter(uint32_t attr, uint32_t chan, uint32_t selector) {
+        if (!fragment_interpolation || !fragment_interpolation->requires_geometry)
+            return selector == 2 ? interp_read(attr, chan) : 0;
+        if (attr >= fragment_interpolation->parameter_locations.size() || selector >= 3) return 0;
+        const uint32_t location = fragment_interpolation->parameter_locations[attr][selector];
+        if (location == FragmentInterpolationLayout::kUnusedLocation) return 0;
+        auto it = in_varying.find(0x10000u | location);
+        uint32_t variable = 0;
+        if (it != in_varying.end()) variable = it->second;
+        else {
+            if (!t_ptr_in_v4f) {
+                t_ptr_in_v4f = id();
+                put(types, Op_TypePointer, {t_ptr_in_v4f, SC_Input, t_v4f});
+            }
+            variable = id(); put(types, Op_Variable, {t_ptr_in_v4f, variable, SC_Input});
+            put(deco, Op_Decorate, {variable, Dec_Location, location});
+            put(deco, Op_Decorate, {variable, Dec_Flat});
+            in_varying[0x10000u | location] = variable; iface.push_back(variable);
+        }
+        uint32_t vec = id(); put(code, Op_Load, {t_v4f, vec, variable});
+        uint32_t element = id(); put(code, Op_CompositeExtract, {t_f32, element, vec, chan});
+        return bcu(element);
+    }
+    uint32_t system_interpolation_component(uint32_t field, uint32_t component) {
+        if (!fragment_interpolation || !fragment_interpolation->requires_geometry || field >= 7)
+            return 0;
+        const uint32_t location = fragment_interpolation->system_locations[field];
+        if (location == FragmentInterpolationLayout::kUnusedLocation) return 0;
+        auto it = in_varying.find(0x20000u | location);
+        uint32_t variable = 0;
+        if (it != in_varying.end()) variable = it->second;
+        else {
+            if (!t_ptr_in_v4f) {
+                t_ptr_in_v4f = id();
+                put(types, Op_TypePointer, {t_ptr_in_v4f, SC_Input, t_v4f});
+            }
+            variable = id(); put(types, Op_Variable, {t_ptr_in_v4f, variable, SC_Input});
+            put(deco, Op_Decorate, {variable, Dec_Location, location});
+            if (field >= 4) put(deco, Op_Decorate, {variable, Dec_NoPerspective});
+            if (field == 0 || field == 4) put(deco, Op_Decorate, {variable, Dec_Sample});
+            if (field == 2 || field == 6) put(deco, Op_Decorate, {variable, Dec_Centroid});
+            in_varying[0x20000u | location] = variable; iface.push_back(variable);
+        }
+        uint32_t vec = id(); put(code, Op_Load, {t_v4f, vec, variable});
+        uint32_t element = id(); put(code, Op_CompositeExtract, {t_f32, element, vec, component});
+        return bcu(element);
     }
     // FS: gl_FragCoord (BuiltIn 15), lazily declared — used by the DPP quad_perm lowering.
     uint32_t v_fragcoord = 0;
@@ -1323,6 +1383,165 @@ struct SpirvCompute {
         put(code, Op_Store, {v, vec});
     }
 
+    // Descriptor-free geometry pass-through used when a fragment program asks for AMD's explicit
+    // P0/P10/P20 vertex parameters on a Vulkan device without a barycentric/vertex-parameter
+    // extension. Input assembly has already decomposed lists/strips/fans into triangles here.
+    std::vector<uint32_t> build_interpolation_geometry(const FragmentInterpolationLayout& layout) {
+        if (!layout.requires_geometry || !layout.valid) return {};
+
+        t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
+        t_v4f = id();
+        const uint32_t t_per_vertex = id();
+        const uint32_t c_three = id();
+        const uint32_t t_input_positions = id(), t_input_varyings = id();
+        const uint32_t ptr_in_positions = id(), ptr_in_varyings = id();
+        const uint32_t ptr_in_v4f = id(), ptr_out_position = id(), ptr_out_v4f = id();
+        const uint32_t input_position = id(), output_position = id();
+        f_main = id(); const uint32_t label = id(); glsl = id();
+
+        std::array<uint32_t, 32> attribute_inputs{}, attribute_outputs{};
+        std::array<std::array<uint32_t, 3>, 32> parameter_outputs{};
+        std::array<uint32_t, 7> system_outputs{};
+        for (uint32_t attr = 0; attr < 32; ++attr) {
+            if (!(layout.attribute_mask & (1u << attr))) continue;
+            attribute_inputs[attr] = id();
+            if (layout.smooth_mask & (1u << attr)) attribute_outputs[attr] = id();
+            for (uint32_t selector = 0; selector < 3; ++selector)
+                if (layout.parameter_locations[attr][selector] !=
+                    FragmentInterpolationLayout::kUnusedLocation)
+                    parameter_outputs[attr][selector] = id();
+        }
+        for (uint32_t field = 0; field < 7; ++field)
+            if (layout.system_locations[field] != FragmentInterpolationLayout::kUnusedLocation)
+                system_outputs[field] = id();
+
+        put(caps, Op_Capability, {Cap_Shader});
+        put(caps, Op_Capability, {Cap_Geometry});
+        { std::vector<uint32_t> operands{glsl}; pstr(operands, "GLSL.std.450");
+          putv(extimp, Op_ExtInstImport, operands); }
+        put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
+        exec_model = Exec_Geometry;
+        put(exec, Op_ExecutionMode, {f_main, EM_Triangles});
+        put(exec, Op_ExecutionMode, {f_main, EM_OutputTriangleStrip});
+        put(exec, Op_ExecutionMode, {f_main, EM_OutputVertices, 3});
+
+        put(deco, Op_MemberDecorate, {t_per_vertex, 0, Dec_BuiltIn, BI_Position});
+        put(deco, Op_Decorate, {t_per_vertex, Dec_Block});
+        for (uint32_t attr = 0; attr < 32; ++attr) {
+            if (attribute_inputs[attr]) {
+                put(deco, Op_Decorate, {attribute_inputs[attr], Dec_Location, attr});
+                iface.push_back(attribute_inputs[attr]);
+            }
+            if (attribute_outputs[attr]) {
+                put(deco, Op_Decorate, {attribute_outputs[attr], Dec_Location, attr});
+                iface.push_back(attribute_outputs[attr]);
+            }
+            for (uint32_t selector = 0; selector < 3; ++selector) {
+                const uint32_t variable = parameter_outputs[attr][selector];
+                if (!variable) continue;
+                put(deco, Op_Decorate,
+                    {variable, Dec_Location, layout.parameter_locations[attr][selector]});
+                put(deco, Op_Decorate, {variable, Dec_Flat});
+                iface.push_back(variable);
+            }
+        }
+        for (uint32_t field = 0; field < 7; ++field) {
+            const uint32_t variable = system_outputs[field];
+            if (!variable) continue;
+            put(deco, Op_Decorate, {variable, Dec_Location, layout.system_locations[field]});
+            if (field >= 4) put(deco, Op_Decorate, {variable, Dec_NoPerspective});
+            if (field == 0 || field == 4) put(deco, Op_Decorate, {variable, Dec_Sample});
+            if (field == 2 || field == 6) put(deco, Op_Decorate, {variable, Dec_Centroid});
+            iface.push_back(variable);
+        }
+        iface.push_back(input_position); iface.push_back(output_position);
+
+        put(types, Op_TypeVoid, {t_void});
+        put(types, Op_TypeFunction, {t_fn, t_void});
+        put(types, Op_TypeFloat, {t_f32, 32});
+        put(types, Op_TypeInt, {t_u32, 32, 0});
+        put(types, Op_TypeInt, {t_i32, 32, 1});
+        put(types, Op_TypeBool, {t_bool});
+        put(types, Op_TypeVector, {t_v4f, t_f32, 4});
+        put(types, Op_TypeStruct, {t_per_vertex, t_v4f});
+        put(types, Op_Constant, {t_u32, c_three, 3});
+        put(types, Op_TypeArray, {t_input_positions, t_per_vertex, c_three});
+        put(types, Op_TypeArray, {t_input_varyings, t_v4f, c_three});
+        put(types, Op_TypePointer, {ptr_in_positions, SC_Input, t_input_positions});
+        put(types, Op_TypePointer, {ptr_in_varyings, SC_Input, t_input_varyings});
+        put(types, Op_TypePointer, {ptr_in_v4f, SC_Input, t_v4f});
+        put(types, Op_TypePointer, {ptr_out_position, SC_Output, t_per_vertex});
+        put(types, Op_TypePointer, {ptr_out_v4f, SC_Output, t_v4f});
+        put(types, Op_Variable, {ptr_in_positions, input_position, SC_Input});
+        put(types, Op_Variable, {ptr_out_position, output_position, SC_Output});
+        for (uint32_t variable : attribute_inputs)
+            if (variable) put(types, Op_Variable, {ptr_in_varyings, variable, SC_Input});
+        for (uint32_t variable : attribute_outputs)
+            if (variable) put(types, Op_Variable, {ptr_out_v4f, variable, SC_Output});
+        for (const auto& selectors : parameter_outputs)
+            for (uint32_t variable : selectors)
+                if (variable) put(types, Op_Variable, {ptr_out_v4f, variable, SC_Output});
+        for (uint32_t variable : system_outputs)
+            if (variable) put(types, Op_Variable, {ptr_out_v4f, variable, SC_Output});
+
+        put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
+        put(code, Op_Label, {label}); cur_block = label;
+
+        std::array<std::array<uint32_t, 3>, 32> attribute_values{};
+        for (uint32_t attr = 0; attr < 32; ++attr) {
+            if (!attribute_inputs[attr]) continue;
+            for (uint32_t vertex = 0; vertex < 3; ++vertex) {
+                const uint32_t pointer = id();
+                put(code, Op_AccessChain,
+                    {ptr_in_v4f, pointer, attribute_inputs[attr], uconst(vertex)});
+                attribute_values[attr][vertex] = id();
+                put(code, Op_Load, {t_v4f, attribute_values[attr][vertex], pointer});
+            }
+        }
+        std::array<std::array<uint32_t, 3>, 32> parameters{};
+        for (uint32_t attr = 0; attr < 32; ++attr) {
+            if (!attribute_inputs[attr]) continue;
+            parameters[attr][2] = attribute_values[attr][0];
+            parameters[attr][0] = id();
+            put(code, Op_FSub, {t_v4f, parameters[attr][0],
+                                attribute_values[attr][1], attribute_values[attr][0]});
+            parameters[attr][1] = id();
+            put(code, Op_FSub, {t_v4f, parameters[attr][1],
+                                attribute_values[attr][2], attribute_values[attr][0]});
+        }
+
+        for (uint32_t vertex = 0; vertex < 3; ++vertex) {
+            uint32_t input_pointer = id();
+            put(code, Op_AccessChain,
+                {ptr_in_v4f, input_pointer, input_position, uconst(vertex), uconst(0)});
+            uint32_t position = id(); put(code, Op_Load, {t_v4f, position, input_pointer});
+            uint32_t output_pointer = id();
+            put(code, Op_AccessChain,
+                {ptr_out_v4f, output_pointer, output_position, uconst(0)});
+            put(code, Op_Store, {output_pointer, position});
+
+            for (uint32_t attr = 0; attr < 32; ++attr) {
+                if (attribute_outputs[attr])
+                    put(code, Op_Store,
+                        {attribute_outputs[attr], attribute_values[attr][vertex]});
+                for (uint32_t selector = 0; selector < 3; ++selector)
+                    if (parameter_outputs[attr][selector])
+                        put(code, Op_Store,
+                            {parameter_outputs[attr][selector], parameters[attr][selector]});
+            }
+            const float i = vertex == 1 ? 1.0f : 0.0f;
+            const float j = vertex == 2 ? 1.0f : 0.0f;
+            const uint32_t barycentric = id();
+            putv(code, Op_CompositeConstruct,
+                 {t_v4f, barycentric, fconstf(i), fconstf(j), fconstf(1.0f), fconstf(1.0f)});
+            for (uint32_t variable : system_outputs)
+                if (variable) put(code, Op_Store, {variable, barycentric});
+            put(code, Op_EmitVertex, {});
+        }
+        put(code, Op_EndPrimitive, {});
+        return finish();
+    }
+
     std::vector<uint32_t> finish() {
         if (invocation_guard_merge) {
             emit_branch(invocation_guard_merge);
@@ -1340,6 +1559,62 @@ struct SpirvCompute {
 };
 
 }  // namespace
+
+FragmentInterpolationLayout fragment_interpolation_layout(
+        const uint32_t* code, size_t dwords,
+        const PixelSystemInputMapping* system_inputs) {
+    FragmentInterpolationLayout layout;
+    std::vector<Rdna2Inst> instructions;
+    rdna2_walk(code, dwords, instructions);
+    std::array<uint8_t, 32> selectors{};
+    uint32_t highest_attribute = 0;
+    bool has_attribute = false;
+    for (const auto& instruction : instructions) {
+        if (instruction.is_end) break;
+        if (instruction.fmt != Rdna2Format::VINTRP || instruction.vintrp_attr >= 32) continue;
+        const uint32_t attr = instruction.vintrp_attr;
+        layout.attribute_mask |= 1u << attr;
+        highest_attribute = std::max(highest_attribute, attr);
+        has_attribute = true;
+        if (instruction.opcode == 0 || instruction.opcode == 1)
+            layout.smooth_mask |= 1u << attr;
+        else if (instruction.opcode == 2 && instruction.src[0].value < 3)
+            selectors[attr] |= static_cast<uint8_t>(1u << instruction.src[0].value);
+    }
+
+    // P10/P20 have no ordinary Vulkan varying equivalent. P0 can retain the cheap Flat-input path
+    // when it is the attribute's only interpolation mode; mixed P0+smooth needs the geometry copy too.
+    for (uint32_t attr = 0; attr < 32; ++attr) {
+        if (selectors[attr] & 0x3u) layout.requires_geometry = true;
+        if ((selectors[attr] & 0x4u) && (layout.smooth_mask & (1u << attr)))
+            layout.requires_geometry = true;
+    }
+    if (!layout.requires_geometry) return layout;
+
+    uint32_t location = has_attribute ? highest_attribute + 1 : 0;
+    for (uint32_t attr = 0; attr < 32; ++attr) {
+        for (uint32_t selector = 0; selector < 3; ++selector) {
+            if (!(selectors[attr] & (1u << selector))) continue;
+            if (location >= 32) { layout.valid = false; return layout; }
+            layout.parameter_locations[attr][selector] = location++;
+        }
+    }
+    if (system_inputs) {
+        for (uint32_t field = 0; field < 7; ++field) {
+            const uint32_t bit = 1u << field;
+            if (!(system_inputs->addr & bit) || !(system_inputs->ena & bit)) continue;
+            if (location >= 32) { layout.valid = false; return layout; }
+            layout.system_locations[field] = location++;
+        }
+    }
+    return layout;
+}
+
+std::vector<uint32_t> recompile_interpolation_geometry(
+        const FragmentInterpolationLayout& layout) {
+    SpirvCompute builder;
+    return builder.build_interpolation_geometry(layout);
+}
 
 // Machine state during recompilation: the VGPR and SGPR files (VGPR/SGPR number -> current SSA bits
 // id) and VCC (current bool condition). VGPRs and SGPRs are separate register files; VALU/EXP source
@@ -5191,13 +5466,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // deliver the interpolated attribute component from the matching Input varying. Fragment-only.
             if (!b.is_fragment) { ok = false; return true; }
             if (in.opcode == 0) return true;   // p1: no-op (p2/mov produce the value)
-            // v_interp_mov_f32's VSRC selects WHICH parameter to load: 0=P10 (v1-v0 delta),
-            // 1=P20 (v2-v0 delta), 2=P0 (provoking-vertex value). Only P0 maps to our
-            // rasterizer-interpolated flat varying; the per-vertex deltas are not recoverable
-            // from it, so a P10/P20 load must reject, not silently return the attribute value.
-            if (in.opcode == 2 && in.src[0].value != 2) { ok = false; return true; }
             uint32_t old = vreg_old(b, rs, in.dst.value);
-            rs.vreg[in.dst.value] = b.interp_read(in.vintrp_attr, in.vintrp_chan);
+            if (in.opcode == 2) {
+                const uint32_t parameter = b.interp_parameter(
+                    in.vintrp_attr, in.vintrp_chan, in.src[0].value);
+                if (!parameter) { ok = false; return true; }
+                rs.vreg[in.dst.value] = parameter;
+            } else {
+                rs.vreg[in.dst.value] = b.interp_read(in.vintrp_attr, in.vintrp_chan);
+            }
             predicate_write(b, rs, in.dst.value, old);
             return true;
         }
@@ -7263,10 +7540,27 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     return cov;
 }
 
+uint32_t fragment_color_export_mask(const uint32_t* code, size_t dwords) {
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code, dwords, ins);
+    uint32_t packed = 0;
+    std::array<bool, 2> realized{};
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt != Rdna2Format::EXP || in.exp_target >= realized.size() ||
+            realized[in.exp_target] || in.exp_en == 0)
+            continue;
+        packed |= (in.exp_en & 0xFu) << (in.exp_target * 4u);
+        realized[in.exp_target] = true;
+    }
+    return packed;
+}
+
 std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          const ShaderResourceTable* rt,
                                          const PixelSystemInputMapping* system_inputs,
-                                         uint32_t pcrel_dispatch_target) {
+                                         uint32_t pcrel_dispatch_target,
+                                         const FragmentInterpolationLayout* interpolation) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
     if (pcrel_dispatch_target != UINT32_MAX) {
@@ -7299,21 +7593,20 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
         return {};
     }
 
+    const FragmentInterpolationLayout derived_interpolation = interpolation
+        ? *interpolation : fragment_interpolation_layout(code, dwords, system_inputs);
+    if (!derived_interpolation.valid) return {};
     SpirvCompute b;
     b.begin_fragment(rt, color_mask);
-    // Classify each interpolated attribute by HOW it's read (#152): v_interp_p2 (op 1) = smooth
-    // rasterizer interpolation; v_interp_mov (op 2) = a raw per-vertex / provoking-vertex value (a
-    // flat read). An attribute read only via v_interp_mov gets its Input varying decorated Flat so
-    // the driver delivers the provoking vertex value, not a blend of the three. An attribute read
-    // via BOTH is contradictory (a varying can't be smooth and flat at once) -> reject the shader.
-    { std::unordered_set<uint32_t> smooth_attr;
-      for (const auto& in : ins) {
-          if (in.is_end) break;
-          if (in.fmt != Rdna2Format::VINTRP) continue;
-          if (in.opcode == 1) smooth_attr.insert(in.vintrp_attr);        // v_interp_p2
-          else if (in.opcode == 2) b.flat_attrs.insert(in.vintrp_attr);  // v_interp_mov
-      }
-      for (uint32_t a : b.flat_attrs) if (smooth_attr.count(a)) return {};   // mixed smooth+flat: reject
+    b.fragment_interpolation = &derived_interpolation;
+    // P0-only attributes retain the cheap Flat varying path. Mixed smooth/explicit-parameter reads
+    // are legal with the portable geometry stage and use separate packed locations there.
+    if (!derived_interpolation.requires_geometry) {
+        for (const auto& in : ins) {
+            if (in.is_end) break;
+            if (in.fmt == Rdna2Format::VINTRP && in.opcode == 2)
+                b.flat_attrs.insert(in.vintrp_attr);
+        }
     }
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     if (system_inputs) {
@@ -7325,8 +7618,17 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
         for (uint32_t field = 0; field < 16; ++field) {
             const uint32_t bit = 1u << field;
             if (!(system_inputs->addr & bit)) continue;
-            if ((system_inputs->ena & bit) && field >= 8 && field <= 11)
-                rs.vreg[(int)vgpr] = b.fragcoord_component(field - 8);
+            if (system_inputs->ena & bit) {
+                if (field <= 6 && derived_interpolation.requires_geometry) {
+                    for (uint32_t component = 0; component < widths[field]; ++component) {
+                        const uint32_t value = b.system_interpolation_component(field, component);
+                        if (!value) return {};
+                        rs.vreg[(int)(vgpr + component)] = value;
+                    }
+                } else if (field >= 8 && field <= 11) {
+                    rs.vreg[(int)vgpr] = b.fragcoord_component(field - 8);
+                }
+            }
             vgpr += widths[field];
         }
     }
@@ -7359,23 +7661,28 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
         }
         if (in.exp_target < exported.size() && !exported[in.exp_target]) {
             // EN (Table 56) selects which VSRC channels the export sends; hardware does not update
-            // disabled components. EN=0 sends nothing; a PARTIAL mask cannot be expressed against
-            // our full-RGBA attachments (the old code exported stale VGPR data in the disabled
-            // channels) — reject fail-visibly until partial-EN MRT exports are modeled with the
-            // export-format machinery. All exercised titles export EN=0xF.
+            // disabled components. The executor maps this mask to Vulkan colorWriteMask, so the SPIR-V
+            // value in a disabled channel is irrelevant and must not force a read of a stale VGPR.
             if (in.exp_en == 0) return true;
-            if (in.exp_en != 0xFu) return false;
             bool eok = true;   // a Special (wave-mask) source has no data value — reject, don't export 0 (#134)
             if (in.exp_compr) {
                 // COMPR: the 4 channels are two f16x2 pairs — src[0] holds (r,g), src[1] holds (b,a).
                 // Unpack each half to a float and reassemble the vec4 (the pkrtz'd tonemap/sRGB output).
-                uint32_t p0 = operand_bits(b, rs, in, in.src[0], &eok), p1 = operand_bits(b, rs, in, in.src[1], &eok);
-                b.export_color(in.exp_target, b.unpack_half(p0, 0), b.unpack_half(p0, 1),
-                               b.unpack_half(p1, 0), b.unpack_half(p1, 1));
+                const uint32_t p0 = (in.exp_en & 0x3u)
+                    ? operand_bits(b, rs, in, in.src[0], &eok) : b.uconst(0);
+                const uint32_t p1 = (in.exp_en & 0xCu)
+                    ? operand_bits(b, rs, in, in.src[1], &eok) : b.uconst(0);
+                b.export_color(in.exp_target,
+                               (in.exp_en & 0x1u) ? b.unpack_half(p0, 0) : b.uconst(0),
+                               (in.exp_en & 0x2u) ? b.unpack_half(p0, 1) : b.uconst(0),
+                               (in.exp_en & 0x4u) ? b.unpack_half(p1, 0) : b.uconst(0),
+                               (in.exp_en & 0x8u) ? b.unpack_half(p1, 1) : b.uconst(0));
             } else {
                 b.export_color(in.exp_target,
-                               operand_bits(b, rs, in, in.src[0], &eok), operand_bits(b, rs, in, in.src[1], &eok),
-                               operand_bits(b, rs, in, in.src[2], &eok), operand_bits(b, rs, in, in.src[3], &eok));
+                               (in.exp_en & 0x1u) ? operand_bits(b, rs, in, in.src[0], &eok) : b.uconst(0),
+                               (in.exp_en & 0x2u) ? operand_bits(b, rs, in, in.src[1], &eok) : b.uconst(0),
+                               (in.exp_en & 0x4u) ? operand_bits(b, rs, in, in.src[2], &eok) : b.uconst(0),
+                               (in.exp_en & 0x8u) ? operand_bits(b, rs, in, in.src[3], &eok) : b.uconst(0));
             }
             if (!eok) return false;
             exported[in.exp_target] = true;
@@ -7442,10 +7749,16 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
         // VGPR writes like compute. A vertex MUST still export from full EXEC — the compiled shape
         // always restores EXEC before its pos/param exports; if one ever arrives narrowed, reject
         // (fail-visibly) rather than export possibly-inactive-lane values.
-        if (rs.exec_narrowed && (in.exp_target >= 32 || (in.exp_target >= 12 && in.exp_target <= 15))) return false;
-        if (in.exp_target >= 12 && in.exp_target <= 15 && !exported) {
-            // A position export must supply all four components (EN=0xF); a partial position is
-            // not meaningfully completable, so reject rather than invent components.
+        if (rs.exec_narrowed && (in.exp_target >= 32 ||
+            (in.exp_target >= 12 && in.exp_target <= 16))) return false;
+        if (in.exp_target == 12 && !exported) {
+            // POS0 is the mandatory x/y/z/w position vector. POS1..POS4 carry ancillary position
+            // data (clip/cull distances, point size, viewport/layer selection according to the
+            // programmed position format) and must never be mistaken for gl_Position merely because
+            // an NGG shader emits one before POS0. Until those built-ins are modeled, retain the
+            // existing deliberate behavior of ignoring them.
+            // A position export must supply all four components (EN=0xF); a partial POS0 is not
+            // meaningfully completable in the current model, so reject rather than invent components.
             if (in.exp_en != 0xFu) return false;
             b.export_position(operand_bits(b, rs, in, in.src[0], &eok), operand_bits(b, rs, in, in.src[1], &eok),
                               operand_bits(b, rs, in, in.src[2], &eok), operand_bits(b, rs, in, in.src[3], &eok));

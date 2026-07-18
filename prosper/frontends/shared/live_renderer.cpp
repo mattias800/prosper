@@ -1803,6 +1803,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     const auto& it = *itp;
                     prosper::test::BackendDraw bd;
                     bd.vs     = refvs ? refvs_spv : it.vs;
+                    bd.gs     = refvs ? std::vector<uint32_t>{} : it.gs;
                     // File and synthetic overrides have independent exact-match gates.
                     bool fs_ov = !ps_override.empty();
                     if (fs_ov && ps_override_is_file) {

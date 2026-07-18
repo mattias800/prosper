@@ -31,6 +31,9 @@
 #ifdef PROSPER_VIDEO_MF
 #include "media_foundation_backend.hpp" // native Windows AvPlayer demux + hardware decode
 #endif
+#ifdef PROSPER_VIDEO_VAAPI
+#include "vaapi_backend.hpp"             // native Linux FFmpeg demux + VA-API hardware decode
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -510,6 +513,10 @@ int main(int argc, char** argv) {
 #ifdef PROSPER_VIDEO_MF
         if (!prosper::video::install_media_foundation_backend())
             fprintf(stderr, "[avp] Media Foundation backend unavailable\n");
+#endif
+#ifdef PROSPER_VIDEO_VAAPI
+        if (!prosper::video::install_vaapi_backend())
+            fprintf(stderr, "[avp] FFmpeg/VA-API backend unavailable\n");
 #endif
     })) { fprintf(stderr, "screenshot: boot failed: %s\n", err.c_str()); return 1; }
     std::thread guest([&prog] {

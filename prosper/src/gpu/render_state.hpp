@@ -125,6 +125,7 @@ struct RenderState {
     uint32_t cb_color_control  = 0;   // CB_COLOR_CONTROL
     uint32_t cb_blend0_control = 0;   // CB_BLEND0_CONTROL
     uint32_t cb_target_mask    = 0;   // CB_TARGET_MASK (per-MRT write mask)
+    uint32_t cb_shader_mask    = 0;   // CB_SHADER_MASK (components exported by the pixel shader)
     // Rasterizer cull/front-face/polygon mode (PA_SU_SC_MODE_CNTL). An ABSENT register reads 0, which
     // decodes to CULL_NONE + CCW-front + FILL — exactly the prior hardcoded default, so nothing changes
     // for a guest that never programs it. Decoded in resolve to Vk enums (#456).

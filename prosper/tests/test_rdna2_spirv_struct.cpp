@@ -392,10 +392,9 @@ int main() {
     }
     printf("  [ok]   lds_bytes>64 KB clamps to the RDNA2 max (16384 dwords)\n");
 
-    // v_interp_mov flat read (#152): an attribute read via v_interp_mov (a provoking-vertex / flat
-    // read) must decorate its FS Input varying Flat so the driver delivers the raw vertex value, not
-    // a smooth blend. An attribute read via BOTH v_interp_mov and v_interp_p2 is contradictory ->
-    // reject. Encodings llvm-mc gfx1030 verified. Dec_Flat = 14.
+    // v_interp_mov explicit-parameter reads (#152/#897). P0-only retains the cheap Flat varying.
+    // Mixed smooth+P0 and P10/P20 use the portable generated geometry stage, which publishes the
+    // coefficient values through separate Flat locations. Encodings llvm-mc gfx1030 verified.
     enum : uint32_t { OpDecorate = 71, DecFlat = 14 };
     // Flat-only: v_interp_mov v3, p0, attr0.x ; exp mrt0 v3,v3,v3,v3 ; s_endpgm
     const uint32_t ps_flat[] = { 0xc80e0002u, 0xf800000fu, 0x03030303u, 0xbf810000u };
@@ -413,14 +412,39 @@ int main() {
         return 1;
     }
     printf("  [ok]   v_interp_p2-only attribute stays smooth (no Flat decoration)\n");
-    // Mixed: attr0 read via BOTH v_interp_mov (flat) and v_interp_p2 (smooth) -> reject (can't be both).
+    // Mixed: attr0 read via BOTH P0 and smooth interpolation needs separate interface locations.
     const uint32_t ps_mixed[] = { 0xc80e0002u, 0xc8110002u, 0xf800000fu, 0x03030303u, 0xbf810000u };
-    std::vector<uint32_t> mixed_spv = recompile_fragment(ps_mixed, sizeof(ps_mixed)/sizeof(ps_mixed[0]));
-    if (!mixed_spv.empty()) {
-        printf("  [FAIL] an attribute read via BOTH v_interp_mov and v_interp_p2 must be REJECTED\n");
+    FragmentInterpolationLayout mixed_layout = fragment_interpolation_layout(
+        ps_mixed, sizeof(ps_mixed)/sizeof(ps_mixed[0]));
+    std::vector<uint32_t> mixed_spv = recompile_fragment(
+        ps_mixed, sizeof(ps_mixed)/sizeof(ps_mixed[0]), nullptr, nullptr, UINT32_MAX, &mixed_layout);
+    std::vector<uint32_t> mixed_gs = recompile_interpolation_geometry(mixed_layout);
+    if (!mixed_layout.valid || !mixed_layout.requires_geometry || mixed_spv.empty() ||
+        mixed_gs.empty() || !has_opcode(mixed_gs, 218) || !has_opcode(mixed_gs, 219)) {
+        printf("  [FAIL] mixed P0+smooth interpolation did not generate a geometry fallback\n");
         return 1;
     }
-    printf("  [ok]   mixed flat+smooth read of one attribute is rejected\n");
+    printf("  [ok]   mixed P0+smooth interpolation generates coefficient pass-through SPIR-V\n");
+
+    // Explicit P10/P20/P0 values are the three AMD parameters used by Astro Bot's rejected title
+    // composite PS. All three fragment inputs are Flat outputs of the generated geometry stage.
+    const uint32_t ps_parameters[] = {
+        0xc80e0000u, 0xc8120001u, 0xc8160002u,
+        0xf800000fu, 0x05050403u, 0xbf810000u,
+    };
+    FragmentInterpolationLayout parameter_layout = fragment_interpolation_layout(
+        ps_parameters, sizeof(ps_parameters)/sizeof(ps_parameters[0]));
+    std::vector<uint32_t> parameter_spv = recompile_fragment(
+        ps_parameters, sizeof(ps_parameters)/sizeof(ps_parameters[0]), nullptr, nullptr,
+        UINT32_MAX, &parameter_layout);
+    std::vector<uint32_t> parameter_gs = recompile_interpolation_geometry(parameter_layout);
+    if (!parameter_layout.valid || !parameter_layout.requires_geometry || parameter_spv.empty() ||
+        parameter_gs.empty() || !has_decoration(parameter_spv, DecFlat) ||
+        !has_decoration(parameter_gs, DecFlat)) {
+        printf("  [FAIL] P10/P20/P0 explicit parameters did not lower through Flat geometry outputs\n");
+        return 1;
+    }
+    printf("  [ok]   P10/P20/P0 lower through the portable Flat geometry interface\n");
 
     // Pixel-system VGPR initialization: with perspective sample/center enabled, disabled
     // centroid/pull-model slots reserved by ADDR, and position X/Y enabled, the packed destinations

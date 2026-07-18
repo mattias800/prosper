@@ -221,6 +221,11 @@ RenderState extract_render_state(const GpuState& st) {
     // the real art rendered only under PROSPER_FORCE_COLORWRITE. A register that IS present (even 0) is
     // honored, so a genuine depth-only pass that programs mask 0 still skips correctly.
     rs.cb_target_mask    = st.cx.count(P::CB_TARGET_MASK) ? rd(st.cx, P::CB_TARGET_MASK) : 0xFFFFFFFFu;
+    // CB_SHADER_MASK is programmed from the pixel shader's color-export contract. Like the target
+    // mask, an absent register must not suppress color in synthetic/legacy command streams. The
+    // resolved Vulkan write mask intersects both registers so channels the shader does not export
+    // preserve their existing attachment contents (AMD RDNA2 EXP EN semantics, Table 56).
+    rs.cb_shader_mask    = st.cx.count(P::CB_SHADER_MASK) ? rd(st.cx, P::CB_SHADER_MASK) : 0xFFFFFFFFu;
 
     // Viewport 0 transform (guest floats; all-zero when never programmed).
     rs.vport_xscale  = flt(rd(st.cx, P::PA_CL_VPORT_XSCALE));
@@ -455,10 +460,11 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
         ps.alpha_blend_op1 = ps.color_blend_op1;
     }
 
-    // CB_TARGET_MASK holds a 4-bit write mask per MRT; MRT0 is bits [3:0]. RDNA2's R/G/B/A bit order
-    // matches VkColorComponentFlags (R=1,G=2,B=4,A=8), so the nibble maps 1:1.
-    ps.color_write_mask = rs.cb_target_mask & 0xFu;
-    ps.color1_write_mask = (rs.cb_target_mask >> 4) & 0xFu;
+    // CB_TARGET_MASK and CB_SHADER_MASK each hold a 4-bit mask per MRT. Hardware writes only their
+    // intersection; RDNA2's R/G/B/A bit order matches VkColorComponentFlags 1:1.
+    const uint32_t effective_color_mask = rs.cb_target_mask & rs.cb_shader_mask;
+    ps.color_write_mask = effective_color_mask & 0xFu;
+    ps.color1_write_mask = (effective_color_mask >> 4) & 0xFu;
 
     // Viewport: hardware maps screen = offset + scale * ndc; Vulkan maps px = (x + w/2) + ndc * (w/2).
     // Equating the two: x = xoffset - xscale, w = 2*xscale (same for y). A guest with GNM's +Y-up NDC

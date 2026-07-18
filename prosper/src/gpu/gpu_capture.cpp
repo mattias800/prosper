@@ -37,7 +37,7 @@ namespace prosper::gpu {
 namespace {
 
 constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
-constexpr uint32_t kVersion = 17;
+constexpr uint32_t kVersion = 18;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -545,6 +545,7 @@ void collect_shader_versions(GpuCaptureFile& capture) {
     };
     for (const auto& draw : capture.draws) {
         add(draw.vs);
+        if (!draw.gs.empty()) add(draw.gs);
         add(draw.fs);
     }
     for (const auto& compute : capture.computes) add(compute.spirv);
@@ -903,7 +904,8 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         }
     }
     for (const auto& d : draws) {
-        GpuCapturedDraw c; c.vs = d.vs; c.fs = d.fs; c.ps = d.ps; c.vertex_count = d.vertex_count;
+        GpuCapturedDraw c; c.vs = d.vs; c.gs = d.gs; c.fs = d.fs;
+        c.ps = d.ps; c.vertex_count = d.vertex_count;
         c.indices = d.indices; c.color0_base = d.color0_base;
         c.color0_width = d.color0_width; c.color0_height = d.color0_height;
         c.color1_base = d.color1_base;
@@ -1111,7 +1113,11 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         });
         if (it == versions.end()) versions.push_back({hash, words});
     };
-    for (const auto& d : c.draws) { add_shader(d.vs); add_shader(d.fs); }
+    for (const auto& d : c.draws) {
+        add_shader(d.vs);
+        if (!d.gs.empty()) add_shader(d.gs);
+        add_shader(d.fs);
+    }
     for (const auto& compute : c.computes) add_shader(compute.spirv);
     if (versions.size() > kMaxResources) { error = "invalid shader-version count"; return false; }
     w.u32(static_cast<uint32_t>(versions.size()));
@@ -1130,7 +1136,8 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         if (vs_index == 0xFFFFFFFFu || fs_index == 0xFFFFFFFFu) {
             error = "draw shader is missing from the version table"; return false;
         }
-        w.u32(vs_index); w.u32(fs_index); write_pipeline(w, d.ps); write_table(w, d.vrt); write_table(w, d.prt);
+        w.u32(vs_index); w.u32(fs_index);
+        write_pipeline(w, d.ps); write_table(w, d.vrt); write_table(w, d.prt);
         w.u32(d.vertex_count); w.words(d.indices); w.u64(d.color0_base);
         w.u32(d.color0_width); w.u32(d.color0_height);
         w.u64(d.draw_index); w.u64(d.command_order);
@@ -1375,6 +1382,18 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
     for (const auto& diagnostic : c.failure_diagnostics)
         if (diagnostic.pipeline_present) write_scissor_pipeline(w, diagnostic.pipeline);
+    // v18 appends the optional generated geometry-stage identity without changing any legacy draw
+    // prefix. UINT32_MAX means the normal VS->FS fast path; otherwise the index names the shared
+    // content-addressed SPIR-V version, just like the base VS/FS indices.
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws) {
+        const uint32_t geometry_index = draw.gs.empty()
+            ? 0xFFFFFFFFu : shader_version_index(versions, draw.gs);
+        if (!draw.gs.empty() && geometry_index == 0xFFFFFFFFu) {
+            error = "draw geometry shader is missing from the version table"; return false;
+        }
+        w.u32(geometry_index);
+    }
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -1844,6 +1863,21 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             if (diagnostic.pipeline_present && !read_scissor_pipeline(r, diagnostic.pipeline))
                 return false;
     }
+    if (version >= 18) {
+        uint32_t draw_count = 0;
+        if (!r.u32(draw_count) || draw_count != c.draws.size()) {
+            error = "invalid geometry-stage draw-state count"; return false;
+        }
+        for (auto& draw : c.draws) {
+            uint32_t geometry_index = 0;
+            if (!r.u32(geometry_index)) return false;
+            if (geometry_index == 0xFFFFFFFFu) continue;
+            if (geometry_index >= c.shader_versions.size()) {
+                error = "invalid draw geometry shader-version index"; return false;
+            }
+            draw.gs = c.shader_versions[geometry_index].words;
+        }
+    }
     if (r.left) { error = "capture has trailing data"; return false; }
     return true;
 }
@@ -1913,7 +1947,8 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
     };
     out.items.reserve(c.draws.size());
     for (const auto& x : c.draws) {
-        DrawItem d; d.vs = x.vs; d.fs = x.fs; d.ps = x.ps; d.vertex_count = x.vertex_count;
+        DrawItem d; d.vs = x.vs; d.gs = x.gs; d.fs = x.fs;
+        d.ps = x.ps; d.vertex_count = x.vertex_count;
         d.indices = x.indices; d.color0_base = x.color0_base;
         d.color0_width = x.color0_width; d.color0_height = x.color0_height;
         d.color1_base = x.color1_base;

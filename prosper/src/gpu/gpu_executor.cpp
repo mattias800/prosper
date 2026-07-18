@@ -2621,10 +2621,24 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     g_dyntrace_force = false;
                     std::fprintf(stderr, "[dynfail]   const-fold recovered %zu descriptor use(s):\n",
                                  cs_uses.size());
-                    for (const auto& u : cs_uses)
-                        std::fprintf(stderr, "[dynfail]     %s key=0x%x use_pc=%u dw0=0x%x\n",
-                                     u.kind == 0 ? "TEX/IMG(t8)" : "BUF(v4)", u.key, u.use_pc,
-                                     u.kind == 0 ? u.t8[0] : u.v4[0]);
+                    for (const auto& u : cs_uses) {
+                        if (u.kind == 0) {
+                            std::fprintf(stderr,
+                                         "[dynfail]     TEX/IMG(t8) key=0x%x use_pc=%u "
+                                         "t8=%08x:%08x:%08x:%08x:%08x:%08x:%08x:%08x\n",
+                                         u.key, u.use_pc, u.t8[0], u.t8[1], u.t8[2], u.t8[3],
+                                         u.t8[4], u.t8[5], u.t8[6], u.t8[7]);
+                        } else {
+                            const DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
+                            std::fprintf(stderr,
+                                         "[dynfail]     BUF(v4) key=0x%x use_pc=%u "
+                                         "v4=%08x:%08x:%08x:%08x base=0x%llx stride=%u "
+                                         "records=%u size=%u required=%u\n",
+                                         u.key, u.use_pc, u.v4[0], u.v4[1], u.v4[2], u.v4[3],
+                                         (unsigned long long)d.base, d.stride, d.num_records,
+                                         d.size_bytes, u.required_size);
+                        }
+                    }
                 }
             }
             static std::set<uint64_t> logged;

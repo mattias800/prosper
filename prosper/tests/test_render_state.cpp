@@ -73,6 +73,7 @@ int main() {
         { P::CB_BLEND0_CONTROL,  (1u << 30) | (4u << 0) | (5u << 8) | (0u << 5) },
         { P::CB_BLEND1_CONTROL,  (1u << 30) | (1u << 0) | (5u << 8) | (0u << 5) },
         { P::CB_TARGET_MASK,     0x000000FFu },
+        { P::CB_SHADER_MASK,     0x000000F3u },
         // CB fast-clear (#309): CLEAR_WORD0 holds one texel in the surface's 8_8_8_8 format.
         { P::CB_COLOR0_CLEAR_WORD0, 0x11223344u },
         { P::CB_COLOR0_CLEAR_WORD1, 0x00000000u },
@@ -345,6 +346,7 @@ int main() {
     CHECK(rs.db_depth_control  == 0x00000046u, "db_depth_control raw preserved");
     CHECK(rs.cb_color_control  == 0x00CC0010u, "cb_color_control raw preserved");
     CHECK(rs.cb_target_mask    == 0x000000FFu, "cb_target_mask raw preserved");
+    CHECK(rs.cb_shader_mask    == 0x000000F3u, "cb_shader_mask raw preserved");
 
     // #309: CB fast-clear word extraction + format-aware decode in resolve_pipeline_state.
     CHECK(rs.color0_has_clear, "color0_has_clear = true (CLEAR_WORD programmed)");
@@ -352,6 +354,8 @@ int main() {
     {
         // This target is ALT/BGRA + SRGB, so byte0=B, byte1=G, byte2=R, byte3=A, with RGB linearized.
         ResolvedPipelineState ps = resolve_pipeline_state(rs);
+        CHECK(ps.color_write_mask == 0x3u,
+              "MRT0 write mask intersects CB_TARGET_MASK with CB_SHADER_MASK");
         CHECK(ps.has_clear_color, "resolve decodes the fast-clear color");
         CHECK_NEAR(ps.clear_color[0], srgb2lin(0x22 / 255.0f), "clear R = byte2 (ALT swap), sRGB-linearized");
         CHECK_NEAR(ps.clear_color[1], srgb2lin(0x33 / 255.0f), "clear G = byte1, sRGB-linearized");

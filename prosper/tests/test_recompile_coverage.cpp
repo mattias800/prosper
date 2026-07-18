@@ -97,6 +97,39 @@ int main() {
                           compute_cfg_dispatch_dead_descriptor.size(), 0, 0,
                           &dispatch_rt).empty(),
           "unreachable dispatcher writes cannot invalidate a live direct descriptor");
+
+    // Descriptor identity is compile-time provenance, not part of the scalar value persisted by the
+    // complex-CFG dispatcher's Function variables. This reduced Astro shape loads V# s[20:23] before
+    // the branch tree and consumes it with a raw MUBUF at the shared exit. SRT-only lookup cannot be
+    // proven at that later block; the front-half's exact per-MUBUF fetch_pc alias makes it unambiguous.
+    std::vector<uint32_t> compute_cfg_dispatch_cross_block_vsharp = {
+        0xF4080504u, 0xFA000010u, // s_load_dwordx4 s[20:23], s[8:9], 0x10
+    };
+    compute_cfg_dispatch_cross_block_vsharp.insert(
+        compute_cfg_dispatch_cross_block_vsharp.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + sizeof(compute_cfg_dispatch) / sizeof(compute_cfg_dispatch[0]) - 1);
+    const uint32_t cross_block_fetch_pc =
+        static_cast<uint32_t>(compute_cfg_dispatch_cross_block_vsharp.size());
+    compute_cfg_dispatch_cross_block_vsharp.push_back(0xE00C2000u);
+    compute_cfg_dispatch_cross_block_vsharp.push_back(0x80050400u); // buffer_load_dword v4,v0,s[20:23]
+    compute_cfg_dispatch_cross_block_vsharp.push_back(0xBF810000u);
+    ShaderResourceTable cross_block_rt = dispatch_rt;
+    ShaderResource cross_block_vsharp{};
+    cross_block_vsharp.cls = ResourceClass::ConstantBuffer;
+    cross_block_vsharp.binding = 4;
+    cross_block_vsharp.srt_offset = 0x10;
+    cross_block_vsharp.stride = 4;
+    cross_block_rt.resources.push_back(cross_block_vsharp);
+    CHECK(recompile_valu(compute_cfg_dispatch_cross_block_vsharp.data(),
+                         compute_cfg_dispatch_cross_block_vsharp.size(), 0, 0,
+                         &cross_block_rt).empty(),
+          "a cross-block V# without exact fetch provenance remains unresolved");
+    cross_block_rt.resources.back().fetch_pc = cross_block_fetch_pc;
+    CHECK(!recompile_valu(compute_cfg_dispatch_cross_block_vsharp.data(),
+                          compute_cfg_dispatch_cross_block_vsharp.size(), 0, 0,
+                          &cross_block_rt).empty(),
+          "exact MUBUF fetch provenance survives the complex compute CFG boundary");
+
     std::vector<uint32_t> compute_cfg_dispatch_live_vopc_write = {
         0x7C0400F9u, 0x06068800u, // v_cmp_eq_f32_sdwa s8, v0, v0 (writes s[8:9])
     };

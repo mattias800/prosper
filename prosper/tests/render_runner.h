@@ -160,7 +160,7 @@ inline BackendColorTargetStats backend_color_target_stats() {
 // render pass (clear once, then per-draw pipeline+descriptors+draw) so a multi-draw frame composites
 // correctly. render_triangle_rgba is a thin single-draw wrapper (below).
 struct BackendDraw {
-    std::vector<uint32_t> vs, fs;
+    std::vector<uint32_t> vs, gs, fs;
     uint64_t vs_identity = 0, fs_identity = 0;
     const prosper::gpu::ResolvedPipelineState* ps = nullptr;   // null -> triangle-list, write RGBA, no depth
     std::vector<FrameResource> R;                              // set-tagged resources (empty -> no descriptors)
@@ -338,6 +338,10 @@ inline const RenderVkCtx& render_vk_ctx() {
         r.aniso_enabled = supported.samplerAnisotropy;
         r.max_aniso_limit = phys_props.limits.maxSamplerAnisotropy;
         if (r.aniso_enabled) feats.samplerAnisotropy = VK_TRUE;
+        // Portable AMD P0/P10/P20 lowering inserts a descriptor-free geometry pass on devices that
+        // lack explicit vertex-parameter fragment extensions. Core geometryShader is available on
+        // the Linux llvmpipe headless target and the desktop Vulkan drivers we support.
+        feats.geometryShader = supported.geometryShader;
         // Storage-image shaders declare the format-free read/write capabilities. Enable every
         // corresponding core feature advertised by the device; fragment/vertex stores additionally
         // need their pipeline-stage store features.
@@ -1396,7 +1400,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // Per-draw Vulkan objects — kept alive until after the queue submit, freed at the end.
     const auto timing_target_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     struct DV {
-        VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+        VkShaderModule vs = VK_NULL_HANDLE, gs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
         std::vector<FrameResource> R;
         std::vector<VkDescriptorSetLayout> dsls; std::vector<VkDescriptorSet> dsets;
         VkDescriptorPool dpool = VK_NULL_HANDLE;
@@ -1526,9 +1530,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         DV& v = dv[di];
         if (backend_trace) {
             fprintf(stderr,
-                    "[backend-trace] draw=%zu/%zu begin extent=%ux%u vs=%zu fs=%zu "
+                    "[backend-trace] draw=%zu/%zu begin extent=%ux%u vs=%zu gs=%zu fs=%zu "
                     "vs_id=%016llx fs_id=%016llx resources=%zu\n",
-                    di, draws.size(), W, H, bd.vs.size(), bd.fs.size(),
+                    di, draws.size(), W, H, bd.vs.size(), bd.gs.size(), bd.fs.size(),
                     (unsigned long long)bd.vs_identity,
                     (unsigned long long)bd.fs_identity, bd.R.size());
             fflush(stderr);
@@ -1565,9 +1569,17 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             std::memcpy(ip, bd.indices.data(), (size_t)isz); vkUnmapMemory(dev, v.ibmem);
             v.icount = (uint32_t)bd.indices.size();
         }
-        VkPipelineShaderStageCreateInfo st[2]{};
+        VkPipelineShaderStageCreateInfo st[3]{};
         st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}; st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = v.vs; st[0].pName = "main";
-        st[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}; st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = v.fs; st[1].pName = "main";
+        const uint32_t fragment_stage_index = bd.gs.empty() ? 1u : 2u;
+        if (!bd.gs.empty()) {
+            st[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            st[1].stage = VK_SHADER_STAGE_GEOMETRY_BIT; st[1].module = v.gs; st[1].pName = "main";
+        }
+        st[fragment_stage_index] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        st[fragment_stage_index].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        st[fragment_stage_index].module = v.fs;
+        st[fragment_stage_index].pName = "main";
         VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
         VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
         ia.topology = ps ? (VkPrimitiveTopology)ps->topology : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -1941,7 +1953,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         if (v.use_desc) { plci.setLayoutCount = v.n_sets; plci.pSetLayouts = v.dsls.data(); }
         vkCreatePipelineLayout(dev, &plci, nullptr, &v.layout);
         VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-        gp.stageCount = 2; gp.pStages = st; gp.pVertexInputState = &vin; gp.pInputAssemblyState = &ia;
+        gp.stageCount = bd.gs.empty() ? 2u : 3u; gp.pStages = st;
+        gp.pVertexInputState = &vin; gp.pInputAssemblyState = &ia;
         gp.pViewportState = &vpst; gp.pRasterizationState = &rs; gp.pMultisampleState = &ms;
         gp.pColorBlendState = &cb; gp.pDynamicState = &dynamic_state;
         gp.layout = v.layout; gp.renderPass = rp; gp.subpass = 0;
@@ -1965,7 +1978,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 memcpy(&word, &value, sizeof word);
                 append(word);
             };
-            append(4); // key schema version (scissor is dynamic per draw)
+            append(5); // key schema version (geometry stage + dynamic scissor)
             append(W); append(H); append(color_count); append(static_cast<uint32_t>(FMT));
             append(static_cast<uint32_t>(FMT1)); append(use_ds); append(static_cast<uint32_t>(DFMT));
             const bool exact_shader_identities = bd.vs_identity && bd.fs_identity;
@@ -1985,6 +1998,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 append(static_cast<uint32_t>(bd.fs.size()));
                 for (uint32_t word : bd.fs) append(word);
             }
+            append(static_cast<uint32_t>(bd.gs.size()));
+            for (uint32_t word : bd.gs) append(word);
             append(v.use_desc); append(v.n_sets);
             // A pair of shader-cache identities names the exact compile keys, including every
             // descriptor's class and binding. External/replay shaders have identity zero and keep
@@ -2051,24 +2066,27 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 fprintf(stderr, "[backend-trace] draw=%zu create-shaders begin\n", di);
                 fflush(stderr);
             }
-            v.vs = mkmod(bd.vs); v.fs = mkmod(bd.fs);
+            v.vs = mkmod(bd.vs); v.gs = bd.gs.empty() ? VK_NULL_HANDLE : mkmod(bd.gs);
+            v.fs = mkmod(bd.fs);
             if (backend_trace) {
                 fprintf(stderr,
-                        "[backend-trace] draw=%zu create-shaders end vs=%p fs=%p\n",
-                        di, (void*)v.vs, (void*)v.fs);
+                        "[backend-trace] draw=%zu create-shaders end vs=%p gs=%p fs=%p\n",
+                        di, (void*)v.vs, (void*)v.gs, (void*)v.fs);
                 fflush(stderr);
             }
             const auto setup_shader_ready = timing_enabled
                 ? TimingClock::now() : TimingClock::time_point{};
             if (timing_enabled)
                 setup_shader_ms += setup_elapsed_ms(setup_shader_begin, setup_shader_ready);
-            if (!v.vs || !v.fs) {
+            if (!v.vs || !v.fs || (!bd.gs.empty() && !v.gs)) {
                 if (timing_enabled)
                     setup_pipeline_ms += setup_elapsed_ms(
                         setup_resources_ready, setup_pipeline_key_ready);
                 continue;   // rejected SPIR-V -> skip this draw
             }
-            st[0].module = v.vs; st[1].module = v.fs;
+            st[0].module = v.vs;
+            if (!bd.gs.empty()) st[1].module = v.gs;
+            st[fragment_stage_index].module = v.fs;
             setup_pipeline_create_begin = setup_shader_ready;
             if (backend_trace) {
                 fprintf(stderr, "[backend-trace] draw=%zu create-pipeline begin\n", di);
@@ -2472,6 +2490,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         if (v.ibuf)   vkDestroyBuffer(dev, v.ibuf, nullptr);
         if (v.ibmem)  release_transient_render_memory(dev, v.ibmem);
         if (v.vs)     vkDestroyShaderModule(dev, v.vs, nullptr);
+        if (v.gs)     vkDestroyShaderModule(dev, v.gs, nullptr);
         if (v.fs)     vkDestroyShaderModule(dev, v.fs, nullptr);
         if (v.dpool)  vkDestroyDescriptorPool(dev, v.dpool, nullptr);
         for (auto d : v.dsls) if (d) vkDestroyDescriptorSetLayout(dev, d, nullptr);
