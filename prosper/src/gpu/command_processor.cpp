@@ -1449,27 +1449,27 @@ void GpuState::apply(const Pm4Command& c) {
             state_dirty_ = true;   // register state changed -> the next draw needs a fresh snapshot
             break;
         }
-        case K::SetShRegDirect:
-            // SET_SH_REG writes a consecutive RANGE (the driver uploads the whole user-data SGPR block
-            // this way). Write every value, not just the first — else all descriptors past the range's
-            // first register are silently dropped (which left the shaders' V#/T# SGPRs empty).
+        case K::SetRegDirect: {
+            // SET_*_REG writes a consecutive range into the file named by its opcode. SH commonly
+            // uploads a whole user-data SGPR block, while the direct APIs emit one Cx/Sh/Uc pair.
+            auto& file = (c.reg_class == RegClass::Cx) ? cx
+                       : (c.reg_class == RegClass::Sh) ? sh : uc;
             if (getenv("PROSPER_RESDUMP")) {
-                fprintf(stderr, "[shdirect] off=0x%x count=%u vals:", c.sh_reg_offset,
-                        c.sh_reg_data ? c.sh_reg_count : 1u);
-                if (c.sh_reg_data && c.sh_reg_count)
-                    for (uint32_t k = 0; k < c.sh_reg_count && k < 40; k++)
-                        fprintf(stderr, " 0x%x", c.sh_reg_data[k]);
-                else fprintf(stderr, " 0x%x", c.sh_reg_value);
+                const char* cn = c.reg_class == RegClass::Cx ? "Cx" : c.reg_class == RegClass::Sh ? "Sh" : "Uc";
+                fprintf(stderr, "[regdirect] class=%s off=0x%x count=%u vals:", cn, c.reg_offset,
+                        c.reg_data ? c.reg_count : 1u);
+                if (c.reg_data && c.reg_count)
+                    for (uint32_t k = 0; k < c.reg_count && k < 40; k++)
+                        fprintf(stderr, " 0x%x", c.reg_data[k]);
+                else fprintf(stderr, " 0x%x", c.reg_value);
                 fprintf(stderr, "\n");
             }
-            if (c.sh_reg_data && c.sh_reg_count) {
-                for (uint32_t k = 0; k < c.sh_reg_count && c.sh_reg_count <= kMaxRegsPerPacket; k++)
-                    sh[c.sh_reg_offset + k] = c.sh_reg_data[k];
-            } else {
-                sh[c.sh_reg_offset] = c.sh_reg_value;   // fallback (single-register / legacy path)
-            }
+            if (!c.reg_data || c.reg_count == 0 || c.reg_count > kMaxRegsPerPacket) break;
+            for (uint32_t k = 0; k < c.reg_count; k++)
+                file[c.reg_offset + k] = c.reg_data[k];
             state_dirty_ = true;
             break;
+        }
         case K::SetIndexType:
             index_type = c.index_size;
             state_dirty_ = true;

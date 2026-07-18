@@ -37,9 +37,14 @@ int main() {
     auto evt   = Hle::lookup("aJf+j5yntiU");   // EventWrite
     auto push  = Hle::lookup("+kSrjIVxKFE");   // PushMarker (#641)
     auto pop   = Hle::lookup("H7uZqCoNuWk");   // PopMarker (#641)
-    CHECK(reset && idx && setcx && p_add && p_adr && draw && drawi && evt && push && pop,
+    auto setcx_direct = Hle::lookup("LHFXRrlTPD8"); // SetCxRegisterDirect (#395 F5)
+    auto setsh_direct = Hle::lookup("pFLArOT53+w"); // SetShRegisterDirect (#395 F5)
+    auto setuc_direct = Hle::lookup("w4-d0n60hdo"); // SetUcRegisterDirect (#395 F5)
+    CHECK(reset && idx && setcx && p_add && p_adr && draw && drawi && evt && push && pop &&
+          setcx_direct && setsh_direct && setuc_direct,
           "AGC Dcb builders registered");
-    if (!(reset && idx && setcx && p_add && p_adr && draw && drawi && evt && push && pop)) {
+    if (!(reset && idx && setcx && p_add && p_adr && draw && drawi && evt && push && pop &&
+          setcx_direct && setsh_direct && setuc_direct)) {
         printf("== FAIL ==\n"); return 1;
     }
 
@@ -57,6 +62,12 @@ int main() {
     uint64_t rc = setcx(D, /*regs vaddr*/ 0x1122334455667788ull, /*num*/ 3, 0, 0, 0);
     p_add(rc, 5, 0, 0, 0, 0);                                     // num_regs: 3 -> 8
     p_adr(rc, 0xCAFEF00DDEADBEEFull, 0, 0, 0, 0);                 // rewrite the regs vaddr
+    auto pack_reg = [](uint32_t offset, uint32_t value) {
+        return (uint64_t)offset | ((uint64_t)value << 32u);
+    };
+    setcx_direct(D, pack_reg(0x100, 0x11111111), 0, 0, 0, 0);
+    setsh_direct(D, pack_reg(0x200, 0x22222222), 0, 0, 0, 0);
+    setuc_direct(D, pack_reg(0x300, 0x33333333), 0, 0, 0, 0);
     draw(D, /*index_count*/ 0x1234, 0, 0, 0, 0);
     drawi(D, /*index_count*/ 0x0600, /*indices*/ 0xDEAD0000BEEF0040ull, /*modifier*/ 0x40000000ull, 0, 0);
     evt(D, /*event_type*/ 0x42, /*address*/ 0x1400ABCD00ull, 0, 0, 0);
@@ -68,8 +79,8 @@ int main() {
     std::vector<Pm4Command> ops;
     size_t consumed = decode_pm4(buffer, 256, ops);   // pass full buffer; decoder stops at the zero tail
     CHECK(consumed == used_dw, "decoder consumed exactly the built dwords (stops at zero pad)");
-    CHECK(ops.size() == 8, "decoded 8 packets");
-    if (ops.size() != 8) { printf("== FAIL: got %zu packets ==\n", ops.size()); return 1; }
+    CHECK(ops.size() == 11, "decoded 11 packets");
+    if (ops.size() != 11) { printf("== FAIL: got %zu packets ==\n", ops.size()); return 1; }
 
     using K = Pm4Command::Kind;
     CHECK(ops[0].kind == K::PushMarker && ops[0].marker_label &&
@@ -84,19 +95,32 @@ int main() {
     CHECK(ops[3].num_regs == 8, "op3 num_regs = 8 (3 + patched 5)");
     CHECK(ops[3].regs_vaddr == 0xCAFEF00DDEADBEEFull, "op3 regs_vaddr = patched address");
 
-    CHECK(ops[4].kind == K::DrawIndexAuto && ops[4].index_count == 0x1234, "op4 = DrawIndexAuto(0x1234)");
+    CHECK(ops[4].kind == K::SetRegDirect && ops[4].reg_class == RegClass::Cx &&
+          ops[4].reg_offset == 0x100 && ops[4].reg_count == 1 &&
+          ops[4].reg_data && ops[4].reg_data[0] == 0x11111111,
+          "op4 = SetCxRegisterDirect(offset/value)");
+    CHECK(ops[5].kind == K::SetRegDirect && ops[5].reg_class == RegClass::Sh &&
+          ops[5].reg_offset == 0x200 && ops[5].reg_count == 1 &&
+          ops[5].reg_data && ops[5].reg_data[0] == 0x22222222,
+          "op5 = SetShRegisterDirect(offset/value)");
+    CHECK(ops[6].kind == K::SetRegDirect && ops[6].reg_class == RegClass::Uc &&
+          ops[6].reg_offset == 0x300 && ops[6].reg_count == 1 &&
+          ops[6].reg_data && ops[6].reg_data[0] == 0x33333333,
+          "op6 = SetUcRegisterDirect(offset/value)");
+
+    CHECK(ops[7].kind == K::DrawIndexAuto && ops[7].index_count == 0x1234, "op7 = DrawIndexAuto(0x1234)");
 
     // DrawIndex round-trip (issue #63): the builder wrote [1]=count, [2..3]=index addr, [4..5]=modifier;
     // the decoder must hand every field back (indexed draws were previously dropped as unknown NOPs).
-    CHECK(ops[5].kind == K::DrawIndex && ops[5].index_count == 0x0600, "op5 = DrawIndex(count=0x600)");
-    CHECK(ops[5].di_index_addr == 0xDEAD0000BEEF0040ull, "op5 index-buffer address round-trips");
-    CHECK(ops[5].di_modifier == 0x40000000ull && ops[5].di_valid, "op5 modifier round-trips (valid)");
+    CHECK(ops[8].kind == K::DrawIndex && ops[8].index_count == 0x0600, "op8 = DrawIndex(count=0x600)");
+    CHECK(ops[8].di_index_addr == 0xDEAD0000BEEF0040ull, "op8 index-buffer address round-trips");
+    CHECK(ops[8].di_modifier == 0x40000000ull && ops[8].di_valid, "op8 modifier round-trips (valid)");
 
-    CHECK(ops[6].kind == K::EventWrite && ops[6].event_type == 0x42, "op6 = EventWrite(0x42)");
+    CHECK(ops[9].kind == K::EventWrite && ops[9].event_type == 0x42, "op9 = EventWrite(0x42)");
     // Address-carrying EVENT_WRITE (#132): the widened packet now round-trips its destination
     // address (was discarded, so an address-carrying event lost its write target).
-    CHECK(ops[6].event_addr == 0x1400ABCD00ull, "op6 EventWrite address round-trips (was dropped)");
-    CHECK(ops[7].kind == K::PopMarker, "op7 = PopMarker");
+    CHECK(ops[9].event_addr == 0x1400ABCD00ull, "op9 EventWrite address round-trips (was dropped)");
+    CHECK(ops[10].kind == K::PopMarker, "op10 = PopMarker");
 
     // Every decoded packet's len must match its header, and the payload pointer must be in-buffer.
     bool spans_ok = true;
