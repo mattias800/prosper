@@ -272,6 +272,32 @@ int main() {
         }
     }
 
+    // #911: the workgroup local size is COMPUTE_NUM_THREAD_*.NUM_THREAD_FULL [15:0]; a nonzero
+    // NUM_THREAD_PARTIAL in bits [31:16] must NOT be folded into the dimension. Program X with a set
+    // PARTIAL field (0x3 << 16) over a real count of 32; the resolved local_x must be 32, not 0x30020.
+    {
+        namespace P = prosper::agc::Pm4;
+        alignas(4) uint32_t cbuf[128];
+        Dcb cd{}; cd.bottom = cbuf; cd.top = cbuf + 128; cd.cursor_up = cbuf; cd.cursor_down = cbuf + 128;
+        auto CD = (uint64_t)(uintptr_t)&cd;
+        reset(CD, 0x3ff, 0, 0, 0, 0);
+        ShaderReg thread_regs[3] = {
+            {P::COMPUTE_NUM_THREAD_X, (0x3u << 16) | 32u},   // PARTIAL=3, FULL=32
+            {P::COMPUTE_NUM_THREAD_Y, (0x7u << 16) | 4u},    // PARTIAL=7, FULL=4
+            {P::COMPUTE_NUM_THREAD_Z, 1u},
+        };
+        setsh(CD, (uint64_t)(uintptr_t)thread_regs, 3, 0, 0, 0);
+        dispatch(CD, 32, 4, 1, 0x1, 0);   // native workgroup dimensions
+        GpuState cs;
+        run_cb(cbuf, 128, cs);
+        CHECK(cs.dispatches.size() == 1, "#911 masked-thread dispatch counted");
+        if (cs.dispatches.size() == 1) {
+            const auto launch = resolve_compute_launch(cs.dispatches[0]);
+            CHECK(launch.local_x == 32 && launch.local_y == 4 && launch.local_z == 1,
+                  "#911: NUM_THREAD local size masks to FULL [15:0], ignoring PARTIAL [31:16]");
+        }
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

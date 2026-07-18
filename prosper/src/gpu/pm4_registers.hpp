@@ -821,6 +821,11 @@ constexpr uint32_t COMPUTE_PGM_HI                  = 0x20D;
 constexpr uint32_t COMPUTE_NUM_THREAD_X             = 0x207;
 constexpr uint32_t COMPUTE_NUM_THREAD_Y             = 0x208;
 constexpr uint32_t COMPUTE_NUM_THREAD_Z             = 0x209;
+// The workgroup dimension is the NUM_THREAD_FULL field [15:0]; bits [31:16] are NUM_THREAD_PARTIAL
+// (residual-thread count for partial dispatches, which prosper does not model). Consumers must mask
+// to [15:0] — reading the full 32-bit register would fold a nonzero PARTIAL into the local size.
+constexpr uint32_t COMPUTE_NUM_THREAD_FULL_SHIFT    = 0;
+constexpr uint32_t COMPUTE_NUM_THREAD_FULL_MASK     = 0xFFFF;
 constexpr uint32_t COMPUTE_PGM_RSRC1             = 0x212;
 constexpr uint32_t COMPUTE_PGM_RSRC1_VGPRS_SHIFT = 0;
 constexpr uint32_t COMPUTE_PGM_RSRC1_VGPRS_MASK  = 0x3F;
