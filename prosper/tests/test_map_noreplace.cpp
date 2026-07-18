@@ -2,8 +2,8 @@
 // map_at/map_phys_at forced MAP_FIXED for any non-zero hint, so a MapFlexible/MapDirectMemory
 // whose hint overlapped a committed mapping (or a loaded guest image) destroyed it. The fix:
 // MAP_FIXED_NOREPLACE, upgraded to MAP_FIXED only when the hint is entirely our own uncommitted
-// reservation. This drives the real HLE handlers and asserts a committed range survives a
-// colliding map, that committing an OWN reservation still works, and that a free hint is honored.
+// reservation. This drives the real HLE handlers and asserts a non-fixed collision relocates, a
+// fixed collision fails without clobbering, and committing an OWN reservation still works.
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
 #include <cstdio>
@@ -35,12 +35,22 @@ int main() {
     volatile uint32_t* cell = (volatile uint32_t*)(uintptr_t)va;
     *cell = 0xC0FFEE42u;
 
-    // 2. Map AGAIN at the same (now COMMITTED) hint. The old code MAP_FIXED'd fresh zero pages over
-    //    it, erasing the sentinel; the fix refuses (the range is committed, not a free reservation).
+    // 2. Map AGAIN at the same (now COMMITTED) non-fixed hint. The address is a search start, so
+    //    the mapping relocates forward rather than overwriting the live range or returning ENOMEM.
     uint64_t va2 = va;
     uint64_t r2 = flexible(U(&va2), LEN, 0x2, 0, U("colliding"), 0);
-    CHECK(r2 != 0, "MapFlexible over a COMMITTED hint fails (does not clobber)");
-    CHECK(*cell == 0xC0FFEE42u, "the committed range's contents SURVIVED the colliding map");
+    CHECK(r2 == 0 && va2 > va,
+          "non-fixed MapFlexible over a committed hint relocates forward");
+    CHECK(*cell == 0xC0FFEE42u,
+          "the committed range's contents survive the relocated map");
+
+    uint64_t fixed = va;
+    uint64_t rf = flexible(U(&fixed), LEN, 0x2, 0x10 /*SCE_KERNEL_MAP_FIXED*/,
+                           U("fixed-colliding"), 0);
+    CHECK(rf != 0 && fixed == va,
+          "fixed MapFlexible over a committed hint fails without relocating");
+    CHECK(*cell == 0xC0FFEE42u,
+          "the committed range's contents survive the failed fixed map");
 
     // 3. Committing an OWN reservation must still work: reserve fixed, then map into it.
     //    Find a free high VA by probing with the host mmap the handler uses.
