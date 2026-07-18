@@ -403,6 +403,51 @@ HLE(g_vo_set_buffer_attribute2) {  // a0=attr* a1=pixel_format a2=tiling a3=widt
     return 0;
 }
 
+// sceVideoOutRegisterBuffers (w3BY+tAEiQY): register a legacy flat framebuffer-address array and
+// return the lowest free attribute-group index. The Gen4 attribute stores its 32-bit pixel format at
+// offset 0; the remaining surface fields share the Gen5 offsets used by the present registry.
+HLE(g_vo_register_buffers) {  // a0=handle a1=start a2=addresses a3=buffer_num a4=attribute
+    vo_argtrace("RegisterBuffers", a0,a1,a2,a3,a4,a5);
+    const int start = (int)a1, num = (int)a3;
+    if (!a2 || !a4)
+        return (uint64_t)(int64_t)(int32_t)0x80290002;  // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
+    if (start < 0 || start > 15 || num < 1 || num > 16 || start + num > 16)
+        return (uint64_t)(int64_t)(int32_t)0x80290001;  // SCE_VIDEO_OUT_ERROR_INVALID_VALUE
+
+    const uint8_t* attr = (const uint8_t*)(uintptr_t)a4;
+    const DisplayConfig::SetConfig config = {
+        *(const uint32_t*)(attr + 0x0c), *(const uint32_t*)(attr + 0x10),
+        *(const uint32_t*)(attr + 0x00), *(const uint32_t*)(attr + 0x04), true
+    };
+    const auto* addresses = (const void* const*)(uintptr_t)a2;
+    std::lock_guard<std::mutex> lk(g_display_mx);
+
+    int set = 0;
+    while (set < 4 && g_display.sets[set].registered) ++set;
+    if (set == 4)
+        return (uint64_t)(int64_t)(int32_t)0x8029000f;  // SCE_VIDEO_OUT_ERROR_NO_EMPTY_SLOT
+    for (int i = 0; i < num; ++i) {
+        if (g_display.buffer_set[start + i] != 0)
+            return (uint64_t)(int64_t)(int32_t)0x80290010;  // SCE_VIDEO_OUT_ERROR_SLOT_OCCUPIED
+    }
+
+    g_display.width = config.width;
+    g_display.height = config.height;
+    g_display.pixel_format = config.pixel_format;
+    g_display.tiling_mode = config.tiling_mode;
+    g_display.sets[set] = config;
+    for (int i = 0; i < num; ++i) {
+        g_display.buffer_addr[start + i] = (uint64_t)(uintptr_t)addresses[i];
+        g_display.buffer_set[start + i] = (uint8_t)(set + 1);
+        uint64_t generation = ++g_display.next_generation;
+        if (generation == 0) generation = ++g_display.next_generation;
+        g_display.buffer_generation[start + i] = generation;
+    }
+    if (g_display.buffer_num < start + num) g_display.buffer_num = start + num;
+    g_display.configured = true;
+    return (uint64_t)set;
+}
+
 // sceVideoOutRegisterBuffers2 (rKBUtgRrtbk): (handle, set_index, buffer_index_start, buffers,
 // buffer_num, attribute, [category, option on stack]). Validate ranges like Kyty and accept. The
 // buffers' GPU backing becomes swapchain images once the swapchain exists; for now, registration
@@ -745,7 +790,7 @@ void register_graphics_hle() {
     R("sceVideoOutGetResolutionStatus", g_vo_resstatus);
     R("sceVideoOutGetVblankStatus", g_vo_vblankstatus);
     R("sceVideoOutGetDeviceCapabilityInfo", g_vo_devcap);
-    R("sceVideoOutRegisterBuffers", g_vo_close);R("sceVideoOutSetBufferAttribute", g_vo_set_buffer_attribute);
+    R("sceVideoOutRegisterBuffers", g_vo_register_buffers);R("sceVideoOutSetBufferAttribute", g_vo_set_buffer_attribute);
     // PS5 "2"/query variants — the 5 previously-unimplemented VideoOut NIDs (resolved via shadPS4
     // aerolib + Kyty VideoOut.cpp). Registered by raw NID (PS5-specific, not in our name DB).
     RN("Nv8c-Kb+DUM", g_vo_is_output_supported);   // sceVideoOutIsOutputSupported
