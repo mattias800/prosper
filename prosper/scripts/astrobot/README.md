@@ -14,6 +14,21 @@ GAME: Level has started: intro_next
 PLAY: SubLevelLocator sublevel_locator_hub [hub_crashsite_tutorial], state changed 1->4
 ```
 
+## Captures
+
+These are unmodified frontend captures from the documented routes. The incomplete rendering is
+visible in the images and is not presented as renderer-completeness evidence.
+
+Linux app, real decoded opening movie:
+
+![Astro Bot Sony Presents on the Linux app](../../docs/screenshots/issue-825-astrobot-linux-sony-presents.png)
+
+Windows app, Media Foundation/DXVA opening movie and title screen:
+
+![Astro Bot Sony Presents on the Windows app](../../docs/screenshots/issue-825-astrobot-windows-sony-presents.png)
+
+![Astro Bot title screen on the Windows app](../../docs/screenshots/issue-825-astrobot-windows-title.png)
+
 On a host without a usable VA-API device, explicitly enable the bounded synthetic
 video fallback for control-flow testing:
 
