@@ -265,10 +265,36 @@ HLE(h_posix_memalign) {
     return 0;
 }
 HLE(h_aligned_alloc)  { return (uint64_t)(uintptr_t)aligned_alloc_portable(a0, a1); }
-// C++ operators new/delete (the whole IL2CPP game is C++). new -> malloc; the aligned
-// forms take (size, align); nothrow forms take an extra tag arg we ignore.
-HLE(h_new)         { return (uint64_t)(uintptr_t)guest_malloc_portable(a0 ? a0 : 1); }
-HLE(h_new_align)   { return (uint64_t)(uintptr_t)aligned_alloc_portable(a1 ? a1 : 16, a0 ? a0 : 1); }
+// C++ operators new/delete (the whole IL2CPP game is C++). Throwing operator new must never
+// return null: the caller would treat an illegal null as constructed storage instead of taking
+// its exception/termination path.
+// prosper cannot yet propagate a guest std::bad_alloc across the HLE boundary, so allocation
+// failure is fail-stop. The explicit nothrow overloads retain their required null return.
+[[noreturn]] static void guest_new_oom(uint64_t size, uint64_t alignment) {
+    if (alignment) {
+        fprintf(stderr, "[libc] throwing aligned operator new failed: size=%llu alignment=%llu\n",
+                (unsigned long long)size, (unsigned long long)alignment);
+    } else {
+        fprintf(stderr, "[libc] throwing operator new failed: size=%llu\n",
+                (unsigned long long)size);
+    }
+    abort();
+}
+HLE(h_new) {
+    void* p = guest_malloc_portable(a0 ? a0 : 1);
+    if (!p) guest_new_oom(a0, 0);
+    return (uint64_t)(uintptr_t)p;
+}
+HLE(h_new_nothrow) { return (uint64_t)(uintptr_t)guest_malloc_portable(a0 ? a0 : 1); }
+HLE(h_new_align) {
+    uint64_t alignment = a1 ? a1 : 16;
+    void* p = aligned_alloc_portable(alignment, a0 ? a0 : 1);
+    if (!p) guest_new_oom(a0, alignment);
+    return (uint64_t)(uintptr_t)p;
+}
+HLE(h_new_align_nothrow) {
+    return (uint64_t)(uintptr_t)aligned_alloc_portable(a1 ? a1 : 16, a0 ? a0 : 1);
+}
 HLE(h_delete)      { guest_free_portable(P(a0)); return 0; }
 
 // --- stdio ---
@@ -551,9 +577,10 @@ void register_builtin_hle() {
     R("memalign", h_memalign); R("posix_memalign", h_posix_memalign); R("aligned_alloc", h_aligned_alloc);
     // operator new / new[] (+ nothrow), and aligned variants
     R("_Znwm", h_new); R("_Znam", h_new);
-    R("_ZnwmRKSt9nothrow_t", h_new); R("_ZnamRKSt9nothrow_t", h_new);
+    R("_ZnwmRKSt9nothrow_t", h_new_nothrow); R("_ZnamRKSt9nothrow_t", h_new_nothrow);
     R("_ZnwmSt11align_val_t", h_new_align); R("_ZnamSt11align_val_t", h_new_align);
-    R("_ZnwmSt11align_val_tRKSt9nothrow_t", h_new_align); R("_ZnamSt11align_val_tRKSt9nothrow_t", h_new_align);
+    R("_ZnwmSt11align_val_tRKSt9nothrow_t", h_new_align_nothrow);
+    R("_ZnamSt11align_val_tRKSt9nothrow_t", h_new_align_nothrow);
     // operator delete / delete[] (+ sized, aligned, nothrow) -> free
     R("_ZdlPv", h_delete); R("_ZdaPv", h_delete);
     R("_ZdlPvm", h_delete); R("_ZdaPvm", h_delete);
