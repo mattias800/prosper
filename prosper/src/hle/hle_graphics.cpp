@@ -79,8 +79,16 @@ namespace {
     // that never happened (#394 F3).
     int32_t  g_current_buffer = -1;
     int64_t  g_last_flip_arg = -1;
+    // sceVideoOutGetBufferLabelAddress exposes this contiguous per-port array directly to the
+    // guest. The guest writes 1 when an EOP flip is ready; completing the next flip releases the
+    // previously displayed slot back to 0. Keep the storage stable for the process lifetime.
+    alignas(uint64_t) uint64_t g_buffer_labels[16] = {};
+    int32_t g_previous_buffer = -1;
     void flip_advance(int32_t bufidx, int64_t flip_arg) {
         std::lock_guard<std::mutex> lk(g_flip_mx);
+        if (g_previous_buffer >= 0 && g_previous_buffer < 16)
+            g_buffer_labels[g_previous_buffer] = 0;
+        g_previous_buffer = (bufidx >= 0 && bufidx < 16) ? bufidx : -1;
         g_flip_count++;
         g_current_buffer = bufidx;
         g_last_flip_arg = flip_arg;
@@ -298,6 +306,14 @@ HLE(g_vo_addvblankevent) {
     prosper_eq_add_vblank(a0, (int64_t)(int32_t)a1, a2);
     return 0;
 }
+// sceVideoOutGetBufferLabelAddress (OcQybQejHEY): return the stable array whose 16 u64 entries
+// coordinate EOP flip ownership between the guest and VideoOut completion path.
+HLE(g_vo_get_buffer_label_address) {
+    if (!a1)
+        return (uint64_t)(int64_t)(int32_t)0x80290002;  // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
+    *(uintptr_t*)(uintptr_t)a1 = (uintptr_t)g_buffer_labels;
+    return 16;
+}
 HLE(g_vo_submitflip)  {
     if (evlog()) fprintf(stderr, "[ev] SubmitFlip handle=0x%llx bufidx=%lld flipmode=0x%llx fl013arg=0x%llx\n",
         (unsigned long long)a0, (long long)(int32_t)a1, (unsigned long long)a2, (unsigned long long)a3);
@@ -436,6 +452,10 @@ HLE(g_vo_register_buffers) {  // a0=handle a1=start a2=addresses a3=buffer_num a
     g_display.pixel_format = config.pixel_format;
     g_display.tiling_mode = config.tiling_mode;
     g_display.sets[set] = config;
+    {
+        std::lock_guard<std::mutex> flip_lk(g_flip_mx);
+        for (int i = 0; i < num; ++i) g_buffer_labels[start + i] = 0;
+    }
     for (int i = 0; i < num; ++i) {
         g_display.buffer_addr[start + i] = (uint64_t)(uintptr_t)addresses[i];
         g_display.buffer_set[start + i] = (uint8_t)(set + 1);
@@ -478,6 +498,10 @@ HLE(g_vo_register_buffers2) {  // a0=handle a1=set_index a2=buffer_index_start a
     g_display.pixel_format = config.pixel_format;
     g_display.tiling_mode = config.tiling_mode;
     g_display.sets[set] = config;
+    {
+        std::lock_guard<std::mutex> flip_lk(g_flip_mx);
+        for (int i = 0; i < num; ++i) g_buffer_labels[start + i] = 0;
+    }
     for (int i = 0; i < num; i++) {
         g_display.buffer_addr[start + i] = (uint64_t)(uintptr_t)bufs[i].data;
         g_display.buffer_set[start + i] = (uint8_t)(set + 1);
@@ -505,17 +529,24 @@ HLE(g_vo_unregister_buffers) {
     std::lock_guard<std::mutex> lk(g_display_mx);
     const uint8_t tag = (uint8_t)(set + 1);
     bool found = false;
-    for (int i = 0; i < 16; ++i) {
-        if (g_display.buffer_set[i] != tag) continue;
-        found = true;
-        if (g_display.front_index == i &&
-            g_display.front_generation == g_display.buffer_generation[i]) {
-            g_display.front_index = -1;
-            g_display.front_generation = 0;
+    {
+        std::lock_guard<std::mutex> flip_lk(g_flip_mx);
+        for (int i = 0; i < 16; ++i) {
+            if (g_display.buffer_set[i] != tag) continue;
+            found = true;
+            if (g_display.front_index == i &&
+                g_display.front_generation == g_display.buffer_generation[i]) {
+                g_display.front_index = -1;
+                g_display.front_generation = 0;
+            }
+            // A numeric slot can be registered again with a different backing surface. Retire the
+            // old label identity now so a later flip cannot clear the new registration's label.
+            g_buffer_labels[i] = 0;
+            if (g_previous_buffer == i) g_previous_buffer = -1;
+            g_display.buffer_set[i] = 0;
+            g_display.buffer_addr[i] = 0;
+            g_display.buffer_generation[i] = 0;
         }
-        g_display.buffer_set[i] = 0;
-        g_display.buffer_addr[i] = 0;
-        g_display.buffer_generation[i] = 0;
     }
     if (!found)
         return (uint64_t)(int64_t)(int32_t)0x8029000a;  // SCE_VIDEO_OUT_ERROR_INVALID_INDEX
@@ -811,6 +842,7 @@ void register_graphics_hle() {
     RN("PjS5uASwcV8", g_vo_set_buffer_attribute2);  // sceVideoOutSetBufferAttribute2
     RN("rKBUtgRrtbk", g_vo_register_buffers2);       // sceVideoOutRegisterBuffers2
     RN("N5KDtkIjjJ4", g_vo_unregister_buffers);      // sceVideoOutUnregisterBuffers
+    RN("OcQybQejHEY", g_vo_get_buffer_label_address); // sceVideoOutGetBufferLabelAddress (#394 F4)
     RN("utPrVdxio-8", g_vo_get_output_status);        // sceVideoOutGetOutputStatus
     RN("w0hLuNarQxY", g_vo_configure_output);          // sceVideoOutConfigureOutput
     RN("U2JJtSqNKZI", g_vo_get_event_id);              // sceVideoOutGetEventId (#210)

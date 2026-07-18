@@ -17,6 +17,8 @@ extern "C" uint32_t prosper_vo_display_width();
 extern "C" uint32_t prosper_vo_display_height();
 extern "C" uint64_t prosper_vo_display_format();
 extern "C" uint64_t prosper_vo_buffer_addr(int i);
+extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx,
+                                           uint32_t flip_mode, int64_t flip_arg);
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
@@ -38,14 +40,31 @@ int main() {
     auto setba2 = Hle::lookup("PjS5uASwcV8");   // SetBufferAttribute2
     auto regb2  = Hle::lookup("rKBUtgRrtbk");   // RegisterBuffers2
     auto unreg  = Hle::lookup("N5KDtkIjjJ4");   // UnregisterBuffers
+    auto labels = Hle::lookup("OcQybQejHEY");   // GetBufferLabelAddress
     auto cfg    = Hle::lookup("w0hLuNarQxY");   // ConfigureOutput
     auto flip   = Hle::lookup(nid_hash("sceVideoOutSubmitFlip"));
     auto fstat  = Hle::lookup(nid_hash("sceVideoOutGetFlipStatus"));
-    CHECK(res && vbl && cap && issup && setba && regb && setba2 && regb2 && unreg && cfg && flip && fstat,
+    CHECK(res && vbl && cap && issup && setba && regb && setba2 && regb2 && unreg && labels &&
+              cfg && flip && fstat,
           "VideoOut functions registered");
-    if (!(res && vbl && cap && issup && setba && regb && setba2 && regb2 && unreg && cfg && flip && fstat)) {
+    if (!(res && vbl && cap && issup && setba && regb && setba2 && regb2 && unreg && labels &&
+          cfg && flip && fstat)) {
         printf("== FAIL ==\n"); return 1;
     }
+
+    // #394 F4: the query must initialize its output with stable, guest-writable storage for all
+    // 16 buffer labels. A missing handler returned success without touching this pointer.
+    uintptr_t label_address = UINTPTR_MAX;
+    CHECK((uint32_t)labels(0x1001, 0, 0, 0, 0, 0) == 0x80290002u,
+          "GetBufferLabelAddress rejects a null output pointer");
+    CHECK(labels(0x1001, (uint64_t)(uintptr_t)&label_address, 0, 0, 0, 0) == 16 &&
+              label_address != 0 && label_address != UINTPTR_MAX,
+          "GetBufferLabelAddress returns 16 initialized labels");
+    auto* buffer_labels = (uint64_t*)label_address;
+    uintptr_t second_label_address = 0;
+    CHECK(labels(0x1001, (uint64_t)(uintptr_t)&second_label_address, 0, 0, 0, 0) == 16 &&
+              second_label_address == label_address,
+          "GetBufferLabelAddress returns stable storage");
 
     // #394 F3: before any completed flip, -1 is the ABI's "none yet" sentinel for both the argument
     // and current buffer. Zero is valid and used to make a frame pacer advance prematurely.
@@ -126,6 +145,8 @@ int main() {
     CHECK((uint32_t)regb(0x1001, 15, (uint64_t)(uintptr_t)legacy_buffers, 2,
                          (uint64_t)(uintptr_t)legacy_attr, 0) == 0x80290001u,
           "legacy RegisterBuffers rejects a range past slot 15");
+    buffer_labels[2] = 0xAAAA;
+    buffer_labels[3] = 0xBBBB;
     uint64_t legacy_group = regb(0x1001, 2, (uint64_t)(uintptr_t)legacy_buffers, 2,
                                  (uint64_t)(uintptr_t)legacy_attr, 0);
     CHECK(legacy_group == 0, "legacy RegisterBuffers returns the lowest free attribute group");
@@ -133,6 +154,8 @@ int main() {
           prosper_vo_buffer_addr(2) == (uint64_t)(uintptr_t)legacy_fb2 &&
           prosper_vo_buffer_addr(3) == (uint64_t)(uintptr_t)legacy_fb3,
           "legacy RegisterBuffers records the flat framebuffer array at the requested slots");
+    CHECK(buffer_labels[2] == 0 && buffer_labels[3] == 0,
+          "legacy RegisterBuffers resets labels for its registered slots");
     CHECK(prosper_vo_display_width() == 1280 && prosper_vo_display_height() == 720 &&
           prosper_vo_display_format() == 0x80002200u,
           "legacy RegisterBuffers records Gen4 surface geometry and format");
@@ -158,8 +181,13 @@ int main() {
     struct VOB { const void* data; const void* metadata; const void* reserved[2]; };
     uint8_t fb0[16], fb1[16], fb2[16];
     VOB buffers[3] = { {fb0,0,{0,0}}, {fb1,0,{0,0}}, {fb2,0,{0,0}} };
+    buffer_labels[0] = 0x1111;
+    buffer_labels[1] = 0x2222;
+    buffer_labels[2] = 0x3333;
     uint64_t rc = regb2(0x1001, 0 /*set*/, 0 /*start*/, (uint64_t)(uintptr_t)buffers, 3, (uint64_t)(uintptr_t)attr);
     CHECK(rc == 0, "RegisterBuffers2 accepted 3 buffers");
+    CHECK(buffer_labels[0] == 0 && buffer_labels[1] == 0 && buffer_labels[2] == 0,
+          "RegisterBuffers2 resets labels for its registered slots");
 
     // Swapchain scaffolding recorded the surface.
     CHECK(prosper_vo_buffer_count() == 3, "registry recorded 3 display buffers");
@@ -190,8 +218,11 @@ int main() {
           "failed registrations leave all existing slots unchanged");
 
     uint8_t fs[0x40]; memset(fs, 0xEE, sizeof fs);
+    buffer_labels[2] = 1;
     CHECK(flip(0x1001, 2 /*buffer*/, 0 /*mode*/, 0x12345678 /*flipArg*/, 0, 0) == 0,
           "SubmitFlip accepted buffer 2");
+    CHECK(buffer_labels[2] == 1,
+          "first completed flip retains the current buffer label");
     fstat(0x1001, (uint64_t)(uintptr_t)fs, 0, 0, 0, 0);
     CHECK(*(uint64_t*)(fs + 0x00) == 1, "flip status count increments");
     CHECK(*(int64_t*) (fs + 0x18) == 0x12345678, "flip status reports the submitted flipArg");
@@ -221,9 +252,15 @@ int main() {
               prosper_vo_display_width() == 1280 && prosper_vo_display_height() == 720,
           "registry tracks two independently owned buffer sets");
     flip(0x1001, 2 /*set 0 buffer*/, 0, 0, 0, 0);
+    CHECK(buffer_labels[2] == 0,
+          "SubmitFlip releases the previously displayed buffer label");
     CHECK(gpu::present_width() == 1920 && gpu::present_height() == 1080,
           "present uses set 0 geometry when an older set's buffer is flipped");
-    flip(0x1001, 4 /*set 1 buffer*/, 0, 0, 0, 0);
+    buffer_labels[2] = 1;
+    buffer_labels[4] = 1;
+    prosper_vo_flip_from_gpu(0x1001, 4 /*set 1 buffer*/, 0, 0);
+    CHECK(buffer_labels[2] == 0 && buffer_labels[4] == 1,
+          "GPU flip releases the previous label without overwriting the current label");
     CHECK(gpu::present_width() == 1280 && gpu::present_height() == 720,
           "present uses set 1 geometry when its buffer is flipped");
     CHECK(unreg(0x1001, 1 /*set*/, 0, 0, 0, 0) == 0 &&
@@ -232,7 +269,21 @@ int main() {
               prosper_vo_buffer_addr(2) == (uint64_t)(uintptr_t)fb2 &&
               prosper_vo_display_width() == 1920 && prosper_vo_display_height() == 1080,
           "unregistering one set restores the remaining set's range and geometry");
+    CHECK(regb2(0x1001, 1 /*reused set*/, 4 /*reused start*/,
+                (uint64_t)(uintptr_t)high_buffers, 2,
+                (uint64_t)(uintptr_t)high_attr) == 0,
+          "an unregistered buffer range can be registered again");
+    buffer_labels[4] = 1;
+    flip(0x1001, 4 /*new registration in reused slot*/, 0, 0, 0, 0);
+    CHECK(buffer_labels[4] == 1,
+          "first flip of a reused slot retains the new registration's current label");
+    CHECK(unreg(0x1001, 1 /*reused set*/, 0, 0, 0, 0) == 0 &&
+              buffer_labels[4] == 0,
+          "unregistering a displayed slot retires its label identity");
+    buffer_labels[2] = 1;
     flip(0x1001, 2 /*remaining set 0 buffer*/, 0, 0, 0, 0);
+    CHECK(buffer_labels[2] == 1,
+          "first flip after the previous slot is unregistered retains the current label");
     CHECK(gpu::present_width() == 1920 && gpu::present_height() == 1080,
           "present continues with the surviving set after unregister");
     CHECK(unreg(0x1001, 0 /*set*/, 0, 0, 0, 0) == 0 &&
