@@ -136,6 +136,14 @@ std::vector<DynFetch> resolve_dynamic_fetch(const uint32_t* code, size_t dwords,
                                             std::vector<SrtUse>* srt_uses = nullptr,
                                             uint32_t pcrel_dispatch_target = UINT32_MAX);
 
+// Add instruction-provenance compute buffer resources to a metadata-built table. This is the exact
+// buffer-discovery path used by realize_compute_dispatches; it is exposed so tests can assert the
+// final resource identities instead of manually rebuilding a lookalike table. Returned SrtUses also
+// contain image uses, which the production caller materializes with image-specific view handling.
+std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
+                                                 const uint32_t* code, size_t dwords,
+                                                 const uint32_t* user_sgprs, uint32_t nsgpr);
+
 // The dynamic descriptor fold and shader-cache key builder both walk immutable shader instructions
 // on every draw. Cache only the decoded instructions, validating the complete consumed byte range on
 // every hit. Concrete SGPR values and descriptor-table memory remain per-draw inputs to the fold.
