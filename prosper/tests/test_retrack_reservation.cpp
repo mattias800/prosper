@@ -34,6 +34,24 @@ int main() {
           "reserve three uncommitted pages");
     if (!base) return 1;
 
+    // #387 F3: a host protection failure must reach the guest and must not retag the tracked
+    // reservation. The old handler returned success and split/renamed the mapping even though no
+    // host protection changed. Use a span the platform cannot protect as one reservation.
+#ifdef _WIN32
+    const uint64_t invalid_start = base + len - page / 2; // crosses the reserved allocation boundary
+#else
+    const uint64_t invalid_start = base + 1;              // POSIX mprotect requires page alignment
+#endif
+    CHECK((uint32_t)protect(invalid_start, page, 0x2, 0, 0, 0) == 0x80020016u,
+          "mprotect maps an invalid host span to SCE_KERNEL_ERROR_EINVAL");
+    uint8_t failed_info[0x48]{};
+    CHECK(query(base + len - page / 4, 0, (uint64_t)(uintptr_t)failed_info,
+                sizeof(failed_info), 0, 0) == 0 &&
+              *(uint64_t*)(failed_info + 0x00) == base &&
+              *(uint64_t*)(failed_info + 0x08) == base + len &&
+              *(uint32_t*)(failed_info + 0x20) == 0,
+          "failed mprotect leaves reservation tracking unchanged");
+
     const uint64_t middle = base + page;
     CHECK(protect(middle, page, 0x2 /* SCE_KERNEL_PROT_CPU_RW */, 0, 0, 0) == 0,
           "mprotect accepts the middle reservation page");
