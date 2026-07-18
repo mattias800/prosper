@@ -6199,6 +6199,18 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             for (const auto& candidate : ins) if (candidate.pc == target) { restore = &candidate; break; }
             if (!restore || restore->fmt != Rdna2Format::SOP1 || restore->opcode != 0x04 ||
                 restore->dst.value < 126 || !reg_operand(restore->src[0], saveexec.dst.value)) continue;
+            // A lexical save/restore pair is not necessarily balanced along the counted-loop CFG.
+            // In particular, a save in the body with its restore after the backedge leaves EXEC
+            // narrowed between iterations (EXEC has no loop phi), and a zero-trip path reaches an
+            // undominated restore. Accept only a pair contained in one straight-line loop segment,
+            // or a true preheader-to-postloop wrapper around the complete loop.
+            const bool same_preloop = saveexec.pc < L.header_pc && target < L.header_pc;
+            const bool same_condition = saveexec.pc >= L.header_pc && target < L.exit_branch_pc;
+            const bool same_body = saveexec.pc > L.exit_branch_pc && target < L.backedge_pc;
+            const bool same_postloop = saveexec.pc >= L.exit_pc;
+            const bool wraps_loop = saveexec.pc < L.header_pc && target >= L.exit_pc;
+            if (!same_preloop && !same_condition && !same_body && !same_postloop && !wraps_loop)
+                continue;
             bool side_effect_free = true;
             for (const auto& candidate : ins) {
                 if (candidate.pc <= branch.pc || candidate.pc >= target) continue;

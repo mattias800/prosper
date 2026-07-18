@@ -300,6 +300,18 @@ int main() {
                           std::size(guarded_counted_loop_nested_save), 0, 0).empty(),
           "guarded counted loop accepts a balanced nested EXEC guard");
 
+    const uint32_t guarded_counted_loop_cross_backedge[] = {
+        0xBE84247Eu, 0xBF88000Cu,                         // outer guard -> outer restore
+        0xB0020005u, 0xBE800380u, 0x7E020280u,
+        0xBF0A0200u, 0xBF840005u,                         // loop compare/exit
+        0xBE86247Eu, 0xBF880004u,                         // inner restore is after the backedge
+        0x4A020200u, 0x81008100u, 0xBF82FFF9u,
+        0x7E000D01u, 0xBEFE0406u, 0xBEFE0404u, 0xBF810000u,
+    };
+    CHECK(recompile_valu(guarded_counted_loop_cross_backedge,
+                         std::size(guarded_counted_loop_cross_backedge), 0, 0).empty(),
+          "nested EXEC guard crossing the counted-loop backedge is rejected");
+
     const uint32_t guarded_counted_loop_inner_save[] = {
         0xBE84247Eu, 0xBF88000Au,
         0xB0020005u, 0xBE800380u, 0x7E020280u,
