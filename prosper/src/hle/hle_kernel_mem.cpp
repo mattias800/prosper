@@ -1282,7 +1282,8 @@ void register_kernel_mem_hle() {
 //
 // What DIFFERS: the OS primitives. Linux uses mmap over a shared memfd so a phys offset can be
 // mapped at two VAs that ALIAS the same bytes (unified-physical-memory contract). One sparse
-// paging-file section backs the entire pool, matching the POSIX memfd implementation. Windows
+// temporary file backs the entire pool, matching the POSIX memfd implementation without requiring
+// guest-time access violations to commit SEC_RESERVE pages. Windows
 // ordinary file views require 64 KiB-aligned offsets and bases. Modern placeholder replacement
 // removes that restriction: MapViewOfFile3 accepts page-aligned offsets/bases when replacing an
 // exact placeholder, so every 16 KiB guest mapping can preserve physical aliasing. The legacy
@@ -1299,6 +1300,7 @@ void register_kernel_mem_hle() {
 #define _WIN32_WINNT 0x0A00   // Win10: WaitOnAddress/WakeByAddress* need >= 0x0602 (Win8)
 #endif
 #include <windows.h>
+#include <winioctl.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1516,18 +1518,78 @@ namespace {
     constexpr uint64_t kGuestAutoVaMin = 0x2000000000ull;   // 128 GiB
     constexpr uint64_t kGuestAutoVaMax = 0xfbffffffffull;  // inclusive; one byte below a 64 KiB boundary
 
-    // One sparse paging-file section is the Windows equivalent of the POSIX direct-memory memfd.
-    // SEC_RESERVE avoids charging 16 GiB of host commit up front; each view commits only its guest span.
-    HANDLE dmem_section() {
-        static HANDLE section = [] {
-            HANDLE h = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
-                                          PAGE_READWRITE | SEC_RESERVE,
-                                          (DWORD)(kDmemTotal >> 32),
-                                          (DWORD)(kDmemTotal & 0xffffffffu), nullptr);
-            if (!h) MLOG("CreateFileMapping(dmem) failed error=%lu\n", GetLastError());
-            return h;
+    // A paging-file SEC_RESERVE section avoids a 16 GiB commit charge, but every first guest touch
+    // raises a Windows access violation. Windows builds its exception-dispatch frame below RSP
+    // before the VEH runs, overwriting the 128-byte SysV red zone used by unmodified PS5 code.
+    // Back the aperture with a delete-on-close sparse file instead: mapped pages are ordinary
+    // demand-paged file data (MEM_COMMIT from the guest's perspective), untouched ranges consume no
+    // disk clusters, aliases remain coherent, and guest execution never needs a lazy-commit fault.
+    struct DmemSectionState {
+        HANDLE file = INVALID_HANDLE_VALUE;
+        HANDLE section = nullptr;
+    };
+
+    const DmemSectionState& dmem_section_state() {
+        static const DmemSectionState state = [] {
+            wchar_t temp_dir[MAX_PATH + 1]{};
+            wchar_t temp_path[MAX_PATH + 1]{};
+            const DWORD temp_len = GetTempPathW(MAX_PATH, temp_dir);
+            if (temp_len && temp_len <= MAX_PATH &&
+                GetTempFileNameW(temp_dir, L"ps5", 0, temp_path)) {
+                HANDLE file = CreateFileW(
+                    temp_path, GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE |
+                        FILE_FLAG_RANDOM_ACCESS,
+                    nullptr);
+                if (file != INVALID_HANDLE_VALUE) {
+                    DWORD ignored = 0;
+                    LARGE_INTEGER size{};
+                    size.QuadPart = static_cast<LONGLONG>(kDmemTotal);
+                    if (DeviceIoControl(file, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0,
+                                        &ignored, nullptr) &&
+                        SetFilePointerEx(file, size, nullptr, FILE_BEGIN) && SetEndOfFile(file)) {
+                        HANDLE section = CreateFileMappingW(
+                            file, nullptr, PAGE_READWRITE,
+                            static_cast<DWORD>(kDmemTotal >> 32),
+                            static_cast<DWORD>(kDmemTotal & 0xffffffffu), nullptr);
+                        if (section) return DmemSectionState{file, section};
+                    }
+                    CloseHandle(file); // FILE_FLAG_DELETE_ON_CLOSE removes the temporary file.
+                } else {
+                    DeleteFileW(temp_path);
+                }
+            }
+
+            std::fprintf(stderr,
+                         "[memhle] Windows direct memory requires a sparse temporary file\n");
+            return DmemSectionState{};
         }();
-        return section;
+        return state;
+    }
+
+    HANDLE dmem_section() { return dmem_section_state().section; }
+
+    bool ensure_section_pages_committed(uint64_t base, uint64_t len, int hp) {
+        if (!len || base > UINT64_MAX - len) return false;
+        const uint64_t end = base + len;
+        uint64_t cursor = base;
+        while (cursor < end) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(cursor)),
+                              &mbi, sizeof(mbi))) return false;
+            const uint64_t region_end = std::min<uint64_t>(
+                end, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mbi.BaseAddress)) +
+                         mbi.RegionSize);
+            if (region_end <= cursor || mbi.State == MEM_FREE) return false;
+            if (mbi.State == MEM_RESERVE && !VirtualAlloc(
+                    reinterpret_cast<void*>(static_cast<uintptr_t>(cursor)),
+                    static_cast<SIZE_T>(region_end - cursor), MEM_COMMIT,
+                    win_page_prot(hp))) return false;
+            cursor = region_end;
+        }
+        return true;
     }
 
     struct DmemView {
@@ -1809,7 +1871,8 @@ namespace {
         // Placeholder replacement is page-granular, unlike MapViewOfFileEx. Map the guest range
         // directly at its physical-section offset, with no 64 KiB congruence requirement.
         view = map_placeholder_section_view(section, hint, rel, len, requested_align, hp);
-        sparse = placeholder = view != nullptr;
+        placeholder = view != nullptr;
+        sparse = false;
         if (!view) {
             void* requested = nullptr;
             if (hint) {
@@ -1850,7 +1913,9 @@ namespace {
             }
             return nullptr;
         }
-        if (!sparse && !VirtualAlloc(guest, (SIZE_T)len, MEM_COMMIT, PAGE_READWRITE)) {
+        if (!sparse && !ensure_section_pages_committed(
+                           static_cast<uint64_t>(reinterpret_cast<uintptr_t>(guest)),
+                           len, HP_R | HP_W)) {
             MLOG("section commit va=0x%llx len=0x%llx failed error=%lu\n",
                  (unsigned long long)(uintptr_t)guest, (unsigned long long)len, GetLastError());
             UnmapViewOfFile(view);
@@ -2106,7 +2171,9 @@ namespace {
             return;
         }
         uint8_t* bytes = (uint8_t*)view + delta;
-        if (VirtualAlloc(bytes, (SIZE_T)len, MEM_COMMIT, PAGE_READWRITE)) {
+        if (ensure_section_pages_committed(
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(bytes)),
+                len, HP_R | HP_W)) {
             memset(bytes, 0, (size_t)len);
             bool protections_ok = true;
             {
@@ -2548,10 +2615,13 @@ namespace {
             remember_free_placeholder_locked(base, size);
             return false;
         }
-        out = DmemView{base, size, phys, mapped, size, true, true};
-        const uint64_t pages = (size + 0x3fff) / 0x4000;
-        out.committed_pages.resize((pages + 63) / 64);
-        out.page_cache_generation = host::guest_mapping_generation();
+        const bool sparse = false;
+        out = DmemView{base, size, phys, mapped, size, sparse, true};
+        if (sparse) {
+            const uint64_t pages = (size + 0x3fff) / 0x4000;
+            out.committed_pages.resize((pages + 63) / 64);
+            out.page_cache_generation = host::guest_mapping_generation();
+        }
         return true;
     }
 
@@ -2579,9 +2649,8 @@ namespace {
             if (mapped) UnmapViewOfFile(mapped);
             return false;
         }
-        if (!VirtualAlloc(reinterpret_cast<void*>(static_cast<uintptr_t>(original.guest_base)),
-                          static_cast<SIZE_T>(original.guest_size), MEM_COMMIT,
-                          PAGE_READWRITE) ||
+        if (!ensure_section_pages_committed(original.guest_base, original.guest_size,
+                                            HP_R | HP_W) ||
             !restore_view_protections(original)) {
             UnmapViewOfFile(mapped);
             return false;
