@@ -482,7 +482,7 @@ namespace {
 }
 // sceAjmInitialize(s64 reserved, u32* out_context): create a context. Filling out_context is the point.
 HLE(ajm_initialize) {
-    if (!a1) return AJM_ERR_INVALID_PARAMETER;
+    if (a0 != 0 || !a1) return AJM_ERR_INVALID_PARAMETER;
     *(uint32_t*)P(a1) = g_ajm_next.fetch_add(1);
     return 0;
 }

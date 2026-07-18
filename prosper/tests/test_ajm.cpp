@@ -37,6 +37,10 @@ int main() {
     CHECK(init(0, (uint64_t)(uintptr_t)&ctx, 0, 0, 0, 0) == 0, "sceAjmInitialize -> OK");
     CHECK(ctx != 0 && ctx != 0xDEAD, "Initialize WROTE a valid non-zero context (not left garbage)");
     CHECK(init(0, 0, 0, 0, 0, 0) == 0x80930005ull, "Initialize(NULL out) -> INVALID_PARAMETER");
+    uint32_t rejected_ctx = 0xCAFE;
+    CHECK(init(1, (uint64_t)(uintptr_t)&rejected_ctx, 0, 0, 0, 0) == 0x80930005ull,
+          "Initialize(nonzero reserved) -> INVALID_PARAMETER");
+    CHECK(rejected_ctx == 0xCAFE, "invalid Initialize leaves the context output untouched");
 
     // ModuleRegister needs a context.
     CHECK(modreg(ctx, 1 /*At9Dec*/, 0, 0, 0, 0) == 0, "sceAjmModuleRegister(ctx) -> OK");

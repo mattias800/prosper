@@ -308,9 +308,13 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   is easy to get wrong: for example, a regression test with another path that can produce the expected result,
   or a snapshot route or baseline update that needs judgment to confirm it exercises the intended behavior.
   Judge both implementation risk and verification risk, not merely the diff size. Routine, well-bounded,
-  low-risk changes do not require an independent reviewer. The reviewer inspects the assumptions, code, risks,
-  and tests, including whether each regression test would fail without the fix, but does not duplicate the
-  author's builds, tests, snapshots, or CI jobs. Once the author is satisfied and the PR
+  low-risk changes do not require an independent reviewer. Passing author verification does not substitute for
+  review where review is warranted: verification demonstrates observed behavior, while review challenges the
+  contract assumptions, untested paths, and whether the regression actually proves the intended behavior.
+  When uncertain, favor review for reverse-engineered API semantics and other changes where an independent
+  reader can materially challenge the reasoning, even when the patch is small. The reviewer inspects the
+  assumptions, code, risks, and tests, including whether each regression test would fail without the fix, but
+  does not duplicate the author's builds, tests, snapshots, or CI jobs. Once the author is satisfied and the PR
   is published, run author verification and any required review; the author posts exact-head evidence and the
   reviewer posts approval on the corrected exact head. Address every blocking finding and re-review authored
   corrections, then merge only after the merge agent separately confirms author verification, reviewer approval
