@@ -37,6 +37,8 @@ int main() {
     CHECK(init(0, (uint64_t)(uintptr_t)&ctx, 0, 0, 0, 0) == 0, "sceAjmInitialize -> OK");
     CHECK(ctx != 0 && ctx != 0xDEAD, "Initialize WROTE a valid non-zero context (not left garbage)");
     CHECK(init(0, 0, 0, 0, 0, 0) == 0x80930005ull, "Initialize(NULL out) -> INVALID_PARAMETER");
+    CHECK(init(0, 1, 0, 0, 0, 0) == 0x80930005ull,
+          "Initialize(inaccessible out) -> INVALID_PARAMETER without host fault");
     uint32_t rejected_ctx = 0xCAFE;
     CHECK(init(1, (uint64_t)(uintptr_t)&rejected_ctx, 0, 0, 0, 0) == 0x80930005ull,
           "Initialize(nonzero reserved) -> INVALID_PARAMETER");
@@ -51,12 +53,16 @@ int main() {
     CHECK(icreate(ctx, 1 /*At9Dec*/, 0 /*flags*/, (uint64_t)(uintptr_t)&inst, 0, 0) == 0, "sceAjmInstanceCreate -> OK");
     CHECK(inst != 0 && inst != 0xBEEF && inst != ctx, "InstanceCreate WROTE a distinct non-zero instance");
     CHECK(icreate(0, 1, 0, (uint64_t)(uintptr_t)&inst, 0, 0) == 0x80930002ull, "InstanceCreate(ctx 0) -> INVALID_CONTEXT");
+    CHECK(icreate(ctx, 1, 0, 1, 0, 0) == 0x80930005ull,
+          "InstanceCreate(inaccessible out) -> INVALID_PARAMETER without host fault");
 
     // Batch: StartBuffer fills a batch id; Wait completes it.
     uint32_t batch = 0xF00D;
     CHECK(bstart(ctx, 0 /*batch buf*/, 0 /*size*/, 0 /*prio*/, 0 /*err*/, (uint64_t)(uintptr_t)&batch) == 0,
           "sceAjmBatchStartBuffer -> OK");
     CHECK(batch != 0 && batch != 0xF00D, "BatchStartBuffer WROTE a valid non-zero batch id");
+    CHECK(bstart(ctx, 0, 0, 0, 0, 1) == 0x80930005ull,
+          "BatchStartBuffer(inaccessible out) -> INVALID_PARAMETER without host fault");
     CHECK(bwait(ctx, batch, 0, 0, 0, 0) == 0, "sceAjmBatchWait -> OK (batch completed)");
 
     // Teardown.

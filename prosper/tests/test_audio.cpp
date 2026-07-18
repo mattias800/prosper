@@ -74,6 +74,11 @@ int main() {
         CHECK(ch == t.ch); CHECK(f == t.fmt);
     }
 
+    // AudioOut2 shares the guest-store primitive with AJM. Inaccessible outputs must report an
+    // error instead of faulting the host; these cover both fixed-size zero-fill and u64 stores.
+    CHECK((int32_t)call("sceAudioOut2ContextResetParam", 1) == (int32_t)0x80260003);
+    CHECK((int32_t)call("sceAudioOut2ContextQueryMemory", 0, 1) == (int32_t)0x80260003);
+
     // --- 2. open -> handle + backend.open with decoded params --------------------------------
     audio_reset();
     CapturingSink sink; audio_set_sink(&sink);
