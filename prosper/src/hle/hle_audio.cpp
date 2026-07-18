@@ -225,9 +225,11 @@ HLE(audio_get_port_state) {
         memset(st, 0, 0x20);
         *(int16_t*)(st + 4) = 127;   // volume (Kyty AudioOutGetPortState reports 127)
         switch (type) {              // output/channel are port-type dependent (Kyty :432-448)
-            case 3: case 127: /* output=0, channel=0 */ break;
-            case 4:  *(uint16_t*)(st + 0) = 4; st[2] = 1; break;                          // pad speaker
-            default: *(uint16_t*)(st + 0) = 1; st[2] = (uint8_t)(channels > 2 ? 2 : channels); break;
+            case 2: case 3: *(uint16_t*)(st + 0) = 0x40; st[2] = 1; break;                // voice/personal -> headphone
+            case 4:         *(uint16_t*)(st + 0) = 0x04; st[2] = 1; break;                // pad speaker
+            case 127:       *(uint16_t*)(st + 0) = 0x80; break;                           // aux -> external
+            default:        *(uint16_t*)(st + 0) = 0x01;
+                            st[2] = (uint8_t)(channels > 2 ? 2 : channels); break;          // main/bgm -> primary
         }
     }
     return 0;
