@@ -85,6 +85,46 @@ int main() {
         CHECK(gev.udata == kEopUdata, "EOP event echoed the registered udata");
     }
 
+    // VideoOut flip event accessor (#394 F5): the producer stores the submitted flipArg raw in
+    // kevent.data, so GetEventData must preserve all 64 bits rather than decode a packed value.
+    auto addflip   = Hle::lookup(nid_hash("sceVideoOutAddFlipEvent"));
+    auto submitflp = Hle::lookup(nid_hash("sceVideoOutSubmitFlip"));
+    auto vo_evid   = Hle::lookup("U2JJtSqNKZI");
+    auto vo_evdata = Hle::lookup("rWUTcKdkUzQ");
+    CHECK(addflip && submitflp && vo_evid && vo_evdata,
+          "VideoOut flip event producer and accessors registered");
+    if (addflip && submitflp && vo_evid && vo_evdata) {
+        constexpr uint64_t kFlipArg = 0x8000000000001234ull;
+        constexpr uint64_t kFlipUdata = 0xFACEB00Cull;
+        addflip(eq, 0x1001, kFlipUdata, 0, 0, 0);
+        submitflp(0x1001, 0, 0, kFlipArg, 0, 0);
+
+        KEvent fev{}; int32_t fout = -1; uint32_t fcap = 50000;
+        wait(eq, (uint64_t)(uintptr_t)&fev, 1, (uint64_t)(uintptr_t)&fout,
+             (uint64_t)(uintptr_t)&fcap, 0);
+        CHECK(fout == 1 && fev.ident == 0 && fev.filter == -13 && fev.udata == kFlipUdata,
+              "WaitEqueue returns the registered VideoOut flip event");
+        int64_t decoded = 0;
+        CHECK(vo_evid((uint64_t)(uintptr_t)&fev, 0, 0, 0, 0, 0) == 0 &&
+              vo_evdata((uint64_t)(uintptr_t)&fev, (uint64_t)(uintptr_t)&decoded,
+                        0, 0, 0, 0) == 0 &&
+              (uint64_t)decoded == kFlipArg,
+              "VideoOut accessors return flip id and the raw 64-bit flipArg");
+
+        decoded = 0x1122334455667788ll;
+        CHECK((uint32_t)vo_evdata(0, (uint64_t)(uintptr_t)&decoded, 0, 0, 0, 0) ==
+                  0x80290002u && decoded == 0x1122334455667788ll,
+              "GetEventData rejects a null event without changing output");
+        CHECK((uint32_t)vo_evdata((uint64_t)(uintptr_t)&fev, 0, 0, 0, 0, 0) ==
+                  0x80290002u,
+              "GetEventData rejects a null output pointer");
+        KEvent non_video{}; non_video.filter = -14; non_video.data = 0x55;
+        CHECK((uint32_t)vo_evdata((uint64_t)(uintptr_t)&non_video,
+                                  (uint64_t)(uintptr_t)&decoded, 0, 0, 0, 0) ==
+                  0x8029000du && decoded == 0x1122334455667788ll,
+              "GetEventData rejects a non-VideoOut event without changing output");
+    }
+
     // --- Invalid WaitEqueue arguments (#388): num < 1 is EINVAL and a null event array is EFAULT.
     //     Neither failure may consume a ready event; the next valid wait must still receive it.
     {

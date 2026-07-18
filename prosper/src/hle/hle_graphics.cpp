@@ -583,6 +583,20 @@ HLE(g_vo_get_event_id) {
     return (uint64_t)*(const int64_t*)ev;                     // ident: FLIP=0 / VBLANK=1 / ...
 }
 
+// sceVideoOutGetEventData (rWUTcKdkUzQ): return the data carried by a delivered VideoOut kevent.
+// Prosper's producer owns this contract: flip completion posts the submitted flipArg verbatim at
+// SceKernelEvent+0x10, while vblank posts its frame counter there. Do not apply the packed-event
+// decoding used by backends whose producers encode time/count bits into this field.
+HLE(g_vo_get_event_data) {
+    if (!a0 || !a1)
+        return (uint64_t)(int64_t)(int32_t)0x80290002;         // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
+    const uint8_t* ev = (const uint8_t*)(uintptr_t)a0;
+    if (*(const int16_t*)(ev + 8) != -13)
+        return (uint64_t)(int64_t)(int32_t)0x8029000d;         // SCE_VIDEO_OUT_ERROR_INVALID_EVENT
+    *(int64_t*)(uintptr_t)a1 = *(const int64_t*)(ev + 0x10);
+    return 0;
+}
+
 // sceVideoOutSetWindowModeMargins (MTxxrOCeSig — same brute-force naming): windowed-mode margin
 // hint for the system compositor. No compositor here — accept and ignore. CONFIDENCE: HIGH (pure
 // cosmetic setter; success unblocks the caller).
@@ -800,6 +814,7 @@ void register_graphics_hle() {
     RN("utPrVdxio-8", g_vo_get_output_status);        // sceVideoOutGetOutputStatus
     RN("w0hLuNarQxY", g_vo_configure_output);          // sceVideoOutConfigureOutput
     RN("U2JJtSqNKZI", g_vo_get_event_id);              // sceVideoOutGetEventId (#210)
+    RN("rWUTcKdkUzQ", g_vo_get_event_data);            // sceVideoOutGetEventData (#394 F5)
     RN("MTxxrOCeSig", g_vo_set_window_mode_margins);   // sceVideoOutSetWindowModeMargins (#210)
     RN("b0xyllnVY-I", g_gnm_add_eq_event);             // sceGnmAddEqEvent / GraphicsAddEqEvent (GPU EOP)
     #undef R
