@@ -66,6 +66,14 @@ int main() {
     HleFn pread_fn = Hle::lookup(nid_hash("sceKernelPread"));
     HleFn posix_pwrite_fn = Hle::lookup(nid_hash("pwrite"));
     HleFn pwrite_fn = Hle::lookup(nid_hash("sceKernelPwrite"));
+    HleFn posix_readv_fn = Hle::lookup(nid_hash("readv"));
+    HleFn readv_fn = Hle::lookup(nid_hash("sceKernelReadv"));
+    HleFn posix_writev_fn = Hle::lookup(nid_hash("writev"));
+    HleFn writev_fn = Hle::lookup(nid_hash("sceKernelWritev"));
+    HleFn posix_preadv_fn = Hle::lookup(nid_hash("preadv"));
+    HleFn preadv_fn = Hle::lookup(nid_hash("sceKernelPreadv"));
+    HleFn posix_pwritev_fn = Hle::lookup(nid_hash("pwritev"));
+    HleFn pwritev_fn = Hle::lookup(nid_hash("sceKernelPwritev"));
     HleFn posix_lseek_fn = Hle::lookup(nid_hash("lseek"));
     HleFn lseek_fn = Hle::lookup(nid_hash("sceKernelLseek"));
     HleFn close_fn = Hle::lookup(nid_hash("sceKernelClose"));
@@ -84,6 +92,8 @@ int main() {
     HleFn kernel_fcntl_fn = Hle::lookup(nid_hash("sceKernelFcntl"));
     CHECK(posix_open_fn && open_fn && posix_read_fn && read_fn && posix_write_fn && write_fn &&
               posix_pread_fn && pread_fn && posix_pwrite_fn && pwrite_fn && posix_lseek_fn &&
+              posix_readv_fn && readv_fn && posix_writev_fn && writev_fn &&
+              posix_preadv_fn && preadv_fn && posix_pwritev_fn && pwritev_fn &&
               lseek_fn && close_fn && dup_fn && kernel_dup_fn &&
               dup2_fn && kernel_dup2_fn && mkdir_fn && kernel_mkdir_fn && getdents_fn &&
               kernel_getdents_fn && getdirentries_fn && kernel_getdirentries_fn && fstat_fn &&
@@ -468,6 +478,16 @@ int main() {
     check_bad_fd_contract("Pwrite", posix_pwrite_fn, pwrite_fn,
                           (uint64_t)(uintptr_t)io_byte.data(), io_byte.size(), 0);
     check_bad_fd_contract("Lseek", posix_lseek_fn, lseek_fn, 0, SEEK_SET, 0);
+    struct GuestIovec { void* base; size_t len; };
+    GuestIovec io_vector{io_byte.data(), io_byte.size()};
+    check_bad_fd_contract("Readv", posix_readv_fn, readv_fn,
+                          (uint64_t)(uintptr_t)&io_vector, 1, 0);
+    check_bad_fd_contract("Writev", posix_writev_fn, writev_fn,
+                          (uint64_t)(uintptr_t)&io_vector, 1, 0);
+    check_bad_fd_contract("Preadv", posix_preadv_fn, preadv_fn,
+                          (uint64_t)(uintptr_t)&io_vector, 1, 0);
+    check_bad_fd_contract("Pwritev", posix_pwritev_fn, pwritev_fn,
+                          (uint64_t)(uintptr_t)&io_vector, 1, 0);
 
     // A duplicate is a distinct descriptor for the same open file description: it shares the
     // current offset and remains usable after the original descriptor is closed.
