@@ -29,6 +29,8 @@ static int fails = 0;
 static constexpr uint64_t kBase  = 0x10000000ull;
 static constexpr uint64_t kTotal = 16ull * 1024 * 1024 * 1024;
 static constexpr uint64_t kEnd   = kBase + kTotal;
+using Hle7Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t,
+                            uint64_t, uint64_t, uint64_t);
 #ifdef _WIN32
 static constexpr uint64_t kGuestAutoVaMin = 0x2000000000ull;
 static constexpr uint64_t kGuestAutoVaMax = 0xfbffffffffull;
@@ -45,10 +47,14 @@ int main() {
     auto alloc   = Hle::lookup(nid_hash("sceKernelAllocateDirectMemory"));
     auto alloc_main = Hle::lookup(nid_hash("sceKernelAllocateMainDirectMemory"));
     auto map     = Hle::lookup(nid_hash("sceKernelMapDirectMemory"));
+    auto map2    = reinterpret_cast<Hle7Fn>(
+        Hle::lookup(nid_hash("sceKernelMapDirectMemory2")));
     auto protect = Hle::lookup(nid_hash("sceKernelMprotect"));
     auto release = Hle::lookup(nid_hash("sceKernelReleaseDirectMemory"));
     auto query   = Hle::lookup(nid_hash("sceKernelVirtualQuery"));
-    CHECK(reserve && unmap && alloc && alloc_main && map && protect && release && query,
+    CHECK(nid_hash("sceKernelMapDirectMemory2") == "BQQniolj9tQ",
+          "sceKernelMapDirectMemory2 hashes to the PS5 3.20 import NID");
+    CHECK(reserve && unmap && alloc && alloc_main && map && map2 && protect && release && query,
           "memory HLE functions registered");
     if (fails) return 1;
 
@@ -72,7 +78,7 @@ int main() {
           "AllocateDirectMemory(null physAddrOut) -> EINVAL");
     CHECK((uint32_t)alloc_main(dlen, dlen, 0, 0, 0, 0) == 0x80020016u,
           "AllocateMainDirectMemory(null physAddrOut) -> EINVAL");
-    uint64_t phys = 0, va1 = 0, va2 = 0;
+    uint64_t phys = 0, va1 = 0, va2 = 0, va_map2 = 0;
     CHECK(alloc(0, kEnd, dlen, dlen, 0, (uint64_t)(uintptr_t)&phys) == 0 && phys == kBase,
           "allocate one 64 KiB direct-memory page");
     CHECK(map((uint64_t)(uintptr_t)&va1, dlen, 0x2, 0, phys, dlen) == 0 && va1,
@@ -83,10 +89,16 @@ int main() {
 #endif
     CHECK(map((uint64_t)(uintptr_t)&va2, dlen, 0x2, 0, phys, dlen) == 0 && va2 && va2 != va1,
           "map second direct-memory view");
+    CHECK(map2((uint64_t)(uintptr_t)&va_map2, dlen, 0 /* type */, 0x2 /* RW */, 0,
+               phys, dlen) == 0 && va_map2 && va_map2 != va1 && va_map2 != va2,
+          "MapDirectMemory2 consumes shifted prot/flags/phys/alignment arguments");
     if (va1 && va2) {
         *(volatile uint64_t*)(uintptr_t)(va1 + 0x1230) = 0x6310CAFEDEADC0DEull;
         CHECK(*(volatile uint64_t*)(uintptr_t)(va2 + 0x1230) == 0x6310CAFEDEADC0DEull,
               "two virtual mappings of one physical offset alias the same bytes");
+        CHECK(va_map2 && *(volatile uint64_t*)(uintptr_t)(va_map2 + 0x1230) ==
+                         0x6310CAFEDEADC0DEull,
+              "MapDirectMemory2 view aliases the requested physical range");
     }
 
     uint64_t hinted = va1;
@@ -111,6 +123,8 @@ int main() {
     if (va1) CHECK(unmap(va1, dlen, 0, 0, 0, 0) == 0, "unmap first direct-memory view");
     if (va2) CHECK(unmap(va2, dlen, 0, 0, 0, 0) == 0, "unmap second direct-memory view");
     if (va3) CHECK(unmap(va3, dlen, 0, 0, 0, 0) == 0, "unmap reused direct-memory view");
+    if (va_map2) CHECK(unmap(va_map2, dlen, 0, 0, 0, 0) == 0,
+                       "unmap MapDirectMemory2 view");
     if (hinted) CHECK(unmap(hinted, dlen, 0, 0, 0, 0) == 0, "unmap relocated direct-memory view");
     if (reused_phys) release(reused_phys, dlen, 0, 0, 0, 0);
 
@@ -217,9 +231,13 @@ int main() {
     auto alloc   = Hle::lookup(nid_hash("sceKernelAllocateDirectMemory"));
     auto alloc_main = Hle::lookup(nid_hash("sceKernelAllocateMainDirectMemory"));
     auto map     = Hle::lookup(nid_hash("sceKernelMapDirectMemory"));
+    auto map2    = reinterpret_cast<Hle7Fn>(
+        Hle::lookup(nid_hash("sceKernelMapDirectMemory2")));
     auto release = Hle::lookup(nid_hash("sceKernelReleaseDirectMemory"));
-    CHECK(avail && alloc && alloc_main && map && release, "dmem fns registered");
-    if (!(avail && alloc && alloc_main && map && release)) { printf("== FAIL ==\n"); return 1; }
+    CHECK(nid_hash("sceKernelMapDirectMemory2") == "BQQniolj9tQ",
+          "sceKernelMapDirectMemory2 hashes to the PS5 3.20 import NID");
+    CHECK(avail && alloc && alloc_main && map && map2 && release, "dmem fns registered");
+    if (!(avail && alloc && alloc_main && map && map2 && release)) { printf("== FAIL ==\n"); return 1; }
 
     // Both allocation APIs require their physical-address output. Reject before taking from
     // the pool so an unobservable allocation cannot leak capacity.
@@ -301,6 +319,30 @@ int main() {
         CHECK(rr == 0 && va && (va & 0xffff) == 0,
               "map direct memory honors requested 64KiB VA alignment");
         if (va) munmap((void*)(uintptr_t)va, 0x10000);
+        if (p) release(p, 0x10000, 0, 0, 0, 0);
+    }
+
+    // MapDirectMemory2 inserts `type` before prot/flags/phys/alignment. Type zero deliberately
+    // differs from RW protection so an unshifted six-argument alias cannot pass this write/alias
+    // check, and the seventh alignment argument is exercised by the real fixed-arity prototype.
+    {
+        uint64_t p = 0, va = 0, alias = 0;
+        uint64_t rr = alloc(0, kEnd, 0x10000, 0x10000, 0,
+                            (uint64_t)(uintptr_t)&p);
+        CHECK(rr == 0, "allocate direct page for MapDirectMemory2");
+        rr = map2((uint64_t)(uintptr_t)&va, 0x10000, 0 /* type */, 0x2 /* RW */, 0,
+                  p, 0x10000);
+        CHECK(rr == 0 && va && (va & 0xffff) == 0,
+              "MapDirectMemory2 consumes shifted arguments and seventh-argument alignment");
+        rr = map((uint64_t)(uintptr_t)&alias, 0x10000, 0x2, 0, p, 0x10000);
+        CHECK(rr == 0 && alias, "map ordinary alias for MapDirectMemory2 physical range");
+        if (va && alias) {
+            *(volatile uint64_t*)(uintptr_t)(va + 0x120) = 0xB002D1EC7A11A5ull;
+            CHECK(*(volatile uint64_t*)(uintptr_t)(alias + 0x120) == 0xB002D1EC7A11A5ull,
+                  "MapDirectMemory2 maps the requested physical offset as writable shared memory");
+        }
+        if (va) munmap((void*)(uintptr_t)va, 0x10000);
+        if (alias) munmap((void*)(uintptr_t)alias, 0x10000);
         if (p) release(p, 0x10000, 0, 0, 0, 0);
     }
 

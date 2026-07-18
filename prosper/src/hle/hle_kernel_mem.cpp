@@ -37,6 +37,8 @@ namespace prosper {
 
 #define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5)
+#define HLE7(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
+                                       uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 
 namespace {
     bool memlog() { static int v = getenv("PROSPER_MEMLOG") ? 1 : 0; return v; }
@@ -756,6 +758,15 @@ HLE(k_mprotect) {
     retrack_prot(a0, a1, prot, "mprotect");
     return 0;
 }
+
+// sceKernelMapDirectMemory2(void** addrInOut, len, type, prot, flags, phys, align) inserts a
+// memory-type argument before the ordinary mapper's protection argument. The current VA tracker
+// does not expose per-mapping memory types yet, but mapping must still consume the shifted
+// protection/flags/physical-offset/alignment arguments rather than silently returning success.
+HLE7(k_map_dmem2) {
+    (void)a2;   // Memory-type reporting is tracked separately in #387.
+    return k_map_dmem(a0, a1, a3, a4, a5, a6);
+}
 // sceKernelMtypeprotect(addr, size, mtype, prot): apply the CPU protection (arg a3) then set the direct-
 // memory type (a2). Was MISSING -> the stub returned success without applying EITHER, so a later access
 // under the wrong protection faults (write to a still-RO page / exec of a still-NX page) -- the same class
@@ -1212,6 +1223,7 @@ void register_kernel_mem_hle() {
     R("sceKernelAllocateDirectMemory", k_alloc_dmem);
     R("sceKernelAllocateMainDirectMemory", k_alloc_main_dmem);  // 4-arg signature (physOut at arg3)
     R("sceKernelMapDirectMemory", k_map_dmem);
+    R("sceKernelMapDirectMemory2", k_map_dmem2);
     R("sceKernelMapNamedDirectMemory", k_map_dmem);
     R("sceKernelMunmap", k_munmap);
     // sceKernelReleaseFlexibleMemory(addr, len): same shape as munmap (unmap + untrack the flexible range).
@@ -1302,6 +1314,8 @@ namespace prosper {
 
 #define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5)
+#define HLE7(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
+                                       uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 
 namespace {
     bool memlog() { static int v = getenv("PROSPER_MEMLOG") ? 1 : 0; return v; }
@@ -2161,6 +2175,14 @@ HLE(k_map_dmem) {
     return 0;
 }
 
+// sceKernelMapDirectMemory2 inserts `type` before prot/flags/phys/align. Windows uses the same
+// direct-memory view mapper after shifting those arguments; memory-type queries remain separate
+// #387 tracking work.
+HLE7(k_map_dmem2) {
+    (void)a2;
+    return k_map_dmem(a0, a1, a3, a4, a5, a6);
+}
+
 HLE(k_munmap)   { if (!a1) return 0x80020016ull;
                   if (a0) { win_unmap(a0, a1); untrack(a0, a1); } return 0; }
 static uint64_t sce_win_mprotect_error(DWORD error) {
@@ -2398,6 +2420,7 @@ void register_kernel_mem_hle() {
     R("sceKernelAllocateDirectMemory", k_alloc_dmem);
     R("sceKernelAllocateMainDirectMemory", k_alloc_main_dmem);
     R("sceKernelMapDirectMemory", k_map_dmem);
+    R("sceKernelMapDirectMemory2", k_map_dmem2);
     R("sceKernelMapNamedDirectMemory", k_map_dmem);
     R("sceKernelMunmap", k_munmap);
     R("sceKernelReleaseFlexibleMemory", k_munmap);
