@@ -700,7 +700,7 @@ namespace {
     //   EXTRQ   (66 0F 78 /0 ib ib  and  66 0F 79 /r): extract `len` bits at `idx`, zero-extend into low 64.
     // Control for the /78 imm forms is the two trailing imm8s; for the /79 reg forms it comes from the
     // source xmm (EXTRQ: rm[13:0]; INSERTQ: rm[77:64]). len==0 means 64. CONFIDENCE: HIGH
-    // (AMD64 Architecture Programmer's Manual, Volume 3, publication 24592).
+    // (AMD64 Architecture Programmer's Manual, Volume 4, publication 26568).
     volatile unsigned long g_sse4a_emulated = 0;
     const bool g_sse4a_stat = getenv("PROSPER_SSE4A_STAT") != nullptr;
 #ifdef __APPLE__
