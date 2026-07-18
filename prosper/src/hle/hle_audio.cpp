@@ -18,6 +18,14 @@
 #ifndef _WIN32
 #include <sys/uio.h>
 #include <unistd.h>
+#else
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 #include "../host/posix_shim.hpp"   // Darwin: process_vm_readv/writev
 
@@ -316,26 +324,26 @@ std::mutex g_a2_mx;
 A2Context  g_a2_ctx[4];
 uint32_t   g_a2_users = 0, g_a2_ports = 0;
 
-// Fault-safe u64 store to a guest out-pointer (same rationale as apr_write_guest_dst: a bad
-// pointer must fail the call, not SIGSEGV inside the HLE).
-bool a2_store_u64(uint64_t dst, uint64_t v) {
+// Fault-safe store to a guest out-pointer (same rationale as apr_write_guest_dst: a bad pointer
+// must fail the call, not SIGSEGV inside the HLE). WriteProcessMemory validates the complete
+// destination range before copying, matching the all-or-fail process_vm_writev contract here.
+bool audio_store_bytes(uint64_t dst, const void* src, size_t n) {
+    if (!dst || (!src && n)) return false;
+    if (!n) return true;
 #ifndef _WIN32
-    struct iovec l { &v, sizeof v }, r { (void*)(uintptr_t)dst, sizeof v };
-    return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof v;
-#else
-    if (!dst) return false;
-    *(uint64_t*)(uintptr_t)dst = v; return true;
-#endif
-}
-bool a2_store_zeros(uint64_t dst, size_t n) {
-#ifndef _WIN32
-    std::vector<uint8_t> z(n, 0);
-    struct iovec l { z.data(), n }, r { (void*)(uintptr_t)dst, n };
+    struct iovec l { const_cast<void*>(src), n }, r { (void*)(uintptr_t)dst, n };
     return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)n;
 #else
-    if (!dst) return false;
-    memset((void*)(uintptr_t)dst, 0, n); return true;
+    SIZE_T written = 0;
+    return WriteProcessMemory(GetCurrentProcess(), (void*)(uintptr_t)dst, src, n, &written) &&
+           written == n;
 #endif
+}
+bool a2_store_u32(uint64_t dst, uint32_t v) { return audio_store_bytes(dst, &v, sizeof v); }
+bool a2_store_u64(uint64_t dst, uint64_t v) { return audio_store_bytes(dst, &v, sizeof v); }
+bool a2_store_zeros(uint64_t dst, size_t n) {
+    std::vector<uint8_t> z(n, 0);
+    return audio_store_bytes(dst, z.data(), n);
 }
 
 constexpr uint64_t kA2ErrInvalid = (uint64_t)(int64_t)(int32_t)0x80260003;   // AudioOut error space
@@ -483,7 +491,7 @@ namespace {
 // sceAjmInitialize(s64 reserved, u32* out_context): create a context. Filling out_context is the point.
 HLE(ajm_initialize) {
     if (a0 != 0 || !a1) return AJM_ERR_INVALID_PARAMETER;
-    *(uint32_t*)P(a1) = g_ajm_next.fetch_add(1);
+    if (!a2_store_u32(a1, g_ajm_next.fetch_add(1))) return AJM_ERR_INVALID_PARAMETER;
     return 0;
 }
 HLE(ajm_finalize)         { return 0; }
@@ -494,7 +502,7 @@ HLE(ajm_module_unregister){ return 0; }
 HLE(ajm_instance_create) {
     if (!a0) return AJM_ERR_INVALID_CONTEXT;
     if (!a3) return AJM_ERR_INVALID_PARAMETER;
-    *(uint32_t*)P(a3) = g_ajm_next.fetch_add(1);
+    if (!a2_store_u32(a3, g_ajm_next.fetch_add(1))) return AJM_ERR_INVALID_PARAMETER;
     return 0;
 }
 // sceAjmInstanceDestroy(u32 context, u32 instance).
@@ -509,7 +517,7 @@ HLE(ajm_instance_destroy) {
 HLE(ajm_batch_start) {
     if (!a0) return AJM_ERR_INVALID_CONTEXT;
     if (!a5) return AJM_ERR_INVALID_PARAMETER;
-    *(uint32_t*)P(a5) = g_ajm_next.fetch_add(1);
+    if (!a2_store_u32(a5, g_ajm_next.fetch_add(1))) return AJM_ERR_INVALID_PARAMETER;
     return 0;
 }
 HLE(ajm_batch_wait)       { return a0 ? 0 : AJM_ERR_INVALID_CONTEXT; }   // batch completed
