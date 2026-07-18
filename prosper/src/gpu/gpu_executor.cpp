@@ -61,6 +61,7 @@ struct GuestGpuWriteJournal {
 };
 thread_local GuestGpuWriteJournal g_guest_gpu_writes;
 std::atomic<uint64_t> g_next_guest_gpu_submit_serial{0};
+std::atomic<uint64_t> g_next_shader_analysis_identity{0};
 
 bool ranges_overlap(uint64_t a, uint64_t a_size, uint64_t b, uint64_t b_size) {
     if (!a_size || !b_size) return false;
@@ -224,6 +225,60 @@ struct ShaderDecodeCache {
     uint64_t use_counter = 0;
 };
 
+struct ShaderCodeAnalysis {
+    std::vector<uint32_t> code;
+    PcrelDispatchInfo pcrel_dispatch;
+    uint64_t identity = 0;
+    size_t source_dwords = 0;
+    bool bounded_span = false;
+    uint64_t bytes = 0;
+};
+
+struct ShaderCodeAnalysisEntry {
+    std::shared_ptr<const ShaderCodeAnalysis> analysis;
+    uint64_t last_use = 0;
+};
+
+struct ShaderAnalysisCache {
+    std::mutex mutex;
+    std::unordered_map<uintptr_t, ShaderCodeAnalysisEntry> entries;
+    ShaderAnalysisCacheStats stats;
+    uint64_t use_counter = 0;
+};
+
+struct InterpolationCacheKey {
+    uint64_t analysis_identity = 0;
+    PixelSystemInputMapping system_inputs{};
+    bool has_system_inputs = false;
+
+    bool operator==(const InterpolationCacheKey&) const = default;
+};
+
+struct InterpolationCacheKeyHash {
+    size_t operator()(const InterpolationCacheKey& key) const {
+        uint64_t hash = 1469598103934665603ull;
+        hash = hash_mix(hash, key.analysis_identity);
+        hash = hash_mix(hash, key.has_system_inputs);
+        if (key.has_system_inputs) {
+            hash = hash_mix(hash, key.system_inputs.ena);
+            hash = hash_mix(hash, key.system_inputs.addr);
+        }
+        return static_cast<size_t>(hash);
+    }
+};
+
+struct CachedInterpolationLayout {
+    FragmentInterpolationLayout layout;
+    uint64_t last_use = 0;
+};
+
+struct InterpolationCache {
+    std::mutex mutex;
+    std::unordered_map<InterpolationCacheKey, CachedInterpolationLayout,
+                       InterpolationCacheKeyHash> entries;
+    uint64_t use_counter = 0;
+};
+
 struct StageFoldProfileEntry {
     uint64_t code = 0;
     uint32_t user_base = 0;
@@ -320,6 +375,16 @@ void record_stage_fold_profile(uint64_t code, uint32_t user_base, size_t code_dw
 
 ShaderDecodeCache& shader_decode_cache() {
     static ShaderDecodeCache cache;
+    return cache;
+}
+
+ShaderAnalysisCache& shader_analysis_cache() {
+    static ShaderAnalysisCache cache;
+    return cache;
+}
+
+InterpolationCache& interpolation_cache() {
+    static InterpolationCache cache;
     return cache;
 }
 
@@ -434,6 +499,89 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
     return decoded;
 }
 
+uint64_t shader_analysis_cache_limit_bytes() {
+    constexpr uint64_t default_bytes = 64ull * 1024 * 1024;
+    const char* value = getenv("PROSPER_SHADER_ANALYSIS_CACHE_MB");
+    if (!value || !*value) return default_bytes;
+    char* end = nullptr;
+    const unsigned long long mib = strtoull(value, &end, 10);
+    if (end == value || *end != '\0') return default_bytes;
+    return std::min<uint64_t>(mib, 1024ull) * 1024 * 1024;
+}
+
+std::shared_ptr<const ShaderCodeAnalysis> analyze_shader_code_cached(const uint32_t* code,
+                                                                      size_t dwords) {
+    auto analyze = [&] {
+        auto result = std::make_shared<ShaderCodeAnalysis>();
+        result->identity = ++g_next_shader_analysis_identity;
+        result->source_dwords = dwords;
+        const size_t span = rdna2_recompile_code_span(code, dwords);
+        result->bounded_span = span < dwords;
+        if (code && span) result->code.assign(code, code + span);
+        result->pcrel_dispatch = rdna2_pcrel_dispatch_info(code, dwords);
+        result->bytes = static_cast<uint64_t>(result->code.size()) * sizeof(uint32_t) +
+                        static_cast<uint64_t>(result->pcrel_dispatch.target_pcs.size()) *
+                            sizeof(uint32_t) +
+                        static_cast<uint64_t>(result->pcrel_dispatch.setup_pcs.size()) *
+                            sizeof(uint32_t);
+        return result;
+    };
+
+    if (!code || !dwords) return analyze();
+    auto& cache = shader_analysis_cache();
+    if (getenv("PROSPER_NO_SHADER_ANALYSIS_CACHE")) {
+        std::lock_guard lock(cache.mutex);
+        ++cache.stats.bypasses;
+        return analyze();
+    }
+
+    const uintptr_t address = reinterpret_cast<uintptr_t>(code);
+    {
+        std::lock_guard lock(cache.mutex);
+        auto found = cache.entries.find(address);
+        if (found != cache.entries.end()) {
+            const auto& cached = found->second.analysis;
+            const bool compatible_length = cached->bounded_span
+                ? cached->code.size() <= dwords : cached->source_dwords == dwords;
+            const uint64_t code_bytes = static_cast<uint64_t>(cached->code.size()) * sizeof(uint32_t);
+            const bool readable = code_bytes == 0 ||
+                                  (code_bytes <= UINT32_MAX &&
+                                   guest_readable(address, static_cast<uint32_t>(code_bytes)));
+            if (compatible_length && readable &&
+                (code_bytes == 0 ||
+                 memcmp(code, cached->code.data(), static_cast<size_t>(code_bytes)) == 0)) {
+                ++cache.stats.hits;
+                found->second.last_use = ++cache.use_counter;
+                return cached;
+            }
+            cache.stats.bytes -= cached->bytes;
+            cache.entries.erase(found);
+            ++cache.stats.invalidations;
+        }
+        ++cache.stats.misses;
+    }
+
+    auto analysis = analyze();
+    std::lock_guard lock(cache.mutex);
+    constexpr size_t max_entries = 4096;
+    const uint64_t limit = shader_analysis_cache_limit_bytes();
+    while (!cache.entries.empty() &&
+           (cache.entries.size() >= max_entries || cache.stats.bytes + analysis->bytes > limit)) {
+        auto oldest = cache.entries.begin();
+        for (auto it = std::next(cache.entries.begin()); it != cache.entries.end(); ++it)
+            if (it->second.last_use < oldest->second.last_use) oldest = it;
+        cache.stats.bytes -= oldest->second.analysis->bytes;
+        cache.entries.erase(oldest);
+        ++cache.stats.evictions;
+    }
+    if (analysis->bytes <= limit && max_entries != 0) {
+        cache.entries[address] = {analysis, ++cache.use_counter};
+        cache.stats.bytes += analysis->bytes;
+    }
+    cache.stats.entries = cache.entries.size();
+    return analysis;
+}
+
 uint64_t shader_cache_limit_bytes() {
     constexpr uint64_t default_bytes = 128ull * 1024 * 1024;
     const char* value = getenv("PROSPER_SHADER_CACHE_MB");
@@ -461,10 +609,12 @@ struct PcrelDispatchSelection {
 };
 
 PcrelDispatchSelection select_pcrel_dispatch(const uint32_t* code, size_t dwords,
-                                              const ShaderResourceTable* resources) {
+                                              const ShaderResourceTable* resources,
+                                              const ShaderCodeAnalysis* analysis = nullptr) {
     PcrelDispatchSelection selection;
     if (!code || !dwords || !resources) return selection;
-    selection.dispatch = rdna2_pcrel_dispatch_info(code, dwords);
+    selection.dispatch = analysis ? analysis->pcrel_dispatch
+                                  : rdna2_pcrel_dispatch_info(code, dwords);
     if (!selection.dispatch.valid) return selection;
 
     selection.resource = resources->by_sgpr_base_cls(
@@ -515,8 +665,11 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
     if (key.has_pixel_inputs) key.pixel_inputs = *pixel_inputs;
     key.has_system_inputs = stage == ShaderProgramStage::Fragment && system_inputs != nullptr;
     if (key.has_system_inputs) key.system_inputs = *system_inputs;
+    const std::shared_ptr<const ShaderCodeAnalysis> analysis =
+        code && dwords ? analyze_shader_code_cached(code, dwords) : nullptr;
     if (stage == ShaderProgramStage::Fragment && code && dwords && resources) {
-        const PcrelDispatchSelection selection = select_pcrel_dispatch(code, dwords, resources);
+        const PcrelDispatchSelection selection =
+            select_pcrel_dispatch(code, dwords, resources, analysis.get());
         const PcrelDispatchInfo& dispatch = selection.dispatch;
         if (dispatch.valid) {
             if (selection.target != UINT32_MAX) {
@@ -548,12 +701,11 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             }
         }
     }
-    if (code && dwords) {
+    if (analysis) {
         // Most shaders end at S_ENDPGM. A compiler-generated s_getpc_b64 V# may instead address an
         // embedded lookup table after ENDPGM; retain that proven tail so cached recompilation sees the
         // same blob as the direct path and table contents participate in the cache identity.
-        const size_t span = rdna2_recompile_code_span(code, dwords);
-        key.code.assign(code, code + span);
+        key.code = analysis->code;
     }
     if (resources) {
         key.resources.reserve(resources->resources.size());
@@ -641,6 +793,63 @@ void clear_shader_decode_cache() {
     cache.entries.clear();
     cache.stats = {};
     cache.use_counter = 0;
+}
+
+ShaderAnalysisCacheStats shader_analysis_cache_stats() {
+    auto& cache = shader_analysis_cache();
+    std::lock_guard lock(cache.mutex);
+    ShaderAnalysisCacheStats stats = cache.stats;
+    stats.entries = cache.entries.size();
+    return stats;
+}
+
+void clear_shader_analysis_cache() {
+    {
+        auto& cache = shader_analysis_cache();
+        std::lock_guard lock(cache.mutex);
+        cache.entries.clear();
+        cache.stats = {};
+        cache.use_counter = 0;
+    }
+    {
+        auto& cache = interpolation_cache();
+        std::lock_guard lock(cache.mutex);
+        cache.entries.clear();
+        cache.use_counter = 0;
+    }
+}
+
+FragmentInterpolationLayout fragment_interpolation_layout_cached(
+        const uint32_t* code, size_t dwords,
+        const PixelSystemInputMapping* system_inputs) {
+    const auto analysis = analyze_shader_code_cached(code, dwords);
+    if (!analysis || getenv("PROSPER_NO_SHADER_ANALYSIS_CACHE"))
+        return fragment_interpolation_layout(code, dwords, system_inputs);
+
+    InterpolationCacheKey key;
+    // Use the immutable analysis version, without retaining its shader-byte allocation beyond the
+    // analysis cache's own memory bound. A same-address shader mutation receives a new identity.
+    key.analysis_identity = analysis->identity;
+    key.has_system_inputs = system_inputs != nullptr;
+    if (system_inputs) key.system_inputs = *system_inputs;
+    auto& cache = interpolation_cache();
+    std::lock_guard lock(cache.mutex);
+    auto found = cache.entries.find(key);
+    if (found != cache.entries.end()) {
+        found->second.last_use = ++cache.use_counter;
+        return found->second.layout;
+    }
+    const FragmentInterpolationLayout layout =
+        fragment_interpolation_layout(code, dwords, system_inputs);
+    constexpr size_t max_entries = 4096;
+    while (cache.entries.size() >= max_entries && !cache.entries.empty()) {
+        auto oldest = cache.entries.begin();
+        for (auto it = std::next(cache.entries.begin()); it != cache.entries.end(); ++it)
+            if (it->second.last_use < oldest->second.last_use) oldest = it;
+        cache.entries.erase(oldest);
+    }
+    cache.entries.emplace(std::move(key), CachedInterpolationLayout{layout, ++cache.use_counter});
+    return layout;
 }
 
 std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
@@ -990,7 +1199,8 @@ size_t registered_shader_dwords(const AgcShaderHeader& header, uint64_t code_add
 std::vector<DynFetch>
 resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_sgprs, uint32_t nsgpr,
                       uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses,
-                      uint32_t pcrel_dispatch_target) {
+                      uint32_t pcrel_dispatch_target,
+                      const PcrelDispatchInfo* pcrel_dispatch) {
     using FoldClock = std::chrono::steady_clock;
     static const bool profile_fold = std::getenv("PROSPER_STAGE_FOLD_PROFILE") != nullptr;
     const auto fold_start = profile_fold ? FoldClock::now() : FoldClock::time_point{};
@@ -1004,7 +1214,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     const std::vector<Rdna2Inst>* fold_instructions = &decoded->instructions;
     if (pcrel_dispatch_target != UINT32_MAX) {
         specialized = decoded->instructions;
-        const PcrelDispatchInfo dispatch = rdna2_pcrel_dispatch_info(code, dwords);
+        const PcrelDispatchInfo dispatch = pcrel_dispatch
+            ? *pcrel_dispatch : rdna2_pcrel_dispatch_info(code, dwords);
         if (!rdna2_specialize_pcrel_dispatch(specialized, dispatch,
                                              pcrel_dispatch_target)) {
             // The fragment recompiler will reject the same unprovable specialization. Do not walk all
@@ -1880,15 +2091,19 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     ShaderResourceTable primary_resources =
         build_shader_resources(*hdr, primary_sgprs, kUserSgprs, user_sgpr_base);
     PcrelDispatchSelection dispatch_selection;
+    std::shared_ptr<const ShaderCodeAnalysis> shader_analysis;
     if (is_ps) {
+        shader_analysis = analyze_shader_code_cached(
+            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)), shader_dwords);
         dispatch_selection = select_pcrel_dispatch(
-            (const uint32_t*)(uintptr_t)code_addr, shader_dwords, &primary_resources);
+            (const uint32_t*)(uintptr_t)code_addr, shader_dwords, &primary_resources,
+            shader_analysis.get());
     }
     const auto metadata_done = phase_timing ? StageClock::now() : StageClock::time_point{};
     if (is_ps) {
         dyn_vb = resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
                                        primary_sgprs, kUserSgprs, 0, &srt_uses,
-                                       dispatch_selection.target);
+                                       dispatch_selection.target, &dispatch_selection.dispatch);
     } else {
         // NGG merged VS/GS: s0..s7 are system SGPRs, user data starts at s8 (confirmed by matching the
         // shader's s[8:11]/s[24:25] descriptor pointers to the register file at GS_0+offset).

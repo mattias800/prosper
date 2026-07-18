@@ -138,7 +138,8 @@ std::vector<DynFetch> resolve_dynamic_fetch(const uint32_t* code, size_t dwords,
                                             const uint32_t* user_sgprs, uint32_t nsgpr,
                                             uint32_t user_sgpr_base,
                                             std::vector<SrtUse>* srt_uses = nullptr,
-                                            uint32_t pcrel_dispatch_target = UINT32_MAX);
+                                            uint32_t pcrel_dispatch_target = UINT32_MAX,
+                                            const PcrelDispatchInfo* pcrel_dispatch = nullptr);
 
 // Add instruction-provenance compute buffer resources to a metadata-built table. This is the exact
 // buffer-discovery path used by realize_compute_dispatches; it is exposed so tests can assert the
@@ -162,6 +163,21 @@ struct ShaderDecodeCacheStats {
 };
 ShaderDecodeCacheStats shader_decode_cache_stats();
 void clear_shader_decode_cache();
+
+// Immutable shader analysis shared by resource folding, interpolation discovery, and recompile-key
+// construction. Hits validate the complete code/table span byte-for-byte before reusing its bounds
+// and PC-relative dispatch metadata.
+struct ShaderAnalysisCacheStats {
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t bypasses = 0;
+    uint64_t invalidations = 0;
+    uint64_t evictions = 0;
+    uint64_t entries = 0;
+    uint64_t bytes = 0;
+};
+ShaderAnalysisCacheStats shader_analysis_cache_stats();
+void clear_shader_analysis_cache();
 
 // PROSPER_DYNTRACE_FAIL support (gpu_executor.cpp): while true, resolve_dynamic_fetch traces its
 // walk and build_stage_table dumps the user-data SGPR blocks. realize_draw_item sets it around a
@@ -256,6 +272,10 @@ std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
                                                        uint64_t* cache_identity = nullptr);
 ShaderRecompileCacheStats shader_recompile_cache_stats();
 void clear_shader_recompile_cache();
+
+FragmentInterpolationLayout fragment_interpolation_layout_cached(
+    const uint32_t* code, size_t dwords,
+    const PixelSystemInputMapping* system_inputs = nullptr);
 
 struct DrawRealizationPhaseStats {
     uint64_t draws = 0;
@@ -547,7 +567,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     const PixelSystemInputMapping* system_input_ptr =
         (system_inputs.ena || system_inputs.addr) ? &system_inputs : nullptr;
     const ResolvedPipelineState resolved_pipeline = resolve_pipeline_state(rs);
-    const FragmentInterpolationLayout interpolation = fragment_interpolation_layout(
+    const FragmentInterpolationLayout interpolation = fragment_interpolation_layout_cached(
         reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.ps_addr)),
         max_shader_dwords, system_input_ptr);
     uint64_t vs_identity = 0, fs_identity = 0;

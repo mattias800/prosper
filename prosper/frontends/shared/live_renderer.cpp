@@ -641,7 +641,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             static std::vector<uint8_t> persistent_validation_scratch;
             const size_t persistent_decode_limit = [] {
                 const char* value = getenv("PROSPER_TEXTURE_DECODE_CACHE_MB");
-                const uint64_t mib = value ? strtoull(value, nullptr, 10) : 256ull;
+                const uint64_t mib = value ? strtoull(value, nullptr, 10) : 1024ull;
                 return static_cast<size_t>(std::min<uint64_t>(mib, SIZE_MAX / (1024ull * 1024ull))) *
                        1024ull * 1024ull;
             }();
@@ -734,29 +734,45 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const bool is_volume = r.img_dim == 2u;
                         const uint32_t persistent_pitch = getenv("PROSPER_PITCH")
                             ? static_cast<uint32_t>(atoi(getenv("PROSPER_PITCH"))) : 0;
-                        const bool persistent_rgba_texture =
+                        const uint32_t persistent_bc_block_bytes =
+                            prosper::gpu::bc_block_bytes(r.format);
+                        const bool persistent_unorm8_texture =
+                            r.format == prosper::gpu::DataFormat::Unorm8 &&
+                            r.num_components >= 1 && r.num_components <= 4;
+                        const bool persistent_sampled_texture =
                             !has_live_rtt && !r.host_data && r.img_dim == 1u &&
                             r.cls == RC::Texture &&
-                            r.format == prosper::gpu::DataFormat::Unorm8 &&
-                            r.num_components == 4;
+                            (persistent_unorm8_texture || persistent_bc_block_bytes != 0);
                         const bool persistent_source_is_tiled =
-                            persistent_rgba_texture && !getenv("PROSPER_NODETILE") &&
+                            persistent_sampled_texture && !getenv("PROSPER_NODETILE") &&
                             prosper::gpu::tile_mode_is_tiled(r.tile_mode);
                         const bool persistent_source_matches_pixels =
-                            persistent_rgba_texture &&
+                            persistent_unorm8_texture && r.num_components == 4 &&
                             !prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
                             (!getenv("PROSPER_DETILE") || atoi(getenv("PROSPER_DETILE")) == 0);
+                        const size_t persistent_source_size = [&] {
+                            if (!persistent_sampled_texture) return size_t{0};
+                            if (persistent_bc_block_bytes) {
+                                const uint32_t bw = (tw + 3) / 4;
+                                const uint32_t bh = (th + 3) / 4;
+                                return persistent_source_is_tiled
+                                    ? prosper::gpu::tiled_elements_bytes(
+                                          bw, bh, persistent_bc_block_bytes, r.tile_mode)
+                                    : static_cast<size_t>(bw) * bh * persistent_bc_block_bytes;
+                            }
+                            const uint32_t source_bpt = r.num_components;
+                            if (persistent_source_is_tiled)
+                                return prosper::gpu::tiled_surface_bytes(
+                                    tw, th, r.tile_mode, persistent_pitch, source_bpt);
+                            // Forced detiling treats a nominally linear Unorm8x4 descriptor as tiled.
+                            // Its decode source is therefore not the linear byte range computed here.
+                            if (source_bpt == 4 && !persistent_source_matches_pixels) return size_t{0};
+                            return static_cast<size_t>(tw) * th * source_bpt;
+                        }();
                         const bool persistent_cache_eligible = !fr.is_storage_image &&
                             !getenv("PROSPER_NO_TEXTURE_DECODE_CACHE") &&
                             !r.compression_enabled &&
-                            persistent_decode_limit &&
-                            (persistent_source_is_tiled || persistent_source_matches_pixels);
-                        const size_t persistent_source_size = persistent_source_matches_pixels
-                            ? static_cast<size_t>(tw) * th * 4
-                            : (persistent_source_is_tiled
-                                ? prosper::gpu::tiled_surface_bytes(
-                                      tw, th, r.tile_mode, persistent_pitch)
-                                : 0);
+                            persistent_decode_limit && persistent_source_size != 0;
                         static const bool cross_submit_watch_enabled =
                             !getenv("PROSPER_NO_CROSS_SUBMIT_TEXTURE_WRITE_WATCH");
                         static const bool audit_cross_submit_watch =

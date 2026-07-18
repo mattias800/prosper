@@ -251,13 +251,15 @@ graphics and compute pools. Decoded texture scratch vectors are also retained ac
 are storage only, and every partial decode/read explicitly clears its unwritten tail.
 
 Within one renderer callback, repeated guest-backed texture descriptions reuse the first decoded
-pixel buffer. A bounded process-wide cache also covers guest-backed linear and tiled `Unorm8x4`
-sampled textures, the common sprite-atlas cases. Every cross-submit lookup compares the complete guest
-source before reusing decoded pixels; the linear path compares directly against its decoded copy while
-the tiled path retains and compares the padded tiled source. Changed bytes, a changed mapping extent,
-or address reuse invalidates the entry and creates a new content-version ID. Live render targets,
-storage images, captured host backing, and other formats remain excluded. The default budget is
-256 MiB; use `PROSPER_TEXTURE_DECODE_CACHE_MB=<MiB>` to change it or
+pixel buffer. A bounded process-wide cache also covers guest-backed linear and tiled 2D sampled
+textures in `Unorm8` component widths 1-4 and BC1-BC7 formats. Every cross-submit lookup validates
+the exact source range before reusing decoded pixels: direct narrow sources compare their native
+bytes, tiled sources retain the padded tiled range, and block-compressed sources use their exact
+block dimensions and block size. Changed bytes, mapping/readability changes, or address reuse
+invalidates the entry and creates a new content-version ID. Live render targets, storage images,
+captured host backing, cube/volume textures, DCC surfaces, and other formats remain excluded. The
+default budget is 1 GiB, which covers Evergate's measured 835 MiB working set; use
+`PROSPER_TEXTURE_DECODE_CACHE_MB=<MiB>` to change it or
 `PROSPER_NO_TEXTURE_DECODE_CACHE=1` for an A/B run. Timing reports cross-submit `texture_cache`
 hits/misses/invalidations separately from `textures` (all texture uses) and `reused` (both local and
 persistent decodes avoided).
@@ -279,6 +281,13 @@ current guest addresses and backing data remain on each draw and are never cache
 `PROSPER_SHADER_CACHE_MB=<MiB>` to change the byte budget. `test_shader_recompile_cache` compares
 every tested miss byte-for-byte with the direct recompiler and verifies that runtime-only resource
 changes hit while descriptor-interface changes miss.
+
+Shader code span, PC-relative dispatch metadata, and fragment interpolation discovery use a separate
+64 MiB immutable-analysis cache. Every lookup validates the complete instruction/embedded-table span
+byte-for-byte, so same-address shader patching invalidates the entry. Concrete user SGPRs, descriptor
+table bytes, guest addresses, and resource backing remain per-draw inputs and are never reused by this
+cache. Set `PROSPER_NO_SHADER_ANALYSIS_CACHE=1` for the direct-analysis A/B or
+`PROSPER_SHADER_ANALYSIS_CACHE_MB=<MiB>` to change its budget.
 
 The Vulkan backend retains graphics pipelines across render-target calls. Live draws carry a
 process-unique, never-recycled identity from the exact shader cache, so a hot lookup does not copy or

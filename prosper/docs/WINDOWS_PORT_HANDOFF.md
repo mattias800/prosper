@@ -215,12 +215,18 @@ bytes plus descriptor-interface semantics; `PROSPER_NO_SHADER_CACHE=1` disables 
 miss compilation time. Run `test_shader_recompile_cache` after changing the key or recompiler contract.
 Frontend windows also report texture resource uses as `textures` and callback-local duplicate decodes
 avoided as `reused`, plus exact-byte cross-submit `texture_cache` hits/misses/invalidations. The persistent
-cache is limited to guest-backed tiled `Unorm8x4` sampled textures and defaults to 256 MiB; use
+cache covers guest-backed linear/tiled 2D `Unorm8` (1-4 components) and BC1-BC7 sampled textures and
+defaults to 1 GiB; use
 `PROSPER_NO_TEXTURE_DECODE_CACHE=1` for an A/B or `PROSPER_TEXTURE_DECODE_CACHE_MB=<MiB>` to change the
 budget. Do not infer descriptor-table
 identity from shader/user-SGPR values alone:
 pointed-to guest memory is mutable, and that cache experiment stalled Messenger at its loading screen.
 See `FRONTEND_APP.md` for the invalidation requirement.
+
+Immutable shader span/dispatch/interpolation analysis is separately byte-validated and bounded to
+64 MiB. `PROSPER_NO_SHADER_ANALYSIS_CACHE=1` restores direct analysis for an A/B;
+`PROSPER_SHADER_ANALYSIS_CACHE_MB=<MiB>` changes the bound. This cache never stores concrete user
+SGPR or descriptor-table contents.
 
 Diagnostics (env, all off by default): `PROSPER_GFXLOG` (`[gfx]`/`[agc]` PM4 decode + the `NOT satisfied`
 fence log), `PROSPER_EVLOG` (`[ev]` equeue/flip/EOP), `PROSPER_SYNCLOG` (`[sync]` WaitOnAddress/Wake with
