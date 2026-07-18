@@ -37,6 +37,20 @@ int main() {
     CHECK(res && vbl && cap && issup && setba2 && regb2 && cfg && flip && fstat, "VideoOut functions registered");
     if (!(res && vbl && cap && issup && setba2 && regb2 && cfg && flip && fstat)) { printf("== FAIL ==\n"); return 1; }
 
+    // #394 F3: before any completed flip, -1 is the ABI's "none yet" sentinel for both the argument
+    // and current buffer. Zero is valid and used to make a frame pacer advance prematurely.
+    uint8_t initial_fs[0x48]; memset(initial_fs, 0xEE, sizeof initial_fs);
+    CHECK(fstat(0x1001, (uint64_t)(uintptr_t)initial_fs, 0, 0, 0, 0) == 0,
+          "initial GetFlipStatus succeeds");
+    CHECK(*(uint64_t*)(initial_fs + 0x00) == 0 &&
+          *(int64_t*)(initial_fs + 0x18) == -1 &&
+          *(int32_t*)(initial_fs + 0x38) == -1,
+          "initial flip status reports count=0 and -1 argument/buffer sentinels");
+    bool initial_tail_untouched = true;
+    for (size_t i = 0x40; i < sizeof initial_fs; ++i)
+        initial_tail_untouched &= initial_fs[i] == 0xEE;
+    CHECK(initial_tail_untouched, "GetFlipStatus writes exactly its 0x40-byte ABI struct");
+
     // Resolution: real 1080p @ 59.94Hz (refresh enum 3), not zeroed.
     uint8_t rs[0x20]; memset(rs, 0xEE, sizeof rs);
     res(0x1001, (uint64_t)(uintptr_t)rs, 0, 0, 0, 0);

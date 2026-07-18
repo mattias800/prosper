@@ -72,8 +72,11 @@ namespace {
     // believe a flip completed with the wrong arg; concurrent flips could lose an increment.
     std::mutex g_flip_mx;
     uint64_t g_flip_count = 0;      // incremented per flip so GetFlipStatus shows progress
-    int32_t  g_current_buffer = 0;
-    int64_t  g_last_flip_arg = 0;
+    // The VideoOut ABI uses -1 for both fields until the first completed flip. Zero is a valid
+    // buffer index/argument, so exposing zero early can fool a frame pacer into consuming a flip
+    // that never happened (#394 F3).
+    int32_t  g_current_buffer = -1;
+    int64_t  g_last_flip_arg = -1;
     void flip_advance(int32_t bufidx, int64_t flip_arg) {
         std::lock_guard<std::mutex> lk(g_flip_mx);
         g_flip_count++;
