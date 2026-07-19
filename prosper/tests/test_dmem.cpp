@@ -235,24 +235,35 @@ int main() {
               *(int32_t*)(direct_info + 0x1c) == 9 &&
               *(uint32_t*)(direct_info + 0x20) == 0x12,
           "Mtypeprotect preserves the carved page's physical offset and publishes its type");
+    CHECK(mtypeprotect(va1 + 0x4000, 0, 14, 0x2, 0, 0) == 0,
+          "aligned zero-length Mtypeprotect is a successful no-op");
+    memset(direct_info, 0, sizeof(direct_info));
+    CHECK(query(va1 + 0x5000, 0, (uint64_t)(uintptr_t)direct_info,
+                sizeof(direct_info), 0, 0) == 0 &&
+              *(int32_t*)(direct_info + 0x18) == 0x1 &&
+              *(int32_t*)(direct_info + 0x1c) == 9,
+          "zero-length Mtypeprotect leaves protection and type metadata unchanged");
 
     alignas(8) uint8_t type_entry[0x20]{};
-    *(uint64_t*)(type_entry + 0x00) = va1 + 0x8000;
-    *(uint64_t*)(type_entry + 0x10) = 0x4000;
+    *(uint64_t*)(type_entry + 0x00) = va1 + 0x8123;
+    *(uint64_t*)(type_entry + 0x10) = 0x100;
     type_entry[0x18] = 0x2;
     type_entry[0x19] = 11;
     *(int32_t*)(type_entry + 0x1c) = 4; // TYPE_PROTECT
     int32_t type_done = -1;
     CHECK(batch((uint64_t)(uintptr_t)type_entry, 1,
                 (uint64_t)(uintptr_t)&type_done, 0, 0, 0) == 0 && type_done == 1,
-          "BatchMap TYPE_PROTECT changes one direct-mapping page");
+          "BatchMap TYPE_PROTECT accepts an unaligned sub-page range");
     memset(direct_info, 0, sizeof(direct_info));
     CHECK(query(va1 + 0x9000, 0, (uint64_t)(uintptr_t)direct_info,
                 sizeof(direct_info), 0, 0) == 0 &&
+              *(uint64_t*)(direct_info + 0x00) == va1 + 0x8000 &&
+              *(uint64_t*)(direct_info + 0x08) == va1 + 0xc000 &&
               *(uint64_t*)(direct_info + 0x10) == phys + 0x8000 &&
+              *(int32_t*)(direct_info + 0x18) == 0x2 &&
               *(int32_t*)(direct_info + 0x1c) == 11 &&
               *(uint32_t*)(direct_info + 0x20) == 0x12,
-          "BatchMap TYPE_PROTECT publishes the carved page's offset and type");
+          "BatchMap TYPE_PROTECT normalizes protection and metadata to the guest page");
     memset(direct_info, 0, sizeof(direct_info));
     CHECK(query(va1 + 0xd000, 0, (uint64_t)(uintptr_t)direct_info,
                 sizeof(direct_info), 0, 0) == 0 &&
@@ -759,22 +770,32 @@ int main() {
                   *(int32_t*)(info + 0x1c) == 9 &&
                   *(uint32_t*)(info + 0x20) == 0x12,
               "Mtypeprotect publishes the carved page's rebased offset and type");
+        CHECK(mtypeprotect(va + 0x4000, 0, 14, 0x2, 0, 0) == 0,
+              "aligned zero-length Mtypeprotect is a successful no-op");
+        memset(info, 0, sizeof(info));
+        CHECK(query(va + 0x5000, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
+                  *(int32_t*)(info + 0x18) == 0x1 &&
+                  *(int32_t*)(info + 0x1c) == 9,
+              "zero-length Mtypeprotect leaves protection and type metadata unchanged");
 
         alignas(8) uint8_t type_entry[0x20]{};
-        *(uint64_t*)(type_entry + 0x00) = va + 0x8000;
-        *(uint64_t*)(type_entry + 0x10) = 0x4000;
+        *(uint64_t*)(type_entry + 0x00) = va + 0x8123;
+        *(uint64_t*)(type_entry + 0x10) = 0x100;
         type_entry[0x18] = 0x2;
         type_entry[0x19] = 11;
         *(int32_t*)(type_entry + 0x1c) = 4; // TYPE_PROTECT
         int32_t type_done = -1;
         CHECK(batch((uint64_t)(uintptr_t)type_entry, 1,
                     (uint64_t)(uintptr_t)&type_done, 0, 0, 0) == 0 && type_done == 1,
-              "BatchMap TYPE_PROTECT changes one direct-mapping page");
+              "BatchMap TYPE_PROTECT accepts an unaligned sub-page range");
         memset(info, 0, sizeof(info));
         CHECK(query(va + 0x9000, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
+                  *(uint64_t*)(info + 0x00) == va + 0x8000 &&
+                  *(uint64_t*)(info + 0x08) == va + 0xc000 &&
                   *(uint64_t*)(info + 0x10) == p + 0x8000 &&
+                  *(int32_t*)(info + 0x18) == 0x2 &&
                   *(int32_t*)(info + 0x1c) == 11,
-              "BatchMap TYPE_PROTECT publishes its carved offset and type");
+              "BatchMap TYPE_PROTECT normalizes protection and metadata to the guest page");
         memset(info, 0, sizeof(info));
         CHECK(query(va + 0xd000, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
                   *(uint64_t*)(info + 0x10) == p + 0xc000 &&

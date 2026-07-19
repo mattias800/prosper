@@ -58,7 +58,7 @@ namespace {
         if (raw_end > UINT64_MAX - mask) return false;
         const uint64_t base = addr & ~mask;
         const uint64_t end = (raw_end + mask) & ~mask;
-        if (end <= base) return false;
+        if (end < base) return false;
         base_out = base;
         len_out = end - base;
         return true;
@@ -977,6 +977,7 @@ HLE(k_mtypeprotect) {
     if (!a0) return 0x80020016ull;
     uint64_t base = 0, len = 0;
     if (!normalize_guest_page_range(a0, a1, base, len)) return 0x80020016ull;
+    if (!len) return 0;
     const int prot = host_prot(a3);
     if (mprotect((void*)base, len, prot) != 0) return sce_mprotect_error(errno);
     retrack_prot(base, len, prot, static_cast<uint32_t>(a3), "mtypeprotect");
@@ -1415,12 +1416,22 @@ HLE(k_batch_map) {
             case 1: if (start) { munmap((void*)(uintptr_t)start, len); untrack(start, len); } break;  // UNMAP
             case 2: case 4: {                                                            // PROTECT / TYPE_PROTECT
                 if (start) {
-                    if (mprotect((void*)(uintptr_t)start, len, host_prot(prot)) != 0) {
+                    uint64_t protect_start = start, protect_len = len;
+                    if (op == 4 && !normalize_guest_page_range(
+                                       start, len, protect_start, protect_len)) {
+                        ok = false;
+                        ret = 0x80020016ull;
+                        break;
+                    }
+                    if (!protect_len) break;
+                    if (mprotect((void*)(uintptr_t)protect_start, protect_len,
+                                 host_prot(prot)) != 0) {
                         ok = false;
                         ret = sce_mprotect_error(errno);
                     } else {
-                        retrack_prot(start, len, host_prot(prot), prot, "batch-prot");
-                        if (op == 4) retrack_type(start, len, type);
+                        retrack_prot(protect_start, protect_len, host_prot(prot), prot,
+                                     "batch-prot");
+                        if (op == 4) retrack_type(protect_start, protect_len, type);
                     }
                 }
                 break;
@@ -1568,7 +1579,7 @@ namespace {
         if (raw_end > UINT64_MAX - mask) return false;
         const uint64_t base = addr & ~mask;
         const uint64_t end = (raw_end + mask) & ~mask;
-        if (end <= base) return false;
+        if (end < base) return false;
         base_out = base;
         len_out = end - base;
         return true;
@@ -3725,6 +3736,7 @@ HLE(k_mtypeprotect) {
     if (!a0) return 0x80020016ull;
     uint64_t base = 0, len = 0;
     if (!normalize_guest_page_range(a0, a1, base, len)) return 0x80020016ull;
+    if (!len) return 0;
     const int prot = host_prot(a3);
     DWORD error = ERROR_SUCCESS;
     if (!win_protect(base, len, prot, &error)) return sce_win_mprotect_error(error);
@@ -3796,11 +3808,20 @@ HLE(k_batch_map) {
             }
             case 2: case 4: {                                                            // PROTECT / TYPE_PROTECT
                 if (start) {
+                    uint64_t protect_start = start, protect_len = len;
+                    if (op == 4 && !normalize_guest_page_range(
+                                       start, len, protect_start, protect_len)) {
+                        ok = false;
+                        ret = 0x80020016ull;
+                        break;
+                    }
+                    if (!protect_len) break;
                     DWORD error = ERROR_SUCCESS;
-                    ok = win_protect(start, len, host_prot(prot), &error);
+                    ok = win_protect(protect_start, protect_len, host_prot(prot), &error);
                     if (ok) {
-                        retrack_prot(start, len, host_prot(prot), prot, "batch-prot");
-                        if (op == 4) retrack_type(start, len, type);
+                        retrack_prot(protect_start, protect_len, host_prot(prot), prot,
+                                     "batch-prot");
+                        if (op == 4) retrack_type(protect_start, protect_len, type);
                     } else {
                         ret = sce_win_mprotect_error(error);
                     }
