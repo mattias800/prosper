@@ -54,11 +54,14 @@ int main() {
     auto protect = Hle::lookup(nid_hash("sceKernelMprotect"));
     auto release = Hle::lookup(nid_hash("sceKernelReleaseDirectMemory"));
     auto query   = Hle::lookup(nid_hash("sceKernelVirtualQuery"));
+    auto get_type = Hle::lookup(nid_hash("sceKernelGetDirectMemoryType"));
     auto batch   = Hle::lookup(nid_hash("sceKernelBatchMap"));
     CHECK(nid_hash("sceKernelMapDirectMemory2") == "BQQniolj9tQ",
           "sceKernelMapDirectMemory2 hashes to the PS5 3.20 import NID");
+    CHECK(nid_hash("sceKernelGetDirectMemoryType") == "BC+OG5m9+bw",
+          "sceKernelGetDirectMemoryType hashes to the PS5 3.20 import NID");
     CHECK(reserve && flexible && unmap && alloc && alloc_main && map && map2 && protect &&
-              release && query && batch,
+              release && query && get_type && batch,
           "memory HLE functions registered");
     if (fails) return 1;
 
@@ -157,8 +160,24 @@ int main() {
     CHECK((uint32_t)alloc_main(dlen, dlen, 0, 0, 0, 0) == 0x80020016u,
           "AllocateMainDirectMemory(null physAddrOut) -> EINVAL");
     uint64_t phys = 0, va1 = 0, va2 = 0, va_map2 = 0;
-    CHECK(alloc(0, kEnd, dlen, dlen, 0, (uint64_t)(uintptr_t)&phys) == 0 && phys == kBase,
+    CHECK(alloc(0, kEnd, dlen, dlen, 7, (uint64_t)(uintptr_t)&phys) == 0 && phys == kBase,
           "allocate one 64 KiB direct-memory page");
+    int32_t direct_type = -1;
+    uint64_t direct_start = UINT64_MAX, direct_end = UINT64_MAX;
+    CHECK(get_type(phys + 0x4000, (uint64_t)(uintptr_t)&direct_type,
+                   (uint64_t)(uintptr_t)&direct_start,
+                   (uint64_t)(uintptr_t)&direct_end, 0, 0) == 0 &&
+              direct_type == 7 && direct_start == phys && direct_end == phys + dlen,
+          "GetDirectMemoryType returns the containing physical allocation and exact type");
+    CHECK((uint32_t)get_type(phys, 0, (uint64_t)(uintptr_t)&direct_start,
+                             (uint64_t)(uintptr_t)&direct_end, 0, 0) == 0x80020016u,
+          "GetDirectMemoryType requires all output pointers");
+    direct_type = -1; direct_start = UINT64_MAX; direct_end = UINT64_MAX;
+    CHECK((uint32_t)get_type(phys + dlen, (uint64_t)(uintptr_t)&direct_type,
+                             (uint64_t)(uintptr_t)&direct_start,
+                             (uint64_t)(uintptr_t)&direct_end, 0, 0) == 0x80020002u &&
+              direct_type == -1 && direct_start == UINT64_MAX && direct_end == UINT64_MAX,
+          "GetDirectMemoryType returns ENOENT without changing outputs for a free offset");
     CHECK(map((uint64_t)(uintptr_t)&va1, dlen, 0x2, 0, phys, dlen) == 0 && va1,
           "map first direct-memory view");
 #ifdef _WIN32
@@ -189,6 +208,12 @@ int main() {
     }
 
     CHECK(release(phys, dlen, 0, 0, 0, 0) == 0, "release direct-memory page");
+    direct_type = -1; direct_start = UINT64_MAX; direct_end = UINT64_MAX;
+    CHECK((uint32_t)get_type(phys, (uint64_t)(uintptr_t)&direct_type,
+                             (uint64_t)(uintptr_t)&direct_start,
+                             (uint64_t)(uintptr_t)&direct_end, 0, 0) == 0x80020002u &&
+              direct_type == -1 && direct_start == UINT64_MAX && direct_end == UINT64_MAX,
+          "GetDirectMemoryType stops reporting a released allocation");
     uint64_t reused_phys = 0, va3 = 0;
     CHECK(alloc(0, kEnd, dlen, dlen, 0, (uint64_t)(uintptr_t)&reused_phys) == 0 && reused_phys == phys,
           "released physical range is reused");
@@ -465,10 +490,16 @@ int main() {
     auto map2    = reinterpret_cast<Hle7Fn>(
         Hle::lookup(nid_hash("sceKernelMapDirectMemory2")));
     auto release = Hle::lookup(nid_hash("sceKernelReleaseDirectMemory"));
+    auto get_type = Hle::lookup(nid_hash("sceKernelGetDirectMemoryType"));
     CHECK(nid_hash("sceKernelMapDirectMemory2") == "BQQniolj9tQ",
           "sceKernelMapDirectMemory2 hashes to the PS5 3.20 import NID");
-    CHECK(avail && alloc && alloc_main && map && map2 && release, "dmem fns registered");
-    if (!(avail && alloc && alloc_main && map && map2 && release)) { printf("== FAIL ==\n"); return 1; }
+    CHECK(nid_hash("sceKernelGetDirectMemoryType") == "BC+OG5m9+bw",
+          "sceKernelGetDirectMemoryType hashes to the PS5 3.20 import NID");
+    CHECK(avail && alloc && alloc_main && map && map2 && release && get_type,
+          "dmem fns registered");
+    if (!(avail && alloc && alloc_main && map && map2 && release && get_type)) {
+        printf("== FAIL ==\n"); return 1;
+    }
 
     // Both allocation APIs require their physical-address output. Reject before taking from
     // the pool so an unobservable allocation cannot leak capacity.
@@ -492,8 +523,24 @@ int main() {
 
     // Allocate 1 MiB (args: searchStart, searchEnd, len, align, type, physOut) at the pool base.
     uint64_t ap = 0;
-    uint64_t ar = alloc(0, kEnd, 0x100000, 0x4000, 0, (uint64_t)(uintptr_t)&ap);
+    uint64_t ar = alloc(0, kEnd, 0x100000, 0x4000, 6, (uint64_t)(uintptr_t)&ap);
     CHECK(ar == 0 && ap == kBase, "allocate 1MiB -> phys at pool base");
+    int32_t direct_type = -1;
+    uint64_t direct_start = UINT64_MAX, direct_end = UINT64_MAX;
+    CHECK(get_type(ap + 0x80000, (uint64_t)(uintptr_t)&direct_type,
+                   (uint64_t)(uintptr_t)&direct_start,
+                   (uint64_t)(uintptr_t)&direct_end, 0, 0) == 0 &&
+              direct_type == 6 && direct_start == ap && direct_end == ap + 0x100000,
+          "GetDirectMemoryType returns the containing physical allocation and exact type");
+    CHECK((uint32_t)get_type(ap, (uint64_t)(uintptr_t)&direct_type, 0,
+                             (uint64_t)(uintptr_t)&direct_end, 0, 0) == 0x80020016u,
+          "GetDirectMemoryType requires all output pointers");
+    direct_type = -1; direct_start = UINT64_MAX; direct_end = UINT64_MAX;
+    CHECK((uint32_t)get_type(ap + 0x100000, (uint64_t)(uintptr_t)&direct_type,
+                             (uint64_t)(uintptr_t)&direct_start,
+                             (uint64_t)(uintptr_t)&direct_end, 0, 0) == 0x80020002u &&
+              direct_type == -1 && direct_start == UINT64_MAX && direct_end == UINT64_MAX,
+          "GetDirectMemoryType returns ENOENT without changing outputs for a free offset");
 
     // Now the largest free block starts just past the allocation and is the pool minus 1 MiB.
     phys = size = 0;
@@ -518,6 +565,12 @@ int main() {
 
     // Release the allocation -> the whole pool is available again.
     release(kBase, 0x100000, 0, 0, 0, 0);
+    direct_type = -1; direct_start = UINT64_MAX; direct_end = UINT64_MAX;
+    CHECK((uint32_t)get_type(kBase, (uint64_t)(uintptr_t)&direct_type,
+                             (uint64_t)(uintptr_t)&direct_start,
+                             (uint64_t)(uintptr_t)&direct_end, 0, 0) == 0x80020002u &&
+              direct_type == -1 && direct_start == UINT64_MAX && direct_end == UINT64_MAX,
+          "GetDirectMemoryType stops reporting a released allocation");
     phys = size = 0;
     avail(0, kEnd, 0x4000, (uint64_t)(uintptr_t)&phys, (uint64_t)(uintptr_t)&size, 0);
     CHECK(phys == kBase && size == kTotal, "available after release -> whole pool free again");
