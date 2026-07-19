@@ -266,6 +266,62 @@ int main() {
         CHECK(bad == 0, "Unorm8 unpack -> uvec4 copy -> pack writeback is byte-exact (#590)");
     }
 
+    // --- #590: the same production storage-image copy across the INTEGER and packed formats DOLL's
+    // UE4 post-process writes its color-grading LUT / exposure / volume dispatches as (a 32x32x32
+    // Uint8/Unorm2_10_10_10 3D LUT, a 1x1x1 exposure, a 16x16x16 Uint16 volume). Each dispatch was
+    // skipped before storage_(un)pack gained these formats, leaving the tonemap sampling an
+    // unproduced surface. A raw uvec4 copy through the production backend must round-trip the guest
+    // bytes bit-exact: integer formats widen/truncate, and any quantized 10/10/10/2 word is stable
+    // under unpack->pack.
+    auto run_format_copy = [&](DataFormat fmt, uint32_t ncomp, uint32_t texel_bytes,
+                               const std::vector<uint8_t>& src) -> std::vector<uint8_t> {
+        std::vector<uint8_t> dst(src.size(), 0x5A);
+        ShaderResourceTable frt;
+        frt.resources = irt.resources;   // reuse constant buffers 0..3 (binding 0 -> v0 = gid)
+        frt.resources.erase(std::remove_if(frt.resources.begin(), frt.resources.end(),
+            [](const ShaderResource& r) { return r.cls == ResourceClass::StorageImage; }),
+            frt.resources.end());
+        auto add_fmt_image = [&](uint32_t binding, uint32_t sgpr, void* data) {
+            ShaderResource im{};
+            im.cls = ResourceClass::StorageImage; im.img_dim = 0; im.binding = binding;
+            im.sgpr_base = sgpr; im.format = fmt; im.num_components = ncomp;
+            im.width = W; im.height = 1;
+            im.gpu_addr = (uint64_t)(uintptr_t)data; im.size = W * texel_bytes;
+            frt.resources.push_back(im);
+        };
+        add_fmt_image(4, 0, const_cast<uint8_t*>(src.data()));
+        add_fmt_image(5, 8, dst.data());
+        std::vector<uint32_t> spv = recompile_valu(
+            image_copy, sizeof(image_copy) / sizeof(image_copy[0]), 1, 0, &frt);
+        if (spv.empty()) return {};
+        ComputeItem it;
+        it.spirv = spv;
+        it.resources = std::make_shared<ShaderResourceTable>(frt);
+        it.launch.threads_x = W; it.launch.local_x = 64; it.launch.groups_x = 1;
+        it.launch.local_y = it.launch.local_z = 1; it.launch.groups_y = it.launch.groups_z = 1;
+        it.code_addr = 0x590591;
+        if (!prosper::frontend::execute_live_compute_items({it})) return {};
+        return dst;
+    };
+    {   // Uint8 x4 (fmt=11): raw integer channels, exact round-trip
+        std::vector<uint8_t> s(W * 4);
+        for (uint32_t i = 0; i < s.size(); i++) s[i] = (uint8_t)(i * 53 + 7);
+        CHECK(run_format_copy(DataFormat::Uint8, 4, 4, s) == s,
+              "Uint8x4 storage copy round-trips guest bytes bit-exact (#590)");
+    }
+    {   // Uint16 x1 (fmt=7): 16-bit integer widen on load, low-16-bit truncate on store
+        std::vector<uint8_t> s(W * 2);
+        for (uint32_t i = 0; i < s.size(); i++) s[i] = (uint8_t)(i * 29 + 3);
+        CHECK(run_format_copy(DataFormat::Uint16, 1, 2, s) == s,
+              "Uint16x1 storage copy round-trips guest bytes bit-exact (#590)");
+    }
+    {   // Unorm2_10_10_10 x4 (fmt=21): packed 10/10/10/2, quantized word stable under unpack->pack
+        std::vector<uint8_t> s(W * 4);
+        for (uint32_t t = 0; t < W; t++) { uint32_t p = t * 2654435761u; std::memcpy(&s[t * 4], &p, 4); }
+        CHECK(run_format_copy(DataFormat::Unorm2_10_10_10, 4, 4, s) == s,
+              "Unorm2_10_10_10 storage copy round-trips packed guest word bit-exact (#590)");
+    }
+
     // The backend publishes ordinary tiled texels, not hardware-compressed blocks. Prove that a
     // DCC-enabled storage destination atomically becomes the uncompressed (0xff) metadata state,
     // including replay-owned metadata that a later sampled descriptor shares by logical address.

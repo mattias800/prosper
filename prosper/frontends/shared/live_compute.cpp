@@ -330,17 +330,30 @@ struct BoundImage {
 //   Unorm8  -> float(b/255) bits         <- clamp(bitcast float,0,1)*255 rounded
 //   Float16 -> half->float bits          <- round-to-nearest-even float->half
 //   Float32/Uint32/Sint32 -> raw 4-byte move both ways.
+//   Uint8/Sint8/Uint16/Sint16 -> integer channel widen (sign-extend for Sint) <- truncate to width.
+//     A UINT/SINT image_load returns the stored integer directly and image_store writes the low
+//     N bits with no normalization or saturation (Vulkan integer-format store contract), so the
+//     host move is a width-aware zero/sign extend on upload and a low-bit truncation on writeback.
+//   Unorm2_10_10_10 -> per-field float(bits/max) bits <- clamp(bitcast float,0,1)*max rounded, packed
+//     high-to-low A2/B10/G10/R10 (GFX10 IMG_FMT 50 layout, matching unorm2_10_10_10_to_rgba8).
+// UE4's post-process color-grading writes its 3D LUT / exposure volumes as these formats (DOLL: a
+// 32x32x32 Uint8/Unorm2_10_10_10 LUT + 1x1x1 exposure + a 16x16x16 Uint16 volume); skipping the
+// dispatch left the tonemap sampling an unproduced volume -> a near-zero grade -> black title (#590).
 // Missing channels read the hardware default (0,0,0,1.0f). Anything else is unsupported -> the caller
 // skips the dispatch loudly (never a silent wrong-layout write — correctness-first).
 bool storage_unpack_supported(prosper::gpu::DataFormat f) {
     using DF = prosper::gpu::DataFormat;
     return f == DF::Unorm8 || f == DF::Float16 || f == DF::Float32 || f == DF::Uint32 ||
-           f == DF::Sint32 || f == DF::Float10_11_11;
+           f == DF::Sint32 || f == DF::Float10_11_11 ||
+           f == DF::Uint8 || f == DF::Sint8 || f == DF::Uint16 || f == DF::Sint16 ||
+           f == DF::Unorm2_10_10_10;
 }
 bool storage_pack_supported(prosper::gpu::DataFormat f) {
     using DF = prosper::gpu::DataFormat;
     return f == DF::Unorm8 || f == DF::Float16 || f == DF::Float32 ||
-           f == DF::Uint32 || f == DF::Sint32 || f == DF::Float10_11_11;
+           f == DF::Uint32 || f == DF::Sint32 || f == DF::Float10_11_11 ||
+           f == DF::Uint8 || f == DF::Sint8 || f == DF::Uint16 || f == DF::Sint16 ||
+           f == DF::Unorm2_10_10_10;
 }
 void storage_unpack_texel(const uint8_t* src, prosper::gpu::DataFormat f, uint32_t ncomp, uint32_t out[4]) {
     using DF = prosper::gpu::DataFormat;
@@ -354,12 +367,29 @@ void storage_unpack_texel(const uint8_t* src, prosper::gpu::DataFormat f, uint32
         for (uint32_t c = 0; c < 3; ++c) std::memcpy(&out[c], &values[c], sizeof(values[c]));
         return;
     }
+    if (f == DF::Unorm2_10_10_10) {
+        uint32_t packed = 0; std::memcpy(&packed, src, sizeof(packed));
+        const float values[4] = { ((packed >>  0) & 0x3ffu) / 1023.0f,
+                                  ((packed >> 10) & 0x3ffu) / 1023.0f,
+                                  ((packed >> 20) & 0x3ffu) / 1023.0f,
+                                  ((packed >> 30) & 0x3u)   / 3.0f };
+        for (uint32_t c = 0; c < 4; ++c) std::memcpy(&out[c], &values[c], sizeof(values[c]));
+        return;
+    }
     for (uint32_t c = 0; c < ncomp && c < 4; c++) {
         switch (f) {
             case DF::Unorm8: { float v = src[c] / 255.0f; std::memcpy(&out[c], &v, 4); break; }
             case DF::Float16: { float v = prosper::gpu::half_to_float(
                                     (uint16_t)(src[c * 2] | (src[c * 2 + 1] << 8)));
                                 std::memcpy(&out[c], &v, 4); break; }
+            // Integer formats carry the raw channel value; a UINT/SINT image_load reads the stored
+            // integer directly (zero-extend for Uint, sign-extend for Sint). No normalization.
+            case DF::Uint8:  out[c] = src[c]; break;
+            case DF::Sint8:  out[c] = static_cast<uint32_t>(static_cast<int32_t>(
+                                          static_cast<int8_t>(src[c]))); break;
+            case DF::Uint16: out[c] = static_cast<uint32_t>(src[c * 2] | (src[c * 2 + 1] << 8)); break;
+            case DF::Sint16: out[c] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(
+                                          src[c * 2] | (src[c * 2 + 1] << 8)))); break;
             default: std::memcpy(&out[c], src + c * 4, 4); break;   // 32-bit raw
         }
     }
@@ -375,6 +405,19 @@ void storage_pack_texel(const uint32_t in[4], prosper::gpu::DataFormat f, uint32
         std::memcpy(dst, &packed, sizeof(packed));
         return;
     }
+    if (f == DF::Unorm2_10_10_10) {
+        auto q = [](const uint32_t bits, float scale) -> uint32_t {
+            float v; std::memcpy(&v, &bits, 4);
+            v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+            return static_cast<uint32_t>(v * scale + 0.5f);
+        };
+        const uint32_t packed = (q(in[0], 1023.0f) & 0x3ffu)        |
+                                ((q(in[1], 1023.0f) & 0x3ffu) << 10) |
+                                ((q(in[2], 1023.0f) & 0x3ffu) << 20) |
+                                ((q(in[3], 3.0f)    & 0x3u)   << 30);
+        std::memcpy(dst, &packed, sizeof(packed));
+        return;
+    }
     for (uint32_t c = 0; c < ncomp && c < 4; c++) {
         switch (f) {
             case DF::Unorm8: dst[c] = storage_pack_unorm8(in[c]); break;
@@ -382,6 +425,13 @@ void storage_pack_texel(const uint32_t in[4], prosper::gpu::DataFormat f, uint32
                                 const uint16_t h = prosper::gpu::float_to_half(v);
                                 dst[c * 2] = static_cast<uint8_t>(h);
                                 dst[c * 2 + 1] = static_cast<uint8_t>(h >> 8); break; }
+            // Integer image_store writes the low N bits with no saturation (mirrors the 32-bit raw
+            // move truncated to the format width).
+            case DF::Uint8: case DF::Sint8:
+                dst[c] = static_cast<uint8_t>(in[c]); break;
+            case DF::Uint16: case DF::Sint16:
+                dst[c * 2] = static_cast<uint8_t>(in[c]);
+                dst[c * 2 + 1] = static_cast<uint8_t>(in[c] >> 8); break;
             default: std::memcpy(dst + c * 4, &in[c], 4); break;    // 32-bit raw
         }
     }
@@ -828,7 +878,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     skip_image(r, "storage format has no channel pack/unpack yet"); break; }
                 const uint32_t cb = data_format_bytes(r->format);
                 const uint32_t nc = r->num_components ? r->num_components : 1;
-                const size_t guest_texel = r->format == DataFormat::Float10_11_11
+                const size_t guest_texel = (r->format == DataFormat::Float10_11_11 ||
+                                            r->format == DataFormat::Unorm2_10_10_10)
                     ? 4u : (size_t)cb * nc;
                 const size_t texels = (size_t)volume_texels;
                 const uint64_t linear_guest_bytes = static_cast<uint64_t>(texels) * guest_texel;
@@ -1493,7 +1544,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             const uint32_t cb = data_format_bytes(r->format);
             const uint32_t nc = r->num_components ? r->num_components : 1;
-            const size_t guest_texel = r->format == DataFormat::Float10_11_11
+            const size_t guest_texel = (r->format == DataFormat::Float10_11_11 ||
+                                        r->format == DataFormat::Unorm2_10_10_10)
                 ? 4u : (size_t)cb * nc;
             const size_t texels = (size_t)r->width * r->height * r->depth;
             std::vector<uint8_t> linear(texels * guest_texel, 0);
