@@ -172,6 +172,22 @@ int main() {
     CHECK(kernel_reachability_fn &&
               kernel_reachability_fn((uint64_t)(uintptr_t)reachable_directory.c_str(), 0, 0, 0, 0, 0) == 0,
           "sceKernelCheckReachability finds a translated guest directory");
+#ifdef _WIN32
+    CHECK(SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL),
+          "prepare a normal-attribute Windows chmod fixture");
+    auto read_chmod_times = [&](FILETIME* access, FILETIME* modify) {
+        HANDLE file = CreateFileA(path, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, 0, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return false;
+        const BOOL result = GetFileTime(file, nullptr, access, modify);
+        CloseHandle(file);
+        return result != FALSE;
+    };
+    FILETIME chmod_access_before{}, chmod_modify_before{};
+    CHECK(read_chmod_times(&chmod_access_before, &chmod_modify_before),
+          "read Windows fixture timestamps before chmod");
+#endif
     CHECK(kernel_chmod_fn &&
               kernel_chmod_fn((uint64_t)(uintptr_t)reachable_file.c_str(), 0444, 0, 0, 0, 0) == 0,
           "sceKernelChmod makes a translated guest file read-only");
@@ -179,13 +195,23 @@ int main() {
               kernel_chmod_fn((uint64_t)(uintptr_t)reachable_directory.c_str(), 0555, 0, 0, 0, 0) == 0,
           "sceKernelChmod applies a mode to a translated guest directory");
 #ifdef _WIN32
-    CHECK((GetFileAttributesA(path) & FILE_ATTRIBUTE_READONLY) != 0,
-          "Windows sceKernelChmod maps a non-writable mode to the read-only attribute");
+    DWORD readonly_attributes = GetFileAttributesA(path);
+    CHECK((readonly_attributes & FILE_ATTRIBUTE_READONLY) != 0 &&
+              (readonly_attributes & FILE_ATTRIBUTE_NORMAL) == 0,
+          "Windows sceKernelChmod normalizes the read-only attribute set");
 #endif
     CHECK(kernel_chmod_fn &&
               kernel_chmod_fn((uint64_t)(uintptr_t)reachable_file.c_str(), 0644, 0, 0, 0, 0) == 0 &&
               kernel_chmod_fn((uint64_t)(uintptr_t)reachable_directory.c_str(), 0755, 0, 0, 0, 0) == 0,
           "sceKernelChmod restores writable fixture modes");
+#ifdef _WIN32
+    FILETIME chmod_access_after{}, chmod_modify_after{};
+    CHECK(GetFileAttributesA(path) == FILE_ATTRIBUTE_NORMAL &&
+              read_chmod_times(&chmod_access_after, &chmod_modify_after) &&
+              CompareFileTime(&chmod_access_before, &chmod_access_after) == 0 &&
+              CompareFileTime(&chmod_modify_before, &chmod_modify_after) == 0,
+          "Windows sceKernelChmod restores normal attributes without changing timestamps");
+#endif
     int64_t chmod_fd = open_fn
         ? (int64_t)open_fn((uint64_t)(uintptr_t)reachable_file.c_str(), 0, 0, 0, 0, 0)
         : -1;
@@ -194,15 +220,21 @@ int main() {
               kernel_fchmod_fn((uint64_t)chmod_fd, 0400, 0, 0, 0, 0) == 0,
           "sceKernelFchmod makes an open file read-only");
 #ifdef _WIN32
-    CHECK((GetFileAttributesA(path) & FILE_ATTRIBUTE_READONLY) != 0,
-          "Windows sceKernelFchmod updates the descriptor's file attribute");
+    readonly_attributes = GetFileAttributesA(path);
+    CHECK((readonly_attributes & FILE_ATTRIBUTE_READONLY) != 0 &&
+              (readonly_attributes & FILE_ATTRIBUTE_NORMAL) == 0,
+          "Windows sceKernelFchmod normalizes the descriptor's read-only attribute");
 #endif
     CHECK(chmod_fd >= 0 && kernel_fchmod_fn &&
               kernel_fchmod_fn((uint64_t)chmod_fd, 0600, 0, 0, 0, 0) == 0,
           "sceKernelFchmod restores a writable descriptor mode");
 #ifdef _WIN32
-    CHECK((GetFileAttributesA(path) & FILE_ATTRIBUTE_READONLY) == 0,
-          "Windows sceKernelFchmod clears read-only for a writable guest mode");
+    FILETIME fchmod_access_after{}, fchmod_modify_after{};
+    CHECK(GetFileAttributesA(path) == FILE_ATTRIBUTE_NORMAL &&
+              read_chmod_times(&fchmod_access_after, &fchmod_modify_after) &&
+              CompareFileTime(&chmod_access_before, &fchmod_access_after) == 0 &&
+              CompareFileTime(&chmod_modify_before, &fchmod_modify_after) == 0,
+          "Windows sceKernelFchmod restores normal attributes without changing timestamps");
 #endif
     if (chmod_fd >= 0 && close_fn) close_fn((uint64_t)chmod_fd, 0, 0, 0, 0, 0);
 #ifndef _WIN32

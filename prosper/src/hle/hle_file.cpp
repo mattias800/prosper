@@ -266,8 +266,19 @@ namespace {
         }
         // Win32 has one meaningful permission bit: FILE_ATTRIBUTE_READONLY. Treat any guest
         // owner/group/other write bit as writable and preserve every unrelated file attribute.
-        if (mode & 0222) info.FileAttributes &= ~FILE_ATTRIBUTE_READONLY;
-        else info.FileAttributes |= FILE_ATTRIBUTE_READONLY;
+        if (mode & 0222) {
+            info.FileAttributes &= ~FILE_ATTRIBUTE_READONLY;
+            if (info.FileAttributes == 0) info.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+        } else {
+            info.FileAttributes &= ~FILE_ATTRIBUTE_NORMAL;
+            info.FileAttributes |= FILE_ATTRIBUTE_READONLY;
+        }
+        // Zero timestamps mean "leave unchanged" for FileBasicInfo. Replaying the values read
+        // above would race another handle and could roll a newer write/access time backwards.
+        info.CreationTime.QuadPart = 0;
+        info.LastAccessTime.QuadPart = 0;
+        info.LastWriteTime.QuadPart = 0;
+        info.ChangeTime.QuadPart = 0;
         if (!SetFileInformationByHandle(file, FileBasicInfo, &info, sizeof info)) {
             errno = windows_directory_errno(GetLastError());
             return -1;
