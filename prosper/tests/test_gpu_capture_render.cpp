@@ -331,6 +331,14 @@ int main() {
         CHECK(center[0] > 0xC0 && center[1] < 0x40 && center[2] < 0x40,
               "later pass samples pixels cached from the 32x2 producer target");
     }
+    LiveTargetSnapshot chained_producer_snapshot;
+    CHECK(read_live_render_target(producer.color0_base, chained_producer_snapshot) &&
+              chained_producer_snapshot.width == producer.color0_width &&
+              chained_producer_snapshot.height == producer.color0_height &&
+              chained_producer_snapshot.pixels &&
+              chained_producer_snapshot.pixels->size() ==
+                  static_cast<size_t>(producer.color0_width) * producer.color0_height * 4,
+          "compute reader materializes a deferred GPU-only graphics target on demand");
 
     // A native 32x32 offscreen target receives a scissor that was globally scaled from 32 to 16
     // for the 128->64 presentation reduction above. The pass-local target correction must undo that

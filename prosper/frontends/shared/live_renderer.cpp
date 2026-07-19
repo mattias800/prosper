@@ -279,21 +279,43 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
     prosper::gpu::set_live_target_reader(
         [invalidate_ds](uint64_t addr, prosper::gpu::LiveTargetSnapshot& snapshot) {
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
-            const auto it = g_rtt.find(addr);
-            if (it == g_rtt.end() || !it->second.rgba || !it->second.w || !it->second.h)
-                return false;
-            const VkFormat format = prosper::test::backend_color_format(it->second.format);
+            auto it = g_rtt.find(addr);
+            if (it == g_rtt.end() || !it->second.w || !it->second.h) return false;
+            RttSurf& surface = it->second;
+            const VkFormat format = prosper::test::backend_color_format(surface.format);
             const uint32_t bytes_per_pixel = prosper::test::backend_color_bytes_per_pixel(format);
-            const uint64_t texels = static_cast<uint64_t>(it->second.w) * it->second.h;
-            if (texels > UINT64_MAX / bytes_per_pixel) return false;
+            const uint64_t texels = static_cast<uint64_t>(surface.w) * surface.h;
+            if (!bytes_per_pixel || texels > UINT64_MAX / bytes_per_pixel) return false;
             const uint64_t expected = texels * bytes_per_pixel;
-            if (expected != it->second.rgba->size()) return false;
-            snapshot.width = it->second.w;
-            snapshot.height = it->second.h;
+            // Graphics-to-graphics intermediates normally stay in the persistent Vulkan target.
+            // Compute cannot import that color attachment directly, so materialize its current
+            // pixels only when an ordered compute dispatch actually consumes the surface.
+            if ((!surface.rgba || surface.rgba->size() != expected) && surface.gpu_valid) {
+                std::vector<uint8_t> materialized;
+                std::string error;
+                if (prosper::test::readback_persistent_color_target(
+                        addr, surface.w, surface.h, format, materialized, error) &&
+                    materialized.size() == expected) {
+                    surface.rgba = std::make_shared<const std::vector<uint8_t>>(
+                        std::move(materialized));
+                } else {
+                    static std::atomic<int> warned{0};
+                    if (warned.fetch_add(1) < 24)
+                        std::fprintf(stderr,
+                                     "[rtt] live compute target readback failed: base=0x%llx "
+                                     "extent=%ux%u error=%s\n",
+                                     static_cast<unsigned long long>(addr), surface.w, surface.h,
+                                     error.c_str());
+                    return false;
+                }
+            }
+            if (!surface.rgba || expected != surface.rgba->size()) return false;
+            snapshot.width = surface.w;
+            snapshot.height = surface.h;
             snapshot.format = format == VK_FORMAT_R16G16B16A16_SFLOAT
                 ? prosper::gpu::LiveTargetPixelFormat::Rgba16Float
                 : prosper::gpu::LiveTargetPixelFormat::Rgba8Unorm;
-            snapshot.pixels = it->second.rgba;
+            snapshot.pixels = surface.rgba;
             return true;
         });
     prosper::gpu::set_live_target_byte_range_reader(
