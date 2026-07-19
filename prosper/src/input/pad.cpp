@@ -31,6 +31,11 @@ static_assert(offsetof(ScePadData, device_unique_data) == 0x6c, "device_unique_d
 
 static_assert(sizeof(ScePadControllerInformation) == 28, "ScePadControllerInformation must be 28 bytes (Sony reserve[8], #283)");
 static_assert(offsetof(ScePadControllerInformation, device_class) == 0x10, "device_class");
+static_assert(sizeof(ScePadExtendedControllerInformation) == 44,
+              "ScePadExtendedControllerInformation must be 44 bytes");
+static_assert(offsetof(ScePadExtendedControllerInformation, pad_type1) == 0x1c, "pad_type1");
+static_assert(offsetof(ScePadExtendedControllerInformation, capability) == 0x20, "capability");
+static_assert(offsetof(ScePadExtendedControllerInformation, class_data) == 0x24, "class_data");
 
 uint8_t pad_axis_u8(int raw, int min, int max) {
     if (max <= min) return 0x80;
@@ -109,6 +114,13 @@ void pad_fill_controller_info(ScePadControllerInformation* out, bool connected, 
     out->connected_count = connected_count;
     out->connected       = connected ? 1 : 0;
     out->device_class    = 0;       // SCE_PAD_DEVICE_CLASS_STANDARD
+}
+
+void pad_fill_extended_controller_info(ScePadExtendedControllerInformation* out, bool connected,
+                                       uint8_t connected_count) {
+    if (!out) return;
+    std::memset(out, 0, sizeof(*out));
+    pad_fill_controller_info(&out->base, connected, connected_count);
 }
 
 // --- Scripted input (PROSPER_PAD_SCRIPT) pure helpers — see pad.hpp -----------------------------

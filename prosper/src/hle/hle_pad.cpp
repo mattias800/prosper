@@ -473,6 +473,20 @@ HLE(pad_get_info) {
     return 0;
 }
 
+// scePadGetExtControllerInformation(handle, ScePadExtendedControllerInformation* out) -> 0.
+// The inherited public layout is exactly 0x2c bytes: the 0x1c controller-info base followed by
+// padType1/padType2, capability, alignment, and an 8-byte device-class union. A standard pad has no
+// device-class extension, so the tail remains zero while the base reports current connection state.
+HLE(pad_get_ext_controller_info) {
+    PadHandleGuard handle(a0);
+    if (!handle.valid()) return kPadErrorInvalidHandle;
+    if (!a1) return 0;
+    HostPadState s = poll_controller((int)a0, __func__, false);
+    pad_fill_extended_controller_info((ScePadExtendedControllerInformation*)PW(a1), s.connected,
+                                      s.connected ? 1 : 0);
+    return 0;
+}
+
 // scePadDeviceClassGetExtendedInformation(handle, out*) -> 0. Report a zeroed extended-info block
 // (standard device class, no extra capabilities). OrbisPadDeviceClassExtendedInformation is exactly
 // 20 bytes (0x14): deviceClass(4) + reserved[4](4) + a 12-byte classData union (shadPS4 pad.h). Writing
@@ -505,6 +519,7 @@ void register_pad_hle() {
     R("scePadClose", pad_close);
     R("scePadGetHandle", pad_get_handle);
     R("scePadGetControllerInformation", pad_get_info);
+    R("scePadGetExtControllerInformation", pad_get_ext_controller_info);
     R("scePadDeviceClassGetExtendedInformation", pad_ext_info);
     R("scePadReadState", pad_read_state);
     R("scePadRead", pad_read);

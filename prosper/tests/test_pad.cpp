@@ -47,6 +47,14 @@ int main() {
     // 0x1c after the struct. A 32-byte struct overran that 28-byte buffer -> canary crash (#283).
     CHECK(sizeof(ScePadControllerInformation) == 28, "sizeof(ScePadControllerInformation) == 28");
     CHECK(offsetof(ScePadControllerInformation, device_class) == 0x10, "device_class @ 0x10");
+    CHECK(sizeof(ScePadExtendedControllerInformation) == 44,
+          "sizeof(ScePadExtendedControllerInformation) == 44");
+    CHECK(offsetof(ScePadExtendedControllerInformation, pad_type1) == 0x1c,
+          "extended pad_type1 @ 0x1c");
+    CHECK(offsetof(ScePadExtendedControllerInformation, capability) == 0x20,
+          "extended capability @ 0x20");
+    CHECK(offsetof(ScePadExtendedControllerInformation, class_data) == 0x24,
+          "extended class_data @ 0x24");
 
     // (2) Neutral state -> centered sticks, zero buttons, released triggers, identity orientation.
     {
@@ -109,6 +117,19 @@ int main() {
         CHECK(ci.connected_count == 1, "info: connected_count");
         CHECK(ci.device_class == 0, "info: standard device class");
         CHECK(ci.stick_dead_zone_left == ci.stick_dead_zone_right, "info: symmetric dead zone");
+
+        ScePadExtendedControllerInformation ext;
+        memset(&ext, 0xAA, sizeof(ext));
+        pad_fill_extended_controller_info(&ext, true, 1);
+        CHECK(ext.base.connected == 1 && ext.base.connected_count == 1,
+              "extended info: populated controller-info base");
+        bool extension_zero = true;
+        const auto* extension_bytes = reinterpret_cast<const uint8_t*>(&ext.pad_type1);
+        for (size_t i = 0; i < sizeof(ext) -
+                                   offsetof(ScePadExtendedControllerInformation, pad_type1);
+             ++i)
+            extension_zero &= extension_bytes[i] == 0;
+        CHECK(extension_zero, "extended info: standard-pad extension zeroed");
     }
 
     // (6) HLE registration + full-struct fill. The built-in NeutralPadBackend presents one connected
@@ -118,14 +139,17 @@ int main() {
         // consume either window; the first two successful input reads must see p0 and p1 in order.
         set_test_env("PROSPER_PAD_SCRIPT", "0-0.05:triangle;p0-1:cross;p1-2:options");
         register_builtin_hle();
+        CHECK(nid_hash("scePadGetExtControllerInformation") == "hGbf2QTBmqc",
+              "scePadGetExtControllerInformation hashes to its public NID");
         HleFn read_state = Hle::lookup(nid_hash("scePadReadState"));
         HleFn read       = Hle::lookup(nid_hash("scePadRead"));
         HleFn get_info   = Hle::lookup(nid_hash("scePadGetControllerInformation"));
+        HleFn get_ext_info = Hle::lookup(nid_hash("scePadGetExtControllerInformation"));
         HleFn open       = Hle::lookup(nid_hash("scePadOpen"));
         HleFn open_ext   = Hle::lookup(nid_hash("scePadOpenExt"));
         HleFn close      = Hle::lookup(nid_hash("scePadClose"));
         HleFn is_valid   = Hle::lookup(nid_hash("scePadIsValidHandle"));
-        CHECK(read_state && read && get_info && open && open_ext && close && is_valid,
+        CHECK(read_state && read && get_info && get_ext_info && open && open_ext && close && is_valid,
               "pad HLE functions registered");
 
         const uint64_t handle = open ? open(1, 0, 0, 0, 0, 0) : 0;
@@ -154,6 +178,8 @@ int main() {
         std::memset(&invalid_data, 0x5a, sizeof invalid_data);
         ScePadControllerInformation invalid_info;
         std::memset(&invalid_info, 0x6b, sizeof invalid_info);
+        ScePadExtendedControllerInformation invalid_ext_info;
+        std::memset(&invalid_ext_info, 0x4d, sizeof invalid_ext_info);
         if (read_state)
             CHECK(read_state(unknown, (uint64_t)(uintptr_t)&invalid_data, 0, 0, 0, 0) ==
                       invalid_handle,
@@ -166,6 +192,10 @@ int main() {
             CHECK(get_info(unknown, (uint64_t)(uintptr_t)&invalid_info, 0, 0, 0, 0) ==
                       invalid_handle,
                   "scePadGetControllerInformation rejects an unknown handle");
+        if (get_ext_info)
+            CHECK(get_ext_info(unknown, (uint64_t)(uintptr_t)&invalid_ext_info, 0, 0, 0, 0) ==
+                      invalid_handle,
+                  "scePadGetExtControllerInformation rejects an unknown handle");
         bool invalid_data_untouched = true;
         const auto* invalid_data_bytes = reinterpret_cast<const uint8_t*>(&invalid_data);
         for (size_t i = 0; i < sizeof invalid_data; ++i)
@@ -174,7 +204,11 @@ int main() {
         const auto* invalid_info_bytes = reinterpret_cast<const uint8_t*>(&invalid_info);
         for (size_t i = 0; i < sizeof invalid_info; ++i)
             invalid_info_untouched &= invalid_info_bytes[i] == 0x6b;
-        CHECK(invalid_data_untouched && invalid_info_untouched,
+        bool invalid_ext_info_untouched = true;
+        const auto* invalid_ext_info_bytes = reinterpret_cast<const uint8_t*>(&invalid_ext_info);
+        for (size_t i = 0; i < sizeof invalid_ext_info; ++i)
+            invalid_ext_info_untouched &= invalid_ext_info_bytes[i] == 0x4d;
+        CHECK(invalid_data_untouched && invalid_info_untouched && invalid_ext_info_untouched,
               "invalid-handle Pad calls leave outputs untouched");
 
         if (get_info) {
@@ -182,6 +216,28 @@ int main() {
             CHECK(get_info(handle, (uint64_t)(uintptr_t)&ci, 0, 0, 0, 0) == 0,
                   "scePadGetControllerInformation -> 0 (OK)");
             CHECK(ci.connected == 1, "info query sees script-driven controller connectivity");
+        }
+        if (get_ext_info) {
+            struct {
+                ScePadExtendedControllerInformation info;
+                uint8_t canary[12];
+            } guarded;
+            std::memset(&guarded, 0xa7, sizeof guarded);
+            CHECK(get_ext_info(handle, (uint64_t)(uintptr_t)&guarded.info, 0, 0, 0, 0) == 0,
+                  "scePadGetExtControllerInformation -> 0 (OK)");
+            CHECK(guarded.info.base.connected == 1 && guarded.info.base.device_class == 0,
+                  "extended info reports a connected standard controller");
+            bool extension_zero = true;
+            const auto* extension_bytes =
+                reinterpret_cast<const uint8_t*>(&guarded.info.pad_type1);
+            for (size_t i = 0; i < sizeof guarded.info -
+                                       offsetof(ScePadExtendedControllerInformation, pad_type1);
+                 ++i)
+                extension_zero &= extension_bytes[i] == 0;
+            bool canary_untouched = true;
+            for (uint8_t byte : guarded.canary) canary_untouched &= byte == 0xa7;
+            CHECK(extension_zero && canary_untouched,
+                  "extended info writes exactly 0x2c bytes and zeroes its extension");
         }
 
         // The legacy seconds origin is the first pad poll, including an information query. If the
@@ -229,14 +285,21 @@ int main() {
             CHECK(is_valid(ext_handle, 0, 0, 0, 0, 0) == 0,
                   "scePadIsValidHandle rejects a closed OpenExt handle");
             std::memset(&invalid_data, 0x7c, sizeof invalid_data);
+            std::memset(&invalid_ext_info, 0x3e, sizeof invalid_ext_info);
             CHECK(read_state(handle, (uint64_t)(uintptr_t)&invalid_data, 0, 0, 0, 0) ==
                       invalid_handle && close(handle, 0, 0, 0, 0, 0) == invalid_handle,
                   "closed handles stay invalid for input and repeated close");
+            CHECK(get_ext_info(handle, (uint64_t)(uintptr_t)&invalid_ext_info, 0, 0, 0, 0) ==
+                      invalid_handle,
+                  "scePadGetExtControllerInformation rejects a closed handle");
             bool closed_output_untouched = true;
             for (size_t i = 0; i < sizeof invalid_data; ++i)
                 closed_output_untouched &= invalid_data_bytes[i] == 0x7c;
-            CHECK(closed_output_untouched,
-                  "closed-handle input leaves output untouched");
+            bool closed_ext_output_untouched = true;
+            for (size_t i = 0; i < sizeof invalid_ext_info; ++i)
+                closed_ext_output_untouched &= invalid_ext_info_bytes[i] == 0x3e;
+            CHECK(closed_output_untouched && closed_ext_output_untouched,
+                  "closed-handle Pad calls leave output untouched");
         }
         set_test_env("PROSPER_PAD_SCRIPT", "");
     }
