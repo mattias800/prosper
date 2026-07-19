@@ -432,7 +432,7 @@ namespace {
     }
     uint64_t align_up(uint64_t v, uint64_t a) { return a ? (v + a - 1) & ~(a - 1) : v; }
 
-    constexpr uint64_t kMaxDirectMemoryType = 10;
+    constexpr uint64_t kMaxDirectMemoryType = 0x7fffffffull;
     bool valid_dmem_allocation(uint64_t len, uint64_t alignment,
                                uint64_t memory_type, uint64_t phys_out) {
         // The direct-memory ABI is 16 KiB-granular. Do not round a malformed request up: doing so
@@ -440,6 +440,9 @@ namespace {
         // default page alignment; the allocator supports every explicit 16 KiB multiple.
         if (!len || (len & (kGuestPageSize - 1)) != 0) return false;
         if (alignment && (alignment & (kGuestPageSize - 1)) != 0) return false;
+        // memoryType is a signed int in the ABI. Preserve every non-negative value it can carry:
+        // PS5 titles use values above the older type-10 ceiling (Blasphemous 2 requests type 12),
+        // and the mapping/type-query paths already preserve types 11 and 13.
         if (memory_type > kMaxDirectMemoryType) return false;
         // Low values are not plausible guest pointers. The old code accepted them, allocated from
         // the pool, then skipped the guarded write -- false success plus leaked physical capacity.
@@ -1921,11 +1924,13 @@ namespace {
     }
     uint64_t align_up(uint64_t v, uint64_t a) { return a ? (v + a - 1) & ~(a - 1) : v; }
 
-    constexpr uint64_t kMaxDirectMemoryType = 10;
+    constexpr uint64_t kMaxDirectMemoryType = 0x7fffffffull;
     bool valid_dmem_allocation(uint64_t len, uint64_t alignment,
                                uint64_t memory_type, uint64_t phys_out) {
         if (!len || (len & (kGuestPageSize - 1)) != 0) return false;
         if (alignment && (alignment & (kGuestPageSize - 1)) != 0) return false;
+        // memoryType is a signed int in the ABI. PS5 titles legitimately use values above 10;
+        // reject only values that cannot represent a non-negative int.
         if (memory_type > kMaxDirectMemoryType) return false;
         return phys_out > 0xffff;
     }

@@ -195,10 +195,10 @@ int main() {
                           (uint64_t)(uintptr_t)&invalid_phys) == 0x8002000cu &&
               invalid_phys == 0xfeedfacecafebeefull,
           "AllocateDirectMemory(overflowing size) fails without writing output");
-    CHECK((uint32_t)alloc(0, kEnd, dlen, dlen, 11,
+    CHECK((uint32_t)alloc(0, kEnd, dlen, dlen, 0x80000000ull,
                           (uint64_t)(uintptr_t)&invalid_phys) == 0x80020016u &&
               invalid_phys == 0xfeedfacecafebeefull,
-          "AllocateDirectMemory(out-of-range memory type) -> EINVAL without writing output");
+          "AllocateDirectMemory(non-int memory type) -> EINVAL without writing output");
     CHECK((uint32_t)alloc(0, kEnd, dlen, dlen, 0, 1) == 0x80020016u,
           "AllocateDirectMemory(low invalid physAddrOut) -> EINVAL");
     CHECK((uint32_t)alloc_main(dlen - 1, dlen, 0,
@@ -218,14 +218,14 @@ int main() {
         CHECK(release(multiple_align_phys, 0x4000, 0, 0, 0, 0) == 0,
               "release the non-power-of-two-aligned allocation");
     uint64_t phys = 0, va1 = 0, va2 = 0, va_map2 = 0;
-    CHECK(alloc(0, kEnd, dlen, dlen, 7, (uint64_t)(uintptr_t)&phys) == 0 && phys == kBase,
-          "invalid allocations leave the pool untouched before a valid allocation");
+    CHECK(alloc(0, kEnd, dlen, dlen, 12, (uint64_t)(uintptr_t)&phys) == 0 && phys == kBase,
+          "PS5 memory type 12 succeeds after invalid allocations leave the pool untouched");
     int32_t direct_type = -1;
     uint64_t direct_start = UINT64_MAX, direct_end = UINT64_MAX;
     CHECK(get_type(phys + 0x4000, (uint64_t)(uintptr_t)&direct_type,
                    (uint64_t)(uintptr_t)&direct_start,
                    (uint64_t)(uintptr_t)&direct_end, 0, 0) == 0 &&
-              direct_type == 7 && direct_start == phys && direct_end == phys + dlen,
+              direct_type == 12 && direct_start == phys && direct_end == phys + dlen,
           "GetDirectMemoryType returns the containing physical allocation and exact type");
     CHECK((uint32_t)get_type(phys, 0, (uint64_t)(uintptr_t)&direct_start,
                              (uint64_t)(uintptr_t)&direct_end, 0, 0) == 0x80020016u,
@@ -262,7 +262,7 @@ int main() {
               *(uint64_t*)(direct_info + 0x00) == va1 &&
               *(uint64_t*)(direct_info + 0x08) == va1 + dlen &&
               *(uint64_t*)(direct_info + 0x10) == phys &&
-              *(int32_t*)(direct_info + 0x1c) == 7 &&
+              *(int32_t*)(direct_info + 0x1c) == 12 &&
               direct_info[0x20] == 0x12,
           "VirtualQuery reports ordinary direct mapping offset/type/classification");
     uint8_t short_query_info[0x22];
@@ -344,7 +344,7 @@ int main() {
     CHECK(query(va1 + 0xd000, 0, (uint64_t)(uintptr_t)direct_info,
                 sizeof(direct_info), 0, 0) == 0 &&
               *(uint64_t*)(direct_info + 0x10) == phys + 0xc000 &&
-              *(int32_t*)(direct_info + 0x1c) == 7,
+              *(int32_t*)(direct_info + 0x1c) == 12,
           "tracker suffix keeps its original type and rebased physical offset");
     direct_type = -1; direct_start = direct_end = 0;
     CHECK(get_type(phys + 0x9000, (uint64_t)(uintptr_t)&direct_type,
@@ -727,10 +727,10 @@ int main() {
                           (uint64_t)(uintptr_t)&invalid_phys) == 0x8002000cu &&
               invalid_phys == 0xfeedfacecafebeefull,
           "AllocateDirectMemory(overflowing size) fails without writing output");
-    CHECK((uint32_t)alloc(0, kEnd, 0x4000, 0x4000, 11,
+    CHECK((uint32_t)alloc(0, kEnd, 0x4000, 0x4000, 0x80000000ull,
                           (uint64_t)(uintptr_t)&invalid_phys) == 0x80020016u &&
               invalid_phys == 0xfeedfacecafebeefull,
-          "AllocateDirectMemory(out-of-range memory type) -> EINVAL without writing output");
+          "AllocateDirectMemory(non-int memory type) -> EINVAL without writing output");
     CHECK((uint32_t)alloc(0, kEnd, 0x4000, 0x4000, 0, 1) == 0x80020016u,
           "AllocateDirectMemory(low invalid physAddrOut) -> EINVAL");
     CHECK((uint32_t)alloc_main(0x4001, 0x4000, 0,
@@ -765,15 +765,15 @@ int main() {
 
     // Allocate 1 MiB (args: searchStart, searchEnd, len, align, type, physOut) at the pool base.
     uint64_t ap = 0;
-    uint64_t ar = alloc(0, kEnd, 0x100000, 0x4000, 6, (uint64_t)(uintptr_t)&ap);
+    uint64_t ar = alloc(0, kEnd, 0x100000, 0x4000, 12, (uint64_t)(uintptr_t)&ap);
     CHECK(ar == 0 && ap == kBase,
-          "invalid allocations leave the pool untouched before a valid allocation");
+          "PS5 memory type 12 succeeds after invalid allocations leave the pool untouched");
     int32_t direct_type = -1;
     uint64_t direct_start = UINT64_MAX, direct_end = UINT64_MAX;
     CHECK(get_type(ap + 0x80000, (uint64_t)(uintptr_t)&direct_type,
                    (uint64_t)(uintptr_t)&direct_start,
                    (uint64_t)(uintptr_t)&direct_end, 0, 0) == 0 &&
-              direct_type == 6 && direct_start == ap && direct_end == ap + 0x100000,
+              direct_type == 12 && direct_start == ap && direct_end == ap + 0x100000,
           "GetDirectMemoryType returns the containing physical allocation and exact type");
     CHECK((uint32_t)get_type(ap, (uint64_t)(uintptr_t)&direct_type, 0,
                              (uint64_t)(uintptr_t)&direct_end, 0, 0) == 0x80020016u,
