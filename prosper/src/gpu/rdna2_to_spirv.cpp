@@ -5187,6 +5187,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             fmt == DataFormat::Uint2_10_10_10);
             bool is_sint = (fmt == DataFormat::Sint8 || fmt == DataFormat::Sint16 ||
                             fmt == DataFormat::Sint2_10_10_10);
+            // A buffer_load_FORMAT whose V# type is a sub-dword integer (Uint8/Sint8/Uint16/Sint16)
+            // reads tightly-packed integer components at a RUNTIME byte address — exactly like the raw
+            // buffer_load_ubyte/ushort path, NOT the descriptor-defined statically-aligned packing the
+            // norm/half formats use. DOLL's post-process LUT compute kernels index a stride-1 Uint8
+            // table this way (`buffer_load_format_x v, vIDX, V#`, idxen), which the aligned packed path
+            // below wrongly rejected as unaligned. Handle it with a runtime byte/halfword extract.
+            const bool int_subword = is_format && !raw_subword && (is_uint || is_sint) &&
+                                     (comp_bytes == 1 || comp_bytes == 2);
             float norm = 0.0f;
             switch (fmt) {
                 case DataFormat::Unorm8:  norm = 255.0f;   break;
@@ -5211,6 +5219,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // the gap) rather than silently mis-decode. Aligned iff: inst offset %4==0; stride %4==0
             // when idxen; no offen (a runtime per-lane byte offset is unprovable); SOFFSET is NULL/0.
             bool dyn_half = false;   // 16-bit element at a runtime dword half (stride-2 buffers, #273)
+            bool dyn_int = false;    // integer sub-dword FORMAT component at a runtime (unaligned) byte addr
             if (packed && !raw_subword) {
                 bool base_aligned;
                 if (dyn_vfetch) {
@@ -5239,7 +5248,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                      (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
                     dyn_half = !packed_word && !is_store && n == 1 && comp_bytes == 2 && !offen && !dyn_vfetch &&
                                (offset & 1u) == 0 && (!idxen || (stride & 1u) == 0) && soff_zero;
-                    if (!dyn_half) {
+                    // An integer sub-dword FORMAT load extracts each component at its runtime byte
+                    // address (join the straddled dwords, then bfe), so it needs no static alignment.
+                    // Only LOADS: the packed store path still rejects sub-dword ints (they don't pack).
+                    if (!dyn_half) dyn_int = int_subword && !is_store;
+                    if (!dyn_half && !dyn_int) {
                         if (getenv("PROSPER_DBG"))
                             fprintf(stderr, "[mubuf-unaligned] pc=%u fmt=%u off=%u offen=%d idxen=%d stride=%u\n",
                                     in.pc, (unsigned)fmt, offset, (int)offen, (int)idxen, stride);
@@ -5390,6 +5403,26 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                           : is_uint ? b.bfe_u(dws, b.uconst(0), b.uconst(16))
                           : is_sint ? b.bfe_s(dws, b.uconst(0), b.uconst(16))
                                     : b.unpack_norm(dws, 0, 16, is_snorm, norm);
+                } else if (dyn_int) {
+                    // Integer sub-dword FORMAT component k at a runtime byte address (addr + k*comp_bytes):
+                    // shift the loaded dword right by (byteaddr&3)*8, join the next dword when a 16-bit
+                    // field straddles the boundary, then zero-/sign-extend the comp_bytes*8-bit field.
+                    // Mirrors the raw_subword path but per packed component (stride-1 Uint8, unaligned u16).
+                    const uint32_t caddr = k ? b.ibin(Op_IAdd, addr, b.uconst(k * comp_bytes)) : addr;
+                    const uint32_t cidx  = b.ibin(Op_ShiftRightLogical, caddr, b.uconst(2));
+                    const uint32_t shift = b.ibin(Op_ShiftLeftLogical,
+                                                  b.ibin(Op_BitwiseAnd, caddr, b.uconst(3)), b.uconst(3));
+                    uint32_t joined = b.ibin(Op_ShiftRightLogical, b.cbuf_load(cidx, binding), shift);
+                    if (comp_bytes == 2) {
+                        const uint32_t dw1 = b.cbuf_load(b.ibin(Op_IAdd, cidx, b.uconst(1)), binding);
+                        const uint32_t inv_shift = b.ibin(Op_BitwiseAnd,
+                            b.ibin(Op_ISub, b.uconst(32), shift), b.uconst(31));
+                        const uint32_t upper = b.ibin(Op_ShiftLeftLogical, dw1, inv_shift);
+                        joined = b.ibin(Op_BitwiseOr, joined,
+                                        b.sel(b.ucmp(Op_IEqual, shift, b.uconst(0)), b.uconst(0), upper));
+                    }
+                    value = is_sint ? b.bfe_s(joined, b.uconst(0), b.uconst(comp_bytes * 8))
+                                    : b.bfe_u(joined, b.uconst(0), b.uconst(comp_bytes * 8));
                 } else {
                     // Component k lives at byte k*comp_bytes within the element: pick its dword + field.
                     uint32_t byte_off = k * comp_bytes;
