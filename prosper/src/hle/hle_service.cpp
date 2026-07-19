@@ -1103,6 +1103,26 @@ HLE(s_syss_safearea) {
     return 0;
 }
 
+// sceSystemServiceGetHdrToneMapLuminance(out). Kyty models the output as three floats in this order:
+// max-full-frame, max, and min tone-map luminance. The imported function previously fell through to
+// success-without-output, so display setup consumed poisoned values. Use Kyty's 80/1000/0 values as
+// a deterministic fallback; this does not advertise or implement an HDR presentation path.
+// CONFIDENCE: MED on the Kyty-derived 12-byte layout/order; LOW on the real-hardware values.
+struct SysHdrToneMapLuminance {
+    float max_full_frame;
+    float max;
+    float min;
+};
+static_assert(sizeof(SysHdrToneMapLuminance) == 12, "Kyty-modeled HDR tone-map luminance layout");
+HLE(s_syss_hdr_luminance) {
+    auto* luminance = (SysHdrToneMapLuminance*)PW(a0);
+    if (!luminance) return 0x80A10003ull;   // SYSTEM_SERVICE_ERROR_PARAMETER
+    luminance->max_full_frame = 80.0f;
+    luminance->max = 1000.0f;
+    luminance->min = 0.0f;
+    return 0;
+}
+
 // sceAppContentTemporaryDataMount2(option, SceAppContentMountPoint* mp) — mount the app's temp-data
 // area and write its guest path into mp. SceAppContentMountPoint = char data[16] (shadPS4
 // app_content.h; PS4/PS5 identical). shadPS4 writes exactly "/temp0\0" and returns 0. Our previous
@@ -2221,6 +2241,8 @@ void register_service_hle() {
     R("sceSystemServiceReceiveEvent", s_sysservice_receiveevent);   // NO_EVENT, don't leave the struct garbage
     // sceSystemServiceGetDisplaySafeAreaInfo (1n37q1Bvc5Y) — fill ratio=1.0 (see s_syss_safearea).
     Hle::register_fn("1n37q1Bvc5Y", (HleFn)s_syss_safearea, "sceSystemServiceGetDisplaySafeAreaInfo");
+    Hle::register_fn("mPpPxv5CZt4", (HleFn)s_syss_hdr_luminance,
+                     "sceSystemServiceGetHdrToneMapLuminance");
 
     // ---- Issue #232 services (raw NIDs; every pair verified against the PS5 3.20 stub tables) ----
     // libScePlayGo — everything installed & locus-local.
