@@ -413,9 +413,63 @@ int main() {
     }
 
     CHECK(rs.db_depth_control  == 0x00000046u, "db_depth_control raw preserved");
-    CHECK(rs.cb_color_control  == 0x00CC0010u, "cb_color_control raw preserved");
+    CHECK(rs.has_cb_color_control && rs.cb_color_control == 0x00CC0010u,
+          "programmed cb_color_control presence and raw value preserved");
     CHECK(rs.cb_target_mask    == 0x000000FFu, "cb_target_mask raw preserved");
     CHECK(rs.cb_shader_mask    == 0x000000F3u, "cb_shader_mask raw preserved");
+
+    // #919: an explicit MODE=DISABLE suppresses MRT writes but must not suppress depth/stencil.
+    // Presence matters because zero is also the historical value of an absent register in direct
+    // RenderState users. DCC_DECOMPRESS remains owned by the helper-program path in gpu_execute.hpp.
+    {
+        GpuState absent_state;
+        absent_state.cx[P::CB_TARGET_MASK] = 0xFFu;
+        absent_state.cx[P::CB_SHADER_MASK] = 0xFFu;
+        RenderState absent = extract_render_state(absent_state);
+        ResolvedPipelineState absent_ps = resolve_pipeline_state(absent);
+        CHECK(!absent.has_cb_color_control && absent_ps.color_write_mask == 0xFu &&
+                  absent_ps.color1_write_mask == 0xFu,
+              "absent CB_COLOR_CONTROL retains legacy color-write behavior");
+
+        RenderState disabled = absent;
+        disabled.has_cb_color_control = true;
+        disabled.cb_color_control =
+            P::CB_COLOR_CONTROL_MODE_DISABLE << P::CB_COLOR_CONTROL_MODE_SHIFT;
+        disabled.z_write_enable = true;
+        ResolvedPipelineState disabled_ps = resolve_pipeline_state(disabled);
+        CHECK(disabled_ps.color_write_mask == 0 && disabled_ps.color1_write_mask == 0,
+              "explicit CB MODE=DISABLE suppresses every MRT color-write mask");
+        CHECK(disabled_ps.depth_write_enable && has_depth_stencil_side_effect(disabled_ps),
+              "explicit CB MODE=DISABLE preserves depth/stencil side effects");
+
+        RenderState normal = absent;
+        normal.has_cb_color_control = true;
+        normal.cb_color_control =
+            P::CB_COLOR_CONTROL_MODE_NORMAL << P::CB_COLOR_CONTROL_MODE_SHIFT;
+        CHECK(resolve_pipeline_state(normal).color_write_mask == 0xFu,
+              "explicit CB MODE=NORMAL retains ordinary color writes");
+
+        RenderState dcc = absent;
+        dcc.has_cb_color_control = true;
+        dcc.cb_color_control =
+            P::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS << P::CB_COLOR_CONTROL_MODE_SHIFT;
+        CHECK(resolve_pipeline_state(dcc).color_write_mask == 0xFu,
+              "DCC decompress keeps its helper-program handling outside state resolution");
+
+        RenderState unsupported2 = absent;
+        unsupported2.has_cb_color_control = true;
+        unsupported2.cb_color_control = 2u << P::CB_COLOR_CONTROL_MODE_SHIFT;
+        RenderState unsupported3 = unsupported2;
+        unsupported3.cb_color_control = 3u << P::CB_COLOR_CONTROL_MODE_SHIFT;
+        const std::string mode_diagnostics = capture_stderr([&] {
+            (void)resolve_pipeline_state(unsupported2);
+            (void)resolve_pipeline_state(unsupported2);
+            (void)resolve_pipeline_state(unsupported3);
+        });
+        CHECK(occurrence_count(mode_diagnostics, "MODE=2 ") == 1u &&
+                  occurrence_count(mode_diagnostics, "MODE=3 ") == 1u,
+              "unmodeled CB modes log once per distinct value while retaining fallback behavior");
+    }
 
     // #309: CB fast-clear word extraction + format-aware decode in resolve_pipeline_state.
     CHECK(rs.color0_has_clear, "color0_has_clear = true (CLEAR_WORD programmed)");

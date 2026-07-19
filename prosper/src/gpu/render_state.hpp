@@ -124,6 +124,10 @@ struct RenderState {
     uint32_t db_stencil_control   = 0;   // DB_STENCIL_CONTROL   (front/back stencil-fail / z-pass / z-fail ops)
     uint32_t db_stencilrefmask    = 0;   // DB_STENCILREFMASK    (front ref / compare-mask / write-mask)
     uint32_t db_stencilrefmask_bf = 0;   // DB_STENCILREFMASK_BF (back-face ref / compare-mask / write-mask)
+    // MODE=0 means DISABLE when the register was explicitly programmed, but zero is also the
+    // historical value of an absent register in synthetic/legacy streams. Retain presence so the
+    // resolver can honor a real disable without turning old direct RenderState users into no-ops.
+    bool     has_cb_color_control = false;
     uint32_t cb_color_control  = 0;   // CB_COLOR_CONTROL
     uint32_t cb_blend0_control = 0;   // CB_BLEND0_CONTROL
     uint32_t cb_target_mask    = 0;   // CB_TARGET_MASK (per-MRT write mask)
