@@ -35,8 +35,9 @@ struct GpuCaptureShaderVersion {
     std::vector<uint32_t> words;
 };
 
-// Raw RDNA2 retained only for failed operations. Each version is capped at 64 KiB and ends at the
-// first decoded s_endpgm/unknown instruction or that cap. Equal byte streams share one version.
+// Raw RDNA2 retained for realized graphics stages and failed operations. Each version is capped at
+// 64 KiB and ends at the first decoded s_endpgm/unknown instruction or that cap. Equal byte streams
+// share one version.
 struct GpuCaptureRawShaderVersion {
     uint64_t content_hash = 0;
     bool has_endpgm = false;
@@ -72,6 +73,8 @@ struct GpuCapturedDraw {
     uint32_t color1_width = 0, color1_height = 0;
     uint64_t draw_index = 0;
     uint64_t command_order = 0;
+    uint32_t vs_raw_shader_index = 0xFFFFFFFFu;
+    uint32_t fs_raw_shader_index = 0xFFFFFFFFu;
 };
 
 struct GpuCapturedCompute {

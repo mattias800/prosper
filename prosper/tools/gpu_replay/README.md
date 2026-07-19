@@ -73,6 +73,7 @@ expected hash. `--allow-mismatch` is for an intentional differential such as `--
 ./build-linux/gpu_replay --dump-rtt-seed 0x7f9f504b0000 /tmp/history.bmp \
   --inspect-only /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-shader 18:fs /tmp/fragment.spv /tmp/submit.prgcap
+./build-linux/gpu_replay --dump-realized-shader 18:fs /tmp/fragment-rdna2.bin /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-compute 0 /tmp/compute.spv /tmp/submit.prgcap
 ./build-linux/gpu_replay --compute-only 0 /tmp/submit.prgcap
 ./build-linux/gpu_replay --compute-only 0 --override-compute-spv 0 /tmp/reduced.spv \
@@ -80,6 +81,12 @@ expected hash. `--allow-mismatch` is for an intentional differential such as `--
 ./build-linux/gpu_replay --dump-compute-resource 0:2 /tmp/storage.bin /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-failed-shader 0:1 /tmp/failed-fragment.bin /tmp/submit.prgcap
 ```
+
+`--dump-shader DRAW:vs|fs PATH` writes the recompiled SPIR-V. Capture v19 adds
+`--dump-realized-shader DRAW:vs|fs PATH` for the exact bounded raw RDNA2 stream that produced that realized
+draw stage, suitable for `shader_inspect`. The VS/FS streams use the same content-addressed 64 KiB-per-stage,
+64 MiB-total store as failed-shader diagnostics. Captures v1-v18 remain readable; because they did not retain
+realized-stage source identities, this command reports the raw stream as unavailable instead of guessing.
 
 Selected draw ranges and ordered prefixes write the BMP at the final selected draw target's extent when
 the returned RGBA byte count confirms that native size. Presentation-scaled replays retain the capsule's

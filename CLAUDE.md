@@ -217,6 +217,8 @@ The #781 investigation localizes that residual pattern to the additive window-li
 depth, history-alpha, simple sampler-filter, and perspective-interpolation explanations. It remains open and
 deprioritized; see `docs/DEAD_CELLS_STATUS.md` before repeating live experiments. Successful raw RDNA2/SPIR-V
 pairs can now be captured with `PROSPER_SHADER_DUMP_SUCCESS=DIR` for offline inspection.
+Capture v19 also retains the exact bounded raw VS/FS source for every realized draw; export one offline with
+`gpu_replay --dump-realized-shader DRAW:vs|fs PATH` and inspect it with `shader_inspect`.
 
 `--bundle-final-capsule` snapshots both color RTT state and exact valid planes from persistent Vulkan
 depth/stencil images into capture v8 (#569). Capture v8 reads v1-v7 artifacts; pre-v7 failed-operation diagnostics
