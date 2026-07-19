@@ -398,7 +398,9 @@ void decode_operands(Rdna2Inst& i) {
             // the Gen5 combined seven-bit BUF_FMT in d0[25:19]. Operand/address fields match
             // MUBUF: VDATA, VADDR, SRSRC*4, SOFFSET plus OFFSET/OFFEN/IDXEN.
             const uint32_t d1 = i.words[1];
-            i.opcode = (w >> 16) & 0x7u;
+            // gfx10 moves OP[3] to instruction bit 53 (dword1 bit 21) to make room for the
+            // combined seven-bit format. Opcodes 8..15 are the packed-D16 variants.
+            i.opcode = ((w >> 16) & 0x7u) | (((d1 >> 21) & 1u) << 3);
             i.mtbuf_format = (w >> 19) & 0x7Fu;
             i.mubuf_glc = ((w >> 14) & 1u) != 0;
             i.dst    = vgpr(d1 >> 8);

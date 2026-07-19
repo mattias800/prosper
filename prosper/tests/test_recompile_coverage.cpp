@@ -31,6 +31,12 @@ int main() {
     CHECK(mtbuf.total == 1 && mtbuf.table_dependent == 1 && mtbuf.unsupported == 0 &&
           mtbuf.first_bad_fmt < 0,
           "MTBUF typed loads are reported as resource-table-dependent coverage");
+    const uint32_t mtbuf_d16_code[] = { 0xe8682000u, 0x80220000u, 0xBF810000u };
+    RecompileCoverage mtbuf_d16 = recompile_coverage(
+        mtbuf_d16_code, sizeof(mtbuf_d16_code)/sizeof(mtbuf_d16_code[0]));
+    CHECK(mtbuf_d16.total == 1 && mtbuf_d16.table_dependent == 0 &&
+          mtbuf_d16.unsupported == 1 && mtbuf_d16.first_bad_op == 8u,
+          "unimplemented MTBUF D16 remains an explicit unsupported opcode");
 
     // Contains an unsupported op: v_add_f32 ; s_branch +5 (unconditional -> rejected) ; s_endpgm.
     const uint32_t bad_code[] = { 0x06000300u, 0xbf820005u, 0xBF810000u };

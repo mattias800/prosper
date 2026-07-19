@@ -124,6 +124,13 @@ int main() {
               mt_store.src[2].kind == OperandKind::InlineInt &&
               mt_store.src[2].value == 0 && ((mt_store.literal >> 13) & 1u),
           "MTBUF store decodes opcode, combined format, operands, and IDXEN");
+    // gfx1030 llvm-mc: tbuffer_load_format_d16_x v0, v0, s[8:11], 0
+    // format:[BUF_FMT_16_FLOAT] idxen. OP[3] lives in dword1 bit 21 on gfx10.
+    const uint32_t mtbuf_d16[] = { 0xe8682000u, 0x80220000u };
+    Rdna2Inst mt_d16 = rdna2_decode_one(mtbuf_d16, 2);
+    CHECK(mt_d16.fmt == Rdna2Format::MTBUF && mt_d16.opcode == 8u &&
+              mt_d16.mtbuf_format == 13u,
+          "MTBUF decodes the split high opcode bit instead of aliasing D16 onto ordinary loads");
     // Exact DS_READ2_B32 words from Astro Bot's loading-surface compute producer. The packed
     // offset bytes are dword indices (offset0 in the low byte, offset1 in the high byte).
     const uint32_t ds_read2_adjacent[] = { 0xd8dc0100u, 0x04000002u };

@@ -777,6 +777,29 @@ int main() {
                          sizeof(code23mt_badfmt)/sizeof(code23mt_badfmt[0]),
                          1, 1, &rt23mt).empty(),
           "MTBUF unknown combined format is rejected instead of silently read as raw dwords");
+    // gfx1030 MTBUF forces identity selection from its instruction format. A four-component opcode
+    // reading a three-component 32_32_32_FLOAT element therefore returns XYZ0 (not MUBUF's XYZ1).
+    const uint32_t code23mt_identity[] = {
+        0x7e000f00u, 0xea532000u, 0x80020100u, 0xbf810000u,
+    };
+    ShaderResourceTable rt23mt_identity;
+    { ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Float32;
+      vb.num_components = 4; vb.binding = 3; vb.stride = 12; vb.sgpr_base = 8;
+      rt23mt_identity.resources.push_back(vb); }
+    std::vector<uint32_t> vbuf23mt_identity(N * 3u);
+    for (uint32_t i = 0; i < N; ++i) {
+        const float xyz[3] = { (float)i, (float)i + 1.0f, (float)i + 2.0f };
+        std::memcpy(vbuf23mt_identity.data() + i * 3u, xyz, sizeof(xyz));
+    }
+    std::vector<uint32_t> spv23mt_identity = recompile_valu(
+        code23mt_identity, sizeof(code23mt_identity)/sizeof(code23mt_identity[0]),
+        1, 4, &rt23mt_identity);
+    std::vector<float> got23mt_identity = prosper::test::run_compute(
+        spv23mt_identity, in23, N, N, {}, vbuf23mt_identity);
+    bool identity_zero = got23mt_identity.size() == N;
+    for (float w : got23mt_identity) identity_zero &= w == 0.0f;
+    CHECK(!spv23mt_identity.empty() && identity_zero,
+          "MTBUF identity selection fills absent W with zero");
 
     // A pc-keyed VertexBuffer is not necessarily the NGG v0 fetch prologue. DOLL's skinned scene
     // shaders use a direct structured V# through computed VADDRs (v4/v5/v7/...); the old shortcut

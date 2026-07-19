@@ -1712,8 +1712,14 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         uint32_t inst_components = 0;
                         if (is_mtbuf)
                             rdna2_buffer_format(in.mtbuf_format, &inst_format, &inst_components);
+                        // FORMAT=INVALID is the architectural unbound-resource marker. MTBUF's
+                        // instruction format controls conversion, but does not turn an unbound V#
+                        // into a valid resource.
+                        const bool descriptor_bound = !is_mtbuf ||
+                            (((u.v4[3] >> 12) & 0x7Fu) != 0);
                         const bool format_supported = !format_store_use ||
-                            (is_mtbuf ? (inst_format != DataFormat::Unknown && inst_components != 0)
+                            (is_mtbuf ? (descriptor_bound && inst_format != DataFormat::Unknown &&
+                                         inst_components != 0)
                                       : (d.format != DataFormat::Unknown && d.num_components != 0 &&
                                          !d.forbid_unknown_fallback));
                         // Byte-addressed raw/atomic V#s validly use stride zero: NUM_RECORDS is bytes.
@@ -1773,6 +1779,12 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     };
                     auto append_fetch = [&](DecodedBufferDescriptor d, uint32_t desc_v3,
                                             bool from_seed = false) {
+                        if (is_mtbuf && ((desc_v3 >> 12) & 0x7Fu) == 0) {
+                            if (trc) fprintf(stderr,
+                                "[dyntrace]   MTBUF pc=%u unbound V# v3=0x%x -> unresolved\n",
+                                in.pc, desc_v3);
+                            return;
+                        }
                         // decode_buffer_descriptor deliberately rejects packed formats whose selector
                         // or conversion semantics are unsupported. Do not let build_stage_table's
                         // legacy Unknown->Float32 fallback resurrect that descriptor as four raw dwords.
@@ -1900,6 +1912,9 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
     // OFFSET/SOFFSET itself; `fetch.desc` is shifted for graphics' special vertex-index path.
     for (const auto& fetch : direct_fetches) {
         const DecodedBufferDescriptor& d = fetch.unshifted_desc;
+        if (fetch.instruction_format != UINT32_MAX &&
+            ((fetch.desc_v3 >> 12) & 0x7Fu) == 0)
+            continue;
         DataFormat format = d.format;
         uint32_t components = d.num_components;
         if (fetch.instruction_format != UINT32_MAX)
@@ -1932,6 +1947,8 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
     std::set<uint64_t> seen;
     for (const auto& u : srt_uses) {
         if (u.kind != 1) continue;
+        if (u.instruction_format != UINT32_MAX && ((u.v4[3] >> 12) & 0x7Fu) == 0)
+            continue;
         // Keyed buffer uses dedupe by table offset; key-less live descriptors dedupe by consumer pc.
         const uint64_t dk = u.key == 0xFFFFFFFFu
             ? (0x8000000100000000ull | u.use_pc)
@@ -2181,6 +2198,9 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
         // (a raw 32-bit-per-component fetch, correct for float attributes like positions).
         for (auto& kv : dyn_vb) {
             const auto& d = kv.desc;
+            if (kv.instruction_format != UINT32_MAX &&
+                ((kv.desc_v3 >> 12) & 0x7Fu) == 0)
+                continue;
             // Belt-and-suspenders: resolve_dynamic_fetch filters these before emitting DynFetch, but
             // never allow a deliberately rejected packed descriptor to reach the generic Float32
             // fallback if another producer constructs a DynFetch in the future.
@@ -2281,6 +2301,9 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     for (const auto& r0 : t.resources) if (r0.srt_offset == u.key) { clash = true; break; }
                 if (u.kind == 1) {                       // constant buffer / structured-buffer V#
                     DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
+                    if (u.instruction_format != UINT32_MAX &&
+                        ((u.v4[3] >> 12) & 0x7Fu) == 0)
+                        continue;
                     if (d.base <= 0x10000) continue;
                     uint32_t resource_size = d.size_bytes;
                     uint32_t resource_stride = d.stride;

@@ -4679,6 +4679,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // a VGPR load would clobber a live register AND drop the LDS write. Reject until a
             // buffer->LDS model exists.
             if (in.fmt == Rdna2Format::MUBUF && in.mubuf_lds) { ok = false; return true; }
+            // MTBUF opcodes 8..15 pack D16 results/inputs two per VGPR. Reusing the ordinary or raw
+            // MUBUF cases below would silently apply the wrong register layout, so fail closed until
+            // that packing is modeled.
+            if (in.fmt == Rdna2Format::MTBUF && in.opcode >= 8u) { ok = false; return true; }
             uint32_t n = 0; bool is_format = false, is_store = false, is_atomic = false;
             bool raw_subword = false, raw_signed = false;
             uint32_t raw_bits = 32;
@@ -5007,16 +5011,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 int d = in.dst.value + (int)k;
                 uint32_t old = vreg_old(b, rs, d);
                 uint32_t value;
-                // Format default-fill (#368): BUFFER_LOAD_FORMAT_* returns only the components the V#'s
-                // format defines; a component the OPCODE requests beyond that (e.g. _xyzw against a
-                // 32_32_32 position, or _xyz against a 32_32 UV) is filled with the standard vector
-                // default — 0 for G/B/Z, 1 for A/W — NOT read from adjacent memory (which yielded the
-                // next vertex's bytes, or robust-0 at the buffer tail, so a vec4 read of a vec3 attribute
-                // got W = garbage/0 instead of 1.0 -> broken transforms). Only for format loads with a
-                // known component count; untyped raw MUBUF loads keep every opcode component.
+                // Format default-fill (#368): a requested component beyond the format's component
+                // count is not read from adjacent memory. MUBUF takes DST_SEL from the V# contract
+                // (0 for G/B/Z, 1 for A/W). MTBUF forces identity selection from its instruction
+                // format (X000/XY00/XYZ0/XYZW), so every absent component is zero.
                 if (is_format && fmt_ncomp && k >= fmt_ncomp) {
                     uint32_t one = fmt_is_int ? 1u : 0x3f800000u;   // integer 1 vs float 1.0 (raw bits)
-                    value = b.uconst(k == 3 ? one : 0u);            // W/A -> 1, G/B/Z -> 0
+                    value = b.uconst(in.fmt != Rdna2Format::MTBUF && k == 3 ? one : 0u);
                 } else if (raw_subword) {
                     // Raw byte/short loads use their full byte address, unlike typed packed-format
                     // loads whose component packing is descriptor-defined. A 16-bit access may begin
