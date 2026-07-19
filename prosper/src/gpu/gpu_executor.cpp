@@ -437,7 +437,8 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
                                      instruction.fmt == Rdna2Format::SOPP ||
                                      instruction.fmt == Rdna2Format::SMEM ||
                                      instruction.fmt == Rdna2Format::MIMG ||
-                                     instruction.fmt == Rdna2Format::MUBUF;
+                                     instruction.fmt == Rdna2Format::MUBUF ||
+                                     instruction.fmt == Rdna2Format::MTBUF;
             if (fold_format || scalar_spill || scalar_spill_invalidation ||
                 instruction.dst.kind == OperandKind::SGPR)
                 result->instructions.push_back(instruction);
@@ -1661,13 +1662,15 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 }
                 break;
             }
-            case Rdna2Format::MUBUF: {
+            case Rdna2Format::MUBUF:
+            case Rdna2Format::MTBUF: {
+                const bool is_mtbuf = in.fmt == Rdna2Format::MTBUF;
                 // Buffer stores, raw loads/stores, and supported atomics need a kind-1 resource use.
                 // Format loads are intentionally handled only by DynFetch below: it snapshots the V#
                 // live at the instruction and resolves by exact pc, avoiding a duplicate stale SRT use.
-                const bool raw_buffer_use =
-                    (in.opcode >= 0x08 && in.opcode <= 0x0F) ||
-                    (in.opcode >= 0x1C && in.opcode <= 0x1E);
+                const bool raw_buffer_use = !is_mtbuf &&
+                    ((in.opcode >= 0x08 && in.opcode <= 0x0F) ||
+                     (in.opcode >= 0x1C && in.opcode <= 0x1E));
                 const bool format_store_use = in.opcode >= 0x04 && in.opcode <= 0x07;
                 const bool atomic_buffer_use = in.opcode == 0x38; // buffer_atomic_umax
                 if (srt_uses && (format_store_use || raw_buffer_use || atomic_buffer_use)) {
@@ -1684,6 +1687,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         // exact; an unmodeled/incompatible write becomes unknown and fails closed
                         // instead of resurrecting the load-time descriptor snapshot.
                         SrtUse u; u.kind = 1; u.v4 = current; u.key = 0xFFFFFFFFu; u.use_pc = in.pc;
+                        if (is_mtbuf) u.instruction_format = in.mtbuf_format;
                         if (loaded_provenance) {
                             uint32_t common_key = 0;
                             bool have_common_key = true;
@@ -1704,9 +1708,14 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             if (have_common_key) u.key = common_key;
                         }
                         DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
+                        DataFormat inst_format = DataFormat::Unknown;
+                        uint32_t inst_components = 0;
+                        if (is_mtbuf)
+                            rdna2_buffer_format(in.mtbuf_format, &inst_format, &inst_components);
                         const bool format_supported = !format_store_use ||
-                            (d.format != DataFormat::Unknown && d.num_components != 0 &&
-                             !d.forbid_unknown_fallback);
+                            (is_mtbuf ? (inst_format != DataFormat::Unknown && inst_components != 0)
+                                      : (d.format != DataFormat::Unknown && d.num_components != 0 &&
+                                         !d.forbid_unknown_fallback));
                         // Byte-addressed raw/atomic V#s validly use stride zero: NUM_RECORDS is bytes.
                         // Typed format stores retain the strided record requirement.
                         const bool stride_supported = !format_store_use || d.stride != 0;
@@ -1767,7 +1776,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         // decode_buffer_descriptor deliberately rejects packed formats whose selector
                         // or conversion semantics are unsupported. Do not let build_stage_table's
                         // legacy Unknown->Float32 fallback resurrect that descriptor as four raw dwords.
-                        if (d.forbid_unknown_fallback) {
+                        if (!is_mtbuf && d.forbid_unknown_fallback) {
                             if (trc) fprintf(stderr,
                                 "[dyntrace]   MUBUF pc=%u packed V# v3=0x%x unsupported -> unresolved\n",
                                 in.pc, desc_v3);
@@ -1775,6 +1784,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         }
                         DynFetch fetch{ in.pc, srsrc, with_off(d), desc_v3, from_seed };
                         fetch.unshifted_desc = d;
+                        if (is_mtbuf) fetch.instruction_format = in.mtbuf_format;
                         out.push_back(fetch);
                     };
                     if (trc) fprintf(stderr, "[dyntrace] MUBUF fetch pc=%u op=0x%x SRSRC=s%d patched=%d (k=%d%d%d%d v3=0x%x) have_descr=%d off=+0x%x soff_known=%d\n",
@@ -1817,7 +1827,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         DecodedBufferDescriptor d = decode_buffer_descriptor(sv);
                         // Plausibility: only emit a real-looking V# (mirrors the direct-resource guard).
                         if (d.base > 0x10000 && d.size_bytes != 0 && d.size_bytes <= 0x10000000u &&
-                            !d.forbid_unknown_fallback) {
+                            (is_mtbuf || !d.forbid_unknown_fallback)) {
                             if (trc) fprintf(stderr, "[dyntrace]   MUBUF pc=%u seed-V# fallback SRSRC=s%d base=0x%llx\n",
                                              in.pc, srsrc, (unsigned long long)d.base);
                             append_fetch(d, sv[3], /*from_seed=*/true);
@@ -1890,14 +1900,19 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
     // OFFSET/SOFFSET itself; `fetch.desc` is shifted for graphics' special vertex-index path.
     for (const auto& fetch : direct_fetches) {
         const DecodedBufferDescriptor& d = fetch.unshifted_desc;
+        DataFormat format = d.format;
+        uint32_t components = d.num_components;
+        if (fetch.instruction_format != UINT32_MAX)
+            rdna2_buffer_format(fetch.instruction_format, &format, &components);
         if (d.base <= 0x10000 || d.size_bytes == 0 || d.size_bytes > 0x10000000u ||
-            d.format == DataFormat::Unknown || !d.num_components || d.forbid_unknown_fallback)
+            format == DataFormat::Unknown || !components ||
+            (fetch.instruction_format == UINT32_MAX && d.forbid_unknown_fallback))
             continue;
         bool mapped = false;
         for (auto& r0 : table.resources) {
             if (r0.cls != ResourceClass::ConstantBuffer || r0.gpu_addr != d.base ||
-                r0.size != d.size_bytes || r0.stride != d.stride || r0.format != d.format ||
-                r0.num_components != d.num_components)
+                r0.size != d.size_bytes || r0.stride != d.stride || r0.format != format ||
+                r0.num_components != components)
                 continue;
             if (r0.fetch_pc == 0xFFFFFFFFu) r0.fetch_pc = fetch.fetch_pc;
             if (r0.fetch_pc == fetch.fetch_pc) { mapped = true; break; }
@@ -1905,8 +1920,8 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         if (mapped) continue;
         ShaderResource r;
         r.cls = ResourceClass::ConstantBuffer;
-        r.format = d.format;
-        r.num_components = d.num_components;
+        r.format = format;
+        r.num_components = components;
         r.gpu_addr = d.base;
         r.size = d.size_bytes;
         r.stride = d.stride;
@@ -1943,8 +1958,13 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         }
         ShaderResource r;
         r.cls = ResourceClass::ConstantBuffer;
-        r.format = d.format;
-        r.num_components = d.num_components ? d.num_components : 1;
+        if (u.instruction_format != UINT32_MAX) {
+            rdna2_buffer_format(u.instruction_format, &r.format, &r.num_components);
+            if (r.format == DataFormat::Unknown || r.num_components == 0) continue;
+        } else {
+            r.format = d.format;
+            r.num_components = d.num_components ? d.num_components : 1;
+        }
         r.gpu_addr = d.base;
         r.size = d.size_bytes;
         r.stride = d.stride;
@@ -2164,7 +2184,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             // Belt-and-suspenders: resolve_dynamic_fetch filters these before emitting DynFetch, but
             // never allow a deliberately rejected packed descriptor to reach the generic Float32
             // fallback if another producer constructs a DynFetch in the future.
-            if (d.forbid_unknown_fallback) continue;
+            if (kv.instruction_format == UINT32_MAX && d.forbid_unknown_fallback) continue;
             // A SEED-fallback entry must not shadow a metadata-described DIRECT vertex buffer at the
             // same SGPRs (see DynFetch::from_seed): the direct resource resolves the fetch through
             // the faithful address path, which is the correct model for a single un-patched V#.
@@ -2181,8 +2201,13 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             // computed VADDR/stride address; labeling it VertexBuffer makes the recompiler take
             // the gl_VertexIndex shortcut and rejects valid stride-2 uint16 tables (#719).
             r.cls           = is_ps ? ResourceClass::ConstantBuffer : ResourceClass::VertexBuffer;
-            r.format        = (d.format == DataFormat::Unknown) ? DataFormat::Float32 : d.format;
-            r.num_components = d.num_components ? d.num_components : 4;
+            if (kv.instruction_format != UINT32_MAX) {
+                rdna2_buffer_format(kv.instruction_format, &r.format, &r.num_components);
+                if (r.format == DataFormat::Unknown || r.num_components == 0) continue;
+            } else {
+                r.format = (d.format == DataFormat::Unknown) ? DataFormat::Float32 : d.format;
+                r.num_components = d.num_components ? d.num_components : 4;
+            }
             r.gpu_addr      = d.base;
             if (d.size_bytes) {
                 r.size = d.size_bytes;
@@ -2221,7 +2246,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                                  "compatibility size=%u\n",
                                  (unsigned long long)code_addr, kv.fetch_pc, r.size);
             }
-            if (d.format == DataFormat::Unknown) {
+            if (kv.instruction_format == UINT32_MAX && d.format == DataFormat::Unknown) {
                 static std::mutex unknown_mx;
                 static std::set<std::tuple<uint64_t, bool, uint32_t, uint32_t>> unknown_seen;
                 std::lock_guard<std::mutex> lk(unknown_mx);
@@ -2288,7 +2313,13 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     }
                     ShaderResource r;
                     r.cls = ResourceClass::ConstantBuffer;
-                    r.format = d.format; r.num_components = d.num_components ? d.num_components : 1;
+                    if (u.instruction_format != UINT32_MAX) {
+                        rdna2_buffer_format(u.instruction_format, &r.format, &r.num_components);
+                        if (r.format == DataFormat::Unknown || r.num_components == 0) continue;
+                    } else {
+                        r.format = d.format;
+                        r.num_components = d.num_components ? d.num_components : 1;
+                    }
                     r.gpu_addr = d.base; r.size = resource_size; r.stride = resource_stride;
                     r.srt_offset = clash ? 0xFFFFFFFFu : u.key;
                     if (clash) r.fetch_pc = u.use_pc;    // pc-only provenance (key-less/collided V#)

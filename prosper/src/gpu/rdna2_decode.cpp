@@ -393,6 +393,22 @@ void decode_operands(Rdna2Inst& i) {
             i.literal = (w & 0xFFFu) | (((w >> 12) & 1u) << 12) | (((w >> 13) & 1u) << 13);
             i.n_src = 3; break;
         }
+        case Rdna2Format::MTBUF: {
+            // Typed buffer op. gfx1030 keeps the eight load/store opcodes in d0[18:16] and uses
+            // the Gen5 combined seven-bit BUF_FMT in d0[25:19]. Operand/address fields match
+            // MUBUF: VDATA, VADDR, SRSRC*4, SOFFSET plus OFFSET/OFFEN/IDXEN.
+            const uint32_t d1 = i.words[1];
+            i.opcode = (w >> 16) & 0x7u;
+            i.mtbuf_format = (w >> 19) & 0x7Fu;
+            i.mubuf_glc = ((w >> 14) & 1u) != 0;
+            i.dst    = vgpr(d1 >> 8);
+            i.src[0] = vgpr(d1);
+            i.src[1] = sgpr(((d1 >> 16) & 0x1Fu) << 2);
+            i.src[2] = decode_src_field((d1 >> 24) & 0xFFu);
+            i.literal = (w & 0xFFFu) | (((w >> 12) & 1u) << 12) |
+                        (((w >> 13) & 1u) << 13);
+            i.n_src = 3; break;
+        }
         case Rdna2Format::MIMG: {
             // Image op. opcode is 8 bits: MSB in dword0 bit 0, low 7 bits in [24:18] (Table 100:
             // "combine bits zero and 18-24" — dropping bit 0 aliased IMAGE_MSAA_LOAD (128) onto
@@ -439,7 +455,7 @@ void decode_operands(Rdna2Inst& i) {
             i.src[0]      = vgpr(w & 0xFFu);
             i.n_src = 1; break;
         }
-        default: break;   // MTBUF/DS/FLAT: operands not decoded at this stage
+        default: break;   // FLAT operands are not decoded at this stage
     }
 }
 }  // namespace

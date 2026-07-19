@@ -2,7 +2,8 @@
 // real GPU resources) and the recompiler back-half (which must translate the shader's memory ops
 // correctly). This is the seam that unblocks the format-dependent memory instructions:
 //   * s_buffer_load_*   — uniforms / constant buffers (multi-buffer, beyond the single-cbuf model)
-//   * buffer_load_format_* (MUBUF) — vertex attribute fetch (needs the attribute's data format)
+//   * buffer_load_format_* (MUBUF) — vertex attribute fetch (needs the descriptor data format)
+//   * tbuffer_load/store_format_* (MTBUF) — typed buffers (the instruction supplies its data format)
 //   * image_sample / image_load (MIMG) — texture reads (needs texture format + sampler)
 //
 // Why a contract: to translate `buffer_load_format_xyzw` the recompiler must know the attribute's
@@ -18,8 +19,8 @@
 
 namespace prosper::gpu {
 
-// Element data format, decoded from a V#/T# descriptor's DFMT (data format) + NFMT (number format).
-// Determines the conversion a format load / texture sample must emit. `Float32` is the common case
+// Element data format decoded from gfx1030's combined V#/T#/MTBUF format fields. Determines the
+// conversion a format load / texture sample must emit. `Float32` is the common case
 // for positions and most attributes — and for our raw-32-bit-VGPR model it is a *no-op reinterpret*,
 // so float32 format loads reduce to raw dword loads. The rest require real conversion.
 enum class DataFormat : uint32_t {
@@ -51,6 +52,10 @@ enum class DataFormat : uint32_t {
     Uint2_10_10_10,
     Sint2_10_10_10,
 };
+
+// Decode an RDNA2 (GFX10/PS5) combined seven-bit buffer FORMAT field, used by both V# descriptors
+// and MTBUF instructions, into the recompiler's data-format contract. Unknown values stay explicit.
+void rdna2_buffer_format(uint32_t fmt, DataFormat* out_fmt, uint32_t* out_components);
 
 // How many bytes one component of `format` occupies (0 for Unknown and block-compressed formats).
 uint32_t data_format_bytes(DataFormat f);

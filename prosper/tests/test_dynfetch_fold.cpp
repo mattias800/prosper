@@ -564,6 +564,47 @@ int main() {
                              &direct_copy_table, direct_copy_config).empty(),
           "#636: instruction-provenance table keeps the Dead Cells format-copy dispatch realizable");
 
+    // MTBUF's instruction format must also survive the production compute discovery path. Both V#s
+    // deliberately carry format 0 (Unknown); the encoded gfx1030 BUF_FMT 56 supplies Unorm8x4 for
+    // the load and store independently of descriptor dword3.
+    const uint32_t direct_mtbuf_copy[] = {
+        0xE9C32000u, 0x80000100u,   // tbuffer_load_format_xyzw ..., s[0:3], fmt 56, idxen
+        0xE9C72000u, 0x80010101u,   // tbuffer_store_format_xyzw ..., s[4:7], fmt 56, idxen
+        0xBF810000u,
+    };
+    const uint32_t direct_mtbuf_seed[8] = {
+        0x00020000u, 0x00040000u, 16u, 0u,
+        0x00030000u, 0x00040000u, 16u, 0u,
+    };
+    std::vector<SrtUse> direct_mtbuf_uses;
+    const std::vector<DynFetch> direct_mtbuf_fetches = resolve_dynamic_fetch(
+        direct_mtbuf_copy, std::size(direct_mtbuf_copy), direct_mtbuf_seed, 8, 0,
+        &direct_mtbuf_uses);
+    CHECK(direct_mtbuf_fetches.size() == 1 &&
+              direct_mtbuf_fetches[0].instruction_format == 56u &&
+              direct_mtbuf_fetches[0].desc.format == DataFormat::Unknown,
+          "MTBUF load discovery retains the instruction format over an unknown V# format");
+    CHECK(direct_mtbuf_uses.size() == 1 &&
+              direct_mtbuf_uses[0].instruction_format == 56u &&
+              direct_mtbuf_uses[0].use_pc == 2,
+          "MTBUF store discovery retains instruction format and exact consumer pc");
+    ShaderResourceTable direct_mtbuf_table;
+    add_compute_buffer_resources(direct_mtbuf_table, direct_mtbuf_copy,
+                                 std::size(direct_mtbuf_copy), direct_mtbuf_seed, 8);
+    assign_convention_bindings(direct_mtbuf_table, 2);
+    bool mtbuf_formats_ok = direct_mtbuf_table.resources.size() == 2;
+    for (const auto& resource : direct_mtbuf_table.resources)
+        mtbuf_formats_ok &= resource.format == DataFormat::Unorm8 &&
+                            resource.num_components == 4;
+    ComputeShaderConfig direct_mtbuf_config;
+    direct_mtbuf_config.user_sgprs.assign(direct_mtbuf_seed, direct_mtbuf_seed + 8);
+    direct_mtbuf_config.local_x = direct_mtbuf_config.local_y =
+        direct_mtbuf_config.local_z = 1;
+    CHECK(mtbuf_formats_ok &&
+              !recompile_compute(direct_mtbuf_copy, std::size(direct_mtbuf_copy),
+                                 &direct_mtbuf_table, direct_mtbuf_config).empty(),
+          "production compute discovery emits instruction-typed MTBUF source and destination resources");
+
     // DynFetch shifts graphics vertex descriptors by a constant instruction offset because their
     // special address path drops the original OFFSET/SOFFSET. Compute resources use ConstantBuffer's
     // faithful MUBUF path instead, so the production helper must retain base B and let that path add

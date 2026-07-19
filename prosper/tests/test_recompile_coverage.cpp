@@ -22,6 +22,16 @@ int main() {
     CHECK(a.total == 2 && a.alu == 2 && a.unsupported == 0 && a.first_bad_fmt < 0,
           "a fully-handled ALU kernel reports 100% coverage");
 
+    // tbuffer_load_format_x v0, v0, s[8:11], 0 format:32_FLOAT ; s_endpgm.
+    // MTBUF needs a resolved V# binding, so the table-less coverage pass must classify it as
+    // recompilable-in-context rather than truly unsupported.
+    const uint32_t mtbuf_code[] = { 0xe8b02000u, 0x80020100u, 0xBF810000u };
+    RecompileCoverage mtbuf = recompile_coverage(mtbuf_code,
+                                                  sizeof(mtbuf_code)/sizeof(mtbuf_code[0]));
+    CHECK(mtbuf.total == 1 && mtbuf.table_dependent == 1 && mtbuf.unsupported == 0 &&
+          mtbuf.first_bad_fmt < 0,
+          "MTBUF typed loads are reported as resource-table-dependent coverage");
+
     // Contains an unsupported op: v_add_f32 ; s_branch +5 (unconditional -> rejected) ; s_endpgm.
     const uint32_t bad_code[] = { 0x06000300u, 0xbf820005u, 0xBF810000u };
     RecompileCoverage b = recompile_coverage(bad_code, sizeof(bad_code)/sizeof(bad_code[0]));

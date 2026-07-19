@@ -753,6 +753,31 @@ int main() {
     printf("  kernel23 mismatches=%u (out[5]=%g expect=6.5)\n", bad23, got23.size()==N?got23[5]:-1);
     CHECK(got23.size()==N && bad23==0, "recompiled kernel 23 (float32 vertex fetch via sgpr_base provenance) correct");
 
+    // MTBUF uses the same descriptor/address path, but its gfx1030 instruction owns the combined
+    // BUF_FMT. Deliberately give the resource misleading Uint8 metadata: tbuffer_load_format_x's
+    // encoded format 22 (32_FLOAT) must still fetch full float dwords.
+    const uint32_t code23mt[] = { 0x7e000f00u, 0xe8b02000u, 0x80020100u, 0xbf810000u };
+    ShaderResourceTable rt23mt;
+    { ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Uint8;
+      vb.num_components = 1; vb.binding = 3; vb.stride = 4; vb.sgpr_base = 8;
+      rt23mt.resources.push_back(vb); }
+    std::vector<uint32_t> spv23mt = recompile_valu(
+        code23mt, sizeof(code23mt)/sizeof(code23mt[0]), 1, 1, &rt23mt);
+    std::vector<float> got23mt = prosper::test::run_compute(
+        spv23mt, in23, N, N, {}, vbuf23);
+    uint32_t bad23mt = 0;
+    for (uint32_t i = 0; i < N && got23mt.size() == N; ++i)
+        if (std::fabs(got23mt[i] - exp23[i]) > 1e-3f) ++bad23mt;
+    CHECK(!spv23mt.empty() && got23mt.size() == N && bad23mt == 0,
+          "MTBUF 32_FLOAT load uses the instruction format instead of V# metadata");
+    const uint32_t code23mt_badfmt[] = {
+        0x7e000f00u, 0xe8002000u, 0x80020100u, 0xbf810000u,
+    };
+    CHECK(recompile_valu(code23mt_badfmt,
+                         sizeof(code23mt_badfmt)/sizeof(code23mt_badfmt[0]),
+                         1, 1, &rt23mt).empty(),
+          "MTBUF unknown combined format is rejected instead of silently read as raw dwords");
+
     // A pc-keyed VertexBuffer is not necessarily the NGG v0 fetch prologue. DOLL's skinned scene
     // shaders use a direct structured V# through computed VADDRs (v4/v5/v7/...); the old shortcut
     // replaced all of them with gl_VertexIndex. Pin v1=1 and prove the fetch stays on record 1 for
@@ -839,6 +864,44 @@ int main() {
     uint32_t bad24 = 0; for (uint32_t i=0;i<N&&got24.size()==N;i++) if (std::fabs(got24[i]-exp24[i])>2e-3f) bad24++;
     printf("  kernel24 mismatches=%u (out[5]=%g expect=%g)\n", bad24, got24.size()==N?got24[5]:-1, got24.size()==N?exp24[5]:-1);
     CHECK(got24.size()==N && bad24==0, "recompiled kernel 24 (unorm8x4 -> 4 normalized floats) correct");
+
+    // The same packed conversion through MTBUF: opcode XYZW and combined format 56 are both carried
+    // by the instruction. Resource metadata is intentionally Float32x1 to catch accidental reuse.
+    const uint32_t code24mt[] = {
+        0x7e000f00u, 0xe9c32000u, 0x80020100u, 0x7e0a02f4u, 0x100c0505u,
+        0x06020d01u, 0x7e0a02f6u, 0x100c0905u, 0x06020d01u, 0x7e0a02ffu,
+        0x40400000u, 0x100c0705u, 0x06020d01u, 0xbf810000u,
+    };
+    ShaderResourceTable rt24mt;
+    { ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Float32;
+      vb.num_components = 1; vb.binding = 3; vb.stride = 4; vb.sgpr_base = 8;
+      rt24mt.resources.push_back(vb); }
+    std::vector<uint32_t> spv24mt = recompile_valu(
+        code24mt, sizeof(code24mt)/sizeof(code24mt[0]), 1, 1, &rt24mt);
+    std::vector<float> got24mt = prosper::test::run_compute(
+        spv24mt, in24, N, N, {}, vbuf24);
+    uint32_t bad24mt = 0;
+    for (uint32_t i = 0; i < N && got24mt.size() == N; ++i)
+        if (std::fabs(got24mt[i] - exp24[i]) > 2e-3f) ++bad24mt;
+    CHECK(!spv24mt.empty() && got24mt.size() == N && bad24mt == 0,
+          "MTBUF 8_8_8_8_UNORM load applies the instruction's packed conversion");
+
+    // Store the same constant normalized vector to every lane through MTBUF. Round-to-even maps
+    // 0.5*255 to 128, so each destination dword is RGBA = {0,128,255,255}.
+    const uint32_t code24mt_store[] = {
+        0x7e020280u, 0x7e0402f0u, 0x7e0602f2u, 0x7e0802f2u, 0x7e0a0f00u,
+        0xe9c72000u, 0x80020105u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv24mt_store = recompile_valu(
+        code24mt_store, sizeof(code24mt_store)/sizeof(code24mt_store[0]), 1, 0, &rt24mt);
+    std::vector<uint32_t> packed_store_in(N, 0), packed_store_out;
+    prosper::test::run_compute(spv24mt_store, in24, N, N, {}, packed_store_in,
+                               &packed_store_out);
+    uint32_t bad24mt_store = 0;
+    for (uint32_t word : packed_store_out)
+        if (word != 0xffff8000u) ++bad24mt_store;
+    CHECK(!spv24mt_store.empty() && packed_store_out.size() == N && bad24mt_store == 0,
+          "MTBUF 8_8_8_8_UNORM store packs and predicates instruction-typed components");
 
     // Kernel 24b (#150): the SAME unorm8x4 fetch but with a NON-dword-aligned inst offset (offset:2).
     // The packed unpack extracts components at static byte offsets from a dword-aligned base and drops
@@ -1068,6 +1131,23 @@ int main() {
     { float f5 = 0; if (stored_out.size()==N) std::memcpy(&f5, &stored_out[5], 4);
       printf("  kernel29 mismatches=%u (buf[5]=%g expect=10)\n", bad29, f5); }
     CHECK(stored_out.size() == N && bad29 == 0, "recompiled kernel 29 (MUBUF store writes buffer[gid]=2*gid) correct");
+
+    const uint32_t code29mt[] = {
+        0x7e040f00u, 0x06060100u, 0xe8b42000u, 0x80020302u, 0xbf810000u,
+    };
+    ShaderResourceTable rt29mt = rt29;
+    rt29mt.resources[0].format = DataFormat::Uint8; // MTBUF's encoded 32_FLOAT remains authoritative
+    std::vector<uint32_t> spv29mt = recompile_valu(
+        code29mt, sizeof(code29mt)/sizeof(code29mt[0]), 1, 0, &rt29mt);
+    std::vector<uint32_t> stored29mt(N, 0), stored29mt_out;
+    prosper::test::run_compute(spv29mt, in29, N, N, {}, stored29mt, &stored29mt_out);
+    uint32_t bad29mt = 0;
+    for (uint32_t i = 0; i < N && stored29mt_out.size() == N; ++i) {
+        float f = 0.0f; std::memcpy(&f, &stored29mt_out[i], sizeof(f));
+        if (std::fabs(f - 2.0f*(float)i) > 1e-3f) ++bad29mt;
+    }
+    CHECK(!spv29mt.empty() && stored29mt_out.size() == N && bad29mt == 0,
+          "MTBUF 32_FLOAT store writes instruction-typed dwords through descriptor provenance");
 
     // Kernel 30: EXEC-PREDICATED store. v_cmpx_lt_u32 narrows EXEC to lanes gid<4, then buffer_store_
     // format_x. Only active lanes must write (conditional store via a selection merge); lanes gid>=4

@@ -103,6 +103,27 @@ int main() {
           isS(mb.src[1], 8) && ((mb.literal >> 12) & 1u), "buffer_load_dwordx4 MUBUF op/VDATA/VADDR/SRSRC/offen");
     CHECK(mb.src[2].kind == OperandKind::InlineInt && mb.src[2].value == 0,
           "MUBUF SOFFSET 0x80 decodes as inline 0, not SGPR s0");
+    // gfx1030 llvm-mc: tbuffer_load_format_xy v[4:5], v2, s[8:11], s12
+    // format:[BUF_FMT_16_16_FLOAT] offen offset:52. MTBUF uses the Gen5 combined format 29,
+    // not the old split DFMT=13/NFMT=1 interpretation of those same seven bits.
+    const uint32_t mtbuf_load[] = { 0xe8e91034u, 0x0c020402u };
+    Rdna2Inst mt_load = rdna2_decode_one(mtbuf_load, 2);
+    CHECK(mt_load.fmt == Rdna2Format::MTBUF && mt_load.opcode == 1u &&
+              mt_load.mtbuf_format == 29u && isV(mt_load.dst, 4) &&
+              isV(mt_load.src[0], 2) && isS(mt_load.src[1], 8) &&
+              isS(mt_load.src[2], 12) && (mt_load.literal & 0xfffu) == 52u &&
+              ((mt_load.literal >> 12) & 1u) && !((mt_load.literal >> 13) & 1u),
+          "MTBUF load decodes opcode, combined format, operands, offset, and OFFEN");
+    // gfx1030 llvm-mc: tbuffer_store_format_xyzw v[32:35], v8, s[32:35], 0
+    // format:[BUF_FMT_8_8_8_8_UINT] idxen.
+    const uint32_t mtbuf_store[] = { 0xe9e72000u, 0x80082008u };
+    Rdna2Inst mt_store = rdna2_decode_one(mtbuf_store, 2);
+    CHECK(mt_store.fmt == Rdna2Format::MTBUF && mt_store.opcode == 7u &&
+              mt_store.mtbuf_format == 60u && isV(mt_store.dst, 32) &&
+              isV(mt_store.src[0], 8) && isS(mt_store.src[1], 32) &&
+              mt_store.src[2].kind == OperandKind::InlineInt &&
+              mt_store.src[2].value == 0 && ((mt_store.literal >> 13) & 1u),
+          "MTBUF store decodes opcode, combined format, operands, and IDXEN");
     // Exact DS_READ2_B32 words from Astro Bot's loading-surface compute producer. The packed
     // offset bytes are dword indices (offset0 in the low byte, offset1 in the high byte).
     const uint32_t ds_read2_adjacent[] = { 0xd8dc0100u, 0x04000002u };

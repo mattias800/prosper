@@ -1927,7 +1927,8 @@ std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& i
                  ((in.opcode >= 0x128 && in.opcode <= 0x12A) || in.opcode == 0x176));
             if (!scalar_side_effect &&
                 (in.fmt == Rdna2Format::VOP1 || in.fmt == Rdna2Format::VOP2 || in.fmt == Rdna2Format::VOP3 ||
-                 in.fmt == Rdna2Format::MIMG || in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::DS ||
+                 in.fmt == Rdna2Format::MIMG || in.fmt == Rdna2Format::MUBUF ||
+                 in.fmt == Rdna2Format::MTBUF || in.fmt == Rdna2Format::DS ||
                  sopp_is_noop(in))) {
                 continue;
             }
@@ -2151,7 +2152,8 @@ std::unordered_set<uint32_t> waterfall_branches(const std::vector<Rdna2Inst>& in
             bool skip_ok =
                 (p.fmt == Rdna2Format::SOP1 && (p.opcode == 0x03 || p.opcode == 0x04)) ||   // s_mov_b32/b64
                 p.fmt == Rdna2Format::VOP1 || p.fmt == Rdna2Format::VOP2 || p.fmt == Rdna2Format::VOP3 ||
-                p.fmt == Rdna2Format::VOPC || p.fmt == Rdna2Format::MIMG || p.fmt == Rdna2Format::MUBUF ||
+                p.fmt == Rdna2Format::VOPC || p.fmt == Rdna2Format::MIMG ||
+                p.fmt == Rdna2Format::MUBUF || p.fmt == Rdna2Format::MTBUF ||
                 sopp_is_noop(p);
             if (skip_ok) continue;
             // The SCC producer: a 64-bit wave-mask logical op (s_and/or/xor/andn2_b64, SCC = result!=0).
@@ -2277,6 +2279,9 @@ uint32_t vgpr_write_count(const Rdna2Inst& in) {
                 case 0x3: case 0x7: case 0xE: return 4;
                 default: return 1;
             }
+        case Rdna2Format::MTBUF:
+            if (in.opcode >= 4u) return 0; // stores read VDATA; they do not write it
+            return in.opcode + 1u;
         case Rdna2Format::MIMG: {
             if (in.opcode == 0x47 || in.opcode == 0x57) return 4;  // gather4 always returns four texels
             uint32_t n = 0;
@@ -2924,7 +2929,7 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
                 for (uint32_t k = 0; k < vgpr_write_count(in); ++k)
                     vregs.insert(in.dst.value + (int)k);
                 break;
-            case Rdna2Format::MUBUF: case Rdna2Format::MIMG:
+            case Rdna2Format::MUBUF: case Rdna2Format::MTBUF: case Rdna2Format::MIMG:
                 for (uint32_t k = 0; k < vgpr_write_count(in); ++k)
                     vregs.insert(in.dst.value + (int)k);
                 break;
@@ -4663,7 +4668,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             return true;
         }
-        case Rdna2Format::MUBUF: {
+        case Rdna2Format::MUBUF:
+        case Rdna2Format::MTBUF: {
             // Untyped buffer LOAD — the per-lane fetch mechanism (vertex fetch et al.). Modeled as a
             // per-lane load from the bound constant buffer: byte addr = (offen ? VADDR : 0) + SOFFSET
             // + inst-offset; index = addr>>2; N dwords -> VDATA..+N-1. Descriptor (SRSRC), idxen*stride,
@@ -4672,7 +4678,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // VDATA VGPRs stay untouched on hardware and the data lands in LDS — translating it as
             // a VGPR load would clobber a live register AND drop the LDS write. Reject until a
             // buffer->LDS model exists.
-            if (in.mubuf_lds) { ok = false; return true; }
+            if (in.fmt == Rdna2Format::MUBUF && in.mubuf_lds) { ok = false; return true; }
             uint32_t n = 0; bool is_format = false, is_store = false, is_atomic = false;
             bool raw_subword = false, raw_signed = false;
             uint32_t raw_bits = 32;
@@ -4802,8 +4808,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 binding = res->binding;
                 stride = res->stride;
-                fmt = res->format;
-                fmt_ncomp = res->num_components;   // for the format default-fill below (#368)
+                if (in.fmt == Rdna2Format::MTBUF) {
+                    // Unlike MUBUF format ops, MTBUF owns the type in the instruction. gfx1030 uses
+                    // the same combined 7-bit BUF_FMT table as Gen5 V# descriptors.
+                    rdna2_buffer_format(in.mtbuf_format, &fmt, &fmt_ncomp);
+                    if (fmt == DataFormat::Unknown || fmt_ncomp == 0) {
+                        ok = false; return true;
+                    }
+                } else {
+                    fmt = res->format;
+                    fmt_ncomp = res->num_components;   // format default-fill below (#368)
+                }
             } else if (rt) {
                 // RAW (untyped) MUBUF with a resource table: resolve SRSRC (src[1]) exactly like the
                 // format path — a raw buffer op targets whatever buffer its V# describes, NOT a fixed
@@ -7550,6 +7565,7 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                 }
                 case Rdna2Format::MUBUF:  return i.opcode <= 0x07u ||                    // load/store_format_*
                                                  (i.opcode >= 0x0Cu && i.opcode <= 0x0Fu);  // load_dword/x2/x4/x3 (need the V#)
+                case Rdna2Format::MTBUF:  return i.opcode <= 0x07u;
                 case Rdna2Format::VINTRP: return true;               // handled in the fragment shell
                 default: return false;
             }

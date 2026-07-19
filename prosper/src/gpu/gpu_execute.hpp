@@ -103,6 +103,9 @@ struct DynFetch {
     // Graphics VertexBuffers need the shifted descriptor for their special vertex-index path;
     // compute ConstantBuffers keep this original descriptor and apply those terms exactly once.
     DecodedBufferDescriptor unshifted_desc;
+    // MTBUF takes its type from the instruction's combined gfx1030 BUF_FMT, not V# dword3.
+    // UINT32_MAX identifies ordinary MUBUF, whose descriptor remains authoritative.
+    uint32_t instruction_format = UINT32_MAX;
 };
 
 // One descriptor-TABLE use recovered by the same const-fold (#294): UE4 shaders load their T#/S#/V#
@@ -118,6 +121,7 @@ struct SrtUse {
                                      // recompiler then resolves the use by its instruction pc instead)
     std::array<uint32_t, 8> t8{};    // T# dwords as loaded (kind 0)
     std::array<uint32_t, 4> v4{};    // V# dwords as loaded (kind 1)
+    uint32_t instruction_format = UINT32_MAX; // MTBUF BUF_FMT override for kind 1
     bool has_samp = false;
     std::array<uint32_t, 4> s4{};    // paired S# dwords (kind 0, when the SSAMP load also resolved)
     // Minimum byte span needed by this scalar-buffer consumer, measured from V#.Base. Some PS5
