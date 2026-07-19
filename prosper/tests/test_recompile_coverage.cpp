@@ -52,8 +52,8 @@ int main() {
           "an unconditional s_branch is reported as the first unsupported instruction");
 
     // A scalar conditional whose target is a straight-line second arm after the first s_endpgm is
-    // structured as two terminating arms. Coverage must credit both the conditional and the synthetic
-    // arm-skip rather than reporting either branch as unsupported.
+    // structured as two terminating arms. Coverage credits the guest conditional while excluding the
+    // compiler-only arm skip that replaces the first s_endpgm.
     const uint32_t terminating_if_else[] = {
         0xbe800387u, 0xbe810388u, 0xbf060100u, 0xbf840003u,
         0x7e0002ffu, 0x42280000u, 0xbf810000u,

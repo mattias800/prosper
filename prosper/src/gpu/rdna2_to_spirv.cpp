@@ -6024,7 +6024,7 @@ size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords) {
         required = std::max(required, terminating_span);
     // Detection both proves the compiler idiom and bounds every referenced table. Do not retain an
     // arbitrary post-ENDPGM trailer: only bytes that can affect the generated SPIR-V belong in the key.
-    (void)detect_pcrel_tables(ins, code, dwords, &required);
+    (void)detect_pcrel_tables(terminating_cfg, code, dwords, &required);
     const PcrelDispatchInfo dispatch = detect_pcrel_dispatch(ins, code, dwords, program_dwords);
     if (dispatch.valid) required = std::max(required, dispatch.required_dwords);
     return std::min(required, dwords);
