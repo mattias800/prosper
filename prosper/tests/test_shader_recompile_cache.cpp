@@ -125,6 +125,16 @@ int main() {
     CHECK(cached_rebound == direct_rebound && stats.misses == 2 && stats.entries == 2,
           "compile-time resource changes miss and remain byte-identical to the oracle");
 
+    // Guest programs with identical bytes may be mapped at different addresses. Shader analysis is
+    // address-local, but the compiled shader cache must still compare its immutable code by value.
+    std::vector<uint32_t> relocated_vs(kVs, kVs + std::size(kVs));
+    const auto relocated_cached = recompile_graphics_shader_cached(
+        ShaderProgramStage::Vertex, relocated_vs.data(), relocated_vs.size(), &table);
+    stats = shader_recompile_cache_stats();
+    CHECK(relocated_cached == cached_rebound && stats.hits == 3 && stats.misses == 2 &&
+              stats.entries == 2,
+          "byte-identical shader code at a different address reuses the compiled cache entry");
+
     const auto direct_ps = recompile_fragment(kPs, std::size(kPs), nullptr);
     const auto cached_ps = recompile_graphics_shader_cached(
         ShaderProgramStage::Fragment, kPs, std::size(kPs), nullptr);

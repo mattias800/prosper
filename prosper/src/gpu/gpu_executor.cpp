@@ -136,10 +136,26 @@ struct ShaderCompileKey {
     PixelSystemInputMapping system_inputs{};
     bool has_pcrel_dispatch = false;
     uint32_t pcrel_dispatch_target = UINT32_MAX;
-    std::vector<uint32_t> code;
+    // Aliases ShaderCodeAnalysis::code and keeps that immutable analysis alive. Warm lookups used to
+    // copy and re-hash the complete raw program for every draw before reaching the shader cache.
+    std::shared_ptr<const std::vector<uint32_t>> code;
     std::vector<ShaderResourceCompileKey> resources;
+    size_t cached_hash = 0;
 
-    bool operator==(const ShaderCompileKey&) const = default;
+    bool operator==(const ShaderCompileKey& other) const {
+        const bool same_code = code == other.code ||
+            (code && other.code && *code == *other.code);
+        return stage == other.stage &&
+               has_resource_table == other.has_resource_table &&
+               force_position_w == other.force_position_w &&
+               has_pixel_inputs == other.has_pixel_inputs &&
+               pixel_inputs == other.pixel_inputs &&
+               has_system_inputs == other.has_system_inputs &&
+               system_inputs == other.system_inputs &&
+               has_pcrel_dispatch == other.has_pcrel_dispatch &&
+               pcrel_dispatch_target == other.pcrel_dispatch_target &&
+               resources == other.resources && same_code;
+    }
 };
 
 static uint64_t hash_mix(uint64_t hash, uint64_t value) {
@@ -152,7 +168,7 @@ static uint64_t hash_mix(uint64_t hash, uint64_t value) {
 }
 
 struct ShaderCompileKeyHash {
-    size_t operator()(const ShaderCompileKey& key) const {
+    static size_t compute(const ShaderCompileKey& key) {
         uint64_t hash = 1469598103934665603ull;
         hash = hash_mix(hash, static_cast<uint32_t>(key.stage));
         hash = hash_mix(hash, key.has_resource_table);
@@ -170,8 +186,9 @@ struct ShaderCompileKeyHash {
         }
         hash = hash_mix(hash, key.has_pcrel_dispatch);
         if (key.has_pcrel_dispatch) hash = hash_mix(hash, key.pcrel_dispatch_target);
-        hash = hash_mix(hash, key.code.size());
-        for (uint32_t word : key.code) hash = hash_mix(hash, word);
+        hash = hash_mix(hash, key.code ? key.code->size() : 0u);
+        if (key.code)
+            for (uint32_t word : *key.code) hash = hash_mix(hash, word);
         hash = hash_mix(hash, key.resources.size());
         for (const auto& resource : key.resources) {
             hash = hash_mix(hash, resource.cls);
@@ -185,6 +202,8 @@ struct ShaderCompileKeyHash {
         }
         return static_cast<size_t>(hash);
     }
+
+    size_t operator()(const ShaderCompileKey& key) const { return key.cached_hash; }
 };
 
 struct CachedShader {
@@ -596,7 +615,7 @@ uint64_t shader_cache_limit_bytes() {
 }
 
 uint64_t shader_cache_entry_bytes(const ShaderCompileKey& key, const std::vector<uint32_t>& spirv) {
-    return static_cast<uint64_t>(key.code.size()) * sizeof(uint32_t) +
+    return static_cast<uint64_t>(key.code ? key.code->size() : 0u) * sizeof(uint32_t) +
            static_cast<uint64_t>(key.resources.size()) * sizeof(ShaderResourceCompileKey) +
            (key.has_pixel_inputs ? sizeof(PixelInputMapping) : 0u) +
            (key.has_system_inputs ? sizeof(PixelSystemInputMapping) : 0u) +
@@ -708,7 +727,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
         // Most shaders end at S_ENDPGM. A compiler-generated s_getpc_b64 V# may instead address an
         // embedded lookup table after ENDPGM; retain that proven tail so cached recompilation sees the
         // same blob as the direct path and table contents participate in the cache identity.
-        key.code = analysis->code;
+        key.code = std::shared_ptr<const std::vector<uint32_t>>(analysis, &analysis->code);
     }
     if (resources) {
         key.resources.reserve(resources->resources.size());
@@ -720,17 +739,19 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             });
         }
     }
+    key.cached_hash = ShaderCompileKeyHash::compute(key);
     return key;
 }
 
 std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const ShaderCompileKey& key,
                                               const ShaderResourceTable* resources) {
-    const uint32_t* code = key.code.empty() ? nullptr : key.code.data();
+    const uint32_t* code = !key.code || key.code->empty() ? nullptr : key.code->data();
+    const size_t code_size = key.code ? key.code->size() : 0u;
     if (stage == ShaderProgramStage::Vertex)
-        return recompile_vertex(code, key.code.size(), resources,
+        return recompile_vertex(code, code_size, resources,
                                 key.has_pixel_inputs ? &key.pixel_inputs : nullptr);
     if (stage == ShaderProgramStage::Fragment)
-        return recompile_fragment(code, key.code.size(), resources,
+        return recompile_fragment(code, code_size, resources,
                                   key.has_system_inputs ? &key.system_inputs : nullptr,
                                   key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX);
     return {};
@@ -739,12 +760,12 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
 void maybe_dump_successful_shader(ShaderProgramStage stage, const ShaderCompileKey& key,
                                   const std::vector<uint32_t>& spirv) {
     const char* directory = getenv("PROSPER_SHADER_DUMP_SUCCESS");
-    if (!directory || !*directory || key.code.empty() || spirv.empty()) return;
+    if (!directory || !*directory || !key.code || key.code->empty() || spirv.empty()) return;
 
     const uint64_t spirv_hash = gpu_capture_hash(
         reinterpret_cast<const uint8_t*>(spirv.data()), spirv.size() * sizeof(uint32_t));
     const uint64_t raw_hash = gpu_capture_hash(
-        reinterpret_cast<const uint8_t*>(key.code.data()), key.code.size() * sizeof(uint32_t));
+        reinterpret_cast<const uint8_t*>(key.code->data()), key.code->size() * sizeof(uint32_t));
     static std::mutex dump_mutex;
     static std::set<std::tuple<uint32_t, uint64_t, uint64_t>> dumped;
     std::lock_guard lock(dump_mutex);
@@ -767,16 +788,16 @@ void maybe_dump_successful_shader(ShaderProgramStage stage, const ShaderCompileK
              static_cast<unsigned long long>(raw_hash));
     FILE* raw = fopen(raw_path, "wb");
     FILE* translated = fopen(spirv_path, "wb");
-    const size_t raw_bytes = key.code.size() * sizeof(uint32_t);
+    const size_t raw_bytes = key.code->size() * sizeof(uint32_t);
     const size_t spirv_bytes = spirv.size() * sizeof(uint32_t);
     const bool ok = raw && translated &&
-        fwrite(key.code.data(), 1, raw_bytes, raw) == raw_bytes &&
+        fwrite(key.code->data(), 1, raw_bytes, raw) == raw_bytes &&
         fwrite(spirv.data(), 1, spirv_bytes, translated) == spirv_bytes;
     if (raw) fclose(raw);
     if (translated) fclose(translated);
     fprintf(stderr, "[shader-dump] %s spv=%016llx raw=%016llx words=%zu/%zu result=%s\n", tag,
             static_cast<unsigned long long>(spirv_hash),
-            static_cast<unsigned long long>(raw_hash), key.code.size(), spirv.size(),
+            static_cast<unsigned long long>(raw_hash), key.code->size(), spirv.size(),
             ok ? "written" : "failed");
 }
 
