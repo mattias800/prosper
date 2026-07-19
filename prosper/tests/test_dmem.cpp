@@ -191,10 +191,10 @@ int main() {
                           (uint64_t)(uintptr_t)&invalid_phys) == 0x80020016u &&
               invalid_phys == 0xfeedfacecafebeefull,
           "AllocateDirectMemory(non-page alignment) -> EINVAL without writing output");
-    CHECK((uint32_t)alloc(0, kEnd, dlen, 0xc000, 0,
-                          (uint64_t)(uintptr_t)&invalid_phys) == 0x80020016u &&
+    CHECK((uint32_t)alloc(0, kEnd, UINT64_MAX & ~0x3fffull, dlen, 0,
+                          (uint64_t)(uintptr_t)&invalid_phys) == 0x8002000cu &&
               invalid_phys == 0xfeedfacecafebeefull,
-          "AllocateDirectMemory(non-power-of-two alignment) -> EINVAL without writing output");
+          "AllocateDirectMemory(overflowing size) fails without writing output");
     CHECK((uint32_t)alloc(0, kEnd, dlen, dlen, 11,
                           (uint64_t)(uintptr_t)&invalid_phys) == 0x80020016u &&
               invalid_phys == 0xfeedfacecafebeefull,
@@ -205,6 +205,18 @@ int main() {
                                (uint64_t)(uintptr_t)&invalid_phys, 0, 0) == 0x80020016u &&
               invalid_phys == 0xfeedfacecafebeefull,
           "AllocateMainDirectMemory validates the shared direct-memory request contract");
+    CHECK((uint32_t)alloc_main(UINT64_MAX & ~0x3fffull, dlen, 0,
+                               (uint64_t)(uintptr_t)&invalid_phys, 0, 0) == 0x8002000cu &&
+              invalid_phys == 0xfeedfacecafebeefull,
+          "AllocateMainDirectMemory(overflowing size) fails without writing output");
+    uint64_t multiple_align_phys = 0;
+    CHECK(alloc(0, kEnd, 0x4000, 0xc000, 0,
+                (uint64_t)(uintptr_t)&multiple_align_phys) == 0 &&
+              multiple_align_phys % 0xc000 == 0,
+          "AllocateDirectMemory accepts a 16-KiB-multiple non-power-of-two alignment");
+    if (multiple_align_phys)
+        CHECK(release(multiple_align_phys, 0x4000, 0, 0, 0, 0) == 0,
+              "release the non-power-of-two-aligned allocation");
     uint64_t phys = 0, va1 = 0, va2 = 0, va_map2 = 0;
     CHECK(alloc(0, kEnd, dlen, dlen, 7, (uint64_t)(uintptr_t)&phys) == 0 && phys == kBase,
           "invalid allocations leave the pool untouched before a valid allocation");
@@ -711,10 +723,10 @@ int main() {
                           (uint64_t)(uintptr_t)&invalid_phys) == 0x80020016u &&
               invalid_phys == 0xfeedfacecafebeefull,
           "AllocateDirectMemory(non-page alignment) -> EINVAL without writing output");
-    CHECK((uint32_t)alloc(0, kEnd, 0x4000, 0xc000, 0,
-                          (uint64_t)(uintptr_t)&invalid_phys) == 0x80020016u &&
+    CHECK((uint32_t)alloc(0, kEnd, UINT64_MAX & ~0x3fffull, 0x4000, 0,
+                          (uint64_t)(uintptr_t)&invalid_phys) == 0x8002000cu &&
               invalid_phys == 0xfeedfacecafebeefull,
-          "AllocateDirectMemory(non-power-of-two alignment) -> EINVAL without writing output");
+          "AllocateDirectMemory(overflowing size) fails without writing output");
     CHECK((uint32_t)alloc(0, kEnd, 0x4000, 0x4000, 11,
                           (uint64_t)(uintptr_t)&invalid_phys) == 0x80020016u &&
               invalid_phys == 0xfeedfacecafebeefull,
@@ -725,6 +737,18 @@ int main() {
                                (uint64_t)(uintptr_t)&invalid_phys, 0, 0) == 0x80020016u &&
               invalid_phys == 0xfeedfacecafebeefull,
           "AllocateMainDirectMemory validates the shared direct-memory request contract");
+    CHECK((uint32_t)alloc_main(UINT64_MAX & ~0x3fffull, 0x4000, 0,
+                               (uint64_t)(uintptr_t)&invalid_phys, 0, 0) == 0x8002000cu &&
+              invalid_phys == 0xfeedfacecafebeefull,
+          "AllocateMainDirectMemory(overflowing size) fails without writing output");
+    uint64_t multiple_align_phys = 0;
+    CHECK(alloc(0, kEnd, 0x4000, 0xc000, 0,
+                (uint64_t)(uintptr_t)&multiple_align_phys) == 0 &&
+              multiple_align_phys % 0xc000 == 0,
+          "AllocateDirectMemory accepts a 16-KiB-multiple non-power-of-two alignment");
+    if (multiple_align_phys)
+        CHECK(release(multiple_align_phys, 0x4000, 0, 0, 0, 0) == 0,
+              "release the non-power-of-two-aligned allocation");
 
     // Fresh pool: the largest free block is the whole pool, and BOTH out-params are written.
     uint64_t phys = 0xdead, size = 0xdead;

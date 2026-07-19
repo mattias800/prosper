@@ -50,6 +50,15 @@ namespace {
     constexpr uint32_t kVirtualQueryCommitted = 0x10;
     constexpr uint64_t kGuestPageSize = 0x4000;
 
+    bool align_up_multiple(uint64_t value, uint64_t alignment, uint64_t& out) {
+        if (!alignment) { out = value; return true; }
+        const uint64_t remainder = value % alignment;
+        const uint64_t delta = remainder ? alignment - remainder : 0;
+        if (delta > UINT64_MAX - value) return false;
+        out = value + delta;
+        return true;
+    }
+
     bool normalize_guest_page_range(uint64_t addr, uint64_t len,
                                     uint64_t& base_out, uint64_t& len_out) {
         constexpr uint64_t mask = kGuestPageSize - 1;
@@ -118,8 +127,10 @@ namespace {
             // Clip the free gap to the search window, then align the start.
             uint64_t beg = gap_beg < lo ? lo : gap_beg;
             uint64_t end = gap_end > hi ? hi : gap_end;
-            uint64_t off = (beg + align - 1) & ~(align - 1);
-            if (off + sz <= end) { insert_at = i; off_out = off; goto found; }
+            uint64_t off = 0;
+            if (align_up_multiple(beg, align, off) && off <= end && sz <= end - off) {
+                insert_at = i; off_out = off; goto found;
+            }
             if (i < g_dmem.size()) cursor = g_dmem[i].end;
         }
         return false;
@@ -145,8 +156,11 @@ namespace {
             // Clip the free gap to the caller's search window, then align its start.
             uint64_t beg = gap_beg < lo ? lo : gap_beg;
             uint64_t end = gap_end > hi ? hi : gap_end;
-            uint64_t aligned = (beg + align - 1) & ~(align - 1);
-            if (end > aligned && end - aligned > size_out) { off_out = aligned; size_out = end - aligned; }
+            uint64_t aligned = 0;
+            if (align_up_multiple(beg, align, aligned) && end > aligned &&
+                end - aligned > size_out) {
+                off_out = aligned; size_out = end - aligned;
+            }
             if (i < g_dmem.size()) cursor = g_dmem[i].end;
         }
     }
@@ -423,11 +437,9 @@ namespace {
                                uint64_t memory_type, uint64_t phys_out) {
         // The direct-memory ABI is 16 KiB-granular. Do not round a malformed request up: doing so
         // consumes a different physical range than the guest requested. Alignment zero selects the
-        // default page alignment; explicit alignments must also be powers of two because dmem_take's
-        // first-fit alignment arithmetic has that contract.
+        // default page alignment; the allocator supports every explicit 16 KiB multiple.
         if (!len || (len & (kGuestPageSize - 1)) != 0) return false;
-        if (alignment && ((alignment & (kGuestPageSize - 1)) != 0 ||
-                          (alignment & (alignment - 1)) != 0)) return false;
+        if (alignment && (alignment & (kGuestPageSize - 1)) != 0) return false;
         if (memory_type > kMaxDirectMemoryType) return false;
         // Low values are not plausible guest pointers. The old code accepted them, allocated from
         // the pool, then skipped the guarded write -- false success plus leaked physical capacity.
@@ -1600,6 +1612,15 @@ namespace {
     constexpr uint32_t kVirtualQueryCommitted = 0x10;
     constexpr uint64_t kGuestPageSize = 0x4000;
 
+    bool align_up_multiple(uint64_t value, uint64_t alignment, uint64_t& out) {
+        if (!alignment) { out = value; return true; }
+        const uint64_t remainder = value % alignment;
+        const uint64_t delta = remainder ? alignment - remainder : 0;
+        if (delta > UINT64_MAX - value) return false;
+        out = value + delta;
+        return true;
+    }
+
     bool normalize_guest_page_range(uint64_t addr, uint64_t len,
                                     uint64_t& base_out, uint64_t& len_out) {
         constexpr uint64_t mask = kGuestPageSize - 1;
@@ -1653,8 +1674,10 @@ namespace {
             uint64_t gap_end = (i < g_dmem.size()) ? g_dmem[i].start : kDmemBase + kDmemTotal;
             uint64_t beg = gap_beg < lo ? lo : gap_beg;
             uint64_t end = gap_end > hi ? hi : gap_end;
-            uint64_t off = (beg + align - 1) & ~(align - 1);
-            if (off + sz <= end) { insert_at = i; off_out = off; goto found; }
+            uint64_t off = 0;
+            if (align_up_multiple(beg, align, off) && off <= end && sz <= end - off) {
+                insert_at = i; off_out = off; goto found;
+            }
             if (i < g_dmem.size()) cursor = g_dmem[i].end;
         }
         return false;
@@ -1674,8 +1697,11 @@ namespace {
             uint64_t gap_end = (i < g_dmem.size()) ? g_dmem[i].start : kDmemBase + kDmemTotal;
             uint64_t beg = gap_beg < lo ? lo : gap_beg;
             uint64_t end = gap_end > hi ? hi : gap_end;
-            uint64_t aligned = (beg + align - 1) & ~(align - 1);
-            if (end > aligned && end - aligned > size_out) { off_out = aligned; size_out = end - aligned; }
+            uint64_t aligned = 0;
+            if (align_up_multiple(beg, align, aligned) && end > aligned &&
+                end - aligned > size_out) {
+                off_out = aligned; size_out = end - aligned;
+            }
             if (i < g_dmem.size()) cursor = g_dmem[i].end;
         }
     }
@@ -1899,8 +1925,7 @@ namespace {
     bool valid_dmem_allocation(uint64_t len, uint64_t alignment,
                                uint64_t memory_type, uint64_t phys_out) {
         if (!len || (len & (kGuestPageSize - 1)) != 0) return false;
-        if (alignment && ((alignment & (kGuestPageSize - 1)) != 0 ||
-                          (alignment & (alignment - 1)) != 0)) return false;
+        if (alignment && (alignment & (kGuestPageSize - 1)) != 0) return false;
         if (memory_type > kMaxDirectMemoryType) return false;
         return phys_out > 0xffff;
     }
