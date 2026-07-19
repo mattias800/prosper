@@ -54,6 +54,15 @@ struct Import {            // one unresolved external symbol
     uint32_t    sym_index = 0;
 };
 
+// Defining-module identity for a TLS export. DTPMOD64 and DTPOFF64 form one tls_index pair, so
+// they must resolve through the same record: the module id selects the per-thread block and the
+// offset selects the exported object within that block.
+struct TlsSymbolLocation {
+    uint32_t modid = 0;
+    uint64_t offset = 0;
+};
+using TlsSymbolMap = std::unordered_map<std::string, TlsSymbolLocation>;
+
 // ---- a parsed module -------------------------------------------------------
 struct Module {
     std::string path;
@@ -130,11 +139,11 @@ void bind_imports_to_stubs(const Module& m, LoadedImage& img,
 
 // Apply all relocations into img.mem. Symbol relocs use img.import_addr for imports
 // and the module's own symbol values for internal defs. Returns #applied.
-// `tls_modid_by_nid` (optional) maps an exported symbol's NID to its defining module's TLS module
-// id, so a cross-module DTPMOD64 (a TLS reference imported from another module) resolves to the
-// RIGHT module's TLS block instead of this one's (#136). Null -> module-local resolution only
-// (correct for the common case; a cross-module TLS import is then logged unhandled).
+// `tls_symbols_by_nid` (optional) maps an exported TLS symbol's NID to its defining module id and
+// in-block offset. Cross-module DTPMOD64/DTPOFF64 relocations must use both halves of the same record
+// so __tls_get_addr selects the right module and object (#136/#338). Null -> module-local resolution
+// only (correct for the common case; a cross-module TLS import is then logged unhandled).
 size_t apply_relocations(const Module& m, LoadedImage& img,
-                         const std::unordered_map<std::string, uint32_t>* tls_modid_by_nid = nullptr);
+                         const TlsSymbolMap* tls_symbols_by_nid = nullptr);
 
 } // namespace prosper
