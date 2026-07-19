@@ -204,4 +204,39 @@ uint32_t vk_blend_op(uint32_t comb_fcn) {
     }
 }
 
+bool vk_logic_op(uint32_t rop3, uint32_t& logic_op) {
+    // AMD PAL's GFX9+ Rop3 table. Values on the right are the VkLogicOp enumerants; unlike
+    // blend factors this mapping is semantic, not an identity mapping (COPY is Vulkan value 3).
+    logic_op = 3; // VK_LOGIC_OP_COPY
+    switch (rop3 & 0xFFu) {
+        case 0x00: logic_op = 0;  return true; // CLEAR
+        case 0x88: logic_op = 1;  return true; // AND
+        case 0x44: logic_op = 2;  return true; // AND_REVERSE
+        case 0xCC: logic_op = 3;  return true; // COPY
+        case 0x22: logic_op = 4;  return true; // AND_INVERTED
+        case 0xAA: logic_op = 5;  return true; // NO_OP
+        case 0x66: logic_op = 6;  return true; // XOR
+        case 0xEE: logic_op = 7;  return true; // OR
+        case 0x11: logic_op = 8;  return true; // NOR
+        case 0x99: logic_op = 9;  return true; // EQUIVALENT
+        case 0x55: logic_op = 10; return true; // INVERT
+        case 0xDD: logic_op = 11; return true; // OR_REVERSE
+        case 0x33: logic_op = 12; return true; // COPY_INVERTED
+        case 0xBB: logic_op = 13; return true; // OR_INVERTED
+        case 0x77: logic_op = 14; return true; // NAND
+        case 0xFF: logic_op = 15; return true; // SET
+        default: break;
+    }
+
+    static std::set<uint32_t> logged;
+    static std::mutex logged_mu;
+    {
+        std::lock_guard<std::mutex> lk(logged_mu);
+        if (logged.insert(rop3 & 0xFFu).second)
+            fprintf(stderr, "[gpu] vk_logic_op: unsupported three-input ROP3=0x%02x "
+                            "-> COPY fallback\n", rop3 & 0xFFu);
+    }
+    return false;
+}
+
 } // namespace prosper::gpu

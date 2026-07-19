@@ -4,8 +4,10 @@
 #include "vk_translate.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
+#include <mutex>
 
 namespace prosper::gpu {
 
@@ -192,6 +194,7 @@ RenderState extract_render_state(const GpuState& st) {
     rs.alpha_src_blend = PM4_FIELD(bc, CB_BLEND0_CONTROL, ALPHA_SRCBLEND);
     rs.alpha_dst_blend = PM4_FIELD(bc, CB_BLEND0_CONTROL, ALPHA_DESTBLEND);
     rs.alpha_comb_fcn  = PM4_FIELD(bc, CB_BLEND0_CONTROL, ALPHA_COMB_FCN);
+    rs.disable_rop3    = PM4_FIELD(bc, CB_BLEND0_CONTROL, DISABLE_ROP3) != 0;
 
     const uint32_t bc1 = rd(st.cx, P::CB_BLEND1_CONTROL);
     rs.blend1_enable = PM4_FIELD(bc1, CB_BLEND0_CONTROL, ENABLE) != 0;
@@ -202,6 +205,7 @@ RenderState extract_render_state(const GpuState& st) {
     rs.alpha1_src_blend = PM4_FIELD(bc1, CB_BLEND0_CONTROL, ALPHA_SRCBLEND);
     rs.alpha1_dst_blend = PM4_FIELD(bc1, CB_BLEND0_CONTROL, ALPHA_DESTBLEND);
     rs.alpha1_comb_fcn = PM4_FIELD(bc1, CB_BLEND0_CONTROL, ALPHA_COMB_FCN);
+    rs.disable_rop3_1 = PM4_FIELD(bc1, CB_BLEND0_CONTROL, DISABLE_ROP3) != 0;
 
     // Faithful raw state registers.
     rs.db_depth_control  = dc;
@@ -465,6 +469,33 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     const uint32_t effective_color_mask = rs.cb_target_mask & rs.cb_shader_mask;
     ps.color_write_mask = effective_color_mask & 0xFu;
     ps.color1_write_mask = (effective_color_mask >> 4) & 0xFu;
+
+    // CB_COLOR_CONTROL.ROP3 is AMD's global raster operation. Vulkan exposes the same 16
+    // source/destination Boolean functions as VkLogicOp. COPY stays disabled here: enabling Vulkan
+    // COPY would suppress ordinary blending, while disabled COPY preserves the hardware's normal
+    // blend-then-copy path. CB_BLENDn_CONTROL.DISABLE_ROP3 can opt an attachment out; Vulkan's logic
+    // op is global, so a mixed two-target enable cannot be represented and falls back visibly to COPY.
+    const uint32_t cb_mode = PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, MODE);
+    const uint32_t rop3 = PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, ROP3);
+    uint32_t logic_op = 3;
+    if (cb_mode == P::CB_COLOR_CONTROL_MODE_NORMAL && vk_logic_op(rop3, logic_op) && logic_op != 3u) {
+        const bool target0_active = ps.color_write_mask != 0;
+        const bool target1_active = ps.color1_format != 0 && ps.color1_write_mask != 0;
+        const bool any_target_uses_rop3 = (target0_active && !rs.disable_rop3) ||
+                                           (target1_active && !rs.disable_rop3_1);
+        const bool every_target_uses_rop3 = (!target0_active || !rs.disable_rop3) &&
+                                             (!target1_active || !rs.disable_rop3_1);
+        if (any_target_uses_rop3 && every_target_uses_rop3) {
+            ps.logic_op_enable = true;
+            ps.logic_op = logic_op;
+        } else if (any_target_uses_rop3) {
+            static std::once_flag logged;
+            std::call_once(logged, [] {
+                fprintf(stderr, "[gpu] resolve_pipeline_state: per-target DISABLE_ROP3 cannot be "
+                                "represented by Vulkan -> COPY fallback\n");
+            });
+        }
+    }
 
     // Viewport: hardware maps screen = offset + scale * ndc; Vulkan maps px = (x + w/2) + ndc * (w/2).
     // Equating the two: x = xoffset - xscale, w = 2*xscale (same for y). A guest with GNM's +Y-up NDC

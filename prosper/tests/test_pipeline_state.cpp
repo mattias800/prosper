@@ -3,7 +3,10 @@
 // RDNA2->Vulkan mappings are NON-identity (e.g. RDNA2 triangle-strip=6 -> VK topology 4; DstColor
 // blend=8 -> VK DST_COLOR=4; Min comb=2 -> VK MIN=3) — proving translation, not passthrough.
 #include "../src/gpu/render_state.hpp"
+#include "../src/gpu/vk_translate.hpp"
+#include <array>
 #include <cstdio>
+#include <utility>
 
 using namespace prosper::gpu;
 
@@ -40,6 +43,43 @@ int main() {
     CHECK(ps.dst_color_blend_factor == 7, "dst OneMinusSrcAlpha -> VK ONE_MINUS_SRC_ALPHA (7)");
     CHECK(ps.color_blend_op == 3,         "comb Min -> VK_BLEND_OP_MIN (3)");
     CHECK(ps.color_write_mask == 0x7,     "CB_TARGET_MASK MRT0 nibble -> RGB write mask");
+
+    // AMD PAL's 16 source/destination ROP3 truth tables map exactly to Vulkan's 16 logic ops,
+    // but in a different order (notably AMD COPY=0xCC -> Vulkan COPY=3).
+    constexpr std::array<std::pair<uint32_t, uint32_t>, 16> logic_ops = {{
+        {0x00, 0}, {0x88, 1}, {0x44, 2}, {0xCC, 3},
+        {0x22, 4}, {0xAA, 5}, {0x66, 6}, {0xEE, 7},
+        {0x11, 8}, {0x99, 9}, {0x55, 10}, {0xDD, 11},
+        {0x33, 12}, {0xBB, 13}, {0x77, 14}, {0xFF, 15},
+    }};
+    bool all_logic_ops_map = true;
+    for (const auto& [rop3, expected] : logic_ops) {
+        uint32_t actual = 99;
+        all_logic_ops_map &= vk_logic_op(rop3, actual) && actual == expected;
+    }
+    CHECK(all_logic_ops_map, "all 16 two-input ROP3 values map to VkLogicOp");
+    uint32_t unsupported_logic_op = 99;
+    CHECK(!vk_logic_op(0x5A, unsupported_logic_op) && unsupported_logic_op == 3,
+          "three-input ROP3 falls back visibly to VK_LOGIC_OP_COPY");
+
+    RenderState logic;
+    logic.cb_target_mask = 0xF;
+    logic.cb_color_control = (1u << 4) | (0x66u << 16); // MODE=NORMAL, ROP3=XOR
+    ResolvedPipelineState xor_ps = resolve_pipeline_state(logic);
+    CHECK(xor_ps.logic_op_enable && xor_ps.logic_op == 6,
+          "CB_COLOR_CONTROL normal/XOR resolves to VK_LOGIC_OP_XOR");
+    logic.cb_color_control = (1u << 4) | (0xCCu << 16); // COPY preserves ordinary blending
+    ResolvedPipelineState copy_ps = resolve_pipeline_state(logic);
+    CHECK(!copy_ps.logic_op_enable && copy_ps.logic_op == 3,
+          "ROP3 COPY keeps Vulkan logic ops disabled");
+    logic.cb_color_control = (1u << 4) | (0x66u << 16);
+    logic.disable_rop3 = true;
+    CHECK(!resolve_pipeline_state(logic).logic_op_enable,
+          "CB_BLEND0_CONTROL.DISABLE_ROP3 suppresses the global operation");
+    logic.disable_rop3 = false;
+    logic.cb_color_control = (6u << 4) | (0x66u << 16); // DCC helper mode, not a color draw
+    CHECK(!resolve_pipeline_state(logic).logic_op_enable,
+          "non-normal CB mode does not become a Vulkan logic op");
 
     // A default/empty RenderState resolves to a safe pipeline (point list, undefined format, no blend).
     ResolvedPipelineState def = resolve_pipeline_state(RenderState{});

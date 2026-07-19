@@ -86,4 +86,9 @@ uint32_t vk_blend_factor(uint32_t rdna2_factor);
 // VK ADD=0,SUB=1,MIN=3,MAX=4,REV_SUB=2). Unknown -> ADD.
 uint32_t vk_blend_op(uint32_t comb_fcn);
 
+// Map one of AMD's 16 two-input CB_COLOR_CONTROL.ROP3 truth tables to a VkLogicOp value.
+// Returns false for a ROP3 that also depends on the pattern input (which Vulkan cannot express),
+// leaves logic_op at VK_LOGIC_OP_COPY, and logs the unsupported byte once.
+bool vk_logic_op(uint32_t rop3, uint32_t& logic_op);
+
 } // namespace prosper::gpu

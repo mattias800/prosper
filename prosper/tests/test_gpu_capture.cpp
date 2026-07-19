@@ -103,6 +103,7 @@ int main() {
     draw.ps.alpha_blend_op1 = 0; draw.ps.color1_write_mask = 0xf;
     draw.ps.has_scissor = true; draw.ps.scissor_left = 12; draw.ps.scissor_top = 19;
     draw.ps.scissor_right = 70; draw.ps.scissor_bottom = 75;
+    draw.ps.logic_op_enable = true; draw.ps.logic_op = 6;
 
     GpuCaptureMetadata meta; meta.width = 480; meta.height = 270; meta.submit_index = 42;
     meta.revision = "deadbeef"; meta.title_id = "PPSA24651"; meta.input_route = "@reach-level.pad";
@@ -180,9 +181,9 @@ int main() {
               scalar_capture.computes[0].resources.resources.empty(),
           "#636: capture ignores unconsumed descriptor-looking scalar arguments");
 
-    // v17 appends scissor state without changing the legacy pipeline prefix. Remove v20's instance
-    // count, v19's realized raw-stage indices, v18's geometry index, then the v17 tail to recover a
-    // byte-exact v16 capture.
+    // v17 appends scissor state without changing the legacy pipeline prefix. Remove v21's logic op,
+    // v20's instance count, v19's realized raw-stage indices, v18's geometry index, then the v17 tail
+    // to recover a byte-exact v16 capture.
     GpuCaptureFile v16_scissor_source = captured;
     v16_scissor_source.raw_shader_versions.clear();
     v16_scissor_source.draws[0].vs_raw_shader_index = 0xFFFFFFFFu;
@@ -193,6 +194,7 @@ int main() {
               v16_scissor_bytes.size() >= 25,
           "v17 capture serializes effective guest scissor state");
     if (v16_scissor_bytes.size() >= 25) {
+        v16_scissor_bytes.resize(v16_scissor_bytes.size() - 13); // v21 one draw + zero failures
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 8); // v20 draw count + instance count
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 12); // v19 count + two raw indices
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 8); // v18 draw count + no-GS sentinel
@@ -337,6 +339,7 @@ int main() {
           "writer rejects an out-of-bounds DCC metadata reference");
     CHECK(serialize_gpu_capture(volume_capture, volume_bytes, error),
           "recreated valid v12 DCC bytes after malformed-reference check");
+    volume_bytes.resize(volume_bytes.size() - 13); // v21 one logic-op draw + zero failures
     volume_bytes.resize(volume_bytes.size() - 8); // v20 draw count + instance count
     volume_bytes.resize(volume_bytes.size() - 12); // v19 count + two raw indices
     volume_bytes.resize(volume_bytes.size() - 8); // v18 draw count + no-GS sentinel
@@ -399,10 +402,20 @@ int main() {
     CHECK(write_gpu_capture(path.string(), captured, error), "versioned capture writes atomically");
     GpuCaptureFile loaded;
     CHECK(read_gpu_capture(path.string(), loaded, error), "versioned capture reads back");
-    std::vector<uint8_t> v19_bytes;
+    std::vector<uint8_t> v20_bytes;
+    GpuCaptureFile v20_loaded;
+    CHECK(serialize_gpu_capture(captured, v20_bytes, error) && v20_bytes.size() >= 21,
+          "v21 capture serializes the logic-op extension");
+    if (v20_bytes.size() >= 21) {
+        v20_bytes.resize(v20_bytes.size() - 13); // v21 one logic-op draw + zero failures
+        v20_bytes[8] = 20; v20_bytes[9] = v20_bytes[10] = v20_bytes[11] = 0;
+    }
+    CHECK(deserialize_gpu_capture(v20_bytes, v20_loaded, error) &&
+              !v20_loaded.draws[0].ps.logic_op_enable && v20_loaded.draws[0].ps.logic_op == 3 &&
+              v20_loaded.draws[0].instance_count == 3,
+          "v20 capture reopens with disabled/COPY logic-op defaults");
+    std::vector<uint8_t> v19_bytes = v20_bytes;
     GpuCaptureFile v19_loaded;
-    CHECK(serialize_gpu_capture(captured, v19_bytes, error) && v19_bytes.size() >= 12,
-          "v20 capture serializes the instance-count extension");
     if (v19_bytes.size() >= 12) {
         v19_bytes.resize(v19_bytes.size() - 8); // v20 draw count + one instance count
         v19_bytes[8] = 19; v19_bytes[9] = v19_bytes[10] = v19_bytes[11] = 0;
@@ -419,6 +432,8 @@ int main() {
           loaded.draws[0].ps.scissor_top == 19 && loaded.draws[0].ps.scissor_right == 70 &&
           loaded.draws[0].ps.scissor_bottom == 75,
           "effective guest scissor round-trips through the v17 extension");
+    CHECK(loaded.draws[0].ps.logic_op_enable && loaded.draws[0].ps.logic_op == 6,
+          "v21 framebuffer logic op round-trips explicitly");
     CHECK(loaded.draws[0].color0_width == 1024 && loaded.draws[0].color0_height == 32,
           "per-target extent round-trips");
     CHECK(loaded.draws[0].color1_base == 0x3000 && loaded.draws[0].color1_width == 1024 &&
@@ -661,6 +676,9 @@ int main() {
     set_pgm(failed_state, P::SPI_SHADER_PGM_LO_PS, P::SPI_SHADER_PGM_HI_PS, kDiagnosticBadPs);
     failed_state.uc[P::VGT_PRIMITIVE_TYPE] = 4;
     failed_state.cx[P::CB_TARGET_MASK] = 0xf;
+    failed_state.cx[P::CB_COLOR_CONTROL] =
+        (P::CB_COLOR_CONTROL_MODE_NORMAL << P::CB_COLOR_CONTROL_MODE_SHIFT) |
+        (0x66u << P::CB_COLOR_CONTROL_ROP3_SHIFT);
     failed_state.cx[P::CB_COLOR0_BASE] = 0x1234;
     failed_state.cx[P::PA_SC_SCREEN_SCISSOR_TL] = 0x000A0009u;
     failed_state.cx[P::PA_SC_SCREEN_SCISSOR_BR] = 0x0028001Eu;
@@ -679,6 +697,7 @@ int main() {
     });
     CHECK(failed.reason == RealizationFailureReason::ShaderRecompile && failed.pipeline_present &&
           failed.pipeline.color_write_mask == 0xf && failed.vertex_count == 3 &&
+          failed.pipeline.logic_op_enable && failed.pipeline.logic_op == 6 &&
           failed.pipeline.has_scissor && failed.pipeline.scissor_left == 9 &&
           failed.pipeline.scissor_top == 10 && failed.pipeline.scissor_right == 30 &&
           failed.pipeline.scissor_bottom == 40 &&
@@ -740,6 +759,8 @@ int main() {
           failed_loaded.raw_shader_versions.size() == failed_capture.raw_shader_versions.size() &&
           failed_loaded.failure_diagnostics[0].pipeline.has_scissor &&
           failed_loaded.failure_diagnostics[0].pipeline.scissor_left == 9 &&
+          failed_loaded.failure_diagnostics[0].pipeline.logic_op_enable &&
+          failed_loaded.failure_diagnostics[0].pipeline.logic_op == 6 &&
           failed_loaded.failure_diagnostics[0].stages[1].coverage.first_bad_pc == 1,
           "failed stage state, coverage, and raw shader versions round-trip offline");
 
@@ -773,11 +794,12 @@ int main() {
     legacy_source.draws[0].fs_raw_shader_index = 0xFFFFFFFFu;
     std::vector<uint8_t> legacy_bytes;
     CHECK(serialize_gpu_capture(legacy_source, legacy_bytes, error) && legacy_bytes.size() >= 32,
-          "created a diagnostic-free v20 payload for legacy-reader fixtures");
+          "created a diagnostic-free v21 payload for legacy-reader fixtures");
     std::vector<uint8_t> v13_bytes = legacy_bytes;
     if (v13_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        v13_bytes.resize(v13_bytes.size() - 13); // v21 one logic-op draw + zero failures
         v13_bytes.resize(v13_bytes.size() - 8); // v20 draw count + instance count
         v13_bytes.resize(v13_bytes.size() - 12); // v19 count + two raw indices
         v13_bytes.resize(v13_bytes.size() - 8); // v18 draw count + no-GS sentinel
@@ -798,6 +820,7 @@ int main() {
     if (legacy_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        legacy_bytes.resize(legacy_bytes.size() - 13); // v21 one logic-op draw + zero failures
         legacy_bytes.resize(legacy_bytes.size() - 8); // v20 draw count + instance count
         legacy_bytes.resize(legacy_bytes.size() - 12); // v19 count + two raw indices
         legacy_bytes.resize(legacy_bytes.size() - 8); // v18 draw count + no-GS sentinel
@@ -844,9 +867,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 21;
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 22;
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 21",
+          error == "unsupported capture version 22",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

@@ -383,7 +383,8 @@ struct RenderVkCtx {
     VkInstance inst = VK_NULL_HANDLE; VkPhysicalDevice phys = VK_NULL_HANDLE;
     VkDevice dev = VK_NULL_HANDLE; VkQueue queue = VK_NULL_HANDLE; uint32_t qfi = UINT32_MAX;
     VkDeviceSize storage_buffer_alignment = 1;
-    bool aniso_enabled = false; float max_aniso_limit = 1.0f; bool ok = false;
+    bool aniso_enabled = false; float max_aniso_limit = 1.0f;
+    bool logic_op_enabled = false; bool ok = false;
 };
 inline const RenderVkCtx& render_vk_ctx() {
     static RenderVkCtx c = [] {
@@ -415,8 +416,10 @@ inline const RenderVkCtx& render_vk_ctx() {
         r.storage_buffer_alignment = std::max<VkDeviceSize>(
             1, phys_props.limits.minStorageBufferOffsetAlignment);
         r.aniso_enabled = supported.samplerAnisotropy;
+        r.logic_op_enabled = supported.logicOp;
         r.max_aniso_limit = phys_props.limits.maxSamplerAnisotropy;
         if (r.aniso_enabled) feats.samplerAnisotropy = VK_TRUE;
+        if (r.logic_op_enabled) feats.logicOp = VK_TRUE;
         // Portable AMD P0/P10/P20 lowering inserts a descriptor-free geometry pass on devices that
         // lack explicit vertex-parameter fragment extensions. Core geometryShader is available on
         // the Linux llvmpipe headless target and the desktop Vulkan drivers we support.
@@ -2072,6 +2075,17 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             cba[1].alphaBlendOp = (VkBlendOp)ps->alpha_blend_op1;
         }
         VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        if (ps && ps->logic_op_enable) {
+            if (ctx.logic_op_enabled) {
+                cb.logicOpEnable = VK_TRUE;
+                cb.logicOp = static_cast<VkLogicOp>(ps->logic_op);
+            } else {
+                static std::once_flag logged;
+                std::call_once(logged, [] {
+                    fprintf(stderr, "[gpu] Vulkan device lacks logicOp support -> COPY fallback\n");
+                });
+            }
+        }
         cb.attachmentCount = color_count; cb.pAttachments = cba;
         VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         if (ps && ps->depth_test_enable) {
@@ -2569,7 +2583,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 memcpy(&word, &value, sizeof word);
                 append(word);
             };
-            append(5); // key schema version (geometry stage + dynamic scissor)
+            append(6); // key schema version (framebuffer logic op)
             append(W); append(H); append(color_count); append(static_cast<uint32_t>(FMT));
             append(static_cast<uint32_t>(FMT1)); append(use_ds); append(static_cast<uint32_t>(DFMT));
             const bool exact_shader_identities = bd.vs_identity && bd.fs_identity;
@@ -2615,6 +2629,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             append_float(vp.x); append_float(vp.y); append_float(vp.width); append_float(vp.height);
             append_float(vp.minDepth); append_float(vp.maxDepth);
             append(rs.polygonMode); append(rs.cullMode); append(rs.frontFace); append_float(rs.lineWidth);
+            append(cb.logicOpEnable); append(cb.logicOp);
             for (uint32_t attachment = 0; attachment < color_count; ++attachment) {
                 append(cba[attachment].blendEnable); append(cba[attachment].srcColorBlendFactor);
                 append(cba[attachment].dstColorBlendFactor); append(cba[attachment].colorBlendOp);
