@@ -928,6 +928,30 @@ int main() {
     CHECK(!spv24mt_store.empty() && packed_store_out.size() == N && bad24mt_store == 0,
           "MTBUF 8_8_8_8_UNORM store packs and predicates instruction-typed components");
 
+    // A wider store opcode does not extend the physical format. BUF_FMT_16_16_FLOAT has identity
+    // XY00, so the Z/W source VGPRs must not spill into the next dword of each eight-byte record.
+    const uint32_t code24mt_store_xy00[] = {
+        0x7e020280u, 0x7e0402f0u, 0x7e0602f2u, 0x7e0802f2u, 0x7e0a0f00u,
+        0xe8ef2000u, 0x80020105u, 0xbf810000u,
+    };
+    ShaderResourceTable rt24mt_store_xy00 = rt24mt_store;
+    rt24mt_store_xy00.resources[0].stride = 8;
+    std::vector<uint32_t> spv24mt_store_xy00 = recompile_valu(
+        code24mt_store_xy00, sizeof(code24mt_store_xy00)/sizeof(code24mt_store_xy00[0]),
+        1, 0, &rt24mt_store_xy00);
+    std::vector<uint32_t> xy00_store_in(N * 2, 0xdeadbeefu), xy00_store_out;
+    prosper::test::run_compute(spv24mt_store_xy00, in24, N, N, {}, xy00_store_in,
+                               &xy00_store_out);
+    uint32_t bad24mt_store_xy00 = 0;
+    for (uint32_t i = 0; i < N && xy00_store_out.size() == N * 2; ++i) {
+        if (xy00_store_out[i * 2] != 0x38000000u ||
+            xy00_store_out[i * 2 + 1] != 0xdeadbeefu)
+            ++bad24mt_store_xy00;
+    }
+    CHECK(!spv24mt_store_xy00.empty() && xy00_store_out.size() == N * 2 &&
+              bad24mt_store_xy00 == 0,
+          "MTBUF XYZW store honors XY00 format width and leaves the adjacent dword untouched");
+
     // Kernel 24b (#150): the SAME unorm8x4 fetch but with a NON-dword-aligned inst offset (offset:2).
     // The packed unpack extracts components at static byte offsets from a dword-aligned base and drops
     // addr&3, so a non-aligned element base would decode the wrong bits — it must be REJECTED (the

@@ -4984,20 +4984,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // Store the VDATA VGPRs (in.dst..+n-1). Integer sub-dword formats (Uint8/Sint8/...) have
                 // no packing path here -> reject rather than mis-store (loads extend them; stores don't pack).
                 if (packed_word || (packed && (is_uint || is_sint))) { ok = false; return true; }
+                // MTBUF's instruction format owns the physical component count. A wider opcode still uses
+                // identity selection (for example XY00), so Z/W must not spill into adjacent memory.
+                const uint32_t store_n = in.fmt == Rdna2Format::MTBUF && fmt_ncomp < n
+                                           ? fmt_ncomp : n;
                 auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
                 if (!packed) {
                     // Raw/Float32/Uint32: one dword per component.
-                    for (uint32_t k = 0; k < n; k++) {
+                    for (uint32_t k = 0; k < store_n; k++) {
                         uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
                         b.cbuf_store(kidx, vread(in.dst.value + (int)k), binding, rs.exec_narrowed, rs.exec);
                     }
                 } else {
                     // Packed UNORM/SNORM/Float16: pack the components tightly into ceil(n*bytes/4) dwords
                     // (inverse of the packed load). Each dword ORs together the fields that land in it.
-                    const uint32_t dwords = (n * comp_bytes + 3) / 4;
+                    const uint32_t dwords = (store_n * comp_bytes + 3) / 4;
                     for (uint32_t d = 0; d < dwords; d++) {
                         uint32_t acc = b.uconst(0);
-                        for (uint32_t k = 0; k < n; k++) {
+                        for (uint32_t k = 0; k < store_n; k++) {
                             uint32_t byte_off = k * comp_bytes;
                             if (byte_off / 4 != d) continue;
                             uint32_t field = is_half ? b.pack_half_lo(vread(in.dst.value + (int)k))
