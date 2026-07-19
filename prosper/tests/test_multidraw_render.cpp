@@ -436,6 +436,30 @@ int main() {
         CHECK(lc && lc[1] > 0xC0 && lc[0] < 0x40,
               "persistent guest DS identity LOADs stencil written by an earlier renderer call");
 
+        // The same dependency must survive when both calls are recorded before one queue submit.
+        // Give the calls GPU-only color targets so the stencil producer does not force an early CPU
+        // readback; the consumer's requested readback flushes both command buffers behind one fence.
+        ResolvedPipelineState batched_writer = writer;
+        batched_writer.stencil_read_base = batched_writer.stencil_write_base = 0x99410000;
+        ResolvedPipelineState batched_reader = reader;
+        batched_reader.stencil_read_base = batched_reader.stencil_write_base = 0x99410000;
+        prosper::test::BackendDraw bw = w; bw.ps = &batched_writer;
+        prosper::test::BackendDraw br = r; br.ps = &batched_reader;
+        prosper::test::BackendColorTarget batch_write_target{
+            0x9941000000000001ull, false, false};
+        prosper::test::BackendColorTarget batch_read_target{
+            0x9941000000000002ull, false, true};
+        prosper::test::BackendSubmissionBatch ds_batch;
+        const std::vector<uint8_t> pending = prosper::test::render_draws_rgba(
+            {bw}, W, H, nullptr, nullptr, true, &batch_write_target,
+            nullptr, nullptr, nullptr, &ds_batch, false);
+        const std::vector<uint8_t> batched_loaded = prosper::test::render_draws_rgba(
+            {br}, W, H, nullptr, nullptr, true, &batch_read_target,
+            nullptr, nullptr, nullptr, &ds_batch, true);
+        const uint8_t* blc = center(batched_loaded);
+        CHECK(pending.empty() && blc && blc[1] > 0xC0 && blc[0] < 0x40,
+              "batched renderer calls publish persistent stencil before a later LOAD");
+
         ResolvedPipelineState fresh = reader;
         fresh.stencil_read_base = fresh.stencil_write_base = 0x22220000;
         prosper::test::BackendDraw f = r; f.ps = &fresh;
