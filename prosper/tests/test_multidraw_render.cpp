@@ -92,6 +92,43 @@ int main() {
         if (c) CHECK(c[0] > 0xC0 && c[1] < 0x40 && c[2] < 0x40, "one opaque red draw -> RED center");
     }
 
+    // #919: an explicitly programmed CB_COLOR_CONTROL.MODE=DISABLE reaches Vulkan as zero color
+    // write masks, while the same draw can still populate stencil for a later color pass.
+    {
+        RenderState raw{};
+        raw.prim_type = 4; // triangle list
+        raw.cb_target_mask = raw.cb_shader_mask = 0xFu;
+        raw.has_cb_color_control = true;
+        raw.cb_color_control = 0; // MODE=DISABLE
+        ResolvedPipelineState disabled = resolve_pipeline_state(raw);
+        CHECK(disabled.color_write_mask == 0,
+              "explicit CB MODE=DISABLE reaches Vulkan with color writes disabled");
+
+        ResolvedPipelineState writer = disabled;
+        writer.stencil_enable = true;
+        writer.stencil_compare_op[0] = writer.stencil_compare_op[1] = 7; // ALWAYS
+        writer.stencil_pass_op[0] = writer.stencil_pass_op[1] = 2;       // REPLACE
+        writer.stencil_op_val[0] = writer.stencil_op_val[1] = 2;
+        writer.stencil_write_mask[0] = writer.stencil_write_mask[1] = 0xff;
+
+        prosper::test::BackendDraw w; w.vs = vs; w.fs = red; w.ps = &writer; w.vcount = 3;
+        const std::vector<uint8_t> suppressed = prosper::test::render_draws_rgba({w}, W, H);
+        const uint8_t* sc = center(suppressed);
+        CHECK(sc && sc[2] > 0xC0 && sc[0] < 0x40 && sc[1] < 0x40,
+              "CB MODE=DISABLE red fragment preserves the blue color attachment");
+
+        ResolvedPipelineState reader = opaque;
+        reader.stencil_enable = true;
+        reader.stencil_compare_op[0] = reader.stencil_compare_op[1] = 2; // EQUAL
+        reader.stencil_ref[0] = reader.stencil_ref[1] = 2;
+        reader.stencil_compare_mask[0] = reader.stencil_compare_mask[1] = 0xff;
+        prosper::test::BackendDraw r; r.vs = vs; r.fs = green; r.ps = &reader; r.vcount = 3;
+        const std::vector<uint8_t> consumed = prosper::test::render_draws_rgba({w, r}, W, H);
+        const uint8_t* cc = center(consumed);
+        CHECK(cc && cc[1] > 0xC0 && cc[0] < 0x40 && cc[2] < 0x40,
+              "CB MODE=DISABLE draw still writes stencil consumed by a later color pass");
+    }
+
     // Hardware instance count reaches both Vulkan submission paths. Additive quarter-red makes the
     // number of identical instances directly observable: one instance contributes ~64 red, while
     // three contribute ~192. The indexed sibling must produce the same pixels.

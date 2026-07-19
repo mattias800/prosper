@@ -47,6 +47,21 @@ int32_t scale_scissor_boundary(int32_t value, float scale, bool lower) {
         static_cast<double>(std::numeric_limits<int32_t>::max())));
 }
 
+void warn_unsupported_cb_color_mode(uint32_t mode) {
+    static std::mutex mutex;
+    static uint32_t seen_modes = 0;
+    bool first = false;
+    {
+        std::lock_guard lock(mutex);
+        const uint32_t bit = 1u << (mode & P::CB_COLOR_CONTROL_MODE_MASK);
+        first = (seen_modes & bit) == 0;
+        seen_modes |= bit;
+    }
+    if (first)
+        fprintf(stderr, "[gpu] resolve_pipeline_state: unsupported CB_COLOR_CONTROL.MODE=%u "
+                        "-> ordinary draw fallback\n", mode);
+}
+
 // sRGB (gamma-encoded) 8-bit sample -> linear [0,1]. VkClearColorValue's float channels are LINEAR
 // for an sRGB attachment (Vulkan re-encodes on store), so an sRGB fast-clear word must be linearized
 // here to round-trip to the exact stored byte. Identity at 0 and 1, so black/white are exact.
@@ -215,6 +230,7 @@ RenderState extract_render_state(const GpuState& st) {
     rs.db_stencil_control   = st.cx.count(P::DB_STENCIL_CONTROL)   ? rd(st.cx, P::DB_STENCIL_CONTROL)   : 0u;
     rs.db_stencilrefmask    = st.cx.count(P::DB_STENCILREFMASK)    ? rd(st.cx, P::DB_STENCILREFMASK)    : 0u;
     rs.db_stencilrefmask_bf = st.cx.count(P::DB_STENCILREFMASK_BF) ? rd(st.cx, P::DB_STENCILREFMASK_BF) : 0u;
+    rs.has_cb_color_control = st.cx.count(P::CB_COLOR_CONTROL) != 0;
     rs.cb_color_control  = rd(st.cx, P::CB_COLOR_CONTROL);
     rs.cb_blend0_control = bc;
     // CB_TARGET_MASK (per-MRT color write mask). The AGC driver defaults it to write-all when the game
@@ -470,12 +486,27 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     ps.color_write_mask = effective_color_mask & 0xFu;
     ps.color1_write_mask = (effective_color_mask >> 4) & 0xFu;
 
+    // MODE=DISABLE suppresses color-buffer writes, not the whole draw: depth/stencil tests and
+    // updates still execute. An absent CB_COLOR_CONTROL retains the legacy normal-draw behavior;
+    // otherwise a zero-initialized synthetic RenderState would unexpectedly lose every color draw.
+    // DCC_DECOMPRESS is handled by the AGC helper-program path in gpu_execute.hpp. Other hardware
+    // metadata modes remain ordinary draws for compatibility, but are now visible instead of silent.
+    const uint32_t cb_mode = PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, MODE);
+    if (rs.has_cb_color_control) {
+        if (cb_mode == P::CB_COLOR_CONTROL_MODE_DISABLE) {
+            ps.color_write_mask = 0;
+            ps.color1_write_mask = 0;
+        } else if (cb_mode != P::CB_COLOR_CONTROL_MODE_NORMAL &&
+                   cb_mode != P::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS) {
+            warn_unsupported_cb_color_mode(cb_mode);
+        }
+    }
+
     // CB_COLOR_CONTROL.ROP3 is AMD's global raster operation. Vulkan exposes the same 16
     // source/destination Boolean functions as VkLogicOp. COPY stays disabled here: enabling Vulkan
     // COPY would suppress ordinary blending, while disabled COPY preserves the hardware's normal
     // blend-then-copy path. CB_BLENDn_CONTROL.DISABLE_ROP3 can opt an attachment out; Vulkan's logic
     // op is global, so a mixed two-target enable cannot be represented and falls back visibly to COPY.
-    const uint32_t cb_mode = PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, MODE);
     const uint32_t rop3 = PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, ROP3);
     uint32_t logic_op = 3;
     if (cb_mode == P::CB_COLOR_CONTROL_MODE_NORMAL && vk_logic_op(rop3, logic_op) && logic_op != 3u) {
