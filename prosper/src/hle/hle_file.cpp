@@ -578,7 +578,7 @@ std::string resolve_guest_path(const char* guest_path) {
 }
 
 // Mount / unmount the guest "/savedata0" area onto a host dir named by the save's dirName
-// (sceSaveDataMount3 HLE, hle_service.cpp). create=true makes the host dir (CREATE-mode mount);
+// (sceSaveDataMount* HLEs, hle_service.cpp). create=true makes the host dir (CREATE-mode mount);
 // create=false requires it to already exist (open-mode) and fails otherwise ("no such save").
 // Returns true on success with /savedata0 translation active.
 bool savedata0_mount(const char* dirname, bool create) {
@@ -597,7 +597,12 @@ bool savedata0_mount(const char* dirname, bool create) {
     g_save0 = d;
     return true;
 }
-void savedata0_umount() { std::lock_guard<std::mutex> lk(g_save0_mx); g_save0.clear(); }
+bool savedata0_umount() {
+    std::lock_guard<std::mutex> lk(g_save0_mx);
+    const bool was_mounted = !g_save0.empty();
+    g_save0.clear();
+    return was_mounted;
+}
 // List the save-dir names that exist under the host save root (each subdir is one save the guest created
 // via sceSaveDataMount3 create-mode). sceSaveDataDirNameSearch reports these so a prior session's saves
 // appear in the game's load/continue list (#299 — the saves persisted but were invisible).

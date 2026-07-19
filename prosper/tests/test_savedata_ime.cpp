@@ -8,6 +8,13 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <filesystem>
+#include <string>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 using namespace prosper;
 
@@ -24,20 +31,64 @@ struct Set2       { int32_t userId; uint8_t pad[4]; const MemData* data; const v
                     const void* icon; uint32_t dataNum; uint32_t slotId; uint8_t rsv[32]; };
 struct Get2       { int32_t userId; uint8_t pad[4]; MemData* data; const void* param;
                     const void* icon; uint32_t slotId; uint8_t rsv[28]; };
+struct SaveDirName { char data[32]; };
+struct LegacyMount {
+    int32_t userId; uint32_t pad; const void* titleId; const SaveDirName* dirName;
+    const void* fingerprint; uint64_t blocks; uint32_t mode; uint8_t reserved[32];
+};
+struct LegacyMount2 {
+    int32_t userId; uint32_t pad; const SaveDirName* dirName; uint64_t blocks;
+    uint32_t mode; uint8_t reserved[32]; uint32_t tailPad;
+};
+struct MountResult {
+    char mountPoint[16]; uint64_t requiredBlocks; uint32_t unused; uint32_t status;
+    uint8_t reserved[28]; uint32_t tailPad;
+};
 static_assert(offsetof(MemData, buf) == 0 && offsetof(MemData, bufSize) == 8 && offsetof(MemData, offset) == 16, "MemData");
 static_assert(offsetof(Setup2, userId) == 4 && offsetof(Setup2, memSize) == 8 && offsetof(Setup2, slotId) == 40, "Setup2");
 static_assert(offsetof(Set2, data) == 8 && offsetof(Set2, dataNum) == 32 && offsetof(Set2, slotId) == 36, "Set2");
 static_assert(offsetof(Get2, data) == 8 && offsetof(Get2, slotId) == 32, "Get2");
+static_assert(sizeof(LegacyMount) == 0x50 && offsetof(LegacyMount, dirName) == 0x10 &&
+              offsetof(LegacyMount, mode) == 0x28, "legacy Mount ABI");
+static_assert(sizeof(LegacyMount2) == 0x40 && offsetof(LegacyMount2, dirName) == 0x08 &&
+              offsetof(LegacyMount2, mode) == 0x18, "legacy Mount2 ABI");
+static_assert(sizeof(MountResult) == 0x40 && offsetof(MountResult, status) == 0x1c,
+              "SaveData MountResult ABI");
+
+static bool all_bytes_are(const void* data, size_t size, uint8_t value) {
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < size; ++i) if (bytes[i] != value) return false;
+    return true;
+}
 
 int main() {
     printf("== test_savedata_ime ==\n");
-    // Hermeticity: SaveDataMemory now persists a synced slot to PROSPER_SAVEDATA_DIR (#432), which
-    // survives across ctest runs -- so the "fresh slot" check below would see a PRIOR run's file. Point
-    // it at a test-private dir and clear that run's slot file so fresh/resume are deterministic.
-#ifndef _WIN32
-    setenv("PROSPER_SAVEDATA_DIR", "/tmp/prosper-savemem-selftest", 1);
-    remove("/tmp/prosper-savemem-selftest/savemem_1_0.bin");
+    const int process_id =
+#ifdef _WIN32
+        _getpid();
+#else
+        (int)getpid();
 #endif
+    const std::filesystem::path test_root = std::filesystem::temp_directory_path() /
+        ("prosper-savedata-selftest-" + std::to_string(process_id));
+    const std::filesystem::path mount_root = test_root / "mount";
+    const std::filesystem::path memory_root = test_root / "memory";
+    std::error_code mount_ec;
+    std::filesystem::remove_all(test_root, mount_ec);
+    std::filesystem::create_directories(mount_root, mount_ec);
+    std::filesystem::create_directories(memory_root, mount_ec);
+    const std::string mount_root_string = mount_root.string();
+    const std::string memory_root_string = memory_root.string();
+#ifdef _WIN32
+    _putenv_s("PROSPER_SAVE0", mount_root_string.c_str());
+    _putenv_s("PROSPER_SAVEDATA_DIR", memory_root_string.c_str());
+#else
+    setenv("PROSPER_SAVE0", mount_root_string.c_str(), 1);
+    setenv("PROSPER_SAVEDATA_DIR", memory_root_string.c_str(), 1);
+#endif
+    // Hermeticity: SaveDataMemory now persists a synced slot to PROSPER_SAVEDATA_DIR (#432), which
+    // survives across ctest runs. Both save backends use this process-private root, so concurrent
+    // agents and repeated runs cannot turn the fresh-save assertions into order-dependent tests.
     register_builtin_hle();
 
     // ---- libSceImeDialog: auto-completing lifecycle ----
@@ -114,6 +165,91 @@ int main() {
         CHECK(get_v1(user + 1, (uint64_t)(uintptr_t)dst, sizeof dst, 0, 0, 0) == 0x809F0012ull,
               "v1 Get before Setup -> MEMORY_NOT_READY");
     }
+
+    // ---- PS4-inherited SaveData mount ABIs: exact layouts share the /savedata0 backend ----
+    {
+        HleFn mount = Hle::lookup("32HQAQdwM2o"), mount2 = Hle::lookup("0z45PIH+SNI"),
+              mount3 = Hle::lookup("ZP4e7rlzOUk"), umount = Hle::lookup("BMR4F-Uek3E");
+        CHECK(mount && mount2 && mount3 && umount,
+              "SaveData Mount/Mount2/Mount3/Umount functions registered");
+        if (mount && mount2 && mount3 && umount) {
+            SaveDirName dir2{}; memcpy(dir2.data, "LegacyMount2", 13);
+            LegacyMount2 input2{}; input2.userId = 1; input2.dirName = &dir2;
+            input2.blocks = 96; input2.mode = 1; // RDONLY: missing save must not be invented
+            struct GuardedResult { MountResult result; uint8_t canary[8]; } guarded;
+            memset(&guarded, 0xAB, sizeof guarded);
+            CHECK(mount2((uint64_t)(uintptr_t)&input2, (uint64_t)(uintptr_t)&guarded.result,
+                         0,0,0,0) == 0x809F0008ull,
+                  "Mount2 RDONLY of a missing save -> NOT_FOUND");
+            CHECK(all_bytes_are(&guarded, sizeof guarded, 0xAB),
+                  "failed Mount2 leaves its result and post-object canary untouched");
+
+            input2.mode = 4; // CREATE
+            CHECK(mount2((uint64_t)(uintptr_t)&input2, (uint64_t)(uintptr_t)&guarded.result,
+                         0,0,0,0) == 0,
+                  "Mount2 CREATE makes and mounts the named save");
+            CHECK(strcmp(guarded.result.mountPoint, "/savedata0") == 0 &&
+                  guarded.result.requiredBlocks == 0 && guarded.result.status == 1,
+                  "Mount2 writes the shared mount point and CREATED status");
+            CHECK(guarded.result.unused == 0 && guarded.result.tailPad == 0 &&
+                  all_bytes_are(guarded.result.reserved, sizeof guarded.result.reserved, 0),
+                  "Mount2 zero-initializes the complete result body");
+            CHECK(all_bytes_are(guarded.canary, sizeof guarded.canary, 0xAB),
+                  "Mount2 writes exactly the 0x40-byte result");
+            const auto expected2 = (mount_root / "LegacyMount2" / "probe.bin").lexically_normal();
+            CHECK(std::filesystem::path(resolve_guest_path("/savedata0/probe.bin")).lexically_normal() == expected2,
+                  "Mount2 activates /savedata0 path translation");
+
+            CHECK(umount((uint64_t)(uintptr_t)guarded.result.mountPoint, 0,0,0,0,0) == 0,
+                  "legacy Umount releases an active mount synchronously");
+            CHECK(resolve_guest_path("/savedata0/probe.bin") == "/savedata0/probe.bin",
+                  "legacy Umount removes /savedata0 path translation");
+            CHECK(umount((uint64_t)(uintptr_t)guarded.result.mountPoint, 0,0,0,0,0) == 0x809F0008ull,
+                  "legacy Umount of an inactive mount -> NOT_FOUND");
+
+            memset(&guarded, 0xAB, sizeof guarded);
+            input2.mode = 1;
+            CHECK(mount2((uint64_t)(uintptr_t)&input2, (uint64_t)(uintptr_t)&guarded.result,
+                         0,0,0,0) == 0 && guarded.result.status == 0,
+                  "Mount2 RDONLY opens an existing save with OPENED status");
+            CHECK(umount((uint64_t)(uintptr_t)guarded.result.mountPoint, 0,0,0,0,0) == 0,
+                  "legacy Umount releases the reopened save");
+
+            SaveDirName dir1{}; memcpy(dir1.data, "LegacyMount1", 13);
+            LegacyMount input1{}; input1.userId = 1;
+            input1.titleId = reinterpret_cast<const void*>(uintptr_t{1}); // decoy: dirName is @0x10
+            input1.dirName = &dir1; input1.blocks = 96; input1.mode = 4;
+            memset(&guarded, 0xAB, sizeof guarded);
+            CHECK(mount((uint64_t)(uintptr_t)&input1, (uint64_t)(uintptr_t)&guarded.result,
+                        0,0,0,0) == 0 && guarded.result.status == 1,
+                  "legacy Mount decodes its distinct dirName/mode offsets and creates the save");
+            const auto expected1 = (mount_root / "LegacyMount1" / "probe.bin").lexically_normal();
+            CHECK(std::filesystem::path(resolve_guest_path("/savedata0/probe.bin")).lexically_normal() == expected1,
+                  "legacy Mount activates the same /savedata0 backend");
+            CHECK(umount((uint64_t)(uintptr_t)guarded.result.mountPoint, 0,0,0,0,0) == 0,
+                  "legacy Umount releases the Mount-created save");
+
+            // The shared result writer must preserve the already-live PS5-native Mount3 ABI too.
+            SaveDirName dir3{}; memcpy(dir3.data, "NativeMount3", 13);
+            alignas(8) uint8_t input3[0x30]{};
+            *(const SaveDirName**)(input3 + 0x08) = &dir3;
+            *(uint64_t*)(input3 + 0x10) = 96;
+            *(uint32_t*)(input3 + 0x20) = 4;
+            memset(&guarded, 0xAB, sizeof guarded);
+            CHECK(mount3((uint64_t)(uintptr_t)input3, (uint64_t)(uintptr_t)&guarded.result,
+                         0,0,0,0) == 0 && guarded.result.status == 1,
+                  "shared mount helper preserves Mount3 create/result behavior");
+            CHECK(umount((uint64_t)(uintptr_t)guarded.result.mountPoint, 0,0,0,0,0) == 0,
+                  "legacy Umount releases a Mount3-created save");
+
+            CHECK(mount2(0, (uint64_t)(uintptr_t)&guarded.result, 0,0,0,0) == 0x809F0000ull &&
+                  mount2((uint64_t)(uintptr_t)&input2, 0, 0,0,0,0) == 0x809F0000ull &&
+                  umount(0,0,0,0,0,0) == 0x809F0000ull,
+                  "legacy mount lifecycle rejects null ABI pointers");
+        }
+    }
+
+    std::filesystem::remove_all(test_root, mount_ec);
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
