@@ -9,6 +9,7 @@
 #include "render_runner.h"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
