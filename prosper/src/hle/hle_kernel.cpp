@@ -725,6 +725,130 @@ HLE(k_getprio)            { // scePthreadGetprio(thread, int* prio)
     return 0;
 }
 
+// Guest-visible names need their own registry: Linux truncates host names to 15 bytes, Darwin can
+// rename only the current host thread, and Windows uses thread descriptions. Generation tags keep
+// an exiting thread from erasing the name of a later thread that reuses the same pthread_t.
+namespace {
+constexpr size_t kGuestThreadNameSize = 32;
+struct GuestThreadName {
+    uint64_t generation = 0;
+    std::array<char, kGuestThreadNameSize> value{};
+};
+std::mutex g_guest_thread_name_mutex;
+std::unordered_map<uint64_t, GuestThreadName> g_guest_thread_names;
+std::atomic<uint64_t> g_guest_thread_name_generation{1};
+
+uint64_t next_guest_thread_name_generation() {
+    uint64_t generation = g_guest_thread_name_generation.fetch_add(1, std::memory_order_relaxed);
+    if (generation == 0)
+        generation = g_guest_thread_name_generation.fetch_add(1, std::memory_order_relaxed);
+    return generation;
+}
+
+std::array<char, kGuestThreadNameSize> bounded_guest_thread_name(const char* name) {
+    std::array<char, kGuestThreadNameSize> result{};
+    if (name) {
+        strncpy(result.data(), name, result.size() - 1);
+        result.back() = '\0';
+    }
+    return result;
+}
+
+bool publish_guest_thread_name(uint64_t thread, uint64_t generation, const char* name) noexcept {
+    std::lock_guard<std::mutex> lock(g_guest_thread_name_mutex);
+    try {
+        g_guest_thread_names[thread] = GuestThreadName{generation, bounded_guest_thread_name(name)};
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void retire_guest_thread_name(uint64_t thread, uint64_t generation) {
+    std::lock_guard<std::mutex> lock(g_guest_thread_name_mutex);
+    const auto it = g_guest_thread_names.find(thread);
+    if (it != g_guest_thread_names.end() && (!generation || it->second.generation == generation))
+        g_guest_thread_names.erase(it);
+}
+
+bool get_guest_thread_name(uint64_t thread, std::array<char, kGuestThreadNameSize>& name) {
+    std::lock_guard<std::mutex> lock(g_guest_thread_name_mutex);
+    const auto it = g_guest_thread_names.find(thread);
+    if (it != g_guest_thread_names.end()) {
+        name = it->second.value;
+        return true;
+    }
+    if (thread == (uint64_t)(uintptr_t)pthread_self()) {
+        name.fill('\0');
+        return true;
+    }
+    return false;
+}
+
+void set_host_thread_name(uint64_t thread, const char* name) {
+    char short_name[16]{};
+    if (name) strncpy(short_name, name, sizeof(short_name) - 1);
+#ifdef __APPLE__
+    if (thread == (uint64_t)(uintptr_t)pthread_self()) pthread_setname_np(short_name);
+#elif defined(__linux__)
+    pthread_setname_np((pthread_t)(uintptr_t)thread, short_name);
+#elif defined(_WIN32)
+    if (thread == (uint64_t)(uintptr_t)pthread_self()) {
+        wchar_t wide_name[kGuestThreadNameSize]{};
+        MultiByteToWideChar(CP_UTF8, 0, name ? name : "", -1, wide_name,
+                            static_cast<int>(kGuestThreadNameSize));
+        SetThreadDescription(GetCurrentThread(), wide_name);
+    }
+#endif
+}
+
+bool set_guest_thread_name(uint64_t thread, const char* name) {
+    std::lock_guard<std::mutex> lock(g_guest_thread_name_mutex);
+    auto it = g_guest_thread_names.find(thread);
+    if (it == g_guest_thread_names.end()) {
+        if (thread != (uint64_t)(uintptr_t)pthread_self()) return false;
+        try {
+            it = g_guest_thread_names.emplace(thread, GuestThreadName{}).first;
+        } catch (...) {
+            return false;
+        }
+    }
+    it->second.value = bounded_guest_thread_name(name);
+    // Serialize the host rename with registry retirement so a target cannot exit between the
+    // lifetime check above and pthread_setname_np receiving its host pthread_t.
+    set_host_thread_name(thread, name);
+    return true;
+}
+}
+
+HLE(k_pthread_getname) {
+    if (!a0) return 3;    // ESRCH
+    if (!a1) return 14;   // EFAULT
+    std::array<char, kGuestThreadNameSize> name{};
+    if (!get_guest_thread_name(a0, name)) return 3;
+    memcpy((void*)(uintptr_t)a1, name.data(), name.size());
+    return 0;
+}
+
+HLE(k_pthread_getname_np) {
+    if (!a0) return 3;
+    if (!a1) return 14;
+    std::array<char, kGuestThreadNameSize> name{};
+    if (!get_guest_thread_name(a0, name)) return 3;
+    const size_t needed = strlen(name.data()) + 1;
+    if (a2 < needed) return 34;
+    memcpy((void*)(uintptr_t)a1, name.data(), needed);
+    return 0;
+}
+
+HLE(k_pthread_rename) {
+    if (!a0) return 22;  // EINVAL
+    if (!a1) return 0;   // Sony accepts a null name as a no-op
+    const char* name = (const char*)(uintptr_t)a1;
+    if (!set_guest_thread_name(a0, name)) return 3;
+    return 0;
+}
+
 // --- thread creation: run the guest entry on a real host thread (ABI matches) ---
 // Worker stacks are GLIBC-OWNED (#138): create passes only a stacksize (honoring the guest attr),
 // so glibc allocates the stack and — crucially — RECLAIMS it when the thread is joined or a
@@ -742,13 +866,17 @@ struct ThreadStart {
     void* arg;
     void* guest_stack;
     size_t guest_stack_size;
-    char name[16];
+    char name[kGuestThreadNameSize];
+    uint64_t name_generation;
+    std::atomic<bool> name_published{false};
 };
 // Runs first on the new thread: register our own stack (keyed by our tid) BEFORE any guest code,
 // so an early GC_register_my_thread / stack-base query from this thread finds it. Closes a race
 // where a fast-starting worker ran before the parent's post-create registration → "Bad stack base".
 void* thread_trampoline(void* p) {
     auto* ts = (ThreadStart*)p;
+    while (!ts->name_published.load(std::memory_order_acquire)) std::this_thread::yield();
+    const uint64_t name_generation = ts->name_generation;
     void* registered_stack = ts->guest_stack;
     size_t registered_stack_size = ts->guest_stack_size;
     {
@@ -770,13 +898,19 @@ void* thread_trampoline(void* p) {
     // role names (GameThread, RenderThread, RHIThread, ...) instead of the binary name. Kernel
     // limit is 15 chars + NUL; host libc call, so it must run on the host %fs (we are).
 #ifdef __APPLE__
-    if (ts->name[0]) pthread_setname_np(ts->name);   // Darwin can only name the CURRENT thread (which this is)
+    if (ts->name[0]) {
+        char host_name[16]{}; strncpy(host_name, ts->name, sizeof(host_name) - 1);
+        pthread_setname_np(host_name);
+    }
 #else
-    if (ts->name[0]) pthread_setname_np(pthread_self(), ts->name);
+    if (ts->name[0]) {
+        char host_name[16]{}; strncpy(host_name, ts->name, sizeof(host_name) - 1);
+        pthread_setname_np(pthread_self(), host_name);
+    }
 #endif
     auto entry = ts->entry; void* arg = ts->arg;
     void* guest_stack = ts->guest_stack; size_t guest_stack_size = ts->guest_stack_size;
-    free(ts);   // all host libc — MUST run on the host %fs
+    delete ts;   // all host libc; MUST run on the host %fs
     // gated (PROSPER_GUEST_FS): give this guest worker its own guest TCB + static TLS and switch %fs to it
     // as the LAST host action before entering guest code (so guest initial-exec TLS — incl. libc.prx's
     // allocator arena/tcache — resolves to real guest storage, not the aliased host glibc TCB). The import
@@ -806,6 +940,7 @@ void* thread_trampoline(void* p) {
     (void)guest_fs_to_host_scoped();
     tls_dtv_purge_current_thread();
     unregister_thread_stack((uint64_t)pthread_self());   // ids recycle; stale bounds = wrong bounds (#138)
+    retire_guest_thread_name((uint64_t)(uintptr_t)pthread_self(), name_generation);
     return rv;
 }
 }
@@ -822,7 +957,9 @@ struct WinThreadStart {
     void* arg;
     void* guest_stack;
     size_t guest_stack_size;
-    char name[64];
+    char name[kGuestThreadNameSize];
+    uint64_t name_generation;
+    std::atomic<bool> name_published{false};
 };
 extern "C" uint64_t prosper_call_guest_sysv(uint64_t fn, uint64_t a0, uint64_t a1);
 extern "C" uint64_t prosper_call_guest_on_stack(uintptr_t stack_top, uint64_t fn,
@@ -869,10 +1006,12 @@ bool prepare_guest_windows_stack(ULONG_PTR* out_low, ULONG_PTR* out_high) {
 
 void* win_thread_trampoline(void* p) {
     auto* ts = (WinThreadStart*)p;
+    while (!ts->name_published.load(std::memory_order_acquire)) std::this_thread::yield();
+    const uint64_t name_generation = ts->name_generation;
     uint64_t entry = ts->entry; void* arg = ts->arg;
     void* guest_stack = ts->guest_stack; size_t guest_stack_size = ts->guest_stack_size;
     char name[sizeof(ts->name)]; memcpy(name, ts->name, sizeof(name));
-    free(ts);   // host libc: run on host %fs (before activate)
+    delete ts;   // host libc: run on host %fs (before activate)
     if (name[0]) {
         wchar_t wname[sizeof(name)]{};
         MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, (int)(sizeof(wname) / sizeof(wname[0])));
@@ -917,6 +1056,7 @@ void* win_thread_trampoline(void* p) {
     unregister_thread_stack((uint64_t)GetCurrentThreadId());   // ids recycle; stale bounds = wrong bounds
     unregister_thread_stack(guest_thread);
     unregister_current_thread_handle(guest_thread);
+    retire_guest_thread_name(guest_thread, name_generation);
     return rv;
 }
 }
@@ -959,16 +1099,19 @@ HLE(k_pthread_create) {
     int attr_rc = pthread_attr_setstacksize(&la, supplied_stack ? kStackFloor : ssz);
     if (attr_rc) { pthread_attr_destroy(&la); return (uint64_t)(unsigned)attr_rc; }
     pthread_attr_setdetachstate(&la, detach);
-    auto* ts = (ThreadStart*)malloc(sizeof(ThreadStart));
+    auto* ts = new (std::nothrow) ThreadStart{};
     if (!ts) { pthread_attr_destroy(&la); return 12; }         // ENOMEM (FreeBSD and host agree)
     ts->entry = entry; ts->arg = arg;
     ts->guest_stack = supplied_stack; ts->guest_stack_size = supplied_stack_size;
+    ts->name_generation = next_guest_thread_name_generation();
     ts->name[0] = 0;
     if (a4) { strncpy(ts->name, (const char*)(uintptr_t)a4, sizeof(ts->name) - 1); ts->name[sizeof(ts->name) - 1] = 0; }
     int r = pthread_create(&tid, &la, thread_trampoline, ts);   // trampoline registers the stack first
     if (getenv("PROSPER_SYNCLOG")) fprintf(stderr, "[thread] pthread_create rc=%d\n", r);
     pthread_attr_destroy(&la);
-    if (r) { free(ts); return (uint64_t)r; }
+    if (r) { delete ts; return (uint64_t)r; }
+    (void)publish_guest_thread_name((uint64_t)(uintptr_t)tid, ts->name_generation, ts->name);
+    ts->name_published.store(true, std::memory_order_release);
 #else
     // Windows: route through win_thread_trampoline so the guest entry is called with the SysV ABI and
     // gets its guest %fs TCB — a bare pthread_create(entry, arg) mis-passes the arg (MS x64 vs SysV) and
@@ -993,15 +1136,18 @@ HLE(k_pthread_create) {
     pthread_attr_t la; pthread_attr_init(&la);
     pthread_attr_setstacksize(&la, supplied_stack ? kStackFloor : ssz);
     pthread_attr_setdetachstate(&la, detach);
-    auto* ts = (WinThreadStart*)malloc(sizeof(WinThreadStart));
+    auto* ts = new (std::nothrow) WinThreadStart{};
     if (!ts) { pthread_attr_destroy(&la); return 12; }          // ENOMEM (FreeBSD and host agree)
     ts->entry = (uint64_t)(uintptr_t)entry; ts->arg = arg;
     ts->guest_stack = supplied_stack; ts->guest_stack_size = supplied_stack_size;
+    ts->name_generation = next_guest_thread_name_generation();
     ts->name[0] = 0;
     if (a4) { strncpy(ts->name, (const char*)(uintptr_t)a4, sizeof(ts->name) - 1); ts->name[sizeof(ts->name) - 1] = 0; }
     int r = pthread_create(&tid, &la, win_thread_trampoline, ts);
     pthread_attr_destroy(&la);
-    if (r) { free(ts); return (uint64_t)r; }
+    if (r) { delete ts; return (uint64_t)r; }
+    (void)publish_guest_thread_name((uint64_t)(uintptr_t)tid, ts->name_generation, ts->name);
+    ts->name_published.store(true, std::memory_order_release);
 #endif
     if (a0) *(uint64_t*)a0 = (uint64_t)tid;
     return 0;
@@ -1020,6 +1166,7 @@ HLE(k_pthread_exit)   {
     // registration (#138 — pthread ids recycle). HLE handlers run under the HOST %fs (the import
     // stubs swap), so the host libc below is safe. No-op for threads that never touched either.
     tls_dtv_purge_current_thread();
+    retire_guest_thread_name((uint64_t)(uintptr_t)pthread_self(), 0);
 #if defined(__linux__) || defined(__APPLE__)
     unregister_thread_stack((uint64_t)pthread_self());
 #elif defined(_WIN32)
@@ -2762,6 +2909,9 @@ void register_kernel_hle() {
     R("scePthreadGetschedparam", k_getschedparam);  R("pthread_getschedparam", k_getschedparam);
     R("scePthreadSetschedparam", k_attr_noop);  R("scePthreadSetprio", k_attr_noop);
     R("scePthreadGetprio", k_getprio);
+    R("scePthreadGetname", k_pthread_getname);
+    R("scePthreadRename", k_pthread_rename);
+    R("scePthreadSetName", k_pthread_rename);
     R("scePthreadGetstack", k_attr_getstackaddr);
     // TLS keys (POSIX + Sony names -> host pthread keys)
     R("pthread_key_create", k_key_create);   R("scePthreadKeyCreate", k_key_create);
@@ -2797,7 +2947,8 @@ void register_kernel_hle() {
     R("pthread_attr_setinheritsched", k_attr_noop);
     R("pthread_attr_setschedpolicy", k_attr_noop);  R("pthread_attr_setschedparam", k_attr_noop);
     R("pthread_attr_getstacksize", k_attr_getstacksize);
-    R("scePthreadAttrSetaffinity", k_attr_noop); R("pthread_setname_np", k_attr_noop);
+    R("scePthreadAttrSetaffinity", k_attr_noop);
+    R("pthread_getname_np", k_pthread_getname_np); R("pthread_setname_np", k_pthread_rename);
     // Plain libScePosix sem_* imports use the same guest object representation as scePthreadSem*.
     // Registering only the Sony-prefixed spellings left successful no-op imports in native engines.
     R("sem_init", k_sem_init);       R("sem_destroy", k_sem_destroy);

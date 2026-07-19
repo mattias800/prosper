@@ -270,6 +270,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_pthread_sched_getters PRIVATE prosper_core)
   add_test(NAME pthread_sched_getters COMMAND test_pthread_sched_getters)
 
+  add_executable(test_pthread_names tests/test_pthread_names.cpp)
+  target_link_libraries(test_pthread_names PRIVATE prosper_core)
+  add_test(NAME pthread_names COMMAND test_pthread_names)
+
   # libScePad controller input: ScePadData layout + HostPadState mapping + HLE fill contract (pure).
   add_executable(test_pad tests/test_pad.cpp)
   target_link_libraries(test_pad PRIVATE prosper_core)
