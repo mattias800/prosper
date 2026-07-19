@@ -834,8 +834,26 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const bool persistent_source_is_tiled =
                             persistent_sampled_texture && !getenv("PROSPER_NODETILE") &&
                             prosper::gpu::tile_mode_is_tiled(r.tile_mode);
+                        // A sampled LINEAR (tile_mode 0) 2D surface whose tight row (tw*4) is not 256-aligned
+                        // is pitch-padded: RDNA2 requires a sampled linear texture's row pitch to be aligned
+                        // (256 B here), so its real pitch is align(tw*4,256). The RGBA8 decode below must read
+                        // it row-by-row at that pitch (else every row drifts -> horizontal scramble, e.g.
+                        // Dead Cells' 348-wide Motion Twin splash whose real pitch is 384 texels). Guards keep
+                        // this narrow and regression-safe: 2D only (volume/cube layouts untouched); tile_mode
+                        // == 0 exactly, so unrecognized/actually-tiled modes are NOT strided (they fall to the
+                        // contiguous read + auto-detile pass); !host_data, so CPU-uploaded tightly-packed
+                        // pixels (test fixtures, staged uploads) are read contiguously. The tightly-packed
+                        // LINEAR_GENERAL layout is a buffer/copy layout, not a sampled-texture layout, so it
+                        // does not reach here. r.size is the TIGHT extent (tw*th*bpp), so it cannot gate this.
+                        const size_t linear_dst_row = (size_t)tw * 4;
+                        size_t linear_src_row = (linear_dst_row + 255) & ~size_t(255);
+                        if (const char* lp = getenv("PROSPER_LINPITCH"))
+                            linear_src_row = (size_t)strtoull(lp, nullptr, 0) * 4;
+                        const bool linear_padded_read =
+                            r.cls == RC::Texture && r.img_dim == 1u && r.tile_mode == 0 && !r.host_data &&
+                            linear_dst_row != 0 && linear_src_row > linear_dst_row;
                         const bool persistent_source_matches_pixels =
-                            persistent_unorm8_texture && r.num_components == 4 &&
+                            persistent_unorm8_texture && r.num_components == 4 && !linear_padded_read &&
                             !prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
                             (!getenv("PROSPER_DETILE") || atoi(getenv("PROSPER_DETILE")) == 0);
                         const size_t persistent_source_size = [&] {
@@ -1339,6 +1357,20 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 p[0] = p[1] = p[2] = p[3] = v;
                             }
                             narrow_done = true;   // already detiled+expanded; skip the 32-bpp auto-detile below
+                        } else if (linear_padded_read) {
+                            // Pitch-padded linear surface (see linear_padded_read above): read row-by-row at
+                            // the 256-byte-aligned source pitch into the tight destination, dropping the
+                            // per-row padding. The read stays within the backing (linear_src_row*th <= size,
+                            // checked when the flag was set) and copy_resource is fault-safe on a short row.
+                            size_t total = 0;
+                            for (uint32_t y = 0; y < th; ++y) {
+                                uint8_t* drow = texture_pixels.data() + (size_t)y * linear_dst_row;
+                                const size_t got = copy_resource(
+                                    drow, r.gpu_addr + (uint64_t)y * linear_src_row, linear_dst_row);
+                                total += got;
+                                if (got < linear_dst_row) std::fill(drow + got, drow + linear_dst_row, 0);
+                            }
+                            linear_source_prefix_size = total;
                         } else {
                             const size_t got = copy_resource(texture_pixels.data(), r.gpu_addr, nb);
                             linear_source_prefix_size = got;
