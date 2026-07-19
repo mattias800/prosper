@@ -79,7 +79,8 @@ int main() {
     DrawItem draw; draw.vs = {0x07230203, 1, 2}; draw.fs = {0x07230203, 3}; draw.vrt = table;
     draw.vs_guest_addr = reinterpret_cast<uint64_t>(kDiagnosticVs);
     draw.fs_guest_addr = reinterpret_cast<uint64_t>(kDiagnosticBadPs);
-    draw.vertex_count = 6; draw.indices = {0, 1, 2, 2, 3, 0}; draw.color0_base = 0x2000;
+    draw.vertex_count = 6; draw.instance_count = 3;
+    draw.indices = {0, 1, 2, 2, 3, 0}; draw.color0_base = 0x2000;
     draw.color0_width = 1024; draw.color0_height = 32;
     draw.color1_base = 0x3000; draw.color1_width = 1024; draw.color1_height = 32;
     draw.draw_index = 7; draw.command_order = 123;
@@ -131,6 +132,8 @@ int main() {
     CHECK(captured.shader_versions.size() == 2 && captured.operations.size() == 1 &&
           captured.operations[0].source_index == 7 && captured.operations[0].realized,
           "capture indexes unique shaders and retains operation provenance");
+    CHECK(captured.draws.size() == 1 && captured.draws[0].instance_count == 3,
+          "capture retains the realized draw instance count");
     CHECK(captured.raw_shader_versions.size() == 2 &&
           captured.draws[0].vs_raw_shader_index < captured.raw_shader_versions.size() &&
           captured.draws[0].fs_raw_shader_index < captured.raw_shader_versions.size() &&
@@ -177,8 +180,9 @@ int main() {
               scalar_capture.computes[0].resources.resources.empty(),
           "#636: capture ignores unconsumed descriptor-looking scalar arguments");
 
-    // v17 appends scissor state without changing the legacy pipeline prefix. Remove v19's realized
-    // raw-stage indices, v18's geometry index, then the v17 tail to recover a byte-exact v16 capture.
+    // v17 appends scissor state without changing the legacy pipeline prefix. Remove v20's instance
+    // count, v19's realized raw-stage indices, v18's geometry index, then the v17 tail to recover a
+    // byte-exact v16 capture.
     GpuCaptureFile v16_scissor_source = captured;
     v16_scissor_source.raw_shader_versions.clear();
     v16_scissor_source.draws[0].vs_raw_shader_index = 0xFFFFFFFFu;
@@ -189,6 +193,7 @@ int main() {
               v16_scissor_bytes.size() >= 25,
           "v17 capture serializes effective guest scissor state");
     if (v16_scissor_bytes.size() >= 25) {
+        v16_scissor_bytes.resize(v16_scissor_bytes.size() - 8); // v20 draw count + instance count
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 12); // v19 count + two raw indices
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 8); // v18 draw count + no-GS sentinel
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 25);
@@ -332,6 +337,7 @@ int main() {
           "writer rejects an out-of-bounds DCC metadata reference");
     CHECK(serialize_gpu_capture(volume_capture, volume_bytes, error),
           "recreated valid v12 DCC bytes after malformed-reference check");
+    volume_bytes.resize(volume_bytes.size() - 8); // v20 draw count + instance count
     volume_bytes.resize(volume_bytes.size() - 12); // v19 count + two raw indices
     volume_bytes.resize(volume_bytes.size() - 8); // v18 draw count + no-GS sentinel
     volume_bytes.resize(volume_bytes.size() - 25); // v17 one-draw scissor tail, zero failures
@@ -393,6 +399,17 @@ int main() {
     CHECK(write_gpu_capture(path.string(), captured, error), "versioned capture writes atomically");
     GpuCaptureFile loaded;
     CHECK(read_gpu_capture(path.string(), loaded, error), "versioned capture reads back");
+    std::vector<uint8_t> v19_bytes;
+    GpuCaptureFile v19_loaded;
+    CHECK(serialize_gpu_capture(captured, v19_bytes, error) && v19_bytes.size() >= 12,
+          "v20 capture serializes the instance-count extension");
+    if (v19_bytes.size() >= 12) {
+        v19_bytes.resize(v19_bytes.size() - 8); // v20 draw count + one instance count
+        v19_bytes[8] = 19; v19_bytes[9] = v19_bytes[10] = v19_bytes[11] = 0;
+    }
+    CHECK(deserialize_gpu_capture(v19_bytes, v19_loaded, error) &&
+              v19_loaded.draws[0].instance_count == 1,
+          "v19 capture reopens with the historical one-instance default");
     CHECK(loaded.metadata.submit_index == 42 && loaded.metadata.title_id == "PPSA24651" &&
           loaded.metadata.renderer_env.size() == 2 && loaded.metadata.renderer_env[0].first == "PROSPER_RTT_PERTARGET" &&
           loaded.draws.size() == 1 && loaded.draws[0].indices.size() == 6, "metadata and draw data round-trip");
@@ -423,6 +440,8 @@ int main() {
     CHECK(loaded.shader_versions.size() == 2 && loaded.draws[0].draw_index == 7 &&
           loaded.draws[0].command_order == 123 && loaded.operations[0].source_index == 7,
           "content versions and draw operation identity round-trip");
+    CHECK(loaded.draws[0].instance_count == 3,
+          "v20 realized draw instance count round-trips");
     CHECK(loaded.raw_shader_versions.size() == 2 &&
           loaded.draws[0].vs_raw_shader_index < loaded.raw_shader_versions.size() &&
           loaded.draws[0].fs_raw_shader_index < loaded.raw_shader_versions.size(),
@@ -477,6 +496,8 @@ int main() {
           "an empty renderer result does not become a valid replay oracle");
     CHECK(replay.items[0].draw_index == 7 && replay.items[0].command_order == 123,
           "materialized draw retains its source operation identity");
+    CHECK(replay.items[0].instance_count == 3,
+          "materialized replay retains the draw instance count");
     CHECK(replay.items[0].vs_raw_shader_index == loaded.draws[0].vs_raw_shader_index &&
           replay.items[0].fs_raw_shader_index == loaded.draws[0].fs_raw_shader_index,
           "materialized replay exposes both realized raw-stage identities");
@@ -752,11 +773,12 @@ int main() {
     legacy_source.draws[0].fs_raw_shader_index = 0xFFFFFFFFu;
     std::vector<uint8_t> legacy_bytes;
     CHECK(serialize_gpu_capture(legacy_source, legacy_bytes, error) && legacy_bytes.size() >= 32,
-          "created a diagnostic-free v19 payload for legacy-reader fixtures");
+          "created a diagnostic-free v20 payload for legacy-reader fixtures");
     std::vector<uint8_t> v13_bytes = legacy_bytes;
     if (v13_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        v13_bytes.resize(v13_bytes.size() - 8); // v20 draw count + instance count
         v13_bytes.resize(v13_bytes.size() - 12); // v19 count + two raw indices
         v13_bytes.resize(v13_bytes.size() - 8); // v18 draw count + no-GS sentinel
         v13_bytes.resize(v13_bytes.size() - 25); // v17 one-draw scissor tail, zero failures
@@ -776,6 +798,7 @@ int main() {
     if (legacy_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        legacy_bytes.resize(legacy_bytes.size() - 8); // v20 draw count + instance count
         legacy_bytes.resize(legacy_bytes.size() - 12); // v19 count + two raw indices
         legacy_bytes.resize(legacy_bytes.size() - 8); // v18 draw count + no-GS sentinel
         legacy_bytes.resize(legacy_bytes.size() - 25); // v17 one-draw scissor tail, zero failures
@@ -821,9 +844,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 20;
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 21;
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 20",
+          error == "unsupported capture version 21",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

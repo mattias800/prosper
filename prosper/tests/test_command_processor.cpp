@@ -41,13 +41,14 @@ int main() {
     auto setcx = Hle::lookup("ZvwO9euwYzc");   // SetCxRegistersIndirect
     auto setsh = Hle::lookup("-HOOCn0JY48");   // SetShRegistersIndirect
     auto draw  = Hle::lookup("Yw0jKSqop+E");   // DrawIndexAuto
+    auto instances = Hle::lookup("tSBxhAPyytQ"); // SetNumInstances
     auto dispatch = Hle::lookup("k3GhuSNmBLU"); // DispatchDirect
     auto setcx_direct = Hle::lookup("LHFXRrlTPD8"); // SetCxRegisterDirect (#395 F5)
     auto setsh_direct = Hle::lookup("pFLArOT53+w"); // SetShRegisterDirect (#395 F5)
     auto setuc_direct = Hle::lookup("w4-d0n60hdo"); // SetUcRegisterDirect (#395 F5)
-    CHECK(reset && idx && setcx && setsh && draw && dispatch &&
+    CHECK(reset && idx && setcx && setsh && draw && instances && dispatch &&
           setcx_direct && setsh_direct && setuc_direct, "AGC Dcb builders registered");
-    if (!(reset && idx && setcx && setsh && draw && dispatch &&
+    if (!(reset && idx && setcx && setsh && draw && instances && dispatch &&
           setcx_direct && setsh_direct && setuc_direct)) { printf("== FAIL ==\n"); return 1; }
 
     uint32_t buffer[256];
@@ -71,7 +72,9 @@ int main() {
     setcx_direct(D, pack_reg(0xA318u, 0xCCCCCCCCu), 0, 0, 0, 0);
     setsh_direct(D, pack_reg(0x2C0Du, 0xDDDDDDDDu), 0, 0, 0, 0);
     setuc_direct(D, pack_reg(0x0123u, 0xEEEEEEEEu), 0, 0, 0, 0);
+    instances(D, 3, 0, 0, 0, 0);
     draw(D, 0x0300, 0, 0, 0, 0);
+    instances(D, 0, 0, 0, 0, 0);
     draw(D, 0x0006, 0, 0, 0, 0);
 
     GpuState st;
@@ -98,6 +101,12 @@ int main() {
     CHECK(st.draws.size() == 2, "2 draws recorded");
     CHECK(st.draws.size() == 2 && st.draws[0].index_count == 0x0300, "draw0 index_count = 0x300");
     CHECK(st.draws.size() == 2 && st.draws[1].index_count == 0x0006, "draw1 index_count = 0x6");
+    CHECK(st.draws.size() == 2 && st.draws[0].instance_count == 3 && st.draws[0].state &&
+              st.draws[0].state->num_instances == 3,
+          "draw0 record and snapshot retain SetNumInstances(3)");
+    CHECK(st.draws.size() == 2 && st.draws[1].instance_count == 1 && st.draws[1].state &&
+              st.draws[1].state->num_instances == 1,
+          "draw1 normalizes SetNumInstances(0) to the single-instance default");
 
     // SET_SH_REG (IT_SET_SH_REG=0x76) sets a RANGE: payload[0]=start offset, payload[1..]=consecutive
     // values. The driver uploads the whole user-data descriptor block this way, so the decode+apply MUST

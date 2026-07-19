@@ -37,7 +37,7 @@ namespace prosper::gpu {
 namespace {
 
 constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
-constexpr uint32_t kVersion = 19;
+constexpr uint32_t kVersion = 20;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -935,6 +935,7 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
     for (const auto& d : draws) {
         GpuCapturedDraw c; c.vs = d.vs; c.gs = d.gs; c.fs = d.fs;
         c.ps = d.ps; c.vertex_count = d.vertex_count;
+        c.instance_count = d.instance_count;
         c.indices = d.indices; c.color0_base = d.color0_base;
         c.color0_width = d.color0_width; c.color0_height = d.color0_height;
         c.color1_base = d.color1_base;
@@ -1438,6 +1439,10 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         w.u32(draw.vs_raw_shader_index);
         w.u32(draw.fs_raw_shader_index);
     }
+    // v20 retains the hardware instance count per realized draw. Older captures default to one,
+    // matching the command-processor and Vulkan defaults before IT_NUM_INSTANCES was consumed.
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws) w.u32(draw.instance_count);
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -1930,6 +1935,14 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             if (!r.u32(draw.vs_raw_shader_index) || !r.u32(draw.fs_raw_shader_index))
                 return false;
     }
+    if (version >= 20) {
+        uint32_t draw_count = 0;
+        if (!r.u32(draw_count) || draw_count != c.draws.size()) {
+            error = "invalid draw instance-count state count"; return false;
+        }
+        for (auto& draw : c.draws)
+            if (!r.u32(draw.instance_count)) return false;
+    }
     if (version >= 7 && !validate_failure_diagnostics(c, error)) return false;
     if (r.left) { error = "capture has trailing data"; return false; }
     return true;
@@ -2002,6 +2015,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
     for (const auto& x : c.draws) {
         DrawItem d; d.vs = x.vs; d.gs = x.gs; d.fs = x.fs;
         d.ps = x.ps; d.vertex_count = x.vertex_count;
+        d.instance_count = x.instance_count;
         d.indices = x.indices; d.color0_base = x.color0_base;
         d.color0_width = x.color0_width; d.color0_height = x.color0_height;
         d.color1_base = x.color1_base;

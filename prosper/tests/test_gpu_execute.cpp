@@ -49,7 +49,12 @@ int main() {
     set_pgm(st, P::SPI_SHADER_PGM_LO_PS, P::SPI_SHADER_PGM_HI_PS, kPs);
     st.uc[P::VGT_PRIMITIVE_TYPE] = 4;     // triangle list
     st.cx[P::CB_TARGET_MASK]     = 0xF;   // write RGBA
-    st.draws.push_back({3});
+    st.num_instances = 4;
+    GpuState::Draw source_draw;
+    source_draw.index_count = 3;
+    source_draw.instance_count = 4;
+    st.draws.push_back(source_draw);
+    st.num_instances = 0; // later state must not rewrite the already-recorded draw in folded mode
 
     // The executor core, with the offscreen Vulkan renderer supplied as the backend (as the HLE will
     // supply the live-device renderer). execute_gpustate does recompile + resolve + render internally.
@@ -69,6 +74,8 @@ int main() {
     uint32_t green = 0, total = 0;
     for (uint32_t y : {0u, H/2, H-1}) for (uint32_t x : {0u, W/2, W-1}) { total++; if (isGreen(x, y)) green++; }
     CHECK(green == total, "GpuState -> executor -> GREEN frame (full recompile+resolve+render spine)");
+    CHECK(realized_draw.instance_count == 4,
+          "draw realization retains the folded hardware instance count");
 
     // DCC_DECOMPRESS binds a graphics helper whose color export is interpreted by the hardware as a
     // metadata operation. Prosper stores only materialized Vulkan color, so realization substitutes

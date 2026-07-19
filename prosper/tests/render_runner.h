@@ -161,7 +161,8 @@ inline BackendColorTargetStats backend_color_target_stats() {
 // When `tex` is non-null, its RGBA8 texels are uploaded to a sampled VkImage and bound as a combined
 // image sampler at tex->binding — how a recompiled pixel shader's image_sample reaches a real texture.
 // One draw for the multi-draw backend: recompiled VS+PS SPIR-V, its resolved fixed-function state, its
-// set-tagged resources, and its vertex count. render_draws_rgba records ALL of a submit's draws into ONE
+// set-tagged resources, vertex count, and instance count. render_draws_rgba records ALL of a submit's
+// draws into ONE
 // render pass (clear once, then per-draw pipeline+descriptors+draw) so a multi-draw frame composites
 // correctly. render_triangle_rgba is a thin single-draw wrapper (below).
 struct BackendDraw {
@@ -170,10 +171,11 @@ struct BackendDraw {
     const prosper::gpu::ResolvedPipelineState* ps = nullptr;   // null -> triangle-list, write RGBA, no depth
     std::vector<FrameResource> R;                              // set-tagged resources (empty -> no descriptors)
     uint32_t vcount = 3;
+    uint32_t instance_count = 1;
     // Indexed draw: 32-bit index data (the executor widens guest 16-bit indices). Non-empty -> the draw
     // is recorded as vkCmdBindIndexBuffer + vkCmdDrawIndexed(indices.size()), so gl_VertexIndex is the
     // fetched index — exactly what the recompiled VS's storage-buffer vertex fetch expects. Empty ->
-    // plain vkCmdDraw(vcount).
+    // plain vkCmdDraw(vcount). Both paths preserve instance_count.
     std::vector<uint32_t> indices;
 };
 
@@ -1664,7 +1666,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         VkPipelineLayout layout = VK_NULL_HANDLE; VkPipeline pipe = VK_NULL_HANDLE;
         VkBuffer ibuf = VK_NULL_HANDLE; VkDeviceMemory ibmem = VK_NULL_HANDLE;   // index buffer (indexed draws)
         VkRect2D scissor{};
-        uint32_t n_sets = 1, vcount = 3, icount = 0;
+        uint32_t n_sets = 1, vcount = 3, icount = 0, instance_count = 1;
         bool use_desc = false, ok = false, pipeline_cached = false;
     };
     struct TextureUploadKey {
@@ -1970,6 +1972,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         const auto setup_shaders_ready = setup_begin;
         const prosper::gpu::ResolvedPipelineState* ps = bd.ps;
         v.vcount = bd.vcount;
+        v.instance_count = bd.instance_count;
         v.scissor = {{0, 0}, {W, H}};
         if (ps && ps->has_scissor) {
             const int64_t left = std::clamp<int64_t>(ps->scissor_left, 0, W);
@@ -2904,9 +2907,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         if (v.use_desc) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
         if (v.icount) {
             vkCmdBindIndexBuffer(cmd, v.ibuf, 0, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(cmd, v.icount, 1, 0, 0, 0);
+            vkCmdDrawIndexed(cmd, v.icount, v.instance_count, 0, 0, 0);
         } else {
-            vkCmdDraw(cmd, v.vcount, 1, 0, 0);
+            vkCmdDraw(cmd, v.vcount, v.instance_count, 0, 0);
         }
     }
     vkCmdEndRenderPass(cmd);
@@ -3039,8 +3042,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 for (size_t di = 0; di < dv.size(); di++) { auto& v = dv[di]; if (!v.ok) continue; if ((int)di == kk) continue;
                     vkCmdBindPipeline(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
                     if (v.use_desc) vkCmdBindDescriptorSets(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
-                    if (v.icount) { vkCmdBindIndexBuffer(c2, v.ibuf, 0, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(c2, v.icount, 1, 0, 0, 0); }
-                    else vkCmdDraw(c2, v.vcount, 1, 0, 0);
+                    if (v.icount) { vkCmdBindIndexBuffer(c2, v.ibuf, 0, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(c2, v.icount, v.instance_count, 0, 0, 0); }
+                    else vkCmdDraw(c2, v.vcount, v.instance_count, 0, 0);
                 }
                 vkCmdEndRenderPass(c2);
                 vkCmdCopyImageToBuffer(c2, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp2);

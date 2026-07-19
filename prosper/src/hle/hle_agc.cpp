@@ -1283,6 +1283,7 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
                 case K::SetRegDirect:    return "SetRegDirect";
                 case K::SetRegsIndirect: return "SetRegsIndirect";
                 case K::SetIndexType:    return "SetIndexType";
+                case K::SetNumInstances: return "SetNumInstances";
                 case K::DrawIndex:       return "DrawIndex";
                 case K::DrawIndexAuto:   return "DrawIndexAuto";
                 case K::EventWrite:      return "EventWrite";

@@ -17,7 +17,7 @@ namespace prosper::gpu {
 
 // IT_* opcodes and the R_* sub-opcodes carried inside IT_NOP (mirror hle_agc.cpp).
 enum : uint32_t {
-    IT_NOP = 0x10, IT_INDEX_TYPE = 0x2A, IT_EVENT_WRITE = 0x46,
+    IT_NOP = 0x10, IT_INDEX_TYPE = 0x2A, IT_NUM_INSTANCES = 0x2F, IT_EVENT_WRITE = 0x46,
     IT_SET_CONTEXT_REG = 0x69, IT_SET_SH_REG = 0x76, IT_SET_UCONFIG_REG = 0x79,
 };
 enum : uint32_t {
@@ -49,6 +49,7 @@ enum class RegClass { Cx, Sh, Uc };
 struct Pm4Command {
     enum class Kind {
         DrawReset, WaitFlipDone, PushMarker, PopMarker, SetRegDirect, SetRegsIndirect, SetIndexType,
+        SetNumInstances,
         DrawIndex, DrawIndexAuto, EventWrite, AcquireMem, WriteData, WaitRegMem, Flip, ReleaseMem,
         DispatchDirect, SetIndexBase, SetIndexCount, DrawIndexOffset, Jump, SetPredication,
         DmaData, Unknown,
@@ -69,6 +70,7 @@ struct Pm4Command {
     uint64_t regs_vaddr = 0;             // SetRegsIndirect: guest addr of the register array
     uint32_t index_count = 0;            // DrawIndexAuto / DrawIndex
     uint32_t index_size = 0;             // SetIndexType
+    uint32_t instance_count = 1;         // SetNumInstances
 
     // CbDispatch (sceAgcCbDispatch -> R_DISPATCH_DIRECT, hle_agc.cpp). This is a prosper custom
     // packet, not raw hardware DISPATCH_DIRECT: payload [0..2] retains raw API dimensions x/y/z.

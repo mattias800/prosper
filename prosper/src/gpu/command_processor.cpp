@@ -1474,6 +1474,11 @@ void GpuState::apply(const Pm4Command& c) {
             index_type = c.index_size;
             state_dirty_ = true;
             break;
+        case K::SetNumInstances:
+            // The command processor treats a zero payload as the single-instance default.
+            num_instances = c.instance_count ? c.instance_count : 1u;
+            state_dirty_ = true;
+            break;
         case K::SetIndexBase:
             index_base = c.ib_addr;   // bind index-buffer base (issue #232)
             break;
@@ -1493,12 +1498,14 @@ void GpuState::apply(const Pm4Command& c) {
             if (state_dirty_ || !last_snapshot_) {
                 auto snap = std::make_shared<GpuState>();
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
+                snap->num_instances = num_instances;
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }
             uint32_t elem = index_type ? 4u : 2u;
             Draw d;
             d.index_count = c.index_count ? c.index_count : index_num;
+            d.instance_count = num_instances;
             d.state = last_snapshot_;
             if (index_base && d.index_count) {
                 d.indexed = true;
@@ -1522,11 +1529,13 @@ void GpuState::apply(const Pm4Command& c) {
             if (state_dirty_ || !last_snapshot_) {
                 auto snap = std::make_shared<GpuState>();
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
+                snap->num_instances = num_instances;
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }
             Draw d;
             d.index_count = c.index_count;
+            d.instance_count = num_instances;
             d.state = last_snapshot_;
             if (c.kind == K::DrawIndex) {
                 // Mark as indexed only when the packet was fully decoded — a short packet's addr/
@@ -1682,6 +1691,7 @@ void GpuState::apply(const Pm4Command& c) {
             if (state_dirty_ || !last_snapshot_) {
                 auto snap = std::make_shared<GpuState>();
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
+                snap->num_instances = num_instances;
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }
