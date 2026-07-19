@@ -409,8 +409,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
         !getenv("PROSPER_RTTLOG");
     static const bool defer_intermediate_scanout = live_gpu_targets &&
         !getenv("PROSPER_NO_INTERMEDIATE_SCANOUT_DEFER");
+    // Ordered passes share one queue and keep their attachments GPU-resident, so submit the callback's
+    // command buffers in one batch by default. Keep a direct recovery/A-B switch for driver issues.
     static const bool batch_backend_submits = live_gpu_targets &&
-        getenv("PROSPER_BACKEND_BATCH_SUBMITS") != nullptr;
+        !getenv("PROSPER_NO_BACKEND_BATCH_SUBMITS");
     if (live_gpu_targets)
         fprintf(stderr, "[render] persistent GPU color targets enabled (experimental)\n");
     if (batch_backend_submits)
