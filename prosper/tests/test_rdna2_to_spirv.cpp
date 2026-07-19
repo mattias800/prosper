@@ -758,8 +758,8 @@ int main() {
     // encoded format 22 (32_FLOAT) must still fetch full float dwords.
     const uint32_t code23mt[] = { 0x7e000f00u, 0xe8b02000u, 0x80020100u, 0xbf810000u };
     ShaderResourceTable rt23mt;
-    { ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Uint8;
-      vb.num_components = 1; vb.binding = 3; vb.stride = 4; vb.sgpr_base = 8;
+    { ShaderResource vb{}; vb.cls = ResourceClass::ConstantBuffer; vb.format = DataFormat::Uint8;
+      vb.num_components = 1; vb.binding = 3; vb.stride = 4; vb.sgpr_base = 8; vb.fetch_pc = 1;
       rt23mt.resources.push_back(vb); }
     std::vector<uint32_t> spv23mt = recompile_valu(
         code23mt, sizeof(code23mt)/sizeof(code23mt[0]), 1, 1, &rt23mt);
@@ -783,8 +783,8 @@ int main() {
         0x7e000f00u, 0xea532000u, 0x80020100u, 0xbf810000u,
     };
     ShaderResourceTable rt23mt_identity;
-    { ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Float32;
-      vb.num_components = 4; vb.binding = 3; vb.stride = 12; vb.sgpr_base = 8;
+    { ShaderResource vb{}; vb.cls = ResourceClass::ConstantBuffer; vb.format = DataFormat::Float32;
+      vb.num_components = 4; vb.binding = 3; vb.stride = 12; vb.sgpr_base = 8; vb.fetch_pc = 1;
       rt23mt_identity.resources.push_back(vb); }
     std::vector<uint32_t> vbuf23mt_identity(N * 3u);
     for (uint32_t i = 0; i < N; ++i) {
@@ -896,8 +896,8 @@ int main() {
         0x40400000u, 0x100c0705u, 0x06020d01u, 0xbf810000u,
     };
     ShaderResourceTable rt24mt;
-    { ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Float32;
-      vb.num_components = 1; vb.binding = 3; vb.stride = 4; vb.sgpr_base = 8;
+    { ShaderResource vb{}; vb.cls = ResourceClass::ConstantBuffer; vb.format = DataFormat::Float32;
+      vb.num_components = 1; vb.binding = 3; vb.stride = 4; vb.sgpr_base = 8; vb.fetch_pc = 1;
       rt24mt.resources.push_back(vb); }
     std::vector<uint32_t> spv24mt = recompile_valu(
         code24mt, sizeof(code24mt)/sizeof(code24mt[0]), 1, 1, &rt24mt);
@@ -915,8 +915,10 @@ int main() {
         0x7e020280u, 0x7e0402f0u, 0x7e0602f2u, 0x7e0802f2u, 0x7e0a0f00u,
         0xe9c72000u, 0x80020105u, 0xbf810000u,
     };
+    ShaderResourceTable rt24mt_store = rt24mt;
+    rt24mt_store.resources[0].fetch_pc = 5;
     std::vector<uint32_t> spv24mt_store = recompile_valu(
-        code24mt_store, sizeof(code24mt_store)/sizeof(code24mt_store[0]), 1, 0, &rt24mt);
+        code24mt_store, sizeof(code24mt_store)/sizeof(code24mt_store[0]), 1, 0, &rt24mt_store);
     std::vector<uint32_t> packed_store_in(N, 0), packed_store_out;
     prosper::test::run_compute(spv24mt_store, in24, N, N, {}, packed_store_in,
                                &packed_store_out);
@@ -1160,6 +1162,7 @@ int main() {
     };
     ShaderResourceTable rt29mt = rt29;
     rt29mt.resources[0].format = DataFormat::Uint8; // MTBUF's encoded 32_FLOAT remains authoritative
+    rt29mt.resources[0].fetch_pc = 2;
     std::vector<uint32_t> spv29mt = recompile_valu(
         code29mt, sizeof(code29mt)/sizeof(code29mt[0]), 1, 0, &rt29mt);
     std::vector<uint32_t> stored29mt(N, 0), stored29mt_out;

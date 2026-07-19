@@ -4783,19 +4783,25 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         dyn_vfetch = res->cls == ResourceClass::VertexBuffer &&
                                      (in.src[0].value == 0 || srsrc_rewritten);
                     }
-                    if (!res && !srsrc_rewritten)
-                        res = rt->by_sgpr_base_cls(in.src[1].value, ResourceClass::VertexBuffer);
-                    uint32_t srt_tag = 0;
-                    if (!res && sreg_srt_range_tag(rs, in.src[1].value, 4, srt_tag))
-                        res = rt->by_srt_offset(srt_tag);
-                    // DIRECT user-data V# of any class (#273 — DOLL's title post PSes format-fetch
-                    // through a V# the metadata labels a CONSTANT buffer sharp at s[24:27]): the class
-                    // label doesn't change the descriptor's fields. Only when the SGPR was never
-                    // REWRITTEN in-shader (no rs.sreg entry in its four-dword range) — a reloaded
-                    // register no longer holds the seed-time sharp, and trusting it would fetch through
-                    // a stale descriptor.
-                    if (!res && !srsrc_rewritten)
-                        res = rt->by_sgpr_base(in.src[1].value);
+                    // MTBUF must resolve through the exact dynamic-use entry. The fold validates the
+                    // live V# FORMAT != INVALID before publishing that pc. Falling back to an older
+                    // metadata resource here can resurrect an unbound V# that happens to share its
+                    // SGPR/SRT identity. MUBUF retains its established metadata fallbacks.
+                    if (in.fmt != Rdna2Format::MTBUF) {
+                        if (!res && !srsrc_rewritten)
+                            res = rt->by_sgpr_base_cls(in.src[1].value, ResourceClass::VertexBuffer);
+                        uint32_t srt_tag = 0;
+                        if (!res && sreg_srt_range_tag(rs, in.src[1].value, 4, srt_tag))
+                            res = rt->by_srt_offset(srt_tag);
+                        // DIRECT user-data V# of any class (#273 — DOLL's title post PSes format-fetch
+                        // through a V# the metadata labels a CONSTANT buffer sharp at s[24:27]): the class
+                        // label doesn't change the descriptor's fields. Only when the SGPR was never
+                        // REWRITTEN in-shader (no rs.sreg entry in its four-dword range) — a reloaded
+                        // register no longer holds the seed-time sharp, and trusting it would fetch through
+                        // a stale descriptor.
+                        if (!res && !srsrc_rewritten)
+                            res = rt->by_sgpr_base(in.src[1].value);
+                    }
                 }
                 if (!res) {
                     if (getenv("PROSPER_DBG")) {   // which provenance step failed for this format load

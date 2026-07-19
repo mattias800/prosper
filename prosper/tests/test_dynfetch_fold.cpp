@@ -618,6 +618,22 @@ int main() {
     CHECK(invalid_mtbuf_fetches.empty() && invalid_mtbuf_uses.empty() &&
               invalid_mtbuf_table.resources.empty(),
           "MTBUF leaves FORMAT=INVALID descriptors unbound instead of replacing their format");
+    // Metadata discovery may already have published the same invalid direct V# for raw SMEM use.
+    // MTBUF must not resurrect that older SGPR-keyed resource when its exact validated pc entry is
+    // absent.
+    ShaderResourceTable invalid_mtbuf_metadata;
+    { ShaderResource r{}; r.cls = ResourceClass::ConstantBuffer;
+      r.format = DataFormat::Unknown; r.num_components = 0; r.gpu_addr = 0x20000u;
+      r.size = 64u; r.stride = 4u; r.sgpr_base = 0u;
+      invalid_mtbuf_metadata.resources.push_back(r); }
+    assign_convention_bindings(invalid_mtbuf_metadata, 2);
+    ComputeShaderConfig invalid_mtbuf_config;
+    invalid_mtbuf_config.user_sgprs.assign(invalid_mtbuf_seed, invalid_mtbuf_seed + 8);
+    invalid_mtbuf_config.local_x = invalid_mtbuf_config.local_y =
+        invalid_mtbuf_config.local_z = 1;
+    CHECK(recompile_compute(direct_mtbuf_copy, std::size(direct_mtbuf_copy),
+                            &invalid_mtbuf_metadata, invalid_mtbuf_config).empty(),
+          "MTBUF cannot fall back to a metadata resource for an INVALID live V#");
 
     // DynFetch shifts graphics vertex descriptors by a constant instruction offset because their
     // special address path drops the original OFFSET/SOFFSET. Compute resources use ConstantBuffer's

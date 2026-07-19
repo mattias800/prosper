@@ -1949,19 +1949,20 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         if (u.kind != 1) continue;
         if (u.instruction_format != UINT32_MAX && ((u.v4[3] >> 12) & 0x7Fu) == 0)
             continue;
+        const bool exact_mtbuf = u.instruction_format != UINT32_MAX;
         // Keyed buffer uses dedupe by table offset; key-less live descriptors dedupe by consumer pc.
-        const uint64_t dk = u.key == 0xFFFFFFFFu
+        const uint64_t dk = exact_mtbuf || u.key == 0xFFFFFFFFu
             ? (0x8000000100000000ull | u.use_pc)
             : (0x0000000100000000ull | u.key);
         if (!seen.insert(dk).second) continue;
-        bool clash = u.key == 0xFFFFFFFFu;
+        bool clash = exact_mtbuf || u.key == 0xFFFFFFFFu;
         if (!clash)
             for (const auto& r0 : table.resources)
                 if (r0.srt_offset == u.key) { clash = true; break; }
 
         const DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
         if (d.base <= 0x10000 || d.size_bytes == 0 || d.size_bytes > 0x10000000u) continue;
-        if (clash) {
+        if (clash && !exact_mtbuf) {
             bool piggybacked = false;
             for (auto& r0 : table.resources) {
                 if (r0.cls != ResourceClass::ConstantBuffer || r0.gpu_addr != d.base ||
@@ -2208,7 +2209,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             // A SEED-fallback entry must not shadow a metadata-described DIRECT vertex buffer at the
             // same SGPRs (see DynFetch::from_seed): the direct resource resolves the fetch through
             // the faithful address path, which is the correct model for a single un-patched V#.
-            if (kv.from_seed) {
+            if (kv.from_seed && kv.instruction_format == UINT32_MAX) {
                 bool direct_exists = false;
                 for (const auto& r0 : t.resources)
                     if (r0.cls == ResourceClass::VertexBuffer && r0.sgpr_base == (uint32_t)kv.srsrc)
@@ -2292,11 +2293,12 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                 // key-less buffer uses per CONSUMING INSTRUCTION (#273 — several image ops may share
                 // one key, or have none; a key-less V# fetch resolves by its pc).
                 // Distinct namespaces: pc keys must never collide with byte-offset keys.
-                uint64_t dk = (u.kind == 0 || u.key == 0xFFFFFFFFu)
+                const bool exact_mtbuf = u.kind == 1 && u.instruction_format != UINT32_MAX;
+                uint64_t dk = (u.kind == 0 || u.key == 0xFFFFFFFFu || exact_mtbuf)
                                   ? (0x8000000000000000ull | ((uint64_t)(uint32_t)u.kind << 32) | u.use_pc)
                                   : ((uint64_t)(uint32_t)u.kind << 32) | u.key;
                 if (!srt_seen.insert(dk).second) continue;
-                bool clash = u.key == 0xFFFFFFFFu;       // key-less: never resolvable by srt_offset
+                bool clash = exact_mtbuf || u.key == 0xFFFFFFFFu;
                 if (!clash)
                     for (const auto& r0 : t.resources) if (r0.srt_offset == u.key) { clash = true; break; }
                 if (u.kind == 1) {                       // constant buffer / structured-buffer V#
@@ -2322,7 +2324,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     // A keyed use whose key already resolves keeps the existing resource; a key-less
                     // (or key-clashed) use still needs a pc-provenance entry — piggyback the pc onto
                     // an existing resource describing the SAME buffer, else create one (#273).
-                    if (clash) {
+                    if (clash && !exact_mtbuf) {
                         bool piggybacked = false;
                         for (auto& r0 : t.resources)
                             if ((r0.cls == ResourceClass::ConstantBuffer || r0.cls == ResourceClass::VertexBuffer) &&

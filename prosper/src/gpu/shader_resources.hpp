@@ -117,10 +117,11 @@ struct ShaderResource {
     uint32_t      srt_offset    = 0xFFFFFFFFu;
     uint32_t      sgpr_base     = 0xFFFFFFFFu;
 
-    //   * fetch_pc — PER-FETCH: the pc of the exact buffer_load_format_* instruction this descriptor was
+    //   * fetch_pc — PER-FETCH: the pc of the exact buffer/tbuffer format instruction this descriptor was
     //     resolved for. A single SRSRC SGPR is reloaded with a DIFFERENT V# per vertex attribute (position,
-    //     uv, color, …), so keying only by sgpr_base collapses them to the first. The recompiler resolves a
-    //     vertex fetch by its instruction pc first (exact), falling back to sgpr_base. 0xFFFFFFFF = unset.
+    //     uv, color, …), so keying only by sgpr_base collapses them to the first. MUBUF may fall back to
+    //     metadata provenance; MTBUF requires this validated live-V# identity so FORMAT=INVALID cannot be
+    //     resurrected through an older metadata resource. 0xFFFFFFFF = unset.
     uint32_t      fetch_pc      = 0xFFFFFFFFu;
 
     // Texture-only (cls == Texture). img_dim mirrors the MIMG dim field (1D=0, 2D=1, 3D=2, ...).
