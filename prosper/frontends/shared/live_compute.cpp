@@ -357,8 +357,12 @@ bool storage_pack_supported(prosper::gpu::DataFormat f) {
 }
 void storage_unpack_texel(const uint8_t* src, prosper::gpu::DataFormat f, uint32_t ncomp, uint32_t out[4]) {
     using DF = prosper::gpu::DataFormat;
-    const uint32_t one_f32 = 0x3f800000u;                 // hardware default: missing channels = (0,0,0,1.0f)
-    out[0] = out[1] = out[2] = 0; out[3] = one_f32;
+    const uint32_t one_f32 = 0x3f800000u;                 // hardware default: missing channels = (0,0,0,1)
+    // A missing alpha reads 1 — as the FLOAT 1.0 bits for float/unorm formats, but the INTEGER 1 for
+    // UINT/SINT formats (an integer image_load returns raw integer channels, not normalized floats).
+    const bool integer_fmt = f == DF::Uint8 || f == DF::Sint8 || f == DF::Uint16 ||
+                             f == DF::Sint16 || f == DF::Uint32 || f == DF::Sint32;
+    out[0] = out[1] = out[2] = 0; out[3] = integer_fmt ? 1u : one_f32;
     if (f == DF::Float10_11_11) {
         uint32_t packed = 0; std::memcpy(&packed, src, sizeof(packed));
         const float values[3] = { prosper::gpu::f11_to_float(static_cast<uint16_t>(packed)),
@@ -408,7 +412,7 @@ void storage_pack_texel(const uint32_t in[4], prosper::gpu::DataFormat f, uint32
     if (f == DF::Unorm2_10_10_10) {
         auto q = [](const uint32_t bits, float scale) -> uint32_t {
             float v; std::memcpy(&v, &bits, 4);
-            v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+            v = !(v > 0.0f) ? 0.0f : (v > 1.0f ? 1.0f : v);   // NaN and negatives clamp to 0
             return static_cast<uint32_t>(v * scale + 0.5f);
         };
         const uint32_t packed = (q(in[0], 1023.0f) & 0x3ffu)        |
