@@ -114,11 +114,13 @@ struct Rdna2Inst {
     // FLAT/GLOBAL/SCRATCH share the 0x37 encoding. Segment 0=flat, 1=scratch, 2=global; OFFSET is a
     // signed 12-bit byte immediate stored sign-extended in `literal`. src[0] is VADDR (None for the
     // canonical scratch `off, sN` form), src[1] is the seven-bit SADDR field, and dst is VDST for
-    // loads or VDATA for stores. Cache-policy flags do not change private scratch data semantics.
+    // loads or VDATA for stores. Cache-policy flags do not change private scratch data semantics;
+    // LDS requests a memory-to/from-LDS transfer and must not be treated as an ordinary VGPR access.
     uint32_t flat_segment = 0;
     bool     flat_glc = false;
     bool     flat_slc = false;
     bool     flat_dlc = false;
+    bool     flat_lds = false;
     // DS-only: GDS flag. llvm-mc gfx1030 round-trip places it at dword0 bit 17 (ds_add_u32 gds =
     // 0xd8020000 vs 0xd8000000; Table 94's "GDS [16]" is a GFX9-era erratum — it also misplaces
     // OP). Bit 16 is likewise captured so an unknown flag rejects rather than silently running

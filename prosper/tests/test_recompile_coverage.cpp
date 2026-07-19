@@ -75,6 +75,17 @@ int main() {
     CHECK(global.total == 1 && global.unsupported == 1 && global.first_bad_op == 0x0cu,
           "arbitrary global addresses remain explicit unsupported coverage");
 
+    const uint32_t scratch_lds[] = {
+        0xdc306000u, 0x00000000u, // scratch_load_dword off, s0 lds
+        0xBF810000u,
+    };
+    RecompileCoverage lds_transfer = recompile_coverage(
+        scratch_lds, sizeof(scratch_lds) / sizeof(scratch_lds[0]));
+    CHECK(lds_transfer.total == 1 && lds_transfer.unsupported == 1 &&
+              lds_transfer.first_bad_op == 0x0cu &&
+              recompile_valu(scratch_lds, sizeof(scratch_lds) / sizeof(scratch_lds[0]), 0, 0).empty(),
+          "scratch LDS-transfer packets remain explicit unsupported coverage");
+
     const uint32_t rewritten_scratch_base[] = {
         0xbe800384u,               // s_mov_b32 s0, 4
         0xdc704010u, 0x00000000u, // scratch_store_dword off, v0, s0 offset:16

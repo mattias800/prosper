@@ -413,7 +413,8 @@ void decode_operands(Rdna2Inst& i) {
             i.n_src = 3; break;
         }
         case Rdna2Format::FLAT: {
-            // gfx10 FLAT/GLOBAL/SCRATCH. OP d0[24:18], SEG d0[15:14], signed byte OFFSET d0[11:0];
+            // gfx10 FLAT/GLOBAL/SCRATCH. OP d0[24:18], SEG d0[15:14], LDS d0[13],
+            // signed byte OFFSET d0[11:0];
             // d1 holds VADDR[7:0], VDATA[15:8], SADDR[22:16], and VDST[31:24]. A scratch instruction
             // uses either `off, sN` (SADDR != NULL; canonical VADDR field 0) or `vN, off`
             // (SADDR=NULL=125). Global/flat address forms retain their operands for diagnostics but
@@ -424,6 +425,7 @@ void decode_operands(Rdna2Inst& i) {
             i.flat_glc = ((w >> 16) & 1u) != 0;
             i.flat_slc = ((w >> 17) & 1u) != 0;
             i.flat_dlc = ((w >> 12) & 1u) != 0;
+            i.flat_lds = ((w >> 13) & 1u) != 0;
             const uint32_t off12 = w & 0xFFFu;
             i.literal = (off12 & 0x800u) ? (off12 | 0xFFFFF000u) : off12;
             const uint32_t vaddr = d1 & 0xFFu;

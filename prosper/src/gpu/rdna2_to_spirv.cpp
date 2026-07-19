@@ -139,7 +139,8 @@ StaticScratchLayout analyze_static_scratch(const std::vector<Rdna2Inst>& ins) {
         // The common compiler spill form is a static byte offset from one entry-provided scratch
         // base: `scratch_* ..., off, sN`. Dynamic VADDR, multiple/rewritten bases, D16-high forms,
         // atomics, and arbitrary flat/global pointers stay fail-closed.
-        if (in.flat_segment != 1u || !access.valid || in.src[0].kind != OperandKind::None ||
+        if (in.flat_segment != 1u || in.flat_lds || !access.valid ||
+            in.src[0].kind != OperandKind::None ||
             in.src[1].kind != OperandKind::SGPR) {
             out.valid = false;
             return out;
@@ -4918,7 +4919,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // Model the compiler's private spill area only. Each generated shader invocation owns
             // one Function-storage array, so the entry-provided hardware base has no host-visible
             // address to preserve. Other FLAT/GLOBAL forms remain deliberately unsupported.
-            if (!access.valid || in.flat_segment != 1u || !b.guest_scratch ||
+            if (!access.valid || in.flat_segment != 1u || in.flat_lds || !b.guest_scratch ||
                 in.src[0].kind != OperandKind::None || in.src[1].kind != OperandKind::SGPR ||
                 in.src[1].value != b.guest_scratch_saddr ||
                 rs.sreg_written.count(in.src[1].value)) {

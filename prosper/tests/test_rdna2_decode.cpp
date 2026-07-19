@@ -155,6 +155,10 @@ int main() {
     Rdna2Inst scratch_neg = rdna2_decode_one(scratch_negative, 2);
     CHECK(scratch_neg.flat_segment == 1u && static_cast<int32_t>(scratch_neg.literal) == -4,
           "scratch signed 12-bit OFFSET is sign-extended");
+    const uint32_t scratch_lds[] = { 0xdc306000u, 0x00000000u };
+    Rdna2Inst scratch_to_lds = rdna2_decode_one(scratch_lds, 2);
+    CHECK(scratch_to_lds.flat_segment == 1u && scratch_to_lds.flat_lds,
+          "scratch LDS-transfer flag is retained for fail-closed recompilation");
     const uint32_t global_load[] = { 0xdc308000u, 0x007d0002u };
     const uint32_t flat_load[]   = { 0xdc300000u, 0x007d0002u };
     Rdna2Inst global_l = rdna2_decode_one(global_load, 2);
