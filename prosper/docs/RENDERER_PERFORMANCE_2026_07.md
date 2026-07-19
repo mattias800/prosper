@@ -124,6 +124,42 @@ bundles. Evergate's instances were mostly unique, so hashing/key construction co
 objects and regressed a 476-draw window to 483.9 ms; that tranche was removed. The remaining major cost is
 still structural GPU submission/fence/readback ownership, not another broad exact-hash cache.
 
+## Evergate persistent host-buffer objects (2026-07-19)
+
+Call-local sharing still created roughly 170-180 distinct host-visible storage buffers in each backend
+call during Evergate's dense transition, then destroyed them after the fence. A frontend submit contains
+about 14 such calls. Fine-grained probes showed descriptor-pool, descriptor-layout, and descriptor-update
+work together below 0.1 ms/call; storage-buffer creation/upload cost 1-4 ms/call and buffer teardown another
+2-5 ms/call. The repeated Vulkan buffer-object lifecycle, not descriptor management, was the actionable
+resource cost.
+
+The backend now pools persistently mapped host-coherent buffers after the existing fence wait. Buffers use
+power-of-two capacities to avoid exact-size shape churn, but descriptor ranges remain the exact captured
+byte count. The cache is thread-local, bounded to 4096 entries / 256 MiB by default, and contains no guest
+identity or stale-content assumption: every checkout rewrites all shader-visible bytes. Set
+`PROSPER_NO_BACKEND_BUFFER_POOL=1` for the transient-object A/B or
+`PROSPER_BACKEND_BUFFER_POOL_MB=<MiB>` to change the byte budget.
+
+Native Windows / RTX 4090, one final binary, separate fresh saves, native scale/cadence, the documented
+route, normal renderer timing only, and matched dense 25-submit windows produced:
+
+| Measurement | Pool disabled | Capacity-class pool |
+|---|---:|---:|
+| Draws / submit | 479.3 | 483.6 |
+| Whole submit | 198.6 ms | 130.3 ms |
+| Backend execution | 151.0 ms | 81.5 ms |
+| Backend resource setup | 51.3 ms | 25.7 ms |
+| Backend cleanup | 48.7 ms | 4.8 ms |
+| GPU fence wait | 37.2 ms | 38.0 ms |
+| Observed rate near frame 360 | 3.2 FPS | 4.1 FPS |
+
+An initial exact-size pool was rejected: it filled the 4096-entry cap and accumulated about 20,000
+evictions, leaving setup/cleanup unchanged. Capacity classes stabilized at 2464 buffers / 7.4 MiB with
+zero evictions in the same transition; a detailed sample reached 203,263 hits after 2,464 compulsory
+misses. The flat GPU wait confirms the measured improvement comes from CPU Vulkan object lifetime rather
+than different GPU work. The next dense-scene costs are texture-binding setup and the synchronous
+submit/fence/readback architecture.
+
 ## Dead Cells backend upload duplication (2026-07-15)
 
 Dead Cells exposed a second duplication layer after the frontend decode caches. The frontend correctly

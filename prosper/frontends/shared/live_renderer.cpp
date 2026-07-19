@@ -2614,6 +2614,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             totals.backend_pipeline_bypasses / nsub,
                             (unsigned long long)totals.backend_pipeline_entries,
                             totals.backend_pipeline_evictions / nsub);
+                    const auto backend_buffers =
+                        prosper::test::render_host_buffer_pool_stats();
+                    fprintf(stderr,
+                            "[render-timing] backend_buffer_pool hits=%llu misses=%llu cached=%zu "
+                            "%.1f MiB evictions=%llu\n",
+                            (unsigned long long)backend_buffers.hits,
+                            (unsigned long long)backend_buffers.misses,
+                            backend_buffers.cached_buffers,
+                            backend_buffers.cached_bytes / (1024.0 * 1024.0),
+                            (unsigned long long)backend_buffers.evictions);
                     fprintf(stderr,
                             "[render-timing] color_targets writes=%llu load_hits=%llu sample_hits=%llu "
                             "readbacks=%llu deferred=%llu cached=%llu %.1f MiB\n",
