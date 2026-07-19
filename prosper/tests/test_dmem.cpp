@@ -267,6 +267,29 @@ int main() {
               direct_end == phys + 0xc000,
           "TYPE_PROTECT carves the same type range in physical allocation queries");
 
+    CHECK(mtypeprotect(va1 + 0xc123, 0x100, 13, 0x1, 0, 0) == 0,
+          "Mtypeprotect accepts an unaligned sub-page range");
+    memset(direct_info, 0, sizeof(direct_info));
+    CHECK(query(va1 + 0xd000, 0, (uint64_t)(uintptr_t)direct_info,
+                sizeof(direct_info), 0, 0) == 0 &&
+              *(uint64_t*)(direct_info + 0x00) == va1 + 0xc000 &&
+              *(uint64_t*)(direct_info + 0x08) == va1 + 0x10000 &&
+              *(uint64_t*)(direct_info + 0x10) == phys + 0xc000 &&
+              *(int32_t*)(direct_info + 0x18) == 0x1 &&
+              *(int32_t*)(direct_info + 0x1c) == 13 &&
+              *(uint32_t*)(direct_info + 0x20) == 0x12,
+          "unaligned Mtypeprotect normalizes VA metadata to the 16 KiB guest page");
+    direct_type = -1; direct_start = direct_end = 0;
+    CHECK(get_type(phys + 0xd000, (uint64_t)(uintptr_t)&direct_type,
+                   (uint64_t)(uintptr_t)&direct_start,
+                   (uint64_t)(uintptr_t)&direct_end, 0, 0) == 0 &&
+              direct_type == 13 && direct_start == phys + 0xc000 &&
+              direct_end == phys + 0x10000,
+          "unaligned Mtypeprotect normalizes physical type metadata to the same page");
+    CHECK((uint32_t)mtypeprotect(UINT64_MAX - 0x1000, 0x2000, 13, 0x1, 0, 0) ==
+              0x80020016u,
+          "Mtypeprotect rejects an overflowing guest range");
+
     uint64_t hinted = va1;
     CHECK(map((uint64_t)(uintptr_t)&hinted, dlen, 0x2, 0, phys, dlen) == 0 &&
               hinted && hinted != va1,
@@ -764,6 +787,28 @@ int main() {
                   direct_type == 11 && direct_start == p + 0x8000 &&
                   direct_end == p + 0xc000,
               "TYPE_PROTECT carves the same type range in physical allocation queries");
+
+        CHECK(mtypeprotect(va + 0xc123, 0x100, 13, 0x1, 0, 0) == 0,
+              "Mtypeprotect accepts an unaligned sub-page range");
+        memset(info, 0, sizeof(info));
+        CHECK(query(va + 0xd000, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
+                  *(uint64_t*)(info + 0x00) == va + 0xc000 &&
+                  *(uint64_t*)(info + 0x08) == va + 0x10000 &&
+                  *(uint64_t*)(info + 0x10) == p + 0xc000 &&
+                  *(int32_t*)(info + 0x18) == 0x1 &&
+                  *(int32_t*)(info + 0x1c) == 13 &&
+                  *(uint32_t*)(info + 0x20) == 0x12,
+              "unaligned Mtypeprotect normalizes VA metadata to the 16 KiB guest page");
+        direct_type = -1; direct_start = direct_end = 0;
+        CHECK(get_type(p + 0xd000, (uint64_t)(uintptr_t)&direct_type,
+                       (uint64_t)(uintptr_t)&direct_start,
+                       (uint64_t)(uintptr_t)&direct_end, 0, 0) == 0 &&
+                  direct_type == 13 && direct_start == p + 0xc000 &&
+                  direct_end == p + 0x10000,
+              "unaligned Mtypeprotect normalizes physical type metadata to the same page");
+        CHECK((uint32_t)mtypeprotect(UINT64_MAX - 0x1000, 0x2000, 13, 0x1, 0, 0) ==
+                  0x80020016u,
+              "Mtypeprotect rejects an overflowing guest range");
         if (va) munmap((void*)(uintptr_t)va, 0x10000);
         if (alias) munmap((void*)(uintptr_t)alias, 0x10000);
         if (p) release(p, 0x10000, 0, 0, 0, 0);

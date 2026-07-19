@@ -48,6 +48,21 @@ namespace {
     constexpr uint32_t kVirtualQueryFlexible = 0x01;
     constexpr uint32_t kVirtualQueryDirect   = 0x02;
     constexpr uint32_t kVirtualQueryCommitted = 0x10;
+    constexpr uint64_t kGuestPageSize = 0x4000;
+
+    bool normalize_guest_page_range(uint64_t addr, uint64_t len,
+                                    uint64_t& base_out, uint64_t& len_out) {
+        constexpr uint64_t mask = kGuestPageSize - 1;
+        if (len > UINT64_MAX - addr) return false;
+        const uint64_t raw_end = addr + len;
+        if (raw_end > UINT64_MAX - mask) return false;
+        const uint64_t base = addr & ~mask;
+        const uint64_t end = (raw_end + mask) & ~mask;
+        if (end <= base) return false;
+        base_out = base;
+        len_out = end - base;
+        return true;
+    }
 
     struct Mapping {
         uint64_t base, size, offset;
@@ -960,10 +975,12 @@ HLE7(k_map_dmem2) {
 // memory type (a2). Only publish either change after the host protection operation succeeds.
 HLE(k_mtypeprotect) {
     if (!a0) return 0x80020016ull;
+    uint64_t base = 0, len = 0;
+    if (!normalize_guest_page_range(a0, a1, base, len)) return 0x80020016ull;
     const int prot = host_prot(a3);
-    if (mprotect((void*)a0, a1, prot) != 0) return sce_mprotect_error(errno);
-    retrack_prot(a0, a1, prot, static_cast<uint32_t>(a3), "mtypeprotect");
-    retrack_type(a0, a1, static_cast<int32_t>(a2));
+    if (mprotect((void*)base, len, prot) != 0) return sce_mprotect_error(errno);
+    retrack_prot(base, len, prot, static_cast<uint32_t>(a3), "mtypeprotect");
+    retrack_type(base, len, static_cast<int32_t>(a2));
     return 0;
 }
 HLE(k_dmem_size){ return kDmemTotal; }   // sparse-backed; allocation failures enforce this bound
@@ -1541,6 +1558,21 @@ namespace {
     constexpr uint32_t kVirtualQueryFlexible = 0x01;
     constexpr uint32_t kVirtualQueryDirect   = 0x02;
     constexpr uint32_t kVirtualQueryCommitted = 0x10;
+    constexpr uint64_t kGuestPageSize = 0x4000;
+
+    bool normalize_guest_page_range(uint64_t addr, uint64_t len,
+                                    uint64_t& base_out, uint64_t& len_out) {
+        constexpr uint64_t mask = kGuestPageSize - 1;
+        if (len > UINT64_MAX - addr) return false;
+        const uint64_t raw_end = addr + len;
+        if (raw_end > UINT64_MAX - mask) return false;
+        const uint64_t base = addr & ~mask;
+        const uint64_t end = (raw_end + mask) & ~mask;
+        if (end <= base) return false;
+        base_out = base;
+        len_out = end - base;
+        return true;
+    }
 
     struct Mapping {
         uint64_t base, size, offset;
@@ -3691,11 +3723,13 @@ HLE(k_mprotect) {
 }
 HLE(k_mtypeprotect) {
     if (!a0) return 0x80020016ull;
+    uint64_t base = 0, len = 0;
+    if (!normalize_guest_page_range(a0, a1, base, len)) return 0x80020016ull;
     const int prot = host_prot(a3);
     DWORD error = ERROR_SUCCESS;
-    if (!win_protect(a0, a1, prot, &error)) return sce_win_mprotect_error(error);
-    retrack_prot(a0, a1, prot, static_cast<uint32_t>(a3), "mtypeprotect");
-    retrack_type(a0, a1, static_cast<int32_t>(a2));
+    if (!win_protect(base, len, prot, &error)) return sce_win_mprotect_error(error);
+    retrack_prot(base, len, prot, static_cast<uint32_t>(a3), "mtypeprotect");
+    retrack_type(base, len, static_cast<int32_t>(a2));
     return 0;
 }
 HLE(k_dmem_size){ return kDmemTotal; }
