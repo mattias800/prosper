@@ -7,12 +7,15 @@
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <chrono>
 #include <thread>
 
 using namespace prosper;
+
+namespace prosper { void prosper_eq_trigger_eop(); }
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
@@ -25,6 +28,11 @@ static_assert(sizeof(KEvent) == 0x20, "SceKernelEvent must be 0x20 bytes");
 
 int main() {
     printf("== test_equeue_events ==\n");
+#ifdef _WIN32
+    _putenv_s("PROSPER_EOP_SYNC", "1");
+#else
+    setenv("PROSPER_EOP_SYNC", "1", 1);
+#endif
     register_builtin_hle();
 
     auto create  = Hle::lookup(nid_hash("sceKernelCreateEqueue"));
@@ -43,6 +51,10 @@ int main() {
     uint64_t eq = 0;
     create((uint64_t)(uintptr_t)&eq, 0, 0, 0, 0, 0);
     CHECK(eq != 0, "CreateEqueue produced a handle");
+
+    // #987 diagnostic path: observe one completion before any EOP source is registered. The gated
+    // counter/log must remain observation-only; registration below must not receive a phantom replay.
+    prosper_eq_trigger_eop();
 
     // --- User event: register id=999 with a udata, trigger it, then WaitEqueue should return it. ---
     const int64_t kId = 999; const uint64_t kUdata = 0xCAFEF00D;
@@ -75,6 +87,8 @@ int main() {
     if (addeq && submit) {
         const int64_t kEop = 0x40; const uint64_t kEopUdata = 0x1234BEEF;
         addeq(eq, (uint64_t)kEop, kEopUdata, 0, 0, 0);
+        CHECK(getcount(eq, 0, 0, 0, 0, 0) == 0,
+              "pre-registration EOP diagnostic does not replay or alter queue behavior");
         // Minimal valid Dcb: a single DRAW_RESET packet (2 dwords). header = 0xC0000000 | (op<<8) | (r<<2).
         uint32_t dcbbuf[2] = { 0xC0000000u | (0x10u << 8) | (0x05u << 2), 0 };  // IT_NOP=0x10, R_DRAW_RESET=0x05
         struct Packet { uint32_t* addr; uint32_t dw_num; uint8_t pad[4]; } pkt{ dcbbuf, 2, {0,0,0,0} };
