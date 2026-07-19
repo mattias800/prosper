@@ -12,7 +12,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <vector>
 #ifndef _WIN32
@@ -444,6 +446,31 @@ bool audio_read_bytes(uint64_t src, void* dst, size_t n) {
 #endif
 }
 
+// Best-effort read: copy as many leading bytes of [src, src+n) as are accessible, returning the
+// count actually read (0 on total failure). Unlike audio_read_bytes this tolerates a short/partial
+// guest range — the NGS2 mixer needs to consume whatever valid PCM a voice still has this render.
+size_t audio_read_bytes_partial(uint64_t src, void* dst, size_t n) {
+    if (!src || !dst || !n) return 0;
+#ifndef _WIN32
+    struct iovec l { dst, n }, r { (void*)(uintptr_t)src, n };
+    ssize_t got = process_vm_readv(getpid(), &l, 1, &r, 1, 0);
+    if (got > 0) return (size_t)got;
+    // process_vm_readv is all-or-nothing per iovec; on failure, binary-search the readable prefix so a
+    // block that ends partway through the requested span still yields its valid head.
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo + 1) / 2;
+        struct iovec l2 { dst, mid }, r2 { (void*)(uintptr_t)src, mid };
+        if (process_vm_readv(getpid(), &l2, 1, &r2, 1, 0) == (ssize_t)mid) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+#else
+    SIZE_T read = 0;
+    ReadProcessMemory(GetCurrentProcess(), (const void*)(uintptr_t)src, dst, n, &read);
+    return (size_t)read;
+#endif
+}
+
 bool a2_store_u32(uint64_t dst, uint32_t v) { return audio_store_bytes(dst, &v, sizeof v); }
 bool a2_store_u64(uint64_t dst, uint64_t v) { return audio_store_bytes(dst, &v, sizeof v); }
 bool a2_store_zeros(uint64_t dst, size_t n) {
@@ -786,10 +813,12 @@ HLE10(ajm_batch_job_run_split_buffer_ra) {
 // guest arguments for this PS5 surface; normal execution uses the same handlers without logging.
 namespace {
 
-bool ngs2_trace_enabled() {
-    const char* e = getenv("PROSPER_NGS2_TRACE");
-    return e && *e && *e != '0';
+int ngs2_trace_level() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PROSPER_NGS2_TRACE"); v = (e && *e) ? atoi(e) : 0; if (v < 0) v = 0; }
+    return v;
 }
+bool ngs2_trace_enabled() { return ngs2_trace_level() >= 1; }
 
 void ngs2_trace_call(const char* name, std::atomic<uint64_t>& calls,
                      uint64_t a0, uint64_t a1, uint64_t a2,
@@ -825,6 +854,189 @@ bool g_ngs2_systems[4]{};
 Ngs2RackState g_ngs2_racks[32];
 std::mutex g_ngs2_zero_mx;
 std::vector<uint8_t> g_ngs2_zeros;
+
+// --- NGS2 sampler PCM mixer (Dead Cells) -------------------------------------------------------
+// Dead Cells decodes its audio to interleaved 16-bit PCM in-engine (Heaps/Haxe) and streams it into
+// NGS2 sampler voices; NGS2 mixes those voices in SystemRender and the guest hands the result to
+// sceAudioOut. The previous headless backend zero-filled SystemRender, so the game played silence.
+// This mixes the real voices. Protocol observed live (PROSPER_NGS2_TRACE=2), voice param IDs:
+//   0x40010000  waveform format   { u32 waveform_type@0, u32 channels@4, u32 sample_rate@8 }
+//   0x40010001  waveform block    { u64 data_ptr@0, ... }   (interleaved PCM at data_ptr)
+//   0x40001300  matrix/gain       (per-render float matrix; unity for v1)
+// waveform_type 0x12 == signed-16 LE PCM (the only type Dead Cells uses); ATRAC9 is deferred until a
+// title that needs it exists. CONFIDENCE: MED — format/data/render layouts are live-verified; block
+// length and one-shot/loop semantics are played from the current pointer and re-based when the guest
+// re-points (fault-safe reads bound every access), pending an ngs2.h WaveformBlock cross-check.
+constexpr uint32_t kNgs2ParamWaveformFormat = 0x40010000;
+constexpr uint32_t kNgs2ParamWaveformBlock  = 0x40010001;
+constexpr uint32_t kNgs2ParamMatrixLevels   = 0x40001300;   // per-render output level matrix (gains)
+constexpr uint32_t kNgs2WaveformTypePcmS16  = 0x12;
+// A voice stops when it has been mixed this many consecutive renders without a fresh waveform block.
+// Sampler SFX are re-fed continuously while audible (observed: a play is followed by a stream of block
+// params); one that stops being fed has ended, so expiring it bounds voice accumulation (voice-pool
+// handles otherwise read a persistent/reused buffer forever and pile up into clipping over time).
+constexpr int kNgs2VoiceIdleRendersMax = 3;
+
+struct Ngs2Voice {
+    bool     playing      = false;
+    bool     played_audio = false; // has produced any non-silent sample since the last (re)trigger
+    int      idle         = 0;     // renders mixed since the last waveform-block feed
+    uint64_t data_ptr  = 0;        // guest base of the current interleaved-PCM block
+    uint32_t channels  = 2;        // source channel count
+    uint32_t rate      = 48000;    // source sample rate (Hz)
+    // Per-output-channel gain from the voice's level matrix (kNgs2ParamMatrixLevels). Sized for the
+    // full PS5 surround layout (up to 7.1); prosper currently mixes only the front L/R pair (see
+    // ngs2_mix_voices), so gain[2..7] are parsed and stored but not yet summed into a surround bus.
+    // SURROUND-TODO: when a multichannel output bus is added, mix all channels through these gains.
+    float    gain[8]   = {1,1,1,1,1,1,1,1};
+    uint32_t wtype     = kNgs2WaveformTypePcmS16;
+    double   cursor    = 0.0;      // fractional source-frame position since data_ptr
+};
+std::map<uint32_t, Ngs2Voice> g_ngs2_voices;   // key: voice handle & 0xffffff (rack_slot<<8 | voice_id)
+
+bool ngs2_mix_disabled() {
+    static const bool off = [] { const char* e = getenv("PROSPER_NGS2_SILENT"); return e && *e && *e != '0'; }();
+    return off;
+}
+
+// Parse a voice-param chain and fold format/data updates into the voice state. `handle` is the full
+// guest voice handle; the low 24 bits key g_ngs2_voices. Runs under g_ngs2_mx.
+void ngs2_apply_voice_params(uint64_t handle, uint64_t list) {
+    if ((handle & kNgs2VoiceMask) != kNgs2VoiceTag || !list) return;
+    Ngs2Voice& v = g_ngs2_voices[(uint32_t)(handle & 0xffffff)];
+    uint64_t p = list;
+    for (int i = 0; i < 32 && p; ++i) {
+        struct { uint16_t size; int16_t next; uint32_t id; } head{};
+        if (!audio_read_bytes(p, &head, sizeof(head)) || head.size < sizeof(head) || head.size > 0x400) break;
+        if (head.id == kNgs2ParamWaveformFormat) {
+            uint32_t fmt[3] = {};   // { waveform_type, channels, sample_rate }
+            if (audio_read_bytes(p + 8, fmt, sizeof(fmt))) {
+                v.wtype = fmt[0];
+                if (fmt[1] >= 1 && fmt[1] <= 8)          v.channels = fmt[1];
+                if (fmt[2] >= 8000 && fmt[2] <= 192000)  v.rate     = fmt[2];
+                if (getenv("PROSPER_NGS2_TRACE"))
+                    fprintf(stderr, "[ngs2] FORMAT voice=0x%llx waveform_type=0x%x ch=%u rate=%u\n",
+                            (unsigned long long)handle, fmt[0], fmt[1], fmt[2]);
+            }
+        } else if (head.id == kNgs2ParamMatrixLevels) {
+            // Per-render output level matrix. Observed layout (VoiceControl capture): a leading count
+            // word (+0x10) and a ramp/config float (+0x14, ~1e4), then the front L/R output levels as
+            // two floats at +0x18 and +0x1c (e.g. 0.707, 1.0). Apply them as this voice's front L/R
+            // gains so the game's own mix balance holds (this is what keeps the summed bus in range —
+            // prosper was mixing every voice at unity before). Values outside a sane [0,4] range are
+            // ignored (the matrix also carries non-gain fields like ramp lengths).
+            // SURROUND-TODO: the full matrix maps source channels to ALL output ports (up to 7.1); we
+            // read only the front pair. Parse the rest into gain[2..7] once a surround bus exists.
+            float lv[2] = {};
+            if (audio_read_bytes(p + 0x18, lv, sizeof(lv))) {
+                if (lv[0] >= 0.0f && lv[0] <= 4.0f) v.gain[0] = lv[0];
+                if (lv[1] >= 0.0f && lv[1] <= 4.0f) v.gain[1] = lv[1];
+            }
+        } else if (head.id == kNgs2ParamWaveformBlock) {
+            uint64_t ptr = 0;
+            if (audio_read_bytes(p + 8, &ptr, 8) && ptr >= 0x200000000ull) {
+                v.data_ptr     = ptr;  // (re)point at a fresh PCM block
+                v.cursor       = 0.0;
+                v.playing      = true; // a fresh waveform starts playing
+                v.idle         = 0;    // fed this render -> not idle
+                v.played_audio = false;// new sound: re-arm one-shot completion detection
+                if (getenv("PROSPER_NGS2_TRACE")) {
+                    int16_t probe[64] = {}; size_t g = audio_read_bytes_partial(ptr, probe, sizeof probe);
+                    int pk = 0; for (size_t j = 0; j < g / 2; j++) { int a = probe[j] < 0 ? -probe[j] : probe[j]; if (a > pk) pk = a; }
+                    fprintf(stderr, "[ngs2] FEED voice=0x%llx ptr=0x%llx got=%zu probe_peak=%d ch=%u rate=%u\n",
+                            (unsigned long long)handle, (unsigned long long)ptr, g, pk, v.channels, v.rate);
+                }
+            }
+        }
+        if (head.next == 0) break;
+        p += (uint64_t)head.next;
+    }
+}
+
+// Mix all playing voices of `system` into one render buffer of `frames` interleaved frames at
+// `out_rate`/`out_channels`, accumulating float samples into `mix` (size frames*out_channels).
+// Reads source PCM fault-safely in one bulk read per voice; a short/unmapped source just stops that
+// voice. Linear resample from each voice's source rate; source stereo→out stereo direct, mono→dup.
+void ngs2_mix_voices(uint64_t system, float* mix, uint32_t frames, uint32_t out_channels, uint32_t out_rate) {
+    // De-duplicate the 16-voice sampler pool: Dead Cells cycles a fixed pool and reuses a small set of
+    // shared PCM buffers, so after the pool wraps, several stale voice handles still reference the SAME
+    // buffer. NGS2 stops those on hardware; prosper lacks the (undocumented) one-shot-end/stop state, so
+    // without this the same click renders on top of itself a few ms apart (audible doubling once >16
+    // clicks have fired). Render each distinct buffer only once, choosing the FRESHEST voice (smallest
+    // cursor = most recently (re)triggered); older duplicates at that buffer are skipped this pass.
+    // CONFIDENCE: MED — a pragmatic proxy for real voice lifecycle; identical-buffer voices are truly
+    // redundant into a mono/stereo bus, so this cannot drop a distinct sound.
+    std::map<uint64_t, double> freshest;   // data_ptr -> min cursor among playing voices
+    for (auto& [key, v] : g_ngs2_voices) {
+        if (v.playing && v.data_ptr && v.wtype == kNgs2WaveformTypePcmS16) {
+            auto it = freshest.find(v.data_ptr);
+            if (it == freshest.end() || v.cursor < it->second) freshest[v.data_ptr] = v.cursor;
+        }
+    }
+    std::set<uint64_t> rendered_ptr;       // buffers already rendered this pass (exactly one voice each)
+    for (auto& [key, v] : g_ngs2_voices) {
+        if (!v.playing || !v.data_ptr) continue;
+        // A voice that stops being re-fed has ended; expiring it bounds accumulation of stale
+        // voice-pool handles (which otherwise read a reused/persistent buffer forever and pile up).
+        if (++v.idle > kNgs2VoiceIdleRendersMax) { v.playing = false; continue; }
+        // Render each distinct buffer once: skip unless this voice is the freshest (min cursor) for its
+        // buffer and that buffer has not been rendered yet this pass (breaks freshest-cursor ties).
+        { auto it = freshest.find(v.data_ptr);
+          if (it != freshest.end() && (v.cursor > it->second || !rendered_ptr.insert(v.data_ptr).second)) continue; }
+        if (v.wtype != kNgs2WaveformTypePcmS16) {           // only S16 PCM implemented (ATRAC9 deferred)
+            if (getenv("PROSPER_NGS2_TRACE")) {
+                static uint32_t skipped = 0;
+                if ((skipped++ & 0xff) == 0)
+                    fprintf(stderr, "[ngs2] SKIP non-PCM voice=0x%x waveform_type=0x%x (music/codec?)\n", key, v.wtype);
+            }
+            continue;
+        }
+        const double step = (double)v.rate / (double)(out_rate ? out_rate : 48000);
+        const uint32_t src_ch = v.channels ? v.channels : 2;
+        // Source frames this render touches: [floor(cursor), cursor + frames*step] + 1 for interp.
+        const uint64_t first = (uint64_t)v.cursor;
+        const uint64_t last  = (uint64_t)(v.cursor + (double)frames * step) + 2;
+        const uint64_t need_frames = last > first ? last - first : 1;
+        if (need_frames > (1u << 20)) { v.playing = false; continue; }
+        // Best-effort read: the guest may keep only part of the block mapped/valid, so accept a PARTIAL
+        // read and mix exactly the frames that came back. Demanding the whole span (all-or-nothing) made
+        // any voice whose valid PCM is shorter than one render fail outright and go silent.
+        std::vector<int16_t> src(need_frames * src_ch, 0);
+        const size_t got = audio_read_bytes_partial(v.data_ptr + first * src_ch * 2,
+                                                    src.data(), src.size() * 2);
+        const uint64_t have_frames = got / ((uint64_t)src_ch * 2);
+        if (have_frames == 0) { v.playing = false; continue; }   // nothing valid -> block ended
+        // One-shot completion: a sampler voice that has played some audio and now reads only silence
+        // has finished. Stop it so sceNgs2VoiceGetStateFlags reports it EMPTY and the game recycles the
+        // pool voice — otherwise finished-but-still-mapped voices read as "playing", the 16-voice pool
+        // fills with phantom-busy handles, and the game overlaps reuse into a persistent comb/doubling.
+        { bool any = false;
+          for (uint64_t j = 0; j < have_frames * src_ch; j++) if (src[j]) { any = true; break; }
+          if (any) v.played_audio = true;
+          else if (v.played_audio) { v.playing = false; continue; } }
+        for (uint32_t f = 0; f < frames; ++f) {
+            const double sp = v.cursor + (double)f * step;
+            const uint64_t i0 = (uint64_t)sp - first;
+            const double frac = sp - (double)((uint64_t)sp);
+            bool ran_out = false;
+            for (uint32_t oc = 0; oc < out_channels; ++oc) {
+                // Channel routing. SURROUND-LIMITATION: prosper targets a 2-channel (front L/R) bus,
+                // so we map source channel oc→oc for stereo and fold mono to both. A true PS5 surround
+                // (up to 7.1) output would route every source channel to its speaker via the full level
+                // matrix; here only gain[0]/gain[1] (front L/R) are applied. Extend when a surround bus
+                // and the full matrix parse (gain[2..7]) land.
+                const uint32_t sc = (src_ch == 1) ? 0 : (oc < src_ch ? oc : src_ch - 1);
+                const uint64_t a = (i0)     * src_ch + sc;
+                const uint64_t b = (i0 + 1) * src_ch + sc;
+                if (b >= have_frames * src_ch) { ran_out = true; break; }
+                const double s = (1.0 - frac) * src[a] + frac * src[b];
+                mix[f * out_channels + oc] += (float)(s / 32768.0) * (oc < 8 ? v.gain[oc] : 1.0f);
+            }
+            if (ran_out) break;   // consumed all valid source this render
+        }
+        v.cursor += (double)frames * step;
+    }
+}
 
 bool ngs2_read_u32(uint64_t src, uint32_t& value) {
     return audio_read_bytes(src, &value, sizeof value);
@@ -931,14 +1143,52 @@ HLE(ngs2_rack_get_voice) {
     return a2_store_u64(a2, kNgs2VoiceTag | (rack_slot << 8) | a1) ? 0 : kNgs2ErrInvalidOut;
 }
 
+// PROSPER_NGS2_TRACE=2 additionally dumps the voice-command param chain: each entry is a
+// Ngs2VoiceParamHead { uint16 size; int16 next; uint32 id; payload... } (Sony's documented
+// voice-param list shape). This is capture-first RE for the real sampler implementation —
+// the play/setup commands carry the waveform format (codec/rate/channels) and data pointers
+// we need before mixing can be implemented faithfully.
+void ngs2_dump_param_chain(const char* tag, uint64_t list) {
+    if (ngs2_trace_level() < 2 || !list) return;
+    uint64_t p = list;
+    for (int i = 0; i < 16 && p; ++i) {
+        struct { uint16_t size; int16_t next; uint32_t id; } head{};
+        if (!ngs2_read_bytes(p, &head, sizeof(head))) break;
+        fprintf(stderr, "[ngs2]   %s param[%d] @0x%llx size=0x%x next=%d id=0x%08x\n",
+                tag, i, (unsigned long long)p, head.size, head.next, head.id);
+        if (head.size == 0 || head.size > 0x400) break;
+        a2_dump("payload", p, head.size < 0x60 ? head.size : 0x60);
+        // Fingerprint any guest pointer the payload carries (waveform data address): dump its first
+        // bytes so PCM (sample data) vs a codec container (RIFF/'RIFF', 'AT9 ', ATRAC9 config) is
+        // decidable from the magic. Guest heap/direct pointers live in the 0x2_00000000+ aperture.
+        for (uint16_t off = 8; off + 8 <= head.size; off += 8) {
+            uint64_t val = 0;
+            if (!ngs2_read_bytes(p + off, &val, 8)) break;
+            if (val >= 0x200000000ull && val < 0x8000000000ull) {
+                fprintf(stderr, "[ngs2]   %s param[%d] +0x%x -> guest ptr 0x%llx:\n",
+                        tag, i, off, (unsigned long long)val);
+                a2_dump("wavedata", val, 0x40);
+            }
+        }
+        if (head.next == 0) break;
+        p += (uint64_t)head.next;
+    }
+}
+
 HLE(ngs2_voice_control) {
     NGS2_LOG("sceNgs2VoiceControl");
-    return (a0 & kNgs2VoiceMask) == kNgs2VoiceTag ? 0 : kNgs2ErrInvalidVoice;
+    ngs2_dump_param_chain("VoiceControl", a1);
+    if ((a0 & kNgs2VoiceMask) != kNgs2VoiceTag) return kNgs2ErrInvalidVoice;
+    if (!ngs2_mix_disabled()) { std::lock_guard<std::mutex> lock(g_ngs2_mx); ngs2_apply_voice_params(a0, a1); }
+    return 0;
 }
 
 HLE(ngs2_voice_run_commands) {
     NGS2_LOG("sceNgs2VoiceRunCommands");
-    return (a0 & kNgs2VoiceMask) == kNgs2VoiceTag ? 0 : kNgs2ErrInvalidVoice;
+    ngs2_dump_param_chain("RunCommands", a1);
+    if ((a0 & kNgs2VoiceMask) != kNgs2VoiceTag) return kNgs2ErrInvalidVoice;
+    if (!ngs2_mix_disabled()) { std::lock_guard<std::mutex> lock(g_ngs2_mx); ngs2_apply_voice_params(a0, a1); }
+    return 0;
 }
 
 HLE(ngs2_voice_get_state) {
@@ -947,6 +1197,50 @@ HLE(ngs2_voice_get_state) {
     // An inert backend has no active decoder: zero stateFlags means Empty. Dead Cells requests the
     // sampler extension, so clear the caller-declared payload as Kyty does before filling it.
     if (!a1 || !a2 || a2 > 0x1000 || !a2_store_zeros(a1, (size_t)a2)) return kNgs2ErrInvalidOut;
+    return 0;
+}
+
+// State-flag bits the guest tests (Kyty Ngs2GetStateFlags): Empty=0, Playing=0x3, Paused=0x5,
+// Stopped=0xb. Report Playing for a voice we are actively mixing so the game's audio state machine
+// treats the voice as live; else Empty.
+uint32_t ngs2_voice_state_flags(uint64_t handle) {
+    if ((handle & kNgs2VoiceMask) != kNgs2VoiceTag) return 0;
+    auto it = g_ngs2_voices.find((uint32_t)(handle & 0xffffff));
+    return (it != g_ngs2_voices.end() && it->second.playing && it->second.data_ptr) ? 0x3u : 0u;
+}
+
+// sceNgs2VoiceGetStateFlags(voice, uint32_t* outFlags) -> 0. Was UNREGISTERED (#TBD): the generic
+// stub returned 0 and left *outFlags uninitialized, so the guest read garbage voice state and its
+// audio scheduler misbehaved (the uninit-out class). Return real Playing/Empty flags.
+HLE(ngs2_voice_get_state_flags) {
+    NGS2_LOG("sceNgs2VoiceGetStateFlags");
+    if ((a0 & kNgs2VoiceMask) != kNgs2VoiceTag) return kNgs2ErrInvalidVoice;
+    if (!a1) return kNgs2ErrInvalidOut;
+    uint32_t flags; { std::lock_guard<std::mutex> lock(g_ngs2_mx); flags = ngs2_voice_state_flags(a0); }
+    return a2_store_u32(a1, flags) ? 0 : kNgs2ErrInvalidOut;
+}
+
+// sceNgs2RackDestroy(rack, Ngs2ContextBufferInfo* out) -> 0. Was UNREGISTERED. Release the rack and
+// drop its voices so their handles do not leak into later mixes; the out context-buffer info, if
+// present, is zeroed (we own no returned host buffer).
+HLE(ngs2_rack_destroy) {
+    NGS2_LOG("sceNgs2RackDestroy");
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    const uint64_t slot = a0 & 0xff;
+    if ((a0 & kNgs2TagMask) != kNgs2RackTag || slot < 1 || slot > 32) return kNgs2ErrInvalidRack;
+    g_ngs2_racks[slot - 1] = {};
+    for (auto it = g_ngs2_voices.begin(); it != g_ngs2_voices.end(); )
+        it = ((it->first >> 8) == slot) ? g_ngs2_voices.erase(it) : std::next(it);
+    if (a1 && !a2_store_zeros(a1, 0x40)) return kNgs2ErrInvalidOut;
+    return 0;
+}
+
+// sceNgs2GeomApply(...) -> 0. Was UNREGISTERED (NID eF8yRCC6W64, seen unimplemented in boot logs):
+// applies 3D listener/source geometry to a voice's pan matrix. prosper mixes without 3D panning, so
+// this is a faithful no-op success (the guest keeps its pre-initialized pan) — never leave it to the
+// generic stub, which the guest cannot distinguish from a real error path.
+HLE(ngs2_geom_apply) {
+    NGS2_LOG("sceNgs2GeomApply");
     return 0;
 }
 
@@ -966,8 +1260,46 @@ HLE(ngs2_system_render) {
     for (uint64_t i = 0; i < a2; ++i) {
         RenderBufferInfo info{};
         if (!ngs2_read_bytes(a1 + i * sizeof(info), &info, sizeof(info)) ||
-            !info.buffer || info.size > 64ull * 1024 * 1024 || !ngs2_zero_bytes(info.buffer, (size_t)info.size))
+            !info.buffer || info.size > 64ull * 1024 * 1024)
             return kNgs2ErrInvalidOut;
+
+        // The render buffer is the mix destination. Output format: waveform_type 0x12 == S16, anything
+        // else (the NGS2 render default) == F32. Frame count derives from size and the output stride.
+        const bool     out_s16      = info.waveform_type == kNgs2WaveformTypePcmS16;
+        const uint32_t out_channels = (info.channels >= 1 && info.channels <= 8) ? info.channels : 2;
+        const uint32_t out_bps      = out_s16 ? 2 : 4;
+        const uint32_t frames       = (uint32_t)(info.size / ((uint64_t)out_channels * out_bps));
+
+        if (ngs2_mix_disabled() || frames == 0) {
+            if (!ngs2_zero_bytes(info.buffer, (size_t)info.size)) return kNgs2ErrInvalidOut;
+            continue;
+        }
+
+        std::vector<float> mix((size_t)frames * out_channels, 0.0f);
+        int playing = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_ngs2_mx);
+            for (auto& [k, vc] : g_ngs2_voices) if (vc.playing && vc.data_ptr) playing++;
+            ngs2_mix_voices(a0, mix.data(), frames, out_channels, 48000 /* NGS2 system rate */);
+        }
+        if (ngs2_trace_enabled()) {
+            float pk = 0; for (float f : mix) { float a = f < 0 ? -f : f; if (a > pk) pk = a; }
+            static uint64_t rc = 0; static float maxpk = 0; static int maxpv = 0;
+            if (pk > maxpk) maxpk = pk; if (playing > maxpv) maxpv = playing;
+            if ((++rc & 0x3f) == 1 || (pk > 0 && playing > 0))
+                fprintf(stderr, "[ngs2] render buf#%llu out=%s ch=%u frames=%u size=%llu playing_voices=%d(max%d) mix_peak=%.4f(max%.4f)\n",
+                        (unsigned long long)i, out_s16 ? "s16" : "f32", out_channels, frames,
+                        (unsigned long long)info.size, playing, maxpv, pk, maxpk);
+        }
+        // Serialize the float mix into the guest buffer's native format (clamped), then commit it.
+        std::vector<uint8_t> out((size_t)info.size, 0);
+        for (size_t s = 0; s < mix.size(); ++s) {
+            float f = mix[s];
+            f = f > 1.0f ? 1.0f : (f < -1.0f ? -1.0f : f);
+            if (out_s16) { int16_t v = (int16_t)(f * 32767.0f); memcpy(&out[s * 2], &v, 2); }
+            else         { memcpy(&out[s * 4], &f, 4); }
+        }
+        if (!audio_store_bytes(info.buffer, out.data(), out.size())) return kNgs2ErrInvalidOut;
     }
     return 0;
 }
@@ -1037,6 +1369,9 @@ void register_audio_hle() {
     Hle::register_fn("uu94irFOGpA", ngs2_voice_control, "sceNgs2VoiceControl");
     Hle::register_fn("AbYvTOZ8Pts", ngs2_voice_run_commands, "sceNgs2VoiceRunCommands");
     Hle::register_fn("-TOuuAQ-buE", ngs2_voice_get_state, "sceNgs2VoiceGetState");
+    Hle::register_fn("rEh728kXk3w", ngs2_voice_get_state_flags, "sceNgs2VoiceGetStateFlags");
+    Hle::register_fn("lCqD7oycmIM", ngs2_rack_destroy, "sceNgs2RackDestroy");
+    Hle::register_fn("eF8yRCC6W64", ngs2_geom_apply, "sceNgs2GeomApply");
     Hle::register_fn("0lbbayqDNoE", ngs2_geom_reset_source, "sceNgs2GeomResetSourceParam");
     Hle::register_fn("i0VnXM-C9fc", ngs2_system_render, "sceNgs2SystemRender");
     Hle::register_fn("7Lcfo8SmpsU", ngs2_geom_reset_listener, "sceNgs2GeomResetListenerParam");
