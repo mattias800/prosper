@@ -268,6 +268,10 @@ default budget is 1 GiB, which covers Evergate's measured 835 MiB working set; u
 `PROSPER_NO_TEXTURE_DECODE_CACHE=1` for an A/B run. Timing reports cross-submit `texture_cache`
 hits/misses/invalidations separately from `textures` (all texture uses) and `reused` (both local and
 persistent decodes avoided).
+Complete readable source ranges are compared directly against the cache's retained encoded bytes;
+partial sparse ranges keep the guarded scratch-copy fallback. This preserves the same exact byte and
+readability checks without copying large texture sources before comparing them. Set
+`PROSPER_TEXTURE_VALIDATION_SCRATCH_COPY=1` for an A/B against the previous copy-then-compare path.
 
 The Vulkan backend may retain an optimal sampled image only when that exact frontend validation
 supplies a nonzero content-version ID. Cache hits skip image allocation, staging allocation, pixel
