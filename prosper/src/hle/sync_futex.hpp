@@ -32,6 +32,12 @@ int interruptible_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
                                  const timespec* deadline,
                                  GuestWaitKind kind = GuestWaitKind::ConditionSequence,
                                  uintptr_t source = 0);
+// Wait for a relative duration measured by a stable host clock. Used when a guest condition's
+// absolute deadline belongs to a non-realtime clock and must not inherit wall-clock jumps.
+int interruptible_cond_timedwait_relative(pthread_cond_t* cond, pthread_mutex_t* mutex,
+                                          const timespec* duration,
+                                          GuestWaitKind kind = GuestWaitKind::ConditionSequence,
+                                          uintptr_t source = 0);
 int interruptible_cond_signal(pthread_cond_t* cond);
 int interruptible_cond_broadcast(pthread_cond_t* cond);
 // Release the Windows WaitOnAddress registry entry after a condition variable is destroyed.

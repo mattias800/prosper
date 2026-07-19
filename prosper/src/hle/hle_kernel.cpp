@@ -546,8 +546,8 @@ namespace {
                (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec);
     }
 
-    timespec realtime_slice_deadline(const timespec& selected_now,
-                                     const timespec& selected_deadline) {
+    timespec stable_slice_duration(const timespec& selected_now,
+                                   const timespec& selected_deadline) {
         int64_t wait_ns = kCondClockSliceNs;
         if (selected_deadline.tv_sec == selected_now.tv_sec) {
             wait_ns = selected_deadline.tv_nsec - selected_now.tv_nsec;
@@ -556,15 +556,8 @@ namespace {
                                       selected_deadline.tv_nsec;
             if (remainder < wait_ns) wait_ns = remainder;
         }
-        timespec realtime{};
-        clock_gettime(CLOCK_REALTIME, &realtime);
-        realtime.tv_sec += (time_t)(wait_ns / 1'000'000'000ll);
-        realtime.tv_nsec += (long)(wait_ns % 1'000'000'000ll);
-        if (realtime.tv_nsec >= 1'000'000'000l) {
-            ++realtime.tv_sec;
-            realtime.tv_nsec -= 1'000'000'000l;
-        }
-        return realtime;
+        return timespec{(time_t)(wait_ns / 1'000'000'000ll),
+                        (long)(wait_ns % 1'000'000'000ll)};
     }
 
     int interruptible_cond_clock_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
@@ -580,8 +573,8 @@ namespace {
             if (result != 0) return result;
             if (timespec_reached(selected_now, deadline)) return ETIMEDOUT;
 
-            const timespec slice = realtime_slice_deadline(selected_now, deadline);
-            result = interruptible_cond_timedwait(cond, mutex, &slice);
+            const timespec slice = stable_slice_duration(selected_now, deadline);
+            result = interruptible_cond_timedwait_relative(cond, mutex, &slice);
             if (result != ETIMEDOUT) return result;
             // A signal can land between two host timed waits. Treat a generation change as a
             // permitted spurious wake instead of losing the signal during clock conversion.

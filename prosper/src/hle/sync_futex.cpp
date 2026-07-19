@@ -1,7 +1,11 @@
 // sync_futex.cpp — see sync_futex.hpp.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE // pthread_cond_clockwait on Linux
+#endif
 #include "sync_futex.hpp"
 #include "dispatch.hpp"
 #include <atomic>
+#include <cerrno>
 #include <climits>
 #if defined(__linux__) || defined(__APPLE__)
 #include <unistd.h>
@@ -209,6 +213,53 @@ int interruptible_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
     (void)kind;
     (void)source;
     return pthread_cond_timedwait(cond, mutex, deadline);
+#endif
+}
+
+int interruptible_cond_timedwait_relative(pthread_cond_t* cond, pthread_mutex_t* mutex,
+                                          const timespec* duration, GuestWaitKind kind,
+                                          uintptr_t source) {
+    if (!duration || duration->tv_sec < 0 || duration->tv_nsec < 0 ||
+        duration->tv_nsec >= 1000000000L) return EINVAL;
+#ifdef _WIN32
+    CondSlot* slot = cond_slot_for(cond);
+    if (!slot) return ENOMEM;
+    uint32_t expected = slot->sequence.load(std::memory_order_acquire);
+    WaitSlot* registration = register_wait(kind, (uintptr_t)&slot->sequence,
+                                           source ? source : (uintptr_t)cond);
+    const int unlock_result = pthread_mutex_unlock(mutex);
+    if (unlock_result != 0) {
+        unregister_wait(registration);
+        return unlock_result;
+    }
+    dispatch_pending_guest_exception();
+
+    const uint64_t milliseconds = (uint64_t)duration->tv_sec * 1000ull +
+                                  ((uint64_t)duration->tv_nsec + 999999ull) / 1000000ull;
+    const DWORD timeout = milliseconds >= (uint64_t)INFINITE ? INFINITE - 1 : (DWORD)milliseconds;
+    const bool signaled = WaitOnAddress((volatile void*)&slot->sequence, &expected,
+                                        sizeof(expected), timeout) != FALSE;
+    dispatch_pending_guest_exception();
+    unregister_wait(registration);
+    const int lock_result = interruptible_mutex_lock(mutex);
+    if (lock_result != 0) return lock_result;
+    return signaled ? 0 : ETIMEDOUT;
+#elif defined(__APPLE__)
+    (void)kind;
+    (void)source;
+    return pthread_cond_timedwait_relative_np(cond, mutex, duration);
+#else
+    (void)kind;
+    (void)source;
+    timespec deadline{};
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) return errno ? errno : EINVAL;
+    deadline.tv_sec += duration->tv_sec;
+    deadline.tv_nsec += duration->tv_nsec;
+    if (deadline.tv_nsec >= 1000000000L) {
+        ++deadline.tv_sec;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    return pthread_cond_clockwait(cond, mutex, CLOCK_MONOTONIC, &deadline);
 #endif
 }
 
