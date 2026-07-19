@@ -51,10 +51,13 @@ int main() {
     auto mtypeprotect = Hle::lookup(nid_hash("sceKernelMtypeprotect"));
     auto batch    = Hle::lookup(nid_hash("sceKernelBatchMap"));
     auto query    = Hle::lookup(nid_hash("sceKernelVirtualQuery"));
+    auto query_protection = Hle::lookup(nid_hash("sceKernelQueryMemoryProtection"));
     auto flexible = Hle::lookup(nid_hash("sceKernelMapNamedFlexibleMemory"));
     auto flexible_noname = Hle::lookup(nid_hash("sceKernelMapFlexibleMemory"));
     auto unmap    = Hle::lookup(nid_hash("sceKernelMunmap"));
-    CHECK(reserve && protect && mtypeprotect && batch && query && flexible &&
+    CHECK(nid_hash("sceKernelQueryMemoryProtection") == "WFcfL2lzido",
+          "QueryMemoryProtection hashes to the PS5 3.20 import NID");
+    CHECK(reserve && protect && mtypeprotect && batch && query && query_protection && flexible &&
               flexible_noname && unmap,
           "memory HLE functions registered");
     if (fails) return 1;
@@ -286,6 +289,17 @@ int main() {
               *(int32_t*)(info + 0x18) == 0x2 &&
               *(uint32_t*)(info + 0x20) == 0x10,
           "VirtualQuery reports the committed page's exact guest read/write protection");
+    uint64_t protection_start = UINT64_MAX;
+    uint64_t protection_end = UINT64_MAX;
+    uint32_t protection_value = UINT32_MAX;
+    CHECK(query_protection(middle + page / 2, (uint64_t)(uintptr_t)&protection_start,
+                           (uint64_t)(uintptr_t)&protection_end,
+                           (uint64_t)(uintptr_t)&protection_value, 0, 0) == 0 &&
+              protection_start == middle && protection_end == middle + page &&
+              protection_value == 0x2,
+          "QueryMemoryProtection returns the containing region and exact guest protection");
+    CHECK(query_protection(middle + page / 2, 0, 0, 0, 0, 0) == 0,
+          "QueryMemoryProtection permits optional output pointers");
 
     CHECK(protect(middle, page, 0x11 /* CPU_READ | GPU_READ */, 0, 0, 0) == 0,
           "mprotect accepts guest-only GPU protection bits");
@@ -294,6 +308,11 @@ int main() {
               *(int32_t*)(info + 0x18) == 0x11 &&
               *(uint32_t*)(info + 0x20) == 0x10,
           "VirtualQuery preserves guest-only GPU protection bits");
+    protection_value = UINT32_MAX;
+    CHECK(query_protection(middle + page / 2, 0, 0,
+                           (uint64_t)(uintptr_t)&protection_value, 0, 0) == 0 &&
+              protection_value == 0x11,
+          "QueryMemoryProtection preserves guest-only GPU protection bits");
 
     CHECK(protect(base, len, 0x1 /* SCE_KERNEL_PROT_CPU_READ */, 0, 0, 0) == 0,
           "mprotect accepts a range spanning reserved and committed pages");
@@ -312,6 +331,16 @@ int main() {
           "range protection keeps the trailing page uncommitted");
 
     CHECK(unmap(base, len, 0, 0, 0, 0) == 0, "the test reservation unmaps cleanly");
+    protection_start = UINT64_MAX;
+    protection_end = UINT64_MAX;
+    protection_value = UINT32_MAX;
+    CHECK((uint32_t)query_protection(
+              middle + page / 2, (uint64_t)(uintptr_t)&protection_start,
+              (uint64_t)(uintptr_t)&protection_end,
+              (uint64_t)(uintptr_t)&protection_value, 0, 0) == 0x8002000du &&
+              protection_start == UINT64_MAX && protection_end == UINT64_MAX &&
+              protection_value == UINT32_MAX,
+          "QueryMemoryProtection rejects an untracked address without writing outputs");
     if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

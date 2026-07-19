@@ -232,13 +232,15 @@ namespace {
         for (const auto& m : retagged)
             host::notify_guest_mapping_added(m.base, m.size, m.committed && (prot & 0x1));
     }
-    const Mapping* find(uint64_t addr) {
+    bool snapshot_mapping(uint64_t addr, Mapping& out) {
         std::lock_guard<std::mutex> lk(g_mx);
         const Mapping* best = nullptr;
         for (auto& m : g_maps)
             if (addr >= m.base && addr < m.base + m.size)
                 if (!best || m.base > best->base) best = &m;   // most specific (latest overlay)
-        return best;
+        if (!best) return false;
+        out = *best;
+        return true;
     }
     // Is [base, base+len) entirely covered by our OWN UNCOMMITTED (PROT_NONE reservation) mappings?
     // Only then is a MAP_FIXED replace safe: the guest is committing a range it reserved (#137). A
@@ -645,18 +647,19 @@ HLE(k_virtual_query) {
     uint8_t* info = (uint8_t*)a2;
     uint64_t sz = a3 ? (a3 > 0x48 ? 0x48 : a3) : 0x48;
     memset(info, 0, sz);
-    const Mapping* m = find(a0);
+    Mapping mapping{};
+    const bool found = snapshot_mapping(a0, mapping);
     uint64_t start, end; int prot; uint32_t flags;
     const char* how;
-    if (m) {                                   // inside a real mapping
+    if (found) {                               // inside a real mapping
         // Report the mapping's REAL commit state: a reserved-but-uncommitted range has NO access
         // (prot 0). Lying prot=RW for the whole 512GB reservation made UE4's allocator skip its
         // BatchMap commit for pages VirtualQuery claimed were already writable -> first-touch crash.
-        start = m->base; end = m->base + m->size;
+        start = mapping.base; end = mapping.base + mapping.size;
         // Keep Sony's exact protection value: CPU_RW is enum 0x02 (not host R|W 0x03), and
         // GPU-only bits have no host-page-protection equivalent but remain guest-visible state.
-        prot = m->committed ? static_cast<int>(m->guest_prot) : 0x0;
-        flags = m->committed ? 0x10 : 0x0; how = "tracked";
+        prot = mapping.committed ? static_cast<int>(mapping.guest_prot) : 0x0;
+        flags = mapping.committed ? 0x10 : 0x0; how = "tracked";
     } else {                                   // unmapped: report the whole hole to the next mapping
         uint64_t nb = next_base(a0);
         if (!nb) { MLOG("virtual_query(0x%llx) -> end-of-space (EACCES)\n", (unsigned long long)a0); return 0x8002000e; }
@@ -666,9 +669,22 @@ HLE(k_virtual_query) {
     if (sz >= 0x10) *(uint64_t*)(info + 0x08) = end;
     if (sz >= 0x1c) *(int32_t*)(info + 0x18) = prot;
     if (sz >= 0x24) *(uint32_t*)(info + 0x20) = flags;
-    if (sz >= 0x44 && m && m->name[0]) memcpy(info + 0x24, m->name, 32);
+    if (sz >= 0x44 && found && mapping.name[0]) memcpy(info + 0x24, mapping.name, 32);
     MLOG("virtual_query(0x%llx,f=0x%llx) -> [0x%llx,0x%llx) %s\n",
          (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)start, (unsigned long long)end, how);
+    return 0;
+}
+
+// sceKernelQueryMemoryProtection(addr, startOut, endOut, protOut): query the exact tracked VMA
+// without VirtualQuery's larger result structure. Every output is optional; an untracked address
+// fails before touching any of them. Copying the Mapping under g_mx avoids retaining a vector
+// element pointer while another thread splits or replaces the tracker.
+HLE(k_query_memory_protection) {
+    Mapping mapping{};
+    if (!snapshot_mapping(a0, mapping)) return 0x8002000dull;  // SCE_KERNEL_ERROR_EACCES
+    if (a1) *(uint64_t*)(uintptr_t)a1 = mapping.base;
+    if (a2) *(uint64_t*)(uintptr_t)a2 = mapping.base + mapping.size;
+    if (a3) *(uint32_t*)(uintptr_t)a3 = mapping.guest_prot;
     return 0;
 }
 
@@ -1262,6 +1278,7 @@ void register_kernel_mem_hle() {
     R("sceKernelBatchMap", k_batch_map);
     R("sceKernelBatchMap2", k_batch_map);   // (entries, num, out, flags) — extra flags arg ignored
     R("sceKernelVirtualQuery", k_virtual_query);
+    R("sceKernelQueryMemoryProtection", k_query_memory_protection);
     R("sceKernelDirectMemoryQuery", k_direct_memory_query);
     R("sceKernelGetDirectMemorySize", k_dmem_size);
     R("sceKernelAvailableDirectMemorySize", k_avail_dmem);
@@ -1506,13 +1523,15 @@ namespace {
                 m.base, m.size, m.committed && host_readable && (prot & 0x1));
         }
     }
-    const Mapping* find(uint64_t addr) {
+    bool snapshot_mapping(uint64_t addr, Mapping& out) {
         std::lock_guard<std::mutex> lk(g_mx);
         const Mapping* best = nullptr;
         for (auto& m : g_maps)
             if (addr >= m.base && addr < m.base + m.size)
                 if (!best || m.base > best->base) best = &m;
-        return best;
+        if (!best) return false;
+        out = *best;
+        return true;
     }
     uint64_t next_base(uint64_t addr) {
         std::lock_guard<std::mutex> lk(g_mx);
@@ -3476,14 +3495,15 @@ HLE(k_virtual_query) {
     uint8_t* info = (uint8_t*)a2;
     uint64_t sz = a3 ? (a3 > 0x48 ? 0x48 : a3) : 0x48;
     memset(info, 0, sz);
-    const Mapping* m = find(a0);
+    Mapping mapping{};
+    const bool found = snapshot_mapping(a0, mapping);
     uint64_t start, end; int prot; uint32_t flags;
-    if (m) {
-        start = m->base; end = m->base + m->size;
+    if (found) {
+        start = mapping.base; end = mapping.base + mapping.size;
         // CPU read/write is an SCE enum (RW is 0x2, not host READ|WRITE 0x3), and the GPU bits
         // have no host-page equivalent. Return the original guest protection value verbatim.
-        prot = m->committed ? static_cast<int>(m->guest_prot) : 0x0;
-        flags = m->committed ? 0x10 : 0x0;
+        prot = mapping.committed ? static_cast<int>(mapping.guest_prot) : 0x0;
+        flags = mapping.committed ? 0x10 : 0x0;
     } else {
         uint64_t nb = next_base(a0);
         if (!nb) return 0x8002000eull;
@@ -3493,7 +3513,16 @@ HLE(k_virtual_query) {
     if (sz >= 0x10) *(uint64_t*)(info + 0x08) = end;
     if (sz >= 0x1c) *(int32_t*)(info + 0x18) = prot;
     if (sz >= 0x24) *(uint32_t*)(info + 0x20) = flags;
-    if (sz >= 0x44 && m && m->name[0]) memcpy(info + 0x24, m->name, 32);
+    if (sz >= 0x44 && found && mapping.name[0]) memcpy(info + 0x24, mapping.name, 32);
+    return 0;
+}
+
+HLE(k_query_memory_protection) {
+    Mapping mapping{};
+    if (!snapshot_mapping(a0, mapping)) return 0x8002000dull;
+    if (a1) *(uint64_t*)(uintptr_t)a1 = mapping.base;
+    if (a2) *(uint64_t*)(uintptr_t)a2 = mapping.base + mapping.size;
+    if (a3) *(uint32_t*)(uintptr_t)a3 = mapping.guest_prot;
     return 0;
 }
 
@@ -3634,6 +3663,7 @@ void register_kernel_mem_hle() {
     R("sceKernelBatchMap", k_batch_map);
     R("sceKernelBatchMap2", k_batch_map);
     R("sceKernelVirtualQuery", k_virtual_query);
+    R("sceKernelQueryMemoryProtection", k_query_memory_protection);
     R("sceKernelDirectMemoryQuery", k_direct_memory_query);
     R("sceKernelGetDirectMemorySize", k_dmem_size);
     R("sceKernelAvailableDirectMemorySize", k_avail_dmem);
