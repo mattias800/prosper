@@ -46,8 +46,9 @@ We already have the seed: **`PROSPER_PAD_SCRIPT` (#202)** — a scripted `PadBac
   `right-stick-{left,right,up,down}` directions. Seconds points use `PROSPER_PAD_HOLD` ms
   (default 300); flip/read points use their count-axis holds above. Explicit ranges always use their
   exclusive end.
-- **Anchored to the first pad poll**: seconds and flips retain their existing first-poll origins;
-  pad reads are numbered from zero at that same first snapshot.
+- **Anchored to the first successful input-state read**: seconds and flips retain their existing
+  first-read origins; pad reads number successful `scePadRead`/`scePadReadState` calls from zero.
+  Controller-information queries and rejected reads do not advance any route axis.
 - Pad reports CONNECTED whenever a script is set. Parse + time-eval are pure and unit-tested in `pad.cpp`.
 - Explicit wall-clock ranges are sampled only when the game polls the pad. A short range can fall
   entirely between polls under slow synchronous rendering. Use longer holds with neutral gaps,
@@ -66,7 +67,7 @@ validation that does not depend on presentation speed.
 ### 1. Frame/pad-read-anchored, file-loadable scripts (core) - implemented
 - **Anchor to game frames, not wall-time.** Keep the "first pad poll" origin (robust to load time), but measure progress in **flips since first poll** (game logic frames), not elapsed seconds. The Messenger is a fixed-timestep platformer, so wall-time drifts vs game frames on slow llvmpipe vs a fast GPU — frame anchoring makes `f300:cross` reproduce everywhere. Add an `f<frame>:` entry syntax alongside the existing `<seconds>:` (kept for back-compat).
 - **Anchor to pad reads when presentation is not the clock.** `p1200-1240:cross` holds Cross for
-  guest controller snapshots 1200 through 1239. This axis advances when synchronous rendering pauses
+  successful guest input-state reads 1200 through 1239. This axis advances when synchronous rendering pauses
   display flips and cannot miss between polls like a short wall-time range. The transition log prints
   the live read index so routes can be calibrated without a code change.
 - **Load from a file.** `PROSPER_PAD_SCRIPT=@path` reads a multi-line script file, so long routes live in the repo, not an env string.

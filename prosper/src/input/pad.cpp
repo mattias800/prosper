@@ -178,19 +178,30 @@ std::vector<PadScriptEntry> parse_pad_script(const std::string& spec) {
             out = value;
             return true;
         };
+        auto parse_count = [](const std::string& text, double& out) {
+            // Validate the decimal spelling before converting to double. Near 2^53, strtod can
+            // otherwise round a fractional token to an integer and make it look like a valid count.
+            constexpr uint64_t kMaxExactInteger = 9007199254740991ULL;  // 2^53 - 1
+            if (text.empty()) return false;
+            uint64_t value = 0;
+            for (const char ch : text) {
+                if (ch < '0' || ch > '9') return false;
+                const uint64_t digit = static_cast<uint64_t>(ch - '0');
+                if (value > (kMaxExactInteger - digit) / 10) return false;
+                value = value * 10 + digit;
+            }
+            out = static_cast<double>(value);
+            return true;
+        };
+        const bool count_anchored = frame_anchored || read_anchored;
+        const auto parse_anchor = [&](const std::string& text, double& out) {
+            return count_anchored ? parse_count(text, out) : parse_number(text, out);
+        };
         double start = 0.0, end = 0.0;
-        if (!parse_number(trim(window.substr(0, dash)), start)) continue;
+        if (!parse_anchor(trim(window.substr(0, dash)), start)) continue;
         if (dash != std::string::npos) {
-            if (!parse_number(trim(window.substr(dash + 1)), end) || end <= start) continue;
+            if (!parse_anchor(trim(window.substr(dash + 1)), end) || end <= start) continue;
         }
-        // Count anchors are integers. Keep them exactly representable in the double-backed entry so
-        // evaluation cannot silently round or overflow while converting to int64_t.
-        constexpr double kMaxExactInteger = 9007199254740991.0;  // 2^53 - 1
-        if ((frame_anchored || read_anchored) &&
-            (start != std::floor(start) || start > kMaxExactInteger ||
-             (dash != std::string::npos &&
-              (end != std::floor(end) || end > kMaxExactInteger))))
-            continue;
         std::string btns = tok.substr(colon + 1);
         uint32_t mask = 0;
         uint8_t axis_mask = 0;

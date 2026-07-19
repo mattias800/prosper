@@ -73,7 +73,7 @@ uint64_t now_us() {
 // script is set the pad reports
 // CONNECTED for the whole run (a menu that gates on a controller sees one).
 //
-// Timing is anchored to the FIRST input poll, not process start: the game only reads the pad once it
+// Timing is anchored to the FIRST successful input-state read, not process start: the game only reads the pad once it
 // reaches the interactive menu, so t=0 == "menu appeared" — robust to how long asset loading takes.
 // CONFIDENCE: HIGH (mechanism); MED (that the game's submit maps to OPTIONS="Start" / CROSS).
 // The parse + time-eval live in pad.cpp (pure, unit-tested); this file supplies getenv + the clock.
@@ -242,8 +242,8 @@ int64_t pad_frame_now() {
     return flips >= base ? (int64_t)(flips - base) : 0;
 }
 
-// Pad-read anchor: each controller snapshot is one read, numbered from zero at the first poll. This
-// advances even when presentation is paused by synchronous rendering.
+// Pad-read anchor: each successful scePadRead/scePadReadState call is one read, numbered from zero.
+// Metadata queries and rejected reads do not consume it; it advances even when presentation is paused.
 std::atomic<uint64_t> g_pad_read_count{0};
 
 int64_t pad_read_hold() {
@@ -351,17 +351,22 @@ void pad_record(int64_t frame, uint32_t buttons) {
 // installed, prosper_core's default backend reports ONE connected controller with neutral input (a PS5
 // title can gate progression on a pad being present, so dev/testing needs one). PROSPER_PAD_PRESS adds
 // a synthetic CROSS; PROSPER_PAD_SCRIPT adds a timed controller sequence — device-independent test drivers.
-HostPadState snapshot(int /*handle*/, const char* what) {
+HostPadState poll_controller(int /*handle*/, const char* what, bool consume_input_read) {
     HostPadState s;   // filled by the backend below (default: one connected, neutral controller)
     pad_backend()->poll(0, s);
     if (getenv("PROSPER_PAD_PRESS")) {
         s.connected = true;
         s.buttons  |= SCE_PAD_BUTTON_CROSS;
     }
-    const int64_t frame = pad_frame_now();
-    const int64_t read = pad_read_now();
-    apply_pad_script(s, frame, read);
-    pad_record(frame, s.buttons);
+    // Information queries report script-driven connectivity, but they must not advance pN routes.
+    // Only calls that return an input state consume a pad-read anchor.
+    if (pad_script_runtime().configured()) s.connected = true;
+    if (consume_input_read) {
+        const int64_t frame = pad_frame_now();
+        const int64_t read = pad_read_now();
+        apply_pad_script(s, frame, read);
+        pad_record(frame, s.buttons);
+    }
     padlog_once(what, &s);
     return s;
 }
@@ -387,7 +392,7 @@ HLE(pad_is_valid_handle) { return a0 >= 1 ? 1 : 0; }
 // scePadReadState(handle, ScePadData* out) -> 0 on success. One current snapshot.
 HLE(pad_read_state) {
     if (!a1) return 0;
-    HostPadState s = snapshot((int)a0, __func__);
+    HostPadState s = poll_controller((int)a0, __func__, true);
     pad_fill_data((ScePadData*)PW(a1), s, now_us(), s.connected ? 1 : 0);
     return 0;
 }
@@ -397,7 +402,7 @@ HLE(pad_read_state) {
 HLE(pad_read) {
     int num = (int)(int64_t)a2;
     if (!a1 || num < 1) return 0;
-    HostPadState s = snapshot((int)a0, __func__);
+    HostPadState s = poll_controller((int)a0, __func__, true);
     pad_fill_data((ScePadData*)PW(a1), s, now_us(), s.connected ? 1 : 0);
     return 1;   // one state written
 }
@@ -405,7 +410,7 @@ HLE(pad_read) {
 // scePadGetControllerInformation(handle, ScePadControllerInformation* out) -> 0.
 HLE(pad_get_info) {
     if (!a1) return 0;
-    HostPadState s = snapshot((int)a0, __func__);
+    HostPadState s = poll_controller((int)a0, __func__, false);
     pad_fill_controller_info((ScePadControllerInformation*)PW(a1), s.connected, s.connected ? 1 : 0);
     return 0;
 }
