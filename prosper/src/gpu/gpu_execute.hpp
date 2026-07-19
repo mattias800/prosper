@@ -10,6 +10,7 @@
 #pragma once
 #include "command_processor.hpp"   // GpuState
 #include "render_state.hpp"        // extract_render_state / resolve_pipeline_state / ResolvedPipelineState
+#include "pm4_registers.hpp"        // CB_COLOR_CONTROL operation decode
 #include <cstring>                 // memcpy: aliasing-safe index-buffer fingerprint loads
 #include "rdna2_to_spirv.hpp"      // recompile_vertex / recompile_fragment
 #include "shader_resources.hpp"    // ShaderResourceTable
@@ -585,6 +586,33 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     std::vector<uint32_t> fs = recompile_graphics_shader_cached(
         ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
         max_shader_dwords, prt.get(), nullptr, system_input_ptr, &fs_identity);
+    // CB_COLOR_CONTROL.DCC_DECOMPRESS interprets the bound AGC metadata helper, rather than its
+    // ordinary fragment-color export. The operation bits can remain folded into a later graphics
+    // submit even though the guest's utility sequence has restored normal mode by then, so MODE alone
+    // is not a sufficient discriminator: doing that replaced Astro's post-process and scanout shaders.
+    // Match the descriptor-free clear-RG helper program emitted by AGC as well. This is program content,
+    // not a title-specific address, and keeps normal shaders fail-visible when stale operation bits leak.
+    static constexpr uint32_t kDccDecompressHelperProgram[] = {
+        0x7e000280u, 0xf8001803u, 0x00000000u, 0xbf810000u,
+    };
+    const auto* raw_fragment = reinterpret_cast<const uint32_t*>(
+        static_cast<uintptr_t>(rs.ps_addr));
+    const bool dcc_helper_program = raw_fragment && max_shader_dwords >=
+        std::size(kDccDecompressHelperProgram) &&
+        std::equal(std::begin(kDccDecompressHelperProgram),
+                   std::end(kDccDecompressHelperProgram), raw_fragment);
+    const bool dcc_decompress = dcc_helper_program &&
+        PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, MODE) ==
+            prosper::agc::Pm4::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS;
+    if (dcc_decompress) {
+        static constexpr uint32_t kNullExportProgram[] = {
+            0xf8001890u, 0x00000000u, 0xbf810000u,
+        };
+        static const std::vector<uint32_t> kNullExportFragment =
+            recompile_fragment(kNullExportProgram, std::size(kNullExportProgram));
+        fs = kNullExportFragment;
+        fs_identity = 0;
+    }
     std::vector<uint32_t> gs;
     if (interpolation.requires_geometry && interpolation.valid) {
         // Geometry `Triangles` accepts list, strip, and fan input assembly. Points/lines cannot
