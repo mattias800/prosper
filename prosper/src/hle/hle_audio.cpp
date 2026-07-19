@@ -7,7 +7,11 @@
 #include "dispatch.hpp"
 #include "nid.hpp"
 #include "audio.hpp"
+#include "callback_fs.hpp"      // recover the caller's guest %fs for firing guest callbacks
+#include "../host/posix_shim.hpp" // PROSPER_ASM_TRAMPOLINE (pass entry %rsp as 7th arg)
+#include <algorithm>
 #include <atomic>
+#include <deque>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -963,6 +967,14 @@ struct Ngs2RackState {
 
 std::mutex g_ngs2_mx;
 bool g_ngs2_systems[4]{};
+// NGS2 produces num_grain_samples frames per SystemRender; the guest hands us a buffer that can be far
+// larger (Dead Cells passes 37888 frames) and only consumes one grain, streaming one grain-sized block
+// per render. We fill only this many frames of an oversized buffer — filling the whole capacity makes a
+// streaming voice's read cursor race ~9x ahead of the ~8-block queue the guest keeps topped up, i.e. the
+// rhythmic underrun. Real NGS2 grains are small (SDK default 256, max 512), so this 4096 default is a
+// safe upper bound that only trims oversized buffers. sceNgs2SystemCreate reads the real value from the
+// SceNgs2SystemOption (num_grain_samples @ +0x70) when the title supplies one; Dead Cells passes null.
+uint32_t g_ngs2_grain = 4096;
 Ngs2RackState g_ngs2_racks[32];
 std::mutex g_ngs2_zero_mx;
 std::vector<uint8_t> g_ngs2_zeros;
@@ -982,6 +994,7 @@ std::vector<uint8_t> g_ngs2_zeros;
 constexpr uint32_t kNgs2ParamWaveformFormat = 0x40010000;
 constexpr uint32_t kNgs2ParamWaveformBlock  = 0x40010001;
 constexpr uint32_t kNgs2ParamMatrixLevels   = 0x40001300;   // per-render output level matrix (gains)
+constexpr uint32_t kNgs2ParamVoiceCallback  = 0x00000007;   // Ngs2VoiceCallbackParam (block-done handler)
 constexpr uint32_t kNgs2WaveformTypePcmS16  = 0x12;
 // A voice stops when it has been mixed this many consecutive renders without a fresh waveform block.
 // Sampler SFX are re-fed continuously while audible (observed: a play is followed by a stream of block
@@ -1002,7 +1015,20 @@ struct Ngs2Voice {
     // SURROUND-TODO: when a multichannel output bus is added, mix all channels through these gains.
     float    gain[8]   = {1,1,1,1,1,1,1,1};
     uint32_t wtype     = kNgs2WaveformTypePcmS16;
-    double   cursor    = 0.0;      // fractional source-frame position since data_ptr
+    double   cursor    = 0.0;      // fractional source-frame position within blocks.front()
+    // Fed waveform blocks awaiting playback, in feed order (front = currently playing). A streaming
+    // guest feeds a fixed-size block per grain and reuses a small ring of non-contiguous pool buffers,
+    // so the mixer must play them one block at a time and never read past a block boundary (doing so
+    // samples the next, unrelated pool buffer -> the garbled "digital noise").
+    std::deque<uint64_t> blocks;
+    // Waveform-block completion callback (voice param 0x0007, Ngs2VoiceCallbackParam). A streaming guest
+    // registers it and expects NGS2 to invoke it as each fed block finishes, so it can queue the next.
+    uint64_t cb_fn = 0, cb_data = 0;   // guest handler function pointer + user data
+    uint32_t cb_flags = 0;
+    uint64_t played_samples = 0;       // wall-clock-paced total source frames played; reported as
+                                       // VoiceGetState's num_decoded_samples so the guest's decode/feed
+                                       // loop paces to real time instead of to our (faster) render rate.
+    uint64_t t0_ns          = 0;       // steady-clock ns at stream start (0 = not started / resync).
 };
 std::map<uint32_t, Ngs2Voice> g_ngs2_voices;   // key: voice handle & 0xffffff (rack_slot<<8 | voice_id)
 
@@ -1023,6 +1049,15 @@ void ngs2_apply_voice_params(uint64_t handle, uint64_t list) {
         if (head.id == kNgs2ParamWaveformFormat) {
             uint32_t fmt[3] = {};   // { waveform_type, channels, sample_rate }
             if (audio_read_bytes(p + 8, fmt, sizeof(fmt))) {
+                // A waveform-format param starts a NEW sound on this voice: the guest reuses a small pool
+                // of voices, reformatting one each time it (re)triggers a click/SFX, and streams a fresh
+                // track's blocks after re-formatting the music voice. Reset the stream state so the new
+                // sound plays from the start instead of queueing behind the previous sound's leftover
+                // blocks and stale clock (that pile-up is the "buffer mess" on the second click).
+                v.blocks.clear();
+                v.cursor = 0.0;
+                v.played_samples = 0;
+                v.t0_ns = 0;
                 v.wtype = fmt[0];
                 if (fmt[1] >= 1 && fmt[1] <= 8)          v.channels = fmt[1];
                 if (fmt[2] >= 8000 && fmt[2] <= 192000)  v.rate     = fmt[2];
@@ -1047,11 +1082,12 @@ void ngs2_apply_voice_params(uint64_t handle, uint64_t list) {
         } else if (head.id == kNgs2ParamWaveformBlock) {
             uint64_t ptr = 0;
             if (audio_read_bytes(p + 8, &ptr, 8) && ptr >= 0x200000000ull) {
-                v.data_ptr     = ptr;  // (re)point at a fresh PCM block
-                v.cursor       = 0.0;
-                v.playing      = true; // a fresh waveform starts playing
+                // Enqueue the block for in-order playback (bounded so a runaway feed can't grow it
+                // without limit). The mixer plays through the queue one block at a time.
+                if (v.blocks.size() < 64) v.blocks.push_back(ptr);
+                v.data_ptr     = ptr;  // last fed block (FEED trace / diagnostics)
+                v.playing      = true; // streaming
                 v.idle         = 0;    // fed this render -> not idle
-                v.played_audio = false;// new sound: re-arm one-shot completion detection
                 if (getenv("PROSPER_NGS2_TRACE")) {
                     int16_t probe[64] = {}; size_t g = audio_read_bytes_partial(ptr, probe, sizeof probe);
                     int pk = 0; for (size_t j = 0; j < g / 2; j++) { int a = probe[j] < 0 ? -probe[j] : probe[j]; if (a > pk) pk = a; }
@@ -1059,11 +1095,74 @@ void ngs2_apply_voice_params(uint64_t handle, uint64_t list) {
                             (unsigned long long)handle, (unsigned long long)ptr, g, pk, v.channels, v.rate);
                 }
             }
+        } else if (head.id == kNgs2ParamVoiceCallback) {
+            // Ngs2VoiceCallbackParam: header(8), callback fn(8), callback_data(8), flags(4), reserved(4).
+            // The guest registers a per-voice waveform-block completion handler here; NGS2 invokes it as
+            // each fed block finishes so the guest queues the next (see ngs2_fire_pending_callbacks).
+            uint64_t fn = 0, data = 0; uint32_t fl = 0;
+            audio_read_bytes(p + 8,  &fn,   8);
+            audio_read_bytes(p + 16, &data, 8);
+            audio_read_bytes(p + 24, &fl,   4);
+            v.cb_fn = fn; v.cb_data = data; v.cb_flags = fl;
+            if (getenv("PROSPER_NGS2_TRACE"))
+                fprintf(stderr, "[ngs2] CALLBACK voice=0x%llx fn=0x%llx data=0x%llx flags=0x%x\n",
+                        (unsigned long long)handle, (unsigned long long)fn, (unsigned long long)data, fl);
         }
         if (head.next == 0) break;
         p += (uint64_t)head.next;
     }
 }
+
+// --- NGS2 waveform-block completion callbacks --------------------------------------------------
+// A streaming guest (Dead Cells) registers a per-voice callback (voice param 0x0007) and expects
+// NGS2 to invoke it as each fed waveform block finishes, so it can queue the next block. Without it
+// the stream stalls after the initial ring fill and no music is ever produced. The registered handler
+// is GUEST code; recovered from Dead Cells' handler at eboot+0x1740f50 it reads a
+// SceNgs2VoiceCallbackInfo*:
+//     +0x00 : callbackData  (the game's per-stream context pointer we were handed at registration)
+//     +0x10 : event flags   (bit0 = "waveform block consumed"; the handler no-ops if it is clear)
+//     +0x18 : a pointer whose byte +0x48 must be non-zero for the handler to run its state update
+// The handler then re-enters sceNgs2VoiceGetState and reads num_decoded_samples (state+0x10) to
+// advance its stream clock. So the callback must run (a) with the caller's guest %fs restored (its
+// nested imports resolve through the guest TCB) and (b) OUTSIDE g_ngs2_mx (it re-enters our HLE).
+namespace {
+struct Ngs2PendingCallback { uint64_t fn, data; uint32_t flags; };
+// Populated (under g_ngs2_mx) while mixing, drained after the lock drops on the same SystemRender
+// (guest) thread. Thread-local: each guest audio thread renders and fires its own system's voices.
+thread_local std::vector<Ngs2PendingCallback> t_ngs2_pending_cb;
+thread_local uint64_t t_ngs2_render_guest_fs = 0;  // caller's guest %fs, captured at SystemRender entry
+
+// Firing a guest callback needs the FSGSBASE swap and the SystemRender entry trampoline, both of which
+// only exist on the Linux guest-execution path (the trampoline is registered under the same guard). On
+// other platforms the callbacks are simply not fired (music streaming is a Linux capability for now), so
+// nothing here — including the queuing in ngs2_mix_voices — is compiled elsewhere.
+#if defined(__linux__)
+inline uint64_t ngs2_rd_fsbase() { uint64_t v; __asm__ volatile("rdfsbase %0" : "=r"(v)); return v; }
+inline void     ngs2_wr_fsbase(uint64_t v) { __asm__ volatile("wrfsbase %0" : : "r"(v)); }
+
+void ngs2_fire_pending_callbacks() {
+    if (t_ngs2_pending_cb.empty()) return;
+    std::vector<Ngs2PendingCallback> pend;
+    pend.swap(t_ngs2_pending_cb);
+    const uint64_t guest_fs = t_ngs2_render_guest_fs;
+    uint64_t host_fs = 0; bool swapped = false;
+    if (guest_fs) { host_fs = ngs2_rd_fsbase(); ngs2_wr_fsbase(guest_fs); swapped = true; }
+    for (const auto& cb : pend) {
+        if (!cb.fn) continue;
+        // Minimal, valid SceNgs2VoiceCallbackInfo on the host stack (guest code reads it directly; the
+        // guest runs in-process so a host address is a valid guest pointer). obj carries the +0x48
+        // "active" byte the handler checks via eboot+0x173f490.
+        alignas(16) uint8_t obj[0x50] = {}; obj[0x48] = 1;
+        alignas(16) uint8_t info[0x40] = {};
+        *(uint64_t*)(info + 0x00) = cb.data;          // callbackData -> game stream context
+        *(uint32_t*)(info + 0x10) = cb.flags | 1u;    // event flags, bit0 (block-consumed) set
+        *(uint64_t*)(info + 0x18) = (uint64_t)(uintptr_t)obj;
+        ((void (*)(uint64_t))(uintptr_t)cb.fn)((uint64_t)(uintptr_t)info);
+    }
+    if (swapped) ngs2_wr_fsbase(host_fs);
+}
+#endif
+} // namespace
 
 // Mix all playing voices of `system` into one render buffer of `frames` interleaved frames at
 // `out_rate`/`out_channels`, accumulating float samples into `mix` (size frames*out_channels).
@@ -1078,23 +1177,30 @@ void ngs2_mix_voices(uint64_t system, float* mix, uint32_t frames, uint32_t out_
     // cursor = most recently (re)triggered); older duplicates at that buffer are skipped this pass.
     // CONFIDENCE: MED — a pragmatic proxy for real voice lifecycle; identical-buffer voices are truly
     // redundant into a mono/stereo bus, so this cannot drop a distinct sound.
-    std::map<uint64_t, double> freshest;   // data_ptr -> min cursor among playing voices
+    // A streamed waveform block is one grain of frames (the guest feeds one block per grain), so the
+    // retire boundary and the per-block read length both track num_grain_samples rather than a constant.
+    // For Dead Cells (grain 4096) this is the validated value; a title with a different grain retires and
+    // fires its completion callback at the correct rate instead of ~grain/4096x off.
+    const uint64_t kBlockFrames = g_ngs2_grain ? g_ngs2_grain : 4096;
+    const uint64_t now_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::set<uint64_t> rendered_front;         // render each distinct front block once (pool reuse across voices)
     for (auto& [key, v] : g_ngs2_voices) {
-        if (v.playing && v.data_ptr && v.wtype == kNgs2WaveformTypePcmS16) {
-            auto it = freshest.find(v.data_ptr);
-            if (it == freshest.end() || v.cursor < it->second) freshest[v.data_ptr] = v.cursor;
+        if (!v.playing) continue;
+        if (v.blocks.empty()) {
+            // Not fed this render. A callback (streaming) voice is re-fed by its block-completion callback,
+            // so it may sit briefly between feeds; give it a much longer idle window than a one-shot before
+            // expiring (a genuinely dead stream still stops, just later). HOLD the playback clock across the
+            // gap by rebasing t0 so (now - t0)*rate == played_samples: the pause neither advances nor
+            // rewinds the stream position, and playback resumes seamlessly. (Zeroing t0 here instead would,
+            // on resume, make target=0 << played_samples and clamp advance to 0 for played_samples/rate
+            // seconds — a multi-second freeze whenever the queue momentarily drains.)
+            if (v.rate) v.t0_ns = now_ns - (uint64_t)((double)v.played_samples / (double)v.rate * 1e9);
+            const int idle_max = v.cb_fn ? 240 : kNgs2VoiceIdleRendersMax;
+            if (++v.idle > idle_max) v.playing = false;
+            continue;
         }
-    }
-    std::set<uint64_t> rendered_ptr;       // buffers already rendered this pass (exactly one voice each)
-    for (auto& [key, v] : g_ngs2_voices) {
-        if (!v.playing || !v.data_ptr) continue;
-        // A voice that stops being re-fed has ended; expiring it bounds accumulation of stale
-        // voice-pool handles (which otherwise read a reused/persistent buffer forever and pile up).
-        if (++v.idle > kNgs2VoiceIdleRendersMax) { v.playing = false; continue; }
-        // Render each distinct buffer once: skip unless this voice is the freshest (min cursor) for its
-        // buffer and that buffer has not been rendered yet this pass (breaks freshest-cursor ties).
-        { auto it = freshest.find(v.data_ptr);
-          if (it != freshest.end() && (v.cursor > it->second || !rendered_ptr.insert(v.data_ptr).second)) continue; }
+        v.idle = 0;
         if (v.wtype != kNgs2WaveformTypePcmS16) {           // only S16 PCM implemented (ATRAC9 deferred)
             if (getenv("PROSPER_NGS2_TRACE")) {
                 static uint32_t skipped = 0;
@@ -1103,33 +1209,29 @@ void ngs2_mix_voices(uint64_t system, float* mix, uint32_t frames, uint32_t out_
             }
             continue;
         }
+        if (!rendered_front.insert(v.blocks.front()).second) continue;  // duplicate front block this pass
+
         const double step = (double)v.rate / (double)(out_rate ? out_rate : 48000);
         const uint32_t src_ch = v.channels ? v.channels : 2;
-        // Source frames this render touches: [floor(cursor), cursor + frames*step] + 1 for interp.
-        const uint64_t first = (uint64_t)v.cursor;
-        const uint64_t last  = (uint64_t)(v.cursor + (double)frames * step) + 2;
-        const uint64_t need_frames = last > first ? last - first : 1;
-        if (need_frames > (1u << 20)) { v.playing = false; continue; }
-        // Best-effort read: the guest may keep only part of the block mapped/valid, so accept a PARTIAL
-        // read and mix exactly the frames that came back. Demanding the whole span (all-or-nothing) made
-        // any voice whose valid PCM is shorter than one render fail outright and go silent.
-        std::vector<int16_t> src(need_frames * src_ch, 0);
-        const size_t got = audio_read_bytes_partial(v.data_ptr + first * src_ch * 2,
-                                                    src.data(), src.size() * 2);
-        const uint64_t have_frames = got / ((uint64_t)src_ch * 2);
-        if (have_frames == 0) { v.playing = false; continue; }   // nothing valid -> block ended
-        // One-shot completion: a sampler voice that has played some audio and now reads only silence
-        // has finished. Stop it so sceNgs2VoiceGetStateFlags reports it EMPTY and the game recycles the
-        // pool voice — otherwise finished-but-still-mapped voices read as "playing", the 16-voice pool
-        // fills with phantom-busy handles, and the game overlaps reuse into a persistent comb/doubling.
-        { bool any = false;
-          for (uint64_t j = 0; j < have_frames * src_ch; j++) if (src[j]) { any = true; break; }
-          if (any) v.played_audio = true;
-          else if (v.played_audio) { v.playing = false; continue; } }
+        // Gather the source frames this render needs by reading whole blocks in queue order. Reading one
+        // block at a time (never a single span across two pool buffers) is what stops the mixer sampling
+        // an unrelated neighbouring block. cursor is the fractional read position within blocks.front().
+        const uint64_t need_frames = (uint64_t)(v.cursor + (double)frames * step) + 2;
+        std::vector<int16_t> src;
+        src.reserve((size_t)std::min<uint64_t>(need_frames, 1u << 20) * src_ch);
+        for (size_t bi = 0; bi < v.blocks.size() && src.size() < need_frames * src_ch; ++bi) {
+            std::vector<int16_t> blk((size_t)kBlockFrames * src_ch, 0);
+            const size_t got = audio_read_bytes_partial(v.blocks[bi], blk.data(), blk.size() * 2);
+            const size_t bf  = got / ((size_t)src_ch * 2);   // valid frames in this block
+            src.insert(src.end(), blk.begin(), blk.begin() + bf * src_ch);
+            if (bf < kBlockFrames) break;                    // short/unmapped block -> stream truncated
+        }
+        const uint64_t have_frames = src.size() / src_ch;
+        if (have_frames == 0) { v.blocks.clear(); v.playing = false; continue; }
         for (uint32_t f = 0; f < frames; ++f) {
             const double sp = v.cursor + (double)f * step;
-            const uint64_t i0 = (uint64_t)sp - first;
-            const double frac = sp - (double)((uint64_t)sp);
+            const uint64_t i0 = (uint64_t)sp;
+            const double frac = sp - (double)i0;
             bool ran_out = false;
             for (uint32_t oc = 0; oc < out_channels; ++oc) {
                 // Channel routing. SURROUND-LIMITATION: prosper targets a 2-channel (front L/R) bus,
@@ -1146,7 +1248,28 @@ void ngs2_mix_voices(uint64_t system, float* mix, uint32_t frames, uint32_t out_
             }
             if (ran_out) break;   // consumed all valid source this render
         }
-        v.cursor += (double)frames * step;
+        // Advance the read cursor by WALL-CLOCK real time, not by frames*step. The guest over-calls
+        // SystemRender (measured ~4x real time) while its decoder feeds blocks at real time; advancing by
+        // frames*step every call would drain the queue ~4x faster than it is filled (the rhythmic under-
+        // run). Pacing to real time makes consumption match the real-time feed, so the queue holds its
+        // depth. The full frames*step window is still MIXED from the cursor each call — the guest double-
+        // buffers and outputs one render per real-time grain — but the cursor only moves by elapsed time.
+        if (v.t0_ns == 0) { v.t0_ns = now_ns; }
+        const double target = (double)(now_ns - v.t0_ns) * 1e-9 * (double)v.rate;
+        double advance = target - (double)v.played_samples;
+        if (advance < 0.0) advance = 0.0;
+        if (advance > (double)frames * step) advance = (double)frames * step;  // at most one grain/call
+        v.cursor += advance;
+        v.played_samples += (uint64_t)advance;
+        // Retire fully-consumed blocks; each completed block fires the guest's block-completion callback
+        // so it queues the next one. Fired after the lock drops (see ngs2_fire_pending_callbacks).
+        while (v.cursor >= (double)kBlockFrames && !v.blocks.empty()) {
+            v.blocks.pop_front();
+            v.cursor -= (double)kBlockFrames;
+#if defined(__linux__)
+            if (v.cb_fn) t_ngs2_pending_cb.push_back({v.cb_fn, v.cb_data, v.cb_flags});
+#endif
+        }
     }
 }
 
@@ -1205,6 +1328,11 @@ HLE(ngs2_system_query_buffer) {
 
 HLE(ngs2_system_create) {
     NGS2_LOG("sceNgs2SystemCreate");
+    // a0 = const SceNgs2SystemOption* (optional). num_grain_samples is at +0x70 (size@0, name[64]@8,
+    // job_scheduler_options[4]@0x48, flags@0x68, max_grain_samples@0x6c, num_grain_samples@0x70). Honour
+    // it when present and sane, else keep the streaming-safe default. Dead Cells passes a0 == null.
+    // CONFIDENCE: MED — offset from the published SceNgs2SystemOption layout; not yet seen non-null live.
+    if (a0) { uint32_t g = 0; if (audio_read_bytes(a0 + 0x70, &g, 4) && g >= 64 && g <= 8192) g_ngs2_grain = g; }
     if (!a1 || !a2) return kNgs2ErrInvalidOut;
     std::lock_guard<std::mutex> lock(g_ngs2_mx);
     for (uint64_t i = 0; i < 4; ++i) {
@@ -1306,9 +1434,24 @@ HLE(ngs2_voice_run_commands) {
 HLE(ngs2_voice_get_state) {
     NGS2_LOG("sceNgs2VoiceGetState");
     if ((a0 & kNgs2VoiceMask) != kNgs2VoiceTag) return kNgs2ErrInvalidVoice;
-    // An inert backend has no active decoder: zero stateFlags means Empty. Dead Cells requests the
-    // sampler extension, so clear the caller-declared payload as Kyty does before filling it.
     if (!a1 || !a2 || a2 > 0x1000 || !a2_store_zeros(a1, (size_t)a2)) return kNgs2ErrInvalidOut;
+    // SceNgs2SamplerVoiceState (0x30): state_flags@0x00, envelope_height@0x04(f), peak_height@0x08(f),
+    // reserved@0x0c, num_decoded_samples@0x10(u64), decoded_data_size@0x18(u64), user_data@0x20,
+    // waveform_data@0x28. The block-completion callback re-enters here and reads num_decoded_samples to
+    // advance its stream clock, so it must reflect real playback progress or the stream never advances.
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    auto it = g_ngs2_voices.find((uint32_t)(a0 & 0xffffff));
+    const bool playing = it != g_ngs2_voices.end() && it->second.playing && it->second.data_ptr;
+    a2_store_u32(a1, playing ? 0x3u : 0u);          // state_flags: Playing / Empty
+    if (a2 >= 0x30) {
+        a2_store_u32(a1 + 0x04, 0x3f800000u);       // envelope_height = 1.0f
+        if (it != g_ngs2_voices.end()) {
+            const uint64_t decoded = it->second.played_samples;
+            const uint32_t ch = it->second.channels ? it->second.channels : 2;
+            a2_store_u64(a1 + 0x10, decoded);        // num_decoded_samples (per-channel frames)
+            a2_store_u64(a1 + 0x18, decoded * ch * 2); // decoded_data_size (bytes, s16)
+        }
+    }
     return 0;
 }
 
@@ -1380,7 +1523,11 @@ HLE(ngs2_system_render) {
         const bool     out_s16      = info.waveform_type == kNgs2WaveformTypePcmS16;
         const uint32_t out_channels = (info.channels >= 1 && info.channels <= 8) ? info.channels : 2;
         const uint32_t out_bps      = out_s16 ? 2 : 4;
-        const uint32_t frames       = (uint32_t)(info.size / ((uint64_t)out_channels * out_bps));
+        uint32_t       frames       = (uint32_t)(info.size / ((uint64_t)out_channels * out_bps));
+        // Fill only num_grain_samples frames of an oversized buffer (see g_ngs2_grain); the rest stays
+        // zeroed. Filling the whole capacity makes a streaming voice's read cursor race ahead of the
+        // guest's block queue and produce the rhythmic underrun.
+        if (g_ngs2_grain && frames > g_ngs2_grain) frames = g_ngs2_grain;
 
         if (ngs2_mix_disabled() || frames == 0) {
             if (!ngs2_zero_bytes(info.buffer, (size_t)info.size)) return kNgs2ErrInvalidOut;
@@ -1415,6 +1562,25 @@ HLE(ngs2_system_render) {
     }
     return 0;
 }
+
+// SystemRender fires guest waveform-block callbacks (queued during mixing). Guest code must run with
+// the caller's guest %fs, recovered from the import-stub frame via the shared entry trampoline (it
+// forwards entry %rsp as a 7th argument), and after mixing has released g_ngs2_mx. Non-Linux platforms
+// register the plain handler; their guest-callback dispatch would need prosper_call_guest_sysv instead.
+#if defined(__linux__)
+extern "C" uint64_t ngs2_system_render_c(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                         uint64_t a4, uint64_t a5, uint64_t entry_rsp);
+PROSPER_ASM_TRAMPOLINE(ngs2_system_render_entry, ngs2_system_render_c)
+extern "C" void ngs2_system_render_entry();
+extern "C" uint64_t ngs2_system_render_c(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                         uint64_t a4, uint64_t a5, uint64_t entry_rsp) {
+    t_ngs2_render_guest_fs = prosper::callback_guest_fs_from_entry_stack(entry_rsp);
+    const uint64_t r = ngs2_system_render(a0, a1, a2, a3, a4, a5);
+    ngs2_fire_pending_callbacks();
+    t_ngs2_render_guest_fs = 0;
+    return r;
+}
+#endif
 
 HLE(ngs2_geom_reset_listener) {
     NGS2_LOG("sceNgs2GeomResetListenerParam");
@@ -1490,7 +1656,13 @@ void register_audio_hle() {
     Hle::register_fn("lCqD7oycmIM", ngs2_rack_destroy, "sceNgs2RackDestroy");
     Hle::register_fn("eF8yRCC6W64", ngs2_geom_apply, "sceNgs2GeomApply");
     Hle::register_fn("0lbbayqDNoE", ngs2_geom_reset_source, "sceNgs2GeomResetSourceParam");
+#if defined(__linux__)
+    // The trampoline forwards entry %rsp so the handler can recover the caller's guest %fs and fire
+    // waveform-block completion callbacks (guest code) after mixing. See ngs2_system_render_c.
+    Hle::register_fn("i0VnXM-C9fc", (HleFn)ngs2_system_render_entry, "sceNgs2SystemRender");
+#else
     Hle::register_fn("i0VnXM-C9fc", ngs2_system_render, "sceNgs2SystemRender");
+#endif
     Hle::register_fn("7Lcfo8SmpsU", ngs2_geom_reset_listener, "sceNgs2GeomResetListenerParam");
     Hle::register_fn("1WsleK-MTkE", ngs2_geom_calc_listener, "sceNgs2GeomCalcListener");
     #undef R

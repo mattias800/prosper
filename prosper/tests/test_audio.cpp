@@ -286,9 +286,17 @@ int main() {
     CHECK((int32_t)call_raw("MwmHz8pAdAo", rack, 2, PTR(&invalid_voice)) == (int32_t)0x804A0302);
     CHECK(invalid_voice == 0xDEADBEEFDEADBEEFull);
 
+    // sceNgs2VoiceGetState fills SceNgs2SamplerVoiceState: state_flags@0x00 (Empty for an un-fed voice),
+    // envelope_height@0x04 = 1.0f, and num_decoded_samples@0x10 / decoded_data_size@0x18 = 0 (no
+    // playback yet). A streaming guest reads num_decoded_samples from here to pace its feed loop.
     uint8_t voice_state[0x30]; memset(voice_state, 0xCC, sizeof voice_state);
     CHECK(call_raw("-TOuuAQ-buE", voice, PTR(voice_state), sizeof voice_state) == 0);
-    for (uint8_t b : voice_state) CHECK(b == 0);           // inert voice = Empty
+    CHECK(*(uint32_t*)(voice_state + 0x00) == 0);          // state_flags = Empty (never fed)
+    CHECK(*(float*)(voice_state + 0x04) == 1.0f);          // envelope_height = unity
+    CHECK(*(uint64_t*)(voice_state + 0x10) == 0);          // num_decoded_samples = 0
+    CHECK(*(uint64_t*)(voice_state + 0x18) == 0);          // decoded_data_size  = 0
+    for (int i = 0x08; i < 0x10; i++) CHECK(voice_state[i] == 0);   // peak_height + reserved cleared
+    for (int i = 0x20; i < 0x30; i++) CHECK(voice_state[i] == 0);   // user_data + waveform_data cleared
 
     uint8_t ngs_pcm[256]; memset(ngs_pcm, 0xA5, sizeof ngs_pcm);
     RenderInfo render{PTR(ngs_pcm), sizeof ngs_pcm, 0, 2};
