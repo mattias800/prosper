@@ -25,6 +25,19 @@ int main() {
     printf("== test_texture_sample_render ==\n");
     const uint32_t W = 64, H = 64;
 
+    {
+        bool speculative_state_valid = true;
+        bool retained_resources_released = false;
+        prosper::test::BackendSubmissionBatch discarded_batch;
+        discarded_batch.enqueue(VK_NULL_HANDLE);
+        discarded_batch.add_failure_cleanup([&]() { speculative_state_valid = false; });
+        discarded_batch.add_cleanup([&]() { retained_resources_released = true; });
+        discarded_batch.discard();
+        discarded_batch.complete();
+        CHECK(!discarded_batch.pending() && !speculative_state_valid && retained_resources_released,
+              "discarded submission batch invalidates speculative state before cleanup");
+    }
+
     // Fullscreen-triangle VS (from gl_VertexIndex; no resource table needed).
     const uint32_t vs[] = {
         0x36020081u, 0x2C040081u, 0x7E020D01u, 0x7E040D02u, 0x7E0A02F6u, 0x7E0C02F2u, 0x10020B01u,

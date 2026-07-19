@@ -489,6 +489,7 @@ public:
         if (!commands_.empty()) {
             const RenderVkCtx& ctx = render_vk_ctx();
             if (ctx.ok) (void)submit_and_wait(ctx.dev, ctx.queue, false);
+            else discard();
         }
         if (commands_.empty()) complete();
     }
@@ -501,6 +502,18 @@ public:
 
     void add_cleanup(std::function<void()> cleanup) {
         cleanups_.push_back(std::move(cleanup));
+    }
+
+    // Persistent attachment state is updated speculatively so later command buffers in the same
+    // ordered batch can LOAD/sample earlier results. If the batch cannot be submitted and completed,
+    // every touched entry must be invalidated before its retained resources are released.
+    void add_failure_cleanup(std::function<void()> cleanup) {
+        failure_cleanups_.push_back(std::move(cleanup));
+    }
+
+    void discard() {
+        commands_.clear();
+        finish_persistent_state(false);
     }
 
     BackendSubmissionBatchResult submit_and_wait(VkDevice dev, VkQueue queue,
@@ -516,7 +529,7 @@ public:
         VkFence fence = VK_NULL_HANDLE;
         if (vkCreateFence(dev, &fence_info, nullptr, &fence) != VK_SUCCESS || !fence) {
             result.submit_result = VK_ERROR_INITIALIZATION_FAILED;
-            commands_.clear();
+            discard();
             return result;
         }
         if (backend_trace) {
@@ -547,6 +560,8 @@ public:
         }
         vkDestroyFence(dev, fence, nullptr);
         commands_.clear();
+        finish_persistent_state(result.submit_result == VK_SUCCESS &&
+                                result.wait_result == VK_SUCCESS);
         return result;
     }
 
@@ -556,8 +571,17 @@ public:
     }
 
 private:
+    void finish_persistent_state(bool completed) {
+        if (!completed)
+            for (auto cleanup = failure_cleanups_.rbegin();
+                 cleanup != failure_cleanups_.rend(); ++cleanup)
+                (*cleanup)();
+        failure_cleanups_.clear();
+    }
+
     std::vector<VkCommandBuffer> commands_;
     std::vector<std::function<void()>> cleanups_;
+    std::vector<std::function<void()>> failure_cleanups_;
 };
 
 struct PersistentColorTargetKey {
@@ -3233,6 +3257,23 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
 
     const auto timing_recorded = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     active_submission.enqueue(cmd);
+    if (cached_ds) {
+        active_submission.add_failure_cleanup([cached_ds]() {
+            cached_ds->layout_initialized = false;
+            cached_ds->depth_valid = false;
+            cached_ds->stencil_valid = false;
+        });
+        cached_ds->layout_initialized = true;
+        cached_ds->depth_valid |= use_depth && depth_used_meaningfully;
+        cached_ds->stencil_valid |= use_stencil;
+    }
+    if (cached_color) {
+        active_submission.add_failure_cleanup([cached_color]() {
+            cached_color->valid = false;
+        });
+        cached_color->valid = true;
+        cached_color->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
     const bool flush_now = !submission_batch || readback_requested || flush_submission_batch;
     BackendSubmissionBatchResult batch_result;
     if (flush_now)
@@ -3240,17 +3281,6 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     const auto timing_gpu_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     const bool batch_completed = !flush_now ||
         (batch_result.submit_result == VK_SUCCESS && batch_result.wait_result == VK_SUCCESS);
-    if (cached_ds && batch_completed) {
-        cached_ds->layout_initialized = true;
-        cached_ds->depth_valid |= use_depth && depth_used_meaningfully;
-        cached_ds->stencil_valid |= use_stencil;
-    }
-    if (cached_color && batch_completed) {
-        cached_color->valid = true;
-        cached_color->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    } else if (cached_color) {
-        cached_color->valid = false;
-    }
 
     if (readback_requested && batch_completed) {
         void* mp = nullptr; vkMapMemory(dev, bmem, 0, readback_bytes, 0, &mp);
