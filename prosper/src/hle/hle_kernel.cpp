@@ -993,6 +993,30 @@ bool prepare_guest_windows_stack(ULONG_PTR* out_low, ULONG_PTR* out_high) {
     return true;
 }
 
+#ifdef _WIN32
+// #997: a guest worker thread that calls scePthreadExit must NOT reach host pthread_exit — winpthreads'
+// pthread_exit unwinds (RtlUnwind) back through the hand-written prosper_call_guest_* bridge and the
+// guest frames, none of which carry x64 .pdata unwind info, so RtlUnwind fails and RtlRaiseStatus
+// (STATUS_UNSUCCESSFUL) terminates the whole PROCESS kernel-side — no catchable user-mode exception,
+// exit ~0xC00000FF, first observed as DOLL's ~4s death when its first "TAsync" async-loader worker
+// exits. Escape back to win_thread_trampoline via __builtin_longjmp instead (a plain SP/register
+// restore, no SEH unwind — the same technique exec_image_win.cpp's t_jb uses for guest faults), and
+// let the trampoline run the ordinary cleanup + winpthreads exit, exactly like a normal-return worker.
+static thread_local void*    t_thread_exit_jb[5];
+static thread_local int      t_thread_exit_armed = 0;
+static thread_local uint64_t t_thread_exit_rv = 0;
+static thread_local void*    t_saved_teb_base = nullptr;
+static thread_local void*    t_saved_teb_limit = nullptr;
+static thread_local int      t_teb_swapped = 0;
+// True while the current thread is inside a win_thread_trampoline guest call with the longjmp armed.
+bool win_thread_exit_armed() { return t_thread_exit_armed != 0; }
+[[noreturn]] void win_thread_exit_longjmp(uint64_t rv) {
+    t_thread_exit_rv = rv;
+    t_thread_exit_armed = 0;
+    __builtin_longjmp(t_thread_exit_jb, 1);
+}
+#endif
+
 void* win_thread_trampoline(void* p) {
     auto* ts = (WinThreadStart*)p;
     while (!ts->name_published.load(std::memory_order_acquire)) std::this_thread::yield();
@@ -1027,16 +1051,33 @@ void* win_thread_trampoline(void* p) {
     guest_tls_activate_thread();   // this worker's guest %fs TCB (FSGSBASE); no-op if the gate is off
     void* rv = nullptr;
     if (entry) {
-        if (guest_stack) {
-            NT_TIB* tib = (NT_TIB*)NtCurrentTeb();
-            void* saved_base = tib->StackBase; void* saved_limit = tib->StackLimit;
-            tib->StackLimit = guest_stack;
-            tib->StackBase = (void*)((uintptr_t)guest_stack + guest_stack_size);
-            rv = (void*)(uintptr_t)prosper_call_guest_on_stack(
-                (uintptr_t)guest_stack + guest_stack_size, entry, (uint64_t)(uintptr_t)arg, 0);
-            tib->StackLimit = saved_limit; tib->StackBase = saved_base;
+        // Arm the scePthreadExit escape (see win_thread_exit_longjmp / #997). __builtin_setjmp returns
+        // 0 on the direct path and non-zero when k_pthread_exit longjmps back here.
+        if (__builtin_setjmp(t_thread_exit_jb) == 0) {
+            t_thread_exit_armed = 1;
+            if (guest_stack) {
+                NT_TIB* tib = (NT_TIB*)NtCurrentTeb();
+                t_saved_teb_base = tib->StackBase; t_saved_teb_limit = tib->StackLimit;
+                t_teb_swapped = 1;
+                tib->StackLimit = guest_stack;
+                tib->StackBase = (void*)((uintptr_t)guest_stack + guest_stack_size);
+                rv = (void*)(uintptr_t)prosper_call_guest_on_stack(
+                    (uintptr_t)guest_stack + guest_stack_size, entry, (uint64_t)(uintptr_t)arg, 0);
+                tib->StackLimit = t_saved_teb_limit; tib->StackBase = t_saved_teb_base;
+                t_teb_swapped = 0;
+            } else {
+                rv = (void*)(uintptr_t)prosper_call_guest_sysv(entry, (uint64_t)(uintptr_t)arg, 0);
+            }
+            t_thread_exit_armed = 0;
         } else {
-            rv = (void*)(uintptr_t)prosper_call_guest_sysv(entry, (uint64_t)(uintptr_t)arg, 0);
+            // Returned via scePthreadExit's __builtin_longjmp: recover the exit value and undo any TEB
+            // stack swap the guest_stack path left in place (the longjmp skipped its inline restore).
+            rv = (void*)(uintptr_t)t_thread_exit_rv;
+            if (t_teb_swapped) {
+                NT_TIB* tib = (NT_TIB*)NtCurrentTeb();
+                tib->StackBase = t_saved_teb_base; tib->StackLimit = t_saved_teb_limit;
+                t_teb_swapped = 0;
+            }
         }
     }
     tls_dtv_purge_current_thread();
@@ -1154,6 +1195,16 @@ HLE(k_pthread_exit)   {
     // thread-exit path: purge the exiting thread's __tls_get_addr DTV first (#68) and drop its stack
     // registration (#138 — pthread ids recycle). HLE handlers run under the HOST %fs (the import
     // stubs swap), so the host libc below is safe. No-op for threads that never touched either.
+#ifdef _WIN32
+    // #997: for a guest WORKER thread (entered through win_thread_trampoline), escape back to the
+    // trampoline via __builtin_longjmp rather than host pthread_exit, whose SEH unwind through the
+    // un-unwindable guest / prosper_call_guest_* frames raises RtlRaiseStatus and kills the process.
+    // The trampoline then runs the single normal-exit cleanup path. The main guest thread is not
+    // armed (it never runs through win_thread_trampoline), so it keeps the pthread_exit fallback.
+    if (win_thread_exit_armed()) {
+        win_thread_exit_longjmp(a0);   // does not return
+    }
+#endif
     tls_dtv_purge_current_thread();
     retire_guest_thread_name((uint64_t)(uintptr_t)pthread_self(), 0);
 #if defined(__linux__) || defined(__APPLE__)
