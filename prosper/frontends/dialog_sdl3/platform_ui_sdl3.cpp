@@ -5,6 +5,7 @@
 // modal), records the result, and reports FINISHED; the next poll returns it.
 #include "dialog_sdl3.hpp"
 #include "dialog_helpers.hpp"
+#include "hle/dispatch.hpp"
 #include "hle/platform_ui.hpp"
 #include <SDL3/SDL.h>
 #include <algorithm>
@@ -99,7 +100,9 @@ int run_savedata_modal(const SaveDataRequest& req, Active&& active) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_EVENT_QUIT) {
+                SDL_PushEvent(&ev);
                 done = true;
+                break;
             } else if (ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
                        ev.window.windowID != window_id) {
                 // The app window is no longer SDL's last window while this modal exists. Preserve
@@ -108,6 +111,7 @@ int run_savedata_modal(const SaveDataRequest& req, Active&& active) {
                 quit.type = SDL_EVENT_QUIT;
                 SDL_PushEvent(&quit);
                 done = true;
+                break;
             } else if (ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
                        ev.window.windowID == window_id && req.cancelable) {
                 done = true;
@@ -195,13 +199,16 @@ int run_savedata_list(const SaveDataRequest& req, Active&& active) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_EVENT_QUIT) {
+                SDL_PushEvent(&ev);
                 done = true;
+                break;
             } else if (ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
                        ev.window.windowID != window_id) {
                 SDL_Event quit{};
                 quit.type = SDL_EVENT_QUIT;
                 SDL_PushEvent(&quit);
                 done = true;
+                break;
             } else if (ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
                        ev.window.windowID == window_id && req.cancelable) {
                 done = true;
@@ -320,7 +327,7 @@ struct SdlPlatformUi : PlatformUi {
     uint64_t save_progress_generation = 0;
 
     bool saveDataDialogOpen(uint64_t param) override {
-        SaveDataRequest request = read_savedata_request(param);
+        SaveDataRequest request = read_savedata_request(param, savedata0_dir_mtime);
         if (!request.supported) return false;
         save_state.open(std::move(request));
         return true;

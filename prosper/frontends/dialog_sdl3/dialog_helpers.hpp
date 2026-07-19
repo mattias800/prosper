@@ -122,10 +122,14 @@ private:
     uint64_t pending_generation_ = 0;
 };
 
+using SaveDataSlotTimeLookup = bool (*)(const std::string& dirName, int64_t& modified);
+
 // Parse supported modes into an owned request safe to retain until the SDL main-thread pump runs.
 // LIST retains only guest-provided virtual directory names/new-item text; no host path is exposed.
 // USER_MSG, ordinary SYSTEM_MSG confirmations/notices, ERROR_CODE, and PROGRESS_BAR are also supported.
-SaveDataRequest read_savedata_request(uint64_t param);
+// Date-based LIST focus uses the optional virtual-slot metadata lookup and declines when no dated
+// guest slot can be resolved instead of substituting positional focus.
+SaveDataRequest read_savedata_request(uint64_t param, SaveDataSlotTimeLookup slotTime = nullptr);
 
 // Write fields owned by the service: mode/result/buttonId/userData and, for LIST, the selected virtual
 // directory through the caller-provided dirName pointer. The param output pointer, ABI pad, and all

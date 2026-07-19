@@ -540,6 +540,27 @@ std::vector<std::string> savedata0_list_dirs() {
     return out;
 }
 
+bool savedata0_dir_mtime(const std::string& dirname, int64_t& modified) {
+    modified = 0;
+    if (dirname.empty() || dirname == "." || dirname == ".." ||
+        dirname.find('/') != std::string::npos || dirname.find('\\') != std::string::npos)
+        return false;
+    const std::string dir = save0_base() + "/" + dirname;
+    const std::string param = dir + "/sce_sys/param.sfo";
+#ifdef _WIN32
+    struct _stat64 st{};
+    if (_stat64(param.c_str(), &st) != 0 && _stat64(dir.c_str(), &st) != 0) return false;
+    if (!(st.st_mode & _S_IFREG) && !(st.st_mode & _S_IFDIR)) return false;
+    modified = (int64_t)st.st_mtime;
+#else
+    struct stat st{};
+    if (::stat(param.c_str(), &st) != 0 && ::stat(dir.c_str(), &st) != 0) return false;
+    if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) return false;
+    modified = (int64_t)st.st_mtim.tv_sec * 1000000000ll + st.st_mtim.tv_nsec;
+#endif
+    return true;
+}
+
 // Translate a host (Linux) struct stat into the FreeBSD/Orbis SceKernelStat layout the
 // guest expects: 0x78 bytes, different field order. Writing the host layout (144 bytes,
 // different offsets) both gives wrong values AND overruns the guest's 0x78-byte buffer

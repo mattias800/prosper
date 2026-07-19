@@ -12,6 +12,12 @@ static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
+static bool slot_time(const std::string& dir_name, int64_t& modified) {
+    if (dir_name == "SlotOne") { modified = 10; return true; }
+    if (dir_name == "SlotTwo") { modified = 20; return true; }
+    return false;
+}
+
 int main() {
     printf("== test_dialog_helpers ==\n");
 
@@ -296,6 +302,19 @@ int main() {
         CHECK(request.supported && request.slots.size() == 2 &&
                   request.slots[0].dirName == "SlotOne" && request.initialSlot == 1,
               "SaveDataDialog LOAD LIST ignores SAVE new-item data and honors tail focus");
+
+        focus_pos = 4 /*DATALATEST*/;
+        std::memcpy(items + 0x28, &focus_pos, 4);
+        CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
+              "SaveDataDialog date focus declines when virtual-slot metadata is unavailable");
+        request = read_savedata_request((uint64_t)(uintptr_t)save_param, slot_time);
+        CHECK(request.supported && request.initialSlot == 1,
+              "SaveDataDialog DATALATEST focuses the newest virtual slot by metadata time");
+        focus_pos = 5 /*DATAOLDEST*/;
+        std::memcpy(items + 0x28, &focus_pos, 4);
+        request = read_savedata_request((uint64_t)(uintptr_t)save_param, slot_time);
+        CHECK(request.supported && request.initialSlot == 0,
+              "SaveDataDialog DATAOLDEST focuses the oldest virtual slot by metadata time");
 
         dir_names_count = 1025;
         std::memcpy(items + 0x18, &dir_names_count, 4);

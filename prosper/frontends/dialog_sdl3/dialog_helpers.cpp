@@ -163,7 +163,7 @@ const char* save_action(uint32_t display_type) {
 
 } // namespace
 
-SaveDataRequest read_savedata_request(uint64_t param) {
+SaveDataRequest read_savedata_request(uint64_t param, SaveDataSlotTimeLookup slotTime) {
     SaveDataRequest request;
     if (!param) return request;
     std::array<uint8_t, 0x98> outer{};
@@ -215,11 +215,30 @@ SaveDataRequest read_savedata_request(uint64_t param) {
 
         const uint32_t focus = local_field<uint32_t>(items, 0x28);
         if (!request.slots.empty()) {
-            if (focus == 1 || focus == 3 || focus == 5) {
+            if (focus == 1 || focus == 3) {
                 request.initialSlot = request.slots.size() - 1;
-            } else if ((focus == 2 || focus == 4) && request.slots.front().dirName.empty() &&
+            } else if (focus == 2 && request.slots.front().dirName.empty() &&
                        request.slots.size() > 1) {
-                request.initialSlot = 1; // DATAHEAD/DATALATEST skip the SAVE new-item entry
+                request.initialSlot = 1; // DATAHEAD skips the SAVE new-item entry
+            } else if (focus == 4 || focus == 5) {
+                if (!slotTime) return SaveDataRequest{};
+                bool found_time = false;
+                int64_t best_time = 0;
+                for (size_t index = 0; index < request.slots.size(); ++index) {
+                    const SaveDataSlot& slot = request.slots[index];
+                    if (slot.dirName.empty()) continue;
+                    int64_t modified = 0;
+                    if (!slotTime(slot.dirName, modified)) continue;
+                    if (!found_time || (focus == 4 ? modified > best_time : modified < best_time)) {
+                        found_time = true;
+                        best_time = modified;
+                        request.initialSlot = index;
+                    }
+                }
+                if (!found_time) {
+                    if (!request.slots.front().dirName.empty()) return SaveDataRequest{};
+                    request.initialSlot = 0; // reference UI focuses the new item when no data exists
+                }
             } else if (focus == 6) {
                 const uint64_t focus_name_address = local_field<uint64_t>(items, 0x30);
                 std::string focus_name;

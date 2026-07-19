@@ -82,6 +82,9 @@ std::string resolve_guest_path(const char* guest_path);
 bool savedata0_mount(const char* dirname, bool create);
 void savedata0_umount();
 std::vector<std::string> savedata0_list_dirs();   // existing save dirs under the host save root (#299)
+// Read a virtual save slot's param.sfo modification time (or directory time if absent). Rejects names
+// that are not a single guest directory component; used only for SaveDataDialog date-focus ordering.
+bool savedata0_dir_mtime(const std::string& dirname, int64_t& modified);
 // PS5 system services (user/NP/mouse/appcontent/dialog); called by register_builtin_hle().
 void register_service_hle();
 // libSceHttp local URI helpers; called by register_builtin_hle().
