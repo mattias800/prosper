@@ -1103,17 +1103,17 @@ HLE(s_syss_safearea) {
     return 0;
 }
 
-// sceSystemServiceGetHdrToneMapLuminance(SceSystemServiceHdrToneMapLuminance* out). The PS5
-// structure is exactly three floats: max-full-frame, max, and min tone-map luminance. The imported
-// function previously fell through to success-without-output, so display setup consumed poisoned or
-// uninitialized values even though Prosper advertises an SDR output. Match the deterministic PS5
-// baseline used by Kyty: 80-nit full-frame content, 1000-nit peak mastering value, and zero minimum.
+// sceSystemServiceGetHdrToneMapLuminance(out). Kyty models the output as three floats in this order:
+// max-full-frame, max, and min tone-map luminance. The imported function previously fell through to
+// success-without-output, so display setup consumed poisoned values. Use Kyty's 80/1000/0 values as
+// a deterministic fallback; this does not advertise or implement an HDR presentation path.
+// CONFIDENCE: MED on the Kyty-derived 12-byte layout/order; LOW on the real-hardware values.
 struct SysHdrToneMapLuminance {
     float max_full_frame;
     float max;
     float min;
 };
-static_assert(sizeof(SysHdrToneMapLuminance) == 12, "PS5 HDR tone-map luminance ABI");
+static_assert(sizeof(SysHdrToneMapLuminance) == 12, "Kyty-modeled HDR tone-map luminance layout");
 HLE(s_syss_hdr_luminance) {
     auto* luminance = (SysHdrToneMapLuminance*)PW(a0);
     if (!luminance) return 0x80A10003ull;   // SYSTEM_SERVICE_ERROR_PARAMETER
