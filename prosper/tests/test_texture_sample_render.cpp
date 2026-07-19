@@ -277,6 +277,42 @@ int main() {
                   sampled_stats.sampled_hits == 1,
               "GPU-resident target sampling matches CPU readback+upload byte-for-byte");
 
+        // Multiple ordered target calls may record into one queue submission. The producer returns no
+        // CPU pixels; the consumer samples that not-yet-submitted target, then its requested readback
+        // flushes both command buffers behind one fence.
+#ifdef _WIN32
+        _putenv_s("PROSPER_RENDER_TIMING", "1");
+#else
+        setenv("PROSPER_RENDER_TIMING", "1", 1);
+#endif
+        constexpr uint64_t batched_target_id = 0x9940000000000001ull;
+        prosper::test::BackendColorTarget batched_target{batched_target_id, false, false};
+        prosper::test::BackendSubmissionBatch submission_batch;
+        const std::vector<uint8_t> batched_producer = prosper::test::render_draws_rgba(
+            {producer}, W, H, nullptr, nullptr, false, &batched_target,
+            nullptr, nullptr, nullptr, &submission_batch, false);
+        const auto producer_timing = prosper::test::backend_render_timing_stats();
+        prosper::test::FrameResource batched_resource = gpu_resource;
+        batched_resource.persistent_render_target_id = batched_target_id;
+        prosper::test::BackendDraw batched_sample = gpu_sample;
+        batched_sample.R = {batched_resource};
+        const std::vector<uint8_t> batched_roundtrip = prosper::test::render_draws_rgba(
+            {batched_sample}, W, H, nullptr, nullptr, false, nullptr,
+            nullptr, nullptr, nullptr, &submission_batch, true);
+        const auto consumer_timing = prosper::test::backend_render_timing_stats();
+#ifdef _WIN32
+        _putenv_s("PROSPER_RENDER_TIMING", "");
+#else
+        unsetenv("PROSPER_RENDER_TIMING");
+#endif
+        CHECK(batched_producer.empty() && producer_timing.queue_submits == 0 &&
+                  producer_timing.fence_waits == 0,
+              "intermediate batched target records without submitting or waiting");
+        CHECK(batched_roundtrip == cpu_roundtrip &&
+                  consumer_timing.command_buffers == 2 &&
+                  consumer_timing.queue_submits == 1 && consumer_timing.fence_waits == 1,
+              "batched producer-to-sampler output matches synchronous output with one submit/wait");
+
         prosper::test::BackendDraw add_green;
         add_green.vs = vert; add_green.fs = green; add_green.ps = &additive;
         add_green.vcount = 3;
