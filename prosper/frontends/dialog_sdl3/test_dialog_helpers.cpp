@@ -230,11 +230,93 @@ int main() {
         save_message_ptr = (uint64_t)(uintptr_t)save_message;
         std::memcpy(user + 8, &save_message_ptr, 8);
 
+        char dir_names[3][32] = {};
+        std::memcpy(dir_names[0], "SlotOne", 8);
+        std::memcpy(dir_names[2], "SlotTwo", 8); // empty entries are skipped
+        char focus_name[32] = "SlotTwo";
+        const char* new_title = "Create New Save";
+        uint8_t new_item[56] = {};
+        uint64_t new_title_ptr = (uint64_t)(uintptr_t)new_title;
+        std::memcpy(new_item + 0, &new_title_ptr, 8);
+        uint8_t items[0x3c] = {};
+        uint64_t dir_names_ptr = (uint64_t)(uintptr_t)dir_names;
+        uint32_t dir_names_count = 3;
+        uint64_t new_item_ptr = (uint64_t)(uintptr_t)new_item;
+        uint32_t focus_pos = 6 /*DIRNAME*/;
+        uint64_t focus_name_ptr = (uint64_t)(uintptr_t)focus_name;
+        std::memcpy(items + 0x10, &dir_names_ptr, 8);
+        std::memcpy(items + 0x18, &dir_names_count, 4);
+        std::memcpy(items + 0x20, &new_item_ptr, 8);
+        std::memcpy(items + 0x28, &focus_pos, 4);
+        std::memcpy(items + 0x30, &focus_name_ptr, 8);
+        uint64_t items_ptr = (uint64_t)(uintptr_t)items;
         save_mode = SAVE_DATA_DIALOG_MODE_LIST;
+        display_type = 1 /*SAVE*/;
         std::memcpy(save_param + 0x34, &save_mode, 4);
-        CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
-              "SaveDataDialog LIST declines until the virtual-slot UI is implemented");
+        std::memcpy(save_param + 0x38, &display_type, 4);
+        std::memcpy(save_param + 0x48, &items_ptr, 8);
+        request = read_savedata_request((uint64_t)(uintptr_t)save_param);
+        CHECK(request.supported && request.slotList && request.cancelable &&
+                  request.slots.size() == 3 && request.slots[0].dirName.empty() &&
+                  request.slots[0].label == new_title && request.slots[1].dirName == "SlotOne" &&
+                  request.slots[2].dirName == "SlotTwo" && request.initialSlot == 2,
+              "SaveDataDialog LIST owns guest virtual slots, new-item text, and DIRNAME focus");
 
+        uint8_t list_name[40]; std::memset(list_name, 0xAB, sizeof list_name);
+        uint8_t list_result[0x48]; std::memset(list_result, 0xCD, sizeof list_result);
+        uint64_t list_name_ptr = (uint64_t)(uintptr_t)(list_name + 4);
+        uint64_t list_param_ptr = 0x1122334455667788ull;
+        std::memcpy(list_result + 0x10, &list_name_ptr, 8);
+        std::memcpy(list_result + 0x18, &list_param_ptr, 8);
+        write_savedata_result((uint64_t)(uintptr_t)list_result, request, 0, false, "SlotTwo");
+        uint32_t list_common = 99, list_button = 99;
+        uint64_t retained_name_ptr = 0, retained_param_ptr = 0;
+        std::memcpy(&list_common, list_result + 4, 4);
+        std::memcpy(&list_button, list_result + 8, 4);
+        std::memcpy(&retained_name_ptr, list_result + 0x10, 8);
+        std::memcpy(&retained_param_ptr, list_result + 0x18, 8);
+        CHECK(list_common == 0 && list_button == 0 &&
+                  std::strcmp((char*)list_name + 4, "SlotTwo") == 0 &&
+                  list_name[3] == 0xAB && list_name[36] == 0xAB,
+              "SaveDataDialog LIST writes OK/INVALID and a bounded selected virtual directory");
+        CHECK(retained_name_ptr == list_name_ptr && retained_param_ptr == list_param_ptr &&
+                  list_result[0x0c] == 0xCD && list_result[0x28] == 0xCD &&
+                  list_result[0x47] == 0xCD,
+              "SaveDataDialog LIST preserves output pointers, ABI pad, param target, and reserved tail");
+        write_savedata_result((uint64_t)(uintptr_t)list_result, request, 0, true);
+        std::memcpy(&list_common, list_result + 4, 4);
+        CHECK(list_common == 1 && list_name[4] == 0,
+              "SaveDataDialog canceled LIST result clears the directory and reports USER_CANCELED");
+
+        focus_pos = 1 /*LISTTAIL*/;
+        display_type = 2 /*LOAD: newItem must be ignored*/;
+        std::memcpy(items + 0x28, &focus_pos, 4);
+        std::memcpy(save_param + 0x38, &display_type, 4);
+        request = read_savedata_request((uint64_t)(uintptr_t)save_param);
+        CHECK(request.supported && request.slots.size() == 2 &&
+                  request.slots[0].dirName == "SlotOne" && request.initialSlot == 1,
+              "SaveDataDialog LOAD LIST ignores SAVE new-item data and honors tail focus");
+
+        dir_names_count = 1025;
+        std::memcpy(items + 0x18, &dir_names_count, 4);
+        CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
+              "SaveDataDialog LIST rejects an unreasonable guest slot count");
+        dir_names_count = 3;
+        dir_names_ptr = 1;
+        std::memcpy(items + 0x18, &dir_names_count, 4);
+        std::memcpy(items + 0x10, &dir_names_ptr, 8);
+        CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
+              "SaveDataDialog LIST rejects an unreadable directory array without crashing");
+        dir_names_ptr = (uint64_t)(uintptr_t)dir_names;
+        std::memcpy(items + 0x10, &dir_names_ptr, 8);
+        items_ptr = 1;
+        std::memcpy(save_param + 0x48, &items_ptr, 8);
+        CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
+              "SaveDataDialog LIST rejects an unreadable items pointer without crashing");
+        items_ptr = (uint64_t)(uintptr_t)items;
+        std::memcpy(save_param + 0x48, &items_ptr, 8);
+
+        request = {};
         request.mode = SAVE_DATA_DIALOG_MODE_USER_MSG;
         request.userData = user_data;
         uint8_t save_result[0x48]; std::memset(save_result, 0xAB, sizeof save_result);
@@ -302,6 +384,25 @@ int main() {
         std::memcpy(&lifecycle_button, lifecycle_result + 8, 4);
         CHECK(lifecycle_common == 1 && lifecycle_button == 0,
               "SaveData lifecycle canceled completion writes USER_CANCELED + INVALID");
+
+        SaveDataRequest list_request;
+        list_request.supported = true;
+        list_request.slotList = true;
+        list_request.mode = SAVE_DATA_DIALOG_MODE_LIST;
+        list_request.slots = {{"SlotOne", "SlotOne"}, {"SlotTwo", "SlotTwo"}};
+        state.open(list_request);
+        SaveDataModalTicket list_ticket = state.take_pending();
+        state.complete_list(list_ticket.generation, 1);
+        SaveDataResultSnapshot list_snapshot = state.result_snapshot();
+        CHECK(state.status() == 3 && !list_snapshot.canceled && list_snapshot.buttonId == 0 &&
+                  list_snapshot.dirName == "SlotTwo",
+              "SaveData LIST lifecycle publishes only the selected virtual directory");
+        state.open(list_request);
+        list_ticket = state.take_pending();
+        state.complete_list(list_ticket.generation, -1);
+        list_snapshot = state.result_snapshot();
+        CHECK(state.status() == 3 && list_snapshot.canceled && list_snapshot.dirName.empty(),
+              "SaveData LIST lifecycle maps Back to USER_CANCELED with an empty directory");
 
         SaveDataRequest progress_request;
         progress_request.supported = true;

@@ -101,6 +101,14 @@ int run_savedata_modal(const SaveDataRequest& req, Active&& active) {
             if (ev.type == SDL_EVENT_QUIT) {
                 done = true;
             } else if (ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
+                       ev.window.windowID != window_id) {
+                // The app window is no longer SDL's last window while this modal exists. Preserve
+                // its close request as an app quit instead of draining it inside the modal loop.
+                SDL_Event quit{};
+                quit.type = SDL_EVENT_QUIT;
+                SDL_PushEvent(&quit);
+                done = true;
+            } else if (ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
                        ev.window.windowID == window_id && req.cancelable) {
                 done = true;
             } else if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.windowID == window_id) {
@@ -159,6 +167,120 @@ int run_savedata_modal(const SaveDataRequest& req, Active&& active) {
     return still_active ? clicked : -2;
 }
 
+// Dedicated virtual-slot LIST modal. It renders only guest-provided directory identifiers and an
+// optional SAVE new-item label; no host filesystem path or picker crosses the frontend boundary.
+// Returns the selected slot index, -1 for cancel, or -2 when a guest Close/re-Open invalidates it.
+template<typename Active>
+int run_savedata_list(const SaveDataRequest& req, Active&& active) {
+    if (!active()) return -2;
+    SDL_Window* win = nullptr;
+    SDL_Renderer* ren = nullptr;
+    if (!SDL_CreateWindowAndRenderer("prosper - Saved Data", 640, 400, 0, &win, &ren)) {
+        SDL_Log("prosper: saved-data list window failed: %s", SDL_GetError());
+        return -1;
+    }
+    const SDL_WindowID window_id = SDL_GetWindowID(win);
+    constexpr size_t visible_rows = 8;
+    constexpr float row_x = 28.0f, row_y = 68.0f, row_w = 584.0f, row_h = 34.0f;
+    size_t selected = req.slots.empty() ? 0 : std::min(req.initialSlot, req.slots.size() - 1);
+    size_t first = selected >= visible_rows ? selected - visible_rows + 1 : 0;
+    int result = -1;
+    bool done = false;
+    auto reveal = [&] {
+        if (selected < first) first = selected;
+        if (selected >= first + visible_rows) first = selected - visible_rows + 1;
+    };
+
+    while (!done && active()) {
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_EVENT_QUIT) {
+                done = true;
+            } else if (ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
+                       ev.window.windowID != window_id) {
+                SDL_Event quit{};
+                quit.type = SDL_EVENT_QUIT;
+                SDL_PushEvent(&quit);
+                done = true;
+            } else if (ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
+                       ev.window.windowID == window_id && req.cancelable) {
+                done = true;
+            } else if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.windowID == window_id) {
+                if ((ev.key.key == SDLK_UP || ev.key.key == SDLK_KP_8) && selected > 0) {
+                    --selected;
+                    reveal();
+                } else if ((ev.key.key == SDLK_DOWN || ev.key.key == SDLK_KP_2) &&
+                           selected + 1 < req.slots.size()) {
+                    ++selected;
+                    reveal();
+                } else if (ev.key.key == SDLK_HOME && !req.slots.empty()) {
+                    selected = 0;
+                    reveal();
+                } else if (ev.key.key == SDLK_END && !req.slots.empty()) {
+                    selected = req.slots.size() - 1;
+                    reveal();
+                } else if ((ev.key.key == SDLK_RETURN || ev.key.key == SDLK_KP_ENTER) &&
+                           !req.slots.empty()) {
+                    result = (int)selected;
+                    done = true;
+                } else if (ev.key.key == SDLK_ESCAPE && req.cancelable) {
+                    done = true;
+                }
+            } else if (ev.type == SDL_EVENT_MOUSE_WHEEL &&
+                       ev.wheel.windowID == window_id && !req.slots.empty()) {
+                if (ev.wheel.y > 0 && selected > 0) --selected;
+                if (ev.wheel.y < 0 && selected + 1 < req.slots.size()) ++selected;
+                reveal();
+            } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
+                       ev.button.windowID == window_id && ev.button.button == SDL_BUTTON_LEFT) {
+                if (ev.button.x >= row_x && ev.button.x <= row_x + row_w &&
+                    ev.button.y >= row_y) {
+                    const size_t row = (size_t)((ev.button.y - row_y) / row_h);
+                    const size_t index = first + row;
+                    if (row < visible_rows && index < req.slots.size()) {
+                        selected = index;
+                        result = (int)selected;
+                        done = true;
+                    }
+                }
+            }
+        }
+
+        SDL_SetRenderDrawColor(ren, 28, 30, 40, 255);
+        SDL_RenderClear(ren);
+        SDL_SetRenderDrawColor(ren, 235, 235, 240, 255);
+        SDL_RenderDebugText(ren, 28.0f, 24.0f, req.message.c_str());
+        if (req.slots.empty()) {
+            SDL_RenderDebugText(ren, 28.0f, 84.0f, "There is no saved data.");
+        } else {
+            const size_t end = std::min(req.slots.size(), first + visible_rows);
+            for (size_t index = first; index < end; ++index) {
+                const float y = row_y + (float)(index - first) * row_h;
+                SDL_FRect row{row_x, y, row_w, row_h - 4.0f};
+                if (index == selected) {
+                    SDL_SetRenderDrawColor(ren, 76, 132, 214, 255);
+                    SDL_RenderFillRect(ren, &row);
+                }
+                SDL_SetRenderDrawColor(ren, 210, 214, 225, 255);
+                SDL_RenderRect(ren, &row);
+                const SaveDataSlot& slot = req.slots[index];
+                const std::string label = slot.dirName.empty() ?
+                    std::string("[New Save] ") + slot.label : slot.label;
+                SDL_RenderDebugText(ren, row.x + 12.0f, row.y + 10.0f, label.c_str());
+            }
+        }
+        SDL_SetRenderDrawColor(ren, 220, 220, 230, 255);
+        SDL_RenderDebugText(ren, 28.0f, 372.0f,
+                            req.cancelable ? "Enter = Select     Esc = Back" : "Enter = Select");
+        SDL_RenderPresent(ren);
+        SDL_Delay(8);
+    }
+    const bool still_active = active();
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    return still_active ? result : -2;
+}
+
 struct SdlPlatformUi : PlatformUi {
     std::atomic<int>      msg_status{0}, err_status{0};
     std::atomic<uint32_t> msg_btn{1 /*OK*/};
@@ -191,8 +313,7 @@ struct SdlPlatformUi : PlatformUi {
     void errorDialogClose() override { err_status.store(0); }
 
     // SaveDataDialog. Open copies the guest request; the prosper-app main-thread pump owns SDL UI.
-    // Modal notices and the non-modal progress window share the same generation-safe state. LIST is
-    // still declined until its dedicated virtual-slot UI exists, preserving the headless fallback.
+    // Modal notices/LIST and the non-modal progress window share the same generation-safe state.
     SaveDataDialogState save_state;
     SDL_Window* save_progress_window = nullptr;
     SDL_Renderer* save_progress_renderer = nullptr;
@@ -207,7 +328,8 @@ struct SdlPlatformUi : PlatformUi {
     int saveDataDialogStatus() override { return save_state.status(); }
     int saveDataDialogResult(uint64_t result) override {
         const SaveDataResultSnapshot snapshot = save_state.result_snapshot();
-        write_savedata_result(result, snapshot.request, snapshot.buttonId, snapshot.canceled);
+        write_savedata_result(result, snapshot.request, snapshot.buttonId, snapshot.canceled,
+                              snapshot.dirName);
         return (int)snapshot.buttonId;
     }
     void saveDataDialogProgressBarInc(uint32_t target, uint32_t delta) override {
@@ -311,8 +433,13 @@ struct SdlPlatformUi : PlatformUi {
             auto active = [this, generation = ticket.generation] {
                 return save_state.active(generation);
             };
-            const int clicked = run_savedata_modal(ticket.request, active);
-            if (clicked != -2) save_state.complete(ticket.generation, clicked);
+            if (ticket.request.slotList) {
+                const int selected = run_savedata_list(ticket.request, active);
+                if (selected != -2) save_state.complete_list(ticket.generation, selected);
+            } else {
+                const int clicked = run_savedata_modal(ticket.request, active);
+                if (clicked != -2) save_state.complete(ticket.generation, clicked);
+            }
         }
         if (ime_pending.exchange(false)) {
             ImeRequest r; { std::lock_guard<std::mutex> lk(ime_mx); r = ime_req; }
@@ -334,7 +461,7 @@ SdlPlatformUi g_sdl_ui;
 
 bool install_sdl3_platform_ui() {
     set_platform_ui(&g_sdl_ui);
-    SDL_Log("prosper: SDL3 dialog backend installed (Msg/Error/SaveData progress + Ime text entry)");
+    SDL_Log("prosper: SDL3 dialog backend installed (Msg/Error/SaveData list+progress + Ime text entry)");
     return true;
 }
 void shutdown_sdl3_platform_ui() {

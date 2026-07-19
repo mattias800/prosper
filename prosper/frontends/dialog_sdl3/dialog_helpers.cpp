@@ -124,6 +124,25 @@ bool guest_string(uint64_t address, std::string& out) {
     return false;
 }
 
+bool guest_dir_name(uint64_t address, std::string& out) {
+    std::array<char, 32> name{};
+    if (!guest_read_bytes(address, name.data(), name.size())) return false;
+    const char* end = (const char*)std::memchr(name.data(), 0, name.size());
+    if (!end) return false; // the result ABI needs a bounded, NUL-terminated 32-byte name
+    out.assign(name.data(), (size_t)(end - name.data()));
+    return true;
+}
+
+bool read_save_back_option(const std::array<uint8_t, 0x98>& outer, bool& enabled) {
+    enabled = true;
+    const uint64_t option = local_field<uint64_t>(outer, 0x78);
+    if (!option) return true;
+    uint32_t value = 0;
+    if (!guest_read_bytes(option, &value, sizeof value)) return false;
+    enabled = value == 0; // OptionBack::ENABLE=0, DISABLE=1
+    return true;
+}
+
 MsgButtons save_user_buttons(uint32_t type) {
     switch (type) {
     case 0: return {1, {"OK", nullptr, nullptr}, {1, 0, 0}};
@@ -155,6 +174,73 @@ SaveDataRequest read_savedata_request(uint64_t param) {
     request.mode = local_field<uint32_t>(outer, 0x34);
     request.displayType = local_field<uint32_t>(outer, 0x38);
     request.userData = local_field<uint64_t>(outer, 0x70);
+
+    if (request.mode == SAVE_DATA_DIALOG_MODE_LIST) {
+        if (request.displayType < 1 || request.displayType > 3) return request;
+        bool back_enabled = true;
+        if (!read_save_back_option(outer, back_enabled)) return request;
+        request.cancelable = back_enabled;
+
+        const uint64_t items_address = local_field<uint64_t>(outer, 0x48);
+        if (!items_address) return request;
+        // SaveDialogItems owned prefix through itemStyle: dirName@0x10, count@0x18,
+        // newItem@0x20, focusPos@0x28, focusPosDirName@0x30, itemStyle@0x38.
+        std::array<uint8_t, 0x3c> items{};
+        if (!guest_read_bytes(items_address, items.data(), items.size())) return request;
+        const uint64_t names_address = local_field<uint64_t>(items, 0x10);
+        const uint32_t names_count = local_field<uint32_t>(items, 0x18);
+        constexpr uint32_t MAX_SLOT_NAMES = 1024;
+        if (names_count > MAX_SLOT_NAMES || (names_count && !names_address)) return request;
+
+        const uint64_t new_item_address = local_field<uint64_t>(items, 0x20);
+        if (request.displayType == 1 && new_item_address) {
+            uint64_t title_address = 0;
+            if (!guest_read_bytes(new_item_address, &title_address, sizeof title_address))
+                return request;
+            SaveDataSlot slot;
+            if (title_address && !guest_string(title_address, slot.label)) return request;
+            if (slot.label.empty()) slot.label = "New Save";
+            request.slots.push_back(std::move(slot));
+        }
+
+        for (uint32_t i = 0; i < names_count; ++i) {
+            if (names_address > UINT64_MAX - (uint64_t)i * 32u) return SaveDataRequest{};
+            SaveDataSlot slot;
+            if (!guest_dir_name(names_address + (uint64_t)i * 32u, slot.dirName))
+                return SaveDataRequest{};
+            if (slot.dirName.empty()) continue;
+            slot.label = slot.dirName;
+            request.slots.push_back(std::move(slot));
+        }
+
+        const uint32_t focus = local_field<uint32_t>(items, 0x28);
+        if (!request.slots.empty()) {
+            if (focus == 1 || focus == 3 || focus == 5) {
+                request.initialSlot = request.slots.size() - 1;
+            } else if ((focus == 2 || focus == 4) && request.slots.front().dirName.empty() &&
+                       request.slots.size() > 1) {
+                request.initialSlot = 1; // DATAHEAD/DATALATEST skip the SAVE new-item entry
+            } else if (focus == 6) {
+                const uint64_t focus_name_address = local_field<uint64_t>(items, 0x30);
+                std::string focus_name;
+                if (!focus_name_address || !guest_dir_name(focus_name_address, focus_name))
+                    return SaveDataRequest{};
+                const auto found = std::find_if(request.slots.begin(), request.slots.end(),
+                    [&](const SaveDataSlot& slot) { return slot.dirName == focus_name; });
+                if (found != request.slots.end())
+                    request.initialSlot = (size_t)(found - request.slots.begin());
+            }
+        } else if (!request.cancelable) {
+            return request; // avoid owning a list with neither a selectable item nor a Back path
+        }
+
+        request.message = request.displayType == 1 ? "Select where to save." :
+                          request.displayType == 2 ? "Select saved data to load." :
+                                                     "Select saved data to delete.";
+        request.slotList = true;
+        request.supported = true;
+        return request;
+    }
 
     if (request.mode == SAVE_DATA_DIALOG_MODE_USER_MSG) {
         const uint64_t user = local_field<uint64_t>(outer, 0x50);
@@ -228,12 +314,7 @@ SaveDataRequest read_savedata_request(uint64_t param) {
         }
         if (type == 10 || type == 11 || type == 13) {
             bool back_enabled = true; // OptionBack defaults to ENABLE when the pointer is absent.
-            const uint64_t option = local_field<uint64_t>(outer, 0x78);
-            if (option) {
-                uint32_t option_back = 0;
-                if (!guest_read_bytes(option, &option_back, sizeof option_back)) return request;
-                back_enabled = option_back == 0; // ENABLE=0, DISABLE=1
-            }
+            if (!read_save_back_option(outer, back_enabled)) return request;
             request.cancelable = back_enabled;
             request.buttons = save_user_buttons(back_enabled ? 3u : 0u);
         }
@@ -291,7 +372,7 @@ SaveDataRequest read_savedata_request(uint64_t param) {
 }
 
 void write_savedata_result(uint64_t result, const SaveDataRequest& request,
-                           uint32_t buttonId, bool canceled) {
+                           uint32_t buttonId, bool canceled, const std::string& dirName) {
     if (!result || result > UINT64_MAX - 0x20) return;
     const uint32_t common_result = canceled ? 1u : 0u;
     const uint32_t guest_button = canceled ? 0u : buttonId;
@@ -299,6 +380,15 @@ void write_savedata_result(uint64_t result, const SaveDataRequest& request,
     (void)guest_write_bytes(result + 0x04, &common_result, sizeof common_result);
     (void)guest_write_bytes(result + 0x08, &guest_button, sizeof guest_button);
     (void)guest_write_bytes(result + 0x20, &request.userData, sizeof request.userData);
+    if (request.mode == SAVE_DATA_DIALOG_MODE_LIST) {
+        uint64_t output = 0;
+        if (guest_read_bytes(result + 0x10, &output, sizeof output) && output) {
+            std::array<char, 32> name{};
+            const size_t length = std::min(dirName.size(), name.size() - 1);
+            std::memcpy(name.data(), dirName.data(), length);
+            (void)guest_write_bytes(output, name.data(), name.size());
+        }
+    }
 }
 
 void SaveDataDialogState::open(SaveDataRequest request) {
@@ -309,6 +399,7 @@ void SaveDataDialogState::open(SaveDataRequest request) {
     button_ = 0;
     progress_ = 0;
     canceled_ = false;
+    dir_name_.clear();
     status_ = 2 /*RUNNING*/;
     pending_generation_ = request_.progress ? 0 : generation_;
 }
@@ -347,9 +438,23 @@ void SaveDataDialogState::complete(uint64_t generation, int clicked) {
     status_ = 3 /*FINISHED*/;
 }
 
+void SaveDataDialogState::complete_list(uint64_t generation, int selected) {
+    std::lock_guard<std::mutex> lock(mx_);
+    if (status_ != 2 || generation != generation_ || !request_.slotList) return;
+    if (selected >= 0 && (size_t)selected < request_.slots.size()) {
+        dir_name_ = request_.slots[(size_t)selected].dirName;
+        canceled_ = false;
+    } else {
+        dir_name_.clear();
+        canceled_ = true;
+    }
+    button_ = 0; // LIST selection has no button id
+    status_ = 3 /*FINISHED*/;
+}
+
 SaveDataResultSnapshot SaveDataDialogState::result_snapshot() const {
     std::lock_guard<std::mutex> lock(mx_);
-    return {request_, button_, canceled_};
+    return {request_, button_, canceled_, dir_name_};
 }
 
 void SaveDataDialogState::progress_inc(uint32_t target, uint32_t delta) {
