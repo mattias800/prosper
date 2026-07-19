@@ -7,6 +7,7 @@
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
 #include "../src/hle/audio.hpp"
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -189,7 +190,52 @@ int main() {
                                                           // ports (Kyty/shadPS4 both return a single grain)
     CHECK(sink.outs.size() == 2);                         // ...but both valid entries are still forwarded
 
-    // --- 10. libSceNgs2 silent lifecycle: sizes, handles, state, and render output -------------
+    // --- 10. libSceAudioIn: tagged lifecycle, exact silence, errors, exhaustion, pacing -------
+    CHECK(call("sceAudioInInit") == 0);
+    CHECK((int32_t)call("sceAudioInOpen", 1, 1, 0, 0, 16000, 0) == (int32_t)0x80260102);
+    CHECK((int32_t)call("sceAudioInOpen", 1, 1, 0, 2049, 16000, 0) == (int32_t)0x80260102);
+    CHECK((int32_t)call("sceAudioInOpen", 1, 1, 0, 320, 44100, 0) == (int32_t)0x80260103);
+    CHECK((int32_t)call("sceAudioInOpen", 1, 1, 0, 320, 16000, 1) == (int32_t)0x80260106);
+
+    int64_t hi = call("sceAudioInOpen", 1, 1 /* GENERAL */, 0, 320, 16000, 0 /* S16 mono */);
+    CHECK(hi >= 0 && ((uint32_t)hi & 0x7f000000u) == 0x30000000u);
+    CHECK((int32_t)call("sceAudioInInput", (uint64_t)hi, 0) == (int32_t)0x80260105);
+    CHECK((int32_t)call("sceAudioInInput", (uint64_t)hi, 1) == (int32_t)0x80260105);
+
+    std::vector<uint8_t> mic(320 * 2 + 2, 0xA5);
+    auto mic_start = std::chrono::steady_clock::now();
+    CHECK(call("sceAudioInInput", (uint64_t)hi, PTR(mic.data() + 1)) == 320);
+    auto mic_elapsed = std::chrono::steady_clock::now() - mic_start;
+    CHECK(mic_elapsed >= std::chrono::milliseconds(10));  // 320 / 16 kHz = 20 ms; tolerate coarse clocks
+    CHECK(mic.front() == 0xA5 && mic.back() == 0xA5);     // exact-size write canaries
+    for (size_t i = 1; i + 1 < mic.size(); i++) CHECK(mic[i] == 0);
+
+    CHECK(call("sceAudioInClose", (uint64_t)hi) == 0);
+    memset(mic.data() + 1, 0x5A, mic.size() - 2);
+    CHECK((int32_t)call("sceAudioInInput", (uint64_t)hi, PTR(mic.data() + 1)) ==
+          (int32_t)0x80260109);
+    for (size_t i = 1; i + 1 < mic.size(); i++) CHECK(mic[i] == 0x5A); // closed handle leaves output
+    CHECK((int32_t)call("sceAudioInClose", (uint64_t)hi) == (int32_t)0x80260109);
+    CHECK((int32_t)call("sceAudioInInput", 1, PTR(mic.data() + 1)) == (int32_t)0x80260101);
+    CHECK((int32_t)call("sceAudioInClose", 1) == (int32_t)0x80260101);
+
+    int64_t stereo_hi = call("sceAudioInOpen", 1, 0, 0, 64, 48000, 2 /* S16 stereo */);
+    std::vector<uint8_t> stereo_mic(64 * 2 * 2 + 2, 0xC7);
+    CHECK(call("sceAudioInInput", (uint64_t)stereo_hi, PTR(stereo_mic.data() + 1)) == 64);
+    CHECK(stereo_mic.front() == 0xC7 && stereo_mic.back() == 0xC7);
+    for (size_t i = 1; i + 1 < stereo_mic.size(); i++) CHECK(stereo_mic[i] == 0);
+    CHECK(call("sceAudioInClose", (uint64_t)stereo_hi) == 0);
+
+    int64_t input_handles[7];
+    for (int i = 0; i < 7; i++) {
+        input_handles[i] = call("sceAudioInOpen", 1, 0, i, 64, 48000, 2 /* S16 stereo */);
+        CHECK(input_handles[i] >= 0);
+        for (int j = 0; j < i; j++) CHECK(input_handles[i] != input_handles[j]);
+    }
+    CHECK((int32_t)call("sceAudioInOpen", 1, 0, 7, 64, 48000, 2) == (int32_t)0x80260107);
+    for (int i = 0; i < 7; i++) CHECK(call("sceAudioInClose", (uint64_t)input_handles[i]) == 0);
+
+    // --- 11. libSceNgs2 silent lifecycle: sizes, handles, state, and render output -------------
     struct BufferInfo { uint64_t host_buffer, host_buffer_size, reserved[5], user_data; };
     struct RackOption {
         uint64_t size; char name[16]; uint32_t flags, max_grain, max_voices,

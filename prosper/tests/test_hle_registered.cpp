@@ -46,6 +46,7 @@ int main() {
         // audio (headless / pluggable backend)
         "sceAudioOutInit", "sceAudioOutOpen", "sceAudioOutOutput", "sceAudioOutOutputs",
         "sceAudioOutSetVolume", "sceAudioOutClose", "sceAudioOutGetPortState",
+        "sceAudioInInit", "sceAudioInOpen", "sceAudioInInput", "sceAudioInClose",
     };
     for (const char* n : names) must(n);
     // sync_on_address futex is registered by raw NID (no symbol name) — check it directly.
