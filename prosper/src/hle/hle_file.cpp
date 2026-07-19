@@ -1367,6 +1367,12 @@ HLE(f_fdatasync) {
     return (uint64_t)(int64_t)::fdatasync((int)a0);
 #endif
 }
+HLE(k_sync) {
+    // sceKernelSync is the descriptor-free, whole-filesystem durability barrier. Unlike fsync it
+    // has no failure result to translate: the BSD/POSIX primitive returns void.
+    ::sync();
+    return 0;
+}
 #else
 HLE(f_stat)  { std::string h = translate(CS(a0)); struct _stat64 st; int r = ::_stat64(h.c_str(), &st); if (r == 0 && a1) to_sce_stat64(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
 HLE(f_fstat) { struct _stat64 st; std::string directory_path;
@@ -1385,6 +1391,13 @@ HLE(f_fsync) { ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
 // The Windows CRT has no data-only durability primitive. _commit is the same stronger fallback
 // used for fsync and, unlike the missing-import stub, reports invalid descriptors truthfully.
 HLE(f_fdatasync) { return f_fsync(a0,a1,a2,a3,a4,a5); }
+HLE(k_sync) {
+    // Windows has no whole-filesystem sync primitive. Flush every process-owned stdio stream so
+    // buffered guest/libc writes at least reach the OS cache; descriptor callers that need a
+    // durable per-file barrier use the real sceKernelFsync/Fdatasync handlers above.
+    (void)::_flushall();
+    return 0;
+}
 #endif
 
 // These file APIs have signed 32-bit results. Kernel exports return the translated SCE error
@@ -2142,6 +2155,7 @@ void register_file_hle() {
     R("lstat", f_lstat);   R("sceKernelLstat", k_lstat);     // was MISSING -> uninitialized stat buffer
     R("fsync", f_fsync);       R("sceKernelFsync", k_fsync);       // real descriptor durability
     R("fdatasync", f_fdatasync); R("sceKernelFdatasync", k_fdatasync); // data-only durability
+    R("sceKernelSync", k_sync); // whole-filesystem/process-file flush (was fake success)
     R("sceKernelTruncate", k_truncate);      // path-based sibling (same corruption class)
     R("sceKernelFstat", k_fstat);
     // Low-level POSIX wrappers with the internal leading-underscore names. Real libc.prx implements
