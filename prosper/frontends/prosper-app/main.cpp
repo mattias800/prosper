@@ -53,6 +53,11 @@
 #include <cmath>
 #include <chrono>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 using namespace prosper;
 
@@ -351,7 +356,168 @@ void poll_keyboard() {
 
 } // namespace
 
+#ifdef _WIN32
+// PROSPER_WIN_EXIT_TRACE: catch and backtrace whoever terminates the process. The Windows app has
+// exited silently with code 0 during guest bring-up with no logged exit path, no unhandled exception,
+// and no clean shutdown — meaning some thread funnels into ExitProcess/TerminateProcess directly.
+// Inline-hook both (12-byte absolute-jump patch) to print the return-address stack before passing the
+// call through. A terminal function, so re-entrancy on the unpatch/forward is safe.
+namespace {
+uint8_t g_ep_saved[12], g_tp_saved[12];
+void* g_ep_addr = nullptr;
+void* g_tp_addr = nullptr;
+void log_exit_backtrace(const char* who, unsigned code) {
+    fprintf(stderr, "[app] WIN_EXIT_TRACE: %s(code=%u) tid=%lu — backtrace:\n",
+            who, code, (unsigned long)GetCurrentThreadId());
+    void* frames[40]; USHORT n = CaptureStackBackTrace(0, 40, frames, nullptr);
+    HMODULE self = GetModuleHandleW(nullptr);
+    for (USHORT i = 0; i < n; i++) {
+        HMODULE mod = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)frames[i], &mod);
+        wchar_t name[MAX_PATH] = L"?"; if (mod) GetModuleFileNameW(mod, name, MAX_PATH);
+        const wchar_t* base = wcsrchr(name, L'\\'); base = base ? base + 1 : name;
+        fprintf(stderr, "    [%2u] %p  off=+0x%llx  %ls%s\n", i, frames[i],
+                mod ? (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)mod) : 0ull,
+                base, mod == self ? "  <-- app" : "");
+    }
+    fflush(nullptr);
+}
+void install_exit_trap(const char* dll, const char* fn, void* thunk, uint8_t* saved, void** slot) {
+    HMODULE h = GetModuleHandleA(dll); if (!h) return;
+    void* addr = (void*)GetProcAddress(h, fn); if (!addr) return;
+    *slot = addr;
+    DWORD old; if (!VirtualProtect(addr, 12, PAGE_EXECUTE_READWRITE, &old)) return;
+    memcpy(saved, addr, 12);
+    uint8_t patch[12] = { 0x48, 0xB8 };                 // mov rax, imm64
+    memcpy(patch + 2, &thunk, 8);
+    patch[10] = 0xFF; patch[11] = 0xE0;                 // jmp rax
+    memcpy(addr, patch, 12);
+    VirtualProtect(addr, 12, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), addr, 12);
+}
+[[noreturn]] void WINAPI hook_ExitProcess(UINT code) {
+    log_exit_backtrace("ExitProcess", code);
+    DWORD old; VirtualProtect(g_ep_addr, 12, PAGE_EXECUTE_READWRITE, &old);
+    memcpy(g_ep_addr, g_ep_saved, 12); VirtualProtect(g_ep_addr, 12, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), g_ep_addr, 12);
+    ((decltype(&ExitProcess))g_ep_addr)(code);
+    for (;;) {}
+}
+BOOL WINAPI hook_TerminateProcess(HANDLE proc, UINT code) {
+    if (proc == GetCurrentProcess() || proc == (HANDLE)-1)
+        log_exit_backtrace("TerminateProcess(self)", code);
+    DWORD old; VirtualProtect(g_tp_addr, 12, PAGE_EXECUTE_READWRITE, &old);
+    memcpy(g_tp_addr, g_tp_saved, 12); VirtualProtect(g_tp_addr, 12, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), g_tp_addr, 12);
+    return ((decltype(&TerminateProcess))g_tp_addr)(proc, code);
+}
+// ntdll funnels: kernel32!ExitProcess -> ntdll!RtlExitUserProcess -> ntdll!NtTerminateProcess.
+// Hooking NtTerminateProcess catches ALL termination (including RtlExitUserThread's last-thread path
+// and any code that skips kernel32). Signature: NtTerminateProcess(HANDLE, NTSTATUS).
+uint8_t g_rep_saved[12], g_ntp_saved[12];
+void* g_rep_addr = nullptr;
+void* g_ntp_addr = nullptr;
+[[noreturn]] void WINAPI hook_RtlExitUserProcess(UINT code) {
+    log_exit_backtrace("RtlExitUserProcess", code);
+    DWORD old; VirtualProtect(g_rep_addr, 12, PAGE_EXECUTE_READWRITE, &old);
+    memcpy(g_rep_addr, g_rep_saved, 12); VirtualProtect(g_rep_addr, 12, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), g_rep_addr, 12);
+    ((void(WINAPI*)(UINT))g_rep_addr)(code);
+    for (;;) {}
+}
+LONG WINAPI hook_NtTerminateProcess(HANDLE proc, LONG status) {
+    // proc==NULL terminates the current process (RtlExitUserProcess uses NULL); handle self too.
+    if (proc == nullptr || proc == GetCurrentProcess() || proc == (HANDLE)-1)
+        log_exit_backtrace("NtTerminateProcess", (unsigned)status);
+    DWORD old; VirtualProtect(g_ntp_addr, 12, PAGE_EXECUTE_READWRITE, &old);
+    memcpy(g_ntp_addr, g_ntp_saved, 12); VirtualProtect(g_ntp_addr, 12, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), g_ntp_addr, 12);
+    return ((LONG(WINAPI*)(HANDLE, LONG))g_ntp_addr)(proc, status);
+}
+uint8_t g_ntt_saved[12];
+void* g_ntt_addr = nullptr;
+DWORD g_ntt_ssn = 0;   // NtTerminateThread syscall number (from the original stub's mov eax,imm32)
+// Forward NtTerminateThread via a raw syscall so the inline patch stays permanently installed — a
+// self-termination never returns, so the usual unpatch/call/re-arm loses the hook after the first
+// catch and misses the LAST thread exit (the one that ends the process). Win64 stub is
+// 4C 8B D1 (mov r10,rcx) / B8 ssn (mov eax,ssn) / syscall — ssn lives at saved[4..7].
+LONG WINAPI hook_NtTerminateThread(HANDLE thr, LONG status) {
+    if (thr == nullptr || thr == GetCurrentThread() || thr == (HANDLE)-2)
+        log_exit_backtrace("NtTerminateThread(self)", (unsigned)status);
+    LONG out;
+    __asm__ volatile(
+        "movl %1, %%eax\n\t"
+        "movq %2, %%r10\n\t"
+        "movq %3, %%rdx\n\t"
+        "syscall\n\t"
+        "movl %%eax, %0\n\t"
+        : "=r"(out)
+        : "r"(g_ntt_ssn), "r"(thr), "r"((uint64_t)(int64_t)status)
+        : "rax", "r10", "rdx", "r11", "rcx", "memory");
+    return out;
+}
+void install_win_exit_trace() {
+    install_exit_trap("kernel32.dll", "ExitProcess", (void*)&hook_ExitProcess, g_ep_saved, &g_ep_addr);
+    install_exit_trap("kernel32.dll", "TerminateProcess", (void*)&hook_TerminateProcess, g_tp_saved, &g_tp_addr);
+    install_exit_trap("ntdll.dll", "RtlExitUserProcess", (void*)&hook_RtlExitUserProcess, g_rep_saved, &g_rep_addr);
+    install_exit_trap("ntdll.dll", "NtTerminateProcess", (void*)&hook_NtTerminateProcess, g_ntp_saved, &g_ntp_addr);
+    // NtTerminateThread forwards via a raw syscall (see hook), which needs the stub's syscall number.
+    // Only install this hook if the stub matches the expected 4C 8B D1 / B8 <ssn> form — otherwise a
+    // format mismatch would forward with a wrong number and break every thread exit. Extract from the
+    // live function bytes BEFORE patching, and skip the hook entirely if it doesn't match.
+    if (HMODULE nt = GetModuleHandleA("ntdll.dll")) {
+        if (auto* p = (const uint8_t*)GetProcAddress(nt, "NtTerminateThread")) {
+            if (p[0] == 0x4C && p[1] == 0x8B && p[2] == 0xD1 && p[3] == 0xB8) {
+                g_ntt_ssn = *(const uint32_t*)(p + 4);
+                install_exit_trap("ntdll.dll", "NtTerminateThread", (void*)&hook_NtTerminateThread, g_ntt_saved, &g_ntt_addr);
+            }
+        }
+    }
+    fprintf(stderr, "[app] WIN_EXIT_TRACE installed (EP=%p TP=%p RtlEUP=%p NtTP=%p NtTT=%p ssn=0x%lx)\n",
+            g_ep_addr, g_tp_addr, g_rep_addr, g_ntp_addr, g_ntt_addr, (unsigned long)g_ntt_ssn);
+}
+}  // namespace
+#endif
+
+// Present-layer readiness gate. On Windows, SDL_CreateWindow (with SDL_WINDOW_VULKAN, which loads
+// the NVIDIA Vulkan ICD and creates the HWND) crashes the process to a silent exit(0) when the guest
+// thread runs concurrently — the guest's process-wide vectored exception handler and its large
+// address-space reservations race the window/driver bring-up. Booting the guest only AFTER the whole
+// present layer (window + Vulkan device + swapchain) is up removes the race. The window comes up in a
+// few ms, so the boot delay is negligible. Gated to Windows so Linux/macOS startup is byte-identical.
+namespace {
+std::mutex g_present_ready_mx;
+std::condition_variable g_present_ready_cv;
+bool g_present_ready = false;
+void wait_present_ready() {
+    std::unique_lock<std::mutex> lk(g_present_ready_mx);
+    g_present_ready_cv.wait(lk, [] { return g_present_ready; });
+}
+void signal_present_ready() {
+    { std::lock_guard<std::mutex> lk(g_present_ready_mx); g_present_ready = true; }
+    g_present_ready_cv.notify_all();
+}
+}  // namespace
+
 int main(int argc, char** argv) {
+    // Unbuffered stderr: on Windows the CRT fully buffers stderr when redirected to a file, so an
+    // abrupt process exit (guest exit(), unhandled fault) drops the last diagnostics — exactly the
+    // lines that explain the exit. Line/char buffering keeps the crash tail intact. (Harmless on
+    // POSIX where stderr is already unbuffered.)
+    setvbuf(stderr, nullptr, _IONBF, 0);
+#ifdef _WIN32
+    if (getenv("PROSPER_WIN_EXIT_TRACE")) install_win_exit_trace();
+    SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
+        fprintf(stderr, "[app] unhandled exception code=0x%08lx rip=0x%llx addr=0x%llx\n",
+                (unsigned long)ep->ExceptionRecord->ExceptionCode,
+                (unsigned long long)(uintptr_t)ep->ExceptionRecord->ExceptionAddress,
+                ep->ExceptionRecord->NumberParameters >= 2
+                    ? (unsigned long long)ep->ExceptionRecord->ExceptionInformation[1] : 0ull);
+        fflush(nullptr);
+        return EXCEPTION_CONTINUE_SEARCH;
+    });
+#endif
     bool testPattern = false; int exitAfter = 0; uint32_t winW = 1280, winH = 720;
     std::string dump;
     for (int i = 1; i < argc; i++) {
@@ -435,6 +601,9 @@ int main(int argc, char** argv) {
         };
         if (!boot_program(dump, prog, &err, install_backends)) { fprintf(stderr, "[app] boot failed: %s\n", err.c_str()); return 1; }
         guestThread = std::thread([]{
+#ifdef _WIN32
+            wait_present_ready();   // don't race SDL_CreateWindow / Vulkan bring-up (silent exit(0))
+#endif
             const BootResult result = run_entry(prog.imgs[0]);
             fprintf(stderr,
                     "[app] guest thread ended: kind=%d detail=%s rip=0x%llx addr=0x%llx "
@@ -499,6 +668,7 @@ int main(int argc, char** argv) {
 
     fprintf(stderr, "[app] window up (%s). Close the window or press Esc to quit.\n",
             testPattern ? "test-pattern" : "waiting for guest frames");
+    signal_present_ready();   // present layer is up: release the guest boot (Windows gate; no-op elsewhere)
 
     // Keyboard controls augment SDL pad 0; the fallback keeps physical pads and their analog state.
     prosper::input::pad_set_backend(&g_keyboard_pad);
