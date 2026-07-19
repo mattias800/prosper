@@ -147,6 +147,78 @@ void audio_reset() {
     g_sink.store(&g_default_sink);
 }
 
+// --- legacy-path diagnostics --------------------------------------------------------------
+// PROSPER_AUDIOLOG=1: log port opens (raw args + decoded format), SetVolume args, and a
+// once-per-second PCM peak per port, so a silent/quiet/garbled title shows WHERE the signal
+// degrades (no output calls vs silent PCM vs wrong format vs volume mapping).
+// PROSPER_AUDIO_DUMP=PATH: append each port's raw output() grains to PATH.portN.raw for
+// offline analysis, mirroring PROSPER_SHADER_DUMP's capture-first workflow.
+namespace {
+
+int audiolog_level() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PROSPER_AUDIOLOG"); v = (e && *e) ? atoi(e) : 0; if (v < 0) v = 0; }
+    return v;
+}
+bool audiolog() { return audiolog_level() >= 1; }
+
+const char* audio_dump_path() {
+    static const char* p = getenv("PROSPER_AUDIO_DUMP");
+    return (p && *p) ? p : nullptr;
+}
+
+// Peak |sample| of one grain, normalized to [0,1] for either sample format.
+double audio_pcm_peak(const void* pcm, int frames, const AudioPortInfo& info) {
+    if (!pcm || frames <= 0) return 0.0;
+    const int n = frames * info.channels;
+    double peak = 0.0;
+    if (info.fmt == AudioFmt::F32) {
+        const float* s = (const float*)pcm;
+        for (int i = 0; i < n; i++) { double v = s[i] < 0 ? -(double)s[i] : (double)s[i]; if (v > peak) peak = v; }
+    } else {
+        const int16_t* s = (const int16_t*)pcm;
+        for (int i = 0; i < n; i++) { double v = (s[i] < 0 ? -(double)s[i] : (double)s[i]) / 32768.0; if (v > peak) peak = v; }
+    }
+    return peak;
+}
+
+// Once-per-second peak report + optional raw dump. Called from the output paths (guest audio
+// thread) with the port's decoded info; per-port state, no cross-port locking needed beyond
+// the distinct slots.
+void audio_observe_output(int handle, const void* pcm, int frames, const AudioPortInfo& info) {
+    if (!audiolog() && !audio_dump_path()) return;
+    if (handle < 1 || handle > kMaxPorts) return;
+    static struct Obs { uint64_t calls = 0; double peak = 0.0; FILE* dump = nullptr;
+                        std::chrono::steady_clock::time_point last{}; } st[kMaxPorts];
+    Obs& s = st[handle - 1];
+    s.calls++;
+    double p = audio_pcm_peak(pcm, frames, info);
+    if (p > s.peak) s.peak = p;
+    if (audiolog()) {
+        auto now = std::chrono::steady_clock::now();
+        if (s.last.time_since_epoch().count() == 0) s.last = now;
+        if (now - s.last >= std::chrono::seconds(1)) {
+            fprintf(stderr, "[audio] port %d: %llu output calls, 1s-peak=%.4f (fmt=%s ch=%d freq=%d grain=%d)\n",
+                    handle, (unsigned long long)s.calls, s.peak,
+                    info.fmt == AudioFmt::F32 ? "f32" : "s16", info.channels, info.freq, info.grain);
+            s.last = now; s.peak = 0.0;
+        }
+    }
+    if (const char* base = audio_dump_path()) {
+        if (!s.dump) {
+            char path[1024];
+            snprintf(path, sizeof path, "%s.port%d.raw", base, handle);
+            s.dump = fopen(path, "ab");
+            fprintf(stderr, "[audio] port %d: dumping raw PCM to %s (fmt=%s ch=%d freq=%d grain=%d)\n",
+                    handle, path, info.fmt == AudioFmt::F32 ? "f32" : "s16",
+                    info.channels, info.freq, info.grain);
+        }
+        if (s.dump && pcm && frames > 0) fwrite(pcm, 1, (size_t)frames * audio_frame_bytes(info), s.dump);
+    }
+}
+
+} // namespace
+
 // --- sceAudioOut HLE --------------------------------------------------------------------
 HLE(audio_init) { (void)a0; return 0; }   // sceAudioOutInit: idempotent success
 
@@ -171,6 +243,12 @@ HLE(audio_open) {
           break;
       } }
     if (!handle) return kAudioErrPortFull;
+    if (audiolog())
+        fprintf(stderr, "[audio] open: handle=%d userId=%d type=%d index=%d len=%llu freq=%llu param=0x%llx"
+                        " -> fmt=%s ch=%d grain=%d\n",
+                handle, (int)a0, type, (int)a2, (unsigned long long)a3, (unsigned long long)a4,
+                (unsigned long long)a5, info.fmt == AudioFmt::F32 ? "f32" : "s16",
+                info.channels, info.grain);
     if (auto* s = audio_sink()) s->open(handle, info);
     return (uint64_t)handle;
 }
@@ -180,6 +258,7 @@ HLE(audio_output) {
     AudioPortInfo info;
     { std::lock_guard<std::mutex> lk(g_mx); Port* p = port_of((int)a0); if (!p) return kAudioErrInvalidPort; info = p->info; }
     if (a1 == 0) return 0;   // drain/flush: nothing buffered in the headless model
+    audio_observe_output((int)a0, P(a1), info.grain, info);
     if (auto* s = audio_sink()) s->output((int)a0, P(a1), info.grain);
     return (uint64_t)info.grain;
 }
@@ -199,7 +278,8 @@ HLE(audio_outputs) {
         AudioPortInfo info; bool ok;
         { std::lock_guard<std::mutex> lk(g_mx); Port* p = port_of(arr[i].handle); ok = (p != nullptr); if (ok) info = p->info; }
         if (!ok) continue;
-        if (arr[i].ptr) { if (auto* s = audio_sink()) s->output(arr[i].handle, P(arr[i].ptr), info.grain); }
+        if (arr[i].ptr) { audio_observe_output(arr[i].handle, P(arr[i].ptr), info.grain, info);
+                          if (auto* s = audio_sink()) s->output(arr[i].handle, P(arr[i].ptr), info.grain); }
         if (!have) { grain = info.grain; have = true; }
     }
     return grain;
@@ -209,6 +289,9 @@ HLE(audio_outputs) {
 HLE(audio_set_volume) {
     uint32_t mask = (uint32_t)a1;
     const int* vols = (const int*)P(a2);
+    if (audiolog() && vols)
+        fprintf(stderr, "[audio] set_volume: handle=%d mask=0x%x vols=[%d,%d,%d,%d,%d,%d,%d,%d]\n",
+                (int)a0, mask, vols[0], vols[1], vols[2], vols[3], vols[4], vols[5], vols[6], vols[7]);
     { std::lock_guard<std::mutex> lk(g_mx);
       Port* p = port_of((int)a0); if (!p) return kAudioErrInvalidPort;
       audio_apply_channel_volumes(p->vol, mask, vols); }
