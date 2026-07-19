@@ -1927,7 +1927,8 @@ std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& i
                  ((in.opcode >= 0x128 && in.opcode <= 0x12A) || in.opcode == 0x176));
             if (!scalar_side_effect &&
                 (in.fmt == Rdna2Format::VOP1 || in.fmt == Rdna2Format::VOP2 || in.fmt == Rdna2Format::VOP3 ||
-                 in.fmt == Rdna2Format::MIMG || in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::DS ||
+                 in.fmt == Rdna2Format::MIMG || in.fmt == Rdna2Format::MUBUF ||
+                 in.fmt == Rdna2Format::MTBUF || in.fmt == Rdna2Format::DS ||
                  sopp_is_noop(in))) {
                 continue;
             }
@@ -2151,7 +2152,8 @@ std::unordered_set<uint32_t> waterfall_branches(const std::vector<Rdna2Inst>& in
             bool skip_ok =
                 (p.fmt == Rdna2Format::SOP1 && (p.opcode == 0x03 || p.opcode == 0x04)) ||   // s_mov_b32/b64
                 p.fmt == Rdna2Format::VOP1 || p.fmt == Rdna2Format::VOP2 || p.fmt == Rdna2Format::VOP3 ||
-                p.fmt == Rdna2Format::VOPC || p.fmt == Rdna2Format::MIMG || p.fmt == Rdna2Format::MUBUF ||
+                p.fmt == Rdna2Format::VOPC || p.fmt == Rdna2Format::MIMG ||
+                p.fmt == Rdna2Format::MUBUF || p.fmt == Rdna2Format::MTBUF ||
                 sopp_is_noop(p);
             if (skip_ok) continue;
             // The SCC producer: a 64-bit wave-mask logical op (s_and/or/xor/andn2_b64, SCC = result!=0).
@@ -2277,6 +2279,9 @@ uint32_t vgpr_write_count(const Rdna2Inst& in) {
                 case 0x3: case 0x7: case 0xE: return 4;
                 default: return 1;
             }
+        case Rdna2Format::MTBUF:
+            if (in.opcode >= 4u) return 0; // stores read VDATA; they do not write it
+            return in.opcode + 1u;
         case Rdna2Format::MIMG: {
             if (in.opcode == 0x47 || in.opcode == 0x57) return 4;  // gather4 always returns four texels
             uint32_t n = 0;
@@ -2924,7 +2929,7 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
                 for (uint32_t k = 0; k < vgpr_write_count(in); ++k)
                     vregs.insert(in.dst.value + (int)k);
                 break;
-            case Rdna2Format::MUBUF: case Rdna2Format::MIMG:
+            case Rdna2Format::MUBUF: case Rdna2Format::MTBUF: case Rdna2Format::MIMG:
                 for (uint32_t k = 0; k < vgpr_write_count(in); ++k)
                     vregs.insert(in.dst.value + (int)k);
                 break;
@@ -4663,7 +4668,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             return true;
         }
-        case Rdna2Format::MUBUF: {
+        case Rdna2Format::MUBUF:
+        case Rdna2Format::MTBUF: {
             // Untyped buffer LOAD — the per-lane fetch mechanism (vertex fetch et al.). Modeled as a
             // per-lane load from the bound constant buffer: byte addr = (offen ? VADDR : 0) + SOFFSET
             // + inst-offset; index = addr>>2; N dwords -> VDATA..+N-1. Descriptor (SRSRC), idxen*stride,
@@ -4672,7 +4678,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // VDATA VGPRs stay untouched on hardware and the data lands in LDS — translating it as
             // a VGPR load would clobber a live register AND drop the LDS write. Reject until a
             // buffer->LDS model exists.
-            if (in.mubuf_lds) { ok = false; return true; }
+            if (in.fmt == Rdna2Format::MUBUF && in.mubuf_lds) { ok = false; return true; }
+            // MTBUF opcodes 8..15 pack D16 results/inputs two per VGPR. Reusing the ordinary or raw
+            // MUBUF cases below would silently apply the wrong register layout, so fail closed until
+            // that packing is modeled.
+            if (in.fmt == Rdna2Format::MTBUF && in.opcode >= 8u) { ok = false; return true; }
+            // TFE appends a fault/status result after the data VGPRs. Dropping that write can corrupt
+            // later register consumers, so reject until status-return semantics are implemented.
+            if (in.fmt == Rdna2Format::MTBUF && in.mtbuf_tfe) { ok = false; return true; }
             uint32_t n = 0; bool is_format = false, is_store = false, is_atomic = false;
             bool raw_subword = false, raw_signed = false;
             uint32_t raw_bits = 32;
@@ -4773,19 +4786,25 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         dyn_vfetch = res->cls == ResourceClass::VertexBuffer &&
                                      (in.src[0].value == 0 || srsrc_rewritten);
                     }
-                    if (!res && !srsrc_rewritten)
-                        res = rt->by_sgpr_base_cls(in.src[1].value, ResourceClass::VertexBuffer);
-                    uint32_t srt_tag = 0;
-                    if (!res && sreg_srt_range_tag(rs, in.src[1].value, 4, srt_tag))
-                        res = rt->by_srt_offset(srt_tag);
-                    // DIRECT user-data V# of any class (#273 — DOLL's title post PSes format-fetch
-                    // through a V# the metadata labels a CONSTANT buffer sharp at s[24:27]): the class
-                    // label doesn't change the descriptor's fields. Only when the SGPR was never
-                    // REWRITTEN in-shader (no rs.sreg entry in its four-dword range) — a reloaded
-                    // register no longer holds the seed-time sharp, and trusting it would fetch through
-                    // a stale descriptor.
-                    if (!res && !srsrc_rewritten)
-                        res = rt->by_sgpr_base(in.src[1].value);
+                    // MTBUF must resolve through the exact dynamic-use entry. The fold validates the
+                    // live V# FORMAT != INVALID before publishing that pc. Falling back to an older
+                    // metadata resource here can resurrect an unbound V# that happens to share its
+                    // SGPR/SRT identity. MUBUF retains its established metadata fallbacks.
+                    if (in.fmt != Rdna2Format::MTBUF) {
+                        if (!res && !srsrc_rewritten)
+                            res = rt->by_sgpr_base_cls(in.src[1].value, ResourceClass::VertexBuffer);
+                        uint32_t srt_tag = 0;
+                        if (!res && sreg_srt_range_tag(rs, in.src[1].value, 4, srt_tag))
+                            res = rt->by_srt_offset(srt_tag);
+                        // DIRECT user-data V# of any class (#273 — DOLL's title post PSes format-fetch
+                        // through a V# the metadata labels a CONSTANT buffer sharp at s[24:27]): the class
+                        // label doesn't change the descriptor's fields. Only when the SGPR was never
+                        // REWRITTEN in-shader (no rs.sreg entry in its four-dword range) — a reloaded
+                        // register no longer holds the seed-time sharp, and trusting it would fetch through
+                        // a stale descriptor.
+                        if (!res && !srsrc_rewritten)
+                            res = rt->by_sgpr_base(in.src[1].value);
+                    }
                 }
                 if (!res) {
                     if (getenv("PROSPER_DBG")) {   // which provenance step failed for this format load
@@ -4802,8 +4821,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 binding = res->binding;
                 stride = res->stride;
-                fmt = res->format;
-                fmt_ncomp = res->num_components;   // for the format default-fill below (#368)
+                if (in.fmt == Rdna2Format::MTBUF) {
+                    // Unlike MUBUF format ops, MTBUF owns the type in the instruction. gfx1030 uses
+                    // the same combined 7-bit BUF_FMT table as Gen5 V# descriptors.
+                    rdna2_buffer_format(in.mtbuf_format, &fmt, &fmt_ncomp);
+                    if (fmt == DataFormat::Unknown || fmt_ncomp == 0) {
+                        ok = false; return true;
+                    }
+                } else {
+                    fmt = res->format;
+                    fmt_ncomp = res->num_components;   // format default-fill below (#368)
+                }
             } else if (rt) {
                 // RAW (untyped) MUBUF with a resource table: resolve SRSRC (src[1]) exactly like the
                 // format path — a raw buffer op targets whatever buffer its V# describes, NOT a fixed
@@ -4956,20 +4984,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // Store the VDATA VGPRs (in.dst..+n-1). Integer sub-dword formats (Uint8/Sint8/...) have
                 // no packing path here -> reject rather than mis-store (loads extend them; stores don't pack).
                 if (packed_word || (packed && (is_uint || is_sint))) { ok = false; return true; }
+                // MTBUF's instruction format owns the physical component count. A wider opcode still uses
+                // identity selection (for example XY00), so Z/W must not spill into adjacent memory.
+                const uint32_t store_n = in.fmt == Rdna2Format::MTBUF && fmt_ncomp < n
+                                           ? fmt_ncomp : n;
                 auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
                 if (!packed) {
                     // Raw/Float32/Uint32: one dword per component.
-                    for (uint32_t k = 0; k < n; k++) {
+                    for (uint32_t k = 0; k < store_n; k++) {
                         uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
                         b.cbuf_store(kidx, vread(in.dst.value + (int)k), binding, rs.exec_narrowed, rs.exec);
                     }
                 } else {
                     // Packed UNORM/SNORM/Float16: pack the components tightly into ceil(n*bytes/4) dwords
                     // (inverse of the packed load). Each dword ORs together the fields that land in it.
-                    const uint32_t dwords = (n * comp_bytes + 3) / 4;
+                    const uint32_t dwords = (store_n * comp_bytes + 3) / 4;
                     for (uint32_t d = 0; d < dwords; d++) {
                         uint32_t acc = b.uconst(0);
-                        for (uint32_t k = 0; k < n; k++) {
+                        for (uint32_t k = 0; k < store_n; k++) {
                             uint32_t byte_off = k * comp_bytes;
                             if (byte_off / 4 != d) continue;
                             uint32_t field = is_half ? b.pack_half_lo(vread(in.dst.value + (int)k))
@@ -4992,16 +5024,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 int d = in.dst.value + (int)k;
                 uint32_t old = vreg_old(b, rs, d);
                 uint32_t value;
-                // Format default-fill (#368): BUFFER_LOAD_FORMAT_* returns only the components the V#'s
-                // format defines; a component the OPCODE requests beyond that (e.g. _xyzw against a
-                // 32_32_32 position, or _xyz against a 32_32 UV) is filled with the standard vector
-                // default — 0 for G/B/Z, 1 for A/W — NOT read from adjacent memory (which yielded the
-                // next vertex's bytes, or robust-0 at the buffer tail, so a vec4 read of a vec3 attribute
-                // got W = garbage/0 instead of 1.0 -> broken transforms). Only for format loads with a
-                // known component count; untyped raw MUBUF loads keep every opcode component.
+                // Format default-fill (#368): a requested component beyond the format's component
+                // count is not read from adjacent memory. MUBUF takes DST_SEL from the V# contract
+                // (0 for G/B/Z, 1 for A/W). MTBUF forces identity selection from its instruction
+                // format (X000/XY00/XYZ0/XYZW), so every absent component is zero.
                 if (is_format && fmt_ncomp && k >= fmt_ncomp) {
                     uint32_t one = fmt_is_int ? 1u : 0x3f800000u;   // integer 1 vs float 1.0 (raw bits)
-                    value = b.uconst(k == 3 ? one : 0u);            // W/A -> 1, G/B/Z -> 0
+                    value = b.uconst(in.fmt != Rdna2Format::MTBUF && k == 3 ? one : 0u);
                 } else if (raw_subword) {
                     // Raw byte/short loads use their full byte address, unlike typed packed-format
                     // loads whose component packing is descriptor-defined. A 16-bit access may begin
@@ -7550,6 +7579,7 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                 }
                 case Rdna2Format::MUBUF:  return i.opcode <= 0x07u ||                    // load/store_format_*
                                                  (i.opcode >= 0x0Cu && i.opcode <= 0x0Fu);  // load_dword/x2/x4/x3 (need the V#)
+                case Rdna2Format::MTBUF:  return i.opcode <= 0x07u && !i.mtbuf_tfe;
                 case Rdna2Format::VINTRP: return true;               // handled in the fragment shell
                 default: return false;
             }

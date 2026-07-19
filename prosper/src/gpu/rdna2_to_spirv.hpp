@@ -141,7 +141,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
 // Recompile a pixel/fragment shader to a fragment SPIR-V module: run the VALU, and on EXP to MRT0/1
 // write vec4(src0..3) to the matching color output. NULL-only shaders retain discard/EXEC effects and
 // intentionally expose no color output. Returns {} if unsupported / no implemented export.
-// An optional ShaderResourceTable enables memory ops (SMEM/MUBUF) with resolved bindings.
+// An optional ShaderResourceTable enables memory ops (SMEM/MUBUF/MTBUF) with resolved bindings.
 std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          const ShaderResourceTable* rt = nullptr,
                                          const PixelSystemInputMapping* system_inputs = nullptr,
@@ -168,7 +168,7 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
 struct RecompileCoverage {
     uint32_t total = 0, alu = 0, exports = 0, unsupported = 0;
     // Instructions the recompiler handles GIVEN the right context (a resource table for MIMG /
-    // buffer_load_format, or a fragment stage for VINTRP) but that recompile_coverage — which runs
+    // MUBUF / MTBUF, or a fragment stage for VINTRP) but that recompile_coverage — which runs
     // table-less on a compute shell — cannot exercise. Counting them apart from `unsupported` gives an
     // honest "recompilable in context" number; the table-less `alu`/`unsupported` split understates it.
     uint32_t table_dependent = 0;

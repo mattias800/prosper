@@ -564,6 +564,77 @@ int main() {
                              &direct_copy_table, direct_copy_config).empty(),
           "#636: instruction-provenance table keeps the Dead Cells format-copy dispatch realizable");
 
+    // MTBUF's instruction format must also survive the production compute discovery path. Both V#s
+    // deliberately carry a different but valid 32_FLOAT format; the encoded gfx1030 BUF_FMT 56
+    // supplies Unorm8x4 for the load and store independently of descriptor dword3.
+    const uint32_t direct_mtbuf_copy[] = {
+        0xE9C32000u, 0x80000100u,   // tbuffer_load_format_xyzw ..., s[0:3], fmt 56, idxen
+        0xE9C72000u, 0x80010101u,   // tbuffer_store_format_xyzw ..., s[4:7], fmt 56, idxen
+        0xBF810000u,
+    };
+    const uint32_t direct_mtbuf_seed[8] = {
+        0x00020000u, 0x00040000u, 16u, 22u << 12,
+        0x00030000u, 0x00040000u, 16u, 22u << 12,
+    };
+    std::vector<SrtUse> direct_mtbuf_uses;
+    const std::vector<DynFetch> direct_mtbuf_fetches = resolve_dynamic_fetch(
+        direct_mtbuf_copy, std::size(direct_mtbuf_copy), direct_mtbuf_seed, 8, 0,
+        &direct_mtbuf_uses);
+    CHECK(direct_mtbuf_fetches.size() == 1 &&
+              direct_mtbuf_fetches[0].instruction_format == 56u &&
+              direct_mtbuf_fetches[0].desc.format == DataFormat::Float32,
+          "MTBUF load discovery retains the instruction format over a different valid V# format");
+    CHECK(direct_mtbuf_uses.size() == 1 &&
+              direct_mtbuf_uses[0].instruction_format == 56u &&
+              direct_mtbuf_uses[0].use_pc == 2,
+          "MTBUF store discovery retains instruction format and exact consumer pc");
+    ShaderResourceTable direct_mtbuf_table;
+    add_compute_buffer_resources(direct_mtbuf_table, direct_mtbuf_copy,
+                                 std::size(direct_mtbuf_copy), direct_mtbuf_seed, 8);
+    assign_convention_bindings(direct_mtbuf_table, 2);
+    bool mtbuf_formats_ok = direct_mtbuf_table.resources.size() == 2;
+    for (const auto& resource : direct_mtbuf_table.resources)
+        mtbuf_formats_ok &= resource.format == DataFormat::Unorm8 &&
+                            resource.num_components == 4;
+    ComputeShaderConfig direct_mtbuf_config;
+    direct_mtbuf_config.user_sgprs.assign(direct_mtbuf_seed, direct_mtbuf_seed + 8);
+    direct_mtbuf_config.local_x = direct_mtbuf_config.local_y =
+        direct_mtbuf_config.local_z = 1;
+    CHECK(mtbuf_formats_ok &&
+              !recompile_compute(direct_mtbuf_copy, std::size(direct_mtbuf_copy),
+                                 &direct_mtbuf_table, direct_mtbuf_config).empty(),
+          "production compute discovery emits instruction-typed MTBUF source and destination resources");
+    const uint32_t invalid_mtbuf_seed[8] = {
+        0x00020000u, 0x00040000u, 16u, 0u,
+        0x00030000u, 0x00040000u, 16u, 0u,
+    };
+    std::vector<SrtUse> invalid_mtbuf_uses;
+    const std::vector<DynFetch> invalid_mtbuf_fetches = resolve_dynamic_fetch(
+        direct_mtbuf_copy, std::size(direct_mtbuf_copy), invalid_mtbuf_seed, 8, 0,
+        &invalid_mtbuf_uses);
+    ShaderResourceTable invalid_mtbuf_table;
+    add_compute_buffer_resources(invalid_mtbuf_table, direct_mtbuf_copy,
+                                 std::size(direct_mtbuf_copy), invalid_mtbuf_seed, 8);
+    CHECK(invalid_mtbuf_fetches.empty() && invalid_mtbuf_uses.empty() &&
+              invalid_mtbuf_table.resources.empty(),
+          "MTBUF leaves FORMAT=INVALID descriptors unbound instead of replacing their format");
+    // Metadata discovery may already have published the same invalid direct V# for raw SMEM use.
+    // MTBUF must not resurrect that older SGPR-keyed resource when its exact validated pc entry is
+    // absent.
+    ShaderResourceTable invalid_mtbuf_metadata;
+    { ShaderResource r{}; r.cls = ResourceClass::ConstantBuffer;
+      r.format = DataFormat::Unknown; r.num_components = 0; r.gpu_addr = 0x20000u;
+      r.size = 64u; r.stride = 4u; r.sgpr_base = 0u;
+      invalid_mtbuf_metadata.resources.push_back(r); }
+    assign_convention_bindings(invalid_mtbuf_metadata, 2);
+    ComputeShaderConfig invalid_mtbuf_config;
+    invalid_mtbuf_config.user_sgprs.assign(invalid_mtbuf_seed, invalid_mtbuf_seed + 8);
+    invalid_mtbuf_config.local_x = invalid_mtbuf_config.local_y =
+        invalid_mtbuf_config.local_z = 1;
+    CHECK(recompile_compute(direct_mtbuf_copy, std::size(direct_mtbuf_copy),
+                            &invalid_mtbuf_metadata, invalid_mtbuf_config).empty(),
+          "MTBUF cannot fall back to a metadata resource for an INVALID live V#");
+
     // DynFetch shifts graphics vertex descriptors by a constant instruction offset because their
     // special address path drops the original OFFSET/SOFFSET. Compute resources use ConstantBuffer's
     // faithful MUBUF path instead, so the production helper must retain base B and let that path add

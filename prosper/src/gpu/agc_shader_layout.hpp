@@ -5,7 +5,7 @@
 //
 // Layouts cross-checked against Kyty (PS5/RDNA2 gfx1030, same target): the SDK `Shader`/`ShaderUserData`
 // (Shader.h:911/974) and the buffer resource descriptor V# (ShaderBufferResource getters: Base48,
-// Stride[16:29], NumRecords=word2, Nfmt[12:14], Dfmt[15:18]).
+// Stride[16:29], NumRecords=word2, Format[12:18]).
 #pragma once
 #include "shader_resources.hpp"
 #include <array>
@@ -99,7 +99,8 @@ AgcPixelInputControls derive_agc_pixel_input_controls(const AgcShaderHeader* pro
                                                       const AgcShaderHeader* pixel);
 
 // A decoded buffer resource descriptor (V#, 4 dwords). base/stride/num_records per Kyty's getters;
-// format+num_components from the (dfmt,nfmt) split. `size_bytes` is the backing region size.
+// format+num_components come from gfx1030's combined seven-bit FORMAT. `size_bytes` is the backing
+// region size.
 struct DecodedBufferDescriptor {
     uint64_t   base = 0;
     uint32_t   stride = 0;
@@ -190,11 +191,6 @@ void warn_unsupported_image_view(const DecodedImageDescriptor& descriptor);
 // Map a T#'s 9-bit Gen5 IMG_FMT value to format info. Returns false (out left Unknown/zero) for
 // values not in the table — callers must not assume RGBA8 for those (#65). Pure; exposed for testing.
 bool gen5_image_format(uint32_t fmt, Gen5ImageFormatInfo* out);
-
-// Map a GCN/Gen5 buffer (DFMT, NFMT) pair to a DataFormat + component count. Pure.
-// Decode an RDNA2 (GFX10/PS5) buffer V# combined 7-bit FORMAT field (dword3 bits[18:12]) into a
-// DataFormat + component count. (Replaces the GCN dfmt/nfmt split, which is wrong for PS5 V#s.)
-void rdna2_buffer_format(uint32_t fmt, DataFormat* out_fmt, uint32_t* out_components);
 
 // FRONT-HALF DELIVERABLE: build the resource table a shader uses. `user_sgprs` is the shader's bound
 // user-data SGPR block (num_user_sgprs dwords) — the V# descriptors live there at each sharp's
