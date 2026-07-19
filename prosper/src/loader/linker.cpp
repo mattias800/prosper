@@ -100,9 +100,10 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,
     if (getenv("PROSPER_INITLOG")) {
         for (size_t i = 0; i < out.mods.size(); i++) {
             const Module& m = *out.mods[i];
-            fprintf(stderr, "[initlog] module %zu base=0x%llx init_va=0x%llx init_array_va=0x%llx entries=%llu\n",
+            fprintf(stderr, "[initlog] module %zu base=0x%llx init_va=0x%llx init_array_va=0x%llx entries=%llu path=%s\n",
                     i, (unsigned long long)out.imgs[i].base, (unsigned long long)m.init_va,
-                    (unsigned long long)m.init_array_va, (unsigned long long)(m.init_array_sz / 8));
+                    (unsigned long long)m.init_array_va, (unsigned long long)(m.init_array_sz / 8),
+                    m.path.c_str());
         }
     }
     for (size_t i = out.mods.size(); i-- > 1; ) {
