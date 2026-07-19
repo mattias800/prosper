@@ -269,6 +269,15 @@ default budget (`PROSPER_COMPUTE_MEMORY_POOL_MB=<MiB>`). `PROSPER_NO_MEMORY_POOL
 graphics and compute pools. Decoded texture scratch vectors are also retained across callbacks; they
 are storage only, and every partial decode/read explicitly clears its unwritten tail.
 
+Storage buffers whose complete backing range passes the executor's generation-scoped readability guard
+are handed to the synchronous Vulkan backend as immutable views of unified guest memory. The backend hashes
+and copies every visible byte into its upload arena before returning; ordered submission batches retain only
+that completed Vulkan upload, never the guest pointer. This removes frontend allocation and copy work without
+adding cross-submit freshness or lifetime assumptions. Captured host backing follows the same rule only when
+it covers the complete requested range, and partial/unreadable ranges retain the zero-filled owned-copy
+fallback. Set `PROSPER_NO_FRONTEND_BUFFER_VIEW=1` to restore per-reference materialization for an A/B.
+Renderer timing reports buffer `views`, logical bytes, and bytes that still required materialization.
+
 Within one renderer callback, repeated guest-backed texture descriptions reuse the first decoded
 pixel buffer. A bounded process-wide cache also covers guest-backed linear and tiled 2D sampled
 textures in `Unorm8` component widths 1-4 and BC1-BC7 formats. Every cross-submit lookup validates

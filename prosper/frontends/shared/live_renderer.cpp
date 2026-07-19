@@ -488,13 +488,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 uint64_t color_target_writes = 0, color_target_write_hits = 0;
                 uint64_t color_target_sample_hits = 0, color_target_readbacks = 0;
                 uint64_t color_target_cached_bytes = 0, color_target_cached_entries = 0;
-                uint64_t textures = 0, texture_reuses = 0, buffers = 0;
+                uint64_t textures = 0, texture_reuses = 0, buffers = 0, buffer_views = 0;
                 uint64_t persistent_hits = 0, persistent_misses = 0, persistent_invalidations = 0;
                 uint64_t persistent_submit_reuses = 0, persistent_validations = 0;
                 uint64_t persistent_validation_bytes = 0;
                 uint64_t persistent_watch_reuses = 0, persistent_watch_dirty = 0;
                 uint64_t persistent_watch_unknown = 0, persistent_watch_disabled = 0;
-                uint64_t texture_bytes = 0, buffer_bytes = 0;
+                uint64_t texture_bytes = 0, buffer_bytes = 0, buffer_materialized_bytes = 0;
                 double texture_ms = 0, buffer_ms = 0;
             };
             struct RttTimingRecord {
@@ -694,6 +694,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             static std::vector<std::vector<uint8_t>> texstore;
             size_t texstore_used = 0;
             std::unordered_map<TextureDecodeKey, DecodedTexture, TextureDecodeKeyHash> decoded_textures;
+            const bool use_direct_buffer_views =
+                getenv("PROSPER_NO_FRONTEND_BUFFER_VIEW") == nullptr;
             static std::unordered_map<TextureDecodeKey, PersistentDecodedTexture, TextureDecodeKeyHash>
                 persistent_decoded_textures;
             static size_t persistent_decoded_texture_bytes = 0;
@@ -735,6 +737,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     bool resource_persistent_submit_reuse = false;
                     bool resource_persistent_miss = false;
                     bool resource_persistent_invalidation = false;
+                    bool resource_buffer_view = false;
                     prosper::test::FrameResource fr; fr.binding = r.binding; fr.set = set;
                     fr.is_storage_image = r.cls == RC::StorageImage;
                     // Captured replays preserve the logical guest address for RT identity but provide
@@ -747,6 +750,29 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         size_t take = static_cast<size_t>(std::min<uint64_t>(n, r.host_data_size - off));
                         std::memcpy(dst, r.host_data + off, take);
                         return take;
+                    };
+                    // Avoid allocating and copying storage buffers that are already present in stable,
+                    // readable unified guest memory. The callback and backend upload are synchronous;
+                    // compute/DMA boundaries split graphics spans before this point. The submit-scoped
+                    // readability guard proves the complete range; an invalid tail retains the copied
+                    // fallback.
+                    auto direct_resource = [&](uint64_t addr, size_t n) -> const uint8_t* {
+                        if (!n || addr < 0x1000 || addr > UINT64_MAX - n ||
+                            (addr & (alignof(uint32_t) - 1))) return nullptr;
+                        if (r.host_data) {
+                            if (addr < r.gpu_addr) return nullptr;
+                            const uint64_t off = addr - r.gpu_addr;
+                            if (off > r.host_data_size || n > r.host_data_size - off) return nullptr;
+                            const uint8_t* source = r.host_data + off;
+                            return (reinterpret_cast<uintptr_t>(source) &
+                                    (alignof(uint32_t) - 1)) ? nullptr : source;
+                        }
+                        // Reuse the executor's submit-scoped range cache; on Windows the same guard
+                        // also materializes sparse direct-memory pages when necessary.
+                        if (n > UINT32_MAX ||
+                            !prosper::gpu::guest_readable(addr, static_cast<uint32_t>(n)))
+                            return nullptr;
+                        return reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(addr));
                     };
                     auto copy_dcc_metadata = [&](uint8_t* dst, size_t n) -> size_t {
                         if (!r.dcc_metadata_host_data)
@@ -1693,23 +1719,43 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     } else {
                         fr.buffer_identity = r.gpu_addr;
                         uint32_t nb = std::min(r.size ? r.size : 256u, 1u << 20) & ~3u;   // cap 1 MB, dword-aligned
-                        if (nb >= 4) {
-                            std::vector<uint8_t> tmp(nb, 0);
-                            if (copy_resource(tmp.data(), r.gpu_addr, nb) > 0)
-                                fr.dwords.assign((const uint32_t*)tmp.data(), (const uint32_t*)(tmp.data() + nb));
+                        if (use_direct_buffer_views && nb >= 4) {
+                            if (const uint8_t* source = direct_resource(r.gpu_addr, nb)) {
+                                fr.dwords_view = reinterpret_cast<const uint32_t*>(source);
+                                fr.dwords_view_count = nb / sizeof(uint32_t);
+                                resource_buffer_view = true;
+                            }
                         }
-                        if (fr.dwords.empty()) fr.dwords.assign(64, 0);
+                        if (!fr.dwords_view_count && use_direct_buffer_views) {
+                            if (nb >= 4) {
+                                fr.dwords.assign(nb / sizeof(uint32_t), 0);
+                                if (!copy_resource(reinterpret_cast<uint8_t*>(fr.dwords.data()),
+                                                   r.gpu_addr, nb))
+                                    fr.dwords.clear();
+                            }
+                            if (fr.dwords.empty()) fr.dwords.assign(64, 0);
+                        } else if (!use_direct_buffer_views) {
+                            if (nb >= 4) {
+                                std::vector<uint8_t> tmp(nb, 0);
+                                if (copy_resource(tmp.data(), r.gpu_addr, nb) > 0)
+                                    fr.dwords.assign(
+                                        reinterpret_cast<const uint32_t*>(tmp.data()),
+                                        reinterpret_cast<const uint32_t*>(tmp.data() + nb));
+                            }
+                            if (fr.dwords.empty()) fr.dwords.assign(64, 0);
+                        }
                         // PROSPER_CBLOG: log each constant buffer's first 4 dwords as floats, once per
                         // address. If a scene draw's color/tint CB is (0,0,0,0), the PS outputs black
                         // regardless of the (correctly-decoded) texture — the #300 black-scene suspect.
                         if (getenv("PROSPER_CBLOG") && r.cls == RC::ConstantBuffer) {
                             static std::set<uint64_t> cbseen;
                             if (cbseen.insert(r.gpu_addr).second) {
-                                const float* fp = (const float*)fr.dwords.data();
-                                size_t n = fr.dwords.size();
+                                const uint32_t* words = fr.buffer_words_data();
+                                size_t n = fr.buffer_word_count();
+                                const float* fp = reinterpret_cast<const float*>(words);
                                 fprintf(stderr, "[cb] bind=%u addr=0x%llx size=%u dw=%08x %08x %08x %08x  f=%.3f %.3f %.3f %.3f\n",
                                         r.binding, (unsigned long long)r.gpu_addr, (unsigned)r.size,
-                                        n>0?fr.dwords[0]:0, n>1?fr.dwords[1]:0, n>2?fr.dwords[2]:0, n>3?fr.dwords[3]:0,
+                                        n>0?words[0]:0, n>1?words[1]:0, n>2?words[2]:0, n>3?words[3]:0,
                                         n>0?fp[0]:0.f, n>1?fp[1]:0.f, n>2?fp[2]:0.f, n>3?fp[3]:0.f);
                             }
                         }
@@ -1746,8 +1792,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 }
                             }
                         } else {
+                            const size_t buffer_bytes = fr.buffer_word_count() * sizeof(uint32_t);
                             pending_timing.buffers++;
-                            pending_timing.buffer_bytes += static_cast<uint64_t>(fr.dwords.size()) * 4;
+                            pending_timing.buffer_views += resource_buffer_view;
+                            pending_timing.buffer_bytes += buffer_bytes;
+                            if (!resource_buffer_view)
+                                pending_timing.buffer_materialized_bytes += buffer_bytes;
                             pending_timing.buffer_ms += elapsed;
                         }
                     }
@@ -1786,7 +1836,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         d.kind == prosper::gpu::SpirvDescriptorKind::StorageImage;
                     const uint64_t available = first == resources.end() ? 0 :
                         (first->is_texture() ? (uint64_t)first->tw * first->th * first->td * 4
-                                             : first->dwords.size() * 4);
+                                             : first->buffer_word_count() * 4);
                     const bool wrong_type = first != resources.end() &&
                         (wants_buffer ? first->is_texture()
                                       : (!first->is_texture() ||
@@ -2642,13 +2692,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     uint64_t color_target_writes = 0, color_target_write_hits = 0;
                     uint64_t color_target_sample_hits = 0, color_target_readbacks = 0;
                     uint64_t color_target_cached_bytes = 0, color_target_cached_entries = 0;
-                    uint64_t textures = 0, texture_reuses = 0, buffers = 0;
+                    uint64_t textures = 0, texture_reuses = 0, buffers = 0, buffer_views = 0;
                     uint64_t persistent_hits = 0, persistent_misses = 0, persistent_invalidations = 0;
                     uint64_t persistent_submit_reuses = 0, persistent_validations = 0;
                     uint64_t persistent_validation_bytes = 0;
                     uint64_t persistent_watch_reuses = 0, persistent_watch_dirty = 0;
                     uint64_t persistent_watch_unknown = 0, persistent_watch_disabled = 0;
-                    uint64_t texture_bytes = 0, buffer_bytes = 0;
+                    uint64_t texture_bytes = 0, buffer_bytes = 0, buffer_materialized_bytes = 0;
                     double texture_ms = 0, buffer_ms = 0;
                 };
                 static TimingTotals totals;
@@ -2700,8 +2750,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     timing.persistent_watch_unknown += pending_timing.persistent_watch_unknown;
                     timing.persistent_watch_disabled += pending_timing.persistent_watch_disabled;
                     timing.buffers += pending_timing.buffers;
+                    timing.buffer_views += pending_timing.buffer_views;
                     timing.texture_bytes += pending_timing.texture_bytes;
                     timing.buffer_bytes += pending_timing.buffer_bytes;
+                    timing.buffer_materialized_bytes += pending_timing.buffer_materialized_bytes;
                     timing.texture_ms += pending_timing.texture_ms;
                     timing.buffer_ms += pending_timing.buffer_ms;
                 };
@@ -2776,12 +2828,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             totals.color_target_cached_bytes / (1024.0 * 1024.0));
                     fprintf(stderr,
                             "[render-timing] resources textures=%llu reused=%llu %.1f MiB %.2f ms/submit; "
-                            "buffers=%llu %.1f MiB %.2f ms/submit\n",
+                            "buffers=%llu views=%llu logical=%.1f MiB materialized=%.1f MiB "
+                            "%.2f ms/submit\n",
                             (unsigned long long)totals.textures,
                             (unsigned long long)totals.texture_reuses,
                             totals.texture_bytes / (1024.0 * 1024.0), totals.texture_ms / nsub,
                             (unsigned long long)totals.buffers,
-                            totals.buffer_bytes / (1024.0 * 1024.0), totals.buffer_ms / nsub);
+                            (unsigned long long)totals.buffer_views,
+                            totals.buffer_bytes / (1024.0 * 1024.0),
+                            totals.buffer_materialized_bytes / (1024.0 * 1024.0),
+                            totals.buffer_ms / nsub);
                     fprintf(stderr,
                             "[render-timing] texture_cache hits=%llu submit_reuse=%llu misses=%llu "
                             "watch_reuse=%llu watch_dirty=%llu watch_unknown=%llu watch_disabled=%llu "
@@ -2838,14 +2894,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             "[render-window] frontend submits=%llu callbacks=%.1f avg_ms: total=%.2f "
                             "build_resources=%.2f backend=%.2f output_copy=%.2f other=%.2f; "
                             "resources textures=%.1f "
-                            "reused=%.1f %.1f MiB %.2f ms buffers=%.1f %.1f MiB %.2f ms\n",
+                            "reused=%.1f %.1f MiB %.2f ms buffers=%.1f views=%.1f "
+                            "logical=%.1f MiB materialized=%.1f MiB %.2f ms\n",
                             (unsigned long long)window.submits, window.callbacks / wn,
                             window.total_ms / wn, window.build_resources_ms / wn,
                             window.backend_ms / wn, window.output_copy_ms / wn, window_other / wn,
                             window.textures / wn,
                             window.texture_reuses / wn,
                             window.texture_bytes / (wn * 1024.0 * 1024.0), window.texture_ms / wn,
-                            window.buffers / wn, window.buffer_bytes / (wn * 1024.0 * 1024.0),
+                            window.buffers / wn, window.buffer_views / wn,
+                            window.buffer_bytes / (wn * 1024.0 * 1024.0),
+                            window.buffer_materialized_bytes / (wn * 1024.0 * 1024.0),
                             window.buffer_ms / wn);
                     const double window_backend_detail_ms = window.backend_target_ms +
                         window.backend_draw_setup_ms + window.backend_record_upload_ms +

@@ -273,6 +273,29 @@ int main() {
                   shared_stats.descriptor_pools == 1,
               "identical draw contracts share layouts and one call-wide descriptor pool");
 
+        // The live frontend can hand the synchronous backend a proven-readable immutable guest view
+        // instead of copying it into each FrameResource. Exercise that representation independently of
+        // guest memory and require it to preserve rendering plus exact-content upload reuse.
+        prosper::test::BackendDraw shared_contents0 = d0;
+        prosper::test::BackendDraw shared_contents1 = d1;
+        for (prosper::test::BackendDraw* draw : {&shared_contents0, &shared_contents1}) {
+            draw->R[0].dwords.clear();
+            draw->R[0].dwords_view = filler.dwords.data();
+            draw->R[0].dwords_view_count = filler.dwords.size();
+            draw->R[1].dwords.clear();
+            draw->R[1].dwords_view = buffer.dwords.data();
+            draw->R[1].dwords_view_count = buffer.dwords.size();
+        }
+        const std::vector<uint8_t> shared_contents = prosper::test::render_draws_rgba(
+            {shared_contents0, shared_contents1}, W, H);
+        const auto shared_contents_stats = prosper::test::backend_resource_reuse_stats();
+        const auto pool_after_shared_contents = prosper::test::render_host_buffer_pool_stats();
+        CHECK(shared_contents == shared,
+              "immutable buffer views render byte-identically to owned vectors");
+        CHECK(shared_contents_stats.buffer_references == 4 &&
+                  shared_contents_stats.unique_buffers == 2,
+              "immutable buffer views retain exact backend upload reuse");
+
         prosper::test::BackendDraw capacity_peer0 = d0;
         prosper::test::BackendDraw capacity_peer1 = d1;
         capacity_peer0.R[1].dwords.resize(61);
@@ -281,8 +304,8 @@ int main() {
             {capacity_peer0, capacity_peer1}, W, H);
         const auto pool_after_second = prosper::test::render_host_buffer_pool_stats();
         const auto layout_stats = prosper::test::backend_resource_reuse_stats();
-        CHECK(pool_after_second.hits == pool_after_first.hits + 1 &&
-                  pool_after_second.misses == pool_after_first.misses &&
+        CHECK(pool_after_second.hits == pool_after_shared_contents.hits + 1 &&
+                  pool_after_second.misses == pool_after_shared_contents.misses &&
                   pooled_again == shared,
               "next logical size reuses the mapped arena byte-identically");
         CHECK(layout_stats.persistent_pipeline_layout_hits >= 1 &&

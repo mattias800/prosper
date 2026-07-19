@@ -274,6 +274,40 @@ initial binding miss, the next-call hit, byte-identical output, and bounded evic
 current call's binding. Later end-to-end controls coincided with unrelated GPU saturation, so the cache and
 CPU phase counters above are used for attribution rather than presenting those wall-clock rates as FPS gains.
 
+## Evergate direct frontend buffer views (2026-07-19)
+
+After parallel draw realization, dense Evergate submits still constructed roughly 3,300 storage-buffer
+resources for only about 4 MiB of logical bytes. The frontend allocated a zeroed byte vector, copied guest
+memory into it, then allocated and copied again into each `FrameResource`; the backend immediately hashed and
+uploaded those immutable bytes synchronously. Reusing materializations by guest identity was rejected after
+an exact A/B: only about one third of references repeated and the hash-map/ownership overhead made the buffer
+bucket 2-3 ms slower.
+
+The final path instead reuses the executor's mapping-generation-scoped readable-range cache. A complete
+readable guest or capture range becomes a non-owning immutable `FrameResource` view; the backend hashes and
+copies it into the mapped Vulkan upload arena before returning. Submission batching retains only the Vulkan
+objects after that point. Partial or unreadable ranges keep the existing zero-filled owned-copy fallback, and
+`PROSPER_NO_FRONTEND_BUFFER_VIEW=1` restores materialization for comparison.
+
+A native Windows / RTX 4090 A/B used one final RelWithDebInfo binary, separate fresh saves, native 1920x1080
+rendering on every submit, the documented read-anchored Evergate route, and six screenshots spaced over 360
+rendered frames. The table averages the two closest dense 25-submit windows (about 489/479 and 490/479 draws):
+
+| Measurement | Materialized control | Direct views |
+|---|---:|---:|
+| Draws / submit | 484.1 | 483.8 |
+| Frontend resource construction | 46.3 ms | 34.9 ms |
+| Buffer construction bucket | 13.1 ms | 5.1 ms |
+| Frontend callback total | 86.8 ms | 74.4 ms |
+| Backend execution | 39.1 ms | 38.5 ms |
+| Complete 360-frame route | 43.43 s | 39.62 s |
+
+The dense windows used direct views for all but roughly two of 3,300 buffer references and materialized less
+than 0.05 MiB per submit. Backend time remained flat, while frontend construction fell by about 11.4 ms and
+the complete route improved by 8.8%. Exact renderer snapshots remain the semantic guard; the next dominant
+Windows cost is cross-submit texture validation, which still compares roughly 129 MiB of encoded source per
+dense frame because page-protection write watches are not ABI-safe there.
+
 ## Dead Cells backend upload duplication (2026-07-15)
 
 Dead Cells exposed a second duplication layer after the frontend decode caches. The frontend correctly
