@@ -191,6 +191,23 @@ int main() {
             CHECK(ratio == 1.0f, "GetDisplaySafeAreaInfo -> ratio 1.0 (full display, no viewport collapse)");
         } else CHECK(false, "sceSystemServiceGetDisplaySafeAreaInfo registered");
 
+        // sceSystemServiceGetHdrToneMapLuminance(out*) -> exact three-float PS5 ABI. A success-only
+        // stub left all three display-setup inputs poisoned, while an oversized fill would corrupt
+        // adjacent guest stack storage.
+        if (HleFn f = Hle::lookup("mPpPxv5CZt4")) {
+            struct GuardedLuminance { float value[3]; uint8_t canary[4]; } out;
+            memset(&out, 0xAB, sizeof out);
+            CHECK(f((uint64_t)(uintptr_t)&out.value, 0, 0, 0, 0, 0) == 0,
+                  "GetHdrToneMapLuminance -> OK");
+            CHECK(out.value[0] == 80.0f && out.value[1] == 1000.0f && out.value[2] == 0.0f,
+                  "GetHdrToneMapLuminance writes deterministic full-frame/peak/min values");
+            bool canary_ok = true;
+            for (uint8_t byte : out.canary) if (byte != 0xAB) canary_ok = false;
+            CHECK(canary_ok, "GetHdrToneMapLuminance writes exactly its 12-byte ABI object");
+            CHECK(f(0, 0, 0, 0, 0, 0) == 0x80A10003ull,
+                  "GetHdrToneMapLuminance rejects a null output pointer");
+        } else CHECK(false, "sceSystemServiceGetHdrToneMapLuminance registered");
+
         // sceAppContentTemporaryDataMount2(opt, char mp[16]) -> exactly "/temp0\0" (7 bytes), never 16.
         if (HleFn f = Hle::lookup("buYbeLOGWmA")) {
             char mp[16]; memset(mp, 0xAB, sizeof mp);
