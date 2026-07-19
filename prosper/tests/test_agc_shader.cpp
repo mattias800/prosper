@@ -357,10 +357,14 @@ int main() {
     prosper::gpu::clear_shader_recompile_cache();
     const auto serial_draws = prosper::gpu::realize_gpustate_draws(
         parallel_state, 0x10000, 1.0f, 1.0f, nullptr, false, false);
+    // Cold-start only the analysis layer so the parallel run races its two address-local inserts while
+    // retaining warm compiled shaders. Entry bytes must remain exact even if several workers miss.
+    prosper::gpu::clear_shader_analysis_cache();
     const auto parallel_before = prosper::gpu::parallel_draw_realization_stats();
     const auto parallel_draws = prosper::gpu::realize_gpustate_draws(
         parallel_state, 0x10000, 1.0f, 1.0f, nullptr, true, true);
     const auto parallel_after = prosper::gpu::parallel_draw_realization_stats();
+    const auto parallel_analysis = prosper::gpu::shader_analysis_cache_stats();
     bool equivalent = serial_draws.size() == parallel_state.draws.size() &&
                       parallel_draws.size() == serial_draws.size();
     for (size_t i = 0; equivalent && i < serial_draws.size(); ++i) {
@@ -391,6 +395,9 @@ int main() {
                   parallel_before.semantic_draws + parallel_state.draws.size() &&
               parallel_after.worker_threads > parallel_before.worker_threads,
           "dense draw realization records one multi-threaded batch");
+    CHECK(parallel_analysis.entries == 2 &&
+              parallel_analysis.bytes == sizeof(parallel_vs) + sizeof(parallel_ps),
+          "parallel cold analysis keeps exact entry and byte accounting");
 
     // Exercise persistent-worker generation changes repeatedly. This catches an early return or a
     // stale batch/context reference that a single batch cannot expose, while warm shader-cache reuse

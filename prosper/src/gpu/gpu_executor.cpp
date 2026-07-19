@@ -558,33 +558,55 @@ std::shared_ptr<const ShaderCodeAnalysis> analyze_shader_code_cached(const uint3
     }
 
     const uintptr_t address = reinterpret_cast<uintptr_t>(code);
-    {
+    // Copy the immutable candidate under the mutex, then validate guest bytes without it. Dense draw
+    // realization performs these exact checks from several workers; holding one global cache mutex
+    // across guest_readable + memcmp otherwise serializes every warm lookup.
+    for (;;) {
+        std::shared_ptr<const ShaderCodeAnalysis> cached;
+        {
+            std::lock_guard lock(cache.mutex);
+            auto found = cache.entries.find(address);
+            if (found == cache.entries.end()) {
+                ++cache.stats.misses;
+                break;
+            }
+            cached = found->second.analysis;
+        }
+        const bool compatible_length = cached->bounded_span
+            ? cached->code.size() <= dwords : cached->source_dwords == dwords;
+        const uint64_t code_bytes = static_cast<uint64_t>(cached->code.size()) * sizeof(uint32_t);
+        const bool readable = code_bytes == 0 ||
+                              (code_bytes <= UINT32_MAX &&
+                               guest_readable(address, static_cast<uint32_t>(code_bytes)));
+        const bool matches = compatible_length && readable &&
+            (code_bytes == 0 ||
+             memcmp(code, cached->code.data(), static_cast<size_t>(code_bytes)) == 0);
+
         std::lock_guard lock(cache.mutex);
         auto found = cache.entries.find(address);
-        if (found != cache.entries.end()) {
-            const auto& cached = found->second.analysis;
-            const bool compatible_length = cached->bounded_span
-                ? cached->code.size() <= dwords : cached->source_dwords == dwords;
-            const uint64_t code_bytes = static_cast<uint64_t>(cached->code.size()) * sizeof(uint32_t);
-            const bool readable = code_bytes == 0 ||
-                                  (code_bytes <= UINT32_MAX &&
-                                   guest_readable(address, static_cast<uint32_t>(code_bytes)));
-            if (compatible_length && readable &&
-                (code_bytes == 0 ||
-                 memcmp(code, cached->code.data(), static_cast<size_t>(code_bytes)) == 0)) {
-                ++cache.stats.hits;
-                found->second.last_use = ++cache.use_counter;
-                return cached;
-            }
-            cache.stats.bytes -= cached->bytes;
-            cache.entries.erase(found);
-            ++cache.stats.invalidations;
+        if (found == cache.entries.end() || found->second.analysis != cached)
+            continue; // Evicted/replaced while unlocked: validate the current version instead.
+        if (matches) {
+            ++cache.stats.hits;
+            found->second.last_use = ++cache.use_counter;
+            return cached;
         }
+        cache.stats.bytes -= cached->bytes;
+        cache.entries.erase(found);
+        ++cache.stats.invalidations;
         ++cache.stats.misses;
+        break;
     }
 
     auto analysis = analyze();
     std::lock_guard lock(cache.mutex);
+    // Another cold worker may have populated this address while analysis ran. Keep exact byte
+    // accounting when replacing it; each returned shared_ptr remains independently valid.
+    auto concurrent = cache.entries.find(address);
+    if (concurrent != cache.entries.end()) {
+        cache.stats.bytes -= concurrent->second.analysis->bytes;
+        cache.entries.erase(concurrent);
+    }
     constexpr size_t max_entries = 4096;
     const uint64_t limit = shader_analysis_cache_limit_bytes();
     while (!cache.entries.empty() &&
