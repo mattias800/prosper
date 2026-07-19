@@ -296,9 +296,12 @@ device-image budget are separate: a hot immutable atlas can occupy space in both
 residency for lower frame time.
 
 Intermediate live color targets remain on the GPU by default. A later graphics pass that samples the
-same guest target identity, extent, and format binds the retained image directly; scanout, captures,
-pixel diagnostics, same-target feedback, and authoritative-readback spans keep the CPU path. Guest GPU
-writes invalidate overlapping retained targets through the ordered write observer. Set
+same guest target identity, extent, and format binds the retained image directly. Intermediate scanout
+spans also defer readback until the final renderer callback; a final scanout pass reads the accumulated
+target normally, while a submit that ends elsewhere materializes its cached scanout once before publishing.
+Ordered DMA producers, captures, pixel diagnostics, same-target feedback, and other authoritative-readback
+spans keep the CPU path. Guest GPU writes invalidate overlapping retained targets through the ordered write
+observer. Set `PROSPER_NO_INTERMEDIATE_SCANOUT_DEFER=1` to restore per-span scanout readback for an A/B. Set
 `PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1` for a complete frontend A/B, or
 `PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS=1` to disable backend retention independently. The backend
 cache defaults to 256 MiB and can be changed with `PROSPER_BACKEND_TARGET_CACHE_MB=<MiB>`.

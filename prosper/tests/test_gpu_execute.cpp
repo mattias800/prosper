@@ -219,6 +219,9 @@ int main() {
               phases[0].first_span && !phases[0].final_span &&
               !phases[1].first_span && phases[1].final_span,
               "ordered executor brackets one submit across two graphics spans");
+        CHECK(phases[0].allows_deferred_scanout_readback() &&
+              !phases[1].allows_deferred_scanout_readback(),
+              "only a non-final graphics span may defer scanout readback across compute");
         CHECK(overlapping == GuestGpuWriteQuery::Overlap &&
               unrelated == GuestGpuWriteQuery::Unchanged,
               "write journal distinguishes overlapping and unrelated in-submit GPU writes");
@@ -260,6 +263,9 @@ int main() {
         CHECK(dma_phases.size() == 2 && dma_phases[0].authoritative_readback &&
               !dma_phases[1].authoritative_readback,
               "the graphics span immediately before DMA requests authoritative target readback");
+        CHECK(!dma_phases[0].allows_deferred_scanout_readback() &&
+              !dma_phases[1].allows_deferred_scanout_readback(),
+              "DMA producers and final spans cannot defer scanout readback");
     }
 
     // A rendered target's authoritative bytes can live only in the backend cache. Resolve the
@@ -541,6 +547,9 @@ int main() {
         CHECK(phases[0].first_span && !phases[0].final_span &&
               !phases[1].first_span && phases[1].final_span,
               "lazy-span terminal callback closes the submit exactly once");
+        CHECK(phases[0].allows_deferred_scanout_readback() == failed_first &&
+              !phases[1].allows_deferred_scanout_readback(),
+              "terminal finalization preserves the prior span's readback requirement");
     }
 
     CHECK(!have_submit_renderer(), "no live renderer registered by default (game path stays inert)");

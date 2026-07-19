@@ -1150,6 +1150,10 @@ struct LiveRenderPhase {
     // The next ordered operation reads render-target bytes on the CPU. Persistent Vulkan targets
     // must synchronously read back this span instead of deferring their authoritative pixels.
     bool authoritative_readback = false;
+
+    bool allows_deferred_scanout_readback() const {
+        return !final_span && !authoritative_readback;
+    }
 };
 LiveRenderPhase live_render_phase();
 
