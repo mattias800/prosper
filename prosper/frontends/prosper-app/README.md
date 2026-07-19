@@ -83,6 +83,11 @@ For frontend A/B diagnostics, `PROSPER_APP_DISABLE_AUDIO=1`, `PROSPER_APP_DISABL
 the core's realtime silent audio sink, keyboard/scripted pad input, or headless dialog auto-dismiss.
 These switches isolate frontend-specific behavior without requiring a separate build.
 
+The SDL dialog backend presents message/error/save confirmations, IME text entry, and SaveData
+percentage progress. Progress uses a non-focusable utility window updated from the app's main thread,
+so the title keeps presenting and retains keyboard/controller focus. SaveData LIST selection remains a
+separate virtual-slot follow-up; prosper never opens an arbitrary host file picker for guest save data.
+
 - Two Vulkan contexts by design (`docs/FRONTEND_APP.md`): the core renders headless; the app owns a
   separate presentation device; frames cross as CPU pixels via `present_readback`.
 - On window-close the guest thread is detached and reclaimed by process exit (a cooperative

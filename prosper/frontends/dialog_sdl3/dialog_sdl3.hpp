@@ -2,8 +2,8 @@
 //
 // Built only when -DPROSPER_APP=ON (needs SDL3 video). Installs a PlatformUi that shows real
 // SDL_ShowMessageBox dialogs for the guest's MsgDialog / ErrorDialog, so a windowed session presents
-// them instead of the core's headless auto-dismiss. ImeDialog text entry (which needs a custom text
-// field, not a message box) is not handled yet, so it falls back to the core's headless default.
+// them instead of the core's headless auto-dismiss. Custom main-thread windows provide ImeDialog text
+// entry, SaveData confirmations, and non-modal SaveData percentage progress.
 #pragma once
 
 namespace prosper {
@@ -16,8 +16,8 @@ bool install_sdl3_platform_ui();
 void shutdown_sdl3_platform_ui();
 
 // Pump pending interactive UI on the MAIN thread — call once per frame from the app's event/present
-// loop. The ImeDialog text-entry modal (SDL windowing is main-thread only) runs here; MsgDialog/
-// ErrorDialog use SDL_ShowMessageBox directly and don't need it. Safe to call when nothing is pending.
+// loop. ImeDialog/SaveData UI (SDL windowing is main-thread only) runs here; MsgDialog/ErrorDialog use
+// SDL_ShowMessageBox directly and don't need it. Safe to call when nothing is pending.
 void sdl_platform_ui_pump();
 
 } // namespace prosper
