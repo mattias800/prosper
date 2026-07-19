@@ -301,19 +301,36 @@ bool apply_pad_script(HostPadState& s, int64_t frame, int64_t read) {
     return true;
 }
 
-// Record the final button stream as explicit flip ranges. Completed intervals are flushed immediately;
-// only a button still held when a process is force-killed can be absent from the route tail.
-void pad_record(int64_t frame, uint32_t buttons) {
+PadRecordAxis pad_record_axis() {
+    static const PadRecordAxis axis = [] {
+        const char* configured = getenv("PROSPER_PAD_RECORD_AXIS");
+        if (!configured || !*configured || strcmp(configured, "flip") == 0)
+            return PadRecordAxis::display_flip;
+        if (strcmp(configured, "pad-read") == 0) return PadRecordAxis::pad_read;
+        fprintf(stderr,
+                "[pad] PROSPER_PAD_RECORD_AXIS: unknown value '%s'; using flip\n", configured);
+        return PadRecordAxis::display_flip;
+    }();
+    return axis;
+}
+
+// Record the final button stream as explicit flip or successful-pad-read ranges. Completed intervals
+// are flushed immediately; only a button still held when a process is force-killed can be absent from
+// the route tail. Metadata polls do not initialize or advance a pad-read-axis recording.
+void pad_record(int64_t frame, int64_t read, uint32_t buttons) {
     static const char* output = getenv("PROSPER_PAD_RECORD");
     if (!output || !*output) return;
+    const PadRecordAxis axis = pad_record_axis();
+    if (axis == PadRecordAxis::pad_read && read < 0) return;
+    const int64_t position = axis == PadRecordAxis::pad_read ? read : frame;
     struct Recorder {
+        explicit Recorder(PadRecordAxis selected) : state(selected) {}
         std::mutex mutex;
         bool initialized = false;
         FILE* file = nullptr;
-        uint32_t previous = 0;
-        int64_t start = 0;
+        PadRecordState state;
     };
-    static Recorder recorder;
+    static Recorder recorder(axis);
     std::lock_guard<std::mutex> lock(recorder.mutex);
     if (!recorder.initialized) {
         recorder.initialized = true;
@@ -324,27 +341,26 @@ void pad_record(int64_t frame, uint32_t buttons) {
             fprintf(stderr, "[pad] PROSPER_PAD_RECORD: cannot create '%s': %s\n",
                     path.parent_path().string().c_str(), ec.message().c_str());
         } else if ((recorder.file = fopen(output, "w"))) {
-            fprintf(recorder.file,
-                    "# recorded PROSPER_PAD_SCRIPT route; fN is display flips since first pad poll\n");
+            if (axis == PadRecordAxis::pad_read) {
+                fprintf(recorder.file,
+                        "# recorded PROSPER_PAD_SCRIPT route; pN is successful pad reads since first input-state read\n");
+            } else {
+                fprintf(recorder.file,
+                        "# recorded PROSPER_PAD_SCRIPT route; fN is display flips since first pad poll\n");
+            }
             fflush(recorder.file);
-            fprintf(stderr, "[pad] recording input route -> %s\n", output);
+            fprintf(stderr, "[pad] recording input route (%s axis) -> %s\n",
+                    axis == PadRecordAxis::pad_read ? "pad-read" : "flip", output);
         } else {
             fprintf(stderr, "[pad] PROSPER_PAD_RECORD: cannot open '%s': %s\n",
                     output, strerror(errno));
         }
     }
-    if (!recorder.file || buttons == recorder.previous) return;
-    if (recorder.previous) {
-        const int64_t end = std::max(frame, recorder.start + 1);
-        const std::string names = pad_button_names(recorder.previous);
-        if (!names.empty()) {
-            fprintf(recorder.file, "f%lld-%lld:%s\n", (long long)recorder.start,
-                    (long long)end, names.c_str());
-            fflush(recorder.file);
-        }
-    }
-    recorder.previous = buttons;
-    recorder.start = frame;
+    if (!recorder.file) return;
+    const std::string completed = recorder.state.observe(position, buttons);
+    if (completed.empty()) return;
+    fputs(completed.c_str(), recorder.file);
+    fflush(recorder.file);
 }
 
 // Snapshot the controller for a given pad handle via the installed backend. With no host frontend
@@ -364,7 +380,7 @@ HostPadState poll_controller(int /*handle*/, const char* what, bool consume_inpu
     const int64_t frame = pad_frame_now();
     const int64_t read = consume_input_read ? pad_read_now() : -1;
     apply_pad_script(s, frame, read);
-    pad_record(frame, s.buttons);
+    pad_record(frame, read, s.buttons);
     padlog_once(what, &s);
     return s;
 }

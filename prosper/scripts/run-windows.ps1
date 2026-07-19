@@ -7,6 +7,8 @@ param(
     [string]$GuestArgs = '-force-gfx-direct',
     [string]$SavedataDir,
     [string]$Record,
+    [ValidateSet('flip', 'pad-read')]
+    [string]$RecordAxis = 'flip',
     [int]$Frames = 0,
     [int]$Jobs = 8,
     [ValidateSet('fifo', 'mailbox', 'immediate')]
@@ -67,6 +69,9 @@ if (-not $TestPattern) {
         throw "Dump is not a directory: $Dump"
     }
 }
+if (-not $Record -and $RecordAxis -ne 'flip') {
+    throw '-RecordAxis requires -Record.'
+}
 
 $cmake = (Get-Command cmake -ErrorAction Stop).Source
 $cache = Join-Path $BuildDir 'CMakeCache.txt'
@@ -110,7 +115,12 @@ if ($TestPattern) {
 }
 if ($Frames -gt 0) { $runArgs += @('--frames', "$Frames") }
 if ($PresentMode -ne 'fifo') { $runArgs += @('--present-mode', $PresentMode.ToLowerInvariant()) }
-if ($Record) { $runArgs += @('--record', [IO.Path]::GetFullPath($Record)) }
+if ($Record) {
+    $runArgs += @('--record', [IO.Path]::GetFullPath($Record))
+    if ($RecordAxis -ne 'flip') {
+        $runArgs += @('--record-axis', $RecordAxis.ToLowerInvariant())
+    }
+}
 
 Write-Host "Starting $app"
 & $app @runArgs

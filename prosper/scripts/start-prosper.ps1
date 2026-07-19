@@ -6,6 +6,8 @@ param(
     [string]$SavedataDir = (Join-Path $PSScriptRoot 'savedata'),
     [string]$GuestArgs = '-force-gfx-direct',
     [string]$Record,
+    [ValidateSet('flip', 'pad-read')]
+    [string]$RecordAxis = 'flip',
     [int]$Frames = 0,
     [ValidateSet('fifo', 'mailbox', 'immediate')]
     [string]$PresentMode = 'fifo',
@@ -17,6 +19,9 @@ $app = Join-Path $PSScriptRoot 'prosper-app.exe'
 
 if (-not (Test-Path -LiteralPath $app -PathType Leaf)) {
     throw "prosper-app.exe must be beside this script: $app"
+}
+if (-not $Record -and $RecordAxis -ne 'flip') {
+    throw '-RecordAxis requires -Record.'
 }
 
 $runArgs = @()
@@ -44,6 +49,9 @@ if ($Record) {
     $recordParent = Split-Path -Parent $recordPath
     if ($recordParent) { New-Item -ItemType Directory -Path $recordParent -Force | Out-Null }
     $runArgs += @('--record', $recordPath)
+    if ($RecordAxis -ne 'flip') {
+        $runArgs += @('--record-axis', $RecordAxis.ToLowerInvariant())
+    }
 }
 
 & $app @runArgs

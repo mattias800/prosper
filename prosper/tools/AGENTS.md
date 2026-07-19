@@ -54,8 +54,10 @@ line, `#` comments,
 and explicit ranges such as `f300-340:cross`. Full-deflection stick actions use names such as
 `left-stick-left` and can be combined with buttons using `+`. See `docs/INPUT_REPLAY.md`.
 Set `PROSPER_PAD_RECORD=<path>` on any runner, or use `prosper-app --record <path>`, to capture the
-final button stream in that format. Completed button intervals are flushed immediately; scripted stick
-directions are supported for playback but are not yet emitted by the recorder.
+final button stream in that format. Recording uses `fA-B:` flip ranges by default; set
+`PROSPER_PAD_RECORD_AXIS=pad-read`, or add `prosper-app --record-axis pad-read`, for `pA-B:` ranges
+that advance only on successful input-state reads. Completed button intervals are flushed immediately;
+scripted stick directions are supported for playback but are not yet emitted by the recorder.
 Set `PROSPER_PAD_SCRIPT_LOG=1` to log each scripted state transition observed at a pad poll.
 For long exploratory runs, add `PROSPER_PAD_SCRIPT_RELOAD=1` to live-reload an `@file` route while
 preserving its original time/flip/read origin; append only future windows and confirm the reload log.

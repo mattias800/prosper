@@ -180,6 +180,26 @@ uint32_t pad_button_by_name(const std::string& name);
 // stable order so recorded routes have deterministic text.
 std::string pad_button_names(uint32_t mask);
 
+// Recording uses the same explicit-range syntax accepted by PROSPER_PAD_SCRIPT. Keep transition
+// tracking pure so interval boundaries and axis prefixes can be tested without an output file or
+// a controller backend. The caller supplies either the current display-flip or successful-read
+// position; observe() returns a completed interval when the button state changes.
+enum class PadRecordAxis : uint8_t {
+    display_flip,
+    pad_read,
+};
+
+class PadRecordState {
+public:
+    explicit PadRecordState(PadRecordAxis axis = PadRecordAxis::display_flip) : axis_(axis) {}
+    std::string observe(int64_t position, uint32_t buttons);
+
+private:
+    PadRecordAxis axis_;
+    uint32_t previous_ = 0;
+    int64_t start_ = 0;
+};
+
 // Parse ';'- or newline-separated entries. Actions are '+'-joined button names and/or full-stick
 // directions such as "left-stick-left" and "right-stick-up". A time token starting with 'f' is
 // frame-anchored (flips since the first pad poll); one starting with 'p' is pad-read-anchored
