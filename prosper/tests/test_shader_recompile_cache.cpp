@@ -334,9 +334,10 @@ int main() {
     (void)recompile_graphics_shader_cached(
         ShaderProgramStage::Fragment, mutable_ps.data(), mutable_ps.size(), nullptr);
     analysis_stats = shader_analysis_cache_stats();
+    stats = shader_recompile_cache_stats();
     CHECK(analysis_stats.hits == 1 && analysis_stats.misses == 2 &&
-              analysis_stats.invalidations == 1,
-          "same-address shader mutation invalidates immutable analysis before reuse");
+              analysis_stats.invalidations == 1 && stats.hits == 1 && stats.misses == 2,
+          "same-address shader mutation invalidates analysis and misses the compiled cache");
 
     // Live realization retains the cache allocation directly. Repeated hits must share one immutable
     // word vector, and eviction/reset must not invalidate a DrawItem that still owns that version.

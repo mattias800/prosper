@@ -139,6 +139,7 @@ struct ShaderCompileKey {
     // Aliases ShaderCodeAnalysis::code and keeps that immutable analysis alive. Warm lookups used to
     // copy and re-hash the complete raw program for every draw before reaching the shader cache.
     std::shared_ptr<const std::vector<uint32_t>> code;
+    uint64_t code_hash = 0;
     std::vector<ShaderResourceCompileKey> resources;
     size_t cached_hash = 0;
 
@@ -167,6 +168,12 @@ static uint64_t hash_mix(uint64_t hash, uint64_t value) {
     return hash;
 }
 
+static uint64_t hash_shader_code(const std::vector<uint32_t>& code) {
+    uint64_t hash = 1469598103934665603ull;
+    for (uint32_t word : code) hash = hash_mix(hash, word);
+    return hash;
+}
+
 struct ShaderCompileKeyHash {
     static size_t compute(const ShaderCompileKey& key) {
         uint64_t hash = 1469598103934665603ull;
@@ -187,8 +194,7 @@ struct ShaderCompileKeyHash {
         hash = hash_mix(hash, key.has_pcrel_dispatch);
         if (key.has_pcrel_dispatch) hash = hash_mix(hash, key.pcrel_dispatch_target);
         hash = hash_mix(hash, key.code ? key.code->size() : 0u);
-        if (key.code)
-            for (uint32_t word : *key.code) hash = hash_mix(hash, word);
+        hash = hash_mix(hash, key.code_hash);
         hash = hash_mix(hash, key.resources.size());
         for (const auto& resource : key.resources) {
             hash = hash_mix(hash, resource.cls);
@@ -248,6 +254,7 @@ struct ShaderDecodeCache {
 
 struct ShaderCodeAnalysis {
     std::vector<uint32_t> code;
+    uint64_t code_hash = 0;
     PcrelDispatchInfo pcrel_dispatch;
     uint64_t identity = 0;
     size_t source_dwords = 0;
@@ -547,6 +554,7 @@ std::shared_ptr<const ShaderCodeAnalysis> analyze_shader_code_cached(const uint3
         const size_t span = rdna2_recompile_code_span(code, dwords);
         result->bounded_span = span < dwords;
         if (code && span) result->code.assign(code, code + span);
+        result->code_hash = hash_shader_code(result->code);
         result->pcrel_dispatch = rdna2_pcrel_dispatch_info(code, dwords);
         result->bytes = static_cast<uint64_t>(result->code.size()) * sizeof(uint32_t) +
                         static_cast<uint64_t>(result->pcrel_dispatch.target_pcs.size()) *
@@ -757,6 +765,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
         // embedded lookup table after ENDPGM; retain that proven tail so cached recompilation sees the
         // same blob as the direct path and table contents participate in the cache identity.
         key.code = std::shared_ptr<const std::vector<uint32_t>>(analysis, &analysis->code);
+        key.code_hash = analysis->code_hash;
     }
     if (resources) {
         key.resources.reserve(resources->resources.size());
