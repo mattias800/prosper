@@ -32,6 +32,10 @@ namespace prosper::gpu {
 
 struct ShaderResourceTable;   // fwd (shader_resources.hpp); passed to the backend so it can bind resources
 
+// Generation-scoped host-readability guard used while a synchronous GPU submit is active. Positive
+// mapping ranges are cached for that submit only and discarded before guest code can reuse an address.
+bool guest_readable(uint64_t address, uint32_t bytes);
+
 using SharedShaderWords = std::shared_ptr<const std::vector<uint32_t>>;
 
 // One realized draw of a submit: recompiled VS+PS SPIR-V, the draw's OWN resolved fixed-function

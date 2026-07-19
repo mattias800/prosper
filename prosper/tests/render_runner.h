@@ -17,6 +17,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace prosper::test {
@@ -59,6 +60,15 @@ inline bool dump_bmp(const char* path, const std::vector<uint8_t>& px, uint32_t 
 struct TexDesc { uint32_t binding; uint32_t w; uint32_t h; const uint8_t* rgba;
                  uint32_t max_aniso_ratio = 0; };   // #275: S# anisotropy ratio (0 = isotropic)
 
+inline uint64_t hash_buffer_words(const uint32_t* words, size_t count) {
+    uint64_t hash = 1469598103934665603ull;
+    for (size_t word = 0; word < count; ++word) {
+        hash ^= words[word];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
 // One resource for the general N-binding path (render_triangle_rgba's `gres`): a storage buffer
 // (dwords non-empty, tex_rgba null), combined image sampler, or storage image at `binding`. Lets a
 // real game shader that declares several buffers and images have each bound distinctly.
@@ -67,7 +77,13 @@ struct FrameResource {
     uint32_t set = 0;               // descriptor set: VS resources -> 0, PS resources -> 1 (they must not
                                     // share a set — both stages number bindings from 2, so one set would
                                     // collide binding 2/3 between stages and make the layout invalid).
-    std::vector<uint32_t> dwords;   // storage-buffer contents (empty -> a 1-dword zero buffer)
+    std::vector<uint32_t> dwords;   // owned storage-buffer contents (empty -> a 1-dword zero buffer)
+    // A production callback may point directly at a fully readable immutable guest/capture range.
+    // The backend consumes and uploads this view synchronously; an explicit submission batch retains
+    // only the completed Vulkan upload, never this pointer. Tests/replays may use the same contract
+    // when their backing outlives render_draws_rgba().
+    const uint32_t* dwords_view = nullptr;
+    size_t dwords_view_count = 0;
     // Exact guest resource identity for a storage buffer. The backend may share an immutable upload
     // within one synchronous call only when both this identity and the complete captured bytes match;
     // zero keeps synthetic/replay resources conservatively distinct.
@@ -106,6 +122,13 @@ struct FrameResource {
     // target is available, bind its GPU image directly instead of uploading `tex_rgba` again.
     // `tex_rgba` remains an optional conservative fallback for an invalidated/missing target.
     uint64_t persistent_render_target_id = 0;
+    const uint32_t* buffer_words_data() const {
+        return dwords_view && dwords_view_count
+            ? dwords_view : (dwords.empty() ? nullptr : dwords.data());
+    }
+    size_t buffer_word_count() const {
+        return dwords_view && dwords_view_count ? dwords_view_count : dwords.size();
+    }
     bool is_texture() const { return tex_rgba != nullptr || persistent_render_target_id != 0; }
 };
 
@@ -2591,13 +2614,13 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     wr[i].descriptorType = lb[i].descriptorType; wr[i].pImageInfo = &dii[i];
                 } else {
                     lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; lb[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-                    const uint32_t* words = r.dwords.empty() ? &zero_buffer_word : r.dwords.data();
-                    const size_t word_count = r.dwords.empty() ? 1 : r.dwords.size();
-                    uint64_t content_hash = 1469598103934665603ull;
-                    for (size_t word = 0; word < word_count; ++word) {
-                        content_hash ^= words[word];
-                        content_hash *= 1099511628211ull;
+                    const uint32_t* words = r.buffer_words_data();
+                    size_t word_count = r.buffer_word_count();
+                    if (!words || !word_count) {
+                        words = &zero_buffer_word;
+                        word_count = 1;
                     }
+                    const uint64_t content_hash = hash_buffer_words(words, word_count);
                     SharedBufferKey buffer_key{
                         words, word_count, r.buffer_identity, content_hash,
                         share_backend_resources && r.buffer_identity ? 0 : ++resource_unique_tag};
