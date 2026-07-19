@@ -34,6 +34,8 @@ namespace prosper {
 #define HLE7(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 
+extern "C" uint64_t prosper_guest_tsc_ns(); // shared sceKernelReadTsc/process-time clock
+
 namespace {
 // Optional fork-safe counter bumped when the guest calls into the graphics libs (libSceAgc /
 // libSceVideoOut). Tests use it to assert the boot advanced all the way into GPU/display init — a
@@ -87,7 +89,7 @@ namespace {
         std::unique_lock<std::mutex> lock_;
         bool valid_;
     };
-    // Flip bookkeeping (#82): count/flipArg/currentBuffer are written by TWO paths — SubmitFlip on
+    // Flip bookkeeping (#82): completion status is written by TWO paths — SubmitFlip on
     // any guest thread and prosper_vo_flip_from_gpu on the submit thread — and read by GetFlipStatus
     // on Unity's pacer thread. They must move as ONE unit under a mutex: an unsynchronized reader
     // could observe the count advanced but a stale flipArg/buffer (torn triple), making the pacer
@@ -100,12 +102,18 @@ namespace {
     // that never happened (#394 F3).
     int32_t  g_current_buffer = -1;
     int64_t  g_last_flip_arg = -1;
+    uint64_t g_last_flip_process_time = 0; // microseconds, like sceKernelGetProcessTime
+    uint64_t g_last_flip_tsc = 0;          // 1 GHz guest counter, like sceKernelReadTsc
+    uint64_t g_last_submit_tsc = 0;
     // sceVideoOutGetBufferLabelAddress exposes this contiguous per-port array directly to the
     // guest. The guest writes 1 when an EOP flip is ready; completing the next flip releases the
     // previously displayed slot back to 0. Keep the storage stable for the process lifetime.
     alignas(uint64_t) uint64_t g_buffer_labels[16] = {};
     int32_t g_previous_buffer = -1;
     void flip_advance(int32_t bufidx, int64_t flip_arg) {
+        // The renderer completes flips synchronously, so submit and completion share one instant.
+        // Sample before taking g_flip_mx: the deterministic guest clock reads the flip count.
+        const uint64_t tsc = prosper_guest_tsc_ns();
         std::lock_guard<std::mutex> lk(g_flip_mx);
         if (g_previous_buffer >= 0 && g_previous_buffer < 16)
             g_buffer_labels[g_previous_buffer] = 0;
@@ -113,6 +121,12 @@ namespace {
         g_flip_count++;
         g_current_buffer = bufidx;
         g_last_flip_arg = flip_arg;
+        // Concurrent submitters can acquire the mutex in the opposite order to their clock samples.
+        // Keep the published completion timeline monotonic in status/count order.
+        const uint64_t completion_tsc = tsc < g_last_flip_tsc ? g_last_flip_tsc : tsc;
+        g_last_flip_process_time = completion_tsc / 1000;
+        g_last_flip_tsc = completion_tsc;
+        g_last_submit_tsc = completion_tsc;
     }
 
     // The one display we advertise. 1920x1080 @ 59.94Hz (refresh-rate enum 3), 16:9, ~50".
@@ -399,18 +413,27 @@ HLE(g_vo_flippending) {
     return 0;  // never pending in the synchronous present model
 }
 HLE(g_vo_flipstatus)  { // (handle, SceVideoOutFlipStatus* status): report our simulated flip count.
-    // SceVideoOutFlipStatus is exactly 0x40 bytes — writing more smashes the caller's stack canary!
+    // This title uses the legacy 0x40-byte SceVideoOutFlipStatus ABI; the newer native PS5 0x80
+    // object is a distinct generation. Public PS5 compatibility code plus the captured caller pin
+    // these offsets. Writing more than 0x40 smashes the caller's stack canary. CONFIDENCE: HIGH.
     if (!a1)
         return (uint64_t)(int64_t)(int32_t)0x80290002;  // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
     VideoOutHandleGuard handle(a0);
     if (!handle.valid()) return kVoErrorInvalidHandle;
     uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x40);
-    uint64_t cnt; int64_t arg; int32_t buf;
-    { std::lock_guard<std::mutex> lk(g_flip_mx);   // consistent snapshot of the flip triple
-      cnt = g_flip_count; arg = g_last_flip_arg; buf = g_current_buffer; }
-    *(uint64_t*)(s + 0x00) = cnt;    // count
-    *(int64_t*) (s + 0x18) = arg;    // flipArg
-    *(int32_t*) (s + 0x38) = buf;    // currentBuffer
+    uint64_t cnt, process_time, tsc, submit_tsc;
+    int64_t arg;
+    int32_t buf;
+    { std::lock_guard<std::mutex> lk(g_flip_mx);   // one coherent completion snapshot
+      cnt = g_flip_count; process_time = g_last_flip_process_time; tsc = g_last_flip_tsc;
+      arg = g_last_flip_arg; submit_tsc = g_last_submit_tsc; buf = g_current_buffer; }
+    *(uint64_t*)(s + 0x00) = cnt;          // count
+    *(uint64_t*)(s + 0x08) = process_time; // processTime (microseconds)
+    *(uint64_t*)(s + 0x10) = tsc;          // tsc (shared 1 GHz guest clock)
+    *(int64_t*) (s + 0x18) = arg;          // flipArg
+    *(uint64_t*)(s + 0x20) = submit_tsc;   // submitTsc (same instant: synchronous completion)
+    // reserved0@0x28, gcQueueNum@0x30, and flipPendingNum@0x34 stay zero: no queued work.
+    *(int32_t*) (s + 0x38) = buf;          // currentBuffer
     return 0;
 }
 // SceVideoOutResolutionStatus (0x30 bytes): report a real 1080p60 panel instead of the previous

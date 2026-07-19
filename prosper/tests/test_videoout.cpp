@@ -170,9 +170,15 @@ int main() {
     CHECK(fstat(handle, (uint64_t)(uintptr_t)initial_fs, 0, 0, 0, 0) == 0,
           "initial GetFlipStatus succeeds");
     CHECK(*(uint64_t*)(initial_fs + 0x00) == 0 &&
+          *(uint64_t*)(initial_fs + 0x08) == 0 &&
+          *(uint64_t*)(initial_fs + 0x10) == 0 &&
           *(int64_t*)(initial_fs + 0x18) == -1 &&
+          *(uint64_t*)(initial_fs + 0x20) == 0 &&
+          *(uint64_t*)(initial_fs + 0x28) == 0 &&
+          *(int32_t*)(initial_fs + 0x30) == 0 &&
+          *(int32_t*)(initial_fs + 0x34) == 0 &&
           *(int32_t*)(initial_fs + 0x38) == -1,
-          "initial flip status reports count=0 and -1 argument/buffer sentinels");
+          "initial flip status reports empty timing/queues and -1 argument/buffer sentinels");
     bool initial_tail_untouched = true;
     for (size_t i = 0x40; i < sizeof initial_fs; ++i)
         initial_tail_untouched &= initial_fs[i] == 0xEE;
@@ -333,7 +339,15 @@ int main() {
           "first completed flip retains the current buffer label");
     fstat(handle, (uint64_t)(uintptr_t)fs, 0, 0, 0, 0);
     CHECK(*(uint64_t*)(fs + 0x00) == 1, "flip status count increments");
+    CHECK(*(uint64_t*)(fs + 0x10) > 0 &&
+              *(uint64_t*)(fs + 0x08) == *(uint64_t*)(fs + 0x10) / 1000,
+          "flip status reports processTime and tsc on the shared guest clock");
     CHECK(*(int64_t*) (fs + 0x18) == 0x12345678, "flip status reports the submitted flipArg");
+    CHECK(*(uint64_t*)(fs + 0x20) == *(uint64_t*)(fs + 0x10),
+          "synchronous flip reports one submit/completion timestamp");
+    CHECK(*(uint64_t*)(fs + 0x28) == 0 && *(int32_t*)(fs + 0x30) == 0 &&
+              *(int32_t*)(fs + 0x34) == 0,
+          "synchronous flip reports zero reserved and pending-queue fields");
     CHECK(*(int32_t*) (fs + 0x38) == 2, "flip status reports the submitted currentBuffer");
 
     // Range validation: out-of-range buffer counts are rejected.
