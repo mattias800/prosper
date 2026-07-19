@@ -48,7 +48,8 @@ enum : uint32_t {
     Op_ImageRead=98, Op_ImageWrite=99, Op_ImageQuerySizeLod=103, Op_ImageQueryLevels=106,
     Op_TypeArray=28, Op_ControlBarrier=224, Op_AtomicExchange=229, Op_AtomicIAdd=234,
     Op_AtomicISub=235,
-    Op_AtomicUMin=237, Op_AtomicUMax=239,
+    Op_AtomicSMin=236, Op_AtomicUMin=237, Op_AtomicSMax=238, Op_AtomicUMax=239,
+    Op_AtomicAnd=240, Op_AtomicOr=241, Op_AtomicXor=242,
     Op_DPdx=207, Op_DPdy=208,   // screen-space derivatives (Fragment; plain Shader capability)
     Op_Phi=245, Op_LoopMerge=246,
     Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Switch=251,
@@ -4977,6 +4978,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // later register consumers, so reject until status-return semantics are implemented.
             if (in.fmt == Rdna2Format::MTBUF && in.mtbuf_tfe) { ok = false; return true; }
             uint32_t n = 0; bool is_format = false, is_store = false, is_atomic = false;
+            uint32_t atomic_op = 0;   // SPIR-V atomic RMW opcode for is_atomic (set by the switch)
             bool raw_subword = false, raw_signed = false;
             uint32_t raw_bits = 32;
             switch (in.opcode) {
@@ -5000,7 +5002,21 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x5: n = 2; is_format = true; is_store = true; break;   // buffer_store_format_xy
                 case 0x6: n = 3; is_format = true; is_store = true; break;   // buffer_store_format_xyz
                 case 0x7: n = 4; is_format = true; is_store = true; break;   // buffer_store_format_xyzw
-                case 0x38: n = 1; is_atomic = true; break; // buffer_atomic_umax: mem=max_u32(mem,VDATA), VDATA=old
+                // 32-bit atomic RMW family (RDNA2 MUBUF opcodes 0x30..0x3b). Each does
+                // mem = mem OP VDATA and returns the PRE-op value in VDATA. They all share the generic
+                // OpAtomic<Op>(ptr, Device, AcqRel, value) shape emitted by cbuf_atomic_rtn. VDATA is one
+                // dword. CMPSWAP (0x31, two-operand), INC/DEC (0x3c/0x3d, wrap semantics), and the x2
+                // 64-bit variants stay deferred (fail-visible) — they need distinct lowering.
+                case 0x30: n = 1; is_atomic = true; atomic_op = Op_AtomicExchange; break; // swap
+                case 0x32: n = 1; is_atomic = true; atomic_op = Op_AtomicIAdd;     break; // add
+                case 0x33: n = 1; is_atomic = true; atomic_op = Op_AtomicISub;     break; // sub
+                case 0x35: n = 1; is_atomic = true; atomic_op = Op_AtomicSMin;     break; // smin (signed)
+                case 0x36: n = 1; is_atomic = true; atomic_op = Op_AtomicUMin;     break; // umin (unsigned)
+                case 0x37: n = 1; is_atomic = true; atomic_op = Op_AtomicSMax;     break; // smax (signed)
+                case 0x38: n = 1; is_atomic = true; atomic_op = Op_AtomicUMax;     break; // umax (unsigned)
+                case 0x39: n = 1; is_atomic = true; atomic_op = Op_AtomicAnd;      break; // and
+                case 0x3a: n = 1; is_atomic = true; atomic_op = Op_AtomicOr;       break; // or
+                case 0x3b: n = 1; is_atomic = true; atomic_op = Op_AtomicXor;      break; // xor
                 default: ok = false; return true;           // remaining typed/atomic opcodes deferred
             }
             uint32_t offset = in.literal & 0xFFFu;
@@ -5278,7 +5294,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t old = vreg_old(b, rs, d);
                 const auto it = rs.vreg.find(d);
                 const uint32_t value = it == rs.vreg.end() ? b.uconst(0) : it->second;
-                const uint32_t pre = b.cbuf_atomic_rtn(Op_AtomicUMax, idx, value, binding,
+                const uint32_t pre = b.cbuf_atomic_rtn(atomic_op, idx, value, binding,
                                                        rs.exec_narrowed, rs.exec, old);
                 // ISA 8.1 / Table 98: for atomics GLC means "return pre-op value to VGPR". With
                 // GLC=0 hardware leaves VDATA untouched (it still holds the DATA operand) — the

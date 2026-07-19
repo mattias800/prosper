@@ -952,6 +952,47 @@ int main() {
               bad24mt_store_xy00 == 0,
           "MTBUF XYZW store honors XY00 format width and leaves the adjacent dword untouched");
 
+    // Kernel 24atomic (#590): the MUBUF 32-bit atomic RMW family. buffer_atomic_add over a binding-3
+    // storage buffer — all N dispatched lanes each add 3 to element 0, so the final memory word is 3N.
+    // This exercises the opcode -> SPIR-V-atomic mapping end-to-end through the proven cbuf_atomic_rtn
+    // path (real Vulkan atomic accumulation, not just recompile).
+    ShaderResourceTable rt_atomic;
+    { ShaderResource ab{}; ab.cls = ResourceClass::ConstantBuffer; ab.format = DataFormat::Uint32;
+      ab.num_components = 1; ab.binding = 3; ab.stride = 4; ab.sgpr_base = 8; ab.fetch_pc = 1;
+      rt_atomic.resources.push_back(ab); }
+    const uint32_t code_atomic_add[] = {
+        0x7e020283u,               // v_mov_b32 v1, 3                 (the value to add)
+        0xe0c80000u, 0x80020100u,  // buffer_atomic_add v1, v0, s[8:11]  (op 0x32, element 0)
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv_atomic_add = recompile_valu(
+        code_atomic_add, std::size(code_atomic_add), 1, 0, &rt_atomic);
+    std::vector<uint32_t> atomic_buf_in(1, 0), atomic_buf_out;
+    std::vector<float> atomic_dummy(N, 0.0f);
+    prosper::test::run_compute(spv_atomic_add, atomic_dummy, N, N, {}, atomic_buf_in, &atomic_buf_out);
+    CHECK(!spv_atomic_add.empty() && atomic_buf_out.size() == 1 &&
+              atomic_buf_out[0] == (uint32_t)N * 3u,
+          "#590: buffer_atomic_add accumulates N lanes x 3 into element 0 (= 3N)");
+
+    // The rest of the 32-bit RMW family recompiles to valid SPIR-V (same emit, different atomic op).
+    const uint32_t atomic_op_dw0[] = {
+        0xE0C00000u,   // buffer_atomic_swap (0x30)
+        0xE0CC0000u,   // buffer_atomic_sub  (0x33)
+        0xE0D40000u,   // buffer_atomic_smin (0x35)
+        0xE0D80000u,   // buffer_atomic_umin (0x36)
+        0xE0DC0000u,   // buffer_atomic_smax (0x37)
+        0xE0E40000u,   // buffer_atomic_and  (0x39)
+        0xE0E80000u,   // buffer_atomic_or   (0x3a)
+        0xE0EC0000u,   // buffer_atomic_xor  (0x3b)
+    };
+    uint32_t atomic_bad = 0;
+    for (uint32_t dw0 : atomic_op_dw0) {
+        const uint32_t code[] = { 0x7e020283u, dw0, 0x80020100u, 0xbf810000u };
+        if (recompile_valu(code, std::size(code), 1, 0, &rt_atomic).empty()) ++atomic_bad;
+    }
+    CHECK(atomic_bad == 0,
+          "#590: swap/sub/smin/umin/smax/and/or/xor MUBUF atomics all recompile to SPIR-V");
+
     // Kernel 24b (#150): the SAME unorm8x4 fetch but with a NON-dword-aligned inst offset (offset:2).
     // The packed unpack extracts components at static byte offsets from a dword-aligned base and drops
     // addr&3, so a non-aligned element base would decode the wrong bits — it must be REJECTED (the
