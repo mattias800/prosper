@@ -347,6 +347,14 @@ if(TARGET prosper_core)
     add_test(NAME win_kernel_is_stack COMMAND test_win_kernel_is_stack)
   endif()
 
+  # Boot preload path case correction (#1006): a module present with different casing than the
+  # hard-coded preload path (Blasphemous 2 / Evergate's Il2CppUserAssemblies.prx on a case-sensitive
+  # host filesystem) must resolve to the real on-disk entry instead of being dropped as absent.
+  # Pure std::filesystem against a temp tree; no game dump needed.
+  add_executable(test_module_path_case tests/test_module_path_case.cpp)
+  target_link_libraries(test_module_path_case PRIVATE prosper_core)
+  add_test(NAME module_path_case COMMAND test_module_path_case)
+
   # APR container registry + size-keyed read matching (issue #62): stable ids, path dedup, and
   # the ambiguity/chunk-read refusal the read-submit path relies on. Pure, no game dump needed.
   add_executable(test_apr_registry tests/test_apr_registry.cpp)
