@@ -7,6 +7,8 @@ param(
     [string]$GuestArgs = '-force-gfx-direct',
     [string]$Record,
     [int]$Frames = 0,
+    [ValidateSet('fifo', 'mailbox', 'immediate')]
+    [string]$PresentMode = 'fifo',
     [switch]$TestPattern
 )
 
@@ -36,6 +38,7 @@ if ($TestPattern) {
 }
 
 if ($Frames -gt 0) { $runArgs += @('--frames', "$Frames") }
+if ($PresentMode -ne 'fifo') { $runArgs += @('--present-mode', $PresentMode) }
 if ($Record) {
     $recordPath = [IO.Path]::GetFullPath($Record)
     $recordParent = Split-Path -Parent $recordPath
