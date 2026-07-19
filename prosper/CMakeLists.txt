@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(prosper LANGUAGES CXX)
+project(prosper LANGUAGES C CXX)   # C for the vendored LibAtrac9 decoder (third_party/libatrac9)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -47,12 +47,24 @@ endif()
 # self_dump: SELF/ELF inspector and NID import extractor (M0).
 add_executable(self_dump tools/self_dump/self_dump.cpp)
 
+# --- third-party: LibAtrac9 (MIT, vendored) - ATRAC9 audio decode -------------------------
+# Vendored verbatim (see third_party/libatrac9/README.md). C99; needs libm. Compiled as its own
+# static lib so the C sources stay isolated from prosper's C++ and are trivially auditable/updatable.
+file(GLOB LIBATRAC9_SRC CONFIGURE_DEPENDS third_party/libatrac9/src/*.c)
+add_library(libatrac9 STATIC ${LIBATRAC9_SRC})
+target_include_directories(libatrac9 PUBLIC third_party/libatrac9/src)
+set_target_properties(libatrac9 PROPERTIES C_STANDARD 99)
+if(NOT WIN32)
+  target_link_libraries(libatrac9 PUBLIC m)
+endif()
+
 # --- core library (M1+) --------------------------------------------------
 # Loader / HLE / kernel / gpu sources accrete here per the roadmap.
 file(GLOB_RECURSE PROSPER_SRC CONFIGURE_DEPENDS src/*.cpp)
 if(PROSPER_SRC)
   add_library(prosper_core STATIC ${PROSPER_SRC})
   target_include_directories(prosper_core PUBLIC src)
+  target_link_libraries(prosper_core PUBLIC libatrac9)
   target_compile_definitions(prosper_core PRIVATE PROSPER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   execute_process(COMMAND git rev-parse --verify HEAD WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/.."
                   OUTPUT_VARIABLE PROSPER_GIT_REVISION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
@@ -358,6 +370,12 @@ if(TARGET prosper_core)
   add_executable(test_module_path_case tests/test_module_path_case.cpp)
   target_link_libraries(test_module_path_case PRIVATE prosper_core)
   add_test(NAME module_path_case COMMAND test_module_path_case)
+
+  # ATRAC9 decode (vendored LibAtrac9 + prosper glue): an embedded 16-superframe slice of a real PS5
+  # snd0.at9 decodes bit-exact vs the LibAtrac9 reference (CRC32). Pure, no game dump; runs in CI.
+  add_executable(test_atrac9 tests/test_atrac9.cpp)
+  target_link_libraries(test_atrac9 PRIVATE prosper_core)
+  add_test(NAME atrac9_decode COMMAND test_atrac9)
 
   # APR container registry + size-keyed read matching (issue #62): stable ids, path dedup, and
   # the ambiguity/chunk-read refusal the read-submit path relies on. Pure, no game dump needed.
