@@ -651,7 +651,13 @@ HLE(k_reserve_vrange) {
         MLOG("reserve(fixed) -> 0x%llx len=0x%llx align=0x%llx\n", (unsigned long long)p, (unsigned long long)a1, (unsigned long long)align);
         return 0;
     }
-    if (hint) {
+    // #946/#312: a HUGE non-fixed reservation (UE MallocBinned3's 512 GiB arena, hint 0x1000000000)
+    // must NOT be searched from its low hint — placing the giant arena at 0x1000000000 overlaps
+    // prosper's low guest-VA structures (race). Fall through to map_guest_auto (searches from
+    // kGuestAutoMapBase 0x2000000000, above the low hint), leaving 0x1000000000 free for the small
+    // metadata pool the guest reserves next with the same hint. Mirrors the Windows win_reserve fix.
+    constexpr uint64_t kBigReserveArena = 0x2000000000ull;   // 128 GiB — only the flex arena is this large
+    if (hint && a1 < kBigReserveArena) {
         // Non-fixed hint: search for a free range starting at the hint. Probe candidates with
         // MAP_FIXED_NOREPLACE (also catches host mappings the tracker doesn't know); on a miss,
         // skip past whichever TRACKED mapping covers the candidate (fast-forwards the search past
@@ -1960,7 +1966,12 @@ namespace {
     // rejected 1-8 TiB gap (Astro observed 0x2d980000000), after which sceLibcMspaceCreate returns
     // null even though the pages are accessible.
     constexpr uint64_t kGuestAutoVaMin = 0x2000000000ull;   // 128 GiB
-    constexpr uint64_t kGuestAutoVaMax = 0xfbffffffffull;  // inclusive; one byte below a 64 KiB boundary
+    // Inclusive upper bound for guest auto-map / placeholder / flex-arena placement. Raised from the
+    // historical ~1 TiB to ~4 TiB (matching the Linux kGuestAutoMapLimit) so UE's 512 GiB MallocBinned3
+    // arena fits comfortably IN-window alongside auto-maps without fragmenting them out of space (#946):
+    // a tight window forced the arena to a host-chosen out-of-window base, and arena-relative batchmaps
+    // then exceeded the window and ENOMEM'd. One byte below a 64 KiB boundary (0x40000000000).
+    constexpr uint64_t kGuestAutoVaMax = 0x3ffffffffffull;
 
     // A paging-file SEC_RESERVE section avoids a 16 GiB commit charge, but every first guest touch
     // raises a Windows access violation. Windows builds its exception-dispatch frame below RSP
@@ -2946,6 +2957,30 @@ namespace {
     // Reserve (no commit). Modern Windows placeholders can be partitioned at the guest's 16 KiB
     // page boundary and later replaced by either a section view or private pages.
     void* win_reserve(uint64_t hint, uint64_t len, bool fixed, uint64_t align) {
+        // #946/#312: a HUGE non-fixed reservation (UE MallocBinned3's 512 GiB arena, hint 0x1000000000)
+        // must not be placed AT its low hint. sceKernelReserveVirtualRange without MAP_FIXED treats the
+        // hint as a SEARCH START, not a fixed address (BSD mmap contract). Honoring the low hint for the
+        // giant arena is a race: when 0x1000000000 is free at reserve time the arena grabs it, overlapping
+        // prosper's low guest-VA structures and wedging the guest into a re-entrant __cxa_guard deadlock
+        // (A/B-confirmed: hang runs reserve -> 0x1000000000; boot runs reserve -> a high base). Place the
+        // arena INSIDE the guest auto-map window [kGuestAutoVaMin, kGuestAutoVaMax] via the window-bounded
+        // placeholder path ONLY -- never an unconstrained VirtualAlloc(nullptr), which can land it above
+        // kGuestAutoVaMax where the guest's arena-relative batchmaps then exceed the window and ENOMEM (a
+        // second wedge). In-window it stays contiguous with, and skipped by, later auto-maps; the small
+        // metadata pool the guest reserves next with the same hint then takes the low hint. Same root as
+        // the Linux #312 MallocBinned3 corruption (cross-linked). If placeholders are unavailable this
+        // returns ENOMEM rather than a dangerous out-of-window base.
+        constexpr uint64_t kBigReserveArena = 0x2000000000ull;   // 128 GiB -- only the flex arena is this large
+        if (!fixed && hint && len >= kBigReserveArena) {
+            std::lock_guard<std::mutex> lk(g_dview_mx);
+            AcquiredPlaceholder acquired = acquire_placeholder_locked(kGuestAutoVaMin, len, align, false);
+            if (!acquired.address)
+                acquired = acquire_placeholder_locked(0, len, align, false);   // any window-bounded spot
+            if (!acquired.address) return nullptr;                             // in-window ENOMEM (never OOB)
+            const uint64_t base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(acquired.address));
+            remember_guest_placeholder_locked(base, len);
+            return acquired.address;
+        }
         {
             std::lock_guard<std::mutex> lk(g_dview_mx);
             AcquiredPlaceholder acquired =
