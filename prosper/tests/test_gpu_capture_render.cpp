@@ -18,6 +18,9 @@
 
 using namespace prosper::gpu;
 
+using Hle8Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t,
+                            uint64_t, uint64_t, uint64_t, uint64_t);
+
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
                          else std::printf("  [ok]   %s\n", m); } while (0)
@@ -56,7 +59,8 @@ int main() {
     prosper::register_builtin_hle();
     present_reset();
     auto open = prosper::Hle::lookup(prosper::nid_hash("sceVideoOutOpen"));
-    auto setba2 = prosper::Hle::lookup("PjS5uASwcV8");
+    auto setba2 = reinterpret_cast<Hle8Fn>(
+        prosper::Hle::lookup("PjS5uASwcV8"));
     auto regb2 = prosper::Hle::lookup("rKBUtgRrtbk");
     constexpr uint32_t PRESENT_W = 128, PRESENT_H = 128;
     std::vector<uint8_t> scanout0(PRESENT_W * PRESENT_H * 4u);
@@ -72,7 +76,7 @@ int main() {
     const uint64_t video_handle = open ? open(0, 0, 0, 0, 0, 0) : 0;
     if (setba2)
         setba2(reinterpret_cast<uint64_t>(scanout_attr), 0x8000000000000000ull,
-               0, PRESENT_W, PRESENT_H, 0);
+               0, PRESENT_W, PRESENT_H, 0, 0, 0);
     const uint64_t register_result = regb2
         ? regb2(video_handle, 0, 0, reinterpret_cast<uint64_t>(scanouts), 3,
                 reinterpret_cast<uint64_t>(scanout_attr))

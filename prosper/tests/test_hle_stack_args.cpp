@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -67,10 +68,16 @@ __asm__(
 using GuestHle10 = uint64_t (__attribute__((sysv_abi)) *)(
     uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
     uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+using GuestHle8 = uint64_t (__attribute__((sysv_abi)) *)(
+    uint64_t, uint64_t, uint64_t, uint64_t,
+    uint64_t, uint64_t, uint64_t, uint64_t);
 #else
 using GuestHle10 = uint64_t (*)(
     uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
     uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+using GuestHle8 = uint64_t (*)(
+    uint64_t, uint64_t, uint64_t, uint64_t,
+    uint64_t, uint64_t, uint64_t, uint64_t);
 #endif
 
 int fails = 0;
@@ -97,12 +104,16 @@ int main(int argc, char** argv) {
 #endif
 
     constexpr const char* kNid = "test.hle.stack.args";
+    register_builtin_hle();
     Hle::register_fn(kNid, reinterpret_cast<HleFn>(&prosper_test_hle10_entry),
                      "prosper_test_hle10_entry");
     // Keep an unresolved import immediately before the implemented one. The largest Linux guest-FS
     // variant is the unresolved stub; it must fit its fixed 96-byte slot without corrupting its
     // neighbour.
-    const std::vector<ImportSlot> slots = {{"test", "test.hle.unimplemented"}, {"test", kNid}};
+    const std::vector<ImportSlot> slots = {
+        {"test", "test.hle.unimplemented"}, {"test", kNid},
+        {"libSceVideoOut", "PjS5uASwcV8"},
+    };
     std::string err;
     dispatch_init(&slots, nullptr);
     CHECK(install_stubs(slots, 0x710000000ull, 96, &err), "generated adjacent unresolved and executable import stubs");
@@ -178,6 +189,26 @@ after_hle_call:
         std::snprintf(what, sizeof what, "argument %d preserved (0x%016llx)", i + 1,
                       static_cast<unsigned long long>(kArgs[i]));
         CHECK(g_seen[i] == kArgs[i], what);
+    }
+
+    // Exercise a real eight-argument HLE through the same generated import path. This catches an
+    // accidental six-argument registration even if the generic ten-argument bridge still passes.
+    if (!guest_fs) {
+        uint8_t attr[0x58];
+        std::memset(attr, 0xee, sizeof attr);
+        constexpr uint64_t kDccClear = 0x8877665544332211ull;
+        constexpr uint32_t kDccControl = 0xa1b2c3d4u;
+        auto set_attribute2 = reinterpret_cast<GuestHle8>(
+            static_cast<uintptr_t>(stub_addr(2)));
+        CHECK(set_attribute2(reinterpret_cast<uint64_t>(attr), 0x8000000000000000ull,
+                             0, 1920, 1080, 0, kDccControl, kDccClear) == 0,
+              "real eight-argument VideoOut import returned success");
+        CHECK(*reinterpret_cast<const uint64_t*>(attr + 0x28) == kDccClear &&
+              *reinterpret_cast<const uint32_t*>(attr + 0x30) == kDccControl,
+              "real VideoOut import preserved stack arguments 7 and 8");
+        bool canary_untouched = true;
+        for (size_t i = 0x50; i < sizeof attr; ++i) canary_untouched &= attr[i] == 0xee;
+        CHECK(canary_untouched, "real VideoOut import retained the 0x50-byte write bound");
     }
 
     if (fails) {
