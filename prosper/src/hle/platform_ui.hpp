@@ -14,6 +14,8 @@
 // Status values are the shared SceCommonDialogStatus: 0=NONE, 1=INITIALIZED, 2=RUNNING, 3=FINISHED.
 #pragma once
 #include <cstdint>
+#include <mutex>
+#include <utility>
 
 namespace prosper {
 
@@ -45,6 +47,21 @@ struct PlatformUi {
     virtual int  msgDialogResult(uint64_t result) { (void)result; return 0; }
     virtual void msgDialogClose() {}
 
+    // --- libSceSaveDataDialog (save/load/delete confirmation and save-slot UI) ---
+    // `param` is the guest SceSaveDataDialogParam*. Return true to own this Open; the core then
+    // routes every status/result/progress/close call to this same backend instance. Returning false
+    // preserves the headless policy: Open auto-completes with a neutral result.
+    virtual bool saveDataDialogOpen(uint64_t param) { (void)param; return false; }
+    virtual int  saveDataDialogStatus() { return 3 /*FINISHED*/; }
+    virtual int  saveDataDialogResult(uint64_t result) { (void)result; return 0; }
+    virtual void saveDataDialogProgressBarInc(uint32_t target, uint32_t delta) {
+        (void)target; (void)delta;
+    }
+    virtual void saveDataDialogProgressBarSetValue(uint32_t target, uint32_t value) {
+        (void)target; (void)value;
+    }
+    virtual void saveDataDialogClose() {}
+
     // --- libSceErrorDialog (single-button error message; no result struct) ---
     // Show an error dialog. `param` is the guest sceErrorDialogOpen argument (opaque). Return true to
     // OWN it; false -> the core auto-dismisses headlessly (and logs the errorCode).
@@ -60,6 +77,34 @@ struct PlatformUi {
     virtual int keyboardResourceIds(int32_t userId, uint32_t* outIds, int max) {
         (void)userId; (void)outIds; (void)max; return 0;
     }
+};
+
+// A short-lived, registry-locked reference to the current backend. The frontend must unregister
+// itself before destroying its PlatformUi; set_platform_ui() then waits for every outstanding lease,
+// so an HLE callback cannot race backend destruction. Supplying `expected` additionally prevents an
+// open dialog from being rerouted to a different backend registered later.
+class PlatformUiLease;
+PlatformUiLease platform_ui_lease(PlatformUi* expected = nullptr);
+
+class PlatformUiLease {
+public:
+    PlatformUiLease() = default;
+    PlatformUiLease(PlatformUiLease&&) noexcept = default;
+    PlatformUiLease& operator=(PlatformUiLease&&) noexcept = default;
+    PlatformUiLease(const PlatformUiLease&) = delete;
+    PlatformUiLease& operator=(const PlatformUiLease&) = delete;
+
+    PlatformUi* get() const { return ui_; }
+    PlatformUi* operator->() const { return ui_; }
+    explicit operator bool() const { return ui_ != nullptr; }
+
+private:
+    friend PlatformUiLease platform_ui_lease(PlatformUi* expected);
+    PlatformUiLease(std::unique_lock<std::mutex>&& lock, PlatformUi* ui)
+        : lock_(std::move(lock)), ui_(ui) {}
+
+    std::unique_lock<std::mutex> lock_;
+    PlatformUi* ui_ = nullptr;
 };
 
 // The registered backend, or nullptr when headless. The frontend calls set_platform_ui once at startup

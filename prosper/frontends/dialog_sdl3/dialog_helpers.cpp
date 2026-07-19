@@ -1,7 +1,24 @@
-// dialog_helpers.cpp — see dialog_helpers.hpp. Pure struct parsing (no SDL). memcpy is used for every
-// guest read/write so unaligned guest structs and strict aliasing are both safe.
+// dialog_helpers.cpp — see dialog_helpers.hpp. Pure struct parsing (no SDL). SaveData's nested guest
+// pointers use fault-contained OS copies; memcpy keeps local unaligned fields alias-safe.
 #include "dialog_helpers.hpp"
+#include <algorithm>
+#include <array>
+#include <cstdio>
 #include <cstring>
+#include <utility>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include "../../src/host/posix_shim.hpp"
+#include <sys/uio.h>
+#include <unistd.h>
+#endif
 
 namespace prosper {
 
@@ -47,6 +64,257 @@ uint32_t read_error_code(uint64_t param) {
     uint32_t code = 0;
     if (param) std::memcpy(&code, (const void*)(uintptr_t)(param + 4), 4);
     return code;
+}
+
+// --- SaveDataDialog ---
+
+namespace {
+
+bool guest_read_bytes(uint64_t address, void* destination, size_t size) {
+    if (!address || !destination || !size || address > UINT64_MAX - (size - 1)) return false;
+#ifdef _WIN32
+    SIZE_T copied = 0;
+    return ReadProcessMemory(GetCurrentProcess(), (const void*)(uintptr_t)address,
+                             destination, size, &copied) && copied == size;
+#else
+    iovec local{destination, size};
+    iovec remote{(void*)(uintptr_t)address, size};
+    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)size;
+#endif
+}
+
+bool guest_write_bytes(uint64_t address, const void* source, size_t size) {
+    if (!address || !source || !size || address > UINT64_MAX - (size - 1)) return false;
+#ifdef _WIN32
+    SIZE_T copied = 0;
+    return WriteProcessMemory(GetCurrentProcess(), (void*)(uintptr_t)address,
+                              source, size, &copied) && copied == size;
+#else
+    iovec local{const_cast<void*>(source), size};
+    iovec remote{(void*)(uintptr_t)address, size};
+    return process_vm_writev(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)size;
+#endif
+}
+
+template<typename T, size_t N>
+T local_field(const std::array<uint8_t, N>& bytes, size_t offset) {
+    T value{};
+    std::memcpy(&value, bytes.data() + offset, sizeof value);
+    return value;
+}
+
+bool guest_string(uint64_t address, std::string& out) {
+    out.clear();
+    if (!address) return true;
+    constexpr size_t CAP = 4096;
+    std::array<char, 256> chunk{};
+    size_t consumed = 0;
+    while (consumed < CAP) {
+        if (address > UINT64_MAX - consumed) return false;
+        const uint64_t current = address + consumed;
+        const size_t page_left = 0x1000u - (size_t)(current & 0xfffu);
+        const size_t count = std::min({chunk.size(), page_left, CAP - consumed});
+        if (!guest_read_bytes(current, chunk.data(), count)) return false;
+        const void* nul = std::memchr(chunk.data(), 0, count);
+        const size_t length = nul ? (size_t)((const char*)nul - chunk.data()) : count;
+        out.append(chunk.data(), length);
+        if (nul) return true;
+        consumed += count;
+    }
+    return false;
+}
+
+MsgButtons save_user_buttons(uint32_t type) {
+    switch (type) {
+    case 0: return {1, {"OK", nullptr, nullptr}, {1, 0, 0}};
+    case 1: return {2, {"Yes", "No", nullptr}, {1, 2, 0}};
+    case 3: return {2, {"OK", "Cancel", nullptr}, {1, 0, 0}};
+    default: return {0, {nullptr, nullptr, nullptr}, {0, 0, 0}};
+    }
+}
+
+const char* save_action(uint32_t display_type) {
+    switch (display_type) {
+    case 1: return "save";
+    case 2: return "load";
+    case 3: return "delete";
+    default: return "continue";
+    }
+}
+
+} // namespace
+
+SaveDataRequest read_savedata_request(uint64_t param) {
+    SaveDataRequest request;
+    if (!param) return request;
+    std::array<uint8_t, 0x98> outer{};
+    if (!guest_read_bytes(param, outer.data(), outer.size())) return request;
+    if (local_field<uint64_t>(outer, 0x00) != 0x30 ||
+        local_field<uint32_t>(outer, 0x30) != 0x98)
+        return request;
+    request.mode = local_field<uint32_t>(outer, 0x34);
+    request.displayType = local_field<uint32_t>(outer, 0x38);
+    request.userData = local_field<uint64_t>(outer, 0x70);
+
+    if (request.mode == SAVE_DATA_DIALOG_MODE_USER_MSG) {
+        const uint64_t user = local_field<uint64_t>(outer, 0x50);
+        if (!user) return request;
+        std::array<uint8_t, 16> user_param{};
+        if (!guest_read_bytes(user, user_param.data(), user_param.size())) return request;
+        request.buttons = save_user_buttons(local_field<uint32_t>(user_param, 0x00));
+        if (request.buttons.count == 0) return request;
+        request.error = local_field<uint32_t>(user_param, 0x04) == 1;
+        if (!guest_string(local_field<uint64_t>(user_param, 0x08), request.message))
+            return request;
+        request.supported = true;
+        return request;
+    }
+
+    if (request.mode == SAVE_DATA_DIALOG_MODE_SYSTEM_MSG) {
+        const uint64_t system = local_field<uint64_t>(outer, 0x58);
+        if (!system) return request;
+        uint32_t type = 0;
+        if (!guest_read_bytes(system, &type, sizeof type)) return request;
+        const char* action = save_action(request.displayType);
+        char message[192] = {};
+        switch (type) {
+        case 1: // NODATA
+            request.message = "There is no saved data.";
+            request.buttons = save_user_buttons(0);
+            break;
+        case 2: // CONFIRM
+            std::snprintf(message, sizeof message, "Do you want to %s this saved data?", action);
+            request.message = message;
+            request.buttons = save_user_buttons(1);
+            break;
+        case 3: // OVERWRITE
+            request.message = "Do you want to overwrite the existing saved data?";
+            request.buttons = save_user_buttons(1);
+            break;
+        case 4: case 8: // NOSPACE / NOSPACE_CONTINUABLE
+            request.message = "There is not enough space for this saved data operation.";
+            request.buttons = save_user_buttons(0);
+            request.error = true;
+            break;
+        case 6: // FILE_CORRUPTED
+            request.message = "The saved data is corrupted.";
+            request.buttons = save_user_buttons(0);
+            request.error = true;
+            break;
+        case 7: // FINISHED
+            std::snprintf(message, sizeof message, "Saved data %s completed.", action);
+            request.message = message;
+            request.buttons = save_user_buttons(0);
+            break;
+        case 10: // CORRUPTED_AND_DELETED
+            request.message = "The saved data is corrupted and will be deleted.";
+            request.error = true;
+            break;
+        case 11: // CORRUPTED_AND_CREATED
+            request.message = "The corrupted saved data will be replaced with new saved data.";
+            request.error = true;
+            break;
+        case 13: // CORRUPTED_AND_RESTORE
+            request.message = "The corrupted saved data will be restored from its backup.";
+            request.error = true;
+            break;
+        case 14: // TOTAL_SIZE_EXCEEDED
+            request.message = "Cannot create more saved data.";
+            request.buttons = save_user_buttons(0);
+            request.error = true;
+            break;
+        default:
+            return request; // PROGRESS and unknown modes need a non-modal/dedicated UI
+        }
+        if (type == 10 || type == 11 || type == 13) {
+            bool back_enabled = true; // OptionBack defaults to ENABLE when the pointer is absent.
+            const uint64_t option = local_field<uint64_t>(outer, 0x78);
+            if (option) {
+                uint32_t option_back = 0;
+                if (!guest_read_bytes(option, &option_back, sizeof option_back)) return request;
+                back_enabled = option_back == 0; // ENABLE=0, DISABLE=1
+            }
+            request.cancelable = back_enabled;
+            request.buttons = save_user_buttons(back_enabled ? 3u : 0u);
+        }
+        request.supported = true;
+        return request;
+    }
+
+    if (request.mode == SAVE_DATA_DIALOG_MODE_ERROR_CODE) {
+        const uint64_t error = local_field<uint64_t>(outer, 0x60);
+        if (!error) return request;
+        uint32_t code = 0;
+        if (!guest_read_bytes(error, &code, sizeof code)) return request;
+        char message[96];
+        std::snprintf(message, sizeof message, "An error occurred.\n\nError code: 0x%08X", code);
+        request.message = message;
+        request.buttons = save_user_buttons(0);
+        request.error = true;
+        request.supported = true;
+    }
+    return request;
+}
+
+void write_savedata_result(uint64_t result, const SaveDataRequest& request,
+                           uint32_t buttonId, bool canceled) {
+    if (!result || result > UINT64_MAX - 0x20) return;
+    const uint32_t common_result = canceled ? 1u : 0u;
+    const uint32_t guest_button = canceled ? 0u : buttonId;
+    (void)guest_write_bytes(result + 0x00, &request.mode, sizeof request.mode);
+    (void)guest_write_bytes(result + 0x04, &common_result, sizeof common_result);
+    (void)guest_write_bytes(result + 0x08, &guest_button, sizeof guest_button);
+    (void)guest_write_bytes(result + 0x20, &request.userData, sizeof request.userData);
+}
+
+void SaveDataDialogState::open(SaveDataRequest request) {
+    std::lock_guard<std::mutex> lock(mx_);
+    ++generation_;
+    if (!generation_) ++generation_; // zero is reserved for "no ticket"
+    request_ = std::move(request);
+    button_ = 0;
+    canceled_ = false;
+    status_ = 2 /*RUNNING*/;
+    pending_generation_ = generation_;
+}
+
+int SaveDataDialogState::status() const {
+    std::lock_guard<std::mutex> lock(mx_);
+    return status_;
+}
+
+void SaveDataDialogState::close() {
+    std::lock_guard<std::mutex> lock(mx_);
+    ++generation_;
+    if (!generation_) ++generation_;
+    pending_generation_ = 0;
+    status_ = 0 /*NONE*/;
+}
+
+SaveDataModalTicket SaveDataDialogState::take_pending() {
+    std::lock_guard<std::mutex> lock(mx_);
+    const uint64_t pending = pending_generation_;
+    pending_generation_ = 0;
+    if (!pending || pending != generation_ || status_ != 2 /*RUNNING*/) return {};
+    return {pending, request_};
+}
+
+bool SaveDataDialogState::active(uint64_t generation) const {
+    std::lock_guard<std::mutex> lock(mx_);
+    return generation && generation_ == generation && status_ == 2 /*RUNNING*/;
+}
+
+void SaveDataDialogState::complete(uint64_t generation, int clicked) {
+    std::lock_guard<std::mutex> lock(mx_);
+    if (!generation || generation_ != generation || status_ != 2 /*RUNNING*/) return;
+    canceled_ = clicked <= 0;
+    button_ = canceled_ ? 0u : (uint32_t)clicked;
+    status_ = 3 /*FINISHED*/;
+}
+
+SaveDataResultSnapshot SaveDataDialogState::result_snapshot() const {
+    std::lock_guard<std::mutex> lock(mx_);
+    return {request_, button_, canceled_};
 }
 
 // --- ImeDialog text entry ---

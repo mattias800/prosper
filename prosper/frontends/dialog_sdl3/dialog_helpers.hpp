@@ -10,6 +10,7 @@
 //   ErrorDialog param:    s32 size @0 ; s32 errorCode @4 ; s32 userId @8 ; s32 reserved @12
 #pragma once
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 namespace prosper {
@@ -35,6 +36,76 @@ void write_msg_result(uint64_t result, uint32_t buttonId);
 
 // Read errorCode (@4) from a guest OrbisErrorDialogParam*.
 uint32_t read_error_code(uint64_t param);
+
+// --- SaveDataDialog ---
+// Param layout (0x98 bytes): CommonDialog::BaseParam[0x30], size@0x30, mode@0x34,
+// dispType@0x38, then nested pointers userMsg@0x50, systemMsg@0x58, errorCode@0x60,
+// progress@0x68, userData@0x70, option@0x78. Result layout (0x48 bytes):
+// mode/result/buttonId @0/4/8, caller-owned dirName/param pointers @0x10/0x18,
+// userData @0x20, reserved[32] @0x28. These offsets match the PS4/PS5 inherited ABI.
+enum : uint32_t {
+    SAVE_DATA_DIALOG_MODE_LIST = 1,
+    SAVE_DATA_DIALOG_MODE_USER_MSG = 2,
+    SAVE_DATA_DIALOG_MODE_SYSTEM_MSG = 3,
+    SAVE_DATA_DIALOG_MODE_ERROR_CODE = 4,
+    SAVE_DATA_DIALOG_MODE_PROGRESS_BAR = 5,
+};
+
+struct SaveDataRequest {
+    bool supported = false;       // false -> frontend declines ownership; core keeps headless policy
+    bool error = false;           // choose the error rather than information message-box style
+    bool cancelable = true;       // false when OptionBack::DISABLE forbids a back/cancel outcome
+    uint32_t mode = 0;
+    uint32_t displayType = 0;     // 1=SAVE, 2=LOAD, 3=DELETE
+    uint64_t userData = 0;
+    std::string message;
+    MsgButtons buttons{0, {nullptr, nullptr, nullptr}, {0, 0, 0}};
+};
+
+// SDL-free lifecycle seam shared by the frontend and unit tests. A pending ticket is consumed once;
+// Close or a newer Open invalidates every older generation, including one already visible.
+struct SaveDataModalTicket {
+    uint64_t generation = 0;
+    SaveDataRequest request{};
+    explicit operator bool() const { return generation != 0; }
+};
+
+struct SaveDataResultSnapshot {
+    SaveDataRequest request{};
+    uint32_t buttonId = 0;
+    bool canceled = false;
+};
+
+class SaveDataDialogState {
+public:
+    void open(SaveDataRequest request);
+    int status() const;
+    void close();
+    SaveDataModalTicket take_pending();
+    bool active(uint64_t generation) const;
+    void complete(uint64_t generation, int clicked);
+    SaveDataResultSnapshot result_snapshot() const;
+
+private:
+    mutable std::mutex mx_;
+    SaveDataRequest request_{};
+    int status_ = 0;
+    uint32_t button_ = 0;
+    bool canceled_ = false;
+    uint64_t generation_ = 0;
+    uint64_t pending_generation_ = 0;
+};
+
+// Parse the supported non-list modes into an owned request safe to retain until the SDL main-thread
+// pump runs. USER_MSG, ordinary SYSTEM_MSG confirmations/notices, and ERROR_CODE are supported.
+// LIST and progress/no-button modes deliberately return supported=false until their dedicated UI exists.
+SaveDataRequest read_savedata_request(uint64_t param);
+
+// Write only fields owned by the service: mode/result/buttonId/userData. Caller-provided dirName and
+// param output pointers, the ABI pad, and all reserved bytes remain untouched. `canceled` writes
+// CommonDialog::Result::USER_CANCELED and ButtonId::INVALID. An unreadable result pointer is ignored.
+void write_savedata_result(uint64_t result, const SaveDataRequest& request,
+                           uint32_t buttonId, bool canceled);
 
 // --- ImeDialog (text entry) --- offsets from shadPS4 ime/ime_common.h OrbisImeDialogParam:
 //   user_id@0 type@4 ... max_text_length@36(u32) input_text_buffer@40(char16_t*) ... title@72(char16_t*)
