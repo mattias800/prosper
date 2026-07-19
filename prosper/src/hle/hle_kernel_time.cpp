@@ -1114,9 +1114,8 @@ void register_kernel_time_hle() {
     // their out-params (affinity mask 0xff, priority 700) — a Get* that returns success without
     // writing hands the caller uninitialized stack memory. register_kernel_time_hle() runs AFTER
     // register_kernel_hle(), so re-registering scePthreadGet{affinity,prio} to a bare k_ok here
-    // (last-write-wins) SILENTLY re-broke exactly that fix. Only scePthreadRename is unique to this
-    // file; leave the scheduling functions to hle_kernel.cpp.
-    R("scePthreadRename", k_ok);
+    // (last-write-wins) SILENTLY re-broke exactly that fix. Thread naming also has its real,
+    // guest-visible implementation in hle_kernel.cpp; leave the entire family there.
     R("sceKernelUuidCreate", k_uuid_create);
     R("_exit", k_exit);
     R("sceKernelDebugRaiseExceptionOnReleaseMode", k_debug_raise_release);
