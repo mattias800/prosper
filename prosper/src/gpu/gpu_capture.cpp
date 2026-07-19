@@ -945,7 +945,7 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
     uint64_t raw_shader_words = 0;
     std::map<uint64_t, uint32_t> raw_shader_index_by_address;
     for (const auto& d : draws) {
-        GpuCapturedDraw c; c.vs = d.vs; c.gs = d.gs; c.fs = d.fs;
+        GpuCapturedDraw c; c.vs = d.vs_words(); c.gs = d.gs_words(); c.fs = d.fs_words();
         c.ps = d.ps; c.vertex_count = d.vertex_count;
         c.instance_count = d.instance_count;
         c.indices = d.indices; c.color0_base = d.color0_base;

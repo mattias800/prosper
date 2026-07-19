@@ -167,6 +167,7 @@ inline BackendColorTargetStats backend_color_target_stats() {
 // correctly. render_triangle_rgba is a thin single-draw wrapper (below).
 struct BackendDraw {
     std::vector<uint32_t> vs, gs, fs;
+    prosper::gpu::SharedShaderWords vs_shared, fs_shared;
     uint64_t vs_identity = 0, fs_identity = 0;
     const prosper::gpu::ResolvedPipelineState* ps = nullptr;   // null -> triangle-list, write RGBA, no depth
     std::vector<FrameResource> R;                              // set-tagged resources (empty -> no descriptors)
@@ -177,6 +178,10 @@ struct BackendDraw {
     // fetched index — exactly what the recompiled VS's storage-buffer vertex fetch expects. Empty ->
     // plain vkCmdDraw(vcount). Both paths preserve instance_count.
     std::vector<uint32_t> indices;
+
+    const std::vector<uint32_t>& vs_words() const { return vs_shared ? *vs_shared : vs; }
+    const std::vector<uint32_t>& gs_words() const { return gs; }
+    const std::vector<uint32_t>& fs_words() const { return fs_shared ? *fs_shared : fs; }
 };
 
 struct BackendTextureUploadStats {
@@ -2100,12 +2105,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     for (size_t di = 0; di < draws.size(); di++) {
         const auto setup_begin = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         const BackendDraw& bd = draws[di];
+        const std::vector<uint32_t>& bd_vs = bd.vs_words();
+        const std::vector<uint32_t>& bd_gs = bd.gs_words();
+        const std::vector<uint32_t>& bd_fs = bd.fs_words();
         DV& v = dv[di];
         if (backend_trace) {
             fprintf(stderr,
                     "[backend-trace] draw=%zu/%zu begin extent=%ux%u vs=%zu gs=%zu fs=%zu "
                     "vs_id=%016llx fs_id=%016llx resources=%zu\n",
-                    di, draws.size(), W, H, bd.vs.size(), bd.gs.size(), bd.fs.size(),
+                    di, draws.size(), W, H, bd_vs.size(), bd_gs.size(), bd_fs.size(),
                     (unsigned long long)bd.vs_identity,
                     (unsigned long long)bd.fs_identity, bd.R.size());
             fflush(stderr);
@@ -2145,8 +2153,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         }
         VkPipelineShaderStageCreateInfo st[3]{};
         st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}; st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = v.vs; st[0].pName = "main";
-        const uint32_t fragment_stage_index = bd.gs.empty() ? 1u : 2u;
-        if (!bd.gs.empty()) {
+        const uint32_t fragment_stage_index = bd_gs.empty() ? 1u : 2u;
+        if (!bd_gs.empty()) {
             st[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
             st[1].stage = VK_SHADER_STAGE_GEOMETRY_BIT; st[1].module = v.gs; st[1].pName = "main";
         }
@@ -2748,7 +2756,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             ++resource_reuse_stats.unique_pipeline_layouts;
         }
         VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-        gp.stageCount = bd.gs.empty() ? 2u : 3u; gp.pStages = st;
+        gp.stageCount = bd_gs.empty() ? 2u : 3u; gp.pStages = st;
         gp.pVertexInputState = &vin; gp.pInputAssemblyState = &ia;
         gp.pViewportState = &vpst; gp.pRasterizationState = &rs; gp.pMultisampleState = &ms;
         gp.pColorBlendState = &cb; gp.pDynamicState = &dynamic_state;
@@ -2782,19 +2790,19 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 append(static_cast<uint32_t>(bd.vs_identity));
                 append(static_cast<uint32_t>(bd.vs_identity >> 32));
             } else {
-                append(static_cast<uint32_t>(bd.vs.size()));
-                for (uint32_t word : bd.vs) append(word);
+                append(static_cast<uint32_t>(bd_vs.size()));
+                for (uint32_t word : bd_vs) append(word);
             }
             append(bd.fs_identity != 0);
             if (bd.fs_identity) {
                 append(static_cast<uint32_t>(bd.fs_identity));
                 append(static_cast<uint32_t>(bd.fs_identity >> 32));
             } else {
-                append(static_cast<uint32_t>(bd.fs.size()));
-                for (uint32_t word : bd.fs) append(word);
+                append(static_cast<uint32_t>(bd_fs.size()));
+                for (uint32_t word : bd_fs) append(word);
             }
-            append(static_cast<uint32_t>(bd.gs.size()));
-            for (uint32_t word : bd.gs) append(word);
+            append(static_cast<uint32_t>(bd_gs.size()));
+            for (uint32_t word : bd_gs) append(word);
             append(v.use_desc); append(v.n_sets);
             // A pair of shader-cache identities names the exact compile keys, including every
             // descriptor's class and binding. External/replay shaders have identity zero and keep
@@ -2862,8 +2870,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 fprintf(stderr, "[backend-trace] draw=%zu create-shaders begin\n", di);
                 fflush(stderr);
             }
-            v.vs = mkmod(bd.vs); v.gs = bd.gs.empty() ? VK_NULL_HANDLE : mkmod(bd.gs);
-            v.fs = mkmod(bd.fs);
+            v.vs = mkmod(bd_vs); v.gs = bd_gs.empty() ? VK_NULL_HANDLE : mkmod(bd_gs);
+            v.fs = mkmod(bd_fs);
             if (backend_trace) {
                 fprintf(stderr,
                         "[backend-trace] draw=%zu create-shaders end vs=%p gs=%p fs=%p\n",
@@ -2874,14 +2882,14 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 ? TimingClock::now() : TimingClock::time_point{};
             if (timing_enabled)
                 setup_shader_ms += setup_elapsed_ms(setup_shader_begin, setup_shader_ready);
-            if (!v.vs || !v.fs || (!bd.gs.empty() && !v.gs)) {
+            if (!v.vs || !v.fs || (!bd_gs.empty() && !v.gs)) {
                 if (timing_enabled)
                     setup_pipeline_ms += setup_elapsed_ms(
                         setup_resources_ready, setup_pipeline_key_ready);
                 continue;   // rejected SPIR-V -> skip this draw
             }
             st[0].module = v.vs;
-            if (!bd.gs.empty()) st[1].module = v.gs;
+            if (!bd_gs.empty()) st[1].module = v.gs;
             st[fragment_stage_index].module = v.fs;
             setup_pipeline_create_begin = setup_shader_ready;
             if (backend_trace) {

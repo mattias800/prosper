@@ -20,11 +20,13 @@
 #include <algorithm>
 #include <atomic>
 #include <bitset>
+#include <condition_variable>
 #include <filesystem>
 #include <iterator>
 #include <mutex>
 #include <set>
 #include <tuple>
+#include <thread>
 #include <vector>
 #include <unordered_map>
 #ifdef _WIN32
@@ -134,10 +136,26 @@ struct ShaderCompileKey {
     PixelSystemInputMapping system_inputs{};
     bool has_pcrel_dispatch = false;
     uint32_t pcrel_dispatch_target = UINT32_MAX;
-    std::vector<uint32_t> code;
+    // Aliases ShaderCodeAnalysis::code and keeps that immutable analysis alive. Warm lookups used to
+    // copy and re-hash the complete raw program for every draw before reaching the shader cache.
+    std::shared_ptr<const std::vector<uint32_t>> code;
     std::vector<ShaderResourceCompileKey> resources;
+    size_t cached_hash = 0;
 
-    bool operator==(const ShaderCompileKey&) const = default;
+    bool operator==(const ShaderCompileKey& other) const {
+        const bool same_code = code == other.code ||
+            (code && other.code && *code == *other.code);
+        return stage == other.stage &&
+               has_resource_table == other.has_resource_table &&
+               force_position_w == other.force_position_w &&
+               has_pixel_inputs == other.has_pixel_inputs &&
+               pixel_inputs == other.pixel_inputs &&
+               has_system_inputs == other.has_system_inputs &&
+               system_inputs == other.system_inputs &&
+               has_pcrel_dispatch == other.has_pcrel_dispatch &&
+               pcrel_dispatch_target == other.pcrel_dispatch_target &&
+               resources == other.resources && same_code;
+    }
 };
 
 static uint64_t hash_mix(uint64_t hash, uint64_t value) {
@@ -150,7 +168,7 @@ static uint64_t hash_mix(uint64_t hash, uint64_t value) {
 }
 
 struct ShaderCompileKeyHash {
-    size_t operator()(const ShaderCompileKey& key) const {
+    static size_t compute(const ShaderCompileKey& key) {
         uint64_t hash = 1469598103934665603ull;
         hash = hash_mix(hash, static_cast<uint32_t>(key.stage));
         hash = hash_mix(hash, key.has_resource_table);
@@ -168,8 +186,9 @@ struct ShaderCompileKeyHash {
         }
         hash = hash_mix(hash, key.has_pcrel_dispatch);
         if (key.has_pcrel_dispatch) hash = hash_mix(hash, key.pcrel_dispatch_target);
-        hash = hash_mix(hash, key.code.size());
-        for (uint32_t word : key.code) hash = hash_mix(hash, word);
+        hash = hash_mix(hash, key.code ? key.code->size() : 0u);
+        if (key.code)
+            for (uint32_t word : *key.code) hash = hash_mix(hash, word);
         hash = hash_mix(hash, key.resources.size());
         for (const auto& resource : key.resources) {
             hash = hash_mix(hash, resource.cls);
@@ -183,10 +202,12 @@ struct ShaderCompileKeyHash {
         }
         return static_cast<size_t>(hash);
     }
+
+    size_t operator()(const ShaderCompileKey& key) const { return key.cached_hash; }
 };
 
 struct CachedShader {
-    std::vector<uint32_t> spirv;
+    SharedShaderWords spirv;
     uint64_t identity = 0;
     uint64_t last_use = 0;
     uint64_t bytes = 0;
@@ -481,6 +502,13 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
 
     auto decoded = decode();
     std::lock_guard lock(cache.mutex);
+    // Another cold worker may have populated this address while decode ran. Replace it only after
+    // removing its accounted bytes; returned shared_ptrs remain valid independently of the map entry.
+    auto concurrent = cache.entries.find(address);
+    if (concurrent != cache.entries.end()) {
+        cache.stats.bytes -= concurrent->second.shader->bytes;
+        cache.entries.erase(concurrent);
+    }
     constexpr size_t max_entries = 4096;
     const uint64_t limit = shader_decode_cache_limit_bytes();
     while (!cache.entries.empty() &&
@@ -537,33 +565,55 @@ std::shared_ptr<const ShaderCodeAnalysis> analyze_shader_code_cached(const uint3
     }
 
     const uintptr_t address = reinterpret_cast<uintptr_t>(code);
-    {
+    // Copy the immutable candidate under the mutex, then validate guest bytes without it. Dense draw
+    // realization performs these exact checks from several workers; holding one global cache mutex
+    // across guest_readable + memcmp otherwise serializes every warm lookup.
+    for (;;) {
+        std::shared_ptr<const ShaderCodeAnalysis> cached;
+        {
+            std::lock_guard lock(cache.mutex);
+            auto found = cache.entries.find(address);
+            if (found == cache.entries.end()) {
+                ++cache.stats.misses;
+                break;
+            }
+            cached = found->second.analysis;
+        }
+        const bool compatible_length = cached->bounded_span
+            ? cached->code.size() <= dwords : cached->source_dwords == dwords;
+        const uint64_t code_bytes = static_cast<uint64_t>(cached->code.size()) * sizeof(uint32_t);
+        const bool readable = code_bytes == 0 ||
+                              (code_bytes <= UINT32_MAX &&
+                               guest_readable(address, static_cast<uint32_t>(code_bytes)));
+        const bool matches = compatible_length && readable &&
+            (code_bytes == 0 ||
+             memcmp(code, cached->code.data(), static_cast<size_t>(code_bytes)) == 0);
+
         std::lock_guard lock(cache.mutex);
         auto found = cache.entries.find(address);
-        if (found != cache.entries.end()) {
-            const auto& cached = found->second.analysis;
-            const bool compatible_length = cached->bounded_span
-                ? cached->code.size() <= dwords : cached->source_dwords == dwords;
-            const uint64_t code_bytes = static_cast<uint64_t>(cached->code.size()) * sizeof(uint32_t);
-            const bool readable = code_bytes == 0 ||
-                                  (code_bytes <= UINT32_MAX &&
-                                   guest_readable(address, static_cast<uint32_t>(code_bytes)));
-            if (compatible_length && readable &&
-                (code_bytes == 0 ||
-                 memcmp(code, cached->code.data(), static_cast<size_t>(code_bytes)) == 0)) {
-                ++cache.stats.hits;
-                found->second.last_use = ++cache.use_counter;
-                return cached;
-            }
-            cache.stats.bytes -= cached->bytes;
-            cache.entries.erase(found);
-            ++cache.stats.invalidations;
+        if (found == cache.entries.end() || found->second.analysis != cached)
+            continue; // Evicted/replaced while unlocked: validate the current version instead.
+        if (matches) {
+            ++cache.stats.hits;
+            found->second.last_use = ++cache.use_counter;
+            return cached;
         }
+        cache.stats.bytes -= cached->bytes;
+        cache.entries.erase(found);
+        ++cache.stats.invalidations;
         ++cache.stats.misses;
+        break;
     }
 
     auto analysis = analyze();
     std::lock_guard lock(cache.mutex);
+    // Another cold worker may have populated this address while analysis ran. Keep exact byte
+    // accounting when replacing it; each returned shared_ptr remains independently valid.
+    auto concurrent = cache.entries.find(address);
+    if (concurrent != cache.entries.end()) {
+        cache.stats.bytes -= concurrent->second.analysis->bytes;
+        cache.entries.erase(concurrent);
+    }
     constexpr size_t max_entries = 4096;
     const uint64_t limit = shader_analysis_cache_limit_bytes();
     while (!cache.entries.empty() &&
@@ -594,7 +644,7 @@ uint64_t shader_cache_limit_bytes() {
 }
 
 uint64_t shader_cache_entry_bytes(const ShaderCompileKey& key, const std::vector<uint32_t>& spirv) {
-    return static_cast<uint64_t>(key.code.size()) * sizeof(uint32_t) +
+    return static_cast<uint64_t>(key.code ? key.code->size() : 0u) * sizeof(uint32_t) +
            static_cast<uint64_t>(key.resources.size()) * sizeof(ShaderResourceCompileKey) +
            (key.has_pixel_inputs ? sizeof(PixelInputMapping) : 0u) +
            (key.has_system_inputs ? sizeof(PixelSystemInputMapping) : 0u) +
@@ -706,7 +756,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
         // Most shaders end at S_ENDPGM. A compiler-generated s_getpc_b64 V# may instead address an
         // embedded lookup table after ENDPGM; retain that proven tail so cached recompilation sees the
         // same blob as the direct path and table contents participate in the cache identity.
-        key.code = analysis->code;
+        key.code = std::shared_ptr<const std::vector<uint32_t>>(analysis, &analysis->code);
     }
     if (resources) {
         key.resources.reserve(resources->resources.size());
@@ -718,17 +768,19 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             });
         }
     }
+    key.cached_hash = ShaderCompileKeyHash::compute(key);
     return key;
 }
 
 std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const ShaderCompileKey& key,
                                               const ShaderResourceTable* resources) {
-    const uint32_t* code = key.code.empty() ? nullptr : key.code.data();
+    const uint32_t* code = !key.code || key.code->empty() ? nullptr : key.code->data();
+    const size_t code_size = key.code ? key.code->size() : 0u;
     if (stage == ShaderProgramStage::Vertex)
-        return recompile_vertex(code, key.code.size(), resources,
+        return recompile_vertex(code, code_size, resources,
                                 key.has_pixel_inputs ? &key.pixel_inputs : nullptr);
     if (stage == ShaderProgramStage::Fragment)
-        return recompile_fragment(code, key.code.size(), resources,
+        return recompile_fragment(code, code_size, resources,
                                   key.has_system_inputs ? &key.system_inputs : nullptr,
                                   key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX);
     return {};
@@ -737,12 +789,12 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
 void maybe_dump_successful_shader(ShaderProgramStage stage, const ShaderCompileKey& key,
                                   const std::vector<uint32_t>& spirv) {
     const char* directory = getenv("PROSPER_SHADER_DUMP_SUCCESS");
-    if (!directory || !*directory || key.code.empty() || spirv.empty()) return;
+    if (!directory || !*directory || !key.code || key.code->empty() || spirv.empty()) return;
 
     const uint64_t spirv_hash = gpu_capture_hash(
         reinterpret_cast<const uint8_t*>(spirv.data()), spirv.size() * sizeof(uint32_t));
     const uint64_t raw_hash = gpu_capture_hash(
-        reinterpret_cast<const uint8_t*>(key.code.data()), key.code.size() * sizeof(uint32_t));
+        reinterpret_cast<const uint8_t*>(key.code->data()), key.code->size() * sizeof(uint32_t));
     static std::mutex dump_mutex;
     static std::set<std::tuple<uint32_t, uint64_t, uint64_t>> dumped;
     std::lock_guard lock(dump_mutex);
@@ -765,16 +817,16 @@ void maybe_dump_successful_shader(ShaderProgramStage stage, const ShaderCompileK
              static_cast<unsigned long long>(raw_hash));
     FILE* raw = fopen(raw_path, "wb");
     FILE* translated = fopen(spirv_path, "wb");
-    const size_t raw_bytes = key.code.size() * sizeof(uint32_t);
+    const size_t raw_bytes = key.code->size() * sizeof(uint32_t);
     const size_t spirv_bytes = spirv.size() * sizeof(uint32_t);
     const bool ok = raw && translated &&
-        fwrite(key.code.data(), 1, raw_bytes, raw) == raw_bytes &&
+        fwrite(key.code->data(), 1, raw_bytes, raw) == raw_bytes &&
         fwrite(spirv.data(), 1, spirv_bytes, translated) == spirv_bytes;
     if (raw) fclose(raw);
     if (translated) fclose(translated);
     fprintf(stderr, "[shader-dump] %s spv=%016llx raw=%016llx words=%zu/%zu result=%s\n", tag,
             static_cast<unsigned long long>(spirv_hash),
-            static_cast<unsigned long long>(raw_hash), key.code.size(), spirv.size(),
+            static_cast<unsigned long long>(raw_hash), key.code->size(), spirv.size(),
             ok ? "written" : "failed");
 }
 
@@ -853,12 +905,10 @@ FragmentInterpolationLayout fragment_interpolation_layout_cached(
     return layout;
 }
 
-std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
-                                                       const uint32_t* code, size_t dwords,
-                                                       const ShaderResourceTable* resources,
-                                                       const PixelInputMapping* pixel_inputs,
-                                                       const PixelSystemInputMapping* system_inputs,
-                                                       uint64_t* cache_identity) {
+SharedShaderWords recompile_graphics_shader_cached_shared(
+        ShaderProgramStage stage, const uint32_t* code, size_t dwords,
+        const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
+        const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity) {
     if (cache_identity) *cache_identity = 0;
     ShaderCompileKey key = make_shader_compile_key(stage, code, dwords, resources, pixel_inputs,
                                                    system_inputs);
@@ -868,8 +918,9 @@ std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
             std::lock_guard lock(cache.mutex);
             ++cache.stats.bypasses;
         }
-        std::vector<uint32_t> spirv = compile_graphics_shader(stage, key, resources);
-        maybe_dump_successful_shader(stage, key, spirv);
+        auto spirv = std::make_shared<const std::vector<uint32_t>>(
+            compile_graphics_shader(stage, key, resources));
+        maybe_dump_successful_shader(stage, key, *spirv);
         return spirv;
     }
 
@@ -880,19 +931,20 @@ std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
         ++cache.stats.hits;
         found->second.last_use = ++cache.use_counter;
         if (cache_identity) *cache_identity = found->second.identity;
-        maybe_dump_successful_shader(stage, key, found->second.spirv);
+        maybe_dump_successful_shader(stage, key, *found->second.spirv);
         return found->second.spirv;
     }
 
     const auto start = std::chrono::steady_clock::now();
-    std::vector<uint32_t> spirv = compile_graphics_shader(stage, key, resources);
-    maybe_dump_successful_shader(stage, key, spirv);
+    auto spirv = std::make_shared<const std::vector<uint32_t>>(
+        compile_graphics_shader(stage, key, resources));
+    maybe_dump_successful_shader(stage, key, *spirv);
     const auto end = std::chrono::steady_clock::now();
     ++cache.stats.misses;
     cache.stats.compile_ms += std::chrono::duration<double, std::milli>(end - start).count();
 
     constexpr size_t max_entries = 4096;
-    const uint64_t bytes = shader_cache_entry_bytes(key, spirv);
+    const uint64_t bytes = shader_cache_entry_bytes(key, *spirv);
     const uint64_t limit = shader_cache_limit_bytes();
     while (!cache.entries.empty() &&
            (cache.entries.size() >= max_entries || cache.stats.bytes + bytes > limit)) {
@@ -915,6 +967,15 @@ std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
     }
     cache.stats.entries = cache.entries.size();
     return spirv;
+}
+
+std::vector<uint32_t> recompile_graphics_shader_cached(
+        ShaderProgramStage stage, const uint32_t* code, size_t dwords,
+        const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
+        const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity) {
+    SharedShaderWords words = recompile_graphics_shader_cached_shared(
+        stage, code, dwords, resources, pixel_inputs, system_inputs, cache_identity);
+    return words ? *words : std::vector<uint32_t>{};
 }
 
 ShaderRecompileCacheStats shader_recompile_cache_stats() {
@@ -3441,6 +3502,354 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
 }
 
 namespace {
+
+struct DrawRealizationBatch {
+    using Callback = void (*)(void*, size_t);
+    using DrawCallback = void (*)(void*, size_t, size_t);
+
+    void* context = nullptr;
+    Callback begin = nullptr;
+    DrawCallback draw = nullptr;
+    Callback end = nullptr;
+    size_t count = 0;
+    size_t worker_participants = 0;
+    std::atomic<size_t> next{0};
+    std::atomic<size_t> remaining{0};
+    std::mutex done_mutex;
+    std::condition_variable done_cv;
+    std::mutex error_mutex;
+    std::exception_ptr error;
+};
+
+// One process-lifetime worker set avoids creating dozens of host threads for every guest submit.
+// The pool deliberately supports one batch at a time; callers are serialized at run() even when
+// independent submit threads arrive concurrently. The submit thread participates as slot zero;
+// each persistent worker owns a stable measurement slot.
+class DrawRealizationPool {
+public:
+    explicit DrawRealizationPool(size_t workers) {
+        workers_.reserve(workers);
+        try {
+            for (size_t i = 0; i < workers; ++i)
+                workers_.emplace_back([this, i] { worker_main(i); });
+        } catch (...) {
+            {
+                std::lock_guard lock(mutex_);
+                stopping_ = true;
+                ++generation_;
+            }
+            work_cv_.notify_all();
+            for (auto& worker : workers_) if (worker.joinable()) worker.join();
+            throw;
+        }
+    }
+
+    ~DrawRealizationPool() {
+        std::lock_guard run_lock(run_mutex_);
+        {
+            std::lock_guard lock(mutex_);
+            stopping_ = true;
+            ++generation_;
+        }
+        work_cv_.notify_all();
+        for (auto& worker : workers_) if (worker.joinable()) worker.join();
+    }
+
+    size_t worker_count() const { return workers_.size(); }
+
+    void run(const std::shared_ptr<DrawRealizationBatch>& batch, size_t workers_to_use) {
+        std::lock_guard run_lock(run_mutex_);
+        workers_to_use = std::min(workers_to_use, workers_.size());
+        batch->worker_participants = workers_to_use;
+        batch->remaining.store(workers_to_use, std::memory_order_relaxed);
+        {
+            std::lock_guard lock(mutex_);
+            active_ = batch;
+            ++generation_;
+        }
+        work_cv_.notify_all();
+
+        run_participant(batch, 0);
+        if (workers_to_use) {
+            std::unique_lock lock(batch->done_mutex);
+            batch->done_cv.wait(lock, [&] {
+                return batch->remaining.load(std::memory_order_acquire) == 0;
+            });
+        }
+        // Do not retain the caller-owned context through the process-lifetime pool. A worker that
+        // woke for this generation but was not selected may still hold its own shared batch reference;
+        // clearing the pool reference is safe after every selected worker has completed.
+        {
+            std::lock_guard lock(mutex_);
+            if (active_ == batch) active_.reset();
+        }
+        if (batch->error) std::rethrow_exception(batch->error);
+    }
+
+private:
+    static void remember_error(const std::shared_ptr<DrawRealizationBatch>& batch) {
+        std::lock_guard lock(batch->error_mutex);
+        if (!batch->error) batch->error = std::current_exception();
+    }
+
+    static void run_participant(const std::shared_ptr<DrawRealizationBatch>& batch,
+                                size_t measurement_slot) {
+        bool began = false;
+        try {
+            if (batch->begin) batch->begin(batch->context, measurement_slot);
+            began = true;
+            constexpr size_t kGrain = 4;
+            for (;;) {
+                const size_t first = batch->next.fetch_add(kGrain, std::memory_order_relaxed);
+                if (first >= batch->count) break;
+                const size_t last = std::min(first + kGrain, batch->count);
+                for (size_t draw = first; draw < last; ++draw)
+                    batch->draw(batch->context, draw, measurement_slot);
+            }
+        } catch (...) {
+            remember_error(batch);
+        }
+        if (began && batch->end) {
+            try { batch->end(batch->context, measurement_slot); }
+            catch (...) { remember_error(batch); }
+        }
+    }
+
+    void worker_main(size_t worker_index) {
+        uint64_t seen_generation = 0;
+        for (;;) {
+            std::shared_ptr<DrawRealizationBatch> batch;
+            {
+                std::unique_lock lock(mutex_);
+                work_cv_.wait(lock, [&] {
+                    return stopping_ || generation_ != seen_generation;
+                });
+                if (stopping_) return;
+                seen_generation = generation_;
+                batch = active_;
+            }
+            if (!batch || worker_index >= batch->worker_participants) continue;
+            run_participant(batch, worker_index + 1);
+            if (batch->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                std::lock_guard lock(batch->done_mutex);
+                batch->done_cv.notify_one();
+            }
+        }
+    }
+
+    std::vector<std::thread> workers_;
+    std::mutex run_mutex_;
+    std::mutex mutex_;
+    std::condition_variable work_cv_;
+    std::shared_ptr<DrawRealizationBatch> active_;
+    uint64_t generation_ = 0;
+    bool stopping_ = false;
+};
+
+size_t configured_draw_realization_threads() {
+    static const size_t threads = [] {
+        const unsigned hardware = std::thread::hardware_concurrency();
+        size_t result = std::min<size_t>(hardware ? hardware : 4u, 8u);
+        if (const char* value = std::getenv("PROSPER_DRAW_REALIZE_THREADS")) {
+            char* end = nullptr;
+            const unsigned long parsed = std::strtoul(value, &end, 10);
+            if (end != value && *end == '\0') result = std::clamp<size_t>(parsed, 1u, 32u);
+        }
+        return std::max<size_t>(result, 1u);
+    }();
+    return threads;
+}
+
+size_t parallel_draw_minimum() {
+    static const size_t minimum = [] {
+        size_t result = 32;
+        if (const char* value = std::getenv("PROSPER_DRAW_REALIZE_MIN_DRAWS")) {
+            char* end = nullptr;
+            const unsigned long parsed = std::strtoul(value, &end, 10);
+            if (end != value && *end == '\0') result = std::clamp<size_t>(parsed, 2u, 4096u);
+        }
+        return result;
+    }();
+    return minimum;
+}
+
+bool parallel_draw_diagnostic_active(bool log) {
+    if (log || std::getenv("PROSPER_SERIAL_DRAW_REALIZE")) return true;
+    static constexpr const char* diagnostics[] = {
+        "PROSPER_RTLOG", "PROSPER_INTERPLOG", "PROSPER_RESDUMP",
+        "PROSPER_DYNTRACE_FAIL", "PROSPER_DRAWDIAG", "PROSPER_ONLY_ATLAS",
+        "PROSPER_CAPTION_DIAG", "PROSPER_VS_DUMP", "PROSPER_SHADER_DUMP",
+        "PROSPER_SHADER_DUMP_SUCCESS", "PROSPER_DRAWLOG", "PROSPER_DBG",
+        "PROSPER_STAGE_FOLD_PROFILE", "PROSPER_DESCRIPTOR_VALIDATE",
+        "PROSPER_NO_SHADER_CACHE",
+    };
+    for (const char* name : diagnostics)
+        if (std::getenv(name)) return true;
+    return false;
+}
+
+DrawRealizationPool& draw_realization_pool() {
+    static DrawRealizationPool pool(configured_draw_realization_threads() - 1);
+    return pool;
+}
+
+struct ParallelDrawSlot {
+    DrawItem item;
+    bool realized = false;
+};
+
+struct ParallelWorkerMeasurement {
+    DrawRealizationPhaseStats draw_before;
+    StageTablePhaseStats table_before;
+    DrawRealizationPhaseStats draw_delta;
+    StageTablePhaseStats table_delta;
+    uint64_t readable_calls = 0;
+    uint64_t readable_hits = 0;
+    uint64_t readable_os_probes = 0;
+    std::unique_ptr<GuestReadableSubmitScope> readable_scope;
+};
+
+struct ParallelDrawContext {
+    const GpuState* state = nullptr;
+    uint32_t max_shader_dwords = 0;
+    bool retain_shared_shader_words = false;
+    bool parent_readable_active = false;
+    std::vector<ParallelDrawSlot> slots;
+    std::vector<ParallelWorkerMeasurement> measurements;
+};
+
+void parallel_draw_worker_begin(void* opaque, size_t worker_slot) {
+    auto& context = *static_cast<ParallelDrawContext*>(opaque);
+    auto& measurement = context.measurements[worker_slot];
+    if (worker_slot != 0)
+        measurement.readable_scope = std::make_unique<GuestReadableSubmitScope>();
+    measurement.draw_before = draw_realization_phase_stats();
+    measurement.table_before = stage_table_phase_stats();
+}
+
+void parallel_draw_worker_execute(void* opaque, size_t draw_index, size_t) {
+    auto& context = *static_cast<ParallelDrawContext*>(opaque);
+    const GpuState& state = *context.state;
+    const GpuState::Draw& draw = state.draws[draw_index];
+    ParallelDrawSlot& slot = context.slots[draw_index];
+    slot.realized = realize_draw_item(
+        state.state_at_draw(draw_index), &draw, draw.index_count,
+        context.max_shader_dwords, false, slot.item, nullptr,
+        context.retain_shared_shader_words);
+    if (slot.realized) {
+        slot.item.draw_index = draw_index;
+        slot.item.command_order = draw.command_order;
+    }
+}
+
+void parallel_draw_worker_end(void* opaque, size_t worker_slot) {
+    auto& context = *static_cast<ParallelDrawContext*>(opaque);
+    auto& measurement = context.measurements[worker_slot];
+    const DrawRealizationPhaseStats draw_after = draw_realization_phase_stats();
+    const StageTablePhaseStats table_after = stage_table_phase_stats();
+    measurement.draw_delta = {
+        draw_after.draws - measurement.draw_before.draws,
+        draw_after.table_ms - measurement.draw_before.table_ms,
+        draw_after.shader_ms - measurement.draw_before.shader_ms,
+    };
+    measurement.table_delta = {
+        table_after.calls - measurement.table_before.calls,
+        table_after.metadata_ms - measurement.table_before.metadata_ms,
+        table_after.dynamic_fold_ms - measurement.table_before.dynamic_fold_ms,
+        table_after.resources_ms - measurement.table_before.resources_ms,
+    };
+    if (worker_slot != 0) {
+        measurement.readable_calls = g_guest_readable_cache.calls;
+        measurement.readable_hits = g_guest_readable_cache.hits;
+        measurement.readable_os_probes = g_guest_readable_cache.os_probes;
+        measurement.readable_scope.reset();
+    }
+}
+
+struct ParallelDrawStatsState {
+    std::mutex mutex;
+    ParallelDrawRealizationStats totals;
+};
+
+ParallelDrawStatsState& parallel_draw_stats_state() {
+    static ParallelDrawStatsState state;
+    return state;
+}
+
+} // namespace
+
+ParallelDrawRealizationStats parallel_draw_realization_stats() {
+    auto& state = parallel_draw_stats_state();
+    std::lock_guard lock(state.mutex);
+    return state.totals;
+}
+
+std::vector<DrawItem> realize_gpustate_draws_parallel(
+        const GpuState& st, uint32_t max_shader_dwords, bool log,
+        bool retain_shared_shader_words, bool* attempted) {
+    if (attempted) *attempted = false;
+    const size_t thread_count = configured_draw_realization_threads();
+    if (thread_count < 2 || st.draws.size() < parallel_draw_minimum() ||
+        parallel_draw_diagnostic_active(log))
+        return {};
+    if (attempted) *attempted = true;
+
+    DrawRealizationPool& pool = draw_realization_pool();
+    const size_t worker_count = std::min(pool.worker_count(), thread_count - 1);
+    ParallelDrawContext context;
+    context.state = &st;
+    context.max_shader_dwords = max_shader_dwords;
+    context.retain_shared_shader_words = retain_shared_shader_words;
+    context.parent_readable_active = g_guest_readable_cache.active;
+    context.slots.resize(st.draws.size());
+    context.measurements.resize(worker_count + 1);
+
+    auto batch = std::make_shared<DrawRealizationBatch>();
+    batch->context = &context;
+    batch->begin = parallel_draw_worker_begin;
+    batch->draw = parallel_draw_worker_execute;
+    batch->end = parallel_draw_worker_end;
+    batch->count = st.draws.size();
+    const auto begin = std::chrono::steady_clock::now();
+    pool.run(batch, worker_count);
+    const auto end = std::chrono::steady_clock::now();
+
+    // The parent thread's phase/readability counters feed the existing submit timing report. Worker
+    // thread-local deltas must be merged explicitly so parallel work is not mislabeled as "other".
+    for (size_t i = 1; i < context.measurements.size(); ++i) {
+        const auto& measurement = context.measurements[i];
+        g_draw_realization_phases.draws += measurement.draw_delta.draws;
+        g_draw_realization_phases.table_ms += measurement.draw_delta.table_ms;
+        g_draw_realization_phases.shader_ms += measurement.draw_delta.shader_ms;
+        g_stage_table_phases.calls += measurement.table_delta.calls;
+        g_stage_table_phases.metadata_ms += measurement.table_delta.metadata_ms;
+        g_stage_table_phases.dynamic_fold_ms += measurement.table_delta.dynamic_fold_ms;
+        g_stage_table_phases.resources_ms += measurement.table_delta.resources_ms;
+        if (context.parent_readable_active) {
+            g_guest_readable_cache.calls += measurement.readable_calls;
+            g_guest_readable_cache.hits += measurement.readable_hits;
+            g_guest_readable_cache.os_probes += measurement.readable_os_probes;
+        }
+    }
+
+    {
+        auto& stats = parallel_draw_stats_state();
+        std::lock_guard lock(stats.mutex);
+        ++stats.totals.batches;
+        stats.totals.semantic_draws += st.draws.size();
+        stats.totals.worker_threads += worker_count + 1;
+        stats.totals.wall_ms +=
+            std::chrono::duration<double, std::milli>(end - begin).count();
+    }
+
+    std::vector<DrawItem> items;
+    items.reserve(st.draws.size());
+    for (auto& slot : context.slots)
+        if (slot.realized) items.push_back(std::move(slot.item));
+    return items;
+}
+
+namespace {
 enum class RetainedSubmitKind : uint8_t { Draw, Dispatch, DmaCopy, MemoryEffect };
 struct RetainedSubmitOperation {
     RetainedSubmitKind kind;
@@ -3465,7 +3874,8 @@ bool realize_retained_draw(const GpuState& st, size_t index, float scale_x, floa
     const GpuState& draw_state = per_draw ? st.state_at_draw(index) : st;
     const GpuState::Draw& draw = st.draws[index];
     const bool log = getenv("PROSPER_GFXLOG") != nullptr || getenv("PROSPER_EXECLOG") != nullptr;
-    if (!realize_draw_item(draw_state, &draw, draw.index_count, 0x10000, log, item)) return false;
+    if (!realize_draw_item(draw_state, &draw, draw.index_count, 0x10000, log, item,
+                           nullptr, true)) return false;
     item.draw_index = index;
     item.command_order = draw.command_order;
     if (scale_x != 1.0f || scale_y != 1.0f)
@@ -3695,6 +4105,8 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
         ? draw_realization_phase_stats() : DrawRealizationPhaseStats{};
     const StageTablePhaseStats table_phases_before = timing_enabled
         ? stage_table_phase_stats() : StageTablePhaseStats{};
+    const ParallelDrawRealizationStats parallel_before = timing_enabled
+        ? parallel_draw_realization_stats() : ParallelDrawRealizationStats{};
     uint32_t fw = present_width(), fh = present_height();
     float sx = fw ? (float)width / (float)fw : 1.0f;
     float sy = fh ? (float)height / (float)fh : 1.0f;
@@ -3702,7 +4114,8 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     // A DMA-bearing submit realizes consumers at their ordered position below. Pre-realizing here
     // would snapshot old indices/descriptors/shader bytes before the copy updates their backing.
     std::vector<DrawItem> draws = !has_ordered_dma && g_live && width && height
-        ? realize_gpustate_draws(st, 0x10000, sx, sy) : std::vector<DrawItem>{};
+        ? realize_gpustate_draws(st, 0x10000, sx, sy, nullptr, true)
+        : std::vector<DrawItem>{};
     const ShaderRecompileCacheStats shader_after = timing_enabled
         ? shader_recompile_cache_stats() : ShaderRecompileCacheStats{};
     const ShaderDecodeCacheStats decode_after = timing_enabled
@@ -3711,6 +4124,8 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
         ? draw_realization_phase_stats() : DrawRealizationPhaseStats{};
     const StageTablePhaseStats table_phases_after = timing_enabled
         ? stage_table_phase_stats() : StageTablePhaseStats{};
+    const ParallelDrawRealizationStats parallel_after = timing_enabled
+        ? parallel_draw_realization_stats() : ParallelDrawRealizationStats{};
     const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     std::vector<ComputeItem> computes = !has_ordered_dma && g_compute
         ? realize_compute_dispatches(st, submit_no) : std::vector<ComputeItem>{};
@@ -3747,9 +4162,11 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
             uint64_t shader_hits = 0, shader_misses = 0, shader_bypasses = 0;
             uint64_t decode_hits = 0, decode_misses = 0, decode_invalidations = 0;
             uint64_t readable_calls = 0, readable_hits = 0, readable_os_probes = 0;
+            uint64_t parallel_batches = 0, parallel_draws = 0, parallel_threads = 0;
             double realize_draws = 0, realize_compute = 0, plan = 0, backend = 0, publish = 0;
             double table_build = 0, shader_lookup = 0, shader_compile = 0;
             double table_metadata = 0, table_dynamic_fold = 0, table_resources = 0;
+            double parallel_wall = 0;
         };
         static TimingTotals totals;
         static TimingTotals window;
@@ -3767,6 +4184,10 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
             timing.readable_calls += g_guest_readable_cache.calls;
             timing.readable_hits += g_guest_readable_cache.hits;
             timing.readable_os_probes += g_guest_readable_cache.os_probes;
+            timing.parallel_batches += parallel_after.batches - parallel_before.batches;
+            timing.parallel_draws += parallel_after.semantic_draws - parallel_before.semantic_draws;
+            timing.parallel_threads += parallel_after.worker_threads - parallel_before.worker_threads;
+            timing.parallel_wall += parallel_after.wall_ms - parallel_before.wall_ms;
             timing.realize_draws += ms(timing_start, timing_draws_ready);
             timing.realize_compute += ms(timing_draws_ready, timing_compute_ready);
             timing.plan += ms(timing_compute_ready, timing_plan_ready);
@@ -3805,6 +4226,7 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
                          "readable: hit=%.1f/%.1f os=%.1f "
                          "avg_ms: total=%.2f realize_draws=%.2f tables=%.2f shader_lookup=%.2f "
                          "shader_compile=%.2f table_parts: metadata=%.2f fold=%.2f resources=%.2f "
+                         "parallel: batches=%.2f draws=%.1f threads=%.1f wall=%.2f "
                          "realize_compute=%.2f plan=%.2f backend=%.2f publish=%.2f\n",
                          (unsigned long long)window.submits, window.draws / wn,
                          window.dispatches / wn, window.render_spans / wn,
@@ -3817,6 +4239,12 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
                          window.shader_lookup / wn, window.shader_compile / wn,
                          window.table_metadata / wn, window.table_dynamic_fold / wn,
                          window.table_resources / wn,
+                         window.parallel_batches / wn, window.parallel_draws / wn,
+                         window.parallel_batches
+                             ? static_cast<double>(window.parallel_threads) /
+                                   static_cast<double>(window.parallel_batches)
+                             : 0.0,
+                         window.parallel_wall / wn,
                          window.realize_compute / wn, window.plan / wn, window.backend / wn,
                          window.publish / wn);
             window = {};
@@ -3835,7 +4263,8 @@ bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height, bo
     uint32_t fw = present_width(), fh = present_height();
     float sx = fw ? (float)width  / (float)fw : 1.0f;
     float sy = fh ? (float)height / (float)fh : 1.0f;
-    std::vector<DrawItem> items = realize_gpustate_draws(st, 0x10000, sx, sy);
+    std::vector<DrawItem> items = realize_gpustate_draws(
+        st, 0x10000, sx, sy, nullptr, true);
     if (items.empty()) return false;
     std::vector<SubmitOperation> operations;
     operations.reserve(items.size());

@@ -64,7 +64,8 @@ int main() {
     auto backend = [&](const std::vector<DrawItem>& items) -> std::vector<uint8_t> {
         if (items.empty()) return {};
         realized_draw = items[0];
-        return prosper::test::render_triangle_rgba(items[0].vs, items[0].fs, W, H, &items[0].ps);
+        return prosper::test::render_triangle_rgba(
+            items[0].vs_words(), items[0].fs_words(), W, H, &items[0].ps);
     };
     std::vector<uint8_t> px = execute_gpustate(st, backend);
     CHECK(px.size() == (size_t)W * H * 4, "execute_gpustate rendered a frame from the GpuState");
@@ -143,8 +144,8 @@ int main() {
         ResolvedPipelineState fp16_dcc_state = items[0].ps;
         fp16_dcc_state.color0_format = VK_FORMAT_R16G16B16A16_SFLOAT;
         prosper::test::BackendDraw draw;
-        draw.vs = items[0].vs;
-        draw.fs = items[0].fs;
+        draw.vs = items[0].vs_words();
+        draw.fs = items[0].fs_words();
         draw.ps = &fp16_dcc_state;
         draw.vcount = items[0].vertex_count;
         prosper::test::BackendColorTarget target{
@@ -410,7 +411,7 @@ int main() {
     auto backend_idx = [&](const std::vector<DrawItem>& items) -> std::vector<uint8_t> {
         if (items.empty()) return {};
         prosper::test::BackendDraw d;
-        d.vs = items[0].vs; d.fs = items[0].fs; d.ps = &items[0].ps;
+        d.vs = items[0].vs_words(); d.fs = items[0].fs_words(); d.ps = &items[0].ps;
         d.vcount = items[0].vertex_count; d.indices = items[0].indices;
         return prosper::test::render_draws_rgba({std::move(d)}, W, H);
     };
@@ -567,7 +568,8 @@ int main() {
         if (items.empty()) return {};
         live_calls++;
         live_storage = std::make_shared<const std::vector<uint8_t>>(
-            prosper::test::render_triangle_rgba(items[0].vs, items[0].fs, w, h, &items[0].ps));
+            prosper::test::render_triangle_rgba(
+                items[0].vs_words(), items[0].fs_words(), w, h, &items[0].ps));
         return RenderedFrame(live_storage);
     });
     CHECK(have_submit_renderer(), "live renderer registered");

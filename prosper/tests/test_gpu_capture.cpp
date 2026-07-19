@@ -144,6 +144,21 @@ int main() {
               std::vector<uint32_t>(std::begin(kDiagnosticBadPs), std::end(kDiagnosticBadPs)),
           "realized draw captures exact bounded VS and FS RDNA2 streams");
 
+    DrawItem shared_shader_draw = draw;
+    shared_shader_draw.vs_shared =
+        std::make_shared<const std::vector<uint32_t>>(shared_shader_draw.vs);
+    shared_shader_draw.fs_shared =
+        std::make_shared<const std::vector<uint32_t>>(shared_shader_draw.fs);
+    shared_shader_draw.vs.clear();
+    shared_shader_draw.fs.clear();
+    GpuCaptureFile shared_shader_capture;
+    CHECK(capture_draw_items({shared_shader_draw}, meta, reader, shared_shader_capture,
+                             error, rtt_reader) &&
+              shared_shader_capture.draws.size() == 1 &&
+              shared_shader_capture.draws[0].vs == draw.vs &&
+              shared_shader_capture.draws[0].fs == draw.fs,
+          "live capture materializes shared shader words without dropping SPIR-V");
+
     // #636: a descriptor-looking scalar quartet with no matching MUBUF instruction is not a compute
     // resource. The capture path must therefore neither probe its guest address nor retain a blob.
     uint32_t scalar_sgprs[32] = {};

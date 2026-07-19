@@ -32,6 +32,8 @@ namespace prosper::gpu {
 
 struct ShaderResourceTable;   // fwd (shader_resources.hpp); passed to the backend so it can bind resources
 
+using SharedShaderWords = std::shared_ptr<const std::vector<uint32_t>>;
+
 // One realized draw of a submit: recompiled VS+PS SPIR-V, the draw's OWN resolved fixed-function
 // state, the two stages' resource tables (so the backend can bind the constant/vertex buffers +
 // textures the shaders declare, reading their bytes from 1:1-mapped guest memory), and its vertex
@@ -41,6 +43,11 @@ struct ShaderResourceTable;   // fwd (shader_resources.hpp); passed to the backe
 // correctly instead of collapsing onto a single draw. The tables may be null (color-only shaders).
 struct DrawItem {
     std::vector<uint32_t> vs, gs, fs;                 // recompiled/generated SPIR-V
+    // The live path can retain warm-cache shader modules by shared ownership instead of copying the
+    // same SPIR-V words twice per draw (cache -> DrawItem -> BackendDraw). Capture/replay and direct
+    // tests keep using the owned vectors above. Consumers must use the accessors so both forms are
+    // equivalent; a shared value is immutable and remains valid if its cache entry is evicted.
+    SharedShaderWords vs_shared, fs_shared;
     uint64_t vs_guest_addr = 0, fs_guest_addr = 0;    // diagnostic/source identity in guest VA space
     // Content-addressed raw RDNA2 versions owned by a materialized capture. Live draw items leave
     // these unset; capture assigns them from the guest addresses above and replay restores them.
@@ -69,6 +76,10 @@ struct DrawItem {
     uint32_t color1_width = 0, color1_height = 0;
     uint64_t draw_index = 0;
     uint64_t command_order = 0;
+
+    const std::vector<uint32_t>& vs_words() const { return vs_shared ? *vs_shared : vs; }
+    const std::vector<uint32_t>& gs_words() const { return gs; }
+    const std::vector<uint32_t>& fs_words() const { return fs_shared ? *fs_shared : fs; }
 };
 
 // The pluggable Vulkan backend: render the submit's draw items into one image and return W*H*4 RGBA8
@@ -280,6 +291,12 @@ std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
                                                        const PixelInputMapping* pixel_inputs = nullptr,
                                                        const PixelSystemInputMapping* system_inputs = nullptr,
                                                        uint64_t* cache_identity = nullptr);
+SharedShaderWords recompile_graphics_shader_cached_shared(
+    ShaderProgramStage stage, const uint32_t* code, size_t dwords,
+    const ShaderResourceTable* resources = nullptr,
+    const PixelInputMapping* pixel_inputs = nullptr,
+    const PixelSystemInputMapping* system_inputs = nullptr,
+    uint64_t* cache_identity = nullptr);
 ShaderRecompileCacheStats shader_recompile_cache_stats();
 void clear_shader_recompile_cache();
 
@@ -303,6 +320,14 @@ struct StageTablePhaseStats {
 };
 void record_stage_table_phases(double metadata_ms, double dynamic_fold_ms, double resources_ms);
 StageTablePhaseStats stage_table_phase_stats();
+
+struct ParallelDrawRealizationStats {
+    uint64_t batches = 0;
+    uint64_t semantic_draws = 0;
+    uint64_t worker_threads = 0;  // sum of participating threads, including the submit thread
+    double wall_ms = 0.0;
+};
+ParallelDrawRealizationStats parallel_draw_realization_stats();
 
 enum class RealizationFailureReason : uint8_t {
     None,
@@ -474,7 +499,8 @@ inline bool index_buffer_is_unannounced_32bit(const uint16_t* p16, const uint32_
 // (folded-state, one item) and PROSPER_PERDRAW (per-draw) paths so their per-draw handling is identical.
 inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcount_hint,
                               uint32_t max_shader_dwords, bool log, DrawItem& out,
-                              OperationRealizationFailure* failure = nullptr) {
+                              OperationRealizationFailure* failure = nullptr,
+                              bool retain_shared_shader_words = false) {
     RenderState rs = extract_render_state(ds);
     if (failure) {
         *failure = {};
@@ -581,12 +607,23 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.ps_addr)),
         max_shader_dwords, system_input_ptr);
     uint64_t vs_identity = 0, fs_identity = 0;
-    std::vector<uint32_t> vs = recompile_graphics_shader_cached(
-        ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)rs.es_addr,
-        max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity);
-    std::vector<uint32_t> fs = recompile_graphics_shader_cached(
-        ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
-        max_shader_dwords, prt.get(), nullptr, system_input_ptr, &fs_identity);
+    SharedShaderWords vs_shared, fs_shared;
+    std::vector<uint32_t> vs, fs;
+    if (retain_shared_shader_words) {
+        vs_shared = recompile_graphics_shader_cached_shared(
+            ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)rs.es_addr,
+            max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity);
+        fs_shared = recompile_graphics_shader_cached_shared(
+            ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
+            max_shader_dwords, prt.get(), nullptr, system_input_ptr, &fs_identity);
+    } else {
+        vs = recompile_graphics_shader_cached(
+            ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)rs.es_addr,
+            max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity);
+        fs = recompile_graphics_shader_cached(
+            ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
+            max_shader_dwords, prt.get(), nullptr, system_input_ptr, &fs_identity);
+    }
     // CB_COLOR_CONTROL.DCC_DECOMPRESS interprets the bound AGC metadata helper, rather than its
     // ordinary fragment-color export. The operation bits can remain folded into a later graphics
     // submit even though the guest's utility sequence has restored normal mode by then, so MODE alone
@@ -611,9 +648,12 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         };
         static const std::vector<uint32_t> kNullExportFragment =
             recompile_fragment(kNullExportProgram, std::size(kNullExportProgram));
+        fs_shared.reset();
         fs = kNullExportFragment;
         fs_identity = 0;
     }
+    const std::vector<uint32_t>& vs_words = vs_shared ? *vs_shared : vs;
+    const std::vector<uint32_t>& fs_words = fs_shared ? *fs_shared : fs;
     std::vector<uint32_t> gs;
     if (interpolation.requires_geometry && interpolation.valid) {
         // Geometry `Triangles` accepts list, strip, and fan input assembly. Points/lines cannot
@@ -628,14 +668,14 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             std::chrono::duration<double, std::milli>(table_done - table_start).count(),
             std::chrono::duration<double, std::milli>(shader_done - table_done).count());
     }
-    add_stage_diagnostic(ShaderProgramStage::Vertex, rs.es_addr, vrt, vs);
-    add_stage_diagnostic(ShaderProgramStage::Fragment, rs.ps_addr, prt, fs);
+    add_stage_diagnostic(ShaderProgramStage::Vertex, rs.es_addr, vrt, vs_words);
+    add_stage_diagnostic(ShaderProgramStage::Fragment, rs.ps_addr, prt, fs_words);
     if (const char* dd = getenv("PROSPER_VS_DUMP")) {   // diag: dump successful VS SPIR-V + raw RDNA2 for inspection
         static int nd = 0;
-        if (nd < 3 && !vs.empty()) {
+        if (nd < 3 && !vs_words.empty()) {
             char fn[512];
             snprintf(fn, sizeof fn, "%s/vs_%d_%llx.spv", dd, nd, (unsigned long long)rs.es_addr);
-            if (FILE* f = fopen(fn, "wb")) { fwrite(vs.data(), 4, vs.size(), f); fclose(f); }
+            if (FILE* f = fopen(fn, "wb")) { fwrite(vs_words.data(), 4, vs_words.size(), f); fclose(f); }
             snprintf(fn, sizeof fn, "%s/vs_%d_%llx.bin", dd, nd, (unsigned long long)rs.es_addr);
             if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)rs.es_addr, 1, 4096, f); fclose(f); }
             // Also dump the paired PS raw RDNA2 (the recompile-guard fixture needs both stages, #228).
@@ -644,12 +684,12 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             nd++;
         }
     }
-    if (vs.empty() || fs.empty() || (interpolation.requires_geometry && gs.empty())) {
+    if (vs_words.empty() || fs_words.empty() || (interpolation.requires_geometry && gs.empty())) {
         if (failure) failure->reason = RealizationFailureReason::ShaderRecompile;
         // PROSPER_DYNTRACE_FAIL=1: replay the FAILED vertex stage's resource build with the
         // dynamic-fetch walk trace + user-data block dump forced on (once per distinct VS), so the
         // failing draw's exact seeding/s_load chain is captured without knowing its address up front.
-        if (vs.empty() && getenv("PROSPER_DYNTRACE_FAIL")) {
+        if (vs_words.empty() && getenv("PROSPER_DYNTRACE_FAIL")) {
             static std::set<uint64_t> traced;
             if (traced.insert(rs.es_addr).second) {
                 fprintf(stderr, "[dynfail] replaying VS 0x%llx resource build with trace:\n",
@@ -660,7 +700,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             }
         }
         // Same replay for a FAILED pixel stage (#273 — the PS-side descriptor-resolution walls).
-        if (fs.empty() && getenv("PROSPER_DYNTRACE_FAIL")) {
+        if (fs_words.empty() && getenv("PROSPER_DYNTRACE_FAIL")) {
             static std::set<uint64_t> traced_ps;
             if (traced_ps.insert(rs.ps_addr).second) {
                 fprintf(stderr, "[dynfail] replaying PS 0x%llx resource build with trace:\n",
@@ -674,7 +714,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             fprintf(stderr, "[exec-recompile-reject] es=0x%llx ps=0x%llx vs=%zu gs=%zu fs=%zu "
                             "prim=%u topo=%u ena=%08x addr=%08x order=%llu\n",
                     (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
-                    vs.size(), gs.size(), fs.size(), rs.prim_type, resolved_pipeline.topology,
+                    vs_words.size(), gs.size(), fs_words.size(), rs.prim_type, resolved_pipeline.topology,
                     rs.ps_input_ena, rs.ps_input_addr,
                     (unsigned long long)(draw ? draw->command_order : 0));
         if (const char* dd = getenv("PROSPER_SHADER_DUMP")) {
@@ -699,7 +739,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                             "es=0x%llx ps=0x%llx color0=0x%llx/%ux%u "
                             "depth=%d/%d/op%u clear=%d/%g base=0x%llx/0x%llx "
                             "stencil=%d clear=%d/%u base=0x%llx/0x%llx)\n",
-                    vs.size(), gs.size(), fs.size(),
+                    vs_words.size(), gs.size(), fs_words.size(),
                     (unsigned long long)(draw ? draw->command_order : 0),
                     (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
                     (unsigned long long)rs.color0_base, rs.color0_width, rs.color0_height,
@@ -719,8 +759,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         }
         return false;
     }
-    if (!validate_runtime_descriptor_contract("VS", vs, vrt.get(), 0, SpirvShaderStage::Vertex) ||
-        !validate_runtime_descriptor_contract("PS", fs, prt.get(), 1, SpirvShaderStage::Fragment)) {
+    if (!validate_runtime_descriptor_contract("VS", vs_words, vrt.get(), 0, SpirvShaderStage::Vertex) ||
+        !validate_runtime_descriptor_contract("PS", fs_words, prt.get(), 1, SpirvShaderStage::Fragment)) {
         if (failure) failure->reason = RealizationFailureReason::DescriptorContract;
         if (log) fprintf(stderr, "[exec] skip draw: strict descriptor contract failed "
                                 "(es=0x%llx ps=0x%llx color0=0x%llx)\n",
@@ -956,17 +996,18 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 // The RECOMPILED VS SPIR-V — disassemble offline (spirv-dis) to trace the gl_Position export
                 // op-by-op against the RDNA2 source and find the mis-modeled op / bad matrix input. #257.
                 snprintf(fn, sizeof fn, "%s/caption_recompiled_%llx.spv", dd, (unsigned long long)rs.es_addr);
-                if (FILE* f = fopen(fn, "wb")) { fwrite(vs.data(), 4, vs.size(), f); fclose(f); }
+                if (FILE* f = fopen(fn, "wb")) { fwrite(vs_words.data(), 4, vs_words.size(), f); fclose(f); }
                 // The recompiled PIXEL shader — the text is invisible because the PS discards every fragment
                 // (SDF alpha-test). Dump it (spirv-dis) to inspect the discard condition + atlas sample. #257.
                 snprintf(fn, sizeof fn, "%s/caption_ps_%llx.spv", dd, (unsigned long long)rs.ps_addr);
-                if (FILE* f = fopen(fn, "wb")) { fwrite(fs.data(), 4, fs.size(), f); fclose(f); }
+                if (FILE* f = fopen(fn, "wb")) { fwrite(fs_words.data(), 4, fs_words.size(), f); fclose(f); }
                 snprintf(fn, sizeof fn, "%s/caption_ps_raw_%llx.bin", dd, (unsigned long long)rs.ps_addr);
                 if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)rs.ps_addr, 1, 8192, f); fclose(f); }
             }
         }
     }
     out.vs = std::move(vs); out.gs = std::move(gs); out.fs = std::move(fs);
+    out.vs_shared = std::move(vs_shared); out.fs_shared = std::move(fs_shared);
     out.vs_guest_addr = rs.es_addr; out.fs_guest_addr = rs.ps_addr;
     out.vs_identity = vs_identity; out.fs_identity = fs_identity; out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;
@@ -979,6 +1020,15 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     out.color1_width = rs.color1_width; out.color1_height = rs.color1_height;
     return true;
 }
+
+// Live submits with hundreds of immutable draw snapshots can realize those snapshots concurrently.
+// The implementation owns a bounded persistent worker set, writes one result slot per semantic draw,
+// and compacts those slots in original PM4 order. `attempted` distinguishes an ineligible batch from
+// a batch in which every draw was legitimately filtered out, so callers only take the serial fallback
+// in the former case.
+std::vector<DrawItem> realize_gpustate_draws_parallel(
+    const GpuState& st, uint32_t max_shader_dwords, bool log,
+    bool retain_shared_shader_words, bool* attempted = nullptr);
 
 // Recompile + resolve a GpuState's draws and render them via `render`. Default: ONE item from the folded
 // end state, realized as the submit's LAST draw — the folded register file IS the state at the last
@@ -998,7 +1048,9 @@ inline std::vector<DrawItem> realize_gpustate_draws(const GpuState& st,
                                                     uint32_t max_shader_dwords = 0x10000,
                                                     float vp_scale_x = 1.0f,
                                                     float vp_scale_y = 1.0f,
-                                                    std::vector<OperationRealizationFailure>* failures = nullptr) {
+                                                    std::vector<OperationRealizationFailure>* failures = nullptr,
+                                                    bool retain_shared_shader_words = false,
+                                                    bool allow_parallel = true) {
     if (failures) failures->clear();
     if (st.draws.empty()) return {};
     // PROSPER_EXECLOG: just the per-draw bail-point/skip logs, without PROSPER_GFXLOG's per-packet
@@ -1018,18 +1070,27 @@ inline std::vector<DrawItem> realize_gpustate_draws(const GpuState& st,
                          (!force_folded && (st.draws.size() > 1 || !st.dispatches.empty()));
     std::vector<DrawItem> items;
     if (perdraw) {
-        for (size_t i = 0; i < st.draws.size(); i++) {
-            DrawItem it;
-            OperationRealizationFailure failure;
-            if (realize_draw_item(st.state_at_draw(i), &st.draws[i], st.draws[i].index_count,
-                                  max_shader_dwords, log, it, failures ? &failure : nullptr)) {
-                it.draw_index = i;
-                it.command_order = st.draws[i].command_order;
-                items.push_back(std::move(it));
-            } else if (failures) {
-                failure.index = i;
-                failure.command_order = st.draws[i].command_order;
-                failures->push_back(std::move(failure));
+        bool parallel_attempted = false;
+        if (allow_parallel && !failures)
+            items = realize_gpustate_draws_parallel(
+                st, max_shader_dwords, log, retain_shared_shader_words,
+                &parallel_attempted);
+        if (!parallel_attempted) {
+            for (size_t i = 0; i < st.draws.size(); i++) {
+                DrawItem it;
+                OperationRealizationFailure failure;
+                if (realize_draw_item(st.state_at_draw(i), &st.draws[i], st.draws[i].index_count,
+                                      max_shader_dwords, log, it,
+                                      failures ? &failure : nullptr,
+                                      retain_shared_shader_words)) {
+                    it.draw_index = i;
+                    it.command_order = st.draws[i].command_order;
+                    items.push_back(std::move(it));
+                } else if (failures) {
+                    failure.index = i;
+                    failure.command_order = st.draws[i].command_order;
+                    failures->push_back(std::move(failure));
+                }
             }
         }
     } else {
@@ -1041,7 +1102,8 @@ inline std::vector<DrawItem> realize_gpustate_draws(const GpuState& st,
                 OperationRealizationFailure failure;
                 const bool would_realize = realize_draw_item(
                     st.state_at_draw(i), &st.draws[i], st.draws[i].index_count,
-                    max_shader_dwords, log, ignored, &failure);
+                    max_shader_dwords, log, ignored, &failure,
+                    retain_shared_shader_words);
                 if (would_realize) failure.reason = RealizationFailureReason::Filtered;
                 failure.index = i;
                 failure.command_order = st.draws[i].command_order;
@@ -1053,7 +1115,8 @@ inline std::vector<DrawItem> realize_gpustate_draws(const GpuState& st,
         const GpuState::Draw& last = st.draws.back();
         OperationRealizationFailure failure;
         if (realize_draw_item(st, &last, last.index_count, max_shader_dwords, log, it,
-                              failures ? &failure : nullptr)) {
+                              failures ? &failure : nullptr,
+                              retain_shared_shader_words)) {
             it.draw_index = st.draws.size() - 1;
             it.command_order = last.command_order;
             items.push_back(std::move(it));

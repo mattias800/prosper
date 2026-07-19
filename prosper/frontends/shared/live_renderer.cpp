@@ -633,9 +633,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             // Dump the FIRST item's recompiled SPIR-V (diagnostic; survives a mid-render crash).
             if (getenv("PROSPER_SHADER_DUMP") && !items.empty()) {
                 std::string d = getenv("PROSPER_SHADER_DUMP");
-                if (FILE* f = fopen((d + "/frame_vs.spv").c_str(), "wb")) { fwrite(items[0].vs.data(), 4, items[0].vs.size(), f); fclose(f); }
-                if (FILE* f = fopen((d + "/frame_fs.spv").c_str(), "wb")) { fwrite(items[0].fs.data(), 4, items[0].fs.size(), f); fclose(f); }
-                fprintf(stderr, "[render] dumped SPIR-V vs=%zu fs=%zu dwords\n", items[0].vs.size(), items[0].fs.size()); fflush(stderr);
+                const auto& dump_vs = items[0].vs_words();
+                const auto& dump_fs = items[0].fs_words();
+                if (FILE* f = fopen((d + "/frame_vs.spv").c_str(), "wb")) { fwrite(dump_vs.data(), 4, dump_vs.size(), f); fclose(f); }
+                if (FILE* f = fopen((d + "/frame_fs.spv").c_str(), "wb")) { fwrite(dump_fs.data(), 4, dump_fs.size(), f); fclose(f); }
+                fprintf(stderr, "[render] dumped SPIR-V vs=%zu fs=%zu dwords\n", dump_vs.size(), dump_fs.size()); fflush(stderr);
             }
             // Copy [a, a+n) into dst, but stop at the first 64KB block that is NOT within a reserved guest
             // mapping (prosper_reserved_range_state == 0). A resource's declared size (e.g. a 2048x1024
@@ -1891,17 +1893,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 for (const auto* itp : group) {
                     const auto& it = *itp;
                     prosper::test::BackendDraw bd;
-                    bd.vs     = refvs ? refvs_spv : it.vs;
-                    bd.gs     = refvs ? std::vector<uint32_t>{} : it.gs;
+                    if (refvs) {
+                        bd.vs = refvs_spv;
+                    } else if (it.vs_shared) {
+                        bd.vs_shared = it.vs_shared;
+                    } else {
+                        bd.vs = it.vs;
+                    }
+                    bd.gs = refvs ? std::vector<uint32_t>{} : it.gs;
                     // File and synthetic overrides have independent exact-match gates.
                     bool fs_ov = !ps_override.empty();
                     if (fs_ov && ps_override_is_file) {
-                        if (fs_match_mode == 1)      fs_ov = (it.fs == fs_match);   // valid match -> exact only
+                        if (fs_match_mode == 1)      fs_ov = (it.fs_words() == fs_match);   // valid match -> exact only
                         else if (fs_match_mode == 2) fs_ov = false;                // requested-but-invalid -> off
                         // mode 0 -> legacy global file override (unchanged)
                     }
                     if (fs_ov && ps_override_is_test) {
-                        if (testps_match_mode == 1)      fs_ov = (it.fs == testps_match);
+                        if (testps_match_mode == 1)      fs_ov = (it.fs_words() == testps_match);
                         else if (testps_match_mode == 2) fs_ov = false;
                         // mode 0 -> legacy global TESTPS override (unchanged)
                     }
@@ -1911,7 +1919,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     if (fs_ov && ps_override_is_test && testps_match_mode == 1)
                         fprintf(stderr, "[testps-match] synthetic override applied to draw#%llu\n",
                                 (unsigned long long)it.draw_index);
-                    bd.fs     = fs_ov ? ps_override : it.fs;
+                    if (fs_ov) {
+                        bd.fs = ps_override;
+                    } else if (it.fs_shared) {
+                        bd.fs_shared = it.fs_shared;
+                    } else {
+                        bd.fs = it.fs;
+                    }
                     bd.vs_identity = refvs ? 0 : it.vs_identity;
                     bd.fs_identity = fs_ov ? 0 : it.fs_identity;
                     bd.vcount = refvs ? 3u : it.vertex_count;
@@ -1919,12 +1933,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     bd.ps     = nops ? nullptr : &it.ps;
                     bd.R      = build_R(it, it.vrt.get(), it.prt.get());
                     if (!prosper::gpu::validate_runtime_descriptor_contract(
-                            "VS/backend", bd.vs, it.vrt.get(), 0, prosper::gpu::SpirvShaderStage::Vertex) ||
+                            "VS/backend", bd.vs_words(), it.vrt.get(), 0, prosper::gpu::SpirvShaderStage::Vertex) ||
                         !prosper::gpu::validate_runtime_descriptor_contract(
-                            "PS/backend", bd.fs, it.prt.get(), 1, prosper::gpu::SpirvShaderStage::Fragment))
+                            "PS/backend", bd.fs_words(), it.prt.get(), 1, prosper::gpu::SpirvShaderStage::Fragment))
                         continue;
-                    poison_R(bd.R, bd.vs, it.vrt.get(), 0, prosper::gpu::SpirvShaderStage::Vertex);
-                    poison_R(bd.R, bd.fs, it.prt.get(), 1, prosper::gpu::SpirvShaderStage::Fragment);
+                    poison_R(bd.R, bd.vs_words(), it.vrt.get(), 0, prosper::gpu::SpirvShaderStage::Vertex);
+                    poison_R(bd.R, bd.fs_words(), it.prt.get(), 1, prosper::gpu::SpirvShaderStage::Fragment);
                     // Indexed draw: hand the executor-fetched index data to the backend (vkCmdDrawIndexed).
                     // Skipped under REFVS — the reference VS is a 3-vertex non-indexed fullscreen triangle.
                     if (!refvs) bd.indices = it.indices;
@@ -2363,8 +2377,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     (unsigned long long)base, k, render_pass.size(),
                                     (unsigned long long)draw->draw_index,
                                     (unsigned long long)draw->command_order,
-                                    (unsigned long long)spirv_hash(draw->vs),
-                                    (unsigned long long)spirv_hash(draw->fs),
+                                    (unsigned long long)spirv_hash(draw->vs_words()),
+                                    (unsigned long long)spirv_hash(draw->fs_words()),
                                     draw->ps.color_write_mask, (int)draw->ps.blend_enable,
                                     draw->ps.src_color_blend_factor,
                                     draw->ps.dst_color_blend_factor,
