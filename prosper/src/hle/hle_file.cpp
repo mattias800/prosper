@@ -549,13 +549,19 @@ bool savedata0_dir_mtime(const std::string& dirname, int64_t& modified) {
     const std::string param = dir + "/sce_sys/param.sfo";
 #ifdef _WIN32
     struct _stat64 st{};
-    if (_stat64(param.c_str(), &st) != 0 && _stat64(dir.c_str(), &st) != 0) return false;
-    if (!(st.st_mode & _S_IFREG) && !(st.st_mode & _S_IFDIR)) return false;
+    if (_stat64(param.c_str(), &st) == 0) {
+        if (!(st.st_mode & _S_IFREG)) return false;
+    } else if (_stat64(dir.c_str(), &st) != 0 || !(st.st_mode & _S_IFDIR)) {
+        return false;
+    }
     modified = (int64_t)st.st_mtime;
 #else
     struct stat st{};
-    if (::stat(param.c_str(), &st) != 0 && ::stat(dir.c_str(), &st) != 0) return false;
-    if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) return false;
+    if (::stat(param.c_str(), &st) == 0) {
+        if (!S_ISREG(st.st_mode)) return false;
+    } else if (::stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+        return false;
+    }
     modified = (int64_t)st.st_mtim.tv_sec * 1000000000ll + st.st_mtim.tv_nsec;
 #endif
     return true;

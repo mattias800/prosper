@@ -236,7 +236,8 @@ SaveDataRequest read_savedata_request(uint64_t param, SaveDataSlotTimeLookup slo
                     }
                 }
                 if (!found_time) {
-                    if (!request.slots.front().dirName.empty()) return SaveDataRequest{};
+                    if (request.slots.size() != 1 || !request.slots.front().dirName.empty())
+                        return SaveDataRequest{};
                     request.initialSlot = 0; // reference UI focuses the new item when no data exists
                 }
             } else if (focus == 6) {
