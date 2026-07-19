@@ -255,7 +255,8 @@ void bind_imports_to_stubs(const Module& m, LoadedImage& img, uint64_t stub_base
 }
 
 size_t apply_relocations(const Module& m, LoadedImage& img,
-                         const TlsSymbolMap* tls_symbols_by_nid) {
+                         const TlsSymbolMap* tls_symbols_by_nid,
+                         const std::vector<uint64_t>* tls_module_below) {
     size_t applied = 0;
     auto write64 = [&](uint64_t va, uint64_t val) -> bool {
         uint8_t* p = img.at(va);
@@ -345,13 +346,48 @@ size_t apply_relocations(const Module& m, LoadedImage& img,
                 if (write64(va, sv + (uint64_t)r.addend)) applied++;
                 break;
             }
+            case R_X86_64_TPOFF64: {
+                // x86-64 Variant II: TPOFF64 = S + A - distance(TP, defining module block).
+                // The distance comes from the same helper used by guest_tls_set_templates, so the
+                // linker-baked offset and runtime allocation cannot independently drift (#338).
+                uint32_t modid = img.tls_modid;
+                uint64_t sv = 0;
+                bool resolved = r.sym && r.sym < m.symbols.size();
+                if (resolved) {
+                    const Symbol& sym = m.symbols[r.sym];
+                    sv = sym.value;
+                    if (sym.is_import) {
+                        resolved = false;
+                        if (tls_symbols_by_nid) {
+                            auto it = tls_symbols_by_nid->find(sym.nid);
+                            if (it != tls_symbols_by_nid->end()) {
+                                modid = it->second.modid;
+                                sv = it->second.offset;
+                                resolved = true;
+                            }
+                        }
+                    }
+                }
+                resolved = resolved && modid != 0 && tls_module_below &&
+                           modid < tls_module_below->size() && (*tls_module_below)[modid] != 0;
+                if (!resolved) {
+                    uint64_t& cnt = unhandled[r.type];
+                    if (cnt == 0)
+                        fprintf(stderr, "[reloc] WARNING: unresolved TPOFF64 in %s — "
+                                "static TLS offset left unapplied (issue #338)\n", m.path.c_str());
+                    cnt++;
+                    break;
+                }
+                const uint64_t tpoff = sv + (uint64_t)r.addend - (*tls_module_below)[modid];
+                if (write64(va, tpoff)) applied++;
+                break;
+            }
             default: {
                 // Make an unhandled TLS relocation LOUD (once per type) even without
                 // PROSPER_RELOC_HISTO: a silently-skipped TLS reloc leaves the GOT slot 0, so the guest
                 // reads/writes thread-local storage at the wrong (often zero) offset and corrupts it
-                // INVISIBLY. The notable gap is TPOFF64 (18) — declared in module.hpp but with no case
-                // here (its correct value needs the guest static-TLS layout; types 19-23 are other TLS
-                // models). No current title emits these (verified), so this never fires today; when one
+                // INVISIBLY. Types 19-23 are other unsupported TLS models. No current title emits
+                // these (verified), so this never fires today; when one
                 // does, it fails visibly instead of silently corrupting TLS. #338.
                 uint64_t& cnt = unhandled[r.type];
                 if (cnt == 0 && r.type >= 16 && r.type <= 23)
@@ -367,7 +403,7 @@ size_t apply_relocations(const Module& m, LoadedImage& img,
                 (unsigned long long)img.base, m.relocs.size(), applied);
         for (auto& kv : histo)
             fprintf(stderr, "[reloc]   type %u: %llu%s\n", kv.first, (unsigned long long)kv.second,
-                    unhandled.count(kv.first) ? "  <<< UNHANDLED (silently skipped)" : "");
+                    unhandled.count(kv.first) ? "  <<< UNHANDLED/FALLBACK" : "");
     }
     return applied;
 }

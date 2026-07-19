@@ -1,4 +1,5 @@
 #include "linker.hpp"
+#include "tls_layout.hpp"
 #include <unordered_map>
 #include <cstring>
 #include <cstdio>
@@ -90,9 +91,15 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,
                 tls_symbols_by_nid.emplace(s.nid, TlsSymbolLocation{ mid, s.value });
     }
 
+    // Initial-exec TLS relocations must use the exact Variant-II layout later used to allocate each
+    // thread's static TLS. Computing it through the shared helper prevents linker/allocator drift.
+    const StaticTlsLayout static_tls =
+        make_static_tls_layout(out.tls_templates.data(), out.tls_templates.size());
+
     // --- Pass 3: apply relocations now that all import addresses are known. ---
     for (size_t i = 0; i < out.mods.size(); i++)
-        apply_relocations(*out.mods[i], out.imgs[i], &tls_symbols_by_nid);
+        apply_relocations(*out.mods[i], out.imgs[i], &tls_symbols_by_nid,
+                          &static_tls.module_below);
 
     // --- Collect init functions for dependent modules (module 0 = main exe runs its
     // own ctors via _start; PRX modules need their init_array run by the loader). We run

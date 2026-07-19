@@ -15,17 +15,12 @@ namespace prosper {
 
 struct LinkInput { std::string path; uint64_t base; };
 
-// Per-module TLS template for the general-dynamic model (__tls_get_addr). init_va points at the
-// module's mapped tdata (guest==host address, since we map at guest base); a per-thread block of
-// `memsz` is allocated lazily, `filesz` bytes copied from init_va, the rest zeroed (tbss).
-struct TlsTemplate { uint64_t init_va = 0, filesz = 0, memsz = 0, align = 0; };
-
 struct Program {
     std::vector<std::unique_ptr<Module>> mods;   // unique_ptr: stable addresses for imports[]
     std::vector<LoadedImage>             imgs;    // parallel to mods
     std::vector<ImportSlot>              slots;   // unresolved imports -> stub slots
     std::vector<uint64_t>                init_fns; // dependent-module init fns, in call order
-    std::vector<TlsTemplate>             tls_templates; // indexed by module TLS id (0 = unused)
+    std::vector<TlsModuleDesc>           tls_templates; // indexed by module TLS id (0 = unused)
     uint64_t entry = 0;                            // main module entry
     uint64_t stub_base = 0, stub_size = 96;   // 96 contains the largest guest-%fs swap stub (94 bytes)
 
