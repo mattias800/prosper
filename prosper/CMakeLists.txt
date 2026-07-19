@@ -561,6 +561,11 @@ if(TARGET prosper_core)
     add_test(NAME hle_stack_args_guest_fs COMMAND test_hle_stack_args --guest-fs)
   endif()
 
+  # x86-64 low-address READ decoder used by the Windows PROSPER_NULL_PAGE emulation. Header-only, so the
+  # decode logic is verified on every platform even though the VEH caller is Windows-only.
+  add_executable(test_x86_read_decode tests/test_x86_read_decode.cpp)
+  add_test(NAME x86_read_decode COMMAND test_x86_read_decode)
+
   # End-to-end AGC submit plus fixed args 7-9 in ReleaseMem/WaitRegMem. This is cross-platform so
   # Windows validates the real fence builders behind the generated import-ABI conformance test.
   add_executable(test_agc_submit tests/test_agc_submit.cpp)
