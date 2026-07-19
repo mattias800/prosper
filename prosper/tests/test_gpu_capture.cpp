@@ -48,6 +48,16 @@ int main() {
     std::vector<uint8_t> memory(32);
     for (size_t i = 0; i < memory.size(); ++i) memory[i] = static_cast<uint8_t>(0x40 + i);
     auto reader = [&](uint64_t addr, uint8_t* dst, size_t n) -> size_t {
+        const auto read_shader = [&](const uint32_t* words, size_t bytes) -> size_t {
+            const uint64_t base = reinterpret_cast<uint64_t>(words);
+            if (addr < base || addr >= base + bytes) return 0;
+            const size_t offset = static_cast<size_t>(addr - base);
+            const size_t take = std::min(n, bytes - offset);
+            std::memcpy(dst, reinterpret_cast<const uint8_t*>(words) + offset, take);
+            return take;
+        };
+        if (const size_t read = read_shader(kDiagnosticVs, sizeof(kDiagnosticVs))) return read;
+        if (const size_t read = read_shader(kDiagnosticBadPs, sizeof(kDiagnosticBadPs))) return read;
         if (addr < 0x1000 || addr >= 0x1000 + memory.size()) return 0;
         size_t off = static_cast<size_t>(addr - 0x1000), take = std::min(n, memory.size() - off);
         std::memcpy(dst, memory.data() + off, take); return take;
@@ -67,6 +77,8 @@ int main() {
     table->resources = {a, b, dcc};
 
     DrawItem draw; draw.vs = {0x07230203, 1, 2}; draw.fs = {0x07230203, 3}; draw.vrt = table;
+    draw.vs_guest_addr = reinterpret_cast<uint64_t>(kDiagnosticVs);
+    draw.fs_guest_addr = reinterpret_cast<uint64_t>(kDiagnosticBadPs);
     draw.vertex_count = 6; draw.indices = {0, 1, 2, 2, 3, 0}; draw.color0_base = 0x2000;
     draw.color0_width = 1024; draw.color0_height = 32;
     draw.color1_base = 0x3000; draw.color1_width = 1024; draw.color1_height = 32;
@@ -119,6 +131,14 @@ int main() {
     CHECK(captured.shader_versions.size() == 2 && captured.operations.size() == 1 &&
           captured.operations[0].source_index == 7 && captured.operations[0].realized,
           "capture indexes unique shaders and retains operation provenance");
+    CHECK(captured.raw_shader_versions.size() == 2 &&
+          captured.draws[0].vs_raw_shader_index < captured.raw_shader_versions.size() &&
+          captured.draws[0].fs_raw_shader_index < captured.raw_shader_versions.size() &&
+          captured.raw_shader_versions[captured.draws[0].vs_raw_shader_index].words ==
+              std::vector<uint32_t>(std::begin(kDiagnosticVs), std::end(kDiagnosticVs)) &&
+          captured.raw_shader_versions[captured.draws[0].fs_raw_shader_index].words ==
+              std::vector<uint32_t>(std::begin(kDiagnosticBadPs), std::end(kDiagnosticBadPs)),
+          "realized draw captures exact bounded VS and FS RDNA2 streams");
 
     // #636: a descriptor-looking scalar quartet with no matching MUBUF instruction is not a compute
     // resource. The capture path must therefore neither probe its guest address nor retain a blob.
@@ -157,14 +177,19 @@ int main() {
               scalar_capture.computes[0].resources.resources.empty(),
           "#636: capture ignores unconsumed descriptor-looking scalar arguments");
 
-    // v17 appends scissor state without changing the legacy pipeline prefix. Remove v18's one-draw
-    // geometry index first, then the v17 tail, to recover a byte-exact v16 capture.
+    // v17 appends scissor state without changing the legacy pipeline prefix. Remove v19's realized
+    // raw-stage indices, v18's geometry index, then the v17 tail to recover a byte-exact v16 capture.
+    GpuCaptureFile v16_scissor_source = captured;
+    v16_scissor_source.raw_shader_versions.clear();
+    v16_scissor_source.draws[0].vs_raw_shader_index = 0xFFFFFFFFu;
+    v16_scissor_source.draws[0].fs_raw_shader_index = 0xFFFFFFFFu;
     std::vector<uint8_t> v16_scissor_bytes;
     GpuCaptureFile v16_scissor_loaded;
-    CHECK(serialize_gpu_capture(captured, v16_scissor_bytes, error) &&
+    CHECK(serialize_gpu_capture(v16_scissor_source, v16_scissor_bytes, error) &&
               v16_scissor_bytes.size() >= 25,
           "v17 capture serializes effective guest scissor state");
     if (v16_scissor_bytes.size() >= 25) {
+        v16_scissor_bytes.resize(v16_scissor_bytes.size() - 12); // v19 count + two raw indices
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 8); // v18 draw count + no-GS sentinel
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 25);
         v16_scissor_bytes[8] = 16;
@@ -307,6 +332,7 @@ int main() {
           "writer rejects an out-of-bounds DCC metadata reference");
     CHECK(serialize_gpu_capture(volume_capture, volume_bytes, error),
           "recreated valid v12 DCC bytes after malformed-reference check");
+    volume_bytes.resize(volume_bytes.size() - 12); // v19 count + two raw indices
     volume_bytes.resize(volume_bytes.size() - 8); // v18 draw count + no-GS sentinel
     volume_bytes.resize(volume_bytes.size() - 25); // v17 one-draw scissor tail, zero failures
     volume_bytes.resize(volume_bytes.size() - 21); // v16 count plus one 17-byte mip-tail state
@@ -397,6 +423,10 @@ int main() {
     CHECK(loaded.shader_versions.size() == 2 && loaded.draws[0].draw_index == 7 &&
           loaded.draws[0].command_order == 123 && loaded.operations[0].source_index == 7,
           "content versions and draw operation identity round-trip");
+    CHECK(loaded.raw_shader_versions.size() == 2 &&
+          loaded.draws[0].vs_raw_shader_index < loaded.raw_shader_versions.size() &&
+          loaded.draws[0].fs_raw_shader_index < loaded.raw_shader_versions.size(),
+          "v19 realized raw-stage identities round-trip with their content versions");
     CHECK(loaded.rtt_seeds.size() == 1 && loaded.rtt_seeds[0].width == 2 &&
           loaded.rtt_seeds[0].format == GpuCaptureColorFormat::Rgba8Unorm &&
           loaded.rtt_seeds[0].rgba == temporal_rgba, "temporal RTT seed round-trips");
@@ -447,6 +477,9 @@ int main() {
           "an empty renderer result does not become a valid replay oracle");
     CHECK(replay.items[0].draw_index == 7 && replay.items[0].command_order == 123,
           "materialized draw retains its source operation identity");
+    CHECK(replay.items[0].vs_raw_shader_index == loaded.draws[0].vs_raw_shader_index &&
+          replay.items[0].fs_raw_shader_index == loaded.draws[0].fs_raw_shader_index,
+          "materialized replay exposes both realized raw-stage identities");
     CHECK(replay.rtt_seeds.size() == 1 && replay.rtt_seeds[0].guest_addr == draw.color0_base,
           "materialized replay owns temporal RTT seed pixels");
     CHECK(replay.ds_seeds.size() == 1 && replay.ds_seeds[0].htile_data_base == 0x800000,
@@ -692,30 +725,39 @@ int main() {
     GpuCaptureFile stale_raw = failed_capture;
     stale_raw.raw_shader_versions[0].content_hash ^= 1;
     CHECK(!serialize_gpu_capture(stale_raw, repeated, error) &&
-          error == "failed-operation raw shader content hash mismatch",
+          error == "raw shader content hash mismatch",
           "writer rejects stale failed-shader content identity");
     GpuCaptureFile bad_raw_index = failed_capture;
     bad_raw_index.failure_diagnostics[0].stages[0].raw_shader_index = 0xfffffffeu;
     CHECK(!serialize_gpu_capture(bad_raw_index, repeated, error) &&
           error == "invalid failed-stage diagnostic metadata",
           "writer rejects an out-of-range failed-shader reference");
+    GpuCaptureFile bad_realized_raw_index = captured;
+    bad_realized_raw_index.draws[0].vs_raw_shader_index = 0xfffffffeu;
+    CHECK(!serialize_gpu_capture(bad_realized_raw_index, repeated, error) &&
+          error == "realized draw references an invalid raw shader",
+          "writer rejects an out-of-range realized-shader reference");
     GpuCaptureFile oversized_raw = failed_capture;
     oversized_raw.raw_shader_versions[0].words.resize(0x4001, 0xbf810000u);
     oversized_raw.raw_shader_versions[0].content_hash = gpu_capture_hash(
         reinterpret_cast<const uint8_t*>(oversized_raw.raw_shader_versions[0].words.data()),
         oversized_raw.raw_shader_versions[0].words.size() * sizeof(uint32_t));
     CHECK(!serialize_gpu_capture(oversized_raw, repeated, error) &&
-          error == "failed-operation raw shader data exceeds its bounded limit",
+          error == "raw shader data exceeds its bounded limit",
           "writer enforces the documented 64 KiB per-stage raw bound");
 
     GpuCaptureFile legacy_source = captured; legacy_source.ds_seeds.clear();
+    legacy_source.raw_shader_versions.clear();
+    legacy_source.draws[0].vs_raw_shader_index = 0xFFFFFFFFu;
+    legacy_source.draws[0].fs_raw_shader_index = 0xFFFFFFFFu;
     std::vector<uint8_t> legacy_bytes;
     CHECK(serialize_gpu_capture(legacy_source, legacy_bytes, error) && legacy_bytes.size() >= 32,
-          "created a diagnostic-free v18 payload for legacy-reader fixtures");
+          "created a diagnostic-free v19 payload for legacy-reader fixtures");
     std::vector<uint8_t> v13_bytes = legacy_bytes;
     if (v13_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        v13_bytes.resize(v13_bytes.size() - 12); // v19 count + two raw indices
         v13_bytes.resize(v13_bytes.size() - 8); // v18 draw count + no-GS sentinel
         v13_bytes.resize(v13_bytes.size() - 25); // v17 one-draw scissor tail, zero failures
         v13_bytes.resize(v13_bytes.size() - (4 + 17 * legacy_resource_count));
@@ -734,6 +776,7 @@ int main() {
     if (legacy_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        legacy_bytes.resize(legacy_bytes.size() - 12); // v19 count + two raw indices
         legacy_bytes.resize(legacy_bytes.size() - 8); // v18 draw count + no-GS sentinel
         legacy_bytes.resize(legacy_bytes.size() - 25); // v17 one-draw scissor tail, zero failures
         legacy_bytes.resize(legacy_bytes.size() - (4 + 17 * legacy_resource_count));
@@ -778,9 +821,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 19;
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 20;
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 19",
+          error == "unsupported capture version 20",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

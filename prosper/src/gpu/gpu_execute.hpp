@@ -41,6 +41,10 @@ struct ShaderResourceTable;   // fwd (shader_resources.hpp); passed to the backe
 struct DrawItem {
     std::vector<uint32_t> vs, gs, fs;                 // recompiled/generated SPIR-V
     uint64_t vs_guest_addr = 0, fs_guest_addr = 0;    // diagnostic/source identity in guest VA space
+    // Content-addressed raw RDNA2 versions owned by a materialized capture. Live draw items leave
+    // these unset; capture assigns them from the guest addresses above and replay restores them.
+    uint32_t vs_raw_shader_index = 0xFFFFFFFFu;
+    uint32_t fs_raw_shader_index = 0xFFFFFFFFu;
     // Process-unique identities supplied by the exact shader-recompile cache. Zero means the
     // shader came from an external/replay path, so persistent backend caches must compare words.
     uint64_t vs_identity = 0, fs_identity = 0;

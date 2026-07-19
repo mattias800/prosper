@@ -212,6 +212,8 @@ composite/scanout draws; a single `--draw N` remains supported.
 `--dump-resource DRAW:vs|ps:BINDING PATH` writes one captured resource's exact backing bytes for
 external numeric/image inspection without dereferencing the original guest address.
 `--dump-shader DRAW:vs|fs PATH` writes the captured SPIR-V module for validation/disassembly.
+Capture v19+ also supports `--dump-realized-shader DRAW:vs|fs PATH`, which writes the exact bounded raw
+RDNA2 source for a successfully realized graphics stage; use that output with `shader_inspect`.
 `--dump-compute N PATH` writes one realized compute SPIR-V module, and
 `--dump-compute-resource N:BINDING PATH` writes its exact pre-dispatch storage-buffer bytes.
 `--compute-only N` executes one realized dispatch in isolation; combine it with

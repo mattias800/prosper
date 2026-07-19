@@ -5,6 +5,7 @@
 #include "gpu/shader_resources.hpp"
 #include "live_renderer.hpp"
 #include "replay_output_extent.hpp"
+#include "realized_shader_dump.hpp"
 #include "render_runner.h"
 
 #include <algorithm>
@@ -54,6 +55,7 @@ void usage(const char* argv0) {
                          "[--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
                          "[--dump-rtt-seed ADDR PATH] "
                          "[--dump-shader DRAW:vs|fs PATH] [--dump-compute N PATH] "
+                         "[--dump-realized-shader DRAW:vs|fs PATH] "
                          "[--override-compute-spv N PATH] "
                          "[--dump-failed-shader FAILURE:STAGE PATH] "
                          "[--dump-compute-resource N:BINDING PATH] "
@@ -1132,6 +1134,7 @@ int main(int argc, char** argv) {
     std::string compute_override_spec, compute_override_path;
     std::string compute_resource_spec, compute_resource_path;
     std::string failed_shader_spec, failed_shader_path;
+    std::string realized_shader_spec, realized_shader_path;
     std::string rtt_seed_path;
     std::string graph_json_path, prepend_path;
     std::string bundle_path, bundle_compact_path;
@@ -1221,6 +1224,9 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--dump-shader" && i + 2 < argc) {
             shader_spec = argv[++i]; shader_path = argv[++i];
         }
+        else if (std::string(argv[i]) == "--dump-realized-shader" && i + 2 < argc) {
+            realized_shader_spec = argv[++i]; realized_shader_path = argv[++i];
+        }
         else if (std::string(argv[i]) == "--dump-compute" && i + 2 < argc) {
             compute_shader_spec = argv[++i]; compute_shader_path = argv[++i];
         }
@@ -1244,6 +1250,7 @@ int main(int argc, char** argv) {
             compute_only >= 0 ||
             warmup_repeats || !dump_spec.empty() || rtt_seed_addr ||
             !shader_spec.empty() || !compute_shader_spec.empty() ||
+            !realized_shader_spec.empty() ||
             !compute_override_spec.empty() ||
             !compute_resource_spec.empty() || !failed_shader_spec.empty() ||
             !prepend_path.empty()) {
@@ -1421,6 +1428,25 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[gpureplay] dumped %s (%zu bytes) to %s\n", shader_spec.c_str(), bytes,
                      shader_path.c_str());
     }
+    if (!realized_shader_spec.empty()) {
+        const auto* raw = prosper::tools::select_realized_raw_shader(
+            replay, realized_shader_spec, error);
+        if (!raw) {
+            std::fprintf(stderr, "gpu_replay: %s\n", error.c_str());
+            return 2;
+        }
+        FILE* f = std::fopen(realized_shader_path.c_str(), "wb");
+        const size_t bytes = raw->words.size() * sizeof(uint32_t);
+        if (!f || std::fwrite(raw->words.data(), 1, bytes, f) != bytes) {
+            if (f) std::fclose(f);
+            std::fprintf(stderr, "gpu_replay: cannot write %s\n", realized_shader_path.c_str());
+            return 2;
+        }
+        std::fclose(f);
+        std::fprintf(stderr, "[gpureplay] dumped realized shader %s (%zu bytes) to %s\n",
+                     realized_shader_spec.c_str(), bytes, realized_shader_path.c_str());
+        if (positional.size() == 1 && !inspect) return 0;
+    }
     if (!failed_shader_spec.empty()) {
         const size_t colon = failed_shader_spec.find(':');
         char* failure_end = nullptr;
@@ -1560,7 +1586,7 @@ int main(int argc, char** argv) {
                    !entry.second.empty() && entry.second != "0" && entry.second != "off";
         });
     std::fprintf(stderr, "[gpureplay] rev=%s title=%s submit=%llu %ux%u draws=%zu computes=%zu "
-                         "operations=%zu shaders=%zu failed=%zu raw-failed-shaders=%zu blobs=%zu "
+                         "operations=%zu shaders=%zu failed=%zu raw-shaders=%zu blobs=%zu "
                          "RTT-seeds=%zu DS-seeds=%zu oracle=%s resource-data=%s\n",
                  m.revision.c_str(), m.title_id.c_str(), static_cast<unsigned long long>(m.submit_index),
                  m.width, m.height, replay.items.size(), replay.computes.size(), replay.operations.size(),

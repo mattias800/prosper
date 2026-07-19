@@ -519,6 +519,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_gpu_replay_extent PRIVATE prosper_core)
   add_test(NAME gpu_replay_output_extent COMMAND test_gpu_replay_extent)
 
+  add_executable(test_gpu_replay_shader_dump tests/test_gpu_replay_shader_dump.cpp)
+  target_link_libraries(test_gpu_replay_shader_dump PRIVATE prosper_core)
+  add_test(NAME gpu_replay_shader_dump COMMAND test_gpu_replay_shader_dump)
+
   add_executable(test_gpu_dependency_graph tests/test_gpu_dependency_graph.cpp)
   target_link_libraries(test_gpu_dependency_graph PRIVATE prosper_core)
   add_test(NAME gpu_dependency_graph COMMAND test_gpu_dependency_graph)
