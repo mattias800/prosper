@@ -412,6 +412,36 @@ void decode_operands(Rdna2Inst& i) {
                         (((w >> 13) & 1u) << 13);
             i.n_src = 3; break;
         }
+        case Rdna2Format::FLAT: {
+            // gfx10 FLAT/GLOBAL/SCRATCH. OP d0[24:18], SEG d0[15:14], LDS d0[13],
+            // signed byte OFFSET d0[11:0];
+            // d1 holds VADDR[7:0], VDATA[15:8], SADDR[22:16], and VDST[31:24]. A scratch instruction
+            // uses either `off, sN` (SADDR != NULL; canonical VADDR field 0) or `vN, off`
+            // (SADDR=NULL=125). Global/flat address forms retain their operands for diagnostics but
+            // remain fail-closed in the recompiler until arbitrary guest pointers are modeled.
+            const uint32_t d1 = i.words[1];
+            i.opcode = (w >> 18) & 0x7Fu;
+            i.flat_segment = (w >> 14) & 0x3u;
+            i.flat_glc = ((w >> 16) & 1u) != 0;
+            i.flat_slc = ((w >> 17) & 1u) != 0;
+            i.flat_dlc = ((w >> 12) & 1u) != 0;
+            i.flat_lds = ((w >> 13) & 1u) != 0;
+            const uint32_t off12 = w & 0xFFFu;
+            i.literal = (off12 & 0x800u) ? (off12 | 0xFFFFF000u) : off12;
+            const uint32_t vaddr = d1 & 0xFFu;
+            const uint32_t vdata = (d1 >> 8) & 0xFFu;
+            const uint32_t saddr = (d1 >> 16) & 0x7Fu;
+            const uint32_t vdst = (d1 >> 24) & 0xFFu;
+            const bool store = i.opcode >= 0x18u && i.opcode <= 0x1Fu;
+            i.dst = vgpr(store ? vdata : vdst);
+            if (i.flat_segment == 1u && saddr != 125u && vaddr == 0u)
+                i.src[0] = {};                         // canonical scratch `off, sN`
+            else
+                i.src[0] = vgpr(vaddr);
+            i.src[1] = decode_src_field(saddr);
+            i.n_src = 2;
+            break;
+        }
         case Rdna2Format::MIMG: {
             // Image op. opcode is 8 bits: MSB in dword0 bit 0, low 7 bits in [24:18] (Table 100:
             // "combine bits zero and 18-24" — dropping bit 0 aliased IMAGE_MSAA_LOAD (128) onto

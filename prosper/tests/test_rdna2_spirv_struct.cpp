@@ -16,6 +16,7 @@ enum : uint32_t {
     OpTypeInt = 21,
     OpTypeFloat = 22,
     OpTypeVector = 23,
+    OpTypeArray = 28,
     OpTypeRuntimeArray = 29,
     OpTypeStruct = 30,
     OpTypePointer = 32,
@@ -29,6 +30,7 @@ bool is_type_decl(uint32_t op) {
         case OpTypeInt:
         case OpTypeFloat:
         case OpTypeVector:
+        case OpTypeArray:
         case OpTypeRuntimeArray:
         case OpTypeStruct:
         case OpTypePointer:
@@ -177,6 +179,47 @@ int main() {
         return 1;
     }
     printf("  [ok]   signed kernel SPIR-V declares signed i32 with a nonzero id\n");
+
+    // Fixed-offset private spill/fill must also produce structurally valid graphics-stage modules.
+    // This exercises Function-variable placement in the fragment and vertex shells, independently
+    // of the compute execution tests.
+    const uint32_t scratch_fragment[] = {
+        0xdc704010u, 0x00000000u, // scratch_store_dword off, v0, s0 offset:16
+        0x7e000280u,              // v_mov_b32 v0, 0
+        0xdc304010u, 0x00000000u, // scratch_load_dword v0, off, s0 offset:16
+        0xf800000fu, 0x00000000u, // exp mrt0 v0, v0, v0, v0
+        0xBF810000u,
+    };
+    const auto scratch_fragment_spv = recompile_fragment(
+        scratch_fragment, sizeof(scratch_fragment) / sizeof(scratch_fragment[0]));
+    uint32_t scratch_fragment_bad_op = 0;
+    if (scratch_fragment_spv.empty() || !has_opcode(scratch_fragment_spv, 28) ||
+        !type_result_ids_are_nonzero(scratch_fragment_spv, &scratch_fragment_bad_op) ||
+        !phi_ids_are_nonzero(scratch_fragment_spv)) {
+        printf("  [FAIL] fragment private spill/fill emitted invalid SPIR-V (op=%u)\n",
+               scratch_fragment_bad_op);
+        return 1;
+    }
+    printf("  [ok]   fragment private spill/fill emits structurally valid Function storage\n");
+
+    const uint32_t scratch_vertex[] = {
+        0xdc704010u, 0x00000000u, // scratch_store_dword off, v0, s0 offset:16
+        0x7e000280u,              // v_mov_b32 v0, 0
+        0xdc304010u, 0x00000000u, // scratch_load_dword v0, off, s0 offset:16
+        0xf80008cfu, 0x00000000u, // exp pos0 v0, v0, v0, v0
+        0xBF810000u,
+    };
+    const auto scratch_vertex_spv = recompile_vertex(
+        scratch_vertex, sizeof(scratch_vertex) / sizeof(scratch_vertex[0]));
+    uint32_t scratch_vertex_bad_op = 0;
+    if (scratch_vertex_spv.empty() || !has_opcode(scratch_vertex_spv, 28) ||
+        !type_result_ids_are_nonzero(scratch_vertex_spv, &scratch_vertex_bad_op) ||
+        !phi_ids_are_nonzero(scratch_vertex_spv)) {
+        printf("  [FAIL] vertex private spill/fill emitted invalid SPIR-V (op=%u)\n",
+               scratch_vertex_bad_op);
+        return 1;
+    }
+    printf("  [ok]   vertex private spill/fill emits structurally valid Function storage\n");
 
     // NGG wave packing writes EXEC through s_lshr_b64 before later structured control flow. The
     // instruction is mask-domain only; inserting rs.sreg[EXEC] left an SSA id 0 that a later merge

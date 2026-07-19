@@ -136,6 +136,38 @@ int main() {
     CHECK(mt_tfe.fmt == Rdna2Format::MTBUF && mt_tfe.opcode == 0u &&
               mt_tfe.mtbuf_format == 22u && mt_tfe.mtbuf_tfe,
           "MTBUF decodes TFE instead of silently dropping its status destination");
+    // gfx1030 llvm-mc exact words. FLAT's dword1 places SADDR and VDST differently from MUBUF;
+    // scratch `off, sN` also uses a real absent VADDR, not an accidental read of v0.
+    const uint32_t scratch_load_x2[] = { 0xdc344020u, 0x08060000u };
+    Rdna2Inst scratch_l2 = rdna2_decode_one(scratch_load_x2, 2);
+    CHECK(scratch_l2.fmt == Rdna2Format::FLAT && scratch_l2.flat_segment == 1u &&
+              scratch_l2.opcode == 0x0du && scratch_l2.literal == 32u &&
+              isV(scratch_l2.dst, 8) && scratch_l2.src[0].kind == OperandKind::None &&
+              isS(scratch_l2.src[1], 6),
+          "scratch_load_dwordx2 decodes segment, signed offset, VDST, absent VADDR, and SADDR");
+    const uint32_t scratch_store_x2[] = { 0xdc744020u, 0x00060a00u };
+    Rdna2Inst scratch_s2 = rdna2_decode_one(scratch_store_x2, 2);
+    CHECK(scratch_s2.fmt == Rdna2Format::FLAT && scratch_s2.flat_segment == 1u &&
+              scratch_s2.opcode == 0x1du && isV(scratch_s2.dst, 10) &&
+              scratch_s2.src[0].kind == OperandKind::None && isS(scratch_s2.src[1], 6),
+          "scratch_store_dwordx2 decodes VDATA rather than the load-only VDST field");
+    const uint32_t scratch_negative[] = { 0xdc304ffcu, 0x00000000u };
+    Rdna2Inst scratch_neg = rdna2_decode_one(scratch_negative, 2);
+    CHECK(scratch_neg.flat_segment == 1u && static_cast<int32_t>(scratch_neg.literal) == -4,
+          "scratch signed 12-bit OFFSET is sign-extended");
+    const uint32_t scratch_lds[] = { 0xdc306000u, 0x00000000u };
+    Rdna2Inst scratch_to_lds = rdna2_decode_one(scratch_lds, 2);
+    CHECK(scratch_to_lds.flat_segment == 1u && scratch_to_lds.flat_lds,
+          "scratch LDS-transfer flag is retained for fail-closed recompilation");
+    const uint32_t global_load[] = { 0xdc308000u, 0x007d0002u };
+    const uint32_t flat_load[]   = { 0xdc300000u, 0x007d0002u };
+    Rdna2Inst global_l = rdna2_decode_one(global_load, 2);
+    Rdna2Inst flat_l = rdna2_decode_one(flat_load, 2);
+    CHECK(global_l.flat_segment == 2u && isV(global_l.src[0], 2) &&
+              global_l.src[1].kind == OperandKind::Special && global_l.src[1].value == 125,
+          "global_load_dword retains its VGPR address and NULL SADDR for fail-closed diagnostics");
+    CHECK(flat_l.flat_segment == 0u && isV(flat_l.src[0], 2),
+          "flat_load_dword remains distinct from global and scratch segments");
     // Exact DS_READ2_B32 words from Astro Bot's loading-surface compute producer. The packed
     // offset bytes are dword indices (offset0 in the low byte, offset1 in the high byte).
     const uint32_t ds_read2_adjacent[] = { 0xd8dc0100u, 0x04000002u };

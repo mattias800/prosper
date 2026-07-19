@@ -42,13 +42,25 @@ int main(int argc, char** argv) {
     // Compute + SMEM constant-buffer load (s_buffer_load_dword; routes to binding 2).
     { const uint32_t c[] = {0xf4000000u, 0xfa000004u, 0x7e000200u, 0xbf810000u};
       dump(dir, "compute_smem", recompile_valu(c, sizeof(c)/4, 1, 0)); }
+    // Compute private spill/fill, including a signed short crossing a dword boundary.
+    { const uint32_t c[] = {0x7e0002ffu,0x00008001u,0xdc684003u,0x00000000u,0x7e000280u,
+                            0xdc2c4003u,0x00000000u,0x7e000b00u,0xBF810000u};
+      dump(dir, "compute_private_spill", recompile_valu(c, sizeof(c)/4, 0, 0)); }
     // Fragment: solid green (EXP MRT0).
     { const uint32_t c[] = {0x7E000280u,0x7E0202F2u,0x7E040280u,0x7E0602F2u,0xF800180Fu,0x03020100u,0xBF810000u};
       dump(dir, "fragment_color", recompile_fragment(c, sizeof(c)/4)); }
+    // Fragment private spill/fill (Function-storage declaration in the graphics shell).
+    { const uint32_t c[] = {0xdc704010u,0x00000000u,0x7e000280u,0xdc304010u,0x00000000u,
+                            0xf800000fu,0x00000000u,0xBF810000u};
+      dump(dir, "fragment_private_spill", recompile_fragment(c, sizeof(c)/4)); }
     // Vertex: fullscreen triangle from gl_VertexIndex (EXP POS0).
     { const uint32_t c[] = {0x36020081u,0x2C040081u,0x7E020D01u,0x7E040D02u,0x7E0A02F6u,0x7E0C02F2u,0x10020B01u,
                             0x08020D01u,0x10040B02u,0x08040D02u,0x7E060280u,0x7E0802F2u,0xF80008CFu,0x04030201u,0xBF810000u};
       dump(dir, "vertex_fullscreen", recompile_vertex(c, sizeof(c)/4)); }
+    // Vertex private spill/fill (Function-storage declaration in the graphics shell).
+    { const uint32_t c[] = {0xdc704010u,0x00000000u,0x7e000280u,0xdc304010u,0x00000000u,
+                            0xf80008cfu,0x00000000u,0xBF810000u};
+      dump(dir, "vertex_private_spill", recompile_vertex(c, sizeof(c)/4)); }
     // Vertex fetch (buffer_load_format_xy from a V# in user-data s[8:11]).
     { const uint32_t c[] = {0x7e060280u,0x7e0802f2u,0xe0042000u,0x80020100u,0xf80008cfu,0x04030201u,0xbf810000u};
       ShaderResourceTable rt; ShaderResource vb{}; vb.cls=ResourceClass::VertexBuffer; vb.format=DataFormat::Float32;

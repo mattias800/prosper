@@ -44,6 +44,59 @@ int main() {
           mtbuf_tfe.unsupported == 1 && mtbuf_tfe.first_bad_op == 0u,
           "MTBUF TFE remains explicit unsupported coverage until its status write is modeled");
 
+    // The common compiler spill/fill form uses a fixed byte offset and one unmodified scalar base.
+    // The host shader maps that private storage to one per-invocation Function array.
+    const uint32_t scratch_static[] = {
+        0xdc704010u, 0x00000000u, // scratch_store_dword off, v0, s0 offset:16
+        0xdc304010u, 0x00000000u, // scratch_load_dword v0, off, s0 offset:16
+        0xBF810000u,
+    };
+    RecompileCoverage scratch = recompile_coverage(
+        scratch_static, sizeof(scratch_static) / sizeof(scratch_static[0]));
+    CHECK(scratch.total == 2 && scratch.alu == 2 && scratch.unsupported == 0 &&
+              scratch.first_bad_fmt < 0,
+          "static private spill/fill instructions report full recompiler coverage");
+
+    const uint32_t scratch_dynamic[] = {
+        0xdc304000u, 0x007d0002u, // scratch_load_dword v0, v2, off
+        0xBF810000u,
+    };
+    RecompileCoverage dynamic = recompile_coverage(
+        scratch_dynamic, sizeof(scratch_dynamic) / sizeof(scratch_dynamic[0]));
+    CHECK(dynamic.total == 1 && dynamic.unsupported == 1 && dynamic.first_bad_op == 0x0cu,
+          "dynamic private addresses remain explicit unsupported coverage");
+
+    const uint32_t global_address[] = {
+        0xdc308000u, 0x007d0002u, // global_load_dword v0, v[2:3], off
+        0xBF810000u,
+    };
+    RecompileCoverage global = recompile_coverage(
+        global_address, sizeof(global_address) / sizeof(global_address[0]));
+    CHECK(global.total == 1 && global.unsupported == 1 && global.first_bad_op == 0x0cu,
+          "arbitrary global addresses remain explicit unsupported coverage");
+
+    const uint32_t scratch_lds[] = {
+        0xdc306000u, 0x00000000u, // scratch_load_dword off, s0 lds
+        0xBF810000u,
+    };
+    RecompileCoverage lds_transfer = recompile_coverage(
+        scratch_lds, sizeof(scratch_lds) / sizeof(scratch_lds[0]));
+    CHECK(lds_transfer.total == 1 && lds_transfer.unsupported == 1 &&
+              lds_transfer.first_bad_op == 0x0cu &&
+              recompile_valu(scratch_lds, sizeof(scratch_lds) / sizeof(scratch_lds[0]), 0, 0).empty(),
+          "scratch LDS-transfer packets remain explicit unsupported coverage");
+
+    const uint32_t rewritten_scratch_base[] = {
+        0xbe800384u,               // s_mov_b32 s0, 4
+        0xdc704010u, 0x00000000u, // scratch_store_dword off, v0, s0 offset:16
+        0xdc304010u, 0x00000000u, // scratch_load_dword v0, off, s0 offset:16
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(rewritten_scratch_base,
+                         sizeof(rewritten_scratch_base) / sizeof(rewritten_scratch_base[0]),
+                         1, 0).empty(),
+          "a shader-written private-storage base rejects instead of aliasing the entry spill area");
+
     // Contains an unsupported op: v_add_f32 ; s_branch +5 (unconditional -> rejected) ; s_endpgm.
     const uint32_t bad_code[] = { 0x06000300u, 0xbf820005u, 0xBF810000u };
     RecompileCoverage b = recompile_coverage(bad_code, sizeof(bad_code)/sizeof(bad_code[0]));
