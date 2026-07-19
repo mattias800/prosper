@@ -630,7 +630,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const bool dim_1d = r->img_dim == 0;
             const bool dim_3d = r->img_dim == 2;
             const bool dim_2d_array = r->img_dim == 5 && r->depth_compare;
-            if (!dim_1d && r->img_dim != 1 && !dim_3d && !dim_2d_array) {
+            // A SINGLE-LAYER 2D array (img_dim==5, depth==1, no depth-compare) is byte-identical to a
+            // plain 2D image (one layer, same tiling), so it flows through the 2D path below unchanged.
+            // The general multi-layer/array case stays deferred to #657. DOLL's post-process compute
+            // declares its mask/LUT surfaces this way; skipping them left the tonemap sampling an empty
+            // surface -> a zero mask -> black composite even though the scene renders (#319/#657).
+            const bool dim_2d_single = r->img_dim == 5 && !r->depth_compare && r->depth == 1;
+            if (!dim_1d && r->img_dim != 1 && !dim_3d && !dim_2d_array && !dim_2d_single) {
                 skip_image(r, "layered image deferred to #657"); break;
             }
             if (dim_1d && r->height != 1) { skip_image(r, "1D image has non-unit height"); break; }
