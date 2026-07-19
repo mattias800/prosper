@@ -374,10 +374,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
     static const bool pertarget = getenv("PROSPER_RTT_PERTARGET") != nullptr ||
                                   getenv("PROSPER_RTT_SINGLE_TARGET") == nullptr;
     static const bool rtt_on = getenv("PROSPER_RTT") != nullptr || pertarget;
-    // First deployment is opt-in. Captures and per-target pixel diagnostics require authoritative
-    // CPU pixels at every pass, so they retain the established readback path even when requested.
-    static const bool live_gpu_targets = getenv("PROSPER_LIVE_PERSISTENT_COLOR_TARGETS") &&
-        pertarget && !getenv("PROSPER_GPU_CAPTURE") &&
+    // Retain intermediate color targets on the GPU by default. Captures and per-target pixel
+    // diagnostics require authoritative CPU pixels at every pass, so they retain the established
+    // readback path. The explicit opt-out keeps a direct A/B and a recovery switch for driver issues.
+    static const bool live_gpu_targets = pertarget &&
+        !getenv("PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS") && !getenv("PROSPER_GPU_CAPTURE") &&
         !getenv("PROSPER_GPU_TIMELINE_CAPTURE") && !getenv("PROSPER_GPU_REPLAY_EXPORT_RTT") &&
         !getenv("PROSPER_GPU_REPLAY_RTT_SEEDS") && !getenv("PROSPER_DUMP_SAMPLED_RTT") &&
         !getenv("PROSPER_DUMP_RTGROUPS") && !getenv("PROSPER_DUMP_RTGROUPS_RGBA") &&

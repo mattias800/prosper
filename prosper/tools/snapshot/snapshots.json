@@ -5,7 +5,7 @@
       "dump": "PPSA24651-app0",
       "scale": 4,
       "timeout": 320,
-      "capture_after_seconds": 270,
+      "capture_after_seconds": 290,
       "capture_before_seconds": 319,
       "pad_script": "scripts/messenger/reach-first-level.pad",
       "savedata_policy": "fresh",
@@ -21,7 +21,7 @@
         270
       ],
       "review": "Approved 16 composited images from two independent runs on 2026-07-16; intended scene, layers, and progression visually confirmed.",
-      "_note": "Reviewed presented-frame guard for The Messenger's first level. A late idempotent Up/Cross recovery sequence tolerates cold full-render stalls that can skip early menu polls. Both independent runs show the player, terrain/structures, sky, water, HUD, and animation progression in every retained frame.",
+      "_note": "Reviewed presented-frame guard for The Messenger's first level. A late idempotent Up/Cross recovery sequence tolerates cold full-render stalls that can skip early menu polls and continues through 280 seconds so variable dialogue timing clears before capture. Both independent baseline runs show the player, terrain/structures, sky, water, HUD, and animation progression in every retained frame.",
       "structural_references": [
         {
           "luma16x9": "1e00000000000000000000000000001146292929272929292929292a516a755f465c539087213929262c432c466c6b35414f62854f2f3331414e3130414e33313131354c1d1e2b31312f1e2b31313131313131312f1918282f1e161f262a2f31313132393623161e221b201c1d1a282b242c2f262e2a2f2c2c2c2a2f2c2c2a2f3838363833343a373636343a36363735",

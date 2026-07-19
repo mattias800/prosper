@@ -279,6 +279,14 @@ local. The cache is bounded to 256 MiB and 1024 allocations by default. Set
 device-image budget are separate: a hot immutable atlas can occupy space in both, trading bounded
 residency for lower frame time.
 
+Intermediate live color targets remain on the GPU by default. A later graphics pass that samples the
+same guest target identity, extent, and format binds the retained image directly; scanout, captures,
+pixel diagnostics, same-target feedback, and authoritative-readback spans keep the CPU path. Guest GPU
+writes invalidate overlapping retained targets through the ordered write observer. Set
+`PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1` for a complete frontend A/B, or
+`PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS=1` to disable backend retention independently. The backend
+cache defaults to 256 MiB and can be changed with `PROSPER_BACKEND_TARGET_CACHE_MB=<MiB>`.
+
 Graphics RDNA2-to-SPIR-V results use a process-wide bounded cache (4096 entries and 128 MiB by
 default). Its key contains the shader bytes and only the resource-table fields consumed by compilation;
 current guest addresses and backing data remain on each draw and are never cached. Use
