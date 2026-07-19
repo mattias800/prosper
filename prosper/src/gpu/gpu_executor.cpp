@@ -1950,10 +1950,11 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         if (u.instruction_format != UINT32_MAX && ((u.v4[3] >> 12) & 0x7Fu) == 0)
             continue;
         const bool exact_mtbuf = u.instruction_format != UINT32_MAX;
-        // Keyed buffer uses dedupe by table offset; key-less live descriptors dedupe by consumer pc.
-        const uint64_t dk = exact_mtbuf || u.key == 0xFFFFFFFFu
-            ? (0x8000000100000000ull | u.use_pc)
-            : (0x0000000100000000ull | u.key);
+        // Keep an exact alias for every consumer pc, including an otherwise keyed table load. The
+        // arbitrary-CFG compute dispatcher persists scalar values across basic blocks, but descriptor
+        // identity is compile-time provenance and is intentionally not stored in those Function
+        // variables. Exact aliases therefore remain the only unambiguous lookup after a block join.
+        const uint64_t dk = 0x8000000100000000ull | u.use_pc;
         if (!seen.insert(dk).second) continue;
         bool clash = exact_mtbuf || u.key == 0xFFFFFFFFu;
         if (!clash)
@@ -1987,7 +1988,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         r.size = d.size_bytes;
         r.stride = d.stride;
         r.srt_offset = clash ? 0xFFFFFFFFu : u.key;
-        if (clash) r.fetch_pc = u.use_pc;
+        r.fetch_pc = u.use_pc;
         table.resources.push_back(r);
     }
     return srt_uses;
