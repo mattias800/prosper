@@ -3972,6 +3972,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                b.cvt_i2f(b.bfe_s(a, b.uconst(0), b.uconst(4))),
                                b.uconst(fbits(0.0625f)));
                     break;
+                // AMD RDNA2 ISA: select one unsigned byte from the source dword and convert it
+                // directly to f32. The opcode number selects BYTE_0 through BYTE_3.
+                case 0x11: case 0x12: case 0x13: case 0x14:
+                    d = b.cvt_u2f(b.bfe_u(a,
+                                          b.uconst(8u * (in.opcode - 0x11u)),
+                                          b.uconst(8)));
+                    break;
                 case 0x20: d = b.fext1(Glsl_Fract, a); break;         // v_fract_f32
                 case 0x21: d = b.fext1(Glsl_Trunc, a); break;         // v_trunc_f32
                 case 0x22: d = b.fext1(Glsl_Ceil, a); break;          // v_ceil_f32
@@ -4020,7 +4027,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // opcodes only (mirrors the VOP2/VOP3 fresult path; DOLL VS: `v_exp_f32_sdwa … clamp`).
             // A modifier on a non-float-result op would silently drop — reject loudly instead.
             if (ok && (in.omod || in.clamp)) switch (in.opcode) {
-                case 0x05: case 0x06: case 0x0B: case 0x0E: case 0x20: case 0x21: case 0x22: case 0x23: case 0x24:
+                case 0x05: case 0x06: case 0x0B: case 0x0E: case 0x11: case 0x12: case 0x13: case 0x14:
+                case 0x20: case 0x21: case 0x22: case 0x23: case 0x24:
                 case 0x25: case 0x27: case 0x2A: case 0x2B: case 0x2E: case 0x33: case 0x35: case 0x36:
                     if      (in.omod == 1) d = b.fbin(Op_FMul, d, b.uconst(fbits(2.0f)));
                     else if (in.omod == 2) d = b.fbin(Op_FMul, d, b.uconst(fbits(4.0f)));
