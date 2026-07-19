@@ -18,6 +18,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include <unistd.h>
 #endif
 
 using namespace prosper;
@@ -204,13 +206,13 @@ int main() {
 #else
     // The source tree can live on WSL's /mnt/c mount, whose metadata bridge truncates subsecond
     // timestamps. Exercise microsecond preservation on the native temporary filesystem instead.
-    const std::string precision_path =
-        (std::filesystem::temp_directory_path() / "prosper-test-utimes-precision.tmp").string();
-    FILE* precision_file = std::fopen(precision_path.c_str(), "wb");
-    CHECK(precision_file != nullptr, "create native-filesystem timestamp fixture");
-    if (precision_file) std::fclose(precision_file);
+    std::string precision_path =
+        (std::filesystem::temp_directory_path() / "prosper-test-utimes-precision-XXXXXX").string();
+    const int precision_fd = ::mkstemp(precision_path.data());
+    CHECK(precision_fd >= 0, "create unique native-filesystem timestamp fixture");
+    if (precision_fd >= 0) ::close(precision_fd);
     timestamp_stat.fill(0);
-    CHECK(precision_file && kernel_utimes_fn && kernel_stat_fn &&
+    CHECK(precision_fd >= 0 && kernel_utimes_fn && kernel_stat_fn &&
               kernel_utimes_fn((uint64_t)(uintptr_t)precision_path.c_str(),
                                 (uint64_t)(uintptr_t)explicit_times, 0, 0, 0, 0) == 0 &&
               kernel_stat_fn((uint64_t)(uintptr_t)precision_path.c_str(),
