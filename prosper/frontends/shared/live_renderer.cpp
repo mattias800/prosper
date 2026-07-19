@@ -798,6 +798,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                             cached->second.pixels.data(), r.gpu_addr,
                                             persistent_source_size, validated_bytes) &&
                                             validated_bytes == cached->second.source_prefix_size;
+                                    } else if (!getenv("PROSPER_TEXTURE_VALIDATION_SCRATCH_COPY") &&
+                                               cached->second.source_prefix.size() ==
+                                                   persistent_source_size) {
+                                        // The cached prefix owns the complete encoded texture. Compare
+                                        // guest memory directly against it: copying the same 100+ MiB
+                                        // working set into a scratch buffer before memcmp doubled the
+                                        // validation traffic on every Evergate frame. safe_equal keeps
+                                        // the same sparse-page/readability guards and exact byte check.
+                                        matches = safe_equal(
+                                            cached->second.source_prefix.data(), r.gpu_addr,
+                                            persistent_source_size, validated_bytes) &&
+                                            validated_bytes == persistent_source_size;
                                     } else {
                                         persistent_validation_scratch.resize(persistent_source_size);
                                         validated_bytes = copy_resource(
