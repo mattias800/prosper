@@ -73,8 +73,8 @@ uint64_t now_us() {
 // script is set the pad reports
 // CONNECTED for the whole run (a menu that gates on a controller sees one).
 //
-// Timing is anchored to the FIRST successful input-state read, not process start: the game only reads the pad once it
-// reaches the interactive menu, so t=0 == "menu appeared" — robust to how long asset loading takes.
+// Timing is anchored to the FIRST pad poll, not process start: the game only polls once it reaches
+// the interactive menu, so t=0 == "menu appeared" — robust to how long asset loading takes.
 // CONFIDENCE: HIGH (mechanism); MED (that the game's submit maps to OPTIONS="Start" / CROSS).
 // The parse + time-eval live in pad.cpp (pure, unit-tested); this file supplies getenv + the clock.
 double pad_hold_secs();
@@ -358,15 +358,13 @@ HostPadState poll_controller(int /*handle*/, const char* what, bool consume_inpu
         s.connected = true;
         s.buttons  |= SCE_PAD_BUTTON_CROSS;
     }
-    // Information queries report script-driven connectivity, but they must not advance pN routes.
-    // Only calls that return an input state consume a pad-read anchor.
-    if (pad_script_runtime().configured()) s.connected = true;
-    if (consume_input_read) {
-        const int64_t frame = pad_frame_now();
-        const int64_t read = pad_read_now();
-        apply_pad_script(s, frame, read);
-        pad_record(frame, s.buttons);
-    }
+    // Preserve the established seconds/flip origins and recording behavior on every pad poll. A
+    // metadata query evaluates those axes with no read index, so only successful input-state calls
+    // can activate or advance pN routes.
+    const int64_t frame = pad_frame_now();
+    const int64_t read = consume_input_read ? pad_read_now() : -1;
+    apply_pad_script(s, frame, read);
+    pad_record(frame, s.buttons);
     padlog_once(what, &s);
     return s;
 }

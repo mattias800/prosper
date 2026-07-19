@@ -139,7 +139,7 @@ uint32_t pad_trigger_buttons(uint8_t l2, uint8_t r2);
 // ---- Scripted input (PROSPER_PAD_SCRIPT) — pure, unit-tested -----------------------------------
 // A timed controller sequence lets a headless run drive menus and gameplay with no host device
 // (issue #163). These helpers are pure (no env, no clock) so parse + time evaluation is verifiable; the HLE
-// (hle_pad.cpp) supplies getenv + the wall clock and anchors t=0 to the first successful state read.
+// (hle_pad.cpp) supplies getenv + the wall clock and anchors t=0 to the first pad poll.
 // t_secs holds wall-clock seconds by default, a flip number when frame_anchored, or a pad-read number
 // when read_anchored. `p300:cross` is independent of wall time and presentation rate, which keeps a
 // route usable when synchronous rendering changes both. See #302.
@@ -182,7 +182,7 @@ std::string pad_button_names(uint32_t mask);
 
 // Parse ';'- or newline-separated entries. Actions are '+'-joined button names and/or full-stick
 // directions such as "left-stick-left" and "right-stick-up". A time token starting with 'f' is
-// frame-anchored (flips since the first state read); one starting with 'p' is pad-read-anchored
+// frame-anchored (flips since the first pad poll); one starting with 'p' is pad-read-anchored
 // (successful scePadRead/scePadReadState calls, numbered from zero). All anchors accept explicit ranges
 // ("3-4.5:cross", "f300-340:cross",
 // "p1200-1240:cross"); '#' starts a comment. Malformed entries and entries with no recognized action

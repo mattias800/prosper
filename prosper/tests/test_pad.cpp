@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 
 using namespace prosper;
 using namespace prosper::input;
@@ -115,7 +116,7 @@ int main() {
     {
         // Explicit one-read windows make counter movement visible. Metadata queries below must not
         // consume either window; the first two successful input reads must see p0 and p1 in order.
-        set_test_env("PROSPER_PAD_SCRIPT", "p0-1:cross;p1-2:options");
+        set_test_env("PROSPER_PAD_SCRIPT", "0-0.05:triangle;p0-1:cross;p1-2:options");
         register_builtin_hle();
         HleFn read_state = Hle::lookup(nid_hash("scePadReadState"));
         HleFn read       = Hle::lookup(nid_hash("scePadRead"));
@@ -131,6 +132,10 @@ int main() {
                   "scePadGetControllerInformation -> 0 (OK)");
             CHECK(ci.connected == 1, "info query sees script-driven controller connectivity");
         }
+
+        // The legacy seconds origin is the first pad poll, including an information query. If the
+        // origin moved to the first state read, the short Triangle window would incorrectly fire below.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         if (read) {
             ScePadData unused{};
@@ -149,7 +154,7 @@ int main() {
             CHECK(d.left_stick_x == 0x80, "readstate: sticks centered");
             CHECK(d.orientation_w == 1.0f, "readstate: identity orientation");
             CHECK(d.buttons == SCE_PAD_BUTTON_CROSS,
-                  "readstate: metadata query did not consume p0 input window");
+                  "readstate: metadata preserves seconds origin without consuming p0 input window");
         }
 
         if (read) {

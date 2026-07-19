@@ -65,7 +65,8 @@ flip-anchored ranges while presentation advances, or `pA-B:` ranges keyed to the
 by `PROSPER_PAD_SCRIPT_LOG=1`. Point entries use `PROSPER_PAD_FRAME_HOLD` or
 `PROSPER_PAD_READ_HOLD` (both default 8) on their count axis.
 Pad-read indices advance only for successful `scePadRead`/`scePadReadState` calls; controller metadata
-queries and rejected reads do not consume route entries.
+queries and rejected reads do not consume pad-read entries. Seconds and flips keep their first-pad-poll
+origin for compatibility with existing routes.
 
 Capture one draw-carrying renderer invocation with:
 

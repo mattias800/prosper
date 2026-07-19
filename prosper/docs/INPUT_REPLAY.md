@@ -46,9 +46,9 @@ We already have the seed: **`PROSPER_PAD_SCRIPT` (#202)** — a scripted `PadBac
   `right-stick-{left,right,up,down}` directions. Seconds points use `PROSPER_PAD_HOLD` ms
   (default 300); flip/read points use their count-axis holds above. Explicit ranges always use their
   exclusive end.
-- **Anchored to the first successful input-state read**: seconds and flips retain their existing
-  first-read origins; pad reads number successful `scePadRead`/`scePadReadState` calls from zero.
-  Controller-information queries and rejected reads do not advance any route axis.
+- **Anchored at the established origins**: seconds and flips retain their existing first-pad-poll
+  origin. Pad reads number successful `scePadRead`/`scePadReadState` calls from zero; controller-
+  information queries and rejected reads do not advance the pad-read axis.
 - Pad reports CONNECTED whenever a script is set. Parse + time-eval are pure and unit-tested in `pad.cpp`.
 - Explicit wall-clock ranges are sampled only when the game polls the pad. A short range can fall
   entirely between polls under slow synchronous rendering. Use longer holds with neutral gaps,
