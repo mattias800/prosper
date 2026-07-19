@@ -175,13 +175,39 @@ int main() {
     // releases and reuses small physical ranges aggressively; independent Windows allocations
     // let its allocator observe different metadata through two aliases and corrupt adjacent VA.
     constexpr uint64_t dlen = 0x10000;
+    uint64_t invalid_phys = 0xfeedfacecafebeefull;
     CHECK((uint32_t)alloc(0, kEnd, dlen, dlen, 0, 0) == 0x80020016u,
           "AllocateDirectMemory(null physAddrOut) -> EINVAL");
     CHECK((uint32_t)alloc_main(dlen, dlen, 0, 0, 0, 0) == 0x80020016u,
           "AllocateMainDirectMemory(null physAddrOut) -> EINVAL");
+    CHECK((uint32_t)alloc(0, kEnd, 0, dlen, 0, (uint64_t)(uintptr_t)&invalid_phys) ==
+              0x80020016u && invalid_phys == 0xfeedfacecafebeefull,
+          "AllocateDirectMemory(zero length) -> EINVAL without writing output");
+    CHECK((uint32_t)alloc(0, kEnd, dlen - 1, dlen, 0,
+                          (uint64_t)(uintptr_t)&invalid_phys) == 0x80020016u &&
+              invalid_phys == 0xfeedfacecafebeefull,
+          "AllocateDirectMemory(non-page length) -> EINVAL without writing output");
+    CHECK((uint32_t)alloc(0, kEnd, dlen, 0x2000, 0,
+                          (uint64_t)(uintptr_t)&invalid_phys) == 0x80020016u &&
+              invalid_phys == 0xfeedfacecafebeefull,
+          "AllocateDirectMemory(non-page alignment) -> EINVAL without writing output");
+    CHECK((uint32_t)alloc(0, kEnd, dlen, 0xc000, 0,
+                          (uint64_t)(uintptr_t)&invalid_phys) == 0x80020016u &&
+              invalid_phys == 0xfeedfacecafebeefull,
+          "AllocateDirectMemory(non-power-of-two alignment) -> EINVAL without writing output");
+    CHECK((uint32_t)alloc(0, kEnd, dlen, dlen, 11,
+                          (uint64_t)(uintptr_t)&invalid_phys) == 0x80020016u &&
+              invalid_phys == 0xfeedfacecafebeefull,
+          "AllocateDirectMemory(out-of-range memory type) -> EINVAL without writing output");
+    CHECK((uint32_t)alloc(0, kEnd, dlen, dlen, 0, 1) == 0x80020016u,
+          "AllocateDirectMemory(low invalid physAddrOut) -> EINVAL");
+    CHECK((uint32_t)alloc_main(dlen - 1, dlen, 0,
+                               (uint64_t)(uintptr_t)&invalid_phys, 0, 0) == 0x80020016u &&
+              invalid_phys == 0xfeedfacecafebeefull,
+          "AllocateMainDirectMemory validates the shared direct-memory request contract");
     uint64_t phys = 0, va1 = 0, va2 = 0, va_map2 = 0;
     CHECK(alloc(0, kEnd, dlen, dlen, 7, (uint64_t)(uintptr_t)&phys) == 0 && phys == kBase,
-          "allocate one 64 KiB direct-memory page");
+          "invalid allocations leave the pool untouched before a valid allocation");
     int32_t direct_type = -1;
     uint64_t direct_start = UINT64_MAX, direct_end = UINT64_MAX;
     CHECK(get_type(phys + 0x4000, (uint64_t)(uintptr_t)&direct_type,
@@ -666,12 +692,39 @@ int main() {
               0x80020016u,
           "Munmap rejects an overflowing guest range");
 
-    // Both allocation APIs require their physical-address output. Reject before taking from
-    // the pool so an unobservable allocation cannot leak capacity.
+    // Both allocation APIs validate the complete 16 KiB-granular request before taking from the
+    // pool, so a rejected call cannot write its output or leak capacity.
+    uint64_t invalid_phys = 0xfeedfacecafebeefull;
     CHECK((uint32_t)alloc(0, kEnd, 0x4000, 0x4000, 0, 0) == 0x80020016u,
           "AllocateDirectMemory(null physAddrOut) -> EINVAL");
     CHECK((uint32_t)alloc_main(0x4000, 0x4000, 0, 0, 0, 0) == 0x80020016u,
           "AllocateMainDirectMemory(null physAddrOut) -> EINVAL");
+    CHECK((uint32_t)alloc(0, kEnd, 0, 0x4000, 0,
+                          (uint64_t)(uintptr_t)&invalid_phys) == 0x80020016u &&
+              invalid_phys == 0xfeedfacecafebeefull,
+          "AllocateDirectMemory(zero length) -> EINVAL without writing output");
+    CHECK((uint32_t)alloc(0, kEnd, 0x4001, 0x4000, 0,
+                          (uint64_t)(uintptr_t)&invalid_phys) == 0x80020016u &&
+              invalid_phys == 0xfeedfacecafebeefull,
+          "AllocateDirectMemory(non-page length) -> EINVAL without writing output");
+    CHECK((uint32_t)alloc(0, kEnd, 0x4000, 0x2000, 0,
+                          (uint64_t)(uintptr_t)&invalid_phys) == 0x80020016u &&
+              invalid_phys == 0xfeedfacecafebeefull,
+          "AllocateDirectMemory(non-page alignment) -> EINVAL without writing output");
+    CHECK((uint32_t)alloc(0, kEnd, 0x4000, 0xc000, 0,
+                          (uint64_t)(uintptr_t)&invalid_phys) == 0x80020016u &&
+              invalid_phys == 0xfeedfacecafebeefull,
+          "AllocateDirectMemory(non-power-of-two alignment) -> EINVAL without writing output");
+    CHECK((uint32_t)alloc(0, kEnd, 0x4000, 0x4000, 11,
+                          (uint64_t)(uintptr_t)&invalid_phys) == 0x80020016u &&
+              invalid_phys == 0xfeedfacecafebeefull,
+          "AllocateDirectMemory(out-of-range memory type) -> EINVAL without writing output");
+    CHECK((uint32_t)alloc(0, kEnd, 0x4000, 0x4000, 0, 1) == 0x80020016u,
+          "AllocateDirectMemory(low invalid physAddrOut) -> EINVAL");
+    CHECK((uint32_t)alloc_main(0x4001, 0x4000, 0,
+                               (uint64_t)(uintptr_t)&invalid_phys, 0, 0) == 0x80020016u &&
+              invalid_phys == 0xfeedfacecafebeefull,
+          "AllocateMainDirectMemory validates the shared direct-memory request contract");
 
     // Fresh pool: the largest free block is the whole pool, and BOTH out-params are written.
     uint64_t phys = 0xdead, size = 0xdead;
@@ -689,7 +742,8 @@ int main() {
     // Allocate 1 MiB (args: searchStart, searchEnd, len, align, type, physOut) at the pool base.
     uint64_t ap = 0;
     uint64_t ar = alloc(0, kEnd, 0x100000, 0x4000, 6, (uint64_t)(uintptr_t)&ap);
-    CHECK(ar == 0 && ap == kBase, "allocate 1MiB -> phys at pool base");
+    CHECK(ar == 0 && ap == kBase,
+          "invalid allocations leave the pool untouched before a valid allocation");
     int32_t direct_type = -1;
     uint64_t direct_start = UINT64_MAX, direct_end = UINT64_MAX;
     CHECK(get_type(ap + 0x80000, (uint64_t)(uintptr_t)&direct_type,

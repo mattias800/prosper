@@ -418,6 +418,22 @@ namespace {
     }
     uint64_t align_up(uint64_t v, uint64_t a) { return a ? (v + a - 1) & ~(a - 1) : v; }
 
+    constexpr uint64_t kMaxDirectMemoryType = 10;
+    bool valid_dmem_allocation(uint64_t len, uint64_t alignment,
+                               uint64_t memory_type, uint64_t phys_out) {
+        // The direct-memory ABI is 16 KiB-granular. Do not round a malformed request up: doing so
+        // consumes a different physical range than the guest requested. Alignment zero selects the
+        // default page alignment; explicit alignments must also be powers of two because dmem_take's
+        // first-fit alignment arithmetic has that contract.
+        if (!len || (len & (kGuestPageSize - 1)) != 0) return false;
+        if (alignment && ((alignment & (kGuestPageSize - 1)) != 0 ||
+                          (alignment & (alignment - 1)) != 0)) return false;
+        if (memory_type > kMaxDirectMemoryType) return false;
+        // Low values are not plausible guest pointers. The old code accepted them, allocated from
+        // the pool, then skipped the guarded write -- false success plus leaked physical capacity.
+        return phys_out > 0xffff;
+    }
+
     // The console chooses automatic mappings from its guest user-VA space.  Letting mmap(nullptr)
     // choose instead leaks a host VA (commonly 0x7f...) to the guest.  Besides being outside the PS5
     // address model, Sony libc explicitly rejects such an address as mspace backing.  Search a quiet
@@ -690,9 +706,10 @@ HLE(k_avail_flexible) { if (!a0) return 0x80020016ull; *(uint64_t*)(uintptr_t)a0
 
 // sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t align, int memType, off_t* physOut)
 HLE(k_alloc_dmem) {   // (searchStart, searchEnd, len, alignment, memoryType, physAddrOut)
-    if (!a5) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL: required physAddrOut
+    if (!valid_dmem_allocation(a2, a3, a4, a5))
+        return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
     uint64_t align = a3 ? a3 : 0x4000;
-    uint64_t sz = align_up(a2, align);
+    uint64_t sz = a2;
     uint64_t off;
     // Honor the [searchStart, searchEnd) window (a0/a1) — dropping it handed the guest an offset
     // outside the window it asked for.
@@ -703,7 +720,7 @@ HLE(k_alloc_dmem) {   // (searchStart, searchEnd, len, alignment, memoryType, ph
         return 0x8002000Cull;   // SCE_KERNEL_ERROR_ENOMEM
     }
     dmem_zero(off, sz);                       // fresh allocation -> zeroed pages (console semantics)
-    if (a5 > 0xffff) *(uint64_t*)a5 = off;   // only write through a plausible out-pointer
+    *(uint64_t*)a5 = off;
     MLOG("alloc_dmem range=[0x%llx,0x%llx) len=0x%llx align=0x%llx type=0x%llx -> phys=0x%llx\n",
          (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
          (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)off);
@@ -714,16 +731,17 @@ HLE(k_alloc_dmem) {   // (searchStart, searchEnd, len, alignment, memoryType, ph
 // DIFFERENT signature (4 args) from AllocateDirectMemory: physOut is arg3, not arg5. Aliasing them
 // to one handler wrote the result through arg5 (uninitialized garbage, e.g. 0xa) -> crash.
 HLE(k_alloc_main_dmem) {
-    if (!a3) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL: required physAddrOut
+    if (!valid_dmem_allocation(a0, a1, a2, a3))
+        return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
     uint64_t align = a1 ? a1 : 0x4000;
-    uint64_t sz = align_up(a0, align);
+    uint64_t sz = a0;
     uint64_t off;
     if (!dmem_take(sz, align, (int)a2, off)) {
         MLOG("alloc_main_dmem len=0x%llx -> ENOMEM (pool exhausted)\n", (unsigned long long)a0);
         return 0x8002000Cull;   // SCE_KERNEL_ERROR_ENOMEM
     }
     dmem_zero(off, sz);                       // fresh allocation -> zeroed pages (console semantics)
-    if (a3 > 0xffff) *(uint64_t*)a3 = off;
+    *(uint64_t*)a3 = off;
     MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a0, (unsigned long long)off);
     return 0;
 }
@@ -1876,6 +1894,16 @@ namespace {
         return n;
     }
     uint64_t align_up(uint64_t v, uint64_t a) { return a ? (v + a - 1) & ~(a - 1) : v; }
+
+    constexpr uint64_t kMaxDirectMemoryType = 10;
+    bool valid_dmem_allocation(uint64_t len, uint64_t alignment,
+                               uint64_t memory_type, uint64_t phys_out) {
+        if (!len || (len & (kGuestPageSize - 1)) != 0) return false;
+        if (alignment && ((alignment & (kGuestPageSize - 1)) != 0 ||
+                          (alignment & (alignment - 1)) != 0)) return false;
+        if (memory_type > kMaxDirectMemoryType) return false;
+        return phys_out > 0xffff;
+    }
 
     // Guest Orbis protection bits (READ=1, WRITE=2 [implies read], EXEC=4). WRITE implies READ,
     // and prot 0 is a legitimate no-access guard page (matches the Linux host_prot #342 fix).
@@ -3640,9 +3668,10 @@ HLE(k_avail_flexible) { if (!a0) return 0x80020016ull; *(uint64_t*)(uintptr_t)a0
 
 // sceKernelAllocateDirectMemory(start, end, len, align, memType, off_t* physOut)
 HLE(k_alloc_dmem) {
-    if (!a5) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL: required physAddrOut
+    if (!valid_dmem_allocation(a2, a3, a4, a5))
+        return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
     uint64_t align = a3 ? a3 : 0x4000;
-    uint64_t sz = align_up(a2, align);
+    uint64_t sz = a2;
     uint64_t off;
     if (!dmem_take(sz, align, (int)a4, off, a0, a1 ? a1 : ~0ull)) {
         MLOG("alloc_dmem len=0x%llx in [0x%llx,0x%llx) -> ENOMEM\n",
@@ -3650,22 +3679,23 @@ HLE(k_alloc_dmem) {
         return 0x8002000Cull;
     }
     dmem_prepare_allocation(off, sz);
-    if (a5 > 0xffff) *(uint64_t*)a5 = off;
+    *(uint64_t*)a5 = off;
     MLOG("alloc_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a2, (unsigned long long)off);
     return 0;
 }
 // sceKernelAllocateMainDirectMemory(len, align, memType, off_t* physOut) — physOut at arg3.
 HLE(k_alloc_main_dmem) {
-    if (!a3) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL: required physAddrOut
+    if (!valid_dmem_allocation(a0, a1, a2, a3))
+        return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
     uint64_t align = a1 ? a1 : 0x4000;
-    uint64_t sz = align_up(a0, align);
+    uint64_t sz = a0;
     uint64_t off;
     if (!dmem_take(sz, align, (int)a2, off)) {
         MLOG("alloc_main_dmem len=0x%llx -> ENOMEM\n", (unsigned long long)a0);
         return 0x8002000Cull;
     }
     dmem_prepare_allocation(off, sz);
-    if (a3 > 0xffff) *(uint64_t*)a3 = off;
+    *(uint64_t*)a3 = off;
     MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a0, (unsigned long long)off);
     return 0;
 }
