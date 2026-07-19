@@ -233,7 +233,17 @@ int main() {
         for (int j = 0; j < i; j++) CHECK(input_handles[i] != input_handles[j]);
     }
     CHECK((int32_t)call("sceAudioInOpen", 1, 0, 7, 64, 48000, 2) == (int32_t)0x80260107);
-    for (int i = 0; i < 7; i++) CHECK(call("sceAudioInClose", (uint64_t)input_handles[i]) == 0);
+    audio_reset();
+    memset(stereo_mic.data() + 1, 0x3C, stereo_mic.size() - 2);
+    CHECK((int32_t)call("sceAudioInInput", (uint64_t)input_handles[0], PTR(stereo_mic.data() + 1)) ==
+          (int32_t)0x80260109);
+    for (size_t i = 1; i + 1 < stereo_mic.size(); i++) CHECK(stereo_mic[i] == 0x3C);
+    for (int i = 0; i < 7; i++) {
+        input_handles[i] = call("sceAudioInOpen", 1, 0, i, 64, 48000, 2);
+        CHECK(input_handles[i] >= 0);                     // reset released every input slot
+    }
+    CHECK((int32_t)call("sceAudioInOpen", 1, 0, 7, 64, 48000, 2) == (int32_t)0x80260107);
+    audio_reset();
 
     // --- 11. libSceNgs2 silent lifecycle: sizes, handles, state, and render output -------------
     struct BufferInfo { uint64_t host_buffer, host_buffer_size, reserved[5], user_data; };

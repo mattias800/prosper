@@ -110,6 +110,7 @@ Port* port_of(int handle) {
 // --- public backend hooks (audio.hpp) ---------------------------------------------------
 void audio_set_sink(AudioSink* sink) { g_sink.store(sink ? sink : &g_default_sink); }
 AudioSink* audio_sink() { return g_sink.load(); }
+static void audio_in_reset_ports();
 
 void audio_decode_format(uint32_t param, int& channels, AudioFmt& fmt) {
     switch (param & 0xff) {                                   // SceAudioOutParamFormat (low byte)
@@ -141,12 +142,15 @@ int audio_peak_channel_volume(uint32_t mask, const int* vols) {
 
 void audio_reset() {
     AudioSink* s = audio_sink();
-    std::lock_guard<std::mutex> lk(g_mx);
-    for (int i = 0; i < kMaxPorts; i++) {
-        if (g_ports[i].in_use && s) s->close(i + 1);
-        g_ports[i] = Port{};
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        for (int i = 0; i < kMaxPorts; i++) {
+            if (g_ports[i].in_use && s) s->close(i + 1);
+            g_ports[i] = Port{};
+        }
+        g_sink.store(&g_default_sink);
     }
-    g_sink.store(&g_default_sink);
+    audio_in_reset_ports();
 }
 
 // --- legacy-path diagnostics --------------------------------------------------------------
@@ -515,6 +519,11 @@ int audio_in_port_id(uint64_t raw_handle) {
 }
 
 } // namespace
+
+static void audio_in_reset_ports() {
+    std::lock_guard<std::mutex> lk(g_audio_in_mx);
+    for (auto& port : g_audio_in_ports) port = {};
+}
 
 HLE(audio_in_init) { return 0; }
 
