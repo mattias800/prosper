@@ -3407,6 +3407,36 @@ int main() {
     CHECK(gotT32b.size() == 1 && gotT32b[0] == 17.0f && atomic_out_b.size() == 2 && atomic_out_b[1] == 42u,
           "T32b: GLC=1 buffer_atomic_umax returns the pre-op value and stores the maximum");
 
+    // T33 (#1021): Astro title vertex shaders use the VOP1 unsigned-byte conversion family.
+    // Convert all four bytes from v4 independently, then sum the exact f32 results in v0.
+    const uint32_t codeT33[] = {
+        0x7e002304u,                         // v_cvt_f32_ubyte0 v0, v4
+        0x7e022504u,                         // v_cvt_f32_ubyte1 v1, v4
+        0x7e042704u,                         // v_cvt_f32_ubyte2 v2, v4
+        0x7e062904u,                         // v_cvt_f32_ubyte3 v3, v4
+        0x06000300u,                         // v_add_f32 v0, v0, v1
+        0x06000500u,                         // v_add_f32 v0, v0, v2
+        0x06000700u,                         // v_add_f32 v0, v0, v3
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvT33 = recompile_valu(codeT33, std::size(codeT33), 5, 0);
+    CHECK(!spvT33.empty(), "recompiled T33 (Astro V_CVT_F32_UBYTE0..3) -> SPIR-V");
+    const uint32_t rawT33[] = {
+        0x00000000u, 0x01020304u, 0x10203040u, 0x11223344u,
+        0x3f800000u, 0x80000001u, 0x7e7d7c7bu, 0xdeadbeefu,
+    };
+    std::vector<float> inT33(std::size(rawT33) * 5, 0.0f), expT33(std::size(rawT33));
+    for (size_t i = 0; i < std::size(rawT33); ++i) {
+        std::memcpy(&inT33[i * 5 + 4], &rawT33[i], sizeof(uint32_t));
+        expT33[i] = static_cast<float>((rawT33[i] & 0xffu) + ((rawT33[i] >> 8) & 0xffu) +
+                                       ((rawT33[i] >> 16) & 0xffu) + (rawT33[i] >> 24));
+    }
+    std::vector<float> gotT33 = prosper::test::run_compute(
+        spvT33, inT33, static_cast<uint32_t>(std::size(rawT33)),
+        static_cast<uint32_t>(std::size(rawT33)));
+    CHECK(gotT33 == expT33,
+          "T33: UBYTE0..3 extract the selected unsigned byte and convert every result exactly");
+
     // --- 2026-07 ISA-audit semantic fixes (#879/#880) — execution kernels ---
 
     // A1 (#879): s_not_b32 writes SCC=(result!=0). ~0 = all-ones -> SCC=1 -> cselect 11;
