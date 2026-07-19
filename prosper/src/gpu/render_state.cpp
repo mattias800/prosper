@@ -448,17 +448,17 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
         }
     }
 
-    ps.blend_enable            = rs.blend_enable;
-    ps.src_color_blend_factor  = vk_blend_factor(rs.color_src_blend);
-    ps.dst_color_blend_factor  = vk_blend_factor(rs.color_dst_blend);
-    ps.color_blend_op          = vk_blend_op(rs.color_comb_fcn);
+    ps.blend_enable = rs.blend_enable;
+    vk_blend_factors(rs.color_src_blend, rs.color_dst_blend,
+                     ps.src_color_blend_factor, ps.dst_color_blend_factor);
+    ps.color_blend_op = vk_blend_op(rs.color_comb_fcn);
     // Alpha blend factors/op (#381): use the separate ALPHA_* fields when SEPARATE_ALPHA_BLEND is set,
     // else mirror the color factors (RDNA2 behavior — Kyty GraphicsRender). The backend reads these
     // directly, so it no longer has to reuse the color factors for the alpha channel (which corrupted
     // stored dst-alpha on any target later read back — RTT composites, alpha-test/text layers).
     if (rs.separate_alpha_blend) {
-        ps.src_alpha_blend_factor = vk_blend_factor(rs.alpha_src_blend);
-        ps.dst_alpha_blend_factor = vk_blend_factor(rs.alpha_dst_blend);
+        vk_blend_factors(rs.alpha_src_blend, rs.alpha_dst_blend,
+                         ps.src_alpha_blend_factor, ps.dst_alpha_blend_factor);
         ps.alpha_blend_op         = vk_blend_op(rs.alpha_comb_fcn);
     } else {
         ps.src_alpha_blend_factor = ps.src_color_blend_factor;
@@ -467,12 +467,12 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     }
 
     ps.blend1_enable = rs.blend1_enable;
-    ps.src_color_blend_factor1 = vk_blend_factor(rs.color1_src_blend);
-    ps.dst_color_blend_factor1 = vk_blend_factor(rs.color1_dst_blend);
+    vk_blend_factors(rs.color1_src_blend, rs.color1_dst_blend,
+                     ps.src_color_blend_factor1, ps.dst_color_blend_factor1);
     ps.color_blend_op1 = vk_blend_op(rs.color1_comb_fcn);
     if (rs.separate_alpha_blend1) {
-        ps.src_alpha_blend_factor1 = vk_blend_factor(rs.alpha1_src_blend);
-        ps.dst_alpha_blend_factor1 = vk_blend_factor(rs.alpha1_dst_blend);
+        vk_blend_factors(rs.alpha1_src_blend, rs.alpha1_dst_blend,
+                         ps.src_alpha_blend_factor1, ps.dst_alpha_blend_factor1);
         ps.alpha_blend_op1 = vk_blend_op(rs.alpha1_comb_fcn);
     } else {
         ps.src_alpha_blend_factor1 = ps.src_color_blend_factor1;

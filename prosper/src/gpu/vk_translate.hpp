@@ -82,6 +82,12 @@ inline uint32_t vk_stencil_op(uint32_t op) {
 // DstColor=8 -> VK DST_COLOR=4). Per Kyty GraphicsRender.cpp. Unknown -> ZERO.
 uint32_t vk_blend_factor(uint32_t rdna2_factor);
 
+// Resolve a source/destination factor pair. The obsolete BOTH_SRC_ALPHA (11) and
+// BOTH_INV_SRC_ALPHA (12) source factors override the destination selection, so they must be
+// translated together rather than as independent VkBlendFactors. Other pairs use vk_blend_factor.
+void vk_blend_factors(uint32_t rdna2_src_factor, uint32_t rdna2_dst_factor,
+                      uint32_t& vk_src_factor, uint32_t& vk_dst_factor);
+
 // Map an RDNA2 COLOR_COMB_FCN to a VkBlendOp value (0=ADD,1=SUB,2=MIN,3=MAX,4=REV_SUB ->
 // VK ADD=0,SUB=1,MIN=3,MAX=4,REV_SUB=2). Unknown -> ADD.
 uint32_t vk_blend_op(uint32_t comb_fcn);
