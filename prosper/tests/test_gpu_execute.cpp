@@ -28,6 +28,11 @@ alignas(256) static const uint32_t kVs[] = {
 alignas(256) static const uint32_t kPs[] = {
     0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u,
 };
+// Descriptor-free clear-RG helper emitted by AGC for CB_COLOR_CONTROL.DCC_DECOMPRESS. Hardware
+// interprets its export as a metadata operation; it must not run as an ordinary Vulkan color shader.
+alignas(256) static const uint32_t kDccPs[] = {
+    0x7E000280u, 0xF8001803u, 0x00000000u, 0xBF810000u,
+};
 static void set_pgm(GpuState& st, uint32_t lo_off, uint32_t hi_off, const void* p) {
     uint64_t a = (uint64_t)(uintptr_t)p;
     st.sh[lo_off] = (uint32_t)((a >> 8) & 0xFFFFFFFFu);
@@ -50,8 +55,10 @@ int main() {
     // supply the live-device renderer). execute_gpustate does recompile + resolve + render internally.
     // The backend gets the submit's DrawItem list; this test submits a single draw, so render items[0] via
     // the single-draw wrapper (default empty-buffer resources), exactly as before.
+    DrawItem realized_draw;
     auto backend = [&](const std::vector<DrawItem>& items) -> std::vector<uint8_t> {
         if (items.empty()) return {};
+        realized_draw = items[0];
         return prosper::test::render_triangle_rgba(items[0].vs, items[0].fs, W, H, &items[0].ps);
     };
     std::vector<uint8_t> px = execute_gpustate(st, backend);
@@ -62,6 +69,86 @@ int main() {
     uint32_t green = 0, total = 0;
     for (uint32_t y : {0u, H/2, H-1}) for (uint32_t x : {0u, W/2, W-1}) { total++; if (isGreen(x, y)) green++; }
     CHECK(green == total, "GpuState -> executor -> GREEN frame (full recompile+resolve+render spine)");
+
+    // DCC_DECOMPRESS binds a graphics helper whose color export is interpreted by the hardware as a
+    // metadata operation. Prosper stores only materialized Vulkan color, so realization substitutes
+    // a NULL-export fragment module while retaining the target's ordinary write mask/cache identity.
+    GpuState dcc = st;
+    set_pgm(dcc, P::SPI_SHADER_PGM_LO_PS, P::SPI_SHADER_PGM_HI_PS, kDccPs);
+    dcc.cx[P::CB_COLOR_CONTROL] =
+        (P::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS << P::CB_COLOR_CONTROL_MODE_SHIFT) |
+        (0xCCu << P::CB_COLOR_CONTROL_ROP3_SHIFT);
+    std::vector<uint8_t> dcc_px = execute_gpustate(dcc, backend);
+    bool dcc_preserved = dcc_px.size() == (size_t)W * H * 4;
+    if (dcc_preserved) {
+        const uint8_t* center = &dcc_px[((size_t)(H / 2) * W + W / 2) * 4];
+        dcc_preserved = center[2] > 0x80 && center[0] < 0x40 && center[1] < 0x40;
+    }
+    CHECK(dcc_preserved,
+          "DCC decompress keeps the color attachment unchanged instead of running its helper export");
+    bool dcc_has_output_variable = false;
+    for (size_t word = 5; word < realized_draw.fs.size();) {
+        const uint32_t instruction = realized_draw.fs[word];
+        const uint32_t word_count = instruction >> 16;
+        const uint32_t opcode = instruction & 0xffffu;
+        if (!word_count || word_count > realized_draw.fs.size() - word) break;
+        // OpVariable's third operand is its StorageClass; 3 is Output. A fragment module with no
+        // output interface is the Vulkan equivalent of the hardware metadata operation.
+        if (opcode == 59u && word_count >= 4u && realized_draw.fs[word + 3u] == 3u)
+            dcc_has_output_variable = true;
+        word += word_count;
+    }
+    CHECK(!dcc_has_output_variable,
+          "DCC decompress replacement exposes no ordinary fragment-color output");
+
+    // A folded submit can retain MODE=6 after the guest has restored normal mode. Do not classify a
+    // real shader from the following post-process pass as the helper merely because of that residue.
+    GpuState stale_dcc_mode = st;
+    stale_dcc_mode.cx[P::CB_COLOR_CONTROL] = dcc.cx[P::CB_COLOR_CONTROL];
+    const std::vector<uint8_t> stale_dcc_px = execute_gpustate(stale_dcc_mode, backend);
+    bool stale_dcc_green = stale_dcc_px.size() == static_cast<size_t>(W) * H * 4;
+    if (stale_dcc_green) {
+        const uint8_t* center =
+            &stale_dcc_px[(static_cast<size_t>(H / 2) * W + W / 2) * 4];
+        stale_dcc_green = center[1] > 0x80 && center[0] < 0x40 && center[2] < 0x40;
+    }
+    CHECK(stale_dcc_green,
+          "stale DCC mode does not suppress the following ordinary color shader");
+
+    // Astro's DCC helpers operate on native FP16 post-process targets. Seed one persistent target
+    // with the ordinary green shader, then execute the realized metadata helper against the same
+    // image with LOAD semantics. A format-specific pipeline mistake here would silently erase HDR
+    // intermediates even though the RGBA8 clear-preservation check above passed.
+    constexpr uint64_t dcc_fp16_target_id = 0x8250000000000016ull;
+    ResolvedPipelineState fp16_state = realized_draw.ps;
+    fp16_state.color0_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    prosper::test::BackendDraw fp16_seed_draw;
+    fp16_seed_draw.vs = realized_draw.vs;
+    fp16_seed_draw.fs = recompile_fragment(kPs, std::size(kPs));
+    fp16_seed_draw.ps = &fp16_state;
+    fp16_seed_draw.vcount = 3;
+    prosper::test::BackendColorTarget fp16_seed_target{
+        dcc_fp16_target_id, false, true, VK_FORMAT_R16G16B16A16_SFLOAT};
+    const std::vector<uint8_t> fp16_seed = prosper::test::render_draws_rgba(
+        {fp16_seed_draw}, W, H, nullptr, nullptr, false, &fp16_seed_target);
+    auto fp16_dcc_backend = [&](const std::vector<DrawItem>& items) -> std::vector<uint8_t> {
+        if (items.empty()) return {};
+        ResolvedPipelineState fp16_dcc_state = items[0].ps;
+        fp16_dcc_state.color0_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        prosper::test::BackendDraw draw;
+        draw.vs = items[0].vs;
+        draw.fs = items[0].fs;
+        draw.ps = &fp16_dcc_state;
+        draw.vcount = items[0].vertex_count;
+        prosper::test::BackendColorTarget target{
+            dcc_fp16_target_id, true, true, VK_FORMAT_R16G16B16A16_SFLOAT};
+        return prosper::test::render_draws_rgba(
+            {std::move(draw)}, W, H, nullptr, nullptr, false, &target);
+    };
+    const std::vector<uint8_t> fp16_dcc = execute_gpustate(dcc, fp16_dcc_backend);
+    CHECK(fp16_seed.size() == static_cast<size_t>(W) * H * 8 && fp16_dcc == fp16_seed,
+          "DCC decompress preserves a native FP16 color attachment byte-for-byte");
+    prosper::test::invalidate_persistent_color_target(dcc_fp16_target_id);
 
     // Present round-trip: hand the frame to the scanout path and read it back (what videoout presents).
     prosper::gpu::present_reset();

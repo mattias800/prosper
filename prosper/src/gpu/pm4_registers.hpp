@@ -400,6 +400,7 @@ constexpr uint32_t DB_SHADER_CONTROL_CONSERVATIVE_Z_EXPORT_MASK  = 0x3;
 constexpr uint32_t CB_COLOR_CONTROL            = 0x202;
 constexpr uint32_t CB_COLOR_CONTROL_MODE_SHIFT = 4;
 constexpr uint32_t CB_COLOR_CONTROL_MODE_MASK  = 0x7;
+constexpr uint32_t CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS = 6;
 constexpr uint32_t CB_COLOR_CONTROL_ROP3_SHIFT = 16;
 constexpr uint32_t CB_COLOR_CONTROL_ROP3_MASK  = 0xFF;
 constexpr uint32_t PA_CL_CLIP_CNTL                                 = 0x204;
