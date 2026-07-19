@@ -1587,6 +1587,71 @@ struct SpirvCompute {
 
 }  // namespace
 
+// Extend the narrow compiler shape
+//
+//   s_cbranch_scc* ELSE
+//   THEN...
+//   s_endpgm
+// ELSE:
+//   ELSE...
+//   s_endpgm
+//
+// into the existing structured-if/else input. The first s_endpgm is represented as a synthetic
+// s_branch to the second end, which is semantically exact: it skips the other terminating arm, while
+// the shared SPIR-V shell may still converge solely to publish outputs/return. Keep this deliberately
+// conservative: one scalar conditional, adjacent straight-line else arm, and a real terminating end.
+// Immediate-end/nop-end tails remain the established early-out shape and are not rewritten.
+static bool extend_terminating_if_else(const uint32_t* code, size_t dwords,
+                                       std::vector<Rdna2Inst>& instructions,
+                                       size_t* required_dwords = nullptr) {
+    if (!code || instructions.empty()) return false;
+    auto first_end = std::find_if(instructions.begin(), instructions.end(),
+                                  [](const Rdna2Inst& in) { return in.is_end; });
+    if (first_end == instructions.end()) return false;
+
+    const Rdna2Inst* branch = nullptr;
+    for (auto it = instructions.begin(); it != first_end; ++it) {
+        if (it->fmt != Rdna2Format::SOPP) continue;
+        if (it->opcode == 0x04 || it->opcode == 0x05) {
+            if (branch) return false;
+            branch = &*it;
+        } else if (it->opcode >= 0x02 && it->opcode <= 0x09 && it->opcode != 0x03) {
+            return false;
+        }
+    }
+    if (!branch || branch->simm16 <= 0) return false;
+    const int64_t target64 = static_cast<int64_t>(branch->pc) + branch->len_dwords + branch->simm16;
+    if (target64 < 0 || static_cast<uint64_t>(target64) >= dwords) return false;
+    const uint32_t target = static_cast<uint32_t>(target64);
+    if (target != first_end->pc + first_end->len_dwords) return false;
+
+    std::vector<Rdna2Inst> tail;
+    const size_t tail_dwords = rdna2_walk(code + target, dwords - target, tail);
+    if (tail.empty() || !tail.back().is_end) return false;
+    bool has_real_else = false;
+    for (auto it = tail.begin(); it != tail.end() - 1; ++it) {
+        if (it->fmt == Rdna2Format::SOPP) {
+            if (it->opcode == 0x00) continue; // padding is harmless but not a real else arm
+            if (it->opcode >= 0x02 && it->opcode <= 0x09 && it->opcode != 0x03) return false;
+        }
+        has_real_else = true;
+    }
+    if (!has_real_else) return false;
+
+    for (auto& in : tail) in.pc += target;
+    const uint32_t merge_pc = tail.back().pc;
+    const uint32_t skip_dwords = merge_pc - (first_end->pc + first_end->len_dwords);
+    if (!skip_dwords || skip_dwords > static_cast<uint32_t>(INT16_MAX)) return false;
+    first_end->fmt = Rdna2Format::SOPP;
+    first_end->opcode = 0x02; // s_branch merge_pc: terminates the lexical then arm
+    first_end->simm16 = static_cast<int32_t>(skip_dwords);
+    first_end->words[0] = 0xbf820000u | (skip_dwords & 0xffffu);
+    first_end->is_end = false;
+    instructions.insert(instructions.end(), tail.begin(), tail.end());
+    if (required_dwords) *required_dwords = target + tail_dwords;
+    return true;
+}
+
 FragmentInterpolationLayout fragment_interpolation_layout(
         const uint32_t* code, size_t dwords,
         const PixelSystemInputMapping* system_inputs) {
@@ -5950,6 +6015,10 @@ size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords) {
     std::vector<Rdna2Inst> ins;
     const size_t program_dwords = rdna2_walk(code, dwords, ins);
     size_t required = program_dwords;
+    std::vector<Rdna2Inst> terminating_cfg = ins;
+    size_t terminating_span = program_dwords;
+    if (extend_terminating_if_else(code, dwords, terminating_cfg, &terminating_span))
+        required = std::max(required, terminating_span);
     // Detection both proves the compiler idiom and bounds every referenced table. Do not retain an
     // arbitrary post-ENDPGM trailer: only bytes that can affect the generated SPIR-V belong in the key.
     (void)detect_pcrel_tables(ins, code, dwords, &required);
@@ -7425,6 +7494,10 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
                                      const ShaderResourceTable* rt, uint32_t lds_bytes) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
+    // This shell publishes register state after the structured region, so both terminal arms can
+    // converge in the host SPIR-V without inventing further guest execution. Graphics exports keep
+    // separate side-effect bookkeeping and remain on the conservative reject path for this shape.
+    (void)extend_terminating_if_else(code, dwords, ins);
     SpirvCompute b;
     // Size the LDS array from the shader's real allocation when known (#130): bytes -> dwords, at
     // least the ds ops need, clamped to the RDNA2 64 KB (16384-dword) max. 0 keeps the 16 KB default.
@@ -7454,6 +7527,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                         const ComputeShaderConfig& config) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
+    // See recompile_valu: compute has no branch-external EXP state, so the common host-shell merge is
+    // only a place to finish the invocation after either guest arm has terminated.
+    (void)extend_terminating_if_else(code, dwords, ins);
     SpirvCompute b;
     if (config.lds_bytes) {
         uint32_t dw = (config.lds_bytes + 3) / 4;
@@ -7523,6 +7599,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
 RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
+    (void)extend_terminating_if_else(code, dwords, ins);
 
     // A scratch builder/state so emit_alu can run; its emitted code is discarded — we only want `ok`.
     SpirvCompute b; b.begin(1);
@@ -7539,7 +7616,8 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                                                           /*compute_wave_branches*/true);   // matches the compute shell (#590)
     auto cf_reconstructed = [&](const Rdna2Inst& i) {
         if (cL.found && (i.pc == cL.backedge_pc || i.pc == cL.exit_branch_pc)) return true;
-        for (const auto& F : cFs) if (i.pc == F.branch_pc) return true;
+        for (const auto& F : cFs)
+            if (i.pc == F.branch_pc || (F.has_else && i.pc == F.sb_pc)) return true;
         return false;
     };
 

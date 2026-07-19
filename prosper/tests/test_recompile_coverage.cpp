@@ -51,6 +51,19 @@ int main() {
     CHECK(b.total == 2 && b.alu == 1 && b.unsupported == 1 && b.first_bad_fmt >= 0 && b.first_bad_op == 0x02,
           "an unconditional s_branch is reported as the first unsupported instruction");
 
+    // A scalar conditional whose target is a straight-line second arm after the first s_endpgm is
+    // structured as two terminating arms. Coverage must credit both the conditional and the synthetic
+    // arm-skip rather than reporting either branch as unsupported.
+    const uint32_t terminating_if_else[] = {
+        0xbe800387u, 0xbe810388u, 0xbf060100u, 0xbf840003u,
+        0x7e0002ffu, 0x42280000u, 0xbf810000u,
+        0x7e0002ffu, 0x41100000u, 0xbf810000u,
+    };
+    RecompileCoverage terminal = recompile_coverage(
+        terminating_if_else, sizeof(terminating_if_else)/sizeof(terminating_if_else[0]));
+    CHECK(terminal.unsupported == 0 && terminal.first_bad_fmt < 0,
+          "a terminating post-endpgm if/else reports fully structured coverage");
+
     // A forward VCC branch is not covered by EXEC predication. Treating it as a no-op would execute
     // the skipped block even when VCC says to branch, so the recompiler must reject it for now.
     const uint32_t vcc_branch[] = { 0x7da80300u, 0xbf860001u, 0x4a060300u, 0xBF810000u };
