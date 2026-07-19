@@ -208,6 +208,10 @@ struct BackendResourceReuseStats {
     size_t pipeline_layout_references = 0;
     size_t unique_pipeline_layouts = 0;
     size_t descriptor_pools = 0;
+    size_t persistent_pipeline_layout_hits = 0;
+    size_t persistent_pipeline_layout_misses = 0;
+    size_t persistent_pipeline_layout_entries = 0;
+    size_t persistent_pipeline_layout_evictions = 0;
 };
 
 inline BackendResourceReuseStats& backend_resource_reuse_stats_storage() {
@@ -283,6 +287,47 @@ inline size_t persistent_pipeline_cache_limit() {
     static const size_t limit = [] {
         const char* value = getenv("PROSPER_PIPELINE_CACHE_ENTRIES");
         return value ? static_cast<size_t>(strtoull(value, nullptr, 10)) : size_t{1024};
+    }();
+    return limit;
+}
+
+struct BackendWordVectorHash {
+    size_t operator()(const std::vector<uint64_t>& words) const {
+        uint64_t hash = 1469598103934665603ull;
+        for (uint64_t word : words) {
+            hash ^= word;
+            hash *= 1099511628211ull;
+        }
+        return static_cast<size_t>(hash);
+    }
+};
+
+struct PersistentBackendPipelineLayout {
+    VkPipelineLayout handle = VK_NULL_HANDLE;
+    uint64_t last_use = 0;
+};
+
+inline std::unordered_map<std::vector<uint64_t>, PersistentBackendPipelineLayout,
+                          BackendWordVectorHash>&
+persistent_backend_pipeline_layout_cache() {
+    static std::unordered_map<std::vector<uint64_t>, PersistentBackendPipelineLayout,
+                              BackendWordVectorHash> cache;
+    return cache;
+}
+
+inline uint64_t& persistent_pipeline_layout_generation() {
+    static uint64_t generation = 0;
+    return generation;
+}
+
+inline bool persistent_pipeline_layout_cache_enabled() {
+    return getenv("PROSPER_NO_BACKEND_PIPELINE_LAYOUT_CACHE") == nullptr;
+}
+
+inline size_t persistent_pipeline_layout_cache_limit() {
+    static const size_t limit = [] {
+        const char* value = getenv("PROSPER_PIPELINE_LAYOUT_CACHE_ENTRIES");
+        return value ? static_cast<size_t>(strtoull(value, nullptr, 10)) : size_t{256};
     }();
     return limit;
 }
@@ -1612,6 +1657,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         VkShaderModule vs = VK_NULL_HANDLE, gs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
         std::vector<FrameResource> R;
         std::vector<VkDescriptorSetLayout> dsls; std::vector<VkDescriptorSet> dsets;
+        std::vector<std::vector<uint64_t>> descriptor_layout_keys;
         std::vector<VkBuffer> sbuf;
         std::vector<size_t> texture_upload;
         std::vector<VkImageView> tview; std::vector<VkSampler> tsamp;
@@ -1751,15 +1797,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         VkImageView view = VK_NULL_HANDLE;
         VkSampler sampler = VK_NULL_HANDLE;
     };
-    struct WordVectorHash {
-        size_t operator()(const std::vector<uint64_t>& words) const {
-            uint64_t hash = 1469598103934665603ull;
-            for (uint64_t word : words) {
-                hash ^= word;
-                hash *= 1099511628211ull;
-            }
-            return static_cast<size_t>(hash);
-        }
+    struct SharedPipelineLayout {
+        VkPipelineLayout handle = VK_NULL_HANDLE;
+        bool persistent = false;
     };
     std::vector<SharedBufferUpload> shared_buffers;
     std::vector<SharedBufferArena> shared_buffer_arenas;
@@ -1767,9 +1807,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     std::vector<SharedTextureBinding> shared_texture_bindings;
     std::unordered_map<TextureBindingKey, size_t, TextureBindingKeyHash>
         shared_texture_binding_indices;
-    std::unordered_map<std::vector<uint64_t>, VkDescriptorSetLayout, WordVectorHash>
+    std::unordered_map<std::vector<uint64_t>, VkDescriptorSetLayout, BackendWordVectorHash>
         shared_descriptor_set_layouts;
-    std::unordered_map<std::vector<uint64_t>, VkPipelineLayout, WordVectorHash>
+    std::unordered_map<std::vector<uint64_t>, SharedPipelineLayout, BackendWordVectorHash>
         shared_pipeline_layouts;
     uint64_t resource_unique_tag = 0;
     const uint32_t zero_buffer_word = 0;
@@ -1840,6 +1880,25 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     const uint64_t pipeline_generation = ++persistent_pipeline_generation();
     const bool pipeline_cache_enabled = persistent_pipeline_cache_enabled();
     const size_t pipeline_cache_limit = persistent_pipeline_cache_limit();
+    const bool pipeline_layout_cache_enabled = share_backend_resources &&
+        persistent_pipeline_layout_cache_enabled();
+    const size_t pipeline_layout_cache_limit = persistent_pipeline_layout_cache_limit();
+    const uint64_t pipeline_layout_generation = ++persistent_pipeline_layout_generation();
+    auto& persistent_pipeline_layouts = persistent_backend_pipeline_layout_cache();
+    auto evict_persistent_pipeline_layout = [&]() {
+        auto victim = persistent_pipeline_layouts.end();
+        for (auto it = persistent_pipeline_layouts.begin();
+             it != persistent_pipeline_layouts.end(); ++it) {
+            if (it->second.last_use == pipeline_layout_generation) continue;
+            if (victim == persistent_pipeline_layouts.end() ||
+                it->second.last_use < victim->second.last_use) victim = it;
+        }
+        if (victim == persistent_pipeline_layouts.end()) return false;
+        vkDestroyPipelineLayout(dev, victim->second.handle, nullptr);
+        persistent_pipeline_layouts.erase(victim);
+        ++resource_reuse_stats.persistent_pipeline_layout_evictions;
+        return true;
+    };
     auto evict_pipeline = [&]() {
         auto victim = pipeline_cache.end();
         for (auto it = pipeline_cache.begin(); it != pipeline_cache.end(); ++it) {
@@ -2070,6 +2129,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         v.use_desc = !R.empty();
         for (auto& r : R) v.n_sets = std::max(v.n_sets, r.set + 1);
         v.dsls.assign(v.n_sets, VK_NULL_HANDLE); v.dsets.assign(v.n_sets, VK_NULL_HANDLE);
+        v.descriptor_layout_keys.resize(v.n_sets);
         v.sbuf.assign(R.size(), VK_NULL_HANDLE);
         v.texture_upload.assign(R.size(), SIZE_MAX);
         v.tview.assign(R.size(), VK_NULL_HANDLE); v.tsamp.assign(R.size(), VK_NULL_HANDLE);
@@ -2395,6 +2455,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     layout_key.push_back(binding.descriptorCount);
                     layout_key.push_back(binding.stageFlags);
                 }
+                v.descriptor_layout_keys[s] = layout_key;
                 ++resource_reuse_stats.descriptor_set_layout_references;
                 auto layout_found = shared_descriptor_set_layouts.find(layout_key);
                 if (layout_found != shared_descriptor_set_layouts.end()) {
@@ -2422,23 +2483,61 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         const auto setup_resources_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         if (timing_enabled) setup_resources_ms += setup_elapsed_ms(setup_fixed_ready, setup_resources_ready);
         std::vector<uint64_t> pipeline_layout_key;
-        pipeline_layout_key.reserve(1 + (v.use_desc ? v.dsls.size() : 0));
+        size_t pipeline_layout_key_words = 1;
+        if (v.use_desc) {
+            for (const auto& descriptor_layout_key : v.descriptor_layout_keys)
+                pipeline_layout_key_words += 1 + descriptor_layout_key.size();
+        }
+        pipeline_layout_key.reserve(pipeline_layout_key_words);
         pipeline_layout_key.push_back(share_backend_resources ? 0 : ++resource_unique_tag);
-        if (v.use_desc)
-            for (VkDescriptorSetLayout layout : v.dsls)
-                pipeline_layout_key.push_back(handle_bits(layout));
+        if (v.use_desc) {
+            for (const auto& descriptor_layout_key : v.descriptor_layout_keys) {
+                pipeline_layout_key.push_back(descriptor_layout_key.size());
+                pipeline_layout_key.insert(pipeline_layout_key.end(),
+                                           descriptor_layout_key.begin(),
+                                           descriptor_layout_key.end());
+            }
+        }
         ++resource_reuse_stats.pipeline_layout_references;
         auto pipeline_layout_found = shared_pipeline_layouts.find(pipeline_layout_key);
         if (pipeline_layout_found != shared_pipeline_layouts.end()) {
-            v.layout = pipeline_layout_found->second;
+            v.layout = pipeline_layout_found->second.handle;
         } else {
-            VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-            if (v.use_desc) {
-                layout_info.setLayoutCount = v.n_sets;
-                layout_info.pSetLayouts = v.dsls.data();
+            SharedPipelineLayout shared_layout;
+            const bool can_persist_pipeline_layout = pipeline_layout_cache_enabled &&
+                pipeline_layout_cache_limit;
+            auto persistent_layout = can_persist_pipeline_layout
+                ? persistent_pipeline_layouts.find(pipeline_layout_key)
+                : persistent_pipeline_layouts.end();
+            if (persistent_layout != persistent_pipeline_layouts.end()) {
+                persistent_layout->second.last_use = pipeline_layout_generation;
+                shared_layout.handle = persistent_layout->second.handle;
+                shared_layout.persistent = true;
+                ++resource_reuse_stats.persistent_pipeline_layout_hits;
+            } else {
+                VkPipelineLayoutCreateInfo layout_info{
+                    VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+                if (v.use_desc) {
+                    layout_info.setLayoutCount = v.n_sets;
+                    layout_info.pSetLayouts = v.dsls.data();
+                }
+                vkCreatePipelineLayout(dev, &layout_info, nullptr, &shared_layout.handle);
+                if (can_persist_pipeline_layout) {
+                    ++resource_reuse_stats.persistent_pipeline_layout_misses;
+                    while (persistent_pipeline_layouts.size() >= pipeline_layout_cache_limit &&
+                           evict_persistent_pipeline_layout()) {}
+                    if (shared_layout.handle &&
+                        persistent_pipeline_layouts.size() < pipeline_layout_cache_limit) {
+                        persistent_pipeline_layouts.emplace(
+                            pipeline_layout_key,
+                            PersistentBackendPipelineLayout{
+                                shared_layout.handle, pipeline_layout_generation});
+                        shared_layout.persistent = true;
+                    }
+                }
             }
-            vkCreatePipelineLayout(dev, &layout_info, nullptr, &v.layout);
-            shared_pipeline_layouts.emplace(std::move(pipeline_layout_key), v.layout);
+            v.layout = shared_layout.handle;
+            shared_pipeline_layouts.emplace(std::move(pipeline_layout_key), shared_layout);
             ++resource_reuse_stats.unique_pipeline_layouts;
         }
         VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
@@ -2984,7 +3083,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     if (shared_descriptor_pool)
         vkDestroyDescriptorPool(dev, shared_descriptor_pool, nullptr);
     for (const auto& [key, layout] : shared_pipeline_layouts)
-        if (layout) vkDestroyPipelineLayout(dev, layout, nullptr);
+        if (layout.handle && !layout.persistent)
+            vkDestroyPipelineLayout(dev, layout.handle, nullptr);
     for (const auto& [key, layout] : shared_descriptor_set_layouts)
         if (layout) vkDestroyDescriptorSetLayout(dev, layout, nullptr);
     for (const SharedTextureBinding& binding : shared_texture_bindings) {
@@ -3079,6 +3179,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
            evict_persistent_color_target(ctx, color_target_generation)) {}
     color_target_stats.cached_bytes = persistent_color_target_bytes();
     color_target_stats.cached_entries = persistent_color_target_cache().size();
+    resource_reuse_stats.persistent_pipeline_layout_entries =
+        persistent_pipeline_layouts.size();
     if (timing_enabled) {
         const auto timing_done = TimingClock::now();
         auto ms = [](auto begin, auto end) {

@@ -222,6 +222,29 @@ completed the fresh-save route at 1920x1080 and produced direct composited frame
 cost is the fence wait after every backend call; removing it requires deferred lifetime management for all
 call-local Vulkan resources and is intentionally outside this tranche.
 
+## Evergate persistent pipeline layouts (2026-07-19)
+
+Dense Evergate submits still recreated the same small set of pipeline layouts in each backend call. The
+backend now retains pipeline layouts by the complete ordered descriptor contract. Descriptor pools, sets,
+set layouts, contents, images, and buffers remain call-local; a cache hit changes only the immutable pipeline
+layout lifetime. The cache defaults to 256 entries and evicts the least-recently-used layout not referenced by
+the current call. `PROSPER_PIPELINE_LAYOUT_CACHE_ENTRIES=<N>` changes the bound and
+`PROSPER_NO_BACKEND_PIPELINE_LAYOUT_CACHE=1` restores call-local creation.
+
+A native-Windows A/B/A used one final binary, separate fresh saves, native scale/cadence, the documented
+route, and submit-aligned windows matched at 472-488 realized draws:
+
+| Mode | Draws | Pipeline-layout setup | Whole submit |
+|---|---:|---:|---:|
+| Cache-disabled control 1 | 474-488 | 1.78-1.82 ms | 254-265 ms |
+| Bounded cache | 472-484 | 0.23-0.37 ms | 199-214 ms |
+| Cache-disabled control 2 | 474-487 | 1.33-1.52 ms | 180-185 ms |
+
+The reversed control exposes substantial warm-state variance in the other timing buckets, so the whole-submit
+ranges are not an FPS claim. The isolated layout bucket consistently removes about 1.1-1.5 ms from a dense
+submit. This is a bounded CPU improvement; GPU fence waits and draw/resource realization remain the dominant
+Evergate costs.
+
 ## Dead Cells backend upload duplication (2026-07-15)
 
 Dead Cells exposed a second duplication layer after the frontend decode caches. The frontend correctly
