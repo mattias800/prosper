@@ -33,6 +33,7 @@ static void set_env(const char* name, const char* value) {
 int main() {
     printf("== test_multidraw_render ==\n");
     set_env("PROSPER_RENDER_TIMING", "1");
+    set_env("PROSPER_PIPELINE_LAYOUT_CACHE_ENTRIES", "2");
     const uint32_t W = 64, H = 64;
 
     // Known-good fullscreen-triangle vertex shader (SPIR-V), shared by both draws.
@@ -59,9 +60,16 @@ int main() {
     // EXP mrt0). Inline consts: 0xF2 = 1.0f, 0x80 = 0.0f.  RED = (1,0,0,1)  GREEN = (0,1,0,1).
     static const uint32_t kRedPs[]   = {0x7E0002F2u, 0x7E020280u, 0x7E040280u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u};
     static const uint32_t kGreenPs[] = {0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u};
+    static const uint32_t kQuarterRedPs[] = {
+        0x7E0002FFu, 0x3E800000u, 0x7E020280u, 0x7E040280u, 0x7E0602F2u,
+        0xF800180Fu, 0x03020100u, 0xBF810000u,
+    };
     std::vector<uint32_t> red   = recompile_fragment(kRedPs,   sizeof(kRedPs)   / 4, nullptr);
     std::vector<uint32_t> green = recompile_fragment(kGreenPs, sizeof(kGreenPs) / 4, nullptr);
-    CHECK(!vs.empty() && !red.empty() && !green.empty(), "fullscreen VS + red/green PS available");
+    std::vector<uint32_t> quarter_red = recompile_fragment(
+        kQuarterRedPs, sizeof(kQuarterRedPs) / 4, nullptr);
+    CHECK(!vs.empty() && !red.empty() && !green.empty() && !quarter_red.empty(),
+          "fullscreen VS + red/green/quarter-red PS available");
 
     ResolvedPipelineState opaque{};
     opaque.topology = 3 /*VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST*/; opaque.color_write_mask = 0xF;
@@ -82,6 +90,77 @@ int main() {
         CHECK(px.size() == (size_t)W * H * 4, "single-draw path rendered a frame");
         const uint8_t* c = center(px);
         if (c) CHECK(c[0] > 0xC0 && c[1] < 0x40 && c[2] < 0x40, "one opaque red draw -> RED center");
+    }
+
+    // #919: an explicitly programmed CB_COLOR_CONTROL.MODE=DISABLE reaches Vulkan as zero color
+    // write masks, while the same draw can still populate stencil for a later color pass.
+    {
+        RenderState raw{};
+        raw.prim_type = 4; // triangle list
+        raw.cb_target_mask = raw.cb_shader_mask = 0xFu;
+        raw.has_cb_color_control = true;
+        raw.cb_color_control = 0; // MODE=DISABLE
+        ResolvedPipelineState disabled = resolve_pipeline_state(raw);
+        CHECK(disabled.color_write_mask == 0,
+              "explicit CB MODE=DISABLE reaches Vulkan with color writes disabled");
+
+        ResolvedPipelineState writer = disabled;
+        writer.stencil_enable = true;
+        writer.stencil_compare_op[0] = writer.stencil_compare_op[1] = 7; // ALWAYS
+        writer.stencil_pass_op[0] = writer.stencil_pass_op[1] = 2;       // REPLACE
+        writer.stencil_op_val[0] = writer.stencil_op_val[1] = 2;
+        writer.stencil_write_mask[0] = writer.stencil_write_mask[1] = 0xff;
+
+        prosper::test::BackendDraw w; w.vs = vs; w.fs = red; w.ps = &writer; w.vcount = 3;
+        const std::vector<uint8_t> suppressed = prosper::test::render_draws_rgba({w}, W, H);
+        const uint8_t* sc = center(suppressed);
+        CHECK(sc && sc[2] > 0xC0 && sc[0] < 0x40 && sc[1] < 0x40,
+              "CB MODE=DISABLE red fragment preserves the blue color attachment");
+
+        ResolvedPipelineState reader = opaque;
+        reader.stencil_enable = true;
+        reader.stencil_compare_op[0] = reader.stencil_compare_op[1] = 2; // EQUAL
+        reader.stencil_ref[0] = reader.stencil_ref[1] = 2;
+        reader.stencil_compare_mask[0] = reader.stencil_compare_mask[1] = 0xff;
+        prosper::test::BackendDraw r; r.vs = vs; r.fs = green; r.ps = &reader; r.vcount = 3;
+        const std::vector<uint8_t> consumed = prosper::test::render_draws_rgba({w, r}, W, H);
+        const uint8_t* cc = center(consumed);
+        CHECK(cc && cc[1] > 0xC0 && cc[0] < 0x40 && cc[2] < 0x40,
+              "CB MODE=DISABLE draw still writes stencil consumed by a later color pass");
+    }
+
+    // Hardware instance count reaches both Vulkan submission paths. Additive quarter-red makes the
+    // number of identical instances directly observable: one instance contributes ~64 red, while
+    // three contribute ~192. The indexed sibling must produce the same pixels.
+    {
+        prosper::test::BackendDraw one;
+        one.vs = vs; one.fs = quarter_red; one.ps = &additive; one.vcount = 3;
+        prosper::test::BackendDraw zero = one; zero.instance_count = 0;
+        prosper::test::BackendDraw zero_indexed = zero; zero_indexed.indices = {0, 1, 2};
+        prosper::test::BackendDraw three = one; three.instance_count = 3;
+        prosper::test::BackendDraw three_indexed = three; three_indexed.indices = {0, 1, 2};
+        const std::vector<uint8_t> px_zero = prosper::test::render_draws_rgba({zero}, W, H);
+        const std::vector<uint8_t> px_zero_indexed =
+            prosper::test::render_draws_rgba({zero_indexed}, W, H);
+        const std::vector<uint8_t> px_one = prosper::test::render_draws_rgba({one}, W, H);
+        const std::vector<uint8_t> px_three = prosper::test::render_draws_rgba({three}, W, H);
+        const std::vector<uint8_t> px_three_indexed =
+            prosper::test::render_draws_rgba({three_indexed}, W, H);
+        const uint8_t* zero_center = center(px_zero);
+        const uint8_t* one_center = center(px_one);
+        const uint8_t* three_center = center(px_three);
+        CHECK(zero_center && zero_center[0] < 0x40 && zero_center[1] < 0x40 &&
+                  zero_center[2] > 0xC0,
+              "zero non-indexed instances leave the blue clear untouched");
+        CHECK(!px_zero.empty() && px_zero_indexed == px_zero,
+              "zero indexed instances are the same no-op");
+        CHECK(one_center && one_center[0] >= 48 && one_center[0] <= 80,
+              "one additive quarter-red instance contributes one layer");
+        CHECK(three_center && one_center && three_center[0] >= one_center[0] + 96 &&
+                  three_center[0] >= 160 && three_center[0] <= 224,
+              "three non-indexed instances contribute three additive layers");
+        CHECK(!px_three.empty() && px_three_indexed == px_three,
+              "indexed and non-indexed Vulkan draws consume the same instance count");
     }
 
     // Red opaque THEN green additive, in one submit -> yellow center (both composited into one target).
@@ -201,18 +280,32 @@ int main() {
         const std::vector<uint8_t> pooled_again = prosper::test::render_draws_rgba(
             {capacity_peer0, capacity_peer1}, W, H);
         const auto pool_after_second = prosper::test::render_host_buffer_pool_stats();
+        const auto layout_stats = prosper::test::backend_resource_reuse_stats();
         CHECK(pool_after_second.hits == pool_after_first.hits + 1 &&
                   pool_after_second.misses == pool_after_first.misses &&
                   pooled_again == shared,
               "next logical size reuses the mapped arena byte-identically");
+        CHECK(layout_stats.persistent_pipeline_layout_hits >= 1 &&
+                  layout_stats.persistent_pipeline_layout_entries >= 1,
+              "equal pipeline-layout contracts reuse the bounded cross-call cache");
 
+        set_env("PROSPER_NO_BACKEND_PIPELINE_LAYOUT_CACHE", "1");
+        const std::vector<uint8_t> uncached_layouts =
+            prosper::test::render_draws_rgba({d0, d1}, W, H);
+        const auto uncached_layout_stats = prosper::test::backend_resource_reuse_stats();
+        set_env("PROSPER_NO_BACKEND_PIPELINE_LAYOUT_CACHE", nullptr);
+        CHECK(uncached_layout_stats.persistent_pipeline_layout_hits == 0 &&
+                  uncached_layouts == shared,
+              "layout-cache disable switch restores byte-identical call-local layouts");
+
+        const auto pool_before_bypass = prosper::test::render_host_buffer_pool_stats();
         set_env("PROSPER_NO_BACKEND_BUFFER_POOL", "1");
         const std::vector<uint8_t> pool_bypassed =
             prosper::test::render_draws_rgba({d0, d1}, W, H);
         const auto pool_after_bypass = prosper::test::render_host_buffer_pool_stats();
         set_env("PROSPER_NO_BACKEND_BUFFER_POOL", nullptr);
-        CHECK(pool_after_bypass.hits == pool_after_second.hits &&
-                  pool_after_bypass.misses == pool_after_second.misses,
+        CHECK(pool_after_bypass.hits == pool_before_bypass.hits &&
+                  pool_after_bypass.misses == pool_before_bypass.misses,
               "buffer-pool disable switch restores transient Vulkan uploads");
         CHECK(pool_bypassed == shared,
               "pooled and forced-transient storage buffers render byte-identically");
@@ -237,6 +330,35 @@ int main() {
               "resource-share disable switch restores distinct per-draw immutable objects");
         CHECK(!shared.empty() && shared == unshared,
               "shared and unshared per-draw resources render byte-identically");
+
+        const std::vector<uint8_t> original_layout_output =
+            prosper::test::render_draws_rgba({d0}, W, H);
+        prosper::test::BackendDraw alternate_layout = d0;
+        alternate_layout.R[0].binding = 1;
+        const std::vector<uint8_t> alternate_output =
+            prosper::test::render_draws_rgba({alternate_layout}, W, H);
+        const auto bounded_layout_stats = prosper::test::backend_resource_reuse_stats();
+        CHECK(alternate_output == original_layout_output &&
+                  bounded_layout_stats.persistent_pipeline_layout_entries == 2 &&
+                  bounded_layout_stats.persistent_pipeline_layout_evictions >= 1,
+              "pipeline-layout cache evicts an older contract at its configured bound");
+
+        // Warm both bounded entries, then require three distinct contracts in one call. The third
+        // layout must remain call-local: evicting either of the first two would destroy an object
+        // already referenced by a pipeline recorded for this submission.
+        prosper::test::render_draws_rgba({d0}, W, H);
+        prosper::test::render_draws_rgba({alternate_layout}, W, H);
+        prosper::test::BackendDraw overflow_layout = d0;
+        overflow_layout.R[0].binding = 0;
+        const std::vector<uint8_t> protected_output = prosper::test::render_draws_rgba(
+            {d0, alternate_layout, overflow_layout}, W, H);
+        const auto protected_layout_stats = prosper::test::backend_resource_reuse_stats();
+        CHECK(protected_output == original_layout_output &&
+                  protected_layout_stats.persistent_pipeline_layout_hits >= 2 &&
+                  protected_layout_stats.persistent_pipeline_layout_misses >= 1 &&
+                  protected_layout_stats.persistent_pipeline_layout_entries == 2 &&
+                  protected_layout_stats.persistent_pipeline_layout_evictions == 0,
+              "pipeline-layout eviction preserves every contract used by the current call");
     }
 
     // #531: a guest scissor must constrain a color-disabled stencil writer. The following full-target

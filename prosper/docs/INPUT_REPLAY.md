@@ -1,20 +1,23 @@
 # Input replay & checkpoints — reaching a game state to reproduce a bug
 
-> **Status (2026-07-12): frame anchoring, route loading/recording, and the opt-in deterministic clock have landed.**
-> Current master supports inline `PROSPER_PAD_SCRIPT` entries anchored as `fN:`/`fA-B:` and
-> `PROSPER_DET_CLOCK=1` (fixed `1/PROSPER_DET_FPS`, default 60, per flip). Before the first flip the
+> **Status (2026-07-19): frame/pad-read anchoring, route loading/recording, and the opt-in deterministic clock have landed.**
+> Current master supports inline `PROSPER_PAD_SCRIPT` entries anchored as `fN:`/`fA-B:` (display
+> flips) or `pN:`/`pA-B:` (pad reads), alongside the existing seconds axis. Point entries use
+> `PROSPER_PAD_FRAME_HOLD` or `PROSPER_PAD_READ_HOLD` (both default 8) on their count axis. It also
+> supports `PROSPER_DET_CLOCK=1` (fixed `1/PROSPER_DET_FPS`, default 60, per flip). Before the first flip the
 > monotonic clock follows host time so initialization can progress; afterward it intentionally pauses
 > between flips. Realtime/RTC clocks remain tied to host time. `PROSPER_PAD_SCRIPT=@path` loads newline-
-> separated routes with comments, explicit time/flip ranges, and full-deflection stick directions such
+> separated routes with comments, explicit time/flip/read ranges, and full-deflection stick directions such
 > as `left-stick-left`. `PROSPER_PAD_RECORD=path` records the
 > final button stream on that same flip axis; `prosper-app --record path` exposes it interactively.
-> `PROSPER_PAD_SCRIPT_LOG=1` logs state transitions as the game observes them at pad polls.
+> `PROSPER_PAD_SCRIPT_LOG=1` logs state transitions with the elapsed time, flip, and pad-read index
+> as the game observes them.
 > `PROSPER_PAD_SCRIPT_RELOAD=1` live-reloads an `@file` route after a changed file remains
-> stable across two metadata polls. Existing time and flip anchors are preserved, so an agent can
+> stable across two metadata polls. Existing time, flip, and read anchors are preserved, so an agent can
 > append future input windows during a long exploratory run without restarting the title.
 > The first checked-in route, `scripts/messenger/reach-intro-story.pad`, repeatedly reaches the opening
-> story but still has small narration-phase drift. Deeper routes and a precise pad-read screenshot
-> checkpoint axis remain open in #302. The original design follows.
+> story but still has small narration-phase drift. Capturing directly onto the pad-read axis and
+> semantic checkpoint validation remain open in #302. The original design follows.
 
 ## The problem
 
@@ -36,26 +39,37 @@ We already have the seed: **`PROSPER_PAD_SCRIPT` (#202)** — a scripted `PadBac
 
 ## What exists today (`PROSPER_PAD_SCRIPT`, #202)
 
-- Format: `;`-separated `<seconds>:<action>[+action…]`, e.g. `3:start;9:cross;16:left-stick-left+cross`.
+- Format: `;`- or newline-separated `<anchor>:<action>[+action…]`, where an anchor is seconds,
+  `fN`/`fA-B` display flips, or `pN`/`pA-B` pad reads. For example:
+  `3:start;f300-340:cross;p1200-1240:left-stick-left+cross`.
 - Actions are button names or full-deflection `left-stick-{left,right,up,down}` and
-  `right-stick-{left,right,up,down}` directions. Each entry holds its actions for
-  `PROSPER_PAD_HOLD` ms (default 300) starting at `<seconds>`.
-- **Anchored to the first pad poll** (t=0 = "the game first read the controller" ≈ menu appeared) — robust to asset-load time.
+  `right-stick-{left,right,up,down}` directions. Seconds points use `PROSPER_PAD_HOLD` ms
+  (default 300); flip/read points use their count-axis holds above. Explicit ranges always use their
+  exclusive end.
+- **Anchored at the established origins**: seconds and flips retain their existing first-pad-poll
+  origin. Pad reads number successful `scePadRead`/`scePadReadState` calls from zero; controller-
+  information queries and rejected reads do not advance the pad-read axis.
 - Pad reports CONNECTED whenever a script is set. Parse + time-eval are pure and unit-tested in `pad.cpp`.
 - Explicit wall-clock ranges are sampled only when the game polls the pad. A short range can fall
   entirely between polls under slow synchronous rendering. Use longer holds with neutral gaps,
-  prefer flip-anchored ranges when the title keeps presenting, and enable
+  prefer flip-anchored ranges when the title keeps presenting, or pad-read ranges when presentation
+  pauses but the game continues polling. Enable
   `PROSPER_PAD_SCRIPT_LOG=1` to verify delivery rather than inferring it from the route text.
 - For exploratory `@file` routes, set `PROSPER_PAD_SCRIPT_RELOAD=1`. A changed route is debounced
   for 250 ms and replaces the active route only after a complete stable read; read/stat failures
-  retain the last valid route. Reload does not reset the first-poll wall-clock or flip origin.
+  retain the last valid route. Reload does not reset the first-poll wall-clock, flip, or read origin.
 
-Good bones. Two gaps for reaching deep states reliably: the clock is **wall-time**, and scripts are an env string (fine for a few presses, not for a long route).
+The remaining work is deeper route calibration, pad-read-axis recording, and semantic checkpoint
+validation that does not depend on presentation speed.
 
 ## Design
 
-### 1. Frame-anchored, file-loadable scripts (core) - implemented
+### 1. Frame/pad-read-anchored, file-loadable scripts (core) - implemented
 - **Anchor to game frames, not wall-time.** Keep the "first pad poll" origin (robust to load time), but measure progress in **flips since first poll** (game logic frames), not elapsed seconds. The Messenger is a fixed-timestep platformer, so wall-time drifts vs game frames on slow llvmpipe vs a fast GPU — frame anchoring makes `f300:cross` reproduce everywhere. Add an `f<frame>:` entry syntax alongside the existing `<seconds>:` (kept for back-compat).
+- **Anchor to pad reads when presentation is not the clock.** `p1200-1240:cross` holds Cross for
+  successful guest input-state reads 1200 through 1239. This axis advances when synchronous rendering pauses
+  display flips and cannot miss between polls like a short wall-time range. The transition log prints
+  the live read index so routes can be calibrated without a code change.
 - **Load from a file.** `PROSPER_PAD_SCRIPT=@path` reads a multi-line script file, so long routes live in the repo, not an env string.
 - **Richer input.** Explicit ranges and full-deflection analog stick directions are implemented;
   proportional axis values remain future work.

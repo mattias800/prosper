@@ -50,6 +50,9 @@ $env:PROSPER_SAVEDATA_DIR = "$PWD/savedata"
 `-force-gfx-direct` is the current Unity default. For a title that must not receive it, launch with
 `-GuestArgs ''`.
 
+Presentation defaults to FIFO vsync. Pass `-PresentMode mailbox` for low-latency vsync or
+`-PresentMode immediate` to permit tearing; either optional mode falls back to FIFO when unsupported.
+
 ## Input and exit
 
 SDL3 automatically uses a connected controller as pad 0. Keyboard input is composed over it:
@@ -64,9 +67,11 @@ SDL3 automatically uses a connected controller as pad 0. Keyboard input is compo
 | U / O | L1 / R1 |
 | Y / H | L2 / R2 |
 | Enter | Options |
+| F11 or Alt+Enter | Toggle host-window fullscreen |
 | Escape | Exit |
 
-Closing the window also exits. Shutdown currently terminates the process after flushing logs because
+Alt+Enter is consumed by the host window and is not forwarded as the guest Options button. Closing
+the window also exits. Shutdown currently terminates the process after flushing logs because
 cooperative guest-thread teardown is not implemented yet.
 
 ## Smoke test and recordings

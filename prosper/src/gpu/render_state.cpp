@@ -4,8 +4,10 @@
 #include "vk_translate.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
+#include <mutex>
 
 namespace prosper::gpu {
 
@@ -43,6 +45,21 @@ int32_t scale_scissor_boundary(int32_t value, float scale, bool lower) {
     return static_cast<int32_t>(std::clamp(
         rounded, static_cast<double>(std::numeric_limits<int32_t>::min()),
         static_cast<double>(std::numeric_limits<int32_t>::max())));
+}
+
+void warn_unsupported_cb_color_mode(uint32_t mode) {
+    static std::mutex mutex;
+    static uint32_t seen_modes = 0;
+    bool first = false;
+    {
+        std::lock_guard lock(mutex);
+        const uint32_t bit = 1u << (mode & P::CB_COLOR_CONTROL_MODE_MASK);
+        first = (seen_modes & bit) == 0;
+        seen_modes |= bit;
+    }
+    if (first)
+        fprintf(stderr, "[gpu] resolve_pipeline_state: unsupported CB_COLOR_CONTROL.MODE=%u "
+                        "-> ordinary draw fallback\n", mode);
 }
 
 // sRGB (gamma-encoded) 8-bit sample -> linear [0,1]. VkClearColorValue's float channels are LINEAR
@@ -192,6 +209,7 @@ RenderState extract_render_state(const GpuState& st) {
     rs.alpha_src_blend = PM4_FIELD(bc, CB_BLEND0_CONTROL, ALPHA_SRCBLEND);
     rs.alpha_dst_blend = PM4_FIELD(bc, CB_BLEND0_CONTROL, ALPHA_DESTBLEND);
     rs.alpha_comb_fcn  = PM4_FIELD(bc, CB_BLEND0_CONTROL, ALPHA_COMB_FCN);
+    rs.disable_rop3    = PM4_FIELD(bc, CB_BLEND0_CONTROL, DISABLE_ROP3) != 0;
 
     const uint32_t bc1 = rd(st.cx, P::CB_BLEND1_CONTROL);
     rs.blend1_enable = PM4_FIELD(bc1, CB_BLEND0_CONTROL, ENABLE) != 0;
@@ -202,6 +220,7 @@ RenderState extract_render_state(const GpuState& st) {
     rs.alpha1_src_blend = PM4_FIELD(bc1, CB_BLEND0_CONTROL, ALPHA_SRCBLEND);
     rs.alpha1_dst_blend = PM4_FIELD(bc1, CB_BLEND0_CONTROL, ALPHA_DESTBLEND);
     rs.alpha1_comb_fcn = PM4_FIELD(bc1, CB_BLEND0_CONTROL, ALPHA_COMB_FCN);
+    rs.disable_rop3_1 = PM4_FIELD(bc1, CB_BLEND0_CONTROL, DISABLE_ROP3) != 0;
 
     // Faithful raw state registers.
     rs.db_depth_control  = dc;
@@ -211,6 +230,7 @@ RenderState extract_render_state(const GpuState& st) {
     rs.db_stencil_control   = st.cx.count(P::DB_STENCIL_CONTROL)   ? rd(st.cx, P::DB_STENCIL_CONTROL)   : 0u;
     rs.db_stencilrefmask    = st.cx.count(P::DB_STENCILREFMASK)    ? rd(st.cx, P::DB_STENCILREFMASK)    : 0u;
     rs.db_stencilrefmask_bf = st.cx.count(P::DB_STENCILREFMASK_BF) ? rd(st.cx, P::DB_STENCILREFMASK_BF) : 0u;
+    rs.has_cb_color_control = st.cx.count(P::CB_COLOR_CONTROL) != 0;
     rs.cb_color_control  = rd(st.cx, P::CB_COLOR_CONTROL);
     rs.cb_blend0_control = bc;
     // CB_TARGET_MASK (per-MRT color write mask). The AGC driver defaults it to write-all when the game
@@ -428,17 +448,17 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
         }
     }
 
-    ps.blend_enable            = rs.blend_enable;
-    ps.src_color_blend_factor  = vk_blend_factor(rs.color_src_blend);
-    ps.dst_color_blend_factor  = vk_blend_factor(rs.color_dst_blend);
-    ps.color_blend_op          = vk_blend_op(rs.color_comb_fcn);
+    ps.blend_enable = rs.blend_enable;
+    vk_blend_factors(rs.color_src_blend, rs.color_dst_blend,
+                     ps.src_color_blend_factor, ps.dst_color_blend_factor);
+    ps.color_blend_op = vk_blend_op(rs.color_comb_fcn);
     // Alpha blend factors/op (#381): use the separate ALPHA_* fields when SEPARATE_ALPHA_BLEND is set,
     // else mirror the color factors (RDNA2 behavior — Kyty GraphicsRender). The backend reads these
     // directly, so it no longer has to reuse the color factors for the alpha channel (which corrupted
     // stored dst-alpha on any target later read back — RTT composites, alpha-test/text layers).
     if (rs.separate_alpha_blend) {
-        ps.src_alpha_blend_factor = vk_blend_factor(rs.alpha_src_blend);
-        ps.dst_alpha_blend_factor = vk_blend_factor(rs.alpha_dst_blend);
+        vk_blend_factors(rs.alpha_src_blend, rs.alpha_dst_blend,
+                         ps.src_alpha_blend_factor, ps.dst_alpha_blend_factor);
         ps.alpha_blend_op         = vk_blend_op(rs.alpha_comb_fcn);
     } else {
         ps.src_alpha_blend_factor = ps.src_color_blend_factor;
@@ -447,12 +467,12 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     }
 
     ps.blend1_enable = rs.blend1_enable;
-    ps.src_color_blend_factor1 = vk_blend_factor(rs.color1_src_blend);
-    ps.dst_color_blend_factor1 = vk_blend_factor(rs.color1_dst_blend);
+    vk_blend_factors(rs.color1_src_blend, rs.color1_dst_blend,
+                     ps.src_color_blend_factor1, ps.dst_color_blend_factor1);
     ps.color_blend_op1 = vk_blend_op(rs.color1_comb_fcn);
     if (rs.separate_alpha_blend1) {
-        ps.src_alpha_blend_factor1 = vk_blend_factor(rs.alpha1_src_blend);
-        ps.dst_alpha_blend_factor1 = vk_blend_factor(rs.alpha1_dst_blend);
+        vk_blend_factors(rs.alpha1_src_blend, rs.alpha1_dst_blend,
+                         ps.src_alpha_blend_factor1, ps.dst_alpha_blend_factor1);
         ps.alpha_blend_op1 = vk_blend_op(rs.alpha1_comb_fcn);
     } else {
         ps.src_alpha_blend_factor1 = ps.src_color_blend_factor1;
@@ -465,6 +485,48 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     const uint32_t effective_color_mask = rs.cb_target_mask & rs.cb_shader_mask;
     ps.color_write_mask = effective_color_mask & 0xFu;
     ps.color1_write_mask = (effective_color_mask >> 4) & 0xFu;
+
+    // MODE=DISABLE suppresses color-buffer writes, not the whole draw: depth/stencil tests and
+    // updates still execute. An absent CB_COLOR_CONTROL retains the legacy normal-draw behavior;
+    // otherwise a zero-initialized synthetic RenderState would unexpectedly lose every color draw.
+    // DCC_DECOMPRESS is handled by the AGC helper-program path in gpu_execute.hpp. Other hardware
+    // metadata modes remain ordinary draws for compatibility, but are now visible instead of silent.
+    const uint32_t cb_mode = PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, MODE);
+    if (rs.has_cb_color_control) {
+        if (cb_mode == P::CB_COLOR_CONTROL_MODE_DISABLE) {
+            ps.color_write_mask = 0;
+            ps.color1_write_mask = 0;
+        } else if (cb_mode != P::CB_COLOR_CONTROL_MODE_NORMAL &&
+                   cb_mode != P::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS) {
+            warn_unsupported_cb_color_mode(cb_mode);
+        }
+    }
+
+    // CB_COLOR_CONTROL.ROP3 is AMD's global raster operation. Vulkan exposes the same 16
+    // source/destination Boolean functions as VkLogicOp. COPY stays disabled here: enabling Vulkan
+    // COPY would suppress ordinary blending, while disabled COPY preserves the hardware's normal
+    // blend-then-copy path. CB_BLENDn_CONTROL.DISABLE_ROP3 can opt an attachment out; Vulkan's logic
+    // op is global, so a mixed two-target enable cannot be represented and falls back visibly to COPY.
+    const uint32_t rop3 = PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, ROP3);
+    uint32_t logic_op = 3;
+    if (cb_mode == P::CB_COLOR_CONTROL_MODE_NORMAL && vk_logic_op(rop3, logic_op) && logic_op != 3u) {
+        const bool target0_active = ps.color_write_mask != 0;
+        const bool target1_active = ps.color1_format != 0 && ps.color1_write_mask != 0;
+        const bool any_target_uses_rop3 = (target0_active && !rs.disable_rop3) ||
+                                           (target1_active && !rs.disable_rop3_1);
+        const bool every_target_uses_rop3 = (!target0_active || !rs.disable_rop3) &&
+                                             (!target1_active || !rs.disable_rop3_1);
+        if (any_target_uses_rop3 && every_target_uses_rop3) {
+            ps.logic_op_enable = true;
+            ps.logic_op = logic_op;
+        } else if (any_target_uses_rop3) {
+            static std::once_flag logged;
+            std::call_once(logged, [] {
+                fprintf(stderr, "[gpu] resolve_pipeline_state: per-target DISABLE_ROP3 cannot be "
+                                "represented by Vulkan -> COPY fallback\n");
+            });
+        }
+    }
 
     // Viewport: hardware maps screen = offset + scale * ndc; Vulkan maps px = (x + w/2) + ndc * (w/2).
     // Equating the two: x = xoffset - xscale, w = 2*xscale (same for y). A guest with GNM's +Y-up NDC

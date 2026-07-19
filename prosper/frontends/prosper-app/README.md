@@ -37,6 +37,9 @@ It reuses `prosper/build-mingw-app` on later runs. Use `-NoBuild` to skip the co
 CMake, Ninja, and MinGW-w64 UCRT are required; the launcher discovers the standard winget WinLibs
 installation automatically.
 
+Pass `-PresentMode mailbox` (low-latency vsync) or `-PresentMode immediate` (tearing permitted) to
+the Windows launcher when the driver supports it. The default is FIFO.
+
 WSLg remains an alternate way to run the Linux build, but it is no longer the primary Windows path.
 Prebuilt Windows archives include `start-prosper.ps1`; see `prosper/docs/WINDOWS_RELEASE.md` for the
 no-UI launch command, save-data selection, keyboard map, and runtime requirements.
@@ -52,13 +55,15 @@ PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
 ./build-app/prosper-app --test-pattern
 ```
 
-Esc or closing the window quits.
+F11 or Alt+Enter toggles borderless desktop fullscreen. Esc or closing the window quits.
 
 ## Options
 
 - `--dump <app0>` — boot and display the PS5 title at this app0 directory (positional path also works).
 - `--test-pattern` — feed a synthetic animated frame through the real present path (no guest).
 - `--frames N` — present N frames then exit 0 (non-interactive smoke; exit 1 if it couldn't).
+- `--present-mode fifo|mailbox|immediate` — choose swapchain latency behavior. FIFO is the default;
+  mailbox is low-latency vsync, and immediate may tear. Unsupported optional modes fall back to FIFO.
 - `--record PATH` — record the final controller stream to a replayable `PROSPER_PAD_SCRIPT` route.
   Missing parent directories are created; release the last held button before stopping so its interval
   is closed and flushed.

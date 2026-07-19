@@ -110,18 +110,24 @@ struct RenderState {
     uint32_t alpha_src_blend  = 0;    // ALPHA_SRCBLEND  (@16)
     uint32_t alpha_dst_blend  = 0;    // ALPHA_DESTBLEND (@24)
     uint32_t alpha_comb_fcn   = 0;    // ALPHA_COMB_FCN  (@21)
+    bool     disable_rop3     = false; // DISABLE_ROP3    (@31)
 
     // MRT1 blend state has the same register layout as CB_BLEND0_CONTROL.
     bool     blend1_enable = false;
     uint32_t color1_src_blend = 0, color1_dst_blend = 0, color1_comb_fcn = 0;
     bool     separate_alpha_blend1 = false;
     uint32_t alpha1_src_blend = 0, alpha1_dst_blend = 0, alpha1_comb_fcn = 0;
+    bool     disable_rop3_1 = false;
 
     // Raw state registers — remaining bit layouts decoded by the Vulkan backend later (kept faithful).
     uint32_t db_depth_control  = 0;   // DB_DEPTH_CONTROL
     uint32_t db_stencil_control   = 0;   // DB_STENCIL_CONTROL   (front/back stencil-fail / z-pass / z-fail ops)
     uint32_t db_stencilrefmask    = 0;   // DB_STENCILREFMASK    (front ref / compare-mask / write-mask)
     uint32_t db_stencilrefmask_bf = 0;   // DB_STENCILREFMASK_BF (back-face ref / compare-mask / write-mask)
+    // MODE=0 means DISABLE when the register was explicitly programmed, but zero is also the
+    // historical value of an absent register in synthetic/legacy streams. Retain presence so the
+    // resolver can honor a real disable without turning old direct RenderState users into no-ops.
+    bool     has_cb_color_control = false;
     uint32_t cb_color_control  = 0;   // CB_COLOR_CONTROL
     uint32_t cb_blend0_control = 0;   // CB_BLEND0_CONTROL
     uint32_t cb_target_mask    = 0;   // CB_TARGET_MASK (per-MRT write mask)
@@ -248,6 +254,11 @@ struct ResolvedPipelineState {
     // aggregate initializers retain their existing layout/default behavior.
     bool has_scissor = false;
     int32_t scissor_left = 0, scissor_top = 0, scissor_right = 0, scissor_bottom = 0;
+
+    // Global framebuffer logic operation. COPY is represented by logic_op_enable=false so ordinary
+    // blending remains active; logic_op values are the VkLogicOp enumerants.
+    bool logic_op_enable = false;
+    uint32_t logic_op = 3; // VK_LOGIC_OP_COPY
 };
 
 // A color-disabled draw must still execute when it can change the depth/stencil attachment consumed

@@ -1,0 +1,16 @@
+# Evergate (PPSA01885): full-render route through the title menu and first save slot.
+# Pad-read anchoring preserves every Cross/neutral edge when synchronous rendering makes wall time
+# advance between guest polls. Keep this route for native-resolution interactive/performance runs;
+# the accelerated screenshot route must remain wall-time anchored because it skips render submits.
+p16-21:cross
+p31-40:cross
+p51-56:cross
+p64-69:cross
+p77-82:cross
+p89-96:cross
+p103-108:cross
+p117-125:cross
+p134-140:cross
+p144-148:cross
+p156-162:cross
+p173-178:cross

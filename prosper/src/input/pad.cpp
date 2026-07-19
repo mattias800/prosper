@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cmath>
 #include <fstream>
+#include <limits>
 #include <sstream>
 
 namespace prosper::input {
@@ -165,9 +166,10 @@ std::vector<PadScriptEntry> parse_pad_script(const std::string& spec) {
         size_t colon = tok.find(':');
         if (colon == std::string::npos) continue;
         std::string head = trim(tok.substr(0, colon));
-        // A leading 'f' marks a FRAME-anchored entry ("f300:cross" -> flip 300); else it's seconds.
+        // Leading 'f' and 'p' select flips and pad reads since the first poll; else it's seconds.
         bool frame_anchored = (!head.empty() && (head[0] == 'f' || head[0] == 'F'));
-        std::string window = frame_anchored ? head.substr(1) : head;
+        bool read_anchored = (!head.empty() && (head[0] == 'p' || head[0] == 'P'));
+        std::string window = (frame_anchored || read_anchored) ? head.substr(1) : head;
         size_t dash = window.find('-', 1);
         auto parse_number = [](const std::string& text, double& out) {
             char* end = nullptr;
@@ -176,10 +178,29 @@ std::vector<PadScriptEntry> parse_pad_script(const std::string& spec) {
             out = value;
             return true;
         };
+        auto parse_count = [](const std::string& text, double& out) {
+            // Validate the decimal spelling before converting to double. Near 2^53, strtod can
+            // otherwise round a fractional token to an integer and make it look like a valid count.
+            constexpr uint64_t kMaxExactInteger = 9007199254740991ULL;  // 2^53 - 1
+            if (text.empty()) return false;
+            uint64_t value = 0;
+            for (const char ch : text) {
+                if (ch < '0' || ch > '9') return false;
+                const uint64_t digit = static_cast<uint64_t>(ch - '0');
+                if (value > (kMaxExactInteger - digit) / 10) return false;
+                value = value * 10 + digit;
+            }
+            out = static_cast<double>(value);
+            return true;
+        };
+        const bool count_anchored = frame_anchored || read_anchored;
+        const auto parse_anchor = [&](const std::string& text, double& out) {
+            return count_anchored ? parse_count(text, out) : parse_number(text, out);
+        };
         double start = 0.0, end = 0.0;
-        if (!parse_number(trim(window.substr(0, dash)), start)) continue;
+        if (!parse_anchor(trim(window.substr(0, dash)), start)) continue;
         if (dash != std::string::npos) {
-            if (!parse_number(trim(window.substr(dash + 1)), end) || end <= start) continue;
+            if (!parse_anchor(trim(window.substr(dash + 1)), end) || end <= start) continue;
         }
         std::string btns = tok.substr(colon + 1);
         uint32_t mask = 0;
@@ -202,7 +223,7 @@ std::vector<PadScriptEntry> parse_pad_script(const std::string& spec) {
         }
         auto direction = [](int value) -> int8_t { return value < 0 ? -1 : value > 0 ? 1 : 0; };
         if (mask || axis_mask) {
-            PadScriptEntry entry{start, mask, frame_anchored, end};
+            PadScriptEntry entry{start, mask, frame_anchored, read_anchored, end};
             entry.left_x = direction(left_x); entry.left_y = direction(left_y);
             entry.right_x = direction(right_x); entry.right_y = direction(right_y);
             entry.axis_mask = axis_mask;
@@ -231,15 +252,29 @@ std::vector<PadScriptEntry> load_pad_script(const std::string& source, std::stri
 }
 
 PadScriptState pad_script_state_at(const std::vector<PadScriptEntry>& script, double elapsed_secs,
-                                   double hold_secs, int64_t frame_count, int64_t frame_hold) {
+                                   double hold_secs, int64_t frame_count, int64_t frame_hold,
+                                   int64_t read_count, int64_t read_hold) {
     PadScriptState state;
     int left_x = 0, left_y = 0, right_x = 0, right_y = 0;
+    const auto count_active = [](const PadScriptEntry& entry, int64_t count, int64_t hold) {
+        if (count < 0 || hold <= 0) return false;
+        const int64_t start = static_cast<int64_t>(entry.t_secs);
+        int64_t end = 0;
+        if (entry.end > entry.t_secs) {
+            end = static_cast<int64_t>(entry.end);
+        } else if (start > std::numeric_limits<int64_t>::max() - hold) {
+            end = std::numeric_limits<int64_t>::max();
+        } else {
+            end = start + hold;
+        }
+        return count >= start && count < end;
+    };
     for (const auto& e : script) {
         bool active = false;
-        if (e.frame_anchored) {
-            int64_t f = (int64_t)e.t_secs;   // frame number lives in t_secs for frame-anchored entries
-            int64_t end = e.end > e.t_secs ? (int64_t)e.end : f + frame_hold;
-            active = frame_count >= 0 && frame_count >= f && frame_count < end;
+        if (e.read_anchored) {
+            active = count_active(e, read_count, read_hold);
+        } else if (e.frame_anchored) {
+            active = count_active(e, frame_count, frame_hold);
         } else {
             double end = e.end > e.t_secs ? e.end : e.t_secs + hold_secs;
             active = elapsed_secs >= e.t_secs && elapsed_secs < end;
@@ -268,8 +303,10 @@ void pad_apply_script_state(HostPadState& target, const PadScriptState& scripted
 }
 
 uint32_t pad_script_buttons_at(const std::vector<PadScriptEntry>& script, double elapsed_secs, double hold_secs,
-                               int64_t frame_count, int64_t frame_hold) {
-    return pad_script_state_at(script, elapsed_secs, hold_secs, frame_count, frame_hold).button_mask;
+                               int64_t frame_count, int64_t frame_hold,
+                               int64_t read_count, int64_t read_hold) {
+    return pad_script_state_at(script, elapsed_secs, hold_secs, frame_count, frame_hold,
+                               read_count, read_hold).button_mask;
 }
 
 } // namespace prosper::input

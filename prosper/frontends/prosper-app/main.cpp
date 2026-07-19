@@ -20,6 +20,8 @@
 #include "loader/linker.hpp"           // Program
 #include "input/pad.hpp"               // keyboard -> libScePad (HostPadState / PadBackend)
 #include "pad_overlay.hpp"              // keyboard pad 0 composed over the physical controller backend
+#include "present_mode.hpp"             // explicit swapchain latency/vsync policy, pure regression seam
+#include "window_controls.hpp"           // debounced app-window shortcuts, pure regression seam
 #ifdef PROSPER_HAVE_LIVE_RENDERER
 #include "live_renderer.hpp"           // shared DrawItem->Vulkan compositor (register_live_renderer)
 #endif
@@ -176,7 +178,8 @@ bool pick_device(Vk& vk) {
     return true;
 }
 
-bool create_swapchain(Vk& vk, uint32_t w, uint32_t h) {
+bool create_swapchain(Vk& vk, uint32_t w, uint32_t h,
+                      prosper::frontend::AppPresentMode requestedPresentMode) {
     VkSurfaceCapabilitiesKHR caps; vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk.phys, vk.surface, &caps);
     vk.scExtent = caps.currentExtent.width != UINT32_MAX ? caps.currentExtent : VkExtent2D{w, h};
     if (vk.scExtent.width == 0 || vk.scExtent.height == 0) return false;   // minimized
@@ -188,6 +191,29 @@ bool create_swapchain(Vk& vk, uint32_t w, uint32_t h) {
 
     uint32_t imgCount = caps.minImageCount + 1;
     if (caps.maxImageCount && imgCount > caps.maxImageCount) imgCount = caps.maxImageCount;
+
+    uint32_t modeN = 0;
+    VKCHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(vk.phys, vk.surface, &modeN, nullptr),
+            "vkGetPhysicalDeviceSurfacePresentModesKHR(count)");
+    std::vector<VkPresentModeKHR> modes(modeN);
+    VKCHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(vk.phys, vk.surface, &modeN, modes.data()),
+            "vkGetPhysicalDeviceSurfacePresentModesKHR(list)");
+    const bool hasMailbox = std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_MAILBOX_KHR) != modes.end();
+    const bool hasImmediate = std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_IMMEDIATE_KHR) != modes.end();
+    const auto selectedPresentMode = prosper::frontend::select_present_mode(
+        requestedPresentMode, hasMailbox, hasImmediate);
+    VkPresentModeKHR vkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+    if (selectedPresentMode.mode == prosper::frontend::AppPresentMode::mailbox)
+        vkPresentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+    else if (selectedPresentMode.mode == prosper::frontend::AppPresentMode::immediate)
+        vkPresentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    if (selectedPresentMode.fell_back) {
+        fprintf(stderr, "[app] requested present mode %s is unsupported; falling back to fifo\n",
+                prosper::frontend::present_mode_name(requestedPresentMode));
+    }
+    fprintf(stderr, "[app] present mode: %s\n",
+            prosper::frontend::present_mode_name(selectedPresentMode.mode));
+
     VkSwapchainCreateInfoKHR si{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     si.surface = vk.surface; si.minImageCount = imgCount; si.imageFormat = vk.scFormat;
     si.imageColorSpace = cs; si.imageExtent = vk.scExtent; si.imageArrayLayers = 1;
@@ -195,7 +221,7 @@ bool create_swapchain(Vk& vk, uint32_t w, uint32_t h) {
     si.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     si.preTransform = caps.currentTransform;
     si.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    si.presentMode = VK_PRESENT_MODE_FIFO_KHR;   // vsync
+    si.presentMode = vkPresentMode;
     si.clipped = VK_TRUE;
     VKCHECK(vkCreateSwapchainKHR(vk.device, &si, nullptr, &vk.swapchain), "vkCreateSwapchainKHR");
     uint32_t n = 0; vkGetSwapchainImagesKHR(vk.device, vk.swapchain, &n, nullptr);
@@ -317,10 +343,9 @@ void feed_test_pattern(uint32_t w, uint32_t h, uint64_t frame) {
 prosper::frontend::KeyboardPadOverlay g_keyboard_pad;
 
 // Snapshot the current keyboard into the overlay. Call from the thread that pumps SDL events.
-void poll_keyboard() {
+void poll_keyboard(const bool* keyboard, bool enter_maps_to_options) {
     using namespace prosper::input;
-    const bool* k = SDL_GetKeyboardState(nullptr);
-    auto d = [&](SDL_Scancode s){ return k[s]; };
+    auto d = [&](SDL_Scancode s){ return keyboard[s]; };
     bool up    = d(SDL_SCANCODE_UP)   || d(SDL_SCANCODE_W);
     bool down  = d(SDL_SCANCODE_DOWN) || d(SDL_SCANCODE_S);
     bool left  = d(SDL_SCANCODE_LEFT) || d(SDL_SCANCODE_A);
@@ -338,7 +363,10 @@ void poll_keyboard() {
     if (d(SDL_SCANCODE_O))     b |= SCE_PAD_BUTTON_R1;
     if (d(SDL_SCANCODE_Y))     b |= SCE_PAD_BUTTON_L2;
     if (d(SDL_SCANCODE_H))     b |= SCE_PAD_BUTTON_R2;
-    if (d(SDL_SCANCODE_RETURN) || d(SDL_SCANCODE_RETURN2)) b |= SCE_PAD_BUTTON_OPTIONS;   // menu/start
+    const bool enter_down = d(SDL_SCANCODE_RETURN) || d(SDL_SCANCODE_RETURN2) ||
+                            d(SDL_SCANCODE_KP_ENTER);
+    if (enter_down && enter_maps_to_options)
+        b |= SCE_PAD_BUTTON_OPTIONS;   // menu/start; Alt+Enter belongs to the host window
     HostPadState st;
     st.buttons = b;
     st.left_x  = left ? 0x00 : (right ? 0xff : 0x80);   // also drive the left stick, for stick-only titles
@@ -353,12 +381,20 @@ void poll_keyboard() {
 
 int main(int argc, char** argv) {
     bool testPattern = false; int exitAfter = 0; uint32_t winW = 1280, winH = 720;
+    prosper::frontend::AppPresentMode requestedPresentMode = prosper::frontend::AppPresentMode::fifo;
     std::string dump;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--test-pattern") testPattern = true;
         else if (a == "--frames" && i + 1 < argc) exitAfter = atoi(argv[++i]);   // present N frames then exit (CI/smoke)
         else if (a == "--dump" && i + 1 < argc) dump = argv[++i];                // boot the game at this app0 dir
+        else if (a == "--present-mode") {
+            if (i + 1 >= argc ||
+                !prosper::frontend::parse_present_mode(argv[++i], requestedPresentMode)) {
+                fprintf(stderr, "prosper-app: --present-mode requires fifo, mailbox, or immediate\n");
+                return 2;
+            }
+        }
         else if (a == "--record" && i + 1 < argc) {
             if (!set_environment("PROSPER_PAD_RECORD", argv[++i])) {
                 fprintf(stderr, "prosper-app: failed to set PROSPER_PAD_RECORD\n");
@@ -483,7 +519,7 @@ int main(int argc, char** argv) {
     if (!create_instance(vk, win) || !pick_device(vk)) return 1;
     // Initial swapchain sized to the window; recreated on resize / out-of-date.
     { int dw = 0, dh = 0; SDL_GetWindowSizeInPixels(win, &dw, &dh);
-      if (!create_swapchain(vk, (uint32_t)dw, (uint32_t)dh)) return 1; }
+      if (!create_swapchain(vk, (uint32_t)dw, (uint32_t)dh, requestedPresentMode)) return 1; }
 
     VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; cpi.queueFamilyIndex = vk.qfamily;
@@ -503,7 +539,8 @@ int main(int argc, char** argv) {
     // Keyboard controls augment SDL pad 0; the fallback keeps physical pads and their analog state.
     prosper::input::pad_set_backend(&g_keyboard_pad);
     fprintf(stderr, "[app] keyboard: WASD/Arrows=move  J/Space=Cross(jump)  K=Square(attack)  L=Circle  "
-                    "I=Triangle  U/O=L1/R1  Y/H=L2/R2  Enter=Options  Esc=quit\n");
+                    "I=Triangle  U/O=L1/R1  Y/H=L2/R2  Enter=Options  "
+                    "F11/Alt+Enter=fullscreen  Esc=quit\n");
 
     const bool frameTrace = getenv("PROSPER_APP_FRAME_TRACE") != nullptr;
     const char* stallDumpEnv = getenv("PROSPER_APP_STALL_DUMP_MS");
@@ -524,17 +561,95 @@ int main(int argc, char** argv) {
     unsigned timedDumpCount = 0;
     bool timedDumpPending = timedDumpMs > 0;
     bool running = true;
+    bool swapchainDirty = false;
+    const SDL_WindowID appWindowId = SDL_GetWindowID(win);
+    prosper::frontend::AppWindowControls windowControls;
+    const SDL_WindowFlags initialWindowFlags = SDL_GetWindowFlags(win);
+    bool fullscreenRequested = (initialWindowFlags & SDL_WINDOW_FULLSCREEN) != 0;
+    windowControls.set_app_focus((initialWindowFlags & SDL_WINDOW_INPUT_FOCUS) != 0);
     while (running && !prosper_stop_requested()) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_EVENT_QUIT) running = false;
-            else if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE) running = false;
+            else if (ev.type == SDL_EVENT_KEY_DOWN || ev.type == SDL_EVENT_KEY_UP) {
+                prosper::frontend::AppWindowKey key{};
+                key.app_window = ev.key.windowID == appWindowId;
+                key.pressed = ev.key.down;
+                key.repeat = ev.key.repeat;
+                key.escape = ev.key.key == SDLK_ESCAPE;
+                key.f11 = ev.key.key == SDLK_F11;
+                key.enter = ev.key.key == SDLK_RETURN || ev.key.key == SDLK_KP_ENTER;
+                key.alt = (ev.key.mod & SDL_KMOD_ALT) != 0;
+                switch (windowControls.handle_key(key)) {
+                case prosper::frontend::AppWindowCommand::quit:
+                    running = false;
+                    break;
+                case prosper::frontend::AppWindowCommand::toggle_fullscreen: {
+                    // SDL may apply fullscreen requests asynchronously. Toggle the last accepted
+                    // target instead of reading a flag that can still describe the old state.
+                    const bool targetFullscreen = !fullscreenRequested;
+                    if (!SDL_SetWindowFullscreen(win, targetFullscreen)) {
+                        fprintf(stderr, "[app] fullscreen toggle failed: %s\n", SDL_GetError());
+                    } else {
+                        fullscreenRequested = targetFullscreen;
+                        swapchainDirty = true;
+                        fprintf(stderr, "[app] fullscreen %s requested\n",
+                                targetFullscreen ? "on" : "off");
+                    }
+                    break;
+                }
+                case prosper::frontend::AppWindowCommand::none:
+                    break;
+                }
+            } else if (ev.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED &&
+                       ev.window.windowID == appWindowId) {
+                swapchainDirty = true;
+            } else if (ev.type == SDL_EVENT_WINDOW_FOCUS_LOST &&
+                       ev.window.windowID == appWindowId) {
+                windowControls.set_app_focus(false);
+            } else if (ev.type == SDL_EVENT_WINDOW_FOCUS_GAINED &&
+                       ev.window.windowID == appWindowId) {
+                windowControls.set_app_focus(true);
+            } else if (ev.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN &&
+                       ev.window.windowID == appWindowId) {
+                fullscreenRequested = true;
+            } else if (ev.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN &&
+                       ev.window.windowID == appWindowId) {
+                fullscreenRequested = false;
+            }
         }
         if (!running) break;
-        poll_keyboard();   // snapshot key state for the guest's pad reads
+
+        // Snapshot input before any minimized-window early exit. This clears released guest
+        // buttons even while swapchain recreation has to wait for a non-zero pixel extent.
+        const bool* keyboard = SDL_GetKeyboardState(nullptr);
+        const bool enterDown = keyboard[SDL_SCANCODE_RETURN] ||
+                               keyboard[SDL_SCANCODE_RETURN2] ||
+                               keyboard[SDL_SCANCODE_KP_ENTER];
+        windowControls.reconcile_enter(enterDown);
+        poll_keyboard(keyboard, windowControls.guest_options_allowed());
 #ifdef PROSPER_HAVE_DIALOG_SDL3
         prosper::sdl_platform_ui_pump();   // run a pending ImeDialog text-entry modal on this (main) thread
 #endif
+
+        if (swapchainDirty) {
+            int dw = 0, dh = 0;
+            SDL_GetWindowSizeInPixels(win, &dw, &dh);
+            if (dw <= 0 || dh <= 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;   // minimized or between fullscreen modes; retry after the next event
+            }
+            vkDeviceWaitIdle(vk.device);
+            if (vk.swapchain) vkDestroySwapchainKHR(vk.device, vk.swapchain, nullptr);
+            vk.swapchain = VK_NULL_HANDLE;
+            if (!create_swapchain(vk, static_cast<uint32_t>(dw), static_cast<uint32_t>(dh),
+                                  requestedPresentMode)) {
+                fprintf(stderr, "[app] could not recreate the swapchain after a window-size change\n");
+                running = false;
+                break;
+            }
+            swapchainDirty = false;
+        }
         const auto loopNow = std::chrono::steady_clock::now();
         if (timedDumpPending && loopNow >= nextTimedDump) {
             ++timedDumpCount;
@@ -569,11 +684,8 @@ int main(int argc, char** argv) {
             if (w == 0 || h == 0) { std::this_thread::sleep_for(std::chrono::milliseconds(2)); continue; }
             if (frame.rgba && frame.rgba->size() == (size_t)w * h * 4) {
                 if (!present_frame(vk, frame.rgba->data(), w, h)) {
-                    // out-of-date / resize: recreate the swapchain and retry next iteration.
-                    vkDeviceWaitIdle(vk.device);
-                    vkDestroySwapchainKHR(vk.device, vk.swapchain, nullptr); vk.swapchain = VK_NULL_HANDLE;
-                    int dw = 0, dh = 0; SDL_GetWindowSizeInPixels(win, &dw, &dh);
-                    create_swapchain(vk, (uint32_t)dw, (uint32_t)dh);
+                    // Out-of-date/suboptimal: share the resize/fullscreen recreation path next loop.
+                    swapchainDirty = true;
                 } else {
                     lastFrameSeq = frame.frame_seq; shown++;
                     lastFrameProgress = std::chrono::steady_clock::now();

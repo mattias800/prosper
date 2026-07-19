@@ -120,6 +120,8 @@ init:  SDL_Init(VIDEO|AUDIO|GAMECONTROLLER); create window;
        start the guest run-loop on its own thread.
 
 frame: SDL_PollEvent → on SDL_QUIT / window-close: prosper_request_stop(); break;
+       F11 / Alt+Enter toggles borderless desktop fullscreen;
+       pixel-size change → recreate the Vulkan swapchain before the next present;
        if present_count() advanced since last shown:
            lease = present_acquire_rendered_frame();
            upload lease.rgba → VkImage; blit/scale VkImage → acquired swapchain image; vkQueuePresentKHR;
@@ -287,8 +289,10 @@ readability checks without copying large texture sources before comparing them. 
 
 The Vulkan backend may retain an optimal sampled image only when that exact frontend validation
 supplies a nonzero content-version ID. Cache hits skip image allocation, staging allocation, pixel
-copy, transfer commands, and upload barriers; per-draw views, swizzles, and samplers remain callback
-local. The cache is bounded to 256 MiB and 1024 allocations by default. Set
+copy, transfer commands, and upload barriers. Exact image-view and sampler contracts over a retained
+image remain resident with that image, under a 32-contract per-image bound; set
+`PROSPER_NO_BACKEND_PERSISTENT_TEXTURE_BINDINGS=1` to retain images while restoring callback-local
+bindings for an A/B. The image cache is bounded to 1 GiB and 1024 allocations by default. Set
 `PROSPER_BACKEND_TEXTURE_CACHE_MB=<MiB>` to change the byte budget or
 `PROSPER_NO_BACKEND_PERSISTENT_TEXTURES=1` for a forced-upload A/B. Backend timing reports
 `persistent=hits/misses` and the current cache bytes. The frontend decoded-pixel budget and backend
@@ -331,6 +335,13 @@ fixed-function value; equality still compares the complete key after hashing. Th
 `PROSPER_NO_BACKEND_PIPELINE_CACHE=1` for a transient-pipeline A/B. With `PROSPER_RENDER_TIMING=1`,
 the backend and submit-aligned windows report references, hits, misses, bypasses, current entries, and
 evictions. A pipeline hit also skips temporary Vulkan shader-module creation.
+
+Pipeline layouts use a separate exact cross-call cache keyed by every descriptor set's ordered binding,
+type, count, and stage contract. Descriptor pools, descriptor sets, and descriptor-set layouts remain
+call-local; Vulkan pipeline-layout compatibility follows the complete descriptor contract rather than the
+temporary layout handle. The cache retains at most 256 layouts and evicts the least-recently-used entry not
+referenced by the current backend call. Set `PROSPER_PIPELINE_LAYOUT_CACHE_ENTRIES=<N>` to change the bound
+or `PROSPER_NO_BACKEND_PIPELINE_LAYOUT_CACHE=1` for a call-local A/B.
 
 Do not cache `build_stage_table` results using only shader addresses and user-SGPR values. Descriptor
 tables are reached through guest pointers, and their memory can change while every pointer/register
@@ -416,7 +427,8 @@ duplicate. Until then the app is fully functional via `--test-pattern` (and any 
   shows the composited game (verified `--dump … --frames 3`).
 - **P1 — audio** ✅ **done**: `prosper-app` installs the SDL3 `AudioSink` (`sceAudioOut` → host).
 - **P2 — controllers** ✅ **done**: installs the SDL3 `PadBackend` (host gamepad → `libScePad`).
-- **P3 — polish** (in progress): resize/fullscreen, pause/quit UX, and present-mode/latency tuning.
+- **P3 — polish** (in progress): resize/fullscreen and present-mode selection are implemented;
+  pause/quit UX remains.
   Native Windows build/run packaging is done via `scripts/run-windows.ps1`. Cooperative guest-stop
   at a flip boundary is a follow-up (today the
   guest thread is detached at window-close and reclaimed by process exit).
@@ -428,7 +440,8 @@ duplicate. Until then the app is fully functional via `--test-pattern` (and any 
 - **The run/stop hook touches the run harness** (`boot_trace`/how the guest loop is driven), which the
   render-frontier and audio workstreams also use — coordinate; keep the fixed-budget CI path intact.
 - **`feat/audio-sdl3` overlap** — P1 must build on that branch, not fork it.
-- **Present latency/vsync** is intentionally FIFO today; low-latency present-mode selection remains
-  P3 work.
+- **Present latency/vsync** defaults to FIFO. `--present-mode mailbox` opts into low-latency vsync,
+  and `--present-mode immediate` explicitly permits tearing; unsupported optional modes fall back to
+  FIFO with a diagnostic.
 - **Later zero-copy** (`external_memory`) is deliberately deferred; the readback seam is the v1 answer.
 - **area:** shared/host infrastructure — needs an `area:` decision and coordination before build.

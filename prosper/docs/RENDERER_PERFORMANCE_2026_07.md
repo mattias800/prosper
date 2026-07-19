@@ -222,6 +222,58 @@ completed the fresh-save route at 1920x1080 and produced direct composited frame
 cost is the fence wait after every backend call; removing it requires deferred lifetime management for all
 call-local Vulkan resources and is intentionally outside this tranche.
 
+## Evergate persistent pipeline layouts (2026-07-19)
+
+Dense Evergate submits still recreated the same small set of pipeline layouts in each backend call. The
+backend now retains pipeline layouts by the complete ordered descriptor contract. Descriptor pools, sets,
+set layouts, contents, images, and buffers remain call-local; a cache hit changes only the immutable pipeline
+layout lifetime. The cache defaults to 256 entries and evicts the least-recently-used layout not referenced by
+the current call. `PROSPER_PIPELINE_LAYOUT_CACHE_ENTRIES=<N>` changes the bound and
+`PROSPER_NO_BACKEND_PIPELINE_LAYOUT_CACHE=1` restores call-local creation.
+
+A native-Windows A/B/A used one final binary, separate fresh saves, native scale/cadence, the documented
+route, and submit-aligned windows matched at 472-488 realized draws:
+
+| Mode | Draws | Pipeline-layout setup | Whole submit |
+|---|---:|---:|---:|
+| Cache-disabled control 1 | 474-488 | 1.78-1.82 ms | 254-265 ms |
+| Bounded cache | 472-484 | 0.23-0.37 ms | 199-214 ms |
+| Cache-disabled control 2 | 474-487 | 1.33-1.52 ms | 180-185 ms |
+
+The reversed control exposes substantial warm-state variance in the other timing buckets, so the whole-submit
+ranges are not an FPS claim. The isolated layout bucket consistently removes about 1.1-1.5 ms from a dense
+submit. This is a bounded CPU improvement; GPU fence waits and draw/resource realization remain the dominant
+Evergate costs.
+
+## Evergate backend resource references and texture residency (2026-07-19)
+
+A deferred-submit prototype proved that removing intermediate CPU waits alone is not sufficient. It reduced
+the readback-free wait bucket from roughly 33 ms to below 1 ms, but retaining complete call-local resource
+graphs made the matched backend window slower (77.6 ms versus 71.9 ms) and produced fewer presented frames.
+The prototype was removed. Future multi-target submission work must share command/resource ownership rather
+than queueing several independently realized calls.
+
+The next exact phase probe found avoidable work inside each independent call. A 462-draw Evergate pass spent
+8.09 ms deep-copying every draw's `FrameResource` vectors into backend bookkeeping, although later recording
+needed only descriptor sets, pipelines, index buffers, and scissors. Using the immutable `BackendDraw`
+resources by reference and keeping descriptor-construction arrays local reduced the closest 460-draw sample's
+draw setup from 43.60 ms to 22.21 ms; its GPU wait remained approximately 27-28 ms.
+
+Texture residency was the next larger mechanism. The dense pass referenced about 960 texture bindings but
+only 43-44 distinct exact image/view/sampler contracts. The old 256 MiB backend image budget thrashed that
+working set. Even a 512 MiB control sat at 502.3 MiB and still evicted and reuploaded a 16 MiB image on each
+dense call. The default backend image budget is therefore 1 GiB, matching the already-bounded frontend decode
+budget; this is a cap, not a preallocation. A warmed 1 GiB run reported 43 persistent image hits, zero uploads,
+and about 2.8 ms of texture-binding work in a 479-draw pass.
+
+Exact image-view/sampler bindings now live with their persistent image instead of being recreated on every
+callback. Each image retains at most 32 complete contracts and evicts only a binding not referenced by the
+current call. `PROSPER_NO_BACKEND_PERSISTENT_TEXTURE_BINDINGS=1` restores callback-local bindings, while
+`PROSPER_BACKEND_TEXTURE_CACHE_MB` still controls image residency. The Vulkan regression test covers the
+initial binding miss, the next-call hit, byte-identical output, and bounded eviction without destroying the
+current call's binding. Later end-to-end controls coincided with unrelated GPU saturation, so the cache and
+CPU phase counters above are used for attribution rather than presenting those wall-clock rates as FPS gains.
+
 ## Dead Cells backend upload duplication (2026-07-15)
 
 Dead Cells exposed a second duplication layer after the frontend decode caches. The frontend correctly
@@ -268,9 +320,9 @@ Dead Cells loading submit referenced 54 textures. Eleven distinct uploads remain
 
 The frontend cache now exact-validates linear `Unorm8x4` sources as well as tiled sources. A validated
 content version receives a monotonic ID; any source-byte or readable-prefix change creates a new ID.
-The Vulkan backend retains only images with such an ID, under a 256 MiB / 1024-entry default bound.
+The Vulkan backend retains only images with such an ID, under a bounded cache.
 Render targets, storage images, captured host backing, and unvalidated formats never receive an ID.
-Per-call views and samplers remain independent, so descriptor swizzles and filtering are unchanged.
+Exact view and sampler contracts remain independent, so descriptor swizzles and filtering are unchanged.
 
 Native Windows / RTX 4090, same RelWithDebInfo binary, fresh saves, documented full-render route, and
 matched 110-second samples:

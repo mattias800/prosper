@@ -50,6 +50,15 @@ namespace {
     constexpr uint32_t kVirtualQueryCommitted = 0x10;
     constexpr uint64_t kGuestPageSize = 0x4000;
 
+    bool align_up_multiple(uint64_t value, uint64_t alignment, uint64_t& out) {
+        if (!alignment) { out = value; return true; }
+        const uint64_t remainder = value % alignment;
+        const uint64_t delta = remainder ? alignment - remainder : 0;
+        if (delta > UINT64_MAX - value) return false;
+        out = value + delta;
+        return true;
+    }
+
     bool normalize_guest_page_range(uint64_t addr, uint64_t len,
                                     uint64_t& base_out, uint64_t& len_out) {
         constexpr uint64_t mask = kGuestPageSize - 1;
@@ -118,8 +127,10 @@ namespace {
             // Clip the free gap to the search window, then align the start.
             uint64_t beg = gap_beg < lo ? lo : gap_beg;
             uint64_t end = gap_end > hi ? hi : gap_end;
-            uint64_t off = (beg + align - 1) & ~(align - 1);
-            if (off + sz <= end) { insert_at = i; off_out = off; goto found; }
+            uint64_t off = 0;
+            if (align_up_multiple(beg, align, off) && off <= end && sz <= end - off) {
+                insert_at = i; off_out = off; goto found;
+            }
             if (i < g_dmem.size()) cursor = g_dmem[i].end;
         }
         return false;
@@ -145,8 +156,11 @@ namespace {
             // Clip the free gap to the caller's search window, then align its start.
             uint64_t beg = gap_beg < lo ? lo : gap_beg;
             uint64_t end = gap_end > hi ? hi : gap_end;
-            uint64_t aligned = (beg + align - 1) & ~(align - 1);
-            if (end > aligned && end - aligned > size_out) { off_out = aligned; size_out = end - aligned; }
+            uint64_t aligned = 0;
+            if (align_up_multiple(beg, align, aligned) && end > aligned &&
+                end - aligned > size_out) {
+                off_out = aligned; size_out = end - aligned;
+            }
             if (i < g_dmem.size()) cursor = g_dmem[i].end;
         }
     }
@@ -418,6 +432,23 @@ namespace {
     }
     uint64_t align_up(uint64_t v, uint64_t a) { return a ? (v + a - 1) & ~(a - 1) : v; }
 
+    constexpr uint64_t kMaxDirectMemoryType = 0x7fffffffull;
+    bool valid_dmem_allocation(uint64_t len, uint64_t alignment,
+                               uint64_t memory_type, uint64_t phys_out) {
+        // The direct-memory ABI is 16 KiB-granular. Do not round a malformed request up: doing so
+        // consumes a different physical range than the guest requested. Alignment zero selects the
+        // default page alignment; the allocator supports every explicit 16 KiB multiple.
+        if (!len || (len & (kGuestPageSize - 1)) != 0) return false;
+        if (alignment && (alignment & (kGuestPageSize - 1)) != 0) return false;
+        // memoryType is a signed int in the ABI. Preserve every non-negative value it can carry:
+        // PS5 titles use values above the older type-10 ceiling (Blasphemous 2 requests type 12),
+        // and the mapping/type-query paths already preserve types 11 and 13.
+        if (memory_type > kMaxDirectMemoryType) return false;
+        // Low values are not plausible guest pointers. The old code accepted them, allocated from
+        // the pool, then skipped the guarded write -- false success plus leaked physical capacity.
+        return phys_out > 0xffff;
+    }
+
     // The console chooses automatic mappings from its guest user-VA space.  Letting mmap(nullptr)
     // choose instead leaks a host VA (commonly 0x7f...) to the guest.  Besides being outside the PS5
     // address model, Sony libc explicitly rejects such an address as mspace backing.  Search a quiet
@@ -425,6 +456,17 @@ namespace {
     // collision can skip directly past them instead of probing every 64 KiB page.
     constexpr uint64_t kGuestAutoMapBase  = 0x2000000000ull;
     constexpr uint64_t kGuestAutoMapLimit = 0x40000000000ull;
+    // Monotonic placement cursor for auto-mapped guest VA (#983). Restarting the linear probe in
+    // map_guest_from() from kGuestAutoMapBase on EVERY auto-map is O(N) in the live-mapping count,
+    // and on macOS each collided probe is a full mmap+munmap under Rosetta's VM tracking
+    // (prosper_mmap_noreplace emulates MAP_FIXED_NOREPLACE that way) — a level's tens of thousands
+    // of sceKernelMapDirectMemory calls degrade to O(N^2) Rosetta VM churn (minutes). Advancing a
+    // cursor past each successful placement makes the common case a single successful mmap.
+    // Correctness is unchanged: map_guest_from still uses NOREPLACE (never clobbers) and still scans
+    // g_maps for a free slot; the cursor only picks the STARTING hint, and map_guest_auto wraps back
+    // to the base to reclaim VA freed below the cursor. Atomic (lock-free) — concurrent mappers stay
+    // correct via NOREPLACE; the cursor is a hint, not a lock.
+    uint64_t g_auto_map_cursor = kGuestAutoMapBase;
     void* map_guest_from(uint64_t start, uint64_t len, int prot, uint64_t align) {
         const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
         if (align < page) align = page;
@@ -459,7 +501,23 @@ namespace {
     }
 
     void* map_guest_auto(uint64_t len, int prot, uint64_t align) {
-        return map_guest_from(kGuestAutoMapBase, len, prot, align);
+        // Start probing past the last successful placement (see g_auto_map_cursor, #983) instead of
+        // rescanning from kGuestAutoMapBase every call. If the tail is exhausted, wrap once to the
+        // base to reclaim VA freed below the cursor.
+        uint64_t hint = __atomic_load_n(&g_auto_map_cursor, __ATOMIC_RELAXED);
+        if (hint < kGuestAutoMapBase) hint = kGuestAutoMapBase;
+        void* p = map_guest_from(hint, len, prot, align);
+        if (!p && hint > kGuestAutoMapBase)
+            p = map_guest_from(kGuestAutoMapBase, len, prot, align);
+        if (p) {
+            // Advance the cursor monotonically to the end of this placement (only forward; VA below
+            // the cursor is reclaimed by the wrap above, never leaked).
+            uint64_t end = (uint64_t)p + len;
+            uint64_t cur = __atomic_load_n(&g_auto_map_cursor, __ATOMIC_RELAXED);
+            while (end > cur && !__atomic_compare_exchange_n(&g_auto_map_cursor, &cur, end, true,
+                                                             __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+        }
+        return p;
     }
 
     void* map_at(uint64_t hint, uint64_t len, int prot) {
@@ -690,9 +748,10 @@ HLE(k_avail_flexible) { if (!a0) return 0x80020016ull; *(uint64_t*)(uintptr_t)a0
 
 // sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t align, int memType, off_t* physOut)
 HLE(k_alloc_dmem) {   // (searchStart, searchEnd, len, alignment, memoryType, physAddrOut)
-    if (!a5) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL: required physAddrOut
+    if (!valid_dmem_allocation(a2, a3, a4, a5))
+        return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
     uint64_t align = a3 ? a3 : 0x4000;
-    uint64_t sz = align_up(a2, align);
+    uint64_t sz = a2;
     uint64_t off;
     // Honor the [searchStart, searchEnd) window (a0/a1) — dropping it handed the guest an offset
     // outside the window it asked for.
@@ -703,7 +762,7 @@ HLE(k_alloc_dmem) {   // (searchStart, searchEnd, len, alignment, memoryType, ph
         return 0x8002000Cull;   // SCE_KERNEL_ERROR_ENOMEM
     }
     dmem_zero(off, sz);                       // fresh allocation -> zeroed pages (console semantics)
-    if (a5 > 0xffff) *(uint64_t*)a5 = off;   // only write through a plausible out-pointer
+    *(uint64_t*)a5 = off;
     MLOG("alloc_dmem range=[0x%llx,0x%llx) len=0x%llx align=0x%llx type=0x%llx -> phys=0x%llx\n",
          (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
          (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)off);
@@ -714,16 +773,17 @@ HLE(k_alloc_dmem) {   // (searchStart, searchEnd, len, alignment, memoryType, ph
 // DIFFERENT signature (4 args) from AllocateDirectMemory: physOut is arg3, not arg5. Aliasing them
 // to one handler wrote the result through arg5 (uninitialized garbage, e.g. 0xa) -> crash.
 HLE(k_alloc_main_dmem) {
-    if (!a3) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL: required physAddrOut
+    if (!valid_dmem_allocation(a0, a1, a2, a3))
+        return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
     uint64_t align = a1 ? a1 : 0x4000;
-    uint64_t sz = align_up(a0, align);
+    uint64_t sz = a0;
     uint64_t off;
     if (!dmem_take(sz, align, (int)a2, off)) {
         MLOG("alloc_main_dmem len=0x%llx -> ENOMEM (pool exhausted)\n", (unsigned long long)a0);
         return 0x8002000Cull;   // SCE_KERNEL_ERROR_ENOMEM
     }
     dmem_zero(off, sz);                       // fresh allocation -> zeroed pages (console semantics)
-    if (a3 > 0xffff) *(uint64_t*)a3 = off;
+    *(uint64_t*)a3 = off;
     MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a0, (unsigned long long)off);
     return 0;
 }
@@ -1582,6 +1642,15 @@ namespace {
     constexpr uint32_t kVirtualQueryCommitted = 0x10;
     constexpr uint64_t kGuestPageSize = 0x4000;
 
+    bool align_up_multiple(uint64_t value, uint64_t alignment, uint64_t& out) {
+        if (!alignment) { out = value; return true; }
+        const uint64_t remainder = value % alignment;
+        const uint64_t delta = remainder ? alignment - remainder : 0;
+        if (delta > UINT64_MAX - value) return false;
+        out = value + delta;
+        return true;
+    }
+
     bool normalize_guest_page_range(uint64_t addr, uint64_t len,
                                     uint64_t& base_out, uint64_t& len_out) {
         constexpr uint64_t mask = kGuestPageSize - 1;
@@ -1635,8 +1704,10 @@ namespace {
             uint64_t gap_end = (i < g_dmem.size()) ? g_dmem[i].start : kDmemBase + kDmemTotal;
             uint64_t beg = gap_beg < lo ? lo : gap_beg;
             uint64_t end = gap_end > hi ? hi : gap_end;
-            uint64_t off = (beg + align - 1) & ~(align - 1);
-            if (off + sz <= end) { insert_at = i; off_out = off; goto found; }
+            uint64_t off = 0;
+            if (align_up_multiple(beg, align, off) && off <= end && sz <= end - off) {
+                insert_at = i; off_out = off; goto found;
+            }
             if (i < g_dmem.size()) cursor = g_dmem[i].end;
         }
         return false;
@@ -1656,8 +1727,11 @@ namespace {
             uint64_t gap_end = (i < g_dmem.size()) ? g_dmem[i].start : kDmemBase + kDmemTotal;
             uint64_t beg = gap_beg < lo ? lo : gap_beg;
             uint64_t end = gap_end > hi ? hi : gap_end;
-            uint64_t aligned = (beg + align - 1) & ~(align - 1);
-            if (end > aligned && end - aligned > size_out) { off_out = aligned; size_out = end - aligned; }
+            uint64_t aligned = 0;
+            if (align_up_multiple(beg, align, aligned) && end > aligned &&
+                end - aligned > size_out) {
+                off_out = aligned; size_out = end - aligned;
+            }
             if (i < g_dmem.size()) cursor = g_dmem[i].end;
         }
     }
@@ -1876,6 +1950,17 @@ namespace {
         return n;
     }
     uint64_t align_up(uint64_t v, uint64_t a) { return a ? (v + a - 1) & ~(a - 1) : v; }
+
+    constexpr uint64_t kMaxDirectMemoryType = 0x7fffffffull;
+    bool valid_dmem_allocation(uint64_t len, uint64_t alignment,
+                               uint64_t memory_type, uint64_t phys_out) {
+        if (!len || (len & (kGuestPageSize - 1)) != 0) return false;
+        if (alignment && (alignment & (kGuestPageSize - 1)) != 0) return false;
+        // memoryType is a signed int in the ABI. PS5 titles legitimately use values above 10;
+        // reject only values that cannot represent a non-negative int.
+        if (memory_type > kMaxDirectMemoryType) return false;
+        return phys_out > 0xffff;
+    }
 
     // Guest Orbis protection bits (READ=1, WRITE=2 [implies read], EXEC=4). WRITE implies READ,
     // and prot 0 is a legitimate no-access guard page (matches the Linux host_prot #342 fix).
@@ -3640,9 +3725,10 @@ HLE(k_avail_flexible) { if (!a0) return 0x80020016ull; *(uint64_t*)(uintptr_t)a0
 
 // sceKernelAllocateDirectMemory(start, end, len, align, memType, off_t* physOut)
 HLE(k_alloc_dmem) {
-    if (!a5) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL: required physAddrOut
+    if (!valid_dmem_allocation(a2, a3, a4, a5))
+        return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
     uint64_t align = a3 ? a3 : 0x4000;
-    uint64_t sz = align_up(a2, align);
+    uint64_t sz = a2;
     uint64_t off;
     if (!dmem_take(sz, align, (int)a4, off, a0, a1 ? a1 : ~0ull)) {
         MLOG("alloc_dmem len=0x%llx in [0x%llx,0x%llx) -> ENOMEM\n",
@@ -3650,22 +3736,23 @@ HLE(k_alloc_dmem) {
         return 0x8002000Cull;
     }
     dmem_prepare_allocation(off, sz);
-    if (a5 > 0xffff) *(uint64_t*)a5 = off;
+    *(uint64_t*)a5 = off;
     MLOG("alloc_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a2, (unsigned long long)off);
     return 0;
 }
 // sceKernelAllocateMainDirectMemory(len, align, memType, off_t* physOut) — physOut at arg3.
 HLE(k_alloc_main_dmem) {
-    if (!a3) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL: required physAddrOut
+    if (!valid_dmem_allocation(a0, a1, a2, a3))
+        return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
     uint64_t align = a1 ? a1 : 0x4000;
-    uint64_t sz = align_up(a0, align);
+    uint64_t sz = a0;
     uint64_t off;
     if (!dmem_take(sz, align, (int)a2, off)) {
         MLOG("alloc_main_dmem len=0x%llx -> ENOMEM\n", (unsigned long long)a0);
         return 0x8002000Cull;
     }
     dmem_prepare_allocation(off, sz);
-    if (a3 > 0xffff) *(uint64_t*)a3 = off;
+    *(uint64_t*)a3 = off;
     MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a0, (unsigned long long)off);
     return 0;
 }

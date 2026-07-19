@@ -9,6 +9,8 @@ param(
     [string]$Record,
     [int]$Frames = 0,
     [int]$Jobs = 8,
+    [ValidateSet('fifo', 'mailbox', 'immediate')]
+    [string]$PresentMode = 'fifo',
     [switch]$TestPattern,
     [switch]$NoBuild
 )
@@ -107,6 +109,7 @@ if ($TestPattern) {
     $runArgs += @('--dump', $Dump)
 }
 if ($Frames -gt 0) { $runArgs += @('--frames', "$Frames") }
+if ($PresentMode -ne 'fifo') { $runArgs += @('--present-mode', $PresentMode.ToLowerInvariant()) }
 if ($Record) { $runArgs += @('--record', [IO.Path]::GetFullPath($Record)) }
 
 Write-Host "Starting $app"

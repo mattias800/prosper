@@ -24,6 +24,7 @@ struct ShaderReg { uint32_t offset; uint32_t value; };
 struct GpuState {
     std::unordered_map<uint32_t, uint32_t> cx, sh, uc;   // register files by offset
     uint32_t index_type = 0;                             // last SetIndexType
+    uint32_t num_instances = 1;                          // default before SetNumInstances; zero discards
     // Gen5 indexed-draw binding state (issue #232, DOLL/UE4 geometry). SetIndexBuffer/SetIndexCount
     // set these; DrawIndexOffset consumes them to emit an indexed Draw. Persist across draws within a
     // submit (as on hardware) until re-set.
@@ -43,6 +44,7 @@ struct GpuState {
     // 1 = 32-bit). The executor fetches the index data and renders with vkCmdDrawIndexed (#64).
     struct Draw {
         uint32_t index_count;
+        uint32_t instance_count = 1;
         std::shared_ptr<const GpuState> state;
         bool     indexed = false;
         uint64_t index_addr = 0;
