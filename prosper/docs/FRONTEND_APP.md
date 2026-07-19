@@ -250,6 +250,15 @@ object remains call-local and is destroyed after the existing fence wait, so thi
 freshness assumption. Set `PROSPER_NO_BACKEND_RESOURCE_SHARE=1` to disable the keyed object reuse for an
 A/B; the safe call-wide descriptor-pool consolidation remains enabled in both modes.
 
+Host-visible storage buffers use a separate bounded pool across backend calls. The backend waits for its
+fence before returning a buffer, retains its host-coherent allocation persistently mapped, and rewrites it
+before the next use. Power-of-two capacity classes absorb changing guest buffer sizes, while each Vulkan
+descriptor keeps the exact logical byte range, so pooling does not expose capacity padding to shaders.
+The thread-local pool is capped at 4096 buffers and 256 MiB by default; set
+`PROSPER_BACKEND_BUFFER_POOL_MB=<MiB>` to change the byte budget or
+`PROSPER_NO_BACKEND_BUFFER_POOL=1` for the former create/map/destroy path. With renderer timing enabled,
+`backend_buffer_pool` reports cumulative hits, misses, cached count/bytes, and evictions.
+
 The persistent compute device has the same exact-requirements allocation pool with a separate 256 MiB
 default budget (`PROSPER_COMPUTE_MEMORY_POOL_MB=<MiB>`). `PROSPER_NO_MEMORY_POOL=1` disables both
 graphics and compute pools. Decoded texture scratch vectors are also retained across callbacks; they

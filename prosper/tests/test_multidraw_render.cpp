@@ -132,23 +132,51 @@ int main() {
         buffer.binding = 2;
         buffer.set = 0;
         buffer.buffer_identity = 0x7020000000000002ull;
-        buffer.dwords.assign(64, 0x3f800000u);
+        buffer.dwords.assign(63, 0x3f800000u); // 252 bytes -> pooled 256-byte capacity
         prosper::test::BackendDraw d0;
         d0.vs = vs; d0.fs = red; d0.ps = &opaque; d0.vcount = 3; d0.R = {buffer};
         prosper::test::BackendDraw d1;
         d1.vs = vs; d1.fs = green; d1.ps = &additive; d1.vcount = 3; d1.R = {buffer};
 
+        const auto pool_before = prosper::test::render_host_buffer_pool_stats();
         const std::vector<uint8_t> shared =
             prosper::test::render_draws_rgba({d0, d1}, W, H);
         const auto shared_stats = prosper::test::backend_resource_reuse_stats();
+        const auto pool_after_first = prosper::test::render_host_buffer_pool_stats();
         CHECK(shared_stats.buffer_references == 2 && shared_stats.unique_buffers == 1,
               "identical guest-buffer payloads share one Vulkan upload");
+        CHECK(pool_after_first.misses == pool_before.misses + 1 &&
+                  pool_after_first.cached_buffers == pool_before.cached_buffers + 1,
+              "first storage-buffer shape populates the persistent host-buffer pool");
         CHECK(shared_stats.descriptor_set_layout_references == 2 &&
                   shared_stats.unique_descriptor_set_layouts == 1 &&
                   shared_stats.pipeline_layout_references == 2 &&
                   shared_stats.unique_pipeline_layouts == 1 &&
                   shared_stats.descriptor_pools == 1,
               "identical draw contracts share layouts and one call-wide descriptor pool");
+
+        prosper::test::BackendDraw capacity_peer0 = d0;
+        prosper::test::BackendDraw capacity_peer1 = d1;
+        capacity_peer0.R[0].dwords.resize(61); // 244 bytes, same 256-byte capacity class
+        capacity_peer1.R[0].dwords.resize(61);
+        const std::vector<uint8_t> pooled_again = prosper::test::render_draws_rgba(
+            {capacity_peer0, capacity_peer1}, W, H);
+        const auto pool_after_second = prosper::test::render_host_buffer_pool_stats();
+        CHECK(pool_after_second.hits == pool_after_first.hits + 1 &&
+                  pool_after_second.misses == pool_after_first.misses &&
+                  pooled_again == shared,
+              "next logical size in the capacity class reuses the mapped buffer byte-identically");
+
+        set_env("PROSPER_NO_BACKEND_BUFFER_POOL", "1");
+        const std::vector<uint8_t> pool_bypassed =
+            prosper::test::render_draws_rgba({d0, d1}, W, H);
+        const auto pool_after_bypass = prosper::test::render_host_buffer_pool_stats();
+        set_env("PROSPER_NO_BACKEND_BUFFER_POOL", nullptr);
+        CHECK(pool_after_bypass.hits == pool_after_second.hits &&
+                  pool_after_bypass.misses == pool_after_second.misses,
+              "buffer-pool disable switch restores transient Vulkan uploads");
+        CHECK(pool_bypassed == shared,
+              "pooled and forced-transient storage buffers render byte-identically");
 
         prosper::test::BackendDraw distinct = d1;
         distinct.R[0].buffer_identity++;

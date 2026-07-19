@@ -650,6 +650,148 @@ inline uint32_t render_memory_type(VkPhysicalDevice phys, uint32_t bits,
     return UINT32_MAX;
 }
 
+// Storage-buffer contents are rewritten for every synchronous render call, but their Vulkan object
+// shapes repeat heavily. Keep capacity-class host-coherent buffers mapped between calls so the hot path
+// only copies bytes; each call waits for its fence before returning the buffers, so no in-flight GPU
+// work can observe a later upload. Capacity classes reduce shape churn; descriptors retain the exact
+// logical upload range, so pooling never broadens shader-visible storage.
+struct RenderHostBuffer {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* mapped = nullptr;
+    VkDeviceSize bytes = 0;
+    VkDeviceSize allocation_bytes = 0;
+};
+
+struct RenderHostBufferPool {
+    std::unordered_map<VkDeviceSize, std::vector<RenderHostBuffer>> available;
+    VkDeviceSize cached_bytes = 0;
+    size_t cached_buffers = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t evictions = 0;
+};
+
+struct RenderHostBufferPoolStats {
+    VkDeviceSize cached_bytes = 0;
+    size_t cached_buffers = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t evictions = 0;
+};
+
+inline RenderHostBufferPool& render_host_buffer_pool() {
+    static thread_local RenderHostBufferPool pool;
+    return pool;
+}
+
+inline bool render_host_buffer_pool_enabled() {
+    return getenv("PROSPER_NO_BACKEND_BUFFER_POOL") == nullptr;
+}
+
+inline VkDeviceSize render_host_buffer_pool_limit() {
+    static const VkDeviceSize limit = []() -> VkDeviceSize {
+        const char* value = getenv("PROSPER_BACKEND_BUFFER_POOL_MB");
+        const uint64_t mib = value ? strtoull(value, nullptr, 10) : 256ull;
+        if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
+        return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
+    }();
+    return limit;
+}
+
+inline void destroy_render_host_buffer(VkDevice device, RenderHostBuffer& buffer) {
+    if (buffer.mapped) vkUnmapMemory(device, buffer.memory);
+    if (buffer.buffer) vkDestroyBuffer(device, buffer.buffer, nullptr);
+    if (buffer.memory) vkFreeMemory(device, buffer.memory, nullptr);
+    buffer = {};
+}
+
+inline RenderHostBuffer acquire_render_host_buffer(const RenderVkCtx& ctx,
+                                                   VkDeviceSize bytes) {
+    if (!bytes) return {};
+    VkDeviceSize capacity = 4;
+    while (capacity < bytes && capacity <= UINT64_MAX / 2) capacity *= 2;
+    if (capacity < bytes) capacity = bytes;
+    RenderHostBufferPool& pool = render_host_buffer_pool();
+    auto found = pool.available.find(capacity);
+    if (found != pool.available.end() && !found->second.empty()) {
+        RenderHostBuffer buffer = found->second.back();
+        found->second.pop_back();
+        if (found->second.empty()) pool.available.erase(found);
+        pool.cached_bytes -= buffer.allocation_bytes;
+        --pool.cached_buffers;
+        ++pool.hits;
+        return buffer;
+    }
+    ++pool.misses;
+
+    RenderHostBuffer buffer;
+    buffer.bytes = capacity;
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = capacity;
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    if (vkCreateBuffer(ctx.dev, &info, nullptr, &buffer.buffer) != VK_SUCCESS)
+        return {};
+    VkMemoryRequirements requirements{};
+    vkGetBufferMemoryRequirements(ctx.dev, buffer.buffer, &requirements);
+    buffer.allocation_bytes = requirements.size;
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = requirements.size;
+    allocation.memoryTypeIndex = render_memory_type(
+        ctx.phys, requirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (allocation.memoryTypeIndex == UINT32_MAX ||
+        vkAllocateMemory(ctx.dev, &allocation, nullptr, &buffer.memory) != VK_SUCCESS ||
+        vkBindBufferMemory(ctx.dev, buffer.buffer, buffer.memory, 0) != VK_SUCCESS ||
+        vkMapMemory(ctx.dev, buffer.memory, 0, VK_WHOLE_SIZE, 0, &buffer.mapped) != VK_SUCCESS) {
+        destroy_render_host_buffer(ctx.dev, buffer);
+        return {};
+    }
+    return buffer;
+}
+
+inline void release_render_host_buffer(VkDevice device, RenderHostBuffer buffer) {
+    if (!buffer.buffer || !buffer.memory || !buffer.mapped) {
+        destroy_render_host_buffer(device, buffer);
+        return;
+    }
+    constexpr size_t max_cached_buffers = 4096;
+    const VkDeviceSize limit = render_host_buffer_pool_limit();
+    if (!limit || buffer.allocation_bytes > limit) {
+        destroy_render_host_buffer(device, buffer);
+        return;
+    }
+
+    std::vector<RenderHostBuffer> evicted;
+    RenderHostBufferPool& pool = render_host_buffer_pool();
+    while ((pool.cached_buffers >= max_cached_buffers ||
+            pool.cached_bytes > limit - buffer.allocation_bytes) &&
+           !pool.available.empty()) {
+        auto victim = pool.available.begin();
+        RenderHostBuffer old = victim->second.back();
+        victim->second.pop_back();
+        if (victim->second.empty()) pool.available.erase(victim);
+        pool.cached_bytes -= old.allocation_bytes;
+        --pool.cached_buffers;
+        ++pool.evictions;
+        evicted.push_back(old);
+    }
+    if (pool.cached_buffers < max_cached_buffers &&
+        pool.cached_bytes <= limit - buffer.allocation_bytes) {
+        pool.available[buffer.bytes].push_back(buffer);
+        pool.cached_bytes += buffer.allocation_bytes;
+        ++pool.cached_buffers;
+        buffer = {};
+    }
+    for (RenderHostBuffer& old : evicted) destroy_render_host_buffer(device, old);
+    if (buffer.buffer) destroy_render_host_buffer(device, buffer);
+}
+
+inline RenderHostBufferPoolStats render_host_buffer_pool_stats() {
+    RenderHostBufferPool& pool = render_host_buffer_pool();
+    return {pool.cached_bytes, pool.cached_buffers, pool.hits, pool.misses, pool.evictions};
+}
+
 struct PersistentDsKey {
     uint64_t dr = 0, dw = 0, sr = 0, sw = 0, htile = 0;
     uint32_t w = 0, h = 0, fmt = 0;
@@ -1521,6 +1663,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     }();
     const bool share_backend_resources =
         getenv("PROSPER_NO_BACKEND_RESOURCE_SHARE") == nullptr;
+    const bool reuse_host_buffers = render_host_buffer_pool_enabled();
     struct SharedBufferKey {
         const uint32_t* words = nullptr;
         size_t count = 0;
@@ -1543,6 +1686,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     struct SharedBufferUpload {
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
+        void* mapped = nullptr;
+        VkDeviceSize bytes = 0;
+        VkDeviceSize allocation_bytes = 0;
+        bool pooled = false;
     };
     struct TextureBindingKey {
         std::array<uint64_t, 22> words{};
@@ -2110,29 +2257,43 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                         buffer_index = shared_buffers.size();
                         SharedBufferUpload upload;
                         const VkDeviceSize bytes = static_cast<VkDeviceSize>(word_count) * 4;
-                        VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-                        buffer_info.size = bytes;
-                        buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-                        vkCreateBuffer(dev, &buffer_info, nullptr, &upload.buffer);
-                        VkMemoryRequirements requirements;
-                        vkGetBufferMemoryRequirements(dev, upload.buffer, &requirements);
-                        const uint32_t memory_type = pick(
-                            requirements.memoryTypeBits,
-                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                        upload.memory = allocate_transient_render_memory(
-                            dev, requirements.size, memory_type);
-                        vkBindBufferMemory(dev, upload.buffer, upload.memory, 0);
-                        void* mapped = nullptr;
-                        vkMapMemory(dev, upload.memory, 0, bytes, 0, &mapped);
-                        std::memcpy(mapped, words, static_cast<size_t>(bytes));
-                        vkUnmapMemory(dev, upload.memory);
+                        if (reuse_host_buffers) {
+                            RenderHostBuffer pooled = acquire_render_host_buffer(ctx, bytes);
+                            upload.buffer = pooled.buffer;
+                            upload.memory = pooled.memory;
+                            upload.mapped = pooled.mapped;
+                            upload.bytes = pooled.bytes;
+                            upload.allocation_bytes = pooled.allocation_bytes;
+                            upload.pooled = upload.buffer && upload.memory && upload.mapped;
+                        }
+                        if (!upload.pooled) {
+                            VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+                            buffer_info.size = bytes;
+                            buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+                            vkCreateBuffer(dev, &buffer_info, nullptr, &upload.buffer);
+                            VkMemoryRequirements requirements;
+                            vkGetBufferMemoryRequirements(dev, upload.buffer, &requirements);
+                            const uint32_t memory_type = pick(
+                                requirements.memoryTypeBits,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                            upload.memory = allocate_transient_render_memory(
+                                dev, requirements.size, memory_type);
+                            vkBindBufferMemory(dev, upload.buffer, upload.memory, 0);
+                            void* mapped = nullptr;
+                            vkMapMemory(dev, upload.memory, 0, bytes, 0, &mapped);
+                            std::memcpy(mapped, words, static_cast<size_t>(bytes));
+                            vkUnmapMemory(dev, upload.memory);
+                        } else {
+                            std::memcpy(upload.mapped, words, static_cast<size_t>(bytes));
+                        }
                         shared_buffers.push_back(upload);
                         shared_buffer_indices.emplace(buffer_key, buffer_index);
                         ++resource_reuse_stats.unique_buffers;
                     }
                     v.sbuf[i] = shared_buffers[buffer_index].buffer;
-                    dbi[i] = {v.sbuf[i], 0, VK_WHOLE_SIZE};
+                    dbi[i] = {v.sbuf[i], 0,
+                              static_cast<VkDeviceSize>(word_count) * sizeof(uint32_t)};
                     wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr[i].dstBinding = r.binding; wr[i].descriptorCount = 1;
                     wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[i].pBufferInfo = &dbi[i];
                 }
@@ -2749,8 +2910,14 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         if (binding.view) vkDestroyImageView(dev, binding.view, nullptr);
     }
     for (const SharedBufferUpload& upload : shared_buffers) {
-        if (upload.buffer) vkDestroyBuffer(dev, upload.buffer, nullptr);
-        if (upload.memory) release_transient_render_memory(dev, upload.memory);
+        if (upload.pooled) {
+            release_render_host_buffer(
+                dev, {upload.buffer, upload.memory, upload.mapped,
+                      upload.bytes, upload.allocation_bytes});
+        } else {
+            if (upload.buffer) vkDestroyBuffer(dev, upload.buffer, nullptr);
+            if (upload.memory) release_transient_render_memory(dev, upload.memory);
+        }
     }
     auto evict_persistent_texture = [&]() {
         auto victim = persistent_texture_images.end();
@@ -2925,6 +3092,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     pool.cached_allocations,
                     static_cast<double>(pool.cached_bytes) / (1024.0 * 1024.0),
                     (unsigned long long)pool.discarded);
+            const RenderHostBufferPoolStats buffer_pool = render_host_buffer_pool_stats();
+            fprintf(stderr,
+                    "[render-timing] backend_buffer_pool hits=%llu misses=%llu cached=%zu %.1f MiB "
+                    "evictions=%llu\n",
+                    (unsigned long long)buffer_pool.hits,
+                    (unsigned long long)buffer_pool.misses,
+                    buffer_pool.cached_buffers,
+                    static_cast<double>(buffer_pool.cached_bytes) / (1024.0 * 1024.0),
+                    (unsigned long long)buffer_pool.evictions);
             const double wn = static_cast<double>(window.calls);
             const double window_total = window.target + window.draw_setup + window.record +
                                         window.gpu_wait + window.readback + window.cleanup;
