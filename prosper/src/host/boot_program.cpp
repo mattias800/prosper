@@ -3,6 +3,46 @@
 // (Linux/macOS: exec_image_linux.cpp; Windows: exec_image_win.cpp).
 #include "boot_program.hpp"
 
+#include <cctype>
+#include <filesystem>
+#include <system_error>
+
+namespace prosper {
+
+// See boot_program.hpp. The fixed preload list names each module with ONE hard-coded casing, but
+// titles disagree: The Messenger ships "Il2cppUserAssemblies.prx" while Blasphemous 2 / Evergate ship
+// "Il2CppUserAssemblies.prx". On case-insensitive hosts (NTFS / WSL DrvFs / default APFS) fopen()
+// opens either spelling — which is the only reason the wrong-case probe ever "worked". On a
+// case-sensitive Linux filesystem it misses, the module is silently dropped as absent, and the
+// guest's runtime sceKernelLoadStartModule gets ENOENT and null-jumps (SIGSEGV at rip=0, #1006).
+// PS5 module paths are effectively case-insensitive (matching the runtime basename compare in
+// hle_kernel.cpp), so correct each missing component against the real directory entry instead.
+// Pure std::filesystem; never throws (error_code overloads), and an unreadable/missing parent just
+// yields `want` unchanged so the caller's existing absence handling applies.
+std::string resolve_module_path_case(const std::string& want) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (want.empty() || fs::exists(fs::path(want), ec)) return want;   // exact case (or case-insensitive FS)
+    const fs::path p(want);
+    const std::string parent = p.parent_path().string();
+    if (parent.empty() || parent == want) return want;                 // no ancestor left to correct
+    const std::string dir = resolve_module_path_case(parent);          // fix ancestor casing first
+    const std::string base = p.filename().string();
+    auto ieq = [](const std::string& a, const std::string& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); i++)
+            if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) return false;
+        return true;
+    };
+    for (const auto& e : fs::directory_iterator(dir, fs::directory_options::skip_permission_denied, ec)) {
+        const std::string real = e.path().filename().string();
+        if (ieq(real, base)) return (fs::path(dir) / real).string();
+    }
+    return want;   // no case-insensitive match either — genuinely absent
+}
+
+} // namespace prosper
+
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
 #include "host/exec_image.hpp"
 #include "hle/dispatch.hpp"
@@ -49,8 +89,15 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
                 in[i].path.find("PSNCommon.prx") != std::string::npos ||
                 in[i].path.find("SaveData.prx") != std::string::npos) in.erase(in.begin() + (ptrdiff_t)i);
     // Cross-title tolerance: drop dependent modules whose file doesn't exist in this dump (the eboot
-    // at index 0 is always kept; each module keeps its fixed base).
+    // at index 0 is always kept; each module keeps its fixed base). Resolve each hard-coded casing to
+    // the real on-disk entry first so a case-only mismatch (#1006) doesn't drop a present module on a
+    // case-sensitive host filesystem.
     for (size_t i = in.size(); i-- > 1; ) {
+        std::string resolved = resolve_module_path_case(in[i].path);
+        if (resolved != in[i].path) {
+            printf("module path case-corrected: %s -> %s\n", in[i].path.c_str(), resolved.c_str());
+            in[i].path = std::move(resolved);
+        }
         if (FILE* f = fopen(in[i].path.c_str(), "rb")) fclose(f);
         else { printf("skipping absent module: %s\n", in[i].path.c_str()); in.erase(in.begin() + (ptrdiff_t)i); }
     }
