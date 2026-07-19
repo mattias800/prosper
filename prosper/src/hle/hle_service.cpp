@@ -1425,6 +1425,7 @@ HLE(s_playgo_getlang) { if (!a1) return PLAYGO_ERR_BAD_POINTER;
 // MED on Mount3's arg order (mount-desc in, result out — matches every PS4 Mount variant);
 // LOW on Prepare/Commit internals (no-op success; PROSPER_SVCLOG captures their real args).
 static constexpr uint64_t SAVE_DATA_ERR_PARAMETER = 0x809F0000ull;
+static constexpr uint64_t SAVE_DATA_ERR_EXISTS = 0x809F0007ull;
 static constexpr uint64_t SAVE_DATA_ERR_NOT_FOUND = 0x809F0008ull;
 static constexpr uint64_t SAVE_DATA_ERR_NO_EVENT = 0x809F0018ull;
 namespace { std::atomic<unsigned> g_savedata_umount_events{0}; }
@@ -1612,8 +1613,16 @@ HLE(s_savemem_sync) {
 static uint64_t savedata_mount_common(const char* api, const char* dirname,
                                       uint32_t mode, uint64_t result_va) {
     if (!dirname || !*dirname || !result_va) return SAVE_DATA_ERR_PARAMETER;
-    const bool create = (mode & 0x24) != 0; // CREATE(4) | CREATE2(0x20, create-if-missing)
-    if (!savedata0_mount(dirname, create)) {
+    const SaveDataMountPolicy policy = (mode & 0x04) ? SaveDataMountPolicy::Create
+        : (mode & 0x20) ? SaveDataMountPolicy::OpenOrCreate
+                        : SaveDataMountPolicy::Open;
+    const SaveDataMountOutcome outcome = savedata0_mount(dirname, policy);
+    if (outcome == SaveDataMountOutcome::Exists) {
+        if (svclog()) fprintf(stderr, "[svc]   %s dir='%s' mode=%#x -> EXISTS\n",
+                              api, dirname, mode);
+        return SAVE_DATA_ERR_EXISTS;
+    }
+    if (outcome == SaveDataMountOutcome::NotFound) {
         if (svclog()) fprintf(stderr, "[svc]   %s dir='%s' mode=%#x -> NOT_FOUND\n",
                               api, dirname, mode);
         return SAVE_DATA_ERR_NOT_FOUND;
@@ -1621,9 +1630,10 @@ static uint64_t savedata_mount_common(const char* api, const char* dirname,
     uint8_t* result = (uint8_t*)PW(result_va);
     memset(result, 0, 0x40);
     memcpy(result, "/savedata0", 11);
-    *(uint32_t*)(result + 0x1c) = create ? 1u : 0u;
-    if (svclog()) fprintf(stderr, "[svc]   %s dir='%s' mode=%#x -> OK (create=%d)\n",
-                          api, dirname, mode, (int)create);
+    const bool created = outcome == SaveDataMountOutcome::Created;
+    *(uint32_t*)(result + 0x1c) = created ? 1u : 0u;
+    if (svclog()) fprintf(stderr, "[svc]   %s dir='%s' mode=%#x -> OK (created=%d)\n",
+                          api, dirname, mode, (int)created);
     return 0;
 }
 

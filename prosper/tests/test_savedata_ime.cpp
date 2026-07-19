@@ -208,6 +208,33 @@ int main() {
                   "legacy Umount of an inactive mount -> NOT_FOUND");
 
             memset(&guarded, 0xAB, sizeof guarded);
+            input2.mode = 4; // CREATE is exclusive
+            CHECK(mount2((uint64_t)(uintptr_t)&input2, (uint64_t)(uintptr_t)&guarded.result,
+                         0,0,0,0) == 0x809F0007ull,
+                  "Mount2 CREATE of an existing save -> EXISTS");
+            CHECK(all_bytes_are(&guarded, sizeof guarded, 0xAB) &&
+                  resolve_guest_path("/savedata0/probe.bin") == "/savedata0/probe.bin",
+                  "failed exclusive CREATE leaves its result untouched and does not mount");
+
+            memset(&guarded, 0xAB, sizeof guarded);
+            input2.mode = 0x20; // CREATE2 opens or creates
+            CHECK(mount2((uint64_t)(uintptr_t)&input2, (uint64_t)(uintptr_t)&guarded.result,
+                         0,0,0,0) == 0 && guarded.result.status == 0,
+                  "Mount2 CREATE2 opens an existing save with OPENED status");
+            CHECK(umount((uint64_t)(uintptr_t)guarded.result.mountPoint, 0,0,0,0,0) == 0,
+                  "legacy Umount releases the CREATE2-opened save");
+
+            SaveDirName create2_dir{}; memcpy(create2_dir.data, "LegacyCreate2", 14);
+            input2.dirName = &create2_dir;
+            memset(&guarded, 0xAB, sizeof guarded);
+            CHECK(mount2((uint64_t)(uintptr_t)&input2, (uint64_t)(uintptr_t)&guarded.result,
+                         0,0,0,0) == 0 && guarded.result.status == 1,
+                  "Mount2 CREATE2 creates a missing save with CREATED status");
+            CHECK(umount((uint64_t)(uintptr_t)guarded.result.mountPoint, 0,0,0,0,0) == 0,
+                  "legacy Umount releases the CREATE2-created save");
+
+            memset(&guarded, 0xAB, sizeof guarded);
+            input2.dirName = &dir2;
             input2.mode = 1;
             CHECK(mount2((uint64_t)(uintptr_t)&input2, (uint64_t)(uintptr_t)&guarded.result,
                          0,0,0,0) == 0 && guarded.result.status == 0,
