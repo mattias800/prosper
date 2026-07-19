@@ -348,6 +348,15 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   their code, types, comments, prose, or tests. Re-derive behavior in prosper's own architecture and add
   project-owned evidence/tests. Never weaken behavior demonstrated by a live boot to match a secondary
   reference, and mark unresolved evidence with `CONFIDENCE: HIGH/MED/LOW`.
+  - **Exception — vendoring permissively-licensed standalone libraries.** The "re-derive, don't copy"
+    rule targets other *emulators'* reimplementations of Sony HLE interfaces (clean-room integrity). It
+    does **not** forbid vendoring a general-purpose, permissively-licensed (MIT/BSD/zlib), self-contained
+    library for a well-defined standalone problem — a codec, hash, math kernel — when that library is
+    itself clean-room (no Sony code/keys) and re-deriving it would be disproportionate. Such a dependency
+    is a deliberate project-owner decision, vendored **verbatim** under `third_party/<name>/` with its
+    LICENSE and a README recording origin/version/why; prosper's own glue (parsing, wiring into the guest
+    path) stays project code. First instance: `third_party/libatrac9/` (MIT, ATRAC9 decode — a large
+    codec, not a Sony interface). Do not use this exception to shortcut Sony ABI/HLE work.
 - **AMD RDNA 2 shader ISA reference:** ["RDNA 2" Instruction Set Architecture: Reference Guide
   (document 70648)](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content). Consult it
   for instruction encodings, operand and condition-code semantics, wave behavior, and memory-instruction
