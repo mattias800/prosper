@@ -1227,11 +1227,10 @@ HLE(ngs2_rack_destroy) {
     NGS2_LOG("sceNgs2RackDestroy");
     std::lock_guard<std::mutex> lock(g_ngs2_mx);
     const uint64_t slot = a0 & 0xff;
-    if ((a0 & kNgs2TagMask) == kNgs2RackTag && slot >= 1 && slot <= 32) {
-        g_ngs2_racks[slot - 1] = {};
-        for (auto it = g_ngs2_voices.begin(); it != g_ngs2_voices.end(); )
-            it = ((it->first >> 8) == slot) ? g_ngs2_voices.erase(it) : std::next(it);
-    }
+    if ((a0 & kNgs2TagMask) != kNgs2RackTag || slot < 1 || slot > 32) return kNgs2ErrInvalidRack;
+    g_ngs2_racks[slot - 1] = {};
+    for (auto it = g_ngs2_voices.begin(); it != g_ngs2_voices.end(); )
+        it = ((it->first >> 8) == slot) ? g_ngs2_voices.erase(it) : std::next(it);
     if (a1 && !a2_store_zeros(a1, 0x40)) return kNgs2ErrInvalidOut;
     return 0;
 }
