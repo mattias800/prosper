@@ -5093,11 +5093,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         uint32_t srt_tag = 0;
                         const bool has_srt_tag = sreg_srt_range_tag(
                             rs, in.src[1].value, 4, srt_tag);
+                        const ShaderResource* tagged_res = has_srt_tag && rt
+                                                               ? rt->by_srt_offset(srt_tag)
+                                                               : nullptr;
                         fprintf(stderr, "[mubuf-unresolved] pc=%u srsrc=s%d srt_tag=%s0x%x key_res=%s (%zu res)\n",
                                 in.pc, in.src[1].value, has_srt_tag ? "" : "NONE ",
                                 has_srt_tag ? srt_tag : 0u,
-                                has_srt_tag && rt->by_srt_offset(srt_tag) ? "yes" : "null",
-                                rt->resources.size());
+                                !rt ? "no-table" : (tagged_res ? "yes" : "null"),
+                                rt ? rt->resources.size() : 0u);
                     }
                     ok = false; return true;
                 }

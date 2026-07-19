@@ -3,6 +3,7 @@
 // data-driven coverage report over the real game shaders (shader_histo).
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include "../src/gpu/shader_resources.hpp"
+#include <cstdlib>
 #include <cstdio>
 #include <vector>
 
@@ -26,11 +27,21 @@ int main() {
     // MTBUF needs a resolved V# binding, so the table-less coverage pass must classify it as
     // recompilable-in-context rather than truly unsupported.
     const uint32_t mtbuf_code[] = { 0xe8b02000u, 0x80020100u, 0xBF810000u };
+#ifdef _WIN32
+    _putenv_s("PROSPER_DBG", "1");
+#else
+    setenv("PROSPER_DBG", "1", 1);
+#endif
     RecompileCoverage mtbuf = recompile_coverage(mtbuf_code,
                                                   sizeof(mtbuf_code)/sizeof(mtbuf_code[0]));
+#ifdef _WIN32
+    _putenv_s("PROSPER_DBG", "");
+#else
+    unsetenv("PROSPER_DBG");
+#endif
     CHECK(mtbuf.total == 1 && mtbuf.table_dependent == 1 && mtbuf.unsupported == 0 &&
           mtbuf.first_bad_fmt < 0,
-          "MTBUF typed loads are reported as resource-table-dependent coverage");
+          "MTBUF typed loads remain null-safe under debug coverage and report table dependence");
     const uint32_t mtbuf_d16_code[] = { 0xe8682000u, 0x80220000u, 0xBF810000u };
     RecompileCoverage mtbuf_d16 = recompile_coverage(
         mtbuf_d16_code, sizeof(mtbuf_d16_code)/sizeof(mtbuf_d16_code[0]));
