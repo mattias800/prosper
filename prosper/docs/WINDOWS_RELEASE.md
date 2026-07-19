@@ -88,7 +88,9 @@ Record controller/keyboard input as a replay route while playing:
 ./start-prosper.ps1 'D:/PS5/PPSA24651-app0' -Record "$PWD/routes/session.pad"
 ```
 
-Release the final held button before exiting so its interval can be written. Runtime logs are printed
+Add `-RecordAxis pad-read` when successful input-state reads are a more stable route clock than
+display presentation; flip recording remains the default. Release the final held button before
+exiting so its interval can be written. Runtime logs are printed
 to the PowerShell console; include those logs, the title ID, GPU/driver, and the release version when
 reporting a problem.
 

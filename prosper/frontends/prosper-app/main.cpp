@@ -395,9 +395,28 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
-        else if (a == "--record" && i + 1 < argc) {
+        else if (a == "--record") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "prosper-app: --record requires a path\n");
+                return 2;
+            }
             if (!set_environment("PROSPER_PAD_RECORD", argv[++i])) {
                 fprintf(stderr, "prosper-app: failed to set PROSPER_PAD_RECORD\n");
+                return 2;
+            }
+        }
+        else if (a == "--record-axis") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "prosper-app: --record-axis requires flip or pad-read\n");
+                return 2;
+            }
+            const std::string axis = argv[++i];
+            if (axis != "flip" && axis != "pad-read") {
+                fprintf(stderr, "prosper-app: --record-axis requires flip or pad-read\n");
+                return 2;
+            }
+            if (!set_environment("PROSPER_PAD_RECORD_AXIS", axis.c_str())) {
+                fprintf(stderr, "prosper-app: failed to set PROSPER_PAD_RECORD_AXIS\n");
                 return 2;
             }
         }

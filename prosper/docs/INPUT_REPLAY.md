@@ -1,6 +1,6 @@
 # Input replay & checkpoints — reaching a game state to reproduce a bug
 
-> **Status (2026-07-19): frame/pad-read anchoring, route loading/recording, and the opt-in deterministic clock have landed.**
+> **Status (2026-07-19): frame/pad-read anchoring and recording, route loading, and the opt-in deterministic clock have landed.**
 > Current master supports inline `PROSPER_PAD_SCRIPT` entries anchored as `fN:`/`fA-B:` (display
 > flips) or `pN:`/`pA-B:` (pad reads), alongside the existing seconds axis. Point entries use
 > `PROSPER_PAD_FRAME_HOLD` or `PROSPER_PAD_READ_HOLD` (both default 8) on their count axis. It also
@@ -9,15 +9,16 @@
 > between flips. Realtime/RTC clocks remain tied to host time. `PROSPER_PAD_SCRIPT=@path` loads newline-
 > separated routes with comments, explicit time/flip/read ranges, and full-deflection stick directions such
 > as `left-stick-left`. `PROSPER_PAD_RECORD=path` records the
-> final button stream on that same flip axis; `prosper-app --record path` exposes it interactively.
+> final button stream on the flip axis by default. Set `PROSPER_PAD_RECORD_AXIS=pad-read`, or pass
+> `prosper-app --record path --record-axis pad-read`, to emit successful-input-read `pA-B:` ranges.
 > `PROSPER_PAD_SCRIPT_LOG=1` logs state transitions with the elapsed time, flip, and pad-read index
 > as the game observes them.
 > `PROSPER_PAD_SCRIPT_RELOAD=1` live-reloads an `@file` route after a changed file remains
 > stable across two metadata polls. Existing time, flip, and read anchors are preserved, so an agent can
 > append future input windows during a long exploratory run without restarting the title.
 > The first checked-in route, `scripts/messenger/reach-intro-story.pad`, repeatedly reaches the opening
-> story but still has small narration-phase drift. Capturing directly onto the pad-read axis and
-> semantic checkpoint validation remain open in #302. The original design follows.
+> story but still has small narration-phase drift. Deeper route calibration and semantic checkpoint
+> validation remain open in #302. The original design follows.
 
 ## The problem
 
@@ -59,8 +60,8 @@ We already have the seed: **`PROSPER_PAD_SCRIPT` (#202)** — a scripted `PadBac
   for 250 ms and replaces the active route only after a complete stable read; read/stat failures
   retain the last valid route. Reload does not reset the first-poll wall-clock, flip, or read origin.
 
-The remaining work is deeper route calibration, pad-read-axis recording, and semantic checkpoint
-validation that does not depend on presentation speed.
+The remaining work is deeper route calibration and semantic checkpoint validation that does not
+depend on presentation speed.
 
 ## Design
 
@@ -75,7 +76,11 @@ validation that does not depend on presentation speed.
   proportional axis values remain future work.
 
 ### 2. Record mode in `prosper-app` - implemented
-`prosper-app --dump <app0> --record <file>`: capture the human's keyboard/gamepad input **stamped by flip count**, writing a script file. This is how checkpoint scripts get *created* — play to the point once, get a reusable, committable route. (The app already snapshots keyboard state per frame; recording is writing that stream out, anchored to `present_count`.)
+`prosper-app --dump <app0> --record <file>` captures the human's keyboard/gamepad button input stamped
+by display-flip count and writes a script file. Add `--record-axis pad-read` to stamp it by successful
+guest input-state reads instead; controller-information queries and rejected reads neither initialize
+nor advance that recording. The flip axis remains the default for backward compatibility. This is how
+checkpoint scripts get *created* — play to the point once, get a reusable, committable route.
 
 ### 3. Checkpoint library + agent docs
 - `prosper/scripts/<title>/reach-*.pad` — **tiny text files, no game imagery, safe to commit** (unlike golden frames). Named by the state they reach: `reach-title-menu.pad`, `reach-level1.pad`, …
@@ -97,7 +102,8 @@ Determinism is iterative: frame-anchoring first, measure drift across repeated r
 
 1. Bug reported "at the shop". Report cites `reach-shop.pad`.
 2. Agent runs their tool with `PROSPER_PAD_SCRIPT=@scripts/messenger/reach-shop.pad` + whatever debug flags — lands at the shop, observes the bug, keeps every existing tool.
-3. New checkpoint needed? Play there once with `prosper-app --record`, commit the `.pad`.
+3. New checkpoint needed? Play there once with `prosper-app --record`; add
+   `--record-axis pad-read` when input polling is the more stable clock, then commit the `.pad`.
 4. Checkpoints double as regression coverage ("can we still reach level 3?") via the #248 harness.
 
 ## Build order
