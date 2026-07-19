@@ -950,7 +950,9 @@ HLE(k_wake_by_address) {
 }
 
 HLE(k_munmap) {
-    if (!a0 || !a1) return 0x80020016ull;
+    constexpr uint64_t mask = kGuestPageSize - 1;
+    if (!a0 || !a1 || (a0 & mask) || (a1 & mask) || a1 > UINT64_MAX - a0)
+        return 0x80020016ull;
     if (munmap((void*)a0, a1) != 0) return 0x80020016ull;
     untrack(a0, a1);
     return 0;
@@ -3721,7 +3723,9 @@ HLE7(k_map_dmem2) {
 }
 
 HLE(k_munmap) {
-    if (!a0 || !a1) return 0x80020016ull;
+    constexpr uint64_t mask = kGuestPageSize - 1;
+    if (!a0 || !a1 || (a0 & mask) || (a1 & mask) || a1 > UINT64_MAX - a0)
+        return 0x80020016ull;
     if (!win_unmap(a0, a1)) return 0x80020016ull;
     untrack(a0, a1);
     return 0;

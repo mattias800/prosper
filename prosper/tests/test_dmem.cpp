@@ -72,6 +72,9 @@ int main() {
           "Munmap rejects a null address");
     CHECK((uint32_t)unmap(0x4000, 0, 0, 0, 0, 0) == 0x80020016u,
           "Munmap rejects a zero-length range");
+    CHECK((uint32_t)unmap(UINT64_MAX & ~0x3fffull, 0x8000, 0, 0, 0, 0) ==
+              0x80020016u,
+          "Munmap rejects an overflowing guest range");
     uint64_t va = 0x30000000000ull;  // Fixed, 64 KiB-aligned, and above the VEH's heap threshold.
     CHECK(reserve((uint64_t)(uintptr_t)&va, len, 0x10 /* MAP_FIXED */, len, 0, 0) == 0,
           "ReserveVirtualRange creates an exact 16 KiB reservation");
@@ -83,6 +86,8 @@ int main() {
     CHECK(*cell == 0x6310CAFEu, "first touch commits one guest page and preserves the write");
     CHECK((uint32_t)unmap(va + 1, len, 0, 0, 0, 0) == 0x80020016u,
           "Munmap reports an unaligned host-unmap failure");
+    CHECK((uint32_t)unmap(va, 1, 0, 0, 0, 0) == 0x80020016u,
+          "Munmap rejects a non-page-multiple length before host rounding");
     uint8_t failed_unmap_info[0x48]{};
     CHECK(query(va, 0, (uint64_t)(uintptr_t)failed_unmap_info,
                 sizeof(failed_unmap_info), 0, 0) == 0 &&
@@ -657,6 +662,9 @@ int main() {
           "Munmap rejects a null address");
     CHECK((uint32_t)unmap(0x4000, 0, 0, 0, 0, 0) == 0x80020016u,
           "Munmap rejects a zero-length range");
+    CHECK((uint32_t)unmap(UINT64_MAX & ~0x3fffull, 0x8000, 0, 0, 0, 0) ==
+              0x80020016u,
+          "Munmap rejects an overflowing guest range");
 
     // Both allocation APIs require their physical-address output. Reject before taking from
     // the pool so an unobservable allocation cannot leak capacity.
@@ -780,6 +788,8 @@ int main() {
         CHECK(rr == 0 && alias, "map ordinary alias for MapDirectMemory2 physical range");
         CHECK((uint32_t)unmap(va + 1, 0x4000, 0, 0, 0, 0) == 0x80020016u,
               "Munmap reports an unaligned host-unmap failure");
+        CHECK((uint32_t)unmap(va, 1, 0, 0, 0, 0) == 0x80020016u,
+              "Munmap rejects a non-page-multiple length before host rounding");
         uint8_t failed_unmap_info[0x48]{};
         CHECK(query(va + 0x2000, 0, (uint64_t)(uintptr_t)failed_unmap_info,
                     sizeof(failed_unmap_info), 0, 0) == 0 &&
