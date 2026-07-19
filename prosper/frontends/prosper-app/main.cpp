@@ -20,6 +20,7 @@
 #include "loader/linker.hpp"           // Program
 #include "input/pad.hpp"               // keyboard -> libScePad (HostPadState / PadBackend)
 #include "pad_overlay.hpp"              // keyboard pad 0 composed over the physical controller backend
+#include "present_mode.hpp"             // explicit swapchain latency/vsync policy, pure regression seam
 #include "window_controls.hpp"           // debounced app-window shortcuts, pure regression seam
 #ifdef PROSPER_HAVE_LIVE_RENDERER
 #include "live_renderer.hpp"           // shared DrawItem->Vulkan compositor (register_live_renderer)
@@ -177,7 +178,8 @@ bool pick_device(Vk& vk) {
     return true;
 }
 
-bool create_swapchain(Vk& vk, uint32_t w, uint32_t h) {
+bool create_swapchain(Vk& vk, uint32_t w, uint32_t h,
+                      prosper::frontend::AppPresentMode requestedPresentMode) {
     VkSurfaceCapabilitiesKHR caps; vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk.phys, vk.surface, &caps);
     vk.scExtent = caps.currentExtent.width != UINT32_MAX ? caps.currentExtent : VkExtent2D{w, h};
     if (vk.scExtent.width == 0 || vk.scExtent.height == 0) return false;   // minimized
@@ -189,6 +191,29 @@ bool create_swapchain(Vk& vk, uint32_t w, uint32_t h) {
 
     uint32_t imgCount = caps.minImageCount + 1;
     if (caps.maxImageCount && imgCount > caps.maxImageCount) imgCount = caps.maxImageCount;
+
+    uint32_t modeN = 0;
+    VKCHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(vk.phys, vk.surface, &modeN, nullptr),
+            "vkGetPhysicalDeviceSurfacePresentModesKHR(count)");
+    std::vector<VkPresentModeKHR> modes(modeN);
+    VKCHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(vk.phys, vk.surface, &modeN, modes.data()),
+            "vkGetPhysicalDeviceSurfacePresentModesKHR(list)");
+    const bool hasMailbox = std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_MAILBOX_KHR) != modes.end();
+    const bool hasImmediate = std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_IMMEDIATE_KHR) != modes.end();
+    const auto selectedPresentMode = prosper::frontend::select_present_mode(
+        requestedPresentMode, hasMailbox, hasImmediate);
+    VkPresentModeKHR vkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+    if (selectedPresentMode.mode == prosper::frontend::AppPresentMode::mailbox)
+        vkPresentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+    else if (selectedPresentMode.mode == prosper::frontend::AppPresentMode::immediate)
+        vkPresentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    if (selectedPresentMode.fell_back) {
+        fprintf(stderr, "[app] requested present mode %s is unsupported; falling back to fifo\n",
+                prosper::frontend::present_mode_name(requestedPresentMode));
+    }
+    fprintf(stderr, "[app] present mode: %s\n",
+            prosper::frontend::present_mode_name(selectedPresentMode.mode));
+
     VkSwapchainCreateInfoKHR si{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     si.surface = vk.surface; si.minImageCount = imgCount; si.imageFormat = vk.scFormat;
     si.imageColorSpace = cs; si.imageExtent = vk.scExtent; si.imageArrayLayers = 1;
@@ -196,7 +221,7 @@ bool create_swapchain(Vk& vk, uint32_t w, uint32_t h) {
     si.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     si.preTransform = caps.currentTransform;
     si.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    si.presentMode = VK_PRESENT_MODE_FIFO_KHR;   // vsync
+    si.presentMode = vkPresentMode;
     si.clipped = VK_TRUE;
     VKCHECK(vkCreateSwapchainKHR(vk.device, &si, nullptr, &vk.swapchain), "vkCreateSwapchainKHR");
     uint32_t n = 0; vkGetSwapchainImagesKHR(vk.device, vk.swapchain, &n, nullptr);
@@ -356,12 +381,20 @@ void poll_keyboard(const bool* keyboard, bool enter_maps_to_options) {
 
 int main(int argc, char** argv) {
     bool testPattern = false; int exitAfter = 0; uint32_t winW = 1280, winH = 720;
+    prosper::frontend::AppPresentMode requestedPresentMode = prosper::frontend::AppPresentMode::fifo;
     std::string dump;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--test-pattern") testPattern = true;
         else if (a == "--frames" && i + 1 < argc) exitAfter = atoi(argv[++i]);   // present N frames then exit (CI/smoke)
         else if (a == "--dump" && i + 1 < argc) dump = argv[++i];                // boot the game at this app0 dir
+        else if (a == "--present-mode") {
+            if (i + 1 >= argc ||
+                !prosper::frontend::parse_present_mode(argv[++i], requestedPresentMode)) {
+                fprintf(stderr, "prosper-app: --present-mode requires fifo, mailbox, or immediate\n");
+                return 2;
+            }
+        }
         else if (a == "--record" && i + 1 < argc) {
             if (!set_environment("PROSPER_PAD_RECORD", argv[++i])) {
                 fprintf(stderr, "prosper-app: failed to set PROSPER_PAD_RECORD\n");
@@ -486,7 +519,7 @@ int main(int argc, char** argv) {
     if (!create_instance(vk, win) || !pick_device(vk)) return 1;
     // Initial swapchain sized to the window; recreated on resize / out-of-date.
     { int dw = 0, dh = 0; SDL_GetWindowSizeInPixels(win, &dw, &dh);
-      if (!create_swapchain(vk, (uint32_t)dw, (uint32_t)dh)) return 1; }
+      if (!create_swapchain(vk, (uint32_t)dw, (uint32_t)dh, requestedPresentMode)) return 1; }
 
     VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; cpi.queueFamilyIndex = vk.qfamily;
@@ -609,7 +642,8 @@ int main(int argc, char** argv) {
             vkDeviceWaitIdle(vk.device);
             if (vk.swapchain) vkDestroySwapchainKHR(vk.device, vk.swapchain, nullptr);
             vk.swapchain = VK_NULL_HANDLE;
-            if (!create_swapchain(vk, static_cast<uint32_t>(dw), static_cast<uint32_t>(dh))) {
+            if (!create_swapchain(vk, static_cast<uint32_t>(dw), static_cast<uint32_t>(dh),
+                                  requestedPresentMode)) {
                 fprintf(stderr, "[app] could not recreate the swapchain after a window-size change\n");
                 running = false;
                 break;

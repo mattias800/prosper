@@ -427,8 +427,8 @@ duplicate. Until then the app is fully functional via `--test-pattern` (and any 
   shows the composited game (verified `--dump … --frames 3`).
 - **P1 — audio** ✅ **done**: `prosper-app` installs the SDL3 `AudioSink` (`sceAudioOut` → host).
 - **P2 — controllers** ✅ **done**: installs the SDL3 `PadBackend` (host gamepad → `libScePad`).
-- **P3 — polish** (in progress): resize/fullscreen is implemented; pause/quit UX and
-  present-mode/latency tuning remain.
+- **P3 — polish** (in progress): resize/fullscreen and present-mode selection are implemented;
+  pause/quit UX remains.
   Native Windows build/run packaging is done via `scripts/run-windows.ps1`. Cooperative guest-stop
   at a flip boundary is a follow-up (today the
   guest thread is detached at window-close and reclaimed by process exit).
@@ -440,7 +440,8 @@ duplicate. Until then the app is fully functional via `--test-pattern` (and any 
 - **The run/stop hook touches the run harness** (`boot_trace`/how the guest loop is driven), which the
   render-frontier and audio workstreams also use — coordinate; keep the fixed-budget CI path intact.
 - **`feat/audio-sdl3` overlap** — P1 must build on that branch, not fork it.
-- **Present latency/vsync** is intentionally FIFO today; low-latency present-mode selection remains
-  P3 work.
+- **Present latency/vsync** defaults to FIFO. `--present-mode mailbox` opts into low-latency vsync,
+  and `--present-mode immediate` explicitly permits tearing; unsupported optional modes fall back to
+  FIFO with a diagnostic.
 - **Later zero-copy** (`external_memory`) is deliberately deferred; the readback seam is the v1 answer.
 - **area:** shared/host infrastructure — needs an `area:` decision and coordination before build.

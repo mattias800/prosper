@@ -288,6 +288,10 @@ if(TARGET prosper_core)
   target_include_directories(test_prosper_app_window_controls PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_window_controls COMMAND test_prosper_app_window_controls)
 
+  add_executable(test_prosper_app_present_mode frontends/prosper-app/test_present_mode.cpp)
+  target_include_directories(test_prosper_app_present_mode PRIVATE frontends/prosper-app)
+  add_test(NAME prosper_app_present_mode COMMAND test_prosper_app_present_mode)
+
   add_executable(test_sync_on_address tests/test_sync_on_address.cpp)
   target_link_libraries(test_sync_on_address PRIVATE prosper_core)
   add_test(NAME sync_on_address COMMAND test_sync_on_address)

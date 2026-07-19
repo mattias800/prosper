@@ -50,6 +50,9 @@ $env:PROSPER_SAVEDATA_DIR = "$PWD/savedata"
 `-force-gfx-direct` is the current Unity default. For a title that must not receive it, launch with
 `-GuestArgs ''`.
 
+Presentation defaults to FIFO vsync. Pass `-PresentMode mailbox` for low-latency vsync or
+`-PresentMode immediate` to permit tearing; either optional mode falls back to FIFO when unsupported.
+
 ## Input and exit
 
 SDL3 automatically uses a connected controller as pad 0. Keyboard input is composed over it:
