@@ -94,6 +94,8 @@ int main() {
     HleFn kernel_ftruncate_fn = Hle::lookup(nid_hash("sceKernelFtruncate"));
     HleFn fsync_fn = Hle::lookup(nid_hash("fsync"));
     HleFn kernel_fsync_fn = Hle::lookup(nid_hash("sceKernelFsync"));
+    HleFn fdatasync_fn = Hle::lookup(nid_hash("fdatasync"));
+    HleFn kernel_fdatasync_fn = Hle::lookup(nid_hash("sceKernelFdatasync"));
     HleFn getdents_fn = Hle::lookup(nid_hash("getdents"));
     HleFn kernel_getdents_fn = Hle::lookup(nid_hash("sceKernelGetdents"));
     HleFn getdirentries_fn = Hle::lookup(nid_hash("getdirentries"));
@@ -114,7 +116,7 @@ int main() {
               dup2_fn && kernel_dup2_fn && mkdir_fn && kernel_mkdir_fn && rmdir_fn &&
               kernel_rmdir_fn && unlink_fn && kernel_unlink_fn && rename_fn &&
               kernel_rename_fn && kernel_truncate_fn && kernel_ftruncate_fn && fsync_fn &&
-              kernel_fsync_fn && getdents_fn &&
+              kernel_fsync_fn && fdatasync_fn && kernel_fdatasync_fn && getdents_fn &&
               kernel_getdents_fn && getdirentries_fn && kernel_getdirentries_fn && stat_fn &&
               kernel_stat_fn && fstat_fn && kernel_fstat_fn && lstat_fn && kernel_lstat_fn &&
               fcntl_fn && kernel_fcntl_fn,
@@ -423,15 +425,19 @@ int main() {
     uint64_t kernel_fsync_result = descriptor_resize_fd >= 0 && kernel_fsync_fn
         ? kernel_fsync_fn((uint64_t)descriptor_resize_fd, 0, 0, 0, 0, 0)
         : ~uint64_t{0};
+    uint64_t kernel_fdatasync_result = descriptor_resize_fd >= 0 && kernel_fdatasync_fn
+        ? kernel_fdatasync_fn((uint64_t)descriptor_resize_fd, 0, 0, 0, 0, 0)
+        : ~uint64_t{0};
     if (descriptor_resize_fd >= 0 && close_fn)
         close_fn((uint64_t)descriptor_resize_fd, 0, 0, 0, 0, 0);
     std::error_code descriptor_resize_size_error;
     uintmax_t descriptor_resize_size =
         std::filesystem::file_size(descriptor_resize_path, descriptor_resize_size_error);
     CHECK(descriptor_resize_fixture_written && kernel_ftruncate_result == 0 &&
-              kernel_fsync_result == 0 && !descriptor_resize_size_error &&
+              kernel_fsync_result == 0 && kernel_fdatasync_result == 0 &&
+              !descriptor_resize_size_error &&
               descriptor_resize_size == 3,
-          "sceKernelFtruncate and sceKernelFsync persist a resized descriptor on both hosts");
+          "sceKernelFtruncate/Fsync/Fdatasync persist a resized descriptor on both hosts");
     std::filesystem::remove(descriptor_resize_path, missing_remove_error);
 
     constexpr uint64_t kGuestOWriteOnly = 0x0001;
@@ -682,6 +688,14 @@ int main() {
     uint64_t kernel_fsync_failure = kernel_fsync_fn
         ? kernel_fsync_fn(closed_io_fd, 0, 0, 0, 0, 0)
         : 0;
+    errno = 0;
+    int64_t libc_fdatasync_result = fdatasync_fn
+        ? (int64_t)fdatasync_fn(closed_io_fd, 0, 0, 0, 0, 0)
+        : 0;
+    const int libc_fdatasync_error = errno;
+    uint64_t kernel_fdatasync_failure = kernel_fdatasync_fn
+        ? kernel_fdatasync_fn(closed_io_fd, 0, 0, 0, 0, 0)
+        : 0;
     uint64_t kernel_ftruncate_failure = kernel_ftruncate_fn
         ? kernel_ftruncate_fn(closed_io_fd, 0, 0, 0, 0, 0)
         : 0;
@@ -689,6 +703,10 @@ int main() {
           "libc fsync retains -1 plus EBADF");
     CHECK(kernel_fsync_failure == 0x80020009u,
           "sceKernelFsync returns SCE_KERNEL_ERROR_EBADF directly");
+    CHECK(libc_fdatasync_result == -1 && libc_fdatasync_error == EBADF,
+          "libc fdatasync retains -1 plus EBADF");
+    CHECK(kernel_fdatasync_failure == 0x80020009u,
+          "sceKernelFdatasync returns SCE_KERNEL_ERROR_EBADF directly");
     CHECK(kernel_ftruncate_failure == 0x80020009u,
           "sceKernelFtruncate returns SCE_KERNEL_ERROR_EBADF directly");
 

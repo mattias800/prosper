@@ -1331,6 +1331,15 @@ HLE(f_fstat) { struct stat st; int r = ::fstat((int)a0, &st); int err = r < 0 ? 
 // the key fix is WRITING the buffer. fsync: was fake-success; flush for real save durability.
 HLE(f_lstat) { std::string h = translate(CS(a0)); struct stat st; int r = ::lstat(h.c_str(), &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
 HLE(f_fsync) { return (uint64_t)(int64_t)::fsync((int)a0); }
+HLE(f_fdatasync) {
+#if defined(__APPLE__)
+    // Darwin does not expose fdatasync. fsync provides the required durability as a stronger
+    // operation while preserving the descriptor/error contract.
+    return (uint64_t)(int64_t)::fsync((int)a0);
+#else
+    return (uint64_t)(int64_t)::fdatasync((int)a0);
+#endif
+}
 #else
 HLE(f_stat)  { std::string h = translate(CS(a0)); struct _stat64 st; int r = ::_stat64(h.c_str(), &st); if (r == 0 && a1) to_sce_stat64(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
 HLE(f_fstat) { struct _stat64 st; std::string directory_path;
@@ -1346,6 +1355,9 @@ HLE(f_fstat) { struct _stat64 st; std::string directory_path;
 HLE(f_lstat) { return f_stat(a0,a1,a2,a3,a4,a5); }
 HLE(f_fsync) { ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
                return (uint64_t)(int64_t)::_commit((int)a0); }
+// The Windows CRT has no data-only durability primitive. _commit is the same stronger fallback
+// used for fsync and, unlike the missing-import stub, reports invalid descriptors truthfully.
+HLE(f_fdatasync) { return f_fsync(a0,a1,a2,a3,a4,a5); }
 #endif
 
 // These file APIs have signed 32-bit results. Kernel exports return the translated SCE error
@@ -1360,6 +1372,7 @@ HLE(k_lstat)    { uint64_t r = f_lstat(a0, a1, a2, a3, a4, a5);    int e = errno
 HLE(k_truncate) { uint64_t r = f_truncate(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
 HLE(k_ftruncate){ uint64_t r = f_ftruncate(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
 HLE(k_fsync)    { uint64_t r = f_fsync(a0, a1, a2, a3, a4, a5);    int e = errno; return kernel_file_result32(r, e); }
+HLE(k_fdatasync){ uint64_t r = f_fdatasync(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
 HLE(f_access){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::access(h.c_str(), (int)a1); }
 HLE(f_mkdir) { std::string h = translate(CS(a0));   // sceKernelMkdir(path, mode)
 #ifdef _WIN32
@@ -2100,7 +2113,8 @@ void register_file_hle() {
     R("sceKernelWrite", k_write); R("sceKernelLseek", k_lseek); R("sceKernelStat", k_stat);
     R("sceKernelFtruncate", k_ftruncate);   // real resize (was fake-success -> corrupt saves)
     R("lstat", f_lstat);   R("sceKernelLstat", k_lstat);     // was MISSING -> uninitialized stat buffer
-    R("fsync", f_fsync);   R("sceKernelFsync", k_fsync);     // was fake-success -> no durability
+    R("fsync", f_fsync);       R("sceKernelFsync", k_fsync);       // real descriptor durability
+    R("fdatasync", f_fdatasync); R("sceKernelFdatasync", k_fdatasync); // data-only durability
     R("sceKernelTruncate", k_truncate);      // path-based sibling (same corruption class)
     R("sceKernelFstat", k_fstat);
     // Low-level POSIX wrappers with the internal leading-underscore names. Real libc.prx implements
