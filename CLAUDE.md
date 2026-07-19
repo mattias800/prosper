@@ -399,13 +399,18 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
        or park the work, comment what state it's in and remove the `in-progress` label.
     6. Claims expire: `in-progress` with no open PR and no activity for 24 h is stale — anyone
        may re-claim after posting a takeover comment.
-  - **Stay in your area lane (multi-workstream).** Separate workstreams run in parallel, each
-    possibly coordinating its own sub-agents, split by title/subsystem via `area:` labels:
-    `area:ue4` (PPSA17942 / Unreal Engine — IoStore/APR/Ampr, RHI, the UE allocator) and
-    `area:messenger` (PPSA24651 / The Messenger, IL2CPP/Unity, and shared infra: loader, libc,
-    libkernel, the recompiler, generic GPU/AGC). **Do NOT touch code or claim issues outside your
-    workstream's area** — cross-lane edits collide with the other workstream's in-flight sub-agents.
-    If a fix genuinely spans both (shared infra that a UE issue also needs), coordinate on the issue
-    first; default to the shared-infra/Messenger lane owning shared files. Label every new issue with
-    its `area:` so the lanes stay legible; when unsure which lane a file belongs to, check which
-    title's boot path exercises it.
+  - **Labels are organizational, not access gates.** Two prefixes classify every issue:
+    - **`game:<title>`** names a *game* whose specific boot path an issue exercises — `game:messenger`
+      (PPSA24651 / The Messenger, IL2CPP/Unity), `game:blasphemous2` (PPSA13579), `game:ue4`
+      (PPSA17942 / Unreal Engine), etc.
+    - **`area:<subsystem>`** names *shared code used across titles*. `area:infra` is the shared
+      substrate — loader, libc, libkernel, the recompiler, generic GPU/AGC, host mapping/ABI. Shared
+      code is never bucketed under a game's label (it belongs to every title, so a single `game:` tag
+      would be a category error).
+
+    Pick `game:<title>` when the fix is specific to one game; pick `area:infra` (or another `area:`
+    subsystem label) when it lives in the shared substrate. A single issue may carry both — e.g. an
+    `area:infra` loader bug first observed in `game:blasphemous2`. The labels describe *what* an issue
+    touches; they do **not** fence off who may work where. Any file or issue is fair game — when
+    several agents run concurrently, coordinate through the claim lock and worktrees above rather than
+    by carving up the codebase.
