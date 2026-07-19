@@ -61,8 +61,10 @@ int main() {
     };
     RecompileCoverage terminal = recompile_coverage(
         terminating_if_else, sizeof(terminating_if_else)/sizeof(terminating_if_else[0]));
-    CHECK(terminal.unsupported == 0 && terminal.first_bad_fmt < 0,
-          "a terminating post-endpgm if/else reports fully structured coverage");
+    CHECK(terminal.total == 6 && terminal.alu == 6 && terminal.exports == 0 &&
+              terminal.table_dependent == 0 && terminal.unsupported == 0 &&
+              terminal.first_bad_fmt < 0,
+          "a terminating post-endpgm if/else reports six real guest instructions as structured");
 
     // A forward VCC branch is not covered by EXEC predication. Treating it as a no-op would execute
     // the skipped block even when VCC says to branch, so the recompiler must reject it for now.

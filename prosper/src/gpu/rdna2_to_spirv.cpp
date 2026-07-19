@@ -1603,7 +1603,9 @@ struct SpirvCompute {
 // Immediate-end/nop-end tails remain the established early-out shape and are not rewritten.
 static bool extend_terminating_if_else(const uint32_t* code, size_t dwords,
                                        std::vector<Rdna2Inst>& instructions,
-                                       size_t* required_dwords = nullptr) {
+                                       size_t* required_dwords = nullptr,
+                                       uint32_t* synthetic_branch_pc = nullptr) {
+    if (synthetic_branch_pc) *synthetic_branch_pc = UINT32_MAX;
     if (!code || instructions.empty()) return false;
     auto first_end = std::find_if(instructions.begin(), instructions.end(),
                                   [](const Rdna2Inst& in) { return in.is_end; });
@@ -1647,6 +1649,7 @@ static bool extend_terminating_if_else(const uint32_t* code, size_t dwords,
     first_end->simm16 = static_cast<int32_t>(skip_dwords);
     first_end->words[0] = 0xbf820000u | (skip_dwords & 0xffffu);
     first_end->is_end = false;
+    if (synthetic_branch_pc) *synthetic_branch_pc = first_end->pc;
     instructions.insert(instructions.end(), tail.begin(), tail.end());
     if (required_dwords) *required_dwords = target + tail_dwords;
     return true;
@@ -7599,7 +7602,8 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
 RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
-    (void)extend_terminating_if_else(code, dwords, ins);
+    uint32_t synthetic_branch_pc = UINT32_MAX;
+    (void)extend_terminating_if_else(code, dwords, ins, nullptr, &synthetic_branch_pc);
 
     // A scratch builder/state so emit_alu can run; its emitted code is discarded — we only want `ok`.
     SpirvCompute b; b.begin(1);
@@ -7624,6 +7628,10 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     RecompileCoverage cov;
     for (const auto& in : ins) {
         if (in.is_end) break;
+        // The rewritten first s_endpgm is compiler-only control flow. It lets the structured emitter
+        // reuse its ordinary if/else path, but coverage describes decoded guest instructions and has
+        // always excluded s_endpgm, so do not inflate total/ALU with this synthetic arm skip.
+        if (in.pc == synthetic_branch_pc) continue;
         cov.total++;
         if (in.fmt == Rdna2Format::EXP) { cov.exports++; continue; }   // handled by the stage recompilers
         bool ok = true;
