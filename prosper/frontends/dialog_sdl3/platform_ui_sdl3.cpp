@@ -116,11 +116,13 @@ struct SdlPlatformUi : PlatformUi {
     std::atomic<bool>     save_pending{false};
     std::atomic<uint32_t> save_button{0 /*INVALID*/};
     std::atomic<bool>     save_canceled{false};
+    std::atomic<uint64_t> save_generation{0};
 
     bool saveDataDialogOpen(uint64_t param) override {
         SaveDataRequest request = read_savedata_request(param);
         if (!request.supported) return false;
         { std::lock_guard<std::mutex> lk(save_mx); save_request = request; }
+        save_generation.fetch_add(1);
         save_button.store(0);
         save_canceled.store(false);
         save_status.store(2 /*RUNNING*/);
@@ -135,7 +137,9 @@ struct SdlPlatformUi : PlatformUi {
         return (int)save_button.load();
     }
     void saveDataDialogClose() override {
+        save_generation.fetch_add(1); // invalidate a modal already running on the main thread
         save_pending.store(false);
+        std::lock_guard<std::mutex> lk(save_mx);
         save_status.store(0 /*NONE*/);
     }
 
@@ -178,6 +182,7 @@ struct SdlPlatformUi : PlatformUi {
     // then flips status to FINISHED so the guest's next poll — and its buffer read — see it).
     void pump() {
         if (save_pending.exchange(false)) {
+            const uint64_t generation = save_generation.load();
             SaveDataRequest request;
             { std::lock_guard<std::mutex> lk(save_mx); request = save_request; }
             const int clicked = show_box(request.error ? SDL_MESSAGEBOX_ERROR
@@ -185,9 +190,12 @@ struct SdlPlatformUi : PlatformUi {
                                          "prosper - Saved Data", request.message.c_str(),
                                          request.buttons);
             const bool canceled = clicked <= 0;
-            save_button.store(canceled ? 0u : (uint32_t)clicked);
-            save_canceled.store(canceled);
-            save_status.store(3 /*FINISHED*/);
+            std::lock_guard<std::mutex> lk(save_mx);
+            if (save_generation.load() == generation && save_status.load() == 2 /*RUNNING*/) {
+                save_button.store(canceled ? 0u : (uint32_t)clicked);
+                save_canceled.store(canceled);
+                save_status.store(3 /*FINISHED*/);
+            }
         }
         if (ime_pending.exchange(false)) {
             ImeRequest r; { std::lock_guard<std::mutex> lk(ime_mx); r = ime_req; }
