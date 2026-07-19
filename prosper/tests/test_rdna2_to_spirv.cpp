@@ -3533,6 +3533,54 @@ int main() {
     CHECK(!spvA9b.empty(),
           "A9b: a real s_cmp between the mask op and the consumer re-arms SCC (recompiles)");
 
+    // A10 (#458): a fixed-offset compiler spill/fill preserves the exact per-invocation VGPR bits.
+    const uint32_t codeA10[] = {
+        0xdc704010u, 0x00000000u, // scratch_store_dword off, v0, s0 offset:16
+        0x7e000280u,              // v_mov_b32 v0, 0
+        0xdc304010u, 0x00000000u, // scratch_load_dword v0, off, s0 offset:16
+        0xBF810000u,
+    };
+    std::vector<uint32_t> spvA10 = recompile_valu(codeA10, std::size(codeA10), 1, 0);
+    CHECK(!spvA10.empty(), "A10: fixed-offset private dword spill/fill recompiles");
+    const std::vector<float> scratch_in = {-7.25f, 0.0f, 3.5f, 1234.0f};
+    std::vector<float> gotA10 = prosper::test::run_compute(
+        spvA10, scratch_in, static_cast<uint32_t>(scratch_in.size()),
+        static_cast<uint32_t>(scratch_in.size()));
+    CHECK(gotA10 == scratch_in,
+          "A10: private dword spill/fill round-trips exact values for every invocation");
+
+    // A11 (#458): vector forms use consecutive VGPRs while retaining one private offset range.
+    const uint32_t codeA11[] = {
+        0xdc744020u, 0x00060000u, // scratch_store_dwordx2 off, v[0:1], s6 offset:32
+        0x7e000280u, 0x7e020280u, // clear v0/v1
+        0xdc344020u, 0x00060000u, // scratch_load_dwordx2 v[0:1], off, s6 offset:32
+        0xBF810000u,
+    };
+    std::vector<uint32_t> spvA11 = recompile_valu(codeA11, std::size(codeA11), 2, 1);
+    CHECK(!spvA11.empty(), "A11: fixed-offset private dwordx2 spill/fill recompiles");
+    const std::vector<float> scratch_pair_in = {
+        1.0f, 11.0f, 2.0f, 12.0f, 3.0f, 13.0f, 4.0f, 14.0f,
+    };
+    const std::vector<float> scratch_pair_expect = {11.0f, 12.0f, 13.0f, 14.0f};
+    std::vector<float> gotA11 = prosper::test::run_compute(spvA11, scratch_pair_in, 4, 4);
+    CHECK(gotA11 == scratch_pair_expect,
+          "A11: private dwordx2 spill/fill restores the second consecutive VGPR");
+
+    // A12 (#458): a signed 16-bit spill crossing a dword boundary is reconstructed exactly.
+    const uint32_t codeA12[] = {
+        0x7e0002ffu, 0x00008001u, // v_mov_b32 v0, 0x8001
+        0xdc684003u, 0x00000000u, // scratch_store_short off, v0, s0 offset:3
+        0x7e000280u,              // v_mov_b32 v0, 0
+        0xdc2c4003u, 0x00000000u, // scratch_load_sshort v0, off, s0 offset:3
+        0x7e000b00u,              // v_cvt_f32_i32 v0, v0
+        0xBF810000u,
+    };
+    std::vector<uint32_t> spvA12 = recompile_valu(codeA12, std::size(codeA12), 0, 0);
+    CHECK(!spvA12.empty(), "A12: unaligned signed private short spill/fill recompiles");
+    std::vector<float> gotA12 = prosper::test::run_compute(spvA12, {0.0f}, 1, 1);
+    CHECK(gotA12.size() == 1 && gotA12[0] == -32767.0f,
+          "A12: straddling signed private short reloads with correct sign extension");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

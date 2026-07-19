@@ -71,9 +71,9 @@ struct Rdna2Inst {
     // 4/5 = WORD_0/WORD_1. Only combos the recompiler models clear has_modifier.
     uint8_t     sdwa_dst_sel = 6, sdwa_dst_unused = 0, sdwa_src0_sel = 6, sdwa_src1_sel = 6;
 
-    // Decoded operands (filled for the ALU formats: SOP1/2/K, VOP1/2/C, VOP3). `opcode` is the
-    // format-local opcode; `dst` the destination; `src[0..n_src-1]` the sources. simm16 holds the
-    // signed 16-bit immediate for SOPK/SOPP. Memory/interp/export formats leave these unset (fmt only).
+    // Decoded operands. `opcode` is the format-local opcode; `dst` the destination (or VDATA source
+    // base for memory stores); `src[0..n_src-1]` the remaining sources. simm16 holds the signed
+    // 16-bit immediate for SOPK/SOPP. Most memory/interp/export formats populate the same fields.
     uint32_t opcode = 0;
     Operand  dst;
     Operand  src[4];        // up to 4 (EXP has 4 VGPR sources; VOP3 uses 3)
@@ -111,6 +111,14 @@ struct Rdna2Inst {
     // MTBUF Texel Fault Enable (instruction bit 55 / dword1 bit 23) writes a status VGPR after the
     // data results. Kept explicit so the recompiler can reject until that observable write is modeled.
     bool     mtbuf_tfe = false;
+    // FLAT/GLOBAL/SCRATCH share the 0x37 encoding. Segment 0=flat, 1=scratch, 2=global; OFFSET is a
+    // signed 12-bit byte immediate stored sign-extended in `literal`. src[0] is VADDR (None for the
+    // canonical scratch `off, sN` form), src[1] is the seven-bit SADDR field, and dst is VDST for
+    // loads or VDATA for stores. Cache-policy flags do not change private scratch data semantics.
+    uint32_t flat_segment = 0;
+    bool     flat_glc = false;
+    bool     flat_slc = false;
+    bool     flat_dlc = false;
     // DS-only: GDS flag. llvm-mc gfx1030 round-trip places it at dword0 bit 17 (ds_add_u32 gds =
     // 0xd8020000 vs 0xd8000000; Table 94's "GDS [16]" is a GFX9-era erratum — it also misplaces
     // OP). Bit 16 is likewise captured so an unknown flag rejects rather than silently running

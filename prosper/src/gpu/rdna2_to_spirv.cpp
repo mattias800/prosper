@@ -92,6 +92,89 @@ enum : uint32_t {
 
 uint32_t fbits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 
+struct FlatAccessInfo {
+    bool valid = false;
+    bool store = false;
+    bool sign_extend = false;
+    uint32_t bits = 0;
+    uint32_t components = 0;
+    uint32_t bytes() const { return (bits / 8u) * components; }
+};
+
+FlatAccessInfo flat_access_info(uint32_t opcode) {
+    switch (opcode) {
+        case 0x08: return {true, false, false, 8, 1};   // *_load_ubyte
+        case 0x09: return {true, false, true,  8, 1};   // *_load_sbyte
+        case 0x0a: return {true, false, false, 16, 1};  // *_load_ushort
+        case 0x0b: return {true, false, true,  16, 1};  // *_load_sshort
+        case 0x0c: return {true, false, false, 32, 1};  // *_load_dword
+        case 0x0d: return {true, false, false, 32, 2};
+        case 0x0e: return {true, false, false, 32, 4};
+        case 0x0f: return {true, false, false, 32, 3};
+        case 0x18: return {true, true,  false, 8, 1};   // *_store_byte
+        case 0x1a: return {true, true,  false, 16, 1};  // *_store_short
+        case 0x1c: return {true, true,  false, 32, 1};  // *_store_dword
+        case 0x1d: return {true, true,  false, 32, 2};
+        case 0x1e: return {true, true,  false, 32, 4};
+        case 0x1f: return {true, true,  false, 32, 3};
+        default: return {};
+    }
+}
+
+struct StaticScratchLayout {
+    bool valid = true;
+    bool used = false;
+    int32_t min_byte = 0;
+    uint32_t dwords = 0;
+    int32_t saddr = -1;
+};
+
+StaticScratchLayout analyze_static_scratch(const std::vector<Rdna2Inst>& ins) {
+    StaticScratchLayout out;
+    int32_t min_byte = INT32_MAX, max_byte = INT32_MIN;
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt != Rdna2Format::FLAT) continue;
+        const FlatAccessInfo access = flat_access_info(in.opcode);
+        // The common compiler spill form is a static byte offset from one entry-provided scratch
+        // base: `scratch_* ..., off, sN`. Dynamic VADDR, multiple/rewritten bases, D16-high forms,
+        // atomics, and arbitrary flat/global pointers stay fail-closed.
+        if (in.flat_segment != 1u || !access.valid || in.src[0].kind != OperandKind::None ||
+            in.src[1].kind != OperandKind::SGPR) {
+            out.valid = false;
+            return out;
+        }
+        if (out.saddr < 0) out.saddr = in.src[1].value;
+        else if (out.saddr != in.src[1].value) {
+            out.valid = false;
+            return out;
+        }
+        const int32_t begin = static_cast<int32_t>(in.literal);
+        const int32_t end = begin + static_cast<int32_t>(access.bytes());
+        min_byte = std::min(min_byte, begin);
+        max_byte = std::max(max_byte, end);
+        out.used = true;
+    }
+    if (!out.used) return out;
+    auto floor4 = [](int32_t value) {
+        return value >= 0 ? (value / 4) * 4 : -(((-value + 3) / 4) * 4);
+    };
+    auto ceil4 = [](int32_t value) {
+        return value >= 0 ? ((value + 3) / 4) * 4 : -((-value / 4) * 4);
+    };
+    const int32_t aligned_min = floor4(min_byte);
+    const int32_t aligned_max = ceil4(max_byte);
+    // The signed 12-bit instruction offset spans 4096 bytes, and a vector access at the positive
+    // edge can extend by another 16 bytes. Keep a modest ceiling while accepting that full range.
+    if (aligned_max <= aligned_min || aligned_max - aligned_min > 8192) {
+        out.valid = false;
+        return out;
+    }
+    out.min_byte = aligned_min;
+    out.dwords = static_cast<uint32_t>((aligned_max - aligned_min) / 4);
+    return out;
+}
+
 // The f16 bit pattern an inline float constant supplies in a 16-bit operand position (ISA Table 10
 // lists per-width encodings: "0.5 ... half: 0x3800" etc.). Only 1/(2*pi) (code 248, 0x3118) differs
 // from rounding the f32 value — the f32 table entry 0.15915494 would round to a different last bit
@@ -122,6 +205,9 @@ struct SpirvCompute {
     uint32_t v_push_constants = 0, t_ptr_push_u32 = 0;
     uint32_t linear_localid = 0, local_count = 64, wave_size = 64;
     uint32_t v_cbuf=0, v_cbuf1=0, t_ptr_sb_u32=0;   // scalar-memory constant buffers (bindings 2 and 3)
+    uint32_t guest_scratch=0, t_ptr_guest_scratch_u32=0;
+    int32_t guest_scratch_min_byte=0, guest_scratch_saddr=-1;
+    uint32_t guest_scratch_dwords=0;
     std::map<uint32_t, uint32_t> cbuf_var;          // binding -> storage-buffer var (N-buffer model; 2/3 map to v_cbuf/v_cbuf1)
     bool     is_fragment=0;                          // true in the fragment shell (gates VINTRP interp)
     bool     is_compute=0;                            // true in the compute shell (gates LDS / s_barrier)
@@ -242,6 +328,88 @@ struct SpirvCompute {
                     decl.begin(), decl.end());
         function_var_insert += decl.size();
         return var;
+    }
+    void declare_guest_scratch(const StaticScratchLayout& layout) {
+        if (!layout.valid || !layout.used || !layout.dwords || guest_scratch) return;
+        guest_scratch_min_byte = layout.min_byte;
+        guest_scratch_saddr = layout.saddr;
+        guest_scratch_dwords = layout.dwords;
+        const uint32_t array = id();
+        put(types, Op_TypeArray, {array, t_u32, uconst(layout.dwords)});
+        uint32_t ptr_array = 0;
+        guest_scratch = function_var(array, ptr_array);
+        t_ptr_guest_scratch_u32 = id();
+        put(types, Op_TypePointer, {t_ptr_guest_scratch_u32, SC_Function, t_u32});
+    }
+    uint32_t guest_scratch_load_word(uint32_t index) {
+        uint32_t pointer = id();
+        putv(code, Op_AccessChain,
+             {t_ptr_guest_scratch_u32, pointer, guest_scratch, uconst(index)});
+        uint32_t value = id();
+        put(code, Op_Load, {t_u32, value, pointer});
+        return value;
+    }
+    void guest_scratch_store_word(uint32_t index, uint32_t value,
+                                  bool predicated, uint32_t pred) {
+        auto store = [&]() {
+            uint32_t pointer = id();
+            putv(code, Op_AccessChain,
+                 {t_ptr_guest_scratch_u32, pointer, guest_scratch, uconst(index)});
+            put(code, Op_Store, {pointer, value});
+        };
+        if (!predicated) { store(); return; }
+        const uint32_t then_label = id(), merge_label = id();
+        emit_selmerge(merge_label);
+        emit_condbranch(pred, then_label, merge_label);
+        emit_label(then_label);
+        store();
+        emit_branch(merge_label);
+        emit_label(merge_label);
+    }
+    uint32_t guest_scratch_load_bits(int32_t byte_offset, uint32_t bits, bool sign_extend) {
+        const uint32_t relative = static_cast<uint32_t>(byte_offset - guest_scratch_min_byte);
+        const uint32_t index = relative / 4u, shift = (relative & 3u) * 8u;
+        uint32_t value = guest_scratch_load_word(index);
+        if (shift + bits <= 32u)
+            return sign_extend ? bfe_s(value, uconst(shift), uconst(bits))
+                               : bfe_u(value, uconst(shift), uconst(bits));
+        const uint32_t low_bits = 32u - shift, high_bits = bits - low_bits;
+        const uint32_t low = ibin(Op_ShiftRightLogical, value, uconst(shift));
+        const uint32_t high_word = guest_scratch_load_word(index + 1u);
+        const uint32_t high = bfe_u(high_word, uconst(0), uconst(high_bits));
+        const uint32_t joined = ibin(Op_BitwiseOr, low,
+                                     ibin(Op_ShiftLeftLogical, high, uconst(low_bits)));
+        return sign_extend ? bfe_s(joined, uconst(0), uconst(bits)) : joined;
+    }
+    void guest_scratch_store_bits(int32_t byte_offset, uint32_t bits, uint32_t value,
+                                  bool predicated, uint32_t pred) {
+        const uint32_t relative = static_cast<uint32_t>(byte_offset - guest_scratch_min_byte);
+        const uint32_t index = relative / 4u, shift = (relative & 3u) * 8u;
+        auto bit_mask = [](uint32_t width) {
+            return width == 32u ? 0xffffffffu : ((1u << width) - 1u);
+        };
+        auto replace = [&](uint32_t word_index, uint32_t dst_shift,
+                           uint32_t width, uint32_t source_shift) {
+            const uint32_t mask = bit_mask(width) << dst_shift;
+            const uint32_t old = guest_scratch_load_word(word_index);
+            uint32_t field = source_shift
+                ? ibin(Op_ShiftRightLogical, value, uconst(source_shift)) : value;
+            if (dst_shift) field = ibin(Op_ShiftLeftLogical, field, uconst(dst_shift));
+            field = ibin(Op_BitwiseAnd, field, uconst(mask));
+            const uint32_t retained = ibin(Op_BitwiseAnd, old, uconst(~mask));
+            guest_scratch_store_word(word_index, ibin(Op_BitwiseOr, retained, field),
+                                     predicated, pred);
+        };
+        if (shift + bits <= 32u) {
+            if (bits == 32u && shift == 0u)
+                guest_scratch_store_word(index, value, predicated, pred);
+            else
+                replace(index, shift, bits, 0);
+            return;
+        }
+        const uint32_t low_bits = 32u - shift;
+        replace(index, shift, low_bits, 0);
+        replace(index + 1u, 0, bits - low_bits, low_bits);
     }
     uint32_t load_function(uint32_t type, uint32_t var) {
         uint32_t value = id(); put(code, Op_Load, {type, value, var}); return value;
@@ -1206,6 +1374,7 @@ struct SpirvCompute {
         if (with_cbufs) declare_cbufs(rt);   // only when the shader has memory ops (keeps no-op renders binding-free)
         put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
         put(code, Op_Label, {lbl}); cur_block = lbl;
+        function_var_insert = code.size();
     }
     // Write a vec4(r,g,b,a) (bit-operands) to the matching fragment color output.
     void export_color(uint32_t mrt, uint32_t r, uint32_t g, uint32_t bl, uint32_t a) {
@@ -1262,6 +1431,7 @@ struct SpirvCompute {
         if (with_cbufs) declare_cbufs(rt);   // vertex fetch (buffer_load_format_*) reads these
         put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
         put(code, Op_Label, {lbl}); cur_block = lbl;
+        function_var_insert = code.size();
     }
     // Load gl_VertexIndex as raw bits (VGPR v0 for a vertex shader).
     uint32_t load_vertex_index() { uint32_t r = id(); put(code, Op_Load, {t_i32, r, v_vid}); return i2u(r); }
@@ -1997,6 +2167,7 @@ std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& i
                 (in.fmt == Rdna2Format::VOP1 || in.fmt == Rdna2Format::VOP2 || in.fmt == Rdna2Format::VOP3 ||
                  in.fmt == Rdna2Format::MIMG || in.fmt == Rdna2Format::MUBUF ||
                  in.fmt == Rdna2Format::MTBUF || in.fmt == Rdna2Format::DS ||
+                 in.fmt == Rdna2Format::FLAT ||
                  sopp_is_noop(in))) {
                 continue;
             }
@@ -2222,6 +2393,7 @@ std::unordered_set<uint32_t> waterfall_branches(const std::vector<Rdna2Inst>& in
                 p.fmt == Rdna2Format::VOP1 || p.fmt == Rdna2Format::VOP2 || p.fmt == Rdna2Format::VOP3 ||
                 p.fmt == Rdna2Format::VOPC || p.fmt == Rdna2Format::MIMG ||
                 p.fmt == Rdna2Format::MUBUF || p.fmt == Rdna2Format::MTBUF ||
+                p.fmt == Rdna2Format::FLAT ||
                 sopp_is_noop(p);
             if (skip_ok) continue;
             // The SCC producer: a 64-bit wave-mask logical op (s_and/or/xor/andn2_b64, SCC = result!=0).
@@ -2350,6 +2522,10 @@ uint32_t vgpr_write_count(const Rdna2Inst& in) {
         case Rdna2Format::MTBUF:
             if (in.opcode >= 4u) return 0; // stores read VDATA; they do not write it
             return in.opcode + 1u;
+        case Rdna2Format::FLAT: {
+            const FlatAccessInfo access = flat_access_info(in.opcode);
+            return access.valid && !access.store ? access.components : 0;
+        }
         case Rdna2Format::MIMG: {
             if (in.opcode == 0x47 || in.opcode == 0x57) return 4;  // gather4 always returns four texels
             uint32_t n = 0;
@@ -2998,6 +3174,7 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
                     vregs.insert(in.dst.value + (int)k);
                 break;
             case Rdna2Format::MUBUF: case Rdna2Format::MTBUF: case Rdna2Format::MIMG:
+            case Rdna2Format::FLAT:
                 for (uint32_t k = 0; k < vgpr_write_count(in); ++k)
                     vregs.insert(in.dst.value + (int)k);
                 break;
@@ -4733,6 +4910,42 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else {
                 // Scalar data loads overwrite the destination; they do not carry descriptor identity.
                 for (uint32_t k = 0; k < n; k++) rs.sreg_srt.erase(in.dst.value + (int)k);
+            }
+            return true;
+        }
+        case Rdna2Format::FLAT: {
+            const FlatAccessInfo access = flat_access_info(in.opcode);
+            // Model the compiler's private spill area only. Each generated shader invocation owns
+            // one Function-storage array, so the entry-provided hardware base has no host-visible
+            // address to preserve. Other FLAT/GLOBAL forms remain deliberately unsupported.
+            if (!access.valid || in.flat_segment != 1u || !b.guest_scratch ||
+                in.src[0].kind != OperandKind::None || in.src[1].kind != OperandKind::SGPR ||
+                in.src[1].value != b.guest_scratch_saddr ||
+                rs.sreg_written.count(in.src[1].value)) {
+                ok = false;
+                return true;
+            }
+            const int32_t base = static_cast<int32_t>(in.literal);
+            const int64_t storage_begin = b.guest_scratch_min_byte;
+            const int64_t storage_end = storage_begin + static_cast<int64_t>(b.guest_scratch_dwords) * 4;
+            for (uint32_t component = 0; component < access.components; ++component) {
+                const int32_t byte_offset = base +
+                    static_cast<int32_t>(component * (access.bits / 8u));
+                const int64_t access_end = static_cast<int64_t>(byte_offset) + access.bits / 8u;
+                if (byte_offset < storage_begin || access_end > storage_end) {
+                    ok = false;
+                    return true;
+                }
+                const int reg = in.dst.value + static_cast<int>(component);
+                if (access.store) {
+                    b.guest_scratch_store_bits(byte_offset, access.bits, vreg_old(b, rs, reg),
+                                               rs.exec_narrowed, rs.exec);
+                } else {
+                    const uint32_t old_value = vreg_old(b, rs, reg);
+                    rs.vreg[reg] = b.guest_scratch_load_bits(byte_offset, access.bits,
+                                                            access.sign_extend);
+                    predicate_write(b, rs, reg, old_value);
+                }
             }
             return true;
         }
@@ -7501,6 +7714,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     // converge in the host SPIR-V without inventing further guest execution. Graphics exports keep
     // separate side-effect bookkeeping and remain on the conservative reject path for this shape.
     (void)extend_terminating_if_else(code, dwords, ins);
+    const StaticScratchLayout scratch = analyze_static_scratch(ins);
     SpirvCompute b;
     // Size the LDS array from the shader's real allocation when known (#130): bytes -> dwords, at
     // least the ds ops need, clamped to the RDNA2 64 KB (16384-dword) max. 0 keeps the 16 KB default.
@@ -7509,6 +7723,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
         b.lds_dwords = dw > 16384u ? 16384u : (dw ? dw : 1u);
     }
     b.begin(num_inputs ? num_inputs : 1, rt);
+    b.declare_guest_scratch(scratch);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);   // readfirstlane waterfalls (#273)
@@ -7533,6 +7748,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     // See recompile_valu: compute has no branch-external EXP state, so the common host-shell merge is
     // only a place to finish the invocation after either guest arm has terminated.
     (void)extend_terminating_if_else(code, dwords, ins);
+    const StaticScratchLayout scratch = analyze_static_scratch(ins);
     SpirvCompute b;
     if (config.lds_bytes) {
         uint32_t dw = (config.lds_bytes + 3) / 4;
@@ -7544,6 +7760,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const uint32_t wave_size = config.wave_size == 32 ? 32u : 64u;
     b.begin(1, rt, local_x, local_y, local_z, wave_size,
             static_cast<uint32_t>(config.user_sgprs.size()));
+    b.declare_guest_scratch(scratch);
     const bool has_partial_workgroup = config.threads_x % local_x != 0 ||
                                        config.threads_y % local_y != 0 ||
                                        config.threads_z % local_z != 0;
@@ -7604,9 +7821,11 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     rdna2_walk(code, dwords, ins);
     uint32_t synthetic_branch_pc = UINT32_MAX;
     (void)extend_terminating_if_else(code, dwords, ins, nullptr, &synthetic_branch_pc);
+    const StaticScratchLayout scratch = analyze_static_scratch(ins);
 
     // A scratch builder/state so emit_alu can run; its emitted code is discarded — we only want `ok`.
     SpirvCompute b; b.begin(1);
+    b.declare_guest_scratch(scratch);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);   // readfirstlane waterfalls (#273)
@@ -7716,6 +7935,7 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
             return {};
         }
     }
+    const StaticScratchLayout scratch = analyze_static_scratch(ins);
 
     // Preserve hardware target locations. MRT0 and MRT1 are backed by real Vulkan attachments; later
     // targets remain unsupported and must never be silently remapped to location 0 (#635).
@@ -7742,6 +7962,7 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
     if (!derived_interpolation.valid) return {};
     SpirvCompute b;
     b.begin_fragment(rt, color_mask);
+    b.declare_guest_scratch(scratch);
     b.fragment_interpolation = &derived_interpolation;
     // P0-only attributes retain the cheap Flat varying path. Mixed smooth/explicit-parameter reads
     // are legal with the portable geometry stage and use separate packed locations there.
@@ -7855,9 +8076,11 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
                                        const PixelInputMapping* pixel_inputs) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
+    const StaticScratchLayout scratch = analyze_static_scratch(ins);
 
     SpirvCompute b;
     b.begin_vertex(rt);
+    b.declare_guest_scratch(scratch);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);   // readfirstlane waterfalls (#273)
