@@ -699,6 +699,30 @@ int main() {
     CHECK(store_uses.size() == 1 && store_uses[0].v4[0] == store_table[4] &&
           store_uses[0].v4[1] == store_table[5] && store_uses[0].v4[2] == 16u,
           "raw buffer-store V# preserves the table-loaded descriptor dwords");
+    uint32_t store_compute_seed[10] = {};
+    store_compute_seed[8] = seed5vs[0];
+    store_compute_seed[9] = seed5vs[1];
+    ShaderResourceTable store_compute_table;
+    add_compute_buffer_resources(store_compute_table, k5vs, std::size(k5vs),
+                                 store_compute_seed, std::size(store_compute_seed));
+    CHECK(store_compute_table.resources.size() == 1 &&
+          store_compute_table.by_srt_offset(0x10) &&
+          store_compute_table.by_fetch_pc(2) == store_compute_table.by_srt_offset(0x10),
+          "table-loaded raw store retains both SRT and exact consumer provenance");
+
+    const uint32_t repeated_store[] = {
+        0xF4080504u, 0xFA000010u,   // s_load_dwordx4 s[20:23], s[8:9], 0x10
+        0xE0702000u, 0x80051100u,   // buffer_store_dword v17, v0, s[20:23]
+        0xE0702004u, 0x80051100u,   // same V#, second consumer at a different pc
+        0xBF810000u,
+    };
+    ShaderResourceTable repeated_store_table;
+    add_compute_buffer_resources(repeated_store_table, repeated_store,
+                                 std::size(repeated_store), store_compute_seed,
+                                 std::size(store_compute_seed));
+    CHECK(repeated_store_table.resources.size() == 2 &&
+          repeated_store_table.by_fetch_pc(2) && repeated_store_table.by_fetch_pc(4),
+          "each raw store consumer keeps an exact alias across compute CFG block boundaries");
 
     // A scalar patch after the table load changes the descriptor that the store actually consumes.
     // The table key is no longer live as a complete four-dword provenance tag, so publish the current

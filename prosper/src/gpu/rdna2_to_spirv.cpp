@@ -5124,11 +5124,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // (indirect), then user-data SGPR (direct).
                 const ShaderResource* res = rt->by_fetch_pc(in.pc);
                 uint32_t srt_tag = 0;
-                if (!res && sreg_srt_range_tag(rs, in.src[1].value, 4, srt_tag))
+                const bool has_srt_tag = sreg_srt_range_tag(rs, in.src[1].value, 4, srt_tag);
+                if (!res && has_srt_tag)
                     res = rt->by_srt_offset(srt_tag);
                 if (!res && !sreg_range_written(rs, in.src[1].value, 4))
                     res = rt->by_sgpr_base(in.src[1].value);
-                if (!res) { ok = false; return true; }   // unresolvable V# -> reject; NEVER default to binding 2
+                if (!res) {
+                    if (getenv("PROSPER_DBG")) {
+                        const ShaderResource* pp = rt->by_fetch_pc(in.pc);
+                        fprintf(stderr,
+                                "[mubuf-raw-unresolved] pc=%u srsrc=s%d srt_tag=%s0x%x "
+                                "key_res=%s pc_res=%s rewritten=%d (%zu res)\n",
+                                in.pc, in.src[1].value, has_srt_tag ? "" : "NONE ", srt_tag,
+                                has_srt_tag && rt->by_srt_offset(srt_tag) ? "yes" : "null",
+                                pp ? "yes" : "null",
+                                sreg_range_written(rs, in.src[1].value, 4), rt->resources.size());
+                    }
+                    ok = false; return true;   // unresolvable V# -> reject; NEVER default to binding 2
+                }
                 binding = res->binding;
                 stride  = res->stride;
                 // fmt stays raw Uint32: untyped ops move raw dwords regardless of the V#'s declared format.

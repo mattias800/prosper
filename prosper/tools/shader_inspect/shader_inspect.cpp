@@ -49,8 +49,8 @@ int main(int argc, char** argv) {
     std::string stage;
     if (argc == 4 && std::strcmp(argv[2], "--stage") == 0) stage = argv[3];
     if ((argc != 2 && argc != 4) ||
-        (!stage.empty() && stage != "vertex" && stage != "fragment")) {
-        std::fprintf(stderr, "usage: %s <raw-rdna2.bin> [--stage vertex|fragment]\n", argv[0]);
+        (!stage.empty() && stage != "vertex" && stage != "fragment" && stage != "compute")) {
+        std::fprintf(stderr, "usage: %s <raw-rdna2.bin> [--stage vertex|fragment|compute]\n", argv[0]);
         return 2;
     }
 
@@ -92,9 +92,15 @@ int main(int argc, char** argv) {
                 coverage.first_bad_op);
     bool stage_ok = true;
     if (!stage.empty()) {
-        std::vector<uint32_t> spirv = stage == "vertex"
-            ? recompile_vertex(words.data(), words.size())
-            : recompile_fragment(words.data(), words.size());
+        std::vector<uint32_t> spirv;
+        if (stage == "vertex") {
+            spirv = recompile_vertex(words.data(), words.size());
+        } else if (stage == "fragment") {
+            spirv = recompile_fragment(words.data(), words.size());
+        } else {
+            ComputeShaderConfig config;
+            spirv = recompile_compute(words.data(), words.size(), nullptr, config);
+        }
         stage_ok = !spirv.empty();
         std::printf("stage-recompile stage=%s status=%s spirv_dwords=%zu\n",
                     stage.c_str(), stage_ok ? "ok" : "rejected", spirv.size());

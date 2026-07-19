@@ -9,6 +9,7 @@ cmake --build build-linux -j8 --target shader_inspect
 
 # Run the complete stage translator too; PROSPER_DBG identifies a contextual rejection PC.
 PROSPER_DBG=1 ./build-linux/shader_inspect /tmp/shaders/exec_vs_7f123400.bin --stage vertex
+PROSPER_DBG=1 ./build-linux/shader_inspect /tmp/shaders/exec_cs_7f123400.bin --stage compute
 ```
 
 `PROSPER_SHADER_DUMP=DIR` writes raw shaders that fail recompilation. To inspect a shader that succeeds,
@@ -30,7 +31,7 @@ Each instruction row includes its dword PC, encoded length, format/opcode, exact
 operands, and, for SOPP branches, the signed immediate and resolved target PC. The header also prints
 the stage-agnostic `recompile_coverage` result. That coverage is intentionally compute-safe; a VCC
 control-flow shape may remain listed there even when the vertex/fragment structurizer accepts it.
-`--stage vertex|fragment` additionally runs the complete stage translator, which exposes contextual
+`--stage vertex|fragment|compute` additionally runs the complete stage translator, which exposes contextual
 resource and structured-control-flow failures that per-instruction coverage cannot decide.
 When a shader contains the fully proven bounded scalar `s_setpc_b64` jump-table idiom, the header also
 prints its constant-buffer selector, adjustment/clamp, complete target list, merge PC, and owning span.
