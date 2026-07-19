@@ -77,10 +77,13 @@ void set_app0_root(const std::string& root);
 // Resolve a guest filesystem path through the same mount table used by libkernel file I/O.
 // Host frontends such as native media decoders must never receive raw /app0 paths.
 std::string resolve_guest_path(const char* guest_path);
-// Mount/unmount the guest "/savedata0" area onto a host dir named by the save's dirName
-// (sceSaveDataMount3 HLE). create=true makes the dir; create=false fails if it doesn't exist.
-bool savedata0_mount(const char* dirname, bool create);
-void savedata0_umount();
+// Mount/unmount the guest "/savedata0" area onto a host dir named by the save's dirName.
+// The policy/result distinction preserves SaveData's exclusive CREATE versus CREATE2
+// (open-or-create) semantics, including whether MountResult should report CREATED or OPENED.
+enum class SaveDataMountPolicy { Open, Create, OpenOrCreate };
+enum class SaveDataMountOutcome { NotFound, Exists, Opened, Created };
+SaveDataMountOutcome savedata0_mount(const char* dirname, SaveDataMountPolicy policy);
+bool savedata0_umount();
 std::vector<std::string> savedata0_list_dirs();   // existing save dirs under the host save root (#299)
 // Read a virtual save slot's param.sfo modification time (or directory time if absent). Rejects names
 // that are not a single guest directory component; used only for SaveDataDialog date-focus ordering.

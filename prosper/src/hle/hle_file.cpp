@@ -578,26 +578,53 @@ std::string resolve_guest_path(const char* guest_path) {
 }
 
 // Mount / unmount the guest "/savedata0" area onto a host dir named by the save's dirName
-// (sceSaveDataMount3 HLE, hle_service.cpp). create=true makes the host dir (CREATE-mode mount);
-// create=false requires it to already exist (open-mode) and fails otherwise ("no such save").
-// Returns true on success with /savedata0 translation active.
-bool savedata0_mount(const char* dirname, bool create) {
-    if (!dirname || !*dirname) return false;
+// (sceSaveDataMount* HLEs, hle_service.cpp). CREATE is exclusive, while OpenOrCreate (CREATE2)
+// opens an existing directory or creates a missing one. The outcome lets the HLE write an honest
+// MountResult status instead of deriving CREATED from the requested mode.
+SaveDataMountOutcome savedata0_mount(const char* dirname, SaveDataMountPolicy policy) {
+    if (!dirname || !*dirname) return SaveDataMountOutcome::NotFound;
     std::string d = save0_base() + "/" + dirname;
+    bool exists = false;
 #ifdef _WIN32
-    if (create) _mkdir(d.c_str());
     struct _stat st{};
-    if (_stat(d.c_str(), &st) != 0 || !(st.st_mode & _S_IFDIR)) return false;
+    exists = _stat(d.c_str(), &st) == 0 && (st.st_mode & _S_IFDIR);
 #else
-    if (create) ::mkdir(d.c_str(), 0777);
     struct stat st{};
-    if (::stat(d.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) return false;
+    exists = ::stat(d.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 #endif
+    if (exists && policy == SaveDataMountPolicy::Create) return SaveDataMountOutcome::Exists;
+
+    bool created = false;
+    if (!exists) {
+        if (policy == SaveDataMountPolicy::Open) return SaveDataMountOutcome::NotFound;
+#ifdef _WIN32
+        created = _mkdir(d.c_str()) == 0;
+        if (!created) {
+            struct _stat retry{};
+            exists = _stat(d.c_str(), &retry) == 0 && (retry.st_mode & _S_IFDIR);
+        }
+#else
+        created = ::mkdir(d.c_str(), 0777) == 0;
+        if (!created) {
+            struct stat retry{};
+            exists = ::stat(d.c_str(), &retry) == 0 && S_ISDIR(retry.st_mode);
+        }
+#endif
+        if (!created && !exists) return SaveDataMountOutcome::NotFound;
+        // Another creator may have won between the stat and mkdir. Exclusive CREATE must still
+        // report EXISTS and must not activate the mount in that case.
+        if (!created && policy == SaveDataMountPolicy::Create) return SaveDataMountOutcome::Exists;
+    }
     std::lock_guard<std::mutex> lk(g_save0_mx);
     g_save0 = d;
-    return true;
+    return created ? SaveDataMountOutcome::Created : SaveDataMountOutcome::Opened;
 }
-void savedata0_umount() { std::lock_guard<std::mutex> lk(g_save0_mx); g_save0.clear(); }
+bool savedata0_umount() {
+    std::lock_guard<std::mutex> lk(g_save0_mx);
+    const bool was_mounted = !g_save0.empty();
+    g_save0.clear();
+    return was_mounted;
+}
 // List the save-dir names that exist under the host save root (each subdir is one save the guest created
 // via sceSaveDataMount3 create-mode). sceSaveDataDirNameSearch reports these so a prior session's saves
 // appear in the game's load/continue list (#299 — the saves persisted but were invisible).

@@ -1425,6 +1425,7 @@ HLE(s_playgo_getlang) { if (!a1) return PLAYGO_ERR_BAD_POINTER;
 // MED on Mount3's arg order (mount-desc in, result out — matches every PS4 Mount variant);
 // LOW on Prepare/Commit internals (no-op success; PROSPER_SVCLOG captures their real args).
 static constexpr uint64_t SAVE_DATA_ERR_PARAMETER = 0x809F0000ull;
+static constexpr uint64_t SAVE_DATA_ERR_EXISTS = 0x809F0007ull;
 static constexpr uint64_t SAVE_DATA_ERR_NOT_FOUND = 0x809F0008ull;
 static constexpr uint64_t SAVE_DATA_ERR_NO_EVENT = 0x809F0018ull;
 namespace { std::atomic<unsigned> g_savedata_umount_events{0}; }
@@ -1604,6 +1605,56 @@ HLE(s_savemem_sync) {
     savemem_store(userId, slotId, it->second);   // Sync commits the slot to disk (survives restart)
     return 0;
 }
+// All three pinned mount ABIs feed one backend/result writer. The PS4-inherited layouts come from
+// the public libSceSaveData ABI and retain their NIDs in the PS5 3.20 table:
+//   Mount:  dirName pointer @0x10, blocks @0x20, mode @0x28, size 0x50
+//   Mount2: dirName pointer @0x08, blocks @0x10, mode @0x18, size 0x40
+// Mount3's PS5-native layout is documented below. MountResult is the shared exact 0x40-byte shape.
+static uint64_t savedata_mount_common(const char* api, const char* dirname,
+                                      uint32_t mode, uint64_t result_va) {
+    if (!dirname || !*dirname || !result_va) return SAVE_DATA_ERR_PARAMETER;
+    const SaveDataMountPolicy policy = (mode & 0x04) ? SaveDataMountPolicy::Create
+        : (mode & 0x20) ? SaveDataMountPolicy::OpenOrCreate
+                        : SaveDataMountPolicy::Open;
+    const SaveDataMountOutcome outcome = savedata0_mount(dirname, policy);
+    if (outcome == SaveDataMountOutcome::Exists) {
+        if (svclog()) fprintf(stderr, "[svc]   %s dir='%s' mode=%#x -> EXISTS\n",
+                              api, dirname, mode);
+        return SAVE_DATA_ERR_EXISTS;
+    }
+    if (outcome == SaveDataMountOutcome::NotFound) {
+        if (svclog()) fprintf(stderr, "[svc]   %s dir='%s' mode=%#x -> NOT_FOUND\n",
+                              api, dirname, mode);
+        return SAVE_DATA_ERR_NOT_FOUND;
+    }
+    uint8_t* result = (uint8_t*)PW(result_va);
+    memset(result, 0, 0x40);
+    memcpy(result, "/savedata0", 11);
+    const bool created = outcome == SaveDataMountOutcome::Created;
+    *(uint32_t*)(result + 0x1c) = created ? 1u : 0u;
+    if (svclog()) fprintf(stderr, "[svc]   %s dir='%s' mode=%#x -> OK (created=%d)\n",
+                          api, dirname, mode, (int)created);
+    return 0;
+}
+
+HLE(s_savedata_mount) {
+    svc_log("sceSaveDataMount", a0,a1,a2,a3,a4,a5);
+    if (!a0 || !a1) return SAVE_DATA_ERR_PARAMETER;
+    const uint8_t* mount = (const uint8_t*)PW(a0);
+    const char* dirname = *(const char* const*)(mount + 0x10);
+    const uint32_t mode = *(const uint32_t*)(mount + 0x28);
+    return savedata_mount_common("Mount", dirname, mode, a1);
+}
+
+HLE(s_savedata_mount2) {
+    svc_log("sceSaveDataMount2", a0,a1,a2,a3,a4,a5);
+    if (!a0 || !a1) return SAVE_DATA_ERR_PARAMETER;
+    const uint8_t* mount = (const uint8_t*)PW(a0);
+    const char* dirname = *(const char* const*)(mount + 0x08);
+    const uint32_t mode = *(const uint32_t*)(mount + 0x18);
+    return savedata_mount_common("Mount2", dirname, mode, a1);
+}
+
 // sceSaveDataMount3(const Mount3* mount, MountResult* result). The mount desc layout is pinned
 // from DOLL's OWN wrapper (eboot+0x2251610 disassembly, matching the live capture):
 //   +0x00 u32 userId; +0x08 const char* dirName; +0x10 u64 blocks; +0x20 u32 mountMode;
@@ -1625,18 +1676,14 @@ HLE(s_savedata_mount3)  {
     const uint8_t* m = (const uint8_t*)PW(a0);
     const char* dirname = *(const char* const*)(m + 0x08);
     uint32_t mode = *(const uint32_t*)(m + 0x20);
-    if (!dirname) return SAVE_DATA_ERR_PARAMETER;
-    bool create = (mode & 0x24) != 0;   // CREATE(4) | CREATE2(0x20, create-if-missing; live: mode 0x20 remount)
-    if (!savedata0_mount(dirname, create)) {
-        if (svclog()) fprintf(stderr, "[svc]   Mount3 dir='%s' mode=%#x -> NOT_FOUND\n", dirname, mode);
-        return SAVE_DATA_ERR_NOT_FOUND;
-    }
-    uint8_t* r = (uint8_t*)PW(a1);
-    memset(r, 0, 0x40);
-    memcpy(r, "/savedata0", 11);
-    *(uint32_t*)(r + 0x1c) = create ? 1u : 0u;   // mountStatus: created vs opened
-    if (svclog()) fprintf(stderr, "[svc]   Mount3 dir='%s' mode=%#x -> OK (create=%d)\n", dirname, mode, (int)create);
-    return 0;
+    return savedata_mount_common("Mount3", dirname, mode, a1);
+}
+HLE(s_savedata_umount) {
+    svc_log("sceSaveDataUmount", a0,a1,a2,a3,a4,a5);
+    if (!a0) return SAVE_DATA_ERR_PARAMETER;
+    const char* mount_point = (const char*)PW(a0); // OrbisSaveDataMountPoint: char data[16]
+    if (strncmp(mount_point, "/savedata0", 16) != 0) return SAVE_DATA_ERR_NOT_FOUND;
+    return savedata0_umount() ? 0 : SAVE_DATA_ERR_NOT_FOUND;
 }
 HLE(s_savedata_umount2) {
     svc_log("sceSaveDataUmount2", a0,a1,a2,a3,a4,a5);
@@ -2205,7 +2252,10 @@ void register_service_hle() {
     Hle::register_fn("yKDy8S5yLA0", (HleFn)s_savedata_term,      "sceSaveDataTerminate");
     Hle::register_fn("gjRZNnw0JPE", (HleFn)s_savedata_txres,     "sceSaveDataCreateTransactionResource");
     Hle::register_fn("lJUQuaKqoKY", (HleFn)s_savedata_txres_del, "sceSaveDataDeleteTransactionResource");
+    Hle::register_fn("32HQAQdwM2o", (HleFn)s_savedata_mount,     "sceSaveDataMount");
+    Hle::register_fn("0z45PIH+SNI", (HleFn)s_savedata_mount2,    "sceSaveDataMount2");
     Hle::register_fn("ZP4e7rlzOUk", (HleFn)s_savedata_mount3,    "sceSaveDataMount3");
+    Hle::register_fn("BMR4F-Uek3E", (HleFn)s_savedata_umount,    "sceSaveDataUmount");
     Hle::register_fn("uW4vfTwMQVo", (HleFn)s_savedata_umount2,   "sceSaveDataUmount2");
     Hle::register_fn("sDCBrmc61XU", (HleFn)s_savedata_prepare,   "sceSaveDataPrepare");
     Hle::register_fn("ie7qhZ4X0Cc", (HleFn)s_savedata_commit,    "sceSaveDataCommit");
