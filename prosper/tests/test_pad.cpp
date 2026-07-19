@@ -122,13 +122,64 @@ int main() {
         HleFn read       = Hle::lookup(nid_hash("scePadRead"));
         HleFn get_info   = Hle::lookup(nid_hash("scePadGetControllerInformation"));
         HleFn open       = Hle::lookup(nid_hash("scePadOpen"));
-        CHECK(read_state && read && get_info && open, "pad HLE functions registered");
+        HleFn open_ext   = Hle::lookup(nid_hash("scePadOpenExt"));
+        HleFn close      = Hle::lookup(nid_hash("scePadClose"));
+        HleFn is_valid   = Hle::lookup(nid_hash("scePadIsValidHandle"));
+        CHECK(read_state && read && get_info && open && open_ext && close && is_valid,
+              "pad HLE functions registered");
 
-        if (open) CHECK(open(1, 0, 0, 0, 0, 0) >= 1, "scePadOpen -> positive handle");
+        const uint64_t handle = open ? open(1, 0, 0, 0, 0, 0) : 0;
+        const uint64_t ext_handle = open_ext ? open_ext(1, 0, 1, 0, 0, 0) : 0;
+        CHECK(handle >= 1, "scePadOpen -> positive handle");
+        CHECK(ext_handle >= 1 && ext_handle != handle,
+              "scePadOpenExt -> distinct positive handle");
+        if (is_valid) {
+            CHECK(is_valid(handle, 0, 0, 0, 0, 0) == 1,
+                  "scePadIsValidHandle accepts the opened handle");
+            CHECK(is_valid(ext_handle, 0, 0, 0, 0, 0) == 1,
+                  "scePadIsValidHandle accepts the OpenExt handle");
+            CHECK(is_valid(handle + 0x1000, 0, 0, 0, 0, 0) == 0,
+                  "scePadIsValidHandle rejects an unknown positive handle");
+        }
+
+        constexpr uint64_t invalid_handle = 0xffffffff80920003ull;
+        const uint64_t unknown = handle + 0x1000;
+        if (close)
+            CHECK(close(unknown, 0, 0, 0, 0, 0) == invalid_handle,
+                  "scePadClose rejects an unknown handle");
+
+        // Invalid-handle failures happen before polling or touching output. The later valid reads
+        // therefore still consume the scripted p0 and p1 windows in order.
+        ScePadData invalid_data;
+        std::memset(&invalid_data, 0x5a, sizeof invalid_data);
+        ScePadControllerInformation invalid_info;
+        std::memset(&invalid_info, 0x6b, sizeof invalid_info);
+        if (read_state)
+            CHECK(read_state(unknown, (uint64_t)(uintptr_t)&invalid_data, 0, 0, 0, 0) ==
+                      invalid_handle,
+                  "scePadReadState rejects an unknown handle");
+        if (read)
+            CHECK(read(unknown, (uint64_t)(uintptr_t)&invalid_data, 1, 0, 0, 0) ==
+                      invalid_handle,
+                  "scePadRead rejects an unknown handle");
+        if (get_info)
+            CHECK(get_info(unknown, (uint64_t)(uintptr_t)&invalid_info, 0, 0, 0, 0) ==
+                      invalid_handle,
+                  "scePadGetControllerInformation rejects an unknown handle");
+        bool invalid_data_untouched = true;
+        const auto* invalid_data_bytes = reinterpret_cast<const uint8_t*>(&invalid_data);
+        for (size_t i = 0; i < sizeof invalid_data; ++i)
+            invalid_data_untouched &= invalid_data_bytes[i] == 0x5a;
+        bool invalid_info_untouched = true;
+        const auto* invalid_info_bytes = reinterpret_cast<const uint8_t*>(&invalid_info);
+        for (size_t i = 0; i < sizeof invalid_info; ++i)
+            invalid_info_untouched &= invalid_info_bytes[i] == 0x6b;
+        CHECK(invalid_data_untouched && invalid_info_untouched,
+              "invalid-handle Pad calls leave outputs untouched");
 
         if (get_info) {
             ScePadControllerInformation ci{};
-            CHECK(get_info(1, (uint64_t)(uintptr_t)&ci, 0, 0, 0, 0) == 0,
+            CHECK(get_info(handle, (uint64_t)(uintptr_t)&ci, 0, 0, 0, 0) == 0,
                   "scePadGetControllerInformation -> 0 (OK)");
             CHECK(ci.connected == 1, "info query sees script-driven controller connectivity");
         }
@@ -139,15 +190,15 @@ int main() {
 
         if (read) {
             ScePadData unused{};
-            CHECK(read(1, 0, 1, 0, 0, 0) == 0 &&
-                  read(1, (uint64_t)(uintptr_t)&unused, 0, 0, 0, 0) == 0,
+            CHECK(read(handle, 0, 1, 0, 0, 0) == 0 &&
+                  read(handle, (uint64_t)(uintptr_t)&unused, 0, 0, 0, 0) == 0,
                   "failed scePadRead calls do not consume input windows");
         }
 
         if (read_state) {
             ScePadData d;
             memset(&d, 0x5A, sizeof(d));
-            uint64_t r = read_state(1, (uint64_t)(uintptr_t)&d, 0, 0, 0, 0);
+            uint64_t r = read_state(handle, (uint64_t)(uintptr_t)&d, 0, 0, 0, 0);
             CHECK(r == 0, "scePadReadState -> 0 (OK)");
             // The struct's TAIL (bytes the old 48-byte stub never touched) must now be written:
             CHECK(d.connected == 1, "readstate: one controller connected by default (dev/testing default)");
@@ -160,13 +211,32 @@ int main() {
         if (read) {
             if (get_info) {
                 ScePadControllerInformation ci{};
-                get_info(1, (uint64_t)(uintptr_t)&ci, 0, 0, 0, 0);
+                get_info(handle, (uint64_t)(uintptr_t)&ci, 0, 0, 0, 0);
             }
             ScePadData d;
-            uint64_t n = read(1, (uint64_t)(uintptr_t)&d, 4 /*num*/, 0, 0, 0);
+            uint64_t n = read(handle, (uint64_t)(uintptr_t)&d, 4 /*num*/, 0, 0, 0);
             CHECK(n == 1, "scePadRead -> 1 state");
             CHECK(d.buttons == SCE_PAD_BUTTON_OPTIONS,
                   "scePadRead: intervening metadata query did not consume p1 input window");
+        }
+        if (close && is_valid) {
+            CHECK(close(handle, 0, 0, 0, 0, 0) == 0,
+                  "scePadClose retires the opened handle");
+            CHECK(close(ext_handle, 0, 0, 0, 0, 0) == 0,
+                  "scePadClose retires the OpenExt handle");
+            CHECK(is_valid(handle, 0, 0, 0, 0, 0) == 0,
+                  "scePadIsValidHandle rejects a closed handle");
+            CHECK(is_valid(ext_handle, 0, 0, 0, 0, 0) == 0,
+                  "scePadIsValidHandle rejects a closed OpenExt handle");
+            std::memset(&invalid_data, 0x7c, sizeof invalid_data);
+            CHECK(read_state(handle, (uint64_t)(uintptr_t)&invalid_data, 0, 0, 0, 0) ==
+                      invalid_handle && close(handle, 0, 0, 0, 0, 0) == invalid_handle,
+                  "closed handles stay invalid for input and repeated close");
+            bool closed_output_untouched = true;
+            for (size_t i = 0; i < sizeof invalid_data; ++i)
+                closed_output_untouched &= invalid_data_bytes[i] == 0x7c;
+            CHECK(closed_output_untouched,
+                  "closed-handle input leaves output untouched");
         }
         set_test_env("PROSPER_PAD_SCRIPT", "");
     }

@@ -28,6 +28,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -42,6 +43,26 @@ using namespace prosper::input;
 namespace {
 
 std::atomic<int> g_pad_handle{1};
+std::mutex g_pad_handle_mx;
+std::unordered_set<int32_t> g_pad_handles;
+
+constexpr uint64_t kPadErrorInvalidHandle =
+    (uint64_t)(int64_t)(int32_t)0x80920003u;
+
+// Retain handle validity through each input operation so Close cannot retire the handle between
+// validation and its poll/output side effects.
+class PadHandleGuard {
+public:
+    explicit PadHandleGuard(uint64_t handle)
+        : lock_(g_pad_handle_mx),
+          valid_(g_pad_handles.contains((int32_t)handle)) {}
+
+    bool valid() const { return valid_; }
+
+private:
+    std::unique_lock<std::mutex> lock_;
+    bool valid_;
+};
 
 // PROSPER_PADLOG=1: trace pad calls (rate-limited) so a boot run shows the game polling input.
 bool padlog() { static const bool on = getenv("PROSPER_PADLOG") != nullptr; return on; }
@@ -387,24 +408,43 @@ HostPadState poll_controller(int /*handle*/, const char* what, bool consume_inpu
 
 } // namespace
 
-// scePadInit / scePadClose / effector no-ops -> OK.
+// scePadInit / effector no-ops -> OK.
 HLE(pad_ok) { if (padlog()) fprintf(stderr, "[pad] init/ok call\n"); return 0; }
 
 // scePadOpen(userId, type, index, param) -> positive handle.
-HLE(pad_open) { int h = g_pad_handle.fetch_add(1);
+HLE(pad_open) {
+    const int h = g_pad_handle.fetch_add(1);
+    {
+        std::lock_guard<std::mutex> lock(g_pad_handle_mx);
+        g_pad_handles.insert(h);
+    }
     if (padlog()) fprintf(stderr, "[pad] OPEN userId=%llu type=%llu index=%llu -> handle=%d\n",
                           (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2, h);
-    return (uint64_t)h; }
+    return (uint64_t)h;
+}
+
+// scePadClose(handle) -> OK exactly once, then INVALID_HANDLE for an unknown/retired handle.
+HLE(pad_close) {
+    const int32_t handle = (int32_t)a0;
+    std::lock_guard<std::mutex> lock(g_pad_handle_mx);
+    if (g_pad_handles.erase(handle) == 0) return kPadErrorInvalidHandle;
+    if (padlog()) fprintf(stderr, "[pad] CLOSE handle=%d\n", handle);
+    return 0;
+}
 
 // scePadGetHandle(userId, type, index) -> handle (games that opened once may re-query it).
 HLE(pad_get_handle) { return 1; }
 
-// scePadIsValidHandle(handle) -> nonzero if the handle is an open pad. Was MISSING -> returned 0, which a
-// caller reads as "invalid". Our handles start at 1, so report valid for any positive handle.
-HLE(pad_is_valid_handle) { return a0 >= 1 ? 1 : 0; }
+// scePadIsValidHandle(handle) -> nonzero only while the handle remains open.
+HLE(pad_is_valid_handle) {
+    std::lock_guard<std::mutex> lock(g_pad_handle_mx);
+    return g_pad_handles.contains((int32_t)a0) ? 1 : 0;
+}
 
 // scePadReadState(handle, ScePadData* out) -> 0 on success. One current snapshot.
 HLE(pad_read_state) {
+    PadHandleGuard handle(a0);
+    if (!handle.valid()) return kPadErrorInvalidHandle;
     if (!a1) return 0;
     HostPadState s = poll_controller((int)a0, __func__, true);
     pad_fill_data((ScePadData*)PW(a1), s, now_us(), s.connected ? 1 : 0);
@@ -414,6 +454,8 @@ HLE(pad_read_state) {
 // scePadRead(handle, ScePadData* out, int num) -> number of states written (>=1). We report the
 // single current state (no historical buffering yet), which is a valid, common driver behavior.
 HLE(pad_read) {
+    PadHandleGuard handle(a0);
+    if (!handle.valid()) return kPadErrorInvalidHandle;
     int num = (int)(int64_t)a2;
     if (!a1 || num < 1) return 0;
     HostPadState s = poll_controller((int)a0, __func__, true);
@@ -423,6 +465,8 @@ HLE(pad_read) {
 
 // scePadGetControllerInformation(handle, ScePadControllerInformation* out) -> 0.
 HLE(pad_get_info) {
+    PadHandleGuard handle(a0);
+    if (!handle.valid()) return kPadErrorInvalidHandle;
     if (!a1) return 0;
     HostPadState s = poll_controller((int)a0, __func__, false);
     pad_fill_controller_info((ScePadControllerInformation*)PW(a1), s.connected, s.connected ? 1 : 0);
@@ -458,7 +502,7 @@ void register_pad_hle() {
     R("scePadOpen", pad_open);
     R("scePadOpenExt", pad_open);              // was MISSING -> returned 0 (read as a valid handle 0 / error)
     R("scePadIsValidHandle", pad_is_valid_handle);   // was MISSING -> 0 = "invalid"
-    R("scePadClose", pad_ok);
+    R("scePadClose", pad_close);
     R("scePadGetHandle", pad_get_handle);
     R("scePadGetControllerInformation", pad_get_info);
     R("scePadDeviceClassGetExtendedInformation", pad_ext_info);
