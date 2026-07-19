@@ -1,8 +1,8 @@
-// hle_audio.cpp — libSceAudioOut HLE, backed by a pluggable AudioSink (see audio.hpp).
+// hle_audio.cpp — libSceAudioOut/AudioIn HLE, with pluggable output (see audio.hpp).
 //
 // Decodes the PS5 sceAudioOut* calls into port lifecycle + interleaved PCM grains and forwards
-// them to the installed backend. prosper_core ships only the headless default (silent, real-time
-// paced) so it stays dependency-free; a concrete frontend (SDL3, ...) installs itself via
+// them to the installed backend. The inherited AudioIn core provides deterministic paced silence.
+// prosper_core stays dependency-free; a concrete output frontend (SDL3, ...) installs itself via
 // audio_set_sink() from outside the core.
 #include "dispatch.hpp"
 #include "nid.hpp"
@@ -110,6 +110,7 @@ Port* port_of(int handle) {
 // --- public backend hooks (audio.hpp) ---------------------------------------------------
 void audio_set_sink(AudioSink* sink) { g_sink.store(sink ? sink : &g_default_sink); }
 AudioSink* audio_sink() { return g_sink.load(); }
+static void audio_in_reset_ports();
 
 void audio_decode_format(uint32_t param, int& channels, AudioFmt& fmt) {
     switch (param & 0xff) {                                   // SceAudioOutParamFormat (low byte)
@@ -141,12 +142,15 @@ int audio_peak_channel_volume(uint32_t mask, const int* vols) {
 
 void audio_reset() {
     AudioSink* s = audio_sink();
-    std::lock_guard<std::mutex> lk(g_mx);
-    for (int i = 0; i < kMaxPorts; i++) {
-        if (g_ports[i].in_use && s) s->close(i + 1);
-        g_ports[i] = Port{};
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        for (int i = 0; i < kMaxPorts; i++) {
+            if (g_ports[i].in_use && s) s->close(i + 1);
+            g_ports[i] = Port{};
+        }
+        g_sink.store(&g_default_sink);
     }
-    g_sink.store(&g_default_sink);
+    audio_in_reset_ports();
 }
 
 // --- legacy-path diagnostics --------------------------------------------------------------
@@ -476,6 +480,114 @@ bool a2_store_u64(uint64_t dst, uint64_t v) { return audio_store_bytes(dst, &v, 
 bool a2_store_zeros(uint64_t dst, size_t n) {
     std::vector<uint8_t> z(n, 0);
     return audio_store_bytes(dst, z.data(), n);
+}
+
+// ---- libSceAudioIn: headless, silent, real-time paced ----------------------------------
+//
+// The inherited PS4/PS5 core ABI has seven ports. Handles carry the public 0x30000000 tag,
+// the port type in bits 16..23, and a zero-based port id in bits 0..7. We deliberately do not
+// open a host microphone: returning exact-size silence gives privacy-preserving deterministic
+// behavior, while grain/frequency pacing preserves the blocking capture-thread contract.
+namespace {
+
+constexpr int      kAudioInMaxPorts  = 7;
+constexpr uint32_t kAudioInHandleTag = 0x30000000u;
+constexpr uint64_t kAudioInErrInvalidHandle = (uint64_t)(int64_t)(int32_t)0x80260101;
+constexpr uint64_t kAudioInErrInvalidSize   = (uint64_t)(int64_t)(int32_t)0x80260102;
+constexpr uint64_t kAudioInErrInvalidFreq   = (uint64_t)(int64_t)(int32_t)0x80260103;
+constexpr uint64_t kAudioInErrInvalidPtr    = (uint64_t)(int64_t)(int32_t)0x80260105;
+constexpr uint64_t kAudioInErrInvalidParam  = (uint64_t)(int64_t)(int32_t)0x80260106;
+constexpr uint64_t kAudioInErrPortFull      = (uint64_t)(int64_t)(int32_t)0x80260107;
+constexpr uint64_t kAudioInErrNotOpened     = (uint64_t)(int64_t)(int32_t)0x80260109;
+
+struct AudioInPort {
+    bool in_use = false;
+    uint32_t grain = 0;
+    uint32_t freq = 0;
+    uint32_t channels = 0;
+    std::chrono::steady_clock::time_point next{};
+};
+
+std::mutex  g_audio_in_mx;
+AudioInPort g_audio_in_ports[kAudioInMaxPorts];
+
+int audio_in_port_id(uint64_t raw_handle) {
+    uint32_t handle = (uint32_t)raw_handle;
+    if ((handle & 0x7f000000u) != kAudioInHandleTag) return -1;
+    uint32_t id = handle & 0xffu;
+    return id < kAudioInMaxPorts ? (int)id : -1;
+}
+
+} // namespace
+
+static void audio_in_reset_ports() {
+    std::lock_guard<std::mutex> lk(g_audio_in_mx);
+    for (auto& port : g_audio_in_ports) port = {};
+}
+
+HLE(audio_in_init) { return 0; }
+
+// sceAudioInOpen(userId, type, index, len, freq, param) -> tagged handle or AudioIn error.
+// Public formats are S16 mono (0) and S16 stereo (2); supported rates are 16/48 kHz and the
+// hardware grain limit is 1..2048 frames. userId/type/index policy is left to the guest-facing
+// service just as in the reference implementation; type is retained in the opaque handle.
+HLE(audio_in_open) {
+    (void)a0; (void)a2;
+    uint32_t grain = (uint32_t)a3;
+    uint32_t freq = (uint32_t)a4;
+    uint32_t format = (uint32_t)a5;
+    if (!grain || grain > 2048) return kAudioInErrInvalidSize;
+    if (freq != 16000 && freq != 48000) return kAudioInErrInvalidFreq;
+    uint32_t channels;
+    if (format == 0) channels = 1;
+    else if (format == 2) channels = 2;
+    else return kAudioInErrInvalidParam;
+
+    std::lock_guard<std::mutex> lk(g_audio_in_mx);
+    for (int id = 0; id < kAudioInMaxPorts; id++) {
+        if (g_audio_in_ports[id].in_use) continue;
+        g_audio_in_ports[id] = {true, grain, freq, channels, {}};
+        return (uint32_t)(kAudioInHandleTag | (((uint32_t)a1 & 0xffu) << 16) | (uint32_t)id);
+    }
+    return kAudioInErrPortFull;
+}
+
+// sceAudioInInput(handle, dst) blocks for one capture grain and returns frames captured. The
+// null backend writes exactly grain*channels S16 samples. Fault-safe output preserves the HLE
+// process when a guest supplies an inaccessible range.
+HLE(audio_in_input) {
+    int id = audio_in_port_id(a0);
+    if (id < 0) return kAudioInErrInvalidHandle;
+    if (!a1) return kAudioInErrInvalidPtr;
+
+    std::chrono::steady_clock::time_point deadline;
+    uint32_t grain;
+    {
+        std::lock_guard<std::mutex> lk(g_audio_in_mx);
+        AudioInPort& port = g_audio_in_ports[id];
+        if (!port.in_use) return kAudioInErrNotOpened;
+        size_t bytes = (size_t)port.grain * port.channels * sizeof(int16_t);
+        if (!a2_store_zeros(a1, bytes)) return kAudioInErrInvalidPtr;
+
+        grain = port.grain;
+        auto now = std::chrono::steady_clock::now();
+        auto duration = std::chrono::nanoseconds((uint64_t)port.grain * 1000000000ull / port.freq);
+        if (port.next.time_since_epoch().count() == 0 || port.next < now - duration * 4)
+            port.next = now;
+        port.next += duration;
+        deadline = port.next;
+    }
+    if (deadline > std::chrono::steady_clock::now()) std::this_thread::sleep_until(deadline);
+    return grain;
+}
+
+HLE(audio_in_close) {
+    int id = audio_in_port_id(a0);
+    if (id < 0) return kAudioInErrInvalidHandle;
+    std::lock_guard<std::mutex> lk(g_audio_in_mx);
+    if (!g_audio_in_ports[id].in_use) return kAudioInErrNotOpened;
+    g_audio_in_ports[id] = {};
+    return 0;
 }
 
 constexpr uint64_t kA2ErrInvalid = (uint64_t)(int64_t)(int32_t)0x80260003;   // AudioOut error space
@@ -1325,6 +1437,11 @@ void register_audio_hle() {
     R("sceAudioOutSetVolume", audio_set_volume);
     R("sceAudioOutClose", audio_close);
     R("sceAudioOutGetPortState", audio_get_port_state);
+    // libSceAudioIn inherited core: deterministic null microphone with real-time capture pacing.
+    R("sceAudioInInit", audio_in_init);
+    R("sceAudioInOpen", audio_in_open);
+    R("sceAudioInInput", audio_in_input);
+    R("sceAudioInClose", audio_in_close);
     // libSceAudioOut2 (PS5) — see the probe block above.
     R("sceAudioOut2Initialize", audio2_initialize);
     R("sceAudioOut2ContextResetParam", audio2_ctx_reset_param);
