@@ -1,6 +1,7 @@
 // test_agc_shader -- focused guards for sceAgcCreateShader's guest-visible side effects.
 #include "../src/hle/dispatch.hpp"
 #include "../src/gpu/gpu_execute.hpp"
+#include "../src/gpu/pm4_registers.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -302,6 +303,133 @@ int main() {
     CHECK(packed_buffer && packed_buffer->format == prosper::gpu::DataFormat::Unorm2_10_10_10 &&
           packed_buffer->size == 7u * sizeof(uint32_t),
           "zero-record packed V# size uses one physical dword per drawn record");
+
+    // Hundreds of draw snapshots dominate Evergate's opening transition. Prime the exact serial
+    // result, then realize the same immutable snapshots through the live parallel/shared-word path.
+    // The worker completion order is intentionally unconstrained; compaction must still return the
+    // original PM4 order and every semantic field must match the serial oracle.
+    alignas(256) static const uint32_t parallel_vs[] = {
+        0x36020081u, 0x2C040081u, 0x7E020D01u, 0x7E040D02u, 0x7E0A02F6u,
+        0x7E0C02F2u, 0x10020B01u, 0x08020D01u, 0x10040B02u, 0x08040D02u,
+        0x7E060280u, 0x7E0802F2u, 0xF80008CFu, 0x04030201u, 0xBF810000u,
+    };
+    alignas(256) static const uint32_t parallel_ps[] = {
+        0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u,
+        0xF800180Fu, 0x03020100u, 0xBF810000u,
+    };
+    Shader parallel_vs_header{};
+    parallel_vs_header.file_header = 0x34333231u;
+    parallel_vs_header.version = 0x18u;
+    parallel_vs_header.shader_size = sizeof(parallel_vs);
+    parallel_vs_header.type = 2;
+    dst = nullptr;
+    const uint64_t parallel_vs_rc = create_shader(
+        reinterpret_cast<uint64_t>(&dst), reinterpret_cast<uint64_t>(&parallel_vs_header),
+        reinterpret_cast<uint64_t>(parallel_vs), 0, 0, 0);
+    Shader parallel_ps_header{};
+    parallel_ps_header.file_header = 0x34333231u;
+    parallel_ps_header.version = 0x18u;
+    parallel_ps_header.shader_size = sizeof(parallel_ps);
+    parallel_ps_header.type = 1;
+    dst = nullptr;
+    const uint64_t parallel_ps_rc = create_shader(
+        reinterpret_cast<uint64_t>(&dst), reinterpret_cast<uint64_t>(&parallel_ps_header),
+        reinterpret_cast<uint64_t>(parallel_ps), 0, 0, 0);
+    CHECK(parallel_vs_rc == 0 && parallel_ps_rc == 0,
+          "parallel-realization shaders enter the AGC registry");
+
+    namespace P = prosper::agc::Pm4;
+    prosper::gpu::GpuState parallel_state;
+    auto set_pgm = [&](uint32_t lo, uint32_t hi, const void* code) {
+        const uint64_t address = reinterpret_cast<uint64_t>(code);
+        parallel_state.sh[lo] = static_cast<uint32_t>(address >> 8);
+        parallel_state.sh[hi] = static_cast<uint32_t>((address >> 40) & 0xffu);
+    };
+    set_pgm(P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES, parallel_vs);
+    set_pgm(P::SPI_SHADER_PGM_LO_PS, P::SPI_SHADER_PGM_HI_PS, parallel_ps);
+    parallel_state.uc[P::VGT_PRIMITIVE_TYPE] = 4;
+    parallel_state.cx[P::CB_TARGET_MASK] = 0xf;
+    parallel_state.draws.resize(128);
+    for (size_t i = 0; i < parallel_state.draws.size(); ++i) {
+        parallel_state.draws[i].index_count = 3;
+        parallel_state.draws[i].command_order = 1000 + i * 3;
+    }
+    prosper::gpu::clear_shader_recompile_cache();
+    const auto serial_draws = prosper::gpu::realize_gpustate_draws(
+        parallel_state, 0x10000, 1.0f, 1.0f, nullptr, false, false);
+    const auto parallel_before = prosper::gpu::parallel_draw_realization_stats();
+    const auto parallel_draws = prosper::gpu::realize_gpustate_draws(
+        parallel_state, 0x10000, 1.0f, 1.0f, nullptr, true, true);
+    const auto parallel_after = prosper::gpu::parallel_draw_realization_stats();
+    bool equivalent = serial_draws.size() == parallel_state.draws.size() &&
+                      parallel_draws.size() == serial_draws.size();
+    for (size_t i = 0; equivalent && i < serial_draws.size(); ++i) {
+        const auto& serial = serial_draws[i];
+        const auto& parallel = parallel_draws[i];
+        equivalent = serial.draw_index == i && parallel.draw_index == i &&
+            serial.command_order == parallel.command_order &&
+            serial.vertex_count == parallel.vertex_count &&
+            serial.instance_count == parallel.instance_count &&
+            serial.indices == parallel.indices && serial.vs_words() == parallel.vs_words() &&
+            serial.gs_words() == parallel.gs_words() && serial.fs_words() == parallel.fs_words() &&
+            serial.vs_identity == parallel.vs_identity &&
+            serial.fs_identity == parallel.fs_identity &&
+            serial.ps.topology == parallel.ps.topology &&
+            serial.ps.color_write_mask == parallel.ps.color_write_mask &&
+            serial.ps.blend_enable == parallel.ps.blend_enable &&
+            serial.color0_base == parallel.color0_base &&
+            serial.color0_width == parallel.color0_width &&
+            serial.color0_height == parallel.color0_height &&
+            parallel.vs_shared && parallel.fs_shared &&
+            !parallel.vs_shared->empty() && !parallel.fs_shared->empty() &&
+            parallel.vs.empty() && parallel.fs.empty();
+    }
+    CHECK(equivalent,
+          "parallel shared-word realization is field- and order-equivalent to serial realization");
+    CHECK(parallel_after.batches == parallel_before.batches + 1 &&
+              parallel_after.semantic_draws ==
+                  parallel_before.semantic_draws + parallel_state.draws.size() &&
+              parallel_after.worker_threads > parallel_before.worker_threads,
+          "dense draw realization records one multi-threaded batch");
+
+    // Exercise persistent-worker generation changes repeatedly. This catches an early return or a
+    // stale batch/context reference that a single batch cannot expose, while warm shader-cache reuse
+    // keeps the stress loop small and deterministic.
+    const auto repeated_before = prosper::gpu::parallel_draw_realization_stats();
+    bool repeated_ok = true;
+    constexpr size_t kRepeatedBatches = 64;
+    for (size_t batch = 0; batch < kRepeatedBatches && repeated_ok; ++batch) {
+        const auto repeated = prosper::gpu::realize_gpustate_draws(
+            parallel_state, 0x10000, 1.0f, 1.0f, nullptr, true, true);
+        repeated_ok = repeated.size() == parallel_state.draws.size();
+        for (size_t i = 0; repeated_ok && i < repeated.size(); ++i)
+            repeated_ok = repeated[i].draw_index == i &&
+                          repeated[i].command_order == parallel_state.draws[i].command_order &&
+                          repeated[i].vs_shared && repeated[i].fs_shared;
+    }
+    const auto repeated_after = prosper::gpu::parallel_draw_realization_stats();
+    CHECK(repeated_ok &&
+              repeated_after.batches == repeated_before.batches + kRepeatedBatches &&
+              repeated_after.semantic_draws == repeated_before.semantic_draws +
+                  kRepeatedBatches * parallel_state.draws.size(),
+          "persistent realization workers survive repeated batch generations");
+
+    // An attempted parallel batch can correctly produce no items. That must not be mistaken for
+    // "parallel disabled" and replay all draws serially. Each no-effect draw reaches both already-warm
+    // shader cache entries once; a serial retry would double this exact hit count.
+    prosper::gpu::GpuState filtered_state = parallel_state;
+    filtered_state.cx[P::CB_TARGET_MASK] = 0;
+    const auto filtered_parallel_before = prosper::gpu::parallel_draw_realization_stats();
+    const auto filtered_shader_before = prosper::gpu::shader_recompile_cache_stats();
+    const auto filtered_draws = prosper::gpu::realize_gpustate_draws(
+        filtered_state, 0x10000, 1.0f, 1.0f, nullptr, true, true);
+    const auto filtered_shader_after = prosper::gpu::shader_recompile_cache_stats();
+    const auto filtered_parallel_after = prosper::gpu::parallel_draw_realization_stats();
+    CHECK(filtered_draws.empty() &&
+              filtered_parallel_after.batches == filtered_parallel_before.batches + 1 &&
+              filtered_shader_after.hits ==
+                  filtered_shader_before.hits + filtered_state.draws.size() * 2,
+          "all-filtered parallel batch is not retried through the serial path");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

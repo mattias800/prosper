@@ -328,6 +328,26 @@ int main() {
               analysis_stats.invalidations == 1,
           "same-address shader mutation invalidates immutable analysis before reuse");
 
+    // Live realization retains the cache allocation directly. Repeated hits must share one immutable
+    // word vector, and eviction/reset must not invalidate a DrawItem that still owns that version.
+    clear_shader_recompile_cache();
+    uint64_t shared_first_identity = 0, shared_second_identity = 0;
+    const SharedShaderWords shared_first = recompile_graphics_shader_cached_shared(
+        ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, nullptr, nullptr,
+        &shared_first_identity);
+    const SharedShaderWords shared_second = recompile_graphics_shader_cached_shared(
+        ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, nullptr, nullptr,
+        &shared_second_identity);
+    stats = shader_recompile_cache_stats();
+    CHECK(shared_first && shared_first == shared_second && *shared_first ==
+              recompile_vertex(kVs, std::size(kVs), &table) &&
+              shared_first_identity != 0 && shared_first_identity == shared_second_identity &&
+              stats.misses == 1 && stats.hits == 1,
+          "live shader-cache hits share one exact immutable SPIR-V allocation");
+    clear_shader_recompile_cache();
+    CHECK(shared_first && !shared_first->empty(),
+          "shared shader words outlive cache reset while a realized draw retains them");
+
     if (failures) {
         std::printf("== FAIL: %d ==\n", failures);
         return 1;
