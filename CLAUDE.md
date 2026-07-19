@@ -306,7 +306,10 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   Run the strongest relevant local checks and wait for every applicable required CI check. Before
   merging, synchronize with the live target branch when needed, inspect the resulting diff, run `diff --check`,
   and address every known correctness concern. An agent may merge only when the user or task explicitly
-  authorizes it. The PR author owns verification; prefer `powershell -File prosper/tools/verify-pr.ps1 core` or,
+  authorizes it. Each agent owns its PR through merge and branch cleanup: before claiming or starting new work,
+  merge the current PR after all gates pass, or explicitly close it with a clear rejected/superseded explanation.
+  Do not accumulate floating PRs or silently hand merge ownership to another agent. The PR author owns
+  verification; prefer `powershell -File prosper/tools/verify-pr.ps1 core` or,
   for renderer changes, `powershell -File prosper/tools/verify-pr.ps1 renderer -Snapshot <name>`, and post the
   exact-head results.
 - **Use independent review whenever it can materially improve confidence.** Treat review as a correctness
