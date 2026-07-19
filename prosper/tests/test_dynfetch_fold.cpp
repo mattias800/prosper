@@ -423,6 +423,53 @@ int main() {
           direct_uses[0].s4[0] == seed5d[8] && direct_uses[0].s4[3] == seed5d[11],
           "direct user-SGPR T#/S# dwords are preserved");
 
+    // Astro's title PS consumes a V# placed directly in s[24:27] with a scalar offset computed in
+    // VCC_LO. No s_load gives that descriptor an SRT key, and AGC metadata need not publish a sharp
+    // for it. The fold nevertheless knows all four entry dwords and the exact offset, so retain the
+    // resource by the consuming SMEM pc. The production resource path must then give the fragment
+    // recompiler a real binding instead of its unbound binding-2 fallback.
+    static uint32_t direct_sbuffer_payload[64]{};
+    const uint64_t direct_sbuffer_base =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(direct_sbuffer_payload));
+    uint32_t direct_sbuffer_seed[28]{};
+    direct_sbuffer_seed[24] = static_cast<uint32_t>(direct_sbuffer_base);
+    direct_sbuffer_seed[25] =
+        (static_cast<uint32_t>(direct_sbuffer_base >> 32) & 0xffffu) | (4u << 16);
+    direct_sbuffer_seed[26] = std::size(direct_sbuffer_payload);
+    direct_sbuffer_seed[27] = 4u << 12;
+    const uint32_t direct_sbuffer[] = {
+        0xbeea03ffu, 0x00000010u,   // s_mov_b32 vcc_lo, 16
+        0xf424000cu, 0xd4000004u,   // s_buffer_load_dwordx2 s[0:1], s[24:27], vcc_lo offset:4
+        0xbf810000u,
+    };
+    std::vector<SrtUse> direct_sbuffer_uses;
+    resolve_dynamic_fetch(direct_sbuffer, std::size(direct_sbuffer),
+                          direct_sbuffer_seed, std::size(direct_sbuffer_seed), 0,
+                          &direct_sbuffer_uses);
+    CHECK(direct_sbuffer_uses.size() == 1 && direct_sbuffer_uses[0].kind == 1 &&
+              direct_sbuffer_uses[0].key == 0xffffffffu &&
+              direct_sbuffer_uses[0].use_pc == 2 &&
+              direct_sbuffer_uses[0].required_size == 28 &&
+              direct_sbuffer_uses[0].v4[0] == direct_sbuffer_seed[24] &&
+              direct_sbuffer_uses[0].v4[1] == direct_sbuffer_seed[25],
+          "#1029: direct user-SGPR V# resolves scalar buffer load by exact pc");
+    ShaderResourceTable direct_sbuffer_table;
+    add_compute_buffer_resources(direct_sbuffer_table, direct_sbuffer,
+                                 std::size(direct_sbuffer), direct_sbuffer_seed,
+                                 std::size(direct_sbuffer_seed));
+    assign_convention_bindings(direct_sbuffer_table, 2);
+    ComputeShaderConfig direct_sbuffer_config;
+    direct_sbuffer_config.user_sgprs.assign(
+        direct_sbuffer_seed, direct_sbuffer_seed + std::size(direct_sbuffer_seed));
+    direct_sbuffer_config.local_x = direct_sbuffer_config.local_y =
+        direct_sbuffer_config.local_z = 1;
+    CHECK(direct_sbuffer_table.resources.size() == 1 &&
+              direct_sbuffer_table.by_fetch_pc(2) &&
+              direct_sbuffer_table.by_fetch_pc(2)->binding == 2 &&
+              !recompile_compute(direct_sbuffer, std::size(direct_sbuffer),
+                                 &direct_sbuffer_table, direct_sbuffer_config).empty(),
+          "#1029: pc-keyed direct scalar buffer is bound and recompiles");
+
     // Evergate's title PS uses a bounded PC-relative dispatch. An omitted alternative reloads the
     // same T# SGPRs that the selected arm consumes directly; a linear fold used to walk that reload
     // and attach the alternative texture to the selected image_sample's pc. Specialize the fold to
