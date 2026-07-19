@@ -109,7 +109,7 @@ if ($TestPattern) {
     $runArgs += @('--dump', $Dump)
 }
 if ($Frames -gt 0) { $runArgs += @('--frames', "$Frames") }
-if ($PresentMode -ne 'fifo') { $runArgs += @('--present-mode', $PresentMode) }
+if ($PresentMode -ne 'fifo') { $runArgs += @('--present-mode', $PresentMode.ToLowerInvariant()) }
 if ($Record) { $runArgs += @('--record', [IO.Path]::GetFullPath($Record)) }
 
 Write-Host "Starting $app"

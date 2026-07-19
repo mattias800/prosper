@@ -38,7 +38,7 @@ if ($TestPattern) {
 }
 
 if ($Frames -gt 0) { $runArgs += @('--frames', "$Frames") }
-if ($PresentMode -ne 'fifo') { $runArgs += @('--present-mode', $PresentMode) }
+if ($PresentMode -ne 'fifo') { $runArgs += @('--present-mode', $PresentMode.ToLowerInvariant()) }
 if ($Record) {
     $recordPath = [IO.Path]::GetFullPath($Record)
     $recordParent = Split-Path -Parent $recordPath
