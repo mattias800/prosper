@@ -675,6 +675,30 @@ HLE(k_virtual_query) {
     return 0;
 }
 
+// sceKernelGetDirectMemoryType(off_t offset, int* typeOut, off_t* startOut, off_t* endOut)
+// queries the allocated physical range containing `offset`. All three outputs are required by the
+// ABI; a miss must fail without changing them rather than returning success with stale guest data.
+HLE(k_get_direct_memory_type) {
+    if (!a1 || !a2 || !a3) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
+    DMem result{};
+    {
+        std::lock_guard<std::mutex> lk(g_dmx);
+        bool found = false;
+        for (const auto& d : g_dmem) {
+            if (a0 >= d.start && a0 < d.end) {
+                result = d;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return 0x80020002ull;          // SCE_KERNEL_ERROR_ENOENT
+    }
+    *(int32_t*)(uintptr_t)a1 = result.type;
+    *(uint64_t*)(uintptr_t)a2 = result.start;
+    *(uint64_t*)(uintptr_t)a3 = result.end;
+    return 0;
+}
+
 // sceKernelQueryMemoryProtection(addr, startOut, endOut, protOut): query the exact tracked VMA
 // without VirtualQuery's larger result structure. Every output is optional; an untracked address
 // fails before touching any of them. Copying the Mapping under g_mx avoids retaining a vector
@@ -1280,6 +1304,7 @@ void register_kernel_mem_hle() {
     R("sceKernelVirtualQuery", k_virtual_query);
     R("sceKernelQueryMemoryProtection", k_query_memory_protection);
     R("sceKernelDirectMemoryQuery", k_direct_memory_query);
+    R("sceKernelGetDirectMemoryType", k_get_direct_memory_type);
     R("sceKernelGetDirectMemorySize", k_dmem_size);
     R("sceKernelAvailableDirectMemorySize", k_avail_dmem);
     #undef R
@@ -3517,6 +3542,29 @@ HLE(k_virtual_query) {
     return 0;
 }
 
+// Physical-allocation query counterpart to sceKernelDirectMemoryQuery. Keep the implementation
+// identical to the POSIX path so a missing range and required-output validation have one contract.
+HLE(k_get_direct_memory_type) {
+    if (!a1 || !a2 || !a3) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
+    DMem result{};
+    {
+        std::lock_guard<std::mutex> lk(g_dmx);
+        bool found = false;
+        for (const auto& d : g_dmem) {
+            if (a0 >= d.start && a0 < d.end) {
+                result = d;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return 0x80020002ull;          // SCE_KERNEL_ERROR_ENOENT
+    }
+    *(int32_t*)(uintptr_t)a1 = result.type;
+    *(uint64_t*)(uintptr_t)a2 = result.start;
+    *(uint64_t*)(uintptr_t)a3 = result.end;
+    return 0;
+}
+
 HLE(k_query_memory_protection) {
     Mapping mapping{};
     if (!snapshot_mapping(a0, mapping)) return 0x8002000dull;
@@ -3665,6 +3713,7 @@ void register_kernel_mem_hle() {
     R("sceKernelVirtualQuery", k_virtual_query);
     R("sceKernelQueryMemoryProtection", k_query_memory_protection);
     R("sceKernelDirectMemoryQuery", k_direct_memory_query);
+    R("sceKernelGetDirectMemoryType", k_get_direct_memory_type);
     R("sceKernelGetDirectMemorySize", k_dmem_size);
     R("sceKernelAvailableDirectMemorySize", k_avail_dmem);
     #undef R
