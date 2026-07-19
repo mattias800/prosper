@@ -85,6 +85,38 @@ int main() {
         CHECK(r > 128 && g < 128 && b > 128, "additive blend: red over blue -> magenta (blend state honored)");
     } else { CHECK(false, "additive blend render produced a frame"); }
 
+    // Logic op honored: AMD ROP3 XOR (0x66) combines the red fragment with the blue destination,
+    // producing magenta. The operation is decoded from real CB_COLOR_CONTROL state and reaches the
+    // VkPipelineColorBlendStateCreateInfo, proving the full register-to-pixel path.
+    {
+        namespace P = prosper::agc::Pm4;
+        GpuState st;
+        st.uc[P::VGT_PRIMITIVE_TYPE] = 4;
+        st.cx[P::CB_TARGET_MASK] = 0xF;
+        st.cx[P::CB_COLOR_CONTROL] =
+            (P::CB_COLOR_CONTROL_MODE_NORMAL << P::CB_COLOR_CONTROL_MODE_SHIFT) |
+            (0x66u << P::CB_COLOR_CONTROL_ROP3_SHIFT);
+        ResolvedPipelineState logic = resolve_pipeline_state(extract_render_state(st));
+        CHECK(logic.logic_op_enable && logic.logic_op == VK_LOGIC_OP_XOR,
+              "CB_COLOR_CONTROL ROP3 XOR resolves to VK_LOGIC_OP_XOR");
+        st.cx[P::CB_BLEND0_CONTROL] =
+            (1u << P::CB_BLEND0_CONTROL_DISABLE_ROP3_SHIFT);
+        CHECK(!resolve_pipeline_state(extract_render_state(st)).logic_op_enable,
+              "CB_BLEND0_CONTROL.DISABLE_ROP3 suppresses XOR through the raw register path");
+        st.cx.erase(P::CB_BLEND0_CONTROL);
+        if (prosper::test::render_vk_ctx().logic_op_enabled) {
+            std::vector<uint8_t> imgl = render_triangle_rgba(vert, frag, W, H, &logic);
+            if (imgl.size() == (size_t)W*H*4) {
+                uint8_t r = imgl[center], g = imgl[center+1], b = imgl[center+2];
+                printf("  center (logic XOR)   = (%u,%u,%u)\n", r, g, b);
+                CHECK(r > 128 && g < 128 && b > 128,
+                      "logic XOR: red source XOR blue destination -> magenta");
+            } else { CHECK(false, "logic XOR render produced a frame"); }
+        } else {
+            printf("  [skip] Vulkan device does not advertise logicOp\n");
+        }
+    }
+
     // Depth honored: the harness clears depth to 0.5 and the triangle's fragments are at z=0.0.
     // ZFUNC=LESS (1): 0.0 < 0.5 -> passes -> red visible. ZFUNC=GREATER (4): 0.0 > 0.5 -> fails ->
     // triangle rejected, center stays blue. Both compare ops come from resolve_pipeline_state.

@@ -37,7 +37,7 @@ namespace prosper::gpu {
 namespace {
 
 constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
-constexpr uint32_t kVersion = 20;
+constexpr uint32_t kVersion = 21;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -253,6 +253,18 @@ bool read_scissor_pipeline(Reader& r, ResolvedPipelineState& p) {
     p.scissor_top = std::bit_cast<int32_t>(top);
     p.scissor_right = std::bit_cast<int32_t>(right);
     p.scissor_bottom = std::bit_cast<int32_t>(bottom);
+    return true;
+}
+
+void write_logic_op_pipeline(Writer& w, const ResolvedPipelineState& p) {
+    w.u8(p.logic_op_enable);
+    w.u32(p.logic_op);
+}
+
+bool read_logic_op_pipeline(Reader& r, ResolvedPipelineState& p) {
+    uint8_t enabled = 0;
+    if (!r.u8(enabled) || enabled > 1 || !r.u32(p.logic_op) || p.logic_op > 15u) return false;
+    p.logic_op_enable = enabled != 0;
     return true;
 }
 
@@ -1443,6 +1455,13 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     // matching the command-processor and Vulkan defaults before IT_NUM_INSTANCES was consumed.
     w.u32(static_cast<uint32_t>(c.draws.size()));
     for (const auto& draw : c.draws) w.u32(draw.instance_count);
+    // v21 appends the resolved framebuffer logic operation for realized and failed draw pipelines.
+    // Older captures retain the historical disabled/COPY default.
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws) write_logic_op_pipeline(w, draw.ps);
+    w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
+    for (const auto& diagnostic : c.failure_diagnostics)
+        if (diagnostic.pipeline_present) write_logic_op_pipeline(w, diagnostic.pipeline);
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -1942,6 +1961,21 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
         }
         for (auto& draw : c.draws)
             if (!r.u32(draw.instance_count)) return false;
+    }
+    if (version >= 21) {
+        uint32_t draw_count = 0;
+        if (!r.u32(draw_count) || draw_count != c.draws.size()) {
+            error = "invalid logic-op draw-state count"; return false;
+        }
+        for (auto& draw : c.draws)
+            if (!read_logic_op_pipeline(r, draw.ps)) return false;
+        uint32_t failure_count = 0;
+        if (!r.u32(failure_count) || failure_count != c.failure_diagnostics.size()) {
+            error = "invalid logic-op failure-state count"; return false;
+        }
+        for (auto& diagnostic : c.failure_diagnostics)
+            if (diagnostic.pipeline_present && !read_logic_op_pipeline(r, diagnostic.pipeline))
+                return false;
     }
     if (version >= 7 && !validate_failure_diagnostics(c, error)) return false;
     if (r.left) { error = "capture has trailing data"; return false; }
