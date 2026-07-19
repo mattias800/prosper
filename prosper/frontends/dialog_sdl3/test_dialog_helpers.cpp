@@ -84,6 +84,19 @@ int main() {
                   request.userData == user_data,
               "SaveDataDialog USER_MSG parses text, YES/NO buttons, mode, and userData");
 
+        button_type = 3 /*OK_CANCEL*/; std::memcpy(user + 0, &button_type, 4);
+        request = read_savedata_request((uint64_t)(uintptr_t)save_param);
+        uint8_t cancel_result[0x48] = {};
+        write_savedata_result((uint64_t)(uintptr_t)cancel_result, request,
+                              request.buttons.id[1], request.buttons.id[1] == 0);
+        uint32_t cancel_common = 0, cancel_button = 99;
+        std::memcpy(&cancel_common, cancel_result + 4, 4);
+        std::memcpy(&cancel_button, cancel_result + 8, 4);
+        CHECK(request.supported && request.buttons.count == 2 && request.buttons.id[1] == 0 &&
+                  cancel_common == 1 && cancel_button == 0,
+              "SaveDataDialog USER_MSG OK_CANCEL writes USER_CANCELED + INVALID for Cancel");
+        button_type = 1 /*YESNO*/; std::memcpy(user + 0, &button_type, 4);
+
         uint8_t system[48] = {};
         uint32_t system_type = 2 /*CONFIRM*/;
         std::memcpy(system, &system_type, 4);
@@ -112,8 +125,21 @@ int main() {
         std::memcpy(option, &option_back, 4);
         request = read_savedata_request((uint64_t)(uintptr_t)save_param);
         CHECK(request.supported && request.cancelable && request.buttons.count == 2 &&
-                  request.buttons.id[1] == 2,
-              "SaveDataDialog OptionBack::ENABLE exposes OK + Cancel with the ABI button ids");
+                  request.buttons.id[1] == 0,
+              "SaveDataDialog OptionBack::ENABLE exposes OK + Cancel with INVALID for Cancel");
+        std::memset(cancel_result, 0, sizeof cancel_result);
+        write_savedata_result((uint64_t)(uintptr_t)cancel_result, request,
+                              request.buttons.id[1], request.buttons.id[1] == 0);
+        std::memcpy(&cancel_common, cancel_result + 4, 4);
+        std::memcpy(&cancel_button, cancel_result + 8, 4);
+        CHECK(cancel_common == 1 && cancel_button == 0,
+              "SaveDataDialog OptionBack-enabled Cancel writes USER_CANCELED + INVALID");
+
+        option_ptr = 0; std::memcpy(save_param + 0x78, &option_ptr, 8);
+        request = read_savedata_request((uint64_t)(uintptr_t)save_param);
+        CHECK(request.supported && request.cancelable && request.buttons.count == 2 &&
+                  request.buttons.id[1] == 0,
+              "SaveDataDialog absent OptionBack defaults to enabled OK + Cancel");
 
         option_ptr = 1; std::memcpy(save_param + 0x78, &option_ptr, 8);
         CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
@@ -196,6 +222,49 @@ int main() {
               "SaveDataDialog canceled result returns USER_CANCELED + INVALID button");
         write_savedata_result(1, request, 1, false);
         CHECK(true, "SaveDataDialog unreadable result pointer is ignored without crashing");
+    }
+
+    // SaveData lifecycle seam: pending tickets are single-consumer and generations invalidate both
+    // queued and already-visible stale modals without allowing their completion to overwrite state.
+    {
+        SaveDataRequest a; a.supported = true; a.message = "A"; a.userData = 1;
+        SaveDataRequest b; b.supported = true; b.message = "B"; b.userData = 2;
+        SaveDataDialogState state;
+
+        state.open(a);
+        state.close();
+        CHECK(!state.take_pending() && state.status() == 0,
+              "SaveData lifecycle Close-before-pump removes the pending modal");
+
+        state.open(a);
+        SaveDataModalTicket visible = state.take_pending();
+        state.close();
+        state.complete(visible.generation, 1);
+        CHECK(visible && !state.active(visible.generation) && state.status() == 0,
+              "SaveData lifecycle Close-while-visible invalidates stale completion");
+
+        state.open(a);
+        SaveDataModalTicket old = state.take_pending();
+        state.open(b);
+        state.complete(old.generation, 1);
+        SaveDataModalTicket current = state.take_pending();
+        SaveDataModalTicket duplicate = state.take_pending();
+        CHECK(old && !state.active(old.generation) && current &&
+                  current.request.userData == 2 && !duplicate,
+              "SaveData lifecycle re-Open invalidates old UI and exposes the new request exactly once");
+        state.complete(current.generation, 0 /*Cancel*/);
+        SaveDataResultSnapshot snapshot = state.result_snapshot();
+        CHECK(state.status() == 3 && snapshot.request.userData == 2 &&
+                  snapshot.canceled && snapshot.buttonId == 0,
+              "SaveData lifecycle publishes only the current generation's canceled result");
+        uint8_t lifecycle_result[0x48] = {};
+        write_savedata_result((uint64_t)(uintptr_t)lifecycle_result, snapshot.request,
+                              snapshot.buttonId, snapshot.canceled);
+        uint32_t lifecycle_common = 0, lifecycle_button = 99;
+        std::memcpy(&lifecycle_common, lifecycle_result + 4, 4);
+        std::memcpy(&lifecycle_button, lifecycle_result + 8, 4);
+        CHECK(lifecycle_common == 1 && lifecycle_button == 0,
+              "SaveData lifecycle canceled completion writes USER_CANCELED + INVALID");
     }
 
     // --- ImeDialog: read_ime_request from a synthetic OrbisImeDialogParam (96 bytes) ---

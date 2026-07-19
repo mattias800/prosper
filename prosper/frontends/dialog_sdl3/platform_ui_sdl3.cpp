@@ -192,49 +192,21 @@ struct SdlPlatformUi : PlatformUi {
     // SaveDataDialog. Open copies the guest request; the prosper-app main-thread pump owns SDL UI.
     // LIST/progress modes are declined until their dedicated virtual-slot UI exists, preserving the
     // core's established headless auto-dismiss for those modes.
-    std::mutex      save_mx;
-    SaveDataRequest save_request{};
-    int             save_status = 0 /*NONE*/;
-    uint32_t        save_button = 0 /*INVALID*/;
-    bool            save_canceled = false;
-    uint64_t        save_generation = 0;
-    uint64_t        save_pending_generation = 0;
+    SaveDataDialogState save_state;
 
     bool saveDataDialogOpen(uint64_t param) override {
         SaveDataRequest request = read_savedata_request(param);
         if (!request.supported) return false;
-        std::lock_guard<std::mutex> lk(save_mx);
-        ++save_generation;
-        save_request = std::move(request);
-        save_button = 0;
-        save_canceled = false;
-        save_status = 2 /*RUNNING*/;
-        save_pending_generation = save_generation;
+        save_state.open(std::move(request));
         return true;
     }
-    int saveDataDialogStatus() override {
-        std::lock_guard<std::mutex> lk(save_mx);
-        return save_status;
-    }
+    int saveDataDialogStatus() override { return save_state.status(); }
     int saveDataDialogResult(uint64_t result) override {
-        SaveDataRequest request;
-        uint32_t button = 0;
-        bool canceled = false;
-        {
-            std::lock_guard<std::mutex> lk(save_mx);
-            request = save_request;
-            button = save_button;
-            canceled = save_canceled;
-        }
-        write_savedata_result(result, request, button, canceled);
-        return (int)button;
+        const SaveDataResultSnapshot snapshot = save_state.result_snapshot();
+        write_savedata_result(result, snapshot.request, snapshot.buttonId, snapshot.canceled);
+        return (int)snapshot.buttonId;
     }
-    void saveDataDialogClose() override {
-        std::lock_guard<std::mutex> lk(save_mx);
-        ++save_generation; // makes a visible modal's active predicate fail
-        save_pending_generation = 0;
-        save_status = 0 /*NONE*/;
-    }
+    void saveDataDialogClose() override { save_state.close(); }
 
     // Ime keyboard presence: a windowed session runs on a host with a keyboard, so report one (#347).
     // This makes sceImeKeyboardGetResourceId/GetInfo report a connected keyboard, enabling a title's
@@ -274,31 +246,13 @@ struct SdlPlatformUi : PlatformUi {
     // MAIN-thread: if a text dialog is pending, run its modal to completion (writes the guest buffer,
     // then flips status to FINISHED so the guest's next poll — and its buffer read — see it).
     void pump() {
-        uint64_t generation = 0;
-        SaveDataRequest request;
-        {
-            std::lock_guard<std::mutex> lk(save_mx);
-            generation = save_pending_generation;
-            if (generation) {
-                request = save_request;
-                save_pending_generation = 0; // consume this exact generation once
-            }
-        }
-        if (generation) {
-            auto active = [this, generation] {
-                std::lock_guard<std::mutex> lk(save_mx);
-                return save_generation == generation && save_status == 2 /*RUNNING*/;
+        const SaveDataModalTicket ticket = save_state.take_pending();
+        if (ticket) {
+            auto active = [this, generation = ticket.generation] {
+                return save_state.active(generation);
             };
-            const int clicked = run_savedata_modal(request, active);
-            if (clicked != -2) {
-                const bool canceled = clicked <= 0;
-                std::lock_guard<std::mutex> lk(save_mx);
-                if (save_generation == generation && save_status == 2 /*RUNNING*/) {
-                    save_button = canceled ? 0u : (uint32_t)clicked;
-                    save_canceled = canceled;
-                    save_status = 3 /*FINISHED*/;
-                }
-            }
+            const int clicked = run_savedata_modal(ticket.request, active);
+            if (clicked != -2) save_state.complete(ticket.generation, clicked);
         }
         if (ime_pending.exchange(false)) {
             ImeRequest r; { std::lock_guard<std::mutex> lk(ime_mx); r = ime_req; }
@@ -319,8 +273,8 @@ bool install_sdl3_platform_ui() {
     return true;
 }
 void shutdown_sdl3_platform_ui() {
-    g_sdl_ui.saveDataDialogClose();
     set_platform_ui(nullptr);
+    g_sdl_ui.saveDataDialogClose();
 }
 void sdl_platform_ui_pump() { g_sdl_ui.pump(); }
 

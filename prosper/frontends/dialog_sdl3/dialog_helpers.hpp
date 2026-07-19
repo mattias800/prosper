@@ -10,6 +10,7 @@
 //   ErrorDialog param:    s32 size @0 ; s32 errorCode @4 ; s32 userId @8 ; s32 reserved @12
 #pragma once
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 namespace prosper {
@@ -59,6 +60,40 @@ struct SaveDataRequest {
     uint64_t userData = 0;
     std::string message;
     MsgButtons buttons{0, {nullptr, nullptr, nullptr}, {0, 0, 0}};
+};
+
+// SDL-free lifecycle seam shared by the frontend and unit tests. A pending ticket is consumed once;
+// Close or a newer Open invalidates every older generation, including one already visible.
+struct SaveDataModalTicket {
+    uint64_t generation = 0;
+    SaveDataRequest request{};
+    explicit operator bool() const { return generation != 0; }
+};
+
+struct SaveDataResultSnapshot {
+    SaveDataRequest request{};
+    uint32_t buttonId = 0;
+    bool canceled = false;
+};
+
+class SaveDataDialogState {
+public:
+    void open(SaveDataRequest request);
+    int status() const;
+    void close();
+    SaveDataModalTicket take_pending();
+    bool active(uint64_t generation) const;
+    void complete(uint64_t generation, int clicked);
+    SaveDataResultSnapshot result_snapshot() const;
+
+private:
+    mutable std::mutex mx_;
+    SaveDataRequest request_{};
+    int status_ = 0;
+    uint32_t button_ = 0;
+    bool canceled_ = false;
+    uint64_t generation_ = 0;
+    uint64_t pending_generation_ = 0;
 };
 
 // Parse the supported non-list modes into an owned request safe to retain until the SDL main-thread

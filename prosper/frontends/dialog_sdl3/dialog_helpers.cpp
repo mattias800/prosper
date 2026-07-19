@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -127,7 +128,7 @@ MsgButtons save_user_buttons(uint32_t type) {
     switch (type) {
     case 0: return {1, {"OK", nullptr, nullptr}, {1, 0, 0}};
     case 1: return {2, {"Yes", "No", nullptr}, {1, 2, 0}};
-    case 3: return {2, {"OK", "Cancel", nullptr}, {1, 2, 0}};
+    case 3: return {2, {"OK", "Cancel", nullptr}, {1, 0, 0}};
     default: return {0, {nullptr, nullptr, nullptr}, {0, 0, 0}};
     }
 }
@@ -264,6 +265,56 @@ void write_savedata_result(uint64_t result, const SaveDataRequest& request,
     (void)guest_write_bytes(result + 0x04, &common_result, sizeof common_result);
     (void)guest_write_bytes(result + 0x08, &guest_button, sizeof guest_button);
     (void)guest_write_bytes(result + 0x20, &request.userData, sizeof request.userData);
+}
+
+void SaveDataDialogState::open(SaveDataRequest request) {
+    std::lock_guard<std::mutex> lock(mx_);
+    ++generation_;
+    if (!generation_) ++generation_; // zero is reserved for "no ticket"
+    request_ = std::move(request);
+    button_ = 0;
+    canceled_ = false;
+    status_ = 2 /*RUNNING*/;
+    pending_generation_ = generation_;
+}
+
+int SaveDataDialogState::status() const {
+    std::lock_guard<std::mutex> lock(mx_);
+    return status_;
+}
+
+void SaveDataDialogState::close() {
+    std::lock_guard<std::mutex> lock(mx_);
+    ++generation_;
+    if (!generation_) ++generation_;
+    pending_generation_ = 0;
+    status_ = 0 /*NONE*/;
+}
+
+SaveDataModalTicket SaveDataDialogState::take_pending() {
+    std::lock_guard<std::mutex> lock(mx_);
+    const uint64_t pending = pending_generation_;
+    pending_generation_ = 0;
+    if (!pending || pending != generation_ || status_ != 2 /*RUNNING*/) return {};
+    return {pending, request_};
+}
+
+bool SaveDataDialogState::active(uint64_t generation) const {
+    std::lock_guard<std::mutex> lock(mx_);
+    return generation && generation_ == generation && status_ == 2 /*RUNNING*/;
+}
+
+void SaveDataDialogState::complete(uint64_t generation, int clicked) {
+    std::lock_guard<std::mutex> lock(mx_);
+    if (!generation || generation_ != generation || status_ != 2 /*RUNNING*/) return;
+    canceled_ = clicked <= 0;
+    button_ = canceled_ ? 0u : (uint32_t)clicked;
+    status_ = 3 /*FINISHED*/;
+}
+
+SaveDataResultSnapshot SaveDataDialogState::result_snapshot() const {
+    std::lock_guard<std::mutex> lock(mx_);
+    return {request_, button_, canceled_};
 }
 
 // --- ImeDialog text entry ---
