@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 #ifndef _WIN32
 #include <unistd.h>
+#include <sys/time.h>    // utimes: sceKernelUtimes timestamp preservation
 #include <sys/syscall.h>
 #include <dirent.h>      // opendir/readdir: savedata0_list_dirs (sceSaveDataDirNameSearch, #299)
 #include <sys/uio.h>     // process_vm_readv: fault-safe guest-memory reads for the APR diagnostics
@@ -421,6 +422,12 @@ namespace {
         int64_t size = 0, blocks = 0;
         uint32_t blksize = 0;
     };
+
+    struct GuestTimeval {
+        int64_t sec;
+        int64_t usec;
+    };
+    static_assert(sizeof(GuestTimeval) == 0x10, "SceKernelTimeval ABI");
 
     int64_t blocks_512_for_size(int64_t size) {
         return size > 0 ? (size + 511) / 512 : 0;
@@ -1426,6 +1433,64 @@ HLE(k_check_reachability) {
     if (::access(host.c_str(), 0) == 0) return 0;
     return file_sce_error(errno);
 }
+HLE(k_utimes) {
+    if (!a0) return file_sce_error(EFAULT);
+    const auto* guest_times = a1 ? (const GuestTimeval*)P(a1) : nullptr;
+    if (guest_times && (guest_times[0].usec < 0 || guest_times[0].usec >= 1000000 ||
+                        guest_times[1].usec < 0 || guest_times[1].usec >= 1000000))
+        return file_sce_error(EINVAL);
+    const std::string host = translate(CS(a0));
+#ifndef _WIN32
+    struct timeval host_times[2];
+    if (guest_times) {
+        for (size_t i = 0; i < 2; ++i) {
+            host_times[i].tv_sec = (time_t)guest_times[i].sec;
+            host_times[i].tv_usec = (suseconds_t)guest_times[i].usec;
+        }
+    }
+    const int result = ::utimes(host.c_str(), guest_times ? host_times : nullptr);
+    return result == 0 ? 0 : file_sce_error(errno);
+#else
+    auto to_file_time = [](const GuestTimeval& value, FILETIME* out) {
+        constexpr int64_t kUnixToWindowsEpochSeconds = 11644473600ll;
+        constexpr uint64_t kTicksPerSecond = 10000000ull;
+        uint64_t epoch_seconds;
+        if (value.sec < 0) {
+            if (value.sec < -kUnixToWindowsEpochSeconds) return false;
+            epoch_seconds = (uint64_t)(value.sec + kUnixToWindowsEpochSeconds);
+        } else {
+            const uint64_t sec = (uint64_t)value.sec;
+            if (sec > UINT64_MAX / kTicksPerSecond - (uint64_t)kUnixToWindowsEpochSeconds)
+                return false;
+            epoch_seconds = sec + (uint64_t)kUnixToWindowsEpochSeconds;
+        }
+        const uint64_t subsecond = (uint64_t)value.usec * 10ull;
+        if (epoch_seconds > (UINT64_MAX - subsecond) / kTicksPerSecond) return false;
+        const uint64_t ticks = epoch_seconds * kTicksPerSecond + subsecond;
+        out->dwLowDateTime = (DWORD)ticks;
+        out->dwHighDateTime = (DWORD)(ticks >> 32);
+        return true;
+    };
+    FILETIME access_time{}, modify_time{};
+    if (guest_times) {
+        if (!to_file_time(guest_times[0], &access_time) ||
+            !to_file_time(guest_times[1], &modify_time))
+            return file_sce_error(EOVERFLOW);
+    } else {
+        GetSystemTimeAsFileTime(&access_time);
+        modify_time = access_time;
+    }
+    HANDLE file = CreateFileA(host.c_str(), FILE_WRITE_ATTRIBUTES,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return file_sce_error(windows_directory_errno(GetLastError()));
+    const BOOL updated = SetFileTime(file, nullptr, &access_time, &modify_time);
+    const DWORD error = updated ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(file);
+    return updated ? 0 : file_sce_error(windows_directory_errno(error));
+#endif
+}
 HLE(f_access){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::access(h.c_str(), (int)a1); }
 HLE(f_mkdir) { std::string h = translate(CS(a0));   // sceKernelMkdir(path, mode)
 #ifdef _WIN32
@@ -2170,6 +2235,7 @@ void register_file_hle() {
     R("fdatasync", f_fdatasync); R("sceKernelFdatasync", k_fdatasync); // data-only durability
     R("sceKernelSync", k_sync); // whole-filesystem/process-file flush (was fake success)
     R("sceKernelCheckReachability", k_check_reachability); // truthful file/directory existence
+    R("sceKernelUtimes", k_utimes); // preserve guest access/modify timestamps (incl. touch-now)
     R("sceKernelTruncate", k_truncate);      // path-based sibling (same corruption class)
     R("sceKernelFstat", k_fstat);
     // Low-level POSIX wrappers with the internal leading-underscore names. Real libc.prx implements

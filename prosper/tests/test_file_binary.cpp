@@ -38,6 +38,12 @@ static constexpr uint64_t kGuestONonblock = 0x0004;
 static constexpr uint64_t kGuestOAppend = 0x0008;
 static constexpr uint64_t kGuestOSync = 0x0080;
 
+struct GuestTimeval {
+    int64_t sec;
+    int64_t usec;
+};
+static_assert(sizeof(GuestTimeval) == 0x10, "SceKernelTimeval ABI");
+
 int main() {
     std::printf("== test_file_binary ==\n");
     const char* path = "prosper-test-file-binary.tmp";
@@ -98,6 +104,7 @@ int main() {
     HleFn kernel_fdatasync_fn = Hle::lookup(nid_hash("sceKernelFdatasync"));
     HleFn kernel_sync_fn = Hle::lookup(nid_hash("sceKernelSync"));
     HleFn kernel_reachability_fn = Hle::lookup(nid_hash("sceKernelCheckReachability"));
+    HleFn kernel_utimes_fn = Hle::lookup(nid_hash("sceKernelUtimes"));
     HleFn getdents_fn = Hle::lookup(nid_hash("getdents"));
     HleFn kernel_getdents_fn = Hle::lookup(nid_hash("sceKernelGetdents"));
     HleFn getdirentries_fn = Hle::lookup(nid_hash("getdirentries"));
@@ -119,7 +126,7 @@ int main() {
               kernel_rmdir_fn && unlink_fn && kernel_unlink_fn && rename_fn &&
               kernel_rename_fn && kernel_truncate_fn && kernel_ftruncate_fn && fsync_fn &&
               kernel_fsync_fn && fdatasync_fn && kernel_fdatasync_fn && kernel_sync_fn &&
-              kernel_reachability_fn && getdents_fn &&
+              kernel_reachability_fn && kernel_utimes_fn && getdents_fn &&
               kernel_getdents_fn && getdirentries_fn && kernel_getdirentries_fn && stat_fn &&
               kernel_stat_fn && fstat_fn && kernel_fstat_fn && lstat_fn && kernel_lstat_fn &&
               fcntl_fn && kernel_fcntl_fn,
@@ -158,6 +165,81 @@ int main() {
     CHECK(kernel_reachability_fn &&
               kernel_reachability_fn((uint64_t)(uintptr_t)reachable_directory.c_str(), 0, 0, 0, 0, 0) == 0,
           "sceKernelCheckReachability finds a translated guest directory");
+    GuestTimeval explicit_times[2]{{1700000001, 123456}, {1700000002, 654321}};
+    CHECK(kernel_utimes_fn &&
+              kernel_utimes_fn((uint64_t)(uintptr_t)reachable_file.c_str(),
+                                (uint64_t)(uintptr_t)explicit_times, 0, 0, 0, 0) == 0,
+          "sceKernelUtimes applies explicit timestamps to a translated guest file");
+    CHECK(kernel_utimes_fn &&
+              kernel_utimes_fn((uint64_t)(uintptr_t)reachable_directory.c_str(),
+                                (uint64_t)(uintptr_t)explicit_times, 0, 0, 0, 0) == 0,
+          "sceKernelUtimes applies explicit timestamps to a translated guest directory");
+    std::array<uint8_t, 0x78> timestamp_stat{};
+    CHECK(kernel_stat_fn &&
+              kernel_stat_fn((uint64_t)(uintptr_t)reachable_file.c_str(),
+                             (uint64_t)(uintptr_t)timestamp_stat.data(), 0, 0, 0, 0) == 0 &&
+              *(const int64_t*)(timestamp_stat.data() + 0x18) == explicit_times[0].sec &&
+              *(const int64_t*)(timestamp_stat.data() + 0x28) == explicit_times[1].sec,
+          "sceKernelUtimes preserves explicit access/modify seconds");
+#ifdef _WIN32
+    HANDLE timestamp_handle = CreateFileA(path, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    FILETIME access_time{}, modify_time{};
+    const BOOL read_times = timestamp_handle != INVALID_HANDLE_VALUE &&
+        GetFileTime(timestamp_handle, nullptr, &access_time, &modify_time);
+    auto filetime_ticks = [](const FILETIME& value) {
+        return (uint64_t)value.dwLowDateTime | ((uint64_t)value.dwHighDateTime << 32);
+    };
+    constexpr uint64_t kUnixToWindowsEpochSeconds = 11644473600ull;
+    constexpr uint64_t kTicksPerSecond = 10000000ull;
+    CHECK(read_times &&
+              filetime_ticks(access_time) ==
+                  ((uint64_t)explicit_times[0].sec + kUnixToWindowsEpochSeconds) * kTicksPerSecond +
+                      (uint64_t)explicit_times[0].usec * 10 &&
+              filetime_ticks(modify_time) ==
+                  ((uint64_t)explicit_times[1].sec + kUnixToWindowsEpochSeconds) * kTicksPerSecond +
+                      (uint64_t)explicit_times[1].usec * 10,
+          "sceKernelUtimes preserves explicit Windows microseconds");
+    if (timestamp_handle != INVALID_HANDLE_VALUE) CloseHandle(timestamp_handle);
+#else
+    // The source tree can live on WSL's /mnt/c mount, whose metadata bridge truncates subsecond
+    // timestamps. Exercise microsecond preservation on the native temporary filesystem instead.
+    const std::string precision_path =
+        (std::filesystem::temp_directory_path() / "prosper-test-utimes-precision.tmp").string();
+    FILE* precision_file = std::fopen(precision_path.c_str(), "wb");
+    CHECK(precision_file != nullptr, "create native-filesystem timestamp fixture");
+    if (precision_file) std::fclose(precision_file);
+    timestamp_stat.fill(0);
+    CHECK(precision_file && kernel_utimes_fn && kernel_stat_fn &&
+              kernel_utimes_fn((uint64_t)(uintptr_t)precision_path.c_str(),
+                                (uint64_t)(uintptr_t)explicit_times, 0, 0, 0, 0) == 0 &&
+              kernel_stat_fn((uint64_t)(uintptr_t)precision_path.c_str(),
+                             (uint64_t)(uintptr_t)timestamp_stat.data(), 0, 0, 0, 0) == 0 &&
+              *(const int64_t*)(timestamp_stat.data() + 0x20) == explicit_times[0].usec * 1000 &&
+              *(const int64_t*)(timestamp_stat.data() + 0x30) == explicit_times[1].usec * 1000,
+          "sceKernelUtimes preserves explicit POSIX microseconds");
+    std::filesystem::remove(precision_path, remove_error);
+#endif
+    GuestTimeval invalid_times[2]{{1700000001, 1000000}, {1700000002, 0}};
+    CHECK(kernel_utimes_fn &&
+              kernel_utimes_fn((uint64_t)(uintptr_t)reachable_file.c_str(),
+                                (uint64_t)(uintptr_t)invalid_times, 0, 0, 0, 0) == 0x80020016u,
+          "sceKernelUtimes rejects an out-of-range microsecond field");
+    timestamp_stat.fill(0);
+    CHECK(kernel_stat_fn &&
+              kernel_stat_fn((uint64_t)(uintptr_t)reachable_file.c_str(),
+                             (uint64_t)(uintptr_t)timestamp_stat.data(), 0, 0, 0, 0) == 0 &&
+              *(const int64_t*)(timestamp_stat.data() + 0x28) == explicit_times[1].sec,
+          "rejected sceKernelUtimes leaves the modify time unchanged");
+    CHECK(kernel_utimes_fn &&
+              kernel_utimes_fn((uint64_t)(uintptr_t)reachable_file.c_str(), 0, 0, 0, 0, 0) == 0,
+          "sceKernelUtimes supports null-times touch-now semantics");
+    timestamp_stat.fill(0);
+    CHECK(kernel_stat_fn &&
+              kernel_stat_fn((uint64_t)(uintptr_t)reachable_file.c_str(),
+                             (uint64_t)(uintptr_t)timestamp_stat.data(), 0, 0, 0, 0) == 0 &&
+              *(const int64_t*)(timestamp_stat.data() + 0x28) > explicit_times[1].sec,
+          "touch-now sceKernelUtimes advances the modify time");
 #ifdef _WIN32
     // Windows has no CRT directory-open API, but a directory HANDLE can be attached to a CRT fd.
     // The zero-entry stub must still publish the defined starting offset through basep.
@@ -334,6 +416,12 @@ int main() {
               kernel_reachability_fn((uint64_t)(uintptr_t)overlong_path.c_str(), 0, 0, 0, 0, 0) ==
                   0x8002003fu,
           "sceKernelCheckReachability enforces the 255-byte console path bound");
+    CHECK(kernel_utimes_fn &&
+              kernel_utimes_fn((uint64_t)(uintptr_t)unreachable_file.c_str(), 0, 0, 0, 0, 0) ==
+                  0x80020002u,
+          "sceKernelUtimes returns SCE_KERNEL_ERROR_ENOENT for a missing path");
+    CHECK(kernel_utimes_fn && kernel_utimes_fn(0, 0, 0, 0, 0, 0) == 0x8002000eu,
+          "sceKernelUtimes returns SCE_KERNEL_ERROR_EFAULT for a null path");
 
     // The stat-family libc names preserve -1 plus errno, while their kernel siblings return
     // a 32-bit SCE error directly. Neither contract may overwrite the guest buffer on failure.
