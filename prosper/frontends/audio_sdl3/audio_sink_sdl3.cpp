@@ -10,6 +10,7 @@
 #include <SDL3/SDL.h>
 
 #include <array>
+#include <chrono>
 #include <mutex>
 #include <thread>
 
@@ -49,43 +50,38 @@ public:
         if (!s.stream) { SDL_Log("prosper-audio: OpenAudioDeviceStream failed: %s", SDL_GetError()); return false; }
         s.frame_bytes = audio_frame_bytes(info);
         s.grain_bytes = audio_grain_bytes(info);
-        // Queue cap for output()'s pacing: enough to cover TWO device periods plus two grains of
-        // jitter margin, floored at the historical 4 grains. A fixed 4-grain cap (~21 ms at the
-        // common 256-frame grain) left ZERO headroom against PipeWire's ~21 ms pull quantum, so any
-        // scheduling jitter starved the device once per quantum and playback came out garbled —
-        // while WASAPI's ~10 ms periods and PulseAudio's deep server buffering masked the same math
-        // on Windows/WSL. Sizing from the real device period keeps latency minimal per platform
-        // instead of hard-coding one backend's numbers.
-        int device_frames = 0;
-        SDL_AudioSpec dev_spec{};
-        if (SDL_AudioDeviceID dev = SDL_GetAudioStreamDevice(s.stream))
-            SDL_GetAudioDeviceFormat(dev, &dev_spec, &device_frames);
-        // device_frames is in DEVICE-rate frames; rescale to the port's rate before mixing units.
-        int period_port_frames = (device_frames > 0 && dev_spec.freq > 0)
-            ? (int)((int64_t)device_frames * info.freq / dev_spec.freq) : 0;
-        int cap = 4 * s.grain_bytes;
-        if (period_port_frames > 0) {
-            int period_bytes = period_port_frames * s.frame_bytes;
-            if (2 * period_bytes + 2 * s.grain_bytes > cap) cap = 2 * period_bytes + 2 * s.grain_bytes;
-        }
-        s.queue_cap = cap;
+        s.freq = info.freq;
+        s.next = {};   // (re)start the per-grain pacing clock on the first output()
         SDL_ResumeAudioStreamDevice(s.stream);
         return true;
     }
 
     void output(int port, const void* pcm, int frames) override {
         if (port < 1 || port > kMaxPorts) return;
-        SDL_AudioStream* stream; int frame_bytes, queue_cap;
-        { std::lock_guard<std::mutex> lk(mx_); Slot& s = slots_[port - 1];
-          stream = s.stream; frame_bytes = s.frame_bytes; queue_cap = s.queue_cap; }
+        SDL_AudioStream* stream; int frame_bytes; int freq;
+        std::chrono::steady_clock::time_point target;
+        {
+            std::lock_guard<std::mutex> lk(mx_);
+            Slot& s = slots_[port - 1];
+            stream = s.stream; frame_bytes = s.frame_bytes; freq = s.freq;
+            if (stream && freq > 0) {
+                // Pace EACH call one grain of wall-clock time apart (real sceAudioOutOutput blocks
+                // until the hardware ring frees one grain — evenly spaced, never bursty). The old
+                // cap-based pacing let the guest burst a whole device quantum (4+ grains) and then
+                // stall: FMOD signals its mixer's condvar once per submitted grain, condvar signals
+                // COALESCE within a burst, so the mixer woke once per ~21 ms instead of once per
+                // grain and mixed at 1/4 real time — every DSP block audibly replayed ~4x (#1016).
+                // Same resync-if-behind model as the core's RealtimeSilentSink.
+                auto dur = std::chrono::nanoseconds((int64_t)frames * 1000000000LL / freq);
+                auto now = std::chrono::steady_clock::now();
+                if (s.next.time_since_epoch().count() == 0 || s.next < now - dur * 4) s.next = now;
+                s.next += dur;
+                target = s.next;
+            }
+        }
         if (!stream) return;
-        int bytes = frames * frame_bytes;
-        SDL_PutAudioStreamData(stream, pcm, bytes);
-        // Pace like real hardware: block while the queue is ahead of the device-derived cap
-        // (computed in open() — two device periods + jitter margin, min 4 grains).
-        const int cap = queue_cap > 0 ? queue_cap : bytes * 4;
-        for (int spins = 0; SDL_GetAudioStreamQueued(stream) > cap && spins < 1000; spins++)
-            SDL_Delay(1);
+        SDL_PutAudioStreamData(stream, pcm, frames * frame_bytes);
+        if (freq > 0) std::this_thread::sleep_until(target);
     }
 
     void set_volume(int port, uint32_t mask, const int* vols) override {
@@ -107,7 +103,8 @@ public:
 
 private:
     struct Slot { SDL_AudioStream* stream = nullptr; int frame_bytes = 0; int grain_bytes = 0;
-                  int queue_cap = 0; };   // pacing cap in bytes, derived from the device period in open()
+                  int freq = 0;                                     // port sample rate for pacing
+                  std::chrono::steady_clock::time_point next{}; };  // per-grain pacing deadline
     std::mutex mx_;
     std::array<Slot, kMaxPorts> slots_{};
 };

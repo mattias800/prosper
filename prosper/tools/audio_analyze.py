@@ -80,7 +80,26 @@ def main():
     ncorrs = {lag: corr(seg, lag) for lag in neighbors}
     baseline = max(ncorrs.values())
     spike = block_corr - baseline
-    broken = spike > REPEAT_SPIKE
+
+    # Sharper co-metric: byte-identical grain duplication. In the broken Messenger capture, 74% of
+    # non-silent 256-frame grains were bit-identical to the grain 4 back (the resubmitted DSP block);
+    # healthy mixed audio essentially never emits byte-identical non-silent grains.
+    grain_bytes = 256 * a.channels * (4 if a.fmt == "f32" else 2)
+    raw = open(a.dump, "rb").read()
+    tail_bytes = int(a.tail_seconds * a.rate) * a.channels * (4 if a.fmt == "f32" else 2)
+    rawseg = raw[-tail_bytes:] if len(raw) > tail_bytes else raw
+    grains = [rawseg[i:i + grain_bytes] for i in range(0, len(rawseg) - grain_bytes, grain_bytes)]
+    nonsilent = dup = 0
+    for i in range(8, len(grains)):
+        g = grains[i]
+        if not any(g):
+            continue
+        nonsilent += 1
+        if any(g == grains[i - lag] for lag in range(1, 9)):
+            dup += 1
+    dup_ratio = dup / nonsilent if nonsilent else 0.0
+
+    broken = spike > REPEAT_SPIKE or dup_ratio > 0.10
 
     out = {
         "verdict": "block-repetition" if broken else "clean",
@@ -89,6 +108,7 @@ def main():
         "neighbor_corrs": {str(k): round(v, 4) for k, v in ncorrs.items()},
         "spike": round(spike, 4),
         "threshold": REPEAT_SPIKE,
+        "dup_grain_ratio": round(dup_ratio, 4),
         "rms": round(rms, 6),
         "peak": round(peak, 6),
         "analyzed_seconds": round(len(seg) / a.rate, 2),
@@ -98,7 +118,7 @@ def main():
     else:
         print(f"{out['verdict'].upper()}: corr(block {a.block}f)={block_corr:+.3f} "
               f"neighbor-max={baseline:+.3f} spike={spike:+.3f} (threshold {REPEAT_SPIKE}) "
-              f"rms={rms:.4f} peak={peak:.4f}")
+              f"dup-grains={dup_ratio:.1%} rms={rms:.4f} peak={peak:.4f}")
     return 1 if broken else 0
 
 
