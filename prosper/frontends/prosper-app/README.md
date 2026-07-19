@@ -52,7 +52,7 @@ PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
 ./build-app/prosper-app --test-pattern
 ```
 
-Esc or closing the window quits.
+F11 or Alt+Enter toggles borderless desktop fullscreen. Esc or closing the window quits.
 
 ## Options
 
