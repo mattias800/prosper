@@ -2099,6 +2099,45 @@ HLE(f_apr_read_direct) {
 }
 // APR completion-token plumbing (hle_kernel_time.cpp) — see the k_apr_submit block in
 // hle_kernel_mem.cpp for the recovered contract.
+#else
+// Windows port of the APR DIRECT read (#984). The POSIX version above uses mmap/pread, so it was
+// only compiled/registered on Linux — leaving vWU-odnS+fU as the unimplemented-stub 0 on Windows.
+// That silently skipped the CreateGlobalShaderMap direct read (GlobalShaderCache-SF_PS5.bin out of
+// pakchunk0), so the shader precache never completed, FAPREventQueueListener blocked on an empty
+// APREventQueue, and the game never reached GPU submission (main spun broadcasting a condvar). Same
+// synchronous whole-range read + guest DMA-write, over stdio + windows_prepare_guest_write. No
+// completion event, matching the Linux path and the #208 listener contract.
+HLE(f_apr_read_direct) {
+    uint64_t id = a0, dst = a1, size = a2, offset = a3;
+    std::string host = prosper_apr_path_for_id((uint32_t)id);
+    if (host.empty()) {
+        if (filelog()) fprintf(stderr, "[apr] read-direct(win): no file for id=%llu\n", (unsigned long long)id);
+        return 0x80020016ull;
+    }
+    uint64_t fsize = 0;
+    { struct _stat64 st{}; if (::_stat64(host.c_str(), &st) == 0) fsize = (uint64_t)st.st_size; }
+    if (offset > fsize) offset = fsize;
+    if (size > fsize - offset) size = fsize - offset;
+    void* slot = ::malloc(size ? (size_t)size : 16);
+    if (!slot) return 0x80020016ull;
+    size_t got = 0;
+    if (size) {
+        FILE* f = ::fopen(host.c_str(), "rb");
+        if (!f) { ::free(slot); return 0x80020016ull; }
+        if (_fseeki64(f, (__int64)offset, SEEK_SET) == 0) got = ::fread(slot, 1, (size_t)size, f);
+        ::fclose(f);
+    }
+    bool ok = (uint64_t)got == size;
+    if (ok && size) {
+        if (windows_prepare_guest_write(dst, size)) memcpy((void*)(uintptr_t)dst, slot, (size_t)size);
+        else ok = false;
+    }
+    ::free(slot);
+    if (filelog()) fprintf(stderr, "[apr] read-direct(win) id=%llu %s -> dst=0x%llx off=0x%llx size=%llu %s\n",
+                           (unsigned long long)id, host.c_str(), (unsigned long long)dst,
+                           (unsigned long long)offset, (unsigned long long)size, ok ? "OK" : "FAIL");
+    return ok ? 0 : 0x80020016ull;
+}
 #endif
 
 void register_file_hle() {
@@ -2160,6 +2199,11 @@ void register_file_hle() {
     Hle::register_fn("vWU-odnS+fU", (HleFn)f_apr_read_direct, "AprReadFileDirect?");
 #else
     Hle::register_fn("mQ16-QdKv7k", (HleFn)f_apr_read_submit, "sceAmprAprCommandBufferReadFile");
+    // The direct (whole-range) APR read — completion-less, consumed synchronously by the guest
+    // (issue #115). Now registered on Windows too (#984): without it, vWU-odnS+fU fell through to the
+    // unimplemented stub and the shader-cache direct read never happened, wedging the boot at the
+    // CreateGlobalShaderMap precache.
+    Hle::register_fn("vWU-odnS+fU", (HleFn)f_apr_read_direct, "AprReadFileDirect?");
 #endif
     #undef R
 }
