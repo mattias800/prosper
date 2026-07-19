@@ -38,12 +38,15 @@ int main() {
     HleFn rename = Hle::lookup(nid_hash("scePthreadRename"));
     HleFn set_name = Hle::lookup(nid_hash("scePthreadSetName"));
     HleFn posix_get = Hle::lookup(nid_hash("pthread_getname_np"));
-    HleFn posix_set = Hle::lookup(nid_hash("pthread_setname_np"));
+    HleFn posix_rename = Hle::lookup(nid_hash("pthread_rename_np"));
+    HleFn posix_set_name = Hle::lookup(nid_hash("pthread_set_name_np"));
     HleFn create = Hle::lookup(nid_hash("scePthreadCreate"));
     HleFn join = Hle::lookup(nid_hash("scePthreadJoin"));
-    CHECK(self && getname && rename && set_name && posix_get && posix_set && create && join,
+    CHECK(self && getname && rename && set_name && posix_get && posix_rename && posix_set_name &&
+              create && join,
           "Sony and POSIX thread-name functions are registered");
-    if (!self || !getname || !rename || !set_name || !posix_get || !posix_set || !create || !join)
+    if (!self || !getname || !rename || !set_name || !posix_get || !posix_rename ||
+        !posix_set_name || !create || !join)
         return 1;
 
     const uint64_t thread = self(0, 0, 0, 0, 0, 0);
@@ -71,18 +74,18 @@ int main() {
 
     std::array<unsigned char, 40> posix_out{};
     posix_out.fill(0x6c);
-    CHECK(posix_get(thread, (uint64_t)(uintptr_t)posix_out.data(), 8, 0, 0, 0) == 34,
-          "pthread_getname_np reports ERANGE for a short buffer");
-    CHECK(posix_out[0] == 0x6c, "short POSIX buffer is not partially overwritten");
-    CHECK(posix_get(thread, (uint64_t)(uintptr_t)posix_out.data(), 32, 0, 0, 0) == 0,
-          "pthread_getname_np accepts the complete guest name");
+    CHECK(posix_get(thread, (uint64_t)(uintptr_t)posix_out.data(), 0, 0, 0, 0) == 0,
+          "pthread_getname_np uses the fixed-width two-argument guest ABI");
     CHECK(strcmp((const char*)posix_out.data(), (const char*)sony_out.data()) == 0,
           "Sony and POSIX getters share one guest-visible name");
+    CHECK(posix_out[31] == 0 && posix_out[32] == 0x6c,
+          "POSIX getter writes exactly the 32-byte guest name field");
 
     static const char renamed_again[] = "io-worker";
-    CHECK(posix_set(thread, (uint64_t)(uintptr_t)renamed_again, 0, 0, 0, 0) == 0 &&
+    CHECK(posix_rename(thread, (uint64_t)(uintptr_t)renamed_again, 0, 0, 0, 0) == 0 &&
+          posix_set_name(thread, (uint64_t)(uintptr_t)renamed_again, 0, 0, 0, 0) == 0 &&
           set_name(thread, (uint64_t)(uintptr_t)renamed_again, 0, 0, 0, 0) == 0,
-          "POSIX setname and scePthreadSetName share the rename contract");
+          "POSIX rename/set-name and scePthreadSetName share the rename contract");
     sony_out.fill(0xa5);
     getname(thread, (uint64_t)(uintptr_t)sony_out.data(), 0, 0, 0, 0);
     CHECK(strcmp((const char*)sony_out.data(), renamed_again) == 0,

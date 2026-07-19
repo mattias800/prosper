@@ -830,17 +830,6 @@ HLE(k_pthread_getname) {
     return 0;
 }
 
-HLE(k_pthread_getname_np) {
-    if (!a0) return 3;
-    if (!a1) return 14;
-    std::array<char, kGuestThreadNameSize> name{};
-    if (!get_guest_thread_name(a0, name)) return 3;
-    const size_t needed = strlen(name.data()) + 1;
-    if (a2 < needed) return 34;
-    memcpy((void*)(uintptr_t)a1, name.data(), needed);
-    return 0;
-}
-
 HLE(k_pthread_rename) {
     if (!a0) return 22;  // EINVAL
     if (!a1) return 0;   // Sony accepts a null name as a no-op
@@ -2912,6 +2901,9 @@ void register_kernel_hle() {
     R("scePthreadGetname", k_pthread_getname);
     R("scePthreadRename", k_pthread_rename);
     R("scePthreadSetName", k_pthread_rename);
+    R("pthread_getname_np", k_pthread_getname);
+    R("pthread_rename_np", k_pthread_rename);
+    R("pthread_set_name_np", k_pthread_rename);
     R("scePthreadGetstack", k_attr_getstackaddr);
     // TLS keys (POSIX + Sony names -> host pthread keys)
     R("pthread_key_create", k_key_create);   R("scePthreadKeyCreate", k_key_create);
@@ -2947,8 +2939,7 @@ void register_kernel_hle() {
     R("pthread_attr_setinheritsched", k_attr_noop);
     R("pthread_attr_setschedpolicy", k_attr_noop);  R("pthread_attr_setschedparam", k_attr_noop);
     R("pthread_attr_getstacksize", k_attr_getstacksize);
-    R("scePthreadAttrSetaffinity", k_attr_noop);
-    R("pthread_getname_np", k_pthread_getname_np); R("pthread_setname_np", k_pthread_rename);
+    R("scePthreadAttrSetaffinity", k_attr_noop); R("pthread_setname_np", k_attr_noop);
     // Plain libScePosix sem_* imports use the same guest object representation as scePthreadSem*.
     // Registering only the Sony-prefixed spellings left successful no-op imports in native engines.
     R("sem_init", k_sem_init);       R("sem_destroy", k_sem_destroy);
