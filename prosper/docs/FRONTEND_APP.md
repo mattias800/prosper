@@ -299,6 +299,7 @@ Intermediate live color targets remain on the GPU by default. A later graphics p
 same guest target identity, extent, and format binds the retained image directly. Intermediate scanout
 spans also defer readback until the final renderer callback; a final scanout pass reads the accumulated
 target normally, while a submit that ends elsewhere materializes its cached scanout once before publishing.
+Deferred scanouts are pinned against bounded target-cache eviction until that final callback.
 Ordered DMA producers, captures, pixel diagnostics, same-target feedback, and other authoritative-readback
 spans keep the CPU path. Guest GPU writes invalidate overlapping retained targets through the ordered write
 observer. Set `PROSPER_NO_INTERMEDIATE_SCANOUT_DEFER=1` to restore per-span scanout readback for an A/B. Set

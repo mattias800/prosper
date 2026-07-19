@@ -202,8 +202,9 @@ and a DMA producer is explicitly marked authoritative by the ordered executor.
 
 Intermediate non-authoritative scanout spans now remain GPU-resident. The final callback either uses the
 normal readback from a later scanout pass or materializes the cached target once if the submit ended on a
-different target. `PROSPER_NO_INTERMEDIATE_SCANOUT_DEFER=1` restores per-span scanout readback for a same-
-binary comparison.
+different target. Deferred scanouts are pinned against the backend's bounded LRU eviction until final
+materialization, while guest writes may still invalidate their pixels.
+`PROSPER_NO_INTERMEDIATE_SCANOUT_DEFER=1` restores per-span scanout readback for a same-binary comparison.
 
 Native Windows / RTX 4090, one RelWithDebInfo binary, separate fresh saves, native scale/cadence, and the
 documented Evergate route produced 104 dense submits in each run:

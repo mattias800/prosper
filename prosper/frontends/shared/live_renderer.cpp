@@ -417,6 +417,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             using RC = prosper::gpu::ResourceClass;
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
             const prosper::gpu::LiveRenderPhase phase = prosper::gpu::live_render_phase();
+            struct PinnedScanout {
+                uint64_t id = 0;
+                uint32_t width = 0, height = 0;
+                VkFormat format = VK_FORMAT_UNDEFINED;
+            };
+            static thread_local std::vector<PinnedScanout> pinned_scanouts;
+            auto release_pinned_scanouts = [&] {
+                for (const PinnedScanout& target : pinned_scanouts)
+                    prosper::test::unpin_persistent_color_target(
+                        target.id, target.width, target.height, target.format);
+                pinned_scanouts.clear();
+            };
+            // A terminal callback normally releases every pin. Recover conservatively if an earlier
+            // submit was aborted after rendering but before frontend finalization.
+            if (phase.first_span && !pinned_scanouts.empty()) release_pinned_scanouts();
             // PROSPER_RENDER_FIRST=<N>: skip the slow (~400x) Vulkan render for the first N GPU submits, so
             // the game reaches a LATE scene (e.g. the level1 cutscene, which only starts submitting after
             // ~5000 title-loop submits) at native speed before we begin rendering/dumping. Returning {}
@@ -2205,6 +2220,31 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             base, gw, gh, pass_format) != nullptr;
                         if (!pass_pixels->empty()) surface.rgba = pass_pixels;
                         else if (surface.gpu_valid) surface.rgba.reset();
+                        if (defer_readback && is_vo && surface.gpu_valid) {
+                            const auto already_pinned = std::find_if(
+                                pinned_scanouts.begin(), pinned_scanouts.end(),
+                                [&](const PinnedScanout& target) {
+                                    return target.id == base && target.width == gw &&
+                                           target.height == gh && target.format == pass_format;
+                                });
+                            if (already_pinned == pinned_scanouts.end()) {
+                                if (prosper::test::pin_persistent_color_target(
+                                        base, gw, gh, pass_format)) {
+                                    pinned_scanouts.push_back({base, gw, gh, pass_format});
+                                } else {
+                                    // Pinning is expected to succeed for the target just written. If
+                                    // cache state is inconsistent, preserve correctness by immediately
+                                    // restoring the authoritative CPU fallback.
+                                    std::vector<uint8_t> materialized;
+                                    std::string error;
+                                    if (prosper::test::readback_persistent_color_target(
+                                            base, gw, gh, pass_format, materialized, error))
+                                        surface.rgba =
+                                            std::make_shared<const std::vector<uint8_t>>(
+                                                std::move(materialized));
+                                }
+                            }
+                        }
                     } else if (base && !pass_pixels->empty()) {
                         RttSurf& surface = g_rtt[base];
                         surface.rgba = pass_pixels;
@@ -2516,6 +2556,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 }
                 if (scanout) selected_pixels = scanout->rgba;
             }
+            if (phase.final_span) release_pinned_scanouts();
             if (phase.final_span && lightweight_rtt_timing && rtt_log_in_range &&
                 pending_timing.backend_draws >= rtt_timing_min_draws) {
                 std::string output;
