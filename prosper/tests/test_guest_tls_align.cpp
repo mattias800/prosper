@@ -3,6 +3,7 @@
 // block at the wrong distance below the thread pointer and every initial-exec %fs:-N access resolves
 // off. Drives guest_tls_set_templates and reads back the per-module offsets. Linux-only.
 #include "../src/hle/dispatch.hpp"
+#include "../src/loader/tls_layout.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -31,6 +32,7 @@ int main() {
         { 0, 0, /*memsz*/0x10, /*align*/16 },
     };
     guest_tls_set_templates(descs.data(), descs.size());
+    const StaticTlsLayout layout = make_static_tls_layout(descs.data(), descs.size());
 #if defined(__linux__)
     CHECK(guest_tls_enabled(), "guest initial-exec TLS is enabled by default on Linux");
 #endif
@@ -40,10 +42,15 @@ int main() {
     uint64_t exp2 = align_up(exp1 + 0x10, 16);       // = 0x50
     CHECK(guest_tls_module_below(1) == exp1, "module 1 offset rounds to its real p_align 64 (0x40, was 0x30)");
     CHECK(guest_tls_module_below(2) == exp2, "module 2 offset accumulates from module 1 (0x50)");
+    CHECK(layout.module_below[1] == guest_tls_module_below(1) &&
+          layout.module_below[2] == guest_tls_module_below(2),
+          "shared linker layout exactly matches the runtime allocator offsets");
     CHECK(guest_tls_module_below(1) != 0x30, "the old 16-byte rounding (0x30) is NOT used for p_align 64");
     // TP must be aligned to the max module align (64 here), so the total is >= exp2 rounded to 64.
     CHECK(guest_tls_total_below() >= exp2 && (guest_tls_total_below() % 64) == 0,
           "total below TP is a multiple of the max module align (64)");
+    CHECK(layout.total_below == guest_tls_total_below(),
+          "shared linker layout exactly matches the allocator's total size");
 
     // Regression: the common p_align <= 16 case is byte-identical to the old per-size rounding
     // (round_up of a 16-multiple running total by 16 == summing round_up(memsz,16)).

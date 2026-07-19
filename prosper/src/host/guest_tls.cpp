@@ -13,6 +13,7 @@
 // (exec_image_linux.cpp), which read the stashed host %fs from [guestTP + GUEST_TCB_HOSTFS_OFF].
 #if defined(__linux__) || defined(__APPLE__)
 #include "../hle/dispatch.hpp"
+#include "../loader/tls_layout.hpp"
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -28,7 +29,6 @@ namespace {
     bool     g_enabled = false;
     bool     g_configured = false;
 
-    inline uint64_t align_up(uint64_t v, uint64_t a) { return a ? (v + a - 1) & ~(a - 1) : v; }
     inline uint64_t rd_fsbase() { uint64_t v; __asm__ volatile("rdfsbase %0" : "=r"(v)); return v; }
     inline void     wr_fsbase(uint64_t v) { __asm__ volatile("wrfsbase %0" : : "r"(v)); }
 }
@@ -67,17 +67,9 @@ void guest_tls_set_templates(const TlsModuleDesc* descs, size_t count) {
     // block at the wrong offset -> every %fs:-N read resolved off (#143). For the common p_align<=16
     // case the per-module offsets are identical to before (round_up up a 16-multiple running total by
     // 16 == the old per-size rounding), so nothing changes there.
-    g_below.assign(g_mods.size(), 0);
-    uint64_t off = 0, max_align = 16;
-    for (size_t i = 1; i < g_mods.size(); i++) {
-        uint64_t a = g_mods[i].align ? g_mods[i].align : 16;
-        if (a > max_align) max_align = a;
-        off = align_up(off + g_mods[i].memsz, a);
-        g_below[i] = off;
-    }
-    // Round the total (hence the TP position within the page-aligned block) up to the max module
-    // align, with a 64-byte floor preserved from the original (TCB/cache-line headroom).
-    g_total_below = align_up(off, max_align < 64 ? 64 : max_align);
+    const StaticTlsLayout layout = make_static_tls_layout(g_mods.data(), g_mods.size());
+    g_below = layout.module_below;
+    g_total_below = layout.total_below;
     g_configured = true;
     if (getenv("PROSPER_TLSLOG"))
         fprintf(stderr, "[tls] guest-fs %s; static TLS below TP = 0x%llx bytes\n",
@@ -219,6 +211,7 @@ uint64_t guest_tls_total_below() { return g_total_below; }
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include "../hle/dispatch.hpp"
+#include "../loader/tls_layout.hpp"
 #include <windows.h>
 #include <cstdint>
 #include <cstddef>
@@ -235,7 +228,6 @@ namespace {
     bool g_enabled = false, g_configured = false;
     thread_local uint64_t t_guest_tp = 0;
 
-    inline uint64_t align_up(uint64_t v, uint64_t a) { return a ? (v + a - 1) & ~(a - 1) : v; }
     inline uint64_t rd_fsbase() { uint64_t v; __asm__ volatile("rdfsbase %0" : "=r"(v)); return v; }
     inline void     wr_fsbase(uint64_t v) { __asm__ volatile("wrfsbase %0" : : "r"(v)); }
 }
@@ -250,15 +242,9 @@ void guest_tls_set_templates(const TlsModuleDesc* descs, size_t count) {
     // x86-64 Variant II static-TLS layout (same math as the Linux path): each module's block sits
     // BELOW the thread pointer at a distance rounded to its PT_TLS p_align, so a symbol at byte X
     // reads at %fs:(X - off[i]) — exactly the tpoff the guest static linker baked in.
-    g_below.assign(g_mods.size(), 0);
-    uint64_t off = 0, max_align = 16;
-    for (size_t i = 1; i < g_mods.size(); i++) {
-        uint64_t a = g_mods[i].align ? g_mods[i].align : 16;
-        if (a > max_align) max_align = a;
-        off = align_up(off + g_mods[i].memsz, a);
-        g_below[i] = off;
-    }
-    g_total_below = align_up(off, max_align < 64 ? 64 : max_align);
+    const StaticTlsLayout layout = make_static_tls_layout(g_mods.data(), g_mods.size());
+    g_below = layout.module_below;
+    g_total_below = layout.total_below;
     g_configured = true;
     if (getenv("PROSPER_TLSLOG"))
         fprintf(stderr, "[tls] guest-fs %s (win/fsgsbase); static TLS below TP = 0x%llx bytes\n",

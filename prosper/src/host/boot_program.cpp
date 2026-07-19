@@ -120,9 +120,11 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
 
     set_app0_root(d);
     for (auto& img : p.imgs) if (!map_image(img, &e)) return fail("map failed: " + e);
-    { std::vector<TlsModuleDesc> td; for (auto& t : p.tls_templates) td.push_back({t.init_va, t.filesz, t.memsz, t.align});
-      set_tls_modules(td.data(), td.size());              // __tls_get_addr for loaded modules (real libc.prx)
-      guest_tls_set_templates(td.data(), td.size()); }    // guest initial-exec %fs TLS (Linux/Windows default on)
+    {
+        // General-dynamic and initial-exec TLS consume the same descriptors and module-id order.
+        set_tls_modules(p.tls_templates.data(), p.tls_templates.size());
+        guest_tls_set_templates(p.tls_templates.data(), p.tls_templates.size());
+    }
 
     // C++ exception unwinding: give each module's .eh_frame_hdr + text segment to the unwinder.
     { static std::vector<std::string> names; names.reserve(p.imgs.size());

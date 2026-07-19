@@ -140,10 +140,11 @@ void bind_imports_to_stubs(const Module& m, LoadedImage& img,
 // Apply all relocations into img.mem. Symbol relocs use img.import_addr for imports
 // and the module's own symbol values for internal defs. Returns #applied.
 // `tls_symbols_by_nid` (optional) maps an exported TLS symbol's NID to its defining module id and
-// in-block offset. Cross-module DTPMOD64/DTPOFF64 relocations must use both halves of the same record
-// so __tls_get_addr selects the right module and object (#136/#338). Null -> module-local resolution
-// only (correct for the common case; a cross-module TLS import is then logged unhandled).
+// in-block offset. Cross-module TLS relocations must use both halves of the same record. TPOFF64 also
+// requires `tls_module_below`, the shared Variant-II distance below TP indexed by module id. Missing
+// information is logged and left unapplied rather than baking a silently incorrect static offset.
 size_t apply_relocations(const Module& m, LoadedImage& img,
-                         const TlsSymbolMap* tls_symbols_by_nid = nullptr);
+                         const TlsSymbolMap* tls_symbols_by_nid = nullptr,
+                         const std::vector<uint64_t>* tls_module_below = nullptr);
 
 } // namespace prosper
