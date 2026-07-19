@@ -332,6 +332,13 @@ fixed-function value; equality still compares the complete key after hashing. Th
 the backend and submit-aligned windows report references, hits, misses, bypasses, current entries, and
 evictions. A pipeline hit also skips temporary Vulkan shader-module creation.
 
+Pipeline layouts use a separate exact cross-call cache keyed by every descriptor set's ordered binding,
+type, count, and stage contract. Descriptor pools, descriptor sets, and descriptor-set layouts remain
+call-local; Vulkan pipeline-layout compatibility follows the complete descriptor contract rather than the
+temporary layout handle. The cache retains at most 256 layouts and evicts the least-recently-used entry not
+referenced by the current backend call. Set `PROSPER_PIPELINE_LAYOUT_CACHE_ENTRIES=<N>` to change the bound
+or `PROSPER_NO_BACKEND_PIPELINE_LAYOUT_CACHE=1` for a call-local A/B.
+
 Do not cache `build_stage_table` results using only shader addresses and user-SGPR values. Descriptor
 tables are reached through guest pointers, and their memory can change while every pointer/register
 value remains identical. That experiment caused Messenger to remain on its initial loading screen and

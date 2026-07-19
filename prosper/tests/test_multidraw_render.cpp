@@ -33,6 +33,7 @@ static void set_env(const char* name, const char* value) {
 int main() {
     printf("== test_multidraw_render ==\n");
     set_env("PROSPER_RENDER_TIMING", "1");
+    set_env("PROSPER_PIPELINE_LAYOUT_CACHE_ENTRIES", "2");
     const uint32_t W = 64, H = 64;
 
     // Known-good fullscreen-triangle vertex shader (SPIR-V), shared by both draws.
@@ -201,18 +202,32 @@ int main() {
         const std::vector<uint8_t> pooled_again = prosper::test::render_draws_rgba(
             {capacity_peer0, capacity_peer1}, W, H);
         const auto pool_after_second = prosper::test::render_host_buffer_pool_stats();
+        const auto layout_stats = prosper::test::backend_resource_reuse_stats();
         CHECK(pool_after_second.hits == pool_after_first.hits + 1 &&
                   pool_after_second.misses == pool_after_first.misses &&
                   pooled_again == shared,
               "next logical size reuses the mapped arena byte-identically");
+        CHECK(layout_stats.persistent_pipeline_layout_hits >= 1 &&
+                  layout_stats.persistent_pipeline_layout_entries >= 1,
+              "equal pipeline-layout contracts reuse the bounded cross-call cache");
 
+        set_env("PROSPER_NO_BACKEND_PIPELINE_LAYOUT_CACHE", "1");
+        const std::vector<uint8_t> uncached_layouts =
+            prosper::test::render_draws_rgba({d0, d1}, W, H);
+        const auto uncached_layout_stats = prosper::test::backend_resource_reuse_stats();
+        set_env("PROSPER_NO_BACKEND_PIPELINE_LAYOUT_CACHE", nullptr);
+        CHECK(uncached_layout_stats.persistent_pipeline_layout_hits == 0 &&
+                  uncached_layouts == shared,
+              "layout-cache disable switch restores byte-identical call-local layouts");
+
+        const auto pool_before_bypass = prosper::test::render_host_buffer_pool_stats();
         set_env("PROSPER_NO_BACKEND_BUFFER_POOL", "1");
         const std::vector<uint8_t> pool_bypassed =
             prosper::test::render_draws_rgba({d0, d1}, W, H);
         const auto pool_after_bypass = prosper::test::render_host_buffer_pool_stats();
         set_env("PROSPER_NO_BACKEND_BUFFER_POOL", nullptr);
-        CHECK(pool_after_bypass.hits == pool_after_second.hits &&
-                  pool_after_bypass.misses == pool_after_second.misses,
+        CHECK(pool_after_bypass.hits == pool_before_bypass.hits &&
+                  pool_after_bypass.misses == pool_before_bypass.misses,
               "buffer-pool disable switch restores transient Vulkan uploads");
         CHECK(pool_bypassed == shared,
               "pooled and forced-transient storage buffers render byte-identically");
@@ -237,6 +252,35 @@ int main() {
               "resource-share disable switch restores distinct per-draw immutable objects");
         CHECK(!shared.empty() && shared == unshared,
               "shared and unshared per-draw resources render byte-identically");
+
+        const std::vector<uint8_t> original_layout_output =
+            prosper::test::render_draws_rgba({d0}, W, H);
+        prosper::test::BackendDraw alternate_layout = d0;
+        alternate_layout.R[0].binding = 1;
+        const std::vector<uint8_t> alternate_output =
+            prosper::test::render_draws_rgba({alternate_layout}, W, H);
+        const auto bounded_layout_stats = prosper::test::backend_resource_reuse_stats();
+        CHECK(alternate_output == original_layout_output &&
+                  bounded_layout_stats.persistent_pipeline_layout_entries == 2 &&
+                  bounded_layout_stats.persistent_pipeline_layout_evictions >= 1,
+              "pipeline-layout cache evicts an older contract at its configured bound");
+
+        // Warm both bounded entries, then require three distinct contracts in one call. The third
+        // layout must remain call-local: evicting either of the first two would destroy an object
+        // already referenced by a pipeline recorded for this submission.
+        prosper::test::render_draws_rgba({d0}, W, H);
+        prosper::test::render_draws_rgba({alternate_layout}, W, H);
+        prosper::test::BackendDraw overflow_layout = d0;
+        overflow_layout.R[0].binding = 0;
+        const std::vector<uint8_t> protected_output = prosper::test::render_draws_rgba(
+            {d0, alternate_layout, overflow_layout}, W, H);
+        const auto protected_layout_stats = prosper::test::backend_resource_reuse_stats();
+        CHECK(protected_output == original_layout_output &&
+                  protected_layout_stats.persistent_pipeline_layout_hits >= 2 &&
+                  protected_layout_stats.persistent_pipeline_layout_misses >= 1 &&
+                  protected_layout_stats.persistent_pipeline_layout_entries == 2 &&
+                  protected_layout_stats.persistent_pipeline_layout_evictions == 0,
+              "pipeline-layout eviction preserves every contract used by the current call");
     }
 
     // #531: a guest scissor must constrain a color-disabled stencil writer. The following full-target
