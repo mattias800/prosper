@@ -31,6 +31,7 @@
 #include <cstring>
 #include <atomic>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 namespace prosper {
@@ -44,10 +45,16 @@ namespace {
     bool memlog() { static int v = getenv("PROSPER_MEMLOG") ? 1 : 0; return v; }
     #define MLOG(...) do { if (memlog()) fprintf(stderr, "[memhle] " __VA_ARGS__); } while (0)
 
+    constexpr uint32_t kVirtualQueryFlexible = 0x01;
+    constexpr uint32_t kVirtualQueryDirect   = 0x02;
+    constexpr uint32_t kVirtualQueryCommitted = 0x10;
+
     struct Mapping {
-        uint64_t base, size;
+        uint64_t base, size, offset;
         int prot;                  // normalized host CPU-access mask
         uint32_t guest_prot;       // exact SCE protection enum/bits returned to the guest
+        int32_t memory_type;        // direct-memory type; meaningful only with is_direct
+        uint32_t query_flags;       // is_flexible / is_direct bits (commit state is separate)
         bool committed;
         char name[32];
     };
@@ -66,6 +73,12 @@ namespace {
     struct DMem { uint64_t start, end; int type; };
     std::mutex g_dmx;
     std::vector<DMem> g_dmem;
+
+    void rebase_mapping(Mapping& mapping, uint64_t new_base) {
+        if ((mapping.query_flags & kVirtualQueryDirect) && new_base > mapping.base)
+            mapping.offset += new_base - mapping.base;
+        mapping.base = new_base;
+    }
 
     // Claim `sz` bytes of direct memory at `align`, first-fit over the pool's free gaps WITHIN the
     // caller's [lo, hi) search window (default = the whole pool). False (no state change) when
@@ -138,10 +151,44 @@ namespace {
         g_dmem.swap(out);
     }
 
+    bool dmem_type_at(uint64_t offset, int32_t& type_out) {
+        std::lock_guard<std::mutex> lk(g_dmx);
+        for (const auto& d : g_dmem) {
+            if (offset >= d.start && offset < d.end) {
+                type_out = d.type;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Change the memory type of an allocated physical subrange. Carving the allocation keeps
+    // GetDirectMemoryType/DirectMemoryQuery truthful after Mtypeprotect or MapDirectMemory2.
+    void dmem_retype(uint64_t start, uint64_t len, int32_t type) {
+        if (!len || start > UINT64_MAX - len) return;
+        const uint64_t end = start + len;
+        std::lock_guard<std::mutex> lk(g_dmx);
+        std::vector<DMem> out;
+        out.reserve(g_dmem.size() + 2);
+        for (const auto& d : g_dmem) {
+            if (d.end <= start || d.start >= end) {
+                out.push_back(d);
+                continue;
+            }
+            if (d.start < start) out.push_back({d.start, start, d.type});
+            const uint64_t changed_start = d.start < start ? start : d.start;
+            const uint64_t changed_end = d.end > end ? end : d.end;
+            out.push_back({changed_start, changed_end, type});
+            if (d.end > end) out.push_back({end, d.end, d.type});
+        }
+        g_dmem.swap(out);
+    }
+
     // A successful host map replaces any reservation record under it. Keeping both as overlays
     // lets the older uncommitted record win same-base queries after the real commit.
     void track(uint64_t base, uint64_t size, int prot, uint32_t guest_prot,
-               bool committed, const char* nm) {
+               bool committed, const char* nm, uint32_t query_flags = 0,
+               uint64_t offset = 0, int32_t memory_type = 0) {
         if (!size || base > UINT64_MAX - size) return;
         const uint64_t end = base + size;
         {
@@ -155,10 +202,21 @@ namespace {
                     Mapping lo = old; lo.size = base - old.base; out.push_back(lo);
                 }
                 if (old_end > end) {
-                    Mapping hi = old; hi.base = end; hi.size = old_end - end; out.push_back(hi);
+                    Mapping hi = old;
+                    rebase_mapping(hi, end);
+                    hi.size = old_end - end;
+                    out.push_back(hi);
                 }
             }
-            Mapping m{ base, size, prot, guest_prot, committed, {0} };
+            Mapping m{};
+            m.base = base;
+            m.size = size;
+            m.offset = offset;
+            m.prot = prot;
+            m.guest_prot = guest_prot;
+            m.memory_type = memory_type;
+            m.query_flags = query_flags;
+            m.committed = committed;
             if (nm) { strncpy(m.name, nm, sizeof m.name - 1); }
             out.push_back(m);
             g_maps.swap(out);
@@ -181,7 +239,12 @@ namespace {
             uint64_t me = m.base + m.size;
             if (me <= base || m.base >= end) { out.push_back(m); continue; }
             if (m.base < base) { Mapping lo = m; lo.size = base - m.base; out.push_back(lo); }
-            if (me > end)      { Mapping hi = m; hi.base = end; hi.size = me - end; out.push_back(hi); }
+            if (me > end) {
+                Mapping hi = m;
+                rebase_mapping(hi, end);
+                hi.size = me - end;
+                out.push_back(hi);
+            }
         }
         g_maps.swap(out);
         host::notify_guest_mapping_removed(base, len);
@@ -205,7 +268,7 @@ namespace {
                     Mapping lo = m; lo.size = base - m.base; out.push_back(lo);
                 }
                 Mapping changed = m;
-                changed.base = m.base < base ? base : m.base;
+                rebase_mapping(changed, m.base < base ? base : m.base);
                 const uint64_t changed_end = me > end ? end : me;
                 changed.size = changed_end - changed.base;
                 changed.prot = prot;
@@ -215,13 +278,21 @@ namespace {
                 out.push_back(changed);
                 retagged.push_back(changed);
                 if (me > end) {
-                    Mapping hi = m; hi.base = end; hi.size = me - end; out.push_back(hi);
+                    Mapping hi = m;
+                    rebase_mapping(hi, end);
+                    hi.size = me - end;
+                    out.push_back(hi);
                 }
             }
             // Preserve the prior treatment of a successful protection change over an otherwise
             // untracked host mapping: begin tracking it as committed.
             if (retagged.empty()) {
-                Mapping changed{base, len, prot, guest_prot, true, {0}};
+                Mapping changed{};
+                changed.base = base;
+                changed.size = len;
+                changed.prot = prot;
+                changed.guest_prot = guest_prot;
+                changed.committed = true;
                 if (nm) strncpy(changed.name, nm, sizeof changed.name - 1);
                 out.push_back(changed);
                 retagged.push_back(changed);
@@ -231,6 +302,48 @@ namespace {
         host::notify_guest_mapping_removed(base, len);
         for (const auto& m : retagged)
             host::notify_guest_mapping_added(m.base, m.size, m.committed && (prot & 0x1));
+    }
+
+    // Re-tag direct mappings with a new memory type while preserving virtual-to-physical offset
+    // correspondence across every carved prefix/suffix. Flexible/reserved mappings have no type.
+    void retrack_type(uint64_t base, uint64_t len, int32_t memory_type) {
+        if (!len || base > UINT64_MAX - len) return;
+        const uint64_t end = base + len;
+        std::vector<std::pair<uint64_t, uint64_t>> physical_ranges;
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            std::vector<Mapping> out;
+            out.reserve(g_maps.size() + 2);
+            for (const auto& mapping : g_maps) {
+                const uint64_t mapping_end = mapping.base + mapping.size;
+                if (mapping_end <= base || mapping.base >= end ||
+                    !(mapping.query_flags & kVirtualQueryDirect)) {
+                    out.push_back(mapping);
+                    continue;
+                }
+                if (mapping.base < base) {
+                    Mapping prefix = mapping;
+                    prefix.size = base - mapping.base;
+                    out.push_back(prefix);
+                }
+                Mapping changed = mapping;
+                rebase_mapping(changed, mapping.base < base ? base : mapping.base);
+                const uint64_t changed_end = mapping_end > end ? end : mapping_end;
+                changed.size = changed_end - changed.base;
+                changed.memory_type = memory_type;
+                physical_ranges.emplace_back(changed.offset, changed.size);
+                out.push_back(changed);
+                if (mapping_end > end) {
+                    Mapping suffix = mapping;
+                    rebase_mapping(suffix, end);
+                    suffix.size = mapping_end - end;
+                    out.push_back(suffix);
+                }
+            }
+            g_maps.swap(out);
+        }
+        for (const auto& range : physical_ranges)
+            dmem_retype(range.first, range.second, memory_type);
     }
     bool snapshot_mapping(uint64_t addr, Mapping& out) {
         std::lock_guard<std::mutex> lk(g_mx);
@@ -542,7 +655,7 @@ HLE(k_map_flexible) {
     if (!p) { MLOG("mapflexible hint=0x%llx len=0x%llx FAILED\n", (unsigned long long)hint, (unsigned long long)a1); return 0x8002000cull; } // ENOMEM
     if (a0) *(uint64_t*)a0 = (uint64_t)p;
     track((uint64_t)p, a1, host_prot(a2), static_cast<uint32_t>(a2), true,
-          a4 ? (const char*)a4 : "flexible");
+          a4 ? (const char*)a4 : "flexible", kVirtualQueryFlexible);
     MLOG("mapflexible -> 0x%llx len=0x%llx prot=0x%llx name=%s\n",
          (unsigned long long)p, (unsigned long long)a1, (unsigned long long)a2, a4 ? (const char*)a4 : "");
     return 0;
@@ -623,21 +736,31 @@ HLE(k_direct_memory_query) {
     return 0;
 }
 
+static uint64_t map_dmem_impl(uint64_t addr_in_out, uint64_t len, uint64_t prot,
+                              uint64_t flags, uint64_t phys, uint64_t align,
+                              int32_t memory_type, bool set_memory_type) {
+    uint64_t hint = addr_in_out ? *(uint64_t*)addr_in_out : 0;
+    const bool fixed = (flags & 0x10) != 0;
+    void* p = map_phys_at(hint, len, host_prot(prot), phys, align, fixed);
+    if (!p) { MLOG("map_dmem hint=0x%llx len=0x%llx flags=0x%llx phys=0x%llx align=0x%llx FAILED\n",
+                   (unsigned long long)hint, (unsigned long long)len,
+                   (unsigned long long)flags, (unsigned long long)phys,
+                   (unsigned long long)align); return 0x8002000cull; } // ENOMEM
+    if (set_memory_type) dmem_retype(phys, len, memory_type);
+    if (addr_in_out) *(uint64_t*)addr_in_out = (uint64_t)p;
+    track((uint64_t)p, len, host_prot(prot), static_cast<uint32_t>(prot), true,
+          "direct", kVirtualQueryDirect, phys, memory_type);
+    MLOG("map_dmem -> 0x%llx len=0x%llx phys=0x%llx prot=0x%llx flags=0x%llx align=0x%llx\n",
+         (unsigned long long)p, (unsigned long long)len, (unsigned long long)phys,
+         (unsigned long long)prot, (unsigned long long)flags, (unsigned long long)align);
+    return 0;
+}
+
 // sceKernelMapDirectMemory(void** addrInOut, size_t len, int prot, int flags, off_t phys, size_t align)
 HLE(k_map_dmem) {
-    uint64_t hint = a0 ? *(uint64_t*)a0 : 0;
-    const bool fixed = (a3 & 0x10) != 0;
-    void* p = map_phys_at(hint, a1, host_prot(a2), a4, a5, fixed);
-    if (!p) { MLOG("map_dmem hint=0x%llx len=0x%llx flags=0x%llx phys=0x%llx align=0x%llx FAILED\n",
-                   (unsigned long long)hint, (unsigned long long)a1,
-                   (unsigned long long)a3, (unsigned long long)a4,
-                   (unsigned long long)a5); return 0x8002000cull; } // ENOMEM
-    if (a0) *(uint64_t*)a0 = (uint64_t)p;
-    track((uint64_t)p, a1, host_prot(a2), static_cast<uint32_t>(a2), true, "direct");
-    MLOG("map_dmem -> 0x%llx len=0x%llx phys=0x%llx prot=0x%llx flags=0x%llx align=0x%llx\n",
-         (unsigned long long)p, (unsigned long long)a1, (unsigned long long)a4,
-         (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)a5);
-    return 0;
+    int32_t memory_type = 0;
+    dmem_type_at(a4, memory_type);
+    return map_dmem_impl(a0, a1, a2, a3, a4, a5, memory_type, false);
 }
 
 // sceKernelVirtualQuery(const void* addr, int flags, SceKernelVirtualQueryInfo* info, size_t infoSize)
@@ -649,7 +772,7 @@ HLE(k_virtual_query) {
     memset(info, 0, sz);
     Mapping mapping{};
     const bool found = snapshot_mapping(a0, mapping);
-    uint64_t start, end; int prot; uint32_t flags;
+    uint64_t start, end, offset = 0; int prot, memory_type = 0; uint32_t flags;
     const char* how;
     if (found) {                               // inside a real mapping
         // Report the mapping's REAL commit state: a reserved-but-uncommitted range has NO access
@@ -659,7 +782,10 @@ HLE(k_virtual_query) {
         // Keep Sony's exact protection value: CPU_RW is enum 0x02 (not host R|W 0x03), and
         // GPU-only bits have no host-page-protection equivalent but remain guest-visible state.
         prot = mapping.committed ? static_cast<int>(mapping.guest_prot) : 0x0;
-        flags = mapping.committed ? 0x10 : 0x0; how = "tracked";
+        offset = (mapping.query_flags & kVirtualQueryDirect) ? mapping.offset : 0;
+        memory_type = (mapping.query_flags & kVirtualQueryDirect) ? mapping.memory_type : 0;
+        flags = mapping.query_flags |
+                (mapping.committed ? kVirtualQueryCommitted : 0); how = "tracked";
     } else {                                   // unmapped: report the whole hole to the next mapping
         uint64_t nb = next_base(a0);
         if (!nb) { MLOG("virtual_query(0x%llx) -> end-of-space (EACCES)\n", (unsigned long long)a0); return 0x8002000e; }
@@ -667,7 +793,9 @@ HLE(k_virtual_query) {
     }
     if (sz >= 0x08) *(uint64_t*)(info + 0x00) = start;
     if (sz >= 0x10) *(uint64_t*)(info + 0x08) = end;
+    if (sz >= 0x18) *(uint64_t*)(info + 0x10) = offset;
     if (sz >= 0x1c) *(int32_t*)(info + 0x18) = prot;
+    if (sz >= 0x20) *(int32_t*)(info + 0x1c) = memory_type;
     if (sz >= 0x24) *(uint32_t*)(info + 0x20) = flags;
     if (sz >= 0x44 && found && mapping.name[0]) memcpy(info + 0x24, mapping.name, 32);
     MLOG("virtual_query(0x%llx,f=0x%llx) -> [0x%llx,0x%llx) %s\n",
@@ -823,20 +951,21 @@ HLE(k_mprotect) {
     return 0;
 }
 
-// sceKernelMapDirectMemory2(void** addrInOut, len, type, prot, flags, phys, align) inserts a
-// memory-type argument before the ordinary mapper's protection argument. The current VA tracker
-// does not expose per-mapping memory types yet, but mapping must still consume the shifted
-// protection/flags/physical-offset/alignment arguments rather than silently returning success.
+// sceKernelMapDirectMemory2 inserts a memory-type argument before protection. A successful map
+// applies that explicit type to both this VMA and the corresponding physical-allocation range.
 HLE7(k_map_dmem2) {
-    (void)a2;   // Memory-type reporting is tracked separately in #387.
-    return k_map_dmem(a0, a1, a3, a4, a5, a6);
+    return map_dmem_impl(a0, a1, a3, a4, a5, a6, static_cast<int32_t>(a2), true);
 }
 // sceKernelMtypeprotect(addr, size, mtype, prot): apply the CPU protection (arg a3) then set the direct-
-// memory type (a2). Was MISSING -> the stub returned success without applying EITHER, so a later access
-// under the wrong protection faults (write to a still-RO page / exec of a still-NX page) -- the same class
-// as the batch-map TYPE_PROTECT op. We don't track memoryType yet, so apply the protection (the load-
-// bearing half). NOTE prot is arg a3 here, not a2.
-HLE(k_mtypeprotect) { if (a0) { mprotect((void*)a0, a1, host_prot(a3)); retrack_prot(a0, a1, host_prot(a3), static_cast<uint32_t>(a3), "mtypeprotect"); } return 0; }
+// memory type (a2). Only publish either change after the host protection operation succeeds.
+HLE(k_mtypeprotect) {
+    if (!a0) return 0x80020016ull;
+    const int prot = host_prot(a3);
+    if (mprotect((void*)a0, a1, prot) != 0) return sce_mprotect_error(errno);
+    retrack_prot(a0, a1, prot, static_cast<uint32_t>(a3), "mtypeprotect");
+    retrack_type(a0, a1, static_cast<int32_t>(a2));
+    return 0;
+}
 HLE(k_dmem_size){ return kDmemTotal; }   // sparse-backed; allocation failures enforce this bound
 // sceKernelAvailableDirectMemorySize(searchStart, searchEnd, alignment, off_t* physAddrOut,
 // size_t* sizeOut) — report the LARGEST free aligned direct-memory block in [searchStart, searchEnd).
@@ -1157,7 +1286,9 @@ HLE(k_ampr_push_map) {
         bool have_phys = dmem_take(a2, 0x10000, 0x0c, phys);
         void* p = have_phys ? map_phys_at(a1, a2, PROT_READ | PROT_WRITE, phys)
                             : map_at(a1, a2, PROT_READ | PROT_WRITE);
-        if (p) track((uint64_t)p, a2, PROT_READ | PROT_WRITE, 0x2, true, "ampr-map");
+        if (p) track((uint64_t)p, a2, PROT_READ | PROT_WRITE, 0x2, true, "ampr-map",
+                     have_phys ? kVirtualQueryDirect : 0, have_phys ? phys : 0,
+                     have_phys ? 0x0c : 0);
         if (p && have_phys && a1 > 0x540000000ull + 0x1000000000ull) {
             uint64_t mirror = a1 - 0x540000000ull;
             // issue #107: the mirror is a LOW-confidence heuristic (the 0x540000000 rule was pinned
@@ -1183,7 +1314,8 @@ HLE(k_ampr_push_map) {
                      (unsigned long long)a1, (unsigned long long)mirror);
             } else {
                 q = map_phys_at(mirror, a2, PROT_READ | PROT_WRITE, phys);
-                if (q) track((uint64_t)q, a2, PROT_READ | PROT_WRITE, 0x2, true, "ampr-mirror");
+                if (q) track((uint64_t)q, a2, PROT_READ | PROT_WRITE, 0x2, true,
+                             "ampr-mirror", kVirtualQueryDirect, phys, 0x0c);
             }
             MLOG("ampr push-map va=0x%llx len=0x%llx phys=0x%llx mirror=0x%llx -> %s/%s\n",
                  (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)phys,
@@ -1238,6 +1370,7 @@ HLE(k_batch_map) {
         uint64_t phys  = *(const uint64_t*)(e + 0x08);
         uint64_t len   = *(const uint64_t*)(e + 0x10);
         uint8_t  prot  = e[0x18];
+        int32_t  type  = e[0x19];
         int32_t  op    = *(const int32_t*)(e + 0x1c);
         // Per-entry phys trace (#312 alias hunt): log map/unmap WITH the phys offset so an offline
         // pass can prove/disprove two live VAs aliasing one phys range through the shared memfd.
@@ -1249,19 +1382,32 @@ HLE(k_batch_map) {
             case 0: {                               // MAP_DIRECT: phys-backed (aliasing preserved)
                 void* p = map_phys_at(start, len, host_prot(prot), phys);
                 ok = (p != nullptr);
-                if (ok) track((uint64_t)p, len, host_prot(prot), prot, true, "batch-direct");
+                int32_t memory_type = 0;
+                dmem_type_at(phys, memory_type);
+                if (ok) track((uint64_t)p, len, host_prot(prot), prot, true,
+                              "batch-direct", kVirtualQueryDirect, phys, memory_type);
                 break;
             }
             case 3: {                               // MAP_FLEXIBLE: anonymous
                 void* p = map_at(start, len, host_prot(prot));
                 ok = (p != nullptr);
-                if (ok) track((uint64_t)p, len, host_prot(prot), prot, true, "batch-flex");
+                if (ok) track((uint64_t)p, len, host_prot(prot), prot, true,
+                              "batch-flex", kVirtualQueryFlexible);
                 break;
             }
             case 1: if (start) { munmap((void*)(uintptr_t)start, len); untrack(start, len); } break;  // UNMAP
-            case 2: case 4:                                                              // PROTECT / TYPE_PROTECT
-                if (start) { mprotect((void*)(uintptr_t)start, len, host_prot(prot));
-                             retrack_prot(start, len, host_prot(prot), prot, "batch-prot"); } break;
+            case 2: case 4: {                                                            // PROTECT / TYPE_PROTECT
+                if (start) {
+                    if (mprotect((void*)(uintptr_t)start, len, host_prot(prot)) != 0) {
+                        ok = false;
+                        ret = sce_mprotect_error(errno);
+                    } else {
+                        retrack_prot(start, len, host_prot(prot), prot, "batch-prot");
+                        if (op == 4) retrack_type(start, len, type);
+                    }
+                }
+                break;
+            }
             default: ok = false; ret = 0x80020016ull; break;
         }
         if (!ok) { if (!ret) ret = 0x8002000Cull; break; }   // ENOMEM on a failed map
@@ -1377,6 +1523,7 @@ void register_kernel_mem_hle() {
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 namespace prosper {
@@ -1391,10 +1538,16 @@ namespace {
     #define MLOG(...) do { if (memlog()) fprintf(stderr, "[memhle] " __VA_ARGS__); } while (0)
 
     // --- VA tracker + direct-memory pool: PURE logic, copied verbatim from the Linux path -----
+    constexpr uint32_t kVirtualQueryFlexible = 0x01;
+    constexpr uint32_t kVirtualQueryDirect   = 0x02;
+    constexpr uint32_t kVirtualQueryCommitted = 0x10;
+
     struct Mapping {
-        uint64_t base, size;
+        uint64_t base, size, offset;
         int prot;                  // normalized host CPU mask
         uint32_t guest_prot;       // exact SCE protection enum/bits returned to the guest
+        int32_t memory_type;        // direct-memory type; meaningful only with is_direct
+        uint32_t query_flags;       // is_flexible / is_direct bits (commit state is separate)
         bool committed;
         char name[32];
     };
@@ -1406,6 +1559,12 @@ namespace {
     struct DMem { uint64_t start, end; int type; };
     std::mutex g_dmx;
     std::vector<DMem> g_dmem;
+
+    void rebase_mapping(Mapping& mapping, uint64_t new_base) {
+        if ((mapping.query_flags & kVirtualQueryDirect) && new_base > mapping.base)
+            mapping.offset += new_base - mapping.base;
+        mapping.base = new_base;
+    }
 
     // First-fit claim of `sz` bytes at `align` within [lo,hi) — identical to the Linux allocator.
     bool dmem_take(uint64_t sz, uint64_t align, int type, uint64_t& off_out,
@@ -1460,9 +1619,42 @@ namespace {
         }
         g_dmem.swap(out);
     }
+
+    bool dmem_type_at(uint64_t offset, int32_t& type_out) {
+        std::lock_guard<std::mutex> lk(g_dmx);
+        for (const auto& d : g_dmem) {
+            if (offset >= d.start && offset < d.end) {
+                type_out = d.type;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void dmem_retype(uint64_t start, uint64_t len, int32_t type) {
+        if (!len || start > UINT64_MAX - len) return;
+        const uint64_t end = start + len;
+        std::lock_guard<std::mutex> lk(g_dmx);
+        std::vector<DMem> out;
+        out.reserve(g_dmem.size() + 2);
+        for (const auto& d : g_dmem) {
+            if (d.end <= start || d.start >= end) {
+                out.push_back(d);
+                continue;
+            }
+            if (d.start < start) out.push_back({d.start, start, d.type});
+            const uint64_t changed_start = d.start < start ? start : d.start;
+            const uint64_t changed_end = d.end > end ? end : d.end;
+            out.push_back({changed_start, changed_end, type});
+            if (d.end > end) out.push_back({end, d.end, d.type});
+        }
+        g_dmem.swap(out);
+    }
     // Keep tracking non-overlapping when a commit replaces part of an existing reservation.
     void track(uint64_t base, uint64_t size, int prot, uint32_t guest_prot,
-               bool committed, const char* nm, bool host_readable = true) {
+               bool committed, const char* nm, uint32_t query_flags = 0,
+               uint64_t offset = 0, int32_t memory_type = 0,
+               bool host_readable = true) {
         if (!size || base > UINT64_MAX - size) return;
         const uint64_t end = base + size;
         {
@@ -1476,10 +1668,21 @@ namespace {
                     Mapping lo = old; lo.size = base - old.base; out.push_back(lo);
                 }
                 if (old_end > end) {
-                    Mapping hi = old; hi.base = end; hi.size = old_end - end; out.push_back(hi);
+                    Mapping hi = old;
+                    rebase_mapping(hi, end);
+                    hi.size = old_end - end;
+                    out.push_back(hi);
                 }
             }
-            Mapping m{ base, size, prot, guest_prot, committed, {0} };
+            Mapping m{};
+            m.base = base;
+            m.size = size;
+            m.offset = offset;
+            m.prot = prot;
+            m.guest_prot = guest_prot;
+            m.memory_type = memory_type;
+            m.query_flags = query_flags;
+            m.committed = committed;
             if (nm) { strncpy(m.name, nm, sizeof m.name - 1); }
             out.push_back(m);
             g_maps.swap(out);
@@ -1497,7 +1700,12 @@ namespace {
             uint64_t me = m.base + m.size;
             if (me <= base || m.base >= end) { out.push_back(m); continue; }
             if (m.base < base) { Mapping lo = m; lo.size = base - m.base; out.push_back(lo); }
-            if (me > end)      { Mapping hi = m; hi.base = end; hi.size = me - end; out.push_back(hi); }
+            if (me > end) {
+                Mapping hi = m;
+                rebase_mapping(hi, end);
+                hi.size = me - end;
+                out.push_back(hi);
+            }
         }
         g_maps.swap(out);
         host::notify_guest_mapping_removed(base, len);
@@ -1518,7 +1726,7 @@ namespace {
                     Mapping lo = m; lo.size = base - m.base; out.push_back(lo);
                 }
                 Mapping changed = m;
-                changed.base = m.base < base ? base : m.base;
+                rebase_mapping(changed, m.base < base ? base : m.base);
                 const uint64_t changed_end = me > end ? end : me;
                 changed.size = changed_end - changed.base;
                 changed.prot = prot;
@@ -1528,11 +1736,19 @@ namespace {
                 out.push_back(changed);
                 retagged.push_back(changed);
                 if (me > end) {
-                    Mapping hi = m; hi.base = end; hi.size = me - end; out.push_back(hi);
+                    Mapping hi = m;
+                    rebase_mapping(hi, end);
+                    hi.size = me - end;
+                    out.push_back(hi);
                 }
             }
             if (retagged.empty()) {
-                Mapping changed{base, len, prot, guest_prot, true, {0}};
+                Mapping changed{};
+                changed.base = base;
+                changed.size = len;
+                changed.prot = prot;
+                changed.guest_prot = guest_prot;
+                changed.committed = true;
                 if (nm) strncpy(changed.name, nm, sizeof changed.name - 1);
                 out.push_back(changed);
                 retagged.push_back(changed);
@@ -1547,6 +1763,46 @@ namespace {
             host::notify_guest_mapping_added(
                 m.base, m.size, m.committed && host_readable && (prot & 0x1));
         }
+    }
+
+    void retrack_type(uint64_t base, uint64_t len, int32_t memory_type) {
+        if (!len || base > UINT64_MAX - len) return;
+        const uint64_t end = base + len;
+        std::vector<std::pair<uint64_t, uint64_t>> physical_ranges;
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            std::vector<Mapping> out;
+            out.reserve(g_maps.size() + 2);
+            for (const auto& mapping : g_maps) {
+                const uint64_t mapping_end = mapping.base + mapping.size;
+                if (mapping_end <= base || mapping.base >= end ||
+                    !(mapping.query_flags & kVirtualQueryDirect)) {
+                    out.push_back(mapping);
+                    continue;
+                }
+                if (mapping.base < base) {
+                    Mapping prefix = mapping;
+                    prefix.size = base - mapping.base;
+                    out.push_back(prefix);
+                }
+                Mapping changed = mapping;
+                rebase_mapping(changed, mapping.base < base ? base : mapping.base);
+                const uint64_t changed_end = mapping_end > end ? end : mapping_end;
+                changed.size = changed_end - changed.base;
+                changed.memory_type = memory_type;
+                physical_ranges.emplace_back(changed.offset, changed.size);
+                out.push_back(changed);
+                if (mapping_end > end) {
+                    Mapping suffix = mapping;
+                    rebase_mapping(suffix, end);
+                    suffix.size = mapping_end - end;
+                    out.push_back(suffix);
+                }
+            }
+            g_maps.swap(out);
+        }
+        for (const auto& range : physical_ranges)
+            dmem_retype(range.first, range.second, memory_type);
     }
     bool snapshot_mapping(uint64_t addr, Mapping& out) {
         std::lock_guard<std::mutex> lk(g_mx);
@@ -3318,7 +3574,7 @@ HLE(k_map_flexible) {
                    (unsigned long long)hint, (unsigned long long)a1); return 0x8002000cull; }
     if (a0) *(uint64_t*)a0 = (uint64_t)p;
     track((uint64_t)p, a1, host_prot(a2), static_cast<uint32_t>(a2), true,
-          a4 ? (const char*)a4 : "flexible");
+          a4 ? (const char*)a4 : "flexible", kVirtualQueryFlexible);
     MLOG("mapflexible -> 0x%llx len=0x%llx prot=0x%llx\n",
          (unsigned long long)p, (unsigned long long)a1, (unsigned long long)a2);
     return 0;
@@ -3380,29 +3636,36 @@ HLE(k_direct_memory_query) {
     return 0;
 }
 
-// sceKernelMapDirectMemory(void** addrInOut, len, prot, flags, off_t phys, size_t align)
-HLE(k_map_dmem) {
-    uint64_t hint = a0 ? *(uint64_t*)a0 : 0;
-    const bool fixed = (a3 & 0x10) != 0;
-    void* p = win_map_phys(hint, a1, host_prot(a2), a4, a5, fixed);
+static uint64_t map_dmem_impl(uint64_t addr_in_out, uint64_t len, uint64_t prot,
+                              uint64_t flags, uint64_t phys, uint64_t align,
+                              int32_t memory_type, bool set_memory_type) {
+    uint64_t hint = addr_in_out ? *(uint64_t*)addr_in_out : 0;
+    const bool fixed = (flags & 0x10) != 0;
+    void* p = win_map_phys(hint, len, host_prot(prot), phys, align, fixed);
     if (!p) { MLOG("map_dmem hint=0x%llx len=0x%llx FAILED\n",
-                   (unsigned long long)hint, (unsigned long long)a1); return 0x8002000cull; }
-    if (a0) *(uint64_t*)a0 = (uint64_t)p;
-    const bool sparse = sparse_dmem_view_contains((uint64_t)p, (uint64_t)p + a1);
-    track((uint64_t)p, a1, host_prot(a2), static_cast<uint32_t>(a2), true,
-          "direct", !sparse);
+                   (unsigned long long)hint, (unsigned long long)len); return 0x8002000cull; }
+    if (set_memory_type) dmem_retype(phys, len, memory_type);
+    if (addr_in_out) *(uint64_t*)addr_in_out = (uint64_t)p;
+    const bool sparse = sparse_dmem_view_contains((uint64_t)p, (uint64_t)p + len);
+    track((uint64_t)p, len, host_prot(prot), static_cast<uint32_t>(prot), true,
+          "direct", kVirtualQueryDirect, phys, memory_type, !sparse);
     MLOG("map_dmem -> 0x%llx len=0x%llx phys=0x%llx prot=0x%llx flags=0x%llx align=0x%llx\n",
-         (unsigned long long)p, (unsigned long long)a1, (unsigned long long)a4,
-         (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)a5);
+         (unsigned long long)p, (unsigned long long)len, (unsigned long long)phys,
+         (unsigned long long)prot, (unsigned long long)flags, (unsigned long long)align);
     return 0;
 }
 
-// sceKernelMapDirectMemory2 inserts `type` before prot/flags/phys/align. Windows uses the same
-// direct-memory view mapper after shifting those arguments; memory-type queries remain separate
-// #387 tracking work.
+// sceKernelMapDirectMemory(void** addrInOut, len, prot, flags, off_t phys, size_t align)
+HLE(k_map_dmem) {
+    int32_t memory_type = 0;
+    dmem_type_at(a4, memory_type);
+    return map_dmem_impl(a0, a1, a2, a3, a4, a5, memory_type, false);
+}
+
+// sceKernelMapDirectMemory2 inserts `type` before prot/flags/phys/align and applies it to the
+// mapped VMA plus the corresponding physical-allocation range.
 HLE7(k_map_dmem2) {
-    (void)a2;
-    return k_map_dmem(a0, a1, a3, a4, a5, a6);
+    return map_dmem_impl(a0, a1, a3, a4, a5, a6, static_cast<int32_t>(a2), true);
 }
 
 HLE(k_munmap)   { if (!a1) return 0x80020016ull;
@@ -3432,6 +3695,7 @@ HLE(k_mtypeprotect) {
     DWORD error = ERROR_SUCCESS;
     if (!win_protect(a0, a1, prot, &error)) return sce_win_mprotect_error(error);
     retrack_prot(a0, a1, prot, static_cast<uint32_t>(a3), "mtypeprotect");
+    retrack_type(a0, a1, static_cast<int32_t>(a2));
     return 0;
 }
 HLE(k_dmem_size){ return kDmemTotal; }
@@ -3464,6 +3728,7 @@ HLE(k_batch_map) {
         uint64_t phys  = *(const uint64_t*)(e + 0x08);
         uint64_t len   = *(const uint64_t*)(e + 0x10);
         uint8_t  prot  = e[0x18];
+        int32_t  type  = e[0x19];
         int32_t  op    = *(const int32_t*)(e + 0x1c);
         MLOG("bm op=%d va=0x%llx phys=0x%llx len=0x%llx prot=0x%x\n",
              op, (unsigned long long)start, (unsigned long long)phys,
@@ -3476,8 +3741,10 @@ HLE(k_batch_map) {
                 if (ok) {
                     const bool sparse = sparse_dmem_view_contains(
                         (uint64_t)p, (uint64_t)p + len);
+                    int32_t memory_type = 0;
+                    dmem_type_at(phys, memory_type);
                     track((uint64_t)p, len, host_prot(prot), prot, true,
-                          "batch-direct", !sparse);
+                          "batch-direct", kVirtualQueryDirect, phys, memory_type, !sparse);
                 }
                 break;
             }
@@ -3485,7 +3752,7 @@ HLE(k_batch_map) {
                 void* p = win_commit(start, len, host_prot(prot));
                 ok = (p != nullptr);
                 if (ok) track((uint64_t)p, len, host_prot(prot), prot, true,
-                              "batch-flex");
+                              "batch-flex", kVirtualQueryFlexible);
                 break;
             }
             case 1: {                               // UNMAP
@@ -3497,10 +3764,12 @@ HLE(k_batch_map) {
                 if (start) {
                     DWORD error = ERROR_SUCCESS;
                     ok = win_protect(start, len, host_prot(prot), &error);
-                    if (ok)
+                    if (ok) {
                         retrack_prot(start, len, host_prot(prot), prot, "batch-prot");
-                    else
+                        if (op == 4) retrack_type(start, len, type);
+                    } else {
                         ret = sce_win_mprotect_error(error);
+                    }
                 }
                 break;
             }
@@ -3514,7 +3783,8 @@ HLE(k_batch_map) {
     return ret;
 }
 
-// sceKernelVirtualQuery(addr, flags, info*, infoSize): 0x00 start;0x08 end;0x18 i32 prot;0x20 u32 flags;0x24 name[32]
+// sceKernelVirtualQuery(addr, flags, info*, infoSize): 0x00 start; 0x08 end; 0x10
+// physical offset; 0x18 protection; 0x1c memory type; 0x20 classification flags; 0x24 name.
 HLE(k_virtual_query) {
     if (!a2) return 0x80020016ull;
     uint8_t* info = (uint8_t*)a2;
@@ -3522,13 +3792,16 @@ HLE(k_virtual_query) {
     memset(info, 0, sz);
     Mapping mapping{};
     const bool found = snapshot_mapping(a0, mapping);
-    uint64_t start, end; int prot; uint32_t flags;
+    uint64_t start, end, offset = 0; int prot, memory_type = 0; uint32_t flags;
     if (found) {
         start = mapping.base; end = mapping.base + mapping.size;
         // CPU read/write is an SCE enum (RW is 0x2, not host READ|WRITE 0x3), and the GPU bits
         // have no host-page equivalent. Return the original guest protection value verbatim.
         prot = mapping.committed ? static_cast<int>(mapping.guest_prot) : 0x0;
-        flags = mapping.committed ? 0x10 : 0x0;
+        offset = (mapping.query_flags & kVirtualQueryDirect) ? mapping.offset : 0;
+        memory_type = (mapping.query_flags & kVirtualQueryDirect) ? mapping.memory_type : 0;
+        flags = mapping.query_flags |
+                (mapping.committed ? kVirtualQueryCommitted : 0);
     } else {
         uint64_t nb = next_base(a0);
         if (!nb) return 0x8002000eull;
@@ -3536,7 +3809,9 @@ HLE(k_virtual_query) {
     }
     if (sz >= 0x08) *(uint64_t*)(info + 0x00) = start;
     if (sz >= 0x10) *(uint64_t*)(info + 0x08) = end;
+    if (sz >= 0x18) *(uint64_t*)(info + 0x10) = offset;
     if (sz >= 0x1c) *(int32_t*)(info + 0x18) = prot;
+    if (sz >= 0x20) *(int32_t*)(info + 0x1c) = memory_type;
     if (sz >= 0x24) *(uint32_t*)(info + 0x20) = flags;
     if (sz >= 0x44 && found && mapping.name[0]) memcpy(info + 0x24, mapping.name, 32);
     return 0;

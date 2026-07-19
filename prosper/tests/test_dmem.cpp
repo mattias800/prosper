@@ -16,6 +16,7 @@ extern "C" int prosper_try_commit_dmem(uint64_t addr, uint64_t len, int write);
 #endif
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #ifdef __linux__
 #include <sys/mman.h>
 #endif
@@ -52,6 +53,7 @@ int main() {
     auto map2    = reinterpret_cast<Hle7Fn>(
         Hle::lookup(nid_hash("sceKernelMapDirectMemory2")));
     auto protect = Hle::lookup(nid_hash("sceKernelMprotect"));
+    auto mtypeprotect = Hle::lookup(nid_hash("sceKernelMtypeprotect"));
     auto release = Hle::lookup(nid_hash("sceKernelReleaseDirectMemory"));
     auto query   = Hle::lookup(nid_hash("sceKernelVirtualQuery"));
     auto get_type = Hle::lookup(nid_hash("sceKernelGetDirectMemoryType"));
@@ -61,7 +63,7 @@ int main() {
     CHECK(nid_hash("sceKernelGetDirectMemoryType") == "BC+OG5m9+bw",
           "sceKernelGetDirectMemoryType hashes to the PS5 3.20 import NID");
     CHECK(reserve && flexible && unmap && alloc && alloc_main && map && map2 && protect &&
-              release && query && get_type && batch,
+              mtypeprotect && release && query && get_type && batch,
           "memory HLE functions registered");
     if (fails) return 1;
 
@@ -186,7 +188,7 @@ int main() {
 #endif
     CHECK(map((uint64_t)(uintptr_t)&va2, dlen, 0x2, 0, phys, dlen) == 0 && va2 && va2 != va1,
           "map second direct-memory view");
-    CHECK(map2((uint64_t)(uintptr_t)&va_map2, dlen, 0 /* type */, 0x2 /* RW */, 0,
+    CHECK(map2((uint64_t)(uintptr_t)&va_map2, dlen, 3 /* type */, 0x2 /* RW */, 0,
                phys, dlen) == 0 && va_map2 && va_map2 != va1 && va_map2 != va2,
           "MapDirectMemory2 consumes shifted prot/flags/phys/alignment arguments");
     if (va1 && va2) {
@@ -194,9 +196,76 @@ int main() {
         CHECK(*(volatile uint64_t*)(uintptr_t)(va2 + 0x1230) == 0x6310CAFEDEADC0DEull,
               "two virtual mappings of one physical offset alias the same bytes");
         CHECK(va_map2 && *(volatile uint64_t*)(uintptr_t)(va_map2 + 0x1230) ==
-                         0x6310CAFEDEADC0DEull,
-              "MapDirectMemory2 view aliases the requested physical range");
+                          0x6310CAFEDEADC0DEull,
+               "MapDirectMemory2 view aliases the requested physical range");
     }
+
+    uint8_t direct_info[0x48]{};
+    CHECK(query(va1 + 0x2000, 0, (uint64_t)(uintptr_t)direct_info,
+                sizeof(direct_info), 0, 0) == 0 &&
+              *(uint64_t*)(direct_info + 0x00) == va1 &&
+              *(uint64_t*)(direct_info + 0x08) == va1 + dlen &&
+              *(uint64_t*)(direct_info + 0x10) == phys &&
+              *(int32_t*)(direct_info + 0x1c) == 7 &&
+              *(uint32_t*)(direct_info + 0x20) == 0x12,
+          "VirtualQuery reports ordinary direct mapping offset/type/classification");
+    memset(direct_info, 0, sizeof(direct_info));
+    CHECK(query(va_map2 + 0x2000, 0, (uint64_t)(uintptr_t)direct_info,
+                sizeof(direct_info), 0, 0) == 0 &&
+              *(uint64_t*)(direct_info + 0x10) == phys &&
+              *(int32_t*)(direct_info + 0x1c) == 3 &&
+              *(uint32_t*)(direct_info + 0x20) == 0x12,
+          "MapDirectMemory2 publishes its explicit type in VirtualQuery");
+    direct_type = -1; direct_start = direct_end = 0;
+    CHECK(get_type(phys + 0x2000, (uint64_t)(uintptr_t)&direct_type,
+                   (uint64_t)(uintptr_t)&direct_start,
+                   (uint64_t)(uintptr_t)&direct_end, 0, 0) == 0 &&
+              direct_type == 3 && direct_start == phys && direct_end == phys + dlen,
+          "MapDirectMemory2 updates the physical allocation type");
+
+    CHECK(mtypeprotect(va1 + 0x4000, 0x4000, 9, 0x1, 0, 0) == 0,
+          "Mtypeprotect changes one direct-mapping page");
+    memset(direct_info, 0, sizeof(direct_info));
+    CHECK(query(va1 + 0x5000, 0, (uint64_t)(uintptr_t)direct_info,
+                sizeof(direct_info), 0, 0) == 0 &&
+              *(uint64_t*)(direct_info + 0x00) == va1 + 0x4000 &&
+              *(uint64_t*)(direct_info + 0x08) == va1 + 0x8000 &&
+              *(uint64_t*)(direct_info + 0x10) == phys + 0x4000 &&
+              *(int32_t*)(direct_info + 0x18) == 0x1 &&
+              *(int32_t*)(direct_info + 0x1c) == 9 &&
+              *(uint32_t*)(direct_info + 0x20) == 0x12,
+          "Mtypeprotect preserves the carved page's physical offset and publishes its type");
+
+    alignas(8) uint8_t type_entry[0x20]{};
+    *(uint64_t*)(type_entry + 0x00) = va1 + 0x8000;
+    *(uint64_t*)(type_entry + 0x10) = 0x4000;
+    type_entry[0x18] = 0x2;
+    type_entry[0x19] = 11;
+    *(int32_t*)(type_entry + 0x1c) = 4; // TYPE_PROTECT
+    int32_t type_done = -1;
+    CHECK(batch((uint64_t)(uintptr_t)type_entry, 1,
+                (uint64_t)(uintptr_t)&type_done, 0, 0, 0) == 0 && type_done == 1,
+          "BatchMap TYPE_PROTECT changes one direct-mapping page");
+    memset(direct_info, 0, sizeof(direct_info));
+    CHECK(query(va1 + 0x9000, 0, (uint64_t)(uintptr_t)direct_info,
+                sizeof(direct_info), 0, 0) == 0 &&
+              *(uint64_t*)(direct_info + 0x10) == phys + 0x8000 &&
+              *(int32_t*)(direct_info + 0x1c) == 11 &&
+              *(uint32_t*)(direct_info + 0x20) == 0x12,
+          "BatchMap TYPE_PROTECT publishes the carved page's offset and type");
+    memset(direct_info, 0, sizeof(direct_info));
+    CHECK(query(va1 + 0xd000, 0, (uint64_t)(uintptr_t)direct_info,
+                sizeof(direct_info), 0, 0) == 0 &&
+              *(uint64_t*)(direct_info + 0x10) == phys + 0xc000 &&
+              *(int32_t*)(direct_info + 0x1c) == 7,
+          "tracker suffix keeps its original type and rebased physical offset");
+    direct_type = -1; direct_start = direct_end = 0;
+    CHECK(get_type(phys + 0x9000, (uint64_t)(uintptr_t)&direct_type,
+                   (uint64_t)(uintptr_t)&direct_start,
+                   (uint64_t)(uintptr_t)&direct_end, 0, 0) == 0 &&
+              direct_type == 11 && direct_start == phys + 0x8000 &&
+              direct_end == phys + 0xc000,
+          "TYPE_PROTECT carves the same type range in physical allocation queries");
 
     uint64_t hinted = va1;
     CHECK(map((uint64_t)(uintptr_t)&hinted, dlen, 0x2, 0, phys, dlen) == 0 &&
@@ -251,8 +320,9 @@ int main() {
         uint8_t guest_query[0x48]{};
         CHECK(query(sparse_va1 + 0x01000000, 0,
                     (uint64_t)(uintptr_t)guest_query, sizeof(guest_query), 0, 0) == 0 &&
-                  *(uint32_t*)(guest_query + 0x20) == 0x10,
-              "guest VirtualQuery reports the sparse direct view as committed");
+                  *(uint64_t*)(guest_query + 0x10) == sparse_phys &&
+                  *(uint32_t*)(guest_query + 0x20) == 0x12,
+              "guest VirtualQuery reports sparse direct backing and classification");
         host::GuestReadableRange persistent_range{};
         CHECK(host::guest_readable_mapping_containing(
                   sparse_va1 + 0x4000, sparse_va1 + 0x8000, persistent_range),
@@ -427,6 +497,15 @@ int main() {
               *(volatile uint64_t*)(uintptr_t)(fixed_va + 0xc100) ==
                   0x9999aaaabbbbccccull,
               "partial unmap preserves the prefix and suffix views");
+        uint8_t suffix_query[0x48]{};
+        CHECK(query(fixed_va + 0xc000, 0, (uint64_t)(uintptr_t)suffix_query,
+                    sizeof(suffix_query), 0, 0) == 0 &&
+                  *(uint64_t*)(suffix_query + 0x00) == fixed_va + 0x8000 &&
+                  *(uint64_t*)(suffix_query + 0x08) == fixed_va + fixed_len &&
+                  *(uint64_t*)(suffix_query + 0x10) == fixed_phys + 0x8000 &&
+                  *(int32_t*)(suffix_query + 0x1c) == 0 &&
+                  *(uint32_t*)(suffix_query + 0x20) == 0x12,
+              "partial direct unmap rebases the retained suffix's physical offset");
 
         uint64_t flexible_hole = hole;
         const bool flexible_mapped =
@@ -489,15 +568,20 @@ int main() {
     auto map     = Hle::lookup(nid_hash("sceKernelMapDirectMemory"));
     auto map2    = reinterpret_cast<Hle7Fn>(
         Hle::lookup(nid_hash("sceKernelMapDirectMemory2")));
+    auto query   = Hle::lookup(nid_hash("sceKernelVirtualQuery"));
+    auto mtypeprotect = Hle::lookup(nid_hash("sceKernelMtypeprotect"));
+    auto batch   = Hle::lookup(nid_hash("sceKernelBatchMap"));
     auto release = Hle::lookup(nid_hash("sceKernelReleaseDirectMemory"));
     auto get_type = Hle::lookup(nid_hash("sceKernelGetDirectMemoryType"));
     CHECK(nid_hash("sceKernelMapDirectMemory2") == "BQQniolj9tQ",
           "sceKernelMapDirectMemory2 hashes to the PS5 3.20 import NID");
     CHECK(nid_hash("sceKernelGetDirectMemoryType") == "BC+OG5m9+bw",
           "sceKernelGetDirectMemoryType hashes to the PS5 3.20 import NID");
-    CHECK(avail && alloc && alloc_main && map && map2 && release && get_type,
+    CHECK(avail && alloc && alloc_main && map && map2 && query && mtypeprotect && batch &&
+              release && get_type,
           "dmem fns registered");
-    if (!(avail && alloc && alloc_main && map && map2 && release && get_type)) {
+    if (!(avail && alloc && alloc_main && map && map2 && query && mtypeprotect && batch &&
+          release && get_type)) {
         printf("== FAIL ==\n"); return 1;
     }
 
@@ -606,15 +690,15 @@ int main() {
         if (p) release(p, 0x10000, 0, 0, 0, 0);
     }
 
-    // MapDirectMemory2 inserts `type` before prot/flags/phys/alignment. Type zero deliberately
-    // differs from RW protection so an unshifted six-argument alias cannot pass this write/alias
-    // check, and the seventh alignment argument is exercised by the real fixed-arity prototype.
+    // MapDirectMemory2 inserts `type` before prot/flags/phys/alignment. The explicit type must
+    // reach both VirtualQuery and the physical allocation table. Later type-protect operations
+    // carve metadata without losing the virtual-to-physical offset of suffix pages.
     {
         uint64_t p = 0, va = 0, alias = 0;
-        uint64_t rr = alloc(0, kEnd, 0x10000, 0x10000, 0,
+        uint64_t rr = alloc(0, kEnd, 0x10000, 0x10000, 6,
                             (uint64_t)(uintptr_t)&p);
         CHECK(rr == 0, "allocate direct page for MapDirectMemory2");
-        rr = map2((uint64_t)(uintptr_t)&va, 0x10000, 0 /* type */, 0x2 /* RW */, 0,
+        rr = map2((uint64_t)(uintptr_t)&va, 0x10000, 3 /* type */, 0x2 /* RW */, 0,
                   p, 0x10000);
         CHECK(rr == 0 && va && (va & 0xffff) == 0,
               "MapDirectMemory2 consumes shifted arguments and seventh-argument alignment");
@@ -623,8 +707,63 @@ int main() {
         if (va && alias) {
             *(volatile uint64_t*)(uintptr_t)(va + 0x120) = 0xB002D1EC7A11A5ull;
             CHECK(*(volatile uint64_t*)(uintptr_t)(alias + 0x120) == 0xB002D1EC7A11A5ull,
-                  "MapDirectMemory2 maps the requested physical offset as writable shared memory");
+                   "MapDirectMemory2 maps the requested physical offset as writable shared memory");
         }
+
+        uint8_t info[0x48]{};
+        CHECK(query(va + 0x2000, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
+                  *(uint64_t*)(info + 0x00) == va &&
+                  *(uint64_t*)(info + 0x08) == va + 0x10000 &&
+                  *(uint64_t*)(info + 0x10) == p &&
+                  *(int32_t*)(info + 0x1c) == 3 &&
+                  *(uint32_t*)(info + 0x20) == 0x12,
+              "VirtualQuery reports direct offset, explicit type, and classification");
+        direct_type = -1; direct_start = direct_end = 0;
+        CHECK(get_type(p + 0x2000, (uint64_t)(uintptr_t)&direct_type,
+                       (uint64_t)(uintptr_t)&direct_start,
+                       (uint64_t)(uintptr_t)&direct_end, 0, 0) == 0 &&
+                  direct_type == 3 && direct_start == p && direct_end == p + 0x10000,
+              "MapDirectMemory2 updates the physical allocation type");
+
+        CHECK(mtypeprotect(va + 0x4000, 0x4000, 9, 0x1, 0, 0) == 0,
+              "Mtypeprotect changes one direct-mapping page");
+        memset(info, 0, sizeof(info));
+        CHECK(query(va + 0x5000, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
+                  *(uint64_t*)(info + 0x00) == va + 0x4000 &&
+                  *(uint64_t*)(info + 0x08) == va + 0x8000 &&
+                  *(uint64_t*)(info + 0x10) == p + 0x4000 &&
+                  *(int32_t*)(info + 0x18) == 0x1 &&
+                  *(int32_t*)(info + 0x1c) == 9 &&
+                  *(uint32_t*)(info + 0x20) == 0x12,
+              "Mtypeprotect publishes the carved page's rebased offset and type");
+
+        alignas(8) uint8_t type_entry[0x20]{};
+        *(uint64_t*)(type_entry + 0x00) = va + 0x8000;
+        *(uint64_t*)(type_entry + 0x10) = 0x4000;
+        type_entry[0x18] = 0x2;
+        type_entry[0x19] = 11;
+        *(int32_t*)(type_entry + 0x1c) = 4; // TYPE_PROTECT
+        int32_t type_done = -1;
+        CHECK(batch((uint64_t)(uintptr_t)type_entry, 1,
+                    (uint64_t)(uintptr_t)&type_done, 0, 0, 0) == 0 && type_done == 1,
+              "BatchMap TYPE_PROTECT changes one direct-mapping page");
+        memset(info, 0, sizeof(info));
+        CHECK(query(va + 0x9000, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
+                  *(uint64_t*)(info + 0x10) == p + 0x8000 &&
+                  *(int32_t*)(info + 0x1c) == 11,
+              "BatchMap TYPE_PROTECT publishes its carved offset and type");
+        memset(info, 0, sizeof(info));
+        CHECK(query(va + 0xd000, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
+                  *(uint64_t*)(info + 0x10) == p + 0xc000 &&
+                  *(int32_t*)(info + 0x1c) == 3,
+              "tracker suffix keeps its original type and rebased physical offset");
+        direct_type = -1; direct_start = direct_end = 0;
+        CHECK(get_type(p + 0x9000, (uint64_t)(uintptr_t)&direct_type,
+                       (uint64_t)(uintptr_t)&direct_start,
+                       (uint64_t)(uintptr_t)&direct_end, 0, 0) == 0 &&
+                  direct_type == 11 && direct_start == p + 0x8000 &&
+                  direct_end == p + 0xc000,
+              "TYPE_PROTECT carves the same type range in physical allocation queries");
         if (va) munmap((void*)(uintptr_t)va, 0x10000);
         if (alias) munmap((void*)(uintptr_t)alias, 0x10000);
         if (p) release(p, 0x10000, 0, 0, 0, 0);

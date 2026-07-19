@@ -286,9 +286,10 @@ int main() {
     }
     memset(info, 0, sizeof(info));
     CHECK(query(middle, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
+              *(uint64_t*)(info + 0x10) == 0 && *(int32_t*)(info + 0x1c) == 0 &&
               *(int32_t*)(info + 0x18) == 0x2 &&
-              *(uint32_t*)(info + 0x20) == 0x10,
-          "VirtualQuery reports the committed page's exact guest read/write protection");
+              *(uint32_t*)(info + 0x20) == 0x11,
+          "VirtualQuery reports flexible metadata without physical backing fields");
     uint64_t protection_start = UINT64_MAX;
     uint64_t protection_end = UINT64_MAX;
     uint32_t protection_value = UINT32_MAX;
@@ -306,7 +307,7 @@ int main() {
     memset(info, 0, sizeof(info));
     CHECK(query(middle, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
               *(int32_t*)(info + 0x18) == 0x11 &&
-              *(uint32_t*)(info + 0x20) == 0x10,
+              *(uint32_t*)(info + 0x20) == 0x11,
           "VirtualQuery preserves guest-only GPU protection bits");
     protection_value = UINT32_MAX;
     CHECK(query_protection(middle + page / 2, 0, 0,
@@ -323,7 +324,7 @@ int main() {
     memset(info, 0, sizeof(info));
     CHECK(query(middle, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
               *(int32_t*)(info + 0x18) == 0x1 &&
-              *(uint32_t*)(info + 0x20) == 0x10,
+              *(uint32_t*)(info + 0x20) == 0x11,
           "range protection keeps the middle page committed and reports read-only access");
     memset(info, 0, sizeof(info));
     CHECK(query(middle + page, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
