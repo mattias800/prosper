@@ -53,9 +53,17 @@ int main() {
     key.app_window = true;
     key.alt = true;
     controls.handle_key(key);
-    controls.release_host_shortcuts();
+    controls.set_app_focus(false);
+    controls.reconcile_enter(false);
+    CHECK(!controls.guest_options_allowed(),
+          "focus loss cannot release a host-owned Enter chord");
+    controls.set_app_focus(true);
+    controls.reconcile_enter(true);
+    CHECK(!controls.guest_options_allowed(),
+          "focus regain while Enter is held keeps guest Options suppressed");
+    controls.reconcile_enter(false);
     CHECK(controls.guest_options_allowed(),
-          "losing window focus clears host-shortcut suppression");
+          "post-focus keyboard reconciliation releases an unheld Enter chord");
 
     key = {};
     key.app_window = true;

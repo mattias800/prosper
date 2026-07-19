@@ -318,10 +318,9 @@ void feed_test_pattern(uint32_t w, uint32_t h, uint64_t frame) {
 prosper::frontend::KeyboardPadOverlay g_keyboard_pad;
 
 // Snapshot the current keyboard into the overlay. Call from the thread that pumps SDL events.
-void poll_keyboard(bool enter_maps_to_options) {
+void poll_keyboard(const bool* keyboard, bool enter_maps_to_options) {
     using namespace prosper::input;
-    const bool* k = SDL_GetKeyboardState(nullptr);
-    auto d = [&](SDL_Scancode s){ return k[s]; };
+    auto d = [&](SDL_Scancode s){ return keyboard[s]; };
     bool up    = d(SDL_SCANCODE_UP)   || d(SDL_SCANCODE_W);
     bool down  = d(SDL_SCANCODE_DOWN) || d(SDL_SCANCODE_S);
     bool left  = d(SDL_SCANCODE_LEFT) || d(SDL_SCANCODE_A);
@@ -339,7 +338,8 @@ void poll_keyboard(bool enter_maps_to_options) {
     if (d(SDL_SCANCODE_O))     b |= SCE_PAD_BUTTON_R1;
     if (d(SDL_SCANCODE_Y))     b |= SCE_PAD_BUTTON_L2;
     if (d(SDL_SCANCODE_H))     b |= SCE_PAD_BUTTON_R2;
-    const bool enter_down = d(SDL_SCANCODE_RETURN) || d(SDL_SCANCODE_RETURN2);
+    const bool enter_down = d(SDL_SCANCODE_RETURN) || d(SDL_SCANCODE_RETURN2) ||
+                            d(SDL_SCANCODE_KP_ENTER);
     if (enter_down && enter_maps_to_options)
         b |= SCE_PAD_BUTTON_OPTIONS;   // menu/start; Alt+Enter belongs to the host window
     HostPadState st;
@@ -531,6 +531,9 @@ int main(int argc, char** argv) {
     bool swapchainDirty = false;
     const SDL_WindowID appWindowId = SDL_GetWindowID(win);
     prosper::frontend::AppWindowControls windowControls;
+    const SDL_WindowFlags initialWindowFlags = SDL_GetWindowFlags(win);
+    bool fullscreenRequested = (initialWindowFlags & SDL_WINDOW_FULLSCREEN) != 0;
+    windowControls.set_app_focus((initialWindowFlags & SDL_WINDOW_INPUT_FOCUS) != 0);
     while (running && !prosper_stop_requested()) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
@@ -549,13 +552,16 @@ int main(int argc, char** argv) {
                     running = false;
                     break;
                 case prosper::frontend::AppWindowCommand::toggle_fullscreen: {
-                    const bool fullscreen =
-                        (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN) != 0;
-                    if (!SDL_SetWindowFullscreen(win, !fullscreen)) {
+                    // SDL may apply fullscreen requests asynchronously. Toggle the last accepted
+                    // target instead of reading a flag that can still describe the old state.
+                    const bool targetFullscreen = !fullscreenRequested;
+                    if (!SDL_SetWindowFullscreen(win, targetFullscreen)) {
                         fprintf(stderr, "[app] fullscreen toggle failed: %s\n", SDL_GetError());
                     } else {
+                        fullscreenRequested = targetFullscreen;
                         swapchainDirty = true;
-                        fprintf(stderr, "[app] fullscreen %s\n", fullscreen ? "off" : "on");
+                        fprintf(stderr, "[app] fullscreen %s requested\n",
+                                targetFullscreen ? "on" : "off");
                     }
                     break;
                 }
@@ -567,10 +573,32 @@ int main(int argc, char** argv) {
                 swapchainDirty = true;
             } else if (ev.type == SDL_EVENT_WINDOW_FOCUS_LOST &&
                        ev.window.windowID == appWindowId) {
-                windowControls.release_host_shortcuts();
+                windowControls.set_app_focus(false);
+            } else if (ev.type == SDL_EVENT_WINDOW_FOCUS_GAINED &&
+                       ev.window.windowID == appWindowId) {
+                windowControls.set_app_focus(true);
+            } else if (ev.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN &&
+                       ev.window.windowID == appWindowId) {
+                fullscreenRequested = true;
+            } else if (ev.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN &&
+                       ev.window.windowID == appWindowId) {
+                fullscreenRequested = false;
             }
         }
         if (!running) break;
+
+        // Snapshot input before any minimized-window early exit. This clears released guest
+        // buttons even while swapchain recreation has to wait for a non-zero pixel extent.
+        const bool* keyboard = SDL_GetKeyboardState(nullptr);
+        const bool enterDown = keyboard[SDL_SCANCODE_RETURN] ||
+                               keyboard[SDL_SCANCODE_RETURN2] ||
+                               keyboard[SDL_SCANCODE_KP_ENTER];
+        windowControls.reconcile_enter(enterDown);
+        poll_keyboard(keyboard, windowControls.guest_options_allowed());
+#ifdef PROSPER_HAVE_DIALOG_SDL3
+        prosper::sdl_platform_ui_pump();   // run a pending ImeDialog text-entry modal on this (main) thread
+#endif
+
         if (swapchainDirty) {
             int dw = 0, dh = 0;
             SDL_GetWindowSizeInPixels(win, &dw, &dh);
@@ -588,12 +616,6 @@ int main(int argc, char** argv) {
             }
             swapchainDirty = false;
         }
-        // Snapshot key state for the guest's pad reads. The control state keeps an Alt+Enter chord
-        // host-owned until Enter is released, even if Alt is released first.
-        poll_keyboard(windowControls.guest_options_allowed());
-#ifdef PROSPER_HAVE_DIALOG_SDL3
-        prosper::sdl_platform_ui_pump();   // run a pending ImeDialog text-entry modal on this (main) thread
-#endif
         const auto loopNow = std::chrono::steady_clock::now();
         if (timedDumpPending && loopNow >= nextTimedDump) {
             ++timedDumpCount;

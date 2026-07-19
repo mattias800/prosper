@@ -38,12 +38,20 @@ public:
         return !suppress_enter_options_;
     }
 
-    constexpr void release_host_shortcuts() {
-        suppress_enter_options_ = false;
+    constexpr void set_app_focus(bool focused) {
+        app_focused_ = focused;
+    }
+
+    // SDL can omit the key-up event while focus is elsewhere. Reconcile against its keyboard
+    // snapshot only while the app owns focus: a fullscreen transition must not expose an Enter
+    // key that is still physically held as the guest Options button.
+    constexpr void reconcile_enter(bool enter_down) {
+        if (app_focused_ && !enter_down) suppress_enter_options_ = false;
     }
 
 private:
     bool suppress_enter_options_ = false;
+    bool app_focused_ = true;
 };
 
 } // namespace prosper::frontend
