@@ -341,6 +341,9 @@ inline size_t persistent_pipeline_layout_cache_limit() {
 struct BackendRenderTimingStats {
     uint64_t calls = 0;
     uint64_t draws = 0;
+    uint64_t command_buffers = 0;
+    uint64_t queue_submits = 0;
+    uint64_t fence_waits = 0;
     double target_ms = 0;
     double draw_setup_ms = 0;
     double record_upload_ms = 0;
@@ -381,8 +384,8 @@ inline BackendRenderTimingStats backend_render_timing_stats() {
 // wall-clock — every submit paid full device init — which made a many-draw frame (real gameplay is
 // hundreds of draws/submit) impossibly slow and blocked headless scene investigation (#320). Create the
 // instance/physical-device/device/queue ONCE (lazy, thread-safe static init) and reuse it across every
-// call; per-call resources (images/pipelines/descriptors/command buffer/fence/pool) are still created and
-// freed per call. The context intentionally leaks at process exit — fine for a headless/diagnostic tool.
+// call. Per-call Vulkan resources are created independently and are retained until their direct call
+// or explicit ordered submission batch completes. The context intentionally leaks at process exit.
 struct RenderVkCtx {
     VkInstance inst = VK_NULL_HANDLE; VkPhysicalDevice phys = VK_NULL_HANDLE;
     VkDevice dev = VK_NULL_HANDLE; VkQueue queue = VK_NULL_HANDLE; uint32_t qfi = UINT32_MAX;
@@ -463,6 +466,123 @@ inline const RenderVkCtx& render_vk_ctx() {
     }();
     return c;
 }
+
+struct BackendSubmissionBatchResult {
+    VkResult submit_result = VK_SUCCESS;
+    VkResult wait_result = VK_SUCCESS;
+    uint64_t command_buffers = 0;
+    uint64_t queue_submits = 0;
+    uint64_t fence_waits = 0;
+};
+
+// Collect command buffers that belong to one ordered renderer callback. Vulkan queue order preserves
+// target producer/consumer dependencies; one fence on the final submission is enough to retain every
+// referenced object until the complete callback has finished. Direct test callers keep the established
+// synchronous behavior by omitting this object.
+class BackendSubmissionBatch {
+public:
+    BackendSubmissionBatch() = default;
+    BackendSubmissionBatch(const BackendSubmissionBatch&) = delete;
+    BackendSubmissionBatch& operator=(const BackendSubmissionBatch&) = delete;
+
+    ~BackendSubmissionBatch() {
+        if (!commands_.empty()) {
+            const RenderVkCtx& ctx = render_vk_ctx();
+            if (ctx.ok) (void)submit_and_wait(ctx.dev, ctx.queue, false);
+            else discard();
+        }
+        if (commands_.empty()) complete();
+    }
+
+    bool pending() const { return !commands_.empty(); }
+
+    void enqueue(VkCommandBuffer command) {
+        commands_.push_back(command);
+    }
+
+    void add_cleanup(std::function<void()> cleanup) {
+        cleanups_.push_back(std::move(cleanup));
+    }
+
+    // Persistent attachment state is updated speculatively so later command buffers in the same
+    // ordered batch can LOAD/sample earlier results. If the batch cannot be submitted and completed,
+    // every touched entry must be invalidated before its retained resources are released.
+    void add_failure_cleanup(std::function<void()> cleanup) {
+        failure_cleanups_.push_back(std::move(cleanup));
+    }
+
+    void discard() {
+        commands_.clear();
+        finish_persistent_state(false);
+    }
+
+    BackendSubmissionBatchResult submit_and_wait(VkDevice dev, VkQueue queue,
+                                                  bool backend_trace) {
+        BackendSubmissionBatchResult result;
+        result.command_buffers = commands_.size();
+        if (commands_.empty()) return result;
+
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = static_cast<uint32_t>(commands_.size());
+        submit.pCommandBuffers = commands_.data();
+        VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VkFence fence = VK_NULL_HANDLE;
+        if (vkCreateFence(dev, &fence_info, nullptr, &fence) != VK_SUCCESS || !fence) {
+            result.submit_result = VK_ERROR_INITIALIZATION_FAILED;
+            discard();
+            return result;
+        }
+        if (backend_trace) {
+            std::fprintf(stderr, "[backend-trace] queue-submit begin command_buffers=%zu\n",
+                         commands_.size());
+            std::fflush(stderr);
+        }
+        result.submit_result = vkQueueSubmit(queue, 1, &submit, fence);
+        result.queue_submits = 1;
+        if (backend_trace) {
+            std::fprintf(stderr,
+                         "[backend-trace] queue-submit end result=%d; fence-wait begin\n",
+                         static_cast<int>(result.submit_result));
+            std::fflush(stderr);
+        }
+        if (result.submit_result == VK_SUCCESS) {
+            result.wait_result = vkWaitForFences(
+                dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
+            result.fence_waits = 1;
+            // Preserve lifetime safety even if the bounded diagnostic wait expires.
+            if (result.wait_result != VK_SUCCESS)
+                result.wait_result = vkQueueWaitIdle(queue);
+        }
+        if (backend_trace) {
+            std::fprintf(stderr, "[backend-trace] fence-wait end result=%d\n",
+                         static_cast<int>(result.wait_result));
+            std::fflush(stderr);
+        }
+        vkDestroyFence(dev, fence, nullptr);
+        commands_.clear();
+        finish_persistent_state(result.submit_result == VK_SUCCESS &&
+                                result.wait_result == VK_SUCCESS);
+        return result;
+    }
+
+    void complete() {
+        for (auto& cleanup : cleanups_) cleanup();
+        cleanups_.clear();
+    }
+
+private:
+    void finish_persistent_state(bool completed) {
+        if (!completed)
+            for (auto cleanup = failure_cleanups_.rbegin();
+                 cleanup != failure_cleanups_.rend(); ++cleanup)
+                (*cleanup)();
+        failure_cleanups_.clear();
+    }
+
+    std::vector<VkCommandBuffer> commands_;
+    std::vector<std::function<void()>> cleanups_;
+    std::vector<std::function<void()>> failure_cleanups_;
+};
 
 struct PersistentColorTargetKey {
     uint64_t id = 0;
@@ -592,9 +712,10 @@ inline bool evict_persistent_color_target(const RenderVkCtx& ctx, uint64_t curre
     return true;
 }
 
-// Each call waits for its fence before cleanup, so transient allocations can be safely recycled by
-// exact Vulkan memory requirements. Keeping only the memory object avoids changing image layouts or
-// descriptor lifetimes while removing the driver's expensive allocate/free churn between batches.
+// Transient allocations return to this pool only after their call or explicit submission batch has
+// completed, so they can be safely recycled by exact Vulkan memory requirements. Keeping only the
+// memory object avoids changing image layouts or descriptor lifetimes while removing the driver's
+// expensive allocate/free churn between batches.
 struct RenderMemoryKey {
     VkDeviceSize bytes = 0;
     uint32_t memory_type = UINT32_MAX;
@@ -732,9 +853,10 @@ inline uint32_t render_memory_type(VkPhysicalDevice phys, uint32_t bits,
 // Storage-buffer contents are rewritten for every synchronous render call, but their Vulkan object
 // shapes repeat heavily. Keep capacity-class host-coherent buffers mapped between calls so the hot path
 // only copies bytes. The backend normally packs call-local logical uploads into aligned slices of a few
-// pooled arenas; the same pool also backs the per-upload fallback. Each call waits for its fence before
-// returning buffers, so no in-flight GPU work can observe a later upload. Descriptors retain exact
-// logical offsets and ranges, so capacity padding and neighboring arena slices remain shader-inaccessible.
+// pooled arenas; the same pool also backs the per-upload fallback. A call or explicit submission batch
+// completes before returning buffers, so no in-flight GPU work can observe a later upload. Descriptors
+// retain exact logical offsets and ranges, so capacity padding and neighboring arena slices remain
+// shader-inaccessible.
 struct RenderHostBuffer {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -1291,6 +1413,10 @@ inline bool restore_persistent_ds_image(const prosper::gpu::GpuCaptureDsSeed& se
     return true;
 }
 
+// `submission_batch` is an explicit live-renderer ownership scope. Calls with no requested CPU
+// readback may return after recording; `flush_submission_batch` submits every accumulated command
+// buffer in order, waits once, and releases all retained resources. Omitting the batch preserves the
+// synchronous test/replay contract.
 inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& draws, uint32_t W, uint32_t H,
                                               const uint8_t* seed_rgba = nullptr,
                                               const float* clear_rgba = nullptr,
@@ -1298,7 +1424,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                               const BackendColorTarget* color_target = nullptr,
                                               const uint8_t* seed_rgba1 = nullptr,
                                               const float* clear_rgba1 = nullptr,
-                                              std::vector<uint8_t>* out_rgba1 = nullptr) {
+                                              std::vector<uint8_t>* out_rgba1 = nullptr,
+                                              BackendSubmissionBatch* submission_batch = nullptr,
+                                              bool flush_submission_batch = true) {
     using TimingClock = std::chrono::steady_clock;
     const bool timing_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
     const auto timing_start = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
@@ -1312,6 +1440,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     if (draws.empty()) return out;
     const RenderVkCtx& ctx = render_vk_ctx();
     if (!ctx.ok) return out;
+    BackendSubmissionBatch direct_submission;
+    BackendSubmissionBatch& active_submission = submission_batch
+        ? *submission_batch : direct_submission;
+    const bool avoid_cache_eviction = active_submission.pending();
     const bool persistent_color_targets_enabled =
         getenv("PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS") == nullptr;
     const bool persistent_color_enabled = persistent_color_targets_enabled && color_target &&
@@ -1510,7 +1642,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         iai.allocationSize = ir.size; iai.memoryTypeIndex = pick(ir.memoryTypeBits, 0);
         if (persistent_color) {
             const VkDeviceSize limit = persistent_color_target_limit();
-            while ((persistent_color_target_cache().size() > 64 || ir.size > limit ||
+            while (!avoid_cache_eviction &&
+                   (persistent_color_target_cache().size() > 64 || ir.size > limit ||
                     persistent_color_target_bytes() > limit - ir.size) &&
                    evict_persistent_color_target(ctx, color_target_generation)) {}
             if (ir.size <= limit && persistent_color_target_cache().size() <= 64 &&
@@ -1660,7 +1793,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         VkShaderModuleCreateInfo s{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         s.codeSize = c.size() * 4; s.pCode = c.data(); VkShaderModule m = VK_NULL_HANDLE;
         vkCreateShaderModule(dev, &s, nullptr, &m); return m; };
-    // Per-draw Vulkan objects — kept alive until after the queue submit, freed at the end.
+    // Per-draw Vulkan objects stay alive until the call or explicit submission batch completes.
     const auto timing_target_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     struct DV {
         VkShaderModule vs = VK_NULL_HANDLE, gs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
@@ -2403,8 +2536,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                             } else {
                                 ++resource_reuse_stats.persistent_texture_binding_misses;
                                 constexpr size_t max_bindings_per_texture = 32;
-                                if (persistent_image->second.bindings.size() >=
-                                    max_bindings_per_texture) {
+                                if (!avoid_cache_eviction &&
+                                    persistent_image->second.bindings.size() >=
+                                        max_bindings_per_texture) {
                                     auto victim = persistent_image->second.bindings.end();
                                     for (auto it = persistent_image->second.bindings.begin();
                                          it != persistent_image->second.bindings.end(); ++it) {
@@ -2596,7 +2730,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 vkCreatePipelineLayout(dev, &layout_info, nullptr, &shared_layout.handle);
                 if (can_persist_pipeline_layout) {
                     ++resource_reuse_stats.persistent_pipeline_layout_misses;
-                    while (persistent_pipeline_layouts.size() >= pipeline_layout_cache_limit &&
+                    while (!avoid_cache_eviction &&
+                           persistent_pipeline_layouts.size() >= pipeline_layout_cache_limit &&
                            evict_persistent_pipeline_layout()) {}
                     if (shared_layout.handle &&
                         persistent_pipeline_layouts.size() < pipeline_layout_cache_limit) {
@@ -2764,8 +2899,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             if (pipeline_result == VK_SUCCESS) {
                 v.ok = true;
                 bool retain = pipeline_cache_enabled && pipeline_cache_limit;
-                while (retain && pipeline_cache.size() >= pipeline_cache_limit)
+                while (retain && !avoid_cache_eviction &&
+                       pipeline_cache.size() >= pipeline_cache_limit)
                     if (!evict_pipeline()) retain = false;
+                if (retain && pipeline_cache.size() >= pipeline_cache_limit) retain = false;
                 if (retain) {
                     pipeline_cache.emplace(std::move(pipeline_key),
                                            PersistentPipeline{v.pipe, pipeline_generation});
@@ -2833,11 +2970,16 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         load.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         load.image = img;
         load.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        load.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        // A previous target pass may be an earlier command buffer in the same queue submission.
+        // Command-buffer order does not itself make its attachment writes visible, so include the
+        // producer access/stage as well as the layouts in which an already-flushed target can rest.
+        load.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
         load.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
                              VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         vkCmdPipelineBarrier(cmd,
-                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                 VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -2983,6 +3125,44 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         }
     }
     vkCmdEndRenderPass(cmd);
+    // Fence waits used to provide the device-memory dependency between every target call. Batched
+    // command buffers deliberately remove those intermediate waits, and command-buffer/submission
+    // order alone permits action commands to overlap. Publish persistent attachment writes here so
+    // any later command buffer in the queue can sample or LOAD them without relying on driver-wide
+    // serialization. The final render-pass layouts are already correct; these same-layout barriers
+    // supply the missing availability/visibility dependency.
+    if (persistent_color && !readback_requested) {
+        VkImageMemoryBarrier color_ready{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        color_ready.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        color_ready.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        color_ready.image = img;
+        color_ready.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        color_ready.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        color_ready.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &color_ready);
+    }
+    if (persistent_ds) {
+        VkImageMemoryBarrier ds_ready{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        ds_ready.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        ds_ready.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        ds_ready.image = dimg;
+        ds_ready.subresourceRange = {DASPECT, 0, 1, 0, 1};
+        ds_ready.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        ds_ready.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                             VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &ds_ready);
+    }
     if (readback_requested) {
         if (persistent_color) {
             VkImageMemoryBarrier to_readback{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -3012,45 +3192,97 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             to_sample.image = img;
             to_sample.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             to_sample.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            to_sample.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            to_sample.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                      VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                  VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                                  0, 0, nullptr, 0, nullptr, 1, &to_sample);
         }
     }
     vkEndCommandBuffer(cmd);
+
+    // Publish newly uploaded exact-version textures before a later command buffer in the same batch
+    // is recorded. The image upload and every consumer remain ordered in the eventual queue submit.
+    // Do not evict while an earlier command buffer is pending: it may still reference the candidate.
+    auto evict_persistent_texture = [&]() {
+        auto victim = persistent_texture_images.end();
+        for (auto it = persistent_texture_images.begin();
+             it != persistent_texture_images.end(); ++it) {
+            if (it->second.last_use == texture_generation) continue;
+            if (victim == persistent_texture_images.end() ||
+                it->second.last_use < victim->second.last_use) victim = it;
+        }
+        if (victim == persistent_texture_images.end()) return false;
+        for (const auto& [key, binding] : victim->second.bindings) {
+            if (binding.sampler) vkDestroySampler(dev, binding.sampler, nullptr);
+            if (binding.view) vkDestroyImageView(dev, binding.view, nullptr);
+        }
+        vkDestroyImage(dev, victim->second.image, nullptr);
+        vkFreeMemory(dev, victim->second.memory, nullptr);
+        persistent_texture_bytes -= victim->second.bytes;
+        persistent_texture_images.erase(victim);
+        return true;
+    };
+    for (auto& upload : texture_uploads) {
+        if (!upload.direct_memory || !upload.persistent_id || upload.persistent_hit) continue;
+        const PersistentTextureKey key{upload.persistent_id, upload.key.width, upload.key.height,
+                                       upload.key.depth, upload.key.img_dim, upload.key.format};
+        while (!avoid_cache_eviction &&
+               (persistent_texture_images.size() >= persistent_texture_max_entries ||
+                (upload.image_bytes <= persistent_texture_limit &&
+                 persistent_texture_bytes > persistent_texture_limit - upload.image_bytes)) &&
+               evict_persistent_texture()) {}
+        if (upload.image_bytes <= persistent_texture_limit &&
+            persistent_texture_images.size() < persistent_texture_max_entries &&
+            persistent_texture_bytes <= persistent_texture_limit - upload.image_bytes) {
+            auto [cached, inserted] = persistent_texture_images.emplace(
+                key, PersistentTextureImage{upload.image, upload.memory, upload.image_bytes,
+                                            texture_generation});
+            if (inserted) {
+                persistent_texture_bytes += upload.image_bytes;
+                upload.image = VK_NULL_HANDLE;
+                upload.memory = VK_NULL_HANDLE;
+            }
+        }
+    }
+    if (!avoid_cache_eviction)
+        while (persistent_texture_bytes > persistent_texture_limit &&
+               evict_persistent_texture()) {}
+    for (const auto& [key, image] : persistent_texture_images)
+        resource_reuse_stats.persistent_texture_binding_entries += image.bindings.size();
+    texture_stats.persistent_cached_bytes = persistent_texture_bytes;
+
     const auto timing_recorded = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence fence; vkCreateFence(dev, &fci, nullptr, &fence);
-    if (backend_trace) {
-        fprintf(stderr, "[backend-trace] queue-submit begin draws=%zu\n", draws.size());
-        fflush(stderr);
-    }
-    const VkResult submit_result = vkQueueSubmit(queue, 1, &si, fence);
-    if (backend_trace) {
-        fprintf(stderr, "[backend-trace] queue-submit end result=%d; fence-wait begin\n",
-                (int)submit_result);
-        fflush(stderr);
-    }
-    const VkResult wait_result = vkWaitForFences(
-        dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
-    if (backend_trace) {
-        fprintf(stderr, "[backend-trace] fence-wait end result=%d\n", (int)wait_result);
-        fflush(stderr);
-    }
-    const auto timing_gpu_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
+    active_submission.enqueue(cmd);
     if (cached_ds) {
+        active_submission.add_failure_cleanup([cached_ds]() {
+            cached_ds->layout_initialized = false;
+            cached_ds->depth_valid = false;
+            cached_ds->stencil_valid = false;
+        });
         cached_ds->layout_initialized = true;
         cached_ds->depth_valid |= use_depth && depth_used_meaningfully;
         cached_ds->stencil_valid |= use_stencil;
     }
     if (cached_color) {
+        active_submission.add_failure_cleanup([cached_color]() {
+            cached_color->valid = false;
+        });
         cached_color->valid = true;
         cached_color->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
+    const bool flush_now = !submission_batch || readback_requested || flush_submission_batch;
+    BackendSubmissionBatchResult batch_result;
+    if (flush_now)
+        batch_result = active_submission.submit_and_wait(dev, queue, backend_trace);
+    const auto timing_gpu_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
+    const bool batch_completed = !flush_now ||
+        (batch_result.submit_result == VK_SUCCESS && batch_result.wait_result == VK_SUCCESS);
 
-    if (readback_requested) {
+    if (readback_requested && batch_completed) {
         void* mp = nullptr; vkMapMemory(dev, bmem, 0, readback_bytes, 0, &mp);
         const auto* readback = static_cast<const uint8_t*>(mp);
         // A range assignment constructs directly from the mapped pixels. resize()+memcpy first zeroed the
@@ -3103,6 +3335,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 int nt = 0; for (const auto& r : draws[di].R) if (r.is_texture()) { fprintf(stderr, " tex%d=%ux%u", nt, r.tw, r.th); nt++; }
                 fprintf(stderr, "\n");
             }
+            VkFenceCreateInfo iso_fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            VkFence iso_fence = VK_NULL_HANDLE;
+            vkCreateFence(dev, &iso_fence_info, nullptr, &iso_fence);
             VkBufferImageCopy cp2{}; cp2.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; cp2.imageExtent = {W, H, 1};
             for (int kk = -1; kk < (int)dv.size(); kk++) {
                 VkCommandBuffer c2; VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -3117,9 +3352,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 }
                 vkCmdEndRenderPass(c2);
                 vkCmdCopyImageToBuffer(c2, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp2);
-                vkEndCommandBuffer(c2); vkResetFences(dev, 1, &fence);
+                vkEndCommandBuffer(c2); vkResetFences(dev, 1, &iso_fence);
                 VkSubmitInfo si2{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si2.commandBufferCount = 1; si2.pCommandBuffers = &c2;
-                vkQueueSubmit(queue, 1, &si2, fence); vkWaitForFences(dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
+                vkQueueSubmit(queue, 1, &si2, iso_fence); vkWaitForFences(dev, 1, &iso_fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
                 std::vector<uint8_t> px(bytes); void* m2 = nullptr; vkMapMemory(dev, bmem, 0, bytes, 0, &m2);
                 for (VkDeviceSize i = 0; i < bytes; i++) px[i] = ((const uint8_t*)m2)[i]; vkUnmapMemory(dev, bmem);
                 const uint8_t* tp = &px[((size_t)ty * W + tx) * 4];
@@ -3140,128 +3375,104 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 char fn[512]; snprintf(fn, sizeof fn, "%s/iso_kill_%d.bmp", dir.c_str(), kk); dump_bmp(fn, px, W, H);
                 vkFreeCommandBuffers(dev, pool, 1, &c2);
             }
+            if (iso_fence) vkDestroyFence(dev, iso_fence, nullptr);
             fprintf(stderr, "[iso] done: the kill index marked 'dark' is the draw painting (%d,%d)\n", tx, ty);
         }
     }
 
-    vkDestroyFence(dev, fence, nullptr); vkDestroyCommandPool(dev, pool, nullptr);
-    for (auto& v : dv) {   // per-draw objects
-        if (v.pipe && !v.pipeline_cached) vkDestroyPipeline(dev, v.pipe, nullptr);
-        if (v.ibuf)   vkDestroyBuffer(dev, v.ibuf, nullptr);
-        if (v.ibmem)  release_transient_render_memory(dev, v.ibmem);
-        if (v.vs)     vkDestroyShaderModule(dev, v.vs, nullptr);
-        if (v.gs)     vkDestroyShaderModule(dev, v.gs, nullptr);
-        if (v.fs)     vkDestroyShaderModule(dev, v.fs, nullptr);
-    }
-    if (shared_descriptor_pool)
-        vkDestroyDescriptorPool(dev, shared_descriptor_pool, nullptr);
-    for (const auto& [key, layout] : shared_pipeline_layouts)
-        if (layout.handle && !layout.persistent)
-            vkDestroyPipelineLayout(dev, layout.handle, nullptr);
-    for (const auto& [key, layout] : shared_descriptor_set_layouts)
-        if (layout) vkDestroyDescriptorSetLayout(dev, layout, nullptr);
-    for (const SharedTextureBinding& binding : shared_texture_bindings) {
-        if (!binding.persistent) {
-            if (binding.sampler) vkDestroySampler(dev, binding.sampler, nullptr);
-            if (binding.view) vkDestroyImageView(dev, binding.view, nullptr);
-        }
-    }
-    for (const SharedBufferUpload& upload : shared_buffers) {
-        if (upload.arena) {
-            continue;
-        } else if (upload.pooled) {
-            release_render_host_buffer(
-                dev, {upload.buffer, upload.memory, upload.mapped,
-                      upload.bytes, upload.allocation_bytes});
-        } else {
-            if (upload.buffer) vkDestroyBuffer(dev, upload.buffer, nullptr);
-            if (upload.memory) release_transient_render_memory(dev, upload.memory);
-        }
-    }
-    for (SharedBufferArena& arena : shared_buffer_arenas)
-        release_render_host_buffer(dev, arena.buffer);
-    auto evict_persistent_texture = [&]() {
-        auto victim = persistent_texture_images.end();
-        for (auto it = persistent_texture_images.begin();
-             it != persistent_texture_images.end(); ++it) {
-            if (it->second.last_use == texture_generation) continue;
-            if (victim == persistent_texture_images.end() ||
-                it->second.last_use < victim->second.last_use) victim = it;
-        }
-        if (victim == persistent_texture_images.end()) return false;
-        for (const auto& [key, binding] : victim->second.bindings) {
-            if (binding.sampler) vkDestroySampler(dev, binding.sampler, nullptr);
-            if (binding.view) vkDestroyImageView(dev, binding.view, nullptr);
-        }
-        vkDestroyImage(dev, victim->second.image, nullptr);
-        vkFreeMemory(dev, victim->second.memory, nullptr);
-        persistent_texture_bytes -= victim->second.bytes;
-        persistent_texture_images.erase(victim);
-        return true;
-    };
-    for (auto& upload : texture_uploads) {
-        if (!upload.direct_memory || !upload.persistent_id || upload.persistent_hit) continue;
-        const PersistentTextureKey key{upload.persistent_id, upload.key.width, upload.key.height,
-                                       upload.key.depth, upload.key.img_dim, upload.key.format};
-        while ((persistent_texture_images.size() >= persistent_texture_max_entries ||
-                (upload.image_bytes <= persistent_texture_limit &&
-                 persistent_texture_bytes > persistent_texture_limit - upload.image_bytes)) &&
-               evict_persistent_texture()) {}
-        if (upload.image_bytes <= persistent_texture_limit &&
-            persistent_texture_images.size() < persistent_texture_max_entries &&
-            persistent_texture_bytes <= persistent_texture_limit - upload.image_bytes) {
-            auto [cached, inserted] = persistent_texture_images.emplace(
-                key, PersistentTextureImage{upload.image, upload.memory, upload.image_bytes,
-                                            texture_generation});
-            if (inserted) {
-                persistent_texture_bytes += upload.image_bytes;
-                upload.image = VK_NULL_HANDLE;
-                upload.memory = VK_NULL_HANDLE;
-            }
-        }
-    }
-    while (persistent_texture_bytes > persistent_texture_limit && evict_persistent_texture()) {}
-    for (const auto& [key, image] : persistent_texture_images)
-        resource_reuse_stats.persistent_texture_binding_entries += image.bindings.size();
-    texture_stats.persistent_cached_bytes = persistent_texture_bytes;
-    for (auto& upload : texture_uploads) {
-        if (upload.image && !upload.persistent_hit && !upload.borrowed_target)
-            vkDestroyImage(dev, upload.image, nullptr);
-        if (upload.memory) {
-            if (upload.direct_memory) vkFreeMemory(dev, upload.memory, nullptr);
-            else release_transient_render_memory(dev, upload.memory);
-        }
-        if (upload.staging) vkDestroyBuffer(dev, upload.staging, nullptr);
-        if (upload.staging_memory)
-            release_transient_render_memory(dev, upload.staging_memory);
-    }
-    if (seedbuf) vkDestroyBuffer(dev, seedbuf, nullptr);
-    if (seedmem) release_transient_render_memory(dev, seedmem);
-    if (seedbuf1) vkDestroyBuffer(dev, seedbuf1, nullptr);
-    if (seedmem1) release_transient_render_memory(dev, seedmem1);
-    if (rb) vkDestroyBuffer(dev, rb, nullptr);
-    if (bmem) release_transient_render_memory(dev, bmem);
-    vkDestroyFramebuffer(dev, fb, nullptr); vkDestroyRenderPass(dev, rp, nullptr);
-    if (!cached_color) {
-        vkDestroyImageView(dev, view, nullptr);
-        vkDestroyImage(dev, img, nullptr);
-        release_transient_render_memory(dev, imem);
-    }
-    if (use_color1) {
-        vkDestroyImageView(dev, view1, nullptr); vkDestroyImage(dev, img1, nullptr);
-        release_transient_render_memory(dev, imem1);
-    }
-    if (use_ds && !cached_ds) {
-        vkDestroyImageView(dev, dview, nullptr); vkDestroyImage(dev, dimg, nullptr);
-        release_transient_render_memory(dev, dmem);
-    }
-    while ((persistent_color_target_cache().size() > 64 ||
-            persistent_color_target_bytes() > persistent_color_target_limit()) &&
-           evict_persistent_color_target(ctx, color_target_generation)) {}
     color_target_stats.cached_bytes = persistent_color_target_bytes();
     color_target_stats.cached_entries = persistent_color_target_cache().size();
     resource_reuse_stats.persistent_pipeline_layout_entries =
         persistent_pipeline_layouts.size();
+    const bool transient_color = cached_color == nullptr;
+    const bool transient_ds = use_ds && cached_ds == nullptr;
+    const RenderVkCtx* ctx_ptr = &ctx;
+    active_submission.add_cleanup(
+        [dev, pool, dv = std::move(dv), shared_descriptor_pool,
+         shared_pipeline_layouts = std::move(shared_pipeline_layouts),
+         shared_descriptor_set_layouts = std::move(shared_descriptor_set_layouts),
+         shared_texture_bindings = std::move(shared_texture_bindings),
+         shared_buffers = std::move(shared_buffers),
+         shared_buffer_arenas = std::move(shared_buffer_arenas),
+         texture_uploads = std::move(texture_uploads), seedbuf, seedmem, seedbuf1, seedmem1,
+         rb, bmem, fb, rp, transient_color, view, img, imem, use_color1, view1, img1,
+         imem1, transient_ds, dview, dimg, dmem, ctx_ptr,
+         color_target_generation]() mutable {
+            vkDestroyCommandPool(dev, pool, nullptr);
+            for (auto& v : dv) {
+                if (v.pipe && !v.pipeline_cached) vkDestroyPipeline(dev, v.pipe, nullptr);
+                if (v.ibuf) vkDestroyBuffer(dev, v.ibuf, nullptr);
+                if (v.ibmem) release_transient_render_memory(dev, v.ibmem);
+                if (v.vs) vkDestroyShaderModule(dev, v.vs, nullptr);
+                if (v.gs) vkDestroyShaderModule(dev, v.gs, nullptr);
+                if (v.fs) vkDestroyShaderModule(dev, v.fs, nullptr);
+            }
+            if (shared_descriptor_pool)
+                vkDestroyDescriptorPool(dev, shared_descriptor_pool, nullptr);
+            for (const auto& [key, layout] : shared_pipeline_layouts)
+                if (layout.handle && !layout.persistent)
+                    vkDestroyPipelineLayout(dev, layout.handle, nullptr);
+            for (const auto& [key, layout] : shared_descriptor_set_layouts)
+                if (layout) vkDestroyDescriptorSetLayout(dev, layout, nullptr);
+            for (const SharedTextureBinding& binding : shared_texture_bindings) {
+                if (!binding.persistent) {
+                    if (binding.sampler) vkDestroySampler(dev, binding.sampler, nullptr);
+                    if (binding.view) vkDestroyImageView(dev, binding.view, nullptr);
+                }
+            }
+            for (const SharedBufferUpload& upload : shared_buffers) {
+                if (upload.arena) {
+                    continue;
+                } else if (upload.pooled) {
+                    release_render_host_buffer(
+                        dev, {upload.buffer, upload.memory, upload.mapped,
+                              upload.bytes, upload.allocation_bytes});
+                } else {
+                    if (upload.buffer) vkDestroyBuffer(dev, upload.buffer, nullptr);
+                    if (upload.memory) release_transient_render_memory(dev, upload.memory);
+                }
+            }
+            for (SharedBufferArena& arena : shared_buffer_arenas)
+                release_render_host_buffer(dev, arena.buffer);
+            for (auto& upload : texture_uploads) {
+                if (upload.image && !upload.persistent_hit && !upload.borrowed_target)
+                    vkDestroyImage(dev, upload.image, nullptr);
+                if (upload.memory) {
+                    if (upload.direct_memory) vkFreeMemory(dev, upload.memory, nullptr);
+                    else release_transient_render_memory(dev, upload.memory);
+                }
+                if (upload.staging) vkDestroyBuffer(dev, upload.staging, nullptr);
+                if (upload.staging_memory)
+                    release_transient_render_memory(dev, upload.staging_memory);
+            }
+            if (seedbuf) vkDestroyBuffer(dev, seedbuf, nullptr);
+            if (seedmem) release_transient_render_memory(dev, seedmem);
+            if (seedbuf1) vkDestroyBuffer(dev, seedbuf1, nullptr);
+            if (seedmem1) release_transient_render_memory(dev, seedmem1);
+            if (rb) vkDestroyBuffer(dev, rb, nullptr);
+            if (bmem) release_transient_render_memory(dev, bmem);
+            vkDestroyFramebuffer(dev, fb, nullptr);
+            vkDestroyRenderPass(dev, rp, nullptr);
+            if (transient_color) {
+                vkDestroyImageView(dev, view, nullptr);
+                vkDestroyImage(dev, img, nullptr);
+                release_transient_render_memory(dev, imem);
+            }
+            if (use_color1) {
+                vkDestroyImageView(dev, view1, nullptr);
+                vkDestroyImage(dev, img1, nullptr);
+                release_transient_render_memory(dev, imem1);
+            }
+            if (transient_ds) {
+                vkDestroyImageView(dev, dview, nullptr);
+                vkDestroyImage(dev, dimg, nullptr);
+                release_transient_render_memory(dev, dmem);
+            }
+            while ((persistent_color_target_cache().size() > 64 ||
+                    persistent_color_target_bytes() > persistent_color_target_limit()) &&
+                   evict_persistent_color_target(*ctx_ptr, color_target_generation)) {}
+        });
+    if (flush_now) active_submission.complete();
     if (timing_enabled) {
         const auto timing_done = TimingClock::now();
         auto ms = [](auto begin, auto end) {
@@ -3270,6 +3481,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         BackendRenderTimingStats& call_timing = backend_render_timing_stats_storage();
         call_timing.calls = 1;
         call_timing.draws = draws.size();
+        call_timing.command_buffers = batch_result.command_buffers;
+        call_timing.queue_submits = batch_result.queue_submits;
+        call_timing.fence_waits = batch_result.fence_waits;
         call_timing.target_ms = ms(timing_start, timing_target_ready);
         call_timing.draw_setup_ms = ms(timing_target_ready, timing_draws_ready);
         call_timing.record_upload_ms = ms(timing_draws_ready, timing_recorded);
@@ -3282,6 +3496,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         call_timing.setup_pipeline_ms = setup_pipeline_ms;
         struct TimingTotals {
             uint64_t calls = 0, draws = 0;
+            uint64_t command_buffers = 0, queue_submits = 0, fence_waits = 0;
             uint64_t texture_references = 0, texture_uploads = 0, texture_upload_bytes = 0;
             uint64_t persistent_hits = 0, persistent_misses = 0, persistent_cached_bytes = 0;
             uint64_t texture_binding_references = 0, unique_texture_bindings = 0;
@@ -3298,6 +3513,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         auto accumulate = [&](TimingTotals& timing) {
             timing.calls++;
             timing.draws += draws.size();
+            timing.command_buffers += call_timing.command_buffers;
+            timing.queue_submits += call_timing.queue_submits;
+            timing.fence_waits += call_timing.fence_waits;
             timing.texture_references += texture_stats.references;
             timing.texture_uploads += texture_stats.unique_uploads;
             timing.texture_upload_bytes += texture_stats.upload_bytes;
@@ -3346,6 +3564,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     totals.target / n, totals.draw_setup / n, totals.record / n,
                     totals.gpu_wait / n, totals.readback / n, totals.cleanup / n);
             fprintf(stderr,
+                    "[render-timing] backend synchronization command_buffers=%llu queue_submits=%llu "
+                    "fence_waits=%llu\n",
+                    (unsigned long long)totals.command_buffers,
+                    (unsigned long long)totals.queue_submits,
+                    (unsigned long long)totals.fence_waits);
+            fprintf(stderr,
                     "[render-timing] draw_setup avg_ms: shaders=%.2f fixed=%.2f resources=%.2f pipeline=%.2f\n",
                     totals.setup_shader / n, totals.setup_fixed / n,
                     totals.setup_resources / n, totals.setup_pipeline / n);
@@ -3393,6 +3617,11 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     (unsigned long long)window.calls, window.draws / wn, window_total / wn,
                     window.target / wn, window.draw_setup / wn, window.record / wn,
                     window.gpu_wait / wn, window.readback / wn, window.cleanup / wn);
+            fprintf(stderr,
+                    "[render-window] backend synchronization command_buffers=%.1f queue_submits=%.1f "
+                    "fence_waits=%.1f\n",
+                    window.command_buffers / wn, window.queue_submits / wn,
+                    window.fence_waits / wn);
             fprintf(stderr,
                     "[render-window] draw_setup avg_ms: shaders=%.2f fixed=%.2f resources=%.2f pipeline=%.2f\n",
                     window.setup_shader / wn, window.setup_fixed / wn,
