@@ -1,5 +1,9 @@
 # Renderer performance and tooling findings (2026-07-14)
 
+> **Native-Linux continuation:** the current Evergate performance frontier, reproducible dense-route
+> baseline, rejected experiments, and ranked continuation plan are recorded in
+> [`EVERGATE_PERFORMANCE_HANDOFF_2026_07.md`](EVERGATE_PERFORMANCE_HANDOFF_2026_07.md).
+
 This is the handoff for the native Windows performance work tracked in
 [#702](https://github.com/mattias800/ps5ys/issues/702). It records measured results, rejected
 experiments, capture-tool corrections, and the remaining architectural work. Use it with
