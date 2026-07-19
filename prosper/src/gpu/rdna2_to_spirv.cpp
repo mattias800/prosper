@@ -5005,8 +5005,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // 32-bit atomic RMW family (RDNA2 MUBUF opcodes 0x30..0x3b). Each does
                 // mem = mem OP VDATA and returns the PRE-op value in VDATA. They all share the generic
                 // OpAtomic<Op>(ptr, Device, AcqRel, value) shape emitted by cbuf_atomic_rtn. VDATA is one
-                // dword. CMPSWAP (0x31, two-operand), INC/DEC (0x3c/0x3d, wrap semantics), and the x2
-                // 64-bit variants stay deferred (fail-visible) — they need distinct lowering.
+                // dword. CMPSWAP (0x31, two-operand), CSUB (0x34, conditional-subtract), INC/DEC
+                // (0x3c/0x3d, wrap semantics), and the x2 64-bit variants stay deferred (fail-visible)
+                // via the default case below — they need distinct lowering, not a plain RMW.
                 case 0x30: n = 1; is_atomic = true; atomic_op = Op_AtomicExchange; break; // swap
                 case 0x32: n = 1; is_atomic = true; atomic_op = Op_AtomicIAdd;     break; // add
                 case 0x33: n = 1; is_atomic = true; atomic_op = Op_AtomicISub;     break; // sub

@@ -993,6 +993,21 @@ int main() {
     CHECK(atomic_bad == 0,
           "#590: swap/sub/smin/umin/smax/and/or/xor MUBUF atomics all recompile to SPIR-V");
 
+    // Behaviorally verify a bitwise atomic too (catches an op transposition among the recompile-only
+    // set): element 0 starts at 4 and every lane ORs 3, so the idempotent result is 4|3 = 7 — distinct
+    // from add (4+3N), max (4), swap (3), and (0), and xor (4 for even N).
+    const uint32_t code_atomic_or[] = {
+        0x7e020283u,               // v_mov_b32 v1, 3
+        0xe0e80000u, 0x80020100u,  // buffer_atomic_or v1, v0, s[8:11]  (op 0x3a)
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv_atomic_or = recompile_valu(
+        code_atomic_or, std::size(code_atomic_or), 1, 0, &rt_atomic);
+    std::vector<uint32_t> or_buf_in(1, 4u), or_buf_out;
+    prosper::test::run_compute(spv_atomic_or, atomic_dummy, N, N, {}, or_buf_in, &or_buf_out);
+    CHECK(!spv_atomic_or.empty() && or_buf_out.size() == 1 && or_buf_out[0] == 7u,
+          "#590: buffer_atomic_or is idempotent (4 | 3 = 7), distinct from add/max/swap");
+
     // Kernel 24b (#150): the SAME unorm8x4 fetch but with a NON-dword-aligned inst offset (offset:2).
     // The packed unpack extracts components at static byte offsets from a dword-aligned base and drops
     // addr&3, so a non-aligned element base would decode the wrong bits — it must be REJECTED (the
