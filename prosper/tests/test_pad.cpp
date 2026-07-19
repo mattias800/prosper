@@ -215,7 +215,40 @@ int main() {
         CHECK(pad_script_buttons_at(fs, 5.1, hold, /*no frame info*/-1, fhold) == SCE_PAD_BUTTON_OPTIONS,
               "frame: seconds entry still fires with frame_count=-1; frame entry does not");
 
-        // File syntax: newlines/comments, explicit time/frame ranges, and @path loading.
+        // Pad-read anchors (#302): "p<N>:" fires on controller snapshot N, independent of time/flips.
+        auto reads = parse_pad_script("p100:cross;P120-125:options;7:circle;f40:square");
+        CHECK(reads.size() == 4, "read: seconds/frame/read entries parse together");
+        CHECK(reads[0].read_anchored && !reads[0].frame_anchored &&
+              reads[0].t_secs == 100.0 && reads[0].button_mask == SCE_PAD_BUTTON_CROSS,
+              "read: 'p100:cross' parses pad-read-anchored at 100");
+        CHECK(reads[1].read_anchored && reads[1].t_secs == 120.0 && reads[1].end == 125.0,
+              "read: explicit range preserves its exclusive end");
+        const int64_t rhold = 4;
+        CHECK(pad_script_buttons_at(reads, 999.0, hold, 999, fhold, 99, rhold) == 0,
+              "read: before point window -> none despite unrelated time/frame values");
+        CHECK(pad_script_buttons_at(reads, 999.0, hold, 999, fhold, 100, rhold) ==
+                  SCE_PAD_BUTTON_CROSS,
+              "read: point starts at the requested pad read");
+        CHECK(pad_script_buttons_at(reads, 999.0, hold, 999, fhold, 103, rhold) ==
+                  SCE_PAD_BUTTON_CROSS,
+              "read: point uses the configured default read hold");
+        CHECK(pad_script_buttons_at(reads, 999.0, hold, 999, fhold, 104, rhold) == 0,
+              "read: point ends exclusively");
+        CHECK(pad_script_buttons_at(reads, 0.0, hold, 0, fhold, 124, rhold) ==
+                  SCE_PAD_BUTTON_OPTIONS,
+              "read: explicit range is active before its end");
+        CHECK(pad_script_buttons_at(reads, 0.0, hold, 0, fhold, 125, rhold) == 0,
+              "read: explicit range ends exclusively");
+        CHECK(pad_script_buttons_at(reads, 7.1, hold, -1, fhold, -1, rhold) ==
+                  SCE_PAD_BUTTON_CIRCLE,
+              "read: unavailable count suppresses read entries without affecting seconds entries");
+        auto invalid_counts = parse_pad_script(
+            "p1.5:cross;p9007199254740992:cross;f2.5:cross;p5:circle");
+        CHECK(invalid_counts.size() == 1 && invalid_counts[0].read_anchored &&
+              invalid_counts[0].t_secs == 5.0,
+              "read: fractional or inexact count anchors are rejected");
+
+        // File syntax: newlines/comments, explicit time/frame/read ranges, and @path loading.
         auto ranges = parse_pad_script("# checkpoint\n f10-20:cross # hold\n3-4.5:up+cross\n");
         CHECK(ranges.size() == 2, "route: comments/newlines parse two entries");
         CHECK(ranges[0].frame_anchored && ranges[0].t_secs == 10.0 && ranges[0].end == 20.0,
@@ -232,11 +265,12 @@ int main() {
         const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
         const auto route_path = std::filesystem::temp_directory_path() /
                                 ("prosper_test_pad_route_" + std::to_string(unique) + ".pad");
-        { std::ofstream route(route_path); route << "# loaded route\nf7-12:options\n"; }
+        { std::ofstream route(route_path); route << "# loaded route\nf7-12:options\np20-24:cross\n"; }
         std::string route_error;
         auto loaded = load_pad_script("@" + route_path.string(), &route_error);
-        CHECK(route_error.empty() && loaded.size() == 1 && loaded[0].frame_anchored && loaded[0].end == 12.0,
-              "route: @path loads and parses a file");
+        CHECK(route_error.empty() && loaded.size() == 2 && loaded[0].frame_anchored &&
+              loaded[0].end == 12.0 && loaded[1].read_anchored && loaded[1].end == 24.0,
+              "route: @path loads and parses flip/read entries");
         std::filesystem::remove(route_path);
         auto missing = load_pad_script("@/this/prosper/route/does/not/exist.pad", &route_error);
         CHECK(missing.empty() && !route_error.empty(), "route: missing @path reports an error");

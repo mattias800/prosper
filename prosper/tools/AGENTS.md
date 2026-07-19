@@ -49,7 +49,8 @@ programmatic check (ctest exit code, `spirv-val`, a snapshot hash) over eyeballi
 
 To drive any runner through a longer input route, set
 `PROSPER_PAD_SCRIPT=@scripts/<title>/reach-<state>.pad`. Route files use the same
-seconds/flip syntax as inline scripts, accept one entry per line, `#` comments,
+seconds/flip/pad-read syntax as inline scripts (`3:`, `f300:`, or `p1200:`), accept one entry per
+line, `#` comments,
 and explicit ranges such as `f300-340:cross`. Full-deflection stick actions use names such as
 `left-stick-left` and can be combined with buttons using `+`. See `docs/INPUT_REPLAY.md`.
 Set `PROSPER_PAD_RECORD=<path>` on any runner, or use `prosper-app --record <path>`, to capture the
@@ -57,10 +58,12 @@ final button stream in that format. Completed button intervals are flushed immed
 directions are supported for playback but are not yet emitted by the recorder.
 Set `PROSPER_PAD_SCRIPT_LOG=1` to log each scripted state transition observed at a pad poll.
 For long exploratory runs, add `PROSPER_PAD_SCRIPT_RELOAD=1` to live-reload an `@file` route while
-preserving its original time/flip origin; append only future windows and confirm the reload log.
+preserving its original time/flip/read origin; append only future windows and confirm the reload log.
 Wall-clock ranges can be skipped entirely when their duration is shorter than the interval between
-polls, especially under synchronous software rendering; use poll-safe holds with neutral gaps or
-flip-anchored ranges for reproducible routes.
+polls, especially under synchronous software rendering; use poll-safe holds with neutral gaps,
+flip-anchored ranges while presentation advances, or `pA-B:` ranges keyed to the pad-read index printed
+by `PROSPER_PAD_SCRIPT_LOG=1`. Point entries use `PROSPER_PAD_FRAME_HOLD` or
+`PROSPER_PAD_READ_HOLD` (both default 8) on their count axis.
 
 Capture one draw-carrying renderer invocation with:
 

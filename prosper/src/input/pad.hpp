@@ -140,14 +140,14 @@ uint32_t pad_trigger_buttons(uint8_t l2, uint8_t r2);
 // A timed controller sequence lets a headless run drive menus and gameplay with no host device
 // (issue #163). These helpers are pure (no env, no clock) so parse + time evaluation is verifiable; the HLE
 // (hle_pad.cpp) supplies getenv + the wall clock and anchors t=0 to the first input poll.
-// t_secs holds a wall-clock time (default) OR, when frame_anchored, a FRAME NUMBER (flips since the
-// first poll). Frame-anchoring is boot-speed-invariant: `f300:cross` fires at the same game state on a
-// fast GPU and slow llvmpipe, where a wall-clock `10:cross` would drift — essential for deterministic
-// menu-reach across builds (bisect/regression repro). See #302.
+// t_secs holds wall-clock seconds by default, a flip number when frame_anchored, or a pad-read number
+// when read_anchored. `p300:cross` is independent of wall time and presentation rate, which keeps a
+// route usable when synchronous rendering changes both. See #302.
 struct PadScriptEntry {
     double t_secs;
     uint32_t button_mask;
     bool frame_anchored = false;
+    bool read_anchored = false;
     double end = 0.0;  // exclusive explicit range end; 0 uses the configured default hold
     int8_t left_x = 0;   // -1=left, 0=neutral/unspecified, +1=right
     int8_t left_y = 0;   // -1=up,   0=neutral/unspecified, +1=down
@@ -181,10 +181,11 @@ uint32_t pad_button_by_name(const std::string& name);
 std::string pad_button_names(uint32_t mask);
 
 // Parse ';'- or newline-separated entries. Actions are '+'-joined button names and/or full-stick
-// directions such as "left-stick-left" and "right-stick-up". An entry whose time token starts with 'f' is
-// FRAME-anchored: "f300:cross" fires at flip 300 since the first poll. Both anchors accept explicit
-// ranges ("3-4.5:cross", "f300-340:cross"); '#' starts a comment. Malformed entries and entries with
-// no recognized action are dropped.
+// directions such as "left-stick-left" and "right-stick-up". A time token starting with 'f' is
+// frame-anchored (flips since the first poll); one starting with 'p' is pad-read-anchored (snapshots
+// since the first poll). All anchors accept explicit ranges ("3-4.5:cross", "f300-340:cross",
+// "p1200-1240:cross"); '#' starts a comment. Malformed entries and entries with no recognized action
+// are dropped.
 std::vector<PadScriptEntry> parse_pad_script(const std::string& spec);
 
 // Parse an inline script, or load and parse one from disk when `source` starts with '@'. Relative
@@ -194,7 +195,8 @@ std::vector<PadScriptEntry> load_pad_script(const std::string& source, std::stri
 // Full scripted controller state now. Active entries combine buttons and full-deflection stick
 // directions; opposing directions on one axis cancel to an explicitly centered axis.
 PadScriptState pad_script_state_at(const std::vector<PadScriptEntry>& script, double elapsed_secs,
-                                   double hold_secs, int64_t frame_count = -1, int64_t frame_hold = 8);
+                                   double hold_secs, int64_t frame_count = -1, int64_t frame_hold = 8,
+                                   int64_t read_count = -1, int64_t read_hold = 8);
 
 // Overlay a scripted state onto a host snapshot. Buttons combine with the backend; only explicitly
 // active script axes replace their host values.
@@ -202,10 +204,12 @@ void pad_apply_script_state(HostPadState& target, const PadScriptState& scripted
 
 // Buttons held now: OR of every entry whose window contains the current time. A seconds-anchored entry
 // matches [t, t+hold_secs) against `elapsed_secs`; a frame-anchored entry matches [f, f+frame_hold)
-// against `frame_count` (pass -1 when no frame count is available -> frame entries never fire).
-// An explicit range uses its exclusive `end`; point entries use hold_secs/frame_hold.
+// against `frame_count`; a read-anchored entry matches [p, p+read_hold) against `read_count`.
+// Pass -1 when a count is unavailable so entries on that axis never fire. An explicit range uses its
+// exclusive `end`; point entries use the configured hold for their axis.
 uint32_t pad_script_buttons_at(const std::vector<PadScriptEntry>& script, double elapsed_secs, double hold_secs,
-                               int64_t frame_count = -1, int64_t frame_hold = 8);
+                               int64_t frame_count = -1, int64_t frame_hold = 8,
+                               int64_t read_count = -1, int64_t read_hold = 8);
 
 // ---- Pluggable host backend (mirrors AudioSink / audio_set_sink) -------------------------------
 //
