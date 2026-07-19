@@ -46,6 +46,9 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
         if (c.op == IT_INDEX_TYPE) {
             c.kind = K::SetIndexType;
             if (npl >= 1) c.index_size = pl[0];
+        } else if (c.op == IT_NUM_INSTANCES) {
+            c.kind = K::SetNumInstances;
+            if (npl >= 1) c.instance_count = pl[0];
         } else if (c.op == IT_EVENT_WRITE) {
             c.kind = K::EventWrite;
             if (npl >= 1) c.event_type = pl[0] & 0xffu;

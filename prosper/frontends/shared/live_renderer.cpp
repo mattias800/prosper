@@ -1900,6 +1900,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     bd.vs_identity = refvs ? 0 : it.vs_identity;
                     bd.fs_identity = fs_ov ? 0 : it.fs_identity;
                     bd.vcount = refvs ? 3u : it.vertex_count;
+                    bd.instance_count = it.instance_count;
                     bd.ps     = nops ? nullptr : &it.ps;
                     bd.R      = build_R(it, it.vrt.get(), it.prt.get());
                     if (!prosper::gpu::validate_runtime_descriptor_contract(
@@ -1913,8 +1914,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     // Skipped under REFVS — the reference VS is a 3-vertex non-indexed fullscreen triangle.
                     if (!refvs) bd.indices = it.indices;
                     if (getenv("PROSPER_GFXLOG")) fprintf(stderr,
-                        "[render] item %zu: %zu resources vcount=%u nidx=%zu topo=%u mask=0x%x blend=%d\n",
-                        bds.size(), bd.R.size(), bd.vcount, bd.indices.size(), it.ps.topology,
+                        "[render] item %zu: %zu resources vcount=%u instances=%u nidx=%zu topo=%u mask=0x%x blend=%d\n",
+                        bds.size(), bd.R.size(), bd.vcount, bd.instance_count, bd.indices.size(), it.ps.topology,
                         it.ps.color_write_mask, (int)it.ps.blend_enable);
                     // RTTLOG per-draw detail (render-window-only, unlike the GFXLOG firehose): enough
                     // state to diagnose a pass whose inputs HIT the RTT cache yet outputs nothing —

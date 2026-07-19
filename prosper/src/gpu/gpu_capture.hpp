@@ -66,6 +66,7 @@ struct GpuCapturedDraw {
     GpuCapturedTable vrt;
     GpuCapturedTable prt;
     uint32_t vertex_count = 3;
+    uint32_t instance_count = 1;
     std::vector<uint32_t> indices;
     uint64_t color0_base = 0;
     uint32_t color0_width = 0, color0_height = 0;

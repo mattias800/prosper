@@ -60,9 +60,16 @@ int main() {
     // EXP mrt0). Inline consts: 0xF2 = 1.0f, 0x80 = 0.0f.  RED = (1,0,0,1)  GREEN = (0,1,0,1).
     static const uint32_t kRedPs[]   = {0x7E0002F2u, 0x7E020280u, 0x7E040280u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u};
     static const uint32_t kGreenPs[] = {0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u};
+    static const uint32_t kQuarterRedPs[] = {
+        0x7E0002FFu, 0x3E800000u, 0x7E020280u, 0x7E040280u, 0x7E0602F2u,
+        0xF800180Fu, 0x03020100u, 0xBF810000u,
+    };
     std::vector<uint32_t> red   = recompile_fragment(kRedPs,   sizeof(kRedPs)   / 4, nullptr);
     std::vector<uint32_t> green = recompile_fragment(kGreenPs, sizeof(kGreenPs) / 4, nullptr);
-    CHECK(!vs.empty() && !red.empty() && !green.empty(), "fullscreen VS + red/green PS available");
+    std::vector<uint32_t> quarter_red = recompile_fragment(
+        kQuarterRedPs, sizeof(kQuarterRedPs) / 4, nullptr);
+    CHECK(!vs.empty() && !red.empty() && !green.empty() && !quarter_red.empty(),
+          "fullscreen VS + red/green/quarter-red PS available");
 
     ResolvedPipelineState opaque{};
     opaque.topology = 3 /*VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST*/; opaque.color_write_mask = 0xF;
@@ -83,6 +90,40 @@ int main() {
         CHECK(px.size() == (size_t)W * H * 4, "single-draw path rendered a frame");
         const uint8_t* c = center(px);
         if (c) CHECK(c[0] > 0xC0 && c[1] < 0x40 && c[2] < 0x40, "one opaque red draw -> RED center");
+    }
+
+    // Hardware instance count reaches both Vulkan submission paths. Additive quarter-red makes the
+    // number of identical instances directly observable: one instance contributes ~64 red, while
+    // three contribute ~192. The indexed sibling must produce the same pixels.
+    {
+        prosper::test::BackendDraw one;
+        one.vs = vs; one.fs = quarter_red; one.ps = &additive; one.vcount = 3;
+        prosper::test::BackendDraw zero = one; zero.instance_count = 0;
+        prosper::test::BackendDraw zero_indexed = zero; zero_indexed.indices = {0, 1, 2};
+        prosper::test::BackendDraw three = one; three.instance_count = 3;
+        prosper::test::BackendDraw three_indexed = three; three_indexed.indices = {0, 1, 2};
+        const std::vector<uint8_t> px_zero = prosper::test::render_draws_rgba({zero}, W, H);
+        const std::vector<uint8_t> px_zero_indexed =
+            prosper::test::render_draws_rgba({zero_indexed}, W, H);
+        const std::vector<uint8_t> px_one = prosper::test::render_draws_rgba({one}, W, H);
+        const std::vector<uint8_t> px_three = prosper::test::render_draws_rgba({three}, W, H);
+        const std::vector<uint8_t> px_three_indexed =
+            prosper::test::render_draws_rgba({three_indexed}, W, H);
+        const uint8_t* zero_center = center(px_zero);
+        const uint8_t* one_center = center(px_one);
+        const uint8_t* three_center = center(px_three);
+        CHECK(zero_center && zero_center[0] < 0x40 && zero_center[1] < 0x40 &&
+                  zero_center[2] > 0xC0,
+              "zero non-indexed instances leave the blue clear untouched");
+        CHECK(!px_zero.empty() && px_zero_indexed == px_zero,
+              "zero indexed instances are the same no-op");
+        CHECK(one_center && one_center[0] >= 48 && one_center[0] <= 80,
+              "one additive quarter-red instance contributes one layer");
+        CHECK(three_center && one_center && three_center[0] >= one_center[0] + 96 &&
+                  three_center[0] >= 160 && three_center[0] <= 224,
+              "three non-indexed instances contribute three additive layers");
+        CHECK(!px_three.empty() && px_three_indexed == px_three,
+              "indexed and non-indexed Vulkan draws consume the same instance count");
     }
 
     // Red opaque THEN green additive, in one submit -> yellow center (both composited into one target).

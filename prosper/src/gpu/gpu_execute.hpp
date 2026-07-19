@@ -52,6 +52,7 @@ struct DrawItem {
     ResolvedPipelineState ps;                         // THIS draw's fixed-function state
     std::shared_ptr<ShaderResourceTable> vrt, prt;    // may be null
     uint32_t vertex_count = 3;
+    uint32_t instance_count = 1;
     // Indexed draw (sceAgcDcbDrawIndex): the guest index buffer, fetched from 1:1-mapped memory and
     // widened to 32-bit. Non-empty -> the backend must render with vkCmdDrawIndexed (gl_VertexIndex
     // then IS the fetched index, which the recompiled VS uses for its storage-buffer vertex fetch);
@@ -969,6 +970,9 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     out.vs_guest_addr = rs.es_addr; out.fs_guest_addr = rs.ps_addr;
     out.vs_identity = vs_identity; out.fs_identity = fs_identity; out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;
+    // The draw record is authoritative even in folded mode: register state may change after the
+    // last draw, while IT_NUM_INSTANCES belongs to the draw at the moment it executes.
+    out.instance_count = draw ? draw->instance_count : ds.num_instances;
     out.color0_base = rs.color0_base;   // render-to-texture: the target this draw writes into (#167)
     out.color0_width = rs.color0_width; out.color0_height = rs.color0_height; // per-target extent (#526)
     out.color1_base = rs.color1_base;
