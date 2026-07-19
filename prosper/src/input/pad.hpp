@@ -99,7 +99,7 @@ struct ScePadData {
     uint8_t  device_unique_data[12];        // 0x6c
 };                                          // 0x78 = 120 bytes
 
-// ScePadControllerInformation — scePadGetControllerInformation. 32 bytes (trailing reserve).
+// ScePadControllerInformation — scePadGetControllerInformation. 28 bytes (trailing reserve).
 struct ScePadControllerInformation {
     float    touch_pixel_density;           // 0x00
     uint16_t touch_resolution_x;            // 0x04
@@ -116,6 +116,17 @@ struct ScePadControllerInformation {
                                             // a 32-byte struct overran the game's 28-byte stack buffer
                                             // into its stack canary -> __stack_chk_fail crash, #283)
 
+// ScePadExtendedControllerInformation. The standard-pad extension is zero; device-specific
+// controllers interpret class_data according to capability.
+struct ScePadExtendedControllerInformation {
+    ScePadControllerInformation base;        // 0x00
+    uint16_t pad_type1;                      // 0x1c
+    uint16_t pad_type2;                      // 0x1e
+    uint8_t  capability;                     // 0x20
+    uint8_t  ext_pad[3];                     // 0x21 (align class-data union to 4)
+    uint8_t  class_data[8];                  // 0x24
+};                                           // 0x2c = 44 bytes
+
 // ---- Pure mapping (no hardware, no globals) ---------------------------------------------------
 
 // Fill a full ScePadData from a host snapshot. Zeroes the struct first (motion/touch reported as
@@ -124,6 +135,10 @@ void pad_fill_data(ScePadData* out, const HostPadState& s, uint64_t timestamp, u
 
 // Fill ScePadControllerInformation for a DualSense-class pad.
 void pad_fill_controller_info(ScePadControllerInformation* out, bool connected, uint8_t connected_count);
+
+// Fill the exact extended controller-info layout for a standard DualSense-class pad.
+void pad_fill_extended_controller_info(ScePadExtendedControllerInformation* out, bool connected,
+                                       uint8_t connected_count);
 
 // Normalize a raw axis reading in [min,max] to the Sony 0..255 range (clamped).
 uint8_t pad_axis_u8(int raw, int min, int max);
