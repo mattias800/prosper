@@ -85,6 +85,60 @@ int main() {
         CHECK(r > 128 && g < 128 && b > 128, "additive blend: red over blue -> magenta (blend state honored)");
     } else { CHECK(false, "additive blend render produced a frame"); }
 
+    // AMD's obsolete BOTH_* source factors program a complementary source/destination pair and
+    // override the destination field. Patch the fragment shader's sole 1.0 alpha constant to 0.25;
+    // red-over-blue then gives (0.25, 0, 0.75) for BOTH_SRC_ALPHA and the inverse for BOTH_INV.
+    {
+        std::vector<uint32_t> quarter_alpha_frag = frag;
+        bool patched_alpha = false;
+        for (uint32_t& word : quarter_alpha_frag) {
+            if (word == 0x3f800000u) {
+                word = 0x3e800000u;
+                patched_alpha = true;
+                break;
+            }
+        }
+        CHECK(patched_alpha, "patched triangle fragment alpha from 1.0 to 0.25");
+
+        auto resolve_both = [](uint32_t source_factor) {
+            namespace Pm4 = prosper::agc::Pm4;
+            GpuState st;
+            st.uc[Pm4::VGT_PRIMITIVE_TYPE] = 4;
+            st.cx[Pm4::CB_TARGET_MASK] = 0xFu;
+            st.cx[Pm4::CB_BLEND0_CONTROL] =
+                (source_factor << Pm4::CB_BLEND0_CONTROL_COLOR_SRCBLEND_SHIFT) |
+                (0u << Pm4::CB_BLEND0_CONTROL_COLOR_DESTBLEND_SHIFT) |
+                (1u << Pm4::CB_BLEND0_CONTROL_ENABLE_SHIFT);
+            return resolve_pipeline_state(extract_render_state(st));
+        };
+
+        ResolvedPipelineState both_src = resolve_both(0x0bu);
+        CHECK(both_src.blend_enable && both_src.src_color_blend_factor == 6u &&
+                  both_src.dst_color_blend_factor == 7u,
+              "raw BOTH_SRC_ALPHA overrides ZERO dst with SRC_ALPHA/ONE_MINUS_SRC_ALPHA");
+        std::vector<uint8_t> img_both_src =
+            render_triangle_rgba(vert, quarter_alpha_frag, W, H, &both_src);
+        if (img_both_src.size() == (size_t)W * H * 4) {
+            uint8_t r = img_both_src[center], g = img_both_src[center + 1], b = img_both_src[center + 2];
+            printf("  center (both src)    = (%u,%u,%u)\n", r, g, b);
+            CHECK(r > 40 && r < 90 && g < 16 && b > 165 && b < 215,
+                  "BOTH_SRC_ALPHA: quarter-alpha red over blue -> quarter red, three-quarter blue");
+        } else { CHECK(false, "BOTH_SRC_ALPHA render produced a frame"); }
+
+        ResolvedPipelineState both_inv = resolve_both(0x0cu);
+        CHECK(both_inv.blend_enable && both_inv.src_color_blend_factor == 7u &&
+                  both_inv.dst_color_blend_factor == 6u,
+              "raw BOTH_INV_SRC_ALPHA overrides ZERO dst with inverse paired factors");
+        std::vector<uint8_t> img_both_inv =
+            render_triangle_rgba(vert, quarter_alpha_frag, W, H, &both_inv);
+        if (img_both_inv.size() == (size_t)W * H * 4) {
+            uint8_t r = img_both_inv[center], g = img_both_inv[center + 1], b = img_both_inv[center + 2];
+            printf("  center (both inv)    = (%u,%u,%u)\n", r, g, b);
+            CHECK(r > 165 && r < 215 && g < 16 && b > 40 && b < 90,
+                  "BOTH_INV_SRC_ALPHA: quarter-alpha red over blue -> three-quarter red, quarter blue");
+        } else { CHECK(false, "BOTH_INV_SRC_ALPHA render produced a frame"); }
+    }
+
     // Logic op honored: AMD ROP3 XOR (0x66) combines the red fragment with the blue destination,
     // producing magenta. The operation is decoded from real CB_COLOR_CONTROL state and reaches the
     // VkPipelineColorBlendStateCreateInfo, proving the full register-to-pixel path.

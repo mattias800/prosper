@@ -177,11 +177,10 @@ uint32_t vk_blend_factor(uint32_t f) {
         case 0x14: return 13;  // OneMinusConstAlpha-> ONE_MINUS_CONSTANT_ALPHA
         default: break;
     }
-    // BOTH_SRC_ALPHA/BOTH_INV_SRC_ALPHA (0x0b/0x0c) program the paired source and destination
-    // factors on RDNA2 and have no single VkBlendFactor equivalent. Keep the established ZERO
-    // fallback until the pipeline grows a dual-output path, but never make that mis-render silent.
-    // Log arbitrary unknown values through the same path so corrupt register state is diagnosable
-    // without flooding this per-draw translation.
+    // BOTH_SRC_ALPHA/BOTH_INV_SRC_ALPHA (0x0b/0x0c) are paired source-state shorthands and have no
+    // single VkBlendFactor equivalent. vk_blend_factors handles their valid source-field use. Keep
+    // direct calls (including invalid destination-field use) fail-visible, along with arbitrary
+    // unknown values, without flooding this per-draw translation.
     static std::set<uint32_t> logged;
     static std::mutex logged_mu;
     {
@@ -191,6 +190,25 @@ uint32_t vk_blend_factor(uint32_t f) {
                             "-> VK_BLEND_FACTOR_ZERO\n", f);
     }
     return 0;
+}
+
+void vk_blend_factors(uint32_t rdna2_src_factor, uint32_t rdna2_dst_factor,
+                      uint32_t& vk_src_factor, uint32_t& vk_dst_factor) {
+    // AMD documents 0x0b/0x0c as the obsolete Direct3D "both" modes. They are source-state-only
+    // shorthands which override the destination selection; they are unrelated to the distinct
+    // SRC1_* dual-source factors at 0x0f..0x12.
+    if (rdna2_src_factor == 0x0bu) {         // BOTH_SRC_ALPHA
+        vk_src_factor = 6u;                  // VK_BLEND_FACTOR_SRC_ALPHA
+        vk_dst_factor = 7u;                  // VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+        return;
+    }
+    if (rdna2_src_factor == 0x0cu) {         // BOTH_INV_SRC_ALPHA
+        vk_src_factor = 7u;                  // VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+        vk_dst_factor = 6u;                  // VK_BLEND_FACTOR_SRC_ALPHA
+        return;
+    }
+    vk_src_factor = vk_blend_factor(rdna2_src_factor);
+    vk_dst_factor = vk_blend_factor(rdna2_dst_factor);
 }
 
 uint32_t vk_blend_op(uint32_t comb_fcn) {
