@@ -58,13 +58,14 @@ public:
 
     void output(int port, const void* pcm, int frames) override {
         if (port < 1 || port > kMaxPorts) return;
-        SDL_AudioStream* stream; int frame_bytes; int freq;
-        std::chrono::steady_clock::time_point target;
+        int freq = 0;
+        std::chrono::steady_clock::time_point target{};
         {
             std::lock_guard<std::mutex> lk(mx_);
             Slot& s = slots_[port - 1];
-            stream = s.stream; frame_bytes = s.frame_bytes; freq = s.freq;
-            if (stream && freq > 0) {
+            if (!s.stream) return;
+            freq = s.freq;
+            if (freq > 0) {
                 // Pace EACH call one grain of wall-clock time apart (real sceAudioOutOutput blocks
                 // until the hardware ring frees one grain — evenly spaced, never bursty). The old
                 // cap-based pacing let the guest burst a whole device quantum (4+ grains) and then
@@ -78,9 +79,13 @@ public:
                 s.next += dur;
                 target = s.next;
             }
+            // Keep the stream protected until SDL has consumed this call. sceAudioOutOutput and
+            // sceAudioOutClose may run on different guest audio threads; copying s.stream out of
+            // the lock let close()/open()/quit() destroy it immediately before this call (#855).
+            // The pacing sleep remains outside the lock, so lifecycle calls wait only for SDL's
+            // synchronous queue copy rather than for an entire audio grain.
+            SDL_PutAudioStreamData(s.stream, pcm, frames * s.frame_bytes);
         }
-        if (!stream) return;
-        SDL_PutAudioStreamData(stream, pcm, frames * frame_bytes);
         if (freq > 0) std::this_thread::sleep_until(target);
     }
 

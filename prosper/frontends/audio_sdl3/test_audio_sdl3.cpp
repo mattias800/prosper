@@ -5,9 +5,11 @@
 #include "../../src/hle/dispatch.hpp"
 #include "../../src/hle/nid.hpp"
 #include "../../src/hle/audio.hpp"
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 #include <vector>
 
 using namespace prosper;
@@ -50,6 +52,36 @@ int main() {
         int vols[2] = { 20000, 20000 };
         CHECK(call("sceAudioOutSetVolume", (uint64_t)h, 0x3, PTR(vols)) == 0);
         CHECK(call("sceAudioOutClose", (uint64_t)h) == 0);
+
+        // Output and lifecycle calls can arrive from different guest audio threads. Exercise the
+        // exact #855 boundary repeatedly: close/reopen must not destroy an SDL_AudioStream while
+        // output() is queueing into it. Completion without a host fault is the lifetime contract;
+        // every dummy-device reopen must also succeed.
+        AudioPortInfo race_info;
+        race_info.grain = 1;
+        AudioSink* sink = audio_sink();
+        CHECK(sink->open(1, race_info));
+        std::atomic<bool> start{false};
+        std::atomic<int> outputs{0};
+        int16_t race_pcm[2] = {123, -123};
+        std::thread output_thread([&] {
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            for (int i = 0; i < 100; ++i) {
+                sink->output(1, race_pcm, 1);
+                outputs.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+        start.store(true, std::memory_order_release);
+        while (outputs.load(std::memory_order_acquire) == 0) std::this_thread::yield();
+        bool all_reopens_succeeded = true;
+        for (int i = 0; i < 50; ++i) {
+            sink->close(1);
+            all_reopens_succeeded &= sink->open(1, race_info);
+        }
+        output_thread.join();
+        CHECK(all_reopens_succeeded);
+        CHECK(outputs.load(std::memory_order_relaxed) == 100);
+        sink->close(1);
 
         shutdown_sdl3_audio_sink();
         CHECK(audio_sink() != nullptr);   // default silent sink restored
