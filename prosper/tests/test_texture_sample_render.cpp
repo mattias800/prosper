@@ -151,13 +151,40 @@ int main() {
         const auto first_stats = prosper::test::backend_texture_upload_stats();
         std::vector<uint8_t> reused = prosper::test::render_draws_rgba({draw}, W, H);
         const auto reused_stats = prosper::test::backend_texture_upload_stats();
+        const auto first_binding_stats = prosper::test::backend_resource_reuse_stats();
+        std::vector<uint8_t> reused_again = prosper::test::render_draws_rgba({draw}, W, H);
+        const auto reused_binding_stats = prosper::test::backend_resource_reuse_stats();
         CHECK(first_stats.persistent_misses == 1 && first_stats.unique_uploads == 1,
               "first exact-validated texture version is uploaded into the persistent cache");
         CHECK(reused_stats.persistent_hits == 1 && reused_stats.unique_uploads == 0 &&
-                  reused_stats.upload_bytes == 0,
+                   reused_stats.upload_bytes == 0,
               "same exact-validated texture version skips its next callback upload");
-        CHECK(!first.empty() && first == reused,
+        CHECK(first_binding_stats.persistent_texture_binding_misses == 1 &&
+                  first_binding_stats.persistent_texture_binding_hits == 0,
+              "first persistent-image reuse retains its exact image-view/sampler binding");
+        CHECK(reused_binding_stats.persistent_texture_binding_hits == 1 &&
+                  reused_binding_stats.persistent_texture_binding_misses == 0 &&
+                  reused_binding_stats.persistent_texture_binding_entries == 1,
+              "next callback reuses the retained exact texture binding");
+        CHECK(!first.empty() && first == reused && reused == reused_again,
               "persistent texture reuse renders byte-identically to its initial upload");
+
+        // Bound sampler/view contracts per persistent texture. Each call uses one distinct, valid
+        // single-mip LOD-bias contract; the 33rd retained contract evicts an idle older one without
+        // touching the binding used by the current call.
+        prosper::test::BackendResourceReuseStats bounded_binding_stats;
+        for (uint32_t i = 1; i <= 32; ++i) {
+            resource.lod_bias = static_cast<float>(i) / 64.0f;
+            draw.R = {resource};
+            std::vector<uint8_t> bounded = prosper::test::render_draws_rgba({draw}, W, H);
+            CHECK(!bounded.empty(), "bounded persistent texture binding renders");
+            bounded_binding_stats = prosper::test::backend_resource_reuse_stats();
+        }
+        CHECK(bounded_binding_stats.persistent_texture_binding_evictions == 1 &&
+                  bounded_binding_stats.persistent_texture_binding_entries == 32,
+              "persistent texture bindings evict an idle contract at the per-texture bound");
+        resource.lod_bias = 0.0f;
+        draw.R = {resource};
 
 #ifdef _WIN32
         _putenv_s("PROSPER_NO_BACKEND_PERSISTENT_TEXTURES", "1");

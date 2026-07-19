@@ -289,8 +289,10 @@ readability checks without copying large texture sources before comparing them. 
 
 The Vulkan backend may retain an optimal sampled image only when that exact frontend validation
 supplies a nonzero content-version ID. Cache hits skip image allocation, staging allocation, pixel
-copy, transfer commands, and upload barriers; per-draw views, swizzles, and samplers remain callback
-local. The cache is bounded to 256 MiB and 1024 allocations by default. Set
+copy, transfer commands, and upload barriers. Exact image-view and sampler contracts over a retained
+image remain resident with that image, under a 32-contract per-image bound; set
+`PROSPER_NO_BACKEND_PERSISTENT_TEXTURE_BINDINGS=1` to retain images while restoring callback-local
+bindings for an A/B. The image cache is bounded to 1 GiB and 1024 allocations by default. Set
 `PROSPER_BACKEND_TEXTURE_CACHE_MB=<MiB>` to change the byte budget or
 `PROSPER_NO_BACKEND_PERSISTENT_TEXTURES=1` for a forced-upload A/B. Backend timing reports
 `persistent=hits/misses` and the current cache bytes. The frontend decoded-pixel budget and backend
