@@ -186,6 +186,10 @@ namespace {
         case ERROR_ACCESS_DENIED:
         case ERROR_SHARING_VIOLATION:
             return EACCES;
+        case ERROR_INVALID_HANDLE:
+            return EBADF;
+        case ERROR_INVALID_PARAMETER:
+            return EINVAL;
         case ERROR_NOT_ENOUGH_MEMORY:
         case ERROR_OUTOFMEMORY:
             return ENOMEM;
@@ -252,6 +256,62 @@ namespace {
         if (it == g_windows_dirs.end()) return false;
         if (path) *path = it->second.path;
         return true;
+    }
+
+    int windows_set_guest_mode(HANDLE file, uint64_t mode) {
+        FILE_BASIC_INFO info{};
+        if (!GetFileInformationByHandleEx(file, FileBasicInfo, &info, sizeof info)) {
+            errno = windows_directory_errno(GetLastError());
+            return -1;
+        }
+        // Win32 has one meaningful permission bit: FILE_ATTRIBUTE_READONLY. Treat any guest
+        // owner/group/other write bit as writable and preserve every unrelated file attribute.
+        if (mode & 0222) info.FileAttributes &= ~FILE_ATTRIBUTE_READONLY;
+        else info.FileAttributes |= FILE_ATTRIBUTE_READONLY;
+        if (!SetFileInformationByHandle(file, FileBasicInfo, &info, sizeof info)) {
+            errno = windows_directory_errno(GetLastError());
+            return -1;
+        }
+        return 0;
+    }
+
+    int windows_chmod_path(const std::string& path, uint64_t mode) {
+        HANDLE file = CreateFileA(path.c_str(), FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            errno = windows_directory_errno(GetLastError());
+            return -1;
+        }
+        const int result = windows_set_guest_mode(file, mode);
+        const int error = result < 0 ? errno : 0;
+        CloseHandle(file);
+        if (result < 0) errno = error;
+        return result;
+    }
+
+    int windows_fchmod(int fd, uint64_t mode) {
+        std::string directory_path;
+        if (windows_directory_path(fd, &directory_path))
+            return windows_chmod_path(directory_path, mode);
+
+        ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
+        const intptr_t raw = ::_get_osfhandle(fd);
+        if (raw == -1) {
+            errno = EBADF;
+            return -1;
+        }
+        HANDLE file = ReOpenFile((HANDLE)raw, FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0);
+        if (file == INVALID_HANDLE_VALUE) {
+            errno = windows_directory_errno(GetLastError());
+            return -1;
+        }
+        const int result = windows_set_guest_mode(file, mode);
+        const int error = result < 0 ? errno : 0;
+        CloseHandle(file);
+        if (result < 0) errno = error;
+        return result;
     }
 
     bool windows_seek_directory(int fd, int64_t offset, int whence, int64_t* result) {
@@ -1364,6 +1424,10 @@ HLE(f_fstat) { struct stat st; int r = ::fstat((int)a0, &st); int err = r < 0 ? 
 // uninitialized garbage (wrong file type/size). We have no symlinks in the dump, so ::lstat == ::stat, but
 // the key fix is WRITING the buffer. fsync: was fake-success; flush for real save durability.
 HLE(f_lstat) { std::string h = translate(CS(a0)); struct stat st; int r = ::lstat(h.c_str(), &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
+HLE(f_chmod) { if (!a0) { errno = EFAULT; return (uint64_t)(int64_t)-1; }
+               std::string h = translate(CS(a0));
+               return (uint64_t)(int64_t)::chmod(h.c_str(), (mode_t)a1); }
+HLE(f_fchmod){ return (uint64_t)(int64_t)::fchmod((int)a0, (mode_t)a1); }
 HLE(f_fsync) { return (uint64_t)(int64_t)::fsync((int)a0); }
 HLE(f_fdatasync) {
 #if defined(__APPLE__)
@@ -1393,6 +1457,10 @@ HLE(f_fstat) { struct _stat64 st; std::string directory_path;
                if (r < 0) errno = err;
                return (uint64_t)(int64_t)r; }
 HLE(f_lstat) { return f_stat(a0,a1,a2,a3,a4,a5); }
+HLE(f_chmod) { if (!a0) { errno = EFAULT; return (uint64_t)(int64_t)-1; }
+               std::string h = translate(CS(a0));
+               return (uint64_t)(int64_t)windows_chmod_path(h, a1); }
+HLE(f_fchmod){ return (uint64_t)(int64_t)windows_fchmod((int)a0, a1); }
 HLE(f_fsync) { ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
                return (uint64_t)(int64_t)::_commit((int)a0); }
 // The Windows CRT has no data-only durability primitive. _commit is the same stronger fallback
@@ -1416,6 +1484,8 @@ static uint64_t kernel_file_result32(uint64_t result, int error) {
 HLE(k_stat)     { uint64_t r = f_stat(a0, a1, a2, a3, a4, a5);     int e = errno; return kernel_file_result32(r, e); }
 HLE(k_fstat)    { uint64_t r = f_fstat(a0, a1, a2, a3, a4, a5);    int e = errno; return kernel_file_result32(r, e); }
 HLE(k_lstat)    { uint64_t r = f_lstat(a0, a1, a2, a3, a4, a5);    int e = errno; return kernel_file_result32(r, e); }
+HLE(k_chmod)    { uint64_t r = f_chmod(a0, a1, a2, a3, a4, a5);    int e = errno; return kernel_file_result32(r, e); }
+HLE(k_fchmod)   { uint64_t r = f_fchmod(a0, a1, a2, a3, a4, a5);   int e = errno; return kernel_file_result32(r, e); }
 HLE(k_truncate) { uint64_t r = f_truncate(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
 HLE(k_ftruncate){ uint64_t r = f_ftruncate(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
 HLE(k_fsync)    { uint64_t r = f_fsync(a0, a1, a2, a3, a4, a5);    int e = errno; return kernel_file_result32(r, e); }
@@ -2227,6 +2297,7 @@ void register_file_hle() {
     R("fgetc", f_fgetc);   R("getc", f_fgetc);
     R("open", f_open);     R("close", f_close);   R("read", f_read);     R("write", f_write);
     R("lseek", f_lseek);   R("stat", f_stat);     R("fstat", f_fstat);   R("access", f_access);
+    R("chmod", f_chmod);   R("fchmod", f_fchmod);
     R("sceKernelOpen", k_open);  R("sceKernelClose", k_close); R("sceKernelRead", k_read);
     R("sceKernelWrite", k_write); R("sceKernelLseek", k_lseek); R("sceKernelStat", k_stat);
     R("sceKernelFtruncate", k_ftruncate);   // real resize (was fake-success -> corrupt saves)
@@ -2236,6 +2307,7 @@ void register_file_hle() {
     R("sceKernelSync", k_sync); // whole-filesystem/process-file flush (was fake success)
     R("sceKernelCheckReachability", k_check_reachability); // truthful file/directory existence
     R("sceKernelUtimes", k_utimes); // preserve guest access/modify timestamps (incl. touch-now)
+    R("sceKernelChmod", k_chmod); R("sceKernelFchmod", k_fchmod); // real guest mode changes
     R("sceKernelTruncate", k_truncate);      // path-based sibling (same corruption class)
     R("sceKernelFstat", k_fstat);
     // Low-level POSIX wrappers with the internal leading-underscore names. Real libc.prx implements

@@ -107,6 +107,10 @@ int main() {
     HleFn kernel_sync_fn = Hle::lookup(nid_hash("sceKernelSync"));
     HleFn kernel_reachability_fn = Hle::lookup(nid_hash("sceKernelCheckReachability"));
     HleFn kernel_utimes_fn = Hle::lookup(nid_hash("sceKernelUtimes"));
+    HleFn chmod_fn = Hle::lookup(nid_hash("chmod"));
+    HleFn kernel_chmod_fn = Hle::lookup(nid_hash("sceKernelChmod"));
+    HleFn fchmod_fn = Hle::lookup(nid_hash("fchmod"));
+    HleFn kernel_fchmod_fn = Hle::lookup(nid_hash("sceKernelFchmod"));
     HleFn getdents_fn = Hle::lookup(nid_hash("getdents"));
     HleFn kernel_getdents_fn = Hle::lookup(nid_hash("sceKernelGetdents"));
     HleFn getdirentries_fn = Hle::lookup(nid_hash("getdirentries"));
@@ -128,7 +132,8 @@ int main() {
               kernel_rmdir_fn && unlink_fn && kernel_unlink_fn && rename_fn &&
               kernel_rename_fn && kernel_truncate_fn && kernel_ftruncate_fn && fsync_fn &&
               kernel_fsync_fn && fdatasync_fn && kernel_fdatasync_fn && kernel_sync_fn &&
-              kernel_reachability_fn && kernel_utimes_fn && getdents_fn &&
+              kernel_reachability_fn && kernel_utimes_fn && chmod_fn && kernel_chmod_fn &&
+              fchmod_fn && kernel_fchmod_fn && getdents_fn &&
               kernel_getdents_fn && getdirentries_fn && kernel_getdirentries_fn && stat_fn &&
               kernel_stat_fn && fstat_fn && kernel_fstat_fn && lstat_fn && kernel_lstat_fn &&
               fcntl_fn && kernel_fcntl_fn,
@@ -167,6 +172,63 @@ int main() {
     CHECK(kernel_reachability_fn &&
               kernel_reachability_fn((uint64_t)(uintptr_t)reachable_directory.c_str(), 0, 0, 0, 0, 0) == 0,
           "sceKernelCheckReachability finds a translated guest directory");
+    CHECK(kernel_chmod_fn &&
+              kernel_chmod_fn((uint64_t)(uintptr_t)reachable_file.c_str(), 0444, 0, 0, 0, 0) == 0,
+          "sceKernelChmod makes a translated guest file read-only");
+    CHECK(kernel_chmod_fn &&
+              kernel_chmod_fn((uint64_t)(uintptr_t)reachable_directory.c_str(), 0555, 0, 0, 0, 0) == 0,
+          "sceKernelChmod applies a mode to a translated guest directory");
+#ifdef _WIN32
+    CHECK((GetFileAttributesA(path) & FILE_ATTRIBUTE_READONLY) != 0,
+          "Windows sceKernelChmod maps a non-writable mode to the read-only attribute");
+#endif
+    CHECK(kernel_chmod_fn &&
+              kernel_chmod_fn((uint64_t)(uintptr_t)reachable_file.c_str(), 0644, 0, 0, 0, 0) == 0 &&
+              kernel_chmod_fn((uint64_t)(uintptr_t)reachable_directory.c_str(), 0755, 0, 0, 0, 0) == 0,
+          "sceKernelChmod restores writable fixture modes");
+    int64_t chmod_fd = open_fn
+        ? (int64_t)open_fn((uint64_t)(uintptr_t)reachable_file.c_str(), 0, 0, 0, 0, 0)
+        : -1;
+    CHECK(chmod_fd >= 3, "open a descriptor for sceKernelFchmod");
+    CHECK(chmod_fd >= 0 && kernel_fchmod_fn &&
+              kernel_fchmod_fn((uint64_t)chmod_fd, 0400, 0, 0, 0, 0) == 0,
+          "sceKernelFchmod makes an open file read-only");
+#ifdef _WIN32
+    CHECK((GetFileAttributesA(path) & FILE_ATTRIBUTE_READONLY) != 0,
+          "Windows sceKernelFchmod updates the descriptor's file attribute");
+#endif
+    CHECK(chmod_fd >= 0 && kernel_fchmod_fn &&
+              kernel_fchmod_fn((uint64_t)chmod_fd, 0600, 0, 0, 0, 0) == 0,
+          "sceKernelFchmod restores a writable descriptor mode");
+#ifdef _WIN32
+    CHECK((GetFileAttributesA(path) & FILE_ATTRIBUTE_READONLY) == 0,
+          "Windows sceKernelFchmod clears read-only for a writable guest mode");
+#endif
+    if (chmod_fd >= 0 && close_fn) close_fn((uint64_t)chmod_fd, 0, 0, 0, 0, 0);
+#ifndef _WIN32
+    // WSL's /mnt/c metadata bridge reports synthetic permission bits. Verify exact POSIX chmod
+    // behavior on a unique native-filesystem fixture while retaining /app0 translation above.
+    std::string mode_path =
+        (std::filesystem::temp_directory_path() / "prosper-test-chmod-mode-XXXXXX").string();
+    const int mode_fd = ::mkstemp(mode_path.data());
+    CHECK(mode_fd >= 0, "create unique native-filesystem mode fixture");
+    std::array<uint8_t, 0x78> mode_stat{};
+    CHECK(mode_fd >= 0 && kernel_chmod_fn && kernel_stat_fn &&
+              kernel_chmod_fn((uint64_t)(uintptr_t)mode_path.c_str(), 0444, 0, 0, 0, 0) == 0 &&
+              kernel_stat_fn((uint64_t)(uintptr_t)mode_path.c_str(),
+                             (uint64_t)(uintptr_t)mode_stat.data(), 0, 0, 0, 0) == 0 &&
+              (*(const uint16_t*)(mode_stat.data() + 0x08) & 0777) == 0444,
+          "POSIX sceKernelChmod preserves requested permission bits");
+    mode_stat.fill(0);
+    CHECK(mode_fd >= 0 && kernel_fchmod_fn && kernel_fstat_fn &&
+              kernel_fchmod_fn((uint64_t)mode_fd, 0600, 0, 0, 0, 0) == 0 &&
+              kernel_fstat_fn((uint64_t)mode_fd, (uint64_t)(uintptr_t)mode_stat.data(),
+                              0, 0, 0, 0) == 0 &&
+              (*(const uint16_t*)(mode_stat.data() + 0x08) & 0777) == 0600,
+          "POSIX sceKernelFchmod preserves descriptor permission bits");
+    if (mode_fd >= 0) ::close(mode_fd);
+    std::filesystem::remove(mode_path, remove_error);
+#endif
     GuestTimeval explicit_times[2]{{1700000001, 123456}, {1700000002, 654321}};
     CHECK(kernel_utimes_fn &&
               kernel_utimes_fn((uint64_t)(uintptr_t)reachable_file.c_str(),
@@ -424,6 +486,29 @@ int main() {
           "sceKernelUtimes returns SCE_KERNEL_ERROR_ENOENT for a missing path");
     CHECK(kernel_utimes_fn && kernel_utimes_fn(0, 0, 0, 0, 0, 0) == 0x8002000eu,
           "sceKernelUtimes returns SCE_KERNEL_ERROR_EFAULT for a null path");
+    errno = 0;
+    int64_t missing_chmod = chmod_fn
+        ? (int64_t)chmod_fn((uint64_t)(uintptr_t)unreachable_file.c_str(), 0600, 0, 0, 0, 0)
+        : 0;
+    int missing_chmod_errno = errno;
+    CHECK(missing_chmod == -1 && missing_chmod_errno == ENOENT,
+          "libc chmod retains -1 plus ENOENT");
+    CHECK(kernel_chmod_fn &&
+              kernel_chmod_fn((uint64_t)(uintptr_t)unreachable_file.c_str(),
+                              0600, 0, 0, 0, 0) == 0x80020002u,
+          "sceKernelChmod returns SCE_KERNEL_ERROR_ENOENT for a missing path");
+    CHECK(kernel_chmod_fn && kernel_chmod_fn(0, 0600, 0, 0, 0, 0) == 0x8002000eu,
+          "sceKernelChmod returns SCE_KERNEL_ERROR_EFAULT for a null path");
+    errno = 0;
+    int64_t invalid_fchmod = fchmod_fn
+        ? (int64_t)fchmod_fn(~uint64_t{0}, 0600, 0, 0, 0, 0)
+        : 0;
+    int invalid_fchmod_errno = errno;
+    CHECK(invalid_fchmod == -1 && invalid_fchmod_errno == EBADF,
+          "libc fchmod retains -1 plus EBADF");
+    CHECK(kernel_fchmod_fn &&
+              kernel_fchmod_fn(~uint64_t{0}, 0600, 0, 0, 0, 0) == 0x80020009u,
+          "sceKernelFchmod returns SCE_KERNEL_ERROR_EBADF for an invalid descriptor");
 
     // The stat-family libc names preserve -1 plus errno, while their kernel siblings return
     // a 32-bit SCE error directly. Neither contract may overwrite the guest buffer on failure.
