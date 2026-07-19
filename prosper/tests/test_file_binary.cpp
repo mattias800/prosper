@@ -96,6 +96,7 @@ int main() {
     HleFn kernel_fsync_fn = Hle::lookup(nid_hash("sceKernelFsync"));
     HleFn fdatasync_fn = Hle::lookup(nid_hash("fdatasync"));
     HleFn kernel_fdatasync_fn = Hle::lookup(nid_hash("sceKernelFdatasync"));
+    HleFn kernel_sync_fn = Hle::lookup(nid_hash("sceKernelSync"));
     HleFn getdents_fn = Hle::lookup(nid_hash("getdents"));
     HleFn kernel_getdents_fn = Hle::lookup(nid_hash("sceKernelGetdents"));
     HleFn getdirentries_fn = Hle::lookup(nid_hash("getdirentries"));
@@ -116,11 +117,13 @@ int main() {
               dup2_fn && kernel_dup2_fn && mkdir_fn && kernel_mkdir_fn && rmdir_fn &&
               kernel_rmdir_fn && unlink_fn && kernel_unlink_fn && rename_fn &&
               kernel_rename_fn && kernel_truncate_fn && kernel_ftruncate_fn && fsync_fn &&
-              kernel_fsync_fn && fdatasync_fn && kernel_fdatasync_fn && getdents_fn &&
+              kernel_fsync_fn && fdatasync_fn && kernel_fdatasync_fn && kernel_sync_fn && getdents_fn &&
               kernel_getdents_fn && getdirentries_fn && kernel_getdirentries_fn && stat_fn &&
               kernel_stat_fn && fstat_fn && kernel_fstat_fn && lstat_fn && kernel_lstat_fn &&
               fcntl_fn && kernel_fcntl_fn,
           "file HLE functions registered");
+    CHECK(kernel_sync_fn && kernel_sync_fn(0, 0, 0, 0, 0, 0) == 0,
+          "sceKernelSync performs the host-wide/process-file flush and returns success");
     std::array<uint8_t, 64> dir_buffer{};
 
     // Creating an existing directory is a failure, not an idempotent success. Linux previously
