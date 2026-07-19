@@ -44,7 +44,13 @@ namespace {
     bool memlog() { static int v = getenv("PROSPER_MEMLOG") ? 1 : 0; return v; }
     #define MLOG(...) do { if (memlog()) fprintf(stderr, "[memhle] " __VA_ARGS__); } while (0)
 
-    struct Mapping { uint64_t base, size; int prot; bool committed; char name[32]; };
+    struct Mapping {
+        uint64_t base, size;
+        int prot;                  // normalized host CPU-access mask
+        uint32_t guest_prot;       // exact SCE protection enum/bits returned to the guest
+        bool committed;
+        char name[32];
+    };
     std::mutex g_mx;
     std::vector<Mapping> g_maps;
     // Direct ("physical") memory: a bump allocator over a FINITE pool. The pool size is what
@@ -134,7 +140,8 @@ namespace {
 
     // A successful host map replaces any reservation record under it. Keeping both as overlays
     // lets the older uncommitted record win same-base queries after the real commit.
-    void track(uint64_t base, uint64_t size, int prot, bool committed, const char* nm) {
+    void track(uint64_t base, uint64_t size, int prot, uint32_t guest_prot,
+               bool committed, const char* nm) {
         if (!size || base > UINT64_MAX - size) return;
         const uint64_t end = base + size;
         {
@@ -151,7 +158,7 @@ namespace {
                     Mapping hi = old; hi.base = end; hi.size = old_end - end; out.push_back(hi);
                 }
             }
-            Mapping m{ base, size, prot, committed, {0} };
+            Mapping m{ base, size, prot, guest_prot, committed, {0} };
             if (nm) { strncpy(m.name, nm, sizeof m.name - 1); }
             out.push_back(m);
             g_maps.swap(out);
@@ -182,7 +189,8 @@ namespace {
     // Re-tag [base, base+len) with a new protection (mprotect) without changing whether each
     // covered span is guest-committed. A reservation remains a reservation until a MAP operation
     // commits it; VirtualQuery and the lazy-commit probe rely on that distinction (#343).
-    void retrack_prot(uint64_t base, uint64_t len, int prot, const char* nm) {
+    void retrack_prot(uint64_t base, uint64_t len, int prot, uint32_t guest_prot,
+                      const char* nm) {
         if (!len || base > UINT64_MAX - len) return;
         const uint64_t end = base + len;
         std::vector<Mapping> retagged;
@@ -201,6 +209,7 @@ namespace {
                 const uint64_t changed_end = me > end ? end : me;
                 changed.size = changed_end - changed.base;
                 changed.prot = prot;
+                changed.guest_prot = guest_prot;
                 memset(changed.name, 0, sizeof changed.name);
                 if (nm) strncpy(changed.name, nm, sizeof changed.name - 1);
                 out.push_back(changed);
@@ -212,7 +221,7 @@ namespace {
             // Preserve the prior treatment of a successful protection change over an otherwise
             // untracked host mapping: begin tracking it as committed.
             if (retagged.empty()) {
-                Mapping changed{base, len, prot, true, {0}};
+                Mapping changed{base, len, prot, guest_prot, true, {0}};
                 if (nm) strncpy(changed.name, nm, sizeof changed.name - 1);
                 out.push_back(changed);
                 retagged.push_back(changed);
@@ -477,7 +486,7 @@ HLE(k_reserve_vrange) {
             MLOG("reserve FIXED hint=0x%llx FAILED\n", (unsigned long long)hint); return 0x8002000cull; // ENOMEM
         }
         if (a0) *(uint64_t*)a0 = (uint64_t)p;
-        track((uint64_t)p, a1, 0, false, "reserved");
+        track((uint64_t)p, a1, 0, 0, false, "reserved");
         MLOG("reserve(fixed) -> 0x%llx len=0x%llx align=0x%llx\n", (unsigned long long)p, (unsigned long long)a1, (unsigned long long)align);
         return 0;
     }
@@ -492,7 +501,7 @@ HLE(k_reserve_vrange) {
             void* p = prosper_mmap_noreplace((void*)cand, a1, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (p != MAP_FAILED) {
                 if (a0) *(uint64_t*)a0 = (uint64_t)p;
-                track((uint64_t)p, a1, 0, false, "reserved");
+                track((uint64_t)p, a1, 0, 0, false, "reserved");
                 MLOG("reserve(search from 0x%llx) -> 0x%llx len=0x%llx align=0x%llx\n",
                      (unsigned long long)hint, (unsigned long long)p,
                      (unsigned long long)a1, (unsigned long long)align);
@@ -514,7 +523,7 @@ HLE(k_reserve_vrange) {
     if (!raw) { MLOG("reserve len=0x%llx FAILED\n", (unsigned long long)a1); return 0x8002000cull; } // ENOMEM
     uint64_t base = (uint64_t)raw;
     if (a0) *(uint64_t*)a0 = base;
-    track(base, a1, 0, false, "reserved");
+    track(base, a1, 0, 0, false, "reserved");
     MLOG("reserve -> 0x%llx len=0x%llx align=0x%llx (raw 0x%llx)\n",
          (unsigned long long)base, (unsigned long long)a1, (unsigned long long)align, (unsigned long long)raw);
     return 0;
@@ -530,7 +539,8 @@ HLE(k_map_flexible) {
         p = map_guest_from(hint, a1, host_prot(a2), 0x4000);
     if (!p) { MLOG("mapflexible hint=0x%llx len=0x%llx FAILED\n", (unsigned long long)hint, (unsigned long long)a1); return 0x8002000cull; } // ENOMEM
     if (a0) *(uint64_t*)a0 = (uint64_t)p;
-    track((uint64_t)p, a1, host_prot(a2), true, a4 ? (const char*)a4 : "flexible");
+    track((uint64_t)p, a1, host_prot(a2), static_cast<uint32_t>(a2), true,
+          a4 ? (const char*)a4 : "flexible");
     MLOG("mapflexible -> 0x%llx len=0x%llx prot=0x%llx name=%s\n",
          (unsigned long long)p, (unsigned long long)a1, (unsigned long long)a2, a4 ? (const char*)a4 : "");
     return 0;
@@ -621,7 +631,7 @@ HLE(k_map_dmem) {
                    (unsigned long long)a3, (unsigned long long)a4,
                    (unsigned long long)a5); return 0x8002000cull; } // ENOMEM
     if (a0) *(uint64_t*)a0 = (uint64_t)p;
-    track((uint64_t)p, a1, host_prot(a2), true, "direct");
+    track((uint64_t)p, a1, host_prot(a2), static_cast<uint32_t>(a2), true, "direct");
     MLOG("map_dmem -> 0x%llx len=0x%llx phys=0x%llx prot=0x%llx flags=0x%llx align=0x%llx\n",
          (unsigned long long)p, (unsigned long long)a1, (unsigned long long)a4,
          (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)a5);
@@ -643,7 +653,10 @@ HLE(k_virtual_query) {
         // (prot 0). Lying prot=RW for the whole 512GB reservation made UE4's allocator skip its
         // BatchMap commit for pages VirtualQuery claimed were already writable -> first-touch crash.
         start = m->base; end = m->base + m->size;
-        prot = m->committed ? 0x3 : 0x0; flags = m->committed ? 0x10 : 0x0; how = "tracked";
+        // Keep Sony's exact protection value: CPU_RW is enum 0x02 (not host R|W 0x03), and
+        // GPU-only bits have no host-page-protection equivalent but remain guest-visible state.
+        prot = m->committed ? static_cast<int>(m->guest_prot) : 0x0;
+        flags = m->committed ? 0x10 : 0x0; how = "tracked";
     } else {                                   // unmapped: report the whole hole to the next mapping
         uint64_t nb = next_base(a0);
         if (!nb) { MLOG("virtual_query(0x%llx) -> end-of-space (EACCES)\n", (unsigned long long)a0); return 0x8002000e; }
@@ -766,7 +779,7 @@ HLE(k_mprotect) {
     if (!a0) return 0x80020016ull;
     const int prot = host_prot(a2);
     if (mprotect((void*)a0, a1, prot) != 0) return sce_mprotect_error(errno);
-    retrack_prot(a0, a1, prot, "mprotect");
+    retrack_prot(a0, a1, prot, static_cast<uint32_t>(a2), "mprotect");
     return 0;
 }
 
@@ -783,7 +796,7 @@ HLE7(k_map_dmem2) {
 // under the wrong protection faults (write to a still-RO page / exec of a still-NX page) -- the same class
 // as the batch-map TYPE_PROTECT op. We don't track memoryType yet, so apply the protection (the load-
 // bearing half). NOTE prot is arg a3 here, not a2.
-HLE(k_mtypeprotect) { if (a0) { mprotect((void*)a0, a1, host_prot(a3)); retrack_prot(a0, a1, host_prot(a3), "mtypeprotect"); } return 0; }
+HLE(k_mtypeprotect) { if (a0) { mprotect((void*)a0, a1, host_prot(a3)); retrack_prot(a0, a1, host_prot(a3), static_cast<uint32_t>(a3), "mtypeprotect"); } return 0; }
 HLE(k_dmem_size){ return kDmemTotal; }   // sparse-backed; allocation failures enforce this bound
 // sceKernelAvailableDirectMemorySize(searchStart, searchEnd, alignment, off_t* physAddrOut,
 // size_t* sizeOut) — report the LARGEST free aligned direct-memory block in [searchStart, searchEnd).
@@ -1104,7 +1117,7 @@ HLE(k_ampr_push_map) {
         bool have_phys = dmem_take(a2, 0x10000, 0x0c, phys);
         void* p = have_phys ? map_phys_at(a1, a2, PROT_READ | PROT_WRITE, phys)
                             : map_at(a1, a2, PROT_READ | PROT_WRITE);
-        if (p) track((uint64_t)p, a2, PROT_READ | PROT_WRITE, true, "ampr-map");
+        if (p) track((uint64_t)p, a2, PROT_READ | PROT_WRITE, 0x2, true, "ampr-map");
         if (p && have_phys && a1 > 0x540000000ull + 0x1000000000ull) {
             uint64_t mirror = a1 - 0x540000000ull;
             // issue #107: the mirror is a LOW-confidence heuristic (the 0x540000000 rule was pinned
@@ -1130,7 +1143,7 @@ HLE(k_ampr_push_map) {
                      (unsigned long long)a1, (unsigned long long)mirror);
             } else {
                 q = map_phys_at(mirror, a2, PROT_READ | PROT_WRITE, phys);
-                if (q) track((uint64_t)q, a2, PROT_READ | PROT_WRITE, true, "ampr-mirror");
+                if (q) track((uint64_t)q, a2, PROT_READ | PROT_WRITE, 0x2, true, "ampr-mirror");
             }
             MLOG("ampr push-map va=0x%llx len=0x%llx phys=0x%llx mirror=0x%llx -> %s/%s\n",
                  (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)phys,
@@ -1196,19 +1209,19 @@ HLE(k_batch_map) {
             case 0: {                               // MAP_DIRECT: phys-backed (aliasing preserved)
                 void* p = map_phys_at(start, len, host_prot(prot), phys);
                 ok = (p != nullptr);
-                if (ok) track((uint64_t)p, len, host_prot(prot), true, "batch-direct");
+                if (ok) track((uint64_t)p, len, host_prot(prot), prot, true, "batch-direct");
                 break;
             }
             case 3: {                               // MAP_FLEXIBLE: anonymous
                 void* p = map_at(start, len, host_prot(prot));
                 ok = (p != nullptr);
-                if (ok) track((uint64_t)p, len, host_prot(prot), true, "batch-flex");
+                if (ok) track((uint64_t)p, len, host_prot(prot), prot, true, "batch-flex");
                 break;
             }
             case 1: if (start) { munmap((void*)(uintptr_t)start, len); untrack(start, len); } break;  // UNMAP
             case 2: case 4:                                                              // PROTECT / TYPE_PROTECT
                 if (start) { mprotect((void*)(uintptr_t)start, len, host_prot(prot));
-                             retrack_prot(start, len, host_prot(prot), "batch-prot"); } break;
+                             retrack_prot(start, len, host_prot(prot), prot, "batch-prot"); } break;
             default: ok = false; ret = 0x80020016ull; break;
         }
         if (!ok) { if (!ret) ret = 0x8002000Cull; break; }   // ENOMEM on a failed map
@@ -1336,7 +1349,13 @@ namespace {
     #define MLOG(...) do { if (memlog()) fprintf(stderr, "[memhle] " __VA_ARGS__); } while (0)
 
     // --- VA tracker + direct-memory pool: PURE logic, copied verbatim from the Linux path -----
-    struct Mapping { uint64_t base, size; int prot; bool committed; char name[32]; };
+    struct Mapping {
+        uint64_t base, size;
+        int prot;                  // normalized host CPU mask
+        uint32_t guest_prot;       // exact SCE protection enum/bits returned to the guest
+        bool committed;
+        char name[32];
+    };
     std::mutex g_mx;
     std::vector<Mapping> g_maps;
     bool sparse_dmem_view_overlaps(uint64_t begin, uint64_t end);
@@ -1400,8 +1419,8 @@ namespace {
         g_dmem.swap(out);
     }
     // Keep tracking non-overlapping when a commit replaces part of an existing reservation.
-    void track(uint64_t base, uint64_t size, int prot, bool committed, const char* nm,
-               bool host_readable = true) {
+    void track(uint64_t base, uint64_t size, int prot, uint32_t guest_prot,
+               bool committed, const char* nm, bool host_readable = true) {
         if (!size || base > UINT64_MAX - size) return;
         const uint64_t end = base + size;
         {
@@ -1418,7 +1437,7 @@ namespace {
                     Mapping hi = old; hi.base = end; hi.size = old_end - end; out.push_back(hi);
                 }
             }
-            Mapping m{ base, size, prot, committed, {0} };
+            Mapping m{ base, size, prot, guest_prot, committed, {0} };
             if (nm) { strncpy(m.name, nm, sizeof m.name - 1); }
             out.push_back(m);
             g_maps.swap(out);
@@ -1441,7 +1460,8 @@ namespace {
         g_maps.swap(out);
         host::notify_guest_mapping_removed(base, len);
     }
-    void retrack_prot(uint64_t base, uint64_t len, int prot, const char* nm) {
+    void retrack_prot(uint64_t base, uint64_t len, int prot, uint32_t guest_prot,
+                      const char* nm) {
         if (!len || base > UINT64_MAX - len) return;
         const uint64_t end = base + len;
         std::vector<Mapping> retagged;
@@ -1460,6 +1480,7 @@ namespace {
                 const uint64_t changed_end = me > end ? end : me;
                 changed.size = changed_end - changed.base;
                 changed.prot = prot;
+                changed.guest_prot = guest_prot;
                 memset(changed.name, 0, sizeof changed.name);
                 if (nm) strncpy(changed.name, nm, sizeof changed.name - 1);
                 out.push_back(changed);
@@ -1469,7 +1490,7 @@ namespace {
                 }
             }
             if (retagged.empty()) {
-                Mapping changed{base, len, prot, true, {0}};
+                Mapping changed{base, len, prot, guest_prot, true, {0}};
                 if (nm) strncpy(changed.name, nm, sizeof changed.name - 1);
                 out.push_back(changed);
                 retagged.push_back(changed);
@@ -3235,7 +3256,7 @@ HLE(k_reserve_vrange) {
     if (!p) { MLOG("reserve hint=0x%llx len=0x%llx FAILED\n",
                    (unsigned long long)hint, (unsigned long long)a1); return 0x8002000cull; } // ENOMEM
     if (a0) *(uint64_t*)a0 = (uint64_t)p;
-    track((uint64_t)p, a1, 0, false, "reserved");
+    track((uint64_t)p, a1, 0, 0, false, "reserved");
     MLOG("reserve -> 0x%llx len=0x%llx flags=0x%llx align=0x%llx\n",
          (unsigned long long)p, (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)align);
     return 0;
@@ -3252,7 +3273,8 @@ HLE(k_map_flexible) {
     if (!p) { MLOG("mapflexible hint=0x%llx len=0x%llx FAILED\n",
                    (unsigned long long)hint, (unsigned long long)a1); return 0x8002000cull; }
     if (a0) *(uint64_t*)a0 = (uint64_t)p;
-    track((uint64_t)p, a1, host_prot(a2), true, a4 ? (const char*)a4 : "flexible");
+    track((uint64_t)p, a1, host_prot(a2), static_cast<uint32_t>(a2), true,
+          a4 ? (const char*)a4 : "flexible");
     MLOG("mapflexible -> 0x%llx len=0x%llx prot=0x%llx\n",
          (unsigned long long)p, (unsigned long long)a1, (unsigned long long)a2);
     return 0;
@@ -3323,7 +3345,8 @@ HLE(k_map_dmem) {
                    (unsigned long long)hint, (unsigned long long)a1); return 0x8002000cull; }
     if (a0) *(uint64_t*)a0 = (uint64_t)p;
     const bool sparse = sparse_dmem_view_contains((uint64_t)p, (uint64_t)p + a1);
-    track((uint64_t)p, a1, host_prot(a2), true, "direct", !sparse);
+    track((uint64_t)p, a1, host_prot(a2), static_cast<uint32_t>(a2), true,
+          "direct", !sparse);
     MLOG("map_dmem -> 0x%llx len=0x%llx phys=0x%llx prot=0x%llx flags=0x%llx align=0x%llx\n",
          (unsigned long long)p, (unsigned long long)a1, (unsigned long long)a4,
          (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)a5);
@@ -3356,7 +3379,7 @@ HLE(k_mprotect) {
     const int prot = host_prot(a2);
     DWORD error = ERROR_SUCCESS;
     if (!win_protect(a0, a1, prot, &error)) return sce_win_mprotect_error(error);
-    retrack_prot(a0, a1, prot, "mprotect");
+    retrack_prot(a0, a1, prot, static_cast<uint32_t>(a2), "mprotect");
     return 0;
 }
 HLE(k_mtypeprotect) {
@@ -3364,7 +3387,7 @@ HLE(k_mtypeprotect) {
     const int prot = host_prot(a3);
     DWORD error = ERROR_SUCCESS;
     if (!win_protect(a0, a1, prot, &error)) return sce_win_mprotect_error(error);
-    retrack_prot(a0, a1, prot, "mtypeprotect");
+    retrack_prot(a0, a1, prot, static_cast<uint32_t>(a3), "mtypeprotect");
     return 0;
 }
 HLE(k_dmem_size){ return kDmemTotal; }
@@ -3409,7 +3432,7 @@ HLE(k_batch_map) {
                 if (ok) {
                     const bool sparse = sparse_dmem_view_contains(
                         (uint64_t)p, (uint64_t)p + len);
-                    track((uint64_t)p, len, host_prot(prot), true,
+                    track((uint64_t)p, len, host_prot(prot), prot, true,
                           "batch-direct", !sparse);
                 }
                 break;
@@ -3417,7 +3440,8 @@ HLE(k_batch_map) {
             case 3: {                               // MAP_FLEXIBLE: anonymous/private
                 void* p = win_commit(start, len, host_prot(prot));
                 ok = (p != nullptr);
-                if (ok) track((uint64_t)p, len, host_prot(prot), true, "batch-flex");
+                if (ok) track((uint64_t)p, len, host_prot(prot), prot, true,
+                              "batch-flex");
                 break;
             }
             case 1: {                               // UNMAP
@@ -3430,7 +3454,7 @@ HLE(k_batch_map) {
                     DWORD error = ERROR_SUCCESS;
                     ok = win_protect(start, len, host_prot(prot), &error);
                     if (ok)
-                        retrack_prot(start, len, host_prot(prot), "batch-prot");
+                        retrack_prot(start, len, host_prot(prot), prot, "batch-prot");
                     else
                         ret = sce_win_mprotect_error(error);
                 }
@@ -3456,7 +3480,10 @@ HLE(k_virtual_query) {
     uint64_t start, end; int prot; uint32_t flags;
     if (m) {
         start = m->base; end = m->base + m->size;
-        prot = m->committed ? 0x3 : 0x0; flags = m->committed ? 0x10 : 0x0;
+        // CPU read/write is an SCE enum (RW is 0x2, not host READ|WRITE 0x3), and the GPU bits
+        // have no host-page equivalent. Return the original guest protection value verbatim.
+        prot = m->committed ? static_cast<int>(m->guest_prot) : 0x0;
+        flags = m->committed ? 0x10 : 0x0;
     } else {
         uint64_t nb = next_base(a0);
         if (!nb) return 0x8002000eull;
