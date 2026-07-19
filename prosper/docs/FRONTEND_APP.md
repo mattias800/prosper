@@ -250,12 +250,15 @@ object remains call-local and is destroyed after the existing fence wait, so thi
 freshness assumption. Set `PROSPER_NO_BACKEND_RESOURCE_SHARE=1` to disable the keyed object reuse for an
 A/B; the safe call-wide descriptor-pool consolidation remains enabled in both modes.
 
-Host-visible storage buffers use a separate bounded pool across backend calls. The backend waits for its
-fence before returning a buffer, retains its host-coherent allocation persistently mapped, and rewrites it
-before the next use. Power-of-two capacity classes absorb changing guest buffer sizes, while each Vulkan
-descriptor keeps the exact logical byte range, so pooling does not expose capacity padding to shaders.
-The thread-local pool is capped at 4096 buffers and 256 MiB by default; set
-`PROSPER_BACKEND_BUFFER_POOL_MB=<MiB>` to change the byte budget or
+Host-visible storage buffers use a separate bounded pool across backend calls. By default, the backend
+packs call-local logical uploads into non-overlapping slices of a persistently mapped host-coherent arena,
+using the device's storage-buffer offset alignment. Each Vulkan descriptor keeps the exact aligned offset
+and logical byte range, and every slice is rewritten before use. The backend waits for its fence before
+returning arenas to the pool, so later uploads cannot race in-flight work. Arenas start at 1 MiB; set
+`PROSPER_BACKEND_BUFFER_ARENA_KB=<KiB>` to tune that target or
+`PROSPER_NO_BACKEND_BUFFER_ARENA=1` to restore one pooled buffer per logical upload. Oversized uploads and
+the fallback path still use power-of-two capacity classes. The thread-local pool is capped at 4096 buffers
+and 256 MiB by default; set `PROSPER_BACKEND_BUFFER_POOL_MB=<MiB>` to change the byte budget or
 `PROSPER_NO_BACKEND_BUFFER_POOL=1` for the former create/map/destroy path. With renderer timing enabled,
 `backend_buffer_pool` reports cumulative hits, misses, cached count/bytes, and evictions.
 

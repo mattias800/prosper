@@ -335,6 +335,7 @@ inline BackendRenderTimingStats backend_render_timing_stats() {
 struct RenderVkCtx {
     VkInstance inst = VK_NULL_HANDLE; VkPhysicalDevice phys = VK_NULL_HANDLE;
     VkDevice dev = VK_NULL_HANDLE; VkQueue queue = VK_NULL_HANDLE; uint32_t qfi = UINT32_MAX;
+    VkDeviceSize storage_buffer_alignment = 1;
     bool aniso_enabled = false; float max_aniso_limit = 1.0f; bool ok = false;
 };
 inline const RenderVkCtx& render_vk_ctx() {
@@ -364,6 +365,8 @@ inline const RenderVkCtx& render_vk_ctx() {
         // samplerAnisotropy (#275): enable only if advertised; maxSamplerAnisotropy is the clamp ceiling.
         VkPhysicalDeviceFeatures supported{}; vkGetPhysicalDeviceFeatures(r.phys, &supported);
         VkPhysicalDeviceProperties phys_props{}; vkGetPhysicalDeviceProperties(r.phys, &phys_props);
+        r.storage_buffer_alignment = std::max<VkDeviceSize>(
+            1, phys_props.limits.minStorageBufferOffsetAlignment);
         r.aniso_enabled = supported.samplerAnisotropy;
         r.max_aniso_limit = phys_props.limits.maxSamplerAnisotropy;
         if (r.aniso_enabled) feats.samplerAnisotropy = VK_TRUE;
@@ -652,9 +655,10 @@ inline uint32_t render_memory_type(VkPhysicalDevice phys, uint32_t bits,
 
 // Storage-buffer contents are rewritten for every synchronous render call, but their Vulkan object
 // shapes repeat heavily. Keep capacity-class host-coherent buffers mapped between calls so the hot path
-// only copies bytes; each call waits for its fence before returning the buffers, so no in-flight GPU
-// work can observe a later upload. Capacity classes reduce shape churn; descriptors retain the exact
-// logical upload range, so pooling never broadens shader-visible storage.
+// only copies bytes. The backend normally packs call-local logical uploads into aligned slices of a few
+// pooled arenas; the same pool also backs the per-upload fallback. Each call waits for its fence before
+// returning buffers, so no in-flight GPU work can observe a later upload. Descriptors retain exact
+// logical offsets and ranges, so capacity padding and neighboring arena slices remain shader-inaccessible.
 struct RenderHostBuffer {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -697,6 +701,16 @@ inline VkDeviceSize render_host_buffer_pool_limit() {
         return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
     }();
     return limit;
+}
+
+inline VkDeviceSize render_host_buffer_arena_size() {
+    static const VkDeviceSize bytes = []() -> VkDeviceSize {
+        const char* value = getenv("PROSPER_BACKEND_BUFFER_ARENA_KB");
+        const uint64_t kib = value ? strtoull(value, nullptr, 10) : 1024ull;
+        if (kib > UINT64_MAX / 1024ull) return VkDeviceSize{UINT64_MAX};
+        return std::max<VkDeviceSize>(4, static_cast<VkDeviceSize>(kib) * 1024ull);
+    }();
+    return bytes;
 }
 
 inline void destroy_render_host_buffer(VkDevice device, RenderHostBuffer& buffer) {
@@ -1687,9 +1701,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         void* mapped = nullptr;
+        VkDeviceSize offset = 0;
         VkDeviceSize bytes = 0;
         VkDeviceSize allocation_bytes = 0;
         bool pooled = false;
+        bool arena = false;
+    };
+    struct SharedBufferArena {
+        RenderHostBuffer buffer;
+        VkDeviceSize used = 0;
     };
     struct TextureBindingKey {
         std::array<uint64_t, 22> words{};
@@ -1720,6 +1740,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         }
     };
     std::vector<SharedBufferUpload> shared_buffers;
+    std::vector<SharedBufferArena> shared_buffer_arenas;
     std::unordered_map<SharedBufferKey, size_t, SharedBufferKeyHash> shared_buffer_indices;
     std::vector<SharedTextureBinding> shared_texture_bindings;
     std::unordered_map<TextureBindingKey, size_t, TextureBindingKeyHash>
@@ -1730,6 +1751,42 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         shared_pipeline_layouts;
     uint64_t resource_unique_tag = 0;
     const uint32_t zero_buffer_word = 0;
+    const VkDeviceSize storage_buffer_alignment = ctx.storage_buffer_alignment;
+    const bool use_buffer_arena = reuse_host_buffers &&
+        getenv("PROSPER_NO_BACKEND_BUFFER_ARENA") == nullptr;
+    auto align_storage_offset = [storage_buffer_alignment](VkDeviceSize value) {
+        const VkDeviceSize remainder = value % storage_buffer_alignment;
+        if (!remainder) return value;
+        const VkDeviceSize padding = storage_buffer_alignment - remainder;
+        return value <= UINT64_MAX - padding ? value + padding : VkDeviceSize{UINT64_MAX};
+    };
+    auto acquire_buffer_arena_slice = [&](VkDeviceSize bytes, SharedBufferUpload& upload) {
+        for (SharedBufferArena& arena : shared_buffer_arenas) {
+            const VkDeviceSize offset = align_storage_offset(arena.used);
+            if (offset != UINT64_MAX && offset <= arena.buffer.bytes &&
+                bytes <= arena.buffer.bytes - offset) {
+                upload.buffer = arena.buffer.buffer;
+                upload.mapped = arena.buffer.mapped;
+                upload.offset = offset;
+                upload.arena = true;
+                arena.used = offset + bytes;
+                return true;
+            }
+        }
+        VkDeviceSize request = std::max(render_host_buffer_arena_size(), bytes);
+        if (request < bytes) request = bytes;
+        RenderHostBuffer buffer = acquire_render_host_buffer(ctx, request);
+        if (!buffer.buffer || !buffer.memory || !buffer.mapped) {
+            destroy_render_host_buffer(ctx.dev, buffer);
+            return false;
+        }
+        shared_buffer_arenas.push_back({buffer, bytes});
+        upload.buffer = buffer.buffer;
+        upload.mapped = buffer.mapped;
+        upload.offset = 0;
+        upload.arena = true;
+        return true;
+    };
     auto handle_bits = [](auto handle) {
         uint64_t bits = 0;
         static_assert(sizeof(handle) <= sizeof(bits));
@@ -2257,7 +2314,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                         buffer_index = shared_buffers.size();
                         SharedBufferUpload upload;
                         const VkDeviceSize bytes = static_cast<VkDeviceSize>(word_count) * 4;
-                        if (reuse_host_buffers) {
+                        if (use_buffer_arena)
+                            acquire_buffer_arena_slice(bytes, upload);
+                        if (!upload.arena && reuse_host_buffers) {
                             RenderHostBuffer pooled = acquire_render_host_buffer(ctx, bytes);
                             upload.buffer = pooled.buffer;
                             upload.memory = pooled.memory;
@@ -2266,7 +2325,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                             upload.allocation_bytes = pooled.allocation_bytes;
                             upload.pooled = upload.buffer && upload.memory && upload.mapped;
                         }
-                        if (!upload.pooled) {
+                        if (!upload.arena && !upload.pooled) {
                             VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
                             buffer_info.size = bytes;
                             buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
@@ -2285,14 +2344,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                             std::memcpy(mapped, words, static_cast<size_t>(bytes));
                             vkUnmapMemory(dev, upload.memory);
                         } else {
-                            std::memcpy(upload.mapped, words, static_cast<size_t>(bytes));
+                            std::memcpy(static_cast<uint8_t*>(upload.mapped) + upload.offset,
+                                        words, static_cast<size_t>(bytes));
                         }
                         shared_buffers.push_back(upload);
                         shared_buffer_indices.emplace(buffer_key, buffer_index);
                         ++resource_reuse_stats.unique_buffers;
                     }
                     v.sbuf[i] = shared_buffers[buffer_index].buffer;
-                    dbi[i] = {v.sbuf[i], 0,
+                    dbi[i] = {v.sbuf[i], shared_buffers[buffer_index].offset,
                               static_cast<VkDeviceSize>(word_count) * sizeof(uint32_t)};
                     wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr[i].dstBinding = r.binding; wr[i].descriptorCount = 1;
                     wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[i].pBufferInfo = &dbi[i];
@@ -2910,7 +2970,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         if (binding.view) vkDestroyImageView(dev, binding.view, nullptr);
     }
     for (const SharedBufferUpload& upload : shared_buffers) {
-        if (upload.pooled) {
+        if (upload.arena) {
+            continue;
+        } else if (upload.pooled) {
             release_render_host_buffer(
                 dev, {upload.buffer, upload.memory, upload.mapped,
                       upload.bytes, upload.allocation_bytes});
@@ -2919,6 +2981,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             if (upload.memory) release_transient_render_memory(dev, upload.memory);
         }
     }
+    for (SharedBufferArena& arena : shared_buffer_arenas)
+        release_render_host_buffer(dev, arena.buffer);
     auto evict_persistent_texture = [&]() {
         auto victim = persistent_texture_images.end();
         for (auto it = persistent_texture_images.begin();
@@ -3015,6 +3079,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             uint64_t calls = 0, draws = 0;
             uint64_t texture_references = 0, texture_uploads = 0, texture_upload_bytes = 0;
             uint64_t persistent_hits = 0, persistent_misses = 0, persistent_cached_bytes = 0;
+            uint64_t texture_binding_references = 0, unique_texture_bindings = 0;
+            uint64_t buffer_references = 0, unique_buffers = 0;
+            uint64_t descriptor_layout_references = 0, unique_descriptor_layouts = 0;
+            uint64_t pipeline_layout_references = 0, unique_pipeline_layouts = 0;
             uint64_t pipeline_references = 0, pipeline_hits = 0, pipeline_misses = 0;
             uint64_t pipeline_bypasses = 0, pipeline_entries = 0, pipeline_evictions = 0;
             double target = 0, draw_setup = 0, record = 0, gpu_wait = 0, readback = 0, cleanup = 0;
@@ -3031,6 +3099,16 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             timing.persistent_hits += texture_stats.persistent_hits;
             timing.persistent_misses += texture_stats.persistent_misses;
             timing.persistent_cached_bytes = texture_stats.persistent_cached_bytes;
+            timing.texture_binding_references += resource_reuse_stats.texture_binding_references;
+            timing.unique_texture_bindings += resource_reuse_stats.unique_texture_bindings;
+            timing.buffer_references += resource_reuse_stats.buffer_references;
+            timing.unique_buffers += resource_reuse_stats.unique_buffers;
+            timing.descriptor_layout_references +=
+                resource_reuse_stats.descriptor_set_layout_references;
+            timing.unique_descriptor_layouts +=
+                resource_reuse_stats.unique_descriptor_set_layouts;
+            timing.pipeline_layout_references += resource_reuse_stats.pipeline_layout_references;
+            timing.unique_pipeline_layouts += resource_reuse_stats.unique_pipeline_layouts;
             timing.pipeline_references += pipeline_stats.references;
             timing.pipeline_hits += pipeline_stats.hits;
             timing.pipeline_misses += pipeline_stats.misses;
@@ -3121,6 +3199,17 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     window.texture_upload_bytes / (wn * 1024.0 * 1024.0),
                     window.persistent_hits / wn, window.persistent_misses / wn,
                     window.persistent_cached_bytes / (1024.0 * 1024.0));
+            fprintf(stderr,
+                    "[render-window] backend resources texture_bindings=%.1f/%.1f "
+                    "buffers=%.1f/%.1f descriptor_layouts=%.1f/%.1f "
+                    "pipeline_layouts=%.1f/%.1f\n",
+                    window.texture_binding_references / wn,
+                    window.unique_texture_bindings / wn,
+                    window.buffer_references / wn, window.unique_buffers / wn,
+                    window.descriptor_layout_references / wn,
+                    window.unique_descriptor_layouts / wn,
+                    window.pipeline_layout_references / wn,
+                    window.unique_pipeline_layouts / wn);
             fprintf(stderr,
                     "[render-window] backend pipelines refs=%.1f hits=%.1f misses=%.1f bypass=%.1f "
                     "entries=%llu evictions=%.1f\n",

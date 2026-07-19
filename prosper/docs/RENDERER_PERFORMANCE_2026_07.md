@@ -160,6 +160,38 @@ misses. The flat GPU wait confirms the measured improvement comes from CPU Vulka
 than different GPU work. The next dense-scene costs are texture-binding setup and the synchronous
 submit/fence/readback architecture.
 
+## Evergate packed host-buffer arenas (2026-07-19)
+
+The persistent buffer pool removed allocation and destruction, but dense backend calls still checked out
+about 179 distinct Vulkan buffers for roughly 267 storage-buffer references. A count-only probe also found
+about 80 texture references collapsing to only five unique texture binding objects, plus 2.5 descriptor-set
+layouts and 1.4 pipeline layouts per call. The remaining resource setup was therefore dominated by the
+large number of logical storage uploads, not texture view/sampler or layout object counts.
+
+The backend now suballocates those logical uploads from aligned slices of a 1 MiB mapped arena. Descriptor
+offsets follow `minStorageBufferOffsetAlignment`, descriptor ranges remain the exact logical byte count,
+and distinct logical resources never overlap. The arena is returned to the existing bounded pool only after
+the backend fence wait. `PROSPER_NO_BACKEND_BUFFER_ARENA=1` restores the per-logical-buffer pooled path for
+an A/B, while `PROSPER_BACKEND_BUFFER_ARENA_KB=<KiB>` changes the target arena size.
+
+Native Windows / RTX 4090, one final binary, separate fresh saves, native scale/cadence, the documented
+route, and matched dense timing windows produced:
+
+| Measurement | Per-logical pool | Packed arena |
+|---|---:|---:|
+| Draws / submit | 489.6 | 485.4 |
+| Whole submit | 135.9 ms | 131.9 ms |
+| Backend execution | 83.7 ms | 81.0 ms |
+| Backend resource setup | 26.9 ms | 25.3 ms |
+| Backend cleanup | 5.1 ms | 4.7 ms |
+| GPU fence wait | 37.3 ms | 37.4 ms |
+| Persistent buffer objects | 2,434 | 4 |
+| Persistent mapped bytes | 6.7 MiB | 4.0 MiB |
+
+A second nearby pair measured 139.4 to 133.6 ms whole-submit time, confirming a modest 3-4% end-to-end
+gain. The flat 37 ms fence wait remains the primary structural limit; packing removes CPU object handling
+and pool bookkeeping but does not change GPU work or synchronous ownership.
+
 ## Dead Cells backend upload duplication (2026-07-15)
 
 Dead Cells exposed a second duplication layer after the frontend decode caches. The frontend correctly

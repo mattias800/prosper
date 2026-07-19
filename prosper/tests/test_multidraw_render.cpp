@@ -6,11 +6,14 @@
 // game's per-draw register-snapshot resolution.
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include "../src/gpu/render_state.hpp"
+#include "../src/gpu/shader_resources.hpp"
 #include "render_runner.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -128,26 +131,62 @@ int main() {
     // A synchronous backend call may share those immutable objects after exact comparison, while the
     // disable switch provides a byte-identical one-object-per-reference control.
     {
+        const uint32_t fetch_vs[] = {
+            0x7e060280u, 0x7e0802f2u, 0xe0042000u, 0x80020100u,
+            0xf80008cfu, 0x04030201u, 0xbf810000u,
+        };
+        ShaderResourceTable fetch_resources;
+        ShaderResource vertex_resource{};
+        vertex_resource.cls = ResourceClass::VertexBuffer;
+        vertex_resource.format = DataFormat::Float32;
+        vertex_resource.num_components = 2;
+        vertex_resource.binding = 3;
+        vertex_resource.stride = 8;
+        vertex_resource.sgpr_base = 8;
+        fetch_resources.resources.push_back(vertex_resource);
+        const std::vector<uint32_t> buffer_vs = recompile_vertex(
+            fetch_vs, sizeof(fetch_vs) / sizeof(fetch_vs[0]), &fetch_resources);
+        CHECK(!buffer_vs.empty(), "storage-buffer-reading vertex shader available");
+        auto f = [](float value) {
+            union { float f; uint32_t u; } bits{value};
+            return bits.u;
+        };
+        prosper::test::FrameResource filler;
+        filler.binding = 2;
+        filler.set = 0;
+        filler.buffer_identity = 0x7020000000000002ull;
+        filler.dwords.assign(17, 0x40000000u);
         prosper::test::FrameResource buffer;
-        buffer.binding = 2;
+        buffer.binding = 3;
         buffer.set = 0;
-        buffer.buffer_identity = 0x7020000000000002ull;
-        buffer.dwords.assign(63, 0x3f800000u); // 252 bytes -> pooled 256-byte capacity
+        buffer.buffer_identity = 0x7020000000000003ull;
+        buffer.dwords.assign(63, 0u);
+        const uint32_t fullscreen_triangle[] = {
+            f(-1.0f), f(-1.0f), f(3.0f), f(-1.0f), f(-1.0f), f(3.0f),
+        };
+        std::copy(std::begin(fullscreen_triangle), std::end(fullscreen_triangle),
+                  buffer.dwords.begin());
         prosper::test::BackendDraw d0;
-        d0.vs = vs; d0.fs = red; d0.ps = &opaque; d0.vcount = 3; d0.R = {buffer};
+        d0.vs = buffer_vs; d0.fs = red; d0.ps = &opaque; d0.vcount = 3;
+        d0.R = {filler, buffer};
         prosper::test::BackendDraw d1;
-        d1.vs = vs; d1.fs = green; d1.ps = &additive; d1.vcount = 3; d1.R = {buffer};
+        d1.vs = buffer_vs; d1.fs = green; d1.ps = &additive; d1.vcount = 3;
+        d1.R = {filler, buffer};
 
         const auto pool_before = prosper::test::render_host_buffer_pool_stats();
         const std::vector<uint8_t> shared =
             prosper::test::render_draws_rgba({d0, d1}, W, H);
         const auto shared_stats = prosper::test::backend_resource_reuse_stats();
         const auto pool_after_first = prosper::test::render_host_buffer_pool_stats();
-        CHECK(shared_stats.buffer_references == 2 && shared_stats.unique_buffers == 1,
-              "identical guest-buffer payloads share one Vulkan upload");
+        CHECK(shared_stats.buffer_references == 4 && shared_stats.unique_buffers == 2,
+              "identical guest-buffer payloads share two arena slices across draws");
         CHECK(pool_after_first.misses == pool_before.misses + 1 &&
                   pool_after_first.cached_buffers == pool_before.cached_buffers + 1,
-              "first storage-buffer shape populates the persistent host-buffer pool");
+              "two logical uploads populate one persistent host-buffer arena");
+        const uint8_t* shared_center = center(shared);
+        CHECK(shared_center && shared_center[0] > 0xC0 && shared_center[1] > 0xC0 &&
+                  shared_center[2] < 0x40,
+              "shader reads the fullscreen vertex payload from a nonzero arena offset");
         CHECK(shared_stats.descriptor_set_layout_references == 2 &&
                   shared_stats.unique_descriptor_set_layouts == 1 &&
                   shared_stats.pipeline_layout_references == 2 &&
@@ -157,15 +196,15 @@ int main() {
 
         prosper::test::BackendDraw capacity_peer0 = d0;
         prosper::test::BackendDraw capacity_peer1 = d1;
-        capacity_peer0.R[0].dwords.resize(61); // 244 bytes, same 256-byte capacity class
-        capacity_peer1.R[0].dwords.resize(61);
+        capacity_peer0.R[1].dwords.resize(61);
+        capacity_peer1.R[1].dwords.resize(61);
         const std::vector<uint8_t> pooled_again = prosper::test::render_draws_rgba(
             {capacity_peer0, capacity_peer1}, W, H);
         const auto pool_after_second = prosper::test::render_host_buffer_pool_stats();
         CHECK(pool_after_second.hits == pool_after_first.hits + 1 &&
                   pool_after_second.misses == pool_after_first.misses &&
                   pooled_again == shared,
-              "next logical size in the capacity class reuses the mapped buffer byte-identically");
+              "next logical size reuses the mapped arena byte-identically");
 
         set_env("PROSPER_NO_BACKEND_BUFFER_POOL", "1");
         const std::vector<uint8_t> pool_bypassed =
@@ -179,11 +218,11 @@ int main() {
               "pooled and forced-transient storage buffers render byte-identically");
 
         prosper::test::BackendDraw distinct = d1;
-        distinct.R[0].buffer_identity++;
+        distinct.R[1].buffer_identity++;
         const std::vector<uint8_t> distinct_output =
             prosper::test::render_draws_rgba({d0, distinct}, W, H);
         const auto distinct_stats = prosper::test::backend_resource_reuse_stats();
-        CHECK(distinct_stats.buffer_references == 2 && distinct_stats.unique_buffers == 2 &&
+        CHECK(distinct_stats.buffer_references == 4 && distinct_stats.unique_buffers == 3 &&
                   distinct_output == shared,
               "equal bytes at different guest buffer identities remain distinct");
 
@@ -192,7 +231,7 @@ int main() {
             prosper::test::render_draws_rgba({d0, d1}, W, H);
         const auto unshared_stats = prosper::test::backend_resource_reuse_stats();
         set_env("PROSPER_NO_BACKEND_RESOURCE_SHARE", nullptr);
-        CHECK(unshared_stats.buffer_references == 2 && unshared_stats.unique_buffers == 2 &&
+        CHECK(unshared_stats.buffer_references == 4 && unshared_stats.unique_buffers == 4 &&
                   unshared_stats.unique_descriptor_set_layouts == 2 &&
                   unshared_stats.unique_pipeline_layouts == 2,
               "resource-share disable switch restores distinct per-draw immutable objects");
