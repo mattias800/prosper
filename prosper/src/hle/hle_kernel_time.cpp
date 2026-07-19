@@ -415,6 +415,11 @@ namespace {
     // ComputeN ring id). Filter GraphicsCore=-14 (shadPS4 equeue.h).
     constexpr int16_t EVFILT_GRAPHICS_CORE = -14;
     std::vector<FlipReg> g_eop_regs;   // same (eq,id,udata) shape
+    // #987 diagnostic: a completion snapshot taken before any EOP source is registered is currently
+    // delivered to zero queues. Count those observations under the same mutex as registration so the
+    // PROSPER_EOPLOG ordering is exact. This is diagnostic only: the count is never replayed.
+    uint64_t g_eop_zero_consumer_count = 0;
+    bool eoplog() { static const bool enabled = getenv("PROSPER_EOPLOG") != nullptr; return enabled; }
     // Registered user-event sources: (eq,id,udata) the game added via sceKernelAddUserEvent and may later
     // trigger. Declared here (before the pump) so the diagnostic PROSPER_PUMP_USEREV heartbeat can fire them.
     struct UserReg { uint64_t eq; int64_t id; uint64_t udata; };
@@ -509,7 +514,21 @@ void prosper_eq_add_vblank(uint64_t eq, int64_t ident, uint64_t udata) {
 }
 // Exposed to the AGC submit path (hle_agc.cpp). Register a GPU EOP event source (sceGnmAddEqEvent).
 void prosper_eq_add_eop(uint64_t eq, int64_t id, uint64_t udata) {
-    std::lock_guard lk(g_eq_mx); g_eop_regs.push_back({ eq, id, udata });
+    size_t registration_count = 0;
+    uint64_t zero_consumer_count = 0;
+    uint64_t registration_ns = 0;
+    {
+        std::lock_guard lk(g_eq_mx);
+        g_eop_regs.push_back({ eq, id, udata });
+        registration_count = g_eop_regs.size();
+        zero_consumer_count = g_eop_zero_consumer_count;
+        registration_ns = real_ns();
+    }
+    if (eoplog())
+        fprintf(stderr, "[eoprace] t_ns=%llu EOP source registered eq=0x%llx id=%lld "
+                        "(regs=%zu zero-consumer-completions=%llu)\n",
+                (unsigned long long)registration_ns, (unsigned long long)eq, (long long)id,
+                registration_count, (unsigned long long)zero_consumer_count);
 }
 // Fire the registered EOP events — called when a submit completes. Posts TriggerEvent(ident=id,
 // filter=GraphicsCore, data=id, udata) to each registered equeue, matching shadPS4's IRQ handler.
@@ -532,7 +551,20 @@ namespace {
         // is a discrete count, never a level. PROSPER_EOP_COALESCE restores the old behavior.
         static const bool coalesce = getenv("PROSPER_EOP_COALESCE") != nullptr;
         std::vector<FlipReg> regs;
-        { std::lock_guard lk(g_eq_mx); regs = g_eop_regs; }
+        uint64_t zero_consumer_ordinal = 0;
+        uint64_t snapshot_ns = 0;
+        {
+            std::lock_guard lk(g_eq_mx);
+            regs = g_eop_regs;
+            if (regs.empty()) {
+                zero_consumer_ordinal = ++g_eop_zero_consumer_count;
+                snapshot_ns = real_ns();
+            }
+        }
+        if (zero_consumer_ordinal && eoplog())
+            fprintf(stderr, "[eoprace] t_ns=%llu EOP completion snapshot had 0 registered "
+                            "queues (zero-consumer ordinal=%llu)\n",
+                    (unsigned long long)snapshot_ns, (unsigned long long)zero_consumer_ordinal);
         for (auto& r : regs) {
             SceKEvent e{}; e.ident = r.ident; e.filter = EVFILT_GRAPHICS_CORE; e.data = r.ident; e.udata = r.udata;
             eq_post(r.eq, e, coalesce);
