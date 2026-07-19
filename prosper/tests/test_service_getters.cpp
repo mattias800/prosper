@@ -146,6 +146,9 @@ int main() {
                   "SaveDataDialog result reports mode and neutral OK/INVALID outcome");
             CHECK(*(uint64_t*)(out + 0x20) == 0x123456789abcdef0ull,
                   "SaveDataDialog result preserves caller userData");
+            CHECK(out[0x0c] == 0xAB && *(uint64_t*)(out + 0x10) == 0xABABABABABABABABull &&
+                  *(uint64_t*)(out + 0x18) == 0xABABABABABABABABull,
+                  "SaveDataDialog result preserves ABI padding and caller-owned output pointers");
             CHECK(out[0x28] == 0xAB && out[0x4f] == 0xAB,
                   "SaveDataDialog result does not overwrite its reserved tail");
             close(0,0,0,0,0,0);

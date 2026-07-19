@@ -107,6 +107,38 @@ struct SdlPlatformUi : PlatformUi {
     int  errorDialogStatus() override { return err_status.load(); }
     void errorDialogClose() override { err_status.store(0); }
 
+    // SaveDataDialog. Open copies the guest request; the prosper-app main-thread pump owns SDL UI.
+    // LIST/progress modes are declined until their dedicated virtual-slot UI exists, preserving the
+    // core's established headless auto-dismiss for those modes.
+    std::mutex            save_mx;
+    SaveDataRequest       save_request{};
+    std::atomic<int>      save_status{0 /*NONE*/};
+    std::atomic<bool>     save_pending{false};
+    std::atomic<uint32_t> save_button{0 /*INVALID*/};
+    std::atomic<bool>     save_canceled{false};
+
+    bool saveDataDialogOpen(uint64_t param) override {
+        SaveDataRequest request = read_savedata_request(param);
+        if (!request.supported) return false;
+        { std::lock_guard<std::mutex> lk(save_mx); save_request = request; }
+        save_button.store(0);
+        save_canceled.store(false);
+        save_status.store(2 /*RUNNING*/);
+        save_pending.store(true);
+        return true;
+    }
+    int saveDataDialogStatus() override { return save_status.load(); }
+    int saveDataDialogResult(uint64_t result) override {
+        SaveDataRequest request;
+        { std::lock_guard<std::mutex> lk(save_mx); request = save_request; }
+        write_savedata_result(result, request, save_button.load(), save_canceled.load());
+        return (int)save_button.load();
+    }
+    void saveDataDialogClose() override {
+        save_pending.store(false);
+        save_status.store(0 /*NONE*/);
+    }
+
     // Ime keyboard presence: a windowed session runs on a host with a keyboard, so report one (#347).
     // This makes sceImeKeyboardGetResourceId/GetInfo report a connected keyboard, enabling a title's
     // keyboard-input option. (Delivering the raw key events to the guest handler is a further step.)
@@ -145,11 +177,24 @@ struct SdlPlatformUi : PlatformUi {
     // MAIN-thread: if a text dialog is pending, run its modal to completion (writes the guest buffer,
     // then flips status to FINISHED so the guest's next poll — and its buffer read — see it).
     void pump() {
-        if (!ime_pending.exchange(false)) return;
-        ImeRequest r; { std::lock_guard<std::mutex> lk(ime_mx); r = ime_req; }
-        int es = run_ime_modal(r);
-        ime_endstatus.store(es);
-        ime_status.store(2 /*Finished*/);
+        if (save_pending.exchange(false)) {
+            SaveDataRequest request;
+            { std::lock_guard<std::mutex> lk(save_mx); request = save_request; }
+            const int clicked = show_box(request.error ? SDL_MESSAGEBOX_ERROR
+                                                       : SDL_MESSAGEBOX_INFORMATION,
+                                         "prosper - Saved Data", request.message.c_str(),
+                                         request.buttons);
+            const bool canceled = clicked <= 0;
+            save_button.store(canceled ? 0u : (uint32_t)clicked);
+            save_canceled.store(canceled);
+            save_status.store(3 /*FINISHED*/);
+        }
+        if (ime_pending.exchange(false)) {
+            ImeRequest r; { std::lock_guard<std::mutex> lk(ime_mx); r = ime_req; }
+            int es = run_ime_modal(r);
+            ime_endstatus.store(es);
+            ime_status.store(2 /*Finished*/);
+        }
     }
 };
 
@@ -159,7 +204,7 @@ SdlPlatformUi g_sdl_ui;
 
 bool install_sdl3_platform_ui() {
     set_platform_ui(&g_sdl_ui);
-    SDL_Log("prosper: SDL3 dialog backend installed (MsgDialog/ErrorDialog + ImeDialog text entry)");
+    SDL_Log("prosper: SDL3 dialog backend installed (Msg/Error/SaveData + Ime text entry)");
     return true;
 }
 void shutdown_sdl3_platform_ui() { set_platform_ui(nullptr); }

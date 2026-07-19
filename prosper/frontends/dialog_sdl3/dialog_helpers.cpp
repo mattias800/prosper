@@ -1,6 +1,7 @@
 // dialog_helpers.cpp — see dialog_helpers.hpp. Pure struct parsing (no SDL). memcpy is used for every
 // guest read/write so unaligned guest structs and strict aliasing are both safe.
 #include "dialog_helpers.hpp"
+#include <cstdio>
 #include <cstring>
 
 namespace prosper {
@@ -47,6 +48,157 @@ uint32_t read_error_code(uint64_t param) {
     uint32_t code = 0;
     if (param) std::memcpy(&code, (const void*)(uintptr_t)(param + 4), 4);
     return code;
+}
+
+// --- SaveDataDialog ---
+
+namespace {
+
+uint32_t read_u32(uint64_t address) {
+    uint32_t value = 0;
+    std::memcpy(&value, (const void*)(uintptr_t)address, sizeof value);
+    return value;
+}
+
+uint64_t read_u64(uint64_t address) {
+    uint64_t value = 0;
+    std::memcpy(&value, (const void*)(uintptr_t)address, sizeof value);
+    return value;
+}
+
+std::string guest_string(uint64_t address) {
+    if (!address) return {};
+    const char* text = (const char*)(uintptr_t)address;
+    size_t length = 0;
+    while (length < 4096 && text[length]) ++length;
+    return std::string(text, length);
+}
+
+MsgButtons save_user_buttons(uint32_t type) {
+    switch (type) {
+    case 0: return {1, {"OK", nullptr, nullptr}, {1, 0, 0}};
+    case 1: return {2, {"Yes", "No", nullptr}, {1, 2, 0}};
+    case 3: return {2, {"OK", "Cancel", nullptr}, {1, 0, 0}};
+    default: return {0, {nullptr, nullptr, nullptr}, {0, 0, 0}};
+    }
+}
+
+const char* save_action(uint32_t display_type) {
+    switch (display_type) {
+    case 1: return "save";
+    case 2: return "load";
+    case 3: return "delete";
+    default: return "continue";
+    }
+}
+
+} // namespace
+
+SaveDataRequest read_savedata_request(uint64_t param) {
+    SaveDataRequest request;
+    if (!param) return request;
+    if (read_u64(param) != 0x30 || read_u32(param + 0x30) != 0x98)
+        return request;
+    request.mode = read_u32(param + 0x34);
+    request.displayType = read_u32(param + 0x38);
+    request.userData = read_u64(param + 0x70);
+
+    if (request.mode == SAVE_DATA_DIALOG_MODE_USER_MSG) {
+        const uint64_t user = read_u64(param + 0x50);
+        if (!user) return request;
+        request.buttons = save_user_buttons(read_u32(user));
+        if (request.buttons.count == 0) return request;
+        request.error = read_u32(user + 4) == 1;
+        request.message = guest_string(read_u64(user + 8));
+        request.supported = true;
+        return request;
+    }
+
+    if (request.mode == SAVE_DATA_DIALOG_MODE_SYSTEM_MSG) {
+        const uint64_t system = read_u64(param + 0x58);
+        if (!system) return request;
+        const uint32_t type = read_u32(system);
+        const char* action = save_action(request.displayType);
+        char message[192] = {};
+        switch (type) {
+        case 1: // NODATA
+            request.message = "There is no saved data.";
+            request.buttons = save_user_buttons(0);
+            break;
+        case 2: // CONFIRM
+            std::snprintf(message, sizeof message, "Do you want to %s this saved data?", action);
+            request.message = message;
+            request.buttons = save_user_buttons(1);
+            break;
+        case 3: // OVERWRITE
+            request.message = "Do you want to overwrite the existing saved data?";
+            request.buttons = save_user_buttons(1);
+            break;
+        case 4: case 8: // NOSPACE / NOSPACE_CONTINUABLE
+            request.message = "There is not enough space for this saved data operation.";
+            request.buttons = save_user_buttons(0);
+            request.error = true;
+            break;
+        case 6: // FILE_CORRUPTED
+            request.message = "The saved data is corrupted.";
+            request.buttons = save_user_buttons(0);
+            request.error = true;
+            break;
+        case 7: // FINISHED
+            std::snprintf(message, sizeof message, "Saved data %s completed.", action);
+            request.message = message;
+            request.buttons = save_user_buttons(0);
+            break;
+        case 10: // CORRUPTED_AND_DELETED
+            request.message = "The saved data is corrupted and will be deleted.";
+            request.buttons = save_user_buttons(3);
+            request.error = true;
+            break;
+        case 11: // CORRUPTED_AND_CREATED
+            request.message = "The corrupted saved data will be replaced with new saved data.";
+            request.buttons = save_user_buttons(3);
+            request.error = true;
+            break;
+        case 13: // CORRUPTED_AND_RESTORE
+            request.message = "The corrupted saved data will be restored from its backup.";
+            request.buttons = save_user_buttons(3);
+            request.error = true;
+            break;
+        case 14: // TOTAL_SIZE_EXCEEDED
+            request.message = "Cannot create more saved data.";
+            request.buttons = save_user_buttons(0);
+            request.error = true;
+            break;
+        default:
+            return request; // PROGRESS and unknown modes need a non-modal/dedicated UI
+        }
+        request.supported = true;
+        return request;
+    }
+
+    if (request.mode == SAVE_DATA_DIALOG_MODE_ERROR_CODE) {
+        const uint64_t error = read_u64(param + 0x60);
+        if (!error) return request;
+        const uint32_t code = read_u32(error);
+        char message[96];
+        std::snprintf(message, sizeof message, "An error occurred.\n\nError code: 0x%08X", code);
+        request.message = message;
+        request.buttons = save_user_buttons(0);
+        request.error = true;
+        request.supported = true;
+    }
+    return request;
+}
+
+void write_savedata_result(uint64_t result, const SaveDataRequest& request,
+                           uint32_t buttonId, bool canceled) {
+    if (!result) return;
+    const uint32_t common_result = canceled ? 1u : 0u;
+    const uint32_t guest_button = canceled ? 0u : buttonId;
+    std::memcpy((void*)(uintptr_t)(result + 0x00), &request.mode, sizeof request.mode);
+    std::memcpy((void*)(uintptr_t)(result + 0x04), &common_result, sizeof common_result);
+    std::memcpy((void*)(uintptr_t)(result + 0x08), &guest_button, sizeof guest_button);
+    std::memcpy((void*)(uintptr_t)(result + 0x20), &request.userData, sizeof request.userData);
 }
 
 // --- ImeDialog text entry ---

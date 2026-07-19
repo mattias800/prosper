@@ -39,6 +39,29 @@ struct MockUi : PlatformUi {
     bool errorDialogOpen(uint64_t param) override { err_opens++; err_last_param = param; err_status = 2; return true; }
     int  errorDialogStatus() override { return err_status; }
     void errorDialogClose() override { err_closes++; err_status = 0; }
+
+    // SaveDataDialog
+    bool save_accept = true;
+    int save_status = 2, save_opens = 0, save_closes = 0, save_results = 0;
+    int save_incs = 0, save_sets = 0;
+    uint64_t save_last_param = 0, save_last_result = 0;
+    uint32_t save_last_target = 0, save_last_value = 0;
+    bool saveDataDialogOpen(uint64_t param) override {
+        save_opens++; save_last_param = param; save_status = 2; return save_accept;
+    }
+    int saveDataDialogStatus() override { return save_status; }
+    int saveDataDialogResult(uint64_t result) override {
+        save_results++; save_last_result = result;
+        if (result) *(uint32_t*)result = 4 /*ERROR_CODE marker*/;
+        return 1;
+    }
+    void saveDataDialogProgressBarInc(uint32_t target, uint32_t delta) override {
+        save_incs++; save_last_target = target; save_last_value = delta;
+    }
+    void saveDataDialogProgressBarSetValue(uint32_t target, uint32_t value) override {
+        save_sets++; save_last_target = target; save_last_value = value;
+    }
+    void saveDataDialogClose() override { save_closes++; save_status = 0; }
 };
 
 int main() {
@@ -117,6 +140,51 @@ int main() {
         CHECK(ui.err_opens == 1 && ui.err_last_param == 0xBBBB, "ErrorDialog backend: Open forwards the param");
         CHECK(e_status(0,0,0,0,0,0) == 2, "ErrorDialog backend: status follows the frontend (RUNNING)");
         if (e_term) { e_term(0,0,0,0,0,0); CHECK(ui.err_closes == 1, "ErrorDialog backend: Term routes to errorDialogClose"); }
+    }
+
+    // --- SaveDataDialog: declined ownership keeps headless behavior; accepted ownership stays bound
+    // to the exact backend that accepted Open, including progress, result, and Term. ---
+    HleFn s_init = Hle::lookup("s9e3+YpRnzw"), s_open = Hle::lookup("4tPhsP6FpDI"),
+          s_status = Hle::lookup("ERKzksauAJA"), s_result = Hle::lookup("yEiJ-qqr6Cg"),
+          s_close = Hle::lookup("fH46Lag88XY"), s_term = Hle::lookup("YuH2FA7azqQ"),
+          s_inc = Hle::lookup("V-uEeFKARJU"), s_set = Hle::lookup("hay1CfTmLyA");
+    CHECK(s_init && s_open && s_status && s_result && s_close && s_term && s_inc && s_set,
+          "SaveDataDialog handlers registered");
+    if (s_init && s_open && s_status && s_result && s_close && s_term && s_inc && s_set) {
+        uint8_t save_param[0x98] = {};
+        *(uint32_t*)(save_param + 0x34) = 3 /*SYSTEM_MSG*/;
+        *(uint64_t*)(save_param + 0x70) = 0x12345678;
+
+        set_platform_ui(&ui);
+        ui.save_accept = false;
+        s_init(0,0,0,0,0,0);
+        s_open((uint64_t)(uintptr_t)save_param,0,0,0,0,0);
+        CHECK(ui.save_opens == 1 && s_status(0,0,0,0,0,0) == 3,
+              "SaveDataDialog declined ownership falls back to headless FINISHED");
+        s_close(0,0,0,0,0,0);
+        CHECK(ui.save_closes == 0, "SaveDataDialog declined ownership is not closed through backend");
+
+        ui.save_accept = true;
+        s_init(0,0,0,0,0,0);
+        s_open((uint64_t)(uintptr_t)save_param,0,0,0,0,0);
+        CHECK(ui.save_opens == 2 && ui.save_last_param == (uint64_t)(uintptr_t)save_param &&
+                  s_status(0,0,0,0,0,0) == 2,
+              "SaveDataDialog accepted ownership forwards Open and backend RUNNING status");
+        set_platform_ui(nullptr); // ownership must remain with the backend that accepted Open
+        CHECK(s_status(0,0,0,0,0,0) == 2,
+              "SaveDataDialog status remains bound to accepting backend after registry changes");
+        s_inc(7, 4,0,0,0,0); s_set(7, 65,0,0,0,0);
+        CHECK(ui.save_incs == 1 && ui.save_sets == 1 && ui.save_last_target == 7 &&
+                  ui.save_last_value == 65,
+              "SaveDataDialog progress callbacks route to accepting backend");
+        uint8_t save_result[0x48] = {};
+        s_result((uint64_t)(uintptr_t)save_result,0,0,0,0,0);
+        CHECK(ui.save_results == 1 && ui.save_last_result == (uint64_t)(uintptr_t)save_result &&
+                  *(uint32_t*)save_result == 4,
+              "SaveDataDialog GetResult routes to accepting backend");
+        s_term(0,0,0,0,0,0);
+        CHECK(ui.save_closes == 1 && s_status(0,0,0,0,0,0) == 0,
+              "SaveDataDialog Term closes accepting backend and returns to NONE");
     }
     set_platform_ui(nullptr);
 

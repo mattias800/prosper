@@ -45,6 +45,21 @@ struct PlatformUi {
     virtual int  msgDialogResult(uint64_t result) { (void)result; return 0; }
     virtual void msgDialogClose() {}
 
+    // --- libSceSaveDataDialog (save/load/delete confirmation and save-slot UI) ---
+    // `param` is the guest SceSaveDataDialogParam*. Return true to own this Open; the core then
+    // routes every status/result/progress/close call to this same backend instance. Returning false
+    // preserves the headless policy: Open auto-completes with a neutral result.
+    virtual bool saveDataDialogOpen(uint64_t param) { (void)param; return false; }
+    virtual int  saveDataDialogStatus() { return 3 /*FINISHED*/; }
+    virtual int  saveDataDialogResult(uint64_t result) { (void)result; return 0; }
+    virtual void saveDataDialogProgressBarInc(uint32_t target, uint32_t delta) {
+        (void)target; (void)delta;
+    }
+    virtual void saveDataDialogProgressBarSetValue(uint32_t target, uint32_t value) {
+        (void)target; (void)value;
+    }
+    virtual void saveDataDialogClose() {}
+
     // --- libSceErrorDialog (single-button error message; no result struct) ---
     // Show an error dialog. `param` is the guest sceErrorDialogOpen argument (opaque). Return true to
     // OWN it; false -> the core auto-dismisses headlessly (and logs the errorCode).

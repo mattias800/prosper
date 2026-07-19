@@ -56,6 +56,102 @@ int main() {
     CHECK(read_error_code((uint64_t)(uintptr_t)ep) == 0x80AABBCC, "read_error_code: errorCode @4");
     CHECK(read_error_code(0) == 0, "read_error_code(NULL) -> 0 (no deref)");
 
+    // --- SaveDataDialog: supported message/confirmation/error modes use the ABI's nested pointers. ---
+    {
+        const char* save_message = "Overwrite this slot?";
+        uint8_t user[48] = {};
+        uint32_t button_type = 1 /*YESNO*/, message_type = 0 /*NORMAL*/;
+        uint64_t save_message_ptr = (uint64_t)(uintptr_t)save_message;
+        std::memcpy(user + 0, &button_type, 4);
+        std::memcpy(user + 4, &message_type, 4);
+        std::memcpy(user + 8, &save_message_ptr, 8);
+
+        uint8_t save_param[0x98] = {};
+        uint32_t save_mode = SAVE_DATA_DIALOG_MODE_USER_MSG, display_type = 1 /*SAVE*/;
+        uint64_t user_ptr = (uint64_t)(uintptr_t)user, user_data = 0x1122334455667788ull;
+        uint64_t base_size = 0x30;
+        uint32_t param_size = 0x98;
+        std::memcpy(save_param + 0x00, &base_size, 8);
+        std::memcpy(save_param + 0x30, &param_size, 4);
+        std::memcpy(save_param + 0x34, &save_mode, 4);
+        std::memcpy(save_param + 0x38, &display_type, 4);
+        std::memcpy(save_param + 0x50, &user_ptr, 8);
+        std::memcpy(save_param + 0x70, &user_data, 8);
+        SaveDataRequest request = read_savedata_request((uint64_t)(uintptr_t)save_param);
+        CHECK(request.supported && request.mode == SAVE_DATA_DIALOG_MODE_USER_MSG &&
+                  request.message == save_message && request.buttons.count == 2 &&
+                  request.buttons.id[0] == 1 && request.buttons.id[1] == 2 &&
+                  request.userData == user_data,
+              "SaveDataDialog USER_MSG parses text, YES/NO buttons, mode, and userData");
+
+        uint8_t system[48] = {};
+        uint32_t system_type = 2 /*CONFIRM*/;
+        std::memcpy(system, &system_type, 4);
+        save_mode = SAVE_DATA_DIALOG_MODE_SYSTEM_MSG; display_type = 3 /*DELETE*/;
+        uint64_t system_ptr = (uint64_t)(uintptr_t)system;
+        std::memcpy(save_param + 0x34, &save_mode, 4);
+        std::memcpy(save_param + 0x38, &display_type, 4);
+        std::memcpy(save_param + 0x58, &system_ptr, 8);
+        request = read_savedata_request((uint64_t)(uintptr_t)save_param);
+        CHECK(request.supported && request.message.find("delete") != std::string::npos &&
+                  request.buttons.count == 2 && request.buttons.id[1] == 2,
+              "SaveDataDialog SYSTEM_MSG confirmation maps display type to DELETE + YES/NO");
+
+        system_type = 5 /*PROGRESS*/; std::memcpy(system, &system_type, 4);
+        CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
+              "SaveDataDialog progress message declines modal ownership");
+
+        uint8_t error[36] = {};
+        uint32_t error_code = 0x809F000F;
+        std::memcpy(error, &error_code, 4);
+        uint64_t error_ptr = (uint64_t)(uintptr_t)error;
+        save_mode = SAVE_DATA_DIALOG_MODE_ERROR_CODE;
+        std::memcpy(save_param + 0x34, &save_mode, 4);
+        std::memcpy(save_param + 0x60, &error_ptr, 8);
+        request = read_savedata_request((uint64_t)(uintptr_t)save_param);
+        CHECK(request.supported && request.error &&
+                  request.message.find("0x809F000F") != std::string::npos &&
+                  request.buttons.count == 1,
+              "SaveDataDialog ERROR_CODE maps to an error box with bounded code text");
+
+        CHECK(!read_savedata_request(0).supported,
+              "SaveDataDialog null outer param declines ownership without dereference");
+        param_size = 0; std::memcpy(save_param + 0x30, &param_size, 4);
+        CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
+              "SaveDataDialog malformed outer size declines ownership");
+        param_size = 0x98; std::memcpy(save_param + 0x30, &param_size, 4);
+        error_ptr = 0; std::memcpy(save_param + 0x60, &error_ptr, 8);
+        CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
+              "SaveDataDialog null nested mode param declines ownership without dereference");
+        save_mode = SAVE_DATA_DIALOG_MODE_LIST;
+        std::memcpy(save_param + 0x34, &save_mode, 4);
+        CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
+              "SaveDataDialog LIST declines until the virtual-slot UI is implemented");
+
+        request.mode = SAVE_DATA_DIALOG_MODE_USER_MSG;
+        request.userData = user_data;
+        uint8_t save_result[0x48]; std::memset(save_result, 0xAB, sizeof save_result);
+        write_savedata_result((uint64_t)(uintptr_t)save_result, request, 2 /*NO*/, false);
+        uint32_t result_mode = 0, common_result = 0, result_button = 0;
+        uint64_t result_user_data = 0;
+        std::memcpy(&result_mode, save_result + 0x00, 4);
+        std::memcpy(&common_result, save_result + 0x04, 4);
+        std::memcpy(&result_button, save_result + 0x08, 4);
+        std::memcpy(&result_user_data, save_result + 0x20, 8);
+        CHECK(result_mode == SAVE_DATA_DIALOG_MODE_USER_MSG && common_result == 0 &&
+                  result_button == 2 && result_user_data == user_data,
+              "SaveDataDialog result returns mode/OK/NO/userData");
+        CHECK(save_result[0x0c] == 0xAB && save_result[0x10] == 0xAB &&
+                  save_result[0x18] == 0xAB && save_result[0x28] == 0xAB &&
+                  save_result[0x47] == 0xAB,
+              "SaveDataDialog result preserves pad, caller output pointers, and reserved tail");
+        write_savedata_result((uint64_t)(uintptr_t)save_result, request, 1, true);
+        std::memcpy(&common_result, save_result + 0x04, 4);
+        std::memcpy(&result_button, save_result + 0x08, 4);
+        CHECK(common_result == 1 && result_button == 0,
+              "SaveDataDialog canceled result returns USER_CANCELED + INVALID button");
+    }
+
     // --- ImeDialog: read_ime_request from a synthetic OrbisImeDialogParam (96 bytes) ---
     {
         char16_t title[] = u"Enter name";

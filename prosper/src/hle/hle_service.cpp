@@ -1159,54 +1159,90 @@ HLE(s_dialog_result) {
 // matches MsgDialog above: Open auto-dismisses to FINISHED so the guest can consume a neutral result.
 //
 // PS4/PS5 SDK layout used below (also used by shadPS4): param.mode is u32 at +0x34 and param.userData
-// is a pointer at +0x70. Result begins with mode/result/buttonId/pad followed by three pointers. Write
-// only that proven 0x28-byte prefix; the remaining 32 reserved bytes belong to the caller.
+// is a pointer at +0x70. Result begins with mode/result/buttonId/pad followed by three pointers. The
+// dirName/param pointer slots are caller-owned output destinations, not fields for the service to
+// replace. Write only mode/result/buttonId/userData and preserve every padding, pointer, and reserved
+// byte. A PlatformUi that accepts Open remains the owner even if the global registration later changes.
 namespace {
     std::atomic<int> g_savedatadialog_status{0 /*NONE*/};
     std::atomic<uint32_t> g_savedatadialog_mode{0 /*INVALID*/};
     std::atomic<uint64_t> g_savedatadialog_user_data{0};
+    std::atomic<PlatformUi*> g_savedatadialog_ui{nullptr};
 }
 HLE(s_savedlg_initialize) {
+    if (auto* ui = g_savedatadialog_ui.exchange(nullptr)) ui->saveDataDialogClose();
     g_savedatadialog_mode.store(0);
     g_savedatadialog_user_data.store(0);
     g_savedatadialog_status.store(1 /*INITIALIZED*/);
     return 0;
 }
 HLE(s_savedlg_open) {
+    if (auto* old_ui = g_savedatadialog_ui.exchange(nullptr)) old_ui->saveDataDialogClose();
     if (a0) {
         const uint8_t* param = (const uint8_t*)PW(a0);
-        g_savedatadialog_mode.store(*(const uint32_t*)(param + 0x34));
-        g_savedatadialog_user_data.store(*(const uint64_t*)(param + 0x70));
+        uint32_t mode = 0;
+        uint64_t user_data = 0;
+        memcpy(&mode, param + 0x34, sizeof mode);
+        memcpy(&user_data, param + 0x70, sizeof user_data);
+        g_savedatadialog_mode.store(mode);
+        g_savedatadialog_user_data.store(user_data);
     } else {
         g_savedatadialog_mode.store(0);
         g_savedatadialog_user_data.store(0);
     }
+    if (auto* ui = platform_ui(); ui && ui->saveDataDialogOpen(a0)) {
+        g_savedatadialog_ui.store(ui);
+        return 0;
+    }
     g_savedatadialog_status.store(3 /*FINISHED (auto-dismiss)*/);
     return 0;
 }
-HLE(s_savedlg_status) { return (uint64_t)(unsigned)g_savedatadialog_status.load(); }
+HLE(s_savedlg_status) {
+    if (auto* ui = g_savedatadialog_ui.load())
+        return (uint64_t)(unsigned)ui->saveDataDialogStatus();
+    return (uint64_t)(unsigned)g_savedatadialog_status.load();
+}
 HLE(s_savedlg_result) {
+    if (auto* ui = g_savedatadialog_ui.load()) {
+        (void)ui->saveDataDialogResult(a0);
+        return 0;
+    }
     if (a0) {
         uint8_t* result = (uint8_t*)PW(a0);
-        *(uint32_t*)(result + 0x00) = g_savedatadialog_mode.load();
-        *(uint32_t*)(result + 0x04) = 0 /*CommonDialogResult::OK*/;
-        *(uint32_t*)(result + 0x08) = 0 /*ButtonId::INVALID*/;
-        *(uint32_t*)(result + 0x0c) = 0;
-        *(uint64_t*)(result + 0x10) = 0 /*dirName*/;
-        *(uint64_t*)(result + 0x18) = 0 /*save param*/;
-        *(uint64_t*)(result + 0x20) = g_savedatadialog_user_data.load();
+        const uint32_t mode = g_savedatadialog_mode.load();
+        const uint32_t ok = 0 /*CommonDialogResult::OK*/;
+        const uint32_t invalid = 0 /*ButtonId::INVALID*/;
+        const uint64_t user_data = g_savedatadialog_user_data.load();
+        memcpy(result + 0x00, &mode, sizeof mode);
+        memcpy(result + 0x04, &ok, sizeof ok);
+        memcpy(result + 0x08, &invalid, sizeof invalid);
+        memcpy(result + 0x20, &user_data, sizeof user_data);
     }
     return 0;
 }
-HLE(s_savedlg_close) { g_savedatadialog_status.store(0 /*NONE*/); return 0; }
+HLE(s_savedlg_close) {
+    if (auto* ui = g_savedatadialog_ui.exchange(nullptr)) ui->saveDataDialogClose();
+    g_savedatadialog_status.store(0 /*NONE*/);
+    return 0;
+}
 HLE(s_savedlg_terminate) {
+    if (auto* ui = g_savedatadialog_ui.exchange(nullptr)) ui->saveDataDialogClose();
     g_savedatadialog_status.store(0 /*NONE*/);
     g_savedatadialog_mode.store(0);
     g_savedatadialog_user_data.store(0);
     return 0;
 }
 HLE(s_savedlg_ready) { return 1; }
-HLE(s_savedlg_progress) { return 0; }
+HLE(s_savedlg_progress_inc) {
+    if (auto* ui = g_savedatadialog_ui.load())
+        ui->saveDataDialogProgressBarInc((uint32_t)a0, (uint32_t)a1);
+    return 0;
+}
+HLE(s_savedlg_progress_set) {
+    if (auto* ui = g_savedatadialog_ui.load())
+        ui->saveDataDialogProgressBarSetValue((uint32_t)a0, (uint32_t)a1);
+    return 0;
+}
 
 // --- libSceImeDialog (on-screen text-entry dialog) (#191). We have no keyboard UI, so the dialog
 // auto-completes: Init -> FINISHED immediately, so the game's "poll GetStatus until Finished" loop
@@ -2014,8 +2050,8 @@ void register_service_hle() {
     Hle::register_fn("s9e3+YpRnzw", (HleFn)s_savedlg_initialize, "sceSaveDataDialogInitialize");
     Hle::register_fn("en7gNVnh878", (HleFn)s_savedlg_ready,      "sceSaveDataDialogIsReadyToDisplay");
     Hle::register_fn("4tPhsP6FpDI", (HleFn)s_savedlg_open,       "sceSaveDataDialogOpen");
-    Hle::register_fn("V-uEeFKARJU", (HleFn)s_savedlg_progress,   "sceSaveDataDialogProgressBarInc");
-    Hle::register_fn("hay1CfTmLyA", (HleFn)s_savedlg_progress,   "sceSaveDataDialogProgressBarSetValue");
+    Hle::register_fn("V-uEeFKARJU", (HleFn)s_savedlg_progress_inc, "sceSaveDataDialogProgressBarInc");
+    Hle::register_fn("hay1CfTmLyA", (HleFn)s_savedlg_progress_set, "sceSaveDataDialogProgressBarSetValue");
     Hle::register_fn("YuH2FA7azqQ", (HleFn)s_savedlg_terminate,  "sceSaveDataDialogTerminate");
     Hle::register_fn("KK3Bdg1RWK0", (HleFn)s_savedlg_status,     "sceSaveDataDialogUpdateStatus");
     // libSceImeDialog (#191): auto-completing text-entry dialog (no keyboard UI). Raw NIDs.
