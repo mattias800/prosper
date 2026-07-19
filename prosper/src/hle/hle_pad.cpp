@@ -65,19 +65,21 @@ uint64_t now_us() {
 
 // --- PROSPER_PAD_SCRIPT: hardware-free timed button sequence -------------------------------------
 // Drives a scripted controller so a headless run can navigate menus and gameplay with no host device.
-// Format: a ';'-separated list of "<seconds>:<action>[+..]" entries; actions are buttons or full-stick
+// Format: a ';'-separated list of "<anchor>:<action>[+..]" entries; actions are buttons or full-stick
 // directions such as "left-stick-left". Prefix with '@' to load a route
-// file; files may use newlines, comments, and explicit ranges such as "f300-340:cross". Time points
-// use PROSPER_PAD_HOLD ms (default 300); flip points use PROSPER_PAD_FRAME_HOLD (default 8). When a
+// file; files may use newlines, comments, and explicit ranges such as "f300-340:cross" and
+// "p1200-1240:cross". Time points use PROSPER_PAD_HOLD ms (default 300); flip points use
+// PROSPER_PAD_FRAME_HOLD (default 8); pad-read points use PROSPER_PAD_READ_HOLD (default 8). When a
 // script is set the pad reports
 // CONNECTED for the whole run (a menu that gates on a controller sees one).
 //
-// Timing is anchored to the FIRST input poll, not process start: the game only reads the pad once it
-// reaches the interactive menu, so t=0 == "menu appeared" — robust to how long asset loading takes.
+// Timing is anchored to the FIRST pad poll, not process start: the game only polls once it reaches
+// the interactive menu, so t=0 == "menu appeared" — robust to how long asset loading takes.
 // CONFIDENCE: HIGH (mechanism); MED (that the game's submit maps to OPTIONS="Start" / CROSS).
 // The parse + time-eval live in pad.cpp (pure, unit-tested); this file supplies getenv + the clock.
 double pad_hold_secs();
 int64_t pad_frame_hold();
+int64_t pad_read_hold();
 
 struct PadScriptFileStamp {
     std::filesystem::file_time_type write_time{};
@@ -106,7 +108,7 @@ std::optional<PadScriptFileStamp> pad_script_file_stamp(const std::filesystem::p
 }
 
 // Long exploratory boots can discover a new prompt minutes into a route. Opt-in @file reload keeps
-// the original time/flip anchors while allowing future windows to be appended without rebooting.
+// the original time/flip/read anchors while allowing future windows to be appended without rebooting.
 // A changed stamp must remain stable across two 250 ms polls, and a replacement is published only
 // after a complete read whose metadata is still unchanged. Pad readers serialize here, so no thread
 // can observe a vector while another replaces it.
@@ -133,10 +135,11 @@ public:
 
     bool configured() const { return !source_.empty(); }
 
-    PadScriptState state_at(double elapsed, int64_t frame) {
+    PadScriptState state_at(double elapsed, int64_t frame, int64_t read) {
         std::lock_guard<std::mutex> lock(mutex_);
         refresh_locked();
-        return pad_script_state_at(script_, elapsed, pad_hold_secs(), frame, pad_frame_hold());
+        return pad_script_state_at(script_, elapsed, pad_hold_secs(), frame, pad_frame_hold(),
+                                   read, pad_read_hold());
     }
 
 private:
@@ -239,8 +242,26 @@ int64_t pad_frame_now() {
     return flips >= base ? (int64_t)(flips - base) : 0;
 }
 
+// Pad-read anchor: each successful scePadRead/scePadReadState call is one read, numbered from zero.
+// Metadata queries and rejected reads do not consume it; it advances even when presentation is paused.
+std::atomic<uint64_t> g_pad_read_count{0};
+
+int64_t pad_read_hold() {
+    static const int64_t h = [] {
+        const char* e = getenv("PROSPER_PAD_READ_HOLD");
+        return e ? (int64_t)atoll(e) : 8;
+    }();
+    return h;
+}
+
+int64_t pad_read_now() {
+    const uint64_t read = g_pad_read_count.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t max = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    return read <= max ? static_cast<int64_t>(read) : std::numeric_limits<int64_t>::max();
+}
+
 // Overlay any active scripted press onto `s`. Returns true if a script is driving the pad.
-bool apply_pad_script(HostPadState& s, int64_t frame) {
+bool apply_pad_script(HostPadState& s, int64_t frame, int64_t read) {
     auto& script = pad_script_runtime();
     if (!script.configured()) return false;
     s.connected = true;                                     // a controller is present for the whole run
@@ -250,7 +271,7 @@ bool apply_pad_script(HostPadState& s, int64_t frame) {
         if (g_pad_t0_us.compare_exchange_strong(expect, now)) t0 = now; else t0 = expect;
     }
     double elapsed = (now_us() - t0) / 1e6;
-    const PadScriptState scripted = script.state_at(elapsed, frame);
+    const PadScriptState scripted = script.state_at(elapsed, frame, read);
     if (pad_script_log()) {
         const auto encoded_direction = [](int8_t value) { return uint64_t(uint8_t(value + 1)); };
         const uint64_t signature = uint64_t(scripted.button_mask) |
@@ -271,8 +292,8 @@ bool apply_pad_script(HostPadState& s, int64_t frame) {
                 append_axis(scripted.right_x < 0 ? "right-stick-left" : scripted.right_x > 0 ? "right-stick-right" : "right-stick-x-center");
             if (scripted.axis_mask & PAD_SCRIPT_RIGHT_Y)
                 append_axis(scripted.right_y < 0 ? "right-stick-up" : scripted.right_y > 0 ? "right-stick-down" : "right-stick-y-center");
-            fprintf(stderr, "[pad-script] elapsed=%.3f frame=%lld buttons=%s%s%s\n", elapsed,
-                    (long long)frame, buttons.empty() ? "neutral" : buttons.c_str(),
+            fprintf(stderr, "[pad-script] elapsed=%.3f frame=%lld read=%lld buttons=%s%s%s\n", elapsed,
+                    (long long)frame, (long long)read, buttons.empty() ? "neutral" : buttons.c_str(),
                     axes.empty() ? "" : " axes=", axes.c_str());
         }
     }
@@ -330,15 +351,19 @@ void pad_record(int64_t frame, uint32_t buttons) {
 // installed, prosper_core's default backend reports ONE connected controller with neutral input (a PS5
 // title can gate progression on a pad being present, so dev/testing needs one). PROSPER_PAD_PRESS adds
 // a synthetic CROSS; PROSPER_PAD_SCRIPT adds a timed controller sequence — device-independent test drivers.
-HostPadState snapshot(int /*handle*/, const char* what) {
+HostPadState poll_controller(int /*handle*/, const char* what, bool consume_input_read) {
     HostPadState s;   // filled by the backend below (default: one connected, neutral controller)
     pad_backend()->poll(0, s);
     if (getenv("PROSPER_PAD_PRESS")) {
         s.connected = true;
         s.buttons  |= SCE_PAD_BUTTON_CROSS;
     }
+    // Preserve the established seconds/flip origins and recording behavior on every pad poll. A
+    // metadata query evaluates those axes with no read index, so only successful input-state calls
+    // can activate or advance pN routes.
     const int64_t frame = pad_frame_now();
-    apply_pad_script(s, frame);
+    const int64_t read = consume_input_read ? pad_read_now() : -1;
+    apply_pad_script(s, frame, read);
     pad_record(frame, s.buttons);
     padlog_once(what, &s);
     return s;
@@ -365,7 +390,7 @@ HLE(pad_is_valid_handle) { return a0 >= 1 ? 1 : 0; }
 // scePadReadState(handle, ScePadData* out) -> 0 on success. One current snapshot.
 HLE(pad_read_state) {
     if (!a1) return 0;
-    HostPadState s = snapshot((int)a0, __func__);
+    HostPadState s = poll_controller((int)a0, __func__, true);
     pad_fill_data((ScePadData*)PW(a1), s, now_us(), s.connected ? 1 : 0);
     return 0;
 }
@@ -375,7 +400,7 @@ HLE(pad_read_state) {
 HLE(pad_read) {
     int num = (int)(int64_t)a2;
     if (!a1 || num < 1) return 0;
-    HostPadState s = snapshot((int)a0, __func__);
+    HostPadState s = poll_controller((int)a0, __func__, true);
     pad_fill_data((ScePadData*)PW(a1), s, now_us(), s.connected ? 1 : 0);
     return 1;   // one state written
 }
@@ -383,7 +408,7 @@ HLE(pad_read) {
 // scePadGetControllerInformation(handle, ScePadControllerInformation* out) -> 0.
 HLE(pad_get_info) {
     if (!a1) return 0;
-    HostPadState s = snapshot((int)a0, __func__);
+    HostPadState s = poll_controller((int)a0, __func__, false);
     pad_fill_controller_info((ScePadControllerInformation*)PW(a1), s.connected, s.connected ? 1 : 0);
     return 0;
 }

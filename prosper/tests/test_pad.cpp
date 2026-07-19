@@ -11,8 +11,10 @@
 #include <cstring>
 #include <cstddef>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 
 using namespace prosper;
 using namespace prosper::input;
@@ -20,6 +22,14 @@ using namespace prosper::input;
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
+
+static void set_test_env(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
 
 int main() {
     printf("== test_pad ==\n");
@@ -101,9 +111,12 @@ int main() {
         CHECK(ci.stick_dead_zone_left == ci.stick_dead_zone_right, "info: symmetric dead zone");
     }
 
-    // (6) HLE registration + full-struct fill (no PROSPER_PAD -> neutral input, but ONE controller is
-    // connected by default: the built-in NeutralPadBackend now presents a connected pad for dev/testing).
+    // (6) HLE registration + full-struct fill. The built-in NeutralPadBackend presents one connected
+    // controller for development/testing; the short route also verifies input-read counter ownership.
     {
+        // Explicit one-read windows make counter movement visible. Metadata queries below must not
+        // consume either window; the first two successful input reads must see p0 and p1 in order.
+        set_test_env("PROSPER_PAD_SCRIPT", "0-0.05:triangle;p0-1:cross;p1-2:options");
         register_builtin_hle();
         HleFn read_state = Hle::lookup(nid_hash("scePadReadState"));
         HleFn read       = Hle::lookup(nid_hash("scePadRead"));
@@ -112,6 +125,24 @@ int main() {
         CHECK(read_state && read && get_info && open, "pad HLE functions registered");
 
         if (open) CHECK(open(1, 0, 0, 0, 0, 0) >= 1, "scePadOpen -> positive handle");
+
+        if (get_info) {
+            ScePadControllerInformation ci{};
+            CHECK(get_info(1, (uint64_t)(uintptr_t)&ci, 0, 0, 0, 0) == 0,
+                  "scePadGetControllerInformation -> 0 (OK)");
+            CHECK(ci.connected == 1, "info query sees script-driven controller connectivity");
+        }
+
+        // The legacy seconds origin is the first pad poll, including an information query. If the
+        // origin moved to the first state read, the short Triangle window would incorrectly fire below.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        if (read) {
+            ScePadData unused{};
+            CHECK(read(1, 0, 1, 0, 0, 0) == 0 &&
+                  read(1, (uint64_t)(uintptr_t)&unused, 0, 0, 0, 0) == 0,
+                  "failed scePadRead calls do not consume input windows");
+        }
 
         if (read_state) {
             ScePadData d;
@@ -122,13 +153,22 @@ int main() {
             CHECK(d.connected == 1, "readstate: one controller connected by default (dev/testing default)");
             CHECK(d.left_stick_x == 0x80, "readstate: sticks centered");
             CHECK(d.orientation_w == 1.0f, "readstate: identity orientation");
+            CHECK(d.buttons == SCE_PAD_BUTTON_CROSS,
+                  "readstate: metadata preserves seconds origin without consuming p0 input window");
         }
 
         if (read) {
+            if (get_info) {
+                ScePadControllerInformation ci{};
+                get_info(1, (uint64_t)(uintptr_t)&ci, 0, 0, 0, 0);
+            }
             ScePadData d;
             uint64_t n = read(1, (uint64_t)(uintptr_t)&d, 4 /*num*/, 0, 0, 0);
             CHECK(n == 1, "scePadRead -> 1 state");
+            CHECK(d.buttons == SCE_PAD_BUTTON_OPTIONS,
+                  "scePadRead: intervening metadata query did not consume p1 input window");
         }
+        set_test_env("PROSPER_PAD_SCRIPT", "");
     }
 
     // (7) PROSPER_PAD_SCRIPT pure helpers — parse + time-eval (drives menus headless, issue #163).
@@ -215,7 +255,41 @@ int main() {
         CHECK(pad_script_buttons_at(fs, 5.1, hold, /*no frame info*/-1, fhold) == SCE_PAD_BUTTON_OPTIONS,
               "frame: seconds entry still fires with frame_count=-1; frame entry does not");
 
-        // File syntax: newlines/comments, explicit time/frame ranges, and @path loading.
+        // Pad-read anchors (#302): "p<N>:" fires on successful state read N, independent of time/flips.
+        auto reads = parse_pad_script("p100:cross;P120-125:options;7:circle;f40:square");
+        CHECK(reads.size() == 4, "read: seconds/frame/read entries parse together");
+        CHECK(reads[0].read_anchored && !reads[0].frame_anchored &&
+              reads[0].t_secs == 100.0 && reads[0].button_mask == SCE_PAD_BUTTON_CROSS,
+              "read: 'p100:cross' parses pad-read-anchored at 100");
+        CHECK(reads[1].read_anchored && reads[1].t_secs == 120.0 && reads[1].end == 125.0,
+              "read: explicit range preserves its exclusive end");
+        const int64_t rhold = 4;
+        CHECK(pad_script_buttons_at(reads, 999.0, hold, 999, fhold, 99, rhold) == 0,
+              "read: before point window -> none despite unrelated time/frame values");
+        CHECK(pad_script_buttons_at(reads, 999.0, hold, 999, fhold, 100, rhold) ==
+                  SCE_PAD_BUTTON_CROSS,
+              "read: point starts at the requested pad read");
+        CHECK(pad_script_buttons_at(reads, 999.0, hold, 999, fhold, 103, rhold) ==
+                  SCE_PAD_BUTTON_CROSS,
+              "read: point uses the configured default read hold");
+        CHECK(pad_script_buttons_at(reads, 999.0, hold, 999, fhold, 104, rhold) == 0,
+              "read: point ends exclusively");
+        CHECK(pad_script_buttons_at(reads, 0.0, hold, 0, fhold, 124, rhold) ==
+                  SCE_PAD_BUTTON_OPTIONS,
+              "read: explicit range is active before its end");
+        CHECK(pad_script_buttons_at(reads, 0.0, hold, 0, fhold, 125, rhold) == 0,
+              "read: explicit range ends exclusively");
+        CHECK(pad_script_buttons_at(reads, 7.1, hold, -1, fhold, -1, rhold) ==
+                  SCE_PAD_BUTTON_CIRCLE,
+              "read: unavailable count suppresses read entries without affecting seconds entries");
+        auto invalid_counts = parse_pad_script(
+            "p1.5:cross;p9007199254740992:cross;f2.5:cross;"
+            "p9007199254740990.5:cross;p1-9007199254740990.5:cross;p5:circle");
+        CHECK(invalid_counts.size() == 1 && invalid_counts[0].read_anchored &&
+              invalid_counts[0].t_secs == 5.0,
+              "read: fractional or inexact count anchors are rejected before conversion");
+
+        // File syntax: newlines/comments, explicit time/frame/read ranges, and @path loading.
         auto ranges = parse_pad_script("# checkpoint\n f10-20:cross # hold\n3-4.5:up+cross\n");
         CHECK(ranges.size() == 2, "route: comments/newlines parse two entries");
         CHECK(ranges[0].frame_anchored && ranges[0].t_secs == 10.0 && ranges[0].end == 20.0,
@@ -232,11 +306,12 @@ int main() {
         const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
         const auto route_path = std::filesystem::temp_directory_path() /
                                 ("prosper_test_pad_route_" + std::to_string(unique) + ".pad");
-        { std::ofstream route(route_path); route << "# loaded route\nf7-12:options\n"; }
+        { std::ofstream route(route_path); route << "# loaded route\nf7-12:options\np20-24:cross\n"; }
         std::string route_error;
         auto loaded = load_pad_script("@" + route_path.string(), &route_error);
-        CHECK(route_error.empty() && loaded.size() == 1 && loaded[0].frame_anchored && loaded[0].end == 12.0,
-              "route: @path loads and parses a file");
+        CHECK(route_error.empty() && loaded.size() == 2 && loaded[0].frame_anchored &&
+              loaded[0].end == 12.0 && loaded[1].read_anchored && loaded[1].end == 24.0,
+              "route: @path loads and parses flip/read entries");
         std::filesystem::remove(route_path);
         auto missing = load_pad_script("@/this/prosper/route/does/not/exist.pad", &route_error);
         CHECK(missing.empty() && !route_error.empty(), "route: missing @path reports an error");
