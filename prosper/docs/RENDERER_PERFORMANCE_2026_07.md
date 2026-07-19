@@ -192,6 +192,36 @@ A second nearby pair measured 139.4 to 133.6 ms whole-submit time, confirming a 
 gain. The flat 37 ms fence wait remains the primary structural limit; packing removes CPU object handling
 and pool bookkeeping but does not change GPU work or synchronous ownership.
 
+## Evergate intermediate scanout readback (2026-07-19)
+
+Per-target timing showed that Evergate's dense transition renders the same 1080p VideoOut target in four
+graphics spans separated by compute. The first three callbacks cannot publish a frame, but each previously
+copied the whole scanout to CPU memory before the fourth and final span repeated that readback. Persistent
+color-target queue order already preserves those writes, compute consumers can materialize a target lazily,
+and a DMA producer is explicitly marked authoritative by the ordered executor.
+
+Intermediate non-authoritative scanout spans now remain GPU-resident. The final callback either uses the
+normal readback from a later scanout pass or materializes the cached target once if the submit ended on a
+different target. Deferred scanouts are pinned against the backend's bounded LRU eviction until final
+materialization, while guest writes may still invalidate their pixels.
+`PROSPER_NO_INTERMEDIATE_SCANOUT_DEFER=1` restores per-span scanout readback for a same-binary comparison.
+
+Native Windows / RTX 4090, one RelWithDebInfo binary, separate fresh saves, native scale/cadence, and the
+documented Evergate route produced 104 dense submits in each run:
+
+| Measurement | Per-span scanout readback | Intermediate defer |
+|---|---:|---:|
+| Median total draws / submit | 474 | 474 |
+| Median backend execution | 77.5 ms | 72.0 ms |
+| Median GPU fence wait | 37.2 ms | 35.3 ms |
+| Median readback | 6.2 ms | 2.7 ms |
+| CPU readbacks / submit | 6 | 3 |
+
+Matched 25-submit windows near 475-482 draws improved from 127.8 ms to 124.8 ms end to end. Both runs
+completed the fresh-save route at 1920x1080 and produced direct composited frames. The remaining structural
+cost is the fence wait after every backend call; removing it requires deferred lifetime management for all
+call-local Vulkan resources and is intentionally outside this tranche.
+
 ## Dead Cells backend upload duplication (2026-07-15)
 
 Dead Cells exposed a second duplication layer after the frontend decode caches. The frontend correctly

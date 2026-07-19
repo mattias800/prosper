@@ -435,6 +435,7 @@ struct PersistentColorTargetImage {
     VkDeviceSize bytes = 0;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     uint64_t last_use = 0;
+    uint32_t pin_count = 0;
     bool valid = false;
 };
 
@@ -474,6 +475,27 @@ inline PersistentColorTargetImage* find_persistent_color_target(
     return &found->second;
 }
 
+// Ordered frontend spans may need a GPU-only target to survive later backend calls until the submit's
+// final callback materializes or presents it. Pins are explicit and short-lived; invalidation still
+// makes the pixels unusable, while eviction waits until every owner releases the allocation.
+inline bool pin_persistent_color_target(uint64_t id, uint32_t width, uint32_t height,
+                                        VkFormat format) {
+    PersistentColorTargetImage* target = find_persistent_color_target(
+        id, width, height, backend_color_format(format));
+    if (!target || target->pin_count == UINT32_MAX) return false;
+    ++target->pin_count;
+    return true;
+}
+
+inline bool unpin_persistent_color_target(uint64_t id, uint32_t width, uint32_t height,
+                                          VkFormat format) {
+    auto& cache = persistent_color_target_cache();
+    auto found = cache.find({id, width, height, backend_color_format(format)});
+    if (found == cache.end() || !found->second.pin_count) return false;
+    --found->second.pin_count;
+    return true;
+}
+
 // Guest/compute writes invalidate the GPU-produced version without immediately freeing the image.
 // The next render may reuse the allocation, but it cannot LOAD or sample stale pixels.
 inline void invalidate_persistent_color_target(uint64_t id) {
@@ -505,7 +527,7 @@ inline bool evict_persistent_color_target(const RenderVkCtx& ctx, uint64_t curre
     auto& cache = persistent_color_target_cache();
     auto victim = cache.end();
     for (auto it = cache.begin(); it != cache.end(); ++it) {
-        if (it->second.last_use == current_generation) continue;
+        if (it->second.last_use == current_generation || it->second.pin_count) continue;
         if (victim == cache.end() || it->second.last_use < victim->second.last_use)
             victim = it;
     }

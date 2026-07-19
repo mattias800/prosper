@@ -264,17 +264,30 @@ int main() {
         std::vector<uint8_t> deferred = prosper::test::render_draws_rgba(
             {add_green}, W, H, nullptr, nullptr, false, &deferred_target);
         const auto deferred_stats = prosper::test::backend_color_target_stats();
+        const bool pinned = prosper::test::pin_persistent_color_target(
+            target_id, W, H, VK_FORMAT_R8G8B8A8_UNORM);
+        // Exceed the 64-entry target-cache cap after the deferred target becomes the oldest live
+        // entry. Without the submit-lifetime pin, normal LRU pressure discards its only current pixels
+        // before the frontend's final callback can materialize them.
+        for (uint64_t pressure = 0; pressure < 70; ++pressure) {
+            prosper::test::BackendColorTarget pressure_target{
+                target_id + 0x1000 + pressure, false, false};
+            prosper::test::render_draws_rgba(
+                {producer}, W, H, nullptr, nullptr, false, &pressure_target);
+        }
         std::vector<uint8_t> materialized;
         std::string materialize_error;
         const bool materialized_ok = prosper::test::readback_persistent_color_target(
             target_id, W, H, VK_FORMAT_R8G8B8A8_UNORM, materialized, materialize_error);
+        const bool unpinned = prosper::test::unpin_persistent_color_target(
+            target_id, W, H, VK_FORMAT_R8G8B8A8_UNORM);
         std::vector<uint8_t> deferred_sample = prosper::test::render_draws_rgba(
             {gpu_sample}, W, H);
         CHECK(deferred.empty() && deferred_stats.write_hits == 1 &&
                   deferred_stats.readbacks == 0,
               "persistent LOAD pass can complete without allocating a CPU readback");
-        CHECK(materialized_ok && materialized == cpu_accumulated,
-              "GPU-only persistent target can be materialized on demand for an ordered consumer");
+        CHECK(pinned && materialized_ok && materialized == cpu_accumulated && unpinned,
+              "pinned GPU-only target survives eviction pressure until ordered materialization");
         CHECK(!deferred_sample.empty() && deferred_sample == cpu_accumulated_sample,
               "deferred-readback accumulation matches the CPU reference after sampling");
 

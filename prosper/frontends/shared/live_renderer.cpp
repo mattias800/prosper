@@ -407,6 +407,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
         !getenv("PROSPER_DUMP_DRAWSTEPS") &&
         !getenv("PROSPER_RESOURCE_HASH_DIM") && !getenv("PROSPER_TARGET_STEP_HASH_DIM") &&
         !getenv("PROSPER_RTTLOG");
+    static const bool defer_intermediate_scanout = live_gpu_targets &&
+        !getenv("PROSPER_NO_INTERMEDIATE_SCANOUT_DEFER");
     if (live_gpu_targets)
         fprintf(stderr, "[render] persistent GPU color targets enabled (experimental)\n");
     prosper::gpu::set_submit_renderer(
@@ -415,6 +417,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             using RC = prosper::gpu::ResourceClass;
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
             const prosper::gpu::LiveRenderPhase phase = prosper::gpu::live_render_phase();
+            struct PinnedScanout {
+                uint64_t id = 0;
+                uint32_t width = 0, height = 0;
+                VkFormat format = VK_FORMAT_UNDEFINED;
+            };
+            static thread_local std::vector<PinnedScanout> pinned_scanouts;
+            auto release_pinned_scanouts = [&] {
+                for (const PinnedScanout& target : pinned_scanouts)
+                    prosper::test::unpin_persistent_color_target(
+                        target.id, target.width, target.height, target.format);
+                pinned_scanouts.clear();
+            };
+            // A terminal callback normally releases every pin. Recover conservatively if an earlier
+            // submit was aborted after rendering but before frontend finalization.
+            if (phase.first_span && !pinned_scanouts.empty()) release_pinned_scanouts();
             // PROSPER_RENDER_FIRST=<N>: skip the slow (~400x) Vulkan render for the first N GPU submits, so
             // the game reaches a LATE scene (e.g. the level1 cutscene, which only starts submitting after
             // ~5000 title-loop submits) at native speed before we begin rendering/dumping. Returning {}
@@ -477,6 +494,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 uint64_t target = 0;
                 uint32_t width = 0, height = 0;
                 size_t draws = 0;
+                bool first_span = false, final_span = false;
+                bool authoritative_readback = false, deferred_readback = false;
                 double measured_ms = 0;
                 prosper::test::BackendRenderTimingStats timing;
                 prosper::test::BackendColorTargetStats color_target;
@@ -522,11 +541,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 const int length = snprintf(
                     line, sizeof(line),
                     "[rtt-timing] submit=%d target=0x%llx extent=%ux%u draws=%zu "
+                    "span=%d/%d authoritative=%d deferred=%d "
                     "measured=%.2f detail=%.2f other=%.2f target_setup=%.2f "
                     "draw_setup=%.2f record_upload=%.2f gpu_wait=%.2f "
                     "readback=%.2f cleanup=%.2f gpu_target=%llu load=%llu sample=%llu cpu=%llu\n",
                     record.submit, (unsigned long long)record.target,
-                    record.width, record.height, record.draws, record.measured_ms, detail_ms,
+                    record.width, record.height, record.draws,
+                    record.first_span, record.final_span, record.authoritative_readback,
+                    record.deferred_readback, record.measured_ms, detail_ms,
                     record.measured_ms - detail_ms,
                     timing.target_ms, timing.draw_setup_ms, timing.record_upload_ms,
                     timing.gpu_wait_ms, timing.readback_ms, timing.cleanup_ms,
@@ -2120,12 +2142,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             inspect(items[later].prt.get());
                         }
                     }
-                    // Defer only a proven graphics-to-graphics intermediate. A same-submit DMA asks
-                    // its producer span for readback; a later-submit DMA materializes the persistent
-                    // image synchronously through the byte-range reader above.
-                    const bool defer_readback = live_gpu_targets && vo_n > 0 && base && !is_vo &&
-                        base != front_va && sampled_exact_later && !feedback_later &&
-                        !phase.authoritative_readback;
+                    // Keep intermediate scanout spans GPU-resident too: they cannot publish until the
+                    // final callback, where the cache is materialized on demand if no later scanout
+                    // pass already requested CPU pixels. A same-submit DMA asks its producer span for
+                    // authoritative readback, and compute consumers use the lazy target reader above.
+                    const bool defer_readback = live_gpu_targets && vo_n > 0 && base &&
+                        !phase.authoritative_readback &&
+                        ((is_vo && phase.allows_deferred_scanout_readback() &&
+                          defer_intermediate_scanout) ||
+                         (!is_vo && base != front_va && sampled_exact_later && !feedback_later));
                     prosper::test::BackendColorTarget backend_target{
                         base, seed_rtt, !defer_readback, pass_format};
                     const bool color1_extent_matches = base1 && !render_pass.empty() &&
@@ -2195,6 +2220,31 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             base, gw, gh, pass_format) != nullptr;
                         if (!pass_pixels->empty()) surface.rgba = pass_pixels;
                         else if (surface.gpu_valid) surface.rgba.reset();
+                        if (defer_readback && is_vo && surface.gpu_valid) {
+                            const auto already_pinned = std::find_if(
+                                pinned_scanouts.begin(), pinned_scanouts.end(),
+                                [&](const PinnedScanout& target) {
+                                    return target.id == base && target.width == gw &&
+                                           target.height == gh && target.format == pass_format;
+                                });
+                            if (already_pinned == pinned_scanouts.end()) {
+                                if (prosper::test::pin_persistent_color_target(
+                                        base, gw, gh, pass_format)) {
+                                    pinned_scanouts.push_back({base, gw, gh, pass_format});
+                                } else {
+                                    // Pinning is expected to succeed for the target just written. If
+                                    // cache state is inconsistent, preserve correctness by immediately
+                                    // restoring the authoritative CPU fallback.
+                                    std::vector<uint8_t> materialized;
+                                    std::string error;
+                                    if (prosper::test::readback_persistent_color_target(
+                                            base, gw, gh, pass_format, materialized, error))
+                                        surface.rgba =
+                                            std::make_shared<const std::vector<uint8_t>>(
+                                                std::move(materialized));
+                                }
+                            }
+                        }
                     } else if (base && !pass_pixels->empty()) {
                         RttSurf& surface = g_rtt[base];
                         surface.rgba = pass_pixels;
@@ -2304,6 +2354,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     }
                     const RttTimingRecord rtt_timing_record{
                         g_this_submit, base, gw, gh, pass.size(),
+                        phase.first_span, phase.final_span, phase.authoritative_readback,
+                        defer_readback,
                         std::chrono::duration<double, std::milli>(
                             backend_done - build_done).count(),
                         backend_call_timing, color_target_call};
@@ -2470,10 +2522,30 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 auto cached_scanout = [&](uint64_t addr) -> const RttSurf* {
                     auto it = g_rtt.find(addr);
                     if (it == g_rtt.end() || it->second.w != w || it->second.h != h ||
-                        it->second.format != VK_FORMAT_R8G8B8A8_UNORM ||
-                        !it->second.rgba || it->second.rgba->size() != (size_t)w * h * 4)
+                        it->second.format != VK_FORMAT_R8G8B8A8_UNORM)
                         return nullptr;
-                    return &it->second;
+                    RttSurf& surface = it->second;
+                    const size_t expected = static_cast<size_t>(w) * h * 4;
+                    if ((!surface.rgba || surface.rgba->size() != expected) && surface.gpu_valid) {
+                        std::vector<uint8_t> materialized;
+                        std::string error;
+                        if (prosper::test::readback_persistent_color_target(
+                                addr, w, h, surface.format, materialized, error) &&
+                            materialized.size() == expected) {
+                            surface.rgba = std::make_shared<const std::vector<uint8_t>>(
+                                std::move(materialized));
+                        } else {
+                            static std::atomic<int> warned{0};
+                            if (warned.fetch_add(1) < 24)
+                                std::fprintf(stderr,
+                                             "[rtt] final scanout readback failed: base=0x%llx "
+                                             "extent=%ux%u error=%s\n",
+                                             static_cast<unsigned long long>(addr), w, h,
+                                             error.c_str());
+                            return nullptr;
+                        }
+                    }
+                    return surface.rgba && surface.rgba->size() == expected ? &surface : nullptr;
                 };
                 const int front = prosper::gpu::present_front_index();
                 const RttSurf* scanout = front >= 0
@@ -2484,6 +2556,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 }
                 if (scanout) selected_pixels = scanout->rgba;
             }
+            if (phase.final_span) release_pinned_scanouts();
             if (phase.final_span && lightweight_rtt_timing && rtt_log_in_range &&
                 pending_timing.backend_draws >= rtt_timing_min_draws) {
                 std::string output;
