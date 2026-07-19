@@ -40,6 +40,7 @@
 #endif
 #if defined(__linux__) || defined(__APPLE__)
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <signal.h>
@@ -156,6 +157,14 @@ struct GuestMutexAttr {
     int sony_type;
 };
 
+// PS5 condition attributes carry clock ids that are not all representable by host
+// pthread_condattr_t (notably Virtual/Prof, and macOS lacks condattr_setclock). Keep the guest
+// identity explicitly and translate its deadline when a timed wait is performed.
+struct GuestCondAttr {
+    int32_t clock_id = 0; // 0=Realtime, 1=Virtual, 2=Prof, 4=Monotonic
+    int32_t pshared = 0;  // only process-private condition variables are supported
+};
+
 HLE(k_mutexattr_init) {
     if (!a0) return 0x16; // EINVAL-ish
     auto* at = (GuestMutexAttr*)calloc(1, sizeof(GuestMutexAttr));
@@ -251,6 +260,32 @@ HLE(k_mutexattr_destroy)     { if (a0 && *(void**)a0) { auto* at = (GuestMutexAt
 // CONFIDENCE: HIGH (semantics cross-checked against FreeBSD libthr + the Kyty reference).
 namespace {
     inline bool pt_static_sentinel(void* v) { return (uintptr_t)v < 0x1000; }  // NULL/1/2/3... = static initializer
+
+    struct GuestCondState {
+        int32_t clock_id = 0;
+        uint64_t generation = 0;
+    };
+    std::mutex g_guest_cond_state_mutex;
+    std::unordered_map<pthread_cond_t*, GuestCondState> g_guest_cond_states;
+
+    void guest_cond_register(pthread_cond_t* cond, int32_t clock_id) {
+        std::lock_guard<std::mutex> lock(g_guest_cond_state_mutex);
+        g_guest_cond_states[cond] = GuestCondState{clock_id, 0};
+    }
+    void guest_cond_unregister(pthread_cond_t* cond) {
+        std::lock_guard<std::mutex> lock(g_guest_cond_state_mutex);
+        g_guest_cond_states.erase(cond);
+    }
+    GuestCondState guest_cond_snapshot(pthread_cond_t* cond) {
+        std::lock_guard<std::mutex> lock(g_guest_cond_state_mutex);
+        auto found = g_guest_cond_states.find(cond);
+        return found == g_guest_cond_states.end() ? GuestCondState{} : found->second;
+    }
+    void guest_cond_advance(pthread_cond_t* cond) {
+        std::lock_guard<std::mutex> lock(g_guest_cond_state_mutex);
+        auto found = g_guest_cond_states.find(cond);
+        if (found != g_guest_cond_states.end()) ++found->second.generation;
+    }
 #ifdef _WIN32
     // winpthreads' cooperative try-lock loop cannot rely on pthread_mutex_lock to report a
     // same-thread ERRORCHECK relock before it starts polling. Track ownership explicitly on Windows
@@ -342,10 +377,13 @@ namespace {
         void* cur = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
         if (!pt_static_sentinel(cur)) return (pthread_cond_t*)cur;
         auto* c = (pthread_cond_t*)calloc(1, sizeof(pthread_cond_t));
-        pthread_cond_init(c, nullptr);
+        if (!c) return nullptr;
+        if (pthread_cond_init(c, nullptr) != 0) { free(c); return nullptr; }
+        guest_cond_register(c, 0);
         if (__atomic_compare_exchange_n(slot, &cur, (void*)c, false,
                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
             return c;
+        guest_cond_unregister(c);
         pthread_cond_destroy(c); free(c);
         return (pthread_cond_t*)cur;
     }
@@ -445,12 +483,166 @@ HLE(k_mutex_unlock)  {
 }
 
 // --- condition variables ---
-HLE(k_condattr_init)    { if (a0) { auto* c = (pthread_condattr_t*)calloc(1, sizeof(pthread_condattr_t)); pthread_condattr_init(c); *(void**)a0 = c; } return 0; }
-HLE(k_condattr_destroy) { if (a0 && *(void**)a0) { free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
-HLE(k_cond_init)      { if (!a0) return 0x16; auto* c = (pthread_cond_t*)calloc(1, sizeof(pthread_cond_t)); pthread_cond_init(c, nullptr); *(void**)a0 = c; return 0; }
-HLE(k_cond_destroy)   { if (a0 && !pt_static_sentinel(*(void**)a0)) { auto* c = (pthread_cond_t*)*(void**)a0; pthread_cond_destroy(c); interruptible_cond_forget(c); free(c); } if (a0) *(void**)a0 = nullptr; return 0; }
-HLE(k_cond_signal)    { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.signal    cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) interruptible_cond_signal(c); return 0; }
-HLE(k_cond_broadcast) { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.broadcast cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) interruptible_cond_broadcast(c); return 0; }
+namespace {
+    constexpr int32_t kSonyClockRealtime = 0;
+    constexpr int32_t kSonyClockVirtual = 1;
+    constexpr int32_t kSonyClockProf = 2;
+    constexpr int32_t kSonyClockMonotonic = 4;
+    constexpr int64_t kCondClockSliceNs = 50'000'000;
+
+    bool valid_cond_clock(int32_t clock_id) {
+        return clock_id == kSonyClockRealtime || clock_id == kSonyClockVirtual ||
+               clock_id == kSonyClockProf || clock_id == kSonyClockMonotonic;
+    }
+    GuestCondAttr* guest_condattr(uint64_t slot_addr) {
+        if (!slot_addr) return nullptr;
+        void* attr = *(void**)(uintptr_t)slot_addr;
+        return pt_static_sentinel(attr) ? nullptr : (GuestCondAttr*)attr;
+    }
+
+#ifdef _WIN32
+    uint64_t filetime_ticks(const FILETIME& value) {
+        ULARGE_INTEGER ticks{};
+        ticks.LowPart = value.dwLowDateTime;
+        ticks.HighPart = value.dwHighDateTime;
+        return ticks.QuadPart;
+    }
+#endif
+
+    // Sony's Virtual clock is process user CPU time; Prof adds kernel CPU time. Neither is a
+    // portable pthread condattr clock, so collect them explicitly on every bounded wait slice.
+    int guest_cond_clock_now(int32_t clock_id, timespec& result) {
+        if (clock_id == kSonyClockRealtime || clock_id == kSonyClockMonotonic) {
+            const clockid_t host_clock = clock_id == kSonyClockRealtime ? CLOCK_REALTIME : CLOCK_MONOTONIC;
+            return clock_gettime(host_clock, &result) == 0 ? 0 : (errno ? errno : EINVAL);
+        }
+#ifdef _WIN32
+        FILETIME created{}, exited{}, kernel{}, user{};
+        if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return EINVAL;
+        uint64_t ticks = filetime_ticks(user);
+        if (clock_id == kSonyClockProf) ticks += filetime_ticks(kernel);
+        result.tv_sec = (time_t)(ticks / 10'000'000ull);
+        result.tv_nsec = (long)((ticks % 10'000'000ull) * 100ull);
+        return 0;
+#else
+        rusage usage{};
+        if (getrusage(RUSAGE_SELF, &usage) != 0) return errno ? errno : EINVAL;
+        int64_t sec = usage.ru_utime.tv_sec;
+        int64_t usec = usage.ru_utime.tv_usec;
+        if (clock_id == kSonyClockProf) {
+            sec += usage.ru_stime.tv_sec;
+            usec += usage.ru_stime.tv_usec;
+        }
+        sec += usec / 1'000'000;
+        usec %= 1'000'000;
+        result.tv_sec = (time_t)sec;
+        result.tv_nsec = (long)(usec * 1000);
+        return 0;
+#endif
+    }
+
+    bool timespec_reached(const timespec& now, const timespec& deadline) {
+        return now.tv_sec > deadline.tv_sec ||
+               (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec);
+    }
+
+    timespec stable_slice_duration(const timespec& selected_now,
+                                   const timespec& selected_deadline) {
+        int64_t wait_ns = kCondClockSliceNs;
+        if (selected_deadline.tv_sec == selected_now.tv_sec) {
+            wait_ns = selected_deadline.tv_nsec - selected_now.tv_nsec;
+        } else if (selected_deadline.tv_sec == selected_now.tv_sec + 1) {
+            const int64_t remainder = 1'000'000'000ll - selected_now.tv_nsec +
+                                      selected_deadline.tv_nsec;
+            if (remainder < wait_ns) wait_ns = remainder;
+        }
+        return timespec{(time_t)(wait_ns / 1'000'000'000ll),
+                        (long)(wait_ns % 1'000'000'000ll)};
+    }
+
+    int interruptible_cond_clock_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
+                                           const timespec& deadline, int32_t clock_id) {
+        if (clock_id == kSonyClockRealtime)
+            return interruptible_cond_timedwait(cond, mutex, &deadline);
+        if (!valid_cond_clock(clock_id)) return EINVAL;
+
+        const uint64_t initial_generation = guest_cond_snapshot(cond).generation;
+        for (;;) {
+            timespec selected_now{};
+            int result = guest_cond_clock_now(clock_id, selected_now);
+            if (result != 0) return result;
+            if (timespec_reached(selected_now, deadline)) return ETIMEDOUT;
+
+            const timespec slice = stable_slice_duration(selected_now, deadline);
+            result = interruptible_cond_timedwait_relative(cond, mutex, &slice);
+            if (result != ETIMEDOUT) return result;
+            // A signal can land between two host timed waits. Treat a generation change as a
+            // permitted spurious wake instead of losing the signal during clock conversion.
+            if (guest_cond_snapshot(cond).generation != initial_generation) return 0;
+        }
+    }
+}
+
+HLE(k_condattr_init) {
+    if (!a0) return 0x16;
+    auto* attr = (GuestCondAttr*)calloc(1, sizeof(GuestCondAttr));
+    if (!attr) return 0x0c;
+    *(void**)a0 = attr;
+    return 0;
+}
+HLE(k_condattr_destroy) {
+    if (a0 && !pt_static_sentinel(*(void**)a0)) free(*(void**)a0);
+    if (a0) *(void**)a0 = nullptr;
+    return 0;
+}
+HLE(k_condattr_setclock) {
+    auto* attr = guest_condattr(a0);
+    if (!attr || !valid_cond_clock((int32_t)a1)) return 0x16;
+    attr->clock_id = (int32_t)a1;
+    return 0;
+}
+HLE(k_condattr_getclock) {
+    auto* attr = guest_condattr(a0);
+    if (!attr || !a1) return 0x16;
+    *(int32_t*)(uintptr_t)a1 = attr->clock_id;
+    return 0;
+}
+HLE(k_condattr_setpshared) {
+    auto* attr = guest_condattr(a0);
+    if (!attr || a1 != 0) return 0x16;
+    attr->pshared = 0;
+    return 0;
+}
+HLE(k_condattr_getpshared) {
+    auto* attr = guest_condattr(a0);
+    if (!attr || !a1) return 0x16;
+    *(int32_t*)(uintptr_t)a1 = attr->pshared;
+    return 0;
+}
+HLE(k_cond_init) {
+    if (!a0) return 0x16;
+    const GuestCondAttr* attr = guest_condattr(a1);
+    auto* cond = (pthread_cond_t*)calloc(1, sizeof(pthread_cond_t));
+    if (!cond) return 0x0c;
+    const int result = pthread_cond_init(cond, nullptr);
+    if (result != 0) { free(cond); return (uint64_t)(unsigned)result; }
+    guest_cond_register(cond, attr ? attr->clock_id : kSonyClockRealtime);
+    *(void**)a0 = cond;
+    return 0;
+}
+HLE(k_cond_destroy) {
+    if (a0 && !pt_static_sentinel(*(void**)a0)) {
+        auto* cond = (pthread_cond_t*)*(void**)a0;
+        pthread_cond_destroy(cond);
+        interruptible_cond_forget(cond);
+        guest_cond_unregister(cond);
+        free(cond);
+    }
+    if (a0) *(void**)a0 = nullptr;
+    return 0;
+}
+HLE(k_cond_signal)    { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.signal    cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) { guest_cond_advance(c); interruptible_cond_signal(c); } return 0; }
+HLE(k_cond_broadcast) { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.broadcast cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) { guest_cond_advance(c); interruptible_cond_broadcast(c); } return 0; }
 HLE(k_cond_wait)      { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.wait.ent  cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0);
     { auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
       if (c && m) {
@@ -460,7 +652,8 @@ HLE(k_cond_wait)      { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu
       } }
     if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.wait.exit cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); return 0; }
 // POSIX pthread_cond_timedwait(cond_slot, mutex_slot, const timespec* abstime) — abstime is an
-// ABSOLUTE CLOCK_REALTIME deadline ({i64 sec, i64 nsec}, FreeBSD == Linux x86-64 layout), and the
+// absolute deadline in the condition attribute's selected clock ({i64 sec, i64 nsec}, FreeBSD ==
+// Linux x86-64 layout), and the
 // POSIX shim returns the errno VALUE directly (FreeBSD ETIMEDOUT = 60). This was an unimplemented
 // stub returning 0 = "signaled": UE's IAsyncReadRequest::WaitCompletion(timeout) loop (guest
 // eboot+0x22ea8ca, live-caught spinning at 100% CPU with RA 0x4022ea954 inside prosper_on_unimpl)
@@ -478,9 +671,11 @@ HLE(k_cond_timedwait) {
         return (uint64_t)rc;
     }
     const int64_t* gts = (const int64_t*)(uintptr_t)a2;
+    if (gts[0] < 0 || gts[1] < 0 || gts[1] >= 1'000'000'000ll) return 22;
     struct timespec dl { (time_t)gts[0], (long)gts[1] };
+    const int32_t clock_id = guest_cond_snapshot(c).clock_id;
     guest_mutex_released(m);
-    int rc = interruptible_cond_timedwait(c, m, &dl);
+    int rc = interruptible_cond_clock_timedwait(c, m, dl, clock_id);
     if (rc == 0 || rc == ETIMEDOUT) guest_mutex_acquired(m);
     if (rc == ETIMEDOUT) return 60;                            // FreeBSD ETIMEDOUT
     return (uint64_t)rc;
@@ -2891,6 +3086,10 @@ void register_kernel_hle() {
     R("scePthreadMutexUnlock", k_mutex_unlock);
     R("scePthreadCondattrInit", k_condattr_init);
     R("scePthreadCondattrDestroy", k_condattr_destroy);
+    R("scePthreadCondattrSetclock", k_condattr_setclock);
+    R("scePthreadCondattrGetclock", k_condattr_getclock);
+    R("scePthreadCondattrSetpshared", k_condattr_setpshared);
+    R("scePthreadCondattrGetpshared", k_condattr_getpshared);
     R("scePthreadCondInit", k_cond_init);
     R("scePthreadCondDestroy", k_cond_destroy);
     R("scePthreadCondSignal", k_cond_signal);
@@ -2983,6 +3182,8 @@ void register_kernel_hle() {
     R("pthread_cond_wait", k_cond_wait);
     R("pthread_cond_timedwait", k_cond_timedwait);   // issue #115: unimpl-0 spun WaitCompletion loops
     R("pthread_condattr_init", k_condattr_init); R("pthread_condattr_destroy", k_condattr_destroy);
+    R("pthread_condattr_setclock", k_condattr_setclock); R("pthread_condattr_getclock", k_condattr_getclock);
+    R("pthread_condattr_setpshared", k_condattr_setpshared); R("pthread_condattr_getpshared", k_condattr_getpshared);
     R("pthread_attr_init", k_attr_init);      R("pthread_attr_destroy", k_attr_destroy);
     R("pthread_attr_setstack", k_attr_setstack);
     R("pthread_attr_setstacksize", k_attr_setstacksize);
