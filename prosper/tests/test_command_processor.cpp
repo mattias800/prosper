@@ -104,9 +104,9 @@ int main() {
     CHECK(st.draws.size() == 2 && st.draws[0].instance_count == 3 && st.draws[0].state &&
               st.draws[0].state->num_instances == 3,
           "draw0 record and snapshot retain SetNumInstances(3)");
-    CHECK(st.draws.size() == 2 && st.draws[1].instance_count == 1 && st.draws[1].state &&
-              st.draws[1].state->num_instances == 1,
-          "draw1 normalizes SetNumInstances(0) to the single-instance default");
+    CHECK(st.draws.size() == 2 && st.draws[1].instance_count == 0 && st.draws[1].state &&
+              st.draws[1].state->num_instances == 0,
+          "draw1 retains SetNumInstances(0) as a zero-instance no-op");
 
     // SET_SH_REG (IT_SET_SH_REG=0x76) sets a RANGE: payload[0]=start offset, payload[1..]=consecutive
     // values. The driver uploads the whole user-data descriptor block this way, so the decode+apply MUST

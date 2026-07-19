@@ -1475,8 +1475,7 @@ void GpuState::apply(const Pm4Command& c) {
             state_dirty_ = true;
             break;
         case K::SetNumInstances:
-            // The command processor treats a zero payload as the single-instance default.
-            num_instances = c.instance_count ? c.instance_count : 1u;
+            num_instances = c.instance_count;
             state_dirty_ = true;
             break;
         case K::SetIndexBase:

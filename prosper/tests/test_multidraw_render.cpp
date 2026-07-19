@@ -98,14 +98,25 @@ int main() {
     {
         prosper::test::BackendDraw one;
         one.vs = vs; one.fs = quarter_red; one.ps = &additive; one.vcount = 3;
+        prosper::test::BackendDraw zero = one; zero.instance_count = 0;
+        prosper::test::BackendDraw zero_indexed = zero; zero_indexed.indices = {0, 1, 2};
         prosper::test::BackendDraw three = one; three.instance_count = 3;
         prosper::test::BackendDraw three_indexed = three; three_indexed.indices = {0, 1, 2};
+        const std::vector<uint8_t> px_zero = prosper::test::render_draws_rgba({zero}, W, H);
+        const std::vector<uint8_t> px_zero_indexed =
+            prosper::test::render_draws_rgba({zero_indexed}, W, H);
         const std::vector<uint8_t> px_one = prosper::test::render_draws_rgba({one}, W, H);
         const std::vector<uint8_t> px_three = prosper::test::render_draws_rgba({three}, W, H);
         const std::vector<uint8_t> px_three_indexed =
             prosper::test::render_draws_rgba({three_indexed}, W, H);
+        const uint8_t* zero_center = center(px_zero);
         const uint8_t* one_center = center(px_one);
         const uint8_t* three_center = center(px_three);
+        CHECK(zero_center && zero_center[0] < 0x40 && zero_center[1] < 0x40 &&
+                  zero_center[2] > 0xC0,
+              "zero non-indexed instances leave the blue clear untouched");
+        CHECK(!px_zero.empty() && px_zero_indexed == px_zero,
+              "zero indexed instances are the same no-op");
         CHECK(one_center && one_center[0] >= 48 && one_center[0] <= 80,
               "one additive quarter-red instance contributes one layer");
         CHECK(three_center && one_center && three_center[0] >= one_center[0] + 96 &&
