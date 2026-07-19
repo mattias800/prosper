@@ -8,11 +8,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdarg>
-#include <cctype>
 #include <cmath>
 #include <cwchar>
 #include <cerrno>
 #include <cstddef>
+#include <array>
 #include <limits>
 #include <atomic>
 #include <mutex>
@@ -432,30 +432,50 @@ HLE(h_putchar)   { return (uint64_t)(int64_t)putchar((int)a0); }
 HLE(h_fputs)     { return (uint64_t)(int64_t)fputs((const char*)P(a0), a1 ? (FILE*)P(a1) : stdout); }
 
 // --- locale / ctype (Dinkumware CRT: _Getpctype/_Getpt{o,}lower return table ptrs) ---
-// Tables have 257 entries; element [-1] is the EOF slot, so we return base+1 and the
-// guest indexes [c] for c in 0..255 (and [-1] for EOF). Classification bits follow the
-// common MSVCRT/Dinkumware layout; built from the host's ctype so they're correct.
+// The 257-entry C-locale table and masks match Dinkumware 5.00: _XD=0x01, _UP=0x02,
+// _SP=0x04, _PU=0x08, _LO=0x10, _DI=0x20, _CN=0x40, _BB=0x80, _XS=0x100,
+// _XA=0x200, and _XB=0x400. A captured PS5 guest inline isspace uses test 0x144,
+// exactly _CN|_SP|_XS, which pins Sony's contract. CONFIDENCE: HIGH.
+// Element [-1] is the EOF slot; bytes 0x80..0xff are unclassified in the C locale.
 namespace {
-    short g_ctype[257], g_tolow[257], g_toup[257];
-    bool  g_ctype_built = false;
-    void build_ctype() {
-        if (g_ctype_built) return;
-        g_ctype[0] = g_tolow[0] = g_toup[0] = 0;   // EOF slot
-        for (int c = 0; c < 256; c++) {
-            short m = 0;
-            if (isupper(c)) m |= 0x01; if (islower(c)) m |= 0x02; if (isdigit(c)) m |= 0x04;
-            if (isspace(c)) m |= 0x08; if (ispunct(c)) m |= 0x10; if (iscntrl(c)) m |= 0x20;
-            if (c == ' ' || c == '\t') m |= 0x40; if (isxdigit(c)) m |= 0x80;
-            g_ctype[c + 1] = m;
-            g_tolow[c + 1] = (short)tolower(c);
-            g_toup[c + 1]  = (short)toupper(c);
+    using CtypeTable = std::array<short, 257>;
+
+    constexpr CtypeTable make_ctype_table() {
+        CtypeTable table{};
+        for (int c = 0; c < 128; ++c) {
+            short mask = 0;
+            if (c <= 0x08 || (c >= 0x0e && c <= 0x1f) || c == 0x7f) mask |= 0x080; // _BB
+            if (c >= 0x09 && c <= 0x0d) mask |= 0x0c0;                              // _BB|_CN
+            if (c == '\t') mask |= 0x400;                                           // _XB
+            if (c == ' ') mask |= 0x004;                                            // _SP
+            if ((c >= '!' && c <= '/') || (c >= ':' && c <= '@') ||
+                (c >= '[' && c <= '`') || (c >= '{' && c <= '~')) mask |= 0x008;   // _PU
+            if (c >= '0' && c <= '9') mask |= 0x021;                                // _DI|_XD
+            if (c >= 'A' && c <= 'Z') mask |= short(0x002 | (c <= 'F' ? 0x001 : 0)); // _UP|_XD
+            if (c >= 'a' && c <= 'z') mask |= short(0x010 | (c <= 'f' ? 0x001 : 0)); // _LO|_XD
+            table[c + 1] = mask;
         }
-        g_ctype_built = true;
+        return table;
     }
+
+    constexpr CtypeTable make_case_table(bool upper) {
+        CtypeTable table{};
+        table[0] = -1; // EOF
+        for (int c = 0; c < 256; ++c) {
+            if (upper && c >= 'a' && c <= 'z') table[c + 1] = short(c - ('a' - 'A'));
+            else if (!upper && c >= 'A' && c <= 'Z') table[c + 1] = short(c + ('a' - 'A'));
+            else table[c + 1] = short(c);
+        }
+        return table;
+    }
+
+    constexpr CtypeTable g_ctype = make_ctype_table();
+    constexpr CtypeTable g_tolow = make_case_table(false);
+    constexpr CtypeTable g_toup = make_case_table(true);
 }
-HLE(h_getpctype)  { build_ctype(); return (uint64_t)(uintptr_t)(g_ctype + 1); }
-HLE(h_getptolow)  { build_ctype(); return (uint64_t)(uintptr_t)(g_tolow + 1); }
-HLE(h_getptoup)   { build_ctype(); return (uint64_t)(uintptr_t)(g_toup + 1); }
+HLE(h_getpctype)  { return (uint64_t)(uintptr_t)(g_ctype.data() + 1); }
+HLE(h_getptolow)  { return (uint64_t)(uintptr_t)(g_tolow.data() + 1); }
+HLE(h_getptoup)   { return (uint64_t)(uintptr_t)(g_toup.data() + 1); }
 // glibc contract: __ctype_get_mb_cur_max returns the VALUE of MB_CUR_MAX (size_t),
 // not a pointer. 1 in the "C" locale we present via setlocale.
 HLE(h_mbcurmax)   { return 1; }
