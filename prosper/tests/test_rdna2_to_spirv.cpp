@@ -2381,40 +2381,54 @@ int main() {
 
     // Kernels J1/J2/J3: forward-branch targets PAST the first s_endpgm (#129). A branch past
     // s_endpgm is a benign early-out ONLY if execution at the target immediately terminates
-    // (s_nop* then s_endpgm). Real code at the target (an else-block) used to be silently
-    // discarded by a blanket clamp — valid SPIR-V, wrong semantics; it must now REJECT.
+    // (s_nop* then s_endpgm). Real straight-line code at the target is a second terminating arm;
+    // it must execute as a structured if/else rather than being silently discarded by a clamp.
     // Shape: s0=7; s1=7|8; s_cmp_eq_u32; s_cbranch_scc0 +3 (-> pc7); v0=42.0; s_endpgm; <target...>
     //   J1: target is s_endpgm            -> accept; SCC=1 runs the block (42), SCC=0 skips (input)
-    //   J2: target is REAL code (v0=9.0)  -> REJECT (was: clamped, taken path silently lost v0=9)
+    //   J2: target is REAL code (v0=9.0)  -> accept; SCC=1 selects 42, SCC=0 selects 9
     //   J3: target is s_nop; s_endpgm     -> accept (nop padding before the end is still an early-out)
     // Encodings llvm-mc gfx1030 verified.
     const uint32_t codeJ1t[] = { 0xbe800387u, 0xbe810387u, 0xbf060100u, 0xbf840003u,
                                  0x7e0002ffu, 0x42280000u, 0xbf810000u, 0xbf810000u };
     const uint32_t codeJ1f[] = { 0xbe800387u, 0xbe810388u, 0xbf060100u, 0xbf840003u,
                                  0x7e0002ffu, 0x42280000u, 0xbf810000u, 0xbf810000u };
-    const uint32_t codeJ2[]  = { 0xbe800387u, 0xbe810388u, 0xbf060100u, 0xbf840003u,
+    const uint32_t codeJ2t[] = { 0xbe800387u, 0xbe810387u, 0xbf060100u, 0xbf840003u,
+                                 0x7e0002ffu, 0x42280000u, 0xbf810000u,
+                                 0x7e0002ffu, 0x41100000u, 0xbf810000u };
+    const uint32_t codeJ2e[] = { 0xbe800387u, 0xbe810388u, 0xbf060100u, 0xbf840003u,
                                  0x7e0002ffu, 0x42280000u, 0xbf810000u,
                                  0x7e0002ffu, 0x41100000u, 0xbf810000u };
     const uint32_t codeJ3[]  = { 0xbe800387u, 0xbe810387u, 0xbf060100u, 0xbf840003u,
                                  0x7e0002ffu, 0x42280000u, 0xbf810000u, 0xbf800000u, 0xbf810000u };
     std::vector<uint32_t> spvJ1t = recompile_valu(codeJ1t, sizeof(codeJ1t)/sizeof(codeJ1t[0]), 1, 0);
     std::vector<uint32_t> spvJ1f = recompile_valu(codeJ1f, sizeof(codeJ1f)/sizeof(codeJ1f[0]), 1, 0);
-    std::vector<uint32_t> spvJ2  = recompile_valu(codeJ2,  sizeof(codeJ2)/sizeof(codeJ2[0]),  1, 0);
+    std::vector<uint32_t> spvJ2t = recompile_valu(codeJ2t, sizeof(codeJ2t)/sizeof(codeJ2t[0]), 1, 0);
+    std::vector<uint32_t> spvJ2e = recompile_valu(codeJ2e, sizeof(codeJ2e)/sizeof(codeJ2e[0]), 1, 0);
     std::vector<uint32_t> spvJ3  = recompile_valu(codeJ3,  sizeof(codeJ3)/sizeof(codeJ3[0]),  1, 0);
     CHECK(!spvJ1t.empty() && !spvJ1f.empty(), "kernel J1 (early-out branch to a trailing s_endpgm) -> SPIR-V");
-    CHECK(spvJ2.empty(), "kernel J2 (branch past s_endpgm into REAL code) is REJECTED, not clamped");
+    CHECK(!spvJ2t.empty() && !spvJ2e.empty(),
+          "kernel J2 (branch past s_endpgm) emits both terminating if/else arms");
+    CHECK(rdna2_recompile_code_span(codeJ2t, sizeof(codeJ2t)/sizeof(codeJ2t[0])) ==
+              sizeof(codeJ2t)/sizeof(codeJ2t[0]),
+          "kernel J2 code span includes the reachable post-endpgm else arm");
     CHECK(!spvJ3.empty(), "kernel J3 (early-out through s_nop padding) -> SPIR-V");
     std::vector<float> inJ(N);
     for (uint32_t i = 0; i < N; i++) inJ[i] = (float)i * 0.25f;
     std::vector<float> gotJt = prosper::test::run_compute(spvJ1t, inJ, N, N);
     std::vector<float> gotJf = prosper::test::run_compute(spvJ1f, inJ, N, N);
-    uint32_t badJ = 0;
+    std::vector<float> gotJ2t = prosper::test::run_compute(spvJ2t, inJ, N, N);
+    std::vector<float> gotJ2e = prosper::test::run_compute(spvJ2e, inJ, N, N);
+    uint32_t badJ = 0, badJ2 = 0;
     for (uint32_t i = 0; i < N && gotJt.size() == N; i++) if (std::fabs(gotJt[i] - 42.0f) > 1e-3f) badJ++;
     for (uint32_t i = 0; i < N && gotJf.size() == N; i++) if (std::fabs(gotJf[i] - inJ[i]) > 1e-3f) badJ++;
+    for (uint32_t i = 0; i < N && gotJ2t.size() == N; i++) if (std::fabs(gotJ2t[i] - 42.0f) > 1e-3f) badJ2++;
+    for (uint32_t i = 0; i < N && gotJ2e.size() == N; i++) if (std::fabs(gotJ2e[i] - 9.0f) > 1e-3f) badJ2++;
     printf("  kernelJ mismatches=%u (scc1->%g expect 42, scc0->%g expect %g)\n", badJ,
            gotJt.size()==N?gotJt[8]:-1, gotJf.size()==N?gotJf[8]:-1, inJ[8]);
     CHECK(gotJt.size()==N && gotJf.size()==N && badJ==0,
           "kernel J1 early-out: block runs on SCC=1 (42), skipped on SCC=0 (input)");
+    CHECK(gotJ2t.size()==N && gotJ2e.size()==N && badJ2==0,
+          "kernel J2 terminating if/else: SCC=1 selects 42 and SCC=0 selects 9");
 
     // Kernels S1/S2: v_cvt_u32_f32 / v_cvt_i32_f32 SATURATION (#135). RDNA2 saturates the
     // float->int converts (NaN -> 0, negative -> 0 for u32, out-of-range clamps to the type

@@ -166,6 +166,29 @@ int main() {
               stats.misses == pcrel_stats.misses + 1,
           "embedded table contents participate in the shader cache key");
 
+    // A terminal if/else may build a PC-relative V# only in the second arm, after the first
+    // s_endpgm. Span analysis must use the same extended instruction stream as emission. Stopping at
+    // span pc20 immediately after the second end would omit four table dwords that can change SPIR-V.
+    const uint32_t terminal_pcrel[] = {
+        0xbe800387u, 0xbe810388u, 0xbf060100u, 0xbf840003u,
+        0x7e0002ffu, 0x42280000u, 0xbf810000u,
+        0xbe841f00u,               // pc7: s_getpc_b64 s[4:5] (next PC byte = 32)
+        0x800404b0u,               // pc8: s_add_u32 s4, 48, s4 (table byte = 80)
+        0x82050580u,               // pc9: s_addc_u32 s5, 0, s5
+        0xbe860390u,               // pc10: s_mov_b32 s6, 16 bytes
+        0xbe8703ffu, 0x10005004u,  // pc11: s_mov_b32 s7, V# format/stride
+        0x7e020f00u,               // pc13: v_cvt_u32_f32 v1, v0
+        0x34020282u,               // pc14: v_lshlrev_b32 v1, 2, v1
+        0xe0301000u, 0x80010101u,  // pc15: buffer_load_dword v1, v1, s[4:7], 0 offen
+        0xbf8c3f70u,               // pc17: s_waitcnt vmcnt(0)
+        0x7e000d01u,               // pc18: v_cvt_f32_u32 v0, v1
+        0xbf810000u,               // pc19: second s_endpgm
+        7u, 11u, 13u, 17u,        // pc20: embedded table used only by the else arm
+    };
+    CHECK(rdna2_recompile_code_span(terminal_pcrel, std::size(terminal_pcrel)) ==
+              std::size(terminal_pcrel),
+          "terminal else-arm PC-relative table participates in the owning shader span");
+
     // Unity emits a bounded uniform jump table for uber-shader variants. The selector is loaded from
     // a direct constant buffer, adjusted by -1, clamped, scaled by eight, then used by s_setpc_b64.
     // This compact synthetic stream has two paths which set v0 differently before a common export.
