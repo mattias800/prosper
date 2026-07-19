@@ -503,11 +503,14 @@ directly instead of reading it to CPU RGBA and uploading it again. Guest GPU wri
 entries through the same ordered write observer used by persistent depth/stencil state. Same-target feedback,
 scanout, presentation fallback, captures, replay seeds, and pixel diagnostics keep the established CPU path.
 
-The live path is initially opt-in with `PROSPER_LIVE_PERSISTENT_COLOR_TARGETS=1`. Set
+The live path is enabled by default as of 2026-07-19. Set
+`PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1` for a complete frontend A/B,
 `PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS=1` to disable backend retention independently, or change its
-256 MiB budget with `PROSPER_BACKEND_TARGET_CACHE_MB`. The backend unit contract compares direct GPU
-producer-to-sampler output byte-for-byte with CPU readback/upload, verifies a deferred-readback LOAD pass,
-and proves that invalidation uses supplied CPU pixels rather than stale GPU contents.
+256 MiB budget with `PROSPER_BACKEND_TARGET_CACHE_MB`. Captures, per-target pixel diagnostics, scanout,
+same-target feedback, and authoritative-readback spans retain the established CPU path. The backend unit
+contract compares direct GPU producer-to-sampler output byte-for-byte with CPU readback/upload, verifies a
+deferred-readback LOAD pass, and proves that invalidation uses supplied CPU pixels rather than stale GPU
+contents.
 
 Native Windows Dead Cells post-`PARSEALL` evidence used one current-master binary with submit-aligned timing.
 The animated runs did not carry identical draw counts, so the phase counters establish the mechanism more
@@ -529,6 +532,25 @@ work while completing slightly faster, but this is not yet a playable frame budg
 still cost about 9 ms, 405-draw realization costs about 40 ms, and the ordered path still executes ten target
 calls plus eight compute calls. The next architectural gain requires fewer synchronous submissions/fences or
 safe reuse of per-draw resource work; neither may weaken the captured graphics/compute dependency order.
+
+The default-on decision used a paired native-Windows Evergate fresh-save route on one current-master binary
+after call-local resource sharing. Both runs used native 1920x1080 targets and the same 75-second controller
+script. Animated windows are not draw-identical, so the mechanism counters and ranges matter more than any
+single sample:
+
+| Measurement | CPU target path | Persistent GPU targets |
+|---|---:|---:|
+| Presented frames in 75 seconds | 314 | 373 |
+| Observed heavy-scene rate | about 1.9 FPS | about 2.7 FPS |
+| Target writes / readbacks / deferred | 0 / 14 / 0 | 14 / 6 / 8 |
+| Direct target samples | 0 | 19 |
+| Heavy whole-submit windows | 450-475 ms | 317-359 ms |
+| Heavy frontend Vulkan work | 252-285 ms | 159-194 ms |
+| Heavy GPU fence waits | 59-61 ms | 34-37 ms |
+| Heavy record/upload | 13-15 ms | 1-2 ms |
+
+This is still far from the 16.7 ms frame budget, but it removes repeated GPU-to-CPU-to-GPU ownership
+round-trips from normal runs and makes the remaining per-draw realization and transient object costs clearer.
 
 ## Current frame budget
 
