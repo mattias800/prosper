@@ -14,6 +14,8 @@
 // Status values are the shared SceCommonDialogStatus: 0=NONE, 1=INITIALIZED, 2=RUNNING, 3=FINISHED.
 #pragma once
 #include <cstdint>
+#include <mutex>
+#include <utility>
 
 namespace prosper {
 
@@ -75,6 +77,34 @@ struct PlatformUi {
     virtual int keyboardResourceIds(int32_t userId, uint32_t* outIds, int max) {
         (void)userId; (void)outIds; (void)max; return 0;
     }
+};
+
+// A short-lived, registry-locked reference to the current backend. The frontend must unregister
+// itself before destroying its PlatformUi; set_platform_ui() then waits for every outstanding lease,
+// so an HLE callback cannot race backend destruction. Supplying `expected` additionally prevents an
+// open dialog from being rerouted to a different backend registered later.
+class PlatformUiLease;
+PlatformUiLease platform_ui_lease(PlatformUi* expected = nullptr);
+
+class PlatformUiLease {
+public:
+    PlatformUiLease() = default;
+    PlatformUiLease(PlatformUiLease&&) noexcept = default;
+    PlatformUiLease& operator=(PlatformUiLease&&) noexcept = default;
+    PlatformUiLease(const PlatformUiLease&) = delete;
+    PlatformUiLease& operator=(const PlatformUiLease&) = delete;
+
+    PlatformUi* get() const { return ui_; }
+    PlatformUi* operator->() const { return ui_; }
+    explicit operator bool() const { return ui_ != nullptr; }
+
+private:
+    friend PlatformUiLease platform_ui_lease(PlatformUi* expected);
+    PlatformUiLease(std::unique_lock<std::mutex>&& lock, PlatformUi* ui)
+        : lock_(std::move(lock)), ui_(ui) {}
+
+    std::unique_lock<std::mutex> lock_;
+    PlatformUi* ui_ = nullptr;
 };
 
 // The registered backend, or nullptr when headless. The frontend calls set_platform_ui once at startup

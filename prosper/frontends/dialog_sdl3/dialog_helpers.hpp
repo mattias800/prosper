@@ -53,6 +53,7 @@ enum : uint32_t {
 struct SaveDataRequest {
     bool supported = false;       // false -> frontend declines ownership; core keeps headless policy
     bool error = false;           // choose the error rather than information message-box style
+    bool cancelable = true;       // false when OptionBack::DISABLE forbids a back/cancel outcome
     uint32_t mode = 0;
     uint32_t displayType = 0;     // 1=SAVE, 2=LOAD, 3=DELETE
     uint64_t userData = 0;
@@ -67,7 +68,7 @@ SaveDataRequest read_savedata_request(uint64_t param);
 
 // Write only fields owned by the service: mode/result/buttonId/userData. Caller-provided dirName and
 // param output pointers, the ABI pad, and all reserved bytes remain untouched. `canceled` writes
-// CommonDialog::Result::USER_CANCELED and ButtonId::INVALID.
+// CommonDialog::Result::USER_CANCELED and ButtonId::INVALID. An unreadable result pointer is ignored.
 void write_savedata_result(uint64_t result, const SaveDataRequest& request,
                            uint32_t buttonId, bool canceled);
 

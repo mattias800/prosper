@@ -57,6 +57,30 @@ namespace { std::atomic<uint64_t> g_handle{1}; }
 namespace {
 bool svclog() { static int v = getenv("PROSPER_SVCLOG") ? 1 : 0; return v; }
 bool svc_ptrish(uint64_t v) { return v >= 0x10000 && v < 0x7fffffffffffull; }
+bool svc_copy_bytes(uint64_t src, void* dst, size_t bytes) {
+    if (!src || !dst || !bytes || src > UINT64_MAX - (bytes - 1)) return false;
+#ifdef _WIN32
+    SIZE_T copied = 0;
+    return ReadProcessMemory(GetCurrentProcess(), (const void*)(uintptr_t)src, dst, bytes, &copied) &&
+           copied == bytes;
+#else
+    iovec local{dst, bytes};
+    iovec remote{(void*)(uintptr_t)src, bytes};
+    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)bytes;
+#endif
+}
+bool svc_write_bytes(uint64_t dst, const void* src, size_t bytes) {
+    if (!dst || !src || !bytes || dst > UINT64_MAX - (bytes - 1)) return false;
+#ifdef _WIN32
+    SIZE_T copied = 0;
+    return WriteProcessMemory(GetCurrentProcess(), (void*)(uintptr_t)dst, src, bytes, &copied) &&
+           copied == bytes;
+#else
+    iovec local{const_cast<void*>(src), bytes};
+    iovec remote{(void*)(uintptr_t)dst, bytes};
+    return process_vm_writev(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)bytes;
+#endif
+}
 size_t svc_copy_words(uint64_t src, uint64_t* dst, size_t words) {
     const size_t bytes = words * sizeof(uint64_t);
 #ifdef _WIN32
@@ -1162,71 +1186,96 @@ HLE(s_dialog_result) {
 // is a pointer at +0x70. Result begins with mode/result/buttonId/pad followed by three pointers. The
 // dirName/param pointer slots are caller-owned output destinations, not fields for the service to
 // replace. Write only mode/result/buttonId/userData and preserve every padding, pointer, and reserved
-// byte. A PlatformUi that accepts Open remains the owner even if the global registration later changes.
+// byte. A PlatformUi that accepts Open remains the intended owner, but every callback obtains a
+// registry lease first: unregistering the backend safely abandons the dialog instead of dereferencing
+// a stale non-owning pointer or rerouting the dialog to a replacement backend.
 namespace {
     std::atomic<int> g_savedatadialog_status{0 /*NONE*/};
     std::atomic<uint32_t> g_savedatadialog_mode{0 /*INVALID*/};
     std::atomic<uint64_t> g_savedatadialog_user_data{0};
     std::atomic<PlatformUi*> g_savedatadialog_ui{nullptr};
+
+    void savedlg_close_owner() {
+        PlatformUi* expected = g_savedatadialog_ui.exchange(nullptr);
+        if (!expected) return;
+        auto ui = platform_ui_lease(expected);
+        if (ui) ui->saveDataDialogClose();
+    }
+
+    PlatformUiLease savedlg_owner_lease(PlatformUi*& expected) {
+        expected = g_savedatadialog_ui.load(std::memory_order_acquire);
+        if (!expected) return {};
+        return platform_ui_lease(expected);
+    }
+
+    void savedlg_abandon_owner(PlatformUi* expected) {
+        if (expected && g_savedatadialog_ui.compare_exchange_strong(expected, nullptr))
+            g_savedatadialog_status.store(3 /*FINISHED: safe headless fallback*/);
+    }
 }
 HLE(s_savedlg_initialize) {
-    if (auto* ui = g_savedatadialog_ui.exchange(nullptr)) ui->saveDataDialogClose();
+    savedlg_close_owner();
     g_savedatadialog_mode.store(0);
     g_savedatadialog_user_data.store(0);
     g_savedatadialog_status.store(1 /*INITIALIZED*/);
     return 0;
 }
 HLE(s_savedlg_open) {
-    if (auto* old_ui = g_savedatadialog_ui.exchange(nullptr)) old_ui->saveDataDialogClose();
-    if (a0) {
-        const uint8_t* param = (const uint8_t*)PW(a0);
+    savedlg_close_owner();
+    if (a0 && a0 <= UINT64_MAX - 0x78) {
         uint32_t mode = 0;
         uint64_t user_data = 0;
-        memcpy(&mode, param + 0x34, sizeof mode);
-        memcpy(&user_data, param + 0x70, sizeof user_data);
+        (void)svc_copy_bytes(a0 + 0x34, &mode, sizeof mode);
+        (void)svc_copy_bytes(a0 + 0x70, &user_data, sizeof user_data);
         g_savedatadialog_mode.store(mode);
         g_savedatadialog_user_data.store(user_data);
     } else {
         g_savedatadialog_mode.store(0);
         g_savedatadialog_user_data.store(0);
     }
-    if (auto* ui = platform_ui(); ui && ui->saveDataDialogOpen(a0)) {
-        g_savedatadialog_ui.store(ui);
+    auto ui = platform_ui_lease();
+    if (ui && ui->saveDataDialogOpen(a0)) {
+        g_savedatadialog_ui.store(ui.get(), std::memory_order_release);
         return 0;
     }
     g_savedatadialog_status.store(3 /*FINISHED (auto-dismiss)*/);
     return 0;
 }
 HLE(s_savedlg_status) {
-    if (auto* ui = g_savedatadialog_ui.load())
+    PlatformUi* expected = nullptr;
+    auto ui = savedlg_owner_lease(expected);
+    if (expected && ui)
         return (uint64_t)(unsigned)ui->saveDataDialogStatus();
+    savedlg_abandon_owner(expected);
     return (uint64_t)(unsigned)g_savedatadialog_status.load();
 }
 HLE(s_savedlg_result) {
-    if (auto* ui = g_savedatadialog_ui.load()) {
+    PlatformUi* expected = nullptr;
+    auto ui = savedlg_owner_lease(expected);
+    if (expected && ui) {
         (void)ui->saveDataDialogResult(a0);
         return 0;
     }
-    if (a0) {
-        uint8_t* result = (uint8_t*)PW(a0);
+    savedlg_abandon_owner(expected);
+    if (a0 && a0 <= UINT64_MAX - 0x20) {
         const uint32_t mode = g_savedatadialog_mode.load();
         const uint32_t ok = 0 /*CommonDialogResult::OK*/;
         const uint32_t invalid = 0 /*ButtonId::INVALID*/;
         const uint64_t user_data = g_savedatadialog_user_data.load();
-        memcpy(result + 0x00, &mode, sizeof mode);
-        memcpy(result + 0x04, &ok, sizeof ok);
-        memcpy(result + 0x08, &invalid, sizeof invalid);
-        memcpy(result + 0x20, &user_data, sizeof user_data);
+        (void)svc_write_bytes(a0 + 0x00, &mode, sizeof mode);
+        (void)svc_write_bytes(a0 + 0x04, &ok, sizeof ok);
+        (void)svc_write_bytes(a0 + 0x08, &invalid, sizeof invalid);
+        (void)svc_write_bytes(a0 + 0x20, &user_data, sizeof user_data);
     }
     return 0;
 }
 HLE(s_savedlg_close) {
-    if (auto* ui = g_savedatadialog_ui.exchange(nullptr)) ui->saveDataDialogClose();
+    savedlg_close_owner();
     g_savedatadialog_status.store(0 /*NONE*/);
     return 0;
 }
 HLE(s_savedlg_terminate) {
-    if (auto* ui = g_savedatadialog_ui.exchange(nullptr)) ui->saveDataDialogClose();
+    savedlg_close_owner();
     g_savedatadialog_status.store(0 /*NONE*/);
     g_savedatadialog_mode.store(0);
     g_savedatadialog_user_data.store(0);
@@ -1234,13 +1283,21 @@ HLE(s_savedlg_terminate) {
 }
 HLE(s_savedlg_ready) { return 1; }
 HLE(s_savedlg_progress_inc) {
-    if (auto* ui = g_savedatadialog_ui.load())
+    PlatformUi* expected = nullptr;
+    auto ui = savedlg_owner_lease(expected);
+    if (expected && ui)
         ui->saveDataDialogProgressBarInc((uint32_t)a0, (uint32_t)a1);
+    else
+        savedlg_abandon_owner(expected);
     return 0;
 }
 HLE(s_savedlg_progress_set) {
-    if (auto* ui = g_savedatadialog_ui.load())
+    PlatformUi* expected = nullptr;
+    auto ui = savedlg_owner_lease(expected);
+    if (expected && ui)
         ui->saveDataDialogProgressBarSetValue((uint32_t)a0, (uint32_t)a1);
+    else
+        savedlg_abandon_owner(expected);
     return 0;
 }
 

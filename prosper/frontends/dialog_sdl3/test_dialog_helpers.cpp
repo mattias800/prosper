@@ -97,6 +97,29 @@ int main() {
                   request.buttons.count == 2 && request.buttons.id[1] == 2,
               "SaveDataDialog SYSTEM_MSG confirmation maps display type to DELETE + YES/NO");
 
+        uint8_t option[36] = {};
+        uint32_t option_back = 1 /*DISABLE*/;
+        uint64_t option_ptr = (uint64_t)(uintptr_t)option;
+        system_type = 10 /*CORRUPTED_AND_DELETED*/;
+        std::memcpy(system, &system_type, 4);
+        std::memcpy(option, &option_back, 4);
+        std::memcpy(save_param + 0x78, &option_ptr, 8);
+        request = read_savedata_request((uint64_t)(uintptr_t)save_param);
+        CHECK(request.supported && !request.cancelable && request.buttons.count == 1 &&
+                  request.buttons.id[0] == 1,
+              "SaveDataDialog OptionBack::DISABLE removes the SYSTEM_MSG cancel path");
+        option_back = 0 /*ENABLE*/;
+        std::memcpy(option, &option_back, 4);
+        request = read_savedata_request((uint64_t)(uintptr_t)save_param);
+        CHECK(request.supported && request.cancelable && request.buttons.count == 2 &&
+                  request.buttons.id[1] == 2,
+              "SaveDataDialog OptionBack::ENABLE exposes OK + Cancel with the ABI button ids");
+
+        option_ptr = 1; std::memcpy(save_param + 0x78, &option_ptr, 8);
+        CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
+              "SaveDataDialog rejects a non-null unreadable option pointer without crashing");
+        option_ptr = 0; std::memcpy(save_param + 0x78, &option_ptr, 8);
+
         system_type = 5 /*PROGRESS*/; std::memcpy(system, &system_type, 4);
         CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
               "SaveDataDialog progress message declines modal ownership");
@@ -116,6 +139,8 @@ int main() {
 
         CHECK(!read_savedata_request(0).supported,
               "SaveDataDialog null outer param declines ownership without dereference");
+        CHECK(!read_savedata_request(1).supported,
+              "SaveDataDialog unreadable outer param declines ownership without crashing");
         param_size = 0; std::memcpy(save_param + 0x30, &param_size, 4);
         CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
               "SaveDataDialog malformed outer size declines ownership");
@@ -123,6 +148,25 @@ int main() {
         error_ptr = 0; std::memcpy(save_param + 0x60, &error_ptr, 8);
         CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
               "SaveDataDialog null nested mode param declines ownership without dereference");
+        error_ptr = 1; std::memcpy(save_param + 0x60, &error_ptr, 8);
+        CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
+              "SaveDataDialog unreadable ERROR_CODE pointer declines without crashing");
+
+        save_mode = SAVE_DATA_DIALOG_MODE_USER_MSG;
+        user_ptr = 1;
+        std::memcpy(save_param + 0x34, &save_mode, 4);
+        std::memcpy(save_param + 0x50, &user_ptr, 8);
+        CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
+              "SaveDataDialog unreadable USER_MSG pointer declines without crashing");
+        user_ptr = (uint64_t)(uintptr_t)user;
+        save_message_ptr = 1;
+        std::memcpy(save_param + 0x50, &user_ptr, 8);
+        std::memcpy(user + 8, &save_message_ptr, 8);
+        CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
+              "SaveDataDialog unreadable nested message pointer declines without crashing");
+        save_message_ptr = (uint64_t)(uintptr_t)save_message;
+        std::memcpy(user + 8, &save_message_ptr, 8);
+
         save_mode = SAVE_DATA_DIALOG_MODE_LIST;
         std::memcpy(save_param + 0x34, &save_mode, 4);
         CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
@@ -150,6 +194,8 @@ int main() {
         std::memcpy(&result_button, save_result + 0x08, 4);
         CHECK(common_result == 1 && result_button == 0,
               "SaveDataDialog canceled result returns USER_CANCELED + INVALID button");
+        write_savedata_result(1, request, 1, false);
+        CHECK(true, "SaveDataDialog unreadable result pointer is ignored without crashing");
     }
 
     // --- ImeDialog: read_ime_request from a synthetic OrbisImeDialogParam (96 bytes) ---

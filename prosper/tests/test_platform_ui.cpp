@@ -7,6 +7,7 @@
 #include "../src/hle/nid.hpp"
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 
 using namespace prosper;
 
@@ -42,14 +43,14 @@ struct MockUi : PlatformUi {
 
     // SaveDataDialog
     bool save_accept = true;
-    int save_status = 2, save_opens = 0, save_closes = 0, save_results = 0;
+    int save_status = 2, save_opens = 0, save_closes = 0, save_results = 0, save_status_calls = 0;
     int save_incs = 0, save_sets = 0;
     uint64_t save_last_param = 0, save_last_result = 0;
     uint32_t save_last_target = 0, save_last_value = 0;
     bool saveDataDialogOpen(uint64_t param) override {
         save_opens++; save_last_param = param; save_status = 2; return save_accept;
     }
-    int saveDataDialogStatus() override { return save_status; }
+    int saveDataDialogStatus() override { save_status_calls++; return save_status; }
     int saveDataDialogResult(uint64_t result) override {
         save_results++; save_last_result = result;
         if (result) *(uint32_t*)result = 4 /*ERROR_CODE marker*/;
@@ -170,9 +171,6 @@ int main() {
         CHECK(ui.save_opens == 2 && ui.save_last_param == (uint64_t)(uintptr_t)save_param &&
                   s_status(0,0,0,0,0,0) == 2,
               "SaveDataDialog accepted ownership forwards Open and backend RUNNING status");
-        set_platform_ui(nullptr); // ownership must remain with the backend that accepted Open
-        CHECK(s_status(0,0,0,0,0,0) == 2,
-              "SaveDataDialog status remains bound to accepting backend after registry changes");
         s_inc(7, 4,0,0,0,0); s_set(7, 65,0,0,0,0);
         CHECK(ui.save_incs == 1 && ui.save_sets == 1 && ui.save_last_target == 7 &&
                   ui.save_last_value == 65,
@@ -185,6 +183,37 @@ int main() {
         s_term(0,0,0,0,0,0);
         CHECK(ui.save_closes == 1 && s_status(0,0,0,0,0,0) == 0,
               "SaveDataDialog Term closes accepting backend and returns to NONE");
+
+        // Replacing/unregistering the non-owning registry pointer must never leave a callable stale
+        // owner. The outstanding dialog falls back to neutral headless completion, and is not
+        // accidentally rerouted to the replacement backend.
+        s_init(0,0,0,0,0,0);
+        s_open((uint64_t)(uintptr_t)save_param,0,0,0,0,0);
+        CHECK(ui.save_opens == 3 && s_status(0,0,0,0,0,0) == 2,
+              "SaveDataDialog can open a second backend-owned request");
+        const int old_status_calls = ui.save_status_calls;
+        MockUi replacement;
+        set_platform_ui(nullptr);
+        set_platform_ui(&replacement);
+        CHECK(s_status(0,0,0,0,0,0) == 3 && ui.save_status_calls == old_status_calls &&
+                  replacement.save_status_calls == 0,
+              "SaveDataDialog safely abandons an unregistered owner without rerouting it");
+        s_inc(3, 9,0,0,0,0); s_set(3, 17,0,0,0,0);
+        CHECK(ui.save_incs == 1 && ui.save_sets == 1 && replacement.save_incs == 0 &&
+                  replacement.save_sets == 0,
+              "SaveDataDialog progress never calls an unregistered or replacement backend");
+        std::memset(save_result, 0xAB, sizeof save_result);
+        s_result((uint64_t)(uintptr_t)save_result,0,0,0,0,0);
+        CHECK(ui.save_results == 1 && replacement.save_results == 0 &&
+                  *(uint32_t*)save_result == 3 && *(uint32_t*)(save_result + 4) == 0,
+              "SaveDataDialog abandoned owner returns the neutral headless result");
+        s_result(1,0,0,0,0,0);
+        CHECK(true, "SaveDataDialog neutral result ignores an unreadable guest pointer");
+        s_term(0,0,0,0,0,0);
+        CHECK(ui.save_closes == 1 && replacement.save_closes == 0 &&
+                  s_status(0,0,0,0,0,0) == 0,
+              "SaveDataDialog Term does not dereference an unregistered owner");
+        set_platform_ui(nullptr);
     }
     set_platform_ui(nullptr);
 
