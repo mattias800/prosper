@@ -245,12 +245,18 @@ int main() {
           "zero-length Mtypeprotect leaves protection and type metadata unchanged");
 
     alignas(8) uint8_t type_entry[0x20]{};
-    *(uint64_t*)(type_entry + 0x00) = va1 + 0x8123;
-    *(uint64_t*)(type_entry + 0x10) = 0x100;
+    *(uint64_t*)(type_entry + 0x00) = va1 + 0x8000;
     type_entry[0x18] = 0x2;
     type_entry[0x19] = 11;
     *(int32_t*)(type_entry + 0x1c) = 4; // TYPE_PROTECT
     int32_t type_done = -1;
+    CHECK((uint32_t)batch((uint64_t)(uintptr_t)type_entry, 1,
+                          (uint64_t)(uintptr_t)&type_done, 0, 0, 0) == 0x80020016u &&
+              type_done == 0,
+          "BatchMap rejects a zero-length type-protect entry without counting it");
+    *(uint64_t*)(type_entry + 0x00) = va1 + 0x8123;
+    *(uint64_t*)(type_entry + 0x10) = 0x100;
+    type_done = -1;
     CHECK(batch((uint64_t)(uintptr_t)type_entry, 1,
                 (uint64_t)(uintptr_t)&type_done, 0, 0, 0) == 0 && type_done == 1,
           "BatchMap TYPE_PROTECT accepts an unaligned sub-page range");
@@ -779,12 +785,18 @@ int main() {
               "zero-length Mtypeprotect leaves protection and type metadata unchanged");
 
         alignas(8) uint8_t type_entry[0x20]{};
-        *(uint64_t*)(type_entry + 0x00) = va + 0x8123;
-        *(uint64_t*)(type_entry + 0x10) = 0x100;
+        *(uint64_t*)(type_entry + 0x00) = va + 0x8000;
         type_entry[0x18] = 0x2;
         type_entry[0x19] = 11;
         *(int32_t*)(type_entry + 0x1c) = 4; // TYPE_PROTECT
         int32_t type_done = -1;
+        CHECK((uint32_t)batch((uint64_t)(uintptr_t)type_entry, 1,
+                              (uint64_t)(uintptr_t)&type_done, 0, 0, 0) == 0x80020016u &&
+                  type_done == 0,
+              "BatchMap rejects a zero-length type-protect entry without counting it");
+        *(uint64_t*)(type_entry + 0x00) = va + 0x8123;
+        *(uint64_t*)(type_entry + 0x10) = 0x100;
+        type_done = -1;
         CHECK(batch((uint64_t)(uintptr_t)type_entry, 1,
                     (uint64_t)(uintptr_t)&type_done, 0, 0, 0) == 0 && type_done == 1,
               "BatchMap TYPE_PROTECT accepts an unaligned sub-page range");

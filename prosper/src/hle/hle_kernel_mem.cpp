@@ -1395,6 +1395,10 @@ HLE(k_batch_map) {
         MLOG("bm op=%d va=0x%llx phys=0x%llx len=0x%llx prot=0x%x\n",
              op, (unsigned long long)start, (unsigned long long)phys,
              (unsigned long long)len, prot);
+        if (!len) {
+            ret = 0x80020016ull;
+            break;
+        }
         bool ok = true;
         switch (op) {
             case 0: {                               // MAP_DIRECT: phys-backed (aliasing preserved)
@@ -3779,6 +3783,10 @@ HLE(k_batch_map) {
         MLOG("bm op=%d va=0x%llx phys=0x%llx len=0x%llx prot=0x%x\n",
              op, (unsigned long long)start, (unsigned long long)phys,
              (unsigned long long)len, prot);
+        if (!len) {
+            ret = 0x80020016ull;
+            break;
+        }
         bool ok = true;
         switch (op) {
             case 0: {                               // MAP_DIRECT: shared physical backing
