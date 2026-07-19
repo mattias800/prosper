@@ -283,8 +283,17 @@ int main() {
     }
     memset(info, 0, sizeof(info));
     CHECK(query(middle, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
+              *(int32_t*)(info + 0x18) == 0x2 &&
               *(uint32_t*)(info + 0x20) == 0x10,
-          "VirtualQuery reports the page as committed only after MapFlexible");
+          "VirtualQuery reports the committed page's exact guest read/write protection");
+
+    CHECK(protect(middle, page, 0x11 /* CPU_READ | GPU_READ */, 0, 0, 0) == 0,
+          "mprotect accepts guest-only GPU protection bits");
+    memset(info, 0, sizeof(info));
+    CHECK(query(middle, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
+              *(int32_t*)(info + 0x18) == 0x11 &&
+              *(uint32_t*)(info + 0x20) == 0x10,
+          "VirtualQuery preserves guest-only GPU protection bits");
 
     CHECK(protect(base, len, 0x1 /* SCE_KERNEL_PROT_CPU_READ */, 0, 0, 0) == 0,
           "mprotect accepts a range spanning reserved and committed pages");
@@ -294,8 +303,9 @@ int main() {
           "range protection keeps the leading page uncommitted");
     memset(info, 0, sizeof(info));
     CHECK(query(middle, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
+              *(int32_t*)(info + 0x18) == 0x1 &&
               *(uint32_t*)(info + 0x20) == 0x10,
-          "range protection keeps the middle page committed");
+          "range protection keeps the middle page committed and reports read-only access");
     memset(info, 0, sizeof(info));
     CHECK(query(middle + page, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
               *(uint32_t*)(info + 0x20) == 0,
