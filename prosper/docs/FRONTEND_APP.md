@@ -428,7 +428,8 @@ duplicate. Until then the app is fully functional via `--test-pattern` (and any 
 - **P1 — audio** ✅ **done**: `prosper-app` installs the SDL3 `AudioSink` (`sceAudioOut` → host).
 - **P2 — controllers** ✅ **done**: installs the SDL3 `PadBackend` (host gamepad → `libScePad`).
 - **P3 — polish** (in progress): resize/fullscreen, present-mode selection, and non-modal SaveData
-  percentage progress presentation are implemented;
+  percentage progress presentation and SaveData virtual-slot LIST selection are implemented. The LIST
+  boundary retains only guest virtual directory names and never exposes a host file picker;
   pause/quit UX remains.
   Native Windows build/run packaging is done via `scripts/run-windows.ps1`. Cooperative guest-stop
   at a flip boundary is a follow-up (today the

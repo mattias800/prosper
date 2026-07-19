@@ -9,9 +9,11 @@
 //   DialogResult:         u32 mode @0 ; Result result @4 ; ButtonId buttonId @8 ; u8 reserved[32]
 //   ErrorDialog param:    s32 size @0 ; s32 errorCode @4 ; s32 userId @8 ; s32 reserved @12
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace prosper {
 
@@ -39,8 +41,8 @@ uint32_t read_error_code(uint64_t param);
 
 // --- SaveDataDialog ---
 // Param layout (0x98 bytes): CommonDialog::BaseParam[0x30], size@0x30, mode@0x34,
-// dispType@0x38, then nested pointers userMsg@0x50, systemMsg@0x58, errorCode@0x60,
-// progress@0x68, userData@0x70, option@0x78. Result layout (0x48 bytes):
+// dispType@0x38, then nested pointers items@0x48, userMsg@0x50, systemMsg@0x58,
+// errorCode@0x60, progress@0x68, userData@0x70, option@0x78. Result layout (0x48 bytes):
 // mode/result/buttonId @0/4/8, caller-owned dirName/param pointers @0x10/0x18,
 // userData @0x20, reserved[32] @0x28. These offsets match the PS4/PS5 inherited ABI.
 enum : uint32_t {
@@ -51,15 +53,23 @@ enum : uint32_t {
     SAVE_DATA_DIALOG_MODE_PROGRESS_BAR = 5,
 };
 
+struct SaveDataSlot {
+    std::string dirName;          // guest virtual directory name; empty selects the SAVE new-item
+    std::string label;            // owned display label; never a host path
+};
+
 struct SaveDataRequest {
     bool supported = false;       // false -> frontend declines ownership; core keeps headless policy
     bool error = false;           // choose the error rather than information message-box style
     bool cancelable = true;       // false when OptionBack::DISABLE forbids a back/cancel outcome
     bool progress = false;        // non-modal PROGRESS_BAR request; guest Close owns completion
+    bool slotList = false;        // modal LIST request backed only by guest-provided virtual slots
     uint32_t mode = 0;
     uint32_t displayType = 0;     // 1=SAVE, 2=LOAD, 3=DELETE
     uint64_t userData = 0;
+    size_t initialSlot = 0;
     std::string message;
+    std::vector<SaveDataSlot> slots;
     MsgButtons buttons{0, {nullptr, nullptr, nullptr}, {0, 0, 0}};
 };
 
@@ -75,6 +85,7 @@ struct SaveDataResultSnapshot {
     SaveDataRequest request{};
     uint32_t buttonId = 0;
     bool canceled = false;
+    std::string dirName;
 };
 
 struct SaveDataProgressSnapshot {
@@ -92,6 +103,7 @@ public:
     SaveDataModalTicket take_pending();
     bool active(uint64_t generation) const;
     void complete(uint64_t generation, int clicked);
+    void complete_list(uint64_t generation, int selected);
     SaveDataResultSnapshot result_snapshot() const;
     void progress_inc(uint32_t target, uint32_t delta);
     void progress_set(uint32_t target, uint32_t value);
@@ -105,20 +117,27 @@ private:
     uint32_t button_ = 0;
     uint32_t progress_ = 0;
     bool canceled_ = false;
+    std::string dir_name_;
     uint64_t generation_ = 0;
     uint64_t pending_generation_ = 0;
 };
 
-// Parse the supported non-list modes into an owned request safe to retain until the SDL main-thread
-// pump runs. USER_MSG, ordinary SYSTEM_MSG confirmations/notices, ERROR_CODE, and non-modal
-// PROGRESS_BAR are supported. LIST deliberately returns supported=false until its virtual-slot UI exists.
-SaveDataRequest read_savedata_request(uint64_t param);
+using SaveDataSlotTimeLookup = bool (*)(const std::string& dirName, int64_t& modified);
 
-// Write only fields owned by the service: mode/result/buttonId/userData. Caller-provided dirName and
-// param output pointers, the ABI pad, and all reserved bytes remain untouched. `canceled` writes
-// CommonDialog::Result::USER_CANCELED and ButtonId::INVALID. An unreadable result pointer is ignored.
+// Parse supported modes into an owned request safe to retain until the SDL main-thread pump runs.
+// LIST retains only guest-provided virtual directory names/new-item text; no host path is exposed.
+// USER_MSG, ordinary SYSTEM_MSG confirmations/notices, ERROR_CODE, and PROGRESS_BAR are also supported.
+// Date-based LIST focus uses the optional virtual-slot metadata lookup and declines when no dated
+// guest slot can be resolved instead of substituting positional focus.
+SaveDataRequest read_savedata_request(uint64_t param, SaveDataSlotTimeLookup slotTime = nullptr);
+
+// Write fields owned by the service: mode/result/buttonId/userData and, for LIST, the selected virtual
+// directory through the caller-provided dirName pointer. The param output pointer, ABI pad, and all
+// reserved bytes remain untouched. `canceled` writes USER_CANCELED, INVALID, and an empty LIST name.
+// Unreadable result/output pointers are ignored.
 void write_savedata_result(uint64_t result, const SaveDataRequest& request,
-                           uint32_t buttonId, bool canceled);
+                           uint32_t buttonId, bool canceled,
+                           const std::string& dirName = {});
 
 // --- ImeDialog (text entry) --- offsets from shadPS4 ime/ime_common.h OrbisImeDialogParam:
 //   user_id@0 type@4 ... max_text_length@36(u32) input_text_buffer@40(char16_t*) ... title@72(char16_t*)
