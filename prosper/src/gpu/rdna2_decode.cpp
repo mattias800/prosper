@@ -402,6 +402,7 @@ void decode_operands(Rdna2Inst& i) {
             // combined seven-bit format. Opcodes 8..15 are the packed-D16 variants.
             i.opcode = ((w >> 16) & 0x7u) | (((d1 >> 21) & 1u) << 3);
             i.mtbuf_format = (w >> 19) & 0x7Fu;
+            i.mtbuf_tfe = ((d1 >> 23) & 1u) != 0;
             i.mubuf_glc = ((w >> 14) & 1u) != 0;
             i.dst    = vgpr(d1 >> 8);
             i.src[0] = vgpr(d1);

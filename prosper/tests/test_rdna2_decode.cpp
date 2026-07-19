@@ -131,6 +131,11 @@ int main() {
     CHECK(mt_d16.fmt == Rdna2Format::MTBUF && mt_d16.opcode == 8u &&
               mt_d16.mtbuf_format == 13u,
           "MTBUF decodes the split high opcode bit instead of aliasing D16 onto ordinary loads");
+    const uint32_t mtbuf_tfe[] = { 0xe8b02000u, 0x80820100u };
+    Rdna2Inst mt_tfe = rdna2_decode_one(mtbuf_tfe, 2);
+    CHECK(mt_tfe.fmt == Rdna2Format::MTBUF && mt_tfe.opcode == 0u &&
+              mt_tfe.mtbuf_format == 22u && mt_tfe.mtbuf_tfe,
+          "MTBUF decodes TFE instead of silently dropping its status destination");
     // Exact DS_READ2_B32 words from Astro Bot's loading-surface compute producer. The packed
     // offset bytes are dword indices (offset0 in the low byte, offset1 in the high byte).
     const uint32_t ds_read2_adjacent[] = { 0xd8dc0100u, 0x04000002u };

@@ -37,6 +37,12 @@ int main() {
     CHECK(mtbuf_d16.total == 1 && mtbuf_d16.table_dependent == 0 &&
           mtbuf_d16.unsupported == 1 && mtbuf_d16.first_bad_op == 8u,
           "unimplemented MTBUF D16 remains an explicit unsupported opcode");
+    const uint32_t mtbuf_tfe_code[] = { 0xe8b02000u, 0x80820100u, 0xBF810000u };
+    RecompileCoverage mtbuf_tfe = recompile_coverage(
+        mtbuf_tfe_code, sizeof(mtbuf_tfe_code)/sizeof(mtbuf_tfe_code[0]));
+    CHECK(mtbuf_tfe.total == 1 && mtbuf_tfe.table_dependent == 0 &&
+          mtbuf_tfe.unsupported == 1 && mtbuf_tfe.first_bad_op == 0u,
+          "MTBUF TFE remains explicit unsupported coverage until its status write is modeled");
 
     // Contains an unsupported op: v_add_f32 ; s_branch +5 (unconditional -> rejected) ; s_endpgm.
     const uint32_t bad_code[] = { 0x06000300u, 0xbf820005u, 0xBF810000u };

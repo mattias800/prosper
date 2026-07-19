@@ -108,6 +108,9 @@ struct Rdna2Inst {
     // Interpreting these bits as the older PS4 DFMT/NFMT split maps valid gfx1030 formats to the
     // wrong type (for example 32_FLOAT is combined format 22).
     uint32_t mtbuf_format = 0;
+    // MTBUF Texel Fault Enable (instruction bit 55 / dword1 bit 23) writes a status VGPR after the
+    // data results. Kept explicit so the recompiler can reject until that observable write is modeled.
+    bool     mtbuf_tfe = false;
     // DS-only: GDS flag. llvm-mc gfx1030 round-trip places it at dword0 bit 17 (ds_add_u32 gds =
     // 0xd8020000 vs 0xd8000000; Table 94's "GDS [16]" is a GFX9-era erratum — it also misplaces
     // OP). Bit 16 is likewise captured so an unknown flag rejects rather than silently running

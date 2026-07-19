@@ -4683,6 +4683,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // MUBUF cases below would silently apply the wrong register layout, so fail closed until
             // that packing is modeled.
             if (in.fmt == Rdna2Format::MTBUF && in.opcode >= 8u) { ok = false; return true; }
+            // TFE appends a fault/status result after the data VGPRs. Dropping that write can corrupt
+            // later register consumers, so reject until status-return semantics are implemented.
+            if (in.fmt == Rdna2Format::MTBUF && in.mtbuf_tfe) { ok = false; return true; }
             uint32_t n = 0; bool is_format = false, is_store = false, is_atomic = false;
             bool raw_subword = false, raw_signed = false;
             uint32_t raw_bits = 32;
@@ -7572,7 +7575,7 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                 }
                 case Rdna2Format::MUBUF:  return i.opcode <= 0x07u ||                    // load/store_format_*
                                                  (i.opcode >= 0x0Cu && i.opcode <= 0x0Fu);  // load_dword/x2/x4/x3 (need the V#)
-                case Rdna2Format::MTBUF:  return i.opcode <= 0x07u;
+                case Rdna2Format::MTBUF:  return i.opcode <= 0x07u && !i.mtbuf_tfe;
                 case Rdna2Format::VINTRP: return true;               // handled in the fragment shell
                 default: return false;
             }
