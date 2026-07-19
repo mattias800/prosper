@@ -5237,6 +5237,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // when idxen; no offen (a runtime per-lane byte offset is unprovable); SOFFSET is NULL/0.
             bool dyn_half = false;   // 16-bit element at a runtime dword half (stride-2 buffers, #273)
             bool dyn_int = false;    // integer sub-dword FORMAT component at a runtime (unaligned) byte addr
+            bool dyn_int_store = false;  // integer sub-dword FORMAT store via race-free atomic clear+set
             if (packed && !raw_subword) {
                 bool base_aligned;
                 if (dyn_vfetch) {
@@ -5269,7 +5270,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // address (join the straddled dwords, then bfe), so it needs no static alignment.
                     // Only LOADS: the packed store path still rejects sub-dword ints (they don't pack).
                     if (!dyn_half) dyn_int = int_subword && !is_store;
-                    if (!dyn_half && !dyn_int) {
+                    // An integer sub-dword FORMAT STORE writes ONE lane's disjoint bit field of the
+                    // containing dword. A plain masked read-modify-write would race (adjacent lanes' fields
+                    // share a dword), but atomicAnd(clear field)+atomicOr(set field) COMMUTE across lanes
+                    // writing DISJOINT fields, so the store is race-free. Requires the field to lie within
+                    // a single dword: address comp_bytes-aligned, no runtime per-lane byte offset. (A
+                    // straddling field would span two dwords -> deferred fail-visibly.)
+                    if (!dyn_half && !dyn_int && is_store && int_subword && !offen && !dyn_vfetch &&
+                        (offset % comp_bytes) == 0 && (!idxen || (stride % comp_bytes) == 0) && soff_zero)
+                        dyn_int_store = true;
+                    if (!dyn_half && !dyn_int && !dyn_int_store) {
                         if (getenv("PROSPER_DBG"))
                             fprintf(stderr, "[mubuf-unaligned] pc=%u fmt=%u off=%u offen=%d idxen=%d stride=%u\n",
                                     in.pc, (unsigned)fmt, offset, (int)offen, (int)idxen, stride);
@@ -5317,14 +5327,36 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 return true;
             }
             if (is_store) {
-                // Store the VDATA VGPRs (in.dst..+n-1). Integer sub-dword formats (Uint8/Sint8/...) have
-                // no packing path here -> reject rather than mis-store (loads extend them; stores don't pack).
+                auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
+                if (dyn_int_store) {
+                    // Integer sub-dword store: clear then set THIS lane's disjoint field of the containing
+                    // dword with two atomics. Disjoint fields commute, so no read-modify-write lock is
+                    // needed; EXEC predication keeps inactive lanes from writing (like cbuf_store).
+                    const uint32_t field_mask = comp_bytes == 2 ? 0xffffu : 0xffu;
+                    for (uint32_t k = 0; k < n; k++) {
+                        const uint32_t caddr = k ? b.ibin(Op_IAdd, addr, b.uconst(k * comp_bytes)) : addr;
+                        const uint32_t cidx  = b.ibin(Op_ShiftRightLogical, caddr, b.uconst(2));
+                        const uint32_t bitpos = b.ibin(Op_ShiftLeftLogical,
+                                                       b.ibin(Op_BitwiseAnd, caddr, b.uconst(3)), b.uconst(3));
+                        const uint32_t mask = b.ibin(Op_ShiftLeftLogical, b.uconst(field_mask), bitpos);
+                        const uint32_t v = b.ibin(Op_ShiftLeftLogical,
+                                                  b.ibin(Op_BitwiseAnd, vread(in.dst.value + (int)k),
+                                                         b.uconst(field_mask)), bitpos);
+                        b.cbuf_atomic_rtn(Op_AtomicAnd, cidx, b.iun(Op_Not, mask), binding,
+                                          rs.exec_narrowed, rs.exec, b.uconst(0));
+                        b.cbuf_atomic_rtn(Op_AtomicOr, cidx, v, binding,
+                                          rs.exec_narrowed, rs.exec, b.uconst(0));
+                    }
+                    return true;
+                }
+                // Store the VDATA VGPRs (in.dst..+n-1). Integer sub-dword formats reach the atomic path
+                // above when in-dword-provable; anything else that can't pack (packed_word, or an
+                // integer field that could straddle) rejects rather than mis-store.
                 if (packed_word || (packed && (is_uint || is_sint))) { ok = false; return true; }
                 // MTBUF's instruction format owns the physical component count. A wider opcode still uses
                 // identity selection (for example XY00), so Z/W must not spill into adjacent memory.
                 const uint32_t store_n = in.fmt == Rdna2Format::MTBUF && fmt_ncomp < n
                                            ? fmt_ncomp : n;
-                auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
                 if (!packed) {
                     // Raw/Float32/Uint32: one dword per component.
                     for (uint32_t k = 0; k < store_n; k++) {

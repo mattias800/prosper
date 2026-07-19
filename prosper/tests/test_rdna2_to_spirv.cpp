@@ -1008,6 +1008,31 @@ int main() {
     CHECK(!spv_atomic_or.empty() && or_buf_out.size() == 1 && or_buf_out[0] == 7u,
           "#590: buffer_atomic_or is idempotent (4 | 3 = 7), distinct from add/max/swap");
 
+    // Kernel 24store (#590): integer sub-dword FORMAT store at a runtime byte address. Every lane stores
+    // its gid as a Uint16 into element[gid] of a stride-2 buffer, so elements 2k and 2k+1 SHARE dword k.
+    // A plain read-modify-write would race; the atomicAnd(clear field)+atomicOr(set field) of each lane's
+    // disjoint 16-bit field must land BOTH values -> dword k == 2k | ((2k+1)<<16). Real Vulkan run.
+    ShaderResourceTable rt_store16;
+    { ShaderResource sb{}; sb.cls = ResourceClass::ConstantBuffer; sb.format = DataFormat::Uint16;
+      sb.num_components = 1; sb.binding = 3; sb.stride = 2; sb.sgpr_base = 8; sb.fetch_pc = 2;
+      rt_store16.resources.push_back(sb); }
+    const uint32_t code_store16[] = {
+        0x7e000f00u,               // v_cvt_u32_f32 v0, v0   (shell input float gid -> int index)
+        0x7e020300u,               // v_mov_b32 v1, v0       (value = gid)
+        0xe0102000u, 0x80020100u,  // buffer_store_format_x v1, v0, s[8:11], idxen  (Uint16, stride 2)
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv_store16 = recompile_valu(
+        code_store16, std::size(code_store16), 1, 0, &rt_store16);
+    std::vector<uint32_t> store16_in(N / 2, 0), store16_out;
+    std::vector<float> store16_dummy(N); for (uint32_t i = 0; i < N; ++i) store16_dummy[i] = (float)i;
+    prosper::test::run_compute(spv_store16, store16_dummy, N, N, {}, store16_in, &store16_out);
+    uint32_t bad_store16 = 0;
+    for (uint32_t k = 0; k < N / 2 && store16_out.size() == N / 2; ++k)
+        if (store16_out[k] != ((2u * k) | ((2u * k + 1u) << 16))) ++bad_store16;
+    CHECK(!spv_store16.empty() && store16_out.size() == N / 2 && bad_store16 == 0,
+          "#590: stride-2 Uint16 buffer_store_format_x lands disjoint fields race-free (dword k = 2k|(2k+1)<<16)");
+
     // Kernel 24b (#150): the SAME unorm8x4 fetch but with a NON-dword-aligned inst offset (offset:2).
     // The packed unpack extracts components at static byte offsets from a dword-aligned base and drops
     // addr&3, so a non-aligned element base would decode the wrong bits — it must be REJECTED (the
