@@ -97,6 +97,7 @@ int main() {
     HleFn fdatasync_fn = Hle::lookup(nid_hash("fdatasync"));
     HleFn kernel_fdatasync_fn = Hle::lookup(nid_hash("sceKernelFdatasync"));
     HleFn kernel_sync_fn = Hle::lookup(nid_hash("sceKernelSync"));
+    HleFn kernel_reachability_fn = Hle::lookup(nid_hash("sceKernelCheckReachability"));
     HleFn getdents_fn = Hle::lookup(nid_hash("getdents"));
     HleFn kernel_getdents_fn = Hle::lookup(nid_hash("sceKernelGetdents"));
     HleFn getdirentries_fn = Hle::lookup(nid_hash("getdirentries"));
@@ -117,7 +118,8 @@ int main() {
               dup2_fn && kernel_dup2_fn && mkdir_fn && kernel_mkdir_fn && rmdir_fn &&
               kernel_rmdir_fn && unlink_fn && kernel_unlink_fn && rename_fn &&
               kernel_rename_fn && kernel_truncate_fn && kernel_ftruncate_fn && fsync_fn &&
-              kernel_fsync_fn && fdatasync_fn && kernel_fdatasync_fn && kernel_sync_fn && getdents_fn &&
+              kernel_fsync_fn && fdatasync_fn && kernel_fdatasync_fn && kernel_sync_fn &&
+              kernel_reachability_fn && getdents_fn &&
               kernel_getdents_fn && getdirentries_fn && kernel_getdirentries_fn && stat_fn &&
               kernel_stat_fn && fstat_fn && kernel_fstat_fn && lstat_fn && kernel_lstat_fn &&
               fcntl_fn && kernel_fcntl_fn,
@@ -147,6 +149,15 @@ int main() {
     CHECK(duplicate_errno == EEXIST, "mkdir preserves EEXIST for the caller");
     CHECK(kernel_mkdir_duplicate == 0x80020011u,
           "sceKernelMkdir returns SCE_KERNEL_ERROR_EEXIST directly");
+    set_app0_root(std::filesystem::current_path().string());
+    const std::string reachable_file = std::string("/app0/") + path;
+    const std::string reachable_directory = std::string("/app0/") + dir_path;
+    CHECK(kernel_reachability_fn &&
+              kernel_reachability_fn((uint64_t)(uintptr_t)reachable_file.c_str(), 0, 0, 0, 0, 0) == 0,
+          "sceKernelCheckReachability finds a translated guest file");
+    CHECK(kernel_reachability_fn &&
+              kernel_reachability_fn((uint64_t)(uintptr_t)reachable_directory.c_str(), 0, 0, 0, 0, 0) == 0,
+          "sceKernelCheckReachability finds a translated guest directory");
 #ifdef _WIN32
     // Windows has no CRT directory-open API, but a directory HANDLE can be attached to a CRT fd.
     // The zero-entry stub must still publish the defined starting offset through basep.
@@ -311,6 +322,18 @@ int main() {
           "libc open retains the -1 plus errno contract");
     CHECK((uint32_t)kernel_missing == 0x80020002u,
           "sceKernelOpen returns SCE_KERNEL_ERROR_ENOENT directly");
+    const std::string unreachable_file = std::string("/app0/") + missing_path;
+    std::string overlong_path(256, 'a');
+    CHECK(kernel_reachability_fn &&
+              kernel_reachability_fn((uint64_t)(uintptr_t)unreachable_file.c_str(), 0, 0, 0, 0, 0) ==
+                  0x80020002u,
+          "sceKernelCheckReachability returns SCE_KERNEL_ERROR_ENOENT for a missing path");
+    CHECK(kernel_reachability_fn && kernel_reachability_fn(0, 0, 0, 0, 0, 0) == 0x80020016u,
+          "sceKernelCheckReachability returns SCE_KERNEL_ERROR_EINVAL for a null path");
+    CHECK(kernel_reachability_fn &&
+              kernel_reachability_fn((uint64_t)(uintptr_t)overlong_path.c_str(), 0, 0, 0, 0, 0) ==
+                  0x8002003fu,
+          "sceKernelCheckReachability enforces the 255-byte console path bound");
 
     // The stat-family libc names preserve -1 plus errno, while their kernel siblings return
     // a 32-bit SCE error directly. Neither contract may overwrite the guest buffer on failure.
