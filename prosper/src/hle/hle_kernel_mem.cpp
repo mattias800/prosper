@@ -949,8 +949,12 @@ HLE(k_wake_by_address) {
     return 0;
 }
 
-HLE(k_munmap)   { if (!a1) return 0x80020016ull;   // EINVAL: a zero-length unmap (shadPS4 sceKernelMunmap)
-                  if (a0) { munmap((void*)a0, a1); untrack(a0, a1); } return 0; }
+HLE(k_munmap) {
+    if (!a0 || !a1) return 0x80020016ull;
+    if (munmap((void*)a0, a1) != 0) return 0x80020016ull;
+    untrack(a0, a1);
+    return 0;
+}
 static uint64_t sce_mprotect_error(int error) {
     switch (error) {
         case EACCES: return 0x8002000dull;
@@ -3716,10 +3720,12 @@ HLE7(k_map_dmem2) {
     return map_dmem_impl(a0, a1, a3, a4, a5, a6, static_cast<int32_t>(a2), true);
 }
 
-HLE(k_munmap)   { if (!a1) return 0x80020016ull;
-                  if (a0 && !win_unmap(a0, a1)) return 0x80020016ull;
-                  if (a0) untrack(a0, a1);
-                  return 0; }
+HLE(k_munmap) {
+    if (!a0 || !a1) return 0x80020016ull;
+    if (!win_unmap(a0, a1)) return 0x80020016ull;
+    untrack(a0, a1);
+    return 0;
+}
 static uint64_t sce_win_mprotect_error(DWORD error) {
     switch (error) {
         case ERROR_ACCESS_DENIED:

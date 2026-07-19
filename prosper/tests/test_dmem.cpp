@@ -68,6 +68,10 @@ int main() {
     if (fails) return 1;
 
     constexpr uint64_t len = 0x4000;
+    CHECK((uint32_t)unmap(0, len, 0, 0, 0, 0) == 0x80020016u,
+          "Munmap rejects a null address");
+    CHECK((uint32_t)unmap(0x4000, 0, 0, 0, 0, 0) == 0x80020016u,
+          "Munmap rejects a zero-length range");
     uint64_t va = 0x30000000000ull;  // Fixed, 64 KiB-aligned, and above the VEH's heap threshold.
     CHECK(reserve((uint64_t)(uintptr_t)&va, len, 0x10 /* MAP_FIXED */, len, 0, 0) == 0,
           "ReserveVirtualRange creates an exact 16 KiB reservation");
@@ -77,6 +81,15 @@ int main() {
     volatile uint32_t* cell = (volatile uint32_t*)(uintptr_t)va;
     *cell = 0x6310CAFEu;
     CHECK(*cell == 0x6310CAFEu, "first touch commits one guest page and preserves the write");
+    CHECK((uint32_t)unmap(va + 1, len, 0, 0, 0, 0) == 0x80020016u,
+          "Munmap reports an unaligned host-unmap failure");
+    uint8_t failed_unmap_info[0x48]{};
+    CHECK(query(va, 0, (uint64_t)(uintptr_t)failed_unmap_info,
+                sizeof(failed_unmap_info), 0, 0) == 0 &&
+              *(uint64_t*)(failed_unmap_info + 0x00) == va &&
+              *(uint64_t*)(failed_unmap_info + 0x08) == va + len &&
+              *cell == 0x6310CAFEu,
+          "failed Munmap preserves VA tracking and mapped contents");
     CHECK(unmap(va, len, 0, 0, 0, 0) == 0, "reserved page unmaps cleanly");
 
     // Placeholder-backed flexible memory must retain the old VirtualAlloc partial-unmap
@@ -623,6 +636,7 @@ int main() {
     auto map2    = reinterpret_cast<Hle7Fn>(
         Hle::lookup(nid_hash("sceKernelMapDirectMemory2")));
     auto query   = Hle::lookup(nid_hash("sceKernelVirtualQuery"));
+    auto unmap   = Hle::lookup(nid_hash("sceKernelMunmap"));
     auto mtypeprotect = Hle::lookup(nid_hash("sceKernelMtypeprotect"));
     auto batch   = Hle::lookup(nid_hash("sceKernelBatchMap"));
     auto release = Hle::lookup(nid_hash("sceKernelReleaseDirectMemory"));
@@ -631,13 +645,18 @@ int main() {
           "sceKernelMapDirectMemory2 hashes to the PS5 3.20 import NID");
     CHECK(nid_hash("sceKernelGetDirectMemoryType") == "BC+OG5m9+bw",
           "sceKernelGetDirectMemoryType hashes to the PS5 3.20 import NID");
-    CHECK(avail && alloc && alloc_main && map && map2 && query && mtypeprotect && batch &&
+    CHECK(avail && alloc && alloc_main && map && map2 && query && unmap && mtypeprotect && batch &&
               release && get_type,
           "dmem fns registered");
-    if (!(avail && alloc && alloc_main && map && map2 && query && mtypeprotect && batch &&
+    if (!(avail && alloc && alloc_main && map && map2 && query && unmap && mtypeprotect && batch &&
           release && get_type)) {
         printf("== FAIL ==\n"); return 1;
     }
+
+    CHECK((uint32_t)unmap(0, 0x4000, 0, 0, 0, 0) == 0x80020016u,
+          "Munmap rejects a null address");
+    CHECK((uint32_t)unmap(0x4000, 0, 0, 0, 0, 0) == 0x80020016u,
+          "Munmap rejects a zero-length range");
 
     // Both allocation APIs require their physical-address output. Reject before taking from
     // the pool so an unobservable allocation cannot leak capacity.
@@ -740,7 +759,8 @@ int main() {
         rr = map((uint64_t)(uintptr_t)&va, 0x10000, 0x2 /*RW*/, 0, p, 0x10000);
         CHECK(rr == 0 && va && (va & 0xffff) == 0,
               "map direct memory honors requested 64KiB VA alignment");
-        if (va) munmap((void*)(uintptr_t)va, 0x10000);
+        if (va) CHECK(unmap(va, 0x10000, 0, 0, 0, 0) == 0,
+                      "unmap aligned direct view through the HLE path");
         if (p) release(p, 0x10000, 0, 0, 0, 0);
     }
 
@@ -758,6 +778,14 @@ int main() {
               "MapDirectMemory2 consumes shifted arguments and seventh-argument alignment");
         rr = map((uint64_t)(uintptr_t)&alias, 0x10000, 0x2, 0, p, 0x10000);
         CHECK(rr == 0 && alias, "map ordinary alias for MapDirectMemory2 physical range");
+        CHECK((uint32_t)unmap(va + 1, 0x4000, 0, 0, 0, 0) == 0x80020016u,
+              "Munmap reports an unaligned host-unmap failure");
+        uint8_t failed_unmap_info[0x48]{};
+        CHECK(query(va + 0x2000, 0, (uint64_t)(uintptr_t)failed_unmap_info,
+                    sizeof(failed_unmap_info), 0, 0) == 0 &&
+                  *(uint64_t*)(failed_unmap_info + 0x00) == va &&
+                  *(uint64_t*)(failed_unmap_info + 0x08) == va + 0x10000,
+              "failed Munmap preserves VA tracking");
         if (va && alias) {
             *(volatile uint64_t*)(uintptr_t)(va + 0x120) = 0xB002D1EC7A11A5ull;
             CHECK(*(volatile uint64_t*)(uintptr_t)(alias + 0x120) == 0xB002D1EC7A11A5ull,
@@ -870,8 +898,10 @@ int main() {
         CHECK((uint32_t)mtypeprotect(UINT64_MAX - 0x1000, 0x2000, 13, 0x1, 0, 0) ==
                   0x80020016u,
               "Mtypeprotect rejects an overflowing guest range");
-        if (va) munmap((void*)(uintptr_t)va, 0x10000);
-        if (alias) munmap((void*)(uintptr_t)alias, 0x10000);
+        if (va) CHECK(unmap(va, 0x10000, 0, 0, 0, 0) == 0,
+                      "unmap MapDirectMemory2 view through the HLE path");
+        if (alias) CHECK(unmap(alias, 0x10000, 0, 0, 0, 0) == 0,
+                         "unmap ordinary alias through the HLE path");
         if (p) release(p, 0x10000, 0, 0, 0, 0);
     }
 
