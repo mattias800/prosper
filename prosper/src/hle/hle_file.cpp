@@ -1413,6 +1413,19 @@ HLE(k_truncate) { uint64_t r = f_truncate(a0, a1, a2, a3, a4, a5); int e = errno
 HLE(k_ftruncate){ uint64_t r = f_ftruncate(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
 HLE(k_fsync)    { uint64_t r = f_fsync(a0, a1, a2, a3, a4, a5);    int e = errno; return kernel_file_result32(r, e); }
 HLE(k_fdatasync){ uint64_t r = f_fdatasync(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
+HLE(k_check_reachability) {
+    // Verified PS5/PS4 contract: a translated file OR directory is reachable. The old missing-import
+    // path returned success for every spelling, so guests could take content-loading branches for
+    // files that did not exist. Keep the console's 255-byte path bound and kernel error contract.
+    if (!a0) return file_sce_error(EINVAL);
+    const char* guest = CS(a0);
+    size_t length = 0;
+    while (length <= 255 && guest[length]) ++length;
+    if (length > 255) return file_sce_error(ENAMETOOLONG);
+    const std::string host = translate(guest);
+    if (::access(host.c_str(), 0) == 0) return 0;
+    return file_sce_error(errno);
+}
 HLE(f_access){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::access(h.c_str(), (int)a1); }
 HLE(f_mkdir) { std::string h = translate(CS(a0));   // sceKernelMkdir(path, mode)
 #ifdef _WIN32
@@ -2156,6 +2169,7 @@ void register_file_hle() {
     R("fsync", f_fsync);       R("sceKernelFsync", k_fsync);       // real descriptor durability
     R("fdatasync", f_fdatasync); R("sceKernelFdatasync", k_fdatasync); // data-only durability
     R("sceKernelSync", k_sync); // whole-filesystem/process-file flush (was fake success)
+    R("sceKernelCheckReachability", k_check_reachability); // truthful file/directory existence
     R("sceKernelTruncate", k_truncate);      // path-based sibling (same corruption class)
     R("sceKernelFstat", k_fstat);
     // Low-level POSIX wrappers with the internal leading-underscore names. Real libc.prx implements
