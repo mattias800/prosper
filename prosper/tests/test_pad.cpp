@@ -189,6 +189,29 @@ int main() {
               (SCE_PAD_BUTTON_LEFT | SCE_PAD_BUTTON_SQUARE | SCE_PAD_BUTTON_R1),
               "names: recorded text round-trips through parser");
 
+        PadRecordState flip_record;
+        CHECK(flip_record.observe(9, 0).empty(), "record: initial neutral flip emits nothing");
+        CHECK(flip_record.observe(10, SCE_PAD_BUTTON_CROSS).empty(),
+              "record: flip press starts an interval");
+        CHECK(flip_record.observe(12, SCE_PAD_BUTTON_CROSS).empty(),
+              "record: unchanged flip state emits nothing");
+        CHECK(flip_record.observe(15, SCE_PAD_BUTTON_OPTIONS) == "f10-15:cross\n",
+              "record: flip transition closes the previous interval");
+        CHECK(flip_record.observe(15, 0) == "f15-16:options\n",
+              "record: same-flip release preserves a non-empty interval");
+
+        PadRecordState read_record(PadRecordAxis::pad_read);
+        CHECK(read_record.observe(3, SCE_PAD_BUTTON_UP | SCE_PAD_BUTTON_CROSS).empty(),
+              "record: pad-read press starts an interval");
+        const std::string read_interval = read_record.observe(5, 0);
+        CHECK(read_interval == "p3-5:up+cross\n",
+              "record: pad-read release emits a canonical p-range");
+        auto recorded_read = parse_pad_script(read_interval);
+        CHECK(recorded_read.size() == 1 && recorded_read[0].read_anchored &&
+              recorded_read[0].t_secs == 3.0 && recorded_read[0].end == 5.0 &&
+              recorded_read[0].button_mask == (SCE_PAD_BUTTON_UP | SCE_PAD_BUTTON_CROSS),
+              "record: pad-read interval round-trips through the route parser");
+
         auto s = parse_pad_script("3:start;9.5:cross;16:up+cross");
         CHECK(s.size() == 3, "parse: 3 entries");
         CHECK(s[0].t_secs == 3.0 && s[0].button_mask == SCE_PAD_BUTTON_OPTIONS, "parse: entry0 t/mask");

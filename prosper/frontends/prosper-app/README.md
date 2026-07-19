@@ -67,6 +67,9 @@ F11 or Alt+Enter toggles borderless desktop fullscreen. Esc or closing the windo
 - `--record PATH` — record the final controller stream to a replayable `PROSPER_PAD_SCRIPT` route.
   Missing parent directories are created; release the last held button before stopping so its interval
   is closed and flushed.
+- `--record-axis flip|pad-read` — timestamp recorded intervals by display flips (the backward-compatible
+  default) or by successful guest input-state reads. Pad-read routes remain stable when presentation
+  pauses while the title continues polling input.
 
 ## Notes
 

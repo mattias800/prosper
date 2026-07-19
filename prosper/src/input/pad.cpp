@@ -148,6 +148,25 @@ std::string pad_button_names(uint32_t mask) {
     return result;
 }
 
+std::string PadRecordState::observe(int64_t position, uint32_t buttons) {
+    if (buttons == previous_) return {};
+
+    std::string completed;
+    if (previous_) {
+        // A press and release can be observed at the same count (for example, through two pad
+        // polls during one display flip). Preserve the existing recorder's non-empty range rule.
+        const int64_t end = position > start_ ? position : start_ + 1;
+        const std::string names = pad_button_names(previous_);
+        if (!names.empty()) {
+            completed = (axis_ == PadRecordAxis::pad_read ? "p" : "f") +
+                        std::to_string(start_) + "-" + std::to_string(end) + ":" + names + "\n";
+        }
+    }
+    previous_ = buttons;
+    start_ = position;
+    return completed;
+}
+
 std::vector<PadScriptEntry> parse_pad_script(const std::string& spec) {
     std::vector<PadScriptEntry> v;
     size_t i = 0;

@@ -29,5 +29,7 @@ PROSPER_PAD_SCRIPT=@scripts/messenger/reach-intro-story.pad \
   and keep `PROSPER_PAD_SCRIPT_LOG=1` enabled.
 
 Create another route with `prosper-app --record <path>` or
-`PROSPER_PAD_RECORD=<path>`, replay it with `PROSPER_PAD_SCRIPT=@path`, and only
+`PROSPER_PAD_RECORD=<path>`. Add `--record-axis pad-read` (or set
+`PROSPER_PAD_RECORD_AXIS=pad-read`) when pad polling is a more stable clock than presentation. Replay
+it with `PROSPER_PAD_SCRIPT=@path`, and only
 commit it after repeated current-master runs reach the state named by the file.
