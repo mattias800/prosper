@@ -427,7 +427,8 @@ duplicate. Until then the app is fully functional via `--test-pattern` (and any 
   shows the composited game (verified `--dump … --frames 3`).
 - **P1 — audio** ✅ **done**: `prosper-app` installs the SDL3 `AudioSink` (`sceAudioOut` → host).
 - **P2 — controllers** ✅ **done**: installs the SDL3 `PadBackend` (host gamepad → `libScePad`).
-- **P3 — polish** (in progress): resize/fullscreen and present-mode selection are implemented;
+- **P3 — polish** (in progress): resize/fullscreen, present-mode selection, and non-modal SaveData
+  percentage progress presentation are implemented;
   pause/quit UX remains.
   Native Windows build/run packaging is done via `scripts/run-windows.ps1`. Cooperative guest-stop
   at a flip boundary is a follow-up (today the

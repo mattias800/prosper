@@ -55,6 +55,7 @@ struct SaveDataRequest {
     bool supported = false;       // false -> frontend declines ownership; core keeps headless policy
     bool error = false;           // choose the error rather than information message-box style
     bool cancelable = true;       // false when OptionBack::DISABLE forbids a back/cancel outcome
+    bool progress = false;        // non-modal PROGRESS_BAR request; guest Close owns completion
     uint32_t mode = 0;
     uint32_t displayType = 0;     // 1=SAVE, 2=LOAD, 3=DELETE
     uint64_t userData = 0;
@@ -76,6 +77,13 @@ struct SaveDataResultSnapshot {
     bool canceled = false;
 };
 
+struct SaveDataProgressSnapshot {
+    uint64_t generation = 0;
+    SaveDataRequest request{};
+    uint32_t value = 0;
+    explicit operator bool() const { return generation != 0; }
+};
+
 class SaveDataDialogState {
 public:
     void open(SaveDataRequest request);
@@ -85,20 +93,25 @@ public:
     bool active(uint64_t generation) const;
     void complete(uint64_t generation, int clicked);
     SaveDataResultSnapshot result_snapshot() const;
+    void progress_inc(uint32_t target, uint32_t delta);
+    void progress_set(uint32_t target, uint32_t value);
+    void finish_progress(uint64_t generation);
+    SaveDataProgressSnapshot progress_snapshot() const;
 
 private:
     mutable std::mutex mx_;
     SaveDataRequest request_{};
     int status_ = 0;
     uint32_t button_ = 0;
+    uint32_t progress_ = 0;
     bool canceled_ = false;
     uint64_t generation_ = 0;
     uint64_t pending_generation_ = 0;
 };
 
 // Parse the supported non-list modes into an owned request safe to retain until the SDL main-thread
-// pump runs. USER_MSG, ordinary SYSTEM_MSG confirmations/notices, and ERROR_CODE are supported.
-// LIST and progress/no-button modes deliberately return supported=false until their dedicated UI exists.
+// pump runs. USER_MSG, ordinary SYSTEM_MSG confirmations/notices, ERROR_CODE, and non-modal
+// PROGRESS_BAR are supported. LIST deliberately returns supported=false until its virtual-slot UI exists.
 SaveDataRequest read_savedata_request(uint64_t param);
 
 // Write only fields owned by the service: mode/result/buttonId/userData. Caller-provided dirName and

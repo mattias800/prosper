@@ -150,6 +150,43 @@ int main() {
         CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
               "SaveDataDialog progress message declines modal ownership");
 
+        uint8_t progress[24] = {};
+        uint32_t bar_type = 0 /*PERCENTAGE*/, progress_system = 1 /*PROGRESS*/;
+        const char* progress_message = "Writing checkpoint...";
+        uint64_t progress_message_ptr = (uint64_t)(uintptr_t)progress_message;
+        uint64_t progress_ptr = (uint64_t)(uintptr_t)progress;
+        std::memcpy(progress + 0, &bar_type, 4);
+        std::memcpy(progress + 8, &progress_message_ptr, 8);
+        std::memcpy(progress + 16, &progress_system, 4);
+        save_mode = SAVE_DATA_DIALOG_MODE_PROGRESS_BAR;
+        display_type = 1 /*SAVE*/;
+        std::memcpy(save_param + 0x34, &save_mode, 4);
+        std::memcpy(save_param + 0x38, &display_type, 4);
+        std::memcpy(save_param + 0x68, &progress_ptr, 8);
+        request = read_savedata_request((uint64_t)(uintptr_t)save_param);
+        CHECK(request.supported && request.progress && !request.cancelable &&
+                  request.message == progress_message,
+              "SaveDataDialog PROGRESS_BAR copies a custom message for non-modal ownership");
+
+        progress_message_ptr = 0;
+        display_type = 2 /*LOAD*/;
+        std::memcpy(progress + 8, &progress_message_ptr, 8);
+        std::memcpy(save_param + 0x38, &display_type, 4);
+        request = read_savedata_request((uint64_t)(uintptr_t)save_param);
+        CHECK(request.supported && request.progress && request.message == "Loading...",
+              "SaveDataDialog PROGRESS system message follows the display operation");
+        progress_system = 2 /*RESTORE*/;
+        std::memcpy(progress + 16, &progress_system, 4);
+        request = read_savedata_request((uint64_t)(uintptr_t)save_param);
+        CHECK(request.supported && request.message == "Restoring saved data...",
+              "SaveDataDialog RESTORE system message is retained by the progress request");
+        bar_type = 1; std::memcpy(progress + 0, &bar_type, 4);
+        CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
+              "SaveDataDialog rejects an unknown progress-bar type");
+        progress_ptr = 1; std::memcpy(save_param + 0x68, &progress_ptr, 8);
+        CHECK(!read_savedata_request((uint64_t)(uintptr_t)save_param).supported,
+              "SaveDataDialog rejects an unreadable progress parameter without crashing");
+
         uint8_t error[36] = {};
         uint32_t error_code = 0x809F000F;
         std::memcpy(error, &error_code, 4);
@@ -265,6 +302,37 @@ int main() {
         std::memcpy(&lifecycle_button, lifecycle_result + 8, 4);
         CHECK(lifecycle_common == 1 && lifecycle_button == 0,
               "SaveData lifecycle canceled completion writes USER_CANCELED + INVALID");
+
+        SaveDataRequest progress_request;
+        progress_request.supported = true;
+        progress_request.progress = true;
+        progress_request.mode = SAVE_DATA_DIALOG_MODE_PROGRESS_BAR;
+        progress_request.message = "Saving...";
+        state.open(progress_request);
+        CHECK(!state.take_pending(),
+              "SaveData progress never enters the blocking modal ticket path");
+        SaveDataProgressSnapshot progress = state.progress_snapshot();
+        CHECK(progress && progress.value == 0 && progress.request.message == "Saving...",
+              "SaveData progress starts at zero with an owned request snapshot");
+        state.progress_inc(1 /*unsupported target*/, 50);
+        state.progress_inc(0, 35);
+        state.progress_set(0, 80);
+        state.progress_inc(0, 5);
+        CHECK(state.progress_snapshot().value == 85,
+              "SaveData progress ignores other targets and applies set/increment in order");
+        const uint64_t old_progress_generation = progress.generation;
+        state.open(progress_request);
+        SaveDataProgressSnapshot replacement_progress = state.progress_snapshot();
+        state.finish_progress(old_progress_generation);
+        CHECK(replacement_progress && replacement_progress.generation != old_progress_generation &&
+                  state.status() == 2 && state.progress_snapshot().value == 0,
+              "SaveData progress re-Open invalidates stale finish and resets percentage");
+        state.finish_progress(replacement_progress.generation);
+        SaveDataResultSnapshot progress_result = state.result_snapshot();
+        CHECK(state.status() == 3 && !state.progress_snapshot() &&
+                  !progress_result.canceled && progress_result.buttonId == 0,
+              "SaveData progress UI failure finishes with the neutral headless result");
+        state.close();
     }
 
     // --- ImeDialog: read_ime_request from a synthetic OrbisImeDialogParam (96 bytes) ---

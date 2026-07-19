@@ -7,6 +7,7 @@
 #include "dialog_helpers.hpp"
 #include "hle/platform_ui.hpp"
 #include <SDL3/SDL.h>
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -190,9 +191,12 @@ struct SdlPlatformUi : PlatformUi {
     void errorDialogClose() override { err_status.store(0); }
 
     // SaveDataDialog. Open copies the guest request; the prosper-app main-thread pump owns SDL UI.
-    // LIST/progress modes are declined until their dedicated virtual-slot UI exists, preserving the
-    // core's established headless auto-dismiss for those modes.
+    // Modal notices and the non-modal progress window share the same generation-safe state. LIST is
+    // still declined until its dedicated virtual-slot UI exists, preserving the headless fallback.
     SaveDataDialogState save_state;
+    SDL_Window* save_progress_window = nullptr;
+    SDL_Renderer* save_progress_renderer = nullptr;
+    uint64_t save_progress_generation = 0;
 
     bool saveDataDialogOpen(uint64_t param) override {
         SaveDataRequest request = read_savedata_request(param);
@@ -206,7 +210,60 @@ struct SdlPlatformUi : PlatformUi {
         write_savedata_result(result, snapshot.request, snapshot.buttonId, snapshot.canceled);
         return (int)snapshot.buttonId;
     }
+    void saveDataDialogProgressBarInc(uint32_t target, uint32_t delta) override {
+        save_state.progress_inc(target, delta);
+    }
+    void saveDataDialogProgressBarSetValue(uint32_t target, uint32_t value) override {
+        save_state.progress_set(target, value);
+    }
     void saveDataDialogClose() override { save_state.close(); }
+
+    void close_progress_window() {
+        if (save_progress_renderer) SDL_DestroyRenderer(save_progress_renderer);
+        if (save_progress_window) SDL_DestroyWindow(save_progress_window);
+        save_progress_renderer = nullptr;
+        save_progress_window = nullptr;
+        save_progress_generation = 0;
+    }
+
+    bool render_progress(const SaveDataProgressSnapshot& progress) {
+        if (!progress) {
+            close_progress_window();
+            return true;
+        }
+        if (progress.generation != save_progress_generation) {
+            close_progress_window();
+            const SDL_WindowFlags flags = SDL_WINDOW_ALWAYS_ON_TOP | SDL_WINDOW_UTILITY |
+                                          SDL_WINDOW_NOT_FOCUSABLE;
+            if (!SDL_CreateWindowAndRenderer("prosper - Saved Data", 560, 160, flags,
+                                             &save_progress_window, &save_progress_renderer)) {
+                SDL_Log("prosper: saved-data progress window failed: %s", SDL_GetError());
+                return false;
+            }
+            save_progress_generation = progress.generation;
+        }
+
+        const uint32_t percent = std::min(progress.value, 100u);
+        SDL_SetRenderDrawColor(save_progress_renderer, 28, 30, 40, 255);
+        SDL_RenderClear(save_progress_renderer);
+        SDL_SetRenderDrawColor(save_progress_renderer, 235, 235, 240, 255);
+        const char* message = progress.request.message.empty() ?
+            "Saved data operation in progress..." : progress.request.message.c_str();
+        SDL_RenderDebugText(save_progress_renderer, 24.0f, 28.0f, message);
+
+        SDL_FRect outline{40.0f, 86.0f, 480.0f, 28.0f};
+        SDL_SetRenderDrawColor(save_progress_renderer, 220, 220, 230, 255);
+        SDL_RenderRect(save_progress_renderer, &outline);
+        SDL_FRect fill{42.0f, 88.0f, 4.76f * percent, 24.0f};
+        SDL_SetRenderDrawColor(save_progress_renderer, 76, 132, 214, 255);
+        SDL_RenderFillRect(save_progress_renderer, &fill);
+        char percent_text[16] = {};
+        std::snprintf(percent_text, sizeof percent_text, "%u%%", percent);
+        SDL_SetRenderDrawColor(save_progress_renderer, 245, 245, 250, 255);
+        SDL_RenderDebugText(save_progress_renderer, 264.0f, 124.0f, percent_text);
+        SDL_RenderPresent(save_progress_renderer);
+        return true;
+    }
 
     // Ime keyboard presence: a windowed session runs on a host with a keyboard, so report one (#347).
     // This makes sceImeKeyboardGetResourceId/GetInfo report a connected keyboard, enabling a title's
@@ -246,6 +303,9 @@ struct SdlPlatformUi : PlatformUi {
     // MAIN-thread: if a text dialog is pending, run its modal to completion (writes the guest buffer,
     // then flips status to FINISHED so the guest's next poll — and its buffer read — see it).
     void pump() {
+        const SaveDataProgressSnapshot progress = save_state.progress_snapshot();
+        if (!render_progress(progress) && progress)
+            save_state.finish_progress(progress.generation);
         const SaveDataModalTicket ticket = save_state.take_pending();
         if (ticket) {
             auto active = [this, generation = ticket.generation] {
@@ -261,6 +321,11 @@ struct SdlPlatformUi : PlatformUi {
             ime_status.store(2 /*Finished*/);
         }
     }
+
+    void shutdown() {
+        save_state.close();
+        close_progress_window();
+    }
 };
 
 SdlPlatformUi g_sdl_ui;
@@ -269,12 +334,12 @@ SdlPlatformUi g_sdl_ui;
 
 bool install_sdl3_platform_ui() {
     set_platform_ui(&g_sdl_ui);
-    SDL_Log("prosper: SDL3 dialog backend installed (Msg/Error/SaveData + Ime text entry)");
+    SDL_Log("prosper: SDL3 dialog backend installed (Msg/Error/SaveData progress + Ime text entry)");
     return true;
 }
 void shutdown_sdl3_platform_ui() {
     set_platform_ui(nullptr);
-    g_sdl_ui.saveDataDialogClose();
+    g_sdl_ui.shutdown();
 }
 void sdl_platform_ui_pump() { g_sdl_ui.pump(); }
 

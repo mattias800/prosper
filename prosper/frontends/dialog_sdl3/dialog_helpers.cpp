@@ -252,6 +252,40 @@ SaveDataRequest read_savedata_request(uint64_t param) {
         request.buttons = save_user_buttons(0);
         request.error = true;
         request.supported = true;
+        return request;
+    }
+
+    if (request.mode == SAVE_DATA_DIALOG_MODE_PROGRESS_BAR) {
+        const uint64_t progress = local_field<uint64_t>(outer, 0x68);
+        if (!progress) return request;
+        // ProgressBarParam prefix: barType@0, pad@4, msg@8, sysMsgType@16. The only documented
+        // bar type is PERCENTAGE=0; reading just the owned prefix avoids relying on reserved size.
+        std::array<uint8_t, 20> progress_param{};
+        if (!guest_read_bytes(progress, progress_param.data(), progress_param.size()) ||
+            local_field<uint32_t>(progress_param, 0x00) != 0)
+            return request;
+        const uint64_t message = local_field<uint64_t>(progress_param, 0x08);
+        if (message) {
+            if (!guest_string(message, request.message)) return request;
+        } else {
+            switch (local_field<uint32_t>(progress_param, 0x10)) {
+            case 0: // INVALID: intentionally no message
+                break;
+            case 1: // PROGRESS: choose the inherited action-specific system text
+                request.message = request.displayType == 1 ? "Saving..." :
+                                  request.displayType == 2 ? "Loading..." :
+                                  request.displayType == 3 ? "Deleting..." : "";
+                break;
+            case 2: // RESTORE
+                request.message = "Restoring saved data...";
+                break;
+            default:
+                return request;
+            }
+        }
+        request.progress = true;
+        request.cancelable = false;
+        request.supported = true;
     }
     return request;
 }
@@ -273,9 +307,10 @@ void SaveDataDialogState::open(SaveDataRequest request) {
     if (!generation_) ++generation_; // zero is reserved for "no ticket"
     request_ = std::move(request);
     button_ = 0;
+    progress_ = 0;
     canceled_ = false;
     status_ = 2 /*RUNNING*/;
-    pending_generation_ = generation_;
+    pending_generation_ = request_.progress ? 0 : generation_;
 }
 
 int SaveDataDialogState::status() const {
@@ -315,6 +350,34 @@ void SaveDataDialogState::complete(uint64_t generation, int clicked) {
 SaveDataResultSnapshot SaveDataDialogState::result_snapshot() const {
     std::lock_guard<std::mutex> lock(mx_);
     return {request_, button_, canceled_};
+}
+
+void SaveDataDialogState::progress_inc(uint32_t target, uint32_t delta) {
+    std::lock_guard<std::mutex> lock(mx_);
+    if (target != 0 || status_ != 2 /*RUNNING*/ || !request_.progress) return;
+    progress_ = delta > UINT32_MAX - progress_ ? UINT32_MAX : progress_ + delta;
+}
+
+void SaveDataDialogState::progress_set(uint32_t target, uint32_t value) {
+    std::lock_guard<std::mutex> lock(mx_);
+    if (target != 0 || status_ != 2 /*RUNNING*/ || !request_.progress) return;
+    progress_ = value;
+}
+
+void SaveDataDialogState::finish_progress(uint64_t generation) {
+    std::lock_guard<std::mutex> lock(mx_);
+    if (!generation || generation_ != generation || status_ != 2 /*RUNNING*/ ||
+        !request_.progress)
+        return;
+    button_ = 0;
+    canceled_ = false;
+    status_ = 3 /*FINISHED: preserve the core's neutral headless fallback*/;
+}
+
+SaveDataProgressSnapshot SaveDataDialogState::progress_snapshot() const {
+    std::lock_guard<std::mutex> lock(mx_);
+    if (status_ != 2 /*RUNNING*/ || !request_.progress) return {};
+    return {generation_, request_, progress_};
 }
 
 // --- ImeDialog text entry ---

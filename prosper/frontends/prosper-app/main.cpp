@@ -590,7 +590,12 @@ int main(int argc, char** argv) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_EVENT_QUIT) running = false;
-            else if (ev.type == SDL_EVENT_KEY_DOWN || ev.type == SDL_EVENT_KEY_UP) {
+            else if (ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
+                     ev.window.windowID == appWindowId) {
+                // A progress utility window means the app window is not necessarily SDL's last
+                // window, so closing it no longer guarantees a synthesized SDL_EVENT_QUIT.
+                running = false;
+            } else if (ev.type == SDL_EVENT_KEY_DOWN || ev.type == SDL_EVENT_KEY_UP) {
                 prosper::frontend::AppWindowKey key{};
                 key.app_window = ev.key.windowID == appWindowId;
                 key.pressed = ev.key.down;
