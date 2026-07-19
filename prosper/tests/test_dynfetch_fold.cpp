@@ -659,6 +659,34 @@ int main() {
                              &offset_compute_table, direct_copy_config).empty(),
           "#636: compute format-load keeps base B and applies nonzero instruction offset once");
 
+    // #590: a stride-1 Uint8 buffer_load_format_x at a runtime (non-dword-aligned) byte address.
+    // DOLL's post-process LUT compute kernels index a Uint8 table this way; the descriptor-defined
+    // aligned packed extraction rejected it (stride 1 is not 4-aligned) until the integer sub-dword
+    // dynamic-extract path. It must resolve the V# AND recompile to non-empty SPIR-V.
+    static uint32_t u8_table[4] = { 0x03020100u };            // 4 bytes {0,1,2,3}, one dword
+    const uint64_t u8_base = (uint64_t)(uintptr_t)u8_table;
+    uint32_t u8_seed[12] = {};
+    u8_seed[8]  = (uint32_t)u8_base;                          // V# at s[8:11]: base low
+    u8_seed[9]  = ((uint32_t)(u8_base >> 32) & 0xFFFFu) | (1u << 16);  // base hi | stride=1
+    u8_seed[10] = 4u;                                         // num_records = 4
+    u8_seed[11] = (5u << 12) | 4u;                            // format field 5 (8_UINT), dst_sel_x = X
+    const uint32_t u8_format_load[] = {
+        0xE0002000u, 0x80020000u,   // buffer_load_format_x v0, v0, s[8:11], 0 idxen
+        0xBF810000u,
+    };
+    ShaderResourceTable u8_table_rt;
+    add_compute_buffer_resources(u8_table_rt, u8_format_load, std::size(u8_format_load),
+                                 u8_seed, std::size(u8_seed));
+    assign_convention_bindings(u8_table_rt, 2);
+    ComputeShaderConfig u8_config;
+    u8_config.user_sgprs.assign(u8_seed, u8_seed + std::size(u8_seed));
+    u8_config.local_x = u8_config.local_y = u8_config.local_z = 1;
+    CHECK(u8_table_rt.by_fetch_pc(0) &&
+          u8_table_rt.by_fetch_pc(0)->format == DataFormat::Uint8 &&
+          !recompile_compute(u8_format_load, std::size(u8_format_load),
+                             &u8_table_rt, u8_config).empty(),
+          "#590: stride-1 Uint8 buffer_load_format_x recompiles via the integer sub-dword dynamic path");
+
     const uint32_t rewritten_copy_dest[] = {
         0xBE840380u,                // s_mov_b32 s4, 0 (seed destination is no longer live)
         0xE01C2000u, 0x80010101u,   // buffer_store_format_xyzw v[1:4], v1, s[4:7], 0 idxen
