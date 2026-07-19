@@ -10,6 +10,7 @@
 #include <SDL3/SDL.h>
 
 #include <array>
+#include <chrono>
 #include <mutex>
 #include <thread>
 
@@ -49,22 +50,38 @@ public:
         if (!s.stream) { SDL_Log("prosper-audio: OpenAudioDeviceStream failed: %s", SDL_GetError()); return false; }
         s.frame_bytes = audio_frame_bytes(info);
         s.grain_bytes = audio_grain_bytes(info);
+        s.freq = info.freq;
+        s.next = {};   // (re)start the per-grain pacing clock on the first output()
         SDL_ResumeAudioStreamDevice(s.stream);
         return true;
     }
 
     void output(int port, const void* pcm, int frames) override {
         if (port < 1 || port > kMaxPorts) return;
-        SDL_AudioStream* stream; int frame_bytes, grain_bytes;
-        { std::lock_guard<std::mutex> lk(mx_); Slot& s = slots_[port - 1];
-          stream = s.stream; frame_bytes = s.frame_bytes; grain_bytes = s.grain_bytes; }
+        SDL_AudioStream* stream; int frame_bytes; int freq;
+        std::chrono::steady_clock::time_point target;
+        {
+            std::lock_guard<std::mutex> lk(mx_);
+            Slot& s = slots_[port - 1];
+            stream = s.stream; frame_bytes = s.frame_bytes; freq = s.freq;
+            if (stream && freq > 0) {
+                // Pace EACH call one grain of wall-clock time apart (real sceAudioOutOutput blocks
+                // until the hardware ring frees one grain — evenly spaced, never bursty). The old
+                // cap-based pacing let the guest burst a whole device quantum (4+ grains) and then
+                // stall: FMOD signals its mixer's condvar once per submitted grain, condvar signals
+                // COALESCE within a burst, so the mixer woke once per ~21 ms instead of once per
+                // grain and mixed at 1/4 real time — every DSP block audibly replayed ~4x (#1016).
+                // Same resync-if-behind model as the core's RealtimeSilentSink.
+                auto dur = std::chrono::nanoseconds((int64_t)frames * 1000000000LL / freq);
+                auto now = std::chrono::steady_clock::now();
+                if (s.next.time_since_epoch().count() == 0 || s.next < now - dur * 4) s.next = now;
+                s.next += dur;
+                target = s.next;
+            }
+        }
         if (!stream) return;
-        int bytes = frames * frame_bytes;
-        SDL_PutAudioStreamData(stream, pcm, bytes);
-        // Pace like real hardware: don't let more than ~4 grains queue up ahead of playback.
-        const int cap = grain_bytes > 0 ? grain_bytes * 4 : bytes * 4;
-        for (int spins = 0; SDL_GetAudioStreamQueued(stream) > cap && spins < 1000; spins++)
-            SDL_Delay(1);
+        SDL_PutAudioStreamData(stream, pcm, frames * frame_bytes);
+        if (freq > 0) std::this_thread::sleep_until(target);
     }
 
     void set_volume(int port, uint32_t mask, const int* vols) override {
@@ -85,7 +102,9 @@ public:
     }
 
 private:
-    struct Slot { SDL_AudioStream* stream = nullptr; int frame_bytes = 0; int grain_bytes = 0; };
+    struct Slot { SDL_AudioStream* stream = nullptr; int frame_bytes = 0; int grain_bytes = 0;
+                  int freq = 0;                                     // port sample rate for pacing
+                  std::chrono::steady_clock::time_point next{}; };  // per-grain pacing deadline
     std::mutex mx_;
     std::array<Slot, kMaxPorts> slots_{};
 };
