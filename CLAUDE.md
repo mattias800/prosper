@@ -296,6 +296,16 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
 - **Correctness-first:** implement real behavior from primary evidence: live captures/traces, guest
   disassembly, published platform contracts, firmware symbol data, and focused tests. Do not ship shims
   that fake output. Mark genuinely uncertain code with `CONFIDENCE: HIGH/MED/LOW`.
+- **An unsupported shader/GPU operation is a FATAL gap, not an acceptable skip — support ALL of them.**
+  A recompiler op the shader stage uses, a storage/texture format a dispatch writes, an AGC/PM4 packet
+  the guest submits: if the guest exercises it, the goal is to implement it, not to `return {}` / skip the
+  draw / skip the dispatch and move on. Silent skips drop real rendered content (a skipped LUT/exposure
+  dispatch collapses the whole title composite to black; a rejected shader drops its draws) and read as
+  "handled" when they are not. Reject paths still exist as a *fail-visible* backstop for genuinely
+  unknown encodings (mark `CONFIDENCE: LOW`, log loudly, file an issue with the exact opcode/format), but
+  treat every one you hit on a live boot as the next thing to implement. Find the exact failing op with
+  `PROSPER_DBG=1` (`[recompile-reject] pc=… op=0x…` from the recompiler) or the `[compute] … skipped`
+  lines from the live backend, then implement it with a round-trip/execution test — do not leave it skipped.
 - **PR verification and merging.** Keep each PR description self-contained: link the issue or goal, explain the
   failure scenario and behavioral contract, summarize the approach and important invariants, identify affected
   and deliberately unaffected behavior, record risks, and list the exact build/test/snapshot commands and
