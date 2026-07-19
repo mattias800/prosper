@@ -255,7 +255,7 @@ void bind_imports_to_stubs(const Module& m, LoadedImage& img, uint64_t stub_base
 }
 
 size_t apply_relocations(const Module& m, LoadedImage& img,
-                         const std::unordered_map<std::string, uint32_t>* tls_modid_by_nid) {
+                         const TlsSymbolMap* tls_symbols_by_nid) {
     size_t applied = 0;
     auto write64 = [&](uint64_t va, uint64_t val) -> bool {
         uint8_t* p = img.at(va);
@@ -302,16 +302,16 @@ size_t apply_relocations(const Module& m, LoadedImage& img,
             // calls __tls_get_addr(tls_index*) which our HLE resolves to a per-thread block. For a
             // module-LOCAL TLS symbol the module id is THIS module's assigned id (the common case:
             // libc's own errno/locale state). A cross-module TLS ref (an IMPORT symbol defined in
-            // another module) needs the DEFINING module's id — resolved via tls_modid_by_nid when
-            // the linker supplies it (#136), else logged unhandled with a best-effort local fallback
-            // (previously it silently used the wrong module's id). DTPOFF64 = offset within the block.
+            // another module) needs the DEFINING module's id and in-block symbol offset — resolved
+            // together via tls_symbols_by_nid when the linker supplies it (#136/#338), else logged
+            // unhandled with a best-effort local fallback. DTPOFF64 = offset within the block.
             case R_X86_64_DTPMOD64: {
                 uint32_t modid = img.tls_modid;
                 if (r.sym && r.sym < m.symbols.size() && m.symbols[r.sym].is_import) {
                     bool resolved = false;
-                    if (tls_modid_by_nid) {
-                        auto it = tls_modid_by_nid->find(m.symbols[r.sym].nid);
-                        if (it != tls_modid_by_nid->end()) { modid = it->second; resolved = true; }
+                    if (tls_symbols_by_nid) {
+                        auto it = tls_symbols_by_nid->find(m.symbols[r.sym].nid);
+                        if (it != tls_symbols_by_nid->end()) { modid = it->second.modid; resolved = true; }
                     }
                     if (!resolved) {
                         unhandled[r.type]++;
@@ -328,6 +328,20 @@ size_t apply_relocations(const Module& m, LoadedImage& img,
                 // psABI: DTPOFF64 = S + A. The addend addresses a field INSIDE the TLS object
                 // (e.g. a struct member); picking S *or* A drops it and resolves to the object base.
                 uint64_t sv = (r.sym && r.sym < m.symbols.size()) ? m.symbols[r.sym].value : 0;
+                if (r.sym && r.sym < m.symbols.size() && m.symbols[r.sym].is_import) {
+                    bool resolved = false;
+                    if (tls_symbols_by_nid) {
+                        auto it = tls_symbols_by_nid->find(m.symbols[r.sym].nid);
+                        if (it != tls_symbols_by_nid->end()) { sv = it->second.offset; resolved = true; }
+                    }
+                    if (!resolved) {
+                        unhandled[r.type]++;
+                        if (getenv("PROSPER_RELOC_HISTO"))
+                            fprintf(stderr, "[reloc]   DTPOFF64 cross-module TLS import '%s' unresolved "
+                                    "-> best-effort zero symbol offset\n",
+                                    m.symbols[r.sym].nid.c_str());
+                    }
+                }
                 if (write64(va, sv + (uint64_t)r.addend)) applied++;
                 break;
             }
