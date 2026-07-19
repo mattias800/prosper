@@ -33,6 +33,9 @@ namespace prosper {
                                        uint64_t a3, uint64_t a4, uint64_t a5)
 #define HLE7(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+#define HLE8(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
+                                       uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, \
+                                       uint64_t a7)
 
 extern "C" uint64_t prosper_guest_tsc_ns(); // shared sceKernelReadTsc/process-time clock
 
@@ -513,9 +516,10 @@ HLE7(g_vo_set_buffer_attribute) {
 }
 
 // sceVideoOutSetBufferAttribute2 (PjS5uASwcV8): fill the caller's VideoOutBufferAttribute2 (0x50
-// bytes, Kyty layout) from (attr, pixel_format, tiling_mode, width, height, option, [dcc_control,
-// dcc_cb_clear on stack]). Mirrors Kyty's setter. Size-exact write.
-HLE(g_vo_set_buffer_attribute2) {  // a0=attr* a1=pixel_format a2=tiling a3=width a4=height a5=option
+// bytes, Kyty layout) from (attr, pixel_format, tiling_mode, width, height, option, dcc_control,
+// dcc_cb_clear). The final two arguments arrive in the guest's stack slots. Mirrors Kyty's setter.
+// Size-exact write.
+HLE8(g_vo_set_buffer_attribute2) {
     vo_argtrace("SetBufferAttribute2", a0,a1,a2,a3,a4,a5);
     if (!a0) return 0;
     uint8_t* p = (uint8_t*)(uintptr_t)a0; memset(p, 0, 0x50);
@@ -525,6 +529,8 @@ HLE(g_vo_set_buffer_attribute2) {  // a0=attr* a1=pixel_format a2=tiling a3=widt
     *(uint32_t*)(p + 0x10) = (uint32_t)a4;   // height
     *(uint64_t*)(p + 0x18) = a5;             // option
     *(uint64_t*)(p + 0x20) = a1;             // pixel_format
+    *(uint64_t*)(p + 0x28) = a7;             // dcc_cb_register_clear_color
+    *(uint32_t*)(p + 0x30) = (uint32_t)a6;   // dcc_control
     return 0;
 }
 

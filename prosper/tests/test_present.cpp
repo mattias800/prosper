@@ -17,13 +17,17 @@ static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
+using Hle8Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t,
+                            uint64_t, uint64_t, uint64_t, uint64_t);
+
 int main() {
     printf("== test_present ==\n");
     register_builtin_hle();
     gpu::present_reset();
 
     auto open   = Hle::lookup(nid_hash("sceVideoOutOpen"));
-    auto setba2 = Hle::lookup("PjS5uASwcV8");   // SetBufferAttribute2
+    auto setba2 = reinterpret_cast<Hle8Fn>(
+        Hle::lookup("PjS5uASwcV8"));             // SetBufferAttribute2
     auto regb2  = Hle::lookup("rKBUtgRrtbk");   // RegisterBuffers2
     auto unreg  = Hle::lookup("N5KDtkIjjJ4");   // UnregisterBuffers
     auto flip   = Hle::lookup(nid_hash("sceVideoOutSubmitFlip"));
@@ -40,7 +44,8 @@ int main() {
 
     // SetBufferAttribute2 with our test dimensions, then RegisterBuffers2 with the 3 framebuffers.
     uint8_t attr[0x50]; memset(attr, 0, sizeof attr);
-    setba2((uint64_t)(uintptr_t)attr, 0x8000000000000000ull /*fmt*/, 0 /*tiling*/, W, H, 0 /*option*/);
+    setba2((uint64_t)(uintptr_t)attr, 0x8000000000000000ull /*fmt*/, 0 /*tiling*/, W, H,
+           0 /*option*/, 0 /*dcc control*/, 0 /*dcc clear*/);
     struct VOB { const void* data; const void* metadata; const void* reserved[2]; };
     VOB buffers[3] = { {fb0.data(),0,{0,0}}, {fb1.data(),0,{0,0}}, {fb2.data(),0,{0,0}} };
     uint64_t rc = regb2(handle, 0, 0, (uint64_t)(uintptr_t)buffers, 3, (uint64_t)(uintptr_t)attr);
@@ -86,7 +91,7 @@ int main() {
     std::vector<uint8_t> fb4(SMALL_BYTES, 0x66), fb5(SMALL_BYTES, 0x77);
     uint8_t small_attr[0x50]; memset(small_attr, 0, sizeof small_attr);
     setba2((uint64_t)(uintptr_t)small_attr, 0x8000000000000000ull,
-           0 /*tiling*/, SMALL_W, SMALL_H, 0 /*option*/);
+           0 /*tiling*/, SMALL_W, SMALL_H, 0 /*option*/, 0 /*dcc control*/, 0 /*dcc clear*/);
     VOB small_buffers[2] = { {fb4.data(),0,{0,0}}, {fb5.data(),0,{0,0}} };
     rc = regb2(handle, 1 /*set*/, 4 /*start*/, (uint64_t)(uintptr_t)small_buffers, 2,
                (uint64_t)(uintptr_t)small_attr);

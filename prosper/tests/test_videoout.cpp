@@ -28,6 +28,8 @@ static int fails = 0;
 
 using Hle7Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t,
                             uint64_t, uint64_t, uint64_t);
+using Hle8Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t,
+                            uint64_t, uint64_t, uint64_t, uint64_t);
 
 int main() {
     printf("== test_videoout ==\n");
@@ -41,7 +43,8 @@ int main() {
     auto issup  = Hle::lookup("Nv8c-Kb+DUM");   // IsOutputSupported
     auto setba  = Hle::lookup(nid_hash("sceVideoOutSetBufferAttribute"));
     auto regb   = Hle::lookup(nid_hash("sceVideoOutRegisterBuffers"));
-    auto setba2 = Hle::lookup("PjS5uASwcV8");   // SetBufferAttribute2
+    auto setba2 = reinterpret_cast<Hle8Fn>(
+        Hle::lookup("PjS5uASwcV8"));             // SetBufferAttribute2
     auto regb2  = Hle::lookup("rKBUtgRrtbk");   // RegisterBuffers2
     auto unreg  = Hle::lookup("N5KDtkIjjJ4");   // UnregisterBuffers
     auto labels = Hle::lookup("OcQybQejHEY");   // GetBufferLabelAddress
@@ -280,13 +283,28 @@ int main() {
           prosper_vo_buffer_count() == 0 && prosper_vo_display_width() == 0,
           "legacy buffer group unregisters cleanly before Gen5 registration");
 
-    // SetBufferAttribute2 fills the 0x50 attribute struct from (fmt, tiling, w, h, option).
-    uint8_t attr[0x50]; memset(attr, 0xEE, sizeof attr);
+    // SetBufferAttribute2 fills exactly the 0x50-byte Gen5 attribute, including the two stack args.
+    uint8_t attr[0x58]; memset(attr, 0xEE, sizeof attr);
     uint64_t fmt = 0x8000000000000000ull;   // the PS5 format the game requests (A8R8G8B8 sRGB)
-    setba2((uint64_t)(uintptr_t)attr, fmt, 0 /*tiling*/, 1920, 1080, 0 /*option*/);
+    constexpr uint64_t option = 0x1122334455667788ull;
+    constexpr uint32_t dcc_control = 0xa1b2c3d4u;
+    constexpr uint64_t dcc_clear = 0x8877665544332211ull;
+    setba2((uint64_t)(uintptr_t)attr, fmt, 0 /*tiling*/, 1920, 1080, option,
+           dcc_control, dcc_clear);
     CHECK(*(uint32_t*)(attr + 0x0c) == 1920 && *(uint32_t*)(attr + 0x10) == 1080, "attribute width/height set");
     CHECK(*(uint64_t*)(attr + 0x20) == fmt, "attribute pixel_format set");
     CHECK(*(uint32_t*)(attr + 0x04) == 0, "attribute tiling_mode set");
+    CHECK(*(uint32_t*)(attr + 0x14) == 0 && *(uint64_t*)(attr + 0x18) == option,
+          "attribute pitch and option set");
+    CHECK(*(uint64_t*)(attr + 0x28) == dcc_clear &&
+          *(uint32_t*)(attr + 0x30) == dcc_control,
+          "attribute DCC clear color and control set from stack arguments");
+    bool attr_reserved_zero = true;
+    for (size_t i = 0x34; i < 0x50; ++i) attr_reserved_zero &= attr[i] == 0;
+    CHECK(attr_reserved_zero, "attribute pad and reserved fields initialized");
+    bool attr_canary_untouched = true;
+    for (size_t i = 0x50; i < sizeof attr; ++i) attr_canary_untouched &= attr[i] == 0xEE;
+    CHECK(attr_canary_untouched, "SetBufferAttribute2 writes exactly its 0x50-byte ABI struct");
 
     // ConfigureOutput accepts the (single advertised) mode.
     CHECK(cfg(handle, 1, 0, 0, 0, 0) == 0, "ConfigureOutput accepted");
