@@ -779,11 +779,12 @@ HLE(k_map_dmem) {
 }
 
 // sceKernelVirtualQuery(const void* addr, int flags, SceKernelVirtualQueryInfo* info, size_t infoSize)
-//   0x00 start; 0x08 end; 0x10 offset; 0x18 i32 prot; 0x1C i32 memType; 0x20 u32 flags; 0x24 name[32]
+//   0x00 start; 0x08 end; 0x10 offset; 0x18 i32 prot; 0x1C i32 memType;
+//   0x20 u8 classification; 0x21 name[32]
 HLE(k_virtual_query) {
     if (!a2) return 0x80020016ull;   // EINVAL (null out-param)
     uint8_t* info = (uint8_t*)a2;
-    uint64_t sz = a3 ? (a3 > 0x48 ? 0x48 : a3) : 0x48;
+    uint64_t sz = a3 ? (a3 > 0x41 ? 0x41 : a3) : 0x41;
     memset(info, 0, sz);
     Mapping mapping{};
     const bool found = snapshot_mapping(a0, mapping);
@@ -811,8 +812,8 @@ HLE(k_virtual_query) {
     if (sz >= 0x18) *(uint64_t*)(info + 0x10) = offset;
     if (sz >= 0x1c) *(int32_t*)(info + 0x18) = prot;
     if (sz >= 0x20) *(int32_t*)(info + 0x1c) = memory_type;
-    if (sz >= 0x24) *(uint32_t*)(info + 0x20) = flags;
-    if (sz >= 0x44 && found && mapping.name[0]) memcpy(info + 0x24, mapping.name, 32);
+    if (sz >= 0x21) info[0x20] = static_cast<uint8_t>(flags);
+    if (sz >= 0x41 && found && mapping.name[0]) memcpy(info + 0x21, mapping.name, 32);
     MLOG("virtual_query(0x%llx,f=0x%llx) -> [0x%llx,0x%llx) %s\n",
          (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)start, (unsigned long long)end, how);
     return 0;
@@ -3847,11 +3848,11 @@ HLE(k_batch_map) {
 }
 
 // sceKernelVirtualQuery(addr, flags, info*, infoSize): 0x00 start; 0x08 end; 0x10
-// physical offset; 0x18 protection; 0x1c memory type; 0x20 classification flags; 0x24 name.
+// physical offset; 0x18 protection; 0x1c memory type; 0x20 u8 classification; 0x21 name[32].
 HLE(k_virtual_query) {
     if (!a2) return 0x80020016ull;
     uint8_t* info = (uint8_t*)a2;
-    uint64_t sz = a3 ? (a3 > 0x48 ? 0x48 : a3) : 0x48;
+    uint64_t sz = a3 ? (a3 > 0x41 ? 0x41 : a3) : 0x41;
     memset(info, 0, sz);
     Mapping mapping{};
     const bool found = snapshot_mapping(a0, mapping);
@@ -3875,8 +3876,8 @@ HLE(k_virtual_query) {
     if (sz >= 0x18) *(uint64_t*)(info + 0x10) = offset;
     if (sz >= 0x1c) *(int32_t*)(info + 0x18) = prot;
     if (sz >= 0x20) *(int32_t*)(info + 0x1c) = memory_type;
-    if (sz >= 0x24) *(uint32_t*)(info + 0x20) = flags;
-    if (sz >= 0x44 && found && mapping.name[0]) memcpy(info + 0x24, mapping.name, 32);
+    if (sz >= 0x21) info[0x20] = static_cast<uint8_t>(flags);
+    if (sz >= 0x41 && found && mapping.name[0]) memcpy(info + 0x21, mapping.name, 32);
     return 0;
 }
 

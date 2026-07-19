@@ -207,14 +207,28 @@ int main() {
               *(uint64_t*)(direct_info + 0x08) == va1 + dlen &&
               *(uint64_t*)(direct_info + 0x10) == phys &&
               *(int32_t*)(direct_info + 0x1c) == 7 &&
-              *(uint32_t*)(direct_info + 0x20) == 0x12,
+              direct_info[0x20] == 0x12,
           "VirtualQuery reports ordinary direct mapping offset/type/classification");
+    uint8_t short_query_info[0x22];
+    memset(short_query_info, 0xa5, sizeof(short_query_info));
+    CHECK(query(va1 + 0x2000, 0, (uint64_t)(uintptr_t)short_query_info,
+                0x21, 0, 0) == 0 &&
+              short_query_info[0x20] == 0x12 && short_query_info[0x21] == 0xa5,
+          "VirtualQuery writes the one-byte classification at exact infoSize 0x21");
+    uint8_t exact_query_info[0x42];
+    memset(exact_query_info, 0xa5, sizeof(exact_query_info));
+    CHECK(query(va1 + 0x2000, 0, (uint64_t)(uintptr_t)exact_query_info,
+                0x41, 0, 0) == 0 &&
+              exact_query_info[0x20] == 0x12 &&
+              memcmp(exact_query_info + 0x21, "direct", 7) == 0 &&
+              exact_query_info[0x41] == 0xa5,
+          "VirtualQuery writes name[32] at 0x21 within the exact ABI size");
     memset(direct_info, 0, sizeof(direct_info));
     CHECK(query(va_map2 + 0x2000, 0, (uint64_t)(uintptr_t)direct_info,
                 sizeof(direct_info), 0, 0) == 0 &&
               *(uint64_t*)(direct_info + 0x10) == phys &&
               *(int32_t*)(direct_info + 0x1c) == 3 &&
-              *(uint32_t*)(direct_info + 0x20) == 0x12,
+              direct_info[0x20] == 0x12,
           "MapDirectMemory2 publishes its explicit type in VirtualQuery");
     direct_type = -1; direct_start = direct_end = 0;
     CHECK(get_type(phys + 0x2000, (uint64_t)(uintptr_t)&direct_type,
@@ -233,7 +247,7 @@ int main() {
               *(uint64_t*)(direct_info + 0x10) == phys + 0x4000 &&
               *(int32_t*)(direct_info + 0x18) == 0x1 &&
               *(int32_t*)(direct_info + 0x1c) == 9 &&
-              *(uint32_t*)(direct_info + 0x20) == 0x12,
+              direct_info[0x20] == 0x12,
           "Mtypeprotect preserves the carved page's physical offset and publishes its type");
     CHECK(mtypeprotect(va1 + 0x4000, 0, 14, 0x2, 0, 0) == 0,
           "aligned zero-length Mtypeprotect is a successful no-op");
@@ -268,7 +282,7 @@ int main() {
               *(uint64_t*)(direct_info + 0x10) == phys + 0x8000 &&
               *(int32_t*)(direct_info + 0x18) == 0x2 &&
               *(int32_t*)(direct_info + 0x1c) == 11 &&
-              *(uint32_t*)(direct_info + 0x20) == 0x12,
+              direct_info[0x20] == 0x12,
           "BatchMap TYPE_PROTECT normalizes protection and metadata to the guest page");
     memset(direct_info, 0, sizeof(direct_info));
     CHECK(query(va1 + 0xd000, 0, (uint64_t)(uintptr_t)direct_info,
@@ -294,7 +308,7 @@ int main() {
               *(uint64_t*)(direct_info + 0x10) == phys + 0xc000 &&
               *(int32_t*)(direct_info + 0x18) == 0x1 &&
               *(int32_t*)(direct_info + 0x1c) == 13 &&
-              *(uint32_t*)(direct_info + 0x20) == 0x12,
+              direct_info[0x20] == 0x12,
           "unaligned Mtypeprotect normalizes VA metadata to the 16 KiB guest page");
     direct_type = -1; direct_start = direct_end = 0;
     CHECK(get_type(phys + 0xd000, (uint64_t)(uintptr_t)&direct_type,
@@ -361,7 +375,7 @@ int main() {
         CHECK(query(sparse_va1 + 0x01000000, 0,
                     (uint64_t)(uintptr_t)guest_query, sizeof(guest_query), 0, 0) == 0 &&
                   *(uint64_t*)(guest_query + 0x10) == sparse_phys &&
-                  *(uint32_t*)(guest_query + 0x20) == 0x12,
+                  guest_query[0x20] == 0x12,
               "guest VirtualQuery reports sparse direct backing and classification");
         host::GuestReadableRange persistent_range{};
         CHECK(host::guest_readable_mapping_containing(
@@ -544,7 +558,7 @@ int main() {
                   *(uint64_t*)(suffix_query + 0x08) == fixed_va + fixed_len &&
                   *(uint64_t*)(suffix_query + 0x10) == fixed_phys + 0x8000 &&
                   *(int32_t*)(suffix_query + 0x1c) == 0 &&
-                  *(uint32_t*)(suffix_query + 0x20) == 0x12,
+                  suffix_query[0x20] == 0x12,
               "partial direct unmap rebases the retained suffix's physical offset");
 
         uint64_t flexible_hole = hole;
@@ -756,8 +770,22 @@ int main() {
                   *(uint64_t*)(info + 0x08) == va + 0x10000 &&
                   *(uint64_t*)(info + 0x10) == p &&
                   *(int32_t*)(info + 0x1c) == 3 &&
-                  *(uint32_t*)(info + 0x20) == 0x12,
+                  info[0x20] == 0x12,
               "VirtualQuery reports direct offset, explicit type, and classification");
+        uint8_t short_query_info[0x22];
+        memset(short_query_info, 0xa5, sizeof(short_query_info));
+        CHECK(query(va + 0x2000, 0, (uint64_t)(uintptr_t)short_query_info,
+                    0x21, 0, 0) == 0 &&
+                  short_query_info[0x20] == 0x12 && short_query_info[0x21] == 0xa5,
+              "VirtualQuery writes the one-byte classification at exact infoSize 0x21");
+        uint8_t exact_query_info[0x42];
+        memset(exact_query_info, 0xa5, sizeof(exact_query_info));
+        CHECK(query(va + 0x2000, 0, (uint64_t)(uintptr_t)exact_query_info,
+                    0x41, 0, 0) == 0 &&
+                  exact_query_info[0x20] == 0x12 &&
+                  memcmp(exact_query_info + 0x21, "direct", 7) == 0 &&
+                  exact_query_info[0x41] == 0xa5,
+              "VirtualQuery writes name[32] at 0x21 within the exact ABI size");
         direct_type = -1; direct_start = direct_end = 0;
         CHECK(get_type(p + 0x2000, (uint64_t)(uintptr_t)&direct_type,
                        (uint64_t)(uintptr_t)&direct_start,
@@ -774,7 +802,7 @@ int main() {
                   *(uint64_t*)(info + 0x10) == p + 0x4000 &&
                   *(int32_t*)(info + 0x18) == 0x1 &&
                   *(int32_t*)(info + 0x1c) == 9 &&
-                  *(uint32_t*)(info + 0x20) == 0x12,
+                  info[0x20] == 0x12,
               "Mtypeprotect publishes the carved page's rebased offset and type");
         CHECK(mtypeprotect(va + 0x4000, 0, 14, 0x2, 0, 0) == 0,
               "aligned zero-length Mtypeprotect is a successful no-op");
@@ -830,7 +858,7 @@ int main() {
                   *(uint64_t*)(info + 0x10) == p + 0xc000 &&
                   *(int32_t*)(info + 0x18) == 0x1 &&
                   *(int32_t*)(info + 0x1c) == 13 &&
-                  *(uint32_t*)(info + 0x20) == 0x12,
+                  info[0x20] == 0x12,
               "unaligned Mtypeprotect normalizes VA metadata to the 16 KiB guest page");
         direct_type = -1; direct_start = direct_end = 0;
         CHECK(get_type(p + 0xd000, (uint64_t)(uintptr_t)&direct_type,

@@ -182,7 +182,7 @@ int main() {
                 sizeof(failed_info), 0, 0) == 0 &&
               *(uint64_t*)(failed_info + 0x00) == base &&
               *(uint64_t*)(failed_info + 0x08) == base + len &&
-              *(uint32_t*)(failed_info + 0x20) == 0,
+              failed_info[0x20] == 0,
           "failed mprotect leaves reservation tracking unchanged");
 
 #ifdef _WIN32
@@ -270,7 +270,7 @@ int main() {
     CHECK(*(uint64_t*)(info + 0x00) == middle &&
               *(uint64_t*)(info + 0x08) == middle + page,
           "protection tracking splits the reservation at the requested bounds");
-    CHECK(*(int32_t*)(info + 0x18) == 0 && *(uint32_t*)(info + 0x20) == 0,
+    CHECK(*(int32_t*)(info + 0x18) == 0 && info[0x20] == 0,
           "VirtualQuery still reports the protected reservation as uncommitted");
     CHECK(prosper_reserved_range_state(middle) == 1,
           "the lazy-commit probe still classifies the page as reserved");
@@ -288,7 +288,7 @@ int main() {
     CHECK(query(middle, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
               *(uint64_t*)(info + 0x10) == 0 && *(int32_t*)(info + 0x1c) == 0 &&
               *(int32_t*)(info + 0x18) == 0x2 &&
-              *(uint32_t*)(info + 0x20) == 0x11,
+              info[0x20] == 0x11,
           "VirtualQuery reports flexible metadata without physical backing fields");
     uint64_t protection_start = UINT64_MAX;
     uint64_t protection_end = UINT64_MAX;
@@ -307,7 +307,7 @@ int main() {
     memset(info, 0, sizeof(info));
     CHECK(query(middle, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
               *(int32_t*)(info + 0x18) == 0x11 &&
-              *(uint32_t*)(info + 0x20) == 0x11,
+              info[0x20] == 0x11,
           "VirtualQuery preserves guest-only GPU protection bits");
     protection_value = UINT32_MAX;
     CHECK(query_protection(middle + page / 2, 0, 0,
@@ -319,16 +319,16 @@ int main() {
           "mprotect accepts a range spanning reserved and committed pages");
     memset(info, 0, sizeof(info));
     CHECK(query(base, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
-              *(uint32_t*)(info + 0x20) == 0,
+              info[0x20] == 0,
           "range protection keeps the leading page uncommitted");
     memset(info, 0, sizeof(info));
     CHECK(query(middle, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
               *(int32_t*)(info + 0x18) == 0x1 &&
-              *(uint32_t*)(info + 0x20) == 0x11,
+              info[0x20] == 0x11,
           "range protection keeps the middle page committed and reports read-only access");
     memset(info, 0, sizeof(info));
     CHECK(query(middle + page, 0, (uint64_t)(uintptr_t)info, sizeof(info), 0, 0) == 0 &&
-              *(uint32_t*)(info + 0x20) == 0,
+              info[0x20] == 0,
           "range protection keeps the trailing page uncommitted");
 
     CHECK(unmap(base, len, 0, 0, 0, 0) == 0, "the test reservation unmaps cleanly");
