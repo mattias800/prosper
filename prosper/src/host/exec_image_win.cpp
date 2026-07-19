@@ -446,7 +446,25 @@ namespace {
         // Zero the full destination register (correct for REX.W/32-bit mov and movzx/movsx of a 0 source).
         DWORD64* creg[16] = { &c->Rax, &c->Rcx, &c->Rdx, &c->Rbx, &c->Rsp, &c->Rbp, &c->Rsi, &c->Rdi,
                               &c->R8, &c->R9, &c->R10, &c->R11, &c->R12, &c->R13, &c->R14, &c->R15 };
-        *creg[reg] = 0;
+        // A guest fs-relative read faults at a LOW linear address only when the fs base has drifted to 0
+        // (Windows zeroes it on kernel transitions). Re-applying the base in the VEH does NOT persist past
+        // the exception return (it re-zeroes -> infinite re-fault loop, observed), so instead EMULATE the
+        // read from the guest TCB: for a 64-bit `mov reg, %fs:disp`, fault_addr is the fs offset, so the
+        // value is *(guest_tp + fault_addr). Fixes eboot+0x24d3c3c (`mov %fs:0x0,%rax` on an APR/IO worker
+        // whose base drifted). Narrower reads / null-field reads keep zero-emulation. (#984)
+        uint64_t fs_tp = 0;
+        { bool is_fs = false, rexw = false; size_t k = 0;
+          for (; k < 15; k++) { uint8_t b = p[k];
+              if (b == 0x64) { is_fs = true; continue; }
+              if (b == 0x65 || b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 ||
+                  b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26) continue;
+              if ((b & 0xF0) == 0x40) { rexw = (b & 0x08) != 0; continue; }     // REX
+              break; }                                                          // opcode
+          if (is_fs && rexw && p[k] == 0x8b) fs_tp = guest_fs_current_tp(); }   // 64-bit mov reg, fs:disp
+        if (fs_tp && addr_readable(fs_tp + fault_addr))
+            *creg[reg] = *(const uint64_t*)(uintptr_t)(fs_tp + fault_addr);
+        else
+            *creg[reg] = 0;
         c->Rip += (uint64_t)insn_len;
         long n = InterlockedIncrement(&g_null_page_count);
         if (getenv("PROSPER_NULL_PAGE_LOG") && n <= 64) {
