@@ -4023,6 +4023,54 @@ HLE(k_query_memory_protection) {
 // (the Linux path models them). Registered by raw NID for parity.
 HLE(k_ampr_ok) { return 0; }
 
+// APR batched-read completion machinery (#984). Ported from the Linux path (register_kernel_mem_hle
+// above) — it was Windows-only-stubbed to k_ampr_ok, so the FAPREventQueueListener blocked forever
+// waiting for completion events that never posted after asset streaming. Pure platform-independent
+// bookkeeping + event posting via the shared prosper_eq_* helpers (hle_kernel_time.cpp). The token
+// contract, and the #180 crash-safety (only H896-BOUND cbs post events; unbound sync reads do not),
+// are preserved verbatim from k_apr_submit — see that function's comment for the full contract.
+uint64_t prosper_apr_next_token(unsigned ring);                          // hle_kernel_time.cpp
+void     prosper_eq_add_apr(uint64_t eq, int64_t id);                    // "
+void     prosper_eq_post_apr_token(uint64_t eq, int64_t id, uint64_t token); // " (tag echo, #208)
+namespace {
+    struct WinAprBoundCb { uint64_t cb, tag, eq; int64_t id; };
+    std::mutex g_win_apr_bound_mx;
+    std::vector<WinAprBoundCb> g_win_apr_bound_cbs;
+    bool win_apr_cb_bound(uint64_t cb, WinAprBoundCb* out) {
+        std::lock_guard<std::mutex> lk(g_win_apr_bound_mx);
+        for (auto& b : g_win_apr_bound_cbs) if (b.cb == cb) { if (out) *out = b; return true; }
+        return false;
+    }
+}
+HLE(k_apr_set_equeue) {          // sSAUCCU1dv4 (eq, id, 0, 0, 0x43, 0): register APR ids on an equeue
+    if (a0) prosper_eq_add_apr(a0, (int64_t)a1);
+    return 0;
+}
+HLE(k_apr_cb_set_equeue) {       // H896Pt-yB4I (cb, eq, id, tag, 0, flags): bind cb -> (eq,id,tag)
+    if (a1) prosper_eq_add_apr(a1, (int64_t)a2);
+    if (a0) {
+        std::lock_guard<std::mutex> lk(g_win_apr_bound_mx);
+        bool seen = false;
+        for (auto& b : g_win_apr_bound_cbs)
+            if (b.cb == a0) { b.tag = a3; b.eq = a1; b.id = (int64_t)a2; seen = true; break; }
+        if (!seen) g_win_apr_bound_cbs.push_back({ a0, a3, a1, (int64_t)a2 });
+    }
+    return 0;
+}
+HLE(k_apr_submit) {              // ASoW5WE-UPo (cb, ring_1based, out1, out2): submit + post completion
+    unsigned ring = a1 ? (unsigned)(a1 - 1) & 0x3f : 0;
+    WinAprBoundCb bc{};
+    const bool bound = win_apr_cb_bound(a0, &bc);
+    const bool tag_echo = bound && bc.tag && bc.eq;   // BOUND streaming cb -> post the tag verbatim
+    uint64_t token = tag_echo ? bc.tag : prosper_apr_next_token(ring);
+    if (!bound) {   // unbound sync/mount flow: hand the token through the out slots, post NO event (#180)
+        if (a2 > 0xffff) *(uint64_t*)(uintptr_t)a2 = token;
+        if (a3 > 0xffff) *(uint64_t*)(uintptr_t)a3 = token;
+    }
+    if (tag_echo) prosper_eq_post_apr_token(bc.eq, bc.id, bc.tag);
+    return 0;
+}
+
 namespace {
 std::mutex g_sync_mx;
 std::condition_variable g_sync_cv;
@@ -4172,9 +4220,9 @@ void register_kernel_mem_hle() {
     Hle::register_fn("tZDDEo2tE5k", (HleFn)k_ampr_ok, "sceAmprCommandBufferGetSize");
     Hle::register_fn("Qs1xtplKo0U", (HleFn)k_ampr_ok, "sceAmprAprCommandBufferDestructor");
     Hle::register_fn("GuchCTefuZw", (HleFn)k_ampr_ok, "sceAmprCommandBufferDestructor");
-    Hle::register_fn("sSAUCCU1dv4", (HleFn)k_ampr_ok, "AprSetEventQueue?");
-    Hle::register_fn("H896Pt-yB4I", (HleFn)k_ampr_ok, "AprCbSetEventQueue?");
-    Hle::register_fn("ASoW5WE-UPo", (HleFn)k_ampr_ok, "AprSubmitCommandBuffer?");
+    Hle::register_fn("sSAUCCU1dv4", (HleFn)k_apr_set_equeue,    "AprSetEventQueue?");      // #984
+    Hle::register_fn("H896Pt-yB4I", (HleFn)k_apr_cb_set_equeue, "AprCbSetEventQueue?");    // #984
+    Hle::register_fn("ASoW5WE-UPo", (HleFn)k_apr_submit,        "AprSubmitCommandBuffer?"); // #984
     Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_ok, "AmprUnknown3");
 }
 
