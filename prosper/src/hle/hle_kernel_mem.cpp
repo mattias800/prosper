@@ -456,6 +456,17 @@ namespace {
     // collision can skip directly past them instead of probing every 64 KiB page.
     constexpr uint64_t kGuestAutoMapBase  = 0x2000000000ull;
     constexpr uint64_t kGuestAutoMapLimit = 0x40000000000ull;
+    // Monotonic placement cursor for auto-mapped guest VA (#983). Restarting the linear probe in
+    // map_guest_from() from kGuestAutoMapBase on EVERY auto-map is O(N) in the live-mapping count,
+    // and on macOS each collided probe is a full mmap+munmap under Rosetta's VM tracking
+    // (prosper_mmap_noreplace emulates MAP_FIXED_NOREPLACE that way) — a level's tens of thousands
+    // of sceKernelMapDirectMemory calls degrade to O(N^2) Rosetta VM churn (minutes). Advancing a
+    // cursor past each successful placement makes the common case a single successful mmap.
+    // Correctness is unchanged: map_guest_from still uses NOREPLACE (never clobbers) and still scans
+    // g_maps for a free slot; the cursor only picks the STARTING hint, and map_guest_auto wraps back
+    // to the base to reclaim VA freed below the cursor. Atomic (lock-free) — concurrent mappers stay
+    // correct via NOREPLACE; the cursor is a hint, not a lock.
+    uint64_t g_auto_map_cursor = kGuestAutoMapBase;
     void* map_guest_from(uint64_t start, uint64_t len, int prot, uint64_t align) {
         const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
         if (align < page) align = page;
@@ -490,7 +501,23 @@ namespace {
     }
 
     void* map_guest_auto(uint64_t len, int prot, uint64_t align) {
-        return map_guest_from(kGuestAutoMapBase, len, prot, align);
+        // Start probing past the last successful placement (see g_auto_map_cursor, #983) instead of
+        // rescanning from kGuestAutoMapBase every call. If the tail is exhausted, wrap once to the
+        // base to reclaim VA freed below the cursor.
+        uint64_t hint = __atomic_load_n(&g_auto_map_cursor, __ATOMIC_RELAXED);
+        if (hint < kGuestAutoMapBase) hint = kGuestAutoMapBase;
+        void* p = map_guest_from(hint, len, prot, align);
+        if (!p && hint > kGuestAutoMapBase)
+            p = map_guest_from(kGuestAutoMapBase, len, prot, align);
+        if (p) {
+            // Advance the cursor monotonically to the end of this placement (only forward; VA below
+            // the cursor is reclaimed by the wrap above, never leaked).
+            uint64_t end = (uint64_t)p + len;
+            uint64_t cur = __atomic_load_n(&g_auto_map_cursor, __ATOMIC_RELAXED);
+            while (end > cur && !__atomic_compare_exchange_n(&g_auto_map_cursor, &cur, end, true,
+                                                             __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+        }
+        return p;
     }
 
     void* map_at(uint64_t hint, uint64_t len, int prot) {
