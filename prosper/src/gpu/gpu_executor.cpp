@@ -502,6 +502,13 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
 
     auto decoded = decode();
     std::lock_guard lock(cache.mutex);
+    // Another cold worker may have populated this address while decode ran. Replace it only after
+    // removing its accounted bytes; returned shared_ptrs remain valid independently of the map entry.
+    auto concurrent = cache.entries.find(address);
+    if (concurrent != cache.entries.end()) {
+        cache.stats.bytes -= concurrent->second.shader->bytes;
+        cache.entries.erase(concurrent);
+    }
     constexpr size_t max_entries = 4096;
     const uint64_t limit = shader_decode_cache_limit_bytes();
     while (!cache.entries.empty() &&
@@ -3515,17 +3522,30 @@ struct DrawRealizationBatch {
 };
 
 // One process-lifetime worker set avoids creating dozens of host threads for every guest submit.
-// AGC submits are serialized, so the pool deliberately supports one batch at a time. The submit
-// thread participates as slot zero; each persistent worker owns a stable measurement slot.
+// The pool deliberately supports one batch at a time; callers are serialized at run() even when
+// independent submit threads arrive concurrently. The submit thread participates as slot zero;
+// each persistent worker owns a stable measurement slot.
 class DrawRealizationPool {
 public:
     explicit DrawRealizationPool(size_t workers) {
         workers_.reserve(workers);
-        for (size_t i = 0; i < workers; ++i)
-            workers_.emplace_back([this, i] { worker_main(i); });
+        try {
+            for (size_t i = 0; i < workers; ++i)
+                workers_.emplace_back([this, i] { worker_main(i); });
+        } catch (...) {
+            {
+                std::lock_guard lock(mutex_);
+                stopping_ = true;
+                ++generation_;
+            }
+            work_cv_.notify_all();
+            for (auto& worker : workers_) if (worker.joinable()) worker.join();
+            throw;
+        }
     }
 
     ~DrawRealizationPool() {
+        std::lock_guard run_lock(run_mutex_);
         {
             std::lock_guard lock(mutex_);
             stopping_ = true;
@@ -3538,6 +3558,7 @@ public:
     size_t worker_count() const { return workers_.size(); }
 
     void run(const std::shared_ptr<DrawRealizationBatch>& batch, size_t workers_to_use) {
+        std::lock_guard run_lock(run_mutex_);
         workers_to_use = std::min(workers_to_use, workers_.size());
         batch->worker_participants = workers_to_use;
         batch->remaining.store(workers_to_use, std::memory_order_relaxed);
@@ -3617,6 +3638,7 @@ private:
     }
 
     std::vector<std::thread> workers_;
+    std::mutex run_mutex_;
     std::mutex mutex_;
     std::condition_variable work_cv_;
     std::shared_ptr<DrawRealizationBatch> active_;

@@ -2,9 +2,12 @@
 #include "../src/hle/dispatch.hpp"
 #include "../src/gpu/gpu_execute.hpp"
 #include "../src/gpu/pm4_registers.hpp"
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
+#include <thread>
 #include <vector>
 
 using namespace prosper;
@@ -355,15 +358,19 @@ int main() {
         parallel_state.draws[i].command_order = 1000 + i * 3;
     }
     prosper::gpu::clear_shader_recompile_cache();
+    prosper::gpu::clear_shader_decode_cache();
     const auto serial_draws = prosper::gpu::realize_gpustate_draws(
         parallel_state, 0x10000, 1.0f, 1.0f, nullptr, false, false);
-    // Cold-start only the analysis layer so the parallel run races its two address-local inserts while
-    // retaining warm compiled shaders. Entry bytes must remain exact even if several workers miss.
+    const auto serial_decode = prosper::gpu::shader_decode_cache_stats();
+    // Cold-start the address-local decode and analysis layers so parallel workers race their two
+    // inserts while retaining warm compiled shaders. Entry bytes must remain exact under both races.
+    prosper::gpu::clear_shader_decode_cache();
     prosper::gpu::clear_shader_analysis_cache();
     const auto parallel_before = prosper::gpu::parallel_draw_realization_stats();
     const auto parallel_draws = prosper::gpu::realize_gpustate_draws(
         parallel_state, 0x10000, 1.0f, 1.0f, nullptr, true, true);
     const auto parallel_after = prosper::gpu::parallel_draw_realization_stats();
+    const auto parallel_decode = prosper::gpu::shader_decode_cache_stats();
     const auto parallel_analysis = prosper::gpu::shader_analysis_cache_stats();
     bool equivalent = serial_draws.size() == parallel_state.draws.size() &&
                       parallel_draws.size() == serial_draws.size();
@@ -398,6 +405,34 @@ int main() {
     CHECK(parallel_analysis.entries == 2 &&
               parallel_analysis.bytes == sizeof(parallel_vs) + sizeof(parallel_ps),
           "parallel cold analysis keeps exact entry and byte accounting");
+    CHECK(serial_decode.entries == 2 && parallel_decode.entries == serial_decode.entries &&
+              parallel_decode.bytes == serial_decode.bytes,
+          "parallel cold decode keeps exact entry and byte accounting");
+
+    // Public realization calls can arrive from independent submit threads. The process-lifetime
+    // pool must serialize whole batches instead of replacing the active generation mid-flight.
+    std::atomic<size_t> concurrent_ready{0};
+    std::atomic<bool> concurrent_start{false};
+    std::vector<prosper::gpu::DrawItem> concurrent_a, concurrent_b;
+    auto concurrent_realize = [&](std::vector<prosper::gpu::DrawItem>& output) {
+        concurrent_ready.fetch_add(1, std::memory_order_release);
+        while (!concurrent_start.load(std::memory_order_acquire)) std::this_thread::yield();
+        output = prosper::gpu::realize_gpustate_draws(
+            parallel_state, 0x10000, 1.0f, 1.0f, nullptr, true, true);
+    };
+    std::thread concurrent_thread_a(concurrent_realize, std::ref(concurrent_a));
+    std::thread concurrent_thread_b(concurrent_realize, std::ref(concurrent_b));
+    while (concurrent_ready.load(std::memory_order_acquire) != 2) std::this_thread::yield();
+    concurrent_start.store(true, std::memory_order_release);
+    concurrent_thread_a.join();
+    concurrent_thread_b.join();
+    bool concurrent_ok = concurrent_a.size() == parallel_state.draws.size() &&
+                         concurrent_b.size() == parallel_state.draws.size();
+    for (size_t i = 0; concurrent_ok && i < parallel_state.draws.size(); ++i)
+        concurrent_ok = concurrent_a[i].draw_index == i && concurrent_b[i].draw_index == i &&
+                        concurrent_a[i].command_order == parallel_state.draws[i].command_order &&
+                        concurrent_b[i].command_order == parallel_state.draws[i].command_order;
+    CHECK(concurrent_ok, "concurrent callers complete serialized realization batches in draw order");
 
     // Exercise persistent-worker generation changes repeatedly. This catches an early return or a
     // stale batch/context reference that a single batch cannot expose, while warm shader-cache reuse
