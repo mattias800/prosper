@@ -5330,8 +5330,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
                 if (dyn_int_store) {
                     // Integer sub-dword store: clear then set THIS lane's disjoint field of the containing
-                    // dword with two atomics. Disjoint fields commute, so no read-modify-write lock is
-                    // needed; EXEC predication keeps inactive lanes from writing (like cbuf_store).
+                    // dword with two atomics. Disjoint fields commute (And clears only this field's bits,
+                    // Or sets only this field's bits), so no read-modify-write lock is needed; EXEC
+                    // predication keeps inactive lanes from writing (like cbuf_store). CONFIDENCE: HIGH —
+                    // this diverges from a hardware byte-enable store ONLY in already-UB situations: two
+                    // lanes storing to the SAME element OR-merge instead of one-winner, and a racing reader
+                    // could observe the transient post-And zero. Both require a data race a well-formed
+                    // shader never has. A straddling field (excluded by the alignment guard above) is the
+                    // one shape this can't express and stays deferred.
                     const uint32_t field_mask = comp_bytes == 2 ? 0xffffu : 0xffu;
                     for (uint32_t k = 0; k < n; k++) {
                         const uint32_t caddr = k ? b.ibin(Op_IAdd, addr, b.uconst(k * comp_bytes)) : addr;
