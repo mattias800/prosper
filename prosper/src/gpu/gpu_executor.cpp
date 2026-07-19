@@ -1545,9 +1545,14 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             current_key_known = false;
                         }
                     }
-                    if (current_known && current_key_known) {
+                    if (current_known) {
                         pending_srt_use.kind = 1;
-                        pending_srt_use.key = current_key;
+                        // A V# may live directly in the entry user SGPRs without an AGC sharp or
+                        // preceding s_load (Astro's title PS uses s[24:27] this way). Its four live
+                        // dwords are still exact; only the table-offset provenance is absent. Publish
+                        // that descriptor by the unambiguous consuming PC, matching direct MIMG/MUBUF
+                        // discovery, instead of forcing the recompiler onto an unbound fallback cbuf.
+                        pending_srt_use.key = current_key_known ? current_key : 0xFFFFFFFFu;
                         for (int k = 0; k < 4; ++k)
                             pending_srt_use.v4[(size_t)k] = val[(size_t)(sbase + k)];
                         pending_srt_use.use_pc = in.pc;

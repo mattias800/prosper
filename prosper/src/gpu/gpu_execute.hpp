@@ -125,17 +125,18 @@ struct DynFetch {
     uint32_t instruction_format = UINT32_MAX;
 };
 
-// One descriptor-TABLE use recovered by the same const-fold (#294): UE4 shaders load their T#/S#/V#
+// One descriptor use recovered by the same const-fold (#294): shaders may load their T#/S#/V#
 // descriptors with `s_load_dwordx4/x8 sN, s[ptr:ptr+1], <imm>` from a resource table whose pointer
-// sits in the user-data SGPRs, then consume them (image_sample SRSRC/SSAMP, s_buffer_load SBASE).
+// sits in the user-data SGPRs, or consume a V# placed directly in their entry user SGPRs. They then
+// use those descriptors through image_sample SRSRC/SSAMP or s_buffer_load SBASE.
 // The recompiler tags such a load's dest SGPRs with the load IMMEDIATE (sreg_srt) and resolves the
 // consumer via by_srt_offset(imm) — so `key` here is exactly that immediate, and build_stage_table
 // turns each use into a ShaderResource with srt_offset = key.
 struct SrtUse {
     int kind = 0;                    // 0 = texture (t8, + s4 sampler when resolved), 1 = constant buffer (v4)
     uint32_t key = 0;                // the s_load immediate byte offset (== emit_alu's sreg_srt tag);
-                                     // 0xFFFFFFFF = key-less (register-SOFFSET / negative-imm load — the
-                                     // recompiler then resolves the use by its instruction pc instead)
+                                     // 0xFFFFFFFF = key-less (direct entry V#, register-SOFFSET, or
+                                     // negative-imm load; resolve by the exact instruction pc instead)
     std::array<uint32_t, 8> t8{};    // T# dwords as loaded (kind 0)
     std::array<uint32_t, 4> v4{};    // V# dwords as loaded (kind 1)
     uint32_t instruction_format = UINT32_MAX; // MTBUF BUF_FMT override for kind 1
