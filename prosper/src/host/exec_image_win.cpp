@@ -1,4 +1,4 @@
-// exec_image_win.cpp — Windows host backing for the guest-execution substrate.
+﻿// exec_image_win.cpp — Windows host backing for the guest-execution substrate.
 //
 // The Windows sibling of exec_image_linux.cpp. It implements the same exec_image.hpp contract with
 // Win32 primitives instead of POSIX: VirtualAlloc for fixed-address guest mappings, a Vectored
@@ -76,6 +76,10 @@ __asm__(
     "    movq  %rcx, %rax\n"           // MS x64: rcx=fn, rdx=argc, r8=argp
     "    movq  %rdx, %rdi\n"           // argc -> SysV arg0
     "    movq  %r8,  %rsi\n"           // argp -> SysV arg1
+    "    xorq  %rbp, %rbp\n"           // terminate the guest frame-pointer chain at the host boundary so
+                                       // the guest's rbp-based backtrace walker (UE FP-chain) stops here
+                                       // instead of walking into host frames (MinGW omits frame pointers,
+                                       // so [rbp] there is garbage). Mirrors win_thread_trampoline. (#946)
     "    callq *%rax\n"
     "    movaps    0(%rsp), %xmm6\n"
     "    movaps   16(%rsp), %xmm7\n"
@@ -124,6 +128,7 @@ __asm__(
     "    movq  %r8,  %rsi\n"           // a1 -> SysV rsi
     "    movq  %r10, %rdx\n"           // a2 -> SysV rdx
     "    movq  48(%rbp), %rcx\n"       // a3 -> SysV rcx (5th MS argument)
+    "    xorq  %rbp, %rbp\n"           // terminate the guest FP-chain at the host boundary (#946); see sysv above
     "    callq *%rax\n"
     "    movaps    0(%rsp), %xmm6\n"
     "    movaps   16(%rsp), %xmm7\n"
@@ -439,6 +444,18 @@ namespace {
         if (fault_addr == c->Rip) return false;           // instruction fetch at null is a real endpoint
         const uint8_t* p = (const uint8_t*)(uintptr_t)c->Rip;
         if (!addr_readable((uint64_t)(uintptr_t)p)) return false;
+        // Decline segment-relative (fs/gs) accesses. A guest %fs/%gs TLS read that faults at a low linear
+        // address means the segment BASE drifted to 0 (Windows zeroes the FS base on kernel transitions),
+        // not that a null pointer was dereferenced. The fs-drift recovery below must re-apply the base and
+        // retry; emulating the read as 0 here would hand back a bogus null TCB and crash downstream
+        // (e.g. eboot+0x24d3c3c: `mov %fs:0x0,%rax ; cmpb -0x10(%rax)`). (#946)
+        for (size_t k = 0; k < 15; k++) {
+            uint8_t b = p[k];
+            if (b == 0x64 || b == 0x65) return false;                 // fs/gs override -> fs-drift recovery
+            if (b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 ||
+                b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26) continue;   // other legacy prefixes
+            break;                                                    // reached REX / opcode
+        }
         int reg = 0, insn_len = 0;
         // Decode via the shared, unit-tested x86 read decoder (only forms where zeroing the full dest is
         // correct for a zero source). 15 = max x86-64 instruction length; Rip is executable so it is mapped.
