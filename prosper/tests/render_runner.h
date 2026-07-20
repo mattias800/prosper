@@ -18,6 +18,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -421,6 +422,11 @@ struct RenderVkCtx {
     VkDeviceSize storage_buffer_alignment = 1;
     bool aniso_enabled = false; float max_aniso_limit = 1.0f;
     bool logic_op_enabled = false; bool ok = false;
+    bool subgroup_size_control = false;
+    uint32_t min_subgroup_size = 0, max_subgroup_size = 0;
+    VkShaderStageFlags required_subgroup_size_stages = 0;
+    VkShaderStageFlags subgroup_stages = 0;
+    VkSubgroupFeatureFlags subgroup_operations = 0;
 };
 inline const RenderVkCtx& render_vk_ctx() {
     static RenderVkCtx c = [] {
@@ -474,6 +480,12 @@ inline const RenderVkCtx& render_vk_ctx() {
         // portability-subset extensions coexist.
         std::vector<const char*> dev_exts;
         VkPhysicalDeviceImageRobustnessFeaturesEXT irf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES_EXT};
+        VkPhysicalDeviceSubgroupSizeControlFeatures subgroup_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES};
+        VkPhysicalDeviceSubgroupSizeControlProperties subgroup_properties{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+        VkPhysicalDeviceSubgroupProperties subgroup_core_properties{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
         { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &ne, nullptr);
           std::vector<VkExtensionProperties> de(ne);
           vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &ne, de.data());
@@ -481,7 +493,33 @@ inline const RenderVkCtx& render_vk_ctx() {
               if (!strcmp(de[i].extensionName, "VK_EXT_image_robustness")) {
                   VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
                   f2.pNext = &irf; vkGetPhysicalDeviceFeatures2(r.phys, &f2);
-                  if (irf.robustImageAccess) { dci.pNext = &irf; dev_exts.push_back("VK_EXT_image_robustness"); }
+                  if (irf.robustImageAccess) {
+                      irf.pNext = const_cast<void*>(dci.pNext);
+                      dci.pNext = &irf;
+                      dev_exts.push_back("VK_EXT_image_robustness");
+                  }
+              }
+              if (!strcmp(de[i].extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
+                  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+                  f2.pNext = &subgroup_features;
+                  vkGetPhysicalDeviceFeatures2(r.phys, &f2);
+                  if (subgroup_features.subgroupSizeControl) {
+                      VkPhysicalDeviceProperties2 p2{
+                          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+                      p2.pNext = &subgroup_core_properties;
+                      subgroup_core_properties.pNext = &subgroup_properties;
+                      vkGetPhysicalDeviceProperties2(r.phys, &p2);
+                      subgroup_features.pNext = const_cast<void*>(dci.pNext);
+                      dci.pNext = &subgroup_features;
+                      dev_exts.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+                      r.subgroup_size_control = true;
+                      r.min_subgroup_size = subgroup_properties.minSubgroupSize;
+                      r.max_subgroup_size = subgroup_properties.maxSubgroupSize;
+                      r.required_subgroup_size_stages =
+                          subgroup_properties.requiredSubgroupSizeStages;
+                      r.subgroup_stages = subgroup_core_properties.supportedStages;
+                      r.subgroup_operations = subgroup_core_properties.supportedOperations;
+                  }
               }
 #ifdef __APPLE__
               // Spec-mandated: must be enabled when advertised (MoltenVK always advertises it).
@@ -2135,6 +2173,31 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         const std::vector<uint32_t>& bd_gs = bd.gs_words();
         const std::vector<uint32_t>& bd_fs = bd.fs_words();
         DV& v = dv[di];
+        const uint32_t required_fragment_subgroup_size =
+            prosper::gpu::fragment_spirv_required_subgroup_size(bd_fs);
+        if (required_fragment_subgroup_size &&
+            (!ctx.subgroup_size_control ||
+             required_fragment_subgroup_size < ctx.min_subgroup_size ||
+             required_fragment_subgroup_size > ctx.max_subgroup_size ||
+             !(ctx.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
+             !(ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
+             !(ctx.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT))) {
+            const uint64_t shader_key = bd.fs_identity
+                ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
+            static std::mutex log_mutex;
+            static std::unordered_set<uint64_t> logged;
+            std::lock_guard<std::mutex> lock(log_mutex);
+            if (logged.insert(shader_key).second)
+                std::fprintf(stderr,
+                             "[render] skip draw: fragment shader requires subgroup size %u "
+                             "(device range %u..%u required-stages=0x%x subgroup-stages=0x%x "
+                             "ops=0x%x control=%d)\n",
+                             required_fragment_subgroup_size, ctx.min_subgroup_size,
+                             ctx.max_subgroup_size, ctx.required_subgroup_size_stages,
+                             ctx.subgroup_stages, ctx.subgroup_operations,
+                             static_cast<int>(ctx.subgroup_size_control));
+            continue;
+        }
         if (backend_trace) {
             fprintf(stderr,
                     "[backend-trace] draw=%zu/%zu begin extent=%ux%u vs=%zu gs=%zu fs=%zu "
@@ -2178,6 +2241,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             v.icount = (uint32_t)bd.indices.size();
         }
         VkPipelineShaderStageCreateInfo st[3]{};
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_fragment_subgroup{
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
         st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}; st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = v.vs; st[0].pName = "main";
         const uint32_t fragment_stage_index = bd_gs.empty() ? 1u : 2u;
         if (!bd_gs.empty()) {
@@ -2188,6 +2253,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         st[fragment_stage_index].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
         st[fragment_stage_index].module = v.fs;
         st[fragment_stage_index].pName = "main";
+        if (required_fragment_subgroup_size) {
+            required_fragment_subgroup.requiredSubgroupSize = required_fragment_subgroup_size;
+            st[fragment_stage_index].pNext = &required_fragment_subgroup;
+        }
         VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
         VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
         ia.topology = ps ? (VkPrimitiveTopology)ps->topology : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -2807,7 +2876,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 memcpy(&word, &value, sizeof word);
                 append(word);
             };
-            append(6); // key schema version (framebuffer logic op)
+            append(7); // key schema version (fragment required subgroup size)
             append(W); append(H); append(color_count); append(static_cast<uint32_t>(FMT));
             append(static_cast<uint32_t>(FMT1)); append(use_ds); append(static_cast<uint32_t>(DFMT));
             const bool exact_shader_identities = bd.vs_identity && bd.fs_identity;
@@ -2827,6 +2896,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 append(static_cast<uint32_t>(bd_fs.size()));
                 for (uint32_t word : bd_fs) append(word);
             }
+            append(required_fragment_subgroup_size);
             append(static_cast<uint32_t>(bd_gs.size()));
             for (uint32_t word : bd_gs) append(word);
             append(v.use_desc); append(v.n_sets);

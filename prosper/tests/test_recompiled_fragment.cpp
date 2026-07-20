@@ -41,6 +41,37 @@ int main() {
     CHECK(c[1] > 0x80 && c[0] < 0x40 && c[2] < 0x40, "center pixel is GREEN (from the recompiled shader)");
     CHECK(k[2] > 0x80 && k[0] < 0x40 && k[1] < 0x40, "corner pixel is the BLUE clear");
 
+    // Fragment MBCNT is a real cross-lane operation. The lowering uses a native subgroup exclusive
+    // sum and marks the module as requiring an exact 64-lane subgroup. RADV can
+    // enforce that contract; llvmpipe is fixed at 8 and must reject the draw rather than execute
+    // silently wrong wave semantics.
+    const uint32_t wave_ps[] = {
+        0xD7650004u, 0x000100C1u, // v_mbcnt_lo_u32_b32 v4, -1, 0
+        0xD7660004u, 0x000208C1u, // v_mbcnt_hi_u32_b32 v4, -1, v4
+        0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u,
+        0xF800180Fu, 0x03020100u, 0xBF810000u,
+    };
+    std::vector<uint32_t> wave_frag = recompile_fragment(wave_ps, std::size(wave_ps));
+    CHECK(!wave_frag.empty(), "recompiled fragment MBCNT through native subgroup exclusive sum");
+    CHECK(fragment_spirv_required_subgroup_size(wave_frag) == 64,
+          "fragment MBCNT module advertises its exact wave64 pipeline requirement");
+    const auto& wave_ctx = prosper::test::render_vk_ctx();
+    const bool supports_fragment_wave64 = wave_ctx.subgroup_size_control &&
+        wave_ctx.min_subgroup_size <= 64 && wave_ctx.max_subgroup_size >= 64 &&
+        (wave_ctx.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
+        (wave_ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
+        (wave_ctx.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT);
+    std::vector<uint8_t> wave_px = prosper::test::render_triangle_rgba(vert, wave_frag, W, H);
+    const bool wave_rendered = wave_px.size() == static_cast<size_t>(W) * H * 4;
+    const uint8_t* wave_center = wave_rendered
+        ? &wave_px[((static_cast<size_t>(H) / 2) * W + W / 2) * 4] : nullptr;
+    CHECK(supports_fragment_wave64
+              ? wave_rendered && wave_center[1] > 0x80 && wave_center[2] < 0x40
+              : wave_rendered && wave_center[2] > 0x80 && wave_center[1] < 0x40,
+          supports_fragment_wave64
+              ? "device enforced wave64 and executed fragment MBCNT"
+              : "device without fragment wave64 skipped MBCNT draw fail-visible");
+
     // Astro Bot's early foreground pass exports only R/G (EN=0x3). AMD's EXP contract preserves
     // disabled destination components; the live executor therefore intersects EN with the Vulkan
     // pipeline write mask. Prove both the exact rejected shader now recompiles and a partial draw
