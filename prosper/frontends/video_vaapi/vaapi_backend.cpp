@@ -249,7 +249,7 @@ bool convert_video_frame(Pipeline& pipeline, HardwareSelection& selection, Sessi
 
     if (avp_log() && !session.initialized) {
         std::fprintf(stderr, "[avp-vaapi] %s decode selected for '%s' (%s -> NV12)\n",
-                     hardware ? "hardware VA-API" : "diagnostic software",
+                     hardware ? "hardware VA-API" : "software (libavcodec)",
                      session.path.c_str(), av_get_pix_fmt_name(static_cast<AVPixelFormat>(source->format)));
     }
     return enqueue_video(session, std::move(packet), stop);
@@ -376,7 +376,7 @@ void decode_session(Session& session, std::stop_token stop) {
                 selection.format = AV_PIX_FMT_NONE;
                 if (avp_log()) {
                     std::fprintf(stderr,
-                                 "[avp-vaapi] VA-API unavailable; explicit software override active: %s\n",
+                                 "[avp-vaapi] VA-API unavailable; falling back to software decode: %s\n",
                                  ff_error(result).c_str());
                 }
             }
