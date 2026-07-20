@@ -1168,6 +1168,26 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
     return invalidated;
 }
 
+// Make device writes visible before the CPU reads a mapped readback buffer. A HOST_CACHED memory
+// type is not required to also be HOST_COHERENT, so every mapped READ of a TRANSFER_DST buffer must
+// invalidate first. Specified as valid on coherent memory too, so callers can invoke it
+// unconditionally rather than tracking the selected memory type.
+// NOTE: this header contains a second readback allocator that requires HOST_COHERENT in every tier,
+// so its mapped reads need no invalidate. Keep that requirement, or route its reads through this
+// helper too -- relaxing it without adding invalidates would silently return stale bytes.
+inline bool invalidate_mapped_readback(const RenderVkCtx& ctx, VkDeviceMemory memory) {
+    if (!memory) return false;
+    VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+    range.memory = memory;
+    range.offset = 0;
+    range.size = VK_WHOLE_SIZE;   // VK_WHOLE_SIZE is exempt from the nonCoherentAtomSize size rule
+    return vkInvalidateMappedMemoryRanges(ctx.dev, 1, &range) == VK_SUCCESS;
+}
+
+// CONTRACT: a pure TRANSFER_DST (readback) buffer may be backed by HOST_CACHED memory that is NOT
+// HOST_COHERENT. Call invalidate_mapped_readback() after mapping and before reading one, and do not
+// host-WRITE through such a mapping without a flush. Any usage including TRANSFER_SRC is always
+// backed by HOST_COHERENT memory, so host writes to it need no flush.
 inline bool persistent_ds_transfer_buffer(const RenderVkCtx& ctx, VkDeviceSize bytes,
                                           VkBufferUsageFlags usage, VkBuffer& buffer,
                                           VkDeviceMemory& memory, std::string& error) {
@@ -1180,13 +1200,46 @@ inline bool persistent_ds_transfer_buffer(const RenderVkCtx& ctx, VkDeviceSize b
     vkGetBufferMemoryRequirements(ctx.dev, buffer, &requirements);
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocation.allocationSize = requirements.size;
-    allocation.memoryTypeIndex = render_memory_type(
+    // A pure TRANSFER_DST buffer is a GPU->CPU readback: the CPU READS every byte of it. Plain
+    // HOST_VISIBLE|HOST_COHERENT memory is typically write-combined and uncached, which streams CPU
+    // writes well but reads back at only a few hundred MB/s -- measured here at ~236 MB/s, making the
+    // map+copy 99% of a color-target readback. Such a buffer therefore prefers HOST_CACHED so the
+    // copy runs at cache speed. A buffer that is ALSO TRANSFER_SRC is host-written (an upload, or a
+    // round trip), so it keeps the write-combined coherent selection that is right for writes and
+    // needs no host flush.
+    const bool readback = (usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT) != 0 &&
+                          (usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) == 0;
+    const uint32_t coherent_type = render_memory_type(
         ctx.phys, requirements.memoryTypeBits,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (allocation.memoryTypeIndex == UINT32_MAX ||
-        vkAllocateMemory(ctx.dev, &allocation, nullptr, &memory) != VK_SUCCESS ||
-        vkBindBufferMemory(ctx.dev, buffer, memory, 0) != VK_SUCCESS) {
-        if (memory) vkFreeMemory(ctx.dev, memory, nullptr);
+    uint32_t preferred = UINT32_MAX;
+    if (readback) {
+        preferred = render_memory_type(
+            ctx.phys, requirements.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (preferred == UINT32_MAX)
+            preferred = render_memory_type(
+                ctx.phys, requirements.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    }
+    // Try the preferred (cached) type first, then the previously used coherent type. The retry
+    // matters because a cached type can live in a small heap (BAR-style) that the coherent type does
+    // not: without it, a cached-heap exhaustion would fail a readback that previously succeeded.
+    auto try_allocate = [&](uint32_t type) {
+        if (type == UINT32_MAX) return false;
+        allocation.memoryTypeIndex = type;
+        if (vkAllocateMemory(ctx.dev, &allocation, nullptr, &memory) != VK_SUCCESS) {
+            memory = VK_NULL_HANDLE;
+            return false;
+        }
+        if (vkBindBufferMemory(ctx.dev, buffer, memory, 0) != VK_SUCCESS) {
+            vkFreeMemory(ctx.dev, memory, nullptr); memory = VK_NULL_HANDLE;
+            return false;
+        }
+        return true;
+    };
+    if (!try_allocate(preferred) && !(preferred != coherent_type && try_allocate(coherent_type))) {
         vkDestroyBuffer(ctx.dev, buffer, nullptr); buffer = VK_NULL_HANDLE; memory = VK_NULL_HANDLE;
         error = "cannot allocate persistent DS transfer buffer"; return false;
     }
@@ -1377,6 +1430,10 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
     if (vkMapMemory(ctx.dev, memory, 0, bytes, 0, &mapped) != VK_SUCCESS || !mapped) {
         cleanup(); error = "cannot map persistent color target readback"; return false;
     }
+    if (!invalidate_mapped_readback(ctx, memory)) {
+        vkUnmapMemory(ctx.dev, memory);
+        cleanup(); error = "cannot invalidate persistent color target readback"; return false;
+    }
     const auto* first = static_cast<const uint8_t*>(mapped);
     output.assign(first, first + static_cast<size_t>(bytes));
     vkUnmapMemory(ctx.dev, memory);
@@ -1424,15 +1481,19 @@ inline bool snapshot_persistent_ds_images(std::vector<prosper::gpu::GpuCaptureDs
         void* mapped = nullptr;
         const bool mapped_ok = copied &&
             vkMapMemory(ctx.dev, memory, 0, depth_bytes + stencil_bytes, 0, &mapped) == VK_SUCCESS;
-        if (mapped_ok) {
+        const bool invalidated = mapped_ok && invalidate_mapped_readback(ctx, memory);
+        if (invalidated) {
             const auto* bytes = static_cast<const uint8_t*>(mapped);
             seed.depth.assign(bytes, bytes + depth_bytes);
             seed.stencil.assign(bytes + depth_bytes, bytes + depth_bytes + stencil_bytes);
             vkUnmapMemory(ctx.dev, memory);
         }
+        if (mapped_ok && !invalidated) vkUnmapMemory(ctx.dev, memory);
         vkDestroyBuffer(ctx.dev, buffer, nullptr); vkFreeMemory(ctx.dev, memory, nullptr);
-        if (!mapped_ok) {
-            if (error.empty()) error = "cannot map persistent DS readback";
+        if (!invalidated) {
+            if (error.empty())
+                error = mapped_ok ? "cannot invalidate persistent DS readback"
+                                  : "cannot map persistent DS readback";
             return false;
         }
         seeds.push_back(std::move(seed));
