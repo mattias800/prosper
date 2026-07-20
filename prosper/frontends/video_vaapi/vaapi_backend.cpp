@@ -38,7 +38,19 @@ bool env_enabled(const char* name) {
 }
 
 bool avp_log() { return env_enabled("PROSPER_AVP_LOG"); }
-bool software_decode_allowed() { return env_enabled("PROSPER_AVP_ALLOW_SOFTWARE"); }
+// Software decode is a REAL FFmpeg libavcodec fallback — it produces the genuine movie pixels (NOT
+// the synthetic black-frame path, which stays explicit/opt-in per #841). It is HARDWARE-PREFERRED:
+// av_hwdevice_ctx_create is tried first and used whenever VA-API succeeds; software only engages if
+// hardware device creation fails (headless systems, no DRI render node, or no working VA driver).
+// Default ON so a title's movie decodes on ANY Linux host rather than failing to open and deadlocking
+// the game — PPSA02664 (Alex Kidd) hung forever in its black intro scene on hosts without VA-API
+// because sceAvPlayer's source open failed and no completion event ever fired (#320). Set
+// PROSPER_AVP_ALLOW_SOFTWARE=0 to force hardware-only (e.g. to detect a VA-API regression).
+bool software_decode_allowed() {
+    const char* value = std::getenv("PROSPER_AVP_ALLOW_SOFTWARE");
+    if (value && *value) return std::strcmp(value, "0") != 0;   // honor an explicit override
+    return true;                                                 // default: hw-preferred, sw fallback
+}
 
 std::string ff_error(int error) {
     char text[AV_ERROR_MAX_STRING_SIZE]{};
@@ -237,7 +249,7 @@ bool convert_video_frame(Pipeline& pipeline, HardwareSelection& selection, Sessi
 
     if (avp_log() && !session.initialized) {
         std::fprintf(stderr, "[avp-vaapi] %s decode selected for '%s' (%s -> NV12)\n",
-                     hardware ? "hardware VA-API" : "diagnostic software",
+                     hardware ? "hardware VA-API" : "software (libavcodec)",
                      session.path.c_str(), av_get_pix_fmt_name(static_cast<AVPixelFormat>(source->format)));
     }
     return enqueue_video(session, std::move(packet), stop);
@@ -364,7 +376,7 @@ void decode_session(Session& session, std::stop_token stop) {
                 selection.format = AV_PIX_FMT_NONE;
                 if (avp_log()) {
                     std::fprintf(stderr,
-                                 "[avp-vaapi] VA-API unavailable; explicit software override active: %s\n",
+                                 "[avp-vaapi] VA-API unavailable; falling back to software decode: %s\n",
                                  ff_error(result).c_str());
                 }
             }

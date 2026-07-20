@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <thread>
 
 using namespace prosper::video;
@@ -22,9 +23,20 @@ int main(int argc, char** argv) {
     if (backend()) {
         CHECK(backend()->open("/prosper-missing/no-such-video.mp4") < 0,
               "missing source fails instead of fabricating a decode session");
-        if (argc == 2) {
-            const int id = backend()->open(argv[1]);
-            CHECK(id >= 0, "MP4 opens with the selected VA-API or explicit diagnostic pipeline");
+        // Decode a committed test-pattern clip. On a headless host (no DRI render node / no working
+        // VA driver — CI runners, containers) VA-API hardware decode is unavailable, so a successful
+        // decode here proves REAL FFmpeg software decode is the default fallback (#320: without it,
+        // sceAvPlayer could not open a title's movie and the game deadlocked in its black intro).
+        // A path argument overrides the built-in asset (local diagnostics with a bigger clip).
+        const char* asset = (argc == 2) ? argv[1] :
+#ifdef PROSPER_TEST_VIDEO_ASSET
+            PROSPER_TEST_VIDEO_ASSET;
+#else
+            nullptr;
+#endif
+        if (asset) {
+            const int id = backend()->open(asset);
+            CHECK(id >= 0, "MP4 opens with hardware VA-API or the software-decode fallback");
             if (id >= 0) {
                 StreamInfo stream{};
                 CHECK(backend()->info(id, stream) && stream.width && stream.height && stream.fps > 0,
@@ -74,6 +86,27 @@ int main(int argc, char** argv) {
                 }
                 backend()->close(id);
             }
+            // Deterministic software-fallback guard for ANY host (incl. machines with working
+            // VA-API): force VA-API device creation to fail by pointing it at a nonexistent render
+            // node, then assert the SAME clip still decodes — via real software decode (#705). Without
+            // the default fallback this open would fail, reproducing the PPSA02664 hang.
+            setenv("PROSPER_AVP_VAAPI_DEVICE", "/prosper-missing/renderD999", 1);
+            const int sw_id = backend()->open(asset);
+            CHECK(sw_id >= 0, "clip decodes via software fallback when VA-API device is unavailable");
+            if (sw_id >= 0) {
+                unsigned sw_frames = 0;
+                const auto sw_deadline =
+                    std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                while (std::chrono::steady_clock::now() < sw_deadline && sw_frames < 3 &&
+                       !backend()->eof(sw_id)) {
+                    VideoFrame frame{};
+                    if (backend()->next_video(sw_id, frame)) ++sw_frames;
+                    else std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                CHECK(sw_frames >= 3, "software fallback delivers real frames with hardware forced off");
+                backend()->close(sw_id);
+            }
+            unsetenv("PROSPER_AVP_VAAPI_DEVICE");
         }
     }
     uninstall_vaapi_backend();
