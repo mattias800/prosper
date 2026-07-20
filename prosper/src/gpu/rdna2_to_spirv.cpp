@@ -2688,17 +2688,48 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
         backedge_execnz.push_back(in.opcode == 0x09);
     }
     if (out.empty()) return out;
-    // Loops must be strictly DISJOINT and in order (nested loops are not modeled). Backward branches
-    // appear in pc order, so headers must too — and each loop must end before the next begins.
-    for (size_t i = 1; i < out.size(); i++)
-        if (out[i].header_pc < out[i - 1].exit_pc) return {};
-    // Pass 2: validate each loop's interior branches and find the canonical exit + breaks.
+    // Loops may be strictly DISJOINT (sequential) or PROPERLY NESTED (#590 — DOLL's post-process
+    // kernel iterates an inner table loop inside an outer row loop). Pass 1 collected loops in
+    // BACK-EDGE pc order (an inner back-edge precedes its outer's); re-sort by header so the list is
+    // in emission order — emit_structured consumes loops by header pc, and emitting an outer body
+    // recursively reaches the inner loop first because its header lies inside that range. Then
+    // validate every pair as either disjoint-in-order or properly nested; partial overlap (an
+    // unstructured region) still rejects loudly.
+    {
+        std::vector<size_t> order(out.size());
+        for (size_t i = 0; i < order.size(); i++) order[i] = i;
+        std::sort(order.begin(), order.end(),
+                  [&](size_t a, size_t c) { return out[a].header_pc < out[c].header_pc; });
+        std::vector<DivLoop> sorted_loops; std::vector<bool> sorted_execnz;
+        sorted_loops.reserve(out.size()); sorted_execnz.reserve(out.size());
+        for (size_t i : order) { sorted_loops.push_back(out[i]); sorted_execnz.push_back(backedge_execnz[i]); }
+        out.swap(sorted_loops); backedge_execnz.swap(sorted_execnz);
+    }
+    for (size_t i = 0; i < out.size(); i++)
+        for (size_t j = i + 1; j < out.size(); j++) {
+            const DivLoop& A = out[i]; const DivLoop& B = out[j];   // A.header_pc <= B.header_pc
+            if (A.header_pc == B.header_pc) return {};              // shared header: not modeled
+            const bool disjoint = B.header_pc >= A.exit_pc;
+            const bool nested   = B.exit_pc <= A.backedge_pc;       // B entirely inside A's body
+            if (!disjoint && !nested) return {};                    // partial overlap: unstructured
+        }
+    // Pass 2: validate each loop's interior branches and find the canonical exit + breaks. A branch
+    // inside a NESTED child loop belongs to the child (which validates itself in its own pass-2
+    // iteration) — skip it here, including the child's backward back-edge, which is exactly the
+    // "second back-edge inside" that used to reject nesting outright.
+    auto inside_nested_child = [&out](const DivLoop& L, uint32_t pc) {
+        for (const auto& C : out)
+            if (C.header_pc > L.header_pc && C.exit_pc <= L.backedge_pc &&
+                pc >= C.header_pc && pc <= C.backedge_pc) return true;
+        return false;
+    };
     for (size_t li = 0; li < out.size(); li++) {
         DivLoop& L = out[li];
         const bool execnz = backedge_execnz[li];
         for (const auto& in : ins) {
             if (in.is_end || in.pc >= L.backedge_pc) break;
             if (in.pc < L.header_pc || in.fmt != Rdna2Format::SOPP) continue;
+            if (inside_nested_child(L, in.pc)) continue;
             switch (in.opcode) {
                 case 0x02: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08: case 0x09: break;
                 default: continue;   // hints
@@ -2745,6 +2776,12 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
         // immediately re-test EXEC (empty condition region) — see the shape comment.
         if (execnz && L.exit_branch_pc != L.header_pc) return {};
     }
+    // A nested child must lie entirely within its parent's BODY: after the parent's canonical exit
+    // test (the condition region [header, exit_branch) stays branch-free) and before its back-edge.
+    for (size_t i = 0; i < out.size(); i++)
+        for (size_t j = i + 1; j < out.size(); j++)
+            if (out[j].exit_pc <= out[i].backedge_pc &&        // nested per the classification above
+                out[j].header_pc <= out[i].exit_branch_pc) return {};
     // Pass 3: no branch from OUTSIDE a loop may target its interior (an unstructured entry edge).
     for (const auto& in : ins) {
         if (in.is_end) break;
@@ -7502,10 +7539,16 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             //     workgroup-divergent control flow (UB). DOLL's blocked light/fill kernels are
             //     straight-line bodies, so nothing observed is lost. CONFIDENCE: MED-HIGH (shared
             //     emit machinery; spirv-val + coverage tests + Messenger guard gate it).
+            // Condition::Vcc loops are accepted under the detector's uniformity proof (#615/#590).
+            // Condition::Exec loops (#590 — DOLL's nested post-process kernel is the observed compute
+            // case) lower with the same per-invocation model as the fragment shell: this invocation
+            // iterates while ITS EXEC bit holds after the header's v_cmpx recompute. Both flavors
+            // require the barrier/LDS/cross-lane-free body below — the per-invocation trip count can
+            // differ across a workgroup, so a barrier inside the loop would be workgroup-divergent
+            // control flow (UB); barriers AFTER the loop are fine (the loop merge reconverges).
             bool compute_ok = !Ls.empty();
             for (const auto& L : Ls) {
                 if (!compute_ok) break;
-                if (L.condition != DivLoop::Condition::Vcc) { compute_ok = false; break; }
                 for (const auto& in : ins) {
                     if (in.is_end || in.pc >= L.exit_pc) break;
                     if (in.pc < L.header_pc) continue;
@@ -7513,6 +7556,26 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a) ||
                         (in.fmt == Rdna2Format::VOP3 &&
                          (in.opcode == 0x365 || in.opcode == 0x366))) { compute_ok = false; break; }
+                }
+                // Fail-visible marker for the per-invocation approximation's one known divergence: a
+                // POST-loop read of an SGPR advanced inside an Exec-condition loop. With a lane-varying
+                // bound, hardware advances in-loop scalars to the wave's MAX trip count while the
+                // per-invocation lowering yields each invocation its own exit value. Uniform bounds
+                // (all observed shapes) are exact. Diagnose loudly instead of silently diverging; if a
+                // real kernel trips this AND has a varying bound, that is the evidence to revisit.
+                if (compute_ok && L.condition == DivLoop::Condition::Exec && getenv("PROSPER_DBG")) {
+                    std::set<int> lv, lsr;
+                    loop_written_regs(ins, L.header_pc, L.backedge_pc, lv, lsr);
+                    for (const auto& in : ins) {
+                        if (in.is_end) break;
+                        if (in.pc < L.exit_pc) continue;
+                        for (uint32_t oi = 0; oi < in.n_src; ++oi)
+                            if (in.src[oi].kind == OperandKind::SGPR && lsr.count((int)in.src[oi].value))
+                                fprintf(stderr,
+                                        "[compute-exec-loop] post-loop read of loop-advanced s%u at pc=%u "
+                                        "(per-invocation value; wave max-trip on hardware)\n",
+                                        (unsigned)in.src[oi].value, in.pc);
+                    }
                 }
             }
             if (!compute_ok) Ls.clear();   // unchanged behavior: the branch reaches emit_alu -> loud reject
