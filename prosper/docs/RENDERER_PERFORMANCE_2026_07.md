@@ -753,8 +753,10 @@ After shared publication, the Dead Cells post-parse loading workload is the most
 These numbers explain why another small CPU lookup cache is not a credible path to 60 FPS. The
 renderer currently creates transient Vulkan objects, waits, and reads back at each ordered backend
 boundary. A durable improvement needs persistent resources and coordinated graphics/compute ownership.
-Shared CPU publication is complete; direct GPU-image presentation remains a later step because the app
-and headless renderer still own separate Vulkan devices.
+Shared CPU publication is complete; direct GPU-image presentation remains a later step. As of #1091
+phase 1 the compute backend ADOPTS the live renderer's Vulkan device instead of creating its own, so
+the two no longer own separate devices when the live renderer is registered; binding a renderer-owned
+image directly to a dispatch (phase 2) is what still remains.
 
 ## Capture correction and dependency evidence
 

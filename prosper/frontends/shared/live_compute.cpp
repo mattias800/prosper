@@ -110,6 +110,9 @@ struct VulkanComputeContext {
     // tests/image_compute_runner.h, the exec-diff harness for that contract). When the device lacks
     // the features, image-binding dispatches are skipped loudly instead of creating an invalid device.
     bool image_support = false;
+    // True when instance/device/queue were ADOPTED from the live renderer (#1091). A borrowed
+    // context is owned by the renderer: destroy our own pipelines/pools/memory, never its device.
+    bool borrowed = false;
 
     ~VulkanComputeContext() {
         release_cached_memory();
@@ -123,6 +126,7 @@ struct VulkanComputeContext {
                 vkDestroyDescriptorSetLayout(device, cached.descriptor_layout, nullptr);
         }
         if (pipeline_cache) vkDestroyPipelineCache(device, pipeline_cache, nullptr);
+        if (borrowed) return;                       // renderer owns the device/instance
         if (device) vkDestroyDevice(device, nullptr);
         if (instance) vkDestroyInstance(instance, nullptr);
     }
@@ -211,7 +215,54 @@ struct VulkanComputeContext {
         memory_pool.cached_allocations = 0;
     }
 
+    // A GRAPHICS queue family is not required by spec to also advertise COMPUTE, and the renderer
+    // selects its family on GRAPHICS alone. Dispatching on a family without COMPUTE is invalid usage,
+    // so verify before adopting rather than assuming the common family-0 layout.
+    static bool queue_family_supports_compute(VkPhysicalDevice phys, uint32_t family) {
+        if (!phys || family == UINT32_MAX) return false;
+        uint32_t count = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(phys, &count, nullptr);
+        if (family >= count) return false;
+        std::vector<VkQueueFamilyProperties> props(count);
+        vkGetPhysicalDeviceQueueFamilyProperties(phys, &count, props.data());
+        return (props[family].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
+    }
+
     bool init() {
+        // Adopt the live renderer's device when it published one (#1091). Sharing a device is what
+        // makes it possible for a dispatch to bind a renderer-owned image at all; without it every
+        // such binding must round-trip through host memory. Declined when the renderer's device
+        // lacks the storage-image features this backend needs, and absent entirely in headless
+        // compute-only use (tests/test_game_compute.cpp), where the private device below is created
+        // exactly as before.
+        const prosper::gpu::SharedVulkanContext shared = prosper::gpu::shared_vulkan_context();
+        if (shared.valid() && shared.storage_image_read_without_format &&
+            shared.storage_image_write_without_format &&
+            queue_family_supports_compute(static_cast<VkPhysicalDevice>(shared.physical),
+                                          shared.queue_family)) {
+            instance = static_cast<VkInstance>(shared.instance);
+            physical = static_cast<VkPhysicalDevice>(shared.physical);
+            device = static_cast<VkDevice>(shared.device);
+            queue = static_cast<VkQueue>(shared.queue);
+            queue_family = shared.queue_family;
+            borrowed = true;
+            image_support = true;
+            VkPipelineCacheCreateInfo pcci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+            if (vkCreatePipelineCache(device, &pcci, nullptr, &pipeline_cache) == VK_SUCCESS) {
+                vkGetPhysicalDeviceMemoryProperties(physical, &memory);
+                std::fprintf(stderr, "[compute] Vulkan device: adopted the renderer's device "
+                                     "(shared, queue family %u)\n", queue_family);
+                return true;
+            }
+            // Anything failing here must fall through to a private device rather than killing the
+            // whole compute backend for the run: adoption is an optimization, never a requirement.
+            // Release only what we created (nothing yet: the pipeline cache is what failed) and drop
+            // the borrowed handles so the private path below starts from a clean context.
+            instance = VK_NULL_HANDLE; physical = VK_NULL_HANDLE;
+            device = VK_NULL_HANDLE; queue = VK_NULL_HANDLE;
+            queue_family = UINT32_MAX; borrowed = false; image_support = false;
+            pipeline_cache = VK_NULL_HANDLE;
+        }
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
         app.apiVersion = VK_API_VERSION_1_1;
         VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};

@@ -430,6 +430,30 @@ struct LiveTargetSnapshot {
 using LiveTargetReaderFn = std::function<bool(uint64_t gpu_addr, LiveTargetSnapshot& snapshot)>;
 void set_live_target_reader(LiveTargetReaderFn fn);
 bool read_live_render_target(uint64_t gpu_addr, LiveTargetSnapshot& snapshot);
+// Shared Vulkan device (#1091 phase 1). live_compute historically created its own VkInstance/VkDevice,
+// so a renderer-owned image could never be bound to a dispatch and had to round-trip through host
+// memory. The live renderer publishes its already-created device here; the compute backend ADOPTS it
+// when it is present and feature-adequate, and otherwise creates its own exactly as before (compute
+// must keep working with no renderer at all -- see tests/test_game_compute.cpp).
+//
+// Handles are opaque so this layer keeps no Vulkan dependency; both sides cast to the real types.
+// An adopted context is BORROWED: the consumer owns none of these objects and must not destroy them.
+// Graphics and compute execute strictly sequentially on one thread (execute_ordered_gpustate), so a
+// shared queue needs no cross-thread synchronization.
+struct SharedVulkanContext {
+    void* instance = nullptr;
+    void* physical = nullptr;
+    void* device = nullptr;
+    void* queue = nullptr;
+    uint32_t queue_family = UINT32_MAX;
+    // Features the compute backend requires; when false it must decline the shared device.
+    bool storage_image_read_without_format = false;
+    bool storage_image_write_without_format = false;
+    bool valid() const { return instance && physical && device && queue && queue_family != UINT32_MAX; }
+};
+void set_shared_vulkan_context(const SharedVulkanContext& context);
+SharedVulkanContext shared_vulkan_context();
+
 // Ordered memory producers need the same authoritative storage version as live compute. A source
 // may begin inside a target, so the renderer validates the complete requested byte range instead of
 // exposing an unbounded pointer into its cache.

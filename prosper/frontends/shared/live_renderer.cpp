@@ -225,6 +225,12 @@ struct PersistentDecodedTexture {
 }
 
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
+    // Create (and thereby PUBLISH) the renderer's Vulkan device up front so the compute backend can
+    // adopt it (#1091). Compute initializes lazily on its first dispatch, and titles routinely
+    // dispatch before their first draw -- without this the compute device would be created first and
+    // the two would never share. Only reached when the live renderer is registered, so headless
+    // compute-only use (tests/test_game_compute.cpp) still creates its own device.
+    (void)prosper::test::render_vk_ctx();
     static RttCache g_rtt;   // render-to-texture cache (#167)
     // Match boot_trace's progression-diagnostic contract: callers may register the graphics
     // renderer while deliberately leaving compute unregistered. This keeps semantic dispatches
