@@ -432,6 +432,10 @@ uint32_t   g_a2_users = 0;
 struct A2PortState {
     bool     used = false;
     uint64_t pcm_ptr = 0;      // guest address of this port's current PCM grain (attr id 0)
+    uint32_t type = 0;         // portParam +0x00: 0 = MAIN (speaker output); others aux (personal/aux/...)
+    uint32_t block_floats = 0; // portParam +0x04: interleaved floats per grain = channels * grain.
+                               // Read EXACTLY this many; the channel count is block_floats/grain (no
+                               // hardcoded channel assumption -> no over-read on non-8ch ports).
 };
 A2PortState g_a2_port_state[16];
 constexpr int kA2SinkPort = 16;     // host sink port id for the AudioOut2 device (sink accepts 1..16;
@@ -677,13 +681,23 @@ HLE(audio2_user_destroy) { A2LOG("sceAudioOut2UserDestroy"); return 0; }
 HLE(audio2_port_create) {
     A2LOG("sceAudioOut2PortCreate");
     if (audio2log()) a2_dump("portParam", a1, 0x40);
+    // portParam layout (live-decoded, both Evergate and Blasphemous 2): +0x00 u32 port type
+    // (0 = MAIN speaker output), +0x04 u32 interleaved floats per grain block (= channels * grain;
+    // MAIN is 0x800 = 256*8 -> the 8-channel 7.1 bed Evergate uses), +0x08 u32 sample rate (48000).
+    // Reading block_floats here lets ContextPush read each port at its REAL width and derive the
+    // channel count as block_floats/grain, instead of assuming every port is an 8-channel main bed.
+    uint32_t ptype = 0, block_floats = 0;
+    if (a1) {
+        uint32_t hdr[2] = {0, 0};
+        if (audio_read_bytes(a1, hdr, sizeof hdr)) { ptype = hdr[0]; block_floats = hdr[1]; }
+    }
     std::lock_guard<std::mutex> lk(g_a2_mx);
     // First-free-slot allocation (not a monotonic counter): slots are recycled on PortDestroy, so a
     // title that churns ports over a long session can't exhaust the table or alias slot state.
     for (uint32_t id = 1; id <= 16; ++id) {
         if (g_a2_port_state[id - 1].used) continue;
         if (!a2_store_u64(a2, kA2PortTag | (uint64_t)id)) return kA2ErrInvalid;
-        g_a2_port_state[id - 1] = A2PortState{true, 0};
+        g_a2_port_state[id - 1] = A2PortState{true, 0, ptype, block_floats};
         return 0;
     }
     return kA2ErrInvalid;
@@ -727,7 +741,17 @@ HLE(audio2_port_set_attr) {
         if (at.id == 0 && at.vsize == 8) {
             uint64_t pcm = 0;
             if (audio_read_bytes(at.vptr, &pcm, 8)) g_a2_port_state[pidx - 1].pcm_ptr = pcm;
-        } else if (audio2log()) {
+            if (getenv("PROSPER_AUDIO2_PROBE")) {
+                static uint64_t seen_store[16] = {0};
+                if (seen_store[(pidx - 1) & 15] != pcm) {
+                    seen_store[(pidx - 1) & 15] = pcm;
+                    fprintf(stderr, "[audio2-attr] port%llu id=0x%llx vptr=0x%llx vsize=%llu -> pcm=0x%llx\n",
+                            (unsigned long long)pidx, (unsigned long long)at.id,
+                            (unsigned long long)at.vptr, (unsigned long long)at.vsize,
+                            (unsigned long long)pcm);
+                }
+            }
+        } else if (audio2log() || getenv("PROSPER_AUDIO2_PROBE")) {
             static std::set<uint64_t> seen;
             if (seen.insert(at.id).second)
                 fprintf(stderr, "[audio2] PortSetAttributes: unhandled attr id=%llu size=%llu\n",
@@ -747,15 +771,16 @@ HLE(audio2_ctx_push) {
     A2LOG("sceAudioOut2ContextPush");
     uint64_t idx = a0 & 0xff;
     uint32_t grain = 256;
-    // Mix every port's current grain into a stereo bed. The port's grain buffer is a 7.1 BED:
-    // 8 interleaved float32 channels per frame (offline stride analysis of a live capture:
-    // adjacent-sample correlation 0.976 and a musical ~433 zero-crossings/s at stride 8, ~0
-    // correlation at strides 2/4 — so frames are 8 floats wide). We forward the front L/R pair.
-    // SURROUND-TODO: channels 2..7 (C/LFE/surrounds) are dropped until the host sink grows a
+    // Mix each active port's current grain into a stereo bed. A port's grain buffer holds
+    // `block_floats` interleaved float32 samples = (channels * grain), with the channel count taken
+    // from the port's own param (portParam +0x04) — NOT a fixed assumption. The 7.1 MAIN port
+    // (Evergate + Blasphemous 2) is 8 channels (block 0x800 = 256*8); a stereo/mono aux port is 2/1.
+    // Reading each port at its real width is what prevents an over-read from splattering adjacent
+    // heap (NaN/garbage) into the mix. We forward the front L/R pair (mono duplicates ch0).
+    // SURROUND-TODO: channels 2..N (C/LFE/surrounds) are dropped until the host sink grows a
     // surround output; fold them in with proper downmix gains when it does.
-    constexpr uint32_t kA2BedChannels = 8;
-    // Off the guest thread's stack: guest-created pump threads can run small stacks.
     static thread_local std::vector<float> bed(4096 * 2);
+    static thread_local std::vector<float> tmp;
     bool have_pcm = false;
     {
         std::lock_guard<std::mutex> lk(g_a2_mx);
@@ -763,15 +788,56 @@ HLE(audio2_ctx_push) {
                        ? &g_a2_ctx[idx - 1] : &g_a2_ctx[0];
         grain = (c->grain >= 64 && c->grain <= 4096) ? c->grain : 256;
         std::memset(bed.data(), 0, sizeof(float) * grain * 2);
-        std::vector<float> tmp((size_t)grain * kA2BedChannels);
+        const bool probe = getenv("PROSPER_AUDIO2_PROBE") != nullptr;
+        int pidx_probe = 0;
         for (const auto& ps : g_a2_port_state) {
+            const int this_pidx = pidx_probe++;
             if (!ps.used || !ps.pcm_ptr) continue;
-            const size_t want = sizeof(float) * grain * kA2BedChannels;
-            const size_t got = audio_read_bytes_partial(ps.pcm_ptr, tmp.data(), want);
-            const size_t frames_got = got / (sizeof(float) * kA2BedChannels);
+            // Only the MAIN port (type 0) drives the host speaker output. Other types route to
+            // separate hardware devices (type 3/4 personal/pad-speaker, chat, etc.); summing them
+            // into the main TV mix would leak that audio. They stay unmixed until per-type device
+            // routing exists. CONFIDENCE: MED (Evergate + Blasphemous 2: MAIN is type 0; aux types
+            // are silent here, so this changes nothing audible today but prevents a latent leak).
+            if (ps.type != 0) {
+                if (probe) { static uint64_t n[16] = {0};
+                    if ((n[this_pidx & 15]++ % 256) == 0)
+                        fprintf(stderr, "[audio2-probe] port%d type=%u NOT mixed (non-MAIN)\n",
+                                this_pidx + 1, ps.type); }
+                continue;
+            }
+            // Channel count from this port's own block size (block_floats = channels*grain), so we
+            // never assume 8. Read EXACTLY channels*grain floats (<= block_floats, no over-read).
+            uint32_t channels;
+            if (ps.block_floats == 0) {
+                channels = 8;                       // param was unreadable: legacy 7.1 MAIN assumption
+            } else {
+                channels = ps.block_floats / grain; // block is channels*grain for a well-formed param
+                if (channels < 1 || channels > 8) {
+                    if (probe) fprintf(stderr, "[audio2-probe] port%d skipped: block=%u grain=%u "
+                                       "-> channels=%u (implausible)\n",
+                                       this_pidx + 1, ps.block_floats, grain, channels);
+                    continue;                        // fail-visible: don't over-read or mis-stride
+                }
+            }
+            const uint32_t read_floats = channels * grain;   // <= block_floats: capped by construction
+            if (tmp.size() < read_floats) tmp.resize(read_floats);
+            const size_t got = audio_read_bytes_partial(ps.pcm_ptr, tmp.data(), sizeof(float) * read_floats);
+            const size_t frames_got = got / (sizeof(float) * channels);
+            if (probe) {
+                static uint64_t call_ct[16] = {0};
+                const size_t nf = frames_got * channels;
+                size_t nan_ct = 0; float amax = 0.0f;
+                for (size_t k = 0; k < nf; k++) { float v = tmp[k];
+                    if (v != v) nan_ct++; else { float a = v < 0 ? -v : v; if (a > amax) amax = a; } }
+                if ((call_ct[this_pidx & 15]++ % 64) == 0)
+                    fprintf(stderr, "[audio2-probe] port%d type=%u ch=%u pcm=0x%llx frames=%zu "
+                            "nan=%zu/%zu |max|=%.4g\n", this_pidx + 1, ps.type, channels,
+                            (unsigned long long)ps.pcm_ptr, frames_got, nan_ct, nf, amax);
+            }
+            const uint32_t r = channels >= 2 ? 1u : 0u;     // mono duplicates ch0 to both outputs
             for (size_t fno = 0; fno < frames_got; fno++) {
-                bed[fno * 2 + 0] += tmp[fno * kA2BedChannels + 0];   // front left
-                bed[fno * 2 + 1] += tmp[fno * kA2BedChannels + 1];   // front right
+                bed[fno * 2 + 0] += tmp[fno * channels + 0];   // front left
+                bed[fno * 2 + 1] += tmp[fno * channels + r];   // front right
             }
             if (frames_got) have_pcm = true;
         }
@@ -789,8 +855,11 @@ HLE(audio2_ctx_push) {
         info.grain = (int)grain;
         if (!opened.exchange(true)) open_ok.store(sink->open(kA2SinkPort, info));
         if (open_ok.load()) {
-            for (uint32_t i = 0; i < grain * 2; i++)
-                bed[i] = bed[i] > 1.0f ? 1.0f : (bed[i] < -1.0f ? -1.0f : bed[i]);
+            for (uint32_t i = 0; i < grain * 2; i++) {
+                float v = bed[i];
+                if (v != v) v = 0.0f;                        // NaN -> 0; Inf is caught by the clamp below
+                bed[i] = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
+            }
             audio_observe_output(kA2SinkPort, bed.data(), (int)grain, info);
             sink->output(kA2SinkPort, bed.data(), (int)grain);
             return 0;
