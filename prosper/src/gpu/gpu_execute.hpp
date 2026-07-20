@@ -430,6 +430,35 @@ struct LiveTargetSnapshot {
 using LiveTargetReaderFn = std::function<bool(uint64_t gpu_addr, LiveTargetSnapshot& snapshot)>;
 void set_live_target_reader(LiveTargetReaderFn fn);
 bool read_live_render_target(uint64_t gpu_addr, LiveTargetSnapshot& snapshot);
+
+// Direct GPU import of a renderer-owned color target (#1095, phase 2 of #1091). Once graphics and
+// compute share one VkDevice, a dispatch that SAMPLES a renderer-owned surface can read the
+// renderer's persistent image in place instead of forcing a GPU->CPU readback and an immediate
+// re-upload of the very same pixels to the very same device.
+//
+// AUTHORITY RULE: the import is offered only while the persistent Vulkan image is the authoritative
+// copy of the surface -- exactly the case where read_live_render_target() would have had to
+// materialize it. Whenever a CPU RTT snapshot already exists it may be the NEWER truth (a guest GPU
+// write discards the CPU copy and invalidates the GPU target independently, #780), so the caller
+// must fall back to the snapshot path rather than assume the two agree.
+//
+// The image is BORROWED: the caller must not destroy it, must restore `layout` before returning, and
+// must call release_live_render_target_image() to drop the pin that keeps the renderer's cache from
+// evicting the entry mid-dispatch. Handles stay opaque so this layer keeps no Vulkan dependency.
+struct LiveTargetImageImport {
+    uint32_t width = 0, height = 0;
+    LiveTargetPixelFormat format = LiveTargetPixelFormat::Rgba8Unorm;
+    void* image = nullptr;    // VkImage owned by the live renderer
+    void* device = nullptr;   // VkDevice it belongs to; the caller must be running on that device
+    uint32_t layout = 0;      // VkImageLayout the renderer left it in -- restore it after the dispatch
+    bool valid() const { return image && device && width && height; }
+};
+using LiveTargetImageImportFn = std::function<bool(uint64_t gpu_addr, LiveTargetImageImport& import)>;
+using LiveTargetImageReleaseFn = std::function<void(uint64_t gpu_addr)>;
+void set_live_target_image_importer(LiveTargetImageImportFn import_fn,
+                                    LiveTargetImageReleaseFn release_fn);
+bool import_live_render_target_image(uint64_t gpu_addr, LiveTargetImageImport& import);
+void release_live_render_target_image(uint64_t gpu_addr);
 // Shared Vulkan device (#1091 phase 1). live_compute historically created its own VkInstance/VkDevice,
 // so a renderer-owned image could never be bound to a dispatch and had to round-trip through host
 // memory. The live renderer publishes its already-created device here; the compute backend ADOPTS it

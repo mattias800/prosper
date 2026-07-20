@@ -4057,6 +4057,30 @@ bool is_live_render_target(uint64_t gpu_addr) {
 }
 static LiveTargetReaderFn g_live_target_reader;
 void set_live_target_reader(LiveTargetReaderFn fn) { g_live_target_reader = std::move(fn); }
+
+static LiveTargetImageImportFn g_live_target_image_import;
+static LiveTargetImageReleaseFn g_live_target_image_release;
+void set_live_target_image_importer(LiveTargetImageImportFn import_fn,
+                                    LiveTargetImageReleaseFn release_fn) {
+    g_live_target_image_import = std::move(import_fn);
+    g_live_target_image_release = std::move(release_fn);
+}
+bool import_live_render_target_image(uint64_t gpu_addr, LiveTargetImageImport& import) {
+    import = LiveTargetImageImport{};
+    if (!g_live_target_image_import) return false;
+    if (!g_live_target_image_import(gpu_addr, import)) { import = LiveTargetImageImport{}; return false; }
+    if (!import.valid()) {
+        // The importer pinned the entry before returning true; drop that pin rather than leaking a
+        // permanently un-evictable cache entry if a future importer breaks the contract.
+        release_live_render_target_image(gpu_addr);
+        import = LiveTargetImageImport{};
+        return false;
+    }
+    return true;
+}
+void release_live_render_target_image(uint64_t gpu_addr) {
+    if (g_live_target_image_release) g_live_target_image_release(gpu_addr);
+}
 static SharedVulkanContext g_shared_vulkan;
 void set_shared_vulkan_context(const SharedVulkanContext& context) { g_shared_vulkan = context; }
 SharedVulkanContext shared_vulkan_context() { return g_shared_vulkan; }

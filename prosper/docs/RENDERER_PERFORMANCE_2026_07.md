@@ -809,6 +809,108 @@ GC suspension continue. The same binary and route can pass on a retry. This is t
 [#712](https://github.com/mattias800/ps5ys/issues/712); do not misclassify it as a renderer-cache
 regression without checking the submit count and suspend logs.
 
+## Renderer-owned RTT sampling: direct image binding (#1091 phase 1 / #1095 phase 2)
+
+The renderer and the compute backend historically created SEPARATE Vulkan devices, so a surface the
+renderer owned could not be handed to a dispatch at all. Sampling one cost a full GPU->CPU readback of
+the persistent color target, a per-texel conversion, a fresh `VkImage`, and a re-upload of those same
+pixels to the GPU. `live_renderer.cpp` recorded the constraint directly: "Compute cannot import that
+color attachment directly."
+
+Phase 1 (#1091, merged as #1092) removed the premise: the renderer publishes its `VkDevice`, physical
+device, queue and queue family through `SharedVulkanContext`, and compute ADOPTS that context when it
+is present and feature-adequate. An adopted context is *borrowed* -- the consumer destroys none of it.
+Compute still creates its own device when no renderer is registered, so headless compute-only use is
+unaffected. Phase 1 is an enabler, not an optimization: a 3-rep A/B measured no throughput change
+(7.74 ms / 45.1 fps shared vs 7.85 ms / 46.0 fps separate), which is the intended result.
+
+Phase 2 (#1095) takes the win. **Measure the binding mix before designing the import.** Instrumentation
+showed renderer-owned compute bindings run about **1000 sampled to 1 storage** -- essentially all
+read-only. That deleted the two hardest requirements from the original sketch: no
+`VK_IMAGE_USAGE_STORAGE_BIT` is needed (`SAMPLED_BIT` is already set on persistent targets), and there
+is no guest writeback contract to preserve, because nothing is written. Every renderer-owned sampled
+binding in the measured route had a single shape: `Unorm8` x4 against an rgba8 target.
+
+Two rules keep the fast path honest, and both are load-bearing:
+
+- **Authority.** The import is offered only while the persistent Vulkan image is the authoritative copy
+  -- exactly when the existing reader would have had to materialize it (`!surface.rgba` or a size
+  mismatch, and `surface.gpu_valid`). The CPU RTT copy and the GPU image are kept coherent by
+  *invalidation*, not by one always being fresher, so whenever a CPU snapshot exists it may be the newer
+  truth (#780) and the snapshot path must still be used. Importing unconditionally would silently
+  resurrect stale pixels.
+- **Exactness.** Only a sampled, non-aliased, single-layer `Unorm8` x4 view whose extent, format and
+  device all match falls through. That shape's host path is a plain `memcpy` into a
+  `VK_FORMAT_R8G8B8A8_UNORM` image, which is precisely what the direct bind produces, so the fast path
+  is byte-identical rather than merely close. `rgba16f` targets deliberately keep the host path: the
+  format selector has no RGBA16F option and converts them down to UNORM8.
+
+The borrowed image gets its own view (preserving T# `DST_SEL` swizzle routing), is barriered into the
+`GENERAL` layout the descriptors declare, and is restored to the layout its owner left it in so the
+renderer's own tracking stays true. The cache entry is pinned per successful import and released per
+import, including on every failure path. `PROSPER_NO_DIRECT_RTT_BIND=1` forces the host path for A/B.
+
+Functional result, Blasphemous 2 title route: **731 direct binds, zero fallbacks to the host path,
+zero validation errors** -- every renderer-owned sampled binding in that route took the fast path.
+
+Throughput, measured on an **idle** machine through `tools/perf/ab_compute.sh`, **4 reps with the arm
+order alternating by rep parity**, 150 s each on `load-save-first-station.pad` (a real gameplay scene,
+not a menu):
+
+| | compute, gameplay tail | gameplay frame rate |
+|---|---|---|
+| host path (`PROSPER_NO_DIRECT_RTT_BIND=1`) | 7.75 ms | 13.3 fps |
+| direct bind | 5.97 ms | 16.6 fps |
+| | **-23.0%** | **+24.3%** |
+
+Split by order, to show the warm-up confound is not producing the result: OFF-first gives -23.7% /
++22.3%, ON-first gives -22.3% / +26.6%. The compute memory pool drops **80.1 -> 63.7 MiB** (9 -> 7
+cached allocations) as the per-dispatch staging buffer and the duplicate image disappear.
+
+**Always alternate the arm order.** An earlier 3-rep sweep ran OFF before ON every time, handing the
+second arm every warm-up benefit there is -- on-disk pipeline caches, GPU clock ramp, page cache -- and
+that arm was the one being advocated. Repetition does not detect a systematic bias; only alternating or
+randomising the order does. Here the bias turned out to be small, but it was not knowable in advance.
+
+**The compute delta reproduces; its frame-rate translation does not.** Across two independent sessions
+the compute saving was stable (-25.0% then -23.0%), while the measured frame-rate benefit ranged from
+**+7.7% to +24.3%**, with the host-path arm steady near 13 fps and the direct-bind arm varying between
+14.0 and 17.5 fps. The fast path is conditional by design -- it is taken only while the persistent
+image is the authoritative copy -- so how often it applies can legitimately vary between runs, and
+absolute frame rates from different sessions are not comparable. Quote within-session deltas, and
+treat any single frame-rate figure here as indicative rather than exact.
+
+### Distance to a playable frame rate
+
+| | current | 30 fps | 60 fps |
+|---|---|---|---|
+| frame time | **71.2 ms (14.0 fps)** | 33.3 ms | 16.7 ms |
+| required | -- | **2.14x faster** (remove 37.9 ms) | **4.27x faster** (remove 54.5 ms) |
+
+Composition of the current frame, from the earlier session's 71.2 ms measurement: **compute 31.4 ms
+(44%)** (5.28 calls x 5.94 ms) and **everything else 39.8 ms (56%)**. A later session measured the same
+build at 60 ms (16.6 fps); see the variance note above, and re-derive the split rather than reusing
+these absolutes.
+
+**Compute alone is 94% of a 30 fps budget and 188% of a 60 fps budget.** Even if every non-compute cost
+went to zero, compute as it stands would still miss 60 fps by roughly 2x. So 60 fps is not reachable by
+optimising the non-compute remainder: the number of dispatches per frame, or their cost, has to fall by
+a large multiple. That is a different class of work from the per-dispatch savings in #1091/#1095 --
+which have now taken the per-call cost from 7.60 to 5.94 ms and removed the readback/re-upload
+entirely, leaving the remaining per-call cost to be attacked structurally.
+
+**Measure gameplay, not only menus.** An earlier pass measured the title-screen route and reported
+about 13%. Gameplay is a different draw and dispatch mix and showed a *larger* win, but the direction
+could equally have gone the other way -- a change that helps a UI-heavy scene can be neutral once real
+geometry and lighting dominate. Report the gameplay portion separately rather than averaging it with
+loading and menus: `ab_compute.sh` prints both the run-wide mean and the mean of the trailing
+`[render-window]` rolling averages for exactly this reason (#1082).
+
+**Record the conditions, not just the number.** The first title-route measurement was taken while an
+interactive session was using the same GPU, which makes it unattributable -- performance has no
+equivalent of ctest's exit code. `ab_compute.sh` therefore refuses to run when another `prosper-app`
+is alive and stamps the commit, route, reps and duration onto its output.
+
 ## Next renderer step
 
 Bring up a representative Unreal/3D workload and collect the same stage timings plus a corrected

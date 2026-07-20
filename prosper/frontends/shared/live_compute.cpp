@@ -365,6 +365,18 @@ struct BoundImage {
     size_t alias_of = SIZE_MAX;         // exact sampled/storage binding sharing an earlier image/view
     uint8_t* dcc_metadata = nullptr;    // DCC control bytes to mark uncompressed after writeback
     size_t dcc_metadata_bytes = 0;
+    // Borrowed renderer-owned image bound in place (#1095). `image` is then owned by the live
+    // renderer: it must not be destroyed here, its layout must be restored, and the pin taken at
+    // import time must be released.
+    bool imported = false;
+    uint64_t imported_addr = 0;
+    uint32_t imported_saved_layout = 0;      // VkImageLayout the renderer left the image in
+    // Several bindings can borrow the SAME renderer image without being folded together, because
+    // the import contract is looser than the alias contract (it ignores sampler state, T# size and
+    // img_dim 1-vs-5). Exactly one of them must emit the layout transitions: a second barrier pair
+    // would declare oldLayout=saved on an image already in GENERAL, which is an invalid transition a
+    // driver may treat as a discard. Ownership is derived at the barrier loops rather than stored
+    // here -- see imported_barrier_owner().
     uint64_t before_hash = 0, after_hash = 0; // trace-only storage-image writeback evidence
     uint64_t nonzero_channels = 0;
 };
@@ -696,10 +708,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (buffer.memory) ctx.release_memory(buffer.memory);
         }
         for (size_t i = 0; i < images.size(); i++) {
+            // A pin is taken per successful import, so it is released per import -- including for a
+            // binding that a later alias check folded into an earlier one (#1095).
+            if (images[i].imported) release_live_render_target_image(images[i].imported_addr);
             if (images[i].alias_of != SIZE_MAX) continue;
             if (images[i].sampler) vkDestroySampler(ctx.device, images[i].sampler, nullptr);
             if (images[i].view) vkDestroyImageView(ctx.device, images[i].view, nullptr);
-            if (images[i].image) vkDestroyImage(ctx.device, images[i].image, nullptr);
+            // An imported image belongs to the live renderer: release the pin, destroy nothing.
+            if (images[i].image && !images[i].imported)
+                vkDestroyImage(ctx.device, images[i].image, nullptr);
             if (images[i].memory) ctx.release_memory(images[i].memory);
             if (staging[i]) vkDestroyBuffer(ctx.device, staging[i], nullptr);
             if (staging_memory[i]) ctx.release_memory(staging_memory[i]);
@@ -851,7 +868,40 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // writeback publishes ordinary guest bytes and invalidates the renderer-owned copy.
             LiveTargetSnapshot live_target;
             bool renderer_owned = !r->in_mip_tail && is_live_render_target(r->gpu_addr);
-            if (renderer_owned) {
+            // Bind the renderer's own image when it is the authoritative copy and this binding
+            // matches it EXACTLY (#1095, phase 2 of #1091). Restricted to a sampled Unorm8x4 view of
+            // an rgba8 target because that is the one shape whose host path is a plain memcpy into a
+            // VK_FORMAT_R8G8B8A8_UNORM image -- the direct bind is then byte-identical, and it skips
+            // a full readback plus a re-upload of those same pixels to the same device. Every other
+            // shape (notably rgba16f, which the host path converts down to UNORM8) keeps that path.
+            if (renderer_owned && !bi.storage && !dim_1d && !dim_3d && !dim_2d_array &&
+                r->depth == 1 && !r->depth_compare && r->format == DataFormat::Unorm8 &&
+                (r->num_components ? r->num_components : 1) == 4) {
+                LiveTargetImageImport import;
+                if (import_live_render_target_image(r->gpu_addr, import)) {
+                    if (import.format == LiveTargetPixelFormat::Rgba8Unorm &&
+                        import.width == r->width && import.height == r->height &&
+                        import.device == static_cast<void*>(ctx.device)) {
+                        bi.imported = true;
+                        bi.imported_addr = r->gpu_addr;
+                        bi.imported_saved_layout = import.layout;
+                        bi.image = static_cast<VkImage>(import.image);
+                        live_target.width = import.width;
+                        live_target.height = import.height;
+                        live_target.format = import.format;
+                        if (trace)
+                            std::fprintf(stderr,
+                                         "[compute]   bound renderer RTT in place binding=%u "
+                                         "addr=0x%llx extent=%ux%u format=rgba8\n",
+                                         bi.binding, (unsigned long long)r->gpu_addr,
+                                         r->width, r->height);
+                    } else {
+                        // Not our exact contract (a different device or a stale aliased view).
+                        release_live_render_target_image(r->gpu_addr);
+                    }
+                }
+            }
+            if (renderer_owned && !bi.imported) {
                 if (dim_3d || r->depth != 1 ||
                     !read_live_render_target(r->gpu_addr, live_target) || !live_target.pixels) {
                     skip_image(r, "renderer-owned RTT has no readable snapshot"); break;
@@ -992,8 +1042,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             staging_bytes[i] = sbytes;
 
             // Fill the upload staging bytes.
-            std::vector<uint8_t> upload((size_t)sbytes, 0);
-            if (bi.storage) {
+            std::vector<uint8_t> upload(bi.imported ? size_t{0} : (size_t)sbytes, 0);
+            if (bi.imported) {
+                // The renderer's image is the source: there is nothing to convert or stage.
+                bi.guest_bytes = 0;
+            } else if (bi.storage) {
                 if (r->tile_mode && !tile_mode_is_tiled(r->tile_mode)) {
                     skip_image(r, "storage tile mode has no supported address pattern"); break;
                 }
@@ -1322,26 +1375,29 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
             }
 
-            // Staging buffer (host-visible) holding the upload bytes; reused for storage readback.
-            VkBufferCreateInfo sci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-            sci.size = sbytes;
-            sci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-            if (!vk_ok(vkCreateBuffer(ctx.device, &sci, nullptr, &staging[i]),
-                       "image-staging-buffer")) { images_ready = false; break; }
-            VkMemoryRequirements sreq{};
-            vkGetBufferMemoryRequirements(ctx.device, staging[i], &sreq);
-            const uint32_t staging_memory_type = ctx.host_memory_type(sreq.memoryTypeBits);
-            staging_memory[i] = ctx.allocate_memory(sreq.size, staging_memory_type);
-            if (!vk_handle_ok(staging_memory[i], "image-staging-memory") ||
-                !vk_ok(vkBindBufferMemory(ctx.device, staging[i], staging_memory[i], 0),
-                       "image-staging-bind")) {
-                images_ready = false; break; }
-            { void* mapped = nullptr;
-              if (!vk_ok(vkMapMemory(ctx.device, staging_memory[i], 0, sbytes, 0, &mapped),
-                         "image-staging-map")) {
-                  images_ready = false; break; }
-              std::memcpy(mapped, upload.data(), (size_t)sbytes);
-              vkUnmapMemory(ctx.device, staging_memory[i]); }
+            // Staging buffer (host-visible) holding the upload bytes; reused for storage
+            // readback. An imported renderer image supplies its own pixels, so it needs none.
+            if (!bi.imported) {
+                VkBufferCreateInfo sci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+                sci.size = sbytes;
+                sci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                if (!vk_ok(vkCreateBuffer(ctx.device, &sci, nullptr, &staging[i]),
+                           "image-staging-buffer")) { images_ready = false; break; }
+                VkMemoryRequirements sreq{};
+                vkGetBufferMemoryRequirements(ctx.device, staging[i], &sreq);
+                const uint32_t staging_memory_type = ctx.host_memory_type(sreq.memoryTypeBits);
+                staging_memory[i] = ctx.allocate_memory(sreq.size, staging_memory_type);
+                if (!vk_handle_ok(staging_memory[i], "image-staging-memory") ||
+                    !vk_ok(vkBindBufferMemory(ctx.device, staging[i], staging_memory[i], 0),
+                           "image-staging-bind")) {
+                    images_ready = false; break; }
+                { void* mapped = nullptr;
+                  if (!vk_ok(vkMapMemory(ctx.device, staging_memory[i], 0, sbytes, 0, &mapped),
+                             "image-staging-map")) {
+                      images_ready = false; break; }
+                  std::memcpy(mapped, upload.data(), (size_t)sbytes);
+                  vkUnmapMemory(ctx.device, staging_memory[i]); }
+            }
 
             // Device-local image.
             VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -1375,15 +1431,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                     : VK_IMAGE_USAGE_SAMPLED_BIT) |
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT;
             ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            if (!vk_ok(vkCreateImage(ctx.device, &ici, nullptr, &bi.image),
-                       "image-create")) { images_ready = false; break; }
-            VkMemoryRequirements ireq{};
-            vkGetImageMemoryRequirements(ctx.device, bi.image, &ireq);
-            const uint32_t image_memory_type = device_memory_type(ireq.memoryTypeBits);
-            bi.memory = ctx.allocate_memory(ireq.size, image_memory_type);
-            if (!vk_handle_ok(bi.memory, "image-memory") ||
-                !vk_ok(vkBindImageMemory(ctx.device, bi.image, bi.memory, 0), "image-bind")) {
-                images_ready = false; break; }
+            // An imported binding already holds the renderer's image; only the view/sampler below
+            // are ours to create. `ici` is still filled above so the view matches its format/layers.
+            if (!bi.imported) {
+                if (!vk_ok(vkCreateImage(ctx.device, &ici, nullptr, &bi.image),
+                           "image-create")) { images_ready = false; break; }
+                VkMemoryRequirements ireq{};
+                vkGetImageMemoryRequirements(ctx.device, bi.image, &ireq);
+                const uint32_t image_memory_type = device_memory_type(ireq.memoryTypeBits);
+                bi.memory = ctx.allocate_memory(ireq.size, image_memory_type);
+                if (!vk_handle_ok(bi.memory, "image-memory") ||
+                    !vk_ok(vkBindImageMemory(ctx.device, bi.image, bi.memory, 0), "image-bind")) {
+                    images_ready = false; break; }
+            }
             VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             vci.image = bi.image;
             vci.viewType = dim_1d ? VK_IMAGE_VIEW_TYPE_1D
@@ -1580,11 +1640,44 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         if (!vk_ok(vkBeginCommandBuffer(command, &begin), "command-begin")) break;
+        // Exactly one binding emits the layout transitions for each borrowed renderer image. The
+        // hazard is per-VkImage, so ownership is keyed on the handle, and it is derived over the
+        // bindings that actually REACH these loops (non-aliased ones) rather than decided at import
+        // time -- an owner chosen earlier could later be folded into an alias, leaving the image
+        // transitioned zero times while descriptors still declare GENERAL.
+        auto imported_barrier_owner = [&](size_t index) {
+            const BoundImage& self = images[index];
+            for (size_t prior = 0; prior < index; prior++)
+                if (images[prior].imported && images[prior].alias_of == SIZE_MAX &&
+                    images[prior].image == self.image)
+                    return false;
+            return true;
+        };
         // Upload every image: UNDEFINED -> TRANSFER_DST, copy the staged texels in, -> GENERAL.
         for (size_t i = 0; i < images.size(); i++) {
             const BoundImage& bi = images[i];
             if (bi.alias_of != SIZE_MAX) continue;
             const ShaderResource* r = bi.resource;
+            if (bi.imported) {
+                if (!imported_barrier_owner(i)) continue;   // another binding transitions this image
+                // Borrowed renderer image (#1095): nothing to upload. Make the renderer's writes
+                // visible to this dispatch and move it into the GENERAL layout the descriptors
+                // declare. The matching barrier after the dispatch puts it back.
+                VkImageMemoryBarrier to_general{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                to_general.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                           VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                to_general.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                to_general.oldLayout = static_cast<VkImageLayout>(bi.imported_saved_layout);
+                to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                to_general.srcQueueFamilyIndex = to_general.dstQueueFamilyIndex =
+                    VK_QUEUE_FAMILY_IGNORED;
+                to_general.image = bi.image;
+                to_general.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+                                     1, &to_general);
+                continue;
+            }
             VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             to_dst.srcAccessMask = 0;
             to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1621,6 +1714,27 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                static_cast<uint32_t>(item.user_sgprs.size() * sizeof(uint32_t)),
                                item.user_sgprs.data());
         vkCmdDispatch(command, item.launch.groups_x, item.launch.groups_y, item.launch.groups_z);
+        // Hand every borrowed renderer image back in the layout its owner left it in (#1095), so the
+        // renderer's own layout tracking stays true whether or not a dispatch consumed the target.
+        for (size_t i = 0; i < images.size(); i++) {
+            const BoundImage& bi = images[i];
+            if (!bi.imported || bi.alias_of != SIZE_MAX || !imported_barrier_owner(i)) continue;
+            VkImageMemoryBarrier restore{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            restore.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            // The renderer's next use of a persistent target is frequently vkCmdCopyImageToBuffer
+            // or a scanout blit, so make the transition visible to transfer access as well.
+            restore.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+                                    VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            restore.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            restore.newLayout = static_cast<VkImageLayout>(bi.imported_saved_layout);
+            restore.srcQueueFamilyIndex = restore.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            restore.image = bi.image;
+            restore.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
+                                 1, &restore);
+        }
         // Storage images: copy the written texels back into the staging buffer for guest writeback.
         for (size_t i = 0; i < images.size(); i++) {
             const BoundImage& bi = images[i];
@@ -1652,7 +1766,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (!vk_ok(vkQueueSubmit(ctx.queue, 1, &submit, fence), "queue-submit")) break;
         if (trace) std::fprintf(stderr, "[compute]   waiting for dispatch\n");
         if (!vk_ok(vkWaitForFences(ctx.device, 1, &fence, VK_TRUE,
-                                   30ull * 1000 * 1000 * 1000), "queue-wait")) break;
+                                   30ull * 1000 * 1000 * 1000), "queue-wait")) {
+            // cleanup() destroys the command buffer and releases the borrowed image's pin. With a
+            // renderer-owned image bound, in-flight work still references it and its layout
+            // transitions, so drain the queue first rather than freeing it underneath the GPU.
+            // readback_persistent_color_target uses the same drain but PROMOTES a successful drain
+            // to success; this item stays failed either way, which is the conservative choice for a
+            // dispatch whose results we can no longer trust.
+            if (vkQueueWaitIdle(ctx.queue) != VK_SUCCESS && trace)
+                std::fprintf(stderr, "[compute]   queue drain after fence timeout failed\n");
+            break;
+        }
         if (trace) std::fprintf(stderr, "[compute]   dispatch complete\n");
         phase_dispatch = ComputeClock::now();
 

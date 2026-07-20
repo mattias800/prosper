@@ -172,7 +172,16 @@ while True:
             self.assertEqual("@" + route, env["PROSPER_PAD_SCRIPT"])
             self.assertEqual("1", env["PROSPER_PAD_SCRIPT_LOG"])
             self.assertEqual("yes", env["EXTRA"])
+            # BOTH save roots must be redirected into the run's temp dir, or a "fresh" guard
+            # inherits the developer's real saves: PROSPER_SAVEDATA_DIR covers SaveDataMemory (the
+            # Unity titles) and PROSPER_SAVE0 covers the /savedata0 file mount (Blasphemous 2).
+            # Leaving either on its shared /tmp default lets existing progress carry a blind route
+            # past the content it guards, so the guard can pass without rendering that scene (#1102).
             self.assertTrue(os.path.isdir(env["PROSPER_SAVEDATA_DIR"]))
+            self.assertTrue(os.path.isdir(env["PROSPER_SAVE0"]))
+            self.assertTrue(env["PROSPER_SAVEDATA_DIR"].startswith(tmp))
+            self.assertTrue(env["PROSPER_SAVE0"].startswith(tmp))
+            self.assertNotEqual(env["PROSPER_SAVEDATA_DIR"], env["PROSPER_SAVE0"])
 
     def test_structural_similarity_tolerates_small_changes_but_rejects_missing_layer(self):
         reference = (100,) * (16 * 9)

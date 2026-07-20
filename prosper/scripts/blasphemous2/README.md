@@ -3,6 +3,26 @@
 Reusable `PROSPER_PAD_SCRIPT` routes for Blasphemous 2 (`PPSA13579`). Run tools
 from `prosper/` so relative script paths resolve.
 
+## Loading a save (preferred for gameplay measurement)
+
+`load-save-first-station.pad` boots, leaves the title, opens "Pilgrimage", and loads an existing
+save at the first Prie Dieu, reaching real gameplay in under two minutes. Prefer it over
+`reach-first-gameplay.pad` for anything that measures or guards GAMEPLAY: the exploratory route
+needs roughly 380 s and every press is a guess against cinematic and tutorial pacing, so a build
+that loads at a different speed silently desynchronises the whole route and measures the wrong
+scene.
+
+It requires save data to exist. A reference copy of the first-station save is kept in
+`saves/savedata0-backup-2026-07-20/` (`slot1/segmentSlot` plus `slot0/segmentGlobal`); restore it
+into the `PROSPER_SAVE0` root (default `/tmp/prosper-savedata0`) before running if that root has
+been cleared. Note the save root is SHARED across titles, not per-game.
+
+The route presses Cross once per five seconds rather than at three fixed offsets. The wall time at
+which each screen becomes ready swings widely with the rendering policy -- the same route reaches
+the title within seconds under `prosper-app` but needs about a minute under full-resolution
+`screenshot` capture -- so it repeats instead of guessing. Surplus presses land in gameplay as
+jumps, which is harmless and keeps both arms of an A/B identical.
+
 ## Current Route
 
 `reach-first-gameplay.pad` is an exploratory Cross route anchored to the
