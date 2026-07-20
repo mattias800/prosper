@@ -61,6 +61,8 @@ int main() {
         (wave_ctx.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
         (wave_ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
         (wave_ctx.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT);
+    const bool supports_fragment_gds =
+        supports_fragment_wave64 && wave_ctx.fragment_stores_atomics;
     std::vector<uint8_t> wave_px = prosper::test::render_triangle_rgba(vert, wave_frag, W, H);
     const bool wave_rendered = wave_px.size() == static_cast<size_t>(W) * H * 4;
     const uint8_t* wave_center = wave_rendered
@@ -71,6 +73,109 @@ int main() {
           supports_fragment_wave64
               ? "device enforced wave64 and executed fragment MBCNT"
               : "device without fragment wave64 skipped MBCNT draw fail-visible");
+
+    // Astro's compaction sequence allocates popcount(EXEC) slots from a device-global GDS
+    // counter, then adds the MBCNT prefix. Export the allocated index parity so both returned
+    // values are observable, and independently verify that helper invocations consumed no slots.
+    const uint32_t gds_ps[] = {
+        0xD7660007u, 0x0001007Fu, // v_mbcnt_hi_u32_b32 v7, exec_hi, 0
+        0xBEFC0380u,              // s_mov_b32 m0, 0
+        0xD8FA0014u, 0x06000000u, // ds_append v6 offset:20 gds
+        0xD7650000u, 0x00020E7Eu, // v_mbcnt_lo_u32_b32 v0, exec_lo, v7
+        0x4A140106u,              // v_add_nc_u32 v10, v6, v0
+        0x36001481u,              // v_and_b32 v0, 1, v10
+        0x7E000D00u,              // v_cvt_f32_u32 v0, v0
+        0x7E020280u, 0x7E040280u, 0x7E0602F2u,
+        0xF800180Fu, 0x03020100u, 0xBF810000u,
+    };
+    std::vector<uint32_t> gds_frag = recompile_fragment(gds_ps, std::size(gds_ps));
+    CHECK(!gds_frag.empty(), "recompiled Astro fragment MBCNT + GDS append compaction sequence");
+    CHECK(fragment_spirv_uses_internal_gds(gds_frag),
+          "fragment GDS module advertises its backend-owned persistent descriptor");
+    CHECK(validate_spirv_descriptor_interface(
+              gds_frag, nullptr, 1, SpirvShaderStage::Fragment, false).ok(),
+          "descriptor validation accepts renderer-owned GDS without a guest table entry");
+    prosper::test::reset_internal_gds_for_test();
+    std::vector<uint8_t> gds_px = prosper::test::render_triangle_rgba(vert, gds_frag, W, H);
+    if (supports_fragment_gds && gds_px.size() == static_cast<size_t>(W) * H * 4) {
+        uint32_t covered = 0, red = 0;
+        for (size_t i = 0; i < gds_px.size(); i += 4) {
+            if (gds_px[i + 2] < 0x40) {
+                ++covered;
+                if (gds_px[i] > 0x80) ++red;
+            }
+        }
+        CHECK(prosper::test::read_internal_gds_for_test(20) == covered,
+              "GDS counter advances once per covered non-helper fragment across all waves");
+        printf("  GDS covered=%u red=%u counter=%u\n", covered, red,
+               prosper::test::read_internal_gds_for_test(20));
+        CHECK(red == covered / 2,
+              "export observes unique append-base + MBCNT-prefix allocation parity");
+    } else {
+        CHECK(!supports_fragment_gds && !gds_px.empty(),
+              "device without fragment wave64/GDS support skips compaction draw fail-visible");
+    }
+
+    // Implicit-LOD sampling forces whole-quad execution on RADV. Primitive-edge helper lanes must
+    // participate in subgroup arithmetic without becoming the atomic leader or consuming slots.
+    const uint32_t gds_wqm_ps[] = {
+        0x7E0002FFu, 0x3E800000u, 0x7E0202FFu, 0x3E800000u,
+        0xF0800F08u, 0x00820000u, // image_sample v[0:3], v[0:1], s[8:15], s[16:19]
+        0xD7660007u, 0x0001007Fu, 0xBEFC0380u,
+        0xD8FA0014u, 0x06000000u,
+        0xD7650000u, 0x00020E7Eu, 0x4A140106u, 0x36001481u, 0x7E000D00u,
+        // Keep sampled v3 live as export alpha so RADV cannot DCE the implicit-LOD sample/WQM.
+        0x7E020280u, 0x7E040280u,
+        0xF800180Fu, 0x03020100u, 0xBF810000u,
+    };
+    ShaderResourceTable gds_wqm_rt;
+    ShaderResource gds_wqm_texture{};
+    gds_wqm_texture.cls = ResourceClass::Texture;
+    gds_wqm_texture.binding = 4; gds_wqm_texture.img_dim = 1;
+    gds_wqm_texture.width = 2; gds_wqm_texture.height = 2;
+    gds_wqm_texture.sgpr_base = 8;
+    gds_wqm_rt.resources.push_back(gds_wqm_texture);
+    std::vector<uint32_t> gds_wqm_frag = recompile_fragment(
+        gds_wqm_ps, std::size(gds_wqm_ps), &gds_wqm_rt);
+    const uint8_t wqm_texels[16] = {
+        255,255,255,255, 255,255,255,255,
+        255,255,255,255, 255,255,255,255,
+    };
+    prosper::test::TexDesc gds_wqm_tex{4, 2, 2, wqm_texels};
+    prosper::test::reset_internal_gds_for_test();
+    std::vector<uint8_t> gds_wqm_px = prosper::test::render_triangle_rgba(
+        vert, gds_wqm_frag, W, H, nullptr, nullptr, nullptr, &gds_wqm_tex);
+    if (supports_fragment_gds && gds_wqm_px.size() == static_cast<size_t>(W) * H * 4) {
+        uint32_t covered = 0, red = 0, sampled_alpha = 0;
+        for (size_t i = 0; i < gds_wqm_px.size(); i += 4) {
+            if (gds_wqm_px[i + 2] < 0x40) {
+                ++covered;
+                if (gds_wqm_px[i] > 0x80) ++red;
+                if (gds_wqm_px[i + 3] > 0x80) ++sampled_alpha;
+            }
+        }
+        CHECK(prosper::test::read_internal_gds_for_test(20) == covered,
+              "WQM helper lanes neither lead the GDS atomic nor consume counter slots");
+        CHECK(red == covered / 2,
+              "WQM append-base + MBCNT-prefix allocation remains unique and contiguous");
+        CHECK(sampled_alpha == covered,
+              "WQM regression keeps implicit-LOD sampled alpha live through export");
+    } else {
+        CHECK(!supports_fragment_gds && !gds_wqm_px.empty(),
+              "unsupported device skips WQM GDS compaction draw fail-visible");
+    }
+
+    if (supports_fragment_gds) {
+        std::vector<uint32_t> gds_consume_ps(gds_ps, gds_ps + std::size(gds_ps));
+        gds_consume_ps[3] = 0xD8F60014u; // ds_consume v6 offset:20 gds
+        std::vector<uint32_t> gds_consume_frag = recompile_fragment(
+            gds_consume_ps.data(), gds_consume_ps.size());
+        std::vector<uint8_t> gds_consume_px = prosper::test::render_triangle_rgba(
+            vert, gds_consume_frag, W, H);
+        CHECK(gds_consume_px.size() == static_cast<size_t>(W) * H * 4 &&
+                  prosper::test::read_internal_gds_for_test(20) == 0,
+              "GDS consume subtracts one covered-fragment allocation across all waves");
+    }
 
     // Astro Bot's early foreground pass exports only R/G (EN=0x3). AMD's EXP contract preserves
     // disabled destination components; the live executor therefore intersects EN with the Vulkan

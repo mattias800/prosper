@@ -90,6 +90,9 @@ struct FrameResource {
     // within one synchronous call only when both this identity and the complete captured bytes match;
     // zero keeps synthetic/replay resources conservatively distinct.
     uint64_t buffer_identity = 0;
+    // Backend-owned PS5 GDS storage. Unlike guest/capture buffers this is one persistent,
+    // zero-initialized 64 KiB allocation shared across ordered render calls.
+    bool is_internal_gds = false;
     const uint8_t* tex_rgba = nullptr;   // non-null => a texture; then tw/th are its dimensions
     uint32_t tw = 0, th = 0, td = 1;
     uint32_t img_dim = 1;             // ShaderResource/MIMG dim (1=2D, 2=3D); depth-1 3D stays 3D
@@ -422,6 +425,7 @@ struct RenderVkCtx {
     VkDeviceSize storage_buffer_alignment = 1;
     bool aniso_enabled = false; float max_aniso_limit = 1.0f;
     bool logic_op_enabled = false; bool ok = false;
+    bool fragment_stores_atomics = false;
     bool subgroup_size_control = false;
     uint32_t min_subgroup_size = 0, max_subgroup_size = 0;
     VkShaderStageFlags required_subgroup_size_stages = 0;
@@ -475,6 +479,7 @@ inline const RenderVkCtx& render_vk_ctx() {
         feats.shaderStorageImageWriteWithoutFormat = supported.shaderStorageImageWriteWithoutFormat;
         feats.vertexPipelineStoresAndAtomics = supported.vertexPipelineStoresAndAtomics;
         feats.fragmentStoresAndAtomics = supported.fragmentStoresAndAtomics;
+        r.fragment_stores_atomics = supported.fragmentStoresAndAtomics;
         // robustImageAccess (VK_EXT_image_robustness): OpImageRead OOB must return zero (#131). Guarded.
         // Device extensions accumulate into a vector so the (optional) image-robustness and (macOS)
         // portability-subset extensions coexist.
@@ -1066,6 +1071,29 @@ inline void release_render_host_buffer(VkDevice device, RenderHostBuffer buffer)
     }
     for (RenderHostBuffer& old : evicted) destroy_render_host_buffer(device, old);
     if (buffer.buffer) destroy_render_host_buffer(device, buffer);
+}
+
+inline const RenderHostBuffer& render_internal_gds_buffer() {
+    static const RenderHostBuffer buffer = [] {
+        constexpr VkDeviceSize kGdsBytes = 64u * 1024u;
+        RenderHostBuffer result = acquire_render_host_buffer(render_vk_ctx(), kGdsBytes);
+        if (result.mapped) std::memset(result.mapped, 0, static_cast<size_t>(kGdsBytes));
+        return result;
+    }();
+    return buffer;
+}
+
+inline void reset_internal_gds_for_test() {
+    const RenderHostBuffer& buffer = render_internal_gds_buffer();
+    if (buffer.mapped) std::memset(buffer.mapped, 0, 64u * 1024u);
+}
+
+inline uint32_t read_internal_gds_for_test(uint32_t byte_offset) {
+    const RenderHostBuffer& buffer = render_internal_gds_buffer();
+    if (!buffer.mapped || byte_offset > 64u * 1024u - sizeof(uint32_t)) return 0;
+    uint32_t value = 0;
+    std::memcpy(&value, static_cast<const uint8_t*>(buffer.mapped) + byte_offset, sizeof(value));
+    return value;
 }
 
 inline RenderHostBufferPoolStats render_host_buffer_pool_stats() {
@@ -2075,6 +2103,17 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         return bits;
     };
     std::vector<DV> dv(draws.size());
+    std::vector<std::vector<FrameResource>> effective_resources(draws.size());
+    for (size_t i = 0; i < draws.size(); ++i) {
+        effective_resources[i] = draws[i].R;
+        if (prosper::gpu::fragment_spirv_uses_internal_gds(draws[i].fs_words())) {
+            FrameResource gds;
+            gds.set = 1;
+            gds.binding = 0;
+            gds.is_internal_gds = true;
+            effective_resources[i].push_back(std::move(gds));
+        }
+    }
     std::vector<SharedTextureUpload> texture_uploads;
     std::unordered_map<TextureUploadKey, size_t, TextureUploadKeyHash> texture_upload_indices;
     const bool share_texture_uploads = getenv("PROSPER_NO_BACKEND_TEXTURE_SHARE") == nullptr;
@@ -2130,10 +2169,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     uint64_t storage_buffers = 0;
     uint64_t sampled_images = 0;
     uint64_t storage_images = 0;
-    for (const BackendDraw& draw : draws) {
-        if (draw.R.empty()) continue;
+    for (const auto& resources : effective_resources) {
+        if (resources.empty()) continue;
         uint32_t set_count = 1;
-        for (const FrameResource& resource : draw.R) {
+        for (const FrameResource& resource : resources) {
             set_count = std::max(set_count, resource.set + 1);
             if (!resource.is_texture()) {
                 ++storage_buffers;
@@ -2175,13 +2214,16 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         DV& v = dv[di];
         const uint32_t required_fragment_subgroup_size =
             prosper::gpu::fragment_spirv_required_subgroup_size(bd_fs);
+        const bool uses_internal_gds =
+            prosper::gpu::fragment_spirv_uses_internal_gds(bd_fs);
         if (required_fragment_subgroup_size &&
             (!ctx.subgroup_size_control ||
              required_fragment_subgroup_size < ctx.min_subgroup_size ||
              required_fragment_subgroup_size > ctx.max_subgroup_size ||
              !(ctx.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
              !(ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
-             !(ctx.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT))) {
+             !(ctx.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) ||
+             (uses_internal_gds && !ctx.fragment_stores_atomics))) {
             const uint64_t shader_key = bd.fs_identity
                 ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
             static std::mutex log_mutex;
@@ -2191,11 +2233,21 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 std::fprintf(stderr,
                              "[render] skip draw: fragment shader requires subgroup size %u "
                              "(device range %u..%u required-stages=0x%x subgroup-stages=0x%x "
-                             "ops=0x%x control=%d)\n",
+                             "ops=0x%x control=%d gds=%d fragment-atomics=%d)\n",
                              required_fragment_subgroup_size, ctx.min_subgroup_size,
                              ctx.max_subgroup_size, ctx.required_subgroup_size_stages,
                              ctx.subgroup_stages, ctx.subgroup_operations,
-                             static_cast<int>(ctx.subgroup_size_control));
+                             static_cast<int>(ctx.subgroup_size_control),
+                             static_cast<int>(uses_internal_gds),
+                             static_cast<int>(ctx.fragment_stores_atomics));
+            continue;
+        }
+        if (uses_internal_gds && !render_internal_gds_buffer().buffer) {
+            static std::once_flag logged;
+            std::call_once(logged, [] {
+                std::fprintf(stderr,
+                             "[render] skip draw: failed to allocate persistent GDS buffer\n");
+            });
             continue;
         }
         if (backend_trace) {
@@ -2385,7 +2437,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         // Descriptor resources for this draw (two-set: VS=set0, PS=set1 — same layout as the single path).
         const auto setup_fixed_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         if (timing_enabled) setup_fixed_ms += setup_elapsed_ms(setup_shaders_ready, setup_fixed_ready);
-        const auto& R = bd.R;
+        const auto& R = effective_resources[di];
         v.use_desc = !R.empty();
         for (auto& r : R) v.n_sets = std::max(v.n_sets, r.set + 1);
         std::vector<VkDescriptorSetLayout> dsls(v.n_sets, VK_NULL_HANDLE);
@@ -2686,6 +2738,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     wr[i].descriptorType = lb[i].descriptorType; wr[i].pImageInfo = &dii[i];
                 } else {
                     lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; lb[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+                    if (r.is_internal_gds) {
+                        const RenderHostBuffer& gds = render_internal_gds_buffer();
+                        dbi[i] = {gds.buffer, 0, 64u * 1024u};
+                        wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                        wr[i].dstBinding = r.binding; wr[i].descriptorCount = 1;
+                        wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                        wr[i].pBufferInfo = &dbi[i];
+                        continue;
+                    }
                     const uint32_t* words = r.buffer_words_data();
                     size_t word_count = r.buffer_word_count();
                     if (!words || !word_count) {

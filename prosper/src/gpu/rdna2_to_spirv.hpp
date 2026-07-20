@@ -151,6 +151,7 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
 // Recompiled fragment wave operations use native Vulkan subgroup instructions and therefore require
 // an exact 64-lane subgroup. Returns zero for ordinary modules and 64 for that explicit contract.
 uint32_t fragment_spirv_required_subgroup_size(const std::vector<uint32_t>& spirv);
+bool fragment_spirv_uses_internal_gds(const std::vector<uint32_t>& spirv);
 
 // Packed RGBA component-enable nibbles for the first realized color export to MRT0/MRT1. EXP.EN is
 // an attachment write mask, not a request to source disabled VGPRs; callers intersect this with the
