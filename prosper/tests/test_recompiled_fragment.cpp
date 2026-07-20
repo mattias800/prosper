@@ -124,7 +124,8 @@ int main() {
         0xD7660007u, 0x0001007Fu, 0xBEFC0380u,
         0xD8FA0014u, 0x06000000u,
         0xD7650000u, 0x00020E7Eu, 0x4A140106u, 0x36001481u, 0x7E000D00u,
-        0x7E020280u, 0x7E040280u, 0x7E0602F2u,
+        // Keep sampled v3 live as export alpha so RADV cannot DCE the implicit-LOD sample/WQM.
+        0x7E020280u, 0x7E040280u,
         0xF800180Fu, 0x03020100u, 0xBF810000u,
     };
     ShaderResourceTable gds_wqm_rt;
@@ -145,17 +146,20 @@ int main() {
     std::vector<uint8_t> gds_wqm_px = prosper::test::render_triangle_rgba(
         vert, gds_wqm_frag, W, H, nullptr, nullptr, nullptr, &gds_wqm_tex);
     if (supports_fragment_gds && gds_wqm_px.size() == static_cast<size_t>(W) * H * 4) {
-        uint32_t covered = 0, red = 0;
+        uint32_t covered = 0, red = 0, sampled_alpha = 0;
         for (size_t i = 0; i < gds_wqm_px.size(); i += 4) {
             if (gds_wqm_px[i + 2] < 0x40) {
                 ++covered;
                 if (gds_wqm_px[i] > 0x80) ++red;
+                if (gds_wqm_px[i + 3] > 0x80) ++sampled_alpha;
             }
         }
         CHECK(prosper::test::read_internal_gds_for_test(20) == covered,
               "WQM helper lanes neither lead the GDS atomic nor consume counter slots");
         CHECK(red == covered / 2,
               "WQM append-base + MBCNT-prefix allocation remains unique and contiguous");
+        CHECK(sampled_alpha == covered,
+              "WQM regression keeps implicit-LOD sampled alpha live through export");
     } else {
         CHECK(!supports_fragment_gds && !gds_wqm_px.empty(),
               "unsupported device skips WQM GDS compaction draw fail-visible");

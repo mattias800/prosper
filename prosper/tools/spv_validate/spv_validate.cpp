@@ -55,6 +55,23 @@ int main(int argc, char** argv) {
           0xD7650000u,0x00020E7Eu,0x4A140106u,0x36001481u,0x7E000D00u,
           0x7E020280u,0x7E040280u,0x7E0602F2u,0xF800180Fu,0x03020100u,0xBF810000u};
       dump(dir, "fragment_gds_append", recompile_fragment(c, sizeof(c)/4)); }
+    // Same allocation with a live implicit-LOD sample: sampled alpha reaches EXP and forces WQM.
+    { const uint32_t c[] = {
+          0x7E0002FFu,0x3E800000u,0x7E0202FFu,0x3E800000u,
+          0xF0800F08u,0x00820000u,0xD7660007u,0x0001007Fu,0xBEFC0380u,
+          0xD8FA0014u,0x06000000u,0xD7650000u,0x00020E7Eu,0x4A140106u,
+          0x36001481u,0x7E000D00u,0x7E020280u,0x7E040280u,
+          0xF800180Fu,0x03020100u,0xBF810000u};
+      ShaderResourceTable rt; ShaderResource t{}; t.cls=ResourceClass::Texture;
+      t.binding=4; t.img_dim=1; t.width=2; t.height=2; t.sgpr_base=8;
+      rt.resources.push_back(t);
+      dump(dir, "fragment_gds_wqm", recompile_fragment(c, sizeof(c)/4, &rt)); }
+    // Consume shares the same wave allocator but subtracts the non-helper population.
+    { const uint32_t c[] = {
+          0xD7660007u,0x0001007Fu,0xBEFC0380u,0xD8F60014u,0x06000000u,
+          0xD7650000u,0x00020E7Eu,0x4A140106u,0x36001481u,0x7E000D00u,
+          0x7E020280u,0x7E040280u,0x7E0602F2u,0xF800180Fu,0x03020100u,0xBF810000u};
+      dump(dir, "fragment_gds_consume", recompile_fragment(c, sizeof(c)/4)); }
     // Fragment private spill/fill (Function-storage declaration in the graphics shell).
     { const uint32_t c[] = {0xdc704010u,0x00000000u,0x7e000280u,0xdc304010u,0x00000000u,
                             0xf800000fu,0x00000000u,0xBF810000u};

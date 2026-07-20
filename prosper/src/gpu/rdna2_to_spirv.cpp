@@ -465,7 +465,11 @@ struct SpirvCompute {
         const uint32_t in_half = lo
             ? ucmp(Op_ULessThan, lane, uconst(32))
             : ucmp(Op_UGreaterThanEqual, lane, uconst(32));
-        const uint32_t selected = sel(land(mask_bit, in_half), uconst(1), uconst(0));
+        // Helper invocations execute subgroup operations under WQM but are not guest lanes and
+        // cannot own GDS allocation slots. Excluding them here keeps MBCNT's prefix exactly aligned
+        // with fragment GDS append/consume's non-helper population.
+        const uint32_t guest_lane = land(mask_bit, logical_not(helper_invocation()));
+        const uint32_t selected = sel(land(guest_lane, in_half), uconst(1), uconst(0));
         uint32_t prefix = id();
         put(code, Op_GroupNonUniformIAdd,
             {t_u32, prefix, uconst(Scope_Subgroup), GroupOp_ExclusiveScan, selected});
