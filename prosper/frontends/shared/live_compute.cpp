@@ -393,6 +393,83 @@ void storage_unpack_texel(const uint8_t* src, prosper::gpu::DataFormat f, uint32
         }
     }
 }
+// Unpack `count` consecutive texels (source stride `src_stride`) into `count` RGBA32 quads.
+//
+// storage_unpack_texel re-derives the format for every texel AND re-enters a switch for every
+// component, so a full-resolution storage image pays ~texels function calls plus ~4x texels switch
+// dispatches. That dominated compute image setup (measured: ~56 ms per image-bearing dispatch on
+// Blasphemous 2's menu, against 0.39 ms of actual GPU dispatch). This hoists the format dispatch out
+// of the loop so each specialized path is a tight typed loop.
+//
+// Every specialized path is bit-identical to storage_unpack_texel by construction; formats without a
+// specialization fall through to the per-texel helper, and PROSPER_VERIFY_UNPACK=1 checks the two
+// against each other at runtime.
+void storage_unpack_range(const uint8_t* src, size_t src_stride, prosper::gpu::DataFormat f,
+                          uint32_t ncomp, size_t count, uint32_t* out) {
+    using DF = prosper::gpu::DataFormat;
+    const uint32_t one_f32 = 0x3f800000u;
+    const bool integer_fmt = f == DF::Uint8 || f == DF::Sint8 || f == DF::Uint16 ||
+                             f == DF::Sint16 || f == DF::Uint32 || f == DF::Sint32;
+    const uint32_t alpha_default = integer_fmt ? 1u : one_f32;
+    const uint32_t n = ncomp < 4u ? ncomp : 4u;
+    auto defaults = [&](uint32_t* o) { o[0] = o[1] = o[2] = 0; o[3] = alpha_default; };
+    switch (f) {
+        case DF::Unorm8:
+            for (size_t t = 0; t < count; ++t) {
+                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                for (uint32_t c = 0; c < n; ++c) { float v = p[c] / 255.0f; std::memcpy(&o[c], &v, 4); }
+            }
+            return;
+        case DF::Float16:
+            for (size_t t = 0; t < count; ++t) {
+                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                for (uint32_t c = 0; c < n; ++c) {
+                    float v = prosper::gpu::half_to_float(
+                        static_cast<uint16_t>(p[c * 2] | (p[c * 2 + 1] << 8)));
+                    std::memcpy(&o[c], &v, 4);
+                }
+            }
+            return;
+        case DF::Uint8:
+            for (size_t t = 0; t < count; ++t) {
+                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                for (uint32_t c = 0; c < n; ++c) o[c] = p[c];
+            }
+            return;
+        case DF::Sint8:
+            for (size_t t = 0; t < count; ++t) {
+                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                for (uint32_t c = 0; c < n; ++c)
+                    o[c] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(p[c])));
+            }
+            return;
+        case DF::Uint16:
+            for (size_t t = 0; t < count; ++t) {
+                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                for (uint32_t c = 0; c < n; ++c)
+                    o[c] = static_cast<uint32_t>(p[c * 2] | (p[c * 2 + 1] << 8));
+            }
+            return;
+        case DF::Sint16:
+            for (size_t t = 0; t < count; ++t) {
+                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                for (uint32_t c = 0; c < n; ++c)
+                    o[c] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(
+                        p[c * 2] | (p[c * 2 + 1] << 8))));
+            }
+            return;
+        case DF::Float32: case DF::Uint32: case DF::Sint32:
+            for (size_t t = 0; t < count; ++t) {
+                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                for (uint32_t c = 0; c < n; ++c) std::memcpy(&o[c], p + c * 4, 4);
+            }
+            return;
+        default:                                  // packed formats keep the general per-texel path
+            for (size_t t = 0; t < count; ++t)
+                storage_unpack_texel(src + t * src_stride, f, ncomp, out + t * 4);
+            return;
+    }
+}
 void storage_pack_texel(const uint32_t in[4], prosper::gpu::DataFormat f, uint32_t ncomp, uint8_t* dst) {
     using DF = prosper::gpu::DataFormat;
     if (f == DF::Float10_11_11) {
@@ -932,9 +1009,33 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     if (trace) bi.before_hash = fnv1a(src, guest_bytes);
                     std::memcpy(linear.data(), src, linear.size());
                 }
-                for (size_t t = 0; t < texels; t++)
-                    storage_unpack_texel(linear.data() + t * guest_texel, r->format, nc,
-                                         reinterpret_cast<uint32_t*>(upload.data()) + t * 4);
+                storage_unpack_range(linear.data(), guest_texel, r->format, nc, texels,
+                                     reinterpret_cast<uint32_t*>(upload.data()));
+                static const bool verify_unpack = std::getenv("PROSPER_VERIFY_UNPACK") != nullptr;
+                if (verify_unpack) {
+                    // Fail-visible A/B: the specialized range unpack must be bit-identical to the
+                    // per-texel path it replaces. Reports the whole divergence (count + first texel)
+                    // and identifies the binding, and logs the clean case too so a verified run is
+                    // self-proving rather than merely silent.
+                    uint32_t expect[4];
+                    const uint32_t* got = reinterpret_cast<const uint32_t*>(upload.data());
+                    size_t bad = 0, first_bad = 0;
+                    for (size_t t = 0; t < texels; ++t) {
+                        storage_unpack_texel(linear.data() + t * guest_texel, r->format, nc, expect);
+                        if (std::memcmp(expect, got + t * 4, sizeof expect) != 0) {
+                            if (!bad) first_bad = t;
+                            ++bad;
+                        }
+                    }
+                    std::fprintf(stderr,
+                                 "[compute] unpack-verify binding=%u addr=0x%llx fmt=%u nc=%u "
+                                 "texels=%zu mismatches=%zu%s\n",
+                                 bi.binding, (unsigned long long)r->gpu_addr,
+                                 (unsigned)r->format, nc, texels, bad,
+                                 bad ? " MISMATCH" : "");
+                    if (bad)
+                        std::fprintf(stderr, "[compute]   first mismatching texel=%zu\n", first_bad);
+                }
             } else {
                 const uint32_t bpb = bc_block_bytes(r->format);
                 const uint32_t cb = data_format_bytes(r->format);
