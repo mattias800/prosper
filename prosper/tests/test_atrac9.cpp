@@ -52,6 +52,12 @@ int main() {
            pcm.size(), crc, kAt9ExpectedCrc32);
     CHECK(crc == kAt9ExpectedCrc32, "decoded PCM is bit-exact vs LibAtrac9 reference (CRC32)");
 
+    // The SUPERFRAME is the only safe advance unit: a superframe's frames are variable-length and need
+    // not fill superframe_bytes(), so stepping a cursor by per-frame consumed counts drifts out of
+    // alignment. Assert the invariant the AJM batch decoder relies on (#1065): decoding N superframes
+    // consumes exactly N*superframe_bytes().
+    CHECK(nsf * sf_bytes == kAt9DataLen, "superframe stride tiles the stream exactly (safe advance unit)");
+
     printf(fails ? "test_atrac9: %d FAILURE(S)\n" : "test_atrac9: all ok\n", fails);
     return fails ? 1 : 0;
 }
