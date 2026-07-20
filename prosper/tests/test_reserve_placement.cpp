@@ -21,6 +21,10 @@ using namespace prosper;
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
+// Every reserve call logs its outcome so a platform-specific CI failure is attributable from the
+// test output alone (address-space contents differ per host process; see the case-0 comment).
+#define LOGV(tag, rc, val) printf("  %-10s rc=0x%llx addr=0x%llx\n", tag, \
+                                  (unsigned long long)(rc), (unsigned long long)(val))
 
 // Window bounds mirror hle_kernel_mem.cpp (kGuestAutoMapBase/Limit on Linux; kGuestAutoVaMin/Max
 // on Windows). The huge-reserve band must stay inside the platform's guest auto window.
@@ -47,10 +51,16 @@ int main() {
     // 0) Threshold boundary, just-below side FIRST, on pristine address space: later cases
     //    reserve/unmap huge in-window spans, and on Windows an unmapped span's VA stays
     //    OS-reserved as a free placeholder — probing a hint whose span crosses such VA would
-    //    test placeholder geometry, not the redirect contract (#1084 review finding).
-    uint64_t below = 0x1200000000ull;
+    //    test placeholder geometry, not the redirect contract (#1084 review finding). The hint
+    //    sits MID-window (0x4000000000): a ~128 GiB span from the earlier 0x1200000000 hint
+    //    crosses the window bottom, which is empirically not free in the Windows CI test process
+    //    (exact-hint cover relocated there even as the first case), while mid-window VA is. The
+    //    assertion's meaning is unchanged: a below-threshold reserve must NOT be huge-classed —
+    //    huge-class placement (band top / OS-chosen) never returns the exact free hint.
+    uint64_t below = 0x4000000000ull;
     uint64_t rc = reserve((uint64_t)&below, kHugeMin - 0x10000, 0, 0x10000, 0, 0);
-    CHECK(rc == 0 && below == 0x1200000000ull,
+    LOGV("case0", rc, below);
+    CHECK(rc == 0 && below == 0x4000000000ull,
           "just-below-threshold reserve still honors its free hint");
     unmap(below, kHugeMin - 0x10000, 0, 0, 0, 0);
 
@@ -58,6 +68,7 @@ int main() {
     //    aligned inside the guest auto window.
     uint64_t base = kArenaHint;
     rc = reserve((uint64_t)&base, kArenaLen, 0, kArenaAlign, 0, 0);
+    LOGV("case1", rc, base);
     CHECK(rc == 0, "huge non-fixed reserve succeeds");
     CHECK(base != kArenaHint, "huge reserve does not land at the low 0x1000000000 hint");
     CHECK(base >= kAutoMin, "huge reserve lands at or above the auto window base");
@@ -68,6 +79,7 @@ int main() {
     //    next small reserve with the same hint (search-start semantics, first free range).
     uint64_t pool = kArenaHint;
     rc = reserve((uint64_t)&pool, 0x4000000, 0, 0x4000, 0, 0);
+    LOGV("case2", rc, pool);
     CHECK(rc == 0, "small same-hint reserve succeeds");
     CHECK(pool == kArenaHint, "small reserve takes the vacated 0x1000000000 hint");
 
@@ -79,6 +91,7 @@ int main() {
     //     (#1084 review), and the idempotency bug under test only needs the huge class.
     uint64_t again = kArenaHint;
     rc = reserve((uint64_t)&again, kHugeMin, 0, kArenaAlign, 0, 0);
+    LOGV("case2b", rc, again);
     CHECK(rc == 0 && again != kArenaHint && again >= kAutoMin,
           "second same-hint huge reserve is redirected, not idempotent-matched to the pool");
     unmap(again, kHugeMin, 0, 0, 0, 0);
@@ -90,18 +103,21 @@ int main() {
     // 3) Non-huge hinted reserves keep literal-when-free search semantics.
     uint64_t small = 0x1800000000ull;
     rc = reserve((uint64_t)&small, 0x10000, 0, 0x4000, 0, 0);
+    LOGV("case3", rc, small);
     CHECK(rc == 0 && small == 0x1800000000ull, "non-huge hinted reserve still honors a free hint");
     unmap(small, 0x10000, 0, 0, 0, 0);
 
     // 4) MAP_FIXED reserves are untouched by the redirect.
     uint64_t fixedBase = 0x1900000000ull;
     rc = reserve((uint64_t)&fixedBase, 0x10000, 0x10, 0x4000, 0, 0);
+    LOGV("case4", rc, fixedBase);
     CHECK(rc == 0 && fixedBase == 0x1900000000ull, "MAP_FIXED reserve keeps its exact hint");
 
     // 4b) A FIXED reserve whose span EXCEEDS the existing same-base reservation must fail, not
     //     false-succeed through the hint-only idempotency match (span containment required).
     uint64_t oversize = 0x1900000000ull;
     rc = reserve((uint64_t)&oversize, 0x20000, 0x10, 0x4000, 0, 0);
+    LOGV("case4b", rc, oversize);
     CHECK(rc != 0, "FIXED re-reserve larger than the owning range fails instead of false-succeeding");
     unmap(fixedBase, 0x10000, 0, 0, 0, 0);
 
@@ -109,6 +125,7 @@ int main() {
     //    exercises free-placeholder recycling of the released arena span.)
     uint64_t atThr = 0x1200000000ull;
     rc = reserve((uint64_t)&atThr, kHugeMin, 0, 0x10000, 0, 0);
+    LOGV("case5", rc, atThr);
     CHECK(rc == 0 && atThr != 0x1200000000ull && atThr >= kAutoMin,
           "exactly-128GiB non-fixed reserve is redirected into the window");
     unmap(atThr, kHugeMin, 0, 0, 0, 0);
