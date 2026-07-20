@@ -421,7 +421,21 @@ struct A2Context {
 };
 std::mutex g_a2_mx;
 A2Context  g_a2_ctx[4];
-uint32_t   g_a2_users = 0, g_a2_ports = 0;
+uint32_t   g_a2_users = 0;
+
+// AudioOut2 data path (derived live from Evergate, the first title to PLAY through this surface):
+// each tick the guest calls PortSetAttributes(port, attrs, count) where an attribute triple
+// {id=0, value_ptr, value_size=8} carries a guest pointer to the port's current grain of
+// interleaved stereo float32 PCM (grain frames from the context param, 256 live). ContextAdvance
+// advances engine state and ContextPush submits the grain to the device. We store each port's PCM
+// pointer here and mix + forward all ports' grains to the host AudioSink at Push.
+struct A2PortState {
+    bool     used = false;
+    uint64_t pcm_ptr = 0;      // guest address of this port's current PCM grain (attr id 0)
+};
+A2PortState g_a2_port_state[16];
+constexpr int kA2SinkPort = 16;     // host sink port id for the AudioOut2 device (sink accepts 1..16;
+                                    // v1 sceAudioOut handles stay in the low single digits)
 
 // Fault-safe store to a guest out-pointer (same rationale as apr_write_guest_dst: a bad pointer
 // must fail the call, not SIGSEGV inside the HLE). WriteProcessMemory validates the complete
@@ -662,11 +676,29 @@ HLE(audio2_user_destroy) { A2LOG("sceAudioOut2UserDestroy"); return 0; }
 // sceAudioOut2PortCreate(ctx, const portParam*, Handle* outPort, ...) -> 0.
 HLE(audio2_port_create) {
     A2LOG("sceAudioOut2PortCreate");
+    if (audio2log()) a2_dump("portParam", a1, 0x40);
     std::lock_guard<std::mutex> lk(g_a2_mx);
-    if (!a2_store_u64(a2, kA2PortTag | (uint64_t)++g_a2_ports)) return kA2ErrInvalid;
+    // First-free-slot allocation (not a monotonic counter): slots are recycled on PortDestroy, so a
+    // title that churns ports over a long session can't exhaust the table or alias slot state.
+    for (uint32_t id = 1; id <= 16; ++id) {
+        if (g_a2_port_state[id - 1].used) continue;
+        if (!a2_store_u64(a2, kA2PortTag | (uint64_t)id)) return kA2ErrInvalid;
+        g_a2_port_state[id - 1] = A2PortState{true, 0};
+        return 0;
+    }
+    return kA2ErrInvalid;
+}
+HLE(audio2_port_destroy) {
+    A2LOG("sceAudioOut2PortDestroy");
+    // Clear the slot so a destroyed port stops being mixed (its guest PCM buffer may be freed and
+    // reused) and the slot is reusable by the next PortCreate.
+    const uint64_t pidx = a0 & 0xff;
+    if ((a0 & ~0xffull) == kA2PortTag && pidx >= 1 && pidx <= 16) {
+        std::lock_guard<std::mutex> lk(g_a2_mx);
+        g_a2_port_state[pidx - 1] = A2PortState{};
+    }
     return 0;
 }
-HLE(audio2_port_destroy) { A2LOG("sceAudioOut2PortDestroy"); return 0; }
 
 // sceAudioOut2PortGetState(port, State* out) -> 0. Layout unknown; the pump loop consumed a
 // zero-filled 0x20 in the capture run and kept cycling. CONFIDENCE: LOW (zero state = silent
@@ -676,7 +708,34 @@ HLE(audio2_port_get_state) {
     if (!a2_store_zeros(a1, 0x20)) return kA2ErrInvalid;
     return 0;
 }
-HLE(audio2_port_set_attr) { A2LOG("sceAudioOut2PortSetAttributes"); return 0; }
+// sceAudioOut2PortSetAttributes(port, const SceAudioOut2Attribute* attrs, size_t count).
+// Attribute = {u64 id, const void* value, size_t valueSize} (0x18 stride). Live-decoded ids:
+//   0 = per-grain PCM data pointer (value: a guest pointer qword to interleaved stereo f32 samples).
+// Unknown ids are skipped fail-visibly under PROSPER_AUDIO2LOG. CONFIDENCE: MED (Evergate-derived).
+HLE(audio2_port_set_attr) {
+    A2LOG("sceAudioOut2PortSetAttributes");
+    const uint64_t pidx = (a0 & 0xff);
+    if ((a0 & ~0xffull) != kA2PortTag || pidx < 1 || pidx > 16) return kA2ErrInvalid;
+    if (a2 == 0) return 0;                        // no attributes: a legal no-op
+    const uint64_t count = a2 <= 32 ? a2 : 32;    // defensive cap; log the clamp fail-visibly
+    if (count != a2 && audio2log())
+        fprintf(stderr, "[audio2] PortSetAttributes: count %llu clamped to 32\n", (unsigned long long)a2);
+    std::lock_guard<std::mutex> lk(g_a2_mx);      // covers port state AND the diagnostic set below
+    for (uint64_t i = 0; i < count; i++) {
+        struct { uint64_t id, vptr, vsize; } at{};
+        if (!audio_read_bytes(a1 + i * 0x18, &at, sizeof at)) break;
+        if (at.id == 0 && at.vsize == 8) {
+            uint64_t pcm = 0;
+            if (audio_read_bytes(at.vptr, &pcm, 8)) g_a2_port_state[pidx - 1].pcm_ptr = pcm;
+        } else if (audio2log()) {
+            static std::set<uint64_t> seen;
+            if (seen.insert(at.id).second)
+                fprintf(stderr, "[audio2] PortSetAttributes: unhandled attr id=%llu size=%llu\n",
+                        (unsigned long long)at.id, (unsigned long long)at.vsize);
+        }
+    }
+    return 0;
+}
 
 // sceAudioOut2ContextAdvance(ctx) -> 0. State advance only; the pacing lives in Push.
 HLE(audio2_ctx_advance) { A2LOG("sceAudioOut2ContextAdvance"); return 0; }
@@ -687,13 +746,65 @@ HLE(audio2_ctx_advance) { A2LOG("sceAudioOut2ContextAdvance"); return 0; }
 HLE(audio2_ctx_push) {
     A2LOG("sceAudioOut2ContextPush");
     uint64_t idx = a0 & 0xff;
+    uint32_t grain = 256;
+    // Mix every port's current grain into a stereo bed. The port's grain buffer is a 7.1 BED:
+    // 8 interleaved float32 channels per frame (offline stride analysis of a live capture:
+    // adjacent-sample correlation 0.976 and a musical ~433 zero-crossings/s at stride 8, ~0
+    // correlation at strides 2/4 — so frames are 8 floats wide). We forward the front L/R pair.
+    // SURROUND-TODO: channels 2..7 (C/LFE/surrounds) are dropped until the host sink grows a
+    // surround output; fold them in with proper downmix gains when it does.
+    constexpr uint32_t kA2BedChannels = 8;
+    // Off the guest thread's stack: guest-created pump threads can run small stacks.
+    static thread_local std::vector<float> bed(4096 * 2);
+    bool have_pcm = false;
+    {
+        std::lock_guard<std::mutex> lk(g_a2_mx);
+        A2Context* c = ((a0 & ~0xffull) == kA2CtxTag && idx >= 1 && idx <= 4 && g_a2_ctx[idx - 1].used)
+                       ? &g_a2_ctx[idx - 1] : &g_a2_ctx[0];
+        grain = (c->grain >= 64 && c->grain <= 4096) ? c->grain : 256;
+        std::memset(bed.data(), 0, sizeof(float) * grain * 2);
+        std::vector<float> tmp((size_t)grain * kA2BedChannels);
+        for (const auto& ps : g_a2_port_state) {
+            if (!ps.used || !ps.pcm_ptr) continue;
+            const size_t want = sizeof(float) * grain * kA2BedChannels;
+            const size_t got = audio_read_bytes_partial(ps.pcm_ptr, tmp.data(), want);
+            const size_t frames_got = got / (sizeof(float) * kA2BedChannels);
+            for (size_t fno = 0; fno < frames_got; fno++) {
+                bed[fno * 2 + 0] += tmp[fno * kA2BedChannels + 0];   // front left
+                bed[fno * 2 + 1] += tmp[fno * kA2BedChannels + 1];   // front right
+            }
+            if (frames_got) have_pcm = true;
+        }
+    }
+    AudioSink* sink = audio_sink();
+    if (sink && have_pcm) {
+        // Forward the mixed grain to the host device; the sink paces one grain per call in real
+        // time (same contract as the v1 sceAudioOutOutput path), so no extra sleep on this path.
+        // A FAILED device open must fall through to the silent wall-clock pacing below instead:
+        // the SDL3 sink's output() is a no-op on a null stream (no sleep), and returning early on
+        // every push would hot-spin the guest's pump thread on hosts with no audio device.
+        static std::atomic<bool> opened{false};
+        static std::atomic<bool> open_ok{false};
+        AudioPortInfo info; info.freq = 48000; info.channels = 2; info.fmt = AudioFmt::F32;
+        info.grain = (int)grain;
+        if (!opened.exchange(true)) open_ok.store(sink->open(kA2SinkPort, info));
+        if (open_ok.load()) {
+            for (uint32_t i = 0; i < grain * 2; i++)
+                bed[i] = bed[i] > 1.0f ? 1.0f : (bed[i] < -1.0f ? -1.0f : bed[i]);
+            audio_observe_output(kA2SinkPort, bed.data(), (int)grain, info);
+            sink->output(kA2SinkPort, bed.data(), (int)grain);
+            return 0;
+        }
+    }
+    // No sink / no data yet: keep the silent real-time pacing so the guest's pump thread does not
+    // hot-spin (on hardware Push blocks while the output queue is full).
     std::chrono::steady_clock::time_point target;
     {
         std::lock_guard<std::mutex> lk(g_a2_mx);
         A2Context* c = ((a0 & ~0xffull) == kA2CtxTag && idx >= 1 && idx <= 4 && g_a2_ctx[idx - 1].used)
                        ? &g_a2_ctx[idx - 1] : &g_a2_ctx[0];
-        uint32_t grain = c->grain ? c->grain : 256;
-        auto dur = std::chrono::nanoseconds((long long)grain * 1000000000LL / 48000);
+        uint32_t g2 = c->grain ? c->grain : 256;
+        auto dur = std::chrono::nanoseconds((long long)g2 * 1000000000LL / 48000);
         auto now = std::chrono::steady_clock::now();
         // (Re)sync if unset or far behind (post-stall) to avoid burst catch-up — same policy
         // as RealtimeSilentSink::output.
@@ -822,10 +933,16 @@ HLE(ajm_initialize) {
 }
 HLE(ajm_finalize)         { return 0; }
 // sceAjmModuleRegister(u32 context, AjmCodecType codec, s64 reserved): register a codec on the context.
-HLE(ajm_module_register)  { return a0 ? 0 : AJM_ERR_INVALID_CONTEXT; }
+HLE(ajm_module_register)  {
+    if (getenv("PROSPER_AUDIOLOG")) fprintf(stderr, "[ajm] ModuleRegister ctx=%llu codec=%llu\n",
+                                            (unsigned long long)a0, (unsigned long long)a1);
+    return a0 ? 0 : AJM_ERR_INVALID_CONTEXT;
+}
 HLE(ajm_module_unregister){ return 0; }
 // sceAjmInstanceCreate(u32 context, codec, flags, u32* instance): a decoder instance handle.
 HLE(ajm_instance_create) {
+    if (getenv("PROSPER_AUDIOLOG")) fprintf(stderr, "[ajm] InstanceCreate ctx=%llu codec=%llu flags=0x%llx\n",
+                                            (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2);
     if (!a0) return AJM_ERR_INVALID_CONTEXT;
     if (!a3) return AJM_ERR_INVALID_PARAMETER;
     if (!a2_store_u32(a3, g_ajm_next.fetch_add(1))) return AJM_ERR_INVALID_PARAMETER;
@@ -837,16 +954,113 @@ HLE(ajm_instance_destroy) {
     if (!a1) return AJM_ERR_INVALID_INSTANCE;
     return 0;
 }
+// sceAjmBatchInitialize(void* pBatchBuffer, size_t szBatchBuffer, SceAjmBatchInfo* pBatchInfo): prepare
+// the caller's batch info so its job builders write into pBatchBuffer starting at offset 0. Was
+// UNIMPLEMENTED (Evergate calls it first, NID MmpF1XsQiHw): the generic stub returned 0 without touching
+// pBatchInfo, so the guest built its audio-decode batch on a garbage buffer/cursor, never ran a decode
+// job, and never opened an AudioOut port -> total silence. Layout: { void* pBuffer; size_t offset(cursor
+// bytes used, starts 0); size_t size; }. CONFIDENCE: MED — 24-byte layout derived from Evergate's live
+// call pattern (buffer/size/info args + a clean validated run); not yet cross-checked against a second
+// title or the caller's stack-frame disassembly.
+HLE(ajm_batch_initialize) {
+    if (getenv("PROSPER_AUDIOLOG")) { static int n; if (n++ < 8)
+        fprintf(stderr, "[ajm] BatchInitialize buf=0x%llx size=%llu info=0x%llx\n",
+                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2); }
+    if (!a0 || !a1 || !a2) return AJM_ERR_INVALID_PARAMETER;
+    uint64_t info[3] = { a0, 0, a1 };   // pBuffer, offset=0, size
+    if (!audio_store_bytes(a2, info, sizeof info)) return AJM_ERR_INVALID_PARAMETER;
+    return 0;
+}
+// --- AJM batch walker (diagnostic) -------------------------------------------------------------------
+// prosper's AJM builders write jobs into the guest batch buffer with a known chunk format (see
+// ajm_write_job). Under PROSPER_AUDIOLOG, walk the submitted batch and log each job's chunk shape
+// (instance, flags, input/output buffers) — the wire-format documentation the future REAL decode
+// needs. NOTE: no decode runs yet; jobs are parsed and logged only. ATRAC9 batch decode via the
+// vendored LibAtrac9 is tracked in #1065.
+struct AjmChunkRef { uint32_t ident; uint32_t size; uint64_t address; };
+
+void ajm_execute_batch(uint64_t batch_addr, uint64_t batch_size) {
+    const bool log = getenv("PROSPER_AUDIOLOG") != nullptr;
+    if (!log) return;   // diagnostic-only until #1065 wires real decode
+    if (!batch_addr || !batch_size || batch_size > AJM_MAX_BUILDER_BYTES) return;
+    std::vector<uint8_t> buf(batch_size, 0);
+    const size_t got = audio_read_bytes_partial(batch_addr, buf.data(), buf.size());
+    if (got < 8) return;
+    int logged = 0;
+    size_t cur = 0;
+    while (cur + 8 <= got) {
+        uint32_t jhdr = 0, jsize = 0;
+        std::memcpy(&jhdr, buf.data() + cur, 4);
+        std::memcpy(&jsize, buf.data() + cur + 4, 4);
+        if ((jhdr & 0x3fu) != AJM_IDENT_JOB) break;         // not a job header -> end of batch
+        const uint32_t instance = (jhdr >> 6) & 0xfffffu;
+        const size_t payload_end = cur + 8 + jsize;
+        if (payload_end > got) break;
+        std::vector<AjmChunkRef> chunks;
+        uint64_t run_flags = 0, ctrl_flags = 0;
+        size_t pc = cur + 8;
+        while (pc + 4 <= payload_end) {
+            uint32_t chdr = 0; std::memcpy(&chdr, buf.data() + pc, 4);
+            const uint32_t cident = chdr & 0x3fu;
+            if (cident == AJM_IDENT_CONTROL_FLAGS || cident == AJM_IDENT_RUN_FLAGS) {
+                if (pc + 8 > payload_end) break;
+                uint32_t flo = 0; std::memcpy(&flo, buf.data() + pc + 4, 4);
+                const uint64_t f = ((uint64_t)((chdr >> 6) & 0xfffffu) << 32) | flo;
+                if (cident == AJM_IDENT_RUN_FLAGS) run_flags = f; else ctrl_flags = f;
+                pc += 8;
+            } else if (cident == AJM_IDENT_INLINE) {
+                if (pc + 8 > payload_end) break;   // header straddles the payload end
+                uint32_t isz = 0; std::memcpy(&isz, buf.data() + pc + 4, 4);
+                pc += 8 + (((size_t)isz + 7u) & ~size_t{7u});
+            } else {                                        // buffer chunk (16 bytes)
+                if (pc + 16 > payload_end) break;
+                uint32_t csize = 0; uint64_t caddr = 0;
+                std::memcpy(&csize, buf.data() + pc + 4, 4);
+                std::memcpy(&caddr, buf.data() + pc + 8, 8);
+                chunks.push_back({cident, csize, caddr});
+                pc += 16;
+            }
+        }
+        auto find = [&](uint32_t id) -> const AjmChunkRef* {
+            for (const auto& c : chunks) if (c.ident == id) return &c; return nullptr; };
+        const AjmChunkRef *in_run = find(AJM_IDENT_INPUT_RUN),  *out_run = find(AJM_IDENT_OUTPUT_RUN);
+        const AjmChunkRef *in_ctl = find(AJM_IDENT_INPUT_CONTROL), *out_ctl = find(AJM_IDENT_OUTPUT_CONTROL);
+        if (log && logged++ < 32) {
+            fprintf(stderr, "[ajm] JOB inst=%u run_flags=0x%llx ctrl_flags=0x%llx chunks=%zu"
+                    " in_run=%s out_run=%s in_ctl=%s out_ctl=%s\n", instance,
+                    (unsigned long long)run_flags, (unsigned long long)ctrl_flags, chunks.size(),
+                    in_run?"y":"-", out_run?"y":"-", in_ctl?"y":"-", out_ctl?"y":"-");
+            if (in_ctl && in_ctl->size && in_ctl->size <= 64) {
+                uint8_t cb[64] = {}; audio_read_bytes_partial(in_ctl->address, cb, in_ctl->size);
+                fprintf(stderr, "[ajm]   in_ctl[%u]:", in_ctl->size);
+                for (uint32_t i = 0; i < in_ctl->size; i++) fprintf(stderr, " %02x", cb[i]);
+                fprintf(stderr, "\n");
+            }
+            if (in_run) fprintf(stderr, "[ajm]   in_run addr=0x%llx size=%u  out_run addr=0x%llx size=%u  out_ctl size=%u\n",
+                    (unsigned long long)in_run->address, in_run->size,
+                    (unsigned long long)(out_run?out_run->address:0), out_run?out_run->size:0, out_ctl?out_ctl->size:0);
+        }
+        (void)in_run; (void)out_run; (void)out_ctl; (void)instance;
+        cur = payload_end;
+    }
+}
+
 // sceAjmBatchStartBuffer(context, batch, size, prio, AjmBatchError* err, u32* out_batch_id): accept a
 // decode batch and report it started (out_batch_id filled). We don't run the jobs; BatchWait completes
 // it. The AjmBatchError out (a4) is left as the caller's value (its layout isn't needed for no-error).
 HLE(ajm_batch_start) {
+    if (getenv("PROSPER_AUDIOLOG")) fprintf(stderr, "[ajm] BatchStart ctx=%llu batch=0x%llx size=%llu prio=%llu\n",
+            (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3);
     if (!a0) return AJM_ERR_INVALID_CONTEXT;
     if (!a5) return AJM_ERR_INVALID_PARAMETER;
+    ajm_execute_batch(a1, a2);   // diagnostic walk/log of the submitted jobs (no decode yet: #1065)
     if (!a2_store_u32(a5, g_ajm_next.fetch_add(1))) return AJM_ERR_INVALID_PARAMETER;
     return 0;
 }
-HLE(ajm_batch_wait)       { return a0 ? 0 : AJM_ERR_INVALID_CONTEXT; }   // batch completed
+HLE(ajm_batch_wait)       {
+    if (getenv("PROSPER_AUDIOLOG")) { static int n; if (n++ < 40)
+        fprintf(stderr, "[ajm] BatchWait ctx=%llu batch=%llu\n", (unsigned long long)a0, (unsigned long long)a1); }
+    return a0 ? 0 : AJM_ERR_INVALID_CONTEXT; }   // batch completed
 HLE(ajm_batch_cancel) {
     if (!a0) return AJM_ERR_INVALID_CONTEXT;
     if (!a1) return AJM_ERR_INVALID_BATCH;
@@ -857,6 +1071,10 @@ HLE(ajm_batch_errordump)  { return 0; }
 // Build one control job and return the next free byte in the caller's batch buffer. Returning zero
 // here is not a harmless stub result: the guest chains the returned cursor into its next builder.
 HLE8(ajm_batch_job_control_buffer_ra) {
+    if (getenv("PROSPER_AUDIOLOG")) { static int n; if (n++ < 40)
+        fprintf(stderr, "[ajm] JobControlRa batch=0x%llx inst=%llu flags=0x%llx in=0x%llx/%llu out=0x%llx/%llu ra=0x%llx\n",
+            (unsigned long long)a0,(unsigned long long)a1,(unsigned long long)a2,(unsigned long long)a3,
+            (unsigned long long)a4,(unsigned long long)a5,(unsigned long long)a6,(unsigned long long)a7); }
     if (a4 > UINT32_MAX || a6 > UINT32_MAX) return 0;
     std::vector<uint8_t> payload;
     payload.reserve(a7 ? 56 : 40);
@@ -886,6 +1104,10 @@ HLE(ajm_batch_job_inline_buffer) {
 }
 
 HLE10(ajm_batch_job_run_buffer_ra) {
+    if (getenv("PROSPER_AUDIOLOG")) { static int n; if (n++ < 40)
+        fprintf(stderr, "[ajm] JobRunRa batch=0x%llx inst=%llu flags=0x%llx in=0x%llx/%llu out=0x%llx/%llu sb=0x%llx/%llu ra=0x%llx\n",
+            (unsigned long long)a0,(unsigned long long)a1,(unsigned long long)a2,(unsigned long long)a3,(unsigned long long)a4,
+            (unsigned long long)a5,(unsigned long long)a6,(unsigned long long)a7,(unsigned long long)a8,(unsigned long long)a9); }
     if (a4 > UINT32_MAX || a6 > UINT32_MAX || a8 > UINT32_MAX) return 0;
     std::vector<uint8_t> payload;
     payload.reserve(a9 ? 72 : 56);
@@ -898,6 +1120,8 @@ HLE10(ajm_batch_job_run_buffer_ra) {
 }
 
 HLE10(ajm_batch_job_run_split_buffer_ra) {
+    if (getenv("PROSPER_AUDIOLOG")) { static int n; if (n++ < 40)
+        fprintf(stderr, "[ajm] JobRunSplitRa batch=0x%llx inst=%llu\n", (unsigned long long)a0,(unsigned long long)a1); }
     if (a4 > UINT32_MAX || a6 > UINT32_MAX || a8 > UINT32_MAX) return 0;
     const uint64_t chunk_count = a4 + a6 + 2u + (a9 ? 1u : 0u);
     if (chunk_count > (AJM_MAX_BUILDER_BYTES - sizeof(AjmJobChunk)) /
@@ -1637,6 +1861,7 @@ void register_audio_hle() {
     R("sceAjmInitialize", ajm_initialize);            R("sceAjmFinalize", ajm_finalize);
     R("sceAjmModuleRegister", ajm_module_register);   R("sceAjmModuleUnregister", ajm_module_unregister);
     R("sceAjmInstanceCreate", ajm_instance_create);   R("sceAjmInstanceDestroy", ajm_instance_destroy);
+    R("sceAjmBatchInitialize", ajm_batch_initialize);
     R("sceAjmBatchStartBuffer", ajm_batch_start);     R("sceAjmBatchWait", ajm_batch_wait);
     R("sceAjmBatchCancel", ajm_batch_cancel);
     R("sceAjmBatchJobControlBufferRa", ajm_batch_job_control_buffer_ra);
