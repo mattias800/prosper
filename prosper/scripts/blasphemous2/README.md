@@ -71,3 +71,26 @@ The title's optional `libfmodstudio.prx` and `libfmod.prx` must be prelinked as
 described by #638/#640. A run that stops before the first studio logo has not
 reached the #641 marker fix; a run that faults at guest `eboot+0x11f79d0` has not
 picked up the #642 URI parser.
+
+## Title-screen route (audio observation)
+
+`title-screen-idle.pad` presses Cross once to dismiss the intro, then sends **no further input** so the
+game rests on the title screen and its ambience/music soundtrack can start (it begins a few seconds
+after the title appears). The `reach-first-gameplay.pad` route deliberately presses Cross every three
+seconds and drives straight past this state, so the title soundtrack never plays under it — use the
+idle route whenever you are observing title/menu audio.
+
+Audio is verifiable without a human listening: `PROSPER_AUDIO_DUMP=<path>` records the final mixed
+output, so a run can be asserted on level/coverage.
+
+```bash
+PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
+PROSPER_VULKAN_LIB=libvulkan.so.1 PROSPER_AUDIO_DUMP=/tmp/t.raw \
+PROSPER_PAD_SCRIPT=@scripts/blasphemous2/title-screen-idle.pad \
+  ./build-linux/prosper-app --dump <PPSA13579-app0>
+# measure per-second peak/coverage of /tmp/t.raw.port16.raw
+```
+
+A healthy title screen holds a sustained non-zero level (coverage >80%). As of 2026-07-20 it does not:
+frame rate starves FMOD's per-frame update so streaming voices cannot be fed, leaving long silences
+(#1080, blocked on the performance issue #1082).
