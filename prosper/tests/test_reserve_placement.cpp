@@ -70,9 +70,16 @@ static bool span_is_free(uint64_t base, uint64_t len) {
 }
 
 static constexpr uint64_t kArenaHint  = 0x1000000000ull;   // 64 GiB — DQ7's live hint
-static constexpr uint64_t kArenaLen   = 0x8000000000ull;   // 512 GiB
 static constexpr uint64_t kArenaAlign = 0x200000ull;       // 2 MiB — DQ7's live align
 static constexpr uint64_t kHugeMin    = 0x2000000000ull;   // 128 GiB redirect threshold
+// DQ7's real arena is 512 GiB, but the redirect CONTRACT only needs a reservation >= the 128 GiB
+// threshold — and a 512 GiB reservation is fragile on the Windows CI runner: host high-entropy
+// ASLR scatters small allocations across the 880 GiB auto window, so a single mid-window occupant
+// can fragment it below 512 GiB contiguous and the reserve legitimately ENOMEMs (observed flaking
+// case 1). A 160 GiB "huge" reservation clears the threshold and reliably fits a free span in the
+// window regardless of occupancy, keeping the test deterministic while still exercising the huge
+// path (the real 512 GiB size is not load-bearing for any assertion here).
+static constexpr uint64_t kArenaLen   = 0x2800000000ull;   // 160 GiB (>= 128 GiB threshold)
 
 #ifdef __APPLE__
 // The macOS CI job runs x86_64 tests under Rosetta 2, whose VM tracking makes this test's
