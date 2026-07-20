@@ -7,11 +7,12 @@
 // syscall instruction directly and return -errno in-register; they never touch errno or TLS.
 #pragma once
 
-#if defined(__linux__) && defined(__x86_64__)
-
 #include <cerrno>
 #include <cstdint>
 #include <sys/mman.h>
+
+#if defined(__linux__) && defined(__x86_64__)
+
 #include <sys/syscall.h>
 
 namespace prosper {
@@ -45,4 +46,28 @@ inline long raw_write(int fd, const void* buf, uint64_t len) {
 
 } // namespace prosper
 
-#endif // __linux__ && __x86_64__
+#elif !defined(_WIN32)
+
+// Non-Linux POSIX (macOS): exec_image_linux.cpp is the shared POSIX substrate and compiles
+// here too. Host TLS is %gs-based on macOS x86-64, so libc's errno store never goes through
+// the guest's %fs — plain libc calls are handler-safe, and these wrappers just adapt them to
+// the same 0/-errno in-register contract the Linux asm versions provide.
+#include <unistd.h>
+
+namespace prosper {
+
+inline long raw_mmap_fixed_ro(uint64_t addr, uint64_t len) {
+    void* p = mmap((void*)addr, (size_t)len, PROT_READ,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (p == MAP_FAILED) return -(long)errno;
+    return (uint64_t)p == addr ? 0 : -EINVAL;
+}
+
+inline long raw_write(int fd, const void* buf, uint64_t len) {
+    long r = (long)write(fd, buf, (size_t)len);
+    return r < 0 ? -(long)errno : r;
+}
+
+} // namespace prosper
+
+#endif // platform
