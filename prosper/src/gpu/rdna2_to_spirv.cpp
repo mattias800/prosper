@@ -1904,10 +1904,11 @@ struct RegState {
     uint32_t scc = 0;          // scalar condition code (bool); set by s_cmp_*/SCC-writing SOP2, read by s_cselect
     uint32_t exec = 0;         // per-lane execution mask (bool); v_cmpx narrows it, output store honors it
     bool exec_narrowed = false; // true once EXEC is narrowed below all-lanes-on (so VGPR writes predicate)
-    // PC-relative EMBEDDED TABLES (#273): mubuf pc -> the table's dwords, resolved by
+    // PC-relative EMBEDDED TABLES (#273): load pc -> the table's dwords, resolved by
     // detect_pcrel_tables (an s_getpc_b64-derived V# whose num_records is a known constant). The
     // shader BLOB carries the table; the recompiler folds it into a compile-time constant lookup.
     std::unordered_map<uint32_t, std::vector<uint32_t>> mubuf_pcrel_tables;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> smem_pcrel_tables;
     // SCALAR-SPILL VGPR (#273 — DOLL's big post PS): the compiler packs excess wave-uniform scalars
     // into one VGPR's lanes via `v_writelane_b32 vN, sX, <const lane>` and reads them back with
     // `v_readlane_b32 sY, vN, <const lane>`. Per-invocation each (vgpr, lane) slot is just a named
@@ -3452,9 +3453,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             if (in.opcode == 0x1f) {   // s_getpc_b64
                 // Accepted ONLY when the pcrel pre-pass FOLDED an embedded-table load from this
-                // shader (rs.mubuf_pcrel_tables non-empty) — the pair then only feeds that folded
-                // chain. Otherwise the PC would flow into unmodeled address math: keep rejecting.
-                if (rs.mubuf_pcrel_tables.empty()) { ok = false; return true; }
+                // shader — the pair then only feeds that folded chain. Otherwise the PC would flow
+                // into unmodeled address math: keep rejecting.
+                if (rs.mubuf_pcrel_tables.empty() && rs.smem_pcrel_tables.empty()) {
+                    ok = false; return true;
+                }
                 for (int k = 0; k < 2; k++) {
                     rs.sreg.erase(in.dst.value + k); rs.sreg_srt.erase(in.dst.value + k);
                 }
@@ -4844,7 +4847,6 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // immediate byte offset (>>2 -> dword index); SBASE/descriptor base is folded into the
             // binding. N consecutive dwords -> SDATA..SDATA+N-1. Only the compute path binds the cbuf,
             // so reject in graphics stages (allow_smem=false). Register-offset SMEM not yet handled.
-            if (!allow_smem) { ok = false; return true; }
             uint32_t n = 0;
             switch (in.opcode) {
                 case 0x0: case 0x8: n = 1;  break;   // s_load_dword     / s_buffer_load_dword
@@ -4854,6 +4856,42 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x4: case 0xC: n = 16; break;   // s_load_dwordx16  / s_buffer_load_dwordx16
                 default: ok = false; return true;    // stores / others not yet
             }
+            // PC-relative scalar embedded table (#1054): this s_buffer_load consumes a descriptor
+            // built from s_getpc_b64 and a bounded table carried by the shader blob. Resolve it before
+            // the external-resource gate, exactly like the established MUBUF form. The byte offset is
+            // still the real tracked scalar value; an untracked SOFFSET remains fail-visible.
+            auto pcrel = rs.smem_pcrel_tables.find(in.pc);
+            if (pcrel != rs.smem_pcrel_tables.end()) {
+                uint32_t soff = 0;
+                const bool soff_null = in.src[1].kind == OperandKind::Special &&
+                                       in.src[1].value == 125;
+                if (soff_null) {
+                    soff = b.uconst(0);
+                } else if (in.src[1].kind == OperandKind::SGPR ||
+                           (in.src[1].kind == OperandKind::Special &&
+                            in.src[1].value >= 106 && in.src[1].value <= 123)) {
+                    auto tracked = rs.sreg.find(in.src[1].value);
+                    if (tracked == rs.sreg.end()) { ok = false; return true; }
+                    soff = tracked->second;
+                } else if (in.src[1].kind == OperandKind::InlineInt && in.src[1].value >= 0) {
+                    soff = b.uconst(static_cast<uint32_t>(in.src[1].value));
+                } else {
+                    ok = false; return true;
+                }
+                uint32_t idx = b.ibin(Op_ShiftRightLogical,
+                    b.ibin(Op_IAdd, soff, b.uconst(in.literal)), b.uconst(2));
+                for (uint32_t k = 0; k < n; ++k) {
+                    uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
+                    uint32_t value = b.uconst(0); // bounded V# OOB contract
+                    for (uint32_t t = 0; t < pcrel->second.size(); ++t)
+                        value = b.sel(b.ucmp(Op_IEqual, kidx, b.uconst(t)),
+                                      b.uconst(pcrel->second[t]), value);
+                    rs.sreg[in.dst.value + static_cast<int>(k)] = value;
+                    rs.sreg_srt.erase(in.dst.value + static_cast<int>(k));
+                }
+                return true;
+            }
+            if (!allow_smem) { ok = false; return true; }
             // SOFFSET handling. Immediate-only loads encode SOFFSET = SGPR_NULL (125). A register
             // SOFFSET adds an SGPR-computed byte offset:
             //  * a DESCRIPTOR s_load (x4/x8 = V#/T#) with a computed offset is the bindless fetch's
@@ -5979,10 +6017,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
 // the load) and returns: mubuf pc -> the table's dwords copied out of the blob.
 // CONFIDENCE: MED-HIGH — exact for the compiler idiom (verified against DOLL's dither PS); every
 // guard failure falls back to the old reject.
-std::unordered_map<uint32_t, std::vector<uint32_t>> detect_pcrel_tables(
+struct PcrelTables {
+    std::unordered_map<uint32_t, std::vector<uint32_t>> mubuf;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> smem;
+};
+
+PcrelTables detect_pcrel_tables(
         const std::vector<Rdna2Inst>& ins, const uint32_t* code, size_t dwords,
         size_t* required_dwords = nullptr) {
-    std::unordered_map<uint32_t, std::vector<uint32_t>> out;
+    PcrelTables out;
     std::unordered_map<int, uint64_t> pcoff;   // reg -> byte offset into the code blob (pair LO half)
     std::unordered_set<int> pchi;              // regs holding the matching HI half
     std::unordered_map<int, uint32_t> kconst;  // reg -> compile-time constant (s_mov_b32 literal/inline)
@@ -6059,6 +6102,37 @@ std::unordered_map<uint32_t, std::vector<uint32_t>> detect_pcrel_tables(
                 uint32_t n = 1;
                 switch (in.opcode) { case 0x1: case 0x9: n=2; break; case 0x2: case 0xA: n=4; break;
                     case 0x3: case 0xB: n=8; break; case 0x4: case 0xC: n=16; break; default: break; }
+                // Scalar-buffer form of the same compiler idiom: SBASE is the getpc-built V#, while
+                // SOFFSET selects a row from the embedded table. Inspect it before killing SDATA facts.
+                const int sb = in.src[0].value;
+                if (in.opcode >= 0x8 && in.opcode <= 0xC && pcoff.count(sb) &&
+                    pchi.count(sb + 1) && kconst.count(sb + 2) && kconst.count(sb + 3)) {
+                    const uint32_t nrec = kconst[sb + 2];
+                    const uint64_t off = pcoff[sb];
+                    uint32_t newest = 0;
+                    for (int r : {sb, sb + 1, sb + 2, sb + 3}) {
+                        auto fact = fact_pc.find(r);
+                        if (fact != fact_pc.end() && fact->second > newest) newest = fact->second;
+                    }
+                    bool entered = false;
+                    for (uint32_t target : br_targets)
+                        if (target > newest && target <= in.pc) { entered = true; break; }
+                    const bool supported_soffset =
+                        (in.src[1].kind == OperandKind::Special && in.src[1].value == 125) ||
+                        in.src[1].kind == OperandKind::SGPR ||
+                        (in.src[1].kind == OperandKind::Special && in.src[1].value >= 106 &&
+                         in.src[1].value <= 123) ||
+                        (in.src[1].kind == OperandKind::InlineInt && in.src[1].value >= 0);
+                    if (!entered && supported_soffset && static_cast<int32_t>(in.literal) >= 0 &&
+                        !(off & 3u) && !(nrec & 3u) && nrec && nrec <= 1024 &&
+                        off / 4 + nrec / 4 <= dwords) {
+                        if (required_dwords)
+                            *required_dwords = std::max(*required_dwords,
+                                static_cast<size_t>(off / 4 + nrec / 4));
+                        out.smem[in.pc] = std::vector<uint32_t>(
+                            code + off / 4, code + off / 4 + nrec / 4);
+                    }
+                }
                 for (uint32_t k = 0; k < n; k++) kill(in.dst.value + (int)k);
                 break;
             }
@@ -6092,7 +6166,7 @@ std::unordered_map<uint32_t, std::vector<uint32_t>> detect_pcrel_tables(
                 if (required_dwords)
                     *required_dwords = std::max(*required_dwords,
                                                 static_cast<size_t>(off / 4 + nrec / 4));
-                out[in.pc] = std::vector<uint32_t>(code + off / 4, code + off / 4 + nrec / 4);
+                out.mubuf[in.pc] = std::vector<uint32_t>(code + off / 4, code + off / 4 + nrec / 4);
                 (void)offen;                                       // offen just adds the runtime index
                 break;
             }
@@ -6720,6 +6794,7 @@ bool emit_compute_cfg_state_machine(
         state.exec = b.load_function(b.t_bool, exec_var);
         state.exec_narrowed = true; // state-machine joins may carry a narrowed EXEC edge
         state.mubuf_pcrel_tables = initial.mubuf_pcrel_tables;
+        state.smem_pcrel_tables = initial.smem_pcrel_tables;
         return state;
     };
     auto save_state = [&](const RegState& state) {
@@ -7214,8 +7289,12 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                const std::function<bool(const Rdna2Inst&)>& exp_fn,
                const uint32_t* code = nullptr, size_t dwords = 0) {   // raw stream (forward-if target check)
     // Fold PC-relative embedded-table loads (s_getpc_b64-built V#s) before the walk — emit_alu's
-    // MUBUF/SOP1 handlers consult rs.mubuf_pcrel_tables (#273).
-    if (code) rs.mubuf_pcrel_tables = detect_pcrel_tables(ins, code, dwords);
+    // SMEM/MUBUF/SOP1 handlers consult the proven table maps (#273/#1054).
+    if (code) {
+        PcrelTables tables = detect_pcrel_tables(ins, code, dwords);
+        rs.mubuf_pcrel_tables = std::move(tables.mubuf);
+        rs.smem_pcrel_tables = std::move(tables.smem);
+    }
     std::unordered_set<uint32_t> effective_safe = safe;
     const std::unordered_set<uint32_t> dead_masks = dead_wave_mask_writes(ins);
     const CountedLoop L = detect_counted_loop(ins);
