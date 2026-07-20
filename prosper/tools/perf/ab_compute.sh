@@ -61,6 +61,7 @@ tail_fps() {
 }
 
 bad=0
+valid=0
 for rep in $(seq 1 "$REPS"); do
   # Re-check contention every rep: a competing process can start mid-sweep, and a startup-only
   # check would let it silently skew the remaining reps.
@@ -81,12 +82,25 @@ for rep in $(seq 1 "$REPS"); do
   order=$([ $((rep % 2)) -eq 1 ] && echo "OFF-first" || echo "ON-first")
   echo "rep$rep ($order)  compute ms/call  OFF run=${off:-n/a} tail=${offt:-n/a}   ON run=${on:-n/a} tail=${ont:-n/a}"
   echo "rep$rep ($order)  frame rate       OFF tail=${offf:-n/a} fps            ON tail=${onf:-n/a} fps"
-  # A run that produced no timing is a FAILED measurement, not a zero result. Reporting n/a and
-  # exiting 0 would let a harness that never launched anything read as a clean benchmark.
-  for v in "$off" "$on"; do [ -n "$v" ] || bad=1; done
+  # A blind timed route can desync and leave a run stuck in menus (cheap frames, ~180 fps, almost
+  # no compute) or produce no timing at all. Neither is a valid sample of the gameplay workload.
+  # Require a floor of compute calls in BOTH arms; a rep failing it is DISCARDED (not counted) and
+  # the sweep continues -- one desync must not fail an otherwise-good sweep on a flaky route.
+  floor="${AB_MIN_COMPUTE_CALLS:-2000}"
+  rep_ok=1
+  for arm in "off_$rep" "on_$rep"; do
+    cc=$(grep -oE '\[render-timing\] compute calls=[0-9]+' "$OUT/$arm.log" 2>/dev/null | tail -1 | grep -oE '[0-9]+')
+    if [ -z "$cc" ] || [ "$cc" -lt "$floor" ]; then
+      echo "rep$rep  DISCARDED: $arm reached only ${cc:-0} compute calls (< $floor) -- route desynced, not gameplay" >&2
+      rep_ok=0
+    fi
+  done
+  [ -n "$off" ] && [ -n "$on" ] || rep_ok=0
+  [ "$rep_ok" -eq 1 ] && valid=$((valid+1))
 done
-echo "# finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-if [ "$bad" -ne 0 ]; then
-  echo "MEASUREMENT FAILED: at least one run produced no [render-timing] output; see $OUT" >&2
+echo "# finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)  valid_reps=$valid/$REPS"
+need="${AB_MIN_VALID_REPS:-3}"
+if [ "$valid" -lt "$need" ]; then
+  echo "MEASUREMENT FAILED: only $valid/$REPS reps reached the gameplay workload (need $need); see $OUT" >&2
   exit 1
 fi

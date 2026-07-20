@@ -533,6 +533,60 @@ void storage_unpack_range(const uint8_t* src, size_t src_stride, prosper::gpu::D
             return;
     }
 }
+// Range-specialized pack (#1101): the writeback mirror of storage_unpack_range (#1092). Hoists the
+// per-texel format dispatch out of the loop with per-format inner loops; packed formats keep the
+// general per-texel path. Semantics are IDENTICAL to storage_pack_texel over the range -- asserted
+// format-by-format by test_storage_pack_range.
+void storage_pack_texel(const uint32_t in[4], prosper::gpu::DataFormat f, uint32_t ncomp, uint8_t* dst);
+void storage_pack_range(const uint32_t* channels, prosper::gpu::DataFormat f, uint32_t ncomp,
+                        size_t count, uint8_t* dst, size_t dst_stride) {
+    using DF = prosper::gpu::DataFormat;
+    const uint32_t n = ncomp < 4u ? ncomp : 4u;
+    switch (f) {
+        case DF::Unorm8:
+            for (size_t t = 0; t < count; ++t) {
+                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
+                for (uint32_t c = 0; c < n; ++c) p[c] = storage_pack_unorm8(in[c]);
+            }
+            return;
+        case DF::Float16:
+            for (size_t t = 0; t < count; ++t) {
+                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
+                for (uint32_t c = 0; c < n; ++c) {
+                    float v; std::memcpy(&v, &in[c], 4);
+                    const uint16_t h = prosper::gpu::float_to_half(v);
+                    p[c * 2] = static_cast<uint8_t>(h);
+                    p[c * 2 + 1] = static_cast<uint8_t>(h >> 8);
+                }
+            }
+            return;
+        case DF::Uint8: case DF::Sint8:
+            for (size_t t = 0; t < count; ++t) {
+                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
+                for (uint32_t c = 0; c < n; ++c) p[c] = static_cast<uint8_t>(in[c]);
+            }
+            return;
+        case DF::Uint16: case DF::Sint16:
+            for (size_t t = 0; t < count; ++t) {
+                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
+                for (uint32_t c = 0; c < n; ++c) {
+                    p[c * 2] = static_cast<uint8_t>(in[c]);
+                    p[c * 2 + 1] = static_cast<uint8_t>(in[c] >> 8);
+                }
+            }
+            return;
+        case DF::Float32: case DF::Uint32: case DF::Sint32:
+            for (size_t t = 0; t < count; ++t) {
+                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
+                for (uint32_t c = 0; c < n; ++c) std::memcpy(p + c * 4, &in[c], 4);
+            }
+            return;
+        default:                                  // packed formats keep the general per-texel path
+            for (size_t t = 0; t < count; ++t)
+                storage_pack_texel(channels + t * 4, f, ncomp, dst + t * dst_stride);
+            return;
+    }
+}
 void storage_pack_texel(const uint32_t in[4], prosper::gpu::DataFormat f, uint32_t ncomp, uint8_t* dst) {
     using DF = prosper::gpu::DataFormat;
     if (f == DF::Float10_11_11) {
@@ -619,9 +673,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     double pack_ms = 0.0;
     double layout_ms = 0.0;
     const bool trace = trace_compute_item(item);
+    const auto setup_validate_start = ComputeClock::now();
     auto report = validate_spirv_descriptor_interface(
         item.spirv, item.resources.get(), 0, SpirvShaderStage::Compute, false);
     if (!report.ok()) return false;
+    double setup_validate_ms = std::chrono::duration<double, std::milli>(
+        ComputeClock::now() - setup_validate_start).count();
+    double setup_buffers_ms = 0.0;
 
     std::vector<SpirvDescriptorBinding> descriptors;       // storage buffers
     std::vector<SpirvDescriptorBinding> image_descriptors; // sampled + storage images (#590)
@@ -782,6 +840,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         bool buffers_ready = true;
         for (const auto& buffer : buffers) buffers_ready &= buffer.resource && buffer.memory;
         if (!buffers_ready) break;
+        setup_buffers_ms = std::chrono::duration<double, std::milli>(
+            ComputeClock::now() - setup_validate_start).count() - setup_validate_ms;
 
         // --- Image bindings (#590): sampled textures use RGBA8 unless integer/packed-float semantics
         // require a native view; storage images are R32G32B32A32_UINT raw-channel texels (the recompiler's
@@ -1831,10 +1891,40 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         bi.nonzero_channels += channels[t * 4 + c] != 0;
             }
             const auto pack_start = ComputeClock::now();
-            for (size_t t = 0; t < texels; t++)
-                storage_pack_texel(channels + t * 4, r->format, nc,
-                                   linear.data() + t * guest_texel);
+            static const bool pack_range_enabled = !std::getenv("PROSPER_NO_PACK_RANGE");
+            if (pack_range_enabled) {
+                storage_pack_range(channels, r->format, nc, texels, linear.data(), guest_texel);
+            } else {
+                for (size_t t = 0; t < texels; t++)
+                    storage_pack_texel(channels + t * 4, r->format, nc,
+                                       linear.data() + t * guest_texel);
+            }
             const auto pack_done = ComputeClock::now();
+            static const bool verify_pack = std::getenv("PROSPER_VERIFY_PACK") != nullptr;
+            if (verify_pack) {
+                // Fail-visible A/B (mirrors PROSPER_VERIFY_UNPACK): the specialized range pack must
+                // be bit-identical to the per-texel path it replaces, verified against the real
+                // workload's texels. Logs the clean case too, so a verified run is self-proving.
+                std::vector<uint8_t> expect(guest_texel);
+                size_t bad = 0, first_bad = 0;
+                for (size_t t = 0; t < texels; ++t) {
+                    std::memset(expect.data(), 0, expect.size());
+                    storage_pack_texel(channels + t * 4, r->format, nc, expect.data());
+                    if (std::memcmp(expect.data(), linear.data() + t * guest_texel,
+                                    guest_texel) != 0) {
+                        if (!bad) first_bad = t;
+                        ++bad;
+                    }
+                }
+                std::fprintf(stderr,
+                             "[compute] pack-verify binding=%u addr=0x%llx fmt=%u nc=%u "
+                             "texels=%zu mismatches=%zu%s\n",
+                             bi.binding, (unsigned long long)r->gpu_addr, (unsigned)r->format,
+                             nc, texels, bad, bad ? " MISMATCH" : "");
+                if (bad)
+                    std::fprintf(stderr, "[compute] pack-verify first mismatch texel=%zu\n",
+                                 first_bad);
+            }
             uint8_t* destination = resource_bytes_for(r, bi.guest_bytes);
             if (r->tile_mode && r->depth > 1) {
                 if (!tile_volume(destination, bi.guest_bytes, linear.data(), r->width, r->height,
@@ -1939,11 +2029,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         };
         std::fprintf(stderr,
                      "[compute-phase] submit=%llu code=0x%llx ok=%u "
-                     "setup_ms=%.2f pipeline_ms=%.2f dispatch_ms=%.2f "
+                     "setup_ms=%.2f setup_validate_ms=%.2f setup_buffers_ms=%.2f "
+                     "pipeline_ms=%.2f dispatch_ms=%.2f "
                      "writeback_ms=%.2f pack_ms=%.2f layout_ms=%.2f "
                      "cleanup_ms=%.2f total_ms=%.2f\n",
                      (unsigned long long)item.submit_no, (unsigned long long)item.code_addr,
                      ok ? 1u : 0u, milliseconds(phase_start, phase_setup),
+                     setup_validate_ms, setup_buffers_ms,
                      milliseconds(phase_setup, phase_pipeline),
                      milliseconds(phase_pipeline, phase_dispatch),
                      milliseconds(phase_dispatch, phase_writeback),
