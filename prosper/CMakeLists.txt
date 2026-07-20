@@ -173,6 +173,13 @@ if(TARGET prosper_core)
   add_executable(test_fs_emu tests/test_fs_emu.cpp)
   add_test(NAME fs_emu_decode COMMAND test_fs_emu)
 
+  # Signal-handler-safe raw syscalls (src/host/raw_syscall.hpp): the fault_handler's
+  # PROSPER_NULL_PAGE backing must not touch errno/TLS on guest-%fs threads (issue #1071).
+  if(UNIX AND NOT APPLE)
+    add_executable(test_raw_syscall tests/test_raw_syscall.cpp)
+    add_test(NAME raw_syscall COMMAND test_raw_syscall)
+  endif()
+
   # sceAudioOut HLE: format decode, port lifecycle, PCM forwarding, volume, batch, error paths
   # (via a capturing AudioSink — headless, no device).
   add_executable(test_audio tests/test_audio.cpp)
