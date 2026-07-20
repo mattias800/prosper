@@ -1031,8 +1031,11 @@ void ime_deliver(uint64_t handler, const ImeKeyEvent& ev) {
     *(uint32_t*)(e + 0x00) = ev.down ? 0x101u : 0x102u;
     *(uint16_t*)(e + 0x08) = ev.hid;
     // Guest handler is SysV-ABI and runs on the guest thread (guest %fs active) — call directly,
-    // exactly as h_qsort calls the guest comparator.
-    ((void (*)(uint64_t, void*))(uintptr_t)handler)(0, e);
+    // exactly as h_qsort calls the guest comparator. arg (rdi) is passed 0: PPSA02664's handler
+    // ignores it; a title whose handler consumes the Open-registered arg is not yet modeled (it
+    // would need the arg captured from the sceImeKeyboardOpen param). The PROSPER_SYSV_ABI marker
+    // documents the host->guest boundary (currently expands empty; see dispatch.hpp).
+    ((void (PROSPER_SYSV_ABI *)(uint64_t, void*))(uintptr_t)handler)(0, e);
 }
 
 // PROSPER_IME_AUTOKEY=1: deliver a repeating Enter down/up pulse so headless routes advance a

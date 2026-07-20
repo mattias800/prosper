@@ -392,13 +392,15 @@ if(TARGET prosper_core)
 
   # Direct-memory allocate/available (issue #99): AvailableDirectMemorySize reports the largest
   # free aligned block in the search window and writes both out-params (was a total-size stub).
-  add_executable(test_ime_input tests/test_ime_input.cpp)
-  target_link_libraries(test_ime_input PRIVATE prosper_core)
-  add_test(NAME ime_input COMMAND test_ime_input)
-
   add_executable(test_dmem tests/test_dmem.cpp)
   target_link_libraries(test_dmem PRIVATE prosper_core)
   add_test(NAME dmem_available COMMAND test_dmem)
+
+  # IME keyboard event delivery (issue #1093): sceImeUpdate must invoke the guest handler
+  # per queued key event; the old stub delivered none.
+  add_executable(test_ime_input tests/test_ime_input.cpp)
+  target_link_libraries(test_ime_input PRIVATE prosper_core)
+  add_test(NAME ime_input COMMAND test_ime_input)
 
   # Huge non-fixed sceKernelReserveVirtualRange placement (#312/#946): the 512 GiB UE arena
   # must be steered off its low hint into the guest auto window (see test for the contract).

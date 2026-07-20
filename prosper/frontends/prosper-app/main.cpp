@@ -20,6 +20,7 @@
 #include "loader/linker.hpp"           // Program
 #include "input/pad.hpp"               // keyboard -> libScePad (HostPadState / PadBackend)
 #include "pad_overlay.hpp"              // keyboard pad 0 composed over the physical controller backend
+#include "hle/ime_input.hpp"           // #1093: forward host keyboard keys to the guest IME path
 #include "present_mode.hpp"             // explicit swapchain latency/vsync policy, pure regression seam
 #include "window_controls.hpp"           // debounced app-window shortcuts, pure regression seam
 #ifdef PROSPER_HAVE_LIVE_RENDERER
@@ -604,6 +605,12 @@ int main(int argc, char** argv) {
                 key.f11 = ev.key.key == SDLK_F11;
                 key.enter = ev.key.key == SDLK_RETURN || ev.key.key == SDLK_KP_ENTER;
                 key.alt = (ev.key.mod & SDL_KMOD_ALT) != 0;
+                // #1093: forward app-window keys to the guest's IME keyboard path. Titles like
+                // PPSA02664 read input through sceImeUpdate, not libScePad. SDL3 scancodes ARE USB
+                // HID usage ids for the keyboard page — exactly the keycode the guest event wants.
+                // Deliver clean press/release edges (skip auto-repeat).
+                if (key.app_window && !ev.key.repeat)
+                    prosper::ime_push_key((uint16_t)ev.key.scancode, ev.key.down);
                 switch (windowControls.handle_key(key)) {
                 case prosper::frontend::AppWindowCommand::quit:
                     running = false;
