@@ -809,6 +809,58 @@ GC suspension continue. The same binary and route can pass on a retry. This is t
 [#712](https://github.com/mattias800/ps5ys/issues/712); do not misclassify it as a renderer-cache
 regression without checking the submit count and suspend logs.
 
+## Renderer-owned RTT sampling: direct image binding (#1091 phase 1 / #1095 phase 2)
+
+The renderer and the compute backend historically created SEPARATE Vulkan devices, so a surface the
+renderer owned could not be handed to a dispatch at all. Sampling one cost a full GPU->CPU readback of
+the persistent color target, a per-texel conversion, a fresh `VkImage`, and a re-upload of those same
+pixels to the GPU. `live_renderer.cpp` recorded the constraint directly: "Compute cannot import that
+color attachment directly."
+
+Phase 1 (#1091, merged as #1092) removed the premise: the renderer publishes its `VkDevice`, physical
+device, queue and queue family through `SharedVulkanContext`, and compute ADOPTS that context when it
+is present and feature-adequate. An adopted context is *borrowed* -- the consumer destroys none of it.
+Compute still creates its own device when no renderer is registered, so headless compute-only use is
+unaffected. Phase 1 is an enabler, not an optimization: a 3-rep A/B measured no throughput change
+(7.74 ms / 45.1 fps shared vs 7.85 ms / 46.0 fps separate), which is the intended result.
+
+Phase 2 (#1095) takes the win. **Measure the binding mix before designing the import.** Instrumentation
+showed renderer-owned compute bindings run about **1000 sampled to 1 storage** -- essentially all
+read-only. That deleted the two hardest requirements from the original sketch: no
+`VK_IMAGE_USAGE_STORAGE_BIT` is needed (`SAMPLED_BIT` is already set on persistent targets), and there
+is no guest writeback contract to preserve, because nothing is written. Every renderer-owned sampled
+binding in the measured route had a single shape: `Unorm8` x4 against an rgba8 target.
+
+Two rules keep the fast path honest, and both are load-bearing:
+
+- **Authority.** The import is offered only while the persistent Vulkan image is the authoritative copy
+  -- exactly when the existing reader would have had to materialize it (`!surface.rgba` or a size
+  mismatch, and `surface.gpu_valid`). The CPU RTT copy and the GPU image are kept coherent by
+  *invalidation*, not by one always being fresher, so whenever a CPU snapshot exists it may be the newer
+  truth (#780) and the snapshot path must still be used. Importing unconditionally would silently
+  resurrect stale pixels.
+- **Exactness.** Only a sampled, non-aliased, single-layer `Unorm8` x4 view whose extent, format and
+  device all match falls through. That shape's host path is a plain `memcpy` into a
+  `VK_FORMAT_R8G8B8A8_UNORM` image, which is precisely what the direct bind produces, so the fast path
+  is byte-identical rather than merely close. `rgba16f` targets deliberately keep the host path: the
+  format selector has no RGBA16F option and converts them down to UNORM8.
+
+The borrowed image gets its own view (preserving T# `DST_SEL` swizzle routing), is barriered into the
+`GENERAL` layout the descriptors declare, and is restored to the layout its owner left it in so the
+renderer's own tracking stays true. The cache entry is pinned per successful import and released per
+import, including on every failure path. `PROSPER_NO_DIRECT_RTT_BIND=1` forces the host path for A/B.
+
+Blasphemous 2 title route, 3 alternating reps: 731 direct binds, zero fallbacks to the host path, zero
+validation errors. Compute call **7.63 -> 6.62 ms** mean (about 13%), with every enabled run faster than
+every disabled run, and the compute memory pool dropping **80.1 -> 63.7 MiB** (9 -> 7 cached
+allocations) as the per-dispatch staging buffer and duplicate image disappear.
+
+**Route caveat.** These numbers come from a title-screen/menu route. That scene's draw and dispatch mix
+is not representative of gameplay, and optimizations must be validated on both -- a change that helps a
+UI-heavy scene can be neutral once real geometry and lighting dominate. Use the tail of the rolling
+`[render-window] compute ... avg_ms` line (reset every 25 calls) to measure a gameplay section without
+diluting it with loading and menus. Tracked on [#1082](https://github.com/mattias800/ps5ys/issues/1082).
+
 ## Next renderer step
 
 Bring up a representative Unreal/3D workload and collect the same stage timings plus a corrected
