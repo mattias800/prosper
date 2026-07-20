@@ -9,6 +9,14 @@
 #include "../host/guest_memory_map.hpp"
 #include "../host/guest_write_watch.hpp"
 
+namespace prosper {
+// #312/#946 huge-reserve redirect threshold, shared by the Linux and Windows reserve paths (one
+// definition so the platforms cannot drift): a non-fixed hinted reservation of at least this size
+// (only UE's 512 GiB MallocBinned3 flex arena qualifies) is steered off its low hint into the
+// guest auto window. See k_reserve_vrange (POSIX) / win_reserve (Windows).
+inline constexpr uint64_t kHugeReserveLen = 0x2000000000ull;   // 128 GiB
+}
+
 #if defined(__linux__) || defined(__APPLE__)
 #include "../host/posix_shim.hpp"
 #include <sys/mman.h>
@@ -665,7 +673,12 @@ HLE(k_reserve_vrange) {
             bool ours = false;
             { std::lock_guard<std::mutex> lk(g_mx);
               for (auto& m : g_maps)
-                  if (!m.committed && hint >= m.base && hint < m.base + m.size) { ours = true; break; } }
+                  // Idempotent only when the WHOLE requested span is contained: matching on the
+                  // hint alone let a large re-reserve false-succeed backed by a smaller range at
+                  // the same base (e.g. the 64 MiB metadata pool at the arena's old 0x1000000000
+                  // hint after #312's huge-reserve redirect) — success with mostly-unreserved VA.
+                  if (!m.committed && hint >= m.base && hint < m.base + m.size &&
+                      a1 <= m.base + m.size - hint) { ours = true; break; } }
             if (ours) {
                 if (a0) *(uint64_t*)a0 = hint;
                 MLOG("reserve hint=0x%llx re-reserve-of-own-range -> OK\n", (unsigned long long)hint);
@@ -678,7 +691,15 @@ HLE(k_reserve_vrange) {
         MLOG("reserve(fixed) -> 0x%llx len=0x%llx align=0x%llx\n", (unsigned long long)p, (unsigned long long)a1, (unsigned long long)align);
         return 0;
     }
-    if (hint) {
+    // #312/#946: a HUGE non-fixed reservation (UE MallocBinned3's 512 GiB arena — hint
+    // 0x1000000000, len 0x8000000000, align 0x200000, live-captured) must NOT be searched from
+    // its low hint. A flag-less hint is only a search start, and honoring it literally races
+    // prosper's own low guest-VA occupants: with the arena based at 0x1000000000 the boot
+    // corrupts MallocBinned3 metadata (#312). Only the flex arena is >= 128 GiB, so steer such
+    // reservations into the guest auto-map region (map_guest_auto below, placement A/B-validated
+    // in the #982 investigation), leaving the low hint free for the small metadata pool the
+    // guest reserves next with the same hint. The auto window bounds are untouched.
+    if (hint && a1 < kHugeReserveLen) {
         // Non-fixed hint: search for a free range starting at the hint. Probe candidates with
         // MAP_FIXED_NOREPLACE (also catches host mappings the tracker doesn't know); on a miss,
         // skip past whichever TRACKED mapping covers the candidate (fast-forwards the search past
@@ -2215,6 +2236,38 @@ namespace {
             remember_free_placeholder_locked(base, size);
     }
 
+    // OS-chosen placeholder inside the guest auto window, with a caller-narrowed lowest bound.
+    // The upper bound is ALWAYS kGuestAutoVaMax: the shared window is never widened (raising it
+    // into the PS5-libc-rejected 1-8 TiB gap is what sank #982); `lowest` only narrows placement
+    // WITHIN the window (the huge-reserve top band in win_reserve).
+    AcquiredPlaceholder acquire_placeholder_window_locked(uint64_t lowest, uint64_t len,
+                                                          uint64_t align) {
+        const PlaceholderApis& apis = placeholder_apis();
+        if (!apis.virtual_alloc2 || !apis.map_view_of_file3 ||
+            !apis.unmap_view_of_file2 || !len || (len & 0xfff) ||
+            (align && (align & (align - 1)))) return {};
+        if (lowest < kGuestAutoVaMin || lowest > kGuestAutoVaMax) return {};
+        MEM_ADDRESS_REQUIREMENTS requirements{};
+        requirements.LowestStartingAddress =
+            reinterpret_cast<void*>(static_cast<uintptr_t>(lowest));
+        requirements.HighestEndingAddress =
+            reinterpret_cast<void*>(static_cast<uintptr_t>(kGuestAutoVaMax));
+        requirements.Alignment = static_cast<SIZE_T>(
+            std::max<uint64_t>(align ? align : 0x4000, kWinAllocationGranularity));
+        MEM_EXTENDED_PARAMETER parameter{};
+        parameter.Type = MemExtendedParameterAddressRequirements;
+        parameter.Pointer = &requirements;
+        if (len > UINT64_MAX - (kWinAllocationGranularity - 1)) return {};
+        const uint64_t cover_size = align_up(len, kWinAllocationGranularity);
+        void* cover = apis.virtual_alloc2(
+            GetCurrentProcess(), nullptr, static_cast<SIZE_T>(cover_size),
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, &parameter, 1);
+        if (!cover) return {};
+        const uint64_t base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cover));
+        remember_free_placeholder_locked(base, cover_size);
+        return {take_free_placeholder_locked(base, len, align), PlaceholderOwner::Free};
+    }
+
     AcquiredPlaceholder acquire_placeholder_locked(uint64_t hint, uint64_t len,
                                                    uint64_t align, bool allow_guest) {
         const PlaceholderApis& apis = placeholder_apis();
@@ -2245,25 +2298,7 @@ namespace {
             return {take_free_placeholder_locked(hint, len, align), PlaceholderOwner::Free};
         }
 
-        MEM_ADDRESS_REQUIREMENTS requirements{};
-        requirements.LowestStartingAddress =
-            reinterpret_cast<void*>(static_cast<uintptr_t>(kGuestAutoVaMin));
-        requirements.HighestEndingAddress =
-            reinterpret_cast<void*>(static_cast<uintptr_t>(kGuestAutoVaMax));
-        requirements.Alignment = static_cast<SIZE_T>(
-            std::max<uint64_t>(align ? align : 0x4000, kWinAllocationGranularity));
-        MEM_EXTENDED_PARAMETER parameter{};
-        parameter.Type = MemExtendedParameterAddressRequirements;
-        parameter.Pointer = &requirements;
-        if (len > UINT64_MAX - (kWinAllocationGranularity - 1)) return {};
-        const uint64_t cover_size = align_up(len, kWinAllocationGranularity);
-        void* cover = apis.virtual_alloc2(
-            GetCurrentProcess(), nullptr, static_cast<SIZE_T>(cover_size),
-            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, &parameter, 1);
-        if (!cover) return {};
-        const uint64_t base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cover));
-        remember_free_placeholder_locked(base, cover_size);
-        return {take_free_placeholder_locked(base, len, align), PlaceholderOwner::Free};
+        return acquire_placeholder_window_locked(kGuestAutoVaMin, len, align);
     }
 
     bool protect_committed_regions(uint64_t base, uint64_t len, int hp) {
@@ -2973,6 +3008,45 @@ namespace {
     // Reserve (no commit). Modern Windows placeholders can be partitioned at the guest's 16 KiB
     // page boundary and later replaced by either a section view or private pages.
     void* win_reserve(uint64_t hint, uint64_t len, bool fixed, uint64_t align) {
+        // #946/#312: a HUGE non-fixed reservation (UE MallocBinned3's 512 GiB arena, hint
+        // 0x1000000000) must not be placed at its literal low hint — a flag-less hint is a
+        // search start, and the low base overlaps prosper's low guest-VA occupants (the #946
+        // __cxa_guard deadlock; the Linux face is the #312 MB3 corruption). It must also never
+        // fall to an unconstrained VirtualAlloc: an out-of-window arena makes the guest's
+        // arena-relative batchmaps exceed the window and ENOMEM (a second wedge). Place it via
+        // window-bounded placeholders ONLY, preferring the TOP of the window so the low window
+        // stays contiguous for ordinary auto-maps; the shared window bounds themselves are
+        // untouched (widening kGuestAutoVaMax into the PS5-libc-rejected 1-8 TiB gap sank #982).
+        // On placeholder-less hosts this returns ENOMEM rather than a dangerous base.
+        if (!fixed && hint && len >= kHugeReserveLen) {
+            std::lock_guard<std::mutex> lk(g_dview_mx);
+            const uint64_t granule =
+                std::max<uint64_t>(align ? align : 0x4000, kWinAllocationGranularity);
+            const uint64_t span = align_up(len, kWinAllocationGranularity);
+            // Recycle a freed placeholder first (window-bounded via the hint-less take path): an
+            // unmapped huge arena's VA stays OS-reserved as a free placeholder, so without this a
+            // reserve->unmap->re-reserve cycle exhausts the window and ENOMEMs (review finding on
+            // #1084; Linux reuses freed VA naturally via the cursor wrap).
+            AcquiredPlaceholder acquired{};
+            if (void* recycled = take_free_placeholder_locked(0, len, align))
+                acquired = {recycled, PlaceholderOwner::Free};
+            if (!acquired.address && span <= kGuestAutoVaMax + 1 - kGuestAutoVaMin) {
+                const uint64_t band_low = (kGuestAutoVaMax + 1 - span) & ~(granule - 1);
+                if (band_low >= kGuestAutoVaMin)
+                    acquired = acquire_placeholder_window_locked(band_low, len, align);
+            }
+            if (!acquired.address) {  // band contended/undersized: anywhere in-window
+                acquired = acquire_placeholder_window_locked(kGuestAutoVaMin, len, align);
+                if (acquired.address)
+                    MLOG("reserve(huge) top band unavailable — whole-window fallback -> 0x%llx\n",
+                         (unsigned long long)(uintptr_t)acquired.address);
+            }
+            if (!acquired.address) return nullptr;
+            const uint64_t base =
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(acquired.address));
+            remember_guest_placeholder_locked(base, len);
+            return acquired.address;
+        }
         {
             std::lock_guard<std::mutex> lk(g_dview_mx);
             AcquiredPlaceholder acquired =
@@ -3686,7 +3760,12 @@ HLE(k_reserve_vrange) {
         bool ours = false;
         { std::lock_guard<std::mutex> lk(g_mx);
           for (auto& m : g_maps)
-              if (!m.committed && hint >= m.base && hint < m.base + m.size) { ours = true; break; } }
+              // Idempotent only when the WHOLE requested span is contained (mirrors the Linux
+              // FIXED branch): a hint-only match let a large re-reserve false-succeed backed by
+              // a smaller range at the same base (the 64 MiB metadata pool at the arena's old
+              // 0x1000000000 hint after #312's huge-reserve redirect).
+              if (!m.committed && hint >= m.base && hint < m.base + m.size &&
+                  a1 <= m.base + m.size - hint) { ours = true; break; } }
         if (ours) { if (a0) *(uint64_t*)a0 = hint;
                     MLOG("reserve hint=0x%llx re-reserve-of-own-range -> OK\n", (unsigned long long)hint);
                     return 0; }
