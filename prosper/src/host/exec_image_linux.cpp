@@ -1589,7 +1589,7 @@ namespace {
                                  " (vm.mmap_min_addr/CAP_SYS_RAWIO)\n",
                                  (unsigned long long)a,
                                  (unsigned long long)(rip - 0x400000000ull), mr);
-                syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
+                raw_write(2, b, (uint64_t)n);   /* not even glibc syscall(): it stores errno via %fs on failure */
             }
         }
         // Null-companion skip probe (diagnostic; see g_skip_null_companion). Redirect the reader past

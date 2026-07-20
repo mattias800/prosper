@@ -32,6 +32,17 @@ inline long raw_mmap_fixed_ro(uint64_t addr, uint64_t len) {
     return (uint64_t)ret == addr ? 0 : -EINVAL;                  // MAP_FIXED must land at addr
 }
 
+// write(2) without errno/TLS access: returns the byte count or a negative errno value.
+// For handler diagnostics; callers may ignore the result (best-effort logging).
+inline long raw_write(int fd, const void* buf, uint64_t len) {
+    long ret;
+    __asm__ volatile("syscall"
+                     : "=a"(ret)
+                     : "0"((long)SYS_write), "D"((long)fd), "S"(buf), "d"(len)
+                     : "rcx", "r11", "memory");
+    return ret;
+}
+
 } // namespace prosper
 
 #endif // __linux__ && __x86_64__

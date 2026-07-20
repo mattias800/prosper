@@ -10,12 +10,16 @@
 #include <cstdio>
 #include <cstring>
 #include <sys/mman.h>
+#include <unistd.h>
 
 static int failures = 0;
 #define CHECK(cond, ...) do { if (!(cond)) { failures++; \
     fprintf(stderr, "FAIL %s:%d: %s\n  ", __FILE__, __LINE__, #cond); \
     fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
 
+#if !defined(__linux__) || !defined(__x86_64__)
+int main() { printf("raw_syscall: skipped (Linux x86-64 only)\n"); return 0; }
+#else
 int main() {
     // --- success: map a fixed read-only zero page at a known-free high address -------------
     // Reserve an address range via the normal allocator, then release it and re-map it raw.
@@ -48,7 +52,28 @@ int main() {
     CHECK(r == -EINVAL, "expected -EINVAL for unaligned addr, got %ld", r);
     CHECK(errno == 999, "errno clobbered on failure path: %d", errno);
 
+    // --- raw_write: success delivers the bytes, returns the count, errno untouched ---------
+    int fds[2];
+    CHECK(pipe(fds) == 0, "pipe failed: %s", strerror(errno));
+    errno = 999;
+    r = prosper::raw_write(fds[1], "abc", 3);
+    CHECK(errno == 999, "errno clobbered on raw_write success: %d", errno);
+    CHECK(r == 3, "expected 3 bytes written, got %ld", r);
+    if (r == 3) {                          // only read what was actually written — a blocking
+        char rb[4] = {0};                  // read on an empty pipe would hang a regressed build
+        CHECK(read(fds[0], rb, 3) == 3 && memcmp(rb, "abc", 3) == 0,
+              "pipe did not deliver raw_write bytes (got '%s')", rb);
+    }
+    close(fds[0]); close(fds[1]);
+
+    // --- raw_write: bad fd reports -EBADF in-register, errno untouched ---------------------
+    errno = 999;
+    r = prosper::raw_write(-1, "x", 1);
+    CHECK(r == -EBADF, "expected -EBADF for bad fd, got %ld", r);
+    CHECK(errno == 999, "errno clobbered on raw_write failure: %d", errno);
+
     if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
     printf("raw_syscall: all checks passed\n");
     return 0;
 }
+#endif
