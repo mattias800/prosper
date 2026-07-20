@@ -445,16 +445,19 @@ struct SpirvCompute {
             put(deco, Op_Decorate, {v_subgroup_localid, Dec_Flat});
             iface.push_back(v_subgroup_localid);
         }
+        // Fragment lane ids model RDNA wave64 lanes, not the implementation's default subgroup.
+        // Arithmetic capability is also the self-contained module marker the backend reflects to
+        // enforce size 64; apply it even when an inline scalar mask only consumes the lane id.
+        if (is_fragment && !declared_subgroup_arithmetic) {
+            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
+            declared_subgroup_arithmetic = true;
+        }
         uint32_t lane = id();
         put(code, Op_Load, {t_u32, lane, v_subgroup_localid});
         return lane;
     }
     uint32_t fragment_mbcnt(uint32_t mask_bit, uint32_t acc_bits, bool lo) {
         if (!is_fragment) return 0;
-        if (!declared_subgroup_arithmetic) {
-            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
-            declared_subgroup_arithmetic = true;
-        }
         const uint32_t lane = subgroup_local_id();
         const uint32_t in_half = lo
             ? ucmp(Op_ULessThan, lane, uconst(32))

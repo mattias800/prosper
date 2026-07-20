@@ -18,6 +18,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -2181,14 +2182,20 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
              !(ctx.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
              !(ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
              !(ctx.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT))) {
-            std::fprintf(stderr,
-                         "[render] skip draw: fragment shader requires subgroup size %u "
-                         "(device range %u..%u required-stages=0x%x subgroup-stages=0x%x "
-                         "ops=0x%x control=%d)\n",
-                         required_fragment_subgroup_size, ctx.min_subgroup_size,
-                         ctx.max_subgroup_size, ctx.required_subgroup_size_stages,
-                         ctx.subgroup_stages, ctx.subgroup_operations,
-                         static_cast<int>(ctx.subgroup_size_control));
+            const uint64_t shader_key = bd.fs_identity
+                ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
+            static std::mutex log_mutex;
+            static std::unordered_set<uint64_t> logged;
+            std::lock_guard<std::mutex> lock(log_mutex);
+            if (logged.insert(shader_key).second)
+                std::fprintf(stderr,
+                             "[render] skip draw: fragment shader requires subgroup size %u "
+                             "(device range %u..%u required-stages=0x%x subgroup-stages=0x%x "
+                             "ops=0x%x control=%d)\n",
+                             required_fragment_subgroup_size, ctx.min_subgroup_size,
+                             ctx.max_subgroup_size, ctx.required_subgroup_size_stages,
+                             ctx.subgroup_stages, ctx.subgroup_operations,
+                             static_cast<int>(ctx.subgroup_size_control));
             continue;
         }
         if (backend_trace) {
