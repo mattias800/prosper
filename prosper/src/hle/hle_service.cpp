@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <atomic>
 #include <algorithm>
+#include <deque>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -1004,8 +1005,74 @@ HLE(s_mouse_read)     { if (a1) memset(PW(a1), 0, 0x18); return 0; }
 // on the device/status enum "disconnected" == 0.
 //   OrbisImeKeyboardResourceIdArray: user_id@0(s32) resource_id[5]@4(u32)                     size 24
 //   OrbisImeKeyboardInfo: user_id@0 device@4 type@8 repeat_delay@12 repeat_rate@16 status@20 rsv[12]@24  size 36
-HLE(s_ime_kbd_open) { svc_log("sceImeKeyboardOpen", a0,a1,a2,a3,a4,a5); return 0; }  // register handler; no events to deliver
-HLE(s_ime_update)   { svc_log("sceImeUpdate", a0,a1,a2,a3,a4,a5); return 0; }        // pump the queue: no events
+// --- IME keyboard event injection (issue #1093) -------------------------------------------------
+// PPSA02664 (Alex Kidd) reads its "press any button" / menu input ONLY through the IME keyboard
+// path: it opens a keyboard and calls sceImeUpdate(handler) every frame, and never touches
+// libScePad or sceUserService. sceImeUpdate must invoke handler(arg, &event) for each queued
+// keyboard event; the old stub returned without calling, delivered no input, and the title never
+// advanced (injected pad input was inert — the game wasn't reading the pad).
+//
+// Event ABI derived directly from the guest handler at eboot+0xf2c540 (PPSA02664 disassembly):
+//   handler(rdi=arg, rsi=SceImeEvent*)   — rdi is unused by this title's handler.
+//   SceImeEvent:  +0x00 u32 id   (0x101 = KEY_DOWN, 0x102 = KEY_UP; 0x103..0x106 = other kbd events)
+//                 +0x08 u16 keycode  (USB HID usage id; indexes the guest's keycode->bit table)
+//                 +0x0a u16 (modifier/char)   +0x0c u32 (status)
+//   KEY_DOWN sets the guest's current + newly-pressed keyboard bitmasks; KEY_UP clears them.
+// HID keycodes verified against the guest's table: Enter=0x28, Space=0x2c, Z=0x1d, A=0x04.
+// CONFIDENCE: HIGH on the id/keycode/offset layout (read from the guest handler + its HID table).
+namespace {
+struct ImeKeyEvent { uint16_t hid; bool down; };
+std::mutex g_ime_mx;
+std::deque<ImeKeyEvent> g_ime_queue;
+
+void ime_deliver(uint64_t handler, const ImeKeyEvent& ev) {
+    if (!handler) return;
+    alignas(16) uint8_t e[0x40] = {0};
+    *(uint32_t*)(e + 0x00) = ev.down ? 0x101u : 0x102u;
+    *(uint16_t*)(e + 0x08) = ev.hid;
+    // Guest handler is SysV-ABI and runs on the guest thread (guest %fs active) — call directly,
+    // exactly as h_qsort calls the guest comparator.
+    ((void (*)(uint64_t, void*))(uintptr_t)handler)(0, e);
+}
+
+// PROSPER_IME_AUTOKEY=1: deliver a repeating Enter down/up pulse so headless routes advance a
+// "press any button" / menu that reads the IME keyboard. Diagnostic/verification lever; the real
+// per-key input comes from a frontend via ime_push_key (below). PROSPER_IME_AUTOKEY_HID overrides
+// the HID usage (default 0x28 Enter). Cadence: down, then up two ticks later, repeating.
+void ime_autokey_tick(uint64_t handler) {
+    static const int on = [] { const char* e = getenv("PROSPER_IME_AUTOKEY");
+                               return e && strtol(e, nullptr, 0) != 0 ? 1 : 0; }();
+    if (!on) return;
+    static const uint16_t hid = [] { const char* e = getenv("PROSPER_IME_AUTOKEY_HID");
+                                     return (uint16_t)(e ? strtol(e, nullptr, 0) : 0x28); }();
+    static std::atomic<uint64_t> tick{0};
+    uint64_t t = tick.fetch_add(1);
+    if ((t % 90) == 0)      ime_deliver(handler, {hid, true});
+    else if ((t % 90) == 2) ime_deliver(handler, {hid, false});
+}
+} // namespace
+
+// Frontend seam (declared in ime_input.hpp): push a keyboard key (USB HID usage id) into the IME
+// queue; drained on the next sceImeUpdate. Thread-safe (called from the frontend's input thread).
+// Mirrors pad_set_backend's role for libScePad.
+void ime_push_key(uint16_t hid_usage, bool down) {
+    std::lock_guard<std::mutex> lk(g_ime_mx);
+    g_ime_queue.push_back({hid_usage, down});
+}
+
+HLE(s_ime_kbd_open) { svc_log("sceImeKeyboardOpen", a0,a1,a2,a3,a4,a5); return 0; }  // handler comes via sceImeUpdate
+HLE(s_ime_update)   {
+    svc_log("sceImeUpdate", a0,a1,a2,a3,a4,a5);
+    ime_autokey_tick(a0);                       // a0 = the guest event handler
+    for (;;) {
+        ImeKeyEvent ev;
+        { std::lock_guard<std::mutex> lk(g_ime_mx);
+          if (g_ime_queue.empty()) break;
+          ev = g_ime_queue.front(); g_ime_queue.pop_front(); }
+        ime_deliver(a0, ev);
+    }
+    return 0;
+}
 // sceImeKeyboardGetResourceId(userId, OrbisImeKeyboardResourceIdArray* out): report the user's keyboard
 // resource ids. Headless -> none (all-zero). A registered PlatformUi (a windowed frontend with a host
 // keyboard) reports its own ids, so a title enables keyboard input (#347).
