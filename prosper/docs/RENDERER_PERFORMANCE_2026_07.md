@@ -911,6 +911,48 @@ interactive session was using the same GPU, which makes it unattributable -- per
 equivalent of ctest's exit code. `ab_compute.sh` therefore refuses to run when another `prosper-app`
 is alive and stamps the commit, route, reps and duration onto its output.
 
+## Frame decomposition of Blasphemous 2 gameplay (#1101)
+
+Following #1095, #1101 decomposed a ~68 ms Blasphemous 2 gameplay frame with
+`PROSPER_COMPUTE_PHASE_TIMING` + `PROSPER_RENDER_TIMING` on the save-backed route. **Actual GPU
+execution is ~5% of the frame.** The rest is host-side pixel round-trips and per-dispatch state:
+
+| cost | ms/frame | what it is |
+|---|---|---|
+| compute image setup (create+upload) | 15.6 | per dispatch; the VkImage-reuse contract, #1106 |
+| graphics readback | 15.6 | GPU->CPU color-target copies |
+| compute writeback (pack+layout) | 13.0 | CPU tiling conversion of storage results |
+| GPU execution + waits | 3.1 | ~5% |
+
+The methodology lesson: the plausible bottleneck was guessed wrong twice -- submit-and-wait at 5.3%,
+SPIR-V validation at 0% (`setup_validate_ms` proved the 2.76 ms setup is entirely image create+upload).
+**Measure the decomposition before choosing the optimization.**
+
+This section documents the two proven-correct outcomes; the largest opportunity (graphics readback) and
+the image-setup cost are tracked as follow-ups.
+
+### Range-specialized storage-image pack (landed)
+
+Compute writeback pack was a non-inlined `storage_pack_texel` call per texel re-entering a format switch
+per component -- the exact shape #1092's `storage_unpack_range` removed on the unpack side.
+`storage_pack_range` hoists the format dispatch out of the loop; packed formats keep the general
+per-texel path. Bit-identical by construction; `PROSPER_VERIFY_PACK=1` proved it on 1,327 real-workload
+dispatches with 0 mismatches. `PROSPER_NO_PACK_RANGE=1` for A/B. It has **no measurable frame impact**
+(pack is ~1.3 ms of a 53 ms frame), so it is a correctness-neutral hot-loop cleanup rather than a win;
+the commit's lasting value is the `setup_validate_ms`/`setup_buffers_ms` sub-timers that made the
+decomposition and #1106's scoping possible.
+
+### Deferred as follow-ups
+
+- **Graphics readback (15.6 ms/frame, #1101):** deferring offscreen color-target readbacks measured
+  +19% fps at scale 1 but broke the scale-4 `messenger-scene` snapshot (black). The cause was not
+  conclusively isolated between render-timing fragility of the blind capture route and a subtle
+  correctness gap, so it is held on branch `perf/issue-1101-frame-decomp` pending a content-based
+  capture window or deeper root-cause. See #1101.
+- **Image setup (15.6 ms/frame, #1106):** reusing the VkImage across dispatches. Needs a correctness
+  contract for storage-image writeback and invisible guest texture writes; deferred to a review-gated
+  change.
+
 ## Next renderer step
 
 Bring up a representative Unreal/3D workload and collect the same stage timings plus a corrected
