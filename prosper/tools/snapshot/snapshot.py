@@ -169,9 +169,18 @@ def apply_entry_env(env, entry, tmp):
         env.setdefault("PROSPER_PAD_SCRIPT_LOG", "1")
     save_policy = entry.get("savedata_policy")
     if save_policy == "fresh":
+        # prosper has TWO independent save roots and a fresh console state needs BOTH redirected:
+        #   PROSPER_SAVEDATA_DIR -> SaveDataMemory slots (the entire save path for Unity titles)
+        #   PROSPER_SAVE0        -> the /savedata0 file mount (Blasphemous 2 writes slot0/slot1 here)
+        # Redirecting only the first left file-mount titles reading the developer's real saves, so a
+        # route that assumes a new game could silently run against existing progress -- which both
+        # produces false failures and can mask real ones. Both roots are per-run temp dirs.
         save_dir = os.path.join(tmp, "savedata")
         os.makedirs(save_dir, exist_ok=True)
         env["PROSPER_SAVEDATA_DIR"] = save_dir
+        save0_dir = os.path.join(tmp, "savedata0")
+        os.makedirs(save0_dir, exist_ok=True)
+        env["PROSPER_SAVE0"] = save0_dir
     elif save_policy not in (None, "preserve"):
         raise RuntimeError(f"unknown savedata_policy={save_policy!r}; use fresh or preserve")
 
