@@ -89,8 +89,13 @@ int main() {
     //    BELOW-window hint so this case's own free-placeholder residue never sits inside the
     //    window and cramps case 2b's whole-window fallback; verify the free-hint precondition
     //    (span_is_free above) instead of assuming any fixed span is free under Windows ASLR.
+    // Single below-window candidate by review: in-window alternates carry latent geometry
+    // hazards for later cases (a freed span at 0x6000000000 fragments the 512 GiB arena's
+    // band+window fit deterministically; one at 0x4000000000 can leave case 2b only an
+    // exact-fit gap). Both retained geometries — free below-window hint, and the relaxed
+    // occupied-hint fallback — are validated by actual CI runs.
     const uint64_t belowLen = kHugeMin - 0x10000;
-    const uint64_t belowCands[] = {0x1200000000ull, 0x4000000000ull, 0x6000000000ull};
+    const uint64_t belowCands[] = {0x1200000000ull};
     uint64_t belowHint = 0;
     for (uint64_t cand : belowCands)
         if (span_is_free(cand, belowLen)) { belowHint = cand; break; }
