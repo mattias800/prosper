@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 
 // Classify a guest address: 0 => not within a reserved/committed guest mapping (see hle_kernel_mem).
@@ -323,6 +324,66 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 : prosper::gpu::LiveTargetPixelFormat::Rgba8Unorm;
             snapshot.pixels = surface.rgba;
             return true;
+        });
+    // Phase 2 of #1091 (#1095): with one shared device the compute backend can sample the renderer's
+    // persistent image in place. Offer it ONLY while that image is the authoritative copy -- exactly
+    // the case the reader above would have had to materialize. Whenever a CPU snapshot exists it may
+    // be the newer truth (a guest GPU write drops the CPU copy and invalidates the GPU target
+    // independently, #780), so the caller must keep using the snapshot path there.
+    // One dispatch can bind the same target through several descriptors, so pins are counted: the
+    // compute backend releases once per successful import and the entry drops at zero.
+    struct PinnedImport { uint32_t width, height; VkFormat format; uint32_t count; };
+    static std::unordered_map<uint64_t, PinnedImport> pinned_imports;
+    const bool direct_bind = !getenv("PROSPER_NO_DIRECT_RTT_BIND");
+    prosper::gpu::set_live_target_image_importer(
+        [invalidate_ds, direct_bind](uint64_t addr, prosper::gpu::LiveTargetImageImport& import) {
+            if (!direct_bind) return false;
+            drain_guest_gpu_writes(g_rtt, invalidate_ds);
+            auto it = g_rtt.find(addr);
+            if (it == g_rtt.end()) return false;
+            RttSurf& surface = it->second;
+            if (!surface.w || !surface.h || !surface.gpu_valid) return false;
+            const VkFormat format = prosper::test::backend_color_format(surface.format);
+            // Map the backend format explicitly and fail closed. A direct bind hands the consumer a
+            // real VkImage, so an unrecognized format must decline rather than be reported as rgba8:
+            // the consumer would then build a mismatched view over the renderer's image.
+            prosper::gpu::LiveTargetPixelFormat pixel_format;
+            if (format == VK_FORMAT_R8G8B8A8_UNORM)
+                pixel_format = prosper::gpu::LiveTargetPixelFormat::Rgba8Unorm;
+            else if (format == VK_FORMAT_R16G16B16A16_SFLOAT)
+                pixel_format = prosper::gpu::LiveTargetPixelFormat::Rgba16Float;
+            else
+                return false;
+            const uint32_t bytes_per_pixel = prosper::test::backend_color_bytes_per_pixel(format);
+            if (!bytes_per_pixel) return false;
+            const uint64_t texels = static_cast<uint64_t>(surface.w) * surface.h;
+            if (texels > UINT64_MAX / bytes_per_pixel) return false;
+            const uint64_t expected = texels * bytes_per_pixel;
+            if (surface.rgba && surface.rgba->size() == expected) return false;  // CPU copy is truth
+            const prosper::test::RenderVkCtx& ctx = prosper::test::render_vk_ctx();
+            if (!ctx.ok) return false;
+            prosper::test::PersistentColorTargetImage* target =
+                prosper::test::find_persistent_color_target(addr, surface.w, surface.h, format);
+            if (!target || !target->image || target->layout == VK_IMAGE_LAYOUT_UNDEFINED) return false;
+            if (!prosper::test::pin_persistent_color_target(addr, surface.w, surface.h, format))
+                return false;
+            target->last_use = ++prosper::test::persistent_color_target_generation();
+            PinnedImport& pin = pinned_imports[addr];
+            pin = {surface.w, surface.h, format, pin.count + 1};
+            import.width = surface.w;
+            import.height = surface.h;
+            import.format = pixel_format;
+            import.image = target->image;
+            import.device = ctx.dev;
+            import.layout = static_cast<uint32_t>(target->layout);
+            return true;
+        },
+        [](uint64_t addr) {
+            auto pinned = pinned_imports.find(addr);
+            if (pinned == pinned_imports.end()) return;
+            PinnedImport& pin = pinned->second;
+            prosper::test::unpin_persistent_color_target(addr, pin.width, pin.height, pin.format);
+            if (--pin.count == 0) pinned_imports.erase(pinned);
         });
     prosper::gpu::set_live_target_byte_range_reader(
         [invalidate_ds](uint64_t addr, uint32_t bytes, std::vector<uint8_t>& output) {
