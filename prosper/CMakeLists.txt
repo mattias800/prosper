@@ -946,6 +946,10 @@ if(UNIX AND NOT APPLE AND PROSPER_VIDEO_VAAPI AND TARGET prosper_core)
 
     add_executable(test_video_vaapi frontends/video_vaapi/test_video_vaapi.cpp)
     target_link_libraries(test_video_vaapi PRIVATE prosper_video_vaapi)
+    # Point the test at a committed test-pattern clip so it decodes a real stream. On headless CI
+    # (no VA-API hardware) a successful decode exercises the default software-decode fallback (#320).
+    target_compile_definitions(test_video_vaapi PRIVATE
+      PROSPER_TEST_VIDEO_ASSET="${CMAKE_CURRENT_SOURCE_DIR}/tests/assets/testpattern.mp4")
     add_test(NAME video_vaapi COMMAND test_video_vaapi)
 
     if(TARGET boot_trace)

@@ -22,8 +22,19 @@ int main(int argc, char** argv) {
     if (backend()) {
         CHECK(backend()->open("/prosper-missing/no-such-video.mp4") < 0,
               "missing source fails instead of fabricating a decode session");
-        if (argc == 2) {
-            const int id = backend()->open(argv[1]);
+        // Decode a committed test-pattern clip. On a headless host (no DRI render node / no working
+        // VA driver — CI runners, containers) VA-API hardware decode is unavailable, so a successful
+        // decode here proves REAL FFmpeg software decode is the default fallback (#320: without it,
+        // sceAvPlayer could not open a title's movie and the game deadlocked in its black intro).
+        // A path argument overrides the built-in asset (local diagnostics with a bigger clip).
+        const char* asset = (argc == 2) ? argv[1] :
+#ifdef PROSPER_TEST_VIDEO_ASSET
+            PROSPER_TEST_VIDEO_ASSET;
+#else
+            nullptr;
+#endif
+        if (asset) {
+            const int id = backend()->open(asset);
             CHECK(id >= 0, "MP4 opens with the selected VA-API or explicit diagnostic pipeline");
             if (id >= 0) {
                 StreamInfo stream{};
