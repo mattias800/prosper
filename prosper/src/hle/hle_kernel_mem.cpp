@@ -3760,7 +3760,12 @@ HLE(k_reserve_vrange) {
         bool ours = false;
         { std::lock_guard<std::mutex> lk(g_mx);
           for (auto& m : g_maps)
-              if (!m.committed && hint >= m.base && hint < m.base + m.size) { ours = true; break; } }
+              // Idempotent only when the WHOLE requested span is contained (mirrors the Linux
+              // FIXED branch): a hint-only match let a large re-reserve false-succeed backed by
+              // a smaller range at the same base (the 64 MiB metadata pool at the arena's old
+              // 0x1000000000 hint after #312's huge-reserve redirect).
+              if (!m.committed && hint >= m.base && hint < m.base + m.size &&
+                  a1 <= m.base + m.size - hint) { ours = true; break; } }
         if (ours) { if (a0) *(uint64_t*)a0 = hint;
                     MLOG("reserve hint=0x%llx re-reserve-of-own-range -> OK\n", (unsigned long long)hint);
                     return 0; }

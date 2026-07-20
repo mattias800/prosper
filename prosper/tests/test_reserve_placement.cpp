@@ -71,15 +71,17 @@ int main() {
     CHECK(rc == 0, "small same-hint reserve succeeds");
     CHECK(pool == kArenaHint, "small reserve takes the vacated 0x1000000000 hint");
 
-    // 2b) A SECOND huge reserve with the same hint, while the small pool occupies it, must not
-    //     false-succeed via the idempotent re-reserve check (hint-containment alone matched the
-    //     64 MiB pool and returned the hint backed by mostly-unreserved VA) — it must be
-    //     redirected like any huge reserve.
+    // 2b) A SECOND huge-class reserve with the same hint, while the small pool occupies it, must
+    //     not false-succeed via the idempotent re-reserve check (a hint-only match returned the
+    //     hint backed by the 64 MiB pool's mostly-unreserved VA) — it must be redirected like any
+    //     huge reserve. Sized at the 128 GiB threshold, not a second 512 GiB arena: with the
+    //     first arena still reserved, the ~880 GiB Windows window cannot hold another 512 GiB
+    //     (#1084 review), and the idempotency bug under test only needs the huge class.
     uint64_t again = kArenaHint;
-    rc = reserve((uint64_t)&again, kArenaLen, 0, kArenaAlign, 0, 0);
+    rc = reserve((uint64_t)&again, kHugeMin, 0, kArenaAlign, 0, 0);
     CHECK(rc == 0 && again != kArenaHint && again >= kAutoMin,
           "second same-hint huge reserve is redirected, not idempotent-matched to the pool");
-    unmap(again, kArenaLen, 0, 0, 0, 0);
+    unmap(again, kHugeMin, 0, 0, 0, 0);
     unmap(pool, 0x4000000, 0, 0, 0, 0);
     // Release the arena so the remaining cases probe hints on clean address space — their
     // assertions guard UNCHANGED semantics and must hold both before and after the fix.
