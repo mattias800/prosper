@@ -90,6 +90,9 @@ struct FrameResource {
     // within one synchronous call only when both this identity and the complete captured bytes match;
     // zero keeps synthetic/replay resources conservatively distinct.
     uint64_t buffer_identity = 0;
+    // Backend-owned PS5 GDS storage. Unlike guest/capture buffers this is one persistent,
+    // zero-initialized 64 KiB allocation shared across ordered render calls.
+    bool is_internal_gds = false;
     const uint8_t* tex_rgba = nullptr;   // non-null => a texture; then tw/th are its dimensions
     uint32_t tw = 0, th = 0, td = 1;
     uint32_t img_dim = 1;             // ShaderResource/MIMG dim (1=2D, 2=3D); depth-1 3D stays 3D
@@ -416,12 +419,19 @@ inline BackendRenderTimingStats backend_render_timing_stats() {
 // instance/physical-device/device/queue ONCE (lazy, thread-safe static init) and reuse it across every
 // call. Per-call Vulkan resources are created independently and are retained until their direct call
 // or explicit ordered submission batch completes. The context intentionally leaks at process exit.
+// LIFETIME INVARIANT: this context is intentionally never destroyed (no destructor; the device and
+// instance leak at process exit). The compute backend BORROWS this device (#1091) and its static
+// destructor calls vkDestroyPipeline/vkFreeMemory on it at exit, with unspecified cross-TU
+// destruction order. Adding a destructor here that destroys the device would therefore create an
+// immediate use-after-free in ~VulkanComputeContext. Do not add one without first giving compute an
+// explicit release-before-teardown handshake.
 struct RenderVkCtx {
     VkInstance inst = VK_NULL_HANDLE; VkPhysicalDevice phys = VK_NULL_HANDLE;
     VkDevice dev = VK_NULL_HANDLE; VkQueue queue = VK_NULL_HANDLE; uint32_t qfi = UINT32_MAX;
     VkDeviceSize storage_buffer_alignment = 1;
     bool aniso_enabled = false; float max_aniso_limit = 1.0f;
     bool logic_op_enabled = false; bool ok = false;
+    bool fragment_stores_atomics = false;
     bool subgroup_size_control = false;
     uint32_t min_subgroup_size = 0, max_subgroup_size = 0;
     VkShaderStageFlags required_subgroup_size_stages = 0;
@@ -475,6 +485,7 @@ inline const RenderVkCtx& render_vk_ctx() {
         feats.shaderStorageImageWriteWithoutFormat = supported.shaderStorageImageWriteWithoutFormat;
         feats.vertexPipelineStoresAndAtomics = supported.vertexPipelineStoresAndAtomics;
         feats.fragmentStoresAndAtomics = supported.fragmentStoresAndAtomics;
+        r.fragment_stores_atomics = supported.fragmentStoresAndAtomics;
         // robustImageAccess (VK_EXT_image_robustness): OpImageRead OOB must return zero (#131). Guarded.
         // Device extensions accumulate into a vector so the (optional) image-robustness and (macOS)
         // portability-subset extensions coexist.
@@ -531,6 +542,26 @@ inline const RenderVkCtx& render_vk_ctx() {
         if (vkCreateDevice(r.phys, &dci, nullptr, &r.dev) != VK_SUCCESS || !r.dev) return r;
         vkGetDeviceQueue(r.dev, r.qfi, 0, &r.queue);
         r.ok = true;
+        // Publish this device so the compute backend can adopt it instead of creating a second one
+        // (#1091). Only the features compute needs are advertised; it declines the shared context if
+        // they are missing and creates its own device exactly as before. Graphics and compute run
+        // strictly sequentially on one thread, so sharing the queue needs no extra synchronization.
+        if (!std::getenv("PROSPER_NO_SHARED_VULKAN_DEVICE")) {
+            prosper::gpu::SharedVulkanContext shared;
+            shared.instance = r.inst;
+            shared.physical = r.phys;
+            shared.device = r.dev;
+            shared.queue = r.queue;
+            shared.queue_family = r.qfi;
+            // Publish what the device was actually CREATED with (feats), not what the physical
+            // device merely supports. They are equal today because feats.x = supported.x
+            // unconditionally, but the consumer's contract is "enabled here" -- if these ever became
+            // gated like aniso/logicOp are, publishing `supported` would let compute emit shaders
+            // declaring a capability the device never enabled.
+            shared.storage_image_read_without_format = feats.shaderStorageImageReadWithoutFormat;
+            shared.storage_image_write_without_format = feats.shaderStorageImageWriteWithoutFormat;
+            prosper::gpu::set_shared_vulkan_context(shared);
+        }
         return r;
     }();
     return c;
@@ -1068,6 +1099,29 @@ inline void release_render_host_buffer(VkDevice device, RenderHostBuffer buffer)
     if (buffer.buffer) destroy_render_host_buffer(device, buffer);
 }
 
+inline const RenderHostBuffer& render_internal_gds_buffer() {
+    static const RenderHostBuffer buffer = [] {
+        constexpr VkDeviceSize kGdsBytes = 64u * 1024u;
+        RenderHostBuffer result = acquire_render_host_buffer(render_vk_ctx(), kGdsBytes);
+        if (result.mapped) std::memset(result.mapped, 0, static_cast<size_t>(kGdsBytes));
+        return result;
+    }();
+    return buffer;
+}
+
+inline void reset_internal_gds_for_test() {
+    const RenderHostBuffer& buffer = render_internal_gds_buffer();
+    if (buffer.mapped) std::memset(buffer.mapped, 0, 64u * 1024u);
+}
+
+inline uint32_t read_internal_gds_for_test(uint32_t byte_offset) {
+    const RenderHostBuffer& buffer = render_internal_gds_buffer();
+    if (!buffer.mapped || byte_offset > 64u * 1024u - sizeof(uint32_t)) return 0;
+    uint32_t value = 0;
+    std::memcpy(&value, static_cast<const uint8_t*>(buffer.mapped) + byte_offset, sizeof(value));
+    return value;
+}
+
 inline RenderHostBufferPoolStats render_host_buffer_pool_stats() {
     RenderHostBufferPool& pool = render_host_buffer_pool();
     return {pool.cached_bytes, pool.cached_buffers, pool.hits, pool.misses, pool.evictions};
@@ -1140,6 +1194,26 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
     return invalidated;
 }
 
+// Make device writes visible before the CPU reads a mapped readback buffer. A HOST_CACHED memory
+// type is not required to also be HOST_COHERENT, so every mapped READ of a TRANSFER_DST buffer must
+// invalidate first. Specified as valid on coherent memory too, so callers can invoke it
+// unconditionally rather than tracking the selected memory type.
+// NOTE: this header contains a second readback allocator that requires HOST_COHERENT in every tier,
+// so its mapped reads need no invalidate. Keep that requirement, or route its reads through this
+// helper too -- relaxing it without adding invalidates would silently return stale bytes.
+inline bool invalidate_mapped_readback(const RenderVkCtx& ctx, VkDeviceMemory memory) {
+    if (!memory) return false;
+    VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+    range.memory = memory;
+    range.offset = 0;
+    range.size = VK_WHOLE_SIZE;   // VK_WHOLE_SIZE is exempt from the nonCoherentAtomSize size rule
+    return vkInvalidateMappedMemoryRanges(ctx.dev, 1, &range) == VK_SUCCESS;
+}
+
+// CONTRACT: a pure TRANSFER_DST (readback) buffer may be backed by HOST_CACHED memory that is NOT
+// HOST_COHERENT. Call invalidate_mapped_readback() after mapping and before reading one, and do not
+// host-WRITE through such a mapping without a flush. Any usage including TRANSFER_SRC is always
+// backed by HOST_COHERENT memory, so host writes to it need no flush.
 inline bool persistent_ds_transfer_buffer(const RenderVkCtx& ctx, VkDeviceSize bytes,
                                           VkBufferUsageFlags usage, VkBuffer& buffer,
                                           VkDeviceMemory& memory, std::string& error) {
@@ -1152,13 +1226,46 @@ inline bool persistent_ds_transfer_buffer(const RenderVkCtx& ctx, VkDeviceSize b
     vkGetBufferMemoryRequirements(ctx.dev, buffer, &requirements);
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocation.allocationSize = requirements.size;
-    allocation.memoryTypeIndex = render_memory_type(
+    // A pure TRANSFER_DST buffer is a GPU->CPU readback: the CPU READS every byte of it. Plain
+    // HOST_VISIBLE|HOST_COHERENT memory is typically write-combined and uncached, which streams CPU
+    // writes well but reads back at only a few hundred MB/s -- measured here at ~236 MB/s, making the
+    // map+copy 99% of a color-target readback. Such a buffer therefore prefers HOST_CACHED so the
+    // copy runs at cache speed. A buffer that is ALSO TRANSFER_SRC is host-written (an upload, or a
+    // round trip), so it keeps the write-combined coherent selection that is right for writes and
+    // needs no host flush.
+    const bool readback = (usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT) != 0 &&
+                          (usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) == 0;
+    const uint32_t coherent_type = render_memory_type(
         ctx.phys, requirements.memoryTypeBits,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (allocation.memoryTypeIndex == UINT32_MAX ||
-        vkAllocateMemory(ctx.dev, &allocation, nullptr, &memory) != VK_SUCCESS ||
-        vkBindBufferMemory(ctx.dev, buffer, memory, 0) != VK_SUCCESS) {
-        if (memory) vkFreeMemory(ctx.dev, memory, nullptr);
+    uint32_t preferred = UINT32_MAX;
+    if (readback) {
+        preferred = render_memory_type(
+            ctx.phys, requirements.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (preferred == UINT32_MAX)
+            preferred = render_memory_type(
+                ctx.phys, requirements.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    }
+    // Try the preferred (cached) type first, then the previously used coherent type. The retry
+    // matters because a cached type can live in a small heap (BAR-style) that the coherent type does
+    // not: without it, a cached-heap exhaustion would fail a readback that previously succeeded.
+    auto try_allocate = [&](uint32_t type) {
+        if (type == UINT32_MAX) return false;
+        allocation.memoryTypeIndex = type;
+        if (vkAllocateMemory(ctx.dev, &allocation, nullptr, &memory) != VK_SUCCESS) {
+            memory = VK_NULL_HANDLE;
+            return false;
+        }
+        if (vkBindBufferMemory(ctx.dev, buffer, memory, 0) != VK_SUCCESS) {
+            vkFreeMemory(ctx.dev, memory, nullptr); memory = VK_NULL_HANDLE;
+            return false;
+        }
+        return true;
+    };
+    if (!try_allocate(preferred) && !(preferred != coherent_type && try_allocate(coherent_type))) {
         vkDestroyBuffer(ctx.dev, buffer, nullptr); buffer = VK_NULL_HANDLE; memory = VK_NULL_HANDLE;
         error = "cannot allocate persistent DS transfer buffer"; return false;
     }
@@ -1349,6 +1456,10 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
     if (vkMapMemory(ctx.dev, memory, 0, bytes, 0, &mapped) != VK_SUCCESS || !mapped) {
         cleanup(); error = "cannot map persistent color target readback"; return false;
     }
+    if (!invalidate_mapped_readback(ctx, memory)) {
+        vkUnmapMemory(ctx.dev, memory);
+        cleanup(); error = "cannot invalidate persistent color target readback"; return false;
+    }
     const auto* first = static_cast<const uint8_t*>(mapped);
     output.assign(first, first + static_cast<size_t>(bytes));
     vkUnmapMemory(ctx.dev, memory);
@@ -1396,15 +1507,19 @@ inline bool snapshot_persistent_ds_images(std::vector<prosper::gpu::GpuCaptureDs
         void* mapped = nullptr;
         const bool mapped_ok = copied &&
             vkMapMemory(ctx.dev, memory, 0, depth_bytes + stencil_bytes, 0, &mapped) == VK_SUCCESS;
-        if (mapped_ok) {
+        const bool invalidated = mapped_ok && invalidate_mapped_readback(ctx, memory);
+        if (invalidated) {
             const auto* bytes = static_cast<const uint8_t*>(mapped);
             seed.depth.assign(bytes, bytes + depth_bytes);
             seed.stencil.assign(bytes + depth_bytes, bytes + depth_bytes + stencil_bytes);
             vkUnmapMemory(ctx.dev, memory);
         }
+        if (mapped_ok && !invalidated) vkUnmapMemory(ctx.dev, memory);
         vkDestroyBuffer(ctx.dev, buffer, nullptr); vkFreeMemory(ctx.dev, memory, nullptr);
-        if (!mapped_ok) {
-            if (error.empty()) error = "cannot map persistent DS readback";
+        if (!invalidated) {
+            if (error.empty())
+                error = mapped_ok ? "cannot invalidate persistent DS readback"
+                                  : "cannot map persistent DS readback";
             return false;
         }
         seeds.push_back(std::move(seed));
@@ -2075,6 +2190,17 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         return bits;
     };
     std::vector<DV> dv(draws.size());
+    std::vector<std::vector<FrameResource>> effective_resources(draws.size());
+    for (size_t i = 0; i < draws.size(); ++i) {
+        effective_resources[i] = draws[i].R;
+        if (prosper::gpu::fragment_spirv_uses_internal_gds(draws[i].fs_words())) {
+            FrameResource gds;
+            gds.set = 1;
+            gds.binding = 0;
+            gds.is_internal_gds = true;
+            effective_resources[i].push_back(std::move(gds));
+        }
+    }
     std::vector<SharedTextureUpload> texture_uploads;
     std::unordered_map<TextureUploadKey, size_t, TextureUploadKeyHash> texture_upload_indices;
     const bool share_texture_uploads = getenv("PROSPER_NO_BACKEND_TEXTURE_SHARE") == nullptr;
@@ -2130,10 +2256,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     uint64_t storage_buffers = 0;
     uint64_t sampled_images = 0;
     uint64_t storage_images = 0;
-    for (const BackendDraw& draw : draws) {
-        if (draw.R.empty()) continue;
+    for (const auto& resources : effective_resources) {
+        if (resources.empty()) continue;
         uint32_t set_count = 1;
-        for (const FrameResource& resource : draw.R) {
+        for (const FrameResource& resource : resources) {
             set_count = std::max(set_count, resource.set + 1);
             if (!resource.is_texture()) {
                 ++storage_buffers;
@@ -2175,13 +2301,16 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         DV& v = dv[di];
         const uint32_t required_fragment_subgroup_size =
             prosper::gpu::fragment_spirv_required_subgroup_size(bd_fs);
+        const bool uses_internal_gds =
+            prosper::gpu::fragment_spirv_uses_internal_gds(bd_fs);
         if (required_fragment_subgroup_size &&
             (!ctx.subgroup_size_control ||
              required_fragment_subgroup_size < ctx.min_subgroup_size ||
              required_fragment_subgroup_size > ctx.max_subgroup_size ||
              !(ctx.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
              !(ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
-             !(ctx.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT))) {
+             !(ctx.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) ||
+             (uses_internal_gds && !ctx.fragment_stores_atomics))) {
             const uint64_t shader_key = bd.fs_identity
                 ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
             static std::mutex log_mutex;
@@ -2191,11 +2320,21 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 std::fprintf(stderr,
                              "[render] skip draw: fragment shader requires subgroup size %u "
                              "(device range %u..%u required-stages=0x%x subgroup-stages=0x%x "
-                             "ops=0x%x control=%d)\n",
+                             "ops=0x%x control=%d gds=%d fragment-atomics=%d)\n",
                              required_fragment_subgroup_size, ctx.min_subgroup_size,
                              ctx.max_subgroup_size, ctx.required_subgroup_size_stages,
                              ctx.subgroup_stages, ctx.subgroup_operations,
-                             static_cast<int>(ctx.subgroup_size_control));
+                             static_cast<int>(ctx.subgroup_size_control),
+                             static_cast<int>(uses_internal_gds),
+                             static_cast<int>(ctx.fragment_stores_atomics));
+            continue;
+        }
+        if (uses_internal_gds && !render_internal_gds_buffer().buffer) {
+            static std::once_flag logged;
+            std::call_once(logged, [] {
+                std::fprintf(stderr,
+                             "[render] skip draw: failed to allocate persistent GDS buffer\n");
+            });
             continue;
         }
         if (backend_trace) {
@@ -2385,7 +2524,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         // Descriptor resources for this draw (two-set: VS=set0, PS=set1 — same layout as the single path).
         const auto setup_fixed_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         if (timing_enabled) setup_fixed_ms += setup_elapsed_ms(setup_shaders_ready, setup_fixed_ready);
-        const auto& R = bd.R;
+        const auto& R = effective_resources[di];
         v.use_desc = !R.empty();
         for (auto& r : R) v.n_sets = std::max(v.n_sets, r.set + 1);
         std::vector<VkDescriptorSetLayout> dsls(v.n_sets, VK_NULL_HANDLE);
@@ -2686,6 +2825,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     wr[i].descriptorType = lb[i].descriptorType; wr[i].pImageInfo = &dii[i];
                 } else {
                     lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; lb[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+                    if (r.is_internal_gds) {
+                        const RenderHostBuffer& gds = render_internal_gds_buffer();
+                        dbi[i] = {gds.buffer, 0, 64u * 1024u};
+                        wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                        wr[i].dstBinding = r.binding; wr[i].descriptorCount = 1;
+                        wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                        wr[i].pBufferInfo = &dbi[i];
+                        continue;
+                    }
                     const uint32_t* words = r.buffer_words_data();
                     size_t word_count = r.buffer_word_count();
                     if (!words || !word_count) {

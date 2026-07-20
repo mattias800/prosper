@@ -1138,3 +1138,12 @@ if(TARGET prosper-app AND TARGET prosper_video_vaapi)
   target_compile_definitions(prosper-app PRIVATE PROSPER_VIDEO_VAAPI=1)
   message(STATUS "prosper-app: FFmpeg/VA-API video enabled")
 endif()
+
+# Shared-device adoption guard (#1091). prosper_live_renderer only exists in frontend-enabled
+# configurations and is defined later in this file than the core test block, so register this
+# after the fact and only when the target is actually present.
+if(TARGET prosper_live_renderer AND TARGET prosper_core)
+  add_executable(test_shared_vulkan_device tests/test_shared_vulkan_device.cpp)
+  target_link_libraries(test_shared_vulkan_device PRIVATE prosper_live_renderer prosper_core)
+  add_test(NAME shared_vulkan_device COMMAND test_shared_vulkan_device)
+endif()

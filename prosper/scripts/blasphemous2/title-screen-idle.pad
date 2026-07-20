@@ -1,0 +1,6 @@
+# Blasphemous 2 — reach the TITLE SCREEN and idle there.
+# One Cross press dismisses the intro/logo, then NO further input so the title screen's
+# ambience/music soundtrack can start (it begins a few seconds after the title appears).
+# Used for audio observation; the reach-first-gameplay route deliberately presses through
+# this state and never lets the title soundtrack play.
+1-2:cross

@@ -543,6 +543,13 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         if (d.set != expected_set)
             report.issues.push_back({DescriptorIssueCode::SetMismatch, true, d.set, d.binding, d.kind});
 
+        // Fragment set 1 binding 0 is reserved for the renderer-owned 64 KiB GDS backing.
+        // It has no guest descriptor-table entry; the live and replay backends inject it from
+        // the SPIR-V contract so capture artifacts remain self-contained.
+        const bool internal_gds = expected_stage == SpirvShaderStage::Fragment &&
+            d.set == 1 && d.binding == 0 && d.kind == SpirvDescriptorKind::StorageBuffer;
+        if (internal_gds) continue;
+
         std::vector<const ShaderResource*> matches;
         if (runtime) for (const auto& r : runtime->resources)
             if (r.binding == d.binding && r.cls != ResourceClass::Sampler) matches.push_back(&r);
