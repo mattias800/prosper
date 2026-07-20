@@ -49,6 +49,12 @@ int main(int argc, char** argv) {
     // Fragment: solid green (EXP MRT0).
     { const uint32_t c[] = {0x7E000280u,0x7E0202F2u,0x7E040280u,0x7E0602F2u,0xF800180Fu,0x03020100u,0xBF810000u};
       dump(dir, "fragment_color", recompile_fragment(c, sizeof(c)/4)); }
+    // Fragment: Astro's exact wave64 MBCNT + device-global append allocation shape.
+    { const uint32_t c[] = {
+          0xD7660007u,0x0001007Fu,0xBEFC0380u,0xD8FA0014u,0x06000000u,
+          0xD7650000u,0x00020E7Eu,0x4A140106u,0x36001481u,0x7E000D00u,
+          0x7E020280u,0x7E040280u,0x7E0602F2u,0xF800180Fu,0x03020100u,0xBF810000u};
+      dump(dir, "fragment_gds_append", recompile_fragment(c, sizeof(c)/4)); }
     // Fragment private spill/fill (Function-storage declaration in the graphics shell).
     { const uint32_t c[] = {0xdc704010u,0x00000000u,0x7e000280u,0xdc304010u,0x00000000u,
                             0xf800000fu,0x00000000u,0xBF810000u};

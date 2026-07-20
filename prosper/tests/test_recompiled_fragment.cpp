@@ -61,9 +61,8 @@ int main() {
         (wave_ctx.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
         (wave_ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
         (wave_ctx.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT);
-    const bool supports_fragment_gds = supports_fragment_wave64 &&
-        (wave_ctx.subgroup_operations & VK_SUBGROUP_FEATURE_BALLOT_BIT) &&
-        wave_ctx.fragment_stores_atomics;
+    const bool supports_fragment_gds =
+        supports_fragment_wave64 && wave_ctx.fragment_stores_atomics;
     std::vector<uint8_t> wave_px = prosper::test::render_triangle_rgba(vert, wave_frag, W, H);
     const bool wave_rendered = wave_px.size() == static_cast<size_t>(W) * H * 4;
     const uint8_t* wave_center = wave_rendered
@@ -115,6 +114,63 @@ int main() {
     } else {
         CHECK(!supports_fragment_gds && !gds_px.empty(),
               "device without fragment wave64/GDS support skips compaction draw fail-visible");
+    }
+
+    // Implicit-LOD sampling forces whole-quad execution on RADV. Primitive-edge helper lanes must
+    // participate in subgroup arithmetic without becoming the atomic leader or consuming slots.
+    const uint32_t gds_wqm_ps[] = {
+        0x7E0002FFu, 0x3E800000u, 0x7E0202FFu, 0x3E800000u,
+        0xF0800F08u, 0x00820000u, // image_sample v[0:3], v[0:1], s[8:15], s[16:19]
+        0xD7660007u, 0x0001007Fu, 0xBEFC0380u,
+        0xD8FA0014u, 0x06000000u,
+        0xD7650000u, 0x00020E7Eu, 0x4A140106u, 0x36001481u, 0x7E000D00u,
+        0x7E020280u, 0x7E040280u, 0x7E0602F2u,
+        0xF800180Fu, 0x03020100u, 0xBF810000u,
+    };
+    ShaderResourceTable gds_wqm_rt;
+    ShaderResource gds_wqm_texture{};
+    gds_wqm_texture.cls = ResourceClass::Texture;
+    gds_wqm_texture.binding = 4; gds_wqm_texture.img_dim = 1;
+    gds_wqm_texture.width = 2; gds_wqm_texture.height = 2;
+    gds_wqm_texture.sgpr_base = 8;
+    gds_wqm_rt.resources.push_back(gds_wqm_texture);
+    std::vector<uint32_t> gds_wqm_frag = recompile_fragment(
+        gds_wqm_ps, std::size(gds_wqm_ps), &gds_wqm_rt);
+    const uint8_t wqm_texels[16] = {
+        255,255,255,255, 255,255,255,255,
+        255,255,255,255, 255,255,255,255,
+    };
+    prosper::test::TexDesc gds_wqm_tex{4, 2, 2, wqm_texels};
+    prosper::test::reset_internal_gds_for_test();
+    std::vector<uint8_t> gds_wqm_px = prosper::test::render_triangle_rgba(
+        vert, gds_wqm_frag, W, H, nullptr, nullptr, nullptr, &gds_wqm_tex);
+    if (supports_fragment_gds && gds_wqm_px.size() == static_cast<size_t>(W) * H * 4) {
+        uint32_t covered = 0, red = 0;
+        for (size_t i = 0; i < gds_wqm_px.size(); i += 4) {
+            if (gds_wqm_px[i + 2] < 0x40) {
+                ++covered;
+                if (gds_wqm_px[i] > 0x80) ++red;
+            }
+        }
+        CHECK(prosper::test::read_internal_gds_for_test(20) == covered,
+              "WQM helper lanes neither lead the GDS atomic nor consume counter slots");
+        CHECK(red == covered / 2,
+              "WQM append-base + MBCNT-prefix allocation remains unique and contiguous");
+    } else {
+        CHECK(!supports_fragment_gds && !gds_wqm_px.empty(),
+              "unsupported device skips WQM GDS compaction draw fail-visible");
+    }
+
+    if (supports_fragment_gds) {
+        std::vector<uint32_t> gds_consume_ps(gds_ps, gds_ps + std::size(gds_ps));
+        gds_consume_ps[3] = 0xD8F60014u; // ds_consume v6 offset:20 gds
+        std::vector<uint32_t> gds_consume_frag = recompile_fragment(
+            gds_consume_ps.data(), gds_consume_ps.size());
+        std::vector<uint8_t> gds_consume_px = prosper::test::render_triangle_rgba(
+            vert, gds_consume_frag, W, H);
+        CHECK(gds_consume_px.size() == static_cast<size_t>(W) * H * 4 &&
+                  prosper::test::read_internal_gds_for_test(20) == 0,
+              "GDS consume subtracts one covered-fragment allocation across all waves");
     }
 
     // Astro Bot's early foreground pass exports only R/G (EN=0x3). AMD's EXP contract preserves

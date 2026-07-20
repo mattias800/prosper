@@ -2223,9 +2223,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
              !(ctx.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
              !(ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
              !(ctx.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) ||
-             (uses_internal_gds &&
-              (!(ctx.subgroup_operations & VK_SUBGROUP_FEATURE_BALLOT_BIT) ||
-               !ctx.fragment_stores_atomics)))) {
+             (uses_internal_gds && !ctx.fragment_stores_atomics))) {
             const uint64_t shader_key = bd.fs_identity
                 ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
             static std::mutex log_mutex;
@@ -2242,6 +2240,14 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                              static_cast<int>(ctx.subgroup_size_control),
                              static_cast<int>(uses_internal_gds),
                              static_cast<int>(ctx.fragment_stores_atomics));
+            continue;
+        }
+        if (uses_internal_gds && !render_internal_gds_buffer().buffer) {
+            static std::once_flag logged;
+            std::call_once(logged, [] {
+                std::fprintf(stderr,
+                             "[render] skip draw: failed to allocate persistent GDS buffer\n");
+            });
             continue;
         }
         if (backend_trace) {
@@ -2734,7 +2740,6 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; lb[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
                     if (r.is_internal_gds) {
                         const RenderHostBuffer& gds = render_internal_gds_buffer();
-                        if (!gds.buffer) continue;
                         dbi[i] = {gds.buffer, 0, 64u * 1024u};
                         wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
                         wr[i].dstBinding = r.binding; wr[i].descriptorCount = 1;
