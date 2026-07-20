@@ -55,6 +55,7 @@ enum : uint32_t {
     Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Switch=251,
     Op_EmitVertex=218, Op_EndPrimitive=219,
     Op_Kill=252, Op_Return=253, Op_GroupNonUniformAny=335,
+    Op_GroupNonUniformIAdd=349,
     Op_GroupNonUniformQuadSwap=366,
 };
 // GLSL.std.450 extended-instruction numbers.
@@ -65,7 +66,7 @@ enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Gls
                   Glsl_NMin=79, Glsl_NMax=80 };   // NaN-aware min/max: one-NaN operand -> the other operand
 enum : uint32_t {
     Cap_Shader=1, Cap_Geometry=2, Cap_Int64=11, Cap_GroupNonUniform=61, Cap_GroupNonUniformVote=62,
-    Cap_GroupNonUniformQuad=68,
+    Cap_GroupNonUniformArithmetic=63, Cap_GroupNonUniformQuad=68,
     Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Geometry=3, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17, EM_Triangles=22,
     EM_OutputVertices=26, EM_OutputTriangleStrip=29,
@@ -88,7 +89,9 @@ enum : uint32_t {
     Dec_Centroid=16, Dec_Sample=17, Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35,
     BI_Position=0, BI_FragCoord=15, BI_FragDepth=22, BI_WorkgroupId=26, BI_LocalInvocationId=27,
-    BI_GlobalInvocationId=28, BI_VertexIndex=42, BI_InstanceIndex=43,
+    BI_GlobalInvocationId=28, BI_SubgroupLocalInvocationId=41,
+    BI_VertexIndex=42, BI_InstanceIndex=43,
+    GroupOp_ExclusiveScan=2,
 };
 
 uint32_t fbits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
@@ -214,6 +217,8 @@ struct SpirvCompute {
     bool     is_fragment=0;                          // true in the fragment shell (gates VINTRP interp)
     bool     is_compute=0;                            // true in the compute shell (gates LDS / s_barrier)
     bool     uses_barrier=0;                          // guest or synthesized workgroup barrier emitted
+    bool     declared_subgroup=0, declared_subgroup_arithmetic=0;
+    uint32_t v_subgroup_localid=0, t_ptr_in_u32=0;
     // Descriptor set for this stage's resources. VS and PS share ONE Vulkan pipeline, so they must NOT
     // reuse binding numbers within one set (both stages number their cbuf/texture from binding 2 -> a
     // set-0 collision made the descriptor layout invalid, corrupting the VS's reads -> degenerate
@@ -424,6 +429,41 @@ struct SpirvCompute {
         uint32_t result = id();
         put(code, Op_GroupNonUniformAny, {t_bool, result, uconst(Scope_Subgroup), value});
         return result;
+    }
+    uint32_t subgroup_local_id() {
+        if (!declared_subgroup) {
+            put(caps, Op_Capability, {Cap_GroupNonUniform});
+            declared_subgroup = true;
+        }
+        if (!v_subgroup_localid) {
+            t_ptr_in_u32 = id();
+            put(types, Op_TypePointer, {t_ptr_in_u32, SC_Input, t_u32});
+            v_subgroup_localid = id();
+            put(types, Op_Variable, {t_ptr_in_u32, v_subgroup_localid, SC_Input});
+            put(deco, Op_Decorate,
+                {v_subgroup_localid, Dec_BuiltIn, BI_SubgroupLocalInvocationId});
+            put(deco, Op_Decorate, {v_subgroup_localid, Dec_Flat});
+            iface.push_back(v_subgroup_localid);
+        }
+        uint32_t lane = id();
+        put(code, Op_Load, {t_u32, lane, v_subgroup_localid});
+        return lane;
+    }
+    uint32_t fragment_mbcnt(uint32_t mask_bit, uint32_t acc_bits, bool lo) {
+        if (!is_fragment) return 0;
+        if (!declared_subgroup_arithmetic) {
+            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
+            declared_subgroup_arithmetic = true;
+        }
+        const uint32_t lane = subgroup_local_id();
+        const uint32_t in_half = lo
+            ? ucmp(Op_ULessThan, lane, uconst(32))
+            : ucmp(Op_UGreaterThanEqual, lane, uconst(32));
+        const uint32_t selected = sel(land(mask_bit, in_half), uconst(1), uconst(0));
+        uint32_t prefix = id();
+        put(code, Op_GroupNonUniformIAdd,
+            {t_u32, prefix, uconst(Scope_Subgroup), GroupOp_ExclusiveScan, selected});
+        return ibin(Op_IAdd, acc_bits, prefix);
     }
     bool declared_subgroup_quad = false;
     uint32_t subgroup_quad_swap(uint32_t value, uint32_t direction) {
@@ -1966,7 +2006,8 @@ inline bool sreg_srt_range_tag(const RegState& rs, int base, uint32_t words, uin
 uint32_t inline_int_mask_bit(SpirvCompute& b, int value) {
     if (value == -1) return b.btrue();
     if (value == 0) return b.bfalse();
-    const uint32_t lane = b.ibin(Op_BitwiseAnd, b.linear_localid,
+    const uint32_t lane_id = b.is_fragment ? b.subgroup_local_id() : b.linear_localid;
+    const uint32_t lane = b.ibin(Op_BitwiseAnd, lane_id,
                                   b.uconst(b.wave_size - 1));
     const uint32_t bit = b.ibin(Op_BitwiseAnd, lane, b.uconst(31));
     const uint32_t high = b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32));
@@ -1982,7 +2023,8 @@ uint32_t inline_int_mask_bit(SpirvCompute& b, int value) {
 // operand. Lanes < 32 never contribute to the HI window, so their bit is 0.
 uint32_t inline_int_mask_bit_hi(SpirvCompute& b, int value) {
     if (value == 0) return b.bfalse();
-    const uint32_t lane = b.ibin(Op_BitwiseAnd, b.linear_localid, b.uconst(b.wave_size - 1));
+    const uint32_t lane_id = b.is_fragment ? b.subgroup_local_id() : b.linear_localid;
+    const uint32_t lane = b.ibin(Op_BitwiseAnd, lane_id, b.uconst(b.wave_size - 1));
     const uint32_t high = b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32));
     const uint32_t bit  = b.ibin(Op_BitwiseAnd, lane, b.uconst(31));   // lane-32 for lanes >= 32
     const uint32_t isset = b.ucmp(Op_INotEqual,
@@ -4743,16 +4785,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (in.sdst.value == 106 || in.sdst.value == 107) rs.vcc = cout_masked;
                     else if (in.sdst.kind == OperandKind::SGPR) rs.sreg_bool[in.sdst.value] = cout_masked;
                 }
-            } else if ((in.opcode == 0x365 || in.opcode == 0x366) && allow_wave && b.is_compute) {
+            } else if ((in.opcode == 0x365 || in.opcode == 0x366) && allow_wave &&
+                       (b.is_compute || b.is_fragment)) {
                 // v_mbcnt_lo/hi_u32_b32 (cross-lane): dst = src1 + count of lanes below this one whose mask
                 // bit (src0) is set, in the low/high 32. The per-lane "mask bit" comes from src0: EXEC
                 // (126/127) -> this lane's exec bool; inline -1 (all-ones) -> always set (mbcnt = lane
                 // index, the common "get my lane id" idiom, e.g. shader 037); inline 0 -> never; an SGPR
                 // pair -> that saved mask's bool. A general computed 32-bit mask VALUE isn't representable
-                // per-lane, so reject that. LDS+barriers (allow_wave => straight-line, barrier-uniform).
+                // per-lane, so reject that. Compute uses LDS+barriers at barrier-uniform sites;
+                // fragment uses a native exclusive subgroup sum with an enforced wave64 pipeline.
                 const uint32_t active = mbcnt_source_bit(
                     b, rs, in.src[0], in.opcode == 0x366);
-                if (active) vreg[in.dst.value] = b.mbcnt(active, val(in.src[1]), in.opcode == 0x365);
+                if (active) vreg[in.dst.value] = b.is_fragment
+                    ? b.fragment_mbcnt(active, val(in.src[1]), in.opcode == 0x365)
+                    : b.mbcnt(active, val(in.src[1]), in.opcode == 0x365);
                 else ok = false;
             } else if (in.opcode == 0x12F) {                          // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
                 vreg[in.dst.value] = b.pack_half2x16_rtz(fv(0), fv(1)); // v_cvt_pkrtz VOP3: RTZ clamp (#452)
@@ -8324,6 +8370,21 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
         return {};
     }
     return b.finish();
+}
+
+uint32_t fragment_spirv_required_subgroup_size(const std::vector<uint32_t>& spirv) {
+    if (spirv.size() < 5 || spirv[0] != 0x07230203u) return 0;
+    for (size_t offset = 5; offset < spirv.size();) {
+        const uint32_t instruction = spirv[offset];
+        const uint32_t words = instruction >> 16;
+        const uint32_t opcode = instruction & 0xffffu;
+        if (!words || words > spirv.size() - offset) return 0;
+        if (opcode == Op_Capability && words == 2 &&
+            spirv[offset + 1] == Cap_GroupNonUniformArithmetic)
+            return 64;
+        offset += words;
+    }
+    return 0;
 }
 
 std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
