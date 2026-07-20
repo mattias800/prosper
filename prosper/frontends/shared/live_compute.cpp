@@ -1,4 +1,5 @@
 #include "live_compute.hpp"
+#include "vulkan_device_select.hpp"
 
 #include "gpu/bc_decode.hpp"
 #include "gpu/gpu_capture.hpp"
@@ -222,19 +223,13 @@ struct VulkanComputeContext {
         if (!device_count) return false;
         std::vector<VkPhysicalDevice> devices(device_count);
         vkEnumeratePhysicalDevices(instance, &device_count, devices.data());
-        physical = devices[0];
-
-        uint32_t family_count = 0;
-        vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, nullptr);
-        std::vector<VkQueueFamilyProperties> families(family_count);
-        vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, families.data());
-        for (uint32_t i = 0; i < family_count; i++) {
-            if (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-                queue_family = i;
-                break;
-            }
-        }
-        if (queue_family == UINT32_MAX) return false;
+        const auto selection = select_vulkan_device(devices, VK_QUEUE_COMPUTE_BIT);
+        physical = selection.device;
+        queue_family = selection.queue_family;
+        if (!physical || queue_family == UINT32_MAX) return false;
+        std::fprintf(stderr, "[compute] Vulkan device: %s (%s)\n",
+                     selection.properties.deviceName,
+                     vulkan_device_type_name(selection.properties.deviceType));
 
         float priority = 1.0f;
         VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};

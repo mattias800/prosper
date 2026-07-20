@@ -28,6 +28,10 @@ render state, texture decode/detiling, executor behavior, or presentation.
 representative presented PNGs, the boot log, and structured per-frame evidence
 in `tools/snapshot/failures/`.
 
+Snapshot rendering uses the shared renderer's hardware-first Vulkan selection: discrete, integrated,
+and virtual GPUs are preferred over CPU devices, with llvmpipe used only when no usable GPU is exposed.
+The selected device is printed in each retained run log.
+
 ## Guard Modes
 
 ### Routed content guard
