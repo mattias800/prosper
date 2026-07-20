@@ -856,15 +856,22 @@ zero validation errors** -- every renderer-owned sampled binding in that route t
 Throughput, measured on an **idle** machine through `tools/perf/ab_compute.sh`, 3 alternating reps of
 150 s on `load-save-first-station.pad` (a real gameplay scene, not a menu):
 
-| | run-wide mean | gameplay-tail mean |
-|---|---|---|
-| host path (`PROSPER_NO_DIRECT_RTT_BIND=1`) | 7.60 ms | 7.84 ms |
-| direct bind | 5.94 ms | 5.88 ms |
-| | **-21.8%** | **-25.0%** |
+| | compute, run-wide | compute, gameplay tail | gameplay frame rate |
+|---|---|---|---|
+| host path (`PROSPER_NO_DIRECT_RTT_BIND=1`) | 7.60 ms | 7.84 ms | 13.0 fps |
+| direct bind | 5.94 ms | 5.88 ms | 14.0 fps |
+| | **-21.8%** | **-25.0%** | **+7.7%** |
 
-Every enabled run beat every disabled run on both metrics, and the compute memory pool drops
+Every enabled run beat every disabled run on all three metrics, and the compute memory pool drops
 **80.1 -> 63.7 MiB** (9 -> 7 cached allocations) as the per-dispatch staging buffer and the duplicate
 image disappear.
+
+**A 25% stage win is a 7.7% frame win, and the two must never be reported interchangeably.** Frame
+time goes 76.8 -> 71.3 ms, i.e. about 5.5 ms saved per frame, which is exactly the ~2.8 compute calls
+per frame times the 1.96 ms this removes from each. The accounting closes -- but the honest headline is
+that gameplay remains **about 14 fps**: this change removes 5.5 ms from a 71 ms frame and leaves the
+other 71 ms untouched. Any further work on this umbrella should profile where that remainder goes
+rather than continuing to optimise compute-side RTT handling, which is now a minority cost.
 
 **Measure gameplay, not only menus.** An earlier pass measured the title-screen route and reported
 about 13%. Gameplay is a different draw and dispatch mix and showed a *larger* win, but the direction

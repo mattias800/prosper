@@ -51,12 +51,20 @@ tail_window() { # mean of the last N rolling windows = the route's tail (skips m
   grep '\[render-window\] compute' "$OUT/$1.log" | tail -"${AB_TAIL_WINDOWS:-20}" \
     | sed -E 's/.*avg_ms=([0-9.]+).*/\1/' | awk '{s+=$1;n++} END {if(n) printf "%.2f", s/n}'
 }
+# FRAME RATE is the metric a user actually feels, and it is NOT interchangeable with the compute
+# cost above: a large win on one stage converts to a much smaller win on the frame if that stage is
+# a minority of frame time. Always report both, or a change looks better than it is.
+tail_fps() {
+  grep -oE '^\[app\] [0-9.]+ fps' "$OUT/$1.log" | grep -oE '[0-9.]+' \
+    | tail -"${AB_TAIL_WINDOWS:-20}" | awk '{s+=$1;n++} END {if(n) printf "%.1f", s/n}'
+}
 
 bad=0
 for rep in $(seq 1 "$REPS"); do
-  off=$(run "off_$rep" "$SWITCH");  offt=$(tail_window "off_$rep")
-  on=$(run  "on_$rep"  "");         ont=$(tail_window "on_$rep")
-  echo "rep$rep  OFF run=${off:-n/a} tail=${offt:-n/a}   ON run=${on:-n/a} tail=${ont:-n/a}  (ms/compute call)"
+  off=$(run "off_$rep" "$SWITCH");  offt=$(tail_window "off_$rep");  offf=$(tail_fps "off_$rep")
+  on=$(run  "on_$rep"  "");         ont=$(tail_window "on_$rep");   onf=$(tail_fps "on_$rep")
+  echo "rep$rep  compute ms/call  OFF run=${off:-n/a} tail=${offt:-n/a}   ON run=${on:-n/a} tail=${ont:-n/a}"
+  echo "rep$rep  frame rate       OFF tail=${offf:-n/a} fps            ON tail=${onf:-n/a} fps"
   # A run that produced no timing is a FAILED measurement, not a zero result. Reporting n/a and
   # exiting 0 would let a harness that never launched anything read as a clean benchmark.
   for v in "$off" "$on"; do [ -n "$v" ] || bad=1; done
