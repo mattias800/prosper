@@ -88,6 +88,11 @@ diagnostic target/resource overrides can preserve producers without saving early
 warmup gates are additive when both are supplied. `--timeout` covers
 the entire run, including warmup.
 
+The renderer prefers discrete, integrated, and virtual GPUs (in that order) over CPU Vulkan devices.
+llvmpipe remains the automatic fallback when no usable hardware Vulkan device is available. The selected
+graphics and compute devices are printed in the run log, so snapshot performance does not depend on the
+loader's unspecified physical-device enumeration order.
+
 Renderer cadence is useful when the sequence itself must include boot, so a complete warmup is not
 appropriate. Sparse rendering can omit temporal producers and is therefore not a gameplay oracle by
 itself. Pair `--render-every N` with `--render-every-for-seconds S` to accelerate a long intro, then

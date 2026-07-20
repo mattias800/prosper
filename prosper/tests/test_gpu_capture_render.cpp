@@ -602,8 +602,11 @@ int main() {
     ds_seed.depth_valid = true; ds_seed.stencil_valid = true;
     ds_seed.depth.resize(4u * 3u * 4u);
     ds_seed.stencil.resize(4u * 3u);
-    for (size_t i = 0; i < ds_seed.depth.size(); ++i)
-        ds_seed.depth[i] = static_cast<uint8_t>(i * 17u + 3u);
+    for (size_t i = 0; i < ds_seed.depth.size() / sizeof(float); ++i) {
+        const float value = static_cast<float>(i + 1) /
+                            static_cast<float>(ds_seed.depth.size() / sizeof(float) + 1);
+        std::memcpy(ds_seed.depth.data() + i * sizeof(float), &value, sizeof(value));
+    }
     for (size_t i = 0; i < ds_seed.stencil.size(); ++i)
         ds_seed.stencil[i] = static_cast<uint8_t>(i * 11u + 1u);
     CHECK(restore_gpu_replay_ds_seeds({ds_seed}, error),

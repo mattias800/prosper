@@ -6,6 +6,7 @@
 #include <vulkan/vulkan.h>
 #include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/render_state.hpp"
+#include "../frontends/shared/vulkan_device_select.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -432,11 +433,13 @@ inline const RenderVkCtx& render_vk_ctx() {
         uint32_t nd = 0; vkEnumeratePhysicalDevices(r.inst, &nd, nullptr);
         if (!nd) return r;
         std::vector<VkPhysicalDevice> devs(nd); vkEnumeratePhysicalDevices(r.inst, &nd, devs.data());
-        r.phys = devs[0];
-        uint32_t nqf = 0; vkGetPhysicalDeviceQueueFamilyProperties(r.phys, &nqf, nullptr);
-        std::vector<VkQueueFamilyProperties> qf(nqf); vkGetPhysicalDeviceQueueFamilyProperties(r.phys, &nqf, qf.data());
-        for (uint32_t i = 0; i < nqf; i++) if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { r.qfi = i; break; }
-        if (r.qfi == UINT32_MAX) return r;
+        const auto selection = prosper::frontend::select_vulkan_device(devs, VK_QUEUE_GRAPHICS_BIT);
+        r.phys = selection.device;
+        r.qfi = selection.queue_family;
+        if (!r.phys || r.qfi == UINT32_MAX) return r;
+        std::fprintf(stderr, "[render] Vulkan device: %s (%s)\n",
+                     selection.properties.deviceName,
+                     prosper::frontend::vulkan_device_type_name(selection.properties.deviceType));
         float prio = 1.0f;
         VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
         qci.queueFamilyIndex = r.qfi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
