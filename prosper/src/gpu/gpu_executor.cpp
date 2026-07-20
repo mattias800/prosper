@@ -23,6 +23,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <iterator>
+#include <map>
 #include <mutex>
 #include <set>
 #include <tuple>
@@ -45,6 +46,20 @@
 extern "C" const void* prosper_agc_shader_header_for_code(uint64_t code_addr);
 
 namespace prosper::gpu {
+
+bool should_log_recompile_reject(uint64_t es_addr, uint64_t ps_addr,
+                                 size_t vs_words, size_t gs_words, size_t fs_words,
+                                 uint64_t* occurrence) {
+    using Key = std::tuple<uint64_t, uint64_t, size_t, size_t, size_t>;
+    static std::mutex mutex;
+    static std::map<Key, uint64_t> counts;
+    std::lock_guard<std::mutex> lock(mutex);
+    uint64_t& count = counts[{es_addr, ps_addr, vs_words, gs_words, fs_words}];
+    if (count != UINT64_MAX) ++count;
+    if (occurrence) *occurrence = count;
+    return count != 0 && (count & (count - 1)) == 0;
+}
+
 namespace {
 LiveRenderFn g_live;   // empty until the runtime/test registers a device-backed renderer
 LiveComputeFn g_compute;   // synchronous compute backend, registered with the live Vulkan frontend

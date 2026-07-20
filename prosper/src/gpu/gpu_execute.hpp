@@ -99,6 +99,13 @@ bool guest_readable(uint64_t addr, uint32_t bytes);
 // into a host fault.
 bool guest_writable(uint64_t addr, uint32_t bytes);
 
+// PROSPER_DBG can encounter the same failed shader pair millions of times in a draw loop. Return
+// true for the first and power-of-two occurrences so diagnostics retain recurrence/count evidence
+// without letting repeated failures bury the unique recompiler rejection that caused them.
+bool should_log_recompile_reject(uint64_t es_addr, uint64_t ps_addr,
+                                 size_t vs_words, size_t gs_words, size_t fs_words,
+                                 uint64_t* occurrence);
+
 // Convert the untrusted byte size published by an AGC shader header into the exact instruction
 // span that dynamic descriptor folding may probe and decode. Exposed so the safety/work bound has
 // direct regression coverage instead of being inferred from whether a large guest range is mapped.
@@ -715,13 +722,18 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 g_dyntrace_force = false;
             }
         }
-        if (getenv("PROSPER_DBG"))
+        uint64_t reject_occurrence = 0;
+        if (getenv("PROSPER_DBG") &&
+            should_log_recompile_reject(rs.es_addr, rs.ps_addr,
+                                        vs_words.size(), gs.size(), fs_words.size(),
+                                        &reject_occurrence))
             fprintf(stderr, "[exec-recompile-reject] es=0x%llx ps=0x%llx vs=%zu gs=%zu fs=%zu "
-                            "prim=%u topo=%u ena=%08x addr=%08x order=%llu\n",
+                            "prim=%u topo=%u ena=%08x addr=%08x order=%llu occurrence=%llu\n",
                     (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
                     vs_words.size(), gs.size(), fs_words.size(), rs.prim_type, resolved_pipeline.topology,
                     rs.ps_input_ena, rs.ps_input_addr,
-                    (unsigned long long)(draw ? draw->command_order : 0));
+                    (unsigned long long)(draw ? draw->command_order : 0),
+                    (unsigned long long)reject_occurrence);
         if (const char* dd = getenv("PROSPER_SHADER_DUMP")) {
             for (auto [tag, addr] : {std::pair{"vs", rs.es_addr}, std::pair{"ps", rs.ps_addr}}) {
                 if (!addr || !guest_readable(addr, sizeof(uint32_t))) continue;
