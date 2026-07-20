@@ -27,7 +27,6 @@
 #include <string>
 #include <vector>
 #include <set>
-#include <tuple>
 #include <unordered_map>
 
 // Classify a guest address: 0 => not within a reserved/committed guest mapping (see hle_kernel_mem).
@@ -368,7 +367,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             if (!prosper::test::pin_persistent_color_target(addr, surface.w, surface.h, format))
                 return false;
             target->last_use = ++prosper::test::persistent_color_target_generation();
+            // The unpin key is {addr, w, h, format}. A repeat import that disagreed with the
+            // recorded key would corrupt the outstanding pin's release, so decline instead.
             PinnedImport& pin = pinned_imports[addr];
+            if (pin.count &&
+                (pin.width != surface.w || pin.height != surface.h || pin.format != format)) {
+                prosper::test::unpin_persistent_color_target(addr, surface.w, surface.h, format);
+                return false;
+            }
             pin = {surface.w, surface.h, format, pin.count + 1};
             import.width = surface.w;
             import.height = surface.h;

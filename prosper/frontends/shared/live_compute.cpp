@@ -371,6 +371,12 @@ struct BoundImage {
     bool imported = false;
     uint64_t imported_addr = 0;
     uint32_t imported_saved_layout = 0;      // VkImageLayout the renderer left the image in
+    // Several bindings can borrow the SAME renderer image without being folded together, because
+    // the import contract is looser than the alias contract (it ignores sampler state, T# size and
+    // img_dim 1-vs-5). Exactly one of them owns the layout transitions: a second barrier pair would
+    // declare oldLayout=saved on an image already in GENERAL, which is an invalid transition a
+    // driver may treat as a discard.
+    bool imported_barrier_owner = false;
     uint64_t before_hash = 0, after_hash = 0; // trace-only storage-image writeback evidence
     uint64_t nonzero_channels = 0;
 };
@@ -880,6 +886,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         bi.imported_addr = r->gpu_addr;
                         bi.imported_saved_layout = import.layout;
                         bi.image = static_cast<VkImage>(import.image);
+                        bi.imported_barrier_owner = true;
+                        for (size_t prior = 0; prior < i; prior++) {
+                            if (images[prior].imported &&
+                                images[prior].imported_addr == r->gpu_addr) {
+                                bi.imported_barrier_owner = false;   // an earlier binding transitions it
+                                break;
+                            }
+                        }
                         live_target.width = import.width;
                         live_target.height = import.height;
                         live_target.format = import.format;
@@ -1640,6 +1654,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (bi.alias_of != SIZE_MAX) continue;
             const ShaderResource* r = bi.resource;
             if (bi.imported) {
+                if (!bi.imported_barrier_owner) continue;   // another binding transitions this image
                 // Borrowed renderer image (#1095): nothing to upload. Make the renderer's writes
                 // visible to this dispatch and move it into the GENERAL layout the descriptors
                 // declare. The matching barrier after the dispatch puts it back.
@@ -1697,11 +1712,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // Hand every borrowed renderer image back in the layout its owner left it in (#1095), so the
         // renderer's own layout tracking stays true whether or not a dispatch consumed the target.
         for (const BoundImage& bi : images) {
-            if (!bi.imported || bi.alias_of != SIZE_MAX) continue;
+            if (!bi.imported || !bi.imported_barrier_owner || bi.alias_of != SIZE_MAX) continue;
             VkImageMemoryBarrier restore{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             restore.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            // The renderer's next use of a persistent target is frequently vkCmdCopyImageToBuffer
+            // or a scanout blit, so make the transition visible to transfer access as well.
             restore.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+                                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+                                    VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
             restore.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
             restore.newLayout = static_cast<VkImageLayout>(bi.imported_saved_layout);
             restore.srcQueueFamilyIndex = restore.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -1742,7 +1760,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (!vk_ok(vkQueueSubmit(ctx.queue, 1, &submit, fence), "queue-submit")) break;
         if (trace) std::fprintf(stderr, "[compute]   waiting for dispatch\n");
         if (!vk_ok(vkWaitForFences(ctx.device, 1, &fence, VK_TRUE,
-                                   30ull * 1000 * 1000 * 1000), "queue-wait")) break;
+                                   30ull * 1000 * 1000 * 1000), "queue-wait")) {
+            // cleanup() destroys the command buffer and releases the borrowed image's pin. With a
+            // renderer-owned image bound, in-flight work still references it and its layout
+            // transitions, so drain the queue first rather than freeing it underneath the GPU --
+            // the same fallback readback_persistent_color_target uses on a failed wait.
+            if (vkQueueWaitIdle(ctx.queue) != VK_SUCCESS && trace)
+                std::fprintf(stderr, "[compute]   queue drain after fence timeout failed\n");
+            break;
+        }
         if (trace) std::fprintf(stderr, "[compute]   dispatch complete\n");
         phase_dispatch = ComputeClock::now();
 

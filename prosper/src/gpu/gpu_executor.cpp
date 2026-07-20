@@ -4069,7 +4069,13 @@ bool import_live_render_target_image(uint64_t gpu_addr, LiveTargetImageImport& i
     import = LiveTargetImageImport{};
     if (!g_live_target_image_import) return false;
     if (!g_live_target_image_import(gpu_addr, import)) { import = LiveTargetImageImport{}; return false; }
-    if (!import.valid()) { import = LiveTargetImageImport{}; return false; }
+    if (!import.valid()) {
+        // The importer pinned the entry before returning true; drop that pin rather than leaking a
+        // permanently un-evictable cache entry if a future importer breaks the contract.
+        release_live_render_target_image(gpu_addr);
+        import = LiveTargetImageImport{};
+        return false;
+    }
     return true;
 }
 void release_live_render_target_image(uint64_t gpu_addr) {
