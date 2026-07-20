@@ -867,11 +867,33 @@ Every enabled run beat every disabled run on all three metrics, and the compute 
 image disappear.
 
 **A 25% stage win is a 7.7% frame win, and the two must never be reported interchangeably.** Frame
-time goes 76.8 -> 71.3 ms, i.e. about 5.5 ms saved per frame, which is exactly the ~2.8 compute calls
-per frame times the 1.96 ms this removes from each. The accounting closes -- but the honest headline is
-that gameplay remains **about 14 fps**: this change removes 5.5 ms from a 71 ms frame and leaves the
-other 71 ms untouched. Any further work on this umbrella should profile where that remainder goes
-rather than continuing to optimise compute-side RTT handling, which is now a minority cost.
+time goes 76.7 -> 71.2 ms, about 5.4 ms saved per frame.
+
+**The accounting does NOT fully close, and an earlier revision of this section wrongly claimed it did.**
+The route runs 5.28 compute calls per frame, so removing 1.66 ms from each predicts an **8.5 ms** frame
+saving; only **5.4 ms** (64%) materialised. Measured non-compute time per frame *rose* 36.7 -> 39.8 ms
+across the arms. The most likely confound is the fixed wall clock: both arms run 150 s, so the faster
+arm renders more frames (2450 vs 2298) and therefore progresses FURTHER along the route, rendering
+different -- and here evidently heavier -- content. A fixed-wall-clock A/B does not compare identical
+scenes. Treat the 5.4 ms as the honest observed figure and the 8.5 ms as an upper bound; closing this
+gap needs a fixed-WORK route (equal frame counts or a fixed scene) rather than a fixed-duration one.
+
+### Distance to a playable frame rate
+
+| | current | 30 fps | 60 fps |
+|---|---|---|---|
+| frame time | **71.2 ms (14.0 fps)** | 33.3 ms | 16.7 ms |
+| required | -- | **2.14x faster** (remove 37.9 ms) | **4.27x faster** (remove 54.5 ms) |
+
+Composition of the current 71.2 ms frame: **compute 31.4 ms (44%)** (5.28 calls x 5.94 ms) and
+**everything else 39.8 ms (56%)**.
+
+**Compute alone is 94% of a 30 fps budget and 188% of a 60 fps budget.** Even if every non-compute cost
+went to zero, compute as it stands would still miss 60 fps by roughly 2x. So 60 fps is not reachable by
+optimising the non-compute remainder: the number of dispatches per frame, or their cost, has to fall by
+a large multiple. That is a different class of work from the per-dispatch savings in #1091/#1095 --
+which have now taken the per-call cost from 7.60 to 5.94 ms and removed the readback/re-upload
+entirely, leaving the remaining per-call cost to be attacked structurally.
 
 **Measure gameplay, not only menus.** An earlier pass measured the title-screen route and reported
 about 13%. Gameplay is a different draw and dispatch mix and showed a *larger* win, but the direction
