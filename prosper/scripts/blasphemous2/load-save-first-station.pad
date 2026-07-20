@@ -1,0 +1,39 @@
+# Blasphemous 2 - LOAD the first-save-station save and land in gameplay.
+#
+# Requires an existing save (a Prie Dieu save at the first station). A reference copy lives in
+# saves/savedata0-backup-2026-07-20/ (slot1/segmentSlot); restore it into the PROSPER_SAVE0 root
+# before running if the live save data has been cleared.
+#
+# This replaces the long exploratory reach-first-gameplay route for gameplay measurement. That route
+# sits through the studio logos, EULA, opening cinematic and the bile-flask/movement tutorials, so it
+# needs roughly 380 s of wall clock and every press is a timing guess against tutorial pacing.
+# Loading a save reaches real gameplay in well under two minutes and depends on no tutorial state.
+#
+# Confirmations needed: Cross leaves the "Press X to continue" title, Cross opens "Pilgrimage",
+# the save list takes a moment to populate, and Cross loads the highlighted save.
+#
+# The presses REPEAT every five seconds rather than firing three times at fixed offsets, because the
+# wall time at which each screen becomes ready swings widely with the rendering policy: the same
+# route reaches the title in a few seconds under prosper-app but needs roughly a minute under
+# full-resolution screenshot capture. Holds are one second because synchronous native-resolution
+# rendering can leave this title only two or three pad polls per second. Surplus presses land in
+# gameplay as jumps, which is harmless and keeps both arms of an A/B identical.
+1-2:cross
+6-7:cross
+11-12:cross
+16-17:cross
+21-22:cross
+26-27:cross
+31-32:cross
+36-37:cross
+41-42:cross
+46-47:cross
+51-52:cross
+56-57:cross
+61-62:cross
+66-67:cross
+71-72:cross
+76-77:cross
+81-82:cross
+86-87:cross
+91-92:cross
