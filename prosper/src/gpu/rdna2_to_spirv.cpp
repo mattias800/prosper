@@ -54,7 +54,8 @@ enum : uint32_t {
     Op_Phi=245, Op_LoopMerge=246,
     Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Switch=251,
     Op_EmitVertex=218, Op_EndPrimitive=219,
-    Op_Kill=252, Op_Return=253, Op_GroupNonUniformAny=335,
+    Op_Kill=252, Op_Return=253, Op_GroupNonUniformElect=333, Op_GroupNonUniformAny=335,
+    Op_GroupNonUniformBroadcastFirst=338,
     Op_GroupNonUniformIAdd=349,
     Op_GroupNonUniformQuadSwap=366,
 };
@@ -66,7 +67,7 @@ enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Gls
                   Glsl_NMin=79, Glsl_NMax=80 };   // NaN-aware min/max: one-NaN operand -> the other operand
 enum : uint32_t {
     Cap_Shader=1, Cap_Geometry=2, Cap_Int64=11, Cap_GroupNonUniform=61, Cap_GroupNonUniformVote=62,
-    Cap_GroupNonUniformArithmetic=63, Cap_GroupNonUniformQuad=68,
+    Cap_GroupNonUniformArithmetic=63, Cap_GroupNonUniformBallot=64, Cap_GroupNonUniformQuad=68,
     Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Geometry=3, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17, EM_Triangles=22,
     EM_OutputVertices=26, EM_OutputTriangleStrip=29,
@@ -88,10 +89,11 @@ enum : uint32_t {
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_NoPerspective=13, Dec_Flat=14,
     Dec_Centroid=16, Dec_Sample=17, Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35,
-    BI_Position=0, BI_FragCoord=15, BI_FragDepth=22, BI_WorkgroupId=26, BI_LocalInvocationId=27,
+    BI_Position=0, BI_FragCoord=15, BI_FragDepth=22, BI_HelperInvocation=23,
+    BI_WorkgroupId=26, BI_LocalInvocationId=27,
     BI_GlobalInvocationId=28, BI_SubgroupLocalInvocationId=41,
     BI_VertexIndex=42, BI_InstanceIndex=43,
-    GroupOp_ExclusiveScan=2,
+    GroupOp_Reduce=0, GroupOp_ExclusiveScan=2,
 };
 
 uint32_t fbits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
@@ -217,8 +219,10 @@ struct SpirvCompute {
     bool     is_fragment=0;                          // true in the fragment shell (gates VINTRP interp)
     bool     is_compute=0;                            // true in the compute shell (gates LDS / s_barrier)
     bool     uses_barrier=0;                          // guest or synthesized workgroup barrier emitted
-    bool     declared_subgroup=0, declared_subgroup_arithmetic=0;
+    bool     declared_subgroup=0, declared_subgroup_arithmetic=0, declared_subgroup_ballot=0;
     uint32_t v_subgroup_localid=0, t_ptr_in_u32=0;
+    uint32_t v_helper_invocation=0, t_ptr_in_bool=0;
+    uint32_t v_internal_gds=0, t_ptr_gds_u32=0;
     // Descriptor set for this stage's resources. VS and PS share ONE Vulkan pipeline, so they must NOT
     // reuse binding numbers within one set (both stages number their cbuf/texture from binding 2 -> a
     // set-0 collision made the descriptor layout invalid, corrupting the VS's reads -> degenerate
@@ -467,6 +471,80 @@ struct SpirvCompute {
         put(code, Op_GroupNonUniformIAdd,
             {t_u32, prefix, uconst(Scope_Subgroup), GroupOp_ExclusiveScan, selected});
         return ibin(Op_IAdd, acc_bits, prefix);
+    }
+    uint32_t helper_invocation() {
+        if (!v_helper_invocation) {
+            t_ptr_in_bool = id();
+            put(types, Op_TypePointer, {t_ptr_in_bool, SC_Input, t_bool});
+            v_helper_invocation = id();
+            put(types, Op_Variable, {t_ptr_in_bool, v_helper_invocation, SC_Input});
+            put(deco, Op_Decorate,
+                {v_helper_invocation, Dec_BuiltIn, BI_HelperInvocation});
+            iface.push_back(v_helper_invocation);
+        }
+        uint32_t result = id();
+        put(code, Op_Load, {t_bool, result, v_helper_invocation});
+        return result;
+    }
+    void declare_internal_gds() {
+        if (v_internal_gds) return;
+        uint32_t runtime_array = id(), block = id(), block_ptr = id();
+        put(deco, Op_Decorate, {runtime_array, Dec_ArrayStride, 4});
+        put(deco, Op_MemberDecorate, {block, 0, Dec_Offset, 0});
+        put(deco, Op_Decorate, {block, Dec_Block});
+        put(types, Op_TypeRuntimeArray, {runtime_array, t_u32});
+        put(types, Op_TypeStruct, {block, runtime_array});
+        put(types, Op_TypePointer, {block_ptr, SC_StorageBuffer, block});
+        t_ptr_gds_u32 = id();
+        put(types, Op_TypePointer, {t_ptr_gds_u32, SC_StorageBuffer, t_u32});
+        v_internal_gds = id();
+        put(types, Op_Variable, {block_ptr, v_internal_gds, SC_StorageBuffer});
+        put(deco, Op_Decorate, {v_internal_gds, Dec_DescriptorSet, 1});
+        put(deco, Op_Decorate, {v_internal_gds, Dec_Binding, 0});
+    }
+    // Fragment GDS append/consume is one device-global atomic per hardware wave. Helper
+    // invocations participate in the subgroup operations but cannot consume guest counter slots.
+    uint32_t fragment_gds_append(uint32_t index, uint32_t exec_bit, bool consume) {
+        declare_internal_gds();
+        if (!declared_subgroup) {
+            put(caps, Op_Capability, {Cap_GroupNonUniform});
+            declared_subgroup = true;
+        }
+        if (!declared_subgroup_arithmetic) {
+            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
+            declared_subgroup_arithmetic = true;
+        }
+        if (!declared_subgroup_ballot) {
+            put(caps, Op_Capability, {Cap_GroupNonUniformBallot});
+            declared_subgroup_ballot = true;
+        }
+        const uint32_t active_bit = land(exec_bit, logical_not(helper_invocation()));
+        const uint32_t contribution = sel(active_bit, uconst(1), uconst(0));
+        uint32_t count = id();
+        put(code, Op_GroupNonUniformIAdd,
+            {t_u32, count, uconst(Scope_Subgroup), GroupOp_Reduce, contribution});
+        uint32_t elected = id();
+        put(code, Op_GroupNonUniformElect, {t_bool, elected, uconst(Scope_Subgroup)});
+        const uint32_t entry = cur_block, leader = id(), merge = id();
+        put(code, Op_SelectionMerge, {merge, 0});
+        put(code, Op_BranchConditional, {elected, leader, merge});
+        put(code, Op_Label, {leader}); cur_block = leader;
+        uint32_t pointer = id();
+        putv(code, Op_AccessChain,
+             {t_ptr_gds_u32, pointer, v_internal_gds, uconst(0), index});
+        uint32_t leader_old = id();
+        put(code, consume ? Op_AtomicISub : Op_AtomicIAdd,
+            {t_u32, leader_old, pointer, uconst(Scope_Device),
+             uconst(MemSem_UniformAcqRel), count});
+        const uint32_t leader_end = cur_block;
+        put(code, Op_Branch, {merge});
+        put(code, Op_Label, {merge}); cur_block = merge;
+        const uint32_t local_old = emit_phi_2way(
+            t_u32, leader_old, leader_end, uconst(0), entry);
+        uint32_t old = id();
+        put(code, Op_GroupNonUniformBroadcastFirst,
+            {t_u32, old, uconst(Scope_Subgroup), local_old});
+        return old;
     }
     bool declared_subgroup_quad = false;
     uint32_t subgroup_quad_swap(uint32_t value, uint32_t direction) {
@@ -5913,6 +5991,26 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 predicate_write(b, rs, in.dst.value, old);
                 return true;
             }
+            if (in.opcode == 0x3d || in.opcode == 0x3e) {
+                auto m0 = rs.sreg.find(124);
+                if (!allow_wave || m0 == rs.sreg.end()) { ok = false; return true; }
+                const uint32_t base = b.ibin(Op_BitwiseAnd, m0->second, b.uconst(0xFFFFu));
+                const uint32_t byte_addr = b.ibin(Op_IAdd, base, b.uconst(in.literal));
+                const uint32_t idx = b.ibin(Op_ShiftRightLogical, byte_addr, b.uconst(2));
+                const uint32_t old = vreg_old(b, rs, in.dst.value);
+                if (b.is_fragment && in.ds_gds) {
+                    rs.vreg[in.dst.value] = b.fragment_gds_append(
+                        idx, rs.exec, in.opcode == 0x3d);
+                } else if (b.is_compute) {
+                    b.declare_lds();
+                    rs.vreg[in.dst.value] = b.wave_append(
+                        idx, rs.exec, in.opcode == 0x3d);
+                } else {
+                    ok = false; return true;
+                }
+                predicate_write(b, rs, in.dst.value, old);
+                return true;
+            }
             // LDS (workgroup shared memory), compute-only. Byte address = ADDR VGPR + instruction
             // offset; the backing store is dword-indexed. gfx10 ds_write2_b64 carries two independent
             // 8-bit offsets in units of 64-bit elements, while ds_write_b64 uses the ordinary 16-bit
@@ -5929,22 +6027,6 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             b.declare_lds();
             auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
-            if (in.opcode == 0x3d || in.opcode == 0x3e) { // ds_consume/append: wave-wide LDS counter allocation
-                // AMD RDNA2 ISA 12.13: address = M0[15:0] + byte offset; atomically subtract/add
-                // popcount(EXEC) once for the wave and broadcast the pre-op value to valid lanes.
-                auto m0 = rs.sreg.find(124);
-                if (!allow_wave || m0 == rs.sreg.end() ||
-                    (b.wave_size != 32 && b.wave_size != 64)) {
-                    ok = false; return true;
-                }
-                const uint32_t base = b.ibin(Op_BitwiseAnd, m0->second, b.uconst(0xFFFFu));
-                const uint32_t byte_addr = b.ibin(Op_IAdd, base, b.uconst(in.literal));
-                const uint32_t idx = b.ibin(Op_ShiftRightLogical, byte_addr, b.uconst(2));
-                const uint32_t old = vreg_old(b, rs, in.dst.value);
-                rs.vreg[in.dst.value] = b.wave_append(idx, rs.exec, in.opcode == 0x3d);
-                predicate_write(b, rs, in.dst.value, old);
-                return true;
-            }
             if (in.opcode == 0x4e) {                    // ds_write2_b64: two VGPR pairs at offset0/offset1
                 const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
                 const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst((in.literal & 0xFFu) * 2u));
@@ -8388,6 +8470,29 @@ uint32_t fragment_spirv_required_subgroup_size(const std::vector<uint32_t>& spir
         offset += words;
     }
     return 0;
+}
+
+bool fragment_spirv_uses_internal_gds(const std::vector<uint32_t>& spirv) {
+    if (spirv.size() < 5 || spirv[0] != 0x07230203u) return false;
+    std::unordered_map<uint32_t, uint32_t> sets, bindings;
+    for (size_t offset = 5; offset < spirv.size();) {
+        const uint32_t instruction = spirv[offset];
+        const uint32_t words = instruction >> 16;
+        const uint32_t opcode = instruction & 0xffffu;
+        if (!words || words > spirv.size() - offset) return false;
+        if (opcode == Op_Decorate && words == 4) {
+            if (spirv[offset + 2] == Dec_DescriptorSet)
+                sets[spirv[offset + 1]] = spirv[offset + 3];
+            else if (spirv[offset + 2] == Dec_Binding)
+                bindings[spirv[offset + 1]] = spirv[offset + 3];
+        }
+        offset += words;
+    }
+    for (const auto& [variable, set] : sets) {
+        auto binding = bindings.find(variable);
+        if (set == 1 && binding != bindings.end() && binding->second == 0) return true;
+    }
+    return false;
 }
 
 std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
