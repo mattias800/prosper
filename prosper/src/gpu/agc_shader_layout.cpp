@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <set>
+#include <vector>
 
 namespace prosper::gpu {
 
@@ -213,6 +214,48 @@ bool gen5_image_format(uint32_t fmt, Gen5ImageFormatInfo* out) {
     return fi.format != DataFormat::Unknown;
 }
 
+// #320: gated raw-T# dump. Prints the exact 8 descriptor dwords alongside the decoded fields, so a
+// size MIS-decode (raw bits disagree with the decode) is distinguishable from a wrong/unresolved
+// descriptor at the source (raw bits genuinely encode the small size). PROSPER_TDUMP=1 dumps every
+// decode; PROSPER_TDUMP=WxH restricts to descriptors whose DECODED size is exactly WxH. Distinct
+// descriptors only (content-hashed), capped, async-log-safe (fprintf like the neighboring paths).
+namespace {
+struct TdumpFilter { bool on = false; uint32_t w = 0, h = 0; };
+const TdumpFilter& tdump_filter() {
+    static const TdumpFilter f = [] {
+        TdumpFilter v;
+        const char* e = getenv("PROSPER_TDUMP");
+        if (!e || !*e) return v;
+        v.on = true;
+        unsigned w = 0, h = 0;
+        if (sscanf(e, "%ux%u", &w, &h) == 2) { v.w = w; v.h = h; }
+        return v;
+    }();
+    return f;
+}
+void tdump_report(const uint32_t t[8], const DecodedImageDescriptor& d) {
+    const TdumpFilter& f = tdump_filter();
+    if (!f.on) return;
+    if (f.w && (d.width != f.w || d.height != f.h)) return;
+    uint64_t hash = 1469598103934665603ull;
+    for (int i = 0; i < 8; i++) { hash ^= t[i]; hash *= 1099511628211ull; }
+    static std::mutex mx;
+    static std::vector<uint64_t> seen;
+    static int emitted = 0;
+    std::lock_guard<std::mutex> lk(mx);
+    if (emitted >= 512) return;
+    for (uint64_t s : seen) if (s == hash) return;
+    if (seen.size() < 4096) seen.push_back(hash);
+    emitted++;
+    fprintf(stderr,
+            "[tdump] t=%08x %08x %08x %08x %08x %08x %08x %08x | base=0x%llx %ux%u fmt=%u type=%u "
+            "tile=%u mips=%u..%u max_mip=%u depth=%u base_array=%u\n",
+            t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7],
+            (unsigned long long)d.base, d.width, d.height, d.format, d.type, d.tile_mode,
+            d.base_level, d.last_level, d.max_mip, d.depth, d.base_array);
+}
+} // namespace
+
 DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
     DecodedImageDescriptor d;
     d.base      = (((uint64_t)t[0] | ((uint64_t)t[1] << 32)) & 0xFFFFFFFFFFull) << 8;             // Base40
@@ -257,6 +300,7 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
     d.color_transform             = ((t[6] >> 23) & 0x1u) != 0;
     const uint64_t metadata_field = (static_cast<uint64_t>(t[7]) << 8) | (t[6] >> 24);
     d.metadata_addr               = metadata_field << 8;
+    tdump_report(t, d);
     return d;
 }
 
