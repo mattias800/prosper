@@ -396,6 +396,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_dmem PRIVATE prosper_core)
   add_test(NAME dmem_available COMMAND test_dmem)
 
+  # Huge non-fixed sceKernelReserveVirtualRange placement (#312/#946): the 512 GiB UE arena
+  # must be steered off its low hint into the guest auto window (see test for the contract).
+  add_executable(test_reserve_placement tests/test_reserve_placement.cpp)
+  target_link_libraries(test_reserve_placement PRIVATE prosper_core)
+  add_test(NAME reserve_placement COMMAND test_reserve_placement)
+
   # A protection-only change must retain an uncommitted reservation's state (#343), or guest
   # VirtualQuery skips the later commit and the first access faults. Cross-platform HLE contract.
   add_executable(test_retrack_reservation tests/test_retrack_reservation.cpp)
