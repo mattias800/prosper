@@ -9,11 +9,9 @@
 #include <array>
 #include <cstring>
 #include <string>
-#ifdef _WIN32
+#include <vector>
 #include "../src/host/exec_image.hpp"
 #include "../src/hle/dispatch.hpp"
-#include <vector>
-#endif
 
 namespace prosper {
     uint32_t    prosper_apr_register(const std::string& path, uint64_t size);
@@ -69,7 +67,6 @@ int main() {
     CHECK(prosper_apr_match_by_size(645, nullptr) == 0 && prosper_apr_path_for_id(1).empty(),
           "reset clears the registry");
 
-#ifdef _WIN32
     // The AMPR builder is a DMA-style read: callers may consume their destination buffer directly,
     // not only the completion record's data pointer. Evergate loads globalgamemanagers this way.
     const char* fixture_path = "prosper-test-apr-read.tmp";
@@ -89,6 +86,7 @@ int main() {
     const std::vector<ImportSlot> slots = {{"libSceAmpr", "mQ16-QdKv7k"}};
     CHECK(install_stubs(slots, 0x720000000ull, 96, &stub_error),
           "generated executable AMPR import stub");
+    // sysv_abi is the default on Linux (a no-op there) and forces the guest SysV ABI on MinGW.
     using GuestReadFile = uint64_t (__attribute__((sysv_abi)) *)(
         uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
         uint64_t, uint64_t, uint64_t, uint64_t);
@@ -112,9 +110,34 @@ int main() {
     CHECK(completion[0] == (uint64_t)(uintptr_t)destination.data() &&
               completion[1] == 0 && completion[2] == read_size,
           "AMPR completion publishes destination, success, and byte count");
+
+    // Regression (Terminator 2D: NO FATE, PPSA25872, Unity IL2CPP): some titles pass the completion
+    // record INSIDE the request object — a2 = req+0x20, so the bytes-transferred slot a2+0x10 aliases
+    // req+0x30, a LIVE guest pointer the engine still uses. A live capture proved the bytes-
+    // transferred write clobbered it with the file size (9612 = 0x258c); the guest later freed
+    // 0x258c, and the next pop of that lock-free allocator freelist dereferenced 0x258c and SIGSEGV'd.
+    // The handler must NOT publish the byte count when its slot overlaps the request object.
+    std::array<uint8_t, 0x48> req_overlap{};
+    const uint64_t live_ptr = 0x2010216e00ull;                 // the guest's live req+0x30 pointer
+    std::memcpy(req_overlap.data() + 0x30, &live_ptr, 8);
+    uint64_t* record = reinterpret_cast<uint64_t*>(req_overlap.data() + 0x20);  // a2 == req+0x20
+    uint32_t overlap_id = prosper_apr_register(fixture_path, expected.size());
+    std::array<uint8_t, read_size> overlap_dst{};
+    uint64_t overlap_result = read_file && stub_error.empty()
+        ? read_file_guest((uint64_t)(uintptr_t)req_overlap.data(), 0,
+                          (uint64_t)(uintptr_t)record, overlap_id,
+                          (uint64_t)(uintptr_t)overlap_dst.data(), overlap_dst.size(),
+                          read_offset, 0, 0)
+        : ~uint64_t{0};
+    uint64_t survived = 0; std::memcpy(&survived, req_overlap.data() + 0x30, 8);
+    CHECK(overlap_result == 0, "overlapping-record read completes successfully");
+    CHECK(survived == live_ptr,
+          "bytes-transferred write does not clobber the live req+0x30 pointer (Terminator 2D)");
+    CHECK(record[0] == (uint64_t)(uintptr_t)overlap_dst.data() && record[1] == 0,
+          "overlapping record still publishes destination + success");
+
     std::remove(fixture_path);
     prosper_apr_reset_for_test();
-#endif
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
