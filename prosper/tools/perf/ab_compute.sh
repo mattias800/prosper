@@ -18,6 +18,7 @@ DUMP="${3:?game dump dir}"
 REPS="${4:-3}"
 SECS="${5:-60}"
 OUT="${AB_OUT_DIR:-$(mktemp -d)}"
+mkdir -p "$OUT" || { echo "cannot create output dir: $OUT" >&2; exit 2; }
 cd "$(dirname "$0")/../.."
 
 # --- refuse to measure against a contended GPU -------------------------------------------------
@@ -51,9 +52,17 @@ tail_window() { # mean of the last N rolling windows = the route's tail (skips m
     | sed -E 's/.*avg_ms=([0-9.]+).*/\1/' | awk '{s+=$1;n++} END {if(n) printf "%.2f", s/n}'
 }
 
+bad=0
 for rep in $(seq 1 "$REPS"); do
   off=$(run "off_$rep" "$SWITCH");  offt=$(tail_window "off_$rep")
   on=$(run  "on_$rep"  "");         ont=$(tail_window "on_$rep")
   echo "rep$rep  OFF run=${off:-n/a} tail=${offt:-n/a}   ON run=${on:-n/a} tail=${ont:-n/a}  (ms/compute call)"
+  # A run that produced no timing is a FAILED measurement, not a zero result. Reporting n/a and
+  # exiting 0 would let a harness that never launched anything read as a clean benchmark.
+  for v in "$off" "$on"; do [ -n "$v" ] || bad=1; done
 done
 echo "# finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+if [ "$bad" -ne 0 ]; then
+  echo "MEASUREMENT FAILED: at least one run produced no [render-timing] output; see $OUT" >&2
+  exit 1
+fi
