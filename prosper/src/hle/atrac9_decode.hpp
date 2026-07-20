@@ -25,13 +25,23 @@ public:
     // Codec geometry (valid after init): interleaved output is `channels` samples per frame position.
     int channels() const { return channels_; }
     int sample_rate() const { return sample_rate_; }
+    int frame_samples() const { return frame_samples_; }             // per channel, per ATRAC9 frame
     int superframe_bytes() const { return superframe_bytes_; }        // compressed bytes per superframe
     int superframe_samples() const { return frame_samples_ * frames_per_superframe_; }  // per channel
 
     // Decode ONE superframe (`superframe_bytes()` compressed bytes at `in`) into `out`, which must hold
     // superframe_samples()*channels() interleaved S16 samples. Returns the number of sample-frames
     // written per channel (== superframe_samples()) on success, or -1 on a decode error.
-    int decode_superframe(const uint8_t* in, int16_t* out);
+    // NOTE: the SUPERFRAME is the only safe advance unit. A superframe's frames are variable-length and
+    // need not fill superframe_bytes() (the remainder is padding), so advancing a cursor by per-frame
+    // consumed counts drifts out of alignment and desyncs the decoder. Always step by superframe_bytes().
+    //
+    // `avail` (optional) is the number of readable bytes at `in`. LibAtrac9's bit reader takes no input
+    // length and will happily parse past the end of a truncated/corrupt block, so a frame whose parse
+    // runs beyond min(avail, superframe_bytes()) is rejected (-1) instead of being trusted. Callers
+    // feeding guest memory MUST pass `avail` and should over-allocate by superframe_bytes() so that a
+    // bounded over-read still lands inside owned memory.
+    int decode_superframe(const uint8_t* in, int16_t* out, int avail = -1);
 
 private:
     void* handle_ = nullptr;
