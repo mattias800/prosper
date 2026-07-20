@@ -43,6 +43,25 @@ int main() {
     printf("== test_gpu_execute ==\n");
     const uint32_t W = 64, H = 64;
 
+    uint64_t occurrence = 0;
+    CHECK(should_log_recompile_reject(0xfeed0001, 0xfeed0002, 0, 0, 0, &occurrence) &&
+          occurrence == 1,
+          "recompile rejection limiter logs a shader pair's first occurrence");
+    CHECK(should_log_recompile_reject(0xfeed0001, 0xfeed0002, 0, 0, 0, &occurrence) &&
+          occurrence == 2,
+          "recompile rejection limiter logs the second power-of-two occurrence");
+    CHECK(!should_log_recompile_reject(0xfeed0001, 0xfeed0002, 0, 0, 0, &occurrence) &&
+          occurrence == 3,
+          "recompile rejection limiter suppresses a non-power-of-two repeat");
+    CHECK(should_log_recompile_reject(0xfeed0001, 0xfeed0002, 0, 0, 0, &occurrence) &&
+          occurrence == 4 &&
+          !should_log_recompile_reject(0xfeed0001, 0xfeed0002, 0, 0, 0, &occurrence) &&
+          occurrence == 5,
+          "recompile rejection limiter reports exponential recurrence counts");
+    CHECK(should_log_recompile_reject(0xfeed0001, 0xfeed0003, 0, 0, 0, &occurrence) &&
+          occurrence == 1,
+          "recompile rejection limiter tracks distinct shader pairs independently");
+
     // Build the GpuState the CommandProcessor produces for one green fullscreen-triangle draw.
     GpuState st;
     set_pgm(st, P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES, kVs);
