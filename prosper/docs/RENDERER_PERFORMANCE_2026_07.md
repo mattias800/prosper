@@ -850,16 +850,33 @@ The borrowed image gets its own view (preserving T# `DST_SEL` swizzle routing), 
 renderer's own tracking stays true. The cache entry is pinned per successful import and released per
 import, including on every failure path. `PROSPER_NO_DIRECT_RTT_BIND=1` forces the host path for A/B.
 
-Blasphemous 2 title route, 3 alternating reps: 731 direct binds, zero fallbacks to the host path, zero
-validation errors. Compute call **7.63 -> 6.62 ms** mean (about 13%), with every enabled run faster than
-every disabled run, and the compute memory pool dropping **80.1 -> 63.7 MiB** (9 -> 7 cached
-allocations) as the per-dispatch staging buffer and duplicate image disappear.
+Functional result, Blasphemous 2 title route: **731 direct binds, zero fallbacks to the host path,
+zero validation errors** -- every renderer-owned sampled binding in that route took the fast path.
 
-**Route caveat.** These numbers come from a title-screen/menu route. That scene's draw and dispatch mix
-is not representative of gameplay, and optimizations must be validated on both -- a change that helps a
-UI-heavy scene can be neutral once real geometry and lighting dominate. Use the tail of the rolling
-`[render-window] compute ... avg_ms` line (reset every 25 calls) to measure a gameplay section without
-diluting it with loading and menus. Tracked on [#1082](https://github.com/mattias800/ps5ys/issues/1082).
+Throughput, measured on an **idle** machine through `tools/perf/ab_compute.sh`, 3 alternating reps of
+150 s on `load-save-first-station.pad` (a real gameplay scene, not a menu):
+
+| | run-wide mean | gameplay-tail mean |
+|---|---|---|
+| host path (`PROSPER_NO_DIRECT_RTT_BIND=1`) | 7.60 ms | 7.84 ms |
+| direct bind | 5.94 ms | 5.88 ms |
+| | **-21.8%** | **-25.0%** |
+
+Every enabled run beat every disabled run on both metrics, and the compute memory pool drops
+**80.1 -> 63.7 MiB** (9 -> 7 cached allocations) as the per-dispatch staging buffer and the duplicate
+image disappear.
+
+**Measure gameplay, not only menus.** An earlier pass measured the title-screen route and reported
+about 13%. Gameplay is a different draw and dispatch mix and showed a *larger* win, but the direction
+could equally have gone the other way -- a change that helps a UI-heavy scene can be neutral once real
+geometry and lighting dominate. Report the gameplay portion separately rather than averaging it with
+loading and menus: `ab_compute.sh` prints both the run-wide mean and the mean of the trailing
+`[render-window]` rolling averages for exactly this reason (#1082).
+
+**Record the conditions, not just the number.** The first title-route measurement was taken while an
+interactive session was using the same GPU, which makes it unattributable -- performance has no
+equivalent of ctest's exit code. `ab_compute.sh` therefore refuses to run when another `prosper-app`
+is alive and stamps the commit, route, reps and duration onto its output.
 
 ## Next renderer step
 
