@@ -853,30 +853,32 @@ import, including on every failure path. `PROSPER_NO_DIRECT_RTT_BIND=1` forces t
 Functional result, Blasphemous 2 title route: **731 direct binds, zero fallbacks to the host path,
 zero validation errors** -- every renderer-owned sampled binding in that route took the fast path.
 
-Throughput, measured on an **idle** machine through `tools/perf/ab_compute.sh`, 3 alternating reps of
-150 s on `load-save-first-station.pad` (a real gameplay scene, not a menu):
+Throughput, measured on an **idle** machine through `tools/perf/ab_compute.sh`, **4 reps with the arm
+order alternating by rep parity**, 150 s each on `load-save-first-station.pad` (a real gameplay scene,
+not a menu):
 
-| | compute, run-wide | compute, gameplay tail | gameplay frame rate |
-|---|---|---|---|
-| host path (`PROSPER_NO_DIRECT_RTT_BIND=1`) | 7.60 ms | 7.84 ms | 13.0 fps |
-| direct bind | 5.94 ms | 5.88 ms | 14.0 fps |
-| | **-21.8%** | **-25.0%** | **+7.7%** |
+| | compute, gameplay tail | gameplay frame rate |
+|---|---|---|
+| host path (`PROSPER_NO_DIRECT_RTT_BIND=1`) | 7.75 ms | 13.3 fps |
+| direct bind | 5.97 ms | 16.6 fps |
+| | **-23.0%** | **+24.3%** |
 
-Every enabled run beat every disabled run on all three metrics, and the compute memory pool drops
-**80.1 -> 63.7 MiB** (9 -> 7 cached allocations) as the per-dispatch staging buffer and the duplicate
-image disappear.
+Split by order, to show the warm-up confound is not producing the result: OFF-first gives -23.7% /
++22.3%, ON-first gives -22.3% / +26.6%. The compute memory pool drops **80.1 -> 63.7 MiB** (9 -> 7
+cached allocations) as the per-dispatch staging buffer and the duplicate image disappear.
 
-**A 25% stage win is a 7.7% frame win, and the two must never be reported interchangeably.** Frame
-time goes 76.7 -> 71.2 ms, about 5.4 ms saved per frame.
+**Always alternate the arm order.** An earlier 3-rep sweep ran OFF before ON every time, handing the
+second arm every warm-up benefit there is -- on-disk pipeline caches, GPU clock ramp, page cache -- and
+that arm was the one being advocated. Repetition does not detect a systematic bias; only alternating or
+randomising the order does. Here the bias turned out to be small, but it was not knowable in advance.
 
-**The accounting does NOT fully close, and an earlier revision of this section wrongly claimed it did.**
-The route runs 5.28 compute calls per frame, so removing 1.66 ms from each predicts an **8.5 ms** frame
-saving; only **5.4 ms** (64%) materialised. Measured non-compute time per frame *rose* 36.7 -> 39.8 ms
-across the arms. The most likely confound is the fixed wall clock: both arms run 150 s, so the faster
-arm renders more frames (2450 vs 2298) and therefore progresses FURTHER along the route, rendering
-different -- and here evidently heavier -- content. A fixed-wall-clock A/B does not compare identical
-scenes. Treat the 5.4 ms as the honest observed figure and the 8.5 ms as an upper bound; closing this
-gap needs a fixed-WORK route (equal frame counts or a fixed scene) rather than a fixed-duration one.
+**The compute delta reproduces; its frame-rate translation does not.** Across two independent sessions
+the compute saving was stable (-25.0% then -23.0%), while the measured frame-rate benefit ranged from
+**+7.7% to +24.3%**, with the host-path arm steady near 13 fps and the direct-bind arm varying between
+14.0 and 17.5 fps. The fast path is conditional by design -- it is taken only while the persistent
+image is the authoritative copy -- so how often it applies can legitimately vary between runs, and
+absolute frame rates from different sessions are not comparable. Quote within-session deltas, and
+treat any single frame-rate figure here as indicative rather than exact.
 
 ### Distance to a playable frame rate
 
@@ -885,8 +887,10 @@ gap needs a fixed-WORK route (equal frame counts or a fixed scene) rather than a
 | frame time | **71.2 ms (14.0 fps)** | 33.3 ms | 16.7 ms |
 | required | -- | **2.14x faster** (remove 37.9 ms) | **4.27x faster** (remove 54.5 ms) |
 
-Composition of the current 71.2 ms frame: **compute 31.4 ms (44%)** (5.28 calls x 5.94 ms) and
-**everything else 39.8 ms (56%)**.
+Composition of the current frame, from the earlier session's 71.2 ms measurement: **compute 31.4 ms
+(44%)** (5.28 calls x 5.94 ms) and **everything else 39.8 ms (56%)**. A later session measured the same
+build at 60 ms (16.6 fps); see the variance note above, and re-derive the split rather than reusing
+these absolutes.
 
 **Compute alone is 94% of a 30 fps budget and 188% of a 60 fps budget.** Even if every non-compute cost
 went to zero, compute as it stands would still miss 60 fps by roughly 2x. So 60 fps is not reachable by
