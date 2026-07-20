@@ -176,6 +176,39 @@ int main() {
               stats.misses == pcrel_stats.misses + 1,
           "embedded table contents participate in the shader cache key");
 
+    // Astro Bot's title PS uses SMEM rather than MUBUF to consume its getpc-built scalar table.
+    // The post-ENDPGM payload must be owned and hashed by the graphics cache in this form as well.
+    std::vector<uint32_t> pcrel_smem_ps = {
+        0xbe801f00u,               // s_getpc_b64 s[0:1]
+        0x800000ffu, 52u,          // table = next-PC byte 4 + 52 = byte 56
+        0x82010180u,               // s_addc_u32 s1, 0, s1
+        0xbe820394u,               // s_mov_b32 s2, 20 bytes
+        0xbe8303ffu, 0x10005004u,  // s_mov_b32 s3, V# config
+        0xbeea0384u,               // s_mov_b32 vcc_lo, 4
+        0xf4280100u, 0xd4000000u,  // s_buffer_load_dwordx4 s[4:7], s[0:3], vcc_lo
+        0x7e000204u,               // v_mov_b32 v0, s4
+        0xf800180fu, 0x00000000u,  // exp mrt0 v0,v0,v0,v0
+        0xbf810000u,               // s_endpgm
+        7u, 11u, 13u, 17u, 19u,
+    };
+    CHECK(rdna2_recompile_code_span(pcrel_smem_ps.data(), pcrel_smem_ps.size()) ==
+              pcrel_smem_ps.size(),
+          "PC-relative SMEM cache span includes the embedded scalar table tail");
+    const auto direct_pcrel_smem_ps = recompile_fragment(
+        pcrel_smem_ps.data(), pcrel_smem_ps.size(), nullptr);
+    const auto cached_pcrel_smem_ps = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, pcrel_smem_ps.data(), pcrel_smem_ps.size(), nullptr);
+    CHECK(!direct_pcrel_smem_ps.empty() && cached_pcrel_smem_ps == direct_pcrel_smem_ps,
+          "fragment cache retains a proven post-ENDPGM PC-relative SMEM table");
+    const auto pcrel_smem_stats = shader_recompile_cache_stats();
+    pcrel_smem_ps[pcrel_smem_ps.size() - 4] = 23u; // selected table[1]
+    const auto changed_pcrel_smem_ps = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, pcrel_smem_ps.data(), pcrel_smem_ps.size(), nullptr);
+    stats = shader_recompile_cache_stats();
+    CHECK(!changed_pcrel_smem_ps.empty() && changed_pcrel_smem_ps != cached_pcrel_smem_ps &&
+              stats.misses == pcrel_smem_stats.misses + 1,
+          "PC-relative SMEM table contents participate in the shader cache key");
+
     // A terminal if/else may build a PC-relative V# only in the second arm, after the first
     // s_endpgm. Span analysis must use the same extended instruction stream as emission. Stopping at
     // span pc20 immediately after the second end would omit four table dwords that can change SPIR-V.

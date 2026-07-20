@@ -13,6 +13,7 @@
 #include "../src/gpu/agc_shader_layout.hpp"
 #include "../src/gpu/shader_resources.hpp"
 #include "compute_runner.h"
+#include <algorithm>
 #include <bit>
 #include <cstdio>
 #include <cmath>
@@ -3026,6 +3027,46 @@ int main() {
         codeT12vertex, sizeof(codeT12vertex)/4, nullptr);
     CHECK(!spvT12vertex.empty(),
           "T12 vertex: resource-free stage accepts a proven embedded-table MUBUF");
+
+    // Astro Bot's title pixel shader builds the same bounded descriptor but consumes it with SMEM.
+    // The scalar byte offset selects table[1], and x4 returns table[1..4]; summing the first two
+    // loaded SGPRs proves that the fold honors both the dynamic offset and consecutive destinations.
+    const uint32_t codeT12smem[] = {
+        0xbe801f00u,               // s_getpc_b64 s[0:1] (next-PC byte = 4)
+        0x800000ffu, 48u,          // s_add_u32 s0, 48, s0 (table byte = 52)
+        0x82010180u,               // s_addc_u32 s1, 0, s1
+        0xbe820394u,               // s_mov_b32 s2, 20 bytes
+        0xbe8303ffu, 0x10005004u,  // s_mov_b32 s3, V# config
+        0xbeea0384u,               // s_mov_b32 vcc_lo, 4 (select table[1])
+        0xf4280100u, 0xd4000000u,  // s_buffer_load_dwordx4 s[4:7], s[0:3], vcc_lo
+        0x80040504u,               // s_add_u32 s4, s4, s5 => 11 + 13
+        0x7e000c04u,               // v_cvt_f32_u32 v0, s4
+        0xbf810000u,               // s_endpgm
+        7u, 11u, 13u, 17u, 19u,
+    };
+    std::vector<uint32_t> spvT12smem = recompile_valu(
+        codeT12smem, std::size(codeT12smem), 1, 0);
+    CHECK(!spvT12smem.empty(), "T12 SMEM: PC-relative scalar table recompiles without a resource");
+    std::vector<float> gotT12smem = spvT12smem.empty() ? std::vector<float>{} :
+        prosper::test::run_compute(spvT12smem, inT12, N, N);
+    CHECK(gotT12smem.size() == N &&
+              std::all_of(gotT12smem.begin(), gotT12smem.end(), [](float value) { return value == 24.0f; }),
+          "T12 SMEM: dynamic byte offset and consecutive scalar table results are preserved");
+    CHECK(rdna2_recompile_code_span(codeT12smem, std::size(codeT12smem)) ==
+              std::size(codeT12smem),
+          "T12 SMEM: the full embedded scalar table participates in the owning code span");
+    std::vector<uint32_t> truncatedT12smem(
+        std::begin(codeT12smem), std::end(codeT12smem) - 1);
+    CHECK(recompile_valu(truncatedT12smem.data(), truncatedT12smem.size(), 1, 0).empty(),
+          "T12 SMEM: a truncated embedded table remains rejected");
+    std::vector<uint32_t> brokenHighT12smem(std::begin(codeT12smem), std::end(codeT12smem));
+    brokenHighT12smem[3] = 0x82010181u; // s_addc_u32 s1, 1, s1: not the proven high-half chain
+    CHECK(recompile_valu(brokenHighT12smem.data(), brokenHighT12smem.size(), 1, 0).empty(),
+          "T12 SMEM: a broken PC-relative high-half chain remains rejected");
+    std::vector<uint32_t> untrackedOffsetT12smem(std::begin(codeT12smem), std::end(codeT12smem));
+    untrackedOffsetT12smem[8] = 0x10000000u; // SOFFSET=s8, which has no tracked scalar value
+    CHECK(recompile_valu(untrackedOffsetT12smem.data(), untrackedOffsetT12smem.size(), 1, 0).empty(),
+          "T12 SMEM: an untracked scalar table offset remains rejected");
 
     // Kernel T13: UINT8x1 vertex fetch (#273 — DOLL's skinned scene VS bone-index attribute class).
     // buffer_load_format_x of a Uint8 element delivers the RAW integer (no normalization) in the VGPR.
