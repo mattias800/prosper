@@ -284,6 +284,71 @@ int main() {
         }
     }
 
+    // NESTED DIVERGENT EXECZ-EXIT LOOPS (#590 — DOLL's last post-process kernel shape, fragment
+    // shell): an inner table loop entirely inside an outer row loop, both v_cmpx/execz-exit with
+    // backward s_branch back-edges, with an exec save around the inner loop and a restore at its
+    // exit. outer 3 x inner 4: v3 += 0.0625 twelve times = 0.75 (green), v2 += 0.25 three times in
+    // the outer body tail = 0.75 (red/blue) -> gray (0.75, 0.75, 0.75, 1.0).
+    {
+        const uint32_t ps[] = {
+            0x7E020283u,               //  0: v_mov_b32 v1, 3        (outer bound)
+            0x7E080284u,               //  1: v_mov_b32 v4, 4        (inner bound)
+            0xBE800380u,               //  2: s_mov_b32 s0, 0
+            0x7E040280u,               //  3: v_mov_b32 v2, 0
+            0x7E060280u,               //  4: v_mov_b32 v3, 0
+            0x7E0A02F2u,               //  5: v_mov_b32 v5, 1.0
+            0xBE82047Eu,               //  6: s_mov_b64 s[2:3], exec
+            0x7DA20200u,               //  7: OUTER_HDR: v_cmpx_lt_u32 s0, v1
+            0xBF88000Du,               //  8: s_cbranch_execz +13 -> 22 (OUTER_EXIT)
+            0xBE810380u,               //  9: s_mov_b32 s1, 0
+            0xBE84047Eu,               // 10: s_mov_b64 s[4:5], exec
+            0x7DA20801u,               // 11: INNER_HDR: v_cmpx_lt_u32 s1, v4
+            0xBF880004u,               // 12: s_cbranch_execz +4 -> 17 (INNER_EXIT)
+            0x060606FFu, 0x3D800000u,  // 13: v_add_f32 v3, 0.0625, v3
+            0x81018101u,               // 15: s_add_i32 s1, s1, 1
+            0xBF82FFFAu,               // 16: s_branch -6 -> 11 (INNER back-edge)
+            0xBEFE0404u,               // 17: INNER_EXIT: s_mov_b64 exec, s[4:5]
+            0x060404FFu, 0x3E800000u,  // 18: v_add_f32 v2, 0.25, v2
+            0x81008100u,               // 20: s_add_i32 s0, s0, 1
+            0xBF82FFF1u,               // 21: s_branch -15 -> 7 (OUTER back-edge)
+            0xBEFE0402u,               // 22: OUTER_EXIT: s_mov_b64 exec, s[2:3]
+            0xF800180Fu, 0x05020302u,  // 23: exp mrt0 v2, v3, v2, v5 done vm
+            0xBF810000u,               // 25: s_endpgm
+        };
+        std::vector<uint32_t> frg = recompile_fragment(ps, sizeof(ps)/sizeof(ps[0]));
+        CHECK(!frg.empty(), "#590: recompiled NESTED execz-exit loops PS -> SPIR-V");
+        if (!frg.empty()) {
+            std::vector<uint8_t> px2 = prosper::test::render_triangle_rgba(vert, frg, W, H);
+            CHECK(px2.size() == (size_t)W*H*4, "rendered the nested-loop PS");
+            if (px2.size() == (size_t)W*H*4) {
+                const uint8_t* cc = &px2[((size_t)(H/2) * W + W/2) * 4];
+                printf("  nested loops center=(%u,%u,%u,%u) expect ~(191,191,191,255)\n",
+                       cc[0],cc[1],cc[2],cc[3]);
+                CHECK(cc[0] > 0xA8 && cc[0] < 0xD8 && cc[1] > 0xA8 && cc[1] < 0xD8 &&
+                      cc[2] > 0xA8 && cc[2] < 0xD8,
+                      "#590: nested loops 3x4: inner 12 x 0.0625 and outer 3 x 0.25 both = 0.75");
+            }
+        }
+
+        // Partially-overlapping loops (a back-edge into another loop's body without proper nesting)
+        // remain rejected in the fragment shell (no dispatcher fallback exists there).
+        const uint32_t overlap_ps[] = {
+            0xBE800380u, 0x7E020284u,
+            0x7DA20200u,               //  2: A_HDR: v_cmpx_lt_u32 s0, v1
+            0xBF880006u,               //  3: s_cbranch_execz +6 -> 10
+            0x7DA20200u,               //  4: B_HDR
+            0xBF880006u,               //  5: s_cbranch_execz +6 -> 12
+            0x81008100u,               //  6: s0++
+            0xBF82FFFAu,               //  7: s_branch -6 -> 2 (A back-edge; A=[2,7])
+            0x81008100u,               //  8: s0++
+            0xBF82FFFAu,               //  9: s_branch -6 -> 4 (B back-edge; B=[4,9] overlaps A)
+            0xF800180Fu, 0x05020302u,  // 10: export
+            0xBF810000u,               // 12: s_endpgm
+        };
+        CHECK(recompile_fragment(overlap_ps, sizeof(overlap_ps)/sizeof(overlap_ps[0])).empty(),
+              "#590: partially-overlapping loops remain REJECTED (fragment)");
+    }
+
     // SCALAR-SPILL lane slots (#273): v_writelane_b32 packs two scalars into v10's lanes 3/7 and
     // v_readlane_b32 restores them; export uses the round-tripped values -> (0.25, 1.0, 0.25, 1.0).
     {

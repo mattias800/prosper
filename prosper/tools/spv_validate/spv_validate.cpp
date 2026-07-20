@@ -223,6 +223,23 @@ int main(int argc, char** argv) {
                             0x00010E06u,0xD7600007u,0x0001070Au,0xD7600008u,0x00010F0Au,0x7E000207u,
                             0x7E020208u,0xF800180Fu,0x01000100u,0xBF810000u};
       dump(dir, "fragment_lane_slots", recompile_fragment(c, sizeof(c)/4, nullptr)); }
+    // NESTED divergent execz-exit loops (#590/#1067 — DOLL's last post-process kernel shape): an
+    // inner table loop entirely inside an outer row loop, execz exits + backward s_branch
+    // back-edges, an exec save around the inner loop, post-loop s_barrier (compute). Locks the
+    // nested OpLoopMerge emission under strict validation for BOTH shells; the execution twins
+    // live in test_rdna2_to_spirv / test_recompiled_fragment.
+    { const uint32_t c[] = {0x7E020283u,0x7E080284u,0xBE800380u,0x7E040280u,0x7E060280u,0x7E0A02F2u,
+                            0xBE82047Eu,0x7DA20200u,0xBF88000Du,0xBE810380u,0xBE84047Eu,0x7DA20801u,
+                            0xBF880004u,0x060606FFu,0x3D800000u,0x81018101u,0xBF82FFFAu,0xBEFE0404u,
+                            0x060404FFu,0x3E800000u,0x81008100u,0xBF82FFF1u,0xBEFE0402u,0xBF8A0000u,
+                            0xBF810000u};
+      dump(dir, "compute_nested_exec_loops", recompile_valu(c, sizeof(c)/4, 1, 3)); }
+    { const uint32_t c[] = {0x7E020283u,0x7E080284u,0xBE800380u,0x7E040280u,0x7E060280u,0x7E0A02F2u,
+                            0xBE82047Eu,0x7DA20200u,0xBF88000Du,0xBE810380u,0xBE84047Eu,0x7DA20801u,
+                            0xBF880004u,0x060606FFu,0x3D800000u,0x81018101u,0xBF82FFFAu,0xBEFE0404u,
+                            0x060404FFu,0x3E800000u,0x81008100u,0xBF82FFF1u,0xBEFE0402u,
+                            0xF800180Fu,0x05020302u,0xBF810000u};
+      dump(dir, "fragment_nested_exec_loops", recompile_fragment(c, sizeof(c)/4, nullptr)); }
 
     if (fails) { printf("== FAIL: %d shader(s) failed recompile/validation ==\n", fails); return 1; }
     printf("== PASS%s ==\n", have_val ? " (all modules pass spirv-val)" : " (recompiled; spirv-val not found)");

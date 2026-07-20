@@ -3692,6 +3692,82 @@ int main() {
     CHECK(gotA12.size() == 1 && gotA12[0] == -32767.0f,
           "A12: straddling signed private short reloads with correct sign extension");
 
+    // NESTED divergent EXEC-exit loops in COMPUTE (#590 — DOLL's last post-process kernel shape:
+    // an inner table loop entirely inside an outer row loop, both v_cmpx/execz-exit with backward
+    // s_branch back-edges, s_barrier AFTER the loops). Per-invocation lowering: this invocation
+    // iterates while its own EXEC bit holds. outer 3 iterations x inner 4 iterations accumulate
+    // v3 += 0.0625 twelve times = 0.75; the outer body adds v2 += 0.25 three times = 0.75.
+    {
+        const uint32_t nested_cs[] = {
+            0x7E020283u,               //  0: v_mov_b32 v1, 3        (outer bound)
+            0x7E080284u,               //  1: v_mov_b32 v4, 4        (inner bound)
+            0xBE800380u,               //  2: s_mov_b32 s0, 0        (outer counter)
+            0x7E040280u,               //  3: v_mov_b32 v2, 0
+            0x7E060280u,               //  4: v_mov_b32 v3, 0
+            0x7E0A02F2u,               //  5: v_mov_b32 v5, 1.0
+            0xBE82047Eu,               //  6: s_mov_b64 s[2:3], exec (outer save)
+            0x7DA20200u,               //  7: OUTER_HDR: v_cmpx_lt_u32 s0, v1
+            0xBF88000Du,               //  8: s_cbranch_execz +13 -> 22 (OUTER_EXIT)
+            0xBE810380u,               //  9: s_mov_b32 s1, 0        (inner counter reset)
+            0xBE84047Eu,               // 10: s_mov_b64 s[4:5], exec (inner save)
+            0x7DA20801u,               // 11: INNER_HDR: v_cmpx_lt_u32 s1, v4
+            0xBF880004u,               // 12: s_cbranch_execz +4 -> 17 (INNER_EXIT)
+            0x060606FFu, 0x3D800000u,  // 13: v_add_f32 v3, 0.0625, v3
+            0x81018101u,               // 15: s_add_i32 s1, s1, 1
+            0xBF82FFFAu,               // 16: s_branch -6 -> 11 (INNER back-edge)
+            0xBEFE0404u,               // 17: INNER_EXIT: s_mov_b64 exec, s[4:5]
+            0x060404FFu, 0x3E800000u,  // 18: v_add_f32 v2, 0.25, v2
+            0x81008100u,               // 20: s_add_i32 s0, s0, 1
+            0xBF82FFF1u,               // 21: s_branch -15 -> 7 (OUTER back-edge)
+            0xBEFE0402u,               // 22: OUTER_EXIT: s_mov_b64 exec, s[2:3]
+            0xBF8A0000u,               // 23: s_barrier (post-loop, uniform: reconverged merge)
+            0xBF810000u,               // 24: s_endpgm
+        };
+        std::vector<uint32_t> spvNL = recompile_valu(nested_cs, std::size(nested_cs), 1, 3);
+        CHECK(!spvNL.empty(), "#590: recompiled NESTED exec-exit loops (compute) -> SPIR-V");
+        std::vector<float> inNL(64, 0.0f);
+        std::vector<float> gotNL = prosper::test::run_compute(spvNL, inNL, 64, 64);
+        uint32_t badNL = 0;
+        for (uint32_t i = 0; i < 64 && gotNL.size() == 64; ++i)
+            if (std::fabs(gotNL[i] - 0.75f) > 1e-3f) ++badNL;
+        if (gotNL.size() == 64)
+            printf("  nested-loop out[0]=%g out[63]=%g expect 0.75\n", gotNL[0], gotNL[63]);
+        CHECK(gotNL.size() == 64 && badNL == 0,
+              "#590: nested loops run 3x4 iterations (inner accumulates 12 x 0.0625 = 0.75)");
+
+        // The outer accumulator proves the OUTER body's tail (after the inner loop's exit + exec
+        // restore) executes exactly once per outer iteration.
+        std::vector<uint32_t> spvNL2 = recompile_valu(nested_cs, std::size(nested_cs), 1, 2);
+        std::vector<float> gotNL2 = prosper::test::run_compute(spvNL2, inNL, 64, 64);
+        CHECK(gotNL2.size() == 64 && std::fabs(gotNL2[0] - 0.75f) < 1e-3f,
+              "#590: outer body tail runs 3 times (3 x 0.25 = 0.75) after each inner-loop exit");
+    }
+
+    // PARTIALLY OVERLAPPING loops (back-edge into another loop's body without proper nesting) must
+    // not be accepted by the STRUCTURIZER. In compute they may legitimately fall to the CFG
+    // state-machine dispatcher (faithful wave emulation) — so this stream carries a mid-region
+    // s_barrier, which disqualifies the dispatcher too: the only remaining outcome is a loud reject.
+    {
+        const uint32_t overlap_cs[] = {
+            0xBE800380u,               //  0: s_mov_b32 s0, 0
+            0x7E020284u,               //  1: v_mov_b32 v1, 4
+            0x7DA20200u,               //  2: A_HDR: v_cmpx_lt_u32 s0, v1
+            0xBF880007u,               //  3: s_cbranch_execz +7 -> 11
+            0x7DA20200u,               //  4: B_HDR: v_cmpx_lt_u32 s0, v1
+            0xBF880007u,               //  5: s_cbranch_execz +7 -> 13
+            0xBF8A0000u,               //  6: s_barrier (disqualifies the dispatcher fallback)
+            0x81008100u,               //  7: s0++
+            0xBF82FFF9u,               //  8: s_branch -7 -> 2 (A back-edge; A=[2,8], exit 9)
+            0x81008100u,               //  9: s0++
+            0xBF82FFF9u,               // 10: s_branch -7 -> 4 (B back-edge; B=[4,10] overlaps A, not nested)
+            0x7E040280u,               // 11: v_mov_b32 v2, 0
+            0x7E040280u,               // 12: v_mov_b32 v2, 0
+            0xBF810000u,               // 13: s_endpgm
+        };
+        CHECK(recompile_valu(overlap_cs, std::size(overlap_cs), 1, 2).empty(),
+              "#590: partially-overlapping loops remain REJECTED (unstructured region)");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
