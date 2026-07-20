@@ -9,6 +9,14 @@
 #include "../host/guest_memory_map.hpp"
 #include "../host/guest_write_watch.hpp"
 
+namespace prosper {
+// #312/#946 huge-reserve redirect threshold, shared by the Linux and Windows reserve paths (one
+// definition so the platforms cannot drift): a non-fixed hinted reservation of at least this size
+// (only UE's 512 GiB MallocBinned3 flex arena qualifies) is steered off its low hint into the
+// guest auto window. See k_reserve_vrange (POSIX) / win_reserve (Windows).
+inline constexpr uint64_t kHugeReserveLen = 0x2000000000ull;   // 128 GiB
+}
+
 #if defined(__linux__) || defined(__APPLE__)
 #include "../host/posix_shim.hpp"
 #include <sys/mman.h>
@@ -665,7 +673,12 @@ HLE(k_reserve_vrange) {
             bool ours = false;
             { std::lock_guard<std::mutex> lk(g_mx);
               for (auto& m : g_maps)
-                  if (!m.committed && hint >= m.base && hint < m.base + m.size) { ours = true; break; } }
+                  // Idempotent only when the WHOLE requested span is contained: matching on the
+                  // hint alone let a large re-reserve false-succeed backed by a smaller range at
+                  // the same base (e.g. the 64 MiB metadata pool at the arena's old 0x1000000000
+                  // hint after #312's huge-reserve redirect) — success with mostly-unreserved VA.
+                  if (!m.committed && hint >= m.base && hint < m.base + m.size &&
+                      a1 <= m.base + m.size - hint) { ours = true; break; } }
             if (ours) {
                 if (a0) *(uint64_t*)a0 = hint;
                 MLOG("reserve hint=0x%llx re-reserve-of-own-range -> OK\n", (unsigned long long)hint);
@@ -686,7 +699,6 @@ HLE(k_reserve_vrange) {
     // reservations into the guest auto-map region (map_guest_auto below, placement A/B-validated
     // in the #982 investigation), leaving the low hint free for the small metadata pool the
     // guest reserves next with the same hint. The auto window bounds are untouched.
-    constexpr uint64_t kHugeReserveLen = 0x2000000000ull;   // 128 GiB
     if (hint && a1 < kHugeReserveLen) {
         // Non-fixed hint: search for a free range starting at the hint. Probe candidates with
         // MAP_FIXED_NOREPLACE (also catches host mappings the tracker doesn't know); on a miss,
@@ -3006,20 +3018,29 @@ namespace {
         // stays contiguous for ordinary auto-maps; the shared window bounds themselves are
         // untouched (widening kGuestAutoVaMax into the PS5-libc-rejected 1-8 TiB gap sank #982).
         // On placeholder-less hosts this returns ENOMEM rather than a dangerous base.
-        constexpr uint64_t kHugeReserveLen = 0x2000000000ull;   // 128 GiB — only the flex arena
         if (!fixed && hint && len >= kHugeReserveLen) {
             std::lock_guard<std::mutex> lk(g_dview_mx);
             const uint64_t granule =
                 std::max<uint64_t>(align ? align : 0x4000, kWinAllocationGranularity);
             const uint64_t span = align_up(len, kWinAllocationGranularity);
+            // Recycle a freed placeholder first (window-bounded via the hint-less take path): an
+            // unmapped huge arena's VA stays OS-reserved as a free placeholder, so without this a
+            // reserve->unmap->re-reserve cycle exhausts the window and ENOMEMs (review finding on
+            // #1084; Linux reuses freed VA naturally via the cursor wrap).
             AcquiredPlaceholder acquired{};
-            if (span <= kGuestAutoVaMax + 1 - kGuestAutoVaMin) {
+            if (void* recycled = take_free_placeholder_locked(0, len, align))
+                acquired = {recycled, PlaceholderOwner::Free};
+            if (!acquired.address && span <= kGuestAutoVaMax + 1 - kGuestAutoVaMin) {
                 const uint64_t band_low = (kGuestAutoVaMax + 1 - span) & ~(granule - 1);
                 if (band_low >= kGuestAutoVaMin)
                     acquired = acquire_placeholder_window_locked(band_low, len, align);
             }
-            if (!acquired.address)   // band contended/undersized: anywhere in-window
+            if (!acquired.address) {  // band contended/undersized: anywhere in-window
                 acquired = acquire_placeholder_window_locked(kGuestAutoVaMin, len, align);
+                if (acquired.address)
+                    MLOG("reserve(huge) top band unavailable — whole-window fallback -> 0x%llx\n",
+                         (unsigned long long)(uintptr_t)acquired.address);
+            }
             if (!acquired.address) return nullptr;
             const uint64_t base =
                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(acquired.address));

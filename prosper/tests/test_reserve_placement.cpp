@@ -44,10 +44,20 @@ int main() {
     CHECK(reserve && unmap, "reserve + munmap HLEs registered");
     if (!reserve || !unmap) { printf("fails=%d\n", fails); return 1; }
 
+    // 0) Threshold boundary, just-below side FIRST, on pristine address space: later cases
+    //    reserve/unmap huge in-window spans, and on Windows an unmapped span's VA stays
+    //    OS-reserved as a free placeholder — probing a hint whose span crosses such VA would
+    //    test placeholder geometry, not the redirect contract (#1084 review finding).
+    uint64_t below = 0x1200000000ull;
+    uint64_t rc = reserve((uint64_t)&below, kHugeMin - 0x10000, 0, 0x10000, 0, 0);
+    CHECK(rc == 0 && below == 0x1200000000ull,
+          "just-below-threshold reserve still honors its free hint");
+    unmap(below, kHugeMin - 0x10000, 0, 0, 0, 0);
+
     // 1) The DQ7 arena reserve: huge + non-fixed must NOT land at its low hint, must land
     //    aligned inside the guest auto window.
     uint64_t base = kArenaHint;
-    uint64_t rc = reserve((uint64_t)&base, kArenaLen, 0, kArenaAlign, 0, 0);
+    rc = reserve((uint64_t)&base, kArenaLen, 0, kArenaAlign, 0, 0);
     CHECK(rc == 0, "huge non-fixed reserve succeeds");
     CHECK(base != kArenaHint, "huge reserve does not land at the low 0x1000000000 hint");
     CHECK(base >= kAutoMin, "huge reserve lands at or above the auto window base");
@@ -60,6 +70,16 @@ int main() {
     rc = reserve((uint64_t)&pool, 0x4000000, 0, 0x4000, 0, 0);
     CHECK(rc == 0, "small same-hint reserve succeeds");
     CHECK(pool == kArenaHint, "small reserve takes the vacated 0x1000000000 hint");
+
+    // 2b) A SECOND huge reserve with the same hint, while the small pool occupies it, must not
+    //     false-succeed via the idempotent re-reserve check (hint-containment alone matched the
+    //     64 MiB pool and returned the hint backed by mostly-unreserved VA) — it must be
+    //     redirected like any huge reserve.
+    uint64_t again = kArenaHint;
+    rc = reserve((uint64_t)&again, kArenaLen, 0, kArenaAlign, 0, 0);
+    CHECK(rc == 0 && again != kArenaHint && again >= kAutoMin,
+          "second same-hint huge reserve is redirected, not idempotent-matched to the pool");
+    unmap(again, kArenaLen, 0, 0, 0, 0);
     unmap(pool, 0x4000000, 0, 0, 0, 0);
     // Release the arena so the remaining cases probe hints on clean address space — their
     // assertions guard UNCHANGED semantics and must hold both before and after the fix.
@@ -75,19 +95,21 @@ int main() {
     uint64_t fixedBase = 0x1900000000ull;
     rc = reserve((uint64_t)&fixedBase, 0x10000, 0x10, 0x4000, 0, 0);
     CHECK(rc == 0 && fixedBase == 0x1900000000ull, "MAP_FIXED reserve keeps its exact hint");
+
+    // 4b) A FIXED reserve whose span EXCEEDS the existing same-base reservation must fail, not
+    //     false-succeed through the hint-only idempotency match (span containment required).
+    uint64_t oversize = 0x1900000000ull;
+    rc = reserve((uint64_t)&oversize, 0x20000, 0x10, 0x4000, 0, 0);
+    CHECK(rc != 0, "FIXED re-reserve larger than the owning range fails instead of false-succeeding");
     unmap(fixedBase, 0x10000, 0, 0, 0, 0);
 
-    // 5) Threshold boundary: exactly 128 GiB redirects; just below does not.
+    // 5) Threshold boundary, at-threshold side: exactly 128 GiB redirects. (On Windows this also
+    //    exercises free-placeholder recycling of the released arena span.)
     uint64_t atThr = 0x1200000000ull;
     rc = reserve((uint64_t)&atThr, kHugeMin, 0, 0x10000, 0, 0);
     CHECK(rc == 0 && atThr != 0x1200000000ull && atThr >= kAutoMin,
           "exactly-128GiB non-fixed reserve is redirected into the window");
     unmap(atThr, kHugeMin, 0, 0, 0, 0);
-    uint64_t below = 0x1200000000ull;
-    rc = reserve((uint64_t)&below, kHugeMin - 0x10000, 0, 0x10000, 0, 0);
-    CHECK(rc == 0 && below == 0x1200000000ull,
-          "just-below-threshold reserve still honors its free hint");
-    unmap(below, kHugeMin - 0x10000, 0, 0, 0, 0);
 
     printf("fails=%d\n", fails);
     return fails ? 1 : 0;
