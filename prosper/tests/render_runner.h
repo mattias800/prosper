@@ -419,6 +419,12 @@ inline BackendRenderTimingStats backend_render_timing_stats() {
 // instance/physical-device/device/queue ONCE (lazy, thread-safe static init) and reuse it across every
 // call. Per-call Vulkan resources are created independently and are retained until their direct call
 // or explicit ordered submission batch completes. The context intentionally leaks at process exit.
+// LIFETIME INVARIANT: this context is intentionally never destroyed (no destructor; the device and
+// instance leak at process exit). The compute backend BORROWS this device (#1091) and its static
+// destructor calls vkDestroyPipeline/vkFreeMemory on it at exit, with unspecified cross-TU
+// destruction order. Adding a destructor here that destroys the device would therefore create an
+// immediate use-after-free in ~VulkanComputeContext. Do not add one without first giving compute an
+// explicit release-before-teardown handshake.
 struct RenderVkCtx {
     VkInstance inst = VK_NULL_HANDLE; VkPhysicalDevice phys = VK_NULL_HANDLE;
     VkDevice dev = VK_NULL_HANDLE; VkQueue queue = VK_NULL_HANDLE; uint32_t qfi = UINT32_MAX;
@@ -536,6 +542,26 @@ inline const RenderVkCtx& render_vk_ctx() {
         if (vkCreateDevice(r.phys, &dci, nullptr, &r.dev) != VK_SUCCESS || !r.dev) return r;
         vkGetDeviceQueue(r.dev, r.qfi, 0, &r.queue);
         r.ok = true;
+        // Publish this device so the compute backend can adopt it instead of creating a second one
+        // (#1091). Only the features compute needs are advertised; it declines the shared context if
+        // they are missing and creates its own device exactly as before. Graphics and compute run
+        // strictly sequentially on one thread, so sharing the queue needs no extra synchronization.
+        if (!std::getenv("PROSPER_NO_SHARED_VULKAN_DEVICE")) {
+            prosper::gpu::SharedVulkanContext shared;
+            shared.instance = r.inst;
+            shared.physical = r.phys;
+            shared.device = r.dev;
+            shared.queue = r.queue;
+            shared.queue_family = r.qfi;
+            // Publish what the device was actually CREATED with (feats), not what the physical
+            // device merely supports. They are equal today because feats.x = supported.x
+            // unconditionally, but the consumer's contract is "enabled here" -- if these ever became
+            // gated like aniso/logicOp are, publishing `supported` would let compute emit shaders
+            // declaring a capability the device never enabled.
+            shared.storage_image_read_without_format = feats.shaderStorageImageReadWithoutFormat;
+            shared.storage_image_write_without_format = feats.shaderStorageImageWriteWithoutFormat;
+            prosper::gpu::set_shared_vulkan_context(shared);
+        }
         return r;
     }();
     return c;

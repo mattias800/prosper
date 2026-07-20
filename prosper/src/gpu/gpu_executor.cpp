@@ -4057,6 +4057,9 @@ bool is_live_render_target(uint64_t gpu_addr) {
 }
 static LiveTargetReaderFn g_live_target_reader;
 void set_live_target_reader(LiveTargetReaderFn fn) { g_live_target_reader = std::move(fn); }
+static SharedVulkanContext g_shared_vulkan;
+void set_shared_vulkan_context(const SharedVulkanContext& context) { g_shared_vulkan = context; }
+SharedVulkanContext shared_vulkan_context() { return g_shared_vulkan; }
 bool read_live_render_target(uint64_t gpu_addr, LiveTargetSnapshot& snapshot) {
     snapshot = {};
     return g_live_target_reader && g_live_target_reader(gpu_addr, snapshot);
