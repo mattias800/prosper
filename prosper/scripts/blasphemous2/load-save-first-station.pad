@@ -1,8 +1,15 @@
 # Blasphemous 2 - LOAD the first-save-station save and land in gameplay.
 #
-# Requires an existing save (a Prie Dieu save at the first station). A reference copy lives in
-# saves/savedata0-backup-2026-07-20/ (slot1/segmentSlot); restore it into the PROSPER_SAVE0 root
-# before running if the live save data has been cleared.
+# Requires an existing save: a Prie Dieu save at the first station, in the PROSPER_SAVE0 root
+# (default /tmp/prosper-savedata0, which is SHARED across titles rather than per-game). The save is
+# NOT committed -- it is a local artifact, since a game save is title data rather than source. To
+# regenerate it: run the title normally, play to the first Prie Dieu and save there; the game writes
+# slot1/segmentSlot plus slot0/segmentGlobal. Keep a copy outside /tmp, which does not survive a
+# reboot.
+#
+# This route is deliberately NOT wired into tools/snapshot/snapshots.json: guards declaring
+# savedata_policy "fresh" get isolated, empty save roots (#1102), so a save-dependent route cannot be
+# a guard without a committed fixture and a "preserve" policy.
 #
 # This replaces the long exploratory reach-first-gameplay route for gameplay measurement. That route
 # sits through the studio logos, EULA, opening cinematic and the bile-flask/movement tutorials, so it

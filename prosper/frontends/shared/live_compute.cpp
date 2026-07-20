@@ -373,10 +373,10 @@ struct BoundImage {
     uint32_t imported_saved_layout = 0;      // VkImageLayout the renderer left the image in
     // Several bindings can borrow the SAME renderer image without being folded together, because
     // the import contract is looser than the alias contract (it ignores sampler state, T# size and
-    // img_dim 1-vs-5). Exactly one of them owns the layout transitions: a second barrier pair would
-    // declare oldLayout=saved on an image already in GENERAL, which is an invalid transition a
-    // driver may treat as a discard.
-    bool imported_barrier_owner = false;
+    // img_dim 1-vs-5). Exactly one of them must emit the layout transitions: a second barrier pair
+    // would declare oldLayout=saved on an image already in GENERAL, which is an invalid transition a
+    // driver may treat as a discard. Ownership is derived at the barrier loops rather than stored
+    // here -- see imported_barrier_owner().
     uint64_t before_hash = 0, after_hash = 0; // trace-only storage-image writeback evidence
     uint64_t nonzero_channels = 0;
 };
@@ -886,14 +886,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         bi.imported_addr = r->gpu_addr;
                         bi.imported_saved_layout = import.layout;
                         bi.image = static_cast<VkImage>(import.image);
-                        bi.imported_barrier_owner = true;
-                        for (size_t prior = 0; prior < i; prior++) {
-                            if (images[prior].imported &&
-                                images[prior].imported_addr == r->gpu_addr) {
-                                bi.imported_barrier_owner = false;   // an earlier binding transitions it
-                                break;
-                            }
-                        }
                         live_target.width = import.width;
                         live_target.height = import.height;
                         live_target.format = import.format;
@@ -1648,13 +1640,26 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         if (!vk_ok(vkBeginCommandBuffer(command, &begin), "command-begin")) break;
+        // Exactly one binding emits the layout transitions for each borrowed renderer image. The
+        // hazard is per-VkImage, so ownership is keyed on the handle, and it is derived over the
+        // bindings that actually REACH these loops (non-aliased ones) rather than decided at import
+        // time -- an owner chosen earlier could later be folded into an alias, leaving the image
+        // transitioned zero times while descriptors still declare GENERAL.
+        auto imported_barrier_owner = [&](size_t index) {
+            const BoundImage& self = images[index];
+            for (size_t prior = 0; prior < index; prior++)
+                if (images[prior].imported && images[prior].alias_of == SIZE_MAX &&
+                    images[prior].image == self.image)
+                    return false;
+            return true;
+        };
         // Upload every image: UNDEFINED -> TRANSFER_DST, copy the staged texels in, -> GENERAL.
         for (size_t i = 0; i < images.size(); i++) {
             const BoundImage& bi = images[i];
             if (bi.alias_of != SIZE_MAX) continue;
             const ShaderResource* r = bi.resource;
             if (bi.imported) {
-                if (!bi.imported_barrier_owner) continue;   // another binding transitions this image
+                if (!imported_barrier_owner(i)) continue;   // another binding transitions this image
                 // Borrowed renderer image (#1095): nothing to upload. Make the renderer's writes
                 // visible to this dispatch and move it into the GENERAL layout the descriptors
                 // declare. The matching barrier after the dispatch puts it back.
@@ -1711,8 +1716,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         vkCmdDispatch(command, item.launch.groups_x, item.launch.groups_y, item.launch.groups_z);
         // Hand every borrowed renderer image back in the layout its owner left it in (#1095), so the
         // renderer's own layout tracking stays true whether or not a dispatch consumed the target.
-        for (const BoundImage& bi : images) {
-            if (!bi.imported || !bi.imported_barrier_owner || bi.alias_of != SIZE_MAX) continue;
+        for (size_t i = 0; i < images.size(); i++) {
+            const BoundImage& bi = images[i];
+            if (!bi.imported || bi.alias_of != SIZE_MAX || !imported_barrier_owner(i)) continue;
             VkImageMemoryBarrier restore{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             restore.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
             // The renderer's next use of a persistent target is frequently vkCmdCopyImageToBuffer
@@ -1763,8 +1769,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                    30ull * 1000 * 1000 * 1000), "queue-wait")) {
             // cleanup() destroys the command buffer and releases the borrowed image's pin. With a
             // renderer-owned image bound, in-flight work still references it and its layout
-            // transitions, so drain the queue first rather than freeing it underneath the GPU --
-            // the same fallback readback_persistent_color_target uses on a failed wait.
+            // transitions, so drain the queue first rather than freeing it underneath the GPU.
+            // readback_persistent_color_target uses the same drain but PROMOTES a successful drain
+            // to success; this item stays failed either way, which is the conservative choice for a
+            // dispatch whose results we can no longer trust.
             if (vkQueueWaitIdle(ctx.queue) != VK_SUCCESS && trace)
                 std::fprintf(stderr, "[compute]   queue drain after fence timeout failed\n");
             break;

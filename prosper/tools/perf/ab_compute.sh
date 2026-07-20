@@ -17,9 +17,10 @@ ROUTE="${2:?route .pad file}"
 DUMP="${3:?game dump dir}"
 REPS="${4:-3}"
 SECS="${5:-60}"
+cd "$(dirname "$0")/../.."
+# Resolve AFTER the cd so a relative AB_OUT_DIR is created where it is later written.
 OUT="${AB_OUT_DIR:-$(mktemp -d)}"
 mkdir -p "$OUT" || { echo "cannot create output dir: $OUT" >&2; exit 2; }
-cd "$(dirname "$0")/../.."
 
 # --- refuse to measure against a contended GPU -------------------------------------------------
 # Match the EXECUTABLE, not any command line containing the string -- a -f match also catches the
@@ -61,10 +62,25 @@ tail_fps() {
 
 bad=0
 for rep in $(seq 1 "$REPS"); do
-  off=$(run "off_$rep" "$SWITCH");  offt=$(tail_window "off_$rep");  offf=$(tail_fps "off_$rep")
-  on=$(run  "on_$rep"  "");         ont=$(tail_window "on_$rep");   onf=$(tail_fps "on_$rep")
-  echo "rep$rep  compute ms/call  OFF run=${off:-n/a} tail=${offt:-n/a}   ON run=${on:-n/a} tail=${ont:-n/a}"
-  echo "rep$rep  frame rate       OFF tail=${offf:-n/a} fps            ON tail=${onf:-n/a} fps"
+  # Re-check contention every rep: a competing process can start mid-sweep, and a startup-only
+  # check would let it silently skew the remaining reps.
+  if [ "$(pgrep -x prosper-app | wc -l)" -gt 0 ]; then
+    echo "ABORTING at rep$rep: another prosper-app started mid-sweep" >&2; exit 2
+  fi
+  # ALTERNATE the arm order by rep parity. Running one arm consistently first hands the second arm
+  # every warm-up benefit there is -- on-disk pipeline caches, GPU clock ramp, page cache -- which
+  # systematically favours it. With a fixed order that bias is indistinguishable from the effect
+  # being measured, and it flatters whichever arm is scheduled second.
+  if [ $((rep % 2)) -eq 1 ]; then
+    off=$(run "off_$rep" "$SWITCH"); on=$(run "on_$rep" "")
+  else
+    on=$(run "on_$rep" ""); off=$(run "off_$rep" "$SWITCH")
+  fi
+  offt=$(tail_window "off_$rep");  offf=$(tail_fps "off_$rep")
+  ont=$(tail_window "on_$rep");    onf=$(tail_fps "on_$rep")
+  order=$([ $((rep % 2)) -eq 1 ] && echo "OFF-first" || echo "ON-first")
+  echo "rep$rep ($order)  compute ms/call  OFF run=${off:-n/a} tail=${offt:-n/a}   ON run=${on:-n/a} tail=${ont:-n/a}"
+  echo "rep$rep ($order)  frame rate       OFF tail=${offf:-n/a} fps            ON tail=${onf:-n/a} fps"
   # A run that produced no timing is a FAILED measurement, not a zero result. Reporting n/a and
   # exiting 0 would let a harness that never launched anything read as a clean benchmark.
   for v in "$off" "$on"; do [ -n "$v" ] || bad=1; done

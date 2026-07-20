@@ -333,6 +333,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
     // compute backend releases once per successful import and the entry drops at zero.
     struct PinnedImport { uint32_t width, height; VkFormat format; uint32_t count; };
     static std::unordered_map<uint64_t, PinnedImport> pinned_imports;
+    // gpu_replay registers a renderer from more than one entry point, so this can run twice in a
+    // process. Pins are taken and released within a single dispatch, so the map is empty between
+    // them; clear it anyway so a second registration cannot inherit counts for a cache that no
+    // longer holds those entries.
+    pinned_imports.clear();
     const bool direct_bind = !getenv("PROSPER_NO_DIRECT_RTT_BIND");
     prosper::gpu::set_live_target_image_importer(
         [invalidate_ds, direct_bind](uint64_t addr, prosper::gpu::LiveTargetImageImport& import) {
