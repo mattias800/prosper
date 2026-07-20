@@ -3,6 +3,7 @@
 #include "exec_image.hpp"
 #include "sse4a.hpp"
 #include "fs_emu.hpp"
+#include "raw_syscall.hpp"
 #include "../hle/nid.hpp"
 #include "../hle/dispatch.hpp"
 
@@ -1563,8 +1564,12 @@ namespace {
             // must NOT be re-backed — those are the real chain endpoints; let them terminate + report.
             unsigned pg = (unsigned)(a >> 12);
             if (a < 0x10000ull && a != rip && pg < 16 && !(g_null_page_mask & (1u << pg))) {
-                void* page = (void*)(a & ~(uint64_t)0xfff);
-                if (mmap(page, 0x1000, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == page) {
+                uint64_t page = a & ~(uint64_t)0xfff;
+                // Raw syscall, NOT glibc mmap()/syscall(): both store errno through %fs on
+                // failure, and %fs is guest TLS on this thread — the store itself faults inside
+                // the handler and kills the process before any report (issue #1071).
+                long mr = raw_mmap_fixed_ro(page, 0x1000);
+                if (mr == 0) {
                     g_null_page_mask |= (1u << pg);
                     g_null_page_count = g_null_page_count + 1;
                     char b[128];
@@ -1575,6 +1580,16 @@ namespace {
                     nullpage_deep_dump(uc, rip);   // issue-#312 attribution dump (registers + heap + GPU ring)
                     return;   // re-execute; the null read now sees zero
                 }
+                // Fail-visible: low mappings need CAP_SYS_RAWIO once addr < vm.mmap_min_addr
+                // (default 65536), so unprivileged/containerized hosts land here. Fall through
+                // to the normal fatal report instead of silently retrying.
+                char b[160];
+                int n = snprintf(b, sizeof b,
+                                 "[nullpage] BACKING DENIED addr=0x%llx rip=eboot+0x%llx err=%ld"
+                                 " (vm.mmap_min_addr/CAP_SYS_RAWIO)\n",
+                                 (unsigned long long)a,
+                                 (unsigned long long)(rip - 0x400000000ull), mr);
+                syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
             }
         }
         // Null-companion skip probe (diagnostic; see g_skip_null_companion). Redirect the reader past
