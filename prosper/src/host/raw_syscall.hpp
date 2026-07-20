@@ -7,12 +7,16 @@
 // syscall instruction directly and return -errno in-register; they never touch errno or TLS.
 #pragma once
 
+// NOTE: exec_image_linux.cpp includes this header above its own platform guard and is globbed
+// into prosper_core on every host, so the top level here must stay Windows/MinGW-clean (no
+// <sys/mman.h> — see posix_shim.hpp). The errno/TLS-free guarantee below holds for the Linux
+// x86-64 asm branch; the POSIX fallback branch is plain libc (safe there, see its comment).
 #include <cerrno>
 #include <cstdint>
-#include <sys/mman.h>
 
 #if defined(__linux__) && defined(__x86_64__)
 
+#include <sys/mman.h>
 #include <sys/syscall.h>
 
 namespace prosper {
@@ -52,6 +56,7 @@ inline long raw_write(int fd, const void* buf, uint64_t len) {
 // here too. Host TLS is %gs-based on macOS x86-64, so libc's errno store never goes through
 // the guest's %fs — plain libc calls are handler-safe, and these wrappers just adapt them to
 // the same 0/-errno in-register contract the Linux asm versions provide.
+#include <sys/mman.h>
 #include <unistd.h>
 
 namespace prosper {
