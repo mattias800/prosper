@@ -1467,14 +1467,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // Synchronous Unity maintenance kernels commonly rewrite a large persistent buffer with
             // the values it already contains. Terminator 2D's startup kernel binds 8,847,360 bytes;
             // after its first dispatch all later readbacks are identical. Avoiding the redundant host
-            // write also avoids publishing a false guest-GPU mutation to renderer caches. The compare
-            // is still linear, but removes one full write pass over both source and destination.
+            // write removes one full pass over both source and destination. Cache invalidation and
+            // writer provenance remain unconditional: renderer-resident state can differ from guest
+            // RAM even when consecutive compute readbacks contain identical bytes.
             if (changed)
                 std::memcpy(destination, result, buffer.resource->size);
             vkUnmapMemory(ctx.device, buffer.memory);
-            if (changed)
-                notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.resource->size);
-            if (changed && !buffer.resource->host_data && writer_provenance_enabled())
+            notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.resource->size);
+            if (!buffer.resource->host_data && writer_provenance_enabled())
                 record_guest_write(GuestWriterKind::ComputeBuffer,
                                    buffer.resource->gpu_addr, buffer.resource->size,
                                    item.submit_no, item.dispatch_index,

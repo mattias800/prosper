@@ -167,8 +167,8 @@ int main() {
     CHECK(prosper::frontend::execute_live_compute_items({item}),
           "production live backend repeats an idempotent buffer dispatch");
     set_guest_gpu_write_observer({});
-    CHECK(unchanged_write_notifications == 0,
-          "unchanged compute buffer writeback does not invalidate guest GPU caches");
+    CHECK(unchanged_write_notifications == 1,
+          "idempotent compute writes still invalidate divergent renderer-resident state");
 
     std::fill(result.begin(), result.end(), 0xeeeeeeee);
     item.user_sgprs = alternate_config.user_sgprs;
