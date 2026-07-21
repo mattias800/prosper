@@ -2534,28 +2534,46 @@ std::unordered_set<uint32_t> waterfall_branches(const std::vector<Rdna2Inst>& in
     return out;
 }
 
-// A recognized COUNTED loop (the game's MSAA-resolve / accumulation shape): a single backward
-// unconditional branch (the back-edge) to a header, with exactly one forward SCC exit branch inside.
-// Anything more complex (nested loops, VCC/EXECNZ exits, multiple back-edges, mid-loop s_branch) is
-// rejected — the recompiler then falls back to the straight-line path (which fails on the loop, as before).
+// A recognized COUNTED loop (the game's MSAA-resolve / accumulation shape). Two accepted shapes:
+//   (a) TOP-tested: a single backward UNCONDITIONAL s_branch (the back-edge) to a header, with
+//       exactly one forward s_cbranch_scc0/scc1 exit inside the body — `for (...) {...}`.
+//   (b) BOTTOM-tested (do-while): the back-edge is ITSELF a backward s_cbranch_scc0/scc1; the loop
+//       continues while its SCC condition holds and exits by falling through — `do {...} while(...)`.
+//       This is what the compiler emits for a fixed-trip texture-accumulation loop whose whole body
+//       (including the s_cmp that sets the exit SCC) runs before the test. Alex Kidd's (PPSA02664)
+//       light/blur-accumulation pixel shaders use it, and rejecting it dropped their draws (#320).
+// Both are lowered by ONE emitter: shape (b) is modeled as exit_branch_pc == backedge_pc, so the
+// emitter emits the entire body as the "condition region" (runs every iteration incl. the exiting
+// one — exactly do-while), tests SCC at the bottom, and its "body region" (exit_branch+1..backedge)
+// is empty. Anything more complex (nested loops, VCC/EXECNZ exits, multiple back-edges, mid-loop
+// s_branch) is rejected — the recompiler then falls back to the straight-line path (as before).
 struct CountedLoop {
     bool found = false;
     uint32_t header_pc = 0;       // loop header (target of the back-edge; condition eval starts here)
-    uint32_t exit_branch_pc = 0;  // the forward s_cbranch_scc0/scc1 that leaves the loop
-    uint32_t backedge_pc = 0;     // the backward s_branch
+    uint32_t exit_branch_pc = 0;  // the s_cbranch_scc0/scc1 exit test (== backedge_pc for a do-while)
+    uint32_t backedge_pc = 0;     // the backward branch (unconditional s_branch, or the scc back-edge)
     uint32_t exit_pc = 0;         // first pc after the loop (== backedge_pc + its length)
-    bool exit_on_scc0 = true;     // s_cbranch_scc0 (exit when SCC==0) vs s_cbranch_scc1 (exit when SCC==1)
+    bool exit_on_scc0 = true;     // exit-test polarity: loop CONTINUES when SCC != (this flag ? 0 : 1)
 };
 inline uint32_t branch_target(const Rdna2Inst& in) { return in.pc + in.len_dwords + (uint32_t)(int32_t)in.simm16; }
 
 CountedLoop detect_counted_loop(const std::vector<Rdna2Inst>& ins) {
     CountedLoop L;
+    // The single backward branch that closes the loop. A conditional scc0/scc1 back-edge is a
+    // bottom-tested do-while; an unconditional s_branch is a top-tested loop.
     const Rdna2Inst* back = nullptr; int nback = 0;
     for (const auto& in : ins) {
         if (in.is_end) break;
-        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x02 && in.simm16 < 0) { back = &in; nback++; }
+        if (in.fmt == Rdna2Format::SOPP && in.simm16 < 0 &&
+            (in.opcode == 0x02 || in.opcode == 0x04 || in.opcode == 0x05)) { back = &in; nback++; }
     }
     if (nback != 1) return L;                       // 0 -> no loop; >1 -> nested/multiple (unhandled)
+    const bool do_while = (back->opcode != 0x02);   // conditional back-edge => bottom-tested
+    // A backward s_cbranch_scc0/scc1 whose SCC is a 64-bit wave-mask reduction is a WATERFALL loop
+    // (once-through per invocation), NOT a do-while counted loop — its cross-lane SCC has no
+    // representable per-lane value. Leave it to waterfall_branches()/the linearizer; treating it as a
+    // counted loop would feed the emitter a poisoned SCC exit and mis-lower the divergent body.
+    if (do_while && waterfall_branches(ins).count(back->pc)) return L;
     const uint32_t header = branch_target(*back);
     bool header_ok = false;
     for (const auto& in : ins) if (in.pc == header && in.pc < back->pc) { header_ok = true; break; }
@@ -2564,16 +2582,29 @@ CountedLoop detect_counted_loop(const std::vector<Rdna2Inst>& ins) {
     const Rdna2Inst* exitbr = nullptr; int nexit = 0;
     for (const auto& in : ins) {                    // scan the loop body [header, back-edge]
         if (in.pc < header || in.pc > back->pc || in.fmt != Rdna2Format::SOPP) continue;
+        if (&in == back) continue;                  // the back-edge is classified above, not here
         switch (in.opcode) {
             case 0x04: case 0x05:                   // s_cbranch_scc0 / scc1 — must be the single exit
                 if (branch_target(in) != exit_pc) return L;
                 exitbr = &in; nexit++; break;
-            case 0x02:                              // any s_branch other than the back-edge -> reject
-                if (&in != back) return L; break;
+            case 0x02:                              // any other s_branch -> reject
+                return L;
             case 0x06: case 0x07: case 0x09:        // vcc / execnz branches -> reject
                 return L;
             case 0x08: default: break;              // execz (forward, predication-handled) / hints ok
         }
+    }
+    if (do_while) {
+        // Bottom-tested: the conditional back-edge IS the exit test; no separate forward exit is
+        // allowed (a do-while with an inner uniform-if stays unsupported and rejects, conservatively).
+        // The back-edge is TAKEN (loops) while its SCC condition holds. exit_on_scc0 drives the
+        // emitter's loop_cond = (exit_on_scc0 ? SCC : !SCC), i.e. "continue when this is true": an
+        // s_cbranch_scc1 back-edge continues while SCC==1 (exit_on_scc0=true); scc0 continues while
+        // SCC==0 (exit_on_scc0=false).
+        if (nexit != 0) return L;
+        L.found = true; L.header_pc = header; L.exit_branch_pc = back->pc; L.backedge_pc = back->pc;
+        L.exit_pc = exit_pc; L.exit_on_scc0 = (back->opcode == 0x05);
+        return L;
     }
     if (nexit != 1) return L;
     L.found = true; L.header_pc = header; L.exit_branch_pc = exitbr->pc; L.backedge_pc = back->pc;
