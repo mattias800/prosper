@@ -823,7 +823,10 @@ HLE(k_direct_memory_query) {
         if (d.start > a0 && (!next || d.start < next->start)) next = &d;
     }
     const DMem* r = hit ? hit : ((a1 & 1) ? next : nullptr);
-    if (!r) { MLOG("dmem_query(0x%llx) -> none\n", (unsigned long long)a0); return 0x8002000e; }
+    // No region at/after the offset: EACCES is the enumeration terminator. GTA V (PPSA04263)
+    // walks query(offset,1)/offset=info.end and its ONLY loop exit compares against 0x8002000d;
+    // any other value reads as success with a zeroed info block and the walk spins forever (#1129).
+    if (!r) { MLOG("dmem_query(0x%llx) -> none (EACCES)\n", (unsigned long long)a0); return 0x8002000dull; }
     if (sz >= 0x08) *(uint64_t*)(info + 0x00) = r->start;
     if (sz >= 0x10) *(uint64_t*)(info + 0x08) = r->end;
     if (sz >= 0x14) *(int32_t*)(info + 0x10) = r->type;
@@ -3849,7 +3852,8 @@ HLE(k_direct_memory_query) {
         if (d.start > a0 && (!next || d.start < next->start)) next = &d;
     }
     const DMem* r = hit ? hit : ((a1 & 1) ? next : nullptr);
-    if (!r) return 0x8002000eull;
+    // EACCES terminates guest enumeration walks — same contract as the Linux variant (#1129).
+    if (!r) return 0x8002000dull;
     if (sz >= 0x08) *(uint64_t*)(info + 0x00) = r->start;
     if (sz >= 0x10) *(uint64_t*)(info + 0x08) = r->end;
     if (sz >= 0x14) *(int32_t*)(info + 0x10) = r->type;
