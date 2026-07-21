@@ -384,14 +384,14 @@ static uint64_t label_build_pre(uint64_t dst, uint64_t num_bytes) {
 HLE9(agc_dcb_dma_data) {  // (dcb, srcOrImm, srcSel?, dstSel?, dst, sel/policy, ..., stack9=numBytes)
     uint64_t num_bytes = a8 <= 0x10000000ull ? a8 : 0;
     static std::atomic<uint64_t> g_dma_n{0};
+    uint32_t* cmd; if (!begin_packet(a0, 9, IT_NOP, R_DMA_DATA, &cmd)) return 0;
     if (getenv("PROSPER_PREDLOG") || getenv("PROSPER_GFXLOG")) {
         uint64_t k = g_dma_n.fetch_add(1);
         if (k < 48 || (k % 4096) == 0)
-            fprintf(stderr, "[pred] DcbDmaData #%llu dst=0x%llx srcOrImm=0x%llx bytes=0x%llx sels=0x%llx/0x%llx\n",
-                    (unsigned long long)k, (unsigned long long)a4, (unsigned long long)a1,
+            fprintf(stderr, "[pred] DcbDmaData #%llu cmd=%p dst=0x%llx srcOrImm=0x%llx bytes=0x%llx sels=0x%llx/0x%llx\n",
+                    (unsigned long long)k, (void*)cmd, (unsigned long long)a4, (unsigned long long)a1,
                     (unsigned long long)num_bytes, (unsigned long long)a2, (unsigned long long)a3);
     }
-    uint32_t* cmd; if (!begin_packet(a0, 9, IT_NOP, R_DMA_DATA, &cmd)) return 0;
     cmd[1] = (uint32_t)(a4 & 0xffffffffu); cmd[2] = (uint32_t)(a4 >> 32u);
     cmd[3] = (uint32_t)(a1 & 0xffffffffu); cmd[4] = (uint32_t)(a1 >> 32u);
     cmd[5] = (uint32_t)num_bytes;
@@ -426,9 +426,44 @@ HLE9(agc_acb_dma_data) {  // (acb, srcSel?, dstSel?, dst, ?, ?, stack7=srcOrImm,
 // sceAgcDmaDataPatchSetDstAddressOrOffset (IxYiarKlXxM) / ...SetSrcAddressOrOffsetOrImmediate
 // (cdDRpqcFGbU): patch a built DMA_DATA packet's dst / src field (same patch-placeholder pattern
 // as the #213 sync-packet address patchers; header-verified before writing).
+//
+// #1124: PPSA02664's GfxDevice "workload" flow builds a DMA_DATA packet into a temp DCB via
+// sceAgcDcbDmaData, memcpy's it into the real command buffer, then DIRECTLY writes the copy's first
+// qword (using the real-AGC field offset) before calling these patchers. prosper's custom 9-dword
+// packet places the R_DMA_DATA header in that first dword, so the direct write clobbers the header
+// to 0x00000000 — which is a PM4 type-0 word that TRUNCATES the fold walk, dropping the DMA entirely
+// (verified live: the packet body survives in prosper's layout — dst at [1..2], bytes at [5] — only
+// the header is lost; restoring it takes the captured gameplay submit from "0 DMA copies" to "1").
+// The observed instances are the workload's 8-byte fence-label inits (#312 consumed-marker lifecycle,
+// previously silently dropped here); the mechanism is general to any DMA the game post-patches.
+// Since the guest is explicitly declaring "this is my DMA packet" by calling the patcher, and a real
+// DMA packet can never have a zero header, restore prosper's header before patching so the copy
+// executes. Guarded to the exact observed clobber (header == 0 AND a plausible DMA body: mapped
+// dst, sane byte count), so a genuine non-DMA target still refuses loudly. CONFIDENCE: MED-HIGH.
+static bool dma_patch_recover_header(uint32_t* cmd, const char* who) {
+    if (!gpu::guest_readable((uint64_t)(uintptr_t)cmd, 9 * sizeof(uint32_t))) return false;
+    if (cmd[0] != 0) return false;                                   // not the zero-clobber shape
+    const uint64_t dst   = (uint64_t)cmd[1] | ((uint64_t)cmd[2] << 32);
+    const uint32_t bytes = cmd[5];
+    if (dst < 0x10000 || bytes == 0 || bytes > 0x10000000u) return false;  // implausible DMA body
+    cmd[0] = PM4(9, IT_NOP, R_DMA_DATA);                             // prosper's 9-dword form
+    static std::atomic<int> n{0};
+    if (n.fetch_add(1) < 8)
+        fprintf(stderr, "[agc] %s: restored clobbered DMA header (dst=0x%llx bytes=%u) — #1124\n",
+                who, (unsigned long long)dst, bytes);
+    return true;
+}
+// Header check for the DMA patchers: accept a valid R_DMA_DATA header, or recover the #1124
+// zero-clobber; only a genuinely unexpected header reaches patch_check's loud refusal.
+static bool dma_patch_ready(uint32_t* cmd, const char* who) {
+    const uint32_t r = (cmd[0] >> 2) & (R_NUM - 1u), op = (cmd[0] >> 8) & 0xffu;
+    if (op == IT_NOP && r == R_DMA_DATA) return true;
+    if (dma_patch_recover_header(cmd, who)) return true;
+    return patch_check(cmd, R_DMA_DATA, who);   // refuse loudly for any other unexpected header
+}
 HLE(agc_patch_dma_data_dst) {  // (cmd, address)
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
-    if (!patch_check(cmd, R_DMA_DATA, "DmaDataPatchSetDst")) return 0;
+    if (!dma_patch_ready(cmd, "DmaDataPatchSetDst")) return 0;
     cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
     uint32_t len = ((cmd[0] >> 16) & 0x3fffu) + 2;
     if (len >= 9) {
@@ -439,7 +474,7 @@ HLE(agc_patch_dma_data_dst) {  // (cmd, address)
 }
 HLE(agc_patch_dma_data_src) {  // (cmd, addressOrImmediate)
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
-    if (!patch_check(cmd, R_DMA_DATA, "DmaDataPatchSetSrc")) return 0;
+    if (!dma_patch_ready(cmd, "DmaDataPatchSetSrc")) return 0;
     cmd[3] = (uint32_t)(a1 & 0xffffffffu); cmd[4] = (uint32_t)(a1 >> 32u);
     return 0;
 }

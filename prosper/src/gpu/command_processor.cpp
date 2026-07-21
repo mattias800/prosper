@@ -795,6 +795,15 @@ static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
     if (eop_writes_disabled() || !c.dd_valid) return;
     const uint64_t packet_addr = retained_packet_addr ? retained_packet_addr : pkt_addr(c);
     const DmaDataForm form = dma_data_form(c, authoritative_source != nullptr);
+    // #1124 (gated): trace every DMA that targets a specific guest region — used to find whether a
+    // texture's backing is (or should be) written by a CP-DMA the fold might drop/mis-form.
+    if (const char* w = getenv("PROSPER_DMA_WATCH_DST")) {
+        uint64_t lo = strtoull(w, nullptr, 0), hi = lo + 0x1000;
+        if (c.dd_dst >= lo - 0x1000 && c.dd_dst < hi)
+            fprintf(stderr, "[dma-watch] dst=0x%llx src=0x%llx bytes=%u sels=0x%x form=%d\n",
+                    (unsigned long long)c.dd_dst, (unsigned long long)c.dd_src, c.dd_bytes,
+                    c.dd_sels, (int)form);
+    }
     if (form == DmaDataForm::Invalid) {
         report_invalid_dma_data(c);
         return;
