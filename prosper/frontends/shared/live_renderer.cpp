@@ -2215,6 +2215,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     uint32_t gw = w, gh = h;
                     const uint32_t present_w = prosper::gpu::present_width();
                     const uint32_t present_h = prosper::gpu::present_height();
+                    bool is_vo = false;
+                    for (int i = 0; i < vo_n && !is_vo; i++)
+                        is_vo = base && base == prosper_vo_buffer_addr(i);
+                    // VideoOut registration is the visible scanout contract. CB_COLOR0_ATTRIB2 can
+                    // describe an overallocated backing surface (Terminator reports 4096x4096 for a
+                    // 1920x1080 scanout), which must not become the persistent target extent or the
+                    // final cache lookup will reject the rendered frame.
+                    if (is_vo && present_w && present_h) {
+                        native_w = present_w;
+                        native_h = present_h;
+                    }
                     // A depth prepass may bind a tiny/dummy color target with CB_TARGET_MASK=0 while
                     // rasterizing the full-size guest depth surface. Keying persistent DS from that
                     // irrelevant color extent creates a small depth image that the later lighting pass
@@ -2307,9 +2318,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             sit->second.format == pass_format && sit->second.rgba &&
                             sit->second.rgba->size() == pass_bytes)
                             seed = sit->second.rgba->data(); }
-                    bool is_vo = false;
-                    for (int i = 0; i < vo_n && !is_vo; i++)
-                        is_vo = base && base == prosper_vo_buffer_addr(i);
                     bool sampled_exact_later = false;
                     bool feedback_later = false;
                     if (live_gpu_targets && base) {
