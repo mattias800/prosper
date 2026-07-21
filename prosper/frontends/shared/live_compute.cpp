@@ -17,8 +17,10 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -681,14 +683,24 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // for skipping the seed. A write-only shader can store a subset of its grid (a masked composite:
     // `if (mask) imageStore(...)`, or a scatter store), covering the grid yet leaving untouched texels
     // undefined. Skipping the seed there would pack reused-pool garbage to the guest -- silent
-    // corruption. So prove full coverage ONCE per (shader, output binding): seed the image with poison,
-    // confirm the write overwrites every texel (0 poison survives), cache the verdict, and only then
-    // fast-skip. The proving frame itself stays correct -- untouched texels are restored from the
-    // seed (see the poison_verify writeback path). Keyed on (code_addr, binding): coverage is a
-    // property of the shader's store pattern, invariant across dispatch extent given covers_extent.
+    // corruption. So prove full coverage ONCE per (shader, binding, extent): seed the image with
+    // poison, confirm the write overwrites every texel (0 poison survives), cache the verdict, and
+    // only then fast-skip. The proving frame itself stays correct -- untouched texels are restored
+    // from the seed (see the poison_verify writeback path).
+    //
+    // The cached verdict is trusted for a DATA-INDEPENDENT store pattern (unconditional per-gid store,
+    // or a store bounded by gid vs a constant/the image extent) -- the exercised full-screen composites
+    // are exactly this. The extent is part of the key, so the same shader reused for a larger target
+    // re-proves (a hard-coded store bound cannot silently under-cover a bigger extent). What this key
+    // does NOT catch is a store whose predicate depends on per-frame INPUT (`if (buffer[gid] > k)
+    // store`) that is full on the proving frame but partial later; that residual soundness gap is
+    // tracked in #1127 -- no exercised title shader triggers it, and a shader first seen partial is
+    // cached Partial and always seeds (safe).
     enum class SeedCoverage : uint8_t { Full, Partial };
+    // key = (shader code_addr, output binding, width, height, depth) -- collision-free by construction.
+    using SeedCoverageKey = std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, uint32_t>;
     static std::mutex seed_coverage_mu;
-    static std::unordered_map<uint64_t, SeedCoverage> seed_coverage_proof;
+    static std::map<SeedCoverageKey, SeedCoverage> seed_coverage_proof;
     // #1122: a compute post-process that only image_stores its output (no image_load) never reads the
     // seed, so materializing the renderer RTT's prior pixels into it is wasted. Detect it cheaply: an
     // OpImageRead-free SPIR-V reads no storage image at all. Combined with full dispatch coverage of
@@ -1009,7 +1021,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // Diagnostic: force the proving (poison) path on every eligible dispatch, never fast-skip.
             static const bool force_verify = std::getenv("PROSPER_VERIFY_SEED_SKIP") != nullptr;
             if (bi.storage && shader_reads_no_image && covers_extent) {
-                const uint64_t proof_key = item.code_addr * 1000003ull + bi.binding;
+                const SeedCoverageKey proof_key{item.code_addr, bi.binding,
+                                                r->width, r->height, r->depth};
                 bool proven_full = false, known = false;
                 {
                     std::lock_guard<std::mutex> lk(seed_coverage_mu);
@@ -2024,7 +2037,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     if (all) { ++survived; poison_texel[t] = 1; }
                 }
                 {
-                    const uint64_t proof_key = item.code_addr * 1000003ull + bi.binding;
+                    const SeedCoverageKey proof_key{item.code_addr, bi.binding,
+                                                    r->width, r->height, r->depth};
                     std::lock_guard<std::mutex> lk(seed_coverage_mu);
                     seed_coverage_proof[proof_key] =
                         survived ? SeedCoverage::Partial : SeedCoverage::Full;
