@@ -51,6 +51,9 @@ struct GpuCapturedResource {
     uint64_t metadata_size = 0;
     uint32_t metadata_blob_index = 0xFFFFFFFFu;
     uint64_t metadata_blob_offset = 0;
+    // GPU-internal resources have no guest address. Capture their initial contents explicitly;
+    // ordered replay materializes one shared instance so mutations remain visible to later work.
+    std::vector<uint8_t> internal_bytes;
 };
 
 struct GpuCapturedTable {
