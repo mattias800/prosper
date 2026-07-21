@@ -1,4 +1,5 @@
 // pm4_decode.cpp — see pm4_decode.hpp. Pure PM4 type-3 stream walker.
+#include <cstdio>
 #include "pm4_decode.hpp"
 
 namespace prosper::gpu {
@@ -212,6 +213,21 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
             }
         } else {
             c.kind = K::Unknown;
+            // #1124: PPSA02664 re-arms cloned workload DMA templates by writing raw PM4 headers the
+            // game computed itself, which prosper's custom-packet fold has never met. Surface every
+            // distinct unknown raw type-3 opcode ONCE (with length + leading payload) so a guest
+            // bypassing the HLE builders is loud instead of silently skipped.
+            static uint32_t unk_n = 0;              // benign-race diagnostic counter
+            static uint32_t unk_ops[16];
+            bool seen = false;
+            for (uint32_t k = 0; k < unk_n && k < 16; k++) if (unk_ops[k] == c.op) { seen = true; break; }
+            if (!seen && unk_n < 16) {
+                unk_ops[unk_n++] = c.op;
+                std::fprintf(stderr, "[pm4] unknown raw type-3 opcode 0x%02x len=%u dwords @%p:", c.op,
+                             (unsigned)(npl + 1), (const void*)&buf[i]);
+                for (uint32_t k = 0; k < npl && k < 8; k++) std::fprintf(stderr, " %08x", pl[k]);
+                std::fprintf(stderr, "\n");
+            }
         }
 
         out.push_back(c);
