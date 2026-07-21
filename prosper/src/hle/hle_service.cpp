@@ -248,6 +248,7 @@ struct AvpPlayer {
     uint64_t poll = 0;               // synthetic frames delivered through GetVideoData[Ex]
     uint64_t audio_poll = 0;
     uint64_t active_poll = 0;        // independent progress for IsActive-only playback loops
+    uint64_t last_ts_ms = 0;         // newest delivered frame timestamp (sceAvPlayerCurrentTime)
     // When the title supplies its AvPlayer texture allocator, decoded NV12 must be written into those
     // guest-visible buffers.  A host vector is invisible to the title's pre-wired texture descriptors.
     std::vector<uint8_t*> texture_frames;
@@ -738,6 +739,7 @@ HLE(s_avp_getvideodata) {
                 if (avp_stage_video(p, vf, staged, pitch)) {
                     fi->p_data = staged;
                     fi->timestamp = vf.pts_us / 1000;
+                    p.last_ts_ms = fi->timestamp;
                     fi->d0 = vf.width; fi->d1 = vf.height; fi->d2 = 0; fi->d3 = 0;
                     result = 1;
                 }
@@ -751,6 +753,7 @@ HLE(s_avp_getvideodata) {
             uint8_t* staged = nullptr;
             if (avp_stage_synthetic(p, staged)) {
                 fi->p_data = staged; fi->timestamp = p.poll * 33ull; // ~30fps PTS (ms)
+                p.last_ts_ms = fi->timestamp;
                 fi->d0 = p.width; fi->d1 = p.height; fi->d2 = 0; fi->d3 = 0;
                 p.poll++; result = 1;
             }
@@ -782,6 +785,7 @@ HLE(s_avp_getvideodataex) {
                 if (avp_stage_video(p, vf, staged, pitch)) {
                     fi->p_data = staged;
                     fi->timestamp = vf.pts_us / 1000;
+                    p.last_ts_ms = fi->timestamp;
                     fi->details.video = {}; fi->details.video.width = vf.width; fi->details.video.height = vf.height;
                     fi->details.video.aspect = vf.height ? (float)vf.width / (float)vf.height : 0.0f;
                     fi->details.video.pitch = pitch;
@@ -796,6 +800,7 @@ HLE(s_avp_getvideodataex) {
             uint8_t* staged = nullptr;
             if (avp_stage_synthetic(p, staged)) {
                 fi->p_data = staged; fi->timestamp = p.poll * 33ull;
+                p.last_ts_ms = fi->timestamp;
                 fi->details.video = {}; fi->details.video.width = p.width; fi->details.video.height = p.height;
                 fi->details.video.aspect = (float)p.width / (float)p.height; fi->details.video.pitch = p.width;
                 fi->details.video.luma_bd = 8; fi->details.video.chroma_bd = 8;
@@ -829,6 +834,7 @@ HLE(s_avp_getaudiodata)   {   // bool sceAvPlayerGetAudioData(handle, AvPlayerFr
         p.audio.resize(sample_count);
         memcpy(p.audio.data(), af.pcm, sample_count * sizeof(int16_t));
         fi->p_data = reinterpret_cast<uint8_t*>(p.audio.data()); fi->timestamp = af.pts_us / 1000;
+        if (fi->timestamp > p.last_ts_ms) p.last_ts_ms = fi->timestamp;
         AvpAudio details{(uint16_t)af.channels, {}, af.sample_rate,
                          (uint32_t)(af.samples * af.channels * sizeof(int16_t)), {}};
         memcpy(&fi->d0, &details, sizeof(details));
@@ -839,12 +845,27 @@ HLE(s_avp_getaudiodata)   {   // bool sceAvPlayerGetAudioData(handle, AvPlayerFr
     if (p.audio.size() != samples * channels) p.audio.assign(samples * channels, 0);
     fi->p_data = (uint8_t*)p.audio.data();
     fi->timestamp = p.audio_poll * 21ull; // 1024/48 kHz, milliseconds
+    if (fi->timestamp > p.last_ts_ms) p.last_ts_ms = fi->timestamp;
     AvpAudio details{2, {}, 48000, samples * channels * sizeof(int16_t), {}};
     memcpy(&fi->d0, &details, sizeof(details));
     p.audio_poll++;
     if (avp_log()) fprintf(stderr, "[avp] audio handle=0x%llx result=1 poll=%llu\n",
                            (unsigned long long)a0, (unsigned long long)p.audio_poll);
     return 1;
+}
+// u64 sceAvPlayerCurrentTime(handle) — current playback position in MILLISECONDS. Returns the
+// newest delivered frame timestamp (video, or audio when audio leads), 0 before the first frame or
+// for an unknown handle. Alex Kidd DX's pre-level cutscene runner polls this to pace/finish the
+// sequence; the old unresolved-import 0 held its fade-to-black over an already-running level
+// forever (#320). Fires no guest callbacks, so no AVP_CALLBACK_ENTRY shim is needed.
+HLE(s_avp_current_time) {
+    svc_log("sceAvPlayerCurrentTime", a0,a1,a2,a3,a4,a5);
+    std::lock_guard<std::mutex> lk(g_avp_mx);
+    auto it = g_avp.find(a0);
+    const uint64_t now_ms = it == g_avp.end() ? 0 : it->second.last_ts_ms;
+    if (avp_log()) fprintf(stderr, "[avp] current-time handle=0x%llx -> %llu ms\n",
+                           (unsigned long long)a0, (unsigned long long)now_ms);
+    return now_ms;
 }
 HLE(s_avp_stop) {   // s32 sceAvPlayerStop(handle)
     svc_log("sceAvPlayerStop", a0,a1,a2,a3,a4,a5);
@@ -1875,14 +1896,22 @@ HLE(s_share_ok) { return 0; }
 HLE(s_npuds_create) { svc_log("sceNpUniversalDataSystemCreate*", a0,a1,a2,a3,a4,a5);
                       if (svc_ptrish(a0)) *(int32_t*)PW(a0) = 1; return 0; }
 HLE(s_npuds_ok)     { return 0; }
-// Dead Cells' wrappers pin CreateEvent(name, reserved, Event**, PropertyObject**) and pass both
-// returned opaque objects to the setter/post/destroy family. They are never dereferenced by the
-// guest. Allocate stable non-null ids and keep the offline telemetry sink inert.
+// Two observed CreateEvent call shapes (both write opaque ids the guest never dereferences):
+//  * Dead Cells: CreateEvent(name?, reserved, Event** a2, PropertyObject** a3) — a2 AND a3 are
+//    out-pointers.
+//  * Alex Kidd DX (PPSA02664, svc dump): CreateEvent(name a0="activityTerminate", ctx a1,
+//    Event** a2, 0, PropertyObject** a4, 0) — outs are a2 and a4, a3 is literal 0. The old
+//    a3-must-be-a-pointer guard returned NP-invalid-argument here, and the title retried every
+//    frame forever — holding its cutscene->gameplay transition on a black screen (#320).
+// Accept both: a2 is always the event out; the property out is a3 when pointer-like, else a4 in
+// the a3==0 shape. Never write through a possibly-garbage register that merely looks like a
+// pointer outside these two proven shapes. CONFIDENCE: LOW (guarded, observed-shape-only).
 HLE(s_npuds_create_event) {
     svc_log("sceNpUniversalDataSystemCreateEvent", a0,a1,a2,a3,a4,a5);
-    if (!svc_ptrish(a2) || !svc_ptrish(a3)) return 0x80550003ull; // NP invalid argument
+    if (!svc_ptrish(a2)) return 0x80550003ull; // NP invalid argument
     *(uint64_t*)PW(a2) = g_handle.fetch_add(1);
-    *(uint64_t*)PW(a3) = g_handle.fetch_add(1);
+    if (svc_ptrish(a3))                     *(uint64_t*)PW(a3) = g_handle.fetch_add(1);
+    else if (a3 == 0 && svc_ptrish(a4))     *(uint64_t*)PW(a4) = g_handle.fetch_add(1);
     return 0;
 }
 HLE(s_npuds_post_event) {
@@ -2293,6 +2322,7 @@ void register_service_hle() {
     // consumes GetVideoDataEx; returning the generic unresolved-import zero meant "no streams" and
     // left its logo movie state machine permanently resident even after synthetic EOF.
     Hle::register_fn("hdTyRzCXQeQ", (HleFn)s_avp_streamcount,   "sceAvPlayerStreamCount");
+    Hle::register_fn("wwM99gjFf1Y", (HleFn)s_avp_current_time,  "sceAvPlayerCurrentTime");
     Hle::register_fn("d8FcbzfAdQw", (HleFn)s_avp_getstreaminfo, "sceAvPlayerGetStreamInfo");
     Hle::register_fn("ctTAcF5DiKQ", (HleFn)s_avp_getstreaminfoex, "sceAvPlayerGetStreamInfoEx");
     Hle::register_fn("ODJK2sn9w4A", (HleFn)s_avp_stream_ok, "sceAvPlayerEnableStream");
