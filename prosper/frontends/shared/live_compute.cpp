@@ -369,6 +369,8 @@ struct BoundImage {
     // renderer: it must not be destroyed here, its layout must be restored, and the pin taken at
     // import time must be released.
     bool imported = false;
+    bool seed_skip = false;             // #1122: write-only full-coverage storage image; no seed needed
+    bool poison_verify = false;         // #1122: PROSPER_VERIFY_SEED_SKIP -- seed poison, prove full coverage
     uint64_t imported_addr = 0;
     uint32_t imported_saved_layout = 0;      // VkImageLayout the renderer left the image in
     // Several bindings can borrow the SAME renderer image without being folded together, because
@@ -673,6 +675,22 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     double pack_ms = 0.0;
     double layout_ms = 0.0;
     const bool trace = trace_compute_item(item);
+    // #1122: a compute post-process that only image_stores its output (no image_load) never reads the
+    // seed, so materializing the renderer RTT's prior pixels into it is wasted. Detect it cheaply: an
+    // OpImageRead-free SPIR-V reads no storage image at all. Combined with full dispatch coverage of
+    // the target, the seed (a GPU readback + rgba8->uvec4 expand + upload, ~20 ms/frame on Blasphemous
+    // 2's full-screen composite) can be skipped entirely. PROSPER_NO_SKIP_SEED forces the seed.
+    const bool shader_reads_no_image = [&] {
+        if (std::getenv("PROSPER_NO_SKIP_SEED")) return false;
+        const auto& w = item.spirv;
+        for (size_t k = 5; k < w.size();) {
+            const uint32_t wc = w[k] >> 16, op = w[k] & 0xffff;
+            if (!wc) break;
+            if (op == 98u /* OpImageRead */) return false;
+            k += wc;
+        }
+        return true;
+    }();
     const auto setup_validate_start = ComputeClock::now();
     auto report = validate_spirv_descriptor_interface(
         item.spirv, item.resources.get(), 0, SpirvShaderStage::Compute, false);
@@ -966,7 +984,30 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     }
                 }
             }
-            if (renderer_owned && !bi.imported) {
+            // #1122: skip the seed entirely for a write-only storage image whose dispatch fully
+            // covers the target (every texel is image_stored, so the prior content is never observed
+            // -- not by the shader, and not by the writeback, which packs only written texels). One
+            // thread per texel with global size >= extent is the standard full-screen post-process
+            // pattern; require it per dimension so a partially-covered write still seeds correctly.
+            const bool covers_extent =
+                item.launch.threads_x >= r->width && item.launch.threads_y >= r->height &&
+                item.launch.threads_z >= r->depth;
+            static const bool verify_seed_skip = std::getenv("PROSPER_VERIFY_SEED_SKIP") != nullptr;
+            if (bi.storage && shader_reads_no_image && covers_extent && verify_seed_skip) {
+                // Prove coverage instead of skipping: seed the image with poison and confirm the
+                // write-only shader overwrites every texel (no poison survives in the result).
+                bi.poison_verify = true;
+            } else if (bi.storage && shader_reads_no_image && covers_extent) {
+                bi.seed_skip = true;   // guest-backed OR renderer-owned: a fully-covered write ignores the seed
+                if (trace)
+                    std::fprintf(stderr,
+                                 "[compute]   seed-skip write-only storage binding=%u addr=0x%llx "
+                                 "extent=%ux%u threads=%ux%ux%u renderer_owned=%d\n",
+                                 bi.binding, (unsigned long long)r->gpu_addr, r->width, r->height,
+                                 item.launch.threads_x, item.launch.threads_y, item.launch.threads_z,
+                                 renderer_owned ? 1 : 0);
+            }
+            if (renderer_owned && !bi.imported && !bi.seed_skip) {
                 if (dim_3d || r->depth != 1 ||
                     !read_live_render_target(r->gpu_addr, live_target) || !live_target.pixels) {
                     skip_image(r, "renderer-owned RTT has no readable snapshot"); break;
@@ -1107,7 +1148,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             staging_bytes[i] = sbytes;
 
             // Fill the upload staging bytes.
-            std::vector<uint8_t> upload(bi.imported ? size_t{0} : (size_t)sbytes, 0);
+            std::vector<uint8_t> upload((bi.imported || bi.seed_skip) ? size_t{0} : (size_t)sbytes, 0);
             if (bi.imported) {
                 // The renderer's image is the source: there is nothing to convert or stage.
                 bi.guest_bytes = 0;
@@ -1140,13 +1181,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     skip_image(r, "storage backing size is invalid"); break;
                 }
                 bi.guest_bytes = guest_bytes;
-                const uint8_t* src = renderer_owned ? nullptr : resource_bytes_for(r, guest_bytes);
-                const bool readable = renderer_owned ||
+                const uint8_t* src = (renderer_owned || bi.seed_skip)
+                    ? nullptr : resource_bytes_for(r, guest_bytes);
+                const bool readable = renderer_owned || bi.seed_skip ||
                                       (r->host_data && r->host_data_size >= guest_bytes) ||
                                       guest_readable(r->gpu_addr, static_cast<uint32_t>(guest_bytes));
                 if (!readable) { skip_image(r, "storage backing unreadable"); break; }
-                std::vector<uint8_t> linear((size_t)linear_guest_bytes, 0);
-                if (renderer_owned) {
+                std::vector<uint8_t> linear(bi.seed_skip ? size_t{0}
+                                            : (size_t)linear_guest_bytes, 0);
+                if (bi.seed_skip) {
+                    // #1122: write-only full-coverage target -- the shader overwrites every texel, so
+                    // the image is created but never seeded, uploaded, or read. Nothing to fill.
+                } else if (renderer_owned) {
                     std::memcpy(linear.data(), live_target.pixels->data(), linear.size());
                     if (trace) {
                         bi.before_hash = fnv1a(linear.data(), linear.size());
@@ -1178,9 +1224,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     if (trace) bi.before_hash = fnv1a(src, guest_bytes);
                     std::memcpy(linear.data(), src, linear.size());
                 }
-                storage_unpack_range(linear.data(), guest_texel, r->format, nc, texels,
-                                     reinterpret_cast<uint32_t*>(upload.data()));
-                static const bool verify_unpack = std::getenv("PROSPER_VERIFY_UNPACK") != nullptr;
+                if (!bi.seed_skip)
+                    storage_unpack_range(linear.data(), guest_texel, r->format, nc, texels,
+                                         reinterpret_cast<uint32_t*>(upload.data()));
+                if (bi.poison_verify) {   // #1122 coverage proof: poison every uvec4 channel
+                    uint32_t* pp = reinterpret_cast<uint32_t*>(upload.data());
+                    for (size_t t = 0; t < texels * 4; ++t) pp[t] = 0xDEADBEEFu;
+                }
+                static const bool verify_unpack =
+                    std::getenv("PROSPER_VERIFY_UNPACK") != nullptr && !bi.seed_skip;
                 if (verify_unpack) {
                     // Fail-visible A/B: the specialized range unpack must be bit-identical to the
                     // per-texel path it replaces. Reports the whole divergence (count + first texel)
@@ -1456,7 +1508,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     !vk_ok(vkBindBufferMemory(ctx.device, staging[i], staging_memory[i], 0),
                            "image-staging-bind")) {
                     images_ready = false; break; }
-                { void* mapped = nullptr;
+                if (!bi.seed_skip) {   // seed-skip (#1122): image is never uploaded, staging stays for writeback
+                  void* mapped = nullptr;
                   if (!vk_ok(vkMapMemory(ctx.device, staging_memory[i], 0, sbytes, 0, &mapped),
                              "image-staging-map")) {
                       images_ready = false; break; }
@@ -1465,6 +1518,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
 
             // Device-local image.
+            const auto img_t1 = ComputeClock::now();
             VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
             ici.imageType = dim_1d ? VK_IMAGE_TYPE_1D : (dim_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D);
             const bool sampled_r11g11b10 = !bi.storage &&
@@ -1723,6 +1777,23 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const BoundImage& bi = images[i];
             if (bi.alias_of != SIZE_MAX) continue;
             const ShaderResource* r = bi.resource;
+            if (bi.seed_skip) {
+                // #1122: nothing uploaded -- take the never-seeded image straight to GENERAL for the
+                // write-only shader (which overwrites every texel). The result is read back below.
+                VkImageMemoryBarrier to_general{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                to_general.srcAccessMask = 0;
+                to_general.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+                to_general.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                to_general.srcQueueFamilyIndex = to_general.dstQueueFamilyIndex =
+                    VK_QUEUE_FAMILY_IGNORED;
+                to_general.image = bi.image;
+                to_general.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+                                     1, &to_general);
+                continue;
+            }
             if (bi.imported) {
                 if (!imported_barrier_owner(i)) continue;   // another binding transitions this image
                 // Borrowed renderer image (#1095): nothing to upload. Make the renderer's writes
@@ -1899,6 +1970,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const size_t texels = (size_t)r->width * r->height * r->depth;
             std::vector<uint8_t> linear(texels * guest_texel, 0);
             const uint32_t* channels = static_cast<const uint32_t*>(mapped);
+            if (bi.poison_verify) {
+                size_t survived = 0;
+                for (size_t t = 0; t < texels; ++t) {
+                    bool all = true;
+                    for (uint32_t c = 0; c < 4; ++c) if (channels[t * 4 + c] != 0xDEADBEEFu) all = false;
+                    if (all) ++survived;
+                }
+                std::fprintf(stderr,
+                             "[seed-skip-verify] code=0x%llx binding=%u texels=%zu poison_survived=%zu %s\n",
+                             (unsigned long long)item.code_addr, bi.binding, texels, survived,
+                             survived ? "PARTIAL-COVERAGE-UNSAFE" : "full-coverage-ok");
+            }
             if (trace) {
                 for (size_t t = 0; t < texels; t++)
                     for (uint32_t c = 0; c < 4; c++)
