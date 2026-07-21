@@ -817,6 +817,121 @@ int main() {
               "tiled Float32 sampled values preserve negative and HDR channels byte-exactly");
     }
 
+    // --- #1122 seed-skip coverage proof. A write-only storage image whose dispatch fully covers the
+    // extent can skip the (expensive) seed -- BUT ONLY after proving the write actually stores every
+    // texel. covers_extent is necessary, not sufficient: a shader that stores a SUBSET of a covering
+    // grid leaves the rest undefined, and skipping the seed there packs pool garbage to the guest.
+    // The backend proves coverage per (shader,binding) on first sight (poison the seed, require zero
+    // survivors) and only fast-skips proven-full shaders; a partial write is detected and always
+    // seeds, restoring untouched texels. These two cases pin both halves of that contract.
+
+    // (a) FULL coverage: a 1D write-only fill (no image load) over threads_x == width. The seed is
+    // unobservable, so the poison-proving run and every seed-skipped run must agree byte-for-byte and
+    // differ from the pre-run guest content (the kernel really wrote every texel).
+    {
+        static const uint32_t fill_1d[] = {
+            0x7E080300u,             // v4 = v0 (x coord from the shell input)
+            0xF0200F00u, 0x00020004u,// IMAGE_STORE v0..v3 at v4 to binding 5 -- NO preceding IMAGE_LOAD
+            0xBF810000u,             // s_endpgm
+        };
+        std::vector<uint32_t> fill_index(W);
+        for (uint32_t i = 0; i < W; ++i) fill_index[i] = i;   // v0 == gid == store coord -> full coverage
+        std::vector<uint32_t> fdummy(4, 0);
+        std::vector<uint8_t> fill_guest(W * 4, 0xC3);   // distinctive pre-run content
+        const std::vector<uint8_t> fill_original = fill_guest;
+        ShaderResourceTable fill_rt;
+        auto fadd_buf = [&](uint32_t b, void* d, uint32_t s) {
+            ShaderResource r{}; r.cls = ResourceClass::ConstantBuffer; r.binding = b;
+            r.gpu_addr = (uint64_t)(uintptr_t)d; r.size = s; fill_rt.resources.push_back(r); };
+        fadd_buf(0, fill_index.data(), W * sizeof(uint32_t));
+        fadd_buf(1, fdummy.data(), 16); fadd_buf(2, fdummy.data(), 16); fadd_buf(3, fdummy.data(), 16);
+        ShaderResource fdst{};
+        fdst.cls = ResourceClass::StorageImage; fdst.img_dim = 0; fdst.binding = 5; fdst.sgpr_base = 8;
+        fdst.format = DataFormat::Unorm8; fdst.num_components = 4; fdst.width = W; fdst.height = 1;
+        fdst.depth = 1; fdst.gpu_addr = (uint64_t)(uintptr_t)fill_guest.data(); fdst.size = W * 4;
+        fill_rt.resources.push_back(fdst);
+        std::vector<uint32_t> fill_spirv = recompile_valu(
+            fill_1d, sizeof(fill_1d) / sizeof(fill_1d[0]), 1, 0, &fill_rt);
+        CHECK(!fill_spirv.empty(), "write-only 1D fill kernel recompiles");
+        if (!fill_spirv.empty()) {
+            ComputeItem it; it.spirv = fill_spirv;
+            it.resources = std::make_shared<ShaderResourceTable>(fill_rt);
+            it.launch.threads_x = W; it.launch.local_x = 64; it.launch.groups_x = 1;
+            it.launch.threads_y = it.launch.threads_z = 1;
+            it.launch.local_y = it.launch.local_z = 1;
+            it.launch.groups_y = it.launch.groups_z = 1;
+            it.code_addr = 0x1122f11du;   // fresh code -> first run proves, second run seed-skips
+            CHECK(prosper::frontend::execute_live_compute_items({it}),
+                  "seed-skip proving run (poison-seeded) executes a full-coverage 1D fill");
+            const std::vector<uint8_t> after_prove = fill_guest;
+            CHECK(after_prove != fill_original,
+                  "full-coverage fill overwrites the guest content (kernel ran)");
+            std::fill(fill_guest.begin(), fill_guest.end(), 0x00);  // scrub between runs
+            CHECK(prosper::frontend::execute_live_compute_items({it}),
+                  "seed-skip fast run (seed skipped) executes the proven full-coverage fill");
+            CHECK(fill_guest == after_prove,
+                  "seed-skipped run is byte-identical to the poison-proven run (seed is unobserved)");
+        }
+    }
+
+    // (b) PARTIAL store under a FULL grid (reviewer B1): a write-only 2D kernel that always stores to
+    // row 0 (v5 hard-zero), dispatched over a W x 2 grid so covers_extent is TRUE while row 1 is never
+    // written. The proof must detect the survivor, NOT fast-skip, and preserve row 1's prior content.
+    // Before the fix this row was undefined pool memory packed to the guest -- silent corruption.
+    {
+        static const uint32_t store_row0_2d[] = {
+            0x7E080300u,             // v4 = v0 (x)
+            0x7E0A0280u,             // v5 = 0  (y) -- ALWAYS row 0, regardless of the y invocation
+            0xF0200F08u, 0x00020004u,// IMAGE_STORE v0..v3 at (v4,v5) to binding 5 -- write-only
+            0xBF810000u,             // s_endpgm
+        };
+        const uint32_t H2 = 2;
+        std::vector<uint32_t> p_index(W);
+        for (uint32_t i = 0; i < W; ++i) p_index[i] = i;   // x == gid: row 0 fully written, row 1 never
+        std::vector<uint32_t> pdummy(4, 0);
+        std::vector<uint8_t> part_guest(W * H2 * 4);
+        for (size_t i = 0; i < part_guest.size(); ++i) part_guest[i] = (uint8_t)(i * 29 + 13);
+        const std::vector<uint8_t> part_original = part_guest;
+        ShaderResourceTable part_rt;
+        auto padd_buf = [&](uint32_t b, void* d, uint32_t s) {
+            ShaderResource r{}; r.cls = ResourceClass::ConstantBuffer; r.binding = b;
+            r.gpu_addr = (uint64_t)(uintptr_t)d; r.size = s; part_rt.resources.push_back(r); };
+        padd_buf(0, p_index.data(), W * sizeof(uint32_t));
+        padd_buf(1, pdummy.data(), 16); padd_buf(2, pdummy.data(), 16); padd_buf(3, pdummy.data(), 16);
+        ShaderResource pdst{};
+        pdst.cls = ResourceClass::StorageImage; pdst.img_dim = 1; pdst.binding = 5; pdst.sgpr_base = 8;
+        pdst.format = DataFormat::Unorm8; pdst.num_components = 4; pdst.width = W; pdst.height = H2;
+        pdst.depth = 1; pdst.gpu_addr = (uint64_t)(uintptr_t)part_guest.data(); pdst.size = W * H2 * 4;
+        part_rt.resources.push_back(pdst);
+        std::vector<uint32_t> part_spirv = recompile_valu(
+            store_row0_2d, sizeof(store_row0_2d) / sizeof(store_row0_2d[0]), 1, 0, &part_rt);
+        CHECK(!part_spirv.empty(), "write-only 2D row-0 store kernel recompiles");
+        if (!part_spirv.empty()) {
+            ComputeItem it; it.spirv = part_spirv;
+            it.resources = std::make_shared<ShaderResourceTable>(part_rt);
+            it.launch.threads_x = W; it.launch.local_x = 64; it.launch.groups_x = 1;
+            it.launch.threads_y = H2; it.launch.local_y = 1; it.launch.groups_y = H2;
+            it.launch.threads_z = 1; it.launch.local_z = 1; it.launch.groups_z = 1;
+            it.code_addr = 0x1122f22du;
+            const size_t row_bytes = (size_t)W * 4;
+            // Two runs: the first proves (poison) and detects partial coverage; the second uses the
+            // cached "Partial" verdict and seeds normally. Row 1 must survive on BOTH.
+            for (int run = 0; run < 2; ++run) {
+                CHECK(prosper::frontend::execute_live_compute_items({it}),
+                      run == 0 ? "partial-store proving run executes"
+                               : "partial-store cached (always-seed) run executes");
+                const bool row1_preserved = std::memcmp(part_guest.data() + row_bytes,
+                                                        part_original.data() + row_bytes, row_bytes) == 0;
+                CHECK(row1_preserved,
+                      run == 0 ? "B1: full-grid partial store preserves untouched row on the proving run"
+                               : "B1: full-grid partial store preserves untouched row once proven partial");
+                const bool row0_written = std::memcmp(part_guest.data(),
+                                                      part_original.data(), row_bytes) != 0;
+                CHECK(row0_written, "partial store did write the covered row (kernel ran)");
+            }
+        }
+    }
+
     if (fails) {
         std::printf("== FAIL: %d ==\n", fails);
         return 1;
