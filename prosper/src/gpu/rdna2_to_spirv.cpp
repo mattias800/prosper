@@ -2570,7 +2570,7 @@ struct CountedLoop {
     uint32_t exit_branch_pc = 0;  // the s_cbranch_scc0/scc1 exit test (== backedge_pc for a do-while)
     uint32_t backedge_pc = 0;     // the backward branch (unconditional s_branch, or the scc back-edge)
     uint32_t exit_pc = 0;         // first pc after the loop (== backedge_pc + its length)
-    bool exit_on_scc0 = true;     // exit-test polarity: loop CONTINUES when SCC != (this flag ? 0 : 1)
+    bool exit_on_scc0 = true;     // exit-test polarity: true ⇔ the loop continues while SCC==1 (exits on SCC==0)
 };
 inline uint32_t branch_target(const Rdna2Inst& in) { return in.pc + in.len_dwords + (uint32_t)(int32_t)in.simm16; }
 
@@ -2578,19 +2578,23 @@ CountedLoop detect_counted_loop(const std::vector<Rdna2Inst>& ins) {
     CountedLoop L;
     // The single backward branch that closes the loop. A conditional scc0/scc1 back-edge is a
     // bottom-tested do-while; an unconditional s_branch is a top-tested loop.
+    // A backward s_cbranch_scc0/scc1 whose SCC is a 64-bit wave-mask reduction is a WATERFALL
+    // (once-through per invocation), NOT a loop back-edge — its cross-lane SCC has no representable
+    // per-lane value, and every emit path already consumes it via safe_branches/the linearizer.
+    // Waterfalls are excluded from the back-edge count entirely: SELECTING one would feed the loop
+    // emitter a poisoned SCC exit and mis-lower the divergent body (T19), and merely COUNTING one
+    // would reject a counted loop that legitimately coexists with a waterfall elsewhere in the same
+    // shader — a previously-recompilable combination (kernel 44d locks it).
+    const std::unordered_set<uint32_t> wf = waterfall_branches(ins);
     const Rdna2Inst* back = nullptr; int nback = 0;
     for (const auto& in : ins) {
         if (in.is_end) break;
-        if (in.fmt == Rdna2Format::SOPP && in.simm16 < 0 &&
-            (in.opcode == 0x02 || in.opcode == 0x04 || in.opcode == 0x05)) { back = &in; nback++; }
+        if (in.fmt != Rdna2Format::SOPP || in.simm16 >= 0) continue;
+        if (in.opcode == 0x02 ||
+            ((in.opcode == 0x04 || in.opcode == 0x05) && !wf.count(in.pc))) { back = &in; nback++; }
     }
     if (nback != 1) return L;                       // 0 -> no loop; >1 -> nested/multiple (unhandled)
     const bool do_while = (back->opcode != 0x02);   // conditional back-edge => bottom-tested
-    // A backward s_cbranch_scc0/scc1 whose SCC is a 64-bit wave-mask reduction is a WATERFALL loop
-    // (once-through per invocation), NOT a do-while counted loop — its cross-lane SCC has no
-    // representable per-lane value. Leave it to waterfall_branches()/the linearizer; treating it as a
-    // counted loop would feed the emitter a poisoned SCC exit and mis-lower the divergent body.
-    if (do_while && waterfall_branches(ins).count(back->pc)) return L;
     const uint32_t header = branch_target(*back);
     bool header_ok = false;
     for (const auto& in : ins) if (in.pc == header && in.pc < back->pc) { header_ok = true; break; }
