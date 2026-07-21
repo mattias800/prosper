@@ -489,7 +489,7 @@ struct SpirvCompute {
         put(code, Op_Load, {t_bool, result, v_helper_invocation});
         return result;
     }
-    void declare_internal_gds() {
+    void declare_internal_gds(uint32_t set = 1, uint32_t binding = 0) {
         if (v_internal_gds) return;
         uint32_t runtime_array = id(), block = id(), block_ptr = id();
         put(deco, Op_Decorate, {runtime_array, Dec_ArrayStride, 4});
@@ -502,8 +502,25 @@ struct SpirvCompute {
         put(types, Op_TypePointer, {t_ptr_gds_u32, SC_StorageBuffer, t_u32});
         v_internal_gds = id();
         put(types, Op_Variable, {block_ptr, v_internal_gds, SC_StorageBuffer});
-        put(deco, Op_Decorate, {v_internal_gds, Dec_DescriptorSet, 1});
-        put(deco, Op_Decorate, {v_internal_gds, Dec_Binding, 0});
+        put(deco, Op_Decorate, {v_internal_gds, Dec_DescriptorSet, set});
+        put(deco, Op_Decorate, {v_internal_gds, Dec_Binding, binding});
+    }
+    void compute_gds_store(uint32_t index, uint32_t value, bool predicated, uint32_t pred) {
+        declare_internal_gds(0, kComputeInternalGdsBinding);
+        auto emit = [&]() {
+            uint32_t pointer = id();
+            putv(code, Op_AccessChain,
+                 {t_ptr_gds_u32, pointer, v_internal_gds, uconst(0), index});
+            put(code, Op_Store, {pointer, value});
+        };
+        if (!predicated) { emit(); return; }
+        uint32_t then = id(), merge = id();
+        put(code, Op_SelectionMerge, {merge, 0});
+        put(code, Op_BranchConditional, {pred, then, merge});
+        put(code, Op_Label, {then}); cur_block = then;
+        emit();
+        put(code, Op_Branch, {merge});
+        put(code, Op_Label, {merge}); cur_block = merge;
     }
     // Fragment GDS append/consume is one device-global atomic per hardware wave. Helper
     // invocations participate in the subgroup operations but cannot consume guest counter slots.
@@ -5964,7 +5981,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // existing wave_append model was landed and live-validated against exactly those
             // packets (#554/#580). Kept as a documented per-workgroup approximation of the
             // device-global counter (exact for the exercised dispatch shapes). CONFIDENCE: MED.
-            if (in.ds_gds && in.opcode != 0x3d && in.opcode != 0x3e) { ok = false; return true; }
+            if (in.ds_gds && in.opcode != 0x3d && in.opcode != 0x3e &&
+                !(b.is_compute && in.opcode == 0x0d)) { ok = false; return true; }
             // ds_write_addtid_b32 (0xb0) / ds_read_addtid_b32 (0xb1) in a GRAPHICS stage (#273):
             // a per-lane VGPR spill through LDS (addr = M0 + offset + tid*4) — DOLL's title post
             // PSes spill v15 before their accumulation loop and reload it after. Per-invocation the
@@ -6074,7 +6092,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 return true;
             }
             uint32_t addr = b.ibin(Op_IAdd, vread(in.src[0].value), b.uconst(in.literal));
+            if (in.ds_gds)
+                addr = b.ibin(Op_BitwiseAnd, addr, b.uconst(0xFFFFu));
             uint32_t idx  = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
+            if (in.ds_gds && in.opcode == 0x0d) {
+                b.compute_gds_store(idx, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
+                return true;
+            }
             if (in.opcode == 0x00) {                     // ds_add_u32: LDS += DATA0, no VGPR return
                 b.lds_atomic(Op_AtomicIAdd, idx, vread(in.src[1].value),
                              rs.exec_narrowed, rs.exec);

@@ -1870,7 +1870,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (changed)
                 std::memcpy(destination, result, buffer.resource->size);
             vkUnmapMemory(ctx.device, buffer.memory);
-            notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.resource->size);
+            if (buffer.resource->gpu_addr)
+                notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.resource->size);
             if (!buffer.resource->host_data && writer_provenance_enabled())
                 record_guest_write(GuestWriterKind::ComputeBuffer,
                                    buffer.resource->gpu_addr, buffer.resource->size,

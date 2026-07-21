@@ -65,6 +65,7 @@ LiveRenderFn g_live;   // empty until the runtime/test registers a device-backed
 LiveComputeFn g_compute;   // synchronous compute backend, registered with the live Vulkan frontend
 GuestGpuWriteObserver g_guest_gpu_write_observer;
 thread_local LiveRenderPhase g_live_phase;
+std::array<uint8_t, 64 * 1024> g_compute_gds{};
 
 struct GuestGpuWriteRange {
     uint64_t addr = 0;
@@ -2907,6 +2908,26 @@ std::vector<ComputeItem> realize_compute_dispatches(
             }
         }
         assign_convention_bindings(*table, 2);
+        {
+            std::vector<Rdna2Inst> decoded;
+            rdna2_walk(reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+                       shader_dwords, decoded);
+            const bool uses_gds = std::any_of(decoded.begin(), decoded.end(), [](const auto& in) {
+                return in.fmt == Rdna2Format::DS && in.ds_gds && in.opcode == 0x0d;
+            });
+            if (uses_gds) {
+                ShaderResource gds;
+                gds.cls = ResourceClass::ConstantBuffer;
+                gds.format = DataFormat::Uint32;
+                gds.num_components = 1;
+                gds.binding = kComputeInternalGdsBinding;
+                gds.size = static_cast<uint32_t>(g_compute_gds.size());
+                gds.stride = 4;
+                gds.host_data = g_compute_gds.data();
+                gds.host_data_size = g_compute_gds.size();
+                table->resources.push_back(gds);
+            }
+        }
 
         const uint32_t rsrc2 = rd(ds.sh, P::COMPUTE_PGM_RSRC2);
         auto field = [&](uint32_t shift, uint32_t mask) { return (rsrc2 >> shift) & mask; };
