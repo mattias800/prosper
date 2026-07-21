@@ -384,6 +384,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_atrac9 PRIVATE prosper_core)
   add_test(NAME atrac9_decode COMMAND test_atrac9)
 
+  # AJM batch-2.0 gapless decode semantics (#1097): skip/total trim, exact EOS landing of
+  # uiTotalDecodedSamples, post-EOS silence, and program re-arm. FMOD's codec recycling keys off
+  # the exact EOS; without it one-shot SFX exhaust the codec pool. Pure, no game dump; runs in CI.
+  add_executable(test_ajm2_gapless tests/test_ajm2_gapless.cpp)
+  target_link_libraries(test_ajm2_gapless PRIVATE prosper_core)
+  add_test(NAME ajm2_gapless COMMAND test_ajm2_gapless)
+
   # APR container registry + size-keyed read matching (issue #62): stable ids, path dedup, and
   # the ambiguity/chunk-read refusal the read-submit path relies on. Pure, no game dump needed.
   add_executable(test_apr_registry tests/test_apr_registry.cpp)

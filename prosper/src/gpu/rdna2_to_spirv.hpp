@@ -18,6 +18,8 @@
 
 namespace prosper::gpu {
 
+inline constexpr uint32_t kComputeInternalGdsBinding = 127;
+
 struct ShaderResourceTable;   // resource-binding contract (shader_resources.hpp); optional to recompile_valu
 struct Rdna2Inst;
 

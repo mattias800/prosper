@@ -1,9 +1,11 @@
 #include "../src/gpu/rdna2_to_spirv.hpp"
+#include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/shader_resources.hpp"
 #include "../src/gpu/tile.hpp"
 #include "live_compute.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -205,6 +207,87 @@ int main() {
         for (uint32_t component = 0; component < 4; ++component)
             replay_padding_untouched &= replay_owned[record * 4 + component] == 0xdddddddd;
     CHECK(replay_padding_untouched, "captured/replay-owned backing preserves padded invocations");
+
+    // Terminator 2D's startup uses device-global GDS. Capture its initial host-backed state, then
+    // execute two ordered replay dispatches against the same materialized 64 KiB instance. The
+    // first store wraps its byte address to 16 bits; the second narrows EXEC to lane zero. If the
+    // store ignores EXEC, lanes 1..3 overwrite the first dispatch's dword at wrapped address 4.
+    static const uint32_t gds_wrap_store[] = {
+        0x7e0002ffu, 0x00010004u,  // v0 = byte address 0x10004 -> GDS byte address 4
+        0x7e0202ffu, 0xdeadbeefu,  // v1 = value
+        0xd8360000u, 0x00000100u,  // ds_write_b32 v0, v1 gds
+        0xbf810000u,
+    };
+    static const uint32_t gds_exec_store[] = {
+        0x34000082u,               // v_lshlrev_b32 v0, 2, v0 (one dword per lane)
+        0x7e0202ffu, 0xcafebabeu,  // v1 = value
+        0x7da40080u,               // v_cmpx_eq_u32 0, v0
+        0xd8360000u, 0x00000100u,  // only lane zero stores at byte address 0
+        0xbf810000u,
+    };
+    std::array<uint8_t, 64 * 1024> gds_initial{};
+    ShaderResource gds_resource;
+    gds_resource.cls = ResourceClass::ConstantBuffer;
+    gds_resource.format = DataFormat::Uint32;
+    gds_resource.num_components = 1;
+    gds_resource.binding = kComputeInternalGdsBinding;
+    gds_resource.size = gds_initial.size();
+    gds_resource.stride = 4;
+    gds_resource.host_data = gds_initial.data();
+    gds_resource.host_data_size = gds_initial.size();
+    auto gds_table = std::make_shared<ShaderResourceTable>();
+    gds_table->resources.push_back(gds_resource);
+    ComputeShaderConfig gds_config;
+    auto make_gds_item = [&](const uint32_t* code_words, size_t word_count,
+                             uint32_t threads, uint64_t order) {
+        ComputeItem gds_item;
+        gds_item.spirv = recompile_compute(code_words, word_count, gds_table.get(), gds_config);
+        gds_item.resources = gds_table;
+        gds_item.launch.threads_x = threads;
+        gds_item.launch.local_x = threads;
+        gds_item.launch.local_y = gds_item.launch.local_z = 1;
+        gds_item.launch.groups_x = gds_item.launch.groups_y = gds_item.launch.groups_z = 1;
+        gds_item.dispatch_index = order;
+        gds_item.command_order = order;
+        return gds_item;
+    };
+    ComputeItem gds_first = make_gds_item(gds_wrap_store, std::size(gds_wrap_store), 1, 10);
+    ComputeItem gds_second = make_gds_item(gds_exec_store, std::size(gds_exec_store), 4, 20);
+    CHECK(!gds_first.spirv.empty() && !gds_second.spirv.empty(),
+          "compute GDS wrap and EXEC kernels recompile");
+    GpuCaptureFile gds_capture;
+    GpuCaptureMetadata gds_metadata;
+    std::string gds_error;
+    const std::vector<SubmitOperation> gds_operations = {
+        {SubmitOperationKind::Dispatch, 10, 10},
+        {SubmitOperationKind::Dispatch, 20, 20},
+    };
+    CHECK(capture_submit_items({}, {gds_first, gds_second}, gds_operations, gds_metadata,
+                               [](uint64_t, uint8_t*, size_t) { return size_t{0}; },
+                               gds_capture, gds_error),
+          "capture records host-backed compute GDS without reading guest address zero");
+    std::vector<uint8_t> gds_capture_bytes;
+    GpuCaptureFile gds_loaded;
+    GpuReplayFrame gds_replay;
+    CHECK(serialize_gpu_capture(gds_capture, gds_capture_bytes, gds_error) &&
+          deserialize_gpu_capture(gds_capture_bytes, gds_loaded, gds_error) &&
+          materialize_gpu_replay(gds_loaded, gds_replay, gds_error) &&
+          gds_replay.computes.size() == 2 &&
+          gds_replay.computes[0].resources->resources[0].host_data ==
+              gds_replay.computes[1].resources->resources[0].host_data,
+          "capture v22 materializes one persistent GDS instance across ordered dispatches");
+    uint32_t gds_notifications = 0;
+    set_guest_gpu_write_observer([&](uint64_t, uint64_t) { ++gds_notifications; });
+    CHECK(prosper::frontend::execute_live_compute_items(gds_replay.computes),
+          "production live backend executes captured GDS stores");
+    set_guest_gpu_write_observer({});
+    const auto* gds_words = reinterpret_cast<const uint32_t*>(
+        gds_replay.computes[0].resources->resources[0].host_data);
+    CHECK(gds_words && gds_words[0] == 0xcafebabeu && gds_words[1] == 0xdeadbeefu &&
+              gds_words[2] == 0 && gds_words[3] == 0,
+          "GDS stores honor 16-bit address wrap, EXEC predication, and cross-dispatch persistence");
+    CHECK(gds_notifications == 0,
+          "GPU-internal GDS writeback does not invalidate guest address zero");
 
     // --- #590: the live backend's storage-IMAGE path. The same 1D image-copy kernel that
     // test_storage_image_copy proves against the raw harness, executed through the PRODUCTION

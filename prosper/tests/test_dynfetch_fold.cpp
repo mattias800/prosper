@@ -903,6 +903,44 @@ int main() {
                              &atomic_table, atomic_config).empty(),
           "#636: production resource table keeps stride-zero supported atomic realizable");
 
+    // Terminator 2D supplies descriptor dwords separately, then reassembles its destination V# in
+    // s[0:3] with four scalar moves immediately before format stores. This has no SRT-load tag and
+    // the destination range no longer equals its entry user data, but the four consecutive seed
+    // origins are exact provenance. Arithmetic or a shuffled word must still fail closed.
+    static uint32_t moved_store_output[16];
+    const uint64_t moved_store_base = (uint64_t)(uintptr_t)moved_store_output;
+    uint32_t moved_store_seed[9] = {};
+    moved_store_seed[5] = (uint32_t)moved_store_base;
+    moved_store_seed[6] = (uint32_t)(moved_store_base >> 32) | (4u << 16);
+    moved_store_seed[7] = 16;
+    moved_store_seed[8] = 0x10005004u;
+    const uint32_t moved_direct_store[] = {
+        0xBE800305u, 0xBE810306u, 0xBE820307u, 0xBE830308u,
+        0xE0142000u, 0x80000000u, // buffer_store_format_x v0, v0, s[0:3]
+        0xBF810000u,
+    };
+    ShaderResourceTable moved_store_table;
+    const std::vector<SrtUse> moved_store_uses = add_compute_buffer_resources(
+        moved_store_table, moved_direct_store, std::size(moved_direct_store),
+        moved_store_seed, std::size(moved_store_seed));
+    assign_convention_bindings(moved_store_table, 2);
+    CHECK(moved_store_uses.size() == 1 && moved_store_uses[0].use_pc == 4 &&
+              moved_store_table.resources.size() == 1 &&
+              moved_store_table.resources[0].gpu_addr == moved_store_base &&
+              moved_store_table.resources[0].fetch_pc == 4,
+          "moved consecutive entry dwords publish the exact format-store V#");
+    const uint32_t moved_shuffled_store[] = {
+        0xBE800305u, 0xBE810306u, 0xBE820308u, 0xBE830307u,
+        0xE0142000u, 0x80000000u,
+        0xBF810000u,
+    };
+    ShaderResourceTable moved_shuffled_table;
+    add_compute_buffer_resources(moved_shuffled_table, moved_shuffled_store,
+                                 std::size(moved_shuffled_store), moved_store_seed,
+                                 std::size(moved_store_seed));
+    CHECK(moved_shuffled_table.resources.empty(),
+          "shuffled entry dwords do not fabricate moved-descriptor provenance");
+
     // Kernel 5dr: once any T# SGPR is reloaded, the initial sharp is stale. An unresolved reload must
     // not silently resurrect it and fabricate a texture mapping for the later image operation.
     const uint32_t k5dr[] = {

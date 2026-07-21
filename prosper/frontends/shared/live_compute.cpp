@@ -828,7 +828,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (vkMapMemory(ctx.device, buffers[i].memory, 0, resource->size, 0, &mapped) != VK_SUCCESS) break;
                 const uint8_t* source = resource_bytes(resource);
                 if (trace) buffers[i].before_hash = fnv1a(source, resource->size);
-                std::memcpy(mapped, source, resource->size);
+                // Pooled host-visible allocations retain their previous contents. Compare them with
+                // current guest memory before uploading: an exact match is safe to reuse even when a
+                // different resource owned the allocation previously, while any guest CPU mutation
+                // still takes the ordinary full-copy path.
+                if (std::memcmp(mapped, source, resource->size) != 0)
+                    std::memcpy(mapped, source, resource->size);
                 vkUnmapMemory(ctx.device, buffers[i].memory);
             }
 
@@ -1865,7 +1870,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (changed)
                 std::memcpy(destination, result, buffer.resource->size);
             vkUnmapMemory(ctx.device, buffer.memory);
-            notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.resource->size);
+            if (buffer.resource->gpu_addr)
+                notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.resource->size);
             if (!buffer.resource->host_data && writer_provenance_enabled())
                 record_guest_write(GuestWriterKind::ComputeBuffer,
                                    buffer.resource->gpu_addr, buffer.resource->size,

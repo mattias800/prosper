@@ -489,7 +489,7 @@ struct SpirvCompute {
         put(code, Op_Load, {t_bool, result, v_helper_invocation});
         return result;
     }
-    void declare_internal_gds() {
+    void declare_internal_gds(uint32_t set = 1, uint32_t binding = 0) {
         if (v_internal_gds) return;
         uint32_t runtime_array = id(), block = id(), block_ptr = id();
         put(deco, Op_Decorate, {runtime_array, Dec_ArrayStride, 4});
@@ -502,8 +502,25 @@ struct SpirvCompute {
         put(types, Op_TypePointer, {t_ptr_gds_u32, SC_StorageBuffer, t_u32});
         v_internal_gds = id();
         put(types, Op_Variable, {block_ptr, v_internal_gds, SC_StorageBuffer});
-        put(deco, Op_Decorate, {v_internal_gds, Dec_DescriptorSet, 1});
-        put(deco, Op_Decorate, {v_internal_gds, Dec_Binding, 0});
+        put(deco, Op_Decorate, {v_internal_gds, Dec_DescriptorSet, set});
+        put(deco, Op_Decorate, {v_internal_gds, Dec_Binding, binding});
+    }
+    void compute_gds_store(uint32_t index, uint32_t value, bool predicated, uint32_t pred) {
+        declare_internal_gds(0, kComputeInternalGdsBinding);
+        auto emit = [&]() {
+            uint32_t pointer = id();
+            putv(code, Op_AccessChain,
+                 {t_ptr_gds_u32, pointer, v_internal_gds, uconst(0), index});
+            put(code, Op_Store, {pointer, value});
+        };
+        if (!predicated) { emit(); return; }
+        uint32_t then = id(), merge = id();
+        put(code, Op_SelectionMerge, {merge, 0});
+        put(code, Op_BranchConditional, {pred, then, merge});
+        put(code, Op_Label, {then}); cur_block = then;
+        emit();
+        put(code, Op_Branch, {merge});
+        put(code, Op_Label, {merge}); cur_block = merge;
     }
     // Fragment GDS append/consume is one device-global atomic per hardware wave. Helper
     // invocations participate in the subgroup operations but cannot consume guest counter slots.
@@ -2553,7 +2570,7 @@ struct CountedLoop {
     uint32_t exit_branch_pc = 0;  // the s_cbranch_scc0/scc1 exit test (== backedge_pc for a do-while)
     uint32_t backedge_pc = 0;     // the backward branch (unconditional s_branch, or the scc back-edge)
     uint32_t exit_pc = 0;         // first pc after the loop (== backedge_pc + its length)
-    bool exit_on_scc0 = true;     // exit-test polarity: loop CONTINUES when SCC != (this flag ? 0 : 1)
+    bool exit_on_scc0 = true;     // exit-test polarity: true ⇔ the loop continues while SCC==1 (exits on SCC==0)
 };
 inline uint32_t branch_target(const Rdna2Inst& in) { return in.pc + in.len_dwords + (uint32_t)(int32_t)in.simm16; }
 
@@ -2561,19 +2578,23 @@ CountedLoop detect_counted_loop(const std::vector<Rdna2Inst>& ins) {
     CountedLoop L;
     // The single backward branch that closes the loop. A conditional scc0/scc1 back-edge is a
     // bottom-tested do-while; an unconditional s_branch is a top-tested loop.
+    // A backward s_cbranch_scc0/scc1 whose SCC is a 64-bit wave-mask reduction is a WATERFALL
+    // (once-through per invocation), NOT a loop back-edge — its cross-lane SCC has no representable
+    // per-lane value, and every emit path already consumes it via safe_branches/the linearizer.
+    // Waterfalls are excluded from the back-edge count entirely: SELECTING one would feed the loop
+    // emitter a poisoned SCC exit and mis-lower the divergent body (T19), and merely COUNTING one
+    // would reject a counted loop that legitimately coexists with a waterfall elsewhere in the same
+    // shader — a previously-recompilable combination (kernel 44d locks it).
+    const std::unordered_set<uint32_t> wf = waterfall_branches(ins);
     const Rdna2Inst* back = nullptr; int nback = 0;
     for (const auto& in : ins) {
         if (in.is_end) break;
-        if (in.fmt == Rdna2Format::SOPP && in.simm16 < 0 &&
-            (in.opcode == 0x02 || in.opcode == 0x04 || in.opcode == 0x05)) { back = &in; nback++; }
+        if (in.fmt != Rdna2Format::SOPP || in.simm16 >= 0) continue;
+        if (in.opcode == 0x02 ||
+            ((in.opcode == 0x04 || in.opcode == 0x05) && !wf.count(in.pc))) { back = &in; nback++; }
     }
     if (nback != 1) return L;                       // 0 -> no loop; >1 -> nested/multiple (unhandled)
     const bool do_while = (back->opcode != 0x02);   // conditional back-edge => bottom-tested
-    // A backward s_cbranch_scc0/scc1 whose SCC is a 64-bit wave-mask reduction is a WATERFALL loop
-    // (once-through per invocation), NOT a do-while counted loop — its cross-lane SCC has no
-    // representable per-lane value. Leave it to waterfall_branches()/the linearizer; treating it as a
-    // counted loop would feed the emitter a poisoned SCC exit and mis-lower the divergent body.
-    if (do_while && waterfall_branches(ins).count(back->pc)) return L;
     const uint32_t header = branch_target(*back);
     bool header_ok = false;
     for (const auto& in : ins) if (in.pc == header && in.pc < back->pc) { header_ok = true; break; }
@@ -5995,7 +6016,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // existing wave_append model was landed and live-validated against exactly those
             // packets (#554/#580). Kept as a documented per-workgroup approximation of the
             // device-global counter (exact for the exercised dispatch shapes). CONFIDENCE: MED.
-            if (in.ds_gds && in.opcode != 0x3d && in.opcode != 0x3e) { ok = false; return true; }
+            if (in.ds_gds && in.opcode != 0x3d && in.opcode != 0x3e &&
+                !(b.is_compute && in.opcode == 0x0d)) { ok = false; return true; }
             // ds_write_addtid_b32 (0xb0) / ds_read_addtid_b32 (0xb1) in a GRAPHICS stage (#273):
             // a per-lane VGPR spill through LDS (addr = M0 + offset + tid*4) — DOLL's title post
             // PSes spill v15 before their accumulation loop and reload it after. Per-invocation the
@@ -6105,7 +6127,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 return true;
             }
             uint32_t addr = b.ibin(Op_IAdd, vread(in.src[0].value), b.uconst(in.literal));
+            if (in.ds_gds)
+                addr = b.ibin(Op_BitwiseAnd, addr, b.uconst(0xFFFFu));
             uint32_t idx  = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
+            if (in.ds_gds && in.opcode == 0x0d) {
+                b.compute_gds_store(idx, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
+                return true;
+            }
             if (in.opcode == 0x00) {                     // ds_add_u32: LDS += DATA0, no VGPR return
                 b.lds_atomic(Op_AtomicIAdd, idx, vread(in.src[1].value),
                              rs.exec_narrowed, rs.exec);

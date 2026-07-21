@@ -1407,6 +1407,33 @@ int main() {
     CHECK(got32b4.size()==1 && std::fabs(got32b4[0]-28.0f)<1e-3f,
           "kernel 32b4 wide LDS reads/writes preserve all three/four consecutive dwords");
 
+    // Terminator 2D's startup clear writes a device-global GDS dword. Compute GDS must use the
+    // backend-owned persistent buffer, not the per-workgroup LDS array.
+    const uint32_t compute_gds_write[] = {
+        0xd8360000u, 0x00000100u,  // ds_write_b32 v0, v1 gds
+        0xbf810000u,
+    };
+    ShaderResourceTable compute_gds_table;
+    ShaderResource compute_gds_resource;
+    compute_gds_resource.cls = ResourceClass::ConstantBuffer;
+    compute_gds_resource.format = DataFormat::Uint32;
+    compute_gds_resource.num_components = 1;
+    compute_gds_resource.binding = kComputeInternalGdsBinding;
+    compute_gds_resource.size = 64 * 1024;
+    compute_gds_resource.stride = 4;
+    std::array<uint8_t, 64 * 1024> compute_gds_backing{};
+    compute_gds_resource.host_data = compute_gds_backing.data();
+    compute_gds_resource.host_data_size = compute_gds_backing.size();
+    compute_gds_table.resources.push_back(compute_gds_resource);
+    ComputeShaderConfig compute_gds_config;
+    std::vector<uint32_t> compute_gds_spv = recompile_compute(
+        compute_gds_write, std::size(compute_gds_write), &compute_gds_table,
+        compute_gds_config);
+    CHECK(!compute_gds_spv.empty(), "compute GDS ds_write_b32 recompiles to SPIR-V");
+    CHECK(validate_spirv_descriptor_interface(
+              compute_gds_spv, &compute_gds_table, 0, SpirvShaderStage::Compute, false).ok(),
+          "compute GDS module binds the persistent backend-owned buffer");
+
     // Kernel 32b5: Astro's exact DS_APPEND word. Initialize the LDS counter to 10, narrow EXEC to
     // the first 32 lanes, then append. Hardware performs one atomic +32 and broadcasts old=10 only
     // to active lanes; inactive lanes preserve their old v8=99. Reading the new counter (42) makes
@@ -1989,6 +2016,67 @@ int main() {
     uint32_t bad44c = 0; for (uint32_t i=0;i<N&&got44c.size()==N;i++) if (std::fabs(got44c[i]-10.0f)>1e-3f) bad44c++;
     printf("  kernel44c mismatches=%u (out[5]=%g expect=10)\n", bad44c, got44c.size()==N?got44c[5]:-1);
     CHECK(got44c.size()==N && bad44c==0, "recompiled kernel 44c (do-while scc0 loop sum 0..4) computes 10");
+
+    // Kernel 44d: COEXISTENCE lock — a top-tested counted loop (s_branch back-edge, kernel-43 shape)
+    //   AND a readfirstlane waterfall (T19 shape, backward s_cbranch_scc1 with wave-mask SCC) in ONE
+    //   kernel. The waterfall's backward scc branch must NOT count as a second loop back-edge (it is
+    //   classified by waterfall_branches and linearized via safe_branches); counting it would reject
+    //   the whole shader — a previously-recompilable combination (review finding on #320's do-while
+    //   change). out = table[u] + sum(0..4) = table[u] + 10, table = 5/7/9 for u = 0/1/2.
+    const uint32_t code44d[] = {
+        0x7E020F00u,              // v_cvt_u32_f32 v1, v0            (pc 0: index u)
+        0xBE86047Eu,              // s_mov_b64 s[6:7], exec          (pc 1: REMAIN = exec)
+        0x7E0402FFu, 0x40A00000u, // v_mov_b32 v2, 5.0f              (pc 2)
+        0x7E0602FFu, 0x40E00000u, // v_mov_b32 v3, 7.0f              (pc 4)
+        0x7E0802FFu, 0x41100000u, // v_mov_b32 v4, 9.0f              (pc 6)
+        0xB0020005u,              // s_movk_i32 s2, 5                (pc 8)
+        0xBE800380u,              // s_mov_b32 s0, 0                 (pc 9)
+        0x7E0C0280u,              // v_mov_b32 v6, 0                 (pc 10)
+        0xBF0A0200u,              // loop: s_cmp_lt_u32 s0, s2       (pc 11: header)
+        0xBF840003u,              // s_cbranch_scc0 exit(+3 -> 16)   (pc 12)
+        0x4A0C0C00u,              // v_add_nc_u32 v6, s0, v6         (pc 13)
+        0x81008100u,              // s_add_i32 s0, s0, 1             (pc 14)
+        0xBF82FFFBu,              // s_branch loop(-5 -> 11)         (pc 15)
+        0x7E080501u,              // exit: v_readfirstlane_b32 s4,v1 (pc 16: waterfall head)
+        0x7DA40204u,              // v_cmpx_eq_u32 s4, v1            (pc 17)
+        0xBEFC0304u,              // s_mov_b32 m0, s4                (pc 18)
+        0x7E0A8702u,              // v_movrels_b32 v5, v2            (pc 19)
+        0x8A867E06u,              // s_andn2_b64 s[6:7], s[6:7],exec (pc 20: wave-mask SCC)
+        0xBEFE0406u,              // s_mov_b64 exec, s[6:7]          (pc 21)
+        0xBF85FFF9u,              // s_cbranch_scc1 (-7 -> 16)       (pc 22: waterfall back-branch)
+        0xBEFE04C1u,              // s_mov_b64 exec, -1              (pc 23)
+        0x7E0C0D06u,              // v_cvt_f32_u32 v6, v6            (pc 24)
+        0x06000D05u,              // v_add_f32 v0, v5, v6            (pc 25)
+        0xBF810000u,              // s_endpgm                        (pc 26)
+    };
+    std::vector<uint32_t> spv44d = recompile_valu(code44d, sizeof(code44d)/sizeof(code44d[0]), 1, 0);
+    CHECK(!spv44d.empty(), "recompiled kernel 44d (counted loop + waterfall coexist) -> SPIR-V");
+    std::vector<float> in44d(8), exp44d(8);
+    const float tab44d[3] = { 5.0f, 7.0f, 9.0f };
+    for (uint32_t i = 0; i < 8; i++) { in44d[i] = (float)(i % 3); exp44d[i] = tab44d[i % 3] + 10.0f; }
+    std::vector<float> got44d = prosper::test::run_compute(spv44d, in44d, 8, 8);
+    uint32_t bad44d = 0; for (uint32_t i=0;i<8&&got44d.size()==8;i++) if (std::fabs(got44d[i]-exp44d[i])>1e-3f) bad44d++;
+    printf("  kernel44d mismatches=%u (out[1]=%g expect=%g)\n", bad44d, got44d.size()==8?got44d[1]:-1, exp44d[1]);
+    CHECK(got44d.size()==8 && bad44d==0, "kernel 44d: counted loop + waterfall compute table[u]+10");
+
+    // Kernel 44e: NEGATIVE — a do-while whose body also has a forward scc exit (an inner uniform
+    //   break). Two exit tests exceed the single-exit contract, so the detector must conservatively
+    //   reject (nexit != 0 for a do-while) and the shader stays fail-visible rather than mis-lowering.
+    //     s0=0; v1=0; loop: v1+=s0; s0++; if (s0==3) break; while (s0<5)
+    const uint32_t code44e[] = {
+        0xBE800380u,              // s_mov_b32 s0, 0                 (pc 0)
+        0x7E020280u,              // v_mov_b32 v1, 0                 (pc 1)
+        0x4A020200u,              // loop: v_add_nc_u32 v1, s0, v1   (pc 2: header)
+        0x81008100u,              // s_add_i32 s0, s0, 1             (pc 3)
+        0xBF068300u,              // s_cmp_eq_u32 s0, 3              (pc 4)
+        0xBF850002u,              // s_cbranch_scc1 exit(+2 -> 8)    (pc 5: inner break)
+        0xBF0A8500u,              // s_cmp_lt_u32 s0, 5              (pc 6)
+        0xBF85FFFAu,              // s_cbranch_scc1 loop(-6 -> 2)    (pc 7: do-while back-edge)
+        0x7E000D01u,              // exit: v_cvt_f32_u32 v0, v1      (pc 8)
+        0xBF810000u,              // s_endpgm                        (pc 9)
+    };
+    std::vector<uint32_t> spv44e = recompile_valu(code44e, sizeof(code44e)/sizeof(code44e[0]), 0, 0);
+    CHECK(spv44e.empty(), "kernel 44e: do-while with inner forward scc break conservatively rejects");
 
     // Kernel 45: EXEC-narrowed-state tracking regression (the review-flagged under-narrow bug). Save all-on
     //   exec to vcc; v_cmp overwrites vcc with a per-lane mask (lanes i<4); restore exec FROM vcc — exec is
