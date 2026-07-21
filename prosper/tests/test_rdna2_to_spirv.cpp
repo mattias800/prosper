@@ -1982,6 +1982,41 @@ int main() {
     printf("  kernel44 mismatches=%u (out[5]=%g expect=40)\n", bad44, got44.size()==N?got44[5]:-1);
     CHECK(got44.size()==N && bad44==0, "recompiled kernel 44 (condition-region reg read after loop) computes 40");
 
+    // Kernel 44b: a BOTTOM-tested do-while loop whose back-edge is a conditional s_cbranch_scc1 (not
+    //   an unconditional s_branch + separate forward exit). The whole body runs, THEN the SCC test at
+    //   the bottom decides whether to loop — the shape Alex Kidd's (PPSA02664) light/blur-accumulation
+    //   pixel shaders use, which previously rejected and dropped their draws (#320). sum=0; i=0;
+    //   do { sum+=i; i++; } while (i<5)  =>  sum = 0+1+2+3+4 = 10.
+    //     s_mov s0,0 | v_mov v1,0
+    //   loop(header): v_add_nc_u32 v1,s0,v1 | s_add_i32 s0,s0,1 | s_cmp_lt_u32 s0,5 | s_cbranch_scc1 loop
+    //   exit: v_cvt_f32_u32 v0,v1 | s_endpgm
+    const uint32_t code44b[] = {
+        0xBE800380u, 0x7E020280u, 0x4A020200u, 0x81008100u, 0xBF0A8500u, 0xBF85FFFCu,
+        0x7E000D01u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv44b = recompile_valu(code44b, sizeof(code44b)/sizeof(code44b[0]), 0, 0);
+    CHECK(!spv44b.empty(), "recompiled kernel 44b (do-while s_cbranch_scc1 back-edge) -> SPIR-V");
+    std::vector<float> in44b(N); for (uint32_t i=0;i<N;i++) in44b[i]=(float)i;
+    std::vector<float> got44b = prosper::test::run_compute(spv44b, in44b, N, N);
+    uint32_t bad44b = 0; for (uint32_t i=0;i<N&&got44b.size()==N;i++) if (std::fabs(got44b[i]-10.0f)>1e-3f) bad44b++;
+    printf("  kernel44b mismatches=%u (out[5]=%g expect=10)\n", bad44b, got44b.size()==N?got44b[5]:-1);
+    CHECK(got44b.size()==N && bad44b==0, "recompiled kernel 44b (do-while scc1 loop sum 0..4) computes 10");
+
+    // Kernel 44c: the same do-while with the OPPOSITE back-edge polarity — s_cbranch_scc0 continues
+    //   while SCC==0. Exit test s_cmp_ge_u32 s0,5 (SCC = s0>=5), so the loop runs while s0<5. Same
+    //   result (10); guards the exit_on_scc0 polarity handling for the conditional back-edge.
+    const uint32_t code44c[] = {
+        0xBE800380u, 0x7E020280u, 0x4A020200u, 0x81008100u, 0xBF098500u, 0xBF84FFFCu,
+        0x7E000D01u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv44c = recompile_valu(code44c, sizeof(code44c)/sizeof(code44c[0]), 0, 0);
+    CHECK(!spv44c.empty(), "recompiled kernel 44c (do-while s_cbranch_scc0 back-edge) -> SPIR-V");
+    std::vector<float> in44c(N); for (uint32_t i=0;i<N;i++) in44c[i]=(float)i;
+    std::vector<float> got44c = prosper::test::run_compute(spv44c, in44c, N, N);
+    uint32_t bad44c = 0; for (uint32_t i=0;i<N&&got44c.size()==N;i++) if (std::fabs(got44c[i]-10.0f)>1e-3f) bad44c++;
+    printf("  kernel44c mismatches=%u (out[5]=%g expect=10)\n", bad44c, got44c.size()==N?got44c[5]:-1);
+    CHECK(got44c.size()==N && bad44c==0, "recompiled kernel 44c (do-while scc0 loop sum 0..4) computes 10");
+
     // Kernel 45: EXEC-narrowed-state tracking regression (the review-flagged under-narrow bug). Save all-on
     //   exec to vcc; v_cmp overwrites vcc with a per-lane mask (lanes i<4); restore exec FROM vcc — exec is
     //   now narrowed, so v_mov v2,7 must be EXEC-predicated (only i<4 get 7; i>=4 keep 0). If the narrowed
