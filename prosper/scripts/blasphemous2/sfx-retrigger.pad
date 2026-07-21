@@ -1,0 +1,31 @@
+# Blasphemous 2 - #1097 one-shot SFX retrigger repro.
+# Loads the first-Prie-Dieu save (same repeating-Cross prelude as load-save-first-station.pad),
+# then presses Square (attack) several times with multi-second gaps. Under PROSPER_AUDIOLOG the
+# AJM lifecycle around press 1 vs press 2 is the diagnostic: does the guest issue a decode for
+# the SFX again, and through which instance?
+# Requires the Prie Dieu save in PROSPER_SAVE0 (see load-save-first-station.pad header).
+1-2:cross
+6-7:cross
+11-12:cross
+16-17:cross
+21-22:cross
+26-27:cross
+31-32:cross
+36-37:cross
+41-42:cross
+46-47:cross
+51-52:cross
+56-57:cross
+61-62:cross
+66-67:cross
+71-72:cross
+76-77:cross
+81-82:cross
+86-87:cross
+91-92:cross
+# gameplay by ~95s; attacks with clean gaps:
+100-101:square
+106-107:square
+112-113:square
+118-119:square
+124-125:square

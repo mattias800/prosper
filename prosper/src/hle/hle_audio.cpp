@@ -1002,9 +1002,11 @@ struct AjmAt9Inst {
     uint8_t  config[4] = {0};
     bool     have_config = false;
     std::unique_ptr<Atrac9Decoder> dec;   // persistent per instance: preserves MDCT overlap across blocks
-    uint32_t skip_samples = 0;            // gapless front-delay (encoder priming), for future trim
-    uint64_t total_samples = 0;           // gapless total (end trim)
-    uint64_t decoded_samples = 0;         // running count of decoded sample-frames (for the sideband)
+    uint32_t skip_samples = 0;            // gapless program: priming frames to drop at program start
+    uint64_t total_samples = 0;           // gapless program: trimmed frames to deliver (0 = no program)
+    uint32_t skip_remaining = 0;          // frames still to drop (counts down from skip_samples)
+    uint64_t gapless_delivered = 0;       // trimmed frames delivered for the CURRENT program
+    uint64_t decoded_samples = 0;         // cumulative delivered sample-frames (no-program sideband)
     // PCM decoded but not yet delivered to a guest output buffer. Lives with the decoder (NOT per
     // batch): the decoder state already spans batches, so a spill must too — dropping it at a batch
     // boundary would lose audio the guest was told (via iSizeConsumed) it had received.
@@ -1018,6 +1020,13 @@ struct AjmDecJob {
 // SCE_AJM_ERROR_INVALID_PARAMETER — the AJM error space (see the constants above); -1 is not a value
 // the guest's error mapping recognizes.
 constexpr int32_t kAjm2ErrDecode = (int32_t)0x80930005;
+// Monotonic milliseconds for [ajm2] diagnostics: pad-script presses are scheduled in wall seconds,
+// so timestamped lifecycle logs let a press at a known time be matched to its AJM traffic (#1097).
+uint64_t ajm2_log_ms() {
+    static const auto t0 = std::chrono::steady_clock::now();
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+}
 std::mutex g_ajm2_mx;
 std::map<uint32_t, AjmAt9Inst> g_ajm2_inst;               // instance id -> decode state
 std::map<uint64_t, std::vector<AjmDecJob>> g_ajm2_jobs;   // batchInfo -> queued decode jobs
@@ -1316,6 +1325,14 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
 
         for (size_t k = ji; k < je; ++k) {
             AjmDecJob& job = jobs[k];
+            AjmAt9Inst& I = it->second;
+            // A programmed gapless decode (#1097): drop `skip` priming frames at the program start,
+            // deliver EXACTLY `total` trimmed frames, then pin the reported total there with no
+            // further PCM. FMOD's channel-end and codec-slot recycling key off that exact landing;
+            // overshooting it (whole raw superframes, cumulative counter) left every one-shot SFX
+            // "still playing" forever, so codec slots were never recycled and the pool exhausted
+            // after ~32 sounds -- every later sound silent.
+            const bool prog = I.total_samples > 0;
             // Over-allocate by a full superframe: LibAtrac9's bit reader is unbounded, so a truncated
             // or corrupt block's parse may step past the nominal superframe. decode_superframe still
             // rejects such a parse, but the read must land in memory we own.
@@ -1326,38 +1343,72 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
             const uint32_t out_cap = job.out_size - (job.out_size % frame_bytes);
             uint32_t in_cur = 0, produced = 0;
             int32_t err = 0;
-            auto write_out = [&](const int16_t* src, uint32_t nbytes) -> uint32_t {
-                const uint32_t room = out_cap - produced;
-                uint32_t w = std::min(nbytes, room);
-                w -= w % frame_bytes;
-                if (!w) return 0;
-                if (!audio_store_bytes(job.out_addr + produced, src, w)) { err = kAjm2ErrDecode; return 0; }
-                produced += w;
+            // Deliver `nframes` at `src`: end-trim against the program total, then write what the
+            // output has room for. Returns the number of frames written; `spill` gets the within-
+            // total remainder (room starvation), while beyond-total frames are discarded.
+            auto deliver = [&](const int16_t* src, uint32_t nframes,
+                               const int16_t** spill, uint32_t* spill_frames) -> uint32_t {
+                *spill = nullptr; *spill_frames = 0;
+                if (prog) {
+                    const uint64_t left = I.total_samples > I.gapless_delivered
+                                              ? I.total_samples - I.gapless_delivered : 0;
+                    if (nframes > left) nframes = (uint32_t)left;
+                }
+                const uint32_t room_frames = (out_cap - produced) / frame_bytes;
+                const uint32_t w = std::min(nframes, room_frames);
+                if (w) {
+                    if (!audio_store_bytes(job.out_addr + produced, src,
+                                           w * frame_bytes)) { err = kAjm2ErrDecode; return 0; }
+                    produced += w * frame_bytes;
+                    I.gapless_delivered += w;
+                }
+                *spill = src + (size_t)w * ch;
+                *spill_frames = nframes - w;
                 return w;
             };
             // 1. Drain carry-over PCM (decoded earlier, not yet delivered) into this output first.
+            //    Carry holds post-skip frames, so only the total/room trims apply here.
             if (!carry.empty() && produced < out_cap) {
-                const uint32_t cbytes = (uint32_t)(carry.size() * sizeof(int16_t));
-                const uint32_t w = write_out(carry.data(), cbytes);
-                if (w >= cbytes) carry.clear();
-                else if (w) carry.erase(carry.begin(), carry.begin() + w / sizeof(int16_t));
+                const uint32_t cframes = (uint32_t)(carry.size() / ch);
+                const int16_t* spill = nullptr; uint32_t spill_frames = 0;
+                deliver(carry.data(), cframes, &spill, &spill_frames);
+                if (!err) {
+                    if (spill_frames)
+                        carry.erase(carry.begin(),
+                                    carry.end() - (size_t)spill_frames * ch);
+                    else
+                        carry.clear();
+                }
             }
             // 2. Decode this block's superframes into the remaining space. Stop BEFORE decoding once
-            //    the output is full so `iSizeConsumed` never covers PCM the guest did not receive.
-            while (!err && produced < out_cap && in_cur + (uint32_t)sfb <= got) {
+            //    the output is full (so `iSizeConsumed` never covers PCM the guest did not receive)
+            //    or the gapless program is complete (post-EOS input produces nothing).
+            while (!err && produced < out_cap && in_cur + (uint32_t)sfb <= got &&
+                   !(prog && I.gapless_delivered >= I.total_samples)) {
                 if (dec->decode_superframe(in.data() + in_cur, pcm.data(),
                                            (int)(got - in_cur)) < 0) { err = kAjm2ErrDecode; break; }
                 in_cur += (uint32_t)sfb;
-                const uint32_t w = write_out(pcm.data(), sf_out_bytes);
+                const int16_t* block = pcm.data();
+                uint32_t nframes = (uint32_t)sfs;
+                if (prog && I.skip_remaining) {     // priming skip: stream-order, decode-time drop
+                    const uint32_t drop = std::min(I.skip_remaining, nframes);
+                    I.skip_remaining -= drop;
+                    block += (size_t)drop * ch;
+                    nframes -= drop;
+                }
+                const int16_t* spill = nullptr; uint32_t spill_frames = 0;
+                deliver(block, nframes, &spill, &spill_frames);
                 if (err) break;
-                if (w < sf_out_bytes)                                   // spilled: carry the rest forward
-                    carry.insert(carry.end(), pcm.begin() + w / sizeof(int16_t), pcm.end());
+                if (spill_frames)                                       // spilled: carry forward
+                    carry.insert(carry.end(), spill, spill + (size_t)spill_frames * ch);
             }
-            it->second.decoded_samples += produced / frame_bytes;
-            ajm2_write_result(job.result_addr, err, in_cur, produced, it->second.decoded_samples);
+            I.decoded_samples += produced / frame_bytes;
+            ajm2_write_result(job.result_addr, err, in_cur, produced,
+                              prog ? I.gapless_delivered : I.decoded_samples);
             if (log)
-                fprintf(stderr, "[ajm2] decode inst=%u in=%zu/%u out=%u -> %u consumed, %u PCM, carry=%zu%s\n",
-                        inst_id, got, job.in_size, job.out_size, in_cur, produced,
+                fprintf(stderr, "[ajm2] t=%llums decode inst=%u in=%zu/%u out=%u -> %u consumed, %u PCM, total=%llu carry=%zu%s\n",
+                        (unsigned long long)ajm2_log_ms(), inst_id, got, job.in_size, job.out_size,
+                        in_cur, produced, (unsigned long long)it->second.decoded_samples,
                         carry.size() * sizeof(int16_t), err ? " ERR" : "");
         }
         ji = je;
@@ -1372,11 +1423,29 @@ HLE10(ajm_batch_job_initialize) {
     const bool have = a2 && audio_read_bytes(a2, cfg, 4) && cfg[0] == 0xFE;
     std::lock_guard<std::mutex> lk(g_ajm2_mx);
     AjmAt9Inst& inst = g_ajm2_inst[(uint32_t)a1];
-    if (have && (!inst.have_config || std::memcmp(inst.config, cfg, 4) != 0)) {
+    const bool config_changed =
+        have && (!inst.have_config || std::memcmp(inst.config, cfg, 4) != 0);
+    if (getenv("PROSPER_AUDIOLOG")) {   // #1097: every re-init, with the state it inherits
+        static std::atomic<uint64_t> n{0};
+        const uint64_t k = n.fetch_add(1);
+        if (k < 400 || (k % 100) == 0)
+            fprintf(stderr, "[ajm2] t=%llums JobInitialize inst=%llu config=%02x%02x%02x%02x "
+                    "changed=%d inherited_decoded=%llu\n",
+                    (unsigned long long)ajm2_log_ms(), (unsigned long long)a1,
+                    cfg[0], cfg[1], cfg[2], cfg[3], config_changed ? 1 : 0,
+                    (unsigned long long)inst.decoded_samples);
+    }
+    if (config_changed) {
         std::memcpy(inst.config, cfg, 4);
         inst.have_config = true;
         inst.dec = std::make_unique<Atrac9Decoder>();
         if (!inst.dec->init(cfg)) inst.dec.reset();
+        // A different stream format on a reused slot: drop the old stream's pending PCM and
+        // program state; the guest programs a fresh gapless spec for the new sound (#1097).
+        inst.carry.clear();
+        inst.skip_remaining = 0;
+        inst.gapless_delivered = 0;
+        inst.total_samples = 0;
         if (getenv("PROSPER_AUDIOLOG"))
             fprintf(stderr, "[ajm2] JobInitialize inst=%llu config=%02x%02x%02x%02x decoder=%s\n",
                     (unsigned long long)a1, cfg[0], cfg[1], cfg[2], cfg[3],
@@ -1393,6 +1462,20 @@ HLE10(ajm_batch_job_gapless) {
     AjmAt9Inst& inst = g_ajm2_inst[(uint32_t)a1];
     inst.total_samples = g[0];
     inst.skip_samples = g[1];
+    // A gapless spec (re)starts the decode PROGRAM (#1097): the skip applies from here, the
+    // delivered counter restarts (FMOD re-arms at a loop boundary and expects the next pass to
+    // count 0..total again), and pending spill PCM belongs to the previous program -- a reused
+    // codec slot must never emit the prior sound's tail into the new one.
+    inst.skip_remaining = g[1];
+    inst.gapless_delivered = 0;
+    inst.carry.clear();
+    if (getenv("PROSPER_AUDIOLOG")) {   // #1097 lifecycle evidence
+        static std::atomic<uint64_t> n{0};
+        const uint64_t k = n.fetch_add(1);
+        if (k < 400 || (k % 100) == 0)
+            fprintf(stderr, "[ajm2] t=%llums SetGapless inst=%llu total=%u skip=%u\n",
+                    (unsigned long long)ajm2_log_ms(), (unsigned long long)a1, g[0], g[1]);
+    }
     return 0;
 }
 HLE10(ajm_batch_job_decode) {
