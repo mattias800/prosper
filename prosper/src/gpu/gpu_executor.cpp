@@ -1336,6 +1336,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     constexpr size_t kFoldSgprs = 128;
     std::array<uint32_t, kFoldSgprs> val{};                 // concrete SGPR values
     std::bitset<kFoldSgprs> val_known;
+    // Entry-user-data identity attached to an otherwise ordinary scalar value. This is narrower
+    // than descriptor provenance: it only proves that four s_mov_b32 copies reassembled four
+    // consecutive entry dwords, without arithmetic or a load changing any word.
+    std::array<uint32_t, kFoldSgprs> val_seed_origin{};
+    std::bitset<kFoldSgprs> val_seed_origin_known;
     // Descriptor provenance attached to the CURRENT scalar value. Unlike the load-time snapshots
     // below, this follows s_mov shuffles and is cleared by arithmetic/data writes. A key-less value
     // uses exact consuming-pc provenance, matching the recompiler after scalar spills.
@@ -1366,16 +1371,24 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val[(size_t)r] = v;
             val_known.set((size_t)r);
             val_srt_key_known.reset((size_t)r);
+            val_seed_origin_known.reset((size_t)r);
         }
     };
     auto forget = [&](int r) {
         if (valid_reg(r)) {
             val_known.reset((size_t)r);
             val_srt_key_known.reset((size_t)r);
+            val_seed_origin_known.reset((size_t)r);
         }
     };
-    for (uint32_t i = 0; i < nsgpr; i++)
-        set_value((int)(user_sgpr_base + i), user_sgprs[i]);
+    for (uint32_t i = 0; i < nsgpr; i++) {
+        const int reg = (int)(user_sgpr_base + i);
+        set_value(reg, user_sgprs[i]);
+        if (valid_reg(reg)) {
+            val_seed_origin[(size_t)reg] = i;
+            val_seed_origin_known.set((size_t)reg);
+        }
+    }
 
     // A direct sharp lives in the initial user-data SGPR block rather than arriving through an
     // s_load. It remains a usable load-time descriptor only while none of its SGPRs has subsequently
@@ -1434,11 +1447,20 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         in.src[0].kind == OperandKind::SGPR && valid_reg(in.src[0].value) &&
                         val_srt_key_known.test((size_t)in.src[0].value) &&
                         (source_key = val_srt_key[(size_t)in.src[0].value], true);
+                    uint32_t source_origin = 0;
+                    const bool source_origin_known =
+                        in.src[0].kind == OperandKind::SGPR && valid_reg(in.src[0].value) &&
+                        val_seed_origin_known.test((size_t)in.src[0].value) &&
+                        (source_origin = val_seed_origin[(size_t)in.src[0].value], true);
                     if (in.src[0].kind == OperandKind::Literal ? (v = in.literal, true) : srcval(in.src[0], v)) {
                         set_value(in.dst.value, v);
                         if (source_key_known && valid_reg(in.dst.value)) {
                             val_srt_key[(size_t)in.dst.value] = source_key;
                             val_srt_key_known.set((size_t)in.dst.value);
+                        }
+                        if (source_origin_known && valid_reg(in.dst.value)) {
+                            val_seed_origin[(size_t)in.dst.value] = source_origin;
+                            val_seed_origin_known.set((size_t)in.dst.value);
                         }
                     } else forget(in.dst.value);
                 } else if (in.dst.kind == OperandKind::SGPR) {
@@ -1772,7 +1794,20 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         current_known &= known(srsrc + k, current[(size_t)k]);
                     const bool loaded_provenance = valid_reg(srsrc) &&
                                                    descr_known.test((size_t)srsrc);
-                    const bool direct_provenance = unchanged_seed_range(srsrc, 4);
+                    bool moved_direct_provenance = valid_reg(srsrc) && valid_reg(srsrc + 3);
+                    uint32_t first_origin = 0;
+                    for (int k = 0; k < 4 && moved_direct_provenance; ++k) {
+                        const size_t reg = (size_t)(srsrc + k);
+                        if (!val_seed_origin_known.test(reg)) {
+                            moved_direct_provenance = false;
+                        } else if (k == 0) {
+                            first_origin = val_seed_origin[reg];
+                        } else if (val_seed_origin[reg] != first_origin + (uint32_t)k) {
+                            moved_direct_provenance = false;
+                        }
+                    }
+                    const bool direct_provenance = unchanged_seed_range(srsrc, 4) ||
+                                                   moved_direct_provenance;
                     if (current_known && (loaded_provenance || direct_provenance)) {
                         // Publish the four values LIVE at the consumer. A modeled scalar patch is
                         // exact; an unmodeled/incompatible write becomes unknown and fails closed

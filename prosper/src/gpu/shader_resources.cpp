@@ -209,6 +209,17 @@ enum : uint32_t {
     OpStore = 62,
     OpAccessChain = 65,
     OpInBoundsAccessChain = 66,
+    OpAtomicLoad = 227,
+    OpAtomicStore = 228,
+    OpAtomicExchange = 229,
+    OpAtomicCompareExchange = 230,
+    OpAtomicCompareExchangeWeak = 231,
+    OpAtomicIIncrement = 232,
+    OpAtomicIDecrement = 233,
+    OpAtomicIAdd = 234,
+    OpAtomicXor = 242,
+    OpAtomicFlagTestAndSet = 318,
+    OpAtomicFlagClear = 319,
     OpDecorate = 71,
     OpMemberDecorate = 72,
 };
@@ -475,6 +486,17 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
             uint32_t ptr = word(in, 2); mark(ptr);
             auto ai = accesses.find(ptr); if (ai != accesses.end()) mark(ai->second.variable);
         } else if (in.opcode == OpStore && n >= 1) {
+            uint32_t ptr = word(in, 0); mark(ptr);
+            auto ai = accesses.find(ptr); if (ai != accesses.end()) mark(ai->second.variable);
+        } else if (((in.opcode >= OpAtomicLoad && in.opcode <= OpAtomicIDecrement) ||
+                    (in.opcode >= OpAtomicIAdd && in.opcode <= OpAtomicXor) ||
+                    in.opcode == OpAtomicFlagTestAndSet) && n >= 3) {
+            // Result-producing atomic instructions place their pointer after result type/result id.
+            // A write-only atomic buffer is still part of the live descriptor interface.
+            uint32_t ptr = word(in, 2); mark(ptr);
+            auto ai = accesses.find(ptr); if (ai != accesses.end()) mark(ai->second.variable);
+        } else if ((in.opcode == OpAtomicStore || in.opcode == OpAtomicFlagClear) && n >= 1) {
+            // The two result-less atomic instructions place the pointer first, like OpStore.
             uint32_t ptr = word(in, 0); mark(ptr);
             auto ai = accesses.find(ptr); if (ai != accesses.end()) mark(ai->second.variable);
         } else if ((in.opcode == OpAccessChain || in.opcode == OpInBoundsAccessChain) && n >= 3) {
