@@ -2004,20 +2004,16 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
         // [+0x10] bytes transferred.
         *(uint64_t*)(uintptr_t)(a2 + 0x00) = in_dst ? a4 : (uint64_t)(uintptr_t)slot;
         *(uint64_t*)(uintptr_t)(a2 + 0x08) = 0;
-        // The bytes-transferred qword at a2+0x10 completes a 3-qword record (Evergate reads it),
-        // but only publish it when a2 points at a DEDICATED record. Terminator 2D (Unity IL2CPP,
-        // PPSA25872) passes a2 = req+0x20, so a2+0x10 == req+0x30 — a LIVE pointer the guest still
-        // uses. A live capture proved the overrun: read id=7 (sharedassets0.assets, size 9612 =
-        // 0x258c) clobbered that pointer with 0x258c; the guest later freed 0x258c, and the next pop
-        // of that lock-free size-class-2 freelist dereferenced 0x258c and SIGSEGV'd (eboot+0x7c4a39).
-        // The request object is 9 qwords (req+0x00..+0x40, dumped by APR_DIAG), so a2+0x10 landing in
-        // [req, req+0x48) means the record overlaps the request and the byte count would corrupt a
-        // request field. Skip it there; a dedicated record (Evergate, UE4) still gets it. CONFIDENCE:
-        // HIGH (live A/B on Terminator: skipping this write advances from an immediate allocator
-        // crash to a rendering frame loop; the Evergate completion contract test is preserved).
-        uint64_t xfer_slot = a2 + 0x10;
-        if (xfer_slot < a0 || xfer_slot >= a0 + 0x48)
-            *(uint64_t*)(uintptr_t)(xfer_slot) = size;
+        // The bytes-transferred qword at a2+0x10 completes a 3-qword record (Evergate reads it).
+        // Terminator 2D (Unity IL2CPP, PPSA25872) instead passes the exact observed alternate shape
+        // a2 = req+0x20, where a2+0x10 == req+0x30 is a LIVE pointer the guest still uses. A live
+        // capture proved that writing read id=7's size (9612 = 0x258c) there led the guest to free
+        // 0x258c and later fault while popping that corrupted allocator freelist (eboot+0x7c4a39).
+        // Skip only that proven shape: the size and meaning of other request layouts are unknown,
+        // so mere address overlap is not evidence that a caller-supplied output slot is invalid.
+        // CONFIDENCE: HIGH for the exact Terminator shape (live A/B advances to the frame loop).
+        if (a2 != a0 + 0x20)
+            *(uint64_t*)(uintptr_t)(a2 + 0x10) = size;
     }
     if (!ok || in_dst) {
         munmap(slot, rounded);   // failure: record stays -> guest reports it; success-into-dst: staging no longer needed
@@ -2052,11 +2048,9 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
     if (a2) {
         *(uint64_t*)(uintptr_t)(a2 + 0x00) = in_dst ? a4 : (uint64_t)(uintptr_t)slot;
         *(uint64_t*)(uintptr_t)(a2 + 0x08) = 0;
-        // Bytes-transferred only when a2 is a dedicated record, not overlapping the request object
-        // (see the Linux path above — it overran Terminator's live req+0x30 pointer).
-        uint64_t xfer_slot = a2 + 0x10;
-        if (xfer_slot < a0 || xfer_slot >= a0 + 0x48)
-            *(uint64_t*)(uintptr_t)(xfer_slot) = size;
+        // Match the exact Terminator alternate record shape described in the Linux path above.
+        if (a2 != a0 + 0x20)
+            *(uint64_t*)(uintptr_t)(a2 + 0x10) = size;
     }
     if (in_dst) ::free(slot);
     if (filelog()) fprintf(stderr,

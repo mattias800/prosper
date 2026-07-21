@@ -116,8 +116,8 @@ int main() {
     // req+0x30, a LIVE guest pointer the engine still uses. A live capture proved the bytes-
     // transferred write clobbered it with the file size (9612 = 0x258c); the guest later freed
     // 0x258c, and the next pop of that lock-free allocator freelist dereferenced 0x258c and SIGSEGV'd.
-    // The handler must NOT publish the byte count when its slot overlaps the request object.
-    std::array<uint8_t, 0x48> req_overlap{};
+    // The handler must NOT publish the byte count for this exact alternate record shape.
+    alignas(uint64_t) std::array<uint8_t, 0x48> req_overlap{};
     const uint64_t live_ptr = 0x2010216e00ull;                 // the guest's live req+0x30 pointer
     std::memcpy(req_overlap.data() + 0x30, &live_ptr, 8);
     uint64_t* record = reinterpret_cast<uint64_t*>(req_overlap.data() + 0x20);  // a2 == req+0x20
@@ -135,6 +135,21 @@ int main() {
           "bytes-transferred write does not clobber the live req+0x30 pointer (Terminator 2D)");
     CHECK(record[0] == (uint64_t)(uintptr_t)overlap_dst.data() && record[1] == 0,
           "overlapping record still publishes destination + success");
+
+    // Do not generalize the live observation into a guessed request-object extent. A caller may
+    // place an ordinary three-qword completion record at another address within the storage it
+    // passes as a0; a2 remains the authority for that output record.
+    std::array<uint64_t, 9> embedded_request{};
+    uint64_t* embedded_record = embedded_request.data();
+    std::array<uint8_t, read_size> embedded_dst{};
+    uint64_t embedded_result = read_file && stub_error.empty()
+        ? read_file_guest((uint64_t)(uintptr_t)embedded_request.data(), 0,
+                          (uint64_t)(uintptr_t)embedded_record, overlap_id,
+                          (uint64_t)(uintptr_t)embedded_dst.data(), embedded_dst.size(),
+                          read_offset, 0, 0)
+        : ~uint64_t{0};
+    CHECK(embedded_result == 0 && embedded_record[2] == read_size,
+          "ordinary embedded completion record still publishes byte count");
 
     std::remove(fixture_path);
     prosper_apr_reset_for_test();
