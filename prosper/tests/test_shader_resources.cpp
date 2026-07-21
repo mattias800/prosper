@@ -41,6 +41,14 @@ static std::vector<uint32_t> descriptor_test_spirv() {
     return s;
 }
 
+static std::vector<uint32_t> atomic_descriptor_test_spirv() {
+    std::vector<uint32_t> s = descriptor_test_spirv();
+    // %12 points at binding 10. AtomicAnd is result-producing, so its pointer is operand 2 after
+    // result type/result id. The descriptor is write-only and must still be reflected for binding.
+    emit(s, 240, {1, 13, 12, 6, 6, 6});                    // %13 = atomicAnd %12
+    return s;
+}
+
 static std::vector<uint32_t> image_test_spirv() {
     std::vector<uint32_t> s = {0x07230203u, 0x00010000u, 0, 16, 0};
     emit(s, 15, {4, 10, 0x6e69616d, 0});                    // OpEntryPoint Fragment %10 "main"
@@ -188,6 +196,14 @@ int main() {
           vr.descriptors[0].kind == SpirvDescriptorKind::StorageBuffer &&
           vr.descriptors[0].required_bytes == 20 && !vr.descriptors[0].dynamic_access,
           "constant access chain reflects storage-buffer binding 9 with a 20-byte minimum");
+
+    ShaderResource atomic = good; atomic.binding = 10;
+    ShaderResourceTable atomic_table; atomic_table.resources = {good, atomic};
+    const DescriptorValidationReport atomic_report = validate_spirv_descriptor_interface(
+        atomic_descriptor_test_spirv(), &atomic_table, 0, SpirvShaderStage::Vertex);
+    CHECK(atomic_report.ok() && atomic_report.descriptors.size() == 2 &&
+              atomic_report.descriptors[1].binding == 10,
+          "write-only atomic access reflects its storage-buffer descriptor");
 
     ShaderResourceTable missing;
     auto mr = validate_spirv_descriptor_interface(spv, &missing, 0, SpirvShaderStage::Vertex);
