@@ -1407,6 +1407,33 @@ int main() {
     CHECK(got32b4.size()==1 && std::fabs(got32b4[0]-28.0f)<1e-3f,
           "kernel 32b4 wide LDS reads/writes preserve all three/four consecutive dwords");
 
+    // Terminator 2D's startup clear writes a device-global GDS dword. Compute GDS must use the
+    // backend-owned persistent buffer, not the per-workgroup LDS array.
+    const uint32_t compute_gds_write[] = {
+        0xd8360000u, 0x00000100u,  // ds_write_b32 v0, v1 gds
+        0xbf810000u,
+    };
+    ShaderResourceTable compute_gds_table;
+    ShaderResource compute_gds_resource;
+    compute_gds_resource.cls = ResourceClass::ConstantBuffer;
+    compute_gds_resource.format = DataFormat::Uint32;
+    compute_gds_resource.num_components = 1;
+    compute_gds_resource.binding = kComputeInternalGdsBinding;
+    compute_gds_resource.size = 64 * 1024;
+    compute_gds_resource.stride = 4;
+    std::array<uint8_t, 64 * 1024> compute_gds_backing{};
+    compute_gds_resource.host_data = compute_gds_backing.data();
+    compute_gds_resource.host_data_size = compute_gds_backing.size();
+    compute_gds_table.resources.push_back(compute_gds_resource);
+    ComputeShaderConfig compute_gds_config;
+    std::vector<uint32_t> compute_gds_spv = recompile_compute(
+        compute_gds_write, std::size(compute_gds_write), &compute_gds_table,
+        compute_gds_config);
+    CHECK(!compute_gds_spv.empty(), "compute GDS ds_write_b32 recompiles to SPIR-V");
+    CHECK(validate_spirv_descriptor_interface(
+              compute_gds_spv, &compute_gds_table, 0, SpirvShaderStage::Compute, false).ok(),
+          "compute GDS module binds the persistent backend-owned buffer");
+
     // Kernel 32b5: Astro's exact DS_APPEND word. Initialize the LDS counter to 10, narrow EXEC to
     // the first 32 lanes, then append. Hardware performs one atomic +32 and broadcasts old=10 only
     // to active lanes; inactive lanes preserve their old v8=99. Reading the new counter (42) makes

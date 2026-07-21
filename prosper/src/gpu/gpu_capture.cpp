@@ -8,6 +8,7 @@
 
 #include "bc_decode.hpp"
 #include "rdna2_decode.hpp"
+#include "rdna2_to_spirv.hpp"
 #include "tile.hpp"
 
 #include <algorithm>
@@ -37,7 +38,7 @@ namespace prosper::gpu {
 namespace {
 
 constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
-constexpr uint32_t kVersion = 21;
+constexpr uint32_t kVersion = 22;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -369,6 +370,11 @@ struct Interval {
     uint32_t blob_index = 0xFFFFFFFFu;
 };
 
+bool is_compute_internal_gds(const ShaderResource& r) {
+    return r.binding == kComputeInternalGdsBinding && r.gpu_addr == 0 &&
+           r.cls == ResourceClass::ConstantBuffer && r.size == 64u * 1024u && r.stride == 4;
+}
+
 bool collect_intervals(const std::vector<DrawItem>& draws,
                        const std::vector<ComputeItem>& computes,
                        const std::vector<GpuState::DmaCopy>& dma_copies,
@@ -378,6 +384,7 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
     auto add_table = [&](const ShaderResourceTable* t) -> bool {
         if (!t) return true;
         for (const auto& r : t->resources) {
+            if (is_compute_internal_gds(r)) continue;
             uint64_t n = resource_footprint(r);
             if (n) {
                 if (n > kMaxBlobBytes || r.gpu_addr > std::numeric_limits<uint64_t>::max() - n) {
@@ -455,7 +462,13 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
         c.metadata_size = dcc_metadata_footprint(r);
         c.resource.dcc_metadata_size = c.metadata_size;
         uint64_t n = resource_footprint(r);
-        if (n && include_resource_data &&
+        if (is_compute_internal_gds(r) && include_resource_data) {
+            if (!r.host_data || r.host_data_size < n) {
+                error = "compute GDS resource has no complete host backing";
+                return false;
+            }
+            c.internal_bytes.assign(r.host_data, r.host_data + n);
+        } else if (n && include_resource_data &&
             !assign_blob_range(intervals, r.gpu_addr, n, c.blob_index, c.blob_offset,
                                "resource was not assigned to a capture blob", error)) return false;
         if (c.metadata_size && include_resource_data &&
@@ -1462,6 +1475,26 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
     for (const auto& diagnostic : c.failure_diagnostics)
         if (diagnostic.pipeline_present) write_logic_op_pipeline(w, diagnostic.pipeline);
+    // v22 explicitly captures host-backed compute GDS state. Unlike guest-addressed resources,
+    // this state has no valid capture interval; one shared replay instance preserves dispatch order.
+    w.u32(static_cast<uint32_t>(resource_depth_count));
+    auto write_internal_state = [&](const GpuCapturedTable& table) {
+        for (const auto& captured : table.resources) {
+            const bool internal = is_compute_internal_gds(captured.resource);
+            if ((!internal && !captured.internal_bytes.empty()) ||
+                (internal && !captured.internal_bytes.empty() &&
+                 captured.internal_bytes.size() != resource_footprint(captured.resource))) {
+                error = "invalid compute GDS capture state";
+                return false;
+            }
+            w.bytes(captured.internal_bytes);
+        }
+        return true;
+    };
+    for (const auto& draw : c.draws)
+        if (!write_internal_state(draw.vrt) || !write_internal_state(draw.prt)) return false;
+    for (const auto& compute : c.computes)
+        if (!write_internal_state(compute.resources)) return false;
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -1977,6 +2010,35 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             if (diagnostic.pipeline_present && !read_logic_op_pipeline(r, diagnostic.pipeline))
                 return false;
     }
+    if (version >= 22) {
+        uint64_t expected_states = 0;
+        for (const auto& draw : c.draws)
+            expected_states += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes)
+            expected_states += compute.resources.resources.size();
+        uint32_t state_count = 0;
+        if (!r.u32(state_count) || state_count != expected_states) {
+            error = "invalid compute GDS state count";
+            return false;
+        }
+        auto read_internal_state = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources) {
+                if (!r.bytes(captured.internal_bytes)) return false;
+                const bool internal = is_compute_internal_gds(captured.resource);
+                if ((!internal && !captured.internal_bytes.empty()) ||
+                    (internal && !captured.internal_bytes.empty() &&
+                     captured.internal_bytes.size() != resource_footprint(captured.resource))) {
+                    error = "invalid compute GDS capture state";
+                    return false;
+                }
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_internal_state(draw.vrt) || !read_internal_state(draw.prt)) return false;
+        for (auto& compute : c.computes)
+            if (!read_internal_state(compute.resources)) return false;
+    }
     if (version >= 7 && !validate_failure_diagnostics(c, error)) return false;
     if (r.left) { error = "capture has trailing data"; return false; }
     return true;
@@ -2000,6 +2062,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
     resource_reference_count += c.dma_copies.size() * 2;
     out.resource_instances.reserve(resource_reference_count * 2);
     std::map<std::pair<uint32_t, uint64_t>, size_t> instance_by_version_and_base;
+    std::map<uint32_t, size_t> internal_instance_by_binding;
     auto bind_range = [&](uint32_t blob_index, uint64_t blob_offset, uint64_t guest_addr,
                           uint64_t need, uint8_t*& host_data, uint64_t& host_data_size,
                           const char* invalid_error, const char* exceeds_error,
@@ -2029,12 +2092,24 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
             r.dcc_metadata_size = x.metadata_size;
             r.dcc_metadata_host_data = nullptr;
             r.dcc_metadata_host_data_size = 0;
-            if (!bind_range(x.blob_index, x.blob_offset, r.gpu_addr, resource_footprint(r),
+            if (!x.internal_bytes.empty()) {
+                auto [it, inserted] = internal_instance_by_binding.emplace(
+                    r.binding, out.resource_instances.size());
+                if (inserted)
+                    out.resource_instances.push_back({0, 0xFFFFFFFFu, x.internal_bytes});
+                auto& instance = out.resource_instances[it->second].bytes;
+                if (!inserted && instance != x.internal_bytes) {
+                    error = "compute GDS resources disagree on initial state";
+                    return false;
+                }
+                r.host_data = instance.data();
+                r.host_data_size = instance.size();
+            } else if (!bind_range(x.blob_index, x.blob_offset, r.gpu_addr, resource_footprint(r),
                             r.host_data, r.host_data_size,
                             "resource references an invalid capture blob",
                             "resource footprint exceeds capture blob",
-                            "resource blob offset exceeds its logical address") ||
-                !bind_range(x.metadata_blob_index, x.metadata_blob_offset, r.metadata_addr,
+                            "resource blob offset exceeds its logical address")) return false;
+            if (!bind_range(x.metadata_blob_index, x.metadata_blob_offset, r.metadata_addr,
                             x.metadata_size, r.dcc_metadata_host_data,
                             r.dcc_metadata_host_data_size,
                             "resource DCC metadata references an invalid capture blob",
