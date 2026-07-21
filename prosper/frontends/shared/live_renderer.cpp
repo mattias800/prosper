@@ -2048,10 +2048,25 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             // DrawItem with its own resources + fixed-function state (or the diagnostic overrides above).
             // build_R reads the CURRENT g_rtt, so calling this AFTER an earlier target-group has been
             // rendered+stored lets the later group sample that group's pixels (a HIT, not empty memory).
+            // PROSPER_SKIP_DRAW="N[,N...]" (diagnostic): drop these semantic draw_index values from
+            // every pass — isolate whether a specific draw (e.g. a suspected opaque UI backdrop that
+            // hides the composited world) is what corrupts the frame, without touching any state.
+            static const char* skip_draws_env = getenv("PROSPER_SKIP_DRAW");
+            auto draw_is_skipped = [](uint64_t idx) -> bool {
+                if (!skip_draws_env) return false;
+                for (const char* s = skip_draws_env; *s;) {
+                    char* end = nullptr; unsigned long long v = strtoull(s, &end, 0);
+                    if (end != s && v == idx) return true;
+                    s = (end && *end) ? end + 1 : end;
+                    if (!s || !*s) break;
+                }
+                return false;
+            };
             auto build_bds = [&](const std::vector<const prosper::gpu::DrawItem*>& group) {
                 std::vector<prosper::test::BackendDraw> bds;
                 for (const auto* itp : group) {
                     const auto& it = *itp;
+                    if (draw_is_skipped(it.draw_index)) continue;
                     prosper::test::BackendDraw bd;
                     if (refvs) {
                         bd.vs = refvs_spv;
