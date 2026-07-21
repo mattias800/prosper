@@ -370,7 +370,9 @@ struct BoundImage {
     // import time must be released.
     bool imported = false;
     bool seed_skip = false;             // #1122: write-only full-coverage storage image; no seed needed
-    bool poison_verify = false;         // #1122: PROSPER_VERIFY_SEED_SKIP -- seed poison, prove full coverage
+    bool poison_verify = false;         // #1122: proving frame -- seed poison, prove full coverage
+    std::vector<uint8_t> seed_linear;   // #1122: detiled guest seed, kept on a proving frame so any
+                                        // texel the write leaves untouched is restored (not corrupted)
     uint64_t imported_addr = 0;
     uint32_t imported_saved_layout = 0;      // VkImageLayout the renderer left the image in
     // Several bindings can borrow the SAME renderer image without being folded together, because
@@ -675,6 +677,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     double pack_ms = 0.0;
     double layout_ms = 0.0;
     const bool trace = trace_compute_item(item);
+    // #1122 review B1: covers_extent (dispatch grid >= image extent) is NECESSARY but NOT SUFFICIENT
+    // for skipping the seed. A write-only shader can store a subset of its grid (a masked composite:
+    // `if (mask) imageStore(...)`, or a scatter store), covering the grid yet leaving untouched texels
+    // undefined. Skipping the seed there would pack reused-pool garbage to the guest -- silent
+    // corruption. So prove full coverage ONCE per (shader, output binding): seed the image with poison,
+    // confirm the write overwrites every texel (0 poison survives), cache the verdict, and only then
+    // fast-skip. The proving frame itself stays correct -- untouched texels are restored from the
+    // seed (see the poison_verify writeback path). Keyed on (code_addr, binding): coverage is a
+    // property of the shader's store pattern, invariant across dispatch extent given covers_extent.
+    enum class SeedCoverage : uint8_t { Full, Partial };
+    static std::mutex seed_coverage_mu;
+    static std::unordered_map<uint64_t, SeedCoverage> seed_coverage_proof;
     // #1122: a compute post-process that only image_stores its output (no image_load) never reads the
     // seed, so materializing the renderer RTT's prior pixels into it is wasted. Detect it cheaply: an
     // OpImageRead-free SPIR-V reads no storage image at all. Combined with full dispatch coverage of
@@ -985,27 +999,47 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
             }
             // #1122: skip the seed entirely for a write-only storage image whose dispatch fully
-            // covers the target (every texel is image_stored, so the prior content is never observed
-            // -- not by the shader, and not by the writeback, which packs only written texels). One
-            // thread per texel with global size >= extent is the standard full-screen post-process
-            // pattern; require it per dimension so a partially-covered write still seeds correctly.
+            // covers the target -- BUT only after proving (once per shader) that the write actually
+            // stores every texel (see the SeedCoverage cache above). One thread per texel with global
+            // size >= extent is a NECESSARY condition (a partially-covered grid always seeds); the
+            // proving frame establishes it is also sufficient for this specific shader.
             const bool covers_extent =
                 item.launch.threads_x >= r->width && item.launch.threads_y >= r->height &&
                 item.launch.threads_z >= r->depth;
-            static const bool verify_seed_skip = std::getenv("PROSPER_VERIFY_SEED_SKIP") != nullptr;
-            if (bi.storage && shader_reads_no_image && covers_extent && verify_seed_skip) {
-                // Prove coverage instead of skipping: seed the image with poison and confirm the
-                // write-only shader overwrites every texel (no poison survives in the result).
-                bi.poison_verify = true;
-            } else if (bi.storage && shader_reads_no_image && covers_extent) {
-                bi.seed_skip = true;   // guest-backed OR renderer-owned: a fully-covered write ignores the seed
-                if (trace)
-                    std::fprintf(stderr,
-                                 "[compute]   seed-skip write-only storage binding=%u addr=0x%llx "
-                                 "extent=%ux%u threads=%ux%ux%u renderer_owned=%d\n",
-                                 bi.binding, (unsigned long long)r->gpu_addr, r->width, r->height,
-                                 item.launch.threads_x, item.launch.threads_y, item.launch.threads_z,
-                                 renderer_owned ? 1 : 0);
+            // Diagnostic: force the proving (poison) path on every eligible dispatch, never fast-skip.
+            static const bool force_verify = std::getenv("PROSPER_VERIFY_SEED_SKIP") != nullptr;
+            if (bi.storage && shader_reads_no_image && covers_extent) {
+                const uint64_t proof_key = item.code_addr * 1000003ull + bi.binding;
+                bool proven_full = false, known = false;
+                {
+                    std::lock_guard<std::mutex> lk(seed_coverage_mu);
+                    auto it = seed_coverage_proof.find(proof_key);
+                    if (it != seed_coverage_proof.end()) {
+                        known = true;
+                        proven_full = it->second == SeedCoverage::Full;
+                    }
+                }
+                if (force_verify) {
+                    bi.poison_verify = true;    // always re-prove; the writeback caches the verdict
+                } else if (proven_full) {
+                    bi.seed_skip = true;        // proven: every texel is written, the seed is unobserved
+                    if (trace)
+                        std::fprintf(stderr,
+                                     "[compute]   seed-skip write-only storage binding=%u addr=0x%llx "
+                                     "extent=%ux%u threads=%ux%ux%u renderer_owned=%d\n",
+                                     bi.binding, (unsigned long long)r->gpu_addr, r->width, r->height,
+                                     item.launch.threads_x, item.launch.threads_y, item.launch.threads_z,
+                                     renderer_owned ? 1 : 0);
+                } else if (!known) {
+                    bi.poison_verify = true;    // unknown: prove coverage this frame (still correct)
+                    if (trace)
+                        std::fprintf(stderr,
+                                     "[compute]   seed-skip PROVING coverage binding=%u addr=0x%llx "
+                                     "code=0x%llx extent=%ux%u\n",
+                                     bi.binding, (unsigned long long)r->gpu_addr,
+                                     (unsigned long long)item.code_addr, r->width, r->height);
+                }
+                // Proven Partial: fall through, seed normally every frame.
             }
             if (renderer_owned && !bi.imported && !bi.seed_skip) {
                 if (dim_3d || r->depth != 1 ||
@@ -1183,7 +1217,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 bi.guest_bytes = guest_bytes;
                 const uint8_t* src = (renderer_owned || bi.seed_skip)
                     ? nullptr : resource_bytes_for(r, guest_bytes);
-                const bool readable = renderer_owned || bi.seed_skip ||
+                // The writeback still writes up to guest_bytes at r->gpu_addr, so a guest-backed
+                // target must be a valid mapped range even when the SEED read is skipped (#1122
+                // review B2): keep the guard for the writeback target, not the seed source.
+                const bool readable = renderer_owned ||
                                       (r->host_data && r->host_data_size >= guest_bytes) ||
                                       guest_readable(r->gpu_addr, static_cast<uint32_t>(guest_bytes));
                 if (!readable) { skip_image(r, "storage backing unreadable"); break; }
@@ -1228,6 +1265,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     storage_unpack_range(linear.data(), guest_texel, r->format, nc, texels,
                                          reinterpret_cast<uint32_t*>(upload.data()));
                 if (bi.poison_verify) {   // #1122 coverage proof: poison every uvec4 channel
+                    // Keep the clean detiled guest seed: on a partial-coverage proving frame the
+                    // writeback restores every un-stored (still-poison) texel from it, so proving
+                    // never corrupts the guest -- only the GPU `upload` is poisoned, `linear` is not.
+                    bi.seed_linear = linear;
                     uint32_t* pp = reinterpret_cast<uint32_t*>(upload.data());
                     for (size_t t = 0; t < texels * 4; ++t) pp[t] = 0xDEADBEEFu;
                 }
@@ -1518,7 +1559,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
 
             // Device-local image.
-            const auto img_t1 = ComputeClock::now();
             VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
             ici.imageType = dim_1d ? VK_IMAGE_TYPE_1D : (dim_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D);
             const bool sampled_r11g11b10 = !bi.storage &&
@@ -1970,17 +2010,29 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const size_t texels = (size_t)r->width * r->height * r->depth;
             std::vector<uint8_t> linear(texels * guest_texel, 0);
             const uint32_t* channels = static_cast<const uint32_t*>(mapped);
+            // #1122 proving-frame poison scan: a texel still fully poison was NOT stored by the write.
+            // Zero survivors == the shader covers every texel (safe to fast-skip its seed henceforth);
+            // any survivor == partial coverage (must always seed). Cache the verdict per (code,binding)
+            // and, for a partial write, restore the un-stored texels from the clean seed after packing.
+            std::vector<uint8_t> poison_texel;   // 1 == this texel survived as poison (untouched)
             if (bi.poison_verify) {
                 size_t survived = 0;
+                poison_texel.assign(texels, 0);
                 for (size_t t = 0; t < texels; ++t) {
                     bool all = true;
                     for (uint32_t c = 0; c < 4; ++c) if (channels[t * 4 + c] != 0xDEADBEEFu) all = false;
-                    if (all) ++survived;
+                    if (all) { ++survived; poison_texel[t] = 1; }
+                }
+                {
+                    const uint64_t proof_key = item.code_addr * 1000003ull + bi.binding;
+                    std::lock_guard<std::mutex> lk(seed_coverage_mu);
+                    seed_coverage_proof[proof_key] =
+                        survived ? SeedCoverage::Partial : SeedCoverage::Full;
                 }
                 std::fprintf(stderr,
                              "[seed-skip-verify] code=0x%llx binding=%u texels=%zu poison_survived=%zu %s\n",
                              (unsigned long long)item.code_addr, bi.binding, texels, survived,
-                             survived ? "PARTIAL-COVERAGE-UNSAFE" : "full-coverage-ok");
+                             survived ? "PARTIAL-COVERAGE (will always seed)" : "full-coverage (seed-skip proven)");
             }
             if (trace) {
                 for (size_t t = 0; t < texels; t++)
@@ -1995,6 +2047,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 for (size_t t = 0; t < texels; t++)
                     storage_pack_texel(channels + t * 4, r->format, nc,
                                        linear.data() + t * guest_texel);
+            }
+            // #1122: a proving frame that turned out partial-coverage packed poison garbage into the
+            // un-stored texels. Restore each from the clean seed so the guest keeps its real prior
+            // content (exactly a partial write's contract). Full-coverage proving frames have no
+            // survivors, so this is a no-op there. bi.seed_linear shares this row-major texel layout.
+            if (bi.poison_verify && !poison_texel.empty() &&
+                bi.seed_linear.size() == linear.size()) {
+                for (size_t t = 0; t < texels; ++t) {
+                    if (poison_texel[t])
+                        std::memcpy(linear.data() + t * guest_texel,
+                                    bi.seed_linear.data() + t * guest_texel, guest_texel);
+                }
             }
             const auto pack_done = ComputeClock::now();
             static const bool verify_pack = std::getenv("PROSPER_VERIFY_PACK") != nullptr;
