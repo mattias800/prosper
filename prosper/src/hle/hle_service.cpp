@@ -637,7 +637,7 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
             AvpPlayer& p = it->second;
             p.guest_path = guest_path;
             p.have_source = true; p.synthetic = synthetic;
-            p.poll = 0; p.audio_poll = 0; p.active_poll = 0; p.paused = false; p.stop_fired = false;
+            p.poll = 0; p.audio_poll = 0; p.active_poll = 0; p.last_ts_ms = 0; p.paused = false; p.stop_fired = false;
             p.texture_frames = std::move(textures);
             p.texture_frame_bytes = texture_bytes;
             p.next_texture_frame = 0;
@@ -1900,18 +1900,21 @@ HLE(s_npuds_ok)     { return 0; }
 //  * Dead Cells: CreateEvent(name?, reserved, Event** a2, PropertyObject** a3) — a2 AND a3 are
 //    out-pointers.
 //  * Alex Kidd DX (PPSA02664, svc dump): CreateEvent(name a0="activityTerminate", ctx a1,
-//    Event** a2, 0, PropertyObject** a4, 0) — outs are a2 and a4, a3 is literal 0. The old
-//    a3-must-be-a-pointer guard returned NP-invalid-argument here, and the title retried every
-//    frame forever — holding its cutscene->gameplay transition on a black screen (#320).
-// Accept both: a2 is always the event out; the property out is a3 when pointer-like, else a4 in
-// the a3==0 shape. Never write through a possibly-garbage register that merely looks like a
-// pointer outside these two proven shapes. CONFIDENCE: LOW (guarded, observed-shape-only).
+//    Event** a2, 0, PropertyObject** a4, 0) — outs are a2 and a4, a3 is literal 0, a5 literal 0.
+//    The old a3-must-be-a-pointer guard returned NP-invalid-argument here, and the title retried
+//    every frame forever — holding its cutscene->gameplay transition on a black screen (#320).
+// Accept both: a2 is always the event out; the property out is a3 when pointer-like. The a4 form is
+// admitted ONLY for Alex Kidd's exact trailing shape (a3==0 AND a5==0) — svc_ptrish is a wide range
+// check that cannot by itself tell a real out-pointer from leftover-register garbage, so requiring
+// both trailing reserved words to be zero pins the write to the observed 6-arg layout. A different
+// title that legitimately passes a3==0 with a non-zero/garbage a5 hits neither property write and
+// still returns success (0), which is what actually stops the retry loop. CONFIDENCE: LOW.
 HLE(s_npuds_create_event) {
     svc_log("sceNpUniversalDataSystemCreateEvent", a0,a1,a2,a3,a4,a5);
     if (!svc_ptrish(a2)) return 0x80550003ull; // NP invalid argument
     *(uint64_t*)PW(a2) = g_handle.fetch_add(1);
-    if (svc_ptrish(a3))                     *(uint64_t*)PW(a3) = g_handle.fetch_add(1);
-    else if (a3 == 0 && svc_ptrish(a4))     *(uint64_t*)PW(a4) = g_handle.fetch_add(1);
+    if (svc_ptrish(a3))                                *(uint64_t*)PW(a3) = g_handle.fetch_add(1);
+    else if (a3 == 0 && a5 == 0 && svc_ptrish(a4))     *(uint64_t*)PW(a4) = g_handle.fetch_add(1);
     return 0;
 }
 HLE(s_npuds_post_event) {
