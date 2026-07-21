@@ -159,6 +159,17 @@ int main() {
     CHECK(padded_lanes_untouched,
           "partial workgroup suppresses all 62 padded invocations without a guest bounds check");
 
+    uint32_t unchanged_write_notifications = 0;
+    set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+        if (addr == buffer.gpu_addr && size == buffer.size)
+            unchanged_write_notifications++;
+    });
+    CHECK(prosper::frontend::execute_live_compute_items({item}),
+          "production live backend repeats an idempotent buffer dispatch");
+    set_guest_gpu_write_observer({});
+    CHECK(unchanged_write_notifications == 1,
+          "idempotent compute writes still invalidate divergent renderer-resident state");
+
     std::fill(result.begin(), result.end(), 0xeeeeeeee);
     item.user_sgprs = alternate_config.user_sgprs;
     CHECK(prosper::frontend::execute_live_compute_items({item}),

@@ -2230,7 +2230,16 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
         // [+0x10] bytes transferred.
         *(uint64_t*)(uintptr_t)(a2 + 0x00) = in_dst ? a4 : (uint64_t)(uintptr_t)slot;
         *(uint64_t*)(uintptr_t)(a2 + 0x08) = 0;
-        *(uint64_t*)(uintptr_t)(a2 + 0x10) = size;
+        // The bytes-transferred qword at a2+0x10 completes a 3-qword record (Evergate reads it).
+        // Terminator 2D (Unity IL2CPP, PPSA25872) instead passes the exact observed alternate shape
+        // a2 = req+0x20, where a2+0x10 == req+0x30 is a LIVE pointer the guest still uses. A live
+        // capture proved that writing read id=7's size (9612 = 0x258c) there led the guest to free
+        // 0x258c and later fault while popping that corrupted allocator freelist (eboot+0x7c4a39).
+        // Skip only that proven shape: the size and meaning of other request layouts are unknown,
+        // so mere address overlap is not evidence that a caller-supplied output slot is invalid.
+        // CONFIDENCE: HIGH for the exact Terminator shape (live A/B advances to the frame loop).
+        if (a2 != a0 + 0x20)
+            *(uint64_t*)(uintptr_t)(a2 + 0x10) = size;
     }
     if (!ok || in_dst) {
         munmap(slot, rounded);   // failure: record stays -> guest reports it; success-into-dst: staging no longer needed
@@ -2265,7 +2274,9 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
     if (a2) {
         *(uint64_t*)(uintptr_t)(a2 + 0x00) = in_dst ? a4 : (uint64_t)(uintptr_t)slot;
         *(uint64_t*)(uintptr_t)(a2 + 0x08) = 0;
-        *(uint64_t*)(uintptr_t)(a2 + 0x10) = size;
+        // Match the exact Terminator alternate record shape described in the Linux path above.
+        if (a2 != a0 + 0x20)
+            *(uint64_t*)(uintptr_t)(a2 + 0x10) = size;
     }
     if (in_dst) ::free(slot);
     if (filelog()) fprintf(stderr,
