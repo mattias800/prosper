@@ -639,6 +639,24 @@ int main() {
               "missing sampled image receives a full-surface nonblack poison texture instead of zero");
     }
 
+    // VideoOut's registered dimensions are authoritative even when CB_COLOR0_ATTRIB2 describes a
+    // larger backing allocation. Treating this 256x256 declaration as the visible extent scales the
+    // pass to 128x128 and prevents the final 64x64 scanout lookup from publishing the rendered frame.
+    // Keep this last because publishing a registered front buffer intentionally makes it the source
+    // selected by later callbacks.
+    DrawItem oversized_scanout = replay.items[0];
+    oversized_scanout.color0_base = reinterpret_cast<uint64_t>(scanout0.data());
+    oversized_scanout.color0_width = PRESENT_W * 2;
+    oversized_scanout.color0_height = PRESENT_H * 2;
+    std::vector<uint8_t> scanout_pixels = render_submit_items({oversized_scanout}, W, H);
+    CHECK(scanout_pixels.size() == static_cast<size_t>(W) * H * 4,
+          "registered scanout uses the VideoOut extent instead of its oversized CB allocation");
+    if (scanout_pixels.size() == static_cast<size_t>(W) * H * 4) {
+        const uint8_t* center = &scanout_pixels[(static_cast<size_t>(H / 2) * W + W / 2) * 4];
+        CHECK(center[0] > 0xC0 && center[1] < 0x40 && center[2] < 0x40,
+              "oversized registered scanout still publishes its rendered pixels");
+    }
+
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n"); return 0;
 }
