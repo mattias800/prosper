@@ -2812,14 +2812,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             // PROSPER_DUMP_CONTENT=<min-nonzero-bytes>: dump ONLY frames whose framebuffer has at least
             // that many nonzero bytes — catches the intermittent content submits the periodic dump misses.
             size_t content_thr = 0; if (const char* c = getenv("PROSPER_DUMP_CONTENT")) content_thr = (size_t)atol(c);
+            // PROSPER_PRESENT_NZLOG=N: log the presented frame's nonzero-byte count every N frames WITHOUT
+            // writing any image. A memory-safe content proxy for long progression runs — dumping BMPs to a
+            // tmpfs frame dir exhausts RAM, this does not. 0/unset disables.
+            static const int nzlog_every = [] { const char* e = getenv("PROSPER_PRESENT_NZLOG");
+                                                return e ? (int)atol(e) : 0; }();
             size_t px_nz = 0;
-            if (dump_bmps) for (uint8_t b : px) px_nz += (b != 0);
+            if (dump_bmps || nzlog_every) for (uint8_t b : px) px_nz += (b != 0);
             if (px.empty()) {
                 fprintf(stderr, "[render] frame %d: Vulkan render FAILED (%ux%u)\n", n, w, h);
             } else if (dump_bmps && ((content_thr && px_nz >= content_thr) || (!content_thr && (n < 60 || n % 10 == 0)))) {
                 char fn[512]; snprintf(fn, sizeof fn, "%s/frame_%04d.bmp", frame_dir.c_str(), n);
                 prosper::test::dump_bmp(fn, px, w, h);
                 fprintf(stderr, "[render] frame %d rendered (%ux%u) nz=%zu -> %s\n", n, w, h, px_nz, fn);
+            } else if (nzlog_every && !px.empty() && (n % nzlog_every == 0)) {
+                fprintf(stderr, "[render-nz] frame %d (%ux%u) nz=%zu\n", n, w, h, px_nz);
             }
             if (timing_enabled) {
                 pending_timing.callbacks++;
