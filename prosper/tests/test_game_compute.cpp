@@ -219,7 +219,8 @@ int main() {
         0xbf810000u,
     };
     static const uint32_t gds_exec_store[] = {
-        0x7e0202ffu, 0xcafebabeu,  // v1 = value; v0 retains local invocation id
+        0x34000082u,               // v_lshlrev_b32 v0, 2, v0 (one dword per lane)
+        0x7e0202ffu, 0xcafebabeu,  // v1 = value
         0x7da40080u,               // v_cmpx_eq_u32 0, v0
         0xd8360000u, 0x00000100u,  // only lane zero stores at byte address 0
         0xbf810000u,
@@ -282,7 +283,8 @@ int main() {
     set_guest_gpu_write_observer({});
     const auto* gds_words = reinterpret_cast<const uint32_t*>(
         gds_replay.computes[0].resources->resources[0].host_data);
-    CHECK(gds_words && gds_words[0] == 0xcafebabeu && gds_words[1] == 0xdeadbeefu,
+    CHECK(gds_words && gds_words[0] == 0xcafebabeu && gds_words[1] == 0xdeadbeefu &&
+              gds_words[2] == 0 && gds_words[3] == 0,
           "GDS stores honor 16-bit address wrap, EXEC predication, and cross-dispatch persistence");
     CHECK(gds_notifications == 0,
           "GPU-internal GDS writeback does not invalidate guest address zero");
