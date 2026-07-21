@@ -1702,6 +1702,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     }
     if (const char* v = getenv("PROSPER_STENCIL_CLEAR"))
         stencil_clear = static_cast<uint32_t>(strtoul(v, nullptr, 0)) & 0xFFu;
+    // Diagnostic A/B twin of PROSPER_STENCIL_CLEAR: override the derived initial depth value.
+    // The #371 approximation picks the compare-appropriate always-pass value; sweeping this
+    // instead reveals whether a pass's draws sit at DIFFERENT depths (a mid value culls some
+    // draws but not others), i.e. whether real guest depth contents would gate them.
+    if (const char* v = getenv("PROSPER_DEPTH_CLEAR"))
+        depth_clear = strtof(v, nullptr);
     if (getenv("PROSPER_NO_DEPTH"))   use_depth = false;     // diag: isolate depth-test rejection
     if (getenv("PROSPER_NO_STENCIL")) use_stencil = false;   // diag: isolate stencil masking
     const bool use_ds = use_depth || use_stencil;
@@ -2498,6 +2504,22 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 s.passOp      = (VkStencilOp)ps->stencil_pass_op[fb];
                 s.depthFailOp = (VkStencilOp)ps->stencil_depth_fail_op[fb];
                 s.compareOp   = (VkCompareOp)ps->stencil_compare_op[fb];
+                // PROSPER_STENCIL_MIRROR=1 (diagnostic A/B ONLY — NOT hardware semantics): mirror
+                // the asymmetric compare ops, i.e. evaluate `stencil OP ref` instead of Vulkan's
+                // `ref OP stencil`. RDNA2 STENCILFUNC is ref-on-left 1:1 with VkCompareOp (radeonsi
+                // programs PIPE_FUNC straight into the field), so this switch deliberately DIVERGES
+                // from hardware — its use is isolating whether a suspect draw's coverage is
+                // stencil-gated (flipping GREATER<->LESS suppresses/expands it) without touching
+                // any other state. Symmetric ops (EQUAL/NOTEQUAL/ALWAYS/NEVER) are unaffected.
+                if (getenv("PROSPER_STENCIL_MIRROR")) {
+                    switch (s.compareOp) {
+                        case VK_COMPARE_OP_LESS:             s.compareOp = VK_COMPARE_OP_GREATER; break;
+                        case VK_COMPARE_OP_GREATER:          s.compareOp = VK_COMPARE_OP_LESS; break;
+                        case VK_COMPARE_OP_LESS_OR_EQUAL:    s.compareOp = VK_COMPARE_OP_GREATER_OR_EQUAL; break;
+                        case VK_COMPARE_OP_GREATER_OR_EQUAL: s.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL; break;
+                        default: break;
+                    }
+                }
                 s.compareMask = ps->stencil_compare_mask[fb];
                 s.writeMask   = ps->stencil_write_mask[fb];
                 // AMD splits the stencil reference: STENCILTESTVAL is the COMPARE reference, but a REPLACE
