@@ -1836,16 +1836,21 @@ int prosper_apr_match_by_size(uint64_t size, std::string* out_path) {
         if (f.size == size) { if (n++ == 0 && out_path) *out_path = f.path; }
     return n;
 }
-HLE(f_apr_resolve) {
-    const char** paths = (const char**)P(a0);
-    int count = (int)(int64_t)a1;
-    uint32_t* out_ids   = (uint32_t*)P(a2);
-    uint64_t* out_sizes = (uint64_t*)P(a3);
-    uint32_t* out_flags = (uint32_t*)P(a4);
+// Shared body for both APR resolve entry points. `prefix` (may be empty/null) is a guest-path
+// prefix prepended to each entry before /app0 translation — GTA V (PPSA04263, RAGE) calls the
+// WithPrefix variant, DOLL (PPSA17942, UE4) the non-prefix one. Each resolved container is stat'd
+// and assigned a stable 1-based id recorded in the APR registry so the read/stat paths can find
+// its host file. Returning without populating the id/size outputs (the old EINVAL/success stub)
+// makes APR proceed on garbage ids and wild-write over the allocator, so every entry writes all
+// three outputs.
+static uint64_t apr_resolve_impl(const char* prefix, const char** paths, int count,
+                                 uint32_t* out_ids, uint64_t* out_sizes, uint32_t* out_flags) {
     if (!paths || count <= 0) return 0x80020016ull;   // EINVAL
     for (int i = 0; i < count; i++) {
         const char* gp = paths[i];
-        std::string host = gp ? translate(gp) : std::string();
+        std::string guest = gp ? std::string(gp) : std::string();
+        if (prefix && prefix[0] && !guest.empty()) guest = std::string(prefix) + guest;
+        std::string host = guest.empty() ? std::string() : translate(guest.c_str());
         uint64_t size = 0; uint32_t id = 0;
 #ifndef _WIN32
         struct stat st;
@@ -1855,7 +1860,7 @@ HLE(f_apr_resolve) {
         if (!host.empty() && ::_stat64(host.c_str(), &st) == 0) size = (uint64_t)st.st_size;
 #endif
         else { if (out_ids) out_ids[i] = 0; if (out_sizes) out_sizes[i] = 0; if (out_flags) out_flags[i] = 0;
-               if (filelog()) fprintf(stderr, "[apr] resolve MISS %s\n", gp ? gp : "(null)"); continue; }
+               if (filelog()) fprintf(stderr, "[apr] resolve MISS %s\n", guest.empty() ? "(null)" : guest.c_str()); continue; }
         // Warn loudly (unconditionally) when a DIFFERENT container shares this size: the read
         // path is size-keyed (see f_apr_read_submit) and will refuse such reads as ambiguous.
         std::string clash; int same_size = prosper_apr_match_by_size(size, &clash);
@@ -1867,9 +1872,22 @@ HLE(f_apr_resolve) {
         if (out_ids)   out_ids[i]   = id;
         if (out_sizes) out_sizes[i] = size;
         if (out_flags) out_flags[i] = 0;
-        if (filelog()) fprintf(stderr, "[apr] resolve %s -> id=%u size=%llu\n", gp, id, (unsigned long long)size);
+        if (filelog()) fprintf(stderr, "[apr] resolve %s -> id=%u size=%llu\n", guest.c_str(), id, (unsigned long long)size);
     }
     return 0;
+}
+HLE(f_apr_resolve) {
+    return apr_resolve_impl(nullptr, (const char**)P(a0), (int)(int64_t)a1,
+                            (uint32_t*)P(a2), (uint64_t*)P(a3), (uint32_t*)P(a4));
+}
+// sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes(const char* prefix, const char** paths,
+//   int count, uint32_t* outIds, uint64_t* outSizes, uint32_t* outFlags) — GTA V's RAGE resource
+// loader entry. ABI recovered from live guest disassembly (PPSA04263, [RAGE] Main Thr): rdi=prefix
+// (empty ""), rsi=paths (paths[0]="/app0/ps5/audio/sfx/ANIMALS.rpf"), rdx=count(1), then the three
+// output arrays. Same contract as the non-prefix twin with one leading prefix arg.
+HLE(f_apr_resolve_with_prefix) {
+    return apr_resolve_impl((const char*)P(a0), (const char**)P(a1), (int)(int64_t)a2,
+                            (uint32_t*)P(a3), (uint64_t*)P(a4), (uint32_t*)P(a5));
 }
 
 // libSceAmpr::mQ16-QdKv7k — the APR read SUBMIT (identified by tracing readFile eboot 0x59b6110 ->
@@ -2393,6 +2411,7 @@ void register_file_hle() {
     Hle::register_fn("5TgME6AYty4", (HleFn)k_aio_delete,       "sceKernelAioDeleteRequest");
     Hle::register_fn("fR521KIGgb8", (HleFn)k_aio_cancel,       "sceKernelAioCancelRequest");
     R("sceKernelAprResolveFilepathsToIdsAndFileSizes", f_apr_resolve);   // real APR resolve (was EINVAL)
+    R("sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes", f_apr_resolve_with_prefix);  // GTA V (#1130)
     // libSceAmpr sceAmprAprCommandBufferReadFile (NID name recovered by brute-force). The Linux
     // entry is an asm shim that snapshots rsp so the handler can read the stack args (arg7 = file
     // offset); see f_apr_read_submit_entry above.
