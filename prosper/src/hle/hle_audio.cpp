@@ -640,6 +640,21 @@ HLE(audio2_ctx_query_memory) {
     return 0;
 }
 
+// sceAudioOut2GetSpeakerArrayMemorySize(...) -> size (GTA V / PPSA04263, RAGE, issue #1134).
+// RETURNS the speaker-array work-memory byte size directly (rax); the guest uses it verbatim as an
+// allocation size: `r15 = ret; ptr = allocator->alloc(r15, 0x10)`. Live [RAGE] disassembly at
+// eboot+0x2adf25e: arg rdi=8 (speaker/channel config). Stubbed to 0 the guest allocated a ZERO-byte
+// speaker-array buffer and then overran it, aborting RAGE audio/streaming init with its int 0x41
+// fatal — the deterministic pre-render crash on this title. Like sceAudioOut2ContextQueryMemory, the
+// null backend needs no real work memory; report a fixed, comfortably-large size so the allocation
+// succeeds and is big enough. The value's only observable effect is a successful, large-enough alloc.
+// CONFIDENCE: MED — return-is-size and the alloc use are pinned from disassembly; the exact SDK size
+// formula is unknown, so a generous fixed size is used (safe: the buffer is only ever zero-filled here).
+HLE(audio2_get_speaker_array_memory_size) {
+    A2LOG("sceAudioOut2GetSpeakerArrayMemorySize");
+    return 0x100000;   // 1 MiB, 0x10-aligned; matches the ContextQueryMemory null-backend precedent
+}
+
 // sceAudioOut2ContextCreate(param*, mem, memSize, Handle* outCtx) -> 0.
 HLE(audio2_ctx_create) {
     A2LOG("sceAudioOut2ContextCreate");
@@ -2207,6 +2222,7 @@ void register_audio_hle() {
     R("sceAudioOut2PortUnregister", audio2_port_unregister);
     R("sceAudioOut2GetSystemState", audio2_get_system_state);
     R("sceAudioOut2GetSpeakerInfo", audio2_get_speaker_info);
+    R("sceAudioOut2GetSpeakerArrayMemorySize", audio2_get_speaker_array_memory_size);  // GTA V (#1134)
     R("sceAudioOut2MasteringInit", audio2_mastering_init);
     R("sceAudioOut2MasteringTerm", audio2_mastering_term);
     R("sceAudioOut2MasteringSetParam", audio2_mastering_set_param);

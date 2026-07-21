@@ -1498,8 +1498,31 @@ HLE(agc_cb_dispatch) {  // (buf, dimension_x, dimension_y, dimension_z, dispatch
     return (uint64_t)(uintptr_t)cmd;
 }
 
+// AGC command-buffer size queries (GTA V / PPSA04263, RAGE, issue #1137). A GetSize returns how many
+// BYTES a command will occupy so the guest can size its DrawCommandBuffer before building. RAGE's
+// render thread (eboot+0x2bfef.. / +0x2bffd..) sums these across a workload, some used directly as a
+// byte accumulator and some converted to dwords via (n+3)>>2, then rounds up to a 128-byte boundary
+// and allocates the guest DCB (AgcDcb.bottom..top). Stubbed to 0 the guest allocates a 128-byte buffer
+// and the builders overflow it -> corrupt submit -> RAGE fatal, before any GPU frame. Each returns the
+// matching builder's dword count * 4 (see the begin_packet(a0, N, ...) sizes below); the invariant is
+// only that reserved >= written, so a builder prosper hasn't implemented (Rewind) still reserves safely.
+// CONFIDENCE: MED — units (bytes) and the sum/allocate contract are pinned from live render-thread
+// disassembly; exact per-command dword counts mirror prosper's own builders.
+HLE(agc_dcb_jump_get_size)        { (void)a0; return 5u * 4u; }   // sceAgcDcbJump builds 5 dwords
+HLE(agc_dcb_acquire_mem_get_size) { (void)a0; return 8u * 4u; }   // sceAgc(Dcb|Acb)AcquireMem builds 8
+HLE(agc_dcb_rewind_get_size)      { (void)a0; return 2u * 4u; }   // PM4 REWIND, 2 dwords
+HLE(agc_cb_eop_action_get_size)   { (void)a0; return 9u * 4u; }   // sceAgcCbReleaseMem (EOP) builds 9
+// sceAgcCbNopGetSize(numDwords): the NOP is exactly the requested dword count (min 1). arg in a0.
+HLE(agc_cb_nop_get_size)          { uint32_t n = (uint32_t)a0; if (n == 0) n = 1; return (uint64_t)n * 4u; }
+
 void register_agc_hle() {
     #define RN(nid, fn) Hle::register_fn(nid, (HleFn)(fn), nid)
+    RN("VEGu4dixjUg", agc_dcb_jump_get_size);        // sceAgcDcbJumpGetSize (#1137)
+    RN("-vnlTPPXPrw", agc_dcb_acquire_mem_get_size); // sceAgcDcbAcquireMemGetSize
+    RN("ewobAQeMo5k", agc_dcb_acquire_mem_get_size); // sceAgcAcbAcquireMemGetSize (same size)
+    RN("QIXCsbipds0", agc_dcb_rewind_get_size);      // sceAgcDcbRewindGetSize
+    RN("hL7C0IRpWZI", agc_cb_eop_action_get_size);   // sceAgcCbQueueEndOfPipeActionGetSize
+    RN("t7PlZ9nt5Lc", agc_cb_nop_get_size);          // sceAgcCbNopGetSize
     RN("f3dg2CSgRKY", agc_create_shader);   // sceAgcCreateShader — populates the shader registry
     RN("AOLcoIkQDgM", agc_driver_query_resource_registration_user_memory_requirements);
     RN("uJziRsODk1c", agc_driver_get_resource_registration_max_name_length);
