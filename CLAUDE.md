@@ -275,6 +275,20 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   Every new or materially changed baseline requires `snapshot.py verify`,
   inspection of all retained images from both runs, and a factual `review` note. See
   `tools/snapshot/AGENTS.md`.
+- **Per-title bring-up ladder — gameplay is always the target.** Every game climbs the same ladder,
+  and progress claims name the rung reached:
+  1. **Any graphics at all** — real frames from the live renderer (a splash/logo counts; black or
+     diagnostic-only output does not).
+  2. **Title screen** reached and rendered.
+  3. **Gameplay** reached with real GPU draws — this is the standing goal of bring-up; don't stop
+     and declare success at a logo or menu.
+  4. **Manual visual verification** — the user plays it and confirms by eye that it looks right.
+  5. **Oracle comparison** — reference screenshots from PS5 hardware, compared against routed
+     captures for visual correctness.
+  6. **Automatic snapshot testing** — a deterministic route + content guard added to
+     `tools/snapshot`, so regressions are caught without a human.
+  Only after step 6 is a title considered **"done"**, and work moves to the next game. Earlier rungs
+  are milestones worth recording (issue/`COMPATIBILITY.md`), not stopping points.
 - **Build tools — don't avoid them.** This project is a long reverse-engineering effort, and getting
   progressively more complicated games running will keep demanding new instrumentation. When you hit a
   question the existing tools can't answer — "who references this address in the unsymbolicated eboot?",
