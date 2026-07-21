@@ -335,6 +335,12 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                         reinterpret_cast<const uint8_t*>(d.vs.data()), d.vs.size() * 4)),
                     d.fs.size(), static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(
                         reinterpret_cast<const uint8_t*>(d.fs.data()), d.fs.size() * 4)));
+        // Blend detail: UI compositing correctness hangs on the exact color AND alpha factor
+        // programming (a separate-alpha UI backdrop writes a different alpha than its color
+        // factors imply — #320's dialogue overlay), so make the full equation inspectable.
+        std::printf("  blend color=%u,%u op=%u alpha=%u,%u aop=%u\n",
+                    d.ps.src_color_blend_factor, d.ps.dst_color_blend_factor, d.ps.color_blend_op,
+                    d.ps.src_alpha_blend_factor, d.ps.dst_alpha_blend_factor, d.ps.alpha_blend_op);
         std::printf("  stencil clear=%u cmp=%u/%u fail=%u/%u pass=%u/%u zfail=%u/%u "
                     "ref=%u/%u opval=%u/%u cmask=%02x/%02x wmask=%02x/%02x\n",
                     d.ps.stencil_clear_value, d.ps.stencil_compare_op[0], d.ps.stencil_compare_op[1],

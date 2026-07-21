@@ -2317,7 +2317,24 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             sit->second.w == gw && sit->second.h == gh &&
                             sit->second.format == pass_format && sit->second.rgba &&
                             sit->second.rgba->size() == pass_bytes)
-                            seed = sit->second.rgba->data(); }
+                            seed = sit->second.rgba->data();
+                        // Gated seed-decision diagnostic: a pass that should LOAD prior target
+                        // content but silently falls back to its clear color erases everything the
+                        // earlier pass produced (an opaque-black clear wipes a transparent UI RT —
+                        // #320's dialogue overlay). Make the decision and its reason visible.
+                        if (rtt_log && !seed && !gpu_seed_available) {
+                            if (sit == g_rtt.end())
+                                fprintf(stderr, "[rtt] seed miss target=0x%llx reason=no-entry\n",
+                                        (unsigned long long)base);
+                            else
+                                fprintf(stderr,
+                                        "[rtt] seed miss target=0x%llx reason=mismatch "
+                                        "entry=%ux%u fmt=%d rgba=%zu want=%ux%u fmt=%d bytes=%zu\n",
+                                        (unsigned long long)base, sit->second.w, sit->second.h,
+                                        (int)sit->second.format,
+                                        sit->second.rgba ? sit->second.rgba->size() : (size_t)0,
+                                        gw, gh, (int)pass_format, pass_bytes);
+                        } }
                     bool sampled_exact_later = false;
                     bool feedback_later = false;
                     if (live_gpu_targets && base) {

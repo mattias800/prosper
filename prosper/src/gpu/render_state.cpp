@@ -230,6 +230,19 @@ RenderState extract_render_state(const GpuState& st) {
     rs.db_stencil_control   = st.cx.count(P::DB_STENCIL_CONTROL)   ? rd(st.cx, P::DB_STENCIL_CONTROL)   : 0u;
     rs.db_stencilrefmask    = st.cx.count(P::DB_STENCILREFMASK)    ? rd(st.cx, P::DB_STENCILREFMASK)    : 0u;
     rs.db_stencilrefmask_bf = st.cx.count(P::DB_STENCILREFMASK_BF) ? rd(st.cx, P::DB_STENCILREFMASK_BF) : 0u;
+    // PROSPER_STENCILLOG (gated, off by default): the guest's RAW depth/stencil register dwords per
+    // stencil-enabled draw — ground truth for compare/op decode questions (the translated fields
+    // above can be audited against exactly what the title programmed). Dedup on change.
+    if (rs.stencil_enable && getenv("PROSPER_STENCILLOG")) {
+        static thread_local uint32_t last_dc, last_sc, last_rm, last_rmb;
+        if (dc != last_dc || rs.db_stencil_control != last_sc ||
+            rs.db_stencilrefmask != last_rm || rs.db_stencilrefmask_bf != last_rmb) {
+            last_dc = dc; last_sc = rs.db_stencil_control;
+            last_rm = rs.db_stencilrefmask; last_rmb = rs.db_stencilrefmask_bf;
+            fprintf(stderr, "[stencil-raw] dc=%08x sc=%08x rm=%08x rmb=%08x\n",
+                    dc, rs.db_stencil_control, rs.db_stencilrefmask, rs.db_stencilrefmask_bf);
+        }
+    }
     rs.has_cb_color_control = st.cx.count(P::CB_COLOR_CONTROL) != 0;
     rs.cb_color_control  = rd(st.cx, P::CB_COLOR_CONTROL);
     rs.cb_blend0_control = bc;
