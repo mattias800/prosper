@@ -1062,17 +1062,34 @@ void ime_deliver(uint64_t handler, const ImeKeyEvent& ev) {
 // PROSPER_IME_AUTOKEY=1: deliver a repeating Enter down/up pulse so headless routes advance a
 // "press any button" / menu that reads the IME keyboard. Diagnostic/verification lever; the real
 // per-key input comes from a frontend via ime_push_key (below). PROSPER_IME_AUTOKEY_HID overrides
-// the HID usage (default 0x28 Enter). Cadence: down, then up two ticks later, repeating.
+// the HID usage (default 0x28 Enter) and accepts a comma-separated LIST (e.g. "0x28,0x2c,0x1d") that
+// is cycled one key per press-window — so a single headless run can probe which key a dialog accepts.
+// Cadence: down, then up two ticks later, then the next key in the list two windows later.
 void ime_autokey_tick(uint64_t handler) {
     static const int on = [] { const char* e = getenv("PROSPER_IME_AUTOKEY");
                                return e && strtol(e, nullptr, 0) != 0 ? 1 : 0; }();
     if (!on) return;
-    static const uint16_t hid = [] { const char* e = getenv("PROSPER_IME_AUTOKEY_HID");
-                                     return (uint16_t)(e ? strtol(e, nullptr, 0) : 0x28); }();
+    static const std::vector<uint16_t> hids = [] {
+        std::vector<uint16_t> v;
+        const char* e = getenv("PROSPER_IME_AUTOKEY_HID");
+        if (e && *e) for (const char* p = e; *p; ) {
+            char* end = nullptr; long val = strtol(p, &end, 0);
+            if (end == p) break;
+            v.push_back((uint16_t)val);
+            p = (*end == ',') ? end + 1 : end;
+        }
+        if (v.empty()) v.push_back(0x28);   // default Enter
+        return v;
+    }();
     static std::atomic<uint64_t> tick{0};
     uint64_t t = tick.fetch_add(1);
-    if ((t % 90) == 0)      ime_deliver(handler, {hid, true});
-    else if ((t % 90) == 2) ime_deliver(handler, {hid, false});
+    const uint16_t hid = hids[(t / 90) % hids.size()];
+    if ((t % 90) == 0) {
+        ime_deliver(handler, {hid, true});
+        if (svclog()) fprintf(stderr, "[ime-autokey] deliver hid=0x%x down\n", hid);
+    } else if ((t % 90) == 2) {
+        ime_deliver(handler, {hid, false});
+    }
 }
 } // namespace
 
