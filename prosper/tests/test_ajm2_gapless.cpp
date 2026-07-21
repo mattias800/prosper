@@ -118,6 +118,69 @@ int main() {
           "re-armed program's total restarts and lands exactly on the new total");
     CHECK(sb3.iSizeProduced == kTotal2 * frame_bytes, "re-armed program delivers the new total");
 
+    // --- Streaming a gapless program through a TINY output buffer across many jobs (review #1097).
+    // Exercises the subtlest paths the big-buffer cases skip: room-starvation spill UNDER an active
+    // gapless program, the carry erase-tail branch, and multi-batch program continuation. Feeds input
+    // the way a real guest does -- advancing by each job's reported iSizeConsumed -- and accumulates
+    // the delivered PCM, which must equal reference[skip .. skip+total] and land exactly on total.
+    const uint32_t inst3 = 9;
+    const uint32_t kSkip3 = (uint32_t)sfs + 137;             // skip spans MORE than one superframe
+    const uint64_t kTotal3 = raw_frames - kSkip3 - 500;
+    uint32_t gapless3[2] = {(uint32_t)kTotal3, kSkip3};
+    job_init(batch, inst3, addr(kAt9Config), 8, addr(&sb), 0, 0, 0, 0, 0);
+    job_gapl(batch, inst3, addr(gapless3), 1, addr(&sb), 0, 0, 0, 0, 0);
+
+    // CONTROL: single job, whole input, output sized to EXACTLY total. Isolates the code's
+    // skip>superframe + total-cap from the multi-job streaming model.
+    {
+        Sideband sc{};
+        std::vector<uint8_t> exact((size_t)kTotal3 * frame_bytes, 0);
+        job_dec(batch, inst3, addr(kAt9Data), kAt9DataLen, addr(exact.data()), exact.size(),
+                addr(&sc), 0, 0, 0);
+        batch_go(0, batch, 0, 0, 0, 0, 0, 0, 0, 0);
+        CHECK(sc.uiTotalDecodedSamples == kTotal3 &&
+              std::memcmp(exact.data(), reference.data()+(size_t)kSkip3*ch,
+                          (size_t)kTotal3*frame_bytes)==0,
+              "control: single-job skip>superframe + total-cap lands exactly");
+    }
+    // Fresh instance for the streaming test: the control above decoded inst3 to stream-end, and
+    // re-arming gapless resets the trim counters but NOT the Atrac9Decoder's MDCT position, so the
+    // streaming pass needs its own instance (new id -> fresh decoder on first JobInitialize).
+    const uint32_t inst4 = 10;
+    job_init(batch, inst4, addr(kAt9Config), 8, addr(&sb), 0, 0, 0, 0, 0);
+    job_gapl(batch, inst4, addr(gapless3), 1, addr(&sb), 0, 0, 0, 0, 0);
+
+    std::vector<int16_t> collected;
+    const uint32_t tiny = (uint32_t)(300 * ch) * sizeof(int16_t);   // ~300 frames per job
+    std::vector<uint8_t> tinyout(tiny, 0);
+    uint32_t in_off = 0; int guard = 0; bool tiny_ok = true;
+    while (guard++ < 100000) {
+        Sideband s{};
+        const uint32_t in_left = (in_off < kAt9DataLen) ? (kAt9DataLen - in_off) : 0;
+        // Real feed while input remains; once exhausted, a valid sub-superframe input that decodes
+        // nothing new but lets the handler accept the job and drain the carry (mirrors the guest's
+        // next feed, whose carry-drain runs first).
+        const uint64_t din = in_left ? addr(kAt9Data + in_off) : addr(kAt9Data);
+        const uint32_t dsz = in_left ? in_left : 1u;
+        job_dec(batch, inst4, din, dsz, addr(tinyout.data()), tinyout.size(), addr(&s), 0, 0, 0);
+        batch_go(0, batch, 0, 0, 0, 0, 0, 0, 0, 0);
+        if (s.iResult != 0) { tiny_ok = false; break; }
+        const uint32_t got_frames = s.iSizeProduced / frame_bytes;
+        collected.insert(collected.end(),
+                         reinterpret_cast<const int16_t*>(tinyout.data()),
+                         reinterpret_cast<const int16_t*>(tinyout.data()) + (size_t)got_frames * ch);
+        in_off += s.iSizeConsumed;
+        if (s.uiTotalDecodedSamples >= kTotal3) break;      // program complete
+        if (in_left == 0 && s.iSizeProduced == 0) break;    // input gone and carry drained
+    }
+    CHECK(tiny_ok, "tiny-buffer streaming has no decode error");
+    CHECK(collected.size() == (size_t)kTotal3 * ch,
+          "tiny-buffer streaming delivers exactly total frames across many jobs");
+    CHECK(collected.size() == (size_t)kTotal3 * ch &&
+          std::memcmp(collected.data(), reference.data() + (size_t)kSkip3 * ch,
+                      (size_t)kTotal3 * frame_bytes) == 0,
+          "tiny-buffer streamed PCM equals reference[skip..skip+total] (multi-superframe skip)");
+
     // A fresh instance with NO gapless program keeps the historical cumulative behavior
     // (streaming titles that never program gapless must not change).
     const uint32_t inst2 = 8;

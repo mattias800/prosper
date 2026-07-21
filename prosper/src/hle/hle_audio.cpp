@@ -1360,7 +1360,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                     if (!audio_store_bytes(job.out_addr + produced, src,
                                            w * frame_bytes)) { err = kAjm2ErrDecode; return 0; }
                     produced += w * frame_bytes;
-                    I.gapless_delivered += w;
+                    if (prog) I.gapless_delivered += w;   // only meaningful for a gapless program
                 }
                 *spill = src + (size_t)w * ch;
                 *spill_frames = nframes - w;
