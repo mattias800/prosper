@@ -1828,10 +1828,11 @@ namespace {
                 return;   // re-execute from the reader's skip label
             }
         }
-        // Fatal crash path (all diagnostic/stepping cases above already returned). If this thread was
-        // running on OUR guest %fs, restore the host %fs NOW so the host-libc reporting below (snprintf/
-        // write) + the siglongjmp-return into host C++ don't double-fault reading guest TLS as glibc's TCB.
-        // No-op when guest-fs is off. (The GC RT-signal handler is separate and keeps the guest %fs.)
+        // Fault-report path (env-gated diagnostic/stepping cases above already returned; the int-0x41
+        // skip and PROSPER_FAULT_SKIP return-to-guest cases are handled a few lines below). If this
+        // thread was running on OUR guest %fs, switch to the host %fs NOW so the host-libc reporting
+        // below (snprintf/write) + the siglongjmp-return into host C++ don't double-fault reading guest
+        // TLS as glibc's TCB. No-op when guest-fs is off. (The GC RT-signal handler keeps the guest %fs.)
         // Capture the guest %fs (scoped) rather than dropping it: the paths below that RETURN to guest
         // code (int $0x41 skip, PROSPER_FAULT_SKIP) must restore it first — sigreturn does NOT restore
         // fs_base on x86-64, so resuming the guest after a host-%fs swap would run guest code (incl. its
