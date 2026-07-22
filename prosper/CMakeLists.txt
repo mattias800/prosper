@@ -323,6 +323,19 @@ if(TARGET prosper_core)
     add_test(NAME amprlog_safe_read COMMAND test_amprlog_safe_read)
   endif()
 
+  # Bounded-acquire present classification (#1182). Needs Vulkan HEADERS only (VkResult enum), no loader
+  # call — link Vulkan::Vulkan purely for its include dirs. Guarded so a headers-less host skips it
+  # gracefully; every platform that builds prosper-app has Vulkan available.
+  if(NOT TARGET Vulkan::Vulkan)
+    find_package(Vulkan QUIET)
+  endif()
+  if(TARGET Vulkan::Vulkan)
+    add_executable(test_prosper_app_present_policy frontends/prosper-app/test_present_policy.cpp)
+    target_include_directories(test_prosper_app_present_policy PRIVATE frontends/prosper-app)
+    target_link_libraries(test_prosper_app_present_policy PRIVATE Vulkan::Vulkan)
+    add_test(NAME prosper_app_present_policy COMMAND test_prosper_app_present_policy)
+  endif()
+
   add_executable(test_sync_on_address tests/test_sync_on_address.cpp)
   target_link_libraries(test_sync_on_address PRIVATE prosper_core)
   add_test(NAME sync_on_address COMMAND test_sync_on_address)
