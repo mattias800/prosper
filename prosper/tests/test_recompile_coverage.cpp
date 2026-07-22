@@ -23,6 +23,32 @@ int main() {
     CHECK(a.total == 2 && a.alu == 2 && a.unsupported == 0 && a.first_bad_fmt < 0,
           "a fully-handled ALU kernel reports 100% coverage");
 
+    // v_add_co_u32 / v_sub_co_u32 / v_subrev_co_u32 (VOP3B carry-out add/subtract, ops 0x30F/0x310/
+    // 0x319). GTA V's (PPSA04263) texture-decode compute kernel advances a 64-bit flat source pointer
+    // with v_add_co_u32; before this op emitted, the whole kernel was rejected at first_bad_op=0x30f,
+    // so the decoded texture never rendered (#1163/#1165 investigation). Encodings are byte-identical
+    // to that kernel's pc=0030 instruction: op in bits[25:16], sdst=vcc, dst=v1, src0=s12, src1=v6.
+    const uint32_t co_code[] = {
+        0xd70f6a01u, 0x00020c0cu,   // v_add_co_u32    v1, vcc, s12, v6
+        0xd7106a01u, 0x00020c0cu,   // v_sub_co_u32    v1, vcc, s12, v6
+        0xd7196a01u, 0x00020c0cu,   // v_subrev_co_u32 v1, vcc, s12, v6
+        0xBF810000u,                // s_endpgm
+    };
+    RecompileCoverage co = recompile_coverage(co_code, sizeof(co_code)/sizeof(co_code[0]));
+    CHECK(co.total == 3 && co.alu == 3 && co.unsupported == 0 && co.first_bad_fmt < 0,
+          "v_add/sub/subrev_co_u32 (VOP3B carry-out) recompile as supported ALU");
+
+    // Coverage only inspects emit_alu's `ok` flag and discards the SPIR-V; also prove v_add_co_u32
+    // lowers to a real, well-formed module (VGPR operands this time: v2 = v0 + v1, carry->vcc). Without
+    // the emit branch recompile_valu returns {}; with it, a valid module (magic 0x07230203) is produced.
+    const uint32_t co_valu[] = {
+        0xd70f6a02u, 0x00020300u,   // v_add_co_u32 v2, vcc, v0, v1
+        0xBF810000u,                // s_endpgm
+    };
+    std::vector<uint32_t> co_spv = recompile_valu(co_valu, sizeof(co_valu)/sizeof(co_valu[0]), 2, 2);
+    CHECK(!co_spv.empty() && co_spv[0] == 0x07230203u,
+          "v_add_co_u32 lowers to a valid compute SPIR-V module");
+
     // tbuffer_load_format_x v0, v0, s[8:11], 0 format:32_FLOAT ; s_endpgm.
     // MTBUF needs a resolved V# binding, so the table-less coverage pass must classify it as
     // recompilable-in-context rather than truly unsupported.
