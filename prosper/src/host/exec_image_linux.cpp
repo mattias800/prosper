@@ -87,6 +87,7 @@ namespace {
     // trustworthy way to inspect deep crashes (e.g. the null std::ctype facet at eboot+0x3b5ea6).
     bool g_faultmem = false;
     bool g_faultlog = false;
+    bool g_int41_skip = true;   // guest int $0x41 (RAGE debugbreak) -> skip; PROSPER_NO_INT41_SKIP disables (#1138)
     // Probe pipe for probe_readable() below — a pipe write imports the source pages (EFAULT on
     // unmapped memory) where a /dev/null write does not. O_NONBLOCK so a full pipe can never
     // block the fault handler; drained after every probe.
@@ -172,6 +173,29 @@ namespace {
     bool     g_bp_stepping = false;            // mid single-step (orig byte restored, TF set)
     volatile sig_atomic_t g_bp_count = 0;
     int      g_bp_max = 400;                   // cap log volume
+    // PROSPER_BP_KLASS=1: at each int3 hit, print the IL2CPP class name of the object in each SysV-arg
+    // register (rdi/rsi/rdx/rcx/r8/r9) plus rbx/rax/r14/r15 — reliably names the managed receiver/args
+    // WITHOUT gdb (the int3 is armed by prosper after it maps the module, so it is race-free w.r.t. the
+    // demand-map timing that makes gdb managed breakpoints nondeterministic). Reuses the HWBP obj->klass->
+    // name layout. For an IL2CPP-module method use PROSPER_BP=0x30000000+RVA (module base 0x440000000 =
+    // eboot base 0x410000000 + 0x30000000).
+    bool     g_bp_klass = false;
+    // PROSPER_BP_PROBE="<chain>[;<chain>...]": at each hit, evaluate pointer chains and print each result.
+    // A chain is "<start>[+0xN|*]...:<t>": start is a register name (rdi,r14,...) or a 0xADDR; ops apply
+    // left-to-right — "+N" adds an offset, "*" dereferences a qword; the trailing ":t" reads the final
+    // address as q(word,default)/d(word)/b(yte)/f(loat-bits). Lets a single breakpoint read a managed
+    // field chain live, e.g. a mode flag "0x441f32088*+0xb8*:b" or a curtain color.a "rdi+0x20*+...:f".
+    const char* g_bp_probe = nullptr;
+    // PROSPER_KSCAN=0x<Il2CppClass> : on the FIRST PROSPER_BP hit, scan the guest GC heap for every live
+    // object whose [obj]==this class and dump each address + PROSPER_KSCAN_FIELDS. Get the class address from a
+    // [bp-klass] line (which prints klass=0x..). This enumerates all instances of a class WITHOUT gdb/GC
+    // internals — pure guest-memory scan. PROSPER_KSCAN_FIELDS uses the probe grammar with "@" = the found
+    // object (e.g. "@+0x18:b;@+0x40*+0x10:s"). PROSPER_KSCAN_MAX caps dumped matches.
+    uint64_t    g_kscan_klass = 0;
+    const char* g_kscan_fields = nullptr;
+    int         g_kscan_max = 64;
+    bool        g_kscan_done = false;
+    void il2cpp_kscan(void* uctx);   // defined after bp_eval_probes
     void bp_write_byte(uint64_t addr, uint8_t val) {
         uint64_t pg = addr & ~(uint64_t)0xfff;
         mprotect((void*)pg, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
@@ -487,6 +511,164 @@ namespace {
         long w = syscall(SYS_write, g_probe_pipe[1], (const void*)a, 8);
         if (w > 0) { char b[8]; syscall(SYS_read, g_probe_pipe[0], b, (size_t)w); }
         return w == 8;
+    }
+    // Resolve an Il2CppObject's class name: obj -> [obj]=Il2CppClass* -> [klass+0x10]=name (C string).
+    // Returns bytes written (0 if unresolvable / not a plausible object). Async-signal-safe: probe_readable
+    // + reads only. Used by PROSPER_BP_KLASS (and reusable by any handler that has a candidate object ptr).
+    size_t bp_il2cpp_cname(uint64_t obj, char* s, size_t cap) {
+        if (cap == 0) return 0; s[0] = 0;
+        // probe_readable(X) verifies [X, X+8) — so guard each read with its BASE address (not base+size-1,
+        // which would leave the leading bytes of an unaligned read unverified and could fault in-handler).
+        if (obj < 0x1000 || !probe_readable(obj)) return 0;
+        uint64_t klass = *(const uint64_t*)obj;
+        if (klass < 0x1000 || !probe_readable(klass + 0x10)) return 0;
+        uint64_t namep = *(const uint64_t*)(klass + 0x10);
+        if (!probe_readable(namep)) return 0;
+        size_t k = 0;
+        for (; k + 1 < cap && k < 96 && probe_readable(namep + k); ++k) {
+            char c = *(const char*)(namep + k);
+            if (c == 0) break;
+            if (c < 0x20 || c > 0x7e) { if (k < 2) { s[0] = 0; return 0; } break; }
+            s[k] = c;
+        }
+        s[k] = 0;
+        return k >= 2 ? k : 0;
+    }
+    // Evaluate PROSPER_BP_PROBE chains against a saved register file and write the results to stderr.
+    // Grammar per chain: <start>[+0xN|*]...:<t>  where start = a register name or 0xADDR, "+N" adds an
+    // offset, "*" dereferences a qword, and the trailing ":t" reads q/d/b/f. Chains are separated by ';'
+    // or ','. Async-signal-safe: hand-rolled hex parse (no strtoull/locale), probe_readable + reads only.
+    // base != 0 makes the "@" start-token resolve to that object (used by PROSPER_KSCAN to dump each scanned
+    // instance's fields); uctx may be null (then register start-tokens simply fail to resolve). tag is the log
+    // line prefix.
+    void bp_eval_probes(const char* spec, void* uctx, uint64_t base, const char* tag) {
+        // PROSPER_GREGS resolves to a raw greg array on Linux but a view object on Darwin, so construct it with
+        // auto INSIDE reg_val (and only when uctx is provided — KSCAN passes uctx, so register tokens still work
+        // there, but a hypothetical null-uctx caller degrades cleanly to "@"/0xADDR only).
+        auto reg_val = [&](const char* p, size_t len, uint64_t* out) -> bool {
+            if (!uctx) return false;
+            auto gr = PROSPER_GREGS((ucontext_t*)uctx);
+            struct { const char* n; int idx; } R[] = {
+                {"rax",REG_RAX},{"rbx",REG_RBX},{"rcx",REG_RCX},{"rdx",REG_RDX},
+                {"rsi",REG_RSI},{"rdi",REG_RDI},{"rbp",REG_RBP},{"rsp",REG_RSP},
+                {"r10",REG_R10},{"r11",REG_R11},{"r12",REG_R12},{"r13",REG_R13},
+                {"r14",REG_R14},{"r15",REG_R15},{"r8",REG_R8},{"r9",REG_R9} };
+            for (auto& r : R) { size_t rn = 0; while (r.n[rn]) rn++;
+                if (rn == len) { bool eq = true; for (size_t i=0;i<len && eq;i++) if (r.n[i]!=p[i]) eq=false;
+                    if (eq) { *out = (uint64_t)gr[r.idx]; return true; } } }
+            return false;
+        };
+        auto hexval = [](const char** pp) -> uint64_t {
+            const char* p = *pp; uint64_t v = 0;
+            if (p[0]=='0' && (p[1]=='x'||p[1]=='X')) p += 2;
+            for (;; ++p) { char c=*p; uint64_t d;
+                if (c>='0'&&c<='9') d=c-'0'; else if (c>='a'&&c<='f') d=c-'a'+10;
+                else if (c>='A'&&c<='F') d=c-'A'+10; else break; v = v*16 + d; }
+            *pp = p; return v;
+        };
+        char out[400]; int on = snprintf(out, sizeof out, "%s", tag);
+        const char* p = spec;
+        while (*p && on < (int)sizeof out - 64) {
+            while (*p==';'||*p==','||*p==' ') p++;
+            if (!*p) break;
+            const char* start = p; uint64_t v = 0; bool have = false;
+            if (p[0]=='@') { v = base; have = true; p++; }
+            else if (p[0]=='0' && (p[1]=='x'||p[1]=='X')) { v = hexval(&p); have = true; }
+            else { const char* q = p; while ((*q>='a'&&*q<='z')||(*q>='0'&&*q<='9')) q++;
+                   if (reg_val(p, (size_t)(q-p), &v)) { have = true; p = q; } }
+            if (!have) break;
+            char type = 'q'; bool bad = false;
+            while (*p && *p!=';' && *p!=',') {
+                if (*p=='+') { p++; v += hexval(&p); }
+                else if (*p=='*') { p++; if (!probe_readable(v)) { bad = true; break; } v = *(const uint64_t*)v; }   // probe_readable(v) covers [v,v+8)
+                else if (*p==':') { p++; if (*p) { type = *p; p++; } break; }
+                else p++;
+            }
+            int slen = (int)(p - start); if (slen > 40) slen = 40;
+            if (bad) { on += snprintf(out+on, sizeof out-on, " %.*s=<unmapped>", slen, start); continue; }
+            // probe_readable(v) verifies [v,v+8), covering any 1..8-byte read at v (guard the read's base).
+            if (type=='s') {   // Il2CppString at v: length@0x10 (i32), UTF-16 chars@0x14 — print ASCII, capped.
+                on += snprintf(out+on, sizeof out-on, " %.*s=", slen, start);
+                if (probe_readable(v + 0x10)) {
+                    int len = *(const int32_t*)(v + 0x10);
+                    if (len < 0) len = 0; if (len > 48) len = 48;
+                    if (on < (int)sizeof out - 2) out[on++] = '"';
+                    for (int i = 0; i < len && on < (int)sizeof out - 3; ++i) {
+                        uint64_t ca = v + 0x14 + (uint64_t)i * 2;
+                        if (!probe_readable(ca)) break;
+                        uint16_t c = *(const uint16_t*)ca;
+                        out[on++] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+                    }
+                    if (on < (int)sizeof out - 2) out[on++] = '"';
+                } else if (on < (int)sizeof out - 1) out[on++] = '?';
+                continue;
+            }
+            char vb[40];
+            if (type=='b')      snprintf(vb, sizeof vb, probe_readable(v) ? "%u"     : "?", probe_readable(v) ? *(const uint8_t*)v  : 0);
+            else if (type=='d') snprintf(vb, sizeof vb, probe_readable(v) ? "0x%x"   : "?", probe_readable(v) ? *(const uint32_t*)v : 0);
+            else if (type=='f') snprintf(vb, sizeof vb, probe_readable(v) ? "f:0x%x" : "?", probe_readable(v) ? *(const uint32_t*)v : 0);
+            else                snprintf(vb, sizeof vb, probe_readable(v) ? "0x%llx" : "?", (unsigned long long)(probe_readable(v) ? *(const uint64_t*)v : 0));
+            on += snprintf(out+on, sizeof out-on, " %.*s=%s", slen, start, vb);
+        }
+        out[on] = '\n';
+        syscall(SYS_write, 2, out, (size_t)on + 1);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
+    }
+    // PROSPER_KSCAN one-shot enumerator: scan the guest GC-heap mappings (from /proc/self/maps, in the
+    // [0x20_00000000,0x28_00000000) object band) for every 8-aligned qword equal to g_kscan_klass — i.e. every
+    // live Il2CppObject of that class ([obj][0]=klass) — and dump each + PROSPER_KSCAN_FIELDS. Reads are on
+    // mapped, readable, private-anonymous ranges (untouched pages fault to the shared zero page: no RAM commit,
+    // no SIGSEGV), so no probe_readable is needed for the qword compare. Bounded by KSCAN_MAX and a byte cap.
+    void il2cpp_kscan(void* uctx) {
+        static char maps[256 * 1024];
+        long fd = syscall(SYS_open, "/proc/self/maps", O_RDONLY, 0);
+        if (fd < 0) { const char* e = "[kscan] open /proc/self/maps failed\n"; syscall(SYS_write, 2, e, 36); return; }
+        long total = 0, r;
+        while (total < (long)sizeof(maps) - 1 &&
+               (r = syscall(SYS_read, fd, maps + total, sizeof(maps) - 1 - (size_t)total)) > 0) total += r;
+        syscall(SYS_close, fd);
+        maps[total < 0 ? 0 : total] = 0;
+        char hdr[96]; int hn = snprintf(hdr, sizeof hdr, "[kscan] klass=0x%llx max=%d\n",
+                                        (unsigned long long)g_kscan_klass, g_kscan_max);
+        syscall(SYS_write, 2, hdr, (size_t)hn);
+        auto rdhex = [](const char** pp) -> uint64_t { uint64_t v = 0; const char* p = *pp;
+            for (;; ++p) { char c=*p; uint64_t d; if(c>='0'&&c<='9')d=c-'0'; else if(c>='a'&&c<='f')d=c-'a'+10;
+                else if(c>='A'&&c<='F')d=c-'A'+10; else break; v=v*16+d; } *pp=p; return v; };
+        int found = 0; uint64_t scanned = 0; const uint64_t CAP = 6ull << 30;
+        const char* p = maps;
+        while (*p && found < g_kscan_max && scanned < CAP) {
+            while (*p==' ') p++;
+            uint64_t s = rdhex(&p);
+            if (*p != '-') { while (*p && *p!='\n') p++; if (*p) p++; continue; }
+            p++; uint64_t e = rdhex(&p);
+            while (*p==' ') p++;
+            char perm0 = *p;                       // 'r' iff readable
+            while (*p && *p!='\n') p++; if (*p) p++;
+            // Scan only readable chunks in the guest object band. On this port that band is prosper's own device
+            // memory (a /memfd:prosper-dmem mapping split into readable chunks with PROT_NONE `---p` guard gaps
+            // between them); the guards are separate, non-readable map lines that this `'r'` check already
+            // excludes, so each scanned chunk is contiguously readable. That memfd is prosper-owned and never
+            // externally truncated, so the read cannot SIGBUS. (Best-effort snapshot: another guest thread could
+            // remap an in-band chunk between the /proc/self/maps read and a qword read — inherent to a one-shot
+            // live-heap scan; acceptable for an off-by-default diagnostic.)
+            if (perm0 != 'r' || e <= s) continue;
+            if (s < 0x2000000000ull || s >= 0x2800000000ull) continue;
+            uint64_t lim = e; if (lim - s > CAP - scanned) lim = s + (CAP - scanned);
+            for (uint64_t pos = (s + 7) & ~7ull; pos + 16 <= lim && found < g_kscan_max; pos += 8) {
+                // A genuine Il2CppObject header is {klass@0, monitor@8}; the monitor is null for a typical
+                // instance. Requiring [pos+8]==0 rejects the false positives that are just klass-pointer FIELDS
+                // inside Il2CppClass metadata (whose next qword is another non-null metadata pointer).
+                if (*(const uint64_t*)pos != g_kscan_klass) continue;
+                if (pos + 0x400 > g_kscan_klass && pos < g_kscan_klass + 0x400) continue;  // skip the Il2CppClass struct's own self-referencing fields
+                if (*(const uint64_t*)(pos + 8) != 0) continue;
+                found++;
+                char tag[80]; snprintf(tag, sizeof tag, "[kscan] #%d obj=0x%llx", found, (unsigned long long)pos);
+                bp_eval_probes(g_kscan_fields ? g_kscan_fields : "", uctx, pos, tag);
+            }
+            scanned += (lim - s);
+        }
+        char sum[96]; int sn = snprintf(sum, sizeof sum, "[kscan] done: %d instance(s), %llu MiB scanned\n",
+                                        found, (unsigned long long)(scanned >> 20));
+        syscall(SYS_write, 2, sum, (size_t)sn);
     }
     // PROSPER_DUMPAT="0xADDR[,0xADDR...]" — dump 0x40 bytes at each ABSOLUTE guest address at fault
     // time (up to 6). Complements the register-relative FAULTMEM/PEEK when the address of interest
@@ -1319,6 +1501,30 @@ namespace {
                     }
                     if (n < (int)sizeof b - 1) b[n++] = '\n';
                     syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
+                    // PROSPER_BP_PROBE: evaluate the configured pointer/field chains at this hit (first,
+                    // so it is never skipped by a KLASS-candidate issue below).
+                    if (g_bp_probe) bp_eval_probes(g_bp_probe, uc, 0, "[bp-probe]");
+                    // PROSPER_KSCAN: on the first hit, scan the guest heap for every live instance of the
+                    // target class and dump each + its fields (one-shot; see il2cpp_kscan).
+                    if (g_kscan_klass && !g_kscan_done) { g_kscan_done = true; il2cpp_kscan(uc); }
+                    // PROSPER_BP_KLASS: name the IL2CPP object in each candidate register. Only probe values
+                    // in the guest GC-heap band [0x20_00000000, 0x28_00000000) — host stack pointers (0x7f..),
+                    // module/code pointers (0x4..) and small values are not objects and needlessly walk the
+                    // obj->klass->name chain over unrelated memory.
+                    if (g_bp_klass) {
+                        const struct { const char* rn; uint64_t v; } cand[] = {
+                            {"rdi",rdi},{"rsi",rsi},{"rdx",rdx},{"rcx",rcx},{"r8",r8},{"r9",(uint64_t)gr[REG_R9]},
+                            {"rbx",(uint64_t)gr[REG_RBX]},{"rax",rax},{"r14",r14},{"r15",r15} };
+                        for (auto& c : cand) {
+                            if (c.v < 0x2000000000ull || c.v >= 0x2800000000ull) continue;
+                            char nm[112];
+                            if (bp_il2cpp_cname(c.v, nm, sizeof nm)) {
+                                char kb[176]; int kn = snprintf(kb, sizeof kb, "[bp-klass] %s=0x%llx %s\n",
+                                    c.rn, (unsigned long long)c.v, nm);
+                                syscall(SYS_write, 2, kb, (size_t)kn);
+                            }
+                        }
+                    }
                 }
                 bp_write_byte(g_bp_addr, g_bp_orig);              // restore real instruction
                 PROSPER_GREGS(uc)[REG_RIP] = (greg_t)g_bp_addr;  // re-execute it
@@ -1648,6 +1854,32 @@ namespace {
         g_r14 = (uint64_t)g[REG_R14]; g_r15 = (uint64_t)g[REG_R15];
         g_trap_sig = sig;
         g_trap_kind = (sig == SIGILL) ? 3 : 2;
+        // Guest `int $0x41` (opcode CD 41) is RAGE's software breakpoint / assert trap (GTA V,
+        // PPSA04263, #1138). On PS5 an int with a userspace-illegal vector raises #GP; the kernel's
+        // trap handler, with no debugger attached, simply returns past it — so the game continues to
+        // its OWN error-reporting/recovery code after the trap. prosper must emulate the same "no
+        // debugger → skip the breakpoint" behavior, or the trap SIGSEGVs and kills the thread (the
+        // reason GTA V needed the PROSPER_FAULT_SKIP=0x2b2c463:0x2b2c465 diagnostic crutch just to
+        // render its intro). Only fires for a guest-module rip whose bytes really are CD 41; every
+        // other title is unaffected (none emit int 0x41). The rip page is mapped+exec (the trap was
+        // fetched from it), so a direct 2-byte read guarded by the guest band is safe in-handler.
+        // Disable with PROSPER_NO_INT41_SKIP to fall back to the fatal path for debugging.
+        if (g_int41_skip && sig == SIGSEGV && g_base && g_fault_rip >= g_base &&
+            g_fault_rip < g_base + 0x100000000ull) {
+            const auto* ins = (const uint8_t*)g_fault_rip;
+            if (ins[0] == 0xCDu && ins[1] == 0x41u) {
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1) < 8) {
+                    char b[96];
+                    int n = snprintf(b, sizeof b,
+                        "[int41] guest int $0x41 (debugbreak) at eboot+0x%llx -> skipped\n",
+                        (unsigned long long)(g_fault_rip - g_base));
+                    syscall(SYS_write, 2, b, (size_t)n);
+                }
+                g[REG_RIP] = g_fault_rip + 2;   // advance past the 2-byte int instruction
+                return;
+            }
+        }
         // PROSPER_FAULT_SKIP="<fault-off>[:<resume-off>]" DIAGNOSTIC (bring-up, NOT a fix): when a fault
         // hits at eboot+<fault-off>, set rax=0 and resume the guest at eboot+<resume-off> (default
         // fault-off+4, i.e. skip one short instruction). Lets the guest survive ONE specific crash so
@@ -1935,6 +2167,7 @@ void install_sigaltstack() {
 
 void install_trap_handler() {
     g_faultmem = getenv("PROSPER_FAULTMEM") != nullptr;   // read once (getenv is not signal-safe)
+    g_int41_skip = getenv("PROSPER_NO_INT41_SKIP") == nullptr;   // read once (getenv is not signal-safe) — #1138
     // Expose the perf HW write-watch to HLE code (dispatch.hpp g_hwwatch_hook): lets an HLE-side
     // diagnostic arm a watch on a runtime-discovered guest slot (one watch; extra calls ignored).
     // Installs the SIGTRAP handler on demand (the watch may be armed without PROSPER_HWBP).
@@ -2014,6 +2247,11 @@ void install_trap_handler() {
     if (const char* bp = getenv("PROSPER_BP")) {
         g_bp_addr = g_base + strtoull(bp, nullptr, 0);
         if (const char* m = getenv("PROSPER_BP_MAX")) g_bp_max = (int)strtoul(m, nullptr, 0);
+        g_bp_klass = getenv("PROSPER_BP_KLASS") != nullptr;
+        g_bp_probe = getenv("PROSPER_BP_PROBE");   // stable environ string; read (not copied) in the handler
+        if (const char* k = getenv("PROSPER_KSCAN")) g_kscan_klass = strtoull(k, nullptr, 0);
+        g_kscan_fields = getenv("PROSPER_KSCAN_FIELDS");
+        if (const char* m = getenv("PROSPER_KSCAN_MAX")) g_kscan_max = (int)strtoul(m, nullptr, 0);
         ensure_probe_pipe();
         g_bp_on = true;   // the actual 0xCC is written after the image is mapped (arm_bp below)
     }
