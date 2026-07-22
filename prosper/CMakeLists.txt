@@ -247,6 +247,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_http PRIVATE prosper_core)
   add_test(NAME http_hle COMMAND test_http)
 
+  add_executable(test_guard_recursion tests/test_guard_recursion.cpp)
+  target_link_libraries(test_guard_recursion PRIVATE prosper_core Threads::Threads)
+  add_test(NAME guard_recursion COMMAND test_guard_recursion)
+  set_tests_properties(guard_recursion PROPERTIES TIMEOUT 30)
+
   add_executable(test_font tests/test_font.cpp)
   target_link_libraries(test_font PRIVATE prosper_core)
   add_test(NAME font_hle COMMAND test_font)

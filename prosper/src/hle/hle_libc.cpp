@@ -17,6 +17,8 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <thread>
+#include <unordered_map>
 
 // setjmp/longjmp — the guest's Boehm GC calls setjmp to flush callee-saved registers to a
 // buffer so it can scan them as GC roots (and the runtime uses it for exception unwinding).
@@ -492,7 +494,27 @@ HLE(h_cxa_finalize){ return 0; }
 // exactly one thread and blocks the rest until release/abort. Contenders park on one global
 // mutex/condvar pair (init is cold; the winner runs its constructor OUTSIDE the lock, so
 // independent guards cannot deadlock each other); the fast path stays a lock-free acquire-load.
-namespace { std::mutex g_guard_mx; std::condition_variable g_guard_cv; }
+//
+// Recursion (#979): the thread that claimed a guard runs the initializer; if THAT initializer
+// re-enters the SAME guard (a lazy singleton whose constructor touches itself), the old code saw
+// busy=1 (which the thread itself set) and blocked on the condvar — a self-deadlock (it waits for
+// itself to release). The Itanium C++ ABI forbids recursive initialization; PS5's libc++abi aborts
+// with "recursive_init". We track the claiming thread per in-flight guard/flag in g_init_owner and,
+// on re-entry by the same thread, break the deadlock without re-running the initializer (guard ->
+// return 0 "don't run", once -> return 1 "already done") and log loudly rather than aborting the
+// whole emulator over one guest's dubious static. A different thread contending is unchanged: it is
+// not the owner, so it falls through to wait() exactly as before. The map only ever holds the
+// handful of guards/flags CURRENTLY initializing (an entry is erased on release/abort/completion),
+// so it cannot grow unboundedly. CONFIDENCE: MED — correct guests never take this path (they would
+// abort on hardware too); the value is converting a silent hang into a visible, non-fatal event.
+namespace {
+    std::mutex g_guard_mx;
+    std::condition_variable g_guard_cv;
+    // in-flight guard/flag address -> the thread that claimed it (recursion detection). Guarded by
+    // g_guard_mx. Keyed by host address; a guest thread runs its HLE calls on its own host thread,
+    // so std::this_thread::get_id() is a stable per-guest-thread identity across acquire/init/re-entry.
+    std::unordered_map<const void*, std::thread::id> g_init_owner;
+}
 HLE(h_guard_acquire) {
     auto* g = (std::atomic<uint8_t>*)P(a0);
     if (g->load(std::memory_order_acquire)) return 0;      // already initialized
@@ -500,7 +522,19 @@ HLE(h_guard_acquire) {
     for (;;) {
         if (g->load(std::memory_order_acquire)) return 0;  // init finished while we waited
         uint8_t* busy = (uint8_t*)g + 1;
-        if (!*busy) { *busy = 1; return 1; }               // we win: caller runs the initializer
+        if (!*busy) {                                      // we win: caller runs the initializer
+            *busy = 1;
+            g_init_owner[g] = std::this_thread::get_id();
+            return 1;
+        }
+        auto owner = g_init_owner.find(g);
+        if (owner != g_init_owner.end() && owner->second == std::this_thread::get_id()) {
+            // Same thread re-entering its own in-flight guard = recursive static init (ABI-illegal).
+            // Blocking here would deadlock on ourselves; return 0 (don't re-run) instead.
+            std::fprintf(stderr, "[hle] __cxa_guard_acquire: recursive initialization of guard %p by "
+                                 "the same thread (guest C++ ABI violation); not re-running\n", (void*)g);
+            return 0;
+        }
         g_guard_cv.wait(lk);
     }
 }
@@ -508,13 +542,14 @@ HLE(h_guard_release) {
     auto* g = (std::atomic<uint8_t>*)P(a0);
     { std::lock_guard<std::mutex> lk(g_guard_mx);
       ((uint8_t*)g)[1] = 0;
+      g_init_owner.erase(g);
       g->store(1, std::memory_order_release); }
     g_guard_cv.notify_all();
     return 0;
 }
 HLE(h_guard_abort) {   // initializer threw: clear busy so another thread can retry
     auto* g = (std::atomic<uint8_t>*)P(a0);
-    { std::lock_guard<std::mutex> lk(g_guard_mx); ((uint8_t*)g)[1] = 0; }
+    { std::lock_guard<std::mutex> lk(g_guard_mx); ((uint8_t*)g)[1] = 0; g_init_owner.erase(g); }
     g_guard_cv.notify_all();
     return 0;
 }
@@ -534,13 +569,25 @@ HLE(h_execute_once) {
         std::unique_lock<std::mutex> lk(g_guard_mx);
         uint32_t v = flag->load(std::memory_order_acquire);
         if (v == 1) return 1;
-        if (v == 2) { g_guard_cv.wait(lk); continue; }              // another thread is running it
+        if (v == 2) {                                               // an init is running
+            auto owner = g_init_owner.find(flag);
+            if (owner != g_init_owner.end() && owner->second == std::this_thread::get_id()) {
+                // Same thread re-entering call_once on its own in-flight flag = recursive init
+                // (UB per the standard; would self-deadlock). Treat as done without re-running.
+                std::fprintf(stderr, "[hle] std::call_once: recursive execution of once_flag %p by the "
+                                     "same thread (guest UB); not re-running\n", (void*)flag);
+                return 1;
+            }
+            g_guard_cv.wait(lk); continue;                          // another thread is running it
+        }
         flag->store(2, std::memory_order_relaxed);
+        g_init_owner[flag] = std::this_thread::get_id();
         lk.unlock();
         void* ctx = nullptr;
         int r = cb ? cb((void*)P(a0), (void*)P(a2), &ctx) : 1;
         lk.lock();
         flag->store(r ? 1u : 0u, std::memory_order_release);        // failure -> retryable next call
+        g_init_owner.erase(flag);
         lk.unlock();
         g_guard_cv.notify_all();
         return (uint64_t)(r ? 1 : 0);
