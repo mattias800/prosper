@@ -1230,9 +1230,21 @@ HLE(k_ampr_x4) { return ampr_arglog("GuchCTefuZw", a0, a1, a2, a3, a4, a5); }
 // mQ16-QdKv7k in hle_file.cpp): every read queued before this WriteAddress is already complete when
 // this call is made. The completion condition the write represents is therefore already satisfied, so
 // we perform the write here, immediately — consistent with prosper's eager-read model and correct in
-// command order (the write only ever follows its reads). Fault-safe (process_vm_writev refuses an
-// unmapped guest VA instead of faulting the HLE — see issue #1154); *value* is written verbatim (the
-// guest polls for the exact token it queued — GTA increments it per submit: 0, then 4, 5, 6, ...).
+// command order (the write only ever follows its reads). *value* is written verbatim (the guest polls
+// for the exact token it queued — GTA increments it per submit: 0, then 4, 5, 6, ...).
+//
+// Residual hazard (documented, not hit by the observed protocol): because the write fires at
+// append-time rather than at an explicit submit, a title that re-armed *address to its pending
+// sentinel AFTER appending WriteAddress but BEFORE submitting would lose this completion. GTA pre-arms
+// the sentinel FIRST (verified: *addr is already 0xffffffffffffffff when this call is made), so the
+// ordering is safe here; revisit if a future title's WriteAddress completion is dropped.
+//
+// The write is fault-safe (never faults the HLE on a bad guest VA — see issue #1154) AND commits
+// lazy-reserved pages the way the SIGSEGV fault handler does: process_vm_writev cannot fault through
+// prosper's lazy-commit handler, so a target in a guest-RESERVED-but-untouched range would EFAULT even
+// though a real guest write would succeed — so we commit-and-retry, exactly like apr_write_guest_dst
+// in hle_file.cpp. A genuinely undeliverable completion write is logged LOUDLY (unconditionally): a
+// silently dropped completion is precisely the invisible stall this fix exists to remove.
 //
 // Live GTA V evidence: post-intro streaming appends one such command per small metadata buffer, e.g.
 //   j0+3uJMxYJY(cb=0x20001f13f0, addr=cb+0x40, value=0)   with *addr pre-set to 0xffffffffffffffff.
@@ -1242,17 +1254,34 @@ HLE(k_ampr_x4) { return ampr_arglog("GuchCTefuZw", a0, a1, a2, a3, a4, a5); }
 // complete and the game advances past the intro into further streaming. CONFIDENCE: HIGH (ABI +
 // address/value verified live; the write clears the stall and the boot progresses).
 namespace { bool wa_log() { static int v = getenv("PROSPER_FILELOG") ? 1 : 0; return v; } }
+extern "C" int prosper_reserved_range_state(uint64_t addr);   // defined below (lazy-commit tracking)
 HLE(k_ampr_write_address) {   // j0+3uJMxYJY (cb, address, value, flags)
-    (void)a0; (void)a3;
-    if (a1) {
-        struct iovec local { &a2, sizeof(a2) };
-        struct iovec remote { (void*)(uintptr_t)a1, sizeof(a2) };
-        ssize_t n = process_vm_writev(getpid(), &local, 1, &remote, 1, 0);
-        if (wa_log())
-            fprintf(stderr, "[apr] write-address *0x%llx = 0x%llx (%s)\n",
-                    (unsigned long long)a1, (unsigned long long)a2,
-                    n == (ssize_t)sizeof(a2) ? "OK" : "UNMAPPED");
+    (void)a0;
+    if (!a1) return 0;
+    uint64_t value = a2;
+    struct iovec local { &value, sizeof(value) };
+    struct iovec remote { (void*)(uintptr_t)a1, sizeof(value) };
+    bool ok = process_vm_writev(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)sizeof(value);
+    if (!ok) {
+        // Commit any covering 64 KiB pages that are lazy-reserved-but-untouched, then retry once.
+        bool committed = false;
+        for (uint64_t p = a1 & ~0xffffull; p < a1 + sizeof(value); p += 0x10000) {
+            unsigned char vec;
+            if (prosper_mincore((void*)(uintptr_t)p, 1, &vec) != 0 &&
+                prosper_reserved_range_state(p) == 1 &&
+                mmap((void*)(uintptr_t)p, 0x10000, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == (void*)(uintptr_t)p)
+                committed = true;
+        }
+        if (committed)
+            ok = process_vm_writev(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)sizeof(value);
     }
+    if (!ok)
+        fprintf(stderr, "[apr] write-address *0x%llx = 0x%llx UNMAPPED — completion write dropped\n",
+                (unsigned long long)a1, (unsigned long long)value);
+    else if (wa_log())
+        fprintf(stderr, "[apr] write-address *0x%llx = 0x%llx (a3=0x%llx) OK\n",
+                (unsigned long long)a1, (unsigned long long)value, (unsigned long long)a3);
     return 0;
 }
 // --- APR completion-event plumbing (issues #115/#180/#208). Live-captured surface:

@@ -10,6 +10,9 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#ifndef _WIN32
+#include <sys/mman.h>   // mmap/munmap — WriteAddress fault-safety check (#1149/#1154)
+#endif
 #include "../src/host/exec_image.hpp"
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
@@ -252,6 +255,20 @@ int main() {
 
         // A null address must be a safe no-op (never fault the HLE).
         CHECK(write_address_guest(cb, 0, 0x2a, 0) == 0, "WriteAddress tolerates a null address");
+
+        // Fault-safety (issue #1154): a non-null but UNMAPPED target must not fault the HLE. Reserve
+        // then release a page so the address is valid-shaped but unmapped, and confirm the handler
+        // returns cleanly (it drops the undeliverable write and logs, rather than SIGSEGVing).
+#ifndef _WIN32
+        void* scratch = mmap(nullptr, 0x1000, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (scratch != MAP_FAILED) {
+            uint64_t unmapped = (uint64_t)(uintptr_t)scratch;
+            munmap(scratch, 0x1000);
+            CHECK(write_address_guest(cb, unmapped, 0x2a, 0) == 0,
+                  "WriteAddress tolerates an unmapped target without faulting");
+        }
+#endif
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
