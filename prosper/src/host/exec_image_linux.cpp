@@ -86,6 +86,7 @@ namespace {
     // trustworthy way to inspect deep crashes (e.g. the null std::ctype facet at eboot+0x3b5ea6).
     bool g_faultmem = false;
     bool g_faultlog = false;
+    bool g_int41_skip = true;   // guest int $0x41 (RAGE debugbreak) -> skip; PROSPER_NO_INT41_SKIP disables (#1138)
     // Probe pipe for probe_readable() below — a pipe write imports the source pages (EFAULT on
     // unmapped memory) where a /dev/null write does not. O_NONBLOCK so a full pipe can never
     // block the fault handler; drained after every probe.
@@ -1845,6 +1846,32 @@ namespace {
         g_r14 = (uint64_t)g[REG_R14]; g_r15 = (uint64_t)g[REG_R15];
         g_trap_sig = sig;
         g_trap_kind = (sig == SIGILL) ? 3 : 2;
+        // Guest `int $0x41` (opcode CD 41) is RAGE's software breakpoint / assert trap (GTA V,
+        // PPSA04263, #1138). On PS5 an int with a userspace-illegal vector raises #GP; the kernel's
+        // trap handler, with no debugger attached, simply returns past it — so the game continues to
+        // its OWN error-reporting/recovery code after the trap. prosper must emulate the same "no
+        // debugger → skip the breakpoint" behavior, or the trap SIGSEGVs and kills the thread (the
+        // reason GTA V needed the PROSPER_FAULT_SKIP=0x2b2c463:0x2b2c465 diagnostic crutch just to
+        // render its intro). Only fires for a guest-module rip whose bytes really are CD 41; every
+        // other title is unaffected (none emit int 0x41). The rip page is mapped+exec (the trap was
+        // fetched from it), so a direct 2-byte read guarded by the guest band is safe in-handler.
+        // Disable with PROSPER_NO_INT41_SKIP to fall back to the fatal path for debugging.
+        if (g_int41_skip && sig == SIGSEGV && g_base && g_fault_rip >= g_base &&
+            g_fault_rip < g_base + 0x100000000ull) {
+            const auto* ins = (const uint8_t*)g_fault_rip;
+            if (ins[0] == 0xCDu && ins[1] == 0x41u) {
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1) < 8) {
+                    char b[96];
+                    int n = snprintf(b, sizeof b,
+                        "[int41] guest int $0x41 (debugbreak) at eboot+0x%llx -> skipped\n",
+                        (unsigned long long)(g_fault_rip - g_base));
+                    syscall(SYS_write, 2, b, (size_t)n);
+                }
+                g[REG_RIP] = g_fault_rip + 2;   // advance past the 2-byte int instruction
+                return;
+            }
+        }
         // PROSPER_FAULT_SKIP="<fault-off>[:<resume-off>]" DIAGNOSTIC (bring-up, NOT a fix): when a fault
         // hits at eboot+<fault-off>, set rax=0 and resume the guest at eboot+<resume-off> (default
         // fault-off+4, i.e. skip one short instruction). Lets the guest survive ONE specific crash so
@@ -2132,6 +2159,7 @@ void install_sigaltstack() {
 
 void install_trap_handler() {
     g_faultmem = getenv("PROSPER_FAULTMEM") != nullptr;   // read once (getenv is not signal-safe)
+    g_int41_skip = getenv("PROSPER_NO_INT41_SKIP") == nullptr;   // read once (getenv is not signal-safe) — #1138
     // Expose the perf HW write-watch to HLE code (dispatch.hpp g_hwwatch_hook): lets an HLE-side
     // diagnostic arm a watch on a runtime-discovered guest slot (one watch; extra calls ignored).
     // Installs the SIGTRAP handler on demand (the watch may be armed without PROSPER_HWBP).
