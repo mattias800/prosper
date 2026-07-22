@@ -21,6 +21,7 @@ inline constexpr uint64_t kHugeReserveLen = 0x2000000000ull;   // 128 GiB
 #include "../host/posix_shim.hpp"
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>   // process_vm_writev — fault-safe APR completion write (#1149)
 #include <unistd.h>
 #include <fcntl.h>
 #ifdef __linux__
@@ -1213,6 +1214,47 @@ HLE(k_ampr_getsize) {
 }
 HLE(k_ampr_x3) { return ampr_arglog("Qs1xtplKo0U", a0, a1, a2, a3, a4, a5); }
 HLE(k_ampr_x4) { return ampr_arglog("GuchCTefuZw", a0, a1, a2, a3, a4, a5); }
+
+// --- APR command-buffer WriteAddress (NID j0+3uJMxYJY) — the APR completion-notification primitive
+// (issue #1149). The NID is taken verbatim from GTA V (PPSA04263)'s import table; its exact firmware
+// name is not in the PS5 3.20 dump (and does NOT hash from Kyty's guessed
+// "sceAmprCommandBufferWriteAddress"), so the name is unverified — the behavior below is re-derived
+// from the guest's use and confirmed against a live capture, NOT copied from a secondary source.
+// Signature: (cb, u64* address, u64 value, u32 flags).
+// It appends a "write value -> *address" command to the APR command buffer; the APR engine performs
+// that write when the buffer executes, in command-buffer order (i.e. AFTER the reads queued before
+// it). The guest uses it as a load-completion signal: it pre-sets *address to a "pending" sentinel,
+// appends WriteAddress(address, doneValue), then spin-polls *address for doneValue on a waiter thread.
+//
+// prosper serves the APR ReadFile commands SYNCHRONOUSLY at append time (see f_apr_read_submit /
+// mQ16-QdKv7k in hle_file.cpp): every read queued before this WriteAddress is already complete when
+// this call is made. The completion condition the write represents is therefore already satisfied, so
+// we perform the write here, immediately — consistent with prosper's eager-read model and correct in
+// command order (the write only ever follows its reads). Fault-safe (process_vm_writev refuses an
+// unmapped guest VA instead of faulting the HLE — see issue #1154); *value* is written verbatim (the
+// guest polls for the exact token it queued — GTA increments it per submit: 0, then 4, 5, 6, ...).
+//
+// Live GTA V evidence: post-intro streaming appends one such command per small metadata buffer, e.g.
+//   j0+3uJMxYJY(cb=0x20001f13f0, addr=cb+0x40, value=0)   with *addr pre-set to 0xffffffffffffffff.
+// prosper previously stubbed the NID (returned 0, wrote nothing), so *address stayed pending forever
+// and the RAGE main thread busy-waited (eboot+0x2b5f0e0 sched_yield loop) on the load future's ready
+// flag gated behind this write — the title-screen-frontier stall. Performing the write lets the load
+// complete and the game advances past the intro into further streaming. CONFIDENCE: HIGH (ABI +
+// address/value verified live; the write clears the stall and the boot progresses).
+namespace { bool wa_log() { static int v = getenv("PROSPER_FILELOG") ? 1 : 0; return v; } }
+HLE(k_ampr_write_address) {   // j0+3uJMxYJY (cb, address, value, flags)
+    (void)a0; (void)a3;
+    if (a1) {
+        struct iovec local { &a2, sizeof(a2) };
+        struct iovec remote { (void*)(uintptr_t)a1, sizeof(a2) };
+        ssize_t n = process_vm_writev(getpid(), &local, 1, &remote, 1, 0);
+        if (wa_log())
+            fprintf(stderr, "[apr] write-address *0x%llx = 0x%llx (%s)\n",
+                    (unsigned long long)a1, (unsigned long long)a2,
+                    n == (ssize_t)sizeof(a2) ? "OK" : "UNMAPPED");
+    }
+    return 0;
+}
 // --- APR completion-event plumbing (issues #115/#180/#208). Live-captured surface:
 //   sSAUCCU1dv4(eq=APREventQueue, id=0x74fe+ring, 0, 0, 0x43, 0)  — register APR ids on an equeue
 //     (called 6x, rings 0..5, by the guest listener-ctx ctor eboot+0x22a0670)
@@ -1630,6 +1672,10 @@ void register_kernel_mem_hle() {
     Hle::register_fn("H896Pt-yB4I", (HleFn)k_apr_cb_set_equeue, "AprCbSetEventQueue?");
     Hle::register_fn("ASoW5WE-UPo", (HleFn)k_apr_submit,        "AprSubmitCommandBuffer?");
     Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_u3,           "AmprUnknown3");
+    // APR completion-notification write, performed eagerly (#1149). NID from GTA V's import table; the
+    // exact firmware name is unknown (not in the 3.20 dump, and it does not hash from Kyty's guessed
+    // "sceAmprCommandBufferWriteAddress"), so the label carries a "?" per the unverified-name convention.
+    Hle::register_fn("j0+3uJMxYJY", (HleFn)k_ampr_write_address, "sceAmprCommandBufferWriteAddress?");
 }
 
 } // namespace prosper
