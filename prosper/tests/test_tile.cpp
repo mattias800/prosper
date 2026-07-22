@@ -112,6 +112,11 @@ int main() {
     CHECK(roundtrip_ok(64, 64),     "round-trip 64x64");
     CHECK(roundtrip_ok(1920, 1080), "round-trip 1920x1080 (the game's render target)");
     CHECK(roundtrip_ok(96, 64),     "round-trip 96x64 (non-square)");
+    // Large surfaces (>= 512 KB) take the row-parallel detile path (#1177). These round-trips exercise
+    // it across many thread chunks; identity here proves the threaded walk is byte-for-byte equal to the
+    // single-threaded/oracle result. (Run under PROSPER_DETILE_SINGLE_THREADED to confirm the control.)
+    CHECK(roundtrip_ok(2048, 2048), "round-trip 2048x2048 (row-parallel detile, 4K-class)");
+    CHECK(roundtrip_ok(3840, 2160), "round-trip 3840x2160 (row-parallel detile, native 4K)");
 
     // The vector convenience overload must be safe for a NATURALLY-sized (width*height*4, unpadded)
     // tiled input: it zero-pads internally instead of reading past the vector (heap OOB). The visible
