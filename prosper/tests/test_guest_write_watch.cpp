@@ -81,6 +81,7 @@ int main() {
 
 #else   // ---- Linux: exercise the real mprotect + SIGSEGV dirty-tracking (#1144) ------------------
 
+#include <cerrno>
 #include <csignal>
 #include <cstring>
 #include <sys/mman.h>
@@ -165,6 +166,60 @@ int main() {
     CHECK(watch.query() == GuestWriteWatchQuery::Unchanged, "clean before physical write");
     prosper::host::guest_write_watch_notify_physical_write(kPhys + page, page);
     CHECK(watch.query() == GuestWriteWatchQuery::Dirty, "physical write marks the watch Dirty");
+
+    // B2: an alias mapped AFTER the watch is armed must be armed too, or a write through it would not
+    // fault and the watch would wrongly read Unchanged (stale texture). notify_direct_mapping_added must
+    // extend the existing page's coverage in place — without a spurious Dirty for same-phys aliasing.
+    CHECK(watch.rearm(), "rearm before late-alias test");
+    CHECK(watch.query() == GuestWriteWatchQuery::Unchanged, "clean before late alias");
+    auto* c = static_cast<uint8_t*>(mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+    CHECK(c != MAP_FAILED, "third alias mapped");
+    prosper::host::guest_write_watch_notify_direct_mapping_added(
+        reinterpret_cast<uint64_t>(c), size, kPhys, kCpuRw);
+    CHECK(watch.query() == GuestWriteWatchQuery::Unchanged,
+          "adding a same-phys alias does not spuriously dirty the watch");
+    c[page * 3 + 0x20] = 0x3c;   // write through the LATE alias
+    CHECK(c[page * 3 + 0x20] == 0x3c, "write through late alias lands");
+    CHECK(watch.query() == GuestWriteWatchQuery::Dirty,
+          "a write through an alias added AFTER arming is caught (B2)");
+
+    // B5: a real kernel write (::read) into an armed read-only page returns EFAULT — the exact failure a
+    // texture-streaming sceKernelPread would hit. Pre-announcing the write disarms the range so the store
+    // lands and the watch reads Dirty, matching read_full()'s guard.
+    CHECK(watch.rearm(), "rearm before kernel-write test");
+    {
+        int pf[2]; CHECK(pipe(pf) == 0, "pipe A created");
+        const char payload[8] = {9, 8, 7, 6, 5, 4, 3, 2};
+        CHECK(write(pf[1], payload, sizeof payload) == (ssize_t)sizeof payload, "payload A queued");
+        errno = 0;
+        const ssize_t blocked = read(pf[0], a + page * 3, sizeof payload);   // page armed RO -> EFAULT
+        CHECK(blocked < 0 && errno == EFAULT, "kernel write into an armed page is blocked (EFAULT)");
+        close(pf[0]); close(pf[1]);
+    }
+    {
+        int pf[2]; CHECK(pipe(pf) == 0, "pipe B created");
+        const char payload[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+        CHECK(write(pf[1], payload, sizeof payload) == (ssize_t)sizeof payload, "payload B queued");
+        prosper::host::guest_write_watch_notify_host_write(
+            reinterpret_cast<uint64_t>(a + page * 3), sizeof payload);
+        const ssize_t got = read(pf[0], a + page * 3, sizeof payload);       // disarmed -> lands
+        CHECK(got == (ssize_t)sizeof payload, "kernel read into a pre-announced guest page succeeds (B5)");
+        CHECK(a[page * 3] == 1 && a[page * 3 + 7] == 8, "kernel-written bytes landed");
+        CHECK(watch.query() == GuestWriteWatchQuery::Dirty, "kernel write marks the watch Dirty (B5)");
+        close(pf[0]); close(pf[1]);
+    }
+
+    // B4: removing ONE alias of a multi-alias page must drop only that alias and keep the page covered by
+    // the survivors (not orphan a stale entry, and not stop faulting). Remove alias c; a write through a
+    // must still be caught.
+    prosper::host::guest_write_watch_notify_direct_mapping_removed(reinterpret_cast<uint64_t>(c), size);
+    CHECK(watch.rearm(), "rearm after removing one alias");
+    CHECK(watch.query() == GuestWriteWatchQuery::Unchanged, "clean after removing one alias");
+    a[page + 0x24] = 0x4b;   // write through a surviving alias
+    CHECK(a[page + 0x24] == 0x4b, "write through surviving alias lands");
+    CHECK(watch.query() == GuestWriteWatchQuery::Dirty,
+          "a page still covered by a surviving alias keeps faulting after a sibling alias is removed (B4)");
+    munmap(c, size);
 
     // A watch over a range with NO known mapping must return Unknown (exact fallback), not arm.
     GuestWriteWatch none = GuestWriteWatch::create(0x9000000000ULL, page);

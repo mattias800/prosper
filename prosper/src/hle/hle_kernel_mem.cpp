@@ -339,6 +339,11 @@ namespace {
         host::notify_guest_mapping_removed(base, len);
         for (const auto& m : retagged)
             host::notify_guest_mapping_added(m.base, m.size, m.committed && (prot & 0x1));
+        // Protection chokepoint for the texture write-watch (#1144 B3): a guest mprotect/mtypeprotect
+        // (or batch PROTECT) that flips a watched page's writability out from under our read-only arming
+        // must invalidate the watch — otherwise a subsequent CPU store would not fault yet the renderer
+        // would still read Unchanged. `guest_prot` carries the Sony bits the watch decodes.
+        host::guest_write_watch_notify_direct_mapping_protection(base, len, guest_prot);
     }
 
     // Re-tag direct mappings with a new memory type while preserving virtual-to-physical offset
@@ -586,8 +591,8 @@ namespace {
     // Map `len` bytes of the phys pool at `hint` (0 = anywhere). Falls back to anonymous memory
     // if the memfd is unavailable (still boots; loses aliasing). A zero-hint mapping honors the
     // caller's requested VA alignment; the old host-page-aligned mmap violated that ABI contract.
-    void* map_phys_at(uint64_t hint, uint64_t len, int prot, uint64_t phys, uint64_t align = 0,
-                      bool fixed = true) {
+    void* map_phys_at_impl(uint64_t hint, uint64_t len, int prot, uint64_t phys, uint64_t align,
+                           bool fixed) {
         int fd = dmem_fd();
         if (fd >= 0 && phys < kDmemBase + kDmemTotal) {
             if (!hint) {
@@ -632,6 +637,21 @@ namespace {
         if (!reserved) return nullptr;
         void* p = mmap(reserved, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
         if (p == MAP_FAILED) { munmap(reserved, len); return nullptr; }
+        return p;
+    }
+
+    // Single chokepoint for physical-dmem mapping. EVERY dmem alias (map_dmem, BatchMap MAP_DIRECT, Ampr
+    // push-map + its same-phys mirror) funnels through here, so the texture write-watch (#1144) learns
+    // the VA<->phys alias from one place — it can then arm every VA that maps a watched physical page,
+    // rather than only the ones a specific high-level API remembered to report (review B3). `prot` is
+    // host protection whose bits (READ=1/WRITE=2/EXEC=4) coincide with the Sony bits the watch decodes.
+    void* map_phys_at(uint64_t hint, uint64_t len, int prot, uint64_t phys, uint64_t align = 0,
+                      bool fixed = true) {
+        void* p = map_phys_at_impl(hint, len, prot, phys, align, fixed);
+        if (p)
+            host::guest_write_watch_notify_direct_mapping_added(
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p)), len, phys,
+                static_cast<uint32_t>(prot));
         return p;
     }
 }
@@ -849,12 +869,8 @@ static uint64_t map_dmem_impl(uint64_t addr_in_out, uint64_t len, uint64_t prot,
     if (addr_in_out) *(uint64_t*)addr_in_out = (uint64_t)p;
     track((uint64_t)p, len, host_prot(prot), static_cast<uint32_t>(prot), true,
           "direct", kVirtualQueryDirect, phys, memory_type);
-    // Feed the texture write-watch (#1144) the guest VA<->phys alias so it can dirty-track this
-    // dmem-backed GPU memory via mprotect instead of re-hashing it every submit. `prot` is the Sony
-    // protection (bit1 = CPU_WRITE), which the Linux GuestWriteWatch decodes directly. A new mapping
-    // over an already-watched phys page also invalidates that watch here (remap safety).
-    host::guest_write_watch_notify_direct_mapping_added((uint64_t)p, len, phys,
-                                                        static_cast<uint32_t>(prot));
+    // (The texture write-watch alias for this mapping is registered at the map_phys_at chokepoint above,
+    // which also covers BatchMap MAP_DIRECT and Ampr — see #1144 B3.)
     MLOG("map_dmem -> 0x%llx len=0x%llx phys=0x%llx prot=0x%llx flags=0x%llx align=0x%llx\n",
          (unsigned long long)p, (unsigned long long)len, (unsigned long long)phys,
          (unsigned long long)prot, (unsigned long long)flags, (unsigned long long)align);
@@ -1518,7 +1534,10 @@ HLE(k_batch_map) {
                               "batch-flex", kVirtualQueryFlexible);
                 break;
             }
-            case 1: if (start) { munmap((void*)(uintptr_t)start, len); untrack(start, len); } break;  // UNMAP
+            case 1: if (start) {                                                             // UNMAP
+                        host::guest_write_watch_notify_direct_mapping_removed(start, len);    // #1144 B3/B4
+                        munmap((void*)(uintptr_t)start, len); untrack(start, len);
+                    } break;
             case 2: case 4: {                                                            // PROTECT / TYPE_PROTECT
                 if (start) {
                     uint64_t protect_start = start, protect_len = len;

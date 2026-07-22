@@ -401,6 +401,9 @@ void guest_write_watch_invalidate_all() {
     clear_locked(watch);
 }
 
+// Windows never arms pages (create() always refuses), so a host/kernel write can never EFAULT here.
+void guest_write_watch_notify_host_write(uint64_t, uint64_t) {}
+
 bool guest_write_watch_handle_fault(uint64_t addr) {
     (void)addr;
     return false;
@@ -412,6 +415,7 @@ void guest_write_watch_set_fault_onstack(bool) {}   // Windows never arms page-p
 
 #else   // ---- Linux / macOS: real page-protection dirty-tracking (mprotect + SIGSEGV) --------------
 
+#include <sched.h>
 #include <sys/mman.h>
 
 #include <algorithm>
@@ -475,6 +479,13 @@ const AliasRange* alias_at(const WatchState& w, uint64_t addr) {
     for (const AliasRange& a : w.aliases)
         if (addr >= a.addr && addr < a.addr + a.size) return &a;
     return nullptr;
+}
+// Does any recorded alias overlap [begin, end)? O(alias ranges). Lets the notify hooks skip the O(watched
+// pages) purge on the common path: a fresh VA (no reuse) or a non-dmem munmap (every guest heap free).
+bool va_range_has_alias(const WatchState& w, uint64_t begin, uint64_t end) {
+    for (const AliasRange& a : w.aliases)
+        if (a.addr < end && a.addr + a.size > begin) return true;
+    return false;
 }
 // All guest VAs currently mapping `phys` (page-granular). Returns false (leaving `out` empty) if the
 // page is unmapped or any alias is inaccessible (PROT_NONE) -> caller falls back to Unknown.
@@ -540,6 +551,39 @@ void invalidate_phys_range_locked(WatchState& w, uint64_t phys_begin, uint64_t p
         if (phys < phys_end && phys + kPage > phys_begin) hit.push_back(page.get());
     set_pages_armed(hit, false);
     for (WatchedPage* page : hit) page->generation++;
+}
+
+// Drop every page-granular alias whose VA falls in [begin, end) from its WatchedPage: remove it from the
+// page's alias list AND from the address index, and bump the page's generation (topology changed -> the
+// next query reads Dirty). This is what resolves review B4: no stale VA survives in pages_by_addr for a
+// later handle_fault to mprotect after the VA has been unmapped/reused. Does NOT mprotect the vanishing
+// VAs (the caller is unmapping/remapping them; the kernel drops their protection) and — critically — does
+// NOT free the WatchedPage: page lifetime is reference-counted and owned by release_registration_locked,
+// so freeing one here would dangle a live Registration's raw pointer. A page that loses its last alias
+// just lingers, disarmed and Dirty, until its owning registration resets. Called with the lock held.
+void purge_va_range_locked(WatchState& w, uint64_t begin, uint64_t end, bool remove_topology) {
+    for (auto& [phys, pageptr] : w.pages_by_phys) {
+        (void)phys;
+        WatchedPage* page = pageptr.get();
+        bool changed = false;
+        for (auto ai = page->aliases.begin(); ai != page->aliases.end();) {
+            const uint64_t apage = ai->addr & ~(kPage - 1);
+            if (apage < end && apage + kPage > begin) {
+                w.pages_by_addr.erase(apage);
+                ai = page->aliases.erase(ai);
+                changed = true;
+            } else {
+                ++ai;
+            }
+        }
+        if (changed) page->generation++;
+    }
+    if (remove_topology)
+        w.aliases.erase(std::remove_if(w.aliases.begin(), w.aliases.end(),
+                                       [&](const AliasRange& a) {
+                                           return a.addr < end && a.addr + a.size > begin;
+                                       }),
+                        w.aliases.end());
 }
 
 } // namespace
@@ -671,27 +715,43 @@ void guest_write_watch_notify_direct_mapping_added(uint64_t addr, uint64_t size,
     if (!addr || !size || addr > UINT64_MAX - size || phys > UINT64_MAX - size) return;
     WatchState& w = state();
     std::lock_guard lock(w.mutex);
-    // A new mapping over a watched phys range changes topology -> invalidate; then record the alias.
-    invalidate_phys_range_locked(w, phys, phys + size);
+    const uint64_t begin = addr & ~(kPage - 1);
+    const uint64_t end = (addr + size + kPage - 1) & ~(kPage - 1);
+    // VA-reuse safety: only if this VA range still carries stale coverage (rare: a MAP_FIXED reuse of a VA
+    // never unmapped) do we purge it and its topology before recording the new alias, so alias_at() can't
+    // resolve to the old phys. The common fresh-VA path skips the O(watched pages) scan.
+    if (va_range_has_alias(w, begin, end)) purge_va_range_locked(w, begin, end, /*remove_topology=*/true);
     w.aliases.push_back({addr, size, phys, protection});
+
+    // A new alias to an already-watched physical page must be armed too, or a write through it would not
+    // fault and the renderer would trust a stale texture (review B2). Same-phys aliasing does not change
+    // content, so we do NOT bump generation — we extend the page's alias set and arm the new VA in place.
+    if (!cpu_writable(protection) || w.pages_by_phys.empty()) return;   // nothing armed to extend
+    for (uint64_t off = 0; off < size; off += kPage) {
+        auto it = w.pages_by_phys.find(phys + off);
+        if (it == w.pages_by_phys.end()) continue;
+        WatchedPage* page = it->second.get();
+        const uint64_t va = (addr + off) & ~(kPage - 1);
+        page->aliases.push_back({va, protection});
+        w.pages_by_addr[va] = page;
+        if (page->armed &&
+            mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(va)), kPage,
+                     host_prot(protection) & ~PROT_WRITE) != 0)
+            page->generation++;   // couldn't arm the new alias -> mark Dirty so the renderer re-creates
+    }
 }
 
 void guest_write_watch_notify_direct_mapping_removed(uint64_t addr, uint64_t size) {
     if (!addr || !size) return;
     WatchState& w = state();
     std::lock_guard lock(w.mutex);
-    const uint64_t end = addr + size;
-    std::vector<uint64_t> dead_phys;
-    for (const AliasRange& a : w.aliases)
-        if (a.addr < end && a.addr + a.size > addr) dead_phys.push_back(a.phys);
-    for (uint64_t phys : dead_phys) invalidate_phys_range_locked(w, phys, phys + kPage);
-    w.aliases.erase(std::remove_if(w.aliases.begin(), w.aliases.end(),
-                                   [&](const AliasRange& a) {
-                                       return a.addr < end && a.addr + a.size > addr;
-                                   }),
-                    w.aliases.end());
-    // Pages whose every alias just vanished can never fault again; drop them from the addr index so a
-    // stale mprotect can't linger (their generation was already bumped above -> queries read Dirty).
+    const uint64_t begin = addr & ~(kPage - 1);
+    const uint64_t end = (addr + size + kPage - 1) & ~(kPage - 1);
+    // k_munmap calls this for EVERY unmap (including non-dmem heap frees); skip the O(watched pages) scan
+    // unless a dmem alias actually overlaps. When one does, drop coverage for EVERY page of the removed
+    // range (not just the first) and delete emptied pages so no stale WatchedPage / pages_by_addr entry
+    // survives to mprotect a reused VA later (review B4).
+    if (va_range_has_alias(w, begin, end)) purge_va_range_locked(w, begin, end, /*remove_topology=*/true);
 }
 
 void guest_write_watch_notify_direct_mapping_protection(uint64_t addr, uint64_t size,
@@ -715,6 +775,31 @@ void guest_write_watch_notify_physical_write(uint64_t phys, uint64_t size) {
     invalidate_phys_range_locked(w, phys, phys + size);
 }
 
+void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
+    if (!addr || !size || addr > UINT64_MAX - size) return;
+    WatchState& w = state();
+    // Hot path: the HLE calls this before EVERY read()/pread(), mostly into non-dmem heap buffers. When
+    // the feature is off (the default) nothing is ever armed, so skip without even taking the lock.
+    if (!w.fault_onstack.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(w.mutex);
+    // A host/kernel store into an armed (read-only) guest page would EFAULT — e.g. sceKernelPread
+    // streaming texture bytes straight into a watched dmem buffer returns an I/O error where real
+    // hardware succeeds (review B5). The HLE calls this by guest VA range BEFORE such a write: restore
+    // write on the overlapping pages so the store lands, and bump their generation so the watch reads
+    // Dirty (the bytes are about to change). Runs in normal context, so set_pages_armed may allocate.
+    const uint64_t begin = addr & ~(kPage - 1);
+    const uint64_t end = (addr + size + kPage - 1) & ~(kPage - 1);
+    if (!va_range_has_alias(w, begin, end)) return;   // not a dmem buffer -> skip the per-page scan
+    std::vector<WatchedPage*> hit;
+    for (uint64_t va = begin; va < end; va += kPage) {
+        auto it = w.pages_by_addr.find(va);
+        if (it != w.pages_by_addr.end() && it->second) hit.push_back(it->second);
+    }
+    if (hit.empty()) return;
+    set_pages_armed(hit, false);
+    for (WatchedPage* page : hit) page->generation++;
+}
+
 void guest_write_watch_invalidate_all() {
     WatchState& w = state();
     std::lock_guard lock(w.mutex);
@@ -735,21 +820,38 @@ bool guest_write_watch_handle_fault(uint64_t addr) {
     WatchState& w = state();
     if (!w.fault_onstack.load(std::memory_order_acquire)) return false;
     std::unique_lock<std::mutex> lock(w.mutex, std::try_to_lock);
-    if (!lock.owns_lock()) return false;   // contended: not ours to resolve right now, let it re-fault
+    if (!lock.owns_lock()) {
+        // Contended. We CANNOT decide ownership without the lock (pages_by_addr is being mutated), and
+        // returning false here would fall through the caller's fault handler to a fatal _exit — even
+        // though this may well be a watched page whose store just raced an arm/rearm. Instead resume:
+        // the page is still read-only, so the store re-executes and re-faults, retrying until the lock
+        // frees. The lock is only ever held for bounded, non-blocking work (create/rearm/query/notify),
+        // so it always frees; a genuine (non-watched) fault then re-enters, wins the lock, and takes the
+        // false path below into the real fault handler. sched_yield keeps the retry from spinning hot.
+        sched_yield();
+        return true;
+    }
     auto it = w.pages_by_addr.find(addr & ~(kPage - 1));
     if (it == w.pages_by_addr.end() || !it->second || !it->second->armed) return false;
     WatchedPage* page = it->second;
     // Allocation-free (signal context): restore write directly on the page's aliases. mprotect is a
     // syscall; the alias vector is already allocated and mutation-protected by the held lock. Do NOT
     // call set_pages_armed here — its rollback vector would malloc, which can deadlock a thread caught
-    // mid-allocation. If an mprotect fails we still mark dirty; the worst case is a stale RO alias that
-    // re-faults into this same path.
-    for (const PageAlias& al : page->aliases)
-        if (cpu_writable(al.prot))
-            mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(al.addr)), kPage, host_prot(al.prot));
-    page->armed = false;
-    page->generation++;
+    // mid-allocation. Track whether the FAULTING alias itself was restored: if that mprotect failed the
+    // store would re-fault forever, so keep the page armed (retry) rather than clearing it and dropping
+    // into the fatal handler on the next fault. Disarming (RO->RW) merges VMAs and effectively never
+    // fails, so this is a belt-and-braces guard, not an expected path.
+    const uint64_t fault_page = addr & ~(kPage - 1);
+    bool faulting_alias_restored = true;
+    for (const PageAlias& al : page->aliases) {
+        if (!cpu_writable(al.prot)) continue;
+        const bool ok = mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(al.addr)), kPage,
+                                 host_prot(al.prot)) == 0;
+        if (!ok && (al.addr & ~(kPage - 1)) == fault_page) faulting_alias_restored = false;
+    }
+    page->generation++;   // the store is about to land -> the page is Dirty regardless
     bump(stats().faults);
+    if (faulting_alias_restored) page->armed = false;
     return true;
 }
 
