@@ -171,6 +171,19 @@ namespace {
     bool     g_bp_stepping = false;            // mid single-step (orig byte restored, TF set)
     volatile sig_atomic_t g_bp_count = 0;
     int      g_bp_max = 400;                   // cap log volume
+    // PROSPER_BP_KLASS=1: at each int3 hit, print the IL2CPP class name of the object in each SysV-arg
+    // register (rdi/rsi/rdx/rcx/r8/r9) plus rbx/rax/r14/r15 — reliably names the managed receiver/args
+    // WITHOUT gdb (the int3 is armed by prosper after it maps the module, so it is race-free w.r.t. the
+    // demand-map timing that makes gdb managed breakpoints nondeterministic). Reuses the HWBP obj->klass->
+    // name layout. For an IL2CPP-module method use PROSPER_BP=0x30000000+RVA (module base 0x440000000 =
+    // eboot base 0x410000000 + 0x30000000).
+    bool     g_bp_klass = false;
+    // PROSPER_BP_PROBE="<chain>[;<chain>...]": at each hit, evaluate pointer chains and print each result.
+    // A chain is "<start>[+0xN|*]...:<t>": start is a register name (rdi,r14,...) or a 0xADDR; ops apply
+    // left-to-right — "+N" adds an offset, "*" dereferences a qword; the trailing ":t" reads the final
+    // address as q(word,default)/d(word)/b(yte)/f(loat-bits). Lets a single breakpoint read a managed
+    // field chain live, e.g. a mode flag "0x441f32088*+0xb8*:b" or a curtain color.a "rdi+0x20*+...:f".
+    const char* g_bp_probe = nullptr;
     void bp_write_byte(uint64_t addr, uint8_t val) {
         uint64_t pg = addr & ~(uint64_t)0xfff;
         mprotect((void*)pg, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
@@ -486,6 +499,83 @@ namespace {
         long w = syscall(SYS_write, g_probe_pipe[1], (const void*)a, 8);
         if (w > 0) { char b[8]; syscall(SYS_read, g_probe_pipe[0], b, (size_t)w); }
         return w == 8;
+    }
+    // Resolve an Il2CppObject's class name: obj -> [obj]=Il2CppClass* -> [klass+0x10]=name (C string).
+    // Returns bytes written (0 if unresolvable / not a plausible object). Async-signal-safe: probe_readable
+    // + reads only. Used by PROSPER_BP_KLASS (and reusable by any handler that has a candidate object ptr).
+    size_t bp_il2cpp_cname(uint64_t obj, char* s, size_t cap) {
+        if (cap == 0) return 0; s[0] = 0;
+        // probe_readable(X) verifies [X, X+8) — so guard each read with its BASE address (not base+size-1,
+        // which would leave the leading bytes of an unaligned read unverified and could fault in-handler).
+        if (obj < 0x1000 || !probe_readable(obj)) return 0;
+        uint64_t klass = *(const uint64_t*)obj;
+        if (klass < 0x1000 || !probe_readable(klass + 0x10)) return 0;
+        uint64_t namep = *(const uint64_t*)(klass + 0x10);
+        if (!probe_readable(namep)) return 0;
+        size_t k = 0;
+        for (; k + 1 < cap && k < 96 && probe_readable(namep + k); ++k) {
+            char c = *(const char*)(namep + k);
+            if (c == 0) break;
+            if (c < 0x20 || c > 0x7e) { if (k < 2) { s[0] = 0; return 0; } break; }
+            s[k] = c;
+        }
+        s[k] = 0;
+        return k >= 2 ? k : 0;
+    }
+    // Evaluate PROSPER_BP_PROBE chains against a saved register file and write the results to stderr.
+    // Grammar per chain: <start>[+0xN|*]...:<t>  where start = a register name or 0xADDR, "+N" adds an
+    // offset, "*" dereferences a qword, and the trailing ":t" reads q/d/b/f. Chains are separated by ';'
+    // or ','. Async-signal-safe: hand-rolled hex parse (no strtoull/locale), probe_readable + reads only.
+    void bp_eval_probes(const char* spec, void* uctx) {
+        auto gr = PROSPER_GREGS((ucontext_t*)uctx);
+        auto reg_val = [&](const char* p, size_t len, uint64_t* out) -> bool {
+            struct { const char* n; int idx; } R[] = {
+                {"rax",REG_RAX},{"rbx",REG_RBX},{"rcx",REG_RCX},{"rdx",REG_RDX},
+                {"rsi",REG_RSI},{"rdi",REG_RDI},{"rbp",REG_RBP},{"rsp",REG_RSP},
+                {"r10",REG_R10},{"r11",REG_R11},{"r12",REG_R12},{"r13",REG_R13},
+                {"r14",REG_R14},{"r15",REG_R15},{"r8",REG_R8},{"r9",REG_R9} };
+            for (auto& r : R) { size_t rn = 0; while (r.n[rn]) rn++;
+                if (rn == len) { bool eq = true; for (size_t i=0;i<len && eq;i++) if (r.n[i]!=p[i]) eq=false;
+                    if (eq) { *out = (uint64_t)gr[r.idx]; return true; } } }
+            return false;
+        };
+        auto hexval = [](const char** pp) -> uint64_t {
+            const char* p = *pp; uint64_t v = 0;
+            if (p[0]=='0' && (p[1]=='x'||p[1]=='X')) p += 2;
+            for (;; ++p) { char c=*p; uint64_t d;
+                if (c>='0'&&c<='9') d=c-'0'; else if (c>='a'&&c<='f') d=c-'a'+10;
+                else if (c>='A'&&c<='F') d=c-'A'+10; else break; v = v*16 + d; }
+            *pp = p; return v;
+        };
+        char out[400]; int on = snprintf(out, sizeof out, "[bp-probe]");
+        const char* p = spec;
+        while (*p && on < (int)sizeof out - 64) {
+            while (*p==';'||*p==','||*p==' ') p++;
+            if (!*p) break;
+            const char* start = p; uint64_t v = 0; bool have = false;
+            if (p[0]=='0' && (p[1]=='x'||p[1]=='X')) { v = hexval(&p); have = true; }
+            else { const char* q = p; while ((*q>='a'&&*q<='z')||(*q>='0'&&*q<='9')) q++;
+                   if (reg_val(p, (size_t)(q-p), &v)) { have = true; p = q; } }
+            if (!have) break;
+            char type = 'q'; bool bad = false;
+            while (*p && *p!=';' && *p!=',') {
+                if (*p=='+') { p++; v += hexval(&p); }
+                else if (*p=='*') { p++; if (!probe_readable(v)) { bad = true; break; } v = *(const uint64_t*)v; }   // probe_readable(v) covers [v,v+8)
+                else if (*p==':') { p++; if (*p) { type = *p; p++; } break; }
+                else p++;
+            }
+            int slen = (int)(p - start); if (slen > 40) slen = 40;
+            if (bad) { on += snprintf(out+on, sizeof out-on, " %.*s=<unmapped>", slen, start); continue; }
+            // probe_readable(v) verifies [v,v+8), covering any 1..8-byte read at v (guard the read's base).
+            char vb[40];
+            if (type=='b')      snprintf(vb, sizeof vb, probe_readable(v) ? "%u"     : "?", probe_readable(v) ? *(const uint8_t*)v  : 0);
+            else if (type=='d') snprintf(vb, sizeof vb, probe_readable(v) ? "0x%x"   : "?", probe_readable(v) ? *(const uint32_t*)v : 0);
+            else if (type=='f') snprintf(vb, sizeof vb, probe_readable(v) ? "f:0x%x" : "?", probe_readable(v) ? *(const uint32_t*)v : 0);
+            else                snprintf(vb, sizeof vb, probe_readable(v) ? "0x%llx" : "?", (unsigned long long)(probe_readable(v) ? *(const uint64_t*)v : 0));
+            on += snprintf(out+on, sizeof out-on, " %.*s=%s", slen, start, vb);
+        }
+        out[on] = '\n';
+        syscall(SYS_write, 2, out, (size_t)on + 1);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
     }
     // PROSPER_DUMPAT="0xADDR[,0xADDR...]" — dump 0x40 bytes at each ABSOLUTE guest address at fault
     // time (up to 6). Complements the register-relative FAULTMEM/PEEK when the address of interest
@@ -1311,6 +1401,27 @@ namespace {
                     }
                     if (n < (int)sizeof b - 1) b[n++] = '\n';
                     syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
+                    // PROSPER_BP_PROBE: evaluate the configured pointer/field chains at this hit (first,
+                    // so it is never skipped by a KLASS-candidate issue below).
+                    if (g_bp_probe) bp_eval_probes(g_bp_probe, uc);
+                    // PROSPER_BP_KLASS: name the IL2CPP object in each candidate register. Only probe values
+                    // in the guest GC-heap band [0x20_00000000, 0x28_00000000) — host stack pointers (0x7f..),
+                    // module/code pointers (0x4..) and small values are not objects and needlessly walk the
+                    // obj->klass->name chain over unrelated memory.
+                    if (g_bp_klass) {
+                        const struct { const char* rn; uint64_t v; } cand[] = {
+                            {"rdi",rdi},{"rsi",rsi},{"rdx",rdx},{"rcx",rcx},{"r8",r8},{"r9",(uint64_t)gr[REG_R9]},
+                            {"rbx",(uint64_t)gr[REG_RBX]},{"rax",rax},{"r14",r14},{"r15",r15} };
+                        for (auto& c : cand) {
+                            if (c.v < 0x2000000000ull || c.v >= 0x2800000000ull) continue;
+                            char nm[112];
+                            if (bp_il2cpp_cname(c.v, nm, sizeof nm)) {
+                                char kb[176]; int kn = snprintf(kb, sizeof kb, "[bp-klass] %s=0x%llx %s\n",
+                                    c.rn, (unsigned long long)c.v, nm);
+                                syscall(SYS_write, 2, kb, (size_t)kn);
+                            }
+                        }
+                    }
                 }
                 bp_write_byte(g_bp_addr, g_bp_orig);              // restore real instruction
                 PROSPER_GREGS(uc)[REG_RIP] = (greg_t)g_bp_addr;  // re-execute it
@@ -2006,6 +2117,8 @@ void install_trap_handler() {
     if (const char* bp = getenv("PROSPER_BP")) {
         g_bp_addr = g_base + strtoull(bp, nullptr, 0);
         if (const char* m = getenv("PROSPER_BP_MAX")) g_bp_max = (int)strtoul(m, nullptr, 0);
+        g_bp_klass = getenv("PROSPER_BP_KLASS") != nullptr;
+        g_bp_probe = getenv("PROSPER_BP_PROBE");   // stable environ string; read (not copied) in the handler
         ensure_probe_pipe();
         g_bp_on = true;   // the actual 0xCC is written after the image is mapped (arm_bp below)
     }
