@@ -2702,6 +2702,51 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 // Present priority: the flipped front buffer > any registered scanout target > the
                 // legacy "last group" fallback (unchanged behavior when no group targets a VO buffer).
                 selected_pixels = px_front ? px_front : (px_vo ? px_vo : px_last);
+                // PROSPER_DUMP_PERSISTENT=<min-submit>: read back and dump EVERY persistent color
+                // target after this submit's passes render. Unlike PROSPER_RTT*/DUMP_*, this flag is
+                // NOT in the live_gpu_targets disable list (:480-487), so it observes the NORMAL
+                // persistent-render path (all other CPU-pixel diagnostics change that path -> #1103).
+                // readback_persistent_color_target restores the image layout, so rendering is unaffected.
+                if (const char* dp = getenv("PROSPER_DUMP_PERSISTENT")) {
+                    static std::atomic<uint64_t> dp_submit{0};
+                    const uint64_t sub = dp_submit.fetch_add(1);
+                    const uint64_t dp_min = std::strtoull(dp, nullptr, 0);
+                    if (sub >= dp_min && sub < dp_min + 3u) {
+                        const char* dd = getenv("PROSPER_FRAME_DIR");
+                        fprintf(stderr, "[persist] submit=%llu present: front=%d/%d front_va=0x%llx "
+                                "selected=%s vo:", (unsigned long long)sub, vo_front, vo_n,
+                                (unsigned long long)front_va,
+                                px_front ? "px_front" : (px_vo ? "px_vo" : (px_last ? "px_last" : "none")));
+                        for (int i = 0; i < vo_n && i < 8; i++)
+                            fprintf(stderr, " [%d]=0x%llx", i, (unsigned long long)prosper_vo_buffer_addr(i));
+                        fprintf(stderr, "\n");
+                        for (auto& kv : g_rtt) {
+                            RttSurf& s = kv.second;
+                            if (!s.gpu_valid || !s.w || !s.h) continue;
+                            if (static_cast<uint64_t>(s.w) * s.h < 64u * 64u) continue;
+                            const VkFormat fmt = prosper::test::backend_color_format(s.format);
+                            const uint32_t bpp = prosper::test::backend_color_bytes_per_pixel(fmt);
+                            const uint64_t expected = static_cast<uint64_t>(s.w) * s.h * bpp;
+                            std::vector<uint8_t> px; std::string err;
+                            if (!prosper::test::readback_persistent_color_target(
+                                    kv.first, s.w, s.h, fmt, px, err) || px.size() != expected)
+                                continue;
+                            const std::vector<uint8_t> rgba = inspection_rgba8(px, s.w, s.h, fmt);
+                            size_t rgbnz = 0;
+                            for (size_t p = 0; p + 3 < rgba.size(); p += 4)
+                                if (rgba[p] || rgba[p + 1] || rgba[p + 2]) rgbnz++;
+                            char fn[512];
+                            std::snprintf(fn, sizeof fn, "%s/persist_s%04llu_%llx_%ux%u.bmp",
+                                          dd ? dd : ".", (unsigned long long)sub,
+                                          (unsigned long long)kv.first, s.w, s.h);
+                            prosper::test::dump_bmp(fn, rgba, s.w, s.h);
+                            fprintf(stderr, "[persist] submit=%llu addr=0x%llx %ux%u fmt=%u "
+                                    "rgb_nonblack=%zu/%u\n", (unsigned long long)sub,
+                                    (unsigned long long)kv.first, s.w, s.h, (unsigned)s.format,
+                                    rgbnz, s.w * s.h);
+                        }
+                    }
+                }
             } else {
                 // Single-framebuffer path: render_draws_rgba composites every draw into ONE framebuffer.
                 std::vector<const prosper::gpu::DrawItem*> all; all.reserve(items.size());
@@ -2788,6 +2833,27 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         if ((scanout = cached_scanout(prosper_vo_buffer_addr(i)))) break;
                 }
                 if (scanout) selected_pixels = scanout->rgba;
+                // Hold the last good scanout across VideoOut buffer rotation. Bendy (PPSA27616) rapidly
+                // re-registers its scanout buffers; on the frames where the guest has registered new
+                // buffers but not yet rendered+flipped them, none is gpu_valid and the present would be
+                // a black flicker. Presenting the previous frame instead keeps a stable image (the new
+                // buffers get drawn and flipped within a frame or two). CONFIDENCE: MED.
+                // Thread-safety: this static is a plain (non-atomic) shared_ptr, correct only under the
+                // renderer's single present thread (this callback and its sibling statics — dp_submit,
+                // warned, frame_no — all assume the one serialized present path). It must not be read or
+                // assigned from another thread; a concurrent present would race the object assignment.
+                static std::shared_ptr<const std::vector<uint8_t>> last_scanout_present;
+                if (selected_pixels && !selected_pixels->empty()) last_scanout_present = selected_pixels;
+                else if (last_scanout_present) selected_pixels = last_scanout_present;
+                if (getenv("PROSPER_DUMP_PERSISTENT")) {
+                    size_t nb = 0;
+                    if (selected_pixels)
+                        for (size_t p = 0; p + 3 < selected_pixels->size(); p += 4)
+                            if ((*selected_pixels)[p] || (*selected_pixels)[p+1] || (*selected_pixels)[p+2]) nb++;
+                    fprintf(stderr, "[persist] present: front=%d front_va=0x%llx scanout=%s rgb_nonblack=%zu\n",
+                            front, (unsigned long long)(front >= 0 ? prosper_vo_buffer_addr(front) : 0),
+                            scanout ? "HIT" : "MISS", nb);
+                }
             }
             if (phase.final_span) release_pinned_scanouts();
             if (phase.final_span && lightweight_rtt_timing && rtt_log_in_range &&
