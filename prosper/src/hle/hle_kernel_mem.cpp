@@ -1183,9 +1183,20 @@ static uint64_t ampr_arglog(const char* tag, uint64_t a0, uint64_t a1, uint64_t 
         fprintf(stderr, "[amprlog] %s a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
                 tag, (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
                 (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
-        for (uint64_t p : { a0, a1, a2 }) if (p > 0xffff && !(p & 7))
-            fprintf(stderr, "[amprlog]   [0x%llx] = 0x%016llx 0x%016llx\n", (unsigned long long)p,
-                    (unsigned long long)*(uint64_t*)p, (unsigned long long)*(uint64_t*)(p + 8));
+        for (uint64_t p : { a0, a1, a2 }) if (p > 0xffff && !(p & 7)) {
+            // Fault-safe read (#1154): a passed-in guest pointer that is aligned and > 0xffff can still
+            // be UNMAPPED — GTA V's baQO9ez2gL4 passes a2=0x302200, which clears both guards but was
+            // never mapped. A raw *(uint64_t*)p deref SIGSEGVs in host HLE code and kills the very run
+            // this diagnostic is meant to observe. process_vm_readv returns EFAULT instead of faulting
+            // (all-or-nothing per iovec, so a partially-mapped pair reports UNMAPPED — acceptable here).
+            uint64_t v[2];
+            struct iovec l { v, sizeof v }, r { (void*)(uintptr_t)p, sizeof v };
+            if (process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof v)
+                fprintf(stderr, "[amprlog]   [0x%llx] = 0x%016llx 0x%016llx\n", (unsigned long long)p,
+                        (unsigned long long)v[0], (unsigned long long)v[1]);
+            else
+                fprintf(stderr, "[amprlog]   [0x%llx] = UNMAPPED\n", (unsigned long long)p);
+        }
     }
     return 0;
 }
