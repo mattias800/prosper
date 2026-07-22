@@ -8307,6 +8307,10 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
 // Anything else (a non-add producer, a non-user SGPR, a store/atomic/LDS/global-with-saddr form) leaves
 // the load unresolved so the caller keeps failing visibly. flat_access_info lives in this TU's
 // anonymous namespace but is visible here (internal linkage is still TU-wide).
+// Resolution is over LINEAR program order (not CFG-aware). That is exact for the target decode kernels
+// (the address adds sit in the same block immediately before the load) and the base is a loop-invariant
+// kernel-arg pointer, so the resolved base is stable across loop iterations; the executor's
+// guest_readable_mapping_containing validation is the runtime backstop against a bogus base.
 FlatLoadAnalysis analyze_flat_loads(const uint32_t* code, size_t dwords, uint32_t user_sgpr_count) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
