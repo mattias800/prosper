@@ -5869,7 +5869,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // image_sample_lz = 0x27 (LOD 0), image_gather4_lz = 0x47 (2x2 single-channel gather,
             // base level), image_load = 0x00 (integer texel fetch). Opcodes round-trip-verified
             // via llvm-mc gfx1010 (#273).
-            const bool is_sample = (in.opcode == 0x20), is_load = (in.opcode == 0x00);
+            // op 0xa0 = the high-bit sibling of IMAGE_SAMPLE (0x20): the decoder builds the 8-bit
+            // MIMG opcode as ((word0&1)<<7)|bits[24:18], so 0xa0 = 0x80|0x20. GTA V's (PPSA04263,
+            // RAGE) intro/composite pipeline (es=0x2042d6a200 / ps=0x2042d83c00) issues it as a plain
+            // 2D texture sample; rejecting it dropped that pipeline's draws and blacked the whole
+            // frame (#1140). Lowered as an ordinary implicit-LOD sample it renders the animated
+            // Rockstar Games intro logo correctly (live PPSA04263 capture). CONFIDENCE: MED — the base
+            // op and the "samples a 2D texture" behavior are live-title evidence; the exact high-bit
+            // family (an RDNA2 gfx10.3 sample variant) is not yet llvm-mc round-trip-verified, so a
+            // future title exercising its distinguishing modifier may need a dedicated lowering.
+            const bool is_sample = (in.opcode == 0x20) || (in.opcode == 0xa0), is_load = (in.opcode == 0x00);
             const bool is_sample_l = (in.opcode == 0x24), is_sample_lz = (in.opcode == 0x27);
             const bool is_sample_b = (in.opcode == 0x25), is_gather_lz = (in.opcode == 0x47);
             const bool is_sample_c_lz = (in.opcode == 0x2f);
