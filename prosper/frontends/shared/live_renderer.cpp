@@ -2838,6 +2838,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 // buffers but not yet rendered+flipped them, none is gpu_valid and the present would be
                 // a black flicker. Presenting the previous frame instead keeps a stable image (the new
                 // buffers get drawn and flipped within a frame or two). CONFIDENCE: MED.
+                // Thread-safety: this static is a plain (non-atomic) shared_ptr, correct only under the
+                // renderer's single present thread (this callback and its sibling statics — dp_submit,
+                // warned, frame_no — all assume the one serialized present path). It must not be read or
+                // assigned from another thread; a concurrent present would race the object assignment.
                 static std::shared_ptr<const std::vector<uint8_t>> last_scanout_present;
                 if (selected_pixels && !selected_pixels->empty()) last_scanout_present = selected_pixels;
                 else if (last_scanout_present) selected_pixels = last_scanout_present;
