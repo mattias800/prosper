@@ -2942,6 +2942,37 @@ std::vector<ComputeItem> realize_compute_dispatches(
                 resource.size = required;
             }
         }
+        // FLAT-window resources (#1171): a general flat_load reads a byte/dword from a raw 64-bit guest
+        // pointer held in user SGPRs (not a V# descriptor, so build/add above never saw it). Resolve each
+        // such load to its base SGPR pair, read the base pointer from THIS dispatch's user SGPRs, bind the
+        // containing guest allocation as an SSBO, and key it by the load's pc so the recompiler lowers the
+        // load to an indexed read at (address - base). Pushed before assign_convention_bindings so each
+        // window gets a distinct binding; an unmapped base leaves the load unresolved (fail-visible).
+        {
+            const FlatLoadAnalysis fla = analyze_flat_loads(
+                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+                shader_dwords, kUserSgprs);
+            constexpr uint32_t kFlatWindowMax = 0x10000000u;   // 256 MiB cap on the per-dispatch copy
+            for (const auto& fl : fla.loads) {
+                if (fl.base_sgpr < 0 || static_cast<uint32_t>(fl.base_sgpr) + 1u >= kUserSgprs) continue;
+                const uint64_t base = static_cast<uint64_t>(sgprs[fl.base_sgpr]) |
+                                      (static_cast<uint64_t>(sgprs[fl.base_sgpr + 1]) << 32);
+                host::GuestReadableRange range{};
+                if (!host::guest_readable_mapping_containing(base, base + 1, range) || range.end <= base)
+                    continue;                                  // unmapped base -> stay fail-visible
+                const uint64_t avail = range.end - base;
+                ShaderResource w;
+                w.cls = ResourceClass::ConstantBuffer;         // read-only SSBO (declare_cbufs + cbuf_load)
+                w.gpu_addr = base;
+                w.size = static_cast<uint32_t>(std::min<uint64_t>(avail, kFlatWindowMax));
+                w.fetch_pc = fl.load_pc;
+                w.flat_base_sgpr = static_cast<uint32_t>(fl.base_sgpr);
+                table->resources.push_back(w);
+                if (std::getenv("PROSPER_DBG"))
+                    std::fprintf(stderr, "[flat-window] pc=%u base=s%d addr=0x%llx size=%u\n",
+                                 fl.load_pc, fl.base_sgpr, (unsigned long long)base, w.size);
+            }
+        }
         assign_convention_bindings(*table, 2);
         {
             std::vector<Rdna2Inst> decoded;
