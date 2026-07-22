@@ -2187,10 +2187,33 @@ HLE(ngs2_geom_calc_listener) {
 
 #undef NGS2_LOG
 
+// --- libSceVoice (voice chat, #1158). prosper has no voice-capture backend (no microphone / network
+// voice path). GTA V (PPSA04263, RAGE) initialises voice at boot and, when it believes voice is up,
+// builds a voice context and sizes its ring buffers by DIVIDING by voice-parameter fields (bitrate,
+// samples-per-frame, ...) it obtains from the voice API — e.g. `x * 8000 / bitrate` at eboot+0x26043b0
+// and `x / ctx[+0x2dc0]` at eboot+0x2905... . prosper's generic unimplemented stubs returned 0 WITHOUT
+// writing those outputs, so several divisors were 0 → a cascade of guest integer #DE → SIGFPE.
+//
+// Report the subsystem as unavailable from sceVoiceInit: GTA treats a failed voice init as "voice
+// chat off" (a real state — e.g. voice disabled in system settings / no headset region) and skips its
+// entire voice-buffer setup, so none of the divide-by-zero math runs and boot continues to the title.
+// This is the honest model for a host with no voice hardware, and voice is not needed to reach the
+// title screen. CONFIDENCE: MED — verified live to clear the SIGFPE cascade and reach the GTA V title;
+// a faithful null-backend voice implementation (init succeeds, ports return valid silent parameters)
+// is the alternative if a title ever needs working voice (tracked separately).
+HLE(voice_init_unavailable) {   // sceVoiceInit / sceVoiceInitHQ -> report voice unavailable
+    return (uint64_t)(int64_t)(int32_t)0x80410002;   // negative SCE_VOICE-class error (js-checked by guest)
+}
+
 void register_audio_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("sceAudioOutInit", audio_init);
     R("sceAudioOutOpen", audio_open);
+    // libSceVoice: report voice unavailable so titles with no host voice backend skip voice-chat
+    // setup instead of #DE'ing on never-written voice-parameter divisors (GTA V, #1158). Both the
+    // standard and HQ init entry points get the same "unavailable" answer.
+    R("sceVoiceInit", voice_init_unavailable);
+    R("sceVoiceInitHQ", voice_init_unavailable);
     R("sceAudioOutOutput", audio_output);
     R("sceAudioOutOutputs", audio_outputs);
     R("sceAudioOutSetVolume", audio_set_volume);
