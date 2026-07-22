@@ -1889,6 +1889,34 @@ HLE(f_apr_resolve_with_prefix) {
     return apr_resolve_impl((const char*)P(a0), (const char**)P(a1), (int)(int64_t)a2,
                             (uint32_t*)P(a3), (uint64_t*)P(a4), (uint32_t*)P(a5));
 }
+// sceKernelAprGetFileStat(uint32_t fileId, SceKernelStat* out) — GTA V (PPSA04263, RAGE, issue #1133).
+// ABI from live [RAGE] Main Thr disassembly: a0=fileId (a valid id from the WithPrefix resolve),
+// a1=stat buffer. Stubbing it to success without filling `out` made RAGE validate an uninitialized
+// stat (it converts the mtime as a FILETIME: imul 1e7 + epoch 0x19db1ded53e8000) and abort its
+// streaming init with a fatal (int 0x41). Look the id up in the APR registry, host-stat the file, and
+// write the standard SceKernelStat. CONFIDENCE: MED — id/buffer roles pinned from disassembly; the
+// SceKernelStat layout matches prosper's sceKernelStat/fstat writer.
+HLE(f_apr_get_file_stat) {
+    uint32_t id = (uint32_t)a0;
+    uint8_t* out = (uint8_t*)P(a1);
+    if (!out) return 0x80020016ull;   // EINVAL
+    std::string host = prosper_apr_path_for_id(id);
+    if (host.empty()) { if (filelog()) fprintf(stderr, "[apr] GetFileStat id=%u -> unknown id\n", id);
+                        return 0x80020002ull; }   // ENOENT
+#ifndef _WIN32
+    struct stat st;
+    if (::stat(host.c_str(), &st) != 0) { if (filelog()) fprintf(stderr, "[apr] GetFileStat id=%u stat('%s') failed\n", id, host.c_str());
+                                          return 0x80020002ull; }
+    write_sce_stat(from_host_stat(st), out);
+#else
+    struct _stat64 st;
+    if (::_stat64(host.c_str(), &st) != 0) return 0x80020002ull;
+    write_sce_stat(from_host_stat(st), out);
+#endif
+    if (filelog()) fprintf(stderr, "[apr] GetFileStat id=%u '%s' -> size=%lld\n",
+                           id, host.c_str(), (long long)st.st_size);
+    return 0;
+}
 
 // libSceAmpr::mQ16-QdKv7k — the APR read SUBMIT (identified by tracing readFile eboot 0x59b6110 ->
 // this import). Call shape: mQ16(reqFrame, outScratchPtr /*a1*/, outRecord /*a2*/, fileId /*a3*/,
@@ -2412,6 +2440,7 @@ void register_file_hle() {
     Hle::register_fn("fR521KIGgb8", (HleFn)k_aio_cancel,       "sceKernelAioCancelRequest");
     R("sceKernelAprResolveFilepathsToIdsAndFileSizes", f_apr_resolve);   // real APR resolve (was EINVAL)
     R("sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes", f_apr_resolve_with_prefix);  // GTA V (#1130)
+    R("sceKernelAprGetFileStat", f_apr_get_file_stat);  // GTA V (#1133)
     // libSceAmpr sceAmprAprCommandBufferReadFile (NID name recovered by brute-force). The Linux
     // entry is an asm shim that snapshots rsp so the handler can read the stack args (arg7 = file
     // offset); see f_apr_read_submit_entry above.
