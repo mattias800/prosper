@@ -1728,11 +1728,12 @@ namespace {
                 int n = snprintf(b, sizeof b, "[lazy-commit] %s page=0x%llx rip=0x%llx\n",
                                  ok ? "mapped" : "MMAP-FAILED", (unsigned long long)(uint64_t)(uintptr_t)page,
                                  (unsigned long long)PROSPER_GREGS(uc2)[REG_RIP]);
-                // RAW syscall, NOT glibc write(): this handler can run on a thread whose %fs is the
-                // GUEST TCB (PROSPER_GUEST_FS), and glibc write()'s cancellation prologue reads the
-                // TCB through %fs — a nested SIGSEGV inside the handler killed the process (the UE4
-                // boot's silent exit-139).
-                syscall(SYS_write, 2, b, (size_t)n);
+                // raw_write (raw_syscall.hpp), NOT glibc write() OR syscall(): this handler can run on a
+                // thread whose %fs is the GUEST TCB (PROSPER_GUEST_FS). glibc write()'s cancellation
+                // prologue reads the TCB through %fs, and even glibc's syscall() wrapper stores errno
+                // via %fs on write failure — either is a nested SIGSEGV inside the handler that killed
+                // the process (the UE4 boot's silent exit-139; #1071/#1075).
+                raw_write(2, b, (uint64_t)n);
                 if (ok) return;   // re-execute against the now-backed page
             }
         }
@@ -1789,8 +1790,8 @@ namespace {
                     char b[128];
                     int n = snprintf(b, sizeof b, "[nullpage] #%d addr=0x%llx rip=eboot+0x%llx\n",
                                      (int)g_null_page_count, (unsigned long long)a,
-                                     (unsigned long long)(rip - 0x400000000ull));
-                    syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
+                                     (unsigned long long)(rip - g_base));
+                    raw_write(2, b, (uint64_t)n);   /* raw_syscall: no errno/TLS access, %fs-safe in the handler (#1075) */
                     nullpage_deep_dump(uc, rip);   // issue-#312 attribution dump (registers + heap + GPU ring)
                     return;   // re-execute; the null read now sees zero
                 }
@@ -1802,7 +1803,7 @@ namespace {
                                  "[nullpage] BACKING DENIED addr=0x%llx rip=eboot+0x%llx err=%ld"
                                  " (vm.mmap_min_addr/CAP_SYS_RAWIO)\n",
                                  (unsigned long long)a,
-                                 (unsigned long long)(rip - 0x400000000ull), mr);
+                                 (unsigned long long)(rip - g_base), mr);
                 raw_write(2, b, (uint64_t)n);   /* not even glibc syscall(): it stores errno via %fs on failure */
             }
         }
