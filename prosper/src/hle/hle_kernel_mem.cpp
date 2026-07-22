@@ -4173,6 +4173,26 @@ HLE(k_query_memory_protection) {
 // (the Linux path models them). Registered by raw NID for parity.
 HLE(k_ampr_ok) { return 0; }
 
+// APR command-buffer WriteAddress (NID j0+3uJMxYJY) — the completion-notification write (#1149).
+// Windows sibling of the POSIX handler above (full contract documented there): write `value` (a2)
+// verbatim to `*address` (a1). Fault-safe via VirtualQuery — an uncommitted / non-writable / partially
+// mapped target is skipped rather than faulting the emulator (mirrors windows_prepare_guest_write).
+HLE(k_ampr_write_address) {   // j0+3uJMxYJY (cb, address, value, flags)
+    (void)a0; (void)a3;
+    if (a1) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        constexpr DWORD kWritable = PAGE_READWRITE | PAGE_WRITECOPY |
+                                    PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if (VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(a1)), &mbi, sizeof(mbi)) &&
+            mbi.State == MEM_COMMIT && (mbi.Protect & kWritable) &&
+            static_cast<uintptr_t>(a1) + sizeof(uint64_t) <=
+                reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize) {
+            *reinterpret_cast<uint64_t*>(static_cast<uintptr_t>(a1)) = a2;
+        }
+    }
+    return 0;
+}
+
 namespace {
 std::mutex g_sync_mx;
 std::condition_variable g_sync_cv;
@@ -4326,6 +4346,8 @@ void register_kernel_mem_hle() {
     Hle::register_fn("H896Pt-yB4I", (HleFn)k_ampr_ok, "AprCbSetEventQueue?");
     Hle::register_fn("ASoW5WE-UPo", (HleFn)k_ampr_ok, "AprSubmitCommandBuffer?");
     Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_ok, "AmprUnknown3");
+    // APR completion-notification write (#1149) — real behavior on Windows too (see handler above).
+    Hle::register_fn("j0+3uJMxYJY", (HleFn)k_ampr_write_address, "sceAmprCommandBufferWriteAddress?");
 }
 
 } // namespace prosper
