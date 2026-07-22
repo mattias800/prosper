@@ -11,7 +11,6 @@
 #if defined(__linux__) || defined(__APPLE__)
 #include "posix_shim.hpp"
 #include <sys/mman.h>
-#include <sys/prctl.h>   // PR_GET_NAME — #1155 fault-thread name in the TLS probe
 #include <signal.h>
 #include <setjmp.h>
 #include <pthread.h>
@@ -1933,7 +1932,7 @@ namespace {
             // on the host TCB, so any %fs-relative TLS read returned host garbage (the #1155 fault class,
             // now fixed by restoring guest %fs on signal-handler return-to-guest paths above).
             {
-                char nm[16] = {0}; prctl(PR_GET_NAME, (unsigned long)nm, 0, 0, 0);
+                char nm[16] = {0}; pthread_getname_np(pthread_self(), nm, sizeof nm);   // portable (Linux+macOS)
                 bool on_guest_tcb = probe_readable(g_rax + 0x108) &&
                                     *(const uint32_t*)(uintptr_t)(g_rax + 0x108) == 0x50524F53u;
                 char tb[160];
