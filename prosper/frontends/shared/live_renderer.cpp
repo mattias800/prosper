@@ -905,10 +905,24 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const bool persistent_unorm8_texture =
                             r.format == prosper::gpu::DataFormat::Unorm8 &&
                             r.num_components >= 1 && r.num_components <= 4;
+                        // Float16/HDR sampled textures decode to RGBA8 via a dedicated branch below but were
+                        // excluded from the persistent decode cache, so HDR art was re-detiled every frame
+                        // (#1177, the largest `notsampled` bucket). The cache machinery is format-agnostic —
+                        // it stores the decoded RGBA8 and validates against the raw source bytes — so caching
+                        // fp16 is correctness-preserving as long as persistent_source_size counts the fp16
+                        // source (2 B/component) exactly, which is what the decode reads.
+                        // Must match the fp16 DECODE branch's `f16` predicate exactly (bpt in {2,4,8} =
+                        // 1/2/4 components); RGB16F (3 comp, bpt 6) takes a different decode path that reads
+                        // a different byte count, so it must NOT be cached here or the exact-byte source
+                        // validation would compare the wrong region.
+                        const bool persistent_fp16_texture =
+                            r.format == prosper::gpu::DataFormat::Float16 &&
+                            (r.num_components == 1 || r.num_components == 2 || r.num_components == 4);
                         const bool persistent_sampled_texture =
                             !has_live_rtt && !r.host_data && r.img_dim == 1u &&
                             r.cls == RC::Texture &&
-                            (persistent_unorm8_texture || persistent_bc_block_bytes != 0);
+                            (persistent_unorm8_texture || persistent_fp16_texture ||
+                             persistent_bc_block_bytes != 0);
                         const bool persistent_source_is_tiled =
                             persistent_sampled_texture && !getenv("PROSPER_NODETILE") &&
                             prosper::gpu::tile_mode_is_tiled(r.tile_mode);
@@ -944,13 +958,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                           bw, bh, persistent_bc_block_bytes, r.tile_mode)
                                     : static_cast<size_t>(bw) * bh * persistent_bc_block_bytes;
                             }
-                            const uint32_t source_bpt = r.num_components;
+                            // fp16 source is 2 B/component; unorm8 is 1 B/component.
+                            const uint32_t source_bpt =
+                                r.num_components * (persistent_fp16_texture ? 2u : 1u);
                             if (persistent_source_is_tiled)
                                 return prosper::gpu::tiled_surface_bytes(
                                     tw, th, r.tile_mode, persistent_pitch, source_bpt);
-                            // Forced detiling treats a nominally linear Unorm8x4 descriptor as tiled.
-                            // Its decode source is therefore not the linear byte range computed here.
-                            if (source_bpt == 4 && !persistent_source_matches_pixels) return size_t{0};
+                            // Forced detiling treats a nominally linear Unorm8x4 descriptor as tiled; its
+                            // decode source is then not the linear byte range computed here. This exclusion
+                            // is unorm8-specific — fp16 (which can also land at source_bpt==4 for RG16F)
+                            // always reads exactly tw*th*source_bpt and must NOT be excluded.
+                            if (persistent_unorm8_texture && source_bpt == 4 &&
+                                !persistent_source_matches_pixels) return size_t{0};
                             return static_cast<size_t>(tw) * th * source_bpt;
                         }();
                         const bool persistent_cache_eligible = !fr.is_storage_image &&
@@ -1148,6 +1167,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             // instead fell back to CPU detile). storage/notvalid/dimmismatch/self/noptarget.
                             static uint64_t rtt_storage = 0, rtt_notvalid = 0, rtt_dimmismatch = 0,
                                             rtt_self = 0, rtt_noptarget = 0, rtt_unknown = 0;
+                            // For the notsampled bucket, record WHY the guest texture is not a persistent-
+                            // cache candidate (host_data / img_dim!=1 / cls!=Texture / format not
+                            // unorm8|bc) plus a (format<<4|components) histogram of the format-excluded
+                            // ones, to see whether FP16/HDR art dominates (a cache-eligibility gap, #1177).
+                            static uint64_t ns_hostdata = 0, ns_notdim1 = 0, ns_notclass = 0, ns_fmt = 0;
+                            static std::unordered_map<uint32_t, uint64_t> ns_fmt_hist;
                             ds_count[r.gpu_addr]++; ds_total++;
                             if (has_live_rtt) {
                                 r_rtt++;
@@ -1161,7 +1186,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     rtt_noptarget++;   // evicted from / absent in the backend target cache
                                 else rtt_unknown++;
                             }
-                            else if (!persistent_sampled_texture) r_notsampled++;
+                            else if (!persistent_sampled_texture) {
+                                r_notsampled++;
+                                if (r.host_data) ns_hostdata++;
+                                else if (r.img_dim != 1u) ns_notdim1++;
+                                else if (r.cls != RC::Texture) ns_notclass++;
+                                else { ns_fmt++;
+                                    ns_fmt_hist[((uint32_t)r.format << 4) |
+                                                (r.num_components & 0xFu)]++; }
+                            }
                             else if (r.compression_enabled) r_compression++;
                             else if (persistent_source_size == 0) r_size0++;
                             else if ([&] {
@@ -1194,6 +1227,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                         (unsigned long long)rtt_storage, (unsigned long long)rtt_notvalid,
                                         (unsigned long long)rtt_dimmismatch, (unsigned long long)rtt_self,
                                         (unsigned long long)rtt_noptarget, (unsigned long long)rtt_unknown);
+                                std::vector<std::pair<uint32_t, uint64_t>> fh(ns_fmt_hist.begin(),
+                                                                             ns_fmt_hist.end());
+                                std::sort(fh.begin(), fh.end(),
+                                          [](auto& a, auto& b) { return a.second > b.second; });
+                                fprintf(stderr, "[detile-stats] notsampled-why: hostdata=%llu notdim1=%llu "
+                                        "notclass=%llu fmt=%llu; top fmt/comp:",
+                                        (unsigned long long)ns_hostdata, (unsigned long long)ns_notdim1,
+                                        (unsigned long long)ns_notclass, (unsigned long long)ns_fmt);
+                                for (int i = 0; i < 6 && i < (int)fh.size(); i++)
+                                    fprintf(stderr, " fmt=%u/comp=%u x%llu",
+                                            fh[i].first >> 4, fh[i].first & 0xF,
+                                            (unsigned long long)fh[i].second);
+                                fprintf(stderr, "\n");
                                 fflush(stderr);
                             }
                         }
