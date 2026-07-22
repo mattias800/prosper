@@ -359,6 +359,12 @@ if(TARGET prosper_core)
   add_executable(test_tile tests/test_tile.cpp)
   target_link_libraries(test_tile PRIVATE prosper_core)
   add_test(NAME gpu_surface_detile COMMAND test_tile)
+  # Run the same byte-identity suite through the row-parallel detile path (#1177), forcing threads so
+  # it is exercised even on a low-core CI. Passing here + in gpu_surface_detile (single-threaded control
+  # via the < 2-thread gate / PROSPER_DETILE_SINGLE_THREADED) proves threaded == single byte-for-byte.
+  add_test(NAME gpu_surface_detile_threaded COMMAND test_tile)
+  set_tests_properties(gpu_surface_detile_threaded PROPERTIES
+                       ENVIRONMENT "PROSPER_DETILE_THREADS=8")
 
   # BC1/BC2/BC3 block decompression to RGBA8 (#121): hand-built blocks with known output. Pure.
   add_executable(test_bc_decode tests/test_bc_decode.cpp)

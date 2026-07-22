@@ -8,6 +8,7 @@
 #include <limits>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <vector>
 
 namespace prosper::gpu {
@@ -378,6 +379,45 @@ size_t sw64kb_tiled_bytes(uint32_t ew, uint32_t eh, uint32_t pitch, uint32_t bpe
     return (size_t)blocks_per_row * block_rows * 65536;
 }
 
+// Row-parallelism for the tiled<->linear walk (#1177). The walk is row-independent: for detile each
+// output row writes a disjoint linear span and only reads (read-only) tiled bytes; for tile the layout
+// is a bijection so every (y,x) writes a distinct tiled offset. So splitting the row range across
+// threads is race-free. Uses per-call std::thread (not a pool): this gates on large surfaces where the
+// spawn cost is amortized by the 4K detile work, and it avoids any pool-reuse synchronization hazard.
+// Small surfaces and PROSPER_DETILE_SINGLE_THREADED / PROSPER_DETILE_THREADS=1 stay single-threaded;
+// detiling is memory-bandwidth-bound, so the auto thread count is capped low (~8).
+inline unsigned detile_row_threads(size_t work_bytes, uint32_t eh) {
+    static const int env = [] {
+        const char* s = getenv("PROSPER_DETILE_THREADS");
+        return s ? atoi(s) : -1;   // -1 = auto
+    }();
+    static const bool single = getenv("PROSPER_DETILE_SINGLE_THREADED") != nullptr;
+    if (single || env == 1) return 1u;
+    if (work_bytes < (size_t)512 * 1024) return 1u;            // small surface: spawn not worth it
+    const unsigned hw = std::thread::hardware_concurrency();
+    const unsigned want = env > 1 ? std::min((unsigned)env, 32u)   // clamp an over-large override
+                                  : std::min(hw ? hw : 4u, 8u);    // memory-bound -> cap ~8
+    const unsigned by_rows = eh / 32u;                             // keep >= 32 rows per thread
+    return std::max(1u, std::min(want, by_rows));
+}
+
+// body(row_begin, row_end) must not throw: it runs on worker threads that are only join()ed, so an
+// escaping exception would std::terminate. The only caller is the memcpy/memset detile loop (noexcept).
+template <class Body>
+inline void parallel_rows(uint32_t eh, unsigned nthreads, Body&& body) {
+    if (nthreads <= 1 || eh == 0) { if (eh) body(0u, eh); return; }
+    const uint32_t chunk = (eh + nthreads - 1) / nthreads;
+    std::vector<std::thread> ts;
+    ts.reserve(nthreads - 1);
+    for (unsigned i = 1; i < nthreads; i++) {
+        const uint32_t b = i * chunk, e = std::min(eh, b + chunk);
+        if (b >= e) break;
+        ts.emplace_back([&body, b, e] { body(b, e); });
+    }
+    body(0u, std::min(eh, chunk));   // the calling thread runs chunk 0
+    for (auto& t : ts) t.join();
+}
+
 // The 64KB tiled<->linear walk. The pattern offset is XOR-separable in x and y (each offset bit is
 // parity(x&xm)^parity(y&ym)), so precompute fx[] / fy[] per coordinate and each element's in-block
 // offset is fx[x]^fy[y] — exact per addrlib (patterns are evaluated on GLOBAL element coords; every
@@ -409,17 +449,20 @@ void sw64kb_copy(uint8_t* dst, const uint8_t* src, uint32_t ew, uint32_t eh, uin
         for (uint32_t i = el; i < 16; i++) v |= (uint32_t)(__builtin_popcount(y & pat[i].y) & 1) << i;
         fy[y] = (uint16_t)v;
     }
-    for (uint32_t y = 0; y < eh; y++) {
-        uint64_t brow = (uint64_t)(y / bh) * blocks_per_row;
-        for (uint32_t x = 0; x < ew; x++) {
-            uint64_t t = tiled_origin +
-                         (((brow + x / bw) << 16) | (uint32_t)(fx[x] ^ fy[y]));
-            size_t   l = ((size_t)y * ew + x) * bpe;
-            if (ToTiled) { if (t + bpe <= tiled_bytes) std::memcpy(dst + t, src + l, bpe); }
-            else         { if (t + bpe <= tiled_bytes) std::memcpy(dst + l, src + t, bpe);
-                           else                        std::memset(dst + l, 0, bpe); }
+    auto process_rows = [&](uint32_t y0, uint32_t y1) {
+        for (uint32_t y = y0; y < y1; y++) {
+            uint64_t brow = (uint64_t)(y / bh) * blocks_per_row;
+            for (uint32_t x = 0; x < ew; x++) {
+                uint64_t t = tiled_origin +
+                             (((brow + x / bw) << 16) | (uint32_t)(fx[x] ^ fy[y]));
+                size_t   l = ((size_t)y * ew + x) * bpe;
+                if (ToTiled) { if (t + bpe <= tiled_bytes) std::memcpy(dst + t, src + l, bpe); }
+                else         { if (t + bpe <= tiled_bytes) std::memcpy(dst + l, src + t, bpe);
+                               else                        std::memset(dst + l, 0, bpe); }
+            }
         }
-    }
+    };
+    parallel_rows(eh, detile_row_threads((size_t)ew * eh * bpe, eh), process_rows);
 }
 
 inline bool is_64kb_mode(uint32_t tile_mode) {
