@@ -8298,6 +8298,85 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     return b.finish();
 }
 
+// See FlatLoadInfo / analyze_flat_loads in the header (#1171). A `base + offset` flat address VGPR pair
+// v[N:N+1] is computed as vN = add(base_lo_sgpr, offset_lo) [carry-out] and v(N+1) =
+// add(base_hi_sgpr, offset_hi, carry) [carry-in], where s[base_lo:base_hi] are consecutive user SGPRs
+// holding a 64-bit guest pointer (the low kernel-arg pointer dword feeds the low address dword). We
+// identify the base by the NEAREST prior definition of each address dword being an integer add that
+// reads a user-range SGPR, and require the low dword to add the SGPR one below the high dword's.
+// Anything else (a non-add producer, a non-user SGPR, a store/atomic/LDS/global-with-saddr form) leaves
+// the load unresolved so the caller keeps failing visibly. flat_access_info lives in this TU's
+// anonymous namespace but is visible here (internal linkage is still TU-wide).
+// Resolution is over LINEAR program order (not CFG-aware). That is exact for the target decode kernels
+// (the address adds sit in the same block immediately before the load) and the base is a loop-invariant
+// kernel-arg pointer, so the resolved base is stable across loop iterations; the executor's
+// guest_readable_mapping_containing validation is the runtime backstop against a bogus base.
+FlatLoadAnalysis analyze_flat_loads(const uint32_t* code, size_t dwords, uint32_t user_sgpr_count) {
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code, dwords, ins);
+    FlatLoadAnalysis out;
+
+    auto writes_vgpr = [](const Rdna2Inst& d, uint32_t reg) {
+        return d.dst.kind == OperandKind::VGPR && static_cast<uint32_t>(d.dst.value) == reg;
+    };
+    // If `d` is an integer add that could produce a 64-bit-pointer dword, return the user-range SGPR it
+    // adds (else -1). Recognizes the add_co / add_co_ci / add_nc forms a compiler emits for pointer
+    // arithmetic: VOP2 0x25 (add_nc) / 0x28 (add_co_ci), VOP3 0x30F (add_co) / 0x125 (add_nc) / 0x128
+    // (add_co_ci).
+    auto add_user_sgpr = [&](const Rdna2Inst& d) -> int32_t {
+        const bool is_add =
+            (d.fmt == Rdna2Format::VOP2 && (d.opcode == 0x25 || d.opcode == 0x28)) ||
+            (d.fmt == Rdna2Format::VOP3 &&
+             (d.opcode == 0x30F || d.opcode == 0x125 || d.opcode == 0x128));
+        if (!is_add) return -1;
+        for (int s = 0; s < 2; ++s)
+            if (d.src[s].kind == OperandKind::SGPR && d.src[s].value >= 0 &&
+                static_cast<uint32_t>(d.src[s].value) < user_sgpr_count)
+                return d.src[s].value;
+        return -1;
+    };
+    // The user-range SGPR added by the nearest prior writer of `reg` (or -1 if that writer is not a
+    // user-SGPR add). We trust only the immediate definition — a later non-add redefinition breaks the
+    // pattern and must not be skipped over.
+    auto prior_add_sgpr = [&](uint32_t reg, size_t before) -> int32_t {
+        for (size_t j = before; j-- > 0;)
+            if (!ins[j].is_end && writes_vgpr(ins[j], reg))
+                return add_user_sgpr(ins[j]);
+        return -1;
+    };
+
+    for (size_t i = 0; i < ins.size(); ++i) {
+        const Rdna2Inst& in = ins[i];
+        if (in.is_end) break;
+        if (in.fmt != Rdna2Format::FLAT) continue;
+        if (in.flat_segment == 1u) continue;   // scratch spill: analyze_static_scratch owns it
+        out.any = true;
+        const FlatAccessInfo access = flat_access_info(in.opcode);
+        FlatLoadInfo info;
+        info.load_pc = in.pc;
+        info.vaddr_lo_reg = in.src[0].kind == OperandKind::VGPR
+                                ? static_cast<uint32_t>(in.src[0].value) : 0u;
+        info.dst_reg = static_cast<uint32_t>(in.dst.value);
+        info.bits = access.bits;
+        info.components = access.components;
+        info.sign_extend = access.sign_extend;
+        // Resolvable only as a plain LOAD with a VGPR address pair and a null SADDR (true flat segment).
+        const bool shape = access.valid && !access.store && !in.flat_lds &&
+                           in.src[0].kind == OperandKind::VGPR &&
+                           in.src[1].kind == OperandKind::Special && in.src[1].value == 125;
+        if (shape) {
+            const uint32_t lo = info.vaddr_lo_reg, hi = lo + 1;
+            const int32_t hi_base = prior_add_sgpr(hi, i);
+            const int32_t lo_base = prior_add_sgpr(lo, i);
+            if (hi_base > 0 && lo_base == hi_base - 1)
+                info.base_sgpr = lo_base;
+        }
+        if (info.base_sgpr < 0) out.all_resolved = false;
+        out.loads.push_back(info);
+    }
+    return out;
+}
+
 RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);

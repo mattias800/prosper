@@ -185,4 +185,29 @@ struct RecompileCoverage {
 };
 RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords);
 
+// A general (non-scratch) FLAT load resolved to a base user-SGPR pointer pair (#1171). The 64-bit
+// address VGPR pair of a `base + offset` flat access is `v[vaddr_lo_reg : vaddr_lo_reg+1]`, and the
+// base pointer's low/high dwords live in consecutive user SGPRs `s[base_sgpr : base_sgpr+1]`. With the
+// base identified, the executor can bind the containing guest allocation as an SSBO and the emitter can
+// lower the load to an indexed read.
+struct FlatLoadInfo {
+    uint32_t load_pc = 0;        // dword offset of the flat_load in the stream
+    uint32_t vaddr_lo_reg = 0;   // VADDR VGPR; the 64-bit address pair is v[vaddr_lo_reg : +1]
+    uint32_t dst_reg = 0;        // first destination VGPR
+    uint32_t bits = 0;           // access width in bits: 8 / 16 / 32
+    uint32_t components = 0;     // dword count (x1/x2/x3/x4)
+    bool     sign_extend = false;
+    int32_t  base_sgpr = -1;     // resolved base-pointer low-dword user-SGPR (high dword is +1); -1 = unresolved
+};
+struct FlatLoadAnalysis {
+    bool any = false;            // at least one general (non-scratch) FLAT memory op is present
+    bool all_resolved = true;    // every general FLAT op is a resolvable load (false => keep rejecting)
+    std::vector<FlatLoadInfo> loads;
+};
+// Identify general FLAT loads (segment != scratch) and resolve each to a base user-SGPR pointer pair,
+// so a windowed-SSBO lowering can replace today's fail-visible reject (#1171). Fail-visible by design:
+// any store/atomic/LDS/global-with-saddr form, or an address that does not reduce to
+// `user_sgpr_pair + offset`, leaves `all_resolved=false` and the caller keeps rejecting the shader.
+FlatLoadAnalysis analyze_flat_loads(const uint32_t* code, size_t dwords, uint32_t user_sgpr_count);
+
 } // namespace prosper::gpu

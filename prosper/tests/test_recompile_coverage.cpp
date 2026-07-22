@@ -49,6 +49,48 @@ int main() {
     CHECK(!co_spv.empty() && co_spv[0] == 0x07230203u,
           "v_add_co_u32 lowers to a valid compute SPIR-V module");
 
+    // analyze_flat_loads (#1171): resolve a general (non-scratch) flat_load's 64-bit address to its base
+    // user-SGPR pointer pair. Encodings are byte-identical to GTA V's texture-decode kernel
+    // exec_cs_2042d47600 (pc=0030/0040): the low address dword adds base-low s12, the high dword adds
+    // base-high s13, so v[1:2] = s[12:13] + offset and the resolved base is s12.
+    const uint32_t flat_code[] = {
+        0xd70f6a01u, 0x00020c0cu,   // v_add_co_u32    v1, vcc, s12, v6   (addr low  = s12 + v6)
+        0x50041af9u, 0x86860680u,   // v_add_co_ci_u32 v2 (sdwa), addend s13  (addr high = s13 + carry)
+        0xdc200000u, 0x007d0001u,   // flat_load_ubyte v0, v[1:2]
+        0xBF810000u,                // s_endpgm
+    };
+    FlatLoadAnalysis fla = analyze_flat_loads(flat_code, sizeof(flat_code)/sizeof(flat_code[0]), 16);
+    CHECK(fla.any && fla.all_resolved && fla.loads.size() == 1 &&
+          fla.loads[0].base_sgpr == 12 && fla.loads[0].vaddr_lo_reg == 1 &&
+          fla.loads[0].dst_reg == 0 && fla.loads[0].bits == 8 && !fla.loads[0].sign_extend,
+          "analyze_flat_loads resolves v[1:2]=s[12:13]+offset flat_load_ubyte to base s12");
+
+    // Negative: an address whose HIGH dword is a plain VGPR move (not a user-SGPR add) is unresolvable,
+    // so the load stays fail-visible (all_resolved=false) rather than binding a bogus window.
+    const uint32_t flat_unres[] = {
+        0xd70f6a01u, 0x00020c0cu,   // v_add_co_u32    v1, vcc, s12, v6
+        0x7e040300u,                // v_mov_b32       v2, v0             (high dword not from a user SGPR)
+        0xdc200000u, 0x007d0001u,   // flat_load_ubyte v0, v[1:2]
+        0xBF810000u,                // s_endpgm
+    };
+    FlatLoadAnalysis flu = analyze_flat_loads(flat_unres, sizeof(flat_unres)/sizeof(flat_unres[0]), 16);
+    CHECK(flu.any && !flu.all_resolved && flu.loads.size() == 1 && flu.loads[0].base_sgpr < 0,
+          "analyze_flat_loads leaves a non-pointer-arithmetic flat address unresolved (fail-visible)");
+
+    // Negative: both dwords are valid user-SGPR adds but the base SGPRs are NON-CONSECUTIVE (low adds
+    // s12, high adds s15). This must stay unresolved — resolving it to s12 would bind an s[12:13] window
+    // for an address whose high dword is s15, i.e. silent wrong data. Guards the `lo_base==hi_base-1`
+    // invariant (without that clause this would wrongly resolve to base s12).
+    const uint32_t flat_split[] = {
+        0xd70f6a01u, 0x00020c0cu,   // v_add_co_u32    v1, vcc, s12, v6   (low base = s12)
+        0x5004000fu,                // v_add_co_ci_u32 v2, vcc, s15, v0   (high base = s15, NOT s13)
+        0xdc200000u, 0x007d0001u,   // flat_load_ubyte v0, v[1:2]
+        0xBF810000u,                // s_endpgm
+    };
+    FlatLoadAnalysis fls = analyze_flat_loads(flat_split, sizeof(flat_split)/sizeof(flat_split[0]), 16);
+    CHECK(fls.any && !fls.all_resolved && fls.loads.size() == 1 && fls.loads[0].base_sgpr < 0,
+          "analyze_flat_loads rejects a non-consecutive base SGPR pair (s12 low / s15 high)");
+
     // tbuffer_load_format_x v0, v0, s[8:11], 0 format:32_FLOAT ; s_endpgm.
     // MTBUF needs a resolved V# binding, so the table-less coverage pass must classify it as
     // recompilable-in-context rather than truly unsupported.
