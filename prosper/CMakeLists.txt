@@ -315,6 +315,14 @@ if(TARGET prosper_core)
   target_include_directories(test_prosper_app_present_mode PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_present_mode COMMAND test_prosper_app_present_mode)
 
+  # Fault-safe guest-pointer read in the PROSPER_AMPRLOG diagnostic (#1154): an unmapped, aligned,
+  # > 0xffff pointer (GTA V's 0x302200) must report unreadable, not SIGSEGV. POSIX-only
+  # (process_vm_readv / mmap); ampr_arglog lives in the __linux__||__APPLE__ half of hle_kernel_mem.
+  if(NOT WIN32)
+    add_executable(test_amprlog_safe_read tests/test_amprlog_safe_read.cpp)
+    add_test(NAME amprlog_safe_read COMMAND test_amprlog_safe_read)
+  endif()
+
   # Bounded-acquire present classification (#1182). Needs Vulkan HEADERS only (VkResult enum), no loader
   # call — link Vulkan::Vulkan purely for its include dirs. Guarded so a headers-less host skips it
   # gracefully; every platform that builds prosper-app has Vulkan available.
