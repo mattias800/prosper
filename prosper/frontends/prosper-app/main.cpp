@@ -296,6 +296,11 @@ prosper::frontend::PresentAttempt present_frame(Vk& vk, const uint8_t* rgba, uin
     case prosper::frontend::AcquireAction::recreate: return PresentAttempt::out_of_date;
     case prosper::frontend::AcquireAction::proceed:  break;
     }
+    // Load-bearing ordering: vkResetFences MUST stay after the skip/recreate early-returns above. A skip
+    // leaves inFlight signaled (from the last real present) so the next frame's vkWaitForFences returns
+    // immediately; hoisting this reset above the acquire would leave inFlight unsignaled on a skip with no
+    // paired submit to re-signal it, and the next vkWaitForFences would hang. The reset is always paired
+    // with the vkQueueSubmit(..., inFlight) below.
     vkResetFences(vk.device, 1, &vk.inFlight);
     vkResetCommandBuffer(vk.cmd, 0);
 
