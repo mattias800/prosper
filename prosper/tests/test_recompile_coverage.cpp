@@ -385,6 +385,22 @@ int main() {
     CHECK(f.unsupported == 0 && f.table_dependent >= 1 && f.first_bad_fmt < 0,
           "#325: a 2D_ARRAY image_sample is recompilable-in-context (base slice), not unsupported");
 
+    // IMAGE_SAMPLE_C_LZ (op 0x2f) is a depth-compare shadow sample. It was accepted only for 2D_ARRAY
+    // (DIM=5); Bendy and the Ink Machine (PPSA27616) uses it for plain 2D (DIM=1, spot/directional
+    // shadow) and CUBE (DIM=3, point-light shadow) maps, which were rejected -> the whole shadow
+    // shader was skipped. Both now recompile (table_dependent -> needs the depth-compare T#/S#), not
+    // unsupported. Same 2D_ARRAY sample bytes with op 0x20->0x2f (bits[24:18]) and DIM 5->1/3 (bits[5:3]).
+    const uint32_t shadow2d[] = { 0xF0BC0F08u, 0x00A30000u, 0xBF810000u };  // C_LZ, DIM=1 (2D)
+    RecompileCoverage s2 = recompile_coverage(shadow2d, sizeof(shadow2d)/sizeof(shadow2d[0]));
+    printf("  shadow2d c_lz: total=%u table_dependent=%u unsupported=%u first_bad_fmt=%d\n",
+           s2.total, s2.table_dependent, s2.unsupported, s2.first_bad_fmt);
+    CHECK(s2.unsupported == 0 && s2.table_dependent >= 1 && s2.first_bad_fmt < 0,
+          "IMAGE_SAMPLE_C_LZ 2D (DIM=1) shadow sample is recompilable-in-context, not unsupported");
+    const uint32_t shadowcube[] = { 0xF0BC0F18u, 0x00A30000u, 0xBF810000u };  // C_LZ, DIM=3 (CUBE)
+    RecompileCoverage sc = recompile_coverage(shadowcube, sizeof(shadowcube)/sizeof(shadowcube[0]));
+    CHECK(sc.unsupported == 0 && sc.table_dependent >= 1 && sc.first_bad_fmt < 0,
+          "IMAGE_SAMPLE_C_LZ CUBE (DIM=3) shadow sample is recompilable-in-context, not unsupported");
+
     const uint32_t cvt_i4[] = { 0x7e001d00u, 0xBF810000u }; // v_cvt_off_f32_i4 v0,v0
     RecompileCoverage g = recompile_coverage(cvt_i4, sizeof(cvt_i4)/sizeof(cvt_i4[0]));
     CHECK(g.total == 1 && g.alu == 1 && g.unsupported == 0,

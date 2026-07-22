@@ -856,6 +856,21 @@ struct SpirvCompute {
         const uint32_t bits = bcu(result);
         out[0] = out[1] = out[2] = out[3] = bits;
     }
+    // IMAGE_SAMPLE_C_LZ on a plain 2D depth texture (a spot/directional shadow map): compare the
+    // sampled depth against DREF at explicit LOD zero. Coordinates are (u,v); the comparison result
+    // is scalar and RDNA writes that value for the requested dmask component. Same lowering as the
+    // 2D_ARRAY form without the layer coordinate (used by Bendy's shadow pass, dim=1).
+    void image_sample_dref_lz_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
+                                 uint32_t dref_bits, uint32_t out[4]) {
+        uint32_t si = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
+        uint32_t coord = id();
+        put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+        uint32_t result = id();
+        put(code, Op_ImageSampleDrefExplicitLod,
+            {t_f32, result, si, coord, bcf(dref_bits), ImgOp_Lod, fconstf(0.0f)});
+        const uint32_t bits = bcu(result);
+        out[0] = out[1] = out[2] = out[3] = bits;
+    }
     // image_sample_b 2D: implicit-LOD sample with an LOD BIAS (bias_bits float). Bias only means
     // anything with implicit LOD (fragment derivatives); outside the fragment stage the op resolves
     // like the other samples there — explicit LOD 0 (bias dropped, matching image_sample_2d's rule).
@@ -5927,8 +5942,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // (y-1)) / 6 at base LOD (mips aren't uploaded; a >0 LOD clamps to the one level).
                 // The in-face clamp stops bilinear bleed across face seams. CONFIDENCE: MED — the
                 // coordinate convention is Mesa-verified; face memory layout is validated visually.
-                if (!is_sample && !is_sample_l && !is_sample_lz && !is_sample_b) { ok = false; return true; }
-                const uint32_t ci = is_sample_b ? 1u : 0u;              // _b: bias occupies vaddr0
+                // _c_lz on a CUBE is a point-light shadow cubemap: dref occupies vaddr0 (ISA 8.2.5
+                // dref-first), face coords follow, and the compare lowers onto the same stacked-face
+                // 2D depth image. CONFIDENCE: LOW — the stacked-face compare is not yet frame-validated;
+                // it renders the shadow draw instead of skipping it (which blacks the composite).
+                if (!is_sample && !is_sample_l && !is_sample_lz && !is_sample_b && !is_sample_c_lz) { ok = false; return true; }
+                if (is_sample_c_lz && (uint_texture || !res->depth_compare)) { ok = false; return true; }
+                const uint32_t ci = (is_sample_b || is_sample_c_lz) ? 1u : 0u;   // _b: bias, _c_lz: dref occupies vaddr0
                 uint32_t x = vread(cvg(ci)), y = vread(cvg(ci + 1)), fid = vread(cvg(ci + 2));
                 const uint32_t one = b.uconst(fbits(1.0f)), zero = b.uconst(fbits(0.0f));
                 uint32_t uf = b.fbin(Op_FSub, x, one);
@@ -5936,8 +5956,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t layer = b.fext1(Glsl_RoundEven,
                                      b.fext2(Glsl_FMax, b.fext2(Glsl_FMin, fid, b.uconst(fbits(5.0f))), zero));
                 uint32_t v6 = b.fbin(Op_FMul, b.fbin(Op_FAdd, layer, vf), b.uconst(fbits(1.0f / 6.0f)));
-                b.declare_texture(res->binding, Dim_2D, uint_texture);
-                b.image_sample_lod_2d(res->binding, uf, v6, b.uconst(0), out);
+                if (is_sample_c_lz) {
+                    b.declare_texture(res->binding, Dim_2D, false, /*arrayed=*/false, /*depth=*/true);
+                    b.image_sample_dref_lz_2d(res->binding, uf, v6, vread(cvg(0)), out);
+                } else {
+                    b.declare_texture(res->binding, Dim_2D, uint_texture);
+                    b.image_sample_lod_2d(res->binding, uf, v6, b.uconst(0), out);
+                }
             } else if (dim3d) {
                 // 3D: implicit-LOD / LOD-0 sample, or an integer texel FETCH (image_load — DOLL's
                 // color-grade 3D LUT, #273).
@@ -5962,14 +5987,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // four consecutive address VGPRs, dref at slot 0 per 8.2.5) and LLVM's own
                 // llvm.amdgcn.image.sample.c.lz lowering (dref before coords). CONFIDENCE: MED —
                 // the #825 lane must re-validate against a real rendered shadow once it lights up.
-                // Integer views and non-array dimensions are not legal for this lowering; reject
-                // rather than silently turning a comparison sample into an ordinary color read.
-                if (in.mimg_dim != 5u || uint_texture || !res->depth_compare) {
+                // Plain 2D (dim=1) is the ordinary spot/directional shadow map — same lowering with
+                // coords [dref,u,v] and no layer (Bendy's shadow pass, live PPSA27616). 2D_ARRAY
+                // (dim=5) adds the layer coord. Integer views and other dimensions are not legal for
+                // this lowering; reject rather than silently turning a comparison sample into an
+                // ordinary color read. CONFIDENCE: HIGH for 2D/2D_ARRAY (ISA 8.2.5 dref-first order,
+                // llvm-mc round-tripped; Dref sample is a standard SPIR-V op).
+                if ((in.mimg_dim != 1u && in.mimg_dim != 5u) || uint_texture || !res->depth_compare) {
                     ok = false; return true;
                 }
-                b.declare_texture(res->binding, Dim_2D, false, true, true);
-                b.image_sample_dref_lz_2d_array(
-                    res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(3)), vread(cvg(0)), out);
+                if (in.mimg_dim == 5u) {
+                    b.declare_texture(res->binding, Dim_2D, false, /*arrayed=*/true, /*depth=*/true);
+                    b.image_sample_dref_lz_2d_array(
+                        res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(3)), vread(cvg(0)), out);
+                } else {  // dim=1: plain 2D depth texture, coords [dref, u, v]
+                    b.declare_texture(res->binding, Dim_2D, false, /*arrayed=*/false, /*depth=*/true);
+                    b.image_sample_dref_lz_2d(
+                        res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(0)), out);
+                }
             } else if (is_gather_lz || is_gather_lz_o) {
                 // gather4 dmask selects ONE channel (must be a single bit); the result is always the
                 // four texels of that channel -> 4 consecutive VDATA VGPRs, gather order preserved.
@@ -8336,7 +8371,9 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                     // #325) — so array-sampling draws recompile+render instead of being skipped.
                     // 0xa0 is the high-bit sibling of image_sample (0x20), lowered identically (GTA V, #1145).
                     if (i.opcode == 0x20u || i.opcode == 0x27u || i.opcode == 0xa0u) return i.mimg_dim == 1u || i.mimg_dim == 2u || i.mimg_dim == 5u;
-                    if (i.opcode == 0x2fu) return i.mimg_dim == 5u; // IMAGE_SAMPLE_C_LZ 2D_ARRAY
+                    // IMAGE_SAMPLE_C_LZ: 2D (spot/dir shadow), CUBE (point-light shadow, stacked-face
+                    // lowering), 2D_ARRAY (cascade). Depth-compare + non-uint enforced at emit.
+                    if (i.opcode == 0x2fu) return i.mimg_dim == 1u || i.mimg_dim == 3u || i.mimg_dim == 5u;
                     if (i.opcode == 0x24u || i.opcode == 0x25u || i.opcode == 0x47u) return i.mimg_dim == 1u || i.mimg_dim == 5u;
                     return false;
                 }
