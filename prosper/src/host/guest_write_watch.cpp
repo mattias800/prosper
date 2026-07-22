@@ -707,13 +707,24 @@ GuestWriteWatchStats guest_write_watch_stats() {
 }
 
 void guest_write_watch_set_fault_onstack(bool on_altstack) {
+#if defined(__linux__)
     state().fault_onstack.store(on_altstack, std::memory_order_release);
+#else
+    // Only Linux wires handle_fault to the write-protect fault (SIGSEGV). Darwin delivers a
+    // write-to-read-only-page fault as SIGBUS, which this handler is NOT hooked for, so an armed page's
+    // first guest store would crash. macOS uses SA_ONSTACK unconditionally, so without this guard the
+    // watch would arm and crash there. Keep fault_onstack false off Linux -> create() refuses to arm and
+    // callers keep the exact byte-comparison fallback (matching Windows). This is also the single switch
+    // that makes the whole watch (arming + the notify bookkeeping below) a no-op when the feature is off.
+    (void)on_altstack;
+#endif
 }
 
 void guest_write_watch_notify_direct_mapping_added(uint64_t addr, uint64_t size, uint64_t phys,
                                                     uint32_t protection) {
     if (!addr || !size || addr > UINT64_MAX - size || phys > UINT64_MAX - size) return;
     WatchState& w = state();
+    if (!w.fault_onstack.load(std::memory_order_acquire)) return;   // feature off -> table is never used
     std::lock_guard lock(w.mutex);
     const uint64_t begin = addr & ~(kPage - 1);
     const uint64_t end = (addr + size + kPage - 1) & ~(kPage - 1);
@@ -744,6 +755,7 @@ void guest_write_watch_notify_direct_mapping_added(uint64_t addr, uint64_t size,
 void guest_write_watch_notify_direct_mapping_removed(uint64_t addr, uint64_t size) {
     if (!addr || !size) return;
     WatchState& w = state();
+    if (!w.fault_onstack.load(std::memory_order_acquire)) return;   // feature off -> nothing tracked
     std::lock_guard lock(w.mutex);
     const uint64_t begin = addr & ~(kPage - 1);
     const uint64_t end = (addr + size + kPage - 1) & ~(kPage - 1);
@@ -756,15 +768,30 @@ void guest_write_watch_notify_direct_mapping_removed(uint64_t addr, uint64_t siz
 
 void guest_write_watch_notify_direct_mapping_protection(uint64_t addr, uint64_t size,
                                                         uint32_t protection) {
-    if (!addr || !size) return;
+    if (!addr || !size || addr > UINT64_MAX - size) return;
     WatchState& w = state();
+    if (!w.fault_onstack.load(std::memory_order_acquire)) return;   // feature off -> nothing tracked
     std::lock_guard lock(w.mutex);
     const uint64_t end = addr + size;
-    for (AliasRange& a : w.aliases)
-        if (a.addr < end && a.addr + a.size > addr) {
-            a.prot = protection;
-            invalidate_phys_range_locked(w, a.phys, a.phys + a.size);
-        }
+    // A guest re-protect may cover only PART of an alias. Overwriting the whole AliasRange.prot would
+    // mis-record the untouched remainder: if the change makes part read-only, the still-writable part
+    // would read as non-writable, a future create() would skip arming it, and a CPU write there would go
+    // undetected -> stale texture (review N2). Split each overlapping alias so ONLY the re-protected
+    // sub-range takes the new prot; the remainder keeps its own.
+    std::vector<AliasRange> split_out;
+    for (auto it = w.aliases.begin(); it != w.aliases.end();) {
+        const AliasRange a = *it;
+        const uint64_t a_end = a.addr + a.size;
+        if (!(a.addr < end && a_end > addr)) { ++it; continue; }
+        it = w.aliases.erase(it);
+        const uint64_t lo = std::max(a.addr, addr);   // re-protected sub-range [lo, hi)
+        const uint64_t hi = std::min(a_end, end);
+        if (a.addr < lo) split_out.push_back({a.addr, lo - a.addr, a.phys, a.prot});
+        split_out.push_back({lo, hi - lo, a.phys + (lo - a.addr), protection});
+        if (hi < a_end) split_out.push_back({hi, a_end - hi, a.phys + (hi - a.addr), a.prot});
+        invalidate_phys_range_locked(w, a.phys + (lo - a.addr), a.phys + (hi - a.addr));
+    }
+    for (const AliasRange& r : split_out) w.aliases.push_back(r);
 }
 
 void guest_write_watch_notify_physical_write(uint64_t phys, uint64_t size) {

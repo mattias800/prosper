@@ -128,12 +128,17 @@ int main() {
     sigemptyset(&sa.sa_mask);
     CHECK(sigaction(SIGSEGV, &sa, nullptr) == 0, "SIGSEGV handler installed");
 
-    // Gate check: without onstack, create() must refuse (safe fallback).
-    prosper::host::guest_write_watch_set_fault_onstack(false);
+    // The real emulator calls set_fault_onstack(true) once at startup, before any dmem map records an
+    // alias (and the notify hooks only record while the feature is enabled). Mirror that: enable, record
+    // both aliases, THEN prove the gate refuses when the handler is turned back off.
+    prosper::host::guest_write_watch_set_fault_onstack(true);
     prosper::host::guest_write_watch_notify_direct_mapping_added(
         reinterpret_cast<uint64_t>(a), size, kPhys, kCpuRw);
     prosper::host::guest_write_watch_notify_direct_mapping_added(
         reinterpret_cast<uint64_t>(b), size, kPhys, kCpuRw);
+
+    // Gate check: with the handler NOT on the sigaltstack, create() must refuse (safe fallback).
+    prosper::host::guest_write_watch_set_fault_onstack(false);
     GuestWriteWatch off = GuestWriteWatch::create(reinterpret_cast<uint64_t>(a), size);
     CHECK(!static_cast<bool>(off), "create refuses to arm when the handler is not on the sigaltstack");
 
@@ -220,6 +225,34 @@ int main() {
     CHECK(watch.query() == GuestWriteWatchQuery::Dirty,
           "a page still covered by a surviving alias keeps faulting after a sibling alias is removed (B4)");
     munmap(c, size);
+
+    // N2: a partial re-protect must record ONLY the re-protected sub-range. Re-protect the MIDDLE page of
+    // a fresh 3-page mapping read-only; a watch over the FIRST page must still find it writable, arm it,
+    // and catch a write. If the whole alias's prot were overwritten, the outer page would read as
+    // non-writable, never arm, and the write would be missed (stale texture).
+    {
+        int fd2 = memfd_create("prosper-ww-n2", 0);
+        CHECK(fd2 >= 0 && ftruncate(fd2, static_cast<off_t>(page * 3)) == 0, "n2 memfd sized");
+        auto* m = static_cast<uint8_t*>(
+            mmap(nullptr, page * 3, PROT_READ | PROT_WRITE, MAP_SHARED, fd2, 0));
+        CHECK(m != MAP_FAILED, "n2 mapping");
+        constexpr uint64_t kN2Phys = 0x50000;   // distinct from kPhys above
+        prosper::host::guest_write_watch_notify_direct_mapping_added(
+            reinterpret_cast<uint64_t>(m), page * 3, kN2Phys, kCpuRw);
+        prosper::host::guest_write_watch_notify_direct_mapping_protection(
+            reinterpret_cast<uint64_t>(m) + page, page, 0x1 /* CPU_READ only */);
+        GuestWriteWatch outer = GuestWriteWatch::create(reinterpret_cast<uint64_t>(m), page);
+        CHECK(static_cast<bool>(outer), "a page outside a partial re-protect is still armable (N2)");
+        CHECK(outer.query() == GuestWriteWatchQuery::Unchanged, "outer page clean after arm");
+        m[0x30] = 0x9d;
+        CHECK(m[0x30] == 0x9d, "write to the outer page lands");
+        CHECK(outer.query() == GuestWriteWatchQuery::Dirty,
+              "a write to a page outside the re-protected sub-range is caught (N2)");
+        outer.reset();
+        prosper::host::guest_write_watch_notify_direct_mapping_removed(
+            reinterpret_cast<uint64_t>(m), page * 3);
+        munmap(m, page * 3); close(fd2);
+    }
 
     // A watch over a range with NO known mapping must return Unknown (exact fallback), not arm.
     GuestWriteWatch none = GuestWriteWatch::create(0x9000000000ULL, page);
