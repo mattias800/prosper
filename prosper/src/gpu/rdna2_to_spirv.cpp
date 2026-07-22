@@ -8334,7 +8334,8 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                     // (0x27) from a 3D texture; sample_b (0x25) and gather4_lz (0x47) are 2D. 2D_ARRAY (dim 5)
                     // is accepted for all sample paths and handled as its base 2D slice (array index dropped,
                     // #325) — so array-sampling draws recompile+render instead of being skipped.
-                    if (i.opcode == 0x20u || i.opcode == 0x27u) return i.mimg_dim == 1u || i.mimg_dim == 2u || i.mimg_dim == 5u;
+                    // 0xa0 is the high-bit sibling of image_sample (0x20), lowered identically (GTA V, #1145).
+                    if (i.opcode == 0x20u || i.opcode == 0x27u || i.opcode == 0xa0u) return i.mimg_dim == 1u || i.mimg_dim == 2u || i.mimg_dim == 5u;
                     if (i.opcode == 0x2fu) return i.mimg_dim == 5u; // IMAGE_SAMPLE_C_LZ 2D_ARRAY
                     if (i.opcode == 0x24u || i.opcode == 0x25u || i.opcode == 0x47u) return i.mimg_dim == 1u || i.mimg_dim == 5u;
                     return false;
