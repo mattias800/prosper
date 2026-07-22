@@ -12,6 +12,7 @@
 #include <vector>
 #include "../src/host/exec_image.hpp"
 #include "../src/hle/dispatch.hpp"
+#include "../src/hle/nid.hpp"
 
 namespace prosper {
     uint32_t    prosper_apr_register(const std::string& path, uint64_t size);
@@ -152,6 +153,67 @@ int main() {
           "ordinary embedded completion record still publishes byte count");
 
     std::remove(fixture_path);
+    prosper_apr_reset_for_test();
+
+    // sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes (GTA V / PPSA04263, RAGE, issue #1130):
+    // the prefix-taking twin of the plain resolve. It must prepend `prefix` to each guest path,
+    // stat the resolved container, and WRITE all three output arrays (id/size/flags). Stubbing it to
+    // success without populating the outputs makes RAGE proceed on a garbage file id (0xffffffff was
+    // observed live at the next GetFileStat) and wild-write over its allocator. translate() passes a
+    // non-mount path through unchanged, so a relative fixture path exercises the real handler.
+    auto resolve_prefix = Hle::lookup(nid_hash("sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes"));
+    auto resolve_plain  = Hle::lookup(nid_hash("sceKernelAprResolveFilepathsToIdsAndFileSizes"));
+    CHECK(nid_hash("sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes") == "w5fcCG+t31g",
+          "WithPrefix resolve hashes to the PS5 3.20 import NID");
+    CHECK(resolve_prefix != nullptr && resolve_plain != nullptr, "both APR resolve entries registered");
+
+    const char* wp_full = "prosper-test-apr-prefix.tmp";   // prefix + tail == this path
+    const char* wp_prefix = "prosper-test-apr-";
+    const char* wp_tail   = "prefix.tmp";
+    std::array<uint8_t, 321> wp_bytes{};
+    for (size_t i = 0; i < wp_bytes.size(); ++i) wp_bytes[i] = (uint8_t)(i * 13u + 5u);
+    if (FILE* wf = std::fopen(wp_full, "wb")) { std::fwrite(wp_bytes.data(), 1, wp_bytes.size(), wf); std::fclose(wf); }
+
+    if (resolve_prefix && resolve_plain) {
+        // The prefix path is prepended: prefix="prosper-test-apr-", paths[0]="prefix.tmp".
+        const char* paths[1] = { wp_tail };
+        uint32_t ids[1] = { 0xdeadbeef }; uint64_t sizes[1] = { 0xdead }; uint32_t flags[1] = { 0xdead };
+        uint64_t r = resolve_prefix((uint64_t)(uintptr_t)wp_prefix, (uint64_t)(uintptr_t)paths, 1,
+                                    (uint64_t)(uintptr_t)ids, (uint64_t)(uintptr_t)sizes, (uint64_t)(uintptr_t)flags);
+        CHECK(r == 0, "WithPrefix resolve returns success");
+        CHECK(sizes[0] == wp_bytes.size(),
+              "WithPrefix resolve prepends the prefix and stats the combined path");
+        CHECK(ids[0] >= 1 && flags[0] == 0, "WithPrefix resolve populates id and flags");
+        CHECK(prosper_apr_path_for_id(ids[0]) == wp_full,
+              "WithPrefix registers the combined host path under the returned id");
+
+        // An empty prefix must behave exactly like the plain (non-prefix) resolve.
+        prosper_apr_reset_for_test();
+        const char* full_paths[1] = { wp_full };
+        uint32_t id_wp = 0, id_plain = 0; uint64_t sz_wp = 0, sz_plain = 0; uint32_t fl_wp = 1, fl_plain = 1;
+        resolve_prefix((uint64_t)(uintptr_t)"", (uint64_t)(uintptr_t)full_paths, 1,
+                       (uint64_t)(uintptr_t)&id_wp, (uint64_t)(uintptr_t)&sz_wp, (uint64_t)(uintptr_t)&fl_wp);
+        prosper_apr_reset_for_test();
+        resolve_plain((uint64_t)(uintptr_t)full_paths, 1,
+                      (uint64_t)(uintptr_t)&id_plain, (uint64_t)(uintptr_t)&sz_plain, (uint64_t)(uintptr_t)&fl_plain, 0);
+        CHECK(id_wp == id_plain && sz_wp == sz_plain && sz_wp == wp_bytes.size() && fl_wp == 0,
+              "empty prefix matches the plain resolve");
+
+        // A missing container zeroes its outputs (no garbage id) rather than failing the batch.
+        prosper_apr_reset_for_test();
+        const char* miss_paths[1] = { "prosper-test-apr-does-not-exist.tmp" };
+        uint32_t miss_id = 0x55; uint64_t miss_sz = 0x55; uint32_t miss_fl = 0x55;
+        uint64_t rm = resolve_prefix((uint64_t)(uintptr_t)"", (uint64_t)(uintptr_t)miss_paths, 1,
+                                     (uint64_t)(uintptr_t)&miss_id, (uint64_t)(uintptr_t)&miss_sz,
+                                     (uint64_t)(uintptr_t)&miss_fl);
+        CHECK(rm == 0 && miss_id == 0 && miss_sz == 0 && miss_fl == 0,
+              "unresolvable container zeroes its outputs");
+
+        // A null paths pointer / non-positive count is rejected without touching memory.
+        CHECK((uint32_t)resolve_prefix((uint64_t)(uintptr_t)"", 0, 1, 0, 0, 0) == 0x80020016u,
+              "WithPrefix resolve rejects a null paths array");
+    }
+    std::remove(wp_full);
     prosper_apr_reset_for_test();
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
