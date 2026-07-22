@@ -2111,10 +2111,23 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
         // Cursor slots (a1/a2 point at them) and the 0x90-byte descriptor buffer (a4): the desc may
         // carry the REAL read layout (file offset / dest / size) — dump to check whether req+0x20 is
         // truly the engine-chosen dest or a stale value from an unpopulated Ampr begin-cursor.
-        if (a1 > 0xffff) fprintf(stderr, "[apr]   *cur1 = 0x%016llx\n", (unsigned long long)*(uint64_t*)a1);
-        if (a2 > 0xffff) fprintf(stderr, "[apr]   *cur2 = 0x%016llx\n", (unsigned long long)*(uint64_t*)a2);
+        // Fault-safe peek: these are DIAGNOSTIC reads of guest-supplied pointers that can be garbage
+        // (e.g. an uninitialized Ampr command-buffer address), so a raw deref SIGSEGVs the emulator.
+        // Read via process_vm_readv, which returns failure instead of faulting. (Live: Bendy PPSA27616
+        // passed g_apr_last_cb=0x50ba49... and the raw cb-dump loop below crashed f_apr_read_submit.)
+        auto apr_peek = [](uint64_t va, uint64_t* out) -> bool {
+#ifndef _WIN32
+            struct iovec l { out, 8 }, r { (void*)(uintptr_t)va, 8 };
+            return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == 8;
+#else
+            *out = *(uint64_t*)(uintptr_t)va; return true;   // Windows: guest memory is directly mapped
+#endif
+        };
+        uint64_t pv;
+        if (a1 > 0xffff && apr_peek(a1, &pv)) fprintf(stderr, "[apr]   *cur1 = 0x%016llx\n", (unsigned long long)pv);
+        if (a2 > 0xffff && apr_peek(a2, &pv)) fprintf(stderr, "[apr]   *cur2 = 0x%016llx\n", (unsigned long long)pv);
         if (a4 > 0xffff) for (int o = 0; o < 0x90; o += 8)
-            fprintf(stderr, "[apr]   desc+0x%02x = 0x%016llx\n", o, (unsigned long long)*(uint64_t*)(a4 + o));
+            if (apr_peek(a4 + o, &pv)) fprintf(stderr, "[apr]   desc+0x%02x = 0x%016llx\n", o, (unsigned long long)pv);
         // The real read command lives in the Ampr command buffer registered at init (a3 of the
         // (req, cbSize, 0, cbBuf, poolCtx, 3) init call); "CB offset 40" is decimal 40 = 0x28 into it.
         // g_apr_last_cb is defined in hle_kernel_mem.cpp, which is entirely #ifdef __linux__ (the whole
@@ -2126,8 +2139,9 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
                     (unsigned long long)g_apr_last_cb, (unsigned long long)g_apr_last_cb_size);
             uint64_t n = g_apr_last_cb_size > 0x80 ? 0x80 : g_apr_last_cb_size;
             for (uint64_t o = 0; o < n; o += 8)
-                fprintf(stderr, "[apr]   cb+0x%02llx = 0x%016llx\n", (unsigned long long)o,
-                        (unsigned long long)*(uint64_t*)(g_apr_last_cb + o));
+                if (apr_peek(g_apr_last_cb + o, &pv))
+                    fprintf(stderr, "[apr]   cb+0x%02llx = 0x%016llx\n", (unsigned long long)o,
+                            (unsigned long long)pv);
         }
 #endif
     }
