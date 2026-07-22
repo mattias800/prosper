@@ -4756,6 +4756,31 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     else if (in.sdst.kind == OperandKind::SGPR) rs.sreg_bool[in.sdst.value] = carry_masked;
                     else ok = false;
                 }
+            } else if (in.opcode == 0x30F || in.opcode == 0x310 || in.opcode == 0x319) {
+                // v_add_co_u32 (0x30F) / v_sub_co_u32 (0x310) / v_subrev_co_u32 (0x319): 32-bit add/
+                // subtract that writes a carry/borrow-out to the VOP3B sdst mask (VCC or an SGPR pair).
+                // No carry-IN — that is the _co_ci_ family (VOP2 0x28-0x2A / VOP3B 0x128-0x12A). Mirrors
+                // the VOP2 e32 carry emit (0x28-0x2A above) plus the v_mad_u64_u32 carry-out sdst write.
+                // GTA V (PPSA04263) UI/content compute shaders use these; the missing op dropped the whole
+                // shader, so its output texture rendered as bare untextured triangles (#1163/#1165).
+                // CONFIDENCE: HIGH (RDNA2 ISA 6.5/3.9; coverage test in test_recompile_coverage).
+                const uint32_t a = val(in.src[0]), c = val(in.src[1]);
+                uint32_t d, carry;
+                if (in.opcode == 0x30F) {                     // a + c ; carry = unsigned overflow
+                    d = b.ibin(Op_IAdd, a, c);
+                    carry = b.ucmp(Op_ULessThan, d, a);
+                } else {                                      // sub: a-c ; subrev: c-a ; borrow = x < y
+                    const uint32_t x = in.opcode == 0x310 ? a : c;
+                    const uint32_t y = in.opcode == 0x310 ? c : a;
+                    d = b.ibin(Op_ISub, x, y);
+                    carry = b.ucmp(Op_ULessThan, x, y);
+                }
+                vreg[in.dst.value] = d;
+                // ISA 3.9 carry-mask rule: an EXEC-inactive lane's bit is written 0, not its raw carry.
+                const uint32_t carry_masked = rs.exec_narrowed ? b.land(rs.exec, carry) : carry;
+                if (in.sdst.value == 106 || in.sdst.value == 107) rs.vcc = carry_masked;
+                else if (in.sdst.kind == OperandKind::SGPR) rs.sreg_bool[in.sdst.value] = carry_masked;
+                else ok = false;
             } else if (in.opcode == 0x169) {                          // v_mul_lo_u32
                 vreg[in.dst.value] = b.ibin(Op_IMul, val(in.src[0]), val(in.src[1]));
             } else if (in.opcode == 0x16a) {                          // v_mul_hi_u32 (high 32 bits)
