@@ -1164,8 +1164,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             else if (!persistent_sampled_texture) r_notsampled++;
                             else if (r.compression_enabled) r_compression++;
                             else if (persistent_source_size == 0) r_size0++;
-                            else if (persistent_decoded_textures.find(decode_key) !=
-                                     persistent_decoded_textures.end()) r_inval++;
+                            else if ([&] {
+                                         auto it = persistent_decoded_textures.find(decode_key);
+                                         // Only a same-size entry actually entered validate_exact() and was
+                                         // rejected; a size mismatch never reaches validation, so treat it
+                                         // as cold rather than an invalidation.
+                                         return it != persistent_decoded_textures.end() &&
+                                                it->second.source_size == persistent_source_size;
+                                     }()) r_inval++;
                             else if (persistent_cache_eligible) r_cold++;
                             else r_other++;
                             if ((ds_total % 3000) == 0) {

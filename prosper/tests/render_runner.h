@@ -1887,6 +1887,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         iai.allocationSize = ir.size; iai.memoryTypeIndex = pick(ir.memoryTypeBits, 0);
         if (persistent_color) {
             const VkDeviceSize limit = persistent_color_target_limit();
+            // NOTE: the unsigned `limit - ir.size` below is guarded by short-circuit ordering, not by the
+            // budget floor: `ir.size > limit` (here) and `ir.size <= limit` (retention check) are evaluated
+            // first, so the subtraction only runs when `ir.size <= limit`. Keep those operands ahead of it —
+            // reordering would let a single over-budget target underflow the subtraction to a huge value.
             while (!avoid_cache_eviction &&
                    (persistent_color_target_cache().size() > persistent_color_target_count_limit() || ir.size > limit ||
                     persistent_color_target_bytes() > limit - ir.size) &&
