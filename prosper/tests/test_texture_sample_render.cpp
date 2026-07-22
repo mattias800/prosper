@@ -342,10 +342,14 @@ int main() {
         const auto deferred_stats = prosper::test::backend_color_target_stats();
         const bool pinned = prosper::test::pin_persistent_color_target(
             target_id, W, H, VK_FORMAT_R8G8B8A8_UNORM);
-        // Exceed the 64-entry target-cache cap after the deferred target becomes the oldest live
-        // entry. Without the submit-lifetime pin, normal LRU pressure discards its only current pixels
-        // before the frontend's final callback can materialize them.
-        for (uint64_t pressure = 0; pressure < 70; ++pressure) {
+        // Exceed the target-cache entry cap after the deferred target becomes the oldest live entry, so
+        // LRU eviction actually fires. Derive the bound from the configured cap (+margin) rather than a
+        // magic number: the default was raised 64 -> 256 (#1177), and a fixed 70 no longer triggers any
+        // eviction, which would let this pin-vs-eviction guard pass trivially. Without the submit-lifetime
+        // pin, normal LRU pressure discards the deferred target's only current pixels before the
+        // frontend's final callback can materialize them.
+        const uint64_t pressure_count = prosper::test::persistent_color_target_count_limit() + 40;
+        for (uint64_t pressure = 0; pressure < pressure_count; ++pressure) {
             prosper::test::BackendColorTarget pressure_target{
                 target_id + 0x1000 + pressure, false, false};
             prosper::test::render_draws_rgba(

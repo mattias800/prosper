@@ -1125,6 +1125,78 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                                           fr.persistent_texture_id});
                             if (timing_enabled) pending_timing.texture_reuses++;
                         } else {
+                        // PROSPER_DETILE_STATS: this branch is the texture-decode MISS path — the cache
+                        // had no entry for decode_key, so we are about to read guest memory and CPU-detile
+                        // this surface. Counting decodes per guest address answers the #1177 redundancy
+                        // question: if a handful of addresses accumulate huge counts, the same immutable
+                        // surface is re-detiled every frame (a cache-key instability / live-RTT re-decode);
+                        // if counts stay near 1 the cost is a large one-time working set instead.
+                        if (getenv("PROSPER_DETILE_STATS")) {
+                            static std::unordered_map<uint64_t, uint64_t> ds_count;  // guest addr -> times decoded
+                            static uint64_t ds_total = 0;
+                            // Classify WHY this decode reached the miss path (so the redundancy is actionable):
+                            // rtt          - a renderer-owned RTT decoded on the CPU (has_live_rtt)
+                            // notsampled   - not a persistent-cache candidate class (host_data / fmt / volume/cube)
+                            // compression  - DCC-compressed source, excluded by persistent_cache_eligible
+                            // size0        - persistent_source_size==0 (force-detiled Unorm8x4)
+                            // invalidated  - eligible AND a cache entry exists, but validate_exact() rejected it
+                            // cold         - eligible but no cache entry (first use / LRU-evicted)
+                            static uint64_t r_rtt = 0, r_notsampled = 0, r_compression = 0,
+                                            r_size0 = 0, r_inval = 0, r_cold = 0, r_other = 0;
+                            // For the rtt bucket, record WHICH has_gpu_live_rtt condition failed (so a
+                            // registered render target that could be sampled straight from the GPU image
+                            // instead fell back to CPU detile). storage/notvalid/dimmismatch/self/noptarget.
+                            static uint64_t rtt_storage = 0, rtt_notvalid = 0, rtt_dimmismatch = 0,
+                                            rtt_self = 0, rtt_noptarget = 0, rtt_unknown = 0;
+                            ds_count[r.gpu_addr]++; ds_total++;
+                            if (has_live_rtt) {
+                                r_rtt++;
+                                if (fr.is_storage_image) rtt_storage++;
+                                else if (!live_rtt->second.gpu_valid) rtt_notvalid++;
+                                else if (live_rtt->second.w != tw || live_rtt->second.h != th)
+                                    rtt_dimmismatch++;
+                                else if (r.gpu_addr == draw.color0_base) rtt_self++;
+                                else if (prosper::test::find_persistent_color_target(
+                                             r.gpu_addr, tw, th, live_rtt->second.format) == nullptr)
+                                    rtt_noptarget++;   // evicted from / absent in the backend target cache
+                                else rtt_unknown++;
+                            }
+                            else if (!persistent_sampled_texture) r_notsampled++;
+                            else if (r.compression_enabled) r_compression++;
+                            else if (persistent_source_size == 0) r_size0++;
+                            else if ([&] {
+                                         auto it = persistent_decoded_textures.find(decode_key);
+                                         // Only a same-size entry actually entered validate_exact() and was
+                                         // rejected; a size mismatch never reaches validation, so treat it
+                                         // as cold rather than an invalidation.
+                                         return it != persistent_decoded_textures.end() &&
+                                                it->second.source_size == persistent_source_size;
+                                     }()) r_inval++;
+                            else if (persistent_cache_eligible) r_cold++;
+                            else r_other++;
+                            if ((ds_total % 3000) == 0) {
+                                std::vector<std::pair<uint64_t, uint64_t>> v(ds_count.begin(), ds_count.end());
+                                std::sort(v.begin(), v.end(),
+                                          [](auto& a, auto& b) { return a.second > b.second; });
+                                fprintf(stderr, "[detile-stats] %llu decodes, %zu distinct addrs; top re-decoded:",
+                                        (unsigned long long)ds_total, ds_count.size());
+                                for (int i = 0; i < 8 && i < (int)v.size(); i++)
+                                    fprintf(stderr, " 0x%llx x%llu",
+                                            (unsigned long long)v[i].first, (unsigned long long)v[i].second);
+                                fprintf(stderr, "\n[detile-stats] miss reasons: rtt=%llu notsampled=%llu "
+                                        "compression=%llu size0=%llu invalidated=%llu cold=%llu other=%llu\n",
+                                        (unsigned long long)r_rtt, (unsigned long long)r_notsampled,
+                                        (unsigned long long)r_compression, (unsigned long long)r_size0,
+                                        (unsigned long long)r_inval, (unsigned long long)r_cold,
+                                        (unsigned long long)r_other);
+                                fprintf(stderr, "[detile-stats] rtt-fail: storage=%llu notvalid=%llu "
+                                        "dimmismatch=%llu self=%llu noptarget=%llu unknown=%llu\n",
+                                        (unsigned long long)rtt_storage, (unsigned long long)rtt_notvalid,
+                                        (unsigned long long)rtt_dimmismatch, (unsigned long long)rtt_self,
+                                        (unsigned long long)rtt_noptarget, (unsigned long long)rtt_unknown);
+                                fflush(stderr);
+                            }
+                        }
                         const size_t volume_texels = (size_t)tw * th * (is_volume ? r.depth : 1u);
                         const VkFormat live_rtt_format = has_cpu_live_rtt
                             ? live_rtt->second.format : VK_FORMAT_R8G8B8A8_UNORM;

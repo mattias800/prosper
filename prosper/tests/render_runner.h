@@ -730,14 +730,68 @@ inline uint64_t& persistent_color_target_generation() {
     return generation;
 }
 
+// Device-derived residency budget, initialized once from the physical device's largest DEVICE_LOCAL
+// heap (see init_persistent_color_target_device_budget). 0 = not yet initialized -> the 256 MiB legacy
+// fallback is used until the first render call has a VkPhysicalDevice in hand.
+inline VkDeviceSize& persistent_color_target_device_budget() {
+    static VkDeviceSize budget = 0;
+    return budget;
+}
+
+// The historical fixed 256 MiB budget holds only ~4-8 targets at 4K (33 MiB RGBA8 / 66 MiB RGBA16F),
+// so a deferred renderer's targets overflow it, are recreated non-resident, and every later sample of
+// them falls to CPU detile (the #1177 bottleneck). Since a GPU-resident sample and a CPU detile produce
+// identical pixels, growing this budget is correctness-preserving and only trades a bounded amount of
+// device memory for far less per-frame CPU work. Precedence: explicit PROSPER_BACKEND_TARGET_CACHE_MB,
+// then the device-derived budget, then the 256 MiB fallback.
 inline VkDeviceSize persistent_color_target_limit() {
-    static const VkDeviceSize limit = []() -> VkDeviceSize {
+    static const bool have_env = getenv("PROSPER_BACKEND_TARGET_CACHE_MB") != nullptr;
+    static const VkDeviceSize env_limit = []() -> VkDeviceSize {
         const char* value = getenv("PROSPER_BACKEND_TARGET_CACHE_MB");
         const uint64_t mib = value ? strtoull(value, nullptr, 10) : 256ull;
         if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
         return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
     }();
-    return limit;
+    if (have_env) return env_limit;
+    const VkDeviceSize dev = persistent_color_target_device_budget();
+    return dev ? dev : static_cast<VkDeviceSize>(256ull * 1024ull * 1024ull);
+}
+
+// Size the default residency budget to a quarter of the largest device-local heap, clamped to
+// [256 MiB, 4 GiB]. On an integrated GPU (shared system RAM, a very large heap) this lands at the 4 GiB
+// ceiling; on a small discrete GPU it stays proportional so we never claim more than ~25% of VRAM.
+// Idempotent: only the first caller (with a valid device) sets it; PROSPER_BACKEND_TARGET_CACHE_MB
+// overrides it entirely (handled in persistent_color_target_limit).
+inline void init_persistent_color_target_device_budget(
+    const VkPhysicalDeviceMemoryProperties& memp) {
+    if (persistent_color_target_device_budget() != 0) return;
+    VkDeviceSize heap = 0;
+    for (uint32_t i = 0; i < memp.memoryHeapCount; i++)
+        if (memp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            heap = std::max(heap, memp.memoryHeaps[i].size);
+    VkDeviceSize budget = heap / 4;
+    budget = std::max<VkDeviceSize>(budget, 256ull * 1024ull * 1024ull);
+    budget = std::min<VkDeviceSize>(budget, 4096ull * 1024ull * 1024ull);
+    persistent_color_target_device_budget() = budget;
+    fprintf(stderr, "[render] persistent color-target residency budget = %llu MiB "
+            "(device-local heap %llu MiB)\n",
+            (unsigned long long)(budget / (1024ull * 1024ull)),
+            (unsigned long long)(heap / (1024ull * 1024ull)));
+}
+
+// Max number of distinct render targets kept GPU-resident (sampleable) at once. A target that would
+// exceed this count is created non-resident (no SAMPLED_BIT), forcing every later sample of it onto the
+// CPU detile path. At 4K a deferred renderer (G-buffer MRTs + lighting + post chain) easily needs more
+// than the historical 64, so this is configurable via PROSPER_BACKEND_TARGET_CACHE_COUNT (see #1177).
+inline size_t persistent_color_target_count_limit() {
+    static const size_t count = []() -> size_t {
+        const char* value = getenv("PROSPER_BACKEND_TARGET_CACHE_COUNT");
+        // Raised from the historical 64 so a 4K deferred renderer's targets are bounded by the memory
+        // budget (persistent_color_target_limit) rather than an arbitrarily small count (#1177).
+        const uint64_t n = value ? strtoull(value, nullptr, 10) : 256ull;
+        return n ? static_cast<size_t>(n) : size_t{256};
+    }();
+    return count;
 }
 
 inline PersistentColorTargetImage* find_persistent_color_target(
@@ -1637,6 +1691,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     VkDevice dev = ctx.dev; VkQueue queue = ctx.queue; uint32_t qfi = ctx.qfi;
     const bool aniso_enabled = ctx.aniso_enabled; const float max_aniso_limit = ctx.max_aniso_limit;
     VkPhysicalDeviceMemoryProperties memp; vkGetPhysicalDeviceMemoryProperties(phys, &memp);
+    init_persistent_color_target_device_budget(memp);   // size the residency budget once (#1177)
     auto pick = [&](uint32_t bits, VkMemoryPropertyFlags want) -> uint32_t {
         for (uint32_t i = 0; i < memp.memoryTypeCount; i++)
             if ((bits & (1u << i)) && (memp.memoryTypes[i].propertyFlags & want) == want) return i;
@@ -1832,11 +1887,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         iai.allocationSize = ir.size; iai.memoryTypeIndex = pick(ir.memoryTypeBits, 0);
         if (persistent_color) {
             const VkDeviceSize limit = persistent_color_target_limit();
+            // NOTE: the unsigned `limit - ir.size` below is guarded by short-circuit ordering, not by the
+            // budget floor: `ir.size > limit` (here) and `ir.size <= limit` (retention check) are evaluated
+            // first, so the subtraction only runs when `ir.size <= limit`. Keep those operands ahead of it —
+            // reordering would let a single over-budget target underflow the subtraction to a huge value.
             while (!avoid_cache_eviction &&
-                   (persistent_color_target_cache().size() > 64 || ir.size > limit ||
+                   (persistent_color_target_cache().size() > persistent_color_target_count_limit() || ir.size > limit ||
                     persistent_color_target_bytes() > limit - ir.size) &&
                    evict_persistent_color_target(ctx, color_target_generation)) {}
-            if (ir.size <= limit && persistent_color_target_cache().size() <= 64 &&
+            if (ir.size <= limit && persistent_color_target_cache().size() <= persistent_color_target_count_limit() &&
                 persistent_color_target_bytes() <= limit - ir.size &&
                 vkAllocateMemory(dev, &iai, nullptr, &imem) == VK_SUCCESS) {
                 cached_color->bytes = ir.size;
@@ -3742,7 +3801,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 vkDestroyImage(dev, dimg, nullptr);
                 release_transient_render_memory(dev, dmem);
             }
-            while ((persistent_color_target_cache().size() > 64 ||
+            while ((persistent_color_target_cache().size() > persistent_color_target_count_limit() ||
                     persistent_color_target_bytes() > persistent_color_target_limit()) &&
                    evict_persistent_color_target(*ctx_ptr, color_target_generation)) {}
         });
