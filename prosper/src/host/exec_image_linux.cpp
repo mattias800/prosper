@@ -505,9 +505,11 @@ namespace {
     // + reads only. Used by PROSPER_BP_KLASS (and reusable by any handler that has a candidate object ptr).
     size_t bp_il2cpp_cname(uint64_t obj, char* s, size_t cap) {
         if (cap == 0) return 0; s[0] = 0;
-        if (obj < 0x1000 || !probe_readable(obj + 7)) return 0;
+        // probe_readable(X) verifies [X, X+8) — so guard each read with its BASE address (not base+size-1,
+        // which would leave the leading bytes of an unaligned read unverified and could fault in-handler).
+        if (obj < 0x1000 || !probe_readable(obj)) return 0;
         uint64_t klass = *(const uint64_t*)obj;
-        if (klass < 0x1000 || !probe_readable(klass + 0x17)) return 0;
+        if (klass < 0x1000 || !probe_readable(klass + 0x10)) return 0;
         uint64_t namep = *(const uint64_t*)(klass + 0x10);
         if (!probe_readable(namep)) return 0;
         size_t k = 0;
@@ -558,17 +560,18 @@ namespace {
             char type = 'q'; bool bad = false;
             while (*p && *p!=';' && *p!=',') {
                 if (*p=='+') { p++; v += hexval(&p); }
-                else if (*p=='*') { p++; if (!probe_readable(v+7)) { bad = true; break; } v = *(const uint64_t*)v; }
+                else if (*p=='*') { p++; if (!probe_readable(v)) { bad = true; break; } v = *(const uint64_t*)v; }   // probe_readable(v) covers [v,v+8)
                 else if (*p==':') { p++; if (*p) { type = *p; p++; } break; }
                 else p++;
             }
             int slen = (int)(p - start); if (slen > 40) slen = 40;
             if (bad) { on += snprintf(out+on, sizeof out-on, " %.*s=<unmapped>", slen, start); continue; }
+            // probe_readable(v) verifies [v,v+8), covering any 1..8-byte read at v (guard the read's base).
             char vb[40];
-            if (type=='b')      snprintf(vb, sizeof vb, probe_readable(v)   ? "%u"     : "?", probe_readable(v)   ? *(const uint8_t*)v  : 0);
-            else if (type=='d') snprintf(vb, sizeof vb, probe_readable(v+3) ? "0x%x"   : "?", probe_readable(v+3) ? *(const uint32_t*)v : 0);
-            else if (type=='f') snprintf(vb, sizeof vb, probe_readable(v+3) ? "f:0x%x" : "?", probe_readable(v+3) ? *(const uint32_t*)v : 0);
-            else                snprintf(vb, sizeof vb, probe_readable(v+7) ? "0x%llx" : "?", (unsigned long long)(probe_readable(v+7) ? *(const uint64_t*)v : 0));
+            if (type=='b')      snprintf(vb, sizeof vb, probe_readable(v) ? "%u"     : "?", probe_readable(v) ? *(const uint8_t*)v  : 0);
+            else if (type=='d') snprintf(vb, sizeof vb, probe_readable(v) ? "0x%x"   : "?", probe_readable(v) ? *(const uint32_t*)v : 0);
+            else if (type=='f') snprintf(vb, sizeof vb, probe_readable(v) ? "f:0x%x" : "?", probe_readable(v) ? *(const uint32_t*)v : 0);
+            else                snprintf(vb, sizeof vb, probe_readable(v) ? "0x%llx" : "?", (unsigned long long)(probe_readable(v) ? *(const uint64_t*)v : 0));
             on += snprintf(out+on, sizeof out-on, " %.*s=%s", slen, start, vb);
         }
         out[on] = '\n';
@@ -1407,7 +1410,7 @@ namespace {
                     // obj->klass->name chain over unrelated memory.
                     if (g_bp_klass) {
                         const struct { const char* rn; uint64_t v; } cand[] = {
-                            {"rdi",rdi},{"rsi",rsi},{"rdx",rdx},{"rcx",rcx},{"r8",r8},
+                            {"rdi",rdi},{"rsi",rsi},{"rdx",rdx},{"rcx",rcx},{"r8",r8},{"r9",(uint64_t)gr[REG_R9]},
                             {"rbx",(uint64_t)gr[REG_RBX]},{"rax",rax},{"r14",r14},{"r15",r15} };
                         for (auto& c : cand) {
                             if (c.v < 0x2000000000ull || c.v >= 0x2800000000ull) continue;
