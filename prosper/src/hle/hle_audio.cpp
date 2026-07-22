@@ -2202,7 +2202,10 @@ HLE(ngs2_geom_calc_listener) {
 // a faithful null-backend voice implementation (init succeeds, ports return valid silent parameters)
 // is the alternative if a title ever needs working voice (tracked separately).
 HLE(voice_init_unavailable) {   // sceVoiceInit / sceVoiceInitHQ -> report voice unavailable
-    return (uint64_t)(int64_t)(int32_t)0x80410002;   // negative SCE_VOICE-class error (js-checked by guest)
+    // Negative SCE_VOICE-class error (facility 0x8041; the guest only sign-checks the return via `js`).
+    // Chosen as a HARD, non-retryable init failure: it is NOT the ALREADY_INITIALIZED code (0x80410004,
+    // which some engines treat as success), so the guest takes its "voice off" branch and does not retry.
+    return (uint64_t)(int64_t)(int32_t)0x80410002;
 }
 
 void register_audio_hle() {
