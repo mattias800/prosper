@@ -22,6 +22,7 @@
 #include "pad_overlay.hpp"              // keyboard pad 0 composed over the physical controller backend
 #include "hle/ime_input.hpp"           // #1093: forward host keyboard keys to the guest IME path
 #include "present_mode.hpp"             // explicit swapchain latency/vsync policy, pure regression seam
+#include "present_policy.hpp"           // bounded-acquire present classification (#1182), pure seam
 #include "window_controls.hpp"           // debounced app-window shortcuts, pure regression seam
 #ifdef PROSPER_HAVE_LIVE_RENDERER
 #include "live_renderer.hpp"           // shared DrawItem->Vulkan compositor (register_live_renderer)
@@ -274,14 +275,27 @@ void barrier(VkCommandBuffer c, VkImage img, VkImageLayout from, VkImageLayout t
 }
 
 // Present one guest RGBA frame (w*h, 4 bytes/pixel) to the window, scaling to the swapchain extent.
-bool present_frame(Vk& vk, const uint8_t* rgba, uint32_t w, uint32_t h) {
-    if (!ensure_stage(vk, w, h)) return false;
+using prosper::frontend::PresentAttempt;
+
+prosper::frontend::PresentAttempt present_frame(Vk& vk, const uint8_t* rgba, uint32_t w, uint32_t h) {
+    if (!ensure_stage(vk, w, h)) return PresentAttempt::out_of_date;
     memcpy(vk.stageMapped, rgba, (size_t)w * h * 4);
 
     vkWaitForFences(vk.device, 1, &vk.inFlight, VK_TRUE, UINT64_MAX);
     uint32_t imgIndex = 0;
-    VkResult acq = vkAcquireNextImageKHR(vk.device, vk.swapchain, UINT64_MAX, vk.acquireSem, VK_NULL_HANDLE, &imgIndex);
-    if (acq == VK_ERROR_OUT_OF_DATE_KHR) return false;   // caller recreates
+    // Bound the acquire (#1182): an occluded/minimized window releases no swapchain image, and an
+    // infinite wait here would block the app main thread — freezing visible output, stalling SDL
+    // event/close handling, and (on the shared physical GPU) potentially the guest. A timeout is a
+    // benign SKIP: return without touching the swapchain and retry next loop. The guest keeps running
+    // on its own device regardless.
+    constexpr uint64_t kAcquireTimeoutNs = 100ull * 1000 * 1000;   // 100 ms — never hit while visible
+    VkResult acq = vkAcquireNextImageKHR(vk.device, vk.swapchain, kAcquireTimeoutNs, vk.acquireSem,
+                                         VK_NULL_HANDLE, &imgIndex);
+    switch (prosper::frontend::classify_acquire(acq)) {
+    case prosper::frontend::AcquireAction::skip:     return PresentAttempt::skipped;
+    case prosper::frontend::AcquireAction::recreate: return PresentAttempt::out_of_date;
+    case prosper::frontend::AcquireAction::proceed:  break;
+    }
     vkResetFences(vk.device, 1, &vk.inFlight);
     vkResetCommandBuffer(vk.cmd, 0);
 
@@ -319,7 +333,7 @@ bool present_frame(Vk& vk, const uint8_t* rgba, uint32_t w, uint32_t h) {
     pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &vk.presentSem;
     pi.swapchainCount = 1; pi.pSwapchains = &vk.swapchain; pi.pImageIndices = &imgIndex;
     VkResult pr = vkQueuePresentKHR(vk.queue, &pi);
-    return pr == VK_SUCCESS;
+    return prosper::frontend::classify_present(pr);
 }
 
 // Synthetic animated frame (no guest): a moving gradient fed through the REAL present layer, so the
@@ -765,9 +779,15 @@ int main(int argc, char** argv) {
             uint32_t h = frame.height;
             if (w == 0 || h == 0) { std::this_thread::sleep_for(std::chrono::milliseconds(2)); continue; }
             if (frame.rgba && frame.rgba->size() == (size_t)w * h * 4) {
-                if (!present_frame(vk, frame.rgba->data(), w, h)) {
+                PresentAttempt attempt = present_frame(vk, frame.rgba->data(), w, h);
+                if (attempt == PresentAttempt::out_of_date) {
                     // Out-of-date/suboptimal: share the resize/fullscreen recreation path next loop.
                     swapchainDirty = true;
+                } else if (attempt == PresentAttempt::skipped) {
+                    // Window occluded/minimized (#1182): no swapchain image within the bounded acquire.
+                    // Leave lastFrameSeq unchanged so we present the freshest frame once the window is
+                    // visible again, and do not mark the swapchain dirty. The guest keeps running.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(4));
                 } else {
                     lastFrameSeq = frame.frame_seq; shown++;
                     lastFrameProgress = std::chrono::steady_clock::now();
