@@ -112,11 +112,6 @@ int main() {
     CHECK(roundtrip_ok(64, 64),     "round-trip 64x64");
     CHECK(roundtrip_ok(1920, 1080), "round-trip 1920x1080 (the game's render target)");
     CHECK(roundtrip_ok(96, 64),     "round-trip 96x64 (non-square)");
-    // Large surfaces (>= 512 KB) take the row-parallel detile path (#1177). These round-trips exercise
-    // it across many thread chunks; identity here proves the threaded walk is byte-for-byte equal to the
-    // single-threaded/oracle result. (Run under PROSPER_DETILE_SINGLE_THREADED to confirm the control.)
-    CHECK(roundtrip_ok(2048, 2048), "round-trip 2048x2048 (row-parallel detile, 4K-class)");
-    CHECK(roundtrip_ok(3840, 2160), "round-trip 3840x2160 (row-parallel detile, native 4K)");
 
     // The vector convenience overload must be safe for a NATURALLY-sized (width*height*4, unpadded)
     // tiled input: it zero-pads internally instead of reading past the vector (heap OOB). The visible
@@ -475,6 +470,15 @@ int main() {
         CHECK(rt64(R, 500, 300, 4),  "SW_64KB_R_X round-trip 500x300 @ 4 B");
         CHECK(rt64(R, 130, 70, 8),   "SW_64KB_R_X round-trip 130x70 @ 8 B");
         CHECK(rt64(R, 70, 70, 16),   "SW_64KB_R_X round-trip 70x70 @ 16 B");
+        // Large 64KB-mode surfaces (>= 512 KiB) take the row-parallel detile path (#1177) — these span
+        // many thread chunks, so round-trip identity proves the threaded sw64kb_copy walk is byte-for-byte
+        // equal to the single-threaded result. The gpu_surface_detile_threaded CTest forces
+        // PROSPER_DETILE_THREADS so this runs multi-threaded regardless of hardware_concurrency, and the
+        // default gpu_surface_detile run covers the single-threaded control (< the thread gate on a
+        // 1-core CI, or via PROSPER_DETILE_SINGLE_THREADED).
+        CHECK(rt64(R, 2048, 2048, 4), "SW_64KB_R_X round-trip 2048x2048 @ 4 B (row-parallel detile)");
+        CHECK(rt64(R, 3840, 2160, 4), "SW_64KB_R_X round-trip 3840x2160 @ 4 B (row-parallel, native 4K)");
+        CHECK(rt64(S, 3840, 2160, 4), "SW_64KB_S round-trip 3840x2160 @ 4 B (row-parallel, native 4K)");
     }
 
     // AMD AddrLib GFX10_SW_64K_Z_X_1xaa golden, 16 pipes, 4 bpe. The selected pattern is

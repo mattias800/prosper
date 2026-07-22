@@ -395,12 +395,14 @@ inline unsigned detile_row_threads(size_t work_bytes, uint32_t eh) {
     if (single || env == 1) return 1u;
     if (work_bytes < (size_t)512 * 1024) return 1u;            // small surface: spawn not worth it
     const unsigned hw = std::thread::hardware_concurrency();
-    const unsigned want = env > 1 ? (unsigned)env
-                                  : std::min(hw ? hw : 4u, 8u);  // memory-bound -> cap ~8
-    const unsigned by_rows = eh / 32u;                          // keep >= 32 rows per thread
+    const unsigned want = env > 1 ? std::min((unsigned)env, 32u)   // clamp an over-large override
+                                  : std::min(hw ? hw : 4u, 8u);    // memory-bound -> cap ~8
+    const unsigned by_rows = eh / 32u;                             // keep >= 32 rows per thread
     return std::max(1u, std::min(want, by_rows));
 }
 
+// body(row_begin, row_end) must not throw: it runs on worker threads that are only join()ed, so an
+// escaping exception would std::terminate. The only caller is the memcpy/memset detile loop (noexcept).
 template <class Body>
 inline void parallel_rows(uint32_t eh, unsigned nthreads, Body&& body) {
     if (nthreads <= 1 || eh == 0) { if (eh) body(0u, eh); return; }
