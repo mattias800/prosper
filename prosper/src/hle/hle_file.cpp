@@ -7,6 +7,7 @@
 #include "dispatch.hpp"
 #include "nid.hpp"
 #include "heap_mutex.hpp"   // #707: keep the APR mutex off macOS __DATA
+#include "../host/guest_write_watch.hpp"   // #1144 B5: disarm texture watches before reading into guest mem
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1131,6 +1132,11 @@ HLE(f_fcntl) {
 // null-derefs (the intermittent Il2cpp crash on the cutscene-scene load; see CUTSCENE_PROGRESSION.md).
 // Looping restores the full-read contract. Returns bytes read (== count on success), or -1/errno.
 static int64_t read_full(int fd, void* buf, size_t count, bool positioned, off_t off) {
+    // The kernel is about to store file bytes straight into this (identity-mapped) guest buffer. If it
+    // overlaps a read-only texture write-watch, the store would EFAULT; disarm the range first so the
+    // read succeeds, and mark it Dirty since its bytes are changing (#1144 B5). No-op off Linux / when
+    // nothing is armed.
+    host::guest_write_watch_notify_host_write(reinterpret_cast<uint64_t>(buf), count);
     size_t done = 0;
     while (done < count) {
         ssize_t r = positioned ? ::pread(fd, (char*)buf + done, count - done, off + (off_t)done)
@@ -1237,9 +1243,20 @@ HLE(f_pwrite) { return (uint64_t)write_full((int)a0, P(a1), (size_t)a2, true, (o
 // identity-mapped, so the guest iovec array and its buffers pass straight to host (p)readv/(p)writev.
 // These were MISSING -> the return-0 stub read as "0 bytes" (silent EOF for readv/preadv) / "0 written",
 // a corruption trap for any module that uses them (e.g. UE4's IO stack).
-HLE(f_readv)  { return (uint64_t)(int64_t)::readv((int)a0, (const struct iovec*)P(a1), (int)a2); }
+// Disarm any texture write-watch over each destination buffer of a vectored read before the kernel
+// stores into it, mirroring read_full (#1144 B5). No-op off Linux / when nothing is armed.
+static void disarm_iovec_watches(const struct iovec* v, int n) {
+    if (!v || n <= 0) return;
+    for (int i = 0; i < n; ++i)
+        if (v[i].iov_base && v[i].iov_len)
+            host::guest_write_watch_notify_host_write(
+                reinterpret_cast<uint64_t>(v[i].iov_base), v[i].iov_len);
+}
+HLE(f_readv)  { const struct iovec* v = (const struct iovec*)P(a1); disarm_iovec_watches(v, (int)a2);
+                return (uint64_t)(int64_t)::readv((int)a0, v, (int)a2); }
 HLE(f_writev) { return (uint64_t)(int64_t)::writev((int)a0, (const struct iovec*)P(a1), (int)a2); }
-HLE(f_preadv) { return (uint64_t)(int64_t)::preadv((int)a0, (const struct iovec*)P(a1), (int)a2, (off_t)a3); }
+HLE(f_preadv) { const struct iovec* v = (const struct iovec*)P(a1); disarm_iovec_watches(v, (int)a2);
+                return (uint64_t)(int64_t)::preadv((int)a0, v, (int)a2, (off_t)a3); }
 HLE(f_pwritev){ return (uint64_t)(int64_t)::pwritev((int)a0, (const struct iovec*)P(a1), (int)a2, (off_t)a3); }
 #else
 // Windows positioned/vectored IO. MinGW has no pread/pwrite/*v, and these previously returned -1

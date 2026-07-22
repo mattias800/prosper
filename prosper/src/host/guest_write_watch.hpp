@@ -63,8 +63,21 @@ void guest_write_watch_notify_direct_mapping_protection(uint64_t addr, uint64_t 
 void guest_write_watch_notify_physical_write(uint64_t phys, uint64_t size);
 void guest_write_watch_invalidate_all();
 
+// Called by the HLE, by guest VA range, immediately BEFORE a host/kernel store into guest memory (e.g. a
+// read()/pread() that streams bytes straight into a guest dmem buffer). Restores write on any armed pages
+// the range overlaps so the store does not EFAULT, and marks them Dirty (the bytes are about to change).
+// No-op on Windows/macOS (no pages are ever armed there).
+void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size);
+
 // Retained for the platform-neutral VEH interface; Windows currently returns false because
 // page-fault write watches are unsafe for SysV guest code.
 bool guest_write_watch_handle_fault(uint64_t addr);
+
+// The Linux page-protection watch (mprotect + SIGSEGV) is only red-zone-safe when the SIGSEGV handler
+// runs on a sigaltstack (SA_ONSTACK): without it the kernel writes the signal frame into the guest's
+// SysV red zone, corrupting live locals of the faulting store. exec_image_linux reports whether the
+// fault handler is installed with SA_ONSTACK; until it is, `create` refuses to arm and callers keep
+// the exact byte-comparison fallback. No-op on other platforms.
+void guest_write_watch_set_fault_onstack(bool on_altstack);
 
 } // namespace prosper::host

@@ -523,7 +523,7 @@ if(TARGET prosper_core)
   target_link_libraries(test_guest_read_cache_disabled PRIVATE prosper_core)
   add_test(NAME guest_read_cache_disabled COMMAND test_guest_read_cache_disabled)
 
-  if(WIN32)
+  if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test_guest_write_watch tests/test_guest_write_watch.cpp)
     target_link_libraries(test_guest_write_watch PRIVATE prosper_core)
     add_test(NAME guest_write_watch COMMAND test_guest_write_watch)
