@@ -310,34 +310,53 @@ RenderState extract_render_state(const GpuState& st) {
             return std::max<int32_t>(0, static_cast<int16_t>(value));
         };
 
-        int32_t left = screen(PM4_FIELD(screen_tl, PA_SC_SCREEN_SCISSOR_TL, TL_X));
-        int32_t top = screen(PM4_FIELD(screen_tl, PA_SC_SCREEN_SCISSOR_TL, TL_Y));
-        int32_t right = screen(PM4_FIELD(screen_br, PA_SC_SCREEN_SCISSOR_BR, BR_X));
-        int32_t bottom = screen(PM4_FIELD(screen_br, PA_SC_SCREEN_SCISSOR_BR, BR_Y));
-        auto intersect = [&](uint32_t tl_x, uint32_t tl_y, uint32_t br_x, uint32_t br_y,
-                             bool offset_disabled) {
-            left = std::max(left, add_scissor_offset(tl_x, offset_x, offset_disabled));
-            top = std::max(top, add_scissor_offset(tl_y, offset_y, offset_disabled));
-            right = std::min(right, add_scissor_offset(br_x, offset_x, offset_disabled));
-            bottom = std::min(bottom, add_scissor_offset(br_y, offset_y, offset_disabled));
+        int32_t left = 0, top = 0, right = 0, bottom = 0;
+        // Intersect screen ∩ window ∩ generic ∩ (optional) viewport. `apply_offset` gates whether
+        // PA_SC_WINDOW_OFFSET participates at all, so the whole combine can be re-run without it.
+        auto combine = [&](bool apply_offset) -> bool {
+            left = screen(PM4_FIELD(screen_tl, PA_SC_SCREEN_SCISSOR_TL, TL_X));
+            top = screen(PM4_FIELD(screen_tl, PA_SC_SCREEN_SCISSOR_TL, TL_Y));
+            right = screen(PM4_FIELD(screen_br, PA_SC_SCREEN_SCISSOR_BR, BR_X));
+            bottom = screen(PM4_FIELD(screen_br, PA_SC_SCREEN_SCISSOR_BR, BR_Y));
+            const int32_t ox = apply_offset ? offset_x : 0;
+            const int32_t oy = apply_offset ? offset_y : 0;
+            auto intersect = [&](uint32_t tl_x, uint32_t tl_y, uint32_t br_x, uint32_t br_y,
+                                 bool offset_disabled) {
+                left = std::max(left, add_scissor_offset(tl_x, ox, offset_disabled));
+                top = std::max(top, add_scissor_offset(tl_y, oy, offset_disabled));
+                right = std::min(right, add_scissor_offset(br_x, ox, offset_disabled));
+                bottom = std::min(bottom, add_scissor_offset(br_y, oy, offset_disabled));
+            };
+            intersect(PM4_FIELD(window_tl, PA_SC_WINDOW_SCISSOR_TL, TL_X),
+                      PM4_FIELD(window_tl, PA_SC_WINDOW_SCISSOR_TL, TL_Y),
+                      PM4_FIELD(window_br, PA_SC_WINDOW_SCISSOR_BR, BR_X),
+                      PM4_FIELD(window_br, PA_SC_WINDOW_SCISSOR_BR, BR_Y),
+                      PM4_FIELD(window_tl, PA_SC_WINDOW_SCISSOR_TL, WINDOW_OFFSET_DISABLE) != 0);
+            intersect(PM4_FIELD(generic_tl, PA_SC_GENERIC_SCISSOR_TL, TL_X),
+                      PM4_FIELD(generic_tl, PA_SC_GENERIC_SCISSOR_TL, TL_Y),
+                      PM4_FIELD(generic_br, PA_SC_GENERIC_SCISSOR_BR, BR_X),
+                      PM4_FIELD(generic_br, PA_SC_GENERIC_SCISSOR_BR, BR_Y),
+                      PM4_FIELD(generic_tl, PA_SC_GENERIC_SCISSOR_TL, WINDOW_OFFSET_DISABLE) != 0);
+            if (PM4_FIELD(mode, PA_SC_MODE_CNTL_0, VPORT_SCISSOR_ENABLE))
+                intersect(PM4_FIELD(viewport_tl, PA_SC_VPORT_SCISSOR_0_TL, TL_X),
+                          PM4_FIELD(viewport_tl, PA_SC_VPORT_SCISSOR_0_TL, TL_Y),
+                          PM4_FIELD(viewport_br, PA_SC_VPORT_SCISSOR_0_BR, BR_X),
+                          PM4_FIELD(viewport_br, PA_SC_VPORT_SCISSOR_0_BR, BR_Y),
+                          PM4_FIELD(viewport_tl, PA_SC_VPORT_SCISSOR_0_TL,
+                                    WINDOW_OFFSET_DISABLE) != 0);
+            return right > left && bottom > top;
         };
-        intersect(PM4_FIELD(window_tl, PA_SC_WINDOW_SCISSOR_TL, TL_X),
-                  PM4_FIELD(window_tl, PA_SC_WINDOW_SCISSOR_TL, TL_Y),
-                  PM4_FIELD(window_br, PA_SC_WINDOW_SCISSOR_BR, BR_X),
-                  PM4_FIELD(window_br, PA_SC_WINDOW_SCISSOR_BR, BR_Y),
-                  PM4_FIELD(window_tl, PA_SC_WINDOW_SCISSOR_TL, WINDOW_OFFSET_DISABLE) != 0);
-        intersect(PM4_FIELD(generic_tl, PA_SC_GENERIC_SCISSOR_TL, TL_X),
-                  PM4_FIELD(generic_tl, PA_SC_GENERIC_SCISSOR_TL, TL_Y),
-                  PM4_FIELD(generic_br, PA_SC_GENERIC_SCISSOR_BR, BR_X),
-                  PM4_FIELD(generic_br, PA_SC_GENERIC_SCISSOR_BR, BR_Y),
-                  PM4_FIELD(generic_tl, PA_SC_GENERIC_SCISSOR_TL, WINDOW_OFFSET_DISABLE) != 0);
-        if (PM4_FIELD(mode, PA_SC_MODE_CNTL_0, VPORT_SCISSOR_ENABLE))
-            intersect(PM4_FIELD(viewport_tl, PA_SC_VPORT_SCISSOR_0_TL, TL_X),
-                      PM4_FIELD(viewport_tl, PA_SC_VPORT_SCISSOR_0_TL, TL_Y),
-                      PM4_FIELD(viewport_br, PA_SC_VPORT_SCISSOR_0_BR, BR_X),
-                      PM4_FIELD(viewport_br, PA_SC_VPORT_SCISSOR_0_BR, BR_Y),
-                      PM4_FIELD(viewport_tl, PA_SC_VPORT_SCISSOR_0_TL,
-                                WINDOW_OFFSET_DISABLE) != 0);
+
+        // A non-zero PA_SC_WINDOW_OFFSET that collapses the intersection to empty has pushed an
+        // offset-enabled viewport/window rectangle entirely off the render target. An emitted draw
+        // never intends an empty scissor (it would clip the whole frame to nothing), so when the
+        // offset is the cause, recover by re-running the combine without it. Observed on Bendy and
+        // the Ink Machine (PPSA27616), whose title/menu/gameplay draws leave the VPORT scissor
+        // offset-enabled while PA_SC_WINDOW_OFFSET carries a large value; the un-offset scissor is
+        // the correct full-target region and the frame renders. CONFIDENCE: MED — mechanism verified
+        // against the live capture; the un-offset recovery matches on-hardware output.
+        if (!combine(/*apply_offset=*/true) && (offset_x != 0 || offset_y != 0))
+            combine(/*apply_offset=*/false);
         rs.scissor_left = left; rs.scissor_top = top;
         rs.scissor_right = right; rs.scissor_bottom = bottom;
     }

@@ -209,6 +209,38 @@ int main() {
               scaled.scissor_right == 4 && scaled.scissor_bottom == 5,
               "reduced-resolution scissors round outward without losing guest coverage");
     }
+    {
+        // Bendy and the Ink Machine (PPSA27616): the title/menu/gameplay draws leave the VPORT
+        // scissor offset-enabled (bit31 clear) while PA_SC_WINDOW_OFFSET carries a large value.
+        // Adding that offset to the on-target VPORT rectangle pushed it entirely off the render
+        // target, collapsing the intersection to empty and clipping every fragment (black frame).
+        // extract_render_state must drop the offset when it is the sole cause of an empty scissor,
+        // recovering the on-target rectangle so the frame renders. Values are the exact live capture.
+        GpuState bendy;
+        bendy.cx[P::PA_SC_SCREEN_SCISSOR_TL] = 0x00000000u;   // (0,0)
+        bendy.cx[P::PA_SC_SCREEN_SCISSOR_BR] = 0x40004000u;   // (16384,16384) AGC default
+        bendy.cx[P::PA_SC_WINDOW_OFFSET]      = 0xe559ee99u;  // (X=-4455, Y=-6823) off-target
+        bendy.cx[P::PA_SC_WINDOW_SCISSOR_TL]  = 0x80000000u;  // offset disabled, full
+        bendy.cx[P::PA_SC_WINDOW_SCISSOR_BR]  = 0x40004000u;
+        bendy.cx[P::PA_SC_GENERIC_SCISSOR_TL] = 0x80000000u;  // offset disabled, full
+        bendy.cx[P::PA_SC_GENERIC_SCISSOR_BR] = 0x40004000u;
+        bendy.cx[P::PA_SC_VPORT_SCISSOR_0_TL] = 0x00000000u;  // (0,0), offset ENABLED (bit31 clear)
+        bendy.cx[P::PA_SC_VPORT_SCISSOR_0_BR] = 0x08000800u;  // (2048,2048)
+        bendy.cx[P::PA_SC_MODE_CNTL_0]        = 0x00000002u;  // VPORT_SCISSOR_ENABLE
+        const RenderState recovered = extract_render_state(bendy);
+        CHECK(recovered.has_scissor && recovered.scissor_left == 0 && recovered.scissor_top == 0 &&
+              recovered.scissor_right == 2048 && recovered.scissor_bottom == 2048,
+              "a window offset that empties an offset-enabled VPORT scissor is dropped, recovering the on-target rectangle");
+
+        // A window offset that keeps the VPORT scissor on-target is genuine and must be preserved
+        // (this is the #531 contract): only the empty-collapse case drops the offset.
+        GpuState shifted = bendy;
+        shifted.cx[P::PA_SC_WINDOW_OFFSET] = 0x00100010u;     // (+16,+16), keeps VPORT on-target
+        const RenderState kept = extract_render_state(shifted);
+        CHECK(kept.scissor_left == 16 && kept.scissor_top == 16 &&
+              kept.scissor_right == 2064 && kept.scissor_bottom == 2064,
+              "a window offset that keeps the VPORT scissor on-target is preserved, not dropped");
+    }
 
     CHECK(rs.color0_base == rdna2_addr(0x00100000u, 0x12u), "color0_base = (BASE<<8)|(EXT<<40)");
     CHECK(rs.color0_format == 0x0Au, "color0_format = 0x0A (FORMAT field)");
