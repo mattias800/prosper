@@ -56,7 +56,13 @@ while True:
                     child_pid = int(pid_file.read())
                 self.assertTrue(self._process_is_running(child_pid))
 
-                os.kill(harness.pid, signal.SIGKILL)
+                # Tolerate the harness already being gone: an absent harness still satisfies the
+                # property under test (the child must not outlive it). Guards a benign TOCTOU race
+                # with the harness's own exit that otherwise surfaces as a spurious ERROR (#1069).
+                try:
+                    os.kill(harness.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 harness.wait(timeout=5)
                 deadline = time.time() + 10
                 while time.time() < deadline and self._process_is_running(child_pid):
@@ -66,19 +72,34 @@ while True:
                     "snapshot child survived the harness's uncatchable termination",
                 )
             finally:
+                # Cleanup only. A ProcessLookupError here means the target exited between the check and
+                # the signal (a benign TOCTOU race with the process's own death) — that is the desired
+                # end state, so tolerate it rather than turning a passing run into a spurious ERROR
+                # (#1069). _process_is_running already tolerates a vanished PID via FileNotFoundError.
                 if harness.poll() is None:
-                    harness.kill()
-                    harness.wait(timeout=5)
+                    try:
+                        harness.kill()
+                        harness.wait(timeout=5)
+                    except ProcessLookupError:
+                        pass
                 if child_pid is not None and self._process_is_running(child_pid):
-                    os.kill(child_pid, signal.SIGKILL)
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
     @staticmethod
     def _process_is_running(pid):
+        # A process that exits while we inspect /proc surfaces as one of three benign vanish signals,
+        # all meaning "not running" (#1069): FileNotFoundError if /proc/<pid> is already gone at open;
+        # ProcessLookupError if the process exits between open and read() (this was the actual CI flake —
+        # the original code caught only FileNotFoundError); and an empty/partial stat (IndexError) if it
+        # is torn down mid-read. Any of these = the PID is not a live, non-zombie process.
         try:
             with open(f"/proc/{pid}/stat") as stat_file:
                 state = stat_file.read().split()[2]
             return state != "Z"
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError, IndexError):
             return False
 
     def test_content_window_requires_multiple_frames_and_progression(self):
