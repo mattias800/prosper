@@ -540,9 +540,12 @@ namespace {
     // instance's fields); uctx may be null (then register start-tokens simply fail to resolve). tag is the log
     // line prefix.
     void bp_eval_probes(const char* spec, void* uctx, uint64_t base, const char* tag) {
-        greg_t* gr = uctx ? PROSPER_GREGS((ucontext_t*)uctx) : nullptr;
+        // PROSPER_GREGS resolves to a raw greg array on Linux but a view object on Darwin, so construct it with
+        // auto INSIDE reg_val (and only when uctx is provided — KSCAN passes uctx, so register tokens still work
+        // there, but a hypothetical null-uctx caller degrades cleanly to "@"/0xADDR only).
         auto reg_val = [&](const char* p, size_t len, uint64_t* out) -> bool {
-            if (!gr) return false;
+            if (!uctx) return false;
+            auto gr = PROSPER_GREGS((ucontext_t*)uctx);
             struct { const char* n; int idx; } R[] = {
                 {"rax",REG_RAX},{"rbx",REG_RBX},{"rcx",REG_RCX},{"rdx",REG_RDX},
                 {"rsi",REG_RSI},{"rdi",REG_RDI},{"rbp",REG_RBP},{"rsp",REG_RSP},
