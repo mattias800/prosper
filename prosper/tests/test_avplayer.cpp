@@ -235,6 +235,19 @@ int main() {
           "the first IsActive poll fires STOP (immediate EOF) so the while(IsActive) loop ends");
     close(failed_handle, 0, 0, 0, 0, 0);
 
+    // Same graceful skip on the auto_start branch (the shape PPSA02664 actually uses): AddSource fires
+    // READY and PLAY itself, then the first IsActive poll fires STOP.
+    AvpInitData auto_data = data;
+    auto_data.auto_start = 1;
+    event_count = 0;
+    uint64_t auto_failed = init((uint64_t)(uintptr_t)&auto_data, 0, 0, 0, 0, 0);
+    CHECK(add(auto_failed, (uint64_t)(uintptr_t)missing_source, 0, 0, 0, 0) == 0 &&
+              event_count == 2 && events[0] == 2 && events[1] == 3,
+          "auto_start unopenable source: AddSource fires READY then PLAY (graceful skip begins)");
+    CHECK(active(auto_failed, 0, 0, 0, 0, 0) == 0 && event_count == 3 && events[2] == 1,
+          "auto_start skipped source reaches STOP on the first IsActive poll");
+    close(auto_failed, 0, 0, 0, 0, 0);
+
     fake.fail_open = false;
     event_count = 0;
     texture_alloc_count = texture_free_count = 0;

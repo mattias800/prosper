@@ -638,7 +638,10 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
                 p.paused = false; p.stop_fired = false;
                 p.texture_frames.clear(); p.texture_frame_bytes = 0; p.next_texture_frame = 0;
                 p.backend = nullptr; p.backend_id = -1;
-                p.width = 0; p.height = 0; p.fps = 0.0f;
+                // Non-zero placeholder dims/fps: a title that queries GetStreamInfo up-front (before it
+                // discovers the immediate EOF) then gets a benign aspect (w/h) and never a 0x0 surface or
+                // a divide-by-zero. The source still delivers zero frames and EOFs on the first poll.
+                p.width = 1920; p.height = 1080; p.fps = 30.0f;
                 p.has_audio = false; p.audio_channels = 0; p.audio_rate = 0; p.duration_ms = 0;
                 obj = p.ev_obj; cb = p.ev_cb;
                 if (p.auto_start) { p.playing = true; play = true; }
