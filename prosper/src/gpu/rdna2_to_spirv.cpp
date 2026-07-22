@@ -5220,7 +5220,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (fw && fw->flat_base_sgpr != 0xFFFFFFFFu) {
                 const uint32_t addr_lo = val(in.src[0]);                     // low dword of the address
                 const uint32_t base_lo = b.load_push_constant(fw->flat_base_sgpr);
-                const uint32_t byte0 = b.ibin(Op_ISub, addr_lo, base_lo);    // byte offset in the window
+                // Byte offset in the window: (address - base) mod 2^32, which equals the true offset for
+                // any 0 <= offset < window <= 256 MiB (the low-dword subtraction wraps complementarily to
+                // the address's own IAdd). A negative offset (address < base) becomes a huge unsigned index
+                // -> out-of-window -> robustBufferAccess returns 0 (defined, but a loose-bounds divergence
+                // from HW; decode kernels use non-negative offsets).
+                const uint32_t byte0 = b.ibin(Op_ISub, addr_lo, base_lo);
                 for (uint32_t c = 0; c < access.components; ++c) {
                     const uint32_t addr = access.bits == 32
                         ? b.ibin(Op_IAdd, byte0, b.uconst(c * 4)) : byte0;

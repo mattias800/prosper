@@ -2949,12 +2949,23 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // load to an indexed read at (address - base). Pushed before assign_convention_bindings so each
         // window gets a distinct binding; an unmapped base leaves the load unresolved (fail-visible).
         {
+            // Bound the analysis by the ACTUAL user-SGPR count, not kUserSgprs (32). The emit indexes the
+            // push-constant block, which is sized to config.user_sgprs.size() = min(user_count, kUserSgprs);
+            // a base resolved in [user_count, 31] would make the emit's load_push_constant index past that
+            // block (spirv-val would fail-visible, but keep the analysis and push-constant widths consistent).
+            const uint32_t fw_user_count = std::min<uint32_t>(
+                (rd(ds.sh, P::COMPUTE_PGM_RSRC2) >> P::COMPUTE_PGM_RSRC2_USER_SGPR_SHIFT) &
+                    P::COMPUTE_PGM_RSRC2_USER_SGPR_MASK,
+                kUserSgprs);
             const FlatLoadAnalysis fla = analyze_flat_loads(
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
-                shader_dwords, kUserSgprs);
-            constexpr uint32_t kFlatWindowMax = 0x10000000u;   // 256 MiB cap on the per-dispatch copy
+                shader_dwords, fw_user_count);
+            // 256 MiB cap on the per-dispatch copy. TODO(#1183): the decode loop reads only base..base+N;
+            // size the window from that access footprint (or the destination image extent) once the loop
+            // executes, instead of the whole containing-allocation remainder.
+            constexpr uint32_t kFlatWindowMax = 0x10000000u;
             for (const auto& fl : fla.loads) {
-                if (fl.base_sgpr < 0 || static_cast<uint32_t>(fl.base_sgpr) + 1u >= kUserSgprs) continue;
+                if (fl.base_sgpr < 0 || static_cast<uint32_t>(fl.base_sgpr) + 1u >= fw_user_count) continue;
                 const uint64_t base = static_cast<uint64_t>(sgprs[fl.base_sgpr]) |
                                       (static_cast<uint64_t>(sgprs[fl.base_sgpr + 1]) << 32);
                 host::GuestReadableRange range{};
