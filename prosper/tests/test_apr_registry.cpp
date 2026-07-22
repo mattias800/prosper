@@ -10,6 +10,9 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#ifndef _WIN32
+#include <sys/mman.h>   // mmap/munmap — WriteAddress fault-safety check (#1149/#1154)
+#endif
 #include "../src/host/exec_image.hpp"
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
@@ -215,6 +218,58 @@ int main() {
     }
     std::remove(wp_full);
     prosper_apr_reset_for_test();
+
+    // sceAmprCommandBufferWriteAddress (GTA V / PPSA04263, RAGE, issue #1149): the APR completion-
+    // notification primitive j0+3uJMxYJY(cb, address, value, flags). It must WRITE `value` to
+    // `*address` (the APR engine performs the queued write when the command buffer executes; prosper
+    // serves the reads eagerly, so the write happens here). RAGE pre-sets the target to a "pending"
+    // sentinel and a waiter thread spin-polls it for the queued value; stubbing the NID to a bare 0
+    // (writing nothing) left the target pending forever and hung the main thread on a load future
+    // (the title-screen stall). This regression FAILS against the old stub — nothing writes the value.
+    // The NID j0+3uJMxYJY is taken verbatim from GTA V's import table (its exact firmware name is not
+    // in the PS5 3.20 library dump — it does NOT hash from "sceAmprCommandBufferWriteAddress"; the
+    // KytyPS5 label is a guess). The NID is the authority, so the handler is registered by raw NID.
+    register_kernel_mem_hle();
+    HleFn write_address = Hle::lookup("j0+3uJMxYJY");
+    CHECK(write_address != nullptr, "AMPR WriteAddress HLE registered");
+    const std::vector<ImportSlot> wa_slots = {{"libSceAmpr", "j0+3uJMxYJY"}};
+    std::string wa_stub_error;
+    CHECK(install_stubs(wa_slots, 0x730000000ull, 96, &wa_stub_error),
+          "generated executable AMPR WriteAddress import stub");
+    using GuestWriteAddress = uint64_t (__attribute__((sysv_abi)) *)(
+        uint64_t, uint64_t, uint64_t, uint64_t);
+    auto write_address_guest = reinterpret_cast<GuestWriteAddress>(
+        static_cast<uintptr_t>(stub_addr(0)));
+    if (write_address && wa_stub_error.empty()) {
+        // The guest pre-arms the target with a pending sentinel and queues the completion value.
+        uint64_t target = 0xffffffffffffffffull;   // matches the live GTA V pre-set
+        uint64_t cb = 0x20001f13f0ull;              // opaque cb handle (not dereferenced)
+        uint64_t r = write_address_guest(cb, (uint64_t)(uintptr_t)&target, 0x2a, 0x60);
+        CHECK(r == 0, "WriteAddress returns success");
+        CHECK(target == 0x2a, "WriteAddress writes the queued value to the target (clears pending)");
+
+        // The value is written verbatim (RAGE increments a per-submit completion token, not always 0).
+        uint64_t token_target = 0;
+        write_address_guest(cb, (uint64_t)(uintptr_t)&token_target, 7, 0);
+        CHECK(token_target == 7, "WriteAddress writes an arbitrary token verbatim");
+
+        // A null address must be a safe no-op (never fault the HLE).
+        CHECK(write_address_guest(cb, 0, 0x2a, 0) == 0, "WriteAddress tolerates a null address");
+
+        // Fault-safety (issue #1154): a non-null but UNMAPPED target must not fault the HLE. Reserve
+        // then release a page so the address is valid-shaped but unmapped, and confirm the handler
+        // returns cleanly (it drops the undeliverable write and logs, rather than SIGSEGVing).
+#ifndef _WIN32
+        void* scratch = mmap(nullptr, 0x1000, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (scratch != MAP_FAILED) {
+            uint64_t unmapped = (uint64_t)(uintptr_t)scratch;
+            munmap(scratch, 0x1000);
+            CHECK(write_address_guest(cb, unmapped, 0x2a, 0) == 0,
+                  "WriteAddress tolerates an unmapped target without faulting");
+        }
+#endif
+    }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
