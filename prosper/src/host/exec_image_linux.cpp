@@ -638,6 +638,13 @@ namespace {
             while (*p==' ') p++;
             char perm0 = *p;                       // 'r' iff readable
             while (*p && *p!='\n') p++; if (*p) p++;
+            // Scan only readable chunks in the guest object band. On this port that band is prosper's own device
+            // memory (a /memfd:prosper-dmem mapping split into readable chunks with PROT_NONE `---p` guard gaps
+            // between them); the guards are separate, non-readable map lines that this `'r'` check already
+            // excludes, so each scanned chunk is contiguously readable. That memfd is prosper-owned and never
+            // externally truncated, so the read cannot SIGBUS. (Best-effort snapshot: another guest thread could
+            // remap an in-band chunk between the /proc/self/maps read and a qword read — inherent to a one-shot
+            // live-heap scan; acceptable for an off-by-default diagnostic.)
             if (perm0 != 'r' || e <= s) continue;
             if (s < 0x2000000000ull || s >= 0x2800000000ull) continue;
             uint64_t lim = e; if (lim - s > CAP - scanned) lim = s + (CAP - scanned);
