@@ -378,6 +378,51 @@ void poll_keyboard(const bool* keyboard, bool enter_maps_to_options) {
     g_keyboard_pad.set_keyboard_state(st);
 }
 
+// Read the human-readable game name from the dump's PS5 param.json so the window title shows e.g.
+// "Bendy and the Ink Machine" instead of the PPSA content-id directory. PS5 param.json stores the name under
+// localizedParameters.<lang>.titleName; we prefer the defaultLanguage's entry and fall back to the first
+// titleName found. Dependency-free string scan (no JSON lib in-tree); returns "" if the file/field is absent.
+static std::string read_game_title(const std::string& dump) {
+    std::string path = dump + "/sce_sys/param.json";
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return "";
+    std::string s; char buf[8192]; size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) s.append(buf, n);
+    std::fclose(f);
+    // Extract the JSON string value that follows the first "titleName" at or after `from`.
+    auto title_after = [&](size_t from) -> std::string {
+        size_t k = s.find("\"titleName\"", from);
+        if (k == std::string::npos) return "";
+        k = s.find(':', k); if (k == std::string::npos) return "";
+        k = s.find('"', k); if (k == std::string::npos) return "";
+        std::string out;
+        for (size_t e = k + 1; e < s.size() && s[e] != '"'; ++e) {
+            if (s[e] == '\\' && e + 1 < s.size()) { ++e; out += s[e]; }  // unescape \" \\ etc. (title is plain ASCII)
+            else out += s[e];
+        }
+        return out;
+    };
+    // Prefer the default language's titleName: find defaultLanguage's value, then that language object's key.
+    std::string title;
+    size_t dl = s.find("\"defaultLanguage\"");
+    if (dl != std::string::npos) {
+        size_t c = s.find(':', dl);
+        size_t q = (c == std::string::npos) ? std::string::npos : s.find('"', c);
+        if (q != std::string::npos) {
+            size_t qe = s.find('"', q + 1);
+            if (qe != std::string::npos) {
+                std::string lang = s.substr(q + 1, qe - q - 1);
+                // The language OBJECT key ("en-US":{ ... }) appears before the defaultLanguage line, so search
+                // from the top for the key and take the titleName inside its object.
+                size_t lk = s.find("\"" + lang + "\"");
+                if (lk != std::string::npos && lk < dl) title = title_after(lk);
+            }
+        }
+    }
+    if (title.empty()) title = title_after(0);
+    return title;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -528,10 +573,16 @@ int main(int argc, char** argv) {
         return 1;
     }
 #endif
-    // Title: "prosper — <app0 basename>" for a booted game, else a plain label.
+    // Title: "prosper — <game name>" for a booted game (name from param.json; falls back to the app0 basename),
+    // else a plain label.
     std::string title = "prosper";
-    if (!dump.empty()) { auto sl = dump.find_last_of("/\\"); title += " — " + (sl == std::string::npos ? dump : dump.substr(sl + 1)); }
+    if (!dump.empty()) {
+        std::string name = read_game_title(dump);
+        if (name.empty()) { auto sl = dump.find_last_of("/\\"); name = (sl == std::string::npos ? dump : dump.substr(sl + 1)); }
+        title += " — " + name;
+    }
     else if (testPattern) title += " — test pattern";
+    fprintf(stderr, "[app] window title: \"%s\"\n", title.c_str());
     SDL_Window* win = SDL_CreateWindow(title.c_str(), (int)winW, (int)winH, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
     if (!win) { fprintf(stderr, "[app] SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
 
