@@ -696,6 +696,22 @@ int main() {
         printf("== FAIL ==\n"); return 1;
     }
 
+    // sceKernelDirectMemoryQuery enumeration contract (issue #1129). GTA V (PPSA04263) walks
+    // allocated direct memory at boot as query(offset, flags=1) / offset = info.end, and its ONLY
+    // loop exit is return code 0x8002000d (EACCES). Returning any other error here (the old
+    // 0x8002000e) reads as success with a zeroed info block, so the guest re-queries offset 0
+    // forever. The pool is empty at this point in the test, so find-next must terminate at once.
+    auto dm_query = Hle::lookup(nid_hash("sceKernelDirectMemoryQuery"));
+    CHECK(nid_hash("sceKernelDirectMemoryQuery") == "BHouLQzh0X0",
+          "sceKernelDirectMemoryQuery hashes to the PS5 3.20 import NID");
+    CHECK(dm_query != nullptr, "DirectMemoryQuery registered");
+    uint8_t dmq_info[0x18];
+    memset(dmq_info, 0xa5, sizeof(dmq_info));
+    CHECK((uint32_t)dm_query(0, 1, (uint64_t)(uintptr_t)dmq_info, 0x18, 0, 0) == 0x8002000du,
+          "DirectMemoryQuery(0, find-next) on an empty pool -> EACCES terminator");
+    CHECK((uint32_t)dm_query(0, 0, (uint64_t)(uintptr_t)dmq_info, 0x18, 0, 0) == 0x8002000du,
+          "DirectMemoryQuery(0, exact) on an empty pool -> EACCES");
+
     CHECK((uint32_t)unmap(0, 0x4000, 0, 0, 0, 0) == 0x80020016u,
           "Munmap rejects a null address");
     CHECK((uint32_t)unmap(0x4000, 0, 0, 0, 0, 0) == 0x80020016u,
@@ -768,6 +784,19 @@ int main() {
     uint64_t ar = alloc(0, kEnd, 0x100000, 0x4000, 12, (uint64_t)(uintptr_t)&ap);
     CHECK(ar == 0 && ap == kBase,
           "PS5 memory type 12 succeeds after invalid allocations leave the pool untouched");
+    // With exactly one region allocated ([kBase, kBase+0x100000) type 12), the GTA V-style walk
+    // must visit it and then terminate: find-next from 0 returns the region, find-next from its
+    // end returns the EACCES terminator (issue #1129).
+    memset(dmq_info, 0, sizeof(dmq_info));
+    CHECK(dm_query(0, 1, (uint64_t)(uintptr_t)dmq_info, 0x18, 0, 0) == 0 &&
+              *(uint64_t*)(dmq_info + 0x00) == ap &&
+              *(uint64_t*)(dmq_info + 0x08) == ap + 0x100000 &&
+              *(int32_t*)(dmq_info + 0x10) == 12,
+          "DirectMemoryQuery(0, find-next) returns the sole region with exact bounds and type");
+    CHECK((uint32_t)dm_query(*(uint64_t*)(dmq_info + 0x08), 1,
+                             (uint64_t)(uintptr_t)dmq_info, 0x18, 0, 0) == 0x8002000du,
+          "DirectMemoryQuery(end, find-next) past the last region -> EACCES terminator");
+
     int32_t direct_type = -1;
     uint64_t direct_start = UINT64_MAX, direct_end = UINT64_MAX;
     CHECK(get_type(ap + 0x80000, (uint64_t)(uintptr_t)&direct_type,
