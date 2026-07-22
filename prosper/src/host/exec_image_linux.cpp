@@ -11,6 +11,7 @@
 #if defined(__linux__) || defined(__APPLE__)
 #include "posix_shim.hpp"
 #include <sys/mman.h>
+#include <sys/prctl.h>   // PR_GET_NAME — #1155 fault-thread name in the TLS probe
 #include <signal.h>
 #include <setjmp.h>
 #include <pthread.h>
@@ -1832,7 +1833,13 @@ namespace {
         // running on OUR guest %fs, restore the host %fs NOW so the host-libc reporting below (snprintf/
         // write) + the siglongjmp-return into host C++ don't double-fault reading guest TLS as glibc's TCB.
         // No-op when guest-fs is off. (The GC RT-signal handler is separate and keeps the guest %fs.)
-        guest_fs_enter_host_for_signal();
+        // Capture the guest %fs (scoped) rather than dropping it: the paths below that RETURN to guest
+        // code (int $0x41 skip, PROSPER_FAULT_SKIP) must restore it first — sigreturn does NOT restore
+        // fs_base on x86-64, so resuming the guest after a host-%fs swap would run guest code (incl. its
+        // %fs-relative TLS reads) on the host glibc TCB. That leaked host %fs after every int-0x41 skip
+        // was the RAGE `[RAGE] Main Thr` TLS crash at eboot+0x2b1f0e5 (#1155: TLS[-0x10] read host
+        // garbage 0x3d and dereferenced it). CONFIDENCE: HIGH (live probe: thread on host TCB at fault).
+        const uint64_t saved_guest_fs = guest_fs_to_host_scoped();
         if (g_faultlog) {
             char b[128]; auto* uc = (ucontext_t*)uctx;
             int n = snprintf(b, sizeof b, "[fault] sig=%d addr=%p rip=0x%llx armed=%d tid=%ld\n",
@@ -1877,6 +1884,7 @@ namespace {
                     syscall(SYS_write, 2, b, (size_t)n);
                 }
                 g[REG_RIP] = g_fault_rip + 2;   // advance past the 2-byte int instruction
+                guest_fs_restore_scoped(saved_guest_fs);   // resume guest on its guest %fs, not host (#1155)
                 return;
             }
         }
@@ -1890,7 +1898,8 @@ namespace {
             uint64_t foff = strtoull(fsk, nullptr, 0);
             const char* colon = strchr(fsk, ':');
             uint64_t roff = colon ? strtoull(colon + 1, nullptr, 0) : foff + 4;
-            if (g_base && g_fault_rip == g_base + foff) { g[REG_RAX] = 0; g[REG_RIP] = g_base + roff; return; }
+            if (g_base && g_fault_rip == g_base + foff) { g[REG_RAX] = 0; g[REG_RIP] = g_base + roff;
+                guest_fs_restore_scoped(saved_guest_fs); return; }   // resume guest on guest %fs (#1155)
         }
         dump_fault_mem();   // no-op unless PROSPER_FAULTMEM is set
         // Dump the HWBP ring on the recoverable (armed/main-thread) crash too — the deser fault is kind=2.
@@ -1917,6 +1926,21 @@ namespace {
                 rdb(g_fault_rip+4), rdb(g_fault_rip+5), rdb(g_fault_rip+6), rdb(g_fault_rip+7),
                 (unsigned long long)(probe_readable(g_rsp) ? *(const uint64_t*)g_rsp : 0));
             syscall(SYS_write, 2,ib, m);
+            // Guest-%fs attribution (#1155): is the faulting thread running guest code on OUR guest TCB
+            // or leaked onto the host glibc TCB? The guest loads its TCB self-pointer with `mov %fs:0x0`;
+            // at a fault right after, that value is still in rax (the common landing reg) and equals the
+            // fs base. Our guest TCBs carry the "PROS" magic at +0x108; a mismatch means guest code ran
+            // on the host TCB, so any %fs-relative TLS read returned host garbage (the #1155 fault class,
+            // now fixed by restoring guest %fs on signal-handler return-to-guest paths above).
+            {
+                char nm[16] = {0}; prctl(PR_GET_NAME, (unsigned long)nm, 0, 0, 0);
+                bool on_guest_tcb = probe_readable(g_rax + 0x108) &&
+                                    *(const uint32_t*)(uintptr_t)(g_rax + 0x108) == 0x50524F53u;
+                char tb[160];
+                int t = snprintf(tb, sizeof tb, "[fault] thread='%s' fs(rax)=0x%llx on-guest-TCB=%s\n",
+                                 nm, (unsigned long long)g_rax, on_guest_tcb ? "yes" : "NO(host-%fs leak?)");
+                syscall(SYS_write, 2, tb, (size_t)t);
+            }
             // #694: guest control-flow backtrace at the worker fault. When the fault is an intermittent
             // bad-pointer jump (e.g. the Blasphemous 2 asset-load worker reaching non-exec Rosetta memory
             // with ret@[rsp]=0x0), rip is uninformative garbage; the only way to attribute it to a guest
