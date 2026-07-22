@@ -1822,6 +1822,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 prosper::test::dump_bmp(fn, texture_pixels, tw, th);
                             }
                         }
+                        // PROSPER_KILL_RING (#1186): null out the concentric-ring light-glow texture
+                        // (a 1024x1024 single-channel glow sprite) to A/B whether it is what draws the
+                        // see-through concentric-circles pattern over the world. Run with
+                        // PROSPER_NO_TEXTURE_DECODE_CACHE=1 so every sample takes this decode path.
+                        if (getenv("PROSPER_KILL_RING") && tw == 1024 && th == 1024 &&
+                            r.num_components == 1 && r.cls == RC::Texture)
+                            std::fill(texture_pixels.begin(), texture_pixels.end(), 0);
                         fr.tex_rgba = texture_pixels.data(); fr.tw = tw; fr.th = cube_done ? th * 6u : th;
                         fr.td = is_volume ? r.depth : 1u;
                         fr.img_dim = r.img_dim;
