@@ -2,6 +2,7 @@
 // on non-Linux so the shared (mingw) build is unaffected.
 #include "exec_image.hpp"
 #include "sse4a.hpp"
+#include "guest_write_watch.hpp"
 #include "fs_emu.hpp"
 #include "raw_syscall.hpp"
 #include "../hle/nid.hpp"
@@ -825,6 +826,13 @@ namespace {
         if ((sig == SIGSEGV || sig == SIGBUS) && try_emulate_fs_access((ucontext_t*)uctx, (uint64_t)si->si_addr))
             return;
 #endif
+        // Texture write-watch (#1144): a guest store into a page we armed read-only for cross-submit
+        // dirty-tracking. Restore the page (all its aliases) to writable, mark it dirty, and resume so
+        // the store re-executes. Returns false for any address we did not arm, so genuine guest faults
+        // fall through untouched. Only ever true when this handler is on the sigaltstack (red-zone-safe).
+        if (sig == SIGSEGV && si->si_addr &&
+            prosper::host::guest_write_watch_handle_fault(reinterpret_cast<uint64_t>(si->si_addr)))
+            return;
         // A SIGILL we did NOT emulate: log the faulting instruction bytes so the offending opcode can be
         // identified (another AMD-only ISA extension, or a decode miss in try_emulate_sse4a). #163-progress.
         if (sig == SIGILL) {
@@ -2060,6 +2068,10 @@ void install_trap_handler() {
     sa.sa_flags |= SA_ONSTACK;
 #endif
     if (getenv("PROSPER_FAULT_ONSTACK")) sa.sa_flags |= SA_ONSTACK;
+    // The texture write-watch (guest_write_watch.cpp) resolves its faults by return, not siglongjmp, so
+    // it is red-zone-safe ONLY when this handler runs on the sigaltstack. Tell it whether that holds;
+    // otherwise create() refuses to arm and callers keep the exact byte-comparison fallback (#1144).
+    prosper::host::guest_write_watch_set_fault_onstack((sa.sa_flags & SA_ONSTACK) != 0);
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGBUS,  &sa, nullptr);

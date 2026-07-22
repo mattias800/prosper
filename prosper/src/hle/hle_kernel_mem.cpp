@@ -849,6 +849,12 @@ static uint64_t map_dmem_impl(uint64_t addr_in_out, uint64_t len, uint64_t prot,
     if (addr_in_out) *(uint64_t*)addr_in_out = (uint64_t)p;
     track((uint64_t)p, len, host_prot(prot), static_cast<uint32_t>(prot), true,
           "direct", kVirtualQueryDirect, phys, memory_type);
+    // Feed the texture write-watch (#1144) the guest VA<->phys alias so it can dirty-track this
+    // dmem-backed GPU memory via mprotect instead of re-hashing it every submit. `prot` is the Sony
+    // protection (bit1 = CPU_WRITE), which the Linux GuestWriteWatch decodes directly. A new mapping
+    // over an already-watched phys page also invalidates that watch here (remap safety).
+    host::guest_write_watch_notify_direct_mapping_added((uint64_t)p, len, phys,
+                                                        static_cast<uint32_t>(prot));
     MLOG("map_dmem -> 0x%llx len=0x%llx phys=0x%llx prot=0x%llx flags=0x%llx align=0x%llx\n",
          (unsigned long long)p, (unsigned long long)len, (unsigned long long)phys,
          (unsigned long long)prot, (unsigned long long)flags, (unsigned long long)align);
@@ -1037,6 +1043,10 @@ HLE(k_munmap) {
     constexpr uint64_t mask = kGuestPageSize - 1;
     if (!a0 || !a1 || (a0 & mask) || (a1 & mask) || a1 > UINT64_MAX - a0)
         return 0x80020016ull;
+    // Retire any texture write-watch over this VA BEFORE the pages disappear (#1144): invalidate the
+    // watch (its next query reads Dirty) and drop the alias so a later create can't mprotect a stale
+    // or reused mapping. Harmless for non-dmem ranges (no matching alias).
+    host::guest_write_watch_notify_direct_mapping_removed(a0, a1);
     if (munmap((void*)a0, a1) != 0) return 0x80020016ull;
     untrack(a0, a1);
     return 0;
