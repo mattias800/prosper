@@ -24,18 +24,26 @@ import gdb, json, os, struct
 import gdb.unwinder
 
 _CFG = {}
-_STUB_LO = _STUB_HI = 0
+_STUB_LO = _STUB_HI = _STUB_SIZE = 0
+# The ONLY stub PC that legitimately appears on the stack as a return address is the `call r10` return
+# site inside a slot: offset 61 for an implemented HLE (emit_impl_swap) and 66 for an unimplemented one
+# (emit_unimpl_swap has a 5-byte `mov edi,idx` prologue). Requiring the frame PC to land on one of these
+# slot offsets stops the rule from misfiring on a thread caught EXECUTING mid-stub (rip at some other
+# offset), whose live rsp is not the HLE CFA the rule assumes. Overridable via config "stub_ret_offsets".
+_STUB_RET_OFFS = (61, 66)
 
 def _load_config():
-    global _CFG, _STUB_LO, _STUB_HI
+    global _CFG, _STUB_LO, _STUB_HI, _STUB_SIZE, _STUB_RET_OFFS
     path = os.environ.get('PROSPER_GBT_CONFIG')
     if not path:
         raise gdb.GdbError('PROSPER_GBT_CONFIG not set')
     _CFG = json.load(open(path))
     sb = int(_CFG['stub_base'], 0)
-    ss = int(_CFG.get('stub_size', 96))
+    _STUB_SIZE = int(_CFG.get('stub_size', 96))
     n = int(_CFG.get('stub_count', 65536))
-    _STUB_LO, _STUB_HI = sb, sb + ss * n
+    _STUB_LO, _STUB_HI = sb, sb + _STUB_SIZE * n
+    if 'stub_ret_offsets' in _CFG:
+        _STUB_RET_OFFS = tuple(int(x) for x in _CFG['stub_ret_offsets'])
     for m in _CFG['modules']:
         base = int(m['base'], 0)
         try:
@@ -51,6 +59,8 @@ class _StubUnwinder(gdb.unwinder.Unwinder):
         pc = int(pending.read_register('pc').cast(gdb.lookup_type('unsigned long')))
         if not (_STUB_LO <= pc < _STUB_HI):
             return None
+        if (pc - _STUB_LO) % _STUB_SIZE not in _STUB_RET_OFFS:
+            return None   # a stub PC that isn't a `call r10` return site -> thread executing mid-stub
         sp = int(pending.read_register('sp').cast(gdb.lookup_type('unsigned long')))
         caller_sp = sp + 0x30
         try:

@@ -53,31 +53,41 @@ def main(src, dst, script=None):
     loads = [p for p in phdrs if p['type'] == PT_LOAD and p['filesz'] > 0]
     # .text := the first executable LOAD (PF_X == 1); its whole span is fine for symbol/addr lookup.
     exe = next((p for p in loads if p['flags'] & 1), loads[0])
+    # gdb's single `add-symbol-file <elf> <base>` anchors ONE relocation delta on .text
+    # (delta = base - sh_addr(.text)), which then places BOTH the symbols and .eh_frame. That is only
+    # equal to the guest base when .text sits at vaddr 0 — which every PS5 SELF/PRX we load does. If a
+    # module ever breaks that, symbols and CFI would silently shift by exe['vaddr'] and produce a
+    # coherent-but-WRONG backtrace, so fail loudly instead.
+    if exe['vaddr'] != 0:
+        raise SystemExit('mk_sym_elf: executable LOAD is at vaddr 0x%x, not 0 — the single '
+                         'add-symbol-file base anchor would misplace symbols/.eh_frame' % exe['vaddr'])
 
-    # Locate .eh_frame via the .eh_frame_hdr the GNU_EH_FRAME segment points at.
+    # Locate .eh_frame via the .eh_frame_hdr the GNU_EH_FRAME segment points at. A module that ships no
+    # CFI is not fatal: emit .text (+ .symtab) so it still symbolicates, just without an unwind section
+    # (the walk simply ends at such a frame). guest_bt.py relies on this to never abort a whole run.
+    eh_frame_vaddr = eh_frame_off = eh_frame_size = 0
     ehh = next((p for p in phdrs if p['type'] == PT_GNU_EH_FRAME), None)
-    if not ehh:
-        raise SystemExit('mk_sym_elf: no PT_GNU_EH_FRAME — module ships no CFI')
-    ho = ehh['off']
-    ver, ptr_enc, cnt_enc, tbl_enc = b[ho], b[ho + 1], b[ho + 2], b[ho + 3]
-    assert ver == 1, 'eh_frame_hdr version %d' % ver
-    eh_frame_vaddr = read_encoded(b, ho + 4, ptr_enc, ehh['vaddr'] + 4)
-    # In a flattened ELF p_offset==p_vaddr, so file offset == vaddr for the loaded image.
-    eh_frame_off = eh_frame_vaddr
-    # Size: walk the CIE/FDE entries (each: u32 length, then body) until a 0-length terminator or the
-    # end of the containing LOAD — the EXACT extent, so a linear parser (pyelftools) never reads past
-    # the real CFI into unrelated segment bytes. A 64-bit-DWARF 0xffffffff length isn't used by
-    # .eh_frame, so treat it as a stop.
-    host = next(p for p in loads if p['vaddr'] <= eh_frame_vaddr < p['vaddr'] + p['filesz'])
-    seg_end = host['vaddr'] + host['filesz']
-    p = eh_frame_vaddr
-    while p + 4 <= seg_end:
-        ln = u32(b, p)
-        if ln == 0 or ln == 0xffffffff:
-            p += 4          # include the terminator word
-            break
-        p += 4 + ln
-    eh_frame_size = p - eh_frame_vaddr
+    if ehh:
+        ho = ehh['off']
+        ver, ptr_enc = b[ho], b[ho + 1]
+        assert ver == 1, 'eh_frame_hdr version %d' % ver
+        eh_frame_vaddr = read_encoded(b, ho + 4, ptr_enc, ehh['vaddr'] + 4)
+        # In a flattened ELF p_offset==p_vaddr, so file offset == vaddr for the loaded image.
+        eh_frame_off = eh_frame_vaddr
+        # Size: walk the CIE/FDE entries (each: u32 length, then body) until a 0-length terminator or
+        # the end of the containing LOAD — the EXACT extent, so a linear parser (pyelftools) never
+        # reads past the real CFI into unrelated segment bytes. .eh_frame is never 64-bit DWARF, so a
+        # 0xffffffff length is treated as a stop.
+        host = next(p for p in loads if p['vaddr'] <= eh_frame_vaddr < p['vaddr'] + p['filesz'])
+        seg_end = host['vaddr'] + host['filesz']
+        p = eh_frame_vaddr
+        while p + 4 <= seg_end:
+            ln = u32(b, p)
+            if ln == 0 or ln == 0xffffffff:
+                p += 4          # include the terminator word
+                break
+            p += 4 + ln
+        eh_frame_size = p - eh_frame_vaddr
 
     # --- build appended data: shstrtab, and (optional) symtab+strtab -------------------------------
     def cstr_table(names):
@@ -86,7 +96,8 @@ def main(src, dst, script=None):
             off[n] = len(blob); blob += n.encode() + b'\x00'
         return blob, off
 
-    sec_names = ['', '.text', '.eh_frame', '.shstrtab']
+    have_eh = eh_frame_size > 0
+    sec_names = ['', '.text'] + (['.eh_frame'] if have_eh else []) + ['.shstrtab']
     syms = []
     if script:
         sj = json.load(open(script))
@@ -95,7 +106,8 @@ def main(src, dst, script=None):
             if a is not None and n:
                 syms.append((a, n))
         syms.sort()
-        sec_names = ['', '.text', '.eh_frame', '.symtab', '.strtab', '.shstrtab']
+        sec_names = ['', '.text'] + (['.eh_frame'] if have_eh else []) + \
+                    ['.symtab', '.strtab', '.shstrtab']
 
     shstr_blob, shstr_off = cstr_table(sec_names)
 
@@ -136,7 +148,8 @@ def main(src, dst, script=None):
     idx = {n: i for i, n in enumerate(sec_names)}
     headers = [b'\x00' * 64]  # null
     headers.append(sh('.text', 1, 0x6, exe['vaddr'], exe['off'], exe['filesz'], align=16))          # PROGBITS AX
-    headers.append(sh('.eh_frame', 1, 0x2, eh_frame_vaddr, eh_frame_off, eh_frame_size, align=8))   # PROGBITS A
+    if have_eh:
+        headers.append(sh('.eh_frame', 1, 0x2, eh_frame_vaddr, eh_frame_off, eh_frame_size, align=8))  # PROGBITS A
     if script:
         nsym = 1 + len(syms)
         headers.append(sh('.symtab', 2, 0, 0, part_off['.symtab'], nsym * 24,
