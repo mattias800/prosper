@@ -10,6 +10,7 @@
 #include "../src/gpu/pm4_decode.hpp"
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>   // setenv/_putenv_s: arm the #1226-retired suppression guards for this test
 #include <cstring>
 #ifdef _WIN32
 #include <windows.h>
@@ -45,6 +46,17 @@ static size_t run_cb(const uint32_t* buf, size_t dwords, GpuState& st) {
 
 int main() {
     printf("== test_eop_write ==\n");
+    // #1226: the generation and MB3-freelist suppression families are OFF by default (their
+    // content/membership premises misfire on live protocols — see generation_guard() /
+    // mb3_freelist_guard() in command_processor.cpp). This test verifies the suppression
+    // MECHANISMS, so arm them explicitly; the env is read once before any fold below.
+#ifdef _WIN32
+    _putenv_s("PROSPER_GENERATION_GUARD", "1");
+    _putenv_s("PROSPER_MB3_FREELIST_GUARD", "1");
+#else
+    setenv("PROSPER_GENERATION_GUARD", "1", 1);
+    setenv("PROSPER_MB3_FREELIST_GUARD", "1", 1);
+#endif
 
     // A RELEASE_MEM writing a 64-bit fence value (data_sel==2) to a label, exactly as agc_cb_release_mem
     // lays it out: [0]=hdr [1..2]=addr [3]=data_sel [4..5]=value lo/hi [6]=action.
