@@ -3841,6 +3841,75 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                 i, pos[i*4+0], pos[i*4+1], pos[i*4+2], pos[i*4+3]);
                     }
                 }
+                // Geometry-health metrics (#1257): the transform-feedback buffer already holds every
+                // post-transform vertex in primitive-assembly order, so consecutive triples ARE the
+                // rasterized triangles (TF decomposes strips/fans into triangles). Report the tells that
+                // localize a geometry/vertex-fetch bug — the exact signals that cracked GTA #1163's
+                // vertex-count inflation: how many DISTINCT positions the draw really has (a shared VB pool
+                // read past its real range collapses most verts onto a few points), what fraction of
+                // triangles are DEGENERATE (zero-area stitching / collapsed fetch), and how many triangles
+                // are exact DUPLICATES (the same triangle rasterized N times = pure overdraw). Overdraw
+                // itself is the funnel's job (occlusion samples > covered pixels): read this WITH
+                // PROSPER_DRAW_STATS. Skipped in tap mode (pos holds VGPR values, not positions).
+                if (!is_tap && written >= 3) {
+                    std::vector<std::array<float, 4>> verts;   // finite positions, for unique/multiplicity
+                    verts.reserve(written);
+                    for (uint32_t i = 0; i < written; i++) {
+                        const float x = pos[i*4+0], y = pos[i*4+1], z = pos[i*4+2], w = pos[i*4+3];
+                        if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z) && std::isfinite(w))
+                            verts.push_back({x, y, z, w});
+                    }
+                    std::sort(verts.begin(), verts.end());
+                    uint32_t unique_pos = 0, max_mult = 0, run = 0;
+                    for (size_t i = 0; i < verts.size(); i++) {
+                        if (i == 0 || verts[i] != verts[i-1]) { unique_pos++; run = 1; } else run++;
+                        max_mult = std::max(max_mult, run);
+                    }
+                    // Per-triangle (over FINITE triangles only): degenerate (near-zero NDC area) + exact
+                    // duplicates (canonical key). Non-finite triangles are a numeric defect already reported
+                    // by the probe's nan/inf count, and are skipped here so no NaN enters std::sort (a NaN
+                    // breaks the strict-weak-ordering -> UB); their vertices are also excluded from `verts`.
+                    const uint32_t ntri = written / 3u;
+                    uint32_t degenerate = 0, finite_tri = 0;
+                    std::vector<std::array<float, 12>> tris;
+                    tris.reserve(ntri);
+                    for (uint32_t t = 0; t < ntri; t++) {
+                        const float* p = &pos[t*3*4];
+                        bool fin = true;
+                        for (int k = 0; k < 12; k++) if (!std::isfinite(p[k])) { fin = false; break; }
+                        if (!fin) continue;
+                        finite_tri++;
+                        auto ndc = [&](int k, int c) {   // p[k*4+3] is finite here
+                            float v = p[k*4+c], w = p[k*4+3];
+                            return w != 0.0f ? v / w : v;
+                        };
+                        const float ax = ndc(0,0), ay = ndc(0,1), bx = ndc(1,0), by = ndc(1,1),
+                                    cx = ndc(2,0), cy = ndc(2,1);
+                        const float area2 = (bx-ax)*(cy-ay) - (cx-ax)*(by-ay);
+                        if (std::fabs(area2) < 1e-10f) degenerate++;
+                        // Canonical key: the triangle's three (x,y,z,w) vertices sorted, so a duplicate
+                        // triangle in any winding/rotation collides.
+                        std::array<std::array<float,4>,3> v3 = {{
+                            {p[0],p[1],p[2],p[3]}, {p[4],p[5],p[6],p[7]}, {p[8],p[9],p[10],p[11]} }};
+                        std::sort(v3.begin(), v3.end());
+                        tris.push_back({v3[0][0],v3[0][1],v3[0][2],v3[0][3],
+                                        v3[1][0],v3[1][1],v3[1][2],v3[1][3],
+                                        v3[2][0],v3[2][1],v3[2][2],v3[2][3]});
+                    }
+                    std::sort(tris.begin(), tris.end());
+                    uint32_t dup_tri = 0;
+                    for (size_t i = 1; i < tris.size(); i++) if (tris[i] == tris[i-1]) dup_tri++;
+                    const uint32_t real_tri = finite_tri - degenerate;
+                    const char* health =
+                        finite && unique_pos <= 2                      ? "COLLAPSED(<=2 distinct positions - fetch/transform returns a constant)" :
+                        finite_tri && degenerate * 5u >= finite_tri*4u ? "DEGENERATE-HEAVY(>=80% zero-area - strip-stitching read as list, or wrong count/stride)" :
+                        dup_tri && dup_tri * 4u >= real_tri            ? "DUPLICATE-TRIANGLES(exact repeats = pure overdraw - likely over-count/wrong vertex range)" :
+                                                                         "ok(check PROSPER_DRAW_STATS for overdraw: samples>pixels)";
+                    fprintf(stderr, "[geom-health] draw=%ld verts=%u unique-pos=%u (max-mult=%u) "
+                                    "triangles=%u degenerate=%u(%.0f%%) real=%u duplicate-tri=%u -> %s\n",
+                            geom_target, (unsigned)verts.size(), unique_pos, max_mult, finite_tri, degenerate,
+                            finite_tri ? 100.0 * degenerate / finite_tri : 0.0, real_tri, dup_tri, health);
+                }
                 // PROSPER_GEOM_PROBE_DUMP=path (gated, off by default): write EVERY post-transform vertex
                 // (x,y,z,w in primitive-assembly order — for a triangle list, consecutive triples are the
                 // rasterized triangles) as CSV, so per-triangle overlap/degeneracy can be analyzed offline
