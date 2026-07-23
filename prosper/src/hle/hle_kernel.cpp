@@ -470,10 +470,18 @@ namespace {
     std::mutex g_mtx_waitlog_mx;
     std::unordered_map<pthread_mutex_t*, MtxOwner> g_mtx_waitlog_owner;
     inline bool mtx_waitlog() { static const bool on = getenv("PROSPER_MUTEX_WAITLOG") != nullptr; return on; }
+    // winpthreads has no pthread_getname_np — fall back to the tid there (this is a POSIX debug tool).
+    inline void mtx_waitlog_self_name(char* buf, size_t len) {
+#ifdef _WIN32
+        snprintf(buf, len, "tid%ld", (long)prosper_gettid());
+#else
+        pthread_getname_np(pthread_self(), buf, len);
+#endif
+    }
     void mtx_waitlog_record(pthread_mutex_t* m) {
         if (!mtx_waitlog()) return;
         MtxOwner o; o.tid = (long)prosper_gettid();
-        pthread_getname_np(pthread_self(), o.name, sizeof o.name);
+        mtx_waitlog_self_name(o.name, sizeof o.name);
         std::lock_guard<std::mutex> lk(g_mtx_waitlog_mx); g_mtx_waitlog_owner[m] = o;
     }
     void mtx_waitlog_clear(pthread_mutex_t* m) {
@@ -486,7 +494,7 @@ namespace {
         MtxOwner o{}; bool have = false;
         { std::lock_guard<std::mutex> lk(g_mtx_waitlog_mx);
           auto it = g_mtx_waitlog_owner.find(m); if (it != g_mtx_waitlog_owner.end()) { o = it->second; have = true; } }
-        char self[16] = {0}; pthread_getname_np(pthread_self(), self, sizeof self);
+        char self[16] = {0}; mtx_waitlog_self_name(self, sizeof self);
         static std::atomic<int> n{0};
         if (n.fetch_add(1) < 256)
             fprintf(stderr, "[mtx-wait] '%s'(tid=%ld) BLOCKING on guest mutex slot=0x%llx held by %s\n",
