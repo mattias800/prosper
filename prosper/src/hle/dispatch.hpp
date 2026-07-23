@@ -82,6 +82,10 @@ std::string resolve_guest_path(const char* guest_path);
 // (open-or-create) semantics, including whether MountResult should report CREATED or OPENED.
 enum class SaveDataMountPolicy { Open, Create, OpenOrCreate };
 enum class SaveDataMountOutcome { NotFound, Exists, Opened, Created };
+// A guest save dirName must be a SINGLE directory component under the host save root — reject empty,
+// "." / "..", and any embedded '/' or '\\' so a crafted/garbled name can't traverse out of the sandbox.
+// Shared by savedata0_mount and savedata0_dir_mtime so the guard can't exist in only one of them.
+bool savedata_dirname_ok(const std::string& dirname);
 SaveDataMountOutcome savedata0_mount(const char* dirname, SaveDataMountPolicy policy);
 bool savedata0_umount();
 std::vector<std::string> savedata0_list_dirs();   // existing save dirs under the host save root (#299)

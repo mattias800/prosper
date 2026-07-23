@@ -582,8 +582,15 @@ std::string resolve_guest_path(const char* guest_path) {
 // (sceSaveDataMount* HLEs, hle_service.cpp). CREATE is exclusive, while OpenOrCreate (CREATE2)
 // opens an existing directory or creates a missing one. The outcome lets the HLE write an honest
 // MountResult status instead of deriving CREATED from the requested mode.
+bool savedata_dirname_ok(const std::string& dirname) {
+    return !dirname.empty() && dirname != "." && dirname != ".." &&
+           dirname.find('/') == std::string::npos && dirname.find('\\') == std::string::npos;
+}
 SaveDataMountOutcome savedata0_mount(const char* dirname, SaveDataMountPolicy policy) {
-    if (!dirname || !*dirname) return SaveDataMountOutcome::NotFound;
+    // Reject an empty / traversal dirName before composing the host path — otherwise a name like
+    // "../foo" would stat/create a directory OUTSIDE the save sandbox root (savedata0_dir_mtime already
+    // guards this; sharing savedata_dirname_ok keeps the two paths from diverging again).
+    if (!dirname || !savedata_dirname_ok(dirname)) return SaveDataMountOutcome::NotFound;
     std::string d = save0_base() + "/" + dirname;
     bool exists = false;
 #ifdef _WIN32
@@ -648,9 +655,7 @@ std::vector<std::string> savedata0_list_dirs() {
 
 bool savedata0_dir_mtime(const std::string& dirname, int64_t& modified) {
     modified = 0;
-    if (dirname.empty() || dirname == "." || dirname == ".." ||
-        dirname.find('/') != std::string::npos || dirname.find('\\') != std::string::npos)
-        return false;
+    if (!savedata_dirname_ok(dirname)) return false;
     const std::string dir = save0_base() + "/" + dirname;
     const std::string param = dir + "/sce_sys/param.sfo";
 #ifdef _WIN32

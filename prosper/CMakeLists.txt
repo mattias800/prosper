@@ -391,6 +391,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_file_binary PRIVATE prosper_core)
   add_test(NAME file_binary_roundtrip COMMAND test_file_binary)
 
+  add_executable(test_savedata_dirname tests/test_savedata_dirname.cpp)
+  target_link_libraries(test_savedata_dirname PRIVATE prosper_core)
+  add_test(NAME savedata_dirname_guard COMMAND test_savedata_dirname)
+
   add_executable(test_service_logging tests/test_service_logging.cpp)
   target_link_libraries(test_service_logging PRIVATE prosper_core)
   add_test(NAME service_logging_unmapped_args COMMAND test_service_logging)
