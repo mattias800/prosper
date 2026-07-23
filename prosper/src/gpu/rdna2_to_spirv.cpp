@@ -7906,9 +7906,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // unmodified uniform VOP1 move from a scalar. With that proven, every lane's compare bool
             // is identical, so the wave-empty vccz exit lowers to THIS invocation's !cond exactly as
             // in the fragment shell (tid-derived/varying inputs fail the proof and keep rejecting).
-            // Two compute-specific guards, both conservative:
-            //   * accept ONLY Condition::Vcc loops (the detector sets it only under the uniform proof;
-            //     per-lane Exec-condition loops stay graphics-only until a compute case is observed);
+            // One compute-specific guard (see the per-condition detail below for why both Vcc- and
+            // Exec-condition loops are safe here — the Exec case is GTA V's exec_cs_2042d47600 grid-stride
+            // decode loop, #1183):
             //   * the body must be barrier/LDS/cross-lane-free — the proof is per-WAVE, and a barrier
             //     inside a loop whose trip count could differ across the workgroup's waves would be
             //     workgroup-divergent control flow (UB). DOLL's blocked light/fill kernels are
