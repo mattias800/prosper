@@ -45,12 +45,14 @@ bool boot_program(const std::string& dump_root, Program& out, std::string* err,
                   const std::function<void()>& after_hle_registered = {});
 
 // Resolve `want` to the real on-disk entry, correcting case-only mismatches component by component
-// (#1006). The boot preload list hard-codes one casing per module path, but titles disagree (The
-// Messenger ships "Il2cppUserAssemblies.prx"; Blasphemous 2 / Evergate ship
-// "Il2CppUserAssemblies.prx"), and PS5 module paths are effectively case-insensitive — so a
-// case-sensitive host filesystem must not decide module presence by exact-case probe. Returns the
-// corrected path, or `want` unchanged when the path already exists or no entry matches (the caller's
-// absence handling then applies as before). Exposed for boot_program's preload loop and its unit test.
-std::string resolve_module_path_case(const std::string& want);
+// (#1006). The PS5's filesystem namespace is case-insensitive (see the runtime basename compare in
+// hle_kernel.cpp), so neither module presence (the boot preload list hard-codes one casing per module
+// path, but titles disagree: The Messenger ships "Il2cppUserAssemblies.prx"; Blasphemous 2 / Evergate
+// ship "Il2CppUserAssemblies.prx") nor a guest file open (ArcRunner requests "Content/Movies/..."
+// where the dump ships "content/movies/...", #1226) may be decided by exact-case probe on a
+// case-sensitive host filesystem. Returns the corrected path, or `want` unchanged when the path
+// already exists or no entry matches (the caller's absence handling then applies as before).
+// Consumers: boot_program's preload loop, hle_file's translate(), and the unit test.
+std::string resolve_host_path_case(const std::string& want);
 
 } // namespace prosper

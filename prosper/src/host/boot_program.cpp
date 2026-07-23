@@ -19,14 +19,14 @@ namespace prosper {
 // hle_kernel.cpp), so correct each missing component against the real directory entry instead.
 // Pure std::filesystem; never throws (error_code overloads), and an unreadable/missing parent just
 // yields `want` unchanged so the caller's existing absence handling applies.
-std::string resolve_module_path_case(const std::string& want) {
+std::string resolve_host_path_case(const std::string& want) {
     namespace fs = std::filesystem;
     std::error_code ec;
     if (want.empty() || fs::exists(fs::path(want), ec)) return want;   // exact case (or case-insensitive FS)
     const fs::path p(want);
     const std::string parent = p.parent_path().string();
     if (parent.empty() || parent == want) return want;                 // no ancestor left to correct
-    const std::string dir = resolve_module_path_case(parent);          // fix ancestor casing first
+    const std::string dir = resolve_host_path_case(parent);          // fix ancestor casing first
     const std::string base = p.filename().string();
     auto ieq = [](const std::string& a, const std::string& b) {
         if (a.size() != b.size()) return false;
@@ -93,7 +93,7 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
     // the real on-disk entry first so a case-only mismatch (#1006) doesn't drop a present module on a
     // case-sensitive host filesystem.
     for (size_t i = in.size(); i-- > 1; ) {
-        std::string resolved = resolve_module_path_case(in[i].path);
+        std::string resolved = resolve_host_path_case(in[i].path);
         if (resolved != in[i].path) {
             printf("module path case-corrected: %s -> %s\n", in[i].path.c_str(), resolved.c_str());
             in[i].path = std::move(resolved);
