@@ -32,6 +32,7 @@
 #include <sys/mman.h>    // PROSPER_APR_ALTDEST: prosper-owned guest read buffer
 #include <pthread.h>
 #include <thread>        // PROSPER_APR_DEFER: async (real-hardware-timing) APR fill
+#include <chrono>        // #1226: APR-destination provenance timestamps
 #else
 #include <direct.h>
 #include <io.h>
@@ -2150,8 +2151,65 @@ static int apr_cached_fd(const std::string& host) {
 // face). Commit the pages exactly like the fault handler and retry once. CONFIDENCE: HIGH (same
 // policy as the lazy-commit path in exec_image_linux.cpp). Shared by the record-based
 // sceAmprAprCommandBufferReadFile path and the direct vWU-odnS+fU read (issue #115).
+// #1226 APR-destination provenance: APR is the one prosper subsystem that bulk-writes guest memory
+// OUTSIDE the GPU write ring / clock-fence provenance (async file reads via process_vm_writev
+// below), and APR-vs-allocator collisions have prior form (#88's second face was exactly the
+// "free an unrecognized block" fatal). Persistent, never-aging, direct-mapped record of the last
+// write per destination, so the PROSPER_FAULTOBJ worker-fault dump can answer "was the corrupted
+// slot (or the buffer a poisoned value points into) ever an APR destination?" Always-on: one
+// hashed store per ATTEMPTED APR write (failed writes are recorded too — conservative in the
+// exonerating direction). Async-signal-safe reader; diagnostic-grade races acceptable. Answers
+// coverage for both the corrupted slot pages and the reconstructed (candidate<<8) page (the
+// FAULTOBJ dump scans both).
+namespace {
+struct AprDestRec { uint64_t dst, size, t_ms; uint32_t count; };
+constexpr uint32_t kAprDestSlots = 8192;               // power of two
+AprDestRec g_apr_dests[kAprDestSlots];
+// Direct-mapped with eviction, so a zero-hit scan means "no SURVIVING record", not "never a
+// destination" (#1252 review). The store/evict totals are printed in the scan header so a zero
+// result carries its own confidence: sparse evictions = strong, heavy churn = weak.
+std::atomic<uint64_t> g_apr_dest_stores{0}, g_apr_dest_evicts{0};
+uint64_t apr_now_ms() {
+    static const auto t0 = std::chrono::steady_clock::now();
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+}
+void apr_dest_record(uint64_t dst, uint64_t size) {
+    AprDestRec& rec = g_apr_dests[(uint32_t)(((dst >> 4) * 0x9E3779B97F4A7C15ull) >> 51)
+                                  & (kAprDestSlots - 1)];
+    g_apr_dest_stores.fetch_add(1, std::memory_order_relaxed);
+    if (rec.dst != dst) {
+        if (rec.dst) g_apr_dest_evicts.fetch_add(1, std::memory_order_relaxed);
+        rec.dst = dst; rec.count = 0;
+    }
+    rec.size = size; rec.t_ms = apr_now_ms(); rec.count++;
+}
+}
+extern "C" int prosper_apr_dest_scan(uint64_t lo, uint64_t hi, char* out, size_t cap) {
+    size_t off = 0; int found = 0;
+    int hdr = snprintf(out, cap, "[aprdest] table: stores=%llu evictions=%llu\n",
+                       (unsigned long long)g_apr_dest_stores.load(std::memory_order_relaxed),
+                       (unsigned long long)g_apr_dest_evicts.load(std::memory_order_relaxed));
+    if (hdr > 0 && (size_t)hdr < cap) off = (size_t)hdr;
+    for (uint32_t i = 0; i < kAprDestSlots && off + 120 < cap; i++) {
+        const AprDestRec& rec = g_apr_dests[i];
+        if (!rec.dst) continue;
+        uint64_t rec_end = rec.dst + rec.size;
+        if (rec_end < rec.dst) rec_end = ~0ull;        // saturate a corrupt/huge size (#1252 review)
+        if (rec_end <= lo || rec.dst >= hi) continue;
+        int m = snprintf(out + off, cap - off,
+                         "[aprdest] dst=0x%llx size=%llu count=%u t=%llums\n",
+                         (unsigned long long)rec.dst, (unsigned long long)rec.size,
+                         rec.count, (unsigned long long)rec.t_ms);
+        if (m > 0) off += (size_t)m;
+        found++;
+    }
+    if (off < cap) out[off] = 0;
+    return found;
+}
 static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
     if (!size) return true;
+    apr_dest_record(dst, size);
     struct iovec l { buf, (size_t)size }, r { (void*)(uintptr_t)dst, (size_t)size };
     if (process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size) return true;
     bool committed = false;

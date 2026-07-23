@@ -339,20 +339,24 @@ static bool ptr_like(uint64_t v) {
            (v >= 0x2000000000ull && v < 0x2100000000ull);
 }
 // #312 POOLSHIFT tripwire: the dominant residual crash reads a BYTE-SHIFTED pool-info pointer
-// (`0x20015f00` == `0x20015f0000 >> 8`) at eboot+0x2316c91. A qword is "byte-shifted pool ptr" when
-// its top 32 bits are 0 and (v<<8) lands in the FPoolInfo metadata region [0x2000000000,0x2100000000)
-// — i.e. an 8-byte pool pointer written one byte too LOW (aligned read drops the low byte). This
+// (historically `0x20015f00` == `0x20015f0000 >> 8` at eboot+0x2316c91). A qword is "byte-shifted
+// pool ptr" when its top 32 bits are 0 and (v<<8) lands in the allocator-metadata region — i.e. an
+// 8-byte pool pointer stored one byte too LOW (an aligned read then drops the low byte). This
 // catches ANY GPU-path write that CREATES that shape in the act, with the packet builder callsite.
+// #1226: the window is [0x2000000000, 0x4000000000) — the old DOLL-era [0x20..0x21) window went
+// stale when prosper's dmem layout moved: post-#1249 faults on BOTH DOLL and ArcRunner dereference
+// `0x30015f00` (<<8 = 0x30015f0000, the same FPoolInfo +0x15f0000 arena offset), which the old
+// window could not see (a silent false-negative for the exact hunt this tripwire exists for).
 static inline bool is_byteshift_poolptr(uint64_t v) {
     if (v >> 32) return false;                 // must fit in low 32 bits (top byte(s) were dropped)
     if (v < 0x100000) return false;            // ignore tiny ints
     uint64_t s = v << 8;
-    return s >= 0x2000000000ull && s < 0x2100000000ull;
+    return s >= 0x2000000000ull && s < 0x4000000000ull;
 }
 // A full (unshifted) pool-info pointer as a WRITE PAYLOAD is itself anomalous for a GPU fence/label
-// write (fence values are small ints / timestamps), so flag that too.
+// write (fence values are small ints / timestamps), so flag that too. (#1226: same widened window.)
 static inline bool is_poolinfo_ptr(uint64_t v) {
-    return v >= 0x2000000000ull && v < 0x2100000000ull;
+    return v >= 0x2000000000ull && v < 0x4000000000ull;
 }
 // Scan the just-written span [dst-8, dst+bytes+8) for a byte-shifted pool pointer and log the GPU
 // writer (kind + dst + packet builder addr) if found. Bounded; small writes only (the label/pointer
@@ -364,20 +368,38 @@ static void poolshift_check(const char* kind, uint64_t dst, uint64_t bytes, uint
     // 0x20015f00 pool pointer — so it stays as diagnostic-only instrumentation for the next session.
     static const bool on = getenv("PROSPER_POOLSHIFT") != nullptr;
     if (!on) return;
-    static std::atomic<int> n{0};
-    if (n.load(std::memory_order_relaxed) >= 128) return;
-    if (is_byteshift_poolptr(payload) || is_poolinfo_ptr(payload)) {
-        if (n.fetch_add(1) < 128)
+    // #1252 review: PAYLOAD and STOMP get SEPARATE caps — with the widened windows, a shared cap
+    // let ordinary address-source DMA payloads (full arena VAs now match is_poolinfo_ptr) burn the
+    // budget and silence the stomp scan, the exact silent-false-negative this tripwire hunts.
+    // The payload flag also requires the same mapped-target proof as the scan (byteshift form) and
+    // skips DMA (whose `payload` is a SOURCE ADDRESS, legitimately arena-valued, not written data).
+    static std::atomic<int> n_payload{0};
+    static std::atomic<int> n{0};   // STOMP-scan reports only
+    const bool payload_suspicious =
+        (is_byteshift_poolptr(payload) && guest_readable(payload << 8, 8)) ||
+        (is_poolinfo_ptr(payload) && kind[0] != 'D');
+    if (payload_suspicious) {
+        if (n_payload.fetch_add(1) < 128)
             fprintf(stderr, "[agc] POOLSHIFT-PAYLOAD kind=%s dst=0x%llx bytes=%llu payload=0x%llx pkt=eboot+0x%llx t=%llums\n",
                     kind, (unsigned long long)dst, (unsigned long long)bytes,
                     (unsigned long long)payload, (unsigned long long)pkt, (unsigned long long)now_ms());
     }
+    if (n.load(std::memory_order_relaxed) >= 128) return;
     if (bytes > 256) return;                    // cap the scan (label/pointer writes are small)
     uint64_t lo = (dst >= 8 ? dst - 8 : dst) & ~7ull;
     uint64_t hi = dst + bytes + 8;
     for (uint64_t a = lo; a < hi; a += 8) {
         uint64_t q = peek_qword(a);
         if (is_byteshift_poolptr(q)) {
+            // #1226 precision: the widened window admits any dword in [0x20000000,0x3fffffff]
+            // (floats, sizes) — a REAL shifted pool pointer's <<8 must at least be MAPPED guest
+            // memory (0x3d787f0000-style unmapped values are guest data, not pointers). Also
+            // dedup consecutive repeats: one stale value next to a hot per-frame label otherwise
+            // saturates the report cap in seconds (measured: 128/128 on one address).
+            if (!guest_readable(q << 8, 8)) continue;
+            static std::atomic<uint64_t> last_a{0}, last_q{0};
+            if (a == last_a.load(std::memory_order_relaxed) && q == last_q.load(std::memory_order_relaxed)) continue;
+            last_a.store(a, std::memory_order_relaxed); last_q.store(q, std::memory_order_relaxed);
             bool inspan = (a + 7 >= dst) && (a < dst + bytes);   // did THIS write touch these bytes?
             if (n.fetch_add(1) < 128)
                 fprintf(stderr, "[agc] POOLSHIFT-STOMP kind=%s @0x%llx=0x%llx (<<8=0x%llx) dst=0x%llx bytes=%llu inspan=%d payload=0x%llx pkt=eboot+0x%llx t=%llums\n",

@@ -763,6 +763,9 @@ namespace {
     // value's high dword (the {orig_low32, clock_low32} A-4 read-back signature; see gpu TU).
     extern "C" int prosper_gpu_clockfence_find_low32(uint32_t low32, char* out, size_t cap)
         __attribute__((weak));
+    // #1226: APR-destination provenance (hle_file.cpp) — the bulk guest-writer no ring tracks.
+    extern "C" int prosper_apr_dest_scan(uint64_t lo, uint64_t hi, char* out, size_t cap)
+        __attribute__((weak));
 
     // Issue-#312 heap-corruption attribution dump, fired on the first PROSPER_NULL_PAGE hit (the
     // deterministic precursor of DOLL's MallocBinned3 "Canary was 0x3" fatal: a read of address
@@ -2047,6 +2050,109 @@ namespace {
                                 (unsigned long long)v, hi32, fn3);
                             syscall(SYS_write, 2, hb, (size_t)hn);
                             if (fn3 > 0) syscall(SYS_write, 2, fb, strlen(fb));
+                        }
+                    }
+                    // #1226 POOLSHIFT probe. Both residual fault classes dereference a value whose
+                    // <<8 lands in the allocator-metadata region (0x30015f00 -> pool table
+                    // 0x30015f0000 on current dmem layouts, both UE4 titles). Two questions a
+                    // fault can answer directly:
+                    // (1) mechanism discriminator — a BYTE dump around the source slot [rdx]: if
+                    //     the UNSHIFTED pointer sits at rdx-1 (bytes align one low), the pointer
+                    //     was STORED at an odd address; if the slot holds exactly the shifted
+                    //     value with clean zero high bytes, it was COPIED/computed already-shifted.
+                    // (2) writer cross-reference — scan the GPU-write ring and clock-fence table
+                    //     around (v<<8), the REAL pool table, not just the corrupted slot.
+                    {
+                        uint64_t rdx_val2 = 0;
+                        struct iovec l2; l2.iov_base = &rdx_val2; l2.iov_len = 8;
+                        struct iovec r2; r2.iov_base = (void*)(uintptr_t)g_rdx; r2.iov_len = 8;
+                        if (syscall(SYS_process_vm_readv, getpid(), &l2, 1UL, &r2, 1UL, 0UL) != 8)
+                            rdx_val2 = 0;
+                        // Byte dump around the free-list SLOT — the mechanism discriminator. The
+                        // two observed pop compilations keep the slot pointer in rdx (ArcRunner,
+                        // image+0x127e751) or r8 (DOLL, image+0x2316acf); dump around both when
+                        // guest-pointer-shaped. Mixed 4-byte compressed entries vs full 8-byte
+                        // heads in the NEIGHBORING bins are visible directly in the byte stream.
+                        // #1252 review: print the ABSOLUTE base address of the dump, never a
+                        // relative label — byte-exact forensics must not require the reader to
+                        // reconstruct the base from call-site arithmetic.
+                        auto byte_dump = [&](const char* nm, uint64_t center) {
+                            if (center < 0x10000) return;
+                            uint8_t bytes[0x60];
+                            struct iovec lb; lb.iov_base = bytes; lb.iov_len = sizeof bytes;
+                            struct iovec rb; rb.iov_base = (void*)(uintptr_t)(center - 0x20); rb.iov_len = sizeof bytes;
+                            ssize_t got = syscall(SYS_process_vm_readv, getpid(), &lb, 1UL, &rb, 1UL, 0UL);
+                            if (got <= 0) return;
+                            char bb[640];
+                            int bn = snprintf(bb, sizeof bb, "[faultobj] bytes (%s) @0x%llx:", nm,
+                                              (unsigned long long)(center - 0x20));
+                            for (ssize_t k = 0; k < got && bn < (int)sizeof bb - 4; k++)
+                                bn += snprintf(bb + bn, sizeof bb - (size_t)bn, "%s%02x",
+                                               (k % 8 == 0) ? " " : "", bytes[k]);
+                            bn += snprintf(bb + bn, sizeof bb - (size_t)bn, "\n");
+                            syscall(SYS_write, 2, bb, (size_t)bn);
+                        };
+                        byte_dump("rdx", g_rdx);
+                        byte_dump("r8", g_r8);
+                        // #1226: cross-reference the slot pages against APR write destinations —
+                        // the bulk guest-writer outside every GPU provenance ring (#88 precedent).
+                        if (prosper_apr_dest_scan) {
+                            static char ab[4096];
+                            const uint64_t aprobes[2] = { g_rdx, g_r8 };
+                            for (uint64_t probe : aprobes) {
+                                uint64_t pg = probe & ~0xfffull;
+                                if (pg < 0x1000) continue;
+                                int an = prosper_apr_dest_scan(pg, pg + 0x1000, ab, sizeof ab);
+                                char h4[112]; int h4n = snprintf(h4, sizeof h4,
+                                    "[faultobj] APR dests overlapping page 0x%llx: %d\n",
+                                    (unsigned long long)pg, an);
+                                syscall(SYS_write, 2, h4, (size_t)h4n);
+                                syscall(SYS_write, 2, ab, strlen(ab));   // unconditional: the stores/evictions header IS the zero-case confidence signal
+                            }
+                        }
+                        const uint64_t cands[3] = { g_rax, g_rcx, rdx_val2 };
+                        for (uint64_t v : cands) {
+                            if (v >> 32 || v < 0x100000) continue;           // must look byte-shifted
+                            uint64_t real = v << 8;
+                            if (real < 0x2000000000ull || real >= 0x4000000000ull) continue;
+                            char pb[128]; int pn = snprintf(pb, sizeof pb,
+                                "[faultobj] POOLSHIFT candidate 0x%llx -> real ptr 0x%llx\n",
+                                (unsigned long long)v, (unsigned long long)real);
+                            syscall(SYS_write, 2, pb, (size_t)pn);
+                            // What actually lives at the reconstructed pointer? A live free block
+                            // (next-pointer residue), a pool-info record, or unrelated data —
+                            // discriminates "compressed pointer misread" from coincidence.
+                            byte_dump("real ptr", real + 0x20);
+                            // Was the reconstructed buffer itself ever an APR destination?
+                            if (prosper_apr_dest_scan) {
+                                static char ar[4096];
+                                uint64_t rp = real & ~0xfffull;
+                                int arn = prosper_apr_dest_scan(rp, rp + 0x1000, ar, sizeof ar);
+                                char h5[112]; int h5n = snprintf(h5, sizeof h5,
+                                    "[faultobj] APR dests overlapping real-ptr page 0x%llx: %d\n",
+                                    (unsigned long long)rp, arn);
+                                syscall(SYS_write, 2, h5, (size_t)h5n);
+                                syscall(SYS_write, 2, ar, strlen(ar));   // unconditional (see above)
+                            }
+                            uint64_t pg = real & ~0xfffull;
+                            if (prosper_gpu_write_ring_scan) {
+                                static char rs[4096];
+                                int rn2 = prosper_gpu_write_ring_scan(pg, pg + 0x1000, rs, sizeof rs);
+                                char h2[112]; int h2n = snprintf(h2, sizeof h2,
+                                    "[faultobj] GPU-write-ring hits at real-ptr page 0x%llx: %d\n",
+                                    (unsigned long long)pg, rn2);
+                                syscall(SYS_write, 2, h2, (size_t)h2n);
+                                if (rn2 > 0) syscall(SYS_write, 2, rs, strlen(rs));
+                            }
+                            if (prosper_gpu_clockfence_scan) {
+                                static char cs[4096];
+                                int cn2 = prosper_gpu_clockfence_scan(pg, pg + 0x1000, cs, sizeof cs);
+                                char h3[112]; int h3n = snprintf(h3, sizeof h3,
+                                    "[faultobj] clock-fence targets at real-ptr page 0x%llx: %d\n",
+                                    (unsigned long long)pg, cn2);
+                                syscall(SYS_write, 2, h3, (size_t)h3n);
+                                if (cn2 > 0) syscall(SYS_write, 2, cs, strlen(cs));
+                            }
                         }
                     }
                 }
