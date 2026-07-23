@@ -344,6 +344,12 @@ if(TARGET prosper_core)
     add_test(NAME amprlog_safe_read COMMAND test_amprlog_safe_read)
   endif()
 
+  # Compute-side renderer-owned-RTT scale detection (PROSPER_RENDER_SCALE>1 downscale vs a view alias).
+  # Pure integer arithmetic, no deps.
+  add_executable(test_rtt_scale frontends/shared/test_rtt_scale.cpp)
+  target_include_directories(test_rtt_scale PRIVATE frontends/shared)
+  add_test(NAME rtt_scale COMMAND test_rtt_scale)
+
   # Bounded-acquire present classification (#1182). Needs Vulkan HEADERS only (VkResult enum), no loader
   # call — link Vulkan::Vulkan purely for its include dirs. Guarded so a headers-less host skips it
   # gracefully; every platform that builds prosper-app has Vulkan available.
