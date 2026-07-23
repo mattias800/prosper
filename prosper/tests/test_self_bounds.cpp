@@ -90,11 +90,46 @@ static void test_at_last_byte_needs_guard() {
     CHECK(last != nullptr && last + 8 > end,          "last-byte pointer +8 overruns mem -> guard required");
 }
 
+// A (bulk memcpy): build_image maps each PT_LOAD's filesz bytes. A malformed near-2^64 filesz wraps
+// the naive `dst + filesz <= mem.size()` check and drives a huge OOB memcpy (a hard segfault) — the
+// overflow-safe check must skip it. A valid segment must still map exactly.
+static void test_build_image_bounds() {
+    {   // valid PT_LOAD maps its bytes at the right image offset
+        Module m;
+        m.file = {1,2,3,4,5,6,7,8};
+        Segment s; s.type = PT_LOAD; s.vaddr = 0x4000; s.filesz = 8; s.memsz = 0x4000; s.file_off = 0; s.flags = 4;
+        m.segments.push_back(s);
+        LoadedImage img = build_image(m, 0x100000000ull);
+        const uint8_t* p = img.at(0x100000000ull + 0x4000);
+        CHECK(p && p[0] == 1 && p[7] == 8, "valid PT_LOAD maps its filesz bytes");
+    }
+    {   // malformed huge filesz that WRAPS BOTH naive checks (dest and source) so they pass -> a huge
+        // OOB memcpy (hard segfault). The overflow-safe check must skip it. vaddr=0x4001 -> dst=1;
+        // with filesz=UINT64_MAX and file_off=1, both `1 + (2^64-1)` wrap to 0, which the OLD
+        // `a + b <= size` accepts; the memcpy size itself stays 2^64-1.
+        Module m;
+        m.file.assign(64, 0xAB);
+        Segment bad; bad.type = PT_LOAD; bad.vaddr = 0x4001; bad.filesz = UINT64_MAX; bad.memsz = 0x4000; bad.file_off = 1; bad.flags = 4;
+        m.segments.push_back(bad);
+        LoadedImage img = build_image(m, 0x100000000ull);   // reaching here at all means no OOB memcpy
+        CHECK(img.mem.size() > 0, "wrapping huge filesz skipped, no OOB memcpy (image still sized)");
+    }
+    {   // malformed huge memsz must not wrap the image extent into a giant allocation
+        Module m;
+        m.file = {1,2,3,4};
+        Segment s; s.type = PT_LOAD; s.vaddr = 0x4000; s.filesz = 4; s.memsz = UINT64_MAX - 0x100; s.file_off = 0; s.flags = 4;
+        m.segments.push_back(s);
+        LoadedImage img = build_image(m, 0x100000000ull);   // must not attempt a ~2^64 mem.assign
+        CHECK(true, "huge memsz segment did not blow up the image extent");
+    }
+}
+
 int main() {
     printf("== test_self_bounds (SELF/ELF/loader malformed-input hardening) ==\n");
     test_self_read_ok();
     test_str_at();
     test_at_last_byte_needs_guard();
+    test_build_image_bounds();
     printf("%s  (%d passed, %d failed)\n", g_fail ? "FAILED" : "PASSED", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

@@ -238,17 +238,24 @@ LoadedImage build_image(const Module& m, uint64_t base) {
     LoadedImage img; img.base = base;
     uint64_t lo = UINT64_MAX, hi = 0;
     for (auto& s : m.segments)
-        if (s.type == PT_LOAD) { lo = std::min(lo, s.vaddr); hi = std::max(hi, s.vaddr + s.memsz); }
+        // Skip a segment whose vaddr+memsz overflows (a malformed memsz): including it would wrap
+        // `hi` and mis-size the image. Well-formed segments have small extents and are unaffected.
+        if (s.type == PT_LOAD && s.memsz <= UINT64_MAX - s.vaddr) {
+            lo = std::min(lo, s.vaddr); hi = std::max(hi, s.vaddr + s.memsz);
+        }
     if (lo == UINT64_MAX) lo = 0;
     auto align_dn = [](uint64_t v, uint64_t a){ return v & ~(a-1); };
     auto align_up = [](uint64_t v, uint64_t a){ return (v + a - 1) & ~(a-1); };
     img.min_vaddr = align_dn(lo, 0x4000);
     img.max_vaddr = align_up(hi, 0x4000);
+    if (img.max_vaddr < img.min_vaddr) img.max_vaddr = img.min_vaddr;  // degenerate (align_up wrap) -> empty
     img.mem.assign(img.max_vaddr - img.min_vaddr, 0);
     for (auto& s : m.segments) {
-        if (s.type != PT_LOAD) continue;
+        if (s.type != PT_LOAD || s.vaddr < img.min_vaddr) continue;   // outside the mapped window
         uint64_t dst = s.vaddr - img.min_vaddr;
-        if (dst + s.filesz <= img.mem.size() && s.file_off + s.filesz <= m.file.size())
+        // Overflow-safe on BOTH the dest (img.mem) and source (m.file) — a malformed near-2^64
+        // filesz/file_off wraps the naive `a + b <= size` check and drives a huge OOB memcpy.
+        if (self_read_ok(dst, s.filesz, img.mem.size()) && self_read_ok(s.file_off, s.filesz, m.file.size()))
             memcpy(img.mem.data() + dst, m.file.data() + s.file_off, s.filesz);
         img.prot.push_back({ s.vaddr, s.memsz, (s.flags & 4) != 0, (s.flags & 2) != 0, (s.flags & 1) != 0 });
     }
