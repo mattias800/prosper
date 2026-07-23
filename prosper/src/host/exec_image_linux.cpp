@@ -157,7 +157,10 @@ namespace {
     uint64_t g_lwatch_stk[8] = {0};          // guest-RA call stack captured on SIGSEGV
     int      g_lwatch_stkn = 0;
     static inline bool lwatch_is_pool_shift(uint64_t v) {
-        return (v >> 32) == 0 && ((v << 8) >= 0x2000000000ull && (v << 8) < 0x2100000000ull);
+        // #1226: widened from the DOLL-era [0x20..0x21) to [0x20..0x40) — the current faults on both
+        // DOLL and ArcRunner store 0x30015f00 (<<8 = 0x30015f0000), which the old window could not
+        // see (dmem layout moved). Matches is_byteshift_poolptr in command_processor.cpp.
+        return (v >> 32) == 0 && ((v << 8) >= 0x2000000000ull && (v << 8) < 0x4000000000ull);
     }
     bool g_bp_shift = false;   // PROSPER_BP_SHIFT=1: only log a BP hit when rsi is a pool-shifted ptr
     // PROSPER_BP=0xOFFSET (guest image offset): int3 code-breakpoint that LOGS registers at each hit,

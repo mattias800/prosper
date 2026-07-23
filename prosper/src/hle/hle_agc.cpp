@@ -1190,9 +1190,11 @@ static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned&
 extern "C" void prosper_gpu_set_fold_origin(uint8_t origin);   // #1226 queue-origin diagnostic
 extern "C" uint64_t prosper_guest_tsc_ns();                    // shared guest clock (hle_kernel_time)
 // #1226 POOLSHIFT window probe (PROSPER_POOLSHIFT_WINDOW=1): after each submit, scan the learned
-// TLS pool bins for the byte-shifted-head poison signature and log on STATE CHANGE — the poisoning
-// guest free() is thereby bounded to one inter-submit window for log correlation (the software
-// fallback while hardware watchpoints are unavailable on the dev host). Serialized by the callers'
+// TLS pool bins + global recycler slots for the byte-shifted-head poison signature and log on STATE
+// CHANGE. A change gives only a WEAK bound — the poison was at a scanned head between these two
+// submits — NOT the free()-to-fault lifetime: the scan samples head residence, and a poison buried
+// in a chain interior or surfacing in a sub-submit sliver is missed (see mb3_poolshift_window_scan).
+// The decisive instrument is PROSPER_MB3WATCH (traps the store). Serialized by the callers'
 // g_agc_state_mu, so the plain statics are single-threaded.
 static void poolshift_window_probe(uint64_t submit_no) {
     static const bool on = getenv("PROSPER_POOLSHIFT_WINDOW") != nullptr;

@@ -260,6 +260,32 @@ int mb3_poolshift_window_scan(char* out, unsigned cap) {
             found++;
         }
     }
+    // #1252-review B1: the eight global recycler slots hold bundle HEAD values directly, so a
+    // poisoned bundle parked there (not in any TLS bin) carries the same byteshift shape. Scan them
+    // too, else a parked poison scores found=0 for its whole residence. Chain INTERIORS remain a
+    // structural blind spot (the poison buried below a healthy head is invisible to a head-only
+    // scan) — see the header comment; the watchpoint path is what actually closes that.
+    uint64_t recycler = g_global_recycler_bin.load(std::memory_order_acquire);
+    if (!recycler) recycler = discover_global_recycler_bin();
+    if (recycler >= 0x10000 && !(recycler & 7ull)) {
+        for (uint8_t slot = 0; slot < 8; ++slot) {
+            uint64_t head = 0;
+            if (!safe_read(recycler + (uint64_t)slot * 8, &head, sizeof head)) break;
+            if (head >> 32 || head < 0x100000) continue;
+            uint64_t real = head << 8;
+            if (real < 0x2000000000ull || real >= 0x4000000000ull) continue;
+            uint64_t probe;
+            if (!safe_read(real, &probe, sizeof probe)) continue;
+            if (out && off + 96 < cap) {
+                int m = snprintf(out + off, cap - off,
+                                 "[poolshift-window] recycler=0x%llx slot=%u head=0x%llx (<<8=0x%llx)\n",
+                                 (unsigned long long)recycler, slot, (unsigned long long)head,
+                                 (unsigned long long)real);
+                if (m > 0) off += (unsigned)m;
+            }
+            found++;
+        }
+    }
     if (out && off < cap) out[off] = 0;
     return found;
 }
