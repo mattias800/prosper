@@ -18,7 +18,12 @@ static bool denied(const std::string& r) { return r.rfind("/prosper-denied", 0) 
 
 int main() {
     // g_app0 is cached on first use, so set the root before any translate() call.
+    // setenv is POSIX-only (MinGW-w64 lacks it); use _putenv_s on Windows.
+#ifdef _WIN32
+    _putenv_s("PROSPER_APP0", "/hostroot/app0");
+#else
     setenv("PROSPER_APP0", "/hostroot/app0", 1);
+#endif
     std::printf("== test_translate_sandbox ==\n");
 
     // Normal path: composed directly under the host root (identical to pre-#1205 behavior).
