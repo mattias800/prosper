@@ -368,12 +368,13 @@ RenderState extract_render_state(const GpuState& st) {
                           PM4_FIELD(viewport_tl, PA_SC_VPORT_SCISSOR_0_TL,
                                     WINDOW_OFFSET_DISABLE) != 0);
             // #1164: a window offset can push the scissor ENTIRELY off the render target while
-            // leaving it non-empty in absolute coordinates (e.g. TL_Y offset 2560 on a 2160-tall
-            // target -> top=2560 > bottom -> zero area once clamped). Judge emptiness against the
-            // color0 extent so the recover below fires for the off-target case too, not only the
-            // absolute-degenerate case. Only when the extent is known (a color pass); a depth-only
-            // pass leaves color0_width/height 0 and keeps the pre-#1164 absolute test.
-            if (rs.color0_width && rs.color0_height) {
+            // leaving it non-empty in ABSOLUTE coordinates. E.g. a VPORT rect [0,2048) offset by
+            // +2560 becomes [2560,4608): right>left (absolutely non-empty), but its overlap with a
+            // 2048-wide target is [max(2560,0), min(4608,2048)) = [2560,2048) = empty. Judge
+            // emptiness against the color0 extent so the recover below fires for that off-target
+            // case too, not only the absolute-degenerate case #1161 handled. Only when the extent
+            // is known (a color pass); a depth-only pass has no extent and keeps the absolute test.
+            if (rs.color0_has_extent) {
                 const int32_t cw = static_cast<int32_t>(rs.color0_width);
                 const int32_t ch = static_cast<int32_t>(rs.color0_height);
                 return std::min(right, cw) > std::max(left, 0) &&
