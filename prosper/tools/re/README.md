@@ -37,3 +37,26 @@ call* at eboot+0x1473a6f  # invokes the populated slot
 
 This slot is zero in the flat image and has no ELF relocation. Treating every indirect RIP-relative call
 as a static GOT import would send the investigation to the wrong layer.
+
+## Disassemble guest code at an address
+
+Once `xref.py` (or a live trace) points at an interesting address, read the instructions there with
+`edis.py`. The flattened module ELFs have no section header table, so `objdump -d`/`readelf` reject them
+outright; `edis.py` resolves the byte at a guest VADDR through the module's PT_LOAD program headers and
+disassembles it in Intel syntax with the real guest addresses:
+
+```bash
+python3 tools/il2cpp/prx_to_elf.py /path/to/eboot.bin /tmp/eboot.elf
+python3 tools/re/edis.py /tmp/eboot.elf 0x109a680 0x70
+```
+
+```text
+ 109a6e4:  c6 05 ba f1 fc 00 01   mov  BYTE PTR [rip+0xfcf1ba],0x1   # 0x20698a5
+ 109a6eb:  89 05 af f1 fc 00      mov  DWORD PTR [rip+0xfcf1af],eax  # 0x20698a0
+```
+
+objdump computes the RIP-relative targets (the `# 0x…` comments), which is how the writer of a guest data
+slot is identified — the byte-store forms (`c6 05 …`, `80 3d …`) that `xref.py` does not decode. Unlike
+`tools/dbg/dis.sh`, which disassembles a pre-extracted `/tmp/text.bin` for one title, `edis.py` takes any
+flattened module ELF directly, so the same command works for every title. Requires `objdump` (binutils) on
+PATH.
