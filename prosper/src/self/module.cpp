@@ -8,7 +8,7 @@ namespace prosper {
 
 // ---- little helpers --------------------------------------------------------
 template<class T> static T rd(const std::vector<uint8_t>& b, size_t off) {
-    T v{}; if (off + sizeof(T) <= b.size()) memcpy(&v, b.data() + off, sizeof(T)); return v;
+    T v{}; if (self_read_ok(off, sizeof(T), b.size())) memcpy(&v, b.data() + off, sizeof(T)); return v;
 }
 // The SCE self-segment id (the phdr index a data segment maps to) is bits [31:20] of the segment
 // flags — 12 bits; higher bits hold other block/property info and MUST be masked off. Without the
@@ -57,8 +57,15 @@ int64_t Module::va2foff(uint64_t va) const {
 const char* Module::str_at(uint64_t off) const {
     int64_t f = va2foff(strtab_va);
     if (f < 0) return "";
-    uint64_t abs = (uint64_t)f + off;
-    return abs < file.size() ? (const char*)(file.data() + abs) : "";
+    uint64_t uf = (uint64_t)f;
+    if (off > file.size() || uf > file.size()) return "";   // guard the addition against wrap
+    uint64_t abs = uf + off;                                 // abs <= 2*file.size() < 2^63, no wrap
+    if (abs >= file.size()) return "";                       // need at least one byte in range
+    // A consumer (std::string / strlen at module.cpp needed_files/imports, sym.raw) reads until a
+    // NUL. On a malformed strtab with no terminator before EOF that would read past the buffer, so
+    // require an in-range NUL and reject otherwise.
+    if (!memchr(file.data() + abs, 0, file.size() - abs)) return "";
+    return (const char*)(file.data() + abs);
 }
 
 std::optional<Module> Module::load(const std::string& path, std::string* err) {

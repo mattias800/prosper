@@ -120,7 +120,10 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,
         if (m.init_va) out.init_fns.push_back(img.base + m.init_va);
         for (uint64_t off = 0; off + 8 <= m.init_array_sz; off += 8) {
             const uint8_t* p = img.at(img.base + m.init_array_va + off);
-            if (!p) break;
+            // at() only checks the start va is in-image; guarantee all 8 bytes are too (the sibling
+            // write64 in apply_relocations has the same p+8 guard) so a DT_INIT_ARRAY landing in the
+            // final <8 bytes of a malformed image cannot read past mem.
+            if (!p || p + 8 > img.mem.data() + img.mem.size()) break;
             uint64_t fn; memcpy(&fn, p, 8);
             if (fn) out.init_fns.push_back(fn);
         }
