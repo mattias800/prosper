@@ -483,6 +483,23 @@ int main() {
               "PS5 procedural RectList expands three vertices to a four-corner Vulkan strip");
     }
 
+    // #1163: a non-indexed DrawIndexAuto count is the AUTHORITATIVE hardware vertex count. The bound VB's
+    // record count (vb_records = size/stride) must NOT override it — a title binding a SHARED vertex pool
+    // (GTA V's Scaleform UI: per-draw counts 3/6/30 against a fixed ~4096-byte pool -> vb_records
+    // 146/1024/512) would otherwise sweep the whole pool, rasterizing stale-data triangles that inflate the
+    // stencil masks past their EQUAL==2 clip (the black menu wedges). The VB record count is only a fallback
+    // when the draw supplied NO count (draw_count == 0, already skipped as a no-op upstream). WITHOUT the
+    // fix (old: `if (vb_records > count) count = vb_records`) every one of these would return the record
+    // count, so each real-count assertion below would fail.
+    CHECK(resolve_nonindexed_vertex_count(/*draw_count*/6u,  /*vb_records*/1024u) == 6u,
+          "#1163: GTA Scaleform mask draw (6 verts vs 1024-record shared pool) keeps its real count");
+    CHECK(resolve_nonindexed_vertex_count(/*draw_count*/3u,  /*vb_records*/146u)  == 3u,
+          "#1163: a 3-vertex non-indexed draw is not inflated to the VB record count");
+    CHECK(resolve_nonindexed_vertex_count(/*draw_count*/30u, /*vb_records*/512u)  == 30u,
+          "#1163: a 30-vertex non-indexed draw is not inflated to the VB record count");
+    CHECK(resolve_nonindexed_vertex_count(/*draw_count*/0u,  /*vb_records*/1024u) == 1024u,
+          "#1163: a draw with NO count falls back to the VB record count (zero-count guard)");
+
     // #461: an indexed draw whose fetched index buffer contains a garbage-large value (an announced
     // 32-bit index buffer, or a torn read of concurrently-freed guest memory) must NOT inflate
     // vertex_count / the VB upload unboundedly (OOM guard). realize_draw_item clamps vertex_count to the
