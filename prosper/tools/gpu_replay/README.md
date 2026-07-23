@@ -185,7 +185,9 @@ Precision: the value goes through the colour attachment, so it inherits that tar
 (UVs, colours, factors, alpha) show directly; larger values clamp (8-bit targets) — read them as colour, not
 exact floats. It confirmed GTA V #1163 draw 6 samples the correct artwork texture (so the colour path is fine;
 the defect is the stencil masks). Fragment stage only; tap a straight-line PC (same loop/if caveat as the VS
-tap); inert and byte-identical when the env var is unset.
+tap); inert and byte-identical when the env var is unset. The re-recompile drops system inputs, so a tapped
+value derived from `gl_FragCoord`/sample position reads 0 (visualise fetch/sample/colour intermediates, not
+FragCoord-dependent terms).
 
 `--dump-shader DRAW:vs|fs PATH` writes the recompiled SPIR-V. Capture v19 adds
 `--dump-realized-shader DRAW:vs|fs PATH` for the exact bounded raw RDNA2 stream that produced that realized
