@@ -114,13 +114,15 @@ static void test_build_image_bounds() {
         LoadedImage img = build_image(m, 0x100000000ull);   // reaching here at all means no OOB memcpy
         CHECK(img.mem.size() > 0, "wrapping huge filesz skipped, no OOB memcpy (image still sized)");
     }
-    {   // malformed huge memsz must not wrap the image extent into a giant allocation
+    {   // malformed huge memsz: vaddr+memsz does not overflow (passes the extent-skip guard) but
+        // align_up(hi) wraps to 0, giving max_vaddr(0) < min_vaddr(0x8000). Without the clamp,
+        // mem.assign(0 - 0x8000) requests ~2^64 bytes -> bad_alloc/terminate. The clamp keeps it empty.
         Module m;
         m.file = {1,2,3,4};
-        Segment s; s.type = PT_LOAD; s.vaddr = 0x4000; s.filesz = 4; s.memsz = UINT64_MAX - 0x100; s.file_off = 0; s.flags = 4;
+        Segment s; s.type = PT_LOAD; s.vaddr = 0x8000; s.filesz = 4; s.memsz = UINT64_MAX - 0x8000; s.file_off = 0; s.flags = 4;
         m.segments.push_back(s);
         LoadedImage img = build_image(m, 0x100000000ull);   // must not attempt a ~2^64 mem.assign
-        CHECK(true, "huge memsz segment did not blow up the image extent");
+        CHECK(img.mem.size() == 0, "align_up-wrapped extent clamped to empty (no giant allocation)");
     }
 }
 
