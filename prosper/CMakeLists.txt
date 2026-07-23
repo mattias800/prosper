@@ -651,6 +651,14 @@ if(TARGET prosper_core)
   target_link_libraries(test_build_shader_resources PRIVATE prosper_core)
   add_test(NAME build_shader_resources COMMAND test_build_shader_resources)
 
+  # GPU descriptor-bound INVARIANT guard (agc_shader_layout.cpp decode_image/buffer_descriptor): the
+  # entire guest-input memory-safety argument relies on width/height <= 16384, depth <= 8192, and V#
+  # size_bytes clamped to 32 bits. Pins those exact ceilings so a mask-widening / +1-bias refactor fails
+  # here first instead of silently un-bounding every downstream size product. Pure decode; no dump/Vulkan.
+  add_executable(test_descriptor_clamp tests/test_descriptor_clamp.cpp)
+  target_link_libraries(test_descriptor_clamp PRIVATE prosper_core)
+  add_test(NAME descriptor_clamp COMMAND test_descriptor_clamp)
+
   # Descriptor-binding policy (#157): textures/storage images never land on the recompiler's hardwired
   # cbuf bindings 2/3; constant/vertex buffers assigned first. Pure, no game dump / Vulkan needed.
   add_executable(test_convention_bindings tests/test_convention_bindings.cpp)
