@@ -3503,22 +3503,33 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         vkGetDeviceProcAddr(dev, "vkCmdBeginTransformFeedbackEXT"));
     static auto p_endxfb   = reinterpret_cast<PFN_vkCmdEndTransformFeedbackEXT>(
         vkGetDeviceProcAddr(dev, "vkCmdEndTransformFeedbackEXT"));
-    VkBuffer geom_buf = VK_NULL_HANDLE; VkDeviceMemory geom_mem = VK_NULL_HANDLE; uint32_t geom_vcount = 0;
+    VkBuffer geom_buf = VK_NULL_HANDLE; VkDeviceMemory geom_mem = VK_NULL_HANDLE;
+    VkBuffer geom_counter = VK_NULL_HANDLE; VkDeviceMemory geom_counter_mem = VK_NULL_HANDLE;
+    uint32_t geom_cap = 0;   // buffer capacity in vertices; the counter buffer gives the exact count written
     if (geom_probe && p_bindxfb && p_beginxfb && p_endxfb && dv[geom_target].ok) {
         const auto& tv = dv[geom_target];
         const uint64_t per_inst = tv.icount ? tv.icount : tv.vcount;
-        uint64_t total = per_inst * (tv.instance_count ? tv.instance_count : 1u);
-        if (total > (1u << 20)) total = (1u << 20);   // cap capture at 1M vertices (16 MiB)
-        geom_vcount = static_cast<uint32_t>(total);
+        // Transform feedback records DECOMPOSED primitives: a triangle strip/fan of N verts emits up to
+        // ~3*(N-2) individual vertices. Over-size by 3x so no records are dropped; the counter buffer
+        // reports how many were actually written so we never read the uninitialized tail.
+        uint64_t total = per_inst * (tv.instance_count ? tv.instance_count : 1u) * 3u;
+        if (total > (1u << 20)) total = (1u << 20);   // cap at 1M vertices (16 MiB)
+        geom_cap = static_cast<uint32_t>(total);
         std::string gerr;
-        if (geom_vcount == 0 ||
-            !persistent_ds_transfer_buffer(ds_ctx, static_cast<VkDeviceSize>(geom_vcount) * 16,
+        if (geom_cap == 0 ||
+            !persistent_ds_transfer_buffer(ds_ctx, static_cast<VkDeviceSize>(geom_cap) * 16,
                                            VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT,
-                                           geom_buf, geom_mem, gerr)) {
-            geom_buf = VK_NULL_HANDLE; geom_mem = VK_NULL_HANDLE; geom_vcount = 0;
+                                           geom_buf, geom_mem, gerr) ||
+            !persistent_ds_transfer_buffer(ds_ctx, 16,
+                                           VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT,
+                                           geom_counter, geom_counter_mem, gerr)) {
+            if (geom_buf) { vkDestroyBuffer(dev, geom_buf, nullptr); vkFreeMemory(dev, geom_mem, nullptr); }
+            if (geom_counter) { vkDestroyBuffer(dev, geom_counter, nullptr); vkFreeMemory(dev, geom_counter_mem, nullptr); }
+            geom_buf = VK_NULL_HANDLE; geom_mem = VK_NULL_HANDLE;
+            geom_counter = VK_NULL_HANDLE; geom_counter_mem = VK_NULL_HANDLE; geom_cap = 0;
         }
     }
-    const bool geom_active = geom_buf != VK_NULL_HANDLE;
+    const bool geom_active = geom_buf != VK_NULL_HANDLE && geom_counter != VK_NULL_HANDLE;
 
     // ONE render pass (cleared once): record every realized draw with its own pipeline + descriptors.
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
@@ -3548,7 +3559,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         if (v.use_desc) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
         const bool geom_here = geom_active && static_cast<long>(di) == geom_target;
         if (geom_here) {
-            VkDeviceSize off = 0, sz = static_cast<VkDeviceSize>(geom_vcount) * 16;
+            VkDeviceSize off = 0, sz = static_cast<VkDeviceSize>(geom_cap) * 16;
             p_bindxfb(cmd, 0, 1, &geom_buf, &off, &sz);
             p_beginxfb(cmd, 0, 0, nullptr, nullptr);
         }
@@ -3558,7 +3569,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         } else {
             vkCmdDraw(cmd, v.vcount, v.instance_count, 0, 0);
         }
-        if (geom_here) p_endxfb(cmd, 0, 0, nullptr, nullptr);
+        if (geom_here) { VkDeviceSize coff = 0; p_endxfb(cmd, 0, 1, &geom_counter, &coff); }
         if (ds_active) {
             vkCmdEndQuery(cmd, ds_occ_pool, static_cast<uint32_t>(di));
             vkCmdEndQuery(cmd, ds_stats_pool, static_cast<uint32_t>(di));
@@ -3765,13 +3776,22 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // geom_active implies flush_now (same gate as buffer creation), so `cmd` has completed here.
     if (geom_active) {
         if (batch_completed) {
+            // The counter buffer holds the byte count transform feedback actually wrote; read only that
+            // many vertices so the uninitialized tail of the (3x-oversized) buffer never pollutes stats.
+            uint32_t written = 0;
+            void* cp = nullptr;
+            if (vkMapMemory(dev, geom_counter_mem, 0, 16, 0, &cp) == VK_SUCCESS) {
+                uint32_t bytes = 0; std::memcpy(&bytes, cp, sizeof bytes);
+                written = std::min(bytes / 16u, geom_cap);
+                vkUnmapMemory(dev, geom_counter_mem);
+            }
             void* gp = nullptr;
-            if (vkMapMemory(dev, geom_mem, 0, static_cast<VkDeviceSize>(geom_vcount) * 16, 0, &gp) == VK_SUCCESS) {
+            if (written && vkMapMemory(dev, geom_mem, 0, static_cast<VkDeviceSize>(written) * 16, 0, &gp) == VK_SUCCESS) {
                 const float* pos = static_cast<const float*>(gp);
                 float minx=1e30f,maxx=-1e30f,miny=1e30f,maxy=-1e30f,minz=1e30f,maxz=-1e30f,minw=1e30f,maxw=-1e30f;
                 uint32_t nan=0, wle0=0, offscreen=0, clipped=0, finite=0;
-                bool all_same = geom_vcount > 0;
-                for (uint32_t i = 0; i < geom_vcount; i++) {
+                bool all_same = written > 0;
+                for (uint32_t i = 0; i < written; i++) {
                     const float x=pos[i*4+0], y=pos[i*4+1], z=pos[i*4+2], w=pos[i*4+3];
                     if (!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)||!std::isfinite(w)) { nan++; continue; }
                     finite++;
@@ -3795,19 +3815,22 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     clipped == finite       ? "ALL-VERTS-OUTSIDE-CLIP-CUBE(see bbox: off-screen shift or oversized quad)" :
                     onscreen * 20u < finite ? "MOSTLY-OUTSIDE(<5% verts on-screen; see bbox)" :
                                               "on-screen(geometry spread across clip space)";
-                fprintf(stderr, "[geom-probe] draw=%ld verts=%u finite=%u on-screen=%u clipped=%u "
+                fprintf(stderr, "[geom-probe] draw=%ld verts-written=%u finite=%u on-screen=%u clipped=%u "
                                 "(offscreen=%u w<=0=%u nan/inf=%u)\n"
                                 "[geom-probe]   clip-bbox x[%g,%g] y[%g,%g] z[%g,%g] w[%g,%g] -> %s\n",
-                        geom_target, geom_vcount, finite, onscreen, clipped, offscreen, wle0, nan,
+                        geom_target, written, finite, onscreen, clipped, offscreen, wle0, nan,
                         minx,maxx, miny,maxy, minz,maxz, minw,maxw, tag);
-                for (uint32_t i = 0; i < geom_vcount && i < 4; i++)
+                for (uint32_t i = 0; i < written && i < 4; i++)
                     fprintf(stderr, "[geom-probe]   v%u = (%g, %g, %g, %g)\n",
                             i, pos[i*4+0], pos[i*4+1], pos[i*4+2], pos[i*4+3]);
                 vkUnmapMemory(dev, geom_mem);
+            } else if (!written) {
+                fprintf(stderr, "[geom-probe] draw=%ld: transform feedback wrote 0 vertices "
+                                "(draw produced no primitives)\n", geom_target);
             }
         }
-        vkDestroyBuffer(dev, geom_buf, nullptr);
-        vkFreeMemory(dev, geom_mem, nullptr);
+        vkDestroyBuffer(dev, geom_buf, nullptr); vkFreeMemory(dev, geom_mem, nullptr);
+        vkDestroyBuffer(dev, geom_counter, nullptr); vkFreeMemory(dev, geom_counter_mem, nullptr);
     }
 
     if (readback_requested && batch_completed) {
