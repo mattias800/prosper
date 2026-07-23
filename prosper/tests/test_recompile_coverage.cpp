@@ -119,6 +119,30 @@ int main() {
     CHECK(!fk_spv.empty() && fk_spv[0] == 0x07230203u,
           "general flat_load lowers to a valid SSBO-read module when its window is bound");
 
+    // #1183: safe_execz_branches must NOT linearize a loop-EXIT execz (one enclosed by a backward branch
+    // that jumps to at-or-before it) — even when its target is s_endpgm — so detect_divergent_loops /
+    // emit_divloop can reconstruct the structured loop; a plain guard-to-end execz (no enclosing back-edge)
+    // still linearizes. Without the loop-awareness fix the loop-exit execz would be wrongly marked safe and
+    // its back-edge would fall to a straight-line reject (GTA V's exec_cs_2042d47600 decode loop).
+    auto has = [](const std::vector<uint32_t>& v, uint32_t x) {
+        for (uint32_t e : v) if (e == x) return true; return false;
+    };
+    const uint32_t execz_guard[] = {
+        0xbf880001u,   // s_cbranch_execz -> pc=2 (s_endpgm): plain guard-to-end, no loop
+        0x7e000301u,   // v_mov_b32 v0, v1  (EXEC-predicated body)
+        0xbf810000u,   // s_endpgm
+    };
+    CHECK(has(safe_execz_branches_for_test(execz_guard, sizeof(execz_guard)/sizeof(execz_guard[0])), 0u),
+          "safe_execz_branches keeps a plain guard-to-end execz linearizable (no regression)");
+    const uint32_t execz_loop[] = {
+        0xbf880002u,   // s_cbranch_execz -> pc=3 (s_endpgm): a LOOP EXIT
+        0x7e000301u,   // v_mov_b32 v0, v1  (loop body)
+        0xbf82fffdu,   // s_branch -> pc=0  (backward -> encloses the execz)
+        0xbf810000u,   // s_endpgm
+    };
+    CHECK(!has(safe_execz_branches_for_test(execz_loop, sizeof(execz_loop)/sizeof(execz_loop[0])), 0u),
+          "safe_execz_branches leaves a loop-exit execz for the divergent-loop structurizer (#1183)");
+
     // tbuffer_load_format_x v0, v0, s[8:11], 0 format:32_FLOAT ; s_endpgm.
     // MTBUF needs a resolved V# binding, so the table-less coverage pass must classify it as
     // recompilable-in-context rather than truly unsupported.
