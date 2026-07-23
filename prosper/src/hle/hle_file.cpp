@@ -8,6 +8,7 @@
 #include "nid.hpp"
 #include "heap_mutex.hpp"   // #707: keep the APR mutex off macOS __DATA
 #include "../host/guest_write_watch.hpp"   // #1144 B5: disarm texture watches before reading into guest mem
+#include "../host/boot_program.hpp"        // #1226: resolve_host_path_case (PS5 FS namespace is case-insensitive)
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -490,6 +491,28 @@ namespace {
         for (const auto& c : stack) { out += '/'; out += c; }
         return out;
     }
+    // Clamp-normalize a RELATIVE guest path (#1226): same lexical walk as sandbox_normalize_subpath,
+    // but a ".." with nothing left to pop is dropped (the POSIX "/.." == "/" rule at the virtual
+    // root) instead of failing. Only for rootless relative spellings — an ABSOLUTE guest path that
+    // climbs above its mount stays a denied sandbox escape (#1205). Returns the normalized path
+    // with no leading separator ("a/../../b/c" -> "b/c").
+    std::string clamp_normalize_relative(const std::string& sub) {
+        std::vector<std::string> stack;
+        size_t i = 0;
+        auto is_sep = [](char c) { return c == '/' || c == '\\'; };
+        while (i < sub.size()) {
+            while (i < sub.size() && is_sep(sub[i])) i++;
+            size_t j = i; while (j < sub.size() && !is_sep(sub[j])) j++;
+            std::string comp = sub.substr(i, j - i);
+            i = j;
+            if (comp.empty() || comp == ".") continue;
+            if (comp == "..") { if (!stack.empty()) stack.pop_back(); continue; }
+            stack.push_back(std::move(comp));
+        }
+        std::string out;
+        for (const auto& c : stack) { if (!out.empty()) out += '/'; out += c; }
+        return out;
+    }
     std::string translate(const char* guest) {
         if (!guest) return {};
         std::string p = guest;
@@ -524,6 +547,22 @@ namespace {
             sub = *norm;
         }
         std::string h = root + sub;
+        // The PS5's filesystem namespace is case-insensitive (runtime basename compare in
+        // hle_kernel.cpp; preload correction in boot_program.cpp, #1006), so a guest open whose
+        // casing differs from the dump's on-disk entry succeeds on real hardware — and silently
+        // "worked" here too on the case-insensitive dev hosts (NTFS / WSL DrvFs / default APFS).
+        // On a case-sensitive host filesystem, fall back to the real entry component by component
+        // (#1226: ArcRunner requests "Content/Movies/..."; its dump ships "content/movies/...").
+        // resolve_host_path_case returns `h` unchanged when it already exists (one stat) or when
+        // nothing matches, so a genuinely absent file still fails with ENOENT exactly as before.
+        if (!root.empty() && !sub.empty()) {
+            std::string fixed = resolve_host_path_case(h);
+            if (fixed != h) {
+                if (filelog()) fprintf(stderr, "[file] case-corrected '%s' -> '%s'\n",
+                                       h.c_str(), fixed.c_str());
+                h = std::move(fixed);
+            }
+        }
         if (filelog()) fprintf(stderr, "[file] open '%s' -> '%s'\n", guest, h.c_str());
         return h;
     }
@@ -610,14 +649,30 @@ namespace {
 void set_app0_root(const std::string& root) { g_app0 = root; }
 std::string resolve_guest_path(const char* guest_path) {
     if (!guest_path || !*guest_path) return {};
+    std::string p = guest_path;
+    // sceAvPlayer sources are URIs, and UE4 hands over the local-file scheme spelled out
+    // (#1226, ArcRunner: "file://../../../arcrunner/Content/Movies/..."). Only the file scheme
+    // names sandbox content; strip it and treat the remainder as the guest path ("file:///app0/x"
+    // is the absolute spelling, "file://<relative>" the BaseDir-relative one).
+    if (p.rfind("file://", 0) == 0) p = p.substr(7);
+    if (p.empty()) return {};
     // Sony media APIs accept content paths relative to the title's application root. Unlike the
     // guest libc, a native host backend has no guest current-working-directory state, so root the
     // relative spelling explicitly before applying the shared mount translation.
-    if (guest_path[0] != '/') {
-        const std::string app_path = std::string("/app0/") + guest_path;
+    if (p[0] != '/') {
+        // A relative URL may carry leading ".." components: UE4 media paths are BaseDir-relative
+        // ("../../../<project>/Content/..." climbs from Engine/Binaries/<Platform>/ up to the
+        // package root), but prosper models no BaseDir/CWD and ArcRunner's dump has no such
+        // directories — the only mount a rootless relative path can name is /app0 itself. Clamp
+        // ".." at that root (POSIX "/.." == "/") instead of letting translate() deny the composed
+        // path as an absolute sandbox escape (#1205 stays intact for absolute guest paths).
+        // CONFIDENCE: MED — correct for the observed UE4 shape, where the ".." count equals the
+        // real base-dir depth; the resolved host path is visible under PROSPER_FILELOG/[avp] logs.
+        if (p.find("..") != std::string::npos) p = clamp_normalize_relative(p);
+        const std::string app_path = std::string("/app0/") + p;
         return translate(app_path.c_str());
     }
-    return translate(guest_path);
+    return translate(p.c_str());
 }
 
 // Mount / unmount the guest "/savedata0" area onto a host dir named by the save's dirName
