@@ -5,8 +5,13 @@
 #   - direct calls          e8 <rel32>
 #   - rip-relative load/store REX.W/REX.WR 8d|8b|89 modrm(rip) <disp32>
 #   - indirect call/jump     ff /2|/4 modrm(rip) <disp32>
+#   - byte/dword store-imm   c6 05 <disp32> <imm8>  /  c7 05 <disp32> <imm32>   (storeb/stored)
+#   - byte compare-imm       80 3d <disp32> <imm8>                              (cmpb)
 #   - data pointers          absolute pointers stored in data, emitted as
 #                            R_X86_64_RELATIVE relocations (DT_RELA / DT_SCE_RELA)
+# The store-imm/compare-imm forms write/test a guest FLAG in place; without them the *writer* of a
+# 1-byte state flag is invisible (it is not a reg-store) -- e.g. the Bendy Agc suspend-point SAFE
+# flag (#1195), whose three `c6 05 .. 01` setters this decodes but objdump/readelf cannot name.
 # so "grep for who references address X" is not a text search — it needs all three
 # decoded. Standard tools don't read the Sony (DT_SCE_*) relocation encoding, and
 # rip-relative refs never appear as literals at all. This tool builds a reverse
@@ -110,6 +115,26 @@ class Module:
                     disp = struct.unpack_from('<i', d, i + 1)[0]
                     site = v + i
                     self.code_xref[site + 5 + disp].append((site, 'call'))
+                elif b == 0xc6 and d[i + 1] == 0x05:
+                    # mov BYTE PTR [rip+disp], imm8  (c6 /0) -- 7 bytes. This is the byte-store form
+                    # that sets a guest 1-byte flag; objdump/readelf and the loads/stores above all
+                    # miss it, so it is how the *writer* of a flag byte is found (e.g. the Bendy Agc
+                    # suspend-point SAFE flag setter, #1195).
+                    disp = struct.unpack_from('<i', d, i + 2)[0]
+                    site = v + i
+                    self.code_xref[site + 7 + disp].append((site, 'storeb'))
+                elif b == 0xc7 and d[i + 1] == 0x05:
+                    # mov DWORD PTR [rip+disp], imm32  (c7 /0) -- 10 bytes; the dword store-immediate.
+                    if i + 10 <= n:
+                        disp = struct.unpack_from('<i', d, i + 2)[0]
+                        site = v + i
+                        self.code_xref[site + 10 + disp].append((site, 'stored'))
+                elif b == 0x80 and d[i + 1] == 0x3d:
+                    # cmp BYTE PTR [rip+disp], imm8  (80 /7) -- 7 bytes; the paired flag-*read* form
+                    # (a spin-loop testing a 1-byte flag, e.g. the Bendy suspend-point watchdog).
+                    disp = struct.unpack_from('<i', d, i + 2)[0]
+                    site = v + i
+                    self.code_xref[site + 7 + disp].append((site, 'cmpb'))
 
 
 def main():

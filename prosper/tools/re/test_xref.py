@@ -42,6 +42,12 @@ def main():
     code += b"\xff\x15" + rel32(site, 6, slot)
     site += 6
     code += b"\xff\x25" + rel32(site, 6, slot)
+    site += 6
+    code += b"\xc6\x05" + rel32(site, 7, slot) + b"\x01"                  # mov BYTE [rip+d],1  storeb
+    site += 7
+    code += b"\xc7\x05" + rel32(site, 10, slot) + b"\x00\x00\x00\x00"    # mov DWORD [rip+d],0 stored
+    site += 10
+    code += b"\x80\x3d" + rel32(site, 7, slot) + b"\x01"                  # cmp BYTE [rip+d],1  cmpb
     raw[0x100:0x100 + len(code)] = code
 
     path = ""
@@ -56,6 +62,9 @@ def main():
             (0x1013, "store"),
             (0x101a, "call*"),
             (0x1020, "jmp*"),
+            (0x1026, "storeb"),
+            (0x102d, "stored"),
+            (0x1037, "cmpb"),
         }
         actual = set(module.code_xref[slot])
         assert actual == expected, (actual, expected)
