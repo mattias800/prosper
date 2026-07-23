@@ -5971,6 +5971,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // gfx1010 round-trip on live DOLL FXAA bytes: 0xf0dc0808/0xf0dc080a "image_sample_lz_o";
             // the offset-adjust folds into the normalized coords, see image_sample_lz_offset_2d).
             const bool is_sample_lz_o = (in.opcode == 0x37);
+            // image_sample_d = 0x22: sample with EXPLICIT gradients. For 2D the vaddr packs four
+            // derivative dwords FIRST — [Ds/Dx, Dt/Dx, Ds/Dy, Dt/Dy] — then the (u,v) coords, per ISA
+            // 8.2.4's "{derivative}{body}" order. Blue Prince (PPSA25009) issues it as a plain 2D texture
+            // sample in a fragment shader (ps=0x2011d60100); rejecting it dropped that whole pipeline's
+            // draws. In a fragment stage the hardware quad already provides implicit derivatives, so we
+            // lower it as an ordinary implicit-LOD sample and drop the explicit gradients (same pragmatic
+            // approximation as GTA's op 0xa0). CONFIDENCE: MED — base op + 2D-sample behavior are live-title
+            // evidence; a faithful OpImageSampleExplicitLod-with-Grad lowering is a documented follow-up if a
+            // title needs the exact gradient-selected mip.
+            const bool is_sample_d = (in.opcode == 0x22);
             // 2D_ARRAY (dim=5) is sampled here as its base 2D slice: the (u,v) coords are read as usual and
             // the array-index coord is dropped, so the shader RECOMPILES instead of being rejected (previously
             // dim!=1&&dim!=2 -> ok=false, silently SKIPPING the whole draw — real content loss, #325). Correct
@@ -5982,7 +5992,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 fprintf(stderr, "[recompile] 2D_ARRAY image_sample -> sampled as base slice 0 (array index dropped; #325)\n");
             if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz && !is_sample_b &&
                  !is_sample_c_lz && !is_gather_lz &&
-                 !is_gather_lz_o && !is_sample_lz_o) || (!dim2d && !dim3d && !dimcube)) { ok = false; return true; }
+                 !is_gather_lz_o && !is_sample_lz_o && !is_sample_d) || (!dim2d && !dim3d && !dimcube)) { ok = false; return true; }
             if (res->cls != ResourceClass::Texture) { ok = false; return true; }
             // UNRM=1 supplies unnormalized (texel-space) coordinates (Table 100). Compilers set it
             // only on loads/stores/atomics — and our fetch paths are already texel-space — but a
@@ -6074,6 +6084,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     b.image_sample_bias_2d(res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(0)), out);
                 } else if (is_sample_lz_o) {   // vaddr order for _o: [packed offset, u, v]
                     b.image_sample_lz_offset_2d(res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(0)), out);
+                } else if (is_sample_d) {   // vaddr order for _d: [Ds/Dx, Dt/Dx, Ds/Dy, Dt/Dy, u, v]
+                    // Drop the four explicit gradients; the (u,v) coords follow them. Implicit-LOD sample
+                    // (fragment quad derivatives ~ the explicit gradients for ordinary UVs).
+                    b.image_sample_2d(res->binding, vread(cvg(4)), vread(cvg(5)), out);
                 } else {
                     uint32_t cu = vread(cvg(0)), cv = vread(cvg(1));
                     if (is_sample)         b.image_sample_2d(res->binding, cu, cv, out);
