@@ -252,6 +252,16 @@ struct BackendResourceReuseStats {
     size_t persistent_texture_binding_misses = 0;
     size_t persistent_texture_binding_entries = 0;
     size_t persistent_texture_binding_evictions = 0;
+    // Buffer content-hash economics (#1268): the shared-buffer dedup key embeds a full content
+    // hash, which profiled as the dominant CPU term on Blue Prince's ~4,000-draw submits. These
+    // count, per call like the rest of this struct, how much hashing actually ran and how much
+    // was avoided (repeat references resolved by the per-call memo; unique-tag keys that cannot
+    // match anything skip hashing entirely).
+    uint64_t buffer_hash_calls = 0;
+    uint64_t buffer_hash_dwords = 0;
+    uint64_t buffer_hash_skipped_unique = 0;
+    uint64_t buffer_hash_skipped_large = 0;
+    uint64_t buffer_ref_memo_hits = 0;
 };
 
 inline BackendResourceReuseStats& backend_resource_reuse_stats_storage() {
@@ -261,6 +271,39 @@ inline BackendResourceReuseStats& backend_resource_reuse_stats_storage() {
 
 inline BackendResourceReuseStats backend_resource_reuse_stats() {
     return backend_resource_reuse_stats_storage();
+}
+
+// Cumulative across calls (the per-call struct above is reset at every render_draws_rgba entry, which
+// tests rely on). PROSPER_HASH_STATS=1 prints these every few seconds from the render path so a live
+// route shows the hashing economics without a debugger (#1268).
+struct BackendHashStatsTotals {
+    uint64_t references = 0;
+    uint64_t memo_hits = 0;
+    uint64_t hash_calls = 0;
+    uint64_t hash_dwords = 0;
+    uint64_t skipped_unique = 0;
+    uint64_t skipped_large = 0;
+    uint64_t unique_buffers = 0;
+};
+inline BackendHashStatsTotals& backend_hash_stats_totals() {
+    static thread_local BackendHashStatsTotals totals;
+    return totals;
+}
+inline void maybe_report_hash_stats() {
+    static const bool on = getenv("PROSPER_HASH_STATS") != nullptr;
+    if (!on) return;
+    static thread_local auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(5)) return;
+    last = now;
+    const BackendHashStatsTotals& t = backend_hash_stats_totals();
+    fprintf(stderr,
+            "[hash-stats] refs=%llu memo_hits=%llu hash_calls=%llu hashed_MiB=%.1f "
+            "skipped_unique=%llu skipped_large=%llu unique_buffers=%llu\n",
+            (unsigned long long)t.references, (unsigned long long)t.memo_hits,
+            (unsigned long long)t.hash_calls, (double)t.hash_dwords * 4.0 / (1024.0 * 1024.0),
+            (unsigned long long)t.skipped_unique, (unsigned long long)t.skipped_large,
+            (unsigned long long)t.unique_buffers);
 }
 
 struct BackendPipelineCacheStats {
@@ -1700,6 +1743,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     color_target_stats = {};
     BackendResourceReuseStats& resource_reuse_stats = backend_resource_reuse_stats_storage();
     resource_reuse_stats = {};
+    maybe_report_hash_stats();   // gated cumulative hashing economics (#1268)
     std::vector<uint8_t> out;
     if (out_rgba1) out_rgba1->clear();
     if (draws.empty()) return out;
@@ -2225,6 +2269,28 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     std::vector<SharedBufferUpload> shared_buffers;
     std::vector<SharedBufferArena> shared_buffer_arenas;
     std::unordered_map<SharedBufferKey, size_t, SharedBufferKeyHash> shared_buffer_indices;
+    // Per-call repeat-reference memo (#1268): draws in one pass batch overwhelmingly re-reference
+    // the same guest ranges (same VB/UB across hundreds of draws), and the SharedBufferKey lookup
+    // pays a FULL content hash per reference because the hash is part of the key. Within one call
+    // the referenced guest memory is stable modulo cross-thread racing writes — which are equally
+    // nondeterministic on real hardware (the GPU samples the buffer once per draw at execution),
+    // so resolving a repeated (words, count, identity) reference to the first upload is within the
+    // same latitude the hardware has. First reference still hashes + memcmps as before.
+    struct BufferRefMemoKey {
+        const uint32_t* words = nullptr;
+        size_t count = 0;
+        uint64_t identity = 0;
+        bool operator==(const BufferRefMemoKey& other) const {
+            return words == other.words && count == other.count && identity == other.identity;
+        }
+    };
+    struct BufferRefMemoKeyHash {
+        size_t operator()(const BufferRefMemoKey& key) const {
+            return static_cast<size_t>((reinterpret_cast<uintptr_t>(key.words) >> 2) ^
+                (key.count * 0x9e3779b97f4a7c15ull) ^ key.identity);
+        }
+    };
+    std::unordered_map<BufferRefMemoKey, size_t, BufferRefMemoKeyHash> buffer_ref_memo;
     std::vector<SharedTextureBinding> shared_texture_bindings;
     std::unordered_map<TextureBindingKey, size_t, TextureBindingKeyHash>
         shared_texture_binding_indices;
@@ -2951,12 +3017,56 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                         words = &zero_buffer_word;
                         word_count = 1;
                     }
-                    const uint64_t content_hash = hash_buffer_words(words, word_count);
+                    ++resource_reuse_stats.buffer_references;
+                    ++backend_hash_stats_totals().references;
+                    const bool shareable = share_backend_resources && r.buffer_identity != 0;
+                    size_t buffer_index = SIZE_MAX;
+                    const BufferRefMemoKey memo_key{words, word_count, r.buffer_identity};
+                    if (shareable) {
+                        auto memo_found = buffer_ref_memo.find(memo_key);
+                        if (memo_found != buffer_ref_memo.end()) {
+                            buffer_index = memo_found->second;
+                            ++resource_reuse_stats.buffer_ref_memo_hits;
+                            ++backend_hash_stats_totals().memo_hits;
+                        }
+                    }
+                    if (buffer_index != SIZE_MAX) {
+                        // repeat reference within this call — resolved without hashing (#1268)
+                    } else {
+                    // A unique-tag key can never match an existing entry (the tag differs from every
+                    // other key and operator== checks all scalars before the memcmp), so its content
+                    // hash contributes nothing to the lookup — skip it (#1268).
+                    //
+                    // Large buffers also take a unique tag: cross-pointer content dedup is kept for
+                    // SMALL buffers only (<= kSharedBufferHashDedupMaxDwords). Measured live on Blue
+                    // Prince's loading submits, the content-hash lookup had ZERO dedup hits across
+                    // 556K hashed references while costing ~1.8 GiB/s of FNV over ~97 KiB average
+                    // payloads — pure waste at exactly the draw volume where it hurts. Repeat
+                    // references to a large range still resolve through the per-call memo above;
+                    // what a large buffer loses is only the merge of two DIFFERENT-pointer,
+                    // identical-content references within one call, which the live data shows never
+                    // happens. Small buffers (per-draw UBO-sized, the tests' contract) keep the full
+                    // hash + memcmp dedup exactly as before.
+                    constexpr size_t kSharedBufferHashDedupMaxDwords = 1024;   // 4 KiB
+                    const bool hash_dedup =
+                        shareable && word_count <= kSharedBufferHashDedupMaxDwords;
+                    uint64_t content_hash = 0;
+                    if (hash_dedup) {
+                        content_hash = hash_buffer_words(words, word_count);
+                        ++resource_reuse_stats.buffer_hash_calls;
+                        resource_reuse_stats.buffer_hash_dwords += word_count;
+                        ++backend_hash_stats_totals().hash_calls;
+                        backend_hash_stats_totals().hash_dwords += word_count;
+                    } else if (shareable) {
+                        ++resource_reuse_stats.buffer_hash_skipped_large;
+                        ++backend_hash_stats_totals().skipped_large;
+                    } else {
+                        ++resource_reuse_stats.buffer_hash_skipped_unique;
+                        ++backend_hash_stats_totals().skipped_unique;
+                    }
                     SharedBufferKey buffer_key{
                         words, word_count, r.buffer_identity, content_hash,
-                        share_backend_resources && r.buffer_identity ? 0 : ++resource_unique_tag};
-                    ++resource_reuse_stats.buffer_references;
-                    size_t buffer_index = SIZE_MAX;
+                        hash_dedup ? 0 : ++resource_unique_tag};
                     auto buffer_found = shared_buffer_indices.find(buffer_key);
                     if (buffer_found != shared_buffer_indices.end()) {
                         buffer_index = buffer_found->second;
@@ -3000,6 +3110,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                         shared_buffers.push_back(upload);
                         shared_buffer_indices.emplace(buffer_key, buffer_index);
                         ++resource_reuse_stats.unique_buffers;
+                        ++backend_hash_stats_totals().unique_buffers;
+                    }
+                    if (shareable) buffer_ref_memo.emplace(memo_key, buffer_index);
                     }
                     dbi[i] = {shared_buffers[buffer_index].buffer,
                               shared_buffers[buffer_index].offset,

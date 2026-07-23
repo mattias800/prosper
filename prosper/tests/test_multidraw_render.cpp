@@ -295,6 +295,18 @@ int main() {
         CHECK(shared_contents_stats.buffer_references == 4 &&
                   shared_contents_stats.unique_buffers == 2,
               "immutable buffer views retain exact backend upload reuse");
+        // #1268: the second draw's references carry the SAME view pointer + identity, so the
+        // per-call memo must resolve them without re-hashing; only the first draw's two
+        // references pay a content hash. (The owned-vector block above copies the dwords into
+        // each BackendDraw, so its four references have distinct pointers and all hash —
+        // asserted below — which is exactly the hash+memcmp dedup path the memo falls back to.)
+        CHECK(shared_contents_stats.buffer_ref_memo_hits == 2 &&
+                  shared_contents_stats.buffer_hash_calls == 2 &&
+                  shared_contents_stats.buffer_hash_skipped_unique == 0,
+              "repeat view references resolve via the per-call memo without re-hashing");
+        CHECK(shared_stats.buffer_ref_memo_hits == 0 &&
+                  shared_stats.buffer_hash_calls == 4,
+              "owned-vector references (distinct pointers) keep full hash+memcmp dedup");
 
         prosper::test::BackendDraw capacity_peer0 = d0;
         prosper::test::BackendDraw capacity_peer1 = d1;
@@ -332,6 +344,58 @@ int main() {
               "buffer-pool disable switch restores transient Vulkan uploads");
         CHECK(pool_bypassed == shared,
               "pooled and forced-transient storage buffers render byte-identically");
+
+        // #1268: buffers above the 4 KiB hash-dedup bound skip content hashing entirely (live Blue
+        // Prince data: zero dedup hits across 556K hashed references at ~1.8 GiB/s of hashing).
+        // Repeat references still resolve through the per-call memo, and rendering is unchanged.
+        // (Placed after the pool-delta assertions above: the 8 KiB upload adds its own pool miss.)
+        {
+            prosper::test::FrameResource large = buffer;
+            large.dwords.assign(2048, 0u);
+            std::copy(std::begin(fullscreen_triangle), std::end(fullscreen_triangle),
+                      large.dwords.begin());
+            large.buffer_identity = 0x7020000000000004ull;
+            prosper::test::BackendDraw large0 = d0;
+            prosper::test::BackendDraw large1 = d1;
+            for (prosper::test::BackendDraw* draw : {&large0, &large1}) {
+                draw->R[1].dwords.clear();
+                draw->R[1].dwords_view = large.dwords.data();
+                draw->R[1].dwords_view_count = large.dwords.size();
+                draw->R[1].buffer_identity = large.buffer_identity;
+            }
+            const std::vector<uint8_t> large_frame =
+                prosper::test::render_draws_rgba({large0, large1}, W, H);
+            const auto large_stats = prosper::test::backend_resource_reuse_stats();
+            CHECK(large_frame == shared,
+                  "large-buffer views render byte-identically (hash-dedup bound is inert visually)");
+            CHECK(large_stats.buffer_hash_skipped_large == 1 &&
+                      large_stats.buffer_ref_memo_hits == 1 &&
+                      large_stats.buffer_hash_calls == 2 &&
+                      large_stats.unique_buffers == 2,
+              "large buffer skips content hashing; its repeat reference resolves via the memo "
+              "(the two owned filler copies keep small-buffer hash dedup)");
+        }
+
+        // #1268 review follow-up: the memo key includes buffer_identity — the SAME view pointer
+        // under two DIFFERENT identities must not memo-merge (equal bytes at distinct identities
+        // remain distinct uploads, as the identity-keyed SharedBufferKey already guarantees).
+        {
+            prosper::test::BackendDraw ident0 = d0;
+            prosper::test::BackendDraw ident1 = d1;
+            for (prosper::test::BackendDraw* draw : {&ident0, &ident1}) {
+                draw->R[1].dwords.clear();
+                draw->R[1].dwords_view = buffer.dwords.data();
+                draw->R[1].dwords_view_count = buffer.dwords.size();
+            }
+            ident1.R[1].buffer_identity++;
+            const std::vector<uint8_t> ident_frame =
+                prosper::test::render_draws_rgba({ident0, ident1}, W, H);
+            const auto ident_stats = prosper::test::backend_resource_reuse_stats();
+            CHECK(ident_frame == shared,
+                  "distinct-identity views render byte-identically");
+            CHECK(ident_stats.buffer_ref_memo_hits == 0 && ident_stats.unique_buffers == 3,
+                  "the memo keys on identity: one view pointer under two identities stays distinct");
+        }
 
         prosper::test::BackendDraw distinct = d1;
         distinct.R[1].buffer_identity++;
