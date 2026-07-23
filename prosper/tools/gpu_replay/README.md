@@ -112,6 +112,36 @@ counting clip whose first mask draw came back `GEOMETRY-VANISH`) in one run. Req
 `pipelineStatisticsQuery`; inert (no output, no cost, byte-identical rendering) when the env var is unset.
 Works on both `gpu_replay` and the live app because it lives in the shared render path.
 
+## Per-draw geometry probe — `PROSPER_GEOM_PROBE=N` (where did draw N's vertices actually land?)
+
+```bash
+PROSPER_GEOM_PROBE=4 ./build-linux/gpu_replay /tmp/submit.prgcap /tmp/out.bmp
+# [geom-probe] draw 4 VS re-recompiled with xfb capture (1700 words)
+# [geom-probe] draw=4 verts=1024 finite=1024 on-screen=0 clipped=1024 (offscreen=1023 w<=0=1 nan/inf=0)
+# [geom-probe]   clip-bbox x[-4.86,0] y[-1.14,3.81] z[0,0] w[0,1] -> ALL-VERTS-OUTSIDE-CLIP-CUBE(...)
+# [geom-probe]   v0 = (-2.9, -0.771, 0, 1) ...
+```
+
+The natural follow-up when the fragment funnel reports **GEOMETRY-VANISH**: capture draw N's **post-transform
+clip-space vertex positions** via `VK_EXT_transform_feedback` and report where they landed — clip-space
+bounding box, on-screen vs clipped counts, `w<=0` (behind-camera), NaN/inf, degenerate (all-collapsed), plus
+the first few raw `vec4`s. This distinguishes the ways a `GEOMETRY-VANISH` can happen:
+
+- all verts at one point → **DEGENERATE** (the vertex fetch returned constant/zero data);
+- `w<=0` for all → **behind camera** (transform / w defect);
+- spread but the bbox sits outside `[-1,1]` → **off-screen** (a transform/matrix defect shifting it away);
+- NaN/inf → a numeric defect.
+
+Read it **with** the funnel: the funnel owns the "does it rasterize" verdict (`after_clip`), the geom probe
+owns *where the geometry is* — a large full-screen quad can have every vertex just outside the cube yet still
+rasterize, so "all verts clipped" is not "renders nothing"; the bbox tells them apart.
+
+Mechanics: on a capsule (stored SPIR-V) gpu_replay re-recompiles draw N's raw RDNA2 VS with `gl_Position`
+xfb-decorated (requires a v19+ capsule that retained the raw VS stream) and swaps it in for that one draw; the
+live app recompiles fresh. Requires the device to advertise `VK_EXT_transform_feedback` (RADV, lavapipe). The
+probed draw's rendered pixels may be inexact (the re-recompile drops pixel-input remapping), but the captured
+`gl_Position` values are faithful; inert and byte-identical when the env var is unset.
+
 `--dump-shader DRAW:vs|fs PATH` writes the recompiled SPIR-V. Capture v19 adds
 `--dump-realized-shader DRAW:vs|fs PATH` for the exact bounded raw RDNA2 stream that produced that realized
 draw stage, suitable for `shader_inspect`. The VS/FS streams use the same content-addressed 64 KiB-per-stage,

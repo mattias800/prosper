@@ -802,8 +802,12 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
     const uint32_t* code = !key.code || key.code->empty() ? nullptr : key.code->data();
     const size_t code_size = key.code ? key.code->size() : 0u;
     if (stage == ShaderProgramStage::Vertex)
+        // Geometry probe (PROSPER_GEOM_PROBE): decorate gl_Position for transform-feedback capture on
+        // the LIVE path (which recompiles here). Capsule replay substitutes an xfb VS in gpu_replay,
+        // because a capsule stores already-recompiled SPIR-V. Inert to the shader's computation.
         return recompile_vertex(code, code_size, resources,
-                                key.has_pixel_inputs ? &key.pixel_inputs : nullptr);
+                                key.has_pixel_inputs ? &key.pixel_inputs : nullptr,
+                                getenv("PROSPER_GEOM_PROBE") != nullptr);
     if (stage == ShaderProgramStage::Fragment)
         return recompile_fragment(code, code_size, resources,
                                   key.has_system_inputs ? &key.system_inputs : nullptr,
