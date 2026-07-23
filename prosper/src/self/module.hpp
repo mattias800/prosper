@@ -13,6 +13,15 @@
 
 namespace prosper {
 
+// Overflow-safe bounds check: can `need` bytes be read at `off` within a `total`-byte buffer?
+// The obvious `off + need <= total` is NOT safe — a malformed/truncated dump can carry a file
+// offset near 2^64 (e.g. an unvalidated e_phoff), and `off + need` then wraps to a small value and
+// passes, letting the caller read from a wild pointer. Ordering `need <= total` first makes the
+// `total - need` in the second term unable to underflow, and `off <= total - need` cannot wrap.
+inline bool self_read_ok(uint64_t off, uint64_t need, uint64_t total) {
+    return need <= total && off <= total - need;
+}
+
 // ---- raw ELF/Sony structures we care about --------------------------------
 enum : uint32_t {
     PT_LOAD = 1, PT_DYNAMIC = 2, PT_TLS = 7,

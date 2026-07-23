@@ -142,6 +142,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_va2foff PRIVATE prosper_core)
   add_test(NAME va2foff_load_priority COMMAND test_va2foff)
 
+  # SELF/ELF/loader parsing must handle a malformed/truncated dump without an out-of-bounds read:
+  # overflow-safe rd() bounds (self_read_ok), NUL-terminated str_at, and the linker init-array p+8
+  # guard. Pure, no game dump.
+  add_executable(test_self_bounds tests/test_self_bounds.cpp)
+  target_link_libraries(test_self_bounds PRIVATE prosper_core)
+  add_test(NAME self_bounds COMMAND test_self_bounds)
+
   # SELF data-segment key masks flag bits >= 32 (#339): the SCE segment id is bits [31:20]; without
   # the mask a data segment keys the map wrong and every phdr lookup misses. Pure, no game dump.
   add_executable(test_self_segment_key tests/test_self_segment_key.cpp)

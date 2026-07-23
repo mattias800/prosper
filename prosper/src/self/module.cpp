@@ -8,7 +8,7 @@ namespace prosper {
 
 // ---- little helpers --------------------------------------------------------
 template<class T> static T rd(const std::vector<uint8_t>& b, size_t off) {
-    T v{}; if (off + sizeof(T) <= b.size()) memcpy(&v, b.data() + off, sizeof(T)); return v;
+    T v{}; if (self_read_ok(off, sizeof(T), b.size())) memcpy(&v, b.data() + off, sizeof(T)); return v;
 }
 // The SCE self-segment id (the phdr index a data segment maps to) is bits [31:20] of the segment
 // flags — 12 bits; higher bits hold other block/property info and MUST be masked off. Without the
@@ -57,8 +57,15 @@ int64_t Module::va2foff(uint64_t va) const {
 const char* Module::str_at(uint64_t off) const {
     int64_t f = va2foff(strtab_va);
     if (f < 0) return "";
-    uint64_t abs = (uint64_t)f + off;
-    return abs < file.size() ? (const char*)(file.data() + abs) : "";
+    uint64_t uf = (uint64_t)f;
+    if (off > file.size() || uf > file.size()) return "";   // guard the addition against wrap
+    uint64_t abs = uf + off;                                 // abs <= 2*file.size() < 2^63, no wrap
+    if (abs >= file.size()) return "";                       // need at least one byte in range
+    // A consumer (std::string / strlen at module.cpp needed_files/imports, sym.raw) reads until a
+    // NUL. On a malformed strtab with no terminator before EOF that would read past the buffer, so
+    // require an in-range NUL and reject otherwise.
+    if (!memchr(file.data() + abs, 0, file.size() - abs)) return "";
+    return (const char*)(file.data() + abs);
 }
 
 std::optional<Module> Module::load(const std::string& path, std::string* err) {
@@ -231,17 +238,24 @@ LoadedImage build_image(const Module& m, uint64_t base) {
     LoadedImage img; img.base = base;
     uint64_t lo = UINT64_MAX, hi = 0;
     for (auto& s : m.segments)
-        if (s.type == PT_LOAD) { lo = std::min(lo, s.vaddr); hi = std::max(hi, s.vaddr + s.memsz); }
+        // Skip a segment whose vaddr+memsz overflows (a malformed memsz): including it would wrap
+        // `hi` and mis-size the image. Well-formed segments have small extents and are unaffected.
+        if (s.type == PT_LOAD && s.memsz <= UINT64_MAX - s.vaddr) {
+            lo = std::min(lo, s.vaddr); hi = std::max(hi, s.vaddr + s.memsz);
+        }
     if (lo == UINT64_MAX) lo = 0;
     auto align_dn = [](uint64_t v, uint64_t a){ return v & ~(a-1); };
     auto align_up = [](uint64_t v, uint64_t a){ return (v + a - 1) & ~(a-1); };
     img.min_vaddr = align_dn(lo, 0x4000);
     img.max_vaddr = align_up(hi, 0x4000);
+    if (img.max_vaddr < img.min_vaddr) img.max_vaddr = img.min_vaddr;  // degenerate (align_up wrap) -> empty
     img.mem.assign(img.max_vaddr - img.min_vaddr, 0);
     for (auto& s : m.segments) {
-        if (s.type != PT_LOAD) continue;
+        if (s.type != PT_LOAD || s.vaddr < img.min_vaddr) continue;   // outside the mapped window
         uint64_t dst = s.vaddr - img.min_vaddr;
-        if (dst + s.filesz <= img.mem.size() && s.file_off + s.filesz <= m.file.size())
+        // Overflow-safe on BOTH the dest (img.mem) and source (m.file) — a malformed near-2^64
+        // filesz/file_off wraps the naive `a + b <= size` check and drives a huge OOB memcpy.
+        if (self_read_ok(dst, s.filesz, img.mem.size()) && self_read_ok(s.file_off, s.filesz, m.file.size()))
             memcpy(img.mem.data() + dst, m.file.data() + s.file_off, s.filesz);
         img.prot.push_back({ s.vaddr, s.memsz, (s.flags & 4) != 0, (s.flags & 2) != 0, (s.flags & 1) != 0 });
     }
