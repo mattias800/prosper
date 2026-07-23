@@ -235,6 +235,16 @@ struct SpirvCompute {
     // Geometry-probe (PROSPER_GEOM_PROBE): when set before begin_vertex(), decorate gl_Position for
     // transform-feedback capture. Inert to the shader's computation; only marks the output for readback.
     bool capture_position = false;
+    // Shader I/O value tap (PROSPER_SHADER_TAP=pc): after the instruction at `tap_pc`, snapshot its
+    // destination VGPR (and the next 3) as a vec4; the vertex position export is then redirected to it,
+    // so the geometry-probe capture reports the intermediate value AT that PC (e.g. a MUBUF fetch result)
+    // instead of gl_Position. Inert unless the env var is set. Values are bitcast-as-float in the output.
+    uint32_t tap_pc = 0xFFFFFFFFu;
+    uint32_t tap_vec = 0;   // 0 = no tap captured; else the vec4 SPIR-V id export_position emits
+    void set_tap(uint32_t a, uint32_t bb, uint32_t c, uint32_t d) {
+        uint32_t v = id(); putv(code, Op_CompositeConstruct, {t_v4f, v, bcf(a), bcf(bb), bcf(c), bcf(d)});
+        tap_vec = v;
+    }
 
     uint32_t id() { return next_id++; }
     static void put(std::vector<uint32_t>& s, uint32_t op, std::initializer_list<uint32_t> o) {
@@ -1597,7 +1607,11 @@ struct SpirvCompute {
         // multiply leaves w at 0 under our (still-incomplete) descriptor decode, collapsing the
         // perspective divide; forcing w=1 reveals whether the x/y are otherwise on-screen.
         if (getenv("PROSPER_FORCE_W")) w = uconst(0x3f800000u);   // raw bits of 1.0f (bcf bitcasts to float)
-        uint32_t v = id(); putv(code, Op_CompositeConstruct, {t_v4f, v, bcf(x), bcf(y), bcf(z), bcf(w)});
+        // Shader I/O tap: if an intermediate was snapshotted at PROSPER_SHADER_TAP's PC, export THAT as
+        // gl_Position instead of the real clip position, so the geometry-probe capture reads it back.
+        uint32_t v;
+        if (tap_vec) { v = tap_vec; }
+        else { v = id(); putv(code, Op_CompositeConstruct, {t_v4f, v, bcf(x), bcf(y), bcf(z), bcf(w)}); }
         uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_out_v4f, p, v_pos, uconst(0)});
         put(code, Op_Store, {p, v});
     }
@@ -7637,6 +7651,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             const bool handled = emit_alu(
                 b, rs, in, ok, allow_exec_update, &effective_safe, allow_smem, rt, wave_ok);
             if (handled && ok) record_scalar_write(rs, in);
+            // Shader I/O tap: snapshot this instruction's destination VGPR (+3) if it is the tapped PC.
+            if (handled && ok && in.pc == b.tap_pc && in.dst.kind == OperandKind::VGPR) {
+                auto tv = [&](int r) { auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
+                b.set_tap(tv(in.dst.value), tv(in.dst.value + 1), tv(in.dst.value + 2), tv(in.dst.value + 3));
+            }
             if (!handled || !ok) {
                 // PROSPER_DBG (gated, off by default): report the instruction that fails recompilation —
                 // the first unsupported op / unresolved resource that makes a shader return empty.
@@ -8785,6 +8804,9 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
 
     SpirvCompute b;
     b.capture_position = capture_position;   // geometry-probe: mark gl_Position for xfb capture (gated)
+    // Shader I/O value tap (PROSPER_SHADER_TAP=pc): redirect the position export to the intermediate VGPR
+    // produced at that PC. Applies to the vertex stage only; captured via the geometry probe.
+    if (const char* tap = getenv("PROSPER_SHADER_TAP")) b.tap_pc = static_cast<uint32_t>(strtoul(tap, nullptr, 0));
     b.begin_vertex(rt);
     b.declare_guest_scratch(scratch);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();

@@ -3815,14 +3815,29 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     clipped == finite       ? "ALL-VERTS-OUTSIDE-CLIP-CUBE(see bbox: off-screen shift or oversized quad)" :
                     onscreen * 20u < finite ? "MOSTLY-OUTSIDE(<5% verts on-screen; see bbox)" :
                                               "on-screen(geometry spread across clip space)";
-                fprintf(stderr, "[geom-probe] draw=%ld verts-written=%u finite=%u on-screen=%u clipped=%u "
-                                "(offscreen=%u w<=0=%u nan/inf=%u)\n"
-                                "[geom-probe]   clip-bbox x[%g,%g] y[%g,%g] z[%g,%g] w[%g,%g] -> %s\n",
-                        geom_target, written, finite, onscreen, clipped, offscreen, wle0, nan,
-                        minx,maxx, miny,maxy, minz,maxz, minw,maxw, tag);
-                for (uint32_t i = 0; i < written && i < 4; i++)
-                    fprintf(stderr, "[geom-probe]   v%u = (%g, %g, %g, %g)\n",
-                            i, pos[i*4+0], pos[i*4+1], pos[i*4+2], pos[i*4+3]);
+                // Shader I/O tap mode (PROSPER_SHADER_TAP): the captured "positions" are actually the tapped
+                // intermediate VGPR (dst..dst+3) at that PC, so print the raw hex too (values are often
+                // integers/bitfields, not clip floats) and skip the meaningless clip classification.
+                const bool is_tap = getenv("PROSPER_SHADER_TAP") != nullptr;
+                if (is_tap)
+                    fprintf(stderr, "[geom-probe] draw=%ld SHADER-TAP: values below are the tapped VGPR "
+                                    "(dst+3) at that PC, not clip positions (bbox/tags meaningless)\n", geom_target);
+                else
+                    fprintf(stderr, "[geom-probe] draw=%ld verts-written=%u finite=%u on-screen=%u clipped=%u "
+                                    "(offscreen=%u w<=0=%u nan/inf=%u)\n"
+                                    "[geom-probe]   clip-bbox x[%g,%g] y[%g,%g] z[%g,%g] w[%g,%g] -> %s\n",
+                            geom_target, written, finite, onscreen, clipped, offscreen, wle0, nan,
+                            minx,maxx, miny,maxy, minz,maxz, minw,maxw, tag);
+                for (uint32_t i = 0; i < written && i < (is_tap ? 8u : 4u); i++) {
+                    if (is_tap) {
+                        uint32_t h[4]; std::memcpy(h, &pos[i*4], 16);
+                        fprintf(stderr, "[geom-probe]   v%u = float(%g, %g, %g, %g) hex(%08x %08x %08x %08x)\n",
+                                i, pos[i*4+0], pos[i*4+1], pos[i*4+2], pos[i*4+3], h[0], h[1], h[2], h[3]);
+                    } else {
+                        fprintf(stderr, "[geom-probe]   v%u = (%g, %g, %g, %g)\n",
+                                i, pos[i*4+0], pos[i*4+1], pos[i*4+2], pos[i*4+3]);
+                    }
+                }
                 vkUnmapMemory(dev, geom_mem);
             } else if (!written) {
                 fprintf(stderr, "[geom-probe] draw=%ld: transform feedback wrote 0 vertices "

@@ -142,6 +142,29 @@ live app recompiles fresh. Requires the device to advertise `VK_EXT_transform_fe
 probed draw's rendered pixels may be inexact (the re-recompile drops pixel-input remapping), but the captured
 `gl_Position` values are faithful; inert and byte-identical when the env var is unset.
 
+## Shader I/O value tap — `PROSPER_SHADER_TAP=PC` (what did the shader compute at instruction PC?)
+
+```bash
+PROSPER_SHADER_TAP=60 PROSPER_GEOM_PROBE=4 ./build-linux/gpu_replay /tmp/submit.prgcap /tmp/out.bmp
+# [geom-probe] draw=4 SHADER-TAP: values below are the tapped VGPR (dst+3) at that PC, not clip positions
+# [geom-probe]   v0 = float(0, 2.04e-41, 0, 0) hex(00000000 000038bc 00000000 00000000)
+```
+
+The deepest probe: capture a **shader's intermediate value** — a `MUBUF` vertex-fetch result, a decoded
+constant, a pre-transform coordinate — at the instruction whose PC you name (the same PC `shader_inspect`
+prints). The recompiler snapshots that instruction's destination VGPR (and the next 3) as a vec4 and redirects
+the vertex-position export to it, so the geometry-probe capture reads the value back per vertex. Output shows
+both float and raw hex (intermediate values are frequently integers/bitfields — read the hex for those).
+
+Workflow: `shader_inspect` the draw's VS (`--dump-realized-shader N:vs`) to find the PC whose value you want,
+then `PROSPER_SHADER_TAP=<pc> PROSPER_GEOM_PROBE=N`. This answers "is prosper fetching the right vertex data /
+computing the right intermediate?" without an oracle — it revealed GTA V #1163's mask draws fetch plausible
+large-integer control coordinates (so the off-screen result is data-driven, not garbage). Vertex stage only; the
+tapped draw's render is garbage in a tap run (position is redirected) but the captured values are exact; inert
+and byte-identical when the env var is unset. Tap a PC in the shader's **straight-line region** (e.g. the
+vertex-fetch/transform prologue) — a PC inside a loop or if-body defines the value in a block that doesn't
+dominate the position export, so the shader fails to compile (fail-visible: the draw drops, no output line).
+
 `--dump-shader DRAW:vs|fs PATH` writes the recompiled SPIR-V. Capture v19 adds
 `--dump-realized-shader DRAW:vs|fs PATH` for the exact bounded raw RDNA2 stream that produced that realized
 draw stage, suitable for `shader_inspect`. The VS/FS streams use the same content-addressed 64 KiB-per-stage,
