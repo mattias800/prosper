@@ -25,8 +25,20 @@ python3 tools/re/xref.py /tmp/eboot.elf to 0x2031d10
 ```
 
 The `to` query reports Sony relative-relocation data pointers, direct calls, RIP-relative loads/stores,
-and indirect calls/jumps through the requested slot. `from ADDRESS` lists references made by the function
-window containing that address; `reloc ADDRESS` restricts output to relative data relocations.
+indirect calls/jumps, and the RIP-relative **immediate byte/dword stores and byte compares**
+(`storeb` = `c6 05` mov-byte-imm, `stored` = `c7 05` mov-dword-imm, `cmpb` = `80 3d` cmp-byte-imm)
+through the requested slot. The immediate forms are how the *writer* of a 1-byte state flag is found —
+it is not a register store, so `objdump`/`readelf` cannot name it. For example, the Bendy Agc
+suspend-point SAFE flag (`#1195`) is set by three `storeb` sites that a plain reg-store scan misses:
+
+```text
+python3 tools/re/xref.py /tmp/eboot.elf to 0x20698a5
+   storeb at 0x109a6e4  (in func 0x109a680)   # mov BYTE [rip+..],1
+   cmpb   at 0x1530385  (in func 0x1530320)   # the watchdog's flag test
+```
+
+`from ADDRESS` lists references made by the function window containing that address; `reloc ADDRESS`
+restricts output to relative data relocations.
 
 For The Messenger, the example above identifies both sides of Unity's runtime IL2CPP API table:
 
@@ -55,8 +67,9 @@ python3 tools/re/edis.py /tmp/eboot.elf 0x109a680 0x70
  109a6eb:  89 05 af f1 fc 00      mov  DWORD PTR [rip+0xfcf1af],eax  # 0x20698a0
 ```
 
-objdump computes the RIP-relative targets (the `# 0x…` comments), which is how the writer of a guest data
-slot is identified — the byte-store forms (`c6 05 …`, `80 3d …`) that `xref.py` does not decode. Unlike
-`tools/dbg/dis.sh`, which disassembles a pre-extracted `/tmp/text.bin` for one title, `edis.py` takes any
-flattened module ELF directly, so the same command works for every title. Requires `objdump` (binutils) on
-PATH.
+objdump computes the RIP-relative targets (the `# 0x…` comments), so `edis.py` shows exactly what the
+code at a site does. It complements `xref.py to <slot>`, which lists the *sites* that reference a slot
+(including the `storeb`/`stored`/`cmpb` immediate byte/dword store + compare forms): find the writers with
+`xref.py`, then read each one with `edis.py`. Unlike `tools/dbg/dis.sh`, which disassembles a pre-extracted
+`/tmp/text.bin` for one title, `edis.py` takes any flattened module ELF directly, so the same command works
+for every title. Requires `objdump` (binutils) on PATH.
