@@ -367,6 +367,18 @@ RenderState extract_render_state(const GpuState& st) {
                           PM4_FIELD(viewport_br, PA_SC_VPORT_SCISSOR_0_BR, BR_Y),
                           PM4_FIELD(viewport_tl, PA_SC_VPORT_SCISSOR_0_TL,
                                     WINDOW_OFFSET_DISABLE) != 0);
+            // #1164: a window offset can push the scissor ENTIRELY off the render target while
+            // leaving it non-empty in absolute coordinates (e.g. TL_Y offset 2560 on a 2160-tall
+            // target -> top=2560 > bottom -> zero area once clamped). Judge emptiness against the
+            // color0 extent so the recover below fires for the off-target case too, not only the
+            // absolute-degenerate case. Only when the extent is known (a color pass); a depth-only
+            // pass leaves color0_width/height 0 and keeps the pre-#1164 absolute test.
+            if (rs.color0_width && rs.color0_height) {
+                const int32_t cw = static_cast<int32_t>(rs.color0_width);
+                const int32_t ch = static_cast<int32_t>(rs.color0_height);
+                return std::min(right, cw) > std::max(left, 0) &&
+                       std::min(bottom, ch) > std::max(top, 0);
+            }
             return right > left && bottom > top;
         };
 
@@ -376,8 +388,10 @@ RenderState extract_render_state(const GpuState& st) {
         // offset is the cause, recover by re-running the combine without it. Observed on Bendy and
         // the Ink Machine (PPSA27616), whose title/menu/gameplay draws leave the VPORT scissor
         // offset-enabled while PA_SC_WINDOW_OFFSET carries a large value; the un-offset scissor is
-        // the correct full-target region and the frame renders. CONFIDENCE: MED — mechanism verified
-        // against the live capture; the un-offset recovery matches on-hardware output.
+        // the correct full-target region and the frame renders. #1164 extends the empty test to
+        // "empty after clamping to the color0 extent" so in-game draws whose offset shifts the
+        // scissor off-target (non-empty in absolute coords) also recover. CONFIDENCE: MED —
+        // mechanism verified against the live capture; the un-offset recovery matches hardware.
         if (!combine(/*apply_offset=*/true) && (offset_x != 0 || offset_y != 0))
             combine(/*apply_offset=*/false);
         rs.scissor_left = left; rs.scissor_top = top;
