@@ -52,6 +52,7 @@ void usage(const char* argv0) {
                          "[--bundle-ds-summary] "
                          "[--bundle-find-ds ADDR] "
                          "[--bundle-zero-boundary] "
+                         "[--draw-steps PREFIX [--draw-steps-every N] [--draw-steps-target WxH]] "
                          "[--prepend producer.prgcap] "
                          "[--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
                          "[--dump-rtt-seed ADDR PATH] "
@@ -1135,6 +1136,9 @@ int main(int argc, char** argv) {
     int draw_first = -1, draw_last = -1;
     int through_operation = -1;
     int compute_only = -1;
+    std::string draw_steps_prefix;     // --draw-steps PREFIX: filmstrip of the composite per operation-step
+    int draw_steps_every = 0;          // --draw-steps-every N (0 = auto ~30 frames)
+    uint32_t draw_steps_target_w = 0, draw_steps_target_h = 0;   // --draw-steps-target WxH (0 = any target)
     uint32_t warmup_repeats = 0;
     std::string dump_spec, dump_path, shader_spec, shader_path;
     std::string compute_shader_spec, compute_shader_path;
@@ -1201,6 +1205,18 @@ int main(int argc, char** argv) {
         }
         else if (std::string(argv[i]) == "--draw-with-compute-prefix")
             draw_with_compute_prefix = true;
+        else if (std::string(argv[i]) == "--draw-steps" && i + 1 < argc)
+            draw_steps_prefix = argv[++i];
+        else if (std::string(argv[i]) == "--draw-steps-every" && i + 1 < argc) {
+            char* end = nullptr;
+            const long value = std::strtol(argv[++i], &end, 0);
+            if (!end || *end || value <= 0 || value > INT_MAX) { usage(argv[0]); return 2; }
+            draw_steps_every = static_cast<int>(value);
+        }
+        else if (std::string(argv[i]) == "--draw-steps-target" && i + 1 < argc) {
+            if (std::sscanf(argv[++i], "%ux%u", &draw_steps_target_w, &draw_steps_target_h) != 2 ||
+                !draw_steps_target_w || !draw_steps_target_h) { usage(argv[0]); return 2; }
+        }
         else if (std::string(argv[i]) == "--through-operation" && i + 1 < argc) {
             char* end = nullptr;
             const long value = std::strtol(argv[++i], &end, 0);
@@ -1651,6 +1667,57 @@ int main(int argc, char** argv) {
                      repeat + 1, warmup_repeats, warmup_pixels.size(),
                      static_cast<unsigned long long>(
                          prosper::gpu::gpu_capture_hash(warmup_pixels)));
+    }
+    // --draw-steps: visual bisection. Render the composite through each operation-step (mixed draws +
+    // compute in captured order) and dump a numbered BMP filmstrip, so the first step where a defect
+    // (e.g. a black quad) appears is found by scrubbing — no oracle needed. Reuses execute_frame's
+    // ordered-prefix render; the per-step [draw-step] log also gives nonzero-byte + hash for a numeric
+    // bisection. Default step ~= total/30 (a ~30-frame contact sheet); narrow with --draw-steps-every.
+    if (!draw_steps_prefix.empty()) {
+        const size_t total_ops = replay.operations.size();
+        if (total_ops == 0) {
+            std::fprintf(stderr, "gpu_replay: --draw-steps: capture has no operations\n"); return 2;
+        }
+        const int every = draw_steps_every > 0 ? draw_steps_every
+                        : std::max<int>(1, static_cast<int>((total_ops + 29) / 30));
+        std::fprintf(stderr, "[gpureplay] --draw-steps: %zu operations, every=%d (~%zu frames) prefix=%s\n",
+                     total_ops, every, (total_ops + every - 1) / every, draw_steps_prefix.c_str());
+        for (size_t k = every;; k += every) {
+            const size_t limit = std::min(k, total_ops);
+            std::vector<uint8_t> px = execute_frame(replay, false, limit);
+            const auto ext = prosper::gpu::replay_tool::replay_output_extent(
+                replay, prosper::gpu::replay_tool::OutputExtentMode::OrderedPrefix, px.size(), limit);
+            // --draw-steps-target WxH: only dump steps whose prefix actually renders that target extent
+            // (e.g. the scanout), so the filmstrip shows one surface building up instead of every
+            // intermediate RTT. Match on the real pixel count, not the extent heuristic (which can
+            // over-report a mid-prefix operation's target).
+            if (draw_steps_target_w &&
+                px.size() != static_cast<size_t>(draw_steps_target_w) * draw_steps_target_h * 4) {
+                if (limit >= total_ops) break;
+                continue;
+            }
+            // `visible` counts RGBA pixels whose R|G|B is nonzero — the true "visible content" signal, so
+            // a scrub of the numeric log tracks what's actually on screen (raw nonzero-bytes is misleading
+            // because a fully-opaque black frame is ~25% nonzero from the alpha channel alone).
+            size_t nonzero = 0, visible = 0;
+            for (size_t p = 0; p + 3 < px.size(); p += 4) {
+                if (px[p] | px[p + 1] | px[p + 2] | px[p + 3]) ++nonzero;
+                if (px[p] | px[p + 1] | px[p + 2]) ++visible;
+            }
+            const uint32_t dw = draw_steps_target_w ? draw_steps_target_w : ext.width;
+            const uint32_t dh = draw_steps_target_w ? draw_steps_target_h : ext.height;
+            char path[1024];
+            std::snprintf(path, sizeof path, "%s_op%06zu.bmp", draw_steps_prefix.c_str(), limit);
+            const bool wrote = px.size() == static_cast<size_t>(dw) * dh * 4 &&
+                               prosper::test::dump_bmp(path, px, dw, dh);
+            std::fprintf(stderr,
+                         "[draw-step] op<=%zu %ux%u nonzero-px=%zu visible-px=%zu hash=%016llx -> %s\n",
+                         limit, dw, dh, nonzero, visible,
+                         static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(px)),
+                         wrote ? path : "(unwritable extent)");
+            if (limit >= total_ops) break;
+        }
+        return 0;
     }
     const size_t operation_limit = through_operation >= 0
         ? static_cast<size_t>(through_operation) + 1 : selected_operation_limit;
