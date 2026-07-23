@@ -1059,6 +1059,51 @@ bool set_guest_thread_name(uint64_t thread, const char* name) {
 }
 }
 
+// PROSPER_PRIOLOG (#1195/#1264 investigation): the priority SET calls are otherwise k_attr_noop (prosper
+// does not re-prioritize host threads). These gated handlers log the priority a title requests so we can
+// see whether it DIFFERENTIATES thread priorities (a PS5 priority-scheduling dependency prosper ignores
+// could explain the suspend-point/safe-flag livelock). Lower Sony priority value = higher scheduling
+// priority (256 highest .. 767 lowest, default 700). Behaviour is unchanged (still return 0/noop); only
+// prints under the env var. SceKernelSchedParam = { int sched_priority } (k_getschedparam writes the same
+// single int32), so the *schedparam forms dereference one int from the caller's param pointer.
+namespace {
+// The gate must be checked BEFORE any caller dereferences a guest SchedParam pointer: an argument
+// expression like *(int32_t*)a2 evaluates even when logging is off, which would make the default
+// path deref a pointer k_attr_noop never touched (review finding on #1264).
+bool priolog_enabled() {
+    static const bool on = getenv("PROSPER_PRIOLOG") != nullptr;
+    return on;
+}
+void priolog(const char* api, uint64_t target_thread, long policy, long prio) {
+    if (!priolog_enabled()) return;
+    char self[16] = {0};
+#ifndef _WIN32
+    pthread_getname_np(pthread_self(), self, sizeof self);   // winpthreads has no getname_np
+#endif
+    std::array<char, kGuestThreadNameSize> tname{};
+    const bool have_target = target_thread && get_guest_thread_name(target_thread, tname);
+    fprintf(stderr, "[prio] %s caller='%s' target=0x%llx'%s'%s policy=%ld prio=%ld\n",
+            api, self, (unsigned long long)target_thread,
+            have_target ? tname.data() : "?",
+            target_thread == (uint64_t)(uintptr_t)pthread_self() ? "(self)" : "",
+            policy, prio);
+}
+}
+HLE(k_log_setprio) {          // scePthreadSetprio(thread, prio)
+    priolog("setprio", a0, -1, (long)(int32_t)a1);
+    return 0;
+}
+HLE(k_log_setschedparam) {    // scePthread/pthread_setschedparam(thread, policy, SchedParam* param)
+    if (priolog_enabled())
+        priolog("setschedparam", a0, (long)(int32_t)a1, a2 ? (long)*(int32_t*)(uintptr_t)a2 : -1);
+    return 0;
+}
+HLE(k_log_attr_setschedparam) { // scePthreadAttrSetschedparam(attr, SchedParam* param)
+    if (priolog_enabled())
+        priolog("attr_setschedparam", 0, -1, a1 ? (long)*(int32_t*)(uintptr_t)a1 : -1);
+    return 0;
+}
+
 HLE(k_pthread_getname) {
     if (!a0) return 3;    // ESRCH
     if (!a1) return 14;   // EFAULT
@@ -3178,7 +3223,7 @@ void register_kernel_hle() {
     R("scePthreadAttrSetstacksize", k_attr_setstacksize);
     R("scePthreadAttrSetinheritsched", k_attr_noop);
     R("scePthreadAttrSetschedpolicy", k_attr_noop);
-    R("scePthreadAttrSetschedparam", k_attr_noop);
+    R("scePthreadAttrSetschedparam", k_log_attr_setschedparam);
     R("scePthreadAttrSetdetachstate", k_attr_setdetachstate);   // was no-op -> detached threads leaked
     R("scePthreadAttrGetdetachstate", k_attr_getdetachstate);   // was MISSING -> uninitialized *state
     R("scePthreadAttrGetschedparam", k_attr_getschedparam);
@@ -3189,7 +3234,7 @@ void register_kernel_hle() {
     R("scePthreadAttrSetaffinity", k_attr_noop);         // accept affinity requests (we don't pin)
     R("scePthreadGetaffinity", k_attr_getaffinity);      R("scePthreadSetaffinity", k_attr_noop);
     R("scePthreadGetschedparam", k_getschedparam);  R("pthread_getschedparam", k_getschedparam);
-    R("scePthreadSetschedparam", k_attr_noop);  R("scePthreadSetprio", k_attr_noop);
+    R("scePthreadSetschedparam", k_log_setschedparam);  R("scePthreadSetprio", k_log_setprio);
     R("scePthreadGetprio", k_getprio);
     R("scePthreadGetname", k_pthread_getname);
     R("scePthreadRename", k_pthread_rename);
