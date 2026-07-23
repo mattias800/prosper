@@ -582,6 +582,12 @@ struct ClockFenceRec {
     uint32_t count;
     uint8_t kind;                      // 1=RELEASE_MEM data_sel==3, 2=EVENT_WRITE timestamp
     uint8_t heapish_pre;               // some write to this address saw pointer-like pre-content
+    // Recent-value history: run-2 evidence shows the poison qword is {orig_low32, clock_low32} —
+    // an 8-byte clock write at A read back at A-4 — but the stomping write is usually NOT the
+    // LAST write to its target (fence labels re-fence every frame), so "last value" alone cannot
+    // answer "which target once held clock X?". Keep a tiny per-target ring of {value, t_ms}.
+    struct { uint64_t value, t_ms; } hist[4];
+    uint32_t hist_next;
 };
 constexpr uint32_t kClockFenceSlots = 8192;            // power of two
 ClockFenceRec g_clock_fences[kClockFenceSlots];
@@ -599,8 +605,12 @@ bool clockfence_log() {
 void clockfence_record(uint64_t addr, uint64_t pre, uint64_t value, uint64_t pkt, uint8_t kind) {
     ClockFenceRec& r = g_clock_fences[(uint32_t)((addr >> 3) * 2654435761u) & (kClockFenceSlots - 1)];
     const uint64_t t = now_ms();
-    if (r.addr != addr) { r.addr = addr; r.count = 0; r.first_ms = t; r.heapish_pre = 0; }
+    if (r.addr != addr) {
+        r.addr = addr; r.count = 0; r.first_ms = t; r.heapish_pre = 0;
+        r.hist_next = 0; memset(r.hist, 0, sizeof r.hist);
+    }
     r.value = value; r.pkt = pkt; r.pre = pre; r.last_ms = t; r.kind = kind; r.count++;
+    r.hist[r.hist_next & 3] = { value, t }; r.hist_next++;
     if (clockfence_heapish(pre)) {
         r.heapish_pre = 1;
         // The durable form of #1226's one-off REL3 diagnostic: a clock fence overwriting memory
@@ -630,6 +640,46 @@ extern "C" int prosper_gpu_clockfence_scan(uint64_t lo, uint64_t hi, char* out, 
                          (unsigned long long)r.addr, r.kind, r.count, (unsigned long long)r.value,
                          (unsigned long long)r.pre, r.heapish_pre, (unsigned long long)r.pkt,
                          (unsigned long long)r.first_ms, (unsigned long long)r.last_ms);
+        if (m > 0) off += (size_t)m;
+        found++;
+    }
+    if (off < cap) out[off] = 0;
+    return found;
+}
+
+// #1226 run-2 evidence: the corrupted bin head reads {high=0x0B782E3D, low=0x00024001} while NO
+// clock fence ever targeted its page — but 0x0B782E3D is exactly the LOW 32 bits of the GPU clock
+// at ~69-73s (16-17 2^32-ns wraps), minutes into the run and just before the ~76s fault. That is
+// the signature of an 8-byte clock write at some OTHER address A whose bytes, read as the qword at
+// A-4, yield {orig_low32, clock_low32} — poison the guest then COPIES into the bin head via a
+// free-list pop. This finder answers, at fault time: which fence target ever wrote a clock whose
+// low32 matches the corrupted value's high dword? EXACT hits match a retained value bit-for-bit;
+// NEAR hits (within ~134ms of clock) catch a target re-fenced shortly after the stomp. A freed
+// label stops being re-fenced, so the poison clock tends to survive as its last/history value.
+extern "C" int prosper_gpu_clockfence_find_low32(uint32_t low32, char* out, size_t cap) {
+    size_t off = 0; int found = 0;
+    for (uint32_t i = 0; i < kClockFenceSlots && off + 150 < cap; i++) {
+        const ClockFenceRec& r = g_clock_fences[i];
+        if (!r.addr) continue;
+        const char* how = nullptr; uint64_t match_v = 0, match_t = 0;
+        uint64_t cand[5]; uint64_t cand_t[5]; int nc = 0;
+        cand[nc] = r.value; cand_t[nc++] = r.last_ms;
+        for (int h = 0; h < 4; h++) if (r.hist[h].value) { cand[nc] = r.hist[h].value; cand_t[nc++] = r.hist[h].t_ms; }
+        for (int k = 0; k < nc && !how; k++) {
+            uint32_t vl = (uint32_t)cand[k];
+            if (vl == low32) { how = "EXACT"; match_v = cand[k]; match_t = cand_t[k]; }
+            else if ((uint32_t)(vl - low32) < 0x08000000u || (uint32_t)(low32 - vl) < 0x08000000u) {
+                how = "NEAR"; match_v = cand[k]; match_t = cand_t[k];
+            }
+        }
+        if (!how) continue;
+        int m = snprintf(out + off, cap - off,
+                         "[clockfence-find] %s addr=0x%llx kind=%u count=%u v=0x%llx@%llums "
+                         "last=0x%llx pre=0x%llx heapish_pre=%u pkt=0x%llx\n",
+                         how, (unsigned long long)r.addr, r.kind, r.count,
+                         (unsigned long long)match_v, (unsigned long long)match_t,
+                         (unsigned long long)r.value, (unsigned long long)r.pre, r.heapish_pre,
+                         (unsigned long long)r.pkt);
         if (m > 0) off += (size_t)m;
         found++;
     }
