@@ -164,9 +164,12 @@ uint32_t fragment_color_export_mask(const uint32_t* code, size_t dwords);
 // Recompile a vertex shader to a vertex SPIR-V module: v0 = gl_VertexIndex, run the VALU, and on EXP
 // to a POS target write vec4(src0..3) to gl_Position. Returns {} if unsupported / no position export.
 // An optional ShaderResourceTable enables vertex fetch (buffer_load_format_*) + constant loads.
+// `capture_position` (geometry-probe, gated): decorate gl_Position for VK_EXT_transform_feedback capture
+// so the host can read back this draw's post-transform clip-space vertices. Inert to the computation.
 std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
                                        const ShaderResourceTable* rt = nullptr,
-                                       const PixelInputMapping* pixel_inputs = nullptr);
+                                       const PixelInputMapping* pixel_inputs = nullptr,
+                                       bool capture_position = false);
 
 // How much of a shader the recompiler currently covers (per-instruction), without requiring the
 // stream to be a complete vertex/fragment. `alu` = instructions emit_alu handles (VALU/scalar/

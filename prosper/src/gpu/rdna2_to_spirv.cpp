@@ -67,9 +67,10 @@ enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Gls
 enum : uint32_t {
     Cap_Shader=1, Cap_Geometry=2, Cap_Int64=11, Cap_GroupNonUniform=61, Cap_GroupNonUniformVote=62,
     Cap_GroupNonUniformArithmetic=63, Cap_GroupNonUniformQuad=68,
+    Cap_TransformFeedback=53,   // VK_EXT_transform_feedback (geometry-probe capture of gl_Position, gated)
     Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Geometry=3, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17, EM_Triangles=22,
-    EM_OutputVertices=26, EM_OutputTriangleStrip=29,
+    EM_OutputVertices=26, EM_OutputTriangleStrip=29, EM_Xfb=11,   // transform-feedback execution mode
     SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_Function=7, SC_PushConstant=9,
     SC_StorageBuffer=12, FC_None=0,
     Dim_1D=0, Dim_2D=1, Dim_3D=2,   // SPIR-V Dim. (2D coincides with the SQ_RSRC 2D dim value, but distinct.)
@@ -87,7 +88,7 @@ enum : uint32_t {
     MemSem_UniformAcqRel=0x48, MemSem_WGAcqRel=0x108,   // storage/LDS AcquireRelease memory semantics
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_NoPerspective=13, Dec_Flat=14,
     Dec_Centroid=16, Dec_Sample=17, Dec_Location=30, Dec_Binding=33,
-    Dec_DescriptorSet=34, Dec_Offset=35,
+    Dec_DescriptorSet=34, Dec_Offset=35, Dec_XfbBuffer=36, Dec_XfbStride=37,
     BI_Position=0, BI_FragCoord=15, BI_FragDepth=22, BI_HelperInvocation=23,
     BI_WorkgroupId=26, BI_LocalInvocationId=27,
     BI_GlobalInvocationId=28, BI_SubgroupLocalInvocationId=41,
@@ -231,6 +232,9 @@ struct SpirvCompute {
     size_t function_var_insert = 0;                   // first-function-block OpVariable insertion point
     uint32_t exec_model=0;                           // deferred EntryPoint (emitted in finish() so lazily-
     std::vector<uint32_t> iface;                     // declared I/O varyings can join the interface list)
+    // Geometry-probe (PROSPER_GEOM_PROBE): when set before begin_vertex(), decorate gl_Position for
+    // transform-feedback capture. Inert to the shader's computation; only marks the output for readback.
+    bool capture_position = false;
 
     uint32_t id() { return next_id++; }
     static void put(std::vector<uint32_t>& s, uint32_t op, std::initializer_list<uint32_t> o) {
@@ -1555,6 +1559,16 @@ struct SpirvCompute {
         put(deco, Op_Decorate, {v_iid, Dec_BuiltIn, BI_InstanceIndex});
         put(deco, Op_MemberDecorate, {t_pv, 0, Dec_BuiltIn, BI_Position});   // gl_PerVertex.gl_Position
         put(deco, Op_Decorate, {t_pv, Dec_Block});
+        // Geometry-probe: mark gl_Position for transform-feedback capture (xfb buffer 0, one vec4/vertex).
+        // These decorations do not change the shader's computation; the host reads back the captured
+        // clip-space positions for the probed draw. Only emitted when explicitly requested.
+        if (capture_position) {
+            put(caps, Op_Capability, {Cap_TransformFeedback});
+            put(exec, Op_ExecutionMode, {f_main, EM_Xfb});
+            put(deco, Op_MemberDecorate, {t_pv, 0, Dec_XfbBuffer, 0});
+            put(deco, Op_MemberDecorate, {t_pv, 0, Dec_XfbStride, 16});
+            put(deco, Op_MemberDecorate, {t_pv, 0, Dec_Offset, 0});
+        }
         put(types, Op_TypeVoid, {t_void});
         put(types, Op_TypeFunction, {t_fn, t_void});
         put(types, Op_TypeFloat, {t_f32, 32});
@@ -8763,12 +8777,14 @@ bool fragment_spirv_uses_internal_gds(const std::vector<uint32_t>& spirv) {
 
 std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
                                        const ShaderResourceTable* rt,
-                                       const PixelInputMapping* pixel_inputs) {
+                                       const PixelInputMapping* pixel_inputs,
+                                       bool capture_position) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
     const StaticScratchLayout scratch = analyze_static_scratch(ins);
 
     SpirvCompute b;
+    b.capture_position = capture_position;   // geometry-probe: mark gl_Position for xfb capture (gated)
     b.begin_vertex(rt);
     b.declare_guest_scratch(scratch);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();

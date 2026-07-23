@@ -1315,6 +1315,31 @@ int main(int argc, char** argv) {
     if (!prosper::gpu::materialize_gpu_replay(capture, replay, error)) {
         std::fprintf(stderr, "gpu_replay: cannot materialize: %s\n", error.c_str()); return 2;
     }
+    // Geometry probe (PROSPER_GEOM_PROBE=N): a capsule stores already-recompiled SPIR-V, so to capture
+    // draw N's gl_Position via transform feedback we re-recompile its raw RDNA2 VS with xfb decorations
+    // and swap it in here; render_runner then binds a TF buffer around that draw and reports where its
+    // post-transform vertices land. Requires a v19+ capsule that retained the raw VS stream.
+    if (const char* g = std::getenv("PROSPER_GEOM_PROBE")) {
+        const long n = std::strtol(g, nullptr, 10);
+        if (n >= 0 && static_cast<size_t>(n) < replay.items.size()) {
+            auto& it = replay.items[static_cast<size_t>(n)];
+            if (it.vs_raw_shader_index < replay.raw_shader_versions.size()) {
+                const auto& raw = replay.raw_shader_versions[it.vs_raw_shader_index];
+                auto xfb = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
+                                                          it.vrt.get(), nullptr, true);
+                if (!xfb.empty()) {
+                    it.vs = std::move(xfb); it.vs_shared.reset(); it.vs_identity = 0;
+                    std::fprintf(stderr, "[geom-probe] draw %ld VS re-recompiled with xfb capture (%zu words)\n",
+                                 n, it.vs.size());
+                } else {
+                    std::fprintf(stderr, "[geom-probe] draw %ld: xfb re-recompile produced no VS "
+                                         "(no raw stream / unsupported)\n", n);
+                }
+            } else {
+                std::fprintf(stderr, "[geom-probe] draw %ld: no captured raw VS stream (capsule predates v19)\n", n);
+            }
+        }
+    }
     prosper::gpu::GpuCaptureFile prepend_capture;
     prosper::gpu::GpuReplayFrame prepend;
     if (!prepend_path.empty() &&

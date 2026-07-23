@@ -135,6 +135,14 @@ objective, needs no oracle, and turns "why did this draw render nothing" into a 
 bisection (it localised GTA V's menu black-wedge defect to a single `GEOMETRY-VANISH` mask draw in one run).
 See `tools/gpu_replay/README.md`. Use it to pick the suspect draw, *then* the filmstrip below to see it.
 
+**When the funnel says `GEOMETRY-VANISH`, follow up with `PROSPER_GEOM_PROBE=N`** (per-draw geometry probe):
+it captures draw N's post-transform clip-space vertices via transform feedback and reports where they landed
+(clip-space bbox, on-screen/clipped counts, `w<=0`, NaN, all-collapsed). That distinguishes *why* the geometry
+vanished — degenerate (fetch returned zero/constant), behind camera (`w<=0`), or shifted off-screen (bbox
+outside `[-1,1]`). It localized GTA V #1231's vanished mask draw to an off-screen transform (bbox `x[-4.86,0]`,
+all verts outside the clip cube) vs a working mask on-screen. Read it with the funnel — the funnel owns the
+"rasterizes?" verdict, the probe owns *where the vertices are*.
+
 **Then localize visually with `gpu_replay --draw-steps` (visual bisection).** Before probing individual draws,
 run `gpu_replay --draw-steps PREFIX --draw-steps-target WxH <capsule>` on the scene: it dumps a numbered BMP
 filmstrip of the composite building up per operation-step (plus a `[draw-step]` log with `visible-px`/`hash`),
