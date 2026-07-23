@@ -142,6 +142,19 @@ std::vector<uint8_t> inspection_rgba8(const std::vector<uint8_t>& pixels,
     const size_t texels = static_cast<size_t>(width) * height;
     if (format == VK_FORMAT_R8G8B8A8_UNORM && pixels.size() == texels * 4)
         return pixels;
+    // R16G16B16A16_UNORM: 16-bit fixed-point per channel -> 8-bit (high byte). Without this, a 64-bit
+    // UNORM color target (a common non-float HDR/deep surface) inspected to black regardless of content,
+    // which is misleading for RTT diagnostics.
+    if (format == VK_FORMAT_R16G16B16A16_UNORM && pixels.size() == texels * 8) {
+        std::vector<uint8_t> rgba(texels * 4);
+        for (size_t texel = 0; texel < texels; ++texel)
+            for (uint32_t channel = 0; channel < 4; ++channel) {
+                uint16_t v = 0;
+                std::memcpy(&v, pixels.data() + texel * 8 + channel * 2, sizeof(v));
+                rgba[texel * 4 + channel] = static_cast<uint8_t>(v >> 8);
+            }
+        return rgba;
+    }
     if (format != VK_FORMAT_R16G16B16A16_SFLOAT || pixels.size() != texels * 8)
         return {};
     std::vector<uint8_t> rgba(texels * 4);
@@ -2359,7 +2372,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     // active_color1(): a fixed-function resolve exports nothing, so its color1_write_mask
                     // is 0 and active_color1 would report no destination. Without this the resolved surface
                     // the display later samples never receives the scene and the frame is a uniform fill.
-                    if (!pass.empty() && pass.front()->ps.cb_resolve) {
+                    static const bool no_resolve = getenv("PROSPER_NO_RESOLVE") != nullptr;
+                    if (!pass.empty() && pass.front()->ps.cb_resolve && !no_resolve) {
                         const uint64_t rsrc = pass.front()->color0_base;
                         const uint64_t rdst = pass.front()->color1_base;
                         auto src_it = rsrc ? g_rtt.find(rsrc) : g_rtt.end();
