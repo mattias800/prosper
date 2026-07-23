@@ -38,7 +38,12 @@ namespace prosper::gpu {
 namespace {
 
 constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
-constexpr uint32_t kVersion = 22;
+// v23 (#1256): each realized draw also retains its RAW draw-packet state — the DrawIndexAuto/DrawIndex
+// index_count and indexed flag as decoded from the guest, BEFORE realization. This lets gpu_replay
+// --inspect-only surface raw-vs-realized offline and flag a decode/realization divergence (e.g. GTA
+// #1163's non-indexed vertex-count inflation) without a live boot. Older captures read fine (the fields
+// default to 0/false = "unknown").
+constexpr uint32_t kVersion = 23;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -961,6 +966,7 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         GpuCapturedDraw c; c.vs = d.vs_words(); c.gs = d.gs_words(); c.fs = d.fs_words();
         c.ps = d.ps; c.vertex_count = d.vertex_count;
         c.instance_count = d.instance_count;
+        c.raw_draw_count = d.raw_draw_count; c.raw_indexed = d.raw_indexed;   // #1256
         c.indices = d.indices; c.color0_base = d.color0_base;
         c.color0_width = d.color0_width; c.color0_height = d.color0_height;
         c.color1_base = d.color1_base;
@@ -1495,6 +1501,11 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         if (!write_internal_state(draw.vrt) || !write_internal_state(draw.prt)) return false;
     for (const auto& compute : c.computes)
         if (!write_internal_state(compute.resources)) return false;
+    // v23 (#1256) appends the raw draw-packet state (DrawIndexAuto/DrawIndex index_count + indexed flag)
+    // per realized draw, decoded from the guest BEFORE realization. Older captures default to 0/false
+    // ("unknown"). Kept as a trailing block so every v1-v22 record prefix stays byte-exact.
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws) { w.u32(draw.raw_draw_count); w.u32(draw.raw_indexed ? 1u : 0u); }
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -2039,6 +2050,15 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
         for (auto& compute : c.computes)
             if (!read_internal_state(compute.resources)) return false;
     }
+    if (version >= 23) {   // #1256: raw draw-packet state per realized draw
+        uint32_t nd = 0;
+        if (!r.u32(nd) || nd != c.draws.size()) { error = "invalid raw-draw-state count"; return false; }
+        for (auto& draw : c.draws) {
+            uint32_t ri = 0;
+            if (!r.u32(draw.raw_draw_count) || !r.u32(ri)) return false;
+            draw.raw_indexed = ri != 0;
+        }
+    }
     if (version >= 7 && !validate_failure_diagnostics(c, error)) return false;
     if (r.left) { error = "capture has trailing data"; return false; }
     return true;
@@ -2125,6 +2145,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         DrawItem d; d.vs = x.vs; d.gs = x.gs; d.fs = x.fs;
         d.ps = x.ps; d.vertex_count = x.vertex_count;
         d.instance_count = x.instance_count;
+        d.raw_draw_count = x.raw_draw_count; d.raw_indexed = x.raw_indexed;   // #1256
         d.indices = x.indices; d.color0_base = x.color0_base;
         d.color0_width = x.color0_width; d.color0_height = x.color0_height;
         d.color1_base = x.color1_base;

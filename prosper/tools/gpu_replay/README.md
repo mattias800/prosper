@@ -41,6 +41,28 @@ Create a capsule with the native-speed workflow in
 ./build-linux/gpu_replay --bundle /tmp/window.prgbundle --bundle-zero-boundary /tmp/zero-ab.bmp
 ```
 
+## Raw-vs-realized draw check — `raw=` on each `--inspect-only` draw line (#1256)
+
+Each `draw[i] … vcount=N indices=M topo=T raw=…` line reports the **raw draw-packet state** the guest
+submitted, decoded BEFORE realization (capture v23+):
+
+```
+draw[12] … vcount=6 indices=0 topo=3 raw=6              # healthy: realized == guest's DrawIndexAuto count
+draw[12] … vcount=1024 indices=0 topo=3 raw=6 [INFLATED] # realized swept more than the guest asked for
+```
+
+- **non-indexed** (`indices=0`): the realized `vcount` MUST equal `raw` (the DrawIndexAuto count). `[INFLATED]`
+  = realized > raw+1 (the GTA #1163 shared-vertex-pool signature); `[DIVERGENT]` = realized < raw. A realized
+  `raw+1` is NOT flagged — a PS5 RectList draw legitimately synthesizes one extra procedural corner (3 -> 4).
+- **indexed**: `raw=N(idx)`; the fetched index count (`indices=`) must equal `N`, else `[INDEX-COUNT-MISMATCH]`
+  (also fires when an indexed draw fell back to non-indexed on an unreadable index buffer — a real signal).
+- `raw=?` = a pre-v23 capture (the raw count was not retained). No flag is possible for those.
+
+This makes a whole class of decode/realization-divergence bug — where prosper renders geometry the guest did
+not ask for — visible **offline** from a capsule, without a live boot. It was added because #1163 (the black
+menu wedges) could only be diagnosed by booting the game repeatedly with `PROSPER_DRAWLOG`; the capsule stored
+only the realized `vcount=1024`, hiding that the guest's real count was 6.
+
 ## Reading graph output
 
 - `edge producer=P consumer=C` means operation `C` reads a range last written by earlier operation `P`.

@@ -80,6 +80,7 @@ int main() {
     draw.vs_guest_addr = reinterpret_cast<uint64_t>(kDiagnosticVs);
     draw.fs_guest_addr = reinterpret_cast<uint64_t>(kDiagnosticBadPs);
     draw.vertex_count = 6; draw.instance_count = 3;
+    draw.raw_draw_count = 6; draw.raw_indexed = false;   // #1256: raw draw-packet state (v23)
     draw.indices = {0, 1, 2, 2, 3, 0}; draw.color0_base = 0x2000;
     draw.color0_width = 1024; draw.color0_height = 32;
     draw.color1_base = 0x3000; draw.color1_width = 1024; draw.color1_height = 32;
@@ -135,6 +136,8 @@ int main() {
           "capture indexes unique shaders and retains operation provenance");
     CHECK(captured.draws.size() == 1 && captured.draws[0].instance_count == 3,
           "capture retains the realized draw instance count");
+    CHECK(captured.draws[0].raw_draw_count == 6 && !captured.draws[0].raw_indexed,
+          "capture retains the raw draw-packet count and indexed flag (#1256)");
     CHECK(captured.raw_shader_versions.size() == 2 &&
           captured.draws[0].vs_raw_shader_index < captured.raw_shader_versions.size() &&
           captured.draws[0].fs_raw_shader_index < captured.raw_shader_versions.size() &&
@@ -210,6 +213,7 @@ int main() {
               v16_scissor_bytes.size() >= 25,
           "v17 capture serializes effective guest scissor state");
     if (v16_scissor_bytes.size() >= 25) {
+        v16_scissor_bytes.resize(v16_scissor_bytes.size() - 12); // v23 count + one raw-draw-state
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 28); // v22 count + three empty vectors
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 13); // v21 one draw + zero failures
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 8); // v20 draw count + instance count
@@ -356,6 +360,7 @@ int main() {
           "writer rejects an out-of-bounds DCC metadata reference");
     CHECK(serialize_gpu_capture(volume_capture, volume_bytes, error),
           "recreated valid v12 DCC bytes after malformed-reference check");
+    volume_bytes.resize(volume_bytes.size() - 12); // v23 count + one raw-draw-state
     volume_bytes.resize(volume_bytes.size() - 12); // v22 count + one empty vector
     volume_bytes.resize(volume_bytes.size() - 13); // v21 one logic-op draw + zero failures
     volume_bytes.resize(volume_bytes.size() - 8); // v20 draw count + instance count
@@ -425,6 +430,7 @@ int main() {
     CHECK(serialize_gpu_capture(captured, v20_bytes, error) && v20_bytes.size() >= 21,
           "v21 capture serializes the logic-op extension");
     if (v20_bytes.size() >= 21) {
+        v20_bytes.resize(v20_bytes.size() - 12); // v23 count + one raw-draw-state
         v20_bytes.resize(v20_bytes.size() - 28); // v22 count + three empty vectors
         v20_bytes.resize(v20_bytes.size() - 13); // v21 one logic-op draw + zero failures
         v20_bytes[8] = 20; v20_bytes[9] = v20_bytes[10] = v20_bytes[11] = 0;
@@ -476,6 +482,8 @@ int main() {
           "content versions and draw operation identity round-trip");
     CHECK(loaded.draws[0].instance_count == 3,
           "v20 realized draw instance count round-trips");
+    CHECK(loaded.draws[0].raw_draw_count == 6 && !loaded.draws[0].raw_indexed,
+          "v23 raw draw-packet state round-trips through write/read (#1256)");
     CHECK(loaded.raw_shader_versions.size() == 2 &&
           loaded.draws[0].vs_raw_shader_index < loaded.raw_shader_versions.size() &&
           loaded.draws[0].fs_raw_shader_index < loaded.raw_shader_versions.size(),
@@ -818,6 +826,7 @@ int main() {
     if (v13_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        v13_bytes.resize(v13_bytes.size() - 12); // v23 count + one raw-draw-state
         v13_bytes.resize(v13_bytes.size() - (4 + 8 * legacy_resource_count)); // v22
         v13_bytes.resize(v13_bytes.size() - 13); // v21 one logic-op draw + zero failures
         v13_bytes.resize(v13_bytes.size() - 8); // v20 draw count + instance count
@@ -840,6 +849,7 @@ int main() {
     if (legacy_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        legacy_bytes.resize(legacy_bytes.size() - 12); // v23 count + one raw-draw-state
         legacy_bytes.resize(legacy_bytes.size() - (4 + 8 * legacy_resource_count)); // v22
         legacy_bytes.resize(legacy_bytes.size() - 13); // v21 one logic-op draw + zero failures
         legacy_bytes.resize(legacy_bytes.size() - 8); // v20 draw count + instance count
@@ -888,9 +898,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 23;
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 24;
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 23",
+          error == "unsupported capture version 24",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

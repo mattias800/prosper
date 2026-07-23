@@ -70,6 +70,11 @@ struct GpuCapturedDraw {
     GpuCapturedTable prt;
     uint32_t vertex_count = 3;
     uint32_t instance_count = 1;
+    // #1256 (v23): the RAW draw-packet count (DrawIndexAuto/DrawIndex index_count) and indexed flag as
+    // decoded from the guest, BEFORE realization. For a non-indexed draw the realized vertex_count must
+    // equal raw_draw_count; a divergence is a decode/realization bug (--inspect-only flags it). 0 = unknown.
+    uint32_t raw_draw_count = 0;
+    bool raw_indexed = false;
     std::vector<uint32_t> indices;
     uint64_t color0_base = 0;
     uint32_t color0_width = 0, color0_height = 0;
