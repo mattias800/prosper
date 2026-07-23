@@ -165,6 +165,30 @@ and byte-identical when the env var is unset. Tap a PC in the shader's **straigh
 vertex-fetch/transform prologue) — a PC inside a loop or if-body defines the value in a block that doesn't
 dominate the position export, so the shader fails to compile (fail-visible: the draw drops, no output line).
 
+## Fragment I/O value tap — `PROSPER_FS_TAP=DRAW:PC` (what did the fragment shader compute at PC?)
+
+```bash
+PROSPER_FS_TAP=6:27 ./build-linux/gpu_replay /tmp/submit.prgcap /tmp/out.bmp
+# [fs-tap] draw 6 FS re-recompiled with colour tap (1740 words)
+# -> draw 6's pixels in out.bmp now show its sampled texel (the value at pc=27), not its real colour
+```
+
+The fragment-stage sibling of `PROSPER_SHADER_TAP`, for "why is this **pixel** the wrong colour?" — capture a
+fragment shader's intermediate at instruction `PC` (the same PC `shader_inspect` prints) and **redirect the
+MRT0 colour export to it**, so draw `DRAW`'s pixels in the rendered frame *are* the value visualised. Unlike the
+VS tap it needs no separate capture — the output BMP is the readout. Point `--dump-realized-shader DRAW:fs` +
+`shader_inspect` at the FS to find the PC (an `image_sample`/MIMG result, a UV, a pre-blend colour), then
+`PROSPER_FS_TAP=DRAW:PC`. gpu_replay re-recompiles only that draw's FS (needs a v19+ capsule with the raw FS
+stream); the rest of the frame renders normally, so read the tapped draw's region.
+
+Precision: the value goes through the colour attachment, so it inherits that target's format — values in [0,1]
+(UVs, colours, factors, alpha) show directly; larger values clamp (8-bit targets) — read them as colour, not
+exact floats. It confirmed GTA V #1163 draw 6 samples the correct artwork texture (so the colour path is fine;
+the defect is the stencil masks). Fragment stage only; tap a straight-line PC (same loop/if caveat as the VS
+tap); inert and byte-identical when the env var is unset. The re-recompile drops system inputs, so a tapped
+value derived from `gl_FragCoord`/sample position reads 0 (visualise fetch/sample/colour intermediates, not
+FragCoord-dependent terms).
+
 `--dump-shader DRAW:vs|fs PATH` writes the recompiled SPIR-V. Capture v19 adds
 `--dump-realized-shader DRAW:vs|fs PATH` for the exact bounded raw RDNA2 stream that produced that realized
 draw stage, suitable for `shader_inspect`. The VS/FS streams use the same content-addressed 64 KiB-per-stage,
