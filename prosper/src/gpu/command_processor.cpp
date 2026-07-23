@@ -564,6 +564,79 @@ static bool rel1_stomp_guard() {
                                return !e || strtol(e, nullptr, 0) != 0; }();   // default ON
     return v;
 }
+// --- #1226 clock-fence provenance: persistent per-address record of 64-bit GPU-clock writes. -----
+// ArcRunner's intermittent RHIThread/RenderThread free-list crash dereferences a bin head holding
+// {high = GPU-clock-like counter, low = constant 0x00024001} — the shape of a RELEASE_MEM
+// data_sel==3 / EVENT_WRITE timestamp write whose low dword the guest later re-initialized. The 16K
+// attribution ring above wraps in well under a second on a busy title, which is why the fault-time
+// ring scan found no writer (#1226). This table instead RETAINS the last clock write per target
+// address for the whole run (direct-mapped by address; collisions replace — diagnostic-grade), so
+// the PROSPER_FAULTOBJ worker-fault dump can answer "was the corrupted address EVER a clock-fence
+// target, and what did it hold before the write?" long after the ring has wrapped. Always-on: one
+// hashed store per clock write, no allocation. This is provenance only — it never gates a write.
+namespace {
+struct ClockFenceRec {
+    uint64_t addr;                     // 0 = empty slot
+    uint64_t value, pkt, pre;          // last write: clock value, builder packet, pre-content
+    uint64_t first_ms, last_ms;
+    uint32_t count;
+    uint8_t kind;                      // 1=RELEASE_MEM data_sel==3, 2=EVENT_WRITE timestamp
+    uint8_t heapish_pre;               // some write to this address saw pointer-like pre-content
+};
+constexpr uint32_t kClockFenceSlots = 8192;            // power of two
+ClockFenceRec g_clock_fences[kClockFenceSlots];
+// Diagnostic-only "looks like a heap pointer" — deliberately wider than ptr_like(): ArcRunner's
+// MallocBinned3 arena and RHI objects live in the 0x2400000000..0x3200000000 region (#1226 FAULTOBJ
+// dumps: objects at 0x2420e48000 / 0x3152b50000 / 0x316366c154), which the DOLL-era ptr_like()
+// windows predate. Flags records for the reader; never used to gate or suppress a write.
+bool clockfence_heapish(uint64_t v) {
+    return ptr_like(v) || (v >= 0x2100000000ull && v < 0x4000000000ull);
+}
+bool clockfence_log() {
+    static const bool v = getenv("PROSPER_CLOCKFENCE_LOG") != nullptr;
+    return v;
+}
+void clockfence_record(uint64_t addr, uint64_t pre, uint64_t value, uint64_t pkt, uint8_t kind) {
+    ClockFenceRec& r = g_clock_fences[(uint32_t)((addr >> 3) * 2654435761u) & (kClockFenceSlots - 1)];
+    const uint64_t t = now_ms();
+    if (r.addr != addr) { r.addr = addr; r.count = 0; r.first_ms = t; r.heapish_pre = 0; }
+    r.value = value; r.pkt = pkt; r.pre = pre; r.last_ms = t; r.kind = kind; r.count++;
+    if (clockfence_heapish(pre)) {
+        r.heapish_pre = 1;
+        // The durable form of #1226's one-off REL3 diagnostic: a clock fence overwriting memory
+        // that currently holds a pointer — a recycled label, or a live allocator/RHI structure
+        // (the crash class). Bounded and off by default (PROSPER_CLOCKFENCE_LOG=1).
+        static std::atomic<int> n{0};
+        if (clockfence_log() && n.fetch_add(1) < 64)
+            fprintf(stderr,
+                    "[agc] CLOCKFENCE-OVER-PTR kind=%u [0x%llx] pre=0x%llx clock=0x%llx pkt=0x%llx t=%llums\n",
+                    kind, (unsigned long long)addr, (unsigned long long)pre,
+                    (unsigned long long)value, (unsigned long long)pkt, (unsigned long long)t);
+    }
+}
+}
+// Scan the persistent clock-fence table for writes overlapping [lo, hi); format matches into `out`
+// (NUL-terminated). Async-signal-safe: no locks, no allocation, tolerates torn racy slots
+// (diagnostic-grade). Called from the PROSPER_FAULTOBJ worker-fault dump (exec_image_linux.cpp) to
+// attribute a stomped allocator/RHI field to the exact fence target + builder packet.
+extern "C" int prosper_gpu_clockfence_scan(uint64_t lo, uint64_t hi, char* out, size_t cap) {
+    size_t off = 0; int found = 0;
+    for (uint32_t i = 0; i < kClockFenceSlots && off + 140 < cap; i++) {
+        const ClockFenceRec& r = g_clock_fences[i];
+        if (!r.addr || r.addr + 8 <= lo || r.addr >= hi) continue;
+        int m = snprintf(out + off, cap - off,
+                         "[clockfence] addr=0x%llx kind=%u count=%u last=0x%llx pre=0x%llx "
+                         "heapish_pre=%u pkt=0x%llx t=%llu..%llums\n",
+                         (unsigned long long)r.addr, r.kind, r.count, (unsigned long long)r.value,
+                         (unsigned long long)r.pre, r.heapish_pre, (unsigned long long)r.pkt,
+                         (unsigned long long)r.first_ms, (unsigned long long)r.last_ms);
+        if (m > 0) off += (size_t)m;
+        found++;
+    }
+    if (off < cap) out[off] = 0;
+    return found;
+}
+
 // Honor a RELEASE_MEM / EVENT_WRITE_EOP completion write. data_sel (Kyty GraphicsCbReleaseMem allows {2,3};
 // shadPS4 DataSelect enum): 1=write 32-bit value, 2=write 64-bit value, 3=write 64-bit GPU clock. The write
 // uses memcpy so an only-4-byte-aligned 64-bit label is handled portably. CONFIDENCE: HIGH — address,
@@ -695,8 +768,10 @@ static void honor_eop_write(const Pm4Command& c) {
                   uint64_t v = c.rel_value;           memcpy(dst, &v, sizeof v);
                   ring_record(c.rel_addr, v, 8, 1, pkt_addr(c));
                   poolshift_check("REL2", c.rel_addr, 8, c.rel_value, pkt_addr(c)); break; }
-        case 3: { uint64_t v = gpu_clock64();         memcpy(dst, &v, sizeof v);
-                  ring_record(c.rel_addr, v, 8, 1, pkt_addr(c)); break; }
+        case 3: { uint64_t pre = 0; memcpy(&pre, dst, sizeof pre);   // #1226 provenance pre-read
+                  uint64_t v = gpu_clock64();         memcpy(dst, &v, sizeof v);
+                  ring_record(c.rel_addr, v, 8, 1, pkt_addr(c));
+                  clockfence_record(c.rel_addr, pre, v, pkt_addr(c), 1); break; }
         // Unknown selector: LOG AND SKIP. The old default wrote the 64-bit value for ANY
         // unrecognized data_sel — a band-aid for the swap-stub stack-arg mis-extraction that made
         // data_sel arrive as a pointer (fixed in exec_image_linux.cpp emit_swap_stub: handlers now
@@ -733,10 +808,12 @@ static void honor_event_write(const Pm4Command& c) {
                     (unsigned long long)c.event_addr);
         return;
     }
+    uint64_t pre = 0; memcpy(&pre, (void*)(uintptr_t)c.event_addr, sizeof pre);   // #1226 provenance
     uint64_t v = gpu_clock64();
     memcpy((void*)(uintptr_t)c.event_addr, &v, sizeof v);
     notify_guest_gpu_write(c.event_addr, sizeof v);
     ring_record(c.event_addr, v, 8, 2, pkt_addr(c));
+    clockfence_record(c.event_addr, pre, v, pkt_addr(c), 2);
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc]   EventWrite [0x%llx] event_type=%u -> clock 0x%llx\n",
                 (unsigned long long)c.event_addr, c.event_type, (unsigned long long)v);

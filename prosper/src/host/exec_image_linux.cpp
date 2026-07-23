@@ -755,6 +755,10 @@ namespace {
     // the host exec image without the gpu lib get a null and skip the scan.
     extern "C" int prosper_gpu_write_ring_scan(uint64_t lo, uint64_t hi, char* out, size_t cap)
         __attribute__((weak));
+    // #1226: persistent clock-fence provenance scanner (same TU as the ring). Unlike the ring, its
+    // records never age out, so a stomp seconds before the fault is still attributable.
+    extern "C" int prosper_gpu_clockfence_scan(uint64_t lo, uint64_t hi, char* out, size_t cap)
+        __attribute__((weak));
 
     // Issue-#312 heap-corruption attribution dump, fired on the first PROSPER_NULL_PAGE hit (the
     // deterministic precursor of DOLL's MallocBinned3 "Canary was 0x3" fatal: a read of address
@@ -1990,6 +1994,26 @@ namespace {
                                 syscall(SYS_write, 2, hb, (size_t)hn);
                                 syscall(SYS_write, 2, ring, strlen(ring));
                             }
+                        }
+                    }
+                    // #1226: cross-reference the same pages against the PERSISTENT clock-fence
+                    // table (RELEASE_MEM data_sel==3 / EVENT_WRITE timestamps). The ring wraps in
+                    // well under a second on a busy title, so "no ring hit" says nothing about a
+                    // stomp seconds earlier; this table retains the last clock write per address
+                    // for the whole run. A zero-hit result is itself evidence (the corrupted field
+                    // was NEVER a clock-fence target), so report both outcomes.
+                    if (prosper_gpu_clockfence_scan) {
+                        static char cfb[8192];
+                        const uint64_t probes[2] = { g_rdx, g_rax };
+                        for (uint64_t probe : probes) {
+                            uint64_t pg = probe & ~0xfffull;
+                            if (pg < 0x1000) continue;
+                            int fn2 = prosper_gpu_clockfence_scan(pg, pg + 0x1000, cfb, sizeof cfb);
+                            char hb[112]; int hn = snprintf(hb, sizeof hb,
+                                "[faultobj] clock-fence targets in page 0x%llx: %d\n",
+                                (unsigned long long)pg, fn2);
+                            syscall(SYS_write, 2, hb, (size_t)hn);
+                            if (fn2 > 0) syscall(SYS_write, 2, cfb, strlen(cfb));
                         }
                     }
                 }
