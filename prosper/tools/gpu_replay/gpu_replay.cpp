@@ -1340,6 +1340,30 @@ int main(int argc, char** argv) {
             }
         }
     }
+    // Fragment I/O tap (PROSPER_FS_TAP=draw:pc): re-recompile draw N's raw FS (recompile_fragment reads the
+    // pc after the ':' and redirects its MRT0 colour export to the intermediate value at that PC) and swap it
+    // in, so that draw's rendered pixels visualise the tapped value. Requires a v19+ capsule with the raw FS.
+    if (const char* f = std::getenv("PROSPER_FS_TAP")) {
+        const long n = std::strtol(f, nullptr, 10);   // draw index (text before the ':')
+        if (n >= 0 && static_cast<size_t>(n) < replay.items.size()) {
+            auto& it = replay.items[static_cast<size_t>(n)];
+            if (it.fs_raw_shader_index < replay.raw_shader_versions.size()) {
+                const auto& raw = replay.raw_shader_versions[it.fs_raw_shader_index];
+                auto fs = prosper::gpu::recompile_fragment(raw.words.data(), raw.words.size(),
+                                                           it.prt.get(), nullptr, UINT32_MAX, nullptr);
+                if (!fs.empty()) {
+                    it.fs = std::move(fs); it.fs_shared.reset(); it.fs_identity = 0;
+                    std::fprintf(stderr, "[fs-tap] draw %ld FS re-recompiled with colour tap (%zu words)\n",
+                                 n, it.fs.size());
+                } else {
+                    std::fprintf(stderr, "[fs-tap] draw %ld: FS re-recompile produced no output "
+                                         "(no raw stream / unsupported)\n", n);
+                }
+            } else {
+                std::fprintf(stderr, "[fs-tap] draw %ld: no captured raw FS stream (capsule predates v19)\n", n);
+            }
+        }
+    }
     prosper::gpu::GpuCaptureFile prepend_capture;
     prosper::gpu::GpuReplayFrame prepend;
     if (!prepend_path.empty() &&

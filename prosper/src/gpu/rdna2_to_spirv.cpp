@@ -1534,7 +1534,11 @@ struct SpirvCompute {
     // Write a vec4(r,g,b,a) (bit-operands) to the matching fragment color output.
     void export_color(uint32_t mrt, uint32_t r, uint32_t g, uint32_t bl, uint32_t a) {
         if (mrt >= v_color.size() || !v_color[mrt]) return;
-        uint32_t v = id(); putv(code, Op_CompositeConstruct, {t_v4f, v, bcf(r), bcf(g), bcf(bl), bcf(a)});
+        // Fragment I/O tap (PROSPER_FS_TAP): if an intermediate was snapshotted at the tapped PC, store THAT
+        // as the MRT0 colour instead of the shader's real colour, so the rendered frame visualises the value.
+        uint32_t v;
+        if (tap_vec && mrt == 0) { v = tap_vec; }
+        else { v = id(); putv(code, Op_CompositeConstruct, {t_v4f, v, bcf(r), bcf(g), bcf(bl), bcf(a)}); }
         put(code, Op_Store, {v_color[mrt], v});
     }
     // Fragment depth export (EXP target 8 = MRTZ) — a lazily declared BuiltIn FragDepth output.
@@ -8647,6 +8651,14 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
     if (!derived_interpolation.valid) return {};
     SpirvCompute b;
     b.begin_fragment(rt, color_mask);
+    // Fragment I/O value tap (PROSPER_FS_TAP=draw:pc): redirect the MRT0 colour export to the intermediate
+    // VGPR produced at that PC so the rendered frame visualises the value. The `draw:` prefix is consumed by
+    // gpu_replay (which re-recompiles only that draw's FS); here we take the PC after the ':' (or the whole
+    // value if there is no ':').
+    if (const char* tap = getenv("PROSPER_FS_TAP")) {
+        const char* pc = strchr(tap, ':');
+        b.tap_pc = static_cast<uint32_t>(strtoul(pc ? pc + 1 : tap, nullptr, 0));
+    }
     b.declare_guest_scratch(scratch);
     b.fragment_interpolation = &derived_interpolation;
     // P0-only attributes retain the cheap Flat varying path. Mixed smooth/explicit-parameter reads
