@@ -3,6 +3,7 @@
 #include "../src/gpu/shader_resources.hpp"
 #include "../src/gpu/tile.hpp"
 #include "live_compute.hpp"
+#include "seed_reprove.hpp"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +21,37 @@ static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { std::printf("FAIL: %s\n", msg); fails++; } } while (0)
 
 int main() {
+    // #1127: the seed-skip re-prove counter (seed_reprove.hpp). interval 0 disables (old prove-once);
+    // interval N fires on the Nth fast-skip and resets, so a Full-cached data-dependent shader is
+    // re-proven within N fast-skips instead of trusting a stale "covers every texel" verdict forever.
+    {
+        using prosper::frontend::seed_reprove_due;
+        uint32_t s = 0;
+        CHECK(!seed_reprove_due(s, 0) && !seed_reprove_due(s, 0) && s == 0,
+              "interval 0 never re-proves and leaves the counter untouched (prove-once)");
+        s = 0;
+        bool a = seed_reprove_due(s, 3), b = seed_reprove_due(s, 3), c = seed_reprove_due(s, 3);
+        CHECK(!a && !b && c && s == 0, "interval 3 fires on the 3rd fast-skip and resets the counter");
+        CHECK(!seed_reprove_due(s, 3) && !seed_reprove_due(s, 3) && seed_reprove_due(s, 3),
+              "the re-prove cycle repeats after a reset");
+        s = 0;
+        CHECK(seed_reprove_due(s, 1) && seed_reprove_due(s, 1),
+              "interval 1 re-proves every fast-skip (maximum soundness)");
+
+        // #1127: the interval env-parse must fail SAFE -- garbage/overflow keeps the default rather
+        // than silently disabling the safety (which an atol-style parse would, returning 0 = off).
+        using prosper::frontend::seed_reprove_interval_from_env;
+        CHECK(seed_reprove_interval_from_env(nullptr, 256) == 256, "unset env -> default");
+        CHECK(seed_reprove_interval_from_env("", 256) == 256, "empty env -> default");
+        CHECK(seed_reprove_interval_from_env("foo", 256) == 256, "non-numeric env -> default (fail-safe, not 0)");
+        CHECK(seed_reprove_interval_from_env("256x", 256) == 256, "trailing junk -> default");
+        CHECK(seed_reprove_interval_from_env("-4", 256) == 256, "negative -> default");
+        CHECK(seed_reprove_interval_from_env("4294967296", 256) == 256, "overflow (2^32) -> default, not truncated to 0");
+        CHECK(seed_reprove_interval_from_env("0", 256) == 0, "explicit 0 honored (intentionally disables re-proving)");
+        CHECK(seed_reprove_interval_from_env("64", 256) == 64, "exact in-range value overrides default");
+        CHECK(seed_reprove_interval_from_env("4294967295", 256) == 4294967295u, "max uint32 accepted");
+    }
+
     // MinGW's lround dominates full-HD storage-image writeback. Prove the bounded integer path is
     // identical to the previous conversion across all half-float values, every UNORM threshold and
     // adjacent float, plus a deterministic million-value float32 sample.
