@@ -2107,7 +2107,7 @@ namespace {
                                     "[faultobj] APR dests overlapping page 0x%llx: %d\n",
                                     (unsigned long long)pg, an);
                                 syscall(SYS_write, 2, h4, (size_t)h4n);
-                                if (an > 0) syscall(SYS_write, 2, ab, strlen(ab));
+                                syscall(SYS_write, 2, ab, strlen(ab));   // unconditional: the stores/evictions header IS the zero-case confidence signal
                             }
                         }
                         const uint64_t cands[3] = { g_rax, g_rcx, rdx_val2 };
@@ -2132,7 +2132,7 @@ namespace {
                                     "[faultobj] APR dests overlapping real-ptr page 0x%llx: %d\n",
                                     (unsigned long long)rp, arn);
                                 syscall(SYS_write, 2, h5, (size_t)h5n);
-                                if (arn > 0) syscall(SYS_write, 2, ar, strlen(ar));
+                                syscall(SYS_write, 2, ar, strlen(ar));   // unconditional (see above)
                             }
                             uint64_t pg = real & ~0xfffull;
                             if (prosper_gpu_write_ring_scan) {
