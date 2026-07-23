@@ -776,6 +776,11 @@ if(TARGET prosper_core)
     target_link_libraries(test_agc_dcb PRIVATE prosper_core)
     add_test(NAME agc_dcb_pm4 COMMAND test_agc_dcb)
 
+    # #1143: each sceAgc*GetSize must equal its builder's emitted dword count — drift guard.
+    add_executable(test_agc_getsize tests/test_agc_getsize.cpp)
+    target_link_libraries(test_agc_getsize PRIVATE prosper_core)
+    add_test(NAME agc_getsize_drift COMMAND test_agc_getsize)
+
     # libSceVideoOut: query/config functions return real 1080p60 values + swapchain-scaffolding
     # display-buffer registry records the game's registered framebuffers.
     add_executable(test_videoout tests/test_videoout.cpp)
