@@ -2337,11 +2337,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     const VkFormat format0 = active_format(items[pass_i], false);
                     const VkFormat format1 = base1
                         ? active_format(items[pass_i], true) : VK_FORMAT_UNDEFINED;
+                    // A MODE=RESOLVE draw shares color0_base with the scene it resolves and reports
+                    // active_color1()==0 (it exports nothing), so without keying the group on cb_resolve
+                    // it could merge with the scene draws; the resolve-copy `continue` below would then
+                    // silently drop any ordinary draws grouped after it. Key on it so a resolve is always
+                    // its own pass.
+                    const bool resolve0 = items[pass_i].ps.cb_resolve;
                     std::vector<const prosper::gpu::DrawItem*> pass;
                     while (pass_i < items.size() && items[pass_i].color0_base == base &&
                            active_color1(items[pass_i]) == base1 &&
                            active_format(items[pass_i], false) == format0 &&
-                           (!base1 || active_format(items[pass_i], true) == format1)) {
+                           (!base1 || active_format(items[pass_i], true) == format1) &&
+                           items[pass_i].ps.cb_resolve == resolve0) {
                         pass.push_back(&items[pass_i]); ++pass_i;
                     }
 
@@ -2357,11 +2364,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const uint64_t rdst = pass.front()->color1_base;
                         auto src_it = rsrc ? g_rtt.find(rsrc) : g_rtt.end();
                         if (rsrc && rdst && src_it != g_rtt.end() && src_it->second.rgba) {
-                            g_rtt[rdst] = src_it->second;   // shares pixels; dest inherits src content
+                            // Copy the source RttSurf out before the g_rtt[rdst] insert: operator[] may
+                            // rehash and invalidate src_it before the assignment reads it.
+                            RttSurf resolved = src_it->second;   // shares pixels (shared_ptr), no deep copy
+                            const uint32_t rw = resolved.w, rh = resolved.h;
+                            g_rtt[rdst] = std::move(resolved);    // dest inherits src content/extent/format
                             if (getenv("PROSPER_MSAA_LOG"))
                                 fprintf(stderr, "[msaa] resolve copy 0x%llx -> 0x%llx (%ux%u)\n",
-                                        (unsigned long long)rsrc, (unsigned long long)rdst,
-                                        src_it->second.w, src_it->second.h);
+                                        (unsigned long long)rsrc, (unsigned long long)rdst, rw, rh);
                         } else if (getenv("PROSPER_MSAA_LOG")) {
                             fprintf(stderr, "[msaa] resolve SKIP src=0x%llx dst=0x%llx (%s)\n",
                                     (unsigned long long)rsrc, (unsigned long long)rdst,
