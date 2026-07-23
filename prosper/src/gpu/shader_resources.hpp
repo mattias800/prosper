@@ -124,6 +124,14 @@ struct ShaderResource {
     //     resurrected through an older metadata resource. 0xFFFFFFFF = unset.
     uint32_t      fetch_pc      = 0xFFFFFFFFu;
 
+    // FLAT-window (#1171) provenance: for a general flat_load whose 64-bit source pointer lives in the
+    // consecutive user SGPRs s[flat_base_sgpr : +1], the executor binds the containing guest allocation
+    // as this SSBO (keyed by the load's fetch_pc) and the emitter lowers the load to an indexed read at
+    // (address - base). Kept SEPARATE from sgpr_base so the direct-descriptor SGPR routing does not
+    // divert the base pointer into sreg_input; the emitter reads it straight from the push constants.
+    // 0xFFFFFFFF = not a flat window.
+    uint32_t      flat_base_sgpr = 0xFFFFFFFFu;
+
     // Texture-only (cls == Texture). img_dim mirrors the MIMG dim field (1D=0, 2D=1, 3D=2, ...).
     // width/height/depth are the complete base-level extent (depth is >1 for 3D only), used by image
     // queries, uploads, and image_load/texelFetch. sampler_sgpr_base = the paired sampler's S# base SGPR (SSAMP); with a Vulkan

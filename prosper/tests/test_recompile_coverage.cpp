@@ -91,6 +91,34 @@ int main() {
     CHECK(fls.any && !fls.all_resolved && fls.loads.size() == 1 && fls.loads[0].base_sgpr < 0,
           "analyze_flat_loads rejects a non-consecutive base SGPR pair (s12 low / s15 high)");
 
+    // FLAT-window emit (#1171 piece 2): with a ConstantBuffer resource keyed by the flat_load's pc plus
+    // flat_base_sgpr, recompile_compute LOWERS the general flat_load to a windowed SSBO read; without
+    // the bound window it stays fail-visible (empty module).
+    const uint32_t flat_kernel[] = {
+        0xd70f6a01u, 0x00020c0cu,   // v_add_co_u32    v1, vcc, s12, v6
+        0x50041af9u, 0x86860680u,   // v_add_co_ci_u32 v2 (sdwa), s13
+        0xdc200000u, 0x007d0001u,   // flat_load_ubyte v0, v[1:2]
+        0xBF810000u,                // s_endpgm
+    };
+    const size_t nfk = sizeof(flat_kernel)/sizeof(flat_kernel[0]);
+    ComputeShaderConfig fcfg;
+    fcfg.user_sgprs.assign(16, 0);   // 16 user SGPRs; s12/s13 hold the (per-dispatch) base pointer
+    CHECK(recompile_compute(flat_kernel, nfk, nullptr, fcfg).empty(),
+          "general flat_load with no bound window still rejects the shader (fail-visible)");
+    FlatLoadAnalysis fka = analyze_flat_loads(flat_kernel, nfk, 16);
+    ShaderResourceTable frt;
+    ShaderResource fwin;
+    fwin.cls = ResourceClass::ConstantBuffer;
+    fwin.binding = 4;
+    fwin.gpu_addr = 0x1000000000ull;
+    fwin.size = 4096;
+    fwin.fetch_pc = fka.loads[0].load_pc;
+    fwin.flat_base_sgpr = static_cast<uint32_t>(fka.loads[0].base_sgpr);   // s12
+    frt.resources.push_back(fwin);
+    std::vector<uint32_t> fk_spv = recompile_compute(flat_kernel, nfk, &frt, fcfg);
+    CHECK(!fk_spv.empty() && fk_spv[0] == 0x07230203u,
+          "general flat_load lowers to a valid SSBO-read module when its window is bound");
+
     // tbuffer_load_format_x v0, v0, s[8:11], 0 format:32_FLOAT ; s_endpgm.
     // MTBUF needs a resolved V# binding, so the table-less coverage pass must classify it as
     // recompilable-in-context rather than truly unsupported.

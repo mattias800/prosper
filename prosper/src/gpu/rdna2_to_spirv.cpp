@@ -5205,6 +5205,61 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         }
         case Rdna2Format::FLAT: {
             const FlatAccessInfo access = flat_access_info(in.opcode);
+            // General (non-scratch) FLAT LOAD from a raw 64-bit guest address (#1171). If the executor
+            // resolved this load's base pointer to user SGPRs s[flat_base_sgpr : +1] and bound the
+            // containing guest allocation as an SSBO (a ConstantBuffer-class resource keyed by this
+            // load's pc), lower it to an indexed read of that window at byte offset (address_lo -
+            // base_lo). base_lo is the ORIGINAL push-constant value (the address the executor bound the
+            // window at), so the module stays dispatch-independent and correct even if the shader later
+            // reuses the base SGPR. Unresolved forms fall through to the scratch/reject path below.
+            const ShaderResource* fw =
+                (rt && access.valid && !access.store && !in.flat_lds &&
+                 in.src[0].kind == OperandKind::VGPR &&
+                 in.src[1].kind == OperandKind::Special && in.src[1].value == 125)
+                    ? rt->by_fetch_pc(in.pc) : nullptr;
+            if (fw && fw->flat_base_sgpr != 0xFFFFFFFFu) {
+                const uint32_t addr_lo = val(in.src[0]);                     // low dword of the address
+                const uint32_t base_lo = b.load_push_constant(fw->flat_base_sgpr);
+                // Byte offset in the window: (address - base) mod 2^32, which equals the true offset for
+                // any 0 <= offset < window <= 256 MiB (the low-dword subtraction wraps complementarily to
+                // the address's own IAdd). A negative offset (address < base) becomes a huge unsigned index
+                // -> out-of-window -> robustBufferAccess returns 0 (defined, but a loose-bounds divergence
+                // from HW; decode kernels use non-negative offsets).
+                const uint32_t byte0 = b.ibin(Op_ISub, addr_lo, base_lo);
+                for (uint32_t c = 0; c < access.components; ++c) {
+                    const uint32_t addr = access.bits == 32
+                        ? b.ibin(Op_IAdd, byte0, b.uconst(c * 4)) : byte0;
+                    const uint32_t idx = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
+                    uint32_t value;
+                    if (access.bits == 32) {
+                        value = b.cbuf_load(idx, fw->binding);
+                    } else {
+                        // Sub-dword (ubyte/ushort) extract, mirroring the MUBUF raw path: a 16-bit
+                        // access may begin at byte 3 and straddle two dwords, so join the adjacent words.
+                        const uint32_t dw0 = b.cbuf_load(idx, fw->binding);
+                        const uint32_t byte_in_dw = b.ibin(Op_BitwiseAnd, addr, b.uconst(3));
+                        const uint32_t shift = b.ibin(Op_ShiftLeftLogical, byte_in_dw, b.uconst(3));
+                        uint32_t joined = b.ibin(Op_ShiftRightLogical, dw0, shift);
+                        if (access.bits == 16) {
+                            const uint32_t dw1 =
+                                b.cbuf_load(b.ibin(Op_IAdd, idx, b.uconst(1)), fw->binding);
+                            const uint32_t inv_shift = b.ibin(Op_BitwiseAnd,
+                                b.ibin(Op_ISub, b.uconst(32), shift), b.uconst(31));
+                            const uint32_t upper = b.ibin(Op_ShiftLeftLogical, dw1, inv_shift);
+                            joined = b.ibin(Op_BitwiseOr, joined,
+                                b.sel(b.ucmp(Op_IEqual, shift, b.uconst(0)), b.uconst(0), upper));
+                        }
+                        value = access.sign_extend
+                            ? b.bfe_s(joined, b.uconst(0), b.uconst(access.bits))
+                            : b.bfe_u(joined, b.uconst(0), b.uconst(access.bits));
+                    }
+                    const int reg = in.dst.value + static_cast<int>(c);
+                    const uint32_t old_value = vreg_old(b, rs, reg);
+                    rs.vreg[reg] = value;
+                    predicate_write(b, rs, reg, old_value);
+                }
+                return true;
+            }
             // Model the compiler's private spill area only. Each generated shader invocation owns
             // one Function-storage array, so the entry-provided hardware base has no host-visible
             // address to preserve. Other FLAT/GLOBAL forms remain deliberately unsupported.
