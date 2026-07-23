@@ -14,6 +14,7 @@
 #include <cerrno>
 #include <climits>
 #include <string>
+#include <optional>      // #1205: sandbox_normalize_subpath escape check
 #include <mutex>
 #include <atomic>        // sceKernelAio* submit-id/state table
 #include <map>
@@ -466,6 +467,29 @@ namespace {
             if (guest.find(sub) != std::string::npos) return true;
         return false;
     }
+    // Lexically normalize a virtual sub-path (the part AFTER a /app0|/temp0|/savedata0 root),
+    // treating both '/' and '\\' as separators. Collapses "." and applies ".." within the sub-path.
+    // Returns the normalized sub-path (leading '/', e.g. "/a/../b" -> "/b", "" for the root itself) if
+    // it stays AT OR BELOW the root, or std::nullopt if a ".." climbs above it (a sandbox escape).
+    // Purely lexical — no filesystem access. Only invoked when the sub-path contains "..", so a normal
+    // path never reaches it and is composed byte-for-byte as before. CONFIDENCE: HIGH (pure string op).
+    std::optional<std::string> sandbox_normalize_subpath(const std::string& sub) {
+        std::vector<std::string> stack;
+        size_t i = 0;
+        auto is_sep = [](char c) { return c == '/' || c == '\\'; };
+        while (i < sub.size()) {
+            while (i < sub.size() && is_sep(sub[i])) i++;
+            size_t j = i; while (j < sub.size() && !is_sep(sub[j])) j++;
+            std::string comp = sub.substr(i, j - i);
+            i = j;
+            if (comp.empty() || comp == ".") continue;
+            if (comp == "..") { if (stack.empty()) return std::nullopt; stack.pop_back(); continue; }
+            stack.push_back(comp);
+        }
+        std::string out;
+        for (const auto& c : stack) { out += '/'; out += c; }
+        return out;
+    }
     std::string translate(const char* guest) {
         if (!guest) return {};
         std::string p = guest;
@@ -474,14 +498,32 @@ namespace {
             if (filelog()) fprintf(stderr, "[file] DENIED (PROSPER_DENY_SUBSTR) '%s'\n", guest);
             return "/prosper-denied" + p;
         }
-        // Map /app0[/...] -> <root>[/...], /temp0[/...] -> scratch dir,
-        // /savedata0[/...] -> the currently mounted save dir; other paths as-is.
+        // Map /app0[/...] -> <root>[/...], /temp0[/...] -> scratch dir, /savedata0[/...] -> the mounted
+        // save dir; other paths as-is. Guest paths are the game's own and normally contain no ".." —
+        // but a path that climbs above its virtual root (e.g. "/savedata0/../x") would otherwise compose
+        // a host path OUTSIDE the sandbox. Only when a ".." is present do we lexically normalize the
+        // sub-path and reject an escape (#1205); normal paths are byte-identical to before, and a benign
+        // in-sandbox ".." resolves to the same host file it would have anyway.
         std::string save0;
         if (p.rfind("/savedata0", 0) == 0) { std::lock_guard<std::mutex> lk(g_save0_mx); save0 = g_save0; }
-        std::string h = (p.rfind("/app0", 0) == 0)       ? g_app0 + p.substr(5)
-                      : (p.rfind("/temp0", 0) == 0)      ? temp0_root() + p.substr(6)
-                      : !save0.empty()                   ? save0 + p.substr(10)
-                      : p;
+        std::string root; size_t vlen = 0;
+        if      (p.rfind("/app0", 0) == 0)  { root = g_app0;       vlen = 5;  }
+        else if (p.rfind("/temp0", 0) == 0) { root = temp0_root(); vlen = 6;  }
+        else if (!save0.empty())            { root = save0;        vlen = 10; }
+        else {
+            if (filelog()) fprintf(stderr, "[file] open '%s' -> '%s'\n", guest, p.c_str());
+            return p;
+        }
+        std::string sub = p.substr(vlen);
+        if (sub.find("..") != std::string::npos) {
+            std::optional<std::string> norm = sandbox_normalize_subpath(sub);
+            if (!norm) {
+                if (filelog()) fprintf(stderr, "[file] DENIED (sandbox traversal) '%s'\n", guest);
+                return "/prosper-denied" + p;
+            }
+            sub = *norm;
+        }
+        std::string h = root + sub;
         if (filelog()) fprintf(stderr, "[file] open '%s' -> '%s'\n", guest, h.c_str());
         return h;
     }

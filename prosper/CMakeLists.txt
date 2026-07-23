@@ -395,6 +395,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_savedata_dirname PRIVATE prosper_core)
   add_test(NAME savedata_dirname_guard COMMAND test_savedata_dirname)
 
+  add_executable(test_translate_sandbox tests/test_translate_sandbox.cpp)
+  target_link_libraries(test_translate_sandbox PRIVATE prosper_core)
+  add_test(NAME translate_sandbox_guard COMMAND test_translate_sandbox)
+
   add_executable(test_service_logging tests/test_service_logging.cpp)
   target_link_libraries(test_service_logging PRIVATE prosper_core)
   add_test(NAME service_logging_unmapped_args COMMAND test_service_logging)
