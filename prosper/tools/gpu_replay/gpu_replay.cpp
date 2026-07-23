@@ -316,8 +316,28 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
     }
     for (size_t i = 0; i < replay.items.size(); ++i) {
         const auto& d = replay.items[i];
+        // #1256: raw-vs-realized draw-count check. The capture retains the raw DrawIndexAuto/DrawIndex
+        // index_count (raw_draw_count) decoded from the guest; for a non-indexed draw the realized
+        // vertex_count MUST equal it, and for an indexed draw the fetched index count must equal it.
+        // A divergence is a decode/realization bug (e.g. GTA #1163's shared-pool vertex-count inflation),
+        // visible here offline without a live boot. raw_draw_count==0 && !raw_indexed = pre-v23 capture.
+        char rawtag[80];
+        if (d.raw_draw_count == 0 && !d.raw_indexed) {
+            std::snprintf(rawtag, sizeof rawtag, " raw=?");
+        } else if (d.raw_indexed) {
+            std::snprintf(rawtag, sizeof rawtag, " raw=%u(idx)%s", d.raw_draw_count,
+                          d.indices.size() == d.raw_draw_count ? "" : " [INDEX-COUNT-MISMATCH]");
+        } else {
+            // A PS5 RectList draw legitimately realizes ONE extra procedural vertex (3 -> 4, the
+            // rectangle's synthesized fourth corner; see realize_draw_item's rect_list expansion), so
+            // vertex_count == raw+1 is benign and must not flag. After #1163 that +1 is the only correct
+            // realized>raw case; any larger excess is a real over-draw (the #1163 pool inflation was ~170x).
+            std::snprintf(rawtag, sizeof rawtag, " raw=%u%s", d.raw_draw_count,
+                          d.vertex_count > d.raw_draw_count + 1 ? " [INFLATED]"
+                          : d.vertex_count < d.raw_draw_count   ? " [DIVERGENT]" : "");
+        }
         std::printf("draw[%zu] source=%llu target=%016llx extent=%ux%u fmt=%u cwm=%x "
-                    "target1=%016llx extent1=%ux%u fmt1=%u cwm1=%x vcount=%u indices=%zu topo=%u "
+                    "target1=%016llx extent1=%ux%u fmt1=%u cwm1=%x vcount=%u indices=%zu topo=%u%s "
                     "depth=%d/%d/%u stencil=%d blend=%d raster=%u/%u/%u viewport=%d %.1f,%.1f %.1fx%.1f "
                     "scissor=%d [%d,%d)-[%d,%d) "
                     "vs=%zu/%016llx fs=%zu/%016llx\n",
@@ -326,7 +346,7 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                     d.ps.color0_format, d.ps.color_write_mask,
                     static_cast<unsigned long long>(d.color1_base), d.color1_width, d.color1_height,
                     d.ps.color1_format, d.ps.color1_write_mask, d.vertex_count, d.indices.size(),
-                    d.ps.topology, d.ps.depth_test_enable,
+                    d.ps.topology, rawtag, d.ps.depth_test_enable,
                     d.ps.depth_write_enable, d.ps.depth_compare_op, d.ps.stencil_enable, d.ps.blend_enable,
                     d.ps.cull_mode, d.ps.front_face, d.ps.polygon_mode,
                     d.ps.has_viewport, d.ps.viewport_x, d.ps.viewport_y, d.ps.viewport_w, d.ps.viewport_h,

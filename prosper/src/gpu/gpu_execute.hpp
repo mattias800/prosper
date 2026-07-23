@@ -64,6 +64,12 @@ struct DrawItem {
     std::shared_ptr<ShaderResourceTable> vrt, prt;    // may be null
     uint32_t vertex_count = 3;
     uint32_t instance_count = 1;
+    // #1256: the RAW draw-packet state recorded BEFORE realization — the DrawIndexAuto/DrawIndex
+    // index_count (vcount_hint) and whether the draw was indexed. For a non-indexed draw the realized
+    // vertex_count must equal raw_draw_count (see resolve_nonindexed_vertex_count / #1163); the capture
+    // persists these so gpu_replay --inspect-only can flag a decode/realization divergence offline.
+    uint32_t raw_draw_count = 0;
+    bool raw_indexed = false;
     // Indexed draw (sceAgcDcbDrawIndex): the guest index buffer, fetched from 1:1-mapped memory and
     // widened to 32-bit. Non-empty -> the backend must render with vkCmdDrawIndexed (gl_VertexIndex
     // then IS the fetched index, which the recompiled VS uses for its storage-buffer vertex fetch);
@@ -1099,6 +1105,9 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     out.vs_guest_addr = rs.es_addr; out.fs_guest_addr = rs.ps_addr;
     out.vs_identity = vs_identity; out.fs_identity = fs_identity; out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;
+    // #1256: record the raw draw-packet state (pre-realization) so a capture can be checked offline for
+    // realization divergence. vcount_hint is the DrawIndexAuto/DrawIndex index_count decoded from the guest.
+    out.raw_draw_count = vcount_hint; out.raw_indexed = (draw && draw->indexed);
     // The draw record is authoritative even in folded mode: register state may change after the
     // last draw, while IT_NUM_INSTANCES belongs to the draw at the moment it executes.
     out.instance_count = draw ? draw->instance_count : ds.num_instances;
