@@ -1,4 +1,5 @@
 #include "live_compute.hpp"
+#include "rtt_scale.hpp"
 #include "seed_reprove.hpp"
 #include "vulkan_device_select.hpp"
 
@@ -1078,20 +1079,49 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     !read_live_render_target(r->gpu_addr, live_target) || !live_target.pixels) {
                     skip_image(r, "renderer-owned RTT has no readable snapshot"); break;
                 }
+                // A dimension mismatch is either (a) an exact integer downscale from PROSPER_RENDER_SCALE
+                // (the renderer rendered this same target at 1/scale; a compute op sampling it at native
+                // res sees e.g. 480x270 cached for a 1920x1080 request), or (b) a genuine view ALIAS at a
+                // reused base (Astro Bot renders 960x540 R11G11B10, then dispatches a 1216x684 R32 Z_X view
+                // at the same base after a dynamic-resolution change — the snapshot is NOT this view).
+                // (a) is the ONLY case that is an equal-on-both-axes integer multiple; upscale the cached
+                // snapshot (nearest) and keep it renderer-owned so a compute composite reads the real
+                // (scaled) scene instead of the zero guest backing. (b) still falls back to guest backing.
                 if (live_target.width != r->width || live_target.height != r->height) {
-                    // Address-only ownership is insufficient when the guest reuses or aliases an
-                    // allocation with another image view. Astro Bot renders a 960x540 R11G11B10
-                    // target at a base, then dispatches a 1216x684 R32 Z_X view at the same base
-                    // after changing dynamic resolution. That stale cache entry does not own the
-                    // new view; import its ordinary guest backing and let successful writeback
-                    // invalidate the overlapping renderer entry.
-                    renderer_owned = false;
-                    if (trace)
-                        std::fprintf(stderr,
-                                     "[compute]   renderer RTT view miss binding=%u addr=0x%llx "
-                                     "cached=%ux%u requested=%ux%u -> guest backing\n",
-                                     bi.binding, (unsigned long long)r->gpu_addr,
-                                     live_target.width, live_target.height, r->width, r->height);
+                    const uint32_t k = prosper::frontend::rtt_integer_upscale_factor(
+                        r->width, r->height, live_target.width, live_target.height);
+                    const uint64_t bpp = live_target.format == LiveTargetPixelFormat::Rgba16Float ? 8u : 4u;
+                    if (k && live_target.pixels &&
+                        live_target.pixels->size() == (uint64_t)live_target.width * live_target.height * bpp) {
+                        const uint32_t sw = live_target.width, sh = live_target.height;
+                        auto up = std::make_shared<std::vector<uint8_t>>(
+                            (size_t)r->width * r->height * (size_t)bpp);
+                        const uint8_t* src = live_target.pixels->data();
+                        uint8_t* dst = up->data();
+                        for (uint32_t y = 0; y < r->height; y++) {
+                            const uint32_t sy = y / k;
+                            for (uint32_t x = 0; x < r->width; x++) {
+                                std::memcpy(dst + ((size_t)y * r->width + x) * bpp,
+                                            src + ((size_t)sy * sw + x / k) * bpp, bpp);
+                            }
+                        }
+                        live_target.pixels = up;
+                        live_target.width = r->width; live_target.height = r->height;
+                        if (trace)
+                            std::fprintf(stderr,
+                                         "[compute]   renderer RTT upscaled binding=%u addr=0x%llx "
+                                         "%ux%u -> %ux%u (RENDER_SCALE x%u)\n",
+                                         bi.binding, (unsigned long long)r->gpu_addr, sw, sh,
+                                         r->width, r->height, k);
+                    } else {
+                        renderer_owned = false;
+                        if (trace)
+                            std::fprintf(stderr,
+                                         "[compute]   renderer RTT view miss binding=%u addr=0x%llx "
+                                         "cached=%ux%u requested=%ux%u -> guest backing\n",
+                                         bi.binding, (unsigned long long)r->gpu_addr,
+                                         live_target.width, live_target.height, r->width, r->height);
+                    }
                 }
                 if (renderer_owned) {
                     const uint64_t bpp = live_target.format == LiveTargetPixelFormat::Rgba16Float ? 8u : 4u;
