@@ -368,14 +368,23 @@ static void poolshift_check(const char* kind, uint64_t dst, uint64_t bytes, uint
     // 0x20015f00 pool pointer — so it stays as diagnostic-only instrumentation for the next session.
     static const bool on = getenv("PROSPER_POOLSHIFT") != nullptr;
     if (!on) return;
-    static std::atomic<int> n{0};
-    if (n.load(std::memory_order_relaxed) >= 128) return;
-    if (is_byteshift_poolptr(payload) || is_poolinfo_ptr(payload)) {
-        if (n.fetch_add(1) < 128)
+    // #1252 review: PAYLOAD and STOMP get SEPARATE caps — with the widened windows, a shared cap
+    // let ordinary address-source DMA payloads (full arena VAs now match is_poolinfo_ptr) burn the
+    // budget and silence the stomp scan, the exact silent-false-negative this tripwire hunts.
+    // The payload flag also requires the same mapped-target proof as the scan (byteshift form) and
+    // skips DMA (whose `payload` is a SOURCE ADDRESS, legitimately arena-valued, not written data).
+    static std::atomic<int> n_payload{0};
+    static std::atomic<int> n{0};   // STOMP-scan reports only
+    const bool payload_suspicious =
+        (is_byteshift_poolptr(payload) && guest_readable(payload << 8, 8)) ||
+        (is_poolinfo_ptr(payload) && kind[0] != 'D');
+    if (payload_suspicious) {
+        if (n_payload.fetch_add(1) < 128)
             fprintf(stderr, "[agc] POOLSHIFT-PAYLOAD kind=%s dst=0x%llx bytes=%llu payload=0x%llx pkt=eboot+0x%llx t=%llums\n",
                     kind, (unsigned long long)dst, (unsigned long long)bytes,
                     (unsigned long long)payload, (unsigned long long)pkt, (unsigned long long)now_ms());
     }
+    if (n.load(std::memory_order_relaxed) >= 128) return;
     if (bytes > 256) return;                    // cap the scan (label/pointer writes are small)
     uint64_t lo = (dst >= 8 ? dst - 8 : dst) & ~7ull;
     uint64_t hi = dst + bytes + 8;
@@ -388,9 +397,9 @@ static void poolshift_check(const char* kind, uint64_t dst, uint64_t bytes, uint
             // dedup consecutive repeats: one stale value next to a hot per-frame label otherwise
             // saturates the report cap in seconds (measured: 128/128 on one address).
             if (!guest_readable(q << 8, 8)) continue;
-            static uint64_t last_a = 0, last_q = 0;
-            if (a == last_a && q == last_q) continue;
-            last_a = a; last_q = q;
+            static std::atomic<uint64_t> last_a{0}, last_q{0};
+            if (a == last_a.load(std::memory_order_relaxed) && q == last_q.load(std::memory_order_relaxed)) continue;
+            last_a.store(a, std::memory_order_relaxed); last_q.store(q, std::memory_order_relaxed);
             bool inspan = (a + 7 >= dst) && (a < dst + bytes);   // did THIS write touch these bytes?
             if (n.fetch_add(1) < 128)
                 fprintf(stderr, "[agc] POOLSHIFT-STOMP kind=%s @0x%llx=0x%llx (<<8=0x%llx) dst=0x%llx bytes=%llu inspan=%d payload=0x%llx pkt=eboot+0x%llx t=%llums\n",

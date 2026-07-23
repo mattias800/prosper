@@ -2073,6 +2073,9 @@ namespace {
                         // image+0x127e751) or r8 (DOLL, image+0x2316acf); dump around both when
                         // guest-pointer-shaped. Mixed 4-byte compressed entries vs full 8-byte
                         // heads in the NEIGHBORING bins are visible directly in the byte stream.
+                        // #1252 review: print the ABSOLUTE base address of the dump, never a
+                        // relative label — byte-exact forensics must not require the reader to
+                        // reconstruct the base from call-site arithmetic.
                         auto byte_dump = [&](const char* nm, uint64_t center) {
                             if (center < 0x10000) return;
                             uint8_t bytes[0x60];
@@ -2080,8 +2083,9 @@ namespace {
                             struct iovec rb; rb.iov_base = (void*)(uintptr_t)(center - 0x20); rb.iov_len = sizeof bytes;
                             ssize_t got = syscall(SYS_process_vm_readv, getpid(), &lb, 1UL, &rb, 1UL, 0UL);
                             if (got <= 0) return;
-                            char bb[600];
-                            int bn = snprintf(bb, sizeof bb, "[faultobj] bytes @%s-0x20:", nm);
+                            char bb[640];
+                            int bn = snprintf(bb, sizeof bb, "[faultobj] bytes (%s) @0x%llx:", nm,
+                                              (unsigned long long)(center - 0x20));
                             for (ssize_t k = 0; k < got && bn < (int)sizeof bb - 4; k++)
                                 bn += snprintf(bb + bn, sizeof bb - (size_t)bn, "%s%02x",
                                                (k % 8 == 0) ? " " : "", bytes[k]);
@@ -2118,7 +2122,18 @@ namespace {
                             // What actually lives at the reconstructed pointer? A live free block
                             // (next-pointer residue), a pool-info record, or unrelated data —
                             // discriminates "compressed pointer misread" from coincidence.
-                            byte_dump("real", real + 0x20);
+                            byte_dump("real ptr", real + 0x20);
+                            // Was the reconstructed buffer itself ever an APR destination?
+                            if (prosper_apr_dest_scan) {
+                                static char ar[4096];
+                                uint64_t rp = real & ~0xfffull;
+                                int arn = prosper_apr_dest_scan(rp, rp + 0x1000, ar, sizeof ar);
+                                char h5[112]; int h5n = snprintf(h5, sizeof h5,
+                                    "[faultobj] APR dests overlapping real-ptr page 0x%llx: %d\n",
+                                    (unsigned long long)rp, arn);
+                                syscall(SYS_write, 2, h5, (size_t)h5n);
+                                if (arn > 0) syscall(SYS_write, 2, ar, strlen(ar));
+                            }
                             uint64_t pg = real & ~0xfffull;
                             if (prosper_gpu_write_ring_scan) {
                                 static char rs[4096];
