@@ -84,6 +84,32 @@ Renderer-invocation captures record an expected byte count/hash and replay exits
 Timeline-selected captures occur before Vulkan and report `oracle=no`; they render normally but do not invent an
 expected hash. `--allow-mismatch` is for an intentional differential such as `--draw N:M`.
 
+## Cross-title regression gate — `regress.py` (#1258)
+
+`tools/gpu_replay/regress.py` replays a whole **corpus** of `.prgcap` capsules and diffs each one's rendered
+output hash against a committed baseline. It runs in seconds (deterministic offline replay, no live game boot),
+so a shared GPU/executor/recompiler change can be checked against many scenes across many titles **before** the
+~18-minute live-boot snapshot suite — the fast pre-snapshot gate the GTA #1163 fix (#1255) lacked.
+
+```bash
+export PROSPER_GPU_REPLAY=build-linux/gpu_replay
+python3 tools/gpu_replay/regress.py update <corpus-dir>   # record baseline hashes after an INTENDED change
+python3 tools/gpu_replay/regress.py check  <corpus-dir>   # exit 1 if any capsule's hash CHANGED (a regression)
+python3 tools/gpu_replay/regress.py list   <corpus-dir>   # just print each capsule's current hash
+```
+
+The corpus (`.prgcap` files) is **local and gitignored** — capsules are large and carry game imagery, exactly
+like the game dumps. Only the small baseline (`regress-baseline.json`, basename → hash) is meant to be committed
+and shared. `check` fails on a changed hash or a capsule that failed to replay; `new`/`missing` capsules are
+reported informationally (pass `--strict` to also fail when a baselined capsule is missing from the corpus,
+so a locally-deleted capsule can't silently shrink coverage). The child gpu_replay runs with `PROSPER_*`
+scrubbed from its environment, so a diagnostic left in your shell can't perturb a hash into a false regression.
+
+**Scope (important):** a replay hash validates the **translation** path (recompiler, AGC/PM4 decode,
+render-state resolve, executor ordering, detile) — it is the right guard for changes to *that* code. It does
+**not** exercise live GPU residency; a change to `live_gpu_targets`/residency can be hash-identical yet wrong
+(the capture/replay blind spot, #1103). Use it to catch translation regressions fast, not as full coverage.
+
 ## Isolation and extraction
 
 ```bash
