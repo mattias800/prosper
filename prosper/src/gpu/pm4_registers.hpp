@@ -404,6 +404,7 @@ constexpr uint32_t CB_COLOR_CONTROL_MODE_SHIFT = 4;
 constexpr uint32_t CB_COLOR_CONTROL_MODE_MASK  = 0x7;
 constexpr uint32_t CB_COLOR_CONTROL_MODE_DISABLE = 0;
 constexpr uint32_t CB_COLOR_CONTROL_MODE_NORMAL = 1;
+constexpr uint32_t CB_COLOR_CONTROL_MODE_RESOLVE = 3;   // hardware MSAA resolve (color0 MSAA -> color1)
 constexpr uint32_t CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS = 6;
 constexpr uint32_t CB_COLOR_CONTROL_ROP3_SHIFT = 16;
 constexpr uint32_t CB_COLOR_CONTROL_ROP3_MASK  = 0xFF;

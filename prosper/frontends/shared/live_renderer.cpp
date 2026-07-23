@@ -2337,12 +2337,47 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     const VkFormat format0 = active_format(items[pass_i], false);
                     const VkFormat format1 = base1
                         ? active_format(items[pass_i], true) : VK_FORMAT_UNDEFINED;
+                    // A MODE=RESOLVE draw shares color0_base with the scene it resolves and reports
+                    // active_color1()==0 (it exports nothing), so without keying the group on cb_resolve
+                    // it could merge with the scene draws; the resolve-copy `continue` below would then
+                    // silently drop any ordinary draws grouped after it. Key on it so a resolve is always
+                    // its own pass.
+                    const bool resolve0 = items[pass_i].ps.cb_resolve;
                     std::vector<const prosper::gpu::DrawItem*> pass;
                     while (pass_i < items.size() && items[pass_i].color0_base == base &&
                            active_color1(items[pass_i]) == base1 &&
                            active_format(items[pass_i], false) == format0 &&
-                           (!base1 || active_format(items[pass_i], true) == format1)) {
+                           (!base1 || active_format(items[pass_i], true) == format1) &&
+                           items[pass_i].ps.cb_resolve == resolve0) {
                         pass.push_back(&items[pass_i]); ++pass_i;
+                    }
+
+                    // CB_COLOR_CONTROL.MODE=RESOLVE(3): the guest resolves an MSAA color0 surface into a
+                    // single-sample color1 destination (Blue Prince PPSA25009 resolves its 4x-MSAA scene
+                    // this way). prosper renders single-sample, so the resolve is a straight copy of the
+                    // already-rendered color0 surface into color1. Use the RAW color1_base, not
+                    // active_color1(): a fixed-function resolve exports nothing, so its color1_write_mask
+                    // is 0 and active_color1 would report no destination. Without this the resolved surface
+                    // the display later samples never receives the scene and the frame is a uniform fill.
+                    if (!pass.empty() && pass.front()->ps.cb_resolve) {
+                        const uint64_t rsrc = pass.front()->color0_base;
+                        const uint64_t rdst = pass.front()->color1_base;
+                        auto src_it = rsrc ? g_rtt.find(rsrc) : g_rtt.end();
+                        if (rsrc && rdst && src_it != g_rtt.end() && src_it->second.rgba) {
+                            // Copy the source RttSurf out before the g_rtt[rdst] insert: operator[] may
+                            // rehash and invalidate src_it before the assignment reads it.
+                            RttSurf resolved = src_it->second;   // shares pixels (shared_ptr), no deep copy
+                            const uint32_t rw = resolved.w, rh = resolved.h;
+                            g_rtt[rdst] = std::move(resolved);    // dest inherits src content/extent/format
+                            if (getenv("PROSPER_MSAA_LOG"))
+                                fprintf(stderr, "[msaa] resolve copy 0x%llx -> 0x%llx (%ux%u)\n",
+                                        (unsigned long long)rsrc, (unsigned long long)rdst, rw, rh);
+                        } else if (getenv("PROSPER_MSAA_LOG")) {
+                            fprintf(stderr, "[msaa] resolve SKIP src=0x%llx dst=0x%llx (%s)\n",
+                                    (unsigned long long)rsrc, (unsigned long long)rdst,
+                                    !rsrc || !rdst ? "missing base" : "source has no rendered surface");
+                        }
+                        continue;   // resolve is a copy, not an ordinary-draw render
                     }
 
                     // Gen5 render-target extent (#526). Large scene/scanout surfaces retain the

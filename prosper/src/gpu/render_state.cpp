@@ -126,6 +126,27 @@ RenderState extract_render_state(const GpuState& st) {
         rs.color0_height = PM4_FIELD(color_attrib2->second, CB_COLOR0_ATTRIB2, MIP0_HEIGHT) + 1u;
     }
 
+    // Diagnostic (PROSPER_MSAA_LOG): report MSAA sample/fragment programming and the CB color mode so we
+    // can tell whether a title uses MSAA + hardware resolve (CB_COLOR_CONTROL.MODE=3), which prosper renders
+    // single-sample and does not yet resolve. Gated; no default behavior change.
+    if (getenv("PROSPER_MSAA_LOG")) {
+        const uint32_t cattr    = st.cx.count(P::CB_COLOR0_ATTRIB)   ? rd(st.cx, P::CB_COLOR0_ATTRIB)   : 0u;
+        const uint32_t aacfg    = st.cx.count(P::PA_SC_AA_CONFIG)    ? rd(st.cx, P::PA_SC_AA_CONFIG)    : 0u;
+        const uint32_t modecntl = st.cx.count(P::PA_SC_MODE_CNTL_0)  ? rd(st.cx, P::PA_SC_MODE_CNTL_0)  : 0u;
+        const uint32_t ctrl     = st.cx.count(P::CB_COLOR_CONTROL)   ? rd(st.cx, P::CB_COLOR_CONTROL)   : 0u;
+        const uint32_t nsamp  = PM4_FIELD(cattr, CB_COLOR0_ATTRIB, NUM_SAMPLES);
+        const uint32_t aa_ns  = PM4_FIELD(aacfg, PA_SC_AA_CONFIG, MSAA_NUM_SAMPLES);
+        const uint32_t msaaen = PM4_FIELD(modecntl, PA_SC_MODE_CNTL_0, MSAA_ENABLE);
+        const uint32_t cbmode = PM4_FIELD(ctrl, CB_COLOR_CONTROL, MODE);
+        const uint64_t c1base  = addr_of(rd(st.cx, P::CB_COLOR1_BASE), rd(st.cx, P::CB_COLOR1_BASE_EXT));
+        const uint32_t tmask   = st.cx.count(P::CB_TARGET_MASK) ? rd(st.cx, P::CB_TARGET_MASK) : 0xffffffffu;
+        fprintf(stderr, "[msaa] color0=0x%llx fmt=%u %ux%u ATTRIB.NUM_SAMPLES=%u(=%ux) "
+                        "AA.NUM_SAMPLES=%u(=%ux) MSAA_ENABLE=%u CB_MODE=%u color1=0x%llx tgtmask=0x%x\n",
+                (unsigned long long)rs.color0_base, rs.color0_format, rs.color0_width, rs.color0_height,
+                nsamp, 1u << nsamp, aa_ns, 1u << aa_ns, msaaen, cbmode,
+                (unsigned long long)c1base, tmask);
+    }
+
     // CB fast-clear color (CB_COLOR0_CLEAR_WORD0/1). Present only when the game programs a fast-clear
     // for MRT 0; the words carry the clear value in the target's pixel format (decoded in resolve).
     rs.color0_has_clear   = st.cx.count(P::CB_COLOR0_CLEAR_WORD0) || st.cx.count(P::CB_COLOR0_CLEAR_WORD1);
@@ -528,6 +549,10 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
         if (cb_mode == P::CB_COLOR_CONTROL_MODE_DISABLE) {
             ps.color_write_mask = 0;
             ps.color1_write_mask = 0;
+        } else if (cb_mode == P::CB_COLOR_CONTROL_MODE_RESOLVE) {
+            // MSAA resolve: color0 (MSAA source) -> color1 (single-sample dest). The live backend copies
+            // the already-rendered color0 surface into color1 instead of running these as ordinary draws.
+            ps.cb_resolve = true;
         } else if (cb_mode != P::CB_COLOR_CONTROL_MODE_NORMAL &&
                    cb_mode != P::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS) {
             warn_unsupported_cb_color_mode(cb_mode);

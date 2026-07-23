@@ -167,6 +167,11 @@ struct ResolvedPipelineState {
     uint32_t topology         = 0;   // == VkPrimitiveTopology
     uint32_t color0_format    = 0;   // == VkFormat (0 = VK_FORMAT_UNDEFINED)
 
+    // CB_COLOR_CONTROL.MODE == RESOLVE (3): this draw is a hardware MSAA resolve of the color0 (MSAA)
+    // surface into the color1 destination, not an ordinary draw. prosper renders single-sample, so the
+    // live backend implements it as a straight copy of the already-rendered color0 surface into color1.
+    bool     cb_resolve       = false;
+
     // Color-target clear value, decoded from CB_COLOR0_CLEAR_WORD0/1 per the surface format (#309).
     // has_clear_color == the game programmed a fast-clear that we decoded; clear_color is RGBA in
     // Vulkan order (float32[0]=R). When has_clear_color is false the backend clears to opaque black —
