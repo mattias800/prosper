@@ -1942,6 +1942,59 @@ namespace {
                                  nm, (unsigned long long)g_rax, on_guest_tcb ? "yes" : "NO(host-%fs leak?)");
                 syscall(SYS_write, 2, tb, (size_t)t);
             }
+            // PROSPER_FAULTOBJ (#1226): dump the leading 0xC0 bytes of the objects in rax/r15/rbx via a
+            // fault-safe self-read (process_vm_readv, EFAULT-safe on unmapped guest VAs). For ArcRunner's
+            // RHIThread null-deref (r14=[rax+0x98]==0) this reveals the object type (leading vtable/tag)
+            // and the null field at +0x98, so the missing RHI dependency is identifiable offline. Gated
+            // so other titles' worker faults stay quiet; snprintf+SYS_write matches this handler's style.
+            // Linux-only: the fault-safe self-read below uses SYS_process_vm_readv (no macOS syscall
+            // number); this is a dev diagnostic and the exercised worker-fault RE runs on Linux.
+#ifndef __APPLE__
+            if (getenv("PROSPER_FAULTOBJ")) {
+                const struct { const char* nm; uint64_t addr; } objs[] = {
+                    {"rax", g_rax}, {"r15", g_r15}, {"rbx", g_rbx},
+                };
+                for (const auto& o : objs) {
+                    uint64_t buf[24];
+                    struct iovec liov; liov.iov_base = buf; liov.iov_len = sizeof buf;
+                    struct iovec riov; riov.iov_base = (void*)(uintptr_t)o.addr; riov.iov_len = sizeof buf;
+                    ssize_t got = syscall(SYS_process_vm_readv, getpid(), &liov, 1UL, &riov, 1UL, 0UL);
+                    char ob[700];
+                    int on = snprintf(ob, sizeof ob, "[faultobj] %s=0x%llx got=%zd:",
+                                      o.nm, (unsigned long long)o.addr, (ssize_t)got);
+                    for (int w = 0; got > 0 && w < (int)((size_t)got / 8) && on < (int)sizeof ob - 24; w++)
+                        on += snprintf(ob + on, sizeof ob - (size_t)on, " +%02x=%016llx",
+                                       w * 8, (unsigned long long)buf[w]);
+                    on += snprintf(ob + on, sizeof ob - (size_t)on, "\n");
+                    syscall(SYS_write, 2, ob, (size_t)on);
+                }
+                // Corruption-source probe: dump rcx/rdx and scan the GPU-write ring around rdx (the
+                // free-list head slot for a `mov [rdx]`-style pop) and rax. If a prosper ReleaseMem/fence
+                // write landed on a guest allocator header, it shows here (DOLL #232/#241 stomp class).
+                {
+                    char cb[160];
+                    int cn = snprintf(cb, sizeof cb, "[faultobj] rcx=0x%llx rdx=0x%llx\n",
+                                      (unsigned long long)g_rcx, (unsigned long long)g_rdx);
+                    syscall(SYS_write, 2, cb, (size_t)cn);
+                    if (prosper_gpu_write_ring_scan) {
+                        static char ring[8192];
+                        const uint64_t probes[2] = { g_rdx, g_rax };
+                        for (uint64_t probe : probes) {
+                            uint64_t pg = probe & ~0xfffull;
+                            if (pg < 0x1000) continue;
+                            int rn = prosper_gpu_write_ring_scan(pg, pg + 0x1000, ring, sizeof ring);
+                            if (rn > 0) {
+                                char hb[96]; int hn = snprintf(hb, sizeof hb,
+                                    "[faultobj] GPU-write-ring hits in page 0x%llx:\n",
+                                    (unsigned long long)pg);
+                                syscall(SYS_write, 2, hb, (size_t)hn);
+                                syscall(SYS_write, 2, ring, strlen(ring));
+                            }
+                        }
+                    }
+                }
+            }
+#endif  // !__APPLE__ (PROSPER_FAULTOBJ)
             // #694: guest control-flow backtrace at the worker fault. When the fault is an intermittent
             // bad-pointer jump (e.g. the Blasphemous 2 asset-load worker reaching non-exec Rosetta memory
             // with ret@[rsp]=0x0), rip is uninformative garbage; the only way to attribute it to a guest
