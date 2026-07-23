@@ -126,9 +126,26 @@ static void test_build_image_bounds() {
     }
 }
 
+// clamp_table_bytes bounds a guest-declared reloc/symbol table size to the file (#1219). Without it a
+// malformed DT_RELASZ/DT_PLTRELSZ/symtab size drives an enormous relocs/symbols vector -> OOM.
+static void test_clamp_table_bytes() {
+    CHECK(clamp_table_bytes(0, 240, 1000) == 240,          "table fully inside file: unchanged");
+    CHECK(clamp_table_bytes(100, 900, 1000) == 900,        "table exactly reaching EOF: unchanged");
+    CHECK(clamp_table_bytes(100, UINT64_MAX, 1000) == 900, "huge declared size clamped to file remainder");
+    CHECK(clamp_table_bytes(1000, 240, 1000) == 0,         "table offset == EOF -> 0 bytes");
+    CHECK(clamp_table_bytes(2000, 240, 1000) == 0,         "table offset past EOF -> 0 bytes (no underflow)");
+    CHECK(clamp_table_bytes(999, 240, 1000) == 1,          "offset one byte before EOF -> 1 byte");
+    CHECK(clamp_table_bytes(500, 100, 1000) == 100,        "small table well inside file: unchanged");
+    // The concrete OOM guard: a UINT64_MAX DT_RELASZ over a 240-byte file yields at most 240/24 = 10
+    // relocs, not ~7.7e17 — the value the RELA loop actually iterates.
+    CHECK(clamp_table_bytes(0, UINT64_MAX, 240) / 24 == 10, "huge DT_RELASZ -> bounded reloc count");
+    CHECK(clamp_table_bytes(0, 0, 1000) == 0,              "zero declared size stays zero");
+}
+
 int main() {
     printf("== test_self_bounds (SELF/ELF/loader malformed-input hardening) ==\n");
     test_self_read_ok();
+    test_clamp_table_bytes();
     test_str_at();
     test_at_last_byte_needs_guard();
     test_build_image_bounds();

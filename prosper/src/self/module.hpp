@@ -22,6 +22,17 @@ inline bool self_read_ok(uint64_t off, uint64_t need, uint64_t total) {
     return need <= total && off <= total - need;
 }
 
+// Clamp a guest-declared table size (DT_RELASZ / DT_PLTRELSZ, or a symtab span) to the bytes that
+// actually exist in the file from the table's file offset. A relocation/symbol table cannot legitimately
+// extend past the file, so a malformed dump declaring a huge size must not drive an enormous
+// relocs/symbols vector (OOM). Returns 0 when the table's file offset is already at/after EOF; never
+// underflows (the offset<size branch guarantees a positive remainder).
+inline uint64_t clamp_table_bytes(uint64_t table_file_off, uint64_t declared_bytes, uint64_t file_size) {
+    if (table_file_off >= file_size) return 0;
+    uint64_t avail = file_size - table_file_off;
+    return declared_bytes < avail ? declared_bytes : avail;
+}
+
 // ---- raw ELF/Sony structures we care about --------------------------------
 enum : uint32_t {
     PT_LOAD = 1, PT_DYNAMIC = 2, PT_TLS = 7,
