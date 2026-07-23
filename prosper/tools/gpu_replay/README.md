@@ -161,7 +161,9 @@ then `PROSPER_SHADER_TAP=<pc> PROSPER_GEOM_PROBE=N`. This answers "is prosper fe
 computing the right intermediate?" without an oracle — it revealed GTA V #1163's mask draws fetch plausible
 large-integer control coordinates (so the off-screen result is data-driven, not garbage). Vertex stage only; the
 tapped draw's render is garbage in a tap run (position is redirected) but the captured values are exact; inert
-and byte-identical when the env var is unset.
+and byte-identical when the env var is unset. Tap a PC in the shader's **straight-line region** (e.g. the
+vertex-fetch/transform prologue) — a PC inside a loop or if-body defines the value in a block that doesn't
+dominate the position export, so the shader fails to compile (fail-visible: the draw drops, no output line).
 
 `--dump-shader DRAW:vs|fs PATH` writes the recompiled SPIR-V. Capture v19 adds
 `--dump-realized-shader DRAW:vs|fs PATH` for the exact bounded raw RDNA2 stream that produced that realized
