@@ -472,6 +472,8 @@ int main() {
         DrawItem it3;
         bool made3 = realize_draw_item(st, nullptr, /*vcount_hint*/3u, 0x10000u, /*log*/false, it3);
         CHECK(made3 && it3.vertex_count == 3u, "non-zero vertex-count draw still realizes");
+        CHECK(made3 && it3.raw_draw_count == 3u && !it3.raw_indexed,
+              "#1256: realize_draw_item records the raw non-indexed draw-packet count (3) for capture");
 
         GpuState rect = st;
         rect.uc[P::VGT_PRIMITIVE_TYPE] = 7;
@@ -514,6 +516,8 @@ int main() {
         bool madeb = realize_draw_item(sbig, &sbig.draws[0], sbig.draws[0].index_count, 0x10000u, /*log*/false, itb);
         CHECK(madeb && itb.vertex_count == (1u << 20),
               "#461: garbage-large index clamps vertex_count to the 1<<20 ceiling (no multi-GB VB)");
+        CHECK(madeb && itb.raw_draw_count == 3u && itb.raw_indexed,
+              "#1256: realize_draw_item records the raw indexed draw-packet count (3) + indexed flag");
     }
 
     // The live-submit registry path — exactly what agc_driver_submit_dcb drives once a device is wired.
