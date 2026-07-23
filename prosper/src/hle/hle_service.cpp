@@ -607,11 +607,50 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
         selected_backend->close(backend_id);
         backend_id = -1;
     }
+    // #1105 test lever: force a total source-open failure to exercise the graceful immediate-EOF path
+    // (an undecodable source) without needing a corrupt media file. Off by default.
+    if (backend_id >= 0 && getenv("PROSPER_AVP_FORCE_FAIL")) {
+        selected_backend->close(backend_id);
+        backend_id = -1;
+    }
     const bool synthetic = backend_id < 0 && avp_synth_enabled();
     if (backend_id < 0 && !synthetic) {
-        if (avp_log()) fprintf(stderr, "[avp] source open failed guest='%s' host='%s' backend=%d\n",
+        // #1105: a source that cannot be opened (corrupt file, missing codec, demux error) must not hang
+        // the title. Returning an error with no lifecycle event leaves a title whose intro state machine
+        // waits for the movie to finish deadlocked in its black scene (the #320 shape). Instead set up an
+        // EMPTY source and drive it to a graceful immediate EOF: fire AVP_READY (so the title starts it),
+        // and the first IsActive/GetVideoData poll finds no backend and no synthetic frames (:506 / :760)
+        // and fires AVP_STOP — the game skips the unplayable movie and proceeds.
+        if (avp_log()) fprintf(stderr, "[avp] source open failed guest='%s' host='%s' backend=%d -> "
+                               "graceful skip (empty source, immediate EOF)\n",
                                guest_path, host_path.c_str(), selected_backend != nullptr);
-        return 0x806a0001ull;
+        void* obj = nullptr; AvpEventCb cb = nullptr; bool play = false, player_missing = false;
+        {
+            std::lock_guard<std::mutex> lk(g_avp_mx);
+            auto it = g_avp.find(handle);
+            if (it == g_avp.end()) {
+                player_missing = true;
+            } else {
+                AvpPlayer& p = it->second;
+                p.guest_path = guest_path;
+                p.have_source = true; p.synthetic = false;
+                p.poll = 0; p.audio_poll = 0; p.active_poll = 0; p.last_ts_ms = 0;
+                p.paused = false; p.stop_fired = false;
+                p.texture_frames.clear(); p.texture_frame_bytes = 0; p.next_texture_frame = 0;
+                p.backend = nullptr; p.backend_id = -1;
+                // Non-zero placeholder dims/fps: a title that queries GetStreamInfo up-front (before it
+                // discovers the immediate EOF) then gets a benign aspect (w/h) and never a 0x0 surface or
+                // a divide-by-zero. The source still delivers zero frames and EOFs on the first poll.
+                p.width = 1920; p.height = 1080; p.fps = 30.0f;
+                p.has_audio = false; p.audio_channels = 0; p.audio_rate = 0; p.duration_ms = 0;
+                obj = p.ev_obj; cb = p.ev_cb;
+                if (p.auto_start) { p.playing = true; play = true; }
+            }
+        }
+        if (player_missing) return 0x80000000ull;
+        avp_fire(obj, cb, AVP_READY);
+        if (play) avp_fire(obj, cb, AVP_PLAY);
+        return 0;
     }
 
     const uint32_t video_width = synthetic ? 1920u : stream.width;

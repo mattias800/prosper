@@ -205,8 +205,10 @@ int main() {
     // IsActive must report "not active" so the game's while(IsActive) playback loop ends and it advances.
     CHECK(active(out, 0, 0, 0, 0, 0) == 0, "sceAvPlayerIsActive -> 0 (finished, proceed)");
 
-    // A missing native source must stay failed: no READY callback, no streams, and no implicit black
-    // frames. The same backend then proves /app0 translation and real stream metadata/frame handoff.
+    // An unopenable native source must be SKIPPED GRACEFULLY, not left hanging (#1105): AddSource sets
+    // up an empty source and drives the normal lifecycle to an immediate EOF instead of returning a bare
+    // error with no event. The same backend then proves /app0 translation and real stream metadata/frame
+    // handoff.
     set_synthetic_frames(nullptr);
     set_app0_root("C:/prosper-test-app0");
     CHECK(resolve_guest_path("movie.mp4") == "C:/prosper-test-app0/movie.mp4",
@@ -221,11 +223,30 @@ int main() {
     fake.fail_open = true;
     uint64_t failed_handle = init((uint64_t)(uintptr_t)&data, 0, 0, 0, 0, 0);
     const char missing_source[] = "/app0/missing.mp4";
-    CHECK(add(failed_handle, (uint64_t)(uintptr_t)missing_source, 0, 0, 0, 0) != 0,
-          "native source-open failure is returned instead of selecting synthetic playback");
-    CHECK(streams(failed_handle, 0, 0, 0, 0, 0) == 0 && event_count == 0,
-          "failed source has no streams and fires no READY callback");
+    CHECK(add(failed_handle, (uint64_t)(uintptr_t)missing_source, 0, 0, 0, 0) == 0,
+          "unopenable source is skipped gracefully: AddSource succeeds instead of hanging (#1105)");
+    CHECK(event_count == 1 && events[0] == 2,
+          "AddSource on an unopenable source fires READY (the source lifecycle begins)");
+    CHECK(streams(failed_handle, 0, 0, 0, 0, 0) == 1,
+          "the skipped source presents as a single empty video stream (immediate EOF, no frames)");
+    CHECK(start(failed_handle, 0, 0, 0, 0, 0) == 0 && event_count == 2 && events[1] == 3,
+          "Start on the skipped source fires PLAY (this player is not auto_start)");
+    CHECK(active(failed_handle, 0, 0, 0, 0, 0) == 0 && event_count == 3 && events[2] == 1,
+          "the first IsActive poll fires STOP (immediate EOF) so the while(IsActive) loop ends");
     close(failed_handle, 0, 0, 0, 0, 0);
+
+    // Same graceful skip on the auto_start branch (the shape PPSA02664 actually uses): AddSource fires
+    // READY and PLAY itself, then the first IsActive poll fires STOP.
+    AvpInitData auto_data = data;
+    auto_data.auto_start = 1;
+    event_count = 0;
+    uint64_t auto_failed = init((uint64_t)(uintptr_t)&auto_data, 0, 0, 0, 0, 0);
+    CHECK(add(auto_failed, (uint64_t)(uintptr_t)missing_source, 0, 0, 0, 0) == 0 &&
+              event_count == 2 && events[0] == 2 && events[1] == 3,
+          "auto_start unopenable source: AddSource fires READY then PLAY (graceful skip begins)");
+    CHECK(active(auto_failed, 0, 0, 0, 0, 0) == 0 && event_count == 3 && events[2] == 1,
+          "auto_start skipped source reaches STOP on the first IsActive poll");
+    close(auto_failed, 0, 0, 0, 0, 0);
 
     fake.fail_open = false;
     event_count = 0;
