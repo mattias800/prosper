@@ -1079,19 +1079,31 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     !read_live_render_target(r->gpu_addr, live_target) || !live_target.pixels) {
                     skip_image(r, "renderer-owned RTT has no readable snapshot"); break;
                 }
-                // A dimension mismatch is either (a) an exact integer downscale from PROSPER_RENDER_SCALE
-                // (the renderer rendered this same target at 1/scale; a compute op sampling it at native
-                // res sees e.g. 480x270 cached for a 1920x1080 request), or (b) a genuine view ALIAS at a
-                // reused base (Astro Bot renders 960x540 R11G11B10, then dispatches a 1216x684 R32 Z_X view
-                // at the same base after a dynamic-resolution change — the snapshot is NOT this view).
-                // (a) is the ONLY case that is an equal-on-both-axes integer multiple; upscale the cached
-                // snapshot (nearest) and keep it renderer-owned so a compute composite reads the real
-                // (scaled) scene instead of the zero guest backing. (b) still falls back to guest backing.
+                // A dimension mismatch is either (a) an exact PROSPER_RENDER_SCALE downscale (the renderer
+                // rendered this same target at 1/scale; a compute op sampling it at native res sees e.g.
+                // 480x270 cached for a 1920x1080 request), or (b) a genuine view ALIAS at a reused base
+                // (Astro Bot renders 960x540 R11G11B10, then dispatches a 1216x684 R32 Z_X view at the same
+                // base after a dynamic-resolution change — the snapshot is NOT this view). Only (a) upscales;
+                // (b) still falls back to guest backing.
+                //
+                // "Equal-on-both-axes integer multiple" is necessary but NOT sufficient to prove a downscale
+                // (a hypothetical alias could also be an exact 2x/3x view), so ALSO require k to equal the
+                // configured render scale. A legitimate render-scale target always downscales by exactly
+                // `scale` (hle_agc.cpp: dim = (present/scale) & ~1u), so this cross-check rejects no working
+                // case, makes scale<=1 a structural no-op, and rejects any alias whose ratio != scale.
+                // Limitation: a target whose native extent is not an exact multiple of scale (odd dims like
+                // 642x362, or present not divisible by scale) yields k=0 and still falls back to guest
+                // backing — no regression, but this fix does not cover those.
+                static const uint32_t render_scale = [] {
+                    const char* e = std::getenv("PROSPER_RENDER_SCALE");
+                    long v = e ? std::strtol(e, nullptr, 10) : 1;
+                    return v > 0 ? (uint32_t)v : 1u;
+                }();
                 if (live_target.width != r->width || live_target.height != r->height) {
                     const uint32_t k = prosper::frontend::rtt_integer_upscale_factor(
                         r->width, r->height, live_target.width, live_target.height);
                     const uint64_t bpp = live_target.format == LiveTargetPixelFormat::Rgba16Float ? 8u : 4u;
-                    if (k && live_target.pixels &&
+                    if (k && k == render_scale && live_target.pixels &&
                         live_target.pixels->size() == (uint64_t)live_target.width * live_target.height * bpp) {
                         const uint32_t sw = live_target.width, sh = live_target.height;
                         auto up = std::make_shared<std::vector<uint8_t>>(

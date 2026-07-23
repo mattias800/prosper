@@ -12,9 +12,11 @@
 //
 // The mismatch must be distinguished from a genuine VIEW ALIAS at the same base address (Astro Bot
 // renders a 960x540 target then dispatches a 1216x684 view at the same base — a stale snapshot that is
-// NOT this view and must fall back). A render-scale downscale is the ONLY case where the requested size
-// is an exact, EQUAL-on-both-axes integer multiple of the cached size; an alias is a non-integer or
-// unequal ratio. Returns that factor k (>=2) when src*k == dst on both axes, else 0.
+// NOT this view and must fall back). An exact, EQUAL-on-both-axes integer multiple is a NECESSARY
+// condition for a render-scale downscale (an alias is typically a non-integer or unequal ratio), but it
+// is not by itself sufficient — a hypothetical alias could also be an exact 2x/3x view. The caller
+// therefore additionally requires k == PROSPER_RENDER_SCALE before upscaling; this helper only reports
+// the equal-axis multiple. Returns that factor k (>=2) when src*k == dst on both axes, else 0.
 namespace prosper::frontend {
 
 constexpr uint32_t rtt_integer_upscale_factor(uint32_t dst_w, uint32_t dst_h,
