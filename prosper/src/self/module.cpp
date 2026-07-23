@@ -194,6 +194,13 @@ std::optional<Module> Module::load(const std::string& path, std::string* err) {
     size_t nsym = m.syment ? (m.symtabsz / m.syment) : 0;
     if (nsym == 0 && sym_foff >= 0 && m.strtab_va > m.symtab_va) // fallback: symtab..strtab
         nsym = (m.strtab_va - m.symtab_va) / m.syment;
+    // Bound the symbol count to what the file can hold from sym_foff, so a malformed symtab size (or a
+    // strtab_va far past symtab_va) can't push billions of zero-filled symbols into m.symbols (OOM). #1219.
+    if (sym_foff >= 0 && m.syment) {
+        uint64_t sym_bytes = clamp_table_bytes((uint64_t)sym_foff, (uint64_t)nsym * m.syment,
+                                               (uint64_t)m.file.size());
+        nsym = (size_t)(sym_bytes / m.syment);
+    }
     for (size_t i = 0; i < nsym && sym_foff >= 0; i++) {
         auto s = rd<Sym>(m.file, (size_t)sym_foff + i * m.syment);
         Symbol sym; sym.raw = m.str_at(s.st_name); sym.shndx = s.st_shndx; sym.value = s.st_value;
@@ -216,6 +223,9 @@ std::optional<Module> Module::load(const std::string& path, std::string* err) {
     auto read_relocs = [&](uint64_t va, uint64_t sz, bool plt) {
         int64_t fo = m.va2foff(va);
         if (fo < 0) return;
+        // Bound the guest-declared DT_RELASZ/DT_PLTRELSZ to the file: a table can't run past EOF, and
+        // without this a malformed size pushes sz/24 zero-filled relocs into m.relocs (OOM). #1219.
+        sz = clamp_table_bytes((uint64_t)fo, sz, (uint64_t)m.file.size());
         for (uint64_t o = 0; o + sizeof(Rela) <= sz; o += sizeof(Rela)) {
             auto r = rd<Rela>(m.file, (size_t)fo + o);
             m.relocs.push_back({ r.r_offset, (uint32_t)(r.r_info & 0xffffffff),
