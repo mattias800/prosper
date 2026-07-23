@@ -126,6 +126,15 @@ On a replayed draw, expose vertex position/color/UV, raw texture samples, consta
 pre-blend fragment output, and final attachment output in a standard report. Existing switches such as
 `PROSPER_RENDER_TESTPS`, `PROSPER_TESTTEX`, `PROSPER_CBUFLOG`, and draw isolation are useful primitives.
 
+**Start localization with `gpu_replay --draw-steps` (visual bisection).** Before probing individual draws,
+run `gpu_replay --draw-steps PREFIX --draw-steps-target WxH <capsule>` on the scene: it dumps a numbered BMP
+filmstrip of the composite building up per operation-step (plus a `[draw-step]` log with `visible-px`/`hash`),
+so the exact step where the black/wrong composition first appears is found by scrubbing — no oracle needed.
+Narrow with `--draw-steps-every 1` around the divergence, then use `--through-operation`/`--draw` for the
+precise draw and `--graph` + `--dump-resource` for the surface it samples and its writer. See
+`tools/gpu_replay/README.md` ("Isolation and extraction"). This turns "which of N draws collapsed the frame"
+into a scrub-and-look instead of a guess, and is the recommended first step of this whole procedure.
+
 ## Decision boundary
 
 Do not start another depth/stencil, vertex-fetch, palette-fade, compute, tiling, or whole-stack rewrite from the
