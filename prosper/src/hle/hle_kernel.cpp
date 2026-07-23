@@ -462,23 +462,66 @@ namespace {
         return fbsd_errno(host);
     }
 }
+// PROSPER_MUTEX_WAITLOG: name the HOLDER of a contended guest mutex when a thread is about to block on
+// it — a deadlock/lock-contention probe. POSIX-only (Linux/macOS): Windows already has the guest-mutex
+// ownership map above, and winpthreads lacks pthread_getname_np. Fully gated: the owner map is only
+// touched when the env var is set, so there is zero cost by default.
+#ifndef _WIN32
+namespace {
+    struct MtxOwner { long tid = 0; char name[16] = {0}; };
+    std::mutex g_mtx_waitlog_mx;
+    std::unordered_map<pthread_mutex_t*, MtxOwner> g_mtx_waitlog_owner;
+    inline bool mtx_waitlog() { static const bool on = getenv("PROSPER_MUTEX_WAITLOG") != nullptr; return on; }
+    void mtx_waitlog_record(pthread_mutex_t* m) {
+        if (!mtx_waitlog()) return;
+        MtxOwner o; o.tid = (long)prosper_gettid();
+        pthread_getname_np(pthread_self(), o.name, sizeof o.name);
+        std::lock_guard<std::mutex> lk(g_mtx_waitlog_mx); g_mtx_waitlog_owner[m] = o;
+    }
+    void mtx_waitlog_clear(pthread_mutex_t* m) {
+        if (!mtx_waitlog()) return;
+        std::lock_guard<std::mutex> lk(g_mtx_waitlog_mx); g_mtx_waitlog_owner.erase(m);
+    }
+    void mtx_waitlog_report_block(pthread_mutex_t* m, uint64_t slot) {
+        if (!mtx_waitlog()) return;
+        if (pthread_mutex_trylock(m) == 0) { pthread_mutex_unlock(m); return; } // uncontended
+        MtxOwner o{}; bool have = false;
+        { std::lock_guard<std::mutex> lk(g_mtx_waitlog_mx);
+          auto it = g_mtx_waitlog_owner.find(m); if (it != g_mtx_waitlog_owner.end()) { o = it->second; have = true; } }
+        char self[16] = {0}; pthread_getname_np(pthread_self(), self, sizeof self);
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 256)
+            fprintf(stderr, "[mtx-wait] '%s'(tid=%ld) BLOCKING on guest mutex slot=0x%llx held by %s\n",
+                    self, (long)prosper_gettid(), (unsigned long long)slot,
+                    have ? ([&]{ static char b[48]; snprintf(b, sizeof b, "'%s'(tid=%ld)", o.name, o.tid); return b; }())
+                         : "<owner unknown / acquired via cond_wait>");
+    }
+}
+#else
+namespace {
+    inline void mtx_waitlog_record(pthread_mutex_t*) {}
+    inline void mtx_waitlog_clear(pthread_mutex_t*) {}
+    inline void mtx_waitlog_report_block(pthread_mutex_t*, uint64_t) {}
+}
+#endif
 HLE(k_mutex_lock)    {
     auto* m = ensure_mutex(a0); if (!m) return 0x16;
     if (guest_mutex_self_deadlock(m)) return mtx_report("lock", a0, m, EDEADLK);
+    mtx_waitlog_report_block(m, a0);
     const int result = interruptible_mutex_lock(m);
-    if (result == 0) guest_mutex_acquired(m);
+    if (result == 0) { guest_mutex_acquired(m); mtx_waitlog_record(m); }
     return mtx_report("lock", a0, m, result);
 }
 HLE(k_mutex_trylock) {
     auto* m = ensure_mutex(a0); if (!m) return 0x16;
     const int result = pthread_mutex_trylock(m);
-    if (result == 0) guest_mutex_acquired(m);
+    if (result == 0) { guest_mutex_acquired(m); mtx_waitlog_record(m); }
     return mtx_report("trylock", a0, m, result);
 }
 HLE(k_mutex_unlock)  {
     auto* m = ensure_mutex(a0); if (!m) return 0x16;
     const int result = pthread_mutex_unlock(m);
-    if (result == 0) guest_mutex_released(m);
+    if (result == 0) { guest_mutex_released(m); mtx_waitlog_clear(m); }
     return mtx_report("unlock", a0, m, result);
 }
 

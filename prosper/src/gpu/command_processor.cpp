@@ -1540,6 +1540,13 @@ bool deferred_pending()   { return !g_deferred.empty(); }
 // drain (vs per-stream) is the right granularity — it only errs later, the safe direction.
 namespace { uint64_t g_owed_pulses = 0; }
 void submit_completion_pulse(bool submit_rejected) {
+    if (getenv("PROSPER_EOPLOG")) {
+        static uint64_t call = 0;
+        fprintf(stderr, "[eop-pulse] #%llu rejected=%d deferred_empty=%d owed=%llu -> %s\n",
+                (unsigned long long)++call, submit_rejected ? 1 : 0, g_deferred.empty() ? 1 : 0,
+                (unsigned long long)g_owed_pulses,
+                submit_rejected ? "SKIP(rejected)" : (g_deferred.empty() ? "FIRE" : "OWE"));
+    }
     if (submit_rejected) return;
     if (!g_deferred.empty()) { g_owed_pulses++; return; }
     prosper_eq_trigger_eop();
