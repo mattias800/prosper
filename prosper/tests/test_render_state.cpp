@@ -512,17 +512,31 @@ int main() {
 
         RenderState unsupported2 = absent;
         unsupported2.has_cb_color_control = true;
-        unsupported2.cb_color_control = 2u << P::CB_COLOR_CONTROL_MODE_SHIFT;
-        RenderState unsupported3 = unsupported2;
-        unsupported3.cb_color_control = 3u << P::CB_COLOR_CONTROL_MODE_SHIFT;
+        unsupported2.cb_color_control = 2u << P::CB_COLOR_CONTROL_MODE_SHIFT;  // ELIMINATE_FAST_CLEAR
+        RenderState unsupported5 = unsupported2;
+        unsupported5.cb_color_control = 5u << P::CB_COLOR_CONTROL_MODE_SHIFT;  // still unmodeled
         const std::string mode_diagnostics = capture_stderr([&] {
             (void)resolve_pipeline_state(unsupported2);
             (void)resolve_pipeline_state(unsupported2);
-            (void)resolve_pipeline_state(unsupported3);
+            (void)resolve_pipeline_state(unsupported5);
         });
         CHECK(occurrence_count(mode_diagnostics, "MODE=2 ") == 1u &&
-                  occurrence_count(mode_diagnostics, "MODE=3 ") == 1u,
+                  occurrence_count(mode_diagnostics, "MODE=5 ") == 1u,
               "unmodeled CB modes log once per distinct value while retaining fallback behavior");
+
+        // MODE=RESOLVE(3) is a modeled hardware MSAA resolve: resolve_pipeline_state flags cb_resolve so
+        // the live backend copies color0->color1, and it is NOT warned as unmodeled. Would fail before the
+        // resolve implementation (cb_resolve=false + a "MODE=3 " unmodeled warning).
+        RenderState resolve_mode = absent;
+        resolve_mode.has_cb_color_control = true;
+        resolve_mode.cb_color_control =
+            P::CB_COLOR_CONTROL_MODE_RESOLVE << P::CB_COLOR_CONTROL_MODE_SHIFT;
+        const std::string resolve_diag = capture_stderr([&] {
+            (void)resolve_pipeline_state(resolve_mode);
+        });
+        CHECK(resolve_pipeline_state(resolve_mode).cb_resolve &&
+                  occurrence_count(resolve_diag, "MODE=3 ") == 0u,
+              "CB_COLOR_CONTROL.MODE=RESOLVE flags cb_resolve and is not warned as unmodeled");
     }
 
     // #309: CB fast-clear word extraction + format-aware decode in resolve_pipeline_state.

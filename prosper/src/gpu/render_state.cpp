@@ -549,6 +549,10 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
         if (cb_mode == P::CB_COLOR_CONTROL_MODE_DISABLE) {
             ps.color_write_mask = 0;
             ps.color1_write_mask = 0;
+        } else if (cb_mode == P::CB_COLOR_CONTROL_MODE_RESOLVE) {
+            // MSAA resolve: color0 (MSAA source) -> color1 (single-sample dest). The live backend copies
+            // the already-rendered color0 surface into color1 instead of running these as ordinary draws.
+            ps.cb_resolve = true;
         } else if (cb_mode != P::CB_COLOR_CONTROL_MODE_NORMAL &&
                    cb_mode != P::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS) {
             warn_unsupported_cb_color_mode(cb_mode);

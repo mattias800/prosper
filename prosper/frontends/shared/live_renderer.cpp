@@ -2345,6 +2345,31 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         pass.push_back(&items[pass_i]); ++pass_i;
                     }
 
+                    // CB_COLOR_CONTROL.MODE=RESOLVE(3): the guest resolves an MSAA color0 surface into a
+                    // single-sample color1 destination (Blue Prince PPSA25009 resolves its 4x-MSAA scene
+                    // this way). prosper renders single-sample, so the resolve is a straight copy of the
+                    // already-rendered color0 surface into color1. Use the RAW color1_base, not
+                    // active_color1(): a fixed-function resolve exports nothing, so its color1_write_mask
+                    // is 0 and active_color1 would report no destination. Without this the resolved surface
+                    // the display later samples never receives the scene and the frame is a uniform fill.
+                    if (!pass.empty() && pass.front()->ps.cb_resolve) {
+                        const uint64_t rsrc = pass.front()->color0_base;
+                        const uint64_t rdst = pass.front()->color1_base;
+                        auto src_it = rsrc ? g_rtt.find(rsrc) : g_rtt.end();
+                        if (rsrc && rdst && src_it != g_rtt.end() && src_it->second.rgba) {
+                            g_rtt[rdst] = src_it->second;   // shares pixels; dest inherits src content
+                            if (getenv("PROSPER_MSAA_LOG"))
+                                fprintf(stderr, "[msaa] resolve copy 0x%llx -> 0x%llx (%ux%u)\n",
+                                        (unsigned long long)rsrc, (unsigned long long)rdst,
+                                        src_it->second.w, src_it->second.h);
+                        } else if (getenv("PROSPER_MSAA_LOG")) {
+                            fprintf(stderr, "[msaa] resolve SKIP src=0x%llx dst=0x%llx (%s)\n",
+                                    (unsigned long long)rsrc, (unsigned long long)rdst,
+                                    !rsrc || !rdst ? "missing base" : "source has no rendered surface");
+                        }
+                        continue;   // resolve is a copy, not an ordinary-draw render
+                    }
+
                     // Gen5 render-target extent (#526). Large scene/scanout surfaces retain the
                     // configured VideoOut render scale; small offscreen targets render at native
                     // resolution so lookup textures (Messenger's 1024x32 grading LUT) preserve every
