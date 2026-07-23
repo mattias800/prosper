@@ -2625,9 +2625,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             };
             dss.front = mkop(0); dss.back = mkop(1);
             if (getenv("PROSPER_STENCILLOG"))
-                fprintf(stderr, "[stencil] front{cmp=%u ref=%u opval=%u cmask=0x%x wmask=0x%x fail=%u pass=%u zfail=%u} vkref=%u depth_test=%d\n",
+                fprintf(stderr, "[stencil] front{cmp=%u ref=%u opval=%u cmask=0x%x wmask=0x%x fail=%u pass=%u zfail=%u} back{cmp=%u ref=%u fail=%u pass=%u zfail=%u} vkref=%u/%u cull=%u depth_test=%d\n",
                         ps->stencil_compare_op[0], ps->stencil_ref[0], ps->stencil_op_val[0], ps->stencil_compare_mask[0], ps->stencil_write_mask[0],
-                        ps->stencil_fail_op[0], ps->stencil_pass_op[0], ps->stencil_depth_fail_op[0], dss.front.reference, (int)ps->depth_test_enable);
+                        ps->stencil_fail_op[0], ps->stencil_pass_op[0], ps->stencil_depth_fail_op[0],
+                        ps->stencil_compare_op[1], ps->stencil_ref[1],
+                        ps->stencil_fail_op[1], ps->stencil_pass_op[1], ps->stencil_depth_fail_op[1],
+                        dss.front.reference, dss.back.reference, (unsigned)ps->cull_mode, (int)ps->depth_test_enable);
         }
         // Descriptor resources for this draw (two-set: VS=set0, PS=set1 — same layout as the single path).
         const auto setup_fixed_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
@@ -3836,6 +3839,20 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     } else {
                         fprintf(stderr, "[geom-probe]   v%u = (%g, %g, %g, %g)\n",
                                 i, pos[i*4+0], pos[i*4+1], pos[i*4+2], pos[i*4+3]);
+                    }
+                }
+                // PROSPER_GEOM_PROBE_DUMP=path (gated, off by default): write EVERY post-transform vertex
+                // (x,y,z,w in primitive-assembly order — for a triangle list, consecutive triples are the
+                // rasterized triangles) as CSV, so per-triangle overlap/degeneracy can be analyzed offline
+                // (e.g. GTA #1163's stencil over-count from self-overlapping mask triangles).
+                if (const char* dp = getenv("PROSPER_GEOM_PROBE_DUMP")) {
+                    if (FILE* f = fopen(dp, "w")) {
+                        fprintf(f, "i,x,y,z,w\n");
+                        for (uint32_t i = 0; i < written; i++)
+                            fprintf(f, "%u,%.7g,%.7g,%.7g,%.7g\n",
+                                    i, pos[i*4+0], pos[i*4+1], pos[i*4+2], pos[i*4+3]);
+                        fclose(f);
+                        fprintf(stderr, "[geom-probe]   wrote %u verts -> %s\n", written, dp);
                     }
                 }
                 vkUnmapMemory(dev, geom_mem);

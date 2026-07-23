@@ -556,6 +556,24 @@ inline bool index_buffer_is_unannounced_32bit(const uint16_t* p16, const uint32_
     return has_odd && odd_zero && all_small && any_nonzero;
 }
 
+// #1163: choose a NON-INDEXED draw's vertex count. A DrawIndexAuto packet's count (draw_count) is the
+// AUTHORITATIVE hardware vertex count — the GPU draws exactly that many vertices with auto indices
+// 0..draw_count-1. The bound vertex buffer's record count (vb_records = size/stride) is ONLY a fallback for
+// a draw that supplied no count at all; it must NEVER override a real count. Historically (#60) the executor
+// folded a whole submit into one item and applied the FIRST draw's index_count to it, so a multi-draw mesh
+// rendered only that first (small) count -> a degenerate sliver; substituting the larger VB record count
+// recovered the geometry. The per-draw executor now gives every draw its OWN decoded count (R_DRAW_INDEX_-
+// AUTO -> index_count), so that workaround is obsolete, and substituting the VB record count is actively WRONG when
+// a title binds a SHARED vertex POOL: GTA V's Scaleform UI submits per-draw counts of 3/6/30 against one
+// fixed ~4096-byte pool, so vb_records = pool/stride is 146/1024/512 — sweeping the whole pool rasterizes
+// hundreds of spurious triangles from stale/zero pool data. That inflated the stencil masks' coverage past
+// their EQUAL==2 clip (GTA #1163's black menu wedges) and painted the same phantom vertex tail that earlier
+// read as an "alpha-0 compositing" artifact. Zero-count non-indexed draws are already skipped as no-ops
+// (#400) before this runs, so draw_count is non-zero in practice and the vb_records fallback is a guard.
+inline uint32_t resolve_nonindexed_vertex_count(uint32_t draw_count, uint32_t vb_records) {
+    return draw_count ? draw_count : vb_records;
+}
+
 // Realize ONE draw of `ds` (a register snapshot or the folded state) into a DrawItem: recompile the
 // VS+PS, resolve fixed-function state, and — for an indexed draw — fetch the guest index buffer.
 // `draw` is the PM4 draw record (index count + indexed/index_addr); null means "no record" (hand-built
@@ -960,17 +978,17 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     }
     // A genuinely empty draw (vcount_hint == 0 — engines emit 0-vertex DrawIndexAuto/DrawIndexOffset as
     // no-ops) that resolved NO indices above must render nothing, exactly as it does on hardware. Do NOT
-    // fall through: `vertex_count = vcount_hint ? vcount_hint : 3` already fabricated 3, and the
-    // vb_entries override below would then sweep the ENTIRE residual vertex pool (0..vb_entries-1) of
-    // whatever geometry the last-bound VB still holds — turning a no-op into a phantom triangle or a
-    // full-VB draw of stale geometry composited into the frame (#400). The vb_entries "truer count"
-    // override exists to correct a LOW/stale count, never to synthesize one for a zero-count draw.
+    // fall through: `vertex_count = vcount_hint ? vcount_hint : 3` already fabricated 3, and the vb_records
+    // fallback in resolve_nonindexed_vertex_count() below would then sweep the ENTIRE residual vertex pool
+    // (0..vb_records-1) of whatever geometry the last-bound VB still holds — turning a no-op into a phantom
+    // triangle or a full-VB draw of stale geometry composited into the frame (#400). Skipping here keeps
+    // that fallback a pure zero-count guard; a non-zero DrawIndexAuto count is authoritative (see #1163).
     if (vcount_hint == 0 && out.indices.empty()) {
         if (failure) failure->reason = RealizationFailureReason::ZeroVertices;
         if (log) fprintf(stderr, "[exec] skip draw: zero vertex count (no-op draw)\n");
         return false;
     }
-    if (out.indices.empty() && vb_entries > vertex_count) vertex_count = vb_entries;
+    if (out.indices.empty()) vertex_count = resolve_nonindexed_vertex_count(vcount_hint, vb_entries);
     // PS5 RectList (primitive 7; standard AMD RectList is 17) consumes three procedural vertices but
     // covers the rectangle's synthesized fourth corner. Vulkan has no rectangle-list topology. The
     // Blasphemous 2 clear shader explicitly computes all four clip-space corners from VertexIndex, has
