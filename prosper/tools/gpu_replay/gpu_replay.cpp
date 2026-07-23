@@ -1723,6 +1723,41 @@ int main(int argc, char** argv) {
         ? static_cast<size_t>(through_operation) + 1 : selected_operation_limit;
     const bool selected_draws_only = draw_first >= 0 && !draw_with_compute_prefix;
     std::vector<uint8_t> pixels = execute_frame(replay, selected_draws_only, operation_limit);
+    // Diagnostic: after rendering, read back every persistent depth/stencil surface's STENCIL plane and
+    // write it as a grayscale image (value*80) plus a value histogram. This shows exactly where a
+    // stencil-counting clip mask reached each count — e.g. GTA V's menu artwork is gated on stencil==2
+    // and renders as black wedges wherever the count never reaches 2 (#1231).
+    if (const char* sdump = getenv("PROSPER_STENCIL_DUMP")) {
+        std::vector<prosper::gpu::GpuCaptureDsSeed> seeds;
+        std::string derr;
+        if (prosper::test::snapshot_persistent_ds_images(seeds, derr)) {
+            for (size_t si = 0; si < seeds.size(); ++si) {
+                const auto& s = seeds[si];
+                if (!s.stencil_valid || s.stencil.empty()) continue;
+                const size_t n = static_cast<size_t>(s.width) * s.height;
+                std::vector<uint8_t> rgba(n * 4, 255);
+                uint64_t histo[8] = {0};
+                for (size_t p = 0; p < n && p < s.stencil.size(); ++p) {
+                    const uint8_t sv = s.stencil[p];
+                    const uint8_t v = static_cast<uint8_t>(sv > 3 ? 255 : sv * 80);
+                    rgba[p * 4 + 0] = v; rgba[p * 4 + 1] = v; rgba[p * 4 + 2] = v; rgba[p * 4 + 3] = 255;
+                    histo[sv < 8 ? sv : 7]++;
+                }
+                char path[600];
+                std::snprintf(path, sizeof path, "%s_ds%zu_%ux%u.bmp", sdump, si, s.width, s.height);
+                prosper::test::dump_bmp(path, rgba, s.width, s.height);
+                std::fprintf(stderr, "[stencil-dump] ds%zu %ux%u -> %s histo[0..7+]="
+                             " %llu %llu %llu %llu %llu %llu %llu %llu\n",
+                             si, s.width, s.height, path,
+                             (unsigned long long)histo[0], (unsigned long long)histo[1],
+                             (unsigned long long)histo[2], (unsigned long long)histo[3],
+                             (unsigned long long)histo[4], (unsigned long long)histo[5],
+                             (unsigned long long)histo[6], (unsigned long long)histo[7]);
+            }
+        } else {
+            std::fprintf(stderr, "[stencil-dump] snapshot failed: %s\n", derr.c_str());
+        }
+    }
     const auto extent_mode = selected_draws_only
         ? prosper::gpu::replay_tool::OutputExtentMode::SelectedDraws
         : (through_operation >= 0 || (draw_first >= 0 && draw_with_compute_prefix))
