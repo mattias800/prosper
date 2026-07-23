@@ -1433,6 +1433,17 @@ void GpuState::apply(const Pm4Command& c) {
                 break;
             }
             if (c.regs_vaddr == 0 || c.num_regs == 0 || c.num_regs > kMaxRegsPerPacket) return;
+            // #312/#448: the indirect-register array lives in GUEST memory (regs_vaddr from the packet),
+            // and a freed/decommitted or recycled command buffer can leave it unmapped. Every other
+            // guest read in this file is guest_readable-guarded; this reader (up to 4096*8 = 32 KiB) was
+            // the one gap — an unmapped regs_vaddr would host-SIGSEGV in the loop below. Skip if unmapped.
+            if (!guest_readable(c.regs_vaddr, c.num_regs * (uint32_t)sizeof(ShaderReg))) {
+                static std::atomic<int> n{0};
+                if (n.fetch_add(1) < 24)
+                    fprintf(stderr, "[agc] SetRegsIndirect array unmapped — packet SKIPPED: vaddr=0x%llx num=%u\n",
+                            (unsigned long long)c.regs_vaddr, c.num_regs);
+                return;
+            }
             auto* regs = reinterpret_cast<const ShaderReg*>(static_cast<uintptr_t>(c.regs_vaddr));
             auto& file = (c.reg_class == RegClass::Cx) ? cx
                        : (c.reg_class == RegClass::Sh) ? sh : uc;

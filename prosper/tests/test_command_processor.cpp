@@ -126,6 +126,20 @@ int main() {
         CHECK(all, "SET_SH_REG range values sh[0x100..0x104] are the consecutive payload values");
     }
 
+    // SetRegsIndirect reads its {offset,value} array from GUEST memory (regs_vaddr from the packet).
+    // A freed/decommitted or recycled command buffer (#312) can leave that address unmapped; every
+    // other guest read in the command processor is guest_readable-guarded, and this one now is too.
+    // An unmapped regs array must be SKIPPED (no host OOB read), not dereferenced -> host SIGSEGV.
+    {
+        uint32_t cb[64]; memset(cb, 0, sizeof cb);
+        Dcb ud{}; ud.bottom = cb; ud.top = cb + 64; ud.cursor_up = cb; ud.cursor_down = cb + 64;
+        const uint64_t unmapped = 0x0000deadbeef0000ull;          // not in any host/guest mapping
+        setsh((uint64_t)(uintptr_t)&ud, unmapped, 4, 0, 0, 0);    // 4 regs @ an unmapped address
+        GpuState su;
+        run_cb(cb, 64, su);                                       // must return (guard skips), not SIGSEGV
+        CHECK(su.sh.empty(), "SetShRegsIndirect with an unmapped array is skipped (no OOB read, no regs applied)");
+    }
+
     // In-stream flip (sceAgcDcbSetFlip -> R_FLIP): the game flips via the Dcb, not the sceVideoOut
     // API, so the CommandProcessor MUST perform the videoout flip when it reaches the packet —
     // GetFlipStatus's count/flipArg/currentBuffer are what Unity's frame pacer polls before building
