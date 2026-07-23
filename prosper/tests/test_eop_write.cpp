@@ -10,6 +10,7 @@
 #include "../src/gpu/pm4_decode.hpp"
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>   // setenv/_putenv_s: arm the #1226-retired suppression guards for this test
 #include <cstring>
 #ifdef _WIN32
 #include <windows.h>

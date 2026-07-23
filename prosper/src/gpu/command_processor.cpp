@@ -456,14 +456,16 @@ static void waf_report(const char* kind, uint64_t addr, uint64_t pre, uint64_t v
 // #312 close: direct, non-trapping membership in the guest allocator's Malloc(0x20) freelists.
 // Unlike content/counter inference, this remains truthful before our DmaData init has overwritten a
 // freed node's NextFreeBlock with 0.
-// #1226: default OFF; PROSPER_MB3_FREELIST_GUARD=1 re-arms for investigation. Membership is not
-// proof of staleness either: a label the guest freed and IMMEDIATELY re-malloc'd sits at the same
-// address, and this walk races the allocator's own updates — observed on ArcRunner as 64
-// suppressed live-protocol writes per run. Partial suppression is the worst state (generation off
-// + this on faulted 3/3 EARLY: inits landed while their paired fences were membership-suppressed);
-// with the whole family off, ArcRunner ran 3/3 zero-fault and DOLL 2/2 zero-fatal (see
-// generation_guard above for the full A/B). The #241 stale-ring source is closed by exact submit
-// counts. CONFIDENCE: MED-HIGH.
+// #1226: default OFF; PROSPER_MB3_FREELIST_GUARD=1 re-arms for investigation (and is also
+// required, together with PROSPER_GENERATION_GUARD=1, to re-arm the DMA-init generation check —
+// see generation_guard below). Membership is not proof of staleness: a label the guest freed and
+// IMMEDIATELY re-malloc'd sits at the same address, and this walk races the allocator's own
+// updates — observed on ArcRunner as 64 suppressed live-protocol writes per run. Partial
+// suppression is the worst state (generation off + this on faulted 3/3 EARLY: inits landed while
+// their paired fences were membership-suppressed); with the whole family off, pooled figures are
+// ArcRunner 2/7 faulting vs 4/7 on, all survivors the pre-existing POOLSHIFT class, and DOLL 0
+// fence fatals in 4/4 (full A/B at generation_guard below). The #241 stale-ring source is closed
+// by exact submit counts. CONFIDENCE: MED-HIGH.
 static bool mb3_freelist_guard() {
     static const bool v = [] { const char* e = getenv("PROSPER_MB3_FREELIST_GUARD");
                                return e && strtol(e, nullptr, 0) != 0; }();   // default OFF (#1226)
@@ -487,18 +489,25 @@ static void stale_dma_change_report(uint64_t addr, uint64_t build_pre, uint64_t 
                 (unsigned long long)pre, (unsigned long long)pkt,
                 (unsigned long long)now_ms());
 }
-// #1226: gate for BOTH build-pre generation checks (the DMA-init form at honor_dma_data and the
-// REL form below). Default OFF; PROSPER_GENERATION_GUARD=1 re-arms for investigation. The
-// content-stability premise ("an owned label's residue cannot change between build and exec, so a
-// change means the packet is stale") is FALSE for titles that build command buffers ahead of
-// submit over a churning label pool: ArcRunner's deferred/late-flushed inits routinely observe
-// drifted content, the suppressed init creates dma-free debt that also kills the paired fence,
-// and every consumer wait on that label then times out (a 1 Hz cascade under PROSPER_WAIT_DEFER).
-// Live A/B evidence (2026-07-23, both titles on the #1245 build): ArcRunner 3/3 zero-fault 120 s
-// runs with this and the MB3 membership guard off vs 4/7 faulting with them on; DOLL 2/2 zero
-// free-unrecognized fatals off vs fatals recurring on (257 generation suppressions in the fatal
-// run). The stale-ring re-execution these checks guarded against (#241) is closed at the source
-// by exact submit dword counts on every entry point. CONFIDENCE: MED-HIGH.
+// #1226: gate for the build-pre generation checks. Default OFF. Re-arm contract: this env alone
+// re-arms only the REL form (stale_release_generation below); the DMA-init form at honor_dma_data
+// lives INSIDE the MB3-gated block and additionally requires PROSPER_MB3_FREELIST_GUARD=1 —
+// deliberately, because a generation-suppressed init creates dma-free debt that only the MB3
+// release leg consumes, and re-arming it alone would recreate the partial-suppression state
+// (init suppressed, paired fence lands) that measured WORST in the A/B. The content-stability
+// premise ("an owned label's residue cannot change between build and exec, so a change means the
+// packet is stale") is FALSE for titles that build command buffers ahead of submit over a
+// churning label pool: ArcRunner's deferred/late-flushed inits routinely observe drifted content,
+// the suppressed init's debt also kills the paired fence, and every consumer wait on that label
+// then times out (a 1 Hz cascade under PROSPER_WAIT_DEFER).
+// Live A/B evidence (2026-07-23, both titles on the #1245 build, pooled): ArcRunner 120 s worker
+// faults 2/7 with this and the MB3 membership guard off vs 4/7 with them on — and EVERY surviving
+// fault in both titles is the pre-existing POOLSHIFT byte-shifted-pool-pointer class, so an
+// observed POOLSHIFT fault is NOT a regression of this flip. Partial removal (generation off,
+// membership on) faulted 3/3 early. DOLL: 0 free-unrecognized fatals in 4/4 runs off vs fatals
+// recurring on (257 generation suppressions in the fatal run). The stale-ring re-execution these
+// checks guarded against (#241) is closed at the source by exact submit dword counts on every
+// entry point. CONFIDENCE: MED-HIGH.
 static bool generation_guard() {
     static const bool v = [] { const char* e = getenv("PROSPER_GENERATION_GUARD");
                                return e && strtol(e, nullptr, 0) != 0; }();   // default OFF (#1226)
