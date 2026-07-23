@@ -139,6 +139,19 @@ int main() {
               "SubmitAcb returns OK");
         uint64_t after = 0; prosper_agc_submit_stats(&after, &ignored);
         CHECK(after == before + 1, "SubmitAcb folds one async command stream");
+
+        // ArcRunner (UE4 4.27) async-compute ABI (#1226): the redundant dword-count copy is in a2,
+        // while a3 mirrors the QUEUE id (a0), NOT the count. The old `a3 == count` validation wrongly
+        // returned kAgcErrInvalidArg for this valid submission, so UE4 aborted with
+        // `Agc::submitAsyncCompute(...) failed 0x8a6c000a`. word[1] of the record is authoritative;
+        // the register mirror may be a2 or a3. This case fails against the old check (a3=0x20 != count).
+        uint64_t before2 = 0; prosper_agc_submit_stats(&before2, &ignored);
+        CHECK(submit_acb(0x20 /*queue*/, (uint64_t)(uintptr_t)&packet,
+                         packet.dw_num /*count mirrored in a2*/, 0x20 /*a3 = queue id, not count*/,
+                         0, 0) == 0,
+              "SubmitAcb accepts the ArcRunner ABI (count in a2, queue id mirrored in a3)");
+        uint64_t after2 = 0; prosper_agc_submit_stats(&after2, &ignored);
+        CHECK(after2 == before2 + 1, "ArcRunner-ABI SubmitAcb folds one async command stream");
     }
 
     // A valid header at the last dword of a readable page must not make the decoder walk into the

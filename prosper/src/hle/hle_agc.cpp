@@ -1384,7 +1384,18 @@ HLE(agc_driver_submit_acb) {  // sceAgcDriverSubmitAcb(queue, const AcbPacket*, 
     uint64_t stream = 0, count64 = 0;
     memcpy(&stream, (const void*)(uintptr_t)a1, 8);
     memcpy(&count64, (const void*)(uintptr_t)(a1 + 8), 8);
-    if (!stream || count64 == 0 || count64 > 0x400000ull || (a3 && a3 != count64))
+    if (!stream || count64 == 0 || count64 > 0x400000ull)
+        return kAgcErrInvalidArg;
+    // word[1] of the record is the authoritative dword count (further validated below via stream
+    // readability + the PM4 header). A redundant count copy is ALSO passed in a register as a sanity
+    // cross-check, but WHICH register holds it varies by the AgcDriver::submitAsyncCompute ABI:
+    // Astro Bot puts the count in a3 (queue id in a0); ArcRunner (UE4 4.27) puts the count in a2 and
+    // mirrors the queue id in a3. Accept the count-mirror in EITHER register; only reject when BOTH
+    // register copies are present and BOTH disagree with word[1] -- a genuinely inconsistent submit.
+    // The previous `a3 == count64` check was Astro-Bot-specific and wrongly rejected ArcRunner's valid
+    // submissions (a3 == queue id 0x20 != count 0x7a) -> sceAgcDriverSubmitAcb returned kAgcErrInvalidArg
+    // and UE4 aborted with `Agc::submitAsyncCompute(...) failed 0x8a6c000a`. CONFIDENCE: HIGH.
+    if (a2 && a3 && a2 != count64 && a3 != count64)
         return kAgcErrInvalidArg;
     // The decoder consumes every advertised dword.  Checking only the header allowed a stream at
     // the end of a readable page to fault as soon as decode crossed into the following guard page.
