@@ -210,4 +210,10 @@ struct FlatLoadAnalysis {
 // `user_sgpr_pair + offset`, leaves `all_resolved=false` and the caller keeps rejecting the shader.
 FlatLoadAnalysis analyze_flat_loads(const uint32_t* code, size_t dwords, uint32_t user_sgpr_count);
 
+// Test hook (#1183): the set of forward s_cbranch_execz pcs the recompiler classifies as safe to
+// linearize (drop the branch, run the block under per-lane EXEC). A loop-EXIT execz — one enclosed by a
+// backward branch that jumps to at-or-before it — must NOT appear here, so detect_divergent_loops claims
+// it and emit_divloop reconstructs the structured loop; a plain guard-to-end/if execz still does.
+std::vector<uint32_t> safe_execz_branches_for_test(const uint32_t* code, size_t dwords);
+
 } // namespace prosper::gpu

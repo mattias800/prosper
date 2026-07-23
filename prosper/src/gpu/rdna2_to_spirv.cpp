@@ -2280,6 +2280,20 @@ std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& i
             if (in.pc == target) { target_found = true; break; }
         }
         if (!target_found) ok = false;
+        // LOOP EXIT (#1183): if a backward branch that jumps to at-or-before this execz sits inside the
+        // block [br, target), then this execz is a data-dependent loop's EXIT, not an if/guard-to-end —
+        // even when its target happens to be s_endpgm. Linearizing it here would strand the loop's
+        // back-edge as a straight-line reject; instead leave it OUT of `safe` so detect_divergent_loops
+        // claims it and emit_divloop reconstructs the structured loop. Back-edges are the shapes that
+        // detector recognizes: unconditional s_branch (0x02) or s_cbranch_execnz (0x09).
+        bool is_loop_exit = false;
+        for (const auto& bb : ins) {
+            if (bb.fmt != Rdna2Format::SOPP || (bb.opcode != 0x02 && bb.opcode != 0x09)) continue;
+            if (bb.pc <= br.pc || bb.pc >= target) continue;                 // must sit inside this block
+            const int64_t bt = static_cast<int64_t>(bb.pc) + bb.len_dwords + bb.simm16;   // signed target
+            if (bt <= static_cast<int64_t>(br.pc)) { is_loop_exit = true; break; }
+        }
+        if (is_loop_exit) continue;
         // Two shapes are safe to linearize (drop the branch, run the block under per-lane EXEC):
         //  * IF/ENDIF rejoining live code (target < end): only EXEC-predicated VGPR writes are safe,
         //    since scalar/VCC/memory writes past the merge would be observed by later code.
@@ -8430,6 +8444,13 @@ FlatLoadAnalysis analyze_flat_loads(const uint32_t* code, size_t dwords, uint32_
         out.loads.push_back(info);
     }
     return out;
+}
+
+std::vector<uint32_t> safe_execz_branches_for_test(const uint32_t* code, size_t dwords) {
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code, dwords, ins);
+    const std::unordered_set<uint32_t> s = safe_execz_branches(ins);
+    return std::vector<uint32_t>(s.begin(), s.end());
 }
 
 RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
