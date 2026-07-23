@@ -2036,7 +2036,11 @@ namespace {
                         const uint64_t vals[2] = { g_rax, rdx_val };
                         for (uint64_t v : vals) {
                             uint32_t hi32 = (uint32_t)(v >> 32);
-                            if (!hi32 || hi32 == 0xffffffffu) continue;
+                            // Shape gate (run-10 lesson): a plain guest ADDRESS has a tiny high
+                            // dword (0x21..0x41), and probing it floods NEAR noise near every
+                            // 2^32 clock wrap. Only clock-plausible high dwords are worth asking
+                            // about (>= ~16.7M ns == 16.7ms into a wrap).
+                            if (hi32 < 0x01000000u || hi32 == 0xffffffffu) continue;
                             int fn3 = prosper_gpu_clockfence_find_low32(hi32, fb, sizeof fb);
                             char hb[128]; int hn = snprintf(hb, sizeof hb,
                                 "[faultobj] clock-fence low32 matches for value 0x%llx (hi32=0x%x): %d\n",
