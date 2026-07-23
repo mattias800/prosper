@@ -444,6 +444,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_apr_registry PRIVATE prosper_core)
   add_test(NAME apr_registry_size_keying COMMAND test_apr_registry)
 
+  # GTA V (#1139/#1142) net-new HLE regression guards: sceKernelAprGetFileStat fills the real stat
+  # (#1133) and sceAudioOut2GetSpeakerArrayMemorySize returns a non-zero allocation size (#1134). The
+  # AGC GetSize third piece is covered separately by test_agc_getsize (#1208).
+  add_executable(test_apr_stat_audio tests/test_apr_stat_audio.cpp)
+  target_link_libraries(test_apr_stat_audio PRIVATE prosper_core)
+  add_test(NAME apr_stat_audio_gtav COMMAND test_apr_stat_audio)
+
   # Direct-memory allocate/available (issue #99): AvailableDirectMemorySize reports the largest
   # free aligned block in the search window and writes both out-params (was a total-size stub).
   add_executable(test_dmem tests/test_dmem.cpp)
