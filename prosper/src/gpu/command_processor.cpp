@@ -157,6 +157,7 @@ enum : uint8_t { LE_DMA_BUILT = 1, LE_REL_BUILT, LE_WAIT_BUILT, LE_DMA_EXEC, LE_
                  LE_DMA_FREE, LE_REL_FREE };
 struct LabelEvent {
     uint8_t  type;
+    uint8_t  origin;      // #1226: exec events — queue_origin of the folding submit (0=?, 1=Dcb, 2=Acb, 3=Final)
     uint32_t fold;        // g_fold_seq at event time (exec events; builds carry it too for context)
     uint64_t t_ms;
     uint64_t aux;         // builds: packet addr; execs: pre-content qword at the label
@@ -181,12 +182,12 @@ inline LabelHist& label_hist_slot(uint64_t addr) {
     }
     return h;
 }
-void label_hist_event(uint64_t addr, uint8_t type, uint64_t aux) {
+void label_hist_event(uint64_t addr, uint8_t type, uint64_t aux, uint8_t origin = 0) {
     if (!addr) return;
     LabelHist& h = label_hist_slot(addr);
     uint32_t i = h.n.fetch_add(1, std::memory_order_relaxed);
     LabelEvent& e = h.ev[i & 15];
-    e.type = type; e.t_ms = now_ms(); e.aux = aux;
+    e.type = type; e.origin = origin; e.t_ms = now_ms(); e.aux = aux;
     e.fold = g_fold_seq.load(std::memory_order_relaxed);
 }
 }
@@ -211,14 +212,14 @@ uint64_t peek_qword(uint64_t addr) {
     if (addr >= 0x10000 && !(addr & 3)) memcpy(&v, (const void*)(uintptr_t)addr, sizeof v);
     return v;
 }
-void label_hist_dma_exec(uint64_t addr, uint64_t pre) {
+void label_hist_dma_exec(uint64_t addr, uint64_t pre, uint8_t origin = 0) {
     label_hist_slot(addr).dma_exec_n.fetch_add(1, std::memory_order_relaxed);
-    label_hist_event(addr, LE_DMA_EXEC, pre);
+    label_hist_event(addr, LE_DMA_EXEC, pre, origin);
 }
 void label_hist_dma_skip(uint64_t addr)               { label_hist_event(addr, LE_DMA_SKIP, 0); }
-void label_hist_rel_exec(uint64_t addr, uint64_t pre) {
+void label_hist_rel_exec(uint64_t addr, uint64_t pre, uint8_t origin = 0) {
     label_hist_slot(addr).rel_exec_n.fetch_add(1, std::memory_order_relaxed);
-    label_hist_event(addr, LE_REL_EXEC, pre);
+    label_hist_event(addr, LE_REL_EXEC, pre, origin);
 }
 void label_hist_dma_free(uint64_t addr, uint64_t pool_base) {
     label_hist_slot(addr).mb3_dma_suppressed_n.fetch_add(1, std::memory_order_relaxed);
@@ -314,11 +315,14 @@ void label_hist_report(uint64_t addr, char* out, size_t cap) {
     uint32_t n = h.n.load(std::memory_order_relaxed);
     uint32_t first = n > 16 ? n - 16 : 0;
     size_t off = (size_t)snprintf(out, cap, "events(total=%u):", n);
-    for (uint32_t i = first; i < n && off + 48 < cap; i++) {
+    // Exec events carry the folding submit entry point (#1226): D=SubmitDcb A=SubmitAcb
+    // F=SubmitDcbFinal, absent when unknown/build-side — the cross-queue discriminator.
+    static const char* qn[] = {"", "(D)", "(A)", "(F)"};
+    for (uint32_t i = first; i < n && off + 52 < cap; i++) {
         const LabelEvent& e = h.ev[i & 15];
-        int m = snprintf(out + off, cap - off, " %s@%llu/f%u:0x%llx",
-                         e.type <= 8 ? nm[e.type] : "?", (unsigned long long)e.t_ms, e.fold,
-                         (unsigned long long)e.aux);
+        int m = snprintf(out + off, cap - off, " %s%s@%llu/f%u:0x%llx",
+                         e.type <= 8 ? nm[e.type] : "?", e.origin <= 3 ? qn[e.origin] : "",
+                         (unsigned long long)e.t_ms, e.fold, (unsigned long long)e.aux);
         if (m > 0) off += (size_t)m;
     }
 }
@@ -766,26 +770,44 @@ static void honor_eop_write(const Pm4Command& c) {
                           // consumed-marker population so plain fence labels (Messenger) are never
                           // affected. CONFIDENCE: HIGH (mechanism captured live, sessions 2-5).
                           if (rel1_stomp_guard() && label_is_consumed_marker(c.rel_addr)) {
-                              label_hist_rel_exec(c.rel_addr, pre);   // ring visibility; write skipped
+                              label_hist_rel_exec(c.rel_addr, pre, c.queue_origin);   // ring visibility; write skipped
                               return;
                           }
                       }
                       else if (pre_low == 1 && (pre >> 32))
                           report_suspect_write("REL1-NOINIT", c.rel_addr, c.rel_value, pre, pkt_addr(c));
                   }
-                  // #312 ROOT (session-10): the missed case — pre is a freelist next-pointer with a
-                  // ZERO low dword (0x1000000000-shaped). The pre_low!=0 branch above never sees it,
-                  // so the value-1 write below would forge pre|1 (0x1000000001) and seed the crash.
+                  // #312 ROOT (session-10): pre is a freelist next-pointer with a ZERO low dword
+                  // (0x1000000000-shaped). The pre_low!=0 branch above never sees it, so the value-1
+                  // write below would forge pre|1 (0x1000000001) and seed the crash.
+                  //
+                  // #1226 CORRECTION to session-10's "this is always a write-after-free" claim: it is
+                  // NOT. The guest's DmaData init writes only 4 BYTES, so a LIVE, correctly init'd
+                  // label whose 0x20-byte malloc residue had nonzero HIGH bits reads exactly
+                  // {stale_high, low=0} — byte-identical to the freed-block shape. Observed live on
+                  // ArcRunner (PPSA21406): residue 0x2020e31680, 4-byte init -> qword 0x2000000000,
+                  // and this guard then suppressed the guest's own paired fence, leaving every
+                  // consumer WaitRegMem dependency-violated (thousands/min) and desynchronizing the
+                  // fence-gated free protocol — the very corruption the guard exists to prevent.
+                  // Content cannot discriminate the two; PROTOCOL STATE can (same model as
+                  // label_freed_marker_kind Case B): an EXECUTED init not yet consumed by a fence
+                  // (dma_exec_n > rel_exec_n) means this rel is the paired fence of a live
+                  // generation — real hardware performs the 32-bit write (the consumer polls only
+                  // the low dword; the stale high half is invisible to it). Suppress only when no
+                  // executed init is outstanding (the true stale/WAF fence). CONFIDENCE: MED-HIGH
+                  // (live ArcRunner protocol trace + the WAF model's documented lifecycle).
                   else if (forges_freelist_ptr(pre, 4, c.rel_value)) {
                       forge_trip("REL1", c.rel_addr, pre, c.rel_value, 4, pkt_addr(c));
-                      // No consumed-marker gate here (unlike REL1-LIVE): pre == a 0x1000000000-shaped
-                      // freelist next-pointer only ever occurs on a FREED/recycled MB3 block — a live
-                      // fence label (Messenger or DOLL) holds 0 / a small fence value there, never a
-                      // 64 KiB-aligned heap pointer. So this is always a write-after-free; suppressing
-                      // it can never re-block a live WaitRegMem==1 consumer. CONFIDENCE: HIGH.
-                      if (forge_guard()) {
+                      LabelHist& fh = label_hist_slot(c.rel_addr);
+                      const bool live_pair =
+                          fh.dma_exec_n.load(std::memory_order_relaxed) >
+                          fh.rel_exec_n.load(std::memory_order_relaxed);
+                      if (forge_guard() && !live_pair) {
                           report_suspect_write("REL1-FORGE", c.rel_addr, c.rel_value, pre, pkt_addr(c));
-                          label_hist_rel_exec(c.rel_addr, pre);   // ring visibility; write skipped
+                          // Ring visibility WITHOUT the rel_exec_n bump: a suppressed fence must not
+                          // advance the consumed-count, or the NEXT generation's live check above
+                          // would read dma_exec_n == rel_exec_n and wrongly suppress a real fence.
+                          label_hist_event(c.rel_addr, LE_REL_EXEC, pre, c.queue_origin);
                           return;
                       }
                   }
@@ -804,7 +826,7 @@ static void honor_eop_write(const Pm4Command& c) {
                   uint32_t v = (uint32_t)c.rel_value; memcpy(dst, &v, sizeof v);
                   ring_record(c.rel_addr, v, 4, 1, pkt_addr(c));
                   poolshift_check("REL1", c.rel_addr, 4, c.rel_value, pkt_addr(c));
-                  label_hist_rel_exec(c.rel_addr, pre); break; }
+                  label_hist_rel_exec(c.rel_addr, pre, c.queue_origin); break; }
         case 2: { if (!c.rel_value_valid) return;
                   if (mb3_suppress_release(c.rel_addr, c.rel_value, "REL2")) return;
                   // #312: the same freelist-stomp guard as the 32-bit path. An 8-byte value-1 fence
@@ -822,7 +844,7 @@ static void honor_eop_write(const Pm4Command& c) {
                   if (rel1_stomp_guard() && ptr_like(pre) && (uint32_t)pre != 0 &&
                       pre != c.rel_value && label_is_consumed_marker(c.rel_addr)) {
                       report_suspect_write("REL2-LIVE", c.rel_addr, c.rel_value, pre, pkt_addr(c));
-                      label_hist_rel_exec(c.rel_addr, pre);   // ring visibility; write skipped
+                      label_hist_rel_exec(c.rel_addr, pre, c.queue_origin);   // ring visibility; write skipped
                       return;
                   }
                   uint64_t v = c.rel_value;           memcpy(dst, &v, sizeof v);
@@ -976,7 +998,7 @@ static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
             if (i < c.dd_bytes) memcpy(dst + i, &v32, c.dd_bytes - i);
         }
         poolshift_check("DMA", c.dd_dst, c.dd_bytes, c.dd_src, packet_addr);
-        if (c.dd_bytes <= 8) label_hist_dma_exec(c.dd_dst, pre_dma);
+        if (c.dd_bytes <= 8) label_hist_dma_exec(c.dd_dst, pre_dma, c.queue_origin);
         if (getenv("PROSPER_GFXLOG"))
             fprintf(stderr, "[agc]   DmaData fill [0x%llx] := 0x%x (%u bytes)\n",
                     (unsigned long long)c.dd_dst, v32, c.dd_bytes);
@@ -1824,8 +1846,10 @@ void GpuState::apply(const Pm4Command& c) {
                         uint64_t baddr = 0, bpre = 0, bt = 0;
                         int have = prosper_fence_journal_lookup(pkt_addr(c), &baddr, &bpre, &bt);
                         char hist[512]; label_hist_report(c.wm_addr, hist, sizeof hist);
-                        fprintf(stderr, "[agc] WaitRegMem #%d NOT satisfied at fold time: [0x%llx]&0x%llx = 0x%llx, func=%u ref=0x%llx — %s | built@%llums(age=%lldms)%s pre@build=0x%llx%s%s | %s\n",
-                                ln, (unsigned long long)c.wm_addr, (unsigned long long)c.wm_mask,
+                        static const char* qn2[] = {"?", "D", "A", "F"};
+                        fprintf(stderr, "[agc] WaitRegMem #%d q=%s NOT satisfied at fold time: [0x%llx]&0x%llx = 0x%llx, func=%u ref=0x%llx — %s | built@%llums(age=%lldms)%s pre@build=0x%llx%s%s | %s\n",
+                                ln, c.queue_origin <= 3 ? qn2[c.queue_origin] : "?",
+                                (unsigned long long)c.wm_addr, (unsigned long long)c.wm_mask,
                                 (unsigned long long)(mem & c.wm_mask), c.wm_func, (unsigned long long)c.wm_ref,
                                 defer_enabled() ? "pausing queue (deferred effects)" : "dependency violated",
                                 (unsigned long long)bt, have ? (long long)(now_ms() - bt) : -1,
@@ -1933,6 +1957,12 @@ void GpuState::apply(const Pm4Command& c) {
     }
 }
 
+// #1226: the submit entry point currently folding (1=SubmitDcb, 2=SubmitAcb, 3=SubmitDcbFinal).
+// Set by hle_agc under g_agc_state_mu (all folds are serialized), stamped onto every decoded
+// command so deferred/pended effects retain their queue of origin. Diagnostic only.
+namespace { uint8_t g_fold_origin = 0; }
+extern "C" void prosper_gpu_set_fold_origin(uint8_t origin) { g_fold_origin = origin; }
+
 size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st) {
     // Each TOP-LEVEL stream starts a fresh fold state (#312: the pause flag and the lazily-opened
     // deferred stream are per-fold). A Jump recursion must NOT reset them: the jump target
@@ -1950,6 +1980,7 @@ size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st) {
     decode_pm4(buf, dwords, ops);
     for (auto& c : ops) {
         c.stream_order = st.command_order + 1;
+        c.queue_origin = g_fold_origin;   // #1226: retained by deferred/pended effects
         st.apply(c);
     }
     return ops.size();
