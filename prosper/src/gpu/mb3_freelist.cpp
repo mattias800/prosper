@@ -228,6 +228,79 @@ bool mb3_freelist_contains_stable(uint64_t block, Mb3FreelistMatch* match) {
     return true;
 }
 
+// See mb3_freelist.hpp. Bin region: the first 0x400 bytes of each learned pool array cover 32
+// size classes of {head, count32, secondaryHead, secondaryCount32} at 0x20 stride; heads sit at
+// +0x00 and +0x10 of each class (observed live: the #1226 poisoned bin at base+0x20 between
+// healthy raw-pointer bins). A legitimate head is 0 or a full 0x20xx/0x30xx pointer (nonzero top
+// dword), so the byte-shifted test (top32==0, <<8 lands in mapped [0x20..0x40) guest memory) has
+// no overlap with healthy state; safe_read doubles as the fault-safe mappedness probe.
+int mb3_poolshift_window_scan(char* out, unsigned cap) {
+    unsigned off = 0; int found = 0;
+    uint32_t count = g_pool_candidate_count.load(std::memory_order_acquire);
+    if (count > kMaxPoolCandidates) count = kMaxPoolCandidates;
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t base = g_pool_candidates[i].load(std::memory_order_acquire);
+        if (!base) continue;
+        uint8_t bins[0x400];
+        if (!safe_read(base, bins, sizeof bins)) continue;
+        for (uint32_t o = 0; o + 8 <= sizeof bins; o += 0x10) {
+            uint64_t q; memcpy(&q, bins + o, sizeof q);
+            if (q >> 32 || q < 0x100000) continue;
+            uint64_t real = q << 8;
+            if (real < 0x2000000000ull || real >= 0x4000000000ull) continue;
+            uint64_t probe;
+            if (!safe_read(real, &probe, sizeof probe)) continue;
+            if (out && off + 96 < cap) {
+                int m = snprintf(out + off, cap - off,
+                                 "[poolshift-window] pool=0x%llx +0x%x head=0x%llx (<<8=0x%llx)\n",
+                                 (unsigned long long)base, o, (unsigned long long)q,
+                                 (unsigned long long)real);
+                if (m > 0) off += (unsigned)m;
+            }
+            found++;
+        }
+    }
+    // #1254-review B1: the eight global recycler slots hold bundle HEAD values directly, so a
+    // poisoned bundle parked there (not in any TLS bin) carries the same byteshift shape. Scan them
+    // too, else a parked poison scores found=0 for its whole residence. Chain INTERIORS remain a
+    // structural blind spot (the poison buried below a healthy head is invisible to a head-only
+    // scan) — see the header comment; the watchpoint path is what actually closes that.
+    uint64_t recycler = g_global_recycler_bin.load(std::memory_order_acquire);
+    if (!recycler) recycler = discover_global_recycler_bin();
+    if (recycler >= 0x10000 && !(recycler & 7ull)) {
+        for (uint8_t slot = 0; slot < 8; ++slot) {
+            uint64_t head = 0;
+            if (!safe_read(recycler + (uint64_t)slot * 8, &head, sizeof head)) break;
+            if (head >> 32 || head < 0x100000) continue;
+            uint64_t real = head << 8;
+            if (real < 0x2000000000ull || real >= 0x4000000000ull) continue;
+            uint64_t probe;
+            if (!safe_read(real, &probe, sizeof probe)) continue;
+            if (out && off + 96 < cap) {
+                int m = snprintf(out + off, cap - off,
+                                 "[poolshift-window] recycler=0x%llx slot=%u head=0x%llx (<<8=0x%llx)\n",
+                                 (unsigned long long)recycler, slot, (unsigned long long)head,
+                                 (unsigned long long)real);
+                if (m > 0) off += (unsigned)m;
+            }
+            found++;
+        }
+    }
+    if (out && off < cap) out[off] = 0;
+    return found;
+}
+
+// #1226: is `base` a learned TLS pool array? Async-signal-safe (atomic loads only) — the
+// PROSPER_FAULTOBJ dump uses it to report whether the faulting pool was even visible to the
+// window probe (an unregistered pool explains a probe miss without implicating scan timing).
+extern "C" int prosper_mb3_is_pool_candidate(uint64_t base) {
+    uint32_t count = g_pool_candidate_count.load(std::memory_order_acquire);
+    if (count > kMaxPoolCandidates) count = kMaxPoolCandidates;
+    for (uint32_t i = 0; i < count; i++)
+        if (g_pool_candidates[i].load(std::memory_order_acquire) == base) return 1;
+    return 0;
+}
+
 void mb3_reset_pool_candidates_for_test() {
     for (auto& base : g_pool_candidates) base.store(0, std::memory_order_relaxed);
     g_pool_candidate_count.store(0, std::memory_order_release);

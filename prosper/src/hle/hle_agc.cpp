@@ -15,6 +15,7 @@
 #include "gpu/gpu_execute.hpp"
 #include "gpu/gpu_timeline.hpp"
 #include "gpu/videoout_present.hpp"
+#include "gpu/mb3_freelist.hpp"   // #1226: per-submit POOLSHIFT window probe
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1187,6 +1188,27 @@ static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned&
 // `dw_num == 0` means "length unknown" — decode_pm4 self-terminates at the first non-type-3 dword, and
 // we cap the walk at kUnknownCap dwords as a runaway guard (a bounded ring can't legitimately exceed it).
 extern "C" void prosper_gpu_set_fold_origin(uint8_t origin);   // #1226 queue-origin diagnostic
+extern "C" uint64_t prosper_guest_tsc_ns();                    // shared guest clock (hle_kernel_time)
+// #1226 POOLSHIFT window probe (PROSPER_POOLSHIFT_WINDOW=1): after each submit, scan the learned
+// TLS pool bins + global recycler slots for the byte-shifted-head poison signature and log on STATE
+// CHANGE. A change gives only a WEAK bound — the poison was at a scanned head between these two
+// submits — NOT the free()-to-fault lifetime: the scan samples head residence, and a poison buried
+// in a chain interior or surfacing in a sub-submit sliver is missed (see mb3_poolshift_window_scan).
+// The decisive instrument is PROSPER_MB3WATCH (traps the store). Serialized by the callers'
+// g_agc_state_mu, so the plain statics are single-threaded.
+static void poolshift_window_probe(uint64_t submit_no) {
+    static const bool on = getenv("PROSPER_POOLSHIFT_WINDOW") != nullptr;
+    if (!on) return;
+    static char buf[2048];
+    static int last_found = -1;
+    int found = gpu::mb3_poolshift_window_scan(buf, sizeof buf);
+    if (found != last_found) {
+        fprintf(stderr, "[agc] POOLSHIFT-WINDOW submit=%llu found=%d (was %d) t=%llums\n%s",
+                (unsigned long long)submit_no, found, last_found,
+                (unsigned long long)prosper_guest_tsc_ns() / 1000000ull, found ? buf : "");
+        last_found = found;
+    }
+}
 static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const char* who) {
     if (!addr) return 0;
     constexpr uint32_t kUnknownCap = 0x80000;   // 512 KiB of dwords — well past any real Dcb
@@ -1221,6 +1243,7 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     // Watchdog keys off PENDING streams, not just this fold: streams can outlive their fold (and
     // the Jump-recursion flag reset once hid a deferring fold entirely — the wedge class).
     if (gpu::deferred_pending()) start_defer_watchdog();
+    poolshift_window_probe(g_submit_count);
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc] %s #%llu: %u dwords (walk=%u) -> %zu packets applied (draws: %zu, dispatches: %llu)\n",
                 who, (unsigned long long)g_submit_count, dw_num, walk, applied,
@@ -1313,6 +1336,7 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     gpu::flush_deferred_streams();
     gpu::submit_completion_pulse(agc_gpu_state().dma_execution_rejected);
     if (gpu::deferred_pending()) start_defer_watchdog();
+    poolshift_window_probe(g_submit_count);
     if (getenv("PROSPER_GFXLOG")) {
         fprintf(stderr, "[agc] SubmitDcb #%llu: %u dwords -> %zu packets applied (draws so far: %zu, dispatches total: %llu)\n",
                 (unsigned long long)g_submit_count, p->dw_num, applied, agc_gpu_state().draws.size(),
