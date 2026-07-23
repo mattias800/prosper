@@ -1,4 +1,5 @@
 #include "live_compute.hpp"
+#include "seed_reprove.hpp"
 #include "vulkan_device_select.hpp"
 
 #include "gpu/bc_decode.hpp"
@@ -697,10 +698,22 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // tracked in #1127 -- no exercised title shader triggers it, and a shader first seen partial is
     // cached Partial and always seeds (safe).
     enum class SeedCoverage : uint8_t { Full, Partial };
+    // #1127: 'prove once, trust forever' is unsound for a DATA-DEPENDENT store (full on the proving
+    // frame, partial later). Re-prove a Full verdict every kSeedReproveInterval fast-skips: a shader
+    // that ever covers partially is then re-cached Partial and always seeds, bounding the corruption
+    // window from unbounded to <= interval fast-skips. A genuinely data-independent full-writer (the
+    // exercised full-screen composites) re-proves to Full each time -- no rendered-output change, ~1
+    // extra poison frame per interval. skips counts fast-skips taken since the last (re-)proof.
+    struct SeedVerdict { SeedCoverage cov = SeedCoverage::Partial; uint32_t skips = 0; };
     // key = (shader code_addr, output binding, width, height, depth) -- collision-free by construction.
     using SeedCoverageKey = std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, uint32_t>;
     static std::mutex seed_coverage_mu;
-    static std::map<SeedCoverageKey, SeedCoverage> seed_coverage_proof;
+    static std::map<SeedCoverageKey, SeedVerdict> seed_coverage_proof;
+    // PROSPER_SEED_REPROVE=N: re-prove every N fast-skips (default 256; explicit 0 disables = old
+    // prove-once). Parsed fail-safe -- garbage/overflow keeps the 256 default rather than silently
+    // disabling the safety (see seed_reprove_interval_from_env).
+    static const uint32_t kSeedReproveInterval =
+        seed_reprove_interval_from_env(std::getenv("PROSPER_SEED_REPROVE"), 256u);
     // #1122: a compute post-process that only image_stores its output (no image_load) never reads the
     // seed, so materializing the renderer RTT's prior pixels into it is wasted. Detect it cheaply: an
     // OpImageRead-free SPIR-V reads no storage image at all. Combined with full dispatch coverage of
@@ -1023,17 +1036,23 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (bi.storage && shader_reads_no_image && covers_extent) {
                 const SeedCoverageKey proof_key{item.code_addr, bi.binding,
                                                 r->width, r->height, r->depth};
-                bool proven_full = false, known = false;
+                bool proven_full = false, known = false, reprove_due = false;
                 {
                     std::lock_guard<std::mutex> lk(seed_coverage_mu);
                     auto it = seed_coverage_proof.find(proof_key);
                     if (it != seed_coverage_proof.end()) {
                         known = true;
-                        proven_full = it->second == SeedCoverage::Full;
+                        proven_full = it->second.cov == SeedCoverage::Full;
+                        // #1127: periodically re-prove a Full verdict so a data-dependent store that
+                        // later under-covers is caught (re-cached Partial, then always seeds). The
+                        // helper resets the counter, so concurrent dispatches on this key don't all
+                        // re-prove at once.
+                        if (proven_full && seed_reprove_due(it->second.skips, kSeedReproveInterval))
+                            reprove_due = true;
                     }
                 }
-                if (force_verify) {
-                    bi.poison_verify = true;    // always re-prove; the writeback caches the verdict
+                if (force_verify || reprove_due) {
+                    bi.poison_verify = true;    // (re-)prove; the writeback caches the verdict
                 } else if (proven_full) {
                     bi.seed_skip = true;        // proven: every texel is written, the seed is unobserved
                     if (trace)
@@ -2040,8 +2059,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     const SeedCoverageKey proof_key{item.code_addr, bi.binding,
                                                     r->width, r->height, r->depth};
                     std::lock_guard<std::mutex> lk(seed_coverage_mu);
+                    // Re-cache the freshly-proven verdict; skips=0 restarts the #1127 re-prove interval.
                     seed_coverage_proof[proof_key] =
-                        survived ? SeedCoverage::Partial : SeedCoverage::Full;
+                        SeedVerdict{ survived ? SeedCoverage::Partial : SeedCoverage::Full, 0 };
                 }
                 std::fprintf(stderr,
                              "[seed-skip-verify] code=0x%llx binding=%u texels=%zu poison_survived=%zu %s\n",
