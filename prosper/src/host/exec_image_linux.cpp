@@ -755,6 +755,14 @@ namespace {
     // the host exec image without the gpu lib get a null and skip the scan.
     extern "C" int prosper_gpu_write_ring_scan(uint64_t lo, uint64_t hi, char* out, size_t cap)
         __attribute__((weak));
+    // #1226: persistent clock-fence provenance scanner (same TU as the ring). Unlike the ring, its
+    // records never age out, so a stomp seconds before the fault is still attributable.
+    extern "C" int prosper_gpu_clockfence_scan(uint64_t lo, uint64_t hi, char* out, size_t cap)
+        __attribute__((weak));
+    // #1226: reverse lookup — which fence target ever wrote a clock whose low32 == the corrupted
+    // value's high dword (the {orig_low32, clock_low32} A-4 read-back signature; see gpu TU).
+    extern "C" int prosper_gpu_clockfence_find_low32(uint32_t low32, char* out, size_t cap)
+        __attribute__((weak));
 
     // Issue-#312 heap-corruption attribution dump, fired on the first PROSPER_NULL_PAGE hit (the
     // deterministic precursor of DOLL's MallocBinned3 "Canary was 0x3" fatal: a read of address
@@ -1990,6 +1998,55 @@ namespace {
                                 syscall(SYS_write, 2, hb, (size_t)hn);
                                 syscall(SYS_write, 2, ring, strlen(ring));
                             }
+                        }
+                    }
+                    // #1226: cross-reference the same pages against the PERSISTENT clock-fence
+                    // table (RELEASE_MEM data_sel==3 / EVENT_WRITE timestamps). The ring wraps in
+                    // well under a second on a busy title, so "no ring hit" says nothing about a
+                    // stomp seconds earlier; this table retains the last clock write per address
+                    // for the whole run. A zero-hit result is itself evidence (the corrupted field
+                    // was NEVER a clock-fence target), so report both outcomes.
+                    if (prosper_gpu_clockfence_scan) {
+                        static char cfb[8192];
+                        const uint64_t probes[2] = { g_rdx, g_rax };
+                        for (uint64_t probe : probes) {
+                            uint64_t pg = probe & ~0xfffull;
+                            if (pg < 0x1000) continue;
+                            int fn2 = prosper_gpu_clockfence_scan(pg, pg + 0x1000, cfb, sizeof cfb);
+                            char hb[112]; int hn = snprintf(hb, sizeof hb,
+                                "[faultobj] clock-fence targets in page 0x%llx: %d\n",
+                                (unsigned long long)pg, fn2);
+                            syscall(SYS_write, 2, hb, (size_t)hn);
+                            if (fn2 > 0) syscall(SYS_write, 2, cfb, strlen(cfb));
+                        }
+                    }
+                    // #1226 reverse lookup: the corrupted value's shape is {orig_low32, clock_low32}
+                    // (an 8-byte clock write at A read back at A-4, then guest-copied into the bin
+                    // head). Ask the table which fence target ever wrote a clock with that low32 —
+                    // probing the high dword of rax and of the qword at [rdx] (fault-safe read).
+                    if (prosper_gpu_clockfence_find_low32) {
+                        static char fb[8192];
+                        uint64_t rdx_val = 0;
+                        {
+                            struct iovec liov; liov.iov_base = &rdx_val; liov.iov_len = 8;
+                            struct iovec riov; riov.iov_base = (void*)(uintptr_t)g_rdx; riov.iov_len = 8;
+                            if (syscall(SYS_process_vm_readv, getpid(), &liov, 1UL, &riov, 1UL, 0UL) != 8)
+                                rdx_val = 0;
+                        }
+                        const uint64_t vals[2] = { g_rax, rdx_val };
+                        for (uint64_t v : vals) {
+                            uint32_t hi32 = (uint32_t)(v >> 32);
+                            // Shape gate (run-10 lesson): a plain guest ADDRESS has a tiny high
+                            // dword (0x21..0x41), and probing it floods NEAR noise near every
+                            // 2^32 clock wrap. Only clock-plausible high dwords are worth asking
+                            // about (>= ~16.7M ns == 16.7ms into a wrap).
+                            if (hi32 < 0x01000000u || hi32 == 0xffffffffu) continue;
+                            int fn3 = prosper_gpu_clockfence_find_low32(hi32, fb, sizeof fb);
+                            char hb[128]; int hn = snprintf(hb, sizeof hb,
+                                "[faultobj] clock-fence low32 matches for value 0x%llx (hi32=0x%x): %d\n",
+                                (unsigned long long)v, hi32, fn3);
+                            syscall(SYS_write, 2, hb, (size_t)hn);
+                            if (fn3 > 0) syscall(SYS_write, 2, fb, strlen(fb));
                         }
                     }
                 }

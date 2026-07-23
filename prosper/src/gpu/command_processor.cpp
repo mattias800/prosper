@@ -564,6 +564,139 @@ static bool rel1_stomp_guard() {
                                return !e || strtol(e, nullptr, 0) != 0; }();   // default ON
     return v;
 }
+// --- #1226 clock-fence provenance: persistent per-address record of 64-bit GPU-clock writes. -----
+// ArcRunner's intermittent RHIThread/RenderThread free-list crash dereferences a bin head holding
+// {high = GPU-clock-like counter, low = constant 0x00024001} — the shape of a RELEASE_MEM
+// data_sel==3 / EVENT_WRITE timestamp write whose low dword the guest later re-initialized. The 16K
+// attribution ring above wraps in well under a second on a busy title, which is why the fault-time
+// ring scan found no writer (#1226). This table instead RETAINS the last clock write per target
+// address for the whole run (direct-mapped by address; collisions replace — diagnostic-grade), so
+// the PROSPER_FAULTOBJ worker-fault dump can answer "was the corrupted address EVER a clock-fence
+// target, and what did it hold before the write?" long after the ring has wrapped. Always-on: one
+// hashed store per clock write, no allocation. This is provenance only — it never gates a write.
+namespace {
+struct ClockFenceRec {
+    uint64_t addr;                     // 0 = empty slot
+    uint64_t value, pkt, pre;          // last write: clock value, builder packet, pre-content
+    uint64_t first_ms, last_ms;
+    uint32_t count;
+    uint8_t kind;                      // 1=RELEASE_MEM data_sel==3, 2=EVENT_WRITE timestamp
+    uint8_t heapish_pre;               // some write to this address saw pointer-like pre-content
+    // Recent-value history: run-2 evidence shows the poison qword is {orig_low32, clock_low32} —
+    // an 8-byte clock write at A read back at A-4 — but the stomping write is usually NOT the
+    // LAST write to its target (fence labels re-fence every frame), so "last value" alone cannot
+    // answer "which target once held clock X?". Keep a tiny per-target ring of {value, t_ms}.
+    struct { uint64_t value, t_ms; } hist[4];
+    uint32_t hist_next;
+};
+constexpr uint32_t kClockFenceSlots = 8192;            // power of two
+ClockFenceRec g_clock_fences[kClockFenceSlots];
+// Diagnostic-only "looks like a heap pointer" — deliberately wider than ptr_like(): ArcRunner's
+// MallocBinned3 arena and RHI objects live in the 0x2400000000..0x3200000000 region (#1226 FAULTOBJ
+// dumps: objects at 0x2420e48000 / 0x3152b50000 / 0x316366c154), which the DOLL-era ptr_like()
+// windows predate. Flags records for the reader; never used to gate or suppress a write.
+bool clockfence_heapish(uint64_t v) {
+    return ptr_like(v) || (v >= 0x2100000000ull && v < 0x4000000000ull);
+}
+bool clockfence_log() {
+    static const bool v = getenv("PROSPER_CLOCKFENCE_LOG") != nullptr;
+    return v;
+}
+// Slot hash: use the TOP bits of a 64-bit golden-ratio product. Masking the low bits of an odd
+// multiply (the label_hist idiom) makes two addresses collide exactly when equal mod 64 KiB —
+// and 64 KiB-aligned recycled chunks are precisely the fence-label population under suspicion
+// (review of #1239), so that stride would systematically evict the interesting records.
+inline uint32_t clockfence_slot(uint64_t addr) {
+    return (uint32_t)(((addr >> 3) * 0x9E3779B97F4A7C15ull) >> 51) & (kClockFenceSlots - 1);
+}
+void clockfence_record(uint64_t addr, uint64_t pre, uint64_t value, uint64_t pkt, uint8_t kind) {
+    ClockFenceRec& r = g_clock_fences[clockfence_slot(addr)];
+    const uint64_t t = now_ms();
+    if (r.addr != addr) {
+        r.addr = addr; r.count = 0; r.first_ms = t; r.heapish_pre = 0;
+        r.hist_next = 0; memset(r.hist, 0, sizeof r.hist);
+    }
+    r.value = value; r.pkt = pkt; r.pre = pre; r.last_ms = t; r.kind = kind; r.count++;
+    r.hist[r.hist_next & 3] = { value, t }; r.hist_next++;
+    if (clockfence_heapish(pre)) {
+        r.heapish_pre = 1;
+        // The durable form of #1226's one-off REL3 diagnostic: a clock fence overwriting memory
+        // that currently holds a pointer — a recycled label, or a live allocator/RHI structure
+        // (the crash class). Bounded and off by default (PROSPER_CLOCKFENCE_LOG=1).
+        static std::atomic<int> n{0};
+        if (clockfence_log() && n.fetch_add(1) < 64)
+            fprintf(stderr,
+                    "[agc] CLOCKFENCE-OVER-PTR kind=%u [0x%llx] pre=0x%llx clock=0x%llx pkt=0x%llx t=%llums\n",
+                    kind, (unsigned long long)addr, (unsigned long long)pre,
+                    (unsigned long long)value, (unsigned long long)pkt, (unsigned long long)t);
+    }
+}
+}
+// Scan the persistent clock-fence table for writes overlapping [lo, hi); format matches into `out`
+// (NUL-terminated). Async-signal-safe: no locks, no allocation, tolerates torn racy slots
+// (diagnostic-grade). Called from the PROSPER_FAULTOBJ worker-fault dump (exec_image_linux.cpp) to
+// attribute a stomped allocator/RHI field to the exact fence target + builder packet.
+extern "C" int prosper_gpu_clockfence_scan(uint64_t lo, uint64_t hi, char* out, size_t cap) {
+    size_t off = 0; int found = 0;
+    for (uint32_t i = 0; i < kClockFenceSlots && off + 208 < cap; i++) {
+        const ClockFenceRec& r = g_clock_fences[i];
+        if (!r.addr || r.addr + 8 <= lo || r.addr >= hi) continue;
+        int m = snprintf(out + off, cap - off,
+                         "[clockfence] addr=0x%llx kind=%u count=%u last=0x%llx pre=0x%llx "
+                         "heapish_pre=%u pkt=0x%llx t=%llu..%llums\n",
+                         (unsigned long long)r.addr, r.kind, r.count, (unsigned long long)r.value,
+                         (unsigned long long)r.pre, r.heapish_pre, (unsigned long long)r.pkt,
+                         (unsigned long long)r.first_ms, (unsigned long long)r.last_ms);
+        if (m > 0) off += (size_t)m;
+        found++;
+    }
+    if (off < cap) out[off] = 0;
+    return found;
+}
+
+// #1226 run-2 evidence: the corrupted bin head reads {high=0x0B782E3D, low=0x00024001} while NO
+// clock fence ever targeted its page — but 0x0B782E3D is exactly the LOW 32 bits of the GPU clock
+// at ~69-73s (16-17 2^32-ns wraps), minutes into the run and just before the ~76s fault. That is
+// the signature of an 8-byte clock write at some OTHER address A whose bytes, read as the qword at
+// A-4, yield {orig_low32, clock_low32} — poison the guest then COPIES into the bin head via a
+// free-list pop. This finder answers, at fault time: which fence target ever wrote a clock whose
+// low32 matches the corrupted value's high dword? EXACT hits match a retained value's low 32 bits bit-for-bit;
+// NEAR hits (within ~134ms of clock) catch a target re-fenced shortly after the stomp. A freed
+// label stops being re-fenced, so the poison clock tends to survive as its last/history value.
+extern "C" int prosper_gpu_clockfence_find_low32(uint32_t low32, char* out, size_t cap) {
+    size_t off = 0; int found = 0;
+    for (uint32_t i = 0; i < kClockFenceSlots && off + 208 < cap; i++) {
+        const ClockFenceRec& r = g_clock_fences[i];
+        if (!r.addr) continue;
+        const char* how = nullptr; uint64_t match_v = 0, match_t = 0;
+        uint64_t cand[5]; uint64_t cand_t[5]; int nc = 0;
+        cand[nc] = r.value; cand_t[nc++] = r.last_ms;
+        for (int h = 0; h < 4; h++) if (r.hist[h].value) { cand[nc] = r.hist[h].value; cand_t[nc++] = r.hist[h].t_ms; }
+        // EXACT anywhere beats NEAR anywhere: EXACT vs NEAR is the evidence grade this tool
+        // exists to produce, so a NEAR-matching last value must not shadow an EXACT history hit.
+        for (int k = 0; k < nc && !how; k++)
+            if ((uint32_t)cand[k] == low32) { how = "EXACT"; match_v = cand[k]; match_t = cand_t[k]; }
+        for (int k = 0; k < nc && !how; k++) {
+            uint32_t vl = (uint32_t)cand[k];
+            if ((uint32_t)(vl - low32) < 0x08000000u || (uint32_t)(low32 - vl) < 0x08000000u) {
+                how = "NEAR"; match_v = cand[k]; match_t = cand_t[k];
+            }
+        }
+        if (!how) continue;
+        int m = snprintf(out + off, cap - off,
+                         "[clockfence-find] %s addr=0x%llx kind=%u count=%u v=0x%llx@%llums "
+                         "last=0x%llx pre=0x%llx heapish_pre=%u pkt=0x%llx\n",
+                         how, (unsigned long long)r.addr, r.kind, r.count,
+                         (unsigned long long)match_v, (unsigned long long)match_t,
+                         (unsigned long long)r.value, (unsigned long long)r.pre, r.heapish_pre,
+                         (unsigned long long)r.pkt);
+        if (m > 0) off += (size_t)m;
+        found++;
+    }
+    if (off < cap) out[off] = 0;
+    return found;
+}
+
 // Honor a RELEASE_MEM / EVENT_WRITE_EOP completion write. data_sel (Kyty GraphicsCbReleaseMem allows {2,3};
 // shadPS4 DataSelect enum): 1=write 32-bit value, 2=write 64-bit value, 3=write 64-bit GPU clock. The write
 // uses memcpy so an only-4-byte-aligned 64-bit label is handled portably. CONFIDENCE: HIGH — address,
@@ -695,8 +828,10 @@ static void honor_eop_write(const Pm4Command& c) {
                   uint64_t v = c.rel_value;           memcpy(dst, &v, sizeof v);
                   ring_record(c.rel_addr, v, 8, 1, pkt_addr(c));
                   poolshift_check("REL2", c.rel_addr, 8, c.rel_value, pkt_addr(c)); break; }
-        case 3: { uint64_t v = gpu_clock64();         memcpy(dst, &v, sizeof v);
-                  ring_record(c.rel_addr, v, 8, 1, pkt_addr(c)); break; }
+        case 3: { uint64_t pre = 0; memcpy(&pre, dst, sizeof pre);   // #1226 provenance pre-read
+                  uint64_t v = gpu_clock64();         memcpy(dst, &v, sizeof v);
+                  ring_record(c.rel_addr, v, 8, 1, pkt_addr(c));
+                  clockfence_record(c.rel_addr, pre, v, pkt_addr(c), 1); break; }
         // Unknown selector: LOG AND SKIP. The old default wrote the 64-bit value for ANY
         // unrecognized data_sel — a band-aid for the swap-stub stack-arg mis-extraction that made
         // data_sel arrive as a pointer (fixed in exec_image_linux.cpp emit_swap_stub: handlers now
@@ -733,10 +868,12 @@ static void honor_event_write(const Pm4Command& c) {
                     (unsigned long long)c.event_addr);
         return;
     }
+    uint64_t pre = 0; memcpy(&pre, (void*)(uintptr_t)c.event_addr, sizeof pre);   // #1226 provenance
     uint64_t v = gpu_clock64();
     memcpy((void*)(uintptr_t)c.event_addr, &v, sizeof v);
     notify_guest_gpu_write(c.event_addr, sizeof v);
     ring_record(c.event_addr, v, 8, 2, pkt_addr(c));
+    clockfence_record(c.event_addr, pre, v, pkt_addr(c), 2);
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc]   EventWrite [0x%llx] event_type=%u -> clock 0x%llx\n",
                 (unsigned long long)c.event_addr, c.event_type, (unsigned long long)v);
