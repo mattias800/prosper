@@ -142,6 +142,30 @@ live app recompiles fresh. Requires the device to advertise `VK_EXT_transform_fe
 probed draw's rendered pixels may be inexact (the re-recompile drops pixel-input remapping), but the captured
 `gl_Position` values are faithful; inert and byte-identical when the env var is unset.
 
+### Geometry-health line (`[geom-health]`, printed alongside the probe)
+
+The probe also emits a one-line **geometry-health** verdict for draw N, computed from the same
+transform-feedback data (consecutive triples are the actual rasterized triangles — TF decomposes
+strips/fans). It surfaces the tells that localize a vertex-fetch / draw-range bug without hand-analysis:
+
+```
+# [geom-health] draw=12 verts=1023 unique-pos=12 (max-mult=918) triangles=341 degenerate=334(98%) real=7 duplicate-tri=326 -> DEGENERATE-HEAVY(...)
+```
+
+- **`unique-pos` / `max-mult`** — distinct post-transform positions and the multiplicity of the most-repeated
+  one. Few unique + huge `max-mult` = most verts collapsed onto a point → the fetch/transform returned a
+  constant, or the draw read **past its real vertex range** into zero/stale data.
+- **`degenerate(%)`** — triangles with ~zero NDC area (collapsed/stitching).
+- **`duplicate-tri`** — exact-repeat triangles (same three positions) = pure overdraw.
+- **verdict**: `COLLAPSED` (<=2 distinct positions), `DEGENERATE-HEAVY` (>=80% zero-area — e.g. a shared vertex
+  **pool** swept past a small draw's real count, or strip-stitching read as a list), `DUPLICATE-TRIANGLES`
+  (exact repeats), or `ok`. Overdraw itself belongs to the funnel — read this **with** `PROSPER_DRAW_STATS`
+  (occlusion `samples` > covered pixels). This is the exact signature that localized GTA V #1163's
+  non-indexed vertex-count inflation (real count 6 rendered as 1024 → 98% degenerate, 12 unique positions).
+
+`PROSPER_GEOM_PROBE_DUMP=path` additionally writes **every** post-transform vertex (`i,x,y,z,w` CSV, in
+primitive-assembly order) for offline per-triangle analysis. Both are inert when unset.
+
 ## Shader I/O value tap — `PROSPER_SHADER_TAP=PC` (what did the shader compute at instruction PC?)
 
 ```bash
