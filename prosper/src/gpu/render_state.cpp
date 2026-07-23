@@ -255,13 +255,15 @@ RenderState extract_render_state(const GpuState& st) {
     // stencil-enabled draw — ground truth for compare/op decode questions (the translated fields
     // above can be audited against exactly what the title programmed). Dedup on change.
     if (rs.stencil_enable && getenv("PROSPER_STENCILLOG")) {
-        static thread_local uint32_t last_dc, last_sc, last_rm, last_rmb;
+        static thread_local uint32_t last_dc, last_sc, last_rm, last_rmb, last_prim = 0xFFFFFFFFu;
         if (dc != last_dc || rs.db_stencil_control != last_sc ||
-            rs.db_stencilrefmask != last_rm || rs.db_stencilrefmask_bf != last_rmb) {
+            rs.db_stencilrefmask != last_rm || rs.db_stencilrefmask_bf != last_rmb ||
+            rs.prim_type != last_prim) {
             last_dc = dc; last_sc = rs.db_stencil_control;
-            last_rm = rs.db_stencilrefmask; last_rmb = rs.db_stencilrefmask_bf;
-            fprintf(stderr, "[stencil-raw] dc=%08x sc=%08x rm=%08x rmb=%08x\n",
-                    dc, rs.db_stencil_control, rs.db_stencilrefmask, rs.db_stencilrefmask_bf);
+            last_rm = rs.db_stencilrefmask; last_rmb = rs.db_stencilrefmask_bf; last_prim = rs.prim_type;
+            fprintf(stderr, "[stencil-raw] dc=%08x sc=%08x rm=%08x rmb=%08x prim=%u backface_en=%u\n",
+                    dc, rs.db_stencil_control, rs.db_stencilrefmask, rs.db_stencilrefmask_bf,
+                    rs.prim_type, PM4_FIELD(dc, DB_DEPTH_CONTROL, BACKFACE_ENABLE));
         }
     }
     rs.has_cb_color_control = st.cx.count(P::CB_COLOR_CONTROL) != 0;
