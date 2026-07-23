@@ -28,7 +28,7 @@ jobs:
         run: cmake --build prosper/build-ci
 
       - name: Test
-        run: ctest --test-dir prosper/build-ci --output-on-failure
+        run: ctest --test-dir prosper/build-ci --output-on-failure --timeout 600
 
   linux-app:
     name: Linux App
@@ -90,7 +90,7 @@ jobs:
 
       - name: Test
         shell: msys2 {0}
-        run: ctest --test-dir prosper/build-ci --output-on-failure
+        run: ctest --test-dir prosper/build-ci --output-on-failure --timeout 600
 
   windows-app:
     name: Windows App
@@ -133,7 +133,7 @@ jobs:
       - name: Test SDL audio and input seams
         shell: msys2 {0}
         run: >-
-          ctest --test-dir prosper/build-windows-app --output-on-failure
+          ctest --test-dir prosper/build-windows-app --output-on-failure --timeout 600
           -R '^(prosper_app_pad_overlay|audio_sdl3|pad_sdl3)$'
 
       - name: Verify portable runtime imports
@@ -202,7 +202,7 @@ jobs:
         run: cmake --build prosper/build-ci
 
       - name: Test
-        run: ctest --test-dir prosper/build-ci --output-on-failure
+        run: ctest --test-dir prosper/build-ci --output-on-failure --timeout 600
 
   macos-app:
     name: macOS App (SDL3 + MoltenVK)
