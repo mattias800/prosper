@@ -602,8 +602,15 @@ bool clockfence_log() {
     static const bool v = getenv("PROSPER_CLOCKFENCE_LOG") != nullptr;
     return v;
 }
+// Slot hash: use the TOP bits of a 64-bit golden-ratio product. Masking the low bits of an odd
+// multiply (the label_hist idiom) makes two addresses collide exactly when equal mod 64 KiB —
+// and 64 KiB-aligned recycled chunks are precisely the fence-label population under suspicion
+// (review of #1239), so that stride would systematically evict the interesting records.
+inline uint32_t clockfence_slot(uint64_t addr) {
+    return (uint32_t)(((addr >> 3) * 0x9E3779B97F4A7C15ull) >> 51) & (kClockFenceSlots - 1);
+}
 void clockfence_record(uint64_t addr, uint64_t pre, uint64_t value, uint64_t pkt, uint8_t kind) {
-    ClockFenceRec& r = g_clock_fences[(uint32_t)((addr >> 3) * 2654435761u) & (kClockFenceSlots - 1)];
+    ClockFenceRec& r = g_clock_fences[clockfence_slot(addr)];
     const uint64_t t = now_ms();
     if (r.addr != addr) {
         r.addr = addr; r.count = 0; r.first_ms = t; r.heapish_pre = 0;
@@ -631,7 +638,7 @@ void clockfence_record(uint64_t addr, uint64_t pre, uint64_t value, uint64_t pkt
 // attribute a stomped allocator/RHI field to the exact fence target + builder packet.
 extern "C" int prosper_gpu_clockfence_scan(uint64_t lo, uint64_t hi, char* out, size_t cap) {
     size_t off = 0; int found = 0;
-    for (uint32_t i = 0; i < kClockFenceSlots && off + 140 < cap; i++) {
+    for (uint32_t i = 0; i < kClockFenceSlots && off + 208 < cap; i++) {
         const ClockFenceRec& r = g_clock_fences[i];
         if (!r.addr || r.addr + 8 <= lo || r.addr >= hi) continue;
         int m = snprintf(out + off, cap - off,
@@ -653,22 +660,25 @@ extern "C" int prosper_gpu_clockfence_scan(uint64_t lo, uint64_t hi, char* out, 
 // the signature of an 8-byte clock write at some OTHER address A whose bytes, read as the qword at
 // A-4, yield {orig_low32, clock_low32} — poison the guest then COPIES into the bin head via a
 // free-list pop. This finder answers, at fault time: which fence target ever wrote a clock whose
-// low32 matches the corrupted value's high dword? EXACT hits match a retained value bit-for-bit;
+// low32 matches the corrupted value's high dword? EXACT hits match a retained value's low 32 bits bit-for-bit;
 // NEAR hits (within ~134ms of clock) catch a target re-fenced shortly after the stomp. A freed
 // label stops being re-fenced, so the poison clock tends to survive as its last/history value.
 extern "C" int prosper_gpu_clockfence_find_low32(uint32_t low32, char* out, size_t cap) {
     size_t off = 0; int found = 0;
-    for (uint32_t i = 0; i < kClockFenceSlots && off + 150 < cap; i++) {
+    for (uint32_t i = 0; i < kClockFenceSlots && off + 208 < cap; i++) {
         const ClockFenceRec& r = g_clock_fences[i];
         if (!r.addr) continue;
         const char* how = nullptr; uint64_t match_v = 0, match_t = 0;
         uint64_t cand[5]; uint64_t cand_t[5]; int nc = 0;
         cand[nc] = r.value; cand_t[nc++] = r.last_ms;
         for (int h = 0; h < 4; h++) if (r.hist[h].value) { cand[nc] = r.hist[h].value; cand_t[nc++] = r.hist[h].t_ms; }
+        // EXACT anywhere beats NEAR anywhere: EXACT vs NEAR is the evidence grade this tool
+        // exists to produce, so a NEAR-matching last value must not shadow an EXACT history hit.
+        for (int k = 0; k < nc && !how; k++)
+            if ((uint32_t)cand[k] == low32) { how = "EXACT"; match_v = cand[k]; match_t = cand_t[k]; }
         for (int k = 0; k < nc && !how; k++) {
             uint32_t vl = (uint32_t)cand[k];
-            if (vl == low32) { how = "EXACT"; match_v = cand[k]; match_t = cand_t[k]; }
-            else if ((uint32_t)(vl - low32) < 0x08000000u || (uint32_t)(low32 - vl) < 0x08000000u) {
+            if ((uint32_t)(vl - low32) < 0x08000000u || (uint32_t)(low32 - vl) < 0x08000000u) {
                 how = "NEAR"; match_v = cand[k]; match_t = cand_t[k];
             }
         }
