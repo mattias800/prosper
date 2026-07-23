@@ -140,6 +140,28 @@ int main() {
         CHECK(su.sh.empty(), "SetShRegsIndirect with an unmapped array is skipped (no OOB read, no regs applied)");
     }
 
+    // WriteData(null data, num>0): the packet declares 5+num dwords and cmd[4]=num tells the CP how many
+    // inline dwords to write to the destination. With a null data pointer the builder must zero-fill the
+    // tail cmd[5..], never leave STALE ring-buffer memory there (the CP would write that stale content
+    // into guest memory — the draw_index_auto stale-tail class). Build into a pre-dirtied buffer and
+    // check the emitted packet's data dwords are zero, not the sentinel.
+    {
+        auto writedata = Hle::lookup("i1jyy49AjXU");   // sceAgcDcbWriteData
+        CHECK(writedata != nullptr, "sceAgcDcbWriteData builder registered");
+        if (writedata) {
+            uint32_t cb[64];
+            for (auto& w : cb) w = 0xDEADBEEFu;        // pre-dirty: a stale tail would keep this sentinel
+            Dcb wd{}; wd.bottom = cb; wd.top = cb + 64; wd.cursor_up = cb; wd.cursor_down = cb + 64;
+            // (buf, dst, cache_policy, addr, data=null, num=4)
+            uint64_t pkt = writedata((uint64_t)(uintptr_t)&wd, 0x1000, 0, 0x2000, /*data=*/0, /*num=*/4);
+            CHECK(pkt != 0, "WriteData(null data) built a packet");
+            const uint32_t* p = (const uint32_t*)(uintptr_t)pkt;   // p[4]=num, p[5..8]=inline data dwords
+            CHECK(p && p[4] == 4, "WriteData packet declares num=4 inline dwords");
+            CHECK(p && p[5] == 0 && p[6] == 0 && p[7] == 0 && p[8] == 0,
+                  "WriteData(null data, num=4) zero-fills the packet tail (no stale ring memory)");
+        }
+    }
+
     // In-stream flip (sceAgcDcbSetFlip -> R_FLIP): the game flips via the Dcb, not the sceVideoOut
     // API, so the CommandProcessor MUST perform the videoout flip when it reaches the packet —
     // GetFlipStatus's count/flipArg/currentBuffer are what Unity's frame pacer polls before building

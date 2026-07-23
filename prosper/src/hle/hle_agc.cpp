@@ -599,7 +599,13 @@ HLE(agc_dcb_write_data) {  // sceAgcDcbWriteData(buf, dst, cache_policy, address
     cmd[1] = (uint32_t)a1;
     cmd[2] = (uint32_t)(a3 & 0xffffffffu); cmd[3] = (uint32_t)(a3 >> 32u);
     cmd[4] = num;
+    // The packet header declares 5+num dwords and cmd[4]=num tells the CommandProcessor how many inline
+    // data dwords follow; the CP writes all `num` of them to the destination. If a caller passes a null
+    // data pointer with num>0, the tail cmd[5..] would otherwise carry STALE ring-buffer memory that the
+    // CP then writes into guest memory (the exact stale-tail class fixed for draw_index_auto; the sibling
+    // set_sh_register_range_direct builder already zero-fills its tail). Zero-fill instead of leaking it.
     if (src) for (uint32_t i = 0; i < num; i++) cmd[5 + i] = src[i];
+    else     memset(cmd + 5, 0, (size_t)num * 4u);
     if (num <= 4) prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a3);   // #312 discriminator
     return (uint64_t)(uintptr_t)cmd;
 }
