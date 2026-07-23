@@ -193,6 +193,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_audio PRIVATE prosper_core)
   add_test(NAME audio_hle COMMAND test_audio)
 
+  # NGS2 waveform-block streaming (#1059/#1060 part 3): a fed block makes the voice Playing and advances
+  # num_decoded_samples across renders (the Dead Cells music stream clock). POSIX-gated (needs a fixed
+  # guest-address PCM mapping); the lifecycle assertions run everywhere.
+  add_executable(test_ngs2_streaming tests/test_ngs2_streaming.cpp)
+  target_link_libraries(test_ngs2_streaming PRIVATE prosper_core)
+  add_test(NAME ngs2_streaming COMMAND test_ngs2_streaming)
+
   # libSceAjm (#187): headless audio-decode lifecycle — handle out-params filled with valid values
   # (context/instance/batch), inputs validated, batch reports complete. Pure, no game dump.
   add_executable(test_ajm tests/test_ajm.cpp)
