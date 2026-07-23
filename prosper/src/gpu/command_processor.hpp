@@ -135,6 +135,24 @@ struct GpuState {
 
     // Safety cap on an indirect register count (a malformed/huge count won't run away).
     static constexpr uint32_t kMaxRegsPerPacket = 4096;
+    // Register-file domain bound (#1264). Real CP register writes address a bounded physical register
+    // file; an out-of-range offset lands nowhere on hardware. Titles exploit that: Blue Prince builds
+    // its Set*RegistersIndirect arrays incrementally (record num=0, then PatchSetAddress +
+    // PatchAddRegisters), and the counted range spans raw stale arena data (arbitrary 32-bit
+    // "offsets") interleaved with the real registers. Folding those into the unordered_map register
+    // files grew cx to ~94,000 dead entries whose per-draw snapshot copies (Draw case in apply())
+    // took seconds per submit — the #1195-family "loading crawl" on that title.
+    //
+    // Scope of the "cannot change rendering" claim: no CURRENT consumer (render_state, executor,
+    // timeline, capture) reads any offset at or above this bound — verified in the #1264 review.
+    // Note that the bound also drops prosper's own bit31-tagged AGC VIRTUAL registers
+    // (pm4_registers.hpp: CX/SH/UC_NOP, PA_SC_FSR_*, TEXTURE_GRADIENT_CONTROL, ...) when a title
+    // writes back the defaults it got from GetRegisterDefaults2 — e.g. (0x80003ffd, 0) is a real
+    // TEXTURE_GRADIENT_CONTROL default write, not stale data. That is safe today (nothing reads
+    // them; CONFIDENCE: MED for the virtual-register encoding itself) — but if FSR / texture-
+    // gradient consumption is ever implemented, ingest for those named offsets must be re-enabled
+    // deliberately. Kept generous (64K dwords) versus the few-hundred range real packets use.
+    static constexpr uint32_t kRegOffsetLimit = 0x10000;
 
     // Fold one decoded command into the state. Reads register arrays via their (1:1-mapped) vaddr.
     void apply(const Pm4Command& c);

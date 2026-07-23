@@ -181,6 +181,16 @@ HLE(agc_dcb_set_uc_register_direct) { return set_register_direct(a0, a1, IT_SET_
 static uint64_t set_regs_indirect(uint64_t buf, uint64_t regs, uint64_t num_regs, uint32_t r) {
     uint32_t* cmd; if (!begin_packet(buf, 4, IT_NOP, r, &cmd)) return 0;
     cmd[1] = (uint32_t)num_regs; cmd[2] = (uint32_t)(regs & 0xffffffffu); cmd[3] = (uint32_t)(regs >> 32u);
+    // PROSPER_REGBLOAT (#1264): record-time provenance for the register-array bloat investigation —
+    // correlate each packet's ORIGINAL count with later PatchAddRegisters growth and the fold-time
+    // garbage seen in command_processor's [regbloat] log.
+    static const bool regbloat = getenv("PROSPER_REGBLOAT") != nullptr;
+    if (regbloat) {
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 96)
+            fprintf(stderr, "[regbloat-rec] r=0x%x cmd=%p regs=0x%llx num=%llu\n", r, (void*)cmd,
+                    (unsigned long long)regs, (unsigned long long)num_regs);
+    }
     return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_set_cx_regs_indirect) { return set_regs_indirect(a0, a1, a2, R_CX_REGS_INDIRECT); }
@@ -1442,10 +1452,24 @@ HLE(agc_driver_submit_acb) {  // sceAgcDriverSubmitAcb(queue, const AcbPacket*, 
 // cmd = a0 (that returned pointer). Old stub returned 0 for Set*RegsIndirect -> these wrote to null. -
 HLE(agc_patch_set_address) {  // (cmd, regs): cmd[2..3] = regs vaddr
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
+    static const bool regbloat = getenv("PROSPER_REGBLOAT") != nullptr;
+    if (regbloat) {
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 96)
+            fprintf(stderr, "[regbloat-patch] set_address cmd=%p old=0x%x%08x new=0x%llx num=%u\n",
+                    (void*)cmd, cmd[3], cmd[2], (unsigned long long)a1, cmd[1]);
+    }
     cmd[2] = (uint32_t)(a1 & 0xffffffffu); cmd[3] = (uint32_t)(a1 >> 32u); return 0;
 }
 HLE(agc_patch_add_registers) {  // (cmd, num_regs): cmd[1] += num_regs
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
+    static const bool regbloat = getenv("PROSPER_REGBLOAT") != nullptr;
+    if (regbloat) {
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 96)
+            fprintf(stderr, "[regbloat-patch] add_registers cmd=%p old_num=%u add=%u\n",
+                    (void*)cmd, cmd[1], (uint32_t)a1);
+    }
     cmd[1] += (uint32_t)a1; return 0;
 }
 

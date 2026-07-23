@@ -1678,7 +1678,26 @@ void GpuState::apply(const Pm4Command& c) {
                     fprintf(stderr, " (off=0x%x val=0x%x)", regs[i].offset, regs[i].value);
                 fprintf(stderr, "\n");
             }
+            // PROSPER_REGBLOAT (#1264 investigation): Blue Prince's cx register file was observed live
+            // with ~94,000 entries whose keys span the full 32-bit space (real register offsets are a
+            // few hundred), making the per-draw snapshot copy in the Draw case below take seconds per
+            // submit. Attribute the garbage: log any indirect array whose offsets exceed the sane
+            // register window, with the packet's provenance, so the corrupt producer is identifiable.
+            static const bool regbloat = getenv("PROSPER_REGBLOAT") != nullptr;
+            uint32_t bad = 0, first_bad = 0;
             for (uint32_t i = 0; i < c.num_regs; i++) {
+                // Hardware drops writes to nonexistent register offsets; mirror that instead of
+                // folding placeholder/stale array slots into the register file (see kRegOffsetLimit).
+                if (regs[i].offset >= kRegOffsetLimit) {
+                    if (bad++ == 0) first_bad = i;
+                    static std::atomic<int> dropped_note{0};
+                    if (dropped_note.fetch_add(1) < 4)
+                        fprintf(stderr,
+                                "[agc] out-of-range indirect reg write dropped: class=%d off=0x%x "
+                                "val=0x%x (#1264; PROSPER_REGBLOAT=1 for provenance)\n",
+                                (int)c.reg_class, regs[i].offset, regs[i].value);
+                    continue;
+                }
                 file[regs[i].offset] = regs[i].value;
                 if (c.reg_class == RegClass::Cx &&
                     regs[i].offset == prosper::agc::Pm4::DB_RENDER_CONTROL &&
@@ -1688,6 +1707,41 @@ void GpuState::apply(const Pm4Command& c) {
                             "[ds-clear-reg] order=%llu value=%08x depth=%u stencil=%u\n",
                             (unsigned long long)command_order, regs[i].value,
                             regs[i].value & 1u, (regs[i].value >> 1) & 1u);
+            }
+            if (regbloat) {
+                if (bad) {
+                    static std::atomic<int> n{0};
+                    const int seq = n.fetch_add(1);
+                    if (seq < 48) {
+                        const char* cn = c.reg_class == RegClass::Cx ? "Cx"
+                                       : c.reg_class == RegClass::Sh ? "Sh" : "Uc";
+                        fprintf(stderr,
+                                "[regbloat] indirect class=%s vaddr=0x%llx num=%u bad=%u first_bad_i=%u "
+                                "order=%llu pairs@first_bad:",
+                                cn, (unsigned long long)c.regs_vaddr, c.num_regs, bad, first_bad,
+                                (unsigned long long)command_order);
+                        for (uint32_t k = first_bad; k < c.num_regs && k < first_bad + 4; k++)
+                            fprintf(stderr, " (0x%x,0x%x)", regs[k].offset, regs[k].value);
+                        fprintf(stderr, "\n");
+                    }
+                    // Level 2: dump the ENTIRE array for the first few bad packets so the real
+                    // entry format (tags/blocks vs flat pairs) is decodable offline.
+                    static const bool full = []{ const char* v = getenv("PROSPER_REGBLOAT");
+                                                 return v && v[0] == '2'; }();
+                    if (full && seq < 6) {
+                        fprintf(stderr, "[regbloat-full] seq=%d vaddr=0x%llx num=%u:",
+                                seq, (unsigned long long)c.regs_vaddr, c.num_regs);
+                        for (uint32_t k = 0; k < c.num_regs && k < 256; k++)
+                            fprintf(stderr, " %x:%x", regs[k].offset, regs[k].value);
+                        fprintf(stderr, "\n");
+                    }
+                }
+                static std::atomic<uint32_t> watermark{4096};
+                uint32_t wm = watermark.load(std::memory_order_relaxed);
+                if (file.size() >= wm &&
+                    watermark.compare_exchange_strong(wm, wm * 4, std::memory_order_relaxed))
+                    fprintf(stderr, "[regbloat] register file size crossed %u (class=%d order=%llu)\n",
+                            wm, (int)c.reg_class, (unsigned long long)command_order);
             }
             state_dirty_ = true;   // register state changed -> the next draw needs a fresh snapshot
             break;
@@ -1708,7 +1762,18 @@ void GpuState::apply(const Pm4Command& c) {
                 fprintf(stderr, "\n");
             }
             if (!c.reg_data || c.reg_count == 0 || c.reg_count > kMaxRegsPerPacket) break;
-            for (uint32_t k = 0; k < c.reg_count; k++)
+            // Same bounded-register-file contract as the indirect path (see kRegOffsetLimit).
+            if (c.reg_offset >= kRegOffsetLimit || c.reg_offset + c.reg_count > kRegOffsetLimit) {
+                static std::atomic<int> n{0};
+                if (n.fetch_add(1) < 8)
+                    fprintf(stderr,
+                            "[agc] out-of-range direct reg write dropped: class=%d off=0x%x count=%u "
+                            "val0=0x%x order=%llu (#1264)\n",
+                            (int)c.reg_class, c.reg_offset, c.reg_count, c.reg_data[0],
+                            (unsigned long long)command_order);
+                if (c.reg_offset >= kRegOffsetLimit) break;
+            }
+            for (uint32_t k = 0; k < c.reg_count && c.reg_offset + k < kRegOffsetLimit; k++)
                 file[c.reg_offset + k] = c.reg_data[k];
             state_dirty_ = true;
             break;

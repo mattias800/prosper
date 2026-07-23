@@ -122,6 +122,40 @@ int main() {
               "recorded one DrawIndexAuto with index_count=42");
     }
 
+    // Bounded register-file ingest (#1264): a Blue Prince-style indirect array interleaves real
+    // registers with out-of-range offsets (prosper's bit31-tagged virtual-register defaults like
+    // TEXTURE_GRADIENT_CONTROL=0x80003FFD, plus raw stale arena data). Hardware drops writes to
+    // nonexistent register offsets; the fold must too, or the per-draw snapshot copies grow
+    // unboundedly (the #1195-family loading crawl). Both cases fail without kRegOffsetLimit.
+    {
+        static uint32_t buffer2[256];
+        memset(buffer2, 0, sizeof buffer2);
+        Dcb dcb2{};
+        dcb2.bottom = buffer2; dcb2.top = buffer2 + 256;
+        dcb2.cursor_up = buffer2; dcb2.cursor_down = buffer2 + 256;
+        auto D2 = (uint64_t)(uintptr_t)&dcb2;
+        static Reg mixed[] = { {0x20, 0x1}, {0x80003FFD, 0x0}, {0x14225680, 0x7fa3}, {0x21, 0x2} };
+        auto setcx_direct = Hle::lookup("LHFXRrlTPD8");   // GraphicsDcbSetCxRegisterDirect
+        CHECK(setcx_direct != nullptr, "direct Cx register setter registered");
+        reset(D2, 0x3ff, 0, 0, 0, 0);
+        setcx(D2, (uint64_t)(uintptr_t)mixed, 4, 0, 0, 0);
+        // Direct form: {offset,value} packed into a1 (SysV by-value ShaderRegister). One write at
+        // the last in-range offset, one just past the bound.
+        setcx_direct(D2, ((uint64_t)0x1234 << 32) | 0xFFFFu, 0, 0, 0, 0);
+        setcx_direct(D2, ((uint64_t)0x5678 << 32) | 0x10000u, 0, 0, 0, 0);
+        gpu::GpuState st2;
+        gpu::run_command_buffer(buffer2, (uint32_t)(dcb2.cursor_up - buffer2), st2);
+        CHECK(st2.cx.count(0x20) == 1 && st2.cx[0x20] == 0x1 &&
+              st2.cx.count(0x21) == 1 && st2.cx[0x21] == 0x2,
+              "in-range indirect registers still fold around dropped neighbors");
+        CHECK(st2.cx.count(0x80003FFD) == 0 && st2.cx.count(0x14225680) == 0,
+              "out-of-range indirect offsets are dropped at ingest (#1264)");
+        CHECK(st2.cx.count(0xFFFF) == 1 && st2.cx[0xFFFF] == 0x1234,
+              "direct write at the last in-range offset (0xFFFF) folds");
+        CHECK(st2.cx.count(0x10000) == 0,
+              "direct write at the bound (0x10000) is dropped at ingest (#1264)");
+    }
+
 
     // ACB uses the same packet descriptor and must enter the command processor instead of silently
     // disappearing. An empty reset packet is sufficient to prove that the async submit is folded.
