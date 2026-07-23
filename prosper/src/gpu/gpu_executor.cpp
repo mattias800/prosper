@@ -3069,9 +3069,12 @@ std::vector<ComputeItem> realize_compute_dispatches(
                 // path was the only dumper, so a failing dispatch's CFG could not be mapped offline.
                 // Keep the established 64 KiB diagnostic window: some compiler-generated branches
                 // jump thousands of dwords forward even when the first rejection is near the entry.
-                // The registered shader mapping is already proven readable by the decoder.
+                // Bound the raw fwrite to the bytes the decoder actually PROVED readable
+                // (registered_shader_dwords is guest_readable-checked and capped at 0x4000 dwords ==
+                // 64 KiB), not a fixed 0x10000 — a short shader at the tail of its mapping would
+                // otherwise over-read past the mapped page into a SIGSEGV inside the dump (#1209).
                 if (const char* dd = getenv("PROSPER_SHADER_DUMP")) {
-                    constexpr size_t dump_bytes = 0x10000;
+                    const size_t dump_bytes = std::min(shader_dwords * sizeof(uint32_t), size_t(0x10000));
                     char fn[512];
                     snprintf(fn, sizeof fn, "%s/exec_cs_%llx.bin", dd,
                              (unsigned long long)code_addr);
