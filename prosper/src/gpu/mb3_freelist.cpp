@@ -260,7 +260,7 @@ int mb3_poolshift_window_scan(char* out, unsigned cap) {
             found++;
         }
     }
-    // #1252-review B1: the eight global recycler slots hold bundle HEAD values directly, so a
+    // #1254-review B1: the eight global recycler slots hold bundle HEAD values directly, so a
     // poisoned bundle parked there (not in any TLS bin) carries the same byteshift shape. Scan them
     // too, else a parked poison scores found=0 for its whole residence. Chain INTERIORS remain a
     // structural blind spot (the poison buried below a healthy head is invisible to a head-only
