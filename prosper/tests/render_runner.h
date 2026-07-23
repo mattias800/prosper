@@ -432,6 +432,10 @@ struct RenderVkCtx {
     bool aniso_enabled = false; float max_aniso_limit = 1.0f;
     bool logic_op_enabled = false; bool ok = false;
     bool fragment_stores_atomics = false;
+    // Per-draw "fragment funnel" diagnostic (PROSPER_DRAW_STATS): pipeline-statistics + precise
+    // occlusion queries. Enabled at device creation only when advertised; inert otherwise.
+    bool pipeline_stats_enabled = false;
+    bool occlusion_precise = false;
     bool subgroup_size_control = false;
     uint32_t min_subgroup_size = 0, max_subgroup_size = 0;
     VkShaderStageFlags required_subgroup_size_stages = 0;
@@ -486,6 +490,11 @@ inline const RenderVkCtx& render_vk_ctx() {
         feats.vertexPipelineStoresAndAtomics = supported.vertexPipelineStoresAndAtomics;
         feats.fragmentStoresAndAtomics = supported.fragmentStoresAndAtomics;
         r.fragment_stores_atomics = supported.fragmentStoresAndAtomics;
+        // Per-draw fragment-funnel diagnostic (PROSPER_DRAW_STATS): pipeline statistics + precise
+        // occlusion. Enable only when advertised; costs nothing unless the diagnostic is used.
+        feats.pipelineStatisticsQuery = supported.pipelineStatisticsQuery;
+        r.pipeline_stats_enabled = supported.pipelineStatisticsQuery;
+        if (supported.occlusionQueryPrecise) { feats.occlusionQueryPrecise = VK_TRUE; r.occlusion_precise = true; }
         // robustImageAccess (VK_EXT_image_robustness): OpImageRead OOB must return zero (#131). Guarded.
         // Device extensions accumulate into a vector so the (optional) image-robustness and (macOS)
         // portability-subset extensions coexist.
@@ -3429,6 +3438,37 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         for (auto& v : dv) fprintf(stderr, " %s%u", v.ok ? "" : "SKIP", v.icount ? v.icount : v.vcount);
         fprintf(stderr, "\n");
     }
+    // Per-draw "fragment funnel" (PROSPER_DRAW_STATS): wrap each recorded draw in pipeline-statistics
+    // + occlusion queries to show WHERE its pixels vanish (geometry clipped away, never rasterized,
+    // depth/stencil-rejected, or survived) — objective per-draw truth, no oracle needed. Read-only, and
+    // only active with the env var AND a real flush in THIS call (so the results are ready to read back;
+    // the flush condition below is identical to `flush_now` computed after the pass). Query-pool RESET
+    // must be recorded outside a render pass, so it happens here.
+    const RenderVkCtx& ds_ctx = render_vk_ctx();
+    const bool draw_stats = getenv("PROSPER_DRAW_STATS") && ds_ctx.pipeline_stats_enabled && !dv.empty()
+                            && (!submission_batch || readback_requested || flush_submission_batch);
+    VkQueryPool ds_stats_pool = VK_NULL_HANDLE, ds_occ_pool = VK_NULL_HANDLE;
+    if (draw_stats) {
+        const uint32_t nq = static_cast<uint32_t>(dv.size());
+        VkQueryPoolCreateInfo sp{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        sp.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS; sp.queryCount = nq;
+        sp.pipelineStatistics =
+            VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT |
+            VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT |
+            VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT |
+            VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
+        VkQueryPoolCreateInfo op{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        op.queryType = VK_QUERY_TYPE_OCCLUSION; op.queryCount = nq;
+        if (vkCreateQueryPool(dev, &sp, nullptr, &ds_stats_pool) == VK_SUCCESS &&
+            vkCreateQueryPool(dev, &op, nullptr, &ds_occ_pool) == VK_SUCCESS) {
+            vkCmdResetQueryPool(cmd, ds_stats_pool, 0, nq);
+            vkCmdResetQueryPool(cmd, ds_occ_pool, 0, nq);
+        } else {
+            if (ds_stats_pool) { vkDestroyQueryPool(dev, ds_stats_pool, nullptr); ds_stats_pool = VK_NULL_HANDLE; }
+            if (ds_occ_pool)   { vkDestroyQueryPool(dev, ds_occ_pool,   nullptr); ds_occ_pool   = VK_NULL_HANDLE; }
+        }
+    }
+    const bool ds_active = ds_stats_pool != VK_NULL_HANDLE && ds_occ_pool != VK_NULL_HANDLE;
     // ONE render pass (cleared once): record every realized draw with its own pipeline + descriptors.
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     for (size_t di = 0; di < dv.size(); di++) {
@@ -3447,6 +3487,11 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 vkCmdClearAttachments(cmd, 1, &dsc, 1, &rect);
         }
         if (!v.ok) continue;
+        if (ds_active) {
+            vkCmdBeginQuery(cmd, ds_stats_pool, static_cast<uint32_t>(di), 0);
+            vkCmdBeginQuery(cmd, ds_occ_pool, static_cast<uint32_t>(di),
+                            ds_ctx.occlusion_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+        }
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
         vkCmdSetScissor(cmd, 0, 1, &v.scissor);
         if (v.use_desc) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
@@ -3455,6 +3500,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             vkCmdDrawIndexed(cmd, v.icount, v.instance_count, 0, 0, 0);
         } else {
             vkCmdDraw(cmd, v.vcount, v.instance_count, 0, 0);
+        }
+        if (ds_active) {
+            vkCmdEndQuery(cmd, ds_occ_pool, static_cast<uint32_t>(di));
+            vkCmdEndQuery(cmd, ds_stats_pool, static_cast<uint32_t>(di));
         }
     }
     vkCmdEndRenderPass(cmd);
@@ -3614,6 +3663,45 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     const auto timing_gpu_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     const bool batch_completed = !flush_now ||
         (batch_result.submit_result == VK_SUCCESS && batch_result.wait_result == VK_SUCCESS);
+
+    // Fragment-funnel readback (PROSPER_DRAW_STATS): one line per realized draw showing where its
+    // pixels vanished. ds_active implies flush_now (the pool-creation gate above uses the same flush
+    // condition), so `cmd` has completed and the results are ready. Pools are destroyed unconditionally.
+    if (ds_active) {
+        const uint32_t nq = static_cast<uint32_t>(dv.size());
+        if (batch_completed) {
+            std::vector<uint64_t> sres(static_cast<size_t>(nq) * 5, 0);  // 4 statistics + availability
+            std::vector<uint64_t> ores(static_cast<size_t>(nq) * 2, 0);  // occlusion samples + availability
+            vkGetQueryPoolResults(dev, ds_stats_pool, 0, nq, sres.size() * sizeof(uint64_t), sres.data(),
+                                  5 * sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            vkGetQueryPoolResults(dev, ds_occ_pool, 0, nq, ores.size() * sizeof(uint64_t), ores.data(),
+                                  2 * sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            for (uint32_t i = 0; i < nq; i++) {
+                if (!sres[i * 5 + 4]) continue;  // unavailable -> draw was skipped (v.ok == false)
+                const uint64_t verts = sres[i * 5 + 0], prims = sres[i * 5 + 1],
+                               clip = sres[i * 5 + 2], fs = sres[i * 5 + 3];
+                const uint64_t samp = ores[i * 2 + 1] ? ores[i * 2 + 0] : 0;
+                // Funnel classification, checked in pipeline order. `samples` (occlusion) is the ground
+                // truth for "survived the depth+stencil test" — it is counted even when the fragment
+                // shader is optimised out for a colour-write-disabled (stencil-only) draw, so it must be
+                // tested before fs_inv or such draws look falsely dead.
+                const char* tag =
+                    (prims == 0) ? "NO-GEOMETRY(no primitives)" :
+                    (clip  == 0) ? "GEOMETRY-VANISH(clipped/degenerate/offscreen)" :
+                    (samp  >  0) ? "passed-samples(colour/stencil written)" :
+                    (fs    >  0) ? "TEST-KILLED(depth/stencil rejected all)" :
+                                   "NO-RASTER(cull/scissor/zero-area)";
+                fprintf(stderr,
+                        "[draw-stats] draw=%u verts=%llu prims=%llu after_clip=%llu fs_inv=%llu samples=%llu %s\n",
+                        i, (unsigned long long)verts, (unsigned long long)prims,
+                        (unsigned long long)clip, (unsigned long long)fs, (unsigned long long)samp, tag);
+            }
+        }
+        vkDestroyQueryPool(dev, ds_stats_pool, nullptr);
+        vkDestroyQueryPool(dev, ds_occ_pool, nullptr);
+    }
 
     if (readback_requested && batch_completed) {
         void* mp = nullptr; vkMapMemory(dev, bmem, 0, readback_bytes, 0, &mp);

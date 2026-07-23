@@ -84,6 +84,34 @@ expected hash. `--allow-mismatch` is for an intentional differential such as `--
 ./build-linux/gpu_replay --dump-failed-shader 0:1 /tmp/failed-fragment.bin /tmp/submit.prgcap
 ```
 
+## Per-draw "fragment funnel" — `PROSPER_DRAW_STATS` (first thing to run on a missing/wrong draw)
+
+```bash
+PROSPER_DRAW_STATS=1 ./build-linux/gpu_replay /tmp/submit.prgcap /tmp/out.bmp
+# [draw-stats] draw=4 verts=1024 prims=341 after_clip=0   fs_inv=0      samples=0        GEOMETRY-VANISH(...)
+# [draw-stats] draw=5 verts=1024 prims=341 after_clip=68  fs_inv=0      samples=12102811 passed-samples(...)
+```
+
+Wraps every realized draw in Vulkan pipeline-statistics + occlusion queries and prints one line per draw
+showing **where its pixels vanished** — objective per-draw truth, no oracle needed. A GPU draw can only
+disappear in four places, and this pinpoints which:
+
+- `prims>0, after_clip=0` → **GEOMETRY-VANISH**: every primitive was clipped/degenerate/off-screen (a
+  vertex-shader / vertex-fetch / transform problem — the geometry never reached the rasteriser).
+- `after_clip>0, samples=0, fs_inv=0` → **NO-RASTER**: rasteriser produced no fragments (backface cull,
+  empty scissor, zero-area).
+- `after_clip>0, samples=0, fs_inv>0` → **TEST-KILLED**: fragments ran but the depth/stencil test rejected
+  every sample.
+- `samples>0` → **passed-samples**: colour and/or stencil was written (for a colour-write-disabled
+  stencil-only draw `fs_inv` is 0 because the fragment shader is optimised out, but `samples` still counts —
+  which is why `samples` is the ground truth for "survived", checked before `fs_inv`).
+
+This is the fastest first-order triage for "why did this draw render nothing/wrong": it replaces manual
+`--through-operation` bisection with a single glance. Localised GTA V's menu black-wedge defect (a stencil-
+counting clip whose first mask draw came back `GEOMETRY-VANISH`) in one run. Requires the device to advertise
+`pipelineStatisticsQuery`; inert (no output, no cost, byte-identical rendering) when the env var is unset.
+Works on both `gpu_replay` and the live app because it lives in the shared render path.
+
 `--dump-shader DRAW:vs|fs PATH` writes the recompiled SPIR-V. Capture v19 adds
 `--dump-realized-shader DRAW:vs|fs PATH` for the exact bounded raw RDNA2 stream that produced that realized
 draw stage, suitable for `shader_inspect`. The VS/FS streams use the same content-addressed 64 KiB-per-stage,

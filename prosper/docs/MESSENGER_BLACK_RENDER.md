@@ -126,7 +126,16 @@ On a replayed draw, expose vertex position/color/UV, raw texture samples, consta
 pre-blend fragment output, and final attachment output in a standard report. Existing switches such as
 `PROSPER_RENDER_TESTPS`, `PROSPER_TESTTEX`, `PROSPER_CBUFLOG`, and draw isolation are useful primitives.
 
-**Start localization with `gpu_replay --draw-steps` (visual bisection).** Before probing individual draws,
+**First triage: `PROSPER_DRAW_STATS=1` (the per-draw "fragment funnel").** Before even the visual filmstrip,
+run `PROSPER_DRAW_STATS=1 gpu_replay <capsule> out.bmp`: it wraps every draw in pipeline-statistics + occlusion
+queries and prints one line per draw classifying **where its pixels vanished** — `GEOMETRY-VANISH` (all
+primitives clipped/degenerate/off-screen → a vertex/fetch/transform bug), `NO-RASTER` (cull/scissor/zero-area),
+`TEST-KILLED` (depth/stencil rejected every sample), or `passed-samples` (colour/stencil written). This is
+objective, needs no oracle, and turns "why did this draw render nothing" into a glance instead of a manual
+bisection (it localised GTA V's menu black-wedge defect to a single `GEOMETRY-VANISH` mask draw in one run).
+See `tools/gpu_replay/README.md`. Use it to pick the suspect draw, *then* the filmstrip below to see it.
+
+**Then localize visually with `gpu_replay --draw-steps` (visual bisection).** Before probing individual draws,
 run `gpu_replay --draw-steps PREFIX --draw-steps-target WxH <capsule>` on the scene: it dumps a numbered BMP
 filmstrip of the composite building up per operation-step (plus a `[draw-step]` log with `visible-px`/`hash`),
 so the exact step where the black/wrong composition first appears is found by scrubbing — no oracle needed.
