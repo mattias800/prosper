@@ -241,6 +241,43 @@ int main() {
               kept.scissor_right == 2064 && kept.scissor_bottom == 2064,
               "a window offset that keeps the VPORT scissor on-target is preserved, not dropped");
     }
+    {
+        // #1164: the OFF-TARGET recover — a window offset that leaves the scissor NON-EMPTY in
+        // absolute coordinates but shifts it entirely off the render target (empty only after
+        // clamping to the color0 extent). The #1161 recover above tests the absolute-empty case;
+        // this tests the absolute-non-empty-but-off-target case, which needs a known color extent.
+        // WOULD-FAIL-WITHOUT-FIX: without the extent-aware emptiness test, combine(true) reports the
+        // off-target rect as non-empty (screen scissor 16384 wide leaves [2560,4608) intact), no
+        // recover fires, and the final scissor is the off-target [2560,4608) — asserted against here.
+        GpuState off;
+        off.cx[P::PA_SC_SCREEN_SCISSOR_TL]  = 0x00000000u;    // (0,0)
+        off.cx[P::PA_SC_SCREEN_SCISSOR_BR]  = 0x40004000u;    // (16384,16384) AGC default
+        off.cx[P::PA_SC_WINDOW_SCISSOR_TL]  = 0x80000000u;    // offset disabled, full
+        off.cx[P::PA_SC_WINDOW_SCISSOR_BR]  = 0x40004000u;
+        off.cx[P::PA_SC_GENERIC_SCISSOR_TL] = 0x80000000u;    // offset disabled, full
+        off.cx[P::PA_SC_GENERIC_SCISSOR_BR] = 0x40004000u;
+        off.cx[P::PA_SC_VPORT_SCISSOR_0_TL] = 0x00000000u;    // (0,0), offset ENABLED (bit31 clear)
+        off.cx[P::PA_SC_VPORT_SCISSOR_0_BR] = 0x08000800u;    // (2048,2048)
+        off.cx[P::PA_SC_MODE_CNTL_0]        = 0x00000002u;    // VPORT_SCISSOR_ENABLE
+        off.cx[P::CB_COLOR0_ATTRIB2]        = ((2048u - 1u) << 14) | (2048u - 1u);   // 2048x2048 target
+        off.cx[P::PA_SC_WINDOW_OFFSET]      = 0x0A000A00u;    // (+2560,+2560): VPORT -> [2560,4608)^2
+        const RenderState recovered_off = extract_render_state(off);
+        CHECK(recovered_off.has_scissor && recovered_off.scissor_left == 0 &&
+              recovered_off.scissor_top == 0 && recovered_off.scissor_right == 2048 &&
+              recovered_off.scissor_bottom == 2048,
+              "a window offset that pushes an absolute-non-empty VPORT scissor off the color0 extent "
+              "is dropped, recovering the on-target rectangle (#1164)");
+
+        // Boundary: an offset that leaves the VPORT scissor PARTIALLY on-target (overlaps the extent)
+        // is genuine and preserved — the recover must not fire. VPORT [0,2048) offset +1900 ->
+        // [1900,3948): overlap with the 2048 extent is [1900,2048), non-empty -> kept as-is.
+        GpuState partial = off;
+        partial.cx[P::PA_SC_WINDOW_OFFSET] = 0x0000076Cu;     // (X=+1900, Y=0)
+        const RenderState kept_partial = extract_render_state(partial);
+        CHECK(kept_partial.scissor_left == 1900 && kept_partial.scissor_right == 3948 &&
+              kept_partial.scissor_top == 0 && kept_partial.scissor_bottom == 2048,
+              "a window offset leaving the VPORT scissor partially on-target is preserved, not dropped");
+    }
 
     CHECK(rs.color0_base == rdna2_addr(0x00100000u, 0x12u), "color0_base = (BASE<<8)|(EXT<<40)");
     CHECK(rs.color0_format == 0x0Au, "color0_format = 0x0A (FORMAT field)");
