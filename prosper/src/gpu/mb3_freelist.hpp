@@ -28,6 +28,13 @@ void mb3_note_global_recycler_bin(uint64_t base);
 // observed twice so a concurrent allocator pop cannot turn a stale first read into a false verdict.
 bool mb3_freelist_contains_stable(uint64_t block, Mb3FreelistMatch* match = nullptr);
 
+// #1226 POOLSHIFT window scan: walk every learned TLS pool array's bin region (both bundle heads
+// per 0x20-stride size class) and report heads whose value is a byte-shifted (>>8-encoded) pointer
+// to MAPPED guest memory — the poisoned-bin signature. Called per submit (env-gated by the caller)
+// so a state CHANGE bounds the poisoning free() to one submit window. Fault-safe; returns the hit
+// count and formats up to `cap` bytes into `out` (NUL-terminated) when out is non-null.
+int mb3_poolshift_window_scan(char* out, unsigned cap);
+
 // Test isolation for the process-global candidate registry.
 void mb3_reset_pool_candidates_for_test();
 

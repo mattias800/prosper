@@ -766,6 +766,8 @@ namespace {
     // #1226: APR-destination provenance (hle_file.cpp) — the bulk guest-writer no ring tracks.
     extern "C" int prosper_apr_dest_scan(uint64_t lo, uint64_t hi, char* out, size_t cap)
         __attribute__((weak));
+    // #1226: pool-candidate membership (mb3_freelist.cpp) — async-signal-safe atomic reads.
+    extern "C" int prosper_mb3_is_pool_candidate(uint64_t base) __attribute__((weak));
 
     // Issue-#312 heap-corruption attribution dump, fired on the first PROSPER_NULL_PAGE hit (the
     // deterministic precursor of DOLL's MallocBinned3 "Canary was 0x3" fatal: a read of address
@@ -2094,6 +2096,16 @@ namespace {
                         };
                         byte_dump("rdx", g_rdx);
                         byte_dump("r8", g_r8);
+                        // #1226: was the faulting pool array even visible to the window probe?
+                        if (prosper_mb3_is_pool_candidate) {
+                            for (uint64_t pb : { g_rdx & ~0xffffull, g_r8 & ~0xffffull }) {
+                                if (pb < 0x10000) continue;
+                                char cb2[96]; int cn2 = snprintf(cb2, sizeof cb2,
+                                    "[faultobj] pool 0x%llx candidate=%d\n",
+                                    (unsigned long long)pb, prosper_mb3_is_pool_candidate(pb));
+                                syscall(SYS_write, 2, cb2, (size_t)cn2);
+                            }
+                        }
                         // #1226: cross-reference the slot pages against APR write destinations —
                         // the bulk guest-writer outside every GPU provenance ring (#88 precedent).
                         if (prosper_apr_dest_scan) {
