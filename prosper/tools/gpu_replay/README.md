@@ -68,6 +68,8 @@ expected hash. `--allow-mismatch` is for an intentional differential such as `--
 ./build-linux/gpu_replay --draw 12:18 /tmp/submit.prgcap /tmp/pass.bmp
 ./build-linux/gpu_replay --draw 18 --draw-with-compute-prefix /tmp/submit.prgcap /tmp/draw.bmp
 ./build-linux/gpu_replay --through-operation 52 /tmp/submit.prgcap /tmp/prefix.bmp
+./build-linux/gpu_replay --draw-steps /tmp/steps/s --draw-steps-target 3840x2160 \
+  /tmp/submit.prgcap                              # visual bisection filmstrip (see below)
 ./build-linux/gpu_replay --warmup-repeats 2 /tmp/submit.prgcap /tmp/converged.bmp
 ./build-linux/gpu_replay --dump-resource 18:ps:34 /tmp/texture.bin /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-rtt-seed 0x7f9f504b0000 /tmp/history.bmp \
@@ -158,6 +160,25 @@ submit without losing those producers. Plain `--draw` intentionally remains the 
 order and all earlier work. Prefix output uses the last executed draw target's native dimensions. Use it with
 a hash-verified seeded final capsule for fast composition bisection; unlike `--draw`, it does not discard
 DMA copies, compute dispatches, or earlier draws.
+
+`--draw-steps PREFIX [--draw-steps-every N] [--draw-steps-target WxH]` is the **visual bisection** primitive —
+the fastest way to localize a composition defect (a black quad, a lost layer, a wrong-blended overlay) to the
+exact operation that introduces it, with **no oracle screenshot**. It renders the `--through-operation` prefix
+for each operation-step and dumps a numbered BMP filmstrip (`PREFIX_op<N>.bmp`) plus a per-step log line:
+
+```
+[draw-step] op<=N WxH nonzero-px=… visible-px=… hash=… -> path
+```
+
+Scrub the filmstrip (or the log's `visible-px`/`hash` columns) to the first step where the defect appears, then
+`--through-operation` / `--draw` around it for the precise draw and `--graph` + `--dump-resource` for what it
+samples and why. `--draw-steps-every N` sets the step size (default auto ≈ total/30, a ~30-frame contact sheet);
+narrow it to 1 near the divergence. `--draw-steps-target WxH` restricts dumps to steps whose prefix actually
+renders that target (matched on the real pixel count) — use it to watch one surface, e.g. the `3840x2160`
+scanout, build up instead of every intermediate render target. Prefer `visible-px` (RGB-nonzero pixels) over
+`nonzero-px` as the on-screen-content signal: a fully-opaque black frame is ~25% `nonzero-px` from the alpha
+channel alone, but `visible-px == 0`. Steps use mixed semantic **operation** indices (like `--graph`/
+`--through-operation`), not realized `--draw` indices.
 
 `--prepend` materializes and executes one earlier capsule in the same renderer instance before the consumer.
 Its rendered targets take precedence over consumer RTT seeds at matching addresses; unrelated seeds are still
