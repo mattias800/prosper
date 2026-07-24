@@ -341,12 +341,19 @@ prosper::frontend::PresentAttempt present_frame(Vk& vk, const uint8_t* rgba, uin
     su.waitSemaphoreCount = 1; su.pWaitSemaphores = &vk.acquireSem; su.pWaitDstStageMask = &waitStage;
     su.commandBufferCount = 1; su.pCommandBuffers = &vk.cmd;
     su.signalSemaphoreCount = 1; su.pSignalSemaphores = &vk.presentSem;
-    vkQueueSubmit(vk.queue, 1, &su, vk.inFlight);
 
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &vk.presentSem;
     pi.swapchainCount = 1; pi.pSwapchains = &vk.swapchain; pi.pImageIndices = &imgIndex;
-    VkResult pr = vkQueuePresentKHR(vk.queue, &pi);
+    VkResult pr;
+    {
+        // #1270: when this CPU present runs on the renderer's shared queue (the GPU-present miss fallback),
+        // serialize the submit + present CALLS against the renderer's submits. No-op on a private device.
+        std::unique_lock<std::mutex> lk(gpu::shared_present_submit_mutex(), std::defer_lock);
+        if (gpu::shared_present_active()) lk.lock();
+        vkQueueSubmit(vk.queue, 1, &su, vk.inFlight);
+        pr = vkQueuePresentKHR(vk.queue, &pi);
+    }
     return prosper::frontend::classify_present(pr);
 }
 
@@ -926,8 +933,24 @@ int main(int argc, char** argv) {
                     }
                     if (exitAfter && (int)shown >= exitAfter) running = false;
                 }
+            } else if (gpu::present_frame_seq() != lastFrameSeq) {
+                // #1270 Finding 2: no GPU frame was published this iteration. On a publish MISS (front
+                // target evicted/invalidated, or no free slot) the renderer still did the CPU readback, so
+                // present that CPU frame rather than stranding the window on a stale/black image. Also
+                // covers startup before the first publish. present_frame serializes on the shared queue.
+                gpu::PresentFrameLease cf;
+                if (gpu::present_acquire_rendered_frame(cf) && cf.width && cf.height && cf.rgba &&
+                    cf.rgba->size() == (size_t)cf.width * cf.height * 4) {
+                    PresentAttempt a = present_frame(vk, cf.rgba->data(), cf.width, cf.height);
+                    if (gpuPrevSlot >= 0) { prosper::frontend::present_blit_release(gpuPrevSlot); gpuPrevSlot = -1; }
+                    if (a == PresentAttempt::out_of_date) swapchainDirty = true;
+                    else if (a == PresentAttempt::skipped) std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                    else { lastFrameSeq = cf.frame_seq; shown++; lastFrameProgress = std::chrono::steady_clock::now(); }
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
             } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));   // no new GPU frame yet
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));   // no new GPU or CPU frame yet
             }
         } else {
         bool newFrame = testPattern || (gpu::present_frame_seq() != lastFrameSeq);

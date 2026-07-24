@@ -4195,9 +4195,10 @@ void set_shared_vulkan_context(const SharedVulkanContext& context) { g_shared_vu
 SharedVulkanContext shared_vulkan_context() { return g_shared_vulkan; }
 
 // Present unification (#1270): see gpu_execute.hpp. The atomic gates the lock so the common (headless /
-// non-shared / app-not-yet-adopted) path pays only a relaxed load. Set true exactly once, by prosper-app,
-// after it has adopted the shared queue for present and before its first present submit; never cleared
-// mid-run (the app owns the shared device for the process lifetime once adopted).
+// non-shared / app-not-yet-adopted) path pays only a single acquire load and takes no lock. Set true
+// exactly once, by prosper-app, after it has adopted the shared queue for present and before its first
+// present submit; never cleared mid-run (the app owns the shared device for the process lifetime once
+// adopted). acquire/release ordering publishes the adoption's writes to the guest thread.
 static std::atomic<bool> g_shared_present_active{false};
 std::mutex& shared_present_submit_mutex() {
     static std::mutex m;

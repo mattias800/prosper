@@ -747,9 +747,11 @@ inline const RenderVkCtx& render_vk_ctx() {
 }
 
 // Present unification (#1270): serialize a single queue CALL against prosper-app's present submits when
-// they share one VkQueue. Locks ONLY around the host call (never a GPU wait), and only once the app has
-// adopted the shared queue (shared_present_active()); otherwise it is a plain call after a relaxed atomic
-// load, so the headless/test/screenshot path and every non-shared device are unaffected.
+// they share one VkQueue, and only once the app has adopted the shared queue (shared_present_active());
+// otherwise it is a plain call after an acquire atomic load, so the headless/test/screenshot path and
+// every non-shared device are unaffected. vkQueueSubmit returns without waiting for GPU work; the
+// wait-idle wrapper (used only on the batch fence-timeout and compute-drain ERROR paths) does drain the
+// queue under the lock, which briefly blocks the peer thread's submits -- acceptable on those rare paths.
 inline VkResult render_locked_queue_submit(VkQueue q, uint32_t n, const VkSubmitInfo* s, VkFence f) {
     if (prosper::gpu::shared_present_active()) {
         std::lock_guard<std::mutex> lk(prosper::gpu::shared_present_submit_mutex());

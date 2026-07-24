@@ -10,6 +10,7 @@ namespace prosper::frontend {
 namespace {
 
 constexpr int kSlots = 3;   // 1 in-flight (consumer) + 1 published (untaken) + >=1 free
+constexpr VkFormat kScanoutFormat = VK_FORMAT_R8G8B8A8_UNORM;
 
 enum class SlotState { Free, Published, InFlight };
 
@@ -18,6 +19,7 @@ struct Slot {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     SlotState      state = SlotState::Free;
+    uint32_t       w = 0, h = 0;            // the size of THIS slot's current image (per-slot, #1270)
     uint64_t       frame_seq = 0;
 };
 
@@ -31,7 +33,6 @@ struct PresentBlitState {
     uint32_t        qfi = UINT32_MAX;
     VkCommandPool   pool = VK_NULL_HANDLE;
     VkFence         blit_fence = VK_NULL_HANDLE;   // publish waits its own blit on this (single producer)
-    uint32_t        img_w = 0, img_h = 0;   // current allocation size of the slot images (0 = none)
     Slot            slots[kSlots];
     int             latest = -1;            // slot index of the newest published frame
     bool            latest_taken = false;   // has the consumer acquired `latest`
@@ -47,6 +48,19 @@ uint32_t find_mem_type(VkPhysicalDevice phys, uint32_t bits, VkMemoryPropertyFla
     return UINT32_MAX;
 }
 
+// #1270: an optimal-tiling image can only be blit source/dest if the driver advertises the feature for
+// that format. On any conformant driver RGBA8/RGBA16F/BGRA8 all support BLIT_SRC/BLIT_DST, so this is
+// belt-and-suspenders: an unsupported combination declines to the CPU present path instead of producing a
+// validation error / garbage. vkGetPhysicalDeviceFormatProperties is a cheap driver-table lookup.
+bool blit_supported(VkPhysicalDevice phys, VkFormat src_format) {
+    auto has = [&](VkFormat f, VkFormatFeatureFlags bit) {
+        VkFormatProperties fp{}; vkGetPhysicalDeviceFormatProperties(phys, f, &fp);
+        return (fp.optimalTilingFeatures & bit) == bit;
+    };
+    return has(src_format, VK_FORMAT_FEATURE_BLIT_SRC_BIT) &&
+           has(kScanoutFormat, VK_FORMAT_FEATURE_BLIT_DST_BIT);
+}
+
 void image_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to,
                    VkAccessFlags src_access, VkAccessFlags dst_access,
                    VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage) {
@@ -59,40 +73,38 @@ void image_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageL
     vkCmdPipelineBarrier(cb, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
-// Destroy the per-slot images (caller holds mx and has made the device idle).
-void destroy_slot_images(PresentBlitState& s) {
-    for (auto& sl : s.slots) {
-        if (sl.image)  vkDestroyImage(s.dev, sl.image, nullptr);
-        if (sl.memory) vkFreeMemory(s.dev, sl.memory, nullptr);
-        sl.image = VK_NULL_HANDLE; sl.memory = VK_NULL_HANDLE;
-        sl.state = SlotState::Free;
-    }
-    s.img_w = s.img_h = 0; s.latest = -1; s.latest_taken = false;
+void destroy_slot_image(PresentBlitState& s, Slot& sl) {
+    if (sl.image)  vkDestroyImage(s.dev, sl.image, nullptr);
+    if (sl.memory) vkFreeMemory(s.dev, sl.memory, nullptr);
+    sl.image = VK_NULL_HANDLE; sl.memory = VK_NULL_HANDLE; sl.w = sl.h = 0;
 }
 
-bool create_slot_images(PresentBlitState& s, uint32_t w, uint32_t h) {
-    for (auto& sl : s.slots) {
-        VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ici.imageType = VK_IMAGE_TYPE_2D;
-        ici.format = VK_FORMAT_R8G8B8A8_UNORM;
-        ici.extent = {w, h, 1};
-        ici.mipLevels = 1; ici.arrayLayers = 1;
-        ici.samples = VK_SAMPLE_COUNT_1_BIT;
-        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        if (vkCreateImage(s.dev, &ici, nullptr, &sl.image) != VK_SUCCESS) return false;
-        VkMemoryRequirements req{}; vkGetImageMemoryRequirements(s.dev, sl.image, &req);
-        uint32_t mt = find_mem_type(s.phys, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (mt == UINT32_MAX) return false;
-        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        mai.allocationSize = req.size; mai.memoryTypeIndex = mt;
-        if (vkAllocateMemory(s.dev, &mai, nullptr, &sl.memory) != VK_SUCCESS) return false;
-        if (vkBindImageMemory(s.dev, sl.image, sl.memory, 0) != VK_SUCCESS) return false;
-        sl.state = SlotState::Free;
-    }
-    s.img_w = w; s.img_h = h; s.latest = -1; s.latest_taken = false;
+// Ensure THIS slot owns an image of exactly (w,h). Caller holds mx AND the slot is Free -- a Free slot's
+// last GPU use (its publish blit, fence-waited; or the consumer's read, released only after its present
+// fence) is provably complete, so destroying/recreating its image needs no device wait and can never
+// touch an image the consumer still references (#1270 Finding 1). Returns false on allocation failure.
+bool ensure_slot_image(PresentBlitState& s, Slot& sl, uint32_t w, uint32_t h) {
+    if (sl.image && sl.w == w && sl.h == h) return true;
+    destroy_slot_image(s, sl);
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = kScanoutFormat;
+    ici.extent = {w, h, 1};
+    ici.mipLevels = 1; ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(s.dev, &ici, nullptr, &sl.image) != VK_SUCCESS) { sl.image = VK_NULL_HANDLE; return false; }
+    VkMemoryRequirements req{}; vkGetImageMemoryRequirements(s.dev, sl.image, &req);
+    uint32_t mt = find_mem_type(s.phys, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mt == UINT32_MAX) { destroy_slot_image(s, sl); return false; }
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size; mai.memoryTypeIndex = mt;
+    if (vkAllocateMemory(s.dev, &mai, nullptr, &sl.memory) != VK_SUCCESS) { destroy_slot_image(s, sl); return false; }
+    if (vkBindImageMemory(s.dev, sl.image, sl.memory, 0) != VK_SUCCESS) { destroy_slot_image(s, sl); return false; }
+    sl.w = w; sl.h = h;
     return true;
 }
 
@@ -128,24 +140,21 @@ int pick_free_slot(PresentBlitState& s) {
 
 } // namespace
 
-bool present_blit_publish(VkImage src, VkImageLayout src_layout, VkFormat /*src_format*/,
+bool present_blit_publish(VkImage src, VkImageLayout src_layout, VkFormat src_format,
                           uint32_t w, uint32_t h, uint64_t frame_seq) {
     if (!src || !w || !h) return false;
     PresentBlitState& s = S();
     std::lock_guard<std::mutex> lk(s.mx);
     if (!ensure_init(s)) return false;
-
-    // (Re)allocate the slot images if this is the first frame or the display size changed. A size change
-    // is rare (window resize); make the device idle first so no in-flight consumer read is dropped.
-    if (s.img_w != w || s.img_h != h) {
-        vkDeviceWaitIdle(s.dev);
-        if (s.img_w) destroy_slot_images(s);
-        if (!create_slot_images(s, w, h)) return false;
-    }
+    if (!blit_supported(s.phys, src_format)) return false;   // decline -> caller keeps CPU present path
 
     const int slot = pick_free_slot(s);
     if (slot < 0) return false;   // consumer is behind; drop this frame's publish (it keeps the last one)
     Slot& sl = s.slots[slot];
+    // Size the (Free) slot's image to this frame. A display-size change (or dynamic resolution) recreates
+    // ONLY this Free slot's image -- never an in-flight one -- so it cannot free an image the consumer
+    // still holds, and needs no device-wide wait (#1270 Finding 1).
+    if (!ensure_slot_image(s, sl, w, h)) return false;
 
     VkCommandBuffer cb = sl.cmd;
     vkResetCommandBuffer(cb, 0);
@@ -217,7 +226,7 @@ bool present_blit_acquire(GpuScanoutFrame& out) {
     sl.state = SlotState::InFlight;
     s.latest_taken = true;
     out.image = sl.image;
-    out.width = s.img_w; out.height = s.img_h;
+    out.width = sl.w; out.height = sl.h;
     out.frame_seq = sl.frame_seq;
     out.slot = s.latest;
     return true;
@@ -235,9 +244,9 @@ void present_blit_reset() {
     PresentBlitState& s = S();
     std::lock_guard<std::mutex> lk(s.mx);
     if (s.dev) vkDeviceWaitIdle(s.dev);
-    if (s.img_w && s.dev) destroy_slot_images(s);
+    if (s.dev)
+        for (auto& sl : s.slots) { destroy_slot_image(s, sl); sl.state = SlotState::Free; sl.cmd = VK_NULL_HANDLE; }
     if (s.dev) {
-        for (auto& sl : s.slots) sl.cmd = VK_NULL_HANDLE;   // freed with the pool
         if (s.blit_fence) { vkDestroyFence(s.dev, s.blit_fence, nullptr); s.blit_fence = VK_NULL_HANDLE; }
         if (s.pool) { vkDestroyCommandPool(s.dev, s.pool, nullptr); s.pool = VK_NULL_HANDLE; }
     }
@@ -246,6 +255,10 @@ void present_blit_reset() {
     s.latest = -1; s.latest_taken = false;
 }
 
-bool present_blit_ready() { return S().ok; }
+bool present_blit_ready() {
+    PresentBlitState& s = S();
+    std::lock_guard<std::mutex> lk(s.mx);
+    return s.ok;
+}
 
 } // namespace prosper::frontend

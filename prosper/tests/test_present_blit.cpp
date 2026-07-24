@@ -218,6 +218,77 @@ int main() {
            (unsigned long long)published.load(), (unsigned long long)consumed.load(),
            mismatches.load());
 
+    // #1270 Finding 3: the real front buffer can be R16G16B16A16_SFLOAT; present_blit converts it to the
+    // RGBA8 scanout format. Verify that conversion (including the HDR >1.0 clamp) with exactly-representable
+    // half values, single-threaded (the concurrent test above already covers the handoff mechanics).
+    {
+        const uint32_t rw = 32, rh = 16;
+        const size_t rsrcBytes = (size_t)rw * rh * 8, rdstBytes = (size_t)rw * rh * 4;
+        VkImage r16 = VK_NULL_HANDLE; VkDeviceMemory r16Mem = VK_NULL_HANDLE;
+        VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ici.imageType = VK_IMAGE_TYPE_2D; ici.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        ici.extent = {rw, rh, 1}; ici.mipLevels = 1; ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT; ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        vkCreateImage(ctx.dev, &ici, nullptr, &r16);
+        VkMemoryRequirements rq{}; vkGetImageMemoryRequirements(ctx.dev, r16, &rq);
+        VkMemoryAllocateInfo rmai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; rmai.allocationSize = rq.size;
+        rmai.memoryTypeIndex = mem_type(ctx.phys, rq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        vkAllocateMemory(ctx.dev, &rmai, nullptr, &r16Mem); vkBindImageMemory(ctx.dev, r16, r16Mem, 0);
+        auto hbuf = [&](VkDeviceSize sz, VkBufferUsageFlags u, VkBuffer& b, VkDeviceMemory& m, void** mp) {
+            VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bci.size = sz; bci.usage = u; bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            vkCreateBuffer(ctx.dev, &bci, nullptr, &b);
+            VkMemoryRequirements q{}; vkGetBufferMemoryRequirements(ctx.dev, b, &q);
+            VkMemoryAllocateInfo a{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; a.allocationSize = q.size;
+            a.memoryTypeIndex = mem_type(ctx.phys, q.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            vkAllocateMemory(ctx.dev, &a, nullptr, &m); vkBindBufferMemory(ctx.dev, b, m, 0);
+            if (mp) vkMapMemory(ctx.dev, m, 0, sz, 0, mp);
+        };
+        VkBuffer rstage, rrb; VkDeviceMemory rstageMem, rrbMem; void* rstageMap = nullptr; void* rrbMap = nullptr;
+        hbuf(rsrcBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, rstage, rstageMem, &rstageMap);
+        hbuf(rdstBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, rrb, rrbMem, &rrbMap);
+        struct HCase { uint16_t half; uint8_t expect; };
+        const HCase cases[] = {{0x0000, 0}, {0x3C00, 255}, {0x4000, 255}};   // 0.0->0, 1.0->255, 2.0->255(clamp)
+        int r16_mismatches = 0; uint64_t seq = 1000;
+        for (const HCase& c : cases) {
+            uint16_t* pmap = (uint16_t*)rstageMap;
+            for (size_t i = 0; i < (size_t)rw * rh * 4; i++) pmap[i] = c.half;
+            VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkResetCommandBuffer(prodCb, 0); vkBeginCommandBuffer(prodCb, &bi);
+            barrier(prodCb, r16, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkBufferImageCopy cp{}; cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; cp.imageExtent = {rw, rh, 1};
+            vkCmdCopyBufferToImage(prodCb, rstage, r16, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+            barrier(prodCb, r16, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            vkEndCommandBuffer(prodCb); locked_submit_wait(ctx, prodCb, prodFence);
+            CHECK(frontend::present_blit_publish(r16, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_FORMAT_R16G16B16A16_SFLOAT, rw, rh, seq++), "R16F publish succeeded");
+            frontend::GpuScanoutFrame gf; bool acq = false;
+            for (int t = 0; t < 1000 && !acq; t++) { acq = frontend::present_blit_acquire(gf); if (!acq) std::this_thread::yield(); }
+            CHECK(acq, "R16F acquire succeeded");
+            if (acq) {
+                vkResetCommandBuffer(prodCb, 0); vkBeginCommandBuffer(prodCb, &bi);
+                VkBufferImageCopy cp2{}; cp2.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; cp2.imageExtent = {rw, rh, 1};
+                vkCmdCopyImageToBuffer(prodCb, gf.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rrb, 1, &cp2);
+                vkEndCommandBuffer(prodCb); locked_submit_wait(ctx, prodCb, prodFence);
+                const uint8_t* out = (const uint8_t*)rrbMap;
+                for (size_t i = 0; i < rdstBytes; i++) if (out[i] != c.expect) { r16_mismatches++; break; }
+                frontend::present_blit_release(gf.slot);
+            }
+        }
+        CHECK(r16_mismatches == 0, "R16G16B16A16_SFLOAT source converts + clamps to the expected RGBA8");
+        printf("test_present_blit: r16f_conversion mismatches=%d\n", r16_mismatches);
+        vkDeviceWaitIdle(ctx.dev);
+        vkDestroyBuffer(ctx.dev, rstage, nullptr); vkFreeMemory(ctx.dev, rstageMem, nullptr);
+        vkDestroyBuffer(ctx.dev, rrb, nullptr); vkFreeMemory(ctx.dev, rrbMem, nullptr);
+        vkDestroyImage(ctx.dev, r16, nullptr); vkFreeMemory(ctx.dev, r16Mem, nullptr);
+    }
+
     vkDeviceWaitIdle(ctx.dev);
     frontend::present_blit_reset();
     gpu::set_shared_present_active(false);

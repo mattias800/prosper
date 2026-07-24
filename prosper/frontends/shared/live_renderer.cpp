@@ -3013,8 +3013,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 // front-buffer image directly, blit it into a scanout slot on the GPU and SKIP the CPU
                 // readback+reupload entirely. gpu_present_active() is false in every headless/test/
                 // screenshot process, so this whole branch is inert there and the CPU path below is
-                // byte-for-byte unchanged. A miss (image not resident this frame) falls through to the CPU
-                // path, so it can never cause a black present.
+                // byte-for-byte unchanged. On a MISS (image not resident/valid this frame) this falls
+                // through to the CPU readback below, which still publishes a CPU frame; prosper-app
+                // presents that CPU frame when no GPU frame was published (main.cpp), so a miss degrades to
+                // the CPU present path rather than freezing the window.
                 bool published_gpu = false;
                 if (front >= 0 && prosper::gpu::gpu_present_active()) {
                     const uint64_t front_va = prosper_vo_buffer_addr(front);
