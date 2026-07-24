@@ -944,6 +944,11 @@ if(TARGET prosper_core)
       target_link_libraries(test_shadow_compare_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME shadow_compare_render COMMAND test_shadow_compare_render)
 
+      # Generated mip chains bounded by the T#'s declared levels (#1272), end-to-end.
+      add_executable(test_texture_mip_render tests/test_texture_mip_render.cpp)
+      target_link_libraries(test_texture_mip_render PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME texture_mip_render COMMAND test_texture_mip_render)
+
       # Pipeline realization: build a VkPipeline whose fixed-function state comes from
       # resolve_pipeline_state(RenderState) and prove the resolved state drives rendering.
       add_executable(test_pipeline_render tests/test_pipeline_render.cpp)

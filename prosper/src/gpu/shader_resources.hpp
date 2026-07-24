@@ -144,6 +144,10 @@ struct ShaderResource {
     uint32_t      tile_mode         = 0;                  // T# GFX10 TileMode; drives auto-detile of a sampled surface
     // A packed mip-tail view shares the allocation's first 4/64 KiB block. gpu_addr remains the
     // shared block base; the backend applies mip_tail_offset and preserves sibling levels on writes.
+    // T#-declared mip-chain length relative to the selected base level (last_level - base_level + 1,
+    // WORD3 [19:16]/[15:12]). 1 = single level (the historical behavior). The backend uses this to
+    // bound generated-mip uploads (#1272) — it never invents levels a T# does not declare.
+    uint32_t      declared_mip_levels = 1;
     bool          in_mip_tail       = false;
     uint32_t      mip_tail_offset   = 0;
     uint32_t      mip_tail_bytes    = 0;

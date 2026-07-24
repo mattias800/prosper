@@ -1150,6 +1150,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             fr.th = decoded_reuse->output_height;
                             fr.td = is_volume ? r.depth : 1u;
                             fr.img_dim = r.img_dim;
+                            // #1272: plain 2D guest textures only — cube outputs stack 6 faces into
+                            // one 2D image (fr.th != th), and volumes keep their own path; generated
+                            // mips across face/slice boundaries would bleed.
+                            if (!is_volume && fr.th == th)
+                                fr.declared_mip_levels = r.declared_mip_levels;
                             narrow_done = decoded_reuse->narrow;
                             fr.persistent_texture_id = decoded_reuse->persistent_id;
                             decoded_textures.emplace(
@@ -1845,6 +1850,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         fr.tex_rgba = texture_pixels.data(); fr.tw = tw; fr.th = cube_done ? th * 6u : th;
                         fr.td = is_volume ? r.depth : 1u;
                         fr.img_dim = r.img_dim;
+                        // #1272: see the reuse path — plain 2D guest textures only.
+                        if (!is_volume && !cube_done)
+                            fr.declared_mip_levels = r.declared_mip_levels;
                         if (persistent_cache_eligible) {
                             size_t source_prefix_size = linear_source_prefix_size;
                             if (!persistent_source_matches_pixels) {
