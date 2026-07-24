@@ -104,6 +104,19 @@ int main() {
         r = fs_emulate_access(sx, c.mem, c.regs);
         CHECK(r.status == FsEmuStatus::Handled && c.regs[RAX] == 0xFFFFFFFFFFFFFF80ull, "movsx m8 sign-extends");
     }
+    // --- #1326: 0x66-prefixed movzx/movsx have a 16-bit destination — must MERGE into the low 16 bits
+    //     and preserve register bits 63:16 (the bug wrote a 32-bit result, zeroing 31:16 and 63:32). ---
+    {
+        Ctx c; c.mem[0] = 0x80;   // RAX starts at 0x1111111111111111
+        const uint8_t zx16[] = { 0x64, 0x66, 0x0f, 0xb6, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00 };
+        auto r = fs_emulate_access(zx16, c.mem, c.regs);
+        CHECK(r.status == FsEmuStatus::Handled && r.insn_len == 10, "movzx16 handled+len");
+        CHECK(c.regs[RAX] == 0x1111111111110080ull, "movzx ax zero-extends into 16-bit dest, preserving bits 63:16");
+        const uint8_t sx16[] = { 0x64, 0x66, 0x0f, 0xbe, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00 };
+        r = fs_emulate_access(sx16, c.mem, c.regs);
+        CHECK(r.status == FsEmuStatus::Handled && c.regs[RAX] == 0x111111111111FF80ull,
+              "movsx ax sign-extends into 16-bit dest, preserving bits 63:16");
+    }
     // --- disp8 form length: mov eax, fs:[rax+0x10] is mod=1 rm=0 (64 8b 40 10) ---
     {
         Ctx c; c.mem[0] = 0x42;

@@ -103,10 +103,15 @@ inline FsEmuResult fs_emulate_access(const uint8_t* p, volatile uint8_t* mem, ui
         }
     } else {
         switch (op) {
-            case 0xB6: wr_reg(reg, rd_mem(1), w?8:4); handled = true; break;          // movzx r, m8
-            case 0xB7: wr_reg(reg, rd_mem(2), w?8:4); handled = true; break;          // movzx r, m16
-            case 0xBE: wr_reg(reg, (uint64_t)(int64_t)(int8_t)rd_mem(1), w?8:4);  handled = true; break;  // movsx m8
-            case 0xBF: wr_reg(reg, (uint64_t)(int64_t)(int16_t)rd_mem(2), w?8:4); handled = true; break;  // movsx m16
+            // Destination width is the effective operand size `sz` (= 8 under REX.W, 2 under a 0x66
+            // operand-size prefix, else 4). The source width is fixed by the opcode (m8/m16). Using a
+            // bare w?8:4 here ignored 0x66 and wrote a 32-bit result into a 16-bit destination, clobbering
+            // all of bits 63:16 (zeroing 63:32 and overwriting 31:16) instead of merging into the low 16
+            // and preserving 63:16 (#1326).
+            case 0xB6: wr_reg(reg, rd_mem(1), sz); handled = true; break;          // movzx r, m8
+            case 0xB7: wr_reg(reg, rd_mem(2), sz); handled = true; break;          // movzx r, m16
+            case 0xBE: wr_reg(reg, (uint64_t)(int64_t)(int8_t)rd_mem(1), sz);  handled = true; break;  // movsx r, m8
+            case 0xBF: wr_reg(reg, (uint64_t)(int64_t)(int16_t)rd_mem(2), sz); handled = true; break;  // movsx r, m16
             default: break;
         }
     }
