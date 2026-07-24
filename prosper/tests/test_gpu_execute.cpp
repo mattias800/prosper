@@ -96,6 +96,18 @@ int main() {
     CHECK(green == total, "GpuState -> executor -> GREEN frame (full recompile+resolve+render spine)");
     CHECK(realized_draw.instance_count == 4,
           "draw realization retains the folded hardware instance count");
+    {
+        GpuState offset_state = st;
+        offset_state.uc[P::GE_INDX_OFFSET] = 37;
+        offset_state.draws[0].modifier = 0x1122334455667788ull;
+        DrawItem offset_item;
+        const bool made_offset = realize_draw_item(
+            offset_state, &offset_state.draws[0], offset_state.draws[0].index_count,
+            0x10000u, false, offset_item);
+        CHECK(made_offset && offset_item.vertex_offset == 37 &&
+              offset_item.raw_draw_modifier == 0x1122334455667788ull,
+              "draw realization retains GE_INDX_OFFSET and the raw ShaderDrawModifier");
+    }
 
     // DCC_DECOMPRESS binds a graphics helper whose color export is interpreted by the hardware as a
     // metadata operation. Prosper stores only materialized Vulkan color, so realization substitutes
@@ -432,6 +444,7 @@ int main() {
         prosper::test::BackendDraw d;
         d.vs = items[0].vs_words(); d.fs = items[0].fs_words(); d.ps = &items[0].ps;
         d.vcount = items[0].vertex_count; d.indices = items[0].indices;
+        d.vertex_offset = items[0].vertex_offset;
         return prosper::test::render_draws_rgba({std::move(d)}, W, H);
     };
     static const uint16_t kIdx012[3] = {0, 1, 2};

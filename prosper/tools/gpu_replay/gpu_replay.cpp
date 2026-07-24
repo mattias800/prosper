@@ -337,21 +337,23 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                           : d.vertex_count < d.raw_draw_count   ? " [DIVERGENT]" : "");
         }
         std::printf("draw[%zu] source=%llu target=%016llx extent=%ux%u fmt=%u cwm=%x "
-                    "target1=%016llx extent1=%ux%u fmt1=%u cwm1=%x vcount=%u indices=%zu topo=%u%s "
+                    "target1=%016llx extent1=%ux%u fmt1=%u cwm1=%x vcount=%u indices=%zu voffset=%d modifier=%016llx topo=%u%s "
                     "depth=%d/%d/%u stencil=%d blend=%d raster=%u/%u/%u viewport=%d %.1f,%.1f %.1fx%.1f "
-                    "scissor=%d [%d,%d)-[%d,%d) "
+                    "scissor=%d [%d,%d)-[%d,%d) export=%08x downconvert=%08x "
                     "vs=%zu/%016llx fs=%zu/%016llx\n",
                     i, static_cast<unsigned long long>(d.draw_index),
                     static_cast<unsigned long long>(d.color0_base), d.color0_width, d.color0_height,
                     d.ps.color0_format, d.ps.color_write_mask,
                     static_cast<unsigned long long>(d.color1_base), d.color1_width, d.color1_height,
                     d.ps.color1_format, d.ps.color1_write_mask, d.vertex_count, d.indices.size(),
+                    d.vertex_offset, static_cast<unsigned long long>(d.raw_draw_modifier),
                     d.ps.topology, rawtag, d.ps.depth_test_enable,
                     d.ps.depth_write_enable, d.ps.depth_compare_op, d.ps.stencil_enable, d.ps.blend_enable,
                     d.ps.cull_mode, d.ps.front_face, d.ps.polygon_mode,
                     d.ps.has_viewport, d.ps.viewport_x, d.ps.viewport_y, d.ps.viewport_w, d.ps.viewport_h,
                     d.ps.has_scissor, d.ps.scissor_left, d.ps.scissor_top,
                     d.ps.scissor_right, d.ps.scissor_bottom,
+                    d.ps.spi_shader_col_format, d.ps.sx_ps_downconvert,
                     d.vs.size(), static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(
                         reinterpret_cast<const uint8_t*>(d.vs.data()), d.vs.size() * 4)),
                     d.fs.size(), static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(
@@ -359,9 +361,10 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
         // Blend detail: UI compositing correctness hangs on the exact color AND alpha factor
         // programming (a separate-alpha UI backdrop writes a different alpha than its color
         // factors imply — #320's dialogue overlay), so make the full equation inspectable.
-        std::printf("  blend color=%u,%u op=%u alpha=%u,%u aop=%u\n",
+        std::printf("  blend color=%u,%u op=%u alpha=%u,%u aop=%u logic=%d/%u\n",
                     d.ps.src_color_blend_factor, d.ps.dst_color_blend_factor, d.ps.color_blend_op,
-                    d.ps.src_alpha_blend_factor, d.ps.dst_alpha_blend_factor, d.ps.alpha_blend_op);
+                    d.ps.src_alpha_blend_factor, d.ps.dst_alpha_blend_factor, d.ps.alpha_blend_op,
+                    d.ps.logic_op_enable, d.ps.logic_op);
         std::printf("  stencil clear=%u cmp=%u/%u fail=%u/%u pass=%u/%u zfail=%u/%u "
                     "ref=%u/%u opval=%u/%u cmask=%02x/%02x wmask=%02x/%02x\n",
                     d.ps.stencil_clear_value, d.ps.stencil_compare_op[0], d.ps.stencil_compare_op[1],

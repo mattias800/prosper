@@ -51,7 +51,11 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // mip-declaring title replayed single-level.
 // v25 (#1240): each realized/failed draw pipeline retains CB_COLOR_CONTROL.MODE=3 resolve intent in
 // another version-gated tail, keeping every v1-v24 record prefix byte-exact.
-constexpr uint32_t kVersion = 25;
+// v26: retain SPI shader export and SX render-target downconversion formats per draw.
+// v27: retain each draw's raw ShaderDrawModifier and signed GE_INDX_OFFSET. The latter is a draw
+// parameter (Vulkan firstVertex/vertexOffset), not pipeline state; omitting it collapsed distinct
+// ranges of a shared vertex pool onto vertex zero in both live rendering and replay.
+constexpr uint32_t kVersion = 27;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -975,6 +979,8 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.ps = d.ps; c.vertex_count = d.vertex_count;
         c.instance_count = d.instance_count;
         c.raw_draw_count = d.raw_draw_count; c.raw_indexed = d.raw_indexed;   // #1256
+        c.raw_draw_modifier = d.raw_draw_modifier;
+        c.vertex_offset = d.vertex_offset;
         c.indices = d.indices; c.color0_base = d.color0_base;
         c.color0_width = d.color0_width; c.color0_height = d.color0_height;
         c.color1_base = d.color1_base;
@@ -1538,6 +1544,23 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
     for (const auto& diagnostic : c.failure_diagnostics)
         if (diagnostic.pipeline_present) w.u8(diagnostic.pipeline.cb_resolve ? 1u : 0u);
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws) {
+        w.u32(draw.ps.spi_shader_col_format);
+        w.u32(draw.ps.sx_ps_downconvert);
+    }
+    w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
+    for (const auto& diagnostic : c.failure_diagnostics) if (diagnostic.pipeline_present) {
+        w.u32(diagnostic.pipeline.spi_shader_col_format);
+        w.u32(diagnostic.pipeline.sx_ps_downconvert);
+    }
+    // v27: raw draw modifier plus GE_INDX_OFFSET-derived Vulkan draw parameter. Keep this in a
+    // trailing block so v1-v26 prefixes remain byte-exact and older captures default both to zero.
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws) {
+        w.u64(draw.raw_draw_modifier);
+        w.u32(static_cast<uint32_t>(draw.vertex_offset));
+    }
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -2127,6 +2150,32 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             diagnostic.pipeline.cb_resolve = enabled != 0;
         }
     }
+    if (version >= 26) {
+        uint32_t draw_count = 0;
+        if (!r.u32(draw_count) || draw_count != c.draws.size()) {
+            error = "invalid color-export draw-state count"; return false;
+        }
+        for (auto& draw : c.draws)
+            if (!r.u32(draw.ps.spi_shader_col_format) || !r.u32(draw.ps.sx_ps_downconvert)) return false;
+        uint32_t failure_count = 0;
+        if (!r.u32(failure_count) || failure_count != c.failure_diagnostics.size()) {
+            error = "invalid color-export failure-state count"; return false;
+        }
+        for (auto& diagnostic : c.failure_diagnostics) if (diagnostic.pipeline_present)
+            if (!r.u32(diagnostic.pipeline.spi_shader_col_format) ||
+                !r.u32(diagnostic.pipeline.sx_ps_downconvert)) return false;
+    }
+    if (version >= 27) {
+        uint32_t draw_count = 0;
+        if (!r.u32(draw_count) || draw_count != c.draws.size()) {
+            error = "invalid draw-parameter state count"; return false;
+        }
+        for (auto& draw : c.draws) {
+            uint32_t vertex_offset = 0;
+            if (!r.u64(draw.raw_draw_modifier) || !r.u32(vertex_offset)) return false;
+            draw.vertex_offset = static_cast<int32_t>(vertex_offset);
+        }
+    }
     if (version >= 7 && !validate_failure_diagnostics(c, error)) return false;
     if (r.left) { error = "capture has trailing data"; return false; }
     return true;
@@ -2214,6 +2263,8 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         d.ps = x.ps; d.vertex_count = x.vertex_count;
         d.instance_count = x.instance_count;
         d.raw_draw_count = x.raw_draw_count; d.raw_indexed = x.raw_indexed;   // #1256
+        d.raw_draw_modifier = x.raw_draw_modifier;
+        d.vertex_offset = x.vertex_offset;
         d.indices = x.indices; d.color0_base = x.color0_base;
         d.color0_width = x.color0_width; d.color0_height = x.color0_height;
         d.color1_base = x.color1_base;

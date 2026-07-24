@@ -177,6 +177,7 @@ RenderState extract_render_state(const GpuState& st) {
     // a Uc-class SetRegsIndirect / CreatePrimState's uc[2]), NOT a context register — read it from st.uc.
     // (Reading st.cx left it 0 -> the default PointList topology, so triangles rasterized as ~3 points.)
     rs.prim_type = PM4_FIELD(rd(st.uc, P::VGT_PRIMITIVE_TYPE), VGT_PRIMITIVE_TYPE, PRIM_TYPE);
+    rs.ge_indx_offset = rd(st.uc, P::GE_INDX_OFFSET);
 
     // Depth/stencil test state (decoded fields of DB_DEPTH_CONTROL).
     const uint32_t dc = rd(st.cx, P::DB_DEPTH_CONTROL);
@@ -282,6 +283,10 @@ RenderState extract_render_state(const GpuState& st) {
     // resolved Vulkan write mask intersects both registers so channels the shader does not export
     // preserve their existing attachment contents (AMD RDNA2 EXP EN semantics, Table 56).
     rs.cb_shader_mask    = st.cx.count(P::CB_SHADER_MASK) ? rd(st.cx, P::CB_SHADER_MASK) : 0xFFFFFFFFu;
+    rs.spi_shader_col_format = st.cx.count(P::SPI_SHADER_COL_FORMAT)
+        ? rd(st.cx, P::SPI_SHADER_COL_FORMAT) : 0u;
+    rs.sx_ps_downconvert = st.cx.count(P::SX_PS_DOWNCONVERT)
+        ? rd(st.cx, P::SX_PS_DOWNCONVERT) : 0u;
 
     // Viewport 0 transform (guest floats; all-zero when never programmed).
     rs.vport_xscale  = flt(rd(st.cx, P::PA_CL_VPORT_XSCALE));
@@ -423,6 +428,8 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
         vk_color_format(rs.color0_format, rs.color0_number_type, rs.color0_comp_swap));
     ps.color1_format = rs.color1_format ? static_cast<uint32_t>(
         vk_color_format(rs.color1_format, rs.color1_number_type, rs.color1_comp_swap)) : 0u;
+    ps.spi_shader_col_format = rs.spi_shader_col_format;
+    ps.sx_ps_downconvert = rs.sx_ps_downconvert;
 
     // Fast-clear color: decode the CB_COLOR0_CLEAR_WORD when the game programmed one (#309). A
     // decode miss (no fast-clear, or an unmapped format) leaves has_clear_color false and the

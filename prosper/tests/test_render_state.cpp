@@ -126,6 +126,8 @@ int main() {
         { P::CB_BLEND1_CONTROL,  (1u << 30) | (1u << 0) | (5u << 8) | (0u << 5) },
         { P::CB_TARGET_MASK,     0x000000FFu },
         { P::CB_SHADER_MASK,     0x000000F3u },
+        { P::SPI_SHADER_COL_FORMAT, 0x00000004u },
+        { P::SX_PS_DOWNCONVERT,     0x00000005u },
         // CB fast-clear (#309): CLEAR_WORD0 holds one texel in the surface's 8_8_8_8 format.
         { P::CB_COLOR0_CLEAR_WORD0, 0x11223344u },
         { P::CB_COLOR0_CLEAR_WORD1, 0x00000000u },
@@ -158,7 +160,10 @@ int main() {
     uint32_t buffer[256]; memset(buffer, 0, sizeof buffer);
     Dcb dcb{}; dcb.bottom = buffer; dcb.top = buffer + 256; dcb.cursor_up = buffer; dcb.cursor_down = buffer + 256;
     auto D = (uint64_t)(uintptr_t)&dcb;
-    ShaderReg uc_regs[] = { { P::VGT_PRIMITIVE_TYPE, 0x00000004u } };   // PRIM_TYPE = 4 (uconfig register)
+    ShaderReg uc_regs[] = {
+        { P::VGT_PRIMITIVE_TYPE, 0x00000004u }, // PRIM_TYPE = 4 (uconfig register)
+        { P::GE_INDX_OFFSET, 0xFFFFFFF9u },      // signed vertex offset = -7
+    };
     setcx(D, (uint64_t)(uintptr_t)cx_regs, sizeof(cx_regs)/sizeof(cx_regs[0]), 0, 0, 0);
     setsh(D, (uint64_t)(uintptr_t)sh_regs, sizeof(sh_regs)/sizeof(sh_regs[0]), 0, 0, 0);
     setuc(D, (uint64_t)(uintptr_t)uc_regs, sizeof(uc_regs)/sizeof(uc_regs[0]), 0, 0, 0);
@@ -170,11 +175,17 @@ int main() {
     CHECK(rs.ps_addr == rdna2_addr(0x00ABCDEFu, 0x12u), "PS shader addr = (LO<<8)|(HI<<40)");
     CHECK(rs.es_addr == rdna2_addr(0x00111111u, 0x34u), "ES shader addr = (LO<<8)|(HI<<40)");
     CHECK(rs.gs_addr == 0 && rs.hs_addr == 0, "unset GS/HS shader addrs are 0");
+    CHECK(static_cast<int32_t>(rs.ge_indx_offset) == -7,
+          "signed GE_INDX_OFFSET survives render-state extraction");
     CHECK(rs.ps_input_cntl_valid_mask == 0x3u &&
           rs.ps_input_cntl[0] == 0x00000401u && rs.ps_input_cntl[1] == 0x00000320u,
           "programmed SPI_PS_INPUT_CNTL words and presence mask are retained");
     CHECK(rs.ps_input_ena == 0x00000303u && rs.ps_input_addr == 0x000003CFu,
           "SPI_PS_INPUT_ENA/ADDR system-value VGPR controls are retained");
+    CHECK(rs.spi_shader_col_format == 4u && rs.sx_ps_downconvert == 5u &&
+          resolve_pipeline_state(rs).spi_shader_col_format == 4u &&
+          resolve_pipeline_state(rs).sx_ps_downconvert == 5u,
+          "pixel export and render-target downconversion formats survive resolution");
     CHECK(rs.has_scissor && rs.scissor_left == 12 && rs.scissor_top == 19 &&
           rs.scissor_right == 70 && rs.scissor_bottom == 75,
           "screen/window/generic/enabled-viewport scissors intersect with per-rectangle offsets");

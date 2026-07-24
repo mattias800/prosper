@@ -64,6 +64,9 @@ struct RenderState {
 
     // Primitive topology (VGT_PRIMITIVE_TYPE.PRIM_TYPE).
     uint32_t prim_type = 0;
+    // Signed base vertex/start vertex supplied through the UCONFIG GE_INDX_OFFSET register.
+    // Non-indexed draws pass it as firstVertex; indexed draws pass it as vertexOffset.
+    uint32_t ge_indx_offset = 0;
 
     // Depth/stencil test state, decoded from DB_DEPTH_CONTROL (field shifts/masks from pm4_registers.hpp,
     // matching Kyty hw_ctx_set_depth_control).
@@ -135,6 +138,8 @@ struct RenderState {
     // hardware/command-stream absent-register fallback so adding CB_SHADER_MASK cannot silently
     // turn those otherwise-valid color writes off.
     uint32_t cb_shader_mask    = 0xFFFFFFFFu; // CB_SHADER_MASK (components exported by the pixel shader)
+    uint32_t spi_shader_col_format = 0; // SPI_SHADER_COL_FORMAT (4-bit export format per MRT)
+    uint32_t sx_ps_downconvert = 0;      // SX_PS_DOWNCONVERT (4-bit target conversion per MRT)
     // Rasterizer cull/front-face/polygon mode (PA_SU_SC_MODE_CNTL). An ABSENT register reads 0, which
     // decodes to CULL_NONE + CCW-front + FILL — exactly the prior hardcoded default, so nothing changes
     // for a guest that never programs it. Decoded in resolve to Vk enums (#456).
@@ -166,6 +171,8 @@ RenderState extract_render_state(const GpuState& st);
 struct ResolvedPipelineState {
     uint32_t topology         = 0;   // == VkPrimitiveTopology
     uint32_t color0_format    = 0;   // == VkFormat (0 = VK_FORMAT_UNDEFINED)
+    uint32_t spi_shader_col_format = 0;
+    uint32_t sx_ps_downconvert = 0;
 
     // CB_COLOR_CONTROL.MODE == RESOLVE (3): this draw is a hardware MSAA resolve of the color0 (MSAA)
     // surface into the color1 destination, not an ordinary draw. prosper renders single-sample, so the

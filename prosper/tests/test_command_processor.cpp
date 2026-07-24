@@ -73,7 +73,7 @@ int main() {
     setsh_direct(D, pack_reg(0x2C0Du, 0xDDDDDDDDu), 0, 0, 0, 0);
     setuc_direct(D, pack_reg(0x0123u, 0xEEEEEEEEu), 0, 0, 0, 0);
     instances(D, 3, 0, 0, 0, 0);
-    draw(D, 0x0300, 0, 0, 0, 0);
+    draw(D, 0x0300, 0x1122334455667788ull, 0, 0, 0);
     instances(D, 0, 0, 0, 0, 0);
     draw(D, 0x0006, 0, 0, 0, 0);
 
@@ -99,6 +99,8 @@ int main() {
     CHECK(st.index_type == 2, "index_type = 2 (from SetIndexSize)");
 
     CHECK(st.draws.size() == 2, "2 draws recorded");
+    CHECK(st.draws.size() == 2 && st.draws[0].modifier == 0x1122334455667788ull,
+          "DrawIndexAuto retains its ShaderDrawModifier");
     CHECK(st.draws.size() == 2 && st.draws[0].index_count == 0x0300, "draw0 index_count = 0x300");
     CHECK(st.draws.size() == 2 && st.draws[1].index_count == 0x0006, "draw1 index_count = 0x6");
     CHECK(st.draws.size() == 2 && st.draws[0].instance_count == 3 && st.draws[0].state &&
