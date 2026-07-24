@@ -511,6 +511,15 @@ std::mutex& shared_present_submit_mutex();
 void set_shared_present_active(bool active);
 bool shared_present_active();
 
+// Present unification (#1270): true once prosper-app has adopted the render device and is consuming the
+// renderer's front-buffer image directly (present_blit). While true the renderer publishes the front image
+// via present_blit_publish and SKIPS the CPU readback+reupload of the scanout buffer. Distinct from
+// shared_present_active: GPU present can run on a dedicated present queue (no shared-queue mutex needed).
+// Stays false in every headless/test/screenshot process, so their CPU present path is byte-for-byte
+// unchanged. Set once by prosper-app after a successful adoption; never cleared mid-run.
+void set_gpu_present_active(bool active);
+bool gpu_present_active();
+
 // Ordered memory producers need the same authoritative storage version as live compute. A source
 // may begin inside a target, so the renderer validates the complete requested byte range instead of
 // exposing an unbounded pointer into its cache.

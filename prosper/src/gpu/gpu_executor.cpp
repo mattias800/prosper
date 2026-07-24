@@ -4209,6 +4209,13 @@ void set_shared_present_active(bool active) {
 bool shared_present_active() {
     return g_shared_present_active.load(std::memory_order_acquire);
 }
+static std::atomic<bool> g_gpu_present_active{false};
+void set_gpu_present_active(bool active) {
+    g_gpu_present_active.store(active, std::memory_order_release);
+}
+bool gpu_present_active() {
+    return g_gpu_present_active.load(std::memory_order_acquire);
+}
 bool read_live_render_target(uint64_t gpu_addr, LiveTargetSnapshot& snapshot) {
     snapshot = {};
     return g_live_target_reader && g_live_target_reader(gpu_addr, snapshot);
