@@ -75,6 +75,12 @@ int main() {
     CHECK(resolve_guest_path("//") == virtual_root,
           "repeated root separators cannot fall through to the host root");
     CHECK(virtual_root != "/", "virtual root is not the real host root");
+    CHECK(resolve_guest_path("\\foo") == base + "/\\foo",
+          "non-root leading backslash remains rooted under /app0");
+    CHECK(resolve_guest_path("\\\\server\\share") == base + "/\\\\server\\share",
+          "UNC-like guest spelling remains rooted under /app0");
+    CHECK(resolve_guest_path("file://\\foo") == base + "/\\foo",
+          "file URL with non-root backslash remains rooted under /app0");
 
     // Benign in-sandbox '..': normalizes to the same host file the OS would have resolved anyway.
     CHECK(resolve_guest_path("/app0/data/../data/config.bin") == base + "/data/config.bin",

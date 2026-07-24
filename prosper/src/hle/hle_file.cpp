@@ -755,10 +755,14 @@ std::string resolve_guest_path(const char* guest_path) {
     // is the absolute spelling, "file://<relative>" the BaseDir-relative one).
     if (p.rfind("file://", 0) == 0) p = p.substr(7);
     if (p.empty()) return {};
+    // A separator-only spelling names the guest root. Send it directly to translate() so a bare
+    // backslash reaches the virtual-root case without making every leading-backslash path host-
+    // absolute on Windows ("\\foo" and UNC-like spellings must remain rooted under /app0).
+    if (p.find_first_not_of("/\\") == std::string::npos) return translate(p.c_str());
     // Sony media APIs accept content paths relative to the title's application root. Unlike the
     // guest libc, a native host backend has no guest current-working-directory state, so root the
     // relative spelling explicitly before applying the shared mount translation.
-    if (p[0] != '/' && p[0] != '\\') {
+    if (p[0] != '/') {
         // A relative URL may carry leading ".." components: UE4 media paths are BaseDir-relative
         // ("../../../<project>/Content/..." climbs from Engine/Binaries/<Platform>/ up to the
         // package root), but prosper models no BaseDir/CWD and ArcRunner's dump has no such
