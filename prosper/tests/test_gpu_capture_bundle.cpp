@@ -265,14 +265,17 @@ int main() {
     record_gpu_timeline_present(6, 0, 0, 1920, 1080);
     GpuState empty_submit;
     record_gpu_timeline_submit(empty_submit, 77);
+    record_gpu_timeline_submit(empty_submit, 78);
     record_gpu_timeline_present(7, 0, 0, 1920, 1080);
     GpuCaptureBundle ds_bundle;
-    GpuCaptureFile ds_first;
+    GpuCaptureFile ds_first, ds_second;
     CHECK(ds_snapshots == 1 && read_gpu_capture_bundle(ds_bundle_path.string(), ds_bundle, error) &&
-          ds_bundle.submits.size() == 1 &&
+          ds_bundle.submits.size() == 2 &&
           materialize_gpu_capture_bundle_submit(ds_bundle, 0, ds_first, error) &&
-          ds_first.ds_seeds.size() == 1 && ds_first.ds_seeds[0].depth == ds_seed.depth,
-          "F9 bundle seeds its first submit with capture-boundary depth/stencil state");
+          materialize_gpu_capture_bundle_submit(ds_bundle, 1, ds_second, error) &&
+          ds_first.ds_seeds.size() == 1 && ds_first.ds_seeds[0].depth == ds_seed.depth &&
+          ds_second.ds_seeds.empty(),
+          "F9 bundle seeds only its first submit with capture-boundary depth/stencil state");
     set_gpu_capture_ds_seed_snapshot_reader({});
     std::filesystem::remove(ds_bundle_path, ec);
 
