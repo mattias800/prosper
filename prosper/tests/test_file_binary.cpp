@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>   // setenv/_putenv_s (PROSPER_DENY_SUBSTR arming)
 #include <cstring>
 #include <filesystem>
 #include <map>
@@ -54,9 +55,9 @@ int main() {
     // (the guest namespace resolves case-insensitively since #1233, so a casing variant must
     // not defeat the deny knob).
 #ifdef _WIN32
-    _putenv_s("PROSPER_DENY_SUBSTR", ".tmpdeny");
+    _putenv_s("PROSPER_DENY_SUBSTR", ".TMPDENY");
 #else
-    setenv("PROSPER_DENY_SUBSTR", ".tmpdeny", 1);
+    setenv("PROSPER_DENY_SUBSTR", ".TMPDENY", 1);
 #endif
     const char* path = "prosper-test-file-binary.tmp";
     std::array<uint8_t, 512> expected{};
