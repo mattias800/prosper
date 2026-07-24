@@ -1442,7 +1442,13 @@ struct PersistentDsImage {
     bool layout_initialized = false;
     bool depth_valid = false;
     bool stencil_valid = false;
+    uint64_t last_depth_write = 0;   // sampled-bridge recency (#1275)
 };
+
+inline uint64_t& persistent_ds_write_generation() {
+    static uint64_t generation = 0;
+    return generation;
+}
 
 inline std::unordered_map<PersistentDsKey, PersistentDsImage, PersistentDsKeyHash>&
 persistent_ds_cache() {
@@ -1463,17 +1469,27 @@ inline PersistentDsSampled find_persistent_ds_sampled(uint64_t addr, uint32_t wi
                                                       uint32_t height) {
     if (!addr) return {};
     static const bool bridge_log = getenv("PROSPER_DSBRIDGE_LOG") != nullptr;
+    // Prefer the most recently DEPTH-WRITTEN match: a surface re-keyed (D32 -> D32S8) keeps its
+    // stale sibling entry, and unordered_map iteration order must not pick the winner.
+    PersistentDsSampled best{};
+    uint64_t best_write = 0;
     for (auto& [key, image] : persistent_ds_cache()) {
         if (key.w != width || key.h != height) continue;
         if (key.dr != addr && key.dw != addr) continue;
         if (!image.depth_valid || !image.layout_initialized || !image.image) continue;
+        if (!best.image || image.last_depth_write > best_write) {
+            best = {&image, static_cast<VkFormat>(key.fmt)};
+            best_write = image.last_depth_write;
+        }
+    }
+    if (best.image) {
         if (bridge_log) {
             static int hits = 0;
             if (hits++ < 8)
                 fprintf(stderr, "[dsbridge] HIT addr=0x%llx %ux%u fmt=%u\n",
-                        (unsigned long long)addr, width, height, key.fmt);
+                        (unsigned long long)addr, width, height, (unsigned)best.format);
         }
-        return {&image, static_cast<VkFormat>(key.fmt)};
+        return best;
     }
     if (bridge_log) {
         static int misses = 0;
@@ -3099,7 +3115,24 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                             vkBindBufferMemory(dev, upload.staging, upload.staging_memory, 0);
                             void* sp = nullptr;
                             vkMapMemory(dev, upload.staging_memory, 0, tbytes, 0, &sp);
-                            std::memcpy(sp, r.tex_rgba, static_cast<size_t>(tbytes));
+                            if (r.tex_rgba) {
+                                std::memcpy(sp, r.tex_rgba, static_cast<size_t>(tbytes));
+                            } else {
+                                // Only a declined/missed depth-plane borrow reaches the creation
+                                // path with no CPU pixels (#1275: the bridge deliberately carries
+                                // none — e.g. the consumer samples its own bound DS attachment, or
+                                // the plane was invalidated between the frontend gate and this
+                                // lookup). Bind well-defined zeros — the value the guest-byte
+                                // decode of an unwritten depth address produced — and say so.
+                                std::memset(sp, 0, static_cast<size_t>(tbytes));
+                                static int declined_logged = 0;
+                                if (declined_logged++ < 16)
+                                    fprintf(stderr,
+                                            "[dsbridge] borrow declined/missed for 0x%llx %ux%u -> "
+                                            "zero texture\n",
+                                            (unsigned long long)r.persistent_depth_target_id,
+                                            r.tw, r.th);
+                            }
                             vkUnmapMemory(dev, upload.staging_memory);
                         }
                     }
@@ -3158,6 +3191,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     };
                     sci.magFilter = vkflt(r.mag_filter); sci.minFilter = vkflt(r.min_filter);
                     sci.mipmapMode = r.mip_filter ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+                    // Sampled depth bridge (#1275): LINEAR filtering of depth formats is an OPTIONAL
+                    // Vulkan format feature, and the manual-compare lowering takes single taps
+                    // anyway (filter-then-compare would differ from hardware's compare-then-filter
+                    // PCF regardless). Force NEAREST for borrowed depth views.
+                    if (upload.borrowed_ds) {
+                        sci.magFilter = VK_FILTER_NEAREST;
+                        sci.minFilter = VK_FILTER_NEAREST;
+                        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+                    }
                     sci.addressModeU = vkaddr(r.addr_uvw[0]);
                     sci.addressModeV = vkaddr(r.addr_uvw[1]);
                     sci.addressModeW = vkaddr(r.addr_uvw[2]);
@@ -3883,13 +3925,13 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // between passes. Transition each (once) to SHADER_READ_ONLY for this pass's sampling; the
     // matching post-pass barrier below returns it so the next depth pass LOADs it unchanged.
     // Both aspects of a combined image must transition together.
-    std::vector<VkImage> borrowed_ds_images;
+    std::vector<std::pair<VkImage, VkFormat>> borrowed_ds_images;
     for (const SharedTextureUpload& upload : texture_uploads) {
         if (!upload.borrowed_ds || !upload.image) continue;
-        if (std::find(borrowed_ds_images.begin(), borrowed_ds_images.end(), upload.image) !=
-            borrowed_ds_images.end())
+        if (std::any_of(borrowed_ds_images.begin(), borrowed_ds_images.end(),
+                        [&](const auto& entry) { return entry.first == upload.image; }))
             continue;
-        borrowed_ds_images.push_back(upload.image);
+        borrowed_ds_images.push_back({upload.image, upload.ds_format});
         const bool ds_has_stencil = upload.ds_format == VK_FORMAT_D32_SFLOAT_S8_UINT;
         VkImageMemoryBarrier to_sampled{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         to_sampled.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -4087,13 +4129,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     }
     // Sampled depth bridge (#1275): return each borrowed DS image to the layout every depth pass
     // expects, so the bridge is invisible to the existing persistent-DS contract.
-    for (VkImage borrowed : borrowed_ds_images) {
-        VkFormat borrowed_format = VK_FORMAT_UNDEFINED;
-        for (const SharedTextureUpload& upload : texture_uploads)
-            if (upload.borrowed_ds && upload.image == borrowed) {
-                borrowed_format = upload.ds_format;
-                break;
-            }
+    for (const auto& [borrowed, borrowed_format] : borrowed_ds_images) {
         VkImageMemoryBarrier to_ds{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         to_ds.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         to_ds.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -4217,6 +4253,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         cached_ds->layout_initialized = true;
         cached_ds->depth_valid |= use_depth && depth_used_meaningfully;
         cached_ds->stencil_valid |= use_stencil;
+        // Sampled depth bridge (#1275): recency for find_persistent_ds_sampled — two valid
+        // entries can share a plane address (a surface re-keyed D32 -> D32S8 keeps its old
+        // entry), and the most recently written one is the live truth.
+        if (use_depth) cached_ds->last_depth_write = ++persistent_ds_write_generation();
     }
     if (cached_color) {
         active_submission.add_failure_cleanup([cached_color]() {

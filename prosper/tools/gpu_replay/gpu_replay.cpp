@@ -458,7 +458,8 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                 // A no-effect verdict hinges on the exact per-face stencil program — print it so a
                 // wrongly-skipped stencil writer is visible from the summary alone.
                 if (failure.pipeline.stencil_enable)
-                    std::printf(" sops=%u/%u/%u|%u/%u/%u swm=%02x/%02x scmp=%u/%u sref=%u/%u",
+                    std::printf(" sops=%u/%u/%u|%u/%u/%u swm=%02x/%02x scmp=%u/%u sref=%u/%u"
+                                " sopval=%u/%u",
                                 failure.pipeline.stencil_fail_op[0],
                                 failure.pipeline.stencil_pass_op[0],
                                 failure.pipeline.stencil_depth_fail_op[0],
@@ -470,7 +471,9 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                                 failure.pipeline.stencil_compare_op[0],
                                 failure.pipeline.stencil_compare_op[1],
                                 failure.pipeline.stencil_ref[0],
-                                failure.pipeline.stencil_ref[1]);
+                                failure.pipeline.stencil_ref[1],
+                                failure.pipeline.stencil_op_val[0],
+                                failure.pipeline.stencil_op_val[1]);
             }
             std::printf("\n");
         } else {
