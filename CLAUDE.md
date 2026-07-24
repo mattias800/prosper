@@ -300,6 +300,16 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   `HWWATCH`/`PEEK`/`FAULTMEM`, `tools/il2cpp/prx_to_elf.py` + Il2CppDumper, `tools/re/xref.py`, the snapshot
   guard) — the RE toolbox is the force multiplier, so grow it deliberately, verify it on a known answer,
   and land it so the next agent (and the next game) inherits it.
+  - **For a graphical bug or an FPS drop, the fastest loop is the F9 frame grab.** While a title runs in
+    `prosper-app`, pressing **F9** captures the current frame — the game's real GPU commands, shaders, and
+    resources, plus the renderer-owned RTTs it samples (seeded) — into a replayable `.prgbundle` + a `.bmp`
+    screenshot (`PROSPER_CAPTURE_DIR`, default cwd). Then `tools/gpu_replay --bundle <file>` reproduces
+    that exact frame **offline and deterministically**, and `--inspect-only` / `--draw-steps` /
+    `--dump-resource` (via `--bundle-extract-submit`) dissect it draw-by-draw. This answers "which draw
+    wrote this pixel / why does this frame look wrong / why is it slow" without re-booting and re-routing
+    to catch the moment live — the human presses F9 once, then the fix is iterated on the frozen frame.
+    It captures *rendered-frame* bugs (not CPU/logic/audio). See `tools/AGENTS.md` (interactive frame grab)
+    and `tools/gpu_replay/README.md`.
 - **Reaching the running frame loop** needs two gated switches (off by default, so the default boot stays
   stable): `PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct`. Add `PROSPER_RENDER=1` to run the
   live renderer, `PROSPER_GFXLOG=1` for graphics diagnostics.
