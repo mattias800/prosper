@@ -561,6 +561,8 @@ int main() {
 
     GpuReplayFrame replay;
     CHECK(materialize_gpu_replay(loaded, replay, error), "capture materializes owned replay draw items");
+    CHECK(replay.items.size() == 1 && replay.items[0].ps.cb_resolve,
+          "materialized gpu_replay draw retains MODE=3 resolve intent");
     const auto& rr = replay.items[0].vrt->resources;
     CHECK(rr[0].gpu_addr == 0x1000 && rr[1].gpu_addr == 0x1008, "replay retains logical guest addresses");
     CHECK(rr[0].host_data && rr[1].host_data == rr[0].host_data + 8 && rr[1].host_data[0] == memory[8],
