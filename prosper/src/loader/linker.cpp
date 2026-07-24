@@ -19,7 +19,9 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,
         auto mo = Module::load(in.path, &e);
         if (!mo) return fail("load " + in.path + ": " + e);
         auto mod = std::make_unique<Module>(std::move(*mo));
-        LoadedImage img = build_image(*mod, in.base);
+        LoadedImage img;
+        if (!build_image(*mod, in.base, img, &e))
+            return fail("load " + in.path + ": " + e);
         out.mods.push_back(std::move(mod));
         out.imgs.push_back(std::move(img));
     }

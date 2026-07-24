@@ -145,7 +145,9 @@ struct LoadedImage {
 };
 
 // Build a flat image from a parsed module at guest base `base`.
-LoadedImage build_image(const Module& m, uint64_t base);
+// Build a module image without allowing a malformed PT_LOAD extent to terminate the process through
+// an uncaught vector allocation failure. Returns false and describes the load error on failure.
+bool build_image(const Module& m, uint64_t base, LoadedImage& out, std::string* err = nullptr);
 
 // The phdr-index key a SELF data segment maps to: bits [31:20] of its flags, masked to 12 bits (the
 // SCE self-segment id). Higher flag bits must be masked off or the data-segment map is keyed wrong.
