@@ -3,6 +3,7 @@
 #include "pm4_registers.hpp"
 #include "vk_translate.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -309,10 +310,38 @@ RenderState extract_render_state(const GpuState& st) {
     rs.has_scissor = std::any_of(std::begin(scissor_registers), std::end(scissor_registers),
                                  [&](uint32_t reg) { return st.cx.count(reg) != 0; });
     if (rs.has_scissor) {
-        const uint32_t screen_tl = st.cx.count(P::PA_SC_SCREEN_SCISSOR_TL)
+        uint32_t screen_tl = st.cx.count(P::PA_SC_SCREEN_SCISSOR_TL)
             ? rd(st.cx, P::PA_SC_SCREEN_SCISSOR_TL) : 0u;
-        const uint32_t screen_br = st.cx.count(P::PA_SC_SCREEN_SCISSOR_BR)
+        uint32_t screen_br = st.cx.count(P::PA_SC_SCREEN_SCISSOR_BR)
             ? rd(st.cx, P::PA_SC_SCREEN_SCISSOR_BR) : 0x40004000u;
+        // #1335: a PRESENT-but-degenerate screen pair (BR <= TL on either axis) is never a
+        // coherently-programmed state — no draw intends a zero-area SCREEN scissor (the same
+        // contract as the window-offset recovery below). Blue Prince writes the TL thousands of
+        // times per route and the BR exactly once, with 0, folded out of a foreign span inside an
+        // indirect-register arena at the Day One transition; honoring it blanks every subsequent
+        // draw and freezes the presented frame (full evidence chain on the issue). Real hardware
+        // keeps the register's initialized full-screen value because that byte range is not
+        // consumed as a register write. Substitute the full default and log fail-visibly; genuine
+        // per-pass closes arrive via the WINDOW/GENERIC/VPORT rects, which stay fully honored.
+        // Both halves are reset, not only the BR: a degenerate partner poisons trust in the pair
+        // (the observed live TL of (0,1024) would otherwise clip 1024 of 1080 rows on its own),
+        // and the init state is the only coherent recovery target.
+        {
+            const auto s16 = [](uint32_t v, uint32_t shift) {
+                return static_cast<int32_t>(static_cast<int16_t>((v >> shift) & 0xffffu));
+            };
+            if (s16(screen_br, 0) <= s16(screen_tl, 0) ||
+                s16(screen_br, 16) <= s16(screen_tl, 16)) {
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1) < 8)
+                    fprintf(stderr,
+                            "[scissor] degenerate SCREEN pair recovered: tl=%08x br=%08x -> "
+                            "full (#1335)\n",
+                            screen_tl, screen_br);
+                screen_tl = 0u;
+                screen_br = 0x40004000u;
+            }
+        }
         const uint32_t window_offset = st.cx.count(P::PA_SC_WINDOW_OFFSET)
             ? rd(st.cx, P::PA_SC_WINDOW_OFFSET) : 0u;
         const uint32_t window_tl = st.cx.count(P::PA_SC_WINDOW_SCISSOR_TL)
