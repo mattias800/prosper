@@ -1386,6 +1386,7 @@ struct InteractiveFrameBundle {
                                  // animation over several frames; each extra frame is a full heavy capture.
     uint32_t frames_seen = 0;    // presents observed while capturing
     uint64_t submits = 0;
+    std::vector<GpuCaptureDsSeed> initial_ds_seeds; // persistent DS state at the capture boundary
     GpuCaptureBundle bundle;
 };
 InteractiveFrameBundle& interactive_frame_bundle() { static InteractiveFrameBundle b; return b; }
@@ -1430,8 +1431,17 @@ void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_n
     GpuCaptureFile capture;
     const GpuCaptureMetadata meta = runtime_capture_metadata(submit_no);
     std::string error;
-    if (!capture_gpustate_submit(state, submit_no, meta.width, meta.height, meta, capture, error) ||
-        !append_capture_to_frame_bundle(b.bundle, capture, b.max_unique_bytes, error)) {
+    if (!capture_gpustate_submit(state, submit_no, meta.width, meta.height, meta, capture, error)) {
+        b.failed = true;
+        std::fprintf(stderr, "[grab] frame-bundle: submit %llu failed (%s); grab aborted\n",
+                     static_cast<unsigned long long>(submit_no), error.c_str());
+        return;
+    }
+    // A persistent shadow atlas may have been produced before the captured frame. Seed that
+    // boundary state on the first submit only; later submits observe the replay cache updated by
+    // their predecessors instead of resetting it to the live pre-frame snapshot (#1307).
+    if (!b.submits) capture.ds_seeds = std::move(b.initial_ds_seeds);
+    if (!append_capture_to_frame_bundle(b.bundle, capture, b.max_unique_bytes, error)) {
         b.failed = true;
         std::fprintf(stderr, "[grab] frame-bundle: submit %llu failed (%s); grab aborted\n",
                      static_cast<unsigned long long>(submit_no), error.c_str());
@@ -1457,12 +1467,21 @@ void interactive_frame_bundle_on_present() {
                 else
                     std::fprintf(stderr, "[grab] frame-bundle: window had no submits; press F9 again\n");
                 b.capturing = false; b.current_path.clear(); b.bundle = GpuCaptureBundle{};
+                b.initial_ds_seeds.clear();
                 b.submits = 0; b.frames_seen = 0; b.failed = false;
                 if (b.armed_path.empty()) g_interactive_frame_active.store(false, std::memory_order_release);
             }
         } else if (!b.armed_path.empty()) {
             b.capturing = true; b.current_path = std::move(b.armed_path); b.armed_path.clear();
             b.bundle = GpuCaptureBundle{}; b.submits = 0; b.frames_seen = 0; b.failed = false;
+            b.initial_ds_seeds.clear();
+            std::string error;
+            if (gpu_capture_ds_seed_snapshot_available() &&
+                !read_all_gpu_capture_ds_seeds(b.initial_ds_seeds, error)) {
+                b.failed = true;
+                std::fprintf(stderr, "[grab] frame-bundle: initial DS snapshot failed (%s); "
+                                     "grab aborted\n", error.c_str());
+            }
             std::fprintf(stderr, "[grab] frame-bundle: capturing %u frames -> %s\n",
                          b.frames_wanted, b.current_path.c_str());
         }
