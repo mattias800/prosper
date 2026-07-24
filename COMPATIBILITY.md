@@ -17,7 +17,7 @@ Last updated: 2026-07-24
 | *Evergate* | `PPSA01885` | Unity | ✅ Reaches and renders the first tutorial-room gameplay |
 | Terminator (2D)&nbsp;¹ | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay reached (user-verified) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Opening gameplay scene ("Day One" at the manor) renders; known lighting/texture defects |
-| *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Title and first-run/language menus render; STORY/ONLINE main menu behind loading not yet reached |
+| *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Title and STORY/ONLINE main menu render; known UI and composition defects remain |
 | *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Interactive title and save-slot flow; later content load is blocked |
 | Additional Unity/IL2CPP target | `PPSA02664` | Unity / IL2CPP | 🔬 Exercised, with no published gameplay milestone |
 
@@ -118,12 +118,20 @@ The investigation and current blocker are documented in
 
 ## Grand Theft Auto V — `PPSA04263`
 
+<p align="center">
+  <img src="assets/screenshots/gta5-title.png" alt="Grand Theft Auto V — title screen with a known missing Continue-button icon">
+</p>
+<p align="center">
+  <img src="assets/screenshots/gta5-main-menu.png" alt="Grand Theft Auto V — STORY and ONLINE main menu with known rendering defects">
+</p>
+
 Rockstar's RAGE engine boots through the intro and reaches the title and the first-run/language-selection
-menus, which render cleanly (owner-confirmed). Reaching this required a series of service and ABI fixes
-spanning the async-compute submit contract, the APR file/write primitives, and guest-`%fs` restoration on
-fault-skip. The STORY/ONLINE main menu behind the title loading spinner is not yet reached (#1160), and the
-in-game loading path (the legal-notice text pass) is a documented blocker, so no gameplay milestone is
-claimed.
+menus, then continues to the STORY/ONLINE main menu. Reaching this required a series of service and ABI
+fixes spanning the async-compute submit contract, the APR file/write primitives, and guest-`%fs`
+restoration on fault-skip. These direct Linux `prosper-app` captures document the current renderer state,
+not visual correctness: the title omits the X button icon beside **Continue**, and the main menu has
+substantial UI and composition glitches. The later in-game loading path remains blocked at the legal-notice
+text pass, so no gameplay milestone is claimed.
 
 ## Terminator (2D) — `PPSA25872`
 
