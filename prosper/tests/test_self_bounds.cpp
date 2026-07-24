@@ -11,6 +11,8 @@
 //      valid pointer for the LAST byte, which +8 overruns) is guarded by test_at_last_byte_needs_guard().
 //   C) str_at() could return a pointer with no NUL before EOF -> a consumer's strlen/std::string
 //      reads past the buffer. Now requires an in-range NUL. Guarded by test_str_at().
+//   D) build_image() allowed a huge non-wrapping PT_LOAD span to reach vector::assign; the uncaught
+//      length_error/bad_alloc terminated linking. Image construction is now fallible and reports it.
 // No game dump needed: pure in-memory construction.
 #include "../src/self/module.hpp"
 #include <cstdio>
@@ -99,7 +101,8 @@ static void test_build_image_bounds() {
         m.file = {1,2,3,4,5,6,7,8};
         Segment s; s.type = PT_LOAD; s.vaddr = 0x4000; s.filesz = 8; s.memsz = 0x4000; s.file_off = 0; s.flags = 4;
         m.segments.push_back(s);
-        LoadedImage img = build_image(m, 0x100000000ull);
+        LoadedImage img;
+        CHECK(build_image(m, 0x100000000ull, img), "valid PT_LOAD image builds");
         const uint8_t* p = img.at(0x100000000ull + 0x4000);
         CHECK(p && p[0] == 1 && p[7] == 8, "valid PT_LOAD maps its filesz bytes");
     }
@@ -111,7 +114,8 @@ static void test_build_image_bounds() {
         m.file.assign(64, 0xAB);
         Segment bad; bad.type = PT_LOAD; bad.vaddr = 0x4001; bad.filesz = UINT64_MAX; bad.memsz = 0x4000; bad.file_off = 1; bad.flags = 4;
         m.segments.push_back(bad);
-        LoadedImage img = build_image(m, 0x100000000ull);   // reaching here at all means no OOB memcpy
+        LoadedImage img;
+        CHECK(build_image(m, 0x100000000ull, img), "wrapping filesz image still builds safely");
         CHECK(img.mem.size() > 0, "wrapping huge filesz skipped, no OOB memcpy (image still sized)");
     }
     {   // malformed huge memsz: vaddr+memsz does not overflow (passes the extent-skip guard) but
@@ -121,8 +125,24 @@ static void test_build_image_bounds() {
         m.file = {1,2,3,4};
         Segment s; s.type = PT_LOAD; s.vaddr = 0x8000; s.filesz = 4; s.memsz = UINT64_MAX - 0x8000; s.file_off = 0; s.flags = 4;
         m.segments.push_back(s);
-        LoadedImage img = build_image(m, 0x100000000ull);   // must not attempt a ~2^64 mem.assign
+        LoadedImage img;
+        CHECK(build_image(m, 0x100000000ull, img), "align-up-wrapped extent returns an empty image");
         CHECK(img.mem.size() == 0, "align_up-wrapped extent clamped to empty (no giant allocation)");
+    }
+    {   // A huge but non-wrapping extent passes the arithmetic guards above and is still far below a
+        // 64-bit vector::max_size(). Before #1299 it reached vector::assign; Linux overcommit could
+        // accept the virtual allocation, then OOM-kill the process while assign zero-filled it.
+        Module m;
+        Segment s; s.type = PT_LOAD; s.vaddr = 0x4000;
+        s.memsz = kMaxLoadedImageBytes + 0x4000; s.flags = 4;
+        m.segments.push_back(s);
+        LoadedImage img;
+        std::string err;
+        CHECK(s.memsz < img.mem.max_size(),
+              "regression extent is below vector::max_size (exercises loader policy, not STL limit)");
+        CHECK(!build_image(m, 0x100000000ull, img, &err),
+              "huge non-wrapping PT_LOAD extent is rejected without throwing");
+        CHECK(!err.empty(), "rejected huge PT_LOAD reports a load error");
     }
 }
 

@@ -56,7 +56,8 @@ int main(int argc, char** argv) {
 
     // --- build image ---
     const uint64_t BASE = 0x400000;
-    LoadedImage img = build_image(m, BASE);
+    LoadedImage img;
+    CHECK(build_image(m, BASE, img), "build image");
     CHECK(img.mem.size() >= 0x2000000, "image size=0x%zx smaller than expected", img.mem.size());
     CHECK(img.entry == BASE + m.e_entry, "entry mismatch");
 

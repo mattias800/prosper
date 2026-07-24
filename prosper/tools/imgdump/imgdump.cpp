@@ -9,7 +9,11 @@ int main(int argc, char** argv) {
     std::string err;
     auto m = prosper::Module::load(argv[1], &err);
     if (!m) { fprintf(stderr, "load failed: %s\n", err.c_str()); return 1; }
-    auto img = prosper::build_image(*m, 0);
+    prosper::LoadedImage img;
+    if (!prosper::build_image(*m, 0, img, &err)) {
+        fprintf(stderr, "build image failed: %s\n", err.c_str());
+        return 1;
+    }
     FILE* f = fopen(argv[2], "wb");
     if (!f) { perror("fopen"); return 1; }
     fwrite(img.mem.data(), 1, img.mem.size(), f);

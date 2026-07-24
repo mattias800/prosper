@@ -1,6 +1,7 @@
 #include "module.hpp"
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <unordered_map>
 #include <algorithm>
 
@@ -244,7 +245,7 @@ uint8_t* LoadedImage::at(uint64_t va) {
 }
 const uint8_t* LoadedImage::at(uint64_t va) const { return const_cast<LoadedImage*>(this)->at(va); }
 
-LoadedImage build_image(const Module& m, uint64_t base) {
+bool build_image(const Module& m, uint64_t base, LoadedImage& out, std::string* err) {
     LoadedImage img; img.base = base;
     uint64_t lo = UINT64_MAX, hi = 0;
     for (auto& s : m.segments)
@@ -259,7 +260,24 @@ LoadedImage build_image(const Module& m, uint64_t base) {
     img.min_vaddr = align_dn(lo, 0x4000);
     img.max_vaddr = align_up(hi, 0x4000);
     if (img.max_vaddr < img.min_vaddr) img.max_vaddr = img.min_vaddr;  // degenerate (align_up wrap) -> empty
-    img.mem.assign(img.max_vaddr - img.min_vaddr, 0);
+    const uint64_t image_size = img.max_vaddr - img.min_vaddr;
+    if (image_size > kMaxLoadedImageBytes) {
+        if (err) *err = "PT_LOAD image extent exceeds prosper's 1 GiB loader limit";
+        return false;
+    }
+    if (image_size > img.mem.max_size()) {
+        if (err) *err = "PT_LOAD image extent exceeds the host vector limit";
+        return false;
+    }
+    try {
+        img.mem.assign(static_cast<size_t>(image_size), 0);
+    } catch (const std::bad_alloc&) {
+        if (err) *err = "PT_LOAD image extent cannot be allocated";
+        return false;
+    } catch (const std::length_error&) {
+        if (err) *err = "PT_LOAD image extent exceeds the host vector limit";
+        return false;
+    }
     for (auto& s : m.segments) {
         if (s.type != PT_LOAD || s.vaddr < img.min_vaddr) continue;   // outside the mapped window
         uint64_t dst = s.vaddr - img.min_vaddr;
@@ -270,7 +288,8 @@ LoadedImage build_image(const Module& m, uint64_t base) {
         img.prot.push_back({ s.vaddr, s.memsz, (s.flags & 4) != 0, (s.flags & 2) != 0, (s.flags & 1) != 0 });
     }
     img.entry = base + m.e_entry;
-    return img;
+    out = std::move(img);
+    return true;
 }
 
 void bind_imports_to_stubs(const Module& m, LoadedImage& img, uint64_t stub_base, uint64_t stub_size) {
