@@ -61,15 +61,19 @@ int main() {
 
     // #1236: an absent LEAF under a case-CORRECTED parent chain must keep the corrected ancestors
     // (only the unmatched leaf retains its requested spelling), so an O_CREAT lands in the real
-    // directory. Query with wrong-case dirs ("media/MODULES") and an absent leaf; the on-disk
-    // "Media/Modules" (created above) must survive in the result. Before #1236 this dropped back to
-    // the fully-original wrong-case path.
+    // directory. Query with wrong-case dirs ("media/MODULES") and an absent leaf against the on-disk
+    // "Media/Modules" (created above). On a case-SENSITIVE host the result is the corrected
+    // ".../Media/Modules/BrandNew.prx"; on a case-INSENSITIVE host resolve short-circuits (the
+    // wrong-case parent already "exists") and returns the input unchanged. The cross-platform
+    // contract in BOTH cases: the returned PARENT directory references a real directory, while the
+    // leaf stays absent. Before #1236 the case-sensitive path dropped back to the wrong-case parent,
+    // whose directory does NOT exist — so this fails without the fix on a case-sensitive FS.
     const std::string corrParent = base + "/media/MODULES/BrandNew.prx";
     const std::string rc = resolve_host_path_case(corrParent);
-    CHECK(rc == base + "/Media/Modules/BrandNew.prx",
-          "absent leaf under a case-corrected parent -> corrected parent + original leaf");
+    CHECK(fs::exists(fs::path(rc).parent_path()),
+          "absent leaf: returned parent references a real directory (corrected on case-sensitive hosts)");
     CHECK(!fs::exists(fs::path(rc)),
-          "the corrected-parent result is still absent, so a read probe still fails ENOENT");
+          "the leaf is still absent, so a read probe still fails ENOENT");
 
     // Empty input: unchanged, no throw.
     CHECK(resolve_host_path_case("").empty(), "empty path returned unchanged");
