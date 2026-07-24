@@ -6,6 +6,7 @@
 
 #include "gpu_capture.hpp"
 
+#include <mutex>
 #include "bc_decode.hpp"
 #include "rdna2_decode.hpp"
 #include "rdna2_to_spirv.hpp"
@@ -2329,28 +2330,61 @@ bool restore_gpu_replay_ds_seeds(const std::vector<GpuCaptureDsSeed>& seeds, std
     return true;
 }
 
+namespace {
+// Interactive one-shot capture request (armed by the app hotkey, consumed on the render thread). A
+// non-empty path means a grab is armed; the guard makes arm/consume race-free across threads.
+std::mutex g_interactive_capture_mx;
+std::string g_interactive_capture_path;
+std::string take_interactive_gpu_capture() {
+    std::lock_guard<std::mutex> lk(g_interactive_capture_mx);
+    return std::exchange(g_interactive_capture_path, std::string());
+}
+}  // namespace
+
+void request_interactive_gpu_capture(const std::string& path) {
+    std::lock_guard<std::mutex> lk(g_interactive_capture_mx);
+    g_interactive_capture_path = path;
+}
+bool interactive_gpu_capture_armed() {
+    std::lock_guard<std::mutex> lk(g_interactive_capture_mx);
+    return !g_interactive_capture_path.empty();
+}
+
 std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     const std::vector<DrawItem>& draws, const std::vector<ComputeItem>& computes,
     const std::vector<SubmitOperation>& operations, uint32_t width, uint32_t height,
     const GpuState* semantic_state, uint64_t submit_no, uint64_t semantic_draw_count) {
-    const char* path = std::getenv("PROSPER_GPU_CAPTURE"); if (!path || !*path) return {};
     const bool has_ordered_dma = semantic_state && !semantic_state->dma_copies.empty();
-    static std::atomic<uint64_t> invocation_sequence{0};
-    const uint64_t invocation = invocation_sequence.fetch_add(1);
-    uint64_t after = 0;
-    if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_AFTER")) after = std::strtoull(v, nullptr, 0);
-    if (invocation < after) return {};
-    uint64_t min_draws = 0, max_draws = std::numeric_limits<uint64_t>::max();
-    if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_MIN_DRAWS")) min_draws = std::strtoull(v, nullptr, 0);
-    if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_MAX_DRAWS")) max_draws = std::strtoull(v, nullptr, 0);
     const uint64_t candidate_draw_count = has_ordered_dma && semantic_draw_count != UINT64_MAX
         ? semantic_draw_count : static_cast<uint64_t>(draws.size());
-    if (candidate_draw_count < min_draws || candidate_draw_count > max_draws) return {};
-    static std::atomic<uint64_t> sequence{0}; static std::atomic<bool> claimed{false};
-    uint64_t current = sequence.fetch_add(1), wanted = 0;
-    if (const char* at = std::getenv("PROSPER_GPU_CAPTURE_AT")) wanted = std::strtoull(at, nullptr, 0);
-    if (current != wanted || claimed.exchange(true)) return {};
-    auto pending = std::make_unique<PendingGpuCapture>(); pending->path = path;
+    // Interactive one-shot (hotkey): consume the armed request on the first DRAWING invocation so the
+    // grab lands on real frame content, and skip the env AT/AFTER/MIN selectors (a live keypress has no
+    // submit index to predict). Falls through to the env PROSPER_GPU_CAPTURE path when nothing is armed.
+    std::string interactive_path;
+    if (candidate_draw_count > 0 && interactive_gpu_capture_armed())
+        interactive_path = take_interactive_gpu_capture();
+    const bool interactive = !interactive_path.empty();
+    const char* env_path = std::getenv("PROSPER_GPU_CAPTURE");
+    if (!interactive && (!env_path || !*env_path)) return {};
+    uint64_t current = 0;
+    if (!interactive) {
+        static std::atomic<uint64_t> invocation_sequence{0};
+        const uint64_t invocation = invocation_sequence.fetch_add(1);
+        uint64_t after = 0;
+        if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_AFTER")) after = std::strtoull(v, nullptr, 0);
+        if (invocation < after) return {};
+        uint64_t min_draws = 0, max_draws = std::numeric_limits<uint64_t>::max();
+        if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_MIN_DRAWS")) min_draws = std::strtoull(v, nullptr, 0);
+        if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_MAX_DRAWS")) max_draws = std::strtoull(v, nullptr, 0);
+        if (candidate_draw_count < min_draws || candidate_draw_count > max_draws) return {};
+        static std::atomic<uint64_t> sequence{0}; static std::atomic<bool> claimed{false};
+        current = sequence.fetch_add(1);
+        uint64_t wanted = 0;
+        if (const char* at = std::getenv("PROSPER_GPU_CAPTURE_AT")) wanted = std::strtoull(at, nullptr, 0);
+        if (current != wanted || claimed.exchange(true)) return {};
+    }
+    auto pending = std::make_unique<PendingGpuCapture>();
+    pending->path = interactive ? interactive_path : std::string(env_path);
     GpuCaptureMetadata m; m.width = width; m.height = height;
     m.submit_index = submit_no ? submit_no : current;
 #ifdef PROSPER_GIT_REVISION
@@ -2387,13 +2421,14 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     if (!captured) {
         std::fprintf(stderr, "[gpucap] capture failed: %s\n", error.c_str()); return {};
     }
-    std::fprintf(stderr, "[gpucap] captured match %llu at invocation %llu: %zu draws, %zu computes, "
+    std::fprintf(stderr, "[gpucap] captured %s submit %llu: %zu draws, %zu computes, "
                          "%zu DMA copies, %zu operations, %zu blobs, %zu RTT seeds -> %s\n",
-                 static_cast<unsigned long long>(current), static_cast<unsigned long long>(invocation),
+                 interactive ? "interactive" : "match",
+                 static_cast<unsigned long long>(m.submit_index),
                  pending->capture.draws.size(), pending->capture.computes.size(),
                  pending->capture.dma_copies.size(), pending->capture.operations.size(),
                  pending->capture.blobs.size(),
-                 pending->capture.rtt_seeds.size(), path);
+                 pending->capture.rtt_seeds.size(), pending->path.c_str());
     return pending;
 }
 

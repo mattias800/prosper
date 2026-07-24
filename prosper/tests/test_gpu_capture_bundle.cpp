@@ -1,4 +1,5 @@
 #include "../src/gpu/gpu_capture_bundle.hpp"
+#include "../src/gpu/gpu_timeline.hpp"     // interactive F9 whole-frame grab state machine
 #include "../src/gpu/tile.hpp"
 
 #include <chrono>
@@ -219,6 +220,37 @@ int main() {
 
     std::error_code ec; std::filesystem::remove(path, ec); std::filesystem::remove(corrupt_path, ec);
     std::filesystem::remove(v1_path, ec);
+
+    // Interactive F9 whole-frame grab (prosper-app): the present-boundary state machine. A grab is armed
+    // from the app's main thread; the NEXT present starts capturing a fresh frame, each submit appends,
+    // and the following present writes the .prgbundle and disarms. Here we drive the present transitions
+    // headlessly (the submit-capture + write + replay are validated on a display host via prosper-app F9)
+    // to prove the on-demand contract: the per-submit hook is provably inert until F9 arms a grab.
+    using prosper::gpu::interactive_capture_bundle_active;
+    using prosper::gpu::request_interactive_capture_bundle;
+    using prosper::gpu::record_gpu_timeline_present;
+    // 1-frame window so start+end is a simple two-present sequence (cross-platform env set).
+#ifdef _WIN32
+    _putenv_s("PROSPER_CAPTURE_FRAMES", "1");
+#else
+    setenv("PROSPER_CAPTURE_FRAMES", "1", 1);
+#endif
+    CHECK(!interactive_capture_bundle_active(), "frame-bundle grab is inert by default");
+    record_gpu_timeline_present(1, 0, 0, 1920, 1080);
+    CHECK(!interactive_capture_bundle_active(), "a present with no armed grab stays inert");
+    request_interactive_capture_bundle("/tmp/prosper_frame_grab_unit.prgbundle");
+    CHECK(interactive_capture_bundle_active(), "F9 arms a whole-frame grab");
+    record_gpu_timeline_present(2, 0, 0, 1920, 1080);   // start capturing the next frame
+    CHECK(interactive_capture_bundle_active(), "the next present starts the frame (still active)");
+    record_gpu_timeline_present(3, 0, 0, 1920, 1080);   // end the frame (no submits captured here)
+    CHECK(!interactive_capture_bundle_active(),
+          "the following present ends the frame and disarms (no re-arm)");
+    request_interactive_capture_bundle("/tmp/prosper_frame_grab_unit2.prgbundle");
+    CHECK(interactive_capture_bundle_active(), "the grab can be re-armed for another press");
+    record_gpu_timeline_present(4, 0, 0, 1920, 1080);
+    record_gpu_timeline_present(5, 0, 0, 1920, 1080);
+    CHECK(!interactive_capture_bundle_active(), "the re-armed grab completes and disarms");
+
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n"); return 0;
 }

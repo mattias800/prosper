@@ -205,4 +205,13 @@ void record_gpu_timeline_present(uint64_t present_count, int buffer_index, int64
 void flush_gpu_timeline();
 void close_gpu_timeline();
 
+// Interactive frame-bundle capture (prosper-app F9): arm a one-shot capture of ONE complete displayed
+// frame (every submit between two presents) into a replayable .prgbundle at `path`. Unlike a single
+// .prgcap, the bundle re-runs the frame's producer submits on replay, so renderer-owned RTTs regenerate
+// instead of replaying black (which they do for a deferred renderer). max_mb (0 = default) caps the
+// deduplicated bundle size. Armed from the app main thread; the frame is captured on the render thread
+// between the next two presents. On-demand: near-zero cost (one atomic load per submit) until armed.
+void request_interactive_capture_bundle(const std::string& path, uint32_t max_mb = 0);
+bool interactive_capture_bundle_active();
+
 } // namespace prosper::gpu

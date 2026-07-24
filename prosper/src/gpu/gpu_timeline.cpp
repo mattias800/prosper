@@ -1364,7 +1364,121 @@ void begin_gpu_timeline_submit(uint64_t submit_no) {
     if (requested) g_active_submit_no.store(submit_no, std::memory_order_release);
 }
 
+// ---- Interactive frame-bundle capture (prosper-app F9) ---------------------------------------------
+// Capture ONE complete displayed frame — every submit between two presents — on demand, so the produced
+// .prgbundle replays faithfully (the producer submits re-run and regenerate renderer-owned RTTs a single
+// .prgcap leaves black). State machine: F9 arms `armed_path`; the NEXT present promotes it to a fresh
+// capturing frame; each submit appends; the following present writes the bundle and disarms. The hot
+// per-submit/per-present hooks are guarded by g_interactive_frame_active (one atomic load) so normal
+// play pays nothing until F9 is pressed.
+namespace {
+struct InteractiveFrameBundle {
+    std::mutex mx;
+    std::string armed_path;      // set by F9; the next present begins the window
+    std::string current_path;    // path for the window currently being captured
+    bool capturing = false;
+    bool failed = false;
+    uint64_t max_unique_bytes = 2048ull << 20;
+    uint32_t frames_wanted = 4;  // capture this many CONSECUTIVE frames so a title that samples RTTs from
+                                 // previous frames (temporal AA / deferred history) has its producers in
+                                 // the window; gpu_replay --bundle then resolves the last frame's inputs.
+                                 // Each frame is a full heavy capture, so this bounds the on-press hitch;
+                                 // raise PROSPER_CAPTURE_FRAMES for a deeper history, lower it for speed.
+    uint32_t frames_seen = 0;    // presents observed while capturing
+    uint64_t submits = 0;
+    GpuCaptureBundle bundle;
+};
+InteractiveFrameBundle& interactive_frame_bundle() { static InteractiveFrameBundle b; return b; }
+std::atomic<bool> g_interactive_frame_active{false};   // armed OR capturing
+
+// Append one capture to `bundle` with content dedup, rolling back if it would exceed the byte budget.
+bool append_capture_to_frame_bundle(GpuCaptureBundle& bundle, const GpuCaptureFile& capture,
+                                    uint64_t max_unique_bytes, std::string& error) {
+    const size_t chunks = bundle.chunks.size(), hashes = bundle.chunk_hashes.size(),
+                 resources = bundle.resources.size(), submits = bundle.submits.size();
+    const uint64_t logical = bundle.logical_bytes;
+    if (!append_gpu_capture_bundle(bundle, capture, error)) return false;
+    if (gpu_capture_bundle_unique_bytes(bundle) <= max_unique_bytes) return true;
+    bundle.chunks.resize(chunks); bundle.chunk_hashes.resize(hashes);
+    bundle.resources.resize(resources); bundle.submits.resize(submits);
+    bundle.logical_bytes = logical;
+    bundle.chunk_indices_by_hash.clear(); bundle.resource_indices_by_hash.clear();
+    error = "frame bundle exceeded its unique-byte budget";
+    return false;
+}
+}  // namespace
+
+void request_interactive_capture_bundle(const std::string& path, uint32_t max_mb) {
+    InteractiveFrameBundle& b = interactive_frame_bundle();
+    std::lock_guard<std::mutex> lk(b.mx);
+    b.armed_path = path;
+    if (max_mb) b.max_unique_bytes = static_cast<uint64_t>(std::clamp<uint32_t>(max_mb, 64u, 4096u)) << 20;
+    if (const char* frames = std::getenv("PROSPER_CAPTURE_FRAMES"))
+        b.frames_wanted = std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(frames, nullptr, 0)), 1u, 240u);
+    g_interactive_frame_active.store(true, std::memory_order_release);
+}
+bool interactive_capture_bundle_active() {
+    return g_interactive_frame_active.load(std::memory_order_acquire);
+}
+
+// Called per submit: when a frame grab is in progress, append this submit's realized state to the bundle.
+void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_no) {
+    if (!g_interactive_frame_active.load(std::memory_order_acquire)) return;
+    InteractiveFrameBundle& b = interactive_frame_bundle();
+    std::lock_guard<std::mutex> lk(b.mx);
+    if (!b.capturing || b.failed) return;
+    GpuCaptureFile capture;
+    const GpuCaptureMetadata meta = runtime_capture_metadata(submit_no);
+    std::string error;
+    if (!capture_gpustate_submit(state, submit_no, meta.width, meta.height, meta, capture, error) ||
+        !append_capture_to_frame_bundle(b.bundle, capture, b.max_unique_bytes, error)) {
+        b.failed = true;
+        std::fprintf(stderr, "[grab] frame-bundle: submit %llu failed (%s); grab aborted\n",
+                     static_cast<unsigned long long>(submit_no), error.c_str());
+        return;
+    }
+    ++b.submits;
+}
+
+// Called per present (flip): starts the frame on the first present after F9, writes it on the next.
+void interactive_frame_bundle_on_present() {
+    if (!g_interactive_frame_active.load(std::memory_order_acquire)) return;
+    InteractiveFrameBundle& b = interactive_frame_bundle();
+    std::string write_path;
+    GpuCaptureBundle write_bundle;
+    {
+        std::lock_guard<std::mutex> lk(b.mx);
+        if (b.capturing) {
+            ++b.frames_seen;
+            if (b.failed || b.frames_seen >= b.frames_wanted) {   // window complete (or aborted)
+                if (!b.failed && b.submits > 0) { write_path = b.current_path; write_bundle = std::move(b.bundle); }
+                else if (b.failed)
+                    std::fprintf(stderr, "[grab] frame-bundle aborted (see error above); not written\n");
+                else
+                    std::fprintf(stderr, "[grab] frame-bundle: window had no submits; press F9 again\n");
+                b.capturing = false; b.current_path.clear(); b.bundle = GpuCaptureBundle{};
+                b.submits = 0; b.frames_seen = 0; b.failed = false;
+                if (b.armed_path.empty()) g_interactive_frame_active.store(false, std::memory_order_release);
+            }
+        } else if (!b.armed_path.empty()) {
+            b.capturing = true; b.current_path = std::move(b.armed_path); b.armed_path.clear();
+            b.bundle = GpuCaptureBundle{}; b.submits = 0; b.frames_seen = 0; b.failed = false;
+            std::fprintf(stderr, "[grab] frame-bundle: capturing %u frames -> %s\n",
+                         b.frames_wanted, b.current_path.c_str());
+        }
+    }
+    if (!write_path.empty()) {
+        std::string error;
+        const size_t n = write_bundle.submits.size();
+        if (write_gpu_capture_bundle(write_path, write_bundle, error))
+            std::fprintf(stderr, "[grab] frame-bundle -> %s (%zu submits)\n", write_path.c_str(), n);
+        else
+            std::fprintf(stderr, "[grab] frame-bundle write failed: %s\n", error.c_str());
+    }
+}
+
 void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
+    interactive_frame_bundle_on_submit(state, submit_no);
     static const bool requested = [] {
         const char* path = std::getenv("PROSPER_GPU_TIMELINE");
         return path && *path;
@@ -1807,6 +1921,7 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
 
 void record_gpu_timeline_present(uint64_t present_count, int buffer_index, int64_t flip_arg,
                                  uint32_t width, uint32_t height) {
+    interactive_frame_bundle_on_present();
     static const bool requested = [] {
         const char* path = std::getenv("PROSPER_GPU_TIMELINE");
         return path && *path;

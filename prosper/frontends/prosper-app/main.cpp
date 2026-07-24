@@ -15,6 +15,8 @@
 // THIS is a separate presentation device, and frames cross as shared immutable CPU pixels.
 #include "gpu/videoout_present.hpp"   // present_acquire_rendered_frame / present_write_frame
 #include "gpu/gpu_execute.hpp"         // shared_vulkan_context / gpu-present activation (#1270)
+#include "gpu/gpu_capture.hpp"         // request_interactive_gpu_capture (F9 frame grab)
+#include "gpu/gpu_timeline.hpp"        // request_interactive_capture_bundle (F9 whole-frame grab)
 #include "present_blit.hpp"           // GPU scanout handoff: acquire/release the renderer's front image
 #include "host/lifecycle.hpp"          // prosper_request_stop / prosper_stop_requested
 #include "host/boot_program.hpp"       // boot_program (shared guest-boot path, also used by boot_trace)
@@ -281,6 +283,31 @@ void barrier(VkCommandBuffer c, VkImage img, VkImageLayout from, VkImageLayout t
     b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     vkCmdPipelineBarrier(c, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+// Interactive frame grab (F9): write a small BGR bottom-up BMP of a presented RGBA frame next to the
+// .prgcap so the user gets a visible "this is the frame I captured" alongside the replayable capsule.
+// A local writer (the shared dump_bmp lives in the Vulkan test harness, not linkable here) — the .prgcap
+// oracle remains the authoritative pixels; this is the convenience screenshot.
+static bool write_frame_bmp(const std::string& path, const uint8_t* rgba, uint32_t w, uint32_t h) {
+    if (!rgba || !w || !h) return false;
+    const uint32_t row = w * 3, pad = (4 - (row & 3)) & 3, stride = row + pad;
+    const uint32_t pixels = stride * h, size = 54 + pixels;
+    std::vector<uint8_t> f(size, 0);
+    auto put16 = [&](uint32_t o, uint16_t v) { f[o] = v & 0xff; f[o + 1] = v >> 8; };
+    auto put32 = [&](uint32_t o, uint32_t v) { for (int i = 0; i < 4; i++) f[o + i] = (v >> (8 * i)) & 0xff; };
+    f[0] = 'B'; f[1] = 'M'; put32(2, size); put32(10, 54);
+    put32(14, 40); put32(18, w); put32(22, h); put16(26, 1); put16(28, 24); put32(34, pixels);
+    for (uint32_t y = 0; y < h; y++) {
+        uint8_t* dst = f.data() + 54 + (size_t)(h - 1 - y) * stride;   // BMP rows are bottom-up
+        const uint8_t* src = rgba + (size_t)y * w * 4;
+        for (uint32_t x = 0; x < w; x++) { dst[x * 3] = src[x * 4 + 2]; dst[x * 3 + 1] = src[x * 4 + 1]; dst[x * 3 + 2] = src[x * 4]; }
+    }
+    FILE* fp = fopen(path.c_str(), "wb");
+    if (!fp) return false;
+    const bool ok = fwrite(f.data(), 1, f.size(), fp) == f.size();
+    fclose(fp);
+    return ok;
 }
 
 // Present one guest RGBA frame (w*h, 4 bytes/pixel) to the window, scaling to the swapchain extent.
@@ -755,6 +782,9 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[app] keyboard: WASD/Arrows=move  J/Space=Cross(jump)  K=Square(attack)  L=Circle  "
                     "I=Triangle  U/O=L1/R1  Y/H=L2/R2  Enter=Options  "
                     "F11/Alt+Enter=fullscreen  Esc=quit\n");
+    fprintf(stderr, "[app] F9 = grab the next few frames: writes a replayable .prgbundle + a .bmp "
+                    "screenshot (to PROSPER_CAPTURE_DIR, default cwd) for gpu_replay debugging "
+                    "(brief hitch on press; PROSPER_CAPTURE_FRAMES sets the window, default 4).\n");
 
     const bool frameTrace = getenv("PROSPER_APP_FRAME_TRACE") != nullptr;
     const char* stallDumpEnv = getenv("PROSPER_APP_STALL_DUMP_MS");
@@ -774,6 +804,18 @@ int main(int argc, char** argv) {
     uint64_t shown = 0, lastFrameSeq = ~0ull, patFrame = 0;
     int gpuPrevSlot = -1;   // #1270: the GPU scanout slot presented last frame (released after its read)
     unsigned timedDumpCount = 0;
+    // Interactive frame grab (F9): base output dir + a per-session counter; when a grab was armed we
+    // also snapshot the next presented CPU frame to a BMP next to its .prgcap.
+    const std::string grabDir = getenv("PROSPER_CAPTURE_DIR") ? getenv("PROSPER_CAPTURE_DIR") : ".";
+    unsigned grabCounter = 0;
+    std::string pendingGrabScreenshot;   // non-empty => write the next presented CPU frame to this path
+    auto flushGrabScreenshot = [&](const uint8_t* rgba, uint32_t w, uint32_t h) {
+        if (pendingGrabScreenshot.empty()) return;
+        const bool ok = write_frame_bmp(pendingGrabScreenshot, rgba, w, h);
+        std::fprintf(stderr, "[grab] screenshot%s -> %s\n", ok ? "" : " write FAILED",
+                     pendingGrabScreenshot.c_str());
+        pendingGrabScreenshot.clear();
+    };
     bool timedDumpPending = timedDumpMs > 0;
     bool running = true;
     bool swapchainDirty = false;
@@ -800,6 +842,23 @@ int main(int argc, char** argv) {
                 key.f11 = ev.key.key == SDLK_F11;
                 key.enter = ev.key.key == SDLK_RETURN || ev.key.key == SDLK_KP_ENTER;
                 key.alt = (ev.key.mod & SDL_KMOD_ALT) != 0;
+                // Interactive frame grab: F9 arms a one-shot capture of the next COMPLETE frame (every
+                // submit between the next two presents) into a replayable .prgbundle, plus a screenshot.
+                // The whole-frame bundle re-runs the frame's producer submits on replay, so renderer-owned
+                // RTTs regenerate instead of replaying black (as a single-submit .prgcap does for a
+                // deferred renderer). It is a HOST hotkey, NOT forwarded to the guest IME/pad. On-demand
+                // only — near-zero cost until pressed, so it never distorts the FPS you are observing.
+                if (ev.type == SDL_EVENT_KEY_DOWN && key.app_window && !ev.key.repeat &&
+                    ev.key.key == SDLK_F9) {
+                    char base[512];
+                    std::snprintf(base, sizeof base, "%s/frame_grab_%03u", grabDir.c_str(), ++grabCounter);
+                    prosper::gpu::request_interactive_capture_bundle(std::string(base) + ".prgbundle");
+                    pendingGrabScreenshot = std::string(base) + ".bmp";
+                    std::fprintf(stderr,
+                        "[grab] F9: arming a whole-frame capture -> %s.prgbundle (+ .bmp screenshot)\n",
+                        base);
+                    continue;
+                }
                 // #1093: forward app-window keys to the guest's IME keyboard path. Titles like
                 // PPSA02664 read input through sceImeUpdate, not libScePad. SDL3 scancodes ARE USB
                 // HID usage ids for the keyboard page — exactly the keycode the guest event wants.
@@ -923,6 +982,13 @@ int main(int argc, char** argv) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(4));
                 } else {
                     shown++; lastFrameProgress = std::chrono::steady_clock::now();
+                    // GPU-present mode has no CPU pixels here for the F9 screenshot; drop the pending
+                    // request rather than letting it leak into a later CPU-present-miss frame (the
+                    // .prgbundle oracle is the authoritative image anyway).
+                    if (!pendingGrabScreenshot.empty()) {
+                        std::fprintf(stderr, "[grab] screenshot skipped (gpu-present); use the .prgbundle\n");
+                        pendingGrabScreenshot.clear();
+                    }
                     static auto t0 = std::chrono::steady_clock::now(); static uint64_t mark = 0;
                     if (shown - mark >= 60) {
                         auto now = std::chrono::steady_clock::now();
@@ -945,7 +1011,8 @@ int main(int argc, char** argv) {
                     if (gpuPrevSlot >= 0) { prosper::frontend::present_blit_release(gpuPrevSlot); gpuPrevSlot = -1; }
                     if (a == PresentAttempt::out_of_date) swapchainDirty = true;
                     else if (a == PresentAttempt::skipped) std::this_thread::sleep_for(std::chrono::milliseconds(4));
-                    else { lastFrameSeq = cf.frame_seq; shown++; lastFrameProgress = std::chrono::steady_clock::now(); }
+                    else { lastFrameSeq = cf.frame_seq; shown++; lastFrameProgress = std::chrono::steady_clock::now();
+                           flushGrabScreenshot(cf.rgba->data(), cf.width, cf.height); }
                 } else {
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 }
@@ -972,6 +1039,7 @@ int main(int argc, char** argv) {
                 } else {
                     lastFrameSeq = frame.frame_seq; shown++;
                     lastFrameProgress = std::chrono::steady_clock::now();
+                    flushGrabScreenshot(frame.rgba->data(), w, h);
                     // Periodic present-rate log (every 60 presented frames).
                     static auto t0 = std::chrono::steady_clock::now(); static uint64_t mark = 0;
                     if (shown - mark >= 60) {
