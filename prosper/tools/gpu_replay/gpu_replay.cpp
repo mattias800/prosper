@@ -449,12 +449,32 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                         static_cast<unsigned long long>(failure.color0_base),
                         failure.color0_width, failure.color0_height, failure.vertex_count,
                         failure.pipeline_present ? "yes" : "no");
-            if (failure.pipeline_present)
+            if (failure.pipeline_present) {
                 std::printf(" fmt=%u cwm=%x depth=%d/%d/%u stencil=%d blend=%d",
                             failure.pipeline.color0_format, failure.pipeline.color_write_mask,
                             failure.pipeline.depth_test_enable, failure.pipeline.depth_write_enable,
                             failure.pipeline.depth_compare_op, failure.pipeline.stencil_enable,
                             failure.pipeline.blend_enable);
+                // A no-effect verdict hinges on the exact per-face stencil program — print it so a
+                // wrongly-skipped stencil writer is visible from the summary alone.
+                if (failure.pipeline.stencil_enable)
+                    std::printf(" sops=%u/%u/%u|%u/%u/%u swm=%02x/%02x scmp=%u/%u sref=%u/%u"
+                                " sopval=%u/%u",
+                                failure.pipeline.stencil_fail_op[0],
+                                failure.pipeline.stencil_pass_op[0],
+                                failure.pipeline.stencil_depth_fail_op[0],
+                                failure.pipeline.stencil_fail_op[1],
+                                failure.pipeline.stencil_pass_op[1],
+                                failure.pipeline.stencil_depth_fail_op[1],
+                                failure.pipeline.stencil_write_mask[0],
+                                failure.pipeline.stencil_write_mask[1],
+                                failure.pipeline.stencil_compare_op[0],
+                                failure.pipeline.stencil_compare_op[1],
+                                failure.pipeline.stencil_ref[0],
+                                failure.pipeline.stencil_ref[1],
+                                failure.pipeline.stencil_op_val[0],
+                                failure.pipeline.stencil_op_val[1]);
+            }
             std::printf("\n");
         } else {
             const auto& launch = failure.compute_launch;
@@ -1825,6 +1845,42 @@ int main(int argc, char** argv) {
             }
         } else {
             std::fprintf(stderr, "[stencil-dump] snapshot failed: %s\n", derr.c_str());
+        }
+    }
+    // Sibling depth-plane dump (#1275): grayscale each persistent DEPTH plane + numeric stats, so a
+    // shadow atlas whose casters rasterize nothing is distinguishable from a populated one.
+    if (const char* ddump = getenv("PROSPER_DEPTH_DUMP")) {
+        std::vector<prosper::gpu::GpuCaptureDsSeed> seeds;
+        std::string derr;
+        if (prosper::test::snapshot_persistent_ds_images(seeds, derr)) {
+            for (size_t si = 0; si < seeds.size(); ++si) {
+                const auto& s = seeds[si];
+                if (!s.depth_valid || s.depth.empty()) continue;
+                const size_t n = static_cast<size_t>(s.width) * s.height;
+                const float* dz = reinterpret_cast<const float*>(s.depth.data());
+                const size_t nz = std::min(n, s.depth.size() / 4);
+                float dmin = 1e30f, dmax = -1e30f;
+                size_t nonzero = 0;
+                std::vector<uint8_t> rgba(n * 4, 255);
+                for (size_t p = 0; p < nz; ++p) {
+                    const float v = dz[p];
+                    dmin = std::min(dmin, v); dmax = std::max(dmax, v);
+                    if (v != 0.0f) ++nonzero;
+                    const uint8_t g = static_cast<uint8_t>(
+                        std::clamp(v, 0.0f, 1.0f) * 255.0f);
+                    rgba[p * 4 + 0] = g; rgba[p * 4 + 1] = g; rgba[p * 4 + 2] = g;
+                    rgba[p * 4 + 3] = 255;
+                }
+                char path[600];
+                std::snprintf(path, sizeof path, "%s_depth%zu_%ux%u.bmp", ddump, si,
+                              s.width, s.height);
+                prosper::test::dump_bmp(path, rgba, s.width, s.height);
+                std::fprintf(stderr,
+                             "[depth-dump] ds%zu %ux%u min=%g max=%g nonzero=%zu/%zu -> %s\n",
+                             si, s.width, s.height, dmin, dmax, nonzero, nz, path);
+            }
+        } else {
+            std::fprintf(stderr, "[depth-dump] snapshot failed: %s\n", derr.c_str());
         }
     }
     const auto extent_mode = selected_draws_only

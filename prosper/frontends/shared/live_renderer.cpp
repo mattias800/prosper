@@ -1237,11 +1237,41 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                         live_rtt != g_rtt.end() ? (int)(bool)live_rtt->second.rgba
                                                                 : -1);
                         }
+                        // Sampled depth bridge (#1275): the T# addresses the depth plane of a
+                        // surface prosper rendered into a persistent Vulkan DS image. Guest memory
+                        // never receives that depth, so the guest-byte decode below would sample
+                        // zeros (every shadow compare passes -> unshadowed, overbright scenes).
+                        // Bind the retained depth image directly instead. Under
+                        // PROSPER_RENDER_SCALE>1 the DS extent is scaled while the T# stays native,
+                        // so the exact-extent match misses and scaled captures render unshadowed —
+                        // a documented limitation of the deliberate sampling accelerations.
+                        const bool has_ds_live = !has_live_rtt && !fr.is_storage_image &&
+                            r.img_dim == 1u && r.cls == RC::Texture &&
+                            prosper::test::find_persistent_ds_sampled(r.gpu_addr, tw, th).image !=
+                                nullptr;
                         if (has_gpu_live_rtt) {
                             fr.persistent_render_target_id = r.gpu_addr;
                             fr.tw = tw; fr.th = th; fr.td = 1; fr.img_dim = r.img_dim;
                             fr.texture_format = live_rtt->second.format;
                             resource_rtt_hit = true;
+                        } else if (has_ds_live) {
+                            fr.persistent_depth_target_id = r.gpu_addr;
+                            fr.tw = tw; fr.th = th; fr.td = 1; fr.img_dim = r.img_dim;
+                            resource_rtt_hit = true;
+                            if (getenv("PROSPER_DSBRIDGE_LOG")) {
+                                static int consumer_logged = 0;
+                                if (consumer_logged++ < 24)
+                                    fprintf(stderr,
+                                            "[dsbridge] consumer draw target=0x%llx samples "
+                                            "0x%llx %ux%u cwm=%x scissor=[%d,%d)-[%d,%d) "
+                                            "dcmp=%d func=%u\n",
+                                            (unsigned long long)draw.color0_base,
+                                            (unsigned long long)r.gpu_addr, tw, th,
+                                            draw.ps.color_write_mask, draw.ps.scissor_left,
+                                            draw.ps.scissor_top, draw.ps.scissor_right,
+                                            draw.ps.scissor_bottom, (int)r.depth_compare,
+                                            r.depth_compare_func);
+                            }
                         } else if (decoded_reuse) {
                             fr.tex_rgba = decoded_reuse->pixels;
                             fr.tw = tw;
@@ -2586,8 +2616,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             std::ceil(viewport_x * static_cast<float>(max_native_w) / w));
                         const uint64_t viewport_native_h = static_cast<uint64_t>(
                             std::ceil(viewport_y * static_cast<float>(max_native_h) / h));
+                        // Depth-only surfaces legitimately exceed the presentation extent: Blue
+                        // Prince's directional-shadow cascades render translated 512x512/1024x1024
+                        // viewports into 2048x2048 and 4096x4096 atlases (#1275). Capping at the
+                        // presentation surface collapsed those atlases to 1x1, erasing every shadow.
+                        // The per-axis bound (each axis against its own presentation axis, or 4096)
+                        // keeps the Dead Cells pathology (translated viewports inferring
+                        // 16384x16384, the reason this cap exists) rejected and fail-visible.
                         const bool viewport_extent_valid = viewport_native_w && viewport_native_h &&
-                            viewport_native_w <= max_native_w && viewport_native_h <= max_native_h;
+                            viewport_native_w <= std::max<uint64_t>(4096u, max_native_w) &&
+                            viewport_native_h <= std::max<uint64_t>(4096u, max_native_h);
                         if (getenv("PROSPER_DSLOG") && (viewport_native_w || viewport_native_h)) {
                             fprintf(stderr,
                                     "[ds] viewport-derived extent %llux%llu (presentation %ux%u) -> %s\n",
@@ -2609,6 +2647,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         } else if (present_w && present_h) {
                             gw = std::max(1u, (uint32_t)(((uint64_t)native_w * w + present_w / 2) / present_w));
                             gh = std::max(1u, (uint32_t)(((uint64_t)native_h * h + present_h / 2) / present_h));
+                        } else if (color_disabled && uses_ds) {
+                            // No presentation extent (offline replay): render scale is 1, so a
+                            // depth-only surface's viewport-derived extent is exact. Falling back
+                            // to the global w/h here silently truncated over-presentation atlases —
+                            // Blue Prince's 2048x2048 shadow atlas became a 1920x1080 DS image
+                            // whose sampled taps then missed the bridge (#1275). Color passes keep
+                            // the historical capture-extent truncation (their over-allocated
+                            // CB_COLOR0_ATTRIB2 backings are a different, hash-pinned contract).
+                            gw = native_w; gh = native_h;
                         }
                     }
                     std::vector<prosper::gpu::DrawItem> adjusted;

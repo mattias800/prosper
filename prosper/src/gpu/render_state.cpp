@@ -395,6 +395,20 @@ RenderState extract_render_state(const GpuState& st) {
         // mechanism verified against the live capture; the un-offset recovery matches hardware.
         if (!combine(/*apply_offset=*/true) && (offset_x != 0 || offset_y != 0))
             combine(/*apply_offset=*/false);
+        // PROSPER_SCISSORLOG (#1287 bring-up): print the raw scissor registers whenever the combined
+        // rectangle is empty — Blue Prince resolves 699 of ~2,400 Day One draws to [0,0)x[0,0).
+        if (right <= left || bottom <= top) {
+            static const bool scissor_log = getenv("PROSPER_SCISSORLOG") != nullptr;
+            static int logged = 0;
+            if (scissor_log && logged < 24) {
+                ++logged;
+                fprintf(stderr,
+                        "[scissor] EMPTY combined=[%d,%d)-[%d,%d) screen=%08x/%08x window=%08x/%08x "
+                        "generic=%08x/%08x vport=%08x/%08x offset=%08x mode=%08x\n",
+                        left, top, right, bottom, screen_tl, screen_br, window_tl, window_br,
+                        generic_tl, generic_br, viewport_tl, viewport_br, window_offset, mode);
+            }
+        }
         rs.scissor_left = left; rs.scissor_top = top;
         rs.scissor_right = right; rs.scissor_bottom = bottom;
     }
