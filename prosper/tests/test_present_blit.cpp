@@ -289,6 +289,82 @@ int main() {
         vkDestroyImage(ctx.dev, r16, nullptr); vkFreeMemory(ctx.dev, r16Mem, nullptr);
     }
 
+    // #1270 Finding 1 (direct guard): an ACQUIRED (in-flight) slot's image must survive a different-size
+    // publish. The resize UAF this replaces would free the held image here. Publish+acquire frame A at
+    // WxH; publish several frames at a DIFFERENT size (which recreate OTHER free slots); the held image
+    // must still be valid and still contain A's pixels.
+    {
+        const uint32_t w2 = 48, h2 = 27;
+        const size_t bytes2 = (size_t)w2 * h2 * 4;
+        VkImage src2 = VK_NULL_HANDLE; VkDeviceMemory src2Mem = VK_NULL_HANDLE;
+        { VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+          ici.imageType = VK_IMAGE_TYPE_2D; ici.format = VK_FORMAT_R8G8B8A8_UNORM; ici.extent = {w2, h2, 1};
+          ici.mipLevels = 1; ici.arrayLayers = 1; ici.samples = VK_SAMPLE_COUNT_1_BIT;
+          ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+          ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+          ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+          vkCreateImage(ctx.dev, &ici, nullptr, &src2);
+          VkMemoryRequirements q{}; vkGetImageMemoryRequirements(ctx.dev, src2, &q);
+          VkMemoryAllocateInfo a{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; a.allocationSize = q.size;
+          a.memoryTypeIndex = mem_type(ctx.phys, q.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+          vkAllocateMemory(ctx.dev, &a, nullptr, &src2Mem); vkBindImageMemory(ctx.dev, src2, src2Mem, 0); }
+        VkBuffer st2, rbA; VkDeviceMemory st2Mem, rbAMem; void* st2Map = nullptr; void* rbAMap = nullptr;
+        auto hbuf2 = [&](VkDeviceSize sz, VkBufferUsageFlags u, VkBuffer& b, VkDeviceMemory& m, void** mp) {
+            VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bci.size = sz; bci.usage = u; bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            vkCreateBuffer(ctx.dev, &bci, nullptr, &b);
+            VkMemoryRequirements q{}; vkGetBufferMemoryRequirements(ctx.dev, b, &q);
+            VkMemoryAllocateInfo a{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; a.allocationSize = q.size;
+            a.memoryTypeIndex = mem_type(ctx.phys, q.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            vkAllocateMemory(ctx.dev, &a, nullptr, &m); vkBindBufferMemory(ctx.dev, b, m, 0);
+            if (mp) vkMapMemory(ctx.dev, m, 0, sz, 0, mp);
+        };
+        hbuf2(bytes2, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, st2, st2Mem, &st2Map);
+        hbuf2((size_t)W * H * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, rbA, rbAMem, &rbAMap);
+        auto upload_and_publish = [&](VkImage img, VkBuffer stg, void* stgMap, uint32_t iw, uint32_t ih,
+                                      uint64_t seq) -> bool {
+            fill_pattern((uint8_t*)stgMap, iw, ih, seq);
+            VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkResetCommandBuffer(prodCb, 0); vkBeginCommandBuffer(prodCb, &bi);
+            barrier(prodCb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkBufferImageCopy cp{}; cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; cp.imageExtent = {iw, ih, 1};
+            vkCmdCopyBufferToImage(prodCb, stg, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+            barrier(prodCb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            vkEndCommandBuffer(prodCb); locked_submit_wait(ctx, prodCb, prodFence);
+            return frontend::present_blit_publish(img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_FORMAT_R8G8B8A8_UNORM, iw, ih, seq);
+        };
+        // Frame A at WxH; hold it.
+        CHECK(upload_and_publish(src, stage, stageMap, W, H, 777), "held-slot: publish A (WxH)");
+        frontend::GpuScanoutFrame gfA; bool gotA = false;
+        for (int t = 0; t < 1000 && !gotA; t++) { gotA = frontend::present_blit_acquire(gfA); if (!gotA) std::this_thread::yield(); }
+        CHECK(gotA && gfA.width == W && gfA.height == H, "held-slot: acquire A");
+        // Publish several DIFFERENT-size frames; these recreate other free slots, never the held one.
+        for (uint64_t k = 0; k < 4; k++) upload_and_publish(src2, st2, st2Map, w2, h2, 800 + k);
+        // The held image must still be valid AND still contain A's pixels.
+        int held_mismatch = 1;
+        if (gotA) {
+            VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkResetCommandBuffer(consCb, 0); vkBeginCommandBuffer(consCb, &bi);
+            VkBufferImageCopy cp{}; cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; cp.imageExtent = {W, H, 1};
+            vkCmdCopyImageToBuffer(consCb, gfA.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rbA, 1, &cp);
+            vkEndCommandBuffer(consCb); locked_submit_wait(ctx, consCb, consFence);
+            std::vector<uint8_t> expA((size_t)W * H * 4); fill_pattern(expA.data(), W, H, 777);
+            held_mismatch = memcmp(rbAMap, expA.data(), expA.size()) != 0 ? 1 : 0;
+            frontend::present_blit_release(gfA.slot);
+        }
+        CHECK(held_mismatch == 0, "held-slot: acquired image survives a different-size publish, content intact");
+        vkDeviceWaitIdle(ctx.dev);
+        vkDestroyBuffer(ctx.dev, st2, nullptr); vkFreeMemory(ctx.dev, st2Mem, nullptr);
+        vkDestroyBuffer(ctx.dev, rbA, nullptr); vkFreeMemory(ctx.dev, rbAMem, nullptr);
+        vkDestroyImage(ctx.dev, src2, nullptr); vkFreeMemory(ctx.dev, src2Mem, nullptr);
+    }
+
     vkDeviceWaitIdle(ctx.dev);
     frontend::present_blit_reset();
     gpu::set_shared_present_active(false);
