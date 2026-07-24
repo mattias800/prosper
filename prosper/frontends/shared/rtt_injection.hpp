@@ -23,11 +23,11 @@ inline bool inject_rtt_pixels(std::vector<uint8_t>& dst, uint32_t dst_w, uint32_
     const size_t dst_bytes = static_cast<size_t>(dst_texels) * bytes_per_pixel;
     const size_t src_bytes = static_cast<size_t>(src_texels) * bytes_per_pixel;
     if (src.size() != src_bytes) return false;
-    dst.assign(dst_bytes, 0);
     if (src_w == dst_w && src_h == dst_h) {
         dst = src;
         return true;
     }
+    dst.resize(dst_bytes);
     for (uint32_t y = 0; y < dst_h; ++y) {
         const uint32_t sy = static_cast<uint32_t>(static_cast<uint64_t>(y) * src_h / dst_h);
         for (uint32_t x = 0; x < dst_w; ++x) {

@@ -27,8 +27,10 @@ int main() {
     CHECK(std::equal(scaled.begin(), scaled.begin() + 8, fp16_source.begin()));
     CHECK(std::equal(scaled.begin() + 8, scaled.end(), fp16_source.begin() + 16));
 
-    std::vector<uint8_t> malformed(7);
+    std::vector<uint8_t> malformed(7), fallback_bytes = {0xaa, 0xbb, 0xcc, 0xdd};
+    consumer = fallback_bytes;
     CHECK(!inject_rtt_pixels(consumer, 1, 1, malformed, 1, 1, 8));
+    CHECK(consumer == fallback_bytes); // rejection preserves the caller's guest-decode fallback buffer
 
     if (!failures) std::printf("rtt_injection: OK\n");
     return failures ? 1 : 0;
