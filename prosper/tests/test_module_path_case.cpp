@@ -59,6 +59,18 @@ int main() {
     const std::string lenDiff = base + "/Media/Modules/Il2cppUserAssemblies2.prx";
     CHECK(resolve_host_path_case(lenDiff) == lenDiff, "length-differing name is not case-matched");
 
+    // #1236: an absent LEAF under a case-CORRECTED parent chain must keep the corrected ancestors
+    // (only the unmatched leaf retains its requested spelling), so an O_CREAT lands in the real
+    // directory. Query with wrong-case dirs ("media/MODULES") and an absent leaf; the on-disk
+    // "Media/Modules" (created above) must survive in the result. Before #1236 this dropped back to
+    // the fully-original wrong-case path.
+    const std::string corrParent = base + "/media/MODULES/BrandNew.prx";
+    const std::string rc = resolve_host_path_case(corrParent);
+    CHECK(rc == base + "/Media/Modules/BrandNew.prx",
+          "absent leaf under a case-corrected parent -> corrected parent + original leaf");
+    CHECK(!fs::exists(fs::path(rc)),
+          "the corrected-parent result is still absent, so a read probe still fails ENOENT");
+
     // Empty input: unchanged, no throw.
     CHECK(resolve_host_path_case("").empty(), "empty path returned unchanged");
 

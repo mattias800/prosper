@@ -108,9 +108,12 @@ int main() {
         CHECK(fs::exists(fs::path(r)), "mixed-case absolute /app0 path resolves to the on-disk file");
     }
 
-    // Case correction must not invent matches: absent names stay the composed exact-case path.
-    CHECK(resolve_guest_path("/app0/Data/Config2.BIN") == base + "/Data/Config2.BIN",
-          "no case-insensitive match leaves the composed path unchanged");
+    // Case correction must not invent matches for the LEAF, but a case-corrected PARENT must survive
+    // (#1236): the parent "Data" resolves to the on-disk "data", and the absent leaf keeps its
+    // requested spelling — so an O_CREAT of this path lands inside the real "data" directory, matching
+    // PS5's case-insensitive namespace. (Before #1236 this dropped back to the uncorrected "Data".)
+    CHECK(resolve_guest_path("/app0/Data/Config2.BIN") == base + "/data/Config2.BIN",
+          "absent leaf under a case-corrected parent keeps the corrected parent, original leaf");
 
     fs::remove_all(root, ec);
     std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);

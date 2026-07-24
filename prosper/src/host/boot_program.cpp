@@ -38,7 +38,15 @@ std::string resolve_host_path_case(const std::string& want) {
         const std::string real = e.path().filename().string();
         if (ieq(real, base)) return (fs::path(dir) / real).string();
     }
-    return want;   // no case-insensitive match either — genuinely absent
+    // No case-insensitive match for the leaf. Still recombine the (possibly case-CORRECTED) parent
+    // with the original leaf spelling rather than dropping back to the fully-original `want` (#1236):
+    // a case-corrected ancestor must survive so an O_CREAT under an existing wrong-case directory
+    // lands inside the real directory (guest makes "/savedata0/Dir", later opens "/savedata0/dir/new"
+    // with O_CREAT — PS5's case-insensitive namespace creates it inside the existing dir). When no
+    // ancestor was corrected `dir` still equals the original parent, so this reconstructs `want`
+    // byte-for-byte; and a genuinely absent leaf still does not exist, so a read probe keeps failing
+    // ENOENT exactly as before.
+    return (fs::path(dir) / base).string();
 }
 
 } // namespace prosper
