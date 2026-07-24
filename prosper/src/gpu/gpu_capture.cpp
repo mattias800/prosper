@@ -49,7 +49,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v1-v23 record prefix is preserved and older captures materialize with the historical default of 1. It
 // was populated live but never written/read, so every reloaded .prgcap resource defaulted to 1 and a
 // mip-declaring title replayed single-level.
-constexpr uint32_t kVersion = 24;
+// v25 (#1240): each realized/failed draw pipeline retains CB_COLOR_CONTROL.MODE=3 resolve intent in
+// another version-gated tail, keeping every v1-v24 record prefix byte-exact.
+constexpr uint32_t kVersion = 25;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -1529,6 +1531,13 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         for (const auto& draw : c.draws) { write_declared_mips(draw.vrt); write_declared_mips(draw.prt); }
         for (const auto& compute : c.computes) write_declared_mips(compute.resources);
     }
+    // v25 (#1240) appends the resolved MODE=3 MSAA-copy intent. gpu_replay drives the same renderer
+    // callback as live execution; without this bit it silently skips color0 -> color1 resolves.
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws) w.u8(draw.ps.cb_resolve ? 1u : 0u);
+    w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
+    for (const auto& diagnostic : c.failure_diagnostics)
+        if (diagnostic.pipeline_present) w.u8(diagnostic.pipeline.cb_resolve ? 1u : 0u);
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -2097,6 +2106,26 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             if (!read_declared_mips(draw.vrt) || !read_declared_mips(draw.prt)) return false;
         for (auto& compute : c.computes)
             if (!read_declared_mips(compute.resources)) return false;
+    }
+    if (version >= 25) {   // #1240: MODE=3 resolve intent for realized and failed pipelines
+        uint32_t draw_count = 0;
+        if (!r.u32(draw_count) || draw_count != c.draws.size()) {
+            error = "invalid resolve draw-state count"; return false;
+        }
+        for (auto& draw : c.draws) {
+            uint8_t enabled = 0;
+            if (!r.u8(enabled) || enabled > 1) return false;
+            draw.ps.cb_resolve = enabled != 0;
+        }
+        uint32_t failure_count = 0;
+        if (!r.u32(failure_count) || failure_count != c.failure_diagnostics.size()) {
+            error = "invalid resolve failure-state count"; return false;
+        }
+        for (auto& diagnostic : c.failure_diagnostics) if (diagnostic.pipeline_present) {
+            uint8_t enabled = 0;
+            if (!r.u8(enabled) || enabled > 1) return false;
+            diagnostic.pipeline.cb_resolve = enabled != 0;
+        }
     }
     if (version >= 7 && !validate_failure_diagnostics(c, error)) return false;
     if (r.left) { error = "capture has trailing data"; return false; }
