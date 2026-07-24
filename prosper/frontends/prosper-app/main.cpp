@@ -16,6 +16,7 @@
 #include "gpu/videoout_present.hpp"   // present_acquire_rendered_frame / present_write_frame
 #include "gpu/gpu_execute.hpp"         // shared_vulkan_context / gpu-present activation (#1270)
 #include "gpu/gpu_capture.hpp"         // request_interactive_gpu_capture (F9 frame grab)
+#include "gpu/gpu_timeline.hpp"        // request_interactive_capture_bundle (F9 whole-frame grab)
 #include "present_blit.hpp"           // GPU scanout handoff: acquire/release the renderer's front image
 #include "host/lifecycle.hpp"          // prosper_request_stop / prosper_stop_requested
 #include "host/boot_program.hpp"       // boot_program (shared guest-boot path, also used by boot_trace)
@@ -781,8 +782,8 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[app] keyboard: WASD/Arrows=move  J/Space=Cross(jump)  K=Square(attack)  L=Circle  "
                     "I=Triangle  U/O=L1/R1  Y/H=L2/R2  Enter=Options  "
                     "F11/Alt+Enter=fullscreen  Esc=quit\n");
-    fprintf(stderr, "[app] F9 = grab the next frame: writes a replayable .prgcap capsule + a .bmp "
-                    "screenshot (to PROSPER_CAPTURE_DIR, default cwd) for gpu_replay debugging.\n");
+    fprintf(stderr, "[app] F9 = grab the next frame: writes a replayable .prgbundle (whole frame) + a "
+                    ".bmp screenshot (to PROSPER_CAPTURE_DIR, default cwd) for gpu_replay debugging.\n");
 
     const bool frameTrace = getenv("PROSPER_APP_FRAME_TRACE") != nullptr;
     const char* stallDumpEnv = getenv("PROSPER_APP_STALL_DUMP_MS");
@@ -840,17 +841,20 @@ int main(int argc, char** argv) {
                 key.f11 = ev.key.key == SDLK_F11;
                 key.enter = ev.key.key == SDLK_RETURN || ev.key.key == SDLK_KP_ENTER;
                 key.alt = (ev.key.mod & SDL_KMOD_ALT) != 0;
-                // Interactive frame grab: F9 arms a one-shot GPU capture of the next drawn frame + a
-                // screenshot. It is a HOST hotkey, so it is NOT forwarded to the guest IME/pad. On-demand
-                // only — zero cost until pressed, so it never distorts the FPS you are trying to observe.
+                // Interactive frame grab: F9 arms a one-shot capture of the next COMPLETE frame (every
+                // submit between the next two presents) into a replayable .prgbundle, plus a screenshot.
+                // The whole-frame bundle re-runs the frame's producer submits on replay, so renderer-owned
+                // RTTs regenerate instead of replaying black (as a single-submit .prgcap does for a
+                // deferred renderer). It is a HOST hotkey, NOT forwarded to the guest IME/pad. On-demand
+                // only — near-zero cost until pressed, so it never distorts the FPS you are observing.
                 if (ev.type == SDL_EVENT_KEY_DOWN && key.app_window && !ev.key.repeat &&
                     ev.key.key == SDLK_F9) {
                     char base[512];
                     std::snprintf(base, sizeof base, "%s/frame_grab_%03u", grabDir.c_str(), ++grabCounter);
-                    prosper::gpu::request_interactive_gpu_capture(std::string(base) + ".prgcap");
+                    prosper::gpu::request_interactive_capture_bundle(std::string(base) + ".prgbundle");
                     pendingGrabScreenshot = std::string(base) + ".bmp";
                     std::fprintf(stderr,
-                        "[grab] F9: arming capture of the next drawn frame -> %s.prgcap (+ .bmp screenshot)\n",
+                        "[grab] F9: arming a whole-frame capture -> %s.prgbundle (+ .bmp screenshot)\n",
                         base);
                     continue;
                 }
