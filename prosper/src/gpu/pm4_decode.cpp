@@ -135,6 +135,9 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                 case R_DRAW_INDEX_AUTO:
                     c.kind = K::DrawIndexAuto;
                     if (npl >= 1) c.index_count = pl[0];
+                    // Custom HLE payload: [0]=count, [1..2]=64-bit ShaderDrawModifier. Legacy
+                    // three-dword hardware/test packets have only count+initiator and retain 0.
+                    if (npl >= 3) c.di_modifier = lo_hi(pl + 1);
                     break;
                 case R_DISPATCH_DIRECT:
                     c.kind = K::DispatchDirect;

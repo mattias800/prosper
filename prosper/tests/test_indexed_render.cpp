@@ -57,9 +57,10 @@ int main() {
         return g == 9u;
     };
     auto draw_of = [&](const std::vector<uint32_t>& vbuf, const ResolvedPipelineState* st,
-                       uint32_t vcount, std::vector<uint32_t> idx) {
+                       uint32_t vcount, std::vector<uint32_t> idx, int32_t vertex_offset = 0) {
         prosper::test::BackendDraw d;
         d.vs = vert; d.fs = frag; d.ps = st; d.vcount = vcount; d.indices = std::move(idx);
+        d.vertex_offset = vertex_offset;
         prosper::test::FrameResource r; r.binding = 3; r.set = 0; r.dwords = vbuf;
         d.R.push_back(std::move(r));
         return d;
@@ -95,6 +96,17 @@ int main() {
         { draw_of(vbufB, &list_ps, 3, {}) }, W, H);
     CHECK(px_noidx.size() == (size_t)W*H*4 && px_noidx != px_tri,
           "dropping the indices changes the picture (indices are really applied)");
+
+    // --- Case C: GE_INDX_OFFSET reaches both Vulkan draw variants. The same shared pool can select
+    // records 1..3 either with non-indexed firstVertex=1 or indexed vertexOffset=1.
+    std::vector<uint8_t> px_first_vertex = prosper::test::render_draws_rgba(
+        { draw_of(vbufB, &list_ps, 3, {}, 1) }, W, H);
+    CHECK(px_first_vertex.size() == (size_t)W*H*4 && greenAt9(px_first_vertex),
+          "non-indexed firstVertex selects records 1..3 from a shared vertex pool");
+    std::vector<uint8_t> px_vertex_offset = prosper::test::render_draws_rgba(
+        { draw_of(vbufB, &list_ps, 3, {0,1,2}, 1) }, W, H);
+    CHECK(px_vertex_offset.size() == (size_t)W*H*4 && greenAt9(px_vertex_offset),
+          "indexed vertexOffset selects records 1..3 from a shared vertex pool");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

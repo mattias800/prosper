@@ -70,7 +70,7 @@ int main() {
     setsh_direct(D, pack_reg(0x200, 0x22222222), 0, 0, 0, 0);
     setuc_direct(D, pack_reg(0x300, 0x33333333), 0, 0, 0, 0);
     instances(D, 7, 0, 0, 0, 0);
-    draw(D, /*index_count*/ 0x1234, 0, 0, 0, 0);
+    draw(D, /*index_count*/ 0x1234, /*modifier*/ 0x1122334455667788ull, 0, 0, 0);
     drawi(D, /*index_count*/ 0x0600, /*indices*/ 0xDEAD0000BEEF0040ull, /*modifier*/ 0x40000000ull, 0, 0);
     evt(D, /*event_type*/ 0x42, /*address*/ 0x1400ABCD00ull, 0, 0, 0);
     pop(D, 0, 0, 0, 0, 0);
@@ -113,6 +113,8 @@ int main() {
     CHECK(ops[7].kind == K::SetNumInstances && ops[7].instance_count == 7,
           "op7 = SetNumInstances(7)");
     CHECK(ops[8].kind == K::DrawIndexAuto && ops[8].index_count == 0x1234, "op8 = DrawIndexAuto(0x1234)");
+    CHECK(ops[8].di_modifier == 0x1122334455667788ull,
+          "op8 DrawIndexAuto modifier round-trips");
 
     // DrawIndex round-trip (issue #63): the builder wrote [1]=count, [2..3]=index addr, [4..5]=modifier;
     // the decoder must hand every field back (indexed draws were previously dropped as unknown NOPs).

@@ -75,6 +75,8 @@ struct GpuCapturedDraw {
     // equal raw_draw_count; a divergence is a decode/realization bug (--inspect-only flags it). 0 = unknown.
     uint32_t raw_draw_count = 0;
     bool raw_indexed = false;
+    uint64_t raw_draw_modifier = 0;
+    int32_t vertex_offset = 0;
     std::vector<uint32_t> indices;
     uint64_t color0_base = 0;
     uint32_t color0_width = 0, color0_height = 0;

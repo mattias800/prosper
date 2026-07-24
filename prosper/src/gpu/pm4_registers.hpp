@@ -325,6 +325,7 @@ constexpr uint32_t SPI_SHADER_IDX_FORMAT  = 0x1C2;
 constexpr uint32_t SPI_SHADER_POS_FORMAT  = 0x1C3;
 constexpr uint32_t SPI_SHADER_Z_FORMAT    = 0x1C4;
 constexpr uint32_t SPI_SHADER_COL_FORMAT  = 0x1C5;
+constexpr uint32_t SX_PS_DOWNCONVERT      = 0x1D5;
 constexpr uint32_t CB_BLEND0_CONTROL                            = 0x1E0;
 constexpr uint32_t CB_BLEND1_CONTROL                            = 0x1E1;
 constexpr uint32_t CB_BLEND0_CONTROL_COLOR_SRCBLEND_SHIFT       = 0;

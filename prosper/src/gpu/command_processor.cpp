@@ -1849,12 +1849,12 @@ void GpuState::apply(const Pm4Command& c) {
             d.index_count = c.index_count;
             d.instance_count = num_instances;
             d.state = last_snapshot_;
+            d.modifier = c.di_modifier;
             if (c.kind == K::DrawIndex) {
                 // Mark as indexed only when the packet was fully decoded — a short packet's addr/
                 // modifier would be fabricated zeros, and `indexed` promises index_addr is real.
                 d.indexed = c.di_valid;
                 d.index_addr = c.di_index_addr;
-                d.modifier = c.di_modifier;
             }
             draws.push_back(std::move(d));
             draws.back().command_order = command_order;

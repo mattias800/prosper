@@ -84,9 +84,11 @@ struct Pm4Command {
     uint32_t threads_x = 0, threads_y = 0, threads_z = 0;
     uint64_t dispatch_modifier = 0;          // DispatchDirect modifier bits
 
-    // DrawIndex (sceAgcDcbDrawIndex -> R_DRAW_INDEX, laid out by hle_agc.cpp agc_dcb_draw_index).
-    // Packet payload: [0]=index_count, [1..2]=index-buffer guest address (lo/hi), [3..4]=64-bit draw
-    // modifier (lo/hi). Field roles cross-checked against Kyty: GraphicsDrawIndex (Graphics.cpp:313)
+    // DrawIndex/DrawIndexAuto modifier. Both custom HLE packets retain the shader's trailing
+    // 64-bit ShaderDrawModifier; DrawIndex additionally carries an index-buffer address.
+    // DrawIndex payload: [0]=index_count, [1..2]=index-buffer guest address (lo/hi), [3..4]=64-bit
+    // modifier (lo/hi). DrawIndexAuto payload: [0]=index_count, [1..2]=64-bit modifier (lo/hi).
+    // Field roles cross-checked against Kyty: GraphicsDrawIndex (Graphics.cpp:313)
     // emits exactly cmd[1]=index_count, cmd[2..3]=index_addr lo/hi under R_DRAW_INDEX, and its consumer
     // cp_op_draw_index (GraphicsRun.cpp:2757) reads buffer[0]=index_count, buffer[1..2]=index_addr —
     // CONFIDENCE: HIGH for count/address. [3..4] follows the Gen5 Dcb convention of a trailing 64-bit
@@ -95,7 +97,7 @@ struct Pm4Command {
     // The index ELEMENT SIZE is not in this packet: it comes from the preceding SetIndexType
     // (GpuState::index_type), which the per-draw snapshot already captures.
     uint64_t di_index_addr = 0;          // DrawIndex: guest address of the index buffer
-    uint64_t di_modifier = 0;            // DrawIndex: raw 64-bit draw-modifier bits
+    uint64_t di_modifier = 0;            // DrawIndex/DrawIndexAuto: raw 64-bit draw-modifier bits
     bool     di_valid = false;           // DrawIndex: payload was long enough to carry addr+modifier
 
     // Gen5 indexed-draw state (issue #232). SetIndexBase: [0..1]=index buffer addr lo/hi.

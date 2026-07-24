@@ -81,6 +81,8 @@ int main() {
     draw.fs_guest_addr = reinterpret_cast<uint64_t>(kDiagnosticBadPs);
     draw.vertex_count = 6; draw.instance_count = 3;
     draw.raw_draw_count = 6; draw.raw_indexed = false;   // #1256: raw draw-packet state (v23)
+    draw.raw_draw_modifier = 0x1122334455667788ull;
+    draw.vertex_offset = -37;
     draw.indices = {0, 1, 2, 2, 3, 0}; draw.color0_base = 0x2000;
     draw.color0_width = 1024; draw.color0_height = 32;
     draw.color1_base = 0x3000; draw.color1_width = 1024; draw.color1_height = 32;
@@ -103,6 +105,8 @@ int main() {
     draw.ps.src_alpha_blend_factor1 = 1; draw.ps.dst_alpha_blend_factor1 = 7;
     draw.ps.alpha_blend_op1 = 0; draw.ps.color1_write_mask = 0xf;
     draw.ps.cb_resolve = true;
+    draw.ps.spi_shader_col_format = 4;
+    draw.ps.sx_ps_downconvert = 5;
     draw.ps.has_scissor = true; draw.ps.scissor_left = 12; draw.ps.scissor_top = 19;
     draw.ps.scissor_right = 70; draw.ps.scissor_bottom = 75;
     draw.ps.logic_op_enable = true; draw.ps.logic_op = 6;
@@ -139,6 +143,9 @@ int main() {
           "capture retains the realized draw instance count");
     CHECK(captured.draws[0].raw_draw_count == 6 && !captured.draws[0].raw_indexed,
           "capture retains the raw draw-packet count and indexed flag (#1256)");
+    CHECK(captured.draws[0].raw_draw_modifier == 0x1122334455667788ull &&
+          captured.draws[0].vertex_offset == -37,
+          "capture retains the draw modifier and GE_INDX_OFFSET draw parameter");
     CHECK(captured.raw_shader_versions.size() == 2 &&
           captured.draws[0].vs_raw_shader_index < captured.raw_shader_versions.size() &&
           captured.draws[0].fs_raw_shader_index < captured.raw_shader_versions.size() &&
@@ -200,8 +207,20 @@ int main() {
               scalar_capture.computes[0].resources.resources.empty(),
           "#636: capture ignores unconsumed descriptor-looking scalar arguments");
 
-    // v25 (#1240): byte length of the trailing resolve-state block. Peeled first in each
-    // version-relabel backward-compat chain below (it is the outermost trailing tail).
+    // v27: byte length of the trailing draw-modifier/vertex-offset block.
+    auto v27_tail = [](const GpuCaptureFile& f) -> size_t {
+        return 4 + 12 * f.draws.size();
+    };
+
+    // v26: byte length of the trailing color-export/downconversion block.
+    auto v26_tail = [](const GpuCaptureFile& f) -> size_t {
+        size_t present_failures = 0;
+        for (const auto& diagnostic : f.failure_diagnostics)
+            if (diagnostic.pipeline_present) ++present_failures;
+        return 4 + 8 * f.draws.size() + 4 + 8 * present_failures;
+    };
+
+    // v25 (#1240): byte length of the trailing resolve-state block.
     auto v25_tail = [](const GpuCaptureFile& f) -> size_t {
         size_t present_failures = 0;
         for (const auto& diagnostic : f.failure_diagnostics)
@@ -231,6 +250,8 @@ int main() {
               v16_scissor_bytes.size() >= 25,
           "v17 capture serializes effective guest scissor state");
     if (v16_scissor_bytes.size() >= 25) {
+        v16_scissor_bytes.resize(v16_scissor_bytes.size() - v27_tail(v16_scissor_source));
+        v16_scissor_bytes.resize(v16_scissor_bytes.size() - v26_tail(v16_scissor_source));
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v25_tail(v16_scissor_source)); // v25 resolve tail
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v24_tail(v16_scissor_source)); // v24 declared-mip tail
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 12); // v23 count + one raw-draw-state
@@ -383,6 +404,8 @@ int main() {
           "writer rejects an out-of-bounds DCC metadata reference");
     CHECK(serialize_gpu_capture(volume_capture, volume_bytes, error),
           "recreated valid v12 DCC bytes after malformed-reference check");
+    volume_bytes.resize(volume_bytes.size() - v27_tail(volume_capture));
+    volume_bytes.resize(volume_bytes.size() - v26_tail(volume_capture));
     volume_bytes.resize(volume_bytes.size() - v25_tail(volume_capture)); // v25 resolve tail
     volume_bytes.resize(volume_bytes.size() - v24_tail(volume_capture)); // v24 declared-mip tail
     volume_bytes.resize(volume_bytes.size() - 12); // v23 count + one raw-draw-state
@@ -455,6 +478,8 @@ int main() {
     CHECK(serialize_gpu_capture(captured, v20_bytes, error) && v20_bytes.size() >= 21,
           "v21 capture serializes the logic-op extension");
     if (v20_bytes.size() >= 21) {
+        v20_bytes.resize(v20_bytes.size() - v27_tail(captured));
+        v20_bytes.resize(v20_bytes.size() - v26_tail(captured));
         v20_bytes.resize(v20_bytes.size() - v25_tail(captured)); // v25 resolve tail
         v20_bytes.resize(v20_bytes.size() - v24_tail(captured)); // v24 declared-mip tail
         v20_bytes.resize(v20_bytes.size() - 12); // v23 count + one raw-draw-state
@@ -488,12 +513,20 @@ int main() {
           "v21 framebuffer logic op round-trips explicitly");
     CHECK(loaded.draws[0].ps.cb_resolve,
           "v25 MODE=3 resolve intent round-trips explicitly for gpu_replay");
+    CHECK(loaded.draws[0].ps.spi_shader_col_format == 4 &&
+          loaded.draws[0].ps.sx_ps_downconvert == 5,
+          "v26 color export/downconversion state round-trips explicitly");
+    CHECK(loaded.draws[0].raw_draw_modifier == 0x1122334455667788ull &&
+          loaded.draws[0].vertex_offset == -37,
+          "v27 draw modifier and vertex offset round-trip explicitly");
     std::vector<uint8_t> v24_resolve_bytes;
     GpuCaptureFile v24_resolve_loaded;
     CHECK(serialize_gpu_capture(captured, v24_resolve_bytes, error) &&
-          v24_resolve_bytes.size() >= v25_tail(captured),
+          v24_resolve_bytes.size() >= v27_tail(captured) + v26_tail(captured) + v25_tail(captured),
           "v25 capture exposes a removable trailing resolve-state block");
-    if (v24_resolve_bytes.size() >= v25_tail(captured)) {
+    if (v24_resolve_bytes.size() >= v27_tail(captured) + v26_tail(captured) + v25_tail(captured)) {
+        v24_resolve_bytes.resize(v24_resolve_bytes.size() - v27_tail(captured));
+        v24_resolve_bytes.resize(v24_resolve_bytes.size() - v26_tail(captured));
         v24_resolve_bytes.resize(v24_resolve_bytes.size() - v25_tail(captured));
         v24_resolve_bytes[8] = 24;
         v24_resolve_bytes[9] = v24_resolve_bytes[10] = v24_resolve_bytes[11] = 0;
@@ -584,6 +617,9 @@ int main() {
           "materialized draw retains its source operation identity");
     CHECK(replay.items[0].instance_count == 3,
           "materialized replay retains the draw instance count");
+    CHECK(replay.items[0].raw_draw_modifier == 0x1122334455667788ull &&
+          replay.items[0].vertex_offset == -37,
+          "materialized replay retains its draw modifier and Vulkan vertex offset");
     CHECK(replay.items[0].vs_raw_shader_index == loaded.draws[0].vs_raw_shader_index &&
           replay.items[0].fs_raw_shader_index == loaded.draws[0].fs_raw_shader_index,
           "materialized replay exposes both realized raw-stage identities");
@@ -872,6 +908,8 @@ int main() {
     if (v13_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        v13_bytes.resize(v13_bytes.size() - v27_tail(legacy_source));
+        v13_bytes.resize(v13_bytes.size() - v26_tail(legacy_source));
         v13_bytes.resize(v13_bytes.size() - v25_tail(legacy_source)); // v25 resolve tail
         v13_bytes.resize(v13_bytes.size() - v24_tail(legacy_source)); // v24 declared-mip tail
         v13_bytes.resize(v13_bytes.size() - 12); // v23 count + one raw-draw-state
@@ -897,6 +935,8 @@ int main() {
     if (legacy_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        legacy_bytes.resize(legacy_bytes.size() - v27_tail(legacy_source));
+        legacy_bytes.resize(legacy_bytes.size() - v26_tail(legacy_source));
         legacy_bytes.resize(legacy_bytes.size() - v25_tail(legacy_source)); // v25 resolve tail
         legacy_bytes.resize(legacy_bytes.size() - v24_tail(legacy_source)); // v24 declared-mip tail
         legacy_bytes.resize(legacy_bytes.size() - 12); // v23 count + one raw-draw-state
@@ -948,9 +988,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 26;   // kVersion (25) + 1: a not-yet-defined future version
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 28;   // kVersion (27) + 1: a not-yet-defined future version
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 26",
+          error == "unsupported capture version 28",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

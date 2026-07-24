@@ -214,6 +214,7 @@ struct BackendDraw {
     std::vector<FrameResource> R;                              // set-tagged resources (empty -> no descriptors)
     uint32_t vcount = 3;
     uint32_t instance_count = 1;
+    int32_t vertex_offset = 0;
     // Indexed draw: 32-bit index data (the executor widens guest 16-bit indices). Non-empty -> the draw
     // is recorded as vkCmdBindIndexBuffer + vkCmdDrawIndexed(indices.size()), so gl_VertexIndex is the
     // fetched index — exactly what the recompiled VS's storage-buffer vertex fetch expects. Empty ->
@@ -2368,6 +2369,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         VkBuffer ibuf = VK_NULL_HANDLE; VkDeviceMemory ibmem = VK_NULL_HANDLE;   // index buffer (indexed draws)
         VkRect2D scissor{};
         uint32_t n_sets = 1, vcount = 3, icount = 0, instance_count = 1;
+        int32_t vertex_offset = 0;
         bool use_desc = false, ok = false, pipeline_cached = false;
     };
     struct TextureUploadKey {
@@ -2765,6 +2767,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         const prosper::gpu::ResolvedPipelineState* ps = bd.ps;
         v.vcount = bd.vcount;
         v.instance_count = bd.instance_count;
+        v.vertex_offset = bd.vertex_offset;
         v.scissor = {{0, 0}, {W, H}};
         // PROSPER_IGNORE_EMPTY_SCISSOR (#1287 bring-up diagnostic): render draws whose resolved
         // scissor is empty with a full-target scissor instead, to A/B whether they carry the
@@ -4094,9 +4097,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         }
         if (v.icount) {
             vkCmdBindIndexBuffer(cmd, v.ibuf, 0, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(cmd, v.icount, v.instance_count, 0, 0, 0);
+            vkCmdDrawIndexed(cmd, v.icount, v.instance_count, 0, v.vertex_offset, 0);
         } else {
-            vkCmdDraw(cmd, v.vcount, v.instance_count, 0, 0);
+            vkCmdDraw(cmd, v.vcount, v.instance_count,
+                      static_cast<uint32_t>(v.vertex_offset), 0);
         }
         if (geom_here) { VkDeviceSize coff = 0; p_endxfb(cmd, 0, 1, &geom_counter, &coff); }
         if (ds_active) {
@@ -4552,8 +4556,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 for (size_t di = 0; di < dv.size(); di++) { auto& v = dv[di]; if (!v.ok) continue; if ((int)di == kk) continue;
                     vkCmdBindPipeline(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
                     if (v.use_desc) vkCmdBindDescriptorSets(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
-                    if (v.icount) { vkCmdBindIndexBuffer(c2, v.ibuf, 0, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(c2, v.icount, v.instance_count, 0, 0, 0); }
-                    else vkCmdDraw(c2, v.vcount, v.instance_count, 0, 0);
+                    if (v.icount) { vkCmdBindIndexBuffer(c2, v.ibuf, 0, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(c2, v.icount, v.instance_count, 0, v.vertex_offset, 0); }
+                    else vkCmdDraw(c2, v.vcount, v.instance_count, static_cast<uint32_t>(v.vertex_offset), 0);
                 }
                 vkCmdEndRenderPass(c2);
                 vkCmdCopyImageToBuffer(c2, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp2);

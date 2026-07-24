@@ -71,6 +71,10 @@ struct DrawItem {
     // persists these so gpu_replay --inspect-only can flag a decode/realization divergence offline.
     uint32_t raw_draw_count = 0;
     bool raw_indexed = false;
+    uint64_t raw_draw_modifier = 0;
+    // GE_INDX_OFFSET at this draw. Vulkan consumes it as firstVertex for non-indexed draws and as
+    // vertexOffset for indexed draws, preserving the hardware gl_VertexIndex contract.
+    int32_t vertex_offset = 0;
     // Indexed draw (sceAgcDcbDrawIndex): the guest index buffer, fetched from 1:1-mapped memory and
     // widened to 32-bit. Non-empty -> the backend must render with vkCmdDrawIndexed (gl_VertexIndex
     // then IS the fetched index, which the recompiled VS uses for its storage-buffer vertex fetch);
@@ -1049,7 +1053,13 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             // and cap the grown size to the same 256 MB plausibility ceiling the V# decode uses — a VB this
             // large is never real, and an unbounded r.size drives a multi-GB upload (#461). Vertices past
             // the real backing degrade safely (safe_copy stops at the mapping edge -> robust-0).
-            uint64_t need = (uint64_t)vertex_count * r.stride;
+            // A positive GE_INDX_OFFSET selects a later range in the same shared vertex pool. The
+            // capture/backend buffer must include that prefix because gl_VertexIndex includes the
+            // Vulkan firstVertex/vertexOffset value before the translated shader fetches the V#.
+            uint64_t addressed_vertices = vertex_count;
+            const int32_t vertex_offset = static_cast<int32_t>(rs.ge_indx_offset);
+            if (vertex_offset > 0) addressed_vertices += static_cast<uint32_t>(vertex_offset);
+            uint64_t need = addressed_vertices * r.stride;
             if (need > 0x10000000ull) need = 0x10000000ull;   // 256 MB cap
             if ((uint64_t)r.size < need) r.size = (uint32_t)need;
         }
@@ -1139,6 +1149,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // #1256: record the raw draw-packet state (pre-realization) so a capture can be checked offline for
     // realization divergence. vcount_hint is the DrawIndexAuto/DrawIndex index_count decoded from the guest.
     out.raw_draw_count = vcount_hint; out.raw_indexed = (draw && draw->indexed);
+    out.raw_draw_modifier = draw ? draw->modifier : 0;
+    out.vertex_offset = static_cast<int32_t>(rs.ge_indx_offset);
     // The draw record is authoritative even in folded mode: register state may change after the
     // last draw, while IT_NUM_INSTANCES belongs to the draw at the moment it executes.
     out.instance_count = draw ? draw->instance_count : ds.num_instances;

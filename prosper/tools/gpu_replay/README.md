@@ -49,8 +49,9 @@ Create a capsule with the native-speed workflow in
 
 ## Raw-vs-realized draw check — `raw=` on each `--inspect-only` draw line (#1256)
 
-Each `draw[i] … vcount=N indices=M topo=T raw=…` line reports the **raw draw-packet state** the guest
-submitted, decoded BEFORE realization (capture v23+):
+Each `draw[i] … vcount=N indices=M voffset=V modifier=D topo=T raw=…` line reports the **raw
+draw-packet state** the guest submitted, decoded BEFORE realization. `raw=` is available in capture
+v23+, while `voffset=` and `modifier=` are available in capture v27+:
 
 ```
 draw[12] … vcount=6 indices=0 topo=3 raw=6              # healthy: realized == guest's DrawIndexAuto count
@@ -63,6 +64,9 @@ draw[12] … vcount=1024 indices=0 topo=3 raw=6 [INFLATED] # realized swept more
 - **indexed**: `raw=N(idx)`; the fetched index count (`indices=`) must equal `N`, else `[INDEX-COUNT-MISMATCH]`
   (also fires when an indexed draw fell back to non-indexed on an unreadable index buffer — a real signal).
 - `raw=?` = a pre-v23 capture (the raw count was not retained). No flag is possible for those.
+- `voffset=V` is the signed `GE_INDX_OFFSET` applied as Vulkan `firstVertex` for non-indexed draws or
+  `vertexOffset` for indexed draws. Pre-v27 captures report zero because they did not retain it.
+- `modifier=D` is the raw 64-bit `ShaderDrawModifier`, retained for offline decode diagnostics in v27+.
 
 This makes a whole class of decode/realization-divergence bug — where prosper renders geometry the guest did
 not ask for — visible **offline** from a capsule, without a live boot. It was added because #1163 (the black
