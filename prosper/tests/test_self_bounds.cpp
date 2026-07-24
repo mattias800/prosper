@@ -129,13 +129,17 @@ static void test_build_image_bounds() {
         CHECK(build_image(m, 0x100000000ull, img), "align-up-wrapped extent returns an empty image");
         CHECK(img.mem.size() == 0, "align_up-wrapped extent clamped to empty (no giant allocation)");
     }
-    {   // A huge but non-wrapping extent passes the arithmetic guards above. Before #1299 it reached
-        // vector::assign and threw an uncaught length_error/bad_alloc, terminating link_program.
+    {   // A huge but non-wrapping extent passes the arithmetic guards above and is still far below a
+        // 64-bit vector::max_size(). Before #1299 it reached vector::assign; Linux overcommit could
+        // accept the virtual allocation, then OOM-kill the process while assign zero-filled it.
         Module m;
-        Segment s; s.type = PT_LOAD; s.vaddr = 0x4000; s.memsz = 1ull << 63; s.flags = 4;
+        Segment s; s.type = PT_LOAD; s.vaddr = 0x4000;
+        s.memsz = kMaxLoadedImageBytes + 0x4000; s.flags = 4;
         m.segments.push_back(s);
         LoadedImage img;
         std::string err;
+        CHECK(s.memsz < img.mem.max_size(),
+              "regression extent is below vector::max_size (exercises loader policy, not STL limit)");
         CHECK(!build_image(m, 0x100000000ull, img, &err),
               "huge non-wrapping PT_LOAD extent is rejected without throwing");
         CHECK(!err.empty(), "rejected huge PT_LOAD reports a load error");

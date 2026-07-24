@@ -261,6 +261,10 @@ bool build_image(const Module& m, uint64_t base, LoadedImage& out, std::string* 
     img.max_vaddr = align_up(hi, 0x4000);
     if (img.max_vaddr < img.min_vaddr) img.max_vaddr = img.min_vaddr;  // degenerate (align_up wrap) -> empty
     const uint64_t image_size = img.max_vaddr - img.min_vaddr;
+    if (image_size > kMaxLoadedImageBytes) {
+        if (err) *err = "PT_LOAD image extent exceeds prosper's 1 GiB loader limit";
+        return false;
+    }
     if (image_size > img.mem.max_size()) {
         if (err) *err = "PT_LOAD image extent exceeds the host vector limit";
         return false;
