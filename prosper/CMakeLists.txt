@@ -939,6 +939,11 @@ if(TARGET prosper_core)
       target_link_libraries(test_textured_interp_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME textured_interp_render COMMAND test_textured_interp_render)
 
+      # IMAGE_SAMPLE_C_LZ 2D (shadow-map compare, #1271): manual-dref lowering, end-to-end.
+      add_executable(test_shadow_compare_render tests/test_shadow_compare_render.cpp)
+      target_link_libraries(test_shadow_compare_render PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME shadow_compare_render COMMAND test_shadow_compare_render)
+
       # Pipeline realization: build a VkPipeline whose fixed-function state comes from
       # resolve_pipeline_state(RenderState) and prove the resolved state drives rendering.
       add_executable(test_pipeline_render tests/test_pipeline_render.cpp)

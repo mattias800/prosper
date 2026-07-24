@@ -175,8 +175,10 @@ struct ShaderResource {
     //   lod_bias:           WORD2 [13:0], signed s5.8 (sign-extended raw/256.0). mip LOD bias.
     //   max_aniso_ratio:    WORD0 [11:9] enum (maxAnisotropy = 1<<ratio). NEEDS the samplerAnisotropy
     //                       device feature — decoded only.
-    //   depth_compare_func: WORD0 [14:12] SQ compare enum for shadow/PCF samplers. NEEDS a depth/shadow
-    //                       sampling path (our images are color UNORM) — decoded only.
+    //   depth_compare_func: WORD0 [14:12] SQ compare enum for shadow/PCF samplers (VkCompareOp order).
+    //                       APPLIED in-shader by the recompiler's manual-dref c_lz lowering (#1271);
+    //                       the hardware compareEnable-sampler path still needs a depth-format view
+    //                       (see the render-runner sampler note).
     //   unnormalized:       WORD0 [15] FORCE_UNNORMALIZED. NEEDS strict validity (no mips, equal filters,
     //                       clamp addressing, minLod=maxLod=0) — decoded only.
     uint32_t      border_color_type = 0;
