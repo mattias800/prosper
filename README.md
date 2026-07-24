@@ -12,6 +12,20 @@ console's OS, ABI, and GPU stack on the host — **not** by emulating a CPU.
 > titles currently reach different milestones and still expose substantial compatibility gaps. See
 > [Game compatibility](COMPATIBILITY.md) for title-by-title results and known blockers.
 
+## Screenshots
+
+Real retail PS5 titles running under prosper on Linux — direct, unmodified captures from the frontend
+(no post-processing). Each reaches the milestone noted in [Game compatibility](COMPATIBILITY.md).
+
+| | |
+| :---: | :---: |
+| <img src="assets/screenshots/messenger.png" width="400" alt="The Messenger"><br>***The Messenger*** — first level, native 1920×1080 | <img src="assets/screenshots/dead-cells.png" width="400" alt="Dead Cells"><br>***Dead Cells*** — controllable Prisoners' Quarters |
+| <img src="assets/screenshots/blasphemous2.png" width="400" alt="Blasphemous 2"><br>***Blasphemous 2*** — first playable room | <img src="assets/screenshots/evergate.png" width="400" alt="Evergate"><br>***Evergate*** — first tutorial room |
+
+> These illustrative screenshots are captures of prosper's own rendered output; the games' artwork remains
+> the property of its respective owners. No game files, assets, keys, or data are redistributed in this
+> repository — you must supply your own legally-obtained dump.
+
 ## Why no CPU emulation?
 
 The PS5 is an x86-64 (AMD Zen 2) machine, so guest game code runs **natively** on any modern PC.
@@ -41,8 +55,10 @@ audio, and graphics stack. See [Game compatibility](COMPATIBILITY.md) for exact 
 - ✅ Enough `libkernel`/`libc` for real memory management (virtual + direct + flexible memory, guard
   pages), threads (pthreads, TLS, mutexes/conds, event flags, semaphores, `sync_on_address` futex),
   scheduling, time, AIO + positioned file I/O (with `/app0` path translation), and locale/ctype.
-- ✅ Loads the C# metadata, spins up the full **IL2CPP GC + worker thread pool**, and boots through
-  IL2CPP init and Unity's `GfxDevice` bring-up into the running frame loop.
+- ✅ Boots several engine families into their running frame loop and real GPU submission — **Unity /
+  IL2CPP** (loads the C# metadata, spins up the full IL2CPP GC + worker thread pool, drives Unity's
+  `GfxDevice` bring-up), **Unreal Engine**, and Rockstar's **RAGE** — with several titles reaching
+  interactive menus or gameplay.
 - ✅ System services the game gates on: user/pad service, SaveData (real per-slot memory blocks),
   AvPlayer / AJM lifecycle, common dialogs + IME (with an optional real SDL3 dialog frontend), NP /
   online (honest signed-out), system-parameter (language) — implemented as faithful behaviors, not
@@ -73,8 +89,8 @@ audio, and graphics stack. See [Game compatibility](COMPATIBILITY.md) for exact 
 evdev/SDL3 controllers + real message/error/IME dialogs), sharing the same boot + render core as the
 headless `boot_trace`.
 
-Development is **agentic-first**: correctness is verified programmatically — **93 self-checking tests**
-under `ctest` (including a headless Vulkan/llvmpipe harness that runs recompiled shaders and asserts
+Development is **agentic-first**: correctness is verified programmatically — a broad suite of
+**self-checking tests** under `ctest` (including a headless Vulkan/llvmpipe harness that runs recompiled shaders and asserts
 numeric/pixel results, and per-opcode round-trip disassembly checks), a **golden-image snapshot guard**
 that boots a real title and pixel/content-asserts an exact frame, cross-platform CI (Linux +
 Windows/MinGW), structured logs, and purpose-built tracing tooling — never by hand.
@@ -107,7 +123,7 @@ sudo apt install ninja-build pkg-config libvulkan-dev libavformat-dev libavcodec
 cd prosper
 cmake -G Ninja -B build-linux
 cmake --build build-linux
-ctest --test-dir build-linux          # 93 self-checking tests
+ctest --test-dir build-linux          # unit + boot + Vulkan-execution tests
 ```
 
 Add `-DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=ON -DPROSPER_PAD_SDL3=ON` to build the windowed frontend
@@ -199,5 +215,6 @@ architecture step are recorded in
 
 ## License
 
-See [LICENSE](LICENSE) if present. Game content and Sony SDK symbols are the property of their
-respective owners and are not distributed here.
+See [LICENSE](LICENSE) if present. Game files, assets, keys, and Sony SDK symbols are the property of
+their respective owners and are not redistributed here; the documentation screenshots are captures of
+prosper's own rendered output, shown for illustration.
