@@ -746,6 +746,25 @@ inline const RenderVkCtx& render_vk_ctx() {
     return c;
 }
 
+// Present unification (#1270): serialize a single queue CALL against prosper-app's present submits when
+// they share one VkQueue. Locks ONLY around the host call (never a GPU wait), and only once the app has
+// adopted the shared queue (shared_present_active()); otherwise it is a plain call after a relaxed atomic
+// load, so the headless/test/screenshot path and every non-shared device are unaffected.
+inline VkResult render_locked_queue_submit(VkQueue q, uint32_t n, const VkSubmitInfo* s, VkFence f) {
+    if (prosper::gpu::shared_present_active()) {
+        std::lock_guard<std::mutex> lk(prosper::gpu::shared_present_submit_mutex());
+        return vkQueueSubmit(q, n, s, f);
+    }
+    return vkQueueSubmit(q, n, s, f);
+}
+inline VkResult render_locked_queue_wait_idle(VkQueue q) {
+    if (prosper::gpu::shared_present_active()) {
+        std::lock_guard<std::mutex> lk(prosper::gpu::shared_present_submit_mutex());
+        return vkQueueWaitIdle(q);
+    }
+    return vkQueueWaitIdle(q);
+}
+
 struct BackendSubmissionBatchResult {
     VkResult submit_result = VK_SUCCESS;
     VkResult wait_result = VK_SUCCESS;
@@ -816,7 +835,7 @@ public:
                          commands_.size());
             std::fflush(stderr);
         }
-        result.submit_result = vkQueueSubmit(queue, 1, &submit, fence);
+        result.submit_result = render_locked_queue_submit(queue, 1, &submit, fence);
         result.queue_submits = 1;
         if (backend_trace) {
             std::fprintf(stderr,
@@ -830,7 +849,7 @@ public:
             result.fence_waits = 1;
             // Preserve lifetime safety even if the bounded diagnostic wait expires.
             if (result.wait_result != VK_SUCCESS)
-                result.wait_result = vkQueueWaitIdle(queue);
+                result.wait_result = render_locked_queue_wait_idle(queue);
         }
         if (backend_trace) {
             std::fprintf(stderr, "[backend-trace] fence-wait end result=%d\n",
@@ -1577,10 +1596,10 @@ inline bool submit_persistent_ds_transfer(const RenderVkCtx& ctx, VkImage image,
         vkCreateFence(ctx.dev, &fence_info, nullptr, &fence) == VK_SUCCESS;
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1; submit.pCommandBuffers = &command;
-    const bool submitted = fenced && vkQueueSubmit(ctx.queue, 1, &submit, fence) == VK_SUCCESS;
+    const bool submitted = fenced && render_locked_queue_submit(ctx.queue, 1, &submit, fence) == VK_SUCCESS;
     bool finished = submitted &&
         vkWaitForFences(ctx.dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000) == VK_SUCCESS;
-    if (submitted && !finished) finished = vkQueueWaitIdle(ctx.queue) == VK_SUCCESS;
+    if (submitted && !finished) finished = render_locked_queue_wait_idle(ctx.queue) == VK_SUCCESS;
     if (fence) vkDestroyFence(ctx.dev, fence, nullptr);
     vkDestroyCommandPool(ctx.dev, pool, nullptr);
     if (!finished) { error = "persistent DS transfer did not complete"; return false; }
@@ -1678,10 +1697,10 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
         vkCreateFence(ctx.dev, &fence_info, nullptr, &fence) == VK_SUCCESS;
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1; submit.pCommandBuffers = &command;
-    const bool submitted = fenced && vkQueueSubmit(ctx.queue, 1, &submit, fence) == VK_SUCCESS;
+    const bool submitted = fenced && render_locked_queue_submit(ctx.queue, 1, &submit, fence) == VK_SUCCESS;
     bool finished = submitted &&
         vkWaitForFences(ctx.dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000) == VK_SUCCESS;
-    if (submitted && !finished) finished = vkQueueWaitIdle(ctx.queue) == VK_SUCCESS;
+    if (submitted && !finished) finished = render_locked_queue_wait_idle(ctx.queue) == VK_SUCCESS;
     if (!finished) {
         cleanup(); error = "persistent color target readback did not complete"; return false;
     }
@@ -4302,7 +4321,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 vkCmdCopyImageToBuffer(c2, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp2);
                 vkEndCommandBuffer(c2); vkResetFences(dev, 1, &iso_fence);
                 VkSubmitInfo si2{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si2.commandBufferCount = 1; si2.pCommandBuffers = &c2;
-                vkQueueSubmit(queue, 1, &si2, iso_fence); vkWaitForFences(dev, 1, &iso_fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
+                render_locked_queue_submit(queue, 1, &si2, iso_fence); vkWaitForFences(dev, 1, &iso_fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
                 std::vector<uint8_t> px(bytes); void* m2 = nullptr; vkMapMemory(dev, bmem, 0, bytes, 0, &m2);
                 for (VkDeviceSize i = 0; i < bytes; i++) px[i] = ((const uint8_t*)m2)[i]; vkUnmapMemory(dev, bmem);
                 const uint8_t* tp = &px[((size_t)ty * W + tx) * 4];

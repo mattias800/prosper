@@ -4193,6 +4193,22 @@ void release_live_render_target_image(uint64_t gpu_addr) {
 static SharedVulkanContext g_shared_vulkan;
 void set_shared_vulkan_context(const SharedVulkanContext& context) { g_shared_vulkan = context; }
 SharedVulkanContext shared_vulkan_context() { return g_shared_vulkan; }
+
+// Present unification (#1270): see gpu_execute.hpp. The atomic gates the lock so the common (headless /
+// non-shared / app-not-yet-adopted) path pays only a relaxed load. Set true exactly once, by prosper-app,
+// after it has adopted the shared queue for present and before its first present submit; never cleared
+// mid-run (the app owns the shared device for the process lifetime once adopted).
+static std::atomic<bool> g_shared_present_active{false};
+std::mutex& shared_present_submit_mutex() {
+    static std::mutex m;
+    return m;
+}
+void set_shared_present_active(bool active) {
+    g_shared_present_active.store(active, std::memory_order_release);
+}
+bool shared_present_active() {
+    return g_shared_present_active.load(std::memory_order_acquire);
+}
 bool read_live_render_target(uint64_t gpu_addr, LiveTargetSnapshot& snapshot) {
     snapshot = {};
     return g_live_target_reader && g_live_target_reader(gpu_addr, snapshot);

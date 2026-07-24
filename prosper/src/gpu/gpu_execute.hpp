@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <mutex>
 #include <memory>
 #include <vector>
 #include <set>
@@ -497,6 +498,18 @@ struct SharedVulkanContext {
 };
 void set_shared_vulkan_context(const SharedVulkanContext& context);
 SharedVulkanContext shared_vulkan_context();
+
+// Present unification (#1270): when prosper-app presents on the SAME VkQueue the renderer/compute submit
+// on (present_queue_shared), the renderer's guest thread and the app's present thread would call
+// vkQueueSubmit/vkQueueWaitIdle/vkQueuePresentKHR on one queue concurrently -- undefined without external
+// synchronization. This mutex serializes those host CALLS (not GPU waits, which don't touch the queue).
+// It is a no-op until the app adopts the shared queue and calls set_shared_present_active(true): every
+// renderer/compute submit site takes it only when shared_present_active() is true, so the headless
+// test/screenshot path pays a single relaxed atomic load and no lock. GPU-side render->present ordering
+// is handled by a semaphore, independently of this mutex.
+std::mutex& shared_present_submit_mutex();
+void set_shared_present_active(bool active);
+bool shared_present_active();
 
 // Ordered memory producers need the same authoritative storage version as live compute. A source
 // may begin inside a target, so the renderer validates the complete requested byte range instead of
