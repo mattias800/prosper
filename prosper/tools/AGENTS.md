@@ -104,6 +104,20 @@ keeps shaders, operations, pipeline state, and resource descriptors for `--inspe
 and `--graph`, but deliberately cannot render.
 Set `PROSPER_CAPTURE_REVISION` explicitly in WSL worktrees: WSL Git cannot resolve their Windows-path
 gitdir links, so the build-time fallback revision is `unknown` there.
+
+**Interactive frame grab (prosper-app hotkey).** When you are *playing* a title in `prosper-app` and see a
+graphical bug or an FPS drop, press **F9** to capture that moment for offline debugging — no need to
+predict a submit index with `PROSPER_GPU_CAPTURE_AT`. F9 arms a one-shot capture of the next drawn frame
+and writes two files (to `PROSPER_CAPTURE_DIR`, default cwd): `frame_grab_NNN.prgcap` (a replayable
+capsule of that frame's presenting submit — draws, resources, shaders, and the pixel oracle) and
+`frame_grab_NNN.bmp` (a convenience screenshot; the `.prgcap` oracle is the authoritative image). It is
+purely on-demand — nothing runs until you press, so the grab never distorts the very slowdown you are
+observing. It captures the frame *right after* the press, so it is faithful for persistent glitches and
+slowdowns (a single-frame transient could slip by a frame). Replay/debug the capsule with
+`gpu_replay frame_grab_NNN.prgcap out.bmp` (or `--draw-steps`, `--inspect-only`, `--dump-resource`).
+The capsule is a single presenting submit; for a frame whose visible defect depends on a renderer-owned
+temporal RTT produced by an earlier submit, use `gpu_replay --prepend`, or capture a whole-frame
+`.prgbundle` window (see `PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE`).
 `PROSPER_SUBMITLOG_DIM=WxH` prints the exact renderer invocation for any submit targeting that Gen5
 surface extent, even while `PROSPER_RENDER_FIRST` skips Vulkan work. Use it to start a later render
 window on a one-time offscreen producer rather than after the producer has already been lost.

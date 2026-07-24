@@ -992,6 +992,29 @@ int main() {
     std::filesystem::remove(path); std::filesystem::remove(truncated); std::filesystem::remove(mixed_path);
     std::filesystem::remove(failed_path); std::filesystem::remove(no_oracle_path);
 
+    // Interactive one-shot capture trigger (frame_grab hotkey). No env capture is configured here, so
+    // begin_requested_gpu_capture is a no-op until a grab is armed — this both proves the default-OFF
+    // path and exercises the arm/consume state machine that the app's hotkey drives.
+    set_test_env("PROSPER_GPU_CAPTURE", nullptr);   // ensure the env path is off for this block
+    CHECK(!interactive_gpu_capture_armed(), "interactive capture is not armed by default");
+    // Not armed + no env => begin_requested is inert, even with drawing work present.
+    { DrawItem d; CHECK(begin_requested_gpu_capture({d}, {}, {}, 64, 64) == nullptr,
+                        "no capture when neither env nor interactive is set"); }
+    request_interactive_gpu_capture("/tmp/prosper_interactive_grab.prgcap");
+    CHECK(interactive_gpu_capture_armed(), "request_interactive_gpu_capture arms a one-shot grab");
+    // A ZERO-draw invocation must NOT consume the arm (the grab should land on real frame content).
+    (void)begin_requested_gpu_capture({}, {}, {}, 64, 64);
+    CHECK(interactive_gpu_capture_armed(), "a zero-draw invocation does not consume the armed grab");
+    // The next DRAWING invocation consumes it (disarms), regardless of whether the synthetic capture
+    // then succeeds — the trigger decision is what the hotkey relies on.
+    { DrawItem d; (void)begin_requested_gpu_capture({d}, {}, {}, 64, 64); }
+    CHECK(!interactive_gpu_capture_armed(), "a drawing invocation consumes the armed grab (one-shot)");
+    // Re-arming and re-disarming works (a second press).
+    request_interactive_gpu_capture("/tmp/prosper_interactive_grab2.prgcap");
+    CHECK(interactive_gpu_capture_armed(), "the grab can be re-armed for a subsequent press");
+    { DrawItem d; (void)begin_requested_gpu_capture({d}, {}, {}, 64, 64); }
+    CHECK(!interactive_gpu_capture_armed(), "the re-armed grab is consumed by the next drawing invocation");
+
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n"); return 0;
 }

@@ -313,4 +313,13 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
 bool finish_requested_gpu_capture(std::unique_ptr<PendingGpuCapture> pending,
                                   const std::vector<uint8_t>& output, std::string& error);
 
+// Interactive one-shot capture (frame_grab tool): arm a capture from a hotkey WITHOUT predicting a
+// submit index ahead of time. The next drawing invocation reaching begin_requested_gpu_capture() writes
+// a .prgcap to `path` and disarms, bypassing the env AT/AFTER/MIN selectors. Thread-safe: arm on the
+// app's main thread, consumed on the render thread. Off unless armed; the env PROSPER_GPU_CAPTURE path
+// is unaffected. interactive_gpu_capture_armed() lets the caller (e.g. the app) know a grab is pending
+// so it can also snapshot the presented pixels for that frame.
+void request_interactive_gpu_capture(const std::string& path);
+bool interactive_gpu_capture_armed();
+
 } // namespace prosper::gpu
