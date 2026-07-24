@@ -100,7 +100,18 @@ namespace {
     // allocator handed out offsets past the pool, the guest's 512GB-arena block bitmap indexed
     // out of range, and user_malloc_init crashed on the bitmap read.
     constexpr uint64_t kDmemBase  = 0x10000000;
-    constexpr uint64_t kDmemTotal = 16ull * 1024 * 1024 * 1024;  // PS5 unified-memory aperture
+    // Direct-memory budget the pool holds AND sceKernelGetDirectMemorySize advertises. Real PS5
+    // reports the GAME budget (aperture minus OS reservation), not the raw 16 GiB aperture; UE
+    // sizes allocator pools from this value (#1213 investigation). PROSPER_DMEM_BUDGET_MB
+    // overrides for A/B experiments; the default stays the historical 16 GiB pending
+    // cross-title verification of a hardware-truthful default.
+    const uint64_t kDmemTotal = [] {
+        if (const char* v = getenv("PROSPER_DMEM_BUDGET_MB")) {
+            const uint64_t mib = strtoull(v, nullptr, 10);
+            if (mib >= 1024) return mib * 1024ull * 1024ull;
+        }
+        return 16ull * 1024 * 1024 * 1024;
+    }();
     // Direct ("physical") memory allocations, kept SORTED by start (first-fit allocation walks the
     // gaps). Also serves sceKernelDirectMemoryQuery.
     struct DMem { uint64_t start, end; int type; };
@@ -1817,7 +1828,18 @@ namespace {
     std::vector<Mapping> g_maps;
     bool sparse_dmem_view_overlaps(uint64_t begin, uint64_t end);
     constexpr uint64_t kDmemBase  = 0x10000000;
-    constexpr uint64_t kDmemTotal = 16ull * 1024 * 1024 * 1024;  // PS5 unified-memory aperture
+    // Direct-memory budget the pool holds AND sceKernelGetDirectMemorySize advertises. Real PS5
+    // reports the GAME budget (aperture minus OS reservation), not the raw 16 GiB aperture; UE
+    // sizes allocator pools from this value (#1213 investigation). PROSPER_DMEM_BUDGET_MB
+    // overrides for A/B experiments; the default stays the historical 16 GiB pending
+    // cross-title verification of a hardware-truthful default.
+    const uint64_t kDmemTotal = [] {
+        if (const char* v = getenv("PROSPER_DMEM_BUDGET_MB")) {
+            const uint64_t mib = strtoull(v, nullptr, 10);
+            if (mib >= 1024) return mib * 1024ull * 1024ull;
+        }
+        return 16ull * 1024 * 1024 * 1024;
+    }();
     struct DMem { uint64_t start, end; int type; };
     std::mutex g_dmx;
     std::vector<DMem> g_dmem;
