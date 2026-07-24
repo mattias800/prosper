@@ -6,6 +6,7 @@
 #include "../src/gpu/videoout_present.hpp"
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>   // setenv/_putenv_s (PROSPER_HDR both-modes test)
 #include <cstring>
 #include <chrono>
 #include <thread>
@@ -83,6 +84,34 @@ int main() {
           "GetDeviceCapabilityInfo rejects a null output pointer");
     CHECK((uint32_t)outstat(handle, 0, 0, 0, 0, 0) == kInvalidAddress,
           "GetOutputStatus rejects a null output pointer");
+
+    // PROSPER_HDR (the --hdr flag): default advertises SDR (capability 0, output mode 0); with the
+    // env set, the BT2020/PQ capability bit and dynamic-range mode 2 — the DOLL-RE'd HDR branch
+    // trigger (issue #82).
+    {
+        auto set_hdr = [](const char* value) {
+#ifdef _WIN32
+            _putenv_s("PROSPER_HDR", value ? value : "");
+#else
+            if (value) setenv("PROSPER_HDR", value, 1);
+            else unsetenv("PROSPER_HDR");
+#endif
+        };
+        uint64_t capability = 0xEEEEEEEEEEEEEEEEull;
+        uint32_t status[2] = {0xEEEEEEEEu, 0xEEEEEEEEu};
+        set_hdr(nullptr);
+        CHECK(cap(handle, (uint64_t)(uintptr_t)&capability, 0, 0, 0, 0) == 0 && capability == 0,
+              "default device capability advertises SDR (0)");
+        CHECK(outstat(handle, (uint64_t)(uintptr_t)status, 0, 0, 0, 0) == 0 && status[1] == 0,
+              "default output status advertises dynamic-range mode 0 (SDR)");
+        set_hdr("1");
+        capability = 0xEEEEEEEEEEEEEEEEull; status[1] = 0xEEEEEEEEu;
+        CHECK(cap(handle, (uint64_t)(uintptr_t)&capability, 0, 0, 0, 0) == 0 && capability == 0x2,
+              "PROSPER_HDR advertises the BT2020/PQ capability bit");
+        CHECK(outstat(handle, (uint64_t)(uintptr_t)status, 0, 0, 0, 0) == 0 && status[1] == 2,
+              "PROSPER_HDR advertises dynamic-range mode 2 (HDR)");
+        set_hdr(nullptr);
+    }
 
     // #394 F10 (handle scope): every handle-taking entrypoint must reject an unknown handle before
     // it mutates output, flip/present state, event registrations, or the display-buffer registry.
