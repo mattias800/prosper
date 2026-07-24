@@ -514,6 +514,11 @@ namespace {
         for (const auto& c : stack) { if (!out.empty()) out += '/'; out += c; }
         return out;
     }
+    bool mount_path_matches(const std::string& path, const char* mount) {
+        const size_t len = std::strlen(mount);
+        return path.compare(0, len, mount) == 0 &&
+               (path.size() == len || path[len] == '/' || path[len] == '\\');
+    }
     std::string translate(const char* guest) {
         if (!guest) return {};
         std::string p = guest;
@@ -529,10 +534,10 @@ namespace {
         // sub-path and reject an escape (#1205); normal paths are byte-identical to before, and a benign
         // in-sandbox ".." resolves to the same host file it would have anyway.
         std::string save0;
-        if (p.rfind("/savedata0", 0) == 0) { std::lock_guard<std::mutex> lk(g_save0_mx); save0 = g_save0; }
+        if (mount_path_matches(p, "/savedata0")) { std::lock_guard<std::mutex> lk(g_save0_mx); save0 = g_save0; }
         std::string root; size_t vlen = 0;
-        if      (p.rfind("/app0", 0) == 0)  { root = g_app0;       vlen = 5;  }
-        else if (p.rfind("/temp0", 0) == 0) { root = temp0_root(); vlen = 6;  }
+        if      (mount_path_matches(p, "/app0"))  { root = g_app0;       vlen = 5;  }
+        else if (mount_path_matches(p, "/temp0")) { root = temp0_root(); vlen = 6;  }
         else if (!save0.empty())            { root = save0;        vlen = 10; }
         else {
             if (filelog()) fprintf(stderr, "[file] open '%s' -> '%s'\n", guest, p.c_str());
