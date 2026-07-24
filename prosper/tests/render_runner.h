@@ -2680,7 +2680,13 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         v.vcount = bd.vcount;
         v.instance_count = bd.instance_count;
         v.scissor = {{0, 0}, {W, H}};
-        if (ps && ps->has_scissor) {
+        // PROSPER_IGNORE_EMPTY_SCISSOR (#1287 bring-up diagnostic): render draws whose resolved
+        // scissor is empty with a full-target scissor instead, to A/B whether they carry the
+        // missing post/shadow content. Off by default; not a fix.
+        static const bool ignore_empty_scissor = getenv("PROSPER_IGNORE_EMPTY_SCISSOR") != nullptr;
+        const bool scissor_empty = ps && ps->has_scissor &&
+            (ps->scissor_right <= ps->scissor_left || ps->scissor_bottom <= ps->scissor_top);
+        if (ps && ps->has_scissor && !(ignore_empty_scissor && scissor_empty)) {
             const int64_t left = std::clamp<int64_t>(ps->scissor_left, 0, W);
             const int64_t top = std::clamp<int64_t>(ps->scissor_top, 0, H);
             const int64_t right = std::clamp<int64_t>(ps->scissor_right, left, W);

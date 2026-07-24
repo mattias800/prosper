@@ -449,12 +449,29 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                         static_cast<unsigned long long>(failure.color0_base),
                         failure.color0_width, failure.color0_height, failure.vertex_count,
                         failure.pipeline_present ? "yes" : "no");
-            if (failure.pipeline_present)
+            if (failure.pipeline_present) {
                 std::printf(" fmt=%u cwm=%x depth=%d/%d/%u stencil=%d blend=%d",
                             failure.pipeline.color0_format, failure.pipeline.color_write_mask,
                             failure.pipeline.depth_test_enable, failure.pipeline.depth_write_enable,
                             failure.pipeline.depth_compare_op, failure.pipeline.stencil_enable,
                             failure.pipeline.blend_enable);
+                // A no-effect verdict hinges on the exact per-face stencil program — print it so a
+                // wrongly-skipped stencil writer is visible from the summary alone.
+                if (failure.pipeline.stencil_enable)
+                    std::printf(" sops=%u/%u/%u|%u/%u/%u swm=%02x/%02x scmp=%u/%u sref=%u/%u",
+                                failure.pipeline.stencil_fail_op[0],
+                                failure.pipeline.stencil_pass_op[0],
+                                failure.pipeline.stencil_depth_fail_op[0],
+                                failure.pipeline.stencil_fail_op[1],
+                                failure.pipeline.stencil_pass_op[1],
+                                failure.pipeline.stencil_depth_fail_op[1],
+                                failure.pipeline.stencil_write_mask[0],
+                                failure.pipeline.stencil_write_mask[1],
+                                failure.pipeline.stencil_compare_op[0],
+                                failure.pipeline.stencil_compare_op[1],
+                                failure.pipeline.stencil_ref[0],
+                                failure.pipeline.stencil_ref[1]);
+            }
             std::printf("\n");
         } else {
             const auto& launch = failure.compute_launch;
