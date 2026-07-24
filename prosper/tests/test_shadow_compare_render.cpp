@@ -84,6 +84,20 @@ int main() {
     CHECK(right_total && right_fail == right_total,
           "dref 0.5 GREATER fails (0.0) where stored depth is ~0.9");
 
+    // #1308: sampled-depth bridge recency tracks writers, not mere depth attachment users.
+    CHECK(!prosper::test::persistent_ds_pass_may_write_depth(
+              false, true, false, VK_COMPARE_OP_ALWAYS),
+          "read-only depth use does not claim writer recency");
+    CHECK(prosper::test::persistent_ds_pass_may_write_depth(
+              true, false, false, VK_COMPARE_OP_NEVER),
+          "a depth clear claims writer recency");
+    CHECK(prosper::test::persistent_ds_pass_may_write_depth(
+              false, true, true, VK_COMPARE_OP_ALWAYS),
+          "depth writes claim writer recency");
+    CHECK(!prosper::test::persistent_ds_pass_may_write_depth(
+              false, true, true, VK_COMPARE_OP_NEVER),
+          "a depth write masked by NEVER does not claim writer recency");
+
     // ---- Persistent-DS sampled bridge (#1275) ----
     // A depth-only producer renders a fullscreen triangle at z=0.25 into a guest-identified
     // persistent DS surface. prosper never writes that depth back to guest memory, so a consumer

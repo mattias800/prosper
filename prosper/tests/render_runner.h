@@ -1450,6 +1450,12 @@ inline uint64_t& persistent_ds_write_generation() {
     return generation;
 }
 
+constexpr bool persistent_ds_pass_may_write_depth(bool clear_enabled, bool test_enabled,
+                                                  bool write_enabled, uint32_t compare_op) {
+    return clear_enabled ||
+        (test_enabled && write_enabled && compare_op != VK_COMPARE_OP_NEVER);
+}
+
 inline std::unordered_map<PersistentDsKey, PersistentDsImage, PersistentDsKeyHash>&
 persistent_ds_cache() {
     static std::unordered_map<PersistentDsKey, PersistentDsImage, PersistentDsKeyHash> cache;
@@ -2079,11 +2085,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     bool ds_layout_initialized = false;
     bool depth_was_valid = false, stencil_was_valid = false;
     bool depth_used_meaningfully = false;
+    bool depth_may_be_written = false;
     for (const auto& d : draws) {
         if (!d.ps) continue;
         depth_used_meaningfully |= d.ps->depth_clear_enable || d.ps->depth_write_enable ||
             (d.ps->depth_test_enable && d.ps->depth_compare_op != VK_COMPARE_OP_ALWAYS &&
                                         d.ps->depth_compare_op != VK_COMPARE_OP_NEVER);
+        depth_may_be_written |= persistent_ds_pass_may_write_depth(
+            d.ps->depth_clear_enable, d.ps->depth_test_enable, d.ps->depth_write_enable,
+            d.ps->depth_compare_op);
     }
     PersistentDsImage* cached_ds = nullptr;
     PersistentDsKey ds_key{};
@@ -4256,7 +4266,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         // Sampled depth bridge (#1275): recency for find_persistent_ds_sampled — two valid
         // entries can share a plane address (a surface re-keyed D32 -> D32S8 keeps its old
         // entry), and the most recently written one is the live truth.
-        if (use_depth) cached_ds->last_depth_write = ++persistent_ds_write_generation();
+        if (use_depth && depth_may_be_written)
+            cached_ds->last_depth_write = ++persistent_ds_write_generation();
     }
     if (cached_color) {
         active_submission.add_failure_cleanup([cached_color]() {
