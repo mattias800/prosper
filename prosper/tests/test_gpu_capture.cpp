@@ -212,6 +212,14 @@ int main() {
         return 4 + 12 * f.draws.size();
     };
 
+    // v28: byte length of the linear-layout tail (u32 count + u32 pitch/u64 span per resource).
+    auto v28_tail = [](const GpuCaptureFile& f) -> size_t {
+        size_t rc = 0;
+        for (const auto& d : f.draws) rc += d.vrt.resources.size() + d.prt.resources.size();
+        for (const auto& cm : f.computes) rc += cm.resources.resources.size();
+        return 4 + 12 * rc;
+    };
+
     // v26: byte length of the trailing color-export/downconversion block.
     auto v26_tail = [](const GpuCaptureFile& f) -> size_t {
         size_t present_failures = 0;
@@ -250,6 +258,7 @@ int main() {
               v16_scissor_bytes.size() >= 25,
           "v17 capture serializes effective guest scissor state");
     if (v16_scissor_bytes.size() >= 25) {
+        v16_scissor_bytes.resize(v16_scissor_bytes.size() - v28_tail(v16_scissor_source));
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v27_tail(v16_scissor_source));
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v26_tail(v16_scissor_source));
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v25_tail(v16_scissor_source)); // v25 resolve tail
@@ -312,6 +321,80 @@ int main() {
     large_resource.size = 2u << 20;
     CHECK(gpu_capture_resource_footprint(large_resource) == (2u << 20),
           "public capture footprint reports the planner's declared buffer range");
+    ShaderResource video_chroma;
+    video_chroma.cls = ResourceClass::Texture;
+    video_chroma.format = DataFormat::Unorm8;
+    video_chroma.num_components = 1;
+    video_chroma.img_dim = 1;
+    video_chroma.width = 1920;
+    video_chroma.height = 1080;
+    video_chroma.tile_mode = static_cast<uint32_t>(TileMode::Linear);
+    video_chroma.size = 1920u * 1080u;
+    CHECK(gpu_capture_resource_footprint(video_chroma) == 2048u * 1080u,
+          "capture includes 256-byte row padding for a guest-backed linear R8 sampled image");
+    uint8_t host_video_texel = 0;
+    video_chroma.host_data = &host_video_texel;
+    CHECK(gpu_capture_resource_footprint(video_chroma) == 1920u * 1080u,
+          "capture keeps tightly-packed host texture fixtures unpadded");
+    video_chroma.host_data = nullptr;
+    video_chroma.gpu_addr = 0xa00000;
+    video_chroma.height = 2;
+    video_chroma.size = 1920u * 2u;
+    auto video_table = std::make_shared<ShaderResourceTable>();
+    video_table->resources = {video_chroma};
+    DrawItem video_draw = draw;
+    video_draw.vrt.reset();
+    video_draw.prt = video_table;
+    std::vector<uint8_t> video_memory(2048u * 2u, 0x80);
+    auto video_reader = [&](uint64_t addr, uint8_t* dst, size_t n) -> size_t {
+        if (addr < video_chroma.gpu_addr ||
+            addr >= video_chroma.gpu_addr + video_memory.size()) return 0;
+        const size_t offset = static_cast<size_t>(addr - video_chroma.gpu_addr);
+        const size_t take = std::min(n, video_memory.size() - offset);
+        std::memcpy(dst, video_memory.data() + offset, take);
+        return take;
+    };
+    GpuCaptureFile video_capture;
+    CHECK(capture_draw_items({video_draw}, meta, video_reader, video_capture, error) &&
+              video_capture.format_version == 28 && video_capture.blobs.size() == 1 &&
+              video_capture.blobs[0].bytes.size() == video_memory.size() &&
+              video_capture.draws[0].prt.resources[0].captured_size == video_memory.size() &&
+              video_capture.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048,
+          "v28 capture retains the complete padded rows and their resolved byte pitch");
+    std::vector<uint8_t> video_capture_bytes;
+    GpuCaptureFile video_loaded;
+    GpuReplayFrame video_replay;
+    CHECK(serialize_gpu_capture(video_capture, video_capture_bytes, error) &&
+              deserialize_gpu_capture(video_capture_bytes, video_loaded, error) &&
+              video_loaded.format_version == 28 &&
+              video_loaded.draws[0].prt.resources[0].captured_size == video_memory.size() &&
+              video_loaded.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
+              materialize_gpu_replay(video_loaded, video_replay, error) &&
+              video_replay.items[0].prt->resources[0].host_data_size == video_memory.size(),
+          "v28 replay round-trips and binds the complete pitch-padded source span");
+    GpuCaptureFile legacy_video = video_capture;
+    legacy_video.format_version = 27;
+    legacy_video.draws[0].prt.resources[0].captured_size = 0;
+    legacy_video.draws[0].prt.resources[0].resource.linear_row_pitch_bytes = 0;
+    legacy_video.blobs[0].bytes.resize(video_chroma.size);
+    legacy_video.blobs[0].bytes_read = legacy_video.blobs[0].bytes.size();
+    legacy_video.blobs[0].content_hash = gpu_capture_hash(legacy_video.blobs[0].bytes);
+    GpuReplayFrame legacy_video_replay;
+    CHECK(materialize_gpu_replay(legacy_video, legacy_video_replay, error) &&
+              legacy_video_replay.items[0].prt->resources[0].host_data_size == video_chroma.size &&
+              legacy_video_replay.items[0].prt->resources[0].linear_row_pitch_bytes == 2048,
+          "v27 replay keeps its tight captured span readable while deriving the guest row pitch");
+    std::vector<uint8_t> upgraded_video_bytes;
+    GpuCaptureFile upgraded_video;
+    GpuReplayFrame upgraded_video_replay;
+    CHECK(serialize_gpu_capture(legacy_video, upgraded_video_bytes, error) &&
+              deserialize_gpu_capture(upgraded_video_bytes, upgraded_video, error) &&
+              upgraded_video.format_version == 28 &&
+              upgraded_video.draws[0].prt.resources[0].captured_size == video_chroma.size &&
+              upgraded_video.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
+              materialize_gpu_replay(upgraded_video, upgraded_video_replay, error) &&
+              upgraded_video_replay.items[0].prt->resources[0].host_data_size == video_chroma.size,
+          "rewriting a v27 capture preserves its short span and best-effort derived pitch in v28");
     large_table->resources = {large_resource};
     DrawItem large_draw = draw;
     large_draw.vrt = large_table;
@@ -404,6 +487,7 @@ int main() {
           "writer rejects an out-of-bounds DCC metadata reference");
     CHECK(serialize_gpu_capture(volume_capture, volume_bytes, error),
           "recreated valid v12 DCC bytes after malformed-reference check");
+    volume_bytes.resize(volume_bytes.size() - v28_tail(volume_capture));
     volume_bytes.resize(volume_bytes.size() - v27_tail(volume_capture));
     volume_bytes.resize(volume_bytes.size() - v26_tail(volume_capture));
     volume_bytes.resize(volume_bytes.size() - v25_tail(volume_capture)); // v25 resolve tail
@@ -478,6 +562,7 @@ int main() {
     CHECK(serialize_gpu_capture(captured, v20_bytes, error) && v20_bytes.size() >= 21,
           "v21 capture serializes the logic-op extension");
     if (v20_bytes.size() >= 21) {
+        v20_bytes.resize(v20_bytes.size() - v28_tail(captured));
         v20_bytes.resize(v20_bytes.size() - v27_tail(captured));
         v20_bytes.resize(v20_bytes.size() - v26_tail(captured));
         v20_bytes.resize(v20_bytes.size() - v25_tail(captured)); // v25 resolve tail
@@ -525,6 +610,7 @@ int main() {
           v24_resolve_bytes.size() >= v27_tail(captured) + v26_tail(captured) + v25_tail(captured),
           "v25 capture exposes a removable trailing resolve-state block");
     if (v24_resolve_bytes.size() >= v27_tail(captured) + v26_tail(captured) + v25_tail(captured)) {
+        v24_resolve_bytes.resize(v24_resolve_bytes.size() - v28_tail(captured));
         v24_resolve_bytes.resize(v24_resolve_bytes.size() - v27_tail(captured));
         v24_resolve_bytes.resize(v24_resolve_bytes.size() - v26_tail(captured));
         v24_resolve_bytes.resize(v24_resolve_bytes.size() - v25_tail(captured));
@@ -908,6 +994,7 @@ int main() {
     if (v13_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        v13_bytes.resize(v13_bytes.size() - v28_tail(legacy_source));
         v13_bytes.resize(v13_bytes.size() - v27_tail(legacy_source));
         v13_bytes.resize(v13_bytes.size() - v26_tail(legacy_source));
         v13_bytes.resize(v13_bytes.size() - v25_tail(legacy_source)); // v25 resolve tail
@@ -935,6 +1022,7 @@ int main() {
     if (legacy_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        legacy_bytes.resize(legacy_bytes.size() - v28_tail(legacy_source));
         legacy_bytes.resize(legacy_bytes.size() - v27_tail(legacy_source));
         legacy_bytes.resize(legacy_bytes.size() - v26_tail(legacy_source));
         legacy_bytes.resize(legacy_bytes.size() - v25_tail(legacy_source)); // v25 resolve tail
@@ -988,9 +1076,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 28;   // kVersion (27) + 1: a not-yet-defined future version
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 29;   // kVersion (28) + 1: a not-yet-defined future version
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 28",
+          error == "unsupported capture version 29",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

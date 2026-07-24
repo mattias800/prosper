@@ -96,6 +96,7 @@ int main() {
     ShaderResourceTable compile_rt;
     ShaderResource tex{}; tex.cls = ResourceClass::Texture; tex.binding = 4; tex.img_dim = 1;
     tex.width = 2; tex.height = 2; tex.size = 16; tex.sgpr_base = 8; tex.gpu_addr = 0x100000;
+    tex.linear_row_pitch_bytes = 8;  // synthetic reader publishes tightly packed RGBA8 rows
     tex.mag_filter = tex.min_filter = 0; compile_rt.resources.push_back(tex);
     DrawItem item; item.vs = recompile_vertex(vs_rdna, std::size(vs_rdna));
     item.fs = recompile_fragment(ps_rdna, std::size(ps_rdna), &compile_rt);

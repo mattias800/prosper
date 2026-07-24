@@ -17,7 +17,9 @@ need, `PROSPER_GPU_CAPTURE_METADATA_ONLY=1` writes a thin capsule with shaders, 
 state, and resource descriptors but no guest resource or RTT bytes. Thin capsules support
 `--inspect-only`, `--validate`, and `--graph`; rendering exits with a concrete error.
 Inspection reports each descriptor's declared size, capture-planned footprint, and captured byte
-count separately, so a thin capsule can still expose a pathological range.
+count separately, so a thin capsule can still expose a pathological range. Capture v28+ retains the exact
+planned span and reports the resolved `row-pitch` for linear sampled images; older captures derive the
+guest pitch while retaining their historical tight byte span.
 
 Build from `prosper/`, using the worktree-local Linux build:
 

@@ -8,6 +8,7 @@
 // the texels follow a Morton/Z order with the Y bit in the LOW position of each pair (y0,x0,y1,x1,...).
 // Empirically derived (raw-tiled-bytes dump + offline swizzle sweep) and pixel-verified against the game.
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -25,6 +26,11 @@ enum class TileMode : uint32_t {
     Sw64KbZX = 24,
     Sw64KbRX = 27,
 };
+
+// GFX10 sampled images in linear mode use a 256-byte-aligned row pitch. Buffer/host-data uploads
+// remain tightly packed; callers apply this only to guest-backed sampled Texture resources.
+size_t linear_sampled_row_pitch(uint32_t width, uint32_t bytes_per_texel);
+size_t linear_sampled_surface_bytes(uint32_t width, uint32_t height, uint32_t bytes_per_texel);
 
 // True if `tile_mode` denotes a swizzled layout that detile_surface will de-swizzle.
 bool tile_mode_is_tiled(uint32_t tile_mode);
