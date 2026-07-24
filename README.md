@@ -15,7 +15,8 @@ console's OS, ABI, and GPU stack on the host — **not** by emulating a CPU.
 ## Screenshots
 
 Real retail PS5 titles running under prosper on Linux — direct, unmodified captures from the frontend
-(no post-processing). Each reaches the milestone noted in [Game compatibility](COMPATIBILITY.md).
+(no post-processing), retained at each title's native output resolution. Each reaches the milestone noted
+in [Game compatibility](COMPATIBILITY.md).
 
 | | |
 | :---: | :---: |
