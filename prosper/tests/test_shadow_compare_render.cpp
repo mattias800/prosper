@@ -84,6 +84,78 @@ int main() {
     CHECK(right_total && right_fail == right_total,
           "dref 0.5 GREATER fails (0.0) where stored depth is ~0.9");
 
+    // ---- Persistent-DS sampled bridge (#1275) ----
+    // A depth-only producer renders a fullscreen triangle at z=0.25 into a guest-identified
+    // persistent DS surface. prosper never writes that depth back to guest memory, so a consumer
+    // sampling the depth-plane address as a 2D texture must be served by the retained Vulkan depth
+    // image (the bridge); without it the consumer reads zeros. The consumer samples at (0.25,0.25)
+    // and exports R = stored depth: bridge -> ~0.25 (R~64), no bridge -> 0.
+    {
+        const uint32_t vs_z[] = {
+            0x36020081u, 0x2c040081u, 0x7e020d01u, 0x7e040d02u, 0x100602f6u, 0x100804f6u,
+            0x060606f3u, 0x060808f3u, 0x100a02f4u, 0x100c04f4u, 0x7e0e02ffu, 0x3e800000u,
+            0x7e1002f2u, 0xf80008cfu, 0x08070403u, 0xf800020fu, 0x08070605u, 0xbf810000u,
+        };
+        const uint32_t ps_red[] = {
+            0x7e0002f2u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+            0xf800180fu, 0x03020100u, 0xbf810000u,
+        };
+        std::vector<uint32_t> vert_z = recompile_vertex(vs_z, sizeof(vs_z) / sizeof(vs_z[0]));
+        std::vector<uint32_t> red = recompile_fragment(ps_red, sizeof(ps_red) / sizeof(ps_red[0]),
+                                                       nullptr);
+        CHECK(!vert_z.empty() && !red.empty(), "recompiled z=0.25 producer shaders");
+
+        constexpr uint64_t kDepthBase = 0x20d5000000ull;
+        ResolvedPipelineState producer{};
+        producer.topology = 3; producer.color_write_mask = 0xF;
+        producer.depth_test_enable = true; producer.depth_write_enable = true;
+        producer.depth_compare_op = 7;   // ALWAYS
+        producer.depth_read_base = kDepthBase; producer.depth_write_base = kDepthBase;
+        prosper::test::BackendDraw pw;
+        pw.vs = vert_z; pw.fs = red; pw.ps = &producer; pw.vcount = 3;
+        std::vector<uint8_t> produced = prosper::test::render_draws_rgba(
+            {pw}, W, H, nullptr, nullptr, /*persist_depth_stencil=*/true);
+        CHECK(!produced.empty(), "depth-writing producer rendered with a persistent DS identity");
+
+        const uint32_t ps_sample[] = {
+            0x7e0002ffu, 0x3e800000u, 0x7e0202ffu, 0x3e800000u, 0xf0800f08u, 0x00820000u,
+            0xf800000fu, 0x03020100u, 0xbf810000u,
+        };
+        ShaderResourceTable sample_rt;
+        { ShaderResource t{}; t.cls = ResourceClass::Texture; t.binding = 4; t.img_dim = 1;
+          t.width = W; t.height = H; t.sgpr_base = 8; sample_rt.resources.push_back(t); }
+        std::vector<uint32_t> sample_fs = recompile_fragment(
+            ps_sample, sizeof(ps_sample) / sizeof(ps_sample[0]), &sample_rt);
+        CHECK(!sample_fs.empty(), "recompiled depth-plane sampling consumer");
+
+        ResolvedPipelineState opaque{};
+        opaque.topology = 3; opaque.color_write_mask = 0xF;
+        prosper::test::FrameResource bridged;
+        bridged.binding = 4; bridged.set = 1;
+        bridged.persistent_depth_target_id = kDepthBase;
+        bridged.tw = W; bridged.th = H;
+        prosper::test::BackendDraw consumer;
+        consumer.vs = vert; consumer.fs = sample_fs; consumer.ps = &opaque;
+        consumer.R = {bridged}; consumer.vcount = 3;
+        std::vector<uint8_t> via_bridge = prosper::test::render_draws_rgba({consumer}, W, H);
+        CHECK(via_bridge.size() == (size_t)W * H * 4, "bridged consumer rendered");
+
+        std::vector<uint8_t> zeros((size_t)W * H * 4, 0);
+        prosper::test::FrameResource unbridged = bridged;
+        unbridged.persistent_depth_target_id = 0;
+        unbridged.tex_rgba = zeros.data();
+        prosper::test::BackendDraw control = consumer;
+        control.R = {unbridged};
+        std::vector<uint8_t> via_zeros = prosper::test::render_draws_rgba({control}, W, H);
+
+        const uint8_t* center = &via_bridge[(((size_t)H / 2) * W + W / 2) * 4];
+        const uint8_t* center0 = &via_zeros[(((size_t)H / 2) * W + W / 2) * 4];
+        printf("  bridged center R=%u control R=%u\n", center[0], center0[0]);
+        CHECK(center[0] > 56 && center[0] < 72,
+              "bridged consumer reads the produced depth (~0.25) from the persistent DS image");
+        CHECK(center0[0] == 0, "control without the bridge samples zeros");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

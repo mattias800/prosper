@@ -132,6 +132,11 @@ struct FrameResource {
     // target is available, bind its GPU image directly instead of uploading `tex_rgba` again.
     // `tex_rgba` remains an optional conservative fallback for an invalidated/missing target.
     uint64_t persistent_render_target_id = 0;
+    // Non-zero identifies a persistent depth/stencil surface whose DEPTH plane this resource
+    // samples (a shadow map / depth pyramid tap, #1275). The backend binds the retained Vulkan
+    // depth image directly — prosper never writes rendered depth back to guest memory, so there
+    // is no CPU fallback; an invalidated/missing surface falls through to the guest-byte decode.
+    uint64_t persistent_depth_target_id = 0;
     const uint32_t* buffer_words_data() const {
         return dwords_view && dwords_view_count
             ? dwords_view : (dwords.empty() ? nullptr : dwords.data());
@@ -139,7 +144,10 @@ struct FrameResource {
     size_t buffer_word_count() const {
         return dwords_view && dwords_view_count ? dwords_view_count : dwords.size();
     }
-    bool is_texture() const { return tex_rgba != nullptr || persistent_render_target_id != 0; }
+    bool is_texture() const {
+        return tex_rgba != nullptr || persistent_render_target_id != 0 ||
+               persistent_depth_target_id != 0;
+    }
 };
 
 // Optional color-target contract for the live backend. A non-zero ID gives the target a stable
@@ -1442,6 +1450,45 @@ persistent_ds_cache() {
     return cache;
 }
 
+// Sampled depth-plane lookup (#1275): a shadow-map / depth-pyramid T# addresses the DEPTH plane of
+// a surface prosper rendered into a persistent Vulkan DS image and never wrote back to guest
+// memory. Resolve that address (read or write base — the guest aliases both at the same plane) to
+// the retained image so the consumer can bind it directly. Extent must match the T# exactly; only
+// a valid, initialized depth plane may be sampled.
+struct PersistentDsSampled {
+    PersistentDsImage* image = nullptr;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+};
+inline PersistentDsSampled find_persistent_ds_sampled(uint64_t addr, uint32_t width,
+                                                      uint32_t height) {
+    if (!addr) return {};
+    static const bool bridge_log = getenv("PROSPER_DSBRIDGE_LOG") != nullptr;
+    for (auto& [key, image] : persistent_ds_cache()) {
+        if (key.w != width || key.h != height) continue;
+        if (key.dr != addr && key.dw != addr) continue;
+        if (!image.depth_valid || !image.layout_initialized || !image.image) continue;
+        if (bridge_log) {
+            static int hits = 0;
+            if (hits++ < 8)
+                fprintf(stderr, "[dsbridge] HIT addr=0x%llx %ux%u fmt=%u\n",
+                        (unsigned long long)addr, width, height, key.fmt);
+        }
+        return {&image, static_cast<VkFormat>(key.fmt)};
+    }
+    if (bridge_log) {
+        static int misses = 0;
+        if (misses++ < 8) {
+            fprintf(stderr, "[dsbridge] miss addr=0x%llx %ux%u; cache:\n",
+                    (unsigned long long)addr, width, height);
+            for (const auto& [key, image] : persistent_ds_cache())
+                fprintf(stderr, "[dsbridge]   dr=0x%llx dw=0x%llx %ux%u fmt=%u dvalid=%d init=%d\n",
+                        (unsigned long long)key.dr, (unsigned long long)key.dw, key.w, key.h,
+                        key.fmt, (int)image.depth_valid, (int)image.layout_initialized);
+        }
+    }
+    return {};
+}
+
 inline bool guest_ranges_overlap(uint64_t a, uint64_t a_size, uint64_t b, uint64_t b_size) {
     if (!a || !a_size || !b || !b_size) return false;
     return a < b + b_size && b < a + a_size;
@@ -1829,7 +1876,8 @@ inline bool restore_persistent_ds_image(const prosper::gpu::GpuCaptureDsSeed& se
         info.mipLevels = 1; info.arrayLayers = 1; info.samples = VK_SAMPLE_COUNT_1_BIT;
         info.tiling = VK_IMAGE_TILING_OPTIMAL;
         info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                     VK_IMAGE_USAGE_SAMPLED_BIT;   // sampled depth bridge (#1275)
         if (vkCreateImage(ctx.dev, &info, nullptr, &image.image) != VK_SUCCESS) {
             error = "cannot create restored persistent DS image"; return false;
         }
@@ -2200,7 +2248,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         dci.mipLevels = 1; dci.arrayLayers = 1; dci.samples = VK_SAMPLE_COUNT_1_BIT;
         dci.tiling = VK_IMAGE_TILING_OPTIMAL;
         dci.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                    VK_IMAGE_USAGE_SAMPLED_BIT;   // sampled depth bridge (#1275)
         vkCreateImage(dev, &dci, nullptr, &dimg);
         VkMemoryRequirements dr; vkGetImageMemoryRequirements(dev, dimg, &dr);
         VkMemoryAllocateInfo dai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -2328,6 +2377,11 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         VkDeviceSize image_bytes = 0;
         bool persistent_hit = false;
         bool borrowed_target = false;
+        // Sampled depth bridge (#1275): image borrowed from the persistent DS cache. The view uses
+        // the DEPTH aspect of ds_format, and the call transitions the image DS-attachment ->
+        // shader-read around its passes.
+        bool borrowed_ds = false;
+        VkFormat ds_format = VK_FORMAT_UNDEFINED;
         bool direct_memory = false;
     };
     struct PersistentTextureKey {
@@ -2921,8 +2975,13 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                         // (T# extents are rejected above 16384 -> <= 15 levels).
                         if (tex_mip_levels > 16u) tex_mip_levels = 16u;
                     }
+                    // A DS-bridged resource shares the id slot: both are guest plane addresses, and
+                    // pixels stays null for either direct bind, so distinct surfaces cannot collide.
                     const TextureUploadKey texture_key{
-                        r.tex_rgba, r.persistent_render_target_id, r.tw, r.th, r.td, r.img_dim,
+                        r.tex_rgba,
+                        r.persistent_render_target_id ? r.persistent_render_target_id
+                                                      : r.persistent_depth_target_id,
+                        r.tw, r.th, r.td, r.img_dim,
                         tex_mip_levels, backend_color_format(r.texture_format), r.is_storage_image};
                     size_t upload_index = SIZE_MAX;
                     if (share_texture_uploads) {
@@ -2950,11 +3009,28 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                 ++color_target_stats.sampled_hits;
                             }
                         }
-                        upload.persistent_id = r.is_storage_image ? 0 : r.persistent_texture_id;
+                        // Sampled depth bridge (#1275): the T# addresses a depth plane rendered
+                        // into a persistent DS image (never written back to guest memory). Bind
+                        // that image's depth aspect directly. The pass's own DS attachment must
+                        // not be borrowed as a sampled input (feedback) — cached_ds identifies it.
+                        if (!upload.image && !upload.borrowed_target && !r.is_storage_image &&
+                            r.persistent_depth_target_id && r.img_dim == 1) {
+                            const PersistentDsSampled sampled_ds = find_persistent_ds_sampled(
+                                r.persistent_depth_target_id, r.tw, r.th);
+                            if (sampled_ds.image &&
+                                (!cached_ds || sampled_ds.image->image != cached_ds->image)) {
+                                upload.image = sampled_ds.image->image;
+                                upload.borrowed_ds = true;
+                                upload.ds_format = sampled_ds.format;
+                            }
+                        }
+                        upload.persistent_id =
+                            r.is_storage_image || upload.borrowed_ds ? 0 : r.persistent_texture_id;
                         const PersistentTextureKey persistent_key{
                             r.persistent_texture_id, r.tw, r.th, r.td, r.img_dim,
                             texture_key.mip_levels, backend_color_format(r.texture_format)};
-                        if (!r.is_storage_image && !upload.borrowed_target && persistent_textures_enabled &&
+                        if (!r.is_storage_image && !upload.borrowed_target && !upload.borrowed_ds &&
+                            persistent_textures_enabled &&
                             r.persistent_texture_id) {
                             auto cached = persistent_texture_images.find(persistent_key);
                             if (cached != persistent_texture_images.end()) {
@@ -2968,7 +3044,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                             }
                         }
 
-                        if (!upload.persistent_hit && !upload.borrowed_target) {
+                        if (!upload.persistent_hit && !upload.borrowed_target && !upload.borrowed_ds) {
                             VkImageCreateInfo tci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
                             const bool texture_3d = r.img_dim == 2;
                             tci.imageType = texture_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
@@ -3060,6 +3136,13 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                         tvci.components = {vkswz(r.swizzle[0]), vkswz(r.swizzle[1]), vkswz(r.swizzle[2]), vkswz(r.swizzle[3])};
                     tvci.subresourceRange =
                         {VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels, 0, 1};
+                    // Sampled depth bridge (#1275): a borrowed DS image is viewed through its own
+                    // depth format's DEPTH aspect (one level — DS surfaces have no mip chains here);
+                    // the sampled value arrives in R. The T# swizzle above still applies.
+                    if (upload.borrowed_ds) {
+                        tvci.format = upload.ds_format;
+                        tvci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+                    }
                     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
                     // Honor the game's decoded S# (r.mag/min/mip_filter, r.addr_uvw) instead of a fixed
                     // LINEAR/clamp sampler — point-sampled art (pixel-art titles) no longer gets a blurred
@@ -3796,6 +3879,34 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                              VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &b1);
     }
+    // Sampled depth bridge (#1275): borrowed DS images live in DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+    // between passes. Transition each (once) to SHADER_READ_ONLY for this pass's sampling; the
+    // matching post-pass barrier below returns it so the next depth pass LOADs it unchanged.
+    // Both aspects of a combined image must transition together.
+    std::vector<VkImage> borrowed_ds_images;
+    for (const SharedTextureUpload& upload : texture_uploads) {
+        if (!upload.borrowed_ds || !upload.image) continue;
+        if (std::find(borrowed_ds_images.begin(), borrowed_ds_images.end(), upload.image) !=
+            borrowed_ds_images.end())
+            continue;
+        borrowed_ds_images.push_back(upload.image);
+        const bool ds_has_stencil = upload.ds_format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+        VkImageMemoryBarrier to_sampled{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        to_sampled.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        to_sampled.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        to_sampled.image = upload.image;
+        to_sampled.subresourceRange = {
+            VK_IMAGE_ASPECT_DEPTH_BIT |
+                (ds_has_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u), 0, 1, 0, 1};
+        to_sampled.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        to_sampled.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &to_sampled);
+    }
     // Clear color: the caller's clear_rgba (game fast-clear / black on the live path), else the
     // legacy diagnostic blue. PROSPER_CLEAR_DEBUG forces blue back on even when a color is passed.
     float cc[4] = {0.0f, 0.0f, 1.0f, 1.0f};   // diagnostic blue
@@ -3973,6 +4084,34 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                                  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &ds_ready);
+    }
+    // Sampled depth bridge (#1275): return each borrowed DS image to the layout every depth pass
+    // expects, so the bridge is invisible to the existing persistent-DS contract.
+    for (VkImage borrowed : borrowed_ds_images) {
+        VkFormat borrowed_format = VK_FORMAT_UNDEFINED;
+        for (const SharedTextureUpload& upload : texture_uploads)
+            if (upload.borrowed_ds && upload.image == borrowed) {
+                borrowed_format = upload.ds_format;
+                break;
+            }
+        VkImageMemoryBarrier to_ds{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        to_ds.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        to_ds.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        to_ds.image = borrowed;
+        to_ds.subresourceRange = {
+            VK_IMAGE_ASPECT_DEPTH_BIT |
+                (borrowed_format == VK_FORMAT_D32_SFLOAT_S8_UINT ? VK_IMAGE_ASPECT_STENCIL_BIT
+                                                                 : 0u),
+            0, 1, 0, 1};
+        to_ds.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        to_ds.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &to_ds);
     }
     if (readback_requested) {
         if (persistent_color) {
@@ -4445,7 +4584,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             for (SharedBufferArena& arena : shared_buffer_arenas)
                 release_render_host_buffer(dev, arena.buffer);
             for (auto& upload : texture_uploads) {
-                if (upload.image && !upload.persistent_hit && !upload.borrowed_target)
+                if (upload.image && !upload.persistent_hit && !upload.borrowed_target &&
+                    !upload.borrowed_ds)
                     vkDestroyImage(dev, upload.image, nullptr);
                 if (upload.memory) {
                     if (upload.direct_memory) vkFreeMemory(dev, upload.memory, nullptr);

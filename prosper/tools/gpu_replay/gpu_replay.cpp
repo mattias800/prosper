@@ -1844,6 +1844,42 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "[stencil-dump] snapshot failed: %s\n", derr.c_str());
         }
     }
+    // Sibling depth-plane dump (#1275): grayscale each persistent DEPTH plane + numeric stats, so a
+    // shadow atlas whose casters rasterize nothing is distinguishable from a populated one.
+    if (const char* ddump = getenv("PROSPER_DEPTH_DUMP")) {
+        std::vector<prosper::gpu::GpuCaptureDsSeed> seeds;
+        std::string derr;
+        if (prosper::test::snapshot_persistent_ds_images(seeds, derr)) {
+            for (size_t si = 0; si < seeds.size(); ++si) {
+                const auto& s = seeds[si];
+                if (!s.depth_valid || s.depth.empty()) continue;
+                const size_t n = static_cast<size_t>(s.width) * s.height;
+                const float* dz = reinterpret_cast<const float*>(s.depth.data());
+                const size_t nz = std::min(n, s.depth.size() / 4);
+                float dmin = 1e30f, dmax = -1e30f;
+                size_t nonzero = 0;
+                std::vector<uint8_t> rgba(n * 4, 255);
+                for (size_t p = 0; p < nz; ++p) {
+                    const float v = dz[p];
+                    dmin = std::min(dmin, v); dmax = std::max(dmax, v);
+                    if (v != 0.0f) ++nonzero;
+                    const uint8_t g = static_cast<uint8_t>(
+                        std::clamp(v, 0.0f, 1.0f) * 255.0f);
+                    rgba[p * 4 + 0] = g; rgba[p * 4 + 1] = g; rgba[p * 4 + 2] = g;
+                    rgba[p * 4 + 3] = 255;
+                }
+                char path[600];
+                std::snprintf(path, sizeof path, "%s_depth%zu_%ux%u.bmp", ddump, si,
+                              s.width, s.height);
+                prosper::test::dump_bmp(path, rgba, s.width, s.height);
+                std::fprintf(stderr,
+                             "[depth-dump] ds%zu %ux%u min=%g max=%g nonzero=%zu/%zu -> %s\n",
+                             si, s.width, s.height, dmin, dmax, nonzero, nz, path);
+            }
+        } else {
+            std::fprintf(stderr, "[depth-dump] snapshot failed: %s\n", derr.c_str());
+        }
+    }
     const auto extent_mode = selected_draws_only
         ? prosper::gpu::replay_tool::OutputExtentMode::SelectedDraws
         : (through_operation >= 0 || (draw_first >= 0 && draw_with_compute_prefix))
