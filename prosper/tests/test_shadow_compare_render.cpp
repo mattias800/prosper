@@ -98,6 +98,41 @@ int main() {
               false, true, true, VK_COMPARE_OP_NEVER),
           "a depth write masked by NEVER does not claim writer recency");
 
+    // Exercise the actual D32/D32S8 sibling selector, not just the predicate above. A read-only
+    // touch of the older format must not steal recency from the surface that was really written.
+    {
+        constexpr uint64_t kRecencyBase = 0x20d5feed00ull;
+        constexpr uint32_t kRecencyW = 17, kRecencyH = 19;
+        prosper::test::PersistentDsKey d32_key{
+            kRecencyBase, kRecencyBase, 0, 0, 0, kRecencyW, kRecencyH,
+            static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT)};
+        prosper::test::PersistentDsKey d32s8_key{
+            kRecencyBase, kRecencyBase, 0, 0, 0, kRecencyW, kRecencyH,
+            static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT_S8_UINT)};
+        auto& cache = prosper::test::persistent_ds_cache();
+        auto& older = cache[d32_key];
+        auto& newer = cache[d32s8_key];
+        older.image = (VkImage)(uintptr_t)1; older.layout_initialized = true; older.depth_valid = true;
+        newer.image = (VkImage)(uintptr_t)2; newer.layout_initialized = true; newer.depth_valid = true;
+        prosper::test::note_persistent_ds_depth_write(older, true, true);
+        prosper::test::note_persistent_ds_depth_write(newer, true, true);
+        CHECK(prosper::test::find_persistent_ds_sampled(
+                  kRecencyBase, kRecencyW, kRecencyH).image == &newer,
+              "newer D32S8 writer wins over stale D32 sibling");
+
+        prosper::test::note_persistent_ds_depth_write(older, true, false);
+        CHECK(prosper::test::find_persistent_ds_sampled(
+                  kRecencyBase, kRecencyW, kRecencyH).image == &newer,
+              "read-only D32 touch preserves D32S8 writer ordering");
+
+        prosper::test::note_persistent_ds_depth_write(older, true, true);
+        CHECK(prosper::test::find_persistent_ds_sampled(
+                  kRecencyBase, kRecencyW, kRecencyH).image == &older,
+              "a later real D32 write updates sibling ordering");
+        cache.erase(d32_key);
+        cache.erase(d32s8_key);
+    }
+
     // ---- Persistent-DS sampled bridge (#1275) ----
     // A depth-only producer renders a fullscreen triangle at z=0.25 into a guest-identified
     // persistent DS surface. prosper never writes that depth back to guest memory, so a consumer

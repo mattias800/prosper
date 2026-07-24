@@ -1456,6 +1456,12 @@ constexpr bool persistent_ds_pass_may_write_depth(bool clear_enabled, bool test_
         (test_enabled && write_enabled && compare_op != VK_COMPARE_OP_NEVER);
 }
 
+inline void note_persistent_ds_depth_write(PersistentDsImage& image, bool use_depth,
+                                           bool depth_may_be_written) {
+    if (use_depth && depth_may_be_written)
+        image.last_depth_write = ++persistent_ds_write_generation();
+}
+
 inline std::unordered_map<PersistentDsKey, PersistentDsImage, PersistentDsKeyHash>&
 persistent_ds_cache() {
     static std::unordered_map<PersistentDsKey, PersistentDsImage, PersistentDsKeyHash> cache;
@@ -4266,8 +4272,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         // Sampled depth bridge (#1275): recency for find_persistent_ds_sampled — two valid
         // entries can share a plane address (a surface re-keyed D32 -> D32S8 keeps its old
         // entry), and the most recently written one is the live truth.
-        if (use_depth && depth_may_be_written)
-            cached_ds->last_depth_write = ++persistent_ds_write_generation();
+        note_persistent_ds_depth_write(*cached_ds, use_depth, depth_may_be_written);
     }
     if (cached_color) {
         active_submission.add_failure_cleanup([cached_color]() {
