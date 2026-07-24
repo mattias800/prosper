@@ -144,8 +144,17 @@ struct LoadedImage {
     const uint8_t* at(uint64_t va) const;
 };
 
+// prosper materializes each ELF module as one contiguous, eagerly zero-filled host vector. Bound
+// guest-declared PT_LOAD spans before allocation so malformed multi-terabyte extents cannot exploit
+// virtual-memory overcommit and OOM-kill the process during zero fill. The current title corpus peaks
+// at about 251 MiB (PPSA21564); 1 GiB retains substantial headroom without pretending this contiguous
+// representation can safely model an arbitrary 64-bit ELF address span.
+inline constexpr uint64_t kMaxLoadedImageBytes = 1ull << 30;
+
 // Build a flat image from a parsed module at guest base `base`.
-LoadedImage build_image(const Module& m, uint64_t base);
+// Build a module image without allowing a malformed PT_LOAD extent to terminate the process through
+// an uncaught vector allocation failure. Returns false and describes the load error on failure.
+bool build_image(const Module& m, uint64_t base, LoadedImage& out, std::string* err = nullptr);
 
 // The phdr-index key a SELF data segment maps to: bits [31:20] of its flags, masked to 12 bits (the
 // SCE self-segment id). Higher flag bits must be masked off or the data-segment map is keyed wrong.

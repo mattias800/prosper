@@ -15,6 +15,7 @@
 // matches), which keeps the byte-exact checks below valid on case-insensitive filesystems too.
 #include "../src/hle/dispatch.hpp"
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -39,12 +40,30 @@ int main() {
     { std::ofstream(root / "arcrunner" / "content" / "movies" / "intro_ps5.mp4") << "x"; }
     const std::string base = root.string();
     set_app0_root(base);
+#ifdef _WIN32
+    _putenv_s("PROSPER_SAVE0", (root / "saves").string().c_str());
+#else
+    setenv("PROSPER_SAVE0", (root / "saves").string().c_str(), 1);
+#endif
 
     // ---- #1205: sandbox containment (unchanged behavior) ----
 
     // Normal path: composed directly under the host root (identical to pre-#1205 behavior).
     CHECK(resolve_guest_path("/app0/data/config.bin") == base + "/data/config.bin",
           "normal /app0 path maps directly under the root");
+
+    // A mount name must end at a component boundary. Raw prefix matching aliases unrelated guest
+    // namespaces into a mount (for example, /app0evil/file -> <app0-root>/evil/file).
+    CHECK(resolve_guest_path("/app0evil/file") == "/app0evil/file",
+          "sibling prefix '/app0evil' is not mapped into /app0");
+    CHECK(resolve_guest_path("/temp00/file") == "/temp00/file",
+          "sibling prefix '/temp00' is not mapped into /temp0");
+    fs::create_directories(root / "saves");
+    CHECK(savedata0_mount("slot", SaveDataMountPolicy::OpenOrCreate) == SaveDataMountOutcome::Created,
+          "test save directory mounts");
+    CHECK(resolve_guest_path("/savedata00/file") == "/savedata00/file",
+          "sibling prefix '/savedata00' is not mapped into /savedata0");
+    CHECK(savedata0_umount(), "test save directory unmounts");
 
     // Benign in-sandbox '..': normalizes to the same host file the OS would have resolved anyway.
     CHECK(resolve_guest_path("/app0/data/../data/config.bin") == base + "/data/config.bin",
