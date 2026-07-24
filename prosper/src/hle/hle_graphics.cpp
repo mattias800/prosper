@@ -478,14 +478,23 @@ HLE(g_vo_vblankstatus) {
     *(uint64_t*)(s + 0x10) = ns;                         // tsc (monotonic ns; matches ReadTsc's unit)
     return 0;
 }
+// PROSPER_HDR (the frontends' --hdr flag): advertise an HDR-capable display. Default is SDR —
+// the common case for prosper users, and the mode whose output path titles tonemap themselves.
+// Deliberately uncached: capability queries are boot-time-rare, and tests exercise both modes in
+// one process.
+static bool prosper_hdr_output() { return getenv("PROSPER_HDR") != nullptr; }
+
 // sceVideoOutGetDeviceCapabilityInfo (SceVideoOutDeviceCapabilityInfo: single u64 capability).
-// Advertise a plain SDR display (no HDR/BT2020) — capability 0.
+// Default: a plain SDR display (no HDR/BT2020) — capability 0. With PROSPER_HDR, set the
+// BT2020/PQ capability bit (0x2 — the Orbis-era SCE_VIDEO_OUT_DEVICE_CAPABILITY_BT2020_PQ value;
+// secondary-implementation agreement only, no Gen5 title has been observed reading a different
+// bit yet). CONFIDENCE: MED on the exact bit; HIGH that 0 == SDR-only.
 HLE(g_vo_devcap) {
     if (!a1)
         return (uint64_t)(int64_t)(int32_t)0x80290002;  // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
     VideoOutHandleGuard handle(a0);
     if (!handle.valid()) return kVoErrorInvalidHandle;
-    *(uint64_t*)(uintptr_t)a1 = 0;
+    *(uint64_t*)(uintptr_t)a1 = prosper_hdr_output() ? 0x2ull : 0ull;
     return 0;
 }
 
@@ -722,7 +731,8 @@ HLE(g_vo_get_output_status) {
     if (!handle.valid()) return kVoErrorInvalidHandle;
     if (a1 > 0xffffull) {
         *(uint32_t*)(uintptr_t)a1       = 0;   // +0x00: output state (0 = the boring/default state)
-        *(uint32_t*)(uintptr_t)(a1 + 4) = 0;   // +0x04: dynamic-range mode (2 = HDR; 0 = SDR)
+        // +0x04: dynamic-range mode (2 = HDR; 0 = SDR — the DOLL-RE'd field, issue #82).
+        *(uint32_t*)(uintptr_t)(a1 + 4) = prosper_hdr_output() ? 2u : 0u;
     }
     return 0;
 }

@@ -630,6 +630,15 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+        else if (a == "--hdr") {
+            // Advertise an HDR-capable display to the guest (sceVideoOut capability + output
+            // status). Default is SDR — the mode most users' displays and captures expect, and
+            // the path where titles apply their own tonemapping.
+            if (!set_environment("PROSPER_HDR", "1")) {
+                fprintf(stderr, "prosper-app: failed to set PROSPER_HDR\n");
+                return 2;
+            }
+        }
         else if (a[0] != '-' && dump.empty()) dump = a;                          // positional dump path
     }
 
