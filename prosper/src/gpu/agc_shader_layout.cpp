@@ -694,6 +694,8 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.width         = view.width;
             r.height        = view.height;
             r.depth         = d.depth;
+            r.declared_mip_levels =
+                d.last_level >= d.base_level ? (uint32_t)(d.last_level - d.base_level) + 1u : 1u;
             r.tile_mode     = d.tile_mode;          // so the renderer can auto-detile a GPU-tiled surface
             r.in_mip_tail   = view.in_mip_tail;
             r.mip_tail_offset = view.in_mip_tail

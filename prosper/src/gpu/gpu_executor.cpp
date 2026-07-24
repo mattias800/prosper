@@ -2534,6 +2534,8 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     r.cls = ResourceClass::Texture;
                     r.format = fi.format; r.num_components = fi.num_components;
                     r.gpu_addr = view.base; r.width = view.width; r.height = view.height; r.depth = d.depth;
+                    r.declared_mip_levels =
+                        d.last_level >= d.base_level ? (uint32_t)(d.last_level - d.base_level) + 1u : 1u;
                     r.tile_mode = d.tile_mode; r.srgb = fi.srgb;
                     r.in_mip_tail = view.in_mip_tail;
                     r.mip_tail_offset = view.in_mip_tail
@@ -2882,6 +2884,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     }
                     r.gpu_addr = view.base; r.width = view.width; r.height = view.height; r.depth = d.depth;
                     r.tile_mode = d.tile_mode;
+                    r.declared_mip_levels =
+                        d.last_level >= d.base_level ? (uint32_t)(d.last_level - d.base_level) + 1u : 1u;
                     r.in_mip_tail = view.in_mip_tail;
                     r.mip_tail_offset = view.in_mip_tail
                         ? static_cast<uint32_t>(view.mip_offset) : 0;
