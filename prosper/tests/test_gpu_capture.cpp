@@ -102,6 +102,7 @@ int main() {
     draw.ps.dst_color_blend_factor1 = 7; draw.ps.color_blend_op1 = 0;
     draw.ps.src_alpha_blend_factor1 = 1; draw.ps.dst_alpha_blend_factor1 = 7;
     draw.ps.alpha_blend_op1 = 0; draw.ps.color1_write_mask = 0xf;
+    draw.ps.cb_resolve = true;
     draw.ps.has_scissor = true; draw.ps.scissor_left = 12; draw.ps.scissor_top = 19;
     draw.ps.scissor_right = 70; draw.ps.scissor_bottom = 75;
     draw.ps.logic_op_enable = true; draw.ps.logic_op = 6;
@@ -199,8 +200,16 @@ int main() {
               scalar_capture.computes[0].resources.resources.empty(),
           "#636: capture ignores unconsumed descriptor-looking scalar arguments");
 
-    // v24 (#1280): byte length of the trailing declared-mip-levels tail (u32 count + one u32 per resource).
-    // Peeled first in each version-relabel backward-compat chain below (it is the outermost trailing tail).
+    // v25 (#1240): byte length of the trailing resolve-state block. Peeled first in each
+    // version-relabel backward-compat chain below (it is the outermost trailing tail).
+    auto v25_tail = [](const GpuCaptureFile& f) -> size_t {
+        size_t present_failures = 0;
+        for (const auto& diagnostic : f.failure_diagnostics)
+            if (diagnostic.pipeline_present) ++present_failures;
+        return 4 + f.draws.size() + 4 + present_failures;
+    };
+
+    // v24 (#1280): byte length of the declared-mip-levels tail (u32 count + one u32 per resource).
     auto v24_tail = [](const GpuCaptureFile& f) -> size_t {
         size_t rc = 0;
         for (const auto& d : f.draws) rc += d.vrt.resources.size() + d.prt.resources.size();
@@ -222,6 +231,7 @@ int main() {
               v16_scissor_bytes.size() >= 25,
           "v17 capture serializes effective guest scissor state");
     if (v16_scissor_bytes.size() >= 25) {
+        v16_scissor_bytes.resize(v16_scissor_bytes.size() - v25_tail(v16_scissor_source)); // v25 resolve tail
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v24_tail(v16_scissor_source)); // v24 declared-mip tail
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 12); // v23 count + one raw-draw-state
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 28); // v22 count + three empty vectors
@@ -373,6 +383,7 @@ int main() {
           "writer rejects an out-of-bounds DCC metadata reference");
     CHECK(serialize_gpu_capture(volume_capture, volume_bytes, error),
           "recreated valid v12 DCC bytes after malformed-reference check");
+    volume_bytes.resize(volume_bytes.size() - v25_tail(volume_capture)); // v25 resolve tail
     volume_bytes.resize(volume_bytes.size() - v24_tail(volume_capture)); // v24 declared-mip tail
     volume_bytes.resize(volume_bytes.size() - 12); // v23 count + one raw-draw-state
     volume_bytes.resize(volume_bytes.size() - 12); // v22 count + one empty vector
@@ -444,6 +455,7 @@ int main() {
     CHECK(serialize_gpu_capture(captured, v20_bytes, error) && v20_bytes.size() >= 21,
           "v21 capture serializes the logic-op extension");
     if (v20_bytes.size() >= 21) {
+        v20_bytes.resize(v20_bytes.size() - v25_tail(captured)); // v25 resolve tail
         v20_bytes.resize(v20_bytes.size() - v24_tail(captured)); // v24 declared-mip tail
         v20_bytes.resize(v20_bytes.size() - 12); // v23 count + one raw-draw-state
         v20_bytes.resize(v20_bytes.size() - 28); // v22 count + three empty vectors
@@ -474,6 +486,21 @@ int main() {
           "effective guest scissor round-trips through the v17 extension");
     CHECK(loaded.draws[0].ps.logic_op_enable && loaded.draws[0].ps.logic_op == 6,
           "v21 framebuffer logic op round-trips explicitly");
+    CHECK(loaded.draws[0].ps.cb_resolve,
+          "v25 MODE=3 resolve intent round-trips explicitly for gpu_replay");
+    std::vector<uint8_t> v24_resolve_bytes;
+    GpuCaptureFile v24_resolve_loaded;
+    CHECK(serialize_gpu_capture(captured, v24_resolve_bytes, error) &&
+          v24_resolve_bytes.size() >= v25_tail(captured),
+          "v25 capture exposes a removable trailing resolve-state block");
+    if (v24_resolve_bytes.size() >= v25_tail(captured)) {
+        v24_resolve_bytes.resize(v24_resolve_bytes.size() - v25_tail(captured));
+        v24_resolve_bytes[8] = 24;
+        v24_resolve_bytes[9] = v24_resolve_bytes[10] = v24_resolve_bytes[11] = 0;
+    }
+    CHECK(deserialize_gpu_capture(v24_resolve_bytes, v24_resolve_loaded, error) &&
+              !v24_resolve_loaded.draws[0].ps.cb_resolve,
+          "v24 capture reopens with the historical no-resolve default");
     CHECK(loaded.draws[0].color0_width == 1024 && loaded.draws[0].color0_height == 32,
           "per-target extent round-trips");
     CHECK(loaded.draws[0].color1_base == 0x3000 && loaded.draws[0].color1_width == 1024 &&
@@ -534,6 +561,8 @@ int main() {
 
     GpuReplayFrame replay;
     CHECK(materialize_gpu_replay(loaded, replay, error), "capture materializes owned replay draw items");
+    CHECK(replay.items.size() == 1 && replay.items[0].ps.cb_resolve,
+          "materialized gpu_replay draw retains MODE=3 resolve intent");
     const auto& rr = replay.items[0].vrt->resources;
     CHECK(rr[0].gpu_addr == 0x1000 && rr[1].gpu_addr == 0x1008, "replay retains logical guest addresses");
     CHECK(rr[0].host_data && rr[1].host_data == rr[0].host_data + 8 && rr[1].host_data[0] == memory[8],
@@ -793,6 +822,7 @@ int main() {
 
     const auto failed_path = std::filesystem::temp_directory_path() /
         "prosper_gpu_capture_failed_diagnostic_test.prgcap";
+    failed_capture.failure_diagnostics[0].pipeline.cb_resolve = true;
     CHECK(write_gpu_capture(failed_path.string(), failed_capture, error),
           "failed-operation diagnostic capture writes");
     GpuCaptureFile failed_loaded;
@@ -803,6 +833,7 @@ int main() {
           failed_loaded.failure_diagnostics[0].pipeline.scissor_left == 9 &&
           failed_loaded.failure_diagnostics[0].pipeline.logic_op_enable &&
           failed_loaded.failure_diagnostics[0].pipeline.logic_op == 6 &&
+          failed_loaded.failure_diagnostics[0].pipeline.cb_resolve &&
           failed_loaded.failure_diagnostics[0].stages[1].coverage.first_bad_pc == 1,
           "failed stage state, coverage, and raw shader versions round-trip offline");
 
@@ -841,6 +872,7 @@ int main() {
     if (v13_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        v13_bytes.resize(v13_bytes.size() - v25_tail(legacy_source)); // v25 resolve tail
         v13_bytes.resize(v13_bytes.size() - v24_tail(legacy_source)); // v24 declared-mip tail
         v13_bytes.resize(v13_bytes.size() - 12); // v23 count + one raw-draw-state
         v13_bytes.resize(v13_bytes.size() - (4 + 8 * legacy_resource_count)); // v22
@@ -865,6 +897,7 @@ int main() {
     if (legacy_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        legacy_bytes.resize(legacy_bytes.size() - v25_tail(legacy_source)); // v25 resolve tail
         legacy_bytes.resize(legacy_bytes.size() - v24_tail(legacy_source)); // v24 declared-mip tail
         legacy_bytes.resize(legacy_bytes.size() - 12); // v23 count + one raw-draw-state
         legacy_bytes.resize(legacy_bytes.size() - (4 + 8 * legacy_resource_count)); // v22
@@ -915,9 +948,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 25;   // kVersion (24) + 1: a not-yet-defined future version
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 26;   // kVersion (25) + 1: a not-yet-defined future version
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 25",
+          error == "unsupported capture version 26",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;
