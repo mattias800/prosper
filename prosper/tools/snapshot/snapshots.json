@@ -487,6 +487,37 @@
       "min_nonblack_ratio": 0.5
     },
     {
+      "name": "blue-prince-title",
+      "dump": "PPSA25009-app0",
+      "scale": 4,
+      "timeout": 62,
+      "sample_seconds": 2,
+      "capture_after_seconds": 28,
+      "capture_before_seconds": 50,
+      "pad_script": null,
+      "savedata_policy": "fresh",
+      "env": {},
+      "min_colors": 10000,
+      "min_qualifying_frames": 8,
+      "min_structural_similarity": 0.9,
+      "min_structural_matches": 8,
+      "min_content_match_ratio": 0.8,
+      "dims": [
+        480,
+        270
+      ],
+      "review": "Approved 16 composited images from two independent fresh-save runs on 2026-07-24; every image shows the stable Blue Prince title screen with the logo, New Game and Settings entries, and the same complete background composition. No input or gameplay transition occurs in the evidence window.",
+      "_note": "Title-screen-only guard for Blue Prince (PPSA25009, Unity). A fresh-save boot settles at the static main menu (BLUE PRINCE / NEW GAME / SETTINGS) by about 30 seconds without controller input. The evidence window deliberately stops before any New Game input or opening gameplay, so this guard makes no gameplay claim.",
+      "structural_references": [
+        {
+          "luma16x9": "000100000102010000000205080504040000010203060302000000030a17060400010507171c0e050000010124310b07000100010a0d01000000020415150c0a000000010505010000071512070b0708000000030101030000162226161d0c0f01010003010004032e45374124130f0a02020202020100000a231b1e0e070a0503040201010000000101010202020100",
+          "average_hash": "00f0f0e044c44400",
+          "difference_hash": "87c4e0ca8c9c9889"
+        }
+      ],
+      "min_nonblack_ratio": 0.288418
+    },
+    {
       "name": "terminator-boot",
       "dump": "PPSA25872-app0",
       "scale": 4,

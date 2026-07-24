@@ -119,10 +119,14 @@ inspection unless they fail.
   sequence for cold full-render processes that miss early menu pad polls.
 - `evergate-title`: reviewed animated title-screen guard using a neutral
   connected-controller route to retain the complete logo, prompt, and scene composition.
+- `blue-prince-title`: reviewed fresh-save title-screen-only guard; it does not
+  navigate into New Game or claim Blue Prince gameplay coverage.
 - `dead-cells-gameplay`: reviewed full-render guard for the controllable
   Prisoners' Quarters Primary weapon tutorial.
 - `blasphemous2-gameplay`: reviewed native-resolution fresh-save guard for
   multiple moving frames in the first playable area.
+- `terminator-boot`: reviewed fresh-save guard for Terminator 2D's boot intro
+  and settled main menu.
 
 ## Environment
 
