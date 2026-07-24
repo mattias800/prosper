@@ -43,6 +43,13 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   windows before making an expensive realized `.prgcap`. Timeline files are gitignored and local-only.
 - **`spv_validate/`** — `spirv-val` wrapper for recompiled SPIR-V.
 - **`niddiag/`, `fetch_niddb.sh`** — NID (Sony symbol hash) resolution helpers.
+- **`hostprof/hostprof.py`** — poor-man's **native sampling profiler**: attach to a running process
+  (pid or name), sample its threads via repeated `gdb` backtraces, and rank the hot leaf functions —
+  the HOST-side "which C++ function is burning CPU" first look (render/submit thread, readback copy,
+  detile, FP16 decode). Works where `perf` is denied (`perf_event_paranoid>=2`) via ptrace-attach.
+  `--thread REGEX` isolates one thread, `--mode folded` emits flamegraph stacks. Complements
+  `guest_bt` (which does the GUEST/managed-C# side). `--self-test` checks the symbol parser.
+  See `hostprof/README.md`.
 
 Verification here is agentic-first (see `docs/VERIFICATION.md`): prefer a
 programmatic check (ctest exit code, `spirv-val`, a snapshot hash) over eyeballing.
