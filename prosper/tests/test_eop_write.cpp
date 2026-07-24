@@ -518,6 +518,22 @@ int main() {
               "live consumed-marker labels still execute DmaData(0) then ReleaseMem(1)");
     }
 
+    // Plain EOP labels have no DmaData-init lifecycle. Their untouched high dword may look like a
+    // heap pointer while the low dword is the legitimate fence payload; the consumed-marker forge
+    // guard must not permanently suppress that ordinary 32-bit completion write.
+    {
+        static struct alignas(0x20) PlainLabel { uint64_t value; uint64_t pad[3]; } label{};
+        label.value = 0x1000000000ull;
+        const uint64_t addr = (uint64_t)(uintptr_t)&label;
+        uint32_t rel[7] = {};
+        rel[0] = PM4(7, IT_NOP, R_RELEASE_MEM);
+        rel[1] = (uint32_t)addr; rel[2] = (uint32_t)(addr >> 32);
+        rel[3] = 1; rel[4] = 1; rel[6] = 4;
+        GpuState st; run_cb(rel, 7, st);
+        CHECK(label.value == 0x1000000001ull,
+              "plain pointer-shaped fence label is not treated as a consumed-marker forge");
+    }
+
     // A suppressed LIVE fence must not count as a completed generation. If an earlier generation's
     // init never executes, its pointer-valued REL1/REL2 is suppressed; the next generation's real
     // DmaData(0)+ReleaseMem(1) must still see an outstanding init and signal the label. Counting the

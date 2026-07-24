@@ -862,7 +862,7 @@ static void honor_eop_write(const Pm4Command& c) {
                       const bool live_pair =
                           fh.dma_exec_n.load(std::memory_order_relaxed) >
                           fh.rel_exec_n.load(std::memory_order_relaxed);
-                      if (forge_guard() && !live_pair) {
+                      if (forge_guard() && label_is_consumed_marker(c.rel_addr) && !live_pair) {
                           report_suspect_write("REL1-FORGE", c.rel_addr, c.rel_value, pre, pkt_addr(c));
                           // Ring visibility WITHOUT the rel_exec_n bump: a suppressed fence must not
                           // advance the consumed-count, or the NEXT generation's live check above
