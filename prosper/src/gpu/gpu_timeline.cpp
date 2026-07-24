@@ -1369,7 +1369,7 @@ void begin_gpu_timeline_submit(uint64_t submit_no) {
 // .prgbundle replays faithfully (the producer submits re-run and regenerate renderer-owned RTTs a single
 // .prgcap leaves black). State machine: F9 arms `armed_path`; the NEXT present promotes it to a fresh
 // capturing frame; each submit appends; the following present writes the bundle and disarms. The hot
-// per-submit/per-present hooks are guarded by g_interactive_frame_active (one relaxed atomic) so normal
+// per-submit/per-present hooks are guarded by g_interactive_frame_active (one atomic load) so normal
 // play pays nothing until F9 is pressed.
 namespace {
 struct InteractiveFrameBundle {

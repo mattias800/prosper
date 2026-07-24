@@ -108,7 +108,7 @@ gitdir links, so the build-time fallback revision is `unknown` there.
 **Interactive frame grab (prosper-app hotkey).** When you are *playing* a title in `prosper-app` and see a
 graphical bug or an FPS drop, press **F9** to capture that moment for offline debugging — no need to
 predict a submit index with `PROSPER_GPU_CAPTURE_AT`. F9 arms a one-shot capture of the next **N
-consecutive frames** (default 8, `PROSPER_CAPTURE_FRAMES=1..240`) and writes two files (to
+consecutive frames** (default 4, `PROSPER_CAPTURE_FRAMES=1..240`) and writes two files (to
 `PROSPER_CAPTURE_DIR`, default cwd): `frame_grab_NNN.prgbundle` (a replayable multi-submit window) and
 `frame_grab_NNN.bmp` (a convenience screenshot). It is purely on-demand — nothing heavy runs until you
 press, so the grab never distorts the very slowdown you are observing (you will see a one-frame hitch on

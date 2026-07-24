@@ -782,8 +782,9 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[app] keyboard: WASD/Arrows=move  J/Space=Cross(jump)  K=Square(attack)  L=Circle  "
                     "I=Triangle  U/O=L1/R1  Y/H=L2/R2  Enter=Options  "
                     "F11/Alt+Enter=fullscreen  Esc=quit\n");
-    fprintf(stderr, "[app] F9 = grab the next frame: writes a replayable .prgbundle (whole frame) + a "
-                    ".bmp screenshot (to PROSPER_CAPTURE_DIR, default cwd) for gpu_replay debugging.\n");
+    fprintf(stderr, "[app] F9 = grab the next few frames: writes a replayable .prgbundle + a .bmp "
+                    "screenshot (to PROSPER_CAPTURE_DIR, default cwd) for gpu_replay debugging "
+                    "(brief hitch on press; PROSPER_CAPTURE_FRAMES sets the window, default 4).\n");
 
     const bool frameTrace = getenv("PROSPER_APP_FRAME_TRACE") != nullptr;
     const char* stallDumpEnv = getenv("PROSPER_APP_STALL_DUMP_MS");
@@ -981,6 +982,13 @@ int main(int argc, char** argv) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(4));
                 } else {
                     shown++; lastFrameProgress = std::chrono::steady_clock::now();
+                    // GPU-present mode has no CPU pixels here for the F9 screenshot; drop the pending
+                    // request rather than letting it leak into a later CPU-present-miss frame (the
+                    // .prgbundle oracle is the authoritative image anyway).
+                    if (!pendingGrabScreenshot.empty()) {
+                        std::fprintf(stderr, "[grab] screenshot skipped (gpu-present); use the .prgbundle\n");
+                        pendingGrabScreenshot.clear();
+                    }
                     static auto t0 = std::chrono::steady_clock::now(); static uint64_t mark = 0;
                     if (shown - mark >= 60) {
                         auto now = std::chrono::steady_clock::now();
