@@ -870,6 +870,20 @@ struct SpirvCompute {
         const uint32_t bits = bcu(result);
         out[0] = out[1] = out[2] = out[3] = bits;
     }
+    // IMAGE_SAMPLE_C_LZ on a plain 2D (non-array) depth texture (#1274 — Bendy's world shadow pass,
+    // dim=1). Identical to the 2D-array form but the coordinate is (u,v) with no layer; the scalar
+    // depth-comparison result is broadcast to the requested dmask component like the array path.
+    void image_sample_dref_lz_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
+                                 uint32_t dref_bits, uint32_t out[4]) {
+        uint32_t si = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
+        uint32_t coord = id();
+        put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+        uint32_t result = id();
+        put(code, Op_ImageSampleDrefExplicitLod,
+            {t_f32, result, si, coord, bcf(dref_bits), ImgOp_Lod, fconstf(0.0f)});
+        const uint32_t bits = bcu(result);
+        out[0] = out[1] = out[2] = out[3] = bits;
+    }
     // image_sample_b 2D: implicit-LOD sample with an LOD BIAS (bias_bits float). Bias only means
     // anything with implicit LOD (fragment derivatives); outside the fragment stage the op resolves
     // like the other samples there — explicit LOD 0 (bias dropped, matching image_sample_2d's rule).
@@ -6098,14 +6112,22 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // four consecutive address VGPRs, dref at slot 0 per 8.2.5) and LLVM's own
                 // llvm.amdgcn.image.sample.c.lz lowering (dref before coords). CONFIDENCE: MED —
                 // the #825 lane must re-validate against a real rendered shadow once it lights up.
-                // Integer views and non-array dimensions are not legal for this lowering; reject
-                // rather than silently turning a comparison sample into an ordinary color read.
-                if (in.mimg_dim != 5u || uint_texture || !res->depth_compare) {
+                // Integer views are never legal for a comparison sample, and the descriptor must be a
+                // depth-compare sampler; reject rather than silently turning a comparison into an
+                // ordinary color read. Both 2D (dim=1, vaddr [dref,u,v]) and 2D_ARRAY (dim=5, vaddr
+                // [dref,u,v,slice]) are handled — same modifier-first order, the array form adds the
+                // trailing slice coordinate (#1274 adds the non-array 2D case for Bendy's shadow pass).
+                if ((in.mimg_dim != 1u && in.mimg_dim != 5u) || uint_texture || !res->depth_compare) {
                     ok = false; return true;
                 }
-                b.declare_texture(res->binding, Dim_2D, false, true, true);
-                b.image_sample_dref_lz_2d_array(
-                    res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(3)), vread(cvg(0)), out);
+                const bool c_lz_arrayed = (in.mimg_dim == 5u);
+                b.declare_texture(res->binding, Dim_2D, false, c_lz_arrayed, true);
+                if (c_lz_arrayed)
+                    b.image_sample_dref_lz_2d_array(
+                        res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(3)), vread(cvg(0)), out);
+                else
+                    b.image_sample_dref_lz_2d(
+                        res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(0)), out);
             } else if (is_gather_lz || is_gather_lz_o) {
                 // gather4 dmask selects ONE channel (must be a single bit); the result is always the
                 // four texels of that channel -> 4 consecutive VDATA VGPRs, gather order preserved.

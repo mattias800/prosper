@@ -177,6 +177,43 @@ int main() {
               "GDS consume subtracts one covered-fragment allocation across all waves");
     }
 
+    // #1274 — IMAGE_SAMPLE_C_LZ on a plain 2D (non-array) depth texture. Bendy and the Ink Machine's
+    // world shadow pass issues op 0x2f with mimg_dim=1 (2D; vaddr [dref,u,v]). The recompiler previously
+    // accepted only the 2D_ARRAY (dim=5) comparison form and rejected the non-array case, dropping every
+    // shadowed draw. Recompile a minimal fragment that samples a depth-compare 2D texture and assert it
+    // lowers to a valid SPIR-V module. Without the fix the reject path returns an empty vector.
+    //   image_sample_c_lz v[0:3], v[0:2], s[8:15], s[16:19]  (op 0x2f, dim=1, SRSRC=s[8:15]).
+    const uint32_t clz2d_ps[] = {
+        0x7E0002FFu, 0x3E800000u,   // v_mov_b32 v0, 0.25  (dref)
+        0x7E0202FFu, 0x3E800000u,   // v_mov_b32 v1, 0.25  (u)
+        0x7E0402FFu, 0x3E800000u,   // v_mov_b32 v2, 0.25  (v)
+        0xF0BC0F08u, 0x00820000u,   // image_sample_c_lz v[0:3], v[0:2], s[8:15], s[16:19]
+        0xF800180Fu, 0x00000000u,   // exp mrt0 v0,v0,v0,v0  (keep sampled v0 live through export)
+        0xBF810000u,                // s_endpgm
+    };
+    ShaderResourceTable clz2d_rt;
+    ShaderResource clz2d_tex{};
+    clz2d_tex.cls = ResourceClass::Texture;
+    clz2d_tex.binding = 5; clz2d_tex.img_dim = 1;
+    clz2d_tex.width = 4; clz2d_tex.height = 4;
+    clz2d_tex.sgpr_base = 8;
+    clz2d_tex.depth_compare = true;    // shadow/PCF comparison sampler
+    clz2d_rt.resources.push_back(clz2d_tex);
+    std::vector<uint32_t> clz2d_frag = recompile_fragment(clz2d_ps, std::size(clz2d_ps), &clz2d_rt);
+    CHECK(!clz2d_frag.empty() && clz2d_frag[0] == 0x07230203u,
+          "#1274: IMAGE_SAMPLE_C_LZ on a 2D (non-array) depth texture recompiles to SPIR-V");
+
+    // The reject fence stays intact: the same instruction against a non-depth-compare descriptor must
+    // still fail-visible rather than silently turn a comparison sample into an ordinary color read.
+    ShaderResourceTable clz2d_nodc_rt;
+    ShaderResource clz2d_nodc_tex = clz2d_tex;
+    clz2d_nodc_tex.depth_compare = false;
+    clz2d_nodc_rt.resources.push_back(clz2d_nodc_tex);
+    std::vector<uint32_t> clz2d_nodc_frag =
+        recompile_fragment(clz2d_ps, std::size(clz2d_ps), &clz2d_nodc_rt);
+    CHECK(clz2d_nodc_frag.empty(),
+          "#1274: IMAGE_SAMPLE_C_LZ on a non-depth-compare 2D texture still rejects fail-visible");
+
     // Astro Bot's early foreground pass exports only R/G (EN=0x3). AMD's EXP contract preserves
     // disabled destination components; the live executor therefore intersects EN with the Vulkan
     // pipeline write mask. Prove both the exact rejected shader now recompiles and a partial draw
