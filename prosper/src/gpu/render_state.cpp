@@ -318,6 +318,9 @@ RenderState extract_render_state(const GpuState& st) {
         // keeps the register's initialized full-screen value because that byte range is not
         // consumed as a register write. Substitute the full default and log fail-visibly; genuine
         // per-pass closes arrive via the WINDOW/GENERIC/VPORT rects, which stay fully honored.
+        // Both halves are reset, not only the BR: a degenerate partner poisons trust in the pair
+        // (the observed live TL of (0,1024) would otherwise clip 1024 of 1080 rows on its own),
+        // and the init state is the only coherent recovery target.
         {
             const auto s16 = [](uint32_t v, uint32_t shift) {
                 return static_cast<int32_t>(static_cast<int16_t>((v >> shift) & 0xffffu));

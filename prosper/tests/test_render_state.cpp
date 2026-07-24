@@ -208,6 +208,18 @@ int main() {
               recovered.scissor_right == 70 && recovered.scissor_bottom == 75,
               "degenerate SCREEN pair (BR<=TL, never coherently programmed) recovers to full and "
               "keeps the window/generic/vport intersection");
+        // Regression-proof the SIGNED half interpretation: a coherent negative-TL pair whose BR
+        // BINDS the combine (50,60 < the 70/75 window/generic/vport bounds) must NOT trigger the
+        // recovery — an unsigned comparison would misread TL=(-4,-3) as huge and substitute full,
+        // which this exact-bound assertion would catch.
+        GpuState negative_tl = st;
+        negative_tl.cx[P::PA_SC_SCREEN_SCISSOR_TL] = 0xFFFDFFFCu;       // (-4,-3)
+        negative_tl.cx[P::PA_SC_SCREEN_SCISSOR_BR] = 0x003C0032u;       // (50,60)
+        const RenderState neg_tl = extract_render_state(negative_tl);
+        CHECK(neg_tl.has_scissor && neg_tl.scissor_left == 12 && neg_tl.scissor_top == 19 &&
+              neg_tl.scissor_right == 50 && neg_tl.scissor_bottom == 60,
+              "coherent negative-TL screen pair stays binding — no recovery misfire");
+
         GpuState closed_vport = degenerate_screen;
         closed_vport.cx[P::PA_SC_VPORT_SCISSOR_0_TL] = 0x04000000u;     // tile TL=(0,1024)
         closed_vport.cx[P::PA_SC_VPORT_SCISSOR_0_BR] = 0x00000000u;     // genuine close: BR=(0,0)
