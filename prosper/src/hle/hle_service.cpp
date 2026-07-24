@@ -1085,17 +1085,33 @@ struct ImeKeyEvent { uint16_t hid; bool down; };
 std::mutex g_ime_mx;
 std::deque<ImeKeyEvent> g_ime_queue;
 
-void ime_deliver(uint64_t handler, const ImeKeyEvent& ev) {
+void ime_deliver(uint64_t handler, const ImeKeyEvent& ev, uint64_t guest_fs) {
     if (!handler) return;
     alignas(16) uint8_t e[0x40] = {0};
     *(uint32_t*)(e + 0x00) = ev.down ? 0x101u : 0x102u;
     *(uint16_t*)(e + 0x08) = ev.hid;
-    // Guest handler is SysV-ABI and runs on the guest thread (guest %fs active) — call directly,
-    // exactly as h_qsort calls the guest comparator. arg (rdi) is passed 0: PPSA02664's handler
-    // ignores it; a title whose handler consumes the Open-registered arg is not yet modeled (it
-    // would need the arg captured from the sceImeKeyboardOpen param). The PROSPER_SYSV_ABI marker
-    // documents the host->guest boundary (currently expands empty; see dispatch.hpp).
+    // The guest handler is guest code that reads guest TLS (its per-thread allocator etc.). But
+    // sceImeUpdate is an HLE handler, so the import stub already swapped this thread to HOST %fs before
+    // it ran (#1155). Calling the guest handler directly here therefore ran it on host %fs, so its
+    // thread-local reads hit host glibc garbage and the first allocation it drives (the menu->gameplay
+    // transition on a key press) faulted at a near-null address — Evergate's SIGSEGV at eboot+0xaf8431
+    // (#1286). Restore the caller's guest %fs (recovered from the import-stub frame) for the duration of
+    // the call, then swap back to host %fs. Linux-only: only Linux swaps hardware %fs at the import
+    // boundary (guest_fs is 0 on Windows/macOS -> unchanged direct call). arg (rdi) is passed 0 as before.
+#if defined(__linux__) && !defined(__APPLE__)
+    uint64_t saved_fs = 0; bool swapped = false;
+    if (guest_fs) {
+        __asm__ volatile("rdfsbase %0" : "=r"(saved_fs));
+        __asm__ volatile("wrfsbase %0" : : "r"(guest_fs));
+        swapped = true;
+    }
+#else
+    (void)guest_fs;
+#endif
     ((void (PROSPER_SYSV_ABI *)(uint64_t, void*))(uintptr_t)handler)(0, e);
+#if defined(__linux__) && !defined(__APPLE__)
+    if (swapped) __asm__ volatile("wrfsbase %0" : : "r"(saved_fs));
+#endif
 }
 
 // PROSPER_IME_AUTOKEY=1: deliver a repeating Enter down/up pulse so headless routes advance a
@@ -1104,7 +1120,7 @@ void ime_deliver(uint64_t handler, const ImeKeyEvent& ev) {
 // the HID usage (default 0x28 Enter) and accepts a comma-separated LIST (e.g. "0x28,0x2c,0x1d") that
 // is cycled one key per press-window — so a single headless run can probe which key a dialog accepts.
 // Cadence: down, then up two ticks later, then the next key in the list two windows later.
-void ime_autokey_tick(uint64_t handler) {
+void ime_autokey_tick(uint64_t handler, uint64_t guest_fs) {
     static const int on = [] { const char* e = getenv("PROSPER_IME_AUTOKEY");
                                return e && strtol(e, nullptr, 0) != 0 ? 1 : 0; }();
     if (!on) return;
@@ -1124,10 +1140,24 @@ void ime_autokey_tick(uint64_t handler) {
     uint64_t t = tick.fetch_add(1);
     const uint16_t hid = hids[(t / 90) % hids.size()];
     if ((t % 90) == 0) {
-        ime_deliver(handler, {hid, true});
+        ime_deliver(handler, {hid, true}, guest_fs);
         if (svclog()) fprintf(stderr, "[ime-autokey] deliver hid=0x%x down\n", hid);
     } else if ((t % 90) == 2) {
-        ime_deliver(handler, {hid, false});
+        ime_deliver(handler, {hid, false}, guest_fs);
+    }
+}
+
+// Shared sceImeUpdate body: fire the autokey pulse (if enabled) then drain the queued keys, dispatching
+// each on the caller's guest %fs (guest_fs == 0 => no swap, the Windows/macOS path). The queue mutex is
+// released before every guest handler call (never held across guest code).
+void ime_update_run(uint64_t handler, uint64_t guest_fs) {
+    ime_autokey_tick(handler, guest_fs);        // handler = the guest event handler
+    for (;;) {
+        ImeKeyEvent ev;
+        { std::lock_guard<std::mutex> lk(g_ime_mx);
+          if (g_ime_queue.empty()) break;
+          ev = g_ime_queue.front(); g_ime_queue.pop_front(); }
+        ime_deliver(handler, ev, guest_fs);
     }
 }
 } // namespace
@@ -1141,18 +1171,29 @@ void ime_push_key(uint16_t hid_usage, bool down) {
 }
 
 HLE(s_ime_kbd_open) { svc_log("sceImeKeyboardOpen", a0,a1,a2,a3,a4,a5); return 0; }  // handler comes via sceImeUpdate
-HLE(s_ime_update)   {
+// sceImeUpdate invokes the guest event handler (guest code), so it must restore the caller's guest %fs
+// around each dispatch (see ime_deliver / #1286). On Linux/macOS the import stub swapped this thread to
+// host %fs, so recover the caller's guest %fs from the import-stub frame via the entry-stack trampoline
+// (as the AvPlayer callbacks do) and hand it to ime_update_run. PROSPER_ASM_TRAMPOLINE is POSIX-only, so
+// Windows/MinGW (which never swaps hardware %fs at the import boundary) registers a plain handler that
+// dispatches directly with guest_fs == 0. callback_guest_fs_from_entry_stack also returns 0 for any
+// non-guest frame, so the plain-tail-jump macOS path is likewise an unchanged direct call.
+#ifndef _WIN32
+extern "C" uint64_t s_ime_update_c(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                   uint64_t a4, uint64_t a5, uint64_t entry_rsp) {
     svc_log("sceImeUpdate", a0,a1,a2,a3,a4,a5);
-    ime_autokey_tick(a0);                       // a0 = the guest event handler
-    for (;;) {
-        ImeKeyEvent ev;
-        { std::lock_guard<std::mutex> lk(g_ime_mx);
-          if (g_ime_queue.empty()) break;
-          ev = g_ime_queue.front(); g_ime_queue.pop_front(); }
-        ime_deliver(a0, ev);
-    }
+    ime_update_run(a0, prosper::callback_guest_fs_from_entry_stack(entry_rsp));
     return 0;
 }
+PROSPER_ASM_TRAMPOLINE(s_ime_update_entry, s_ime_update_c)
+extern "C" void s_ime_update_entry();
+#else
+HLE(s_ime_update) {   // Windows/MinGW: no import-boundary %fs swap -> dispatch directly (guest_fs = 0)
+    svc_log("sceImeUpdate", a0,a1,a2,a3,a4,a5);
+    ime_update_run(a0, 0);
+    return 0;
+}
+#endif
 // sceImeKeyboardGetResourceId(userId, OrbisImeKeyboardResourceIdArray* out): report the user's keyboard
 // resource ids. Headless -> none (all-zero). A registered PlatformUi (a windowed frontend with a host
 // keyboard) reports its own ids, so a title enables keyboard input (#347).
@@ -2345,7 +2386,11 @@ void register_service_hle() {
     R("sceSystemServiceHideSplashScreen", s_ok);
     // libSceIme keyboard API (#186): no physical keyboard -> consistent "none connected" state. Raw NIDs.
     Hle::register_fn("eaFXjfJv3xs", (HleFn)s_ime_kbd_open,  "sceImeKeyboardOpen");
-    Hle::register_fn("-4GCfYdNF1s", (HleFn)s_ime_update,    "sceImeUpdate");
+#ifdef _WIN32
+    Hle::register_fn("-4GCfYdNF1s", (HleFn)s_ime_update, "sceImeUpdate");         // plain handler (guest_fs=0)
+#else
+    Hle::register_fn("-4GCfYdNF1s", (HleFn)s_ime_update_entry, "sceImeUpdate");   // entry-rsp trampoline (#1286)
+#endif
     Hle::register_fn("VkqLPArfFdc", (HleFn)s_ime_kbd_info,  "sceImeKeyboardGetInfo");
     Hle::register_fn("dKadqZFgKKQ", (HleFn)s_ime_kbd_resid, "sceImeKeyboardGetResourceId");
     // libSceAvPlayer (#324): let a post-credits / intro video complete so the game reaches its scene.

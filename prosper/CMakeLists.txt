@@ -708,6 +708,13 @@ if(TARGET prosper_core)
     add_test(NAME hle_stack_args_guest_fs COMMAND test_hle_stack_args --guest-fs)
   endif()
 
+  # sceImeUpdate must invoke the guest key handler on the CALLER's guest %fs, not the host %fs the
+  # import stub swapped in (#1286: Evergate SIGSEGV at eboot+0xaf8431 on a key press). Drives the real
+  # import path on an activated guest TCB; a no-op pass off Linux.
+  add_executable(test_ime_fs tests/test_ime_fs.cpp)
+  target_link_libraries(test_ime_fs PRIVATE prosper_core)
+  add_test(NAME ime_fs COMMAND test_ime_fs)
+
   # x86-64 low-address READ decoder used by the Windows PROSPER_NULL_PAGE emulation. Header-only, so the
   # decode logic is verified on every platform even though the VEH caller is Windows-only.
   add_executable(test_x86_read_decode tests/test_x86_read_decode.cpp)
