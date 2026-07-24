@@ -48,6 +48,13 @@ static_assert(sizeof(GuestTimeval) == 0x10, "SceKernelTimeval ABI");
 
 int main() {
     std::printf("== test_file_binary ==\n");
+    // #1234: map /app0 to the cwd BEFORE any guest file op (the mount root caches on first
+    // translate), so the virtual-root clamp tests below resolve against real files.
+#ifdef _WIN32
+    _putenv_s("PROSPER_APP0", ".");
+#else
+    setenv("PROSPER_APP0", ".", 1);
+#endif
     const char* path = "prosper-test-file-binary.tmp";
     std::array<uint8_t, 512> expected{};
     for (size_t i = 0; i < expected.size(); ++i) expected[i] = (uint8_t)(i * 37u + 11u);
@@ -500,6 +507,33 @@ int main() {
           "libc open retains the -1 plus errno contract");
     CHECK((uint32_t)kernel_missing == 0x80020002u,
           "sceKernelOpen returns SCE_KERNEL_ERROR_ENOENT directly");
+
+    // Virtual-root clamp (#1234): the jailed title's "/app0/.." is its readable root on real
+    // hardware (ArcRunner opens it during boot). It must resolve (directory open succeeds), a
+    // mount re-entry through the root must reach the real file, and a traversal to an unmounted
+    // sibling must KEEP the #1205 deny (ENOENT) — never fall through to host passthrough.
+    {
+        const uint64_t root_fd = open_fn
+            ? open_fn((uint64_t)(uintptr_t)"/app0/..", 0, 0, 0, 0, 0) : 0;
+        CHECK((int64_t)root_fd >= 3, "'/app0/..' opens as the virtual sandbox root");
+        if ((int64_t)root_fd >= 3) {
+            HleFn close_fn = Hle::lookup(nid_hash("sceKernelClose"));
+            if (close_fn) close_fn(root_fd, 0, 0, 0, 0, 0);
+        }
+        const uint64_t reentry_fd = open_fn
+            ? open_fn((uint64_t)(uintptr_t)"/app0/../app0/prosper-test-file-binary.tmp",
+                      0, 0, 0, 0, 0)
+            : 0;
+        CHECK((int64_t)reentry_fd >= 3, "'/app0/../app0/<file>' re-enters the mount");
+        if ((int64_t)reentry_fd >= 3) {
+            HleFn close_fn = Hle::lookup(nid_hash("sceKernelClose"));
+            if (close_fn) close_fn(reentry_fd, 0, 0, 0, 0, 0);
+        }
+        const uint64_t sibling = open_fn
+            ? open_fn((uint64_t)(uintptr_t)"/app0/../etc", 0, 0, 0, 0, 0) : 0;
+        CHECK((uint32_t)sibling == 0x80020002u,
+              "'/app0/../etc' keeps the sandbox-traversal deny (ENOENT)");
+    }
     const std::string unreachable_file = std::string("/app0/") + missing_path;
     std::string overlong_path(256, 'a');
     CHECK(kernel_reachability_fn &&

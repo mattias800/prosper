@@ -427,6 +427,31 @@ namespace {
         }
         return root;
     }
+    // #1234: the jailed title's virtual ROOT ("/app0/..") as a real, readable host directory.
+    // Real hardware jails the title with its mounts as the only root entries; a title that
+    // opendir/stats its root (ArcRunner does during boot) must succeed. Lazily created under
+    // the scratch area with one empty entry per mount prosper serves, so enumeration shows the
+    // expected names. Metadata (inode/times) is host-scratch; no title has been observed
+    // depending on root metadata beyond existence + directory type. CONFIDENCE: MED on the
+    // exact real-hardware root entry list; HIGH that existence must succeed.
+    std::string virtual_root_dir() {
+        static std::string dir;
+        if (dir.empty()) {
+            dir = temp0_root() + "/prosper-vroot";
+#ifdef _WIN32
+            _mkdir(dir.c_str());
+            _mkdir((dir + "/app0").c_str());
+            _mkdir((dir + "/temp0").c_str());
+            _mkdir((dir + "/savedata0").c_str());
+#else
+            ::mkdir(dir.c_str(), 0777);
+            ::mkdir((dir + "/app0").c_str(), 0777);
+            ::mkdir((dir + "/temp0").c_str(), 0777);
+            ::mkdir((dir + "/savedata0").c_str(), 0777);
+#endif
+        }
+        return dir;
+    }
     // Host directory backing guest "/savedata0" — the mounted save-data area that
     // sceSaveDataMount3 (hle_service.cpp) reports to the game. One save dir is mounted at a
     // time (DOLL's wrapper umounts id 0 before the next mount); the current mount's host dir
@@ -533,6 +558,33 @@ namespace {
         // a host path OUTSIDE the sandbox. Only when a ".." is present do we lexically normalize the
         // sub-path and reject an escape (#1205); normal paths are byte-identical to before, and a benign
         // in-sandbox ".." resolves to the same host file it would have anyway.
+        //
+        // #1234: a climb that lands ON the virtual root is not an escape — the title is jailed and
+        // "/app0/.." IS its (readable) root directory on real hardware (ArcRunner opens it during
+        // boot). Normalize the whole absolute path first: the bare root resolves to a prepared
+        // virtual-root host directory (whose entries are the mounts), and a path that re-enters a
+        // mount ("/app0/../app0/x", "/app0/../savedata0/y") proceeds through normal mount mapping.
+        // A traversal to an unmounted sibling ("/app0/../etc") KEEPS the #1205 deny — it must never
+        // fall through to the host-passthrough return below.
+        if (p.find("..") != std::string::npos && (p[0] == '/' || p[0] == '\\')) {
+            const std::string normalized = "/" + clamp_normalize_relative(p);
+            const bool reenters_mount = mount_path_matches(normalized, "/app0") ||
+                                        mount_path_matches(normalized, "/temp0") ||
+                                        mount_path_matches(normalized, "/savedata0");
+            if (normalized == "/") {
+                const std::string vroot = virtual_root_dir();
+                if (filelog())
+                    fprintf(stderr, "[file] open '%s' -> virtual root '%s'\n", guest,
+                            vroot.c_str());
+                return vroot;
+            }
+            if (reenters_mount) {
+                p = normalized;
+            } else {
+                if (filelog()) fprintf(stderr, "[file] DENIED (sandbox traversal) '%s'\n", guest);
+                return "/prosper-denied" + p;
+            }
+        }
         std::string save0;
         if (mount_path_matches(p, "/savedata0")) { std::lock_guard<std::mutex> lk(g_save0_mx); save0 = g_save0; }
         std::string root; size_t vlen = 0;
