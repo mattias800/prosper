@@ -199,8 +199,17 @@ int main() {
               scalar_capture.computes[0].resources.resources.empty(),
           "#636: capture ignores unconsumed descriptor-looking scalar arguments");
 
-    // v17 appends scissor state without changing the legacy pipeline prefix. Remove v22's internal
-    // resource state, v21's logic op,
+    // v24 (#1280): byte length of the trailing declared-mip-levels tail (u32 count + one u32 per resource).
+    // Peeled first in each version-relabel backward-compat chain below (it is the outermost trailing tail).
+    auto v24_tail = [](const GpuCaptureFile& f) -> size_t {
+        size_t rc = 0;
+        for (const auto& d : f.draws) rc += d.vrt.resources.size() + d.prt.resources.size();
+        for (const auto& cm : f.computes) rc += cm.resources.resources.size();
+        return 4 + 4 * rc;
+    };
+
+    // v17 appends scissor state without changing the legacy pipeline prefix. Remove v24's declared-mip
+    // tail, v22's internal resource state, v21's logic op,
     // v20's instance count, v19's realized raw-stage indices, v18's geometry index, then the v17 tail
     // to recover a byte-exact v16 capture.
     GpuCaptureFile v16_scissor_source = captured;
@@ -213,6 +222,7 @@ int main() {
               v16_scissor_bytes.size() >= 25,
           "v17 capture serializes effective guest scissor state");
     if (v16_scissor_bytes.size() >= 25) {
+        v16_scissor_bytes.resize(v16_scissor_bytes.size() - v24_tail(v16_scissor_source)); // v24 declared-mip tail
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 12); // v23 count + one raw-draw-state
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 28); // v22 count + three empty vectors
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 13); // v21 one draw + zero failures
@@ -245,6 +255,7 @@ int main() {
     tail_resource.in_mip_tail = true; tail_resource.mip_tail_offset = 32768;
     tail_resource.mip_tail_bytes = 65536; tail_resource.mip_tail_x = 64;
     tail_resource.mip_tail_y = 0;
+    tail_resource.declared_mip_levels = 5;   // #1280: a non-default T#-declared mip-chain length
     auto tail_table = std::make_shared<ShaderResourceTable>();
     tail_table->resources = {tail_resource};
     DrawItem tail_draw = draw; tail_draw.vrt = tail_table;
@@ -262,6 +273,8 @@ int main() {
               tail_loaded.draws[0].vrt.resources[0].resource.mip_tail_x == 64 &&
               tail_loaded.draws[0].vrt.resources[0].resource.mip_tail_y == 0,
           "v16 capture round-trips packed-tail byte and coordinate placement exactly");
+    CHECK(tail_loaded.draws[0].vrt.resources[0].resource.declared_mip_levels == 5,
+          "#1280: v24 capture round-trips the T#-declared mip-chain length (was silently defaulting to 1)");
 
     auto large_table = std::make_shared<ShaderResourceTable>();
     ShaderResource large_resource = a;
@@ -360,6 +373,7 @@ int main() {
           "writer rejects an out-of-bounds DCC metadata reference");
     CHECK(serialize_gpu_capture(volume_capture, volume_bytes, error),
           "recreated valid v12 DCC bytes after malformed-reference check");
+    volume_bytes.resize(volume_bytes.size() - v24_tail(volume_capture)); // v24 declared-mip tail
     volume_bytes.resize(volume_bytes.size() - 12); // v23 count + one raw-draw-state
     volume_bytes.resize(volume_bytes.size() - 12); // v22 count + one empty vector
     volume_bytes.resize(volume_bytes.size() - 13); // v21 one logic-op draw + zero failures
@@ -430,6 +444,7 @@ int main() {
     CHECK(serialize_gpu_capture(captured, v20_bytes, error) && v20_bytes.size() >= 21,
           "v21 capture serializes the logic-op extension");
     if (v20_bytes.size() >= 21) {
+        v20_bytes.resize(v20_bytes.size() - v24_tail(captured)); // v24 declared-mip tail
         v20_bytes.resize(v20_bytes.size() - 12); // v23 count + one raw-draw-state
         v20_bytes.resize(v20_bytes.size() - 28); // v22 count + three empty vectors
         v20_bytes.resize(v20_bytes.size() - 13); // v21 one logic-op draw + zero failures
@@ -826,6 +841,7 @@ int main() {
     if (v13_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        v13_bytes.resize(v13_bytes.size() - v24_tail(legacy_source)); // v24 declared-mip tail
         v13_bytes.resize(v13_bytes.size() - 12); // v23 count + one raw-draw-state
         v13_bytes.resize(v13_bytes.size() - (4 + 8 * legacy_resource_count)); // v22
         v13_bytes.resize(v13_bytes.size() - 13); // v21 one logic-op draw + zero failures
@@ -849,6 +865,7 @@ int main() {
     if (legacy_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        legacy_bytes.resize(legacy_bytes.size() - v24_tail(legacy_source)); // v24 declared-mip tail
         legacy_bytes.resize(legacy_bytes.size() - 12); // v23 count + one raw-draw-state
         legacy_bytes.resize(legacy_bytes.size() - (4 + 8 * legacy_resource_count)); // v22
         legacy_bytes.resize(legacy_bytes.size() - 13); // v21 one logic-op draw + zero failures
@@ -898,9 +915,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 24;
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 25;   // kVersion (24) + 1: a not-yet-defined future version
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 24",
+          error == "unsupported capture version 25",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;
