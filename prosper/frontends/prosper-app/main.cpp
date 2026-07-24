@@ -782,9 +782,9 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[app] keyboard: WASD/Arrows=move  J/Space=Cross(jump)  K=Square(attack)  L=Circle  "
                     "I=Triangle  U/O=L1/R1  Y/H=L2/R2  Enter=Options  "
                     "F11/Alt+Enter=fullscreen  Esc=quit\n");
-    fprintf(stderr, "[app] F9 = grab the next few frames: writes a replayable .prgbundle + a .bmp "
+    fprintf(stderr, "[app] F9 = grab the current frame: writes a replayable .prgbundle + a .bmp "
                     "screenshot (to PROSPER_CAPTURE_DIR, default cwd) for gpu_replay debugging "
-                    "(brief hitch on press; PROSPER_CAPTURE_FRAMES sets the window, default 4).\n");
+                    "(brief hitch on press; PROSPER_CAPTURE_FRAMES>1 grabs an animation).\n");
 
     const bool frameTrace = getenv("PROSPER_APP_FRAME_TRACE") != nullptr;
     const char* stallDumpEnv = getenv("PROSPER_APP_STALL_DUMP_MS");

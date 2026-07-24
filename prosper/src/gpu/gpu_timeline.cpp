@@ -1379,11 +1379,11 @@ struct InteractiveFrameBundle {
     bool capturing = false;
     bool failed = false;
     uint64_t max_unique_bytes = 2048ull << 20;
-    uint32_t frames_wanted = 4;  // capture this many CONSECUTIVE frames so a title that samples RTTs from
-                                 // previous frames (temporal AA / deferred history) has its producers in
-                                 // the window; gpu_replay --bundle then resolves the last frame's inputs.
-                                 // Each frame is a full heavy capture, so this bounds the on-press hitch;
-                                 // raise PROSPER_CAPTURE_FRAMES for a deeper history, lower it for speed.
+    uint32_t frames_wanted = 1;  // one frame suffices: the capture seeds the sampled renderer-owned RTTs
+                                 // with their live pixels (#1291), so a deferred/temporal-AA frame replays
+                                 // faithfully from a single submit — no need to re-run producers across a
+                                 // multi-frame window. Raise PROSPER_CAPTURE_FRAMES only to grab an
+                                 // animation over several frames; each extra frame is a full heavy capture.
     uint32_t frames_seen = 0;    // presents observed while capturing
     uint64_t submits = 0;
     GpuCaptureBundle bundle;
