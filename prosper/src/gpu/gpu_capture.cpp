@@ -44,7 +44,12 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // --inspect-only surface raw-vs-realized offline and flag a decode/realization divergence (e.g. GTA
 // #1163's non-indexed vertex-count inflation) without a live boot. Older captures read fine (the fields
 // default to 0/false = "unknown").
-constexpr uint32_t kVersion = 23;
+// v24 (#1280): each resource's declared_mip_levels (the T#-declared mip-chain length) is serialized in a
+// deterministic version-gated tail (like the v15 depth-compare / v16 mip-tail tails), so the byte-exact
+// v1-v23 record prefix is preserved and older captures materialize with the historical default of 1. It
+// was populated live but never written/read, so every reloaded .prgcap resource defaulted to 1 and a
+// mip-declaring title replayed single-level.
+constexpr uint32_t kVersion = 24;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -1507,6 +1512,23 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     // ("unknown"). Kept as a trailing block so every v1-v22 record prefix stays byte-exact.
     w.u32(static_cast<uint32_t>(c.draws.size()));
     for (const auto& draw : c.draws) { w.u32(draw.raw_draw_count); w.u32(draw.raw_indexed ? 1u : 0u); }
+    // v24 (#1280) appends each resource's T#-declared mip-chain length (declared_mip_levels), used by the
+    // backend to bound generated-mip uploads (#1272). Kept as a trailing per-resource block (same resource
+    // enumeration as the v16 mip-tail tail) so every v1-v23 prefix stays byte-exact and older captures
+    // materialize with the historical default of 1.
+    {
+        size_t resource_count = 0;
+        for (const auto& draw : c.draws)
+            resource_count += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes)
+            resource_count += compute.resources.resources.size();
+        w.u32(static_cast<uint32_t>(resource_count));
+        auto write_declared_mips = [&](const GpuCapturedTable& table) {
+            for (const auto& captured : table.resources) w.u32(captured.resource.declared_mip_levels);
+        };
+        for (const auto& draw : c.draws) { write_declared_mips(draw.vrt); write_declared_mips(draw.prt); }
+        for (const auto& compute : c.computes) write_declared_mips(compute.resources);
+    }
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -2059,6 +2081,22 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             if (!r.u32(draw.raw_draw_count) || !r.u32(ri)) return false;
             draw.raw_indexed = ri != 0;
         }
+    }
+    if (version >= 24) {   // #1280: per-resource T#-declared mip-chain length (trailing tail; default 1)
+        size_t expected = 0;
+        for (auto& draw : c.draws) expected += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (auto& compute : c.computes) expected += compute.resources.resources.size();
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) { error = "invalid declared-mip-levels count"; return false; }
+        auto read_declared_mips = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources)
+                if (!r.u32(captured.resource.declared_mip_levels)) return false;
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_declared_mips(draw.vrt) || !read_declared_mips(draw.prt)) return false;
+        for (auto& compute : c.computes)
+            if (!read_declared_mips(compute.resources)) return false;
     }
     if (version >= 7 && !validate_failure_diagnostics(c, error)) return false;
     if (r.left) { error = "capture has trailing data"; return false; }
