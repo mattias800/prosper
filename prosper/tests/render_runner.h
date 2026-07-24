@@ -1051,6 +1051,21 @@ inline void destroy_persistent_color_target(const RenderVkCtx& ctx,
     target = {};
 }
 
+inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32_t height,
+                                             VkFormat format, std::vector<uint8_t>& output,
+                                             std::string& error);
+
+// With deferred RTT readback (#1284) a valid persistent target can hold the ONLY copy of its
+// rendered pixels. Eviction must hand those pixels back to the frontend's CPU cache before the
+// image is destroyed, or the content is silently lost. Without a registered sink, eviction keeps
+// the historical destroy-only behavior (every pass then still has an authoritative CPU copy).
+inline std::function<void(uint64_t, uint32_t, uint32_t, VkFormat, std::vector<uint8_t>&&)>&
+persistent_color_target_evict_sink() {
+    static std::function<void(uint64_t, uint32_t, uint32_t, VkFormat, std::vector<uint8_t>&&)>
+        sink;
+    return sink;
+}
+
 inline bool evict_persistent_color_target(const RenderVkCtx& ctx, uint64_t current_generation) {
     auto& cache = persistent_color_target_cache();
     auto victim = cache.end();
@@ -1060,6 +1075,18 @@ inline bool evict_persistent_color_target(const RenderVkCtx& ctx, uint64_t curre
             victim = it;
     }
     if (victim == cache.end()) return false;
+    if (victim->second.valid) {
+        auto& sink = persistent_color_target_evict_sink();
+        if (sink) {
+            std::vector<uint8_t> pixels;
+            std::string error;
+            if (readback_persistent_color_target(victim->first.id, victim->first.width,
+                                                 victim->first.height, victim->first.format,
+                                                 pixels, error))
+                sink(victim->first.id, victim->first.width, victim->first.height,
+                     victim->first.format, std::move(pixels));
+        }
+    }
     persistent_color_target_bytes() -= victim->second.bytes;
     destroy_persistent_color_target(ctx, victim->second);
     cache.erase(victim);
