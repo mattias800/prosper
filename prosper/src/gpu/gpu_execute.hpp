@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <mutex>
 #include <memory>
 #include <vector>
 #include <set>
@@ -484,10 +485,40 @@ struct SharedVulkanContext {
     // Features the compute backend requires; when false it must decline the shared device.
     bool storage_image_read_without_format = false;
     bool storage_image_write_without_format = false;
+    // Present unification (#1270): when present_capable, prosper-app may create its window surface on
+    // `instance`, its swapchain on `device`, and present on `present_queue` -- then blit the renderer's
+    // front-buffer image straight to the swapchain with no CPU round-trip. present_queue_shared means the
+    // present queue aliases the render queue, so both threads must serialize submits through
+    // shared_render_submit_mutex(). false/nullptr on a headless build (prosper-app then uses its own
+    // separate present device + CPU pixels, exactly as before).
+    bool present_capable = false;
+    void* present_queue = nullptr;
+    bool present_queue_shared = false;
     bool valid() const { return instance && physical && device && queue && queue_family != UINT32_MAX; }
 };
 void set_shared_vulkan_context(const SharedVulkanContext& context);
 SharedVulkanContext shared_vulkan_context();
+
+// Present unification (#1270): when prosper-app presents on the SAME VkQueue the renderer/compute submit
+// on (present_queue_shared), the renderer's guest thread and the app's present thread would call
+// vkQueueSubmit/vkQueueWaitIdle/vkQueuePresentKHR on one queue concurrently -- undefined without external
+// synchronization. This mutex serializes those host CALLS (not GPU waits, which don't touch the queue).
+// It is a no-op until the app adopts the shared queue and calls set_shared_present_active(true): every
+// renderer/compute submit site takes it only when shared_present_active() is true, so the headless
+// test/screenshot path pays a single relaxed atomic load and no lock. GPU-side render->present ordering
+// is handled by a semaphore, independently of this mutex.
+std::mutex& shared_present_submit_mutex();
+void set_shared_present_active(bool active);
+bool shared_present_active();
+
+// Present unification (#1270): true once prosper-app has adopted the render device and is consuming the
+// renderer's front-buffer image directly (present_blit). While true the renderer publishes the front image
+// via present_blit_publish and SKIPS the CPU readback+reupload of the scanout buffer. Distinct from
+// shared_present_active: GPU present can run on a dedicated present queue (no shared-queue mutex needed).
+// Stays false in every headless/test/screenshot process, so their CPU present path is byte-for-byte
+// unchanged. Set once by prosper-app after a successful adoption; never cleared mid-run.
+void set_gpu_present_active(bool active);
+bool gpu_present_active();
 
 // Ordered memory producers need the same authoritative storage version as live compute. A source
 // may begin inside a target, so the renderer validates the complete requested byte range instead of

@@ -11,6 +11,7 @@
 #include "gpu/shader_resources.hpp"     // ShaderResourceTable / ResourceClass
 #include "gpu/rdna2_to_spirv.hpp"       // recompile_fragment (diagnostic solid-color PS)
 #include "gpu/videoout_present.hpp"     // present_front_index (flip-anchored present selection)
+#include "present_blit.hpp"             // GPU scanout handoff (#1270 unified-device present)
 #include "host/guest_write_watch.hpp"
 #include "render_runner.h"              // offscreen Vulkan backend (render_draws_rgba) + dump_bmp
 
@@ -3008,9 +3009,34 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     return surface.rgba && surface.rgba->size() == expected ? &surface : nullptr;
                 };
                 const int front = prosper::gpu::present_front_index();
-                const RttSurf* scanout = front >= 0
+                // GPU present (#1270): when prosper-app has adopted this device and is consuming the
+                // front-buffer image directly, blit it into a scanout slot on the GPU and SKIP the CPU
+                // readback+reupload entirely. gpu_present_active() is false in every headless/test/
+                // screenshot process, so this whole branch is inert there and the CPU path below is
+                // byte-for-byte unchanged. On a MISS (image not resident/valid this frame) this falls
+                // through to the CPU readback below, which still publishes a CPU frame; prosper-app
+                // presents that CPU frame when no GPU frame was published (main.cpp), so a miss degrades to
+                // the CPU present path rather than freezing the window.
+                bool published_gpu = false;
+                if (front >= 0 && prosper::gpu::gpu_present_active()) {
+                    const uint64_t front_va = prosper_vo_buffer_addr(front);
+                    auto rit = g_rtt.find(front_va);
+                    if (rit != g_rtt.end() && rit->second.gpu_valid && rit->second.w && rit->second.h) {
+                        const VkFormat fmt = prosper::test::backend_color_format(rit->second.format);
+                        prosper::test::PersistentColorTargetImage* tgt =
+                            prosper::test::find_persistent_color_target(
+                                front_va, rit->second.w, rit->second.h, fmt);
+                        if (tgt && tgt->image && tgt->layout != VK_IMAGE_LAYOUT_UNDEFINED) {
+                            static std::atomic<uint64_t> gpu_present_seq{0};
+                            published_gpu = prosper::frontend::present_blit_publish(
+                                tgt->image, tgt->layout, fmt, rit->second.w, rit->second.h,
+                                gpu_present_seq.fetch_add(1) + 1);
+                        }
+                    }
+                }
+                const RttSurf* scanout = (!published_gpu && front >= 0)
                     ? cached_scanout(prosper_vo_buffer_addr(front)) : nullptr;
-                if (!scanout) {
+                if (!published_gpu && !scanout) {
                     for (int i = 0; i < prosper_vo_buffer_count(); ++i)
                         if ((scanout = cached_scanout(prosper_vo_buffer_addr(i)))) break;
                 }
@@ -3025,8 +3051,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 // warned, frame_no — all assume the one serialized present path). It must not be read or
                 // assigned from another thread; a concurrent present would race the object assignment.
                 static std::shared_ptr<const std::vector<uint8_t>> last_scanout_present;
-                if (selected_pixels && !selected_pixels->empty()) last_scanout_present = selected_pixels;
-                else if (last_scanout_present) selected_pixels = last_scanout_present;
+                if (!published_gpu) {
+                    if (selected_pixels && !selected_pixels->empty()) last_scanout_present = selected_pixels;
+                    else if (last_scanout_present) selected_pixels = last_scanout_present;
+                }
                 if (getenv("PROSPER_DUMP_PERSISTENT")) {
                     size_t nb = 0;
                     if (selected_pixels)

@@ -2013,7 +2013,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &command;
         if (trace) std::fprintf(stderr, "[compute]   submitting dispatch\n");
-        if (!vk_ok(vkQueueSubmit(ctx.queue, 1, &submit, fence), "queue-submit")) break;
+        // #1270: when prosper-app presents on this same (shared) queue, serialize the submit CALL against
+        // its present submits. No-op relaxed atomic load until the app adopts the shared queue.
+        VkResult compute_submit_rc;
+        {
+            std::unique_lock<std::mutex> lk(prosper::gpu::shared_present_submit_mutex(), std::defer_lock);
+            if (prosper::gpu::shared_present_active()) lk.lock();
+            compute_submit_rc = vkQueueSubmit(ctx.queue, 1, &submit, fence);
+        }
+        if (!vk_ok(compute_submit_rc, "queue-submit")) break;
         if (trace) std::fprintf(stderr, "[compute]   waiting for dispatch\n");
         if (!vk_ok(vkWaitForFences(ctx.device, 1, &fence, VK_TRUE,
                                    30ull * 1000 * 1000 * 1000), "queue-wait")) {
@@ -2023,6 +2031,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // readback_persistent_color_target uses the same drain but PROMOTES a successful drain
             // to success; this item stays failed either way, which is the conservative choice for a
             // dispatch whose results we can no longer trust.
+            std::unique_lock<std::mutex> qlk(prosper::gpu::shared_present_submit_mutex(), std::defer_lock);
+            if (prosper::gpu::shared_present_active()) qlk.lock();
             if (vkQueueWaitIdle(ctx.queue) != VK_SUCCESS && trace)
                 std::fprintf(stderr, "[compute]   queue drain after fence timeout failed\n");
             break;
