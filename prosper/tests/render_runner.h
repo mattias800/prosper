@@ -2160,6 +2160,14 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         ++color_target_stats.writes;
         color_target_stats.write_hits = load_cached_color ? 1 : 0;
     }
+    if (color_target && color_target->persistent_id && getenv("PROSPER_BACKEND_LOAD_LOG"))
+        fprintf(stderr,
+                "[backend-load] id=0x%llx %ux%u fmt=%d cached=%d valid=%d load_existing=%d "
+                "seed=%d readback=%d -> load=%d\n",
+                (unsigned long long)color_target->persistent_id, W, H, (int)FMT,
+                cached_color != nullptr, cached_color ? (int)cached_color->valid : -1,
+                (int)color_target->load_existing, seed_rgba != nullptr,
+                (int)color_target->readback, (int)load_cached_color);
 
     VkImage img1 = VK_NULL_HANDLE; VkDeviceMemory imem1 = VK_NULL_HANDLE;
     VkImageView view1 = VK_NULL_HANDLE;

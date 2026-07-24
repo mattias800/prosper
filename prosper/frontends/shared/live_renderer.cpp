@@ -246,6 +246,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
     // compute-only use (tests/test_game_compute.cpp) still creates its own device.
     (void)prosper::test::render_vk_ctx();
     static RttCache g_rtt;   // render-to-texture cache (#167)
+    // Shared final-callback ordinal for PROSPER_PASS_LOG (increments where dp_submit does).
+    static std::atomic<uint64_t> g_pass_log_submit{0};
     // Match boot_trace's progression-diagnostic contract: callers may register the graphics
     // renderer while deliberately leaving compute unregistered. This keeps semantic dispatches
     // visible without letting screenshot/prosper-app registration silently undo the A/B.
@@ -924,10 +926,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // pass, storage image) materializes its CPU copy here on demand. The producer
                         // ran in an earlier batch — same-batch CPU consumers force the eager readback
                         // at defer time — so the queue-ordered copy reads current pixels.
-                        if (live_rtt != g_rtt.end() && live_gpu_targets && r.img_dim == 1u &&
+                        if (live_rtt != g_rtt.end() && live_gpu_targets && r.img_dim != 2u &&
                             live_rtt->second.gpu_valid) {
                             RttSurf& surface = live_rtt->second;
-                            const bool direct_serves = !fr.is_storage_image &&
+                            const bool direct_serves = !fr.is_storage_image && r.img_dim == 1u &&
                                 surface.w == tw && surface.h == th &&
                                 r.gpu_addr != draw.color0_base &&
                                 prosper::test::find_persistent_color_target(
@@ -967,6 +969,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // A retained render target was created for color-attachment + sampled usage,
                         // not storage usage. Storage images therefore take the decoded/upload path.
                         const bool has_gpu_live_rtt = !fr.is_storage_image && live_gpu_targets &&
+                            !getenv("PROSPER_RTT_MATERIALIZE_ALL") &&
                             r.img_dim == 1u &&
                             live_rtt != g_rtt.end() && live_rtt->second.gpu_valid &&
                             live_rtt->second.w == tw && live_rtt->second.h == th &&
@@ -1203,6 +1206,29 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     pending_timing.persistent_misses++;
                                 }
                             }
+                        }
+                        // PROSPER_BIND_LOG=<min-cb>: log every sampled-resource binding decision for
+                        // 3 final callbacks (same ordinal as PROSPER_PASS_LOG) — which path serves
+                        // each guest address, so a black consumer input can be attributed.
+                        if (const char* bl = getenv("PROSPER_BIND_LOG")) {
+                            const uint64_t at = g_pass_log_submit.load(std::memory_order_relaxed);
+                            const uint64_t bl_min = std::strtoull(bl, nullptr, 0);
+                            if (at >= bl_min && at < bl_min + 3u)
+                                fprintf(stderr,
+                                        "[bind] cb=%llu addr=0x%llx %ux%u dim=%u fmt=%u path=%s "
+                                        "rtt(w=%u h=%u gpu=%d rgba=%d)\n",
+                                        (unsigned long long)at, (unsigned long long)r.gpu_addr,
+                                        tw, th, r.img_dim, (unsigned)r.format,
+                                        has_gpu_live_rtt          ? "gpu-bind"
+                                        : has_cpu_live_rtt        ? "cpu-rtt"
+                                        : decoded_reuse           ? "decode-cache"
+                                                                  : "decode",
+                                        live_rtt != g_rtt.end() ? live_rtt->second.w : 0,
+                                        live_rtt != g_rtt.end() ? live_rtt->second.h : 0,
+                                        live_rtt != g_rtt.end() ? (int)live_rtt->second.gpu_valid
+                                                                : -1,
+                                        live_rtt != g_rtt.end() ? (int)(bool)live_rtt->second.rgba
+                                                                : -1);
                         }
                         if (has_gpu_live_rtt) {
                             fr.persistent_render_target_id = r.gpu_addr;
@@ -2450,6 +2476,47 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const uint64_t rsrc = pass.front()->color0_base;
                         const uint64_t rdst = pass.front()->color1_base;
                         auto src_it = rsrc ? g_rtt.find(rsrc) : g_rtt.end();
+                        // Deferred RTT readback (#1284): the resolve is a CPU copy of the source's
+                        // pixels, and the source pass usually rendered EARLIER IN THIS BATCH with its
+                        // readback deferred. The consumer scan cannot see a resolve (it consumes via
+                        // cb_resolve, not a sampled resource), so materialize here: flush the pending
+                        // batch first — a mid-batch readback would otherwise return stale pixels —
+                        // then read the persistent image back once.
+                        if (src_it != g_rtt.end() && src_it->second.gpu_valid &&
+                            src_it->second.w && src_it->second.h && rdst) {
+                            RttSurf& src_surface = src_it->second;
+                            const VkFormat src_format =
+                                prosper::test::backend_color_format(src_surface.format);
+                            const uint32_t src_bpp =
+                                prosper::test::backend_color_bytes_per_pixel(src_format);
+                            const size_t src_bytes = static_cast<size_t>(src_surface.w) *
+                                src_surface.h * src_bpp;
+                            if (src_bpp &&
+                                (!src_surface.rgba || src_surface.rgba->size() != src_bytes)) {
+                                const prosper::test::RenderVkCtx& ctx =
+                                    prosper::test::render_vk_ctx();
+                                if (ctx.ok && backend_submission.pending())
+                                    backend_submission.submit_and_wait(ctx.dev, ctx.queue, false);
+                                std::vector<uint8_t> materialized;
+                                std::string error;
+                                if (prosper::test::readback_persistent_color_target(
+                                        rsrc, src_surface.w, src_surface.h, src_format,
+                                        materialized, error) &&
+                                    materialized.size() == src_bytes) {
+                                    src_surface.rgba =
+                                        std::make_shared<const std::vector<uint8_t>>(
+                                            std::move(materialized));
+                                } else {
+                                    static std::atomic<int> warned{0};
+                                    if (warned.fetch_add(1) < 24)
+                                        fprintf(stderr,
+                                                "[rtt] resolve source readback failed: "
+                                                "base=0x%llx extent=%ux%u error=%s\n",
+                                                (unsigned long long)rsrc, src_surface.w,
+                                                src_surface.h, error.c_str());
+                                }
+                            }
+                        }
                         if (rsrc && rdst && src_it != g_rtt.end() && src_it->second.rgba) {
                             // Copy the source RttSurf out before the g_rtt[rdst] insert: operator[] may
                             // rehash and invalidate src_it before the assignment reads it.
@@ -2614,16 +2681,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 for (const auto& resource : table->resources) {
                                     if ((resource.cls != RC::Texture &&
                                          resource.cls != RC::StorageImage) ||
-                                        resource.gpu_addr != base || resource.img_dim != 1u)
+                                        resource.gpu_addr != base || resource.img_dim == 2u)
                                         continue;
                                     const uint32_t rw = resource.width ? resource.width : 4u;
                                     const uint32_t rh = resource.height ? resource.height : 4u;
-                                    if (rw == gw && rh == gh) {
+                                    if (resource.img_dim == 1u && rw == gw && rh == gh) {
                                         sampled_exact_later = true;
                                         feedback_later |= items[later].color0_base == base;
                                     }
                                     const bool direct_bindable =
-                                        resource.cls == RC::Texture && rw == gw && rh == gh &&
+                                        resource.cls == RC::Texture && resource.img_dim == 1u &&
+                                        rw == gw && rh == gh &&
                                         items[later].color0_base != base;
                                     if (later > pass_i && !direct_bindable)
                                         cpu_needed_same_batch = true;
@@ -3003,10 +3071,40 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         if (is_vo)                    px_vo = pass_pixels;     // any registered scanout
                         px_last = pass_pixels;                                  // last non-empty (fallback)
                     }
+                    // PROSPER_PASS_LOG=<min-submit>: per-pass publish provenance for 3 submits —
+                    // which pass produced pixels, its target identity, and the defer decision.
+                    if (const char* pl = getenv("PROSPER_PASS_LOG")) {
+                        const uint64_t at = g_pass_log_submit.load(std::memory_order_relaxed);
+                        const uint64_t pl_min = std::strtoull(pl, nullptr, 0);
+                        size_t nz = 0;
+                        for (size_t p = 0; p + 3 < rendered_pixels.size(); p += 4)
+                            if (rendered_pixels[p] || rendered_pixels[p + 1] ||
+                                rendered_pixels[p + 2]) nz++;
+                        // In-window: every pass. Out of window: only content-bearing (or deferred)
+                        // passes, so the publish source can be found without knowing the callback.
+                        if ((at >= pl_min && at < pl_min + 3u) || nz > 100 || defer_readback)
+                            fprintf(stderr,
+                                    "[pass] cb=%llu pass=%zu/%zu base=0x%llx %ux%u fmt=%d vo=%d "
+                                    "seed=%d defer=%d writes=%llu px_nonblack=%zu\n",
+                                    (unsigned long long)at, pass_i, items.size(),
+                                    (unsigned long long)base, gw, gh, (int)pass_format,
+                                    (int)is_vo, (int)seed_rtt, (int)defer_readback,
+                                    (unsigned long long)color_target_call.writes, nz);
+                    }
                 }
                 // Present priority: the flipped front buffer > any registered scanout target > the
                 // legacy "last group" fallback (unchanged behavior when no group targets a VO buffer).
                 selected_pixels = px_front ? px_front : (px_vo ? px_vo : px_last);
+                {
+                    const uint64_t at = g_pass_log_submit.fetch_add(1);
+                    if (const char* pl = getenv("PROSPER_PASS_LOG")) {
+                        const uint64_t pl_min = std::strtoull(pl, nullptr, 0);
+                        if (at >= pl_min && at < pl_min + 3u)
+                            fprintf(stderr, "[pass] cb=%llu selected=%s\n", (unsigned long long)at,
+                                    px_front ? "px_front"
+                                             : (px_vo ? "px_vo" : (px_last ? "px_last" : "none")));
+                    }
+                }
                 // PROSPER_DUMP_PERSISTENT=<min-submit>: read back and dump EVERY persistent color
                 // target after this submit's passes render. Unlike PROSPER_RTT*/DUMP_*, this flag is
                 // NOT in the live_gpu_targets disable list (:480-487), so it observes the NORMAL
