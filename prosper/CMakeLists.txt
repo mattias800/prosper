@@ -737,7 +737,8 @@ if(TARGET prosper_core)
       target_link_libraries(boot_trace PRIVATE Vulkan::Vulkan)
       target_compile_definitions(boot_trace PRIVATE PROSPER_HAVE_VULKAN=1)
       add_library(prosper_live_renderer STATIC frontends/shared/live_renderer.cpp
-                                               frontends/shared/live_compute.cpp)
+                                               frontends/shared/live_compute.cpp
+                                               frontends/shared/present_blit.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
       target_link_libraries(prosper_live_renderer PUBLIC prosper_core Vulkan::Vulkan)
       target_include_directories(prosper_live_renderer PUBLIC frontends/shared)
@@ -840,7 +841,8 @@ if(TARGET prosper_core)
       # boot_trace so BOTH boot_trace and prosper-app register the SAME renderer instead of
       # duplicating it. Needs render_runner.h (tests/) and refvs.inc (tools/boot_trace/).
       add_library(prosper_live_renderer STATIC frontends/shared/live_renderer.cpp
-                                               frontends/shared/live_compute.cpp)
+                                               frontends/shared/live_compute.cpp
+                                               frontends/shared/present_blit.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
       target_link_libraries(prosper_live_renderer PUBLIC prosper_core Vulkan::Vulkan)
       target_include_directories(prosper_live_renderer PUBLIC frontends/shared)
@@ -1257,4 +1259,11 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
   add_executable(test_shared_vulkan_device tests/test_shared_vulkan_device.cpp)
   target_link_libraries(test_shared_vulkan_device PRIVATE prosper_live_renderer prosper_core)
   add_test(NAME shared_vulkan_device COMMAND test_shared_vulkan_device)
+
+  # GPU scanout handoff (#1270): the front-buffer image blits into a scanout slot byte-exactly, and the
+  # producer/consumer slot handoff never tears or reuses an image in flight. Headless (no surface).
+  add_executable(test_present_blit tests/test_present_blit.cpp)
+  target_include_directories(test_present_blit PRIVATE src tests)
+  target_link_libraries(test_present_blit PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
+  add_test(NAME present_blit COMMAND test_present_blit)
 endif()
