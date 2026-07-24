@@ -108,9 +108,18 @@ int main() {
         CHECK(fs::exists(fs::path(r)), "mixed-case absolute /app0 path resolves to the on-disk file");
     }
 
-    // Case correction must not invent matches: absent names stay the composed exact-case path.
-    CHECK(resolve_guest_path("/app0/Data/Config2.BIN") == base + "/Data/Config2.BIN",
-          "no case-insensitive match leaves the composed path unchanged");
+    // Case correction must not invent matches for the LEAF, but the returned PARENT must reference a
+    // real directory so an O_CREAT lands inside it (#1236). On a case-SENSITIVE host "Data" is
+    // corrected to the on-disk "data"; on a case-INSENSITIVE host resolve returns the composed path
+    // as-is (its parent already "exists"). Either way the parent directory exists and the leaf is
+    // absent — and before #1236 the case-sensitive path returned the uncorrected "Data", whose
+    // directory does NOT exist, so this fails without the fix on a case-sensitive FS.
+    {
+        const std::string r = resolve_guest_path("/app0/Data/Config2.BIN");
+        CHECK(fs::exists(fs::path(r).parent_path()),
+              "absent leaf under a case-corrected parent: parent dir exists (O_CREAT would land in it)");
+        CHECK(!fs::exists(fs::path(r)), "the leaf itself stays absent (still ENOENT on read)");
+    }
 
     fs::remove_all(root, ec);
     std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);

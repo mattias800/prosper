@@ -554,8 +554,10 @@ namespace {
         // "worked" here too on the case-insensitive dev hosts (NTFS / WSL DrvFs / default APFS).
         // On a case-sensitive host filesystem, fall back to the real entry component by component
         // (#1226: ArcRunner requests "Content/Movies/..."; its dump ships "content/movies/...").
-        // resolve_host_path_case returns `h` unchanged when it already exists (one stat) or when
-        // nothing matches, so a genuinely absent file still fails with ENOENT exactly as before.
+        // resolve_host_path_case returns `h` unchanged when it already exists (one stat) or when no
+        // ancestor needed correcting; when the leaf is absent but a parent directory WAS case-
+        // corrected it returns that corrected parent with the original leaf (#1236), so an O_CREAT
+        // lands in the real directory. A read of a genuinely absent leaf still fails ENOENT as before.
         if (!root.empty() && !sub.empty()) {
             std::string fixed = resolve_host_path_case(h);
             if (fixed != h) {

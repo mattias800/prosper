@@ -38,7 +38,16 @@ std::string resolve_host_path_case(const std::string& want) {
         const std::string real = e.path().filename().string();
         if (ieq(real, base)) return (fs::path(dir) / real).string();
     }
-    return want;   // no case-insensitive match either — genuinely absent
+    // No case-insensitive match for the leaf. If an ANCESTOR was case-corrected during the recursion
+    // (dir != the original parent), recombine that corrected parent with the original leaf spelling so
+    // the correction survives — a genuinely absent leaf still does not exist, so a read probe keeps
+    // failing ENOENT, but an O_CREAT under an existing wrong-case directory now lands inside the real
+    // directory (guest makes "/savedata0/Dir", later opens "/savedata0/dir/new" with O_CREAT — PS5's
+    // case-insensitive namespace creates it inside the existing dir; #1236). When nothing was
+    // corrected, return `want` UNCHANGED — byte-for-byte, preserving the caller's exact separators
+    // (fs::path would otherwise rewrite them to the host-native form, e.g. '\' on Windows).
+    if (dir != parent) return (fs::path(dir) / base).string();
+    return want;
 }
 
 } // namespace prosper
