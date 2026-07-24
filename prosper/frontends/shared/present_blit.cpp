@@ -1,5 +1,6 @@
 // present_blit.cpp — see present_blit.hpp (#1270).
 #include "present_blit.hpp"
+#include "present_blit_policy.hpp"
 #include "render_runner.h"            // render_vk_ctx()
 #include "gpu/gpu_execute.hpp"        // shared_present_submit_mutex / shared_present_active
 #include <mutex>
@@ -203,7 +204,17 @@ bool present_blit_publish(VkImage src, VkImageLayout src_layout, VkFormat src_fo
     // acquired -- this is what lets the consumer read it with no cross-thread semaphore, and is strictly
     // cheaper than the GPU->CPU readback + CPU->GPU re-upload it replaces. Does not touch the queue, so it
     // is outside the submit mutex.
-    vkWaitForFences(s.dev, 1, &s.blit_fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
+    const VkResult wait_result =
+        vkWaitForFences(s.dev, 1, &s.blit_fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
+    if (!present_blit_wait_completed(wait_result)) {
+        // The command buffer and destination slot may still be in flight. Fail the GPU-present path
+        // closed for this session so neither can be published or reused; present_blit_reset() retains
+        // the resources until its device-idle barrier and callers fall back to CPU presentation.
+        std::fprintf(stderr, "[present-blit] fence wait failed (%d); disabling GPU present\n",
+                     static_cast<int>(wait_result));
+        s.ok = false;
+        return false;
+    }
 
     sl.frame_seq = frame_seq;
     sl.state = SlotState::Published;
