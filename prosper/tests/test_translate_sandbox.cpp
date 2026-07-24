@@ -65,6 +65,17 @@ int main() {
           "sibling prefix '/savedata00' is not mapped into /savedata0");
     CHECK(savedata0_umount(), "test save directory unmounts");
 
+    // Every separator-only spelling names the jailed title's virtual root. In particular, bare
+    // "/" must not pass through to the real host root while "/app0/.." maps to the vroot (#1323).
+    const std::string virtual_root = resolve_guest_path("/app0/..");
+    CHECK(resolve_guest_path("/") == virtual_root,
+          "bare '/' maps to the same virtual root as '/app0/..'");
+    CHECK(resolve_guest_path("\\") == virtual_root,
+          "bare backslash maps to the virtual root");
+    CHECK(resolve_guest_path("//") == virtual_root,
+          "repeated root separators cannot fall through to the host root");
+    CHECK(virtual_root != "/", "virtual root is not the real host root");
+
     // Benign in-sandbox '..': normalizes to the same host file the OS would have resolved anyway.
     CHECK(resolve_guest_path("/app0/data/../data/config.bin") == base + "/data/config.bin",
           "in-sandbox '..' normalizes to the same host file");
