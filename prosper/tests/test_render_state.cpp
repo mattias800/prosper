@@ -205,6 +205,41 @@ int main() {
         CHECK(!extract_render_state(GpuState{}).has_scissor,
               "completely absent guest scissor state preserves the full-target backend default");
 
+        // #1335: Blue Prince's Day One transition folds one foreign-span entry (0xd, 0x0) into
+        // PA_SC_SCREEN_SCISSOR_BR while the game only ever programs the TL — a PRESENT-but-
+        // degenerate screen pair. Honoring it blanks every draw (right=min(...,0)); hardware keeps
+        // the register's initialized full-screen value because that byte range is never consumed as
+        // a register write. The recovery substitutes the full default; the coherent WINDOW/GENERIC/
+        // VPORT constraints (genuine per-pass closes) must remain fully honored.
+        GpuState degenerate_screen = st;
+        degenerate_screen.cx[P::PA_SC_SCREEN_SCISSOR_TL] = 0x04000000u; // TL=(0,1024) — observed live
+        degenerate_screen.cx[P::PA_SC_SCREEN_SCISSOR_BR] = 0x00000000u; // BR=(0,0) — the stale fold
+        const RenderState recovered = extract_render_state(degenerate_screen);
+        CHECK(recovered.has_scissor && recovered.scissor_left == 12 && recovered.scissor_top == 19 &&
+              recovered.scissor_right == 70 && recovered.scissor_bottom == 75,
+              "degenerate SCREEN pair (BR<=TL, never coherently programmed) recovers to full and "
+              "keeps the window/generic/vport intersection");
+        // Regression-proof the SIGNED half interpretation: a coherent negative-TL pair whose BR
+        // BINDS the combine (50,60 < the 70/75 window/generic/vport bounds) must NOT trigger the
+        // recovery — an unsigned comparison would misread TL=(-4,-3) as huge and substitute full,
+        // which this exact-bound assertion would catch.
+        GpuState negative_tl = st;
+        negative_tl.cx[P::PA_SC_SCREEN_SCISSOR_TL] = 0xFFFDFFFCu;       // (-4,-3)
+        negative_tl.cx[P::PA_SC_SCREEN_SCISSOR_BR] = 0x003C0032u;       // (50,60)
+        const RenderState neg_tl = extract_render_state(negative_tl);
+        CHECK(neg_tl.has_scissor && neg_tl.scissor_left == 12 && neg_tl.scissor_top == 19 &&
+              neg_tl.scissor_right == 50 && neg_tl.scissor_bottom == 60,
+              "coherent negative-TL screen pair stays binding — no recovery misfire");
+
+        GpuState closed_vport = degenerate_screen;
+        closed_vport.cx[P::PA_SC_VPORT_SCISSOR_0_TL] = 0x04000000u;     // tile TL=(0,1024)
+        closed_vport.cx[P::PA_SC_VPORT_SCISSOR_0_BR] = 0x00000000u;     // genuine close: BR=(0,0)
+        const RenderState still_closed = extract_render_state(closed_vport);
+        CHECK(still_closed.has_scissor &&
+              (still_closed.scissor_right <= still_closed.scissor_left ||
+               still_closed.scissor_bottom <= still_closed.scissor_top),
+              "a genuine VPORT close stays closed — the screen recovery must not unmask it");
+
         RenderState empty{}; empty.has_scissor = true;
         empty.scissor_left = 10; empty.scissor_top = 20;
         empty.scissor_right = 5; empty.scissor_bottom = 15;
