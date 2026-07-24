@@ -14,6 +14,8 @@
 // Two Vulkan contexts by design (docs/FRONTEND_APP.md): the core keeps its headless render device;
 // THIS is a separate presentation device, and frames cross as shared immutable CPU pixels.
 #include "gpu/videoout_present.hpp"   // present_acquire_rendered_frame / present_write_frame
+#include "gpu/gpu_execute.hpp"         // shared_vulkan_context / gpu-present activation (#1270)
+#include "present_blit.hpp"           // GPU scanout handoff: acquire/release the renderer's front image
 #include "host/lifecycle.hpp"          // prosper_request_stop / prosper_stop_requested
 #include "host/boot_program.hpp"       // boot_program (shared guest-boot path, also used by boot_trace)
 #include "host/exec_image.hpp"         // run_entry
@@ -57,6 +59,7 @@
 #include <cmath>
 #include <chrono>
 #include <thread>
+#include <mutex>
 
 using namespace prosper;
 
@@ -101,6 +104,12 @@ struct Vk {
     VkCommandBuffer cmd     = VK_NULL_HANDLE;
     VkSemaphore     acquireSem = VK_NULL_HANDLE, presentSem = VK_NULL_HANDLE;
     VkFence         inFlight   = VK_NULL_HANDLE;
+
+    // Present unification (#1270): set when the app adopted the renderer's shared device and presents by
+    // GPU-blitting its front-buffer image (no CPU round-trip). queue_shared means the present queue aliases
+    // the render queue, so present submits serialize through gpu::shared_present_submit_mutex().
+    bool            gpu_present = false;
+    bool            queue_shared = false;
 };
 
 uint32_t find_mem(VkPhysicalDevice p, uint32_t typeBits, VkMemoryPropertyFlags props) {
@@ -338,6 +347,108 @@ prosper::frontend::PresentAttempt present_frame(Vk& vk, const uint8_t* rgba, uin
     pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &vk.presentSem;
     pi.swapchainCount = 1; pi.pSwapchains = &vk.swapchain; pi.pImageIndices = &imgIndex;
     VkResult pr = vkQueuePresentKHR(vk.queue, &pi);
+    return prosper::frontend::classify_present(pr);
+}
+
+// Present unification (#1270): try to present on the RENDERER's Vulkan device instead of a private one,
+// so the app can GPU-blit the renderer's front-buffer image straight to the swapchain (no 4K CPU
+// round-trip). Returns false at any unmet precondition, leaving the caller to create its own device (the
+// unchanged CPU path). Called only when PROSPER_APP_GPU_PRESENT is set and a game is booting.
+bool try_adopt_shared_present(Vk& vk, SDL_Window* win) {
+    const gpu::SharedVulkanContext ctx = gpu::shared_vulkan_context();
+    if (!ctx.valid() || !ctx.present_capable || !ctx.present_queue) {
+        fprintf(stderr, "[app] GPU present: shared device is not present-capable; using own device\n");
+        return false;
+    }
+    VkInstance inst = (VkInstance)ctx.instance;
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    if (!SDL_Vulkan_CreateSurface(win, inst, nullptr, &surface)) {
+        // The shared instance was created before SDL_Init and enabled every AVAILABLE platform surface
+        // extension blind; if SDL needs one we did not get, fall back to a private device.
+        fprintf(stderr, "[app] GPU present: surface on shared instance failed (%s); using own device\n",
+                SDL_GetError());
+        return false;
+    }
+    VkPhysicalDevice phys = (VkPhysicalDevice)ctx.physical;
+    VkBool32 present = VK_FALSE;
+    vkGetPhysicalDeviceSurfaceSupportKHR(phys, ctx.queue_family, surface, &present);
+    if (!present) {
+        fprintf(stderr, "[app] GPU present: shared queue family cannot present here; using own device\n");
+        vkDestroySurfaceKHR(inst, surface, nullptr);
+        return false;
+    }
+    vk.instance = inst; vk.surface = surface; vk.phys = phys;
+    vk.device = (VkDevice)ctx.device; vk.qfamily = ctx.queue_family;
+    vk.queue = (VkQueue)ctx.present_queue;
+    vk.gpu_present = true;
+    vk.queue_shared = ctx.present_queue_shared;
+    // The renderer must now publish the front-buffer image (and skip the CPU readback); if the present
+    // queue aliases the render queue, both threads must serialize their submits.
+    gpu::set_gpu_present_active(true);
+    if (ctx.present_queue_shared) gpu::set_shared_present_active(true);
+    fprintf(stderr, "[app] GPU present: adopted the renderer's device (%s present queue)\n",
+            ctx.present_queue_shared ? "shared" : "dedicated");
+    return true;
+}
+
+// Present one GPU scanout frame (the renderer's front-buffer image, already in TRANSFER_SRC_OPTIMAL) by
+// blitting it straight to the swapchain -- no CPU pixels. `prevSlot` is the slot presented last frame; its
+// GPU read is complete once inFlight signals below, so it is released then. Updates prevSlot to the slot
+// now in flight and returns the acquire/present outcome.
+prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::frontend::GpuScanoutFrame& gf,
+                                                    int& prevSlot) {
+    vkWaitForFences(vk.device, 1, &vk.inFlight, VK_TRUE, UINT64_MAX);   // previous present's read complete
+    if (prevSlot >= 0) { prosper::frontend::present_blit_release(prevSlot); prevSlot = -1; }
+
+    uint32_t imgIndex = 0;
+    constexpr uint64_t kAcquireTimeoutNs = 100ull * 1000 * 1000;
+    VkResult acq = vkAcquireNextImageKHR(vk.device, vk.swapchain, kAcquireTimeoutNs, vk.acquireSem,
+                                         VK_NULL_HANDLE, &imgIndex);
+    switch (prosper::frontend::classify_acquire(acq)) {
+    case prosper::frontend::AcquireAction::skip:
+        prosper::frontend::present_blit_release(gf.slot); return prosper::frontend::PresentAttempt::skipped;
+    case prosper::frontend::AcquireAction::recreate:
+        prosper::frontend::present_blit_release(gf.slot); return prosper::frontend::PresentAttempt::out_of_date;
+    case prosper::frontend::AcquireAction::proceed: break;
+    }
+    vkResetFences(vk.device, 1, &vk.inFlight);
+    vkResetCommandBuffer(vk.cmd, 0);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(vk.cmd, &bi);
+    // gf.image is already TRANSFER_SRC_OPTIMAL (left there by present_blit); swapchain image
+    // UNDEFINED -> TRANSFER_DST -> (scaled blit) -> PRESENT_SRC.
+    barrier(vk.cmd, vk.scImages[imgIndex], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkImageBlit blit{};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[1] = {(int32_t)gf.width, (int32_t)gf.height, 1};
+    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.dstOffsets[1] = {(int32_t)vk.scExtent.width, (int32_t)vk.scExtent.height, 1};
+    vkCmdBlitImage(vk.cmd, gf.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   vk.scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    barrier(vk.cmd, vk.scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    vkEndCommandBuffer(vk.cmd);
+
+    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo su{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    su.waitSemaphoreCount = 1; su.pWaitSemaphores = &vk.acquireSem; su.pWaitDstStageMask = &waitStage;
+    su.commandBufferCount = 1; su.pCommandBuffers = &vk.cmd;
+    su.signalSemaphoreCount = 1; su.pSignalSemaphores = &vk.presentSem;
+    VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &vk.presentSem;
+    pi.swapchainCount = 1; pi.pSwapchains = &vk.swapchain; pi.pImageIndices = &imgIndex;
+    VkResult pr;
+    {
+        // Serialize the present submit + present CALL against the renderer's submits on a shared queue.
+        std::unique_lock<std::mutex> lk(gpu::shared_present_submit_mutex(), std::defer_lock);
+        if (vk.queue_shared) lk.lock();
+        vkQueueSubmit(vk.queue, 1, &su, vk.inFlight);
+        pr = vkQueuePresentKHR(vk.queue, &pi);
+    }
+    prevSlot = gf.slot;
     return prosper::frontend::classify_present(pr);
 }
 
@@ -606,7 +717,13 @@ int main(int argc, char** argv) {
     if (!win) { fprintf(stderr, "[app] SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
 
     Vk vk;
-    if (!create_instance(vk, win) || !pick_device(vk)) return 1;
+    // Present unification (#1270, opt-in): prefer presenting on the renderer's shared device so we can
+    // GPU-blit its front-buffer image. Only for a real boot (the renderer produces front buffers); the
+    // test pattern and any adoption failure fall back to a private device + CPU pixels (unchanged path).
+    const bool wantGpuPresent = getenv("PROSPER_APP_GPU_PRESENT") != nullptr && !testPattern && !dump.empty();
+    if (!wantGpuPresent || !try_adopt_shared_present(vk, win)) {
+        if (!create_instance(vk, win) || !pick_device(vk)) return 1;
+    }
     // Initial swapchain sized to the window; recreated on resize / out-of-date.
     { int dw = 0, dh = 0; SDL_GetWindowSizeInPixels(win, &dw, &dh);
       if (!create_swapchain(vk, (uint32_t)dw, (uint32_t)dh, requestedPresentMode)) return 1; }
@@ -648,6 +765,7 @@ int main(int argc, char** argv) {
     auto lastFrameProgress = loopStarted;
     auto nextTimedDump = loopStarted + std::chrono::milliseconds(timedDumpMs);
     uint64_t shown = 0, lastFrameSeq = ~0ull, patFrame = 0;
+    int gpuPrevSlot = -1;   // #1270: the GPU scanout slot presented last frame (released after its read)
     unsigned timedDumpCount = 0;
     bool timedDumpPending = timedDumpMs > 0;
     bool running = true;
@@ -740,7 +858,17 @@ int main(int argc, char** argv) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 continue;   // minimized or between fullscreen modes; retry after the next event
             }
-            vkDeviceWaitIdle(vk.device);
+            {
+                // #1270: on a shared present queue, hold the submit mutex across the device drain so no
+                // guest submit races vkDeviceWaitIdle (which waits on all queues). Only the wait needs it;
+                // the swapchain destroy/create below do not touch the render queue.
+                std::unique_lock<std::mutex> lk(gpu::shared_present_submit_mutex(), std::defer_lock);
+                if (vk.gpu_present && vk.queue_shared) lk.lock();
+                vkDeviceWaitIdle(vk.device);
+            }
+            if (vk.gpu_present && gpuPrevSlot >= 0) {
+                prosper::frontend::present_blit_release(gpuPrevSlot); gpuPrevSlot = -1;
+            }
             if (vk.swapchain) vkDestroySwapchainKHR(vk.device, vk.swapchain, nullptr);
             vk.swapchain = VK_NULL_HANDLE;
             if (!create_swapchain(vk, static_cast<uint32_t>(dw), static_cast<uint32_t>(dh),
@@ -777,6 +905,31 @@ int main(int argc, char** argv) {
         // Render completion and guest flips are separate clocks: the command stream can flip before
         // the renderer publishes its CPU frame. Key this loop to the completed-frame sequence so a
         // late renderer publication is not missed or marked handled while only the previous frame exists.
+        if (vk.gpu_present) {
+            // GPU present (#1270): blit the renderer's front-buffer image straight to the swapchain.
+            prosper::frontend::GpuScanoutFrame gf;
+            if (prosper::frontend::present_blit_acquire(gf)) {
+                PresentAttempt attempt = present_frame_gpu(vk, gf, gpuPrevSlot);
+                if (attempt == PresentAttempt::out_of_date) {
+                    swapchainDirty = true;
+                } else if (attempt == PresentAttempt::skipped) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                } else {
+                    shown++; lastFrameProgress = std::chrono::steady_clock::now();
+                    static auto t0 = std::chrono::steady_clock::now(); static uint64_t mark = 0;
+                    if (shown - mark >= 60) {
+                        auto now = std::chrono::steady_clock::now();
+                        double s = std::chrono::duration<double>(now - t0).count();
+                        fprintf(stderr, "[app] %.1f fps (%llu frames, gpu-present)\n",
+                                (shown - mark) / (s > 0 ? s : 1), (unsigned long long)shown);
+                        t0 = now; mark = shown;
+                    }
+                    if (exitAfter && (int)shown >= exitAfter) running = false;
+                }
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));   // no new GPU frame yet
+            }
+        } else {
         bool newFrame = testPattern || (gpu::present_frame_seq() != lastFrameSeq);
         gpu::PresentFrameLease frame;
         if (newFrame && gpu::present_acquire_rendered_frame(frame)) {
@@ -829,6 +982,7 @@ int main(int argc, char** argv) {
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));   // no new frame — don't spin
         }
+        }   // end CPU-present branch (#1270)
         if (stallDumpMs > 0 &&
             std::chrono::steady_clock::now() - lastFrameProgress >=
                 std::chrono::milliseconds(stallDumpMs)) {
