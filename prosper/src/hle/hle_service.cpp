@@ -1146,6 +1146,20 @@ void ime_autokey_tick(uint64_t handler, uint64_t guest_fs) {
         ime_deliver(handler, {hid, false}, guest_fs);
     }
 }
+
+// Shared sceImeUpdate body: fire the autokey pulse (if enabled) then drain the queued keys, dispatching
+// each on the caller's guest %fs (guest_fs == 0 => no swap, the Windows/macOS path). The queue mutex is
+// released before every guest handler call (never held across guest code).
+void ime_update_run(uint64_t handler, uint64_t guest_fs) {
+    ime_autokey_tick(handler, guest_fs);        // handler = the guest event handler
+    for (;;) {
+        ImeKeyEvent ev;
+        { std::lock_guard<std::mutex> lk(g_ime_mx);
+          if (g_ime_queue.empty()) break;
+          ev = g_ime_queue.front(); g_ime_queue.pop_front(); }
+        ime_deliver(handler, ev, guest_fs);
+    }
+}
 } // namespace
 
 // Frontend seam (declared in ime_input.hpp): push a keyboard key (USB HID usage id) into the IME
@@ -1158,25 +1172,28 @@ void ime_push_key(uint16_t hid_usage, bool down) {
 
 HLE(s_ime_kbd_open) { svc_log("sceImeKeyboardOpen", a0,a1,a2,a3,a4,a5); return 0; }  // handler comes via sceImeUpdate
 // sceImeUpdate invokes the guest event handler (guest code), so it must restore the caller's guest %fs
-// around each dispatch (see ime_deliver / #1286). Use the entry-stack trampoline (as AvPlayer callbacks
-// do) to recover that guest %fs from the import-stub frame; it returns 0 on Windows/macOS (no hardware
-// %fs swap), leaving those paths unchanged.
+// around each dispatch (see ime_deliver / #1286). On Linux/macOS the import stub swapped this thread to
+// host %fs, so recover the caller's guest %fs from the import-stub frame via the entry-stack trampoline
+// (as the AvPlayer callbacks do) and hand it to ime_update_run. PROSPER_ASM_TRAMPOLINE is POSIX-only, so
+// Windows/MinGW (which never swaps hardware %fs at the import boundary) registers a plain handler that
+// dispatches directly with guest_fs == 0. callback_guest_fs_from_entry_stack also returns 0 for any
+// non-guest frame, so the plain-tail-jump macOS path is likewise an unchanged direct call.
+#ifndef _WIN32
 extern "C" uint64_t s_ime_update_c(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                    uint64_t a4, uint64_t a5, uint64_t entry_rsp) {
     svc_log("sceImeUpdate", a0,a1,a2,a3,a4,a5);
-    const uint64_t guest_fs = prosper::callback_guest_fs_from_entry_stack(entry_rsp);
-    ime_autokey_tick(a0, guest_fs);             // a0 = the guest event handler
-    for (;;) {
-        ImeKeyEvent ev;
-        { std::lock_guard<std::mutex> lk(g_ime_mx);
-          if (g_ime_queue.empty()) break;
-          ev = g_ime_queue.front(); g_ime_queue.pop_front(); }
-        ime_deliver(a0, ev, guest_fs);
-    }
+    ime_update_run(a0, prosper::callback_guest_fs_from_entry_stack(entry_rsp));
     return 0;
 }
 PROSPER_ASM_TRAMPOLINE(s_ime_update_entry, s_ime_update_c)
 extern "C" void s_ime_update_entry();
+#else
+HLE(s_ime_update) {   // Windows/MinGW: no import-boundary %fs swap -> dispatch directly (guest_fs = 0)
+    svc_log("sceImeUpdate", a0,a1,a2,a3,a4,a5);
+    ime_update_run(a0, 0);
+    return 0;
+}
+#endif
 // sceImeKeyboardGetResourceId(userId, OrbisImeKeyboardResourceIdArray* out): report the user's keyboard
 // resource ids. Headless -> none (all-zero). A registered PlatformUi (a windowed frontend with a host
 // keyboard) reports its own ids, so a title enables keyboard input (#347).
@@ -2369,7 +2386,11 @@ void register_service_hle() {
     R("sceSystemServiceHideSplashScreen", s_ok);
     // libSceIme keyboard API (#186): no physical keyboard -> consistent "none connected" state. Raw NIDs.
     Hle::register_fn("eaFXjfJv3xs", (HleFn)s_ime_kbd_open,  "sceImeKeyboardOpen");
-    Hle::register_fn("-4GCfYdNF1s", (HleFn)s_ime_update_entry, "sceImeUpdate");
+#ifdef _WIN32
+    Hle::register_fn("-4GCfYdNF1s", (HleFn)s_ime_update, "sceImeUpdate");         // plain handler (guest_fs=0)
+#else
+    Hle::register_fn("-4GCfYdNF1s", (HleFn)s_ime_update_entry, "sceImeUpdate");   // entry-rsp trampoline (#1286)
+#endif
     Hle::register_fn("VkqLPArfFdc", (HleFn)s_ime_kbd_info,  "sceImeKeyboardGetInfo");
     Hle::register_fn("dKadqZFgKKQ", (HleFn)s_ime_kbd_resid, "sceImeKeyboardGetResourceId");
     // libSceAvPlayer (#324): let a post-credits / intro video complete so the game reaches its scene.

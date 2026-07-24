@@ -99,11 +99,14 @@ int main() {
 
     uint64_t handler = (uint64_t)(uintptr_t)&test_ime_handler;
     ime_update(handler, 0, 0, 0, 0, 0);
+    // Immediately after the import call returns (still before any libc), the import boundary must have
+    // restored the CALLER's guest %fs: the stub swapped guest->host on entry and back on exit. Reading
+    // it here proves the whole swap is balanced, not merely that we can force host %fs afterward.
+    uint64_t fs_at_return = 0;
+    __asm__ volatile("rdfsbase %0" : "=r"(fs_at_return));
 
     // Back to the host TCB so the CHECKs (libc printf) run correctly.
     guest_fs_enter_host_for_signal();
-    uint64_t fs_after = 0;
-    __asm__ volatile("rdfsbase %0" : "=r"(fs_after));
 
     CHECK(guest_fs != 0, "activated a guest %fs base for the call");
     CHECK(guest_fs != host_fs, "guest %fs base differs from the host %fs base");
@@ -116,7 +119,8 @@ int main() {
           "guest key handler ran on the caller's GUEST %fs (not host %fs)");
     CHECK(g_ime_observed_fs != host_fs,
           "guest key handler did NOT run on the host %fs (the #1286 crash condition)");
-    CHECK(fs_after == host_fs, "%fs restored to the host TCB after sceImeUpdate returned");
+    CHECK(fs_at_return == guest_fs,
+          "import boundary left %fs on the caller's guest TCB after sceImeUpdate returned (swap balanced)");
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n");
