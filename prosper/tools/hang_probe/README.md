@@ -23,8 +23,9 @@ For each run it launches the title headless via `boot_trace` (with the gated `PR
 Plain `gdb` **cannot** unwind the guest main thread through prosper's HLE stub boundary (its backtrace
 is all `??? `), so `guest_bt` (which re-sections the flattened module ELFs) is required.
 
-Exit status is `1` if any run was BLOCKED, `0` otherwise — so it doubles as a bisect/gate predicate
-(e.g. "does commit X still hang evergate at boot?").
+Exit status is `1` if any run was BLOCKED, `2` if any run was UNKNOWN/DEAD and no hang was observed,
+and `0` only when every run was classified RUNNING. This makes debugger/attach failures inconclusive
+instead of false-green while preserving the hang/no-hang bisect predicate.
 
 ## Requirements
 

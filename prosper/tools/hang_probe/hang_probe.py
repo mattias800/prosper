@@ -38,6 +38,29 @@ def classify(gbt_text: str):
     return "UNKNOWN", ""
 
 
+def run_guest_bt(cmd, timeout):
+    """Return (state, evidence, stdout), preserving debugger/tool failures as UNKNOWN evidence."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "UNKNOWN", "(guest_bt timed out)", ""
+    if result.returncode != 0:
+        detail = next((line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()), "")
+        suffix = f": {detail}" if detail else ""
+        return "UNKNOWN", f"(guest_bt failed, exit {result.returncode}{suffix})", result.stdout
+    state, frame = classify(result.stdout)
+    return state, frame, result.stdout
+
+
+def result_exit_code(counts):
+    """1 means a reproduced hang; 2 means the experiment was inconclusive; 0 is a clean result."""
+    if counts["BLOCKED"]:
+        return 1
+    if counts["UNKNOWN"] or counts["DEAD"]:
+        return 2
+    return 0
+
+
 def one_run(args, i):
     save = tempfile.mkdtemp(prefix=f"hangprobe_save{i}_")
     log = tempfile.NamedTemporaryFile(prefix=f"hangprobe_run{i}_", suffix=".log", delete=False).name
@@ -61,11 +84,7 @@ def one_run(args, i):
                "--initlog", log, "--thread", str(args.thread)]
         if args.dump:
             cmd += ["--dump", args.dump]
-        try:
-            out = subprocess.run(cmd, capture_output=True, text=True, timeout=args.gbt_timeout).stdout
-        except subprocess.TimeoutExpired:
-            return "UNKNOWN", "(guest_bt timed out)", log
-        state, frame = classify(out)
+        state, frame, out = run_guest_bt(cmd, args.gbt_timeout)
         if state == "BLOCKED" and args.show_stack:
             sys.stdout.write("    --- Thread 1 stack ---\n")
             for l in out.splitlines():
@@ -122,8 +141,9 @@ def main():
     print(f"== BLOCKED={counts['BLOCKED']} RUNNING={counts['RUNNING']} "
           f"DEAD={counts['DEAD']} UNKNOWN={counts['UNKNOWN']} (of {args.runs}) "
           f"=> hang rate ~{rate:.0f}% of classified ==")
-    # exit 1 if any hang was observed, so it's usable as a gate/bisect predicate
-    sys.exit(1 if counts["BLOCKED"] else 0)
+    # A gate must not report a clean result when no usable backtrace was obtained. Keep reproduced
+    # hangs as exit 1 for bisect predicates and use exit 2 for inconclusive/tool-failure runs.
+    sys.exit(result_exit_code(counts))
 
 
 if __name__ == "__main__":
