@@ -44,6 +44,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // --inspect-only surface raw-vs-realized offline and flag a decode/realization divergence (e.g. GTA
 // #1163's non-indexed vertex-count inflation) without a live boot. Older captures read fine (the fields
 // default to 0/false = "unknown").
+// v24 (#1240): a trailing per-draw/per-failure CB_COLOR_CONTROL.MODE=3 resolve flag, so offline
+// replays run the resolve copy the live renderer performs (pre-v24 captures default to false and
+// silently skip it — a Blue Prince replay presented black while live showed content).
 constexpr uint32_t kVersion = 24;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;

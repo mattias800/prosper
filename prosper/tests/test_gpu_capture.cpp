@@ -796,6 +796,9 @@ int main() {
 
     const auto failed_path = std::filesystem::temp_directory_path() /
         "prosper_gpu_capture_failed_diagnostic_test.prgcap";
+    // #1240 (v24): a TRUE resolve flag on a failure pipeline must survive the present-only
+    // trailing payload (the realized-draw fixture covers the draw column).
+    failed_capture.failure_diagnostics[0].pipeline.cb_resolve = true;
     CHECK(write_gpu_capture(failed_path.string(), failed_capture, error),
           "failed-operation diagnostic capture writes");
     GpuCaptureFile failed_loaded;
@@ -806,7 +809,8 @@ int main() {
           failed_loaded.failure_diagnostics[0].pipeline.scissor_left == 9 &&
           failed_loaded.failure_diagnostics[0].pipeline.logic_op_enable &&
           failed_loaded.failure_diagnostics[0].pipeline.logic_op == 6 &&
-          failed_loaded.failure_diagnostics[0].stages[1].coverage.first_bad_pc == 1,
+          failed_loaded.failure_diagnostics[0].stages[1].coverage.first_bad_pc == 1 &&
+          failed_loaded.failure_diagnostics[0].pipeline.cb_resolve,
           "failed stage state, coverage, and raw shader versions round-trip offline");
 
     GpuCaptureFile stale_raw = failed_capture;
