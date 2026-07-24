@@ -9,6 +9,10 @@
 #include "../src/hle/ime_input.hpp"
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <vector>
 
 using namespace prosper;
@@ -27,6 +31,15 @@ static void fake_handler(uint64_t /*arg*/, void* ev) {
 
 int main() {
     printf("== test_ime_input ==\n");
+    const std::filesystem::path script_path =
+        std::filesystem::temp_directory_path() / "prosper_test_ime_input.route";
+    { std::ofstream route(script_path); route << "# headless keyboard route\nf5-6:0x2c\n"; }
+    const std::string script_source = "@" + script_path.string();
+#ifdef _WIN32
+    _putenv_s("PROSPER_IME_SCRIPT", script_source.c_str());
+#else
+    setenv("PROSPER_IME_SCRIPT", script_source.c_str(), 1);
+#endif
     register_builtin_hle();
     auto update = reinterpret_cast<uint64_t (*)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t)>(
         Hle::lookup(nid_hash("sceImeUpdate")));
@@ -66,6 +79,23 @@ int main() {
     update(0, 0, 0, 0, 0, 0, 0);
     CHECK(true, "null handler tolerated");
 
+    // PROSPER_IME_SCRIPT is anchored to non-null sceImeUpdate calls (the null pump above does not
+    // consume a frame). The f5-6 range emits one down transition, remains held, then emits one up.
+    g_rec.clear();
+    update(H, 0, 0, 0, 0, 0, 0); // f4
+    CHECK(g_rec.empty(), "IME script stays idle before its frame window");
+    update(H, 0, 0, 0, 0, 0, 0); // f5
+    CHECK(g_rec.size() == 1 && g_rec[0].id == 0x101 && g_rec[0].keycode == 0x2c,
+          "IME script emits key down at the range start");
+    g_rec.clear();
+    update(H, 0, 0, 0, 0, 0, 0); // f6
+    CHECK(g_rec.empty(), "IME script holds a key without repeating it inside the range");
+    update(H, 0, 0, 0, 0, 0, 0); // f7
+    CHECK(g_rec.size() == 1 && g_rec[0].id == 0x102 && g_rec[0].keycode == 0x2c,
+          "IME script emits key up after the range ends");
+
+    std::error_code remove_error;
+    std::filesystem::remove(script_path, remove_error);
     printf("fails=%d\n", fails);
     return fails ? 1 : 0;
 }

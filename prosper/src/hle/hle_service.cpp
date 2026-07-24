@@ -1147,11 +1147,115 @@ void ime_autokey_tick(uint64_t handler, uint64_t guest_fs) {
     }
 }
 
+// PROSPER_IME_SCRIPT: deterministic headless keyboard input, anchored to the first sceImeUpdate
+// call carrying a non-null handler. Entries are `fN:HID` or `fA-B:HID`, separated by semicolons or
+// newlines; HID accepts decimal or 0x-prefixed USB usage ids. A point entry is held for two update
+// ticks. Prefix the value with '@' to load the same text from a route file. Unlike AUTOKEY this is a
+// finite route: transitions are emitted only when a key enters/leaves an active window.
+struct ImeScriptEntry { uint64_t first = 0, last = 0; uint16_t hid = 0; };
+
+std::string ime_script_text(const char* source, std::string& error) {
+    if (!source || !*source) return {};
+    if (*source != '@') return source;
+    FILE* f = fopen(source + 1, "rb");
+    if (!f) { error = std::string("cannot open route file: ") + (source + 1); return {}; }
+    std::string text;
+    char buf[4096];
+    while (size_t n = fread(buf, 1, sizeof buf, f)) text.append(buf, n);
+    if (ferror(f)) error = std::string("cannot read route file: ") + (source + 1);
+    fclose(f);
+    return text;
+}
+
+std::vector<ImeScriptEntry> parse_ime_script(const std::string& text, std::string& error) {
+    std::vector<ImeScriptEntry> out;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t end = text.find_first_of(";\n\r", pos);
+        if (end == std::string::npos) end = text.size();
+        std::string item = text.substr(pos, end - pos);
+        pos = end + 1;
+        if (size_t hash = item.find('#'); hash != std::string::npos) item.resize(hash);
+        size_t first_nonspace = item.find_first_not_of(" \t");
+        if (first_nonspace == std::string::npos) continue;
+        size_t last_nonspace = item.find_last_not_of(" \t");
+        item = item.substr(first_nonspace, last_nonspace - first_nonspace + 1);
+        if (item.empty()) continue;
+        if (item[0] != 'f') { error = "entry must start with f: " + item; return {}; }
+        const char* p = item.c_str() + 1;
+        char* tail = nullptr;
+        unsigned long long first = strtoull(p, &tail, 0);
+        if (tail == p) { error = "invalid frame anchor: " + item; return {}; }
+        unsigned long long last = first == UINT64_MAX ? first : first + 1;
+        // Point entries hold down for two update ticks (or one at the representational maximum).
+        if (*tail == '-') {
+            p = tail + 1;
+            last = strtoull(p, &tail, 0);
+            if (tail == p || last < first) { error = "invalid frame range: " + item; return {}; }
+        }
+        if (*tail != ':') { error = "missing HID separator: " + item; return {}; }
+        p = tail + 1;
+        unsigned long hid = strtoul(p, &tail, 0);
+        while (*tail == ' ' || *tail == '\t') ++tail;
+        if (tail == p || *tail || hid == 0 || hid > UINT16_MAX) {
+            error = "invalid HID usage: " + item; return {};
+        }
+        out.push_back({(uint64_t)first, (uint64_t)last, (uint16_t)hid});
+    }
+    return out;
+}
+
+class ImeScriptRuntime {
+public:
+    ImeScriptRuntime() {
+        const char* source = getenv("PROSPER_IME_SCRIPT");
+        if (!source || !*source) return;
+        std::string error;
+        const std::string text = ime_script_text(source, error);
+        if (error.empty()) entries_ = parse_ime_script(text, error);
+        if (!error.empty()) fprintf(stderr, "[ime] PROSPER_IME_SCRIPT: %s\n", error.c_str());
+    }
+
+    void tick(uint64_t handler, uint64_t guest_fs) {
+        if (!handler || entries_.empty()) return;
+        std::vector<ImeKeyEvent> transitions;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            std::vector<uint16_t> next;
+            for (const auto& e : entries_)
+                if (tick_ >= e.first && tick_ <= e.last &&
+                    std::find(next.begin(), next.end(), e.hid) == next.end()) next.push_back(e.hid);
+            for (uint16_t hid : active_)
+                if (std::find(next.begin(), next.end(), hid) == next.end())
+                    transitions.push_back({hid, false});
+            for (uint16_t hid : next)
+                if (std::find(active_.begin(), active_.end(), hid) == active_.end())
+                    transitions.push_back({hid, true});
+            active_ = std::move(next);
+            ++tick_;
+        }
+        // Never retain the runtime mutex across a call into guest code.
+        for (const auto& ev : transitions) ime_deliver(handler, ev, guest_fs);
+    }
+
+private:
+    std::vector<ImeScriptEntry> entries_;
+    std::vector<uint16_t> active_;
+    uint64_t tick_ = 0;
+    std::mutex mutex_;
+};
+
+void ime_script_tick(uint64_t handler, uint64_t guest_fs) {
+    static ImeScriptRuntime runtime;
+    runtime.tick(handler, guest_fs);
+}
+
 // Shared sceImeUpdate body: fire the autokey pulse (if enabled) then drain the queued keys, dispatching
 // each on the caller's guest %fs (guest_fs == 0 => no swap, the Windows/macOS path). The queue mutex is
 // released before every guest handler call (never held across guest code).
 void ime_update_run(uint64_t handler, uint64_t guest_fs) {
     ime_autokey_tick(handler, guest_fs);        // handler = the guest event handler
+    ime_script_tick(handler, guest_fs);
     for (;;) {
         ImeKeyEvent ev;
         { std::lock_guard<std::mutex> lk(g_ime_mx);

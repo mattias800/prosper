@@ -63,6 +63,23 @@ We already have the seed: **`PROSPER_PAD_SCRIPT` (#202)** — a scripted `PadBac
 The remaining work is deeper route calibration and semantic checkpoint validation that does not
 depend on presentation speed.
 
+## IME-keyboard scripts
+
+Titles that consume keyboard input through `sceImeUpdate` instead of `scePadRead` can use
+`PROSPER_IME_SCRIPT`. Its entries are `fN:HID` or inclusive `fA-B:HID` windows, where HID is a
+decimal or `0x`-prefixed USB usage id (`0x28` Enter, `0x2c` Space). The frame axis counts non-null
+`sceImeUpdate` handler pumps from zero; in the observed IME titles this is one pump per game frame.
+A point holds for two pumps. Semicolon-separated inline routes and newline-separated `@file` routes
+with `#` comments are accepted:
+
+```bash
+PROSPER_IME_SCRIPT='f30:0x28;f120-124:0x2c' boot_trace <app0>
+PROSPER_IME_SCRIPT=@scripts/title/reach-menu.ime screenshot <app0>
+```
+
+The route emits one KEY_DOWN at the start of a window and one KEY_UP after it, without repeating the
+key while held. It is separate from `PROSPER_PAD_SCRIPT` because an IME-only title never polls the pad.
+
 ## Design
 
 ### 1. Frame/pad-read-anchored, file-loadable scripts (core) - implemented
