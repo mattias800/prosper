@@ -229,8 +229,11 @@ int main() {
     using prosper::gpu::interactive_capture_bundle_active;
     using prosper::gpu::request_interactive_capture_bundle;
     using prosper::gpu::record_gpu_timeline_present;
-#ifndef _WIN32
-    setenv("PROSPER_CAPTURE_FRAMES", "1", 1);   // 1-frame window so start+end is a two-present sequence
+    // 1-frame window so start+end is a simple two-present sequence (cross-platform env set).
+#ifdef _WIN32
+    _putenv_s("PROSPER_CAPTURE_FRAMES", "1");
+#else
+    setenv("PROSPER_CAPTURE_FRAMES", "1", 1);
 #endif
     CHECK(!interactive_capture_bundle_active(), "frame-bundle grab is inert by default");
     record_gpu_timeline_present(1, 0, 0, 1920, 1080);
