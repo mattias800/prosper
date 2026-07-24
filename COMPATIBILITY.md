@@ -62,7 +62,7 @@ See the exact route, current state, and regression workflow in
 ## Blasphemous 2 — `PPSA13579`
 
 <p align="center">
-  <img src="assets/screenshots/blasphemous2-title.png" width="380" alt="Blasphemous 2 — opening cinematic">
+  <img src="assets/screenshots/blasphemous2-title.png" width="380" alt="Blasphemous 2 — title screen">
   <img src="assets/screenshots/blasphemous2.png" width="380" alt="Blasphemous 2 — first playable room">
 </p>
 
