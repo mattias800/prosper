@@ -50,6 +50,12 @@ def main():
     code += b"\x80\x3d" + rel32(site, 7, slot) + b"\x01"                  # cmp BYTE [rip+d],1  cmpb
     raw[0x100:0x100 + len(code)] = code
 
+    # #1314: a seven-byte reference ending exactly at the executable PT_LOAD boundary must be
+    # inspected. The old range(n - 7) stopped one byte before this instruction's start.
+    tail_site = 0x10f9
+    tail_slot = 0x1300
+    raw[0x1f9:0x200] = b"\xc6\x05" + rel32(tail_site, 7, tail_slot) + b"\x01"
+
     path = ""
     try:
         with tempfile.NamedTemporaryFile(delete=False) as f:
@@ -69,6 +75,7 @@ def main():
         actual = set(module.code_xref[slot])
         assert actual == expected, (actual, expected)
         assert module.code_xref[direct_target] == [(0x1000, "call")]
+        assert module.code_xref[tail_slot] == [(tail_site, "storeb")]
     finally:
         if path:
             os.unlink(path)
