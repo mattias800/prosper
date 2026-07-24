@@ -1,4 +1,7 @@
-// test_initfault_dump — the init-fault REPORT must never fault itself (#128). run_guest_inits
+// test_initfault_dump — guest init faults must be recovered and their reports must not fault (#128).
+// This also drives a real integer #DE/SIGFPE through the installed handler (#1160); without the
+// SIGFPE registration the test process is killed before run_guest_inits can recover.
+// run_guest_inits
 // tolerates a faulting init fn (sigsetjmp recovery) and then prints a diagnostic that includes
 // the bytes around the faulting rip and the entry. With a WILD or NULL init-fn pointer — the
 // exact failure this diagnostic exists for — the faulting rip is unmapped; the old report
@@ -8,12 +11,23 @@
 #include "../src/host/exec_image.hpp"
 #include <cstdio>
 
+#ifndef _WIN32
+__attribute__((noinline)) static void divide_by_zero(uint64_t, uint64_t) {
+    __asm__ volatile("mov $1, %%eax; xor %%edx, %%edx; xor %%ecx, %%ecx; idiv %%ecx"
+                     : : : "rax", "rcx", "rdx", "cc");
+}
+#endif
+
 int main() {
     printf("== test_initfault_dump ==\n");
     prosper::install_trap_handler();
     // A canonical-but-unmapped target (wild jump: rip = target, rip-8 also unmapped) and a null
     // call. Both must be tolerated AND survive the byte-dump diagnostic that follows.
-    size_t ok = prosper::run_guest_inits({ 0xdead0000ull, 0ull });
+    std::vector<uint64_t> faulting = { 0xdead0000ull, 0ull };
+#ifndef _WIN32
+    faulting.push_back((uint64_t)(uintptr_t)&divide_by_zero);
+#endif
+    size_t ok = prosper::run_guest_inits(faulting);
     if (ok != 0) {
         printf("  [FAIL] wild init fns were counted as succeeded (ok=%zu)\n", ok);
         return 1;
@@ -27,7 +41,11 @@ int main() {
     }
     printf("  [ok]   recovery thunk provided aligned MS-x64 shadow-space call frame\n");
 #endif
-    printf("  [ok]   wild + null init fns tolerated; the fault report did not kill the process\n");
+#ifdef _WIN32
+    printf("  [ok]   wild and null faults were reported and recovered\n");
+#else
+    printf("  [ok]   wild, null, and integer-divide faults were reported and recovered\n");
+#endif
     printf("== PASS ==\n");
     return 0;
 }

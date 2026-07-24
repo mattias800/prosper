@@ -72,7 +72,7 @@ namespace {
     sigjmp_buf g_jb;
     volatile long g_armed_tid = 0;               // kernel tid that armed g_jb, 0 = none
     inline long cur_tid() { return (long)prosper_gettid(); }
-    volatile sig_atomic_t g_trap_kind = 0;   // 0 none, 2 SEGV/BUS, 3 ILL
+    volatile sig_atomic_t g_trap_kind = 0;   // 0 none, 2 fatal fault, 3 ILL
     volatile int          g_trap_sig = 0;
     void*    g_fault_addr = nullptr;
     uint64_t g_fault_rip = 0;
@@ -2244,7 +2244,9 @@ namespace {
 
     std::string trap_detail() {
         char buf[256];
-        const char* sn = g_trap_sig == SIGILL ? "SIGILL" : g_trap_sig == SIGBUS ? "SIGBUS" : "SIGSEGV";
+        const char* sn = g_trap_sig == SIGILL ? "SIGILL"
+                       : g_trap_sig == SIGBUS ? "SIGBUS"
+                       : g_trap_sig == SIGFPE ? "SIGFPE" : "SIGSEGV";
         uint64_t off = (g_base && g_fault_rip >= g_base) ? g_fault_rip - g_base : 0;
         snprintf(buf, sizeof buf, "%s at addr=%p  rip=0x%llx (image+0x%llx)",
                  sn, g_fault_addr, (unsigned long long)g_fault_rip, (unsigned long long)off);
@@ -2570,6 +2572,7 @@ void install_trap_handler() {
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGBUS,  &sa, nullptr);
     sigaction(SIGILL,  &sa, nullptr);
+    sigaction(SIGFPE,  &sa, nullptr);
     if (g_watch_companion || g_bp_on || g_hwbp_on
         || getenv("PROSPER_WATCH_LABEL")
         || getenv("PROSPER_WATCH_ABS")
