@@ -1316,7 +1316,7 @@ int main(int argc, char** argv) {
             !realized_shader_spec.empty() ||
             !compute_override_spec.empty() ||
             !compute_resource_spec.empty() || !failed_shader_spec.empty() ||
-            !prepend_path.empty()) {
+            !prepend_path.empty() || !draw_steps_prefix.empty()) {
             usage(argv[0]); return 2;
         }
         return replay_bundle(bundle_path, positional.empty() ? nullptr : positional[0],
@@ -1340,6 +1340,10 @@ int main(int argc, char** argv) {
         usage(argv[0]); return 2;
     }
     if (draw_with_compute_prefix && draw_first < 0) { usage(argv[0]); return 2; }
+    // #1332: the filmstrip sub-flags configure --draw-steps; alone they would be silently unused.
+    if ((draw_steps_every > 0 || draw_steps_target_w) && draw_steps_prefix.empty()) {
+        usage(argv[0]); return 2;
+    }
     // #1330: ordered-prefix inspection modes must see the pass a prefix actually ends on, even when
     // that pass renders a non-RGBA8 target (an FP16 HDR scene). The shared live renderer publishes an
     // inspection-converted fallback only under this env, so full replays and live runs are unchanged.
