@@ -1,6 +1,7 @@
 // live_renderer.cpp — see live_renderer.hpp. Extracted from boot_trace's PROSPER_RENDER lambda
 // (behavior-preserving); Vulkan-backed, so this unit links Vulkan::Vulkan.
 #include "live_renderer.hpp"
+#include "rtt_injection.hpp"
 #include "live_compute.hpp"
 
 #include "gpu/gpu_execute.hpp"          // DrawItem, set_submit_renderer
@@ -1415,45 +1416,33 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 !rit->second.rgba->empty()) {
                                 const RttSurf& s = rit->second;
                                 const uint32_t rtt_bpp = prosper::test::backend_color_bytes_per_pixel(s.format);
-                                const size_t expected = static_cast<size_t>(tw) * th * rtt_bpp;
-                                if (s.w == tw && s.h == th && s.rgba->size() == expected) {
-                                    std::memcpy(texture_pixels.data(), s.rgba->data(), expected);
-                                } else {
-                                    std::fill(texture_pixels.begin(), texture_pixels.end(), 0);
-                                    for (uint32_t y = 0; y < th; y++) for (uint32_t x = 0; x < tw; x++) {
-                                        uint32_t sx = (uint32_t)((uint64_t)x * s.w / tw), sy = (uint32_t)((uint64_t)y * s.h / th);
-                                        size_t si = ((size_t)sy * s.w + sx) * rtt_bpp;
-                                        if (si + rtt_bpp <= s.rgba->size())
-                                            std::memcpy(&texture_pixels[((size_t)y * tw + x) * rtt_bpp],
-                                                        &(*s.rgba)[si], rtt_bpp);
-                                    }
-                                }
-                                fr.texture_format = s.format;
-                                rtt_hit = true;
-                                resource_rtt_hit = true;
-                                // PROSPER_DUMP_SAMPLED_RTT (#710/#320): dump the EXACT RTT-layer pixels a
-                                // draw samples, at sample time, so we can see whether an already-rendered
-                                // layer (e.g. the title's menu panel) arrives bright or dark — disambiguates
-                                // "layer rendered dark" from "composite/tint darkens a correct layer". One
-                                // BMP per (sampled addr) into PROSPER_FRAME_DIR.
-                                if (getenv("PROSPER_DUMP_SAMPLED_RTT")) {
-                                    static std::set<uint64_t> seen;
-                                    if (seen.insert(r.gpu_addr).second) {
-                                        const std::vector<uint8_t> inspected = inspection_rgba8(
-                                            texture_pixels, tw, th, s.format);
-                                        size_t nz = 0, rgbnz = 0;
-                                        for (size_t p = 0; p + 3 < inspected.size(); p += 4) {
-                                            if (inspected[p] || inspected[p+1] || inspected[p+2]) rgbnz++;
-                                            for (int k = 0; k < 4; k++) nz += (inspected[p+k] != 0);
+                                if (prosper::frontend::inject_rtt_pixels(
+                                        texture_pixels, tw, th, *s.rgba, s.w, s.h, rtt_bpp)) {
+                                    fr.texture_format = s.format;
+                                    rtt_hit = true;
+                                    resource_rtt_hit = true;
+                                    // PROSPER_DUMP_SAMPLED_RTT (#710/#320): dump the exact RTT-layer
+                                    // pixels a draw samples, disambiguating a dark layer from a later
+                                    // composite/tint that darkens otherwise-correct input.
+                                    if (getenv("PROSPER_DUMP_SAMPLED_RTT")) {
+                                        static std::set<uint64_t> seen;
+                                        if (seen.insert(r.gpu_addr).second) {
+                                            const std::vector<uint8_t> inspected = inspection_rgba8(
+                                                texture_pixels, tw, th, s.format);
+                                            size_t nz = 0, rgbnz = 0;
+                                            for (size_t p = 0; p + 3 < inspected.size(); p += 4) {
+                                                if (inspected[p] || inspected[p+1] || inspected[p+2]) rgbnz++;
+                                                for (int k = 0; k < 4; k++) nz += (inspected[p+k] != 0);
+                                            }
+                                            const char* dd = getenv("PROSPER_FRAME_DIR");
+                                            char fn[512]; snprintf(fn, sizeof fn, "%s/sampledrtt_%llx_%ux%u.bmp",
+                                                                   dd ? dd : ".", (unsigned long long)r.gpu_addr, tw, th);
+                                            prosper::test::dump_bmp(fn, inspected, tw, th);
+                                            fprintf(stderr, "[sampledrtt] addr=0x%llx %ux%u rgb_nonblack=%zu/%u -> %s\n",
+                                                    (unsigned long long)r.gpu_addr, tw, th, rgbnz, tw*th, fn);
                                         }
-                                        const char* dd = getenv("PROSPER_FRAME_DIR");
-                                        char fn[512]; snprintf(fn, sizeof fn, "%s/sampledrtt_%llx_%ux%u.bmp",
-                                                               dd ? dd : ".", (unsigned long long)r.gpu_addr, tw, th);
-                                        prosper::test::dump_bmp(fn, inspected, tw, th);
-                                        fprintf(stderr, "[sampledrtt] addr=0x%llx %ux%u rgb_nonblack=%zu/%u -> %s\n",
-                                                (unsigned long long)r.gpu_addr, tw, th, rgbnz, tw*th, fn);
                                     }
-                                }
+                                } // malformed/incomplete RTT bytes => miss; decode guest backing below
                             }
                             if (rtt_log)
                                 fprintf(stderr, "[rtt] sample tex addr=0x%llx %ux%u fmt=%u -> %s (cache_size=%zu)\n",
