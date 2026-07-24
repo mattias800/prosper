@@ -491,6 +491,15 @@ struct RenderVkCtx {
     VkShaderStageFlags required_subgroup_size_stages = 0;
     VkShaderStageFlags subgroup_stages = 0;
     VkSubgroupFeatureFlags subgroup_operations = 0;
+    // Present unification (#1270): so prosper-app can adopt THIS device for its swapchain and blit the
+    // renderer's front-buffer image straight to the screen (no 4K CPU round-trip). All additive and
+    // only when advertised, so the headless test/screenshot path is byte-for-byte unchanged: on a
+    // display-less target the surface instance-extensions and VK_KHR_swapchain are simply absent, these
+    // stay false, and prosper-app falls back to its own separate present device + CPU pixels.
+    bool present_surface_capable = false;   // instance enabled VK_KHR_surface (+ a platform surface ext)
+    bool present_swapchain_capable = false; // device enabled VK_KHR_swapchain
+    VkQueue present_queue = VK_NULL_HANDLE; // dedicated 2nd queue when the family has >=2, else == queue
+    bool present_queue_shared = false;      // present_queue aliases the render queue -> submits need a mutex
 };
 inline const RenderVkCtx& render_vk_ctx() {
     static RenderVkCtx c = [] {
@@ -499,7 +508,59 @@ inline const RenderVkCtx& render_vk_ctx() {
         VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &app;
         // macOS: MoltenVK is linked directly, so VK_KHR_portability_enumeration is neither needed nor
         // accepted here (see prosper-app main.cpp). Only the device-level portability_subset matters.
-        if (vkCreateInstance(&ici, nullptr, &r.inst) != VK_SUCCESS || !r.inst) return r;
+        //
+        // Present unification (#1270): enable the WSI surface instance-extensions when the loader
+        // advertises them, so prosper-app can create its window surface on THIS instance and present on
+        // this device (see present_surface_capable). "Add-if-available" only: a headless target (llvmpipe
+        // CI, no display) advertises none, so the enabled list stays empty and instance creation is
+        // exactly as before. This is created before SDL_Init in the app, so we can't consult
+        // SDL_Vulkan_GetInstanceExtensions; instead enable every platform surface extension present and
+        // let the app fall back to its own device if SDL still needs one we didn't get (#1270 R4).
+        std::vector<const char*> inst_exts;
+        {
+            static const char* const kWsiExts[] = {
+                "VK_KHR_surface",
+#if defined(_WIN32)
+                "VK_KHR_win32_surface",
+#elif defined(__APPLE__)
+                "VK_EXT_metal_surface", "VK_MVK_macos_surface",
+#else
+                "VK_KHR_xlib_surface", "VK_KHR_xcb_surface", "VK_KHR_wayland_surface",
+#endif
+            };
+            uint32_t nie = 0; vkEnumerateInstanceExtensionProperties(nullptr, &nie, nullptr);
+            std::vector<VkExtensionProperties> avail(nie);
+            if (nie) vkEnumerateInstanceExtensionProperties(nullptr, &nie, avail.data());
+            auto has = [&](const char* name) {
+                for (const auto& e : avail) if (!strcmp(e.extensionName, name)) return true;
+                return false;
+            };
+            bool have_surface = has("VK_KHR_surface");
+            if (have_surface) {
+                bool have_platform = false;
+                for (const char* e : kWsiExts) {
+                    if (has(e)) { inst_exts.push_back(e); if (strcmp(e, "VK_KHR_surface")) have_platform = true; }
+                }
+                // A bare VK_KHR_surface with no platform surface is useless for a window; require both.
+                r.present_surface_capable = have_platform;
+                if (!have_platform) inst_exts.clear();
+            }
+            if (!inst_exts.empty()) {
+                ici.enabledExtensionCount = (uint32_t)inst_exts.size();
+                ici.ppEnabledExtensionNames = inst_exts.data();
+            }
+        }
+        // If the driver rejects the surface set (should not happen since each was advertised), retry with
+        // no instance extensions so the headless render path never regresses on an unexpected loader.
+        if (vkCreateInstance(&ici, nullptr, &r.inst) != VK_SUCCESS || !r.inst) {
+            if (!inst_exts.empty()) {
+                r.present_surface_capable = false;
+                VkInstanceCreateInfo bare{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; bare.pApplicationInfo = &app;
+                if (vkCreateInstance(&bare, nullptr, &r.inst) != VK_SUCCESS || !r.inst) return r;
+            } else {
+                return r;
+            }
+        }
         uint32_t nd = 0; vkEnumeratePhysicalDevices(r.inst, &nd, nullptr);
         if (!nd) return r;
         std::vector<VkPhysicalDevice> devs(nd); vkEnumeratePhysicalDevices(r.inst, &nd, devs.data());
@@ -510,9 +571,24 @@ inline const RenderVkCtx& render_vk_ctx() {
         std::fprintf(stderr, "[render] Vulkan device: %s (%s)\n",
                      selection.properties.deviceName,
                      prosper::frontend::vulkan_device_type_name(selection.properties.deviceType));
-        float prio = 1.0f;
+        // Present unification (#1270): if the graphics family exposes a second queue, dedicate index 1
+        // to prosper-app's present so the app's blit/present submits never contend the render queue's
+        // external-synchronization. On a single-queue family (RADV STRIX_HALO is queueCount==1) the app
+        // instead shares queue index 0 under a submit mutex. Requesting queueCount is harmless to the
+        // headless path: the extra queue is simply never fetched by tests/screenshot.
+        uint32_t family_queue_count = 1;
+        {
+            uint32_t nq = 0; vkGetPhysicalDeviceQueueFamilyProperties(r.phys, &nq, nullptr);
+            if (nq) {
+                std::vector<VkQueueFamilyProperties> qfp(nq);
+                vkGetPhysicalDeviceQueueFamilyProperties(r.phys, &nq, qfp.data());
+                if (r.qfi < nq) family_queue_count = qfp[r.qfi].queueCount;
+            }
+        }
+        float prio[2] = {1.0f, 1.0f};
+        const uint32_t want_queues = family_queue_count >= 2 ? 2u : 1u;
         VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-        qci.queueFamilyIndex = r.qfi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
+        qci.queueFamilyIndex = r.qfi; qci.queueCount = want_queues; qci.pQueuePriorities = prio;
         VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
         dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
         // robustBufferAccess: OOB storage-buffer accesses are well-defined (predicated ops on
@@ -606,6 +682,16 @@ inline const RenderVkCtx& render_vk_ctx() {
                       r.transform_feedback_enabled = true;
                   }
               }
+              // Present unification (#1270): the swapchain device-extension, only when the instance is
+              // surface-capable. Enabling it on the headless render device is harmless (no swapchain is
+              // ever created there by tests/screenshot); prosper-app needs it to create its swapchain on
+              // this shared device. Gated on present_surface_capable so a display-less build never
+              // requests it.
+              if (r.present_surface_capable &&
+                  !strcmp(de[i].extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
+                  dev_exts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+                  r.present_swapchain_capable = true;
+              }
 #ifdef __APPLE__
               // Spec-mandated: must be enabled when advertised (MoltenVK always advertises it).
               if (!strcmp(de[i].extensionName, "VK_KHR_portability_subset")) dev_exts.push_back("VK_KHR_portability_subset");
@@ -615,6 +701,19 @@ inline const RenderVkCtx& render_vk_ctx() {
         dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
         if (vkCreateDevice(r.phys, &dci, nullptr, &r.dev) != VK_SUCCESS || !r.dev) return r;
         vkGetDeviceQueue(r.dev, r.qfi, 0, &r.queue);
+        // Present unification (#1270): resolve the queue prosper-app will use to present. A dedicated
+        // second queue (when the family has >=2) avoids contending the render queue; otherwise the app
+        // shares queue 0 under a submit mutex (present_queue_shared). present capability requires the
+        // swapchain extension to have been enabled above.
+        if (r.present_swapchain_capable) {
+            if (want_queues >= 2) {
+                vkGetDeviceQueue(r.dev, r.qfi, 1, &r.present_queue);
+                r.present_queue_shared = false;
+            } else {
+                r.present_queue = r.queue;
+                r.present_queue_shared = true;
+            }
+        }
         r.ok = true;
         // Publish this device so the compute backend can adopt it instead of creating a second one
         // (#1091). Only the features compute needs are advertised; it declines the shared context if
@@ -634,6 +733,12 @@ inline const RenderVkCtx& render_vk_ctx() {
             // declaring a capability the device never enabled.
             shared.storage_image_read_without_format = feats.shaderStorageImageReadWithoutFormat;
             shared.storage_image_write_without_format = feats.shaderStorageImageWriteWithoutFormat;
+            // Present unification (#1270): advertise present adoption only when the instance is
+            // surface-capable AND the device enabled VK_KHR_swapchain AND a present queue was resolved.
+            shared.present_capable = r.present_surface_capable && r.present_swapchain_capable &&
+                                     r.present_queue != VK_NULL_HANDLE;
+            shared.present_queue = r.present_queue;
+            shared.present_queue_shared = r.present_queue_shared;
             prosper::gpu::set_shared_vulkan_context(shared);
         }
         return r;

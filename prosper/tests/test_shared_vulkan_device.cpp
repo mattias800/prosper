@@ -65,6 +65,34 @@ int main() {
           (props[shared.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0,
           "published queue family supports COMPUTE (dispatches are legal on it)");
 
+    // Present unification (#1270): the published present-capability must exactly mirror what the device
+    // was actually created with. present_capable requires BOTH a surface-capable instance AND the
+    // swapchain device-extension AND a resolved present queue. On a headless target (no display, no
+    // platform surface extension advertised) all three are false and prosper-app falls back to its own
+    // separate present device -- so this assertion also proves the headless path is preserved.
+    CHECK(shared.present_capable ==
+              (ctx.present_surface_capable && ctx.present_swapchain_capable &&
+               ctx.present_queue != VK_NULL_HANDLE),
+          "published present_capable mirrors the surface+swapchain+queue the device was created with");
+    CHECK(!ctx.present_swapchain_capable || ctx.present_surface_capable,
+          "swapchain is never enabled without a surface-capable instance");
+    // The present queue is a dedicated 2nd queue when the family exposes >=2, else it shares queue 0
+    // (RADV STRIX_HALO is queueCount==1). Either way it must be a queue of the SAME family (no ownership
+    // transfers on the front-buffer blit), and the shared flag must agree with the queue identity.
+    if (shared.present_capable) {
+        CHECK(shared.present_queue != nullptr, "present-capable context publishes a non-null present queue");
+        const bool one_queue = props[shared.queue_family].queueCount < 2;
+        CHECK(shared.present_queue_shared == one_queue,
+              "present_queue_shared iff the graphics family has a single queue");
+        CHECK(!shared.present_queue_shared || shared.present_queue == shared.queue,
+              "a shared present queue aliases the render queue (submits will serialize via a mutex)");
+        CHECK(shared.present_queue_shared || shared.present_queue != shared.queue,
+              "a dedicated present queue is distinct from the render queue");
+    } else {
+        CHECK(shared.present_queue == nullptr && !shared.present_queue_shared,
+              "a non-present-capable context publishes no present queue (headless fallback path)");
+    }
+
     printf(fails ? "test_shared_vulkan_device: %d FAILURE(S)\n"
                  : "test_shared_vulkan_device: all ok\n", fails);
     return fails ? 1 : 0;

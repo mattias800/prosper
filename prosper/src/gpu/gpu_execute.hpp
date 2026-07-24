@@ -484,6 +484,15 @@ struct SharedVulkanContext {
     // Features the compute backend requires; when false it must decline the shared device.
     bool storage_image_read_without_format = false;
     bool storage_image_write_without_format = false;
+    // Present unification (#1270): when present_capable, prosper-app may create its window surface on
+    // `instance`, its swapchain on `device`, and present on `present_queue` -- then blit the renderer's
+    // front-buffer image straight to the swapchain with no CPU round-trip. present_queue_shared means the
+    // present queue aliases the render queue, so both threads must serialize submits through
+    // shared_render_submit_mutex(). false/nullptr on a headless build (prosper-app then uses its own
+    // separate present device + CPU pixels, exactly as before).
+    bool present_capable = false;
+    void* present_queue = nullptr;
+    bool present_queue_shared = false;
     bool valid() const { return instance && physical && device && queue && queue_family != UINT32_MAX; }
 };
 void set_shared_vulkan_context(const SharedVulkanContext& context);
