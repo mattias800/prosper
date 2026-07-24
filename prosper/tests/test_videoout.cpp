@@ -6,6 +6,7 @@
 #include "../src/gpu/videoout_present.hpp"
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>   // setenv/_putenv_s (PROSPER_HDR both-modes test)
 #include <cstring>
 #include <chrono>
 #include <thread>

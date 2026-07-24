@@ -719,10 +719,11 @@ HLE(g_vo_configure_output) {
 // (0x8100070400000000) — i.e. status+0x04 is the output's dynamic-range/colorimetry mode with
 // 2 = HDR. Previously we returned success with the struct UNWRITTEN, so the caller consumed
 // uninitialized stack (usually != 2 -> SDR by luck — the classic success+garbage-out hazard).
-// Write a defined 8-byte {u32 state=0, u32 mode=0} prefix: mode 0 selects the SDR path
-// deterministically, matching prosper's advertised SDR-only display. 8 bytes cannot overrun any
-// plausible real struct (the DOLL caller reserves 0x50 stack bytes for it). CONFIDENCE: MED on
-// field semantics (single consumer, unambiguous read), HIGH that a defined write beats garbage.
+// Write a defined 8-byte {u32 state=0, u32 mode} prefix: mode 0 by default (the SDR path,
+// matching prosper's default SDR-only display) and mode 2 under PROSPER_HDR (the --hdr opt-in).
+// 8 bytes cannot overrun any plausible real struct (the DOLL caller reserves 0x50 stack bytes
+// for it). CONFIDENCE: MED on field semantics (single consumer, unambiguous read), HIGH that a
+// defined write beats garbage.
 HLE(g_vo_get_output_status) {
     vo_argtrace("GetOutputStatus", a0,a1,a2,a3,a4,a5);
     if (!a1)
