@@ -13,6 +13,19 @@
 
 namespace prosper::gpu {
 
+size_t linear_sampled_row_pitch(uint32_t width, uint32_t bytes_per_texel) {
+    if (!width || !bytes_per_texel) return 0;
+    const uint64_t tight = static_cast<uint64_t>(width) * bytes_per_texel;
+    const uint64_t aligned = (tight + 255u) & ~uint64_t{255u};
+    return aligned > std::numeric_limits<size_t>::max() ? 0 : static_cast<size_t>(aligned);
+}
+
+size_t linear_sampled_surface_bytes(uint32_t width, uint32_t height, uint32_t bytes_per_texel) {
+    const size_t pitch = linear_sampled_row_pitch(width, bytes_per_texel);
+    if (!pitch || !height || pitch > std::numeric_limits<size_t>::max() / height) return 0;
+    return pitch * height;
+}
+
 bool tile_mode_is_tiled(uint32_t tile_mode) {
     return tile_mode == (uint32_t)TileMode::Sw4KbS ||
            tile_mode == (uint32_t)TileMode::Sw64KbS ||

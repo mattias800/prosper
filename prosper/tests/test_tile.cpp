@@ -99,6 +99,12 @@ int main() {
 
     CHECK(tile_mode_is_tiled((uint32_t)TileMode::Sw4KbS), "tile_mode 5 (SW_4KB_S) is tiled");
     CHECK(!tile_mode_is_tiled((uint32_t)TileMode::Linear), "tile_mode 0 (linear) is not tiled");
+    CHECK(linear_sampled_row_pitch(1920, 1) == 2048 &&
+          linear_sampled_surface_bytes(1920, 1080, 1) == 2048u * 1080u,
+          "linear R8 sampled images align each row to 256 bytes");
+    CHECK(linear_sampled_row_pitch(3840, 1) == 3840 &&
+          linear_sampled_surface_bytes(3840, 2160, 1) == 3840u * 2160u,
+          "already-aligned linear sampled rows retain their tight pitch");
 
     // Linear mode: detile is a straight copy.
     {

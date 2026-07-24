@@ -196,6 +196,7 @@ struct TextureDecodeKey {
     uint32_t num_components = 0;
     uint32_t width = 0, height = 0, depth = 1;
     uint32_t tile_mode = 0;
+    uint32_t linear_row_pitch_bytes = 0;
     uint32_t img_dim = 0;
     uint32_t max_uncompressed_block_size = 0, max_compressed_block_size = 0;
     uint32_t dcc_flags = 0;
@@ -216,7 +217,8 @@ struct TextureDecodeKeyHash {
         };
         mix(key.gpu_addr); mix(key.host_data); mix(key.host_data_size); mix(key.size);
         mix(key.cls); mix(key.format); mix(key.num_components); mix(key.width); mix(key.height); mix(key.depth);
-        mix(key.tile_mode); mix(key.img_dim); mix(key.max_uncompressed_block_size);
+        mix(key.tile_mode); mix(key.linear_row_pitch_bytes); mix(key.img_dim);
+        mix(key.max_uncompressed_block_size);
         mix(key.max_compressed_block_size); mix(key.dcc_flags); mix(key.metadata_addr);
         mix(key.metadata_host_data); mix(key.metadata_host_data_size);
         return hash;
@@ -921,7 +923,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             r.gpu_addr, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(r.host_data)),
                             r.host_data_size, r.size, static_cast<uint32_t>(r.cls),
                             static_cast<uint32_t>(r.format), r.num_components, tw, th, r.depth,
-                            r.tile_mode, r.img_dim,
+                            r.tile_mode, r.linear_row_pitch_bytes, r.img_dim,
                             r.compression_enabled ? r.max_uncompressed_block_size : 0u,
                             r.compression_enabled ? r.max_compressed_block_size : 0u,
                             r.compression_enabled
@@ -1015,6 +1017,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const bool persistent_fp16_texture =
                             r.format == prosper::gpu::DataFormat::Float16 &&
                             (r.num_components == 1 || r.num_components == 2 || r.num_components == 4);
+                        // Real source bytes per texel. It also determines the pitch of a guest-backed
+                        // linear sampled image: GFX10 aligns those rows to 256 bytes independently of
+                        // component count (e.g. a 1920-wide R8 video chroma plane has a 2048-byte row).
+                        uint32_t sampled_source_bpt =
+                            prosper::gpu::data_format_bytes(r.format) *
+                            (r.num_components ? r.num_components : 1u);
+                        const bool sampled_source_f16 =
+                            r.format == prosper::gpu::DataFormat::Float16 &&
+                            (sampled_source_bpt == 2 || sampled_source_bpt == 4 || sampled_source_bpt == 8);
+                        if (sampled_source_bpt == 0 ||
+                            (sampled_source_bpt > 4 && !sampled_source_f16)) sampled_source_bpt = 4;
                         const bool persistent_sampled_texture =
                             !has_live_rtt && !r.host_data && r.img_dim == 1u &&
                             r.cls == RC::Texture &&
@@ -1023,23 +1036,29 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const bool persistent_source_is_tiled =
                             persistent_sampled_texture && !getenv("PROSPER_NODETILE") &&
                             prosper::gpu::tile_mode_is_tiled(r.tile_mode);
-                        // A sampled LINEAR (tile_mode 0) 2D surface whose tight row (tw*4) is not 256-aligned
+                        // A sampled LINEAR (tile_mode 0) 2D surface whose tight row is not 256-aligned
                         // is pitch-padded: RDNA2 requires a sampled linear texture's row pitch to be aligned
-                        // (256 B here), so its real pitch is align(tw*4,256). The RGBA8 decode below must read
-                        // it row-by-row at that pitch (else every row drifts -> horizontal scramble, e.g.
-                        // Dead Cells' 348-wide Motion Twin splash whose real pitch is 384 texels). Guards keep
+                        // (256 B here), so its real pitch is align(tw*bytes_per_texel,256). The decode
+                        // below must read it row-by-row at that pitch (else every row drifts -> horizontal
+                        // scramble, e.g. Dead Cells' 348-wide Motion Twin splash whose real pitch is 384
+                        // texels). Guards keep
                         // this narrow and regression-safe: 2D only (volume/cube layouts untouched); tile_mode
                         // == 0 exactly, so unrecognized/actually-tiled modes are NOT strided (they fall to the
                         // contiguous read + auto-detile pass); !host_data, so CPU-uploaded tightly-packed
-                        // pixels (test fixtures, staged uploads) are read contiguously. The tightly-packed
+                        // pixels (test fixtures, staged uploads) are read contiguously unless capture replay
+                        // supplies an explicit guest-layout pitch. The tightly-packed
                         // LINEAR_GENERAL layout is a buffer/copy layout, not a sampled-texture layout, so it
                         // does not reach here. r.size is the TIGHT extent (tw*th*bpp), so it cannot gate this.
-                        const size_t linear_dst_row = (size_t)tw * 4;
-                        size_t linear_src_row = (linear_dst_row + 255) & ~size_t(255);
+                        const size_t linear_dst_row = (size_t)tw * sampled_source_bpt;
+                        size_t linear_src_row = r.linear_row_pitch_bytes
+                            ? r.linear_row_pitch_bytes
+                            : prosper::gpu::linear_sampled_row_pitch(tw, sampled_source_bpt);
                         if (const char* lp = getenv("PROSPER_LINPITCH"))
-                            linear_src_row = (size_t)strtoull(lp, nullptr, 0) * 4;
+                            linear_src_row = (size_t)strtoull(lp, nullptr, 0) * sampled_source_bpt;
                         const bool linear_padded_read =
-                            r.cls == RC::Texture && r.img_dim == 1u && r.tile_mode == 0 && !r.host_data &&
+                            r.cls == RC::Texture && r.img_dim == 1u && r.tile_mode == 0 &&
+                            (!r.host_data || r.linear_row_pitch_bytes != 0) &&
+                            !r.compression_enabled && persistent_bc_block_bytes == 0 &&
                             linear_dst_row != 0 && linear_src_row > linear_dst_row;
                         const bool persistent_source_matches_pixels =
                             persistent_unorm8_texture && r.num_components == 4 && !linear_padded_read &&
@@ -1067,6 +1086,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             // always reads exactly tw*th*source_bpt and must NOT be excluded.
                             if (persistent_unorm8_texture && source_bpt == 4 &&
                                 !persistent_source_matches_pixels) return size_t{0};
+                            if (linear_padded_read) return linear_src_row * th;
                             return static_cast<size_t>(tw) * th * source_bpt;
                         }();
                         const bool persistent_cache_eligible = !fr.is_storage_image &&
@@ -1409,6 +1429,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         if (texstore_used == texstore.size()) texstore.emplace_back();
                         std::vector<uint8_t>& texture_pixels = texstore[texstore_used++];
                         texture_pixels.resize(nb);
+                        auto copy_linear_padded_rows = [&](uint8_t* dst, size_t dst_row) {
+                            size_t total = 0;
+                            for (uint32_t y = 0; y < th; ++y) {
+                                uint8_t* drow = dst + (size_t)y * dst_row;
+                                const size_t got = copy_resource(
+                                    drow, r.gpu_addr + (uint64_t)y * linear_src_row, dst_row);
+                                total += got;
+                                if (got < dst_row) std::fill(drow + got, drow + dst_row, 0);
+                            }
+                            return total;
+                        };
                         // PROSPER_TEXCOMMIT: log, once per texture base, how much of the sampled surface is
                         // COMMITTED guest memory (the same reserved_range_state safe_copy stops at). If the
                         // level's backgrounds read ~0% committed, they're GPU-DMA'd pages the CPU never
@@ -1441,13 +1472,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // them as RGBA8 packs adjacent texels into one pixel and over-reads the allocation,
                         // which is why glyph text rendered as solid white/black BLOCKS (#102). bpt drives a
                         // narrow read+expand path below. StorageImage / unknown formats keep 4 B (bpt=0->4).
-                        uint32_t bpt = prosper::gpu::data_format_bytes(r.format) * (r.num_components ? r.num_components : 1);
+                        uint32_t bpt = sampled_source_bpt;
                         // fp16 surfaces (fmt 71 Float16x4 = 8 B/texel, 29 = 4 B, 13 = 2 B) get a real
                         // half->UNORM8 conversion path below for guest-backed textures. Renderer-owned
                         // Float16x4 RTTs bypass it and retain native bytes. Other unknown formats keep RGBA8.
-                        const bool f16 = r.format == prosper::gpu::DataFormat::Float16 &&
-                                         (bpt == 2 || bpt == 4 || bpt == 8);
-                        if (bpt == 0 || (bpt > 4 && !f16)) bpt = 4;
+                        const bool f16 = sampled_source_f16;
                         bool f16_done = false;
                         // RTT (#167): if this texture's base is a color target we rendered into, inject those
                         // pixels (nearest-scaled to tw x th) instead of reading empty guest memory.
@@ -1640,6 +1669,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     r.mip_tail_x, r.mip_tail_y);
                                 else prosper::gpu::detile_surface(
                                     hlin.data(), traw.data(), tw, th, r.tile_mode, 0, bpt);
+                            } else if (linear_padded_read) {
+                                copy_linear_padded_rows(hlin.data(), (size_t)tw * bpt);
                             } else {
                                 copy_resource(hlin.data(), r.gpu_addr, hlin.size());
                             }
@@ -1688,6 +1719,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     r.mip_tail_x, r.mip_tail_y);
                                 else prosper::gpu::detile_surface(
                                     nlin.data(), traw.data(), tw, th, r.tile_mode, 0, bpt);
+                            } else if (linear_padded_read) {
+                                copy_linear_padded_rows(nlin.data(), (size_t)tw * bpt);
                             } else {
                                 copy_resource(nlin.data(), r.gpu_addr, nlin.size());
                             }
@@ -1700,17 +1733,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         } else if (linear_padded_read) {
                             // Pitch-padded linear surface (see linear_padded_read above): read row-by-row at
                             // the 256-byte-aligned source pitch into the tight destination, dropping the
-                            // per-row padding. The read stays within the backing (linear_src_row*th <= size,
-                            // checked when the flag was set) and copy_resource is fault-safe on a short row.
-                            size_t total = 0;
-                            for (uint32_t y = 0; y < th; ++y) {
-                                uint8_t* drow = texture_pixels.data() + (size_t)y * linear_dst_row;
-                                const size_t got = copy_resource(
-                                    drow, r.gpu_addr + (uint64_t)y * linear_src_row, linear_dst_row);
-                                total += got;
-                                if (got < linear_dst_row) std::fill(drow + got, drow + linear_dst_row, 0);
-                            }
-                            linear_source_prefix_size = total;
+                            // per-row padding. copy_resource is fault-safe when an old capture has a short
+                            // backing because its pre-v28 writer omitted the final padded rows.
+                            linear_source_prefix_size = copy_linear_padded_rows(
+                                texture_pixels.data(), linear_dst_row);
                         } else {
                             const size_t got = copy_resource(texture_pixels.data(), r.gpu_addr, nb);
                             linear_source_prefix_size = got;

@@ -46,6 +46,9 @@ struct GpuCaptureRawShaderVersion {
 
 struct GpuCapturedResource {
     ShaderResource resource;
+    // Exact base-resource byte span planned by the capture that produced this record. v1-v27 leave
+    // this zero and materialize with their historical footprint rules.
+    uint64_t captured_size = 0;
     uint32_t blob_index = 0xFFFFFFFFu;
     uint64_t blob_offset = 0;
     uint64_t metadata_size = 0;
@@ -188,6 +191,9 @@ struct GpuCaptureDsSeed {
 };
 
 struct GpuCaptureFile {
+    // In-memory provenance for version-dependent materialization. This is populated by capture/read;
+    // the on-disk header remains the single serialized version field.
+    uint32_t format_version = 0;
     GpuCaptureMetadata metadata;
     std::vector<GpuCaptureBlob> blobs;
     std::vector<GpuCaptureShaderVersion> shader_versions;

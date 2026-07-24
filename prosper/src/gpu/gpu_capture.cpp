@@ -55,7 +55,12 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v27: retain each draw's raw ShaderDrawModifier and signed GE_INDX_OFFSET. The latter is a draw
 // parameter (Vulkan firstVertex/vertexOffset), not pipeline state; omitting it collapsed distinct
 // ranges of a shared vertex pool onto vertex zero in both live rendering and replay.
-constexpr uint32_t kVersion = 27;
+// v28: retain the resolved byte row pitch and exact planned span of every resource. Guest-backed
+// GFX10 linear sampled images use 256-byte-aligned rows, which differs from width*bytes-per-texel for
+// video chroma planes.
+// Older captures planned tight spans, so their materializer intentionally binds the legacy span while
+// still deriving the guest pitch for best-effort rendering of the rows that were retained.
+constexpr uint32_t kVersion = 28;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -337,7 +342,16 @@ uint64_t checked_mul(uint64_t a, uint64_t b) {
     return a && b > std::numeric_limits<uint64_t>::max() / a ? std::numeric_limits<uint64_t>::max() : a * b;
 }
 
-uint64_t resource_footprint(const ShaderResource& r) {
+uint32_t resolved_linear_row_pitch(const ShaderResource& r, uint32_t width, uint32_t bpt) {
+    if (r.linear_row_pitch_bytes) return r.linear_row_pitch_bytes;
+    const uint64_t tight = checked_mul(width, bpt);
+    if (tight > UINT32_MAX) return UINT32_MAX;
+    if (r.host_data) return static_cast<uint32_t>(tight);
+    const size_t aligned = linear_sampled_row_pitch(width, bpt);
+    return aligned > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(aligned);
+}
+
+uint64_t resource_footprint_impl(const ShaderResource& r, bool legacy_linear_tight) {
     uint64_t result = r.size;
     if (r.cls != ResourceClass::Texture && r.cls != ResourceClass::StorageImage) return result;
     const uint64_t layers = r.img_dim == 3u ? 6u : (r.img_dim == 2u ? std::max(r.depth, 1u) : 1u);
@@ -352,11 +366,28 @@ uint64_t resource_footprint(const ShaderResource& r) {
         uint32_t bpt = data_format_bytes(r.format) * (r.num_components ? r.num_components : 1);
         const bool f16 = r.format == DataFormat::Float16 && (bpt == 2 || bpt == 4 || bpt == 8);
         if (bpt == 0 || (bpt > 4 && !f16)) bpt = 4;
-        decoded = tile_mode_is_tiled(r.tile_mode) ? tiled_surface_bytes(w, h, r.tile_mode, 0, bpt)
-                                                  : checked_mul(checked_mul(w, h), bpt);
+        if (tile_mode_is_tiled(r.tile_mode)) {
+            decoded = tiled_surface_bytes(w, h, r.tile_mode, 0, bpt);
+        } else if (r.tile_mode == static_cast<uint32_t>(TileMode::Linear) &&
+                   r.cls == ResourceClass::Texture && r.img_dim == 1u &&
+                   !r.compression_enabled && !legacy_linear_tight) {
+            // Guest-backed linear sampled images use GFX10's 256-byte row alignment. Capturing only
+            // width*height*bpt made narrow video planes replay with row drift and omitted their tail.
+            decoded = checked_mul(resolved_linear_row_pitch(r, w, bpt), h);
+        } else {
+            decoded = checked_mul(checked_mul(w, h), bpt);
+        }
     }
     decoded = checked_mul(decoded, layers);
     return std::max(result, decoded);
+}
+
+uint64_t resource_footprint(const ShaderResource& r) {
+    return resource_footprint_impl(r, false);
+}
+
+uint64_t legacy_resource_footprint(const ShaderResource& r) {
+    return resource_footprint_impl(r, true);
 }
 
 uint64_t dcc_metadata_footprint(const ShaderResource& r) {
@@ -473,12 +504,26 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
     dst.present = src != nullptr;
     if (!src) return true;
     for (const auto& r : src->resources) {
-        GpuCapturedResource c; c.resource = r; c.resource.host_data = nullptr; c.resource.host_data_size = 0;
+        GpuCapturedResource c;
+        c.resource = r;
+        if (r.cls == ResourceClass::Texture && r.img_dim == 1u &&
+            r.tile_mode == static_cast<uint32_t>(TileMode::Linear) &&
+            !r.compression_enabled && !bc_block_bytes(r.format)) {
+            uint32_t bpt = data_format_bytes(r.format) *
+                           (r.num_components ? r.num_components : 1u);
+            const bool f16 = r.format == DataFormat::Float16 &&
+                             (bpt == 2 || bpt == 4 || bpt == 8);
+            if (bpt == 0 || (bpt > 4 && !f16)) bpt = 4;
+            c.resource.linear_row_pitch_bytes = resolved_linear_row_pitch(
+                r, r.width ? r.width : 4u, bpt);
+        }
+        c.resource.host_data = nullptr; c.resource.host_data_size = 0;
         c.resource.dcc_metadata_host_data = nullptr;
         c.resource.dcc_metadata_host_data_size = 0;
         c.metadata_size = dcc_metadata_footprint(r);
         c.resource.dcc_metadata_size = c.metadata_size;
         uint64_t n = resource_footprint(r);
+        c.captured_size = n;
         if (is_compute_internal_gds(r) && include_resource_data) {
             if (!r.host_data || r.host_data_size < n) {
                 error = "compute GDS resource has no complete host backing";
@@ -940,7 +985,7 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
                           std::string& error, const CaptureRttSeedReader& rtt_reader,
                           const std::vector<OperationRealizationFailure>& failures,
                           const std::vector<GpuState::DmaCopy>& dma_copies) {
-    error.clear(); out = {}; out.metadata = metadata;
+    error.clear(); out = {}; out.format_version = kVersion; out.metadata = metadata;
     out.failure_diagnostics_available = true;
     if (draws.size() > kMaxDraws || computes.size() > kMaxComputes ||
         operations.size() > kMaxOperations) {
@@ -1561,6 +1606,43 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         w.u64(draw.raw_draw_modifier);
         w.u32(static_cast<uint32_t>(draw.vertex_offset));
     }
+    // v28: exact source row pitch and capture-planned byte span for each resource. A zero pitch remains
+    // meaningful for resources that are not linear sampled images; enumeration matches v16/v24.
+    {
+        size_t resource_count = 0;
+        for (const auto& draw : c.draws)
+            resource_count += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes)
+            resource_count += compute.resources.resources.size();
+        w.u32(static_cast<uint32_t>(resource_count));
+        auto write_linear_layout = [&](const GpuCapturedTable& table) {
+            for (const auto& captured : table.resources) {
+                ShaderResource resource = captured.resource;
+                if (c.format_version < 28 && !resource.linear_row_pitch_bytes &&
+                    resource.cls == ResourceClass::Texture && resource.img_dim == 1u &&
+                    resource.tile_mode == static_cast<uint32_t>(TileMode::Linear) &&
+                    !resource.compression_enabled && !bc_block_bytes(resource.format)) {
+                    uint32_t bpt = data_format_bytes(resource.format) *
+                                   (resource.num_components ? resource.num_components : 1u);
+                    const bool f16 = resource.format == DataFormat::Float16 &&
+                                     (bpt == 2 || bpt == 4 || bpt == 8);
+                    if (bpt == 0 || (bpt > 4 && !f16)) bpt = 4;
+                    resource.linear_row_pitch_bytes = resolved_linear_row_pitch(
+                        resource, resource.width ? resource.width : 4u, bpt);
+                }
+                w.u32(resource.linear_row_pitch_bytes);
+                w.u64(captured.captured_size ? captured.captured_size
+                                             : (c.format_version < 28
+                                                    ? legacy_resource_footprint(resource)
+                                                    : resource_footprint(resource)));
+            }
+        };
+        for (const auto& draw : c.draws) {
+            write_linear_layout(draw.vrt);
+            write_linear_layout(draw.prt);
+        }
+        for (const auto& compute : c.computes) write_linear_layout(compute.resources);
+    }
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -1601,6 +1683,7 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
         error = "unsupported capture version " + std::to_string(version);
         return false;
     }
+    c.format_version = version;
     if (!r.u32(endian)) { error = "truncated capture byte-order marker"; return false; }
     if (endian != kEndian) { error = "unsupported capture byte order"; return false; }
     auto& m = c.metadata;
@@ -2176,6 +2259,28 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             draw.vertex_offset = static_cast<int32_t>(vertex_offset);
         }
     }
+    if (version >= 28) {
+        size_t expected = 0;
+        for (auto& draw : c.draws)
+            expected += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (auto& compute : c.computes)
+            expected += compute.resources.resources.size();
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) {
+            error = "invalid linear-row-pitch count"; return false;
+        }
+        auto read_linear_layout = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources) {
+                if (!r.u32(captured.resource.linear_row_pitch_bytes) ||
+                    !r.u64(captured.captured_size)) return false;
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_linear_layout(draw.vrt) || !read_linear_layout(draw.prt)) return false;
+        for (auto& compute : c.computes)
+            if (!read_linear_layout(compute.resources)) return false;
+    }
     if (version >= 7 && !validate_failure_diagnostics(c, error)) return false;
     if (r.left) { error = "capture has trailing data"; return false; }
     return true;
@@ -2226,6 +2331,21 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         dst = std::make_shared<ShaderResourceTable>();
         for (const auto& x : src.resources) {
             ShaderResource r = x.resource; r.host_data = nullptr; r.host_data_size = 0;
+            const uint64_t captured_footprint = x.captured_size ? x.captured_size
+                : (c.format_version >= 28 ? resource_footprint(r) : legacy_resource_footprint(r));
+            // v1-v27 captured linear images tightly. Preserve that bounded backing so old files stay
+            // readable, but derive the real guest pitch for best-effort replay of every retained row.
+            if (c.format_version < 28 && r.cls == ResourceClass::Texture && r.img_dim == 1u &&
+                r.tile_mode == static_cast<uint32_t>(TileMode::Linear) &&
+                !r.compression_enabled && !bc_block_bytes(r.format)) {
+                uint32_t bpt = data_format_bytes(r.format) *
+                               (r.num_components ? r.num_components : 1u);
+                const bool f16 = r.format == DataFormat::Float16 &&
+                                 (bpt == 2 || bpt == 4 || bpt == 8);
+                if (bpt == 0 || (bpt > 4 && !f16)) bpt = 4;
+                r.linear_row_pitch_bytes = resolved_linear_row_pitch(
+                    r, r.width ? r.width : 4u, bpt);
+            }
             r.dcc_metadata_size = x.metadata_size;
             r.dcc_metadata_host_data = nullptr;
             r.dcc_metadata_host_data_size = 0;
@@ -2241,7 +2361,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
                 }
                 r.host_data = instance.data();
                 r.host_data_size = instance.size();
-            } else if (!bind_range(x.blob_index, x.blob_offset, r.gpu_addr, resource_footprint(r),
+            } else if (!bind_range(x.blob_index, x.blob_offset, r.gpu_addr, captured_footprint,
                             r.host_data, r.host_data_size,
                             "resource references an invalid capture blob",
                             "resource footprint exceeds capture blob",
