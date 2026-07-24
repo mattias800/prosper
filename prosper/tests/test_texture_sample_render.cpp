@@ -380,6 +380,42 @@ int main() {
         CHECK(fallback_stats.sampled_hits == 0 &&
                   invalidated_fallback == cpu_accumulated_sample,
               "invalidated GPU target uses the supplied CPU fallback instead of stale pixels");
+
+        // #1284: with deferred RTT readback the persistent image can hold a target's ONLY pixels.
+        // Evicting an unpinned valid target must hand those exact pixels to the registered sink
+        // before the image is destroyed; without the sink the content would be silently lost.
+        constexpr uint64_t sink_target_id = 0x6210000000000001ull;
+        prosper::test::BackendColorTarget sink_target{sink_target_id, false, false};
+        const std::vector<uint8_t> sink_producer_output = prosper::test::render_draws_rgba(
+            {producer}, W, H, nullptr, nullptr, false, &sink_target);
+        struct SinkCapture {
+            uint32_t w = 0, h = 0;
+            VkFormat format = VK_FORMAT_UNDEFINED;
+            std::vector<uint8_t> pixels;
+            int hits = 0;
+        } sink_capture;
+        prosper::test::persistent_color_target_evict_sink() =
+            [&sink_capture](uint64_t id, uint32_t w, uint32_t h, VkFormat format,
+                            std::vector<uint8_t>&& pixels) {
+                if (id != sink_target_id) return;
+                ++sink_capture.hits;
+                sink_capture.w = w; sink_capture.h = h; sink_capture.format = format;
+                sink_capture.pixels = std::move(pixels);
+            };
+        const uint64_t sink_pressure_count =
+            prosper::test::persistent_color_target_count_limit() + 40;
+        for (uint64_t pressure = 0; pressure < sink_pressure_count; ++pressure) {
+            prosper::test::BackendColorTarget sink_pressure_target{
+                sink_target_id + 0x2000 + pressure, false, false};
+            prosper::test::render_draws_rgba(
+                {producer}, W, H, nullptr, nullptr, false, &sink_pressure_target);
+        }
+        prosper::test::persistent_color_target_evict_sink() = nullptr;
+        CHECK(sink_producer_output.empty() && sink_capture.hits == 1 &&
+                  sink_capture.w == W && sink_capture.h == H &&
+                  sink_capture.format == VK_FORMAT_R8G8B8A8_UNORM &&
+                  sink_capture.pixels == first,
+              "evicting a GPU-only color target hands its exact pixels to the registered sink");
     }
 
     // Renderer-owned FP16 targets must retain HDR values through both CPU RTT readback/upload and
