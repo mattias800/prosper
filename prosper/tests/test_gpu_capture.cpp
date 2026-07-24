@@ -105,6 +105,7 @@ int main() {
     draw.ps.has_scissor = true; draw.ps.scissor_left = 12; draw.ps.scissor_top = 19;
     draw.ps.scissor_right = 70; draw.ps.scissor_bottom = 75;
     draw.ps.logic_op_enable = true; draw.ps.logic_op = 6;
+    draw.ps.cb_resolve = true;   // #1240: MODE=3 MSAA resolve flag (v24)
 
     GpuCaptureMetadata meta; meta.width = 480; meta.height = 270; meta.submit_index = 42;
     meta.revision = "deadbeef"; meta.title_id = "PPSA24651"; meta.input_route = "@reach-level.pad";
@@ -213,6 +214,7 @@ int main() {
               v16_scissor_bytes.size() >= 25,
           "v17 capture serializes effective guest scissor state");
     if (v16_scissor_bytes.size() >= 25) {
+        v16_scissor_bytes.resize(v16_scissor_bytes.size() - 9); // v24 count + one resolve flag + zero-failure count
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 12); // v23 count + one raw-draw-state
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 28); // v22 count + three empty vectors
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - 13); // v21 one draw + zero failures
@@ -360,6 +362,7 @@ int main() {
           "writer rejects an out-of-bounds DCC metadata reference");
     CHECK(serialize_gpu_capture(volume_capture, volume_bytes, error),
           "recreated valid v12 DCC bytes after malformed-reference check");
+    volume_bytes.resize(volume_bytes.size() - 9); // v24 count + one resolve flag + zero-failure count
     volume_bytes.resize(volume_bytes.size() - 12); // v23 count + one raw-draw-state
     volume_bytes.resize(volume_bytes.size() - 12); // v22 count + one empty vector
     volume_bytes.resize(volume_bytes.size() - 13); // v21 one logic-op draw + zero failures
@@ -427,9 +430,22 @@ int main() {
     CHECK(read_gpu_capture(path.string(), loaded, error), "versioned capture reads back");
     std::vector<uint8_t> v20_bytes;
     GpuCaptureFile v20_loaded;
+    // v23 simulation (#1240): strip ONLY the v24 resolve tail — the flag must default to false.
+    std::vector<uint8_t> v23_bytes;
+    GpuCaptureFile v23_loaded;
+    CHECK(serialize_gpu_capture(captured, v23_bytes, error) && v23_bytes.size() >= 21,
+          "v24 capture serializes the resolve extension");
+    if (v23_bytes.size() >= 21) {
+        v23_bytes.resize(v23_bytes.size() - 9); // v24 count + one resolve flag + zero-failure count
+        v23_bytes[8] = 23; v23_bytes[9] = v23_bytes[10] = v23_bytes[11] = 0;
+    }
+    CHECK(deserialize_gpu_capture(v23_bytes, v23_loaded, error) &&
+              !v23_loaded.draws[0].ps.cb_resolve,
+          "v23 capture reopens with the historical no-resolve default (#1240)");
     CHECK(serialize_gpu_capture(captured, v20_bytes, error) && v20_bytes.size() >= 21,
           "v21 capture serializes the logic-op extension");
     if (v20_bytes.size() >= 21) {
+        v20_bytes.resize(v20_bytes.size() - 9); // v24 count + one resolve flag + zero-failure count
         v20_bytes.resize(v20_bytes.size() - 12); // v23 count + one raw-draw-state
         v20_bytes.resize(v20_bytes.size() - 28); // v22 count + three empty vectors
         v20_bytes.resize(v20_bytes.size() - 13); // v21 one logic-op draw + zero failures
@@ -484,6 +500,8 @@ int main() {
           "v20 realized draw instance count round-trips");
     CHECK(loaded.draws[0].raw_draw_count == 6 && !loaded.draws[0].raw_indexed,
           "v23 raw draw-packet state round-trips through write/read (#1256)");
+    CHECK(loaded.draws[0].ps.cb_resolve,
+          "v24 MODE=3 resolve flag round-trips through write/read (#1240)");
     CHECK(loaded.raw_shader_versions.size() == 2 &&
           loaded.draws[0].vs_raw_shader_index < loaded.raw_shader_versions.size() &&
           loaded.draws[0].fs_raw_shader_index < loaded.raw_shader_versions.size(),
@@ -826,6 +844,7 @@ int main() {
     if (v13_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        v13_bytes.resize(v13_bytes.size() - 9); // v24 count + one resolve flag + zero-failure count
         v13_bytes.resize(v13_bytes.size() - 12); // v23 count + one raw-draw-state
         v13_bytes.resize(v13_bytes.size() - (4 + 8 * legacy_resource_count)); // v22
         v13_bytes.resize(v13_bytes.size() - 13); // v21 one logic-op draw + zero failures
@@ -849,6 +868,7 @@ int main() {
     if (legacy_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        legacy_bytes.resize(legacy_bytes.size() - 9); // v24 count + one resolve flag + zero-failure count
         legacy_bytes.resize(legacy_bytes.size() - 12); // v23 count + one raw-draw-state
         legacy_bytes.resize(legacy_bytes.size() - (4 + 8 * legacy_resource_count)); // v22
         legacy_bytes.resize(legacy_bytes.size() - 13); // v21 one logic-op draw + zero failures
@@ -898,9 +918,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 24;
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 25;
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 24",
+          error == "unsupported capture version 25",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

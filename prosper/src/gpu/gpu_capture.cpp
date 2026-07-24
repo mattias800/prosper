@@ -44,7 +44,7 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // --inspect-only surface raw-vs-realized offline and flag a decode/realization divergence (e.g. GTA
 // #1163's non-indexed vertex-count inflation) without a live boot. Older captures read fine (the fields
 // default to 0/false = "unknown").
-constexpr uint32_t kVersion = 23;
+constexpr uint32_t kVersion = 24;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -1507,6 +1507,15 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     // ("unknown"). Kept as a trailing block so every v1-v22 record prefix stays byte-exact.
     w.u32(static_cast<uint32_t>(c.draws.size()));
     for (const auto& draw : c.draws) { w.u32(draw.raw_draw_count); w.u32(draw.raw_indexed ? 1u : 0u); }
+    // v24 (#1240) appends CB_COLOR_CONTROL.MODE=3 (MSAA resolve) per draw + failure pipeline.
+    // Without it a replay silently skips the resolve copy (the display source never fills), so the
+    // offline oracle is blind to #1238's behavior. Trailing block: every v1-v23 prefix stays
+    // byte-exact and pre-v24 captures default to false.
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws) w.u8(draw.ps.cb_resolve ? 1u : 0u);
+    w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
+    for (const auto& diagnostic : c.failure_diagnostics)
+        if (diagnostic.pipeline_present) w.u8(diagnostic.pipeline.cb_resolve ? 1u : 0u);
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -2059,6 +2068,25 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             if (!r.u32(draw.raw_draw_count) || !r.u32(ri)) return false;
             draw.raw_indexed = ri != 0;
         }
+    }
+    if (version >= 24) {   // #1240: MODE=3 resolve flag per draw + failure pipeline
+        uint32_t nd = 0;
+        if (!r.u32(nd) || nd != c.draws.size()) { error = "invalid resolve draw-state count"; return false; }
+        for (auto& draw : c.draws) {
+            uint8_t b = 0;
+            if (!r.u8(b)) return false;
+            draw.ps.cb_resolve = b != 0;
+        }
+        uint32_t nf = 0;
+        if (!r.u32(nf) || nf != c.failure_diagnostics.size()) {
+            error = "invalid resolve failure-state count"; return false;
+        }
+        for (auto& diagnostic : c.failure_diagnostics)
+            if (diagnostic.pipeline_present) {
+                uint8_t b = 0;
+                if (!r.u8(b)) return false;
+                diagnostic.pipeline.cb_resolve = b != 0;
+            }
     }
     if (version >= 7 && !validate_failure_diagnostics(c, error)) return false;
     if (r.left) { error = "capture has trailing data"; return false; }
