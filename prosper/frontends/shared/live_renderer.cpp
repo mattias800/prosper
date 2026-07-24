@@ -1,6 +1,7 @@
 // live_renderer.cpp — see live_renderer.hpp. Extracted from boot_trace's PROSPER_RENDER lambda
 // (behavior-preserving); Vulkan-backed, so this unit links Vulkan::Vulkan.
 #include "live_renderer.hpp"
+#include "rtt_injection.hpp"
 #include "live_compute.hpp"
 
 #include "gpu/gpu_execute.hpp"          // DrawItem, set_submit_renderer
@@ -1415,19 +1416,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 !rit->second.rgba->empty()) {
                                 const RttSurf& s = rit->second;
                                 const uint32_t rtt_bpp = prosper::test::backend_color_bytes_per_pixel(s.format);
-                                const size_t expected = static_cast<size_t>(tw) * th * rtt_bpp;
-                                if (s.w == tw && s.h == th && s.rgba->size() == expected) {
-                                    std::memcpy(texture_pixels.data(), s.rgba->data(), expected);
-                                } else {
-                                    std::fill(texture_pixels.begin(), texture_pixels.end(), 0);
-                                    for (uint32_t y = 0; y < th; y++) for (uint32_t x = 0; x < tw; x++) {
-                                        uint32_t sx = (uint32_t)((uint64_t)x * s.w / tw), sy = (uint32_t)((uint64_t)y * s.h / th);
-                                        size_t si = ((size_t)sy * s.w + sx) * rtt_bpp;
-                                        if (si + rtt_bpp <= s.rgba->size())
-                                            std::memcpy(&texture_pixels[((size_t)y * tw + x) * rtt_bpp],
-                                                        &(*s.rgba)[si], rtt_bpp);
-                                    }
-                                }
+                                if (!prosper::frontend::inject_rtt_pixels(
+                                        texture_pixels, tw, th, *s.rgba, s.w, s.h, rtt_bpp))
+                                    continue;
                                 fr.texture_format = s.format;
                                 rtt_hit = true;
                                 resource_rtt_hit = true;
