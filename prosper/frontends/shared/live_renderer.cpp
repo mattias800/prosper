@@ -265,8 +265,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
 #endif
     }
     static std::atomic<int> frame_no{0};
-    if (getenv("PROSPER_GPU_CAPTURE") || getenv("PROSPER_GPU_TIMELINE_CAPTURE") ||
-        getenv("PROSPER_GPU_REPLAY_EXPORT_RTT")) {
+    // Register the capture RTT-seed readers whenever the live renderer is up — not only under the
+    // capture env vars — so the interactive F9 frame grab (request_interactive_capture_bundle, which has
+    // no env var) can seed the renderer-owned RTTs its frame SAMPLES. Registration is free: these lambdas
+    // are only invoked while a capture is actually in flight; a normal render run never calls them.
+    // Without the seed, a submit that samples a deferred/temporal renderer-owned RGBA16F target (Blue
+    // Prince's presenting pass) replays black because that input is captured as all-zeros (#1291).
+    {
         prosper::gpu::set_gpu_capture_rtt_seed_reader([invalidate_ds](uint64_t addr, prosper::gpu::GpuCaptureRttSeed& seed) {
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
             auto it = g_rtt.find(addr); if (it == g_rtt.end()) return false;
