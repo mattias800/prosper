@@ -22,8 +22,9 @@ Real retail PS5 titles running under prosper on Linux — direct, unmodified cap
 | <img src="assets/screenshots/messenger.png" width="400" alt="The Messenger"><br>***The Messenger*** — first level, native 1920×1080 | <img src="assets/screenshots/dead-cells.png" width="400" alt="Dead Cells"><br>***Dead Cells*** — controllable Prisoners' Quarters |
 | <img src="assets/screenshots/blasphemous2.png" width="400" alt="Blasphemous 2"><br>***Blasphemous 2*** — first playable room | <img src="assets/screenshots/evergate.png" width="400" alt="Evergate"><br>***Evergate*** — first tutorial room |
 
-> These are captures of the running compatibility layer. The games' artwork remains the property of its
-> respective owners and is not distributed in this repository.
+> These illustrative screenshots are captures of prosper's own rendered output; the games' artwork remains
+> the property of its respective owners. No game files, assets, keys, or data are redistributed in this
+> repository — you must supply your own legally-obtained dump.
 
 ## Why no CPU emulation?
 
@@ -214,5 +215,6 @@ architecture step are recorded in
 
 ## License
 
-See [LICENSE](LICENSE) if present. Game content and Sony SDK symbols are the property of their
-respective owners and are not distributed here.
+See [LICENSE](LICENSE) if present. Game files, assets, keys, and Sony SDK symbols are the property of
+their respective owners and are not redistributed here; the documentation screenshots are captures of
+prosper's own rendered output, shown for illustration.
