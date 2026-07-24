@@ -356,6 +356,10 @@ if(TARGET prosper_core)
   target_include_directories(test_rtt_injection PRIVATE frontends/shared)
   add_test(NAME rtt_injection COMMAND test_rtt_injection)
 
+  add_executable(test_readback_policy frontends/shared/test_readback_policy.cpp)
+  target_include_directories(test_readback_policy PRIVATE frontends/shared)
+  add_test(NAME readback_policy COMMAND test_readback_policy)
+
   # Bounded-acquire present classification (#1182). Needs Vulkan HEADERS only (VkResult enum), no loader
   # call — link Vulkan::Vulkan purely for its include dirs. Guarded so a headers-less host skips it
   # gracefully; every platform that builds prosper-app has Vulkan available.

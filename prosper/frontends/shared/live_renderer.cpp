@@ -2,6 +2,7 @@
 // (behavior-preserving); Vulkan-backed, so this unit links Vulkan::Vulkan.
 #include "live_renderer.hpp"
 #include "rtt_injection.hpp"
+#include "readback_policy.hpp"
 #include "live_compute.hpp"
 
 #include "gpu/gpu_execute.hpp"          // DrawItem, set_submit_renderer
@@ -2711,8 +2712,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     // authoritative readback, and compute consumers use the lazy target reader above.
                     const bool defer_readback = live_gpu_targets && vo_n > 0 && base &&
                         !phase.authoritative_readback &&
-                        ((is_vo && phase.allows_deferred_scanout_readback() &&
-                          defer_intermediate_scanout) ||
+                        ((is_vo && can_defer_intermediate_scanout_readback(
+                                       phase.allows_deferred_scanout_readback(),
+                                       defer_intermediate_scanout, cpu_needed_same_batch)) ||
                          (!is_vo && base != front_va && rtt_defer_ok));
                     // PROSPER_READBACK_WHY (#1284): classify WHY each non-deferred pass takes the
                     // synchronous CPU readback (75-79 ms/window on Blue Prince's Day One frame).
