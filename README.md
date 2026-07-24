@@ -18,10 +18,30 @@ Real retail PS5 titles running under prosper on Linux — direct, unmodified cap
 (no post-processing), retained at each title's native output resolution. Each reaches the milestone noted
 in [Game compatibility](COMPATIBILITY.md).
 
-| | |
-| :---: | :---: |
-| <img src="assets/screenshots/messenger.png" width="400" alt="The Messenger"><br>***The Messenger*** — first level, native 1920×1080 | <img src="assets/screenshots/dead-cells.png" width="400" alt="Dead Cells"><br>***Dead Cells*** — controllable Prisoners' Quarters |
-| <img src="assets/screenshots/blasphemous2.png" width="400" alt="Blasphemous 2"><br>***Blasphemous 2*** — first playable room | <img src="assets/screenshots/evergate.png" width="400" alt="Evergate"><br>***Evergate*** — first tutorial room |
+<p align="center">
+  <img src="assets/screenshots/messenger.png" alt="The Messenger — first level gameplay"><br>
+  <em><strong>The Messenger</strong> — first level, native 1920×1080</em>
+</p>
+<p align="center">
+  <img src="assets/screenshots/dead-cells.png" alt="Dead Cells — Prisoners' Quarters gameplay"><br>
+  <em><strong>Dead Cells</strong> — controllable Prisoners' Quarters</em>
+</p>
+<p align="center">
+  <img src="assets/screenshots/blasphemous2.png" alt="Blasphemous 2 — first playable room"><br>
+  <em><strong>Blasphemous 2</strong> — first playable room</em>
+</p>
+<p align="center">
+  <img src="assets/screenshots/evergate.png" alt="Evergate — first tutorial room gameplay"><br>
+  <em><strong>Evergate</strong> — first tutorial room</em>
+</p>
+<p align="center">
+  <img src="assets/screenshots/blue-prince-title.png" alt="Blue Prince — title screen"><br>
+  <em><strong>Blue Prince</strong> — title screen</em>
+</p>
+<p align="center">
+  <img src="assets/screenshots/terminator.png" alt="Terminator 2D: NO FATE — attract-mode gameplay"><br>
+  <em><strong>Terminator 2D: NO FATE</strong> — attract-mode gameplay</em>
+</p>
 
 > These illustrative screenshots are captures of prosper's own rendered output; the games' artwork remains
 > the property of its respective owners. No game files, assets, keys, or data are redistributed in this
