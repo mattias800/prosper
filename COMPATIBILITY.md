@@ -26,8 +26,10 @@ Last updated: 2026-07-24
 ## The Messenger — `PPSA24651`
 
 <p align="center">
-  <img src="assets/screenshots/messenger-title.png" width="380" alt="The Messenger — title screen">
-  <img src="assets/screenshots/messenger.png" width="380" alt="The Messenger — first level gameplay">
+  <img src="assets/screenshots/messenger-title.png" alt="The Messenger — title screen">
+</p>
+<p align="center">
+  <img src="assets/screenshots/messenger.png" alt="The Messenger — first level gameplay">
 </p>
 
 The primary Unity 2022 / IL2CPP target boots through the engine, accepts scripted gamepad input, and
@@ -41,8 +43,10 @@ Reusable input routes are documented in
 ## Dead Cells — `PPSA15552`
 
 <p align="center">
-  <img src="assets/screenshots/dead-cells-title.png" width="380" alt="Dead Cells — main menu">
-  <img src="assets/screenshots/dead-cells.png" width="380" alt="Dead Cells — Prisoners' Quarters gameplay">
+  <img src="assets/screenshots/dead-cells-title.png" alt="Dead Cells — main menu">
+</p>
+<p align="center">
+  <img src="assets/screenshots/dead-cells.png" alt="Dead Cells — Prisoners' Quarters gameplay">
 </p>
 
 A deterministic input route passes the splash and menus and reaches the controllable Prisoners'
@@ -62,8 +66,10 @@ See the exact route, current state, and regression workflow in
 ## Blasphemous 2 — `PPSA13579`
 
 <p align="center">
-  <img src="assets/screenshots/blasphemous2-title.png" width="380" alt="Blasphemous 2 — title screen">
-  <img src="assets/screenshots/blasphemous2.png" width="380" alt="Blasphemous 2 — first playable room">
+  <img src="assets/screenshots/blasphemous2-title.png" alt="Blasphemous 2 — title screen">
+</p>
+<p align="center">
+  <img src="assets/screenshots/blasphemous2.png" alt="Blasphemous 2 — first playable room">
 </p>
 
 The FMOD plugin path, AGC marker contract, two-pass HTTP URI parser, and guest-thread return boundary
@@ -80,8 +86,10 @@ The reproducible route and capture recipe are in
 ## Evergate — `PPSA01885`
 
 <p align="center">
-  <img src="assets/screenshots/evergate-title.png" width="380" alt="Evergate — title screen">
-  <img src="assets/screenshots/evergate.png" width="380" alt="Evergate — first tutorial room gameplay">
+  <img src="assets/screenshots/evergate-title.png" alt="Evergate — title screen">
+</p>
+<p align="center">
+  <img src="assets/screenshots/evergate.png" alt="Evergate — first tutorial room gameplay">
 </p>
 
 This Stone Lantern 2D puzzle-platformer boots through its intro and title, navigates the main menu with
@@ -96,6 +104,10 @@ The reproducible route is in
 [`prosper/scripts/evergate/README.md`](prosper/scripts/evergate/README.md).
 
 ## Blue Prince — `PPSA25009`
+
+<p align="center">
+  <img src="assets/screenshots/blue-prince-title.png" alt="Blue Prince — title screen">
+</p>
 
 This Unity target boots to its menu, renders the full opening cinematic, completes the first-room
 load, and renders the "Day One" opening gameplay scene: the Mt. Holly manor exterior, gardens, and
@@ -134,6 +146,13 @@ substantial UI and composition glitches. The later in-game loading path remains 
 text pass, so no gameplay milestone is claimed.
 
 ## Terminator (2D) — `PPSA25872`
+
+<p align="center">
+  <img src="assets/screenshots/terminator-title.png" alt="Terminator 2D: NO FATE — main menu">
+</p>
+<p align="center">
+  <img src="assets/screenshots/terminator.png" alt="Terminator 2D: NO FATE — attract-mode gameplay">
+</p>
 
 This 2D action title reaches its main menu and attract-mode gameplay, verified and recorded by the
 project owner, with a menu-reach snapshot guard in place. The title ID is confirmed; the exact retail
