@@ -870,6 +870,42 @@ struct SpirvCompute {
         const uint32_t bits = bcu(result);
         out[0] = out[1] = out[2] = out[3] = bits;
     }
+    // IMAGE_SAMPLE_C_LZ on a plain 2D texture, lowered as a MANUAL depth compare: sample the shadow
+    // map as an ordinary float texture at explicit LOD 0 and compare its .x against DREF in-shader
+    // using the S#'s compare function. The hardware path (compareEnable sampler over a depth-format
+    // view) needs backend machinery the color-texture path lacks (see the render-runner S# note);
+    // the manual form is exact for NEAREST shadow maps and approximates LINEAR PCF with a hard
+    // threshold. Vulkan compare semantics: result = (reference OP stored); the SQ S# compare enum
+    // (WORD0 [14:12]) matches VkCompareOp order — 0 NEVER, 1 LESS, 2 EQUAL, 3 LEQUAL, 4 GREATER,
+    // 5 NOTEQUAL, 6 GEQUAL, 7 ALWAYS. CONFIDENCE: MED (standard AMD sampler enum ordering; Blue
+    // Prince renders visually-correct shadows with it — the live A/B on #1271).
+    void image_sample_dref_manual_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
+                                     uint32_t dref_bits, uint32_t compare_func, uint32_t out[4]) {
+        uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
+        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+        uint32_t res   = id(); put(code, Op_ImageSampleExplicitLod,
+                                   {t_v4f, res, si, coord, ImgOp_Lod, fconstf(0.0f)});
+        uint32_t depth = id(); put(code, Op_CompositeExtract, {t_f32, depth, res, 0});
+        uint32_t result;
+        if (compare_func == 0u)      result = fconstf(0.0f);   // NEVER
+        else if (compare_func == 7u) result = fconstf(1.0f);   // ALWAYS
+        else {
+            uint32_t op;
+            switch (compare_func) {
+                case 1u: op = Op_FOrdLessThan;         break;
+                case 2u: op = Op_FOrdEqual;            break;
+                case 3u: op = Op_FOrdLessThanEqual;    break;
+                case 4u: op = Op_FOrdGreaterThan;      break;
+                case 5u: op = Op_FOrdNotEqual;         break;
+                default: op = Op_FOrdGreaterThanEqual; break;   // 6 GEQUAL
+            }
+            uint32_t cmp = id(); put(code, op, {t_bool, cmp, bcf(dref_bits), depth});
+            uint32_t r   = id(); put(code, Op_Select, {t_f32, r, cmp, fconstf(1.0f), fconstf(0.0f)});
+            result = r;
+        }
+        const uint32_t bits = bcu(result);
+        out[0] = out[1] = out[2] = out[3] = bits;
+    }
     // image_sample_b 2D: implicit-LOD sample with an LOD BIAS (bias_bits float). Bias only means
     // anything with implicit LOD (fragment derivatives); outside the fragment stage the op resolves
     // like the other samples there — explicit LOD 0 (bias dropped, matching image_sample_2d's rule).
@@ -6098,14 +6134,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // four consecutive address VGPRs, dref at slot 0 per 8.2.5) and LLVM's own
                 // llvm.amdgcn.image.sample.c.lz lowering (dref before coords). CONFIDENCE: MED —
                 // the #825 lane must re-validate against a real rendered shadow once it lights up.
-                // Integer views and non-array dimensions are not legal for this lowering; reject
-                // rather than silently turning a comparison sample into an ordinary color read.
-                if (in.mimg_dim != 5u || uint_texture || !res->depth_compare) {
-                    ok = false; return true;
-                }
-                b.declare_texture(res->binding, Dim_2D, false, true, true);
-                b.image_sample_dref_lz_2d_array(
-                    res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(3)), vread(cvg(0)), out);
+                // Integer views are not legal for this lowering, and a non-shadow S# means the
+                // provenance drifted; reject rather than silently turning a comparison sample into
+                // an ordinary color read.
+                if (uint_texture || !res->depth_compare) { ok = false; return true; }
+                if (in.mimg_dim == 5u) {
+                    b.declare_texture(res->binding, Dim_2D, false, true, true);
+                    b.image_sample_dref_lz_2d_array(
+                        res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(3)), vread(cvg(0)), out);
+                } else if (in.mimg_dim == 1u) {
+                    // Plain 2D form (Blue Prince's lit-material PSes, #1271: 436 rejects/run, all
+                    // op 0x2f dim 1 dmask 0x1 — the entire shadowed lighting pass dropped and the
+                    // scene rendered unattenuated/blown-out). Same 8.2.5 vaddr order with no array
+                    // slice: [dref, u, v]. Lowered as a manual compare against the color-sampled
+                    // shadow map (see image_sample_dref_manual_2d for why not a compare sampler).
+                    b.declare_texture(res->binding, Dim_2D, false);
+                    b.image_sample_dref_manual_2d(res->binding, vread(cvg(1)), vread(cvg(2)),
+                                                  vread(cvg(0)), res->depth_compare_func, out);
+                } else { ok = false; return true; }
             } else if (is_gather_lz || is_gather_lz_o) {
                 // gather4 dmask selects ONE channel (must be a single bit); the result is always the
                 // four texels of that channel -> 4 consecutive VDATA VGPRs, gather order preserved.
@@ -8567,7 +8613,7 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                     // #325) — so array-sampling draws recompile+render instead of being skipped.
                     // 0xa0 is the high-bit sibling of image_sample (0x20), lowered identically (GTA V, #1145).
                     if (i.opcode == 0x20u || i.opcode == 0x27u || i.opcode == 0xa0u) return i.mimg_dim == 1u || i.mimg_dim == 2u || i.mimg_dim == 5u;
-                    if (i.opcode == 0x2fu) return i.mimg_dim == 5u; // IMAGE_SAMPLE_C_LZ 2D_ARRAY
+                    if (i.opcode == 0x2fu) return i.mimg_dim == 1u || i.mimg_dim == 5u; // IMAGE_SAMPLE_C_LZ 2D (#1271) / 2D_ARRAY
                     if (i.opcode == 0x24u || i.opcode == 0x25u || i.opcode == 0x47u) return i.mimg_dim == 1u || i.mimg_dim == 5u;
                     return false;
                 }
