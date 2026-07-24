@@ -249,6 +249,11 @@ RenderState extract_render_state(const GpuState& st) {
     rs.db_depth_control  = dc;
     // Rasterizer cull/front-face/polygon mode (#456). Absent -> 0 -> CULL_NONE/CCW/FILL (prior default).
     rs.pa_su_sc_mode_cntl = rd(st.cx, P::PA_SU_SC_MODE_CNTL);
+    rs.pa_su_poly_offset_front_scale  = rd(st.cx, P::PA_SU_POLY_OFFSET_FRONT_SCALE);
+    rs.pa_su_poly_offset_front_offset = rd(st.cx, P::PA_SU_POLY_OFFSET_FRONT_OFFSET);
+    rs.pa_su_poly_offset_back_scale   = rd(st.cx, P::PA_SU_POLY_OFFSET_BACK_SCALE);
+    rs.pa_su_poly_offset_back_offset  = rd(st.cx, P::PA_SU_POLY_OFFSET_BACK_OFFSET);
+    rs.pa_su_poly_offset_clamp        = rd(st.cx, P::PA_SU_POLY_OFFSET_CLAMP);
     // Stencil op + ref/mask registers (absent -> 0; stencil_enable already gates whether they apply).
     rs.db_stencil_control   = st.cx.count(P::DB_STENCIL_CONTROL)   ? rd(st.cx, P::DB_STENCIL_CONTROL)   : 0u;
     rs.db_stencilrefmask    = st.cx.count(P::DB_STENCILREFMASK)    ? rd(st.cx, P::DB_STENCILREFMASK)    : 0u;
@@ -688,6 +693,34 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     ps.cull_mode  = (PM4_FIELD(su, PA_SU_SC_MODE_CNTL, CULL_FRONT) ? 1u : 0u)
                   | (PM4_FIELD(su, PA_SU_SC_MODE_CNTL, CULL_BACK)  ? 2u : 0u);
     ps.front_face = PM4_FIELD(su, PA_SU_SC_MODE_CNTL, FACE);
+    // Depth bias (#1349): PA_SU_POLY_OFFSET_* hold float BIT PATTERNS; Vulkan's mapping is the
+    // radv inverse (radv programs FRONT_OFFSET = fui(constantFactor), FRONT_SCALE =
+    // fui(slopeFactor * 16), CLAMP = fui(clamp)). Blue Prince programs the D32F configuration
+    // (DB_FMT_CNTL NEG_NUM_DB_BITS=-23 + FLOAT_FMT) during its shadow passes; without the bias
+    // those maps self-shadow into broad acne bands. Vulkan has a single bias for both faces —
+    // prefer the FRONT block when FRONT_ENABLE is set, else the BACK block. CONFIDENCE: MED for
+    // titles that program asymmetric front/back offsets (none observed).
+    const bool bias_front = PM4_FIELD(su, PA_SU_SC_MODE_CNTL, POLY_OFFSET_FRONT_ENABLE) != 0u;
+    const bool bias_back  = PM4_FIELD(su, PA_SU_SC_MODE_CNTL, POLY_OFFSET_BACK_ENABLE) != 0u;
+    ps.depth_bias_enable = (bias_front || bias_back) ? 1u : 0u;
+    if (ps.depth_bias_enable) {
+        const auto as_float = [](uint32_t bits) {
+            float value; std::memcpy(&value, &bits, sizeof value); return value;
+        };
+        const uint32_t scale  = bias_front ? rs.pa_su_poly_offset_front_scale
+                                           : rs.pa_su_poly_offset_back_scale;
+        const uint32_t offset = bias_front ? rs.pa_su_poly_offset_front_offset
+                                           : rs.pa_su_poly_offset_back_offset;
+        ps.depth_bias_constant = as_float(offset);
+        ps.depth_bias_slope    = as_float(scale) / 16.0f;
+        ps.depth_bias_clamp    = as_float(rs.pa_su_poly_offset_clamp);
+        // A non-finite register value would poison the pipeline; treat it as no bias.
+        if (!std::isfinite(ps.depth_bias_constant) || !std::isfinite(ps.depth_bias_slope) ||
+            !std::isfinite(ps.depth_bias_clamp)) {
+            ps.depth_bias_enable = 0u;
+            ps.depth_bias_constant = ps.depth_bias_slope = ps.depth_bias_clamp = 0.0f;
+        }
+    }
     if (PM4_FIELD(su, PA_SU_SC_MODE_CNTL, POLY_MODE) == 0u) {
         ps.polygon_mode = 0u;   // FILL
     } else {
