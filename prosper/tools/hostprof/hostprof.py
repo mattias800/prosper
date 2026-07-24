@@ -44,16 +44,20 @@ import time
 from collections import Counter, defaultdict
 
 # Leaf functions that mean "this thread is parked/idle, not burning CPU". Filtered by default so the
-# histogram reflects real work; pass --keep-idle to see the wait breakdown instead.
+# histogram reflects real work; pass --keep-idle to see the wait breakdown instead. Matched against the
+# SIMPLIFIED leaf name (a bare identifier like `pthread_cond_wait`), NOT the raw gdb frame — so `read$`
+# actually fires (a raw frame ends in " () at file:line") and the risky short tokens can be word-bounded.
+# `select`/`accept` MUST be word-bounded: unanchored they would silently drop real work like
+# select_render_target / device_selection / accept_connection (which then looks "not hot" to the user).
 IDLE_PATTERNS = re.compile(
     r"(pthread_cond_(?:wait|timedwait)|__futex|futex_(?:wait|abstimed)|nanosleep|clock_nanosleep|"
-    r"epoll_wait|__poll|\bpoll\b|ppoll|select|cnd_wait|cnd_timedwait|sched_yield|"
+    r"epoll_wait|__poll|\bpoll\b|ppoll|\bselect\b|cnd_wait|cnd_timedwait|sched_yield|"
     r"__lll_lock_wait|pthread_join|sem_wait|sigwait|do_futex_wait|syscall_cancel|"
     # A bare `syscall`/`__syscall` leaf means the thread is BLOCKED kernel-side (a parked worker in the
     # pool waiting on a futex/io_uring), i.e. not burning user CPU — treat it as idle. Real syscall-heavy
     # work still shows its libc wrapper (e.g. __memmove for a readback, ioctl issuers) as the leaf.
     r"\bsyscall\b|\b__syscall\b|"
-    r"read$|recvmsg|recvfrom|accept4?|waitpid|__wait)"
+    r"read$|recvmsg|recvfrom|\baccept4?\b|waitpid|__wait)"
 )
 
 FRAME0_RE = re.compile(r"^#0\s+(?:0x[0-9a-fA-F]+\s+in\s+)?(.*)$")
@@ -121,7 +125,7 @@ def simplify(name, raw):
 
 
 def sample_once(pid, depth):
-    """One gdb pass -> dict{tid_label: [frames]} where frames are (level, rawname)."""
+    """One gdb pass -> (dict{tid_label: [frames]}, gdb_stderr). Frames are (level, rawname)."""
     try:
         p = subprocess.run(
             ["gdb", "-p", str(pid), "-batch", "-nx",
@@ -144,7 +148,7 @@ def sample_once(pid, depth):
             frames.append((int(m.group(1)), m.group(2)))
     if cur is not None:
         threads[cur] = frames
-    return threads
+    return threads, p.stderr
 
 
 def self_test():
@@ -168,6 +172,26 @@ def self_test():
         ok = got == want
         bad += not ok
         print(f"  [{'OK ' if ok else 'BAD'}] {got!r}" + ("" if ok else f"  (want {want!r})"))
+
+    # Idle-filter cases: parked leaves must be filtered, but real functions that merely CONTAIN an idle
+    # token as a substring (select_render_target, device_selection, accept_connection) must NOT be —
+    # the word-bounded \bselect\b / \baccept4?\b guards. Checked against the simplified name, as the loop
+    # does. (idle_want=True means "should be treated as idle/filtered".)
+    idle_cases = [
+        ("select ()", True), ("pthread_cond_wait ()", True), ("__futex_abstimed_wait64 ()", True),
+        ("syscall ()", True), ("__libc_read () at ../sysdeps/unix/sysv/linux/read.c:26", True),
+        ("accept4 ()", True),
+        ("prosper::gpu::select_render_target(int)", False), ("prosper::vk::device_selection()", False),
+        ("prosper::net::accept_connection(int)", False), ("prosper::gpu::half_to_float(unsigned short)", False),
+        ("__memmove_avx512_unaligned_erms ()", False),
+    ]
+    for raw, idle_want in idle_cases:
+        got = bool(IDLE_PATTERNS.search(simplify(raw, False)))
+        ok = got == idle_want
+        bad += not ok
+        print(f"  [{'OK ' if ok else 'BAD'}] idle={got} {simplify(raw, False)!r}"
+              + ("" if ok else f"  (want idle={idle_want})"))
+
     print("self-test: PASS" if not bad else f"self-test: {bad} FAILED")
     return 1 if bad else 0
 
@@ -192,6 +216,7 @@ def main():
         sys.exit(self_test())
     if not args.target:
         ap.error("target (pid or process name) is required unless --self-test is given")
+    args.interval = max(0.0, args.interval)   # a negative interval would crash time.sleep
 
     pid = resolve_pid(args.target)
     thread_re = re.compile(args.thread) if args.thread else None
@@ -202,8 +227,18 @@ def main():
     captured = 0
     sys.stderr.write(f"hostprof: sampling pid {pid} x{args.samples} (depth {args.depth}) ...\n")
     for i in range(args.samples):
-        threads = sample_once(pid, args.depth)
+        threads, gdb_err = sample_once(pid, args.depth)
         if not threads:
+            # First pass produced nothing: almost always gdb couldn't attach (ptrace_scope, wrong pid,
+            # process exited). Surface gdb's own reason so the user doesn't misread the empty result as
+            # "everything idle" — the whole point of this tool is to work where perf can't.
+            if i == 0 and captured == 0:
+                hint = next((ln for ln in (gdb_err or "").splitlines()
+                             if ln.strip() and "warning:" not in ln.lower()), "")
+                sys.stderr.write("hostprof: gdb returned no threads on the first pass"
+                                 + (f" — {hint.strip()}" if hint else
+                                    " (attach failed? check the pid and kernel.yama.ptrace_scope)")
+                                 + "\n")
             time.sleep(args.interval)
             continue
         for label, frames in threads.items():
@@ -211,13 +246,14 @@ def main():
                 continue
             if thread_re and not any(thread_re.search(f[1]) for f in frames):
                 continue
-            if focus_tid and f"({focus_tid} " not in label and f" {focus_tid})" not in label \
-               and f" {focus_tid} " not in label:
-                # busiest-thread mode: gdb's "Thread N (LWP <tid> ...)" carries the LWP tid
-                if f"LWP {focus_tid}" not in label:
-                    continue
+            if focus_tid and f"LWP {focus_tid}" not in label:
+                # busiest-thread mode: gdb's thread header carries the LWP tid as "(LWP <tid>)".
+                continue
             leaf_raw = frames[0][1]
-            if not args.keep_idle and IDLE_PATTERNS.search(leaf_raw):
+            # Idle detection runs on the CLEAN function name (not the raw frame): a raw frame ends in
+            # " () at file:line", which would defeat anchored patterns like read$, and the clean name is
+            # what the word-bounded select/accept guards need to avoid dropping real select_*/accept_*.
+            if not args.keep_idle and IDLE_PATTERNS.search(simplify(leaf_raw, False)):
                 continue
             leaves[simplify(leaf_raw, args.raw_names)] += 1
             if args.mode == "folded":

@@ -48,3 +48,7 @@ frame_*.png
 
 # Local universal MoltenVK for the macOS (Rosetta/x86_64) app build — not committed
 /.macos-vulkan/
+
+# Python bytecode from tools/ scripts (e.g. tools/hostprof, tools/snapshot)
+__pycache__/
+*.pyc
