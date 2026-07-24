@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>   // setenv/_putenv_s (PROSPER_DENY_SUBSTR arming)
 #include <cstring>
 #include <filesystem>
 #include <map>
@@ -48,6 +49,16 @@ static_assert(sizeof(GuestTimeval) == 0x10, "SceKernelTimeval ABI");
 
 int main() {
     std::printf("== test_file_binary ==\n");
+    // PROSPER_DENY_SUBSTR (#1237): armed for the whole process BEFORE any guest file op (the
+    // substring list is cached on first use). The unique marker cannot collide with any other
+    // path this test opens; the case-variant open below proves matching is case-insensitive
+    // (the guest namespace resolves case-insensitively since #1233, so a casing variant must
+    // not defeat the deny knob).
+#ifdef _WIN32
+    _putenv_s("PROSPER_DENY_SUBSTR", ".TMPDENY");
+#else
+    setenv("PROSPER_DENY_SUBSTR", ".TMPDENY", 1);
+#endif
     const char* path = "prosper-test-file-binary.tmp";
     std::array<uint8_t, 512> expected{};
     for (size_t i = 0; i < expected.size(); ++i) expected[i] = (uint8_t)(i * 37u + 11u);
@@ -500,6 +511,20 @@ int main() {
           "libc open retains the -1 plus errno contract");
     CHECK((uint32_t)kernel_missing == 0x80020002u,
           "sceKernelOpen returns SCE_KERNEL_ERROR_ENOENT directly");
+
+    // PROSPER_DENY_SUBSTR case-insensitivity (#1237): the fixture EXISTS on disk, but its name
+    // contains a CASE VARIANT of the armed ".tmpdeny" substring — the deny must still fire.
+    {
+        const char* deny_fixture = "prosper-deny-fixture.TmpDeny";
+        FILE* deny_out = std::fopen(deny_fixture, "wb");
+        CHECK(deny_out != nullptr, "create deny fixture");
+        if (deny_out) { std::fputs("x", deny_out); std::fclose(deny_out); }
+        const uint64_t denied = open_fn
+            ? open_fn((uint64_t)(uintptr_t)deny_fixture, 0, 0, 0, 0, 0) : 0;
+        CHECK((uint32_t)denied == 0x80020002u,
+              "PROSPER_DENY_SUBSTR denies a case-variant spelling (ENOENT despite the file existing)");
+        std::remove(deny_fixture);
+    }
 
     // Virtual-root clamp (#1234): the jailed title's "/app0/.." is its readable root on real
     // hardware (ArcRunner opens it during boot). It must resolve (directory open succeeds), a

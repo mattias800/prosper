@@ -517,6 +517,56 @@ int main() {
         CHECK((uint32_t)live_label.next == 1,
               "live consumed-marker labels still execute DmaData(0) then ReleaseMem(1)");
     }
+
+    // Plain EOP labels have no DmaData-init lifecycle. Their untouched high dword may look like a
+    // heap pointer while the low dword is the legitimate fence payload; the consumed-marker forge
+    // guard must not permanently suppress that ordinary 32-bit completion write.
+    {
+        static struct alignas(0x20) PlainLabel { uint64_t value; uint64_t pad[3]; } label{};
+        label.value = 0x1000000000ull;
+        const uint64_t addr = (uint64_t)(uintptr_t)&label;
+        uint32_t rel[7] = {};
+        rel[0] = PM4(7, IT_NOP, R_RELEASE_MEM);
+        rel[1] = (uint32_t)addr; rel[2] = (uint32_t)(addr >> 32);
+        rel[3] = 1; rel[4] = 1; rel[6] = 4;
+        GpuState st; run_cb(rel, 7, st);
+        CHECK(label.value == 0x1000000001ull,
+              "plain pointer-shaped fence label is not treated as a consumed-marker forge");
+    }
+
+    // A suppressed LIVE fence must not count as a completed generation. If an earlier generation's
+    // init never executes, its pointer-valued REL1/REL2 is suppressed; the next generation's real
+    // DmaData(0)+ReleaseMem(1) must still see an outstanding init and signal the label. Counting the
+    // suppressed fence makes dma_exec_n == rel_exec_n and the forge guard suppresses this real fence.
+    for (uint32_t stale_sel : {1u, 2u}) {
+        struct alignas(0x20) Label { uint64_t value; uint64_t pad[3]; } label{};
+        const uint64_t addr = (uint64_t)(uintptr_t)&label;
+        GpuState st;
+
+        prosper_label_hist_dma_built(addr, 0x5000 + stale_sel, 0, 1);
+        label.value = 0x1000000008ull; // freed/relinked pointer: missing init for generation 1
+        uint32_t stale_rel[7] = {};
+        stale_rel[0] = PM4(7, IT_NOP, R_RELEASE_MEM);
+        stale_rel[1] = (uint32_t)addr; stale_rel[2] = (uint32_t)(addr >> 32);
+        stale_rel[3] = stale_sel; stale_rel[4] = 1; stale_rel[6] = 4;
+        run_cb(stale_rel, 7, st);
+        CHECK(label.value == 0x1000000008ull,
+              stale_sel == 1 ? "REL1-LIVE stale fence is suppressed"
+                             : "REL2-LIVE stale fence is suppressed");
+
+        prosper_label_hist_dma_built(addr, 0x6000 + stale_sel, 0, 1);
+        uint32_t live_pair[14] = {};
+        live_pair[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        live_pair[1] = (uint32_t)addr; live_pair[2] = (uint32_t)(addr >> 32);
+        live_pair[3] = 0; live_pair[4] = 0; live_pair[5] = 4; live_pair[6] = 0x303;
+        live_pair[7] = PM4(7, IT_NOP, R_RELEASE_MEM);
+        live_pair[8] = (uint32_t)addr; live_pair[9] = (uint32_t)(addr >> 32);
+        live_pair[10] = 1; live_pair[11] = 1; live_pair[13] = 4;
+        run_cb(live_pair, 14, st);
+        CHECK((uint32_t)label.value == 1,
+              stale_sel == 1 ? "REL1-LIVE suppression does not consume the next generation"
+                             : "REL2-LIVE suppression does not consume the next generation");
+    }
     mb3_reset_pool_candidates_for_test();
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

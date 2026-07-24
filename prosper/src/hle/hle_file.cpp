@@ -9,6 +9,7 @@
 #include "heap_mutex.hpp"   // #707: keep the APR mutex off macOS __DATA
 #include "../host/guest_write_watch.hpp"   // #1144 B5: disarm texture watches before reading into guest mem
 #include "../host/boot_program.hpp"        // #1226: resolve_host_path_case (PS5 FS namespace is case-insensitive)
+#include <cctype>        // #1237: case-insensitive PROSPER_DENY_SUBSTR matching
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -479,6 +480,10 @@ namespace {
     // redirected to a guaranteed-missing host path, so open/stat fail with ENOENT.
     // Diagnostic knob (off by default) — used to A/B whether the title's boot flow gates on a
     // file class we can't service yet (e.g. .usm movies through the stubbed CRI/AJM decoders).
+    // Matching is CASE-INSENSITIVE (#1237): translate() resolves guest paths case-insensitively
+    // against the dump (the PS5 namespace is effectively case-insensitive, #1233), so a guest
+    // spelling `Intro.USM` must not slip past a `.usm` deny — a casing variant defeating the knob
+    // makes the A/B experiment lie.
     bool deny_path(const std::string& guest) {
         static std::vector<std::string> subs = [] {
             std::vector<std::string> v;
@@ -491,11 +496,16 @@ namespace {
                     pos = c + 1;
                 }
             }
+            for (auto& sub : v)
+                for (char& ch : sub)
+                    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
             return v;
         }();
         if (subs.empty()) return false;
+        std::string lower = guest;
+        for (char& ch : lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
         for (const auto& sub : subs)
-            if (guest.find(sub) != std::string::npos) return true;
+            if (lower.find(sub) != std::string::npos) return true;
         return false;
     }
     // Lexically normalize a virtual sub-path (the part AFTER a /app0|/temp0|/savedata0 root),

@@ -62,6 +62,11 @@ def replay_hash(replay_bin: str, capsule: Path, timeout: int) -> str:
     proc = subprocess.run([replay_bin, str(capsule)], capture_output=True, text=True,
                           timeout=timeout, env=child_env)
     out_hash = parse_output_hash(proc.stdout + proc.stderr)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"gpu_replay failed for {capsule.name} (exit {proc.returncode})"
+            + (f" after reporting hash {out_hash}" if out_hash is not None else "")
+            + "\n--- stderr tail ---\n" + "\n".join(proc.stderr.splitlines()[-8:]))
     if out_hash is None:
         raise RuntimeError(
             f"no output hash from gpu_replay for {capsule.name} (exit {proc.returncode})\n"

@@ -98,24 +98,28 @@ class Module:
                 continue
             d = raw[o:o + fs]
             n = len(d)
-            for i in range(n - 7):
+            # Examine every possible instruction start. Each decoder below owns its exact bounds
+            # check; a shared `range(n - 7)` dropped seven-byte store/cmp instructions that ended
+            # exactly at the PT_LOAD boundary (#1314), as well as shorter tail calls.
+            for i in range(n):
                 b = d[i]
-                if b in (0x48, 0x4c) and d[i + 1] in (0x8d, 0x8b, 0x89) and d[i + 2] in MODRM_RIP:
+                if (i + 7 <= n and b in (0x48, 0x4c) and
+                        d[i + 1] in (0x8d, 0x8b, 0x89) and d[i + 2] in MODRM_RIP):
                     disp = struct.unpack_from('<i', d, i + 3)[0]
                     site = v + i
                     kind = {0x8d: 'lea', 0x8b: 'load', 0x89: 'store'}[d[i + 1]]
                     self.code_xref[site + 7 + disp].append((site, kind))
-                elif b == 0xff and i + 5 < n and (d[i + 1] & 0xc7) == 0x05:
+                elif i + 6 <= n and b == 0xff and (d[i + 1] & 0xc7) == 0x05:
                     reg = (d[i + 1] >> 3) & 7
                     if reg in (2, 4):
                         disp = struct.unpack_from('<i', d, i + 2)[0]
                         site = v + i
                         self.code_xref[site + 6 + disp].append((site, 'call*' if reg == 2 else 'jmp*'))
-                elif b == 0xe8:
+                elif i + 5 <= n and b == 0xe8:
                     disp = struct.unpack_from('<i', d, i + 1)[0]
                     site = v + i
                     self.code_xref[site + 5 + disp].append((site, 'call'))
-                elif b == 0xc6 and d[i + 1] == 0x05:
+                elif i + 7 <= n and b == 0xc6 and d[i + 1] == 0x05:
                     # mov BYTE PTR [rip+disp], imm8  (c6 /0) -- 7 bytes. This is the byte-store form
                     # that sets a guest 1-byte flag; objdump/readelf and the loads/stores above all
                     # miss it, so it is how the *writer* of a flag byte is found (e.g. the Bendy Agc
@@ -123,13 +127,12 @@ class Module:
                     disp = struct.unpack_from('<i', d, i + 2)[0]
                     site = v + i
                     self.code_xref[site + 7 + disp].append((site, 'storeb'))
-                elif b == 0xc7 and d[i + 1] == 0x05:
+                elif i + 10 <= n and b == 0xc7 and d[i + 1] == 0x05:
                     # mov DWORD PTR [rip+disp], imm32  (c7 /0) -- 10 bytes; the dword store-immediate.
-                    if i + 10 <= n:
-                        disp = struct.unpack_from('<i', d, i + 2)[0]
-                        site = v + i
-                        self.code_xref[site + 10 + disp].append((site, 'stored'))
-                elif b == 0x80 and d[i + 1] == 0x3d:
+                    disp = struct.unpack_from('<i', d, i + 2)[0]
+                    site = v + i
+                    self.code_xref[site + 10 + disp].append((site, 'stored'))
+                elif i + 7 <= n and b == 0x80 and d[i + 1] == 0x3d:
                     # cmp BYTE PTR [rip+disp], imm8  (80 /7) -- 7 bytes; the paired flag-*read* form
                     # (a spin-loop testing a 1-byte flag, e.g. the Bendy suspend-point watchdog).
                     disp = struct.unpack_from('<i', d, i + 2)[0]

@@ -19,12 +19,17 @@ For each run it launches the title headless via `boot_trace` (with the gated `PR
   `k_ef_wait` / `k_usleep`). On a BLOCKED run it prints Thread 1's stack as evidence.
 - **RUNNING** — an active render/submit frame (`execute_ordered` / `agc_driver_submit` /
   `run_command_buffer` / `present` / `SubmitDcb`).
+- **UNKNOWN** — `guest_bt` timed out/failed, or returned no recognized running/wait frame; the run
+  produced no trustworthy hang verdict.
+- **DEAD** — `boot_trace` exited before the configured sample time, so no live thread could be
+  classified.
 
 Plain `gdb` **cannot** unwind the guest main thread through prosper's HLE stub boundary (its backtrace
 is all `??? `), so `guest_bt` (which re-sections the flattened module ELFs) is required.
 
-Exit status is `1` if any run was BLOCKED, `0` otherwise — so it doubles as a bisect/gate predicate
-(e.g. "does commit X still hang evergate at boot?").
+Exit status is `1` if any run was BLOCKED, `2` if any run was UNKNOWN/DEAD and no hang was observed,
+and `0` only when every run was classified RUNNING. This makes debugger/attach failures inconclusive
+instead of false-green while preserving the hang/no-hang bisect predicate.
 
 ## Requirements
 

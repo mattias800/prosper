@@ -371,6 +371,11 @@ if(TARGET prosper_core)
     target_include_directories(test_prosper_app_present_policy PRIVATE frontends/prosper-app)
     target_link_libraries(test_prosper_app_present_policy PRIVATE Vulkan::Vulkan)
     add_test(NAME prosper_app_present_policy COMMAND test_prosper_app_present_policy)
+
+    add_executable(test_present_blit_policy frontends/shared/test_present_blit_policy.cpp)
+    target_include_directories(test_present_blit_policy PRIVATE frontends/shared)
+    target_link_libraries(test_present_blit_policy PRIVATE Vulkan::Vulkan)
+    add_test(NAME present_blit_policy COMMAND test_present_blit_policy)
   endif()
 
   add_executable(test_sync_on_address tests/test_sync_on_address.cpp)

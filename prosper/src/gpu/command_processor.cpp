@@ -827,7 +827,10 @@ static void honor_eop_write(const Pm4Command& c) {
                           // consumed-marker population so plain fence labels (Messenger) are never
                           // affected. CONFIDENCE: HIGH (mechanism captured live, sessions 2-5).
                           if (rel1_stomp_guard() && label_is_consumed_marker(c.rel_addr)) {
-                              label_hist_rel_exec(c.rel_addr, pre, c.queue_origin);   // ring visibility; write skipped
+                              // Keep the event visible without consuming an init generation. A
+                              // skipped fence did not signal anything; advancing rel_exec_n here
+                              // makes the next real init/fence pair look stale and suppresses it.
+                              label_hist_event(c.rel_addr, LE_REL_EXEC, pre, c.queue_origin);
                               return;
                           }
                       }
@@ -859,7 +862,7 @@ static void honor_eop_write(const Pm4Command& c) {
                       const bool live_pair =
                           fh.dma_exec_n.load(std::memory_order_relaxed) >
                           fh.rel_exec_n.load(std::memory_order_relaxed);
-                      if (forge_guard() && !live_pair) {
+                      if (forge_guard() && label_is_consumed_marker(c.rel_addr) && !live_pair) {
                           report_suspect_write("REL1-FORGE", c.rel_addr, c.rel_value, pre, pkt_addr(c));
                           // Ring visibility WITHOUT the rel_exec_n bump: a suppressed fence must not
                           // advance the consumed-count, or the NEXT generation's live check above
@@ -901,7 +904,9 @@ static void honor_eop_write(const Pm4Command& c) {
                   if (rel1_stomp_guard() && ptr_like(pre) && (uint32_t)pre != 0 &&
                       pre != c.rel_value && label_is_consumed_marker(c.rel_addr)) {
                       report_suspect_write("REL2-LIVE", c.rel_addr, c.rel_value, pre, pkt_addr(c));
-                      label_hist_rel_exec(c.rel_addr, pre, c.queue_origin);   // ring visibility; write skipped
+                      // A suppressed write belongs in the diagnostic ring, but it must not advance
+                      // the completed-fence counter (same protocol rule as REL1-LIVE above).
+                      label_hist_event(c.rel_addr, LE_REL_EXEC, pre, c.queue_origin);
                       return;
                   }
                   uint64_t v = c.rel_value;           memcpy(dst, &v, sizeof v);

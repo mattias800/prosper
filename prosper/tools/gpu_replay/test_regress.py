@@ -6,6 +6,9 @@ import importlib.util
 import os
 import sys
 import unittest
+from pathlib import Path
+from subprocess import CompletedProcess
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SPEC = importlib.util.spec_from_file_location("prosper_regress", os.path.join(HERE, "regress.py"))
@@ -33,6 +36,27 @@ class ParseOutputHashTests(unittest.TestCase):
     def test_lowercased(self):
         self.assertEqual(REGRESS.parse_output_hash("output=1x1 hash=ABCDEF0123456789"),
                          "abcdef0123456789")
+
+
+class ReplayHashTests(unittest.TestCase):
+    @mock.patch.object(REGRESS.subprocess, "run")
+    def test_rejects_hash_when_replay_exits_nonzero(self, run):
+        run.return_value = CompletedProcess(
+            ["gpu_replay", "scene.prgcap"], 1,
+            stdout="[gpureplay] output=8x8 hash=1234567890abcdef\n",
+            stderr="gpu_replay: output mismatch\n")
+
+        with self.assertRaisesRegex(RuntimeError, r"exit 1.*hash 1234567890abcdef"):
+            REGRESS.replay_hash("gpu_replay", Path("scene.prgcap"), 10)
+
+    @mock.patch.object(REGRESS.subprocess, "run")
+    def test_accepts_hash_only_on_successful_exit(self, run):
+        run.return_value = CompletedProcess(
+            ["gpu_replay", "scene.prgcap"], 0,
+            stdout="[gpureplay] output=8x8 hash=1234567890ABCDEF\n", stderr="")
+
+        self.assertEqual(REGRESS.replay_hash("gpu_replay", Path("scene.prgcap"), 10),
+                         "1234567890abcdef")
 
 
 class ClassifyCheckTests(unittest.TestCase):

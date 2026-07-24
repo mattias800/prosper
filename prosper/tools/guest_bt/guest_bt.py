@@ -35,6 +35,12 @@ def parse_initlog(path):
         sys.exit('guest_bt: no [initlog] lines in %s (run the title with PROSPER_INITLOG=1)' % path)
     return mods
 
+def run_gdb(gdb, pid, plugin, command, env):
+    """Run the debugger and preserve its status for callers such as hang_probe."""
+    return subprocess.run([gdb, '-p', str(pid), '-batch',
+                           '-ex', 'set debuginfod enabled off', '-ex', 'set pagination off',
+                           '-ex', 'source %s' % plugin, '-ex', command], env=env).returncode
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--pid', type=int, required=True)
@@ -85,9 +91,7 @@ def main():
     cmd = args.thread or ''
     gdb_cmd = 'guest-bt-all' if (args.all or not cmd) else ('guest-bt %s' % cmd)
     env = dict(os.environ, PROSPER_GBT_CONFIG=cfg_path)
-    subprocess.run([args.gdb, '-p', str(args.pid), '-batch',
-                    '-ex', 'set debuginfod enabled off', '-ex', 'set pagination off',
-                    '-ex', 'source %s' % PLUGIN, '-ex', gdb_cmd], env=env)
+    return run_gdb(args.gdb, args.pid, PLUGIN, gdb_cmd, env)
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
