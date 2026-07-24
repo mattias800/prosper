@@ -48,13 +48,6 @@ static_assert(sizeof(GuestTimeval) == 0x10, "SceKernelTimeval ABI");
 
 int main() {
     std::printf("== test_file_binary ==\n");
-    // #1234: map /app0 to the cwd BEFORE any guest file op (the mount root caches on first
-    // translate), so the virtual-root clamp tests below resolve against real files.
-#ifdef _WIN32
-    _putenv_s("PROSPER_APP0", ".");
-#else
-    setenv("PROSPER_APP0", ".", 1);
-#endif
     const char* path = "prosper-test-file-binary.tmp";
     std::array<uint8_t, 512> expected{};
     for (size_t i = 0; i < expected.size(); ++i) expected[i] = (uint8_t)(i * 37u + 11u);

@@ -435,21 +435,25 @@ namespace {
     // depending on root metadata beyond existence + directory type. CONFIDENCE: MED on the
     // exact real-hardware root entry list; HIGH that existence must succeed.
     std::string virtual_root_dir() {
-        static std::string dir;
-        if (dir.empty()) {
-            dir = temp0_root() + "/prosper-vroot";
+        // Magic-static (thread-safe init: titles do file I/O from several threads). The vroot
+        // lives OUTSIDE the guest-visible /temp0 tree (a sibling of the scratch dir): inside it,
+        // a title enumerating temp0 would see a foreign entry, could write root entries, and a
+        // temp0 wipe would empty the root listing for the rest of the run (review of #1234).
+        static const std::string dir = [] {
+            std::string d = temp0_root() + "-vroot";
 #ifdef _WIN32
-            _mkdir(dir.c_str());
-            _mkdir((dir + "/app0").c_str());
-            _mkdir((dir + "/temp0").c_str());
-            _mkdir((dir + "/savedata0").c_str());
+            _mkdir(d.c_str());
+            _mkdir((d + "/app0").c_str());
+            _mkdir((d + "/temp0").c_str());
+            _mkdir((d + "/savedata0").c_str());
 #else
-            ::mkdir(dir.c_str(), 0777);
-            ::mkdir((dir + "/app0").c_str(), 0777);
-            ::mkdir((dir + "/temp0").c_str(), 0777);
-            ::mkdir((dir + "/savedata0").c_str(), 0777);
+            ::mkdir(d.c_str(), 0777);
+            ::mkdir((d + "/app0").c_str(), 0777);
+            ::mkdir((d + "/temp0").c_str(), 0777);
+            ::mkdir((d + "/savedata0").c_str(), 0777);
 #endif
-        }
+            return d;
+        }();
         return dir;
     }
     // Host directory backing guest "/savedata0" — the mounted save-data area that
@@ -579,6 +583,20 @@ namespace {
                 return vroot;
             }
             if (reenters_mount) {
+                // A savedata0 re-entry with NO save mounted must not proceed: the mount-mapping
+                // below would find no root and fall to the host-passthrough return — the exact
+                // fall-through this block promises never happens (review of #1234). Deny it like
+                // any other unmounted destination; the direct spelling keeps its historical
+                // behavior.
+                if (mount_path_matches(normalized, "/savedata0")) {
+                    std::lock_guard<std::mutex> lk(g_save0_mx);
+                    if (g_save0.empty()) {
+                        if (filelog())
+                            fprintf(stderr, "[file] DENIED (sandbox traversal, save unmounted) '%s'\n",
+                                    guest);
+                        return "/prosper-denied" + p;
+                    }
+                }
                 p = normalized;
             } else {
                 if (filelog()) fprintf(stderr, "[file] DENIED (sandbox traversal) '%s'\n", guest);
