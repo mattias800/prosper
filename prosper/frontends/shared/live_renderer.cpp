@@ -496,12 +496,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             }
             return prosper::gpu::LiveTargetByteReadResult::NotFound;
         });
-    if (getenv("PROSPER_GPU_CAPTURE") || getenv("PROSPER_GPU_TIMELINE_CAPTURE") ||
-        getenv("PROSPER_GPU_REPLAY_EXPORT_DS"))
-        prosper::gpu::set_gpu_capture_ds_seed_snapshot_reader(
-            [](std::vector<prosper::gpu::GpuCaptureDsSeed>& seeds, std::string& error) {
-                return prosper::test::snapshot_persistent_ds_images(seeds, error);
-            });
+    // Register unconditionally, as for RTT seeds above: the interactive F9 bundle has no capture
+    // environment variable and snapshots persistent depth/stencil state only after it is armed.
+    // Normal rendering pays nothing because the callback is otherwise never invoked (#1307).
+    prosper::gpu::set_gpu_capture_ds_seed_snapshot_reader(
+        [](std::vector<prosper::gpu::GpuCaptureDsSeed>& seeds, std::string& error) {
+            return prosper::test::snapshot_persistent_ds_images(seeds, error);
+        });
     if (getenv("PROSPER_GPU_REPLAY_RTT_SEEDS"))
         prosper::gpu::set_gpu_replay_rtt_seed_writer([](const prosper::gpu::GpuCaptureRttSeed& seed, std::string& error) {
             const VkFormat format = replay_color_format(seed.format);

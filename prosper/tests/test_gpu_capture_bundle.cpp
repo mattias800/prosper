@@ -251,6 +251,34 @@ int main() {
     record_gpu_timeline_present(5, 0, 0, 1920, 1080);
     CHECK(!interactive_capture_bundle_active(), "the re-armed grab completes and disarms");
 
+    // Persistent depth/stencil images can predate the captured frame (for example a shadow-atlas
+    // cascade retained from the previous frame). F9 must snapshot them at the capture boundary and
+    // attach them to the first submit so bundle replay does not start those planes at zero (#1307).
+    const auto ds_bundle_path = std::filesystem::temp_directory_path() /
+        ("prosper-f9-ds-seed-" + std::to_string(nonce) + ".prgbundle");
+    unsigned ds_snapshots = 0;
+    set_gpu_capture_ds_seed_snapshot_reader(
+        [&](std::vector<GpuCaptureDsSeed>& seeds, std::string&) {
+            ++ds_snapshots; seeds = {ds_seed}; return true;
+        });
+    request_interactive_capture_bundle(ds_bundle_path.string());
+    record_gpu_timeline_present(6, 0, 0, 1920, 1080);
+    GpuState empty_submit;
+    record_gpu_timeline_submit(empty_submit, 77);
+    record_gpu_timeline_submit(empty_submit, 78);
+    record_gpu_timeline_present(7, 0, 0, 1920, 1080);
+    GpuCaptureBundle ds_bundle;
+    GpuCaptureFile ds_first, ds_second;
+    CHECK(ds_snapshots == 1 && read_gpu_capture_bundle(ds_bundle_path.string(), ds_bundle, error) &&
+          ds_bundle.submits.size() == 2 &&
+          materialize_gpu_capture_bundle_submit(ds_bundle, 0, ds_first, error) &&
+          materialize_gpu_capture_bundle_submit(ds_bundle, 1, ds_second, error) &&
+          ds_first.ds_seeds.size() == 1 && ds_first.ds_seeds[0].depth == ds_seed.depth &&
+          ds_second.ds_seeds.empty(),
+          "F9 bundle seeds only its first submit with capture-boundary depth/stencil state");
+    set_gpu_capture_ds_seed_snapshot_reader({});
+    std::filesystem::remove(ds_bundle_path, ec);
+
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n"); return 0;
 }

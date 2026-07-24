@@ -1430,8 +1430,25 @@ void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_n
     GpuCaptureFile capture;
     const GpuCaptureMetadata meta = runtime_capture_metadata(submit_no);
     std::string error;
-    if (!capture_gpustate_submit(state, submit_no, meta.width, meta.height, meta, capture, error) ||
-        !append_capture_to_frame_bundle(b.bundle, capture, b.max_unique_bytes, error)) {
+    if (!capture_gpustate_submit(state, submit_no, meta.width, meta.height, meta, capture, error)) {
+        b.failed = true;
+        std::fprintf(stderr, "[grab] frame-bundle: submit %llu failed (%s); grab aborted\n",
+                     static_cast<unsigned long long>(submit_no), error.c_str());
+        return;
+    }
+    // A persistent shadow atlas may have been produced before the captured frame. Seed that
+    // boundary state on the first submit only; later submits observe the replay cache updated by
+    // their predecessors instead of resetting it to the live pre-frame snapshot (#1307). This hook
+    // runs under hle_agc's submit mutex, before renderer sampling, so the Vulkan DS cache cannot be
+    // mutated concurrently as it could from the independent present/flip thread.
+    if (!b.submits && gpu_capture_ds_seed_snapshot_available() &&
+        !read_all_gpu_capture_ds_seeds(capture.ds_seeds, error)) {
+        b.failed = true;
+        std::fprintf(stderr, "[grab] frame-bundle: initial DS snapshot failed (%s); grab aborted\n",
+                     error.c_str());
+        return;
+    }
+    if (!append_capture_to_frame_bundle(b.bundle, capture, b.max_unique_bytes, error)) {
         b.failed = true;
         std::fprintf(stderr, "[grab] frame-bundle: submit %llu failed (%s); grab aborted\n",
                      static_cast<unsigned long long>(submit_no), error.c_str());
