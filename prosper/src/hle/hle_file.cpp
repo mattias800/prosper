@@ -566,6 +566,17 @@ namespace {
             if (filelog()) fprintf(stderr, "[file] DENIED (PROSPER_DENY_SUBSTR) '%s'\n", guest);
             return "/prosper-denied" + p;
         }
+        // #1323: separator-only spellings name the jailed title's root, not the host root.
+        // Keep this consistent with the traversal spelling "/app0/.." handled below. Accept
+        // both guest separators (and repeated separators) so no equivalent root spelling can
+        // fall through to the host-passthrough return.
+        if (!p.empty() && p.find_first_not_of("/\\") == std::string::npos) {
+            const std::string vroot = virtual_root_dir();
+            if (filelog())
+                fprintf(stderr, "[file] open '%s' -> virtual root '%s'\n", guest,
+                        vroot.c_str());
+            return vroot;
+        }
         // Map /app0[/...] -> <root>[/...], /temp0[/...] -> scratch dir, /savedata0[/...] -> the mounted
         // save dir; other paths as-is. Guest paths are the game's own and normally contain no ".." —
         // but a path that climbs above its virtual root (e.g. "/savedata0/../x") would otherwise compose
@@ -744,6 +755,10 @@ std::string resolve_guest_path(const char* guest_path) {
     // is the absolute spelling, "file://<relative>" the BaseDir-relative one).
     if (p.rfind("file://", 0) == 0) p = p.substr(7);
     if (p.empty()) return {};
+    // A separator-only spelling names the guest root. Send it directly to translate() so a bare
+    // backslash reaches the virtual-root case without making every leading-backslash path host-
+    // absolute on Windows ("\\foo" and UNC-like spellings must remain rooted under /app0).
+    if (p.find_first_not_of("/\\") == std::string::npos) return translate(p.c_str());
     // Sony media APIs accept content paths relative to the title's application root. Unlike the
     // guest libc, a native host backend has no guest current-working-directory state, so root the
     // relative spelling explicitly before applying the shared mount translation.
