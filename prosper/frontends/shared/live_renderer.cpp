@@ -173,6 +173,15 @@ std::vector<uint8_t> inspection_rgba8(const std::vector<uint8_t>& pixels,
     return rgba;
 }
 
+// #1330: gpu_replay sets PROSPER_PREFIX_INSPECT for its ordered-prefix modes (--draw N:M,
+// --draw-steps, --through-operation) before the first render, so a prefix ending on a non-RGBA8
+// color pass publishes that surface (inspection-converted) instead of a stale earlier RGBA8 pass.
+// Never set outside those diagnostic replays; cached once — the flag is process-lifetime.
+bool prefix_inspect_publish() {
+    static const bool enabled = getenv("PROSPER_PREFIX_INSPECT") != nullptr;
+    return enabled;
+}
+
 // Pixel decoding is a pure function of these fields for guest-backed textures. Keep this cache local
 // to one renderer callback: graphics spans are split at compute operations, so guest texture bytes
 // cannot change within its lifetime. Live RTT inputs are excluded separately because an earlier pass
@@ -3153,6 +3162,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         if (base && base == front_va) px_front = pass_pixels;  // the flipped buffer
                         if (is_vo)                    px_vo = pass_pixels;     // any registered scanout
                         px_last = pass_pixels;                                  // last non-empty (fallback)
+                    } else if (!rendered_pixels.empty() && prefix_inspect_publish()) {
+                        // #1330: under gpu_replay's ordered-prefix inspection (--draw/--draw-steps/
+                        // --through-operation set PROSPER_PREFIX_INSPECT), a prefix ending on a
+                        // non-RGBA8 pass (an FP16 HDR scene target) must return THAT surface, not
+                        // whatever stale RGBA8 pass ran earlier. Publish an inspection-converted copy
+                        // as the weakest fallback: any RGBA8 pass afterwards still overwrites it, and
+                        // with the env unset (every live/normal replay run) behavior is byte-identical.
+                        std::vector<uint8_t> converted =
+                            inspection_rgba8(rendered_pixels, gw, gh, pass_format);
+                        if (!converted.empty())
+                            px_last = std::make_shared<const std::vector<uint8_t>>(std::move(converted));
                     }
                     // PROSPER_PASS_LOG=<min-submit>: per-pass publish provenance for 3 submits —
                     // which pass produced pixels, its target identity, and the defer decision.

@@ -1340,6 +1340,13 @@ int main(int argc, char** argv) {
         usage(argv[0]); return 2;
     }
     if (draw_with_compute_prefix && draw_first < 0) { usage(argv[0]); return 2; }
+    // #1330: ordered-prefix inspection modes must see the pass a prefix actually ends on, even when
+    // that pass renders a non-RGBA8 target (an FP16 HDR scene). The shared live renderer publishes an
+    // inspection-converted fallback only under this env, so full replays and live runs are unchanged.
+    if ((draw_first >= 0 || through_operation >= 0 || !draw_steps_prefix.empty()) &&
+        !set_environment("PROSPER_PREFIX_INSPECT", "1")) {
+        std::fprintf(stderr, "gpu_replay: cannot set PROSPER_PREFIX_INSPECT\n"); return 2;
+    }
     prosper::gpu::GpuCaptureFile capture; std::string error;
     if (!prosper::gpu::read_gpu_capture(positional[0], capture, error)) {
         std::fprintf(stderr, "gpu_replay: %s: %s\n", positional[0], error.c_str()); return 2;
