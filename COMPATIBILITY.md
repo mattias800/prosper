@@ -5,7 +5,7 @@ describe specific, user-supplied PS5 dumps tested primarily on Linux. A mileston
 documented route is reproducible; it does **not** mean the entire game is playable or free of bugs.
 Different title revisions may behave differently.
 
-Last updated: 2026-07-14
+Last updated: 2026-07-24
 
 ## Summary
 
@@ -16,6 +16,7 @@ Last updated: 2026-07-14
 | *Blasphemous 2* | `PPSA13579` | ✅ Opening route reaches and renders the first playable room |
 | *Dragon Quest VII Reimagined* | `PPSA17942` | 🚧 Interactive title and save-slot flow; later content load is blocked |
 | Additional Unity/IL2CPP target | `PPSA02664` | 🔬 Exercised, with no published gameplay milestone |
+| *Blue Prince* | `PPSA25009` | 🚧 Opening gameplay scene ("Day One" at the manor) renders; known lighting/texture defects |
 
 ## The Messenger — `PPSA24651`
 
@@ -55,6 +56,17 @@ corner and renders as a Vulkan triangle strip (#654).
 
 The reproducible route and capture recipe are in
 [`prosper/scripts/blasphemous2/README.md`](prosper/scripts/blasphemous2/README.md).
+
+## Blue Prince — `PPSA25009`
+
+This Unity target boots to its menu, renders the full opening cinematic, completes the first-room
+load, and renders the "Day One" opening gameplay scene: the Mt. Holly manor exterior, gardens, and
+the player character on the approach path, captured over a 600-second scripted route with zero
+render stalls. Two loading-phase performance defects were removed to get here — unbounded
+register-file growth from incrementally patched register arrays (#1266) and per-draw-reference
+full-buffer content hashing (#1269). Known open defects: lit surfaces render blown-out (#1271) and
+small foliage textures render as pixel noise (#1272), so no verified-visuals milestone is claimed.
+Boot remains intermittent (#1178).
 
 ## Dragon Quest VII Reimagined — `PPSA17942`
 
