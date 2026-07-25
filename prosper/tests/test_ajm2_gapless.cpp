@@ -33,8 +33,9 @@ struct Sideband {
     int32_t iResult; int32_t iCodecResult;
     uint32_t iSizeConsumed; uint32_t iSizeProduced;
     uint64_t uiTotalDecodedSamples;
+    uint32_t numFrames; uint32_t reserved;
 };
-static_assert(sizeof(Sideband) == 24, "AJM decode sideband is 24 bytes");
+static_assert(sizeof(Sideband) == 32, "AJM decode sideband includes the MFrame result");
 
 static uint64_t addr(const void* p) { return (uint64_t)(uintptr_t)p; }
 
