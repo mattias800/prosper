@@ -435,6 +435,31 @@ int main() {
           rs.db_stencil_info == 0x66u && rs.db_htile_surface == 0x99u,
           "depth view, HTILE, format, and extent programming is retained");
 
+    // #1353: GFX10 read/write DB bases describe one surface; a LONE zero half is a stale
+    // Gen5 indirect-arena slot (observed live as (DB_Z_WRITE_BASE, 0) folded AFTER the real
+    // pair write in the same array) and recovers from its partner. Pair-zero (a genuine
+    // unbind) and divergent nonzero pairs (asserted verbatim above) are untouched.
+    {
+        GpuState lone;
+        lone.cx[P::DB_Z_READ_BASE] = 0x21135e00u;
+        lone.cx[P::DB_Z_WRITE_BASE] = 0u;
+        lone.cx[P::DB_STENCIL_WRITE_BASE] = 0x21136000u;
+        const RenderState rec = extract_render_state(lone);
+        CHECK(rec.depth_write_base == rec.depth_read_base &&
+              rec.depth_read_base == rdna2_addr(0x21135e00u, 0u),
+              "a lone-zero DB_Z_WRITE_BASE recovers from the read base (#1353)");
+        CHECK(rec.stencil_read_base == rec.stencil_write_base &&
+              rec.stencil_write_base == rdna2_addr(0x21136000u, 0u),
+              "a lone-zero DB_STENCIL_READ_BASE recovers from the write base");
+
+        GpuState unbound;
+        unbound.cx[P::DB_DEPTH_CONTROL] = 0x46u;
+        const RenderState none = extract_render_state(unbound);
+        CHECK(none.depth_read_base == 0 && none.depth_write_base == 0 &&
+              none.stencil_read_base == 0 && none.stencil_write_base == 0,
+              "pair-zero (unbound) DB bases stay zero — no invented identity");
+    }
+
     // #371: depth clear value. The sample stream programs no DB_DEPTH_CLEAR, so resolve defaults it by
     // the compare op — 0.0 for GREATER (this stream), 1.0 for LESS — never a fixed 0.5. A programmed
     // DB_DEPTH_CLEAR is used verbatim.

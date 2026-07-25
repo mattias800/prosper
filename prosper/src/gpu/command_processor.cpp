@@ -1704,6 +1704,20 @@ void GpuState::apply(const Pm4Command& c) {
                     continue;
                 }
                 file[regs[i].offset] = regs[i].value;
+                // PROSPER_DBBASETRACE (#1353): log every cx write to the DB Z/STENCIL base
+                // registers (LO 0x12..0x15, HI 0x1A..0x1D) with its source path, to attribute
+                // which packet family programs (or clobbers) a base half — this trace found the
+                // stale arena slot writing (DB_Z_WRITE_BASE, 0) after the real pair write.
+                static const bool dbbase_trace = getenv("PROSPER_DBBASETRACE") != nullptr;
+                if (dbbase_trace && c.reg_class == RegClass::Cx &&
+                    ((regs[i].offset >= 0x12u && regs[i].offset <= 0x15u) ||
+                     (regs[i].offset >= 0x1Au && regs[i].offset <= 0x1Du))) {
+                    static std::atomic<int> n{0};
+                    if (n.fetch_add(1) < 400000)
+                        fprintf(stderr, "[dbbase] indirect off=0x%x val=0x%x order=%llu\n",
+                                regs[i].offset, regs[i].value,
+                                (unsigned long long)command_order);
+                }
                 if (c.reg_class == RegClass::Cx &&
                     regs[i].offset == prosper::agc::Pm4::DB_RENDER_CONTROL &&
                     (regs[i].value & 0x3u) &&
@@ -1780,6 +1794,21 @@ void GpuState::apply(const Pm4Command& c) {
             }
             for (uint32_t k = 0; k < c.reg_count && c.reg_offset + k < kRegOffsetLimit; k++)
                 file[c.reg_offset + k] = c.reg_data[k];
+            // PROSPER_DBBASETRACE (#1353): direct-span sibling of the indirect-path trace above.
+            {
+                static const bool dbbase_trace = getenv("PROSPER_DBBASETRACE") != nullptr;
+                if (dbbase_trace && c.reg_class == RegClass::Cx && c.reg_offset <= 0x1Du &&
+                    c.reg_offset + c.reg_count > 0x12u) {
+                    static std::atomic<int> n{0};
+                    if (n.fetch_add(1) < 400000) {
+                        fprintf(stderr, "[dbbase] direct off=0x%x count=%u order=%llu vals:",
+                                c.reg_offset, c.reg_count, (unsigned long long)command_order);
+                        for (uint32_t k = 0; k < c.reg_count && k < 16; k++)
+                            fprintf(stderr, " 0x%x", c.reg_data[k]);
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
             state_dirty_ = true;
             break;
         }
