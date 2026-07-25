@@ -102,6 +102,16 @@ def _pick_thread(arg):
             return t
     raise gdb.GdbError('no thread matching %r' % arg)
 
+def _print_native_frame():
+    """Emit the selected thread's native stop frame after any requested thread switch."""
+    try:
+        frame = gdb.newest_frame()
+        pc = int(frame.pc())
+        name = frame.name() or '??'
+        print('guest-bt-native: 0x%x in %s' % (pc, name))
+    except (gdb.error, ValueError) as e:
+        print('guest-bt-native: unavailable (%s)' % e)
+
 class GuestBt(gdb.Command):
     """guest-bt [thread] — symbolicated backtrace of a prosper guest thread across the HLE stub."""
     def __init__(self):
@@ -110,6 +120,7 @@ class GuestBt(gdb.Command):
     def invoke(self, arg, from_tty):
         t = _pick_thread(arg)
         t.switch()
+        _print_native_frame()
         print('=== guest-bt thread %s "%s" (LWP %s) ===' %
               (t.num, t.name or '?', t.ptid[1]))
         gdb.execute('bt')
@@ -122,6 +133,7 @@ class GuestBtAll(gdb.Command):
     def invoke(self, arg, from_tty):
         for t in gdb.selected_inferior().threads():
             t.switch()
+            _print_native_frame()
             print('\n=== thread %s "%s" (LWP %s) ===' % (t.num, t.name or '?', t.ptid[1]))
             try:
                 gdb.execute('bt')

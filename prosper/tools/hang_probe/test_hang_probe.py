@@ -13,31 +13,37 @@ SPEC.loader.exec_module(HANG_PROBE)
 
 class ClassificationTests(unittest.TestCase):
     def test_active_gpu_native_frame_is_running(self):
-        text = ("0x0000000000442f85 in prosper::gpu::build_stage_table(prosper::gpu::GpuState const&) ()\n"
+        text = ("guest-bt-native: 0x0000000000442f85 in prosper::gpu::build_stage_table\n"
                 "guest-bt: loaded\n#0 0x442f85 in ??? ()\n")
         self.assertEqual(HANG_PROBE.classify(text),
-                         ("RUNNING", text.splitlines()[0]))
+                         ("RUNNING", "0x0000000000442f85 in prosper::gpu::build_stage_table"))
 
     def test_active_live_frontend_native_frame_is_running(self):
-        text = ("0x0000000000652319 in prosper::frontend::register_live_renderer()::{lambda()#1}::operator()() const ()\n"
+        text = ("guest-bt-native: 0x0000000000652319 in prosper::frontend::register_live_renderer()::{lambda()#1}::operator()() const\n"
                 "guest-bt: loaded\n#0 0x652319 in ??? ()\n")
         self.assertEqual(HANG_PROBE.classify(text),
-                         ("RUNNING", text.splitlines()[0]))
+                         ("RUNNING", text.splitlines()[0].removeprefix("guest-bt-native: ")))
 
     def test_active_libc_native_frame_is_running(self):
-        text = "0x00007f00 in _int_free_chunk () from /lib64/libc.so.6\n#0 0x7f00 in ??? ()\n"
+        text = "guest-bt-native: 0x00007f00 in _int_free_chunk\n#0 0x7f00 in ??? ()\n"
         self.assertEqual(HANG_PROBE.classify(text),
-                         ("RUNNING", text.splitlines()[0]))
+                         ("RUNNING", "0x00007f00 in _int_free_chunk"))
 
     def test_active_unsymbolicated_guest_frame_is_running(self):
-        text = "0x0000000410f4bb02 in ?? ()\n#0 0x410f4bb02 in ??? ()\n"
+        text = "guest-bt-native: 0x0000000410f4bb02 in ??\n#0 0x410f4bb02 in ??? ()\n"
         self.assertEqual(HANG_PROBE.classify(text),
-                         ("RUNNING", text.splitlines()[0]))
+                         ("RUNNING", "0x0000000410f4bb02 in ??"))
 
     def test_native_blocking_frame_remains_unknown(self):
-        text = "0x00007f00 in pthread_cond_wait@@GLIBC_2.3.2 ()\n#0 0x7f00 in ??? ()\n"
+        text = "guest-bt-native: 0x00007f00 in pthread_cond_wait@@GLIBC_2.3.2\n#0 0x7f00 in ??? ()\n"
         self.assertEqual(HANG_PROBE.classify(text),
-                         ("UNKNOWN", text.splitlines()[0]))
+                         ("UNKNOWN", "0x00007f00 in pthread_cond_wait@@GLIBC_2.3.2"))
+
+    def test_attach_frame_before_thread_switch_is_ignored(self):
+        text = ("0x00007f00 in pthread_cond_wait@@GLIBC_2.3.2 ()\n"
+                "guest-bt-native: 0x0000000410f4bb02 in ??\n#0 0x410f4bb02 in ??? ()\n")
+        self.assertEqual(HANG_PROBE.classify(text),
+                         ("RUNNING", "0x0000000410f4bb02 in ??"))
 
     def test_guest_wait_takes_precedence_over_lower_running_frame(self):
         text = "#0 k_sema_wait\n#1 prosper::gpu::execute_ordered\n"

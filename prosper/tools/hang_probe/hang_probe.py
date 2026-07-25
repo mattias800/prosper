@@ -9,7 +9,7 @@ automates the run -> wait -> gdb/guest_bt classify -> repeat loop that is otherw
 For each run it launches the title headless through boot_trace, waits, then attaches guest_bt to the
 main thread (Thread 1) and classifies it:
   * BLOCKED (hung) - the top HLE frame is a kernel wait (k_sema_wait / k_eq_wait / k_cond_wait / k_ef_wait)
-  * RUNNING        - an active render/submit frame (execute_ordered / present / agc_driver_submit / run_command)
+  * RUNNING        - an active render/submit frame or a non-blocking selected native frame
 Plain gdb cannot unwind the guest main thread through the HLE stub boundary, so guest_bt is required (it
 re-sections the flattened module ELFs). On a BLOCKED run the tool prints Thread 1's stack as evidence.
 
@@ -25,7 +25,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WAIT_FRAMES = ("k_sema_wait", "k_eq_wait", "k_cond_wait", "k_ef_wait", "k_usleep")
 RUN_FRAMES  = ("execute_ordered", "execute_submit", "agc_driver_submit", "run_command_buffer",
                "present", "SubmitDcb", "run_command")
-NATIVE_STOP_FRAME = re.compile(r"^0x[0-9a-f]+ in .+$", re.MULTILINE)
+NATIVE_STOP_FRAME = re.compile(r"^guest-bt-native: (0x[0-9a-f]+ in .+)$", re.MULTILINE)
 NATIVE_BLOCK_FRAME = re.compile(
     r"\b(?:__syscall_cancel_arch|(?:__)?futex\w*|pthread_(?:cond|mutex|rwlock)\w*|sem_wait\w*|"
     r"clock_nanosleep|nanosleep|poll|ppoll|select|epoll_wait|kevent)\b")
@@ -47,7 +47,7 @@ def classify(gbt_text: str):
     # libc allocation/string work, the Vulkan driver, and unsymbolicated guest PCs. Known host waits
     # remain inconclusive unless guest_bt also found the decisive guest kernel-wait frame above.
     m = NATIVE_STOP_FRAME.search(gbt_text)
-    frame = m.group(0).strip() if m else ""
+    frame = m.group(1).strip() if m else ""
     if frame and not NATIVE_BLOCK_FRAME.search(frame):
         return "RUNNING", frame
     return "UNKNOWN", frame
