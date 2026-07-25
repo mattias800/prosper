@@ -1414,7 +1414,23 @@ int main() {
     CHECK(got32b2.size()==1 && std::fabs(got32b2[0]-10.0f)<1e-3f,
           "kernel 32b2 DS_READ2_B32 applies both packed dword offsets exactly");
 
-    // Kernel 32b3: three other exact words from Astro's loading compute shaders. V_MUL_U32_U24
+    // Kernel 32b3: The Plucky Squire's title compute path writes two independent LDS dwords with
+    // DS_WRITE2_B32 before reading the same pair. Use the exact adjacent-offset encoding and make
+    // both values observable as 1+2=3.
+    const uint32_t code32b_write2[] = {
+        0x7e000280u, 0x7e0202f2u, 0x7e0402f4u,
+        0xd8380100u, 0x00020100u, 0xbf8a0000u,
+        0xd8dc0100u, 0x03000000u, 0x06060903u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32b_write2 = recompile_valu(
+        code32b_write2, std::size(code32b_write2), 0, 3);
+    CHECK(!spv32b_write2.empty(), "recompiled kernel 32b3 (DS_WRITE2_B32 + DS_READ2_B32) -> SPIR-V");
+    std::vector<float> got32b_write2 = prosper::test::run_compute(
+        spv32b_write2, std::vector<float>(1), 1, 1);
+    CHECK(got32b_write2.size()==1 && std::fabs(got32b_write2[0]-3.0f)<1e-3f,
+          "kernel 32b3 DS_WRITE2_B32 stores DATA0/1 at both packed dword offsets");
+
+    // Kernel 32b4: three other exact words from Astro's loading compute shaders. V_MUL_U32_U24
     // must mask both operands to 24 bits, while V_CVT_FLR_I32_F32 must round negative values toward
     // -infinity (not toward zero). Add the converted results: (64 * 3) + floor(-2.25) = 189.
     const uint32_t code32b3[] = {
@@ -3828,6 +3844,30 @@ int main() {
         if (gb != bits_of(inX[i]) + 15u) badA2++;
     }
     CHECK(gotA2.size()==N && badA2==0, "A2: s_lshl4_add_u32 SCC = full 64-bit carry (1 then 0)");
+
+    // A2b (#1390): exercise the complete gfx10 s_lshl{1,2,3,4}_add_u32 opcode family. Each
+    // instruction computes (1 << N) + 1 without carry; sum 3+5+9+17 = 34. The first word is the
+    // exact S_LSHL1_ADD_U32 encoding used by The Plucky Squire's title fragment shader.
+    const uint32_t codeA2b[] = {
+        0xbe950381u,                         // s_mov_b32 s21, 1
+        0x976a8115u,                         // s_lshl1_add_u32 vcc_lo, s21, 1 (live title word)
+        0x97018115u,                         // s_lshl1_add_u32 s1, s21, 1
+        0x97828115u,                         // s_lshl2_add_u32 s2, s21, 1
+        0x98038115u,                         // s_lshl3_add_u32 s3, s21, 1
+        0x98848115u,                         // s_lshl4_add_u32 s4, s21, 1
+        0x7e000201u,                         // v_mov_b32 v0, s1
+        0x7e020202u, 0x4a000300u,            // v0 += s2
+        0x7e020203u, 0x4a000300u,            // v0 += s3
+        0x7e020204u, 0x4a000300u,            // v0 += s4
+        0x7e02026au, 0x4a000300u,            // v0 += live-word VCC_LO result
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvA2b = recompile_valu(codeA2b, std::size(codeA2b), 0, 0);
+    CHECK(!spvA2b.empty(), "recompiled A2b (complete S_LSHL1..4_ADD_U32 family) -> SPIR-V");
+    std::vector<float> gotA2b = prosper::test::run_compute(spvA2b, std::vector<float>(1), 1, 1);
+    uint32_t a2b_bits = 0; if (gotA2b.size() == 1) std::memcpy(&a2b_bits, &gotA2b[0], 4);
+    CHECK(gotA2b.size() == 1 && a2b_bits == 37u,
+          "A2b: live VCC_LO destination and all four shift-add results execute exactly");
 
     // A3 (#880): the NEG modifier is a sign-bit toggle: neg(+0.0) = -0.0. v_add_f32_e64
     // v1, -v0, -v0 with v0=+0.0 must produce -0.0 (bits 0x80000000); the old FSub(0,x)

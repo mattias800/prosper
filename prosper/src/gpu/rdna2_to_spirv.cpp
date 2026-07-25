@@ -4503,14 +4503,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x22: { uint32_t sh = b.ibin(Op_BitwiseAnd, c, b.uconst(31));   // s_ashr_i32
                              d = b.sbin(Op_ShiftRightArithmetic, a, sh); scc_nz(d); break; }  // dst = src0 >>a (src1 & 31)
                 case 0x26: d = b.ibin(Op_IMul, a, c); break;         // s_mul_i32 (low 32 bits; no SCC)
-                case 0x31: {   // s_lshl4_add_u32 = (src0<<4)+src1; SCC = unsigned carry-out of the
-                               // FULL 64-bit sum (ISA op 49: ((u64)S0<<4)+S1 >= 2^32). If S0[31:28]
-                               // is nonzero the shifted value alone reaches 2^32; otherwise the
-                               // shift is exact and overflow reduces to 32-bit add wrap (d < S1).
-                    uint32_t shifted = b.ibin(Op_ShiftLeftLogical, a, b.uconst(4));
+                case 0x2E: case 0x2F: case 0x30: case 0x31: {
+                    // s_lshl{1,2,3,4}_add_u32 = (src0<<N)+src1; SCC is unsigned carry-out of the
+                    // FULL 64-bit sum (RDNA2 ISA ops 46-49: ((u64)S0<<N)+S1 >= 2^32). If any of
+                    // S0's top N bits are set, the shift alone overflowed; otherwise overflow is
+                    // exactly the ordinary low-dword addition wrap (D < S1).
+                    const uint32_t shift = in.opcode - 0x2Du;
+                    uint32_t shifted = b.ibin(Op_ShiftLeftLogical, a, b.uconst(shift));
                     d = b.ibin(Op_IAdd, shifted, c);
                     uint32_t shifted_out = b.ucmp(Op_INotEqual,
-                        b.ibin(Op_ShiftRightLogical, a, b.uconst(28)), b.uconst(0));
+                        b.ibin(Op_ShiftRightLogical, a, b.uconst(32u - shift)), b.uconst(0));
                     uint32_t wrapped = b.ucmp(Op_ULessThan, d, c);
                     rs.scc = b.bsel(shifted_out, b.btrue(), wrapped); break;
                 }
@@ -7084,7 +7086,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if ((!b.is_compute && !b.ngg_private_lds) || (in.opcode != 0x00 && in.opcode != 0x07 &&
                                   in.opcode != 0x08 && in.opcode != 0x20 &&
                                   in.opcode != 0x2d &&
-                                  in.opcode != 0x0d && in.opcode != 0x36 && in.opcode != 0x37 &&
+                                  in.opcode != 0x0d && in.opcode != 0x0e &&
+                                  in.opcode != 0x36 && in.opcode != 0x37 &&
                                   in.opcode != 0x3d && in.opcode != 0x3e && in.opcode != 0x4d && in.opcode != 0x4e &&
                                   in.opcode != 0x76 && in.opcode != 0x77 &&
                                   in.opcode != 0xde && in.opcode != 0xdf &&
@@ -7103,6 +7106,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 b.lds_store(idx1, vread(in.src[2].value), rs.exec_narrowed, rs.exec);
                 b.lds_store(b.ibin(Op_IAdd, idx1, b.uconst(1)), vread(in.src[2].value + 1),
                             rs.exec_narrowed, rs.exec);
+                return true;
+            }
+            if (in.opcode == 0x0e) {                    // ds_write2_b32: two dwords at offset0/offset1
+                // AMD RDNA2 ISA 12.13: DATA0/1 go to ADDR + OFFSET0/1 * 4. The packed
+                // 8-bit offsets have the same layout as DS_READ2_B32 below.
+                const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
+                const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst(in.literal & 0xFFu));
+                const uint32_t idx1 = b.ibin(Op_IAdd, base, b.uconst((in.literal >> 8) & 0xFFu));
+                b.lds_store(idx0, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
+                b.lds_store(idx1, vread(in.src[2].value), rs.exec_narrowed, rs.exec);
                 return true;
             }
             if (in.opcode == 0x77) {                    // ds_read2_b64: two pairs at scaled offsets
