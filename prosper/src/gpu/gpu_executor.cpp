@@ -2153,9 +2153,63 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     return out;
 }
 
+// Bound the common compiler-generated linear clear kernel without trusting an oversized/formatless
+// V#. Its first instruction forms GlobalInvocationId.x from TGID.x and TID.x, then an idxen-only
+// single-component store writes literal zero at that descriptor record. Since every supported numeric
+// format represents zero identically, Uint32 is a lossless backing view even when FORMAT is INVALID.
+// This recognizes the complete four-instruction kernel, not a general "large buffer" fallback: any
+// other value, address shape, or side effect stays rejected.
+static uint32_t linear_dispatch_raw_store_size(const uint32_t* code, size_t dwords,
+                                               uint32_t fetch_pc,
+                                               const DecodedBufferDescriptor& descriptor,
+                                               uint32_t local_x, uint32_t threads_x,
+                                               uint32_t tgid_x_sgpr) {
+    if (!code || !dwords || !local_x || !threads_x || tgid_x_sgpr == UINT32_MAX ||
+        !descriptor.stride || (local_x & (local_x - 1u)) != 0)
+        return 0;
+    uint32_t local_shift = 0;
+    for (uint32_t width = local_x; width > 1; width >>= 1) ++local_shift;
+
+    std::vector<Rdna2Inst> instructions;
+    rdna2_walk(code, dwords, instructions);
+    if (instructions.size() != 4) return 0;
+    const Rdna2Inst* index_writer = &instructions[0];
+    const Rdna2Inst* zero_writer = &instructions[1];
+    const Rdna2Inst* access = &instructions[2];
+    const Rdna2Inst* end = &instructions[3];
+    if (access->pc != fetch_pc || index_writer->pc != 0 || zero_writer->pc != 2 ||
+        end->pc != 5 || end->fmt != Rdna2Format::SOPP || end->opcode != 0x001 ||
+        access->fmt != Rdna2Format::MUBUF || access->opcode != 0x004 ||
+        access->dst.kind != OperandKind::VGPR || access->dst.value != 1 ||
+        access->src[0].kind != OperandKind::VGPR || access->src[0].value != 0 ||
+        access->src[2].kind != OperandKind::InlineInt || access->src[2].value != 0 ||
+        (access->literal & 0x3FFFu) != 0x2000u ||
+        zero_writer->fmt != Rdna2Format::VOP1 || zero_writer->opcode != 0x001 ||
+        zero_writer->dst.kind != OperandKind::VGPR || zero_writer->dst.value != 1 ||
+        zero_writer->src[0].kind != OperandKind::InlineInt || zero_writer->src[0].value != 0 ||
+        index_writer->fmt != Rdna2Format::VOP3 || index_writer->opcode != 0x346 ||
+        index_writer->dst.kind != OperandKind::VGPR || index_writer->dst.value != 0 ||
+        index_writer->src[0].kind != OperandKind::SGPR ||
+        static_cast<uint32_t>(index_writer->src[0].value) != tgid_x_sgpr ||
+        index_writer->src[1].kind != OperandKind::InlineInt ||
+        static_cast<uint32_t>(index_writer->src[1].value) != local_shift ||
+        index_writer->src[2].kind != OperandKind::VGPR || index_writer->src[2].value != 0)
+        return 0;
+
+    const uint64_t required =
+        static_cast<uint64_t>(threads_x - 1u) * descriptor.stride + sizeof(uint32_t);
+    constexpr uint32_t kMaxProvenLinearStore = 16u << 20;
+    if (!required || required > descriptor.size_bytes || required > kMaxProvenLinearStore)
+        return 0;
+    return static_cast<uint32_t>(required);
+}
+
 std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                                                  const uint32_t* code, size_t dwords,
-                                                 const uint32_t* user_sgprs, uint32_t nsgpr) {
+                                                 const uint32_t* user_sgprs, uint32_t nsgpr,
+                                                 uint32_t linear_local_x,
+                                                 uint32_t linear_threads_x,
+                                                 uint32_t tgid_x_sgpr) {
     std::vector<SrtUse> srt_uses;
     const std::vector<DynFetch> direct_fetches = resolve_dynamic_fetch(
         code, dwords, user_sgprs, nsgpr, /*user_sgpr_base*/0, &srt_uses);
@@ -2172,14 +2226,15 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         uint32_t components = d.num_components;
         if (fetch.instruction_format != UINT32_MAX)
             rdna2_buffer_format(fetch.instruction_format, &format, &components);
-        if (d.base <= 0x10000 || d.size_bytes == 0 || d.size_bytes > 0x10000000u ||
+        const uint32_t resource_size = d.size_bytes;
+        if (d.base <= 0x10000 || resource_size == 0 || resource_size > 0x10000000u ||
             format == DataFormat::Unknown || !components ||
             (fetch.instruction_format == UINT32_MAX && d.forbid_unknown_fallback))
             continue;
         bool mapped = false;
         for (auto& r0 : table.resources) {
             if (r0.cls != ResourceClass::ConstantBuffer || r0.gpu_addr != d.base ||
-                r0.size != d.size_bytes || r0.stride != d.stride || r0.format != format ||
+                r0.size != resource_size || r0.stride != d.stride || r0.format != format ||
                 r0.num_components != components)
                 continue;
             if (r0.fetch_pc == 0xFFFFFFFFu) r0.fetch_pc = fetch.fetch_pc;
@@ -2191,15 +2246,55 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         r.format = format;
         r.num_components = components;
         r.gpu_addr = d.base;
-        r.size = d.size_bytes;
+        r.size = resource_size;
         r.stride = d.stride;
         r.fetch_pc = fetch.fetch_pc;
         table.resources.push_back(r);
     }
 
+    // Oversized FORMAT=INVALID store descriptors are deliberately absent from the generic fold.
+    // Recover only the exact zero-clear kernel proven above, taking its live direct V# from the
+    // user-data SGPRs and bounding the upload to this dispatch's one-dimensional invocation extent.
+    // A nonzero FORMAT stays on the generic width-aware path: treating an R8/R16 zero as Uint32 would
+    // overwrite adjacent components even though zero itself has the same bit pattern.
+    uint32_t proven_linear_store_pc = UINT32_MAX;
+    if (linear_local_x && linear_threads_x && tgid_x_sgpr != UINT32_MAX && user_sgprs) {
+        std::vector<Rdna2Inst> instructions;
+        rdna2_walk(code, dwords, instructions);
+        if (instructions.size() == 4 && instructions[2].src[1].kind == OperandKind::SGPR) {
+            const uint32_t srsrc = static_cast<uint32_t>(instructions[2].src[1].value);
+            if (srsrc + 4u <= nsgpr) {
+                const DecodedBufferDescriptor d = decode_buffer_descriptor(user_sgprs + srsrc);
+                const uint32_t raw_format = (user_sgprs[srsrc + 3] >> 12) & 0x7Fu;
+                const uint32_t resource_size = linear_dispatch_raw_store_size(
+                    code, dwords, instructions[2].pc, d, linear_local_x, linear_threads_x,
+                    tgid_x_sgpr);
+                const bool already_materialized = std::any_of(
+                    table.resources.begin(), table.resources.end(), [&](const ShaderResource& r) {
+                        return r.cls == ResourceClass::ConstantBuffer && r.gpu_addr == d.base &&
+                               r.fetch_pc == instructions[2].pc;
+                    });
+                if (raw_format == 0 && d.base > 0x10000 && resource_size &&
+                    !already_materialized) {
+                    ShaderResource r;
+                    r.cls = ResourceClass::ConstantBuffer;
+                    r.format = DataFormat::Uint32;
+                    r.num_components = 1;
+                    r.gpu_addr = d.base;
+                    r.size = resource_size;
+                    r.stride = d.stride;
+                    r.fetch_pc = instructions[2].pc;
+                    table.resources.push_back(r);
+                    proven_linear_store_pc = instructions[2].pc;
+                }
+            }
+        }
+    }
+
     std::set<uint64_t> seen;
     for (const auto& u : srt_uses) {
         if (u.kind != 1) continue;
+        if (u.use_pc == proven_linear_store_pc) continue;
         if (u.instruction_format != UINT32_MAX && ((u.v4[3] >> 12) & 0x7Fu) == 0)
             continue;
         const bool exact_mtbuf = u.instruction_format != UINT32_MAX;
@@ -2930,6 +3025,23 @@ std::vector<ComputeItem> realize_compute_dispatches(
         }
         uint32_t sgprs[kUserSgprs] = {};
         read_user_sgprs(ds.sh, P::COMPUTE_USER_DATA_0 + range_start, sgprs);
+        const uint32_t rsrc2 = rd(ds.sh, P::COMPUTE_PGM_RSRC2);
+        auto field = [&](uint32_t shift, uint32_t mask) { return (rsrc2 >> shift) & mask; };
+        const uint32_t user_count = field(P::COMPUTE_PGM_RSRC2_USER_SGPR_SHIFT,
+                                          P::COMPUTE_PGM_RSRC2_USER_SGPR_MASK);
+        const ComputeLaunchDimensions launch = resolve_compute_launch(dispatch);
+        const bool tgid_x_en = field(P::COMPUTE_PGM_RSRC2_TGID_X_EN_SHIFT,
+                                     P::COMPUTE_PGM_RSRC2_TGID_X_EN_MASK) != 0;
+        const bool tgid_y_en = field(P::COMPUTE_PGM_RSRC2_TGID_Y_EN_SHIFT,
+                                     P::COMPUTE_PGM_RSRC2_TGID_Y_EN_MASK) != 0;
+        const bool tgid_z_en = field(P::COMPUTE_PGM_RSRC2_TGID_Z_EN_SHIFT,
+                                     P::COMPUTE_PGM_RSRC2_TGID_Z_EN_MASK) != 0;
+        // System SGPRs follow the user SGPR block. Only provide dispatch geometry to the bounded
+        // linear-store recognizer when TGID.x is the only enabled group id and fits in the
+        // push-constant SGPR block. Extra Y/Z groups merely repeat the exact same zero stores because
+        // the proven kernel cannot observe them; all other oversized/formatless descriptors stay rejected.
+        const bool linear_store_proof_context =
+            user_count < kUserSgprs && tgid_x_en && !tgid_y_en && !tgid_z_en;
         auto table = std::make_shared<ShaderResourceTable>(
             build_shader_resources(*header, sgprs, kUserSgprs, 0));
         // Descriptor-TABLE uses (#590, mirroring the graphics fold in build_stage_table): UE4 compute
@@ -2943,7 +3055,10 @@ std::vector<ComputeItem> realize_compute_dispatches(
         {
             const std::vector<SrtUse> srt_uses = add_compute_buffer_resources(
                 *table, (const uint32_t*)(uintptr_t)code_addr, shader_dwords,
-                sgprs, kUserSgprs);
+                sgprs, kUserSgprs,
+                linear_store_proof_context ? launch.local_x : 0,
+                linear_store_proof_context ? launch.threads_x : 0,
+                linear_store_proof_context ? user_count : UINT32_MAX);
             std::set<uint64_t> srt_seen;
             for (const auto& u : srt_uses) {
                 if (u.kind != 0) continue;                 // buffers were materialized by the shared helper
@@ -3143,13 +3258,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
             }
         }
 
-        const uint32_t rsrc2 = rd(ds.sh, P::COMPUTE_PGM_RSRC2);
-        auto field = [&](uint32_t shift, uint32_t mask) { return (rsrc2 >> shift) & mask; };
         ComputeShaderConfig config;
-        const uint32_t user_count = field(P::COMPUTE_PGM_RSRC2_USER_SGPR_SHIFT,
-                                          P::COMPUTE_PGM_RSRC2_USER_SGPR_MASK);
         config.user_sgprs.assign(sgprs, sgprs + std::min(user_count, kUserSgprs));
-        const ComputeLaunchDimensions launch = resolve_compute_launch(dispatch);
         config.local_x = launch.local_x;
         config.local_y = launch.local_y;
         config.local_z = launch.local_z;
@@ -3162,12 +3272,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
         config.wave_size = ((dispatch.modifier >>
             P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT) &
             P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK) ? 32u : 64u;
-        config.tgid_x_en = field(P::COMPUTE_PGM_RSRC2_TGID_X_EN_SHIFT,
-                                 P::COMPUTE_PGM_RSRC2_TGID_X_EN_MASK) != 0;
-        config.tgid_y_en = field(P::COMPUTE_PGM_RSRC2_TGID_Y_EN_SHIFT,
-                                 P::COMPUTE_PGM_RSRC2_TGID_Y_EN_MASK) != 0;
-        config.tgid_z_en = field(P::COMPUTE_PGM_RSRC2_TGID_Z_EN_SHIFT,
-                                 P::COMPUTE_PGM_RSRC2_TGID_Z_EN_MASK) != 0;
+        config.tgid_x_en = tgid_x_en;
+        config.tgid_y_en = tgid_y_en;
+        config.tgid_z_en = tgid_z_en;
         config.tg_size_en = field(P::COMPUTE_PGM_RSRC2_TG_SIZE_EN_SHIFT,
                                   P::COMPUTE_PGM_RSRC2_TG_SIZE_EN_MASK) != 0;
         config.tidig_comp_cnt = field(P::COMPUTE_PGM_RSRC2_TIDIG_COMP_CNT_SHIFT,
@@ -3209,6 +3316,14 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     std::fprintf(stderr, "[dynfail] replaying COMPUTE 0x%llx resource build with trace:\n",
                                  (unsigned long long)code_addr);
                     std::fprintf(stderr, "[dynfail]   compute user-data SGPRs (s0..s%u):\n", kUserSgprs - 1);
+                    std::fprintf(stderr,
+                                 "[dynfail]   launch groups=%ux%ux%u threads=%ux%ux%u local=%ux%ux%u "
+                                 "user_sgprs=%u tgid=%u/%u/%u\n",
+                                 launch.groups_x, launch.groups_y, launch.groups_z,
+                                 launch.threads_x, launch.threads_y, launch.threads_z,
+                                 launch.local_x, launch.local_y, launch.local_z, user_count,
+                                 (unsigned)config.tgid_x_en, (unsigned)config.tgid_y_en,
+                                 (unsigned)config.tgid_z_en);
                     for (uint32_t i = 0; i < kUserSgprs; i += 4)
                         std::fprintf(stderr, "[dynfail]     s%-2u: %08x %08x %08x %08x\n", i,
                                      sgprs[i], sgprs[i + 1], sgprs[i + 2], sgprs[i + 3]);

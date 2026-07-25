@@ -20,7 +20,9 @@
 #include <cerrno>
 #include <atomic>
 #include <algorithm>
+#include <cctype>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -2003,7 +2005,115 @@ HLE(s_nptrophy2_unavailable) { return 0x80551500ull; }
 // PS4-inherited surface).
 static constexpr uint64_t PLAYGO_ERR_BAD_POINTER = 0x80B2000Aull;
 static constexpr uint64_t PLAYGO_ERR_BAD_SIZE    = 0x80B2000Bull;
-HLE(s_playgo_init)  { svc_log("scePlayGoInitialize", a0,a1,a2,a3,a4,a5); return 0; }
+static constexpr uint64_t PLAYGO_ERR_BAD_CHUNK_ID = 0x80B2000Cull;
+
+// Most PS5 dumps do not include sce_sys/playgo-chunk.dat, but UE IoStore preserves the same chunk
+// ids in paired pakchunk<N>-*.utoc/.ucas files. Keep the PlayGo answers internally consistent with
+// the content that is actually present: GetChunkId enumerates these ids and GetLocus/GetProgress
+// reject everything else.
+// Returning LOCAL_FAST for every possible u16 made DOLL probe through its 1000-id safety cap and left
+// its optional-content state unresolved even though pakchunk1 had mounted successfully (#1373).
+static std::vector<uint16_t> discover_playgo_chunks() {
+    namespace fs = std::filesystem;
+    std::vector<uint16_t> chunks;
+    std::vector<fs::path> pak_dirs;
+    bool saw_iostore_index = false;
+    std::error_code ec;
+    const fs::path app0(resolve_guest_path("/app0"));
+
+    auto lower = [](std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return value;
+    };
+    auto child_named = [&](const fs::path& parent, const char* wanted) -> fs::path {
+        const std::string wanted_lower = lower(wanted);
+        std::error_code iter_ec;
+        for (fs::directory_iterator it(parent, iter_ec), end; !iter_ec && it != end;
+             it.increment(iter_ec)) {
+            if (it->is_directory(iter_ec) && lower(it->path().filename().string()) == wanted_lower)
+                return it->path();
+            iter_ec.clear();
+        }
+        return {};
+    };
+    auto add_project_paks = [&](const fs::path& project) {
+        const fs::path content = child_named(project, "content");
+        if (content.empty()) return;
+        const fs::path paks = child_named(content, "paks");
+        if (!paks.empty()) pak_dirs.push_back(paks);
+    };
+
+    add_project_paks(app0); // /app0/Content/Paks
+    for (fs::directory_iterator it(app0, ec), end; !ec && it != end; it.increment(ec)) {
+        if (it->is_directory(ec)) add_project_paks(it->path()); // /app0/<Project>/Content/Paks
+        ec.clear();
+    }
+
+    for (const fs::path& paks : pak_dirs) {
+        std::vector<std::string> nonempty_files;
+        std::error_code iter_ec;
+        for (fs::directory_iterator it(paks, iter_ec), end; !iter_ec && it != end;
+             it.increment(iter_ec)) {
+            const bool regular = it->is_regular_file(iter_ec);
+            if (iter_ec || !regular) {
+                iter_ec.clear();
+                continue;
+            }
+            const uintmax_t size = it->file_size(iter_ec);
+            if (iter_ec || size == 0) {
+                iter_ec.clear();
+                continue;
+            }
+            nonempty_files.push_back(lower(it->path().filename().string()));
+        }
+        std::sort(nonempty_files.begin(), nonempty_files.end());
+        nonempty_files.erase(std::unique(nonempty_files.begin(), nonempty_files.end()),
+                             nonempty_files.end());
+        for (const std::string& name : nonempty_files) {
+            constexpr const char* prefix = "pakchunk";
+            constexpr size_t prefix_len = 8;
+            if (name.compare(0, prefix_len, prefix) != 0 ||
+                name.size() < prefix_len + 2 + 5 ||
+                name.compare(name.size() - 5, 5, ".utoc") != 0)
+                continue;
+            saw_iostore_index = true;
+            const std::string data_name = name.substr(0, name.size() - 5) + ".ucas";
+            if (!std::binary_search(nonempty_files.begin(), nonempty_files.end(), data_name))
+                continue;
+            size_t pos = prefix_len;
+            uint32_t id = 0;
+            while (pos < name.size() && std::isdigit(static_cast<unsigned char>(name[pos]))) {
+                id = id * 10 + static_cast<unsigned>(name[pos++] - '0');
+                if (id > UINT16_MAX) break;
+            }
+            if (pos == prefix_len || pos >= name.size() || name[pos] != '-' || id > UINT16_MAX)
+                continue;
+            chunks.push_back(static_cast<uint16_t>(id));
+        }
+    }
+    std::sort(chunks.begin(), chunks.end());
+    chunks.erase(std::unique(chunks.begin(), chunks.end()), chunks.end());
+    if (chunks.empty() && !saw_iostore_index)
+        chunks.push_back(0); // compatibility fallback for non-IoStore titles
+    return chunks;
+}
+
+static std::vector<uint16_t> g_playgo_chunks{0};
+static bool playgo_has_chunk(uint16_t id) {
+    return std::binary_search(g_playgo_chunks.begin(), g_playgo_chunks.end(), id);
+}
+
+HLE(s_playgo_init)  { svc_log("scePlayGoInitialize", a0,a1,a2,a3,a4,a5);
+                      g_playgo_chunks = discover_playgo_chunks();
+                      if (svclog()) {
+                          std::fprintf(stderr, "[svc] PlayGo discovered %zu installed chunk(s):",
+                                       g_playgo_chunks.size());
+                          for (uint16_t id : g_playgo_chunks) std::fprintf(stderr, " %u", id);
+                          std::fputc('\n', stderr);
+                      }
+                      return 0; }
 HLE(s_playgo_term)  { return 0; }
 // scePlayGoOpen(u32* outHandle, const void* param): the handle the whole API is keyed on. The
 // unimpl stub's success-with-unfilled-handle left the game querying loci with garbage.
@@ -2011,28 +2121,43 @@ HLE(s_playgo_open)  { svc_log("scePlayGoOpen", a0,a1,a2,a3,a4,a5);
                       if (!a0) return PLAYGO_ERR_BAD_POINTER;
                       *(uint32_t*)PW(a0) = 1; return 0; }
 HLE(s_playgo_close) { return 0; }
-// scePlayGoGetLocus(h, const u16* chunkIds, u32 n, s8* outLoci): every chunk is LOCAL_FAST (3).
+// scePlayGoGetLocus(h, const u16* chunkIds, u32 n, s8* outLoci): installed chunks are LOCAL_FAST.
 HLE(s_playgo_getlocus) { svc_log("scePlayGoGetLocus", a0,a1,a2,a3,a4,a5, 2);
                          if (!a1 || !a3) return PLAYGO_ERR_BAD_POINTER;
                          if (!(uint32_t)a2) return PLAYGO_ERR_BAD_SIZE;
-                         memset(PW(a3), 3 /*SCE_PLAYGO_LOCUS_LOCAL_FAST*/, (uint32_t)a2); return 0; }
+                         const auto* ids = (const uint16_t*)PW(a1);
+                         auto* loci = (int8_t*)PW(a3);
+                         for (uint32_t i = 0; i < (uint32_t)a2; ++i) {
+                             if (!playgo_has_chunk(ids[i])) {
+                                 loci[i] = 0; // SCE_PLAYGO_LOCUS_NOT_DOWNLOADED
+                                 return PLAYGO_ERR_BAD_CHUNK_ID;
+                             }
+                             loci[i] = 3; // SCE_PLAYGO_LOCUS_LOCAL_FAST
+                         }
+                         return 0; }
 // scePlayGoGetProgress(h, chunkIds, n, OrbisPlayGoProgress* out): one struct {u64 progressSize;
 // u64 totalSize} summed over the queried chunks; fully-installed == progressSize==totalSize!=0.
 HLE(s_playgo_getprogress) { svc_log("scePlayGoGetProgress", a0,a1,a2,a3,a4,a5, 2);
                             if (!a1 || !a3) return PLAYGO_ERR_BAD_POINTER;
                             if (!(uint32_t)a2) return PLAYGO_ERR_BAD_SIZE;
+                            const auto* ids = (const uint16_t*)PW(a1);
+                            for (uint32_t i = 0; i < (uint32_t)a2; ++i)
+                                if (!playgo_has_chunk(ids[i])) return PLAYGO_ERR_BAD_CHUNK_ID;
                             uint64_t* p = (uint64_t*)PW(a3);
                             p[0] = p[1] = (uint64_t)(uint32_t)a2 << 20;  // 1 MiB/chunk, done==total
                             return 0; }
 // scePlayGoGetToDoList(h, OrbisPlayGoToDo* list, u32 n, u32* outEntries): nothing left to install.
 HLE(s_playgo_gettodo) { if (!a3) return PLAYGO_ERR_BAD_POINTER; *(uint32_t*)PW(a3) = 0; return 0; }
 HLE(s_playgo_settodo) { return 0; }
-// scePlayGoGetChunkId(h, u16* list, u32 n, u32* outEntries): one chunk, id 0 (the minimal truthful
-// shape for a fully-local title; we don't parse playgo-chunk.dat).
+// scePlayGoGetChunkId(h, u16* list, u32 n, u32* outEntries): enumerate the installed chunk ids.
 HLE(s_playgo_getchunkid) { if (!a3) return PLAYGO_ERR_BAD_POINTER;
                            if (a1 && !(uint32_t)a2) return PLAYGO_ERR_BAD_SIZE;
-                           if (a1) { *(uint16_t*)PW(a1) = 0; *(uint32_t*)PW(a3) = 1; }
-                           else *(uint32_t*)PW(a3) = 1;
+                           const uint32_t count = static_cast<uint32_t>(g_playgo_chunks.size());
+                           if (a1) {
+                               const uint32_t copied = std::min((uint32_t)a2, count);
+                               std::memcpy(PW(a1), g_playgo_chunks.data(), copied * sizeof(uint16_t));
+                               *(uint32_t*)PW(a3) = copied;
+                           } else *(uint32_t*)PW(a3) = count;
                            return 0; }
 // scePlayGoGetEta(h, chunkIds, n, s64* outEta): everything installed -> 0 seconds.
 HLE(s_playgo_geteta) { if (!a1 || !a3) return PLAYGO_ERR_BAD_POINTER;
