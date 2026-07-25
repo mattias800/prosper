@@ -1,6 +1,7 @@
 #include "gpu/gpu_capture.hpp"
 #include "gpu/gpu_capture_bundle.hpp"
 #include "gpu/gpu_dependency_graph.hpp"
+#include "gpu/diagnostic_selectors.hpp"
 #include "gpu/gpu_execute.hpp"
 #include "gpu/shader_resources.hpp"
 #include "live_renderer.hpp"
@@ -1381,10 +1382,13 @@ int main(int argc, char** argv) {
     // and swap it in here; render_runner then binds a TF buffer around that draw and reports where its
     // post-transform vertices land. Requires a v19+ capsule that retained the raw VS stream.
     if (const char* g = std::getenv("PROSPER_GEOM_PROBE")) {
-        char* end = nullptr;
-        const unsigned long long n = std::strtoull(g, &end, 0);
-        const size_t item_index = g[0] != '-' && end != g && end && !*end
-            ? prosper::tools::replay_item_index_for_draw(replay, n) : SIZE_MAX;
+        uint64_t n = 0;
+        if (!prosper::gpu::parse_diagnostic_draw_id(g, n)) {
+            std::fprintf(stderr, "[geom-probe] invalid semantic draw selector '%s'\n", g);
+            return 2;
+        }
+        const auto draw_label = static_cast<unsigned long long>(n);
+        const size_t item_index = prosper::tools::replay_item_index_for_draw(replay, n);
         if (item_index != SIZE_MAX) {
             auto& it = replay.items[item_index];
             const size_t operation_index =
@@ -1400,17 +1404,18 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr,
                                  "[geom-probe] draw=%llu item=%zu operation=%lld VS re-recompiled "
                                  "with xfb capture (%zu words)\n",
-                                 n, item_index, operation_label, it.vs.size());
+                                 draw_label, item_index, operation_label, it.vs.size());
                 } else {
                     std::fprintf(stderr, "[geom-probe] draw %llu: xfb re-recompile produced no VS "
-                                         "(no raw stream / unsupported)\n", n);
+                                         "(no raw stream / unsupported)\n", draw_label);
                 }
             } else {
                 std::fprintf(stderr, "[geom-probe] draw %llu: no captured raw VS stream "
-                                     "(capsule predates v19)\n", n);
+                                     "(capsule predates v19)\n", draw_label);
             }
         } else {
-            std::fprintf(stderr, "[geom-probe] invalid or unrealized semantic draw selector '%s'\n", g);
+            std::fprintf(stderr, "[geom-probe] unrealized semantic draw %llu\n", draw_label);
+            return 2;
         }
     }
     // Fragment I/O tap (PROSPER_FS_TAP=draw:pc): re-recompile draw N's raw FS (recompile_fragment reads the

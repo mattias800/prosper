@@ -1,4 +1,5 @@
 #include "../tools/gpu_replay/realized_shader_dump.hpp"
+#include "../src/gpu/diagnostic_selectors.hpp"
 
 #include <cstdio>
 
@@ -23,6 +24,14 @@ int main() {
               !tools::parse_realized_shader_selector("1:ps", selector) &&
               !tools::parse_realized_shader_selector("1:vs:extra", selector),
           "malformed realized-shader selectors are rejected without partial parsing");
+
+    uint64_t diagnostic_draw = 0;
+    CHECK(gpu::parse_diagnostic_draw_id("0x481", diagnostic_draw) && diagnostic_draw == 1153,
+          "geometry probe accepts the same explicit-base semantic ID in every layer");
+    CHECK(!gpu::parse_diagnostic_draw_id("1153junk", diagnostic_draw) &&
+              !gpu::parse_diagnostic_draw_id("-1", diagnostic_draw) &&
+              !gpu::parse_diagnostic_draw_id("18446744073709551616", diagnostic_draw),
+          "geometry probe rejects partial, signed, and overflowing draw IDs");
 
     gpu::GpuReplayFrame replay;
     replay.raw_shader_versions = {

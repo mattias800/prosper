@@ -5,6 +5,7 @@
 #pragma once
 #include <vulkan/vulkan.h>
 #include "../src/gpu/gpu_capture.hpp"
+#include "../src/gpu/diagnostic_selectors.hpp"
 #include "../src/gpu/render_state.hpp"
 #include "../frontends/shared/vulkan_device_select.hpp"
 #include <algorithm>
@@ -4403,11 +4404,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // Requires VK_EXT_transform_feedback + the VS recompiled with gl_Position xfb-decorated (gated on
     // the same env var in gpu_executor). Only active with the env var, TF support, AND a flush here.
     const char* geom_env = getenv("PROSPER_GEOM_PROBE");
-    const long geom_target = geom_env ? strtol(geom_env, nullptr, 10) : -1;
+    uint64_t geom_target = 0;
+    const bool geom_target_valid = geom_env && gpu::parse_diagnostic_draw_id(geom_env, geom_target);
     size_t geom_item = SIZE_MAX;
-    if (geom_target >= 0) {
+    if (geom_target_valid) {
         for (size_t i = 0; i < draws.size(); ++i)
-            if (draws[i].draw_index == static_cast<uint64_t>(geom_target)) {
+            if (draws[i].draw_index == geom_target) {
                 geom_item = i;
                 break;
             }
@@ -4416,7 +4418,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         if (geom_item == SIZE_MAX &&
             std::none_of(draws.begin(), draws.end(), [](const BackendDraw& draw) {
                 return draw.draw_index != UINT64_MAX;
-            }) && static_cast<size_t>(geom_target) < draws.size())
+            }) && geom_target < draws.size())
             geom_item = static_cast<size_t>(geom_target);
     }
     const bool geom_probe = geom_item != SIZE_MAX
