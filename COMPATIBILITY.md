@@ -120,10 +120,15 @@ Boot remains intermittent (#1178).
 
 ## Dragon Quest VII Reimagined — `PPSA17942`
 
-This Unreal Engine 4 target reaches an interactive title screen, navigates the save-slot menu, and
-starts the subsequent content-load flow. Honest offline and signed-out service behavior removed the
-earlier permanent loading-screen gate. The next documented blocker is a MallocBinned3 heap-corruption
-failure during menu-driven content loading, so no gameplay milestone is claimed here.
+<p align="center">
+  <img src="assets/screenshots/dragon-quest-vii-title.png" alt="Dragon Quest VII Reimagined — title screen">
+</p>
+
+This Unreal Engine 4 target renders its interactive title screen at native 3840×2160, navigates the
+save-slot menu, and starts the subsequent content-load flow. The current title capture still exposes a
+localization key in place of the localized logo text. Honest offline and signed-out service behavior
+removed the earlier permanent loading-screen gate. The next documented blocker is a MallocBinned3
+heap-corruption failure during menu-driven content loading, so no gameplay milestone is claimed here.
 
 The investigation and current blocker are documented in
 [`prosper/docs/DOLL_LOADING_PROGRESSION.md`](prosper/docs/DOLL_LOADING_PROGRESSION.md).

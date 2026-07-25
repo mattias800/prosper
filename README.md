@@ -42,6 +42,10 @@ in [Game compatibility](COMPATIBILITY.md).
   <img src="assets/screenshots/terminator.png" alt="Terminator 2D: NO FATE — attract-mode gameplay"><br>
   <em><strong>Terminator 2D: NO FATE</strong> — attract-mode gameplay</em>
 </p>
+<p align="center">
+  <img src="assets/screenshots/dragon-quest-vii-title.png" alt="Dragon Quest VII Reimagined — title screen"><br>
+  <em><strong>Dragon Quest VII Reimagined</strong> — title screen, native 3840×2160</em>
+</p>
 
 > These illustrative screenshots are captures of prosper's own rendered output; the games' artwork remains
 > the property of its respective owners. No game files, assets, keys, or data are redistributed in this
