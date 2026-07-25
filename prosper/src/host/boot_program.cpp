@@ -83,6 +83,12 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
         // in the list => its init runs first (it's PSNCore's dependency). Absent-file titles skip these.
         { d + "/Media/Plugins/PSNCore.prx", BOOT_PSNCORE },
         { d + "/Media/Plugins/PSNCommon.prx", BOOT_PSNCOMMON },
+        // Unity's PS5 platform layer calls CommonDialog::PrxCommonDialogUpdate before it services
+        // deferred save/load work. Titles such as Space Adventure Cobra reach that P/Invoke only
+        // after accepting input on the title screen; leaving the PRX to the unsupported runtime
+        // loader therefore stalls the main thread with the save request still queued. Preload the
+        // optional plugin just like PSN/SaveData so its export is available to il2cpp immediately.
+        { d + "/Media/Plugins/CommonDialog.prx", BOOT_COMMONDIALOG },
         // FMOD's C# integration resolves these through P/Invoke only when its RuntimeManager is first
         // constructed. Until prosper has true runtime PRX loading (#639), link the optional pair up
         // front so LoadStartModule returns a real module handle. Studio precedes core in this list

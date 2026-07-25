@@ -21,6 +21,7 @@ inline constexpr uint64_t BOOT_IL2CPP   = 0x440000000ull;
 inline constexpr uint64_t BOOT_PS5UTIL  = 0x4c0000000ull;
 inline constexpr uint64_t BOOT_PSNCORE  = 0x480000000ull;   // PPSA02664's Unity PSN native plugin
 inline constexpr uint64_t BOOT_PSNCOMMON = 0x4a0000000ull;  //   (PSNCore.prx + PSNCommon.prx)
+inline constexpr uint64_t BOOT_COMMONDIALOG = 0x4b0000000ull; // Unity CommonDialog native plugin
 inline constexpr uint64_t BOOT_PSN      = 0x4e0000000ull;
 inline constexpr uint64_t BOOT_NPCPPWEBAPI = 0x4d0000000ull; // optional bundled PSN C++ support PRX
 inline constexpr uint64_t BOOT_SAVEDATA = 0x4f0000000ull;
