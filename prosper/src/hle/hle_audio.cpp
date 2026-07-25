@@ -2062,12 +2062,15 @@ HLE10(ajm_batch_start2) {
                 (unsigned long long)a6, (unsigned long long)a7, (unsigned long long)a8,
                 (unsigned long long)a9); }
     std::lock_guard<std::mutex> lk(g_ajm2_mx);
+    // The batch id is the caller-visible proof that BatchStart accepted this submission. Validate
+    // and publish it before any persistent decoder, PCM output, or result sideband advances. On an
+    // inaccessible non-null pointer, leave the queued jobs intact so the guest can retry safely.
+    if (a4 && !a2_store_u32(a4, g_ajm_next.fetch_add(1))) return AJM_ERR_INVALID_PARAMETER;
     auto it = g_ajm2_jobs.find(a1);
     if (it != g_ajm2_jobs.end()) {
         ajm2_decode_batch(it->second);
         g_ajm2_jobs.erase(it);      // erase, not clear: the map is keyed by a guest pointer
     }
-    if (a4 && !a2_store_u32(a4, g_ajm_next.fetch_add(1))) return AJM_ERR_INVALID_PARAMETER;
     return 0;
 }
 
