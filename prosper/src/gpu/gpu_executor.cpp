@@ -1613,6 +1613,15 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_seed_origin_known.set((size_t)reg);
         }
     }
+    if (explicit_ngg_index_provenance) {
+        // Match recompile_vertex's merged GS/ES ABI model: s3[7:0] is the active ES-vertex
+        // count and s3[15:8] the GS-primitive count.  The Vulkan vertex shell represents one
+        // active ES vertex and no GS primitive, so s3=1.  Fetch prologues use this value to
+        // choose and patch V# descriptors before their MUBUF loads; leaving it unknown made the
+        // dynamic resource walk drop otherwise valid scene-geometry fetches even though the
+        // translator itself already compiled the same prologue with s3=1.
+        set_value(3, 1u);
+    }
 
     // A direct sharp lives in the initial user-data SGPR block rather than arriving through an
     // s_load. It remains a usable load-time descriptor only while none of its SGPRs has subsequently

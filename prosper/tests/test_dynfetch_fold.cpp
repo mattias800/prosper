@@ -98,6 +98,21 @@ int main() {
     CHECK(f4.size() == 1 && f4[0].desc.base == 0x20000ull && f4[0].desc.stride == 16u,
           "kernel 4 fallback V# = the SEED (user-data) descriptor");
 
+    // The merged GS/ES ABI supplies s3 outside the user-data block. The live Plucky scene
+    // fetch prologue reads it before constructing its V# descriptors, while recompile_vertex
+    // already models one active ES vertex as s3=1. Prove the resource fold uses the same ABI:
+    // shift s3 into a valid buffer base, then consume the descriptor through s[8:11].
+    const uint32_t ngg_s3_fetch[] = {
+        0x8f089103u,               // s_lshl_b32 s8, s3, 17 -> 0x20000
+        0xe0002000u, 0x80020100u,  // buffer_load_format_x v1, v0, s[8:11], 0 idxen
+        0xbf810000u,
+    };
+    const uint32_t ngg_s3_seed[4] = {0u, 0x00100000u, 64u, 0u};
+    const auto ngg_s3_resolved = resolve_dynamic_fetch(
+        ngg_s3_fetch, std::size(ngg_s3_fetch), ngg_s3_seed, std::size(ngg_s3_seed), 8);
+    CHECK(ngg_s3_resolved.size() == 1 && ngg_s3_resolved[0].desc.base == 0x20000ull,
+          "NGG dynamic fold seeds merged-wave s3 consistently with vertex recompilation");
+
     // DQ's NGG fetch prologue selects between the merged-stage ABI inputs with a wave-uniform
     // s_cselect_b64 + v_cndmask_b32_e64 pair. The same shader selects instance_id for a transform
     // lookup and vertex_id for positions. The descriptor fold must publish that distinction; treating
