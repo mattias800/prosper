@@ -1653,8 +1653,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         } else if (f32) {
                             // Sampled Float32 resources cannot be reinterpreted as RGBA8: a value such as
                             // 1/8192 has bytes 00 00 00 39 and became a zero red channel. Preserve the float
-                            // value and HDR range by narrowing each present component to native RGBA16F;
-                            // the backend already carries that format losslessly between upload and sample.
+                            // ordinary values and useful HDR range by narrowing each present component to
+                            // native RGBA16F. This deliberately loses Float32 precision and extreme range;
+                            // the backend carries the resulting half values losslessly to the sampler.
                             // Power-of-two component counts keep the source texel size compatible with the
                             // supported GFX10 surface detilers (4/8/16 B per texel).
                             const uint32_t nc = bpt / 4;

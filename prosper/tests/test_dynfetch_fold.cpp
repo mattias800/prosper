@@ -1016,6 +1016,31 @@ int main() {
                                  std::size(short_linear_clear_seed), 64, 2048, 4);
     CHECK(short_linear_clear_table.resources.empty(),
           "linear clear proof cannot expand past the guest descriptor's declared range");
+    uint32_t bounded_linear_clear_seed[4];
+    std::copy(std::begin(linear_clear_seed), std::end(linear_clear_seed),
+              bounded_linear_clear_seed);
+    bounded_linear_clear_seed[2] = 3000; // valid but below the generic 256 MiB ceiling
+    ShaderResourceTable bounded_linear_clear_table;
+    add_compute_buffer_resources(bounded_linear_clear_table, linear_clear,
+                                 std::size(linear_clear), bounded_linear_clear_seed,
+                                 std::size(bounded_linear_clear_seed), 64, 2048, 4);
+    CHECK(bounded_linear_clear_table.resources.size() == 1 &&
+              bounded_linear_clear_table.resources[0].size == linear_clear_bytes,
+          "proven formatless clear suppresses its redundant generic SRT resource");
+    uint32_t typed_linear_clear_seed[4];
+    std::copy(std::begin(linear_clear_seed), std::end(linear_clear_seed),
+              typed_linear_clear_seed);
+    typed_linear_clear_seed[2] = 2048;
+    typed_linear_clear_seed[3] =
+        (typed_linear_clear_seed[3] & ~(0x7Fu << 12)) | (56u << 12); // RGBA8 UNORM
+    ShaderResourceTable typed_linear_clear_table;
+    add_compute_buffer_resources(typed_linear_clear_table, linear_clear,
+                                 std::size(linear_clear), typed_linear_clear_seed,
+                                 std::size(typed_linear_clear_seed), 64, 2048, 4);
+    CHECK(typed_linear_clear_table.resources.size() == 1 &&
+              typed_linear_clear_table.resources[0].format == DataFormat::Unorm8 &&
+              typed_linear_clear_table.resources[0].size == 2048u * 1136u,
+          "typed clear keeps its width-aware generic resource instead of a Uint32 alias");
     ShaderResourceTable linear_clear_table;
     add_compute_buffer_resources(linear_clear_table, linear_clear, std::size(linear_clear),
                                  linear_clear_seed, std::size(linear_clear_seed),

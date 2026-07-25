@@ -268,7 +268,7 @@ int main() {
                             center[2] >= 24 && center[2] <= 40 && center[3] > 240;
         }
         CHECK(float_sampled,
-              "sampled Float32x4 texture preserves channel values instead of raw RGBA8 bytes");
+              "sampled Float32x4 texture preserves ordinary values instead of raw RGBA8 bytes");
     }
 
 #if defined(_WIN32) || defined(__linux__)

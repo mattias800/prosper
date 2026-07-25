@@ -2008,14 +2008,16 @@ static constexpr uint64_t PLAYGO_ERR_BAD_SIZE    = 0x80B2000Bull;
 static constexpr uint64_t PLAYGO_ERR_BAD_CHUNK_ID = 0x80B2000Cull;
 
 // Most PS5 dumps do not include sce_sys/playgo-chunk.dat, but UE IoStore preserves the same chunk
-// ids in pakchunk<N>-*.utoc.  Keep the PlayGo answers internally consistent with the content that is
-// actually present: GetChunkId enumerates these ids and GetLocus/GetProgress reject everything else.
+// ids in paired pakchunk<N>-*.utoc/.ucas files. Keep the PlayGo answers internally consistent with
+// the content that is actually present: GetChunkId enumerates these ids and GetLocus/GetProgress
+// reject everything else.
 // Returning LOCAL_FAST for every possible u16 made DOLL probe through its 1000-id safety cap and left
 // its optional-content state unresolved even though pakchunk1 had mounted successfully (#1373).
 static std::vector<uint16_t> discover_playgo_chunks() {
     namespace fs = std::filesystem;
     std::vector<uint16_t> chunks;
     std::vector<fs::path> pak_dirs;
+    bool saw_iostore_index = false;
     std::error_code ec;
     const fs::path app0(resolve_guest_path("/app0"));
 
@@ -2050,6 +2052,7 @@ static std::vector<uint16_t> discover_playgo_chunks() {
     }
 
     for (const fs::path& paks : pak_dirs) {
+        std::vector<std::string> nonempty_files;
         std::error_code iter_ec;
         for (fs::directory_iterator it(paks, iter_ec), end; !iter_ec && it != end;
              it.increment(iter_ec)) {
@@ -2063,12 +2066,21 @@ static std::vector<uint16_t> discover_playgo_chunks() {
                 iter_ec.clear();
                 continue;
             }
-            const std::string name = lower(it->path().filename().string());
+            nonempty_files.push_back(lower(it->path().filename().string()));
+        }
+        std::sort(nonempty_files.begin(), nonempty_files.end());
+        nonempty_files.erase(std::unique(nonempty_files.begin(), nonempty_files.end()),
+                             nonempty_files.end());
+        for (const std::string& name : nonempty_files) {
             constexpr const char* prefix = "pakchunk";
             constexpr size_t prefix_len = 8;
             if (name.compare(0, prefix_len, prefix) != 0 ||
                 name.size() < prefix_len + 2 + 5 ||
                 name.compare(name.size() - 5, 5, ".utoc") != 0)
+                continue;
+            saw_iostore_index = true;
+            const std::string data_name = name.substr(0, name.size() - 5) + ".ucas";
+            if (!std::binary_search(nonempty_files.begin(), nonempty_files.end(), data_name))
                 continue;
             size_t pos = prefix_len;
             uint32_t id = 0;
@@ -2083,7 +2095,8 @@ static std::vector<uint16_t> discover_playgo_chunks() {
     }
     std::sort(chunks.begin(), chunks.end());
     chunks.erase(std::unique(chunks.begin(), chunks.end()), chunks.end());
-    if (chunks.empty()) chunks.push_back(0); // compatibility fallback for non-IoStore titles
+    if (chunks.empty() && !saw_iostore_index)
+        chunks.push_back(0); // compatibility fallback for non-IoStore titles
     return chunks;
 }
 

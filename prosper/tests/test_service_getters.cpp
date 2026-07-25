@@ -53,8 +53,11 @@ int main() {
         const fs::path paks = app0 / "DOLL" / "Content" / "Paks";
         fs::create_directories(paks, ec);
         std::ofstream(paks / "pakchunk0-ps5.utoc", std::ios::binary).put('\1');
+        std::ofstream(paks / "pakchunk0-ps5.ucas", std::ios::binary).put('\1');
         std::ofstream(paks / "pakchunk1-ps5.utoc", std::ios::binary).put('\1');
+        std::ofstream(paks / "pakchunk1-ps5.ucas", std::ios::binary).put('\1');
         std::ofstream(paks / "pakchunk2-ps5.utoc", std::ios::binary); // empty placeholder
+        std::ofstream(paks / "pakchunk3-ps5.utoc", std::ios::binary).put('\1'); // missing data
         set_app0_root(app0.string());
 
         HleFn init = Hle::lookup(nid_hash("scePlayGoInitialize"));
@@ -71,7 +74,7 @@ int main() {
             CHECK(get_ids(1, (uint64_t)(uintptr_t)ids, 4,
                           (uint64_t)(uintptr_t)&entries, 0, 0) == 0 &&
                       entries == 2 && ids[0] == 0 && ids[1] == 1,
-                  "GetChunkId enumerates chunk ids and ignores an empty placeholder");
+                  "GetChunkId requires non-empty IoStore index and data files");
             int8_t loci[2] = {-1, -1};
             CHECK(get_locus(1, (uint64_t)(uintptr_t)ids, 2,
                             (uint64_t)(uintptr_t)loci, 0, 0) == 0 &&
@@ -83,6 +86,12 @@ int main() {
                             (uint64_t)(uintptr_t)&missing_locus, 0, 0) == 0x80B2000Cull &&
                       missing_locus == 0,
                   "GetLocus marks an absent chunk not-downloaded and returns BAD_CHUNK_ID");
+            fs::remove(paks / "pakchunk0-ps5.ucas", ec);
+            fs::remove(paks / "pakchunk1-ps5.ucas", ec);
+            init(0, 0, 0, 0, 0, 0);
+            entries = 99;
+            CHECK(get_ids(1, 0, 0, (uint64_t)(uintptr_t)&entries, 0, 0) == 0 && entries == 0,
+                  "GetChunkId does not apply the non-IoStore fallback to a partial IoStore dump");
         }
         fs::remove_all(app0, ec);
     }

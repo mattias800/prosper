@@ -2252,9 +2252,12 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         table.resources.push_back(r);
     }
 
-    // Oversized or FORMAT=INVALID store descriptors are deliberately absent from the generic fold.
+    // Oversized FORMAT=INVALID store descriptors are deliberately absent from the generic fold.
     // Recover only the exact zero-clear kernel proven above, taking its live direct V# from the
     // user-data SGPRs and bounding the upload to this dispatch's one-dimensional invocation extent.
+    // A nonzero FORMAT stays on the generic width-aware path: treating an R8/R16 zero as Uint32 would
+    // overwrite adjacent components even though zero itself has the same bit pattern.
+    uint32_t proven_linear_store_pc = UINT32_MAX;
     if (linear_local_x && linear_threads_x && tgid_x_sgpr != UINT32_MAX && user_sgprs) {
         std::vector<Rdna2Inst> instructions;
         rdna2_walk(code, dwords, instructions);
@@ -2262,6 +2265,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             const uint32_t srsrc = static_cast<uint32_t>(instructions[2].src[1].value);
             if (srsrc + 4u <= nsgpr) {
                 const DecodedBufferDescriptor d = decode_buffer_descriptor(user_sgprs + srsrc);
+                const uint32_t raw_format = (user_sgprs[srsrc + 3] >> 12) & 0x7Fu;
                 const uint32_t resource_size = linear_dispatch_raw_store_size(
                     code, dwords, instructions[2].pc, d, linear_local_x, linear_threads_x,
                     tgid_x_sgpr);
@@ -2270,7 +2274,8 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                         return r.cls == ResourceClass::ConstantBuffer && r.gpu_addr == d.base &&
                                r.fetch_pc == instructions[2].pc;
                     });
-                if (d.base > 0x10000 && resource_size && !already_materialized) {
+                if (raw_format == 0 && d.base > 0x10000 && resource_size &&
+                    !already_materialized) {
                     ShaderResource r;
                     r.cls = ResourceClass::ConstantBuffer;
                     r.format = DataFormat::Uint32;
@@ -2280,6 +2285,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                     r.stride = d.stride;
                     r.fetch_pc = instructions[2].pc;
                     table.resources.push_back(r);
+                    proven_linear_store_pc = instructions[2].pc;
                 }
             }
         }
@@ -2288,6 +2294,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
     std::set<uint64_t> seen;
     for (const auto& u : srt_uses) {
         if (u.kind != 1) continue;
+        if (u.use_pc == proven_linear_store_pc) continue;
         if (u.instruction_format != UINT32_MAX && ((u.v4[3] >> 12) & 0x7Fu) == 0)
             continue;
         const bool exact_mtbuf = u.instruction_format != UINT32_MAX;
