@@ -1,5 +1,6 @@
 // rdna2_to_spirv.cpp — see rdna2_to_spirv.hpp. Internal SpirvCompute builder + the VALU translator.
 #include "rdna2_to_spirv.hpp"
+#include "diagnostic_selectors.hpp"
 #include "rdna2_decode.hpp"
 #include "shader_resources.hpp"
 #include <algorithm>
@@ -8890,11 +8891,12 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
     b.begin_fragment(rt, color_mask);
     // Fragment I/O value tap (PROSPER_FS_TAP=draw:pc): redirect the MRT0 colour export to the intermediate
     // VGPR produced at that PC so the rendered frame visualises the value. The `draw:` prefix is consumed by
-    // gpu_replay (which re-recompiles only that draw's FS); here we take the PC after the ':' (or the whole
-    // value if there is no ':').
+    // gpu_replay (which re-recompiles only that draw's FS). Parse the same complete selector here so an
+    // invalid or overflowing PC cannot silently become PC zero or truncate to 32 bits.
     if (const char* tap = getenv("PROSPER_FS_TAP")) {
-        const char* pc = strchr(tap, ':');
-        b.tap_pc = static_cast<uint32_t>(strtoul(pc ? pc + 1 : tap, nullptr, 0));
+        uint64_t draw = 0;
+        uint32_t pc = 0;
+        if (parse_fragment_tap_selector(tap, draw, pc)) b.tap_pc = pc;
     }
     b.declare_guest_scratch(scratch);
     b.fragment_interpolation = &derived_interpolation;

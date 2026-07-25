@@ -51,7 +51,7 @@ Create a capsule with the native-speed workflow in
 
 ## Raw-vs-realized draw check — `raw=` on each `--inspect-only` draw line (#1256)
 
-Each `draw[i] … vcount=N indices=M voffset=V modifier=D topo=T raw=…` line reports the **raw
+Each `draw[ID] item=I … vcount=N indices=M voffset=V modifier=D topo=T raw=…` line reports the **raw
 draw-packet state** the guest submitted, decoded BEFORE realization. `raw=` is available in capture
 v23+, while `voffset=` and `modifier=` are available in capture v27+:
 
@@ -182,7 +182,7 @@ PROSPER_GEOM_PROBE=4 ./build-linux/gpu_replay /tmp/submit.prgcap /tmp/out.bmp
 # [geom-probe]   v0 = (-2.9, -0.771, 0, 1) ...
 ```
 
-The natural follow-up when the fragment funnel reports **GEOMETRY-VANISH**: capture draw N's **post-transform
+The natural follow-up when the fragment funnel reports **GEOMETRY-VANISH**: capture semantic draw N's **post-transform
 clip-space vertex positions** via `VK_EXT_transform_feedback` and report where they landed — clip-space
 bounding box, on-screen vs clipped counts, `w<=0` (behind-camera), NaN/inf, degenerate (all-collapsed), plus
 the first few raw `vec4`s. This distinguishes the ways a `GEOMETRY-VANISH` can happen:
@@ -196,7 +196,8 @@ Read it **with** the funnel: the funnel owns the "does it rasterize" verdict (`a
 owns *where the geometry is* — a large full-screen quad can have every vertex just outside the cube yet still
 rasterize, so "all verts clipped" is not "renders nothing"; the bbox tells them apart.
 
-Mechanics: on a capsule (stored SPIR-V) gpu_replay re-recompiles draw N's raw RDNA2 VS with `gl_Position`
+Mechanics: on a capsule (stored SPIR-V) gpu_replay resolves semantic draw N to its compact item, then
+re-recompiles that draw's raw RDNA2 VS with `gl_Position`
 xfb-decorated (requires a v19+ capsule that retained the raw VS stream) and swaps it in for that one draw; the
 live app recompiles fresh. Requires the device to advertise `VK_EXT_transform_feedback` (RADV, lavapipe). The
 probed draw's rendered pixels may be inexact (the re-recompile drops pixel-input remapping), but the captured
@@ -259,7 +260,7 @@ PROSPER_FS_TAP=6:27 ./build-linux/gpu_replay /tmp/submit.prgcap /tmp/out.bmp
 
 The fragment-stage sibling of `PROSPER_SHADER_TAP`, for "why is this **pixel** the wrong colour?" — capture a
 fragment shader's intermediate at instruction `PC` (the same PC `shader_inspect` prints) and **redirect the
-MRT0 colour export to it**, so draw `DRAW`'s pixels in the rendered frame *are* the value visualised. Unlike the
+MRT0 colour export to it**, so semantic draw `DRAW`'s pixels in the rendered frame *are* the value visualised. Unlike the
 VS tap it needs no separate capture — the output BMP is the readout. Point `--dump-realized-shader DRAW:fs` +
 `shader_inspect` at the FS to find the PC (an `image_sample`/MIMG result, a UV, a pre-blend colour), then
 `PROSPER_FS_TAP=DRAW:PC`. gpu_replay re-recompiles only that draw's FS (needs a v19+ capsule with the raw FS
@@ -273,7 +274,8 @@ tap); inert and byte-identical when the env var is unset. The re-recompile drops
 value derived from `gl_FragCoord`/sample position reads 0 (visualise fetch/sample/colour intermediates, not
 FragCoord-dependent terms).
 
-`--dump-shader DRAW:vs|fs PATH` writes the recompiled SPIR-V. Capture v19 adds
+`--dump-shader DRAW:vs|fs PATH` writes the recompiled SPIR-V. `DRAW` is the semantic ID printed by
+`--inspect-only`, as it is for the probes above. Capture v19 adds
 `--dump-realized-shader DRAW:vs|fs PATH` for the exact bounded raw RDNA2 stream that produced that realized
 draw stage, suitable for `shader_inspect`. The VS/FS streams use the same content-addressed 64 KiB-per-stage,
 64 MiB-total store as failed-shader diagnostics. Captures v1-v18 remain readable; because they did not retain
@@ -335,11 +337,14 @@ matches the optional address filter is written. A sampled-texture filter A/B use
 These environment variables are localization probes, not fixes, and their output must not replace an unmodified
 regression oracle.
 
-`--draw` uses realized draw indices, while graphs use mixed semantic operation indices. They are not
-interchangeable when dispatches or unrealized operations are present. Replay restores serialized render-target
-seeds before operation zero and uses owned resource memory; it must not dereference original guest mappings.
-Bundle operation sources are semantic draw IDs and may contain holes; tooling must resolve them through each
-realized item's `draw_index`, never treat them as offsets into the compact draw vector.
+Every user-facing `DRAW` selector (`--draw`, `--dump-resource`, `--dump-shader`,
+`--dump-realized-shader`, `PROSPER_GEOM_PROBE`, and `PROSPER_FS_TAP`) uses the stable semantic draw ID
+printed as `draw[ID]` by `--inspect-only`. The adjacent `item=I` is only the compact realized-vector offset;
+it can differ after an unrealized draw and is never a selector. Mixed `operation[N]` ordinals remain a separate,
+explicit namespace used by `--through-operation`. Replay restores serialized render-target seeds before
+operation zero and uses owned resource memory; it must not dereference original guest mappings. Bundle
+operation sources are semantic draw IDs and may contain holes; tooling resolves them through each realized
+item's `draw_index`, never as offsets into the compact draw vector.
 
 `--draw-with-compute-prefix` retains every compute operation before the selected draw while discarding the
 other graphics draws. This isolates geometry whose vertex/indirect buffers are produced earlier in the same

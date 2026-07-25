@@ -80,7 +80,8 @@ The `blue-prince-title` snapshot route guards the title screen.
   `[render_state] lone-zero DB … recovered` fire on the two landed arena recoveries.
 - `PROSPER_DSLOG=1` / `PROSPER_DSBRIDGE_LOG=1` — persistent-DS call keys and sampled-bridge
   HIT/miss (how #1352 was found).
-- `PROSPER_FS_TAP=DRAW:PC` on a v19+ capsule — visualize a light-FS intermediate offline.
+- `PROSPER_FS_TAP=DRAW:PC` on a v19+ capsule — visualize a light-FS intermediate offline; `DRAW`
+  is the semantic `draw[ID]` printed by `gpu_replay --inspect-only`, not its compact `item=` offset.
 - The #1352-era scissor three-stage traces are parked on branch
   `fix/issue-1335-regindirect-tags`.
 
