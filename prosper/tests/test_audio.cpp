@@ -80,6 +80,27 @@ int main() {
     CHECK((int32_t)call("sceAudioOut2ContextResetParam", 1) == (int32_t)0x80260003);
     CHECK((int32_t)call("sceAudioOut2ContextQueryMemory", 0, 1) == (int32_t)0x80260003);
 
+    // A null-device AudioOut2 context drains each grain synchronously. QueueLevel must therefore
+    // report no queued work and one writable grain. Sonic Origins gates CRI's complete mix/push
+    // cycle on the second output; the former success-with-untouched-outputs stub left it at zero.
+    uint8_t a2_param[0x40]{};
+    CHECK(call("sceAudioOut2ContextResetParam", PTR(a2_param)) == 0);
+    *(uint32_t*)(a2_param + 0x10) = 256;
+    uint64_t a2_mem_size = 0;
+    CHECK(call("sceAudioOut2ContextQueryMemory", PTR(a2_param), PTR(&a2_mem_size)) == 0);
+    std::vector<uint8_t> a2_mem((size_t)a2_mem_size);
+    uint64_t a2_context = 0;
+    CHECK(call("sceAudioOut2ContextCreate", PTR(a2_param), PTR(a2_mem.data()), a2_mem.size(),
+               PTR(&a2_context)) == 0);
+    uint32_t a2_queued = 0xccccccccu, a2_available = 0xddddddddu;
+    CHECK(call("sceAudioOut2ContextGetQueueLevel", a2_context, PTR(&a2_queued),
+               PTR(&a2_available)) == 0);
+    CHECK(a2_queued == 0);
+    CHECK(a2_available == 1);
+    CHECK((int32_t)call("sceAudioOut2ContextGetQueueLevel", a2_context, 1,
+                        PTR(&a2_available)) == (int32_t)0x80260003);
+    CHECK(call("sceAudioOut2ContextDestroy", a2_context) == 0);
+
     // --- 2. open -> handle + backend.open with decoded params --------------------------------
     audio_reset();
     CapturingSink sink; audio_set_sink(&sink);

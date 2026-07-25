@@ -902,9 +902,31 @@ HLE(audio2_ctx_push) {
     return 0;
 }
 
+// sceAudioOut2ContextGetQueueLevel(ctx, queued*, available*) -> 0.
+// The two u32 outputs are consumed as {queued grains, writable grains}.  A null-device context
+// drains synchronously in ContextPush, so it has no queued work and always exposes one writable
+// grain.  Sonic Origins' CRI output thread explicitly gates its whole mix/Advance/Push cycle on
+// `available != 0`; the former success-with-untouched-outputs probe left both caller-initialized
+// words zero and hot-spun forever without ever producing audio.  One available grain is the
+// conservative model: it preserves ContextPush's real-time pacing instead of inviting a burst of
+// several grains.  CONFIDENCE: HIGH for the output order and gate (live caller disassembly), MED
+// for the hardware queue depth (the null backend intentionally advertises only one slot).
+HLE(audio2_ctx_get_queue_level) {
+    A2LOG("sceAudioOut2ContextGetQueueLevel");
+    const uint64_t idx = a0 & 0xff;
+    {
+        std::lock_guard<std::mutex> lk(g_a2_mx);
+        if ((a0 & ~0xffull) != kA2CtxTag || idx < 1 || idx > 4 || !g_a2_ctx[idx - 1].used)
+            return kA2ErrInvalid;
+    }
+    const uint32_t queued = 0;
+    const uint32_t available = 1;
+    if (!a2_store_u32(a1, queued) || !a2_store_u32(a2, available)) return kA2ErrInvalid;
+    return 0;
+}
+
 // Generic logging probes for the not-yet-exercised remainder of the surface.
 #define A2_PROBE(fn, str) HLE(fn) { A2LOG(str); return 0; }
-A2_PROBE(audio2_ctx_get_queue_level, "sceAudioOut2ContextGetQueueLevel")
 A2_PROBE(audio2_ctx_set_attr,    "sceAudioOut2ContextSetAttributes")
 A2_PROBE(audio2_ctx_bed_write,   "sceAudioOut2ContextBedWrite")
 A2_PROBE(audio2_port_register,   "sceAudioOut2PortRegister")

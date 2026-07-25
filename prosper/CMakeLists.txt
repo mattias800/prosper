@@ -481,6 +481,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_apr_stat_audio PRIVATE prosper_core)
   add_test(NAME apr_stat_audio_gtav COMMAND test_apr_stat_audio)
 
+  add_executable(test_ampr_measure tests/test_ampr_measure.cpp)
+  target_link_libraries(test_ampr_measure PRIVATE prosper_core)
+  add_test(NAME ampr_measure COMMAND test_ampr_measure)
+
   # Direct-memory allocate/available (issue #99): AvailableDirectMemorySize reports the largest
   # free aligned block in the search window and writes both out-params (was a total-size stub).
   add_executable(test_dmem tests/test_dmem.cpp)

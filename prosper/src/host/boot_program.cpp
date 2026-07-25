@@ -89,6 +89,23 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
         // because dependent-module init functions run in reverse order (core must initialize first).
         { d + "/Media/Plugins/libfmodstudio.prx", BOOT_FMODSTUDIO },
         { d + "/Media/Plugins/libfmod.prx", BOOT_FMOD },
+        // Wwise's generated C# wrappers resolve AkSoundEngine and its optional motion/Vorbis
+        // extensions lazily through P/Invoke. GRIS reaches that path while constructing
+        // AkCallbackManager: without a real module handle, the first SWIG upcast raises an
+        // EntryPointNotFoundException, aborts the static constructor, and its later async bank load
+        // dereferences the uninitialized callback dictionary. As with FMOD above, preload these
+        // optional native plugins until runtime PRX loading is implemented. Put the extensions
+        // before the core because dependent-module init functions run in reverse link order.
+        { d + "/Media/Plugins/AkMotion.prx", BOOT_AKMOTION },
+        { d + "/Media/Plugins/AkVorbisHwAccelerator.prx", BOOT_AKVORBIS },
+        { d + "/Media/Plugins/AkSoundEngine.prx", BOOT_AKSOUNDENGINE },
+        // Sonic Origins ships libSceNpCppWebApi as a user-space support PRX. Its game code imports
+        // the C++ object/thread implementation directly, while the module itself depends only on
+        // the lower-level Json2/Rtc/NpWebApi2/Http/kernel/libc interfaces handled below. Runtime PRX
+        // loading is not implemented yet (#639), so preload an optional copy from sce_module just as
+        // we do for lazy Unity audio plugins. Keep it before libc so reverse init order initializes
+        // libc first. Absent-file filtering leaves every title without this PRX unchanged.
+        { d + "/sce_module/libSceNpCppWebApi.prx", BOOT_NPCPPWEBAPI },
         { d + "/sce_module/libc.prx", BOOT_LIBC },
     };
     if (getenv("PROSPER_NO_PSN"))
