@@ -237,7 +237,7 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
                     "dcc=%u meta=%016llx meta-bytes=%llu/%llu meta-nz=%zu meta-unique=%zu "
                     "meta-first=%08x meta-hash=%016llx "
                     "blocks=%u/%u flags=%u%u%u%u "
-                    "srt=%08x sgpr=%08x pc=%08x%s\n",
+                    "srt=%08x sgpr=%08x pc=%08x mode=%u%s\n",
                     stage, class_name(r.cls), r.binding, static_cast<unsigned long long>(r.gpu_addr),
                     r.size,
                     static_cast<unsigned long long>(prosper::gpu::gpu_capture_resource_footprint(r)),
@@ -256,7 +256,9 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
                     r.max_uncompressed_block_size, r.max_compressed_block_size,
                     r.meta_pipe_aligned, r.write_compress_enabled,
                     r.alpha_is_on_msb, r.color_transform,
-                    r.srt_offset, r.sgpr_base, r.fetch_pc, temporal_seed ? " temporal-RTT-seed" : "");
+                    r.srt_offset, r.sgpr_base, r.fetch_pc,
+                    static_cast<unsigned>(r.fetch_index_mode),
+                    temporal_seed ? " temporal-RTT-seed" : "");
         if (r.host_data && r.host_data_size >= 16 &&
             (r.cls == prosper::gpu::ResourceClass::ConstantBuffer ||
              r.cls == prosper::gpu::ResourceClass::VertexBuffer)) {

@@ -423,7 +423,33 @@ int main() {
     for (uint32_t i=0;i<N&&got17c.size()==N;i++)
         if (std::fabs(got17c[i]-exp17c[i])>1e-3f) bad17c++;
     CHECK(got17c.size()==N && bad17c==0,
-          "compute execz uses subgroupAny(EXEC): empty wave skips, active wave enters");
+          "compute execz reduces exact guest-wave EXEC: empty wave skips, active wave enters");
+
+    // Kernel 17c2: a single forward VCC branch (no extra CFG complexity) must still use the exact
+    // guest-wave dispatcher. Only lane 63 sets VCC, deliberately outside a host 8/16/32-lane first
+    // subgroup. The scalar VCCZ decision is therefore not taken and every lane writes one.
+    const uint32_t code17c2[] = {
+        0x7e040280u,              // v_mov_b32 v2, 0
+        0x7c020300u,              // v_cmp_lt_f32 vcc, v0, v1
+        0xbf860001u,              // s_cbranch_vccz +1
+        0x7e040281u,              // v_mov_b32 v2, 1
+        0x7e040d02u,              // v_cvt_f32_u32 v2, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv17c2 = recompile_valu(
+        code17c2, std::size(code17c2), 2, /*out_vgpr*/2);
+    CHECK(!spv17c2.empty(), "recompiled kernel 17c2 (single exact wave64 VCC vote) -> SPIR-V");
+    std::vector<float> in17c2(N * 2), exp17c2(N, 1.0f);
+    for (uint32_t i = 0; i < N; ++i) {
+        in17c2[i * 2] = (i & 63u) == 63u ? 0.0f : 1.0f;
+        in17c2[i * 2 + 1] = 0.5f;
+    }
+    std::vector<float> got17c2 = prosper::test::run_compute(spv17c2, in17c2, N, N);
+    uint32_t bad17c2 = 0;
+    for (uint32_t i = 0; i < N && got17c2.size() == N; ++i)
+        if (got17c2[i] != exp17c2[i]) ++bad17c2;
+    CHECK(got17c2.size() == N && bad17c2 == 0,
+          "single VCC branch sees the sole set lane outside the first host subgroup");
 
     // Kernel 17d: force the generic CFG dispatcher (a varying VCC branch plus a VCC loop) and
     // verify that its wave vote spans all 64 emulated RDNA2 lanes, independent of the host Vulkan
@@ -2494,6 +2520,35 @@ int main() {
     printf("  kernel66b mismatches=%u (out[3]=%g expect=%u)\n", bad66b,
            got66b.size()==N?got66b[3]:-1, 500u + 2u*3u + 1u);
     CHECK(got66b.size()==N && bad66b==0, "kernel 66b (idxen+offen): addr = idx*stride + byteoffset (both applied)");
+
+    // The same two-term address through an exact pc-keyed graphics VertexBuffer in Shader mode.
+    // Dynamic fetch discovery publishes these resources too, but unlike ABI Vertex/Instance mode
+    // their base is unshifted and the shader's complete VADDR must survive. In particular, v2 is the
+    // offen byte term; dropping it selects the even dword instead of the odd one in every record.
+    const uint32_t code66b_shader[] = {
+        0x7e020f00u, 0x7e040284u, 0xe0003000u, 0x80020301u, 0xbf810000u,
+    };
+    ShaderResourceTable rt66b_shader;
+    { ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Float32;
+      vb.num_components = 1; vb.binding = 3; vb.stride = 8; vb.sgpr_base = 8; vb.fetch_pc = 2;
+      vb.fetch_index_mode = VertexFetchIndexMode::Shader;
+      rt66b_shader.resources.push_back(vb); }
+    std::vector<uint32_t> spv66b_shader = recompile_valu(
+        code66b_shader, std::size(code66b_shader), 1, 3, &rt66b_shader);
+    std::vector<float> float66b_shader(2 * N), got66b_shader;
+    for (uint32_t i = 0; i < N; ++i) {
+        float66b_shader[2 * i] = -1000.0f - (float)i;
+        float66b_shader[2 * i + 1] = 700.0f + (float)i;
+    }
+    std::vector<uint32_t> buf66b_shader(2 * N);
+    std::memcpy(buf66b_shader.data(), float66b_shader.data(), buf66b_shader.size() * sizeof(uint32_t));
+    got66b_shader = prosper::test::run_compute(
+        spv66b_shader, in66b, N, N, decoy66b, buf66b_shader);
+    uint32_t bad66b_shader = 0;
+    for (uint32_t i = 0; i < N && got66b_shader.size() == N; ++i)
+        if (got66b_shader[i] != 700.0f + (float)i) ++bad66b_shader;
+    CHECK(!spv66b_shader.empty() && got66b_shader.size() == N && bad66b_shader == 0,
+          "Shader-mode pc fetch preserves idxen+offen's nonzero second VADDR VGPR");
 
     // Raw byte/short MUBUF loads use a per-lane byte address and zero/sign-extend into one VGPR.
     // Exercise every in-dword position, including a 16-bit load beginning at byte 3 and crossing

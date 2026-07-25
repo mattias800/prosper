@@ -60,7 +60,10 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // video chroma planes.
 // Older captures planned tight spans, so their materializer intentionally binds the legacy span while
 // still deriving the guest pitch for best-effort rendering of the rows that were retained.
-constexpr uint32_t kVersion = 29;
+// v29: retain resolved depth-bias state per realized and failed pipeline.
+// v30: each const-fold-resolved buffer fetch retains its proven vertex/instance/shader VADDR source.
+// This is a per-resource trailing block so every v1-v29 record prefix stays byte-exact.
+constexpr uint32_t kVersion = 30;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -1661,6 +1664,19 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         w.u32(std::bit_cast<uint32_t>(diagnostic.pipeline.depth_bias_clamp));
     }
 
+    // v30 appends the dynamic-fold-proven fetch index source in deterministic resource order. NGG
+    // merged shaders can select instance_id for one V# and vertex_id for another; replay must compile
+    // the same address model as the live draw.
+    w.u32(static_cast<uint32_t>(resource_depth_count));
+    auto write_fetch_index_modes = [&](const GpuCapturedTable& table) {
+        for (const auto& captured : table.resources)
+            w.u32(static_cast<uint32_t>(captured.resource.fetch_index_mode));
+    };
+    for (const auto& draw : c.draws) {
+        write_fetch_index_modes(draw.vrt);
+        write_fetch_index_modes(draw.prt);
+    }
+    for (const auto& compute : c.computes) write_fetch_index_modes(compute.resources);
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -2322,6 +2338,28 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
         }
         for (auto& diagnostic : c.failure_diagnostics) if (diagnostic.pipeline_present)
             if (!read_bias(diagnostic.pipeline)) return false;
+    }
+    if (version >= 30) {   // dynamic-fold-proven buffer fetch index source
+        size_t expected = 0;
+        for (auto& draw : c.draws) expected += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (auto& compute : c.computes) expected += compute.resources.resources.size();
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) {
+            error = "invalid fetch-index-mode count"; return false;
+        }
+        auto read_fetch_index_modes = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources) {
+                uint32_t mode = 0;
+                if (!r.u32(mode) || mode > static_cast<uint32_t>(VertexFetchIndexMode::Instance))
+                    return false;
+                captured.resource.fetch_index_mode = static_cast<VertexFetchIndexMode>(mode);
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_fetch_index_modes(draw.vrt) || !read_fetch_index_modes(draw.prt)) return false;
+        for (auto& compute : c.computes)
+            if (!read_fetch_index_modes(compute.resources)) return false;
     }
     if (version >= 7 && !validate_failure_diagnostics(c, error)) return false;
     if (r.left) { error = "capture has trailing data"; return false; }

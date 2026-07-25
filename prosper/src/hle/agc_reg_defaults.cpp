@@ -9,9 +9,13 @@
 // real, non-empty RegisterDefaults instead of the previous count=0 placeholder.
 //
 // Consumed by hle_graphics.cpp's GetRegisterDefaults2 thunk via prosper_agc_reg_defaults().
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 
+#include "../gpu/command_processor.hpp"
 #include "../gpu/pm4_registers.hpp"
 
 namespace prosper { namespace agc {
@@ -484,13 +488,55 @@ static RegisterDefaults g_reg_defaults1 = { // @suppress("Invalid arguments")
 static RegisterDefaults g_reg_defaults2 = { // @suppress("Invalid arguments")
     g_tbl_cx2, g_tbl_sh2, g_tbl_uc2, nullptr, {0, 0}, g_tbl_index2, sizeof(g_tbl_index2) / 12};
 
+// SDK 13 preserves the same ABI: Dragon Quest VII reads the count at +0x38, walks
+// 12-byte type records, then follows one of the pointer banks at +0x00. The two
+// qwords at +0x20 remain zero, matching the established table.
+static RegisterDefaultInfo g_modern_cx_extra[] = {
+    // DQ's SDK-13 pipeline builder requests RT0 blend state through this separate
+    // key. Without it, the guest copies its all-ones sentinel into CB_BLEND0_CONTROL.
+    {0xA6D12629, {{Pm4::CB_BLEND0_CONTROL, 0x20010001}}},
+};
+
+struct ModernPublicTables {
+    std::array<ShaderRegister*, std::size(g_tbl_cx1) + std::size(g_modern_cx_extra)> cx{};
+    std::array<uint32_t, std::size(g_tbl_index1) + 3 * std::size(g_modern_cx_extra)> types{};
+    RegisterDefaults defaults{};
+
+    ModernPublicTables() {
+        std::copy(std::begin(g_tbl_cx1), std::end(g_tbl_cx1), cx.begin());
+        std::copy(std::begin(g_tbl_index1), std::end(g_tbl_index1), types.begin());
+
+        for (std::size_t i = 0; i < std::size(g_modern_cx_extra); ++i) {
+            const std::size_t id = std::size(g_tbl_cx1) + i;
+            cx[id] = g_modern_cx_extra[i].reg;
+
+            const std::size_t out = std::size(g_tbl_index1) + 3 * i;
+            types[out] = g_modern_cx_extra[i].type;
+            types[out + 1] = static_cast<uint32_t>(id * 4);
+            types[out + 2] = 0;
+        }
+
+        defaults = {cx.data(), g_tbl_sh1, g_tbl_uc1, nullptr, {0, 0}, types.data(),
+                    static_cast<uint32_t>(types.size() / 3)};
+    }
+};
+
+static RegisterDefaults* modern_public_defaults() {
+    static ModernPublicTables tables;
+    return &tables.defaults;
+}
 
 } } // namespace prosper::agc
 
-// Returned by the sceAgcGetRegisterDefaults2 HLE thunk (ver is the SDK version, always 8).
-extern "C" void* prosper_agc_reg_defaults(unsigned int /*ver*/) {
+// Returned by the sceAgcGetRegisterDefaults2 HLE thunk.
+extern "C" void* prosper_agc_reg_defaults(unsigned int version) {
+    if (version >= 13) {
+        prosper_gpu_enable_post_submit_visibility();
+        return prosper::agc::modern_public_defaults();
+    }
     return &prosper::agc::g_reg_defaults1;
 }
-extern "C" void* prosper_agc_reg_defaults_internal(unsigned int /*ver*/) {
+extern "C" void* prosper_agc_reg_defaults_internal(unsigned int version) {
+    if (version >= 13) prosper_gpu_enable_post_submit_visibility();
     return &prosper::agc::g_reg_defaults2;
 }

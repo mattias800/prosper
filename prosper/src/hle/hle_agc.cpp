@@ -66,6 +66,7 @@ constexpr uint32_t R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET =
                    R_INDEX_BASE = 0x1b, R_INDEX_COUNT = 0x1c, R_DRAW_INDEX_OFFSET = 0x1d,
                    R_JUMP = 0x1e, R_SET_PRED = 0x1f;
 constexpr uint32_t R_NUM = 0x40;
+constexpr uint64_t kAgcErrInvalidArg = 0x8a6c000aull;
 inline uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
     return 0xC0000000u | (((len - 2u) & 0x3fffu) << 16u) | ((op & 0xffu) << 8u) | ((r & (R_NUM - 1u)) << 2u);
 }
@@ -164,6 +165,28 @@ HLE(agc_dcb_type2_nop) {  // (buf)
     if (!cmd) return 0;
     *cmd = 0x80000000u;
     return reinterpret_cast<uint64_t>(cmd);
+}
+
+// Initialise the 32-entry pixel-interpolant descriptor table used by the Gen5 driver. Dragon Quest
+// VII calls this for every graphics pipeline and later submits the low dwords as virtual offsets;
+// returning success without touching `out` left those offsets uninitialised. Descriptor-specific
+// translation is not implemented yet, so keep the bounded identity fallback explicit.
+// CONFIDENCE: HIGH on output/count and the default encoding (live caller and command stream), LOW
+// on the unused descriptor inputs; they remain deliberately uninterpreted.
+static void agc_write_interpolant_defaults(uint64_t* out) {
+    constexpr uint64_t kDefaultEntry = 0x10000000ull;
+    for (uint32_t i = 0; i < 32; ++i) {
+        const uint32_t low = static_cast<uint32_t>(kDefaultEntry) + i;
+        const uint32_t high = static_cast<uint32_t>(kDefaultEntry >> 37u) * 32u + i;
+        out[i] = (static_cast<uint64_t>(high) << 32u) | low;
+    }
+}
+
+HLE(agc_build_interpolant_mapping) {  // (uint64_t out[32], opaque descriptor, opaque source)
+    if (!a0 || !gpu::guest_writable(a0, 32u * sizeof(uint64_t))) return kAgcErrInvalidArg;
+    auto* out = reinterpret_cast<uint64_t*>(static_cast<uintptr_t>(a0));
+    agc_write_interpolant_defaults(out);
+    return 0;
 }
 HLE(agc_dcb_set_num_instances) {  // (buf, num_instances)
     uint32_t* cmd; if (!begin_packet(a0, 2, IT_NUM_INSTANCES, 0, &cmd)) return 0;
@@ -712,9 +735,6 @@ static_assert(offsetof(AgcShader, user_data) == 0x08 && offsetof(AgcShader, code
               offsetof(AgcShader, specials) == 0x28 && offsetof(AgcShader, type) == 0x5a &&
               offsetof(AgcShader, num_sh_registers) == 0x5c, "AgcShader must match the SDK blob layout");
 
-// AGC error codes (observed in the eboot wrapper at 0x3ae120).
-constexpr uint64_t kAgcErrInvalidArg = 0x8a6c000aull;
-
 // Registry of all created shaders — the AGC->Vulkan pipeline consumes this to find shader code by
 // PGM base.
 // The registry mutex covers CreateShader's push_back (guest loader threads) against the submit
@@ -1044,6 +1064,23 @@ HLE(agc_create_interpolant_mapping) {  // (ShaderRegister regs[32], const Shader
     return 0;
 }
 
+// The SDK-revision export dbOlWdppb4o has two live title-visible argument shapes. Cobra passes
+// complete producer/pixel shader blobs (types 2 and 1) and consumes 32 SPI_PS_INPUT_CNTL register
+// pairs. Dragon Quest VII passes opaque/default inputs and consumes the 32-entry virtual-offset
+// table modeled by agc_build_interpolant_mapping. Discriminate on the exact shader types validated
+// by Cobra's eboot wrapper; all other shapes retain DQ's bounded default contract.
+// CONFIDENCE: HIGH (both live callers plus independent focused regressions).
+HLE(agc_create_interpolant_mapping_sdk_alias) {
+    if (a1 && a2 && gpu::guest_readable(a1, sizeof(AgcShader)) &&
+        gpu::guest_readable(a2, sizeof(AgcShader))) {
+        const auto* producer = reinterpret_cast<const AgcShader*>(static_cast<uintptr_t>(a1));
+        const auto* pixel = reinterpret_cast<const AgcShader*>(static_cast<uintptr_t>(a2));
+        if (producer->type == 2 && pixel->type == 1)
+            return agc_create_interpolant_mapping(a0, a1, a2, a3, a4, a5);
+    }
+    return agc_build_interpolant_mapping(a0, a1, a2, a3, a4, a5);
+}
+
 // --- sceAgcDriverSubmitDcb (AgcDriver NID UglJIZjGssM) — the GPU submission point. -------------
 //
 // The game hands us a Packet {dcb_addr, dw_num} (Kyty Gen5Driver::Packet, Graphics.cpp:2168). We
@@ -1184,10 +1221,12 @@ static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned&
         if (!w) w = 2;
         if (!h) h = 2;
     }
-    // Draw spans and dispatches are synchronous. Drain packet writes before the renderer reads guest
-    // resources, then retire completion only after the ordered mixed timeline has finished.
+    // Draw spans and dispatches are synchronous. Apply bulk resource uploads needed by the renderer,
+    // but leave fence/label completions on their post-submit FIFO: exposing a ReleaseMem fence before
+    // this call returns lets another guest thread recycle its label while the submitter is still
+    // updating the corresponding allocation lists (#312).
     gpu::flush_deferred_streams();
-    prosper_gpu_drain_completion_writes();
+    prosper_gpu_drain_renderer_writes();
     // PROSPER_PRESENT_EVERY=N suppresses publication only. Unlike PROSPER_RENDER_EVERY, every
     // graphics/compute operation still executes and persistent targets advance on every submit.
     // Publish the first eligible frame, then one in every N so a consumer gets an image promptly.
@@ -1300,6 +1339,9 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
 // CONFIDENCE: HIGH on the arg9=count ABI (callsite + adapter disassembly agree, and the count matches
 // the primary path's Packet.dw_num field offset).
 HLE9(agc_driver_submit_dcb_variant) {
+    // The generated return hook is attached to this import invocation even when validation rejects
+    // it. Begin before every early return so nested/re-entrant tagged calls remain exactly paired.
+    prosper_gpu_submit_scope_begin();
     auto is_pm4 = [](uint64_t p) -> bool {
         if (p < 0x10000 || (p & 3)) return false;
         uint32_t h = *(const volatile uint32_t*)(uintptr_t)p;
@@ -1329,6 +1371,8 @@ HLE9(agc_driver_submit_dcb_variant) {
 }
 
 HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
+    // Paired with this NID's generated post-handler return hook, including invalid calls.
+    prosper_gpu_submit_scope_begin();
     struct Packet { uint32_t* addr; uint32_t dw_num; uint8_t pad[4]; };
     const auto* p = (const Packet*)(uintptr_t)a0;
     if (!p || !p->addr || !p->dw_num) return kAgcErrInvalidArg;
@@ -1414,6 +1458,8 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
 // ACB streams through the same serialized queue model. Keeping a named wrapper makes the queue type
 // visible in diagnostics and leaves room for independent hardware queue state later.
 HLE(agc_driver_submit_acb) {  // sceAgcDriverSubmitAcb(queue, const AcbPacket*, ...)
+    // Paired with this NID's generated post-handler return hook, including invalid calls.
+    prosper_gpu_submit_scope_begin();
     if (getenv("PROSPER_GFXLOG")) {
         static std::atomic<unsigned> logged{0};
         if (logged.fetch_add(1) < 16) {
@@ -1630,6 +1676,7 @@ HLE(agc_cb_nop_get_size)          { uint32_t n = (uint32_t)a0; if (n == 0) n = 1
 
 void register_agc_hle() {
     #define RN(nid, fn) Hle::register_fn(nid, (HleFn)(fn), nid)
+    #define RN_SUBMIT(nid, fn) Hle::register_fn(nid, (HleFn)(fn), nid, &prosper_gpu_submit_scope_end)
     RN("VEGu4dixjUg", agc_dcb_jump_get_size);        // sceAgcDcbJumpGetSize (#1137)
     RN("-vnlTPPXPrw", agc_dcb_acquire_mem_get_size); // sceAgcDcbAcquireMemGetSize
     RN("ewobAQeMo5k", agc_dcb_acquire_mem_get_size); // sceAgcAcbAcquireMemGetSize (same size)
@@ -1651,7 +1698,7 @@ void register_agc_hle() {
     // Leaving that alias on the generic success stub advertised 32 unwritten stack records and
     // made coincidental junk offsets program real registers.
     RN("pdEV7bI6COI", agc_create_interpolant_mapping);       // PS5 3.20
-    RN("dbOlWdppb4o", agc_create_interpolant_mapping);       // Cobra SDK revision
+    RN("dbOlWdppb4o", agc_create_interpolant_mapping_sdk_alias); // Cobra/DQ SDK revision
     RN("HV4j+E0MBHE", agc_create_interpolant_mapping);       // older observed revision
     RN("TRO721eVt4g", agc_dcb_reset_queue);
     RN("+kSrjIVxKFE", agc_dcb_push_marker);
@@ -1709,9 +1756,12 @@ void register_agc_hle() {
     RN("IxYiarKlXxM", agc_patch_dma_data_dst);  // sceAgcDmaDataPatchSetDstAddressOrOffset
     RN("cdDRpqcFGbU", agc_patch_dma_data_src);  // sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate
     RN("YUeqkyT7mEQ", agc_dcb_set_flip);        // sceAgcDcbSetFlip (Kyty LibGraphicsDriver.cpp:98)
-    RN("UglJIZjGssM", agc_driver_submit_dcb);   // sceAgcDriverSubmitDcb -> CommandProcessor replay
-    RN("gSRnr79F8tQ", agc_driver_submit_acb);   // sceAgcDriverSubmitAcb -> ordered compute replay
-    RN("w1KFAHVqpaU", agc_driver_submit_dcb_variant);  // final-buffer submit variant (#232, DOLL RHI batch)
+    // Completion labels stay private until the handler has returned into its generated import
+    // trampoline. This per-NID checkpoint ends the submit scope immediately before guest return.
+    RN_SUBMIT("UglJIZjGssM", agc_driver_submit_dcb);   // sceAgcDriverSubmitDcb -> CommandProcessor replay
+    RN_SUBMIT("gSRnr79F8tQ", agc_driver_submit_acb);   // sceAgcDriverSubmitAcb -> ordered compute replay
+    RN_SUBMIT("w1KFAHVqpaU", agc_driver_submit_dcb_variant);  // final-buffer submit variant (#232, DOLL RHI batch)
+    #undef RN_SUBMIT
     #undef RN
 }
 

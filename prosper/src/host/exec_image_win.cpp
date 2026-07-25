@@ -290,7 +290,7 @@ namespace {
         };
         memcpy(p, seq, sizeof seq); return sizeof seq;
     }
-    size_t emit_hle_return_checkpoint(uint8_t* p) {
+    size_t emit_hle_return_checkpoint(uint8_t* p, uint64_t return_hook = 0) {
         size_t o = 0;
         p[o++] = 0x48; p[o++] = 0x89; p[o++] = 0x44; p[o++] = 0x24; p[o++] = 0x20;
                                                                         // mov [rsp+0x20],rax
@@ -298,19 +298,25 @@ namespace {
         p[o++] = 0x49; p[o++] = 0xBB; memcpy(p + o, &checkpoint, 8); o += 8;
                                                                         // movabs r11,checkpoint
         p[o++] = 0x41; p[o++] = 0xFF; p[o++] = 0xD3;                    // call r11
+        if (return_hook) {
+            p[o++] = 0x49; p[o++] = 0xBB; memcpy(p + o, &return_hook, 8); o += 8;
+                                                                        // movabs r11,return_hook
+            p[o++] = 0x41; p[o++] = 0xFF; p[o++] = 0xD3;                // call r11
+        }
         p[o++] = 0x48; p[o++] = 0x8B; p[o++] = 0x44; p[o++] = 0x24; p[o++] = 0x20;
                                                                         // mov rax,[rsp+0x20]
         return o;
     }
-    void emit_impl(uint8_t* p, uint64_t fn) {
+    size_t emit_impl(uint8_t* p, uint64_t fn, uint64_t return_hook) {
         size_t o = emit_sysv_to_ms_prologue(p);
         p[o++] = 0x48; p[o++] = 0xB8; memcpy(p + o, &fn, 8); o += 8;   // movabs rax,fn
         p[o++] = 0xFF; p[o++] = 0xD0;                                  // call rax
-        o += emit_hle_return_checkpoint(p + o);
+        o += emit_hle_return_checkpoint(p + o, return_hook);
         p[o++] = 0x48; p[o++] = 0x83; p[o++] = 0xC4; p[o++] = 0x58;    // discard outgoing args + pad
         p[o++] = 0xC3;                                                 // ret
+        return o;
     }
-    void emit_unimpl(uint8_t* p, uint32_t idx, uint64_t fn) {
+    size_t emit_unimpl(uint8_t* p, uint32_t idx, uint64_t fn) {
         size_t o = 0;
         p[o++] = 0x48; p[o++] = 0x83; p[o++] = 0xEC; p[o++] = 0x28;    // sub rsp,0x28 (shadow + align)
         p[o++] = 0x48; p[o++] = 0x8B; p[o++] = 0x54; p[o++] = 0x24; p[o++] = 0x28;
@@ -323,6 +329,7 @@ namespace {
         o += emit_hle_return_checkpoint(p + o);
         p[o++] = 0x48; p[o++] = 0x83; p[o++] = 0xC4; p[o++] = 0x28;    // add rsp,0x28
         p[o++] = 0xC3;                                                 // ret
+        return o;
     }
 
     // Is [addr] readable right now? VirtualQuery-based, so the fault reporter never nests a fault.
@@ -1141,8 +1148,12 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
     for (uint64_t i = 0; i < n; i++) {
         uint8_t* slot = base + i * stub_size;
         HleFn fn = Hle::lookup(slots[i].nid);
-        if (fn) emit_impl(slot, (uint64_t)fn);
-        else    emit_unimpl(slot, (uint32_t)i, (uint64_t)&prosper_on_unimpl);
+        const uint64_t return_hook =
+            (uint64_t)(uintptr_t)Hle::return_hook_of(slots[i].nid);
+        const size_t emitted = fn ? emit_impl(slot, (uint64_t)fn, return_hook)
+                                  : emit_unimpl(slot, (uint32_t)i,
+                                                (uint64_t)&prosper_on_unimpl);
+        if (emitted > stub_size) return fail("generated Windows ABI bridge exceeds stub_size");
     }
     g_stub_base = stub_base; g_stub_size = stub_size; g_nstubs = n;
     // Keep the stack-address-to-import diagnostic available on every execution host. The fingerprint

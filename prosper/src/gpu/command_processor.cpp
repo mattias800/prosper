@@ -1157,6 +1157,12 @@ static void honor_write_data(const Pm4Command& c) {
 // writes fences from its GPU thread, never inside the submit call). The cross-queue wait ordering
 // is handled by the WAIT_REG_MEM barrier model below (opt-in, PROSPER_WAIT_DEFER=1).
 namespace {
+std::atomic<bool> g_post_submit_visibility{false};
+
+bool post_submit_visibility_enabled() {
+    return g_post_submit_visibility.load(std::memory_order_acquire);
+}
+
 bool eop_write_sync() {
     static const bool v = [] { const char* e = getenv("PROSPER_EOP_WRITE_SYNC");
                                return e && strtol(e, nullptr, 0) != 0; }();
@@ -1174,8 +1180,14 @@ struct PendQueue {
     std::deque<PendWrite> q;
     bool worker_started = false;
     int  inflight = 0;    // items popped but whose write hasn't landed yet (see drain)
+    int  active_submits = 0; // fence writes stay private until the import return checkpoint
+    std::chrono::steady_clock::time_point release_after{}; // modeled GPU latency after that checkpoint
 };
 PendQueue& pend_q() { static PendQueue* p = new PendQueue; return *p; }
+// A return hook is attached to the import NID, so it also runs when that handler rejects its
+// arguments before opening a submit scope. Track scopes on the calling thread as well as globally:
+// only the synchronous import call that began a scope may retire it at its return checkpoint.
+thread_local uint32_t t_submit_scope_depth = 0;
 void apply_effect(const Pm4Command& c);   // fwd (defined with the WAIT_DEFER machinery below)
 void apply_deferred_effect(const Pm4Command& c);   // fwd: guarded apply (#449)
 // Drain returns only when every pending write has LANDED, and writes land STRICTLY IN QUEUE ORDER.
@@ -1217,15 +1229,33 @@ void pend_drain_locked(PendQueue& p, std::unique_lock<std::mutex>& lk) {
         p.cv.notify_all();               // wake both drain waiters and the pend worker
     }
 }
+// The HLE import trampoline owns scope_end(), so active_submits cannot reach zero until the submit
+// handler has returned and the trampoline is at its guest-return checkpoint. The deadline below is
+// only modeled GPU latency after that real boundary; correctness no longer depends on a timer being
+// long enough to cover guest-side bookkeeping. A new submit may begin during the latency window; in
+// that case wait for its later checkpoint/deadline instead.
+void pend_wait_post_submit(PendQueue& p, std::unique_lock<std::mutex>& lk) {
+    for (;;) {
+        p.cv.wait(lk, [&] { return p.active_submits == 0; });
+        const auto deadline = p.release_after;
+        if (std::chrono::steady_clock::now() >= deadline) return;
+        p.cv.wait_until(lk, deadline);
+    }
+}
 void pend_worker() {
     PendQueue& p = pend_q();
     std::unique_lock<std::mutex> lk(p.mx);
     for (;;) {
         p.cv.wait(lk, [&] { return !p.q.empty(); });
-        lk.unlock();
-        struct timespec ts{ 0, 1000000 };   // 1 ms modeled pipe-drain latency (matches the EOP worker)
-        nanosleep(&ts, nullptr);
-        lk.lock();
+        if (post_submit_visibility_enabled()) {
+            pend_wait_post_submit(p, lk);
+        } else {
+            // Preserve the established compatibility path for older SDK callers.
+            lk.unlock();
+            struct timespec ts{0, 1000000};
+            nanosleep(&ts, nullptr);
+            lk.lock();
+        }
         pend_drain_locked(p, lk);
     }
 }
@@ -1250,7 +1280,139 @@ void pend_enqueue(const Pm4Command& c) {
 extern "C" void prosper_gpu_drain_completion_writes() {
     PendQueue& p = pend_q();
     std::unique_lock<std::mutex> lk(p.mx);
+    pend_wait_post_submit(p, lk);
     pend_drain_locked(p, lk);
+}
+
+extern "C" void prosper_gpu_enable_post_submit_visibility() {
+    g_post_submit_visibility.store(true, std::memory_order_release);
+}
+
+extern "C" void prosper_gpu_submit_scope_begin() {
+    if (!post_submit_visibility_enabled()) return;
+    PendQueue& p = pend_q();
+    std::unique_lock<std::mutex> lk(p.mx);
+    p.cv.wait(lk, [&] { return p.inflight == 0; });
+    t_submit_scope_depth++;
+    p.active_submits++;
+    p.cv.notify_all();
+}
+
+extern "C" void prosper_gpu_submit_scope_end() {
+    if (!post_submit_visibility_enabled()) return;
+    // Invalid/rejected calls to a submit NID still pass through its generated return hook. Such a
+    // call has no local token and must not retire a valid submit executing on another thread.
+    if (t_submit_scope_depth == 0) return;
+    PendQueue& p = pend_q();
+    {
+        std::lock_guard<std::mutex> lk(p.mx);
+        if (p.active_submits == 0) return; // defensive: preserve both counters if the invariant broke
+        t_submit_scope_depth--;
+        if (--p.active_submits == 0)
+            p.release_after = std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
+    }
+    p.cv.notify_all();
+}
+
+extern "C" bool prosper_gpu_submit_scope_active() {
+    if (!post_submit_visibility_enabled()) return false;
+    PendQueue& p = pend_q();
+    std::lock_guard<std::mutex> lk(p.mx);
+    return p.active_submits > 0;
+}
+
+// The renderer runs synchronously inside the submit import and needs resource initialization before
+// it samples guest memory. A full drain here is unsafe: it also exposes ReleaseMem and EVENT_WRITE
+// completion fences before the submitter has returned and finished its guest-side bookkeeping,
+// allowing another thread to recycle their 0x20-byte labels (#312). Extract every queued
+// WriteData/DmaData resource update except one whose destination overlaps a queued completion
+// fence/event. Selected resource writes may pass unrelated completion records, but never a write to
+// the same label. This boundary retains small descriptor/constant uploads used by older titles;
+// size/content heuristics left those writes one frame behind.
+extern "C" void prosper_gpu_drain_renderer_writes() {
+    if (!post_submit_visibility_enabled()) {
+        prosper_gpu_drain_completion_writes();
+        return;
+    }
+    PendQueue& p = pend_q();
+    for (;;) {
+        std::unique_lock<std::mutex> lk(p.mx);
+        if (p.inflight > 0) {
+            p.cv.wait(lk);
+            continue;
+        }
+        auto overlaps_completion = [&](uint64_t addr, uint64_t bytes) {
+            if (!addr || !bytes) return true;
+            const uint64_t end = addr + bytes;
+            if (end < addr) return true;
+            for (const PendWrite& queued : p.q) {
+                uint64_t target = 0, target_bytes = 0;
+                if (queued.cmd.kind == Pm4Command::Kind::ReleaseMem) {
+                    target = queued.cmd.rel_addr;
+                    target_bytes = queued.cmd.rel_data_sel == 1 ? 4 : 8;
+                } else if (queued.cmd.kind == Pm4Command::Kind::EventWrite) {
+                    target = queued.cmd.event_addr;
+                    target_bytes = 8;
+                }
+                if (target && target < end && addr < target + target_bytes) return true;
+            }
+            return false;
+        };
+        auto it = std::find_if(p.q.begin(), p.q.end(), [&](const PendWrite& w) {
+            using K = Pm4Command::Kind;
+            if (w.cmd.kind == K::DmaData)
+                return !overlaps_completion(w.cmd.dd_dst, w.cmd.dd_bytes);
+            if (w.cmd.kind != K::WriteData || !w.cmd.wd_data || !w.cmd.wd_num) return false;
+            const uint64_t bytes = (uint64_t)w.cmd.wd_num * 4;
+            return !overlaps_completion(w.cmd.wd_addr, bytes);
+        });
+        if (it == p.q.end()) return;
+        PendWrite w = std::move(*it);
+        p.q.erase(it);
+        p.inflight++;
+        lk.unlock();
+        apply_deferred_effect(w.cmd);
+        lk.lock();
+        p.inflight--;
+        p.cv.notify_all();
+    }
+}
+
+// Resolve a scalar label against the writes queued by the currently executing submit without
+// publishing those writes to guest memory. This gives WAIT_REG_MEM its in-queue ordering semantics
+// while other guest threads continue to see the pre-submit value until the import returns.
+bool pend_overlay_qword(uint64_t addr, uint64_t* value) {
+    PendQueue& p = pend_q();
+    std::lock_guard<std::mutex> lk(p.mx);
+    if (p.q.empty()) return false;
+    uint64_t v = *value;
+    bool touched = false;
+    for (const PendWrite& w : p.q) {
+        const Pm4Command& c = w.cmd;
+        using K = Pm4Command::Kind;
+        if (c.kind == K::ReleaseMem && c.rel_addr == addr && c.rel_value_valid) {
+            if (c.rel_data_sel == 1) {
+                uint32_t lo = (uint32_t)c.rel_value;
+                memcpy(&v, &lo, sizeof lo);
+                touched = true;
+            } else if (c.rel_data_sel == 2) {
+                v = c.rel_value;
+                touched = true;
+            }
+        } else if (c.kind == K::WriteData && c.wd_addr == addr && c.wd_data && c.wd_num) {
+            const size_t n = std::min<size_t>((size_t)c.wd_num * 4, sizeof v);
+            memcpy(&v, c.wd_data, n);
+            touched = true;
+        } else if (c.kind == K::DmaData && c.dd_dst == addr && c.dd_valid && c.dd_src <= UINT32_MAX) {
+            const uint32_t word = (uint32_t)c.dd_src;
+            const size_t n = std::min<size_t>(c.dd_bytes, sizeof v);
+            for (size_t off = 0; off < n; off += sizeof word)
+                memcpy((uint8_t*)&v + off, &word, std::min(sizeof word, n - off));
+            touched = true;
+        }
+    }
+    if (touched) *value = v;
+    return touched;
 }
 
 // --- WAIT_REG_MEM per-queue barrier model (issue #312 heap-corruption root cause). ---------------
@@ -1347,6 +1509,7 @@ bool wait_regmem_satisfied(const Pm4Command& c) {
     // unmapped-but-aligned address. #380.
     if (!guest_readable(c.wm_addr, sizeof(uint64_t))) return false;
     uint64_t mem = 0; memcpy(&mem, (const void*)(uintptr_t)c.wm_addr, sizeof mem);
+    pend_overlay_qword(c.wm_addr, &mem);
     uint64_t v = mem & c.wm_mask, r = c.wm_ref;
     switch (c.wm_func) {           // PM4 WAIT_REG_MEM compare functions
         case 0: return true;
@@ -1566,10 +1729,9 @@ void submit_completion_pulse(bool submit_rejected) {
 // backstop). Returns how many streams fully completed.
 int flush_deferred_streams() {
     if (g_deferred.empty()) return 0;
-    // Intra-queue order: PRE-pause writes ride the 1 ms pipe-drain queue while gated writes are
-    // applied here directly. Drain first so a released tail never overtakes its own head — and so
-    // a producer fence still sitting in the pend queue is visible to the barrier checks below.
-    prosper_gpu_drain_completion_writes();
+    // Legacy SDK callers retain the original eager visibility. Modern callers consult the pending
+    // scalar overlay instead, so their completion labels remain post-submit.
+    if (!post_submit_visibility_enabled()) prosper_gpu_drain_completion_writes();
     int completed = 0, signalable_completed = 0;
     for (size_t si = 0; si < g_deferred.size(); ) {
         DeferredStream& s = g_deferred[si];
@@ -1973,7 +2135,7 @@ void GpuState::apply(const Pm4Command& c) {
                 }
                 // Everything queued before the first general copy is its ordered prefix. Land that
                 // prefix now; subsequent effects are retained below and cannot overtake the copy.
-                if (dma_copies.empty()) prosper_gpu_drain_completion_writes();
+                if (dma_copies.empty()) prosper_gpu_drain_renderer_writes();
                 dma_copies.push_back({c.dd_dst, c.dd_src, c.dd_bytes, c.dd_sels,
                                       command_order, pkt_addr(c)});
                 break;
@@ -2010,9 +2172,9 @@ void GpuState::apply(const Pm4Command& c) {
                     defer_push(c);
                     break;
                 }
-                // A prior submit's fence write may still sit in the pipe-drain queue — a consumer's
-                // wait must see it (data dependency): drain before evaluating.
-                prosper_gpu_drain_completion_writes();
+                // Legacy callers consume the concrete value. Modern callers keep it private to the
+                // submit and let the evaluator overlay the queued scalar value.
+                if (!post_submit_visibility_enabled()) prosper_gpu_drain_completion_writes();
                 if (!wait_regmem_satisfied(c)) {
                     // Barrier model (#312), opt-in via PROSPER_WAIT_DEFER=1: pause the queue —
                     // everything downstream defers until the condition holds (see the model

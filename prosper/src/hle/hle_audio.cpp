@@ -1755,15 +1755,15 @@ namespace {
 //   SceAjmSidebandMFrame { u32 numFrames; u32 reserved; }            (codec frames decoded by this job)
 // uiTotalDecodedSamples is load-bearing, not padding: with it left zero the guest's mixer (FMOD) stops
 // after a single batch, so it carries the instance's running sample-frame total.
-void ajm2_write_result(uint64_t result_addr, int32_t err, uint32_t consumed, uint32_t produced,
+bool ajm2_write_result(uint64_t result_addr, int32_t err, uint32_t consumed, uint32_t produced,
                        uint64_t total_samples = 0, uint32_t decoded_frames = 0) {
-    if (!result_addr) return;
+    if (!result_addr) return true;
     struct Sideband { int32_t iResult; int32_t iCodecResult; uint32_t iSizeConsumed;
                       uint32_t iSizeProduced; uint64_t uiTotalDecodedSamples;
                       uint32_t numFrames; uint32_t reserved; };
     static_assert(sizeof(Sideband) == 32, "AJM decode sideband must include the MFrame result");
     Sideband sb{ err, 0, consumed, produced, total_samples, decoded_frames, 0 };
-    audio_store_bytes(result_addr, &sb, sizeof sb);
+    return audio_store_bytes(result_addr, &sb, sizeof sb);
 }
 
 // Decode a batch's queued jobs. Jobs sharing an instance are consecutive stream blocks whose input
@@ -1790,6 +1790,11 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
             const bool log = getenv("PROSPER_AUDIOLOG") != nullptr;
             for (size_t k = ji; k < je; ++k) {
                 AjmDecJob& job = jobs[k];
+                if (!instance.host_dec->valid()) {
+                    ajm2_write_result(job.result_addr, kAjm2ErrDecode, 0, 0,
+                                      instance.decoded_samples);
+                    continue;
+                }
                 std::vector<uint8_t> input(job.in_size);
                 const size_t got = audio_read_bytes_partial(job.in_addr, input.data(), input.size());
                 std::vector<int16_t> pcm(job.out_size / sizeof(int16_t));
@@ -1807,18 +1812,30 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                     decoded.produced_bytes <= job.out_size &&
                     decoded.produced_bytes <= pcm.size() * sizeof(int16_t) &&
                     pcm_shape_valid;
+                // A failed result publishes zero consumption. The backend may already have
+                // advanced parser/codec state, so it must become terminal before the guest retries
+                // the same compressed prefix. This also covers a malformed backend result rejected
+                // by the guest-facing validation above.
+                if (!valid) instance.host_dec->invalidate();
                 int32_t err = valid ? 0 : kAjm2ErrDecode;
                 uint32_t consumed = valid ? decoded.consumed_bytes : 0;
                 uint32_t produced = valid ? decoded.produced_bytes : 0;
                 if (produced && !audio_store_bytes(job.out_addr, pcm.data(), produced)) {
+                    instance.host_dec->invalidate();
                     err = kAjm2ErrDecode;
                     consumed = produced = 0;
                 }
                 if (!err) ajm2_dump_decode(inst_id,
                     std::span<const uint8_t>(input.data(), consumed), pcm.data(), produced);
                 if (!err && produced) instance.decoded_samples += produced / frame_bytes;
-                ajm2_write_result(job.result_addr, err, consumed, produced,
-                                  instance.decoded_samples, decoded.decoded_frames);
+                if (!ajm2_write_result(job.result_addr, err, consumed, produced,
+                                       instance.decoded_samples,
+                                       err ? 0 : decoded.decoded_frames)) {
+                    // The codec and guest PCM may already have advanced, but the guest did not
+                    // receive the progress sideband. Preserve the same terminal invariant as every
+                    // other unpublishable result before another queued job reaches the decoder.
+                    instance.host_dec->invalidate();
+                }
                 if (log)
                     fprintf(stderr, "[ajm2] t=%llums decode inst=%u codec=%u in=%zu/%u "
                             "out=%u -> %u consumed, %u PCM, %uch/%uHz total=%llu%s\n",
@@ -1827,6 +1844,15 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                             decoded.sample_rate, (unsigned long long)instance.decoded_samples,
                             err ? " ERR" : "");
             }
+            ji = je;
+            continue;
+        }
+        // A non-null invalid host decoder is deliberately terminal. Do not fall through to the
+        // ATRAC9 path or erase the cumulative sample count on a later batch's error sideband.
+        if (it != g_ajm2_inst.end() && it->second.host_dec) {
+            for (size_t k = ji; k < je; ++k)
+                ajm2_write_result(jobs[k].result_addr, kAjm2ErrDecode, 0, 0,
+                                  it->second.decoded_samples);
             ji = je;
             continue;
         }

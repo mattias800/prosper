@@ -19,9 +19,9 @@ alignas(256) static const uint32_t kDiagnosticVs[] = {
     0x10020B01u, 0x08020D01u, 0x10040B02u, 0x08040D02u, 0x7E060280u, 0x7E0802F2u,
     0xF80008CFu, 0x04030201u, 0xBF810000u,
 };
-// Forward VCCZ branch is deliberately not invocation-safe and must remain fail-visible.
+// An unconditional scalar branch remains deliberately unsupported and fail-visible.
 alignas(256) static const uint32_t kDiagnosticBadPs[] = {
-    0x7da80300u, 0xbf860001u, 0x4a060300u, 0xBF810000u,
+    0x06000300u, 0xbf820005u, 0xBF810000u,
 };
 
 static void set_pgm(GpuState& state, uint32_t lo_register, uint32_t hi_register,
@@ -66,6 +66,7 @@ int main() {
     auto table = std::make_shared<ShaderResourceTable>();
     ShaderResource a{}; a.cls = ResourceClass::VertexBuffer; a.binding = 9; a.gpu_addr = 0x1000;
     a.size = 16; a.stride = 4; a.format = DataFormat::Sint2_10_10_10; a.num_components = 4; a.fetch_pc = 12;
+    a.fetch_index_mode = VertexFetchIndexMode::Instance;
     ShaderResource b{}; b.cls = ResourceClass::ConstantBuffer; b.binding = 2; b.gpu_addr = 0x1008;
     b.size = 16; b.format = DataFormat::Float32; b.num_components = 4; b.srt_offset = 0x20;
     ShaderResource dcc{}; dcc.cls = ResourceClass::Texture; dcc.binding = 4; dcc.gpu_addr = 0x1000;
@@ -240,6 +241,14 @@ int main() {
         return 4 + 8 * f.draws.size() + 4 + 8 * present_failures;
     };
 
+    // v30: byte length of the per-resource fetch-index-mode tail.
+    auto v30_tail = [](const GpuCaptureFile& f) -> size_t {
+        size_t rc = 0;
+        for (const auto& d : f.draws) rc += d.vrt.resources.size() + d.prt.resources.size();
+        for (const auto& cm : f.computes) rc += cm.resources.resources.size();
+        return 4 + 4 * rc;
+    };
+
     // v25 (#1240): byte length of the trailing resolve-state block.
     auto v25_tail = [](const GpuCaptureFile& f) -> size_t {
         size_t present_failures = 0;
@@ -270,6 +279,7 @@ int main() {
               v16_scissor_bytes.size() >= 25,
           "v17 capture serializes effective guest scissor state");
     if (v16_scissor_bytes.size() >= 25) {
+        v16_scissor_bytes.resize(v16_scissor_bytes.size() - v30_tail(v16_scissor_source));
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v29_tail(v16_scissor_source));
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v28_tail(v16_scissor_source));
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v27_tail(v16_scissor_source));
@@ -369,7 +379,7 @@ int main() {
     };
     GpuCaptureFile video_capture;
     CHECK(capture_draw_items({video_draw}, meta, video_reader, video_capture, error) &&
-              video_capture.format_version == 29 && video_capture.blobs.size() == 1 &&
+              video_capture.format_version == 30 && video_capture.blobs.size() == 1 &&
               video_capture.blobs[0].bytes.size() == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048,
@@ -379,7 +389,7 @@ int main() {
     GpuReplayFrame video_replay;
     CHECK(serialize_gpu_capture(video_capture, video_capture_bytes, error) &&
               deserialize_gpu_capture(video_capture_bytes, video_loaded, error) &&
-              video_loaded.format_version == 29 &&
+              video_loaded.format_version == 30 &&
               video_loaded.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_loaded.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
               materialize_gpu_replay(video_loaded, video_replay, error) &&
@@ -402,7 +412,7 @@ int main() {
     GpuReplayFrame upgraded_video_replay;
     CHECK(serialize_gpu_capture(legacy_video, upgraded_video_bytes, error) &&
               deserialize_gpu_capture(upgraded_video_bytes, upgraded_video, error) &&
-              upgraded_video.format_version == 29 &&
+              upgraded_video.format_version == 30 &&
               upgraded_video.draws[0].prt.resources[0].captured_size == video_chroma.size &&
               upgraded_video.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
               materialize_gpu_replay(upgraded_video, upgraded_video_replay, error) &&
@@ -500,6 +510,7 @@ int main() {
           "writer rejects an out-of-bounds DCC metadata reference");
     CHECK(serialize_gpu_capture(volume_capture, volume_bytes, error),
           "recreated valid v12 DCC bytes after malformed-reference check");
+    volume_bytes.resize(volume_bytes.size() - v30_tail(volume_capture));
     volume_bytes.resize(volume_bytes.size() - v29_tail(volume_capture));
     volume_bytes.resize(volume_bytes.size() - v28_tail(volume_capture));
     volume_bytes.resize(volume_bytes.size() - v27_tail(volume_capture));
@@ -576,6 +587,7 @@ int main() {
     CHECK(serialize_gpu_capture(captured, v20_bytes, error) && v20_bytes.size() >= 21,
           "v21 capture serializes the logic-op extension");
     if (v20_bytes.size() >= 21) {
+        v20_bytes.resize(v20_bytes.size() - v30_tail(captured));
         v20_bytes.resize(v20_bytes.size() - v29_tail(captured));
         v20_bytes.resize(v20_bytes.size() - v28_tail(captured));
         v20_bytes.resize(v20_bytes.size() - v27_tail(captured));
@@ -624,12 +636,20 @@ int main() {
     CHECK(loaded.draws[0].raw_draw_modifier == 0x1122334455667788ull &&
           loaded.draws[0].vertex_offset == -37,
           "v27 draw modifier and vertex offset round-trip explicitly");
+    CHECK(loaded.draws[0].vrt.resources[0].resource.fetch_index_mode ==
+              VertexFetchIndexMode::Instance,
+          "v30 fetch-index provenance round-trips explicitly for gpu_replay");
     std::vector<uint8_t> v24_resolve_bytes;
     GpuCaptureFile v24_resolve_loaded;
     CHECK(serialize_gpu_capture(captured, v24_resolve_bytes, error) &&
-          v24_resolve_bytes.size() >= v27_tail(captured) + v26_tail(captured) + v25_tail(captured),
+          v24_resolve_bytes.size() >= v30_tail(captured) + v29_tail(captured) +
+              v28_tail(captured) + v27_tail(captured) + v26_tail(captured) +
+              v25_tail(captured),
           "v25 capture exposes a removable trailing resolve-state block");
-    if (v24_resolve_bytes.size() >= v27_tail(captured) + v26_tail(captured) + v25_tail(captured)) {
+    if (v24_resolve_bytes.size() >= v30_tail(captured) + v29_tail(captured) +
+            v28_tail(captured) + v27_tail(captured) + v26_tail(captured) +
+            v25_tail(captured)) {
+        v24_resolve_bytes.resize(v24_resolve_bytes.size() - v30_tail(captured));
         v24_resolve_bytes.resize(v24_resolve_bytes.size() - v29_tail(captured));
         v24_resolve_bytes.resize(v24_resolve_bytes.size() - v28_tail(captured));
         v24_resolve_bytes.resize(v24_resolve_bytes.size() - v27_tail(captured));
@@ -919,7 +939,7 @@ int main() {
           "diagnostic distinguishes shader rejection and retains decoded draw state");
     CHECK(failed_stage != failed.stages.end() && !failed_stage->recompiled &&
           failed_stage->coverage.unsupported == 1 && failed_stage->coverage.first_bad_pc == 1 &&
-          failed_stage->coverage.first_bad_op == 0x06,
+          failed_stage->coverage.first_bad_op == 0x02,
           "failed fragment stage retains the exact rejection opcode and dword PC");
     const GpuCaptureRawShaderVersion* failed_raw =
         failed_stage != failed.stages.end() &&
@@ -1015,6 +1035,7 @@ int main() {
     if (v13_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        v13_bytes.resize(v13_bytes.size() - v30_tail(legacy_source));
         v13_bytes.resize(v13_bytes.size() - v29_tail(legacy_source));
         v13_bytes.resize(v13_bytes.size() - v28_tail(legacy_source));
         v13_bytes.resize(v13_bytes.size() - v27_tail(legacy_source));
@@ -1044,6 +1065,7 @@ int main() {
     if (legacy_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        legacy_bytes.resize(legacy_bytes.size() - v30_tail(legacy_source));
         legacy_bytes.resize(legacy_bytes.size() - v29_tail(legacy_source));
         legacy_bytes.resize(legacy_bytes.size() - v28_tail(legacy_source));
         legacy_bytes.resize(legacy_bytes.size() - v27_tail(legacy_source));
@@ -1099,9 +1121,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 30;   // kVersion (29) + 1: a not-yet-defined future version
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 31;   // kVersion + 1: a future version
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 30",
+          error == "unsupported capture version 31",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

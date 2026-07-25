@@ -1,7 +1,7 @@
 // test_eop_write — Stage B of docs/GPU_EXECUTOR_DESIGN.md: the CommandProcessor honors the Dcb's
-// memory-side effects. Because our fold is synchronous (submit == pipe drain), a RELEASE_MEM /
-// EVENT_WRITE_EOP label write and a WRITE_DATA are performed at apply time — correct end-of-pipe
-// semantics, not a shim. This hand-builds the exact packet layout hle_agc.cpp's builders emit (the
+// memory-side effects. RELEASE_MEM / EVENT_WRITE_EOP label writes ride a completion queue and a
+// WRITE_DATA is applied at the renderer/drain boundary — correct end-of-pipe semantics, not a shim.
+// This hand-builds the exact packet layout hle_agc.cpp's builders emit (the
 // builders themselves read SysV stack args via __builtin_frame_address, only valid under the loaded
 // game) and asserts run_command_buffer writes the right bytes to the target address.
 #include "../src/gpu/command_processor.hpp"
@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <cstdlib>   // setenv/_putenv_s: arm the #1226-retired suppression guards for this test
 #include <cstring>
+#include <chrono>
+#include <thread>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -45,6 +47,8 @@ static size_t run_cb(const uint32_t* buf, size_t dwords, GpuState& st) {
 }
 
 int main() {
+    // Exercise the SDK-13 post-submit queue policy; older callers use the eager compatibility path.
+    prosper_gpu_enable_post_submit_visibility();
     printf("== test_eop_write ==\n");
     // #1226: the generation and MB3-freelist suppression families are OFF by default (their
     // content/membership premises misfire on live protocols — see generation_guard() /
@@ -57,6 +61,65 @@ int main() {
     setenv("PROSPER_GENERATION_GUARD", "1", 1);
     setenv("PROSPER_MB3_FREELIST_GUARD", "1", 1);
 #endif
+
+    // SDK-13 completion writes must remain invisible for the entire guest submit import. The
+    // synchronous renderer may consume an unrelated resource upload, but it must not expose either
+    // half of an ordered label initialization -> release pair. A drain after scope end publishes the
+    // pair; an early publication could let another guest thread recycle the label while the submitter
+    // is still updating its allocation lists.
+    {
+        uint64_t label = 0xaaaaaaaa55555555ull;
+        uint32_t resource = 0;
+        uint32_t buf[19]{};
+        const uint64_t label_addr = (uint64_t)(uintptr_t)&label;
+        const uint64_t resource_addr = (uint64_t)(uintptr_t)&resource;
+        buf[0] = PM4(6, IT_NOP, R_WRITE_DATA);
+        buf[1] = 0;
+        buf[2] = (uint32_t)label_addr; buf[3] = (uint32_t)(label_addr >> 32);
+        buf[4] = 1; buf[5] = 0;                       // ordered label initialization
+        buf[6] = PM4(7, IT_NOP, R_RELEASE_MEM);
+        buf[7] = (uint32_t)label_addr; buf[8] = (uint32_t)(label_addr >> 32);
+        buf[9] = 2;
+        buf[10] = 0x76543210u; buf[11] = 0xfedcba98u;
+        buf[12] = 0x04;
+        buf[13] = PM4(6, IT_NOP, R_WRITE_DATA);
+        buf[14] = 0;
+        buf[15] = (uint32_t)resource_addr; buf[16] = (uint32_t)(resource_addr >> 32);
+        buf[17] = 1; buf[18] = 0x13579bdfu;           // renderer resource upload
+        GpuState st;
+        prosper_gpu_submit_scope_begin();
+        const size_t n = run_command_buffer(buf, 19, st);
+        prosper_gpu_drain_renderer_writes();
+        CHECK(n == 3 && prosper_gpu_submit_scope_active(),
+              "SDK-13 submit scope retains queued label writes");
+        CHECK(resource == 0x13579bdfu,
+              "renderer drain applies an unrelated resource upload inside the submit");
+        CHECK(label == 0xaaaaaaaa55555555ull,
+              "renderer drain keeps an overlapping label init and fence private");
+        // Every submit NID has a return hook, including invalid calls that return before scope_begin.
+        // Model one of those rejected calls on a second guest thread while this valid submit remains
+        // stalled: its unmatched hook must not consume this thread's token or expose this label.
+        std::thread rejected_submit_return([] { prosper_gpu_submit_scope_end(); });
+        rejected_submit_return.join();
+        CHECK(prosper_gpu_submit_scope_active() && label == 0xaaaaaaaa55555555ull,
+              "unmatched return hook cannot retire another thread's active submit");
+        // A same-thread re-entrant tagged import opens its own scope before validation. Its return
+        // checkpoint consumes only that nested token, leaving the outer invocation active.
+        prosper_gpu_submit_scope_begin();
+        prosper_gpu_submit_scope_end();
+        CHECK(prosper_gpu_submit_scope_active() && label == 0xaaaaaaaa55555555ull,
+              "matched nested return hook preserves the outer same-thread submit");
+        // Model an arbitrarily descheduled submit handler after all HLE work is complete but before
+        // its generated import trampoline reaches the return checkpoint. This exceeds the old 1 ms
+        // grace timer and proves elapsed time cannot publish a label while the scope is still active.
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        CHECK(prosper_gpu_submit_scope_active() && label == 0xaaaaaaaa55555555ull,
+              "completion stays private across a stalled pre-return checkpoint");
+        prosper_gpu_submit_scope_end();
+        prosper_gpu_drain_completion_writes();
+        CHECK(label == 0xfedcba9876543210ull,
+              "ordered label initialization and fence become visible after submit scope end");
+    }
 
     // A RELEASE_MEM writing a 64-bit fence value (data_sel==2) to a label, exactly as agc_cb_release_mem
     // lays it out: [0]=hdr [1..2]=addr [3]=data_sel [4..5]=value lo/hi [6]=action.

@@ -141,6 +141,10 @@ struct DynFetch {
     // MTBUF takes its type from the instruction's combined gfx1030 BUF_FMT, not V# dword3.
     // UINT32_MAX identifies ordinary MUBUF, whose descriptor remains authoritative.
     uint32_t instruction_format = UINT32_MAX;
+    // Proven VADDR source at this fetch. The scalar fold also follows the wave-uniform mask that
+    // selects NGG's merged-stage VGPR inputs, allowing the recompiler to distinguish vertex_id from
+    // instance_id instead of applying one gl_VertexIndex shortcut to both.
+    VertexFetchIndexMode index_mode = VertexFetchIndexMode::Automatic;
 };
 
 // One descriptor use recovered by the same const-fold (#294): shaders may load their T#/S#/V#
@@ -1102,7 +1106,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 fprintf(stderr, "[caption]   %s binding=%u base=0x%llx stride=%u size=%u fmt=%u nc=%u\n",
                         r.cls == ResourceClass::VertexBuffer ? "VB" :
                         r.cls == ResourceClass::ConstantBuffer ? "CB" : "TEX",
-                        r.binding, (unsigned long long)r.gpu_addr, r.stride, r.size, (unsigned)r.format, r.num_components);
+                        r.binding, (unsigned long long)r.gpu_addr, r.stride, r.size,
+                        (unsigned)r.format, r.num_components);
                 // Raw first 3 records as floats — reveals whether the fetched position/attr data is valid or
                 // NaN/degenerate (a stride-0 buffer reads record 0 for every vertex -> collapse). #257.
                 if (r.cls == ResourceClass::VertexBuffer && r.gpu_addr > 0x10000) {
