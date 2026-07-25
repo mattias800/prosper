@@ -30,6 +30,7 @@ static int fails = 0;
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
 static constexpr uint32_t kEACCES = 0x8002000Du;
+static constexpr uint32_t kEBUSY = 0x80020010u;
 static constexpr uint32_t kETIMEDOUT = 0x8002003Cu;
 
 static bool set_test_env(const char* name, const char* value) {
@@ -102,15 +103,16 @@ int main() {
     register_builtin_hle();
 
     auto ef_create = Hle::lookup(nid_hash("sceKernelCreateEventFlag"));
+    auto ef_poll   = Hle::lookup(nid_hash("sceKernelPollEventFlag"));
     auto ef_wait   = Hle::lookup(nid_hash("sceKernelWaitEventFlag"));
     auto ef_delete = Hle::lookup(nid_hash("sceKernelDeleteEventFlag"));
     auto se_create = Hle::lookup(nid_hash("sceKernelCreateSema"));
     auto se_wait   = Hle::lookup(nid_hash("sceKernelWaitSema"));
     auto se_delete = Hle::lookup(nid_hash("sceKernelDeleteSema"));
     auto se_signal = Hle::lookup(nid_hash("sceKernelSignalSema"));
-    CHECK(ef_create && ef_wait && ef_delete && se_create && se_wait && se_delete && se_signal,
+    CHECK(ef_create && ef_poll && ef_wait && ef_delete && se_create && se_wait && se_delete && se_signal,
           "ef/sema fns registered");
-    if (!(ef_create && ef_wait && ef_delete && se_create && se_wait && se_delete && se_signal)) {
+    if (!(ef_create && ef_poll && ef_wait && ef_delete && se_create && se_wait && se_delete && se_signal)) {
         printf("== FAIL ==\n"); return 1;
     }
 
@@ -120,6 +122,13 @@ int main() {
         void* ef = nullptr;
         ef_create((uint64_t)(uintptr_t)&ef, 0, 0, 0 /*initPattern*/, 0, 0);
         CHECK(ef != nullptr, "event flag created");
+        uint64_t observed_pattern = ~0ull;
+        const uint64_t poll_result = ef_poll((uint64_t)(uintptr_t)ef, 0x1 /*pattern*/,
+                                             0 /*mode OR*/,
+                                             (uint64_t)(uintptr_t)&observed_pattern, 0, 0);
+        CHECK((uint32_t)poll_result == kEBUSY,
+              "unmatched event-flag poll returned SCE_KERNEL_ERROR_EBUSY");
+        CHECK(observed_pattern == 0, "event-flag poll reported the current pattern");
         std::atomic<uint64_t> wret{~0ull}; std::atomic<bool> done{false};
         std::thread t([&]{
             uint64_t r = ef_wait((uint64_t)(uintptr_t)ef, 0x1 /*pattern*/, 0 /*mode OR*/, 0, 0 /*infinite*/, 0);

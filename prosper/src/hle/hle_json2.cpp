@@ -28,6 +28,14 @@ struct Value;
 struct String { std::string* host = nullptr; };
 struct Array { std::vector<Value*>* host = nullptr; };
 struct Object { std::map<std::string, Value*>* host = nullptr; };
+struct InitParameter2 {
+    void* allocator = nullptr;
+    void* user_data = nullptr;
+    size_t file_buffer_size = 0;
+    uint32_t special_float_format_type = 0;
+    uint32_t reserved[3]{};
+};
+static_assert(sizeof(InitParameter2) == 0x28, "libSceJson2 InitParameter2 ABI");
 struct Value {
     Value* parent = nullptr;
     void* root_parameter = nullptr;
@@ -364,6 +372,21 @@ const std::string& text(const String* string) {
 
 JHLE(noop_self) { return a0; }
 JHLE(noop_zero) { return 0; }
+JHLE(init_parameter2_ctor) {
+    if (auto* parameter = ptr<InitParameter2>(a0)) *parameter = InitParameter2{};
+    return a0;
+}
+JHLE(init_parameter2_set_allocator) {
+    if (auto* parameter = ptr<InitParameter2>(a0)) {
+        parameter->allocator = ptr<void>(a1);
+        parameter->user_data = ptr<void>(a2);
+    }
+    return 0;
+}
+JHLE(init_parameter2_set_file_buffer_size) {
+    if (auto* parameter = ptr<InitParameter2>(a0)) parameter->file_buffer_size = a1;
+    return 0;
+}
 JHLE(value_ctor) { if (auto* value = ptr<Value>(a0)) *value = Value{}; return a0; }
 JHLE(value_dtor) { clear(ptr<Value>(a0)); return 0; }
 JHLE(value_assign) {
@@ -420,6 +443,65 @@ JHLE(string_cstring_ctor) {
 JHLE(string_ctor) { if (auto* string = ptr<String>(a0)) string->host = new std::string; return a0; }
 JHLE(string_dtor) {
     if (auto* string = ptr<String>(a0)) { delete string->host; string->host = nullptr; } return 0;
+}
+JHLE(object_ctor) {
+    if (auto* object = ptr<Object>(a0)) object->host = new std::map<std::string, Value*>;
+    return a0;
+}
+JHLE(object_dtor) {
+    if (auto* object = ptr<Object>(a0)) {
+        if (object->host) for (auto& [key, child] : *object->host) destroy(child);
+        delete object->host;
+        object->host = nullptr;
+    }
+    return 0;
+}
+JHLE(object_index_string) {
+    auto* object = ptr<Object>(a0);
+    const auto* key = ptr<const String>(a1);
+    if (!object) return reinterpret_cast<uintptr_t>(&null_value());
+    if (!object->host) object->host = new std::map<std::string, Value*>;
+    auto [position, inserted] = object->host->try_emplace(text(key), nullptr);
+    if (inserted || !position->second) position->second = new Value;
+    return reinterpret_cast<uintptr_t>(position->second);
+}
+JHLE(object_empty) {
+    const auto* object = ptr<const Object>(a0);
+    return !object || !object->host || object->host->empty();
+}
+JHLE(value_string_ctor) {
+    auto* value = ptr<Value>(a0);
+    if (value) {
+        *value = Value{};
+        value->type = ValueType::String;
+        value->data.string = new String{new std::string(text(ptr<const String>(a1)))};
+    }
+    return a0;
+}
+bool set_value_from_object(Value* value, const Object* object, bool clear_first) {
+    if (!value) return false;
+    Value source;
+    source.type = ValueType::Object;
+    source.data.object = const_cast<Object*>(object ? object : &empty_object());
+    Value replacement;
+    if (!clone(&replacement, &source)) return false;
+    if (clear_first) clear(value);
+    *value = replacement;
+    if (value->data.object && value->data.object->host)
+        for (auto& [key, child] : *value->data.object->host) child->parent = value;
+    return true;
+}
+JHLE(value_object_ctor) {
+    auto* value = ptr<Value>(a0);
+    if (value) {
+        *value = Value{};
+        set_value_from_object(value, ptr<const Object>(a1), false);
+    }
+    return a0;
+}
+JHLE(value_set_object) {
+    set_value_from_object(ptr<Value>(a0), ptr<const Object>(a1), true);
+    return 0;
 }
 JHLE(parse) {
     auto* output = ptr<Value>(a0); const char* source = ptr<const char>(a1);
@@ -562,5 +644,22 @@ void register_json2_hle() {
     reg("Ncel8t2Rrpc", value_to_string, "sceJsonValue::toString");
     reg("R7FDWtcN6f8", value_to_string, "sceJsonValue::serialize");
     reg("rQGJeNjOuUk", array_size, "sceJsonArray::size");
+
+    // PS5 SDK 3.20 aliases exercised by Sonic Origins. The existing implementation originally
+    // registered the older PS4 spellings only, leaving these constructors/accessors as generic
+    // success stubs: caller-owned Object and Value storage then remained uninitialized. Names and
+    // ABIs are verified against the local PS5 3.20 libSceJson2 stub corpus and Kyty's Json2 model.
+    reg("WSOuge5IsCg", init_parameter2_ctor, "sceJsonInitParameter2::ctor");
+    reg("I2QC8PYhJWY", init_parameter2_set_allocator, "sceJsonInitParameter2::setAllocator");
+    reg("Eu95jmqn5Rw", init_parameter2_set_file_buffer_size,
+        "sceJsonInitParameter2::setFileBufferSize");
+    reg("IXW-z8pggfg", noop_zero, "sceJsonInitializer::initializeV2");
+    reg("OJPTonqdg0I", object_ctor, "sceJsonObject::ctor");
+    reg("5JmzZt8twAo", object_dtor, "sceJsonObject::dtor");
+    reg("ERuf9y0DY84", object_index_string, "sceJsonObject::indexString");
+    reg("i2l3IYvQ9UE", object_empty, "sceJsonObject::empty");
+    reg("sZIoMRGO+jk", value_string_ctor, "sceJsonValue::stringCtor");
+    reg("3xUXnmUkXfo", value_object_ctor, "sceJsonValue::objectCtor");
+    reg("dFCphqnd+a4", value_set_object, "sceJsonValue::setObject");
 }
 } // namespace prosper

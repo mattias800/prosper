@@ -855,6 +855,21 @@ HLE(k_attr_setstack) {
     return (uint64_t)(unsigned)rc;
 #endif
 }
+HLE(k_attr_setguardsize) {
+    if (!a0 || !*(void**)(uintptr_t)a0) return 0x16;   // SCE_KERNEL_ERROR_EINVAL
+    auto* at = (GuestPthreadAttr*)*(void**)(uintptr_t)a0;
+#ifdef _WIN32
+    // winpthreads returns EINVAL for guard sizes it cannot apply to a CreateThread-owned stack.
+    // Windows already supplies the host stack's guard page, while an explicitly supplied guest
+    // stack is switched in the trampoline and retains the guest mapping's own protection. Accept
+    // the valid guest attribute without claiming winpthreads can reshape either backing stack.
+    (void)at; (void)a1;
+    return 0;
+#else
+    int rc = pthread_attr_setguardsize(&at->host, (size_t)a1);
+    return (uint64_t)(unsigned)rc;
+#endif
+}
 HLE(k_attr_noop)        { return 0; }
 
 // sceKernelGetSanitizerMallocReplaceExternal returns the process replacement table, even when no
@@ -1799,7 +1814,10 @@ HLE(k_ef_poll)    { // (ef, pattern, waitMode, resultPat*)
     if (ok) { if (a2 & 0x10) e->bits = 0; else if (a2 & 0x20) e->bits &= ~a1; }
     pthread_mutex_unlock(&e->m);
     if (a3) *(uint64_t*)(uintptr_t)a3 = res;
-    return ok ? 0 : 0x80020023;   // SCE_KERNEL_ERROR_EBUSY-ish when not matched
+    // PollEventFlag reports EBUSY when the requested pattern is not currently satisfied.
+    // Sonic Origins' RsdxWaitEvent checks this exact ABI value before falling back to a
+    // blocking WaitEventFlag; returning 0x80020023 made every normal poll miss an assertion.
+    return ok ? 0 : 0x80020010;   // SCE_KERNEL_ERROR_EBUSY
 }
 
 // --- semaphores (SceKernelSema): counting sem with wait/signal ---
@@ -1886,6 +1904,10 @@ namespace {
     std::vector<UnwindModuleDesc> g_unwind_mods;
     std::mutex g_unwind_mx;   // guards g_unwind_mods: set_unwind_modules (assign, may realloc) can run on a
                               // runtime module load while a worker is unwinding here (#344).
+    // Real linked-module handles are stable by load order. The unwind descriptors and per-module
+    // export tables are built from that same order, so address lookup can publish the handle expected
+    // by sceKernelGetModuleInfoFromAddr and later consume it in sceKernelDlsym.
+    constexpr uint64_t kModuleHandleBase = 0x10000;
     // Decode the eh_frame pointer out of an .eh_frame_hdr. Layout: [0]=version(1), [1]=eh_frame_ptr_enc,
     // [2]=fde_count_enc, [3]=table_enc, [4..]=eh_frame_ptr (encoded). The common encoding is 0x1B
     // (DW_EH_PE_pcrel|sdata4): a signed 32-bit offset from the field's own address.
@@ -1933,6 +1955,26 @@ HLE(k_get_module_info_for_unwind) {   // (VAddr addr, int flags, ModuleInfoForUn
                 (unsigned long long)a0, nm, (unsigned long long)m->ehframe_hdr,
                 (unsigned long long)eh, (unsigned long long)m->seg0);
     return 0;
+}
+// PS5 SDK 3.20 ModuleInfo: size@0, opaque info[32]@8, int32 module handle@0x108. Native
+// libraries use this to turn a return/program address into a handle for module-local lookup.
+// Returning success without writing the handle sends later dlsym calls to an arbitrary module.
+HLE(k_get_module_info_from_addr) {   // (VAddr addr, int n, ModuleInfo* info)
+    uint8_t* info = (uint8_t*)(uintptr_t)a2;
+    if (!info || (int)a1 != 2) return 0x80020016;      // SCE_KERNEL_ERROR_EINVAL
+    int32_t handle = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_unwind_mx);
+        for (size_t i = 0; i < g_unwind_mods.size(); ++i) {
+            const auto& d = g_unwind_mods[i];
+            if (a0 >= d.lo && a0 < d.hi) {
+                handle = (int32_t)(kModuleHandleBase + i);
+                break;
+            }
+        }
+    }
+    *(int32_t*)(info + 0x108) = handle;
+    return handle ? 0 : (uint64_t)-1;
 }
 void set_unwind_modules(const UnwindModuleDesc* d, size_t c) {
     std::lock_guard<std::mutex> lk(g_unwind_mx); g_unwind_mods.assign(d, d + c);
@@ -3013,9 +3055,6 @@ HLE(k_is_stack) {   // sceKernelIsStack(void* addr): is addr within the current 
 namespace {
     const std::unordered_map<std::string, uint64_t>* g_exports = nullptr;
     std::vector<ModuleExportTable> g_mod_exports;   // per-module tables (#147)
-    // Real module handles occupy 0x10000+index — far above the synthetic success counter
-    // (k_load_start_mod's g_module_handle, which starts at 1), so the ranges can't collide.
-    constexpr uint64_t kModuleHandleBase = 0x10000;
     const char* path_basename(const char* p) {
         const char* b = p;
         for (const char* c = p; *c; c++) if (*c == '/' || *c == '\\') b = c + 1;
@@ -3225,6 +3264,7 @@ void register_kernel_hle() {
     R("scePthreadAttrDestroy", k_attr_destroy);
     R("scePthreadAttrSetstack", k_attr_setstack);
     R("scePthreadAttrSetstacksize", k_attr_setstacksize);
+    R("scePthreadAttrSetguardsize", k_attr_setguardsize);
     R("scePthreadAttrSetinheritsched", k_attr_noop);
     R("scePthreadAttrSetschedpolicy", k_attr_noop);
     R("scePthreadAttrSetschedparam", k_log_attr_setschedparam);
@@ -3279,6 +3319,7 @@ void register_kernel_hle() {
     R("pthread_attr_init", k_attr_init);      R("pthread_attr_destroy", k_attr_destroy);
     R("pthread_attr_setstack", k_attr_setstack);
     R("pthread_attr_setstacksize", k_attr_setstacksize);
+    R("pthread_attr_setguardsize", k_attr_setguardsize);
     R("pthread_attr_setdetachstate", k_attr_setdetachstate); R("pthread_attr_getdetachstate", k_attr_getdetachstate);
     R("pthread_attr_setinheritsched", k_attr_noop);
     R("pthread_attr_setschedpolicy", k_attr_noop);  R("pthread_attr_setschedparam", k_attr_noop);
@@ -3303,6 +3344,7 @@ void register_kernel_hle() {
     // uninitialized, so any exception unwound through a sysmodule-resolved frame read a garbage
     // eh_frame_hdr — the same stack-smash failure mode the kernel variant had before it was implemented.
     Hle::register_fn("4fU5yvOkVG4", (HleFn)k_get_module_info_for_unwind, "sceSysmoduleGetModuleInfoForUnwind");
+    Hle::register_fn("f7KBOafysXo", (HleFn)k_get_module_info_from_addr, "sceKernelGetModuleInfoFromAddr");
     // Registration / hook / debug libkernel calls the app makes at startup that have no observable
     // effect in our headless boot — returning OK without side effects is the correct behavior:
     //  - SetThreadDtors / SetThreadAtexitCount / SetThreadAtexitReport: per-thread exit bookkeeping;
@@ -3320,6 +3362,10 @@ void register_kernel_hle() {
     Hle::register_fn("py6L8jiVAN8", (HleFn)k_get_sanitizer_malloc_replace,
                      "sceKernelGetSanitizerMallocReplaceExternal");
     Hle::register_fn("DGMG3JshrZU", (HleFn)k_attr_noop, "sceKernelSetVirtualRangeName");
+    Hle::register_fn("g0VTBxfJyu0", (HleFn)k_attr_noop, "sceKernelGetCurrentCpu");
+    Hle::register_fn("Tz4RNUCBbGI", (HleFn)k_attr_noop, "_sceKernelRtldThreadAtexitIncrement");
+    Hle::register_fn("jh+8XiK4LeE", (HleFn)k_attr_noop, "sceKernelIsAddressSanitizerEnabled");
+    Hle::register_fn("El+cQ20DynU", (HleFn)k_attr_setguardsize, "scePthreadAttrSetguardsize");
     #undef R
     register_kernel_mem_hle();    // virtual/direct memory
     register_kernel_time_hle();   // time/clock + C11 threads + stubs

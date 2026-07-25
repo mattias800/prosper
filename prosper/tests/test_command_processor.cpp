@@ -98,6 +98,55 @@ int main() {
 
     CHECK(st.index_type == 2, "index_type = 2 (from SetIndexSize)");
 
+    // Hardware ignores nonexistent register OFFSETS, but the value of an otherwise valid register
+    // is not made invalid by an unrelated bad pair. In particular, a zero or >16K window scissor
+    // remains a legitimate hardware write even when the same indirect array has an OOR slot.
+    {
+        constexpr uint32_t bad_off = 0xDEADBEEFu;
+        ShaderReg malformed_bank[] = {
+            {0x100u, 1u}, {0x101u, 2u}, {0x102u, 3u}, {0x103u, 4u}, {0x104u, 5u},
+            {prosper::agc::Pm4::PA_SC_WINDOW_SCISSOR_BR, 0x00FAC60Au},
+            {bad_off, 0xAAAAu},
+            {0x110u, 6u}, {0x111u, 7u}, {0x112u, 8u}, {0x113u, 9u}, {0x114u, 10u},
+        };
+        uint32_t malformed_cb[32]{};
+        Dcb malformed_dcb{};
+        malformed_dcb.bottom = malformed_cb;
+        malformed_dcb.top = malformed_cb + 32;
+        malformed_dcb.cursor_up = malformed_cb;
+        malformed_dcb.cursor_down = malformed_cb + 32;
+        setcx((uint64_t)(uintptr_t)&malformed_dcb,
+              (uint64_t)(uintptr_t)malformed_bank,
+              sizeof(malformed_bank) / sizeof(malformed_bank[0]), 0, 0, 0);
+        GpuState sanitized;
+        run_cb(malformed_cb, 4, sanitized);
+        CHECK(sanitized.cx.count(0x100u) && sanitized.cx.count(0x104u) &&
+              sanitized.cx.count(0x110u) && sanitized.cx.count(0x114u),
+              "malformed indirect bank preserves ordinary register writes");
+        CHECK(sanitized.cx.count(prosper::agc::Pm4::PA_SC_WINDOW_SCISSOR_BR) &&
+                  sanitized.cx[prosper::agc::Pm4::PA_SC_WINDOW_SCISSOR_BR] == 0x00FAC60Au,
+              "unrelated bad offset does not suppress a >16K window-scissor write");
+
+        ShaderReg zero_scissor_bank[] = {
+            {prosper::agc::Pm4::PA_SC_WINDOW_SCISSOR_BR, 0x00000FACu},
+            {bad_off, 0xBBBBu},
+        };
+        uint32_t zero_cb[8]{};
+        Dcb zero_dcb{};
+        zero_dcb.bottom = zero_cb;
+        zero_dcb.top = zero_cb + 8;
+        zero_dcb.cursor_up = zero_cb;
+        zero_dcb.cursor_down = zero_cb + 8;
+        setcx((uint64_t)(uintptr_t)&zero_dcb,
+              (uint64_t)(uintptr_t)zero_scissor_bank,
+              sizeof(zero_scissor_bank) / sizeof(zero_scissor_bank[0]), 0, 0, 0);
+        GpuState zero_scissor;
+        run_cb(zero_cb, 4, zero_scissor);
+        CHECK(zero_scissor.cx.count(prosper::agc::Pm4::PA_SC_WINDOW_SCISSOR_BR) &&
+                  zero_scissor.cx[prosper::agc::Pm4::PA_SC_WINDOW_SCISSOR_BR] == 0x00000FACu,
+              "unrelated bad offset does not suppress an empty window-scissor write");
+    }
+
     CHECK(st.draws.size() == 2, "2 draws recorded");
     CHECK(st.draws.size() == 2 && st.draws[0].modifier == 0x1122334455667788ull,
           "DrawIndexAuto retains its ShaderDrawModifier");

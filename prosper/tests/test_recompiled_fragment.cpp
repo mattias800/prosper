@@ -41,6 +41,50 @@ int main() {
     CHECK(c[1] > 0x80 && c[0] < 0x40 && c[2] < 0x40, "center pixel is GREEN (from the recompiled shader)");
     CHECK(k[2] > 0x80 && k[0] < 0x40 && k[1] < 0x40, "corner pixel is the BLUE clear");
 
+    // Sonic Origins' large UI pixel shader writes a four-register matrix through M0-indexed
+    // v_movreld_b32. Exercise the ISA rule VGPR[VDST+M0]=SRC0 with M0=1, so v1 becomes green.
+    const uint32_t indexed_dest_ps[] = {
+        0x7E000280u, 0x7E020280u, 0x7E0402F2u, 0x7E0602F2u,
+        0xBEFC0381u,              // s_mov_b32 m0, 1
+        0x7E008502u,              // v_movreld_b32 v0, v2 -> v1 = 1.0
+        0xF800180Fu, 0x03000100u, 0xBF810000u,
+    };
+    std::vector<uint32_t> indexed_frag = recompile_fragment(
+        indexed_dest_ps, std::size(indexed_dest_ps));
+    std::vector<uint8_t> indexed_px = prosper::test::render_triangle_rgba(
+        vert, indexed_frag, W, H);
+    const uint8_t* indexed_center = indexed_px.size() == static_cast<size_t>(W) * H * 4
+        ? &indexed_px[((static_cast<size_t>(H) / 2) * W + W / 2) * 4] : nullptr;
+    CHECK(indexed_center && indexed_center[1] > 0x80 && indexed_center[0] < 0x40,
+          "RDNA2 v_movreld_b32 writes the M0-indexed VGPR destination");
+
+    // A second Sonic loop form has an unconditional back-edge but an interior EXECZ targeting the
+    // loop exit. The interior branch must leave the loop directly: going through the back-edge would
+    // restore EXEC and re-enter forever. This one-iteration fixture clears EXEC in the body, takes the
+    // direct break, restores it after the loop, and exports green.
+    const uint32_t direct_exec_break_ps[] = {
+        0x7E000280u,              // v0 = 0
+        0xBE80047Eu,              // s_mov_b64 s[0:1], exec
+        0xBEFE0400u,              // loop: s_mov_b64 exec, s[0:1]
+        0x7DAC0080u,              // v_cmpx_ge_u32 0, v0 (active)
+        0xBF880003u,              // s_cbranch_execz exit
+        0xBEFE0480u,              // s_mov_b64 exec, 0
+        0xBF880001u,              // interior s_cbranch_execz exit
+        0xBF82FFFAu,              // s_branch loop
+        0xBEFE0400u,              // exit: s_mov_b64 exec, s[0:1]
+        0x7E0202F2u, 0x7E040280u, 0x7E0602F2u,
+        0xF800180Fu, 0x03020100u, 0xBF810000u,
+    };
+    std::vector<uint32_t> direct_break_frag = recompile_fragment(
+        direct_exec_break_ps, std::size(direct_exec_break_ps));
+    std::vector<uint8_t> direct_break_px = prosper::test::render_triangle_rgba(
+        vert, direct_break_frag, W, H);
+    const uint8_t* direct_break_center =
+        direct_break_px.size() == static_cast<size_t>(W) * H * 4
+            ? &direct_break_px[((static_cast<size_t>(H) / 2) * W + W / 2) * 4] : nullptr;
+    CHECK(direct_break_center && direct_break_center[1] > 0x80 && direct_break_center[0] < 0x40,
+          "unconditional-backedge EXECZ break exits directly and preserves loop merge state");
+
     // Fragment MBCNT is a real cross-lane operation. The lowering uses a native subgroup exclusive
     // sum and marks the module as requiring an exact 64-lane subgroup. RADV can
     // enforce that contract; llvmpipe is fixed at 8 and must reject the draw rather than execute
@@ -296,6 +340,31 @@ int main() {
                   "#825: NULL export leaves the BLUE color attachment unchanged");
         }
     }
+
+    // Sonic Origins' early prepass uses a real MRTZ export with no color or NULL export. The
+    // fragment shell already lowers target 8 to FragDepth, so the early color-output gate must
+    // retain this valid depth-only module instead of rejecting it before instruction emission.
+    const uint32_t depth_only_ps[] = {
+        0x7e0002ffu, 0x3f000000u,       // v0 = 0.5f
+        0xf8001881u, 0x00000000u,       // exp mrtz v0 (Z enabled)
+        0xbf810000u,
+    };
+    std::vector<uint32_t> depth_frag = recompile_fragment(
+        depth_only_ps, std::size(depth_only_ps));
+    CHECK(!depth_frag.empty() && depth_frag[0] == 0x07230203u,
+          "recompiled Sonic Origins' MRTZ-only fragment shader");
+
+    // Sonic's bloom combine detects NaNs with `v_cmp_u_f32 vcc, v6, v6`. Opcode 0x08 is the
+    // unordered predicate (true when either source is NaN), distinct from the six ordered compares.
+    const uint32_t unordered_compare_ps[] = {
+        0x7e0c0280u,                   // v6 = 0
+        0x7c100d06u,                   // v_cmp_u_f32 vcc, v6, v6
+        0xf800000fu, 0x06060606u,      // exp mrt0 v6,v6,v6,v6
+        0xbf810000u,
+    };
+    CHECK(!recompile_fragment(unordered_compare_ps,
+                              std::size(unordered_compare_ps)).empty(),
+          "recompiled Sonic Origins' unordered f32 comparison");
 
     // DIVERGENT execz region (#273 — DOLL's FXAA PS shape): v_cmpx narrows EXEC, s_cbranch_execz
     // skips a block containing a SCALAR write read after the merge (so it is NOT safe-linearizable

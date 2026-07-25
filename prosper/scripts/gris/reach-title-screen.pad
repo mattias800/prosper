@@ -1,0 +1,5 @@
+# GRIS (PPSA09804): fresh-save route to the NEW GAME title screen.
+#
+# The title appears without input after the opening logos (about 20 seconds on the native Linux
+# renderer). Keeping a neutral, connected scripted controller makes this route deterministic and
+# leaves the verified title/audio checkpoint on screen for evidence capture.

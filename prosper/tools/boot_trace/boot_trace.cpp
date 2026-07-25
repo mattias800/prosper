@@ -72,27 +72,42 @@ extern "C" int prosper_reserved_range_state(uint64_t addr);
 using namespace prosper;
 
 
-// Module bases (keep in sync with the inputs below).
-static const uint64_t EBOOT = 0x400000000ull, IL2CPP = 0x440000000ull, PS5UTIL = 0x4c0000000ull,
-                      PSN = 0x4e0000000ull, SAVEDATA = 0x4f0000000ull, LIBC = 0x500000000ull,
-                      STUB = 0x600000000ull;
+// Fixed module slots from the shared boot path. Keep diagnostics honest when optional plugin code
+// appears in a backtrace; the old local table predated FMOD/Wwise and even retained obsolete eboot
+// and libc bases, misclassifying every address in those later slots as SaveData or libc.
 static const char* cls(uint64_t a) {
-    if (a >= EBOOT    && a < IL2CPP)   return "eboot";
-    if (a >= IL2CPP   && a < PS5UTIL)  return "Il2cpp";
-    if (a >= PS5UTIL  && a < PSN)      return "PS5Util";
-    if (a >= PSN      && a < SAVEDATA) return "PSN.prx";
-    if (a >= SAVEDATA && a < LIBC)     return "SaveData.prx";
-    if (a >= LIBC     && a < STUB)     return "libc.prx";
-    if (a >= STUB     && a < 0x610000000ull) return "STUB";
+    if (a >= BOOT_EBOOT         && a < BOOT_IL2CPP)       return "eboot";
+    if (a >= BOOT_IL2CPP        && a < BOOT_PSNCORE)      return "Il2cpp";
+    if (a >= BOOT_PSNCORE       && a < BOOT_PSNCOMMON)    return "PSNCore.prx";
+    if (a >= BOOT_PSNCOMMON     && a < BOOT_PS5UTIL)      return "PSNCommon.prx";
+    if (a >= BOOT_PS5UTIL       && a < BOOT_NPCPPWEBAPI)  return "PS5Util";
+    if (a >= BOOT_NPCPPWEBAPI   && a < BOOT_PSN)          return "libSceNpCppWebApi.prx";
+    if (a >= BOOT_PSN           && a < BOOT_SAVEDATA)     return "PSN.prx";
+    if (a >= BOOT_SAVEDATA      && a < BOOT_FMODSTUDIO)   return "SaveData.prx";
+    if (a >= BOOT_FMODSTUDIO    && a < BOOT_FMOD)         return "libfmodstudio.prx";
+    if (a >= BOOT_FMOD          && a < BOOT_AKMOTION)     return "libfmod.prx";
+    if (a >= BOOT_AKMOTION      && a < BOOT_AKVORBIS)     return "AkMotion.prx";
+    if (a >= BOOT_AKVORBIS      && a < BOOT_AKSOUNDENGINE)return "AkVorbisHwAccelerator.prx";
+    if (a >= BOOT_AKSOUNDENGINE && a < BOOT_LIBC)         return "AkSoundEngine.prx";
+    if (a >= BOOT_LIBC          && a < BOOT_STUB)         return "libc.prx";
+    if (a >= BOOT_STUB          && a < 0x610000000ull)    return "STUB";
     return "mapped/host";
 }
 static uint64_t bof(uint64_t a) {
-    if (a >= EBOOT    && a < IL2CPP)   return a - EBOOT;
-    if (a >= IL2CPP   && a < PS5UTIL)  return a - IL2CPP;
-    if (a >= PS5UTIL  && a < PSN)      return a - PS5UTIL;
-    if (a >= PSN      && a < SAVEDATA) return a - PSN;
-    if (a >= SAVEDATA && a < LIBC)     return a - SAVEDATA;
-    if (a >= LIBC     && a < STUB)     return a - LIBC;
+    if (a >= BOOT_EBOOT         && a < BOOT_IL2CPP)        return a - BOOT_EBOOT;
+    if (a >= BOOT_IL2CPP        && a < BOOT_PSNCORE)       return a - BOOT_IL2CPP;
+    if (a >= BOOT_PSNCORE       && a < BOOT_PSNCOMMON)     return a - BOOT_PSNCORE;
+    if (a >= BOOT_PSNCOMMON     && a < BOOT_PS5UTIL)       return a - BOOT_PSNCOMMON;
+    if (a >= BOOT_PS5UTIL       && a < BOOT_NPCPPWEBAPI)   return a - BOOT_PS5UTIL;
+    if (a >= BOOT_NPCPPWEBAPI   && a < BOOT_PSN)           return a - BOOT_NPCPPWEBAPI;
+    if (a >= BOOT_PSN           && a < BOOT_SAVEDATA)      return a - BOOT_PSN;
+    if (a >= BOOT_SAVEDATA      && a < BOOT_FMODSTUDIO)    return a - BOOT_SAVEDATA;
+    if (a >= BOOT_FMODSTUDIO    && a < BOOT_FMOD)          return a - BOOT_FMODSTUDIO;
+    if (a >= BOOT_FMOD          && a < BOOT_AKMOTION)      return a - BOOT_FMOD;
+    if (a >= BOOT_AKMOTION      && a < BOOT_AKVORBIS)      return a - BOOT_AKMOTION;
+    if (a >= BOOT_AKVORBIS      && a < BOOT_AKSOUNDENGINE) return a - BOOT_AKVORBIS;
+    if (a >= BOOT_AKSOUNDENGINE && a < BOOT_LIBC)          return a - BOOT_AKSOUNDENGINE;
+    if (a >= BOOT_LIBC          && a < BOOT_STUB)          return a - BOOT_LIBC;
     return a;
 }
 
