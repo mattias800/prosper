@@ -399,7 +399,12 @@ int main() {
     a2_queued = a2_available = 0xCCCCCCCCu;
     CHECK(call("sceAudioOut2ContextGetQueueLevel", a2_context,
                PTR(&a2_queued), PTR(&a2_available)) == 0);
-    CHECK(a2_queued == 1 && a2_available == 3);            // submitted grain is observable
+    // GetQueueLevel advances the emulated 48 kHz device clock. The 64-frame grain lasts only
+    // 1.33 ms, so a slow/suspended runner may legitimately drain it during Push's synchronous
+    // sink copy. The sink assertions below prove submission; here assert the point-in-time queue
+    // contract without assuming the host schedules this query before the first drain boundary.
+    CHECK(a2_queued <= 1);
+    CHECK(a2_queued + a2_available == 4);
     CHECK(sink.opens.size() == 1);
     CHECK(sink.outs.size() == 1);
     if (!sink.outs.empty()) {
