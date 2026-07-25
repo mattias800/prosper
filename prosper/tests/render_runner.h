@@ -9,6 +9,7 @@
 #include "../frontends/shared/vulkan_device_select.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -787,6 +788,32 @@ struct BackendSubmissionBatchResult {
     uint64_t fence_waits = 0;
 };
 
+// A successful queue submit followed by failed fence and queue-idle waits is not an ordinary
+// failure: Vulkan still owns every referenced resource, so those objects must be retained.
+enum class BackendSubmissionState { NotSubmitted, Complete, Pending };
+
+inline constexpr BackendSubmissionState backend_submission_state(bool submitted, bool finished) {
+    return !submitted ? BackendSubmissionState::NotSubmitted
+                      : finished ? BackendSubmissionState::Complete
+                                 : BackendSubmissionState::Pending;
+}
+
+// Once completion of submitted work cannot be proven, cached Vulkan objects may remain referenced
+// beyond the local batch lifetime. Keep the renderer poisoned for the rest of the device lifetime:
+// later callbacks must not submit work or evict any persistent object potentially owned by the GPU.
+inline std::atomic<bool>& backend_unproven_submission_storage() {
+    static std::atomic<bool> pending{false};
+    return pending;
+}
+
+inline bool backend_has_unproven_submission() {
+    return backend_unproven_submission_storage().load(std::memory_order_acquire);
+}
+
+inline void backend_mark_unproven_submission() {
+    backend_unproven_submission_storage().store(true, std::memory_order_release);
+}
+
 // Collect command buffers that belong to one ordered renderer callback. Vulkan queue order preserves
 // target producer/consumer dependencies; one fence on the final submission is enough to retain every
 // referenced object until the complete callback has finished. Direct test callers keep the established
@@ -807,20 +834,24 @@ public:
     }
 
     bool pending() const { return !commands_.empty(); }
+    bool retains_pending_resources() const { return pending_resources_abandoned_; }
 
     void enqueue(VkCommandBuffer command) {
-        commands_.push_back(command);
+        if (!pending_resources_abandoned_)
+            commands_.push_back(command);
     }
 
     void add_cleanup(std::function<void()> cleanup) {
-        cleanups_.push_back(std::move(cleanup));
+        if (!pending_resources_abandoned_)
+            cleanups_.push_back(std::move(cleanup));
     }
 
     // Persistent attachment state is updated speculatively so later command buffers in the same
     // ordered batch can LOAD/sample earlier results. If the batch cannot be submitted and completed,
     // every touched entry must be invalidated before its retained resources are released.
     void add_failure_cleanup(std::function<void()> cleanup) {
-        failure_cleanups_.push_back(std::move(cleanup));
+        if (!pending_resources_abandoned_)
+            failure_cleanups_.push_back(std::move(cleanup));
     }
 
     void discard() {
@@ -828,10 +859,35 @@ public:
         finish_persistent_state(false);
     }
 
+    // Completion could not be proven after a successful submit. Invalidate speculative state, but
+    // never invoke cleanup callbacks for work Vulkan may still own. The sticky flag also rejects
+    // callbacks registered later in the current renderer call (registration follows diagnostics).
+    void abandon_pending_resources() {
+        commands_.clear();
+        finish_persistent_state(false);
+        pending_resources_abandoned_ = true;
+        backend_mark_unproven_submission();
+        cleanups_.clear();
+    }
+
     BackendSubmissionBatchResult submit_and_wait(VkDevice dev, VkQueue queue,
                                                   bool backend_trace) {
         BackendSubmissionBatchResult result;
         result.command_buffers = commands_.size();
+        if (pending_resources_abandoned_) {
+            result.submit_result = VK_ERROR_DEVICE_LOST;
+            result.wait_result = VK_ERROR_DEVICE_LOST;
+            return result;
+        }
+        if (backend_has_unproven_submission()) {
+            // Another batch/helper has unproven submitted work. These commands never reached the
+            // queue, so discard them, invalidate their speculative state, and let complete() safely
+            // release their resources without making another Vulkan call on the poisoned device.
+            result.submit_result = VK_ERROR_DEVICE_LOST;
+            result.wait_result = VK_ERROR_DEVICE_LOST;
+            discard();
+            return result;
+        }
         if (commands_.empty()) return result;
 
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -870,14 +926,24 @@ public:
                          static_cast<int>(result.wait_result));
             std::fflush(stderr);
         }
-        vkDestroyFence(dev, fence, nullptr);
-        commands_.clear();
-        finish_persistent_state(result.submit_result == VK_SUCCESS &&
-                                result.wait_result == VK_SUCCESS);
+        const BackendSubmissionState state = backend_submission_state(
+            result.submit_result == VK_SUCCESS,
+            result.submit_result == VK_SUCCESS && result.wait_result == VK_SUCCESS);
+        if (state != BackendSubmissionState::Pending) {
+            vkDestroyFence(dev, fence, nullptr);
+            commands_.clear();
+            finish_persistent_state(state == BackendSubmissionState::Complete);
+        } else {
+            // Neither wait proved completion, so every command buffer and object captured by its
+            // cleanup may still be in use. Drop the callbacks without invoking them; leaking these
+            // one-shot resources is the only valid last-resort action on an effectively lost device.
+            abandon_pending_resources();
+        }
         return result;
     }
 
     void complete() {
+        if (pending_resources_abandoned_) return;
         for (auto& cleanup : cleanups_) cleanup();
         cleanups_.clear();
     }
@@ -894,6 +960,7 @@ private:
     std::vector<VkCommandBuffer> commands_;
     std::vector<std::function<void()>> cleanups_;
     std::vector<std::function<void()>> failure_cleanups_;
+    bool pending_resources_abandoned_ = false;
 };
 
 struct PersistentColorTargetKey {
@@ -1079,6 +1146,7 @@ persistent_color_target_evict_sink() {
 }
 
 inline bool evict_persistent_color_target(const RenderVkCtx& ctx, uint64_t current_generation) {
+    if (backend_has_unproven_submission()) return false;
     auto& cache = persistent_color_target_cache();
     auto victim = cache.end();
     for (auto it = cache.begin(); it != cache.end(); ++it) {
@@ -1657,19 +1725,19 @@ inline bool persistent_ds_transfer_buffer(const RenderVkCtx& ctx, VkDeviceSize b
     return true;
 }
 
-inline bool submit_persistent_ds_transfer(const RenderVkCtx& ctx, VkImage image,
-                                          VkImageAspectFlags aspects, VkImageLayout old_layout,
-                                          VkImageLayout transfer_layout, VkBuffer buffer,
-                                          uint32_t width, uint32_t height,
-                                          bool copy_depth, bool copy_stencil,
-                                          bool upload, std::string& error) {
+inline BackendSubmissionState submit_persistent_ds_transfer(
+        const RenderVkCtx& ctx, VkImage image, VkImageAspectFlags aspects,
+        VkImageLayout old_layout, VkImageLayout transfer_layout, VkBuffer buffer,
+        uint32_t width, uint32_t height, bool copy_depth, bool copy_stencil,
+        bool upload, std::string& error) {
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer command = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pool_info.queueFamilyIndex = ctx.qfi;
     if (vkCreateCommandPool(ctx.dev, &pool_info, nullptr, &pool) != VK_SUCCESS) {
-        error = "cannot create persistent DS transfer command pool"; return false;
+        error = "cannot create persistent DS transfer command pool";
+        return BackendSubmissionState::NotSubmitted;
     }
     VkCommandBufferAllocateInfo command_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     command_info.commandPool = pool; command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -1679,7 +1747,8 @@ inline bool submit_persistent_ds_transfer(const RenderVkCtx& ctx, VkImage image,
     if (vkAllocateCommandBuffers(ctx.dev, &command_info, &command) != VK_SUCCESS ||
         vkBeginCommandBuffer(command, &begin) != VK_SUCCESS) {
         vkDestroyCommandPool(ctx.dev, pool, nullptr);
-        error = "cannot begin persistent DS transfer command"; return false;
+        error = "cannot begin persistent DS transfer command";
+        return BackendSubmissionState::NotSubmitted;
     }
     VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     barrier.oldLayout = old_layout; barrier.newLayout = transfer_layout;
@@ -1733,10 +1802,16 @@ inline bool submit_persistent_ds_transfer(const RenderVkCtx& ctx, VkImage image,
     bool finished = submitted &&
         vkWaitForFences(ctx.dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000) == VK_SUCCESS;
     if (submitted && !finished) finished = render_locked_queue_wait_idle(ctx.queue) == VK_SUCCESS;
-    if (fence) vkDestroyFence(ctx.dev, fence, nullptr);
-    vkDestroyCommandPool(ctx.dev, pool, nullptr);
-    if (!finished) { error = "persistent DS transfer did not complete"; return false; }
-    return true;
+    const BackendSubmissionState state = backend_submission_state(submitted, finished);
+    if (state == BackendSubmissionState::Pending)
+        backend_mark_unproven_submission();
+    if (state != BackendSubmissionState::Pending) {
+        if (fence) vkDestroyFence(ctx.dev, fence, nullptr);
+        vkDestroyCommandPool(ctx.dev, pool, nullptr);
+    }
+    if (state != BackendSubmissionState::Complete)
+        error = "persistent DS transfer did not complete";
+    return state;
 }
 
 // Materialize a valid GPU-only color target on demand. Ordered DMA may consume a target in a later
@@ -1746,6 +1821,10 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
                                              VkFormat format, std::vector<uint8_t>& output,
                                              std::string& error) {
     output.clear(); error.clear();
+    if (backend_has_unproven_submission()) {
+        error = "Vulkan submission completion is unproven";
+        return false;
+    }
     format = backend_color_format(format);
     PersistentColorTargetImage* target = find_persistent_color_target(
         id, width, height, format);
@@ -1840,6 +1919,7 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
         // invalid use. Deliberately leak the one-shot objects — the device is effectively lost
         // (#1383). The never-submitted failure modes still clean up normally.
         if (!submitted) cleanup();
+        else backend_mark_unproven_submission();
         error = "persistent color target readback did not complete"; return false;
     }
     void* mapped = nullptr;
@@ -1869,6 +1949,10 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
 inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint32_t width,
                                          uint32_t height, VkFormat format, std::string& error) {
     error.clear();
+    if (backend_has_unproven_submission()) {
+        error = "Vulkan submission completion is unproven";
+        return false;
+    }
     format = backend_color_format(format);
     if (!width || !height || !dst_id || src_id == dst_id) {
         error = "invalid copy identity"; return false;
@@ -2024,6 +2108,7 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
         // queue; destroying its pool or fence then is invalid use. Deliberately leak the
         // one-shot objects instead — the device is effectively lost (#1383).
         if (!submitted) cleanup();
+        else backend_mark_unproven_submission();
         return fail("resolve copy did not complete");
     }
     cleanup();
@@ -2035,6 +2120,10 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
 inline bool snapshot_persistent_ds_images(std::vector<prosper::gpu::GpuCaptureDsSeed>& seeds,
                                           std::string& error) {
     error.clear(); seeds.clear();
+    if (backend_has_unproven_submission()) {
+        error = "Vulkan submission completion is unproven";
+        return false;
+    }
     const RenderVkCtx& ctx = render_vk_ctx();
     if (!ctx.ok) { error = "Vulkan renderer is unavailable"; return false; }
     for (const auto& [key, image] : persistent_ds_cache()) {
@@ -2064,12 +2153,21 @@ inline bool snapshot_persistent_ds_images(std::vector<prosper::gpu::GpuCaptureDs
         const VkImageAspectFlags aspects = VK_IMAGE_ASPECT_DEPTH_BIT |
             (key.fmt == static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT_S8_UINT)
                  ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
-        const bool copied = submit_persistent_ds_transfer(
+        const BackendSubmissionState transfer = submit_persistent_ds_transfer(
             ctx, image.image, aspects, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, key.w, key.h,
             seed.depth_valid, seed.stencil_valid, false, error);
+        if (transfer != BackendSubmissionState::Complete) {
+            // Pending work still owns the transfer buffer. Never-submitted failures are safe to
+            // release because the helper has already released its command pool and fence.
+            if (transfer != BackendSubmissionState::Pending) {
+                vkDestroyBuffer(ctx.dev, buffer, nullptr);
+                vkFreeMemory(ctx.dev, memory, nullptr);
+            }
+            return false;
+        }
         void* mapped = nullptr;
-        const bool mapped_ok = copied &&
+        const bool mapped_ok =
             vkMapMemory(ctx.dev, memory, 0, depth_bytes + stencil_bytes, 0, &mapped) == VK_SUCCESS;
         const bool invalidated = mapped_ok && invalidate_mapped_readback(ctx, memory);
         if (invalidated) {
@@ -2094,6 +2192,10 @@ inline bool snapshot_persistent_ds_images(std::vector<prosper::gpu::GpuCaptureDs
 inline bool restore_persistent_ds_image(const prosper::gpu::GpuCaptureDsSeed& seed,
                                         std::string& error) {
     error.clear();
+    if (backend_has_unproven_submission()) {
+        error = "Vulkan submission completion is unproven";
+        return false;
+    }
     const RenderVkCtx& ctx = render_vk_ctx();
     if (!ctx.ok) { error = "Vulkan renderer is unavailable"; return false; }
     const VkFormat format = seed.format == prosper::gpu::GpuCaptureDsFormat::D32Float
@@ -2152,11 +2254,14 @@ inline bool restore_persistent_ds_image(const prosper::gpu::GpuCaptureDsSeed& se
     vkUnmapMemory(ctx.dev, memory);
     const VkImageLayout old_layout = image.layout_initialized
         ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
-    const bool copied = submit_persistent_ds_transfer(
+    const BackendSubmissionState transfer = submit_persistent_ds_transfer(
         ctx, image.image, aspects, old_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         buffer, seed.width, seed.height, seed.depth_valid, seed.stencil_valid, true, error);
-    vkDestroyBuffer(ctx.dev, buffer, nullptr); vkFreeMemory(ctx.dev, memory, nullptr);
-    if (!copied) return false;
+    if (transfer != BackendSubmissionState::Pending) {
+        vkDestroyBuffer(ctx.dev, buffer, nullptr);
+        vkFreeMemory(ctx.dev, memory, nullptr);
+    }
+    if (transfer != BackendSubmissionState::Complete) return false;
     image.layout_initialized = true;
     image.depth_valid = seed.depth_valid; image.stencil_valid = seed.stencil_valid;
     return true;
@@ -2188,12 +2293,14 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     std::vector<uint8_t> out;
     if (out_rgba1) out_rgba1->clear();
     if (draws.empty()) return out;
+    if (backend_has_unproven_submission()) return out;
     const RenderVkCtx& ctx = render_vk_ctx();
     if (!ctx.ok) return out;
     BackendSubmissionBatch direct_submission;
     BackendSubmissionBatch& active_submission = submission_batch
         ? *submission_batch : direct_submission;
-    const bool avoid_cache_eviction = active_submission.pending();
+    const bool avoid_cache_eviction = active_submission.pending() ||
+                                      backend_has_unproven_submission();
     const bool persistent_color_targets_enabled =
         getenv("PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS") == nullptr;
     const bool persistent_color_enabled = persistent_color_targets_enabled && color_target &&
@@ -4601,8 +4708,6 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                         (unsigned long long)clip, (unsigned long long)fs, (unsigned long long)samp, tag);
             }
         }
-        vkDestroyQueryPool(dev, ds_stats_pool, nullptr);
-        vkDestroyQueryPool(dev, ds_occ_pool, nullptr);
     }
 
     // Geometry-probe readback: report where the probed draw's post-transform clip-space vertices landed.
@@ -4760,8 +4865,6 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                 "(draw produced no primitives)\n", geom_target);
             }
         }
-        vkDestroyBuffer(dev, geom_buf, nullptr); vkFreeMemory(dev, geom_mem, nullptr);
-        vkDestroyBuffer(dev, geom_counter, nullptr); vkFreeMemory(dev, geom_counter_mem, nullptr);
     }
 
     if (readback_requested && batch_completed) {
@@ -4784,7 +4887,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // that pixel — the kill index that turns (x,y) dark is the culprit. Reuses the built pipelines/
     // descriptors; a fresh clear each pass. Env-gated, no default behavior. Used to locate a stray primitive
     // such as the #298 menu focus-ring sliver. Dumps iso_kill_<k>.bmp to PROSPER_FRAME_DIR.
-    if (FMT == VK_FORMAT_R8G8B8A8_UNORM &&
+    if (batch_completed && FMT == VK_FORMAT_R8G8B8A8_UNORM &&
         getenv("PROSPER_DRAW_ISO") && getenv("PROSPER_ISO_AT")) {
         static bool iso_done = false;
         int tx = -1, ty = -1; sscanf(getenv("PROSPER_ISO_AT"), "%d,%d", &tx, &ty);
@@ -4819,12 +4922,19 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             }
             VkFenceCreateInfo iso_fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
             VkFence iso_fence = VK_NULL_HANDLE;
-            vkCreateFence(dev, &iso_fence_info, nullptr, &iso_fence);
+            if (vkCreateFence(dev, &iso_fence_info, nullptr, &iso_fence) != VK_SUCCESS)
+                iso_fence = VK_NULL_HANDLE;
+            bool iso_submission_pending = false;
             VkBufferImageCopy cp2{}; cp2.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; cp2.imageExtent = {W, H, 1};
-            for (int kk = -1; kk < (int)dv.size(); kk++) {
-                VkCommandBuffer c2; VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            for (int kk = -1; iso_fence && kk < (int)dv.size(); kk++) {
+                VkCommandBuffer c2 = VK_NULL_HANDLE;
+                VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
                 ai.commandPool = pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
-                vkAllocateCommandBuffers(dev, &ai, &c2); vkBeginCommandBuffer(c2, &cbbi);
+                if (vkAllocateCommandBuffers(dev, &ai, &c2) != VK_SUCCESS ||
+                    vkBeginCommandBuffer(c2, &cbbi) != VK_SUCCESS) {
+                    if (c2) vkFreeCommandBuffers(dev, pool, 1, &c2);
+                    break;
+                }
                 vkCmdBeginRenderPass(c2, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
                 for (size_t di = 0; di < dv.size(); di++) { auto& v = dv[di]; if (!v.ok) continue; if ((int)di == kk) continue;
                     vkCmdBindPipeline(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
@@ -4834,10 +4944,42 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 }
                 vkCmdEndRenderPass(c2);
                 vkCmdCopyImageToBuffer(c2, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp2);
-                vkEndCommandBuffer(c2); vkResetFences(dev, 1, &iso_fence);
+                const bool recorded = vkEndCommandBuffer(c2) == VK_SUCCESS;
+                const bool fence_reset = recorded &&
+                    vkResetFences(dev, 1, &iso_fence) == VK_SUCCESS;
                 VkSubmitInfo si2{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si2.commandBufferCount = 1; si2.pCommandBuffers = &c2;
-                render_locked_queue_submit(queue, 1, &si2, iso_fence); vkWaitForFences(dev, 1, &iso_fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
-                std::vector<uint8_t> px(bytes); void* m2 = nullptr; vkMapMemory(dev, bmem, 0, bytes, 0, &m2);
+                const bool submitted = fence_reset &&
+                    render_locked_queue_submit(queue, 1, &si2, iso_fence) == VK_SUCCESS;
+                bool finished = submitted &&
+                    vkWaitForFences(dev, 1, &iso_fence, VK_TRUE,
+                                    5ull * 1000 * 1000 * 1000) == VK_SUCCESS;
+                if (submitted && !finished)
+                    finished = render_locked_queue_wait_idle(queue) == VK_SUCCESS;
+                const BackendSubmissionState iso_state =
+                    backend_submission_state(submitted, finished);
+                if (iso_state == BackendSubmissionState::Pending) {
+                    // The diagnostic command uses this call's shared pool, framebuffer, pipelines,
+                    // descriptors, images, and readback buffer. Retain that complete cleanup scope,
+                    // its fence, and c2 when neither wait proves completion.
+                    if (cached_ds) {
+                        cached_ds->layout_initialized = false;
+                        cached_ds->depth_valid = false;
+                        cached_ds->stencil_valid = false;
+                    }
+                    if (cached_color) cached_color->valid = false;
+                    active_submission.abandon_pending_resources();
+                    iso_submission_pending = true;
+                    break;
+                }
+                if (iso_state != BackendSubmissionState::Complete) {
+                    vkFreeCommandBuffers(dev, pool, 1, &c2);
+                    break;
+                }
+                std::vector<uint8_t> px(bytes); void* m2 = nullptr;
+                if (vkMapMemory(dev, bmem, 0, bytes, 0, &m2) != VK_SUCCESS || !m2) {
+                    vkFreeCommandBuffers(dev, pool, 1, &c2);
+                    break;
+                }
                 for (VkDeviceSize i = 0; i < bytes; i++) px[i] = ((const uint8_t*)m2)[i]; vkUnmapMemory(dev, bmem);
                 const uint8_t* tp = &px[((size_t)ty * W + tx) * 4];
                 bool lit = tp[0] > 40 || tp[1] > 40 || tp[2] > 40;
@@ -4857,7 +4999,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 char fn[512]; snprintf(fn, sizeof fn, "%s/iso_kill_%d.bmp", dir.c_str(), kk); dump_bmp(fn, px, W, H);
                 vkFreeCommandBuffers(dev, pool, 1, &c2);
             }
-            if (iso_fence) vkDestroyFence(dev, iso_fence, nullptr);
+            if (iso_fence && !iso_submission_pending)
+                vkDestroyFence(dev, iso_fence, nullptr);
             fprintf(stderr, "[iso] done: the kill index marked 'dark' is the draw painting (%d,%d)\n", tx, ty);
         }
     }
@@ -4878,9 +5021,16 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
          shared_buffer_arenas = std::move(shared_buffer_arenas),
          texture_uploads = std::move(texture_uploads), seedbuf, seedmem, seedbuf1, seedmem1,
          rb, bmem, fb, rp, transient_color, view, img, imem, use_color1, view1, img1,
-         imem1, transient_ds, dview, dimg, dmem, ctx_ptr,
+         imem1, transient_ds, dview, dimg, dmem, ds_stats_pool, ds_occ_pool,
+         geom_buf, geom_mem, geom_counter, geom_counter_mem, ctx_ptr,
          color_target_generation]() mutable {
             vkDestroyCommandPool(dev, pool, nullptr);
+            if (ds_stats_pool) vkDestroyQueryPool(dev, ds_stats_pool, nullptr);
+            if (ds_occ_pool) vkDestroyQueryPool(dev, ds_occ_pool, nullptr);
+            if (geom_buf) vkDestroyBuffer(dev, geom_buf, nullptr);
+            if (geom_mem) vkFreeMemory(dev, geom_mem, nullptr);
+            if (geom_counter) vkDestroyBuffer(dev, geom_counter, nullptr);
+            if (geom_counter_mem) vkFreeMemory(dev, geom_counter_mem, nullptr);
             for (auto& v : dv) {
                 if (v.pipe && !v.pipeline_cached) vkDestroyPipeline(dev, v.pipe, nullptr);
                 if (v.ibuf) vkDestroyBuffer(dev, v.ibuf, nullptr);
@@ -4951,7 +5101,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 vkDestroyImage(dev, dimg, nullptr);
                 release_transient_render_memory(dev, dmem);
             }
-            while ((persistent_color_target_cache().size() > persistent_color_target_count_limit() ||
+            while (!backend_has_unproven_submission() &&
+                   (persistent_color_target_cache().size() > persistent_color_target_count_limit() ||
                     persistent_color_target_bytes() > persistent_color_target_limit()) &&
                    evict_persistent_color_target(*ctx_ptr, color_target_generation)) {}
         });
