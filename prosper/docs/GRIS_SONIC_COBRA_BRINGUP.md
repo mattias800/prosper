@@ -7,9 +7,9 @@ Raw PCM, verbose logs, and GPU captures are local diagnostics and are intentiona
 
 | Title | Revision | Visual milestone | Audio evidence |
 | --- | --- | --- | --- |
-| GRIS (`PPSA09804`) | 01.001.000 | Native 1920×1080 **NEW GAME** title; route continues into the opening | CLEAN, `rms=0.1589`, `peak=1.2692`, duplicated grains 0.0% |
+| GRIS (`PPSA09804`) | 01.001.000 | Native 1920×1080 **NEW GAME** title | CLEAN, `rms=0.1800`, `peak=1.2689`, duplicated grains 0.0% |
 | Sonic Origins (`PPSA05325`) | 02.002.000 update targeting 02.001.000 | Blocked: update-only dump is missing two base title assets | AudioOut2 runs, but guest PCM is zero while startup is blocked |
-| Space Adventure Cobra — The Awakening (`PPSA17337`) | 01.004.000 | Native 1920×1080 title | CLEAN, `rms=0.0433`, `peak=0.1880`, duplicated grains 0.0% |
+| Space Adventure Cobra — The Awakening (`PPSA17337`) | 01.004.000 | Native 1920×1080 title | CLEAN, `rms=0.0436`, `peak=0.1880`, duplicated grains 0.0% |
 
 ## Visual evidence
 
@@ -17,7 +17,9 @@ Raw PCM, verbose logs, and GPU captures are local diagnostics and are intentiona
 
 ![GRIS — New Game title](screenshots/issue-1356-gris-title.png)
 
-Route: `scripts/gris/reach-first-gameplay.pad`.
+Route: `scripts/gris/reach-title-screen.pad`. The title appears without input; the comments-only
+route keeps a neutral scripted controller connected and prevents an evidence run from selecting
+**NEW GAME**.
 
 ### Space Adventure Cobra — The Awakening
 
@@ -34,17 +36,19 @@ was used for the committed visual evidence.
 Run from the repository root and point each command at a legally obtained app directory:
 
 ```bash
-PROSPER_PAD_SCRIPT=@prosper/scripts/gris/reach-first-gameplay.pad \
+PROSPER_PAD_SCRIPT=@prosper/scripts/gris/reach-title-screen.pad \
   prosper/build-linux/screenshot /path/PPSA09804-app0 \
-  --seconds 1 --count 90 --timeout 180 --out /tmp/gris-shots
+  --seconds 1 --count 35 --timeout 90 --out /tmp/gris-shots
 
 PROSPER_PAD_SCRIPT=@prosper/scripts/cobra/reach-title-or-gameplay.pad \
   prosper/build-linux/screenshot /path/PPSA17337-app0 \
   --seconds 1 --count 90 --timeout 180 --out /tmp/cobra-shots
 ```
 
-Capture final mixed PCM with `PROSPER_AUDIO_DUMP=/tmp/<title>` on the same route. Analyze the active
-port using its logged format; GRIS uses stereo float32 on port 1:
+Capture final mixed PCM with `PROSPER_AUDIO_DUMP=/tmp/<title>`. GRIS's title is silent, so use
+`scripts/gris/reach-first-gameplay.pad` for its audio exercise; the title-screen route remains the
+visual evidence route. Analyze the active port using its logged format; GRIS uses stereo float32 on
+port 1 (its auxiliary port 3 remained silent):
 
 ```bash
 python3 prosper/tools/audio_analyze.py /tmp/gris.port1.raw \
@@ -54,13 +58,13 @@ python3 prosper/tools/audio_analyze.py /tmp/gris.port1.raw \
 The validated GRIS verdict was:
 
 ```text
-CLEAN: corr(block 1024f)=+0.108 neighbor-max=+0.043 spike=+0.066 (threshold 0.35) dup-grains=0.0% rms=0.1589 peak=1.2692
+CLEAN: corr(block 1024f)=+0.095 neighbor-max=+0.047 spike=+0.048 (threshold 0.35) dup-grains=0.0% rms=0.1800 peak=1.2689
 ```
 
 The validated Cobra verdict was:
 
 ```text
-CLEAN: corr(block 1024f)=-0.043 neighbor-max=+0.047 spike=-0.089 (threshold 0.35) dup-grains=0.0% rms=0.0433 peak=0.1880
+CLEAN: corr(block 1024f)=-0.049 neighbor-max=+0.032 spike=-0.081 (threshold 0.35) dup-grains=0.0% rms=0.0436 peak=0.1880
 ```
 
 ## Sonic Origins dump audit

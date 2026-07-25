@@ -117,7 +117,7 @@ The reproducible route is in
 
 The Unity/IL2CPP title reaches its animated **NEW GAME** screen at native 1920×1080 and accepts the
 scripted default selection into the opening sequence. Its Wwise path produces sustained non-zero
-PCM; the objective repetition check reports clean audio (`rms=0.1589`, no duplicated grains).
+PCM; the objective repetition check reports clean audio (`rms=0.1800`, no duplicated grains).
 
 ## Space Adventure Cobra — The Awakening — `PPSA17337`
 
@@ -126,7 +126,7 @@ PCM; the objective repetition check reports clean audio (`rms=0.1589`, no duplic
 </p>
 
 This Unity/IL2CPP title boots through its opening flow and renders the complete title composition at
-native 1920×1080. Its captured output also passes the objective repetition check (`rms=0.0433`, no
+native 1920×1080. Its captured output also passes the objective repetition check (`rms=0.0436`, no
 duplicated grains). A malformed full-height scissor previously clipped the upper 250 rows; the
 command processor now sanitizes that observed invalid pair before rasterization.
 
