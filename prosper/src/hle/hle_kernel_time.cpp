@@ -508,7 +508,14 @@ namespace {
     // condvar a waiter is blocked on (the old raw-pointer scheme was a use-after-free: delete freed
     // the state while k_eq_wait sat in cv.wait on it). Delete marks `deleted` and wakes waiters; the
     // object dies when the last reference drops.
-    struct EqState { std::mutex m; std::condition_variable cv; std::deque<SceKEvent> ready; bool deleted = false; };
+    struct PendingEvent { SceKEvent event; bool coalescible; };
+    struct EqState {
+        std::mutex m;
+        std::condition_variable cv;
+        std::deque<PendingEvent> ready;
+        size_t coalescible_ready = 0;
+        bool deleted = false;
+    };
     PROSPER_HEAP_MUTEX(g_eq_mx);   // #707: heap-backed on macOS (std::mutex would land in the corrupted __DATA cluster)
     std::unordered_map<uint64_t, std::shared_ptr<EqState>> g_eqs;   // guest eq handle -> state
     struct FlipReg { uint64_t eq; int64_t ident; uint64_t udata; };
@@ -554,18 +561,29 @@ namespace {
         // EVERY completion delivered — two in-flight completions share (ident, filter) but carry
         // different request tags in data, and replacing one loses a completion forever.
         if (coalesce)
-            for (auto& q : s->ready)
-                if (q.ident == e.ident && q.filter == e.filter) {
+            for (auto& pending : s->ready) {
+                auto& q = pending.event;
+                if (pending.coalescible && q.ident == e.ident && q.filter == e.filter) {
                     // Timer / HR-timer (filter -7 / -15): ACCUMULATE expirations across coalesced fires so
                     // the delivered event carries expirations-since-last-read (kqueue EVFILT_TIMER). Other
                     // filters keep replace-in-place (vblank/flip: the newest event wins).
                     int64_t data = (e.filter == -7 || e.filter == -15) ? q.data + e.data : e.data;
                     q = e; q.data = data; s->cv.notify_all(); return;
                 }
-        // Distinct (ident, filter) pairs are few; the cap is a leak guard only. If it ever fires,
-        // shed the OLDEST event — never the just-posted one.
-        if (s->ready.size() >= 64) s->ready.pop_front();
-        s->ready.push_back(e);
+            }
+        // Distinct coalesced (ident, filter) pairs are few; cap that level-style queue as a leak
+        // guard and shed the oldest COALESCIBLE event if it ever fires. Count-sensitive EOP/APR
+        // entries may share this deque and must never be selected as overflow victims.
+        if (coalesce && s->coalescible_ready >= 64) {
+            auto oldest = std::find_if(s->ready.begin(), s->ready.end(),
+                                       [](const PendingEvent& p) { return p.coalescible; });
+            if (oldest != s->ready.end()) {
+                s->ready.erase(oldest);
+                s->coalescible_ready--;
+            }
+        }
+        s->ready.push_back({ e, coalesce });
+        s->coalescible_ready += coalesce;
         s->cv.notify_all();
     }
     void vblank_pump() {
@@ -846,7 +864,12 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
     }
     if (s->deleted && s->ready.empty()) { if (a3) *(int32_t*)P(a3) = 0; return 0x80020009ull; }  // deleted under us
     int n = 0; auto* ev = (SceKEvent*)P(a1);
-    while (n < num && !s->ready.empty()) { if (ev) ev[n] = s->ready.front(); s->ready.pop_front(); n++; }
+    while (n < num && !s->ready.empty()) {
+        if (ev) ev[n] = s->ready.front().event;
+        s->coalescible_ready -= s->ready.front().coalescible;
+        s->ready.pop_front();
+        n++;
+    }
     if (a3) *(int32_t*)P(a3) = n;
     if (evlog() && n > 0) fprintf(stderr, "[ev]   -> delivered %d ev(s) eq=0x%llx ra=eboot+0x%llx (ident=%lld filter=%d)\n",
         n, (unsigned long long)a0, (unsigned long long)((uint64_t)__builtin_return_address(0) - 0x400000000ull),

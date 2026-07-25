@@ -12,6 +12,7 @@
 #include <cstring>
 #include <chrono>
 #include <thread>
+#include <vector>
 
 using namespace prosper;
 
@@ -101,6 +102,35 @@ int main() {
         CHECK(gev.filter == -14, "EOP event filter == GraphicsCore (-14)");
         CHECK(gev.data == kEop, "EOP event data == id (sceGnmGetEqEventType semantics)");
         CHECK(gev.udata == kEopUdata, "EOP event echoed the registered udata");
+
+        // Count-sensitive completion sources use coalesce=false: every trigger must survive until
+        // the guest consumes it. A generic queue leak cap must not silently discard older EOPs.
+        constexpr int kBurst = 80;
+        for (int i = 0; i < kBurst; i++) prosper_eq_trigger_eop();
+        for (int i = 0; i < 50 && getcount(eq, 0, 0, 0, 0, 0) != kBurst; i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(getcount(eq, 0, 0, 0, 0, 0) == kBurst,
+              "non-coalesced EOP burst retains every completion beyond the generic queue cap");
+
+        // A later level-style event shares the deque but may evict only another coalescible entry,
+        // never one of the count-sensitive completions already beyond the generic cap.
+        trigger(eq, (uint64_t)kId, 0x5151, 0, 0, 0);
+        CHECK(getcount(eq, 0, 0, 0, 0, 0) == kBurst + 1,
+              "coalesced post after a completion burst does not evict a completion");
+
+        std::vector<KEvent> burst(kBurst + 1); int32_t bout = -1; uint32_t bcap = 50000;
+        wait(eq, (uint64_t)(uintptr_t)burst.data(), burst.size(), (uint64_t)(uintptr_t)&bout,
+             (uint64_t)(uintptr_t)&bcap, 0);
+        CHECK(bout == kBurst + 1, "WaitEqueue returns every retained EOP completion plus user event");
+        bool burst_shape = true;
+        for (int i = 0; i < kBurst; i++) {
+            const auto& bev = burst[i];
+            burst_shape &= bev.ident == kEop && bev.filter == -14 && bev.data == kEop &&
+                           bev.udata == kEopUdata;
+        }
+        CHECK(burst_shape, "every retained EOP completion preserves its event payload");
+        CHECK(burst.back().ident == kId && burst.back().filter == -11 && burst.back().udata == 0x5151,
+              "coalesced user event retains its payload after the completion burst");
     }
 
     // VideoOut flip event accessor (#394 F5): the producer stores the submitted flipArg raw in
