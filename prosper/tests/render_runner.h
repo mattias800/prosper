@@ -2105,7 +2105,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             stencil_clear_effective(d.ps->stencil_clear_enable, d.ps->stencil_enable,
                                     d.ps->stencil_write_mask[0], d.ps->stencil_write_mask[1])) {
             use_stencil = true;
-            if (!got_stencil_clear) {
+            // Mirror the depth contract (#371/#508 via #1361): DB_STENCIL_CLEAR is consumed as a
+            // fresh image's initial contents only when the guest explicitly requests a clear.
+            // Latching it from every stencil-using draw let a STALE register word poison a new
+            // plane (the stencil analog of #371's Astro Bot depth case); without a clear the
+            // unknown guest contents are approximated as 0.
+            if (!got_stencil_clear && d.ps->stencil_clear_enable) {
                 stencil_clear = d.ps->stencil_clear_value; got_stencil_clear = true;
             } }
     }
