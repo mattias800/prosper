@@ -198,10 +198,12 @@ int main() {
     // The authoritative PS5 symbol map identifies these NIDs as DCB marker/instance builders.
     // PushMarker used to clear live state through the obsolete g_agc_ctx_init workaround (#641).
     auto pushmarker = Hle::lookup("+kSrjIVxKFE");
+    auto setmarker = Hle::lookup("QhCbS4X9Rl8");
     auto popmarker = Hle::lookup("H7uZqCoNuWk");
     auto setinstances = Hle::lookup("tSBxhAPyytQ");
-    CHECK(pushmarker && popmarker && setinstances, "marker and instance Dcb functions registered");
-    if (pushmarker && popmarker && setinstances) {
+    CHECK(pushmarker && setmarker && popmarker && setinstances,
+          "marker and instance Dcb functions registered");
+    if (pushmarker && setmarker && popmarker && setinstances) {
         uint32_t* before = dcb.cursor_up;
         const char marker[] = "Blasphemous 2 landing";
         uint32_t marker_payload_dw = (uint32_t)((sizeof marker + 3u) / 4u);
@@ -212,13 +214,49 @@ int main() {
               "PushMarker emits a correctly sized R_PUSH_MARKER packet");
         CHECK(strcmp((const char*)(push + 1), marker) == 0, "PushMarker copies the NUL-terminated label");
 
+        const char set_label[] = "Sonic SetMarker";
+        uint32_t set_payload_dw = (uint32_t)((sizeof set_label + 3u) / 4u);
+        auto* set = (uint32_t*)(uintptr_t)setmarker(
+            D, (uint64_t)(uintptr_t)set_label, 0xff00ff00u, 0, 0, 0);
+        CHECK(set == push + 1 + marker_payload_dw &&
+              set[0] == PM4(1 + set_payload_dw, IT_NOP, R_PUSH_MARKER) &&
+              strcmp((const char*)(set + 1), set_label) == 0,
+              "SetMarker appends the same native marker packet as PushMarker");
+
         auto* pop = (uint32_t*)(uintptr_t)popmarker(D, 0, 0, 0, 0, 0);
-        CHECK(pop == push + 1 + marker_payload_dw && pop[0] == PM4(2, IT_NOP, R_POP_MARKER),
+        CHECK(pop == set + 1 + set_payload_dw && pop[0] == PM4(2, IT_NOP, R_POP_MARKER),
               "PopMarker appends R_POP_MARKER after the label packet");
 
         auto* instances = (uint32_t*)(uintptr_t)setinstances(D, 3, 0, 0, 0, 0);
         CHECK(instances == pop + 2 && instances[0] == PM4(2, IT_NUM_INSTANCES, 0) && instances[1] == 3,
               "SetNumInstances appends the native IT_NUM_INSTANCES packet");
+    }
+
+    // Resource registration returns a 32-bit opaque ID through out*. Sonic places the owner and
+    // resource outputs four bytes apart on its stack, so an accidental 64-bit store corrupts one.
+    auto reg_owner = Hle::lookup("X-Nm5KLREeg");
+    auto reg_resource = Hle::lookup("W5z4eZrjEas");
+    CHECK(reg_owner && reg_resource, "AGC owner/resource registration handlers registered");
+    if (reg_owner && reg_resource) {
+        struct { uint32_t resource, owner, canary; } outputs{0, 0, 0xA5A55A5Au};
+        const char owner_name[] = "Sonic Origins";
+        const char resource_name[] = "Needle shader";
+        CHECK(reg_owner((uint64_t)(uintptr_t)&outputs.owner,
+                        (uint64_t)(uintptr_t)owner_name, 1, 0, 0, 0) == 0 && outputs.owner != 0,
+              "RegisterOwner publishes a non-zero opaque owner handle");
+        CHECK(reg_resource((uint64_t)(uintptr_t)&outputs.resource, 6, 0x411e70400ull, 0x190,
+                           (uint64_t)(uintptr_t)resource_name, outputs.owner) == 0 &&
+                  outputs.resource != 0,
+              "RegisterResource publishes a non-zero opaque resource handle");
+        uint32_t second = 0;
+        reg_resource((uint64_t)(uintptr_t)&second, 6, 0x411e70600ull, 0xd0,
+                     (uint64_t)(uintptr_t)resource_name, outputs.owner);
+        CHECK(second != 0 && second != outputs.resource,
+              "successive resource registrations receive distinct handles");
+        CHECK(outputs.canary == 0xA5A55A5Au,
+              "32-bit registration outputs preserve adjacent caller stack fields");
+        CHECK(reg_owner(0, 0, 0, 0, 0, 0) != 0 && reg_resource(0, 0, 0, 0, 0, 0) != 0,
+              "registration rejects null output pointers");
     }
 
     auto lookup_default = [](RegisterDefaults* d, uint32_t hash) -> ShaderRegister* {

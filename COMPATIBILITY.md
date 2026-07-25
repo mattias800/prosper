@@ -5,7 +5,7 @@ describe specific, user-supplied PS5 dumps tested primarily on Linux. A mileston
 documented route is reproducible; it does **not** mean the entire game is playable or free of bugs.
 Different title revisions may behave differently.
 
-Last updated: 2026-07-24
+Last updated: 2026-07-25
 
 ## Summary
 
@@ -15,6 +15,9 @@ Last updated: 2026-07-24
 | *Dead Cells* | `PPSA15552` | Custom | ✅ Controllable Prisoners' Quarters scene renders in full color |
 | *Blasphemous 2* | `PPSA13579` | Unity | ✅ Opening route reaches and renders the first playable room |
 | *Evergate* | `PPSA01885` | Unity | ✅ Reaches and renders the first tutorial-room gameplay |
+| *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Native 1920×1080 title reached; opening route and audio verified |
+| *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | ✅ Native 1920×1080 title and audio verified |
+| *Sonic Origins*&nbsp;² | `PPSA05325` | Hedgehog Engine | 🔬 Frontend loop reached; supplied update-only dump lacks its base title assets |
 | Terminator (2D)&nbsp;¹ | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay reached (user-verified) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Opening gameplay scene ("Day One" at the manor) renders; known lighting/texture defects |
 | *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Title and STORY/ONLINE main menu render; known UI and composition defects remain |
@@ -22,6 +25,10 @@ Last updated: 2026-07-24
 | Additional Unity/IL2CPP target | `PPSA02664` | Unity / IL2CPP | 🔬 Exercised, with no published gameplay milestone |
 
 ¹ Exact retail game name pending confirmation.
+
+² No compatibility milestone is claimed for the incomplete Sonic dump. A merged base+update image is
+required before its title, gameplay, or audio can be evaluated. The guest also consumes an authentic
+Sonic 1 activity launch, but still needs the same base UI assets before entering the classic runtime.
 
 ## The Messenger — `PPSA24651`
 
@@ -102,6 +109,47 @@ against regressions.
 
 The reproducible route is in
 [`prosper/scripts/evergate/README.md`](prosper/scripts/evergate/README.md).
+
+## GRIS — `PPSA09804`
+
+<p align="center">
+  <img src="prosper/docs/screenshots/issue-1356-gris-title.png" alt="GRIS — New Game title screen">
+</p>
+
+The Unity/IL2CPP title reaches its animated **NEW GAME** screen at native 1920×1080 and accepts the
+scripted default selection into the opening sequence. Its Wwise path produces sustained non-zero
+PCM; the objective repetition check reports clean audio (`rms=0.1800`, no duplicated grains).
+
+## Space Adventure Cobra — The Awakening — `PPSA17337`
+
+<p align="center">
+  <img src="prosper/docs/screenshots/issue-1356-space-adventure-cobra-title.png" alt="Space Adventure Cobra — The Awakening title screen">
+</p>
+
+This Unity/IL2CPP title boots through its opening flow and renders the complete title composition at
+native 1920×1080. Its captured output also passes the objective repetition check (`rms=0.0436`, no
+duplicated grains). Cobra imports an SDK-revision alias of `sceAgcCreateInterpolantMapping`; routing
+that alias to the real builder initializes all 32 advertised Cx records instead of exposing stale
+stack entries as register writes. The command processor therefore preserves every valid register
+write and rejects only offsets outside its register window.
+
+## Sonic Origins — `PPSA05325`
+
+The supplied 02.002.000 directory is an update image targeting 02.001.000, rather than a merged
+base+update app. Live file tracing shows that its only unresolved startup requests are
+`raw/ui/ui_startup.pac` and `raw/ui/rpl_texture/ui_title_nocopy.dds`; both are absent from the dump.
+The game otherwise initializes its renderer, connected pad, CRI sound banks, and AudioOut2 pump, but
+correctly remains in a black startup loop and emits silence without those title assets. No screenshot,
+audio, or compatibility success is claimed until a complete dump is available.
+
+The update declares PS5 `launchActivity` support and contains the classic RSDK files. An exact
+`TITLE_SONIC_1_CLASSIC` Game Intent is received by the guest and its `activityId` property is consumed,
+but Sonic still requests both missing UI files before opening `raw/retro/Sonic1u.rsdk`. This rules out
+the platform activity route as a way around the incomplete content while preserving truthful default
+no-intent behavior.
+
+Routes, capture commands, audio evidence, and the Sonic audit are recorded in
+[`prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md).
 
 ## Blue Prince — `PPSA25009`
 

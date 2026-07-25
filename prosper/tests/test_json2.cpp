@@ -52,9 +52,10 @@ int main() {
     HleFn string_dtor = Hle::lookup("cG1VE2HMl6c");
     HleFn to_string = Hle::lookup("Ncel8t2Rrpc");
     HleFn refer_string = Hle::lookup("wLsJlmgEIaI");
+    HleFn set_bool = Hle::lookup("5yHuiWXo2gg");
     CHECK(ctor && dtor && parse && index_string && index_uint && get_type && get_boolean &&
           get_integer && get_unsigned && get_string && string_cstr && count && assign && string_ctor && string_dtor &&
-          to_string && refer_string, "Json2 entry points are registered");
+          to_string && refer_string && set_bool, "Json2 entry points are registered");
     if (failures) return 1;
 
     constexpr char source[] =
@@ -127,6 +128,73 @@ int main() {
           "invalid JSON returns the Json2 parse error");
     CHECK(root.type == 0, "failed parse leaves a null value");
     call(dtor, &root);
+
+    // Sonic Origins links the PS5 SDK 3.20 spellings for its startup JSON objects. Exercise the
+    // exact imported aliases so a generic success stub cannot leave caller-owned storage stale.
+    HleFn ps5_parameter_ctor = Hle::lookup("WSOuge5IsCg");
+    HleFn ps5_set_allocator = Hle::lookup("I2QC8PYhJWY");
+    HleFn ps5_set_file_buffer_size = Hle::lookup("Eu95jmqn5Rw");
+    HleFn ps5_initialize = Hle::lookup("IXW-z8pggfg");
+    HleFn ps5_object_ctor = Hle::lookup("OJPTonqdg0I");
+    HleFn ps5_object_dtor = Hle::lookup("5JmzZt8twAo");
+    HleFn ps5_object_index = Hle::lookup("ERuf9y0DY84");
+    HleFn ps5_object_empty = Hle::lookup("i2l3IYvQ9UE");
+    HleFn ps5_string_value_ctor = Hle::lookup("sZIoMRGO+jk");
+    HleFn ps5_object_value_ctor = Hle::lookup("3xUXnmUkXfo");
+    HleFn ps5_set_object = Hle::lookup("dFCphqnd+a4");
+    CHECK(ps5_parameter_ctor && ps5_set_allocator && ps5_set_file_buffer_size && ps5_initialize &&
+          ps5_object_ctor && ps5_object_dtor && ps5_object_index && ps5_object_empty &&
+          ps5_string_value_ctor && ps5_object_value_ctor && ps5_set_object,
+          "Sonic's PS5 Json2 aliases are registered");
+
+    struct JsonInitParameter2 {
+        void* allocator;
+        void* user_data;
+        uint64_t file_buffer_size;
+        uint32_t special_float_format_type;
+        uint32_t reserved[3];
+    } parameter;
+    std::memset(&parameter, 0xa5, sizeof(parameter));
+    CHECK(call(ps5_parameter_ctor, &parameter) == reinterpret_cast<uintptr_t>(&parameter) &&
+          !parameter.allocator && !parameter.user_data && parameter.file_buffer_size == 0 &&
+          parameter.special_float_format_type == 0,
+          "PS5 InitParameter2 constructor clears its complete ABI object");
+    ps5_set_allocator(reinterpret_cast<uintptr_t>(&parameter), 0x12340000u, 0x56780000u, 0, 0, 0);
+    ps5_set_file_buffer_size(reinterpret_cast<uintptr_t>(&parameter), 0x9000u, 0, 0, 0, 0);
+    CHECK(parameter.allocator == reinterpret_cast<void*>(0x12340000u) &&
+          parameter.user_data == reinterpret_cast<void*>(0x56780000u) &&
+          parameter.file_buffer_size == 0x9000u && call(ps5_initialize, &parameter) == 0,
+          "PS5 Json2 initialization parameters retain allocator and file-buffer state");
+
+    struct JsonObject { void* implementation; } object{};
+    JsonString key{};
+    call(ps5_object_ctor, &object);
+    CHECK(call(ps5_object_empty, &object) == 1, "new PS5 JsonObject is empty");
+    call(string_ctor, &key);
+    auto* inserted = reinterpret_cast<JsonValue*>(call(ps5_object_index, &object, &key));
+    call(set_bool, inserted, reinterpret_cast<const void*>(1));
+    CHECK(inserted && call(ps5_object_empty, &object) == 0,
+          "PS5 JsonObject index creates a writable value");
+
+    JsonValue object_value{};
+    call(ps5_object_value_ctor, &object_value, &object);
+    call(ps5_object_dtor, &object);
+    auto* copied_empty_key = reinterpret_cast<JsonValue*>(call(index_string, &object_value, ""));
+    auto* copied_true = reinterpret_cast<const bool*>(call(get_boolean, copied_empty_key));
+    CHECK(object_value.type == 7 && copied_true && *copied_true,
+          "PS5 JsonValue object constructor owns a deep copy");
+
+    JsonValue string_value{};
+    call(ps5_string_value_ctor, &string_value, &key);
+    CHECK(string_value.type == 5, "PS5 JsonValue string constructor preserves the string type");
+    call(ps5_set_object, &string_value, reinterpret_cast<void*>(object_value.payload));
+    auto* set_empty_key = reinterpret_cast<JsonValue*>(call(index_string, &string_value, ""));
+    auto* set_true = reinterpret_cast<const bool*>(call(get_boolean, set_empty_key));
+    CHECK(string_value.type == 7 && set_true && *set_true,
+          "PS5 JsonValue set(Object) replaces and deep-copies the prior value");
+    call(dtor, &string_value);
+    call(string_dtor, &key);
+    call(dtor, &object_value);
 
     std::puts(failures ? "== FAIL ==" : "== PASS ==");
     return failures ? 1 : 0;

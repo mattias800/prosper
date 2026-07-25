@@ -21,7 +21,6 @@
 #include <cstdlib>
 #include <cstddef>
 #include <cstring>
-#include <unordered_set>
 #include <vector>
 #include <mutex>
 #include <atomic>
@@ -736,18 +735,24 @@ static_assert(offsetof(AgcShader, user_data) == 0x08 && offsetof(AgcShader, code
               offsetof(AgcShader, specials) == 0x28 && offsetof(AgcShader, type) == 0x5a &&
               offsetof(AgcShader, num_sh_registers) == 0x5c, "AgcShader must match the SDK blob layout");
 
-// Shaders whose headers we already relocated (the fixup is not idempotent), and the registry of all
-// created shaders — the AGC->Vulkan pipeline consumes this to find shader code by PGM base.
+// Registry of all created shaders — the AGC->Vulkan pipeline consumes this to find shader code by
+// PGM base.
 // The registry mutex covers CreateShader's push_back (guest loader threads) against the submit
 // thread's lookup iteration: an unsynchronized push_back REALLOCATION frees the vector's backing
 // store mid-iteration — a use-after-free read, not the "benign stale read" it was assumed to be.
-std::unordered_set<const void*>& agc_relocated() { static std::unordered_set<const void*> s; return s; }
 std::mutex&                      agc_shaders_mx() { static std::mutex m; return m; }
 std::vector<const AgcShader*>&   agc_shaders()   { static std::vector<const AgcShader*> v; return v; }
 
-// Relocate one self-relative pointer field in place (no-op for null fields).
-template <class T> inline void agc_fix_ptr(T*& m) {
-    if (m) m = reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(m) + reinterpret_cast<uintptr_t>(&m));
+// Relocate one self-relative pointer field in place. SDK shader blobs use small forward offsets from
+// the pointer field; linked guest pointers live above 4 GiB. Inspect the field representation rather
+// than caching the header address: Sonic Origins frees a shader header and later constructs another
+// at the same allocation, so an address-only "already relocated" set misclassifies the new blob and
+// dereferences its raw 0x70/0x78 register offsets as host pointers.
+template <class T> inline bool agc_fix_ptr(T*& m) {
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(m);
+    if (!raw || raw >= 0x100000000ull) return false;
+    m = reinterpret_cast<T*>(raw + reinterpret_cast<uintptr_t>(&m));
+    return true;
 }
 
 }  // namespace
@@ -831,17 +836,16 @@ HLE(agc_create_shader) {  // (Shader** dst, void* header, const void* code)
         return kAgcErrInvalidArg;   // wrong layout model -- fail loudly rather than corrupt the blob
     }
 
-    if (agc_relocated().insert(h).second) {
-        agc_fix_ptr(h->cx_registers);
-        agc_fix_ptr(h->sh_registers);
-        agc_fix_ptr(h->user_data);
-        agc_fix_ptr(h->specials);
-        agc_fix_ptr(h->input_semantics);
-        agc_fix_ptr(h->output_semantics);
-        if (h->user_data) {
-            agc_fix_ptr(h->user_data->direct_resource_offset);
-            for (auto& sharp : h->user_data->sharp_resource_offset) agc_fix_ptr(sharp);
-        }
+    agc_fix_ptr(h->cx_registers);
+    agc_fix_ptr(h->sh_registers);
+    agc_fix_ptr(h->user_data);
+    agc_fix_ptr(h->specials);
+    agc_fix_ptr(h->input_semantics);
+    agc_fix_ptr(h->output_semantics);
+    if (h->user_data) {
+        agc_fix_ptr(h->user_data->direct_resource_offset);
+        for (auto& sharp : h->user_data->sharp_resource_offset)
+            agc_fix_ptr(sharp);
     }
     h->code = code;
 
@@ -1030,7 +1034,7 @@ HLE(agc_create_prim_state) {  // (cx_regs, uc_regs, hs, gs, prim_type)
     return 0;
 }
 
-// sceAgcCreateInterpolantMapping (HV4j+E0MBHE) — build the 32 SPI_PS_INPUT_CNTL_* registers wiring
+// sceAgcCreateInterpolantMapping — build the 32 SPI_PS_INPUT_CNTL_* registers wiring
 // PS inputs to GS/VS output parameter slots. Generalized beyond Kyty (which asserts Unity's exact
 // identity layout): match each PS input to the GS output with the same semantic id and use that
 // output's parameter slot, with the flat-shade bit (0x400) from the PS side. Falls back to the
@@ -1058,6 +1062,23 @@ HLE(agc_create_interpolant_mapping) {  // (ShaderRegister regs[32], const Shader
         regs[i].value = (mapping.valid_mask & (1u << i)) ? mapping.controls[i] : 0u;
     }
     return 0;
+}
+
+// The SDK-revision export dbOlWdppb4o has two live title-visible argument shapes. Cobra passes
+// complete producer/pixel shader blobs (types 2 and 1) and consumes 32 SPI_PS_INPUT_CNTL register
+// pairs. Dragon Quest VII passes opaque/default inputs and consumes the 32-entry virtual-offset
+// table modeled by agc_build_interpolant_mapping. Discriminate on the exact shader types validated
+// by Cobra's eboot wrapper; all other shapes retain DQ's bounded default contract.
+// CONFIDENCE: HIGH (both live callers plus independent focused regressions).
+HLE(agc_create_interpolant_mapping_sdk_alias) {
+    if (a1 && a2 && gpu::guest_readable(a1, sizeof(AgcShader)) &&
+        gpu::guest_readable(a2, sizeof(AgcShader))) {
+        const auto* producer = reinterpret_cast<const AgcShader*>(static_cast<uintptr_t>(a1));
+        const auto* pixel = reinterpret_cast<const AgcShader*>(static_cast<uintptr_t>(a2));
+        if (producer->type == 2 && pixel->type == 1)
+            return agc_create_interpolant_mapping(a0, a1, a2, a3, a4, a5);
+    }
+    return agc_build_interpolant_mapping(a0, a1, a2, a3, a4, a5);
 }
 
 // --- sceAgcDriverSubmitDcb (AgcDriver NID UglJIZjGssM) — the GPU submission point. -------------
@@ -1590,6 +1611,34 @@ HLE(agc_driver_query_resource_registration_user_memory_requirements) {
     return 0;
 }
 
+// sceAgcDriverRegisterOwner / RegisterResource publish 32-bit opaque handles through their first
+// argument. A Sonic Origins startup trace pins both ABIs: RegisterOwner(out, name, userData, ...),
+// followed by RegisterResource(out, type, base, bytes, name, owner). The former generic-success
+// tracers left the two adjacent stack outputs untouched. Prosper does not expose Razor resource
+// inspection yet, so metadata remains guest-owned; stable non-zero IDs are the observable runtime
+// contract needed by callers and by later query APIs. CONFIDENCE: HIGH on args/output width from the
+// live PS5 title callsites; MED on invalid-pointer error until the PS5 error enum is published.
+namespace {
+std::atomic<uint32_t> g_agc_owner_handle{1};
+std::atomic<uint32_t> g_agc_resource_handle{1};
+
+uint32_t next_agc_registration_handle(std::atomic<uint32_t>& counter) {
+    uint32_t handle = counter.fetch_add(1, std::memory_order_relaxed);
+    if (handle == 0) handle = counter.fetch_add(1, std::memory_order_relaxed);
+    return handle;
+}
+}
+HLE(agc_driver_register_owner) {
+    if (!a0) return (uint64_t)(int64_t)(int32_t)0x80D19005u;
+    *(uint32_t*)(uintptr_t)a0 = next_agc_registration_handle(g_agc_owner_handle);
+    return 0;
+}
+HLE(agc_driver_register_resource) {
+    if (!a0) return (uint64_t)(int64_t)(int32_t)0x80D19005u;
+    *(uint32_t*)(uintptr_t)a0 = next_agc_registration_handle(g_agc_resource_handle);
+    return 0;
+}
+
 // sceAgcCbDispatch (NID k3GhuSNmBLU) — compute dispatch.
 // The authoritative PS5 3.20 export name is sceAgcCbDispatch. Arguments a1-a3 are dispatch
 // dimensions and a4 is ShaderDispatchModifier. Modifier.USE_THREAD_DIMENSIONS (bit 5) defines the
@@ -1637,16 +1686,25 @@ void register_agc_hle() {
     RN("f3dg2CSgRKY", agc_create_shader);   // sceAgcCreateShader — populates the shader registry
     RN("AOLcoIkQDgM", agc_driver_query_resource_registration_user_memory_requirements);
     RN("uJziRsODk1c", agc_driver_get_resource_registration_max_name_length);
+    RN("X-Nm5KLREeg", agc_driver_register_owner);
+    RN("W5z4eZrjEas", agc_driver_register_resource);
     RN("V++UgBtQhn0", agc_get_data_packet_payload);          // data packet -> register-bank payload
     RN("n2fD4A+pb+g", agc_cb_set_sh_register_range_direct);  // SET_SH_REG range packet
     RN("UZbQjYAwwXM", agc_cb_set_sh_registers_direct);       // non-contiguous SET_SH_REG packets
     RN("D9sr1xGUriE", agc_create_prim_state);                // prim registers from gs specials
-    RN("HV4j+E0MBHE", agc_create_interpolant_mapping);       // SPI_PS_INPUT_CNTL_* wiring
+    // CreateInterpolantMapping changed NID across SDK revisions. PS5 3.20 names pdEV7bI6COI;
+    // Cobra imports dbOlWdppb4o, and its eboot wrapper at +0x3b2780 proves the same
+    // (regs[32], producer type 2, pixel type 1) ABI before copying all 32 records into the Cx bank.
+    // Leaving that alias on the generic success stub advertised 32 unwritten stack records and
+    // made coincidental junk offsets program real registers.
+    RN("pdEV7bI6COI", agc_create_interpolant_mapping);       // PS5 3.20
+    RN("dbOlWdppb4o", agc_create_interpolant_mapping_sdk_alias); // Cobra/DQ SDK revision
+    RN("HV4j+E0MBHE", agc_create_interpolant_mapping);       // older observed revision
     RN("TRO721eVt4g", agc_dcb_reset_queue);
     RN("+kSrjIVxKFE", agc_dcb_push_marker);
+    RN("QhCbS4X9Rl8", agc_dcb_push_marker);  // sceAgcDcbSetMarker (same native marker packet)
     RN("H7uZqCoNuWk", agc_dcb_pop_marker);
     RN("qj7QZpgr9Uw", agc_dcb_type2_nop);
-    RN("dbOlWdppb4o", agc_build_interpolant_mapping);
     RN("tSBxhAPyytQ", agc_dcb_set_num_instances);
     RN("MWiElSNE8j8", agc_dcb_wait_safe_for_rendering);
     RN("LHFXRrlTPD8", agc_dcb_set_cx_register_direct);

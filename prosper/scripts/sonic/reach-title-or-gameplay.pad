@@ -1,0 +1,55 @@
+# Sonic Origins (PPSA05325): deterministic edges through startup/legal/video gates and the
+# title's "press any button" prompt. Full Needle-engine rendering is substantially slower than
+# realtime. Start immediately so the first skippable movie window cannot pass before the old f20
+# pulse, then alternate Cross and Options without changing a later menu selection.
+f0-4:cross
+f8-12:options
+f16-20:cross
+f24-28:options
+f32-36:cross
+f40-44:options
+f48-52:cross
+f56-60:options
+f64-68:cross
+f72-76:options
+f80-84:cross
+f88-92:options
+f96-100:cross
+f104-108:options
+f112-116:cross
+f120-124:options
+f128-132:cross
+f136-140:options
+f144-148:cross
+f152-156:options
+f160-164:cross
+f168-172:options
+f176-180:cross
+f184-188:options
+f192-196:cross
+f200-204:options
+f208-212:cross
+f216-220:options
+f224-228:cross
+f232-236:options
+f240-244:cross
+f248-252:options
+f256-260:cross
+f264-268:options
+f272-276:cross
+f280-284:options
+f288-292:cross
+f296-300:options
+f304-308:cross
+f312-316:options
+f320-324:cross
+f328-332:options
+f336-340:cross
+f344-348:options
+f352-356:cross
+f360-364:options
+f368-372:cross
+f376-380:options
+f384-388:cross
+f392-396:options
+f400-404:cross

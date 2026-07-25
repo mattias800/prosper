@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <array>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 #ifndef _WIN32
@@ -166,9 +167,13 @@ int main() {
     // non-mount path through unchanged, so a relative fixture path exercises the real handler.
     auto resolve_prefix = Hle::lookup(nid_hash("sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes"));
     auto resolve_plain  = Hle::lookup(nid_hash("sceKernelAprResolveFilepathsToIdsAndFileSizes"));
+    auto resolve_ids    = Hle::lookup("WT-5NKy42fw");
+    auto wait_cb        = Hle::lookup("rqwFKI4PAiM");
     CHECK(nid_hash("sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes") == "w5fcCG+t31g",
           "WithPrefix resolve hashes to the PS5 3.20 import NID");
     CHECK(resolve_prefix != nullptr && resolve_plain != nullptr, "both APR resolve entries registered");
+    CHECK(resolve_ids != nullptr && wait_cb != nullptr,
+          "APR id-only resolver and synchronous completion wait registered");
 
     const char* wp_full = "prosper-test-apr-prefix.tmp";   // prefix + tail == this path
     const char* wp_prefix = "prosper-test-apr-";
@@ -189,6 +194,57 @@ int main() {
         CHECK(ids[0] >= 1 && flags[0] == 0, "WithPrefix resolve populates id and flags");
         CHECK(prosper_apr_path_for_id(ids[0]) == wp_full,
               "WithPrefix registers the combined host path under the returned id");
+
+        // Sonic/CRI uses the compact (paths,count,ids,errorIndex) resolver.  errorIndex is a scalar,
+        // so guard it with canaries and prove a multi-entry call does not treat it as a flags array.
+        if (resolve_ids && wait_cb) {
+            const char* compact_paths[2] = { wp_full, wp_full };
+            uint32_t compact_ids[2] = {0, 0};
+            uint32_t error_guard[3] = {0x11111111u, 0xDEADBEEFu, 0x22222222u};
+            uint64_t rc = resolve_ids((uint64_t)(uintptr_t)compact_paths, 2,
+                                      (uint64_t)(uintptr_t)compact_ids,
+                                      (uint64_t)(uintptr_t)&error_guard[1], 0, 0);
+            CHECK(rc == 0 && compact_ids[0] >= 1 && compact_ids[0] == compact_ids[1],
+                  "id-only APR resolver writes stable ids for every path");
+            CHECK(error_guard[0] == 0x11111111u && error_guard[1] == 0 &&
+                      error_guard[2] == 0x22222222u,
+                  "id-only resolver writes only the scalar errorIndex");
+            CHECK(wait_cb(1, 0, 0, 0, 0, 0) == 0,
+                  "APR wait observes eagerly completed command buffers");
+
+            // Sonic Origins keeps loose Hedgehog Engine assets below app0/raw, while CRI's ACB
+            // metadata names an external AWB relative to that content root (sound/Foo.awb). APR
+            // must resolve the missing /app0/sound spelling to /app0/raw/sound without changing an
+            // ordinary path that already exists. This is what turns the correctly loaded ACB into
+            // an audible bank rather than a silent mixer.
+            namespace fs = std::filesystem;
+            const fs::path app0 = "prosper-test-apr-app0";
+            const fs::path raw_sound = app0 / "raw" / "sound";
+            fs::create_directories(raw_sound);
+            const fs::path awb = raw_sound / "fallback.awb";
+            if (FILE* af = std::fopen(awb.string().c_str(), "wb")) {
+                std::fwrite(wp_bytes.data(), 1, wp_bytes.size(), af);
+                std::fclose(af);
+            }
+            set_app0_root(app0.string());
+            const char* awb_paths[1] = { "/app0/sound/fallback.awb" };
+            uint32_t awb_id = 0, awb_error = ~uint32_t{0};
+            uint64_t awb_rc = resolve_ids((uint64_t)(uintptr_t)awb_paths, 1,
+                                          (uint64_t)(uintptr_t)&awb_id,
+                                          (uint64_t)(uintptr_t)&awb_error, 0, 0);
+            CHECK(awb_rc == 0 && awb_id >= 1 && awb_error == 0,
+                  "APR content-root fallback resolves /app0/sound through /app0/raw/sound");
+            std::error_code awb_path_error;
+            const bool same_awb = fs::equivalent(
+                fs::path(prosper_apr_path_for_id(awb_id)), awb, awb_path_error);
+            CHECK(!awb_path_error && same_awb,
+                  "APR content-root fallback registers the real raw-content path");
+            set_app0_root(".");
+            fs::remove(awb);
+            fs::remove(raw_sound);
+            fs::remove(app0 / "raw");
+            fs::remove(app0);
+        }
 
         // An empty prefix must behave exactly like the plain (non-prefix) resolve.
         prosper_apr_reset_for_test();

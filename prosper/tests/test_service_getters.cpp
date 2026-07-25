@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 
 using namespace prosper;
 
@@ -22,6 +23,15 @@ static int32_t call_int_getter(HleFn fn, int32_t sentinel) {
     int32_t out = sentinel;
     fn(1 /*userId*/, (uint64_t)(uintptr_t)&out, 0, 0, 0, 0);
     return out;
+}
+
+static void set_game_intent_activity(const char* value) {
+#ifdef _WIN32
+    _putenv_s("PROSPER_GAME_INTENT_ACTIVITY_ID", value ? value : "");
+#else
+    if (value) setenv("PROSPER_GAME_INTENT_ACTIVITY_ID", value, 1);
+    else unsetenv("PROSPER_GAME_INTENT_ACTIVITY_ID");
+#endif
 }
 
 int main() {
@@ -65,6 +75,95 @@ int main() {
         if (fn) CHECK(call_int_getter(fn, (int32_t)0xDEAD) == g.want, g.what);
     }
 
+    {
+        HleFn fn = Hle::lookup("qbwy0Ub8b3M");
+        CHECK(fn != nullptr, "sceUserServiceGetUserNumber registered");
+        if (fn) CHECK(call_int_getter(fn, (int32_t)0xDEAD) == 1,
+                      "GetUserNumber writes default local-user number 1");
+    }
+
+    {
+        HleFn fn = Hle::lookup("qP-EvQRl2Hc");
+        CHECK(fn != nullptr, "sceLoginDialogInitialize registered");
+        if (fn) CHECK(fn(0, 0, 0, 0, 0, 0) == 0,
+                      "LoginDialog initialization succeeds without opening UI");
+    }
+
+    {
+        HleFn fn = Hle::lookup("RnDibcGCPKw");
+        CHECK(fn != nullptr, "sceVideodec2QueryComputeMemoryInfo registered");
+        if (fn) {
+            uint64_t info[3] = {24, 0xDEAD, 0xDEAD};
+            CHECK(fn((uint64_t)(uintptr_t)info, 0, 0, 0, 0, 0) == 0,
+                  "Videodec2 compute-memory query succeeds for the 24-byte ABI");
+            CHECK(info[1] == (64ull << 10) && info[2] == 0,
+                  "Videodec2 query writes its one-page no-picture requirement and null allocation");
+
+            auto alloc = Hle::lookup("eD+X2SmxUt4");
+            auto query_decoder = Hle::lookup("qqMCwlULR+E");
+            auto create = Hle::lookup("CNNRoRYd8XI");
+            auto decode = Hle::lookup("852F5+q6+iM");
+            auto flush = Hle::lookup("l1hXwscLuCY");
+            auto destroy = Hle::lookup("jwImxXRGSKA");
+            CHECK(alloc && query_decoder && create && decode && flush && destroy,
+                  "Videodec2 compute/decoder lifecycle registered");
+            if (alloc && query_decoder && create && decode && flush && destroy) {
+                alignas(256) static uint8_t memory[3][64u << 10];
+                struct { uint64_t size; uint16_t pipe, queue; uint8_t check, r0; uint16_t r1; }
+                    cq{16, 0, 0, 0, 0, 0};
+                info[2] = (uint64_t)(uintptr_t)memory[0];
+                uint64_t compute_queue = 0;
+                CHECK(alloc((uint64_t)(uintptr_t)&cq, (uint64_t)(uintptr_t)info,
+                            (uint64_t)(uintptr_t)&compute_queue, 0, 0, 0) == 0 &&
+                          compute_queue == info[2],
+                      "Videodec2 allocate publishes the caller-owned compute queue");
+
+                struct Config {
+                    uint64_t size; uint32_t resource, codec, profile, level;
+                    int32_t width, height, dpb; uint32_t depth; uint64_t queue, affinity;
+                    int32_t priority; uint8_t optimize, check, r0, r1; uint64_t extra;
+                } config{72, 1, 7, 0, 0, 1920, 1080, 4, 2, compute_queue, 0, 0, 0, 0, 0, 0, 0};
+                uint64_t decoder_memory[9] = {72};
+                CHECK(query_decoder((uint64_t)(uintptr_t)&config,
+                                    (uint64_t)(uintptr_t)decoder_memory, 0, 0, 0, 0) == 0 &&
+                          decoder_memory[1] == (64ull << 10) && decoder_memory[7] == (64ull << 10),
+                      "Videodec2 decoder-memory query initializes all size requirements");
+                decoder_memory[2] = (uint64_t)(uintptr_t)memory[0];
+                decoder_memory[4] = (uint64_t)(uintptr_t)memory[1];
+                decoder_memory[6] = (uint64_t)(uintptr_t)memory[2];
+                uint64_t decoder = 0;
+                CHECK(create((uint64_t)(uintptr_t)&config, (uint64_t)(uintptr_t)decoder_memory,
+                             (uint64_t)(uintptr_t)&decoder, 0, 0, 0) == 0 && decoder != 0,
+                      "Videodec2 decoder create publishes an opaque handle");
+                uint64_t input[6] = {48, (uint64_t)(uintptr_t)memory[0], 16, 0, 0, 0};
+                struct { uint64_t size, data, bytes; uint8_t accepted, pad[7]; }
+                    frame{32, (uint64_t)(uintptr_t)memory[1], sizeof(memory[1]), 1, {}};
+                uint8_t output[56]{}; *(uint64_t*)output = 56;
+                CHECK(decode(decoder, (uint64_t)(uintptr_t)input, (uint64_t)(uintptr_t)&frame,
+                             (uint64_t)(uintptr_t)output, 0, 0) == 0 && !frame.accepted,
+                      "Videodec2 no-picture decode consumes an access unit deterministically");
+                alignas(8) uint8_t short_output[64];
+                std::memset(short_output, 0xA5, sizeof short_output);
+                *(uint64_t*)short_output = 48;
+                uint8_t short_before[sizeof short_output];
+                std::memcpy(short_before, short_output, sizeof short_output);
+                frame.accepted = 1;
+                CHECK(decode(decoder, (uint64_t)(uintptr_t)input, (uint64_t)(uintptr_t)&frame,
+                             (uint64_t)(uintptr_t)short_output, 0, 0) == 0x811d0101ull &&
+                          frame.accepted == 1 &&
+                          std::memcmp(short_output, short_before, sizeof short_output) == 0,
+                      "Videodec2 decode rejects the 48-byte output ABI without writing past it");
+                CHECK(flush(decoder, (uint64_t)(uintptr_t)&frame,
+                            (uint64_t)(uintptr_t)short_output, 0, 0, 0) == 0x811d0101ull &&
+                          frame.accepted == 1 &&
+                          std::memcmp(short_output, short_before, sizeof short_output) == 0,
+                      "Videodec2 flush rejects the 48-byte output ABI without writing past it");
+                CHECK(destroy(decoder, 0, 0, 0, 0, 0) == 0,
+                      "Videodec2 decoder lifecycle tears down cleanly");
+            }
+        }
+    }
+
     // libkernel registration/no-op calls: resolve + return OK (0), no crash.
     const char* noops[] = {"rNhWz+lvOMU", "pB-yGZ2nQ9o", "WhCc1w3EhSI",
                            "p5EcQeEeJAE", "bnZxYgAFeA0", "DGMG3JshrZU"};
@@ -72,6 +171,54 @@ int main() {
         HleFn fn = Hle::lookup(nid);
         CHECK(fn != nullptr, nid);
         if (fn) CHECK(fn(0, 0, 0, 0, 0, 0) == 0, nid);
+    }
+
+    // Native SDK modules ask libkernel to turn an address into the stable linked-module handle.
+    // The result lives after 32 opaque qwords at ModuleInfo+0x108, not in the leading size field.
+    {
+        UnwindModuleDesc modules[2]{};
+        modules[0].lo = 0x410000000ull; modules[0].hi = 0x420000000ull;
+        modules[1].lo = 0x5c0000000ull; modules[1].hi = 0x5d0000000ull;
+        set_unwind_modules(modules, 2);
+        HleFn fn = Hle::lookup("f7KBOafysXo");
+        CHECK(fn != nullptr, "sceKernelGetModuleInfoFromAddr registered");
+        if (fn) {
+            alignas(8) uint8_t info[0x1a8];
+            memset(info, 0xA5, sizeof info);
+            *(uint64_t*)info = sizeof info;
+            CHECK(fn(0x5c0001234ull, 2, (uint64_t)(uintptr_t)info, 0, 0, 0) == 0,
+                  "GetModuleInfoFromAddr finds an address in a linked module");
+            CHECK(*(int32_t*)(info + 0x108) == 0x10001,
+                  "GetModuleInfoFromAddr writes the load-order module handle at +0x108");
+            *(int32_t*)(info + 0x108) = (int32_t)0xDEADBEEF;
+            CHECK(fn(0x700000000ull, 2, (uint64_t)(uintptr_t)info, 0, 0, 0) == (uint64_t)-1 &&
+                  *(int32_t*)(info + 0x108) == 0,
+                  "GetModuleInfoFromAddr reports an unknown address and clears its handle");
+            CHECK(fn(0x410000000ull, 1, (uint64_t)(uintptr_t)info, 0, 0, 0) == 0x80020016ull,
+                  "GetModuleInfoFromAddr rejects an unsupported query selector");
+        }
+    }
+
+    const char* startup_zero[] = {"g0VTBxfJyu0", "Tz4RNUCBbGI", "jh+8XiK4LeE"};
+    for (const char* nid : startup_zero) {
+        HleFn fn = Hle::lookup(nid);
+        CHECK(fn != nullptr, nid);
+        if (fn) CHECK(fn(0, 0, 0, 0, 0, 0) == 0, nid);
+    }
+
+    {
+        auto init = Hle::lookup(nid_hash("scePthreadAttrInit"));
+        HleFn guard = Hle::lookup("El+cQ20DynU");
+        auto destroy = Hle::lookup(nid_hash("scePthreadAttrDestroy"));
+        CHECK(init && guard && destroy, "scePthreadAttrSetguardsize lifecycle registered");
+        if (init && guard && destroy) {
+            void* attr = nullptr;
+            CHECK(init((uint64_t)(uintptr_t)&attr, 0, 0, 0, 0, 0) == 0 && attr,
+                  "pthread attributes initialize before setting guard size");
+            CHECK(guard((uint64_t)(uintptr_t)&attr, 0x4000, 0, 0, 0, 0) == 0,
+                  "scePthreadAttrSetguardsize accepts a valid guard size");
+            destroy((uint64_t)(uintptr_t)&attr, 0, 0, 0, 0, 0);
+        }
     }
 
     // Sanitizer malloc replacement query returns a real empty table, not nullptr. Runtimes inspect
@@ -89,6 +236,57 @@ int main() {
                 for (int i = 1; i < 14; ++i) empty &= table[i] == 0;
                 CHECK(empty, "sanitizer malloc replacement callbacks default to null");
             }
+        }
+    }
+
+    // Sonic's disconnected network stack still needs valid local context IDs. NP signup is a
+    // byte-sized bool output (the live title passes an odd address), and must not clobber neighbors.
+    {
+        auto pool = Hle::lookup("dgJBaeJnGpo");
+        auto ssl = Hle::lookup("hdpVEUDFW3s");
+        auto http2 = Hle::lookup("3JCe3lCbQ8A");
+        auto web = Hle::lookup("+o9816YQhqQ");
+        auto user = Hle::lookup("sk54bi6FtYM");
+        auto result = Hle::lookup("0cBgduPRR+M");
+        auto signed_up = Hle::lookup("Oad3rvY-NJQ");
+        CHECK(pool && ssl && http2 && web && user && result && signed_up,
+              "offline network context and NP signup functions registered");
+        if (pool && ssl && http2 && web && user && result && signed_up) {
+            const char name[] = "SonicWebApi";
+            uint64_t pool_id = pool((uint64_t)(uintptr_t)name, 0x8000, 0, 0, 0, 0);
+            uint64_t ssl_id = ssl(0x64000, 0, 0, 0, 0, 0);
+            uint64_t http_id = http2(pool_id, ssl_id, 0x58000, 3, 0, 0);
+            uint64_t web_id = web(http_id, 0x10000, 0, 0, 0, 0);
+            uint64_t user_id = user(web_id, 1, 0, 0, 0, 0);
+            CHECK(pool_id > 0 && ssl_id > 0 && http_id > 0 && web_id > 0 && user_id > 0,
+                  "disconnected console initialization returns valid local context IDs");
+            int32_t error = (int32_t)0xDEADBEEF;
+            CHECK(result(1, (uint64_t)(uintptr_t)&error, 0, 0, 0, 0) == 0 && error == 0,
+                  "NetCtlGetResult writes a successful DISCONNECTED callback result");
+            uint8_t bytes[3] = {0xA5, 0xFF, 0x5A};
+            CHECK(signed_up(1, (uint64_t)(uintptr_t)&bytes[1], 0, 0, 0, 0) == 0 &&
+                      bytes[1] == 0,
+                  "sceNpHasSignedUp writes false for the offline user");
+            CHECK(bytes[0] == 0xA5 && bytes[2] == 0x5A,
+                  "sceNpHasSignedUp writes exactly one byte, preserving odd-address neighbors");
+        }
+    }
+
+    // Sonic's last two startup imports have no output parameters. Keep the required input and
+    // return contract explicit so they cannot regress to the generic success stub unnoticed.
+    {
+        auto share_param = Hle::lookup("7QZtURYnXG4");
+        auto live_init = Hle::lookup("kvYEw2lBndk");
+        CHECK(share_param && live_init,
+              "Share content-param and GameLiveStreaming initialization registered");
+        if (share_param && live_init) {
+            const char content[] = "Sonic Origins";
+            CHECK(share_param((uint64_t)(uintptr_t)content, 0, 0, 0, 0, 0) == 0,
+                  "sceShareSetContentParam accepts a valid content string");
+            CHECK(share_param(0, 0, 0, 0, 0, 0) == 0x81960002ull,
+                  "sceShareSetContentParam rejects a null string with INVALID_PARAM");
+            CHECK(live_init(0x4000, 0, 0, 0, 0, 0) == 0,
+                  "sceGameLiveStreamingInitialize accepts its heap-size argument");
         }
     }
 
@@ -294,11 +492,92 @@ int main() {
             CHECK(untouched, "failed entitlement query leaves output untouched");
         } else CHECK(false, "sceNpEntitlementAccessGetAddcontEntitlementInfo registered");
 
-        if (HleFn game_intent = Hle::lookup("m87BHxt-H60")) {
+        HleFn game_intent_init = Hle::lookup("m87BHxt-H60");
+        HleFn game_intent_term = Hle::lookup("0HBYxYAjmf0");
+        HleFn game_intent_receive = Hle::lookup("jEIXUAr9XE8");
+        HleFn game_intent_get_string = Hle::lookup("rPl0INNc-M8");
+        HleFn system_receive = Hle::lookup("656LMQSrg6U");
+        HleFn system_status = Hle::lookup("rPo6tV8D9bM");
+        CHECK(game_intent_init && game_intent_term && game_intent_receive &&
+              game_intent_get_string && system_receive && system_status,
+              "Game Intent lifecycle and system-event delivery registered");
+        if (game_intent_init && game_intent_term && game_intent_receive &&
+            game_intent_get_string && system_receive && system_status) {
             uint64_t init[5] = {0x28, 0, 0, 0, 0};
-            CHECK(game_intent((uint64_t)(uintptr_t)init, 0, 0, 0, 0, 0) == 0,
+            alignas(8) uint8_t info[16712];
+            set_game_intent_activity(nullptr);
+            CHECK(game_intent_init((uint64_t)(uintptr_t)init, 0, 0, 0, 0, 0) == 0,
                   "sceNpGameIntentInitialize accepts the 0x28-byte inert init struct");
-        } else CHECK(false, "sceNpGameIntentInitialize registered");
+            memset(info, 0xAB, sizeof(info));
+            *(uint64_t*)info = 16704;
+            CHECK(game_intent_receive((uint64_t)(uintptr_t)info, 0, 0, 0, 0, 0) ==
+                      0x80553806ull,
+                  "Game Intent without a host activity reports INTENT_NOT_FOUND");
+            CHECK(*(uint64_t*)info == 16704 && *(int32_t*)(info + 8) == -1,
+                  "no-intent receive preserves size and writes invalid user id");
+            bool type_empty = true;
+            for (size_t i = 12; i < 45; ++i) type_empty &= info[i] == 0;
+            bool reserved_untouched = true;
+            for (size_t i = 45; i < 308; ++i) reserved_untouched &= info[i] == 0xAB;
+            bool data_empty = true;
+            for (size_t i = 308; i < 16700; ++i) data_empty &= info[i] == 0;
+            bool tail_untouched = true;
+            for (size_t i = 16700; i < sizeof(info); ++i) tail_untouched &= info[i] == 0xAB;
+            CHECK(type_empty && reserved_untouched && data_empty && tail_untouched,
+                  "no-intent receive writes only the documented user/type/data fields");
+            char value[40]; memset(value, 0xAB, sizeof(value));
+            CHECK(game_intent_get_string((uint64_t)(uintptr_t)(info + 308),
+                                         (uint64_t)(uintptr_t)"activityId",
+                                         (uint64_t)(uintptr_t)value, sizeof(value), 0, 0) ==
+                      0x80553807ull && value[0] == 0,
+                  "no-intent property lookup reports VALUE_NOT_FOUND with an empty output");
+            CHECK(system_receive((uint64_t)(uintptr_t)info, 0, 0, 0, 0, 0) == 0x80A10004ull,
+                  "no host activity leaves the system event stream idle");
+            CHECK(game_intent_term(0, 0, 0, 0, 0, 0) == 0,
+                  "sceNpGameIntentTerminate succeeds");
+
+            set_game_intent_activity("TITLE_SONIC_1_CLASSIC");
+            CHECK(game_intent_init((uint64_t)(uintptr_t)init, 0, 0, 0, 0, 0) == 0,
+                  "Game Intent reinitializes for a host-selected activity");
+            uint8_t system_status_bytes[12]; memset(system_status_bytes, 0xAB, sizeof(system_status_bytes));
+            CHECK(system_status((uint64_t)(uintptr_t)system_status_bytes, 0, 0, 0, 0, 0) == 0 &&
+                  *(int32_t*)system_status_bytes == 1,
+                  "System Service status advertises one pending GAME_INTENT event");
+            uint8_t system_event[8196]; memset(system_event, 0xAB, sizeof(system_event));
+            CHECK(system_receive((uint64_t)(uintptr_t)system_event, 0, 0, 0, 0, 0) == 0 &&
+                  *(uint32_t*)system_event == 0x10000017u,
+                  "host activity produces one GAME_INTENT system event");
+            CHECK(system_event[4] == 0xAB && system_event[sizeof(system_event) - 1] == 0xAB,
+                  "GAME_INTENT delivery writes only the event type");
+            CHECK(system_receive((uint64_t)(uintptr_t)system_event, 0, 0, 0, 0, 0) == 0x80A10004ull,
+                  "GAME_INTENT system event is one-shot");
+            CHECK(system_status((uint64_t)(uintptr_t)system_status_bytes, 0, 0, 0, 0, 0) == 0 &&
+                  *(int32_t*)system_status_bytes == 0,
+                  "System Service status clears event_num after GAME_INTENT delivery");
+
+            memset(info, 0xAB, sizeof(info));
+            *(uint64_t*)info = 16704;
+            CHECK(game_intent_receive((uint64_t)(uintptr_t)info, 0, 0, 0, 0, 0) == 0 &&
+                  *(int32_t*)(info + 8) == 1 &&
+                  strcmp((char*)info + 12, "launchActivity") == 0,
+                  "selected activity receives as a launchActivity for initial user 1");
+            memset(value, 0xAB, sizeof(value));
+            CHECK(game_intent_get_string((uint64_t)(uintptr_t)(info + 308),
+                                         (uint64_t)(uintptr_t)"activityId",
+                                         (uint64_t)(uintptr_t)value, sizeof(value), 0, 0) == 0 &&
+                  strcmp(value, "TITLE_SONIC_1_CLASSIC") == 0,
+                  "activityId property returns the exact host-selected activity");
+            char unknown_key[sizeof("activityId")] = "otherKey";
+            memset(value, 0xAB, sizeof(value));
+            CHECK(game_intent_get_string((uint64_t)(uintptr_t)(info + 308),
+                                         (uint64_t)(uintptr_t)unknown_key,
+                                         (uint64_t)(uintptr_t)value, sizeof(value), 0, 0) ==
+                      0x80553807ull && value[0] == 0,
+                  "unknown Game Intent property reports VALUE_NOT_FOUND");
+            CHECK(game_intent_term(0, 0, 0, 0, 0, 0) == 0,
+                  "Game Intent terminates after activity delivery");
+            set_game_intent_activity(nullptr);
+        }
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
