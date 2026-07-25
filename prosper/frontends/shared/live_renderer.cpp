@@ -2462,6 +2462,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     }
                     bd.vs_identity = refvs ? 0 : it.vs_identity;
                     bd.fs_identity = fs_ov ? 0 : it.fs_identity;
+                    bd.draw_index = it.draw_index;
                     bd.vcount = refvs ? 3u : it.vertex_count;
                     bd.instance_count = it.instance_count;
                     bd.vertex_offset = refvs ? 0 : it.vertex_offset;

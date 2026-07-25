@@ -339,13 +339,13 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                           d.vertex_count > d.raw_draw_count + 1 ? " [INFLATED]"
                           : d.vertex_count < d.raw_draw_count   ? " [DIVERGENT]" : "");
         }
-        std::printf("draw[%zu] source=%llu target=%016llx extent=%ux%u fmt=%u cwm=%x "
+        std::printf("draw[%llu] item=%zu target=%016llx extent=%ux%u fmt=%u cwm=%x "
                     "target1=%016llx extent1=%ux%u fmt1=%u cwm1=%x vcount=%u indices=%zu voffset=%d modifier=%016llx topo=%u%s "
                     "depth=%d/%d/%u stencil=%d blend=%d raster=%u/%u/%u bias=%u/%g/%g/%g "
                     "viewport=%d %.1f,%.1f %.1fx%.1f "
                     "scissor=%d [%d,%d)-[%d,%d) export=%08x downconvert=%08x "
                     "vs=%zu/%016llx fs=%zu/%016llx\n",
-                    i, static_cast<unsigned long long>(d.draw_index),
+                    static_cast<unsigned long long>(d.draw_index), i,
                     static_cast<unsigned long long>(d.color0_base), d.color0_width, d.color0_height,
                     d.ps.color0_format, d.ps.color_write_mask,
                     static_cast<unsigned long long>(d.color1_base), d.color1_width, d.color1_height,
@@ -539,7 +539,8 @@ bool validate_frame(const prosper::gpu::GpuReplayFrame& replay) {
         for (const auto& s : stages) {
             auto report = prosper::gpu::validate_spirv_descriptor_interface(
                 *s.spirv, s.table, s.set, s.stage, true);
-            std::printf("draw[%zu] %s descriptors=%zu runtime=%zu result=%s\n", i, s.name,
+            std::printf("draw[%llu] item=%zu %s descriptors=%zu runtime=%zu result=%s\n",
+                        static_cast<unsigned long long>(d.draw_index), i, s.name,
                         report.descriptors.size(), s.table ? s.table->resources.size() : 0,
                         report.ok() ? "accept" : "reject");
             for (const auto& binding : report.descriptors)
@@ -1380,48 +1381,72 @@ int main(int argc, char** argv) {
     // and swap it in here; render_runner then binds a TF buffer around that draw and reports where its
     // post-transform vertices land. Requires a v19+ capsule that retained the raw VS stream.
     if (const char* g = std::getenv("PROSPER_GEOM_PROBE")) {
-        const long n = std::strtol(g, nullptr, 10);
-        if (n >= 0 && static_cast<size_t>(n) < replay.items.size()) {
-            auto& it = replay.items[static_cast<size_t>(n)];
+        char* end = nullptr;
+        const unsigned long long n = std::strtoull(g, &end, 0);
+        const size_t item_index = g[0] != '-' && end != g && end && !*end
+            ? prosper::tools::replay_item_index_for_draw(replay, n) : SIZE_MAX;
+        if (item_index != SIZE_MAX) {
+            auto& it = replay.items[item_index];
+            const size_t operation_index =
+                prosper::tools::replay_operation_index_for_draw(replay, n);
+            const long long operation_label = operation_index == SIZE_MAX
+                ? -1 : static_cast<long long>(operation_index);
             if (it.vs_raw_shader_index < replay.raw_shader_versions.size()) {
                 const auto& raw = replay.raw_shader_versions[it.vs_raw_shader_index];
                 auto xfb = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
                                                           it.vrt.get(), nullptr, true);
                 if (!xfb.empty()) {
                     it.vs = std::move(xfb); it.vs_shared.reset(); it.vs_identity = 0;
-                    std::fprintf(stderr, "[geom-probe] draw %ld VS re-recompiled with xfb capture (%zu words)\n",
-                                 n, it.vs.size());
+                    std::fprintf(stderr,
+                                 "[geom-probe] draw=%llu item=%zu operation=%lld VS re-recompiled "
+                                 "with xfb capture (%zu words)\n",
+                                 n, item_index, operation_label, it.vs.size());
                 } else {
-                    std::fprintf(stderr, "[geom-probe] draw %ld: xfb re-recompile produced no VS "
+                    std::fprintf(stderr, "[geom-probe] draw %llu: xfb re-recompile produced no VS "
                                          "(no raw stream / unsupported)\n", n);
                 }
             } else {
-                std::fprintf(stderr, "[geom-probe] draw %ld: no captured raw VS stream (capsule predates v19)\n", n);
+                std::fprintf(stderr, "[geom-probe] draw %llu: no captured raw VS stream "
+                                     "(capsule predates v19)\n", n);
             }
+        } else {
+            std::fprintf(stderr, "[geom-probe] invalid or unrealized semantic draw selector '%s'\n", g);
         }
     }
     // Fragment I/O tap (PROSPER_FS_TAP=draw:pc): re-recompile draw N's raw FS (recompile_fragment reads the
     // pc after the ':' and redirects its MRT0 colour export to the intermediate value at that PC) and swap it
     // in, so that draw's rendered pixels visualise the tapped value. Requires a v19+ capsule with the raw FS.
     if (const char* f = std::getenv("PROSPER_FS_TAP")) {
-        const long n = std::strtol(f, nullptr, 10);   // draw index (text before the ':')
-        if (n >= 0 && static_cast<size_t>(n) < replay.items.size()) {
-            auto& it = replay.items[static_cast<size_t>(n)];
+        char* end = nullptr;
+        const unsigned long long n = std::strtoull(f, &end, 0);
+        const size_t item_index = f[0] != '-' && end != f && end && *end == ':'
+            ? prosper::tools::replay_item_index_for_draw(replay, n) : SIZE_MAX;
+        if (item_index != SIZE_MAX) {
+            auto& it = replay.items[item_index];
+            const size_t operation_index =
+                prosper::tools::replay_operation_index_for_draw(replay, n);
+            const long long operation_label = operation_index == SIZE_MAX
+                ? -1 : static_cast<long long>(operation_index);
             if (it.fs_raw_shader_index < replay.raw_shader_versions.size()) {
                 const auto& raw = replay.raw_shader_versions[it.fs_raw_shader_index];
                 auto fs = prosper::gpu::recompile_fragment(raw.words.data(), raw.words.size(),
                                                            it.prt.get(), nullptr, UINT32_MAX, nullptr);
                 if (!fs.empty()) {
                     it.fs = std::move(fs); it.fs_shared.reset(); it.fs_identity = 0;
-                    std::fprintf(stderr, "[fs-tap] draw %ld FS re-recompiled with colour tap (%zu words)\n",
-                                 n, it.fs.size());
+                    std::fprintf(stderr,
+                                 "[fs-tap] draw=%llu item=%zu operation=%lld FS re-recompiled "
+                                 "with colour tap (%zu words)\n",
+                                 n, item_index, operation_label, it.fs.size());
                 } else {
-                    std::fprintf(stderr, "[fs-tap] draw %ld: FS re-recompile produced no output "
+                    std::fprintf(stderr, "[fs-tap] draw %llu: FS re-recompile produced no output "
                                          "(no raw stream / unsupported)\n", n);
                 }
             } else {
-                std::fprintf(stderr, "[fs-tap] draw %ld: no captured raw FS stream (capsule predates v19)\n", n);
+                std::fprintf(stderr, "[fs-tap] draw %llu: no captured raw FS stream "
+                                     "(capsule predates v19)\n", n);
             }
+        } else {
+            std::fprintf(stderr, "[fs-tap] invalid or unrealized semantic draw selector '%s'\n", f);
         }
     }
     prosper::gpu::GpuCaptureFile prepend_capture;
@@ -1523,9 +1548,13 @@ int main(int argc, char** argv) {
     if (!dump_spec.empty()) {
         size_t c1 = dump_spec.find(':'), c2 = c1 == std::string::npos ? c1 : dump_spec.find(':', c1 + 1);
         if (c1 == std::string::npos || c2 == std::string::npos) { usage(argv[0]); return 2; }
-        int di = std::atoi(dump_spec.c_str()); std::string stage = dump_spec.substr(c1 + 1, c2 - c1 - 1);
+        char* draw_end = nullptr;
+        const unsigned long long draw_index = std::strtoull(dump_spec.c_str(), &draw_end, 0);
+        const size_t di = dump_spec[0] != '-' && draw_end == dump_spec.c_str() + c1
+            ? prosper::tools::replay_item_index_for_draw(replay, draw_index) : SIZE_MAX;
+        std::string stage = dump_spec.substr(c1 + 1, c2 - c1 - 1);
         int binding = std::atoi(dump_spec.c_str() + c2 + 1);
-        if (di < 0 || static_cast<size_t>(di) >= replay.items.size() || (stage != "vs" && stage != "ps")) {
+        if (di == SIZE_MAX || (stage != "vs" && stage != "ps")) {
             std::fprintf(stderr, "gpu_replay: invalid resource selector %s\n", dump_spec.c_str()); return 2;
         }
         const auto* table = stage == "vs" ? replay.items[di].vrt.get() : replay.items[di].prt.get();
@@ -1545,9 +1574,14 @@ int main(int argc, char** argv) {
     }
     if (!shader_spec.empty()) {
         size_t colon = shader_spec.find(':');
-        int di = std::atoi(shader_spec.c_str()); std::string stage =
+        char* draw_end = nullptr;
+        const unsigned long long draw_index = std::strtoull(shader_spec.c_str(), &draw_end, 0);
+        const size_t di = colon != std::string::npos && shader_spec[0] != '-' &&
+                                  draw_end == shader_spec.c_str() + colon
+            ? prosper::tools::replay_item_index_for_draw(replay, draw_index) : SIZE_MAX;
+        std::string stage =
             colon == std::string::npos ? std::string{} : shader_spec.substr(colon + 1);
-        if (colon == std::string::npos || di < 0 || static_cast<size_t>(di) >= replay.items.size() ||
+        if (colon == std::string::npos || di == SIZE_MAX ||
             (stage != "vs" && stage != "fs")) {
             std::fprintf(stderr, "gpu_replay: invalid shader selector %s\n", shader_spec.c_str()); return 2;
         }
@@ -1677,14 +1711,22 @@ int main(int argc, char** argv) {
     }
     size_t selected_operation_limit = SIZE_MAX;
     if (draw_first >= 0) {
-        if (draw_last < draw_first || static_cast<size_t>(draw_last) >= replay.items.size()) {
+        if (draw_last < draw_first) {
             std::fprintf(stderr, "gpu_replay: draw range %d:%d is out of range\n", draw_first, draw_last); return 2;
         }
         std::vector<prosper::gpu::DrawItem> selected;
         std::unordered_set<uint64_t> selected_draw_indexes;
-        for (int i = draw_first; i <= draw_last; ++i) {
-            selected_draw_indexes.insert(replay.items[i].draw_index);
-            selected.push_back(std::move(replay.items[i]));
+        for (auto& item : replay.items) {
+            if (item.draw_index < static_cast<uint64_t>(draw_first) ||
+                item.draw_index > static_cast<uint64_t>(draw_last))
+                continue;
+            selected_draw_indexes.insert(item.draw_index);
+            selected.push_back(std::move(item));
+        }
+        if (selected.empty()) {
+            std::fprintf(stderr, "gpu_replay: semantic draw range %d:%d has no realized items\n",
+                         draw_first, draw_last);
+            return 2;
         }
         if (draw_with_compute_prefix) {
             for (size_t operation_index = 0; operation_index < replay.operations.size();
@@ -1700,8 +1742,9 @@ int main(int argc, char** argv) {
             }
         }
         replay.items = std::move(selected); allow_mismatch = true;
-        std::fprintf(stderr, "[gpureplay] selected original draws %d:%d%s\n", draw_first,
-                     draw_last, draw_with_compute_prefix ? " with compute prefix" : "");
+        std::fprintf(stderr, "[gpureplay] selected semantic draws %d:%d (%zu realized)%s\n",
+                     draw_first, draw_last, replay.items.size(),
+                     draw_with_compute_prefix ? " with compute prefix" : "");
     }
     if (through_operation >= 0) {
         if (static_cast<size_t>(through_operation) >= replay.operations.size()) {

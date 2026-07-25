@@ -30,20 +30,36 @@ int main() {
         {22, true, {0x22222222u, 0xbf810000u}},
     };
     gpu::DrawItem draw;
+    draw.draw_index = 7;
     draw.vs_raw_shader_index = 1;
     draw.fs_raw_shader_index = 0;
     replay.items.push_back(draw);
 
+    gpu::DrawItem later = draw;
+    later.draw_index = 11;
+    later.vs_raw_shader_index = 0;
+    later.fs_raw_shader_index = 1;
+    replay.items.push_back(later);
+    replay.operations = {
+        {gpu::SubmitOperationKind::Draw, 7, 100, true},
+        {gpu::SubmitOperationKind::Dispatch, 3, 101, true},
+        {gpu::SubmitOperationKind::Draw, 11, 102, true},
+    };
+
     std::string error;
-    const auto* vs = tools::select_realized_raw_shader(replay, "0:vs", error);
-    const auto* fs = tools::select_realized_raw_shader(replay, "0:fs", error);
+    const auto* vs = tools::select_realized_raw_shader(replay, "7:vs", error);
+    const auto* fs = tools::select_realized_raw_shader(replay, "7:fs", error);
     CHECK(vs == &replay.raw_shader_versions[1] && fs == &replay.raw_shader_versions[0],
-          "selector resolves the realized draw's exact raw stage identities");
+          "selector resolves a semantic draw ID instead of a compact item offset");
+    CHECK(tools::replay_item_index_for_draw(replay, 11) == 1 &&
+              tools::replay_operation_index_for_draw(replay, 11) == 2 &&
+              tools::replay_item_index_for_draw(replay, 1) == SIZE_MAX,
+          "draw IDs map across compact-item holes and mixed operation indices");
     CHECK(!tools::select_realized_raw_shader(replay, "2:vs", error) &&
-              error.find("invalid realized-shader selector") != std::string::npos,
-          "out-of-range realized draw reports a selector error");
+              error.find("realized draw 2 not found") != std::string::npos,
+          "missing semantic draw reports a selector error");
     replay.items[0].fs_raw_shader_index = 0xFFFFFFFFu;
-    CHECK(!tools::select_realized_raw_shader(replay, "0:fs", error) &&
+    CHECK(!tools::select_realized_raw_shader(replay, "7:fs", error) &&
               error.find("capture predates v19 or source was unreadable") != std::string::npos,
           "missing legacy raw source is explicit instead of selecting unrelated bytes");
 

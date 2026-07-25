@@ -211,6 +211,9 @@ struct BackendDraw {
     std::vector<uint32_t> vs, gs, fs;
     prosper::gpu::SharedShaderWords vs_shared, fs_shared;
     uint64_t vs_identity = 0, fs_identity = 0;
+    // Stable semantic draw ID from DrawItem::draw_index. Diagnostics must not use this backend
+    // vector's pass-local offset: target/compute splitting can make that offset differ per pass.
+    uint64_t draw_index = UINT64_MAX;
     const prosper::gpu::ResolvedPipelineState* ps = nullptr;   // null -> triangle-list, write RGBA, no depth
     std::vector<FrameResource> R;                              // set-tagged resources (empty -> no descriptors)
     uint32_t vcount = 3;
@@ -4401,7 +4404,22 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // the same env var in gpu_executor). Only active with the env var, TF support, AND a flush here.
     const char* geom_env = getenv("PROSPER_GEOM_PROBE");
     const long geom_target = geom_env ? strtol(geom_env, nullptr, 10) : -1;
-    const bool geom_probe = geom_target >= 0 && static_cast<size_t>(geom_target) < dv.size()
+    size_t geom_item = SIZE_MAX;
+    if (geom_target >= 0) {
+        for (size_t i = 0; i < draws.size(); ++i)
+            if (draws[i].draw_index == static_cast<uint64_t>(geom_target)) {
+                geom_item = i;
+                break;
+            }
+        // Direct backend tests and the single-draw wrapper have no semantic DrawItem. Preserve their
+        // positional diagnostic behavior only when the caller supplied no semantic IDs at all.
+        if (geom_item == SIZE_MAX &&
+            std::none_of(draws.begin(), draws.end(), [](const BackendDraw& draw) {
+                return draw.draw_index != UINT64_MAX;
+            }) && static_cast<size_t>(geom_target) < draws.size())
+            geom_item = static_cast<size_t>(geom_target);
+    }
+    const bool geom_probe = geom_item != SIZE_MAX
                             && ds_ctx.transform_feedback_enabled
                             && (!submission_batch || readback_requested || flush_submission_batch);
     static auto p_bindxfb  = reinterpret_cast<PFN_vkCmdBindTransformFeedbackBuffersEXT>(
@@ -4413,8 +4431,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     VkBuffer geom_buf = VK_NULL_HANDLE; VkDeviceMemory geom_mem = VK_NULL_HANDLE;
     VkBuffer geom_counter = VK_NULL_HANDLE; VkDeviceMemory geom_counter_mem = VK_NULL_HANDLE;
     uint32_t geom_cap = 0;   // buffer capacity in vertices; the counter buffer gives the exact count written
-    if (geom_probe && p_bindxfb && p_beginxfb && p_endxfb && dv[geom_target].ok) {
-        const auto& tv = dv[geom_target];
+    if (geom_probe && p_bindxfb && p_beginxfb && p_endxfb && dv[geom_item].ok) {
+        const auto& tv = dv[geom_item];
         const uint64_t per_inst = tv.icount ? tv.icount : tv.vcount;
         // Transform feedback records DECOMPOSED primitives: a triangle strip/fan of N verts emits up to
         // ~3*(N-2) individual vertices. Over-size by 3x so no records are dropped; the counter buffer
@@ -4469,7 +4487,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
         vkCmdSetScissor(cmd, 0, 1, &v.scissor);
         if (v.use_desc) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
-        const bool geom_here = geom_active && static_cast<long>(di) == geom_target;
+        const bool geom_here = geom_active && di == geom_item;
         if (geom_here) {
             VkDeviceSize off = 0, sz = static_cast<VkDeviceSize>(geom_cap) * 16;
             p_bindxfb(cmd, 0, 1, &geom_buf, &off, &sz);
@@ -4702,9 +4720,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     (samp  >  0) ? "passed-samples(colour/stencil written)" :
                     (fs    >  0) ? "TEST-KILLED(depth/stencil rejected all)" :
                                    "NO-RASTER(cull/scissor/zero-area)";
+                const uint64_t draw_index = draws[i].draw_index != UINT64_MAX
+                    ? draws[i].draw_index : i;
                 fprintf(stderr,
-                        "[draw-stats] draw=%u verts=%llu prims=%llu after_clip=%llu fs_inv=%llu samples=%llu %s\n",
-                        i, (unsigned long long)verts, (unsigned long long)prims,
+                        "[draw-stats] draw=%llu verts=%llu prims=%llu after_clip=%llu fs_inv=%llu samples=%llu %s\n",
+                        (unsigned long long)draw_index,
+                        (unsigned long long)verts, (unsigned long long)prims,
                         (unsigned long long)clip, (unsigned long long)fs, (unsigned long long)samp, tag);
             }
         }
