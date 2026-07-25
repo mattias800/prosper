@@ -439,9 +439,12 @@ RenderState extract_render_state(const GpuState& st) {
         // rectangle is empty — Blue Prince resolves 699 of ~2,400 Day One draws to [0,0)x[0,0).
         if (right <= left || bottom <= top) {
             static const bool scissor_log = getenv("PROSPER_SCISSORLOG") != nullptr;
-            static int logged = 0;
-            if (scissor_log && logged < 24) {
-                ++logged;
+            // Atomic like the #1335 recovery log above: extract_render_state runs from
+            // DrawRealizationPool workers, so a plain int here was a formal data race (#1345).
+            static std::atomic<int> logged{0};
+            if (scissor_log && logged.fetch_add(1) < 24) {
+                // screen= is the EFFECTIVE pair — the #1335 degenerate-pair recovery above may
+                // have substituted the full default; the recovery's own log prints the raw pair.
                 fprintf(stderr,
                         "[scissor] EMPTY combined=[%d,%d)-[%d,%d) screen=%08x/%08x window=%08x/%08x "
                         "generic=%08x/%08x vport=%08x/%08x offset=%08x mode=%08x\n",
