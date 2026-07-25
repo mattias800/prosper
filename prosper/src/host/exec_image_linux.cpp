@@ -2182,13 +2182,30 @@ namespace {
             // pthread stack, so non-guest words are filtered out).
             {
                 char lb[160]; int ln;
+#ifndef __APPLE__
+                // The fault can occur before a pointer-dump mode has initialized the pipe-based probe,
+                // and worker frames may live on either a host pthread stack or a guest mapping.
+                // process_vm_readv is EFAULT-safe across both kinds of mapping; use it here so the most
+                // important word -- the return address above a real-PRX call -- is not silently lost.
+                auto safe_qword = [](uint64_t addr, uint64_t* value) -> bool {
+                    struct iovec local = { value, sizeof *value };
+                    struct iovec remote = { (void*)(uintptr_t)addr, sizeof *value };
+                    return syscall(SYS_process_vm_readv, getpid(), &local, 1UL, &remote, 1UL, 0UL) ==
+                           (ssize_t)sizeof *value;
+                };
+#else
+                auto safe_qword = [](uint64_t addr, uint64_t* value) -> bool {
+                    if (!probe_readable(addr)) return false;
+                    *value = *(const uint64_t*)(uintptr_t)addr;
+                    return true;
+                };
+#endif
                 ln = snprintf(lb, sizeof lb, "[prosper]   guest fp-chain (rbp=0x%llx):\n", (unsigned long long)g_rbp);
                 if (ln > 0) raw_write(2, lb, (size_t)ln);
                 uint64_t fp = g_rbp;
                 for (int depth = 0; depth < 16; depth++) {
-                    if (!probe_readable(fp) || !probe_readable(fp + 8)) break;
-                    uint64_t ra  = *(const uint64_t*)(uintptr_t)(fp + 8);
-                    uint64_t nfp = *(const uint64_t*)(uintptr_t)fp;
+                    uint64_t ra = 0, nfp = 0;
+                    if (!safe_qword(fp, &nfp) || !safe_qword(fp + 8, &ra)) break;
                     if (g_base && ra >= g_base && ra < g_base + 0x100000000ull)
                         ln = snprintf(lb, sizeof lb, "[prosper]     #%d ra=0x%llx (eboot+0x%llx)\n",
                                       depth, (unsigned long long)ra, (unsigned long long)(ra - g_base));
@@ -2203,8 +2220,8 @@ namespace {
                 if (ln > 0) raw_write(2, lb, (size_t)ln);
                 for (int i = 0, shown = 0; i < 64 && shown < 16; i++) {
                     uint64_t sa = g_rsp + (uint64_t)i * 8;
-                    if (!probe_readable(sa)) continue;
-                    uint64_t q = *(const uint64_t*)(uintptr_t)sa;
+                    uint64_t q = 0;
+                    if (!safe_qword(sa, &q)) continue;
                     if (g_base && q >= g_base && q < g_base + 0x100000000ull) {
                         ln = snprintf(lb, sizeof lb, "[prosper]     rsp+0x%03x = 0x%llx (eboot+0x%llx)\n",
                                       i * 8, (unsigned long long)q, (unsigned long long)(q - g_base));
