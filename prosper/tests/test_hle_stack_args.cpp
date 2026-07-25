@@ -29,6 +29,9 @@ uint64_t prosper_test_hle_entry_rsp = 0;
 }
 uint64_t g_immediate_return = 0;
 uint64_t g_guest_return = 0;
+bool g_handler_finished = false;
+bool g_hook_saw_finished_handler = false;
+uint32_t g_return_hook_calls = 0;
 
 extern "C" uint64_t prosper_test_hle10_handler(
     uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
@@ -37,7 +40,13 @@ extern "C" uint64_t prosper_test_hle10_handler(
     for (int i = 0; i < 10; ++i) g_seen[i] = args[i];
     g_immediate_return = *(const uint64_t*)(uintptr_t)prosper_test_hle_entry_rsp;
     g_guest_return = hle_guest_return_address(prosper_test_hle_entry_rsp);
+    g_handler_finished = true;
     return kReturn;
+}
+
+extern "C" void prosper_test_hle_return_hook() {
+    g_hook_saw_finished_handler = g_handler_finished;
+    ++g_return_hook_calls;
 }
 
 extern "C" void prosper_test_hle10_entry();
@@ -106,7 +115,7 @@ int main(int argc, char** argv) {
     constexpr const char* kNid = "test.hle.stack.args";
     register_builtin_hle();
     Hle::register_fn(kNid, reinterpret_cast<HleFn>(&prosper_test_hle10_entry),
-                     "prosper_test_hle10_entry");
+                     "prosper_test_hle10_entry", &prosper_test_hle_return_hook);
     // Keep an unresolved import immediately before the implemented one. The largest Linux guest-FS
     // variant is the unresolved stub; it must fit its fixed 96-byte slot without corrupting its
     // neighbour.
@@ -163,23 +172,10 @@ after_hle_call:
     CHECK(!guest_fs || guest_fs_active, "activated a guest FS base for the call");
     CHECK(result == kReturn, "return value crossed the import ABI bridge");
     CHECK(prosper_test_hle_entry_rsp_mod16 == 8, "host handler entered with RSP%16 == 8");
-    const bool called_bridge =
-#if defined(_WIN32)
-        true;
-#elif defined(__linux__)
-        guest_fs;
-#else
-        false;
-#endif
-    const uint64_t stub_begin = stub_addr(1);
-    const uint64_t stub_end = stub_begin + 96;
-    if (called_bridge) {
-        CHECK(g_immediate_return >= stub_begin && g_immediate_return < stub_end,
-              "bridge handler's immediate return points into its generated stub");
-    } else {
-        CHECK(g_immediate_return == g_guest_return,
-              "tail-jump handler uses its immediate return as the guest callsite");
-    }
+    CHECK(g_immediate_return != g_guest_return,
+          "return-hook handler returns into a trampoline, not directly to guest code");
+    CHECK(g_return_hook_calls == 1 && g_hook_saw_finished_handler,
+          "return hook runs exactly once after the HLE handler has returned");
     const uint64_t callsite_lo = callsite_begin < callsite_end ? callsite_begin : callsite_end;
     const uint64_t callsite_hi = callsite_begin < callsite_end ? callsite_end : callsite_begin;
     CHECK(g_guest_return >= callsite_lo && g_guest_return <= callsite_hi,

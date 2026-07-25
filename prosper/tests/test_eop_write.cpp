@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <cstdlib>   // setenv/_putenv_s: arm the #1226-retired suppression guards for this test
 #include <cstring>
+#include <chrono>
+#include <thread>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -94,6 +96,12 @@ int main() {
               "renderer drain applies an unrelated resource upload inside the submit");
         CHECK(label == 0xaaaaaaaa55555555ull,
               "renderer drain keeps an overlapping label init and fence private");
+        // Model an arbitrarily descheduled submit handler after all HLE work is complete but before
+        // its generated import trampoline reaches the return checkpoint. This exceeds the old 1 ms
+        // grace timer and proves elapsed time cannot publish a label while the scope is still active.
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        CHECK(label == 0xaaaaaaaa55555555ull && prosper_gpu_submit_scope_active(),
+              "completion stays private across a stalled pre-return checkpoint");
         prosper_gpu_submit_scope_end();
         prosper_gpu_drain_completion_writes();
         CHECK(label == 0xfedcba9876543210ull,

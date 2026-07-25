@@ -442,11 +442,6 @@ struct SpirvCompute {
     uint32_t logical_not(uint32_t value) {
         uint32_t result = id(); put(code, Op_LogicalNot, {t_bool, result, value}); return result;
     }
-    uint32_t subgroup_any(uint32_t value) {
-        uint32_t result = id();
-        put(code, Op_GroupNonUniformAny, {t_bool, result, uconst(Scope_Subgroup), value});
-        return result;
-    }
     uint32_t subgroup_local_id() {
         if (!declared_subgroup) {
             put(caps, Op_Capability, {Cap_GroupNonUniform});
@@ -3083,9 +3078,9 @@ struct ForwardIf {
 };
 // allow_vcc: also accept a forward s_cbranch_vccz/vccnz. Only the per-invocation VS/FS shells set this —
 // there each SPIR-V invocation IS one lane, so branching on this lane's VCC bit (rs.vcc) is exactly the
-// per-vertex / per-pixel divergent-if the hardware runs. The 64-lane COMPUTE shell must NOT (its VCC is a
-// wave mask needing a subgroup-wide reduction. compute_wave_branches enables that reduction and keeps
-// the branch uniform across the emulated wave; test_recompile_coverage guards the distinction.
+// per-vertex / per-pixel divergent-if the hardware runs. The COMPUTE shell instead routes accepted
+// VCC/EXEC branches through the CFG dispatcher, whose workgroup scratch reduction spans the configured
+// 32/64-lane guest wave independently of the implementation-defined host subgroup width.
 // code/dwords: the raw stream, so a branch target past the first s_endpgm can be decoded and
 // verified to be a genuine early-out (see below) instead of blanket-clamped.
 ForwardIf detect_forward_if(const std::vector<Rdna2Inst>& ins, bool allow_vcc,
@@ -3192,9 +3187,8 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                 if (loop_exit(in.pc)) continue;                      // canonical loop condition: loop emitter owns it
                 if (!allow_vcc) {
                     // Compute VCC is a per-lane bool in the SPIR-V shell. The scalar branch consumes
-                    // the architectural whole-wave VCCZ/VCCNZ flag, so lower it with subgroupAny
-                    // during emission. This remains a subgroup-uniform branch even when the compare
-                    // is lane-varying (DOLL's post-process table choice after its nested loops).
+                    // the architectural whole-wave VCCZ/VCCNZ flag. Accept it for the exact guest-wave
+                    // CFG dispatcher; emit_body must never lower it through a native subgroup vote.
                     if (!compute_wave_branches) return reject();
                     compute_uniform_vcc = true;
                 }
@@ -5500,7 +5494,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // CONSTANT/structured buffer (a PS's per-lane table fetch, #273) keeps the faithful
                     // VADDR*stride+offset address below.
                     res = rt->by_fetch_pc(in.pc);
-                    folded_vfetch = res && res->cls == ResourceClass::VertexBuffer;
+                    // A pc-keyed entry is not itself proof that OFFSET/SOFFSET was folded into the
+                    // bound base. Shader mode deliberately binds DynFetch::unshifted_desc and must
+                    // retain both VADDR terms (idxen+offen), OFFSET and SOFFSET exactly as encoded.
+                    folded_vfetch = res && res->cls == ResourceClass::VertexBuffer &&
+                                      res->fetch_index_mode != VertexFetchIndexMode::Shader;
                     // The NGG fetch-prologue shortcut applies only to an untouched ABI element index. It
                     // must NOT apply after the shader has selected or computed VADDR. DOLL lays out packed
                     // attributes as two/three descriptor records per vertex and computes
@@ -8105,12 +8103,29 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // contain several nested forward EXEC/SCC early-outs but no back-edge. Requiring a back-edge
         // left those valid CFGs in the straight-line path, where their first branch rejected.
         const bool complex_compute_cfg = cfg_dispatch_safe && cfg_branches > 2;
+        const bool exact_compute_wave_cfg = b.is_compute &&
+            std::any_of(Fs.begin(), Fs.end(), [](const ForwardIf& branch) {
+                return branch.on_exec || branch.on_vcc;
+            });
         if (b.is_compute && cfg_branches && getenv("PROSPER_DBG"))
             std::fprintf(stderr,
                          "[compute-cfg] branches=%zu backedge=%d dispatch_safe=%d complex=%d "
-                         "structured_ifs=%zu loops=%zu cf_rejected=%d local=%u wave=%u\n",
+                         "structured_ifs=%zu loops=%zu cf_rejected=%d exact_wave=%d local=%u wave=%u\n",
                          cfg_branches, cfg_has_backedge, cfg_dispatch_safe, complex_compute_cfg,
-                         Fs.size(), Ls.size(), cf_rejected, b.local_count, b.wave_size);
+                         Fs.size(), Ls.size(), cf_rejected, exact_compute_wave_cfg,
+                         b.local_count, b.wave_size);
+        if (exact_compute_wave_cfg) {
+            // Native Vulkan subgroup widths may be 8/16/32 while the guest wave is 32/64. A native
+            // subgroupAny would let different pieces of one guest wave take different scalar edges.
+            // The dispatcher performs the reduction through Workgroup scratch and synchronized common
+            // phases. If a guest barrier makes that transformation unsafe, reject rather than silently
+            // changing the branch domain.
+            if (!cfg_dispatch_safe ||
+                !emit_compute_cfg_state_machine(b, rs, ins, safe, rt,
+                                                allow_exec_update, allow_smem, exp_fn))
+                return false;
+            return true;
+        }
         if (complex_compute_cfg && (cf_rejected || Ls.empty()) &&
             emit_compute_cfg_state_machine(b, rs, ins, safe, rt,
                                            allow_exec_update, allow_smem, exp_fn))
@@ -8121,13 +8136,6 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (!emit_range(0, UINT32_MAX)) return false;   // loop-free: straight-line, unchanged behavior
             (void)safe_branches;
             return true;
-        }
-        if (b.is_compute && std::any_of(Fs.begin(), Fs.end(),
-                                        [](const ForwardIf& branch) {
-                                            return branch.on_exec || branch.on_vcc;
-                                        })) {
-            SpirvCompute::put(b.caps, Op_Capability, {Cap_GroupNonUniform});
-            SpirvCompute::put(b.caps, Op_Capability, {Cap_GroupNonUniformVote});
         }
         // Structured uniform IFs (forward s_cbranch_scc*/vcc*), possibly SEQUENTIAL and/or NESTED
         // (detect_forward_ifs verified the region tree). Each if emits as OpSelectionMerge +
@@ -8263,9 +8271,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 // A poisoned SCC (0: last written by a 64-bit mask op) cannot condition a real
                 // structured if — reject (the ISA-audit #879 stale-SCC consumer).
                 if (!F.on_exec && !F.on_vcc && !rs.scc) return false;
-                uint32_t cond_reg = F.on_exec
-                    ? (b.is_compute ? b.subgroup_any(rs.exec) : rs.exec)
-                    : (F.on_vcc ? (b.is_compute ? b.subgroup_any(rs.vcc) : rs.vcc) : rs.scc);
+                // Compute VCC/EXEC branches returned through the exact guest-wave dispatcher above.
+                // The structured path is per-invocation (VS/FS) or consumes a genuinely scalar SCC.
+                if (b.is_compute && (F.on_exec || F.on_vcc)) return false;
+                uint32_t cond_reg = F.on_exec ? rs.exec : (F.on_vcc ? rs.vcc : rs.scc);
                 uint32_t exec_cond = F.on_scc0 ? cond_reg : b.bsel(cond_reg, b.bfalse(), b.btrue());
                 const uint32_t preblock = b.cur_block;      // block holding the OpBranchConditional
                 if (!F.has_else) {

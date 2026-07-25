@@ -1180,8 +1180,8 @@ struct PendQueue {
     std::deque<PendWrite> q;
     bool worker_started = false;
     int  inflight = 0;    // items popped but whose write hasn't landed yet (see drain)
-    int  active_submits = 0; // fence writes must not become guest-visible until submit returns
-    std::chrono::steady_clock::time_point release_after{}; // preserve latency after the scope ends
+    int  active_submits = 0; // fence writes stay private until the import return checkpoint
+    std::chrono::steady_clock::time_point release_after{}; // modeled GPU latency after that checkpoint
 };
 PendQueue& pend_q() { static PendQueue* p = new PendQueue; return *p; }
 void apply_effect(const Pm4Command& c);   // fwd (defined with the WAIT_DEFER machinery below)
@@ -1225,11 +1225,11 @@ void pend_drain_locked(PendQueue& p, std::unique_lock<std::mutex>& lk) {
         p.cv.notify_all();               // wake both drain waiters and the pend worker
     }
 }
-// An EOP worker may spend its modeled 1 ms latency asleep while the synchronous renderer is still
-// executing inside the guest submit import. Waiting only for active_submits==0 would then let it
-// publish immediately at scope_end(), before the guest stub has returned. Keep the latency deadline
-// on the scope itself so every drainer observes a genuine post-submit bookkeeping window. A new
-// submit may begin during that window; in that case wait for its later deadline instead.
+// The HLE import trampoline owns scope_end(), so active_submits cannot reach zero until the submit
+// handler has returned and the trampoline is at its guest-return checkpoint. The deadline below is
+// only modeled GPU latency after that real boundary; correctness no longer depends on a timer being
+// long enough to cover guest-side bookkeeping. A new submit may begin during the latency window; in
+// that case wait for its later checkpoint/deadline instead.
 void pend_wait_post_submit(PendQueue& p, std::unique_lock<std::mutex>& lk) {
     for (;;) {
         p.cv.wait(lk, [&] { return p.active_submits == 0; });

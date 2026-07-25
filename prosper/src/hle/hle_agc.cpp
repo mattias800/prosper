@@ -1293,7 +1293,6 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
                 agc_gpu_state().draws.size(), (unsigned long long)agc_gpu_state().dispatch_count);
     progress_heartbeat(agc_gpu_state().draws.size(), g_submit_count,
                        (uint64_t)agc_gpu_state().dispatch_count);
-    prosper_gpu_submit_scope_end();
     return 0;
 }
 
@@ -1427,7 +1426,6 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     }
     progress_heartbeat(agc_gpu_state().draws.size(), g_submit_count,
                        (uint64_t)agc_gpu_state().dispatch_count);
-    prosper_gpu_submit_scope_end();
     return 0;
 }
 
@@ -1624,6 +1622,7 @@ HLE(agc_cb_nop_get_size)          { uint32_t n = (uint32_t)a0; if (n == 0) n = 1
 
 void register_agc_hle() {
     #define RN(nid, fn) Hle::register_fn(nid, (HleFn)(fn), nid)
+    #define RN_SUBMIT(nid, fn) Hle::register_fn(nid, (HleFn)(fn), nid, &prosper_gpu_submit_scope_end)
     RN("VEGu4dixjUg", agc_dcb_jump_get_size);        // sceAgcDcbJumpGetSize (#1137)
     RN("-vnlTPPXPrw", agc_dcb_acquire_mem_get_size); // sceAgcDcbAcquireMemGetSize
     RN("ewobAQeMo5k", agc_dcb_acquire_mem_get_size); // sceAgcAcbAcquireMemGetSize (same size)
@@ -1694,9 +1693,12 @@ void register_agc_hle() {
     RN("IxYiarKlXxM", agc_patch_dma_data_dst);  // sceAgcDmaDataPatchSetDstAddressOrOffset
     RN("cdDRpqcFGbU", agc_patch_dma_data_src);  // sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate
     RN("YUeqkyT7mEQ", agc_dcb_set_flip);        // sceAgcDcbSetFlip (Kyty LibGraphicsDriver.cpp:98)
-    RN("UglJIZjGssM", agc_driver_submit_dcb);   // sceAgcDriverSubmitDcb -> CommandProcessor replay
-    RN("gSRnr79F8tQ", agc_driver_submit_acb);   // sceAgcDriverSubmitAcb -> ordered compute replay
-    RN("w1KFAHVqpaU", agc_driver_submit_dcb_variant);  // final-buffer submit variant (#232, DOLL RHI batch)
+    // Completion labels stay private until the handler has returned into its generated import
+    // trampoline. This per-NID checkpoint ends the submit scope immediately before guest return.
+    RN_SUBMIT("UglJIZjGssM", agc_driver_submit_dcb);   // sceAgcDriverSubmitDcb -> CommandProcessor replay
+    RN_SUBMIT("gSRnr79F8tQ", agc_driver_submit_acb);   // sceAgcDriverSubmitAcb -> ordered compute replay
+    RN_SUBMIT("w1KFAHVqpaU", agc_driver_submit_dcb_variant);  // final-buffer submit variant (#232, DOLL RHI batch)
+    #undef RN_SUBMIT
     #undef RN
 }
 

@@ -251,7 +251,7 @@ int main() {
           "a terminating post-endpgm if/else reports six real guest instructions as structured");
 
     // A forward VCC branch consumes the wave-wide any(VCC) predicate. The compute shell lowers that
-    // explicitly with subgroupAny instead of treating the scalar branch as an invocation-local no-op.
+    // through the exact guest-wave dispatcher instead of an implementation-width native subgroup.
     const uint32_t vcc_branch[] = { 0x7da80300u, 0xbf860001u, 0x4a060300u, 0xBF810000u };
     RecompileCoverage c = recompile_coverage(vcc_branch, sizeof(vcc_branch)/sizeof(vcc_branch[0]));
     CHECK(c.unsupported == 0 && c.first_bad_fmt < 0,
@@ -474,7 +474,7 @@ int main() {
           "a forward branch votes on the current VCC after an intervening write");
 
     // A forward s_cbranch_execz that REJOINS LIVE CODE cannot be linearized when its skipped block has
-    // a live scalar write. The compute structurizer now handles that case with subgroupAny(EXEC), so
+    // a live scalar write. The exact guest-wave dispatcher handles that case, so
     // the whole wave either executes or skips the scalar write and its live use remains exact.
     //   v_cmpx ; s_cbranch_execz +1 ; s_mov_b32 s0,1 ; v_mov_b32 v0,s0 ; s_endpgm
     const uint32_t execz_scalar[] = { 0x7da80300u, 0xbf880001u, 0xbe800381u, 0x7e000200u, 0xBF810000u };

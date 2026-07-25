@@ -2452,7 +2452,12 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
         // at runtime by the fetch shader (so the load-time snapshot reads Unknown) — default to Float32
         // (a raw 32-bit-per-component fetch, correct for float attributes like positions).
         for (auto& kv : dyn_vb) {
-            const auto& d = kv.desc;
+            // Only ABI-proven vertex/instance fetches use the special address path that replaces
+            // VADDR with a built-in index and therefore needs OFFSET/SOFFSET folded into the bound
+            // base. A shader-computed VADDR keeps the instruction's complete address expression,
+            // including idxen+offen's second VGPR, so bind the original base for that mode.
+            const auto& d = kv.index_mode == VertexFetchIndexMode::Shader
+                          ? kv.unshifted_desc : kv.desc;
             if (kv.instruction_format != UINT32_MAX &&
                 ((kv.desc_v3 >> 12) & 0x7Fu) == 0)
                 continue;
