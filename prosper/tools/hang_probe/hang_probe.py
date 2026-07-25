@@ -26,9 +26,17 @@ WAIT_FRAMES = ("k_sema_wait", "k_eq_wait", "k_cond_wait", "k_ef_wait", "k_usleep
 RUN_FRAMES  = ("execute_ordered", "execute_submit", "agc_driver_submit", "run_command_buffer",
                "present", "SubmitDcb", "run_command")
 NATIVE_STOP_FRAME = re.compile(r"^guest-bt-native: (0x[0-9a-f]+ in .+)$", re.MULTILINE)
-NATIVE_BLOCK_FRAME = re.compile(
-    r"\b(?:__syscall_cancel_arch|(?:__)?futex\w*|pthread_(?:cond|mutex|rwlock)\w*|sem_wait\w*|"
-    r"clock_nanosleep|nanosleep|poll|ppoll|select|epoll_wait|kevent)\b")
+NATIVE_BLOCK_FUNCTION = re.compile(
+    r"^(?:syscall_cancel_arch|futex\w*|pthread_(?:cond|mutex|rwlock)\w*|sem_wait\w*|"
+    r"clock_nanosleep(?:_time64)?|nanosleep|poll|ppoll|select(?:64)?|epoll_wait|kevent)$")
+
+
+def native_function(frame: str):
+    """Return a normalized function name from a guest-bt-native evidence line."""
+    name = frame.partition(" in ")[2].split("(", 1)[0].split("@", 1)[0].strip()
+    if name.startswith("__GI_"):
+        name = name[len("__GI_"):]
+    return name.lstrip("_")
 
 
 def classify(gbt_text: str):
@@ -42,7 +50,7 @@ def classify(gbt_text: str):
     frame = m.group(1).strip() if m else ""
     # A selected thread stopped in a known host wait is inconclusive even if a lower caller happens
     # to carry an active-render name. Accepting that lower frame would turn a parked thread green.
-    if frame and NATIVE_BLOCK_FRAME.search(frame):
+    if frame and NATIVE_BLOCK_FUNCTION.fullmatch(native_function(frame)):
         return "UNKNOWN", frame
     if any(f in gbt_text for f in RUN_FRAMES):
         m = next((l for l in gbt_text.splitlines() if any(f in l for f in RUN_FRAMES)), "")

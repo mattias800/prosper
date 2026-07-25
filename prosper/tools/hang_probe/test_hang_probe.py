@@ -40,6 +40,18 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(HANG_PROBE.classify(text),
                          ("UNKNOWN", "0x00007f00 in pthread_cond_wait@@GLIBC_2.3.2"))
 
+    def test_decorated_glibc_waits_remain_unknown(self):
+        for name in ("__GI___clock_nanosleep", "__GI___poll", "__GI___select"):
+            with self.subTest(name=name):
+                frame = f"0x00007f00 in {name}"
+                text = f"guest-bt-native: {frame}\n#1 prosper::gpu::execute_ordered\n"
+                self.assertEqual(HANG_PROBE.classify(text), ("UNKNOWN", frame))
+
+    def test_non_wait_name_with_select_prefix_is_running(self):
+        frame = "0x0000000000442f85 in prosper::gpu::select_shader"
+        self.assertEqual(HANG_PROBE.classify(f"guest-bt-native: {frame}\n"),
+                         ("RUNNING", frame))
+
     def test_attach_frame_before_thread_switch_is_ignored(self):
         text = ("0x00007f00 in pthread_cond_wait@@GLIBC_2.3.2 ()\n"
                 "guest-bt-native: 0x0000000410f4bb02 in ??\n#0 0x410f4bb02 in ??? ()\n")
