@@ -48,6 +48,17 @@ struct CondSlot {
 };
 std::array<CondSlot, 4096> g_cond_slots;
 constexpr uintptr_t kCondSlotRetiring = UINTPTR_MAX;
+std::atomic<CondWaitFailurePointForTest> g_cond_wait_failure_point{
+    CondWaitFailurePointForTest::None};
+std::atomic<int> g_cond_wait_failure_error{0};
+
+int consume_cond_wait_failure(CondWaitFailurePointForTest point) {
+    CondWaitFailurePointForTest expected = point;
+    if (!g_cond_wait_failure_point.compare_exchange_strong(
+            expected, CondWaitFailurePointForTest::None, std::memory_order_acq_rel))
+        return 0;
+    return g_cond_wait_failure_error.load(std::memory_order_relaxed);
+}
 
 CondSlot* cond_slot_for(pthread_cond_t* cond) {
     const uintptr_t key = (uintptr_t)cond;
@@ -122,6 +133,13 @@ bool snapshot_wait_slot(const WaitSlot& slot, WaitSlotSnapshot& snapshot) {
 #endif
 }
 
+#ifdef _WIN32
+void win_set_cond_wait_failure_for_test(CondWaitFailurePointForTest point, int error) {
+    g_cond_wait_failure_error.store(error, std::memory_order_relaxed);
+    g_cond_wait_failure_point.store(point, std::memory_order_release);
+}
+#endif
+
 WaitRegistration futex_wait_enter(uint64_t addr) {
 #ifdef _WIN32
     WaitSlot* registration = register_wait(GuestWaitKind::Address, (uintptr_t)addr,
@@ -152,8 +170,12 @@ void futex_wait_exit(WaitRegistration registration) {
 }
 
 int interruptible_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex,
-                            GuestWaitKind kind, uintptr_t source) {
+                            GuestWaitKind kind, uintptr_t source,
+                            CondWaitMutexState* mutex_state) {
+    if (mutex_state) *mutex_state = {};
 #ifdef _WIN32
+    if (const int injected = consume_cond_wait_failure(
+            CondWaitFailurePointForTest::BeforeUnlock)) return injected;
     CondSlot* slot = cond_slot_for(cond);
     if (!slot) return ENOMEM;
     uint32_t expected = slot->sequence.load(std::memory_order_acquire);
@@ -164,22 +186,32 @@ int interruptible_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex,
         unregister_wait(registration);
         return unlock_result;
     }
+    if (mutex_state) mutex_state->unlocked = true;
     dispatch_pending_guest_exception();
     WaitOnAddress((volatile void*)&slot->sequence, &expected, sizeof(expected), INFINITE);
     dispatch_pending_guest_exception();
     unregister_wait(registration);
-    return interruptible_mutex_lock(mutex);
+    if (const int injected = consume_cond_wait_failure(
+            CondWaitFailurePointForTest::BeforeRelock)) return injected;
+    const int lock_result = interruptible_mutex_lock(mutex);
+    if (lock_result == 0 && mutex_state) mutex_state->reacquired = true;
+    return lock_result;
 #else
     (void)kind;
     (void)source;
-    return pthread_cond_wait(cond, mutex);
+    const int result = pthread_cond_wait(cond, mutex);
+    if (mutex_state) *mutex_state = {true, true};
+    return result;
 #endif
 }
 
 int interruptible_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
                                  const timespec* deadline, GuestWaitKind kind,
-                                 uintptr_t source) {
+                                 uintptr_t source, CondWaitMutexState* mutex_state) {
+    if (mutex_state) *mutex_state = {};
 #ifdef _WIN32
+    if (const int injected = consume_cond_wait_failure(
+            CondWaitFailurePointForTest::BeforeUnlock)) return injected;
     CondSlot* slot = cond_slot_for(cond);
     if (!slot) return ENOMEM;
     uint32_t expected = slot->sequence.load(std::memory_order_acquire);
@@ -190,6 +222,7 @@ int interruptible_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
         unregister_wait(registration);
         return unlock_result;
     }
+    if (mutex_state) mutex_state->unlocked = true;
     dispatch_pending_guest_exception();
 
     timespec now{};
@@ -206,22 +239,30 @@ int interruptible_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
                                         sizeof(expected), timeout) != FALSE;
     dispatch_pending_guest_exception();
     unregister_wait(registration);
+    if (const int injected = consume_cond_wait_failure(
+            CondWaitFailurePointForTest::BeforeRelock)) return injected;
     const int lock_result = interruptible_mutex_lock(mutex);
     if (lock_result != 0) return lock_result;
+    if (mutex_state) mutex_state->reacquired = true;
     return signaled ? 0 : ETIMEDOUT;
 #else
     (void)kind;
     (void)source;
-    return pthread_cond_timedwait(cond, mutex, deadline);
+    const int result = pthread_cond_timedwait(cond, mutex, deadline);
+    if (mutex_state) *mutex_state = {true, true};
+    return result;
 #endif
 }
 
 int interruptible_cond_timedwait_relative(pthread_cond_t* cond, pthread_mutex_t* mutex,
                                           const timespec* duration, GuestWaitKind kind,
-                                          uintptr_t source) {
+                                          uintptr_t source, CondWaitMutexState* mutex_state) {
+    if (mutex_state) *mutex_state = {};
     if (!duration || duration->tv_sec < 0 || duration->tv_nsec < 0 ||
         duration->tv_nsec >= 1000000000L) return EINVAL;
 #ifdef _WIN32
+    if (const int injected = consume_cond_wait_failure(
+            CondWaitFailurePointForTest::BeforeUnlock)) return injected;
     CondSlot* slot = cond_slot_for(cond);
     if (!slot) return ENOMEM;
     uint32_t expected = slot->sequence.load(std::memory_order_acquire);
@@ -232,6 +273,7 @@ int interruptible_cond_timedwait_relative(pthread_cond_t* cond, pthread_mutex_t*
         unregister_wait(registration);
         return unlock_result;
     }
+    if (mutex_state) mutex_state->unlocked = true;
     dispatch_pending_guest_exception();
 
     const uint64_t milliseconds = (uint64_t)duration->tv_sec * 1000ull +
@@ -241,13 +283,18 @@ int interruptible_cond_timedwait_relative(pthread_cond_t* cond, pthread_mutex_t*
                                         sizeof(expected), timeout) != FALSE;
     dispatch_pending_guest_exception();
     unregister_wait(registration);
+    if (const int injected = consume_cond_wait_failure(
+            CondWaitFailurePointForTest::BeforeRelock)) return injected;
     const int lock_result = interruptible_mutex_lock(mutex);
     if (lock_result != 0) return lock_result;
+    if (mutex_state) mutex_state->reacquired = true;
     return signaled ? 0 : ETIMEDOUT;
 #elif defined(__APPLE__)
     (void)kind;
     (void)source;
-    return pthread_cond_timedwait_relative_np(cond, mutex, duration);
+    const int result = pthread_cond_timedwait_relative_np(cond, mutex, duration);
+    if (mutex_state) *mutex_state = {true, true};
+    return result;
 #else
     (void)kind;
     (void)source;
@@ -259,7 +306,9 @@ int interruptible_cond_timedwait_relative(pthread_cond_t* cond, pthread_mutex_t*
         ++deadline.tv_sec;
         deadline.tv_nsec -= 1000000000L;
     }
-    return pthread_cond_clockwait(cond, mutex, CLOCK_MONOTONIC, &deadline);
+    const int result = pthread_cond_clockwait(cond, mutex, CLOCK_MONOTONIC, &deadline);
+    if (mutex_state) *mutex_state = {true, true};
+    return result;
 #endif
 }
 

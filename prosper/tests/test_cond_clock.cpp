@@ -3,7 +3,9 @@
 // as CLOCK_REALTIME and normally appeared decades in the past.
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
+#include "../src/hle/sync_futex.hpp"
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -138,7 +140,8 @@ int main() {
     attr_setclock(U(&attr), 4, 0, 0, 0, 0);
     cond_init(U(&monotonic_cond), U(&attr), 0, 0, 0, 0);
     mutex_init(U(&monotonic_mutex), 0, 0, 0, 0, 0);
-    mutex_lock(U(&monotonic_mutex), 0, 0, 0, 0, 0);
+    CHECK(mutex_lock(U(&monotonic_mutex), 0, 0, 0, 0, 0) == 0,
+          "mutex locks before monotonic wait");
     GuestTimespec monotonic_deadline = deadline_after(CLOCK_MONOTONIC, 25);
     const auto started = std::chrono::steady_clock::now();
     const uint64_t timeout_result = cond_timedwait(U(&monotonic_cond), U(&monotonic_mutex),
@@ -150,12 +153,29 @@ int main() {
     CHECK(elapsed_ms >= 10 && elapsed_ms < 1000,
           "monotonic deadline waits for the requested interval");
 
-    mutex_lock(U(&monotonic_mutex), 0, 0, 0, 0, 0);
+    CHECK(mutex_lock(U(&monotonic_mutex), 0, 0, 0, 0, 0) == 0,
+          "mutex locks before invalid-deadline check");
     GuestTimespec invalid_deadline{0, 1'000'000'000ll};
     CHECK(cond_timedwait(U(&monotonic_cond), U(&monotonic_mutex), U(&invalid_deadline),
                          0, 0, 0) == 22,
           "invalid absolute timespec is rejected with EINVAL(22)");
     mutex_unlock(U(&monotonic_mutex), 0, 0, 0, 0, 0);
+#ifdef _WIN32
+    // A Windows helper error before pthread_mutex_unlock leaves the host mutex owned. The HLE had
+    // already cleared its ERRORCHECK owner map before entering the helper, so it must restore that
+    // map from the reported unlock=false fact rather than keying restoration on rc==0/ETIMEDOUT.
+    CHECK(mutex_lock(U(&monotonic_mutex), 0, 0, 0, 0, 0) == 0,
+          "mutex locks before injected pre-unlock failure");
+    win_set_cond_wait_failure_for_test(CondWaitFailurePointForTest::BeforeUnlock, ENOMEM);
+    monotonic_deadline = deadline_after(CLOCK_MONOTONIC, 25);
+    CHECK(cond_timedwait(U(&monotonic_cond), U(&monotonic_mutex), U(&monotonic_deadline),
+                         0, 0, 0) == ENOMEM,
+          "injected pre-unlock wait failure is returned");
+    CHECK(win_guest_mutex_owned_by_current_thread_for_test(monotonic_mutex),
+          "pre-unlock failure preserves guest mutex ownership bookkeeping");
+    CHECK(mutex_unlock(U(&monotonic_mutex), 0, 0, 0, 0, 0) == 0,
+          "mutex remains unlockable after pre-unlock wait failure");
+#endif
     cond_destroy(U(&monotonic_cond), 0, 0, 0, 0, 0);
     mutex_destroy(U(&monotonic_mutex), 0, 0, 0, 0, 0);
 
@@ -181,6 +201,23 @@ int main() {
           "Sony relative wait honors its microsecond interval");
     CHECK(mutex_unlock(U(&sce_mutex), 0, 0, 0, 0, 0) == 0,
           "Sony timed wait reacquires the mutex before returning");
+#ifdef _WIN32
+    // Conversely, an error at the relock boundary follows a successful host unlock. Bookkeeping
+    // must remain released so a later HLE lock can acquire the genuinely unowned mutex.
+    CHECK(mutex_lock(U(&sce_mutex), 0, 0, 0, 0, 0) == 0,
+          "mutex locks before injected relock failure");
+    win_set_cond_wait_failure_for_test(CondWaitFailurePointForTest::BeforeRelock, EIO);
+    CHECK(sce_cond_timedwait(U(&sce_cond), U(&sce_mutex), 1'000, 0, 0, 0) == EIO,
+          "injected relock failure is returned");
+    CHECK(!win_guest_mutex_owned_by_current_thread_for_test(sce_mutex),
+          "relock failure leaves guest mutex ownership released");
+    CHECK(mutex_lock(U(&sce_mutex), 0, 0, 0, 0, 0) == 0,
+          "mutex can be acquired normally after relock failure");
+    CHECK(win_guest_mutex_owned_by_current_thread_for_test(sce_mutex),
+          "subsequent lock republishes guest mutex ownership");
+    CHECK(mutex_unlock(U(&sce_mutex), 0, 0, 0, 0, 0) == 0,
+          "mutex unlocks after relock-failure recovery");
+#endif
     cond_destroy(U(&sce_cond), 0, 0, 0, 0, 0);
     mutex_destroy(U(&sce_mutex), 0, 0, 0, 0, 0);
 

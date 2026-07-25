@@ -342,6 +342,14 @@ namespace {
     inline void guest_mutex_released(pthread_mutex_t*) {}
 #endif
 
+    // Callers mark the guest owner released before entering the helper so asynchronous Windows
+    // exception delivery never observes ownership after the host unlock. Reconcile that optimistic
+    // update on return: no unlock means the old ownership survived; a successful relock restores it.
+    void guest_mutex_cond_wait_finished(pthread_mutex_t* mutex,
+                                        const CondWaitMutexState& wait_state) {
+        if (!wait_state.unlocked || wait_state.reacquired) guest_mutex_acquired(mutex);
+    }
+
     pthread_mutex_t* ensure_mutex(uint64_t slot_addr) {
         if (!slot_addr) return nullptr;
         void** slot = (void**)(uintptr_t)slot_addr;
@@ -414,6 +422,13 @@ namespace {
         return pt_static_sentinel(cur) ? nullptr : (pthread_barrier_t*)cur;
     }
 }
+
+#ifdef _WIN32
+bool win_guest_mutex_owned_by_current_thread_for_test(void* mutex) {
+    return guest_mutex_self_deadlock(static_cast<pthread_mutex_t*>(mutex));
+}
+#endif
+
 // scePthreadMutexInit(mutex_slot, attr_slot, name) / pthread_mutex_init(mutex_slot, attr_slot):
 // honor the caller's attr (type set via k_mutexattr_settype); no attr means Sony's default,
 // ERRORCHECK — FreeBSD PTHREAD_MUTEX_DEFAULT, and what Kyty's attr-init settype(1) produces (#145).
@@ -604,9 +619,13 @@ namespace {
     }
 
     int interruptible_cond_clock_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
-                                           const timespec& deadline, int32_t clock_id) {
+                                           const timespec& deadline, int32_t clock_id,
+                                           CondWaitMutexState* mutex_state) {
+        if (mutex_state) *mutex_state = {};
         if (clock_id == kSonyClockRealtime)
-            return interruptible_cond_timedwait(cond, mutex, &deadline);
+            return interruptible_cond_timedwait(cond, mutex, &deadline,
+                                                GuestWaitKind::ConditionSequence, 0,
+                                                mutex_state);
         if (!valid_cond_clock(clock_id)) return EINVAL;
 
         const uint64_t initial_generation = guest_cond_snapshot(cond).generation;
@@ -617,7 +636,8 @@ namespace {
             if (timespec_reached(selected_now, deadline)) return ETIMEDOUT;
 
             const timespec slice = stable_slice_duration(selected_now, deadline);
-            result = interruptible_cond_timedwait_relative(cond, mutex, &slice);
+            result = interruptible_cond_timedwait_relative(
+                cond, mutex, &slice, GuestWaitKind::ConditionSequence, 0, mutex_state);
             if (result != ETIMEDOUT) return result;
             // A signal can land between two host timed waits. Treat a generation change as a
             // permitted spurious wake instead of losing the signal during clock conversion.
@@ -689,9 +709,11 @@ HLE(k_cond_broadcast) { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu
 HLE(k_cond_wait)      { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.wait.ent  cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0);
     { auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
       if (c && m) {
+          CondWaitMutexState wait_state{};
           guest_mutex_released(m);
-          const int result = interruptible_cond_wait(c, m);
-          if (result == 0) guest_mutex_acquired(m);
+          (void)interruptible_cond_wait(c, m, GuestWaitKind::ConditionSequence, 0,
+                                        &wait_state);
+          guest_mutex_cond_wait_finished(m, wait_state);
       } }
     if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.wait.exit cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); return 0; }
 // POSIX pthread_cond_timedwait(cond_slot, mutex_slot, const timespec* abstime) — abstime is an
@@ -708,18 +730,21 @@ HLE(k_cond_timedwait) {
     auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
     if (!c || !m) return 22;                                   // EINVAL
     if (!a2) {
+        CondWaitMutexState wait_state{};
         guest_mutex_released(m);
-        int rc = interruptible_cond_wait(c, m);
-        if (rc == 0) guest_mutex_acquired(m);
+        int rc = interruptible_cond_wait(c, m, GuestWaitKind::ConditionSequence, 0,
+                                         &wait_state);
+        guest_mutex_cond_wait_finished(m, wait_state);
         return (uint64_t)rc;
     }
     const int64_t* gts = (const int64_t*)(uintptr_t)a2;
     if (gts[0] < 0 || gts[1] < 0 || gts[1] >= 1'000'000'000ll) return 22;
     struct timespec dl { (time_t)gts[0], (long)gts[1] };
     const int32_t clock_id = guest_cond_snapshot(c).clock_id;
+    CondWaitMutexState wait_state{};
     guest_mutex_released(m);
-    int rc = interruptible_cond_clock_timedwait(c, m, dl, clock_id);
-    if (rc == 0 || rc == ETIMEDOUT) guest_mutex_acquired(m);
+    int rc = interruptible_cond_clock_timedwait(c, m, dl, clock_id, &wait_state);
+    guest_mutex_cond_wait_finished(m, wait_state);
     if (rc == ETIMEDOUT) return 60;                            // FreeBSD ETIMEDOUT
     return (uint64_t)rc;
 }
@@ -1726,9 +1751,11 @@ HLE(k_cond_timedwait_sce) {
     auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
     if (!c || !m) return 0x16;                          // EINVAL
     timespec dl = abs_deadline_us(a2);
+    CondWaitMutexState wait_state{};
     guest_mutex_released(m);
-    int rc = interruptible_cond_timedwait(c, m, &dl);
-    if (rc == 0 || rc == ETIMEDOUT) guest_mutex_acquired(m);
+    int rc = interruptible_cond_timedwait(c, m, &dl, GuestWaitKind::ConditionSequence, 0,
+                                          &wait_state);
+    guest_mutex_cond_wait_finished(m, wait_state);
     return rc == ETIMEDOUT ? 0x8002003cu : (uint64_t)rc;
 }
 // scePthreadRwlockTimedrd/wrlock(rwlock, SceKernelUseconds usec): acquire with a RELATIVE µs timeout.
