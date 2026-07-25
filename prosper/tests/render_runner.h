@@ -2440,6 +2440,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     bool depth_was_valid = false, stencil_was_valid = false;
     bool depth_used_meaningfully = false;
     bool depth_may_be_written = false;
+    bool stencil_may_be_written = false;
     for (const auto& d : draws) {
         if (!d.ps) continue;
         depth_used_meaningfully |= effective_depth_clear(d.ps) || d.ps->depth_write_enable ||
@@ -2448,6 +2449,14 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         depth_may_be_written |= persistent_ds_pass_may_write_depth(
             d.ps->depth_clear_enable, d.ps->depth_test_enable, d.ps->depth_write_enable,
             d.ps->depth_compare_op);
+        stencil_may_be_written |= stencil_clear_effective(
+            d.ps->stencil_clear_enable, d.ps->stencil_enable,
+            d.ps->stencil_write_mask[0], d.ps->stencil_write_mask[1]);
+        // Keep the layout decision conservative: Vulkan validates attachment writability from
+        // pipeline state, and a nonzero guest write mask leaves the aspect writable even when this
+        // draw happens to program KEEP for every outcome.
+        stencil_may_be_written |= d.ps->stencil_enable &&
+            (d.ps->stencil_write_mask[0] != 0u || d.ps->stencil_write_mask[1] != 0u);
     }
     PersistentDsImage* cached_ds = nullptr;
     PersistentDsKey ds_key{};
@@ -2468,6 +2477,31 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         depth_was_valid = cached_ds->depth_valid;
         stencil_was_valid = cached_ds->stencil_valid;
     }
+    // A guest may sample the depth plane while that SAME surface remains attached for depth/stencil
+    // tests. Bendy's deferred-lighting and glow passes use read-only depth plus writable stencil in
+    // exactly this shape (#1186). The sampled-depth bridge used to reject it as feedback and upload
+    // zeros. Vulkan supports the hardware contract directly: keep depth read-only for both the
+    // attachment and shader view, while the stencil aspect may remain writable. Never enable the
+    // path when any draw in this render pass can write depth.
+    bool self_sampled_depth = false;
+    if (cached_ds && depth_was_valid && !depth_may_be_written) {
+        for (const auto& draw : draws) {
+            for (const auto& resource : draw.R) {
+                if (!resource.persistent_depth_target_id || resource.img_dim != 1u ||
+                    resource.tw != W || resource.th != H)
+                    continue;
+                if (find_persistent_ds_sampled(resource.persistent_depth_target_id,
+                                               resource.tw, resource.th).image == cached_ds) {
+                    self_sampled_depth = true;
+                    break;
+                }
+            }
+            if (self_sampled_depth) break;
+        }
+    }
+    const VkImageLayout self_depth_layout = format_has_stencil && stencil_may_be_written
+        ? VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL
+        : VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
     if (getenv("PROSPER_DSLOG")) {
         static uint64_t call_id = 0;
         const uint64_t id = ++call_id;
@@ -2700,14 +2734,19 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     att[ds_attachment].stencilStoreOp = (persistent_ds && format_has_stencil)
         ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    att[ds_attachment].initialLayout = ds_layout_initialized
-        ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+    att[ds_attachment].initialLayout = self_sampled_depth
+        ? self_depth_layout
+        : (ds_layout_initialized ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                                 : VK_IMAGE_LAYOUT_UNDEFINED);
     att[ds_attachment].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     VkAttachmentReference ar[2] = {
         {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
         {1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
     };
-    VkAttachmentReference dar{ds_attachment, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference dar{
+        ds_attachment,
+        self_sampled_depth ? self_depth_layout
+                           : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     VkSubpassDescription sub{}; sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     sub.colorAttachmentCount = color_count; sub.pColorAttachments = ar;
     if (use_ds) sub.pDepthStencilAttachment = &dar;
@@ -2782,6 +2821,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         // the DEPTH aspect of ds_format, and the call transitions the image DS-attachment ->
         // shader-read around its passes.
         bool borrowed_ds = false;
+        bool borrowed_ds_feedback = false; // same image is this pass's read-only depth attachment
         VkFormat ds_format = VK_FORMAT_UNDEFINED;
         bool direct_memory = false;
     };
@@ -3429,10 +3469,14 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                             r.persistent_depth_target_id && r.img_dim == 1) {
                             const PersistentDsSampled sampled_ds = find_persistent_ds_sampled(
                                 r.persistent_depth_target_id, r.tw, r.th);
+                            const bool same_pass_feedback = self_sampled_depth && cached_ds &&
+                                sampled_ds.image == cached_ds;
                             if (sampled_ds.image &&
-                                (!cached_ds || sampled_ds.image->image != cached_ds->image)) {
+                                (same_pass_feedback || !cached_ds ||
+                                 sampled_ds.image->image != cached_ds->image)) {
                                 upload.image = sampled_ds.image->image;
                                 upload.borrowed_ds = true;
+                                upload.borrowed_ds_feedback = same_pass_feedback;
                                 upload.ds_format = sampled_ds.format;
                             }
                         }
@@ -3717,8 +3761,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                         shared_texture_binding_indices.emplace(binding_key, binding_index);
                         ++resource_reuse_stats.unique_texture_bindings;
                     }
+                    const SharedTextureUpload& descriptor_upload = texture_uploads[upload_index];
                     const VkImageLayout image_layout = r.is_storage_image
-                        ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        ? VK_IMAGE_LAYOUT_GENERAL
+                        : descriptor_upload.borrowed_ds_feedback
+                            ? self_depth_layout
+                            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                     dii[i] = {shared_texture_bindings[binding_index].sampler,
                               shared_texture_bindings[binding_index].view, image_layout};
                     wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr[i].dstBinding = r.binding; wr[i].descriptorCount = 1;
@@ -4319,13 +4367,38 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                              VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &b1);
     }
+    // Same-pass depth feedback (#1186): make prior attachment writes visible to the shader and
+    // enter the layout declared by both the sampled descriptor and this render pass. The render
+    // pass returns the image to DEPTH_STENCIL_ATTACHMENT_OPTIMAL at the end, preserving the cache
+    // contract for every later call. Include both aspects in the transition for D32S8; the mixed
+    // layout keeps depth read-only while allowing the stencil writes detected above.
+    if (self_sampled_depth) {
+        VkImageMemoryBarrier to_feedback{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        to_feedback.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        to_feedback.newLayout = self_depth_layout;
+        to_feedback.image = dimg;
+        to_feedback.subresourceRange = {DASPECT, 0, 1, 0, 1};
+        to_feedback.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        to_feedback.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                    (stencil_may_be_written
+                                         ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : 0u);
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &to_feedback);
+    }
     // Sampled depth bridge (#1275): borrowed DS images live in DEPTH_STENCIL_ATTACHMENT_OPTIMAL
     // between passes. Transition each (once) to SHADER_READ_ONLY for this pass's sampling; the
     // matching post-pass barrier below returns it so the next depth pass LOADs it unchanged.
     // Both aspects of a combined image must transition together.
     std::vector<std::pair<VkImage, VkFormat>> borrowed_ds_images;
     for (const SharedTextureUpload& upload : texture_uploads) {
-        if (!upload.borrowed_ds || !upload.image) continue;
+        if (!upload.borrowed_ds || upload.borrowed_ds_feedback || !upload.image) continue;
         if (std::any_of(borrowed_ds_images.begin(), borrowed_ds_images.end(),
                         [&](const auto& entry) { return entry.first == upload.image; }))
             continue;
