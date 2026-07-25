@@ -4406,6 +4406,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     const char* geom_env = getenv("PROSPER_GEOM_PROBE");
     uint64_t geom_target = 0;
     const bool geom_target_valid = geom_env && gpu::parse_diagnostic_draw_id(geom_env, geom_target);
+    const auto geom_target_label = static_cast<unsigned long long>(geom_target);
     size_t geom_item = SIZE_MAX;
     if (geom_target_valid) {
         for (size_t i = 0; i < draws.size(); ++i)
@@ -4781,13 +4782,14 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 // integers/bitfields, not clip floats) and skip the meaningless clip classification.
                 const bool is_tap = getenv("PROSPER_SHADER_TAP") != nullptr;
                 if (is_tap)
-                    fprintf(stderr, "[geom-probe] draw=%ld SHADER-TAP: values below are the tapped VGPR "
-                                    "(dst+3) at that PC, not clip positions (bbox/tags meaningless)\n", geom_target);
+                    fprintf(stderr, "[geom-probe] draw=%llu SHADER-TAP: values below are the tapped VGPR "
+                                    "(dst+3) at that PC, not clip positions (bbox/tags meaningless)\n",
+                            geom_target_label);
                 else
-                    fprintf(stderr, "[geom-probe] draw=%ld verts-written=%u finite=%u on-screen=%u clipped=%u "
+                    fprintf(stderr, "[geom-probe] draw=%llu verts-written=%u finite=%u on-screen=%u clipped=%u "
                                     "(offscreen=%u w<=0=%u nan/inf=%u)\n"
                                     "[geom-probe]   clip-bbox x[%g,%g] y[%g,%g] z[%g,%g] w[%g,%g] -> %s\n",
-                            geom_target, written, finite, onscreen, clipped, offscreen, wle0, nan,
+                            geom_target_label, written, finite, onscreen, clipped, offscreen, wle0, nan,
                             minx,maxx, miny,maxy, minz,maxz, minw,maxw, tag);
                 for (uint32_t i = 0; i < written && i < (is_tap ? 8u : 4u); i++) {
                     if (is_tap) {
@@ -4863,9 +4865,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                         finite_tri && degenerate * 5u >= finite_tri*4u ? "DEGENERATE-HEAVY(>=80% zero-area - strip-stitching read as list, or wrong count/stride)" :
                         dup_tri && dup_tri * 4u >= real_tri            ? "DUPLICATE-TRIANGLES(exact repeats = pure overdraw - likely over-count/wrong vertex range)" :
                                                                          "ok(check PROSPER_DRAW_STATS for overdraw: samples>pixels)";
-                    fprintf(stderr, "[geom-health] draw=%ld verts=%u unique-pos=%u (max-mult=%u) "
+                    fprintf(stderr, "[geom-health] draw=%llu verts=%u unique-pos=%u (max-mult=%u) "
                                     "triangles=%u degenerate=%u(%.0f%%) real=%u duplicate-tri=%u -> %s\n",
-                            geom_target, (unsigned)verts.size(), unique_pos, max_mult, finite_tri, degenerate,
+                            geom_target_label, (unsigned)verts.size(), unique_pos, max_mult, finite_tri, degenerate,
                             finite_tri ? 100.0 * degenerate / finite_tri : 0.0, real_tri, dup_tri, health);
                 }
                 // PROSPER_GEOM_PROBE_DUMP=path (gated, off by default): write EVERY post-transform vertex
@@ -4884,8 +4886,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 }
                 vkUnmapMemory(dev, geom_mem);
             } else if (!written) {
-                fprintf(stderr, "[geom-probe] draw=%ld: transform feedback wrote 0 vertices "
-                                "(draw produced no primitives)\n", geom_target);
+                fprintf(stderr, "[geom-probe] draw=%llu: transform feedback wrote 0 vertices "
+                                "(draw produced no primitives)\n", geom_target_label);
             }
         }
     }
