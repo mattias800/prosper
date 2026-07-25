@@ -253,6 +253,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_det_clock PRIVATE prosper_core)
   add_test(NAME det_clock COMMAND test_det_clock)
 
+  # Synchronous host-GPU work must not become a giant guest frame delta. The clock retains one
+  # caller-supplied frame budget, stays monotonic under concurrent reads, and leaves realtime alone.
+  add_executable(test_gpu_time_compensation tests/test_gpu_time_compensation.cpp)
+  target_link_libraries(test_gpu_time_compensation PRIVATE prosper_core)
+  add_test(NAME gpu_time_compensation COMMAND test_gpu_time_compensation)
+
   # UserService/libkernel startup stubs (HLE audit): getters write deterministic defaults; the
   # libkernel registration/hook calls resolve to benign OK no-ops.
   add_executable(test_service_getters tests/test_service_getters.cpp)

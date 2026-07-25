@@ -9,6 +9,7 @@
 // reverse-engineered the real libSceAgc ABI. A later CommandProcessor will decode this PM4 stream to
 // Vulkan (see docs/AGC_IMPL_PLAN.md). Registered by raw NID (AGC lib is undocumented).
 #include "dispatch.hpp"
+#include "hle_kernel_time.hpp"
 #include "gpu/pm4_registers.hpp"
 #include "gpu/command_processor.hpp"
 #include "gpu/pm4_decode.hpp"
@@ -1109,6 +1110,7 @@ void prosper_eq_trigger_eop();
 
 // Total flips so far (hle_graphics.cpp) — part of the PROSPER_PROGRESS heartbeat below.
 extern "C" uint64_t prosper_vo_flip_count();
+extern "C" int prosper_vo_flip_rate();
 
 namespace {
 // PROSPER_PROGRESS=<secs>: emit a one-line timestamped forward-progress heartbeat at most every
@@ -1176,6 +1178,19 @@ static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned&
     // Native-speed semantic capture happens before renderer sampling. PROSPER_RENDER_EVERY and
     // warmup may skip Vulkan work, but must not erase submit/present history from the timeline.
     gpu::record_gpu_timeline_submit(st, submit_no);
+    // Account at most one requested refresh interval per flip while the host performs synchronous
+    // GPU work. A real console returns from submission without charging shader compilation,
+    // resource conversion, execution, or readback latency to the guest's next frame delta.
+    static uint64_t accounted_flips = 0;
+    const uint64_t flips = prosper_vo_flip_count();
+    const uint64_t flip_delta = flips >= accounted_flips ? flips - accounted_flips : flips;
+    accounted_flips = flips;
+    const int flip_rate = prosper_vo_flip_rate();
+    const uint64_t refresh_divisor = flip_rate >= 0 && flip_rate <= 2
+        ? (uint64_t)flip_rate + 1 : 1;
+    const uint64_t period_ns = (1000000000ull * refresh_divisor) / 60ull;
+    const uint64_t clock_budget_ns = flip_delta > UINT64_MAX / period_ns
+        ? UINT64_MAX : flip_delta * period_ns;
     // A bounded sparse phase accelerates long intros, then cadence=1 rebuilds any temporal render
     // targets before a visual checkpoint. Screenshot exposes these as --render-every/--render-every-for-seconds.
     static const unsigned render_every = [] {
@@ -1202,10 +1217,12 @@ static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned&
         render = ordered_dma_requires_render || cadence_render;
     }
     if (!render) {
-        if ((!st.dispatches.empty() || !st.dma_copies.empty()) &&
-            !gpu::execute_nonrender_submit_work(st, submit_no) && getenv("PROSPER_COMPUTELOG"))
-            fprintf(stderr, "[compute] submit #%llu produced no executable work\n",
-                    (unsigned long long)submit_no);
+        if (!st.dispatches.empty() || !st.dma_copies.empty()) {
+            HostGpuClockScope host_gpu_clock(clock_budget_ns);
+            if (!gpu::execute_nonrender_submit_work(st, submit_no) && getenv("PROSPER_COMPUTELOG"))
+                fprintf(stderr, "[compute] submit #%llu produced no executable work\n",
+                        (unsigned long long)submit_no);
+        }
         return false;
     }
 
@@ -1225,6 +1242,7 @@ static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned&
     // but leave fence/label completions on their post-submit FIFO: exposing a ReleaseMem fence before
     // this call returns lets another guest thread recycle its label while the submitter is still
     // updating the corresponding allocation lists (#312).
+    HostGpuClockScope host_gpu_clock(clock_budget_ns);
     gpu::flush_deferred_streams();
     prosper_gpu_drain_renderer_writes();
     // PROSPER_PRESENT_EVERY=N suppresses publication only. Unlike PROSPER_RENDER_EVERY, every
