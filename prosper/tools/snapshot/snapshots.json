@@ -518,6 +518,40 @@
       "min_nonblack_ratio": 0.288418
     },
     {
+      "name": "blue-prince-hall",
+      "dump": "PPSA25009-app0",
+      "scale": 1,
+      "timeout": 480,
+      "sample_seconds": 3,
+      "capture_after_seconds": 345,
+      "capture_before_seconds": 388,
+      "pad_script": null,
+      "savedata_policy": "fresh",
+      "env": {
+        "PROSPER_IME_AUTOKEY": "1"
+      },
+      "min_colors": 40000,
+      "min_qualifying_frames": 6,
+      "min_pixel_changes": 5,
+      "min_structural_similarity": 0.85,
+      "min_structural_matches": 6,
+      "min_content_match_ratio": 0.7,
+      "dims": [
+        1920,
+        1080
+      ],
+      "review": "Approved 16 composited images from two independent runs on 2026-07-25; intended scene, layers, and progression visually confirmed.",
+      "_note": "Display-chain guard for Blue Prince's Day One entrance hall (#1334/#1382/#1287): a fresh-save IME-autokey route walks through the front door into Mount Holly by ~350s; the evidence window covers the vestibule/hall interior. Runs at scale 1 deliberately - scaled runs break the DS-bridge exact-extent match and could mask the resolve->tonemap chain this guard exists to protect (the pre-#1382 failure mode was a BLOWN overbright frame, not black, so the structural luma references are the discriminating check; the color floor only catches collapse).",
+      "structural_references": [
+        {
+          "luma16x9": "0807000000010102020100000000000300000000040100010100000500020105000000000205232a271c0b01033c0911030209250e022047451d02040d6918190a0826360d031612080501020e6a1f1d0f1334511d09160e0e100b0e0f651d1e1b2e453825211b140d121d2313692e2f3e37432c170b0a0602020a151f36211d63570f0201020101010101020406091e",
+          "average_hash": "81c7e7caca580000",
+          "difference_hash": "078e8ebeb6b01411"
+        }
+      ],
+      "min_nonblack_ratio": 0.359395
+    },
+    {
       "name": "terminator-boot",
       "dump": "PPSA25872-app0",
       "scale": 4,

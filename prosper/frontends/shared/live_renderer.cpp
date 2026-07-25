@@ -2645,6 +2645,39 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             // rehash and invalidate src_it before the assignment reads it.
                             RttSurf resolved = src_it->second;   // shares pixels (shared_ptr), no deep copy
                             const uint32_t rw = resolved.w, rh = resolved.h;
+                            // #1334: the destination-keyed persistent GPU image did NOT receive these
+                            // pixels — inheriting gpu_valid from the source let a later #780 CPU-copy
+                            // discard leave consumers importing a stale/zero image (Blue Prince's
+                            // compute tonemap read black; #1287/#1381 evidence chain). Copy the
+                            // device-local pixels into the destination identity so gpu_valid is
+                            // genuinely true; on failure the shared CPU pixels are the only truth.
+                            if (resolved.gpu_valid) {
+                                // #1382 review: the copy submits out-of-band, so any pending
+                                // batched pass — including one targeting the DESTINATION identity
+                                // — must reach the queue first, or it would execute after the copy
+                                // and overwrite the resolve while gpu_valid=true. Mirror the
+                                // source-materialization flush above unconditionally here.
+                                {
+                                    const prosper::test::RenderVkCtx& copy_ctx =
+                                        prosper::test::render_vk_ctx();
+                                    if (copy_ctx.ok && backend_submission.pending())
+                                        backend_submission.submit_and_wait(copy_ctx.dev,
+                                                                           copy_ctx.queue, false);
+                                }
+                                std::string copy_error;
+                                if (!prosper::test::copy_persistent_color_target(
+                                        rsrc, rdst, rw, rh,
+                                        prosper::test::backend_color_format(resolved.format),
+                                        copy_error)) {
+                                    resolved.gpu_valid = false;
+                                    static std::atomic<int> warned{0};
+                                    if (warned.fetch_add(1) < 8)
+                                        fprintf(stderr,
+                                                "[msaa] resolve GPU copy failed (%s) — destination "
+                                                "keeps CPU pixels only (#1334)\n",
+                                                copy_error.c_str());
+                                }
+                            }
                             g_rtt[rdst] = std::move(resolved);    // dest inherits src content/extent/format
                             if (getenv("PROSPER_MSAA_LOG"))
                                 fprintf(stderr, "[msaa] resolve copy 0x%llx -> 0x%llx (%ux%u)\n",
