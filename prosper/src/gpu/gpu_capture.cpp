@@ -8,6 +8,7 @@
 
 #include <mutex>
 #include "bc_decode.hpp"
+#include "guest_texture_layout.hpp"
 #include "rdna2_decode.hpp"
 #include "rdna2_to_spirv.hpp"
 #include "tile.hpp"
@@ -350,6 +351,9 @@ uint32_t resolved_linear_row_pitch(const ShaderResource& r, uint32_t width, uint
     const uint64_t tight = checked_mul(width, bpt);
     if (tight > UINT32_MAX) return UINT32_MAX;
     if (r.host_data) return static_cast<uint32_t>(tight);
+    if (const uint32_t registered = guest_linear_texture_row_pitch(
+            r.gpu_addr, static_cast<uint32_t>(tight)))
+        return registered;
     const size_t aligned = linear_sampled_row_pitch(width, bpt);
     return aligned > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(aligned);
 }
@@ -374,8 +378,9 @@ uint64_t resource_footprint_impl(const ShaderResource& r, bool legacy_linear_tig
         } else if (r.tile_mode == static_cast<uint32_t>(TileMode::Linear) &&
                    r.cls == ResourceClass::Texture && r.img_dim == 1u &&
                    !r.compression_enabled && !legacy_linear_tight) {
-            // Guest-backed linear sampled images use GFX10's 256-byte row alignment. Capturing only
-            // width*height*bpt made narrow video planes replay with row drift and omitted their tail.
+            // Guest-backed linear sampled images default to GFX10's 256-byte row alignment. Exact
+            // HLE-producer provenance may override it (AvPlayer's CPU-staged NV12 is tight). Capturing
+            // only width*height*bpt made genuinely padded video planes drift and omitted their tail.
             decoded = checked_mul(resolved_linear_row_pitch(r, w, bpt), h);
         } else {
             decoded = checked_mul(checked_mul(w, h), bpt);

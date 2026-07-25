@@ -8,6 +8,7 @@
 #include "gpu/gpu_execute.hpp"          // DrawItem, set_submit_renderer
 #include "gpu/writer_provenance.hpp"
 #include "gpu/gpu_capture.hpp"          // temporal RTT capture/replay seeds
+#include "gpu/guest_texture_layout.hpp" // exact pitch for HLE-produced guest textures
 #include "gpu/tile.hpp"                 // detile_surface / tiled_surface_bytes / detile_elements
 #include "gpu/bc_decode.hpp"            // BC1/2/3 block decompression -> RGBA8 (#121)
 #include "gpu/shader_resources.hpp"     // ShaderResourceTable / ResourceClass
@@ -203,6 +204,7 @@ struct TextureDecodeKey {
     uint64_t metadata_addr = 0;
     uint64_t metadata_host_data = 0;
     uint64_t metadata_host_data_size = 0;
+    bool preserve_narrow_channels = false;
     bool operator==(const TextureDecodeKey&) const = default;
 };
 
@@ -221,6 +223,7 @@ struct TextureDecodeKeyHash {
         mix(key.max_uncompressed_block_size);
         mix(key.max_compressed_block_size); mix(key.dcc_flags); mix(key.metadata_addr);
         mix(key.metadata_host_data); mix(key.metadata_host_data_size);
+        mix(key.preserve_narrow_channels);
         return hash;
     }
 };
@@ -919,6 +922,40 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     };
                     if (r.cls == RC::Texture || r.cls == RC::StorageImage) {
                         uint32_t tw = r.width ? r.width : 4, th = r.height ? r.height : 4;
+                        // AvPlayer exposes NV12 as a tight R8 luma plane followed by an RG8 UV plane.
+                        // Live resources carry exact HLE allocation provenance. Capture replay has no
+                        // process-local registry, so recognize the same two-plane contract from the
+                        // captured table: matching tight pitches, 2:1 extents, and adjacent guest VAs.
+                        // Keep this deliberately narrower than all RG8 resources; several established
+                        // game paths still rely on the historical narrow-texture coverage broadcast.
+                        const bool avplayer_chroma_layout = [&] {
+                            if (r.cls != RC::Texture || r.format != prosper::gpu::DataFormat::Unorm8 ||
+                                r.num_components != 2 || r.img_dim != 1u || r.tile_mode != 0u ||
+                                r.compression_enabled || r.swizzle[0] != 4 || r.swizzle[1] != 5 ||
+                                r.swizzle[2] != 0 || r.swizzle[3] != 1 || tw > UINT32_MAX / 2u)
+                                return false;
+                            const uint32_t row_bytes = tw * 2u;
+                            if (prosper::gpu::guest_linear_texture_row_pitch(r.gpu_addr, row_bytes) ==
+                                row_bytes)
+                                return true;
+                            if (!r.host_data || r.linear_row_pitch_bytes != row_bytes) return false;
+                            for (const auto& luma : t->resources) {
+                                if (luma.cls != RC::Texture ||
+                                    luma.format != prosper::gpu::DataFormat::Unorm8 ||
+                                    luma.num_components != 1 || luma.img_dim != 1u ||
+                                    luma.tile_mode != 0u || luma.compression_enabled ||
+                                    luma.width != row_bytes ||
+                                    (static_cast<uint64_t>(luma.height) + 1u) / 2u != th ||
+                                    luma.linear_row_pitch_bytes != row_bytes)
+                                    continue;
+                                const uint64_t luma_bytes =
+                                    static_cast<uint64_t>(row_bytes) * luma.height;
+                                if (luma.gpu_addr <= UINT64_MAX - luma_bytes &&
+                                    luma.gpu_addr + luma_bytes == r.gpu_addr)
+                                    return true;
+                            }
+                            return false;
+                        }();
                         const TextureDecodeKey decode_key{
                             r.gpu_addr, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(r.host_data)),
                             r.host_data_size, r.size, static_cast<uint32_t>(r.cls),
@@ -938,6 +975,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                       r.dcc_metadata_host_data))
                                 : 0u,
                             r.compression_enabled ? r.dcc_metadata_host_data_size : 0u,
+                            avplayer_chroma_layout,
                         };
                         auto live_rtt = rtt_on ? g_rtt.find(r.gpu_addr) : g_rtt.end();
                         // Deferred RTT readback (#1284): a GPU-resident target consumed in a way the
@@ -1025,9 +1063,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const bool persistent_fp32_texture =
                             r.format == prosper::gpu::DataFormat::Float32 &&
                             (r.num_components == 1 || r.num_components == 2 || r.num_components == 4);
-                        // Real source bytes per texel. It also determines the pitch of a guest-backed
-                        // linear sampled image: GFX10 aligns those rows to 256 bytes independently of
-                        // component count (e.g. a 1920-wide R8 video chroma plane has a 2048-byte row).
+                        // Real source bytes per texel. It also determines the visible row size used to
+                        // resolve a guest-backed linear image's pitch below: ordinary sampled images use
+                        // GFX10's 256-byte alignment, while exact HLE-producer provenance may stay tight.
                         uint32_t sampled_source_bpt =
                             prosper::gpu::data_format_bytes(r.format) *
                             (r.num_components ? r.num_components : 1u);
@@ -1059,15 +1097,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // texels). Guards keep
                         // this narrow and regression-safe: 2D only (volume/cube layouts untouched); tile_mode
                         // == 0 exactly, so unrecognized/actually-tiled modes are NOT strided (they fall to the
-                        // contiguous read + auto-detile pass); !host_data, so CPU-uploaded tightly-packed
-                        // pixels (test fixtures, staged uploads) are read contiguously unless capture replay
-                        // supplies an explicit guest-layout pitch. The tightly-packed
+                        // contiguous read + auto-detile pass); exact HLE-producer provenance can select a
+                        // tight guest layout (AvPlayer NV12); !host_data keeps ordinary CPU-uploaded test
+                        // fixtures contiguous unless capture replay supplies an explicit guest-layout pitch.
+                        // The tightly-packed
                         // LINEAR_GENERAL layout is a buffer/copy layout, not a sampled-texture layout, so it
                         // does not reach here. r.size is the TIGHT extent (tw*th*bpp), so it cannot gate this.
                         const size_t linear_dst_row = (size_t)tw * sampled_source_bpt;
+                        const uint32_t registered_linear_pitch = linear_dst_row <= UINT32_MAX
+                            ? prosper::gpu::guest_linear_texture_row_pitch(
+                                  r.gpu_addr, static_cast<uint32_t>(linear_dst_row))
+                            : 0;
                         size_t linear_src_row = r.linear_row_pitch_bytes
                             ? r.linear_row_pitch_bytes
-                            : prosper::gpu::linear_sampled_row_pitch(tw, sampled_source_bpt);
+                            : (registered_linear_pitch
+                                   ? registered_linear_pitch
+                                   : prosper::gpu::linear_sampled_row_pitch(tw, sampled_source_bpt));
                         if (const char* lp = getenv("PROSPER_LINPITCH"))
                             linear_src_row = (size_t)strtoull(lp, nullptr, 0) * sampled_source_bpt;
                         const bool linear_padded_read =
@@ -1766,11 +1811,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         } else if (bpt < 4) {
                             // Narrow (single/dual-channel) surface: read at the REAL element size and detile
                             // with the matching bpe geometry (1 B -> 64x64, 2 B -> 64x32 micro-tiles, #119),
-                            // then expand the first component to RGBA8. Legacy 8-bit coverage resources keep
-                            // the grayscale broadcast so shaders can read either .r or .a. A UNORM16 resource
-                            // instead receives the format-defined missing channels (R,0,0,1), after which the
-                            // real T# DST_SEL is applied below. Its R component must be normalized from both
-                            // bytes; selecting byte zero turns a smooth ramp into a repeating sawtooth (#1186).
+                            // then expand to RGBA8. Legacy 8-bit coverage resources keep the grayscale
+                            // broadcast so shaders can read either .r or .a, while the exact AvPlayer NV12
+                            // contract preserves both bytes of its RG8 interleaved U/V plane. A UNORM16
+                            // resource instead receives the format-defined missing channels (R,0,0,1), after
+                            // which the real T# DST_SEL is applied below. Its R component must be normalized
+                            // from both bytes; selecting byte zero makes a smooth ramp a sawtooth (#1186).
                             std::vector<uint8_t> nlin(volume_texels * bpt, 0);
                             bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !getenv("PROSPER_NODETILE");
                             if (tiled) {
@@ -1806,17 +1852,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             }
                             const bool unorm16 = r.format == prosper::gpu::DataFormat::Unorm16;
                             for (size_t t = 0; t < volume_texels; t++) {
-                                uint8_t v = nlin[t * bpt];   // first (coverage) channel
-                                if (unorm16) {
-                                    uint16_t raw;
-                                    std::memcpy(&raw, &nlin[t * bpt], sizeof(raw));
-                                    v = prosper::gpu::unorm16_to_unorm8(raw);
-                                }
                                 uint8_t* p = &texture_pixels[t * 4];
-                                if (unorm16) {
-                                    p[0] = v; p[1] = p[2] = 0; p[3] = 255;
+                                if (avplayer_chroma_layout) {
+                                    const uint8_t* source = &nlin[t * bpt];
+                                    p[0] = source[0];
+                                    p[1] = source[1];
+                                    p[2] = r.num_components > 2 ? source[2] : 0;
+                                    p[3] = 255;
                                 } else {
-                                    p[0] = p[1] = p[2] = p[3] = v;
+                                    uint8_t v = nlin[t * bpt]; // first (coverage) channel
+                                    if (unorm16) {
+                                        uint16_t raw;
+                                        std::memcpy(&raw, &nlin[t * bpt], sizeof(raw));
+                                        v = prosper::gpu::unorm16_to_unorm8(raw);
+                                        p[0] = v; p[1] = p[2] = 0; p[3] = 255;
+                                    } else {
+                                        p[0] = p[1] = p[2] = p[3] = v;
+                                    }
                                 }
                             }
                             narrow_decode_done = true;   // skip the generic 32-bpp detiler below
@@ -2207,10 +2259,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // (isotropic) so this is a no-op for it; carries correct behavior for titles that
                         // request anisotropic filtering.
                         fr.max_aniso_ratio = r.max_aniso_ratio;
-                        // T# DST_SEL channel remap (#261): apply only to REAL-RGBA texels. The narrow
-                        // R->RGBA replication path (narrow_done) already broadcasts coverage to every
-                        // channel — keep it identity so the font/mask path (#102/#256) is untouched.
-                        if (narrow_done) { fr.swizzle[0]=4; fr.swizzle[1]=5; fr.swizzle[2]=6; fr.swizzle[3]=7; }
+                        // T# DST_SEL channel remap (#261): narrow coverage paths already broadcast to
+                        // every channel, so keep them identity. AvPlayer RG8 preserved U/V above and
+                        // still needs its T# mapping (R,G,0,1).
+                        if (narrow_done && !avplayer_chroma_layout) {
+                            fr.swizzle[0]=4; fr.swizzle[1]=5; fr.swizzle[2]=6; fr.swizzle[3]=7;
+                        }
                         else { for (int k=0;k<4;k++) fr.swizzle[k] = r.swizzle[k]; }
                         // PROSPER_ALPHA1: force the sampled alpha to constant 1 (opaque). Diagnostic for a
                         // black scene whose textures decode to real RGB but composite to nothing — if the
