@@ -1292,6 +1292,35 @@ struct SpirvCompute {
         lds_wave = id();        put(types, Op_Variable, {t_ptr, lds_wave, SC_Workgroup});
         t_ptr_wg_u32b = id();   put(types, Op_TypePointer, {t_ptr_wg_u32b, SC_Workgroup, t_u32});
     }
+    // Exact guest-wave vote at a workgroup-uniform site. Vulkan subgroup width is implementation-
+    // defined and need not match the guest's 32/64-lane wave, so publish every lane through shared
+    // scratch and reduce only lanes with the same guest-wave index. Both barriers are required: the
+    // first publishes this vote, while the second prevents a later vote from overwriting scratch
+    // before every invocation has consumed it. The caller proves the site is outside wave-divergent
+    // structured control flow.
+    uint32_t guest_wave_any(uint32_t active_bool) {
+        declare_wave_lds();
+        const uint32_t bit = sel(active_bool, uconst(1), uconst(0));
+        uint32_t p = id();
+        putv(code, Op_AccessChain, {t_ptr_wg_u32b, p, lds_wave, linear_localid});
+        put(code, Op_Store, {p, bit});
+        barrier();
+
+        const uint32_t wave_index = ibin(
+            Op_ShiftRightLogical, linear_localid, uconst(wave_size == 32 ? 5u : 6u));
+        uint32_t any = bfalse();
+        for (uint32_t i = 0; i < local_count; ++i) {
+            uint32_t q = id();
+            putv(code, Op_AccessChain, {t_ptr_wg_u32b, q, lds_wave, uconst(i)});
+            uint32_t value = id();
+            put(code, Op_Load, {t_u32, value, q});
+            const uint32_t same_wave = ucmp(
+                Op_IEqual, wave_index, uconst(i / wave_size));
+            any = lor(any, land(same_wave, ucmp(Op_INotEqual, value, uconst(0))));
+        }
+        barrier();
+        return any;
+    }
     // v_mbcnt_lo/hi: count active lanes below this one. active_bool = this lane's mask bit (EXEC); acc =
     // src1 accumulator (bits); `lo` selects the [0,32) half (lo) or [32,64) half (hi). Combined lo→hi over
     // a wave = the lane's compaction index among active lanes. Populate LDS[lane]=active, barrier, then an
@@ -8165,14 +8194,44 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             std::any_of(Fs.begin(), Fs.end(), [](const ForwardIf& branch) {
                 return branch.on_exec || branch.on_vcc;
             });
+        // A recognized structured loop shader may also contain top-level guest-wave branches and
+        // workgroup-uniform barriers between those regions (DOLL's title grading kernel). The generic
+        // CFG dispatcher cannot contain guest barriers, but routing the entire shader there is
+        // unnecessary: reduce each top-level branch with exact 32/64-lane scratch votes and retain the
+        // structured loop emitter. Restrict this escape hatch to the observed combination where the
+        // dispatcher is ineligible, the loop tree is valid, and neither a vote nor a guest barrier is
+        // nested inside another wave-varying region.
+        auto top_level_pc = [&](uint32_t pc) {
+            for (const auto& parent : Fs) {
+                const uint32_t parent_end = parent.has_else ? parent.merge_pc : parent.target_pc;
+                if (parent.branch_pc < pc && pc < parent_end)
+                    return false;
+            }
+            for (const auto& loop : Ls)
+                if (pc >= loop.header_pc && pc <= loop.backedge_pc)
+                    return false;
+            return true;
+        };
+        const bool barriers_are_top_level =
+            std::all_of(ins.begin(), ins.end(), [&](const Rdna2Inst& in) {
+                return in.fmt != Rdna2Format::SOPP || in.opcode != 0x0a ||
+                       top_level_pc(in.pc);
+            });
+        const bool structured_compute_wave_cfg = exact_compute_wave_cfg && !cfg_dispatch_safe &&
+            !cf_rejected && !Ls.empty() && barriers_are_top_level &&
+            std::all_of(Fs.begin(), Fs.end(), [&](const ForwardIf& branch) {
+                return (!branch.on_exec && !branch.on_vcc) || top_level_pc(branch.branch_pc);
+            });
         if (b.is_compute && cfg_branches && getenv("PROSPER_DBG"))
             std::fprintf(stderr,
                          "[compute-cfg] branches=%zu backedge=%d dispatch_safe=%d complex=%d "
-                         "structured_ifs=%zu loops=%zu cf_rejected=%d exact_wave=%d local=%u wave=%u\n",
+                         "structured_ifs=%zu loops=%zu cf_rejected=%d exact_wave=%d "
+                         "structured_wave=%d local=%u wave=%u\n",
                          cfg_branches, cfg_has_backedge, cfg_dispatch_safe, complex_compute_cfg,
                          Fs.size(), Ls.size(), cf_rejected, exact_compute_wave_cfg,
+                         structured_compute_wave_cfg,
                          b.local_count, b.wave_size);
-        if (exact_compute_wave_cfg) {
+        if (exact_compute_wave_cfg && !structured_compute_wave_cfg) {
             // Native Vulkan subgroup widths may be 8/16/32 while the guest wave is 32/64. A native
             // subgroupAny would let different pieces of one guest wave take different scalar edges.
             // The dispatcher performs the reduction through Workgroup scratch and synchronized common
@@ -8351,10 +8410,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 // A poisoned SCC (0: last written by a 64-bit mask op) cannot condition a real
                 // structured if — reject (the ISA-audit #879 stale-SCC consumer).
                 if (!F.on_exec && !F.on_vcc && !rs.scc) return false;
-                // Compute VCC/EXEC branches returned through the exact guest-wave dispatcher above.
-                // The structured path is per-invocation (VS/FS) or consumes a genuinely scalar SCC.
-                if (b.is_compute && (F.on_exec || F.on_vcc)) return false;
+                // Compute VCC/EXEC branches normally return through the exact guest-wave dispatcher.
+                // The narrow structured-wave path above accepts only top-level vote sites, where all
+                // workgroup invocations may participate in the scratch barriers uniformly.
+                if (b.is_compute && (F.on_exec || F.on_vcc) && !structured_compute_wave_cfg)
+                    return false;
                 uint32_t cond_reg = F.on_exec ? rs.exec : (F.on_vcc ? rs.vcc : rs.scc);
+                if (b.is_compute && (F.on_exec || F.on_vcc))
+                    cond_reg = b.guest_wave_any(cond_reg);
                 uint32_t exec_cond = F.on_scc0 ? cond_reg : b.bsel(cond_reg, b.bfalse(), b.btrue());
                 const uint32_t preblock = b.cur_block;      // block holding the OpBranchConditional
                 if (!F.has_else) {

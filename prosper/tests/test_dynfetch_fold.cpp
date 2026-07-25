@@ -11,6 +11,7 @@
 // round-trip verified with llvm-mc -mcpu=gfx1030.
 #include "../src/gpu/gpu_execute.hpp"
 #include "../src/gpu/rdna2_to_spirv.hpp"
+#include <algorithm>
 #include <cstdio>
 #include <vector>
 
@@ -976,6 +977,93 @@ int main() {
           !recompile_compute(stride_zero_raw, std::size(stride_zero_raw),
                              &stride_zero_raw_table, raw_config).empty(),
           "#636: direct stride-zero raw buffer remains discovered and realizable");
+
+    // UE4 emits a tiny one-dimensional clear kernel whose V# publishes the whole allocation's
+    // record count. That can exceed the normal 256 MiB upload cap even though this dispatch touches
+    // only a small prefix. Prove the exact GlobalInvocationId.x address shape before narrowing the
+    // resource to the submitted thread extent; without the launch proof it must remain fail-closed.
+    constexpr uint32_t linear_clear_bytes = 2047u * 1136u + 4u;
+    alignas(16) static uint8_t linear_clear_output[linear_clear_bytes];
+    const uint64_t linear_clear_base = (uint64_t)(uintptr_t)linear_clear_output;
+    const uint32_t linear_clear_seed[4] = {
+        (uint32_t)linear_clear_base,
+        ((uint32_t)(linear_clear_base >> 32) & 0xFFFFu) | (1136u << 16),
+        0x0010C01Du,
+        0xA1B00FACu,
+    };
+    const uint32_t linear_clear[] = {
+        0xD7460000u, 0x04010C04u, // v_lshl_add_u32 v0, s4, 6, v0
+        0x7E020280u,              // v_mov_b32 v1, 0
+        0xE0102000u, 0x80000100u, // buffer_store_dword v1, v0, s[0:3], 0 idxen
+        0xBF810000u,
+    };
+    CHECK(resolve_dynamic_fetch(linear_clear, std::size(linear_clear), linear_clear_seed,
+                                std::size(linear_clear_seed), 0).empty(),
+          "generic descriptor fold keeps the oversized formatless store rejected");
+    ShaderResourceTable unproven_linear_clear_table;
+    add_compute_buffer_resources(unproven_linear_clear_table, linear_clear,
+                                 std::size(linear_clear), linear_clear_seed,
+                                 std::size(linear_clear_seed));
+    CHECK(unproven_linear_clear_table.resources.empty(),
+          "oversized formatless raw store stays rejected without dispatch proof");
+    uint32_t short_linear_clear_seed[4];
+    std::copy(std::begin(linear_clear_seed), std::end(linear_clear_seed),
+              short_linear_clear_seed);
+    short_linear_clear_seed[2] = 1; // one 1136-byte record cannot cover the dispatch footprint
+    ShaderResourceTable short_linear_clear_table;
+    add_compute_buffer_resources(short_linear_clear_table, linear_clear,
+                                 std::size(linear_clear), short_linear_clear_seed,
+                                 std::size(short_linear_clear_seed), 64, 2048, 4);
+    CHECK(short_linear_clear_table.resources.empty(),
+          "linear clear proof cannot expand past the guest descriptor's declared range");
+    uint32_t bounded_linear_clear_seed[4];
+    std::copy(std::begin(linear_clear_seed), std::end(linear_clear_seed),
+              bounded_linear_clear_seed);
+    bounded_linear_clear_seed[2] = 3000; // valid but below the generic 256 MiB ceiling
+    ShaderResourceTable bounded_linear_clear_table;
+    add_compute_buffer_resources(bounded_linear_clear_table, linear_clear,
+                                 std::size(linear_clear), bounded_linear_clear_seed,
+                                 std::size(bounded_linear_clear_seed), 64, 2048, 4);
+    CHECK(bounded_linear_clear_table.resources.size() == 1 &&
+              bounded_linear_clear_table.resources[0].size == linear_clear_bytes,
+          "proven formatless clear suppresses its redundant generic SRT resource");
+    uint32_t typed_linear_clear_seed[4];
+    std::copy(std::begin(linear_clear_seed), std::end(linear_clear_seed),
+              typed_linear_clear_seed);
+    typed_linear_clear_seed[2] = 2048;
+    typed_linear_clear_seed[3] =
+        (typed_linear_clear_seed[3] & ~(0x7Fu << 12)) | (56u << 12); // RGBA8 UNORM
+    ShaderResourceTable typed_linear_clear_table;
+    add_compute_buffer_resources(typed_linear_clear_table, linear_clear,
+                                 std::size(linear_clear), typed_linear_clear_seed,
+                                 std::size(typed_linear_clear_seed), 64, 2048, 4);
+    CHECK(typed_linear_clear_table.resources.size() == 1 &&
+              typed_linear_clear_table.resources[0].format == DataFormat::Unorm8 &&
+              typed_linear_clear_table.resources[0].size == 2048u * 1136u,
+          "typed clear keeps its width-aware generic resource instead of a Uint32 alias");
+    ShaderResourceTable linear_clear_table;
+    add_compute_buffer_resources(linear_clear_table, linear_clear, std::size(linear_clear),
+                                 linear_clear_seed, std::size(linear_clear_seed),
+                                 64, 2048, 4);
+    assign_convention_bindings(linear_clear_table, 2);
+    ComputeShaderConfig linear_clear_config;
+    linear_clear_config.user_sgprs.assign(linear_clear_seed, linear_clear_seed + 4);
+    linear_clear_config.local_x = 64;
+    linear_clear_config.local_y = linear_clear_config.local_z = 1;
+    linear_clear_config.tgid_x_en = true;
+    CHECK(linear_clear_table.resources.size() == 1,
+          "proven linear raw store creates exactly one resource");
+    CHECK(linear_clear_table.resources.size() == 1 &&
+              linear_clear_table.resources[0].size == linear_clear_bytes &&
+              linear_clear_table.resources[0].stride == 1136 &&
+              linear_clear_table.resources[0].format == DataFormat::Uint32 &&
+              linear_clear_table.resources[0].num_components == 1 &&
+              linear_clear_table.resources[0].fetch_pc == 3,
+          "proven linear raw store is bounded to the submitted X invocation extent");
+    CHECK(!recompile_compute(linear_clear, std::size(linear_clear),
+                             &linear_clear_table, linear_clear_config).empty(),
+          "proven linear raw store recompiles through its exact resource");
+
     const uint32_t atomic_umax[] = {
         0xE0E00004u, 0x80000000u, // buffer_atomic_umax v0, v0, s[0:3], offset:4
         0xBF810000u,
