@@ -11,6 +11,7 @@
 // round-trip verified with llvm-mc -mcpu=gfx1030.
 #include "../src/gpu/gpu_execute.hpp"
 #include "../src/gpu/rdna2_to_spirv.hpp"
+#include <algorithm>
 #include <cstdio>
 #include <vector>
 
@@ -1005,6 +1006,16 @@ int main() {
                                  std::size(linear_clear_seed));
     CHECK(unproven_linear_clear_table.resources.empty(),
           "oversized formatless raw store stays rejected without dispatch proof");
+    uint32_t short_linear_clear_seed[4];
+    std::copy(std::begin(linear_clear_seed), std::end(linear_clear_seed),
+              short_linear_clear_seed);
+    short_linear_clear_seed[2] = 1; // one 1136-byte record cannot cover the dispatch footprint
+    ShaderResourceTable short_linear_clear_table;
+    add_compute_buffer_resources(short_linear_clear_table, linear_clear,
+                                 std::size(linear_clear), short_linear_clear_seed,
+                                 std::size(short_linear_clear_seed), 64, 2048, 4);
+    CHECK(short_linear_clear_table.resources.empty(),
+          "linear clear proof cannot expand past the guest descriptor's declared range");
     ShaderResourceTable linear_clear_table;
     add_compute_buffer_resources(linear_clear_table, linear_clear, std::size(linear_clear),
                                  linear_clear_seed, std::size(linear_clear_seed),

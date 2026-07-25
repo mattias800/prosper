@@ -4016,6 +4016,13 @@ int main() {
                    gotStructuredWave[64], gotStructuredWave[127]);
         CHECK(gotStructuredWave.size() == 128 && badStructuredWave == 0,
               "#1373: structured branch performs one exact 64-lane guest-wave vote");
+
+        std::vector<uint32_t> divergentBarrierStructuredWave(
+            std::begin(structured_wave_cs), std::end(structured_wave_cs));
+        divergentBarrierStructuredWave[3] = 0xBF8A0000u; // s_barrier inside the top-level VCC arm
+        CHECK(recompile_valu(divergentBarrierStructuredWave.data(),
+                             divergentBarrierStructuredWave.size(), 2, 2).empty(),
+              "#1373: structured exact-wave path rejects a barrier in a conditional arm");
     }
 
     // PARTIALLY OVERLAPPING loops (back-edge into another loop's body without proper nesting) must

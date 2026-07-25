@@ -2199,7 +2199,9 @@ static uint32_t linear_dispatch_raw_store_size(const uint32_t* code, size_t dwor
     const uint64_t required =
         static_cast<uint64_t>(threads_x - 1u) * descriptor.stride + sizeof(uint32_t);
     constexpr uint32_t kMaxProvenLinearStore = 16u << 20;
-    return required && required <= kMaxProvenLinearStore ? static_cast<uint32_t>(required) : 0;
+    if (!required || required > descriptor.size_bytes || required > kMaxProvenLinearStore)
+        return 0;
+    return static_cast<uint32_t>(required);
 }
 
 std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,

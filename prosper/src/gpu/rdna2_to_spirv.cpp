@@ -8199,24 +8199,28 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // CFG dispatcher cannot contain guest barriers, but routing the entire shader there is
         // unnecessary: reduce each top-level branch with exact 32/64-lane scratch votes and retain the
         // structured loop emitter. Restrict this escape hatch to the observed combination where the
-        // dispatcher is ineligible, the loop tree is valid, and no vote site is nested inside another
-        // wave-varying region.
-        auto top_level_wave_branch = [&](const ForwardIf& branch) {
+        // dispatcher is ineligible, the loop tree is valid, and neither a vote nor a guest barrier is
+        // nested inside another wave-varying region.
+        auto top_level_pc = [&](uint32_t pc) {
             for (const auto& parent : Fs) {
-                if (&parent == &branch) continue;
                 const uint32_t parent_end = parent.has_else ? parent.merge_pc : parent.target_pc;
-                if (parent.branch_pc < branch.branch_pc && branch.branch_pc < parent_end)
+                if (parent.branch_pc < pc && pc < parent_end)
                     return false;
             }
             for (const auto& loop : Ls)
-                if (branch.branch_pc >= loop.header_pc && branch.branch_pc <= loop.backedge_pc)
+                if (pc >= loop.header_pc && pc <= loop.backedge_pc)
                     return false;
             return true;
         };
+        const bool barriers_are_top_level =
+            std::all_of(ins.begin(), ins.end(), [&](const Rdna2Inst& in) {
+                return in.fmt != Rdna2Format::SOPP || in.opcode != 0x0a ||
+                       top_level_pc(in.pc);
+            });
         const bool structured_compute_wave_cfg = exact_compute_wave_cfg && !cfg_dispatch_safe &&
-            !cf_rejected && !Ls.empty() &&
+            !cf_rejected && !Ls.empty() && barriers_are_top_level &&
             std::all_of(Fs.begin(), Fs.end(), [&](const ForwardIf& branch) {
-                return (!branch.on_exec && !branch.on_vcc) || top_level_wave_branch(branch);
+                return (!branch.on_exec && !branch.on_vcc) || top_level_pc(branch.branch_pc);
             });
         if (b.is_compute && cfg_branches && getenv("PROSPER_DBG"))
             std::fprintf(stderr,
