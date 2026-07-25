@@ -4,7 +4,9 @@
 // result as MRT0.R. The word0 encoding (0xf0bc0108) is byte-identical to Blue Prince's live
 // packets from the #1271 reject log — this test fails (recompile reject) without the 2D dref
 // lowering. The manual-compare semantics are asserted end-to-end: with compare func GREATER and
-// dref 0.5, texels darker than 0.5 pass (1.0) and brighter texels fail (0.0).
+// dref 0.5, texels darker than 0.5 pass (1.0) and brighter texels fail (0.0). Both S# filter paths
+// are covered: NEAREST remains a single comparison, while LINEAR compare-before-filter PCF produces
+// a fractional 0.5 result at the boundary between passing and failing texels (#1394).
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include "../src/gpu/shader_resources.hpp"
 #include "render_runner.h"
@@ -45,6 +47,7 @@ int main() {
     { ShaderResource t{}; t.cls = ResourceClass::Texture; t.binding = 4; t.img_dim = 1;
       t.width = 8; t.height = 8; t.sgpr_base = 8;
       t.depth_compare = true; t.depth_compare_func = 4;   // GREATER: pass = dref > stored
+      t.mag_filter = t.min_filter = 0;                    // exercise the exact NEAREST path
       rt.resources.push_back(t); }
     std::vector<uint32_t> frag = recompile_fragment(ps, sizeof(ps)/sizeof(ps[0]), &rt);
     CHECK(!vert.empty() && vert[0] == 0x07230203u, "recompiled VS -> SPIR-V");
@@ -59,9 +62,14 @@ int main() {
         uint8_t* t = &tex[(y * 8 + x) * 4];
         t[0] = x < 4 ? 0 : 230; t[1] = 0; t[2] = 0; t[3] = 255;
     }
-    prosper::test::TexDesc td{ /*binding*/4, 8, 8, tex.data() };
+    prosper::test::FrameResource nearest_tex;
+    nearest_tex.binding = 4; nearest_tex.set = 1;
+    nearest_tex.tex_rgba = tex.data(); nearest_tex.tw = 8; nearest_tex.th = 8;
+    nearest_tex.mag_filter = nearest_tex.min_filter = 0;
+    std::vector<prosper::test::FrameResource> nearest_resources{nearest_tex};
 
-    std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vert, frag, W, H, nullptr, nullptr, nullptr, &td);
+    std::vector<uint8_t> px = prosper::test::render_triangle_rgba(
+        vert, frag, W, H, nullptr, nullptr, nullptr, nullptr, &nearest_resources);
     CHECK(px.size() == (size_t)W * H * 4, "shadow-compare pipeline rendered a frame");
     if (px.size() != (size_t)W * H * 4) { printf("== FAIL: render failed ==\n"); return 1; }
 
@@ -83,6 +91,39 @@ int main() {
           "dref 0.5 GREATER passes (1.0) where stored depth is 0.0");
     CHECK(right_total && right_fail == right_total,
           "dref 0.5 GREATER fails (0.0) where stored depth is ~0.9");
+
+    // Fix #1394: hardware LINEAR comparison sampling compares all four footprint texels first and
+    // only then bilinearly weights their boolean results. Pin u=v=0.5 so the 8x8 footprint straddles
+    // the x=3 pass / x=4 fail boundary at exactly half weight. The old lowering linearly sampled a
+    // depth of ~0.45 and hard-thresholded once, yielding 255 instead of the required 128.
+    const uint32_t ps_linear_pcf[] = {
+        0x7e0202f0u,                                          // v1 = 0.5 DREF
+        0x7e0402f0u,                                          // v2 = 0.5 u
+        0x7e0602f0u,                                          // v3 = 0.5 v
+        0xf0bc0108u, 0x00820401u,                             // image_sample_c_lz v4, v[1:3], s8, s16
+        0xf800080fu, 0x07060504u,                             // exp mrt0 v4..v7
+        0xbf810000u,
+    };
+    ShaderResourceTable linear_rt = rt;
+    linear_rt.resources[0].mag_filter = linear_rt.resources[0].min_filter = 1;
+    std::vector<uint32_t> linear_frag = recompile_fragment(
+        ps_linear_pcf, sizeof(ps_linear_pcf) / sizeof(ps_linear_pcf[0]), &linear_rt);
+    CHECK(!linear_frag.empty() && linear_frag[0] == 0x07230203u,
+          "recompiled LINEAR image_sample_c_lz PCF shader");
+    if (!linear_frag.empty()) {
+        prosper::test::FrameResource linear_tex = nearest_tex;
+        linear_tex.mag_filter = linear_tex.min_filter = 1;
+        std::vector<prosper::test::FrameResource> linear_resources{linear_tex};
+        std::vector<uint8_t> pcf = prosper::test::render_triangle_rgba(
+            vert, linear_frag, W, H, nullptr, nullptr, nullptr, nullptr, &linear_resources);
+        CHECK(pcf.size() == (size_t)W * H * 4, "LINEAR shadow-PCF pipeline rendered a frame");
+        if (pcf.size() == (size_t)W * H * 4) {
+            const uint8_t r = pcf[(((size_t)H / 2 * W + W / 2) * 4)];
+            printf("  linear PCF boundary R=%u (want 128)\n", r);
+            CHECK(r >= 127 && r <= 128,
+                  "LINEAR PCF returns half coverage at a pass/fail texel boundary (#1394)");
+        }
+    }
 
     // #1308: sampled-depth bridge recency tracks writers, not mere depth attachment users.
     CHECK(!prosper::test::persistent_ds_pass_may_write_depth(

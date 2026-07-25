@@ -884,40 +884,93 @@ struct SpirvCompute {
         const uint32_t bits = bcu(result);
         out[0] = out[1] = out[2] = out[3] = bits;
     }
-    // IMAGE_SAMPLE_C_LZ on a plain 2D texture, lowered as a MANUAL depth compare: sample the shadow
-    // map as an ordinary float texture at explicit LOD 0 and compare its .x against DREF in-shader
-    // using the S#'s compare function. The hardware path (compareEnable sampler over a depth-format
-    // view) needs backend machinery the color-texture path lacks (see the render-runner S# note);
-    // the manual form is exact for NEAREST shadow maps and approximates LINEAR PCF with a hard
-    // threshold. Vulkan compare semantics: result = (reference OP stored); the SQ S# compare enum
+    // Compare one sampled/fetched depth value against DREF and return raw float bits containing 0/1.
+    uint32_t image_dref_compare_bits(uint32_t depth, uint32_t dref_bits, uint32_t compare_func) {
+        if (compare_func == 0u) return bcu(fconstf(0.0f));   // NEVER
+        if (compare_func == 7u) return bcu(fconstf(1.0f));   // ALWAYS
+        uint32_t op;
+        switch (compare_func) {
+            case 1u: op = Op_FOrdLessThan;         break;
+            case 2u: op = Op_FOrdEqual;            break;
+            case 3u: op = Op_FOrdLessThanEqual;    break;
+            case 4u: op = Op_FOrdGreaterThan;      break;
+            case 5u: op = Op_FOrdNotEqual;         break;
+            default: op = Op_FOrdGreaterThanEqual; break;   // 6 GEQUAL
+        }
+        uint32_t cmp = id(); put(code, op, {t_bool, cmp, bcf(dref_bits), depth});
+        uint32_t result = id();
+        put(code, Op_Select, {t_f32, result, cmp, fconstf(1.0f), fconstf(0.0f)});
+        return bcu(result);
+    }
+    // IMAGE_SAMPLE_C_LZ on a plain 2D texture, lowered as a MANUAL depth compare. The hardware path
+    // (compareEnable sampler over a depth-format view) needs backend machinery the color-texture path
+    // lacks (see the render-runner S# note). NEAREST retains the exact single sampled tap. LINEAR uses
+    // four level-0 fetches, compares each independently, then bilinearly weights the booleans — the
+    // compare-before-filter order required for 2x2 PCF. Vulkan compare semantics: result =
+    // (reference OP stored); the SQ S# compare enum
     // (WORD0 [14:12]) matches VkCompareOp order — 0 NEVER, 1 LESS, 2 EQUAL, 3 LEQUAL, 4 GREATER,
     // 5 NOTEQUAL, 6 GEQUAL, 7 ALWAYS. CONFIDENCE: MED (standard AMD sampler enum ordering; Blue
     // Prince renders visually-correct shadows with it — the live A/B on #1271).
     void image_sample_dref_manual_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
-                                     uint32_t dref_bits, uint32_t compare_func, uint32_t out[4]) {
+                                     uint32_t dref_bits, uint32_t compare_func,
+                                     bool linear_filter, uint32_t out[4]) {
         uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
+        if (linear_filter) {
+            if (!declared_image_query) {
+                put(caps, Op_Capability, {Cap_ImageQuery});
+                declared_image_query = true;
+            }
+            uint32_t img = id(); put(code, Op_Image, {tex_binding_img[binding], img, si});
+            uint32_t size = id(); put(code, Op_ImageQuerySizeLod, {t_v2i(), size, img, uconst(0)});
+            uint32_t w_i = id(); put(code, Op_CompositeExtract, {t_i32, w_i, size, 0});
+            uint32_t h_i = id(); put(code, Op_CompositeExtract, {t_i32, h_i, size, 1});
+            const uint32_t w = i2u(w_i), h = i2u(h_i);
+
+            // Normalized linear filtering addresses texel centers at n + 0.5. Convert to that
+            // footprint, then clamp both taps independently to reproduce clamp-to-edge.
+            const uint32_t half = bcu(fconstf(0.5f));
+            const uint32_t x = fbin(Op_FSub, fbin(Op_FMul, u_bits, cvt_i2f(w)), half);
+            const uint32_t y = fbin(Op_FSub, fbin(Op_FMul, v_bits, cvt_i2f(h)), half);
+            const uint32_t fx = fext1(Glsl_Fract, x), fy = fext1(Glsl_Fract, y);
+            const uint32_t bx = cvt_f2i(fext1(Glsl_Floor, x));
+            const uint32_t by = cvt_f2i(fext1(Glsl_Floor, y));
+            const uint32_t max_x = sbin(Op_ISub, w, uconst(1));
+            const uint32_t max_y = sbin(Op_ISub, h, uconst(1));
+            auto clamp_coord = [&](uint32_t value, uint32_t maximum) {
+                return sext2(Glsl_SMin, sext2(Glsl_SMax, value, uconst(0)), maximum);
+            };
+            const uint32_t x0 = clamp_coord(bx, max_x);
+            const uint32_t y0 = clamp_coord(by, max_y);
+            const uint32_t x1 = clamp_coord(sbin(Op_IAdd, bx, uconst(1)), max_x);
+            const uint32_t y1 = clamp_coord(sbin(Op_IAdd, by, uconst(1)), max_y);
+
+            auto compare_fetch = [&](uint32_t tx, uint32_t ty) {
+                uint32_t coord = id();
+                put(code, Op_CompositeConstruct, {t_v2u(), coord, tx, ty});
+                uint32_t texel = id();
+                put(code, Op_ImageFetch,
+                    {t_v4f, texel, img, coord, ImgOp_Lod, uconst(0)});
+                uint32_t depth = id();
+                put(code, Op_CompositeExtract, {t_f32, depth, texel, 0});
+                return image_dref_compare_bits(depth, dref_bits, compare_func);
+            };
+            const uint32_t c00 = compare_fetch(x0, y0);
+            const uint32_t c10 = compare_fetch(x1, y0);
+            const uint32_t c01 = compare_fetch(x0, y1);
+            const uint32_t c11 = compare_fetch(x1, y1);
+            auto lerp = [&](uint32_t a, uint32_t b, uint32_t t) {
+                return fbin(Op_FAdd, a, fbin(Op_FMul, fbin(Op_FSub, b, a), t));
+            };
+            const uint32_t bits = lerp(lerp(c00, c10, fx), lerp(c01, c11, fx), fy);
+            out[0] = out[1] = out[2] = out[3] = bits;
+            return;
+        }
+
         uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
         uint32_t res   = id(); put(code, Op_ImageSampleExplicitLod,
                                    {t_v4f, res, si, coord, ImgOp_Lod, fconstf(0.0f)});
         uint32_t depth = id(); put(code, Op_CompositeExtract, {t_f32, depth, res, 0});
-        uint32_t result;
-        if (compare_func == 0u)      result = fconstf(0.0f);   // NEVER
-        else if (compare_func == 7u) result = fconstf(1.0f);   // ALWAYS
-        else {
-            uint32_t op;
-            switch (compare_func) {
-                case 1u: op = Op_FOrdLessThan;         break;
-                case 2u: op = Op_FOrdEqual;            break;
-                case 3u: op = Op_FOrdLessThanEqual;    break;
-                case 4u: op = Op_FOrdGreaterThan;      break;
-                case 5u: op = Op_FOrdNotEqual;         break;
-                default: op = Op_FOrdGreaterThanEqual; break;   // 6 GEQUAL
-            }
-            uint32_t cmp = id(); put(code, op, {t_bool, cmp, bcf(dref_bits), depth});
-            uint32_t r   = id(); put(code, Op_Select, {t_f32, r, cmp, fconstf(1.0f), fconstf(0.0f)});
-            result = r;
-        }
-        const uint32_t bits = bcu(result);
+        const uint32_t bits = image_dref_compare_bits(depth, dref_bits, compare_func);
         out[0] = out[1] = out[2] = out[3] = bits;
     }
     // image_sample_b 2D: implicit-LOD sample with an LOD BIAS (bias_bits float). Bias only means
@@ -6275,7 +6328,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // shadow map (see image_sample_dref_manual_2d for why not a compare sampler).
                     b.declare_texture(res->binding, Dim_2D, false);
                     b.image_sample_dref_manual_2d(res->binding, vread(cvg(1)), vread(cvg(2)),
-                                                  vread(cvg(0)), res->depth_compare_func, out);
+                                                  vread(cvg(0)), res->depth_compare_func,
+                                                  res->mag_filter != 0u, out);
                 } else { ok = false; return true; }
             } else if (is_gather_lz || is_gather_lz_o) {
                 // gather4 dmask selects ONE channel (must be a single bit); the result is always the
