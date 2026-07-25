@@ -1017,6 +1017,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const bool persistent_fp16_texture =
                             r.format == prosper::gpu::DataFormat::Float16 &&
                             (r.num_components == 1 || r.num_components == 2 || r.num_components == 4);
+                        // Float32 sampled textures narrow to RGBA16F below. Like the existing fp16 path,
+                        // the decoded result is fully determined by the exact source bytes and descriptor
+                        // shape, so immutable versions can use the same validated cross-submit cache.
+                        // This matters for titles that repeatedly bind large Float32 post-process inputs:
+                        // otherwise every callback re-detiles and scalar-narrows the complete surface.
+                        const bool persistent_fp32_texture =
+                            r.format == prosper::gpu::DataFormat::Float32 &&
+                            (r.num_components == 1 || r.num_components == 2 || r.num_components == 4);
                         // Real source bytes per texel. It also determines the pitch of a guest-backed
                         // linear sampled image: GFX10 aligns those rows to 256 bytes independently of
                         // component count (e.g. a 1920-wide R8 video chroma plane has a 2048-byte row).
@@ -1038,6 +1046,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             !has_live_rtt && !r.host_data && r.img_dim == 1u &&
                             r.cls == RC::Texture &&
                             (persistent_unorm8_texture || persistent_fp16_texture ||
+                             persistent_fp32_texture ||
                              persistent_bc_block_bytes != 0);
                         const bool persistent_source_is_tiled =
                             persistent_sampled_texture && !getenv("PROSPER_NODETILE") &&
@@ -1080,9 +1089,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                           bw, bh, persistent_bc_block_bytes, r.tile_mode)
                                     : static_cast<size_t>(bw) * bh * persistent_bc_block_bytes;
                             }
-                            // fp16 source is 2 B/component; unorm8 is 1 B/component.
-                            const uint32_t source_bpt =
-                                r.num_components * (persistent_fp16_texture ? 2u : 1u);
+                            // fp32/fp16 sources are 4/2 B per component; unorm8 is 1 B/component.
+                            const uint32_t source_component_bytes = persistent_fp32_texture ? 4u
+                                : (persistent_fp16_texture ? 2u : 1u);
+                            const uint32_t source_bpt = r.num_components * source_component_bytes;
                             if (persistent_source_is_tiled)
                                 return prosper::gpu::tiled_surface_bytes(
                                     tw, th, r.tile_mode, persistent_pitch, source_bpt);
@@ -1314,6 +1324,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             fr.th = decoded_reuse->output_height;
                             fr.td = is_volume ? r.depth : 1u;
                             fr.img_dim = r.img_dim;
+                            if (sampled_source_f32)
+                                fr.texture_format = VK_FORMAT_R16G16B16A16_SFLOAT;
                             // #1272: plain 2D guest textures only — cube outputs stack 6 faces into
                             // one 2D image (fr.th != th), and volumes keep their own path; generated
                             // mips across face/slice boundaries would bleed.

@@ -271,11 +271,11 @@ int main() {
     };
     CHECK(!recompile_valu(compute_vcc_loop, sizeof(compute_vcc_loop)/sizeof(compute_vcc_loop[0]), 0, 0).empty(),
           "a proven-uniform VCCZ-exit loop structurizes in the compute shell (#590)");
-    // The SAME loop with v1 defined from a VGPR (`v_mov_b32 v1, v0`) fails the uniform-VOP1-from-
-    // scalar proof clause: the compare can no longer be proven wave-uniform, so compute still
-    // rejects it loudly (a varying trip count needs a real wave reduction).
+    // The SAME loop with v1 defined from an unresolved VGPR (`v_mov_b32 v1, v2`) cannot prove the
+    // compare wave-uniform, so compute still rejects it loudly (a varying trip count needs a real
+    // wave reduction). Do not use v0 here: the preceding `v_mov_b32 v0, 0` makes that chain uniform.
     const uint32_t compute_vcc_loop_varying[] = {
-        0xBE800380u, 0x7E000280u, 0x7E020300u, 0x7D020200u, 0xBF860004u,
+        0xBE800380u, 0x7E000280u, 0x7E020302u, 0x7D020200u, 0xBF860004u,
         0x060000FFu, 0x3E800000u, 0x81008100u, 0xBF82FFFAu, 0xBF810000u,
     };
     CHECK(recompile_valu(compute_vcc_loop_varying,

@@ -2958,8 +2958,10 @@ bool instruction_may_change_exec(const Rdna2Inst& in) {
 // branch as per-invocation structured control flow is exact only when the VCC producer is provably
 // uniform across the wave. Dead Cells' light loops use the narrow compiler shape
 //   v_cvt_i32_f32 vBOUND, sBOUND; ...; v_cmp_* vcc, sCOUNTER, vBOUND; s_cbranch_vccz EXIT
-// so every active lane makes the same comparison. Keep the proof deliberately local and reject a
-// varying/unresolved VGPR bound rather than silently changing wave semantics.
+// so every active lane makes the same comparison. Unity also derives the bound through a short
+// lane-local VALU chain fed only by scalar sources. Trace that chain backwards: uniform inputs stay
+// uniform through ordinary VOP1/VOP2 arithmetic, while lane permutations, VCC-dependent selects,
+// carry chains, interpolants, and unresolved VGPR inputs remain rejected.
 // True when `in` provably cannot overwrite VCC — used by vcc_exit_is_wave_uniform's compare-finding
 // walk (#590) to look past instructions scheduled between the VOPC and its consuming branch (real
 // UE4 compute kernels hoist ~15 unrelated ALU ops in between). Anything not provably safe stops the
@@ -3022,37 +3024,43 @@ bool vcc_exit_is_wave_uniform(const std::vector<Rdna2Inst>& ins, uint32_t branch
     }
     if (!compare || compare->fmt != Rdna2Format::VOPC || vopc_is_cmpx(compare->opcode)) return false;
 
-    auto uniform_operand = [&](const Operand& operand) -> bool {
-        if (operand.kind == OperandKind::SGPR || operand.kind == OperandKind::InlineInt ||
-            operand.kind == OperandKind::InlineFloat || operand.kind == OperandKind::Literal)
-            return true;
+    std::function<bool(const Operand&, uint32_t)> uniform_operand_at;
+    uniform_operand_at = [&](const Operand& operand, uint32_t use_pc) -> bool {
+        if (operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special ||
+            operand.kind == OperandKind::InlineInt || operand.kind == OperandKind::InlineFloat ||
+            operand.kind == OperandKind::Literal)
+            return true; // scalar-register sources (including VCC halves) broadcast one wave value
         if (operand.kind != OperandKind::VGPR) return false;
         for (auto it = ins.rbegin(); it != ins.rend(); ++it) {
-            if (it->pc >= compare->pc) continue;
+            if (it->pc >= use_pc) continue;
             const uint32_t writes = vgpr_write_count(*it);
             if (!writes || operand.value < it->dst.value ||
                 operand.value >= it->dst.value + (int32_t)writes) continue;
-            const bool uniform_unary = it->fmt == Rdna2Format::VOP1 &&
-                (it->opcode == 0x01 || (it->opcode >= 0x05 && it->opcode <= 0x08));
-            const bool uniform_definition = it->dst.value == operand.value && uniform_unary &&
-                !it->has_modifier && !it->has_dpp && it->sdwa_dst_sel == 6 &&
-                it->sdwa_src0_sel == 6 && it->n_src == 1 &&
-                (it->src[0].kind == OperandKind::SGPR ||
-                 it->src[0].kind == OperandKind::InlineInt ||
-                 it->src[0].kind == OperandKind::InlineFloat ||
-                 it->src[0].kind == OperandKind::Literal);
-            if (!uniform_definition) return false;
-            // The write makes every currently active lane uniform. It remains so only while EXEC is
-            // unchanged; a later widen could reactivate lanes that retained an older varying value.
+            if (it->dst.value != operand.value || it->has_dpp) return false;
+            // The write makes every currently active lane uniform. Keep the original conservative
+            // EXEC rule: any later mask change could expose a lane that retained an older value.
             for (const auto& between : ins)
                 if (between.pc > it->pc && between.pc < compare->pc &&
                     instruction_may_change_exec(between)) return false;
+
+            bool pure_lane_alu = false;
+            if (it->fmt == Rdna2Format::VOP1) {
+                pure_lane_alu = it->n_src == 1;
+            } else if (it->fmt == Rdna2Format::VOP2) {
+                // v_cndmask consumes VCC; the carry family consumes/produces VCC. Neither preserves
+                // scalar-source uniformity as a simple lane-local expression.
+                pure_lane_alu = it->n_src == 2 && it->opcode != 0x01 &&
+                    (it->opcode < 0x28 || it->opcode > 0x2a);
+            }
+            if (!pure_lane_alu) return false;
+            for (uint32_t i = 0; i < it->n_src; ++i)
+                if (!uniform_operand_at(it->src[i], it->pc)) return false;
             return true;
         }
         return false;
     };
     for (uint32_t i = 0; i < compare->n_src; ++i)
-        if (!uniform_operand(compare->src[i])) return false;
+        if (!uniform_operand_at(compare->src[i], compare->pc)) return false;
     return compare->n_src != 0;
 }
 

@@ -450,6 +450,24 @@ int main() {
             }
         }
 
+        // Cobra's Unity material PS derives its loop bound through scalar-fed VOP2 + VOP1 before
+        // comparing it with the scalar counter. The resulting VGPR is still wave-uniform.
+        const uint32_t scalar_chain_ps[] = {
+            0xBE800380u, 0x7E020284u,            // s0 = 0; v1 = scalar constant 4
+            0x4A020281u,                         // lane-local VOP2 v1 = v1 + 1
+            0x7E021101u,                         // lane-local VOP1 v1 = f32(v1)
+            0x7D020200u, 0xBF860002u,           // v_cmp_* vcc,s0,v1; vccz -> exit
+            0x81008100u, 0xBF82FFFCu,           // ++s0; back to compare
+            0x7E0002F2u, 0xF800180Fu, 0x00000000u, 0xBF810000u,
+        };
+        CHECK(!recompile_fragment(scalar_chain_ps, std::size(scalar_chain_ps)).empty(),
+              "a scalar-fed VOP chain is accepted as a uniform VCC-loop bound");
+        uint32_t varying_chain_ps[std::size(scalar_chain_ps)];
+        std::copy(std::begin(scalar_chain_ps), std::end(scalar_chain_ps), varying_chain_ps);
+        varying_chain_ps[1] = 0x7E020302u;  // v1 = unresolved lane-varying v2 before the same chain
+        CHECK(recompile_fragment(varying_chain_ps, std::size(varying_chain_ps)).empty(),
+              "a lane-varying input remains rejected through the VOP chain");
+
         uint32_t varying_ps[sizeof(ps)/sizeof(ps[0])];
         std::copy(std::begin(ps), std::end(ps), varying_ps);
         varying_ps[2] = 0x7E020302u;  // v_mov_b32 v1,v2: a lane-varying/unproven loop bound

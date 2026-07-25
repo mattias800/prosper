@@ -53,13 +53,39 @@ resolution. Its key includes a copy of the decoded shader bytes, so same-address
 detected. It is bounded to 64 MiB by default and can be disabled with
 `PROSPER_NO_SHADER_DECODE_CACHE=1`.
 
-The persistent texture cache now covers guest-backed linear/tiled 2D sampled `Unorm8` textures with
-1-4 components and BC1-BC7 textures. It excludes render targets, storage images, cube/volume and DCC
-surfaces, captured host backing, and unsupported formats. Every hit validates the complete native,
-padded-tiled, or compressed-block source range, so address reuse and in-place mutation invalidate the
-entry. Its default 1 GiB budget covers Evergate's measured 835 MiB decoded working set. Disable it with
-`PROSPER_NO_TEXTURE_DECODE_CACHE=1`; the budget is controlled by
+The persistent texture cache now covers guest-backed linear/tiled 2D sampled `Unorm8`, `Float16`, and
+`Float32` textures with supported component counts, plus BC1-BC7 textures. It excludes render targets,
+storage images, cube/volume and DCC surfaces, captured host backing, and unsupported formats. Every hit
+validates the complete native, padded-tiled, or compressed-block source range, so address reuse and
+in-place mutation invalidate the entry. Its default 1 GiB budget covers Evergate's measured 835 MiB
+decoded working set. Disable it with `PROSPER_NO_TEXTURE_DECODE_CACHE=1`; the budget is controlled by
 `PROSPER_TEXTURE_DECODE_CACHE_MB`.
+
+## Cobra Float32 sampled-texture retention (2026-07-25)
+
+Cobra's title and cinematic repeatedly sample large guest-backed Float32 post-process inputs. The live
+renderer narrowed each one to RGBA16F on every callback even when its exact source bytes were unchanged;
+these were the largest frontend CPU cost and also forced a fresh backend image upload. Float32 2D inputs
+now use the existing exact-content cache. The key retains the complete descriptor shape, validation counts
+the 4-byte source components, and a cache hit restores the native RGBA16F backend format. Existing guest
+CPU/GPU write tracking and exact-byte fallback still invalidate changed versions.
+
+One Linux/Radeon 8060S binary, the same scripted route, native 1920x1080 output, audio enabled, and rolling
+25-submit windows produced:
+
+| Measurement | Float32 uncached | Float32 retained |
+|---|---:|---:|
+| Title frames reached at 45 seconds | 744 (16.5 FPS) | 1,178 (26.2 FPS) |
+| Matched cinematic draws / submit | 28.7 | 30.7 |
+| Cinematic whole submit | 142.8 ms | 46.5 ms |
+| Cinematic resource construction | 63.5 ms | 4.5 ms |
+| Matched dense draws / submit | 374.8 | 380.8 |
+| Dense whole submit | 418.2 ms | 279.1 ms |
+| Dense resource construction | 133.1 ms | 82.8 ms |
+
+The dense route retained 141 decoded versions / 910.8 MiB, below the existing 1 GiB bound. Backend draw
+setup and synchronous color-target readbacks remain the largest gameplay costs; this tranche does not
+claim a playable frame budget.
 
 ## Evergate native-render transition (2026-07-18)
 
