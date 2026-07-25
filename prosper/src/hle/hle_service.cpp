@@ -123,6 +123,39 @@ void svc_log(const char* fn, uint64_t a0, uint64_t a1, uint64_t a2,
 }
 }
 
+// PS5 Game Intent is how the shell starts a title at a selected activity instead of its default
+// entry point. A host frontend can model that user action by setting an activity id before boot;
+// without it the console truthfully has no pending intent. Keep the payload opaque to the guest:
+// titles consume it through sceNpGameIntentGetPropertyValueString, as on the console.
+// CONFIDENCE: HIGH — ABI/error contracts match Kyty; event id, type, key, and offsets are also
+// independently exercised by Sonic's eboot and its launchActivity declaration in param.json.
+namespace {
+constexpr uint64_t NP_GAME_INTENT_ERROR_INVALID_ARGUMENT = 0x80553804ull;
+constexpr uint64_t NP_GAME_INTENT_ERROR_INTENT_NOT_FOUND = 0x80553806ull;
+constexpr uint64_t NP_GAME_INTENT_ERROR_VALUE_NOT_FOUND  = 0x80553807ull;
+constexpr size_t NP_GAME_INTENT_TYPE_OFFSET     = 12;
+constexpr size_t NP_GAME_INTENT_TYPE_SIZE       = 33;
+constexpr size_t NP_GAME_INTENT_DATA_OFFSET     = 308;
+constexpr size_t NP_GAME_INTENT_DATA_SIZE       = 16392;
+constexpr uint32_t SYSTEM_SERVICE_EVENT_GAME_INTENT = 0x10000017u;
+
+std::atomic<bool> g_gameintent_initialized{false};
+std::atomic<bool> g_gameintent_event_delivered{false};
+std::atomic<uint64_t> g_gameintent_data_ptr{0};
+
+// Bound host-controlled text to the opaque intent payload capacity. The property accessor separately
+// checks the caller's buffer, so a title with a smaller value limit gets an error, never truncation.
+const char* gameintent_activity_id(size_t* length = nullptr) {
+    const char* value = getenv("PROSPER_GAME_INTENT_ACTIVITY_ID");
+    if (!value) return nullptr;
+    size_t n = 0;
+    while (n < NP_GAME_INTENT_DATA_SIZE && value[n]) ++n;
+    if (n == 0 || n == NP_GAME_INTENT_DATA_SIZE) return nullptr;
+    if (length) *length = n;
+    return value;
+}
+}
+
 // --- user service ---
 HLE(s_user_initial)   { if (a0) *(int32_t*)PW(a0) = 1; return 0; }           // GetInitialUser -> userId 1
 HLE(s_user_idlist)    { if (a0) { int32_t* p = (int32_t*)PW(a0); p[0] = 1; for (int i = 1; i < 4; i++) p[i] = -1; } return 0; }
@@ -131,6 +164,182 @@ HLE(s_user_idlist)    { if (a0) { int32_t* p = (int32_t*)PW(a0); p[0] = 1; for (
 HLE(s_user_name)      { if (a1) snprintf((char*)PW(a1), a2 ? (size_t)a2 : 17, "%s", "Player"); return 0; }
 HLE(s_user_int_out)   { if (a1) *(int32_t*)PW(a1) = 0; return 0; }           // accessibility getters -> 0
 HLE(s_user_age)       { if (a1) *(int32_t*)PW(a1) = 18; return 0; }          // GetAgeLevel -> adult (no restriction)
+// sceUserServiceGetUserNumber(userId, number): each local user has a stable controller/user number.
+// Sonic imports the PS5 NID directly and consumes the out-param during its user bootstrap.  Returning
+// success from the fallback stub without writing it leaves the caller's stack sentinel in place and
+// prevents the frontend from reaching its pad/audio initialization.  This single-user model exposes
+// default user 1 as number 1, consistent with the rest of the UserService handlers above.
+HLE(s_user_number)    { if (a1) *(int32_t*)PW(a1) = 1; return 0; }
+// --- libSceVideodec2 ---------------------------------------------------------------------------
+// Sonic's CRI Mana movie backend uses the native VideoDec2 compute queue and decoder lifecycle.
+// These ABI layouts/NIDs are the PS5 3.20 interfaces.  Decoding is intentionally a no-picture
+// implementation for now: it consumes each access unit, reports a valid lifecycle, and lets the
+// movie reach EOF instead of faking video pixels.  Critically, every successful query/open writes
+// all output fields.  The former generic success stubs left a null compute queue and crashed libc
+// at +0xfe66 on its first queue use.
+namespace {
+// The current no-picture backend has no hardware decoder workspace: it only needs a stable,
+// caller-owned address for the opaque compute-queue identity.  Keep one guest page so clients that
+// require a non-null allocation can follow the real query/allocate lifecycle without reserving the
+// 16 MiB placeholder used by software-decoding implementations.  That placeholder exhausted
+// Sonic Origins' 80 MiB CRI CPU/GPU pool before its movie workers could allocate their own buffers.
+constexpr uint64_t VDEC_MIN_MEMORY = 64ull << 10;
+constexpr uint64_t VDEC_ERR_STRUCT = 0x811d0101ull;
+constexpr uint64_t VDEC_ERR_ARG = 0x811d0102ull;
+constexpr uint64_t VDEC_ERR_DECODER = 0x811d0103ull;
+constexpr uint64_t VDEC_ERR_MEMORY_SIZE = 0x811d0104ull;
+constexpr uint64_t VDEC_ERR_MEMORY_PTR = 0x811d0105ull;
+constexpr uint64_t VDEC_ERR_FRAME_SIZE = 0x811d0106ull;
+constexpr uint64_t VDEC_ERR_FRAME_PTR = 0x811d0107ull;
+constexpr uint64_t VDEC_ERR_CONFIG = 0x811d0200ull;
+constexpr uint64_t VDEC_ERR_PIPE = 0x811d0201ull;
+constexpr uint64_t VDEC_ERR_QUEUE = 0x811d0202ull;
+constexpr uint64_t VDEC_ERR_RESOURCE = 0x811d0203ull;
+constexpr uint64_t VDEC_ERR_INPUT_DEPTH = 0x811d0206ull;
+constexpr uint64_t VDEC_ERR_DPB = 0x811d0209ull;
+constexpr uint64_t VDEC_ERR_DIMS = 0x811d020aull;
+
+struct VdecComputeMemory { uint64_t size, shared_size, shared; };
+struct VdecComputeConfig {
+    uint64_t size; uint16_t pipe, queue; uint8_t check_memory, reserved0; uint16_t reserved1;
+};
+struct VdecConfig {
+    uint64_t size; uint32_t resource, codec, profile, max_level;
+    int32_t max_width, max_height, max_dpb; uint32_t input_depth;
+    uint64_t compute_queue, affinity; int32_t priority;
+    uint8_t optimize, check_memory, reserved0, reserved1; uint64_t extra;
+};
+struct VdecMemory {
+    uint64_t size, cpu_size, cpu, gpu_size, gpu, shared_size, shared, max_frame_size;
+    uint32_t frame_alignment, reserved;
+};
+struct VdecInput { uint64_t size, data, data_size, pts, dts, attached; };
+struct VdecFrame { uint64_t size, data, data_size; uint8_t accepted, pad[7]; };
+struct VdecOutput {
+    uint64_t size; uint8_t valid, error, pictures, discarded;
+    uint32_t codec, width, pitch, height; uint64_t frame, frame_size;
+    uint32_t format, pitch_bytes;
+};
+static_assert(sizeof(VdecComputeMemory) == 24 && sizeof(VdecComputeConfig) == 16);
+static_assert(sizeof(VdecConfig) == 72 && sizeof(VdecMemory) == 72);
+static_assert(sizeof(VdecInput) == 48 && sizeof(VdecFrame) == 32 && sizeof(VdecOutput) == 56);
+
+std::mutex g_vdec_mx;
+std::unordered_map<uint64_t, uint32_t> g_vdec_codecs;
+
+uint64_t vdec_validate_config(const VdecConfig* c) {
+    if (!c || c->size != sizeof(*c)) return !c ? VDEC_ERR_ARG : VDEC_ERR_STRUCT;
+    if (c->resource != 1) return VDEC_ERR_RESOURCE;
+    if (c->reserved0 || c->reserved1) return VDEC_ERR_CONFIG;
+    if (!c->input_depth) return VDEC_ERR_INPUT_DEPTH;
+    if (c->max_dpb < -1 || c->max_dpb == 0) return VDEC_ERR_DPB;
+    if (c->max_width < -1 || c->max_height < -1 || !c->max_width || !c->max_height)
+        return VDEC_ERR_DIMS;
+    if (!c->compute_queue) return VDEC_ERR_CONFIG;
+    return 0;
+}
+void vdec_no_picture(VdecFrame* frame, VdecOutput* out, uint32_t codec) {
+    out->valid = out->error = out->pictures = out->discarded = 0;
+    out->codec = codec; out->width = out->pitch = out->height = 0;
+    out->frame = frame ? frame->data : 0;
+    out->frame_size = frame ? frame->data_size : 0;
+    out->format = out->pitch_bytes = 0;
+}
+}
+
+HLE(s_videodec2_query_compute_memory) {
+    svc_log("sceVideodec2QueryComputeMemoryInfo", a0, a1, a2, a3, a4, a5, 3);
+    auto* info = (VdecComputeMemory*)PW(a0);
+    if (!info) return VDEC_ERR_ARG;
+    if (info->size != sizeof(*info)) return VDEC_ERR_STRUCT;
+    info->shared_size = VDEC_MIN_MEMORY; info->shared = 0;
+    return 0;
+}
+HLE(s_videodec2_allocate_compute_queue) {
+    svc_log("sceVideodec2AllocateComputeQueue", a0, a1, a2, a3, a4, a5, 3);
+    auto* config = (const VdecComputeConfig*)PW(a0);
+    auto* memory = (const VdecComputeMemory*)PW(a1);
+    auto* out = (uint64_t*)PW(a2);
+    if (!config || !memory || !out) return VDEC_ERR_ARG;
+    if (config->size != sizeof(*config) || memory->size != sizeof(*memory)) return VDEC_ERR_STRUCT;
+    if (config->reserved0 || config->reserved1) return VDEC_ERR_CONFIG;
+    if (config->pipe > 4) return VDEC_ERR_PIPE;
+    if (config->queue > 7) return VDEC_ERR_QUEUE;
+    if (memory->shared_size < VDEC_MIN_MEMORY) return VDEC_ERR_MEMORY_SIZE;
+    if (!memory->shared) return VDEC_ERR_MEMORY_PTR;
+    *out = memory->shared;
+    if (svclog()) fprintf(stderr, "[svc]   Videodec2 compute queue -> 0x%llx (%llu bytes)\n",
+                          (unsigned long long)*out, (unsigned long long)memory->shared_size);
+    return 0;
+}
+HLE(s_videodec2_release_compute_queue) { return a0 ? 0 : VDEC_ERR_QUEUE; }
+HLE(s_videodec2_query_decoder_memory) {
+    svc_log("sceVideodec2QueryDecoderMemoryInfo", a0, a1, a2, a3, a4, a5, 9);
+    auto* config = (const VdecConfig*)PW(a0); auto* info = (VdecMemory*)PW(a1);
+    if (!config || !info) return VDEC_ERR_ARG;
+    if (info->size != sizeof(*info)) return VDEC_ERR_STRUCT;
+    uint64_t valid = vdec_validate_config(config); if (valid) return valid;
+    info->cpu_size = info->gpu_size = info->shared_size = info->max_frame_size = VDEC_MIN_MEMORY;
+    info->cpu = info->gpu = info->shared = 0;
+    info->frame_alignment = 0x100; info->reserved = 0;
+    return 0;
+}
+HLE(s_videodec2_create_decoder) {
+    svc_log("sceVideodec2CreateDecoder", a0, a1, a2, a3, a4, a5, 9);
+    auto* config = (const VdecConfig*)PW(a0); auto* memory = (const VdecMemory*)PW(a1);
+    auto* out = (uint64_t*)PW(a2);
+    if (!config || !memory || !out) return VDEC_ERR_ARG;
+    if (memory->size != sizeof(*memory)) return VDEC_ERR_STRUCT;
+    uint64_t valid = vdec_validate_config(config); if (valid) return valid;
+    if (memory->cpu_size < VDEC_MIN_MEMORY || memory->gpu_size < VDEC_MIN_MEMORY ||
+        memory->shared_size < VDEC_MIN_MEMORY || memory->max_frame_size < VDEC_MIN_MEMORY)
+        return VDEC_ERR_MEMORY_SIZE;
+    if (!memory->cpu || !memory->gpu || !memory->shared) return VDEC_ERR_MEMORY_PTR;
+    const uint64_t handle = g_handle.fetch_add(1) + 0x10000;
+    { std::lock_guard<std::mutex> lk(g_vdec_mx); g_vdec_codecs[handle] = config->codec; }
+    *out = handle;
+    if (svclog()) fprintf(stderr, "[svc]   Videodec2 decoder -> 0x%llx codec=%u\n",
+                          (unsigned long long)handle, config->codec);
+    return 0;
+}
+HLE(s_videodec2_delete_decoder) {
+    std::lock_guard<std::mutex> lk(g_vdec_mx);
+    return g_vdec_codecs.erase(a0) ? 0 : VDEC_ERR_DECODER;
+}
+HLE(s_videodec2_decode) {
+    if (svclog()) { static std::atomic<unsigned> n{0}; if (n.fetch_add(1) < 8)
+        svc_log("sceVideodec2Decode", a0, a1, a2, a3, a4, a5, 7); }
+    uint32_t codec;
+    { std::lock_guard<std::mutex> lk(g_vdec_mx); auto it = g_vdec_codecs.find(a0);
+      if (it == g_vdec_codecs.end()) return VDEC_ERR_DECODER; codec = it->second; }
+    auto* input = (const VdecInput*)PW(a1); auto* frame = (VdecFrame*)PW(a2);
+    auto* out = (VdecOutput*)PW(a3);
+    if (!input || !frame || !out) return VDEC_ERR_ARG;
+    if (input->size != sizeof(*input) || frame->size != sizeof(*frame) ||
+        out->size != sizeof(*out)) return VDEC_ERR_STRUCT;
+    if (input->data_size && !input->data) return VDEC_ERR_ARG;
+    if (!frame->data_size) return VDEC_ERR_FRAME_SIZE;
+    if (!frame->data) return VDEC_ERR_FRAME_PTR;
+    frame->accepted = 0; vdec_no_picture(frame, out, codec);
+    return 0;
+}
+HLE(s_videodec2_flush) {
+    uint32_t codec;
+    { std::lock_guard<std::mutex> lk(g_vdec_mx); auto it = g_vdec_codecs.find(a0);
+      if (it == g_vdec_codecs.end()) return VDEC_ERR_DECODER; codec = it->second; }
+    auto* frame = (VdecFrame*)PW(a1); auto* out = (VdecOutput*)PW(a2);
+    if (!frame || !out) return VDEC_ERR_ARG;
+    if (frame->size != sizeof(*frame) || out->size != sizeof(*out)) return VDEC_ERR_STRUCT;
+    frame->accepted = 0; vdec_no_picture(frame, out, codec);
+    return 0;
+}
+HLE(s_videodec2_reset) {
+    std::lock_guard<std::mutex> lk(g_vdec_mx); return g_vdec_codecs.count(a0) ? 0 : VDEC_ERR_DECODER;
+}
+HLE(s_videodec2_picture_info) {
+    auto* out = (const VdecOutput*)PW(a0); if (!out) return VDEC_ERR_ARG;
+    return out->size == sizeof(*out) ? 0 : VDEC_ERR_STRUCT;
+}
 // sceUserServiceGetEvent(SceUserServiceEvent* ev): the event stream. A real system delivers the initial
 // user's LOGIN event once at startup, then reports "no more events" so the game's drain loop terminates.
 // The previous (unimplemented) stub returned 0 = "got an event" but left the struct unfilled -> the game
@@ -142,6 +351,7 @@ HLE(s_user_age)       { if (a1) *(int32_t*)PW(a1) = 18; return 0; }          // 
 // 4/6 PC samples inside this function). One wrong errno constant == a full render stall.
 HLE(s_user_getevent)  {
     static std::atomic<int> delivered{0};
+    svc_log("sceUserServiceGetEvent", a0,a1,a2,a3,a4,a5);
     if (a0 && delivered.exchange(1) == 0) { int32_t* ev = (int32_t*)PW(a0); ev[0] = 0; ev[1] = 1; return 0; }
     return 0x80960007ull;   // SCE_USER_SERVICE_ERROR_NO_EVENT
 }
@@ -150,8 +360,23 @@ HLE(s_user_getevent)  {
 // received" while leaving the 8196-byte out-struct (4-byte eventType + 8192-byte union) uninitialized ->
 // the guest dispatched on a garbage eventType (same harmful class as s_user_getevent above; imported by
 // both Unity targets). The truthful idle answer is NO_EVENT with nothing written. shadPS4
-// systemservice.cpp: NO_EVENT = 0x80A10004, PARAMETER (ev==NULL) = 0x80A10003.
-HLE(s_sysservice_receiveevent) { if (!a0) return 0x80A10003ull; return 0x80A10004ull; }
+// systemservice.cpp: NO_EVENT = 0x80A10004, PARAMETER (ev==NULL) = 0x80A10003. When a host activity
+// was selected, a real shell instead delivers SCE_SYSTEM_SERVICE_EVENT_GAME_INTENT once; the title
+// then obtains the opaque launchActivity payload through libSceNpGameIntent.
+HLE(s_sysservice_receiveevent) {
+    svc_log("sceSystemServiceReceiveEvent", a0,a1,a2,a3,a4,a5);
+    if (!a0) return 0x80A10003ull;
+    if (g_gameintent_initialized.load(std::memory_order_acquire) && gameintent_activity_id()) {
+        bool expected = false;
+        if (g_gameintent_event_delivered.compare_exchange_strong(expected, true)) {
+            const uint32_t event_type = SYSTEM_SERVICE_EVENT_GAME_INTENT;
+            if (svc_write_bytes(a0, &event_type, sizeof(event_type))) return 0;
+            g_gameintent_event_delivered.store(false);
+            return 0x80A10003ull;
+        }
+    }
+    return 0x80A10004ull;
+}
 HLE(s_ok)             { return 0; }
 // ===== libSceAvPlayer (#324/#705): real playback lifecycle over a host video-decode backend =====
 // The core owns the guest sceAvPlayer contract + per-player state + the guest event callback and
@@ -1050,6 +1275,57 @@ HLE(s_np_getnpid)     { svc_log("sceNpGetNpId", a0,a1,a2,a3,a4,a5); return NP_ER
 // (the #306 wedge class). NOTE: the async poll/request pairing (sceNpPollAsync / CreateAsyncRequest) is
 // deliberately left for a follow-up -- its exact completion flow needs a live PROSPER_SVCLOG capture.
 HLE(s_np_check_avail) { svc_log("sceNpCheckNpAvailability", a0,a1,a2,a3,a4,a5); return NP_ERR_SIGNED_OUT; }
+// The local network libraries allocate opaque contexts even on a disconnected console; connection
+// state is reported separately through NetCtl/NP. Returning generic success (0) from these ID-returning
+// constructors instead creates an invalid context and makes their owner's initialization fail. The
+// signatures and positive-return contract agree with the PS5 3.20 symbol table and the independently
+// implemented SDK surface; no online identity or connectivity is fabricated here.
+namespace {
+std::atomic<int32_t> g_net_pool_id{1};
+std::atomic<int32_t> g_ssl_context_id{1};
+std::atomic<int32_t> g_http2_context_id{1};
+std::atomic<int32_t> g_npweb_context_id{1};
+std::atomic<int32_t> g_npweb_user_context_id{1001};
+}
+HLE(s_net_pool_create) {
+    svc_log("sceNetPoolCreate", a0,a1,a2,a3,a4,a5);
+    if (!svc_ptrish(a0) || (int32_t)a1 <= 0) return 0x80410118ull; // SCE_NET_ERROR_ENFILE
+    return (uint64_t)(uint32_t)g_net_pool_id.fetch_add(1);
+}
+HLE(s_ssl_init) {
+    svc_log("sceSslInit", a0,a1,a2,a3,a4,a5);
+    if (!a0) return 0x8094000cull; // SCE_SSL_ERROR_OUT_OF_SIZE
+    return (uint64_t)(uint32_t)g_ssl_context_id.fetch_add(1);
+}
+HLE(s_http2_init) {
+    svc_log("sceHttp2Init", a0,a1,a2,a3,a4,a5);
+    return (uint64_t)(uint32_t)g_http2_context_id.fetch_add(1);
+}
+HLE(s_npweb_init) {
+    svc_log("sceNpWebApi2Initialize", a0,a1,a2,a3,a4,a5);
+    return (uint64_t)(uint32_t)g_npweb_context_id.fetch_add(1);
+}
+HLE(s_npweb_create_user_context) {
+    svc_log("sceNpWebApi2CreateUserContext", a0,a1,a2,a3,a4,a5);
+    return (uint64_t)(uint32_t)g_npweb_user_context_id.fetch_add(1);
+}
+HLE(s_netctl_getresult) {
+    svc_log("sceNetCtlGetResult", a0,a1,a2,a3,a4,a5);
+    if (!svc_ptrish(a1)) return 0x80412103ull; // SCE_NET_CTL_ERROR_INVALID_ADDR
+    *(int32_t*)PW(a1) = 0;
+    return 0;
+}
+// sceNpHasSignedUp(userId, bool* hasSignedUp): Sonic passes an ODD output address (..cdf), proving
+// the result is one byte rather than int32. An offline initial user has no NP signup in this headless
+// profile. Success + false lets the caller select its signed-out branch without inventing an online
+// identity; the old success-with-untouched-stack answer made that branch random. CONFIDENCE: HIGH
+// on the ABI and byte width (live PS5 title trace), MED on success+false for the offline profile.
+HLE(s_np_has_signed_up) {
+    svc_log("sceNpHasSignedUp", a0,a1,a2,a3,a4,a5);
+    if (!svc_ptrish(a1)) return 0x80550003ull; // SCE_NP_ERROR_INVALID_ARGUMENT
+    *(uint8_t*)PW(a1) = 0;
+    return 0;
+}
 
 // --- mouse (report a device that exists but has no input; pad -> hle_pad.cpp real backend) ---
 HLE(s_open)           { return g_handle++; }                                 // sceMouseOpen -> handle
@@ -1413,6 +1689,13 @@ HLE(s_syss_getstatus) {
     auto* st = (uint8_t*)PW(a0);
     if (!st) return 0x80A10003ull;   // SYSTEM_SERVICE_ERROR_PARAMETER (Kyty Errno.h:382)
     memset(st, 0, 12);
+    // event_num is the first field. Titles use it to decide how many times to call ReceiveEvent;
+    // advertising an activity only in ReceiveEvent leaves that function unreachable.
+    if (g_gameintent_initialized.load(std::memory_order_acquire) &&
+        !g_gameintent_event_delivered.load(std::memory_order_acquire) &&
+        gameintent_activity_id()) {
+        *(int32_t*)st = 1;
+    }
     st[6] = 1;                       // isCpuMode7CpuNormal = true
     return 0;
 }
@@ -2236,10 +2519,20 @@ HLE(s_nptrophy2_createhandle) { svc_log("sceNpTrophy2CreateHandle", a0,a1,a2,a3,
 HLE(s_nptrophy2_regctx)       { svc_log("sceNpTrophy2RegisterContext", a0,a1,a2,a3,a4,a5); return 0; }
 HLE(s_nptrophy2_ok)           { return 0; }
 
-// --- libSceShare: succeed; sharing features are simply unavailable headless. --------------------
-// Initialize + the SetContentParam/SetScreenshotOverlayImage setters carry no out-params the
-// guest reads; plain success lets the ShareUpdate worker finish its bring-up. CONFIDENCE: MED.
+// --- libSceShare / libSceGameLiveStreaming: local lifecycle, features unavailable headless. -----
+// The PS5 3.20 import table supplies the exact NIDs. Kyty's matching SDK surface gives the call
+// shapes: ShareSetContentParam takes one required C string; GameLiveStreamingInitialize takes only
+// a heap size. Neither successful call has an out-param. CONFIDENCE: HIGH for the live Sonic call
+// shapes (PROSPER_SVCLOG), MED for the reference-derived invalid-param value.
 HLE(s_share_ok) { return 0; }
+HLE(s_share_content_param) {
+    svc_log("sceShareSetContentParam", a0,a1,a2,a3,a4,a5);
+    return a0 ? 0 : 0x81960002ull; // SCE_SHARE_ERROR_INVALID_PARAM (Kyty libShare.cpp)
+}
+HLE(s_live_streaming_init) {
+    svc_log("sceGameLiveStreamingInitialize", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
 
 // --- libSceNpUniversalDataSystem (PS5 telemetry/activities): hand out ids, stay inert. ----------
 // PS5-only, no reference implementation; by symmetry with every Np Create* API the first arg of
@@ -2283,6 +2576,66 @@ HLE(s_npuds_object_set_string) {
 }
 HLE(s_gameintent_init) {
     svc_log("sceNpGameIntentInitialize", a0,a1,a2,a3,a4,a5);
+    if (!g_gameintent_initialized.exchange(true, std::memory_order_acq_rel))
+        g_gameintent_event_delivered.store(false, std::memory_order_release);
+    g_gameintent_data_ptr.store(0, std::memory_order_release);
+    return 0;
+}
+HLE(s_gameintent_term) {
+    svc_log("sceNpGameIntentTerminate", a0,a1,a2,a3,a4,a5);
+    g_gameintent_data_ptr.store(0, std::memory_order_release);
+    g_gameintent_event_delivered.store(false, std::memory_order_release);
+    g_gameintent_initialized.store(false, std::memory_order_release);
+    return 0;
+}
+HLE(s_gameintent_receive) {
+    svc_log("sceNpGameIntentReceiveIntent", a0,a1,a2,a3,a4,a5);
+    if (!svc_ptrish(a0)) return NP_GAME_INTENT_ERROR_INVALID_ARGUMENT;
+
+    const int32_t invalid_user = -1;
+    const char empty_type[NP_GAME_INTENT_TYPE_SIZE]{};
+    static const uint8_t empty_data[NP_GAME_INTENT_DATA_SIZE]{};
+    if (!svc_write_bytes(a0 + 8, &invalid_user, sizeof(invalid_user)) ||
+        !svc_write_bytes(a0 + NP_GAME_INTENT_TYPE_OFFSET, empty_type, sizeof(empty_type)) ||
+        !svc_write_bytes(a0 + NP_GAME_INTENT_DATA_OFFSET, empty_data, sizeof(empty_data))) {
+        return NP_GAME_INTENT_ERROR_INVALID_ARGUMENT;
+    }
+    g_gameintent_data_ptr.store(0, std::memory_order_release);
+
+    if (!g_gameintent_initialized.load(std::memory_order_acquire))
+        return NP_GAME_INTENT_ERROR_INTENT_NOT_FOUND;
+    if (!gameintent_activity_id()) return NP_GAME_INTENT_ERROR_INTENT_NOT_FOUND;
+
+    const int32_t initial_user = 1;
+    constexpr char launch_activity[] = "launchActivity";
+    if (!svc_write_bytes(a0 + 8, &initial_user, sizeof(initial_user)) ||
+        !svc_write_bytes(a0 + NP_GAME_INTENT_TYPE_OFFSET, launch_activity,
+                         sizeof(launch_activity))) {
+        return NP_GAME_INTENT_ERROR_INVALID_ARGUMENT;
+    }
+    g_gameintent_data_ptr.store(a0 + NP_GAME_INTENT_DATA_OFFSET, std::memory_order_release);
+    return 0;
+}
+HLE(s_gameintent_get_property_string) {
+    svc_log("sceNpGameIntentGetPropertyValueString", a0,a1,a2,a3,a4,a5);
+    if (!svc_ptrish(a0) || !svc_ptrish(a1) || !svc_ptrish(a2) || a3 == 0)
+        return NP_GAME_INTENT_ERROR_INVALID_ARGUMENT;
+
+    char key[sizeof("activityId")]{};
+    if (!svc_copy_bytes(a1, key, sizeof(key))) return NP_GAME_INTENT_ERROR_INVALID_ARGUMENT;
+
+    size_t activity_length = 0;
+    const char* activity = gameintent_activity_id(&activity_length);
+    if (a0 != g_gameintent_data_ptr.load(std::memory_order_acquire) || !activity ||
+        memcmp(key, "activityId", sizeof(key)) != 0) {
+        const char empty = '\0';
+        if (!svc_write_bytes(a2, &empty, sizeof(empty)))
+            return NP_GAME_INTENT_ERROR_INVALID_ARGUMENT;
+        return NP_GAME_INTENT_ERROR_VALUE_NOT_FOUND;
+    }
+    if (a3 < activity_length + 1) return NP_GAME_INTENT_ERROR_INVALID_ARGUMENT;
+    if (!svc_write_bytes(a2, activity, activity_length + 1))
+        return NP_GAME_INTENT_ERROR_INVALID_ARGUMENT;
     return 0;
 }
 HLE(s_npent_addcont_info) {
@@ -2542,6 +2895,13 @@ void register_service_hle() {
     }
 #endif
     Hle::register_fn("obuxdTiwkF8", (HleFn)s_netctl_getinfo, "sceNetCtlGetInfo");  // NOT_CONNECTED
+    Hle::register_fn("0cBgduPRR+M", (HleFn)s_netctl_getresult, "sceNetCtlGetResult");
+    Hle::register_fn("dgJBaeJnGpo", (HleFn)s_net_pool_create, "sceNetPoolCreate");
+    Hle::register_fn("hdpVEUDFW3s", (HleFn)s_ssl_init, "sceSslInit");
+    Hle::register_fn("3JCe3lCbQ8A", (HleFn)s_http2_init, "sceHttp2Init");
+    Hle::register_fn("+o9816YQhqQ", (HleFn)s_npweb_init, "sceNpWebApi2Initialize");
+    Hle::register_fn("sk54bi6FtYM", (HleFn)s_npweb_create_user_context,
+                     "sceNpWebApi2CreateUserContext");
     // NpTrophy2: the config/info queries whose success-with-garbage-out crashed DOLL (see above).
     Hle::register_fn("4IzqhhUQ3nk", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGameInfo");
     Hle::register_fn("y3zHpdZO6ME", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetTrophyInfoArray");
@@ -2567,6 +2927,25 @@ void register_service_hle() {
     // and killed ALL gamepad input (#234). s_gamepresets now zeroes the payload after the caller-set
     // size field and returns success, satisfying both concerns.
     Hle::register_fn("-sD02mFDBh4", (HleFn)s_gamepresets, "sceUserServiceGetGamePresets");
+    Hle::register_fn("qbwy0Ub8b3M", (HleFn)s_user_number, "sceUserServiceGetUserNumber");
+    // Sonic imports LoginDialog only to initialize the service at startup.  There is no UI to show
+    // until Open is requested, so initialization is a truthful successful no-op in the headless HLE.
+    Hle::register_fn("qP-EvQRl2Hc", (HleFn)s_ok, "sceLoginDialogInitialize");
+    Hle::register_fn("RnDibcGCPKw", (HleFn)s_videodec2_query_compute_memory,
+                     "sceVideodec2QueryComputeMemoryInfo");
+    Hle::register_fn("eD+X2SmxUt4", (HleFn)s_videodec2_allocate_compute_queue,
+                     "sceVideodec2AllocateComputeQueue");
+    Hle::register_fn("UvtA3FAiF4Y", (HleFn)s_videodec2_release_compute_queue,
+                     "sceVideodec2ReleaseComputeQueue");
+    Hle::register_fn("qqMCwlULR+E", (HleFn)s_videodec2_query_decoder_memory,
+                     "sceVideodec2QueryDecoderMemoryInfo");
+    Hle::register_fn("CNNRoRYd8XI", (HleFn)s_videodec2_create_decoder, "sceVideodec2CreateDecoder");
+    Hle::register_fn("jwImxXRGSKA", (HleFn)s_videodec2_delete_decoder, "sceVideodec2DeleteDecoder");
+    Hle::register_fn("852F5+q6+iM", (HleFn)s_videodec2_decode, "sceVideodec2Decode");
+    Hle::register_fn("l1hXwscLuCY", (HleFn)s_videodec2_flush, "sceVideodec2Flush");
+    Hle::register_fn("wJXikG6QFN8", (HleFn)s_videodec2_reset, "sceVideodec2Reset");
+    Hle::register_fn("NtXRa3dRzU0", (HleFn)s_videodec2_picture_info, "sceVideodec2GetPictureInfo");
+    Hle::register_fn("kjrLbcyhEiw", (HleFn)s_videodec2_picture_info, "sceVideodec2GetPictureInfo");
     R("sceUserServiceInitialize", s_ok);
     R("sceUserServiceTerminate", s_ok);
     // NP — an honest signed-out console (#306). NIDs verified against the PS5 3.20
@@ -2580,6 +2959,7 @@ void register_service_hle() {
     Hle::register_fn("2rsFmlGWleQ", (HleFn)s_np_check_avail, "sceNpCheckNpAvailability");   // was MISSING -> faked "available"
     Hle::register_fn("8Z2Jc5GvGDI", (HleFn)s_np_check_avail, "sceNpCheckNpAvailabilityA");
     Hle::register_fn("KfGZg2y73oM", (HleFn)s_np_check_avail, "sceNpCheckNpReachability");
+    Hle::register_fn("Oad3rvY-NJQ", (HleFn)s_np_has_signed_up, "sceNpHasSignedUp");
     Hle::register_fn("a8R9-75u4iM", (HleFn)s_np_accountid, "sceNpGetAccountId");  // non-A variant: zero id + SIGNED_OUT
     R("sceNpRegisterStateCallback", s_ok);
 #ifndef _WIN32
@@ -2754,8 +3134,11 @@ void register_service_hle() {
     // libSceShare — succeed; sharing simply unavailable headless.
     Hle::register_fn("nBDD66kiFW8", (HleFn)s_share_ok, "sceShareInitialize");
     Hle::register_fn("0IL1keINExQ", (HleFn)s_share_ok, "sceShareTerminate");
+    Hle::register_fn("7QZtURYnXG4", (HleFn)s_share_content_param, "sceShareSetContentParam");
     Hle::register_fn("ORspsWDXPps", (HleFn)s_share_ok, "sceShareSetContentParamForApplicationTitle");
     Hle::register_fn("T64o-315wbg", (HleFn)s_share_ok, "sceShareSetScreenshotOverlayImage");
+    Hle::register_fn("kvYEw2lBndk", (HleFn)s_live_streaming_init, "sceGameLiveStreamingInitialize");
+    Hle::register_fn("9yK6Fk8mKOQ", (HleFn)s_share_ok, "sceGameLiveStreamingTerminate");
     // libSceErrorDialog — real lifecycle, auto-dismiss (#306). NIDs from the PS5 3.20 stub table
     // (identical to shadPS4's PS4 registrations).
     Hle::register_fn("I88KChlynSs", (HleFn)s_errdialog_init,   "sceErrorDialogInitialize");
@@ -2792,6 +3175,12 @@ void register_service_hle() {
                      "sceNpUniversalDataSystemEventPropertyObjectSetString");
     Hle::register_fn("m87BHxt-H60", (HleFn)s_gameintent_init,
                      "sceNpGameIntentInitialize");
+    Hle::register_fn("0HBYxYAjmf0", (HleFn)s_gameintent_term,
+                     "sceNpGameIntentTerminate");
+    Hle::register_fn("jEIXUAr9XE8", (HleFn)s_gameintent_receive,
+                     "sceNpGameIntentReceiveIntent");
+    Hle::register_fn("rPl0INNc-M8", (HleFn)s_gameintent_get_property_string,
+                     "sceNpGameIntentGetPropertyValueString");
     Hle::register_fn("xddD23+8TfQ", (HleFn)s_npent_addcont_info,
                      "sceNpEntitlementAccessGetAddcontEntitlementInfo");
     #undef R

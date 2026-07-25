@@ -849,6 +849,61 @@ int main() {
               "tiled Float32 sampled values preserve negative and HDR channels byte-exactly");
     }
 
+    // Sonic's full-screen compute resolve reads two unsigned tiled views that were previously
+    // rejected by the live uploader: R32_UINT and RGBA16_UINT.  Keep these as native integer Vulkan
+    // images so image_load returns exact component bits; routing them through RGBA8 would truncate
+    // the former and reinterpret the latter as normalized color.
+    auto sampled_uint_roundtrip = [&](DataFormat format, uint32_t components,
+                                      uint32_t bytes_per_texel, uint64_t code_addr) {
+        std::vector<uint8_t> linear_src(W * bytes_per_texel);
+        std::vector<uint8_t> linear_dst(W * bytes_per_texel, 0xA5);
+        for (size_t i = 0; i < linear_src.size(); ++i)
+            linear_src[i] = static_cast<uint8_t>(i * 73 + 19);
+        const size_t tiled_size = tiled_surface_bytes(W, 1, dcc_tile, 0, bytes_per_texel);
+        std::vector<uint8_t> tiled_src(tiled_size, 0);
+        tile_surface(tiled_src.data(), linear_src.data(), W, 1, dcc_tile, 0, bytes_per_texel);
+        ShaderResourceTable uint_rt = irt;
+        for (ShaderResource& resource : uint_rt.resources) {
+            if (resource.binding != 4 && resource.binding != 5) continue;
+            resource.img_dim = 1;
+            resource.format = format;
+            resource.num_components = components;
+            resource.width = W;
+            resource.height = resource.depth = 1;
+            if (resource.binding == 4) {
+                resource.cls = ResourceClass::Texture;
+                resource.tile_mode = dcc_tile;
+                resource.gpu_addr = reinterpret_cast<uint64_t>(tiled_src.data());
+                resource.size = static_cast<uint32_t>(tiled_src.size());
+                resource.swizzle[0] = 4;
+                resource.swizzle[1] = 5;
+                resource.swizzle[2] = 6;
+                resource.swizzle[3] = 7;
+            } else {
+                resource.tile_mode = 0;
+                resource.gpu_addr = reinterpret_cast<uint64_t>(linear_dst.data());
+                resource.size = static_cast<uint32_t>(linear_dst.size());
+            }
+        }
+        const std::vector<uint32_t> spv = recompile_valu(
+            image_copy_2d, sizeof(image_copy_2d) / sizeof(image_copy_2d[0]), 1, 0, &uint_rt);
+        if (spv.empty()) return false;
+        ComputeItem item;
+        item.spirv = spv;
+        item.resources = std::make_shared<ShaderResourceTable>(uint_rt);
+        item.launch.threads_x = W;
+        item.launch.local_x = 64;
+        item.launch.groups_x = 1;
+        item.launch.local_y = item.launch.local_z = 1;
+        item.launch.groups_y = item.launch.groups_z = 1;
+        item.code_addr = code_addr;
+        return prosper::frontend::execute_live_compute_items({item}) && linear_dst == linear_src;
+    };
+    CHECK(sampled_uint_roundtrip(DataFormat::Uint32, 1, 4, 0x590320),
+          "tiled R32_UINT sampled values reach storage writeback byte-exactly");
+    CHECK(sampled_uint_roundtrip(DataFormat::Uint16, 4, 8, 0x590164),
+          "tiled RGBA16_UINT sampled values reach storage writeback byte-exactly");
+
     // --- #1122 seed-skip coverage proof. A write-only storage image whose dispatch fully covers the
     // extent can skip the (expensive) seed -- BUT ONLY after proving the write actually stores every
     // texel. covers_extent is necessary, not sufficient: a shader that stores a SUBSET of a covering

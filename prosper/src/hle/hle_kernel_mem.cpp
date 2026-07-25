@@ -1376,12 +1376,14 @@ namespace {
         return it != g_apr_eventful.end() && it->second;
     }
 }
-HLE(k_apr_set_equeue) {          // sSAUCCU1dv4 (eq, id, 0, 0, 0x43, 0)
-    ampr_arglog("sSAUCCU1dv4(SetEqueue)", a0, a1, a2, a3, a4, a5);
-    // Called 6x by the guest listener-ctx ctor (eboot+0x22a0670) with id = 0x74fe + ring for
-    // rings 0..5, right after it creates its own equeue and seeds the per-ring counters.
-    if (a0) prosper_eq_add_apr(a0, (int64_t)a1);
-    return 0;
+HLE(k_ampr_measure_write_equeue) { // sSAUCCU1dv4 = sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00
+    ampr_arglog("sSAUCCU1dv4(MeasureWriteEqueue)", a0, a1, a2, a3, a4, a5);
+    // The guest uses this only to reserve its command buffer. A 32-byte record is the conservative
+    // firmware-compatible size; returning 20 risks under-allocation before the real builder runs.
+    // Registration belongs to sceAmprAprCommandBufferWriteKernelEventQueue below; keeping it here
+    // would make another pure size query title-visible and platform-dependent.
+    // CONFIDENCE: MED (Sonic allocation flow plus an independent implementation; no hardware trace).
+    return 32;
 }
 HLE(k_apr_cb_set_equeue) {       // H896Pt-yB4I (cb, eq, id, tag, 0, flags)
     ampr_arglog("H896Pt-yB4I(CbSetEqueue)", a0, a1, a2, a3, a4, a5);
@@ -1430,8 +1432,20 @@ HLE(k_apr_submit) {              // libkernel ASoW5WE-UPo (cb, ring_1based, out1
     if (tag_echo) prosper_eq_post_apr_token(bc.eq, bc.id, bc.tag);
     return 0;
 }
-// Still-unnamed mount-time Ampr NID (state query?); arg-logging no-op under PROSPER_AMPRLOG.
-HLE(k_ampr_u3) { return ampr_arglog("GnxKOHEawhk", a0, a1, a2, a3, a4, a5); }
+// sceAmprCommandBufferGetCurrentOffset. The current command-buffer model does not yet retain this
+// state, and callers observed so far query a freshly reset buffer, for which zero is exact.
+HLE(k_ampr_get_current_offset) {
+    ampr_arglog("GnxKOHEawhk(GetCurrentOffset)", a0, a1, a2, a3, a4, a5);
+    return 0;
+}
+// Sonic Origins sums this result with the ReadFile and equeue sizes to reserve each AMPR command
+// buffer. Use the conservative 32-byte firmware-compatible record size; the earlier guessed
+// 8/12/16 encoding could under-allocate. CONFIDENCE: MED (guest allocation flow plus an independent
+// implementation; no hardware trace).
+HLE(k_ampr_measure_write_address) {
+    ampr_arglog("4fgtGfXDrFc(MeasureWriteAddress)", a0, a1, a2, a3, a4, a5);
+    return 32;
+}
 HLE(k_ampr_begin) {
     if (amprlog()) {
         fprintf(stderr, "[amprlog] begin a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
@@ -1719,10 +1733,14 @@ void register_kernel_mem_hle() {
     Hle::register_fn("GuchCTefuZw", (HleFn)k_ampr_x4, "sceAmprCommandBufferDestructor");
     // APR completion-event plumbing (issue #115). vWU-odnS+fU (the direct async file read) is
     // registered in hle_file.cpp next to the other APR read path.
-    Hle::register_fn("sSAUCCU1dv4", (HleFn)k_apr_set_equeue,    "AprSetEventQueue?");
+    Hle::register_fn("sSAUCCU1dv4", (HleFn)k_ampr_measure_write_equeue,
+                     "sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00");
     Hle::register_fn("H896Pt-yB4I", (HleFn)k_apr_cb_set_equeue, "AprCbSetEventQueue?");
     Hle::register_fn("ASoW5WE-UPo", (HleFn)k_apr_submit,        "AprSubmitCommandBuffer?");
-    Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_u3,           "AmprUnknown3");
+    Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_get_current_offset,
+                     "sceAmprCommandBufferGetCurrentOffset");
+    Hle::register_fn("4fgtGfXDrFc", (HleFn)k_ampr_measure_write_address,
+                     "sceAmprMeasureCommandSizeWriteAddress_04_00");
     // APR completion-notification write, performed eagerly (#1149). NID from GTA V's import table; the
     // exact firmware name is unknown (not in the 3.20 dump, and it does not hash from Kyty's guessed
     // "sceAmprCommandBufferWriteAddress"), so the label carries a "?" per the unverified-name convention.
@@ -4230,10 +4248,13 @@ HLE(k_query_memory_protection) {
     return 0;
 }
 
-// libSceAmpr / APR command-buffer trio + teardown. These commit UE4 (PPSA17942, area:ue4)
-// allocator pages; that title does not boot on Windows yet, so no-op stubs are correct here
-// (the Linux path models them). Registered by raw NID for parity.
+// libSceAmpr / APR command-buffer construction and teardown. The builders that commit UE4
+// (PPSA17942, area:ue4) allocator pages remain no-op stubs because that title does not boot on
+// Windows yet. Pure size/offset queries below keep their platform-independent return contracts.
 HLE(k_ampr_ok) { return 0; }
+HLE(k_ampr_measure_write_equeue) { return 32; }
+HLE(k_ampr_get_current_offset) { return 0; }
+HLE(k_ampr_measure_write_address) { return 32; }
 
 // APR command-buffer WriteAddress (NID j0+3uJMxYJY) — the completion-notification write (#1149).
 // Windows sibling of the POSIX handler above (full contract documented there): write `value` (a2)
@@ -4404,10 +4425,14 @@ void register_kernel_mem_hle() {
     Hle::register_fn("tZDDEo2tE5k", (HleFn)k_ampr_ok, "sceAmprCommandBufferGetSize");
     Hle::register_fn("Qs1xtplKo0U", (HleFn)k_ampr_ok, "sceAmprAprCommandBufferDestructor");
     Hle::register_fn("GuchCTefuZw", (HleFn)k_ampr_ok, "sceAmprCommandBufferDestructor");
-    Hle::register_fn("sSAUCCU1dv4", (HleFn)k_ampr_ok, "AprSetEventQueue?");
+    Hle::register_fn("sSAUCCU1dv4", (HleFn)k_ampr_measure_write_equeue,
+                     "sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00");
     Hle::register_fn("H896Pt-yB4I", (HleFn)k_ampr_ok, "AprCbSetEventQueue?");
     Hle::register_fn("ASoW5WE-UPo", (HleFn)k_ampr_ok, "AprSubmitCommandBuffer?");
-    Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_ok, "AmprUnknown3");
+    Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_get_current_offset,
+                     "sceAmprCommandBufferGetCurrentOffset");
+    Hle::register_fn("4fgtGfXDrFc", (HleFn)k_ampr_measure_write_address,
+                     "sceAmprMeasureCommandSizeWriteAddress_04_00");
     // APR completion-notification write (#1149) — real behavior on Windows too (see handler above).
     Hle::register_fn("j0+3uJMxYJY", (HleFn)k_ampr_write_address, "sceAmprCommandBufferWriteAddress?");
 }

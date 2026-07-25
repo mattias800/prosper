@@ -2076,11 +2076,34 @@ static uint64_t apr_resolve_impl(const char* prefix, const char** paths, int cou
         uint64_t size = 0; uint32_t id = 0;
 #ifndef _WIN32
         struct stat st;
-        if (!host.empty() && ::stat(host.c_str(), &st) == 0) size = (uint64_t)st.st_size;
+        bool found = !host.empty() && ::stat(host.c_str(), &st) == 0;
 #else
         struct _stat64 st;
-        if (!host.empty() && ::_stat64(host.c_str(), &st) == 0) size = (uint64_t)st.st_size;
+        bool found = !host.empty() && ::_stat64(host.c_str(), &st) == 0;
 #endif
+        // Hedgehog Engine packages its loose content under app0/raw, but external CRI ACB banks
+        // name their companion wave banks relative to that content root ("sound/Foo.awb"). The
+        // engine consequently asks APR for /app0/sound/Foo.awb even though the extracted app image
+        // contains /app0/raw/sound/Foo.awb. Live Sonic Origins evidence showed every ACB resolving
+        // and reading correctly while every external AWB failed at exactly that missing `raw`
+        // component, leaving the CRI mixer silent. APR is the content-container resolver, so when
+        // an /app0 path is genuinely absent, try the packaged raw-content root before reporting a
+        // miss. Existing paths and already-raw paths keep exact PS5 namespace semantics.
+        if (!found && guest.rfind("/app0/", 0) == 0 && guest.rfind("/app0/raw/", 0) != 0) {
+            const std::string raw_guest = "/app0/raw/" + guest.substr(6);
+            std::string raw_host = translate(raw_guest.c_str());
+#ifndef _WIN32
+            found = !raw_host.empty() && ::stat(raw_host.c_str(), &st) == 0;
+#else
+            found = !raw_host.empty() && ::_stat64(raw_host.c_str(), &st) == 0;
+#endif
+            if (found) {
+                if (filelog()) fprintf(stderr, "[apr] content-root fallback %s -> %s\n",
+                                       guest.c_str(), raw_guest.c_str());
+                host = std::move(raw_host);
+            }
+        }
+        if (found) size = (uint64_t)st.st_size;
         else { if (out_ids) out_ids[i] = 0; if (out_sizes) out_sizes[i] = 0; if (out_flags) out_flags[i] = 0;
                if (filelog()) fprintf(stderr, "[apr] resolve MISS %s\n", guest.empty() ? "(null)" : guest.c_str()); continue; }
         // Warn loudly (unconditionally) when a DIFFERENT container shares this size: the read
@@ -2102,6 +2125,21 @@ HLE(f_apr_resolve) {
     return apr_resolve_impl(nullptr, (const char**)P(a0), (int)(int64_t)a1,
                             (uint32_t*)P(a2), (uint64_t*)P(a3), (uint32_t*)P(a4));
 }
+// sceKernelAprResolveFilepathsToIds(pathList, count, ids, errorIndex): Sonic/CRI's smaller APR
+// resolver.  It is the same path registry operation as the size-returning variant, but its fourth
+// argument is ONE failure index rather than an array.  Do not pass it to apr_resolve_impl as flags:
+// doing so would overwrite past the scalar when count > 1.  The current tolerant resolver records
+// missing entries as id 0 and completes the batch, so a successful batch leaves errorIndex at zero.
+HLE(f_apr_resolve_ids) {
+    uint32_t* error_index = (uint32_t*)P(a3);
+    if (error_index) *error_index = 0;
+    return apr_resolve_impl(nullptr, (const char**)P(a0), (int)(int64_t)a1,
+                            (uint32_t*)P(a2), nullptr, nullptr);
+}
+// APR builders/read commands execute eagerly in prosper.  A later WaitCommandBuffer therefore has
+// no outstanding host work and succeeds synchronously, matching the completion observed by the
+// caller without inventing an asynchronous submission object.
+HLE(f_apr_wait_command_buffer) { return 0; }
 // sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes(const char* prefix, const char** paths,
 //   int count, uint32_t* outIds, uint64_t* outSizes, uint32_t* outFlags) — GTA V's RAGE resource
 // loader entry. ABI recovered from live guest disassembly (PPSA04263, [RAGE] Main Thr): rdi=prefix
@@ -2628,54 +2666,14 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
 #endif
 }
 
-#ifndef _WIN32
-// libSceAmpr vWU-odnS+fU — the APR DIRECT (whole-range) async file read, issue #115. Live capture
-// at the CreateGlobalShaderMap hang:
-//   vWU-odnS+fU(fileId=8, dst=0x2002860000, size=0x107e3a, off=0x7adec90a, off, 5thArg=4)
-// — fileId 8 = pakchunk0-ps5.pak from APR resolve, and (off,size) is EXACTLY the engine's
-// GlobalShaderCache-SF_PS5.bin region inside that pak (size matched the reader global's recorded
-// file size 0x107e3a). No command buffer, no completion record — and NO completion event (#208):
-// the guest consumes these reads without a listener event; only the H896-bound batch channel gets
-// events, carrying the guest-chosen binding tag (see hle_kernel_time.cpp for the full contract).
-// a3==a4 in the only capture. CONFIDENCE: HIGH on (id,dst,size,off) — verified against the
-// resolved file and the reader's recorded size.
-HLE(f_apr_read_direct) {
-    uint64_t id = a0, dst = a1, size = a2, offset = a3;
-    std::string host = prosper_apr_path_for_id((uint32_t)id);
-    if (host.empty()) {
-        if (filelog()) fprintf(stderr, "[apr] read-direct: no file for id=%llu\n", (unsigned long long)id);
-        return 0x80020016ull;   // EINVAL-class: engine sees a synchronous submit failure
-    }
-    uint64_t fsize = 0;
-    { struct stat st {}; if (::stat(host.c_str(), &st) == 0) fsize = (uint64_t)st.st_size; }
-    if (offset > fsize) offset = fsize;
-    if (size > fsize - offset) size = fsize - offset;
-    uint64_t rounded = (size + 0xfff) & ~0xfffull; if (!rounded) rounded = 0x1000;
-    void* buf = mmap(nullptr, rounded, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (buf == MAP_FAILED) return 0x80020016ull;
-    ssize_t got = 0;
-    if (size) {
-        int fd = apr_cached_fd(host);
-        if (fd < 0) { munmap(buf, rounded); return 0x80020016ull; }
-        got = ::pread(fd, buf, (size_t)size, (off_t)offset);
-    }
-    bool ok = (uint64_t)got == size && (size == 0 || apr_write_guest_dst(dst, buf, size));
-    munmap(buf, rounded);
-    if (filelog()) fprintf(stderr, "[apr] read-direct id=%llu %s -> dst=0x%llx off=0x%llx size=%llu %s\n",
-                           (unsigned long long)id, host.c_str(), (unsigned long long)dst,
-                           (unsigned long long)offset, (unsigned long long)size, ok ? "OK" : "FAIL");
-    if (!ok) return 0x80020016ull;
-    // No completion event (issue #208). Direct reads are consumed by the guest WITHOUT a listener
-    // event (live-verified: the gdb-unwedged engine streamed the whole remaining load through
-    // these with no matching events in flight), and posting an invented counter would REGRESS the
-    // listener's ctor-seeded per-ring last-processed (unconditional last:=cnt store at
-    // eboot+0x2274143), setting up the fatal +0x229df3e range walk. Only exact H896 binding tags
-    // are ever posted (k_apr_submit -> prosper_eq_post_apr_token).
-    return 0;
+// libSceAmpr vWU-odnS+fU — sceAmprMeasureCommandSizeReadFile. The exact firmware contract returns
+// 20 bytes, or 24 when the file offset needs its high 32 bits. This is a pure sizing API on every
+// host: performing the older Linux-only compatibility read here made an allocation query mutate
+// guest memory and gave Windows different title-visible behavior. Encoded reads execute through
+// sceAmprAprCommandBufferReadFile instead.
+HLE(f_apr_measure_read_file) {
+    return (a3 >> 32) ? 24 : 20;
 }
-// APR completion-token plumbing (hle_kernel_time.cpp) — see the k_apr_submit block in
-// hle_kernel_mem.cpp for the recovered contract.
-#endif
 
 void register_file_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
@@ -2732,6 +2730,10 @@ void register_file_hle() {
     Hle::register_fn("5TgME6AYty4", (HleFn)k_aio_delete,       "sceKernelAioDeleteRequest");
     Hle::register_fn("fR521KIGgb8", (HleFn)k_aio_cancel,       "sceKernelAioCancelRequest");
     R("sceKernelAprResolveFilepathsToIdsAndFileSizes", f_apr_resolve);   // real APR resolve (was EINVAL)
+    Hle::register_fn("WT-5NKy42fw", (HleFn)f_apr_resolve_ids,
+                     "sceKernelAprResolveFilepathsToIds");
+    Hle::register_fn("rqwFKI4PAiM", (HleFn)f_apr_wait_command_buffer,
+                     "sceKernelAprWaitCommandBuffer");
     R("sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes", f_apr_resolve_with_prefix);  // GTA V (#1130)
     R("sceKernelAprGetFileStat", f_apr_get_file_stat);  // GTA V (#1133)
     // libSceAmpr sceAmprAprCommandBufferReadFile (NID name recovered by brute-force). The Linux
@@ -2739,11 +2741,11 @@ void register_file_hle() {
     // offset); see f_apr_read_submit_entry above.
 #ifndef _WIN32
     Hle::register_fn("mQ16-QdKv7k", (HleFn)f_apr_read_submit_entry, "sceAmprAprCommandBufferReadFile");
-    // The direct (whole-range) APR read — completion via the APREventQueue (issue #115).
-    Hle::register_fn("vWU-odnS+fU", (HleFn)f_apr_read_direct, "AprReadFileDirect?");
 #else
     Hle::register_fn("mQ16-QdKv7k", (HleFn)f_apr_read_submit, "sceAmprAprCommandBufferReadFile");
 #endif
+    Hle::register_fn("vWU-odnS+fU", (HleFn)f_apr_measure_read_file,
+                     "sceAmprMeasureCommandSizeReadFile");
     #undef R
 }
 

@@ -2119,6 +2119,7 @@ std::vector<uint32_t> recompile_interpolation_geometry(
 // operands may reference either (SGPR is a valid ALU operand), so both are resolved by operand_bits.
 struct RegState {
     std::unordered_map<int, uint32_t> vreg, sreg;
+    int max_vgpr = 0;          // highest statically referenced VGPR in this shader
     // Immutable raw user-data words for DIRECT descriptors. They stay absent from `sreg` so
     // descriptor provenance can still distinguish driver input from a shader overwrite, while
     // scalar ALU may read their real bits (Astro copies V#.word2 into M0 as an LDS base).
@@ -2770,6 +2771,7 @@ struct DivLoop {
     uint32_t backedge_pc = 0;      // backward s_branch (unconditional) or s_cbranch_execnz
     uint32_t exit_pc = 0;          // backedge_pc + its length (first pc after the loop)
     std::vector<uint32_t> break_pcs;   // extra forward vccz/execz -> exit_pc (lowered as body ifs)
+    bool direct_exec_breaks = false;   // unconditional back-edge: an interior execz exits directly
     Condition condition = Condition::Exec;
 };
 
@@ -2993,10 +2995,10 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
     for (size_t i = 0; i < out.size(); i++)
         for (size_t j = i + 1; j < out.size(); j++) {
             const DivLoop& A = out[i]; const DivLoop& B = out[j];   // A.header_pc <= B.header_pc
-            if (A.header_pc == B.header_pc) return {};              // shared header: not modeled
+            if (A.header_pc == B.header_pc) return {}; // shared header: not modeled
             const bool disjoint = B.header_pc >= A.exit_pc;
             const bool nested   = B.exit_pc <= A.backedge_pc;       // B entirely inside A's body
-            if (!disjoint && !nested) return {};                    // partial overlap: unstructured
+            if (!disjoint && !nested) return {};      // partial overlap: unstructured
         }
     // Pass 2: validate each loop's interior branches and find the canonical exit + breaks. A branch
     // inside a NESTED child loop belongs to the child (which validates itself in its own pass-2
@@ -3019,14 +3021,14 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
                 case 0x02: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08: case 0x09: break;
                 default: continue;   // hints
             }
-            if (in.simm16 < 0) return {};                       // second back-edge inside -> nested loop
+            if (in.simm16 < 0) return {};         // second back-edge inside -> nested loop
             if (safe.count(in.pc)) continue;                    // linearized (kill-mask / safe-execz)
             uint32_t tgt = branch_target(in);
             if (in.opcode == 0x02) {                            // forward s_branch: an else-arm terminator
-                if (tgt > L.backedge_pc) return {};             // may not leave the body
+                if (tgt > L.backedge_pc) return {}; // may not leave the body
                 continue;                                       // (validated by detect_forward_ifs)
             }
-            if (tgt > L.exit_pc) return {};                     // conditional jumping past the loop
+            if (tgt > L.exit_pc) return {};       // conditional jumping past the loop
             if (tgt == L.exit_pc) {                             // an exit test
                 if (!L.exit_branch_pc) {                        // first one = the canonical exit
                     if (in.opcode == 0x08) {                    // execz -> EXIT
@@ -3042,20 +3044,26 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
                     }
                     L.exit_branch_pc = in.pc;
                 } else {                                        // later ones = breaks
-                    if (in.opcode != 0x06 && in.opcode != 0x08) return {};  // vccz/execz only
-                    if (!execnz) return {};                     // breaks need the exec-governed back-edge
+                    if (in.opcode != 0x06 && in.opcode != 0x08) return {}; // vccz/execz only
+                    // With an execnz back-edge, a cleared lane skips to the next header check. With
+                    // an unconditional back-edge that could re-enable EXEC, only an EXECZ branch is
+                    // exact: the emitter sends the cleared lane directly to the loop merge instead.
+                    // A VCCZ break does not itself clear EXEC and remains unsupported for that shape.
+                    if (!execnz && in.opcode != 0x08) return {};
+                    if (!execnz) L.direct_exec_breaks = true;
                     L.break_pcs.push_back(in.pc);
                 }
             }
             // (tgt <= backedge_pc: an interior forward if — validated by detect_forward_ifs.)
         }
-        if (!L.exit_branch_pc) return {};                       // no exit test: not this shape
+        if (!L.exit_branch_pc) return {};         // no exit test: not this shape
         // The canonical exit must be the FIRST branch in the loop, so the condition region
         // [header, exit_branch) is branch-free (it is emitted straight-line).
         for (const auto& in : ins) {
             if (in.pc >= L.exit_branch_pc) break;
             if (in.pc < L.header_pc || in.fmt != Rdna2Format::SOPP) continue;
-            if (in.opcode >= 0x02 && in.opcode <= 0x09 && in.opcode != 0x03 && !safe.count(in.pc)) return {};
+            if (in.opcode >= 0x02 && in.opcode <= 0x09 && in.opcode != 0x03 && !safe.count(in.pc))
+                return {};
         }
         // The execnz flavor's unconditional-continue lowering requires the header check to
         // immediately re-test EXEC (empty condition region) — see the shape comment.
@@ -3469,6 +3477,20 @@ void invalidate_loop_descriptor_provenance(RegState& rs, const std::set<int>& sr
 
 } // namespace
 
+int shader_max_vgpr(const std::vector<Rdna2Inst>& ins) {
+    int highest = 0;
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        for (uint32_t source = 0; source < in.n_src; ++source)
+            if (in.src[source].kind == OperandKind::VGPR)
+                highest = std::max(highest, in.src[source].value);
+        const uint32_t writes = vgpr_write_count(in);
+        if (writes)
+            highest = std::max(highest, in.dst.value + static_cast<int>(writes) - 1);
+    }
+    return highest;
+}
+
 // Registers WRITTEN in the pc range [lo, hi): candidates for an OpPhi at the loop header. Over-
 // approximation is safe (an extra phi for a non-carried value merges equal values). Mirrors emit_alu's
 // write targets, INCLUDING multi-register writes (MIMG dmask -> N consecutive VGPRs, SMEM -> N SGPRs) so
@@ -3480,6 +3502,9 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
         switch (in.fmt) {
             case Rdna2Format::VOP1:
                 if (in.opcode == 0x02) sregs.insert(in.dst.value);        // v_readfirstlane -> SGPR
+                else if (in.opcode == 0x42)                              // v_movreld: any observable
+                    for (int reg = in.dst.value; reg <= shader_max_vgpr(ins); ++reg)
+                        vregs.insert(reg);                               // VDST+M0 target
                 else vregs.insert(in.dst.value); break;
             case Rdna2Format::VOP2: case Rdna2Format::VOP3P:
                 vregs.insert(in.dst.value); break;
@@ -4187,6 +4212,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg_srt.erase(in.dst.value);
                 return true;
             }
+            if (in.opcode == 0x42) {   // v_movreld_b32: VGPR[VDST + M0] = SRC0
+                // RDNA2 ISA sec. 6.6. M0 is a runtime unsigned VGPR offset. Represent the indexed
+                // write as selects over every statically referenced destination at or above VDST;
+                // an out-of-range destination is unobservable because no later instruction names it.
+                // This preserves exact loop-carried SSA while avoiding an architectural 256-word
+                // register array for shaders that never use relative source addressing.
+                auto m0 = rs.sreg.find(124);
+                if (m0 == rs.sreg.end()) { ok = false; return true; }
+                for (int reg = in.dst.value; reg <= rs.max_vgpr; ++reg) {
+                    const uint32_t old = vreg_old(b, rs, reg);
+                    rs.vreg[reg] = b.sel(
+                        b.ucmp(Op_IEqual, m0->second,
+                               b.uconst(static_cast<uint32_t>(reg - in.dst.value))),
+                        a, old);
+                    predicate_write(b, rs, reg, old);
+                }
+                return true;
+            }
             uint32_t& d = vreg[in.dst.value];
             // WORD-select v_mov_b32_sdwa (#273): extract the selected 16-bit source half and insert it
             // into the selected dest half, preserving the other (the f16 half-move; decode accepted
@@ -4587,12 +4630,25 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             uint32_t cmp = 0;
             switch (eff) {
+                case 0x00: cmp = b.bfalse(); break;                              // v_cmp_f_f32
                 case 0x01: cmp = b.fcmp(Op_FOrdLessThan, a, c); break;         // v_cmp_lt_f32
                 case 0x02: cmp = b.fcmp(Op_FOrdEqual, a, c); break;            // v_cmp_eq_f32
                 case 0x03: cmp = b.fcmp(Op_FOrdLessThanEqual, a, c); break;    // v_cmp_le_f32
                 case 0x04: cmp = b.fcmp(Op_FOrdGreaterThan, a, c); break;      // v_cmp_gt_f32
                 case 0x05: cmp = b.fcmp(Op_FOrdNotEqual, a, c); break;         // v_cmp_lg_f32
                 case 0x06: cmp = b.fcmp(Op_FOrdGreaterThanEqual, a, c); break; // v_cmp_ge_f32
+                case 0x07: {                                                    // v_cmp_o_f32
+                    const uint32_t a_ordered = b.fcmp(Op_FOrdEqual, a, a);
+                    const uint32_t c_ordered = b.fcmp(Op_FOrdEqual, c, c);
+                    cmp = b.land(a_ordered, c_ordered);
+                    break;
+                }
+                case 0x08: {                                                    // v_cmp_u_f32
+                    const uint32_t a_nan = b.fcmp(Op_FUnordNotEqual, a, a);
+                    const uint32_t c_nan = b.fcmp(Op_FUnordNotEqual, c, c);
+                    cmp = b.lor(a_nan, c_nan);
+                    break;
+                }
                 // NaN-inclusive f32 compares (the "n"-prefix set is the unordered negation of 0x1-0x6):
                 case 0x09: cmp = b.fcmp(Op_FUnordLessThan, a, c); break;       // v_cmp_nge_f32 = !(a>=b)
                 case 0x0A: cmp = b.fcmp(Op_FUnordEqual, a, c); break;          // v_cmp_nlg_f32 = !(a!=b)
@@ -4600,6 +4656,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x0C: cmp = b.fcmp(Op_FUnordGreaterThan, a, c); break;    // v_cmp_nle_f32 = !(a<=b)
                 case 0x0D: cmp = b.fcmp(Op_FUnordNotEqual, a, c); break;       // v_cmp_neq_f32 = !(a==b)
                 case 0x0E: cmp = b.fcmp(Op_FUnordGreaterThanEqual, a, c); break;// v_cmp_nlt_f32 = !(a<b)
+                case 0x0F: cmp = b.btrue(); break;                              // v_cmp_tru_f32
                 case 0x81: cmp = b.scmp(Op_SLessThan, a, c); break;            // v_cmp_lt_i32
                 case 0x82: cmp = b.ucmp(Op_IEqual, a, c); break;               // v_cmp_eq_i32
                 case 0x83: cmp = b.scmp(Op_SLessThanEqual, a, c); break;       // v_cmp_le_i32
@@ -7726,6 +7783,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                bool allow_exec_update, bool allow_smem,
                const std::function<bool(const Rdna2Inst&)>& exp_fn,
                const uint32_t* code = nullptr, size_t dwords = 0) {   // raw stream (forward-if target check)
+    rs.max_vgpr = std::max(rs.max_vgpr, shader_max_vgpr(ins));
     // Fold PC-relative embedded-table loads (s_getpc_b64-built V#s) before the walk — emit_alu's
     // SMEM/MUBUF/SOP1 handlers consult the proven table maps (#273/#1054).
     if (code) {
@@ -8261,6 +8319,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             const uint32_t exec_chk = rs.exec, vcc_chk = rs.vcc, scc_chk = rs.scc;
             const std::unordered_map<int, uint32_t> bool_chk = rs.sreg_bool;
             const uint32_t loop_cond = L.condition == DivLoop::Condition::Exec ? rs.exec : rs.vcc;
+            const uint32_t chk_end = b.cur_block;
             b.emit_condbranch(loop_cond, body, merge);         // execz/vccz exit: continue while bit set
             while (idx < ins.size() && ins[idx].pc < L.exit_branch_pc) ++idx;
             if (idx < ins.size() && ins[idx].pc == L.exit_branch_pc) ++idx;   // consume the exit branch
@@ -8269,7 +8328,13 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (!emit_structured(L.exit_branch_pc + 1, L.backedge_pc, L.backedge_pc)) return false;
             const bool body_exec_narrowed = rs.exec_narrowed;
             if (idx < ins.size() && ins[idx].pc == L.backedge_pc) ++idx;      // consume the back-edge
-            b.emit_branch(cont); b.emit_label(cont);
+            const uint32_t body_end = b.cur_block;
+            // An unconditional back-edge can re-enable EXEC at the header. When an interior EXECZ
+            // targets the loop exit, send the inactive invocation straight to the loop merge; the
+            // ordinary path still reaches the continue block and patches the loop-carried phis.
+            if (L.direct_exec_breaks) b.emit_condbranch(rs.exec, cont, merge);
+            else                      b.emit_branch(cont);
+            b.emit_label(cont);
             for (auto& pr : phis) {
                 uint32_t nv = pr.dom == 0 ? vget(pr.reg)
                             : pr.dom == 1 ? sget(pr.reg)
@@ -8283,13 +8348,28 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             b.emit_branch(hdr);
             b.emit_label(merge);
             for (auto& pr : phis) {
-                if (pr.dom == 0)      rs.vreg[pr.reg] = condv.count(pr.reg) ? condv_val[pr.reg] : pr.phi;
-                else if (pr.dom == 1) rs.sreg[pr.reg] = conds.count(pr.reg) ? conds_val[pr.reg] : pr.phi;
-                else if (pr.dom == 2) rs.scc = scc_chk;    // flags/masks: the chk (exit-iteration) value
-                else if (pr.dom == 3) rs.vcc = vcc_chk;    // dominates the merge and is exact (the phi is
-                else if (pr.dom == 4) rs.exec = exec_chk;  // the pre-recompute value)
-                else { auto itc = bool_chk.find(pr.reg);
-                       rs.sreg_bool[pr.reg] = itc != bool_chk.end() ? itc->second : pr.phi; }
+                uint32_t chk_value = pr.dom == 0 ? (condv.count(pr.reg) ? condv_val[pr.reg] : pr.phi)
+                                   : pr.dom == 1 ? (conds.count(pr.reg) ? conds_val[pr.reg] : pr.phi)
+                                   : pr.dom == 2 ? (scc_chk ? scc_chk : b.bfalse())
+                                   : pr.dom == 3 ? vcc_chk
+                                   : pr.dom == 4 ? exec_chk
+                                   : (bool_chk.count(pr.reg) ? bool_chk.at(pr.reg) : pr.phi);
+                uint32_t body_value = pr.dom == 0 ? vget(pr.reg)
+                                    : pr.dom == 1 ? sget(pr.reg)
+                                    : pr.dom == 2 ? (rs.scc ? rs.scc : b.bfalse())
+                                    : pr.dom == 3 ? rs.vcc
+                                    : pr.dom == 4 ? rs.exec
+                                    : (rs.sreg_bool.count(pr.reg) ? rs.sreg_bool[pr.reg] : pr.phi);
+                const uint32_t merged = L.direct_exec_breaks && chk_value != body_value
+                    ? b.emit_phi_2way(pr.dom <= 1 ? b.t_u32 : b.t_bool,
+                                      chk_value, chk_end, body_value, body_end)
+                    : chk_value;
+                if (pr.dom == 0)      rs.vreg[pr.reg] = merged;
+                else if (pr.dom == 1) rs.sreg[pr.reg] = merged;
+                else if (pr.dom == 2) rs.scc = merged;
+                else if (pr.dom == 3) rs.vcc = merged;
+                else if (pr.dom == 4) rs.exec = merged;
+                else                  rs.sreg_bool[pr.reg] = merged;
             }
             // Masks CREATED inside the loop: their ids do not dominate the merge — drop them.
             for (auto it = rs.sreg_bool.begin(); it != rs.sreg_bool.end();) {
@@ -8769,25 +8849,39 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
     // targets remain unsupported and must never be silently remapped to location 0 (#635).
     uint32_t color_mask = 0;
     bool has_null_export = false;
+    bool has_depth_export = false;
     for (const auto& in : ins) {
         if (in.is_end) break;
         if (in.fmt != Rdna2Format::EXP) continue;
         if (in.exp_target < 2) color_mask |= 1u << in.exp_target;
+        else if (in.exp_target == 8 && !in.exp_compr && (in.exp_en & 1u))
+            has_depth_export = true;
         else if (in.exp_target == 9) has_null_export = true;
     }
     // A NULL export is a real fragment-shader terminator. Depth/stencil-only draws use it after
     // narrowing EXEC to the surviving samples, so the module intentionally has no color outputs.
     // Keep other unsupported MRT-only programs fail-visible instead of accepting every no-color PS.
-    if (!color_mask && !has_null_export) {
-        if (getenv("PROSPER_DBG") && pcrel_dispatch_target != UINT32_MAX)
-            fprintf(stderr, "[recompile-reject] pcrel target=%u has no supported export\n",
-                    pcrel_dispatch_target);
+    if (!color_mask && !has_null_export && !has_depth_export) {
+        if (getenv("PROSPER_DBG")) {
+            fprintf(stderr,
+                    "[recompile-reject] fragment has no supported export dwords=%zu ins=%zu "
+                    "first=%08x last=%08x",
+                    dwords, ins.size(), dwords ? code[0] : 0u,
+                    dwords ? code[dwords - 1] : 0u);
+            if (pcrel_dispatch_target != UINT32_MAX)
+                fprintf(stderr, " pcrel-target=%u", pcrel_dispatch_target);
+            fputc('\n', stderr);
+        }
         return {};
     }
 
     const FragmentInterpolationLayout derived_interpolation = interpolation
         ? *interpolation : fragment_interpolation_layout(code, dwords, system_inputs);
-    if (!derived_interpolation.valid) return {};
+    if (!derived_interpolation.valid) {
+        if (getenv("PROSPER_DBG"))
+            fprintf(stderr, "[recompile-reject] invalid fragment interpolation layout\n");
+        return {};
+    }
     SpirvCompute b;
     b.begin_fragment(rt, color_mask);
     // Fragment I/O value tap (PROSPER_FS_TAP=draw:pc): redirect the MRT0 colour export to the intermediate
@@ -8823,7 +8917,14 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                 if (field <= 6 && derived_interpolation.requires_geometry) {
                     for (uint32_t component = 0; component < widths[field]; ++component) {
                         const uint32_t value = b.system_interpolation_component(field, component);
-                        if (!value) return {};
+                        if (!value) {
+                            if (getenv("PROSPER_DBG"))
+                                fprintf(stderr,
+                                        "[recompile-reject] missing fragment system interpolation "
+                                        "field=%u component=%u\n",
+                                        field, component);
+                            return {};
+                        }
                         rs.vreg[(int)(vgpr + component)] = value;
                     }
                 } else if (field >= 8 && field <= 11) {
@@ -8898,10 +8999,11 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
             fprintf(stderr, "[recompile-reject] pcrel target=%u body failed\n", pcrel_dispatch_target);
         return {};
     }
-    if (!exported[0] && !exported[1] && !has_null_export) {
-        if (getenv("PROSPER_DBG") && pcrel_dispatch_target != UINT32_MAX)
-            fprintf(stderr, "[recompile-reject] pcrel target=%u emitted no color\n",
-                    pcrel_dispatch_target);
+    if (!exported[0] && !exported[1] && !has_null_export && !has_depth_export) {
+        if (getenv("PROSPER_DBG"))
+            fprintf(stderr, "[recompile-reject] emitted no fragment color%s%u\n",
+                    pcrel_dispatch_target != UINT32_MAX ? " pcrel-target=" : "",
+                    pcrel_dispatch_target != UINT32_MAX ? pcrel_dispatch_target : 0u);
         return {};
     }
     return b.finish();

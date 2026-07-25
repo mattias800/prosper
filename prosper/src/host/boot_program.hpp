@@ -22,10 +22,14 @@ inline constexpr uint64_t BOOT_PS5UTIL  = 0x4c0000000ull;
 inline constexpr uint64_t BOOT_PSNCORE  = 0x480000000ull;   // PPSA02664's Unity PSN native plugin
 inline constexpr uint64_t BOOT_PSNCOMMON = 0x4a0000000ull;  //   (PSNCore.prx + PSNCommon.prx)
 inline constexpr uint64_t BOOT_PSN      = 0x4e0000000ull;
+inline constexpr uint64_t BOOT_NPCPPWEBAPI = 0x4d0000000ull; // optional bundled PSN C++ support PRX
 inline constexpr uint64_t BOOT_SAVEDATA = 0x4f0000000ull;
 inline constexpr uint64_t BOOT_LIBC     = 0x5c0000000ull;
 inline constexpr uint64_t BOOT_FMODSTUDIO = 0x520000000ull; // optional Unity FMOD native plugins
 inline constexpr uint64_t BOOT_FMOD       = 0x540000000ull;
+inline constexpr uint64_t BOOT_AKMOTION   = 0x560000000ull; // optional Unity Wwise native plugins
+inline constexpr uint64_t BOOT_AKVORBIS   = 0x580000000ull;
+inline constexpr uint64_t BOOT_AKSOUNDENGINE = 0x5a0000000ull;
 inline constexpr uint64_t BOOT_STUB     = 0x600000000ull;
 
 // Boot the title rooted at `dump_root` (the app0 directory): link the fixed module set (dropping any
