@@ -2667,12 +2667,72 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
 }
 
 // libSceAmpr vWU-odnS+fU — sceAmprMeasureCommandSizeReadFile. The exact firmware contract returns
-// 20 bytes, or 24 when the file offset needs its high 32 bits. This is a pure sizing API on every
-// host: performing the older Linux-only compatibility read here made an allocation query mutate
-// guest memory and gave Windows different title-visible behavior. Encoded reads execute through
-// sceAmprAprCommandBufferReadFile instead.
+// 20 bytes, or 24 when the file offset needs its high 32 bits. DOLL's older SDK wrapper also relies
+// on this call to execute the described read immediately: it passes a valid APR file id and consumes
+// the destination before any encoded command buffer is submitted. Keep sizing-only calls pure by
+// requiring a registered id, while preserving that proven compatibility read on every host. The
+// return value is always the command size; an I/O failure must never become an allocation size.
 HLE(f_apr_measure_read_file) {
-    return (a3 >> 32) ? 24 : 20;
+    const uint64_t measured = (a3 >> 32) ? 24 : 20;
+    const std::string host = prosper_apr_path_for_id((uint32_t)a0);
+    if (host.empty() || a1 <= 0xffff || a2 == 0) {
+        if (filelog())
+            fprintf(stderr, "[apr] measure-read id=%llu -> %llu bytes (no compatibility read)\n",
+                    (unsigned long long)a0, (unsigned long long)measured);
+        return measured;
+    }
+
+    uint64_t file_size = 0;
+#ifndef _WIN32
+    struct stat st {};
+    if (::stat(host.c_str(), &st) == 0) file_size = (uint64_t)st.st_size;
+#else
+    struct _stat64 st {};
+    if (::_stat64(host.c_str(), &st) == 0) file_size = (uint64_t)st.st_size;
+#endif
+    if (a3 > file_size || a2 > file_size - a3 || a2 > (uint64_t)SIZE_MAX - 0xfff) {
+        if (filelog())
+            fprintf(stderr, "[apr] measure-read id=%llu range off=0x%llx size=%llu invalid\n",
+                    (unsigned long long)a0, (unsigned long long)a3,
+                    (unsigned long long)a2);
+        return measured;
+    }
+
+    bool copied = false;
+#ifndef _WIN32
+    const uint64_t rounded = (a2 + 0xfff) & ~0xfffull;
+    void* staging = mmap(nullptr, rounded, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (staging != MAP_FAILED) {
+        const int fd = apr_cached_fd(host);
+        const ssize_t got = fd >= 0 ? ::pread(fd, staging, (size_t)a2, (off_t)a3) : -1;
+        copied = got == (ssize_t)a2 && apr_write_guest_dst(a1, staging, a2);
+        munmap(staging, rounded);
+    }
+#else
+    void* staging = ::malloc((size_t)a2);
+    if (staging) {
+        FILE* file = ::fopen(host.c_str(), "rb");
+        size_t got = 0;
+        if (file) {
+            if (_fseeki64(file, (__int64)a3, SEEK_SET) == 0)
+                got = ::fread(staging, 1, (size_t)a2, file);
+            ::fclose(file);
+        }
+        if (got == (size_t)a2 && windows_prepare_guest_write(a1, a2)) {
+            memcpy((void*)(uintptr_t)a1, staging, (size_t)a2);
+            copied = true;
+        }
+        ::free(staging);
+    }
+#endif
+    if (filelog())
+        fprintf(stderr, "[apr] measure-read compatibility id=%llu %s -> dst=0x%llx "
+                        "off=0x%llx size=%llu %s; measured=%llu\n",
+                (unsigned long long)a0, host.c_str(), (unsigned long long)a1,
+                (unsigned long long)a3, (unsigned long long)a2,
+                copied ? "OK" : "FAIL", (unsigned long long)measured);
+    return measured;
 }
 
 void register_file_hle() {
