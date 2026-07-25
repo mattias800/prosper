@@ -6320,9 +6320,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // shadow map (see image_sample_dref_manual_2d for why not a compare sampler);
                     // an S# requesting LINEAR gets the software 2x2 PCF form (#1287/#781 banding).
                     b.declare_texture(res->binding, Dim_2D, false);
+                    // PROSPER_NO_DREF_PCF restores the historical hard-threshold single tap for
+                    // A/B bisection (PROSPER_NO_DEPTH_BIAS convention).
+                    static const bool no_pcf = getenv("PROSPER_NO_DREF_PCF") != nullptr;
                     b.image_sample_dref_manual_2d(res->binding, vread(cvg(1)), vread(cvg(2)),
                                                   vread(cvg(0)), res->depth_compare_func,
-                                                  res->mag_filter != 0, out);
+                                                  !no_pcf && res->mag_filter != 0, out);
                 } else { ok = false; return true; }
             } else if (is_gather_lz || is_gather_lz_o) {
                 // gather4 dmask selects ONE channel (must be a single bit); the result is always the
@@ -6353,10 +6356,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // dropped them for an implicit-LOD sample; that is wrong exactly where guests
                     // use _d — projected/wrapped coordinates whose quad derivatives spike at wrap
                     // seams, which painted deep-mip bands as concentric light-pattern rings
-                    // (#1287/#781). See image_sample_grad_2d.
-                    b.image_sample_grad_2d(res->binding, vread(cvg(4)), vread(cvg(5)),
-                                           vread(cvg(0)), vread(cvg(1)),
-                                           vread(cvg(2)), vread(cvg(3)), out);
+                    // (#1287/#781). See image_sample_grad_2d. PROSPER_NO_SAMPLE_D_GRAD restores
+                    // the historical implicit-LOD form for A/B bisection (PROSPER_NO_DEPTH_BIAS
+                    // convention).
+                    static const bool no_grad = getenv("PROSPER_NO_SAMPLE_D_GRAD") != nullptr;
+                    if (no_grad)
+                        b.image_sample_2d(res->binding, vread(cvg(4)), vread(cvg(5)), out);
+                    else
+                        b.image_sample_grad_2d(res->binding, vread(cvg(4)), vread(cvg(5)),
+                                               vread(cvg(0)), vread(cvg(1)),
+                                               vread(cvg(2)), vread(cvg(3)), out);
                 } else {
                     uint32_t cu = vread(cvg(0)), cv = vread(cvg(1));
                     if (is_sample)         b.image_sample_2d(res->binding, cu, cv, out);
