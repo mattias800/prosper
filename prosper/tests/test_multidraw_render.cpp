@@ -473,6 +473,12 @@ int main() {
         off_target_clear.color_write_mask = 0;
         off_target_clear.stencil_clear_enable = true;
         off_target_clear.stencil_clear_value = 0;
+        // #1361: keep this an EFFECTIVE clear shape (enable + write mask). With the #1355
+        // write-path gate, a bare clear bit is inert and this check would pass vacuously without
+        // exercising the off-target scissor clamp it was written for (#531).
+        off_target_clear.stencil_enable = true;
+        off_target_clear.stencil_compare_op[0] = off_target_clear.stencil_compare_op[1] = 7;
+        off_target_clear.stencil_write_mask[0] = off_target_clear.stencil_write_mask[1] = 0xff;
         off_target_clear.has_scissor = true;
         off_target_clear.scissor_left = 100; off_target_clear.scissor_top = 100;
         off_target_clear.scissor_right = 120; off_target_clear.scissor_bottom = 120;
@@ -772,6 +778,25 @@ int main() {
         const uint8_t* pc = center(preserved);
         CHECK(pc && pc[1] > 0xC0 && pc[0] < 0x40,
               "EQUAL reader still sees the written stencil after an inert clear rect (#1355)");
+
+        // #1361: an inert clear against a NEVER-written identity must not phantom-initialize the
+        // plane to its clear value. A partial gate (clear-site only) would let the forced stencil
+        // pass create the image, seed it from the latched clear value, and mark it valid — a later
+        // EQUAL-7 reader would then wrongly pass. With the full gate the reader's fresh plane
+        // defaults to 0 and EQUAL-7 rejects everywhere.
+        ResolvedPipelineState inert_fresh = inert_sclear;
+        inert_fresh.stencil_read_base = inert_fresh.stencil_write_base = 0x88780000;
+        ResolvedPipelineState seven_reader = sreader;
+        seven_reader.stencil_ref[0] = seven_reader.stencil_ref[1] = 7;
+        seven_reader.stencil_read_base = seven_reader.stencil_write_base = 0x88780000;
+        prosper::test::BackendDraw fcl; fcl.vs = vs; fcl.fs = red; fcl.ps = &inert_fresh; fcl.vcount = 3;
+        prosper::test::BackendDraw fr7; fr7.vs = vs; fr7.fs = green; fr7.ps = &seven_reader; fr7.vcount = 3;
+        (void)prosper::test::render_draws_rgba({fcl}, W, H, nullptr, nullptr, true);
+        std::vector<uint8_t> untouched =
+            prosper::test::render_draws_rgba({fr7}, W, H, nullptr, nullptr, true);
+        const uint8_t* uc7 = center(untouched);
+        CHECK(uc7 && uc7[1] < 0x80,
+              "an inert clear cannot phantom-initialize a never-written plane (#1361)");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
