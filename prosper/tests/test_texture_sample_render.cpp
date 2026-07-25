@@ -713,6 +713,20 @@ int main() {
             vert, lzf, W, H, nullptr, nullptr, nullptr, &td);
         CHECK(blocked.empty(),
               "global lifetime guard rejects renderer work from a fresh batch");
+
+        bool rejected_state_valid = true;
+        bool rejected_cleanup_ran = false;
+        prosper::test::BackendSubmissionBatch rejected_batch;
+        rejected_batch.enqueue(VK_NULL_HANDLE);
+        rejected_batch.add_failure_cleanup([&]() { rejected_state_valid = false; });
+        rejected_batch.add_cleanup([&]() { rejected_cleanup_ran = true; });
+        const auto rejected = rejected_batch.submit_and_wait(
+            VK_NULL_HANDLE, VK_NULL_HANDLE, false);
+        rejected_batch.complete();
+        CHECK(rejected.submit_result == VK_ERROR_DEVICE_LOST &&
+                  rejected.wait_result == VK_ERROR_DEVICE_LOST &&
+                  !rejected_batch.pending() && !rejected_state_valid && rejected_cleanup_ran,
+              "global lifetime guard discards and cleans never-submitted queued work");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

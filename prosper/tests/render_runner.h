@@ -879,6 +879,15 @@ public:
             result.wait_result = VK_ERROR_DEVICE_LOST;
             return result;
         }
+        if (backend_has_unproven_submission()) {
+            // Another batch/helper has unproven submitted work. These commands never reached the
+            // queue, so discard them, invalidate their speculative state, and let complete() safely
+            // release their resources without making another Vulkan call on the poisoned device.
+            result.submit_result = VK_ERROR_DEVICE_LOST;
+            result.wait_result = VK_ERROR_DEVICE_LOST;
+            discard();
+            return result;
+        }
         if (commands_.empty()) return result;
 
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
