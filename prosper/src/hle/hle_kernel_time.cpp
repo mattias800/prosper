@@ -562,9 +562,11 @@ namespace {
                     int64_t data = (e.filter == -7 || e.filter == -15) ? q.data + e.data : e.data;
                     q = e; q.data = data; s->cv.notify_all(); return;
                 }
-        // Distinct (ident, filter) pairs are few; the cap is a leak guard only. If it ever fires,
-        // shed the OLDEST event — never the just-posted one.
-        if (s->ready.size() >= 64) s->ready.pop_front();
+        // Distinct coalesced (ident, filter) pairs are few; cap that level-style queue as a leak
+        // guard and shed the oldest event if it ever fires. coalesce=false is deliberately exempt:
+        // EOP and APR completions are count-sensitive, so dropping any occurrence loses guest work
+        // and can strand a semaphore consumer even though the producer fired every completion.
+        if (coalesce && s->ready.size() >= 64) s->ready.pop_front();
         s->ready.push_back(e);
         s->cv.notify_all();
     }
