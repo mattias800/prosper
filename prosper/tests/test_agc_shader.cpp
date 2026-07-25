@@ -104,6 +104,44 @@ int main() {
     CHECK(good.code == reinterpret_cast<const void*>(0x2000ull), "valid shader stores code pointer");
     CHECK(prosper_agc_shader_count() == count0 + 1, "valid shader enters registry");
 
+    // Sonic Origins recycles shader-header allocations. A new blob at an address seen by an earlier
+    // CreateShader call once kept its raw 0x70/0x78 self-relative register pointers because relocation
+    // was guarded by header address alone, then crashed while patching the PGM pair. Drive two distinct
+    // blob lifetimes through the same storage and require both to relocate and patch normally.
+    alignas(Shader) unsigned char recycled_storage[256]{};
+    auto* recycled = reinterpret_cast<Shader*>(recycled_storage);
+    auto* recycled_regs = reinterpret_cast<ShaderRegister*>(recycled_storage + 0x80);
+    const uintptr_t raw_sh_offset = reinterpret_cast<uintptr_t>(recycled_regs) -
+                                    reinterpret_cast<uintptr_t>(&recycled->sh_registers);
+    auto prepare_recycled = [&] {
+        *recycled = {};
+        recycled->file_header = 0x34333231u;
+        recycled->version = 0x18u;
+        recycled->header_size = sizeof(recycled_storage);
+        recycled->shader_size = 64;
+        recycled->type = 2;
+        recycled->num_sh_registers = 2;
+        recycled->sh_registers = reinterpret_cast<ShaderRegister*>(raw_sh_offset);
+        recycled_regs[0] = {prosper::agc::Pm4::SPI_SHADER_PGM_LO_ES, 0};
+        recycled_regs[1] = {prosper::agc::Pm4::SPI_SHADER_PGM_HI_ES, 0};
+    };
+    prepare_recycled();
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst), reinterpret_cast<uint64_t>(recycled),
+                       0x1234567800ull, 0, 0, 0);
+    CHECK(rc == 0 && dst == recycled && recycled->sh_registers == recycled_regs,
+          "first shader lifetime relocates its self-relative register pointer");
+    CHECK(recycled_regs[0].value == 0x12345678u,
+          "first shader lifetime patches the program base");
+    prepare_recycled();
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst), reinterpret_cast<uint64_t>(recycled),
+                       0x2345678900ull, 0, 0, 0);
+    CHECK(rc == 0 && dst == recycled && recycled->sh_registers == recycled_regs,
+          "recycled shader allocation relocates the new header again");
+    CHECK(recycled_regs[0].value == 0x23456789u,
+          "recycled shader allocation patches the new program base");
+
     // #719: UE4 pixel shaders use buffer_load_format_* for structured/material data too. The
     // dynamic V# fold is stage-agnostic; build_stage_table must retain its result for PS instead of
     // discarding it under the old "PS has no vertex fetch" assumption. Otherwise the recompiler

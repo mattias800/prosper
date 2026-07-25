@@ -1689,6 +1689,9 @@ void GpuState::apply(const Pm4Command& c) {
             // submit. Attribute the garbage: log any indirect array whose offsets exceed the sane
             // register window, with the packet's provenance, so the corrupt producer is identifiable.
             static const bool regbloat = getenv("PROSPER_REGBLOAT") != nullptr;
+            const bool malformed = std::any_of(regs, regs + c.num_regs, [](const ShaderReg& reg) {
+                return reg.offset >= kRegOffsetLimit;
+            });
             uint32_t bad = 0, first_bad = 0;
             // #1364: within-array clobber detector — a DB base offset written nonzero and then
             // ZERO by a LATER slot of the SAME array is the stale-slot signature (#1353's
@@ -1708,6 +1711,24 @@ void GpuState::apply(const Pm4Command& c) {
                                 "[agc] out-of-range indirect reg write dropped: class=%d off=0x%x "
                                 "val=0x%x (#1264; PROSPER_REGBLOAT=1 for provenance)\n",
                                 (int)c.reg_class, regs[i].offset, regs[i].value);
+                    continue;
+                }
+                // Cobra's patched Cx banks contain overrun pairs among canary/pointer records whose
+                // coincidental offset is the window BR. Their coordinates are outside AGC's initialized
+                // 1..16K raster domain (one axis zero, or above 16K); accepting the observed variants
+                // clips the 1920x1080 composite to 250 or zero rows. Reject only this fail-visible
+                // malformed-bank shape; valid arrays and in-domain scissors remain untouched.
+                if (malformed && c.reg_class == RegClass::Cx &&
+                    regs[i].offset == prosper::agc::Pm4::PA_SC_WINDOW_SCISSOR_BR &&
+                    (!(regs[i].value & 0x7fffu) ||
+                     !((regs[i].value >> 16u) & 0x7fffu) ||
+                     (regs[i].value & 0x7fffu) > 0x4000u ||
+                     ((regs[i].value >> 16u) & 0x7fffu) > 0x4000u)) {
+                    static std::atomic<int> boundary_note{0};
+                    if (boundary_note.fetch_add(1) < 4)
+                        fprintf(stderr,
+                                "[agc] malformed indirect bank invalid scissor dropped: "
+                                "value=0x%x (#1356)\n", regs[i].value);
                     continue;
                 }
                 file[regs[i].offset] = regs[i].value;

@@ -317,10 +317,12 @@ DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
         view.supported = false;
         return view;
     }
-    // The offset helper models only thin 2D allocations. Cube, 3D, array, and MSAA resources have
-    // additional slice/tail rules. Level zero still names their allocation base, but a non-zero view
-    // must be rejected until those rules are modeled; returning the base would sample the wrong mip.
-    if (d.type != 9) {
+    // The offset helper models thin 2D allocations. A 2D_ARRAY view selecting exactly its sole layer
+    // has the same mip placement (there is no inter-slice pitch to apply), which Sonic Origins uses
+    // for its post-process pyramid. Multi-layer arrays, cube, 3D, and MSAA resources have additional
+    // slice/tail rules and remain rejected for non-zero views.
+    const bool thin_2d = d.type == 9 || (d.type == 13 && d.depth == 1);
+    if (!thin_2d) {
         view.supported = d.base_level == 0;
         return view;
     }

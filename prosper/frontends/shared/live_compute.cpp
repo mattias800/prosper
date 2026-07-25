@@ -1146,6 +1146,28 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         skip_image(r, "renderer-owned RTT snapshot byte count mismatch"); break;
                     }
                 }
+                if (renderer_owned && !bi.storage &&
+                    (r->format == DataFormat::Uint16 || r->format == DataFormat::Uint32)) {
+                    const uint64_t cached_bpp =
+                        live_target.format == LiveTargetPixelFormat::Rgba16Float ? 8u : 4u;
+                    const uint64_t requested_bpp =
+                        static_cast<uint64_t>(data_format_bytes(r->format)) *
+                        (r->num_components ? r->num_components : 1u);
+                    if (cached_bpp != requested_bpp) {
+                        // A UINT view is a bit reinterpretation of the target allocation. When the
+                        // cached and requested texel widths differ, the renderer snapshot is a
+                        // different alias and cannot be expanded or numerically converted safely.
+                        renderer_owned = false;
+                        if (trace)
+                            std::fprintf(stderr,
+                                         "[compute]   renderer RTT integer-view miss binding=%u "
+                                         "addr=0x%llx cached-bpp=%llu requested-bpp=%llu "
+                                         "-> guest backing\n",
+                                         bi.binding, (unsigned long long)r->gpu_addr,
+                                         (unsigned long long)cached_bpp,
+                                         (unsigned long long)requested_bpp);
+                    }
+                }
                 if (renderer_owned && bi.storage) {
                     const uint32_t nc = r->num_components ? r->num_components : 1;
                     const bool compatible =
@@ -1242,8 +1264,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const bool sampled_uint8_native = !bi.storage && r->format == DataFormat::Uint8 &&
                                               (sampled_components == 1 || sampled_components == 2 ||
                                                sampled_components == 4);
+            const bool sampled_uint16_native = !bi.storage && r->format == DataFormat::Uint16 &&
+                                               (sampled_components == 1 || sampled_components == 2 ||
+                                                sampled_components == 4);
+            const bool sampled_uint32_native = !bi.storage && r->format == DataFormat::Uint32 &&
+                                               (sampled_components == 1 || sampled_components == 2 ||
+                                                sampled_components == 4);
             const uint32_t texel_bytes = bi.storage || sampled_float32 ? 16u
                                          : sampled_depth ? data_format_bytes(r->format)
+                                         : sampled_uint32_native ? sampled_components * 4u
+                                         : sampled_uint16_native ? sampled_components * 2u
                                          : sampled_unorm16_native ? sampled_components * 2u
                                          : sampled_uint8_native ? sampled_components
                                          : sampled_unorm8x2 ? 2u : 4u;
@@ -1388,7 +1418,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         break;
                     }
                     const std::vector<uint8_t>& pixels = *live_target.pixels;
-                    if (sampled_uint8_native) {
+                    if (sampled_uint16_native || sampled_uint32_native) {
+                        // A renderer-owned target is authoritative only when its cached texel is
+                        // byte-identical to the UINT view.  Sonic aliases an RGBA16F render target
+                        // as RGBA16_UINT for a compute resolve: those eight bytes must be
+                        // reinterpreted, not numerically converted through float or UNORM.
+                        std::memcpy(upload.data(), pixels.data(), upload.size());
+                    } else if (sampled_uint8_native) {
                         const size_t texels = static_cast<size_t>(volume_texels);
                         for (size_t t = 0; t < texels; ++t) {
                             for (uint32_t c = 0; c < sampled_components; ++c) {
@@ -1502,7 +1538,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         need = dim_2d_array ? slice * r->depth : slice;
                     } else if (rgba8 || uint8 || r8 || f16 || f32 || r11g11b10 ||
                                sampled_unorm8x2 || sampled_unorm16_native || sampled_uint8_native ||
-                               sampled_depth) {
+                               sampled_uint16_native || sampled_uint32_native || sampled_depth) {
                         const uint32_t bpt = r11g11b10 ? 4u : cb * nc;
                         if (r->tile_mode && dim_3d && r->depth > 1) {
                             need = tiled_volume_bytes(r->width, r->height, r->depth,
@@ -1569,7 +1605,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         const size_t texels = (size_t)volume_texels;
                         if (rgba8 || uint8 || r11g11b10 ||
                             sampled_unorm8x2 || sampled_unorm16_native ||
-                            sampled_uint8_native || sampled_depth) {   // Native sampled texels
+                            sampled_uint8_native || sampled_uint16_native ||
+                            sampled_uint32_native || sampled_depth) {   // Native sampled texels
                             std::memcpy(upload.data(), lin.data(), lin.size());
                         } else if (f32) {                           // Native float channels + default fill
                             for (size_t t = 0; t < texels; ++t) {
@@ -1646,6 +1683,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                            ? (sampled_components == 1 ? VK_FORMAT_R8_UINT
                                               : sampled_components == 2 ? VK_FORMAT_R8G8_UINT
                                                                          : VK_FORMAT_R8G8B8A8_UINT)
+                                       : sampled_uint16_native
+                                           ? (sampled_components == 1 ? VK_FORMAT_R16_UINT
+                                              : sampled_components == 2 ? VK_FORMAT_R16G16_UINT
+                                                                         : VK_FORMAT_R16G16B16A16_UINT)
+                                       : sampled_uint32_native
+                                           ? (sampled_components == 1 ? VK_FORMAT_R32_UINT
+                                              : sampled_components == 2 ? VK_FORMAT_R32G32_UINT
+                                                                         : VK_FORMAT_R32G32B32A32_UINT)
                                        : sampled_r11g11b10 ? VK_FORMAT_B10G11R11_UFLOAT_PACK32
                                          : sampled_unorm8x2 ? VK_FORMAT_R8G8_UNORM
                                            : sampled_unorm16_native
@@ -1721,9 +1766,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // Integer sampled formats cannot be linearly filtered in Vulkan. DOLL's UINT8x4
                 // volume is consumed by image_load (texel fetch), so the sampler is unused there;
                 // nearest also preserves integer semantics if a shader samples such a descriptor.
-                smci.magFilter = sampled_uint8_native ? VK_FILTER_NEAREST
+                const bool sampled_uint_native = sampled_uint8_native ||
+                    sampled_uint16_native || sampled_uint32_native;
+                smci.magFilter = sampled_uint_native ? VK_FILTER_NEAREST
                                                : (r->mag_filter ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
-                smci.minFilter = sampled_uint8_native ? VK_FILTER_NEAREST
+                smci.minFilter = sampled_uint_native ? VK_FILTER_NEAREST
                                                : (r->min_filter ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
                 smci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
                 smci.addressModeU = wrap(r->addr_uvw[0]);

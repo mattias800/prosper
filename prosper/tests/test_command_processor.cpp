@@ -98,6 +98,36 @@ int main() {
 
     CHECK(st.index_type == 2, "index_type = 2 (from SetIndexSize)");
 
+    // A malformed patched bank can include overrun pairs among pointer/canary records. Preserve its
+    // ordinary register writes but reject out-of-domain window-scissor pairs (the Cobra failure).
+    {
+        constexpr uint32_t bad_off = 0xDEADBEEFu;
+        ShaderReg malformed_bank[] = {
+            {0x100u, 1u}, {0x101u, 2u}, {0x102u, 3u}, {0x103u, 4u}, {0x104u, 5u},
+            {prosper::agc::Pm4::PA_SC_WINDOW_SCISSOR_BR, 0x00FAC60Au},
+            {bad_off, 0xAAAAu},
+            {0x110u, 6u}, {0x111u, 7u}, {0x112u, 8u}, {0x113u, 9u}, {0x114u, 10u},
+            {prosper::agc::Pm4::PA_SC_WINDOW_SCISSOR_BR, 0x00000FACu},
+            {bad_off, 0xBBBBu},
+        };
+        uint32_t malformed_cb[32]{};
+        Dcb malformed_dcb{};
+        malformed_dcb.bottom = malformed_cb;
+        malformed_dcb.top = malformed_cb + 32;
+        malformed_dcb.cursor_up = malformed_cb;
+        malformed_dcb.cursor_down = malformed_cb + 32;
+        setcx((uint64_t)(uintptr_t)&malformed_dcb,
+              (uint64_t)(uintptr_t)malformed_bank,
+              sizeof(malformed_bank) / sizeof(malformed_bank[0]), 0, 0, 0);
+        GpuState sanitized;
+        run_cb(malformed_cb, 4, sanitized);
+        CHECK(sanitized.cx.count(0x100u) && sanitized.cx.count(0x104u) &&
+              sanitized.cx.count(0x110u) && sanitized.cx.count(0x114u),
+              "malformed indirect bank preserves ordinary register writes");
+        CHECK(!sanitized.cx.count(prosper::agc::Pm4::PA_SC_WINDOW_SCISSOR_BR),
+              "malformed indirect bank rejects its out-of-domain scissor writes");
+    }
+
     CHECK(st.draws.size() == 2, "2 draws recorded");
     CHECK(st.draws.size() == 2 && st.draws[0].modifier == 0x1122334455667788ull,
           "DrawIndexAuto retains its ShaderDrawModifier");

@@ -139,6 +139,14 @@ int main() {
         CHECK(vmip1.base == 0x18000000ull + 827392 && vmip1.width == 1024 &&
                   vmip1.height == 576 && vmip1.mip_offset == 827392,
               "non-tail base-level view applies its proven offset and dimensions");
+        uint32_t tmip_array[8]; memcpy(tmip_array, tmip, sizeof tmip_array);
+        tmip_array[3] = (tmip_array[3] & ~(0xfu << 28)) | (13u << 28); // one-layer 2D_ARRAY
+        const DecodedImageDescriptor dmip_array = decode_image_descriptor(tmip_array);
+        const DecodedImageView vmip_array = image_base_level_view(dmip_array, mip_format);
+        CHECK(dmip_array.depth == 1 && vmip_array.supported &&
+                  vmip_array.base == vmip1.base && vmip_array.width == vmip1.width &&
+                  vmip_array.height == vmip1.height && vmip_array.mip_offset == vmip1.mip_offset,
+              "single-layer 2D-array mip view shares the proven thin-2D placement");
         tmip[3] = (tmip[3] & ~(0xfu << 12)) | (7u << 12); // BASE_LEVEL 7, first packed-tail mip
         const DecodedImageDescriptor dmip7 = decode_image_descriptor(tmip);
         const DecodedImageView vmip7 = image_base_level_view(dmip7, mip_format);
