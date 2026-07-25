@@ -726,6 +726,54 @@ int main() {
               "a negative constant depth bias flips the same LESS draw to passing (#1351)");
     }
 
+    // #1355: STENCIL_CLEAR_ENABLE is the stencil twin of the #1352 depth rule — the bit
+    // substitutes the VALUE of stencil writes and only acts through the enabled stencil write
+    // path. A writes-disabled clear rect between a stencil writer and an EQUAL reader must not
+    // destroy the written plane.
+    {
+        CHECK(!prosper::test::stencil_clear_effective(true, false, 0xff, 0xff),
+              "a stencil clear with STENCIL_ENABLE off is inert (#1355)");
+        CHECK(!prosper::test::stencil_clear_effective(true, true, 0, 0),
+              "a stencil clear with a zero write mask is inert");
+        CHECK(prosper::test::stencil_clear_effective(true, true, 0xff, 0),
+              "a real stencil clear shape (enable + mask) stays effective");
+
+        ResolvedPipelineState swriter = opaque;
+        swriter.color_write_mask = 0;
+        swriter.stencil_enable = true;
+        swriter.stencil_compare_op[0] = swriter.stencil_compare_op[1] = 7; // ALWAYS
+        swriter.stencil_pass_op[0] = swriter.stencil_pass_op[1] = 2;       // REPLACE
+        swriter.stencil_op_val[0] = swriter.stencil_op_val[1] = 2;
+        swriter.stencil_write_mask[0] = swriter.stencil_write_mask[1] = 0xff;
+        swriter.stencil_read_base = swriter.stencil_write_base = 0x88770000;
+
+        ResolvedPipelineState inert_sclear{};
+        inert_sclear.topology = 3; inert_sclear.color_write_mask = 0;
+        inert_sclear.stencil_clear_enable = true;
+        inert_sclear.stencil_clear_value = 7;
+        inert_sclear.stencil_enable = false;   // write path fully disabled
+        inert_sclear.stencil_read_base = inert_sclear.stencil_write_base = 0x88770000;
+
+        ResolvedPipelineState sreader = opaque;
+        sreader.stencil_enable = true;
+        sreader.stencil_compare_op[0] = sreader.stencil_compare_op[1] = 2; // EQUAL
+        sreader.stencil_ref[0] = sreader.stencil_ref[1] = 2;
+        sreader.stencil_compare_mask[0] = sreader.stencil_compare_mask[1] = 0xff;
+        sreader.stencil_write_mask[0] = sreader.stencil_write_mask[1] = 0;
+        sreader.stencil_read_base = sreader.stencil_write_base = 0x88770000;
+
+        prosper::test::BackendDraw sw; sw.vs = vs; sw.fs = red; sw.ps = &swriter; sw.vcount = 3;
+        prosper::test::BackendDraw scl; scl.vs = vs; scl.fs = red; scl.ps = &inert_sclear; scl.vcount = 3;
+        prosper::test::BackendDraw sr; sr.vs = vs; sr.fs = green; sr.ps = &sreader; sr.vcount = 3;
+        (void)prosper::test::render_draws_rgba({sw}, W, H, nullptr, nullptr, true);
+        (void)prosper::test::render_draws_rgba({scl}, W, H, nullptr, nullptr, true);
+        std::vector<uint8_t> preserved =
+            prosper::test::render_draws_rgba({sr}, W, H, nullptr, nullptr, true);
+        const uint8_t* pc = center(preserved);
+        CHECK(pc && pc[1] > 0xC0 && pc[0] < 0x40,
+              "EQUAL reader still sees the written stencil after an inert clear rect (#1355)");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
