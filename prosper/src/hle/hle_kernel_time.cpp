@@ -537,6 +537,7 @@ void prosper_eq_add_eop(uint64_t eq, int64_t id, uint64_t udata) {
 // never overtake its submit's fence/label WRITES — drain the write queue before posting. Weak so
 // binaries that link the kernel HLE without the gpu lib still link.
 extern "C" void prosper_gpu_drain_completion_writes() __attribute__((weak));
+extern "C" bool prosper_gpu_submit_scope_active() __attribute__((weak));
 namespace {
     // Actually post one EOP completion to every registered equeue (the worker below calls this).
     void eop_post_now() {
@@ -582,9 +583,13 @@ namespace {
     // (int $0x45, stop code 0xa002000b), killing ~half of boots between flips 200-2500 (issues
     // #232/#241). Deferring only the EVENT (label/fence WRITES stay synchronous — they are data
     // dependencies, not lifecycle signals) restores the real ordering: the submit returns first, then
-    // the completion interrupt fires ~1 ms later. A single FIFO worker preserves inter-submit order
-    // (#236 needs every completion delivered distinctly and in order). PROSPER_EOP_SYNC=1 restores the
-    // old synchronous delivery. CONFIDENCE: HIGH on the invariant (real EOP is post-submit by
+    // the completion interrupt fires ~1 ms later. Completion writes now share the same post-submit
+    // visibility gate, and eop_post_now drains them before publishing the event. A single FIFO
+    // worker preserves inter-submit order
+    // (#236 needs every completion delivered distinctly and in order). PROSPER_EOP_SYNC=1 restores
+    // synchronous delivery only outside a live submit scope; an in-submit request still queues to
+    // avoid deadlocking on its own completion-write drain. CONFIDENCE: HIGH on the invariant (real
+    // EOP is post-submit by
     // construction; Kyty's GraphicsRunDone/EOP also fires from the GPU thread after CommandProcessor
     // execution, never inside the submit call).
     // IMMORTAL (leaked) worker state: the worker thread is detached and outlives main, so this state
@@ -614,7 +619,8 @@ namespace {
 }
 void prosper_eq_trigger_eop() {
     static const bool sync = getenv("PROSPER_EOP_SYNC") != nullptr;
-    if (sync) { eop_post_now(); return; }
+    const bool submit_active = prosper_gpu_submit_scope_active && prosper_gpu_submit_scope_active();
+    if (sync && !submit_active) { eop_post_now(); return; }
     if (!g_eop_worker_started.exchange(true)) std::thread(eop_worker).detach();
     EopQueue& q = eop_q();
     { std::lock_guard<std::mutex> lk(q.mx); q.pending++; }

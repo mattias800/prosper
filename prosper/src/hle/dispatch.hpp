@@ -30,6 +30,7 @@ namespace prosper {
 
 // Generic HLE handler signature (up to 6 integer/pointer args, SysV).
 using HleFn = PROSPER_SYSV_ABI uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+using HleReturnHook = void (*)();
 
 // One unresolved import across the whole linked program (deduped by NID). Its index
 // is the stub slot number; the trap logger names calls via this table.
@@ -49,12 +50,14 @@ struct ShadowedReg {
 // Registry of implemented functions, keyed by NID.
 class Hle {
 public:
-    static void  register_fn(const std::string& nid, HleFn fn, const char* name);
+    static void  register_fn(const std::string& nid, HleFn fn, const char* name,
+                             HleReturnHook return_hook = nullptr);
     // Like register_fn, but marks the entry as a deliberately-overridable placeholder (a diagnostic/
     // tracing thunk that a real handler is expected to replace later). A subsequent register_fn that
     // overwrites a placeholder is NOT flagged as a shadow — that override is the intent.
     static void  register_placeholder(const std::string& nid, HleFn fn, const char* name);
     static HleFn lookup(const std::string& nid);          // nullptr if unimplemented
+    static HleReturnHook return_hook_of(const std::string& nid); // called by the import return trampoline
     static const char* name_of(const std::string& nid);   // registered display name or ""
     // Every NID that was registered 2+ times with DIFFERING handlers, in registration order. Empty
     // is the healthy state; a non-empty list is the #330 double-registration-shadow class and must be

@@ -250,15 +250,14 @@ int main() {
               terminal.first_bad_fmt < 0,
           "a terminating post-endpgm if/else reports six real guest instructions as structured");
 
-    // A forward VCC branch is not covered by EXEC predication. Treating it as a no-op would execute
-    // the skipped block even when VCC says to branch, so the recompiler must reject it for now.
+    // A forward VCC branch consumes the wave-wide any(VCC) predicate. The compute shell lowers that
+    // through the exact guest-wave dispatcher instead of an implementation-width native subgroup.
     const uint32_t vcc_branch[] = { 0x7da80300u, 0xbf860001u, 0x4a060300u, 0xBF810000u };
     RecompileCoverage c = recompile_coverage(vcc_branch, sizeof(vcc_branch)/sizeof(vcc_branch[0]));
-    CHECK(c.unsupported == 1 && c.first_bad_fmt >= 0 && c.first_bad_op == 0x06 &&
-          c.first_bad_pc == 1,
-          "a forward s_cbranch_vccz reports its exact rejection PC instead of becoming a no-op");
-    CHECK(recompile_valu(vcc_branch, sizeof(vcc_branch)/sizeof(vcc_branch[0]), 2, 3).empty(),
-          "the production recompiler rejects the unsafe forward VCC branch");
+    CHECK(c.unsupported == 0 && c.first_bad_fmt < 0,
+          "a forward s_cbranch_vccz is covered by an explicit compute wave vote");
+    CHECK(!recompile_valu(vcc_branch, sizeof(vcc_branch)/sizeof(vcc_branch[0]), 2, 3).empty(),
+          "the production recompiler lowers a forward VCC branch");
 
     // A PROVEN-UNIFORM VCCZ-exit loop now structurizes in the compute shell too (#590, extending
     // #615): the uniformity proof is data-provenance-based — the compare reads s0 (scalar) and v1,
@@ -427,14 +426,14 @@ int main() {
     };
     CHECK(!recompile_valu(compute_vcc_if, sizeof(compute_vcc_if)/sizeof(compute_vcc_if[0]), 0, 0).empty(),
           "a proven-uniform forward vccz if structurizes in the compute shell (#590)");
-    // Varying compare (v1 <- v_mov from a VGPR): still rejects.
+    // A lane-varying compare is still valid: the scalar branch consumes any(VCC), not one lane's bit.
     const uint32_t compute_vcc_if_varying[] = {
         0xBE800380u, 0x7E000280u, 0x7E020300u, 0x7D020200u, 0xBF860002u,
         0x060000FFu, 0x3E800000u, 0xBF810000u,
     };
-    CHECK(recompile_valu(compute_vcc_if_varying,
-                         sizeof(compute_vcc_if_varying)/sizeof(compute_vcc_if_varying[0]), 0, 0).empty(),
-          "a forward vccz if with a varying compare still rejects in the compute shell");
+    CHECK(!recompile_valu(compute_vcc_if_varying,
+                          sizeof(compute_vcc_if_varying)/sizeof(compute_vcc_if_varying[0]), 0, 0).empty(),
+          "a varying forward vccz if lowers through the compute wave vote");
     // s_barrier inside the guarded region: still rejects (workgroup-divergence hazard).
     const uint32_t compute_vcc_if_barrier[] = {
         0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7D020200u, 0xBF860003u,
@@ -464,17 +463,18 @@ int main() {
     CHECK(!recompile_valu(compute_vcc_if_writelane,
                           sizeof(compute_vcc_if_writelane)/sizeof(compute_vcc_if_writelane[0]), 0, 0).empty(),
           "the uniformity proof looks past VCC-preserving v_writelane scalar spills");
-    // But an intervening write that COULD hit VCC (s_mov_b32 s106, 0) stops the walk: reject.
+    // An intervening VCC write changes the value consumed by the vote but no longer invalidates an
+    // obsolete producer-uniformity proof: the branch always reduces the current VCC value.
     const uint32_t compute_vcc_if_clobber[] = {
         0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7D020200u, 0xBEEA0380u,
         0xBF860002u, 0x060000FFu, 0x3E800000u, 0xBF810000u,
     };
-    CHECK(recompile_valu(compute_vcc_if_clobber,
-                         sizeof(compute_vcc_if_clobber)/sizeof(compute_vcc_if_clobber[0]), 0, 0).empty(),
-          "an intervening write to s106 (VCC) between compare and branch stops the proof");
+    CHECK(!recompile_valu(compute_vcc_if_clobber,
+                          sizeof(compute_vcc_if_clobber)/sizeof(compute_vcc_if_clobber[0]), 0, 0).empty(),
+          "a forward branch votes on the current VCC after an intervening write");
 
     // A forward s_cbranch_execz that REJOINS LIVE CODE cannot be linearized when its skipped block has
-    // a live scalar write. The compute structurizer now handles that case with subgroupAny(EXEC), so
+    // a live scalar write. The exact guest-wave dispatcher handles that case, so
     // the whole wave either executes or skips the scalar write and its live use remains exact.
     //   v_cmpx ; s_cbranch_execz +1 ; s_mov_b32 s0,1 ; v_mov_b32 v0,s0 ; s_endpgm
     const uint32_t execz_scalar[] = { 0x7da80300u, 0xbf880001u, 0xbe800381u, 0x7e000200u, 0xBF810000u };

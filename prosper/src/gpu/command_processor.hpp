@@ -210,6 +210,17 @@ void submit_completion_pulse(bool submit_rejected = false);
 // deferred-completion-write block in command_processor.cpp). Callable from C (the EOP-event
 // worker in hle_kernel_time.cpp binds it weakly).
 extern "C" void prosper_gpu_drain_completion_writes();
+// Apply only resource uploads/clears needed by the synchronous renderer. Fence/label completions
+// stay queued until after the guest submit import returns.
+extern "C" void prosper_gpu_drain_renderer_writes();
+// Enable the stricter SDK-13 completion contract for the process. Monotonic: once a modern AGC
+// caller is observed, completion labels remain post-submit for the lifetime of that game process.
+extern "C" void prosper_gpu_enable_post_submit_visibility();
+// Hold asynchronous fence/label publication while a guest submit import is still executing. Scopes
+// are paired on the calling thread so a rejected tagged import cannot retire another thread's submit.
+extern "C" void prosper_gpu_submit_scope_begin();
+extern "C" void prosper_gpu_submit_scope_end();
+extern "C" bool prosper_gpu_submit_scope_active();
 
 namespace prosper::gpu {
 
