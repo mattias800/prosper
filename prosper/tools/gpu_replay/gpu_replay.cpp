@@ -1184,7 +1184,8 @@ int main(int argc, char** argv) {
     bool legacy_htile_before_stencil = false, draw_with_compute_prefix = false;
     size_t bundle_tail = 0;
     uint32_t bundle_intermediate_target_width = 0, bundle_intermediate_target_height = 0;
-    int draw_first = -1, draw_last = -1;
+    bool draw_selected = false;
+    uint64_t draw_first = 0, draw_last = 0;
     int through_operation = -1;
     int compute_only = -1;
     std::string draw_steps_prefix;     // --draw-steps PREFIX: filmstrip of the composite per operation-step
@@ -1250,9 +1251,9 @@ int main(int argc, char** argv) {
         }
         else if (std::string(argv[i]) == "--prepend" && i + 1 < argc) prepend_path = argv[++i];
         else if (std::string(argv[i]) == "--draw" && i + 1 < argc) {
-            std::string range = argv[++i]; size_t colon = range.find(':');
-            draw_first = std::atoi(range.c_str());
-            draw_last = colon == std::string::npos ? draw_first : std::atoi(range.c_str() + colon + 1);
+            draw_selected = prosper::gpu::parse_diagnostic_draw_range(
+                argv[++i], draw_first, draw_last);
+            if (!draw_selected) { usage(argv[0]); return 2; }
         }
         else if (std::string(argv[i]) == "--draw-with-compute-prefix")
             draw_with_compute_prefix = true;
@@ -1320,7 +1321,7 @@ int main(int argc, char** argv) {
     if (!bundle_path.empty()) {
         if (bundle_ds_summary && bundle_find_ds_addr) { usage(argv[0]); return 2; }
         if (positional.size() > 1 || inspect || inspect_only || validate_only || graph_only ||
-            draw_first >= 0 || draw_with_compute_prefix || through_operation >= 0 ||
+            draw_selected || draw_with_compute_prefix || through_operation >= 0 ||
             compute_only >= 0 ||
             warmup_repeats || !dump_spec.empty() || rtt_seed_addr ||
             !shader_spec.empty() || !compute_shader_spec.empty() ||
@@ -1346,11 +1347,11 @@ int main(int argc, char** argv) {
         usage(argv[0]); return 2;
     }
     if (positional.empty() || positional.size() > 2) { usage(argv[0]); return 2; }
-    if ((draw_first >= 0 && through_operation >= 0) ||
-        (compute_only >= 0 && (draw_first >= 0 || through_operation >= 0))) {
+    if ((draw_selected && through_operation >= 0) ||
+        (compute_only >= 0 && (draw_selected || through_operation >= 0))) {
         usage(argv[0]); return 2;
     }
-    if (draw_with_compute_prefix && draw_first < 0) { usage(argv[0]); return 2; }
+    if (draw_with_compute_prefix && !draw_selected) { usage(argv[0]); return 2; }
     // #1332: the filmstrip sub-flags configure --draw-steps; alone they would be silently unused.
     if ((draw_steps_every > 0 || draw_steps_target_w) && draw_steps_prefix.empty()) {
         usage(argv[0]); return 2;
@@ -1358,7 +1359,7 @@ int main(int argc, char** argv) {
     // #1330: ordered-prefix inspection modes must see the pass a prefix actually ends on, even when
     // that pass renders a non-RGBA8 target (an FP16 HDR scene). The shared live renderer publishes an
     // inspection-converted fallback only under this env, so full replays and live runs are unchanged.
-    if ((draw_first >= 0 || through_operation >= 0 || !draw_steps_prefix.empty()) &&
+    if ((draw_selected || through_operation >= 0 || !draw_steps_prefix.empty()) &&
         !set_environment("PROSPER_PREFIX_INSPECT", "1")) {
         std::fprintf(stderr, "gpu_replay: cannot set PROSPER_PREFIX_INSPECT\n"); return 2;
     }
@@ -1422,10 +1423,14 @@ int main(int argc, char** argv) {
     // pc after the ':' and redirects its MRT0 colour export to the intermediate value at that PC) and swap it
     // in, so that draw's rendered pixels visualise the tapped value. Requires a v19+ capsule with the raw FS.
     if (const char* f = std::getenv("PROSPER_FS_TAP")) {
-        char* end = nullptr;
-        const unsigned long long n = std::strtoull(f, &end, 0);
-        const size_t item_index = f[0] != '-' && end != f && end && *end == ':'
-            ? prosper::tools::replay_item_index_for_draw(replay, n) : SIZE_MAX;
+        uint64_t n = 0;
+        uint32_t tap_pc = 0;
+        if (!prosper::gpu::parse_fragment_tap_selector(f, n, tap_pc)) {
+            std::fprintf(stderr, "[fs-tap] invalid draw:pc selector '%s'\n", f);
+            return 2;
+        }
+        const auto draw_label = static_cast<unsigned long long>(n);
+        const size_t item_index = prosper::tools::replay_item_index_for_draw(replay, n);
         if (item_index != SIZE_MAX) {
             auto& it = replay.items[item_index];
             const size_t operation_index =
@@ -1440,18 +1445,19 @@ int main(int argc, char** argv) {
                     it.fs = std::move(fs); it.fs_shared.reset(); it.fs_identity = 0;
                     std::fprintf(stderr,
                                  "[fs-tap] draw=%llu item=%zu operation=%lld FS re-recompiled "
-                                 "with colour tap (%zu words)\n",
-                                 n, item_index, operation_label, it.fs.size());
+                                 "at pc=%u with colour tap (%zu words)\n",
+                                 draw_label, item_index, operation_label, tap_pc, it.fs.size());
                 } else {
                     std::fprintf(stderr, "[fs-tap] draw %llu: FS re-recompile produced no output "
-                                         "(no raw stream / unsupported)\n", n);
+                                         "(no raw stream / unsupported)\n", draw_label);
                 }
             } else {
                 std::fprintf(stderr, "[fs-tap] draw %llu: no captured raw FS stream "
-                                     "(capsule predates v19)\n", n);
+                                     "(capsule predates v19)\n", draw_label);
             }
         } else {
-            std::fprintf(stderr, "[fs-tap] invalid or unrealized semantic draw selector '%s'\n", f);
+            std::fprintf(stderr, "[fs-tap] unrealized semantic draw %llu\n", draw_label);
+            return 2;
         }
     }
     prosper::gpu::GpuCaptureFile prepend_capture;
@@ -1715,22 +1721,25 @@ int main(int argc, char** argv) {
                      compute_resource_path.c_str());
     }
     size_t selected_operation_limit = SIZE_MAX;
-    if (draw_first >= 0) {
+    if (draw_selected) {
         if (draw_last < draw_first) {
-            std::fprintf(stderr, "gpu_replay: draw range %d:%d is out of range\n", draw_first, draw_last); return 2;
+            std::fprintf(stderr, "gpu_replay: draw range %llu:%llu is out of range\n",
+                         static_cast<unsigned long long>(draw_first),
+                         static_cast<unsigned long long>(draw_last));
+            return 2;
         }
         std::vector<prosper::gpu::DrawItem> selected;
         std::unordered_set<uint64_t> selected_draw_indexes;
         for (auto& item : replay.items) {
-            if (item.draw_index < static_cast<uint64_t>(draw_first) ||
-                item.draw_index > static_cast<uint64_t>(draw_last))
+            if (item.draw_index < draw_first || item.draw_index > draw_last)
                 continue;
             selected_draw_indexes.insert(item.draw_index);
             selected.push_back(std::move(item));
         }
         if (selected.empty()) {
-            std::fprintf(stderr, "gpu_replay: semantic draw range %d:%d has no realized items\n",
-                         draw_first, draw_last);
+            std::fprintf(stderr, "gpu_replay: semantic draw range %llu:%llu has no realized items\n",
+                         static_cast<unsigned long long>(draw_first),
+                         static_cast<unsigned long long>(draw_last));
             return 2;
         }
         if (draw_with_compute_prefix) {
@@ -1747,8 +1756,9 @@ int main(int argc, char** argv) {
             }
         }
         replay.items = std::move(selected); allow_mismatch = true;
-        std::fprintf(stderr, "[gpureplay] selected semantic draws %d:%d (%zu realized)%s\n",
-                     draw_first, draw_last, replay.items.size(),
+        std::fprintf(stderr, "[gpureplay] selected semantic draws %llu:%llu (%zu realized)%s\n",
+                     static_cast<unsigned long long>(draw_first),
+                     static_cast<unsigned long long>(draw_last), replay.items.size(),
                      draw_with_compute_prefix ? " with compute prefix" : "");
     }
     if (through_operation >= 0) {
@@ -1878,7 +1888,7 @@ int main(int argc, char** argv) {
     }
     const size_t operation_limit = through_operation >= 0
         ? static_cast<size_t>(through_operation) + 1 : selected_operation_limit;
-    const bool selected_draws_only = draw_first >= 0 && !draw_with_compute_prefix;
+    const bool selected_draws_only = draw_selected && !draw_with_compute_prefix;
     std::vector<uint8_t> pixels = execute_frame(replay, selected_draws_only, operation_limit);
     // Diagnostic: after rendering, read back every persistent depth/stencil surface's STENCIL plane and
     // write it as a grayscale image (value*80) plus a value histogram. This shows exactly where a
@@ -1953,7 +1963,7 @@ int main(int argc, char** argv) {
     }
     const auto extent_mode = selected_draws_only
         ? prosper::gpu::replay_tool::OutputExtentMode::SelectedDraws
-        : (through_operation >= 0 || (draw_first >= 0 && draw_with_compute_prefix))
+        : (through_operation >= 0 || (draw_selected && draw_with_compute_prefix))
             ? prosper::gpu::replay_tool::OutputExtentMode::OrderedPrefix
             : prosper::gpu::replay_tool::OutputExtentMode::Capture;
     const auto output_extent = prosper::gpu::replay_tool::replay_output_extent(
