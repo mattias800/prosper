@@ -263,6 +263,23 @@ int main() {
             resolve_pipeline_state(extract_render_state(poisoned));
         CHECK(nan_bias.depth_bias_enable == 0u,
               "a non-finite POLY_OFFSET register disables the bias instead of poisoning it");
+        // #1351: huge-but-finite float-decoded garbage (documented stale cx-arena phenomenon on
+        // this title family, #1264/#1335) must not become an absurd bias — bound at 2^24.
+        GpuState huge = biased;
+        huge.cx[P::PA_SU_POLY_OFFSET_FRONT_OFFSET] = fbits(1e30f);
+        const ResolvedPipelineState huge_bias =
+            resolve_pipeline_state(extract_render_state(huge));
+        CHECK(huge_bias.depth_bias_enable == 0u && huge_bias.depth_bias_constant == 0.0f,
+              "an implausibly large POLY_OFFSET value (>2^24) disables the bias");
+        // The float depth config (0x1E9) must keep the bias enabled — the DB_FMT_CNTL check is
+        // fail-visible logging only, never a behavior gate for the exercised configuration.
+        GpuState float_cfg = biased;
+        float_cfg.cx[P::PA_SU_POLY_OFFSET_DB_FMT_CNTL] = 0x1E9u;
+        const ResolvedPipelineState float_cfg_bias =
+            resolve_pipeline_state(extract_render_state(float_cfg));
+        CHECK(float_cfg_bias.depth_bias_enable == 1u &&
+              float_cfg_bias.depth_bias_constant == 4.0f,
+              "the float DB_FMT_CNTL configuration (0x1E9) keeps the decoded bias intact");
 
         RenderState empty{}; empty.has_scissor = true;
         empty.scissor_left = 10; empty.scissor_top = 20;

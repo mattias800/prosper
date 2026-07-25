@@ -684,6 +684,48 @@ int main() {
         CHECK(sc && sc[1] < 0x80, "standard-Z EQUAL remains exact");
     }
 
+    // #1351: the backend must APPLY the resolved depth bias, not merely decode it. Precedent for
+    // requiring execution coverage: #456's cull/front-face landed decode-only and its reversed
+    // VkFrontFace survived until #534. Contract under test: a LESS draw at exactly the stored
+    // depth is rejected without bias, and a negative constant bias (Vulkan adds
+    // constant * 2^(e-23) on D32F) nudges its fragments nearer so the same draw passes.
+    {
+        std::vector<uint32_t> z_vs = ref_vs_with_depth(vs, 0x3f000000u); // 0.5f
+        CHECK(!z_vs.empty(), "bias test fullscreen VS at z=0.5 available");
+
+        ResolvedPipelineState bias_writer = opaque;
+        bias_writer.color_write_mask = 0;
+        bias_writer.depth_test_enable = true;
+        bias_writer.depth_write_enable = true;
+        bias_writer.depth_compare_op = 7; // ALWAYS
+        bias_writer.depth_read_base = bias_writer.depth_write_base = 0x77660000;
+
+        ResolvedPipelineState less_reader = opaque;
+        less_reader.depth_test_enable = true;
+        less_reader.depth_compare_op = 1; // LESS
+        less_reader.depth_read_base = less_reader.depth_write_base = 0x77660000;
+
+        prosper::test::BackendDraw bw; bw.vs = z_vs; bw.fs = red; bw.ps = &bias_writer; bw.vcount = 3;
+        prosper::test::BackendDraw br; br.vs = z_vs; br.fs = green; br.ps = &less_reader; br.vcount = 3;
+        (void)prosper::test::render_draws_rgba({bw}, W, H, nullptr, nullptr, true);
+        std::vector<uint8_t> unbiased =
+            prosper::test::render_draws_rgba({br}, W, H, nullptr, nullptr, true);
+        const uint8_t* uc = center(unbiased);
+        CHECK(uc && uc[1] < 0x80, "LESS at exactly the stored depth is rejected without bias");
+
+        ResolvedPipelineState biased_reader = less_reader;
+        biased_reader.depth_bias_enable = 1u;
+        biased_reader.depth_bias_constant = -64.0f;   // ~-3.8e-6 at e(0.5) on D32F — decisive, tiny
+        biased_reader.depth_bias_slope = 0.0f;
+        biased_reader.depth_bias_clamp = 0.0f;
+        prosper::test::BackendDraw bb = br; bb.ps = &biased_reader;
+        std::vector<uint8_t> biased =
+            prosper::test::render_draws_rgba({bb}, W, H, nullptr, nullptr, true);
+        const uint8_t* bc = center(biased);
+        CHECK(bc && bc[1] > 0xC0 && bc[0] < 0x40,
+              "a negative constant depth bias flips the same LESS draw to passing (#1351)");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
