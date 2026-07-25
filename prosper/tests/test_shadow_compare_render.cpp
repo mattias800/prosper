@@ -88,9 +88,19 @@ int main() {
     CHECK(!prosper::test::persistent_ds_pass_may_write_depth(
               false, true, false, VK_COMPARE_OP_ALWAYS),
           "read-only depth use does not claim writer recency");
-    CHECK(prosper::test::persistent_ds_pass_may_write_depth(
+    // #1287: DEPTH_CLEAR_ENABLE substitutes the value of depth writes but does not create them —
+    // with the write path disabled the bit is depth-inert (Blue Prince's per-light shadow loop
+    // issues exactly this shape immediately before sampling the plane its casters rendered).
+    CHECK(!prosper::test::persistent_ds_pass_may_write_depth(
               true, false, false, VK_COMPARE_OP_NEVER),
-          "a depth clear claims writer recency");
+          "a clear with the write path disabled is depth-inert (#1287)");
+    CHECK(prosper::test::persistent_ds_pass_may_write_depth(
+              true, true, true, VK_COMPARE_OP_ALWAYS),
+          "a real clear draw (test+write+ALWAYS) claims writer recency");
+    CHECK(!prosper::test::depth_clear_effective(true, false, false, VK_COMPARE_OP_NEVER) &&
+          !prosper::test::depth_clear_effective(true, false, false, VK_COMPARE_OP_ALWAYS) &&
+          prosper::test::depth_clear_effective(true, true, true, VK_COMPARE_OP_ALWAYS),
+          "depth_clear_effective requires the enabled write path");
     CHECK(prosper::test::persistent_ds_pass_may_write_depth(
               false, true, true, VK_COMPARE_OP_ALWAYS),
           "depth writes claim writer recency");
@@ -203,6 +213,48 @@ int main() {
         CHECK(center[0] > 56 && center[0] < 72,
               "bridged consumer reads the produced depth (~0.25) from the persistent DS image");
         CHECK(center0[0] == 0, "control without the bridge samples zeros");
+
+        // ---- #1287: an ineffective clear draw must not shadow the rendered plane ----
+        // Blue Prince's light loop: shadow casters render depth into plane P (identity dr=P, dw=0),
+        // then a fullscreen rect with DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE set but DB_DEPTH_CONTROL
+        // fully disabled carries identity (dr=P, dw=P), and the light immediately samples P with
+        // 5-tap PCF. Treating the writes-disabled rect as a clear created a SECOND cache entry
+        // keyed (P,P), cleared it, and won find_persistent_ds_sampled's recency — every light
+        // compared against a constant, banding the scene in light-space iso-depth rings. The
+        // consumer must keep reading the casters' depth.
+        {
+            constexpr uint64_t kPlane = 0x20d6000000ull;
+            ResolvedPipelineState casters = producer;
+            casters.depth_read_base = kPlane; casters.depth_write_base = 0;
+            prosper::test::BackendDraw cast_draw = pw;
+            cast_draw.ps = &casters;
+            std::vector<uint8_t> cast_out = prosper::test::render_draws_rgba(
+                {cast_draw}, W, H, nullptr, nullptr, /*persist_depth_stencil=*/true);
+            CHECK(!cast_out.empty(), "shadow casters rendered depth into plane (dr=P, dw=0)");
+
+            ResolvedPipelineState rc_clear{};
+            rc_clear.topology = 3; rc_clear.color_write_mask = 0;
+            rc_clear.depth_clear_enable = true; rc_clear.depth_clear_value = 0.9f;
+            rc_clear.depth_test_enable = false; rc_clear.depth_write_enable = false;
+            rc_clear.depth_compare_op = 0;   // NEVER — DB_DEPTH_CONTROL == 0
+            rc_clear.depth_read_base = kPlane; rc_clear.depth_write_base = kPlane;
+            prosper::test::BackendDraw rc_draw = pw;
+            rc_draw.ps = &rc_clear;
+            std::vector<uint8_t> rc_out = prosper::test::render_draws_rgba(
+                {rc_draw}, W, H, nullptr, nullptr, /*persist_depth_stencil=*/true);
+            CHECK(!rc_out.empty(), "writes-disabled DEPTH_CLEAR_ENABLE rect rendered (depth-inert)");
+
+            prosper::test::FrameResource light_tap = bridged;
+            light_tap.persistent_depth_target_id = kPlane;
+            prosper::test::BackendDraw light = consumer;
+            light.R = {light_tap};
+            std::vector<uint8_t> lit = prosper::test::render_draws_rgba({light}, W, H);
+            CHECK(lit.size() == (size_t)W * H * 4, "light consumer rendered");
+            const uint8_t* lc = &lit[(((size_t)H / 2) * W + W / 2) * 4];
+            printf("  post-rc-clear consumer R=%u (want ~64, not ~230/0)\n", lc[0]);
+            CHECK(lc[0] > 56 && lc[0] < 72,
+                  "light samples the casters' depth, not the ineffective clear value (#1287)");
+        }
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
