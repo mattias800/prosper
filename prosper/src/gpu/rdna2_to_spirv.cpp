@@ -2283,9 +2283,10 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
             // read-scan below can't see the read and the dst-match would falsely report a redefinition.
             case Rdna2Format::SOPP:
                 // Hint/sync SOPPs read and write nothing — scan through them (s_waitcnt is ubiquitous
-                // after the merge). Branches (and anything else) invalidate the LINEAR scan — a skipped
-                // redefinition would make the dead claim unsound — so bail conservatively.
-                if (sopp_is_noop(in)) break;
+                // after the merge). A barrier is also scalar-register-transparent; it changes only
+                // workgroup execution order. Branches (and anything else) invalidate the LINEAR scan
+                // — a skipped redefinition would make the dead claim unsound — so bail conservatively.
+                if (sopp_is_noop(in) || in.opcode == 0x0a) break;
                 return false;
             case Rdna2Format::SMEM: {
                 // s_load/s_buffer_load: reads the SBASE pair (src[0], 2 regs) + SOFFSET (src[1]);
@@ -2305,6 +2306,7 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
             }
             case Rdna2Format::SOP1: case Rdna2Format::SOP2: case Rdna2Format::SOPC:
             case Rdna2Format::VOP1: case Rdna2Format::VOP2: case Rdna2Format::VOP3: case Rdna2Format::VOPC:
+            case Rdna2Format::DS:    // DS operands are VGPR/M0 only; it cannot read an ordinary SGPR/VCC
             case Rdna2Format::EXP:   // EXP data sources are all VGPRs — it can never read an SGPR
                 for (int k = 0; k < in.n_src; k++)
                     if ((in.src[k].kind == OperandKind::SGPR || in.src[k].kind == OperandKind::Special) &&
@@ -3082,8 +3084,8 @@ struct ForwardIf {
 // allow_vcc: also accept a forward s_cbranch_vccz/vccnz. Only the per-invocation VS/FS shells set this —
 // there each SPIR-V invocation IS one lane, so branching on this lane's VCC bit (rs.vcc) is exactly the
 // per-vertex / per-pixel divergent-if the hardware runs. The 64-lane COMPUTE shell must NOT (its VCC is a
-// wave mask needing a wave-uniform reduce — test_recompile_coverage guards this), so it leaves allow_vcc
-// false and vcc branches fall through to straight-line (which rejects them).
+// wave mask needing a subgroup-wide reduction. compute_wave_branches enables that reduction and keeps
+// the branch uniform across the emulated wave; test_recompile_coverage guards the distinction.
 // code/dwords: the raw stream, so a branch target past the first s_endpgm can be decoded and
 // verified to be a genuine early-out (see below) instead of blanket-clamped.
 ForwardIf detect_forward_if(const std::vector<Rdna2Inst>& ins, bool allow_vcc,
@@ -3189,13 +3191,11 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
             case 0x06: case 0x07:                                    // vccz / vccnz
                 if (loop_exit(in.pc)) continue;                      // canonical loop condition: loop emitter owns it
                 if (!allow_vcc) {
-                    // Compute (#590, extending #615): accept the forward VCC if ONLY under the same
-                    // uniformity proof as the VCC-exit loops — every compare input scalar/inline or a
-                    // uniform-VOP1-from-scalar VGPR, and no possible VCC rewrite between compare and
-                    // branch (cannot_write_vcc walk). Every lane's bool is then identical, so the
-                    // wave-empty vccz test lowers to this invocation's bool. Varying compares keep
-                    // rejecting loudly (per-invocation lowering of a varying wave test is wrong).
-                    if (!compute_wave_branches || !vcc_exit_is_wave_uniform(ins, in.pc)) return reject();
+                    // Compute VCC is a per-lane bool in the SPIR-V shell. The scalar branch consumes
+                    // the architectural whole-wave VCCZ/VCCNZ flag, so lower it with subgroupAny
+                    // during emission. This remains a subgroup-uniform branch even when the compare
+                    // is lane-varying (DOLL's post-process table choice after its nested loops).
+                    if (!compute_wave_branches) return reject();
                     compute_uniform_vcc = true;
                 }
                 break;
@@ -5478,6 +5478,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             uint32_t fmt_ncomp = 0;    // the V#'s real component count (format loads only); 0 = don't default-fill
             bool dyn_vfetch = false;   // set when the V# came from by_fetch_pc — a const-folded per-vertex
                                        // attribute fetch, whose element address is exactly gl_VertexIndex*stride.
+            bool instance_vfetch = false;
+            bool folded_vfetch = false; // by-fetch V# base already includes OFFSET/SOFFSET
             if (is_format) {
                 // A format load reads a vertex/buffer attribute — it needs the V# descriptor for the
                 // binding, stride, and data format. Resolve SRSRC (src[1]) via provenance: an s_load
@@ -5498,17 +5500,35 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // CONSTANT/structured buffer (a PS's per-lane table fetch, #273) keeps the faithful
                     // VADDR*stride+offset address below.
                     res = rt->by_fetch_pc(in.pc);
-                    // The NGG fetch-prologue shortcut applies to the conventional v0 element index
-                    // and to attributes whose SRSRC was rewritten by an in-shader descriptor load.
-                    // In the latter case the folded V# base already includes the attribute offset,
-                    // even when the incomplete prologue left a non-v0 VADDR. A pc-keyed VertexBuffer
-                    // can also be a directly supplied structured V# whose SRSRC was never rewritten;
-                    // DOLL skinning indexes those through computed v4/v5/v7/... values. Replacing
-                    // those addresses with gl_VertexIndex reads the wrong matrix row and collapses
-                    // the whole mesh, so preserve a non-v0 VADDR for untouched direct user data.
+                    folded_vfetch = res && res->cls == ResourceClass::VertexBuffer;
+                    // The NGG fetch-prologue shortcut applies only to an untouched ABI element index. It
+                    // must NOT apply after the shader has selected or computed VADDR. DOLL lays out packed
+                    // attributes as two/three descriptor records per vertex and computes
+                    // 2*vertex+channel / 3*vertex+channel in v0/v4/v5/v6. DQ also uses a modeled
+                    // v_cndmask merged-wave selector to choose instance_id for a per-instance transform
+                    // lookup and vertex_id for positions. Replacing either shader value with
+                    // gl_VertexIndex reads allocator metadata as transform indices and emits NaN/giant
+                    // triangles.
+                    // A pc-keyed VertexBuffer can also be a directly supplied structured V# whose SRSRC
+                    // was never rewritten; retain the established non-v0 faithful-address behavior there.
                     if (res) {
-                        dyn_vfetch = res->cls == ResourceClass::VertexBuffer &&
-                                     (in.src[0].value == 0 || srsrc_rewritten);
+                        const int vaddr = in.src[0].value;
+                        switch (res->fetch_index_mode) {
+                            case VertexFetchIndexMode::Vertex:
+                                dyn_vfetch = true;
+                                break;
+                            case VertexFetchIndexMode::Instance:
+                                instance_vfetch = true;
+                                break;
+                            case VertexFetchIndexMode::Shader:
+                                break;
+                            case VertexFetchIndexMode::Automatic:
+                                // Backward-compatible fallback for metadata resources, hand-built
+                                // tests, and captures predating explicit dynamic-fold provenance.
+                                dyn_vfetch = res->cls == ResourceClass::VertexBuffer &&
+                                             (vaddr == 0 || srsrc_rewritten);
+                                break;
+                        }
                     }
                     // MTBUF must resolve through the exact dynamic-use entry. The fold validates the
                     // live V# FORMAT != INVALID before publishing that pc. Falling back to an older
@@ -5657,7 +5677,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             bool dyn_int_store = false;  // integer sub-dword FORMAT store via race-free atomic clear+set
             if (packed && !raw_subword) {
                 bool base_aligned;
-                if (dyn_vfetch) {
+                if (folded_vfetch) {
                     // The dyn_vfetch address path (below) is exactly gl_VertexIndex*stride and DROPS the
                     // shader's inst-offset / offen / SOFFSET — the resolved V# base already folds in this
                     // attribute's in-record byte offset. So packed-component alignment depends ONLY on the
@@ -5718,8 +5738,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // gl_VertexIndex*stride and drop the shader's VADDR/offset/SOFFSET; everything else keeps the
             // faithful address (incl. #148's idxen+offen both-terms fix). CONFIDENCE: HIGH — makes
             // PPSA01885 (Unity/IL2CPP) render real geometry instead of a degenerate collapse.
-            if (dyn_vfetch && idxen && stride) {
-                addr = b.ibin(Op_IMul, b.load_vertex_index(), b.uconst(stride));
+            if (folded_vfetch && idxen && stride) {
+                const uint32_t element = dyn_vfetch ? b.load_vertex_index()
+                                       : instance_vfetch ? b.load_instance_index()
+                                                         : val(in.src[0]);
+                addr = b.ibin(Op_IMul, element, b.uconst(stride));
             } else {
                 addr = b.uconst(offset);
                 if (idxen && stride) addr = b.ibin(Op_IAdd, addr, b.ibin(Op_IMul, val(in.src[0]), b.uconst(stride)));
@@ -8100,7 +8123,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             return true;
         }
         if (b.is_compute && std::any_of(Fs.begin(), Fs.end(),
-                                        [](const ForwardIf& branch) { return branch.on_exec; })) {
+                                        [](const ForwardIf& branch) {
+                                            return branch.on_exec || branch.on_vcc;
+                                        })) {
             SpirvCompute::put(b.caps, Op_Capability, {Cap_GroupNonUniform});
             SpirvCompute::put(b.caps, Op_Capability, {Cap_GroupNonUniformVote});
         }
@@ -8240,7 +8265,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 if (!F.on_exec && !F.on_vcc && !rs.scc) return false;
                 uint32_t cond_reg = F.on_exec
                     ? (b.is_compute ? b.subgroup_any(rs.exec) : rs.exec)
-                    : (F.on_vcc ? rs.vcc : rs.scc);
+                    : (F.on_vcc ? (b.is_compute ? b.subgroup_any(rs.vcc) : rs.vcc) : rs.scc);
                 uint32_t exec_cond = F.on_scc0 ? cond_reg : b.bsel(cond_reg, b.bfalse(), b.btrue());
                 const uint32_t preblock = b.cur_block;      // block holding the OpBranchConditional
                 if (!F.has_else) {

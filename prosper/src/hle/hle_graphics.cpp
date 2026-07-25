@@ -58,8 +58,8 @@ void set_gfx_call_counter(volatile int* counter) { g_gfx_counter = counter; }
 // Unity's Gen5 init left that table null and a later register lookup null-derefed (eboot+0x3b5ea6).
 // We now return the REAL default tables (127 cx+sh+uc registers), vendored from Kyty in
 // agc_reg_defaults.cpp, so the game can build a populated register-offset table.
-extern "C" void* prosper_agc_reg_defaults(unsigned int ver);           // -> g_reg_defaults1 (127 regs)
-extern "C" void* prosper_agc_reg_defaults_internal(unsigned int ver);  // -> g_reg_defaults2 (21 regs)
+extern "C" void* prosper_agc_reg_defaults(unsigned int ver);           // public defaults (versioned keys)
+extern "C" void* prosper_agc_reg_defaults_internal(unsigned int ver);  // internal defaults
 HLE(g_agc_regdefs)     { gfx_tick(); return (uint64_t)(uintptr_t)prosper_agc_reg_defaults((unsigned)a0); }
 HLE(g_agc_regdefs_int) { gfx_tick(); return (uint64_t)(uintptr_t)prosper_agc_reg_defaults_internal((unsigned)a0); }
 

@@ -31,6 +31,18 @@ constexpr uint32_t IT_NOP = 0x10, IT_NUM_INSTANCES = 0x2F, IT_SET_CONTEXT_REG = 
 
 struct ShaderRegister { uint32_t offset, value; };
 
+struct RegisterDefaults {
+    ShaderRegister** tbl0;
+    ShaderRegister** tbl1;
+    ShaderRegister** tbl2;
+    ShaderRegister** tbl3;
+    uint64_t unknown[2];
+    uint32_t* types;
+    uint32_t count;
+};
+static_assert(offsetof(RegisterDefaults, count) == 0x38);
+extern "C" void* prosper_agc_reg_defaults(unsigned int version);
+
 int main() {
     printf("== test_agc_dcb ==\n");
     register_builtin_hle();
@@ -43,11 +55,15 @@ int main() {
     auto setcx_direct = Hle::lookup("LHFXRrlTPD8"); // sceAgcDcbSetCxRegisterDirect
     auto setsh_direct = Hle::lookup("pFLArOT53+w"); // sceAgcDcbSetShRegisterDirect
     auto setuc_direct = Hle::lookup("w4-d0n60hdo"); // sceAgcDcbSetUcRegisterDirect
+    auto type2 = Hle::lookup("qj7QZpgr9Uw"); // one-dword TYPE-2 filler
+    auto interpolants = Hle::lookup("dbOlWdppb4o"); // Gen5 interpolant mapping
     CHECK(reset && setcx && p_add && p_addr && p_dma_src &&
-          setcx_direct && setsh_direct && setuc_direct,
+          setcx_direct && setsh_direct && setuc_direct && type2 && interpolants,
           "AGC Dcb functions registered (override the glog stubs)");
     if (!(reset && setcx && p_add && p_addr && p_dma_src &&
-          setcx_direct && setsh_direct && setuc_direct)) { printf("== FAIL ==\n"); return 1; }
+          setcx_direct && setsh_direct && setuc_direct && type2 && interpolants)) {
+        printf("== FAIL ==\n"); return 1;
+    }
 
     uint32_t buffer[256];
     memset(buffer, 0xEE, sizeof buffer);
@@ -63,15 +79,22 @@ int main() {
     CHECK(buffer[1] == 0, "ResetQueue wrote cmd[1]=0");
     CHECK(dcb.cursor_up == buffer + 2, "ResetQueue advanced the cursor by 2 dwords");
 
+    // This NID is the one legal one-dword PM4 builder: a TYPE-2 filler cannot use a TYPE-3 header.
+    uint32_t* type2_before = dcb.cursor_up;
+    uint64_t type2_result = type2(D, 0, 0, 0, 0, 0);
+    CHECK(type2_result == (uint64_t)(uintptr_t)type2_before && *type2_before == 0x80000000u,
+          "TYPE-2 filler writes its one-dword native PM4 packet");
+    CHECK(dcb.cursor_up == type2_before + 1, "TYPE-2 filler advances the cursor by one dword");
+
     // SetCxRegistersIndirect(dcb, regs=0x1122334455667788, num_regs=3) -> 4-dw packet.
     uint64_t regs = 0x1122334455667788ull;
     uint64_t rc = setcx(D, regs, 3, 0, 0, 0);
     auto* cmd = (uint32_t*)(uintptr_t)rc;
-    CHECK(cmd == buffer + 2, "SetCx returns the next packet ptr");
+    CHECK(cmd == buffer + 3, "SetCx returns the next packet ptr");
     CHECK(cmd[0] == PM4(4, IT_NOP, R_CX_REGS_INDIRECT), "SetCx wrote R_CX_REGS_INDIRECT PM4 header");
     CHECK(cmd[1] == 3, "SetCx wrote num_regs=3");
     CHECK(cmd[2] == 0x55667788u && cmd[3] == 0x11223344u, "SetCx wrote regs vaddr lo/hi");
-    CHECK(dcb.cursor_up == buffer + 6, "SetCx advanced the cursor by 4 dwords");
+    CHECK(dcb.cursor_up == buffer + 7, "SetCx advanced the cursor by 4 dwords");
 
     // Patch helpers modify the returned packet (the old stub returned 0 -> these wrote through null).
     p_add(rc, 5, 0, 0, 0, 0);
@@ -197,6 +220,55 @@ int main() {
         CHECK(instances == pop + 2 && instances[0] == PM4(2, IT_NUM_INSTANCES, 0) && instances[1] == 3,
               "SetNumInstances appends the native IT_NUM_INSTANCES packet");
     }
+
+    auto lookup_default = [](RegisterDefaults* d, uint32_t hash) -> ShaderRegister* {
+        if (!d || !d->types) return nullptr;
+        for (uint32_t i = 0; i < d->count; ++i) {
+            const uint32_t* type = d->types + i * 3;
+            if (type[0] != hash) continue;
+            const uint32_t packed = type[1];
+            ShaderRegister** banks[] = {d->tbl0, d->tbl1, d->tbl2, d->tbl3};
+            const uint32_t bank = packed & 3u;
+            const uint32_t id = (packed & 0x3fcu) / 4u;
+            return banks[bank] ? banks[bank][id] : nullptr;
+        }
+        return nullptr;
+    };
+
+    // DQ requests version 13, searches the 12-byte records, and resolves the pointer-bank/id word.
+    // Its render-target-zero key is absent from the older corpus and must produce the observed blend
+    // default rather than the guest's all-ones not-found sentinel.
+    auto* defaults = static_cast<RegisterDefaults*>(prosper_agc_reg_defaults(13));
+    ShaderRegister* blend = lookup_default(defaults, 0xa6d12629u);
+    CHECK(defaults && defaults->count == 128 && defaults->unknown[0] == 0 &&
+          defaults->unknown[1] == 0 && blend && blend[0].offset == 0x1e0u &&
+          blend[0].value == 0x20010001u,
+          "SDK 13 resolves the render-target-zero blend default");
+
+    // Guard a legacy multi-register run: the pointer must begin at the first register pair, not at
+    // the preceding type hash. DQ copies these exact 16 bytes into its FOV defaults block.
+    ShaderRegister* fov = lookup_default(defaults, 0x88f5e915u);
+    CHECK(fov && fov[0].offset == 0xebu && fov[0].value == 0xff00ff00u &&
+          fov[1].offset == 0xecu && fov[1].value == 0,
+          "SDK 13 preserves legacy multi-register run pointers");
+
+    auto* legacy_defaults = static_cast<RegisterDefaults*>(prosper_agc_reg_defaults(8));
+    CHECK(legacy_defaults && legacy_defaults != defaults && legacy_defaults->count == 127 &&
+          legacy_defaults->unknown[0] == 0 && legacy_defaults->unknown[1] == 0 &&
+          !lookup_default(legacy_defaults, 0xa6d12629u),
+          "SDK 8 callers retain the legacy table layout and defaults");
+
+    uint64_t interpolant_regs[32];
+    memset(interpolant_regs, 0, sizeof interpolant_regs);
+    CHECK(interpolants((uint64_t)(uintptr_t)interpolant_regs, 0, 0, 0, 0, 0) == 0,
+          "Gen5 interpolant helper accepts the identity/default mapping");
+    bool identity_mapping = true;
+    for (uint32_t i = 0; i < 32; ++i) {
+        identity_mapping &= static_cast<uint32_t>(interpolant_regs[i]) == 0x10000000u + i;
+        identity_mapping &= static_cast<uint32_t>(interpolant_regs[i] >> 32u) == i;
+    }
+    CHECK(identity_mapping,
+          "Gen5 interpolant helper initializes all 32 virtual-offset/value pairs");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

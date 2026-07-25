@@ -47,6 +47,8 @@ int main() {
     CHECK(f1.size() == 1 && f1[0].srsrc == 8, "kernel 1 SRSRC = s8");
     CHECK(f1.size() == 1 && f1[0].desc_v3 == 0xFFu,
           "s_bfe_u64 of inline -1 sign-extends: bits[47:40] fold to 0xFF (not 0)");
+    CHECK(f1.size() == 1 && f1[0].index_mode == VertexFetchIndexMode::Automatic,
+          "legacy non-NGG fetches retain the established automatic index heuristic");
 
     // Kernel 2: 32-bit LITERAL src0 zero-extends — a field entirely in the high dword folds to 0.
     //   s_mov_b32 s14, 0x80020 | s_bfe_u64 s[12:13], 0x12345678, s14   ; bits [39:32] of zext = 0
@@ -94,6 +96,98 @@ int main() {
     CHECK(f4.size() == 1, "kernel 4 seed-V# fallback resolves the fetch");
     CHECK(f4.size() == 1 && f4[0].desc.base == 0x20000ull && f4[0].desc.stride == 16u,
           "kernel 4 fallback V# = the SEED (user-data) descriptor");
+
+    // DQ's NGG fetch prologue selects between the merged-stage ABI inputs with a wave-uniform
+    // s_cselect_b64 + v_cndmask_b32_e64 pair. The same shader selects instance_id for a transform
+    // lookup and vertex_id for positions. The descriptor fold must publish that distinction; treating
+    // both as gl_VertexIndex reads past the 252-record transform table on a 1718-vertex draw.
+    const uint32_t ngg_select_fetch[] = {
+        0xBF066A80u,                // s_cmp_eq_u32 0, s106
+        0x85A0807Eu,                // s_cselect_b64 s[32:33], exec, 0
+        0xD5010005u, 0x00820B08u,   // v_cndmask_b32_e64 v5, v8, v5, s[32:33]
+        0xE0082000u, 0x6B100E05u,   // buffer_load_format_xyz v[14:16], v5, s[64:67], 0 idxen
+        0xBF810000u,
+    };
+    std::vector<uint32_t> ngg_seed(100);
+    ngg_seed[64 - 8] = 0x00020000u;
+    ngg_seed[65 - 8] = 12u << 16;
+    ngg_seed[66 - 8] = 1718u;
+    ngg_seed[67 - 8] = (74u << 12) | 0x3ACu; // Float32 xyz
+    ngg_seed[106 - 8] = 0u;                  // SCC=true -> select v5 (vertex_id)
+    auto vertex_selected = resolve_dynamic_fetch(
+        ngg_select_fetch, std::size(ngg_select_fetch), ngg_seed.data(), ngg_seed.size(), 8);
+    CHECK(vertex_selected.size() == 1 &&
+              vertex_selected[0].index_mode == VertexFetchIndexMode::Vertex,
+          "NGG cselect/cndmask fold identifies a vertex_id buffer fetch");
+    ngg_seed[106 - 8] = 1u;                  // SCC=false -> select v8 (instance_id)
+    auto instance_selected = resolve_dynamic_fetch(
+        ngg_select_fetch, std::size(ngg_select_fetch), ngg_seed.data(), ngg_seed.size(), 8);
+    CHECK(instance_selected.size() == 1 &&
+              instance_selected[0].index_mode == VertexFetchIndexMode::Instance,
+          "NGG cselect/cndmask fold identifies an instance_id buffer fetch");
+
+    // The buffer load reads VADDR before writing its destination. A prologue may reuse the same VGPR
+    // for both, so destination invalidation must not erase the index mode of the current fetch.
+    const uint32_t ngg_inplace_fetch[] = {
+        0xBF066A80u,                // s_cmp_eq_u32 0, s106
+        0x85A0807Eu,                // s_cselect_b64 s[32:33], exec, 0
+        0xD5010000u, 0x00820B08u,   // v_cndmask_b32_e64 v0, v8, v5, s[32:33]
+        0xE0082000u, 0x6B100000u,   // buffer_load_format_xyz v[0:2], v0, s[64:67], 0 idxen
+        0xBF810000u,
+    };
+    ngg_seed[106 - 8] = 0u;
+    auto inplace_selected = resolve_dynamic_fetch(
+        ngg_inplace_fetch, std::size(ngg_inplace_fetch), ngg_seed.data(), ngg_seed.size(), 8);
+    CHECK(inplace_selected.size() == 1 &&
+              inplace_selected[0].index_mode == VertexFetchIndexMode::Vertex,
+          "an in-place buffer load retains its read-before-write NGG index provenance");
+
+    // Evergate's Unity fetch prologue uses the compact e32 cndmask form, whose condition is the
+    // implicit VCC pair, before later attributes. The fold used to retain only e64 cndmask and
+    // therefore downgraded the second fetch to a shader-computed address even though VCC selected
+    // the same vertex-id ABI input again.
+    const uint32_t ngg_vop2_reselect_fetch[] = {
+        0xBE800380u,                // s_mov_b32 s0, 0
+        0xBF060000u,                // s_cmp_eq_u32 s0, s0
+        0x85EA807Eu,                // s_cselect_b64 vcc, exec, 0
+        0x02000B08u,                // v_cndmask_b32_e32 v0, v8, v5
+        0xE0082000u, 0x0C020900u,   // buffer_load_format_xyz v[9:11], v0, s[8:11], s12 idxen
+        0xBF060000u,
+        0x85EA807Eu,
+        0x02000B08u,
+        0xE0082000u, 0x0C020900u,
+        0xBF810000u,
+    };
+    std::vector<uint32_t> vop2_seed(100);
+    vop2_seed[0] = 0x00020000u;
+    vop2_seed[1] = 12u << 16;
+    vop2_seed[2] = 1718u;
+    vop2_seed[3] = (74u << 12) | 0x3ACu;
+    auto vop2_reselected = resolve_dynamic_fetch(
+        ngg_vop2_reselect_fetch, std::size(ngg_vop2_reselect_fetch),
+        vop2_seed.data(), vop2_seed.size(), 8);
+    CHECK(vop2_reselected.size() == 2 &&
+              vop2_reselected[0].index_mode == VertexFetchIndexMode::Vertex &&
+              vop2_reselected[1].index_mode == VertexFetchIndexMode::Vertex,
+          "NGG e32 cndmask reselects vertex_id for every Unity attribute fetch");
+
+    // A later packed-attribute address can reuse the ABI VGPR after arithmetic. Its provenance is no
+    // longer vertex_id even though an earlier cndmask selected vertex_id into the same register.
+    // DQ does this for v5 = 3*vertex_id+1 immediately after its position fetch.
+    const uint32_t ngg_computed_fetch[] = {
+        0xBF066A80u,                // s_cmp_eq_u32 0, s106
+        0x85A0807Eu,                // s_cselect_b64 s[32:33], exec, 0
+        0xD5010005u, 0x00820B08u,   // v_cndmask_b32_e64 v5, v8, v5, s[32:33]
+        0x4A0A0881u,                // v_add_nc_u32 v5, 1, v4 (computed packed-record address)
+        0xE0082000u, 0x6B100E05u,   // buffer_load_format_xyz v[14:16], v5, s[64:67], 0 idxen
+        0xBF810000u,
+    };
+    auto computed_selected = resolve_dynamic_fetch(
+        ngg_computed_fetch, std::size(ngg_computed_fetch),
+        ngg_seed.data(), ngg_seed.size(), 8);
+    CHECK(computed_selected.size() == 1 &&
+              computed_selected[0].index_mode == VertexFetchIndexMode::Shader,
+          "a computed VADDR kills inherited NGG ABI index provenance");
 
     // Kernel 4b: same, but s11 was RELOADED from memory (s_load_dword) — the stale seed must NOT be
     // used (the register no longer holds user data). The load's address is unknown (s[40:41]
