@@ -9,6 +9,7 @@
 #include "../frontends/shared/vulkan_device_select.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -797,6 +798,22 @@ inline constexpr BackendSubmissionState backend_submission_state(bool submitted,
                                  : BackendSubmissionState::Pending;
 }
 
+// Once completion of submitted work cannot be proven, cached Vulkan objects may remain referenced
+// beyond the local batch lifetime. Keep the renderer poisoned for the rest of the device lifetime:
+// later callbacks must not submit work or evict any persistent object potentially owned by the GPU.
+inline std::atomic<bool>& backend_unproven_submission_storage() {
+    static std::atomic<bool> pending{false};
+    return pending;
+}
+
+inline bool backend_has_unproven_submission() {
+    return backend_unproven_submission_storage().load(std::memory_order_acquire);
+}
+
+inline void backend_mark_unproven_submission() {
+    backend_unproven_submission_storage().store(true, std::memory_order_release);
+}
+
 // Collect command buffers that belong to one ordered renderer callback. Vulkan queue order preserves
 // target producer/consumer dependencies; one fence on the final submission is enough to retain every
 // referenced object until the complete callback has finished. Direct test callers keep the established
@@ -816,10 +833,8 @@ public:
         if (commands_.empty()) complete();
     }
 
-    // Abandoned work remains logically pending for the batch lifetime: callers use this signal to
-    // suppress cache eviction of persistent objects that the unfinished submission may reference.
-    bool pending() const { return pending_resources_abandoned_ || !commands_.empty(); }
-    bool abandoned() const { return pending_resources_abandoned_; }
+    bool pending() const { return !commands_.empty(); }
+    bool retains_pending_resources() const { return pending_resources_abandoned_; }
 
     void enqueue(VkCommandBuffer command) {
         if (!pending_resources_abandoned_)
@@ -851,6 +866,7 @@ public:
         commands_.clear();
         finish_persistent_state(false);
         pending_resources_abandoned_ = true;
+        backend_mark_unproven_submission();
         cleanups_.clear();
     }
 
@@ -1121,6 +1137,7 @@ persistent_color_target_evict_sink() {
 }
 
 inline bool evict_persistent_color_target(const RenderVkCtx& ctx, uint64_t current_generation) {
+    if (backend_has_unproven_submission()) return false;
     auto& cache = persistent_color_target_cache();
     auto victim = cache.end();
     for (auto it = cache.begin(); it != cache.end(); ++it) {
@@ -1777,6 +1794,8 @@ inline BackendSubmissionState submit_persistent_ds_transfer(
         vkWaitForFences(ctx.dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000) == VK_SUCCESS;
     if (submitted && !finished) finished = render_locked_queue_wait_idle(ctx.queue) == VK_SUCCESS;
     const BackendSubmissionState state = backend_submission_state(submitted, finished);
+    if (state == BackendSubmissionState::Pending)
+        backend_mark_unproven_submission();
     if (state != BackendSubmissionState::Pending) {
         if (fence) vkDestroyFence(ctx.dev, fence, nullptr);
         vkDestroyCommandPool(ctx.dev, pool, nullptr);
@@ -1793,6 +1812,10 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
                                              VkFormat format, std::vector<uint8_t>& output,
                                              std::string& error) {
     output.clear(); error.clear();
+    if (backend_has_unproven_submission()) {
+        error = "Vulkan submission completion is unproven";
+        return false;
+    }
     format = backend_color_format(format);
     PersistentColorTargetImage* target = find_persistent_color_target(
         id, width, height, format);
@@ -1887,6 +1910,7 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
         // invalid use. Deliberately leak the one-shot objects — the device is effectively lost
         // (#1383). The never-submitted failure modes still clean up normally.
         if (!submitted) cleanup();
+        else backend_mark_unproven_submission();
         error = "persistent color target readback did not complete"; return false;
     }
     void* mapped = nullptr;
@@ -1916,6 +1940,10 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
 inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint32_t width,
                                          uint32_t height, VkFormat format, std::string& error) {
     error.clear();
+    if (backend_has_unproven_submission()) {
+        error = "Vulkan submission completion is unproven";
+        return false;
+    }
     format = backend_color_format(format);
     if (!width || !height || !dst_id || src_id == dst_id) {
         error = "invalid copy identity"; return false;
@@ -2071,6 +2099,7 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
         // queue; destroying its pool or fence then is invalid use. Deliberately leak the
         // one-shot objects instead — the device is effectively lost (#1383).
         if (!submitted) cleanup();
+        else backend_mark_unproven_submission();
         return fail("resolve copy did not complete");
     }
     cleanup();
@@ -2082,6 +2111,10 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
 inline bool snapshot_persistent_ds_images(std::vector<prosper::gpu::GpuCaptureDsSeed>& seeds,
                                           std::string& error) {
     error.clear(); seeds.clear();
+    if (backend_has_unproven_submission()) {
+        error = "Vulkan submission completion is unproven";
+        return false;
+    }
     const RenderVkCtx& ctx = render_vk_ctx();
     if (!ctx.ok) { error = "Vulkan renderer is unavailable"; return false; }
     for (const auto& [key, image] : persistent_ds_cache()) {
@@ -2150,6 +2183,10 @@ inline bool snapshot_persistent_ds_images(std::vector<prosper::gpu::GpuCaptureDs
 inline bool restore_persistent_ds_image(const prosper::gpu::GpuCaptureDsSeed& seed,
                                         std::string& error) {
     error.clear();
+    if (backend_has_unproven_submission()) {
+        error = "Vulkan submission completion is unproven";
+        return false;
+    }
     const RenderVkCtx& ctx = render_vk_ctx();
     if (!ctx.ok) { error = "Vulkan renderer is unavailable"; return false; }
     const VkFormat format = seed.format == prosper::gpu::GpuCaptureDsFormat::D32Float
@@ -2247,15 +2284,14 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     std::vector<uint8_t> out;
     if (out_rgba1) out_rgba1->clear();
     if (draws.empty()) return out;
+    if (backend_has_unproven_submission()) return out;
     const RenderVkCtx& ctx = render_vk_ctx();
     if (!ctx.ok) return out;
     BackendSubmissionBatch direct_submission;
     BackendSubmissionBatch& active_submission = submission_batch
         ? *submission_batch : direct_submission;
-    // A previous flush submitted this batch but could not prove completion. The device is
-    // effectively lost; do not record more work or touch caches/resources it may still own.
-    if (active_submission.abandoned()) return out;
-    const bool avoid_cache_eviction = active_submission.pending();
+    const bool avoid_cache_eviction = active_submission.pending() ||
+                                      backend_has_unproven_submission();
     const bool persistent_color_targets_enabled =
         getenv("PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS") == nullptr;
     const bool persistent_color_enabled = persistent_color_targets_enabled && color_target &&
@@ -5056,7 +5092,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 vkDestroyImage(dev, dimg, nullptr);
                 release_transient_render_memory(dev, dmem);
             }
-            while ((persistent_color_target_cache().size() > persistent_color_target_count_limit() ||
+            while (!backend_has_unproven_submission() &&
+                   (persistent_color_target_cache().size() > persistent_color_target_count_limit() ||
                     persistent_color_target_bytes() > persistent_color_target_limit()) &&
                    evict_persistent_color_target(*ctx_ptr, color_target_generation)) {}
         });
