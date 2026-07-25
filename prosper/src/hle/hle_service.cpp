@@ -121,6 +121,39 @@ void svc_log(const char* fn, uint64_t a0, uint64_t a1, uint64_t a2,
 }
 }
 
+// PS5 Game Intent is how the shell starts a title at a selected activity instead of its default
+// entry point. A host frontend can model that user action by setting an activity id before boot;
+// without it the console truthfully has no pending intent. Keep the payload opaque to the guest:
+// titles consume it through sceNpGameIntentGetPropertyValueString, as on the console.
+// CONFIDENCE: HIGH — ABI/error contracts match Kyty; event id, type, key, and offsets are also
+// independently exercised by Sonic's eboot and its launchActivity declaration in param.json.
+namespace {
+constexpr uint64_t NP_GAME_INTENT_ERROR_INVALID_ARGUMENT = 0x80553804ull;
+constexpr uint64_t NP_GAME_INTENT_ERROR_INTENT_NOT_FOUND = 0x80553806ull;
+constexpr uint64_t NP_GAME_INTENT_ERROR_VALUE_NOT_FOUND  = 0x80553807ull;
+constexpr size_t NP_GAME_INTENT_TYPE_OFFSET     = 12;
+constexpr size_t NP_GAME_INTENT_TYPE_SIZE       = 33;
+constexpr size_t NP_GAME_INTENT_DATA_OFFSET     = 308;
+constexpr size_t NP_GAME_INTENT_DATA_SIZE       = 16392;
+constexpr uint32_t SYSTEM_SERVICE_EVENT_GAME_INTENT = 0x10000017u;
+
+std::atomic<bool> g_gameintent_initialized{false};
+std::atomic<bool> g_gameintent_event_delivered{false};
+std::atomic<uint64_t> g_gameintent_data_ptr{0};
+
+// Bound host-controlled text to the opaque intent payload capacity. The property accessor separately
+// checks the caller's buffer, so a title with a smaller value limit gets an error, never truncation.
+const char* gameintent_activity_id(size_t* length = nullptr) {
+    const char* value = getenv("PROSPER_GAME_INTENT_ACTIVITY_ID");
+    if (!value) return nullptr;
+    size_t n = 0;
+    while (n < NP_GAME_INTENT_DATA_SIZE && value[n]) ++n;
+    if (n == 0 || n == NP_GAME_INTENT_DATA_SIZE) return nullptr;
+    if (length) *length = n;
+    return value;
+}
+}
+
 // --- user service ---
 HLE(s_user_initial)   { if (a0) *(int32_t*)PW(a0) = 1; return 0; }           // GetInitialUser -> userId 1
 HLE(s_user_idlist)    { if (a0) { int32_t* p = (int32_t*)PW(a0); p[0] = 1; for (int i = 1; i < 4; i++) p[i] = -1; } return 0; }
@@ -326,8 +359,23 @@ HLE(s_user_getevent)  {
 // received" while leaving the 8196-byte out-struct (4-byte eventType + 8192-byte union) uninitialized ->
 // the guest dispatched on a garbage eventType (same harmful class as s_user_getevent above; imported by
 // both Unity targets). The truthful idle answer is NO_EVENT with nothing written. shadPS4
-// systemservice.cpp: NO_EVENT = 0x80A10004, PARAMETER (ev==NULL) = 0x80A10003.
-HLE(s_sysservice_receiveevent) { if (!a0) return 0x80A10003ull; return 0x80A10004ull; }
+// systemservice.cpp: NO_EVENT = 0x80A10004, PARAMETER (ev==NULL) = 0x80A10003. When a host activity
+// was selected, a real shell instead delivers SCE_SYSTEM_SERVICE_EVENT_GAME_INTENT once; the title
+// then obtains the opaque launchActivity payload through libSceNpGameIntent.
+HLE(s_sysservice_receiveevent) {
+    svc_log("sceSystemServiceReceiveEvent", a0,a1,a2,a3,a4,a5);
+    if (!a0) return 0x80A10003ull;
+    if (g_gameintent_initialized.load(std::memory_order_acquire) && gameintent_activity_id()) {
+        bool expected = false;
+        if (g_gameintent_event_delivered.compare_exchange_strong(expected, true)) {
+            const uint32_t event_type = SYSTEM_SERVICE_EVENT_GAME_INTENT;
+            if (svc_write_bytes(a0, &event_type, sizeof(event_type))) return 0;
+            g_gameintent_event_delivered.store(false);
+            return 0x80A10003ull;
+        }
+    }
+    return 0x80A10004ull;
+}
 HLE(s_ok)             { return 0; }
 // ===== libSceAvPlayer (#324/#705): real playback lifecycle over a host video-decode backend =====
 // The core owns the guest sceAvPlayer contract + per-player state + the guest event callback and
@@ -1640,6 +1688,13 @@ HLE(s_syss_getstatus) {
     auto* st = (uint8_t*)PW(a0);
     if (!st) return 0x80A10003ull;   // SYSTEM_SERVICE_ERROR_PARAMETER (Kyty Errno.h:382)
     memset(st, 0, 12);
+    // event_num is the first field. Titles use it to decide how many times to call ReceiveEvent;
+    // advertising an activity only in ReceiveEvent leaves that function unreachable.
+    if (g_gameintent_initialized.load(std::memory_order_acquire) &&
+        !g_gameintent_event_delivered.load(std::memory_order_acquire) &&
+        gameintent_activity_id()) {
+        *(int32_t*)st = 1;
+    }
     st[6] = 1;                       // isCpuMode7CpuNormal = true
     return 0;
 }
@@ -2410,6 +2465,66 @@ HLE(s_npuds_object_set_string) {
 }
 HLE(s_gameintent_init) {
     svc_log("sceNpGameIntentInitialize", a0,a1,a2,a3,a4,a5);
+    if (!g_gameintent_initialized.exchange(true, std::memory_order_acq_rel))
+        g_gameintent_event_delivered.store(false, std::memory_order_release);
+    g_gameintent_data_ptr.store(0, std::memory_order_release);
+    return 0;
+}
+HLE(s_gameintent_term) {
+    svc_log("sceNpGameIntentTerminate", a0,a1,a2,a3,a4,a5);
+    g_gameintent_data_ptr.store(0, std::memory_order_release);
+    g_gameintent_event_delivered.store(false, std::memory_order_release);
+    g_gameintent_initialized.store(false, std::memory_order_release);
+    return 0;
+}
+HLE(s_gameintent_receive) {
+    svc_log("sceNpGameIntentReceiveIntent", a0,a1,a2,a3,a4,a5);
+    if (!svc_ptrish(a0)) return NP_GAME_INTENT_ERROR_INVALID_ARGUMENT;
+
+    const int32_t invalid_user = -1;
+    const char empty_type[NP_GAME_INTENT_TYPE_SIZE]{};
+    static const uint8_t empty_data[NP_GAME_INTENT_DATA_SIZE]{};
+    if (!svc_write_bytes(a0 + 8, &invalid_user, sizeof(invalid_user)) ||
+        !svc_write_bytes(a0 + NP_GAME_INTENT_TYPE_OFFSET, empty_type, sizeof(empty_type)) ||
+        !svc_write_bytes(a0 + NP_GAME_INTENT_DATA_OFFSET, empty_data, sizeof(empty_data))) {
+        return NP_GAME_INTENT_ERROR_INVALID_ARGUMENT;
+    }
+    g_gameintent_data_ptr.store(0, std::memory_order_release);
+
+    if (!g_gameintent_initialized.load(std::memory_order_acquire))
+        return NP_GAME_INTENT_ERROR_INTENT_NOT_FOUND;
+    if (!gameintent_activity_id()) return NP_GAME_INTENT_ERROR_INTENT_NOT_FOUND;
+
+    const int32_t initial_user = 1;
+    constexpr char launch_activity[] = "launchActivity";
+    if (!svc_write_bytes(a0 + 8, &initial_user, sizeof(initial_user)) ||
+        !svc_write_bytes(a0 + NP_GAME_INTENT_TYPE_OFFSET, launch_activity,
+                         sizeof(launch_activity))) {
+        return NP_GAME_INTENT_ERROR_INVALID_ARGUMENT;
+    }
+    g_gameintent_data_ptr.store(a0 + NP_GAME_INTENT_DATA_OFFSET, std::memory_order_release);
+    return 0;
+}
+HLE(s_gameintent_get_property_string) {
+    svc_log("sceNpGameIntentGetPropertyValueString", a0,a1,a2,a3,a4,a5);
+    if (!svc_ptrish(a0) || !svc_ptrish(a1) || !svc_ptrish(a2) || a3 == 0)
+        return NP_GAME_INTENT_ERROR_INVALID_ARGUMENT;
+
+    char key[sizeof("activityId")]{};
+    if (!svc_copy_bytes(a1, key, sizeof(key))) return NP_GAME_INTENT_ERROR_INVALID_ARGUMENT;
+
+    size_t activity_length = 0;
+    const char* activity = gameintent_activity_id(&activity_length);
+    if (a0 != g_gameintent_data_ptr.load(std::memory_order_acquire) || !activity ||
+        memcmp(key, "activityId", sizeof(key)) != 0) {
+        const char empty = '\0';
+        if (!svc_write_bytes(a2, &empty, sizeof(empty)))
+            return NP_GAME_INTENT_ERROR_INVALID_ARGUMENT;
+        return NP_GAME_INTENT_ERROR_VALUE_NOT_FOUND;
+    }
+    if (a3 < activity_length + 1) return NP_GAME_INTENT_ERROR_INVALID_ARGUMENT;
+    if (!svc_write_bytes(a2, activity, activity_length + 1))
+        return NP_GAME_INTENT_ERROR_INVALID_ARGUMENT;
     return 0;
 }
 HLE(s_npent_addcont_info) {
@@ -2949,6 +3064,12 @@ void register_service_hle() {
                      "sceNpUniversalDataSystemEventPropertyObjectSetString");
     Hle::register_fn("m87BHxt-H60", (HleFn)s_gameintent_init,
                      "sceNpGameIntentInitialize");
+    Hle::register_fn("0HBYxYAjmf0", (HleFn)s_gameintent_term,
+                     "sceNpGameIntentTerminate");
+    Hle::register_fn("jEIXUAr9XE8", (HleFn)s_gameintent_receive,
+                     "sceNpGameIntentReceiveIntent");
+    Hle::register_fn("rPl0INNc-M8", (HleFn)s_gameintent_get_property_string,
+                     "sceNpGameIntentGetPropertyValueString");
     Hle::register_fn("xddD23+8TfQ", (HleFn)s_npent_addcont_info,
                      "sceNpEntitlementAccessGetAddcontEntitlementInfo");
     #undef R

@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 
 using namespace prosper;
 
@@ -22,6 +23,15 @@ static int32_t call_int_getter(HleFn fn, int32_t sentinel) {
     int32_t out = sentinel;
     fn(1 /*userId*/, (uint64_t)(uintptr_t)&out, 0, 0, 0, 0);
     return out;
+}
+
+static void set_game_intent_activity(const char* value) {
+#ifdef _WIN32
+    _putenv_s("PROSPER_GAME_INTENT_ACTIVITY_ID", value ? value : "");
+#else
+    if (value) setenv("PROSPER_GAME_INTENT_ACTIVITY_ID", value, 1);
+    else unsetenv("PROSPER_GAME_INTENT_ACTIVITY_ID");
+#endif
 }
 
 int main() {
@@ -465,11 +475,92 @@ int main() {
             CHECK(untouched, "failed entitlement query leaves output untouched");
         } else CHECK(false, "sceNpEntitlementAccessGetAddcontEntitlementInfo registered");
 
-        if (HleFn game_intent = Hle::lookup("m87BHxt-H60")) {
+        HleFn game_intent_init = Hle::lookup("m87BHxt-H60");
+        HleFn game_intent_term = Hle::lookup("0HBYxYAjmf0");
+        HleFn game_intent_receive = Hle::lookup("jEIXUAr9XE8");
+        HleFn game_intent_get_string = Hle::lookup("rPl0INNc-M8");
+        HleFn system_receive = Hle::lookup("656LMQSrg6U");
+        HleFn system_status = Hle::lookup("rPo6tV8D9bM");
+        CHECK(game_intent_init && game_intent_term && game_intent_receive &&
+              game_intent_get_string && system_receive && system_status,
+              "Game Intent lifecycle and system-event delivery registered");
+        if (game_intent_init && game_intent_term && game_intent_receive &&
+            game_intent_get_string && system_receive && system_status) {
             uint64_t init[5] = {0x28, 0, 0, 0, 0};
-            CHECK(game_intent((uint64_t)(uintptr_t)init, 0, 0, 0, 0, 0) == 0,
+            alignas(8) uint8_t info[16712];
+            set_game_intent_activity(nullptr);
+            CHECK(game_intent_init((uint64_t)(uintptr_t)init, 0, 0, 0, 0, 0) == 0,
                   "sceNpGameIntentInitialize accepts the 0x28-byte inert init struct");
-        } else CHECK(false, "sceNpGameIntentInitialize registered");
+            memset(info, 0xAB, sizeof(info));
+            *(uint64_t*)info = 16704;
+            CHECK(game_intent_receive((uint64_t)(uintptr_t)info, 0, 0, 0, 0, 0) ==
+                      0x80553806ull,
+                  "Game Intent without a host activity reports INTENT_NOT_FOUND");
+            CHECK(*(uint64_t*)info == 16704 && *(int32_t*)(info + 8) == -1,
+                  "no-intent receive preserves size and writes invalid user id");
+            bool type_empty = true;
+            for (size_t i = 12; i < 45; ++i) type_empty &= info[i] == 0;
+            bool reserved_untouched = true;
+            for (size_t i = 45; i < 308; ++i) reserved_untouched &= info[i] == 0xAB;
+            bool data_empty = true;
+            for (size_t i = 308; i < 16700; ++i) data_empty &= info[i] == 0;
+            bool tail_untouched = true;
+            for (size_t i = 16700; i < sizeof(info); ++i) tail_untouched &= info[i] == 0xAB;
+            CHECK(type_empty && reserved_untouched && data_empty && tail_untouched,
+                  "no-intent receive writes only the documented user/type/data fields");
+            char value[40]; memset(value, 0xAB, sizeof(value));
+            CHECK(game_intent_get_string((uint64_t)(uintptr_t)(info + 308),
+                                         (uint64_t)(uintptr_t)"activityId",
+                                         (uint64_t)(uintptr_t)value, sizeof(value), 0, 0) ==
+                      0x80553807ull && value[0] == 0,
+                  "no-intent property lookup reports VALUE_NOT_FOUND with an empty output");
+            CHECK(system_receive((uint64_t)(uintptr_t)info, 0, 0, 0, 0, 0) == 0x80A10004ull,
+                  "no host activity leaves the system event stream idle");
+            CHECK(game_intent_term(0, 0, 0, 0, 0, 0) == 0,
+                  "sceNpGameIntentTerminate succeeds");
+
+            set_game_intent_activity("TITLE_SONIC_1_CLASSIC");
+            CHECK(game_intent_init((uint64_t)(uintptr_t)init, 0, 0, 0, 0, 0) == 0,
+                  "Game Intent reinitializes for a host-selected activity");
+            uint8_t system_status_bytes[12]; memset(system_status_bytes, 0xAB, sizeof(system_status_bytes));
+            CHECK(system_status((uint64_t)(uintptr_t)system_status_bytes, 0, 0, 0, 0, 0) == 0 &&
+                  *(int32_t*)system_status_bytes == 1,
+                  "System Service status advertises one pending GAME_INTENT event");
+            uint8_t system_event[8196]; memset(system_event, 0xAB, sizeof(system_event));
+            CHECK(system_receive((uint64_t)(uintptr_t)system_event, 0, 0, 0, 0, 0) == 0 &&
+                  *(uint32_t*)system_event == 0x10000017u,
+                  "host activity produces one GAME_INTENT system event");
+            CHECK(system_event[4] == 0xAB && system_event[sizeof(system_event) - 1] == 0xAB,
+                  "GAME_INTENT delivery writes only the event type");
+            CHECK(system_receive((uint64_t)(uintptr_t)system_event, 0, 0, 0, 0, 0) == 0x80A10004ull,
+                  "GAME_INTENT system event is one-shot");
+            CHECK(system_status((uint64_t)(uintptr_t)system_status_bytes, 0, 0, 0, 0, 0) == 0 &&
+                  *(int32_t*)system_status_bytes == 0,
+                  "System Service status clears event_num after GAME_INTENT delivery");
+
+            memset(info, 0xAB, sizeof(info));
+            *(uint64_t*)info = 16704;
+            CHECK(game_intent_receive((uint64_t)(uintptr_t)info, 0, 0, 0, 0, 0) == 0 &&
+                  *(int32_t*)(info + 8) == 1 &&
+                  strcmp((char*)info + 12, "launchActivity") == 0,
+                  "selected activity receives as a launchActivity for initial user 1");
+            memset(value, 0xAB, sizeof(value));
+            CHECK(game_intent_get_string((uint64_t)(uintptr_t)(info + 308),
+                                         (uint64_t)(uintptr_t)"activityId",
+                                         (uint64_t)(uintptr_t)value, sizeof(value), 0, 0) == 0 &&
+                  strcmp(value, "TITLE_SONIC_1_CLASSIC") == 0,
+                  "activityId property returns the exact host-selected activity");
+            char unknown_key[sizeof("activityId")] = "otherKey";
+            memset(value, 0xAB, sizeof(value));
+            CHECK(game_intent_get_string((uint64_t)(uintptr_t)(info + 308),
+                                         (uint64_t)(uintptr_t)unknown_key,
+                                         (uint64_t)(uintptr_t)value, sizeof(value), 0, 0) ==
+                      0x80553807ull && value[0] == 0,
+                  "unknown Game Intent property reports VALUE_NOT_FOUND");
+            CHECK(game_intent_term(0, 0, 0, 0, 0, 0) == 0,
+                  "Game Intent terminates after activity delivery");
+            set_game_intent_activity(nullptr);
+        }
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
