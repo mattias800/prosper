@@ -1828,9 +1828,10 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                 if (!err) ajm2_dump_decode(inst_id,
                     std::span<const uint8_t>(input.data(), consumed), pcm.data(), produced);
                 if (!err && produced) instance.decoded_samples += produced / frame_bytes;
-                if (!ajm2_write_result(job.result_addr, err, consumed, produced,
-                                       instance.decoded_samples,
-                                       err ? 0 : decoded.decoded_frames)) {
+                const bool result_published = ajm2_write_result(
+                    job.result_addr, err, consumed, produced, instance.decoded_samples,
+                    err ? 0 : decoded.decoded_frames);
+                if (!result_published) {
                     // The codec and guest PCM may already have advanced, but the guest did not
                     // receive the progress sideband. Preserve the same terminal invariant as every
                     // other unpublishable result before another queued job reaches the decoder.
@@ -1842,7 +1843,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                             (unsigned long long)ajm2_log_ms(), inst_id, instance.codec,
                             got, job.in_size, job.out_size, consumed, produced, decoded.channels,
                             decoded.sample_rate, (unsigned long long)instance.decoded_samples,
-                            err ? " ERR" : "");
+                            !result_published ? " RESULT_STORE_ERR" : (err ? " ERR" : ""));
             }
             ji = je;
             continue;
@@ -1858,7 +1859,16 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
         }
         Atrac9Decoder* dec = (it != g_ajm2_inst.end() && it->second.at9_dec && it->second.at9_dec->valid())
                              ? it->second.at9_dec.get() : nullptr;
-        if (!dec) { for (size_t k = ji; k < je; ++k) ajm2_write_result(jobs[k].result_addr, kAjm2ErrDecode, 0, 0); ji = je; continue; }
+        if (!dec) {
+            const uint64_t total = it != g_ajm2_inst.end()
+                ? (it->second.total_samples ? it->second.gapless_delivered
+                                            : it->second.decoded_samples)
+                : 0;
+            for (size_t k = ji; k < je; ++k)
+                ajm2_write_result(jobs[k].result_addr, kAjm2ErrDecode, 0, 0, total);
+            ji = je;
+            continue;
+        }
         const int ch = dec->channels();
         const int sfb = dec->superframe_bytes();
         const int sfs = dec->superframe_samples();
@@ -1874,6 +1884,14 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
         for (size_t k = ji; k < je; ++k) {
             AjmDecJob& job = jobs[k];
             AjmDecodeInst& I = it->second;
+            // A prior job may have advanced ATRAC9 state and then failed to publish its result.
+            // Such an instance is terminal: later jobs must report zero progress instead of
+            // decoding against state the guest could not observe.
+            if (!dec) {
+                ajm2_write_result(job.result_addr, kAjm2ErrDecode, 0, 0,
+                                  I.total_samples ? I.gapless_delivered : I.decoded_samples);
+                continue;
+            }
             // A programmed gapless decode (#1097): drop `skip` priming frames at the program start,
             // deliver EXACTLY `total` trimmed frames, then pin the reported total there with no
             // further PCM. FMOD's channel-end and codec-slot recycling key off that exact landing;
@@ -1952,14 +1970,23 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                     carry.insert(carry.end(), spill, spill + (size_t)spill_frames * ch);
             }
             I.decoded_samples += produced / frame_bytes;
-            ajm2_write_result(job.result_addr, err, in_cur, produced,
-                              prog ? I.gapless_delivered : I.decoded_samples,
-                              decoded_codec_frames);
+            const bool result_published = ajm2_write_result(
+                job.result_addr, err, in_cur, produced,
+                prog ? I.gapless_delivered : I.decoded_samples, decoded_codec_frames);
+            if (!result_published) {
+                // Decoder/trim/carry state and guest PCM may already have advanced, but the guest
+                // did not receive the progress sideband. Keep cumulative totals for diagnostics
+                // and terminal error sidebands, while preventing any retry from advancing further.
+                I.at9_dec.reset();
+                I.carry.clear();
+                dec = nullptr;
+            }
             if (log)
                 fprintf(stderr, "[ajm2] t=%llums decode inst=%u in=%zu/%u out=%u -> %u consumed, %u PCM, total=%llu carry=%zu%s\n",
                         (unsigned long long)ajm2_log_ms(), inst_id, got, job.in_size, job.out_size,
                         in_cur, produced, (unsigned long long)it->second.decoded_samples,
-                        carry.size() * sizeof(int16_t), err ? " ERR" : "");
+                        carry.size() * sizeof(int16_t),
+                        !result_published ? " RESULT_STORE_ERR" : (err ? " ERR" : ""));
         }
         ji = je;
     }
