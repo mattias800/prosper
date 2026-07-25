@@ -4246,10 +4246,13 @@ HLE(k_query_memory_protection) {
     return 0;
 }
 
-// libSceAmpr / APR command-buffer trio + teardown. These commit UE4 (PPSA17942, area:ue4)
-// allocator pages; that title does not boot on Windows yet, so no-op stubs are correct here
-// (the Linux path models them). Registered by raw NID for parity.
+// libSceAmpr / APR command-buffer construction and teardown. The builders that commit UE4
+// (PPSA17942, area:ue4) allocator pages remain no-op stubs because that title does not boot on
+// Windows yet. Pure size/offset queries below keep their platform-independent return contracts.
 HLE(k_ampr_ok) { return 0; }
+HLE(k_ampr_measure_write_equeue) { return 20; }
+HLE(k_ampr_get_current_offset) { return 0; }
+HLE(k_ampr_measure_write_address) { return (a1 >> 34) == 0 ? (a1 >= 4 ? 12 : 8) : 16; }
 
 // APR command-buffer WriteAddress (NID j0+3uJMxYJY) — the completion-notification write (#1149).
 // Windows sibling of the POSIX handler above (full contract documented there): write `value` (a2)
@@ -4420,12 +4423,13 @@ void register_kernel_mem_hle() {
     Hle::register_fn("tZDDEo2tE5k", (HleFn)k_ampr_ok, "sceAmprCommandBufferGetSize");
     Hle::register_fn("Qs1xtplKo0U", (HleFn)k_ampr_ok, "sceAmprAprCommandBufferDestructor");
     Hle::register_fn("GuchCTefuZw", (HleFn)k_ampr_ok, "sceAmprCommandBufferDestructor");
-    Hle::register_fn("sSAUCCU1dv4", (HleFn)k_ampr_ok,
+    Hle::register_fn("sSAUCCU1dv4", (HleFn)k_ampr_measure_write_equeue,
                      "sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00");
     Hle::register_fn("H896Pt-yB4I", (HleFn)k_ampr_ok, "AprCbSetEventQueue?");
     Hle::register_fn("ASoW5WE-UPo", (HleFn)k_ampr_ok, "AprSubmitCommandBuffer?");
-    Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_ok, "sceAmprCommandBufferGetCurrentOffset");
-    Hle::register_fn("4fgtGfXDrFc", (HleFn)k_ampr_ok,
+    Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_get_current_offset,
+                     "sceAmprCommandBufferGetCurrentOffset");
+    Hle::register_fn("4fgtGfXDrFc", (HleFn)k_ampr_measure_write_address,
                      "sceAmprMeasureCommandSizeWriteAddress_04_00");
     // APR completion-notification write (#1149) — real behavior on Windows too (see handler above).
     Hle::register_fn("j0+3uJMxYJY", (HleFn)k_ampr_write_address, "sceAmprCommandBufferWriteAddress?");

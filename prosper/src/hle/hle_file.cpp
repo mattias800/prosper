@@ -2666,7 +2666,12 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
 #endif
 }
 
-#ifndef _WIN32
+#ifdef _WIN32
+// The command-size contract is platform-independent. Windows does not yet execute the encoded APR
+// command buffer, so it has no compatibility read side effect; it must still publish the exact byte
+// count instead of leaving Sonic's sizing call unregistered.
+HLE(f_apr_measure_read_file) { return (a3 >> 32) ? 24 : 20; }
+#else
 // libSceAmpr vWU-odnS+fU — sceAmprMeasureCommandSizeReadFile. The exact firmware contract returns
 // 20 bytes, or 24 when the file offset needs its high 32 bits. A prior live capture at UE4's
 // CreateGlobalShaderMap looked like a direct read:
@@ -2781,11 +2786,11 @@ void register_file_hle() {
     // offset); see f_apr_read_submit_entry above.
 #ifndef _WIN32
     Hle::register_fn("mQ16-QdKv7k", (HleFn)f_apr_read_submit_entry, "sceAmprAprCommandBufferReadFile");
-    Hle::register_fn("vWU-odnS+fU", (HleFn)f_apr_measure_read_file,
-                     "sceAmprMeasureCommandSizeReadFile");
 #else
     Hle::register_fn("mQ16-QdKv7k", (HleFn)f_apr_read_submit, "sceAmprAprCommandBufferReadFile");
 #endif
+    Hle::register_fn("vWU-odnS+fU", (HleFn)f_apr_measure_read_file,
+                     "sceAmprMeasureCommandSizeReadFile");
     #undef R
 }
 
