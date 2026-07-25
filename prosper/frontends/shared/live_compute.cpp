@@ -78,6 +78,36 @@ uint32_t storage_unpack_float16_bits(uint16_t half_bits) {
     return table[half_bits];
 }
 
+bool pack_live_target_r11g11b10(const prosper::gpu::LiveTargetSnapshot& snapshot,
+                                uint8_t* packed, size_t packed_size) {
+    if (!snapshot.width || !snapshot.height || !snapshot.pixels) return false;
+    const uint64_t texels = static_cast<uint64_t>(snapshot.width) * snapshot.height;
+    const uint32_t source_bytes = snapshot.format == prosper::gpu::LiveTargetPixelFormat::Rgba16Float
+        ? 8u : 4u;
+    if (texels > SIZE_MAX / source_bytes || texels > SIZE_MAX / sizeof(uint32_t) ||
+        snapshot.pixels->size() != static_cast<size_t>(texels) * source_bytes ||
+        !packed || packed_size != static_cast<size_t>(texels) * sizeof(uint32_t))
+        return false;
+    for (size_t t = 0; t < static_cast<size_t>(texels); ++t) {
+        float rgb[3]{};
+        if (snapshot.format == prosper::gpu::LiveTargetPixelFormat::Rgba16Float) {
+            for (uint32_t c = 0; c < 3; ++c) {
+                uint16_t half = 0;
+                std::memcpy(&half, snapshot.pixels->data() + t * 8 + c * 2, sizeof(half));
+                rgb[c] = prosper::gpu::half_to_float(half);
+            }
+        } else {
+            for (uint32_t c = 0; c < 3; ++c)
+                rgb[c] = (*snapshot.pixels)[t * 4 + c] / 255.0f;
+        }
+        const uint32_t word = static_cast<uint32_t>(prosper::gpu::float_to_f11(rgb[0])) |
+                              (static_cast<uint32_t>(prosper::gpu::float_to_f11(rgb[1])) << 11) |
+                              (static_cast<uint32_t>(prosper::gpu::float_to_f10(rgb[2])) << 22);
+        std::memcpy(packed + t * sizeof(word), &word, sizeof(word));
+    }
+    return true;
+}
+
 namespace {
 
 const std::array<uint8_t, 65536>& sampled_float16_unorm8_table() {
@@ -2908,13 +2938,22 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const bool f32 = sampled_f32;
                 const bool r11g11b10 = sampled_r11g11b10;
                 if (renderer_owned) {
-                    if (r11g11b10) {
-                        skip_image(r, "renderer RTT cannot be reconstructed as packed R11G11B10");
-                        break;
-                    }
                     const std::vector<uint8_t>& pixels = *live_target.pixels;
-                    if (sampled_float32_native || sampled_uint16_native ||
-                        sampled_uint32_native) {
+                    if (r11g11b10) {
+                        if (!pack_live_target_r11g11b10(live_target, upload, upload_size)) {
+                            skip_image(r, "renderer RTT R11G11B10 reconstruction failed");
+                            break;
+                        }
+                        if (trace)
+                            std::fprintf(stderr,
+                                         "[compute]   reconstructed renderer RTT binding=%u "
+                                         "addr=0x%llx extent=%ux%u rgba%s -> R11G11B10\n",
+                                         bi.binding, (unsigned long long)r->gpu_addr,
+                                         r->width, r->height,
+                                         live_target.format == LiveTargetPixelFormat::Rgba16Float
+                                             ? "16f" : "8");
+                    } else if (sampled_float32_native || sampled_uint16_native ||
+                               sampled_uint32_native) {
                         // A renderer-owned target is authoritative only when its cached texel is
                         // byte-identical to the UINT view.  Sonic aliases an RGBA16F render target
                         // as RGBA16_UINT for a compute resolve: those eight bytes must be

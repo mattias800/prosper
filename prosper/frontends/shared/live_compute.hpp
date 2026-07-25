@@ -33,6 +33,13 @@ void storage_pack_float16x4_range(const uint32_t* channels, size_t texels, uint8
 bool direct_sampled_rtt_compatible(prosper::gpu::DataFormat format, uint32_t components,
                                    prosper::gpu::LiveTargetPixelFormat target_format);
 
+// Reconstruct a packed R11G11B10 sampled surface from the renderer's canonical color snapshot.
+// The renderer keeps float targets as RGBA16F and ordinary targets as RGBA8; compute descriptors
+// can subsequently alias that same target as GFX10 10_11_11_FLOAT. This conversion restores the
+// descriptor-visible texel representation without reading stale guest backing.
+bool pack_live_target_r11g11b10(const prosper::gpu::LiveTargetSnapshot& snapshot,
+                                uint8_t* packed, size_t packed_size);
+
 // Execute already-realized compute items synchronously. Exposed for the production-backend test.
 bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& items);
 

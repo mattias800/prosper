@@ -138,6 +138,48 @@ int main() {
           !direct_sampled_rtt_compatible(DataFormat::Float16, 2,
                                          LiveTargetPixelFormat::Rgba16Float),
           "renderer RTT direct bind rejects format conversion and component aliases");
+    // A renderer-owned target is stored canonically as RGBA8 or RGBA16F, while a later compute
+    // descriptor can alias it as packed R11G11B10. Reconstruct the descriptor-visible words rather
+    // than sampling stale guest backing or dropping the dispatch.
+    {
+        auto rgba8 = std::make_shared<std::vector<uint8_t>>(std::initializer_list<uint8_t>{
+            255, 0, 128, 17, 0, 255, 64, 99,
+        });
+        LiveTargetSnapshot snapshot8{2, 1, LiveTargetPixelFormat::Rgba8Unorm, rgba8};
+        std::vector<uint8_t> packed8(8);
+        CHECK(prosper::frontend::pack_live_target_r11g11b10(
+                  snapshot8, packed8.data(), packed8.size()),
+              "RGBA8 renderer target reconstructs as two packed R11G11B10 texels");
+        uint32_t words8[2]{};
+        if (packed8.size() == sizeof(words8)) std::memcpy(words8, packed8.data(), sizeof(words8));
+        CHECK((words8[0] & 0x7ffu) == float_to_f11(1.0f) &&
+              ((words8[0] >> 11) & 0x7ffu) == float_to_f11(0.0f) &&
+              ((words8[0] >> 22) & 0x3ffu) == float_to_f10(128.0f / 255.0f),
+              "RGBA8 reconstruction quantizes RGB through the unsigned 11/11/10 float contract");
+
+        auto rgba16 = std::make_shared<std::vector<uint8_t>>(8, 0);
+        const float values[4] = {4.0f, 0.5f, 2.0f, 1.0f};
+        for (uint32_t c = 0; c < 4; ++c) {
+            const uint16_t half = float_to_half(values[c]);
+            std::memcpy(rgba16->data() + c * 2, &half, sizeof(half));
+        }
+        LiveTargetSnapshot snapshot16{1, 1, LiveTargetPixelFormat::Rgba16Float, rgba16};
+        std::vector<uint8_t> packed16(4);
+        CHECK(prosper::frontend::pack_live_target_r11g11b10(
+                  snapshot16, packed16.data(), packed16.size()),
+              "RGBA16F renderer target reconstructs as packed R11G11B10");
+        uint32_t word16 = 0;
+        if (packed16.size() == sizeof(word16)) std::memcpy(&word16, packed16.data(), sizeof(word16));
+        CHECK((word16 & 0x7ffu) == float_to_f11(4.0f) &&
+              ((word16 >> 11) & 0x7ffu) == float_to_f11(0.5f) &&
+              ((word16 >> 22) & 0x3ffu) == float_to_f10(2.0f),
+              "RGBA16F reconstruction preserves HDR RGB while discarding alpha");
+
+        snapshot16.pixels = std::make_shared<std::vector<uint8_t>>(7, 0);
+        CHECK(!prosper::frontend::pack_live_target_r11g11b10(
+                  snapshot16, packed16.data(), packed16.size()),
+              "R11G11B10 reconstruction rejects a malformed renderer snapshot");
+    }
 
     // #1127: the seed-skip re-prove counter (seed_reprove.hpp). interval 0 disables (old prove-once);
     // interval N fires on the Nth fast-skip and resets, so a Full-cached data-dependent shader is
