@@ -487,6 +487,7 @@ struct RenderVkCtx {
     VkDevice dev = VK_NULL_HANDLE; VkQueue queue = VK_NULL_HANDLE; uint32_t qfi = UINT32_MAX;
     VkDeviceSize storage_buffer_alignment = 1;
     bool aniso_enabled = false; float max_aniso_limit = 1.0f;
+    bool depth_bias_clamp_enabled = false;   // VkPhysicalDeviceFeatures::depthBiasClamp (#1349)
     bool logic_op_enabled = false; bool ok = false;
     bool fragment_stores_atomics = false;
     // Per-draw "fragment funnel" diagnostic (PROSPER_DRAW_STATS): pipeline-statistics + precise
@@ -609,6 +610,8 @@ inline const RenderVkCtx& render_vk_ctx() {
         r.storage_buffer_alignment = std::max<VkDeviceSize>(
             1, phys_props.limits.minStorageBufferOffsetAlignment);
         r.aniso_enabled = supported.samplerAnisotropy;
+        r.depth_bias_clamp_enabled = supported.depthBiasClamp;
+        if (r.depth_bias_clamp_enabled) feats.depthBiasClamp = VK_TRUE;
         r.logic_op_enabled = supported.logicOp;
         r.max_aniso_limit = phys_props.limits.maxSamplerAnisotropy;
         if (r.aniso_enabled) feats.samplerAnisotropy = VK_TRUE;
@@ -2851,6 +2854,16 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                                                   : VK_FRONT_FACE_CLOCKWISE)
                       : (VkFrontFace)ps->front_face;
                   rs.polygonMode = (VkPolygonMode)ps->polygon_mode; }
+        // Depth bias (#1349): the guest's PA_SU_POLY_OFFSET_* — shadow-map passes need it against
+        // acne. Clamp requires the depthBiasClamp device feature; without it a non-zero clamp is
+        // dropped to 0 (bias still applies, unclamped — the safe direction). PROSPER_NO_DEPTH_BIAS
+        // is the A/B diagnostic, symmetric with PROSPER_NO_CULL above.
+        if (ps && ps->depth_bias_enable && !getenv("PROSPER_NO_DEPTH_BIAS")) {
+            rs.depthBiasEnable         = VK_TRUE;
+            rs.depthBiasConstantFactor = ps->depth_bias_constant;
+            rs.depthBiasSlopeFactor    = ps->depth_bias_slope;
+            rs.depthBiasClamp = render_vk_ctx().depth_bias_clamp_enabled ? ps->depth_bias_clamp : 0.0f;
+        }
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
         VkPipelineColorBlendAttachmentState cba[2]{};
@@ -3594,7 +3607,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 memcpy(&word, &value, sizeof word);
                 append(word);
             };
-            append(7); // key schema version (fragment required subgroup size)
+            append(8); // key schema version (depth bias in rasterization state, #1349)
             append(W); append(H); append(color_count); append(static_cast<uint32_t>(FMT));
             append(static_cast<uint32_t>(FMT1)); append(use_ds); append(static_cast<uint32_t>(DFMT));
             const bool exact_shader_identities = bd.vs_identity && bd.fs_identity;
@@ -3641,6 +3654,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             append_float(vp.x); append_float(vp.y); append_float(vp.width); append_float(vp.height);
             append_float(vp.minDepth); append_float(vp.maxDepth);
             append(rs.polygonMode); append(rs.cullMode); append(rs.frontFace); append_float(rs.lineWidth);
+            append(rs.depthBiasEnable); append_float(rs.depthBiasConstantFactor);
+            append_float(rs.depthBiasSlopeFactor); append_float(rs.depthBiasClamp);
             append(cb.logicOpEnable); append(cb.logicOp);
             for (uint32_t attachment = 0; attachment < color_count; ++attachment) {
                 append(cba[attachment].blendEnable); append(cba[attachment].srcColorBlendFactor);

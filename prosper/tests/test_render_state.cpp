@@ -240,6 +240,30 @@ int main() {
                still_closed.scissor_bottom <= still_closed.scissor_top),
               "a genuine VPORT close stays closed — the screen recovery must not unmask it");
 
+        // #1349: PA_SU_POLY_OFFSET_* -> Vulkan depth bias (radv inverse: constant=asfloat(OFFSET),
+        // slope=asfloat(SCALE)/16, clamp=asfloat(CLAMP)); enable from PA_SU_SC_MODE_CNTL bit 11/12.
+        GpuState biased = st;
+        biased.cx[P::PA_SU_SC_MODE_CNTL] = st.cx.count(P::PA_SU_SC_MODE_CNTL)
+            ? st.cx[P::PA_SU_SC_MODE_CNTL] | (1u << 11) : (1u << 11);
+        auto fbits = [](float value) { uint32_t bits; memcpy(&bits, &value, sizeof bits); return bits; };
+        biased.cx[P::PA_SU_POLY_OFFSET_FRONT_SCALE]  = fbits(32.0f);   // slope 32/16 = 2.0
+        biased.cx[P::PA_SU_POLY_OFFSET_FRONT_OFFSET] = fbits(4.0f);
+        biased.cx[P::PA_SU_POLY_OFFSET_CLAMP]        = fbits(0.5f);
+        const ResolvedPipelineState with_bias =
+            resolve_pipeline_state(extract_render_state(biased));
+        CHECK(with_bias.depth_bias_enable == 1u && with_bias.depth_bias_constant == 4.0f &&
+              with_bias.depth_bias_slope == 2.0f && with_bias.depth_bias_clamp == 0.5f,
+              "POLY_OFFSET front block resolves to Vulkan depth bias (constant/slope/16/clamp)");
+        const ResolvedPipelineState no_bias = resolve_pipeline_state(extract_render_state(st));
+        CHECK(no_bias.depth_bias_enable == 0u && no_bias.depth_bias_constant == 0.0f,
+              "no POLY_OFFSET enable bit resolves to bias disabled");
+        GpuState poisoned = biased;
+        poisoned.cx[P::PA_SU_POLY_OFFSET_FRONT_SCALE] = 0x7fc00000u;   // NaN bit pattern
+        const ResolvedPipelineState nan_bias =
+            resolve_pipeline_state(extract_render_state(poisoned));
+        CHECK(nan_bias.depth_bias_enable == 0u,
+              "a non-finite POLY_OFFSET register disables the bias instead of poisoning it");
+
         RenderState empty{}; empty.has_scissor = true;
         empty.scissor_left = 10; empty.scissor_top = 20;
         empty.scissor_right = 5; empty.scissor_bottom = 15;
