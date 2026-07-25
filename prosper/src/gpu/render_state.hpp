@@ -152,6 +152,7 @@ struct RenderState {
     uint32_t pa_su_poly_offset_back_scale   = 0;
     uint32_t pa_su_poly_offset_back_offset  = 0;
     uint32_t pa_su_poly_offset_clamp        = 0;
+    uint32_t pa_su_poly_offset_db_fmt_cntl  = 0;
 
     // Viewport 0 transform (PA_CL_VPORT_{X,Y,Z}{SCALE,OFFSET} — IEEE-754 floats stored in the context
     // registers; 0 when the guest never set them). Hardware applies screen = offset + scale * ndc, with
