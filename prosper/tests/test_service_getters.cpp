@@ -103,10 +103,11 @@ int main() {
             auto query_decoder = Hle::lookup("qqMCwlULR+E");
             auto create = Hle::lookup("CNNRoRYd8XI");
             auto decode = Hle::lookup("852F5+q6+iM");
+            auto flush = Hle::lookup("l1hXwscLuCY");
             auto destroy = Hle::lookup("jwImxXRGSKA");
-            CHECK(alloc && query_decoder && create && decode && destroy,
+            CHECK(alloc && query_decoder && create && decode && flush && destroy,
                   "Videodec2 compute/decoder lifecycle registered");
-            if (alloc && query_decoder && create && decode && destroy) {
+            if (alloc && query_decoder && create && decode && flush && destroy) {
                 alignas(256) static uint8_t memory[3][64u << 10];
                 struct { uint64_t size; uint16_t pipe, queue; uint8_t check, r0; uint16_t r1; }
                     cq{16, 0, 0, 0, 0, 0};
@@ -141,6 +142,22 @@ int main() {
                 CHECK(decode(decoder, (uint64_t)(uintptr_t)input, (uint64_t)(uintptr_t)&frame,
                              (uint64_t)(uintptr_t)output, 0, 0) == 0 && !frame.accepted,
                       "Videodec2 no-picture decode consumes an access unit deterministically");
+                alignas(8) uint8_t short_output[64];
+                std::memset(short_output, 0xA5, sizeof short_output);
+                *(uint64_t*)short_output = 48;
+                uint8_t short_before[sizeof short_output];
+                std::memcpy(short_before, short_output, sizeof short_output);
+                frame.accepted = 1;
+                CHECK(decode(decoder, (uint64_t)(uintptr_t)input, (uint64_t)(uintptr_t)&frame,
+                             (uint64_t)(uintptr_t)short_output, 0, 0) == 0x811d0101ull &&
+                          frame.accepted == 1 &&
+                          std::memcmp(short_output, short_before, sizeof short_output) == 0,
+                      "Videodec2 decode rejects the 48-byte output ABI without writing past it");
+                CHECK(flush(decoder, (uint64_t)(uintptr_t)&frame,
+                            (uint64_t)(uintptr_t)short_output, 0, 0, 0) == 0x811d0101ull &&
+                          frame.accepted == 1 &&
+                          std::memcmp(short_output, short_before, sizeof short_output) == 0,
+                      "Videodec2 flush rejects the 48-byte output ABI without writing past it");
                 CHECK(destroy(decoder, 0, 0, 0, 0, 0) == 0,
                       "Videodec2 decoder lifecycle tears down cleanly");
             }

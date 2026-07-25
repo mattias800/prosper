@@ -62,8 +62,30 @@ int main() {
     register_builtin_hle();
 
     HleFn create_shader = Hle::lookup("f3dg2CSgRKY");
+    HleFn create_interp = Hle::lookup("dbOlWdppb4o");
+    HleFn create_interp_320 = Hle::lookup("pdEV7bI6COI");
     CHECK(create_shader != nullptr, "sceAgcCreateShader registered");
+    CHECK(create_interp != nullptr && create_interp_320 != nullptr,
+          "CreateInterpolantMapping SDK aliases registered");
     if (!create_shader) return 1;
+
+    // Cobra's eboot wrapper allocates exactly 32 ShaderRegisters, calls dbOlWdppb4o with
+    // (out, producer type 2, pixel type 1), then advertises all 32 to PatchAddRegisters. A success
+    // stub left most of the stack array unwritten, so coincidental offsets became real Cx writes.
+    if (create_interp && create_interp_320) {
+        Shader producer{}; producer.type = 2;
+        Shader pixel{}; pixel.type = 1;
+        ShaderRegister regs[32];
+        for (auto& reg : regs) reg = {0xDEADBEEFu, 0xA5A5A5A5u};
+        uint64_t interp_rc = create_interp((uint64_t)(uintptr_t)regs,
+                                           (uint64_t)(uintptr_t)&producer,
+                                           (uint64_t)(uintptr_t)&pixel, 0, 0, 0);
+        bool complete = interp_rc == 0;
+        for (uint32_t i = 0; i < 32; ++i)
+            complete = complete && regs[i].offset == prosper::agc::Pm4::SPI_PS_INPUT_CNTL_0 + i &&
+                       regs[i].value == 0;
+        CHECK(complete, "Cobra interpolant builder initializes all 32 advertised Cx records");
+    }
 
     size_t count0 = prosper_agc_shader_count();
 

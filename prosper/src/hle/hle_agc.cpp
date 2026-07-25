@@ -1014,7 +1014,7 @@ HLE(agc_create_prim_state) {  // (cx_regs, uc_regs, hs, gs, prim_type)
     return 0;
 }
 
-// sceAgcCreateInterpolantMapping (HV4j+E0MBHE) — build the 32 SPI_PS_INPUT_CNTL_* registers wiring
+// sceAgcCreateInterpolantMapping — build the 32 SPI_PS_INPUT_CNTL_* registers wiring
 // PS inputs to GS/VS output parameter slots. Generalized beyond Kyty (which asserts Unity's exact
 // identity layout): match each PS input to the GS output with the same semantic id and use that
 // output's parameter slot, with the flat-shade bit (0x400) from the PS side. Falls back to the
@@ -1645,7 +1645,14 @@ void register_agc_hle() {
     RN("n2fD4A+pb+g", agc_cb_set_sh_register_range_direct);  // SET_SH_REG range packet
     RN("UZbQjYAwwXM", agc_cb_set_sh_registers_direct);       // non-contiguous SET_SH_REG packets
     RN("D9sr1xGUriE", agc_create_prim_state);                // prim registers from gs specials
-    RN("HV4j+E0MBHE", agc_create_interpolant_mapping);       // SPI_PS_INPUT_CNTL_* wiring
+    // CreateInterpolantMapping changed NID across SDK revisions. PS5 3.20 names pdEV7bI6COI;
+    // Cobra imports dbOlWdppb4o, and its eboot wrapper at +0x3b2780 proves the same
+    // (regs[32], producer type 2, pixel type 1) ABI before copying all 32 records into the Cx bank.
+    // Leaving that alias on the generic success stub advertised 32 unwritten stack records and
+    // made coincidental junk offsets program real registers.
+    RN("pdEV7bI6COI", agc_create_interpolant_mapping);       // PS5 3.20
+    RN("dbOlWdppb4o", agc_create_interpolant_mapping);       // Cobra SDK revision
+    RN("HV4j+E0MBHE", agc_create_interpolant_mapping);       // older observed revision
     RN("TRO721eVt4g", agc_dcb_reset_queue);
     RN("+kSrjIVxKFE", agc_dcb_push_marker);
     RN("QhCbS4X9Rl8", agc_dcb_push_marker);  // sceAgcDcbSetMarker (same native marker packet)

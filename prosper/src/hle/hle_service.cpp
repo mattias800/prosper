@@ -314,7 +314,7 @@ HLE(s_videodec2_decode) {
     auto* out = (VdecOutput*)PW(a3);
     if (!input || !frame || !out) return VDEC_ERR_ARG;
     if (input->size != sizeof(*input) || frame->size != sizeof(*frame) ||
-        (out->size != sizeof(*out) && (out->size | 8u) != sizeof(*out))) return VDEC_ERR_STRUCT;
+        out->size != sizeof(*out)) return VDEC_ERR_STRUCT;
     if (input->data_size && !input->data) return VDEC_ERR_ARG;
     if (!frame->data_size) return VDEC_ERR_FRAME_SIZE;
     if (!frame->data) return VDEC_ERR_FRAME_PTR;
@@ -327,8 +327,7 @@ HLE(s_videodec2_flush) {
       if (it == g_vdec_codecs.end()) return VDEC_ERR_DECODER; codec = it->second; }
     auto* frame = (VdecFrame*)PW(a1); auto* out = (VdecOutput*)PW(a2);
     if (!frame || !out) return VDEC_ERR_ARG;
-    if (frame->size != sizeof(*frame) ||
-        (out->size != sizeof(*out) && (out->size | 8u) != sizeof(*out))) return VDEC_ERR_STRUCT;
+    if (frame->size != sizeof(*frame) || out->size != sizeof(*out)) return VDEC_ERR_STRUCT;
     frame->accepted = 0; vdec_no_picture(frame, out, codec);
     return 0;
 }
@@ -337,7 +336,7 @@ HLE(s_videodec2_reset) {
 }
 HLE(s_videodec2_picture_info) {
     auto* out = (const VdecOutput*)PW(a0); if (!out) return VDEC_ERR_ARG;
-    return (out->size == sizeof(*out) || (out->size | 8u) == sizeof(*out)) ? 0 : VDEC_ERR_STRUCT;
+    return out->size == sizeof(*out) ? 0 : VDEC_ERR_STRUCT;
 }
 // sceUserServiceGetEvent(SceUserServiceEvent* ev): the event stream. A real system delivers the initial
 // user's LOGIN event once at startup, then reports "no more events" so the game's drain loop terminates.

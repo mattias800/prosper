@@ -2666,59 +2666,14 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
 #endif
 }
 
-#ifdef _WIN32
-// The command-size contract is platform-independent. Windows does not yet execute the encoded APR
-// command buffer, so it has no compatibility read side effect; it must still publish the exact byte
-// count instead of leaving Sonic's sizing call unregistered.
-HLE(f_apr_measure_read_file) { return (a3 >> 32) ? 24 : 20; }
-#else
 // libSceAmpr vWU-odnS+fU — sceAmprMeasureCommandSizeReadFile. The exact firmware contract returns
-// 20 bytes, or 24 when the file offset needs its high 32 bits. A prior live capture at UE4's
-// CreateGlobalShaderMap looked like a direct read:
-//   vWU-odnS+fU(fileId=8, dst=0x2002860000, size=0x107e3a, off=0x7adec90a, off, 5thArg=4)
-// The arguments really do describe that read, but this entry only MEASURES the encoded command.
-// Until prosper executes encoded APR command buffers, retain the proven pread as a compatibility
-// side effect for valid registered ids; critically, always return the measured byte count rather
-// than an error/status. Sonic Origins called this with id=0 while sizing a pool, and the old EINVAL
-// return became a 0x80020016-byte allocation that overran its 2 GiB direct-memory reservation.
+// 20 bytes, or 24 when the file offset needs its high 32 bits. This is a pure sizing API on every
+// host: performing the older Linux-only compatibility read here made an allocation query mutate
+// guest memory and gave Windows different title-visible behavior. Encoded reads execute through
+// sceAmprAprCommandBufferReadFile instead.
 HLE(f_apr_measure_read_file) {
-    uint64_t id = a0, dst = a1, size = a2, offset = a3;
-    const uint64_t measured = (offset >> 32) ? 24 : 20;
-    std::string host = prosper_apr_path_for_id((uint32_t)id);
-    if (host.empty()) {
-        if (filelog()) fprintf(stderr, "[apr] measure-read id=%llu -> %llu bytes\n",
-                               (unsigned long long)id, (unsigned long long)measured);
-        return measured;
-    }
-    uint64_t fsize = 0;
-    { struct stat st {}; if (::stat(host.c_str(), &st) == 0) fsize = (uint64_t)st.st_size; }
-    if (offset > fsize) offset = fsize;
-    if (size > fsize - offset) size = fsize - offset;
-    uint64_t rounded = (size + 0xfff) & ~0xfffull; if (!rounded) rounded = 0x1000;
-    void* buf = mmap(nullptr, rounded, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (buf == MAP_FAILED) return measured;
-    ssize_t got = 0;
-    if (size) {
-        int fd = apr_cached_fd(host);
-        if (fd < 0) { munmap(buf, rounded); return measured; }
-        got = ::pread(fd, buf, (size_t)size, (off_t)offset);
-    }
-    bool ok = (uint64_t)got == size && (size == 0 || apr_write_guest_dst(dst, buf, size));
-    munmap(buf, rounded);
-    if (filelog()) fprintf(stderr, "[apr] read-direct id=%llu %s -> dst=0x%llx off=0x%llx size=%llu %s\n",
-                           (unsigned long long)id, host.c_str(), (unsigned long long)dst,
-                           (unsigned long long)offset, (unsigned long long)size, ok ? "OK" : "FAIL");
-    // No completion event (issue #208). Direct reads are consumed by the guest WITHOUT a listener
-    // event (live-verified: the gdb-unwedged engine streamed the whole remaining load through
-    // these with no matching events in flight), and posting an invented counter would REGRESS the
-    // listener's ctor-seeded per-ring last-processed (unconditional last:=cnt store at
-    // eboot+0x2274143), setting up the fatal +0x229df3e range walk. Only exact H896 binding tags
-    // are ever posted (k_apr_submit -> prosper_eq_post_apr_token).
-    return measured;
+    return (a3 >> 32) ? 24 : 20;
 }
-// APR completion-token plumbing (hle_kernel_time.cpp) — see the k_apr_submit block in
-// hle_kernel_mem.cpp for the recovered contract.
-#endif
 
 void register_file_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)

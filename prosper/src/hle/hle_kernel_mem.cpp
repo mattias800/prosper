@@ -1378,12 +1378,12 @@ namespace {
 }
 HLE(k_ampr_measure_write_equeue) { // sSAUCCU1dv4 = sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00
     ampr_arglog("sSAUCCU1dv4(MeasureWriteEqueue)", a0, a1, a2, a3, a4, a5);
-    // Called 6x by the guest listener-ctx ctor (eboot+0x22a0670) with id = 0x74fe + ring for
-    // rings 0..5, right after it creates its own equeue and seeds the per-ring counters. The API
-    // is only a size calculator, but keep the registration side effect until prosper executes the
-    // encoded command buffer itself; UE4's completion-event model currently consumes this record.
-    if (a0) prosper_eq_add_apr(a0, (int64_t)a1);
-    return 20;
+    // The guest uses this only to reserve its command buffer. A 32-byte record is the conservative
+    // firmware-compatible size; returning 20 risks under-allocation before the real builder runs.
+    // Registration belongs to sceAmprAprCommandBufferWriteKernelEventQueue below; keeping it here
+    // would make another pure size query title-visible and platform-dependent.
+    // CONFIDENCE: MED (Sonic allocation flow plus an independent implementation; no hardware trace).
+    return 32;
 }
 HLE(k_apr_cb_set_equeue) {       // H896Pt-yB4I (cb, eq, id, tag, 0, flags)
     ampr_arglog("H896Pt-yB4I(CbSetEqueue)", a0, a1, a2, a3, a4, a5);
@@ -1438,11 +1438,13 @@ HLE(k_ampr_get_current_offset) {
     ampr_arglog("GnxKOHEawhk(GetCurrentOffset)", a0, a1, a2, a3, a4, a5);
     return 0;
 }
-// FW 04.00 size calculator: 8/12 bytes for a compact immediate, otherwise 16. Sonic Origins sums
-// this return with the ReadFile and equeue command sizes to allocate each AMPR command buffer.
+// Sonic Origins sums this result with the ReadFile and equeue sizes to reserve each AMPR command
+// buffer. Use the conservative 32-byte firmware-compatible record size; the earlier guessed
+// 8/12/16 encoding could under-allocate. CONFIDENCE: MED (guest allocation flow plus an independent
+// implementation; no hardware trace).
 HLE(k_ampr_measure_write_address) {
     ampr_arglog("4fgtGfXDrFc(MeasureWriteAddress)", a0, a1, a2, a3, a4, a5);
-    return (a1 >> 34) == 0 ? (a1 >= 4 ? 12 : 8) : 16;
+    return 32;
 }
 HLE(k_ampr_begin) {
     if (amprlog()) {
@@ -4250,9 +4252,9 @@ HLE(k_query_memory_protection) {
 // (PPSA17942, area:ue4) allocator pages remain no-op stubs because that title does not boot on
 // Windows yet. Pure size/offset queries below keep their platform-independent return contracts.
 HLE(k_ampr_ok) { return 0; }
-HLE(k_ampr_measure_write_equeue) { return 20; }
+HLE(k_ampr_measure_write_equeue) { return 32; }
 HLE(k_ampr_get_current_offset) { return 0; }
-HLE(k_ampr_measure_write_address) { return (a1 >> 34) == 0 ? (a1 >= 4 ? 12 : 8) : 16; }
+HLE(k_ampr_measure_write_address) { return 32; }
 
 // APR command-buffer WriteAddress (NID j0+3uJMxYJY) — the completion-notification write (#1149).
 // Windows sibling of the POSIX handler above (full contract documented there): write `value` (a2)
