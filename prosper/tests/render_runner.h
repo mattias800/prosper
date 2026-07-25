@@ -2072,7 +2072,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             // programmed clear expresses the guest's intended surface value even when this pass's
             // write path cannot apply it (#508 keeps this for ALWAYS/NEVER too). The write-path
             // gate below governs what the pass DOES (in-pass clears, validity, recency), not what
-            // a fresh image starts as.
+            // a fresh image starts as. Note this latch sits inside the depth-using block above, so
+            // a fully write-path-disabled clear draw (the #1287 inert shape) never reaches it —
+            // only a test-enabled clear can supply fresh-image contents.
             if (!got_depth_clear && d.ps->depth_clear_enable) {
                 depth_clear = d.ps->depth_clear_value;
                 got_depth_clear = true;
