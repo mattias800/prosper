@@ -2,6 +2,7 @@
 // libkernel stubs the engine needs during init. Cross-platform (chrono + pthread).
 #include "dispatch.hpp"
 #include "nid.hpp"
+#include "hle_kernel_time.hpp"
 #include "heap_mutex.hpp"   // #707: keep hot equeue/APR mutexes off macOS __DATA
 #include "sync_futex.hpp"
 #include <pthread.h>
@@ -44,6 +45,67 @@ namespace {
         return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - g_start).count();
     }
 
+    // The live GPU backend is synchronous today: the guest submitter performs shader realization,
+    // Vulkan execution, and readback before its HLE call returns. On hardware that work runs on the
+    // GPU after a cheap CPU submission. Without compensation, a one-off host pipeline/resource
+    // warmup is incorrectly exposed as a giant guest frame delta and can skip entire animations.
+    //
+    // During a host-GPU scope, monotonic time advances only through the caller-supplied display
+    // budget, then holds. At scope exit the excess is permanently removed from process-time/TSC.
+    // Ordinary guest execution and all realtime/RTC surfaces keep advancing from the host clocks.
+    // This is deliberately narrower than PROSPER_DET_CLOCK: time-gated media and wait loops can
+    // continue between flips, so a title cannot deadlock waiting to produce its next frame.
+    struct HostGpuClockState {
+        std::mutex writer_mutex;
+        std::atomic<uint64_t> sequence{0};
+        std::atomic<uint64_t> total_excess_ns{0};
+        std::atomic<uint64_t> active_start_ns{0};
+        std::atomic<uint64_t> active_budget_ns{0};
+        std::atomic<uint64_t> active_token{0};
+        uint64_t next_token = 1;
+        std::atomic<uint64_t> last_ns{0};
+    };
+    HostGpuClockState g_host_gpu_clock;
+
+    bool host_gpu_clock_enabled() {
+        static const bool enabled = getenv("PROSPER_NO_GPU_TIME_COMPENSATION") == nullptr;
+        return enabled;
+    }
+
+    uint64_t host_gpu_compensated_ns(uint64_t mono) {
+        // Process-time reads are hot and may come from many guest threads. Writers publish their
+        // handful of atomic fields under a seqlock, giving readers one consistent snapshot without
+        // serializing every clock query on the scope-management mutex.
+        uint64_t total_excess;
+        uint64_t active_start;
+        uint64_t active_budget;
+        uint64_t active_token;
+        for (;;) {
+            const uint64_t before = g_host_gpu_clock.sequence.load(std::memory_order_acquire);
+            if (before & 1) continue;
+            total_excess = g_host_gpu_clock.total_excess_ns.load(std::memory_order_relaxed);
+            active_start = g_host_gpu_clock.active_start_ns.load(std::memory_order_relaxed);
+            active_budget = g_host_gpu_clock.active_budget_ns.load(std::memory_order_relaxed);
+            active_token = g_host_gpu_clock.active_token.load(std::memory_order_relaxed);
+            const uint64_t after = g_host_gpu_clock.sequence.load(std::memory_order_acquire);
+            if (before == after) break;
+        }
+
+        uint64_t excess = total_excess;
+        if (active_token && mono > active_start) {
+            const uint64_t elapsed = mono - active_start;
+            if (elapsed > active_budget) {
+                const uint64_t active_excess = elapsed - active_budget;
+                excess = active_excess > UINT64_MAX - excess ? UINT64_MAX : excess + active_excess;
+            }
+        }
+        const uint64_t current = mono >= excess ? mono - excess : 0;
+        uint64_t last = g_host_gpu_clock.last_ns.load(std::memory_order_relaxed);
+        while (last < current && !g_host_gpu_clock.last_ns.compare_exchange_weak(
+                   last, current, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+        return std::max(last, current);
+    }
+
     // PROSPER_DET_CLOCK: derive the guest MONOTONIC clock from the flip count instead of host elapsed
     // time, so per-frame deltaTime is fixed regardless of host render cost. Wall-clock/RTC surfaces keep
     // using real_ns(): deterministic gameplay time must not freeze the calendar clock between flips.
@@ -73,7 +135,7 @@ namespace {
     uint64_t ns_now() {
         static const bool det = getenv("PROSPER_DET_CLOCK") != nullptr;
         uint64_t mono = real_ns();
-        if (!det) return mono;
+        if (!det) return host_gpu_compensated_ns(mono);
         uint64_t flip = prosper_vo_flip_count();
         std::lock_guard<std::mutex> lock(g_det_clock.mutex);
         if (!g_det_clock.anchored) {
@@ -113,6 +175,48 @@ namespace {
     // RTC epoch: SceRtcTick counts microseconds since 0001-01-01 00:00:00 UTC; the unix epoch is
     // 62135596800 s after it (the documented Orbis RTC convention, also shadPS4 UNIX_EPOCH_TICKS).
     constexpr uint64_t kRtcUnixEpochOffsetUs = 62135596800ull * 1000000ull;
+}
+
+uint64_t guest_clock_host_gpu_begin(uint64_t budget_ns) {
+    if (!host_gpu_clock_enabled()) return 0;
+    std::lock_guard<std::mutex> lock(g_host_gpu_clock.writer_mutex);
+    // AGC submissions are serialized, so overlap indicates a future caller violated the scope
+    // contract. Fail open rather than letting an inner end truncate or double-count the outer wait.
+    if (g_host_gpu_clock.active_token.load(std::memory_order_relaxed)) return 0;
+    // Make the snapshot unavailable before sampling: if this writer is preempted, readers must not
+    // advance against the old state and then have that already-observed interval discounted.
+    g_host_gpu_clock.sequence.fetch_add(1, std::memory_order_acq_rel);
+    const uint64_t mono = real_ns();
+    uint64_t token = g_host_gpu_clock.next_token++;
+    if (!token) token = g_host_gpu_clock.next_token++;
+    g_host_gpu_clock.active_start_ns.store(mono, std::memory_order_relaxed);
+    g_host_gpu_clock.active_budget_ns.store(budget_ns, std::memory_order_relaxed);
+    g_host_gpu_clock.active_token.store(token, std::memory_order_relaxed);
+    g_host_gpu_clock.sequence.fetch_add(1, std::memory_order_release);
+    return token;
+}
+
+void guest_clock_host_gpu_end(uint64_t token) {
+    if (!token) return;
+    std::lock_guard<std::mutex> lock(g_host_gpu_clock.writer_mutex);
+    if (g_host_gpu_clock.active_token.load(std::memory_order_relaxed) != token) return;
+    // Block reader snapshots across the active-to-inactive boundary, then sample as late as possible
+    // so a writer preemption cannot expose a stale end time as a completed transition.
+    g_host_gpu_clock.sequence.fetch_add(1, std::memory_order_acq_rel);
+    const uint64_t active_start = g_host_gpu_clock.active_start_ns.load(std::memory_order_relaxed);
+    const uint64_t active_budget = g_host_gpu_clock.active_budget_ns.load(std::memory_order_relaxed);
+    uint64_t total_excess = g_host_gpu_clock.total_excess_ns.load(std::memory_order_relaxed);
+    const uint64_t mono = real_ns();
+    const uint64_t elapsed = mono > active_start ? mono - active_start : 0;
+    if (elapsed > active_budget) {
+        const uint64_t excess = elapsed - active_budget;
+        total_excess = excess > UINT64_MAX - total_excess ? UINT64_MAX : total_excess + excess;
+    }
+    g_host_gpu_clock.total_excess_ns.store(total_excess, std::memory_order_relaxed);
+    g_host_gpu_clock.active_start_ns.store(0, std::memory_order_relaxed);
+    g_host_gpu_clock.active_budget_ns.store(0, std::memory_order_relaxed);
+    g_host_gpu_clock.active_token.store(0, std::memory_order_relaxed);
+    g_host_gpu_clock.sequence.fetch_add(1, std::memory_order_release);
 }
 
 // --- time / clock (return real, advancing time so wait-for-time loops progress) ---

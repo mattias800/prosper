@@ -167,6 +167,18 @@ For native Windows, configure MinGW with `-DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=
 
 The complete manual PowerShell recipe is in `WINDOWS_PORT_HANDOFF.md`.
 
+### Guest time during synchronous GPU work
+
+Prosper currently realizes and executes an AGC submit synchronously on the guest submitter. The
+guest monotonic clock discounts host GPU time beyond the refresh interval represented by that
+submit's completed VideoOut flips. This keeps shader compilation, resource conversion, execution,
+and readback stalls from becoming multi-second frame deltas that skip time-based guest states. Wall
+clock/RTC surfaces remain tied to host time, and monotonic time continues normally outside the
+backend scope, including while media or wait loops prepare the next frame. This is intentionally
+narrower than the opt-in `PROSPER_DET_CLOCK`, which holds monotonic time between every pair of flips.
+
+Set `PROSPER_NO_GPU_TIME_COMPENSATION=1` only for a diagnostic A/B against the old behavior.
+
 ### Live renderer performance diagnostics
 
 Set `PROSPER_RENDER_TIMING=1` before launching to print aggregate timings every 25 operations:
