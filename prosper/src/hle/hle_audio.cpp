@@ -1790,6 +1790,11 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
             const bool log = getenv("PROSPER_AUDIOLOG") != nullptr;
             for (size_t k = ji; k < je; ++k) {
                 AjmDecJob& job = jobs[k];
+                if (!instance.host_dec->valid()) {
+                    ajm2_write_result(job.result_addr, kAjm2ErrDecode, 0, 0,
+                                      instance.decoded_samples);
+                    continue;
+                }
                 std::vector<uint8_t> input(job.in_size);
                 const size_t got = audio_read_bytes_partial(job.in_addr, input.data(), input.size());
                 std::vector<int16_t> pcm(job.out_size / sizeof(int16_t));
@@ -1807,10 +1812,16 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                     decoded.produced_bytes <= job.out_size &&
                     decoded.produced_bytes <= pcm.size() * sizeof(int16_t) &&
                     pcm_shape_valid;
+                // A failed result publishes zero consumption. The backend may already have
+                // advanced parser/codec state, so it must become terminal before the guest retries
+                // the same compressed prefix. This also covers a malformed backend result rejected
+                // by the guest-facing validation above.
+                if (!valid) instance.host_dec->invalidate();
                 int32_t err = valid ? 0 : kAjm2ErrDecode;
                 uint32_t consumed = valid ? decoded.consumed_bytes : 0;
                 uint32_t produced = valid ? decoded.produced_bytes : 0;
                 if (produced && !audio_store_bytes(job.out_addr, pcm.data(), produced)) {
+                    instance.host_dec->invalidate();
                     err = kAjm2ErrDecode;
                     consumed = produced = 0;
                 }
@@ -1818,7 +1829,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                     std::span<const uint8_t>(input.data(), consumed), pcm.data(), produced);
                 if (!err && produced) instance.decoded_samples += produced / frame_bytes;
                 ajm2_write_result(job.result_addr, err, consumed, produced,
-                                  instance.decoded_samples, decoded.decoded_frames);
+                                  instance.decoded_samples, err ? 0 : decoded.decoded_frames);
                 if (log)
                     fprintf(stderr, "[ajm2] t=%llums decode inst=%u codec=%u in=%zu/%u "
                             "out=%u -> %u consumed, %u PCM, %uch/%uHz total=%llu%s\n",
