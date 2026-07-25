@@ -240,6 +240,47 @@ int main() {
                still_closed.scissor_bottom <= still_closed.scissor_top),
               "a genuine VPORT close stays closed — the screen recovery must not unmask it");
 
+        // #1349: PA_SU_POLY_OFFSET_* -> Vulkan depth bias (radv inverse: constant=asfloat(OFFSET),
+        // slope=asfloat(SCALE)/16, clamp=asfloat(CLAMP)); enable from PA_SU_SC_MODE_CNTL bit 11/12.
+        GpuState biased = st;
+        biased.cx[P::PA_SU_SC_MODE_CNTL] = st.cx.count(P::PA_SU_SC_MODE_CNTL)
+            ? st.cx[P::PA_SU_SC_MODE_CNTL] | (1u << 11) : (1u << 11);
+        auto fbits = [](float value) { uint32_t bits; memcpy(&bits, &value, sizeof bits); return bits; };
+        biased.cx[P::PA_SU_POLY_OFFSET_FRONT_SCALE]  = fbits(32.0f);   // slope 32/16 = 2.0
+        biased.cx[P::PA_SU_POLY_OFFSET_FRONT_OFFSET] = fbits(4.0f);
+        biased.cx[P::PA_SU_POLY_OFFSET_CLAMP]        = fbits(0.5f);
+        const ResolvedPipelineState with_bias =
+            resolve_pipeline_state(extract_render_state(biased));
+        CHECK(with_bias.depth_bias_enable == 1u && with_bias.depth_bias_constant == 4.0f &&
+              with_bias.depth_bias_slope == 2.0f && with_bias.depth_bias_clamp == 0.5f,
+              "POLY_OFFSET front block resolves to Vulkan depth bias (constant/slope/16/clamp)");
+        const ResolvedPipelineState no_bias = resolve_pipeline_state(extract_render_state(st));
+        CHECK(no_bias.depth_bias_enable == 0u && no_bias.depth_bias_constant == 0.0f,
+              "no POLY_OFFSET enable bit resolves to bias disabled");
+        GpuState poisoned = biased;
+        poisoned.cx[P::PA_SU_POLY_OFFSET_FRONT_SCALE] = 0x7fc00000u;   // NaN bit pattern
+        const ResolvedPipelineState nan_bias =
+            resolve_pipeline_state(extract_render_state(poisoned));
+        CHECK(nan_bias.depth_bias_enable == 0u,
+              "a non-finite POLY_OFFSET register disables the bias instead of poisoning it");
+        // #1351: huge-but-finite float-decoded garbage (documented stale cx-arena phenomenon on
+        // this title family, #1264/#1335) must not become an absurd bias — bound at 2^24.
+        GpuState huge = biased;
+        huge.cx[P::PA_SU_POLY_OFFSET_FRONT_OFFSET] = fbits(1e30f);
+        const ResolvedPipelineState huge_bias =
+            resolve_pipeline_state(extract_render_state(huge));
+        CHECK(huge_bias.depth_bias_enable == 0u && huge_bias.depth_bias_constant == 0.0f,
+              "an implausibly large POLY_OFFSET value (>2^24) disables the bias");
+        // The float depth config (0x1E9) must keep the bias enabled — the DB_FMT_CNTL check is
+        // fail-visible logging only, never a behavior gate for the exercised configuration.
+        GpuState float_cfg = biased;
+        float_cfg.cx[P::PA_SU_POLY_OFFSET_DB_FMT_CNTL] = 0x1E9u;
+        const ResolvedPipelineState float_cfg_bias =
+            resolve_pipeline_state(extract_render_state(float_cfg));
+        CHECK(float_cfg_bias.depth_bias_enable == 1u &&
+              float_cfg_bias.depth_bias_constant == 4.0f,
+              "the float DB_FMT_CNTL configuration (0x1E9) keeps the decoded bias intact");
+
         RenderState empty{}; empty.has_scissor = true;
         empty.scissor_left = 10; empty.scissor_top = 20;
         empty.scissor_right = 5; empty.scissor_bottom = 15;
@@ -393,6 +434,31 @@ int main() {
           rs.db_depth_size_xy == 0x01230234u && rs.db_z_info == 0x55u &&
           rs.db_stencil_info == 0x66u && rs.db_htile_surface == 0x99u,
           "depth view, HTILE, format, and extent programming is retained");
+
+    // #1353: GFX10 read/write DB bases describe one surface; a LONE zero half is a stale
+    // Gen5 indirect-arena slot (observed live as (DB_Z_WRITE_BASE, 0) folded AFTER the real
+    // pair write in the same array) and recovers from its partner. Pair-zero (a genuine
+    // unbind) and divergent nonzero pairs (asserted verbatim above) are untouched.
+    {
+        GpuState lone;
+        lone.cx[P::DB_Z_READ_BASE] = 0x21135e00u;
+        lone.cx[P::DB_Z_WRITE_BASE] = 0u;
+        lone.cx[P::DB_STENCIL_WRITE_BASE] = 0x21136000u;
+        const RenderState rec = extract_render_state(lone);
+        CHECK(rec.depth_write_base == rec.depth_read_base &&
+              rec.depth_read_base == rdna2_addr(0x21135e00u, 0u),
+              "a lone-zero DB_Z_WRITE_BASE recovers from the read base (#1353)");
+        CHECK(rec.stencil_read_base == rec.stencil_write_base &&
+              rec.stencil_write_base == rdna2_addr(0x21136000u, 0u),
+              "a lone-zero DB_STENCIL_READ_BASE recovers from the write base");
+
+        GpuState unbound;
+        unbound.cx[P::DB_DEPTH_CONTROL] = 0x46u;
+        const RenderState none = extract_render_state(unbound);
+        CHECK(none.depth_read_base == 0 && none.depth_write_base == 0 &&
+              none.stencil_read_base == 0 && none.stencil_write_base == 0,
+              "pair-zero (unbound) DB bases stay zero — no invented identity");
+    }
 
     // #371: depth clear value. The sample stream programs no DB_DEPTH_CLEAR, so resolve defaults it by
     // the compare op — 0.0 for GREATER (this stream), 1.0 for LESS — never a fixed 0.5. A programmed

@@ -225,7 +225,8 @@ Version-4+ capsules also print and restore temporal RTT seeds: exact host-render
 captured submit whose producer ran in an earlier submit. This keeps replay from silently substituting stale
 guest-memory bytes for renderer-owned history; older capsules remain readable and report zero seeds.
 The draw header also reports raster state as `raster=cull/front-face/polygon-mode`, using Vulkan enum
-values. `PROSPER_NO_CULL=1` disables culling; `PROSPER_FLIP_FRONT_FACE=1` preserves the cull mode and
+values, and the resolved depth bias as `bias=enable/constant/slope/clamp` (all zero for pre-v29
+captures, which did not retain bias state). `PROSPER_NO_CULL=1` disables culling; `PROSPER_FLIP_FRONT_FACE=1` preserves the cull mode and
 toggles only the resolved winding convention. The latter is useful for isolating `PA_SU_SC_MODE_CNTL`
 translation without the overdraw introduced by disabling culling entirely.
 `PROSPER_EXECLOG=1` includes command order, target extent, depth/stencil identity, compare/write state, and clear

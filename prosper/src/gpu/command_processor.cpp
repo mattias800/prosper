@@ -1690,6 +1690,13 @@ void GpuState::apply(const Pm4Command& c) {
             // register window, with the packet's provenance, so the corrupt producer is identifiable.
             static const bool regbloat = getenv("PROSPER_REGBLOAT") != nullptr;
             uint32_t bad = 0, first_bad = 0;
+            // #1364: within-array clobber detector — a DB base offset written nonzero and then
+            // ZERO by a LATER slot of the SAME array is the stale-slot signature (#1353's
+            // (DB_Z_WRITE_BASE, 0)). Dump the whole array for the first few occurrences so the
+            // arena's real record format is decodable offline. Bits 0..3 = LO 0x12..0x15,
+            // bits 4..7 = HI 0x1A..0x1D. Gated with the trace.
+            uint32_t dbbase_nonzero_mask = 0;
+            bool dbbase_clobbered = false;
             for (uint32_t i = 0; i < c.num_regs; i++) {
                 // Hardware drops writes to nonexistent register offsets; mirror that instead of
                 // folding placeholder/stale array slots into the register file (see kRegOffsetLimit).
@@ -1704,6 +1711,24 @@ void GpuState::apply(const Pm4Command& c) {
                     continue;
                 }
                 file[regs[i].offset] = regs[i].value;
+                // PROSPER_DBBASETRACE (#1353): log every cx write to the DB Z/STENCIL base
+                // registers (LO 0x12..0x15, HI 0x1A..0x1D) with its source path, to attribute
+                // which packet family programs (or clobbers) a base half — this trace found the
+                // stale arena slot writing (DB_Z_WRITE_BASE, 0) after the real pair write.
+                static const bool dbbase_trace = getenv("PROSPER_DBBASETRACE") != nullptr;
+                if (dbbase_trace && c.reg_class == RegClass::Cx &&
+                    ((regs[i].offset >= 0x12u && regs[i].offset <= 0x15u) ||
+                     (regs[i].offset >= 0x1Au && regs[i].offset <= 0x1Du))) {
+                    static std::atomic<int> n{0};
+                    if (n.fetch_add(1) < 400000)
+                        fprintf(stderr, "[dbbase] indirect off=0x%x val=0x%x order=%llu\n",
+                                regs[i].offset, regs[i].value,
+                                (unsigned long long)command_order);
+                    const uint32_t bit = regs[i].offset <= 0x15u
+                        ? (regs[i].offset - 0x12u) : (4u + regs[i].offset - 0x1Au);
+                    if (regs[i].value != 0u) dbbase_nonzero_mask |= 1u << bit;
+                    else if (dbbase_nonzero_mask & (1u << bit)) dbbase_clobbered = true;
+                }
                 if (c.reg_class == RegClass::Cx &&
                     regs[i].offset == prosper::agc::Pm4::DB_RENDER_CONTROL &&
                     (regs[i].value & 0x3u) &&
@@ -1712,6 +1737,19 @@ void GpuState::apply(const Pm4Command& c) {
                             "[ds-clear-reg] order=%llu value=%08x depth=%u stencil=%u\n",
                             (unsigned long long)command_order, regs[i].value,
                             regs[i].value & 1u, (regs[i].value >> 1) & 1u);
+            }
+            if (dbbase_clobbered) {
+                static std::atomic<int> dumps{0};
+                const int seq = dumps.fetch_add(1);
+                if (seq < 6) {
+                    fprintf(stderr,
+                            "[dbbase-clobber] seq=%d order=%llu vaddr=0x%llx num=%u full array:",
+                            seq, (unsigned long long)command_order,
+                            (unsigned long long)c.regs_vaddr, c.num_regs);
+                    for (uint32_t k = 0; k < c.num_regs && k < 512; k++)
+                        fprintf(stderr, " %x:%x", regs[k].offset, regs[k].value);
+                    fprintf(stderr, "\n");
+                }
             }
             if (regbloat) {
                 if (bad) {
@@ -1780,6 +1818,21 @@ void GpuState::apply(const Pm4Command& c) {
             }
             for (uint32_t k = 0; k < c.reg_count && c.reg_offset + k < kRegOffsetLimit; k++)
                 file[c.reg_offset + k] = c.reg_data[k];
+            // PROSPER_DBBASETRACE (#1353): direct-span sibling of the indirect-path trace above.
+            {
+                static const bool dbbase_trace = getenv("PROSPER_DBBASETRACE") != nullptr;
+                if (dbbase_trace && c.reg_class == RegClass::Cx && c.reg_offset <= 0x1Du &&
+                    c.reg_offset + c.reg_count > 0x12u) {
+                    static std::atomic<int> n{0};
+                    if (n.fetch_add(1) < 400000) {
+                        fprintf(stderr, "[dbbase] direct off=0x%x count=%u order=%llu vals:",
+                                c.reg_offset, c.reg_count, (unsigned long long)command_order);
+                        for (uint32_t k = 0; k < c.reg_count && k < 16; k++)
+                            fprintf(stderr, " 0x%x", c.reg_data[k]);
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
             state_dirty_ = true;
             break;
         }

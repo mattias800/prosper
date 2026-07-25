@@ -473,6 +473,12 @@ int main() {
         off_target_clear.color_write_mask = 0;
         off_target_clear.stencil_clear_enable = true;
         off_target_clear.stencil_clear_value = 0;
+        // #1361: keep this an EFFECTIVE clear shape (enable + write mask). With the #1355
+        // write-path gate, a bare clear bit is inert and this check would pass vacuously without
+        // exercising the off-target scissor clamp it was written for (#531).
+        off_target_clear.stencil_enable = true;
+        off_target_clear.stencil_compare_op[0] = off_target_clear.stencil_compare_op[1] = 7;
+        off_target_clear.stencil_write_mask[0] = off_target_clear.stencil_write_mask[1] = 0xff;
         off_target_clear.has_scissor = true;
         off_target_clear.scissor_left = 100; off_target_clear.scissor_top = 100;
         off_target_clear.scissor_right = 120; off_target_clear.scissor_bottom = 120;
@@ -682,6 +688,115 @@ int main() {
             prosper::test::render_draws_rgba({s}, W, H, nullptr, nullptr, true);
         const uint8_t* sc = center(strict);
         CHECK(sc && sc[1] < 0x80, "standard-Z EQUAL remains exact");
+    }
+
+    // #1351: the backend must APPLY the resolved depth bias, not merely decode it. Precedent for
+    // requiring execution coverage: #456's cull/front-face landed decode-only and its reversed
+    // VkFrontFace survived until #534. Contract under test: a LESS draw at exactly the stored
+    // depth is rejected without bias, and a negative constant bias (Vulkan adds
+    // constant * 2^(e-23) on D32F) nudges its fragments nearer so the same draw passes.
+    {
+        std::vector<uint32_t> z_vs = ref_vs_with_depth(vs, 0x3f000000u); // 0.5f
+        CHECK(!z_vs.empty(), "bias test fullscreen VS at z=0.5 available");
+
+        ResolvedPipelineState bias_writer = opaque;
+        bias_writer.color_write_mask = 0;
+        bias_writer.depth_test_enable = true;
+        bias_writer.depth_write_enable = true;
+        bias_writer.depth_compare_op = 7; // ALWAYS
+        bias_writer.depth_read_base = bias_writer.depth_write_base = 0x77660000;
+
+        ResolvedPipelineState less_reader = opaque;
+        less_reader.depth_test_enable = true;
+        less_reader.depth_compare_op = 1; // LESS
+        less_reader.depth_read_base = less_reader.depth_write_base = 0x77660000;
+
+        prosper::test::BackendDraw bw; bw.vs = z_vs; bw.fs = red; bw.ps = &bias_writer; bw.vcount = 3;
+        prosper::test::BackendDraw br; br.vs = z_vs; br.fs = green; br.ps = &less_reader; br.vcount = 3;
+        (void)prosper::test::render_draws_rgba({bw}, W, H, nullptr, nullptr, true);
+        std::vector<uint8_t> unbiased =
+            prosper::test::render_draws_rgba({br}, W, H, nullptr, nullptr, true);
+        const uint8_t* uc = center(unbiased);
+        CHECK(uc && uc[1] < 0x80, "LESS at exactly the stored depth is rejected without bias");
+
+        ResolvedPipelineState biased_reader = less_reader;
+        biased_reader.depth_bias_enable = 1u;
+        biased_reader.depth_bias_constant = -64.0f;   // ~-3.8e-6 at e(0.5) on D32F — decisive, tiny
+        biased_reader.depth_bias_slope = 0.0f;
+        biased_reader.depth_bias_clamp = 0.0f;
+        prosper::test::BackendDraw bb = br; bb.ps = &biased_reader;
+        std::vector<uint8_t> biased =
+            prosper::test::render_draws_rgba({bb}, W, H, nullptr, nullptr, true);
+        const uint8_t* bc = center(biased);
+        CHECK(bc && bc[1] > 0xC0 && bc[0] < 0x40,
+              "a negative constant depth bias flips the same LESS draw to passing (#1351)");
+    }
+
+    // #1355: STENCIL_CLEAR_ENABLE is the stencil twin of the #1352 depth rule — the bit
+    // substitutes the VALUE of stencil writes and only acts through the enabled stencil write
+    // path. A writes-disabled clear rect between a stencil writer and an EQUAL reader must not
+    // destroy the written plane.
+    {
+        CHECK(!prosper::test::stencil_clear_effective(true, false, 0xff, 0xff),
+              "a stencil clear with STENCIL_ENABLE off is inert (#1355)");
+        CHECK(!prosper::test::stencil_clear_effective(true, true, 0, 0),
+              "a stencil clear with a zero write mask is inert");
+        CHECK(prosper::test::stencil_clear_effective(true, true, 0xff, 0),
+              "a real stencil clear shape (enable + mask) stays effective");
+
+        ResolvedPipelineState swriter = opaque;
+        swriter.color_write_mask = 0;
+        swriter.stencil_enable = true;
+        swriter.stencil_compare_op[0] = swriter.stencil_compare_op[1] = 7; // ALWAYS
+        swriter.stencil_pass_op[0] = swriter.stencil_pass_op[1] = 2;       // REPLACE
+        swriter.stencil_op_val[0] = swriter.stencil_op_val[1] = 2;
+        swriter.stencil_write_mask[0] = swriter.stencil_write_mask[1] = 0xff;
+        swriter.stencil_read_base = swriter.stencil_write_base = 0x88770000;
+
+        ResolvedPipelineState inert_sclear{};
+        inert_sclear.topology = 3; inert_sclear.color_write_mask = 0;
+        inert_sclear.stencil_clear_enable = true;
+        inert_sclear.stencil_clear_value = 7;
+        inert_sclear.stencil_enable = false;   // write path fully disabled
+        inert_sclear.stencil_read_base = inert_sclear.stencil_write_base = 0x88770000;
+
+        ResolvedPipelineState sreader = opaque;
+        sreader.stencil_enable = true;
+        sreader.stencil_compare_op[0] = sreader.stencil_compare_op[1] = 2; // EQUAL
+        sreader.stencil_ref[0] = sreader.stencil_ref[1] = 2;
+        sreader.stencil_compare_mask[0] = sreader.stencil_compare_mask[1] = 0xff;
+        sreader.stencil_write_mask[0] = sreader.stencil_write_mask[1] = 0;
+        sreader.stencil_read_base = sreader.stencil_write_base = 0x88770000;
+
+        prosper::test::BackendDraw sw; sw.vs = vs; sw.fs = red; sw.ps = &swriter; sw.vcount = 3;
+        prosper::test::BackendDraw scl; scl.vs = vs; scl.fs = red; scl.ps = &inert_sclear; scl.vcount = 3;
+        prosper::test::BackendDraw sr; sr.vs = vs; sr.fs = green; sr.ps = &sreader; sr.vcount = 3;
+        (void)prosper::test::render_draws_rgba({sw}, W, H, nullptr, nullptr, true);
+        (void)prosper::test::render_draws_rgba({scl}, W, H, nullptr, nullptr, true);
+        std::vector<uint8_t> preserved =
+            prosper::test::render_draws_rgba({sr}, W, H, nullptr, nullptr, true);
+        const uint8_t* pc = center(preserved);
+        CHECK(pc && pc[1] > 0xC0 && pc[0] < 0x40,
+              "EQUAL reader still sees the written stencil after an inert clear rect (#1355)");
+
+        // #1361: an inert clear against a NEVER-written identity must not phantom-initialize the
+        // plane to its clear value. A partial gate (clear-site only) would let the forced stencil
+        // pass create the image, seed it from the latched clear value, and mark it valid — a later
+        // EQUAL-7 reader would then wrongly pass. With the full gate the reader's fresh plane
+        // defaults to 0 and EQUAL-7 rejects everywhere.
+        ResolvedPipelineState inert_fresh = inert_sclear;
+        inert_fresh.stencil_read_base = inert_fresh.stencil_write_base = 0x88780000;
+        ResolvedPipelineState seven_reader = sreader;
+        seven_reader.stencil_ref[0] = seven_reader.stencil_ref[1] = 7;
+        seven_reader.stencil_read_base = seven_reader.stencil_write_base = 0x88780000;
+        prosper::test::BackendDraw fcl; fcl.vs = vs; fcl.fs = red; fcl.ps = &inert_fresh; fcl.vcount = 3;
+        prosper::test::BackendDraw fr7; fr7.vs = vs; fr7.fs = green; fr7.ps = &seven_reader; fr7.vcount = 3;
+        (void)prosper::test::render_draws_rgba({fcl}, W, H, nullptr, nullptr, true);
+        std::vector<uint8_t> untouched =
+            prosper::test::render_draws_rgba({fr7}, W, H, nullptr, nullptr, true);
+        const uint8_t* uc7 = center(untouched);
+        CHECK(uc7 && uc7[1] < 0x80,
+              "an inert clear cannot phantom-initialize a never-written plane (#1361)");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

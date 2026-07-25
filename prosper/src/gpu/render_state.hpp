@@ -144,6 +144,15 @@ struct RenderState {
     // decodes to CULL_NONE + CCW-front + FILL — exactly the prior hardcoded default, so nothing changes
     // for a guest that never programs it. Decoded in resolve to Vk enums (#456).
     uint32_t pa_su_sc_mode_cntl = 0;
+    // Polygon-offset (depth bias) raw registers (#1349). Float bit patterns, the radv convention:
+    // Vulkan depthBiasConstantFactor = asfloat(OFFSET), SlopeFactor = asfloat(SCALE)/16,
+    // Clamp = asfloat(CLAMP). Absent registers stay 0 (bias disabled resolves harmlessly).
+    uint32_t pa_su_poly_offset_front_scale  = 0;
+    uint32_t pa_su_poly_offset_front_offset = 0;
+    uint32_t pa_su_poly_offset_back_scale   = 0;
+    uint32_t pa_su_poly_offset_back_offset  = 0;
+    uint32_t pa_su_poly_offset_clamp        = 0;
+    uint32_t pa_su_poly_offset_db_fmt_cntl  = 0;
 
     // Viewport 0 transform (PA_CL_VPORT_{X,Y,Z}{SCALE,OFFSET} — IEEE-754 floats stored in the context
     // registers; 0 when the guest never set them). Hardware applies screen = offset + scale * ndc, with
@@ -251,6 +260,13 @@ struct ResolvedPipelineState {
     uint32_t cull_mode    = 0;   // VK_CULL_MODE_NONE
     uint32_t front_face   = 0;   // VK_FRONT_FACE_COUNTER_CLOCKWISE / guest FACE=0
     uint32_t polygon_mode = 0;   // VK_POLYGON_MODE_FILL
+    // Depth bias from PA_SU_POLY_OFFSET_* (#1349): shadow-map passes rely on it against acne.
+    // Values are ready for VkPipelineRasterizationStateCreateInfo; enable is FRONT|BACK from
+    // PA_SU_SC_MODE_CNTL (Vulkan has one bias for both faces; titles program them identically).
+    uint32_t depth_bias_enable   = 0;
+    float    depth_bias_constant = 0.0f;
+    float    depth_bias_slope    = 0.0f;
+    float    depth_bias_clamp    = 0.0f;
 
     // Optional second color attachment. These fields are appended so capture versions through v9
     // retain their exact serialized prefix and materialize with MRT1 disabled.

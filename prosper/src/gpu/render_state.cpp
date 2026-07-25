@@ -201,6 +201,27 @@ RenderState extract_render_state(const GpuState& st) {
     rs.depth_write_base = addr_of(rd(st.cx, P::DB_Z_WRITE_BASE), rd(st.cx, P::DB_Z_WRITE_BASE_HI));
     rs.stencil_read_base = addr_of(rd(st.cx, P::DB_STENCIL_READ_BASE), rd(st.cx, P::DB_STENCIL_READ_BASE_HI));
     rs.stencil_write_base = addr_of(rd(st.cx, P::DB_STENCIL_WRITE_BASE), rd(st.cx, P::DB_STENCIL_WRITE_BASE_HI));
+    // #1353: on GFX10 the READ and WRITE base registers describe ONE surface — drivers program
+    // both from a single address (the split is a pre-GFX10 TC-compat remnant), so a lone zero on
+    // either side is never a coherent state. Blue Prince's Gen5 indirect register arenas carry
+    // stale slots that parse as (DB_Z_WRITE_BASE, 0) AFTER the real pair write in the SAME array
+    // (PROSPER_DBBASETRACE capture on the issue; the #1335 screen-scissor fold is the same
+    // family), leaving every shadow-caster pass with (read=P, write=0) and splitting the
+    // persistent-DS identity. Recover the clobbered half from its partner and log fail-visibly;
+    // a genuine unbind writes both halves 0 and is untouched. Divergent NONZERO pairs are kept
+    // as-is (not observed; hardware would not produce them either).
+    const auto recover_pair = [](uint64_t& a, uint64_t& b, const char* which) {
+        if (a == b || (a && b)) return;
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 8)
+            fprintf(stderr,
+                    "[render_state] lone-zero DB %s base recovered from partner "
+                    "(read=0x%llx write=0x%llx, #1353 stale arena slot)\n",
+                    which, (unsigned long long)a, (unsigned long long)b);
+        if (!a) a = b; else b = a;
+    };
+    recover_pair(rs.depth_read_base, rs.depth_write_base, "Z");
+    recover_pair(rs.stencil_read_base, rs.stencil_write_base, "STENCIL");
     rs.db_depth_view = rd(st.cx, P::DB_DEPTH_VIEW);
     rs.db_render_override = rd(st.cx, P::DB_RENDER_OVERRIDE);
     rs.db_render_override2 = rd(st.cx, P::DB_RENDER_OVERRIDE2);
@@ -249,6 +270,12 @@ RenderState extract_render_state(const GpuState& st) {
     rs.db_depth_control  = dc;
     // Rasterizer cull/front-face/polygon mode (#456). Absent -> 0 -> CULL_NONE/CCW/FILL (prior default).
     rs.pa_su_sc_mode_cntl = rd(st.cx, P::PA_SU_SC_MODE_CNTL);
+    rs.pa_su_poly_offset_front_scale  = rd(st.cx, P::PA_SU_POLY_OFFSET_FRONT_SCALE);
+    rs.pa_su_poly_offset_front_offset = rd(st.cx, P::PA_SU_POLY_OFFSET_FRONT_OFFSET);
+    rs.pa_su_poly_offset_back_scale   = rd(st.cx, P::PA_SU_POLY_OFFSET_BACK_SCALE);
+    rs.pa_su_poly_offset_back_offset  = rd(st.cx, P::PA_SU_POLY_OFFSET_BACK_OFFSET);
+    rs.pa_su_poly_offset_clamp        = rd(st.cx, P::PA_SU_POLY_OFFSET_CLAMP);
+    rs.pa_su_poly_offset_db_fmt_cntl  = rd(st.cx, P::PA_SU_POLY_OFFSET_DB_FMT_CNTL);
     // Stencil op + ref/mask registers (absent -> 0; stencil_enable already gates whether they apply).
     rs.db_stencil_control   = st.cx.count(P::DB_STENCIL_CONTROL)   ? rd(st.cx, P::DB_STENCIL_CONTROL)   : 0u;
     rs.db_stencilrefmask    = st.cx.count(P::DB_STENCILREFMASK)    ? rd(st.cx, P::DB_STENCILREFMASK)    : 0u;
@@ -433,9 +460,12 @@ RenderState extract_render_state(const GpuState& st) {
         // rectangle is empty — Blue Prince resolves 699 of ~2,400 Day One draws to [0,0)x[0,0).
         if (right <= left || bottom <= top) {
             static const bool scissor_log = getenv("PROSPER_SCISSORLOG") != nullptr;
-            static int logged = 0;
-            if (scissor_log && logged < 24) {
-                ++logged;
+            // Atomic like the #1335 recovery log above: extract_render_state runs from
+            // DrawRealizationPool workers, so a plain int here was a formal data race (#1345).
+            static std::atomic<int> logged{0};
+            if (scissor_log && logged.fetch_add(1) < 24) {
+                // screen= is the EFFECTIVE pair — the #1335 degenerate-pair recovery above may
+                // have substituted the full default; the recovery's own log prints the raw pair.
                 fprintf(stderr,
                         "[scissor] EMPTY combined=[%d,%d)-[%d,%d) screen=%08x/%08x window=%08x/%08x "
                         "generic=%08x/%08x vport=%08x/%08x offset=%08x mode=%08x\n",
@@ -688,6 +718,62 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     ps.cull_mode  = (PM4_FIELD(su, PA_SU_SC_MODE_CNTL, CULL_FRONT) ? 1u : 0u)
                   | (PM4_FIELD(su, PA_SU_SC_MODE_CNTL, CULL_BACK)  ? 2u : 0u);
     ps.front_face = PM4_FIELD(su, PA_SU_SC_MODE_CNTL, FACE);
+    // Depth bias (#1349): PA_SU_POLY_OFFSET_* hold float BIT PATTERNS; Vulkan's mapping is the
+    // radv inverse (radv programs FRONT_OFFSET = fui(constantFactor), FRONT_SCALE =
+    // fui(slopeFactor * 16), CLAMP = fui(clamp)). Blue Prince programs the D32F configuration
+    // (DB_FMT_CNTL NEG_NUM_DB_BITS=-23 + FLOAT_FMT) during its shadow passes; without the bias
+    // those maps self-shadow into broad acne bands. Vulkan has a single bias for both faces —
+    // prefer the FRONT block when FRONT_ENABLE is set, else the BACK block. CONFIDENCE: MED for
+    // titles that program asymmetric front/back offsets (none observed).
+    const bool bias_front = PM4_FIELD(su, PA_SU_SC_MODE_CNTL, POLY_OFFSET_FRONT_ENABLE) != 0u;
+    const bool bias_back  = PM4_FIELD(su, PA_SU_SC_MODE_CNTL, POLY_OFFSET_BACK_ENABLE) != 0u;
+    ps.depth_bias_enable = (bias_front || bias_back) ? 1u : 0u;
+    if (ps.depth_bias_enable) {
+        const auto as_float = [](uint32_t bits) {
+            float value; std::memcpy(&value, &bits, sizeof value); return value;
+        };
+        const uint32_t scale  = bias_front ? rs.pa_su_poly_offset_front_scale
+                                           : rs.pa_su_poly_offset_back_scale;
+        const uint32_t offset = bias_front ? rs.pa_su_poly_offset_front_offset
+                                           : rs.pa_su_poly_offset_back_offset;
+        ps.depth_bias_constant = as_float(offset);
+        ps.depth_bias_slope    = as_float(scale) / 16.0f;
+        ps.depth_bias_clamp    = as_float(rs.pa_su_poly_offset_clamp);
+        // The unscaled-constant inverse above is exact only for the float depth configuration:
+        // prosper hosts depth exclusively as D32F, so the host driver always programs the float
+        // DB_FMT_CNTL, and the guest must agree (NEG_NUM_DB_BITS=-23 + FLOAT_FMT = 0x1E9 — the
+        // value Blue Prince programs). A UNORM-style guest config (D16/D24 units; constants
+        // conventionally in the hundreds) would silently misscale by orders of magnitude — warn
+        // once, fail-visibly, rather than guess a conversion (#1351).
+        if ((rs.pa_su_poly_offset_db_fmt_cntl & 0x1FFu) != 0x1E9u) {
+            static std::atomic<bool> warned_fmt{false};
+            if (!warned_fmt.exchange(true))
+                std::fprintf(stderr,
+                             "[render_state] depth bias enabled with non-float "
+                             "PA_SU_POLY_OFFSET_DB_FMT_CNTL=0x%08x (expected 0x1E9 config); "
+                             "constant may be misscaled\n",
+                             rs.pa_su_poly_offset_db_fmt_cntl);
+        }
+        // A non-finite register value would poison the pipeline; treat it as no bias. Huge-but-
+        // finite values are equally implausible as float-config bias factors and DO occur as
+        // float-decoded stale cx-arena garbage on this title family (#1264/#1335) — bound them
+        // out too. 2^24 passes every plausible legitimate value including unorm-convention
+        // constants while rejecting essentially all garbage bit patterns (#1351).
+        const auto bias_bad = [](float v) {
+            return !std::isfinite(v) || std::fabs(v) > 16777216.0f;
+        };
+        if (bias_bad(ps.depth_bias_constant) || bias_bad(ps.depth_bias_slope) ||
+            bias_bad(ps.depth_bias_clamp)) {
+            static std::atomic<bool> warned_mag{false};
+            if (!warned_mag.exchange(true))
+                std::fprintf(stderr,
+                             "[render_state] implausible depth-bias values "
+                             "(constant=%g slope=%g clamp=%g) — disabling bias for this draw\n",
+                             ps.depth_bias_constant, ps.depth_bias_slope, ps.depth_bias_clamp);
+            ps.depth_bias_enable = 0u;
+            ps.depth_bias_constant = ps.depth_bias_slope = ps.depth_bias_clamp = 0.0f;
+        }
+    }
     if (PM4_FIELD(su, PA_SU_SC_MODE_CNTL, POLY_MODE) == 0u) {
         ps.polygon_mode = 0u;   // FILL
     } else {

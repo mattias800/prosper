@@ -60,7 +60,7 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // video chroma planes.
 // Older captures planned tight spans, so their materializer intentionally binds the legacy span while
 // still deriving the guest pitch for best-effort rendering of the rows that were retained.
-constexpr uint32_t kVersion = 28;
+constexpr uint32_t kVersion = 29;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -1643,6 +1643,24 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         }
         for (const auto& compute : c.computes) write_linear_layout(compute.resources);
     }
+    // v29 (#1349) appends the resolved depth-bias state per realized/failed pipeline. Shadow-map
+    // passes program PA_SU_POLY_OFFSET_*; replaying without it re-introduces the acne the live
+    // renderer now avoids.
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws) {
+        w.u8(draw.ps.depth_bias_enable ? 1u : 0u);
+        w.u32(std::bit_cast<uint32_t>(draw.ps.depth_bias_constant));
+        w.u32(std::bit_cast<uint32_t>(draw.ps.depth_bias_slope));
+        w.u32(std::bit_cast<uint32_t>(draw.ps.depth_bias_clamp));
+    }
+    w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
+    for (const auto& diagnostic : c.failure_diagnostics) if (diagnostic.pipeline_present) {
+        w.u8(diagnostic.pipeline.depth_bias_enable ? 1u : 0u);
+        w.u32(std::bit_cast<uint32_t>(diagnostic.pipeline.depth_bias_constant));
+        w.u32(std::bit_cast<uint32_t>(diagnostic.pipeline.depth_bias_slope));
+        w.u32(std::bit_cast<uint32_t>(diagnostic.pipeline.depth_bias_clamp));
+    }
+
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -2280,6 +2298,30 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             if (!read_linear_layout(draw.vrt) || !read_linear_layout(draw.prt)) return false;
         for (auto& compute : c.computes)
             if (!read_linear_layout(compute.resources)) return false;
+    }
+    if (version >= 29) {   // #1349: resolved depth-bias state for realized and failed pipelines
+        uint32_t draw_count = 0;
+        if (!r.u32(draw_count) || draw_count != c.draws.size()) {
+            error = "invalid depth-bias draw-state count"; return false;
+        }
+        auto read_bias = [&](ResolvedPipelineState& pipeline) {
+            uint8_t enabled = 0;
+            uint32_t constant = 0, slope = 0, clamp = 0;
+            if (!r.u8(enabled) || enabled > 1 || !r.u32(constant) || !r.u32(slope) ||
+                !r.u32(clamp)) return false;
+            pipeline.depth_bias_enable   = enabled;
+            pipeline.depth_bias_constant = std::bit_cast<float>(constant);
+            pipeline.depth_bias_slope    = std::bit_cast<float>(slope);
+            pipeline.depth_bias_clamp    = std::bit_cast<float>(clamp);
+            return true;
+        };
+        for (auto& draw : c.draws) if (!read_bias(draw.ps)) return false;
+        uint32_t failure_count = 0;
+        if (!r.u32(failure_count) || failure_count != c.failure_diagnostics.size()) {
+            error = "invalid depth-bias failure-state count"; return false;
+        }
+        for (auto& diagnostic : c.failure_diagnostics) if (diagnostic.pipeline_present)
+            if (!read_bias(diagnostic.pipeline)) return false;
     }
     if (version >= 7 && !validate_failure_diagnostics(c, error)) return false;
     if (r.left) { error = "capture has trailing data"; return false; }

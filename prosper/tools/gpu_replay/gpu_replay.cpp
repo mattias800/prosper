@@ -339,7 +339,8 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
         }
         std::printf("draw[%zu] source=%llu target=%016llx extent=%ux%u fmt=%u cwm=%x "
                     "target1=%016llx extent1=%ux%u fmt1=%u cwm1=%x vcount=%u indices=%zu voffset=%d modifier=%016llx topo=%u%s "
-                    "depth=%d/%d/%u stencil=%d blend=%d raster=%u/%u/%u viewport=%d %.1f,%.1f %.1fx%.1f "
+                    "depth=%d/%d/%u stencil=%d blend=%d raster=%u/%u/%u bias=%u/%g/%g/%g "
+                    "viewport=%d %.1f,%.1f %.1fx%.1f "
                     "scissor=%d [%d,%d)-[%d,%d) export=%08x downconvert=%08x "
                     "vs=%zu/%016llx fs=%zu/%016llx\n",
                     i, static_cast<unsigned long long>(d.draw_index),
@@ -351,6 +352,8 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                     d.ps.topology, rawtag, d.ps.depth_test_enable,
                     d.ps.depth_write_enable, d.ps.depth_compare_op, d.ps.stencil_enable, d.ps.blend_enable,
                     d.ps.cull_mode, d.ps.front_face, d.ps.polygon_mode,
+                    d.ps.depth_bias_enable, d.ps.depth_bias_constant, d.ps.depth_bias_slope,
+                    d.ps.depth_bias_clamp,
                     d.ps.has_viewport, d.ps.viewport_x, d.ps.viewport_y, d.ps.viewport_w, d.ps.viewport_h,
                     d.ps.has_scissor, d.ps.scissor_left, d.ps.scissor_top,
                     d.ps.scissor_right, d.ps.scissor_bottom,
