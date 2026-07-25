@@ -1024,6 +1024,40 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
   endif()
 endif()
 
+# Optional FFmpeg AJM codec backend (#1347). Keep it outside prosper_core so core-only/headless
+# builds retain no host codec dependency. The core owns the AJM ABI and copies; this frontend only
+# accepts host byte spans and returns interleaved S16 PCM. MP3 is the first implemented codec.
+option(PROSPER_AUDIO_FFMPEG "Build the FFmpeg AJM compressed-audio decoder backend" ON)
+if(UNIX AND PROSPER_AUDIO_FFMPEG AND TARGET prosper_core)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(PROSPER_AJM_FFMPEG QUIET IMPORTED_TARGET
+                      libavcodec libavutil libswresample)
+  endif()
+  if(PROSPER_AJM_FFMPEG_FOUND)
+    add_library(prosper_ajm_ffmpeg STATIC
+                frontends/audio_ffmpeg/ajm_ffmpeg.cpp)
+    target_include_directories(prosper_ajm_ffmpeg PUBLIC frontends/audio_ffmpeg PRIVATE src)
+    target_link_libraries(prosper_ajm_ffmpeg PUBLIC prosper_core
+                          PkgConfig::PROSPER_AJM_FFMPEG)
+
+    add_executable(test_ajm_mp3 tests/test_ajm_mp3.cpp)
+    target_link_libraries(test_ajm_mp3 PRIVATE prosper_ajm_ffmpeg)
+    add_test(NAME ajm_mp3_decode COMMAND test_ajm_mp3)
+
+    if(TARGET boot_trace)
+      target_link_libraries(boot_trace PRIVATE prosper_ajm_ffmpeg)
+      target_compile_definitions(boot_trace PRIVATE PROSPER_AUDIO_FFMPEG=1)
+    endif()
+    if(TARGET screenshot)
+      target_link_libraries(screenshot PRIVATE prosper_ajm_ffmpeg)
+      target_compile_definitions(screenshot PRIVATE PROSPER_AUDIO_FFMPEG=1)
+    endif()
+  else()
+    message(WARNING "FFmpeg audio development packages not found - AJM MP3 decoding disabled")
+  endif()
+endif()
+
 # Windows native AvPlayer backend (#841): Media Foundation performs MP4 demux and video/audio
 # decode on a worker thread. Keep it outside prosper_core so core-only/headless builds retain no OS
 # media dependency and so software fallback can never be selected merely because no frontend exists.
@@ -1246,6 +1280,11 @@ endif()
 # prosper-app is defined above (before these libs), so link them here once they're built. Enable
 # both alongside the app for a full experience:  -DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=ON -DPROSPER_PAD_SDL3=ON
 if(TARGET prosper-app)
+  if(TARGET prosper_ajm_ffmpeg)
+    target_link_libraries(prosper-app PRIVATE prosper_ajm_ffmpeg)
+    target_compile_definitions(prosper-app PRIVATE PROSPER_AUDIO_FFMPEG=1)
+    message(STATUS "prosper-app: FFmpeg AJM audio decoding enabled")
+  endif()
   if(TARGET prosper_audio_sdl3)
     target_link_libraries(prosper-app PRIVATE prosper_audio_sdl3)
     target_include_directories(prosper-app PRIVATE frontends/audio_sdl3)

@@ -7,6 +7,7 @@
 #include "dispatch.hpp"
 #include "nid.hpp"
 #include "audio.hpp"
+#include "ajm_decoder.hpp"     // optional host codecs (MP3); core retains AJM ABI + guest copies
 #include "atrac9_decode.hpp"    // vendored LibAtrac9 glue — AJM ATRAC9 batch decode (Blasphemous 2)
 #include "callback_fs.hpp"      // recover the caller's guest %fs for firing guest callbacks
 #include <memory>
@@ -52,6 +53,11 @@ namespace prosper {
 namespace {
 
 constexpr int kMaxPorts  = 16;
+// Host-only slots above the 16 public sceAudioOut handles keep each of the four AudioOut2
+// contexts on an independent device stream. The host device mixes those streams concurrently;
+// serializing multiple contexts through one paced stream would insert one context's grains into
+// another context's timeline.
+constexpr int kMaxSinkPorts = kMaxPorts + 4;
 constexpr int kVolume0dB = 32768;   // SCE_AUDIO_VOLUME_0DB
 
 struct Port {
@@ -78,9 +84,9 @@ Port       g_ports[kMaxPorts];
 // sleeping each grain's wall-clock duration, so the guest advances at the correct speed.
 struct RealtimeSilentSink : AudioSink {
     struct Pace { std::chrono::steady_clock::time_point next{}; long long ns_per_grain = 0; };
-    Pace p_[kMaxPorts];
+    Pace p_[kMaxSinkPorts];
     bool open(int port, const AudioPortInfo& info) override {
-        if (port < 1 || port > kMaxPorts) return false;
+        if (port < 1 || port > kMaxSinkPorts) return false;
         int freq = info.freq > 0 ? info.freq : 48000;
         int grain = info.grain > 0 ? info.grain : 256;
         p_[port - 1].ns_per_grain = (long long)grain * 1000000000LL / freq;
@@ -88,7 +94,7 @@ struct RealtimeSilentSink : AudioSink {
         return true;
     }
     void output(int port, const void*, int frames) override {
-        if (port < 1 || port > kMaxPorts) return;
+        if (port < 1 || port > kMaxSinkPorts) return;
         auto& s = p_[port - 1];
         long long ns = s.ns_per_grain > 0 ? s.ns_per_grain : ((long long)frames * 1000000000LL / 48000);
         auto now = std::chrono::steady_clock::now();
@@ -98,7 +104,7 @@ struct RealtimeSilentSink : AudioSink {
         s.next += dur;
         if (s.next > now) std::this_thread::sleep_until(s.next);
     }
-    void close(int port) override { if (port >= 1 && port <= kMaxPorts) p_[port - 1] = {}; }
+    void close(int port) override { if (port >= 1 && port <= kMaxSinkPorts) p_[port - 1] = {}; }
 };
 
 RealtimeSilentSink        g_default_sink;
@@ -117,6 +123,7 @@ Port* port_of(int handle) {
 void audio_set_sink(AudioSink* sink) { g_sink.store(sink ? sink : &g_default_sink); }
 AudioSink* audio_sink() { return g_sink.load(); }
 static void audio_in_reset_ports();
+static void audio2_reset();
 
 void audio_decode_format(uint32_t param, int& channels, AudioFmt& fmt) {
     switch (param & 0xff) {                                   // SceAudioOutParamFormat (low byte)
@@ -154,8 +161,11 @@ void audio_reset() {
             if (g_ports[i].in_use && s) s->close(i + 1);
             g_ports[i] = Port{};
         }
-        g_sink.store(&g_default_sink);
     }
+    // Close AudioOut2's host-only context streams while the currently installed sink is still
+    // reachable, then restore the headless sink for the next test/application lifecycle.
+    audio2_reset();
+    g_sink.store(&g_default_sink);
     audio_in_reset_ports();
 }
 
@@ -199,9 +209,9 @@ double audio_pcm_peak(const void* pcm, int frames, const AudioPortInfo& info) {
 // the distinct slots.
 void audio_observe_output(int handle, const void* pcm, int frames, const AudioPortInfo& info) {
     if (!audiolog() && !audio_dump_path()) return;
-    if (handle < 1 || handle > kMaxPorts) return;
+    if (handle < 1 || handle > kMaxSinkPorts) return;
     static struct Obs { uint64_t calls = 0; double peak = 0.0; FILE* dump = nullptr;
-                        std::chrono::steady_clock::time_point last{}; } st[kMaxPorts];
+                        std::chrono::steady_clock::time_point last{}; } st[kMaxSinkPorts];
     Obs& s = st[handle - 1];
     s.calls++;
     double p = audio_pcm_peak(pcm, frames, info);
@@ -414,10 +424,23 @@ void a2_log(const char* name, uint64_t a0, uint64_t a1, uint64_t a2,
 constexpr uint64_t kA2CtxTag  = 0xA2C0000000000000ull;
 constexpr uint64_t kA2UserTag = 0xA2D0000000000000ull;
 constexpr uint64_t kA2PortTag = 0xA2E0000000000000ull;
+constexpr uint64_t kA2SpeakerArrayTag = 0xA2F0000000000000ull;
+constexpr uint64_t kA2PortIndexMask = 0xffffull;
+constexpr uint32_t kA2MaxPorts = 256;
+// Main-bed port flag bit 1 carries 20 dB of intentional digital headroom for AudioOut2's platform
+// mastering stage.  Restore that reference level at the host boundary; flag-zero ports are already
+// consumer-level PCM and must remain unchanged (notably video playback and ordinary stereo titles).
+constexpr uint32_t kA2PortFlag20DbHeadroom = 1u << 1;
+constexpr float kA2HeadroomGain = 10.0f;
 
 struct A2Context {
     bool     used = false;
+    bool     sink_opened = false;
+    bool     sink_open_ok = false;
+    uint32_t queue_depth = 4;
     uint32_t grain = 256;         // samples per Advance/Push cycle (param +0x10, live: 0x100)
+    uint32_t queued = 0;          // submitted grains not yet consumed by the 48 kHz device clock
+    std::chrono::steady_clock::time_point last_queue_update{};
     // Real-time pacing state for ContextPush (blocking-when-full HW semantics).
     std::chrono::steady_clock::time_point next{};
 };
@@ -425,23 +448,47 @@ std::mutex g_a2_mx;
 A2Context  g_a2_ctx[4];
 uint32_t   g_a2_users = 0;
 
-// AudioOut2 data path (derived live from Evergate, the first title to PLAY through this surface):
+// AudioOut2 data path (derived live from Evergate/GTA V and cross-checked against Kyty's public
+// reverse-engineered structs):
 // each tick the guest calls PortSetAttributes(port, attrs, count) where an attribute triple
-// {id=0, value_ptr, value_size=8} carries a guest pointer to the port's current grain of
-// interleaved stereo float32 PCM (grain frames from the context param, 256 live). ContextAdvance
+// {u32 id=0, u32 reserved, value_ptr, value_size=8} carries a guest pointer to the port's current grain of
+// interleaved PCM (grain frames from the context param, 256 live). ContextAdvance
 // advances engine state and ContextPush submits the grain to the device. We store each port's PCM
 // pointer here and mix + forward all ports' grains to the host AudioSink at Push.
 struct A2PortState {
     bool     used = false;
+    uint64_t context = 0;      // owning context; Push must not submit another context's ports
     uint64_t pcm_ptr = 0;      // guest address of this port's current PCM grain (attr id 0)
-    uint32_t type = 0;         // portParam +0x00: 0 = MAIN (speaker output); others aux (personal/aux/...)
-    uint32_t block_floats = 0; // portParam +0x04: interleaved floats per grain = channels * grain.
-                               // Read EXACTLY this many; the channel count is block_floats/grain (no
-                               // hardcoded channel assumption -> no over-read on non-8ch ports).
+    uint16_t type = 0;         // portParam +0x00: 0 = MAIN (speaker output); others aux (personal/...)
+    uint32_t data_format = 0;  // portParam +0x04: bits 8..15=channels, bits 0..6=0 F32 / 1 S16,
+                               // bit 7 selects the standard 8-channel order
+    uint32_t flags = 0;        // portParam +0x0c: device/mastering mode bits
 };
-A2PortState g_a2_port_state[16];
-constexpr int kA2SinkPort = 16;     // host sink port id for the AudioOut2 device (sink accepts 1..16;
-                                    // v1 sceAudioOut handles stay in the low single digits)
+A2PortState g_a2_port_state[kA2MaxPorts];
+bool g_a2_speaker_arrays[32]{};
+constexpr int kA2SinkPortBase = kMaxPorts + 1; // host-only ports 17..20, one per AudioOut2 context
+
+uint32_t audio2_format_channels(uint32_t data_format) {
+    const uint32_t encoded = (data_format >> 8u) & 0xffu;
+    return encoded ? std::min(encoded, 16u) : 2u;
+}
+
+static void audio2_reset() {
+    bool close_sink[4]{};
+    {
+        std::lock_guard<std::mutex> lk(g_a2_mx);
+        for (size_t i = 0; i < 4; ++i) {
+            close_sink[i] = g_a2_ctx[i].sink_opened;
+            g_a2_ctx[i] = A2Context{};
+        }
+        for (auto& port : g_a2_port_state) port = A2PortState{};
+        std::fill(std::begin(g_a2_speaker_arrays), std::end(g_a2_speaker_arrays), false);
+        g_a2_users = 0;
+    }
+    if (AudioSink* sink = audio_sink())
+        for (size_t i = 0; i < 4; ++i)
+            if (close_sink[i]) sink->close(kA2SinkPortBase + (int)i);
+}
 
 // Fault-safe store to a guest out-pointer (same rationale as apr_write_guest_dst: a bad pointer
 // must fail the call, not SIGSEGV inside the HLE). WriteProcessMemory validates the complete
@@ -614,17 +661,55 @@ HLE(audio_in_close) {
     return 0;
 }
 
-constexpr uint64_t kA2ErrInvalid = (uint64_t)(int64_t)(int32_t)0x80260003;   // AudioOut error space
+constexpr uint64_t kA2ErrInvalidParam = (uint64_t)(int64_t)(int32_t)0x80268001;
+constexpr uint64_t kA2ErrNotReady = (uint64_t)(int64_t)(int32_t)0x80268008;
+constexpr uint64_t kA2ErrPortFull = (uint64_t)(int64_t)(int32_t)0x80268012;
+
+// Advance the emulated hardware queue by elapsed 48 kHz grains. Caller holds g_a2_mx. Keeping this
+// state independent of the host sink matters because GetQueueLevel is an observable device clock:
+// middleware uses it to pace state changes even when the backend happens to consume synchronously.
+void audio2_update_queue_locked(A2Context& context,
+                                std::chrono::steady_clock::time_point now) {
+    if (!context.queued) {
+        context.last_queue_update = now;
+        return;
+    }
+    const uint32_t grain = context.grain ? context.grain : 256;
+    const auto grain_duration = std::chrono::nanoseconds(
+        (long long)grain * 1000000000LL / 48000);
+    if (grain_duration.count() <= 0 || context.last_queue_update.time_since_epoch().count() == 0) {
+        context.last_queue_update = now;
+        return;
+    }
+    if (now <= context.last_queue_update) return;
+    const auto elapsed = now - context.last_queue_update;
+    const uint64_t drained = std::min<uint64_t>(
+        context.queued, (uint64_t)(elapsed / grain_duration));
+    if (!drained) return;
+    context.queued -= (uint32_t)drained;
+    context.last_queue_update += grain_duration * (long long)drained;
+    if (!context.queued) context.last_queue_update = now;
+}
 
 // sceAudioOut2Initialize(void) -> 0. Idempotent success (same as sceAudioOutInit).
 HLE(audio2_initialize) { A2LOG("sceAudioOut2Initialize"); return 0; }
 
-// sceAudioOut2ContextResetParam(SceAudioOut2ContextParam* param) -> 0.
-// The param is 0x40 bytes (live: the create-path caller zero-fills exactly 0x00..0x3f before
-// setting fields). Reset = zero-fill; the guest overwrites every field it uses afterwards.
+// sceAudioOut2ContextResetParam(SceAudioOut2ContextParam* param) -> 0.  A reset is not merely a
+// memset: titles may retain any default they do not override.  In particular queue_depth=4,
+// num_grains=512, and flags=1 are part of the observable ABI.
 HLE(audio2_ctx_reset_param) {
     A2LOG("sceAudioOut2ContextResetParam");
-    if (!a2_store_zeros(a0, 0x40)) return kA2ErrInvalid;
+    struct ContextParam {
+        uint32_t max_ports, max_object_ports, guarantee_object_ports;
+        uint32_t queue_depth, num_grains, flags, reserved[10];
+    } param{};
+    static_assert(sizeof(ContextParam) == 0x40);
+    param.max_ports = 256;
+    param.max_object_ports = 256;
+    param.queue_depth = 4;
+    param.num_grains = 512;
+    param.flags = 1;
+    if (!audio_store_bytes(a0, &param, sizeof param)) return kA2ErrInvalidParam;
     return 0;
 }
 
@@ -636,7 +721,7 @@ HLE(audio2_ctx_reset_param) {
 HLE(audio2_ctx_query_memory) {
     A2LOG("sceAudioOut2ContextQueryMemory");
     if (audio2log()) a2_dump("param", a0, 0x40);
-    if (!a2_store_u64(a1, 0x100000)) return kA2ErrInvalid;
+    if (!a2_store_u64(a1, 0x100000)) return kA2ErrInvalidParam;
     return 0;
 }
 
@@ -645,43 +730,53 @@ HLE(audio2_ctx_query_memory) {
 // allocation size: `r15 = ret; ptr = allocator->alloc(r15, 0x10)`. Live [RAGE] disassembly at
 // eboot+0x2adf25e: arg rdi=8 (speaker/channel config). Stubbed to 0 the guest allocated a ZERO-byte
 // speaker-array buffer and then overran it, aborting RAGE audio/streaming init with its int 0x41
-// fatal — the deterministic pre-render crash on this title. Like sceAudioOut2ContextQueryMemory, the
-// null backend needs no real work memory; report a fixed, comfortably-large size so the allocation
-// succeeds and is big enough. The value's only observable effect is a successful, large-enough alloc.
-// CONFIDENCE: MED — return-is-size and the alloc use are pinned from disassembly; the exact SDK size
-// formula is unknown, so a generous fixed size is used (safe: the buffer is only ever zero-filled here).
+// fatal — the deterministic pre-render crash on this title.  The SDK sizing contract is 0x400 bytes
+// of base state plus 0x40 per VBAP speaker or 0x100 per ambisonics speaker, with 0x200 extra for 3D.
 HLE(audio2_get_speaker_array_memory_size) {
     A2LOG("sceAudioOut2GetSpeakerArrayMemorySize");
-    return 0x100000;   // 1 MiB, 0x10-aligned; matches the ContextQueryMemory null-backend precedent
+    const uint64_t speakers = std::clamp<uint64_t>(a0, 1, 32);
+    return 0x400 + speakers * (a2 ? 0x100 : 0x40) + (a1 ? 0x200 : 0);
 }
 
 // sceAudioOut2ContextCreate(param*, mem, memSize, Handle* outCtx) -> 0.
 HLE(audio2_ctx_create) {
     A2LOG("sceAudioOut2ContextCreate");
     uint32_t grain = 256;
-#ifndef _WIN32
-    if (a0) {   // param +0x10 = samples per grain (live: 0x100)
-        uint32_t g = 0;
-        struct iovec l { &g, 4 }, r { (void*)(uintptr_t)(a0 + 0x10), 4 };
-        if (process_vm_readv(getpid(), &l, 1, &r, 1, 0) == 4 && g >= 64 && g <= 4096) grain = g;
+    uint32_t queue_depth = 4;
+    if (a0) {
+        uint32_t param[5]{};
+        if (audio_read_bytes(a0, param, sizeof param)) {
+            if (param[3] >= 1 && param[3] <= 64) queue_depth = param[3];
+            if (param[4] >= 64 && param[4] <= 4096) grain = param[4];
+        }
     }
-#endif
     std::lock_guard<std::mutex> lk(g_a2_mx);
     for (int i = 0; i < 4; i++) {
         if (g_a2_ctx[i].used) continue;
         g_a2_ctx[i] = A2Context{};
         g_a2_ctx[i].used = true;
+        g_a2_ctx[i].queue_depth = queue_depth;
         g_a2_ctx[i].grain = grain;
-        if (!a2_store_u64(a3, kA2CtxTag | (uint64_t)(i + 1))) { g_a2_ctx[i].used = false; return kA2ErrInvalid; }
+        if (!a2_store_u64(a3, kA2CtxTag | (uint64_t)(i + 1))) { g_a2_ctx[i].used = false; return kA2ErrInvalidParam; }
         return 0;
     }
-    return kA2ErrInvalid;
+    return kA2ErrInvalidParam;
 }
 HLE(audio2_ctx_destroy) {
     A2LOG("sceAudioOut2ContextDestroy");
-    std::lock_guard<std::mutex> lk(g_a2_mx);
     uint64_t idx = a0 & 0xff;
-    if ((a0 & ~0xffull) == kA2CtxTag && idx >= 1 && idx <= 4) g_a2_ctx[idx - 1] = A2Context{};
+    bool close_sink = false;
+    if ((a0 & ~0xffull) == kA2CtxTag && idx >= 1 && idx <= 4) {
+        {
+            std::lock_guard<std::mutex> lk(g_a2_mx);
+            close_sink = g_a2_ctx[idx - 1].sink_opened;
+            g_a2_ctx[idx - 1] = A2Context{};
+            for (auto& port : g_a2_port_state)
+                if (port.used && port.context == a0) port = A2PortState{};
+        }
+        if (close_sink)
+            if (AudioSink* sink = audio_sink()) sink->close(kA2SinkPortBase + (int)idx - 1);
+    }
     return 0;
 }
 
@@ -689,7 +784,7 @@ HLE(audio2_ctx_destroy) {
 HLE(audio2_user_create) {
     A2LOG("sceAudioOut2UserCreate");
     std::lock_guard<std::mutex> lk(g_a2_mx);
-    if (!a2_store_u64(a1, kA2UserTag | (uint64_t)++g_a2_users)) return kA2ErrInvalid;
+    if (!a2_store_u64(a1, kA2UserTag | (uint64_t)++g_a2_users)) return kA2ErrInvalidParam;
     return 0;
 }
 HLE(audio2_user_destroy) { A2LOG("sceAudioOut2UserDestroy"); return 0; }
@@ -698,88 +793,136 @@ HLE(audio2_user_destroy) { A2LOG("sceAudioOut2UserDestroy"); return 0; }
 HLE(audio2_port_create) {
     A2LOG("sceAudioOut2PortCreate");
     if (audio2log()) a2_dump("portParam", a1, 0x40);
-    // portParam layout (live-decoded, both Evergate and Blasphemous 2): +0x00 u32 port type
-    // (0 = MAIN speaker output), +0x04 u32 interleaved floats per grain block (= channels * grain;
-    // MAIN is 0x800 = 256*8 -> the 8-channel 7.1 bed Evergate uses), +0x08 u32 sample rate (48000).
-    // Reading block_floats here lets ContextPush read each port at its REAL width and derive the
-    // channel count as block_floats/grain, instead of assuming every port is an 8-channel main bed.
-    uint32_t ptype = 0, block_floats = 0;
+    // AudioOut2PortParam: u16 port_type @0, u32 data_format @4, u32 sampling_freq @8.  The format is
+    // NOT a block length: 0x800 means eight-channel float PCM, while 0x100/0x200 mean mono/stereo.
+    // Confusing it for `channels * grain` happens to work at grain=256, but fails for every other
+    // grain and leaves PortGetState unable to report the format that the guest mixer consumes.
+    uint16_t ptype = 0;
+    uint32_t data_format = 0;
+    uint32_t flags = 0;
     if (a1) {
-        uint32_t hdr[2] = {0, 0};
-        if (audio_read_bytes(a1, hdr, sizeof hdr)) { ptype = hdr[0]; block_floats = hdr[1]; }
+        struct { uint16_t type, pad; uint32_t format; uint32_t rate, flags; } hdr{};
+        if (audio_read_bytes(a1, &hdr, sizeof hdr)) {
+            ptype = hdr.type;
+            data_format = hdr.format;
+            flags = hdr.flags;
+        }
     }
     std::lock_guard<std::mutex> lk(g_a2_mx);
     // First-free-slot allocation (not a monotonic counter): slots are recycled on PortDestroy, so a
     // title that churns ports over a long session can't exhaust the table or alias slot state.
-    for (uint32_t id = 1; id <= 16; ++id) {
+    for (uint32_t id = 1; id <= kA2MaxPorts; ++id) {
         if (g_a2_port_state[id - 1].used) continue;
-        if (!a2_store_u64(a2, kA2PortTag | (uint64_t)id)) return kA2ErrInvalid;
-        g_a2_port_state[id - 1] = A2PortState{true, 0, ptype, block_floats};
+        if (!a2_store_u64(a2, kA2PortTag | (uint64_t)id)) return kA2ErrInvalidParam;
+        g_a2_port_state[id - 1] = A2PortState{true, a0, 0, ptype, data_format, flags};
         return 0;
     }
-    return kA2ErrInvalid;
+    return kA2ErrPortFull;
 }
 HLE(audio2_port_destroy) {
     A2LOG("sceAudioOut2PortDestroy");
     // Clear the slot so a destroyed port stops being mixed (its guest PCM buffer may be freed and
     // reused) and the slot is reusable by the next PortCreate.
-    const uint64_t pidx = a0 & 0xff;
-    if ((a0 & ~0xffull) == kA2PortTag && pidx >= 1 && pidx <= 16) {
+    const uint64_t pidx = a0 & kA2PortIndexMask;
+    if ((a0 & ~kA2PortIndexMask) == kA2PortTag && pidx >= 1 && pidx <= kA2MaxPorts) {
         std::lock_guard<std::mutex> lk(g_a2_mx);
         g_a2_port_state[pidx - 1] = A2PortState{};
     }
     return 0;
 }
 
-// sceAudioOut2PortGetState(port, State* out) -> 0. Layout unknown; the pump loop consumed a
-// zero-filled 0x20 in the capture run and kept cycling. CONFIDENCE: LOW (zero state = silent
-// port, no observed guest field reads yet — re-probe if CRI branches on it).
+// sceAudioOut2PortGetState(port, State* out) -> 0.  Titles read this state before rebuilding their
+// speaker mixer, so the active output, channel count, and device volume are observable ABI state.
 HLE(audio2_port_get_state) {
     A2LOG("sceAudioOut2PortGetState");
-    if (!a2_store_zeros(a1, 0x20)) return kA2ErrInvalid;
+    struct PortState {
+        uint16_t output;
+        uint8_t num_channels, pad1;
+        int16_t volume;
+        uint16_t reroute_counter;
+        uint32_t flags, pad2;
+        uint64_t reserved[6];
+    } state{};
+    static_assert(sizeof(PortState) == 0x40);
+    const uint64_t pidx = a0 & kA2PortIndexMask;
+    {
+        std::lock_guard<std::mutex> lk(g_a2_mx);
+        if ((a0 & ~kA2PortIndexMask) != kA2PortTag || pidx < 1 || pidx > kA2MaxPorts ||
+            !g_a2_port_state[pidx - 1].used) return kA2ErrInvalidParam;
+        state.num_channels = (uint8_t)audio2_format_channels(g_a2_port_state[pidx - 1].data_format);
+    }
+    state.output = 1;
+    state.volume = 127;
+    if (!audio_store_bytes(a1, &state, sizeof state)) return kA2ErrInvalidParam;
     return 0;
 }
 // sceAudioOut2PortSetAttributes(port, const SceAudioOut2Attribute* attrs, size_t count).
-// Attribute = {u64 id, const void* value, size_t valueSize} (0x18 stride). Live-decoded ids:
+// Attribute = {u32 id, u32 reserved, const void* value, size_t valueSize} (0x18 stride).
+// `reserved` is ABI padding and may be indeterminate (GTA V leaves stack-address bits there), so
+// it must never be folded into the id. Live-decoded ids:
 //   0 = per-grain PCM data pointer (value: a guest pointer qword to interleaved stereo f32 samples).
-// Unknown ids are skipped fail-visibly under PROSPER_AUDIO2LOG. CONFIDENCE: MED (Evergate-derived).
+// Unknown ids are skipped fail-visibly under PROSPER_AUDIO2LOG. CONFIDENCE: HIGH (Evergate + GTA V).
 HLE(audio2_port_set_attr) {
     A2LOG("sceAudioOut2PortSetAttributes");
-    const uint64_t pidx = (a0 & 0xff);
-    if ((a0 & ~0xffull) != kA2PortTag || pidx < 1 || pidx > 16) return kA2ErrInvalid;
+    const uint64_t pidx = (a0 & kA2PortIndexMask);
+    if ((a0 & ~kA2PortIndexMask) != kA2PortTag || pidx < 1 || pidx > kA2MaxPorts)
+        return kA2ErrInvalidParam;
     if (a2 == 0) return 0;                        // no attributes: a legal no-op
     const uint64_t count = a2 <= 32 ? a2 : 32;    // defensive cap; log the clamp fail-visibly
     if (count != a2 && audio2log())
         fprintf(stderr, "[audio2] PortSetAttributes: count %llu clamped to 32\n", (unsigned long long)a2);
     std::lock_guard<std::mutex> lk(g_a2_mx);      // covers port state AND the diagnostic set below
     for (uint64_t i = 0; i < count; i++) {
-        struct { uint64_t id, vptr, vsize; } at{};
+        struct { uint32_t id, reserved; uint64_t vptr, vsize; } at{};
+        static_assert(sizeof(at) == 0x18);
         if (!audio_read_bytes(a1 + i * 0x18, &at, sizeof at)) break;
         if (at.id == 0 && at.vsize == 8) {
             uint64_t pcm = 0;
             if (audio_read_bytes(at.vptr, &pcm, 8)) g_a2_port_state[pidx - 1].pcm_ptr = pcm;
             if (getenv("PROSPER_AUDIO2_PROBE")) {
-                static uint64_t seen_store[16] = {0};
-                if (seen_store[(pidx - 1) & 15] != pcm) {
-                    seen_store[(pidx - 1) & 15] = pcm;
-                    fprintf(stderr, "[audio2-attr] port%llu id=0x%llx vptr=0x%llx vsize=%llu -> pcm=0x%llx\n",
-                            (unsigned long long)pidx, (unsigned long long)at.id,
-                            (unsigned long long)at.vptr, (unsigned long long)at.vsize,
-                            (unsigned long long)pcm);
+                // Keep probe history per AudioOut2 port. Object-heavy titles routinely create
+                // more than 16 ports; aliasing this table made their alternating grain buffers
+                // look like a state change on every SetAttributes call and flooded the log.
+                static uint64_t seen_store[kA2MaxPorts] = {0};
+                static uint8_t logged_changes[kA2MaxPorts] = {0};
+                if (seen_store[pidx - 1] != pcm) {
+                    seen_store[pidx - 1] = pcm;
+                    if (logged_changes[pidx - 1] < 4) {
+                        ++logged_changes[pidx - 1];
+                        fprintf(stderr, "[audio2-attr] port%llu id=0x%x vptr=0x%llx vsize=%llu -> pcm=0x%llx\n",
+                                (unsigned long long)pidx, at.id,
+                                (unsigned long long)at.vptr, (unsigned long long)at.vsize,
+                                (unsigned long long)pcm);
+                    }
                 }
             }
         } else if (audio2log() || getenv("PROSPER_AUDIO2_PROBE")) {
             static std::set<uint64_t> seen;
-            if (seen.insert(at.id).second)
-                fprintf(stderr, "[audio2] PortSetAttributes: unhandled attr id=%llu size=%llu\n",
-                        (unsigned long long)at.id, (unsigned long long)at.vsize);
+            if (seen.insert(at.id).second) {
+                uint8_t value[16]{};
+                const size_t got = audio_read_bytes_partial(
+                    at.vptr, value, std::min<size_t>((size_t)at.vsize, sizeof(value)));
+                fprintf(stderr, "[audio2] PortSetAttributes: port%llu unhandled attr id=%u "
+                        "size=%llu value:", (unsigned long long)pidx, at.id,
+                        (unsigned long long)at.vsize);
+                for (size_t j = 0; j < got; ++j) fprintf(stderr, " %02x", value[j]);
+                fprintf(stderr, "\n");
+            }
         }
     }
     return 0;
 }
 
-// sceAudioOut2ContextAdvance(ctx) -> 0. State advance only; the pacing lives in Push.
-HLE(audio2_ctx_advance) { A2LOG("sceAudioOut2ContextAdvance"); return 0; }
+// sceAudioOut2ContextAdvance(ctx) -> 0. Update the public queue clock; PCM submission lives in Push.
+HLE(audio2_ctx_advance) {
+    A2LOG("sceAudioOut2ContextAdvance");
+    const uint64_t idx = a0 & 0xff;
+    std::lock_guard<std::mutex> lk(g_a2_mx);
+    if ((a0 & ~0xffull) != kA2CtxTag || idx < 1 || idx > 4 || !g_a2_ctx[idx - 1].used)
+        return kA2ErrInvalidParam;
+    audio2_update_queue_locked(g_a2_ctx[idx - 1], std::chrono::steady_clock::now());
+    return 0;
+}
 
 // sceAudioOut2ContextPush(ctx, flag) -> 0. On hardware Push blocks while the output queue is
 // full; the null backend reproduces that as one grain of wall-clock pacing per call (same
@@ -788,16 +931,37 @@ HLE(audio2_ctx_push) {
     A2LOG("sceAudioOut2ContextPush");
     uint64_t idx = a0 & 0xff;
     uint32_t grain = 256;
-    // Mix each active port's current grain into a stereo bed. A port's grain buffer holds
-    // `block_floats` interleaved float32 samples = (channels * grain), with the channel count taken
-    // from the port's own param (portParam +0x04) — NOT a fixed assumption. The 7.1 MAIN port
-    // (Evergate + Blasphemous 2) is 8 channels (block 0x800 = 256*8); a stereo/mono aux port is 2/1.
-    // Reading each port at its real width is what prevents an over-read from splattering adjacent
-    // heap (NaN/garbage) into the mix. We forward the front L/R pair (mono duplicates ch0).
-    // SURROUND-TODO: channels 2..N (C/LFE/surrounds) are dropped until the host sink grows a
-    // surround output; fold them in with proper downmix gains when it does.
+    // Reserve one hardware queue slot before reading the guest grain. A nonblocking push on a full
+    // queue returns NOT_READY; a blocking push waits until the 48 kHz device clock drains a slot.
+    for (;;) {
+        std::chrono::nanoseconds wait_duration{};
+        {
+            std::lock_guard<std::mutex> lk(g_a2_mx);
+            if ((a0 & ~0xffull) != kA2CtxTag || idx < 1 || idx > 4 ||
+                !g_a2_ctx[idx - 1].used) return kA2ErrInvalidParam;
+            A2Context& context = g_a2_ctx[idx - 1];
+            const auto now = std::chrono::steady_clock::now();
+            audio2_update_queue_locked(context, now);
+            if (context.queued < context.queue_depth) {
+                if (!context.queued) context.last_queue_update = now;
+                ++context.queued;
+                grain = context.grain;
+                break;
+            }
+            wait_duration = std::chrono::nanoseconds(
+                (long long)(context.grain ? context.grain : 256) * 1000000000LL / 48000);
+        }
+        if (!a1) return kA2ErrNotReady;
+        std::this_thread::sleep_for(wait_duration);
+    }
+    // Mix each active port's current grain into a stereo bed. AudioOut2 data_format encodes the
+    // sample type in bits 0..6 (0 = F32, 1 = S16) and channel count in bits 8..15. Read exactly one
+    // grain at that width, convert it to the float mix bed, then fold a surround MAIN bed into the
+    // stereo host sink. Both sample types are public AudioOut2 formats: for example, 0x200 is F32
+    // stereo and 0x201 is S16 stereo.
     static thread_local std::vector<float> bed(4096 * 2);
     static thread_local std::vector<float> tmp;
+    static thread_local std::vector<int16_t> tmp_s16;
     bool have_pcm = false;
     {
         std::lock_guard<std::mutex> lk(g_a2_mx);
@@ -806,57 +970,113 @@ HLE(audio2_ctx_push) {
         grain = (c->grain >= 64 && c->grain <= 4096) ? c->grain : 256;
         std::memset(bed.data(), 0, sizeof(float) * grain * 2);
         const bool probe = getenv("PROSPER_AUDIO2_PROBE") != nullptr;
+        uint32_t object_ports_with_pcm = 0;
+        float object_peak = 0.0f;
+        int object_peak_port = 0;
         int pidx_probe = 0;
         for (const auto& ps : g_a2_port_state) {
             const int this_pidx = pidx_probe++;
-            if (!ps.used || !ps.pcm_ptr) continue;
-            // Only the MAIN port (type 0) drives the host speaker output. Other types route to
-            // separate hardware devices (type 3/4 personal/pad-speaker, chat, etc.); summing them
-            // into the main TV mix would leak that audio. They stay unmixed until per-type device
-            // routing exists. CONFIDENCE: MED (Evergate + Blasphemous 2: MAIN is type 0; aux types
-            // are silent here, so this changes nothing audible today but prevents a latent leak).
-            if (ps.type != 0) {
-                if (probe) { static uint64_t n[16] = {0};
-                    if ((n[this_pidx & 15]++ % 256) == 0)
-                        fprintf(stderr, "[audio2-probe] port%d type=%u NOT mixed (non-MAIN)\n",
-                                this_pidx + 1, ps.type); }
+            if (!ps.used || ps.context != a0 || !ps.pcm_ptr) continue;
+            const uint32_t data_type = ps.data_format & 0x7fu;
+            const uint32_t channels = audio2_format_channels(ps.data_format);
+            if ((data_type != 0 && data_type != 1) || channels < 1 || channels > 8) {
+                if (probe) fprintf(stderr, "[audio2-probe] port%d skipped: format=0x%x "
+                                           "type=%u channels=%u unsupported\n",
+                                           this_pidx + 1, ps.data_format, data_type, channels);
                 continue;
             }
-            // Channel count from this port's own block size (block_floats = channels*grain), so we
-            // never assume 8. Read EXACTLY channels*grain floats (<= block_floats, no over-read).
-            uint32_t channels;
-            if (ps.block_floats == 0) {
-                channels = 8;                       // param was unreadable: legacy 7.1 MAIN assumption
+            const uint32_t read_samples = channels * grain;
+            size_t frames_got = 0;
+            if (data_type == 0) {
+                if (tmp.size() < read_samples) tmp.resize(read_samples);
+                const size_t got = audio_read_bytes_partial(
+                    ps.pcm_ptr, tmp.data(), sizeof(float) * read_samples);
+                frames_got = got / (sizeof(float) * channels);
             } else {
-                channels = ps.block_floats / grain; // block is channels*grain for a well-formed param
-                if (channels < 1 || channels > 8) {
-                    if (probe) fprintf(stderr, "[audio2-probe] port%d skipped: block=%u grain=%u "
-                                       "-> channels=%u (implausible)\n",
-                                       this_pidx + 1, ps.block_floats, grain, channels);
-                    continue;                        // fail-visible: don't over-read or mis-stride
-                }
+                if (tmp_s16.size() < read_samples) tmp_s16.resize(read_samples);
+                const size_t got = audio_read_bytes_partial(
+                    ps.pcm_ptr, tmp_s16.data(), sizeof(int16_t) * read_samples);
+                frames_got = got / (sizeof(int16_t) * channels);
             }
-            const uint32_t read_floats = channels * grain;   // <= block_floats: capped by construction
-            if (tmp.size() < read_floats) tmp.resize(read_floats);
-            const size_t got = audio_read_bytes_partial(ps.pcm_ptr, tmp.data(), sizeof(float) * read_floats);
-            const size_t frames_got = got / (sizeof(float) * channels);
+            auto sample_at = [&](size_t frame, uint32_t channel) {
+                const size_t sample = frame * channels + channel;
+                return data_type == 0 ? tmp[sample]
+                                      : (float)tmp_s16[sample] * (1.0f / 32768.0f);
+            };
             if (probe) {
-                static uint64_t call_ct[16] = {0};
+                static uint64_t call_ct[kA2MaxPorts] = {0};
                 const size_t nf = frames_got * channels;
                 size_t nan_ct = 0; float amax = 0.0f;
-                for (size_t k = 0; k < nf; k++) { float v = tmp[k];
+                for (size_t k = 0; k < nf; k++) {
+                    float v = data_type == 0 ? tmp[k] : (float)tmp_s16[k] * (1.0f / 32768.0f);
                     if (v != v) nan_ct++; else { float a = v < 0 ? -v : v; if (a > amax) amax = a; } }
-                if ((call_ct[this_pidx & 15]++ % 64) == 0)
-                    fprintf(stderr, "[audio2-probe] port%d type=%u ch=%u pcm=0x%llx frames=%zu "
-                            "nan=%zu/%zu |max|=%.4g\n", this_pidx + 1, ps.type, channels,
+                // Object-heavy engines keep hundreds of valid but silent ports. Reporting every
+                // silent buffer once per 64 grains both hides the active route and perturbs its
+                // real-time pump. Sample only ports that actually contain a signal.
+                if ((call_ct[this_pidx]++ % 64) == 0 && amax > 0.0f)
+                    fprintf(stderr, "[audio2-probe] port%d type=%u fmt=%s ch=%u pcm=0x%llx "
+                            "frames=%zu nan=%zu/%zu |max|=%.4g\n", this_pidx + 1, ps.type,
+                            data_type == 0 ? "f32" : "s16", channels,
                             (unsigned long long)ps.pcm_ptr, frames_got, nan_ct, nf, amax);
+                if ((ps.type & 0xff00u) == 0x0100u) {
+                    object_ports_with_pcm++;
+                    if (amax > object_peak) {
+                        object_peak = amax;
+                        object_peak_port = this_pidx + 1;
+                    }
+                }
             }
-            const uint32_t r = channels >= 2 ? 1u : 0u;     // mono duplicates ch0 to both outputs
+            // Only the MAIN port (type 0) drives the host speaker output. Ordinary non-main types
+            // route to separate hardware devices (personal/pad speaker, chat, vibration). Object
+            // ports also remain unmixed here until their attributes and speaker routing are
+            // implemented, but probe mode still measures them above so discarded object audio is
+            // visible rather than mistaken for decoder attenuation.
+            if (ps.type != 0) {
+                continue;
+            }
+            const float port_gain = (ps.flags & kA2PortFlag20DbHeadroom) ? kA2HeadroomGain : 1.0f;
             for (size_t fno = 0; fno < frames_got; fno++) {
-                bed[fno * 2 + 0] += tmp[fno * channels + 0];   // front left
-                bed[fno * 2 + 1] += tmp[fno * channels + r];   // front right
+                float left = sample_at(fno, 0);
+                float right = channels >= 2 ? sample_at(fno, 1) : left;  // mono duplicates ch0
+                constexpr float kCenter = 0.70710678f;        // -3 dB
+                constexpr float kLfe = 0.5f;                  // -6 dB
+                constexpr float kSurround = 0.70710678f;      // -3 dB
+
+                // Sony's MAIN speaker beds use the conventional order FL, FR, FC, LFE, followed
+                // by rear/side pairs. Keep the smaller layouts useful too: 3ch adds FC, 4ch is
+                // quad, 5ch is FL/FR/FC/SL/SR, and 6ch is standard 5.1.
+                if (channels == 3) {
+                    left += sample_at(fno, 2) * kCenter;
+                    right += sample_at(fno, 2) * kCenter;
+                } else if (channels == 4) {
+                    left += sample_at(fno, 2) * kSurround;
+                    right += sample_at(fno, 3) * kSurround;
+                } else if (channels == 5) {
+                    left += sample_at(fno, 2) * kCenter + sample_at(fno, 3) * kSurround;
+                    right += sample_at(fno, 2) * kCenter + sample_at(fno, 4) * kSurround;
+                } else if (channels >= 6) {
+                    left += sample_at(fno, 2) * kCenter + sample_at(fno, 3) * kLfe
+                          + sample_at(fno, 4) * kSurround;
+                    right += sample_at(fno, 2) * kCenter + sample_at(fno, 3) * kLfe
+                           + sample_at(fno, 5) * kSurround;
+                    if (channels == 7) {
+                        left += sample_at(fno, 6) * (kSurround * 0.5f);
+                        right += sample_at(fno, 6) * (kSurround * 0.5f);
+                    } else if (channels == 8) {
+                        left += sample_at(fno, 6) * kSurround;
+                        right += sample_at(fno, 7) * kSurround;
+                    }
+                }
+                bed[fno * 2 + 0] += left * port_gain;
+                bed[fno * 2 + 1] += right * port_gain;
             }
             if (frames_got) have_pcm = true;
+        }
+        if (probe) {
+            static uint64_t object_probe_calls = 0;
+            if ((object_probe_calls++ % 64) == 0 && object_peak > 0.0f)
+                fprintf(stderr, "[audio2-probe] objects: pcm_ports=%u peak_port=%d |max|=%.4g\n",
+                        object_ports_with_pcm, object_peak_port, object_peak);
         }
     }
     AudioSink* sink = audio_sink();
@@ -866,19 +1086,30 @@ HLE(audio2_ctx_push) {
         // A FAILED device open must fall through to the silent wall-clock pacing below instead:
         // the SDL3 sink's output() is a no-op on a null stream (no sleep), and returning early on
         // every push would hot-spin the guest's pump thread on hosts with no audio device.
-        static std::atomic<bool> opened{false};
-        static std::atomic<bool> open_ok{false};
         AudioPortInfo info; info.freq = 48000; info.channels = 2; info.fmt = AudioFmt::F32;
         info.grain = (int)grain;
-        if (!opened.exchange(true)) open_ok.store(sink->open(kA2SinkPort, info));
-        if (open_ok.load()) {
+        int context_slot = 0;
+        bool open_ok = false;
+        {
+            std::lock_guard<std::mutex> lk(g_a2_mx);
+            if ((a0 & ~0xffull) == kA2CtxTag && idx >= 1 && idx <= 4 && g_a2_ctx[idx - 1].used)
+                context_slot = (int)idx - 1;
+            A2Context& context = g_a2_ctx[context_slot];
+            if (!context.sink_opened) {
+                context.sink_opened = true;
+                context.sink_open_ok = sink->open(kA2SinkPortBase + context_slot, info);
+            }
+            open_ok = context.sink_open_ok;
+        }
+        const int sink_port = kA2SinkPortBase + context_slot;
+        if (open_ok) {
             for (uint32_t i = 0; i < grain * 2; i++) {
                 float v = bed[i];
                 if (v != v) v = 0.0f;                        // NaN -> 0; Inf is caught by the clamp below
                 bed[i] = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
             }
-            audio_observe_output(kA2SinkPort, bed.data(), (int)grain, info);
-            sink->output(kA2SinkPort, bed.data(), (int)grain);
+            audio_observe_output(sink_port, bed.data(), (int)grain, info);
+            sink->output(sink_port, bed.data(), (int)grain);
             return 0;
         }
     }
@@ -902,31 +1133,221 @@ HLE(audio2_ctx_push) {
     return 0;
 }
 
-// Generic logging probes for the not-yet-exercised remainder of the surface.
-#define A2_PROBE(fn, str) HLE(fn) { A2LOG(str); return 0; }
-A2_PROBE(audio2_ctx_get_queue_level, "sceAudioOut2ContextGetQueueLevel")
-A2_PROBE(audio2_ctx_set_attr,    "sceAudioOut2ContextSetAttributes")
+// Targeted control-surface tracing. AudioOut2 ports feed a pre-mastering speaker bed, so these
+// calls are relevant whenever valid decoded PCM reaches the bed but the audible master is wrong.
+void audio2_control_probe(const char* name, uint64_t a0, uint64_t a1, uint64_t a2,
+                          uint64_t a3, uint64_t a4, uint64_t a5) {
+    if (!getenv("PROSPER_AUDIO2_CONTROL_PROBE")) return;
+    static std::atomic<uint32_t> count{0};
+    const uint32_t n = count.fetch_add(1);
+    if (n >= 128) return;
+    fprintf(stderr, "[audio2-control] %s(0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx)\n",
+            name, (unsigned long long)a0, (unsigned long long)a1,
+            (unsigned long long)a2, (unsigned long long)a3,
+            (unsigned long long)a4, (unsigned long long)a5);
+    const uint64_t args[6] = {a0, a1, a2, a3, a4, a5};
+    for (uint32_t i = 0; i < 6; ++i) {
+        if (args[i] < 0x10000 || (args[i] & 0xffff000000000000ull)) continue;
+        uint8_t bytes[48]{};
+        const size_t got = audio_read_bytes_partial(args[i], bytes, sizeof(bytes));
+        if (!got) continue;
+        fprintf(stderr, "[audio2-control]   a%u[0..%zu]:", i, got);
+        for (size_t k = 0; k < got; ++k) fprintf(stderr, " %02x", bytes[k]);
+        fprintf(stderr, "\n");
+    }
+}
+
+HLE(audio2_ctx_set_attr) {
+    audio2_control_probe("sceAudioOut2ContextSetAttributes", a0, a1, a2, a3, a4, a5);
+    return 0;
+}
+HLE(audio2_get_speaker_info) {
+    static std::atomic<uint32_t> probes{0};
+    if (probes.fetch_add(1) < 8)
+        audio2_control_probe("sceAudioOut2GetSpeakerInfo", a0, a1, a2, a3, a4, a5);
+    // The host sink exposed by this HLE is stereo. Report its real speaker mask and positions so
+    // guest mixers can construct their final matrix; leaving this output untouched reports zero
+    // available speakers and causes engines to attenuate/misroute an otherwise healthy mix.
+    struct SpeakerPosition { int16_t azimuth, elevation; };
+    struct SpeakerInfo {
+        uint8_t type;
+        uint8_t reserved0;
+        int16_t reserved1;
+        uint32_t available_bits;
+        uint32_t flags;
+        uint32_t reserved2;
+        SpeakerPosition positions[16];
+    } info{};
+    static_assert(sizeof(SpeakerInfo) == 0x50);
+    info.type = 0;                 // conventional speaker array
+    info.available_bits = 0x3;    // front-left and front-right
+    info.positions[0] = {-30, 0};
+    info.positions[1] = { 30, 0};
+    if (!audio_store_bytes(a0, &info, sizeof(info))) return kA2ErrInvalidParam;
+    return 0;
+}
+
+bool audio2_speaker_array_valid(uint64_t handle) {
+    const uint64_t index = handle & 0xff;
+    return (handle & ~0xffull) == kA2SpeakerArrayTag && index >= 1 && index <= 32 &&
+           g_a2_speaker_arrays[index - 1];
+}
+
+HLE(audio2_speaker_array_create) {
+    // Signature: (SpeakerArrayHandle* out, const void* vbap_params, const void* ambi_params).
+    // The work-memory and speaker geometry live in those parameter objects; this backend only needs
+    // an opaque identity because it computes deterministic stereo coefficients below.
+    if (getenv("PROSPER_AUDIO2_PROBE")) {
+        fprintf(stderr, "[audio2-speaker] create out=0x%llx vbap=0x%llx ambi=0x%llx\n",
+                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2);
+        const uint64_t params[2] = {a1, a2};
+        for (uint32_t p = 0; p < 2; ++p) {
+            uint8_t bytes[64]{};
+            const size_t got = audio_read_bytes_partial(params[p], bytes, sizeof(bytes));
+            if (!got) continue;
+            fprintf(stderr, "[audio2-speaker]   param%u[0..%zu]:", p, got);
+            for (size_t i = 0; i < got; ++i) fprintf(stderr, " %02x", bytes[i]);
+            fprintf(stderr, "\n");
+        }
+    }
+    std::lock_guard<std::mutex> lk(g_a2_mx);
+    for (uint64_t i = 0; i < 32; ++i) {
+        if (g_a2_speaker_arrays[i]) continue;
+        const uint64_t handle = kA2SpeakerArrayTag | (i + 1);
+        if (!a2_store_u64(a0, handle)) return kA2ErrInvalidParam;
+        g_a2_speaker_arrays[i] = true;
+        return 0;
+    }
+    return kA2ErrPortFull;
+}
+
+HLE(audio2_speaker_array_destroy) {
+    std::lock_guard<std::mutex> lk(g_a2_mx);
+    if (!audio2_speaker_array_valid(a0)) return kA2ErrInvalidParam;
+    g_a2_speaker_arrays[(a0 & 0xff) - 1] = false;
+    return 0;
+}
+
+// The position/spread/downmix arguments use the SysV guest ABI's independent XMM argument sequence;
+// handle/output/count/height therefore arrive in RDI/RSI/RDX/RCX. The current deterministic stereo
+// fallback does not consume the float inputs, so use the normal integer HLE bridge. This is also
+// required on Windows, whose import stubs translate the guest's integer registers but do not yet
+// marshal XMM arguments into a typed Microsoft-ABI call.
+HLE(audio2_get_speaker_array_coefficients) {
+    const uint64_t handle = a0;
+    const uint64_t coefficients = a1;
+    const uint32_t count = (uint32_t)a2;
+    const uint8_t height_aware = (uint8_t)a3;
+    if (getenv("PROSPER_AUDIO2_PROBE")) {
+        static std::atomic<uint32_t> calls{0};
+        const uint32_t call = calls.fetch_add(1);
+        if (call < 64)
+            fprintf(stderr, "[audio2-speaker] coeff #%u handle=0x%llx out=0x%llx "
+                    "count=%u height=%u\n", call + 1, (unsigned long long)handle,
+                    (unsigned long long)coefficients, count, height_aware);
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_a2_mx);
+        if (!audio2_speaker_array_valid(handle)) return kA2ErrInvalidParam;
+    }
+    if ((!coefficients && count) || count > 256) return kA2ErrInvalidParam;
+    std::vector<float> values(count, 0.0f);
+    if (count > 0) values[0] = 1.0f;
+    if (count > 1) values[1] = 1.0f;
+    if (values.empty()) return 0;
+    return audio_store_bytes(coefficients, values.data(), values.size() * sizeof(float))
+        ? 0 : kA2ErrInvalidParam;
+}
+
+HLE(audio2_get_speaker_array_ambisonics_coefficients) {
+    if (getenv("PROSPER_AUDIO2_PROBE")) {
+        static std::atomic<uint32_t> calls{0};
+        const uint32_t call = calls.fetch_add(1);
+        if (call < 64)
+            fprintf(stderr, "[audio2-speaker] ambi #%u handle=0x%llx channel=%llu "
+                    "out=0x%llx count=%llu\n", call + 1, (unsigned long long)a0,
+                    (unsigned long long)a1, (unsigned long long)a2,
+                    (unsigned long long)a3);
+    }
+    std::lock_guard<std::mutex> lk(g_a2_mx);
+    if (!audio2_speaker_array_valid(a0) || (!a2 && a3) || a3 > 256) return kA2ErrInvalidParam;
+    std::vector<float> values((size_t)a3, 0.0f);
+    if (!values.empty()) values[0] = (a1 == 0 || a1 == 64) ? 0.70710677f : 1.0f;
+    if (values.empty()) return 0;
+    return audio_store_bytes(a2, values.data(), values.size() * sizeof(float))
+        ? 0 : kA2ErrInvalidParam;
+}
+
+HLE(audio2_mastering_init) {
+    audio2_control_probe("sceAudioOut2MasteringInit", a0, a1, a2, a3, a4, a5);
+    return 0;
+}
+HLE(audio2_mastering_term) {
+    audio2_control_probe("sceAudioOut2MasteringTerm", a0, a1, a2, a3, a4, a5);
+    return 0;
+}
+HLE(audio2_mastering_set_param) {
+    audio2_control_probe("sceAudioOut2MasteringSetParam", a0, a1, a2, a3, a4, a5);
+    return 0;
+}
+HLE(audio2_mastering_get_state) {
+    audio2_control_probe("sceAudioOut2MasteringGetState", a0, a1, a2, a3, a4, a5);
+    return 0;
+}
+
+// Return the device queue state after draining whole grains according to the 48 kHz hardware clock.
+// Both outputs are optional in the SDK contract.
+HLE(audio2_ctx_get_queue_level) {
+    A2LOG("sceAudioOut2ContextGetQueueLevel");
+    static std::atomic<uint32_t> control_probes{0};
+    if (control_probes.fetch_add(1) < 8)
+        audio2_control_probe("sceAudioOut2ContextGetQueueLevel", a0, a1, a2, a3, a4, a5);
+    uint32_t queued = 0, available = 4;
+    const uint64_t idx = a0 & 0xff;
+    {
+        std::lock_guard<std::mutex> lk(g_a2_mx);
+        if ((a0 & ~0xffull) != kA2CtxTag || idx < 1 || idx > 4 ||
+            !g_a2_ctx[idx - 1].used) return kA2ErrInvalidParam;
+        A2Context& context = g_a2_ctx[idx - 1];
+        audio2_update_queue_locked(context, std::chrono::steady_clock::now());
+        queued = context.queued;
+        available = queued < context.queue_depth ? context.queue_depth - queued : 0;
+    }
+    if (a1 && !a2_store_u32(a1, queued)) return kA2ErrInvalidParam;
+    if (a2 && !a2_store_u32(a2, available)) return kA2ErrInvalidParam;
+    return 0;
+}
+
+HLE(audio2_get_system_state) {
+    A2LOG("sceAudioOut2GetSystemState");
+    static std::atomic<uint32_t> control_probes{0};
+    if (control_probes.fetch_add(1) < 8)
+        audio2_control_probe("sceAudioOut2GetSystemState", a0, a1, a2, a3, a4, a5);
+    // { float loudness; u32 pad; u64 reserved[7]; }
+    if (!a2_store_zeros(a0, 0x40)) return kA2ErrInvalidParam;
+    return 0;
+}
+
+// Generic logging probes for the not-yet-exercised remainder of the surface.  These functions can
+// be called once per grain, so sample each export independently: a hot GetSystemState loop must not
+// consume the shared diagnostic budget before a later mastering/control call becomes visible.
+#define A2_PROBE(fn, str) HLE(fn) {                                      \
+    A2LOG(str);                                                          \
+    static std::atomic<uint32_t> control_probes{0};                      \
+    if (control_probes.fetch_add(1) < 8)                                 \
+        audio2_control_probe(str, a0, a1, a2, a3, a4, a5);              \
+    return 0;                                                            \
+}
 A2_PROBE(audio2_ctx_bed_write,   "sceAudioOut2ContextBedWrite")
 A2_PROBE(audio2_port_register,   "sceAudioOut2PortRegister")
 A2_PROBE(audio2_port_unregister, "sceAudioOut2PortUnregister")
-A2_PROBE(audio2_get_system_state, "sceAudioOut2GetSystemState")
-A2_PROBE(audio2_get_speaker_info, "sceAudioOut2GetSpeakerInfo")
-A2_PROBE(audio2_mastering_init,  "sceAudioOut2MasteringInit")
-A2_PROBE(audio2_mastering_term,  "sceAudioOut2MasteringTerm")
-A2_PROBE(audio2_mastering_set_param, "sceAudioOut2MasteringSetParam")
-A2_PROBE(audio2_mastering_get_state, "sceAudioOut2MasteringGetState")
 #undef A2_PROBE
 
-// --- libSceAjm (Audio Job Manager — compressed-audio decode: ATRAC9/MP3/AAC) (#187) ---
-// PPSA02664 initializes AJM at startup. prosper does not decode compressed audio (the AudioOut path
-// already discards/plays raw PCM headlessly), so this is a faithful HEADLESS lifecycle: every handle
-// out-param (context / instance / batch id) is filled with a REAL opaque handle — never left as the
-// caller's garbage, the bug the generic stub caused — inputs are validated, and a submitted decode
-// batch reports "started" then "complete" so the guest's audio pipeline proceeds (producing silence,
-// exactly like AudioSink discarding). It does NOT run the decode jobs — real ATRAC9/MP3/AAC decoding
-// is a separate, large piece and isn't needed to boot. Signatures verified vs shadPS4
-// src/core/libraries/ajm/ajm.h; error codes from ajm_error.h. CONFIDENCE: HIGH (handle lifecycle);
-// the no-decode behavior is intentional, not a guess.
+// --- libSceAjm (Audio Job Manager — compressed-audio decode: ATRAC9/MP3/AAC) --------------------
+// The core owns AJM handles, builders, synchronous batch execution, guest-memory copies, and result
+// sidebands. ATRAC9 is decoded by vendored LibAtrac9; MP3 is delegated through ajm_decoder.hpp to an
+// optional general-purpose host codec frontend. Unsupported codecs fail truthfully in the sideband.
+// CONFIDENCE: HIGH for the exercised ATRAC9 (Blasphemous 2) and MP3 (GTA V) batch-2 paths.
 namespace {
     std::atomic<uint32_t> g_ajm_next{1};   // one non-zero counter for context/instance/batch handles
     // AJM returns signed 32-bit SCE errors. Preserve that ABI in the full HLE return register,
@@ -1011,12 +1432,15 @@ namespace {
             ? destination + job.size() : 0;
     }
 }
-// --- AJM ATRAC9 decode state (batch-2.0 path; see ajm2_decode_batch below) ---------------------
+// --- AJM decode state (batch-2.0 path; see ajm2_decode_batch below) ----------------------------
 namespace {
-struct AjmAt9Inst {
+struct AjmDecodeInst {
+    uint32_t codec = UINT32_MAX;          // AjmCodecType supplied to InstanceCreate
+    uint64_t flags = 0;
+    std::unique_ptr<ajm::StreamDecoder> host_dec; // optional MP3/AAC frontend codec
     uint8_t  config[4] = {0};
     bool     have_config = false;
-    std::unique_ptr<Atrac9Decoder> dec;   // persistent per instance: preserves MDCT overlap across blocks
+    std::unique_ptr<Atrac9Decoder> at9_dec; // persistent per instance: preserves MDCT overlap across blocks
     uint32_t skip_samples = 0;            // gapless program: priming frames to drop at program start
     uint64_t total_samples = 0;           // gapless program: trimmed frames to deliver (0 = no program)
     uint32_t skip_remaining = 0;          // frames still to drop (counts down from skip_samples)
@@ -1042,8 +1466,29 @@ uint64_t ajm2_log_ms() {
     return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
 }
+
+// Optional live codec capture. Keeping compressed input and the exact returned PCM in separate,
+// per-instance files lets the same stream be decoded independently when diagnosing a codec or ABI
+// mismatch. Disabled unless explicitly requested; AJM execution is serialized by g_ajm2_mx.
+void ajm2_dump_decode(uint32_t instance, std::span<const uint8_t> input,
+                      const int16_t* pcm, uint32_t pcm_bytes) {
+    const char* base = getenv("PROSPER_AJM_DUMP");
+    if (!base || !*base) return;
+    char path[1024];
+    auto append = [&](const char* suffix, const void* data, size_t size) {
+        if (!data || !size) return;
+        const int n = std::snprintf(path, sizeof(path), "%s.inst%u.%s", base, instance, suffix);
+        if (n <= 0 || static_cast<size_t>(n) >= sizeof(path)) return;
+        if (FILE* f = std::fopen(path, "ab")) {
+            std::fwrite(data, 1, size, f);
+            std::fclose(f);
+        }
+    };
+    append("mp3", input.data(), input.size());
+    append("s16le", pcm, pcm_bytes);
+}
 std::mutex g_ajm2_mx;
-std::map<uint32_t, AjmAt9Inst> g_ajm2_inst;               // instance id -> decode state
+std::map<uint32_t, AjmDecodeInst> g_ajm2_inst;             // instance id -> codec + decode state
 std::map<uint64_t, std::vector<AjmDecJob>> g_ajm2_jobs;   // batchInfo -> queued decode jobs
 } // namespace
 
@@ -1067,15 +1512,25 @@ HLE(ajm_instance_create) {
                                             (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2);
     if (!a0) return AJM_ERR_INVALID_CONTEXT;
     if (!a3) return AJM_ERR_INVALID_PARAMETER;
-    if (!a2_store_u32(a3, g_ajm_next.fetch_add(1))) return AJM_ERR_INVALID_PARAMETER;
+    const uint32_t id = g_ajm_next.fetch_add(1);
+    if (!a2_store_u32(a3, id)) return AJM_ERR_INVALID_PARAMETER;
+    AjmDecodeInst instance{};
+    instance.codec = (uint32_t)a1;
+    instance.flags = a2;
+    if (ajm::DecoderBackend* backend = ajm::decoder_backend())
+        instance.host_dec = backend->create((ajm::Codec)instance.codec, instance.flags);
+    {
+        std::lock_guard<std::mutex> lk(g_ajm2_mx);
+        g_ajm2_inst.emplace(id, std::move(instance));
+    }
     return 0;
 }
 // sceAjmInstanceDestroy(u32 context, u32 instance).
 HLE(ajm_instance_destroy) {
     if (!a0) return AJM_ERR_INVALID_CONTEXT;
     if (!a1) return AJM_ERR_INVALID_INSTANCE;
-    {   // Release this instance's ATRAC9 decoder; the LibAtrac9 handle holds ~100 KiB of MDCT state,
-        // and instance ids are monotonic, so without this the table grows for the process lifetime.
+    {   // Release this instance's persistent codec state. Instance ids are monotonic, so without
+        // this both LibAtrac9 and host decoder state would grow for the process lifetime.
         std::lock_guard<std::mutex> lk(g_ajm2_mx);
         g_ajm2_inst.erase((uint32_t)a1);
     }
@@ -1085,16 +1540,15 @@ HLE(ajm_instance_destroy) {
 // the caller's batch info so its job builders write into pBatchBuffer starting at offset 0. Was
 // UNIMPLEMENTED (Evergate calls it first, NID MmpF1XsQiHw): the generic stub returned 0 without touching
 // pBatchInfo, so the guest built its audio-decode batch on a garbage buffer/cursor, never ran a decode
-// job, and never opened an AudioOut port -> total silence. Layout: { void* pBuffer; size_t offset(cursor
-// bytes used, starts 0); size_t size; }. CONFIDENCE: MED — 24-byte layout derived from Evergate's live
-// call pattern (buffer/size/info args + a clean validated run); not yet cross-checked against a second
-// title or the caller's stack-frame disassembly.
+// job, and never opened an AudioOut port -> total silence. GTA V confirms the full 40-byte layout:
+// { void* pBuffer; size_t offset; size_t size; void* lastGoodJob; void* lastGoodJobReturnAddress; }.
+// CONFIDENCE: HIGH — live Evergate construction plus GTA V's initialized 40-byte object and builders.
 HLE(ajm_batch_initialize) {
     if (getenv("PROSPER_AUDIOLOG")) { static int n; if (n++ < 8)
         fprintf(stderr, "[ajm] BatchInitialize buf=0x%llx size=%llu info=0x%llx\n",
                 (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2); }
     if (!a0 || !a1 || !a2) return AJM_ERR_INVALID_PARAMETER;
-    uint64_t info[3] = { a0, 0, a1 };   // pBuffer, offset=0, size
+    uint64_t info[5] = { a0, 0, a1, 0, 0 };
     if (!audio_store_bytes(a2, info, sizeof info)) return AJM_ERR_INVALID_PARAMETER;
     {   // Re-initializing a batch discards anything queued on it: a guest that abandons a batch and
         // rebuilds it must not have the old jobs decoded into output buffers it may since have freed.
@@ -1280,34 +1734,35 @@ HLE10(ajm_batch_job_run_split_buffer_ra) {
     return ajm_write_job(a0, (uint32_t)a1, payload);
 }
 
-// --- AJM batch-2.0 ATRAC9 decode (Blasphemous 2 / FMOD) --------------------------------------------
-// B2's FMOD decodes ATRAC9 through the newer BatchJob* builders (distinct from the RunBufferRa model
-// above). ABI recovered from live capture (PROSPER_AUDIOLOG dumps of B2's calls):
+// --- AJM batch-2.0 compressed-audio decode (Blasphemous 2 / GTA V) -----------------------------
+// B2's FMOD decodes ATRAC9 and GTA V decodes MP3 through the newer BatchJob* builders (distinct from
+// the RunBufferRa model above). ABI recovered from live PROSPER_AUDIOLOG captures:
 //   sceAjmBatchJobInitialize(batchInfo, instance, cfgPtr, cfgSize=8, resultPtr, ...)
 //        cfgPtr[0..3] = the 4-byte ATRAC9 ConfigData (starts 0xFE; e.g. FE 72 09 F0 = 48k stereo).
 //   sceAjmBatchJobSetGaplessDecode(batchInfo, instance, {u32 total, u32 skip}, 1, resultPtr, ...)
 //   sceAjmBatchJobDecode(batchInfo, instance, in, inSize, out, outSize, resultPtr, retAddr, 0, resultPtr)
 //        decode inSize compressed bytes at `in` into interleaved S16 PCM at `out` (<= outSize).
 //   sceAjmBatchStart(context, batchInfo, priority, ...) -> run all jobs queued on batchInfo.
-// prosper accepts the batches, decodes each job through the vendored LibAtrac9, writes PCM into the
-// guest output buffer, and fills the result sideband. FMOD then mixes the PCM into its AudioOut2 MAIN
-// port. CONFIDENCE: MED — ABI + config from live B2 evidence; decoder is the test-covered LibAtrac9
-// glue; the result-sideband layout is the published SceAjmSidebandResult/Stream contract (below).
+// prosper accepts the batches, decodes each job through vendored LibAtrac9 or an optional host codec,
+// writes PCM into the guest output buffer, and fills the result sideband. The guest then mixes it into
+// its AudioOut2 MAIN port. CONFIDENCE: HIGH — live B2 and GTA V evidence plus focused codec tests.
 namespace {
 
-// Write the AJM decode result sideband (published contract), into the 24-byte buffer the guest zeroed:
+// Write the AJM decode result sideband (published contract), into the 32-byte decode buffer:
 //   SceAjmSidebandResult { s32 iResult; s32 iCodecResult; }          (0 / 0 = success)
 //   SceAjmSidebandStream { u32 iSizeConsumed; u32 iSizeProduced;     (input bytes used / PCM bytes out)
 //                          u64 uiTotalDecodedSamples; }
+//   SceAjmSidebandMFrame { u32 numFrames; u32 reserved; }            (codec frames decoded by this job)
 // uiTotalDecodedSamples is load-bearing, not padding: with it left zero the guest's mixer (FMOD) stops
 // after a single batch, so it carries the instance's running sample-frame total.
 void ajm2_write_result(uint64_t result_addr, int32_t err, uint32_t consumed, uint32_t produced,
-                       uint64_t total_samples = 0) {
+                       uint64_t total_samples = 0, uint32_t decoded_frames = 0) {
     if (!result_addr) return;
     struct Sideband { int32_t iResult; int32_t iCodecResult; uint32_t iSizeConsumed;
-                      uint32_t iSizeProduced; uint64_t uiTotalDecodedSamples; };
-    static_assert(sizeof(Sideband) == 24, "AJM decode sideband must match the guest's 24-byte buffer");
-    Sideband sb{ err, 0, consumed, produced, total_samples };
+                      uint32_t iSizeProduced; uint64_t uiTotalDecodedSamples;
+                      uint32_t numFrames; uint32_t reserved; };
+    static_assert(sizeof(Sideband) == 32, "AJM decode sideband must include the MFrame result");
+    Sideband sb{ err, 0, consumed, produced, total_samples, decoded_frames, 0 };
     audio_store_bytes(result_addr, &sb, sizeof sb);
 }
 
@@ -1323,8 +1778,60 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
         const uint32_t inst_id = jobs[ji].instance;
         size_t je = ji; while (je < jobs.size() && jobs[je].instance == inst_id) ++je;  // [ji,je) same instance
         auto it = g_ajm2_inst.find(inst_id);
-        Atrac9Decoder* dec = (it != g_ajm2_inst.end() && it->second.dec && it->second.dec->valid())
-                             ? it->second.dec.get() : nullptr;
+        // InstanceCreate normally constructs optional codecs. Also retry lazily in case a test or
+        // embedding frontend installed its backend after creating the guest instance.
+        if (it != g_ajm2_inst.end() && !it->second.host_dec &&
+            it->second.codec != UINT32_MAX) {
+            if (ajm::DecoderBackend* backend = ajm::decoder_backend())
+                it->second.host_dec = backend->create((ajm::Codec)it->second.codec, it->second.flags);
+        }
+        if (it != g_ajm2_inst.end() && it->second.host_dec && it->second.host_dec->valid()) {
+            AjmDecodeInst& instance = it->second;
+            const bool log = getenv("PROSPER_AUDIOLOG") != nullptr;
+            for (size_t k = ji; k < je; ++k) {
+                AjmDecJob& job = jobs[k];
+                std::vector<uint8_t> input(job.in_size);
+                const size_t got = audio_read_bytes_partial(job.in_addr, input.data(), input.size());
+                std::vector<int16_t> pcm(job.out_size / sizeof(int16_t));
+                const ajm::DecodeResult decoded = instance.host_dec->decode(
+                    std::span<const uint8_t>(input.data(), got), std::span<int16_t>(pcm));
+                const uint32_t frame_bytes = decoded.channels * sizeof(int16_t);
+                // A streaming parser may consume a compressed prefix before it has one complete
+                // frame and therefore before it can report the stream's channel count. That is a
+                // successful zero-output job: requiring frame_bytes here would report an error
+                // after advancing persistent parser state, prompting the guest to resend bytes we
+                // already consumed. Channel alignment becomes meaningful only once PCM is emitted.
+                const bool pcm_shape_valid = decoded.produced_bytes == 0 ||
+                    (frame_bytes != 0 && decoded.produced_bytes % frame_bytes == 0);
+                const bool valid = decoded.ok && decoded.consumed_bytes <= got &&
+                    decoded.produced_bytes <= job.out_size &&
+                    decoded.produced_bytes <= pcm.size() * sizeof(int16_t) &&
+                    pcm_shape_valid;
+                int32_t err = valid ? 0 : kAjm2ErrDecode;
+                uint32_t consumed = valid ? decoded.consumed_bytes : 0;
+                uint32_t produced = valid ? decoded.produced_bytes : 0;
+                if (produced && !audio_store_bytes(job.out_addr, pcm.data(), produced)) {
+                    err = kAjm2ErrDecode;
+                    consumed = produced = 0;
+                }
+                if (!err) ajm2_dump_decode(inst_id,
+                    std::span<const uint8_t>(input.data(), consumed), pcm.data(), produced);
+                if (!err && produced) instance.decoded_samples += produced / frame_bytes;
+                ajm2_write_result(job.result_addr, err, consumed, produced,
+                                  instance.decoded_samples, decoded.decoded_frames);
+                if (log)
+                    fprintf(stderr, "[ajm2] t=%llums decode inst=%u codec=%u in=%zu/%u "
+                            "out=%u -> %u consumed, %u PCM, %uch/%uHz total=%llu%s\n",
+                            (unsigned long long)ajm2_log_ms(), inst_id, instance.codec,
+                            got, job.in_size, job.out_size, consumed, produced, decoded.channels,
+                            decoded.sample_rate, (unsigned long long)instance.decoded_samples,
+                            err ? " ERR" : "");
+            }
+            ji = je;
+            continue;
+        }
+        Atrac9Decoder* dec = (it != g_ajm2_inst.end() && it->second.at9_dec && it->second.at9_dec->valid())
+                             ? it->second.at9_dec.get() : nullptr;
         if (!dec) { for (size_t k = ji; k < je; ++k) ajm2_write_result(jobs[k].result_addr, kAjm2ErrDecode, 0, 0); ji = je; continue; }
         const int ch = dec->channels();
         const int sfb = dec->superframe_bytes();
@@ -1340,7 +1847,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
 
         for (size_t k = ji; k < je; ++k) {
             AjmDecJob& job = jobs[k];
-            AjmAt9Inst& I = it->second;
+            AjmDecodeInst& I = it->second;
             // A programmed gapless decode (#1097): drop `skip` priming frames at the program start,
             // deliver EXACTLY `total` trimmed frames, then pin the reported total there with no
             // further PCM. FMOD's channel-end and codec-slot recycling key off that exact landing;
@@ -1356,7 +1863,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
             // Only ever hand the guest whole sample-frames: a byte-granular partial write would shift
             // the interleave and swap L/R for the rest of the stream.
             const uint32_t out_cap = job.out_size - (job.out_size % frame_bytes);
-            uint32_t in_cur = 0, produced = 0;
+            uint32_t in_cur = 0, produced = 0, decoded_codec_frames = 0;
             int32_t err = 0;
             // Deliver `nframes` at `src`: end-trim against the program total, then write what the
             // output has room for. Returns the number of frames written; `spill` gets the within-
@@ -1403,6 +1910,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                 if (dec->decode_superframe(in.data() + in_cur, pcm.data(),
                                            (int)(got - in_cur)) < 0) { err = kAjm2ErrDecode; break; }
                 in_cur += (uint32_t)sfb;
+                ++decoded_codec_frames;
                 const int16_t* block = pcm.data();
                 uint32_t nframes = (uint32_t)sfs;
                 if (prog && I.skip_remaining) {     // priming skip: stream-order, decode-time drop
@@ -1419,7 +1927,8 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
             }
             I.decoded_samples += produced / frame_bytes;
             ajm2_write_result(job.result_addr, err, in_cur, produced,
-                              prog ? I.gapless_delivered : I.decoded_samples);
+                              prog ? I.gapless_delivered : I.decoded_samples,
+                              decoded_codec_frames);
             if (log)
                 fprintf(stderr, "[ajm2] t=%llums decode inst=%u in=%zu/%u out=%u -> %u consumed, %u PCM, total=%llu carry=%zu%s\n",
                         (unsigned long long)ajm2_log_ms(), inst_id, got, job.in_size, job.out_size,
@@ -1437,7 +1946,7 @@ HLE10(ajm_batch_job_initialize) {
     uint8_t cfg[4] = {0};
     const bool have = a2 && audio_read_bytes(a2, cfg, 4) && cfg[0] == 0xFE;
     std::lock_guard<std::mutex> lk(g_ajm2_mx);
-    AjmAt9Inst& inst = g_ajm2_inst[(uint32_t)a1];
+    AjmDecodeInst& inst = g_ajm2_inst[(uint32_t)a1];
     const bool config_changed =
         have && (!inst.have_config || std::memcmp(inst.config, cfg, 4) != 0);
     if (getenv("PROSPER_AUDIOLOG")) {   // #1097: every re-init, with the state it inherits
@@ -1453,8 +1962,9 @@ HLE10(ajm_batch_job_initialize) {
     if (config_changed) {
         std::memcpy(inst.config, cfg, 4);
         inst.have_config = true;
-        inst.dec = std::make_unique<Atrac9Decoder>();
-        if (!inst.dec->init(cfg)) inst.dec.reset();
+        inst.codec = (uint32_t)ajm::Codec::Atrac9;
+        inst.at9_dec = std::make_unique<Atrac9Decoder>();
+        if (!inst.at9_dec->init(cfg)) inst.at9_dec.reset();
         // A different stream format on a reused slot: drop the old stream's pending PCM and
         // program state; the guest programs a fresh gapless spec for the new sound (#1097).
         inst.carry.clear();
@@ -1464,7 +1974,7 @@ HLE10(ajm_batch_job_initialize) {
         if (getenv("PROSPER_AUDIOLOG"))
             fprintf(stderr, "[ajm2] JobInitialize inst=%llu config=%02x%02x%02x%02x decoder=%s\n",
                     (unsigned long long)a1, cfg[0], cfg[1], cfg[2], cfg[3],
-                    inst.dec ? "ok" : "init-failed");
+                    inst.at9_dec ? "ok" : "init-failed");
     }
     return 0;
 }
@@ -1474,7 +1984,7 @@ HLE10(ajm_batch_job_gapless) {
     uint32_t g[2] = {0, 0};
     if (a2) audio_read_bytes(a2, g, sizeof g);
     std::lock_guard<std::mutex> lk(g_ajm2_mx);
-    AjmAt9Inst& inst = g_ajm2_inst[(uint32_t)a1];
+    AjmDecodeInst& inst = g_ajm2_inst[(uint32_t)a1];
     inst.total_samples = g[0];
     inst.skip_samples = g[1];
     // A gapless spec (re)starts the decode PROGRAM (#1097): the skip applies from here, the
@@ -1496,6 +2006,14 @@ HLE10(ajm_batch_job_gapless) {
 HLE10(ajm_batch_job_decode) {
     // Queue a decode op on this batch; executed in order at BatchStart. a2/a3 = in/inSize,
     // a4/a5 = out/outSize, a6 = result sideband.
+    if (getenv("PROSPER_AUDIOLOG")) { static std::atomic<uint32_t> n{0}; if (n.fetch_add(1) < 16)
+        fprintf(stderr, "[ajm2] JobDecode batch=0x%llx inst=%llu in=0x%llx/%llu "
+                        "out=0x%llx/%llu result=0x%llx ra=0x%llx tail=0x%llx,0x%llx\n",
+                (unsigned long long)a0, (unsigned long long)a1,
+                (unsigned long long)a2, (unsigned long long)a3,
+                (unsigned long long)a4, (unsigned long long)a5,
+                (unsigned long long)a6, (unsigned long long)a7,
+                (unsigned long long)a8, (unsigned long long)a9); }
     if (!a0 || !a2 || !a4) return AJM_ERR_INVALID_PARAMETER;
     // Bound the guest-supplied sizes with the same cap the older AJM builders use. Unbounded values
     // would request a multi-gigabyte zero-filled staging buffer per job (a bad_alloc thrown through a
@@ -1507,13 +2025,23 @@ HLE10(ajm_batch_job_decode) {
 }
 HLE10(ajm_batch_start2) {
     // Run every decode job queued on this batchInfo (a1), in order, then clear it. Synchronous:
-    // BatchWait then just returns success.
+    // BatchWait then just returns success. GTA V passes its u32 batch-id output in a4 and immediately
+    // waits on it; leaving the initialized sentinel (0xffffffff) there breaks the lifecycle even when
+    // decode itself succeeded. a3 is the optional batch-error object, unused on a successful start.
+    if (getenv("PROSPER_AUDIOLOG")) { static std::atomic<uint32_t> n{0}; if (n.fetch_add(1) < 16)
+        fprintf(stderr, "[ajm2] BatchStart ctx=%llu batch=0x%llx priority=%llu "
+                        "a3=0x%llx a4=0x%llx a5=0x%llx a6=0x%llx a7=0x%llx a8=0x%llx a9=0x%llx\n",
+                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+                (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5,
+                (unsigned long long)a6, (unsigned long long)a7, (unsigned long long)a8,
+                (unsigned long long)a9); }
     std::lock_guard<std::mutex> lk(g_ajm2_mx);
     auto it = g_ajm2_jobs.find(a1);
     if (it != g_ajm2_jobs.end()) {
         ajm2_decode_batch(it->second);
         g_ajm2_jobs.erase(it);      // erase, not clear: the map is keyed by a guest pointer
     }
+    if (a4 && !a2_store_u32(a4, g_ajm_next.fetch_add(1))) return AJM_ERR_INVALID_PARAMETER;
     return 0;
 }
 
@@ -2249,6 +2777,11 @@ void register_audio_hle() {
     R("sceAudioOut2GetSystemState", audio2_get_system_state);
     R("sceAudioOut2GetSpeakerInfo", audio2_get_speaker_info);
     R("sceAudioOut2GetSpeakerArrayMemorySize", audio2_get_speaker_array_memory_size);  // GTA V (#1134)
+    R("sceAudioOut2SpeakerArrayCreate", audio2_speaker_array_create);
+    R("sceAudioOut2SpeakerArrayDestroy", audio2_speaker_array_destroy);
+    R("sceAudioOut2GetSpeakerArrayCoefficients", audio2_get_speaker_array_coefficients);
+    R("sceAudioOut2GetSpeakerArrayAmbisonicsCoefficients",
+      audio2_get_speaker_array_ambisonics_coefficients);
     R("sceAudioOut2MasteringInit", audio2_mastering_init);
     R("sceAudioOut2MasteringTerm", audio2_mastering_term);
     R("sceAudioOut2MasteringSetParam", audio2_mastering_set_param);

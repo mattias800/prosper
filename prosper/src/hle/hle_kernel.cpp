@@ -1703,14 +1703,18 @@ HLE(k_mutex_timedlock) {
 }
 // scePthreadCondTimedwait(cond, mutex, SceKernelUseconds usec): the Sony 3rd arg is a RELATIVE µs scalar,
 // NOT an abstime pointer -> it must NOT be aliased to the POSIX k_cond_timedwait (which reads a2 as a
-// timespec*, so a small µs integer there derefs a bogus pointer). Was MISSING -> the stub returned 0
-// (= "woke"), so a timed cond-wait loop busy-spun (the same #115 class fixed for the POSIX variant).
+// timespec*, so a small µs integer there derefs a bogus pointer). Unlike pthread_cond_timedwait, the
+// Sony entry point returns the encoded SCE_KERNEL_ERROR_ETIMEDOUT (0x8002003c), not the positive
+// FreeBSD errno 60. Middleware commonly compares that exact value before returning from its bounded
+// wait; returning 60 makes it retry the timed wait forever instead of running its periodic work.
 HLE(k_cond_timedwait_sce) {
     auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
     if (!c || !m) return 0x16;                          // EINVAL
     timespec dl = abs_deadline_us(a2);
+    guest_mutex_released(m);
     int rc = interruptible_cond_timedwait(c, m, &dl);
-    return rc == ETIMEDOUT ? 60u : (uint64_t)rc;        // FreeBSD ETIMEDOUT
+    if (rc == 0 || rc == ETIMEDOUT) guest_mutex_acquired(m);
+    return rc == ETIMEDOUT ? 0x8002003cu : (uint64_t)rc;
 }
 // scePthreadRwlockTimedrd/wrlock(rwlock, SceKernelUseconds usec): acquire with a RELATIVE µs timeout.
 // Were MISSING -> the generic stub returned 0 (= "lock held") without taking the lock, so the guest ran

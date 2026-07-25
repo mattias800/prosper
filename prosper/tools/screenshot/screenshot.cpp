@@ -34,6 +34,9 @@
 #ifdef PROSPER_VIDEO_VAAPI
 #include "vaapi_backend.hpp"             // native Linux FFmpeg demux + VA-API hardware decode
 #endif
+#ifdef PROSPER_AUDIO_FFMPEG
+#include "ajm_ffmpeg.hpp"                // AJM MP3 decoder (keeps capture boot behavior app-equivalent)
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -510,6 +513,10 @@ int main(int argc, char** argv) {
     prosper::frontend::register_live_renderer(".", /*dump_bmps=*/false);
     Program prog; std::string err;
     if (!boot_program(dump, prog, &err, [&]{
+#ifdef PROSPER_AUDIO_FFMPEG
+        if (!prosper::ajm::install_ffmpeg_decoder_backend())
+            fprintf(stderr, "[ajm] FFmpeg audio decoder unavailable\n");
+#endif
 #ifdef PROSPER_VIDEO_MF
         if (!prosper::video::install_media_foundation_backend())
             fprintf(stderr, "[avp] Media Foundation backend unavailable\n");

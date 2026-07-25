@@ -7,6 +7,8 @@
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
 #include "../src/hle/audio.hpp"
+#include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -77,8 +79,8 @@ int main() {
 
     // AudioOut2 shares the guest-store primitive with AJM. Inaccessible outputs must report an
     // error instead of faulting the host; these cover both fixed-size zero-fill and u64 stores.
-    CHECK((int32_t)call("sceAudioOut2ContextResetParam", 1) == (int32_t)0x80260003);
-    CHECK((int32_t)call("sceAudioOut2ContextQueryMemory", 0, 1) == (int32_t)0x80260003);
+    CHECK((int32_t)call("sceAudioOut2ContextResetParam", 1) == (int32_t)0x80268001);
+    CHECK((int32_t)call("sceAudioOut2ContextQueryMemory", 0, 1) == (int32_t)0x80268001);
 
     // --- 2. open -> handle + backend.open with decoded params --------------------------------
     audio_reset();
@@ -245,7 +247,230 @@ int main() {
     CHECK((int32_t)call("sceAudioInOpen", 1, 0, 7, 64, 48000, 2) == (int32_t)0x80260107);
     audio_reset();
 
-    // --- 11. libSceNgs2 silent lifecycle: sizes, handles, state, and render output -------------
+    // --- 11. libSceAudioOut2: a dirty ABI padding word must not corrupt the attribute id --------
+    audio_reset(); sink = CapturingSink{}; audio_set_sink(&sink);
+    struct A2SpeakerPosition { int16_t azimuth, elevation; };
+    struct A2SpeakerInfo {
+        uint8_t type, reserved0;
+        int16_t reserved1;
+        uint32_t available_bits, flags, reserved2;
+        A2SpeakerPosition positions[16];
+    } a2_speakers;
+    static_assert(sizeof(A2SpeakerInfo) == 0x50);
+    memset(&a2_speakers, 0xCC, sizeof(a2_speakers));
+    CHECK(call("sceAudioOut2GetSpeakerInfo", PTR(&a2_speakers), 1, 0) == 0);
+    CHECK(a2_speakers.type == 0 && a2_speakers.available_bits == 0x3);
+    CHECK(a2_speakers.flags == 0 && a2_speakers.reserved2 == 0);
+    CHECK(a2_speakers.positions[0].azimuth == -30 && a2_speakers.positions[0].elevation == 0);
+    CHECK(a2_speakers.positions[1].azimuth == 30 && a2_speakers.positions[1].elevation == 0);
+    CHECK(a2_speakers.positions[2].azimuth == 0 && a2_speakers.positions[2].elevation == 0);
+    CHECK((int32_t)call("sceAudioOut2GetSpeakerInfo", 1, 1, 0) == (int32_t)0x80268001);
+
+    CHECK(call("sceAudioOut2GetSpeakerArrayMemorySize", 8, 0, 1) == 0xC00);
+    uint64_t a2_speaker_array = 0;
+    CHECK(call("sceAudioOut2SpeakerArrayCreate", PTR(&a2_speaker_array), 0, 0) == 0);
+    CHECK(a2_speaker_array != 0);
+    float a2_coefficients[8];
+    for (float& value : a2_coefficients) value = -99.0f;
+    CHECK(call("sceAudioOut2GetSpeakerArrayCoefficients", a2_speaker_array,
+               PTR(a2_coefficients), 8, 0) == 0);
+    CHECK(a2_coefficients[0] == 1.0f && a2_coefficients[1] == 1.0f);
+    for (size_t i = 2; i < 8; ++i) CHECK(a2_coefficients[i] == 0.0f);
+    for (float& value : a2_coefficients) value = -99.0f;
+    CHECK(call("sceAudioOut2GetSpeakerArrayAmbisonicsCoefficients", a2_speaker_array,
+               0, PTR(a2_coefficients), 8) == 0);
+    CHECK(std::abs(a2_coefficients[0] - 0.70710677f) < 1e-6f);
+    for (size_t i = 1; i < 8; ++i) CHECK(a2_coefficients[i] == 0.0f);
+    CHECK(call("sceAudioOut2SpeakerArrayDestroy", a2_speaker_array) == 0);
+
+    uint8_t a2_context_param[0x40]{};
+    CHECK(call("sceAudioOut2ContextResetParam", PTR(a2_context_param)) == 0);
+    CHECK(*(uint32_t*)(a2_context_param + 0x00) == 256);   // max_ports default
+    CHECK(*(uint32_t*)(a2_context_param + 0x04) == 256);   // max_object_ports default
+    CHECK(*(uint32_t*)(a2_context_param + 0x0c) == 4);     // queue_depth default
+    CHECK(*(uint32_t*)(a2_context_param + 0x10) == 512);   // num_grains default
+    CHECK(*(uint32_t*)(a2_context_param + 0x14) == 1);     // enabled
+    *(uint32_t*)(a2_context_param + 0x10) = 64;            // one 64-frame grain
+    uint64_t a2_context = 0;
+    CHECK(call("sceAudioOut2ContextCreate", PTR(a2_context_param), 0, 0, PTR(&a2_context)) == 0);
+    CHECK(a2_context != 0);
+
+    uint32_t a2_queued = 0xCCCCCCCCu, a2_available = 0xCCCCCCCCu;
+    CHECK(call("sceAudioOut2ContextGetQueueLevel", a2_context,
+               PTR(&a2_queued), PTR(&a2_available)) == 0);
+    CHECK(a2_queued == 0 && a2_available == 4);
+
+    struct A2PortParam {
+        uint16_t type, pad;
+        uint32_t data_format, rate, flags;
+        uint64_t user;
+        uint32_t reserved[10];
+    } a2_port_param{};
+    static_assert(sizeof(A2PortParam) == 0x40);
+    a2_port_param.type = 0;                               // MAIN speaker output
+    a2_port_param.data_format = 0x200;                    // float32, two channels
+    a2_port_param.rate = 48000;
+    uint64_t a2_port = 0;
+    CHECK(call("sceAudioOut2PortCreate", a2_context, PTR(&a2_port_param), PTR(&a2_port)) == 0);
+    CHECK(a2_port != 0);
+
+    struct A2PortState {
+        uint16_t output;
+        uint8_t num_channels, pad1;
+        int16_t volume;
+        uint16_t reroute_counter;
+        uint32_t flags, pad2;
+        uint64_t reserved[6];
+    } a2_state;
+    static_assert(sizeof(A2PortState) == 0x40);
+    memset(&a2_state, 0xCC, sizeof a2_state);
+    CHECK(call("sceAudioOut2PortGetState", a2_port, PTR(&a2_state)) == 0);
+    CHECK(a2_state.output == 1 && a2_state.num_channels == 2 && a2_state.volume == 127);
+    CHECK(a2_state.pad1 == 0 && a2_state.reroute_counter == 0);
+    CHECK(a2_state.flags == 0 && a2_state.pad2 == 0);
+    for (uint64_t value : a2_state.reserved) CHECK(value == 0);
+    CHECK((int32_t)call("sceAudioOut2PortGetState", a2_port, 1) == (int32_t)0x80268001);
+
+    std::vector<float> a2_pcm(64 * 2);
+    for (size_t i = 0; i < a2_pcm.size(); i++) a2_pcm[i] = (float)((int)(i % 17) - 8) / 16.0f;
+    uint64_t a2_pcm_ptr = PTR(a2_pcm.data());
+    struct A2Attribute { uint32_t id, reserved; uint64_t value, value_size; } a2_attr{
+        0, 0x7f2d1234u, PTR(&a2_pcm_ptr), sizeof(a2_pcm_ptr)
+    };
+    static_assert(sizeof(A2Attribute) == 0x18);
+    CHECK(call("sceAudioOut2PortSetAttributes", a2_port, PTR(&a2_attr), 1) == 0);
+    CHECK(call("sceAudioOut2ContextPush", a2_context, 1) == 0);
+    a2_queued = a2_available = 0xCCCCCCCCu;
+    CHECK(call("sceAudioOut2ContextGetQueueLevel", a2_context,
+               PTR(&a2_queued), PTR(&a2_available)) == 0);
+    CHECK(a2_queued == 1 && a2_available == 3);            // submitted grain is observable
+    CHECK(sink.opens.size() == 1);
+    CHECK(sink.outs.size() == 1);
+    if (!sink.outs.empty()) {
+        CHECK(sink.outs[0].port == 17);
+        CHECK(sink.outs[0].frames == 64);
+        CHECK(sink.outs[0].pcm.size() == a2_pcm.size() * sizeof(float));
+        CHECK(memcmp(sink.outs[0].pcm.data(), a2_pcm.data(), sink.outs[0].pcm.size()) == 0);
+    }
+    CHECK(call("sceAudioOut2PortDestroy", a2_port) == 0);
+
+    // AudioOut2 main-bed flag bit 1 reserves 20 dB of digital headroom for platform mastering.
+    // Restore that reference level only for marked ports, then saturate at the host PCM boundary;
+    // the flag-zero byte-for-byte assertion above is the control that ordinary/video ports keep
+    // their original level.
+    sink.outs.clear();
+    a2_port_param.flags = 2;
+    std::vector<float> a2_reference(64 * 2);
+    constexpr float reference_pattern[4] = {0.025f, -0.05f, 0.125f, -0.2f};
+    for (size_t i = 0; i < a2_reference.size(); ++i)
+        a2_reference[i] = reference_pattern[i % 4];
+    a2_pcm_ptr = PTR(a2_reference.data());
+    CHECK(call("sceAudioOut2PortCreate", a2_context, PTR(&a2_port_param), PTR(&a2_port)) == 0);
+    CHECK(call("sceAudioOut2PortSetAttributes", a2_port, PTR(&a2_attr), 1) == 0);
+    CHECK(call("sceAudioOut2ContextPush", a2_context, 1) == 0);
+    CHECK(sink.outs.size() == 1);
+    if (!sink.outs.empty()) {
+        const float* mastered = reinterpret_cast<const float*>(sink.outs[0].pcm.data());
+        for (size_t i = 0; i < a2_reference.size(); ++i) {
+            const float amplified = a2_reference[i] * 10.0f;
+            const float expected = std::max(-1.0f, std::min(1.0f, amplified));
+            CHECK(std::abs(mastered[i] - expected) < 1e-7f);
+        }
+    }
+    CHECK(call("sceAudioOut2PortDestroy", a2_port) == 0);
+    sink.outs.clear();
+    a2_port_param.flags = 0;
+
+    // A stereo host must hear content routed exclusively to center/LFE/surround speakers. This
+    // 7.1 grain deliberately leaves FL/FR silent; the old front-pair-only path emitted silence.
+    a2_port_param.data_format = 0x800;                    // float32, eight channels
+    CHECK(call("sceAudioOut2PortCreate", a2_context, PTR(&a2_port_param), PTR(&a2_port)) == 0);
+    memset(&a2_state, 0xCC, sizeof a2_state);
+    CHECK(call("sceAudioOut2PortGetState", a2_port, PTR(&a2_state)) == 0);
+    CHECK(a2_state.output == 1 && a2_state.num_channels == 8 && a2_state.volume == 127);
+    std::vector<float> a2_surround(64 * 8, 0.0f);
+    for (size_t frame = 0; frame < 64; frame++) {
+        float* sample = a2_surround.data() + frame * 8;
+        sample[2] = 0.02f; // FC
+        sample[3] = 0.01f; // LFE
+        sample[4] = 0.03f; // BL
+        sample[5] = 0.04f; // BR
+        sample[6] = 0.05f; // SL
+        sample[7] = 0.06f; // SR
+    }
+    a2_pcm_ptr = PTR(a2_surround.data());
+    CHECK(call("sceAudioOut2PortSetAttributes", a2_port, PTR(&a2_attr), 1) == 0);
+    CHECK(call("sceAudioOut2ContextPush", a2_context, 1) == 0);
+    CHECK(sink.outs.size() == 1);
+    if (!sink.outs.empty()) {
+        const float* stereo = reinterpret_cast<const float*>(sink.outs[0].pcm.data());
+        constexpr float kMinus3Db = 0.70710678f;
+        const float expected_l = 0.02f * kMinus3Db + 0.01f * 0.5f
+                               + (0.03f + 0.05f) * kMinus3Db;
+        const float expected_r = 0.02f * kMinus3Db + 0.01f * 0.5f
+                               + (0.04f + 0.06f) * kMinus3Db;
+        for (size_t frame = 0; frame < 64; frame++) {
+            CHECK(std::abs(stereo[frame * 2 + 0] - expected_l) < 1e-6f);
+            CHECK(std::abs(stereo[frame * 2 + 1] - expected_r) < 1e-6f);
+        }
+    }
+    CHECK(call("sceAudioOut2PortDestroy", a2_port) == 0);
+    sink.outs.clear();
+
+    // Signed-16 AudioOut2 is a first-class port format, not an unsupported codec path. Exercise it
+    // on a second simultaneous context: each context must get an independently paced host stream so
+    // SDL can mix their grains on the same timeline instead of serializing them. The two-attribute
+    // submission shape used by middleware carries channel gains in attribute 1 and the per-grain PCM
+    // pointer in attribute 0; the mixer must consume the latter even when it is not first.
+    uint64_t a2_context2 = 0;
+    CHECK(call("sceAudioOut2ContextCreate", PTR(a2_context_param), 0, 0, PTR(&a2_context2)) == 0);
+    CHECK(a2_context2 != 0 && a2_context2 != a2_context);
+    a2_port_param.data_format = 0x201;                    // signed-16, two channels
+    CHECK(call("sceAudioOut2PortCreate", a2_context2, PTR(&a2_port_param), PTR(&a2_port)) == 0);
+    std::vector<int16_t> a2_s16(64 * 2);
+    for (size_t i = 0; i < a2_s16.size(); ++i)
+        a2_s16[i] = i == 0 ? INT16_MIN : (i == 1 ? INT16_MAX : (int16_t)((int)i * 257 - 16000));
+    uint64_t a2_s16_ptr = PTR(a2_s16.data());
+    float a2_channel_gains[2] = {1.0f, 1.0f};
+    A2Attribute a2_s16_attrs[2] = {
+        {1, 0, PTR(a2_channel_gains), sizeof(a2_channel_gains)},
+        {0, 0, PTR(&a2_s16_ptr), sizeof(a2_s16_ptr)},
+    };
+    CHECK(call("sceAudioOut2PortSetAttributes", a2_port, PTR(a2_s16_attrs), 2) == 0);
+    CHECK(call("sceAudioOut2ContextPush", a2_context2, 1) == 0);
+    CHECK(sink.opens.size() == 2);
+    if (sink.opens.size() >= 2) CHECK(sink.opens[1].port == 18);
+    CHECK(sink.outs.size() == 1);
+    if (!sink.outs.empty()) {
+        const float* stereo = reinterpret_cast<const float*>(sink.outs[0].pcm.data());
+        CHECK(sink.outs[0].port == 18);
+        CHECK(sink.outs[0].pcm.size() == a2_s16.size() * sizeof(float));
+        for (size_t i = 0; i < a2_s16.size(); ++i)
+            CHECK(std::abs(stereo[i] - (float)a2_s16[i] / 32768.0f) < 1e-7f);
+    }
+    CHECK(call("sceAudioOut2PortDestroy", a2_port) == 0);
+    CHECK(call("sceAudioOut2ContextDestroy", a2_context2) == 0);
+
+    // Object-audio ports share the same context but do not route directly to the speaker sink.
+    // GTA V reserves 72 of them; exercise the full SDK maximum so a 16-slot regression cannot
+    // turn later guest handles into -1 and crash its object mixer.
+    a2_port_param.type = 0x100;
+    a2_port_param.data_format = 0x100;                    // float32 mono object stream
+    std::vector<uint64_t> a2_object_ports(256);
+    for (uint64_t& handle : a2_object_ports) {
+        CHECK(call("sceAudioOut2PortCreate", a2_context, PTR(&a2_port_param), PTR(&handle)) == 0);
+        CHECK(handle != 0);
+    }
+    uint64_t overflow_port = 0xCCCCCCCCCCCCCCCCull;
+    CHECK((int32_t)call("sceAudioOut2PortCreate", a2_context, PTR(&a2_port_param),
+                        PTR(&overflow_port)) == (int32_t)0x80268012);
+    CHECK(overflow_port == 0xCCCCCCCCCCCCCCCCull);
+    for (uint64_t handle : a2_object_ports)
+        CHECK(call("sceAudioOut2PortDestroy", handle) == 0);
+
+    CHECK(call("sceAudioOut2ContextDestroy", a2_context) == 0);
+
+    // --- 12. libSceNgs2 silent lifecycle: sizes, handles, state, and render output -------------
     struct BufferInfo { uint64_t host_buffer, host_buffer_size, reserved[5], user_data; };
     struct RackOption {
         uint64_t size; char name[16]; uint32_t flags, max_grain, max_voices,

@@ -34,6 +34,9 @@
 #ifdef PROSPER_AUDIO_SDL3
 #include "audio_sdl3.hpp"              // install_sdl3_audio_sink (route sceAudioOut to the host)
 #endif
+#ifdef PROSPER_AUDIO_FFMPEG
+#include "ajm_ffmpeg.hpp"              // install AJM MP3 decoder before guest instance creation
+#endif
 #ifdef PROSPER_PAD_SDL3
 #include "pad_sdl3.hpp"                // install_sdl3_pad_backend (route a host controller to libScePad)
 #endif
@@ -663,6 +666,12 @@ int main(int argc, char** argv) {
         // right after the built-in HLE is registered, before the guest runs. Built in only when the
         // corresponding SDL3 frontend is enabled; a window app wants both on by default.
         auto install_backends = []{
+#ifdef PROSPER_AUDIO_FFMPEG
+            if (prosper::ajm::install_ffmpeg_decoder_backend())
+                fprintf(stderr, "[app] FFmpeg AJM audio decoder installed.\n");
+            else
+                fprintf(stderr, "[app] FFmpeg AJM audio decoder unavailable.\n");
+#endif
 #ifdef PROSPER_VIDEO_MF
             if (!getenv("PROSPER_APP_DISABLE_VIDEO")) {
                 if (prosper::video::install_media_foundation_backend())

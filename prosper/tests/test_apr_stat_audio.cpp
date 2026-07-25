@@ -95,7 +95,7 @@ int main() {
         uint64_t sz = spk(8, 0, 0, 0, 0, 0);   // rdi=8 (speaker config) per the live RAGE disassembly
         CHECK(sz != 0, "speaker-array size is non-zero (guards the zero-alloc overrun crash)");
         CHECK((sz & 0xfull) == 0, "speaker-array size is 0x10-aligned (usable as an allocation size)");
-        CHECK(sz == 0x100000ull, "speaker-array size == 1 MiB (0x100000), the null-backend contract");
+        CHECK(sz == 0x600ull, "speaker-array size follows the 0x400 + speakers*0x40 VBAP contract");
     }
 
     std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);

@@ -17,7 +17,10 @@
 namespace prosper {
 namespace {
 
-constexpr int kMaxPorts = 16;
+// 16 public sceAudioOut ports plus four host-only streams for concurrent AudioOut2 contexts.
+// SDL mixes the bound streams into the same playback device while each retains its own pacing
+// clock; this mirrors independent hardware contexts without serializing their sample timelines.
+constexpr int kMaxPorts = 20;
 
 SDL_AudioFormat to_sdl_format(AudioFmt f) { return f == AudioFmt::F32 ? SDL_AUDIO_F32 : SDL_AUDIO_S16; }
 
@@ -51,8 +54,19 @@ public:
         s.frame_bytes = audio_frame_bytes(info);
         s.grain_bytes = audio_grain_bytes(info);
         s.freq = info.freq;
+        s.put_failed = false;
         s.next = {};   // (re)start the per-grain pacing clock on the first output()
-        SDL_ResumeAudioStreamDevice(s.stream);
+        if (!SDL_ResumeAudioStreamDevice(s.stream)) {
+            SDL_Log("prosper-audio: ResumeAudioStreamDevice failed: %s", SDL_GetError());
+            SDL_DestroyAudioStream(s.stream);
+            s.stream = nullptr;
+            return false;
+        }
+        const SDL_AudioDeviceID device = SDL_GetAudioStreamDevice(s.stream);
+        SDL_Log("prosper-audio: opened port %d on %s (%s), %d Hz/%d channel%s",
+                port, SDL_GetAudioDeviceName(device) ? SDL_GetAudioDeviceName(device) : "default device",
+                SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "unknown driver",
+                info.freq, info.channels, info.channels == 1 ? "" : "s");
         return true;
     }
 
@@ -84,7 +98,10 @@ public:
             // the lock let close()/open()/quit() destroy it immediately before this call (#855).
             // The pacing sleep remains outside the lock, so lifecycle calls wait only for SDL's
             // synchronous queue copy rather than for an entire audio grain.
-            SDL_PutAudioStreamData(s.stream, pcm, frames * s.frame_bytes);
+            if (!SDL_PutAudioStreamData(s.stream, pcm, frames * s.frame_bytes) && !s.put_failed) {
+                SDL_Log("prosper-audio: PutAudioStreamData failed on port %d: %s", port, SDL_GetError());
+                s.put_failed = true;
+            }
         }
         if (freq > 0) std::this_thread::sleep_until(target);
     }
@@ -108,6 +125,7 @@ public:
 
 private:
     struct Slot { SDL_AudioStream* stream = nullptr; int frame_bytes = 0; int grain_bytes = 0;
+                  bool put_failed = false;
                   int freq = 0;                                     // port sample rate for pacing
                   std::chrono::steady_clock::time_point next{}; };  // per-grain pacing deadline
     std::mutex mx_;

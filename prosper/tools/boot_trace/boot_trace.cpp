@@ -17,6 +17,9 @@ extern "C" int prosper_reserved_range_state(uint64_t);   // memory-HLE mapping c
 #ifdef PROSPER_AUDIO_SDL3
 #include "audio_sdl3.hpp"                 // optional SDL3 audio frontend (-DPROSPER_AUDIO_SDL3=ON)
 #endif
+#ifdef PROSPER_AUDIO_FFMPEG
+#include "ajm_ffmpeg.hpp"                 // optional AJM MP3 decoder frontend
+#endif
 #include <cstdlib>                        // getenv (PROSPER_PAD gate)
 #ifdef PROSPER_PAD_SDL3
 #include "pad_sdl3.hpp"                   // optional SDL3 gamepad frontend (-DPROSPER_PAD_SDL3=ON)
@@ -127,6 +130,10 @@ int main(int argc, char** argv) {
     // — right after the built-in HLE is registered, before the images are mapped: sceAudioOut
     // output to the host, and (gated by PROSPER_PAD) a controller backend (SDL3, else evdev).
     if (!boot_program(d, p, &e, [&]{
+#ifdef PROSPER_AUDIO_FFMPEG
+        if (!prosper::ajm::install_ffmpeg_decoder_backend())
+            fprintf(stderr, "[ajm] FFmpeg audio decoder unavailable\n");
+#endif
 #ifdef PROSPER_VIDEO_MF
         if (!prosper::video::install_media_foundation_backend())
             fprintf(stderr, "[avp] Media Foundation backend unavailable\n");
