@@ -4877,12 +4877,19 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             }
             VkFenceCreateInfo iso_fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
             VkFence iso_fence = VK_NULL_HANDLE;
-            vkCreateFence(dev, &iso_fence_info, nullptr, &iso_fence);
+            if (vkCreateFence(dev, &iso_fence_info, nullptr, &iso_fence) != VK_SUCCESS)
+                iso_fence = VK_NULL_HANDLE;
+            bool iso_submission_pending = false;
             VkBufferImageCopy cp2{}; cp2.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; cp2.imageExtent = {W, H, 1};
-            for (int kk = -1; kk < (int)dv.size(); kk++) {
-                VkCommandBuffer c2; VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            for (int kk = -1; iso_fence && kk < (int)dv.size(); kk++) {
+                VkCommandBuffer c2 = VK_NULL_HANDLE;
+                VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
                 ai.commandPool = pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
-                vkAllocateCommandBuffers(dev, &ai, &c2); vkBeginCommandBuffer(c2, &cbbi);
+                if (vkAllocateCommandBuffers(dev, &ai, &c2) != VK_SUCCESS ||
+                    vkBeginCommandBuffer(c2, &cbbi) != VK_SUCCESS) {
+                    if (c2) vkFreeCommandBuffers(dev, pool, 1, &c2);
+                    break;
+                }
                 vkCmdBeginRenderPass(c2, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
                 for (size_t di = 0; di < dv.size(); di++) { auto& v = dv[di]; if (!v.ok) continue; if ((int)di == kk) continue;
                     vkCmdBindPipeline(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
@@ -4892,10 +4899,42 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 }
                 vkCmdEndRenderPass(c2);
                 vkCmdCopyImageToBuffer(c2, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp2);
-                vkEndCommandBuffer(c2); vkResetFences(dev, 1, &iso_fence);
+                const bool recorded = vkEndCommandBuffer(c2) == VK_SUCCESS;
+                const bool fence_reset = recorded &&
+                    vkResetFences(dev, 1, &iso_fence) == VK_SUCCESS;
                 VkSubmitInfo si2{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si2.commandBufferCount = 1; si2.pCommandBuffers = &c2;
-                render_locked_queue_submit(queue, 1, &si2, iso_fence); vkWaitForFences(dev, 1, &iso_fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
-                std::vector<uint8_t> px(bytes); void* m2 = nullptr; vkMapMemory(dev, bmem, 0, bytes, 0, &m2);
+                const bool submitted = fence_reset &&
+                    render_locked_queue_submit(queue, 1, &si2, iso_fence) == VK_SUCCESS;
+                bool finished = submitted &&
+                    vkWaitForFences(dev, 1, &iso_fence, VK_TRUE,
+                                    5ull * 1000 * 1000 * 1000) == VK_SUCCESS;
+                if (submitted && !finished)
+                    finished = render_locked_queue_wait_idle(queue) == VK_SUCCESS;
+                const BackendSubmissionState iso_state =
+                    backend_submission_state(submitted, finished);
+                if (iso_state == BackendSubmissionState::Pending) {
+                    // The diagnostic command uses this call's shared pool, framebuffer, pipelines,
+                    // descriptors, images, and readback buffer. Retain that complete cleanup scope,
+                    // its fence, and c2 when neither wait proves completion.
+                    if (cached_ds) {
+                        cached_ds->layout_initialized = false;
+                        cached_ds->depth_valid = false;
+                        cached_ds->stencil_valid = false;
+                    }
+                    if (cached_color) cached_color->valid = false;
+                    active_submission.abandon_pending_resources();
+                    iso_submission_pending = true;
+                    break;
+                }
+                if (iso_state != BackendSubmissionState::Complete) {
+                    vkFreeCommandBuffers(dev, pool, 1, &c2);
+                    break;
+                }
+                std::vector<uint8_t> px(bytes); void* m2 = nullptr;
+                if (vkMapMemory(dev, bmem, 0, bytes, 0, &m2) != VK_SUCCESS || !m2) {
+                    vkFreeCommandBuffers(dev, pool, 1, &c2);
+                    break;
+                }
                 for (VkDeviceSize i = 0; i < bytes; i++) px[i] = ((const uint8_t*)m2)[i]; vkUnmapMemory(dev, bmem);
                 const uint8_t* tp = &px[((size_t)ty * W + tx) * 4];
                 bool lit = tp[0] > 40 || tp[1] > 40 || tp[2] > 40;
@@ -4915,7 +4954,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 char fn[512]; snprintf(fn, sizeof fn, "%s/iso_kill_%d.bmp", dir.c_str(), kk); dump_bmp(fn, px, W, H);
                 vkFreeCommandBuffers(dev, pool, 1, &c2);
             }
-            if (iso_fence) vkDestroyFence(dev, iso_fence, nullptr);
+            if (iso_fence && !iso_submission_pending)
+                vkDestroyFence(dev, iso_fence, nullptr);
             fprintf(stderr, "[iso] done: the kill index marked 'dark' is the draw painting (%d,%d)\n", tx, ty);
         }
     }
