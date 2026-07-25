@@ -2591,6 +2591,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             // device-local pixels into the destination identity so gpu_valid is
                             // genuinely true; on failure the shared CPU pixels are the only truth.
                             if (resolved.gpu_valid) {
+                                // #1382 review: the copy submits out-of-band, so any pending
+                                // batched pass — including one targeting the DESTINATION identity
+                                // — must reach the queue first, or it would execute after the copy
+                                // and overwrite the resolve while gpu_valid=true. Mirror the
+                                // source-materialization flush above unconditionally here.
+                                {
+                                    const prosper::test::RenderVkCtx& copy_ctx =
+                                        prosper::test::render_vk_ctx();
+                                    if (copy_ctx.ok && backend_submission.pending())
+                                        backend_submission.submit_and_wait(copy_ctx.dev,
+                                                                           copy_ctx.queue, false);
+                                }
                                 std::string copy_error;
                                 if (!prosper::test::copy_persistent_color_target(
                                         rsrc, rdst, rw, rh,

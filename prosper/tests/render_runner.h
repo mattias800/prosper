@@ -1865,7 +1865,9 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
                                          uint32_t height, VkFormat format, std::string& error) {
     error.clear();
     format = backend_color_format(format);
-    if (!width || !height || src_id == dst_id) { error = "invalid copy identity"; return false; }
+    if (!width || !height || !dst_id || src_id == dst_id) {
+        error = "invalid copy identity"; return false;
+    }
     PersistentColorTargetImage* src = find_persistent_color_target(src_id, width, height, format);
     if (!src || !src->image || !src->valid || src->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
         error = "source persistent color target is unavailable";
@@ -1913,7 +1915,8 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
         ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         VkImageView view = VK_NULL_HANDLE;
         vkCreateImageView(ctx.dev, &ivci, nullptr, &view);
-        dst = &persistent_color_target_cache()[dst_key];   // try_emplace iterator may be stale after erase paths
+        // Element pointers survive unordered_map rehash; this re-fetch is belt-and-braces only.
+        dst = &persistent_color_target_cache()[dst_key];
         dst->image = img; dst->memory = imem; dst->view = view;
         dst->bytes = ir.size;
         persistent_color_target_bytes() += ir.size;
@@ -1931,9 +1934,15 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
     };
     VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pool_info.queueFamilyIndex = ctx.qfi;
-    if (vkCreateCommandPool(ctx.dev, &pool_info, nullptr, &pool) != VK_SUCCESS) {
-        error = "cannot create resolve copy command pool"; return false;
-    }
+    // A pre-existing valid destination image is exactly the stale object this helper exists to
+    // replace — on ANY failure past this point it must not stay valid (#1382 review finding 2).
+    auto fail = [&](const char* message) {
+        dst->valid = false;
+        error = message;
+        return false;
+    };
+    if (vkCreateCommandPool(ctx.dev, &pool_info, nullptr, &pool) != VK_SUCCESS)
+        return fail("cannot create resolve copy command pool");
     VkCommandBufferAllocateInfo command_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     command_info.commandPool = pool;
     command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -1942,7 +1951,7 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkAllocateCommandBuffers(ctx.dev, &command_info, &command) != VK_SUCCESS ||
         vkBeginCommandBuffer(command, &begin) != VK_SUCCESS) {
-        cleanup(); error = "cannot begin resolve copy command"; return false;
+        cleanup(); return fail("cannot begin resolve copy command");
     }
     const VkImageLayout src_saved = src->layout;
     VkImageMemoryBarrier barriers[2]{};
@@ -1981,17 +1990,17 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
     vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
     if (vkEndCommandBuffer(command) != VK_SUCCESS) {
-        cleanup(); error = "cannot record resolve copy command"; return false;
+        cleanup(); return fail("cannot record resolve copy command");
     }
     VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     if (vkCreateFence(ctx.dev, &fence_info, nullptr, &fence) != VK_SUCCESS) {
-        cleanup(); error = "cannot create resolve copy fence"; return false;
+        cleanup(); return fail("cannot create resolve copy fence");
     }
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1; submit.pCommandBuffers = &command;
     if (render_locked_queue_submit(ctx.queue, 1, &submit, fence) != VK_SUCCESS ||
         vkWaitForFences(ctx.dev, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
-        cleanup(); error = "resolve copy submission failed"; return false;
+        cleanup(); return fail("resolve copy submission failed");
     }
     cleanup();
     dst->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
