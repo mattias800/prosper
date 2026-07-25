@@ -45,6 +45,22 @@ int main() {
               "discarded submission batch invalidates speculative state before cleanup");
     }
 
+    {
+        bool speculative_state_valid = true;
+        bool prior_cleanup_ran = false;
+        bool later_cleanup_ran = false;
+        prosper::test::BackendSubmissionBatch abandoned_batch;
+        abandoned_batch.enqueue(VK_NULL_HANDLE);
+        abandoned_batch.add_failure_cleanup([&]() { speculative_state_valid = false; });
+        abandoned_batch.add_cleanup([&]() { prior_cleanup_ran = true; });
+        abandoned_batch.abandon_pending_resources();
+        abandoned_batch.add_cleanup([&]() { later_cleanup_ran = true; });
+        abandoned_batch.complete();
+        CHECK(!abandoned_batch.pending() && !speculative_state_valid && !prior_cleanup_ran &&
+                  !later_cleanup_ran,
+              "pending submission invalidates state and retains prior and later resources");
+    }
+
     // Fullscreen-triangle VS (from gl_VertexIndex; no resource table needed).
     const uint32_t vs[] = {
         0x36020081u, 0x2C040081u, 0x7E020D01u, 0x7E040D02u, 0x7E0A02F6u, 0x7E0C02F2u, 0x10020B01u,

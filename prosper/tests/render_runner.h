@@ -823,7 +823,8 @@ public:
     }
 
     void add_cleanup(std::function<void()> cleanup) {
-        cleanups_.push_back(std::move(cleanup));
+        if (!pending_resources_abandoned_)
+            cleanups_.push_back(std::move(cleanup));
     }
 
     // Persistent attachment state is updated speculatively so later command buffers in the same
@@ -836,6 +837,16 @@ public:
     void discard() {
         commands_.clear();
         finish_persistent_state(false);
+    }
+
+    // Completion could not be proven after a successful submit. Invalidate speculative state, but
+    // never invoke cleanup callbacks for work Vulkan may still own. The sticky flag also rejects
+    // callbacks registered later in the current renderer call (registration follows diagnostics).
+    void abandon_pending_resources() {
+        commands_.clear();
+        finish_persistent_state(false);
+        pending_resources_abandoned_ = true;
+        cleanups_.clear();
     }
 
     BackendSubmissionBatchResult submit_and_wait(VkDevice dev, VkQueue queue,
@@ -883,20 +894,21 @@ public:
         const BackendSubmissionState state = backend_submission_state(
             result.submit_result == VK_SUCCESS,
             result.submit_result == VK_SUCCESS && result.wait_result == VK_SUCCESS);
-        if (state != BackendSubmissionState::Pending)
+        if (state != BackendSubmissionState::Pending) {
             vkDestroyFence(dev, fence, nullptr);
-        commands_.clear();
-        finish_persistent_state(state == BackendSubmissionState::Complete);
-        if (state == BackendSubmissionState::Pending) {
+            commands_.clear();
+            finish_persistent_state(state == BackendSubmissionState::Complete);
+        } else {
             // Neither wait proved completion, so every command buffer and object captured by its
             // cleanup may still be in use. Drop the callbacks without invoking them; leaking these
             // one-shot resources is the only valid last-resort action on an effectively lost device.
-            cleanups_.clear();
+            abandon_pending_resources();
         }
         return result;
     }
 
     void complete() {
+        if (pending_resources_abandoned_) return;
         for (auto& cleanup : cleanups_) cleanup();
         cleanups_.clear();
     }
@@ -913,6 +925,7 @@ private:
     std::vector<VkCommandBuffer> commands_;
     std::vector<std::function<void()>> cleanups_;
     std::vector<std::function<void()>> failure_cleanups_;
+    bool pending_resources_abandoned_ = false;
 };
 
 struct PersistentColorTargetKey {
