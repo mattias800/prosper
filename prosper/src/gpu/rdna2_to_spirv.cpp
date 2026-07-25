@@ -84,7 +84,7 @@ enum : uint32_t {
     ImgOp_Offset=0x10,                   // ImageOperands bit: dynamic texel offset (needs ImageGatherExtended)
     Img_Sampled_Storage=2,   // OpTypeImage "Sampled" operand: 2 = used WITHOUT a sampler (read/write storage image)
     ImgFmt_Unknown=0,        // OpTypeImage "Image Format": Unknown (runtime view format; needs the caps above)
-    ImgOp_Bias=1, ImgOp_Lod=2, ImgOp_Sample=0x40,   // ImageOperands bits: LOD bias / explicit LOD / MSAA Sample index.
+    ImgOp_Bias=1, ImgOp_Lod=2, ImgOp_Grad=4, ImgOp_Sample=0x40,   // ImageOperands bits.
     SC_Workgroup=4, Scope_Device=1, Scope_Workgroup=2, Scope_Subgroup=3,
     MemSem_UniformAcqRel=0x48, MemSem_WGAcqRel=0x108,   // storage/LDS AcquireRelease memory semantics
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_NoPerspective=13, Dec_Flat=14,
@@ -822,6 +822,24 @@ struct SpirvCompute {
         uint32_t res   = id();
         if (is_fragment) put(code, Op_ImageSampleImplicitLod, {texture_vec4(binding), res, si, coord});
         else             put(code, Op_ImageSampleExplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Lod, fconstf(0.0f)});
+        unpack_texture_result(binding, res, out);
+    }
+    // image_sample_d 2D: the guest supplies explicit normalized-coordinate derivatives in the
+    // modifier-first vaddr slots. Preserve both vectors with the SPIR-V Grad image operand; using
+    // implicit fragment-quad derivatives selects the wrong mip at seams and for uniform coordinates.
+    void image_sample_grad_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
+                              uint32_t dsdx_bits, uint32_t dtdx_bits,
+                              uint32_t dsdy_bits, uint32_t dtdy_bits, uint32_t out[4]) {
+        uint32_t si = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
+        uint32_t coord = id(); put(code, Op_CompositeConstruct,
+                                   {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+        uint32_t grad_x = id(); put(code, Op_CompositeConstruct,
+                                    {t_v2f(), grad_x, bcf(dsdx_bits), bcf(dtdx_bits)});
+        uint32_t grad_y = id(); put(code, Op_CompositeConstruct,
+                                    {t_v2f(), grad_y, bcf(dsdy_bits), bcf(dtdy_bits)});
+        uint32_t res = id(); put(code, Op_ImageSampleExplicitLod,
+                                 {texture_vec4(binding), res, si, coord,
+                                  ImgOp_Grad, grad_x, grad_y});
         unpack_texture_result(binding, res, out);
     }
     // image_sample 3D: (u,v,w) float-BITS coords -> RGBA. Uses the Dim_3D sampled image; same
@@ -6165,11 +6183,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // derivative dwords FIRST — [Ds/Dx, Dt/Dx, Ds/Dy, Dt/Dy] — then the (u,v) coords, per ISA
             // 8.2.4's "{derivative}{body}" order. Blue Prince (PPSA25009) issues it as a plain 2D texture
             // sample in a fragment shader (ps=0x2011d60100); rejecting it dropped that whole pipeline's
-            // draws. In a fragment stage the hardware quad already provides implicit derivatives, so we
-            // lower it as an ordinary implicit-LOD sample and drop the explicit gradients (same pragmatic
-            // approximation as GTA's op 0xa0). CONFIDENCE: MED — base op + 2D-sample behavior are live-title
-            // evidence; a faithful OpImageSampleExplicitLod-with-Grad lowering is a documented follow-up if a
-            // title needs the exact gradient-selected mip.
+            // draws. Preserve those explicit derivatives with OpImageSampleExplicitLod + Grad: projected,
+            // wrapped, atlas, and uniform coordinates do not share the screen quad's implicit derivative.
+            // CONFIDENCE: HIGH — operand order is ISA-defined and an execution regression distinguishes the
+            // requested gradient-selected mip from the implicit-derivative result.
             const bool is_sample_d = (in.opcode == 0x22);
             // 2D_ARRAY (dim=5) is sampled here as its base 2D slice: the (u,v) coords are read as usual and
             // the array-index coord is dropped, so the shader RECOMPILES instead of being rejected (previously
@@ -6285,9 +6302,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 } else if (is_sample_lz_o) {   // vaddr order for _o: [packed offset, u, v]
                     b.image_sample_lz_offset_2d(res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(0)), out);
                 } else if (is_sample_d) {   // vaddr order for _d: [Ds/Dx, Dt/Dx, Ds/Dy, Dt/Dy, u, v]
-                    // Drop the four explicit gradients; the (u,v) coords follow them. Implicit-LOD sample
-                    // (fragment quad derivatives ~ the explicit gradients for ordinary UVs).
-                    b.image_sample_2d(res->binding, vread(cvg(4)), vread(cvg(5)), out);
+                    b.image_sample_grad_2d(
+                        res->binding, vread(cvg(4)), vread(cvg(5)),
+                        vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), vread(cvg(3)), out);
                 } else {
                     uint32_t cu = vread(cvg(0)), cv = vread(cvg(1));
                     if (is_sample)         b.image_sample_2d(res->binding, cu, cv, out);
@@ -8790,7 +8807,9 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                     // is accepted for all sample paths and handled as its base 2D slice (array index dropped,
                     // #325) — so array-sampling draws recompile+render instead of being skipped.
                     // 0xa0 is the high-bit sibling of image_sample (0x20), lowered identically (GTA V, #1145).
-                    if (i.opcode == 0x20u || i.opcode == 0x27u || i.opcode == 0xa0u) return i.mimg_dim == 1u || i.mimg_dim == 2u || i.mimg_dim == 5u;
+                    if (i.opcode == 0x20u || i.opcode == 0x27u || i.opcode == 0xa0u)
+                        return i.mimg_dim == 1u || i.mimg_dim == 2u || i.mimg_dim == 5u;
+                    if (i.opcode == 0x22u) return i.mimg_dim == 1u || i.mimg_dim == 5u;
                     if (i.opcode == 0x2fu) return i.mimg_dim == 1u || i.mimg_dim == 5u; // IMAGE_SAMPLE_C_LZ 2D (#1271) / 2D_ARRAY
                     if (i.opcode == 0x24u || i.opcode == 0x25u || i.opcode == 0x47u) return i.mimg_dim == 1u || i.mimg_dim == 5u;
                     return false;
