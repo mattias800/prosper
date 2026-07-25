@@ -1262,7 +1262,6 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
                                 : strcmp(who, "SubmitDcbFinal") == 0 ? 3 : 1);
     // #312: flush any earlier stream paused on a WAIT_REG_MEM — this submit may be its producer.
     gpu::flush_deferred_streams();
-    prosper_gpu_submit_scope_begin();
     agc_gpu_state().draws.clear();
     agc_gpu_state().dispatches.clear();
     agc_gpu_state().dma_copies.clear();
@@ -1319,6 +1318,9 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
 // CONFIDENCE: HIGH on the arg9=count ABI (callsite + adapter disassembly agree, and the count matches
 // the primary path's Packet.dw_num field offset).
 HLE9(agc_driver_submit_dcb_variant) {
+    // The generated return hook is attached to this import invocation even when validation rejects
+    // it. Begin before every early return so nested/re-entrant tagged calls remain exactly paired.
+    prosper_gpu_submit_scope_begin();
     auto is_pm4 = [](uint64_t p) -> bool {
         if (p < 0x10000 || (p & 3)) return false;
         uint32_t h = *(const volatile uint32_t*)(uintptr_t)p;
@@ -1348,6 +1350,8 @@ HLE9(agc_driver_submit_dcb_variant) {
 }
 
 HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
+    // Paired with this NID's generated post-handler return hook, including invalid calls.
+    prosper_gpu_submit_scope_begin();
     struct Packet { uint32_t* addr; uint32_t dw_num; uint8_t pad[4]; };
     const auto* p = (const Packet*)(uintptr_t)a0;
     if (!p || !p->addr || !p->dw_num) return kAgcErrInvalidArg;
@@ -1360,7 +1364,6 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     // from PRs #31/#32.)
     // #312: flush any earlier stream paused on a WAIT_REG_MEM — this submit may be its producer.
     gpu::flush_deferred_streams();
-    prosper_gpu_submit_scope_begin();
     agc_gpu_state().draws.clear();
     agc_gpu_state().dispatches.clear();
     agc_gpu_state().dma_copies.clear();
@@ -1434,6 +1437,8 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
 // ACB streams through the same serialized queue model. Keeping a named wrapper makes the queue type
 // visible in diagnostics and leaves room for independent hardware queue state later.
 HLE(agc_driver_submit_acb) {  // sceAgcDriverSubmitAcb(queue, const AcbPacket*, ...)
+    // Paired with this NID's generated post-handler return hook, including invalid calls.
+    prosper_gpu_submit_scope_begin();
     if (getenv("PROSPER_GFXLOG")) {
         static std::atomic<unsigned> logged{0};
         if (logged.fetch_add(1) < 16) {

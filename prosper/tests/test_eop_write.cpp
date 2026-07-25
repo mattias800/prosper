@@ -103,6 +103,12 @@ int main() {
         rejected_submit_return.join();
         CHECK(prosper_gpu_submit_scope_active() && label == 0xaaaaaaaa55555555ull,
               "unmatched return hook cannot retire another thread's active submit");
+        // A same-thread re-entrant tagged import opens its own scope before validation. Its return
+        // checkpoint consumes only that nested token, leaving the outer invocation active.
+        prosper_gpu_submit_scope_begin();
+        prosper_gpu_submit_scope_end();
+        CHECK(prosper_gpu_submit_scope_active() && label == 0xaaaaaaaa55555555ull,
+              "matched nested return hook preserves the outer same-thread submit");
         // Model an arbitrarily descheduled submit handler after all HLE work is complete but before
         // its generated import trampoline reaches the return checkpoint. This exceeds the old 1 ms
         // grace timer and proves elapsed time cannot publish a label while the scope is still active.
