@@ -1835,7 +1835,12 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
         vkWaitForFences(ctx.dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000) == VK_SUCCESS;
     if (submitted && !finished) finished = render_locked_queue_wait_idle(ctx.queue) == VK_SUCCESS;
     if (!finished) {
-        cleanup(); error = "persistent color target readback did not complete"; return false;
+        // Submitted-but-unfinished: the command buffer (and the readback buffer it references)
+        // may still be pending on a wedged queue, so destroying the pool, fence, or buffer is
+        // invalid use. Deliberately leak the one-shot objects — the device is effectively lost
+        // (#1383). The never-submitted failure modes still clean up normally.
+        if (!submitted) cleanup();
+        error = "persistent color target readback did not complete"; return false;
     }
     void* mapped = nullptr;
     if (vkMapMemory(ctx.dev, memory, 0, bytes, 0, &mapped) != VK_SUCCESS || !mapped) {
@@ -1909,12 +1914,24 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
             error = "resolve destination exceeds the persistent target budget";
             return false;
         }
-        vkBindImageMemory(ctx.dev, img, imem, 0);
+        if (vkBindImageMemory(ctx.dev, img, imem, 0) != VK_SUCCESS) {
+            vkDestroyImage(ctx.dev, img, nullptr);
+            vkFreeMemory(ctx.dev, imem, nullptr);
+            persistent_color_target_cache().erase(dst_key);
+            error = "cannot bind resolve destination memory";
+            return false;
+        }
         VkImageViewCreateInfo ivci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         ivci.image = img; ivci.viewType = VK_IMAGE_VIEW_TYPE_2D; ivci.format = format;
         ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         VkImageView view = VK_NULL_HANDLE;
-        vkCreateImageView(ctx.dev, &ivci, nullptr, &view);
+        if (vkCreateImageView(ctx.dev, &ivci, nullptr, &view) != VK_SUCCESS || !view) {
+            vkDestroyImage(ctx.dev, img, nullptr);
+            vkFreeMemory(ctx.dev, imem, nullptr);
+            persistent_color_target_cache().erase(dst_key);
+            error = "cannot create resolve destination view";
+            return false;
+        }
         // Element pointers survive unordered_map rehash; this re-fetch is belt-and-braces only.
         dst = &persistent_color_target_cache()[dst_key];
         dst->image = img; dst->memory = imem; dst->view = view;
@@ -1998,9 +2015,16 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
     }
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1; submit.pCommandBuffers = &command;
-    if (render_locked_queue_submit(ctx.queue, 1, &submit, fence) != VK_SUCCESS ||
-        vkWaitForFences(ctx.dev, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
-        cleanup(); return fail("resolve copy submission failed");
+    const bool submitted = render_locked_queue_submit(ctx.queue, 1, &submit, fence) == VK_SUCCESS;
+    bool finished = submitted &&
+        vkWaitForFences(ctx.dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000) == VK_SUCCESS;
+    if (submitted && !finished) finished = render_locked_queue_wait_idle(ctx.queue) == VK_SUCCESS;
+    if (!finished) {
+        // Submitted-but-unfinished means the command buffer may still be pending on a wedged
+        // queue; destroying its pool or fence then is invalid use. Deliberately leak the
+        // one-shot objects instead — the device is effectively lost (#1383).
+        if (!submitted) cleanup();
+        return fail("resolve copy did not complete");
     }
     cleanup();
     dst->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -2403,6 +2427,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                       (persistent_color ? VK_IMAGE_USAGE_SAMPLED_BIT : 0u) |
                       ((seed_rgba || persistent_color) ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u);
         vkCreateImage(dev, &imgci, nullptr, &img);
+        if (!img) {
+            if (cached_color) persistent_color_target_cache().erase(color_key);
+            return out;
+        }
         VkMemoryRequirements ir{}; vkGetImageMemoryRequirements(dev, img, &ir);
         VkMemoryAllocateInfo iai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         iai.allocationSize = ir.size; iai.memoryTypeIndex = pick(ir.memoryTypeBits, 0);
@@ -2430,17 +2458,33 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 imgci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                               (seed_rgba ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u);
                 vkCreateImage(dev, &imgci, nullptr, &img);
+                if (!img) return out;
                 vkGetImageMemoryRequirements(dev, img, &ir);
                 iai.allocationSize = ir.size; iai.memoryTypeIndex = pick(ir.memoryTypeBits, 0);
             }
         }
         if (!imem)
             imem = allocate_transient_render_memory(dev, iai.allocationSize, iai.memoryTypeIndex);
-        vkBindImageMemory(dev, img, imem, 0);
         VkImageViewCreateInfo ivci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         ivci.image = img; ivci.viewType = VK_IMAGE_VIEW_TYPE_2D; ivci.format = FMT;
         ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCreateImageView(dev, &ivci, nullptr, &view);
+        const bool target_ready = imem &&
+            vkBindImageMemory(dev, img, imem, 0) == VK_SUCCESS &&
+            vkCreateImageView(dev, &ivci, nullptr, &view) == VK_SUCCESS && view;
+        if (!target_ready) {
+            // Caching a half-created target (null view / unbound memory) would break every
+            // later LOAD of this identity (#1383): drop it fail-visibly instead.
+            if (view) vkDestroyImageView(dev, view, nullptr);
+            vkDestroyImage(dev, img, nullptr);
+            if (cached_color) {
+                if (cached_color->bytes) persistent_color_target_bytes() -= cached_color->bytes;
+                if (imem) vkFreeMemory(dev, imem, nullptr);
+                persistent_color_target_cache().erase(color_key);
+            } else if (imem) {
+                release_transient_render_memory(dev, imem);
+            }
+            return out;
+        }
         if (cached_color) {
             cached_color->image = img;
             cached_color->memory = imem;
