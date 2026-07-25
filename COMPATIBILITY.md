@@ -128,8 +128,10 @@ PCM; the objective repetition check reports clean audio (`rms=0.1800`, no duplic
 
 This Unity/IL2CPP title boots through its opening flow and renders the complete title composition at
 native 1920×1080. Its captured output also passes the objective repetition check (`rms=0.0436`, no
-duplicated grains). A malformed full-height scissor previously clipped the upper 250 rows; the
-command processor now sanitizes that observed invalid pair before rasterization.
+duplicated grains). Cobra imports an SDK-revision alias of `sceAgcCreateInterpolantMapping`; routing
+that alias to the real builder initializes all 32 advertised Cx records instead of exposing stale
+stack entries as register writes. The command processor therefore preserves every valid register
+write and rejects only offsets outside its register window.
 
 ## Sonic Origins — `PPSA05325`
 
