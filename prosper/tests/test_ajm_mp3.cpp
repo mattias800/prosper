@@ -25,6 +25,7 @@ static int fails = 0;
 using HleFn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 using Hle10Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                              uint64_t, uint64_t, uint64_t, uint64_t);
+static constexpr uint64_t kInvalidParameter = 0xffffffff80930005ull;
 
 struct Sideband {
     int32_t iResult;
@@ -512,6 +513,62 @@ int main() {
           "failed PCM store terminalizes before the same-batch retry");
     CHECK(instance_destroy(context, pcm_store_instance, 0, 0, 0, 0) == 0,
           "PCM-store MP3 instance destroys normally");
+
+    // BatchStart's optional batch-id output is its acceptance commit point. If the non-null pointer
+    // is inaccessible, no queued job may run or disappear: the guest sees an error and must be able
+    // to retry the same batch safely with a valid pointer. A null optional pointer remains valid.
+    TestBackendStats batch_id_stats{TestDecoderMode::ProducePcm};
+    TestDecoderBackend batch_id_backend(&batch_id_stats);
+    ajm::set_decoder_backend(&batch_id_backend);
+    uint32_t batch_id_instance = 0;
+    CHECK(instance_create(context, 0 /* MP3 */, 1, addr(&batch_id_instance), 0, 0) == 0 &&
+          batch_id_instance != 0 && batch_id_stats.creates == 1,
+          "batch-id publication fixture creates one stateful decoder");
+    int16_t batch_id_pcm = (int16_t)0x5555;
+    Sideband batch_id_sideband{};
+    std::memset(&batch_id_sideband, 0xCC, sizeof(batch_id_sideband));
+    const Sideband untouched_batch_id_sideband = batch_id_sideband;
+    CHECK(job_decode(addr(&batch.info), batch_id_instance, addr(&fake_packet), 1,
+                     addr(&batch_id_pcm), sizeof(batch_id_pcm), addr(&batch_id_sideband),
+                     0, 0, 0) == 0,
+          "batch-id publication fixture queues a decode job");
+    CHECK(batch_start(context, addr(&batch.info), 40, 0, inaccessible_result,
+                      0, 0, 0, 0, 0) == kInvalidParameter,
+          "BatchStart rejects an inaccessible non-null batch-id pointer");
+    CHECK(batch_id_stats.decodes == 0 && batch_id_stats.invalidations == 0 &&
+          batch_id_pcm == (int16_t)0x5555 &&
+          std::memcmp(&batch_id_sideband, &untouched_batch_id_sideband,
+                      sizeof(batch_id_sideband)) == 0,
+          "failed batch-id publication leaves decoder, PCM, sideband, and queued job untouched");
+
+    uint32_t recovered_batch_id = 0xffffffffu;
+    CHECK(batch_start(context, addr(&batch.info), 40, 0, addr(&recovered_batch_id),
+                      0, 0, 0, 0, 0) == 0 && recovered_batch_id != 0xffffffffu,
+          "valid batch-id pointer retries the preserved batch");
+    CHECK(batch_id_stats.decodes == 1 && batch_id_pcm == 1234 &&
+          batch_id_sideband.iResult == 0 && batch_id_sideband.iSizeConsumed == 1 &&
+          batch_id_sideband.iSizeProduced == sizeof(int16_t) &&
+          batch_id_sideband.numFrames == 1,
+          "recovered batch executes exactly once and publishes normal progress");
+
+    batch_id_pcm = (int16_t)0x5555;
+    Sideband null_batch_id_sideband{};
+    CHECK(job_decode(addr(&batch.info), batch_id_instance, addr(&fake_packet), 1,
+                     addr(&batch_id_pcm), sizeof(batch_id_pcm), addr(&null_batch_id_sideband),
+                     0, 0, 0) == 0 &&
+          batch_start(context, addr(&batch.info), 40, 0, 0 /* optional batch id */,
+                      0, 0, 0, 0, 0) == 0,
+          "null optional batch-id pointer retains normal BatchStart behavior");
+    CHECK(batch_id_stats.decodes == 2 && batch_id_pcm == 1234 &&
+          null_batch_id_sideband.iResult == 0 && null_batch_id_sideband.iSizeConsumed == 1,
+          "null batch-id path executes the queued job exactly once");
+    uint32_t empty_batch_id = 0xffffffffu;
+    CHECK(batch_start(context, addr(&batch.info), 40, 0, addr(&empty_batch_id),
+                      0, 0, 0, 0, 0) == 0 && empty_batch_id != 0xffffffffu &&
+          batch_id_stats.decodes == 2,
+          "empty batch still publishes an id without inventing a decode");
+    CHECK(instance_destroy(context, batch_id_instance, 0, 0, 0, 0) == 0,
+          "batch-id publication MP3 instance destroys normally");
     CHECK(ajm::install_ffmpeg_decoder_backend(),
           "FFmpeg AJM backend reinstalls after custom-backend fixtures");
 
