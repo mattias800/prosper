@@ -56,9 +56,9 @@ int main() {
         abandoned_batch.abandon_pending_resources();
         abandoned_batch.add_cleanup([&]() { later_cleanup_ran = true; });
         abandoned_batch.complete();
-        CHECK(!abandoned_batch.pending() && !speculative_state_valid && !prior_cleanup_ran &&
-                  !later_cleanup_ran,
-              "pending submission invalidates state and retains prior and later resources");
+        CHECK(abandoned_batch.pending() && abandoned_batch.abandoned() &&
+                  !speculative_state_valid && !prior_cleanup_ran && !later_cleanup_ran,
+              "pending submission stays protected and retains prior and later resources");
     }
 
     // Fullscreen-triangle VS (from gl_VertexIndex; no resource table needed).

@@ -816,10 +816,14 @@ public:
         if (commands_.empty()) complete();
     }
 
-    bool pending() const { return !commands_.empty(); }
+    // Abandoned work remains logically pending for the batch lifetime: callers use this signal to
+    // suppress cache eviction of persistent objects that the unfinished submission may reference.
+    bool pending() const { return pending_resources_abandoned_ || !commands_.empty(); }
+    bool abandoned() const { return pending_resources_abandoned_; }
 
     void enqueue(VkCommandBuffer command) {
-        commands_.push_back(command);
+        if (!pending_resources_abandoned_)
+            commands_.push_back(command);
     }
 
     void add_cleanup(std::function<void()> cleanup) {
@@ -831,7 +835,8 @@ public:
     // ordered batch can LOAD/sample earlier results. If the batch cannot be submitted and completed,
     // every touched entry must be invalidated before its retained resources are released.
     void add_failure_cleanup(std::function<void()> cleanup) {
-        failure_cleanups_.push_back(std::move(cleanup));
+        if (!pending_resources_abandoned_)
+            failure_cleanups_.push_back(std::move(cleanup));
     }
 
     void discard() {
@@ -853,6 +858,11 @@ public:
                                                   bool backend_trace) {
         BackendSubmissionBatchResult result;
         result.command_buffers = commands_.size();
+        if (pending_resources_abandoned_) {
+            result.submit_result = VK_ERROR_DEVICE_LOST;
+            result.wait_result = VK_ERROR_DEVICE_LOST;
+            return result;
+        }
         if (commands_.empty()) return result;
 
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -2242,6 +2252,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     BackendSubmissionBatch direct_submission;
     BackendSubmissionBatch& active_submission = submission_batch
         ? *submission_batch : direct_submission;
+    // A previous flush submitted this batch but could not prove completion. The device is
+    // effectively lost; do not record more work or touch caches/resources it may still own.
+    if (active_submission.abandoned()) return out;
     const bool avoid_cache_eviction = active_submission.pending();
     const bool persistent_color_targets_enabled =
         getenv("PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS") == nullptr;
