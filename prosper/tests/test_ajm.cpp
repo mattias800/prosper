@@ -1,5 +1,5 @@
-// test_ajm (#187) — libSceAjm headless decode lifecycle. prosper doesn't decode compressed audio, but
-// the handle lifecycle must be REAL: Initialize/InstanceCreate/BatchStartBuffer fill their handle
+// test_ajm (#187) — libSceAjm lifecycle and serialized batch-builder contract. Independent codec tests
+// cover compressed decode; this test proves Initialize/InstanceCreate/BatchStartBuffer fill their handle
 // out-param with a valid value (never the caller's garbage — the bug the generic stub caused), inputs
 // are validated, and a batch reports started->complete so the guest's audio pipeline proceeds. Names
 // hash to the game's import NIDs, so R()-registration reaches the guest.

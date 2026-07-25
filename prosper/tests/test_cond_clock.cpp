@@ -51,6 +51,7 @@ int main() {
     HleFn cond_destroy = Hle::lookup(nid_hash("scePthreadCondDestroy"));
     HleFn cond_signal = Hle::lookup(nid_hash("scePthreadCondSignal"));
     HleFn cond_timedwait = Hle::lookup(nid_hash("pthread_cond_timedwait"));
+    HleFn sce_cond_timedwait = Hle::lookup(nid_hash("scePthreadCondTimedwait"));
     HleFn mutex_init = Hle::lookup(nid_hash("scePthreadMutexInit"));
     HleFn mutex_destroy = Hle::lookup(nid_hash("scePthreadMutexDestroy"));
     HleFn mutex_lock = Hle::lookup(nid_hash("scePthreadMutexLock"));
@@ -58,7 +59,7 @@ int main() {
 
     CHECK(attr_init && attr_destroy && attr_setclock && attr_getclock &&
               attr_setpshared && attr_getpshared && posix_setclock && posix_getclock &&
-              cond_init && cond_destroy && cond_signal && cond_timedwait && mutex_init &&
+              cond_init && cond_destroy && cond_signal && cond_timedwait && sce_cond_timedwait && mutex_init &&
               mutex_destroy && mutex_lock && mutex_unlock,
           "condition-clock and mutex HLE functions are registered");
     CHECK(Hle::lookup("c-bxj027czs") == attr_setclock &&
@@ -157,6 +158,31 @@ int main() {
     mutex_unlock(U(&monotonic_mutex), 0, 0, 0, 0, 0);
     cond_destroy(U(&monotonic_cond), 0, 0, 0, 0, 0);
     mutex_destroy(U(&monotonic_mutex), 0, 0, 0, 0, 0);
+
+    // The Sony API takes a relative microsecond count and returns an encoded SCE kernel error.
+    // This contract intentionally differs from the POSIX entry point above, which takes an absolute
+    // timespec and returns positive FreeBSD ETIMEDOUT(60).
+    void* sce_cond = nullptr;
+    void* sce_mutex = nullptr;
+    CHECK(cond_init(U(&sce_cond), 0, 0, 0, 0, 0) == 0 && sce_cond,
+          "Sony timed-wait condition initializes");
+    CHECK(mutex_init(U(&sce_mutex), 0, 0, 0, 0, 0) == 0 && sce_mutex,
+          "Sony timed-wait mutex initializes");
+    CHECK(mutex_lock(U(&sce_mutex), 0, 0, 0, 0, 0) == 0,
+          "Sony timed-wait mutex locks");
+    const auto sce_started = std::chrono::steady_clock::now();
+    const uint64_t sce_timeout_result = sce_cond_timedwait(
+        U(&sce_cond), U(&sce_mutex), 5'000, 0, 0, 0);
+    const auto sce_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - sce_started).count();
+    CHECK(sce_timeout_result == 0x8002003cu,
+          "Sony relative wait returns SCE_KERNEL_ERROR_ETIMEDOUT");
+    CHECK(sce_elapsed_ms >= 2 && sce_elapsed_ms < 1000,
+          "Sony relative wait honors its microsecond interval");
+    CHECK(mutex_unlock(U(&sce_mutex), 0, 0, 0, 0, 0) == 0,
+          "Sony timed wait reacquires the mutex before returning");
+    cond_destroy(U(&sce_cond), 0, 0, 0, 0, 0);
+    mutex_destroy(U(&sce_mutex), 0, 0, 0, 0, 0);
 
     attr_destroy(U(&attr), 0, 0, 0, 0, 0);
     CHECK(attr == nullptr, "condition attribute destroy clears the guest handle");
