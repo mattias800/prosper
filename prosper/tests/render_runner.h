@@ -1454,10 +1454,23 @@ inline uint64_t& persistent_ds_write_generation() {
     return generation;
 }
 
+// DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE substitutes the VALUE of depth writes (DB_DEPTH_CLEAR); it
+// does not create writes on its own — the write path still requires Z_ENABLE + Z_WRITE_ENABLE and a
+// compare that can pass. Real guest clear draws program exactly that shape (test+write+ALWAYS);
+// Blue Prince's per-light shadow loop instead issues a fullscreen rect with DEPTH_CLEAR_ENABLE set
+// and DB_DEPTH_CONTROL fully disabled immediately BEFORE sampling the plane its shadow casters
+// rendered — treating that as a clear/write destroyed the shadow map it is about to consume and
+// banded every light (#1287). The guest's own draw order proves the writes-disabled shape must be
+// depth-inert. CONFIDENCE: MED (write-path gating; the exercised title shapes are covered).
+constexpr bool depth_clear_effective(bool clear_enabled, bool test_enabled, bool write_enabled,
+                                     uint32_t compare_op) {
+    return clear_enabled && test_enabled && write_enabled && compare_op != VK_COMPARE_OP_NEVER;
+}
+
 constexpr bool persistent_ds_pass_may_write_depth(bool clear_enabled, bool test_enabled,
                                                   bool write_enabled, uint32_t compare_op) {
-    return clear_enabled ||
-        (test_enabled && write_enabled && compare_op != VK_COMPARE_OP_NEVER);
+    (void)clear_enabled;   // an effective clear already satisfies the write-path clause below
+    return test_enabled && write_enabled && compare_op != VK_COMPARE_OP_NEVER;
 }
 
 inline void note_persistent_ds_depth_write(PersistentDsImage& image, bool use_depth,
@@ -2036,9 +2049,16 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     float    depth_clear   = 1.0f;
     uint32_t stencil_clear = 0;
     bool     got_depth_clear = false, got_stencil_clear = false;
+    // A DEPTH_CLEAR_ENABLE bit only acts through the enabled depth-write path (see
+    // depth_clear_effective) — the writes-disabled Blue Prince light-loop shape is depth-inert and
+    // must not force a depth attachment, pick the clear value, or clear in-pass (#1287).
+    const auto effective_depth_clear = [](const prosper::gpu::ResolvedPipelineState* ps) {
+        return depth_clear_effective(ps->depth_clear_enable, ps->depth_test_enable,
+                                     ps->depth_write_enable, ps->depth_compare_op);
+    };
     for (const auto& d : draws) {
         if (!d.ps) continue;
-        if (d.ps->depth_test_enable || d.ps->depth_clear_enable) { use_depth = true;
+        if (d.ps->depth_test_enable || effective_depth_clear(d.ps)) { use_depth = true;
             // DB_DEPTH_CLEAR is only consumed when DB_RENDER_CONTROL requests an actual clear. Merely
             // programming the register does not initialize a newly-created host depth image: it is
             // commonly stale state, and Astro Bot even leaves the packed 1920x1080 max coordinates
@@ -2048,6 +2068,13 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             //
             // An explicit clear wins even on ALWAYS/NEVER. Otherwise those compare modes do not depend
             // on the initial value and must not poison the first later meaningful draw (#508).
+            // Initial-contents approximation for a NEWLY-CREATED host image: an explicitly
+            // programmed clear expresses the guest's intended surface value even when this pass's
+            // write path cannot apply it (#508 keeps this for ALWAYS/NEVER too). The write-path
+            // gate below governs what the pass DOES (in-pass clears, validity, recency), not what
+            // a fresh image starts as. Note this latch sits inside the depth-using block above, so
+            // a fully write-path-disabled clear draw (the #1287 inert shape) never reaches it —
+            // only a test-enabled clear can supply fresh-image contents.
             if (!got_depth_clear && d.ps->depth_clear_enable) {
                 depth_clear = d.ps->depth_clear_value;
                 got_depth_clear = true;
@@ -2080,7 +2107,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     const prosper::gpu::ResolvedPipelineState* identity = nullptr;
     for (const auto& d : draws)
         if (d.ps && (d.ps->depth_test_enable || d.ps->stencil_enable ||
-                     d.ps->depth_clear_enable || d.ps->stencil_clear_enable)) { identity = d.ps; break; }
+                     effective_depth_clear(d.ps) || d.ps->stencil_clear_enable)) { identity = d.ps; break; }
     const bool has_ds_identity = identity && (identity->depth_read_base || identity->depth_write_base ||
                                                identity->stencil_read_base || identity->stencil_write_base);
     const bool persistent_ds = persist_depth_stencil && use_ds && has_ds_identity;
@@ -2098,7 +2125,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     bool depth_may_be_written = false;
     for (const auto& d : draws) {
         if (!d.ps) continue;
-        depth_used_meaningfully |= d.ps->depth_clear_enable || d.ps->depth_write_enable ||
+        depth_used_meaningfully |= effective_depth_clear(d.ps) || d.ps->depth_write_enable ||
             (d.ps->depth_test_enable && d.ps->depth_compare_op != VK_COMPARE_OP_ALWAYS &&
                                         d.ps->depth_compare_op != VK_COMPARE_OP_NEVER);
         depth_may_be_written |= persistent_ds_pass_may_write_depth(
@@ -4083,9 +4110,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     for (size_t di = 0; di < dv.size(); di++) {
         auto& v = dv[di];
         const auto* ps = draws[di].ps;
-        if (use_ds && ps && (ps->depth_clear_enable || ps->stencil_clear_enable)) {
+        if (use_ds && ps && (effective_depth_clear(ps) || ps->stencil_clear_enable)) {
             VkClearAttachment dsc{};
-            if (ps->depth_clear_enable) dsc.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+            if (effective_depth_clear(ps)) dsc.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
             if (ps->stencil_clear_enable && format_has_stencil)
                 dsc.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
             dsc.clearValue.depthStencil = {ps->depth_clear_value, ps->stencil_clear_value};
