@@ -2611,9 +2611,22 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
             case Rdna2Format::VOP1: case Rdna2Format::VOP2: case Rdna2Format::VOP3: case Rdna2Format::VOPC:
             case Rdna2Format::DS:    // DS operands are VGPR/M0 only; it cannot read an ordinary SGPR/VCC
             case Rdna2Format::EXP:   // EXP data sources are all VGPRs — it can never read an SGPR
-                for (int k = 0; k < in.n_src; k++)
-                    if ((in.src[k].kind == OperandKind::SGPR || in.src[k].kind == OperandKind::Special) &&
-                        (in.src[k].value == R || in.src[k].value == R - 1)) return false;   // read before redef -> live
+                for (int k = 0; k < in.n_src; k++) {
+                    if (in.src[k].kind != OperandKind::SGPR &&
+                        in.src[k].kind != OperandKind::Special) continue;
+                    if (in.src[k].value == R) return false;              // direct read before redef -> live
+                    // Vector ALU operands are single dwords even when the scalar field names VCC_LO.
+                    // Do not mistake that low-half read for a read of VCC_HI: a later VOPC can kill the
+                    // complete physical pair before any real B64 consumer. Scalar ALU operands retain
+                    // the conservative pair interpretation because their opcode-specific B32/B64 width
+                    // is not represented in Operand. VOP3 is conservative too: cndmask's third operand
+                    // can be an explicit mask pair. The ordinary VOP1/VOP2/VOPC scalar inputs here are
+                    // dwords (implicit VOP2 VCC-mask readers were handled above). This distinction proves
+                    // UE4's temporary VCC_HI descriptor word dead without weakening mask lifetimes.
+                    const bool dword_vector_alu = in.fmt == Rdna2Format::VOP1 ||
+                        in.fmt == Rdna2Format::VOP2 || in.fmt == Rdna2Format::VOPC;
+                    if (!dword_vector_alu && in.src[k].value == R - 1) return false;
+                }
                 // A VOP3B carry-out (sdst) is a 64-bit mask write — reads none of R beyond its sources.
                 if (in.sdst.kind == OperandKind::SGPR &&
                     (in.sdst.value == R || in.sdst.value + 1 == R)) return !entered_between(in.pc);   // redefined (pair)
@@ -3584,7 +3597,13 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
             for (const auto& r : ins) {
                 if (r.is_end || r.pc >= region_end) break;
                 if (r.pc <= in.pc) continue;
-                if (r.fmt == Rdna2Format::SOPP && r.opcode == 0x0a) return reject();
+                if (r.fmt == Rdna2Format::SOPP && r.opcode == 0x0a) {
+                    if (getenv("PROSPER_DBG"))
+                        std::fprintf(stderr,
+                                     "[compute-struct-reject] execz pc=%u contains barrier pc=%u\n",
+                                     in.pc, r.pc);
+                    return reject();
+                }
 
                 uint32_t scalar_width = 0;
                 if (r.fmt == Rdna2Format::SOP1) scalar_width = r.opcode == 0x04 ? 2u : 1u;
@@ -3603,7 +3622,14 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                     (r.dst.kind != OperandKind::SGPR && r.dst.kind != OperandKind::Special)) continue;
                 for (int vcc_half = 106; vcc_half <= 107; ++vcc_half) {
                     if (vcc_half < r.dst.value || vcc_half >= r.dst.value + (int)scalar_width) continue;
-                    if (!sgpr_dead_at_merge(ins, region_end, vcc_half)) return reject();
+                    if (!sgpr_dead_at_merge(ins, region_end, vcc_half)) {
+                        if (getenv("PROSPER_DBG"))
+                            std::fprintf(stderr,
+                                         "[compute-struct-reject] execz pc=%u scalar write pc=%u "
+                                         "leaves vcc-half s%d live at merge pc=%u\n",
+                                         in.pc, r.pc, vcc_half, region_end);
+                        return reject();
+                    }
                 }
             }
         }
@@ -9222,13 +9248,12 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             std::any_of(Fs.begin(), Fs.end(), [](const ForwardIf& branch) {
                 return branch.on_exec || branch.on_vcc;
             });
-        // A recognized structured loop shader may also contain top-level guest-wave branches and
-        // workgroup-uniform barriers between those regions (DOLL's title grading kernel). The generic
-        // CFG dispatcher cannot contain guest barriers, but routing the entire shader there is
-        // unnecessary: reduce each top-level branch with exact 32/64-lane scratch votes and retain the
-        // structured loop emitter. Restrict this escape hatch to the observed combination where the
-        // dispatcher is ineligible, the loop tree is valid, and neither a vote nor a guest barrier is
-        // nested inside another wave-varying region.
+        // A structured shader may contain top-level guest-wave branches and workgroup-uniform barriers
+        // between those regions (DOLL's title grading kernel and UE4's barrier-separated reductions).
+        // The generic CFG dispatcher cannot contain guest barriers, but routing the entire shader there
+        // is unnecessary: reduce each top-level branch with exact 32/64-lane scratch votes and retain the
+        // structured emitter. Loops are not required; a sequence of forward top-level reductions has the
+        // same safety argument. Neither a vote nor a guest barrier may be nested in a varying region.
         auto top_level_pc = [&](uint32_t pc) {
             for (const auto& parent : Fs) {
                 const uint32_t parent_end = parent.has_else ? parent.merge_pc : parent.target_pc;
@@ -9246,7 +9271,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                        top_level_pc(in.pc);
             });
         const bool structured_compute_wave_cfg = exact_compute_wave_cfg && !cfg_dispatch_safe &&
-            !cf_rejected && !Ls.empty() && barriers_are_top_level &&
+            !cf_rejected && barriers_are_top_level &&
             std::all_of(Fs.begin(), Fs.end(), [&](const ForwardIf& branch) {
                 return (!branch.on_exec && !branch.on_vcc) || top_level_pc(branch.branch_pc);
             });

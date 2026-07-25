@@ -4151,6 +4151,46 @@ int main() {
         CHECK(gotStructuredWave.size() == 128 && badStructuredWave == 0,
               "#1373: structured branch performs one exact 64-lane guest-wave vote");
 
+        // UE4 reduction kernels also use sequential top-level EXEC tests separated by workgroup
+        // barriers, with no loop in the shader. A scalar write in each arm makes the result visible
+        // to every invocation in the complete guest wave, not merely the host subgroup containing
+        // the one active lane. This proves the structured exact-wave path independently of loops.
+        const uint32_t barrier_reduction_cs[] = {
+            0xBE800380u,               //  0: s_mov_b32 s0, 0
+            0xBE810380u,               //  1: s_mov_b32 s1, 0
+            0x7DA20200u,               //  2: v_cmpx_lt_u32 exec, s0, v1
+            0xBF880001u,               //  3: s_cbranch_execz +1 -> 5
+            0xBE800381u,               //  4: s_mov_b32 s0, 1 (wave-visible arm result)
+            0xBEFE04C1u,               //  5: s_mov_b64 exec, -1
+            0xBF8A0000u,               //  6: s_barrier
+            0x7DA20600u,               //  7: v_cmpx_lt_u32 exec, s0, v3
+            0xBF880001u,               //  8: s_cbranch_execz +1 -> 10
+            0xBE810382u,               //  9: s_mov_b32 s1, 2 (wave-visible arm result)
+            0xBEFE04C1u,               // 10: s_mov_b64 exec, -1
+            0xBF8A0000u,               // 11: s_barrier
+            0x80020100u,               // 12: s_add_u32 s2, s0, s1
+            0x7E040C02u,               // 13: v_cvt_f32_u32 v2, s2
+            0xBF810000u,               // 14: s_endpgm
+        };
+        std::vector<uint32_t> spvBarrierReduction = recompile_valu(
+            barrier_reduction_cs, std::size(barrier_reduction_cs), 4, 2);
+        CHECK(!spvBarrierReduction.empty(),
+              "barrier-separated top-level wave reductions recompile without a loop");
+        std::vector<float> inBarrierReduction(128 * 4, 0.0f);
+        std::vector<float> expBarrierReduction(128);
+        for (uint32_t i = 0; i < 128; ++i) {
+            inBarrierReduction[i * 4 + 1] = i == 63 ? 1.0f : 0.0f;   // v1
+            inBarrierReduction[i * 4 + 3] = i == 127 ? 1.0f : 0.0f;  // v3
+            expBarrierReduction[i] = i < 64 ? 1.0f : 2.0f;
+        }
+        const std::vector<float> gotBarrierReduction = prosper::test::run_compute(
+            spvBarrierReduction, inBarrierReduction, 128, 128);
+        uint32_t badBarrierReduction = 0;
+        for (uint32_t i = 0; i < 128 && gotBarrierReduction.size() == 128; ++i)
+            if (gotBarrierReduction[i] != expBarrierReduction[i]) ++badBarrierReduction;
+        CHECK(gotBarrierReduction.size() == 128 && badBarrierReduction == 0,
+              "barrier-separated reductions perform independent exact 64-lane guest-wave votes");
+
         std::vector<uint32_t> divergentBarrierStructuredWave(
             std::begin(structured_wave_cs), std::end(structured_wave_cs));
         divergentBarrierStructuredWave[3] = 0xBF8A0000u; // s_barrier inside the top-level VCC arm

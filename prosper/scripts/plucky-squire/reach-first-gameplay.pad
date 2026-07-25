@@ -1,0 +1,18 @@
+# The Plucky Squire (PPSA15319): fresh-save route through title, slot, and play-style menus.
+# Full 4K rendering advances at only a few flips per second, so each Cross pulse spans twenty
+# presented frames with a broad neutral gap. Surplus pulses are harmless once the opening level
+# starts; they become ordinary gameplay actions after the final menu confirmation.
+f720-740:cross
+f900-920:cross
+f1080-1100:cross
+f1260-1280:cross
+f1440-1460:cross
+f1600-1620:cross
+f1760-1780:cross
+f1920-1940:cross
+f2080-2100:cross
+f2240-2260:cross
+f2400-2420:cross
+f2560-2580:cross
+f2720-2740:cross
+f2880-2900:cross
