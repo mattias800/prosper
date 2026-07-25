@@ -201,6 +201,27 @@ RenderState extract_render_state(const GpuState& st) {
     rs.depth_write_base = addr_of(rd(st.cx, P::DB_Z_WRITE_BASE), rd(st.cx, P::DB_Z_WRITE_BASE_HI));
     rs.stencil_read_base = addr_of(rd(st.cx, P::DB_STENCIL_READ_BASE), rd(st.cx, P::DB_STENCIL_READ_BASE_HI));
     rs.stencil_write_base = addr_of(rd(st.cx, P::DB_STENCIL_WRITE_BASE), rd(st.cx, P::DB_STENCIL_WRITE_BASE_HI));
+    // #1353: on GFX10 the READ and WRITE base registers describe ONE surface — drivers program
+    // both from a single address (the split is a pre-GFX10 TC-compat remnant), so a lone zero on
+    // either side is never a coherent state. Blue Prince's Gen5 indirect register arenas carry
+    // stale slots that parse as (DB_Z_WRITE_BASE, 0) AFTER the real pair write in the SAME array
+    // (PROSPER_DBBASETRACE capture on the issue; the #1335 screen-scissor fold is the same
+    // family), leaving every shadow-caster pass with (read=P, write=0) and splitting the
+    // persistent-DS identity. Recover the clobbered half from its partner and log fail-visibly;
+    // a genuine unbind writes both halves 0 and is untouched. Divergent NONZERO pairs are kept
+    // as-is (not observed; hardware would not produce them either).
+    const auto recover_pair = [](uint64_t& a, uint64_t& b, const char* which) {
+        if (a == b || (a && b)) return;
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 8)
+            fprintf(stderr,
+                    "[render_state] lone-zero DB %s base recovered from partner "
+                    "(read=0x%llx write=0x%llx, #1353 stale arena slot)\n",
+                    which, (unsigned long long)a, (unsigned long long)b);
+        if (!a) a = b; else b = a;
+    };
+    recover_pair(rs.depth_read_base, rs.depth_write_base, "Z");
+    recover_pair(rs.stencil_read_base, rs.stencil_write_base, "STENCIL");
     rs.db_depth_view = rd(st.cx, P::DB_DEPTH_VIEW);
     rs.db_render_override = rd(st.cx, P::DB_RENDER_OVERRIDE);
     rs.db_render_override2 = rd(st.cx, P::DB_RENDER_OVERRIDE2);
