@@ -47,10 +47,24 @@ class ClassificationTests(unittest.TestCase):
                 text = f"guest-bt-native: {frame}\n#1 prosper::gpu::execute_ordered\n"
                 self.assertEqual(HANG_PROBE.classify(text), ("UNKNOWN", frame))
 
-    def test_non_wait_name_with_select_prefix_is_running(self):
-        frame = "0x0000000000442f85 in prosper::gpu::select_shader"
-        self.assertEqual(HANG_PROBE.classify(f"guest-bt-native: {frame}\n"),
-                         ("RUNNING", frame))
+    def test_native_blocking_operations_remain_unknown(self):
+        names = ("__futex_abstimed_wait_common64", "pthread_cond_timedwait",
+                 "pthread_mutex_lock", "pthread_rwlock_rdlock", "sem_clockwait")
+        for name in names:
+            with self.subTest(name=name):
+                frame = f"0x00007f00 in {name}"
+                self.assertEqual(HANG_PROBE.classify(f"guest-bt-native: {frame}\n"),
+                                 ("UNKNOWN", frame))
+
+    def test_active_native_operations_are_running(self):
+        names = ("futex_wake", "pthread_cond_signal", "pthread_mutex_unlock",
+                 "pthread_mutex_trylock", "pthread_rwlock_unlock",
+                 "prosper::gpu::select_shader")
+        for name in names:
+            with self.subTest(name=name):
+                frame = f"0x0000000000442f85 in {name}"
+                self.assertEqual(HANG_PROBE.classify(f"guest-bt-native: {frame}\n"),
+                                 ("RUNNING", frame))
 
     def test_attach_frame_before_thread_switch_is_ignored(self):
         text = ("0x00007f00 in prosper::k_sema_wait()\n#1 prosper::gpu::present\n"

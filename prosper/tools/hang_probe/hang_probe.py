@@ -27,8 +27,11 @@ RUN_FRAMES  = ("execute_ordered", "execute_submit", "agc_driver_submit", "run_co
                "present", "SubmitDcb", "run_command")
 NATIVE_STOP_FRAME = re.compile(r"^guest-bt-native: (0x[0-9a-f]+ in .+)$", re.MULTILINE)
 NATIVE_BLOCK_FUNCTION = re.compile(
-    r"^(?:syscall_cancel_arch|futex\w*|pthread_(?:cond|mutex|rwlock)\w*|sem_wait\w*|"
-    r"clock_nanosleep(?:_time64)?|nanosleep|poll|ppoll|select(?:64)?|epoll_wait|kevent)$")
+    r"^(?:syscall_cancel_arch|futex_(?:(?:abstimed_)?wait(?:_(?:common|cancelable))?(?:64)?|wait_simple)|"
+    r"pthread_cond_(?:wait|timedwait|clockwait)|pthread_mutex_(?:lock|timedlock|clocklock)(?:_full)?|"
+    r"pthread_rwlock_(?:rdlock|wrlock|timedrdlock|timedwrlock|clockrdlock|clockwrlock)|"
+    r"sem_(?:wait|timedwait|clockwait)|clock_nanosleep(?:_time64)?|nanosleep|poll|ppoll|"
+    r"select(?:64)?|epoll_(?:wait|pwait|pwait2)|kevent(?:64)?)$")
 
 
 def native_function(frame: str):
