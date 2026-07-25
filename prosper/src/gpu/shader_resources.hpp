@@ -53,6 +53,17 @@ enum class DataFormat : uint32_t {
     Sint2_10_10_10,
 };
 
+// Address source for a const-fold-resolved graphics buffer fetch. Automatic preserves the legacy
+// recompiler heuristic; the other values are proofs produced by the dynamic fetch walk. In an NGG
+// merged shader the same MUBUF VADDR register can be selected from vertex_id or instance_id by a
+// wave-uniform v_cndmask, so replacing every such fetch with gl_VertexIndex is not equivalent.
+enum class VertexFetchIndexMode : uint32_t {
+    Automatic = 0,
+    Shader = 1,
+    Vertex = 2,
+    Instance = 3,
+};
+
 // Decode an RDNA2 (GFX10/PS5) combined seven-bit buffer FORMAT field, used by both V# descriptors
 // and MTBUF instructions, into the recompiler's data-format contract. Unknown values stay explicit.
 void rdna2_buffer_format(uint32_t fmt, DataFormat* out_fmt, uint32_t* out_components);
@@ -123,6 +134,7 @@ struct ShaderResource {
     //     metadata provenance; MTBUF requires this validated live-V# identity so FORMAT=INVALID cannot be
     //     resurrected through an older metadata resource. 0xFFFFFFFF = unset.
     uint32_t      fetch_pc      = 0xFFFFFFFFu;
+    VertexFetchIndexMode fetch_index_mode = VertexFetchIndexMode::Automatic;
 
     // FLAT-window (#1171) provenance: for a general flat_load whose 64-bit source pointer lives in the
     // consecutive user SGPRs s[flat_base_sgpr : +1], the executor binds the containing guest allocation

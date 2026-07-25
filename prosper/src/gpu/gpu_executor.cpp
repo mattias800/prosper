@@ -138,6 +138,7 @@ struct ShaderResourceCompileKey {
     uint32_t srt_offset = 0;
     uint32_t sgpr_base = 0;
     uint32_t fetch_pc = 0;
+    uint32_t fetch_index_mode = 0;
 
     bool operator==(const ShaderResourceCompileKey&) const = default;
 };
@@ -458,12 +459,18 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         // destination (the conservative unknown-value invalidation). Scalar lane spills are the exception:
         // retain their spill VGPR writes too, so an ordinary VGPR write invalidates any saved lane values.
         std::set<int> scalar_spill_vgprs;
+        std::set<int> fetch_vaddr_vgprs;
         for (const Rdna2Inst& instruction : decoded) {
-            if (instruction.fmt != Rdna2Format::VOP3) continue;
-            if (instruction.opcode == 0x361 && instruction.dst.kind == OperandKind::VGPR)
-                scalar_spill_vgprs.insert(instruction.dst.value);       // v_writelane_b32
-            else if (instruction.opcode == 0x360 && instruction.src[0].kind == OperandKind::VGPR)
-                scalar_spill_vgprs.insert(instruction.src[0].value);    // v_readlane_b32
+            if ((instruction.fmt == Rdna2Format::MUBUF ||
+                 instruction.fmt == Rdna2Format::MTBUF) &&
+                instruction.src[0].kind == OperandKind::VGPR)
+                fetch_vaddr_vgprs.insert(instruction.src[0].value);
+            if (instruction.fmt == Rdna2Format::VOP3) {
+                if (instruction.opcode == 0x361 && instruction.dst.kind == OperandKind::VGPR)
+                    scalar_spill_vgprs.insert(instruction.dst.value);       // v_writelane_b32
+                else if (instruction.opcode == 0x360 && instruction.src[0].kind == OperandKind::VGPR)
+                    scalar_spill_vgprs.insert(instruction.src[0].value);    // v_readlane_b32
+            }
         }
         // Retain only instructions that can affect fold state or emit a descriptor use, preserving
         // their original order and PCs.
@@ -472,6 +479,18 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
             if (instruction.is_end) break;
             const bool scalar_spill = instruction.fmt == Rdna2Format::VOP3 &&
                                       (instruction.opcode == 0x360 || instruction.opcode == 0x361);
+            const bool vector_index_select =
+                ((instruction.fmt == Rdna2Format::VOP3 && instruction.opcode == 0x101) ||
+                 (instruction.fmt == Rdna2Format::VOP2 && instruction.opcode == 0x01)) &&
+                instruction.dst.kind == OperandKind::VGPR &&
+                fetch_vaddr_vgprs.contains(instruction.dst.value);
+            // Index provenance begins at the hardware ABI VGPRs and is killed by any later shader
+            // computation of a register used as VADDR. Keep only writes to actual fetch-address
+            // registers; retaining every VALU instruction would make the otherwise-small scalar fold
+            // walk large UE shaders in full. This is what distinguishes DQ's first v5=vertex_id fetch
+            // from its later v5=3*vertex_id+1 packed-attribute fetch.
+            const bool fetch_vaddr_write = instruction.dst.kind == OperandKind::VGPR &&
+                                           fetch_vaddr_vgprs.contains(instruction.dst.value);
             const bool scalar_spill_invalidation = instruction.dst.kind == OperandKind::VGPR &&
                                                    scalar_spill_vgprs.contains(instruction.dst.value);
             const bool fold_format = instruction.fmt == Rdna2Format::SOP1 ||
@@ -483,7 +502,8 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
                                      instruction.fmt == Rdna2Format::MIMG ||
                                      instruction.fmt == Rdna2Format::MUBUF ||
                                      instruction.fmt == Rdna2Format::MTBUF;
-            if (fold_format || scalar_spill || scalar_spill_invalidation ||
+            if (fold_format || scalar_spill || vector_index_select || fetch_vaddr_write ||
+                scalar_spill_invalidation ||
                 instruction.dst.kind == OperandKind::SGPR)
                 result->instructions.push_back(instruction);
         }
@@ -790,6 +810,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                 static_cast<uint32_t>(resource.cls), static_cast<uint32_t>(resource.format),
                 resource.num_components, resource.binding, resource.stride,
                 resource.srt_offset, resource.sgpr_base, resource.fetch_pc,
+                static_cast<uint32_t>(resource.fetch_index_mode),
             });
         }
     }
@@ -1366,6 +1387,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     // stale user-data snapshot once the register was RELOADED from memory (ALU patches deliberately
     // don't count: descriptor snapshots are load-time semantics, pre-patch, like `descr`).
     std::bitset<kFoldSgprs> reloaded;
+    enum class FoldMask : uint8_t { Unknown, None, All };
+    std::array<FoldMask, kFoldSgprs> mask_state{};
+    constexpr size_t kFoldVgprs = 256;
+    std::array<VertexFetchIndexMode, kFoldVgprs> vector_index_mode{};
+    const bool explicit_ngg_index_provenance = user_sgpr_base == 8;
+    if (explicit_ngg_index_provenance) {
+        // GFX10 NGG merged VS/GS ABI: the VS inputs follow five GS VGPRs.
+        vector_index_mode[5] = VertexFetchIndexMode::Vertex;
+        vector_index_mode[8] = VertexFetchIndexMode::Instance;
+    }
     int scc = -1;   // tracked SCC (-1 unknown): set by s_cmp_*, consumed by s_cselect (the format patch's tail)
     // The SPI loads the user-data block starting at shader SGPR `user_sgpr_base` (s0..s7 are NGG system
     // SGPRs). So user-data block index k lands in shader SGPR (user_sgpr_base + k).
@@ -1376,6 +1407,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_known.set((size_t)r);
             val_srt_key_known.reset((size_t)r);
             val_seed_origin_known.reset((size_t)r);
+            mask_state[(size_t)r] = FoldMask::Unknown;
         }
     };
     auto forget = [&](int r) {
@@ -1383,6 +1415,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_known.reset((size_t)r);
             val_srt_key_known.reset((size_t)r);
             val_seed_origin_known.reset((size_t)r);
+            mask_state[(size_t)r] = FoldMask::Unknown;
         }
     };
     for (uint32_t i = 0; i < nsgpr; i++) {
@@ -1432,16 +1465,45 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             default: return false;
         }
     };
+    auto srcmask = [&](const Operand& o) -> FoldMask {
+        if (o.kind == OperandKind::Special && (o.value == 126 || o.value == 127))
+            return FoldMask::All;       // EXEC is full at this fetch-prologue boundary
+        if (o.kind == OperandKind::InlineInt)
+            return o.value == 0 ? FoldMask::None
+                 : o.value == -1 ? FoldMask::All : FoldMask::Unknown;
+        if ((o.kind == OperandKind::SGPR || o.kind == OperandKind::Special) &&
+            valid_reg(o.value))
+            return mask_state[(size_t)o.value];
+        return FoldMask::Unknown;
+    };
 
     for (const auto& in : ins) {
         if (in.is_end) break;
         const bool scalar_spill = in.fmt == Rdna2Format::VOP3 &&
                                   (in.opcode == 0x360 || in.opcode == 0x361);
+        const bool vector_select =
+            (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x101) ||
+            (in.fmt == Rdna2Format::VOP2 && in.opcode == 0x01);
+        // Buffer instructions read VADDR before writing their payload destination. Some prologues
+        // intentionally reuse the same VGPR for both (Messenger's v0 attribute fetch), so retain the
+        // source provenance before the generic destination-write invalidation below.
+        VertexFetchIndexMode fetch_index_mode_before_write = VertexFetchIndexMode::Automatic;
+        if (explicit_ngg_index_provenance &&
+            (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) &&
+            in.src[0].kind == OperandKind::VGPR && in.src[0].value >= 0 &&
+            in.src[0].value < static_cast<int>(kFoldVgprs))
+            fetch_index_mode_before_write = vector_index_mode[(size_t)in.src[0].value];
         if (!scalar_spill && in.dst.kind == OperandKind::VGPR) {
             // Any ordinary write replaces the whole vector result. Drop scalar values previously
             // packed into that VGPR's lanes rather than restoring stale descriptor words later.
             for (uint32_t lane = 0; lane < 64; ++lane)
                 scalar_spill_slots.erase(((uint32_t)in.dst.value << 6) | lane);
+            // Address selectors are scalar VGPR values; ordinary VALU writes replace their exact
+            // destination. Multi-dword memory results are payload here, not later ABI selectors.
+            if (explicit_ngg_index_provenance && !vector_select && in.dst.value >= 0 &&
+                in.dst.value < static_cast<int>(kFoldVgprs)) {
+                vector_index_mode[(size_t)in.dst.value] = VertexFetchIndexMode::Shader;
+            }
         }
         switch (in.fmt) {
             case Rdna2Format::SOP1:
@@ -1483,6 +1545,22 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 if (in.opcode != 0x03 && in.opcode != 0x04) scc = -1;
                 break;
             case Rdna2Format::SOP2: {
+                // s_cselect_b64 is commonly used to make an all-lanes/zero mask for the following
+                // NGG v_cndmask ABI selector. It does not produce ordinary scalar data, but SCC and
+                // both source masks are wave-uniform here, so retain the exact All/None result.
+                if (in.opcode == 0x0B) {
+                    const FoldMask m0 = srcmask(in.src[0]);
+                    const FoldMask m1 = srcmask(in.src[1]);
+                    const FoldMask result = scc < 0 ? FoldMask::Unknown : (scc ? m0 : m1);
+                    forget(in.dst.value);
+                    forget(in.dst.value + 1);
+                    if (valid_reg(in.dst.value)) mask_state[(size_t)in.dst.value] = result;
+                    if (trc)
+                        fprintf(stderr,
+                                "[dyntrace]   SOP2 pc=%u s_cselect_b64 dst=s%d scc=%d mask=%u\n",
+                                in.pc, in.dst.value, scc, (unsigned)result);
+                    break;
+                }
                 uint32_t a, c; bool ka, kc;
                 ka = (in.src[0].kind == OperandKind::Literal) ? (a = in.literal, true) : srcval(in.src[0], a);
                 kc = (in.src[1].kind == OperandKind::Literal) ? (c = in.literal, true) : srcval(in.src[1], c);
@@ -1927,6 +2005,15 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         DynFetch fetch{ in.pc, srsrc, with_off(d), desc_v3, from_seed };
                         fetch.unshifted_desc = d;
                         if (is_mtbuf) fetch.instruction_format = in.mtbuf_format;
+                        fetch.index_mode = fetch_index_mode_before_write;
+                        if (trc)
+                            fprintf(stderr,
+                                    "[dyntrace]   fetch pc=%u -> base=0x%llx stride=%u "
+                                    "num_records=%u size=%u fmt=%u nc=%u index=%u\n",
+                                    in.pc, (unsigned long long)fetch.desc.base, fetch.desc.stride,
+                                    fetch.desc.num_records, fetch.desc.size_bytes,
+                                    (unsigned)fetch.desc.format, fetch.desc.num_components,
+                                    (unsigned)fetch.index_mode);
                         out.push_back(fetch);
                     };
                     if (trc) fprintf(stderr, "[dyntrace] MUBUF fetch pc=%u op=0x%x SRSRC=s%d patched=%d (k=%d%d%d%d v3=0x%x) have_descr=%d off=+0x%x soff_known=%d\n",
@@ -1978,7 +2065,43 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 }
                 break;
             }
+            case Rdna2Format::VOP2:
+                // The compact e32 v_cndmask form uses VCC implicitly. Unity's NGG fetch prologue
+                // reissues this selector before each attribute load; treating the write as ordinary
+                // shader arithmetic loses the vertex-id proof after the first position fetch and
+                // collapses Evergate's later UV/color attributes.
+                if (explicit_ngg_index_provenance && in.opcode == 0x01 &&
+                    in.dst.kind == OperandKind::VGPR) {
+                    const FoldMask mask = mask_state[106]; // implicit VCC_LO/HI pair
+                    const Operand& selected = mask == FoldMask::All ? in.src[1] : in.src[0];
+                    VertexFetchIndexMode mode = VertexFetchIndexMode::Shader;
+                    if (mask != FoldMask::Unknown && selected.kind == OperandKind::VGPR &&
+                        selected.value >= 0 && selected.value < static_cast<int>(kFoldVgprs))
+                        mode = vector_index_mode[(size_t)selected.value];
+                    if (in.dst.value >= 0 && in.dst.value < static_cast<int>(kFoldVgprs))
+                        vector_index_mode[(size_t)in.dst.value] = mode;
+                    if (trc)
+                        fprintf(stderr,
+                                "[dyntrace]   VOP2 pc=%u cndmask v%d mask=%u selected=v%d index=%u\n",
+                                in.pc, in.dst.value, (unsigned)mask, selected.value, (unsigned)mode);
+                }
+                break;
             case Rdna2Format::VOP3:
+                if (explicit_ngg_index_provenance && in.opcode == 0x101 &&
+                    in.dst.kind == OperandKind::VGPR) {
+                    const FoldMask mask = srcmask(in.src[2]);
+                    const Operand& selected = mask == FoldMask::All ? in.src[1] : in.src[0];
+                    VertexFetchIndexMode mode = VertexFetchIndexMode::Shader;
+                    if (mask != FoldMask::Unknown && selected.kind == OperandKind::VGPR &&
+                        selected.value >= 0 && selected.value < static_cast<int>(kFoldVgprs))
+                        mode = vector_index_mode[(size_t)selected.value];
+                    if (in.dst.value >= 0 && in.dst.value < static_cast<int>(kFoldVgprs))
+                        vector_index_mode[(size_t)in.dst.value] = mode;
+                    if (trc)
+                        fprintf(stderr,
+                                "[dyntrace]   VOP3 pc=%u cndmask v%d mask=%u selected=v%d index=%u\n",
+                                in.pc, in.dst.value, (unsigned)mask, selected.value, (unsigned)mode);
+                }
                 // Scalar spill slots used by large UE shaders: v_writelane_b32 packs wave-uniform
                 // SGPR values into fixed VGPR lanes, then v_readlane_b32 restores them later. The
                 // recompiler deliberately drops SRT tags on restore, so recovered descriptors use
@@ -2329,7 +2452,12 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
         // at runtime by the fetch shader (so the load-time snapshot reads Unknown) — default to Float32
         // (a raw 32-bit-per-component fetch, correct for float attributes like positions).
         for (auto& kv : dyn_vb) {
-            const auto& d = kv.desc;
+            // Only ABI-proven vertex/instance fetches use the special address path that replaces
+            // VADDR with a built-in index and therefore needs OFFSET/SOFFSET folded into the bound
+            // base. A shader-computed VADDR keeps the instruction's complete address expression,
+            // including idxen+offen's second VGPR, so bind the original base for that mode.
+            const auto& d = kv.index_mode == VertexFetchIndexMode::Shader
+                          ? kv.unshifted_desc : kv.desc;
             if (kv.instruction_format != UINT32_MAX &&
                 ((kv.desc_v3 >> 12) & 0x7Fu) == 0)
                 continue;
@@ -2386,6 +2514,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             r.stride        = d.stride;
             r.sgpr_base     = kv.srsrc;           // DIRECT provenance = the fetch's SRSRC SGPR (fallback)
             r.fetch_pc      = kv.fetch_pc;        // PER-FETCH provenance = the exact fetch instruction
+            r.fetch_index_mode = kv.index_mode;
             r.srt_offset    = 0xFFFFFFFFu;
             if (!d.size_bytes && is_ps) {
                 static std::mutex zero_ps_mx;

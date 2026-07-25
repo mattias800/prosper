@@ -2255,13 +2255,94 @@ namespace {
 
     uint64_t page_up(uint64_t v) { return (v + 0xfff) & ~((uint64_t)0xfff); }
 
-    // Emit machine code into a stub slot.
-    void emit_impl(uint8_t* p, uint64_t fn) {          // movabs rax,fn ; jmp rax
-        p[0] = 0x48; p[1] = 0xB8; memcpy(p + 2, &fn, 8); p[10] = 0xFF; p[11] = 0xE0;
+    // Return-hook imports jump through one shared trampoline so the fixed 96-byte slot does not
+    // duplicate argument forwarding, optional guest-%fs switching, result preservation and the
+    // checkpoint call. r10=handler, r11=hook. Seven qwords make both paths share one handler-frame
+    // contract: the original guest return is at handler-entry RSP+0x40.
+    extern "C" __attribute__((naked)) void prosper_hle_hook_host_trampoline() {
+        __asm__ volatile(
+            "pushq %rax\n"                         // saved dummy / alignment
+            "pushq %r11\n"                         // return hook
+            "pushq %rax\n"                         // result spill / alignment
+            "pushq 0x38(%rsp)\n"                   // original arg10
+            "pushq 0x38(%rsp)\n"                   // original arg9
+            "pushq 0x38(%rsp)\n"                   // original arg8
+            "pushq 0x38(%rsp)\n"                   // original arg7
+            "callq *%r10\n"
+            "movq %rax, 0x20(%rsp)\n"
+            "movq 0x28(%rsp), %r10\n"
+            "callq *%r10\n"                        // true post-handler return checkpoint
+            "movq 0x20(%rsp), %rax\n"
+            "addq $0x38, %rsp\n"
+            "retq\n");
     }
-    void emit_unimpl(uint8_t* p, uint32_t idx, uint64_t fn) { // mov edi,idx ; movabs rax,fn ; jmp rax
+#ifdef __linux__
+    extern "C" __attribute__((naked)) void prosper_hle_hook_swap_trampoline() {
+        __asm__ volatile(
+            "rdfsbase %rax\n"
+            "cmpl $0x50524f53, 0x108(%rax)\n"
+            "jne 1f\n"
+            // Guest-FS path: save the guest base as the outer slot, switch to the host TCB, then
+            // checkpoint while host TLS is still active and restore guest FS immediately before ret.
+            "pushq %rax\n"
+            "pushq %r11\n"
+            "pushq %rax\n"
+            "pushq 0x38(%rsp)\n"
+            "pushq 0x38(%rsp)\n"
+            "pushq 0x38(%rsp)\n"
+            "pushq 0x38(%rsp)\n"
+            "movq 0x100(%rax), %rax\n"
+            "wrfsbase %rax\n"
+            "callq *%r10\n"
+            "movq %rax, 0x20(%rsp)\n"
+            "movq 0x28(%rsp), %r10\n"
+            "callq *%r10\n"
+            "movq 0x20(%rsp), %rax\n"
+            "movq 0x30(%rsp), %r11\n"
+            "addq $0x38, %rsp\n"
+            "wrfsbase %r11\n"
+            "retq\n"
+            // Host-FS path: same seven-qword frame, without an FS transition.
+            "1:\n"
+            "pushq %rax\n"
+            "pushq %r11\n"
+            "pushq %rax\n"
+            "pushq 0x38(%rsp)\n"
+            "pushq 0x38(%rsp)\n"
+            "pushq 0x38(%rsp)\n"
+            "pushq 0x38(%rsp)\n"
+            "callq *%r10\n"
+            "movq %rax, 0x20(%rsp)\n"
+            "movq 0x28(%rsp), %r10\n"
+            "callq *%r10\n"
+            "movq 0x20(%rsp), %rax\n"
+            "addq $0x38, %rsp\n"
+            "retq\n");
+    }
+#endif
+
+    // Emit machine code into a stub slot.
+    size_t emit_impl(uint8_t* p, uint64_t fn) {        // movabs rax,fn ; jmp rax
+        p[0] = 0x48; p[1] = 0xB8; memcpy(p + 2, &fn, 8); p[10] = 0xFF; p[11] = 0xE0;
+        return 12;
+    }
+    size_t emit_unimpl(uint8_t* p, uint32_t idx, uint64_t fn) { // mov edi,idx ; movabs rax,fn ; jmp rax
         p[0] = 0xBF; memcpy(p + 1, &idx, 4);
         p[5] = 0x48; p[6] = 0xB8; memcpy(p + 7, &fn, 8); p[15] = 0xFF; p[16] = 0xE0;
+        return 17;
+    }
+    size_t emit_impl_hook(uint8_t* p, uint64_t fn, uint64_t hook, bool swap) {
+        p[0] = 0x49; p[1] = 0xBA; memcpy(p + 2, &fn, 8);       // movabs r10,handler
+        p[10] = 0x49; p[11] = 0xBB; memcpy(p + 12, &hook, 8); // movabs r11,hook
+        uint64_t trampoline = (uint64_t)(uintptr_t)&prosper_hle_hook_host_trampoline;
+#ifdef __linux__
+        if (swap) trampoline = (uint64_t)(uintptr_t)&prosper_hle_hook_swap_trampoline;
+#else
+        (void)swap;
+#endif
+        p[20] = 0x48; p[21] = 0xB8; memcpy(p + 22, &trampoline, 8); // movabs rax,trampoline
+        p[30] = 0xFF; p[31] = 0xE0;                               // jmp rax
+        return 32;
     }
     // --- Guest-%fs swap stubs (only when PROSPER_GUEST_FS is enabled). Guest code runs with %fs = guest
     // TP; HLE handlers need the host %fs (host libc TLS). The stub is ROBUST to the calling thread's fs:
@@ -2354,11 +2435,15 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
     for (uint64_t i = 0; i < n; i++) {
         uint8_t* slot = base + i * stub_size;
         HleFn fn = Hle::lookup(slots[i].nid);
+        HleReturnHook return_hook = Hle::return_hook_of(slots[i].nid);
         size_t emitted = 0;
-        if (fn) { if (swap) emitted = emit_impl_swap(slot, (uint64_t)fn); else emit_impl(slot, (uint64_t)fn); }
+        if (fn) { if (return_hook) emitted = emit_impl_hook(slot, (uint64_t)fn,
+                                                            (uint64_t)return_hook, swap);
+                  else if (swap) emitted = emit_impl_swap(slot, (uint64_t)fn);
+                  else emitted = emit_impl(slot, (uint64_t)fn); }
         else    { if (swap) emitted = emit_unimpl_swap(slot, (uint32_t)i, (uint64_t)&prosper_on_unimpl);
-                  else      emit_unimpl(slot, (uint32_t)i, (uint64_t)&prosper_on_unimpl); }
-        if (emitted > stub_size) return fail("generated guest-%fs swap stub exceeds stub_size");
+                  else      emitted = emit_unimpl(slot, (uint32_t)i, (uint64_t)&prosper_on_unimpl); }
+        if (emitted > stub_size) return fail("generated import stub exceeds stub_size");
     }
     g_stub_base = stub_base; g_stub_size = stub_size; g_nstubs = n;
     // PROSPER_STUBDUMP: dump the stub table (index, guest offset from stub_base, lib::nid + resolved name).
@@ -2652,6 +2737,19 @@ uint64_t stub_addr(uint64_t idx) { return g_stub_base + idx * g_stub_size; }
 uint64_t hle_guest_return_address(uint64_t entry_rsp) {
     if (!entry_rsp) return 0;
     const uint64_t immediate = *(const uint64_t*)(uintptr_t)entry_rsp;
+    // Return-hook imports CALL the handler from a shared trampoline. Both its host-FS and guest-FS
+    // paths use the same seven-qword forwarding frame, so the original guest return is +0x40 from
+    // the handler entry (including the handler call's own return slot).
+    const uint64_t host_hook_begin =
+        (uint64_t)(uintptr_t)&prosper_hle_hook_host_trampoline;
+    bool from_hook_trampoline = immediate >= host_hook_begin && immediate < host_hook_begin + 256;
+#ifdef __linux__
+    const uint64_t swap_hook_begin =
+        (uint64_t)(uintptr_t)&prosper_hle_hook_swap_trampoline;
+    from_hook_trampoline |= immediate >= swap_hook_begin && immediate < swap_hook_begin + 256;
+#endif
+    if (from_hook_trampoline)
+        return *(const uint64_t*)(uintptr_t)(entry_rsp + 0x40);
 #if defined(__linux__)
     // Only the Linux guest-FS path CALLS the HLE handler. At handler entry its frame is:
     //   +0x00 return-to-stub, +0x08..0x18 forwarded args 7..9, +0x20 alignment pad,

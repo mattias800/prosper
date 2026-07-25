@@ -13,7 +13,12 @@ namespace {
     // tracing thunks, which a real handler in hle_agc is EXPECTED to replace later). Overwriting a
     // placeholder is intended and not flagged; overwriting a REAL handler with a different fn is the
     // accidental-shadow class (#330) that register_fn records.
-    struct Reg { HleFn fn; std::string name; bool placeholder = false; };
+    struct Reg {
+        HleFn fn;
+        std::string name;
+        bool placeholder = false;
+        HleReturnHook return_hook = nullptr;
+    };
     std::unordered_map<std::string, Reg>& registry() {
         static std::unordered_map<std::string, Reg> r; return r;
     }
@@ -87,7 +92,8 @@ void (*g_mb3_arm_hook)(uint64_t) = nullptr;   // #312: set by the Linux exec har
 
 namespace { std::vector<ShadowedReg>& shadow_list() { static std::vector<ShadowedReg> s; return s; } }
 
-void Hle::register_fn(const std::string& nid, HleFn fn, const char* name) {
+void Hle::register_fn(const std::string& nid, HleFn fn, const char* name,
+                      HleReturnHook return_hook) {
     auto& reg = registry();
     auto it = reg.find(nid);
     // A second registration of the same NID with a DIFFERENT handler silently shadows the first
@@ -96,7 +102,7 @@ void Hle::register_fn(const std::string& nid, HleFn fn, const char* name) {
     // A re-registration with the SAME fn (harmless dedup) is not recorded.
     if (it != reg.end() && it->second.fn != fn && !it->second.placeholder)
         shadow_list().push_back({ nid, it->second.name, name ? name : "" });
-    reg[nid] = { fn, name ? name : "", false };
+    reg[nid] = { fn, name ? name : "", false, return_hook };
 }
 void Hle::register_placeholder(const std::string& nid, HleFn fn, const char* name) {
     // Same as register_fn but marks the entry overridable, so a later real handler replacing it is
@@ -106,12 +112,16 @@ void Hle::register_placeholder(const std::string& nid, HleFn fn, const char* nam
     auto it = reg.find(nid);
     if (it != reg.end() && it->second.fn != fn && !it->second.placeholder)
         shadow_list().push_back({ nid, it->second.name, name ? name : "" });
-    reg[nid] = { fn, name ? name : "", true };
+    reg[nid] = { fn, name ? name : "", true, nullptr };
 }
 const std::vector<ShadowedReg>& Hle::shadowed_registrations() { return shadow_list(); }
 HleFn Hle::lookup(const std::string& nid) {
     auto it = registry().find(nid);
     return it == registry().end() ? nullptr : it->second.fn;
+}
+HleReturnHook Hle::return_hook_of(const std::string& nid) {
+    auto it = registry().find(nid);
+    return it == registry().end() ? nullptr : it->second.return_hook;
 }
 const char* Hle::name_of(const std::string& nid) {
     auto it = registry().find(nid);
