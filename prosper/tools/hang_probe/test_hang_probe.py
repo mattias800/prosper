@@ -11,6 +11,42 @@ HANG_PROBE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(HANG_PROBE)
 
 
+class ClassificationTests(unittest.TestCase):
+    def test_active_gpu_native_frame_is_running(self):
+        text = ("0x0000000000442f85 in prosper::gpu::build_stage_table(prosper::gpu::GpuState const&) ()\n"
+                "guest-bt: loaded\n#0 0x442f85 in ??? ()\n")
+        self.assertEqual(HANG_PROBE.classify(text),
+                         ("RUNNING", text.splitlines()[0]))
+
+    def test_active_live_frontend_native_frame_is_running(self):
+        text = ("0x0000000000652319 in prosper::frontend::register_live_renderer()::{lambda()#1}::operator()() const ()\n"
+                "guest-bt: loaded\n#0 0x652319 in ??? ()\n")
+        self.assertEqual(HANG_PROBE.classify(text),
+                         ("RUNNING", text.splitlines()[0]))
+
+    def test_active_libc_native_frame_is_running(self):
+        text = "0x00007f00 in _int_free_chunk () from /lib64/libc.so.6\n#0 0x7f00 in ??? ()\n"
+        self.assertEqual(HANG_PROBE.classify(text),
+                         ("RUNNING", text.splitlines()[0]))
+
+    def test_active_unsymbolicated_guest_frame_is_running(self):
+        text = "0x0000000410f4bb02 in ?? ()\n#0 0x410f4bb02 in ??? ()\n"
+        self.assertEqual(HANG_PROBE.classify(text),
+                         ("RUNNING", text.splitlines()[0]))
+
+    def test_native_blocking_frame_remains_unknown(self):
+        text = "0x00007f00 in pthread_cond_wait@@GLIBC_2.3.2 ()\n#0 0x7f00 in ??? ()\n"
+        self.assertEqual(HANG_PROBE.classify(text),
+                         ("UNKNOWN", text.splitlines()[0]))
+
+    def test_guest_wait_takes_precedence_over_lower_running_frame(self):
+        text = "#0 k_sema_wait\n#1 prosper::gpu::execute_ordered\n"
+        self.assertEqual(HANG_PROBE.classify(text), ("BLOCKED", "#0 k_sema_wait"))
+
+    def test_unknown_without_native_frame_has_empty_evidence(self):
+        self.assertEqual(HANG_PROBE.classify("#0 0x7f00 in ??? ()\n"), ("UNKNOWN", ""))
+
+
 class GuestBtResultTests(unittest.TestCase):
     @mock.patch.object(HANG_PROBE.subprocess, "run")
     def test_failed_guest_bt_is_unknown_with_stderr(self, run):

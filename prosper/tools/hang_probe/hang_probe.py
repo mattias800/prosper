@@ -25,17 +25,32 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WAIT_FRAMES = ("k_sema_wait", "k_eq_wait", "k_cond_wait", "k_ef_wait", "k_usleep")
 RUN_FRAMES  = ("execute_ordered", "execute_submit", "agc_driver_submit", "run_command_buffer",
                "present", "SubmitDcb", "run_command")
+NATIVE_STOP_FRAME = re.compile(r"^0x[0-9a-f]+ in .+$", re.MULTILINE)
+NATIVE_BLOCK_FRAME = re.compile(
+    r"\b(?:__syscall_cancel_arch|(?:__)?futex\w*|pthread_(?:cond|mutex|rwlock)\w*|sem_wait\w*|"
+    r"clock_nanosleep|nanosleep|poll|ppoll|select|epoll_wait|kevent)\b")
 
 
 def classify(gbt_text: str):
     """Return ('BLOCKED'|'RUNNING'|'UNKNOWN', top_frame_str) for the main thread's stack."""
-    if any(f in gbt_text for f in RUN_FRAMES):
-        m = next((l for l in gbt_text.splitlines() if any(f in l for f in RUN_FRAMES)), "")
-        return "RUNNING", m.strip()
+    # A guest kernel wait is decisive even when a lower frame happens to contain a render symbol.
+    # The EOP deadlock this probe targets has exactly that shape: the main thread is in k_sema_wait.
     if any(f in gbt_text for f in WAIT_FRAMES):
         m = next((l for l in gbt_text.splitlines() if any(f in l for f in WAIT_FRAMES)), "")
         return "BLOCKED", m.strip()
-    return "UNKNOWN", ""
+    if any(f in gbt_text for f in RUN_FRAMES):
+        m = next((l for l in gbt_text.splitlines() if any(f in l for f in RUN_FRAMES)), "")
+        return "RUNNING", m.strip()
+    # Re-sectioning guest modules leaves native boot_trace frames unnamed in the backtrace, but gdb
+    # prints the selected thread's current frame immediately before it. A non-blocking current frame
+    # means Thread 1 is executing: observed healthy Evergate samples include Prosper render helpers,
+    # libc allocation/string work, the Vulkan driver, and unsymbolicated guest PCs. Known host waits
+    # remain inconclusive unless guest_bt also found the decisive guest kernel-wait frame above.
+    m = NATIVE_STOP_FRAME.search(gbt_text)
+    frame = m.group(0).strip() if m else ""
+    if frame and not NATIVE_BLOCK_FRAME.search(frame):
+        return "RUNNING", frame
+    return "UNKNOWN", frame
 
 
 def run_guest_bt(cmd, timeout):
