@@ -1473,6 +1473,18 @@ constexpr bool persistent_ds_pass_may_write_depth(bool clear_enabled, bool test_
     return test_enabled && write_enabled && compare_op != VK_COMPARE_OP_NEVER;
 }
 
+// STENCIL_CLEAR_ENABLE is the stencil twin of the rule above (#1355): the bit substitutes the
+// VALUE of stencil writes and only acts through the enabled stencil write path — STENCIL_ENABLE
+// plus a nonzero write mask (driver stencil-clear draws program enable+ALWAYS+REPLACE+full mask).
+// Op-level analysis (a KEEP-everywhere draw writes nothing) is deliberately omitted: requiring
+// only enable+mask errs toward honoring clears, the safe direction for real guest clear shapes.
+// CONFIDENCE: MED (write-path gating by analogy with the #1352 title evidence; no title observed
+// exercising the writes-disabled stencil shape).
+constexpr bool stencil_clear_effective(bool clear_enabled, bool stencil_enabled,
+                                       uint32_t write_mask_front, uint32_t write_mask_back) {
+    return clear_enabled && stencil_enabled && ((write_mask_front | write_mask_back) != 0u);
+}
+
 inline void note_persistent_ds_depth_write(PersistentDsImage& image, bool use_depth,
                                            bool depth_may_be_written) {
     if (use_depth && depth_may_be_written)
@@ -2085,7 +2097,14 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     ? 0.0f : 1.0f;
                 got_depth_clear = true;
             } }
-        if (d.ps->stencil_enable || d.ps->stencil_clear_enable) { use_stencil = true;
+        // #1355: like the depth gate above, a STENCIL_CLEAR_ENABLE bit with the stencil write
+        // path disabled is inert and must not force a stencil attachment or clear in-pass. The
+        // initial-value latch stays reachable through stencil_enable only, mirroring the depth
+        // fresh-image approximation.
+        if (d.ps->stencil_enable ||
+            stencil_clear_effective(d.ps->stencil_clear_enable, d.ps->stencil_enable,
+                                    d.ps->stencil_write_mask[0], d.ps->stencil_write_mask[1])) {
+            use_stencil = true;
             if (!got_stencil_clear) {
                 stencil_clear = d.ps->stencil_clear_value; got_stencil_clear = true;
             } }
@@ -2107,7 +2126,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     const prosper::gpu::ResolvedPipelineState* identity = nullptr;
     for (const auto& d : draws)
         if (d.ps && (d.ps->depth_test_enable || d.ps->stencil_enable ||
-                     effective_depth_clear(d.ps) || d.ps->stencil_clear_enable)) { identity = d.ps; break; }
+                     effective_depth_clear(d.ps) ||
+                     stencil_clear_effective(d.ps->stencil_clear_enable, d.ps->stencil_enable,
+                                             d.ps->stencil_write_mask[0],
+                                             d.ps->stencil_write_mask[1]))) { identity = d.ps; break; }
     const bool has_ds_identity = identity && (identity->depth_read_base || identity->depth_write_base ||
                                                identity->stencil_read_base || identity->stencil_write_base);
     const bool persistent_ds = persist_depth_stencil && use_ds && has_ds_identity;
@@ -4110,10 +4132,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     for (size_t di = 0; di < dv.size(); di++) {
         auto& v = dv[di];
         const auto* ps = draws[di].ps;
-        if (use_ds && ps && (effective_depth_clear(ps) || ps->stencil_clear_enable)) {
+        if (use_ds && ps &&
+            (effective_depth_clear(ps) ||
+             stencil_clear_effective(ps->stencil_clear_enable, ps->stencil_enable,
+                                     ps->stencil_write_mask[0], ps->stencil_write_mask[1]))) {
             VkClearAttachment dsc{};
             if (effective_depth_clear(ps)) dsc.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
-            if (ps->stencil_clear_enable && format_has_stencil)
+            if (stencil_clear_effective(ps->stencil_clear_enable, ps->stencil_enable,
+                                        ps->stencil_write_mask[0], ps->stencil_write_mask[1]) &&
+                format_has_stencil)
                 dsc.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
             dsc.clearValue.depthStencil = {ps->depth_clear_value, ps->stencil_clear_value};
             VkClearRect rect{v.scissor, 0, 1};
