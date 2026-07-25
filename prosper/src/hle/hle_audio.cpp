@@ -153,6 +153,12 @@ int audio_peak_channel_volume(uint32_t mask, const int* vols) {
     return peak;
 }
 
+bool audio2_reserve_queue_slot(uint32_t& queued, uint32_t queue_depth) {
+    if (queued >= queue_depth) return false;
+    ++queued;
+    return true;
+}
+
 void audio_reset() {
     AudioSink* s = audio_sink();
     {
@@ -1007,9 +1013,9 @@ HLE(audio2_ctx_push) {
             if (!context) return kA2ErrInvalidParam;
             const auto now = std::chrono::steady_clock::now();
             audio2_update_queue_locked(*context, now);
-            if (context->queued < context->queue_depth) {
-                if (!context->queued) context->last_queue_update = now;
-                ++context->queued;
+            const bool was_empty = !context->queued;
+            if (audio2_reserve_queue_slot(context->queued, context->queue_depth)) {
+                if (was_empty) context->last_queue_update = now;
                 grain = context->grain;
                 break;
             }

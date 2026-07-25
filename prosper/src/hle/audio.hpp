@@ -35,6 +35,10 @@ void audio_decode_format(uint32_t param, int& channels, AudioFmt& fmt);
 void audio_apply_channel_volumes(int dst[8], uint32_t mask, const int* vols);
 int audio_peak_channel_volume(uint32_t mask, const int* vols);
 
+// Reserve one AudioOut2 device-queue slot. Kept as a pure transition so queue accounting can be
+// verified independently of the wall-clock drain performed by sceAudioOut2ContextGetQueueLevel.
+bool audio2_reserve_queue_slot(uint32_t& queued, uint32_t queue_depth);
+
 // Pluggable audio backend. All calls arrive on the guest's audio thread; output() MAY block to
 // pace it (as real hardware does — sceAudioOutOutput blocks until the ring has room).
 struct AudioSink {
