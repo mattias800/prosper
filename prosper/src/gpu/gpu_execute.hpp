@@ -195,7 +195,10 @@ std::vector<DynFetch> resolve_dynamic_fetch(const uint32_t* code, size_t dwords,
 // contain image uses, which the production caller materializes with image-specific view handling.
 std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                                                  const uint32_t* code, size_t dwords,
-                                                 const uint32_t* user_sgprs, uint32_t nsgpr);
+                                                 const uint32_t* user_sgprs, uint32_t nsgpr,
+                                                 uint32_t linear_local_x = 0,
+                                                 uint32_t linear_threads_x = 0,
+                                                 uint32_t tgid_x_sgpr = UINT32_MAX);
 
 // The dynamic descriptor fold and shader-cache key builder both walk immutable shader instructions
 // on every draw. Cache only the decoded instructions, validating the complete consumed byte range on

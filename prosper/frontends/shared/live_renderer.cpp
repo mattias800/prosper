@@ -1026,8 +1026,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const bool sampled_source_f16 =
                             r.format == prosper::gpu::DataFormat::Float16 &&
                             (sampled_source_bpt == 2 || sampled_source_bpt == 4 || sampled_source_bpt == 8);
+                        const bool sampled_source_f32 =
+                            r.cls == RC::Texture && r.img_dim != 3u && !r.compression_enabled &&
+                            r.format == prosper::gpu::DataFormat::Float32 &&
+                            (sampled_source_bpt == 4 || sampled_source_bpt == 8 ||
+                             sampled_source_bpt == 16);
                         if (sampled_source_bpt == 0 ||
-                            (sampled_source_bpt > 4 && !sampled_source_f16)) sampled_source_bpt = 4;
+                            (sampled_source_bpt > 4 && !sampled_source_f16 && !sampled_source_f32))
+                            sampled_source_bpt = 4;
                         const bool persistent_sampled_texture =
                             !has_live_rtt && !r.host_data && r.img_dim == 1u &&
                             r.cls == RC::Texture &&
@@ -1421,9 +1427,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         }
                         const size_t volume_texels = (size_t)tw * th * (is_volume ? r.depth : 1u);
                         const VkFormat live_rtt_format = has_cpu_live_rtt
-                            ? live_rtt->second.format : VK_FORMAT_R8G8B8A8_UNORM;
-                        const uint32_t output_bpp = has_cpu_live_rtt
-                            ? prosper::test::backend_color_bytes_per_pixel(live_rtt_format) : 4u;
+                            ? live_rtt->second.format
+                            : (sampled_source_f32 ? VK_FORMAT_R16G16B16A16_SFLOAT
+                                                  : VK_FORMAT_R8G8B8A8_UNORM);
+                        fr.texture_format = live_rtt_format;
+                        const uint32_t output_bpp =
+                            prosper::test::backend_color_bytes_per_pixel(live_rtt_format);
                         size_t nb = volume_texels * output_bpp * (is_cube ? 6u : 1u);
                         size_t linear_source_prefix_size = 0;
                         if (texstore_used == texstore.size()) texstore.emplace_back();
@@ -1473,11 +1482,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // which is why glyph text rendered as solid white/black BLOCKS (#102). bpt drives a
                         // narrow read+expand path below. StorageImage / unknown formats keep 4 B (bpt=0->4).
                         uint32_t bpt = sampled_source_bpt;
-                        // fp16 surfaces (fmt 71 Float16x4 = 8 B/texel, 29 = 4 B, 13 = 2 B) get a real
-                        // half->UNORM8 conversion path below for guest-backed textures. Renderer-owned
-                        // Float16x4 RTTs bypass it and retain native bytes. Other unknown formats keep RGBA8.
+                        // fp16/fp32 surfaces use their real source element size below. Guest fp16 keeps
+                        // the historical UNORM8 conversion, while fp32 narrows to native RGBA16F so small
+                        // values and HDR range survive. Renderer-owned RTTs bypass both conversions.
                         const bool f16 = sampled_source_f16;
-                        bool f16_done = false;
+                        const bool f32 = sampled_source_f32;
+                        bool f16_done = false, f32_done = false;
                         // RTT (#167): if this texture's base is a color target we rendered into, inject those
                         // pixels (nearest-scaled to tw x th) instead of reading empty guest memory.
                         bool rtt_hit = false;
@@ -1640,6 +1650,55 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             if (!prosper::gpu::bc_decode_surface(
                                     texture_pixels.data(), lin.data(), lin.size(), tw, th, r.format))
                                 std::fill(texture_pixels.begin(), texture_pixels.end(), 0);
+                        } else if (f32) {
+                            // Sampled Float32 resources cannot be reinterpreted as RGBA8: a value such as
+                            // 1/8192 has bytes 00 00 00 39 and became a zero red channel. Preserve the float
+                            // value and HDR range by narrowing each present component to native RGBA16F;
+                            // the backend already carries that format losslessly between upload and sample.
+                            // Power-of-two component counts keep the source texel size compatible with the
+                            // supported GFX10 surface detilers (4/8/16 B per texel).
+                            const uint32_t nc = bpt / 4;
+                            std::vector<uint8_t> flin(volume_texels * bpt, 0);
+                            const bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
+                                !getenv("PROSPER_NODETILE");
+                            if (tiled) {
+                                const size_t tbytes = is_volume
+                                    ? prosper::gpu::tiled_volume_bytes(
+                                          tw, th, r.depth, r.tile_mode, bpt)
+                                    : prosper::gpu::tiled_surface_bytes(
+                                          tw, th, r.tile_mode, 0, bpt);
+                                std::vector<uint8_t> traw(tbytes, 0);
+                                const size_t got = copy_resource(
+                                    traw.data(), r.gpu_addr, tbytes);
+                                if (got < flin.size()) {
+                                    copy_resource(flin.data(), r.gpu_addr, flin.size());
+                                } else if (is_volume) {
+                                    prosper::gpu::detile_volume(
+                                        flin.data(), traw.data(), got, tw, th, r.depth,
+                                        r.tile_mode, bpt);
+                                } else if (r.in_mip_tail) {
+                                    prosper::gpu::detile_surface_level(
+                                        flin.data(), traw.data(), got, tw, th, r.tile_mode,
+                                        bpt, r.mip_tail_x, r.mip_tail_y);
+                                } else {
+                                    prosper::gpu::detile_surface(
+                                        flin.data(), traw.data(), tw, th, r.tile_mode, 0, bpt);
+                                }
+                            } else if (linear_padded_read) {
+                                copy_linear_padded_rows(flin.data(), (size_t)tw * bpt);
+                            } else {
+                                copy_resource(flin.data(), r.gpu_addr, flin.size());
+                            }
+                            for (size_t t = 0; t < volume_texels; ++t) {
+                                for (uint32_t c = 0; c < 4; ++c) {
+                                    float value = c == 3 ? 1.0f : 0.0f;
+                                    if (c < nc)
+                                        std::memcpy(&value, flin.data() + t * bpt + c * 4, 4);
+                                    const uint16_t half = prosper::gpu::float_to_half(value);
+                                    std::memcpy(texture_pixels.data() + t * 8 + c * 2, &half, 2);
+                                }
+                            }
+                            f32_done = true;
                         } else if (f16) {
                             // fp16 texture (#290 wall 1): read at the REAL bytes-per-texel and detile
                             // with the REAL element size — the old clamp read an 8-B/texel Float16x4
@@ -1759,7 +1818,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         bool auto_tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode);
                         const char* dt = getenv("PROSPER_DETILE");
                         // BC textures already block-detiled + decoded above; the 32-bpp detiler must not touch them.
-                        if (!rtt_hit && !cube_done && !dcc_fast_clear_done && !bcb && !narrow_done && !f16_done &&
+                        if (!rtt_hit && !cube_done && !dcc_fast_clear_done && !bcb && !narrow_done &&
+                            !f16_done && !f32_done &&
                             !getenv("PROSPER_NODETILE") &&
                             (auto_tiled || (!is_volume && dt && atoi(dt) != 0))) {
                             const uint32_t tmode = auto_tiled ? r.tile_mode : (uint32_t)prosper::gpu::TileMode::Sw4KbS;

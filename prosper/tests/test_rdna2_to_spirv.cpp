@@ -3960,6 +3960,62 @@ int main() {
         std::vector<float> gotNL2 = prosper::test::run_compute(spvNL2, inNL, 64, 64);
         CHECK(gotNL2.size() == 64 && std::fabs(gotNL2[0] - 0.75f) < 1e-3f,
               "#590: outer body tail runs 3 times (3 x 0.25 = 0.75) after each inner-loop exit");
+
+        // DOLL's title kernel combines those nested loops and a post-loop workgroup barrier with a
+        // top-level scalar VCC branch. The generic exact-wave dispatcher cannot contain a barrier,
+        // so this shape must retain structured loops and reduce the branch through guest-wave LDS.
+        // Workgroup 0 has no VCC lane; workgroup 1 has only lane 63 set, proving that the vote covers
+        // the complete 64-lane guest wave rather than the host's potentially narrower subgroup.
+        const uint32_t structured_wave_cs[] = {
+            0x7E040280u,               //  0: v_mov_b32 v2, 0
+            0x7C020300u,               //  1: v_cmp_lt_f32 vcc, v0, v1
+            0xBF860001u,               //  2: s_cbranch_vccz +1 -> 4
+            0x7E040281u,               //  3: v_mov_b32 v2, 1
+            0x7E020283u,               //  4: v_mov_b32 v1, 3
+            0x7E080284u,               //  5: v_mov_b32 v4, 4
+            0xBE800380u,               //  6: s_mov_b32 s0, 0
+            0x7E060280u,               //  7: v_mov_b32 v3, 0
+            0x7E0A02F2u,               //  8: v_mov_b32 v5, 1.0
+            0xBE82047Eu,               //  9: s_mov_b64 s[2:3], exec
+            0x7DA20200u,               // 10: OUTER_HDR: v_cmpx_lt_u32 s0, v1
+            0xBF88000Du,               // 11: s_cbranch_execz +13 -> 25
+            0xBE810380u,               // 12: s_mov_b32 s1, 0
+            0xBE84047Eu,               // 13: s_mov_b64 s[4:5], exec
+            0x7DA20801u,               // 14: INNER_HDR: v_cmpx_lt_u32 s1, v4
+            0xBF880004u,               // 15: s_cbranch_execz +4 -> 20
+            0x060606FFu, 0x3D800000u,  // 16: v_add_f32 v3, 0.0625, v3
+            0x81018101u,               // 18: s_add_i32 s1, s1, 1
+            0xBF82FFFAu,               // 19: s_branch -6 -> 14
+            0xBEFE0404u,               // 20: s_mov_b64 exec, s[4:5]
+            0x060606FFu, 0x3E800000u,  // 21: v_add_f32 v3, 0.25, v3
+            0x81008100u,               // 23: s_add_i32 s0, s0, 1
+            0xBF82FFF1u,               // 24: s_branch -15 -> 10
+            0xBEFE0402u,               // 25: s_mov_b64 exec, s[2:3]
+            0xBF8A0000u,               // 26: s_barrier
+            0x7E040D02u,               // 27: v_cvt_f32_u32 v2, v2
+            0xBF810000u,               // 28: s_endpgm
+        };
+        std::vector<uint32_t> spvStructuredWave = recompile_valu(
+            structured_wave_cs, std::size(structured_wave_cs), 2, 2);
+        CHECK(!spvStructuredWave.empty(),
+              "#1373: nested loops + barrier + top-level exact-wave branch recompile");
+        std::vector<float> inStructuredWave(128 * 2), expStructuredWave(128);
+        for (uint32_t i = 0; i < 128; ++i) {
+            inStructuredWave[i * 2] = (i == 127) ? 0.0f : 1.0f;
+            inStructuredWave[i * 2 + 1] = 0.5f;
+            expStructuredWave[i] = i < 64 ? 0.0f : 1.0f;
+        }
+        const std::vector<float> gotStructuredWave = prosper::test::run_compute(
+            spvStructuredWave, inStructuredWave, 128, 128);
+        uint32_t badStructuredWave = 0;
+        for (uint32_t i = 0; i < 128 && gotStructuredWave.size() == 128; ++i)
+            if (gotStructuredWave[i] != expStructuredWave[i]) ++badStructuredWave;
+        if (gotStructuredWave.size() == 128)
+            printf("  structured-wave mismatches=%u out[0/63/64/127]=%g/%g/%g/%g\n",
+                   badStructuredWave, gotStructuredWave[0], gotStructuredWave[63],
+                   gotStructuredWave[64], gotStructuredWave[127]);
+        CHECK(gotStructuredWave.size() == 128 && badStructuredWave == 0,
+              "#1373: structured branch performs one exact 64-lane guest-wave vote");
     }
 
     // PARTIALLY OVERLAPPING loops (back-edge into another loop's body without proper nesting) must
