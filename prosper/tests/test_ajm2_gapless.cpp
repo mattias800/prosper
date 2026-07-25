@@ -194,6 +194,49 @@ int main() {
     CHECK(sb4.uiTotalDecodedSamples == raw_frames,
           "no-gapless instance keeps the cumulative raw-frame counter");
 
+    // Result publication is the commit point for a persistent ATRAC9 decode. If the result pointer
+    // is inaccessible after PCM and codec state advance, the instance must become terminal before
+    // either a later job in the same batch or a later batch can decode against hidden state.
+    const uint32_t inst5 = 11;
+    Sideband terminal_same_batch{};
+    std::vector<int16_t> terminal_first((size_t)sfs * ch, (int16_t)0x5555);
+    std::vector<int16_t> terminal_second((size_t)sfs * ch, (int16_t)0x6666);
+    job_init(batch, inst5, addr(kAt9Config), 8, 0, 0, 0, 0, 0, 0);
+    constexpr uint64_t inaccessible_result = 0x0000deadbeef0000ull;
+    CHECK(job_dec(batch, inst5, addr(kAt9Data), (uint32_t)sfb,
+                  addr(terminal_first.data()), (uint32_t)(terminal_first.size() * sizeof(int16_t)),
+                  inaccessible_result, 0, 0, 0) == 0 &&
+          job_dec(batch, inst5, addr(kAt9Data + sfb), (uint32_t)sfb,
+                  addr(terminal_second.data()), (uint32_t)(terminal_second.size() * sizeof(int16_t)),
+                  addr(&terminal_same_batch), 0, 0, 0) == 0,
+          "ATRAC9 publication fixture queues two jobs on one persistent instance");
+    batch_go(0, batch, 0, 0, 0, 0, 0, 0, 0, 0);
+    CHECK(std::memcmp(terminal_first.data(), reference.data(),
+                      (size_t)sfs * frame_bytes) == 0,
+          "failed result publication occurs after the first ATRAC9 decode reaches PCM output");
+    CHECK(terminal_same_batch.iResult != 0 &&
+          terminal_same_batch.iSizeConsumed == 0 &&
+          terminal_same_batch.iSizeProduced == 0 &&
+          terminal_same_batch.uiTotalDecodedSamples == (uint64_t)sfs &&
+          terminal_same_batch.numFrames == 0 &&
+          terminal_second.front() == (int16_t)0x6666,
+          "failed result publication terminalizes before the same-batch job");
+
+    Sideband terminal_later_batch{};
+    std::vector<int16_t> terminal_third((size_t)sfs * ch, (int16_t)0x7777);
+    CHECK(job_dec(batch, inst5, addr(kAt9Data + 2 * sfb), (uint32_t)sfb,
+                  addr(terminal_third.data()), (uint32_t)(terminal_third.size() * sizeof(int16_t)),
+                  addr(&terminal_later_batch), 0, 0, 0) == 0,
+          "terminal ATRAC9 instance accepts a later job for an error sideband");
+    batch_go(0, batch, 0, 0, 0, 0, 0, 0, 0, 0);
+    CHECK(terminal_later_batch.iResult != 0 &&
+          terminal_later_batch.iSizeConsumed == 0 &&
+          terminal_later_batch.iSizeProduced == 0 &&
+          terminal_later_batch.uiTotalDecodedSamples == (uint64_t)sfs &&
+          terminal_later_batch.numFrames == 0 &&
+          terminal_third.front() == (int16_t)0x7777,
+          "terminal ATRAC9 state persists across batches with a stable cumulative total");
+
     printf(fails ? "test_ajm2_gapless: %d FAILURE(S)\n" : "test_ajm2_gapless: all ok\n", fails);
     return fails ? 1 : 0;
 }
