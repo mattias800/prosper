@@ -25,6 +25,13 @@ int main() {
     printf("== test_texture_sample_render ==\n");
     const uint32_t W = 64, H = 64;
 
+    using prosper::test::BackendSubmissionState;
+    using prosper::test::backend_submission_state;
+    CHECK(backend_submission_state(false, false) == BackendSubmissionState::NotSubmitted &&
+              backend_submission_state(true, true) == BackendSubmissionState::Complete &&
+              backend_submission_state(true, false) == BackendSubmissionState::Pending,
+          "submission cleanup distinguishes never-submitted, completed, and pending work");
+
     {
         bool speculative_state_valid = true;
         bool retained_resources_released = false;
