@@ -6,10 +6,12 @@
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
 #include "../src/hle/callback_fs.hpp"
+#include <cstdlib>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
-#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 
 using namespace prosper;
 
@@ -37,6 +39,62 @@ static void set_game_intent_activity(const char* value) {
 int main() {
     printf("== test_service_getters ==\n");
     register_builtin_hle();
+
+    // PlayGo must describe the chunks actually present in an Unreal IoStore dump. In particular,
+    // invalid ids must not be reported LOCAL_FAST: DOLL probes sequential ids until BAD_CHUNK_ID,
+    // and the old all-local answer ran it through a 1000-id safety cap while pakchunk1 content was
+    // waiting to become available (#1373).
+    {
+        namespace fs = std::filesystem;
+        const fs::path app0 = fs::temp_directory_path() /
+            ("prosper-playgo-" + std::to_string((uintptr_t)&fails));
+        std::error_code ec;
+        fs::remove_all(app0, ec);
+        const fs::path paks = app0 / "DOLL" / "Content" / "Paks";
+        fs::create_directories(paks, ec);
+        std::ofstream(paks / "pakchunk0-ps5.utoc", std::ios::binary).put('\1');
+        std::ofstream(paks / "pakchunk0-ps5.ucas", std::ios::binary).put('\1');
+        std::ofstream(paks / "pakchunk1-ps5.utoc", std::ios::binary).put('\1');
+        std::ofstream(paks / "pakchunk1-ps5.ucas", std::ios::binary).put('\1');
+        std::ofstream(paks / "pakchunk2-ps5.utoc", std::ios::binary); // empty placeholder
+        std::ofstream(paks / "pakchunk3-ps5.utoc", std::ios::binary).put('\1'); // missing data
+        set_app0_root(app0.string());
+
+        HleFn init = Hle::lookup(nid_hash("scePlayGoInitialize"));
+        HleFn get_ids = Hle::lookup(nid_hash("scePlayGoGetChunkId"));
+        HleFn get_locus = Hle::lookup(nid_hash("scePlayGoGetLocus"));
+        CHECK(init && get_ids && get_locus, "PlayGo chunk-query functions registered");
+        if (init && get_ids && get_locus) {
+            init(0, 0, 0, 0, 0, 0);
+            uint32_t entries = 0;
+            CHECK(get_ids(1, 0, 0, (uint64_t)(uintptr_t)&entries, 0, 0) == 0 && entries == 2,
+                  "GetChunkId reports both non-empty IoStore chunks");
+            uint16_t ids[4] = {0xffff, 0xffff, 0xffff, 0xffff};
+            entries = 0;
+            CHECK(get_ids(1, (uint64_t)(uintptr_t)ids, 4,
+                          (uint64_t)(uintptr_t)&entries, 0, 0) == 0 &&
+                      entries == 2 && ids[0] == 0 && ids[1] == 1,
+                  "GetChunkId requires non-empty IoStore index and data files");
+            int8_t loci[2] = {-1, -1};
+            CHECK(get_locus(1, (uint64_t)(uintptr_t)ids, 2,
+                            (uint64_t)(uintptr_t)loci, 0, 0) == 0 &&
+                      loci[0] == 3 && loci[1] == 3,
+                  "GetLocus reports discovered chunks LOCAL_FAST");
+            const uint16_t missing = 2;
+            int8_t missing_locus = -1;
+            CHECK(get_locus(1, (uint64_t)(uintptr_t)&missing, 1,
+                            (uint64_t)(uintptr_t)&missing_locus, 0, 0) == 0x80B2000Cull &&
+                      missing_locus == 0,
+                  "GetLocus marks an absent chunk not-downloaded and returns BAD_CHUNK_ID");
+            fs::remove(paks / "pakchunk0-ps5.ucas", ec);
+            fs::remove(paks / "pakchunk1-ps5.ucas", ec);
+            init(0, 0, 0, 0, 0, 0);
+            entries = 99;
+            CHECK(get_ids(1, 0, 0, (uint64_t)(uintptr_t)&entries, 0, 0) == 0 && entries == 0,
+                  "GetChunkId does not apply the non-IoStore fallback to a partial IoStore dump");
+        }
+        fs::remove_all(app0, ec);
+    }
 
 #ifndef _WIN32
     // Guest callback shims must recover saved r11 from the import stub's real +0x28 slot. +0x18 is

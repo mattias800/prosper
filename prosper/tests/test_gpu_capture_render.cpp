@@ -94,7 +94,8 @@ int main() {
         0xf800000fu, 0x03020100u, 0xbf810000u,
     };
     ShaderResourceTable compile_rt;
-    ShaderResource tex{}; tex.cls = ResourceClass::Texture; tex.binding = 4; tex.img_dim = 1;
+    ShaderResource tex{}; tex.cls = ResourceClass::Texture; tex.format = DataFormat::Unorm8;
+    tex.num_components = 4; tex.binding = 4; tex.img_dim = 1;
     tex.width = 2; tex.height = 2; tex.size = 16; tex.sgpr_base = 8; tex.gpu_addr = 0x100000;
     tex.linear_row_pitch_bytes = 8;  // synthetic reader publishes tightly packed RGBA8 rows
     tex.mag_filter = tex.min_filter = 0; compile_rt.resources.push_back(tex);
@@ -236,6 +237,38 @@ int main() {
         }
         CHECK(packed_red,
               "reused scratch converts and uploads the current packed R10G10B10A2 texture");
+
+        float float_texels[16] = {
+            0.5f, 0.25f, 0.125f, 1.0f, 0.5f, 0.25f, 0.125f, 1.0f,
+            0.5f, 0.25f, 0.125f, 1.0f, 0.5f, 0.25f, 0.125f, 1.0f,
+        };
+        DrawItem float_draw = replay.items[0];
+        float_draw.color0_base = 0xd60000;
+        auto float_table = std::make_shared<ShaderResourceTable>(*float_draw.prt);
+        ShaderResource& float_resource = float_table->resources[0];
+        float_resource.gpu_addr = 0xd70000;
+        float_resource.size = sizeof(float_texels);
+        float_resource.width = float_resource.height = 2;
+        float_resource.depth = 1;
+        float_resource.img_dim = 1;
+        float_resource.tile_mode = 0;
+        float_resource.linear_row_pitch_bytes = 2u * 4u * sizeof(float);
+        float_resource.format = DataFormat::Float32;
+        float_resource.num_components = 4;
+        float_resource.host_data = reinterpret_cast<uint8_t*>(float_texels);
+        float_resource.host_data_size = sizeof(float_texels);
+        float_draw.prt = std::move(float_table);
+        const std::vector<uint8_t> float_pixels = render_submit_items({float_draw}, W, H);
+        bool float_sampled = float_pixels.size() == static_cast<size_t>(W) * H * 4;
+        if (float_sampled) {
+            const uint8_t* center =
+                &float_pixels[(static_cast<size_t>(H / 2) * W + W / 2) * 4];
+            float_sampled = center[0] >= 120 && center[0] <= 136 &&
+                            center[1] >= 56 && center[1] <= 72 &&
+                            center[2] >= 24 && center[2] <= 40 && center[3] > 240;
+        }
+        CHECK(float_sampled,
+              "sampled Float32x4 texture preserves ordinary values instead of raw RGBA8 bytes");
     }
 
 #if defined(_WIN32) || defined(__linux__)
