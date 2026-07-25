@@ -8,7 +8,7 @@ Raw PCM, verbose logs, and GPU captures are local diagnostics and are intentiona
 | Title | Revision | Visual milestone | Audio evidence |
 | --- | --- | --- | --- |
 | GRIS (`PPSA09804`) | 01.001.000 | Native 1920×1080 **NEW GAME** title | CLEAN, `rms=0.1800`, `peak=1.2689`, duplicated grains 0.0% |
-| Sonic Origins (`PPSA05325`) | 02.002.000 update targeting 02.001.000 | Blocked: update-only dump is missing two base title assets | AudioOut2 runs, but guest PCM is zero while startup is blocked |
+| Sonic Origins (`PPSA05325`) | 02.002.000 update targeting 02.001.000 | Blocked: update-only dump is missing two base title assets | AudioOut2 port 16 runs, but guest PCM is zero while startup is blocked |
 | Space Adventure Cobra — The Awakening (`PPSA17337`) | 01.004.000 | Native 1920×1080 title | CLEAN, `rms=0.0436`, `peak=0.1880`, duplicated grains 0.0% |
 
 ## Visual evidence
@@ -94,3 +94,36 @@ scanouts and its correctly initialized AudioOut2 buffers remain zero. This is a 
 blocker, not evidence of title compatibility. Resume the visual and audio validation with a merged
 base+02.002.000 dump containing both files; do not alias another PAC/DDS or use a black frame as a
 success screenshot.
+
+### Game Intent activity audit
+
+The update does contain the four classic RSDK data files, so an authentic PS5 activity launch was
+also tested rather than assuming the normal menu was the only route. `sce_sys/param.json` permits the
+standard `launchActivity` intent. Guest disassembly independently shows that Sonic reads its
+`activityId` property and recognizes `TITLE_SONIC_1_CLASSIC` as its Sonic 1 Classic boot selection.
+
+Prosper now models that shell action with `PROSPER_GAME_INTENT_ACTIVITY_ID`: it advertises one pending
+System Service event, delivers event `0x10000017` once, and implements the Game Intent receive,
+property, and terminate contracts. With the exact activity selected, the guest trace proves that
+Sonic consumes all three relevant calls:
+
+```text
+sceSystemServiceReceiveEvent
+sceNpGameIntentReceiveIntent
+sceNpGameIntentGetPropertyValueString(..., "activityId", ..., 0x21)
+```
+
+That route still requests `ui_startup.pac` and `ui_title_nocopy.dds` before it can transfer control to
+the classic runtime. A 30-second filtered trace never opens `raw/retro/Sonic1u.rsdk`; a 44-second
+native capture remains black after frame 1, and the active stereo float32 48 kHz port 16 capture is
+silent (`rms=0`). The activity experiment therefore narrows the blocker but does not change the
+compatibility result. Reproduce it with:
+
+```bash
+PROSPER_GAME_INTENT_ACTIVITY_ID=TITLE_SONIC_1_CLASSIC \
+PROSPER_PAD_SCRIPT=@prosper/scripts/sonic/reach-title-or-gameplay.pad \
+  prosper/build-linux/screenshot /path/PPSA05325-app0 \
+  --seconds 1 --count 60 --timeout 120 --out /tmp/sonic-activity-shots
+```
+
+The control is off by default; an ordinary launch continues to report no pending Game Intent.

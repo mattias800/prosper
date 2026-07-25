@@ -27,7 +27,8 @@ Last updated: 2026-07-25
 ¹ Exact retail game name pending confirmation.
 
 ² No compatibility milestone is claimed for the incomplete Sonic dump. A merged base+update image is
-required before its title, gameplay, or audio can be evaluated.
+required before its title, gameplay, or audio can be evaluated. The guest also consumes an authentic
+Sonic 1 activity launch, but still needs the same base UI assets before entering the classic runtime.
 
 ## The Messenger — `PPSA24651`
 
@@ -138,6 +139,12 @@ base+update app. Live file tracing shows that its only unresolved startup reques
 The game otherwise initializes its renderer, connected pad, CRI sound banks, and AudioOut2 pump, but
 correctly remains in a black startup loop and emits silence without those title assets. No screenshot,
 audio, or compatibility success is claimed until a complete dump is available.
+
+The update declares PS5 `launchActivity` support and contains the classic RSDK files. An exact
+`TITLE_SONIC_1_CLASSIC` Game Intent is received by the guest and its `activityId` property is consumed,
+but Sonic still requests both missing UI files before opening `raw/retro/Sonic1u.rsdk`. This rules out
+the platform activity route as a way around the incomplete content while preserving truthful default
+no-intent behavior.
 
 Routes, capture commands, audio evidence, and the Sonic audit are recorded in
 [`prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md).
