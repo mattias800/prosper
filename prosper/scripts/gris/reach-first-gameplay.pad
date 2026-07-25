@@ -1,0 +1,21 @@
+# GRIS (PPSA09804): fresh-save route through the opening logos and default New Game entry.
+# Seconds start at the first pad poll. The title settles around 25 seconds on the native Linux
+# renderer; repeated poll-safe Cross edges cover timing variation without changing the default menu
+# selection. Later movement keeps the first playable sequence advancing after the opening fall.
+24-26:cross
+30-32:cross
+36-38:cross
+42-44:cross
+48-50:cross
+54-56:cross
+60-62:cross
+66-68:cross
+72-74:cross
+
+78-150:right
+82-84:cross
+94-96:cross
+106-108:cross
+118-120:cross
+130-132:cross
+142-144:cross

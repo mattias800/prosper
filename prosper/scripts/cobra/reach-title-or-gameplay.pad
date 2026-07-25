@@ -1,0 +1,12 @@
+# Space Adventure Cobra boots through several skippable video/legal screens before its menu.
+# Repeated, separated Cross pulses keep the route deterministic across video-decoder timing while
+# avoiding a held-button interpretation. Reaching gameplay is acceptable if a pulse confirms the
+# title's default selection.
+f300-312:cross
+f500-512:cross
+f700-712:cross
+f900-912:cross
+f1100-1112:cross
+f1300-1312:cross
+f1500-1512:cross
+f1700-1712:cross
