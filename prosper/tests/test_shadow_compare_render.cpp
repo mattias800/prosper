@@ -257,6 +257,58 @@ int main() {
         }
     }
 
+    // LINEAR-filter dref = software 2x2 PCF with hardware compare-THEN-filter semantics
+    // (#1287/#781): a 2x2 depth texture with a pass/fail diagonal — texel (0,0)=0.0 and
+    // (1,1)=0.0 pass dref 0.5 GREATER, (1,0)=(0,1)~0.9 fail — sampled at the shared texel
+    // corner (u=v~0.5) must bilinearly weight the four 0/1 COMPARE RESULTS to ~0.5 (gray).
+    // The previous hard-threshold single tap produced only 0 or 1 there. A NEAREST S# keeps
+    // the exact single-tap behavior (1.0: the nearest texel passes).
+    {
+        std::vector<uint8_t> diag(2 * 2 * 4, 0);
+        auto texel = [&](uint32_t x, uint32_t y, uint8_t depth) {
+            uint8_t* t = &diag[(y * 2 + x) * 4]; t[0] = depth; t[3] = 255;
+        };
+        texel(0, 0, 0); texel(1, 0, 230); texel(0, 1, 230); texel(1, 1, 0);
+        prosper::test::TexDesc diag_td{4, 2, 2, diag.data()};
+
+        ShaderResourceTable pcf_rt;
+        { ShaderResource t{}; t.cls = ResourceClass::Texture; t.binding = 4; t.img_dim = 1;
+          t.width = 2; t.height = 2; t.sgpr_base = 8;
+          t.depth_compare = true; t.depth_compare_func = 4;   // GREATER
+          t.mag_filter = 1;                                   // LINEAR -> the PCF lowering
+          pcf_rt.resources.push_back(t); }
+        std::vector<uint32_t> pcf_frag = recompile_fragment(ps, sizeof(ps)/sizeof(ps[0]), &pcf_rt);
+        CHECK(!pcf_frag.empty(), "recompiled LINEAR-S# dref PS -> SPIR-V");
+        if (!pcf_frag.empty()) {
+            std::vector<uint8_t> px = prosper::test::render_triangle_rgba(
+                vert, pcf_frag, W, H, nullptr, nullptr, nullptr, &diag_td);
+            const uint8_t* c = px.size() == (size_t)W * H * 4
+                ? &px[((size_t)(H / 2) * W + W / 2) * 4] : nullptr;
+            printf("  PCF diagonal center R=%d (want ~128)\n", c ? c[0] : -1);
+            CHECK(c && c[0] > 90 && c[0] < 165,
+                  "LINEAR dref at the texel corner bilinearly weights the four compare "
+                  "results (~0.5) — hard-threshold gives 0/255");
+        }
+
+        ShaderResourceTable point_rt;
+        { ShaderResource t{}; t.cls = ResourceClass::Texture; t.binding = 4; t.img_dim = 1;
+          t.width = 2; t.height = 2; t.sgpr_base = 8;
+          t.depth_compare = true; t.depth_compare_func = 4;
+          t.mag_filter = 0; t.min_filter = 0;                 // NEAREST -> exact single tap
+          point_rt.resources.push_back(t); }
+        std::vector<uint32_t> point_frag = recompile_fragment(ps, sizeof(ps)/sizeof(ps[0]), &point_rt);
+        CHECK(!point_frag.empty(), "recompiled NEAREST-S# dref PS -> SPIR-V");
+        if (!point_frag.empty()) {
+            std::vector<uint8_t> px = prosper::test::render_triangle_rgba(
+                vert, point_frag, W, H, nullptr, nullptr, nullptr, &diag_td);
+            const uint8_t* c = px.size() == (size_t)W * H * 4
+                ? &px[((size_t)(H / 2) * W + W / 2) * 4] : nullptr;
+            printf("  NEAREST diagonal center R=%d (want 255)\n", c ? c[0] : -1);
+            CHECK(c && c[0] > 200,
+                  "NEAREST dref keeps the single-tap compare (the near texel passes)");
+        }
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

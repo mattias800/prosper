@@ -83,7 +83,7 @@ enum : uint32_t {
     ImgOp_Offset=0x10,                   // ImageOperands bit: dynamic texel offset (needs ImageGatherExtended)
     Img_Sampled_Storage=2,   // OpTypeImage "Sampled" operand: 2 = used WITHOUT a sampler (read/write storage image)
     ImgFmt_Unknown=0,        // OpTypeImage "Image Format": Unknown (runtime view format; needs the caps above)
-    ImgOp_Bias=1, ImgOp_Lod=2, ImgOp_Sample=0x40,   // ImageOperands bits: LOD bias / explicit LOD / MSAA Sample index.
+    ImgOp_Bias=1, ImgOp_Lod=2, ImgOp_Grad=4, ImgOp_Sample=0x40,   // ImageOperands bits: LOD bias / explicit LOD / explicit gradients / MSAA Sample index.
     SC_Workgroup=4, Scope_Device=1, Scope_Workgroup=2, Scope_Subgroup=3,
     MemSem_UniformAcqRel=0x48, MemSem_WGAcqRel=0x108,   // storage/LDS AcquireRelease memory semantics
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_NoPerspective=13, Dec_Flat=14,
@@ -865,40 +865,87 @@ struct SpirvCompute {
         const uint32_t bits = bcu(result);
         out[0] = out[1] = out[2] = out[3] = bits;
     }
-    // IMAGE_SAMPLE_C_LZ on a plain 2D texture, lowered as a MANUAL depth compare: sample the shadow
-    // map as an ordinary float texture at explicit LOD 0 and compare its .x against DREF in-shader
-    // using the S#'s compare function. The hardware path (compareEnable sampler over a depth-format
-    // view) needs backend machinery the color-texture path lacks (see the render-runner S# note);
-    // the manual form is exact for NEAREST shadow maps and approximates LINEAR PCF with a hard
-    // threshold. Vulkan compare semantics: result = (reference OP stored); the SQ S# compare enum
-    // (WORD0 [14:12]) matches VkCompareOp order — 0 NEVER, 1 LESS, 2 EQUAL, 3 LEQUAL, 4 GREATER,
-    // 5 NOTEQUAL, 6 GEQUAL, 7 ALWAYS. CONFIDENCE: MED (standard AMD sampler enum ordering; Blue
-    // Prince renders visually-correct shadows with it — the live A/B on #1271).
-    void image_sample_dref_manual_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
-                                     uint32_t dref_bits, uint32_t compare_func, uint32_t out[4]) {
-        uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
-        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
-        uint32_t res   = id(); put(code, Op_ImageSampleExplicitLod,
-                                   {t_v4f, res, si, coord, ImgOp_Lod, fconstf(0.0f)});
-        uint32_t depth = id(); put(code, Op_CompositeExtract, {t_f32, depth, res, 0});
-        uint32_t result;
-        if (compare_func == 0u)      result = fconstf(0.0f);   // NEVER
-        else if (compare_func == 7u) result = fconstf(1.0f);   // ALWAYS
-        else {
-            uint32_t op;
-            switch (compare_func) {
-                case 1u: op = Op_FOrdLessThan;         break;
-                case 2u: op = Op_FOrdEqual;            break;
-                case 3u: op = Op_FOrdLessThanEqual;    break;
-                case 4u: op = Op_FOrdGreaterThan;      break;
-                case 5u: op = Op_FOrdNotEqual;         break;
-                default: op = Op_FOrdGreaterThanEqual; break;   // 6 GEQUAL
-            }
-            uint32_t cmp = id(); put(code, op, {t_bool, cmp, bcf(dref_bits), depth});
-            uint32_t r   = id(); put(code, Op_Select, {t_f32, r, cmp, fconstf(1.0f), fconstf(0.0f)});
-            result = r;
+    // The S# comparison (VkCompareOp order) of DREF against one depth value; both operands and the
+    // f32 0/1 result are raw bits. Vulkan compare semantics: result = (reference OP stored); the SQ
+    // S# compare enum (WORD0 [14:12]) matches VkCompareOp order — 0 NEVER, 1 LESS, 2 EQUAL,
+    // 3 LEQUAL, 4 GREATER, 5 NOTEQUAL, 6 GEQUAL, 7 ALWAYS. CONFIDENCE: MED (standard AMD sampler
+    // enum ordering; Blue Prince renders visually-correct shadows with it — the live A/B on #1271).
+    uint32_t dref_compare_result(uint32_t dref_bits, uint32_t depth_bits, uint32_t compare_func) {
+        if (compare_func == 0u) return bcu(fconstf(0.0f));   // NEVER
+        if (compare_func == 7u) return bcu(fconstf(1.0f));   // ALWAYS
+        uint32_t op;
+        switch (compare_func) {
+            case 1u: op = Op_FOrdLessThan;         break;
+            case 2u: op = Op_FOrdEqual;            break;
+            case 3u: op = Op_FOrdLessThanEqual;    break;
+            case 4u: op = Op_FOrdGreaterThan;      break;
+            case 5u: op = Op_FOrdNotEqual;         break;
+            default: op = Op_FOrdGreaterThanEqual; break;   // 6 GEQUAL
         }
-        const uint32_t bits = bcu(result);
+        uint32_t cmp = id(); put(code, op, {t_bool, cmp, bcf(dref_bits), bcf(depth_bits)});
+        uint32_t r   = id(); put(code, Op_Select, {t_f32, r, cmp, fconstf(1.0f), fconstf(0.0f)});
+        return bcu(r);
+    }
+    // IMAGE_SAMPLE_C_LZ on a plain 2D texture, lowered as a MANUAL depth compare. The hardware path
+    // (compareEnable sampler over a depth-format view) needs backend machinery the color-texture
+    // path lacks (see the render-runner S# note), so the comparison is emitted in-shader using the
+    // S#'s compare function. Two forms by the S#'s XY filter:
+    //  - NEAREST: sample the shadow map as an ordinary float texture at explicit LOD 0 and compare
+    //    its .x against DREF (exact for point sampling).
+    //  - LINEAR (linear_pcf): software 2x2 PCF with hardware compare-THEN-filter semantics — fetch
+    //    the four footprint texels, compare EACH against DREF, and bilinearly weight the four 0/1
+    //    results by the sample position's fractional texel weights. A compare sampler filters
+    //    comparison results, never depth values, so this matches hardware PCF. The previous
+    //    hard-threshold single tap quantized every filtered penumbra to 0/1, which surfaced as the
+    //    #1287/#781 light-attenuation banding (concentric rings / wall striping) once per-light
+    //    contributions were amplified. Texel coordinates clamp to the level-0 edge (CLAMP_TO_EDGE —
+    //    the observed shadow S# address mode; border modes would need the border value here).
+    void image_sample_dref_manual_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
+                                     uint32_t dref_bits, uint32_t compare_func, bool linear_pcf,
+                                     uint32_t out[4]) {
+        if (!linear_pcf) {
+            uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
+            uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+            uint32_t res   = id(); put(code, Op_ImageSampleExplicitLod,
+                                       {t_v4f, res, si, coord, ImgOp_Lod, fconstf(0.0f)});
+            uint32_t depth = id(); put(code, Op_CompositeExtract, {t_f32, depth, res, 0});
+            const uint32_t bits = dref_compare_result(dref_bits, bcu(depth), compare_func);
+            out[0] = out[1] = out[2] = out[3] = bits;
+            return;
+        }
+        if (!declared_image_query) { put(caps, Op_Capability, {Cap_ImageQuery}); declared_image_query = true; }
+        uint32_t si   = id(); put(code, Op_Load,  {tex_binding_simg[binding], si, tex_var[binding]});
+        uint32_t img  = id(); put(code, Op_Image, {tex_binding_img[binding], img, si});
+        uint32_t size = id(); put(code, Op_ImageQuerySizeLod, {t_v2i(), size, img, uconst(0)});
+        uint32_t w_i  = id(); put(code, Op_CompositeExtract, {t_i32, w_i, size, 0});
+        uint32_t h_i  = id(); put(code, Op_CompositeExtract, {t_i32, h_i, size, 1});
+        // Unnormalized sample position t = coord*size - 0.5; base texel floor(t), weights fract(t).
+        const uint32_t half = uconst(0x3f000000u);   // 0.5f
+        uint32_t tx = fbin(Op_FSub, fbin(Op_FMul, u_bits, cvt_i2f(i2u(w_i))), half);
+        uint32_t ty = fbin(Op_FSub, fbin(Op_FMul, v_bits, cvt_i2f(i2u(h_i))), half);
+        uint32_t fx = fext1(Glsl_Fract, tx), fy = fext1(Glsl_Fract, ty);
+        uint32_t x0 = cvt_f2i(fext1(Glsl_Floor, tx));
+        uint32_t y0 = cvt_f2i(fext1(Glsl_Floor, ty));
+        uint32_t wm1 = sbin(Op_ISub, i2u(w_i), uconst(1u));
+        uint32_t hm1 = sbin(Op_ISub, i2u(h_i), uconst(1u));
+        auto edge_clamp = [&](uint32_t value, uint32_t max_bits) {
+            return sext2(Glsl_SMin, sext2(Glsl_SMax, value, uconst(0u)), max_bits);
+        };
+        uint32_t x0c = edge_clamp(x0, wm1), x1c = edge_clamp(sbin(Op_IAdd, x0, uconst(1u)), wm1);
+        uint32_t y0c = edge_clamp(y0, hm1), y1c = edge_clamp(sbin(Op_IAdd, y0, uconst(1u)), hm1);
+        auto tap = [&](uint32_t xb, uint32_t yb) {
+            uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2u(), coord, xb, yb});
+            uint32_t texel = id(); put(code, Op_ImageFetch,
+                                       {texture_vec4(binding), texel, img, coord, ImgOp_Lod, uconst(0)});
+            uint32_t depth = id(); put(code, Op_CompositeExtract, {t_f32, depth, texel, 0});
+            return dref_compare_result(dref_bits, bcu(depth), compare_func);
+        };
+        uint32_t r00 = tap(x0c, y0c), r10 = tap(x1c, y0c);
+        uint32_t r01 = tap(x0c, y1c), r11 = tap(x1c, y1c);
+        auto lerp = [&](uint32_t a, uint32_t b_, uint32_t f) {
+            return fbin(Op_FAdd, a, fbin(Op_FMul, fbin(Op_FSub, b_, a), f));
+        };
+        const uint32_t bits = lerp(lerp(r00, r10, fx), lerp(r01, r11, fx), fy);
         out[0] = out[1] = out[2] = out[3] = bits;
     }
     // image_sample_b 2D: implicit-LOD sample with an LOD BIAS (bias_bits float). Bias only means
@@ -910,6 +957,22 @@ struct SpirvCompute {
         uint32_t res   = id();
         if (is_fragment) put(code, Op_ImageSampleImplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Bias, bcf(bias_bits)});
         else             put(code, Op_ImageSampleExplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Lod, fconstf(0.0f)});
+        unpack_texture_result(binding, res, out);
+    }
+    // image_sample_d 2D: explicit-gradient sample (OpImageSampleExplicitLod + Grad). The guest
+    // supplies analytic d(s,t)/dx and d(s,t)/dy precisely because its coordinates are NOT plain
+    // interpolants (projected/wrapped light patterns, polar mappings): screen-quad derivatives
+    // spike at every wrap seam, and an implicit-LOD fallback sampled the deepest mip in a band
+    // around each seam — the #1287/#781 concentric light-pattern rings. Honor the gradients.
+    void image_sample_grad_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
+                              uint32_t dsdx_bits, uint32_t dtdx_bits,
+                              uint32_t dsdy_bits, uint32_t dtdy_bits, uint32_t out[4]) {
+        uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
+        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+        uint32_t dx    = id(); put(code, Op_CompositeConstruct, {t_v2f(), dx, bcf(dsdx_bits), bcf(dtdx_bits)});
+        uint32_t dy    = id(); put(code, Op_CompositeConstruct, {t_v2f(), dy, bcf(dsdy_bits), bcf(dtdy_bits)});
+        uint32_t res   = id(); put(code, Op_ImageSampleExplicitLod,
+                                   {texture_vec4(binding), res, si, coord, ImgOp_Grad, dx, dy});
         unpack_texture_result(binding, res, out);
     }
     // image_gather4_lz 2D: OpImageGather of component `comp` (0..3) — the 2x2 footprint's four texels
@@ -6254,10 +6317,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // op 0x2f dim 1 dmask 0x1 — the entire shadowed lighting pass dropped and the
                     // scene rendered unattenuated/blown-out). Same 8.2.5 vaddr order with no array
                     // slice: [dref, u, v]. Lowered as a manual compare against the color-sampled
-                    // shadow map (see image_sample_dref_manual_2d for why not a compare sampler).
+                    // shadow map (see image_sample_dref_manual_2d for why not a compare sampler);
+                    // an S# requesting LINEAR gets the software 2x2 PCF form (#1287/#781 banding).
                     b.declare_texture(res->binding, Dim_2D, false);
                     b.image_sample_dref_manual_2d(res->binding, vread(cvg(1)), vread(cvg(2)),
-                                                  vread(cvg(0)), res->depth_compare_func, out);
+                                                  vread(cvg(0)), res->depth_compare_func,
+                                                  res->mag_filter != 0, out);
                 } else { ok = false; return true; }
             } else if (is_gather_lz || is_gather_lz_o) {
                 // gather4 dmask selects ONE channel (must be a single bit); the result is always the
@@ -6284,9 +6349,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 } else if (is_sample_lz_o) {   // vaddr order for _o: [packed offset, u, v]
                     b.image_sample_lz_offset_2d(res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(0)), out);
                 } else if (is_sample_d) {   // vaddr order for _d: [Ds/Dx, Dt/Dx, Ds/Dy, Dt/Dy, u, v]
-                    // Drop the four explicit gradients; the (u,v) coords follow them. Implicit-LOD sample
-                    // (fragment quad derivatives ~ the explicit gradients for ordinary UVs).
-                    b.image_sample_2d(res->binding, vread(cvg(4)), vread(cvg(5)), out);
+                    // Honor the explicit gradients (SPIR-V Grad operands). The previous lowering
+                    // dropped them for an implicit-LOD sample; that is wrong exactly where guests
+                    // use _d — projected/wrapped coordinates whose quad derivatives spike at wrap
+                    // seams, which painted deep-mip bands as concentric light-pattern rings
+                    // (#1287/#781). See image_sample_grad_2d.
+                    b.image_sample_grad_2d(res->binding, vread(cvg(4)), vread(cvg(5)),
+                                           vread(cvg(0)), vread(cvg(1)),
+                                           vread(cvg(2)), vread(cvg(3)), out);
                 } else {
                     uint32_t cu = vread(cvg(0)), cv = vread(cvg(1));
                     if (is_sample)         b.image_sample_2d(res->binding, cu, cv, out);

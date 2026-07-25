@@ -92,6 +92,47 @@ int main() {
     CHECK(ok && rgb[0] > 0xC0 && rgb[2] < 0x40,
           "declared_mip_levels=1 (the default) keeps the historical single-level clamp-to-0 behavior");
 
+    // IMAGE_SAMPLE_D honors the guest's explicit gradients (#1287/#781): du/dx = 1.0 across a
+    // 4-texel-wide base level is a 4-texel footprint -> LOD 2 -> the box-filtered purple. The
+    // previous lowering DROPPED the gradients for an implicit-LOD sample; the coordinates here
+    // are literals (zero quad derivatives), so it read level 0 (red) and this check fails.
+    {
+        const uint32_t ps_d[] = {
+            0x7e0002ffu, 0x3f800000u,   // v_mov_b32 v0, 1.0  (Ds/Dx)
+            0x7e0202ffu, 0x00000000u,   // v_mov_b32 v1, 0.0  (Dt/Dx)
+            0x7e0402ffu, 0x00000000u,   // v_mov_b32 v2, 0.0  (Ds/Dy)
+            0x7e0602ffu, 0x3f800000u,   // v_mov_b32 v3, 1.0  (Dt/Dy)
+            0x7e0802ffu, 0x3e000000u,   // v_mov_b32 v4, 0.125 (u)
+            0x7e0a02ffu, 0x3e000000u,   // v_mov_b32 v5, 0.125 (v)
+            0xf0880f08u, 0x00820600u,   // image_sample_d v[6:9], v[0:5], s8, s16 dim:2D dmask:0xf
+            0xf800000fu, 0x09080706u,   // exp mrt0 v6..v9
+            0xbf810000u,
+        };
+        std::vector<uint32_t> frag = recompile_fragment(ps_d, sizeof(ps_d)/sizeof(ps_d[0]), &rt);
+        CHECK(!frag.empty() && frag[0] == 0x07230203u, "recompiled PS with image_sample_d -> SPIR-V");
+        if (!frag.empty()) {
+            prosper::test::FrameResource resource;
+            resource.binding = 4; resource.set = 1;
+            resource.tex_rgba = texels; resource.tw = 4; resource.th = 4;
+            resource.declared_mip_levels = 3;
+            resource.mip_filter = 0;
+            resource.max_lod = 8.0f;
+            prosper::test::BackendDraw draw;
+            draw.vs = vert; draw.fs = frag; draw.R = {resource}; draw.vcount = 3;
+            std::vector<uint8_t> px = prosper::test::render_draws_rgba({draw}, W, H);
+            bool rendered = px.size() == (size_t)W * H * 4;
+            uint8_t r = 0, g = 0, b = 0;
+            if (rendered) {
+                const uint8_t* c = &px[((size_t)(H / 2) * W + W / 2) * 4];
+                r = c[0]; g = c[1]; b = c[2];
+            }
+            printf("  sample_d grad=1.0 center=(%u,%u,%u)\n", r, g, b);
+            CHECK(rendered && r > 0x60 && r < 0xA0 && g < 0x20 && b > 0x60 && b < 0xA0,
+                  "image_sample_d with unit gradients reads the LOD-2 purple "
+                  "(red = gradients dropped for implicit LOD)");
+        }
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
