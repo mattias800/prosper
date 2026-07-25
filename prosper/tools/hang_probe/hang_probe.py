@@ -38,6 +38,12 @@ def classify(gbt_text: str):
     if any(f in gbt_text for f in WAIT_FRAMES):
         m = next((l for l in gbt_text.splitlines() if any(f in l for f in WAIT_FRAMES)), "")
         return "BLOCKED", m.strip()
+    m = NATIVE_STOP_FRAME.search(gbt_text)
+    frame = m.group(1).strip() if m else ""
+    # A selected thread stopped in a known host wait is inconclusive even if a lower caller happens
+    # to carry an active-render name. Accepting that lower frame would turn a parked thread green.
+    if frame and NATIVE_BLOCK_FRAME.search(frame):
+        return "UNKNOWN", frame
     if any(f in gbt_text for f in RUN_FRAMES):
         m = next((l for l in gbt_text.splitlines() if any(f in l for f in RUN_FRAMES)), "")
         return "RUNNING", m.strip()
@@ -46,9 +52,7 @@ def classify(gbt_text: str):
     # means Thread 1 is executing: observed healthy Evergate samples include Prosper render helpers,
     # libc allocation/string work, the Vulkan driver, and unsymbolicated guest PCs. Known host waits
     # remain inconclusive unless guest_bt also found the decisive guest kernel-wait frame above.
-    m = NATIVE_STOP_FRAME.search(gbt_text)
-    frame = m.group(1).strip() if m else ""
-    if frame and not NATIVE_BLOCK_FRAME.search(frame):
+    if frame:
         return "RUNNING", frame
     return "UNKNOWN", frame
 

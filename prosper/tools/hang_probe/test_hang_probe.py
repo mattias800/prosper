@@ -35,7 +35,8 @@ class ClassificationTests(unittest.TestCase):
                          ("RUNNING", "0x0000000410f4bb02 in ??"))
 
     def test_native_blocking_frame_remains_unknown(self):
-        text = "guest-bt-native: 0x00007f00 in pthread_cond_wait@@GLIBC_2.3.2\n#0 0x7f00 in ??? ()\n"
+        text = ("guest-bt-native: 0x00007f00 in pthread_cond_wait@@GLIBC_2.3.2\n"
+                "#0 0x7f00 in ??? ()\n#1 prosper::gpu::present\n")
         self.assertEqual(HANG_PROBE.classify(text),
                          ("UNKNOWN", "0x00007f00 in pthread_cond_wait@@GLIBC_2.3.2"))
 
