@@ -128,6 +128,47 @@ int main() {
               grad_center[1] < 0x20 && grad_center[2] > 0x60 && grad_center[2] < 0xA0,
           "IMAGE_SAMPLE_D unit gradients select LOD 2 instead of the literal UV's implicit LOD 0");
 
+    // An identity gradient on a square texture cannot distinguish the required
+    // [Ds/Dx, Dt/Dx, Ds/Dy, Dt/Dy] grouping from its transpose. Use a non-square 8x2 texture and
+    // put the only derivative in Dt/Dx: correctly grouped it spans 2*.25=.5 texels and selects
+    // mip 0 (red); the erroneous {Ds/Dx,Ds/Dy}/{Dt/Dx,Dt/Dy} grouping puts it in S, spans
+    // 8*.25=2 texels, and selects mip 1 (purple).
+    uint8_t asym_texels[8 * 2 * 4];
+    for (uint32_t y = 0; y < 2; y++) for (uint32_t x = 0; x < 8; x++) {
+        uint8_t* t = &asym_texels[(y * 8 + x) * 4];
+        t[0] = (x & 1) ? 0 : 255; t[1] = 0; t[2] = (x & 1) ? 255 : 0; t[3] = 255;
+    }
+    ShaderResourceTable asym_rt;
+    { ShaderResource t{}; t.cls = ResourceClass::Texture; t.binding = 4; t.img_dim = 1;
+      t.width = 8; t.height = 2; t.sgpr_base = 8; asym_rt.resources.push_back(t); }
+    const uint32_t ps_asym_grad[] = {
+        0x7e000280u,                // v0 = Ds/Dx = 0
+        0x7e0202ffu, 0x3e800000u,   // v1 = Dt/Dx = 0.25
+        0x7e040280u,                // v2 = Ds/Dy = 0
+        0x7e060280u,                // v3 = Dt/Dy = 0
+        0x7e0802ffu, 0x3d800000u,   // v4 = u = 0.0625 (level-0 texel 0 center)
+        0x7e0a02ffu, 0x3e800000u,   // v5 = v = 0.25   (level-0 texel 0 center)
+        0xf0880f08u, 0x00820600u,   // image_sample_d v[6:9], v[0:5], s8, s16, dmask:xyzw dim:2D
+        0xf800000fu, 0x09080706u,   // exp mrt0 v6..v9
+        0xbf810000u,
+    };
+    std::vector<uint32_t> asym_frag = recompile_fragment(
+        ps_asym_grad, sizeof(ps_asym_grad) / sizeof(ps_asym_grad[0]), &asym_rt);
+    prosper::test::FrameResource asym_resource = grad_resource;
+    asym_resource.tex_rgba = asym_texels; asym_resource.tw = 8; asym_resource.th = 2;
+    prosper::test::BackendDraw asym_draw;
+    asym_draw.vs = vert; asym_draw.fs = asym_frag; asym_draw.R = {asym_resource}; asym_draw.vcount = 3;
+    std::vector<uint8_t> asym_px = asym_frag.empty() ? std::vector<uint8_t>{}
+        : prosper::test::render_draws_rgba({asym_draw}, W, H);
+    const uint8_t* asym_center = asym_px.size() == (size_t)W * H * 4
+        ? &asym_px[((size_t)(H / 2) * W + W / 2) * 4] : nullptr;
+    printf("  sample_d asymmetric-grad center=(%u,%u,%u)\n",
+           asym_center ? asym_center[0] : 0, asym_center ? asym_center[1] : 0,
+           asym_center ? asym_center[2] : 0);
+    CHECK(!asym_frag.empty() && asym_center &&
+              asym_center[0] > 0xC0 && asym_center[1] < 0x20 && asym_center[2] < 0x40,
+          "IMAGE_SAMPLE_D keeps asymmetric Dt/Dx in the T component of Grad X (#1400)");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
