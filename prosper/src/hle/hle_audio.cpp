@@ -1755,15 +1755,15 @@ namespace {
 //   SceAjmSidebandMFrame { u32 numFrames; u32 reserved; }            (codec frames decoded by this job)
 // uiTotalDecodedSamples is load-bearing, not padding: with it left zero the guest's mixer (FMOD) stops
 // after a single batch, so it carries the instance's running sample-frame total.
-void ajm2_write_result(uint64_t result_addr, int32_t err, uint32_t consumed, uint32_t produced,
+bool ajm2_write_result(uint64_t result_addr, int32_t err, uint32_t consumed, uint32_t produced,
                        uint64_t total_samples = 0, uint32_t decoded_frames = 0) {
-    if (!result_addr) return;
+    if (!result_addr) return true;
     struct Sideband { int32_t iResult; int32_t iCodecResult; uint32_t iSizeConsumed;
                       uint32_t iSizeProduced; uint64_t uiTotalDecodedSamples;
                       uint32_t numFrames; uint32_t reserved; };
     static_assert(sizeof(Sideband) == 32, "AJM decode sideband must include the MFrame result");
     Sideband sb{ err, 0, consumed, produced, total_samples, decoded_frames, 0 };
-    audio_store_bytes(result_addr, &sb, sizeof sb);
+    return audio_store_bytes(result_addr, &sb, sizeof sb);
 }
 
 // Decode a batch's queued jobs. Jobs sharing an instance are consecutive stream blocks whose input
@@ -1828,8 +1828,14 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                 if (!err) ajm2_dump_decode(inst_id,
                     std::span<const uint8_t>(input.data(), consumed), pcm.data(), produced);
                 if (!err && produced) instance.decoded_samples += produced / frame_bytes;
-                ajm2_write_result(job.result_addr, err, consumed, produced,
-                                  instance.decoded_samples, err ? 0 : decoded.decoded_frames);
+                if (!ajm2_write_result(job.result_addr, err, consumed, produced,
+                                       instance.decoded_samples,
+                                       err ? 0 : decoded.decoded_frames)) {
+                    // The codec and guest PCM may already have advanced, but the guest did not
+                    // receive the progress sideband. Preserve the same terminal invariant as every
+                    // other unpublishable result before another queued job reaches the decoder.
+                    instance.host_dec->invalidate();
+                }
                 if (log)
                     fprintf(stderr, "[ajm2] t=%llums decode inst=%u codec=%u in=%zu/%u "
                             "out=%u -> %u consumed, %u PCM, %uch/%uHz total=%llu%s\n",
@@ -1838,6 +1844,15 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                             decoded.sample_rate, (unsigned long long)instance.decoded_samples,
                             err ? " ERR" : "");
             }
+            ji = je;
+            continue;
+        }
+        // A non-null invalid host decoder is deliberately terminal. Do not fall through to the
+        // ATRAC9 path or erase the cumulative sample count on a later batch's error sideband.
+        if (it != g_ajm2_inst.end() && it->second.host_dec) {
+            for (size_t k = ji; k < je; ++k)
+                ajm2_write_result(jobs[k].result_addr, kAjm2ErrDecode, 0, 0,
+                                  it->second.decoded_samples);
             ji = je;
             continue;
         }

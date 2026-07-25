@@ -48,53 +48,66 @@ static_assert(sizeof(BatchInfo) == 40);
 
 static uint64_t addr(const void* p) { return (uint64_t)(uintptr_t)p; }
 
-struct MalformedBackendStats {
+enum class TestDecoderMode {
+    MalformedSecondResult,
+    ProducePcm,
+};
+
+struct TestBackendStats {
+    TestDecoderMode mode = TestDecoderMode::MalformedSecondResult;
     uint32_t creates = 0;
     uint32_t decodes = 0;
     uint32_t invalidations = 0;
 };
 
-class MalformedStreamDecoder final : public ajm::StreamDecoder {
+class TestStreamDecoder final : public ajm::StreamDecoder {
 public:
-    explicit MalformedStreamDecoder(MalformedBackendStats* stats): stats_(stats) {}
+    explicit TestStreamDecoder(TestBackendStats* stats): stats_(stats) {}
 
     bool valid() const override { return valid_; }
     void invalidate() override {
+        if (!valid_) return;
         valid_ = false;
         ++stats_->invalidations;
     }
 
     ajm::DecodeResult decode(std::span<const uint8_t> input,
-                             std::span<int16_t>) override {
+                             std::span<int16_t> output) override {
         ++stats_->decodes;
         ajm::DecodeResult result{};
         result.ok = true;
         result.consumed_bytes = static_cast<uint32_t>(input.size());
-        if (stats_->decodes == 2) {
+        if (stats_->mode == TestDecoderMode::MalformedSecondResult && stats_->decodes == 2) {
             // Claim one byte beyond the supplied span after a previous successful job. HLE must
             // reject this result and poison the stateful decoder before the guest retries it.
             ++result.consumed_bytes;
             result.decoded_frames = 7;
+        } else if (stats_->mode == TestDecoderMode::ProducePcm && !output.empty()) {
+            output[0] = 1234;
+            result.produced_bytes = sizeof(int16_t);
+            result.decoded_frames = 1;
+            result.channels = 1;
+            result.sample_rate = 48000;
         }
         return result;
     }
 
 private:
-    MalformedBackendStats* stats_ = nullptr;
+    TestBackendStats* stats_ = nullptr;
     bool valid_ = true;
 };
 
-class MalformedDecoderBackend final : public ajm::DecoderBackend {
+class TestDecoderBackend final : public ajm::DecoderBackend {
 public:
-    explicit MalformedDecoderBackend(MalformedBackendStats* stats): stats_(stats) {}
+    explicit TestDecoderBackend(TestBackendStats* stats): stats_(stats) {}
 
     std::unique_ptr<ajm::StreamDecoder> create(ajm::Codec, uint64_t) override {
         ++stats_->creates;
-        return std::make_unique<MalformedStreamDecoder>(stats_);
+        return std::make_unique<TestStreamDecoder>(stats_);
     }
 
 private:
-    MalformedBackendStats* stats_ = nullptr;
+    TestBackendStats* stats_ = nullptr;
 };
 
 static std::vector<uint8_t> bytes_from_hex(std::string_view hex) {
@@ -360,6 +373,7 @@ int main() {
     CHECK(batch_start(context, addr(&batch.info), 40, 0, addr(&guest_error_batch_id),
                       0, 0, 0, 0, 0) == 0 && guest_error_sideband.iResult != 0 &&
           guest_error_sideband.iSizeConsumed == 0 && guest_error_sideband.iSizeProduced == 0 &&
+          guest_error_sideband.uiTotalDecodedSamples == 4608 &&
           guest_error_sideband.numFrames == 0,
           "guest codec failure truthfully publishes zero consumption and output");
     CHECK(std::all_of(guest_terminal_pcm.begin(), guest_terminal_pcm.end(),
@@ -375,6 +389,7 @@ int main() {
     CHECK(batch_start(context, addr(&batch.info), 40, 0, addr(&guest_retry_batch_id),
                       0, 0, 0, 0, 0) == 0 && guest_retry_sideband.iResult != 0 &&
           guest_retry_sideband.iSizeConsumed == 0 && guest_retry_sideband.iSizeProduced == 0 &&
+          guest_retry_sideband.uiTotalDecodedSamples == 4608 &&
           guest_retry_sideband.numFrames == 0,
           "terminal guest instance rejects retry without reusing advanced codec state");
     CHECK(std::all_of(guest_terminal_pcm.begin(), guest_terminal_pcm.end(),
@@ -386,8 +401,8 @@ int main() {
     // A backend can also advance successfully and then return metadata that the guest-facing layer
     // cannot safely publish. Use a deliberately malformed backend to prove HLE invalidates that
     // decoder, zeros every progress field, and never calls it for the guest's exact retry.
-    MalformedBackendStats malformed_stats{};
-    MalformedDecoderBackend malformed_backend(&malformed_stats);
+    TestBackendStats malformed_stats{};
+    TestDecoderBackend malformed_backend(&malformed_stats);
     ajm::set_decoder_backend(&malformed_backend);
     uint32_t malformed_instance = 0;
     CHECK(instance_create(context, 0 /* MP3 */, 1, addr(&malformed_instance), 0, 0) == 0 &&
@@ -427,8 +442,78 @@ int main() {
           "terminal HLE decoder rejects same-batch retry without decode or recreation");
     CHECK(instance_destroy(context, malformed_instance, 0, 0, 0, 0) == 0,
           "malformed-result MP3 instance destroys normally");
+
+    // Sideband publication is the commit point for a stateful decode. Exercise a successful decode
+    // and PCM copy whose deliberately inaccessible result address cannot receive progress, followed
+    // by a same-batch job with a valid sideband. The second job must observe a terminal instance
+    // without reaching the backend.
+    TestBackendStats publication_stats{TestDecoderMode::ProducePcm};
+    TestDecoderBackend publication_backend(&publication_stats);
+    ajm::set_decoder_backend(&publication_backend);
+    uint32_t publication_instance = 0;
+    CHECK(instance_create(context, 0 /* MP3 */, 1, addr(&publication_instance), 0, 0) == 0 &&
+          publication_instance != 0 && publication_stats.creates == 1,
+          "sideband-publication fixture creates one stateful decoder");
+    int16_t publication_pcm = (int16_t)0x5555;
+    constexpr uint64_t inaccessible_result = 0x0000deadbeef0000ull;
+    CHECK(job_decode(addr(&batch.info), publication_instance, addr(&fake_packet), 1,
+                     addr(&publication_pcm), sizeof(publication_pcm), inaccessible_result,
+                     0, 0, 0) == 0,
+          "decode with an inaccessible result sideband queues normally");
+    Sideband publication_retry_sideband{};
+    CHECK(job_decode(addr(&batch.info), publication_instance, addr(&fake_packet), 1,
+                     addr(&publication_pcm), sizeof(publication_pcm),
+                     addr(&publication_retry_sideband), 0, 0, 0) == 0,
+          "valid-sideband retry queues behind the unpublishable result");
+    uint32_t publication_batch_id = 0xffffffffu;
+    CHECK(batch_start(context, addr(&batch.info), 40, 0, addr(&publication_batch_id),
+                      0, 0, 0, 0, 0) == 0 && publication_pcm == 1234,
+          "first job advances the backend and copies its decoded PCM");
+    CHECK(publication_retry_sideband.iResult != 0 &&
+          publication_retry_sideband.iSizeConsumed == 0 &&
+          publication_retry_sideband.iSizeProduced == 0 &&
+          publication_retry_sideband.numFrames == 0 &&
+          publication_stats.decodes == 1 && publication_stats.invalidations == 1 &&
+          publication_stats.creates == 1,
+          "failed sideband publication terminalizes before the same-batch retry");
+    CHECK(instance_destroy(context, publication_instance, 0, 0, 0, 0) == 0,
+          "sideband-publication MP3 instance destroys normally");
+
+    // Cover the other guest-publication boundary: the backend succeeds, but decoded PCM cannot be
+    // stored. The error sideband must report no progress and the next same-batch job must not decode.
+    TestBackendStats pcm_store_stats{TestDecoderMode::ProducePcm};
+    TestDecoderBackend pcm_store_backend(&pcm_store_stats);
+    ajm::set_decoder_backend(&pcm_store_backend);
+    uint32_t pcm_store_instance = 0;
+    CHECK(instance_create(context, 0 /* MP3 */, 1, addr(&pcm_store_instance), 0, 0) == 0 &&
+          pcm_store_instance != 0 && pcm_store_stats.creates == 1,
+          "PCM-store fixture creates one stateful decoder");
+    Sideband pcm_store_sideband{};
+    CHECK(job_decode(addr(&batch.info), pcm_store_instance, addr(&fake_packet), 1,
+                     inaccessible_result, sizeof(int16_t), addr(&pcm_store_sideband),
+                     0, 0, 0) == 0,
+          "decode with an inaccessible PCM destination queues normally");
+    int16_t pcm_store_retry_output = (int16_t)0x5555;
+    Sideband pcm_store_retry_sideband{};
+    CHECK(job_decode(addr(&batch.info), pcm_store_instance, addr(&fake_packet), 1,
+                     addr(&pcm_store_retry_output), sizeof(pcm_store_retry_output),
+                     addr(&pcm_store_retry_sideband), 0, 0, 0) == 0,
+          "valid-output retry queues behind the failed PCM store");
+    uint32_t pcm_store_batch_id = 0xffffffffu;
+    CHECK(batch_start(context, addr(&batch.info), 40, 0, addr(&pcm_store_batch_id),
+                      0, 0, 0, 0, 0) == 0 && pcm_store_sideband.iResult != 0 &&
+          pcm_store_sideband.iSizeConsumed == 0 && pcm_store_sideband.iSizeProduced == 0,
+          "failed PCM store publishes an error with zero progress");
+    CHECK(pcm_store_retry_sideband.iResult != 0 &&
+          pcm_store_retry_sideband.iSizeConsumed == 0 &&
+          pcm_store_retry_sideband.iSizeProduced == 0 &&
+          pcm_store_retry_output == (int16_t)0x5555 && pcm_store_stats.decodes == 1 &&
+          pcm_store_stats.invalidations == 1 && pcm_store_stats.creates == 1,
+          "failed PCM store terminalizes before the same-batch retry");
+    CHECK(instance_destroy(context, pcm_store_instance, 0, 0, 0, 0) == 0,
+          "PCM-store MP3 instance destroys normally");
     CHECK(ajm::install_ffmpeg_decoder_backend(),
-          "FFmpeg AJM backend reinstalls after malformed-result fixture");
+          "FFmpeg AJM backend reinstalls after custom-backend fixtures");
 
     // The FFmpeg seam currently implements only AJM's signed-16 output encoding. An S32 instance
     // must fail truthfully in the sideband and leave the guest output untouched; reporting success

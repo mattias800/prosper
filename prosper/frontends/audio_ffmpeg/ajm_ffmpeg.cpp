@@ -44,6 +44,7 @@ public:
     bool valid() const override { return valid_; }
 
     void invalidate() override {
+        if (!valid_) return;
         valid_ = false;
         carry_.clear();
         carry_offset_ = 0;

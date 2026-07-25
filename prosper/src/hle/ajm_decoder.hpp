@@ -34,6 +34,8 @@ class StreamDecoder {
 public:
     virtual ~StreamDecoder() = default;
     virtual bool valid() const = 0;
+    // Terminal and idempotent. Implementations may call this before returning an error; HLE calls it
+    // again whenever the result cannot be published safely.
     virtual void invalidate() = 0;
     virtual DecodeResult decode(std::span<const uint8_t> input,
                                 std::span<int16_t> output) = 0;
