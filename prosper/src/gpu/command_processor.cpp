@@ -1184,6 +1184,10 @@ struct PendQueue {
     std::chrono::steady_clock::time_point release_after{}; // modeled GPU latency after that checkpoint
 };
 PendQueue& pend_q() { static PendQueue* p = new PendQueue; return *p; }
+// A return hook is attached to the import NID, so it also runs when that handler rejects its
+// arguments before opening a submit scope. Track scopes on the calling thread as well as globally:
+// only the synchronous import call that began a scope may retire it at its return checkpoint.
+thread_local uint32_t t_submit_scope_depth = 0;
 void apply_effect(const Pm4Command& c);   // fwd (defined with the WAIT_DEFER machinery below)
 void apply_deferred_effect(const Pm4Command& c);   // fwd: guarded apply (#449)
 // Drain returns only when every pending write has LANDED, and writes land STRICTLY IN QUEUE ORDER.
@@ -1289,16 +1293,22 @@ extern "C" void prosper_gpu_submit_scope_begin() {
     PendQueue& p = pend_q();
     std::unique_lock<std::mutex> lk(p.mx);
     p.cv.wait(lk, [&] { return p.inflight == 0; });
+    t_submit_scope_depth++;
     p.active_submits++;
     p.cv.notify_all();
 }
 
 extern "C" void prosper_gpu_submit_scope_end() {
     if (!post_submit_visibility_enabled()) return;
+    // Invalid/rejected calls to a submit NID still pass through its generated return hook. Such a
+    // call has no local token and must not retire a valid submit executing on another thread.
+    if (t_submit_scope_depth == 0) return;
     PendQueue& p = pend_q();
     {
         std::lock_guard<std::mutex> lk(p.mx);
-        if (p.active_submits > 0 && --p.active_submits == 0)
+        if (p.active_submits == 0) return; // defensive: preserve both counters if the invariant broke
+        t_submit_scope_depth--;
+        if (--p.active_submits == 0)
             p.release_after = std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
     }
     p.cv.notify_all();

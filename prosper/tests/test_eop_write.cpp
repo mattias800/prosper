@@ -96,11 +96,18 @@ int main() {
               "renderer drain applies an unrelated resource upload inside the submit");
         CHECK(label == 0xaaaaaaaa55555555ull,
               "renderer drain keeps an overlapping label init and fence private");
+        // Every submit NID has a return hook, including invalid calls that return before scope_begin.
+        // Model one of those rejected calls on a second guest thread while this valid submit remains
+        // stalled: its unmatched hook must not consume this thread's token or expose this label.
+        std::thread rejected_submit_return([] { prosper_gpu_submit_scope_end(); });
+        rejected_submit_return.join();
+        CHECK(prosper_gpu_submit_scope_active() && label == 0xaaaaaaaa55555555ull,
+              "unmatched return hook cannot retire another thread's active submit");
         // Model an arbitrarily descheduled submit handler after all HLE work is complete but before
         // its generated import trampoline reaches the return checkpoint. This exceeds the old 1 ms
         // grace timer and proves elapsed time cannot publish a label while the scope is still active.
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        CHECK(label == 0xaaaaaaaa55555555ull && prosper_gpu_submit_scope_active(),
+        CHECK(prosper_gpu_submit_scope_active() && label == 0xaaaaaaaa55555555ull,
               "completion stays private across a stalled pre-return checkpoint");
         prosper_gpu_submit_scope_end();
         prosper_gpu_drain_completion_writes();

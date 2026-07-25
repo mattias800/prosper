@@ -216,7 +216,8 @@ extern "C" void prosper_gpu_drain_renderer_writes();
 // Enable the stricter SDK-13 completion contract for the process. Monotonic: once a modern AGC
 // caller is observed, completion labels remain post-submit for the lifetime of that game process.
 extern "C" void prosper_gpu_enable_post_submit_visibility();
-// Hold asynchronous fence/label publication while a guest submit import is still executing.
+// Hold asynchronous fence/label publication while a guest submit import is still executing. Scopes
+// are paired on the calling thread so a rejected tagged import cannot retire another thread's submit.
 extern "C" void prosper_gpu_submit_scope_begin();
 extern "C" void prosper_gpu_submit_scope_end();
 extern "C" bool prosper_gpu_submit_scope_active();
