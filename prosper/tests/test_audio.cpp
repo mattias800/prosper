@@ -138,6 +138,15 @@ int main() {
     CHECK((int32_t)call("sceAudioOut2ContextResetParam", 1) == (int32_t)0x80268001);
     CHECK((int32_t)call("sceAudioOut2ContextQueryMemory", 0, 1) == (int32_t)0x80268001);
 
+    // Queue-level queries advance a wall clock and can observe a just-pushed grain before or after
+    // it drains. Cover the positive accounting transition itself without that timing dependency.
+    uint32_t reserved_grains = 0;
+    CHECK(audio2_reserve_queue_slot(reserved_grains, 4));
+    CHECK(reserved_grains == 1);
+    reserved_grains = 4;
+    CHECK(!audio2_reserve_queue_slot(reserved_grains, 4));
+    CHECK(reserved_grains == 4);
+
     // --- 2. open -> handle + backend.open with decoded params --------------------------------
     audio_reset();
     CapturingSink sink; audio_set_sink(&sink);
