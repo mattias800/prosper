@@ -336,6 +336,50 @@ int main() {
             CHECK(!changed_bc.empty() && changed_bc != reused_bc,
                   "guest BC mutation publishes newly decoded pixels instead of stale cache data");
 #endif
+
+            // Cobra repeatedly binds guest-backed Float32 post-process inputs. They narrow to
+            // RGBA16F, but an unchanged version should retain both that conversion and its backend
+            // image just like BC/fp16 textures do.
+            float* float_source = reinterpret_cast<float*>(source_va + 0x1000);
+            const float float_values[16] = {
+                0.5f, 0.25f, 0.125f, 1.0f, 0.5f, 0.25f, 0.125f, 1.0f,
+                0.5f, 0.25f, 0.125f, 1.0f, 0.5f, 0.25f, 0.125f, 1.0f,
+            };
+            std::memcpy(float_source, float_values, sizeof(float_values));
+            DrawItem cached_float_draw = replay.items[0];
+            cached_float_draw.color0_base = 0xd80000;
+            auto cached_float_table =
+                std::make_shared<ShaderResourceTable>(*cached_float_draw.prt);
+            ShaderResource& cached_float_resource = cached_float_table->resources[0];
+            cached_float_resource.gpu_addr = reinterpret_cast<uint64_t>(float_source);
+            cached_float_resource.host_data = nullptr;
+            cached_float_resource.host_data_size = 0;
+            cached_float_resource.size = sizeof(float_values);
+            cached_float_resource.width = cached_float_resource.height = 2;
+            cached_float_resource.depth = 1;
+            cached_float_resource.img_dim = 1;
+            cached_float_resource.tile_mode = 0;
+            cached_float_resource.linear_row_pitch_bytes = 2u * 4u * sizeof(float);
+            cached_float_resource.format = DataFormat::Float32;
+            cached_float_resource.num_components = 4;
+            cached_float_resource.compression_enabled = false;
+            cached_float_draw.prt = std::move(cached_float_table);
+
+            const std::vector<uint8_t> first_float =
+                render_submit_items({cached_float_draw}, W, H);
+            const auto first_float_stats = prosper::test::backend_texture_upload_stats();
+            const std::vector<uint8_t> reused_float =
+                render_submit_items({cached_float_draw}, W, H);
+            const auto reused_float_stats = prosper::test::backend_texture_upload_stats();
+            CHECK(first_float_stats.persistent_misses == 1 &&
+                      first_float_stats.unique_uploads == 1,
+                  "first guest-backed Float32 version enters the persistent texture cache");
+            CHECK(reused_float_stats.persistent_hits == 1 &&
+                      reused_float_stats.unique_uploads == 0 &&
+                      reused_float_stats.upload_bytes == 0,
+                  "unchanged Float32 texture skips its next narrow/decode/upload callback");
+            CHECK(!first_float.empty() && first_float == reused_float,
+                  "persistent Float32 reuse preserves the native RGBA16F sampling result");
             CHECK(unmap(source_va, source_mapping_size, 0, 0, 0, 0) == 0,
                   "persistent BC test unmaps its guest source");
         }
