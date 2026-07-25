@@ -661,8 +661,9 @@ HLE(audio_in_close) {
     return 0;
 }
 
-constexpr uint64_t kA2ErrInvalid = (uint64_t)(int64_t)(int32_t)0x80260003;   // AudioOut error space
+constexpr uint64_t kA2ErrInvalidParam = (uint64_t)(int64_t)(int32_t)0x80268001;
 constexpr uint64_t kA2ErrNotReady = (uint64_t)(int64_t)(int32_t)0x80268008;
+constexpr uint64_t kA2ErrPortFull = (uint64_t)(int64_t)(int32_t)0x80268012;
 
 // Advance the emulated hardware queue by elapsed 48 kHz grains. Caller holds g_a2_mx. Keeping this
 // state independent of the host sink matters because GetQueueLevel is an observable device clock:
@@ -708,7 +709,7 @@ HLE(audio2_ctx_reset_param) {
     param.queue_depth = 4;
     param.num_grains = 512;
     param.flags = 1;
-    if (!audio_store_bytes(a0, &param, sizeof param)) return kA2ErrInvalid;
+    if (!audio_store_bytes(a0, &param, sizeof param)) return kA2ErrInvalidParam;
     return 0;
 }
 
@@ -720,7 +721,7 @@ HLE(audio2_ctx_reset_param) {
 HLE(audio2_ctx_query_memory) {
     A2LOG("sceAudioOut2ContextQueryMemory");
     if (audio2log()) a2_dump("param", a0, 0x40);
-    if (!a2_store_u64(a1, 0x100000)) return kA2ErrInvalid;
+    if (!a2_store_u64(a1, 0x100000)) return kA2ErrInvalidParam;
     return 0;
 }
 
@@ -756,10 +757,10 @@ HLE(audio2_ctx_create) {
         g_a2_ctx[i].used = true;
         g_a2_ctx[i].queue_depth = queue_depth;
         g_a2_ctx[i].grain = grain;
-        if (!a2_store_u64(a3, kA2CtxTag | (uint64_t)(i + 1))) { g_a2_ctx[i].used = false; return kA2ErrInvalid; }
+        if (!a2_store_u64(a3, kA2CtxTag | (uint64_t)(i + 1))) { g_a2_ctx[i].used = false; return kA2ErrInvalidParam; }
         return 0;
     }
-    return kA2ErrInvalid;
+    return kA2ErrInvalidParam;
 }
 HLE(audio2_ctx_destroy) {
     A2LOG("sceAudioOut2ContextDestroy");
@@ -783,7 +784,7 @@ HLE(audio2_ctx_destroy) {
 HLE(audio2_user_create) {
     A2LOG("sceAudioOut2UserCreate");
     std::lock_guard<std::mutex> lk(g_a2_mx);
-    if (!a2_store_u64(a1, kA2UserTag | (uint64_t)++g_a2_users)) return kA2ErrInvalid;
+    if (!a2_store_u64(a1, kA2UserTag | (uint64_t)++g_a2_users)) return kA2ErrInvalidParam;
     return 0;
 }
 HLE(audio2_user_destroy) { A2LOG("sceAudioOut2UserDestroy"); return 0; }
@@ -812,11 +813,11 @@ HLE(audio2_port_create) {
     // title that churns ports over a long session can't exhaust the table or alias slot state.
     for (uint32_t id = 1; id <= kA2MaxPorts; ++id) {
         if (g_a2_port_state[id - 1].used) continue;
-        if (!a2_store_u64(a2, kA2PortTag | (uint64_t)id)) return kA2ErrInvalid;
+        if (!a2_store_u64(a2, kA2PortTag | (uint64_t)id)) return kA2ErrInvalidParam;
         g_a2_port_state[id - 1] = A2PortState{true, a0, 0, ptype, data_format, flags};
         return 0;
     }
-    return kA2ErrInvalid;
+    return kA2ErrPortFull;
 }
 HLE(audio2_port_destroy) {
     A2LOG("sceAudioOut2PortDestroy");
@@ -847,12 +848,12 @@ HLE(audio2_port_get_state) {
     {
         std::lock_guard<std::mutex> lk(g_a2_mx);
         if ((a0 & ~kA2PortIndexMask) != kA2PortTag || pidx < 1 || pidx > kA2MaxPorts ||
-            !g_a2_port_state[pidx - 1].used) return kA2ErrInvalid;
+            !g_a2_port_state[pidx - 1].used) return kA2ErrInvalidParam;
         state.num_channels = (uint8_t)audio2_format_channels(g_a2_port_state[pidx - 1].data_format);
     }
     state.output = 1;
     state.volume = 127;
-    if (!audio_store_bytes(a1, &state, sizeof state)) return kA2ErrInvalid;
+    if (!audio_store_bytes(a1, &state, sizeof state)) return kA2ErrInvalidParam;
     return 0;
 }
 // sceAudioOut2PortSetAttributes(port, const SceAudioOut2Attribute* attrs, size_t count).
@@ -865,7 +866,7 @@ HLE(audio2_port_set_attr) {
     A2LOG("sceAudioOut2PortSetAttributes");
     const uint64_t pidx = (a0 & kA2PortIndexMask);
     if ((a0 & ~kA2PortIndexMask) != kA2PortTag || pidx < 1 || pidx > kA2MaxPorts)
-        return kA2ErrInvalid;
+        return kA2ErrInvalidParam;
     if (a2 == 0) return 0;                        // no attributes: a legal no-op
     const uint64_t count = a2 <= 32 ? a2 : 32;    // defensive cap; log the clamp fail-visibly
     if (count != a2 && audio2log())
@@ -918,7 +919,7 @@ HLE(audio2_ctx_advance) {
     const uint64_t idx = a0 & 0xff;
     std::lock_guard<std::mutex> lk(g_a2_mx);
     if ((a0 & ~0xffull) != kA2CtxTag || idx < 1 || idx > 4 || !g_a2_ctx[idx - 1].used)
-        return kA2ErrInvalid;
+        return kA2ErrInvalidParam;
     audio2_update_queue_locked(g_a2_ctx[idx - 1], std::chrono::steady_clock::now());
     return 0;
 }
@@ -937,7 +938,7 @@ HLE(audio2_ctx_push) {
         {
             std::lock_guard<std::mutex> lk(g_a2_mx);
             if ((a0 & ~0xffull) != kA2CtxTag || idx < 1 || idx > 4 ||
-                !g_a2_ctx[idx - 1].used) return kA2ErrInvalid;
+                !g_a2_ctx[idx - 1].used) return kA2ErrInvalidParam;
             A2Context& context = g_a2_ctx[idx - 1];
             const auto now = std::chrono::steady_clock::now();
             audio2_update_queue_locked(context, now);
@@ -1182,7 +1183,7 @@ HLE(audio2_get_speaker_info) {
     info.available_bits = 0x3;    // front-left and front-right
     info.positions[0] = {-30, 0};
     info.positions[1] = { 30, 0};
-    if (!audio_store_bytes(a0, &info, sizeof(info))) return kA2ErrInvalid;
+    if (!audio_store_bytes(a0, &info, sizeof(info))) return kA2ErrInvalidParam;
     return 0;
 }
 
@@ -1213,51 +1214,49 @@ HLE(audio2_speaker_array_create) {
     for (uint64_t i = 0; i < 32; ++i) {
         if (g_a2_speaker_arrays[i]) continue;
         const uint64_t handle = kA2SpeakerArrayTag | (i + 1);
-        if (!a2_store_u64(a0, handle)) return kA2ErrInvalid;
+        if (!a2_store_u64(a0, handle)) return kA2ErrInvalidParam;
         g_a2_speaker_arrays[i] = true;
         return 0;
     }
-    return kA2ErrInvalid;
+    return kA2ErrPortFull;
 }
 
 HLE(audio2_speaker_array_destroy) {
     std::lock_guard<std::mutex> lk(g_a2_mx);
-    if (!audio2_speaker_array_valid(a0)) return kA2ErrInvalid;
+    if (!audio2_speaker_array_valid(a0)) return kA2ErrInvalidParam;
     g_a2_speaker_arrays[(a0 & 0xff) - 1] = false;
     return 0;
 }
 
-struct A2Position { float x, y, z; };
-static_assert(sizeof(A2Position) == 12);
-
-// The position/spread/downmix arguments are passed in XMM registers by the SysV guest ABI, while
-// the handle/output/count arguments use GPRs.  Keep the real typed signature so the import stub's
-// untouched register file is decoded correctly (a six-u64 HLE shim would lose the float arguments).
-static __attribute__((noinline)) PROSPER_SYSV_ABI uint64_t
-audio2_get_speaker_array_coefficients(uint64_t handle, A2Position position, float spread,
-                                      uint64_t coefficients, uint32_t count,
-                                      uint8_t height_aware, float downmix_spread_radius) {
+// The position/spread/downmix arguments use the SysV guest ABI's independent XMM argument sequence;
+// handle/output/count/height therefore arrive in RDI/RSI/RDX/RCX. The current deterministic stereo
+// fallback does not consume the float inputs, so use the normal integer HLE bridge. This is also
+// required on Windows, whose import stubs translate the guest's integer registers but do not yet
+// marshal XMM arguments into a typed Microsoft-ABI call.
+HLE(audio2_get_speaker_array_coefficients) {
+    const uint64_t handle = a0;
+    const uint64_t coefficients = a1;
+    const uint32_t count = (uint32_t)a2;
+    const uint8_t height_aware = (uint8_t)a3;
     if (getenv("PROSPER_AUDIO2_PROBE")) {
         static std::atomic<uint32_t> calls{0};
         const uint32_t call = calls.fetch_add(1);
         if (call < 64)
-            fprintf(stderr, "[audio2-speaker] coeff #%u handle=0x%llx pos=(%.6g,%.6g,%.6g) "
-                    "spread=%.6g out=0x%llx count=%u height=%u downmix=%.6g\n",
-                    call + 1, (unsigned long long)handle, position.x, position.y, position.z,
-                    spread, (unsigned long long)coefficients, count, height_aware,
-                    downmix_spread_radius);
+            fprintf(stderr, "[audio2-speaker] coeff #%u handle=0x%llx out=0x%llx "
+                    "count=%u height=%u\n", call + 1, (unsigned long long)handle,
+                    (unsigned long long)coefficients, count, height_aware);
     }
     {
         std::lock_guard<std::mutex> lk(g_a2_mx);
-        if (!audio2_speaker_array_valid(handle)) return kA2ErrInvalid;
+        if (!audio2_speaker_array_valid(handle)) return kA2ErrInvalidParam;
     }
-    if ((!coefficients && count) || count > 256) return kA2ErrInvalid;
+    if ((!coefficients && count) || count > 256) return kA2ErrInvalidParam;
     std::vector<float> values(count, 0.0f);
     if (count > 0) values[0] = 1.0f;
     if (count > 1) values[1] = 1.0f;
     if (values.empty()) return 0;
     return audio_store_bytes(coefficients, values.data(), values.size() * sizeof(float))
-        ? 0 : kA2ErrInvalid;
+        ? 0 : kA2ErrInvalidParam;
 }
 
 HLE(audio2_get_speaker_array_ambisonics_coefficients) {
@@ -1271,12 +1270,12 @@ HLE(audio2_get_speaker_array_ambisonics_coefficients) {
                     (unsigned long long)a3);
     }
     std::lock_guard<std::mutex> lk(g_a2_mx);
-    if (!audio2_speaker_array_valid(a0) || (!a2 && a3) || a3 > 256) return kA2ErrInvalid;
+    if (!audio2_speaker_array_valid(a0) || (!a2 && a3) || a3 > 256) return kA2ErrInvalidParam;
     std::vector<float> values((size_t)a3, 0.0f);
     if (!values.empty()) values[0] = (a1 == 0 || a1 == 64) ? 0.70710677f : 1.0f;
     if (values.empty()) return 0;
     return audio_store_bytes(a2, values.data(), values.size() * sizeof(float))
-        ? 0 : kA2ErrInvalid;
+        ? 0 : kA2ErrInvalidParam;
 }
 
 HLE(audio2_mastering_init) {
@@ -1308,14 +1307,14 @@ HLE(audio2_ctx_get_queue_level) {
     {
         std::lock_guard<std::mutex> lk(g_a2_mx);
         if ((a0 & ~0xffull) != kA2CtxTag || idx < 1 || idx > 4 ||
-            !g_a2_ctx[idx - 1].used) return kA2ErrInvalid;
+            !g_a2_ctx[idx - 1].used) return kA2ErrInvalidParam;
         A2Context& context = g_a2_ctx[idx - 1];
         audio2_update_queue_locked(context, std::chrono::steady_clock::now());
         queued = context.queued;
         available = queued < context.queue_depth ? context.queue_depth - queued : 0;
     }
-    if (a1 && !a2_store_u32(a1, queued)) return kA2ErrInvalid;
-    if (a2 && !a2_store_u32(a2, available)) return kA2ErrInvalid;
+    if (a1 && !a2_store_u32(a1, queued)) return kA2ErrInvalidParam;
+    if (a2 && !a2_store_u32(a2, available)) return kA2ErrInvalidParam;
     return 0;
 }
 
@@ -1325,7 +1324,7 @@ HLE(audio2_get_system_state) {
     if (control_probes.fetch_add(1) < 8)
         audio2_control_probe("sceAudioOut2GetSystemState", a0, a1, a2, a3, a4, a5);
     // { float loudness; u32 pad; u64 reserved[7]; }
-    if (!a2_store_zeros(a0, 0x40)) return kA2ErrInvalid;
+    if (!a2_store_zeros(a0, 0x40)) return kA2ErrInvalidParam;
     return 0;
 }
 
@@ -1797,10 +1796,17 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                 const ajm::DecodeResult decoded = instance.host_dec->decode(
                     std::span<const uint8_t>(input.data(), got), std::span<int16_t>(pcm));
                 const uint32_t frame_bytes = decoded.channels * sizeof(int16_t);
+                // A streaming parser may consume a compressed prefix before it has one complete
+                // frame and therefore before it can report the stream's channel count. That is a
+                // successful zero-output job: requiring frame_bytes here would report an error
+                // after advancing persistent parser state, prompting the guest to resend bytes we
+                // already consumed. Channel alignment becomes meaningful only once PCM is emitted.
+                const bool pcm_shape_valid = decoded.produced_bytes == 0 ||
+                    (frame_bytes != 0 && decoded.produced_bytes % frame_bytes == 0);
                 const bool valid = decoded.ok && decoded.consumed_bytes <= got &&
                     decoded.produced_bytes <= job.out_size &&
                     decoded.produced_bytes <= pcm.size() * sizeof(int16_t) &&
-                    frame_bytes != 0 && decoded.produced_bytes % frame_bytes == 0;
+                    pcm_shape_valid;
                 int32_t err = valid ? 0 : kAjm2ErrDecode;
                 uint32_t consumed = valid ? decoded.consumed_bytes : 0;
                 uint32_t produced = valid ? decoded.produced_bytes : 0;
@@ -1810,7 +1816,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                 }
                 if (!err) ajm2_dump_decode(inst_id,
                     std::span<const uint8_t>(input.data(), consumed), pcm.data(), produced);
-                if (!err) instance.decoded_samples += produced / frame_bytes;
+                if (!err && produced) instance.decoded_samples += produced / frame_bytes;
                 ajm2_write_result(job.result_addr, err, consumed, produced,
                                   instance.decoded_samples, decoded.decoded_frames);
                 if (log)

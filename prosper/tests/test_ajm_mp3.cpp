@@ -92,6 +92,8 @@ int main() {
     std::puts("== test_ajm_mp3 ==");
     register_builtin_hle();
     CHECK(ajm::install_ffmpeg_decoder_backend(), "FFmpeg AJM decoder backend installs");
+    CHECK(ajm::decoder_backend()->create(ajm::Codec::Mp3, 0) != nullptr,
+          "zero AJM max-channel field retains its default stereo S16 contract");
 
     auto initialize = reinterpret_cast<HleFn>(Hle::lookup(nid_hash("sceAjmInitialize")));
     auto module_register = reinterpret_cast<HleFn>(Hle::lookup(nid_hash("sceAjmModuleRegister")));
@@ -116,7 +118,9 @@ int main() {
           instance != 0, "AJM MP3 instance owns a persistent decoder");
 
     uint8_t batch_buffer[64]{};
-    struct { BatchInfo info; uint64_t canary; } batch{{}, 0x1122334455667788ull};
+    struct { BatchInfo info; uint64_t canary; } batch{};
+    std::memset(&batch.info, 0xCC, sizeof(batch.info));
+    batch.canary = 0x1122334455667788ull;
     CHECK(batch_initialize(addr(batch_buffer), sizeof(batch_buffer), addr(&batch.info), 0, 0, 0) == 0,
           "BatchInitialize accepts caller storage");
     CHECK(batch.info.buffer == addr(batch_buffer) && batch.info.offset == 0 &&
@@ -141,6 +145,74 @@ int main() {
           "MP3 decoder retains PCM that exceeds one output frame");
     CHECK(remaining.ok && remaining.consumed_bytes == 0 && remaining.produced_bytes == 6912,
           "MP3 decoder drains all retained PCM without re-consuming input");
+
+    // Fill the decoder's retained-PCM high-water mark with no output capacity. Once capped, another
+    // call must consume no new compressed bytes; after draining, the PCM count must match exactly the
+    // codec frames accepted before backpressure. The old post-packet-only check grew carry by one
+    // frame on every zero-output retry.
+    std::unique_ptr<ajm::StreamDecoder> bounded =
+        ajm::decoder_backend()->create(ajm::Codec::Mp3, 1);
+    std::vector<uint8_t> repeated_mp3;
+    repeated_mp3.reserve(mp3.size() * 240);
+    for (int i = 0; i < 240; ++i)
+        repeated_mp3.insert(repeated_mp3.end(), mp3.begin(), mp3.end());
+    const ajm::DecodeResult filled = bounded->decode(repeated_mp3, {});
+    CHECK(filled.ok && filled.consumed_bytes > 0 && filled.consumed_bytes < repeated_mp3.size() &&
+          filled.produced_bytes == 0 && filled.decoded_frames > 0,
+          "MP3 decoder stops accepting input when retained PCM reaches its bound");
+    const ajm::DecodeResult capped = bounded->decode(
+        std::span<const uint8_t>(repeated_mp3).subspan(filled.consumed_bytes), {});
+    CHECK(capped.ok && capped.consumed_bytes == 0 && capped.produced_bytes == 0 &&
+          capped.decoded_frames == 0,
+          "capped MP3 decoder applies backpressure before parsing another packet");
+    std::vector<int16_t> bounded_drain((size_t)filled.decoded_frames * 1152 + 1152);
+    const ajm::DecodeResult drained = bounded->decode({}, bounded_drain);
+    CHECK(drained.ok && drained.consumed_bytes == 0 &&
+          drained.produced_bytes / sizeof(int16_t) == (size_t)filled.decoded_frames * 1152,
+          "bounded MP3 carry drains exactly the frames accepted before backpressure");
+
+    // AJM jobs need not end on an MPEG frame boundary. The first half-frame is a successful
+    // parser-only job: it consumes bytes into persistent state while channel/rate metadata and PCM
+    // remain unavailable. A later batch supplies the suffix and must complete the original frame
+    // without the guest resending its prefix.
+    constexpr size_t split = 120;
+    Sideband prefix_sideband{};
+    std::vector<int16_t> split_pcm(4 * 1152, (int16_t)0x5555);
+    CHECK(job_decode(addr(&batch.info), instance, addr(mp3.data()), split,
+                     addr(split_pcm.data()), split_pcm.size() * sizeof(int16_t),
+                     addr(&prefix_sideband), 0, 0, 0) == 0,
+          "partial-frame MP3 prefix job queues");
+    uint32_t prefix_batch_id = 0xffffffffu;
+    CHECK(batch_start(context, addr(&batch.info), 40, 0, addr(&prefix_batch_id),
+                      0, 0, 0, 0, 0) == 0,
+          "partial-frame MP3 prefix batch executes");
+    CHECK(prefix_sideband.iResult == 0 && prefix_sideband.iCodecResult == 0 &&
+          prefix_sideband.iSizeConsumed == split && prefix_sideband.iSizeProduced == 0 &&
+          prefix_sideband.uiTotalDecodedSamples == 0 && prefix_sideband.numFrames == 0,
+          "parser-only MP3 job succeeds with consumed input and no invented PCM");
+
+    Sideband suffix_sideband{};
+    CHECK(job_decode(addr(&batch.info), instance, addr(mp3.data() + split), mp3.size() - split,
+                     addr(split_pcm.data()), split_pcm.size() * sizeof(int16_t),
+                     addr(&suffix_sideband), 0, 0, 0) == 0,
+          "remaining MP3 suffix job queues on the persistent instance");
+    uint32_t suffix_batch_id = 0xffffffffu;
+    CHECK(batch_start(context, addr(&batch.info), 40, 0, addr(&suffix_batch_id),
+                      0, 0, 0, 0, 0) == 0,
+          "remaining MP3 suffix completes the split frame");
+    CHECK(suffix_sideband.iResult == 0 && suffix_sideband.iSizeConsumed == mp3.size() - split &&
+          suffix_sideband.iSizeProduced == 9216 &&
+          suffix_sideband.uiTotalDecodedSamples == 4608 && suffix_sideband.numFrames == 4,
+          "split MP3 stream decodes once without duplicating its consumed prefix");
+    CHECK(std::any_of(split_pcm.begin(), split_pcm.end(),
+                      [](int16_t sample) { return sample != 0; }),
+          "split MP3 stream produces the generated tone");
+
+    CHECK(instance_destroy(context, instance, 0, 0, 0, 0) == 0,
+          "destroying the split-stream MP3 instance releases decoder state");
+    instance = 0;
+    CHECK(instance_create(context, 0 /* MP3 */, 1 /* signed-16 output */, addr(&instance), 0, 0) == 0 &&
+          instance != 0, "fresh MP3 instance starts an independent stream");
 
     std::vector<int16_t> pcm(4 * 1152, (int16_t)0x5555);
     Sideband sideband{};
@@ -167,6 +239,34 @@ int main() {
 
     CHECK(instance_destroy(context, instance, 0, 0, 0, 0) == 0,
           "destroying an MP3 instance releases decoder state");
+
+    // The FFmpeg seam currently implements only AJM's signed-16 output encoding. An S32 instance
+    // must fail truthfully in the sideband and leave the guest output untouched; reporting success
+    // with S16 bytes would silently corrupt the guest mixer's sample interpretation.
+    uint32_t unsupported_instance = 0;
+    constexpr uint64_t s32_mono_flags = 1u | (1u << 7u);
+    CHECK(instance_create(context, 0 /* MP3 */, s32_mono_flags,
+                          addr(&unsupported_instance), 0, 0) == 0 && unsupported_instance != 0,
+          "unsupported MP3 output encoding retains normal AJM instance lifecycle");
+    std::vector<int16_t> rejected_pcm(4 * 1152, (int16_t)0x5555);
+    Sideband rejected_sideband{};
+    CHECK(job_decode(addr(&batch.info), unsupported_instance, addr(mp3.data()), mp3.size(),
+                     addr(rejected_pcm.data()), rejected_pcm.size() * sizeof(int16_t),
+                     addr(&rejected_sideband), 0, 0, 0) == 0,
+          "unsupported-encoding MP3 job queues for truthful sideband failure");
+    uint32_t rejected_batch_id = 0xffffffffu;
+    CHECK(batch_start(context, addr(&batch.info), 40, 0, addr(&rejected_batch_id),
+                      0, 0, 0, 0, 0) == 0,
+          "unsupported-encoding MP3 batch executes");
+    CHECK(rejected_sideband.iResult != 0 && rejected_sideband.iSizeConsumed == 0 &&
+          rejected_sideband.iSizeProduced == 0 && rejected_sideband.uiTotalDecodedSamples == 0,
+          "unsupported MP3 output encoding reports decode failure without consuming input");
+    CHECK(std::all_of(rejected_pcm.begin(), rejected_pcm.end(),
+                      [](int16_t sample) { return sample == (int16_t)0x5555; }),
+          "unsupported MP3 output encoding leaves guest PCM untouched");
+    CHECK(instance_destroy(context, unsupported_instance, 0, 0, 0, 0) == 0,
+          "unsupported MP3 instance destroys normally");
+
     ajm::uninstall_ffmpeg_decoder_backend();
     std::printf(fails ? "test_ajm_mp3: %d FAILURE(S)\n" : "test_ajm_mp3: all ok\n", fails);
     return fails ? 1 : 0;

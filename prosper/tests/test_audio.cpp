@@ -79,8 +79,8 @@ int main() {
 
     // AudioOut2 shares the guest-store primitive with AJM. Inaccessible outputs must report an
     // error instead of faulting the host; these cover both fixed-size zero-fill and u64 stores.
-    CHECK((int32_t)call("sceAudioOut2ContextResetParam", 1) == (int32_t)0x80260003);
-    CHECK((int32_t)call("sceAudioOut2ContextQueryMemory", 0, 1) == (int32_t)0x80260003);
+    CHECK((int32_t)call("sceAudioOut2ContextResetParam", 1) == (int32_t)0x80268001);
+    CHECK((int32_t)call("sceAudioOut2ContextQueryMemory", 0, 1) == (int32_t)0x80268001);
 
     // --- 2. open -> handle + backend.open with decoded params --------------------------------
     audio_reset();
@@ -264,22 +264,16 @@ int main() {
     CHECK(a2_speakers.positions[0].azimuth == -30 && a2_speakers.positions[0].elevation == 0);
     CHECK(a2_speakers.positions[1].azimuth == 30 && a2_speakers.positions[1].elevation == 0);
     CHECK(a2_speakers.positions[2].azimuth == 0 && a2_speakers.positions[2].elevation == 0);
-    CHECK((int32_t)call("sceAudioOut2GetSpeakerInfo", 1, 1, 0) == (int32_t)0x80260003);
+    CHECK((int32_t)call("sceAudioOut2GetSpeakerInfo", 1, 1, 0) == (int32_t)0x80268001);
 
     CHECK(call("sceAudioOut2GetSpeakerArrayMemorySize", 8, 0, 1) == 0xC00);
     uint64_t a2_speaker_array = 0;
     CHECK(call("sceAudioOut2SpeakerArrayCreate", PTR(&a2_speaker_array), 0, 0) == 0);
     CHECK(a2_speaker_array != 0);
-    struct A2Position { float x, y, z; };
-    using A2CoefficientsFn = uint64_t (*)(uint64_t, A2Position, float, uint64_t,
-                                          uint32_t, uint8_t, float);
-    auto a2_coefficients_fn = reinterpret_cast<A2CoefficientsFn>(
-        FN("sceAudioOut2GetSpeakerArrayCoefficients"));
-    CHECK(a2_coefficients_fn != nullptr);
     float a2_coefficients[8];
     for (float& value : a2_coefficients) value = -99.0f;
-    CHECK(a2_coefficients_fn(a2_speaker_array, {0.0f, 0.0f, 1.0f}, 0.0f,
-                             PTR(a2_coefficients), 8, 0, 0.0f) == 0);
+    CHECK(call("sceAudioOut2GetSpeakerArrayCoefficients", a2_speaker_array,
+               PTR(a2_coefficients), 8, 0) == 0);
     CHECK(a2_coefficients[0] == 1.0f && a2_coefficients[1] == 1.0f);
     for (size_t i = 2; i < 8; ++i) CHECK(a2_coefficients[i] == 0.0f);
     for (float& value : a2_coefficients) value = -99.0f;
@@ -335,7 +329,7 @@ int main() {
     CHECK(a2_state.pad1 == 0 && a2_state.reroute_counter == 0);
     CHECK(a2_state.flags == 0 && a2_state.pad2 == 0);
     for (uint64_t value : a2_state.reserved) CHECK(value == 0);
-    CHECK((int32_t)call("sceAudioOut2PortGetState", a2_port, 1) == (int32_t)0x80260003);
+    CHECK((int32_t)call("sceAudioOut2PortGetState", a2_port, 1) == (int32_t)0x80268001);
 
     std::vector<float> a2_pcm(64 * 2);
     for (size_t i = 0; i < a2_pcm.size(); i++) a2_pcm[i] = (float)((int)(i % 17) - 8) / 16.0f;
@@ -469,7 +463,7 @@ int main() {
     }
     uint64_t overflow_port = 0xCCCCCCCCCCCCCCCCull;
     CHECK((int32_t)call("sceAudioOut2PortCreate", a2_context, PTR(&a2_port_param),
-                        PTR(&overflow_port)) == (int32_t)0x80260003);
+                        PTR(&overflow_port)) == (int32_t)0x80268012);
     CHECK(overflow_port == 0xCCCCCCCCCCCCCCCCull);
     for (uint64_t handle : a2_object_ports)
         CHECK(call("sceAudioOut2PortDestroy", handle) == 0);

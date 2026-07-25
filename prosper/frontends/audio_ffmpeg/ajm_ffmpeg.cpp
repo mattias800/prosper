@@ -24,7 +24,7 @@ namespace {
 
 class FfmpegMp3Decoder final : public StreamDecoder {
 public:
-    FfmpegMp3Decoder() {
+    explicit FfmpegMp3Decoder(uint32_t max_channels): max_channels_(max_channels) {
         const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_MP3);
         if (!codec) return;
         parser_ = av_parser_init(AV_CODEC_ID_MP3);
@@ -51,6 +51,18 @@ public:
         size_t written_samples = drain(output);
         size_t input_offset = 0;
         uint32_t decoded_frames = 0;
+
+        // Once retained PCM reaches the high-water mark, apply backpressure before parsing or
+        // sending another packet. Otherwise a caller that repeatedly supplies input with a zero-size
+        // output would grow carry_ by one decoded frame per call despite the in-loop bound below.
+        // Report the compressed bytes as unconsumed so the guest can retry them after draining PCM.
+        if (carry_.size() - carry_offset_ >= kMaxCarrySamples) {
+            result.ok = true;
+            result.produced_bytes = static_cast<uint32_t>(written_samples * sizeof(int16_t));
+            result.channels = channels_;
+            result.sample_rate = sample_rate_;
+            return result;
+        }
 
         // FFmpeg permits optimized parsers/decoders to read AV_INPUT_BUFFER_PADDING_SIZE bytes past
         // the packet. Guest buffers provide no such promise, so stage and zero-pad them here.
@@ -118,6 +130,10 @@ private:
         if (same) return true;
 
         const uint32_t next_channels = static_cast<uint32_t>(frame->ch_layout.nb_channels);
+        // AJM instance flags bound the guest output contract. This backend currently preserves the
+        // compressed stream's channel layout rather than downmixing, so fail truthfully instead of
+        // returning more interleaved channels than the guest requested.
+        if (next_channels == 0 || next_channels > max_channels_) return false;
         if (channels_ && next_channels != channels_ && carry_offset_ != carry_.size()) return false;
 
         if (swr_) swr_free(&swr_);
@@ -149,7 +165,11 @@ private:
             const int capacity = swr_get_out_samples(swr_, frame_->nb_samples);
             if (capacity < 0) return false;
             const size_t old_size = carry_.size();
-            carry_.resize(old_size + static_cast<size_t>(capacity) * channels_);
+            if (channels_ && static_cast<size_t>(capacity) >
+                std::numeric_limits<size_t>::max() / channels_) return false;
+            const size_t capacity_samples = static_cast<size_t>(capacity) * channels_;
+            if (capacity_samples > carry_.max_size() - old_size) return false;
+            carry_.resize(old_size + capacity_samples);
             uint8_t* destination = reinterpret_cast<uint8_t*>(carry_.data() + old_size);
             const int converted = swr_convert(swr_, &destination, capacity,
                                               const_cast<const uint8_t**>(frame_->extended_data),
@@ -188,6 +208,7 @@ private:
     AVChannelLayout input_layout_{};
     AVSampleFormat input_format_ = AV_SAMPLE_FMT_NONE;
     int input_rate_ = 0;
+    uint32_t max_channels_ = 0;
     uint32_t channels_ = 0;
     uint32_t sample_rate_ = 0;
     std::vector<int16_t> carry_;
@@ -197,9 +218,15 @@ private:
 class FfmpegDecoderBackend final : public DecoderBackend {
 public:
     std::unique_ptr<StreamDecoder> create(Codec codec, uint64_t instance_flags) override {
-        (void)instance_flags;
         if (codec != Codec::Mp3) return nullptr;
-        auto decoder = std::make_unique<FfmpegMp3Decoder>();
+        // AJM packs the maximum output channel count in bits 0..6 and sample encoding in bits
+        // 7..9. The seam emits signed-16 PCM today; reject S32/float instances rather than silently
+        // handing them S16 bytes with a successful sideband.
+        const uint32_t encoded_max_channels = static_cast<uint32_t>(instance_flags & 0x7fu);
+        const uint32_t max_channels = encoded_max_channels ? encoded_max_channels : 2u;
+        const uint32_t sample_encoding = static_cast<uint32_t>((instance_flags >> 7u) & 0x7u);
+        if (max_channels > 8 || sample_encoding != 0) return nullptr;
+        auto decoder = std::make_unique<FfmpegMp3Decoder>(max_channels);
         return decoder->valid() ? std::move(decoder) : nullptr;
     }
 };
@@ -209,7 +236,7 @@ FfmpegDecoderBackend g_ffmpeg_backend;
 } // namespace
 
 bool install_ffmpeg_decoder_backend() {
-    auto probe = g_ffmpeg_backend.create(Codec::Mp3, 0);
+    auto probe = g_ffmpeg_backend.create(Codec::Mp3, 0); // default stereo signed-16 contract
     if (!probe) return false;
     set_decoder_backend(&g_ffmpeg_backend);
     return true;
