@@ -43,6 +43,13 @@ public:
 
     bool valid() const override { return valid_; }
 
+    void invalidate() override {
+        if (!valid_) return;
+        valid_ = false;
+        carry_.clear();
+        carry_offset_ = 0;
+    }
+
     DecodeResult decode(std::span<const uint8_t> input,
                         std::span<int16_t> output) override {
         DecodeResult result{};
@@ -80,7 +87,7 @@ public:
             const int used = av_parser_parse2(parser_, context_, &packet_data, &packet_size,
                                               padded.data() + input_offset, parse_size,
                                               AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
-            if (used < 0 || (used == 0 && packet_size == 0)) return result;
+            if (used < 0 || (used == 0 && packet_size == 0)) return fail();
             input_offset += static_cast<size_t>(used);
 
             if (packet_size > 0) {
@@ -89,10 +96,10 @@ public:
                 packet_->size = packet_size;
                 int send = avcodec_send_packet(context_, packet_);
                 if (send == AVERROR(EAGAIN)) {
-                    if (!receive_frames(&decoded_frames)) return result;
+                    if (!receive_frames(&decoded_frames)) return fail();
                     send = avcodec_send_packet(context_, packet_);
                 }
-                if (send < 0 || !receive_frames(&decoded_frames)) return result;
+                if (send < 0 || !receive_frames(&decoded_frames)) return fail();
                 written_samples += drain(output.subspan(written_samples));
             }
 
@@ -112,6 +119,15 @@ public:
 
 private:
     static constexpr size_t kMaxCarrySamples = 1024u * 1024u;
+
+    DecodeResult fail() {
+        // FFmpeg's parser, codec, resampler, and retained PCM all advance independently. Once any
+        // one of them fails there is no reliable way to roll the others back to the byte offset AJM
+        // will publish (zero on error), so make the instance terminal instead of accepting a retry
+        // against partially advanced state.
+        invalidate();
+        return {};
+    }
 
     void release() {
         if (swr_) swr_free(&swr_);

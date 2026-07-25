@@ -27,11 +27,16 @@ struct DecodeResult {
 };
 
 // Stateful decoder for one AJM instance. decode() emits interleaved signed-16 PCM. Implementations
-// retain parser/codec state and any decoded PCM that did not fit in `output` across calls.
+// retain parser/codec state and any decoded PCM that did not fit in `output` across calls. A caller
+// that cannot publish a successful result must invalidate the decoder: retrying input after hidden
+// parser/codec state advanced can duplicate or corrupt the stream.
 class StreamDecoder {
 public:
     virtual ~StreamDecoder() = default;
     virtual bool valid() const = 0;
+    // Terminal and idempotent. Implementations may call this before returning an error; HLE calls it
+    // again whenever the result cannot be published safely.
+    virtual void invalidate() = 0;
     virtual DecodeResult decode(std::span<const uint8_t> input,
                                 std::span<int16_t> output) = 0;
 };

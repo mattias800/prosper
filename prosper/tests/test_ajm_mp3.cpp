@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string_view>
 #include <vector>
 
@@ -47,6 +48,78 @@ static_assert(sizeof(BatchInfo) == 40);
 
 static uint64_t addr(const void* p) { return (uint64_t)(uintptr_t)p; }
 
+enum class TestDecoderMode {
+    MalformedSecondResult,
+    ProducePcm,
+};
+
+struct TestBackendStats {
+    TestDecoderMode mode = TestDecoderMode::MalformedSecondResult;
+    uint32_t creates = 0;
+    uint32_t decodes = 0;
+    uint32_t invalidations = 0;
+};
+
+class TestStreamDecoder final : public ajm::StreamDecoder {
+public:
+    explicit TestStreamDecoder(TestBackendStats* stats): stats_(stats) {}
+
+    bool valid() const override { return valid_; }
+    void invalidate() override {
+        if (!valid_) return;
+        valid_ = false;
+        ++stats_->invalidations;
+    }
+
+    ajm::DecodeResult decode(std::span<const uint8_t> input,
+                             std::span<int16_t> output) override {
+        ++stats_->decodes;
+        ajm::DecodeResult result{};
+        result.ok = true;
+        result.consumed_bytes = static_cast<uint32_t>(input.size());
+        if (stats_->mode == TestDecoderMode::MalformedSecondResult && stats_->decodes == 2) {
+            // Claim one byte beyond the supplied span after a previous successful job. HLE must
+            // reject this result and poison the stateful decoder before the guest retries it.
+            ++result.consumed_bytes;
+            result.decoded_frames = 7;
+        } else if (stats_->mode == TestDecoderMode::ProducePcm && !output.empty()) {
+            output[0] = 1234;
+            result.produced_bytes = sizeof(int16_t);
+            result.decoded_frames = 1;
+            result.channels = 1;
+            result.sample_rate = 48000;
+        }
+        return result;
+    }
+
+private:
+    TestBackendStats* stats_ = nullptr;
+    bool valid_ = true;
+};
+
+class TestDecoderBackend final : public ajm::DecoderBackend {
+public:
+    explicit TestDecoderBackend(TestBackendStats* stats): stats_(stats) {}
+
+    std::unique_ptr<ajm::StreamDecoder> create(ajm::Codec, uint64_t) override {
+        ++stats_->creates;
+        return std::make_unique<TestStreamDecoder>(stats_);
+    }
+
+private:
+    TestBackendStats* stats_ = nullptr;
+};
+
+static std::vector<uint8_t> bytes_from_hex(std::string_view hex) {
+    auto nibble = [](char c) -> uint8_t {
+        return c >= 'a' ? (uint8_t)(c - 'a' + 10) : (uint8_t)(c - '0');
+    };
+    std::vector<uint8_t> bytes(hex.size() / 2);
+    for (size_t i = 0; i < bytes.size(); ++i)
+        bytes[i] = (uint8_t)((nibble(hex[i * 2]) << 4) | nibble(hex[i * 2 + 1]));
+    return bytes;
+}
+
 static std::vector<uint8_t> mp3_input() {
     constexpr std::string_view hex =
         "fffb64c400000a5c552e15a78001bc99e6e73940003060cc18330a14c28530a0"
@@ -79,13 +152,27 @@ static std::vector<uint8_t> mp3_input() {
         "b682930bb41bbc63034afffff12814c608a0ca0314500591882b7ffffffd47cb8"
         "b3c5f51f2e2278beea6726800025104c4f45a1d19190944931104c4c5d4c210"
         "120928044b4d22448ecccb51c483822782a0aac34581a3c2278";
-    auto nibble = [](char c) -> uint8_t {
-        return c >= 'a' ? (uint8_t)(c - 'a' + 10) : (uint8_t)(c - '0');
-    };
-    std::vector<uint8_t> bytes(hex.size() / 2);
-    for (size_t i = 0; i < bytes.size(); ++i)
-        bytes[i] = (uint8_t)((nibble(hex[i * 2]) << 4) | nibble(hex[i * 2 + 1]));
-    return bytes;
+    return bytes_from_hex(hex);
+}
+
+static std::vector<uint8_t> stereo_mp3_frame() {
+    // One project-owned MPEG-1 Layer III frame generated from a 1.5 kHz sine wave (FFmpeg lavfi +
+    // libmp3lame, 48 kHz stereo, 128 kbps, no container/tag). It intentionally exceeds a mono AJM
+    // instance's declared output contract after that instance has successfully decoded mono data.
+    constexpr std::string_view hex =
+        "fffb9464000001f40c531d31e00000000d20a00001166d452019eb0000000034"
+        "830000000a7db6fd7af5ebd7af7ef7a30b0e0c0c0f1380381902402e074323c0"
+        "40322707c3f88031c1fe503129efe8f3fd1efe8f7ff0c03e7eb02063403efca1"
+        "cefe8303506e30790829996ff9854872182705cc4a25fe61dc1ce611cabb4654"
+        "54bf2c2a481f7c2e6065b07982b994b80ce65031442c40c118500309e110b262"
+        "7b81843098060181181822042924fc0c1002900901c06044070181102802c00d"
+        "15b7f030080140c0300906f303650008020d97ffc2c841b543f60b860b421488"
+        "6adfffc3228c7082c20b0e48a045023abfffc5cc2e621a2e51cd268738738a24"
+        "577ffbff22a644589e312e97522f1b2cbaeb3eaf5036effffca96923b8b000a1"
+        "6005cc01c0008c0470140c07302f8c0a3016cc128057cc216108cc68e1f84c64"
+        "2f37c0e88e3aec0cd6a22140c39204c40c09a02f00c1b105f80c0ab00980c011"
+        "00940c06a014c0c016000c03400203004c0081a68fffffe469228ffffbffff9c";
+    return bytes_from_hex(hex);
 }
 
 int main() {
@@ -171,6 +258,25 @@ int main() {
           drained.produced_bytes / sizeof(int16_t) == (size_t)filled.decoded_frames * 1152,
           "bounded MP3 carry drains exactly the frames accepted before backpressure");
 
+    // A codec error can happen after FFmpeg consumed a packet and advanced persistent state. AJM
+    // reports zero input consumed on an error, so accepting a retry would feed that packet into the
+    // wrong state. Exercise a deterministic mid-stream contract violation: stereo data sent to a
+    // mono instance after valid mono frames must poison the decoder permanently.
+    std::unique_ptr<ajm::StreamDecoder> terminal =
+        ajm::decoder_backend()->create(ajm::Codec::Mp3, 1);
+    std::vector<int16_t> terminal_pcm(4 * 1152);
+    const ajm::DecodeResult terminal_prefix = terminal->decode(mp3, terminal_pcm);
+    const std::vector<uint8_t> stereo = stereo_mp3_frame();
+    const ajm::DecodeResult terminal_error = terminal->decode(stereo, terminal_pcm);
+    const ajm::DecodeResult terminal_retry = terminal->decode(stereo, terminal_pcm);
+    CHECK(terminal_prefix.ok && terminal_prefix.consumed_bytes == mp3.size(),
+          "terminal-error fixture first advances the decoder with valid mono frames");
+    CHECK(!terminal_error.ok && !terminal->valid(),
+          "mid-stream channel-contract failure makes the decoder terminal");
+    CHECK(!terminal_retry.ok && terminal_retry.consumed_bytes == 0 &&
+          terminal_retry.produced_bytes == 0,
+          "terminal decoder rejects a retry instead of reusing advanced FFmpeg state");
+
     // AJM jobs need not end on an MPEG frame boundary. The first half-frame is a successful
     // parser-only job: it consumes bytes into persistent state while channel/rate metadata and PCM
     // remain unavailable. A later batch supplies the suffix and must complete the original frame
@@ -239,6 +345,175 @@ int main() {
 
     CHECK(instance_destroy(context, instance, 0, 0, 0, 0) == 0,
           "destroying an MP3 instance releases decoder state");
+
+    // Verify the same terminal contract at the guest boundary. The failing job and an exact retry
+    // both publish zero consumption and leave output untouched; recreating the instance is the only
+    // way to obtain fresh codec state after an error.
+    uint32_t terminal_instance = 0;
+    CHECK(instance_create(context, 0 /* MP3 */, 1 /* mono S16 */, addr(&terminal_instance), 0, 0) == 0 &&
+          terminal_instance != 0, "guest terminal-error fixture creates a mono MP3 instance");
+    std::vector<int16_t> guest_terminal_pcm(4 * 1152, (int16_t)0x5555);
+    Sideband guest_prefix_sideband{};
+    CHECK(job_decode(addr(&batch.info), terminal_instance, addr(mp3.data()), mp3.size(),
+                     addr(guest_terminal_pcm.data()), guest_terminal_pcm.size() * sizeof(int16_t),
+                     addr(&guest_prefix_sideband), 0, 0, 0) == 0,
+          "guest terminal-error fixture queues its valid mono prefix");
+    uint32_t guest_prefix_batch_id = 0xffffffffu;
+    CHECK(batch_start(context, addr(&batch.info), 40, 0, addr(&guest_prefix_batch_id),
+                      0, 0, 0, 0, 0) == 0 && guest_prefix_sideband.iResult == 0,
+          "guest terminal-error fixture advances persistent decoder state");
+
+    std::fill(guest_terminal_pcm.begin(), guest_terminal_pcm.end(), (int16_t)0x5555);
+    Sideband guest_error_sideband{};
+    CHECK(job_decode(addr(&batch.info), terminal_instance, addr(stereo.data()), stereo.size(),
+                     addr(guest_terminal_pcm.data()), guest_terminal_pcm.size() * sizeof(int16_t),
+                     addr(&guest_error_sideband), 0, 0, 0) == 0,
+          "guest mid-stream channel-contract violation queues normally");
+    uint32_t guest_error_batch_id = 0xffffffffu;
+    CHECK(batch_start(context, addr(&batch.info), 40, 0, addr(&guest_error_batch_id),
+                      0, 0, 0, 0, 0) == 0 && guest_error_sideband.iResult != 0 &&
+          guest_error_sideband.iSizeConsumed == 0 && guest_error_sideband.iSizeProduced == 0 &&
+          guest_error_sideband.uiTotalDecodedSamples == 4608 &&
+          guest_error_sideband.numFrames == 0,
+          "guest codec failure truthfully publishes zero consumption and output");
+    CHECK(std::all_of(guest_terminal_pcm.begin(), guest_terminal_pcm.end(),
+                      [](int16_t sample) { return sample == (int16_t)0x5555; }),
+          "guest codec failure leaves the output buffer untouched");
+
+    Sideband guest_retry_sideband{};
+    CHECK(job_decode(addr(&batch.info), terminal_instance, addr(stereo.data()), stereo.size(),
+                     addr(guest_terminal_pcm.data()), guest_terminal_pcm.size() * sizeof(int16_t),
+                     addr(&guest_retry_sideband), 0, 0, 0) == 0,
+          "guest can submit an exact retry to the terminal instance");
+    uint32_t guest_retry_batch_id = 0xffffffffu;
+    CHECK(batch_start(context, addr(&batch.info), 40, 0, addr(&guest_retry_batch_id),
+                      0, 0, 0, 0, 0) == 0 && guest_retry_sideband.iResult != 0 &&
+          guest_retry_sideband.iSizeConsumed == 0 && guest_retry_sideband.iSizeProduced == 0 &&
+          guest_retry_sideband.uiTotalDecodedSamples == 4608 &&
+          guest_retry_sideband.numFrames == 0,
+          "terminal guest instance rejects retry without reusing advanced codec state");
+    CHECK(std::all_of(guest_terminal_pcm.begin(), guest_terminal_pcm.end(),
+                      [](int16_t sample) { return sample == (int16_t)0x5555; }),
+          "terminal guest retry also leaves output untouched");
+    CHECK(instance_destroy(context, terminal_instance, 0, 0, 0, 0) == 0,
+          "terminal MP3 instance destroys normally");
+
+    // A backend can also advance successfully and then return metadata that the guest-facing layer
+    // cannot safely publish. Use a deliberately malformed backend to prove HLE invalidates that
+    // decoder, zeros every progress field, and never calls it for the guest's exact retry.
+    TestBackendStats malformed_stats{};
+    TestDecoderBackend malformed_backend(&malformed_stats);
+    ajm::set_decoder_backend(&malformed_backend);
+    uint32_t malformed_instance = 0;
+    CHECK(instance_create(context, 0 /* MP3 */, 1, addr(&malformed_instance), 0, 0) == 0 &&
+          malformed_instance != 0 && malformed_stats.creates == 1,
+          "malformed-result fixture creates one stateful decoder");
+    const uint8_t fake_packet = 0x42;
+    Sideband malformed_prefix_sideband{};
+    CHECK(job_decode(addr(&batch.info), malformed_instance, addr(&fake_packet), 1,
+                     addr(guest_terminal_pcm.data()), guest_terminal_pcm.size() * sizeof(int16_t),
+                     addr(&malformed_prefix_sideband), 0, 0, 0) == 0,
+          "malformed-result fixture queues its valid prefix");
+    uint32_t malformed_prefix_batch_id = 0xffffffffu;
+    CHECK(batch_start(context, addr(&batch.info), 40, 0, addr(&malformed_prefix_batch_id),
+                      0, 0, 0, 0, 0) == 0 && malformed_prefix_sideband.iResult == 0 &&
+          malformed_prefix_sideband.iSizeConsumed == 1,
+          "malformed-result fixture first advances with a publishable result");
+
+    Sideband malformed_sideband{};
+    CHECK(job_decode(addr(&batch.info), malformed_instance, addr(&fake_packet), 1,
+                     addr(guest_terminal_pcm.data()), guest_terminal_pcm.size() * sizeof(int16_t),
+                     addr(&malformed_sideband), 0, 0, 0) == 0,
+          "out-of-range backend result queues through normal AJM plumbing");
+    Sideband malformed_retry_sideband{};
+    CHECK(job_decode(addr(&batch.info), malformed_instance, addr(&fake_packet), 1,
+                     addr(guest_terminal_pcm.data()), guest_terminal_pcm.size() * sizeof(int16_t),
+                     addr(&malformed_retry_sideband), 0, 0, 0) == 0,
+          "exact retry queues behind the malformed result in the same batch");
+    uint32_t malformed_batch_id = 0xffffffffu;
+    CHECK(batch_start(context, addr(&batch.info), 40, 0, addr(&malformed_batch_id),
+                      0, 0, 0, 0, 0) == 0 && malformed_sideband.iResult != 0 &&
+          malformed_sideband.iSizeConsumed == 0 && malformed_sideband.iSizeProduced == 0 &&
+          malformed_sideband.numFrames == 0 && malformed_stats.invalidations == 1,
+          "HLE rejects malformed progress metadata and terminalizes the backend");
+    CHECK(malformed_retry_sideband.iResult != 0 &&
+          malformed_retry_sideband.iSizeConsumed == 0 && malformed_stats.decodes == 2 &&
+          malformed_stats.creates == 1,
+          "terminal HLE decoder rejects same-batch retry without decode or recreation");
+    CHECK(instance_destroy(context, malformed_instance, 0, 0, 0, 0) == 0,
+          "malformed-result MP3 instance destroys normally");
+
+    // Sideband publication is the commit point for a stateful decode. Exercise a successful decode
+    // and PCM copy whose deliberately inaccessible result address cannot receive progress, followed
+    // by a same-batch job with a valid sideband. The second job must observe a terminal instance
+    // without reaching the backend.
+    TestBackendStats publication_stats{TestDecoderMode::ProducePcm};
+    TestDecoderBackend publication_backend(&publication_stats);
+    ajm::set_decoder_backend(&publication_backend);
+    uint32_t publication_instance = 0;
+    CHECK(instance_create(context, 0 /* MP3 */, 1, addr(&publication_instance), 0, 0) == 0 &&
+          publication_instance != 0 && publication_stats.creates == 1,
+          "sideband-publication fixture creates one stateful decoder");
+    int16_t publication_pcm = (int16_t)0x5555;
+    constexpr uint64_t inaccessible_result = 0x0000deadbeef0000ull;
+    CHECK(job_decode(addr(&batch.info), publication_instance, addr(&fake_packet), 1,
+                     addr(&publication_pcm), sizeof(publication_pcm), inaccessible_result,
+                     0, 0, 0) == 0,
+          "decode with an inaccessible result sideband queues normally");
+    Sideband publication_retry_sideband{};
+    CHECK(job_decode(addr(&batch.info), publication_instance, addr(&fake_packet), 1,
+                     addr(&publication_pcm), sizeof(publication_pcm),
+                     addr(&publication_retry_sideband), 0, 0, 0) == 0,
+          "valid-sideband retry queues behind the unpublishable result");
+    uint32_t publication_batch_id = 0xffffffffu;
+    CHECK(batch_start(context, addr(&batch.info), 40, 0, addr(&publication_batch_id),
+                      0, 0, 0, 0, 0) == 0 && publication_pcm == 1234,
+          "first job advances the backend and copies its decoded PCM");
+    CHECK(publication_retry_sideband.iResult != 0 &&
+          publication_retry_sideband.iSizeConsumed == 0 &&
+          publication_retry_sideband.iSizeProduced == 0 &&
+          publication_retry_sideband.numFrames == 0 &&
+          publication_stats.decodes == 1 && publication_stats.invalidations == 1 &&
+          publication_stats.creates == 1,
+          "failed sideband publication terminalizes before the same-batch retry");
+    CHECK(instance_destroy(context, publication_instance, 0, 0, 0, 0) == 0,
+          "sideband-publication MP3 instance destroys normally");
+
+    // Cover the other guest-publication boundary: the backend succeeds, but decoded PCM cannot be
+    // stored. The error sideband must report no progress and the next same-batch job must not decode.
+    TestBackendStats pcm_store_stats{TestDecoderMode::ProducePcm};
+    TestDecoderBackend pcm_store_backend(&pcm_store_stats);
+    ajm::set_decoder_backend(&pcm_store_backend);
+    uint32_t pcm_store_instance = 0;
+    CHECK(instance_create(context, 0 /* MP3 */, 1, addr(&pcm_store_instance), 0, 0) == 0 &&
+          pcm_store_instance != 0 && pcm_store_stats.creates == 1,
+          "PCM-store fixture creates one stateful decoder");
+    Sideband pcm_store_sideband{};
+    CHECK(job_decode(addr(&batch.info), pcm_store_instance, addr(&fake_packet), 1,
+                     inaccessible_result, sizeof(int16_t), addr(&pcm_store_sideband),
+                     0, 0, 0) == 0,
+          "decode with an inaccessible PCM destination queues normally");
+    int16_t pcm_store_retry_output = (int16_t)0x5555;
+    Sideband pcm_store_retry_sideband{};
+    CHECK(job_decode(addr(&batch.info), pcm_store_instance, addr(&fake_packet), 1,
+                     addr(&pcm_store_retry_output), sizeof(pcm_store_retry_output),
+                     addr(&pcm_store_retry_sideband), 0, 0, 0) == 0,
+          "valid-output retry queues behind the failed PCM store");
+    uint32_t pcm_store_batch_id = 0xffffffffu;
+    CHECK(batch_start(context, addr(&batch.info), 40, 0, addr(&pcm_store_batch_id),
+                      0, 0, 0, 0, 0) == 0 && pcm_store_sideband.iResult != 0 &&
+          pcm_store_sideband.iSizeConsumed == 0 && pcm_store_sideband.iSizeProduced == 0,
+          "failed PCM store publishes an error with zero progress");
+    CHECK(pcm_store_retry_sideband.iResult != 0 &&
+          pcm_store_retry_sideband.iSizeConsumed == 0 &&
+          pcm_store_retry_sideband.iSizeProduced == 0 &&
+          pcm_store_retry_output == (int16_t)0x5555 && pcm_store_stats.decodes == 1 &&
+          pcm_store_stats.invalidations == 1 && pcm_store_stats.creates == 1,
+          "failed PCM store terminalizes before the same-batch retry");
+    CHECK(instance_destroy(context, pcm_store_instance, 0, 0, 0, 0) == 0,
+          "PCM-store MP3 instance destroys normally");
+    CHECK(ajm::install_ffmpeg_decoder_backend(),
+          "FFmpeg AJM backend reinstalls after custom-backend fixtures");
 
     // The FFmpeg seam currently implements only AJM's signed-16 output encoding. An S32 instance
     // must fail truthfully in the sideband and leave the guest output untouched; reporting success
