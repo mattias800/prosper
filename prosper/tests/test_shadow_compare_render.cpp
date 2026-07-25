@@ -125,6 +125,67 @@ int main() {
         }
     }
 
+    // #1400: the software PCF footprint must use the decoded S# address modes instead of silently
+    // clamping every tap. Keep literal coordinates so each mode has an unambiguous result that the
+    // old clamp-only lowering cannot produce.
+    std::vector<uint8_t> all_pass(8 * 8 * 4);
+    std::vector<uint8_t> vertical(8 * 8 * 4);
+    for (uint32_t y = 0; y < 8; y++) for (uint32_t x = 0; x < 8; x++) {
+        uint8_t* a = &all_pass[(y * 8 + x) * 4];
+        a[0] = a[1] = a[2] = 0; a[3] = 255;
+        uint8_t* v = &vertical[(y * 8 + x) * 4];
+        v[0] = y < 4 ? 0 : 230; v[1] = v[2] = 0; v[3] = 255;
+    }
+    const uint32_t ps_addressed_pcf[] = {
+        0x7e0202f0u,                                          // v1 = 0.5 DREF
+        0x7e0402ffu, 0x00000000u,                             // v2 = literal u (patched below)
+        0x7e0602ffu, 0x00000000u,                             // v3 = literal v (patched below)
+        0xf0bc0108u, 0x00820401u,                             // image_sample_c_lz v4, v[1:3], s8, s16
+        0xf800080fu, 0x07060504u,                             // exp mrt0 v4..v7
+        0xbf810000u,
+    };
+    auto addressed_pcf = [&](uint32_t u, uint32_t v, uint32_t addr_u, uint32_t addr_v,
+                              uint32_t border_type, const uint8_t* pixels) -> int {
+        std::vector<uint32_t> shader(
+            ps_addressed_pcf,
+            ps_addressed_pcf + sizeof(ps_addressed_pcf) / sizeof(ps_addressed_pcf[0]));
+        shader[2] = u; shader[4] = v;
+        ShaderResourceTable addressed_rt = linear_rt;
+        addressed_rt.resources[0].addr_uvw[0] = addr_u;
+        addressed_rt.resources[0].addr_uvw[1] = addr_v;
+        addressed_rt.resources[0].border_color_type = border_type;
+        std::vector<uint32_t> addressed_frag = recompile_fragment(
+            shader.data(), shader.size(), &addressed_rt);
+        if (addressed_frag.empty()) return -1;
+        prosper::test::FrameResource resource = nearest_tex;
+        resource.tex_rgba = pixels;
+        resource.mag_filter = resource.min_filter = 1;
+        resource.addr_uvw[0] = addr_u; resource.addr_uvw[1] = addr_v;
+        resource.border_color_type = border_type;
+        std::vector<prosper::test::FrameResource> resources{resource};
+        std::vector<uint8_t> result = prosper::test::render_triangle_rgba(
+            vert, addressed_frag, W, H, nullptr, nullptr, nullptr, nullptr, &resources);
+        if (result.size() != (size_t)W * H * 4) return -1;
+        return result[(((size_t)H / 2 * W + W / 2) * 4)];
+    };
+    constexpr uint32_t ZERO = 0x00000000u, HALF = 0x3f000000u;
+    const int clamp_u = addressed_pcf(ZERO, HALF, 2, 2, 0, tex.data());
+    const int repeat_u = addressed_pcf(ZERO, HALF, 0, 2, 0, tex.data());
+    const int mirror_u = addressed_pcf(0x3fe00000u /*1.75*/, HALF, 1, 2, 0, tex.data());
+    const int border_u = addressed_pcf(ZERO, HALF, 6, 2, 2, all_pass.data());
+    const int repeat_v = addressed_pcf(HALF, ZERO, 2, 0, 0, vertical.data());
+    printf("  PCF address modes clampU=%d repeatU=%d mirrorU=%d borderU=%d repeatV=%d\n",
+           clamp_u, repeat_u, mirror_u, border_u, repeat_v);
+    CHECK(clamp_u >= 254, "LINEAR PCF clamp-to-edge repeats the passing edge texel");
+    CHECK(repeat_u >= 127 && repeat_u <= 128,
+          "LINEAR PCF U repeat wraps one footprint tap to the failing edge (#1400)");
+    CHECK(mirror_u >= 254,
+          "LINEAR PCF U mirror reflects 1.75 onto the passing half (#1400)");
+    CHECK(border_u >= 127 && border_u <= 128,
+          "LINEAR PCF U border compares an opaque-white border tap independently (#1400)");
+    CHECK(repeat_v >= 127 && repeat_v <= 128,
+          "LINEAR PCF V repeat wraps one footprint tap to the failing edge (#1400)");
+
     // #1308: sampled-depth bridge recency tracks writers, not mere depth attachment users.
     CHECK(!prosper::test::persistent_ds_pass_may_write_depth(
               false, true, false, VK_COMPARE_OP_ALWAYS),

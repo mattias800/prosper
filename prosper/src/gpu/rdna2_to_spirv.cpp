@@ -36,7 +36,7 @@ enum : uint32_t {
     Op_ConvertFToU=109, Op_ConvertFToS=110, Op_ConvertSToF=111, Op_ConvertUToF=112, Op_Bitcast=124,
     Op_CompositeConstruct=80, Op_CompositeExtract=81, Op_IAdd=128, Op_FAdd=129, Op_ISub=130, Op_FSub=131, Op_IMul=132, Op_FMul=133,
     Op_UMulExtended=151, Op_SMulExtended=152,   // {lo,hi} struct results (for mul_hi)
-    Op_FDiv=136, Op_IEqual=170, Op_INotEqual=171, Op_UGreaterThan=172, Op_SGreaterThan=173,
+    Op_FDiv=136, Op_SMod=139, Op_IEqual=170, Op_INotEqual=171, Op_UGreaterThan=172, Op_SGreaterThan=173,
     Op_UGreaterThanEqual=174, Op_SGreaterThanEqual=175, Op_ULessThan=176, Op_SLessThan=177,
     Op_ULessThanEqual=178, Op_SLessThanEqual=179,
     Op_ShiftRightLogical=194, Op_ShiftRightArithmetic=195, Op_ShiftLeftLogical=196, Op_BitwiseOr=197,
@@ -913,7 +913,8 @@ struct SpirvCompute {
     // Prince renders visually-correct shadows with it — the live A/B on #1271).
     void image_sample_dref_manual_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
                                      uint32_t dref_bits, uint32_t compare_func,
-                                     bool linear_filter, uint32_t out[4]) {
+                                     bool linear_filter, uint32_t addr_u, uint32_t addr_v,
+                                     uint32_t border_color_type, uint32_t out[4]) {
         uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
         if (linear_filter) {
             if (!declared_image_query) {
@@ -927,24 +928,54 @@ struct SpirvCompute {
             const uint32_t w = i2u(w_i), h = i2u(h_i);
 
             // Normalized linear filtering addresses texel centers at n + 0.5. Convert to that
-            // footprint, then clamp both taps independently to reproduce clamp-to-edge.
+            // footprint, then address each tap with the decoded S#. Match the backend's current
+            // Gen5 contract (#1400): 0=repeat, 1=mirrored repeat, 2..5=clamp-to-edge, 6..7=border.
+            // The finer mirror-once/half-border distinctions in 3..5 remain deliberately folded by
+            // both paths until the shared sampler decoder grows them.
             const uint32_t half = bcu(fconstf(0.5f));
             const uint32_t x = fbin(Op_FSub, fbin(Op_FMul, u_bits, cvt_i2f(w)), half);
             const uint32_t y = fbin(Op_FSub, fbin(Op_FMul, v_bits, cvt_i2f(h)), half);
             const uint32_t fx = fext1(Glsl_Fract, x), fy = fext1(Glsl_Fract, y);
             const uint32_t bx = cvt_f2i(fext1(Glsl_Floor, x));
             const uint32_t by = cvt_f2i(fext1(Glsl_Floor, y));
-            const uint32_t max_x = sbin(Op_ISub, w, uconst(1));
-            const uint32_t max_y = sbin(Op_ISub, h, uconst(1));
-            auto clamp_coord = [&](uint32_t value, uint32_t maximum) {
+            auto address_coord = [&](uint32_t value, uint32_t extent, uint32_t mode,
+                                     uint32_t& outside_border) {
+                outside_border = bfalse();
+                if (mode == 0u) return sbin(Op_SMod, value, extent);
+                if (mode == 1u) {
+                    const uint32_t period = sbin(Op_IMul, extent, uconst(2));
+                    const uint32_t wrapped = sbin(Op_SMod, value, period);
+                    const uint32_t reflected = sbin(
+                        Op_ISub, sbin(Op_ISub, period, uconst(1)), wrapped);
+                    return sel(scmp(Op_SGreaterThanEqual, wrapped, extent), reflected, wrapped);
+                }
+                const uint32_t maximum = sbin(Op_ISub, extent, uconst(1));
+                if (mode >= 6u) {
+                    outside_border = lor(scmp(Op_SLessThan, value, uconst(0)),
+                                         scmp(Op_SGreaterThanEqual, value, extent));
+                }
                 return sext2(Glsl_SMin, sext2(Glsl_SMax, value, uconst(0)), maximum);
             };
-            const uint32_t x0 = clamp_coord(bx, max_x);
-            const uint32_t y0 = clamp_coord(by, max_y);
-            const uint32_t x1 = clamp_coord(sbin(Op_IAdd, bx, uconst(1)), max_x);
-            const uint32_t y1 = clamp_coord(sbin(Op_IAdd, by, uconst(1)), max_y);
+            uint32_t x0_border, x1_border, y0_border, y1_border;
+            const uint32_t x0 = address_coord(bx, w, addr_u, x0_border);
+            const uint32_t y0 = address_coord(by, h, addr_v, y0_border);
+            const uint32_t x1 = address_coord(
+                sbin(Op_IAdd, bx, uconst(1)), w, addr_u, x1_border);
+            const uint32_t y1 = address_coord(
+                sbin(Op_IAdd, by, uconst(1)), h, addr_v, y1_border);
 
-            auto compare_fetch = [&](uint32_t tx, uint32_t ty) {
+            const bool uses_border = addr_u >= 6u || addr_v >= 6u;
+            uint32_t border_compare = 0;
+            if (uses_border) {
+                // The sampled depth is R: transparent/opaque black and unsupported custom-register
+                // border colors all contribute 0, while opaque white contributes 1. This mirrors the
+                // backend sampler's custom-border fallback.
+                const float border_depth = border_color_type == 2u ? 1.0f : 0.0f;
+                border_compare = image_dref_compare_bits(
+                    fconstf(border_depth), dref_bits, compare_func);
+            }
+
+            auto compare_fetch = [&](uint32_t tx, uint32_t ty, uint32_t outside_border) {
                 uint32_t coord = id();
                 put(code, Op_CompositeConstruct, {t_v2u(), coord, tx, ty});
                 uint32_t texel = id();
@@ -952,12 +983,17 @@ struct SpirvCompute {
                     {t_v4f, texel, img, coord, ImgOp_Lod, uconst(0)});
                 uint32_t depth = id();
                 put(code, Op_CompositeExtract, {t_f32, depth, texel, 0});
-                return image_dref_compare_bits(depth, dref_bits, compare_func);
+                const uint32_t fetched = image_dref_compare_bits(
+                    depth, dref_bits, compare_func);
+                return uses_border ? sel(outside_border, border_compare, fetched) : fetched;
             };
-            const uint32_t c00 = compare_fetch(x0, y0);
-            const uint32_t c10 = compare_fetch(x1, y0);
-            const uint32_t c01 = compare_fetch(x0, y1);
-            const uint32_t c11 = compare_fetch(x1, y1);
+            auto tap_border = [&](uint32_t x_border, uint32_t y_border) {
+                return uses_border ? lor(x_border, y_border) : bfalse();
+            };
+            const uint32_t c00 = compare_fetch(x0, y0, tap_border(x0_border, y0_border));
+            const uint32_t c10 = compare_fetch(x1, y0, tap_border(x1_border, y0_border));
+            const uint32_t c01 = compare_fetch(x0, y1, tap_border(x0_border, y1_border));
+            const uint32_t c11 = compare_fetch(x1, y1, tap_border(x1_border, y1_border));
             auto lerp = [&](uint32_t a, uint32_t b, uint32_t t) {
                 return fbin(Op_FAdd, a, fbin(Op_FMul, fbin(Op_FSub, b, a), t));
             };
@@ -6329,7 +6365,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     b.declare_texture(res->binding, Dim_2D, false);
                     b.image_sample_dref_manual_2d(res->binding, vread(cvg(1)), vread(cvg(2)),
                                                   vread(cvg(0)), res->depth_compare_func,
-                                                  res->mag_filter != 0u, out);
+                                                  res->mag_filter != 0u, res->addr_uvw[0],
+                                                  res->addr_uvw[1], res->border_color_type, out);
                 } else { ok = false; return true; }
             } else if (is_gather_lz || is_gather_lz_o) {
                 // gather4 dmask selects ONE channel (must be a single bit); the result is always the
