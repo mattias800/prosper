@@ -9,6 +9,7 @@
 #include "../src/hle/ime_input.hpp"
 #include <cstdio>
 #include <cstdint>
+#include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -22,15 +23,15 @@ static int fails = 0;
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
 // Fake guest handler: records each delivered event's id + keycode.
-struct Rec { uint32_t id; uint16_t keycode; };
+struct Rec { uint64_t arg; uint32_t id; uint16_t keycode; };
 static std::vector<Rec> g_rec;
 using UpdateFn = uint64_t (*)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
 static UpdateFn g_update = nullptr;
 static uint64_t g_handler_addr = 0;
 static bool g_reenter_on_space_up = false;
-static void fake_handler(uint64_t /*arg*/, void* ev) {
+static void fake_handler(uint64_t arg, void* ev) {
     auto* e = (uint8_t*)ev;
-    const Rec rec{*(uint32_t*)(e + 0x00), *(uint16_t*)(e + 0x08)};
+    const Rec rec{arg, *(uint32_t*)(e + 0x00), *(uint16_t*)(e + 0x08)};
     g_rec.push_back(rec);
     if (g_reenter_on_space_up && rec.id == 0x102 && rec.keycode == 0x2c) {
         g_reenter_on_space_up = false;
@@ -50,10 +51,25 @@ int main() {
     setenv("PROSPER_IME_SCRIPT", script_source.c_str(), 1);
 #endif
     register_builtin_hle();
+    auto open = Hle::lookup("eaFXjfJv3xs");
+    auto close = Hle::lookup("PMVehSlfZ94");
     auto update = reinterpret_cast<UpdateFn>(Hle::lookup(nid_hash("sceImeUpdate")));
+    CHECK(open != nullptr, "sceImeKeyboardOpen registered");
+    CHECK(close != nullptr, "sceImeKeyboardClose registered");
     CHECK(update != nullptr, "sceImeUpdate registered");
-    if (!update) { printf("fails=%d\n", fails); return 1; }
+    if (!open || !close || !update) { printf("fails=%d\n", fails); return 1; }
     const uint64_t H = (uint64_t)(uintptr_t)&fake_handler;
+    constexpr uint64_t CallbackArg = 0x123456789abcdef0ull;
+    struct KeyboardParam {
+        uint32_t option;
+        uint32_t reserved1;
+        uint64_t arg;
+        uint64_t handler;
+        uint64_t reserved2;
+    } param{0, 0, CallbackArg, H, 0};
+    static_assert(sizeof(KeyboardParam) == 0x20 && offsetof(KeyboardParam, arg) == 0x08);
+    CHECK(open(1, (uint64_t)(uintptr_t)&param, 0, 0, 0, 0) == 0,
+          "sceImeKeyboardOpen retains the keyboard callback parameters");
     g_update = update;
     g_handler_addr = H;
 
@@ -80,6 +96,8 @@ int main() {
     if (g_rec.size() == 2) {
         CHECK(g_rec[0].id == 0x101 && g_rec[0].keycode == 0x28, "key DOWN -> id 0x101, keycode 0x28");
         CHECK(g_rec[1].id == 0x102 && g_rec[1].keycode == 0x28, "key UP   -> id 0x102, keycode 0x28");
+        CHECK(g_rec[0].arg == CallbackArg && g_rec[1].arg == CallbackArg,
+              "events receive OrbisImeKeyboardParam::arg from KeyboardOpen");
     }
 
     // FIFO order across keys, and the queue drains fully (empty on the next update).
@@ -116,6 +134,15 @@ int main() {
               g_rec[1].id == 0x101 && g_rec[1].keycode == 0x28 &&
               g_rec[2].id == 0x102 && g_rec[2].keycode == 0x28,
           "reentrant IME update preserves release/press/release transition order");
+
+    // Closing the keyboard retires the open-time callback context; a later host event must not retain
+    // a stale title object pointer if the same handler is used before another KeyboardOpen.
+    CHECK(close(1, 0, 0, 0, 0, 0) == 0, "sceImeKeyboardClose succeeds");
+    g_rec.clear();
+    ime_push_key(0x28, true);
+    update(H, 0, 0, 0, 0, 0, 0);
+    CHECK(g_rec.size() == 1 && g_rec[0].arg == 0,
+          "KeyboardClose clears the retained callback argument");
 
     std::error_code remove_error;
     std::filesystem::remove(script_path, remove_error);
