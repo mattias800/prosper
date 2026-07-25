@@ -48,16 +48,14 @@ struct CondSlot {
 };
 std::array<CondSlot, 4096> g_cond_slots;
 constexpr uintptr_t kCondSlotRetiring = UINTPTR_MAX;
-std::atomic<CondWaitFailurePointForTest> g_cond_wait_failure_point{
-    CondWaitFailurePointForTest::None};
-std::atomic<int> g_cond_wait_failure_error{0};
+std::atomic<uint64_t> g_cond_wait_failure{0};
 
 int consume_cond_wait_failure(CondWaitFailurePointForTest point) {
-    CondWaitFailurePointForTest expected = point;
-    if (!g_cond_wait_failure_point.compare_exchange_strong(
-            expected, CondWaitFailurePointForTest::None, std::memory_order_acq_rel))
-        return 0;
-    return g_cond_wait_failure_error.load(std::memory_order_relaxed);
+    uint64_t armed = g_cond_wait_failure.load(std::memory_order_acquire);
+    if ((uint32_t)(armed >> 32) != (uint32_t)point) return 0; // dormant path: no locked RMW
+    if (!g_cond_wait_failure.compare_exchange_strong(
+            armed, 0, std::memory_order_acq_rel)) return 0;
+    return (int)(uint32_t)armed;
 }
 
 CondSlot* cond_slot_for(pthread_cond_t* cond) {
@@ -135,8 +133,8 @@ bool snapshot_wait_slot(const WaitSlot& slot, WaitSlotSnapshot& snapshot) {
 
 #ifdef _WIN32
 void win_set_cond_wait_failure_for_test(CondWaitFailurePointForTest point, int error) {
-    g_cond_wait_failure_error.store(error, std::memory_order_relaxed);
-    g_cond_wait_failure_point.store(point, std::memory_order_release);
+    const uint64_t armed = ((uint64_t)(uint32_t)point << 32) | (uint32_t)error;
+    g_cond_wait_failure.store(armed, std::memory_order_release);
 }
 #endif
 
@@ -171,7 +169,8 @@ void futex_wait_exit(WaitRegistration registration) {
 
 int interruptible_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex,
                             GuestWaitKind kind, uintptr_t source,
-                            CondWaitMutexState* mutex_state) {
+                            CondWaitMutexState* mutex_state,
+                            const CondWaitMutexBookkeeping* bookkeeping) {
     if (mutex_state) *mutex_state = {};
 #ifdef _WIN32
     if (const int injected = consume_cond_wait_failure(
@@ -181,8 +180,11 @@ int interruptible_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex,
     uint32_t expected = slot->sequence.load(std::memory_order_acquire);
     WaitSlot* registration = register_wait(kind, (uintptr_t)&slot->sequence,
                                            source ? source : (uintptr_t)cond);
+    const bool bookkeeping_released = bookkeeping && bookkeeping->release &&
+                                      bookkeeping->release(mutex);
     const int unlock_result = pthread_mutex_unlock(mutex);
     if (unlock_result != 0) {
+        if (bookkeeping_released && bookkeeping->acquire) bookkeeping->acquire(mutex);
         unregister_wait(registration);
         return unlock_result;
     }
@@ -190,24 +192,34 @@ int interruptible_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex,
     dispatch_pending_guest_exception();
     WaitOnAddress((volatile void*)&slot->sequence, &expected, sizeof(expected), INFINITE);
     dispatch_pending_guest_exception();
-    unregister_wait(registration);
     if (const int injected = consume_cond_wait_failure(
-            CondWaitFailurePointForTest::BeforeRelock)) return injected;
+            CondWaitFailurePointForTest::BeforeRelock)) {
+        unregister_wait(registration);
+        return injected;
+    }
     const int lock_result = interruptible_mutex_lock(mutex);
-    if (lock_result == 0 && mutex_state) mutex_state->reacquired = true;
+    if (lock_result == 0) {
+        if (mutex_state) mutex_state->reacquired = true;
+        if (bookkeeping_released && bookkeeping->acquire) bookkeeping->acquire(mutex);
+    }
+    unregister_wait(registration);
     return lock_result;
 #else
     (void)kind;
     (void)source;
+    const bool bookkeeping_released = bookkeeping && bookkeeping->release &&
+                                      bookkeeping->release(mutex);
     const int result = pthread_cond_wait(cond, mutex);
-    if (mutex_state) *mutex_state = {true, true};
+    if (bookkeeping_released && bookkeeping->acquire) bookkeeping->acquire(mutex);
+    if (result == 0 && mutex_state) *mutex_state = {true, true};
     return result;
 #endif
 }
 
 int interruptible_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
                                  const timespec* deadline, GuestWaitKind kind,
-                                 uintptr_t source, CondWaitMutexState* mutex_state) {
+                                 uintptr_t source, CondWaitMutexState* mutex_state,
+                                 const CondWaitMutexBookkeeping* bookkeeping) {
     if (mutex_state) *mutex_state = {};
 #ifdef _WIN32
     if (const int injected = consume_cond_wait_failure(
@@ -217,8 +229,11 @@ int interruptible_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
     uint32_t expected = slot->sequence.load(std::memory_order_acquire);
     WaitSlot* registration = register_wait(kind, (uintptr_t)&slot->sequence,
                                            source ? source : (uintptr_t)cond);
+    const bool bookkeeping_released = bookkeeping && bookkeeping->release &&
+                                      bookkeeping->release(mutex);
     const int unlock_result = pthread_mutex_unlock(mutex);
     if (unlock_result != 0) {
+        if (bookkeeping_released && bookkeeping->acquire) bookkeeping->acquire(mutex);
         unregister_wait(registration);
         return unlock_result;
     }
@@ -238,25 +253,35 @@ int interruptible_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
     const bool signaled = WaitOnAddress((volatile void*)&slot->sequence, &expected,
                                         sizeof(expected), timeout) != FALSE;
     dispatch_pending_guest_exception();
-    unregister_wait(registration);
     if (const int injected = consume_cond_wait_failure(
-            CondWaitFailurePointForTest::BeforeRelock)) return injected;
+            CondWaitFailurePointForTest::BeforeRelock)) {
+        unregister_wait(registration);
+        return injected;
+    }
     const int lock_result = interruptible_mutex_lock(mutex);
+    if (lock_result == 0) {
+        if (mutex_state) mutex_state->reacquired = true;
+        if (bookkeeping_released && bookkeeping->acquire) bookkeeping->acquire(mutex);
+    }
+    unregister_wait(registration);
     if (lock_result != 0) return lock_result;
-    if (mutex_state) mutex_state->reacquired = true;
     return signaled ? 0 : ETIMEDOUT;
 #else
     (void)kind;
     (void)source;
+    const bool bookkeeping_released = bookkeeping && bookkeeping->release &&
+                                      bookkeeping->release(mutex);
     const int result = pthread_cond_timedwait(cond, mutex, deadline);
-    if (mutex_state) *mutex_state = {true, true};
+    if (bookkeeping_released && bookkeeping->acquire) bookkeeping->acquire(mutex);
+    if ((result == 0 || result == ETIMEDOUT) && mutex_state) *mutex_state = {true, true};
     return result;
 #endif
 }
 
 int interruptible_cond_timedwait_relative(pthread_cond_t* cond, pthread_mutex_t* mutex,
                                           const timespec* duration, GuestWaitKind kind,
-                                          uintptr_t source, CondWaitMutexState* mutex_state) {
+                                          uintptr_t source, CondWaitMutexState* mutex_state,
+                                          const CondWaitMutexBookkeeping* bookkeeping) {
     if (mutex_state) *mutex_state = {};
     if (!duration || duration->tv_sec < 0 || duration->tv_nsec < 0 ||
         duration->tv_nsec >= 1000000000L) return EINVAL;
@@ -268,8 +293,11 @@ int interruptible_cond_timedwait_relative(pthread_cond_t* cond, pthread_mutex_t*
     uint32_t expected = slot->sequence.load(std::memory_order_acquire);
     WaitSlot* registration = register_wait(kind, (uintptr_t)&slot->sequence,
                                            source ? source : (uintptr_t)cond);
+    const bool bookkeeping_released = bookkeeping && bookkeeping->release &&
+                                      bookkeeping->release(mutex);
     const int unlock_result = pthread_mutex_unlock(mutex);
     if (unlock_result != 0) {
+        if (bookkeeping_released && bookkeeping->acquire) bookkeeping->acquire(mutex);
         unregister_wait(registration);
         return unlock_result;
     }
@@ -282,18 +310,27 @@ int interruptible_cond_timedwait_relative(pthread_cond_t* cond, pthread_mutex_t*
     const bool signaled = WaitOnAddress((volatile void*)&slot->sequence, &expected,
                                         sizeof(expected), timeout) != FALSE;
     dispatch_pending_guest_exception();
-    unregister_wait(registration);
     if (const int injected = consume_cond_wait_failure(
-            CondWaitFailurePointForTest::BeforeRelock)) return injected;
+            CondWaitFailurePointForTest::BeforeRelock)) {
+        unregister_wait(registration);
+        return injected;
+    }
     const int lock_result = interruptible_mutex_lock(mutex);
+    if (lock_result == 0) {
+        if (mutex_state) mutex_state->reacquired = true;
+        if (bookkeeping_released && bookkeeping->acquire) bookkeeping->acquire(mutex);
+    }
+    unregister_wait(registration);
     if (lock_result != 0) return lock_result;
-    if (mutex_state) mutex_state->reacquired = true;
     return signaled ? 0 : ETIMEDOUT;
 #elif defined(__APPLE__)
     (void)kind;
     (void)source;
+    const bool bookkeeping_released = bookkeeping && bookkeeping->release &&
+                                      bookkeeping->release(mutex);
     const int result = pthread_cond_timedwait_relative_np(cond, mutex, duration);
-    if (mutex_state) *mutex_state = {true, true};
+    if (bookkeeping_released && bookkeeping->acquire) bookkeeping->acquire(mutex);
+    if ((result == 0 || result == ETIMEDOUT) && mutex_state) *mutex_state = {true, true};
     return result;
 #else
     (void)kind;
@@ -306,8 +343,11 @@ int interruptible_cond_timedwait_relative(pthread_cond_t* cond, pthread_mutex_t*
         ++deadline.tv_sec;
         deadline.tv_nsec -= 1000000000L;
     }
+    const bool bookkeeping_released = bookkeeping && bookkeeping->release &&
+                                      bookkeeping->release(mutex);
     const int result = pthread_cond_clockwait(cond, mutex, CLOCK_MONOTONIC, &deadline);
-    if (mutex_state) *mutex_state = {true, true};
+    if (bookkeeping_released && bookkeeping->acquire) bookkeeping->acquire(mutex);
+    if ((result == 0 || result == ETIMEDOUT) && mutex_state) *mutex_state = {true, true};
     return result;
 #endif
 }

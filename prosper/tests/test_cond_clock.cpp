@@ -202,6 +202,19 @@ int main() {
     CHECK(mutex_unlock(U(&sce_mutex), 0, 0, 0, 0, 0) == 0,
           "Sony timed wait reacquires the mutex before returning");
 #ifdef _WIN32
+    // Calling a condition wait without owning its ERRORCHECK mutex makes the host unlock fail with
+    // EPERM. The bookkeeping transaction must not publish this non-owner as the mutex owner.
+    CHECK(!win_guest_mutex_owned_by_current_thread_for_test(sce_mutex),
+          "unlocked mutex has no current-thread owner before invalid wait");
+    CHECK(sce_cond_timedwait(U(&sce_cond), U(&sce_mutex), 1'000, 0, 0, 0) == EPERM,
+          "condition wait by a mutex non-owner returns EPERM");
+    CHECK(!win_guest_mutex_owned_by_current_thread_for_test(sce_mutex),
+          "failed non-owner unlock does not invent guest mutex ownership");
+    CHECK(mutex_lock(U(&sce_mutex), 0, 0, 0, 0, 0) == 0,
+          "mutex remains acquirable after non-owner condition wait");
+    CHECK(mutex_unlock(U(&sce_mutex), 0, 0, 0, 0, 0) == 0,
+          "mutex unlocks after non-owner wait recovery");
+
     // Conversely, an error at the relock boundary follows a successful host unlock. Bookkeeping
     // must remain released so a later HLE lock can acquire the genuinely unowned mutex.
     CHECK(mutex_lock(U(&sce_mutex), 0, 0, 0, 0, 0) == 0,

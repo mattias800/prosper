@@ -25,6 +25,14 @@ struct CondWaitMutexState {
     bool reacquired = false;
 };
 
+// Optional ownership-map transaction paired with the helper's explicit host unlock/relock. The
+// release callback reports whether it actually removed bookkeeping, so an unlock error cannot
+// invent ownership for a caller that did not own the mutex.
+struct CondWaitMutexBookkeeping {
+    bool (*release)(pthread_mutex_t*) = nullptr;
+    void (*acquire)(pthread_mutex_t*) = nullptr;
+};
+
 // Bracket a blocking guest futex wait: enter before FUTEX_WAIT, exit after it returns. Lets
 // wake_label_waiters skip its wake syscalls entirely while no thread is blocked.
 using WaitRegistration = void*;
@@ -36,19 +44,22 @@ void futex_wait_exit(WaitRegistration registration);
 int interruptible_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex,
                             GuestWaitKind kind = GuestWaitKind::ConditionSequence,
                             uintptr_t source = 0,
-                            CondWaitMutexState* mutex_state = nullptr);
+                            CondWaitMutexState* mutex_state = nullptr,
+                            const CondWaitMutexBookkeeping* bookkeeping = nullptr);
 int interruptible_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
                                  const timespec* deadline,
                                  GuestWaitKind kind = GuestWaitKind::ConditionSequence,
                                  uintptr_t source = 0,
-                                 CondWaitMutexState* mutex_state = nullptr);
+                                 CondWaitMutexState* mutex_state = nullptr,
+                                 const CondWaitMutexBookkeeping* bookkeeping = nullptr);
 // Wait for a relative duration measured by a stable host clock. Used when a guest condition's
 // absolute deadline belongs to a non-realtime clock and must not inherit wall-clock jumps.
 int interruptible_cond_timedwait_relative(pthread_cond_t* cond, pthread_mutex_t* mutex,
                                           const timespec* duration,
                                           GuestWaitKind kind = GuestWaitKind::ConditionSequence,
                                           uintptr_t source = 0,
-                                          CondWaitMutexState* mutex_state = nullptr);
+                                          CondWaitMutexState* mutex_state = nullptr,
+                                          const CondWaitMutexBookkeeping* bookkeeping = nullptr);
 int interruptible_cond_signal(pthread_cond_t* cond);
 int interruptible_cond_broadcast(pthread_cond_t* cond);
 // Release the Windows WaitOnAddress registry entry after a condition variable is destroyed.
