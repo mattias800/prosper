@@ -234,7 +234,10 @@ int main() {
                                           (uint64_t)(uintptr_t)&awb_error, 0, 0);
             CHECK(awb_rc == 0 && awb_id >= 1 && awb_error == 0,
                   "APR content-root fallback resolves /app0/sound through /app0/raw/sound");
-            CHECK(prosper_apr_path_for_id(awb_id) == awb.string(),
+            std::error_code awb_path_error;
+            const bool same_awb = fs::equivalent(
+                fs::path(prosper_apr_path_for_id(awb_id)), awb, awb_path_error);
+            CHECK(!awb_path_error && same_awb,
                   "APR content-root fallback registers the real raw-content path");
             set_app0_root(".");
             fs::remove(awb);

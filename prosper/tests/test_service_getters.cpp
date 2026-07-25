@@ -189,7 +189,7 @@ int main() {
             CHECK(init((uint64_t)(uintptr_t)&attr, 0, 0, 0, 0, 0) == 0 && attr,
                   "pthread attributes initialize before setting guard size");
             CHECK(guard((uint64_t)(uintptr_t)&attr, 0x4000, 0, 0, 0, 0) == 0,
-                  "scePthreadAttrSetguardsize accepts and stores a valid guard size");
+                  "scePthreadAttrSetguardsize accepts a valid guard size");
             destroy((uint64_t)(uintptr_t)&attr, 0, 0, 0, 0, 0);
         }
     }

@@ -858,8 +858,17 @@ HLE(k_attr_setstack) {
 HLE(k_attr_setguardsize) {
     if (!a0 || !*(void**)(uintptr_t)a0) return 0x16;   // SCE_KERNEL_ERROR_EINVAL
     auto* at = (GuestPthreadAttr*)*(void**)(uintptr_t)a0;
+#ifdef _WIN32
+    // winpthreads returns EINVAL for guard sizes it cannot apply to a CreateThread-owned stack.
+    // Windows already supplies the host stack's guard page, while an explicitly supplied guest
+    // stack is switched in the trampoline and retains the guest mapping's own protection. Accept
+    // the valid guest attribute without claiming winpthreads can reshape either backing stack.
+    (void)at; (void)a1;
+    return 0;
+#else
     int rc = pthread_attr_setguardsize(&at->host, (size_t)a1);
     return (uint64_t)(unsigned)rc;
+#endif
 }
 HLE(k_attr_noop)        { return 0; }
 
