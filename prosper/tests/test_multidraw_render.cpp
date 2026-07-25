@@ -799,6 +799,38 @@ int main() {
               "an inert clear cannot phantom-initialize a never-written plane (#1361)");
     }
 
+    // #1334: copy_persistent_color_target — the MSAA-resolve GPU copy. Render red into
+    // persistent identity A (GPU-resident, no readback), copy A -> B on the device, and read B
+    // back: the destination-keyed image must hold the source pixels (previously the resolve only
+    // shared CPU pixels while the destination image stayed stale-but-valid; after a #780 CPU-copy
+    // discard, consumers imported black — Blue Prince's compute tonemap, #1287/#1381).
+    {
+        prosper::test::BackendDraw rd; rd.vs = vs; rd.fs = red; rd.ps = &opaque; rd.vcount = 3;
+        prosper::test::BackendColorTarget src_target{0x1334000000000001ull, false, false};
+        const std::vector<uint8_t> gpu_only = prosper::test::render_draws_rgba(
+            {rd}, W, H, nullptr, nullptr, false, &src_target);
+        CHECK(gpu_only.empty(), "resolve-copy source rendered GPU-resident (no readback)");
+        std::string copy_err;
+        CHECK(prosper::test::copy_persistent_color_target(
+                  0x1334000000000001ull, 0x1334000000000002ull, W, H,
+                  VK_FORMAT_R8G8B8A8_UNORM, copy_err),
+              "GPU-side persistent color copy succeeds");
+        std::vector<uint8_t> copied; std::string read_err;
+        CHECK(prosper::test::readback_persistent_color_target(
+                  0x1334000000000002ull, W, H, VK_FORMAT_R8G8B8A8_UNORM, copied, read_err) &&
+                  copied.size() == (size_t)W * H * 4,
+              "copy destination reads back");
+        const uint8_t* cc = copied.size() == (size_t)W * H * 4
+            ? &copied[((size_t)(H / 2) * W + W / 2) * 4] : nullptr;
+        CHECK(cc && cc[0] > 0xC0 && cc[1] < 0x40,
+              "destination holds the source pixels (RED) after the copy (#1334)");
+        std::string missing_err;
+        CHECK(!prosper::test::copy_persistent_color_target(
+                  0x1334000000000003ull, 0x1334000000000004ull, W, H,
+                  VK_FORMAT_R8G8B8A8_UNORM, missing_err),
+              "a missing source declines the copy");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

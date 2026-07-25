@@ -1853,6 +1853,161 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
     return true;
 }
 
+// #1334: GPU-side copy of one persistent color target into another identity. The MSAA resolve
+// (CB MODE=RESOLVE) copies color0 -> color1 on hardware; sharing only the CPU pixels left the
+// destination-keyed persistent image stale while its RttSurf inherited gpu_valid=true from the
+// source — after a #780 guest-write CPU-copy discard, consumers (Blue Prince's compute tonemap)
+// imported the stale image and read black, cascading the #1287 display-chain collapse. Copy the
+// device-local pixels so the destination image is genuinely valid. Creates the destination if
+// absent (same shape/usage as the render path; budget-checked WITHOUT eviction — an allocation
+// failure returns false and the caller keeps the CPU pixels as the only truth, fail-visibly).
+inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint32_t width,
+                                         uint32_t height, VkFormat format, std::string& error) {
+    error.clear();
+    format = backend_color_format(format);
+    if (!width || !height || !dst_id || src_id == dst_id) {
+        error = "invalid copy identity"; return false;
+    }
+    PersistentColorTargetImage* src = find_persistent_color_target(src_id, width, height, format);
+    if (!src || !src->image || !src->valid || src->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+        error = "source persistent color target is unavailable";
+        return false;
+    }
+    const RenderVkCtx& ctx = render_vk_ctx();
+    if (!ctx.ok) { error = "Vulkan renderer is unavailable"; return false; }
+    src->last_use = ++persistent_color_target_generation();
+
+    PersistentColorTargetKey dst_key{dst_id, width, height, format};
+    auto [dst_it, dst_inserted] = persistent_color_target_cache().try_emplace(dst_key);
+    PersistentColorTargetImage* dst = &dst_it->second;
+    dst->last_use = ++persistent_color_target_generation();
+    if (!dst->image) {
+        VkImageCreateInfo imgci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        imgci.imageType = VK_IMAGE_TYPE_2D; imgci.format = format;
+        imgci.extent = {width, height, 1};
+        imgci.mipLevels = 1; imgci.arrayLayers = 1; imgci.samples = VK_SAMPLE_COUNT_1_BIT;
+        imgci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imgci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        VkImage img = VK_NULL_HANDLE;
+        if (vkCreateImage(ctx.dev, &imgci, nullptr, &img) != VK_SUCCESS || !img) {
+            persistent_color_target_cache().erase(dst_key);
+            error = "cannot create resolve destination image";
+            return false;
+        }
+        VkMemoryRequirements ir{}; vkGetImageMemoryRequirements(ctx.dev, img, &ir);
+        const VkDeviceSize limit = persistent_color_target_limit();
+        VkDeviceMemory imem = VK_NULL_HANDLE;
+        VkMemoryAllocateInfo iai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        iai.allocationSize = ir.size;
+        iai.memoryTypeIndex = render_memory_type(ctx.phys, ir.memoryTypeBits, 0);
+        if (ir.size > limit || persistent_color_target_bytes() > limit - ir.size ||
+            persistent_color_target_cache().size() > persistent_color_target_count_limit() ||
+            vkAllocateMemory(ctx.dev, &iai, nullptr, &imem) != VK_SUCCESS || !imem) {
+            vkDestroyImage(ctx.dev, img, nullptr);
+            persistent_color_target_cache().erase(dst_key);
+            error = "resolve destination exceeds the persistent target budget";
+            return false;
+        }
+        vkBindImageMemory(ctx.dev, img, imem, 0);
+        VkImageViewCreateInfo ivci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        ivci.image = img; ivci.viewType = VK_IMAGE_VIEW_TYPE_2D; ivci.format = format;
+        ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkImageView view = VK_NULL_HANDLE;
+        vkCreateImageView(ctx.dev, &ivci, nullptr, &view);
+        // Element pointers survive unordered_map rehash; this re-fetch is belt-and-braces only.
+        dst = &persistent_color_target_cache()[dst_key];
+        dst->image = img; dst->memory = imem; dst->view = view;
+        dst->bytes = ir.size;
+        persistent_color_target_bytes() += ir.size;
+        dst->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        src = find_persistent_color_target(src_id, width, height, format);
+        if (!src) { error = "source evicted during destination creation"; return false; }
+    }
+
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    auto cleanup = [&] {
+        if (fence) vkDestroyFence(ctx.dev, fence, nullptr);
+        if (pool) vkDestroyCommandPool(ctx.dev, pool, nullptr);
+    };
+    VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pool_info.queueFamilyIndex = ctx.qfi;
+    // A pre-existing valid destination image is exactly the stale object this helper exists to
+    // replace — on ANY failure past this point it must not stay valid (#1382 review finding 2).
+    auto fail = [&](const char* message) {
+        dst->valid = false;
+        error = message;
+        return false;
+    };
+    if (vkCreateCommandPool(ctx.dev, &pool_info, nullptr, &pool) != VK_SUCCESS)
+        return fail("cannot create resolve copy command pool");
+    VkCommandBufferAllocateInfo command_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    command_info.commandPool = pool;
+    command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    command_info.commandBufferCount = 1;
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkAllocateCommandBuffers(ctx.dev, &command_info, &command) != VK_SUCCESS ||
+        vkBeginCommandBuffer(command, &begin) != VK_SUCCESS) {
+        cleanup(); return fail("cannot begin resolve copy command");
+    }
+    const VkImageLayout src_saved = src->layout;
+    VkImageMemoryBarrier barriers[2]{};
+    for (auto& barrier : barriers) {
+        barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                VK_ACCESS_TRANSFER_WRITE_BIT;
+    }
+    barriers[0].image = src->image;
+    barriers[0].oldLayout = src_saved;
+    barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barriers[1].image = dst->image;
+    barriers[1].oldLayout = dst->layout;
+    barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
+    VkImageCopy region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.extent = {width, height, 1};
+    vkCmdCopyImage(command, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   dst->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barriers[0].newLayout = src_saved;
+    barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barriers[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
+    if (vkEndCommandBuffer(command) != VK_SUCCESS) {
+        cleanup(); return fail("cannot record resolve copy command");
+    }
+    VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (vkCreateFence(ctx.dev, &fence_info, nullptr, &fence) != VK_SUCCESS) {
+        cleanup(); return fail("cannot create resolve copy fence");
+    }
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1; submit.pCommandBuffers = &command;
+    if (render_locked_queue_submit(ctx.queue, 1, &submit, fence) != VK_SUCCESS ||
+        vkWaitForFences(ctx.dev, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+        cleanup(); return fail("resolve copy submission failed");
+    }
+    cleanup();
+    dst->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    dst->valid = true;
+    return true;
+}
+
 inline bool snapshot_persistent_ds_images(std::vector<prosper::gpu::GpuCaptureDsSeed>& seeds,
                                           std::string& error) {
     error.clear(); seeds.clear();
