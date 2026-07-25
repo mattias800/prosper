@@ -462,6 +462,11 @@ int main() {
         };
         CHECK(!recompile_fragment(scalar_chain_ps, std::size(scalar_chain_ps)).empty(),
               "a scalar-fed VOP chain is accepted as a uniform VCC-loop bound");
+        uint32_t varying_chain_ps[std::size(scalar_chain_ps)];
+        std::copy(std::begin(scalar_chain_ps), std::end(scalar_chain_ps), varying_chain_ps);
+        varying_chain_ps[1] = 0x7E020302u;  // v1 = unresolved lane-varying v2 before the same chain
+        CHECK(recompile_fragment(varying_chain_ps, std::size(varying_chain_ps)).empty(),
+              "a lane-varying input remains rejected through the VOP chain");
 
         uint32_t varying_ps[sizeof(ps)/sizeof(ps[0])];
         std::copy(std::begin(ps), std::end(ps), varying_ps);
