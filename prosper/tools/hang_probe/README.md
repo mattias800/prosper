@@ -18,9 +18,14 @@ For each run it launches the title headless via `boot_trace` (with the gated `PR
 - **BLOCKED** — the top HLE frame is a kernel wait (`k_sema_wait` / `k_eq_wait` / `k_cond_wait` /
   `k_ef_wait` / `k_usleep`). On a BLOCKED run it prints Thread 1's stack as evidence.
 - **RUNNING** — an active render/submit frame (`execute_ordered` / `agc_driver_submit` /
-  `run_command_buffer` / `present` / `SubmitDcb`).
+  `run_command_buffer` / `present` / `SubmitDcb`), or a non-blocking selected native frame. The
+  latter matters because a healthy main thread may be executing in Prosper, libc, the Vulkan driver,
+  or guest code while re-sectioning leaves native `boot_trace` frames unnamed in the backtrace.
+  `guest_bt` emits this frame only after switching to the requested thread; the unrelated frame gdb
+  prints when it first attaches is deliberately ignored.
 - **UNKNOWN** — `guest_bt` timed out/failed, or returned no recognized running/wait frame; the run
-  produced no trustworthy hang verdict.
+  produced no trustworthy hang verdict. When available, the selected native stop frame is printed
+  as evidence for refining the classifier.
 - **DEAD** — `boot_trace` exited before the configured sample time, so no live thread could be
   classified.
 

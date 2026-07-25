@@ -9,7 +9,7 @@ automates the run -> wait -> gdb/guest_bt classify -> repeat loop that is otherw
 For each run it launches the title headless through boot_trace, waits, then attaches guest_bt to the
 main thread (Thread 1) and classifies it:
   * BLOCKED (hung) - the top HLE frame is a kernel wait (k_sema_wait / k_eq_wait / k_cond_wait / k_ef_wait)
-  * RUNNING        - an active render/submit frame (execute_ordered / present / agc_driver_submit / run_command)
+  * RUNNING        - an active render/submit frame or a non-blocking selected native frame
 Plain gdb cannot unwind the guest main thread through the HLE stub boundary, so guest_bt is required (it
 re-sections the flattened module ELFs). On a BLOCKED run the tool prints Thread 1's stack as evidence.
 
@@ -25,17 +25,50 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WAIT_FRAMES = ("k_sema_wait", "k_eq_wait", "k_cond_wait", "k_ef_wait", "k_usleep")
 RUN_FRAMES  = ("execute_ordered", "execute_submit", "agc_driver_submit", "run_command_buffer",
                "present", "SubmitDcb", "run_command")
+NATIVE_STOP_FRAME = re.compile(r"^guest-bt-native: (0x[0-9a-f]+ in .+)$", re.MULTILINE)
+NATIVE_BLOCK_FUNCTION = re.compile(
+    r"^(?:syscall_cancel_arch|futex_(?:(?:abstimed_)?wait(?:_(?:common|cancelable))?(?:64)?|wait_simple)|"
+    r"pthread_cond_(?:wait|timedwait|clockwait)|pthread_mutex_(?:lock|timedlock|clocklock)(?:_full)?|"
+    r"pthread_rwlock_(?:rdlock|wrlock|timedrdlock|timedwrlock|clockrdlock|clockwrlock)|"
+    r"sem_(?:wait|timedwait|clockwait)|clock_nanosleep(?:_time64)?|nanosleep|poll|ppoll|"
+    r"select(?:64)?|epoll_(?:wait|pwait|pwait2)|kevent(?:64)?)$")
+
+
+def native_function(frame: str):
+    """Return a normalized function name from a guest-bt-native evidence line."""
+    name = frame.partition(" in ")[2].split("(", 1)[0].split("@", 1)[0].strip()
+    if name.startswith("__GI_"):
+        name = name[len("__GI_"):]
+    return name.lstrip("_")
 
 
 def classify(gbt_text: str):
     """Return ('BLOCKED'|'RUNNING'|'UNKNOWN', top_frame_str) for the main thread's stack."""
-    if any(f in gbt_text for f in RUN_FRAMES):
-        m = next((l for l in gbt_text.splitlines() if any(f in l for f in RUN_FRAMES)), "")
-        return "RUNNING", m.strip()
-    if any(f in gbt_text for f in WAIT_FRAMES):
-        m = next((l for l in gbt_text.splitlines() if any(f in l for f in WAIT_FRAMES)), "")
+    native_match = NATIVE_STOP_FRAME.search(gbt_text)
+    # gdb prints the thread it happened to stop on before the guest-bt command switches threads.
+    # Once the selected-thread marker exists, no frame before it is classification evidence.
+    selected_text = gbt_text[native_match.start():] if native_match else gbt_text
+    # A guest kernel wait is decisive even when a lower frame happens to contain a render symbol.
+    # The EOP deadlock this probe targets has exactly that shape: the main thread is in k_sema_wait.
+    if any(f in selected_text for f in WAIT_FRAMES):
+        m = next((l for l in selected_text.splitlines() if any(f in l for f in WAIT_FRAMES)), "")
         return "BLOCKED", m.strip()
-    return "UNKNOWN", ""
+    frame = native_match.group(1).strip() if native_match else ""
+    # A selected thread stopped in a known host wait is inconclusive even if a lower caller happens
+    # to carry an active-render name. Accepting that lower frame would turn a parked thread green.
+    if frame and NATIVE_BLOCK_FUNCTION.fullmatch(native_function(frame)):
+        return "UNKNOWN", frame
+    if any(f in selected_text for f in RUN_FRAMES):
+        m = next((l for l in selected_text.splitlines() if any(f in l for f in RUN_FRAMES)), "")
+        return "RUNNING", m.strip()
+    # Re-sectioning guest modules leaves native boot_trace frames unnamed in the backtrace, but gdb
+    # prints the selected thread's current frame immediately before it. A non-blocking current frame
+    # means Thread 1 is executing: observed healthy Evergate samples include Prosper render helpers,
+    # libc allocation/string work, the Vulkan driver, and unsymbolicated guest PCs. Known host waits
+    # remain inconclusive unless guest_bt also found the decisive guest kernel-wait frame above.
+    if frame:
+        return "RUNNING", frame
+    return "UNKNOWN", frame
 
 
 def run_guest_bt(cmd, timeout):
