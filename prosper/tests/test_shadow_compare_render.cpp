@@ -316,6 +316,56 @@ int main() {
               "bridged consumer reads the produced depth (~0.25) from the persistent DS image");
         CHECK(center0[0] == 0, "control without the bridge samples zeros");
 
+        // #1186: Bendy samples its full-resolution scene depth while the same D32S8 surface is
+        // attached for read-only depth testing and writable stencil masking. The original bridge
+        // rejected that same-pass identity as feedback and silently substituted zeros, removing
+        // the deferred-lighting / lens-flare occlusion input. Exercise the harder mixed-layout
+        // case (depth sampled + read-only, stencil writable) end to end.
+        constexpr uint64_t kFeedbackDepth = 0x20d5800000ull;
+        constexpr uint64_t kFeedbackStencil = 0x20d5900000ull;
+        ResolvedPipelineState feedback_producer = producer;
+        feedback_producer.depth_read_base = kFeedbackDepth;
+        feedback_producer.depth_write_base = kFeedbackDepth;
+        feedback_producer.stencil_read_base = kFeedbackStencil;
+        feedback_producer.stencil_write_base = kFeedbackStencil;
+        feedback_producer.stencil_enable = true;
+        feedback_producer.stencil_compare_op[0] = feedback_producer.stencil_compare_op[1] = 7;
+        prosper::test::BackendDraw feedback_pw = pw;
+        feedback_pw.ps = &feedback_producer;
+        std::vector<uint8_t> feedback_produced = prosper::test::render_draws_rgba(
+            {feedback_pw}, W, H, nullptr, nullptr, /*persist_depth_stencil=*/true);
+        CHECK(!feedback_produced.empty(),
+              "depth producer rendered a persistent D32S8 feedback surface");
+
+        ResolvedPipelineState feedback_state{};
+        feedback_state.topology = 3; feedback_state.color_write_mask = 0xF;
+        feedback_state.depth_test_enable = true; feedback_state.depth_write_enable = false;
+        feedback_state.depth_compare_op = 7;   // read-only ALWAYS
+        feedback_state.depth_read_base = kFeedbackDepth;
+        feedback_state.depth_write_base = kFeedbackDepth;
+        feedback_state.stencil_read_base = kFeedbackStencil;
+        feedback_state.stencil_write_base = kFeedbackStencil;
+        feedback_state.stencil_enable = true;
+        feedback_state.stencil_compare_op[0] = feedback_state.stencil_compare_op[1] = 7;
+        feedback_state.stencil_pass_op[0] = feedback_state.stencil_pass_op[1] = 1; // ZERO
+        feedback_state.stencil_write_mask[0] = feedback_state.stencil_write_mask[1] = 0xff;
+        prosper::test::FrameResource feedback_resource = bridged;
+        feedback_resource.persistent_depth_target_id = kFeedbackDepth;
+        prosper::test::BackendDraw feedback_consumer = consumer;
+        feedback_consumer.ps = &feedback_state;
+        feedback_consumer.R = {feedback_resource};
+        std::vector<uint8_t> via_feedback = prosper::test::render_draws_rgba(
+            {feedback_consumer}, W, H, nullptr, nullptr, /*persist_depth_stencil=*/true);
+        CHECK(via_feedback.size() == (size_t)W * H * 4,
+              "same-pass depth-feedback consumer rendered");
+        if (via_feedback.size() == (size_t)W * H * 4) {
+            const uint8_t* feedback_center =
+                &via_feedback[(((size_t)H / 2) * W + W / 2) * 4];
+            printf("  same-pass feedback center R=%u (want ~64)\n", feedback_center[0]);
+            CHECK(feedback_center[0] > 56 && feedback_center[0] < 72,
+                  "same-pass consumer samples attached depth while stencil remains writable (#1186)");
+        }
+
         // ---- #1287: an ineffective clear draw must not shadow the rendered plane ----
         // Blue Prince's light loop: shadow casters render depth into plane P (identity dr=P, dw=0),
         // then a fullscreen rect with DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE set but DB_DEPTH_CONTROL
