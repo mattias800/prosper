@@ -634,6 +634,38 @@ int main() {
         CHECK(run_format_copy(DataFormat::Uint16, 1, 2, s) == s,
               "Uint16x1 storage copy round-trips guest bytes bit-exact (#590)");
     }
+    {   // Unorm16 x1 (fmt=4): normalized conversion preserves every quantized source value
+        std::vector<uint8_t> s(W * 2);
+        for (uint32_t t = 0; t < W; ++t) {
+            const uint16_t value = static_cast<uint16_t>(t * 1040u);
+            std::memcpy(&s[t * 2], &value, sizeof(value));
+        }
+        CHECK(run_format_copy(DataFormat::Unorm16, 1, 2, s) == s,
+              "Unorm16x1 storage copy round-trips normalized guest values");
+    }
+    {   // Snorm8 x1 (fmt=9): -128 and -127 both represent -1 and write back canonically as -127
+        const int8_t values[] = {-128, -127, -96, -64, -1, 0, 1, 63, 96, 127};
+        std::vector<uint8_t> s(W), expected(W);
+        for (uint32_t t = 0; t < W; ++t) {
+            const int8_t value = values[t % std::size(values)];
+            s[t] = static_cast<uint8_t>(value);
+            expected[t] = static_cast<uint8_t>(value == -128 ? -127 : value);
+        }
+        CHECK(run_format_copy(DataFormat::Snorm8, 1, 1, s) == expected,
+              "Snorm8x1 storage copy normalizes and canonicalizes the negative endpoint");
+    }
+    {   // Snorm16 x1 (fmt=5): The Plucky Squire uses this storage surface in its title path
+        const int16_t values[] = {-32768, -32767, -24576, -16384, -1, 0, 1, 16383, 24576, 32767};
+        std::vector<uint8_t> s(W * 2), expected(W * 2);
+        for (uint32_t t = 0; t < W; ++t) {
+            const int16_t value = values[t % std::size(values)];
+            const int16_t canonical = value == -32768 ? -32767 : value;
+            std::memcpy(&s[t * 2], &value, sizeof(value));
+            std::memcpy(&expected[t * 2], &canonical, sizeof(canonical));
+        }
+        CHECK(run_format_copy(DataFormat::Snorm16, 1, 2, s) == expected,
+              "Snorm16x1 storage copy normalizes and canonicalizes the negative endpoint");
+    }
     {   // Unorm2_10_10_10 x4 (fmt=21): packed 10/10/10/2, quantized word stable under unpack->pack
         std::vector<uint8_t> s(W * 4);
         for (uint32_t t = 0; t < W; t++) { uint32_t p = t * 2654435761u; std::memcpy(&s[t * 4], &p, 4); }
