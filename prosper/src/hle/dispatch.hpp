@@ -121,6 +121,8 @@ void register_kernel_time_hle();
 // Windows pthread-key lifecycle probes used by the focused concurrency regression.
 void win_set_key_delete_after_host_hook_for_test(void (*hook)(uint64_t));
 size_t win_key_destructor_thunk_count_for_test();
+// Observe the ERRORCHECK owner map without attempting a potentially blocking same-thread relock.
+bool win_guest_mutex_owned_by_current_thread_for_test(void* mutex);
 #endif
 
 // Preserve the unsigned native-thread identifier used by sync/exception diagnostics. Exposed so
