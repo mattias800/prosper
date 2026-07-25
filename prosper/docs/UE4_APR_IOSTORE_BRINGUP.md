@@ -1217,3 +1217,27 @@ split to (a) **#288 — 64KB tile-mode detiling** (the noise) and (b) **#273 —
 draws). New diagnostic landed: `PROSPER_DUMP_TILERAW` (reusable for the #288 derivation). Messenger
 unaffected (mode 5 only; the diagnostic is gated + additive). CONFIDENCE: HIGH on the reframing (live
 frame + tile-mode histogram + descriptor dumps); the detiler itself is deliberately NOT shipped.
+
+### SOLVED (2026-07-26): cross-SDK AMPR measure compatibility after #1368
+
+The #1368 review changed `sSAUCCU1dv4` from the exact 20-byte
+`sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00` result to a guessed 32-byte upper bound and
+made both AMPR measure calls pure. DOLL then stopped before its first present: the 32-byte return
+changed its command-buffer offsets, and its older SDK wrapper still consumes the two measure calls as
+eager compatibility operations while prosper does not execute the encoded commands.
+
+The shared contract is now explicit:
+
+- `sSAUCCU1dv4` always returns the exact 20-byte command size. A null queue is a pure Sonic sizing
+  query; DOLL's non-null queue/id pair also registers the APR completion source.
+- `vWU-odnS+fU` always returns 20 or 24 according to the file-offset width. An unregistered id is a
+  pure Sonic sizing query; a valid registered APR file id also performs DOLL's range-checked eager
+  read on both Linux and Windows.
+- `4fgtGfXDrFc` retains the independent 32-byte conservative size used by Sonic; A/B testing proved
+  it is not part of DOLL's regression.
+
+Live validation on current master plus the fix: first present at 2 seconds, Square Enix/Unreal/CRIWARE
+logos render, PCM is produced at 48 kHz stereo, the corrected title appears, and scripted Cross input
+advances into the new-game name entry. The same binary with the 32-byte equeue size remains at frame 0
+for at least 20 seconds. Focused tests cover the exact sizes, the pure unregistered query, and the
+registered eager-read discriminator.

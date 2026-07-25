@@ -1,6 +1,6 @@
 // Regression guard for the libSceAmpr command-size NIDs used by Sonic Origins. These functions
-// return byte counts, not status codes: treating MeasureReadFile as a real read returned EINVAL for
-// a sizing-only call, and the guest used 0x80020016 as an allocation size.
+// return byte counts, not status codes. A sizing-only call must remain pure, while DOLL's older SDK
+// wrapper passes a registered APR id and relies on the same entry point to fill its destination.
 #include "../src/hle/dispatch.hpp"
 #include <array>
 #include <cstdint>
@@ -34,8 +34,8 @@ int main() {
               "write-address size does not under-allocate for a wide value");
     }
     if (write_equeue)
-        CHECK(write_equeue(0, 0, 0, 0, 0, 0) == 32,
-              "kernel-equeue command reserves the conservative 32-byte record");
+        CHECK(write_equeue(0, 0, 0, 0, 0, 0) == 20,
+              "kernel-equeue command measures 20 bytes");
     if (read_file) {
         CHECK(read_file(0, 0, UINT32_MAX, 0xffffffffffull, 0, 0) == 24,
               "wide-offset read command measures 24 bytes (never EINVAL)");
@@ -51,14 +51,18 @@ int main() {
             fixture_written = written == fixture.size() && closed;
         }
         prosper_apr_reset_for_test();
-        const uint32_t id = prosper_apr_register(fixture_path, fixture.size());
         std::array<uint8_t, 4> destination = {0xA1, 0xB2, 0xC3, 0xD4};
         const auto before = destination;
+        CHECK(read_file(0, (uint64_t)(uintptr_t)destination.data(), destination.size(),
+                        0, 0, 0) == 20 &&
+                  destination == before,
+              "unregistered read-file measurement is a pure query");
+        const uint32_t id = prosper_apr_register(fixture_path, fixture.size());
         CHECK(fixture_written &&
                   read_file(id, (uint64_t)(uintptr_t)destination.data(), destination.size(),
                             0, 0, 0) == 20 &&
-                  destination == before,
-              "read-file measurement is a pure query and never writes guest memory");
+                  destination == fixture,
+              "registered read-file measurement preserves the DOLL compatibility read");
         prosper_apr_reset_for_test();
         std::remove(fixture_path);
     }

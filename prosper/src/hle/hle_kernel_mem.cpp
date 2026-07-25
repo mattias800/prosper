@@ -1378,12 +1378,11 @@ namespace {
 }
 HLE(k_ampr_measure_write_equeue) { // sSAUCCU1dv4 = sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00
     ampr_arglog("sSAUCCU1dv4(MeasureWriteEqueue)", a0, a1, a2, a3, a4, a5);
-    // The guest uses this only to reserve its command buffer. A 32-byte record is the conservative
-    // firmware-compatible size; returning 20 risks under-allocation before the real builder runs.
-    // Registration belongs to sceAmprAprCommandBufferWriteKernelEventQueue below; keeping it here
-    // would make another pure size query title-visible and platform-dependent.
-    // CONFIDENCE: MED (Sonic allocation flow plus an independent implementation; no hardware trace).
-    return 32;
+    // DOLL's older SDK wrapper passes the live event queue and APR id here while constructing its
+    // listener. Until prosper executes the encoded command itself, preserve that registration as
+    // a compatibility side effect. Sonic's sizing call passes a null queue and remains pure.
+    if (a0) prosper_eq_add_apr(a0, (int64_t)a1);
+    return 20;
 }
 HLE(k_apr_cb_set_equeue) {       // H896Pt-yB4I (cb, eq, id, tag, 0, flags)
     ampr_arglog("H896Pt-yB4I(CbSetEqueue)", a0, a1, a2, a3, a4, a5);
@@ -1439,9 +1438,7 @@ HLE(k_ampr_get_current_offset) {
     return 0;
 }
 // Sonic Origins sums this result with the ReadFile and equeue sizes to reserve each AMPR command
-// buffer. Use the conservative 32-byte firmware-compatible record size; the earlier guessed
-// 8/12/16 encoding could under-allocate. CONFIDENCE: MED (guest allocation flow plus an independent
-// implementation; no hardware trace).
+// buffer. Use the conservative 32-byte firmware-compatible record size.
 HLE(k_ampr_measure_write_address) {
     ampr_arglog("4fgtGfXDrFc(MeasureWriteAddress)", a0, a1, a2, a3, a4, a5);
     return 32;
@@ -4252,7 +4249,7 @@ HLE(k_query_memory_protection) {
 // (PPSA17942, area:ue4) allocator pages remain no-op stubs because that title does not boot on
 // Windows yet. Pure size/offset queries below keep their platform-independent return contracts.
 HLE(k_ampr_ok) { return 0; }
-HLE(k_ampr_measure_write_equeue) { return 32; }
+HLE(k_ampr_measure_write_equeue) { return 20; }
 HLE(k_ampr_get_current_offset) { return 0; }
 HLE(k_ampr_measure_write_address) { return 32; }
 
