@@ -41,19 +41,22 @@ def native_function(frame: str):
 
 def classify(gbt_text: str):
     """Return ('BLOCKED'|'RUNNING'|'UNKNOWN', top_frame_str) for the main thread's stack."""
+    native_match = NATIVE_STOP_FRAME.search(gbt_text)
+    # gdb prints the thread it happened to stop on before the guest-bt command switches threads.
+    # Once the selected-thread marker exists, no frame before it is classification evidence.
+    selected_text = gbt_text[native_match.start():] if native_match else gbt_text
     # A guest kernel wait is decisive even when a lower frame happens to contain a render symbol.
     # The EOP deadlock this probe targets has exactly that shape: the main thread is in k_sema_wait.
-    if any(f in gbt_text for f in WAIT_FRAMES):
-        m = next((l for l in gbt_text.splitlines() if any(f in l for f in WAIT_FRAMES)), "")
+    if any(f in selected_text for f in WAIT_FRAMES):
+        m = next((l for l in selected_text.splitlines() if any(f in l for f in WAIT_FRAMES)), "")
         return "BLOCKED", m.strip()
-    m = NATIVE_STOP_FRAME.search(gbt_text)
-    frame = m.group(1).strip() if m else ""
+    frame = native_match.group(1).strip() if native_match else ""
     # A selected thread stopped in a known host wait is inconclusive even if a lower caller happens
     # to carry an active-render name. Accepting that lower frame would turn a parked thread green.
     if frame and NATIVE_BLOCK_FUNCTION.fullmatch(native_function(frame)):
         return "UNKNOWN", frame
-    if any(f in gbt_text for f in RUN_FRAMES):
-        m = next((l for l in gbt_text.splitlines() if any(f in l for f in RUN_FRAMES)), "")
+    if any(f in selected_text for f in RUN_FRAMES):
+        m = next((l for l in selected_text.splitlines() if any(f in l for f in RUN_FRAMES)), "")
         return "RUNNING", m.strip()
     # Re-sectioning guest modules leaves native boot_trace frames unnamed in the backtrace, but gdb
     # prints the selected thread's current frame immediately before it. A non-blocking current frame

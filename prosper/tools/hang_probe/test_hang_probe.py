@@ -53,7 +53,7 @@ class ClassificationTests(unittest.TestCase):
                          ("RUNNING", frame))
 
     def test_attach_frame_before_thread_switch_is_ignored(self):
-        text = ("0x00007f00 in pthread_cond_wait@@GLIBC_2.3.2 ()\n"
+        text = ("0x00007f00 in prosper::k_sema_wait()\n#1 prosper::gpu::present\n"
                 "guest-bt-native: 0x0000000410f4bb02 in ??\n#0 0x410f4bb02 in ??? ()\n")
         self.assertEqual(HANG_PROBE.classify(text),
                          ("RUNNING", "0x0000000410f4bb02 in ??"))
