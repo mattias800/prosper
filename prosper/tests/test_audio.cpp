@@ -468,7 +468,70 @@ int main() {
     for (uint64_t handle : a2_object_ports)
         CHECK(call("sceAudioOut2PortDestroy", handle) == 0);
 
-    CHECK(call("sceAudioOut2ContextDestroy", a2_context) == 0);
+    // Context and port handles carry a per-slot generation. Destroying a context invalidates its
+    // children, and neither a delayed worker nor a handle from another live context may access a
+    // recycled slot. PortRegister/Unregister also enforce the port's owning context.
+    a2_port_param.type = 0;
+    a2_port_param.data_format = 0x200;
+    uint64_t a2_peer_context = 0;
+    CHECK(call("sceAudioOut2ContextCreate", PTR(a2_context_param), 0, 0,
+               PTR(&a2_peer_context)) == 0);
+    uint64_t a2_owned_port = 0;
+    CHECK(call("sceAudioOut2PortCreate", a2_context, PTR(&a2_port_param),
+               PTR(&a2_owned_port)) == 0);
+    CHECK(call("sceAudioOut2PortRegister", a2_context, a2_owned_port) == 0);
+    CHECK((int32_t)call("sceAudioOut2PortRegister", a2_peer_context, a2_owned_port) ==
+          (int32_t)0x80268001);
+    CHECK((int32_t)call("sceAudioOut2PortUnregister", a2_peer_context, a2_owned_port) ==
+          (int32_t)0x80268001);
+    CHECK(call("sceAudioOut2PortUnregister", a2_context, a2_owned_port) == 0);
+
+    const uint64_t a2_stale_context = a2_context;
+    const uint64_t a2_stale_port = a2_owned_port;
+    CHECK(call("sceAudioOut2ContextDestroy", a2_stale_context) == 0);
+    CHECK((int32_t)call("sceAudioOut2ContextDestroy", a2_stale_context) ==
+          (int32_t)0x80268001);
+    CHECK((int32_t)call("sceAudioOut2ContextAdvance", a2_stale_context) ==
+          (int32_t)0x80268001);
+    CHECK((int32_t)call("sceAudioOut2ContextPush", a2_stale_context, 0) ==
+          (int32_t)0x80268001);
+    CHECK((int32_t)call("sceAudioOut2ContextGetQueueLevel", a2_stale_context, 0, 0) ==
+          (int32_t)0x80268001);
+    CHECK((int32_t)call("sceAudioOut2ContextSetAttributes", a2_stale_context, 0, 0) ==
+          (int32_t)0x80268001);
+    CHECK((int32_t)call("sceAudioOut2ContextBedWrite", a2_stale_context, 0, 0) ==
+          (int32_t)0x80268001);
+    CHECK((int32_t)call("sceAudioOut2PortGetState", a2_stale_port, PTR(&a2_state)) ==
+          (int32_t)0x80268001);
+    CHECK((int32_t)call("sceAudioOut2PortSetAttributes", a2_stale_port, 0, 0) ==
+          (int32_t)0x80268001);
+    CHECK((int32_t)call("sceAudioOut2PortDestroy", a2_stale_port) ==
+          (int32_t)0x80268001);
+
+    uint64_t a2_recycled_context = 0;
+    CHECK(call("sceAudioOut2ContextCreate", PTR(a2_context_param), 0, 0,
+               PTR(&a2_recycled_context)) == 0);
+    CHECK((a2_recycled_context & 0xffffu) == (a2_stale_context & 0xffffu));
+    CHECK(a2_recycled_context != a2_stale_context);
+    uint64_t rejected_child = 0xCCCCCCCCCCCCCCCCull;
+    CHECK((int32_t)call("sceAudioOut2PortCreate", a2_stale_context, PTR(&a2_port_param),
+                        PTR(&rejected_child)) == (int32_t)0x80268001);
+    CHECK(rejected_child == 0xCCCCCCCCCCCCCCCCull);
+
+    uint64_t a2_recycled_port = 0;
+    CHECK(call("sceAudioOut2PortCreate", a2_recycled_context, PTR(&a2_port_param),
+               PTR(&a2_recycled_port)) == 0);
+    CHECK((a2_recycled_port & 0xffffu) == (a2_stale_port & 0xffffu));
+    CHECK(a2_recycled_port != a2_stale_port);
+    CHECK((int32_t)call("sceAudioOut2PortRegister", a2_peer_context, a2_recycled_port) ==
+          (int32_t)0x80268001);
+    CHECK(call("sceAudioOut2PortRegister", a2_recycled_context, a2_recycled_port) == 0);
+    CHECK((int32_t)call("sceAudioOut2PortGetState", a2_stale_port, PTR(&a2_state)) ==
+          (int32_t)0x80268001);
+    CHECK(call("sceAudioOut2PortGetState", a2_recycled_port, PTR(&a2_state)) == 0);
+    CHECK(call("sceAudioOut2PortDestroy", a2_recycled_port) == 0);
+    CHECK(call("sceAudioOut2ContextDestroy", a2_recycled_context) == 0);
+    CHECK(call("sceAudioOut2ContextDestroy", a2_peer_context) == 0);
 
     // --- 12. libSceNgs2 silent lifecycle: sizes, handles, state, and render output -------------
     struct BufferInfo { uint64_t host_buffer, host_buffer_size, reserved[5], user_data; };

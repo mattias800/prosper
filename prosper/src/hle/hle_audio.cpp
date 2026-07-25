@@ -425,7 +425,8 @@ constexpr uint64_t kA2CtxTag  = 0xA2C0000000000000ull;
 constexpr uint64_t kA2UserTag = 0xA2D0000000000000ull;
 constexpr uint64_t kA2PortTag = 0xA2E0000000000000ull;
 constexpr uint64_t kA2SpeakerArrayTag = 0xA2F0000000000000ull;
-constexpr uint64_t kA2PortIndexMask = 0xffffull;
+constexpr uint64_t kA2HandleTagMask = 0xffff000000000000ull;
+constexpr uint64_t kA2HandleIndexMask = 0xffffull;
 constexpr uint32_t kA2MaxPorts = 256;
 // Main-bed port flag bit 1 carries 20 dB of intentional digital headroom for AudioOut2's platform
 // mastering stage.  Restore that reference level at the host boundary; flag-zero ports are already
@@ -435,6 +436,7 @@ constexpr float kA2HeadroomGain = 10.0f;
 
 struct A2Context {
     bool     used = false;
+    uint32_t generation = 0;
     bool     sink_opened = false;
     bool     sink_open_ok = false;
     uint32_t queue_depth = 4;
@@ -457,6 +459,7 @@ uint32_t   g_a2_users = 0;
 // pointer here and mix + forward all ports' grains to the host AudioSink at Push.
 struct A2PortState {
     bool     used = false;
+    uint32_t generation = 0;
     uint64_t context = 0;      // owning context; Push must not submit another context's ports
     uint64_t pcm_ptr = 0;      // guest address of this port's current PCM grain (attr id 0)
     uint16_t type = 0;         // portParam +0x00: 0 = MAIN (speaker output); others aux (personal/...)
@@ -467,6 +470,46 @@ struct A2PortState {
 A2PortState g_a2_port_state[kA2MaxPorts];
 bool g_a2_speaker_arrays[32]{};
 constexpr int kA2SinkPortBase = kMaxPorts + 1; // host-only ports 17..20, one per AudioOut2 context
+
+uint32_t audio2_next_generation(uint32_t generation) {
+    ++generation;
+    return generation ? generation : 1;
+}
+
+uint64_t audio2_make_handle(uint64_t tag, uint32_t generation, uint32_t one_based_index) {
+    return tag | ((uint64_t)generation << 16) | one_based_index;
+}
+
+template <typename Slot>
+void audio2_clear_slot(Slot& slot) {
+    const uint32_t generation = slot.generation;
+    slot = Slot{};
+    slot.generation = generation;
+}
+
+// Callers hold g_a2_mx. Centralizing the full tag/index/generation/live checks prevents a stale
+// handle from aliasing a recycled slot and keeps every implemented AudioOut2 operation consistent.
+A2Context* audio2_context_locked(uint64_t handle, uint32_t* slot_out = nullptr) {
+    const uint32_t one_based_index = (uint32_t)(handle & kA2HandleIndexMask);
+    const uint32_t generation = (uint32_t)(handle >> 16);
+    if ((handle & kA2HandleTagMask) != kA2CtxTag || one_based_index < 1 ||
+        one_based_index > std::size(g_a2_ctx) || !generation) return nullptr;
+    A2Context& context = g_a2_ctx[one_based_index - 1];
+    if (!context.used || context.generation != generation) return nullptr;
+    if (slot_out) *slot_out = one_based_index - 1;
+    return &context;
+}
+
+A2PortState* audio2_port_locked(uint64_t handle, uint32_t* slot_out = nullptr) {
+    const uint32_t one_based_index = (uint32_t)(handle & kA2HandleIndexMask);
+    const uint32_t generation = (uint32_t)(handle >> 16);
+    if ((handle & kA2HandleTagMask) != kA2PortTag || one_based_index < 1 ||
+        one_based_index > kA2MaxPorts || !generation) return nullptr;
+    A2PortState& port = g_a2_port_state[one_based_index - 1];
+    if (!port.used || port.generation != generation) return nullptr;
+    if (slot_out) *slot_out = one_based_index - 1;
+    return &port;
+}
 
 uint32_t audio2_format_channels(uint32_t data_format) {
     const uint32_t encoded = (data_format >> 8u) & 0xffu;
@@ -479,9 +522,9 @@ static void audio2_reset() {
         std::lock_guard<std::mutex> lk(g_a2_mx);
         for (size_t i = 0; i < 4; ++i) {
             close_sink[i] = g_a2_ctx[i].sink_opened;
-            g_a2_ctx[i] = A2Context{};
+            audio2_clear_slot(g_a2_ctx[i]);
         }
-        for (auto& port : g_a2_port_state) port = A2PortState{};
+        for (auto& port : g_a2_port_state) audio2_clear_slot(port);
         std::fill(std::begin(g_a2_speaker_arrays), std::end(g_a2_speaker_arrays), false);
         g_a2_users = 0;
     }
@@ -753,30 +796,35 @@ HLE(audio2_ctx_create) {
     std::lock_guard<std::mutex> lk(g_a2_mx);
     for (int i = 0; i < 4; i++) {
         if (g_a2_ctx[i].used) continue;
+        const uint32_t generation = audio2_next_generation(g_a2_ctx[i].generation);
         g_a2_ctx[i] = A2Context{};
         g_a2_ctx[i].used = true;
+        g_a2_ctx[i].generation = generation;
         g_a2_ctx[i].queue_depth = queue_depth;
         g_a2_ctx[i].grain = grain;
-        if (!a2_store_u64(a3, kA2CtxTag | (uint64_t)(i + 1))) { g_a2_ctx[i].used = false; return kA2ErrInvalidParam; }
+        if (!a2_store_u64(a3, audio2_make_handle(kA2CtxTag, generation, i + 1))) {
+            audio2_clear_slot(g_a2_ctx[i]);
+            return kA2ErrInvalidParam;
+        }
         return 0;
     }
     return kA2ErrInvalidParam;
 }
 HLE(audio2_ctx_destroy) {
     A2LOG("sceAudioOut2ContextDestroy");
-    uint64_t idx = a0 & 0xff;
     bool close_sink = false;
-    if ((a0 & ~0xffull) == kA2CtxTag && idx >= 1 && idx <= 4) {
-        {
-            std::lock_guard<std::mutex> lk(g_a2_mx);
-            close_sink = g_a2_ctx[idx - 1].sink_opened;
-            g_a2_ctx[idx - 1] = A2Context{};
-            for (auto& port : g_a2_port_state)
-                if (port.used && port.context == a0) port = A2PortState{};
-        }
-        if (close_sink)
-            if (AudioSink* sink = audio_sink()) sink->close(kA2SinkPortBase + (int)idx - 1);
+    uint32_t context_slot = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_a2_mx);
+        A2Context* context = audio2_context_locked(a0, &context_slot);
+        if (!context) return kA2ErrInvalidParam;
+        close_sink = context->sink_opened;
+        audio2_clear_slot(*context);
+        for (auto& port : g_a2_port_state)
+            if (port.used && port.context == a0) audio2_clear_slot(port);
     }
+    if (close_sink)
+        if (AudioSink* sink = audio_sink()) sink->close(kA2SinkPortBase + (int)context_slot);
     return 0;
 }
 
@@ -809,12 +857,23 @@ HLE(audio2_port_create) {
         }
     }
     std::lock_guard<std::mutex> lk(g_a2_mx);
+    if (!audio2_context_locked(a0)) return kA2ErrInvalidParam;
     // First-free-slot allocation (not a monotonic counter): slots are recycled on PortDestroy, so a
-    // title that churns ports over a long session can't exhaust the table or alias slot state.
+    // title that churns ports over a long session can't exhaust the table. The generation in each
+    // returned handle keeps an old identity from aliasing the recycled slot.
     for (uint32_t id = 1; id <= kA2MaxPorts; ++id) {
         if (g_a2_port_state[id - 1].used) continue;
-        if (!a2_store_u64(a2, kA2PortTag | (uint64_t)id)) return kA2ErrInvalidParam;
-        g_a2_port_state[id - 1] = A2PortState{true, a0, 0, ptype, data_format, flags};
+        A2PortState& port = g_a2_port_state[id - 1];
+        const uint32_t generation = audio2_next_generation(port.generation);
+        port.generation = generation; // failed out-pointer publication still consumes this identity
+        const uint64_t handle = audio2_make_handle(kA2PortTag, generation, id);
+        if (!a2_store_u64(a2, handle)) return kA2ErrInvalidParam;
+        port.used = true;
+        port.context = a0;
+        port.pcm_ptr = 0;
+        port.type = ptype;
+        port.data_format = data_format;
+        port.flags = flags;
         return 0;
     }
     return kA2ErrPortFull;
@@ -823,11 +882,10 @@ HLE(audio2_port_destroy) {
     A2LOG("sceAudioOut2PortDestroy");
     // Clear the slot so a destroyed port stops being mixed (its guest PCM buffer may be freed and
     // reused) and the slot is reusable by the next PortCreate.
-    const uint64_t pidx = a0 & kA2PortIndexMask;
-    if ((a0 & ~kA2PortIndexMask) == kA2PortTag && pidx >= 1 && pidx <= kA2MaxPorts) {
-        std::lock_guard<std::mutex> lk(g_a2_mx);
-        g_a2_port_state[pidx - 1] = A2PortState{};
-    }
+    std::lock_guard<std::mutex> lk(g_a2_mx);
+    A2PortState* port = audio2_port_locked(a0);
+    if (!port) return kA2ErrInvalidParam;
+    audio2_clear_slot(*port);
     return 0;
 }
 
@@ -844,12 +902,11 @@ HLE(audio2_port_get_state) {
         uint64_t reserved[6];
     } state{};
     static_assert(sizeof(PortState) == 0x40);
-    const uint64_t pidx = a0 & kA2PortIndexMask;
     {
         std::lock_guard<std::mutex> lk(g_a2_mx);
-        if ((a0 & ~kA2PortIndexMask) != kA2PortTag || pidx < 1 || pidx > kA2MaxPorts ||
-            !g_a2_port_state[pidx - 1].used) return kA2ErrInvalidParam;
-        state.num_channels = (uint8_t)audio2_format_channels(g_a2_port_state[pidx - 1].data_format);
+        A2PortState* port = audio2_port_locked(a0);
+        if (!port) return kA2ErrInvalidParam;
+        state.num_channels = (uint8_t)audio2_format_channels(port->data_format);
     }
     state.output = 1;
     state.volume = 127;
@@ -864,33 +921,33 @@ HLE(audio2_port_get_state) {
 // Unknown ids are skipped fail-visibly under PROSPER_AUDIO2LOG. CONFIDENCE: HIGH (Evergate + GTA V).
 HLE(audio2_port_set_attr) {
     A2LOG("sceAudioOut2PortSetAttributes");
-    const uint64_t pidx = (a0 & kA2PortIndexMask);
-    if ((a0 & ~kA2PortIndexMask) != kA2PortTag || pidx < 1 || pidx > kA2MaxPorts)
-        return kA2ErrInvalidParam;
-    if (a2 == 0) return 0;                        // no attributes: a legal no-op
     const uint64_t count = a2 <= 32 ? a2 : 32;    // defensive cap; log the clamp fail-visibly
     if (count != a2 && audio2log())
         fprintf(stderr, "[audio2] PortSetAttributes: count %llu clamped to 32\n", (unsigned long long)a2);
     std::lock_guard<std::mutex> lk(g_a2_mx);      // covers port state AND the diagnostic set below
+    uint32_t port_slot = 0;
+    A2PortState* port = audio2_port_locked(a0, &port_slot);
+    if (!port) return kA2ErrInvalidParam;
+    if (a2 == 0) return 0;                        // no attributes: a legal no-op on a live port
     for (uint64_t i = 0; i < count; i++) {
         struct { uint32_t id, reserved; uint64_t vptr, vsize; } at{};
         static_assert(sizeof(at) == 0x18);
         if (!audio_read_bytes(a1 + i * 0x18, &at, sizeof at)) break;
         if (at.id == 0 && at.vsize == 8) {
             uint64_t pcm = 0;
-            if (audio_read_bytes(at.vptr, &pcm, 8)) g_a2_port_state[pidx - 1].pcm_ptr = pcm;
+            if (audio_read_bytes(at.vptr, &pcm, 8)) port->pcm_ptr = pcm;
             if (getenv("PROSPER_AUDIO2_PROBE")) {
                 // Keep probe history per AudioOut2 port. Object-heavy titles routinely create
                 // more than 16 ports; aliasing this table made their alternating grain buffers
                 // look like a state change on every SetAttributes call and flooded the log.
                 static uint64_t seen_store[kA2MaxPorts] = {0};
                 static uint8_t logged_changes[kA2MaxPorts] = {0};
-                if (seen_store[pidx - 1] != pcm) {
-                    seen_store[pidx - 1] = pcm;
-                    if (logged_changes[pidx - 1] < 4) {
-                        ++logged_changes[pidx - 1];
+                if (seen_store[port_slot] != pcm) {
+                    seen_store[port_slot] = pcm;
+                    if (logged_changes[port_slot] < 4) {
+                        ++logged_changes[port_slot];
                         fprintf(stderr, "[audio2-attr] port%llu id=0x%x vptr=0x%llx vsize=%llu -> pcm=0x%llx\n",
-                                (unsigned long long)pidx, at.id,
+                                (unsigned long long)(port_slot + 1), at.id,
                                 (unsigned long long)at.vptr, (unsigned long long)at.vsize,
                                 (unsigned long long)pcm);
                     }
@@ -903,7 +960,7 @@ HLE(audio2_port_set_attr) {
                 const size_t got = audio_read_bytes_partial(
                     at.vptr, value, std::min<size_t>((size_t)at.vsize, sizeof(value)));
                 fprintf(stderr, "[audio2] PortSetAttributes: port%llu unhandled attr id=%u "
-                        "size=%llu value:", (unsigned long long)pidx, at.id,
+                        "size=%llu value:", (unsigned long long)(port_slot + 1), at.id,
                         (unsigned long long)at.vsize);
                 for (size_t j = 0; j < got; ++j) fprintf(stderr, " %02x", value[j]);
                 fprintf(stderr, "\n");
@@ -916,11 +973,10 @@ HLE(audio2_port_set_attr) {
 // sceAudioOut2ContextAdvance(ctx) -> 0. Update the public queue clock; PCM submission lives in Push.
 HLE(audio2_ctx_advance) {
     A2LOG("sceAudioOut2ContextAdvance");
-    const uint64_t idx = a0 & 0xff;
     std::lock_guard<std::mutex> lk(g_a2_mx);
-    if ((a0 & ~0xffull) != kA2CtxTag || idx < 1 || idx > 4 || !g_a2_ctx[idx - 1].used)
-        return kA2ErrInvalidParam;
-    audio2_update_queue_locked(g_a2_ctx[idx - 1], std::chrono::steady_clock::now());
+    A2Context* context = audio2_context_locked(a0);
+    if (!context) return kA2ErrInvalidParam;
+    audio2_update_queue_locked(*context, std::chrono::steady_clock::now());
     return 0;
 }
 
@@ -929,7 +985,6 @@ HLE(audio2_ctx_advance) {
 // model as RealtimeSilentSink) so CRI's server thread runs at real time, not a hot spin.
 HLE(audio2_ctx_push) {
     A2LOG("sceAudioOut2ContextPush");
-    uint64_t idx = a0 & 0xff;
     uint32_t grain = 256;
     // Reserve one hardware queue slot before reading the guest grain. A nonblocking push on a full
     // queue returns NOT_READY; a blocking push waits until the 48 kHz device clock drains a slot.
@@ -937,19 +992,18 @@ HLE(audio2_ctx_push) {
         std::chrono::nanoseconds wait_duration{};
         {
             std::lock_guard<std::mutex> lk(g_a2_mx);
-            if ((a0 & ~0xffull) != kA2CtxTag || idx < 1 || idx > 4 ||
-                !g_a2_ctx[idx - 1].used) return kA2ErrInvalidParam;
-            A2Context& context = g_a2_ctx[idx - 1];
+            A2Context* context = audio2_context_locked(a0);
+            if (!context) return kA2ErrInvalidParam;
             const auto now = std::chrono::steady_clock::now();
-            audio2_update_queue_locked(context, now);
-            if (context.queued < context.queue_depth) {
-                if (!context.queued) context.last_queue_update = now;
-                ++context.queued;
-                grain = context.grain;
+            audio2_update_queue_locked(*context, now);
+            if (context->queued < context->queue_depth) {
+                if (!context->queued) context->last_queue_update = now;
+                ++context->queued;
+                grain = context->grain;
                 break;
             }
             wait_duration = std::chrono::nanoseconds(
-                (long long)(context.grain ? context.grain : 256) * 1000000000LL / 48000);
+                (long long)(context->grain ? context->grain : 256) * 1000000000LL / 48000);
         }
         if (!a1) return kA2ErrNotReady;
         std::this_thread::sleep_for(wait_duration);
@@ -965,8 +1019,8 @@ HLE(audio2_ctx_push) {
     bool have_pcm = false;
     {
         std::lock_guard<std::mutex> lk(g_a2_mx);
-        A2Context* c = ((a0 & ~0xffull) == kA2CtxTag && idx >= 1 && idx <= 4 && g_a2_ctx[idx - 1].used)
-                       ? &g_a2_ctx[idx - 1] : &g_a2_ctx[0];
+        A2Context* c = audio2_context_locked(a0);
+        if (!c) return kA2ErrInvalidParam;
         grain = (c->grain >= 64 && c->grain <= 4096) ? c->grain : 256;
         std::memset(bed.data(), 0, sizeof(float) * grain * 2);
         const bool probe = getenv("PROSPER_AUDIO2_PROBE") != nullptr;
@@ -1088,20 +1142,19 @@ HLE(audio2_ctx_push) {
         // every push would hot-spin the guest's pump thread on hosts with no audio device.
         AudioPortInfo info; info.freq = 48000; info.channels = 2; info.fmt = AudioFmt::F32;
         info.grain = (int)grain;
-        int context_slot = 0;
+        uint32_t context_slot = 0;
         bool open_ok = false;
         {
             std::lock_guard<std::mutex> lk(g_a2_mx);
-            if ((a0 & ~0xffull) == kA2CtxTag && idx >= 1 && idx <= 4 && g_a2_ctx[idx - 1].used)
-                context_slot = (int)idx - 1;
-            A2Context& context = g_a2_ctx[context_slot];
-            if (!context.sink_opened) {
-                context.sink_opened = true;
-                context.sink_open_ok = sink->open(kA2SinkPortBase + context_slot, info);
+            A2Context* context = audio2_context_locked(a0, &context_slot);
+            if (!context) return kA2ErrInvalidParam;
+            if (!context->sink_opened) {
+                context->sink_opened = true;
+                context->sink_open_ok = sink->open(kA2SinkPortBase + (int)context_slot, info);
             }
-            open_ok = context.sink_open_ok;
+            open_ok = context->sink_open_ok;
         }
-        const int sink_port = kA2SinkPortBase + context_slot;
+        const int sink_port = kA2SinkPortBase + (int)context_slot;
         if (open_ok) {
             for (uint32_t i = 0; i < grain * 2; i++) {
                 float v = bed[i];
@@ -1118,8 +1171,8 @@ HLE(audio2_ctx_push) {
     std::chrono::steady_clock::time_point target;
     {
         std::lock_guard<std::mutex> lk(g_a2_mx);
-        A2Context* c = ((a0 & ~0xffull) == kA2CtxTag && idx >= 1 && idx <= 4 && g_a2_ctx[idx - 1].used)
-                       ? &g_a2_ctx[idx - 1] : &g_a2_ctx[0];
+        A2Context* c = audio2_context_locked(a0);
+        if (!c) return kA2ErrInvalidParam;
         uint32_t g2 = c->grain ? c->grain : 256;
         auto dur = std::chrono::nanoseconds((long long)g2 * 1000000000LL / 48000);
         auto now = std::chrono::steady_clock::now();
@@ -1159,6 +1212,8 @@ void audio2_control_probe(const char* name, uint64_t a0, uint64_t a1, uint64_t a
 
 HLE(audio2_ctx_set_attr) {
     audio2_control_probe("sceAudioOut2ContextSetAttributes", a0, a1, a2, a3, a4, a5);
+    std::lock_guard<std::mutex> lk(g_a2_mx);
+    if (!audio2_context_locked(a0)) return kA2ErrInvalidParam;
     return 0;
 }
 HLE(audio2_get_speaker_info) {
@@ -1303,15 +1358,13 @@ HLE(audio2_ctx_get_queue_level) {
     if (control_probes.fetch_add(1) < 8)
         audio2_control_probe("sceAudioOut2ContextGetQueueLevel", a0, a1, a2, a3, a4, a5);
     uint32_t queued = 0, available = 4;
-    const uint64_t idx = a0 & 0xff;
     {
         std::lock_guard<std::mutex> lk(g_a2_mx);
-        if ((a0 & ~0xffull) != kA2CtxTag || idx < 1 || idx > 4 ||
-            !g_a2_ctx[idx - 1].used) return kA2ErrInvalidParam;
-        A2Context& context = g_a2_ctx[idx - 1];
-        audio2_update_queue_locked(context, std::chrono::steady_clock::now());
-        queued = context.queued;
-        available = queued < context.queue_depth ? context.queue_depth - queued : 0;
+        A2Context* context = audio2_context_locked(a0);
+        if (!context) return kA2ErrInvalidParam;
+        audio2_update_queue_locked(*context, std::chrono::steady_clock::now());
+        queued = context->queued;
+        available = queued < context->queue_depth ? context->queue_depth - queued : 0;
     }
     if (a1 && !a2_store_u32(a1, queued)) return kA2ErrInvalidParam;
     if (a2 && !a2_store_u32(a2, available)) return kA2ErrInvalidParam;
@@ -1328,20 +1381,34 @@ HLE(audio2_get_system_state) {
     return 0;
 }
 
-// Generic logging probes for the not-yet-exercised remainder of the surface.  These functions can
-// be called once per grain, so sample each export independently: a hot GetSystemState loop must not
-// consume the shared diagnostic budget before a later mastering/control call becomes visible.
-#define A2_PROBE(fn, str) HLE(fn) {                                      \
+// Generic logging probes for the not-yet-exercised remainder of the surface. These functions can
+// be called once per grain, so sample each export independently. Their detailed behavior remains a
+// stub, but handle and ownership validation is observable and must match the implemented paths.
+#define A2_PROBE_LOG(str)                                                \
     A2LOG(str);                                                          \
     static std::atomic<uint32_t> control_probes{0};                      \
     if (control_probes.fetch_add(1) < 8)                                 \
-        audio2_control_probe(str, a0, a1, a2, a3, a4, a5);              \
-    return 0;                                                            \
+        audio2_control_probe(str, a0, a1, a2, a3, a4, a5)
+HLE(audio2_ctx_bed_write) {
+    A2_PROBE_LOG("sceAudioOut2ContextBedWrite");
+    std::lock_guard<std::mutex> lk(g_a2_mx);
+    return audio2_context_locked(a0) ? 0 : kA2ErrInvalidParam;
 }
-A2_PROBE(audio2_ctx_bed_write,   "sceAudioOut2ContextBedWrite")
-A2_PROBE(audio2_port_register,   "sceAudioOut2PortRegister")
-A2_PROBE(audio2_port_unregister, "sceAudioOut2PortUnregister")
-#undef A2_PROBE
+HLE(audio2_port_register) {
+    A2_PROBE_LOG("sceAudioOut2PortRegister");
+    std::lock_guard<std::mutex> lk(g_a2_mx);
+    A2Context* context = audio2_context_locked(a0);
+    A2PortState* port = audio2_port_locked(a1);
+    return context && port && port->context == a0 ? 0 : kA2ErrInvalidParam;
+}
+HLE(audio2_port_unregister) {
+    A2_PROBE_LOG("sceAudioOut2PortUnregister");
+    std::lock_guard<std::mutex> lk(g_a2_mx);
+    A2Context* context = audio2_context_locked(a0);
+    A2PortState* port = audio2_port_locked(a1);
+    return context && port && port->context == a0 ? 0 : kA2ErrInvalidParam;
+}
+#undef A2_PROBE_LOG
 
 // --- libSceAjm (Audio Job Manager — compressed-audio decode: ATRAC9/MP3/AAC) --------------------
 // The core owns AJM handles, builders, synchronous batch execution, guest-memory copies, and result
