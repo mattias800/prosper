@@ -5024,7 +5024,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // Packed-f16 ops apply these after selecting/unpacking the half below.
             const bool packed_f16 = in.opcode == 0x32 || in.opcode == 0x33 || in.opcode == 0x35 ||
                                     in.opcode == 0x39 || in.opcode == 0x3A;
-            if (!packed_f16) {
+            const bool integer_sdwa = in.has_sdwa &&
+                (in.opcode == 0x0B || (in.opcode >= 0x11 && in.opcode <= 0x14) ||
+                 in.opcode == 0x16 || in.opcode == 0x18 ||
+                 (in.opcode >= 0x1A && in.opcode <= 0x1E) ||
+                 (in.opcode >= 0x25 && in.opcode <= 0x2A));
+            if (integer_sdwa) {
+                auto select = [&](uint32_t raw, uint8_t sel) {
+                    if (sel <= 3u) return b.bfe_u(raw, b.uconst(8u * sel), b.uconst(8));
+                    if (sel <= 5u) return b.bfe_u(raw, b.uconst(16u * (sel - 4u)), b.uconst(16));
+                    return raw;
+                };
+                a = select(a, in.sdwa_src0_sel);
+                c = select(c, in.sdwa_src1_sel);
+            } else if (!packed_f16) {
                 if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
                 if (in.src_neg[0]) a = b.fneg(a);
                 if (in.src_abs[1]) c = b.fext1(Glsl_FAbs, c);

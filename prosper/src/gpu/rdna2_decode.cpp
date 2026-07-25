@@ -174,15 +174,40 @@ void decode_operands(Rdna2Inst& i) {
                 if (((sd >> 8) & 7u) == 6u && ((sd >> 16) & 7u) == 6u && ((sd >> 24) & 7u) == 6u &&
                     !((sd >> 19) & 0x9u) && !((sd >> 27) & 0x9u))
                     i.has_modifier = false;
+                // Integer VOP2 SDWA may select a byte/word from either source before the ALU
+                // operation.  Plucky Squire's first gameplay scene uses the four byte selectors
+                // with v_mul_u32_u24 to unpack an RGBA8 value (three times BYTE_0..3).  Admit the
+                // general no-SEXT/no-saturation integer subset: source values are zero-extended,
+                // the destination is a full dword, and the normal integer VOP2 lowering remains
+                // responsible for the operation itself.  Signed extension, integer clamp and
+                // sub-dword destinations remain fail-visible until their distinct semantics are
+                // modeled.
+                else {
+                    const uint32_t op = (w >> 25) & 0x3Fu;
+                    const bool integer_op =
+                        op == 0x0Bu || (op >= 0x11u && op <= 0x14u) ||
+                        op == 0x16u || op == 0x18u || (op >= 0x1Au && op <= 0x1Eu) ||
+                        (op >= 0x25u && op <= 0x2Au);
+                    const uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
+                    const uint32_t s0sel = (sd >> 16) & 7u, s1sel = (sd >> 24) & 7u;
+                    if (integer_op && dsel == 6u && dun == 0u &&
+                        s0sel <= 6u && s1sel <= 6u &&
+                        !((sd >> 19) & 0xFu) && !((sd >> 27) & 0xFu) &&
+                        !i.clamp && !i.omod) {
+                        i.sdwa_src0_sel = static_cast<uint8_t>(s0sel);
+                        i.sdwa_src1_sel = static_cast<uint8_t>(s1sel);
+                        i.has_modifier = false;
+                    }
+                }
                 // WORD-dst v_mul_f16_sdwa (#273 — the f16 half-packing idiom): dst WORD_0/1 with
                 // UNUSED_PRESERVE, src sels WORD/DWORD, no sext/neg/abs/clamp/omod. (llvm-mc gfx1010:
                 // 0x6a0000f9 0x0686156a -> v_mul_f16_sdwa v0, vcc_lo, v0 dst_sel:WORD_1
                 // dst_unused:UNUSED_PRESERVE — DOLL's box-blur tail.)
-                else if (((w >> 25) & 0x3Fu) == 0x32u ||
+                if (i.has_modifier && (((w >> 25) & 0x3Fu) == 0x32u ||
                          ((w >> 25) & 0x3Fu) == 0x33u ||
                          ((w >> 25) & 0x3Fu) == 0x35u ||
                          ((w >> 25) & 0x3Fu) == 0x39u ||
-                         ((w >> 25) & 0x3Fu) == 0x3Au) {
+                         ((w >> 25) & 0x3Fu) == 0x3Au)) {
                     uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
                     uint32_t s0sel = (sd >> 16) & 7u, s1sel = (sd >> 24) & 7u;
                     const bool preserve_word = (dsel == 4u || dsel == 5u) && dun == 2u;
@@ -197,7 +222,7 @@ void decode_operands(Rdna2Inst& i) {
                 }
                 // WORD-destination v_cndmask_b32_sdwa selects one 16-bit source through VCC and
                 // preserves the opposite destination half (the producer's packed conditional).
-                else if (((w >> 25) & 0x3Fu) == 0x01u) {
+                else if (i.has_modifier && ((w >> 25) & 0x3Fu) == 0x01u) {
                     uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
                     uint32_t s0sel = (sd >> 16) & 7u, s1sel = (sd >> 24) & 7u;
                     if ((dsel == 4u || dsel == 5u) && dun == 2u &&

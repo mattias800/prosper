@@ -3668,6 +3668,40 @@ int main() {
     CHECK(gotT27 == expT27,
           "T27: SDWA BYTE_0 conversion produces the exact zero-extended byte value");
 
+    // T27b: Plucky Squire's first gameplay compute pass uses these exact four
+    // v_mul_u32_u24_sdwa packets to multiply each selected byte of v10 by the inline integer 3.
+    // Verify every selector, including the scalar-source encoding in the SDWA control dword.
+    const uint32_t plucky_mul_words[][2] = {
+        {0x166614f9u, 0x01860683u}, // v51 = 3 * BYTE_1(v10)
+        {0x161014f9u, 0x00860683u}, // v8  = 3 * BYTE_0(v10)
+        {0x166214f9u, 0x02860683u}, // v49 = 3 * BYTE_2(v10)
+        {0x165014f9u, 0x03860683u}, // v40 = 3 * BYTE_3(v10)
+    };
+    const uint32_t plucky_dst[] = {51u, 8u, 49u, 40u};
+    const uint32_t plucky_cvt[] = {0x7e660d33u, 0x7e100d08u, 0x7e620d31u, 0x7e500d28u};
+    const uint32_t plucky_shift[] = {8u, 0u, 16u, 24u};
+    const uint32_t plucky_raw[] = {0x12345678u, 0xff008001u, 0x04030201u, 0xabcdef80u};
+    for (size_t k = 0; k < std::size(plucky_mul_words); ++k) {
+        const uint32_t codeT27b[] = {
+            plucky_mul_words[k][0], plucky_mul_words[k][1],
+            plucky_cvt[k], 0xbf810000u,
+        };
+        std::vector<uint32_t> spvT27b = recompile_valu(
+            codeT27b, std::size(codeT27b), 11, plucky_dst[k]);
+        CHECK(!spvT27b.empty(), "recompiled T27b (Plucky integer SDWA byte multiply) -> SPIR-V");
+        std::vector<float> inT27b(std::size(plucky_raw) * 11u, 0.0f);
+        std::vector<float> expT27b(std::size(plucky_raw));
+        for (size_t i = 0; i < std::size(plucky_raw); ++i) {
+            std::memcpy(&inT27b[i * 11u + 10u], &plucky_raw[i], sizeof(uint32_t));
+            expT27b[i] = static_cast<float>(3u * ((plucky_raw[i] >> plucky_shift[k]) & 0xffu));
+        }
+        std::vector<float> gotT27b = prosper::test::run_compute(
+            spvT27b, inT27b, static_cast<uint32_t>(std::size(plucky_raw)),
+            static_cast<uint32_t>(std::size(plucky_raw)));
+        CHECK(gotT27b == expT27b,
+              "T27b: integer SDWA zero-extends the selected byte before U24 multiplication");
+    }
+
     // T28: Astro title compute exact rejected word from the live trace. DPP applies only to src0
     // (v3); src1 (v15) stays in the current lane. With quad_perm [1,0,3,2], every lane receives its
     // horizontal neighbour plus itself.
