@@ -8,7 +8,7 @@ Raw PCM, verbose logs, and GPU captures are local diagnostics and are intentiona
 | Title | Revision | Visual milestone | Audio evidence |
 | --- | --- | --- | --- |
 | GRIS (`PPSA09804`) | 01.001.000 | Native 1920×1080 **NEW GAME** title | CLEAN, `rms=0.1800`, `peak=1.2689`, duplicated grains 0.0% |
-| Sonic Origins (`PPSA05325`) | 02.002.000 update targeting 02.001.000 | Blocked: update-only dump is missing two base title assets | AudioOut2 port 16 runs, but guest PCM is zero while startup is blocked |
+| Sonic Origins (`PPSA05325`) | 02.002.000 update targeting 02.001.000 | Blocked: update-only dump is missing two base title assets | AudioOut2 port 17 runs, but guest PCM is zero while startup is blocked |
 | Space Adventure Cobra — The Awakening (`PPSA17337`) | 01.004.000 | Native 1920×1080 title | CLEAN, `rms=0.0436`, `peak=0.1880`, duplicated grains 0.0% |
 
 ## Visual evidence
@@ -115,7 +115,7 @@ sceNpGameIntentGetPropertyValueString(..., "activityId", ..., 0x21)
 
 That route still requests `ui_startup.pac` and `ui_title_nocopy.dds` before it can transfer control to
 the classic runtime. A 30-second filtered trace never opens `raw/retro/Sonic1u.rsdk`; a 44-second
-native capture remains black after frame 1, and the active stereo float32 48 kHz port 16 capture is
+native capture remains black after frame 1, and the active stereo float32 48 kHz port 17 capture is
 silent (`rms=0`). The activity experiment therefore narrows the blocker but does not change the
 compatibility result. Reproduce it with:
 
