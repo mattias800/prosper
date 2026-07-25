@@ -8,11 +8,15 @@
 #include "../src/hle/nid.hpp"
 #include "../src/hle/audio.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 using namespace prosper;
@@ -44,6 +48,58 @@ struct CapturingSink : AudioSink {
         vols_.push_back(std::move(e));
     }
     void close(int port) override { closes.push_back(port); }
+};
+
+// Holds output in flight while another thread destroys its AudioOut2 context. The private gate
+// also makes a racing close observable before it can complete, so the test can distinguish proper
+// slot serialization from a clear-first/close-later implementation without touching HLE internals.
+struct BlockingSink : AudioSink {
+    std::mutex gate, state_mx;
+    std::condition_variable state_cv;
+    bool output_entered = false;
+    bool release_output = false;
+    bool output_finished = false;
+    bool close_attempted = false;
+    bool close_finished = false;
+
+    bool open(int, const AudioPortInfo&) override { return true; }
+    void output(int, const void*, int) override {
+        std::lock_guard<std::mutex> operation(gate);
+        std::unique_lock<std::mutex> state(state_mx);
+        output_entered = true;
+        state_cv.notify_all();
+        state_cv.wait(state, [&] { return release_output; });
+        output_finished = true;
+        state_cv.notify_all();
+    }
+    void close(int) override {
+        {
+            std::lock_guard<std::mutex> state(state_mx);
+            close_attempted = true;
+            state_cv.notify_all();
+        }
+        std::lock_guard<std::mutex> operation(gate);
+        std::lock_guard<std::mutex> state(state_mx);
+        close_finished = true;
+        state_cv.notify_all();
+    }
+    bool wait_for_output() {
+        std::unique_lock<std::mutex> state(state_mx);
+        return state_cv.wait_for(state, std::chrono::seconds(2), [&] { return output_entered; });
+    }
+    bool wait_for_close_attempt(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> state(state_mx);
+        return state_cv.wait_for(state, timeout, [&] { return close_attempted; });
+    }
+    void unblock_output() {
+        std::lock_guard<std::mutex> state(state_mx);
+        release_output = true;
+        state_cv.notify_all();
+    }
+    bool completed_in_order() {
+        std::lock_guard<std::mutex> state(state_mx);
+        return output_finished && close_attempted && close_finished;
+    }
 };
 
 // Typed shims over the dispatch table.
@@ -532,6 +588,59 @@ int main() {
     CHECK(call("sceAudioOut2PortDestroy", a2_recycled_port) == 0);
     CHECK(call("sceAudioOut2ContextDestroy", a2_recycled_context) == 0);
     CHECK(call("sceAudioOut2ContextDestroy", a2_peer_context) == 0);
+
+    // Host sink slot lifetime is serialized with context teardown. Hold one Push inside output(),
+    // fill the other three context slots, and race Destroy: before output is released, Destroy must
+    // neither reach sink.close nor free slot 1 for a new-generation context. This fails the old
+    // clear-under-state-lock / close-after-unlock ordering deterministically once close is attempted.
+    audio_reset();
+    BlockingSink blocking_sink;
+    audio_set_sink(&blocking_sink);
+    uint64_t race_context = 0;
+    CHECK(call("sceAudioOut2ContextCreate", PTR(a2_context_param), 0, 0,
+               PTR(&race_context)) == 0);
+    uint64_t race_port = 0;
+    CHECK(call("sceAudioOut2PortCreate", race_context, PTR(&a2_port_param), PTR(&race_port)) == 0);
+    a2_pcm_ptr = PTR(a2_pcm.data());
+    CHECK(call("sceAudioOut2PortSetAttributes", race_port, PTR(&a2_attr), 1) == 0);
+    uint64_t occupied_contexts[3]{};
+    for (uint64_t& context : occupied_contexts)
+        CHECK(call("sceAudioOut2ContextCreate", PTR(a2_context_param), 0, 0,
+                   PTR(&context)) == 0);
+
+    int64_t race_push_result = -1;
+    std::thread push_thread([&] {
+        race_push_result = call("sceAudioOut2ContextPush", race_context, 1);
+    });
+    CHECK(blocking_sink.wait_for_output());
+    std::atomic<bool> destroy_started{false};
+    int64_t race_destroy_result = -1;
+    std::thread destroy_thread([&] {
+        destroy_started.store(true, std::memory_order_release);
+        race_destroy_result = call("sceAudioOut2ContextDestroy", race_context);
+    });
+    while (!destroy_started.load(std::memory_order_acquire)) std::this_thread::yield();
+    CHECK(!blocking_sink.wait_for_close_attempt(std::chrono::milliseconds(250)));
+    uint64_t premature_context = 0xCCCCCCCCCCCCCCCCull;
+    CHECK((int32_t)call("sceAudioOut2ContextCreate", PTR(a2_context_param), 0, 0,
+                        PTR(&premature_context)) == (int32_t)0x80268001);
+    CHECK(premature_context == 0xCCCCCCCCCCCCCCCCull);
+
+    blocking_sink.unblock_output();
+    push_thread.join();
+    destroy_thread.join();
+    CHECK(race_push_result == 0);
+    CHECK(race_destroy_result == 0);
+    CHECK(blocking_sink.completed_in_order());
+    uint64_t post_destroy_context = 0;
+    CHECK(call("sceAudioOut2ContextCreate", PTR(a2_context_param), 0, 0,
+               PTR(&post_destroy_context)) == 0);
+    CHECK((post_destroy_context & 0xffffu) == (race_context & 0xffffu));
+    CHECK(post_destroy_context != race_context);
+    CHECK(call("sceAudioOut2ContextDestroy", post_destroy_context) == 0);
+    for (uint64_t context : occupied_contexts)
+        CHECK(call("sceAudioOut2ContextDestroy", context) == 0);
+    audio_reset();
 
     // --- 12. libSceNgs2 silent lifecycle: sizes, handles, state, and render output -------------
     struct BufferInfo { uint64_t host_buffer, host_buffer_size, reserved[5], user_data; };

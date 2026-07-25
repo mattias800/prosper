@@ -447,6 +447,10 @@ struct A2Context {
     std::chrono::steady_clock::time_point next{};
 };
 std::mutex g_a2_mx;
+// Serializes each context slot's host stream across open/output/close. Always acquire a slot mutex
+// before g_a2_mx when both are needed, so Destroy cannot close a stream reopened by a recycled
+// context and an in-flight Push cannot output after that slot has been torn down.
+std::mutex g_a2_sink_mx[4];
 A2Context  g_a2_ctx[4];
 uint32_t   g_a2_users = 0;
 
@@ -517,6 +521,8 @@ uint32_t audio2_format_channels(uint32_t data_format) {
 }
 
 static void audio2_reset() {
+    std::scoped_lock sink_locks(g_a2_sink_mx[0], g_a2_sink_mx[1],
+                                g_a2_sink_mx[2], g_a2_sink_mx[3]);
     bool close_sink[4]{};
     {
         std::lock_guard<std::mutex> lk(g_a2_mx);
@@ -812,11 +818,15 @@ HLE(audio2_ctx_create) {
 }
 HLE(audio2_ctx_destroy) {
     A2LOG("sceAudioOut2ContextDestroy");
+    const uint32_t one_based_index = (uint32_t)(a0 & kA2HandleIndexMask);
+    if ((a0 & kA2HandleTagMask) != kA2CtxTag || one_based_index < 1 ||
+        one_based_index > std::size(g_a2_ctx)) return kA2ErrInvalidParam;
+    const uint32_t context_slot = one_based_index - 1;
+    std::lock_guard<std::mutex> sink_lk(g_a2_sink_mx[context_slot]);
     bool close_sink = false;
-    uint32_t context_slot = 0;
     {
         std::lock_guard<std::mutex> lk(g_a2_mx);
-        A2Context* context = audio2_context_locked(a0, &context_slot);
+        A2Context* context = audio2_context_locked(a0);
         if (!context) return kA2ErrInvalidParam;
         close_sink = context->sink_opened;
         audio2_clear_slot(*context);
@@ -986,13 +996,14 @@ HLE(audio2_ctx_advance) {
 HLE(audio2_ctx_push) {
     A2LOG("sceAudioOut2ContextPush");
     uint32_t grain = 256;
+    uint32_t context_slot = 0;
     // Reserve one hardware queue slot before reading the guest grain. A nonblocking push on a full
     // queue returns NOT_READY; a blocking push waits until the 48 kHz device clock drains a slot.
     for (;;) {
         std::chrono::nanoseconds wait_duration{};
         {
             std::lock_guard<std::mutex> lk(g_a2_mx);
-            A2Context* context = audio2_context_locked(a0);
+            A2Context* context = audio2_context_locked(a0, &context_slot);
             if (!context) return kA2ErrInvalidParam;
             const auto now = std::chrono::steady_clock::now();
             audio2_update_queue_locked(*context, now);
@@ -1133,6 +1144,28 @@ HLE(audio2_ctx_push) {
                         object_ports_with_pcm, object_peak_port, object_peak);
         }
     }
+    // From this point through host output or silent pacing, serialize with Destroy for this exact
+    // sink slot. Revalidate the full generation under g_a2_mx after acquiring the slot mutex.
+    std::unique_lock<std::mutex> sink_lk(g_a2_sink_mx[context_slot]);
+    auto pace_silently = [&]() -> uint64_t {
+        std::chrono::steady_clock::time_point target;
+        {
+            std::lock_guard<std::mutex> lk(g_a2_mx);
+            A2Context* c = audio2_context_locked(a0);
+            if (!c) return kA2ErrInvalidParam;
+            uint32_t g2 = c->grain ? c->grain : 256;
+            auto dur = std::chrono::nanoseconds((long long)g2 * 1000000000LL / 48000);
+            auto now = std::chrono::steady_clock::now();
+            // (Re)sync if unset or far behind (post-stall) to avoid burst catch-up — same policy
+            // as RealtimeSilentSink::output.
+            if (c->next.time_since_epoch().count() == 0 || c->next < now - dur * 4) c->next = now;
+            c->next += dur;
+            target = c->next;
+        }
+        std::this_thread::sleep_until(target);
+        return 0;
+    };
+
     AudioSink* sink = audio_sink();
     if (sink && have_pcm) {
         // Forward the mixed grain to the host device; the sink paces one grain per call in real
@@ -1142,11 +1175,10 @@ HLE(audio2_ctx_push) {
         // every push would hot-spin the guest's pump thread on hosts with no audio device.
         AudioPortInfo info; info.freq = 48000; info.channels = 2; info.fmt = AudioFmt::F32;
         info.grain = (int)grain;
-        uint32_t context_slot = 0;
         bool open_ok = false;
         {
             std::lock_guard<std::mutex> lk(g_a2_mx);
-            A2Context* context = audio2_context_locked(a0, &context_slot);
+            A2Context* context = audio2_context_locked(a0);
             if (!context) return kA2ErrInvalidParam;
             if (!context->sink_opened) {
                 context->sink_opened = true;
@@ -1165,25 +1197,11 @@ HLE(audio2_ctx_push) {
             sink->output(sink_port, bed.data(), (int)grain);
             return 0;
         }
+        return pace_silently();
     }
     // No sink / no data yet: keep the silent real-time pacing so the guest's pump thread does not
     // hot-spin (on hardware Push blocks while the output queue is full).
-    std::chrono::steady_clock::time_point target;
-    {
-        std::lock_guard<std::mutex> lk(g_a2_mx);
-        A2Context* c = audio2_context_locked(a0);
-        if (!c) return kA2ErrInvalidParam;
-        uint32_t g2 = c->grain ? c->grain : 256;
-        auto dur = std::chrono::nanoseconds((long long)g2 * 1000000000LL / 48000);
-        auto now = std::chrono::steady_clock::now();
-        // (Re)sync if unset or far behind (post-stall) to avoid burst catch-up — same policy
-        // as RealtimeSilentSink::output.
-        if (c->next.time_since_epoch().count() == 0 || c->next < now - dur * 4) c->next = now;
-        c->next += dur;
-        target = c->next;
-    }
-    std::this_thread::sleep_until(target);   // pace outside the lock
-    return 0;
+    return pace_silently();
 }
 
 // Targeted control-surface tracing. AudioOut2 ports feed a pre-mastering speaker bed, so these
