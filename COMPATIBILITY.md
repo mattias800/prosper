@@ -19,7 +19,7 @@ Last updated: 2026-07-25
 | *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | ✅ Native 1920×1080 title and audio verified |
 | *Sonic Origins*&nbsp;² | `PPSA05325` | Hedgehog Engine | 🔬 Frontend loop reached; supplied update-only dump lacks its base title assets |
 | Terminator (2D)&nbsp;¹ | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay reached (user-verified) |
-| *Blue Prince* | `PPSA25009` | Unity | 🚧 Opening gameplay scene ("Day One" at the manor) renders; known lighting/texture defects |
+| *Blue Prince* | `PPSA25009` | Unity | 🚧 Day One gameplay renders; the manor entrance hall matches the hardware reference |
 | *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Title and STORY/ONLINE main menu render; known UI and composition defects remain |
 | *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Interactive title and save-slot flow; later content load is blocked |
 | Additional Unity/IL2CPP target | `PPSA02664` | Unity / IL2CPP | 🔬 Exercised, with no published gameplay milestone |
@@ -158,13 +158,23 @@ Routes, capture commands, audio evidence, and the Sonic audit are recorded in
 </p>
 
 This Unity target boots to its menu, renders the full opening cinematic, completes the first-room
-load, and renders the "Day One" opening gameplay scene: the Mt. Holly manor exterior, gardens, and
-the player character on the approach path, captured over a 600-second scripted route with zero
-render stalls. Two loading-phase performance defects were removed to get here — unbounded
-register-file growth from incrementally patched register arrays (#1266) and per-draw-reference
-full-buffer content hashing (#1269). Known open defects: lit surfaces render blown-out (#1271) and
-small foliage textures render as pixel noise (#1272), so no verified-visuals milestone is claimed.
-Boot remains intermittent (#1178).
+load, and plays the "Day One" opening: the Mt. Holly manor exterior and gardens, the approach path,
+and the entrance hall inside. A default-config fresh-save route (scale 1, no sampling window,
+native 1920x1080) produced 420 distinct frames over 2101 seconds with no render stalls.
+
+The hall's composition now matches the PS5 hardware reference — checkered tile floor with
+reflections, the round table and its bouquet, both busts in their niches, wall sconces, chandelier
+and console-table props (`docs/screenshots/issue-1287-hall-live-vs-oracle.png`). Reaching that took
+four defect families: the resolve/tonemap display chain (#1334/#1382), the material path
+(#1411 virtual interpolant resolution, with #1399 sample gradients and #1401/#1404 shadow PCF), and
+a silent 1 MiB buffer-upload clamp that had been erasing 44 of 248 draws in that room — the tile
+floor and the far table among them (#1427/#1429). Two loading-phase performance defects were fixed
+earlier: unbounded register-file growth (#1266) and per-draw full-buffer content hashing (#1269).
+
+Open: a by-eye play-through confirmation is still outstanding, the snapshot guard for the hall
+predates the geometry fix (#1433), floating black rectangles remain at the wall-lamp positions
+(#1287), 27 draws still vanish at clip pending triage (#1435), and boot remains intermittent
+(#1178).
 
 ## Dragon Quest VII Reimagined — `PPSA17942`
 
