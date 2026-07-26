@@ -261,7 +261,16 @@ struct PersistentDecodedTexture {
 }
 
 uint32_t buffer_upload_bytes(uint32_t declared_bytes) {
-    return std::min(declared_bytes, kMaxBufferUploadBytes) & ~3u;
+    // PROSPER_MAX_BUFFER_UPLOAD_MB=N lowers the ceiling (1..64 MiB) so one build can reproduce the
+    // #1427 collapse and its fix back to back; unset/invalid keeps the full ceiling.
+    static const uint32_t ceiling = [] {
+        const char* value = getenv("PROSPER_MAX_BUFFER_UPLOAD_MB");
+        if (!value || !*value) return kMaxBufferUploadBytes;
+        const unsigned long megabytes = strtoul(value, nullptr, 10);
+        if (megabytes < 1 || megabytes > 64) return kMaxBufferUploadBytes;
+        return static_cast<uint32_t>(megabytes) << 20;
+    }();
+    return std::min(declared_bytes, ceiling) & ~3u;
 }
 
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
@@ -2289,11 +2298,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // column) and the primitive died as degenerate, with no reject and no log.
                         // On Blue Prince's entrance hall that erased 44 of 248 scene draws —
                         // the tile floor, the far table, most of the room — and read as a shading
-                        // defect for weeks. Use the same 64 MiB ceiling the sampled-image path
-                        // above already applies, and make any remaining truncation FAIL-VISIBLE.
+                        // defect for weeks. Upload the declared range under a ceiling that exists
+                        // only to bound a corrupt descriptor (a 64 MiB read also costs ~16K
+                        // guest_readable page probes, so it must stay bounded), and make any
+                        // truncation that does happen FAIL-VISIBLE. PROSPER_MAX_BUFFER_UPLOAD_MB
+                        // lowers the ceiling for a same-build A/B of this exact defect.
                         const uint32_t requested_bytes = r.size ? r.size : 256u;
                         uint32_t nb = prosper::frontend::buffer_upload_bytes(requested_bytes);
-                        if (requested_bytes > kMaxBufferUploadBytes) {
+                        if (nb < (requested_bytes & ~3u)) {
                             static std::set<uint64_t> truncated_reported;
                             if (truncated_reported.size() < 32 &&
                                 truncated_reported.insert(r.gpu_addr).second)
@@ -2434,7 +2446,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     replacement.set = set; replacement.binding = d.binding;
                     if (wants_buffer) {
                         size_t words = static_cast<size_t>((std::max<uint64_t>(d.required_bytes, 16) + 3) / 4);
-                        words = std::min<size_t>(words, 1u << 18); // same 1 MiB upload ceiling as build_R
+                        // Poison replacements stay deliberately small: this is a diagnostic
+                        // substitute for an invalid binding, not a real upload, so it does not
+                        // follow build_R's ceiling (which is now the declared range, #1427).
+                        words = std::min<size_t>(words, 1u << 18);
                         replacement.dwords.assign(words, 0x7FC0CDCDu);
                     } else {
                         replacement.tex_rgba = poison_tex; replacement.tw = 2; replacement.th = 2;
