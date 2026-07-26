@@ -145,6 +145,35 @@ int main() {
         CHECK(zero_scissor.cx.count(prosper::agc::Pm4::PA_SC_WINDOW_SCISSOR_BR) &&
                   zero_scissor.cx[prosper::agc::Pm4::PA_SC_WINDOW_SCISSOR_BR] == 0x00000FACu,
               "unrelated bad offset does not suppress an empty window-scissor write");
+
+        // sceAgcBuildInterpolantMapping uses a compact virtual register bank. These entries are
+        // intentional Cx writes, not the arbitrary/stale out-of-range offsets rejected above.
+        ShaderReg virtual_interpolants[] = {
+            {0x10000000u, 0x00000003u},
+            {0x10000001u, 0x00000320u},
+            {0x1000001fu, 0x00000407u},
+            {0x10000020u, 0xDEADBEEFu},
+        };
+        uint32_t virtual_cb[8]{};
+        Dcb virtual_dcb{};
+        virtual_dcb.bottom = virtual_cb;
+        virtual_dcb.top = virtual_cb + 8;
+        virtual_dcb.cursor_up = virtual_cb;
+        virtual_dcb.cursor_down = virtual_cb + 8;
+        setcx((uint64_t)(uintptr_t)&virtual_dcb,
+              (uint64_t)(uintptr_t)virtual_interpolants,
+              sizeof(virtual_interpolants) / sizeof(virtual_interpolants[0]), 0, 0, 0);
+        GpuState resolved_interpolants;
+        run_cb(virtual_cb, 4, resolved_interpolants);
+        CHECK(resolved_interpolants.cx.count(prosper::agc::Pm4::SPI_PS_INPUT_CNTL_0) &&
+                  resolved_interpolants.cx[prosper::agc::Pm4::SPI_PS_INPUT_CNTL_0] == 0x00000003u &&
+                  resolved_interpolants.cx.count(prosper::agc::Pm4::SPI_PS_INPUT_CNTL_31) &&
+                  resolved_interpolants.cx[prosper::agc::Pm4::SPI_PS_INPUT_CNTL_31] == 0x00000407u,
+              "Gen5 virtual interpolant bank resolves to SPI_PS_INPUT_CNTL_0..31");
+        CHECK(resolved_interpolants.cx.count(prosper::agc::Pm4::SPI_PS_INPUT_CNTL_0 + 1u) &&
+                  resolved_interpolants.cx[prosper::agc::Pm4::SPI_PS_INPUT_CNTL_0 + 1u] == 0x00000320u &&
+                  resolved_interpolants.cx.count(0x10000020u) == 0,
+              "virtual interpolant values survive resolution and the adjacent offset stays rejected");
     }
 
     CHECK(st.draws.size() == 2, "2 draws recorded");

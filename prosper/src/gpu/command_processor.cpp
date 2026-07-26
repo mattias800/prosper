@@ -1860,9 +1860,23 @@ void GpuState::apply(const Pm4Command& c) {
             uint32_t dbbase_nonzero_mask = 0;
             bool dbbase_clobbered = false;
             for (uint32_t i = 0; i < c.num_regs; i++) {
+                // Gen5's BuildInterpolantMapping helper returns a reserved virtual Cx-register
+                // bank instead of raw hardware offsets. The Dcb consumes those pairs unchanged;
+                // the real driver resolves 0x10000000+n to SPI_PS_INPUT_CNTL_n while building the
+                // command stream. Our HLE packet deliberately retains the guest array until fold
+                // time (it may be patched after packet creation), so perform that one documented
+                // resolution here before applying the ordinary bounded-register-file guard.
+                uint32_t offset = regs[i].offset;
+                constexpr uint32_t kVirtualPsInputCntl0 = 0x10000000u;
+                if (c.reg_class == RegClass::Cx &&
+                    offset >= kVirtualPsInputCntl0 &&
+                    offset < kVirtualPsInputCntl0 + 32u) {
+                    offset = prosper::agc::Pm4::SPI_PS_INPUT_CNTL_0 +
+                             (offset - kVirtualPsInputCntl0);
+                }
                 // Hardware drops writes to nonexistent register offsets; mirror that instead of
                 // folding placeholder/stale array slots into the register file (see kRegOffsetLimit).
-                if (regs[i].offset >= kRegOffsetLimit) {
+                if (offset >= kRegOffsetLimit) {
                     if (bad++ == 0) first_bad = i;
                     static std::atomic<int> dropped_note{0};
                     if (dropped_note.fetch_add(1) < 4)
@@ -1872,27 +1886,27 @@ void GpuState::apply(const Pm4Command& c) {
                                 (int)c.reg_class, regs[i].offset, regs[i].value);
                     continue;
                 }
-                file[regs[i].offset] = regs[i].value;
+                file[offset] = regs[i].value;
                 // PROSPER_DBBASETRACE (#1353): log every cx write to the DB Z/STENCIL base
                 // registers (LO 0x12..0x15, HI 0x1A..0x1D) with its source path, to attribute
                 // which packet family programs (or clobbers) a base half — this trace found the
                 // stale arena slot writing (DB_Z_WRITE_BASE, 0) after the real pair write.
                 static const bool dbbase_trace = getenv("PROSPER_DBBASETRACE") != nullptr;
                 if (dbbase_trace && c.reg_class == RegClass::Cx &&
-                    ((regs[i].offset >= 0x12u && regs[i].offset <= 0x15u) ||
-                     (regs[i].offset >= 0x1Au && regs[i].offset <= 0x1Du))) {
+                    ((offset >= 0x12u && offset <= 0x15u) ||
+                     (offset >= 0x1Au && offset <= 0x1Du))) {
                     static std::atomic<int> n{0};
                     if (n.fetch_add(1) < 400000)
                         fprintf(stderr, "[dbbase] indirect off=0x%x val=0x%x order=%llu\n",
                                 regs[i].offset, regs[i].value,
                                 (unsigned long long)command_order);
-                    const uint32_t bit = regs[i].offset <= 0x15u
-                        ? (regs[i].offset - 0x12u) : (4u + regs[i].offset - 0x1Au);
+                    const uint32_t bit = offset <= 0x15u
+                        ? (offset - 0x12u) : (4u + offset - 0x1Au);
                     if (regs[i].value != 0u) dbbase_nonzero_mask |= 1u << bit;
                     else if (dbbase_nonzero_mask & (1u << bit)) dbbase_clobbered = true;
                 }
                 if (c.reg_class == RegClass::Cx &&
-                    regs[i].offset == prosper::agc::Pm4::DB_RENDER_CONTROL &&
+                    offset == prosper::agc::Pm4::DB_RENDER_CONTROL &&
                     (regs[i].value & 0x3u) &&
                     getenv("PROSPER_DS_CLEARLOG"))
                     fprintf(stderr,
