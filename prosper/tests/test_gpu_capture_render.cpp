@@ -50,6 +50,9 @@ static void unset_env(const char* name) {
 }
 
 int main() {
+    // buffer_upload_bytes caches this override on first use. Reset it before the renderer can build
+    // any buffer resource so the test always exercises the production default ceiling.
+    unset_env("PROSPER_MAX_BUFFER_UPLOAD_MB");
     std::printf("== test_gpu_capture_render ==\n");
     constexpr uint32_t W = 64, H = 64;
 
@@ -803,6 +806,74 @@ int main() {
               "missing sampled image receives a full-surface nonblack poison texture instead of zero");
     }
 
+    // #1435: prove the live renderer uploads buffer bytes beyond the old 1 MiB clamp. The fragment
+    // shader reads a raw dword through a direct V# at a scalar SOFFSET, then exports those float bits
+    // as red. A below-clamp sentinel is the positive control; the 1.5 MiB sentinel turns robust-OOB
+    // zero under the old truncated upload, so the framebuffer observes the defect end to end without
+    // involving vertex fetch or geometry.
+    {
+        constexpr uint32_t low_offset = 0x80000u;
+        constexpr uint32_t high_offset = 0x180000u;
+        std::vector<uint32_t> buffer_words(high_offset / sizeof(uint32_t) + 1u, 0u);
+        buffer_words[low_offset / sizeof(uint32_t)] = 0x3e800000u;   // 0.25f
+        buffer_words[high_offset / sizeof(uint32_t)] = 0x3f400000u; // 0.75f
+
+        ShaderResourceTable buffer_table;
+        ShaderResource buffer{};
+        buffer.cls = ResourceClass::ConstantBuffer;
+        buffer.format = DataFormat::Float32;
+        buffer.num_components = 1;
+        buffer.binding = 32;
+        buffer.sgpr_base = 0;
+        buffer.gpu_addr = 0x10000000u;
+        buffer.size = static_cast<uint32_t>(buffer_words.size() * sizeof(uint32_t));
+        buffer.host_data = reinterpret_cast<uint8_t*>(buffer_words.data());
+        buffer.host_data_size = buffer.size;
+        buffer_table.resources.push_back(buffer);
+
+        auto render_sentinel = [&](uint32_t byte_offset, uint64_t target_base) {
+            const uint32_t buffer_ps[] = {
+                0xbe8403ffu, byte_offset, // s_mov_b32 s4, byte_offset
+                0xe0300000u, 0x04000000u, // buffer_load_dword v0, off, s[0:3], s4
+                0x7e020280u,              // v_mov_b32 v1, 0
+                0x7e040280u,              // v_mov_b32 v2, 0
+                0x7e0602f2u,              // v_mov_b32 v3, 1.0
+                0xf800000fu, 0x03020100u, // exp mrt0 v0, v1, v2, v3
+                0xbf810000u,
+            };
+            DrawItem draw = replay.items[0];
+            draw.fs = recompile_fragment(buffer_ps, std::size(buffer_ps), &buffer_table);
+            draw.fs_shared.reset();
+            draw.fs_identity = 0;
+            draw.prt = std::make_shared<ShaderResourceTable>(buffer_table);
+            draw.color0_base = target_base;
+            if (draw.fs.empty()) return std::vector<uint8_t>{};
+            return render_submit_items({draw}, W, H);
+        };
+
+        const std::vector<uint8_t> low_pixels = render_sentinel(low_offset, 0xd00000u);
+        bool low_sentinel_visible = low_pixels.size() == static_cast<size_t>(W) * H * 4u;
+        if (low_sentinel_visible) {
+            const uint8_t* center =
+                &low_pixels[(static_cast<size_t>(H / 2) * W + W / 2) * 4u];
+            low_sentinel_visible = center[0] >= 56 && center[0] <= 72 &&
+                                   center[1] < 8 && center[2] < 8;
+        }
+        CHECK(low_sentinel_visible,
+              "fragment buffer read below 1 MiB exposes its distinct pixel sentinel");
+
+        const std::vector<uint8_t> high_pixels = render_sentinel(high_offset, 0xd10000u);
+        bool high_sentinel_visible = high_pixels.size() == static_cast<size_t>(W) * H * 4u;
+        if (high_sentinel_visible) {
+            const uint8_t* center =
+                &high_pixels[(static_cast<size_t>(H / 2) * W + W / 2) * 4u];
+            high_sentinel_visible = center[0] >= 184 && center[0] <= 200 &&
+                                    center[1] < 8 && center[2] < 8;
+        }
+        CHECK(high_sentinel_visible,
+              "fragment buffer read at 1.5 MiB survives the former upload clamp (#1435)");
+    }
+
     // VideoOut's registered dimensions are authoritative even when CB_COLOR0_ATTRIB2 describes a
     // larger backing allocation. Treating this 256x256 declaration as the visible extent scales the
     // pass to 128x128 and prevents the final 64x64 scanout lookup from publishing the rendered frame.
@@ -829,9 +900,6 @@ int main() {
     // that scene run 1.4-3.0 MiB, and the draw that straddled the clamp lost precisely the vertices
     // whose offset exceeded it, so these sizes are the measured contract, not round numbers.
     {
-        // buffer_upload_bytes caches the override in a function-local static, so an exported
-        // PROSPER_MAX_BUFFER_UPLOAD_MB (the A/B shell) would otherwise fail these checks.
-        unset_env("PROSPER_MAX_BUFFER_UPLOAD_MB");
         using prosper::frontend::buffer_upload_bytes;
         CHECK(buffer_upload_bytes(454024u) == 454024u,
               "a sub-megabyte vertex stream uploads whole (unchanged behavior)");
