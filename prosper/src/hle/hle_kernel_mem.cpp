@@ -1386,7 +1386,9 @@ HLE(k_ampr_write_address) {   // j0+3uJMxYJY (cb, address, value, flags)
 // + live tag-echo captures).
 uint64_t prosper_apr_next_token(unsigned ring);                          // hle_kernel_time.cpp
 void prosper_eq_add_apr(uint64_t eq, int64_t id);                        // "
-void prosper_eq_post_apr_token(uint64_t eq, int64_t id, uint64_t token); // " (tag echo, #208)
+uint64_t prosper_eq_identity(uint64_t eq);                               // " (lifetime guard)
+void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
+                               int64_t id, uint64_t token);              // " (tag echo, #208)
 namespace {
     // Command-buffer ctxs bound to the APR event queue via H896Pt-yB4I, with the binding's a3 TAG
     // and target equeue. The tag IS the guest-chosen completion token for that cb ((ring<<58)|n,
@@ -1399,7 +1401,7 @@ namespace {
     // the engine believed batch #1 was in flight forever and the whole async IO pipeline jammed
     // behind it (the CreateGlobalShaderMap precache stall).
     struct AprBoundCb {
-        uint64_t cb, tag, eq;
+        uint64_t cb, tag, eq, eq_identity;
         int64_t id;
         bool deduplicate_completion;
         bool completion_posted;
@@ -1441,7 +1443,8 @@ namespace {
                 ready.push_back(b);
             }
             lk.unlock();
-            for (const auto& b : ready) prosper_eq_post_apr_token(b.eq, b.id, b.tag);
+            for (const auto& b : ready)
+                prosper_eq_post_apr_token(b.eq, b.eq_identity, b.id, b.tag);
             lk.lock();
         }
     }
@@ -1461,6 +1464,16 @@ namespace {
                 return true;
             }
         return false;
+    }
+    void apr_cb_cancel_tail(uint64_t cb) {
+        AprBoundState& state = apr_bound_state();
+        std::lock_guard<std::mutex> lk(state.mx);
+        for (auto& b : state.cbs) {
+            if (b.cb != cb || !b.deduplicate_completion) continue;
+            b.fallback_pending = false;
+            b.completion_posted = true;
+            break;
+        }
     }
     // Per-request "eventful" marks for UNBOUND one-shot cbs (issue #180). The engine drives two
     // flavors of sceAmprAprCommandBufferReadFile through ONE wrapper (identical guest-RA chains):
@@ -1503,6 +1516,11 @@ HLE(k_ampr_measure_write_equeue) { // sSAUCCU1dv4 = sceAmprMeasureCommandSizeWri
     if (a0) prosper_eq_add_apr(a0, (int64_t)a1);
     return 20;
 }
+HLE(k_ampr_destruct_320) {
+    ampr_arglog("AmprCommandBufferDestructor", a0, a1, a2, a3, a4, a5);
+    apr_cb_cancel_tail(a0);
+    return 0;
+}
 // The unversioned PS5 3.20 entry point is a pure command-size query and reserves a 0x20-byte
 // kernel-event record. Keep it separate from the older `_04_00` compatibility path above: DOLL
 // passes a live queue to that legacy sizing NID and depends on its historical 20-byte result.
@@ -1520,6 +1538,7 @@ static uint64_t apr_cb_set_equeue(uint64_t command_size, bool eager_completion,
         for (auto& b : state.cbs)
             if (b.cb == a0) {
                 b.tag = a3; b.eq = a1; b.id = (int64_t)a2;
+                b.eq_identity = prosper_eq_identity(a1);
                 b.deduplicate_completion = eager_completion;
                 b.completion_posted = false;
                 b.fallback_pending = eager_completion && a1 && a3;
@@ -1529,7 +1548,8 @@ static uint64_t apr_cb_set_equeue(uint64_t command_size, bool eager_completion,
                 break;
             }
         if (!seen)
-            state.cbs.push_back({ a0, a3, a1, (int64_t)a2, eager_completion, false,
+            state.cbs.push_back({ a0, a3, a1, prosper_eq_identity(a1), (int64_t)a2,
+                                  eager_completion, false,
                                   eager_completion && a1 && a3,
                                   std::chrono::steady_clock::now() +
                                       std::chrono::milliseconds(10) });
@@ -1590,7 +1610,8 @@ HLE(k_apr_submit) {              // libkernel ASoW5WE-UPo (cb, ring_1based, out1
                            (unsigned long long)a0, (unsigned long long)a1,
                            (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)token,
                            bound ? " (bound)" : "", apr_req_eventful(a0) ? " (arg8-async)" : "");
-    if (tag_echo && should_post) prosper_eq_post_apr_token(bc.eq, bc.id, bc.tag);
+    if (tag_echo && should_post)
+        prosper_eq_post_apr_token(bc.eq, bc.eq_identity, bc.id, bc.tag);
     // Submit consumes the encoded commands. Pathless reuses completed pool buffers without calling
     // the public Reset/ClearBuffer NIDs between batches, so the next append must observe a fresh
     // cursor even though the fixed capacity remains attached to the command-buffer object.
@@ -1892,8 +1913,10 @@ void register_kernel_mem_hle() {
     // libSceAmpr corpus (sceAmprCommandBuffer<Verb>): ClearBuffer and GetSize.
     Hle::register_fn("ULvXMDz56po", (HleFn)k_ampr_x2, "sceAmprCommandBufferClearBuffer");
     Hle::register_fn("tZDDEo2tE5k", (HleFn)k_ampr_getsize, "sceAmprCommandBufferGetSize");
-    Hle::register_fn("Qs1xtplKo0U", (HleFn)k_ampr_x3, "sceAmprAprCommandBufferDestructor");
-    Hle::register_fn("GuchCTefuZw", (HleFn)k_ampr_x4, "sceAmprCommandBufferDestructor");
+    Hle::register_fn("Qs1xtplKo0U", (HleFn)k_ampr_destruct_320,
+                     "sceAmprAprCommandBufferDestructor");
+    Hle::register_fn("GuchCTefuZw", (HleFn)k_ampr_destruct_320,
+                     "sceAmprCommandBufferDestructor");
     // APR completion-event plumbing (issue #115). vWU-odnS+fU (the direct async file read) is
     // registered in hle_file.cpp next to the other APR read path.
     Hle::register_fn("sSAUCCU1dv4", (HleFn)k_ampr_measure_write_equeue,

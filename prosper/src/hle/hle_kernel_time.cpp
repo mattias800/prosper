@@ -514,10 +514,12 @@ namespace {
         std::condition_variable cv;
         std::deque<PendingEvent> ready;
         size_t coalescible_ready = 0;
+        uint64_t identity = 0;
         bool deleted = false;
     };
     PROSPER_HEAP_MUTEX(g_eq_mx);   // #707: heap-backed on macOS (std::mutex would land in the corrupted __DATA cluster)
     std::unordered_map<uint64_t, std::shared_ptr<EqState>> g_eqs;   // guest eq handle -> state
+    std::atomic<uint64_t> g_eq_next_identity{1};
     struct FlipReg { uint64_t eq; int64_t ident; uint64_t udata; };
     std::vector<FlipReg> g_flip_regs, g_vblank_regs;
     // GPU end-of-pipe (EOP) event sources registered via sceGnmAddEqEvent / GraphicsAddEqEvent
@@ -543,13 +545,17 @@ namespace {
     std::map<std::pair<uint64_t, int64_t>, TimerTok> g_timers;
     std::atomic<bool> g_pump_started{false};
 
-    std::shared_ptr<EqState> eq_find(uint64_t eq) {
+    std::shared_ptr<EqState> eq_find(uint64_t eq, uint64_t expected_identity = 0) {
         std::lock_guard lk(g_eq_mx);
         auto it = g_eqs.find(eq);
-        return it == g_eqs.end() ? nullptr : it->second;
+        if (it == g_eqs.end() ||
+            (expected_identity && it->second->identity != expected_identity))
+            return nullptr;
+        return it->second;
     }
-    void eq_post(uint64_t eq, const SceKEvent& e, bool coalesce = true) {
-        auto s = eq_find(eq); if (!s) return;
+    void eq_post(uint64_t eq, const SceKEvent& e, bool coalesce = true,
+                 uint64_t expected_identity = 0) {
+        auto s = eq_find(eq, expected_identity); if (!s) return;
         std::lock_guard<std::mutex> lk(s->m);
         if (s->deleted) return;
         // kqueue semantics: one knote per (ident, filter) — a re-trigger UPDATES the pending event
@@ -749,8 +755,16 @@ void prosper_eq_trigger_eop() {
     q.cv.notify_one();
 }
 
+// Stable identity for the current lifetime of an opaque equeue handle. Allocator address reuse can
+// give a later queue the same handle, so delayed producers must retain and validate this value.
+uint64_t prosper_eq_identity(uint64_t eq) {
+    auto s = eq_find(eq);
+    return s ? s->identity : 0;
+}
+
 HLE(k_eq_create) {
     auto s = std::make_shared<EqState>();
+    s->identity = g_eq_next_identity.fetch_add(1, std::memory_order_relaxed);
     if (a0) *(void**)P(a0) = (void*)s.get();   // the guest's opaque SceKernelEqueue handle IS our state ptr
     { std::lock_guard lk(g_eq_mx); g_eqs[(uint64_t)(uintptr_t)s.get()] = s; }
     if (evlog()) fprintf(stderr, "[ev] CreateEqueue -> eq=%p name=%s\n", (void*)s.get(), a1 ? (const char*)P(a1) : "");
@@ -932,10 +946,11 @@ namespace {
     std::vector<AprEqReg> g_apr_eq_regs;               // guarded by g_apr_mx (registration log)
     uint64_t g_apr_ring_seq[64] = {};                  // per-ring counters for prosper-issued tokens
     uint64_t g_apr_tag_hwm[64] = {};                   // per-ring highest tag counter posted (guarded)
-    void apr_post(const AprEqReg& r, unsigned ring, uint64_t token) {   // no APR lock held
-        SceKEvent e{}; e.ident = r.id + (int64_t)ring; e.filter = EVFILT_AMPR_MODELED;
+    void apr_post(uint64_t eq, uint64_t eq_identity, int64_t id,
+                  unsigned ring, uint64_t token) {   // no APR lock held
+        SceKEvent e{}; e.ident = id + (int64_t)ring; e.filter = EVFILT_AMPR_MODELED;
         e.data = (int64_t)token; e.udata = 0;
-        eq_post(r.eq, e);
+        eq_post(eq, e, /*coalesce=*/true, eq_identity);
     }
 }
 // Post an EXACT guest-chosen completion token (the H896Pt-yB4I binding tag) to the binding's own
@@ -945,7 +960,9 @@ namespace {
 // recorded at post time, not the captured token: two deferred posts can run out of order, and the
 // coalesced knote must never regress the "completed up to" counter (the listener walks
 // last+1..cnt, so the highest counter covers every pending batch on the ring).
-void prosper_eq_post_apr_token(uint64_t eq, int64_t id, uint64_t token) {
+void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
+                               int64_t id, uint64_t token) {
+    if (!eq_identity) return;
     // TWO tag dialects share the H896 binding call, discriminated by the binding's id (a2):
     //   id = 0x74fe+ring (the FAPREventQueueListener channel, #208): tag = (ring<<58)|counter with
     //     a ctor-seeded dense per-ring counter. The listener range-walks last+1..cnt, so the knote
@@ -979,7 +996,7 @@ void prosper_eq_post_apr_token(uint64_t eq, int64_t id, uint64_t token) {
         // no H896/ASoW after it, all delivered events balanced — matches exactly).
         if (evlog()) fprintf(stderr, "[ev] AprPtrTagComplete tag=0x%llx -> eq=0x%llx scheduled\n",
                              (unsigned long long)token, (unsigned long long)eq);
-        struct PtrPost { uint64_t eq; uint64_t token; };
+        struct PtrPost { uint64_t eq, eq_identity, token; };
         struct PtrQueue { std::mutex mx; std::condition_variable cv; std::deque<PtrPost> q; };
         static PtrQueue* pq = new PtrQueue;   // immortal: the worker is detached and outlives exit
         static std::atomic<bool> started{false};
@@ -994,12 +1011,12 @@ void prosper_eq_post_apr_token(uint64_t eq, int64_t id, uint64_t token) {
                 nanosleep(&ts, nullptr);
                 for (auto& p : batch) {
                     SceKEvent e{}; e.ident = 0; e.filter = EVFILT_AMPR_MODELED; e.data = (int64_t)p.token;
-                    eq_post(p.eq, e, /*coalesce=*/false);
+                    eq_post(p.eq, e, /*coalesce=*/false, p.eq_identity);
                 }
                 lk.lock();
             }
         }).detach();
-        { std::lock_guard<std::mutex> lk(pq->mx); pq->q.push_back({ eq, token }); }
+        { std::lock_guard<std::mutex> lk(pq->mx); pq->q.push_back({ eq, eq_identity, token }); }
         pq->cv.notify_one();
         return;
     }
@@ -1011,13 +1028,12 @@ void prosper_eq_post_apr_token(uint64_t eq, int64_t id, uint64_t token) {
     }
     if (evlog()) fprintf(stderr, "[ev] AprTagComplete token=0x%llx (ring=%u) -> eq=0x%llx scheduled\n",
                          (unsigned long long)token, ring, (unsigned long long)eq);
-    std::thread([eq, id, ring] {
+    std::thread([eq, eq_identity, id, ring] {
         struct timespec ts{ 0, 2000000 };   // 2 ms
         nanosleep(&ts, nullptr);
         uint64_t hwm;
         { std::lock_guard lk(g_apr_mx); hwm = g_apr_tag_hwm[ring]; }
-        AprEqReg r{ eq, id };
-        apr_post(r, ring, ((uint64_t)ring << 58) | hwm);
+        apr_post(eq, eq_identity, id, ring, ((uint64_t)ring << 58) | hwm);
     }).detach();
 }
 // Assign the next completion token for `ring` (0-based, 6 bits) — for UNBOUND submits only, whose

@@ -17,6 +17,9 @@ namespace prosper {
 uint32_t prosper_apr_register(const std::string& path, uint64_t size);
 void prosper_apr_reset_for_test();
 void prosper_ampr_advance(uint64_t cb, uint64_t bytes);
+uint64_t prosper_eq_identity(uint64_t eq);
+void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
+                               int64_t id, uint64_t token);
 }
 
 static int fails = 0;
@@ -48,11 +51,12 @@ int main() {
     HleFn get_size       = Hle::lookup("tZDDEo2tE5k");
     HleFn get_offset     = Hle::lookup("GnxKOHEawhk");
     HleFn submit         = Hle::lookup("ASoW5WE-UPo");
+    HleFn destruct       = Hle::lookup("GuchCTefuZw");
     HleFn add_ampr_event = Hle::lookup("bBfz7kMF2Ho");
     HleFn read_file     = Hle::lookup("vWU-odnS+fU");
     CHECK(write_address && write_equeue && write_equeue_320 && append_equeue && append_equeue_320 &&
-              construct && reset && clear && get_size && get_offset && submit && add_ampr_event &&
-              read_file,
+              construct && reset && clear && get_size && get_offset && submit && destruct &&
+              add_ampr_event && read_file,
           "AMPR measure and completion-event NIDs registered");
     if (add_ampr_event)
         CHECK(add_ampr_event(0, 0, 0, 0, 0, 0) == 0,
@@ -118,7 +122,8 @@ int main() {
     auto delete_eq = Hle::lookup(nid_hash("sceKernelDeleteEqueue"));
     auto wait_eq = Hle::lookup(nid_hash("sceKernelWaitEqueue"));
     auto get_count = Hle::lookup(nid_hash("sceKernelGetEventCount"));
-    if (construct && append_equeue_320 && submit && create_eq && delete_eq && wait_eq && get_count) {
+    if (construct && append_equeue_320 && submit && destruct && create_eq && delete_eq && wait_eq &&
+        get_count) {
         uint64_t eq = 0;
         create_eq((uint64_t)(uintptr_t)&eq, 0, 0, 0, 0, 0);
         std::array<uint64_t, 8> tail_storage{};
@@ -150,6 +155,36 @@ int main() {
                   get_count(eq, 0, 0, 0, 0, 0) == 0,
               "explicit submit wins the fallback race without a duplicate completion");
         delete_eq(eq, 0, 0, 0, 0, 0);
+
+        uint64_t stale_eq = 0;
+        create_eq((uint64_t)(uintptr_t)&stale_eq, 0, 0, 0, 0, 0);
+        const uint64_t stale_identity = prosper_eq_identity(stale_eq);
+        std::array<uint64_t, 8> stale_storage{};
+        const uint64_t stale_cb = (uint64_t)(uintptr_t)stale_storage.data();
+        construct(stale_cb, 0, 0x560, 0, 0, 0);
+        append_equeue_320(stale_cb, stale_eq, (uint64_t)event_id, tail_tag + 2, 0, 0);
+        delete_eq(stale_eq, 0, 0, 0, 0, 0);
+        uint64_t replacement_eq = 0;
+        create_eq((uint64_t)(uintptr_t)&replacement_eq, 0, 0, 0, 0, 0);
+        const uint64_t replacement_identity = prosper_eq_identity(replacement_eq);
+        CHECK(stale_identity && replacement_identity && stale_identity != replacement_identity,
+              "replacement equeue receives a distinct lifetime identity");
+        prosper_eq_post_apr_token(replacement_eq, stale_identity,
+                                  event_id, tail_tag + 3);
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        CHECK(get_count(replacement_eq, 0, 0, 0, 0, 0) == 0,
+              "deleted AMPR queue cannot post into a replacement lifetime");
+
+        std::array<uint64_t, 8> destroyed_storage{};
+        const uint64_t destroyed_cb = (uint64_t)(uintptr_t)destroyed_storage.data();
+        construct(destroyed_cb, 0, 0x560, 0, 0, 0);
+        append_equeue_320(destroyed_cb, replacement_eq, (uint64_t)event_id,
+                          tail_tag + 4, 0, 0);
+        destruct(destroyed_cb, 0, 0, 0, 0, 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        CHECK(get_count(replacement_eq, 0, 0, 0, 0, 0) == 0,
+              "destroying a PS5 3.20 command buffer cancels its pending tail");
+        delete_eq(replacement_eq, 0, 0, 0, 0, 0);
     }
 #endif
     if (read_file) {
