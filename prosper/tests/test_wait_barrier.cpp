@@ -11,6 +11,8 @@
 //      recycled labels — the #312 stomp), and a later WAIT on a gated address evaluates in ring
 //      order (after the gated writes it must observe) — but effects to untouched addresses FLOW
 //      (gating them created a CPU<->GPU circular stall, an early-boot wedge measured live).
+//      The domain is queue-local: an Acb producer may write the address that a paused Dcb is waiting
+//      on, while DcbFinal remains ordered with the ordinary Dcb graphics queue.
 //   4. A Jump executed inside a paused stream must NOT un-gate the parent's remaining effects
 //      (the recursive fold once reset the pause flag — the WAIT_DEFER wedge/ordering bug), and the
 //      jump target's own memory effects are gated too.
@@ -132,6 +134,56 @@ int main() {
         CHECK(L == 2, "same-address writes landed in ring order (final = later write)");
         CHECK(N == 1, "gated-address wait evaluated in ring order and released its stream");
         CHECK(!deferred_pending(), "queue fully drained");
+    }
+
+    // ArcRunner uses a real async-compute queue. Its ACB release must be able to satisfy a paused
+    // graphics wait even when the graphics tail has a pending write to the same recycled label.
+    // Conversely, SubmitDcbFinal is another entry point for the SAME graphics queue and must not
+    // overtake that tail.
+    {
+        volatile uint64_t label = 0;
+        volatile uint64_t async_condition = 0;
+        uint64_t graphics_tail = 0, async_tail = 0;
+        uint32_t graphics[8 + 7 + 7], async_wait[8 + 7], async_producer[7];
+        emit_wait_eq(graphics, (uint64_t)(uintptr_t)&label, 1);
+        emit_release(graphics + 8, (uint64_t)(uintptr_t)&label, 0);
+        emit_release(graphics + 15, (uint64_t)(uintptr_t)&graphics_tail, 1);
+        emit_wait_eq(async_wait, (uint64_t)(uintptr_t)&async_condition, 1);
+        emit_release(async_wait + 8, (uint64_t)(uintptr_t)&async_tail, 1);
+        emit_release(async_producer, (uint64_t)(uintptr_t)&label, 1);
+
+        prosper_gpu_set_fold_origin(1);                  // SubmitDcb
+        GpuState graphics_state;
+        run_cb(graphics, 22, graphics_state);
+        prosper_gpu_set_fold_origin(2);                  // SubmitAcb, independent queue
+        GpuState async_state;
+        run_cb(async_wait, 15, async_state);
+        async_condition = 1;
+        flush_deferred_streams();
+        CHECK(async_tail == 1, "ready async-compute tail drained past a blocked graphics front");
+        CHECK(label == 0 && graphics_tail == 0 && deferred_pending(),
+              "async drain did not disturb the blocked graphics queue");
+        run_cb(async_producer, 7, async_state);
+        CHECK(label == 1, "async-compute producer flowed around a paused graphics queue");
+        CHECK(graphics_tail == 0, "graphics tail remained gated until its wait was re-checked");
+        flush_deferred_streams();
+        CHECK(label == 0 && graphics_tail == 1,
+              "async producer released the graphics tail in graphics-stream order");
+        CHECK(!deferred_pending(), "cross-queue dependency fully drained");
+
+        label = 0;
+        graphics_tail = 0;
+        prosper_gpu_set_fold_origin(1);                  // SubmitDcb
+        run_cb(graphics, 22, graphics_state);
+        prosper_gpu_set_fold_origin(3);                  // SubmitDcbFinal, same graphics queue
+        run_cb(async_producer, 7, graphics_state);
+        CHECK(label == 0, "DcbFinal cannot overtake a paused Dcb at the same address");
+        label = 1;                                       // external producer releases the queue
+        flush_deferred_streams();
+        CHECK(label == 1 && graphics_tail == 1,
+              "Dcb and DcbFinal tails drained in graphics-queue order");
+        CHECK(!deferred_pending(), "graphics queue fully drained");
+        prosper_gpu_set_fold_origin(0);
     }
 
     // 4: a Jump inside a paused stream — the jump target's ReleaseMem must be gated with the

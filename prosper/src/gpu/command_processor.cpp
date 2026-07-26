@@ -21,8 +21,10 @@ namespace prosper { void prosper_eq_trigger_eop(); }
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <chrono>
 #include <atomic>
+#include <array>
 #include <deque>
 #include <unordered_set>
 #include <condition_variable>
@@ -1452,12 +1454,10 @@ bool pend_overlay_qword(uint64_t addr, uint64_t* value) {
 //     dissolves that isolation.
 //
 // The model (opt-in via PROSPER_WAIT_DEFER=1; default = the old barrel-on behavior):
-//   - prosper models ONE submission queue today: both driver entry points (sceAgcDriverSubmitDcb
-//     and the w1KFAHVqpaU final-submit variant) feed the same guest gfx ring — the guest's own
-//     SubmitCommandBuffers batch splits its buffer array across BOTH (RE'd at eboot+0x220a9a0),
-//     so they are one stream and MUST keep mutual order. Compute rides the same Dcb
-//     (DISPATCH_DIRECT inline). The only cross-queue producers are guest CPU label writes, which
-//     are never gated by us.
+//   - Dcb and DcbFinal feed the same guest graphics ring — the guest's own SubmitCommandBuffers
+//     batch splits its buffer array across BOTH (RE'd at eboot+0x220a9a0), so they MUST keep mutual
+//     order. SubmitAcb is a distinct async-compute queue: ArcRunner submits real ACB producers, and
+//     queue provenance showed their DMA/Release effects must flow while a graphics wait is paused.
 //   - When a fold hits an UNSATISFIED wait, ITS stream pauses: the wait and this stream's
 //     remaining guest-visible memory effects (ReleaseMem / EVENT_WRITE / WRITE_DATA / DMA_DATA,
 //     and further waits) defer IN ORDER behind the barrier.
@@ -1471,14 +1471,11 @@ bool pend_overlay_qword(uint64_t addr, uint64_t* value) {
 //     — gating them recreated a CPU<->GPU circular stall (guest polls fence F gated behind barrier
 //     W; the guest write that would satisfy W happens after F's poll -> 1 s timeout cascade,
 //     measured as an early-boot wedge + violation stomps).
-//   - The gated tail releases in STRICT submission order (one FIFO), so every gated write lands
-//     in ring order; it is re-checked at every subsequent submit and by hle_agc's 2 ms watchdog
-//     ticker; the front barrier releases the moment it reads satisfied (a pend-queue fence write
-//     from an earlier submit, a flowing later fence, or a CPU-written label — real producers
-//     measured up to ~216 ms under load). Later same-queue writes to an awaited address are NOT
-//     gated by the wait itself: WAIT_REG_MEM polls memory, so a later write satisfying an earlier
-//     blocked wait matches hardware (the producer is another engine/queue/CPU from the ring's
-//     point of view).
+//   - Each gated tail releases in STRICT FIFO order WITHIN ITS HARDWARE QUEUE. A blocked graphics
+//     stream cannot hold an async-compute producer (or vice versa); after another queue makes
+//     progress the blocked fronts are re-checked in the same flush. The watchdog also re-checks
+//     every 2 ms. Later writes to an awaited address are not gated by the wait alone: WAIT_REG_MEM
+//     polls memory, so a producer from another queue/engine/CPU must be able to satisfy it.
 //   - NEVER gated (liveness, measured: gating these wedged every naive-pause run): draws/register
 //     state (touch no guest memory) and the in-stream Flip (the frame pacer; on real HW the flip
 //     engine signals independently). The submit's EOP equeue PULSE follows the hardware
@@ -1496,7 +1493,7 @@ bool pend_overlay_qword(uint64_t addr, uint64_t* value) {
 // All of this runs under the caller's submit mutex (hle_agc g_agc_state_mu).
 // CONFIDENCE: HIGH on the wait semantics (Kyty/shadPS4 both block the queue's execution thread
 // until the condition holds — deferral-in-order is the synchronous-fold equivalent) and on the
-// single-queue strict-FIFO ordering (it is what the ring guarantees on hardware); MED on the
+// queue-local strict-FIFO ordering (it is what each ring guarantees on hardware); MED on the
 // never-gated flip/EOP-pulse liveness exceptions (hardware would order them too, but gating them
 // deadlocks our synchronous fold — the re-pulse keeps the guest-observable protocol sound).
 namespace {
@@ -1534,6 +1531,7 @@ struct DeferItem {
 struct DeferredStream {
     std::vector<DeferItem> items;
     size_t next = 0;
+    uint8_t queue = 0;                    // 0=graphics (Dcb/DcbFinal/unknown), 1=async compute (Acb)
     // A retained address DMA cannot execute through this legacy queue. Preserve effects before the
     // rejected copy, but discard every same-stream completion effect appended after it so stale work
     // cannot later signal success when the wait releases.
@@ -1543,6 +1541,7 @@ struct DeferredStream {
 std::vector<DeferredStream> g_deferred;   // paused queue tails; guarded by the caller's submit mutex
 bool     g_fold_deferring = false;        // current fold hit an unsatisfied wait
 bool     g_fold_discard_deferred_suffix = false;
+uint8_t  g_fold_origin = 0;               // current submit entry point; set under the submit mutex
 uint64_t g_defer_streams = 0, g_defer_timeouts = 0;
 size_t   g_defer_items = 0;               // total queued items across streams (memory guard)
 // 1000 ms default. The timeout is the CORRUPTION knob, not a perf knob: every timeout is a
@@ -1562,6 +1561,15 @@ uint64_t defer_timeout_ms() {
 }
 constexpr size_t   kDeferMaxStreams = 256;   // runaway guard: force-flush oldest beyond this
 constexpr size_t   kDeferMaxItems = 200000;  // memory guard (#312 WAIT_DEFER OOM): force-flush
+constexpr size_t   kDeferredQueueCount = 2;
+
+// SubmitDcbFinal is the final packet buffer of the ordinary graphics queue, not a third queue.
+// Unknown origins retain the historical graphics behavior for direct/test callers.
+size_t deferred_queue(uint8_t origin) { return origin == 2 ? 1u : 0u; }
+bool queue_pending(size_t queue) {
+    return std::any_of(g_deferred.begin(), g_deferred.end(),
+                       [queue](const DeferredStream& s) { return s.queue == queue; });
+}
 
 // Opt-in gate for the whole model (PROSPER_WAIT_DEFER=1). Default OFF = the pre-#312 barrel-on
 // behavior — see the measured verdict in the model block above for why this is not (yet) the
@@ -1576,12 +1584,12 @@ bool defer_enabled() {
 
 // --- Per-address ordering domains: which guest addresses currently have a GATED pending write.
 // Small writes (fence labels — the protocol-critical case) index by 8-byte granule in a hash set;
-// large fills (the 64 KiB DmaData chunk zero-fills) go in a range list. Entries accumulate while
-// the queue tail is non-empty and are cleared when it fully drains: a partial drain can leave
-// STALE entries, which only OVER-gates (an extra write joins the ordered tail — safe, order is
-// still exact; the tail drains within the watchdog cadence anyway).
-std::unordered_set<uint64_t> g_gated_granules;                 // addr >> 3
-std::vector<std::pair<uint64_t, uint64_t>> g_gated_ranges;     // [lo, hi)
+// large fills (the 64 KiB DmaData chunk zero-fills) go in a range list. Each queue has its own
+// domain: entries accumulate while that queue's tail is non-empty and clear when it drains. A
+// partial drain can leave STALE entries, which only OVER-gate later work on the same queue (safe;
+// the tail drains within the watchdog cadence anyway).
+std::array<std::unordered_set<uint64_t>, kDeferredQueueCount> g_gated_granules;             // addr >> 3
+std::array<std::vector<std::pair<uint64_t, uint64_t>>, kDeferredQueueCount> g_gated_ranges; // [lo, hi)
 // The guest-memory span a command writes (0 bytes = writes nothing we track).
 void effect_span(const Pm4Command& c, uint64_t* addr, uint64_t* bytes) {
     using K = Pm4Command::Kind;
@@ -1597,30 +1605,32 @@ void gated_register(const Pm4Command& c) {
     uint64_t a = 0, n = 0;
     effect_span(c, &a, &n);
     if (!a || !n) return;
+    const size_t queue = deferred_queue(c.queue_origin);
     if (n <= 32) {
-        for (uint64_t g = a >> 3; g <= ((a + n - 1) >> 3); g++) g_gated_granules.insert(g);
+        for (uint64_t g = a >> 3; g <= ((a + n - 1) >> 3); g++) g_gated_granules[queue].insert(g);
     } else {
-        g_gated_ranges.emplace_back(a, a + n);
+        g_gated_ranges[queue].emplace_back(a, a + n);
     }
 }
-bool addr_gated(uint64_t a, uint64_t n) {
+bool addr_gated(uint64_t a, uint64_t n, uint8_t origin) {
     if (!a || !n) return false;
-    if (!g_gated_granules.empty())
+    const size_t queue = deferred_queue(origin);
+    if (!g_gated_granules[queue].empty())
         for (uint64_t g = a >> 3; g <= ((a + n - 1) >> 3); g++)
-            if (g_gated_granules.count(g)) return true;
-    for (const auto& r : g_gated_ranges)
+            if (g_gated_granules[queue].count(g)) return true;
+    for (const auto& r : g_gated_ranges[queue])
         if (a < r.second && r.first < a + n) return true;
     return false;
 }
 bool effect_gated(const Pm4Command& c) {
     uint64_t a = 0, n = 0;
     effect_span(c, &a, &n);
-    return addr_gated(a, n);
+    return addr_gated(a, n, c.queue_origin);
 }
 
 // Should this command join the gated tail? Yes when its own fold is paused (everything downstream
 // of the fold's unsatisfied wait keeps stream order), or when it writes into an address domain
-// that already has a gated pending write (per-address ring order across folds).
+// that already has a gated pending write from the SAME queue (per-address ring order across folds).
 bool defer_gate(const Pm4Command& c) {
     if (g_fold_deferring) return true;
     if (g_deferred.empty()) return false;
@@ -1631,6 +1641,7 @@ bool g_fold_stream_open = false;   // current top-level fold already opened its 
 void defer_push(const Pm4Command& c) {
     if (!g_fold_stream_open) {     // one deferred stream per fold that defers anything
         g_deferred.emplace_back();
+        g_deferred.back().queue = static_cast<uint8_t>(deferred_queue(c.queue_origin));
         if (g_fold_discard_deferred_suffix) {
             g_deferred.back().discard_from = 0;
             g_deferred.back().suppress_completion = true;
@@ -1701,40 +1712,46 @@ bool deferred_pending()   { return !g_deferred.empty(); }
 // pending lets the scan observe a half-retired frame, free live label blocks, and take the stomp
 // when the gated write lands — corruption WITHOUT any ordering violation among the writes
 // themselves (observed live: stomps with zero DEFER timeouts). So: a submit's pulse fires
-// immediately only when the gated tail is empty; otherwise it is OWED and fires when the tail
-// fully drains (flush below). Liveness: flips flow regardless, the 2 ms watchdog drains the tail
-// the moment its front barrier satisfies, and the timeout bounds a genuinely-stuck barrier.
+// immediately only when its queue's gated tail is empty; otherwise it is OWED and fires when that
+// tail fully drains (flush below). The other queue's pulse remains independent. Liveness: flips
+// flow regardless, the 2 ms watchdog drains a tail the moment its front barrier satisfies, and the
+// timeout bounds a genuinely-stuck barrier.
 // CONFIDENCE: HIGH on the hardware contract (ring-ordered interrupt), MED that pulse-on-full-
 // drain (vs per-stream) is the right granularity — it only errs later, the safe direction.
-namespace { uint64_t g_owed_pulses = 0; }
+namespace { std::array<uint64_t, kDeferredQueueCount> g_owed_pulses{}; }
 void submit_completion_pulse(bool submit_rejected) {
+    const size_t queue = deferred_queue(g_fold_origin);
+    const bool pending = queue_pending(queue);
     if (getenv("PROSPER_EOPLOG")) {
         static uint64_t call = 0;
-        fprintf(stderr, "[eop-pulse] #%llu rejected=%d deferred_empty=%d owed=%llu -> %s\n",
-                (unsigned long long)++call, submit_rejected ? 1 : 0, g_deferred.empty() ? 1 : 0,
-                (unsigned long long)g_owed_pulses,
-                submit_rejected ? "SKIP(rejected)" : (g_deferred.empty() ? "FIRE" : "OWE"));
+        fprintf(stderr, "[eop-pulse] #%llu queue=%s rejected=%d queue_pending=%d owed=%llu -> %s\n",
+                (unsigned long long)++call, queue ? "Acb" : "Dcb", submit_rejected ? 1 : 0,
+                pending ? 1 : 0, (unsigned long long)g_owed_pulses[queue],
+                submit_rejected ? "SKIP(rejected)" : (!pending ? "FIRE" : "OWE"));
     }
     if (submit_rejected) return;
-    if (!g_deferred.empty()) { g_owed_pulses++; return; }
+    if (pending) { g_owed_pulses[queue]++; return; }
     prosper_eq_trigger_eop();
 }
 
 // Release deferred streams (call at every submit and from hle_agc's watchdog ticker, under the
-// submit mutex). STRICT QUEUE FIFO (#312): the deferred streams are the paused tail of prosper's
-// single submission queue — items apply strictly in submission order, and the front stream's
-// blocked barrier holds everything behind it (exactly the ring order hardware guarantees;
-// releasing later streams around a blocked one was measured to re-seed the corruption). A barrier
+// submit mutex). STRICT PER-QUEUE FIFO (#312/#1226): items apply in submission order within Dcb or
+// Acb, and a front barrier holds later streams from that queue. The other queue keeps running, as
+// hardware requires; the submit boundaries and watchdog re-check every blocked front. A barrier
 // pending > defer_timeout_ms() proceeds with the pre-#312 "dependency violated" loud log (liveness
-// backstop). Returns how many streams fully completed.
+// backstop). Returns how many streams fully completed across both queues.
 int flush_deferred_streams() {
     if (g_deferred.empty()) return 0;
     // Legacy SDK callers retain the original eager visibility. Modern callers consult the pending
     // scalar overlay instead, so their completion labels remain post-submit.
     if (!post_submit_visibility_enabled()) prosper_gpu_drain_completion_writes();
-    int completed = 0, signalable_completed = 0;
+    int completed = 0;
+    std::array<int, kDeferredQueueCount> signalable_completed{};
+    std::array<bool, kDeferredQueueCount> blocked_queue{};
     for (size_t si = 0; si < g_deferred.size(); ) {
         DeferredStream& s = g_deferred[si];
+        const size_t queue = s.queue;
+        if (blocked_queue[queue]) { si++; continue; }
         bool blocked = false;
         bool force = g_deferred.size() > kDeferMaxStreams || g_defer_items > kDeferMaxItems;
         while (s.next < s.items.size()) {
@@ -1783,25 +1800,28 @@ int flush_deferred_streams() {
             apply_deferred_effect(it.cmd);
             s.next++;
         }
-        if (blocked) break;   // strict FIFO: the front barrier holds the whole gated tail
+        if (blocked) {
+            blocked_queue[queue] = true;   // later streams in THIS queue cannot overtake
+            si++;
+            continue;
+        }
         g_defer_items -= s.items.size() < g_defer_items ? s.items.size() : g_defer_items;
-        signalable_completed += !s.suppress_completion;
+        signalable_completed[queue] += !s.suppress_completion;
         g_deferred.erase(g_deferred.begin() + si);
         completed++;
     }
-    if (g_deferred.empty()) {
-        // Address-domain index entries are added per gated item and only cleared here, on full
-        // drain (a partial drain leaves stale entries that merely over-gate — see the index note).
-        g_gated_granules.clear();
-        g_gated_ranges.clear();
-        // The tail is fully visible again: deliver every owed EOP pulse (one per submit whose
-        // pulse was withheld while gated writes were pending — see submit_completion_pulse).
-        // Distinct pulses, not coalesced (#236: a lost completion is a lost semaphore). This is
-        // also the re-pulse that wakes an equeue waiter which consumed an earlier pulse and found
-        // its label still gated (DOLL's "GameThread timed out waiting for RenderThread" wedge).
-        uint64_t owed = g_owed_pulses;
-        g_owed_pulses = 0;
-        if (!owed && signalable_completed > 0) owed = 1; // valid deferral began before pulse was owed
+
+    for (size_t queue = 0; queue < kDeferredQueueCount; queue++) {
+        if (queue_pending(queue)) continue;
+        // Address-domain entries are queue-local. Clear them as soon as that queue drains so a
+        // blocked peer queue cannot over-gate future work from this one.
+        g_gated_granules[queue].clear();
+        g_gated_ranges[queue].clear();
+        // Deliver every pulse owed by submissions from this queue. A blocked peer queue retains its
+        // own pulses; an Acb completion must not wait for an unrelated Dcb barrier (and vice versa).
+        uint64_t owed = g_owed_pulses[queue];
+        g_owed_pulses[queue] = 0;
+        if (!owed && signalable_completed[queue] > 0) owed = 1;
         while (owed--) prosper_eq_trigger_eop();
     }
     return completed;
@@ -2126,7 +2146,8 @@ void GpuState::apply(const Pm4Command& c) {
             if (c.dd_src > UINT32_MAX) {
                 if (!c.dd_valid) { report_invalid_dma_data(c); break; }
                 const bool gated_destination = defer_gate(c);
-                const bool gated_source = !g_deferred.empty() && addr_gated(c.dd_src, c.dd_bytes);
+                const bool gated_source = !g_deferred.empty() &&
+                                          addr_gated(c.dd_src, c.dd_bytes, c.queue_origin);
                 if (gated_destination || gated_source) {
                     dma_copies.push_back({c.dd_dst, c.dd_src, c.dd_bytes, c.dd_sels,
                                           command_order, pkt_addr(c)});
@@ -2181,7 +2202,8 @@ void GpuState::apply(const Pm4Command& c) {
                 // has a GATED PENDING WRITE (an earlier-in-ring write it must observe): evaluating
                 // now against the stale value could wrong-satisfy — join the tail in ring order.
                 // (The rest of this fold's effects then gate too: stream order.)
-                if (g_fold_deferring || (!g_deferred.empty() && addr_gated(c.wm_addr, 8))) {
+                if (g_fold_deferring ||
+                    (!g_deferred.empty() && addr_gated(c.wm_addr, 8, c.queue_origin))) {
                     g_fold_deferring = true;
                     defer_push(c);
                     break;
@@ -2322,8 +2344,8 @@ void GpuState::apply(const Pm4Command& c) {
 
 // #1226: the submit entry point currently folding (1=SubmitDcb, 2=SubmitAcb, 3=SubmitDcbFinal).
 // Set by hle_agc under g_agc_state_mu (all folds are serialized), stamped onto every decoded
-// command so deferred/pended effects retain their queue of origin. Diagnostic only.
-namespace { uint8_t g_fold_origin = 0; }
+// command so deferred/pended effects retain their queue of origin and barrier scheduling can keep
+// Dcb/DcbFinal ordered independently from Acb.
 extern "C" void prosper_gpu_set_fold_origin(uint8_t origin) { g_fold_origin = origin; }
 
 size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st) {

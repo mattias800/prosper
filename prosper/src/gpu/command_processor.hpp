@@ -192,14 +192,18 @@ size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st);
 // deferred_pending(): one or more deferred streams still hold gated effects — the caller must
 // ensure a re-check cadence exists (hle_agc's 2 ms watchdog) so a satisfied/timed-out barrier
 // releases even if the guest never submits again.
-// flush_deferred_streams(): release the queue's gated tail in strict submission order (call at
-// every submit, under the same submit mutex as run_command_buffer); returns how many streams
-// fully completed, and re-fires the EOP equeue pulse when any did.
+// flush_deferred_streams(): release each queue's gated tail in strict queue-local submission order
+// (call at every submit, under the same submit mutex as run_command_buffer); returns how many
+// streams fully completed, and re-fires that queue's owed EOP equeue pulses when it drains.
 bool last_fold_deferred();
 bool deferred_pending();
 int  flush_deferred_streams();
-// submit_completion_pulse(): fire the submit's GPU-EOP equeue pulse — immediately when no gated
-// writes are pending, else OWED and delivered when the gated tail drains (the hardware contract:
+// Select the hardware queue represented by the next fold (0=unknown/graphics, 1=Dcb,
+// 2=Acb async compute, 3=DcbFinal). Submit entry points set this while holding their shared mutex;
+// tests use it to exercise cross-queue ordering.
+extern "C" void prosper_gpu_set_fold_origin(uint8_t origin);
+// submit_completion_pulse(): fire the submit's GPU-EOP equeue pulse — immediately when its queue
+// has no gated writes pending, else OWED and delivered when that queue's tail drains (the contract:
 // the EOP interrupt fires only after everything before it in the ring executed; pulsing earlier
 // lets the guest's completion scan free label blocks our gated writes then stomp — see the
 // visibility-contract block in command_processor.cpp). Call instead of prosper_eq_trigger_eop
