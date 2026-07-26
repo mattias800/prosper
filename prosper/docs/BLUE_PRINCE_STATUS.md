@@ -1,7 +1,8 @@
 # Blue Prince (PPSA25009, Unity/IL2CPP) — status & investigation map
 
-Last revised: 2026-07-26 (materials fixed — #1287 families 1-3 resolved; see below). Prior history: #1216 (closed —
-boot/blank-frame era), #1264 (Day One hold investigation), #1287 (visuals umbrella, open).
+Last revised: 2026-07-26 (materials fixed and residual vanished draws triaged; see below). Prior history:
+#1216 (closed — boot/blank-frame era), #1264 (Day One hold investigation), #1287 (visuals umbrella,
+open).
 
 ## Ladder position
 
@@ -56,8 +57,9 @@ The `blue-prince-title` snapshot route guards the title screen.
 ## Defect families (#1287) — families 1–3 and 5 RESOLVED 2026-07-26
 
 Families 1–3 and 5 below are **fixed on master**; they are retained as the resolution record so
-the evidence is not re-chased. Only family 4 remains open, plus the two #1427 remainders tracked
-in #1435 (a ctest-resident truncation guard, and triage of the 27 still-vanished hall draws).
+the evidence is not re-chased. Only family 4 remains open. Both #1427 remainders tracked in #1435
+are resolved: #1440 added the ctest-resident truncation guard, and the residual 27 vanished draws
+were confirmed as legitimate frustum culls.
 
 1. **RESOLVED — concentric ring/band moiré** radiating from lights. It was never
    light-accumulation math: the ring structure was the *palette/material atlas* sampled through
@@ -95,8 +97,12 @@ in #1435 (a ctest-resident truncation guard, and triage of the 27 still-vanished
    drops vanished draws to 27/248 and renders the hall at oracle parity
    (`docs/screenshots/issue-1427-oracle-before-after.png`). The old bisection range recorded here
    (operations 1100-1200) was a red herring produced by the isolated-draw depth trap — do not
-   resume it. Remaining: the 27 still-vanished draws, some plausibly legitimate off-screen culling
-   (triage tracked in #1435), and the bouquet's confetti-coloured flowers.
+   resume it. The residual 27/248 `GEOMETRY-VANISH` draws were each checked with
+   `PROSPER_GEOM_PROBE`: all wrote their expected finite vertex count, retained real positional
+   spread and healthy topology, and landed wholly outside the clip volume or behind the camera.
+   None had the pre-fix `unique-pos<=2` collapse signature; the repeated transparent-pass meshes
+   reproduced the same off-screen bounds as their opaque passes (#1435). The bouquet's
+   confetti-coloured flowers remain part of family 4.
 
 ## Capsule & artifact inventory (`~/bp-1264/`, all run-local addresses)
 
