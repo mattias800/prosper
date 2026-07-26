@@ -2236,6 +2236,8 @@ extern uint64_t g_apr_last_cb, g_apr_last_cb_size;
 // Mark an APR request frame eventful (async streaming read -> equeue completion event) or sync;
 // consumed by the ASoW5WE-UPo submit handler (hle_kernel_mem.cpp, issue #180).
 void prosper_apr_mark_eventful(uint64_t req, bool eventful);
+// Account for the encoded ReadFile record in the command buffer's GetCurrentOffset state.
+void prosper_ampr_advance(uint64_t cb, uint64_t bytes);
 // Tracked-mapping state probe (hle_kernel_mem.cpp): 1 = addr is inside a guest-RESERVED range
 // whose pages lazy-commit on first touch. Used by the read path's dst-write to replicate the
 // fault handler's commit-on-write semantics for kernel-side (process_vm_writev) copies.
@@ -2621,6 +2623,7 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
     if (!ok || in_dst) {
         munmap(slot, rounded);   // failure: record stays -> guest reports it; success-into-dst: staging no longer needed
     }
+    if (ok) prosper_ampr_advance(a0, (offset >> 32) ? 24 : 20);
     if (filelog()) fprintf(stderr, "[apr] read-submit id=%llu %s -> dst=0x%llx(%s) off=0x%llx size=%llu got=%lld %s\n",
                    (unsigned long long)id, host.c_str(),
                    in_dst ? (unsigned long long)a4 : (unsigned long long)(uintptr_t)slot,
@@ -2656,6 +2659,7 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
             *(uint64_t*)(uintptr_t)(a2 + 0x10) = size;
     }
     if (in_dst) ::free(slot);
+    prosper_ampr_advance(a0, (offset >> 32) ? 24 : 20);
     if (filelog()) fprintf(stderr,
         "[apr] read-submit id=%llu %s -> dst=0x%llx(%s) off=0x%llx size=%llu got=%llu OK\n",
         (unsigned long long)id, host.c_str(),

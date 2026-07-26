@@ -8,6 +8,11 @@
 #include "sync_futex.hpp"   // shared futex wake + waiter registration (also used by the GPU's label wake)
 #include "../host/guest_memory_map.hpp"
 #include "../host/guest_write_watch.hpp"
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 
 namespace prosper {
 // #312/#946 huge-reserve redirect threshold, shared by the Linux and Windows reserve paths (one
@@ -15,6 +20,70 @@ namespace prosper {
 // (only UE's 512 GiB MallocBinned3 flex arena qualifies) is steered off its low hint into the
 // guest auto window. See k_reserve_vrange (POSIX) / win_reserve (Windows).
 inline constexpr uint64_t kHugeReserveLen = 0x2000000000ull;   // 128 GiB
+
+// libSceAmpr command-buffer accounting is host-platform independent. UE4 batches commands until
+// `GetSize(cb) - GetCurrentOffset(cb)` can no longer hold the next packet, then submits that cb.
+// Keep the fixed capacity and appended-byte cursor together so constructor and reset operations
+// cannot leave half-stale state when guest addresses are recycled.
+namespace {
+struct AmprCbState { uint64_t capacity = 0, offset = 0; bool tracks_offset = false; };
+std::mutex g_ampr_cb_state_mx;
+std::unordered_map<uint64_t, AmprCbState> g_ampr_cb_state;
+
+uint64_t ampr_cb_capacity_arg(uint64_t a1, uint64_t a2, uint64_t a5) {
+    // Observed constructor shapes place capacity in a1 (APR request), a2 (Pathless IoStore batch),
+    // or a5 (DOLL IoStore batch). Pointer-valued arguments are outside this conservative bound.
+    if (a1 && a1 <= 0x100000) return a1;
+    // DOLL uses a2=1 as a mode flag and carries capacity in a5. Pathless's PS5 3.20 shape instead
+    // supplies the actual command-buffer size in a2, so accept only a plausible packet capacity.
+    if (a2 >= 0x20 && a2 <= 0x100000) return a2;
+    if (a5 && a5 <= 0x100000) return a5;
+    return 0;
+}
+
+void ampr_cb_construct(uint64_t cb, uint64_t capacity, bool tracks_offset) {
+    if (!cb) return;
+    std::lock_guard<std::mutex> lock(g_ampr_cb_state_mx);
+    if (g_ampr_cb_state.size() >= 4096 && !g_ampr_cb_state.count(cb))
+        g_ampr_cb_state.erase(g_ampr_cb_state.begin());
+    auto& state = g_ampr_cb_state[cb];
+    // Several SDK flows refresh a live object through a constructor-shaped call whose size slots
+    // are all zero/pointers. The previous capacity map updated only when it decoded a nonzero size;
+    // preserve that contract instead of erasing a valid capacity on the refresh.
+    if (capacity) state.capacity = capacity;
+    state.offset = 0;
+    state.tracks_offset = tracks_offset;
+}
+
+void ampr_cb_reset(uint64_t cb) {
+    if (!cb) return;
+    std::lock_guard<std::mutex> lock(g_ampr_cb_state_mx);
+    auto it = g_ampr_cb_state.find(cb);
+    if (it != g_ampr_cb_state.end()) it->second.offset = 0;
+}
+
+uint64_t ampr_cb_capacity(uint64_t cb) {
+    std::lock_guard<std::mutex> lock(g_ampr_cb_state_mx);
+    auto it = g_ampr_cb_state.find(cb);
+    return it == g_ampr_cb_state.end() ? 0 : it->second.capacity;
+}
+
+uint64_t ampr_cb_offset(uint64_t cb) {
+    std::lock_guard<std::mutex> lock(g_ampr_cb_state_mx);
+    auto it = g_ampr_cb_state.find(cb);
+    return it == g_ampr_cb_state.end() ? 0 : it->second.offset;
+}
+}
+
+// The ReadFile builder lives in hle_file.cpp; expose the one state transition it shares with the
+// other AMPR builders without exposing the map itself.
+void prosper_ampr_advance(uint64_t cb, uint64_t bytes) {
+    if (!cb || !bytes) return;
+    std::lock_guard<std::mutex> lock(g_ampr_cb_state_mx);
+    auto it = g_ampr_cb_state.find(cb);
+    if (it != g_ampr_cb_state.end() && it->second.tracks_offset)
+        it->second.offset += bytes;
+}
 }
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -1154,26 +1223,17 @@ namespace { bool amprlog() { static int v = getenv("PROSPER_AMPRLOG") ? 1 : 0; r
 // lives inside cbBuf (the "CB offset 40" of the guest's error message is a byte offset into it).
 // Exposed so the read-submit HLE can locate and decode the real command. CONFIDENCE: MED.
 uint64_t g_apr_last_cb = 0, g_apr_last_cb_size = 0;
-// Per-cb capacity, recorded at init (issue #208 follow-up). Two live-captured init flavors carry
-// the size in different args: the APR read flow inits (req, cbSize=a1, 0, cbBuf=a3, poolCtx, 3),
-// and the IoStore batch-append cb inits (cb=a0, 0, 0, 0, -1, size=a5 — observed a5=0x720). The
+// Per-cb capacity, recorded at init (issue #208 follow-up). Live-captured init flavors carry the
+// size in different args: the APR read flow uses a1; Pathless's IoStore batch uses a2=0x560; and
+// DOLL's IoStore batch uses a5=0x720. The
 // guest's append loop (eboot+0x227e2c0) polls GetSize(cb) - GetUsed(cb) and only appends the next
 // command when the difference exceeds 0xff — with the old global "last size" (0 for this cb) the
 // loop spun forever, parking the IoStore thread and stalling the whole post-shader-map load.
-namespace {
-    std::mutex g_ampr_cb_mx;
-    std::unordered_map<uint64_t, uint64_t> g_ampr_cb_size;   // cb ctx -> byte capacity
-}
 HLE(k_ampr_init) {
     if (a3 > 0xffff && a1 && a1 <= 0x10000) { g_apr_last_cb = a3; g_apr_last_cb_size = a1; }
-    if (a0 > 0xffff) {
-        uint64_t sz = (a1 && a1 <= 0x100000) ? a1 : (a5 && a5 <= 0x100000) ? a5 : 0;
-        if (sz) {
-            std::lock_guard<std::mutex> lk(g_ampr_cb_mx);
-            g_ampr_cb_size[a0] = sz;
-            if (g_ampr_cb_size.size() > 4096) g_ampr_cb_size.clear();   // bound (ctxs recycle)
-        }
-    }
+    if (a0 > 0xffff)
+        ampr_cb_construct(a0, ampr_cb_capacity_arg(a1, a2, a5),
+                          a2 >= 0x20 && a2 <= 0x100000); // Pathless 3.20 uses a2=0x560; DOLL uses 0/1
     if (amprlog()) {
         fprintf(stderr, "[amprlog] init  a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
                 (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
@@ -1211,8 +1271,16 @@ static uint64_t ampr_arglog(const char* tag, uint64_t a0, uint64_t a1, uint64_t 
     }
     return 0;
 }
-HLE(k_ampr_x1) { return ampr_arglog("baQO9ez2gL4", a0, a1, a2, a3, a4, a5); }
-HLE(k_ampr_x2) { return ampr_arglog("ULvXMDz56po", a0, a1, a2, a3, a4, a5); }
+HLE(k_ampr_x1) {
+    ampr_arglog("baQO9ez2gL4", a0, a1, a2, a3, a4, a5);
+    ampr_cb_reset(a0);
+    return 0;
+}
+HLE(k_ampr_x2) {
+    ampr_arglog("ULvXMDz56po", a0, a1, a2, a3, a4, a5);
+    ampr_cb_reset(a0);
+    return 0;
+}
 // sceAmprCommandBufferGetSize (NID tZDDEo2tE5k, recovered by brute-forcing nid_hash over a
 // generated libSceAmpr corpus). Returns the command buffer's byte CAPACITY. Live contract
 // (issue #208 follow-up, guest append loop eboot+0x227e2c0, wrapper 0x59b5dd0): the IoStore
@@ -1227,11 +1295,7 @@ HLE(k_ampr_x2) { return ampr_arglog("ULvXMDz56po", a0, a1, a2, a3, a4, a5); }
 HLE(k_ampr_getsize) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     ampr_arglog("tZDDEo2tE5k(GetSize)", a0, a1, a2, a3, a4, a5);
-    {
-        std::lock_guard<std::mutex> lk(g_ampr_cb_mx);
-        auto it = g_ampr_cb_size.find(a0);
-        if (it != g_ampr_cb_size.end()) return it->second;
-    }
+    if (uint64_t capacity = ampr_cb_capacity(a0)) return capacity;
     return g_apr_last_cb_size ? g_apr_last_cb_size : 0x10000;
 }
 HLE(k_ampr_x3) { return ampr_arglog("Qs1xtplKo0U", a0, a1, a2, a3, a4, a5); }
@@ -1334,13 +1398,68 @@ namespace {
     // pre-#180 code posted an invented per-ring counter (seq 1,2,...) that could never match, so
     // the engine believed batch #1 was in flight forever and the whole async IO pipeline jammed
     // behind it (the CreateGlobalShaderMap precache stall).
-    struct AprBoundCb { uint64_t cb, tag, eq; int64_t id; };
-    std::mutex g_apr_bound_mx;
-    std::vector<AprBoundCb> g_apr_bound_cbs;
-    bool apr_cb_bound(uint64_t cb, AprBoundCb* out = nullptr) {
-        std::lock_guard<std::mutex> lk(g_apr_bound_mx);
-        for (auto& b : g_apr_bound_cbs)
-            if (b.cb == cb) { if (out) *out = b; return true; }
+    struct AprBoundCb {
+        uint64_t cb, tag, eq;
+        int64_t id;
+        bool deduplicate_completion;
+        bool completion_posted;
+        bool fallback_pending;
+        std::chrono::steady_clock::time_point fallback_due;
+    };
+    struct AprBoundState {
+        std::mutex mx;
+        std::condition_variable cv;
+        std::vector<AprBoundCb> cbs;
+        bool worker_started = false;
+    };
+    // The fallback worker is detached and outlives main, so its synchronization state must not run
+    // static destructors during process shutdown.
+    AprBoundState& apr_bound_state() {
+        static AprBoundState* state = new AprBoundState;
+        return *state;
+    }
+    void apr_tail_worker() {
+        AprBoundState& state = apr_bound_state();
+        std::unique_lock<std::mutex> lk(state.mx);
+        for (;;) {
+            auto next = std::chrono::steady_clock::time_point::max();
+            for (const auto& b : state.cbs)
+                if (b.fallback_pending && b.fallback_due < next) next = b.fallback_due;
+            if (next == std::chrono::steady_clock::time_point::max()) {
+                state.cv.wait(lk);
+                continue;
+            }
+            if (state.cv.wait_until(lk, next) != std::cv_status::timeout) continue;
+
+            const auto now = std::chrono::steady_clock::now();
+            std::vector<AprBoundCb> ready;
+            for (auto& b : state.cbs) {
+                if (!b.fallback_pending || b.fallback_due > now) continue;
+                b.fallback_pending = false;
+                if (!b.deduplicate_completion || b.completion_posted) continue;
+                b.completion_posted = true;
+                ready.push_back(b);
+            }
+            lk.unlock();
+            for (const auto& b : ready) prosper_eq_post_apr_token(b.eq, b.id, b.tag);
+            lk.lock();
+        }
+    }
+    bool apr_cb_submit_state(uint64_t cb, AprBoundCb* out, bool* should_post) {
+        AprBoundState& state = apr_bound_state();
+        std::lock_guard<std::mutex> lk(state.mx);
+        for (auto& b : state.cbs)
+            if (b.cb == cb) {
+                if (out) *out = b;
+                if (should_post) {
+                    *should_post = !b.deduplicate_completion || !b.completion_posted;
+                    if (b.deduplicate_completion) {
+                        b.completion_posted = true;
+                        b.fallback_pending = false;
+                    }
+                }
+                return true;
+            }
         return false;
     }
     // Per-request "eventful" marks for UNBOUND one-shot cbs (issue #180). The engine drives two
@@ -1388,17 +1507,55 @@ HLE(k_ampr_measure_write_equeue) { // sSAUCCU1dv4 = sceAmprMeasureCommandSizeWri
 // kernel-event record. Keep it separate from the older `_04_00` compatibility path above: DOLL
 // passes a live queue to that legacy sizing NID and depends on its historical 20-byte result.
 HLE(k_ampr_measure_write_equeue_on_completion) { return 0x20; }
-HLE(k_apr_cb_set_equeue) {       // H896Pt-yB4I (cb, eq, id, tag, 0, flags)
+static uint64_t apr_cb_set_equeue(uint64_t command_size, bool eager_completion,
+                                 uint64_t a0, uint64_t a1, uint64_t a2,
+                                 uint64_t a3, uint64_t a4, uint64_t a5) {
     ampr_arglog("H896Pt-yB4I(CbSetEqueue)", a0, a1, a2, a3, a4, a5);
     if (a1) prosper_eq_add_apr(a1, (int64_t)a2);
+    bool start_worker = false;
     if (a0) {
-        std::lock_guard<std::mutex> lk(g_apr_bound_mx);
+        AprBoundState& state = apr_bound_state();
+        std::lock_guard<std::mutex> lk(state.mx);
         bool seen = false;
-        for (auto& b : g_apr_bound_cbs)
-            if (b.cb == a0) { b.tag = a3; b.eq = a1; b.id = (int64_t)a2; seen = true; break; }
-        if (!seen) g_apr_bound_cbs.push_back({ a0, a3, a1, (int64_t)a2 });
+        for (auto& b : state.cbs)
+            if (b.cb == a0) {
+                b.tag = a3; b.eq = a1; b.id = (int64_t)a2;
+                b.deduplicate_completion = eager_completion;
+                b.completion_posted = false;
+                b.fallback_pending = eager_completion && a1 && a3;
+                b.fallback_due = std::chrono::steady_clock::now() +
+                                 std::chrono::milliseconds(10);
+                seen = true;
+                break;
+            }
+        if (!seen)
+            state.cbs.push_back({ a0, a3, a1, (int64_t)a2, eager_completion, false,
+                                  eager_completion && a1 && a3,
+                                  std::chrono::steady_clock::now() +
+                                      std::chrono::milliseconds(10) });
+        if (eager_completion && !state.worker_started) {
+            state.worker_started = true;
+            start_worker = true;
+        }
+    }
+    prosper_ampr_advance(a0, command_size);
+    // prosper executes ReadFile eagerly while this completion command is appended. Normally the
+    // guest submits immediately and k_apr_submit posts the event. Pathless can drain its work queue
+    // with one partial 3.20 batch left unsent, though: no later append rechecks the flush gate and
+    // every worker sleeps waiting for that already-complete read. After a grace period, complete
+    // only a binding that still has not been claimed by submit. Rebinding replaces the buffer's tag
+    // and deadline, while completion_posted deduplicates the submit and fallback paths.
+    if (start_worker) std::thread(apr_tail_worker).detach();
+    if (eager_completion) {
+        apr_bound_state().cv.notify_one();
     }
     return 0;
+}
+HLE(k_apr_cb_set_equeue) {       // H896Pt-yB4I: legacy eager path keeps zero used bytes
+    return apr_cb_set_equeue(0, false, a0, a1, a2, a3, a4, a5);
+}
+HLE(k_apr_cb_set_equeue_320) {   // o67gODLFpls: PS5 3.20 0x20-byte completion command
+    return apr_cb_set_equeue(0x20, true, a0, a1, a2, a3, a4, a5);
 }
 HLE(k_apr_submit) {              // libkernel ASoW5WE-UPo (cb, ring_1based, out1, out2)
     unsigned ring = a1 ? (unsigned)(a1 - 1) & 0x3f : 0;
@@ -1421,7 +1578,8 @@ HLE(k_apr_submit) {              // libkernel ASoW5WE-UPo (cb, ring_1based, out1
     //     unconditional last:=cnt store (+0x2274143), setting up the fatal +0x229df3e walk (the
     //     #180 residual fault). CONFIDENCE: HIGH (static disassembly + live tag-echo runs).
     AprBoundCb bc{};
-    const bool bound = apr_cb_bound(a0, &bc);
+    bool should_post = false;
+    const bool bound = apr_cb_submit_state(a0, &bc, &should_post);
     const bool tag_echo = bound && bc.tag && bc.eq;
     uint64_t token = tag_echo ? bc.tag : prosper_apr_next_token(ring);
     if (!bound) {
@@ -1432,14 +1590,18 @@ HLE(k_apr_submit) {              // libkernel ASoW5WE-UPo (cb, ring_1based, out1
                            (unsigned long long)a0, (unsigned long long)a1,
                            (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)token,
                            bound ? " (bound)" : "", apr_req_eventful(a0) ? " (arg8-async)" : "");
-    if (tag_echo) prosper_eq_post_apr_token(bc.eq, bc.id, bc.tag);
+    if (tag_echo && should_post) prosper_eq_post_apr_token(bc.eq, bc.id, bc.tag);
+    // Submit consumes the encoded commands. Pathless reuses completed pool buffers without calling
+    // the public Reset/ClearBuffer NIDs between batches, so the next append must observe a fresh
+    // cursor even though the fixed capacity remains attached to the command-buffer object.
+    ampr_cb_reset(a0);
     return 0;
 }
-// sceAmprCommandBufferGetCurrentOffset. The current command-buffer model does not yet retain this
-// state, and callers observed so far query a freshly reset buffer, for which zero is exact.
+// sceAmprCommandBufferGetCurrentOffset: byte cursor after the commands appended since construction,
+// reset, or clear. Pathless uses this with GetSize to decide when an IoStore batch must be submitted.
 HLE(k_ampr_get_current_offset) {
     ampr_arglog("GnxKOHEawhk(GetCurrentOffset)", a0, a1, a2, a3, a4, a5);
-    return 0;
+    return ampr_cb_offset(a0);
 }
 // Sonic Origins sums this result with the ReadFile and equeue sizes to reserve each AMPR command
 // buffer. Use the conservative 32-byte firmware-compatible record size.
@@ -1739,7 +1901,7 @@ void register_kernel_mem_hle() {
     Hle::register_fn("Zi3dBUjgyXI", (HleFn)k_ampr_measure_write_equeue_on_completion,
                      "sceAmprMeasureCommandSizeWriteKernelEventQueueOnCompletion");
     Hle::register_fn("H896Pt-yB4I", (HleFn)k_apr_cb_set_equeue, "AprCbSetEventQueue?");
-    Hle::register_fn("o67gODLFpls", (HleFn)k_apr_cb_set_equeue,
+    Hle::register_fn("o67gODLFpls", (HleFn)k_apr_cb_set_equeue_320,
                      "sceAmprCommandBufferWriteKernelEventQueueOnCompletion");
     Hle::register_fn("ASoW5WE-UPo", (HleFn)k_apr_submit,        "AprSubmitCommandBuffer?");
     Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_get_current_offset,
@@ -4257,9 +4419,22 @@ HLE(k_query_memory_protection) {
 // (PPSA17942, area:ue4) allocator pages remain no-op stubs because that title does not boot on
 // Windows yet. Pure size/offset queries below keep their platform-independent return contracts.
 HLE(k_ampr_ok) { return 0; }
+HLE(k_ampr_init) {
+    ampr_cb_construct(a0, ampr_cb_capacity_arg(a1, a2, a5),
+                      a2 >= 0x20 && a2 <= 0x100000); // match the POSIX 3.20 discriminator
+    return 0;
+}
+HLE(k_ampr_reset) { ampr_cb_reset(a0); return 0; }
+HLE(k_ampr_getsize) {
+    if (uint64_t capacity = ampr_cb_capacity(a0)) return capacity;
+    return 0x10000;
+}
 HLE(k_ampr_measure_write_equeue) { return 20; }
 HLE(k_ampr_measure_write_equeue_on_completion) { return 0x20; }
-HLE(k_ampr_get_current_offset) { return 0; }
+HLE(k_ampr_append_equeue_legacy) { return 0; }
+HLE(k_ampr_append_equeue_320) { prosper_ampr_advance(a0, 0x20); return 0; }
+HLE(k_ampr_submit) { ampr_cb_reset(a0); return 0; }
+HLE(k_ampr_get_current_offset) { return ampr_cb_offset(a0); }
 HLE(k_ampr_measure_write_address) { return 32; }
 
 // APR command-buffer WriteAddress (NID j0+3uJMxYJY) — the completion-notification write (#1149).
@@ -4423,22 +4598,22 @@ void register_kernel_mem_hle() {
     Hle::register_fn("Hc4CaR6JBL0", (HleFn)k_wait_on_address, "sceKernelWaitOnAddress?");
     Hle::register_fn("q2y-wDIVWZA", (HleFn)k_wake_by_address, "sceKernelWakeByAddress?");
     // libSceAmpr / APR command-buffer trio + teardown — no-op stubs on Windows (area:ue4).
-    Hle::register_fn("8aI7R7WaOlc", (HleFn)k_ampr_ok, "sceAmprCommandBufferConstructor");
+    Hle::register_fn("8aI7R7WaOlc", (HleFn)k_ampr_init, "sceAmprCommandBufferConstructor");
     Hle::register_fn("a8uLzYY--tM", (HleFn)k_ampr_ok, "sceAmprAprCommandBufferConstructor");
     Hle::register_fn("N-FSPA4S3nI", (HleFn)k_ampr_ok, "sceAmprCommandBufferSetBuffer");
-    Hle::register_fn("baQO9ez2gL4", (HleFn)k_ampr_ok, "sceAmprCommandBufferReset");
-    Hle::register_fn("ULvXMDz56po", (HleFn)k_ampr_ok, "sceAmprCommandBufferClearBuffer");
-    Hle::register_fn("tZDDEo2tE5k", (HleFn)k_ampr_ok, "sceAmprCommandBufferGetSize");
+    Hle::register_fn("baQO9ez2gL4", (HleFn)k_ampr_reset, "sceAmprCommandBufferReset");
+    Hle::register_fn("ULvXMDz56po", (HleFn)k_ampr_reset, "sceAmprCommandBufferClearBuffer");
+    Hle::register_fn("tZDDEo2tE5k", (HleFn)k_ampr_getsize, "sceAmprCommandBufferGetSize");
     Hle::register_fn("Qs1xtplKo0U", (HleFn)k_ampr_ok, "sceAmprAprCommandBufferDestructor");
     Hle::register_fn("GuchCTefuZw", (HleFn)k_ampr_ok, "sceAmprCommandBufferDestructor");
     Hle::register_fn("sSAUCCU1dv4", (HleFn)k_ampr_measure_write_equeue,
                      "sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00");
     Hle::register_fn("Zi3dBUjgyXI", (HleFn)k_ampr_measure_write_equeue_on_completion,
                      "sceAmprMeasureCommandSizeWriteKernelEventQueueOnCompletion");
-    Hle::register_fn("H896Pt-yB4I", (HleFn)k_ampr_ok, "AprCbSetEventQueue?");
-    Hle::register_fn("o67gODLFpls", (HleFn)k_ampr_ok,
+    Hle::register_fn("H896Pt-yB4I", (HleFn)k_ampr_append_equeue_legacy, "AprCbSetEventQueue?");
+    Hle::register_fn("o67gODLFpls", (HleFn)k_ampr_append_equeue_320,
                      "sceAmprCommandBufferWriteKernelEventQueueOnCompletion");
-    Hle::register_fn("ASoW5WE-UPo", (HleFn)k_ampr_ok, "AprSubmitCommandBuffer?");
+    Hle::register_fn("ASoW5WE-UPo", (HleFn)k_ampr_submit, "AprSubmitCommandBuffer?");
     Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_get_current_offset,
                      "sceAmprCommandBufferGetCurrentOffset");
     Hle::register_fn("4fgtGfXDrFc", (HleFn)k_ampr_measure_write_address,
