@@ -228,6 +228,11 @@ std::vector<uint32_t> recompile_fragment_wave32_for_test(
 // Recompiled fragment wave operations use native Vulkan subgroup instructions and therefore require
 // an exact 64-lane subgroup. Returns zero for ordinary modules and 64 for that explicit contract.
 uint32_t fragment_spirv_required_subgroup_size(const std::vector<uint32_t>& spirv);
+inline constexpr uint32_t kFragmentSubgroupVote = 1u << 0;
+inline constexpr uint32_t kFragmentSubgroupArithmetic = 1u << 1;
+// Capability requirements encoded in a fragment module, independent of the host graphics API's bit
+// values. The backend maps these to VkSubgroupFeatureFlagBits before accepting a wave64 pipeline.
+uint32_t fragment_spirv_required_subgroup_features(const std::vector<uint32_t>& spirv);
 bool fragment_spirv_uses_internal_gds(const std::vector<uint32_t>& spirv);
 
 // Packed RGBA component-enable nibbles for the first realized color export to MRT0/MRT1. EXP.EN is

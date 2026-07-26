@@ -3412,6 +3412,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         DV& v = dv[di];
         const uint32_t required_fragment_subgroup_size =
             prosper::gpu::fragment_spirv_required_subgroup_size(bd_fs);
+        const uint32_t required_fragment_subgroup_features =
+            prosper::gpu::fragment_spirv_required_subgroup_features(bd_fs);
         const bool uses_internal_gds =
             prosper::gpu::fragment_spirv_uses_internal_gds(bd_fs);
         if (required_fragment_subgroup_size &&
@@ -3420,7 +3422,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
              required_fragment_subgroup_size > ctx.max_subgroup_size ||
              !(ctx.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
              !(ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
-             !(ctx.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) ||
+             ((required_fragment_subgroup_features & prosper::gpu::kFragmentSubgroupArithmetic) &&
+              !(ctx.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT)) ||
+             ((required_fragment_subgroup_features & prosper::gpu::kFragmentSubgroupVote) &&
+              !(ctx.subgroup_operations & VK_SUBGROUP_FEATURE_VOTE_BIT)) ||
              (uses_internal_gds && !ctx.fragment_stores_atomics))) {
             const uint64_t shader_key = bd.fs_identity
                 ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
@@ -3431,10 +3436,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 std::fprintf(stderr,
                              "[render] skip draw: fragment shader requires subgroup size %u "
                              "(device range %u..%u required-stages=0x%x subgroup-stages=0x%x "
-                             "ops=0x%x control=%d gds=%d fragment-atomics=%d)\n",
+                             "ops=0x%x required-ops=0x%x control=%d gds=%d fragment-atomics=%d)\n",
                              required_fragment_subgroup_size, ctx.min_subgroup_size,
                              ctx.max_subgroup_size, ctx.required_subgroup_size_stages,
                              ctx.subgroup_stages, ctx.subgroup_operations,
+                             required_fragment_subgroup_features,
                              static_cast<int>(ctx.subgroup_size_control),
                              static_cast<int>(uses_internal_gds),
                              static_cast<int>(ctx.fragment_stores_atomics));

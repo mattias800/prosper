@@ -482,6 +482,31 @@ struct SpirvCompute {
         put(code, Op_Load, {t_u32, lane, v_subgroup_localid});
         return lane;
     }
+    // Exact scalar wave vote for fragment control flow and mask reductions. A guest scalar branch
+    // observes one 64-bit EXEC/VCC value for the complete hardware wave; branching directly on this
+    // invocation's bool would instead create 64 independent pixel branches. Mark the module with the
+    // same arithmetic capability used by fragment MBCNT so the backend enforces subgroup size 64,
+    // and declare Vote for OpGroupNonUniformAny itself.
+    uint32_t fragment_wave_any(uint32_t active_bit) {
+        if (!is_fragment) return 0;
+        if (!declared_subgroup) {
+            put(caps, Op_Capability, {Cap_GroupNonUniform});
+            declared_subgroup = true;
+        }
+        if (!declared_subgroup_vote) {
+            put(caps, Op_Capability, {Cap_GroupNonUniformVote});
+            declared_subgroup_vote = true;
+        }
+        // Self-contained marker reflected by fragment_spirv_required_subgroup_size().
+        if (!declared_subgroup_arithmetic) {
+            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
+            declared_subgroup_arithmetic = true;
+        }
+        uint32_t result = id();
+        put(code, Op_GroupNonUniformAny,
+            {t_bool, result, uconst(Scope_Subgroup), active_bit});
+        return result;
+    }
     uint32_t fragment_mbcnt(uint32_t mask_bit, uint32_t acc_bits, bool lo) {
         if (!is_fragment) return 0;
         const uint32_t lane = subgroup_local_id();
@@ -3040,21 +3065,18 @@ CountedLoop detect_counted_loop(const std::vector<Rdna2Inst>& ins) {
 //     body:   ... (nested forward-execz if regions, saveexec/restore, scalar counter++) ...
 //             s_branch header                           ; backward unconditional back-edge
 //     EXIT:   s_mov_b64 exec, <saved>
-// Per-invocation semantics: THIS lane iterates while its EXEC bit (rs.exec, a bool) holds after the
-// header recompute — the canonical `while (cond) body` divergent loop. Hardware keeps the whole wave
-// looping until EVERY lane's bit clears, but a cleared lane's vector writes are masked from then on,
-// so exiting the lane immediately at its own EXECZ is value-identical for everything it can observe
-// EXCEPT scalar state advanced by the extra wave iterations (a loop counter read after the loop
-// would show the wave's MAX trip count, not this lane's) — compiled code consumes such counters
-// inside the loop, so this is the standard per-invocation approximation. CONFIDENCE: MED, gated by
-// spirv-val + execution kernels + the live-boot A/B.
+// Fragment semantics are exact: a forced 64-lane native subgroup vote keeps the complete guest wave
+// in the loop until every EXEC/VCC bit clears. Cleared lanes remain synchronization participants while
+// EXEC predicates their vector writes, so scalar state advances exactly as on RDNA2. Vertex and the
+// narrow structured-compute path retain the older per-invocation lowering and its uniformity guards.
 //
 // A second flavor (DOLL's scalar-indexed unroll): the back-edge is a backward s_cbranch_EXECNZ and
 // the header IS the execz exit (empty condition region); the body may carry an extra forward
 // vccz/execz BREAK to the exit. A break lowers as a plain forward IF over the remainder of the body
 // (skip-to-backedge): the broken lane's EXEC bit is already clear (the compiled break condition
-// mirrors the exec recompute), so the next header check exits it — we REQUIRE the execnz back-edge
-// (exec-governed continue) for any loop carrying breaks, which makes that reasoning structural.
+// mirrors the exec recompute), so the next header check exits it. Fragment wave64 additionally
+// supports a VCCZ break with an unconditional back-edge by carrying the uniform continue vote to the
+// loop latch and branching the complete wave directly to the loop merge.
 struct DivLoop {
     enum class Condition : uint8_t { Exec, Vcc };
     uint32_t header_pc = 0;        // back-edge target; condition region = [header_pc, exit_branch_pc)
@@ -3063,6 +3085,7 @@ struct DivLoop {
     uint32_t exit_pc = 0;          // backedge_pc + its length (first pc after the loop)
     std::vector<uint32_t> break_pcs;   // extra forward vccz/execz -> exit_pc (lowered as body ifs)
     bool direct_exec_breaks = false;   // unconditional back-edge: an interior execz exits directly
+    bool direct_wave_breaks = false;   // fragment wave64: an interior vccz exits the complete wave
     Condition condition = Condition::Exec;
 };
 
@@ -3137,9 +3160,9 @@ bool instruction_may_change_exec(const Rdna2Inst& in) {
     return is_exec(in.dst) || is_exec(in.sdst);
 }
 
-// A scalar VCCZ branch tests whether ANY active lane set VCC, not this lane's bit. Lowering that
-// branch as per-invocation structured control flow is exact only when the VCC producer is provably
-// uniform across the wave. Dead Cells' light loops use the narrow compiler shape
+// A scalar VCCZ branch tests whether ANY active lane set VCC, not this lane's bit. Stages without
+// fragment's forced wave64 vote may lower it as structured control only when the VCC producer is
+// provably uniform across the wave. Dead Cells' light loops use the narrow compiler shape
 //   v_cvt_i32_f32 vBOUND, sBOUND; ...; v_cmp_* vcc, sCOUNTER, vBOUND; s_cbranch_vccz EXIT
 // so every active lane makes the same comparison. Unity also derives the bound through a short
 // lane-local VALU chain fed only by scalar sources. Trace that chain backwards: uniform inputs stay
@@ -3251,7 +3274,8 @@ bool vcc_exit_is_wave_uniform(const std::vector<Rdna2Inst>& ins, uint32_t branch
 // caller then rejects the stream loudly, exactly as before this feature). `safe` carries the
 // linearized branches (waterfalls etc.) which are not loop back-edges.
 std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
-                                            const std::unordered_set<uint32_t>& safe) {
+                                            const std::unordered_set<uint32_t>& safe,
+                                            bool exact_fragment_wave_breaks = false) {
     std::vector<DivLoop> out;
     uint32_t end_pc = UINT32_MAX;
     for (const auto& in : ins) if (in.is_end) { end_pc = in.pc; break; }
@@ -3333,10 +3357,10 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
                     if (in.opcode == 0x08) {                    // execz -> EXIT
                         L.condition = DivLoop::Condition::Exec;
                     } else if (in.opcode == 0x06 && !execnz &&
-                               vcc_exit_is_wave_uniform(ins, in.pc)) {
-                        // The compare is uniform, so VCC is either set for every active lane or empty.
-                        // Compute still never calls this detector; its general VCC contract remains a
-                        // wave mask requiring a reduction (#590).
+                               (exact_fragment_wave_breaks ||
+                                vcc_exit_is_wave_uniform(ins, in.pc))) {
+                        // Fragment reduces the real VCC mask through a forced wave64 vote. Other
+                        // structured stages require the compare to be proven uniform first.
                         L.condition = DivLoop::Condition::Vcc;
                     } else {
                         return {};
@@ -3348,8 +3372,16 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
                     // an unconditional back-edge that could re-enable EXEC, only an EXECZ branch is
                     // exact: the emitter sends the cleared lane directly to the loop merge instead.
                     // A VCCZ break does not itself clear EXEC and remains unsupported for that shape.
-                    if (!execnz && in.opcode != 0x08) return {};
-                    if (!execnz) L.direct_exec_breaks = true;
+                    if (!execnz && in.opcode != 0x08) {
+                        // A VCCZ break does not clear per-lane EXEC, so the old lane-local loop
+                        // approximation could not carry it to the merge. The fragment shell now
+                        // reduces VCC over an enforced wave64 subgroup and can branch the complete
+                        // guest wave directly at the loop latch. Other stages remain conservative.
+                        if (!exact_fragment_wave_breaks || in.opcode != 0x06) return {};
+                        L.direct_wave_breaks = true;
+                    } else if (!execnz) {
+                        L.direct_exec_breaks = true;
+                    }
                     L.break_pcs.push_back(in.pc);
                 }
             }
@@ -3402,8 +3434,8 @@ struct ForwardIf {
     bool on_vcc  = false;  // condition register: false = SCC, true = VCC (both are wave-uniform branches)
     bool early_out = false;// branch target was clamped to end_pc: the conditional block ENDS the shader
     // Divergent-region if (#273): the branch is a forward s_cbranch_execz over an EXEC-narrowed block
-    // (v_cmpx … s_cbranch_execz — DOLL's FXAA PS). Per-invocation the condition is THIS lane's EXEC
-    // bool; the block may itself narrow/restore EXEC (saveexec idioms), so EXEC is phi'd at the merge.
+    // (v_cmpx … s_cbranch_execz — DOLL's FXAA PS). Fragment reduces EXEC across an enforced wave64;
+    // other structured stages use the guarded per-invocation model. EXEC is phi'd at the merge.
     bool on_exec = false;
     // IF/ELSE (#273): the then-arm [branch_pc+1, sb_pc) is terminated by `s_branch merge_pc` at sb_pc
     // (the instruction immediately before target_pc); the else-arm starts at target_pc and runs to
@@ -3412,11 +3444,10 @@ struct ForwardIf {
     bool has_else = false;
     uint32_t sb_pc = 0, merge_pc = 0;
 };
-// allow_vcc: also accept a forward s_cbranch_vccz/vccnz. Only the per-invocation VS/FS shells set this —
-// there each SPIR-V invocation IS one lane, so branching on this lane's VCC bit (rs.vcc) is exactly the
-// per-vertex / per-pixel divergent-if the hardware runs. The COMPUTE shell instead routes accepted
-// VCC/EXEC branches through the CFG dispatcher, whose workgroup scratch reduction spans the configured
-// 32/64-lane guest wave independently of the implementation-defined host subgroup width.
+// allow_vcc: also accept a forward s_cbranch_vccz/vccnz. Fragment reduces the per-lane bool through an
+// enforced native wave64 subgroup; vertex retains the guarded per-invocation representation. Compute
+// routes accepted VCC/EXEC branches through the CFG dispatcher, whose workgroup scratch reduction spans
+// the configured 32/64-lane guest wave independently of the implementation-defined host subgroup width.
 // code/dwords: the raw stream, so a branch target past the first s_endpgm can be decoded and
 // verified to be a genuine early-out (see below) instead of blanket-clamped.
 ForwardIf detect_forward_if(const std::vector<Rdna2Inst>& ins, bool allow_vcc,
@@ -4677,6 +4708,32 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             // Scalar compare -> SCC (read by s_cselect / s_cbranch_scc). eq/lg are bitwise (sign-agnostic);
             // the ordered compares are signed for i32 (0x02-0x05), unsigned for u32 (0x08-0x0b).
+            //
+            // A B64 compare may consume EXEC, VCC, or a saved wave mask. Those values intentionally
+            // have no scalar-data representation: one SPIR-V bool represents this invocation's bit.
+            // At a wave-uniform fragment site, reduce the per-lane mismatch across the enforced
+            // 64-lane subgroup. This is the exact SCC result of s_cmp_eq/lg_u64 and, unlike reading
+            // VCC_LO as uint data, also preserves masks built by vector comparisons and saveexec.
+            if ((in.opcode == 0x12 || in.opcode == 0x13) && allow_wave && b.is_fragment) {
+                auto mask = [&](const Operand& o) -> uint32_t {
+                    if (o.value == 106 || o.value == 107) return rs.vcc;
+                    if (o.value == 126 || o.value == 127) return rs.exec;
+                    if (o.kind == OperandKind::SGPR) {
+                        auto it = rs.sreg_bool.find(o.value);
+                        if (it != rs.sreg_bool.end()) return it->second;
+                    }
+                    if (o.kind == OperandKind::InlineInt)
+                        return inline_int_mask_bit(b, o.value);
+                    return 0;
+                };
+                const uint32_t m0 = mask(in.src[0]), m1 = mask(in.src[1]);
+                if (m0 && m1) {
+                    const uint32_t mismatch = b.bsel(m0, b.logical_not(m1), m1);
+                    const uint32_t different = b.fragment_wave_any(mismatch);
+                    rs.scc = in.opcode == 0x12 ? b.logical_not(different) : different;
+                    return true;
+                }
+            }
             uint32_t a = val(in.src[0]), c = val(in.src[1]);
             switch (in.opcode) {
                 case 0x00: case 0x06: rs.scc = b.ucmp(Op_IEqual, a, c); break;        // s_cmp_eq_i32/u32
@@ -8982,6 +9039,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // exactly the non-adjacent stale-SCC consumer from the ISA audit (#879).
             if (!F.on_exec && !F.on_vcc && !rs.scc) return false;
             uint32_t condition = F.on_exec ? rs.exec : (F.on_vcc ? rs.vcc : rs.scc);
+            if (b.is_fragment && (F.on_exec || F.on_vcc))
+                condition = b.fragment_wave_any(condition);
             condition = F.on_scc0 ? condition : b.logical_not(condition);
             const RegState before = rs;
             std::set<int> written_v, written_s;
@@ -9149,13 +9208,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             !emit_body(b, rs, postloop, effective_safe, rt, allow_exec_update, allow_smem,
                        exp_fn, code, dwords)) return false;
     } else if (std::vector<DivLoop> Ls; true) {
-        // Per-invocation EXEC/VCC-exit loops (#273/#615) + structured uniform/divergent IFs. Loops are detected
-        // for the per-invocation stages only (fragment/vertex — the compute shell keeps its
-        // wave-level VCC/EXEC contract); each is emitted as a real structured SPIR-V loop
-        // (OpLoopMerge + header OpPhi per carried register/mask) whose per-lane condition is THIS
-        // lane's EXEC bool after the header's exec recompute. The IF machinery is unchanged and
-        // recurses INTO loop bodies (their nested forward-execz regions).
-        Ls = detect_divergent_loops(ins, safe);
+        // EXEC/VCC-exit loops (#273/#615) + structured scalar IFs. Each is a real structured SPIR-V
+        // loop with header phis for carried register/mask state. Fragment conditions are exact wave64
+        // votes; vertex and the guarded compute cases retain their per-invocation form. The IF
+        // machinery recurses into loop bodies and handles their nested forward-execz regions.
+        Ls = detect_divergent_loops(ins, safe, b.is_fragment);
         if (b.is_compute) {
             // Compute VCC-exit loops (#590, extending #615): the fragment-stage uniformity proof is
             // data-provenance-based, not stage-based — vcc_exit_is_wave_uniform accepts a compare only
@@ -9173,7 +9230,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             //     emit machinery; spirv-val + coverage tests + Messenger guard gate it).
             // Condition::Vcc loops are accepted under the detector's uniformity proof (#615/#590).
             // Condition::Exec loops (#590 — DOLL's nested post-process kernel is the observed compute
-            // case) lower with the same per-invocation model as the fragment shell: this invocation
+            // case) lower with the per-invocation model: this invocation
             // iterates while ITS EXEC bit holds after the header's v_cmpx recompute. Both flavors
             // require the barrier/LDS/cross-lane-free body below — the per-invocation trip count can
             // differ across a workgroup, so a barrier inside the loop would be workgroup-divergent
@@ -9333,27 +9390,26 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         auto sget = [&](int r){ auto it = rs.sreg.find(r); return it == rs.sreg.end() ? b.uconst(0) : it->second; };
         size_t bi = 0;   // next unconsumed branch in Fs (pc order; recursion consumes nested ones)
         size_t li = 0;   // next unconsumed loop in Ls (pc order)
+        const DivLoop* active_direct_wave_loop = nullptr;
+        uint32_t* active_direct_wave_continue = nullptr;
         // `cont` = the pc control flows to after `hi` — the enclosing construct's merge chain. An
         // if/else whose merge ESCAPES the current region (the shared-outer-merge cascade) is legal
         // only when it targets exactly this continuation (no skipped instructions); anything else
-        // rejects, fail-visible. Fragment execz-ifs (#273) condition on THIS lane's EXEC bool;
-        // compute execz-ifs condition on subgroupAny(EXEC). Either may enter/leave with EXEC narrowed,
-        // and EXEC is phi'd across the merge like any other value.
-        // CONFIDENCE: MED — per-invocation lowering of wave-level branches; spirv-val + exec-diff
-        // kernels + the live-boot A/B gate it.
+        // rejects, fail-visible. Fragment EXEC/VCC branches vote over the enforced wave64; compute
+        // uses its exact guest-wave reduction paths. Either may enter/leave with EXEC narrowed, and
+        // EXEC is phi'd across the merge like any other value.
         std::function<bool(uint32_t, uint32_t, uint32_t)> emit_structured;
-        // Emit one per-invocation EXEC/VCC-exit loop (#273/#615) as structured SPIR-V. Same block shape as
+        // Emit one EXEC/VCC-exit loop (#273/#615) as structured SPIR-V. Same block shape as
         // the counted-loop path (hdr -> chk -> body -> cont -> hdr, exit chk->merge) with three
-        // differences: (1) the loop condition is THIS lane's EXEC bool after the header's exec
-        // recompute (v_cmpx / s_andn2 exec) — continue while set, exit at execz; (2) the body is
+        // differences: (1) fragment votes the complete wave's EXEC/VCC after the header recompute
+        // (other guarded stages consume this lane's bool); (2) the body is
         // emitted RECURSIVELY (nested forward-execz if regions live inside it); (3) per-lane MASKS
         // (VCC/EXEC/saved sreg_bool pairs) are loop-carried too, so each gets a header phi. At the
         // merge, a register written in the condition region keeps its exit-iteration (chk) value —
         // it dominates the merge — while body-written state takes the header phi (its value when the
         // exiting check ran); masks CREATED inside the loop are dropped at the merge (an SSA id from
         // inside the body does not dominate it — a later read then rejects loudly instead of
-        // emitting invalid SPIR-V). CONFIDENCE: MED (per-invocation lowering of a wave-level loop;
-        // spirv-val + execution kernels + the live-boot A/B gate it).
+        // emitting invalid SPIR-V). Execution tests cover both wave-vote outcomes and direct breaks.
         std::function<bool(const DivLoop&)> emit_divloop = [&](const DivLoop& L) -> bool {
             const bool entry_exec_narrowed = rs.exec_narrowed;
             std::set<int> cv, cs, condv, conds, scalar_may_writes;
@@ -9395,22 +9451,39 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             for (int r : conds) conds_val[r] = sget(r);
             const uint32_t exec_chk = rs.exec, vcc_chk = rs.vcc, scc_chk = rs.scc;
             const std::unordered_map<int, uint32_t> bool_chk = rs.sreg_bool;
-            const uint32_t loop_cond = L.condition == DivLoop::Condition::Exec ? rs.exec : rs.vcc;
+            uint32_t loop_cond = L.condition == DivLoop::Condition::Exec ? rs.exec : rs.vcc;
+            // EXECZ/VCCZ are scalar wave decisions. Keeping every fragment invocation in the loop
+            // until the complete guest wave becomes empty makes scalar state and nested wave votes
+            // exact; vector writes remain predicated by the per-lane EXEC bool.
+            if (b.is_fragment) loop_cond = b.fragment_wave_any(loop_cond);
             const uint32_t chk_end = b.cur_block;
             b.emit_condbranch(loop_cond, body, merge);         // execz/vccz exit: continue while bit set
             while (idx < ins.size() && ins[idx].pc < L.exit_branch_pc) ++idx;
             if (idx < ins.size() && ins[idx].pc == L.exit_branch_pc) ++idx;   // consume the exit branch
             b.emit_label(body);
             // Body (recursive: nested if regions + breaks); ends just before the back-edge.
-            if (!emit_structured(L.exit_branch_pc + 1, L.backedge_pc, L.backedge_pc)) return false;
+            uint32_t direct_wave_continue = b.btrue();
+            const DivLoop* prior_direct_wave_loop = active_direct_wave_loop;
+            uint32_t* prior_direct_wave_continue = active_direct_wave_continue;
+            active_direct_wave_loop = &L;
+            active_direct_wave_continue = &direct_wave_continue;
+            const bool body_ok = emit_structured(
+                L.exit_branch_pc + 1, L.backedge_pc, L.backedge_pc);
+            active_direct_wave_loop = prior_direct_wave_loop;
+            active_direct_wave_continue = prior_direct_wave_continue;
+            if (!body_ok) return false;
             const bool body_exec_narrowed = rs.exec_narrowed;
             if (idx < ins.size() && ins[idx].pc == L.backedge_pc) ++idx;      // consume the back-edge
             const uint32_t body_end = b.cur_block;
             // An unconditional back-edge can re-enable EXEC at the header. When an interior EXECZ
             // targets the loop exit, send the inactive invocation straight to the loop merge; the
             // ordinary path still reaches the continue block and patches the loop-carried phis.
-            if (L.direct_exec_breaks) b.emit_condbranch(rs.exec, cont, merge);
-            else                      b.emit_branch(cont);
+            uint32_t continue_condition = direct_wave_continue;
+            if (L.direct_exec_breaks) continue_condition = b.land(continue_condition, rs.exec);
+            if (L.direct_exec_breaks || L.direct_wave_breaks)
+                b.emit_condbranch(continue_condition, cont, merge);
+            else
+                b.emit_branch(cont);
             b.emit_label(cont);
             for (auto& pr : phis) {
                 uint32_t nv = pr.dom == 0 ? vget(pr.reg)
@@ -9437,7 +9510,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                                     : pr.dom == 3 ? rs.vcc
                                     : pr.dom == 4 ? rs.exec
                                     : (rs.sreg_bool.count(pr.reg) ? rs.sreg_bool[pr.reg] : pr.phi);
-                const uint32_t merged = L.direct_exec_breaks && chk_value != body_value
+                const uint32_t merged = (L.direct_exec_breaks || L.direct_wave_breaks) &&
+                                                chk_value != body_value
                     ? b.emit_phi_2way(pr.dom <= 1 ? b.t_u32 : b.t_bool,
                                       chk_value, chk_end, body_value, body_end)
                     : chk_value;
@@ -9479,8 +9553,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 const ForwardIf F = Fs[bi++];
                 if (idx < ins.size() && ins[idx].pc == F.branch_pc) ++idx;   // skip the branch itself
                 // scc0/vccz/execz: branch (skip block) taken when the flag==0 → the block runs when
-                // flag!=0; scc1/vccnz are the inverse. Compute execz first reduces the per-invocation
-                // EXEC bool to the architecture's wave-wide "any lane active" predicate.
+                // flag!=0; scc1/vccnz are the inverse. Compute and fragment reduce per-invocation
+                // mask bits to the architecture's wave-wide "any lane active" predicate.
                 // A poisoned SCC (0: last written by a 64-bit mask op) cannot condition a real
                 // structured if — reject (the ISA-audit #879 stale-SCC consumer).
                 if (!F.on_exec && !F.on_vcc && !rs.scc) return false;
@@ -9492,7 +9566,16 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 uint32_t cond_reg = F.on_exec ? rs.exec : (F.on_vcc ? rs.vcc : rs.scc);
                 if (b.is_compute && (F.on_exec || F.on_vcc))
                     cond_reg = b.guest_wave_any(cond_reg);
+                else if (b.is_fragment && (F.on_exec || F.on_vcc))
+                    cond_reg = b.fragment_wave_any(cond_reg);
                 uint32_t exec_cond = F.on_scc0 ? cond_reg : b.bsel(cond_reg, b.bfalse(), b.btrue());
+                if (active_direct_wave_loop && active_direct_wave_continue &&
+                    active_direct_wave_loop->direct_wave_breaks && F.on_vcc &&
+                    std::find(active_direct_wave_loop->break_pcs.begin(),
+                              active_direct_wave_loop->break_pcs.end(), F.branch_pc) !=
+                        active_direct_wave_loop->break_pcs.end())
+                    *active_direct_wave_continue =
+                        b.land(*active_direct_wave_continue, exec_cond);
                 const uint32_t preblock = b.cur_block;      // block holding the OpBranchConditional
                 if (!F.has_else) {
                     std::set<int> ifv, ifs;
@@ -9606,6 +9689,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 }
             }
         };
+        // Every scalar branch and loop condition is subgroup-uniform in the fragment shell (SCC is
+        // scalar already; EXECZ/VCCZ use fragment_wave_any), so native wave operations in any
+        // structured arm observe the complete guest wave.
+        wave_ok = b.is_fragment;
         if (!emit_structured(0, UINT32_MAX, UINT32_MAX)) return false;
     }
     (void)safe_branches;
@@ -10154,6 +10241,25 @@ uint32_t fragment_spirv_required_subgroup_size(const std::vector<uint32_t>& spir
         offset += words;
     }
     return 0;
+}
+
+uint32_t fragment_spirv_required_subgroup_features(const std::vector<uint32_t>& spirv) {
+    if (spirv.size() < 5 || spirv[0] != 0x07230203u) return 0;
+    uint32_t features = 0;
+    for (size_t offset = 5; offset < spirv.size();) {
+        const uint32_t instruction = spirv[offset];
+        const uint32_t words = instruction >> 16;
+        const uint32_t opcode = instruction & 0xffffu;
+        if (!words || words > spirv.size() - offset) return 0;
+        if (opcode == Op_Capability && words == 2) {
+            if (spirv[offset + 1] == Cap_GroupNonUniformVote)
+                features |= kFragmentSubgroupVote;
+            else if (spirv[offset + 1] == Cap_GroupNonUniformArithmetic)
+                features |= kFragmentSubgroupArithmetic;
+        }
+        offset += words;
+    }
+    return features;
 }
 
 bool fragment_spirv_uses_internal_gds(const std::vector<uint32_t>& spirv) {
