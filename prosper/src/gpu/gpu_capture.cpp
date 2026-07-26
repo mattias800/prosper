@@ -65,7 +65,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v30: each const-fold-resolved buffer fetch retains its proven vertex/instance/shader VADDR source.
 // This is a per-resource trailing block so every v1-v29 record prefix stays byte-exact.
 // v31: retain an optional linked vertex-main raw stream and the graphics-LDS allocation per draw.
-constexpr uint32_t kVersion = 31;
+// v32: retain the per-layer full-mip-chain stride and selected-level offset for thin 2D arrays and
+// cube faces. Without them replay treated layer one's allocation-level bytes as layer zero's mip.
+constexpr uint32_t kVersion = 32;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -362,32 +364,54 @@ uint32_t resolved_linear_row_pitch(const ShaderResource& r, uint32_t width, uint
 uint64_t resource_footprint_impl(const ShaderResource& r, bool legacy_linear_tight) {
     uint64_t result = r.size;
     if (r.cls != ResourceClass::Texture && r.cls != ResourceClass::StorageImage) return result;
-    const uint64_t layers = r.img_dim == 3u ? 6u : (r.img_dim == 2u ? std::max(r.depth, 1u) : 1u);
+    const uint64_t layers = r.img_dim == 3u ? 6u
+        : ((r.img_dim == 2u || r.img_dim == 5u) ? std::max(r.depth, 1u) : 1u);
     uint32_t w = r.width ? r.width : 4, h = r.height ? r.height : 4;
     const uint32_t bc = bc_block_bytes(r.format);
     uint64_t decoded = 0;
+    bool decoded_is_volume = false;
     if (bc) {
         uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
         decoded = tile_mode_is_tiled(r.tile_mode) ? tiled_elements_bytes(bw, bh, bc, r.tile_mode)
                                                   : checked_mul(checked_mul(bw, bh), bc);
     } else {
         uint32_t bpt = data_format_bytes(r.format) * (r.num_components ? r.num_components : 1);
-        const bool f16 = r.format == DataFormat::Float16 && (bpt == 2 || bpt == 4 || bpt == 8);
-        if (bpt == 0 || (bpt > 4 && !f16)) bpt = 4;
+        const bool native_wide = r.cls == ResourceClass::StorageImage ||
+            (r.format == DataFormat::Float16 && (bpt == 2 || bpt == 4 || bpt == 8));
+        if (bpt == 0 || (bpt > 4 && !native_wide)) bpt = 4;
         if (tile_mode_is_tiled(r.tile_mode)) {
-            decoded = tiled_surface_bytes(w, h, r.tile_mode, 0, bpt);
+            if (r.img_dim == 2u && r.depth > 1u) {
+                decoded = tiled_volume_bytes(w, h, r.depth, r.tile_mode, bpt);
+                decoded_is_volume = decoded != 0;
+            }
+            if (!decoded_is_volume)
+                decoded = tiled_surface_bytes(w, h, r.tile_mode, 0, bpt);
         } else if (r.tile_mode == static_cast<uint32_t>(TileMode::Linear) &&
-                   r.cls == ResourceClass::Texture && r.img_dim == 1u &&
+                   ((r.cls == ResourceClass::Texture && r.img_dim == 1u) ||
+                    ((r.img_dim == 3u || r.img_dim == 5u) && r.layer_stride_bytes)) &&
                    !r.compression_enabled && !legacy_linear_tight) {
             // Guest-backed linear sampled images default to GFX10's 256-byte row alignment. Exact
             // HLE-producer provenance may override it (AvPlayer's CPU-staged NV12 is tight). Capturing
             // only width*height*bpt made genuinely padded video planes drift and omitted their tail.
-            decoded = checked_mul(resolved_linear_row_pitch(r, w, bpt), h);
+            const uint32_t row_pitch = (r.img_dim == 3u || r.img_dim == 5u)
+                ? static_cast<uint32_t>(linear_sampled_row_pitch(w, bpt))
+                : resolved_linear_row_pitch(r, w, bpt);
+            decoded = checked_mul(row_pitch, h);
         } else {
             decoded = checked_mul(checked_mul(w, h), bpt);
         }
     }
-    decoded = checked_mul(decoded, layers);
+    if (r.layer_stride_bytes && layers > 1) {
+        const uint64_t selected_bytes = r.in_mip_tail ? r.mip_tail_bytes : decoded;
+        const uint64_t level_offset = r.in_mip_tail ? 0u : r.layer_mip_offset_bytes;
+        decoded = checked_mul(r.layer_stride_bytes, layers - 1u);
+        decoded = decoded > UINT64_MAX - level_offset
+            ? UINT64_MAX : decoded + level_offset;
+        decoded = decoded > UINT64_MAX - selected_bytes
+            ? UINT64_MAX : decoded + selected_bytes;
+    } else if (!decoded_is_volume) {
+        decoded = checked_mul(decoded, layers);
+    }
     return std::max(result, decoded);
 }
 
@@ -1709,6 +1733,31 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         w.u32(draw.vs_chain_raw_shader_index);
         w.u32(draw.vertex_lds_dwords);
     }
+    // v32 keeps the selected mip's placement inside every thin-2D array or cube slice. This is a
+    // trailing block so v1-v31 records remain byte-exact and old captures retain their tight-layer
+    // default.
+    w.u32(static_cast<uint32_t>(resource_depth_count));
+    auto write_layer_layout = [&](const GpuCapturedTable& table) {
+        for (const auto& captured : table.resources) {
+            const ShaderResource& resource = captured.resource;
+            const bool enabled = resource.layer_stride_bytes != 0;
+            if ((!enabled && resource.layer_mip_offset_bytes != 0) ||
+                (enabled && ((resource.img_dim != 3 && resource.img_dim != 5) ||
+                             resource.depth < 2 ||
+                             resource.layer_mip_offset_bytes >= resource.layer_stride_bytes ||
+                             (resource.in_mip_tail && resource.layer_mip_offset_bytes != 0)))) {
+                error = "invalid resource layered mip layout";
+                return false;
+            }
+            w.u32(resource.layer_stride_bytes);
+            w.u32(resource.layer_mip_offset_bytes);
+        }
+        return true;
+    };
+    for (const auto& draw : c.draws)
+        if (!write_layer_layout(draw.vrt) || !write_layer_layout(draw.prt)) return false;
+    for (const auto& compute : c.computes)
+        if (!write_layer_layout(compute.resources)) return false;
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -2406,6 +2455,37 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             }
         }
     }
+    if (version >= 32) {   // selected mip placement inside each thin-2D array or cube slice
+        size_t expected = 0;
+        for (auto& draw : c.draws) expected += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (auto& compute : c.computes) expected += compute.resources.resources.size();
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) {
+            error = "invalid resource layered layout count"; return false;
+        }
+        auto read_layer_layout = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources) {
+                ShaderResource& resource = captured.resource;
+                if (!r.u32(resource.layer_stride_bytes) ||
+                    !r.u32(resource.layer_mip_offset_bytes))
+                    return false;
+                const bool enabled = resource.layer_stride_bytes != 0;
+                if ((!enabled && resource.layer_mip_offset_bytes != 0) ||
+                    (enabled && ((resource.img_dim != 3 && resource.img_dim != 5) ||
+                                 resource.depth < 2 ||
+                                 resource.layer_mip_offset_bytes >= resource.layer_stride_bytes ||
+                                 (resource.in_mip_tail && resource.layer_mip_offset_bytes != 0)))) {
+                    error = "invalid resource layered mip layout";
+                    return false;
+                }
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_layer_layout(draw.vrt) || !read_layer_layout(draw.prt)) return false;
+        for (auto& compute : c.computes)
+            if (!read_layer_layout(compute.resources)) return false;
+    }
     if (version >= 7 && !validate_failure_diagnostics(c, error)) return false;
     if (r.left) { error = "capture has trailing data"; return false; }
     return true;
@@ -2721,7 +2801,7 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     const std::vector<SubmitOperation>& operations, uint32_t width, uint32_t height,
     const GpuState* semantic_state, uint64_t submit_no, uint64_t semantic_draw_count) {
     const bool has_ordered_dma = semantic_state && !semantic_state->dma_copies.empty();
-    const uint64_t candidate_draw_count = has_ordered_dma && semantic_draw_count != UINT64_MAX
+    const uint64_t candidate_draw_count = semantic_state && semantic_draw_count != UINT64_MAX
         ? semantic_draw_count : static_cast<uint64_t>(draws.size());
     // Interactive one-shot (hotkey): consume the armed request on the first DRAWING invocation so the
     // grab lands on real frame content, and skip the env AT/AFTER/MIN selectors (a live keypress has no
@@ -2739,6 +2819,63 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
         uint64_t after = 0;
         if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_AFTER")) after = std::strtoull(v, nullptr, 0);
         if (invocation < after) return {};
+        if (const char* value = std::getenv("PROSPER_GPU_CAPTURE_COMPUTE_ADDR")) {
+            char* end = nullptr;
+            errno = 0;
+            const uint64_t wanted_code_addr = std::strtoull(value, &end, 0);
+            if (errno || end == value || !end || *end) return {};
+            const bool realized_contains_program = std::any_of(
+                computes.begin(), computes.end(), [&](const ComputeItem& compute) {
+                    return compute.code_addr == wanted_code_addr;
+                });
+            const bool semantic_contains_program = semantic_state && std::any_of(
+                semantic_state->dispatches.begin(), semantic_state->dispatches.end(),
+                [&](const GpuState::Dispatch& dispatch) {
+                    return compute_dispatch_code_addr(*semantic_state, dispatch) == wanted_code_addr;
+                });
+            if (!realized_contains_program && !semantic_contains_program) return {};
+        }
+        if (const char* value = std::getenv("PROSPER_GPU_CAPTURE_SHADER_ADDR")) {
+            char* end = nullptr;
+            errno = 0;
+            const uint64_t wanted_code_addr = std::strtoull(value, &end, 0);
+            if (errno || end == value || !end || *end) return {};
+            const bool realized_contains_program = std::any_of(
+                draws.begin(), draws.end(), [&](const DrawItem& draw) {
+                    return draw.vs_guest_addr == wanted_code_addr ||
+                           draw.vs_chain_guest_addr == wanted_code_addr ||
+                           draw.fs_guest_addr == wanted_code_addr;
+                });
+            const bool semantic_contains_program = semantic_state && std::any_of(
+                semantic_state->draws.begin(), semantic_state->draws.end(),
+                [&](const GpuState::Draw& draw) {
+                    const GpuState& draw_state = draw.state ? *draw.state : *semantic_state;
+                    const RenderState state = extract_render_state(draw_state);
+                    return state.es_addr == wanted_code_addr || state.gs_addr == wanted_code_addr ||
+                           state.hs_addr == wanted_code_addr || state.ps_addr == wanted_code_addr;
+                });
+            if (!realized_contains_program && !semantic_contains_program) return {};
+        }
+        if (const char* value = std::getenv("PROSPER_GPU_CAPTURE_TARGET_DIM")) {
+            uint32_t wanted_width = 0, wanted_height = 0;
+            char trailing = 0;
+            if (std::sscanf(value, "%ux%u%c", &wanted_width, &wanted_height, &trailing) != 2 ||
+                !wanted_width || !wanted_height)
+                return {};
+            const bool realized_contains_target = std::any_of(
+                draws.begin(), draws.end(), [&](const DrawItem& draw) {
+                    return draw.color0_width == wanted_width && draw.color0_height == wanted_height;
+                });
+            const bool semantic_contains_target = semantic_state && std::any_of(
+                semantic_state->draws.begin(), semantic_state->draws.end(),
+                [&](const GpuState::Draw& draw) {
+                    const GpuState& draw_state = draw.state ? *draw.state : *semantic_state;
+                    const RenderState state = extract_render_state(draw_state);
+                    return state.color0_width == wanted_width &&
+                           state.color0_height == wanted_height;
+                });
+            if (!realized_contains_target && !semantic_contains_target) return {};
+        }
         uint64_t min_draws = 0, max_draws = std::numeric_limits<uint64_t>::max();
         if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_MIN_DRAWS")) min_draws = std::strtoull(v, nullptr, 0);
         if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_MAX_DRAWS")) max_draws = std::strtoull(v, nullptr, 0);
@@ -2779,22 +2916,55 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     };
     for (const char* name : render_env) if (const char* value = std::getenv(name)) m.renderer_env.emplace_back(name, value);
     std::string error;
-    const bool captured = has_ordered_dma
-        ? capture_gpustate_submit(*semantic_state, m.submit_index, width, height, m,
-                                  pending->capture, error)
-        : capture_submit_items(draws, computes, operations, m, read_capture_guest_memory,
-                               pending->capture, error, g_rtt_seed_reader);
+    bool captured = false;
+    if (has_ordered_dma) {
+        captured = capture_gpustate_submit(*semantic_state, m.submit_index, width, height, m,
+                                           pending->capture, error);
+    } else {
+        // The live lists contain exactly the DrawItems/ComputeItems sent to the backend, including
+        // scaled viewports and retained shared shader words.  Keep those as the replay payload, but
+        // diagnose the semantic operations too: a rejected draw is absent from the realized list,
+        // so serializing only that list used to downgrade every omission to `unknown` even though
+        // the complete pre-submit GpuState was available here.  Re-realization is capture-only and
+        // cache-backed; it records each exact rejection point without perturbing normal execution.
+        std::vector<OperationRealizationFailure> failures;
+        if (semantic_state) {
+            std::vector<OperationRealizationFailure> compute_failures;
+            (void)realize_gpustate_draws(*semantic_state, 0x10000, 1.0f, 1.0f,
+                                         &failures, false, false);
+            (void)realize_compute_dispatches(*semantic_state, m.submit_index,
+                                             &compute_failures);
+            failures.insert(failures.end(),
+                            std::make_move_iterator(compute_failures.begin()),
+                            std::make_move_iterator(compute_failures.end()));
+        }
+        captured = capture_submit_items(draws, computes, operations, m,
+                                        read_capture_guest_memory, pending->capture, error,
+                                        g_rtt_seed_reader, failures);
+    }
     if (!captured) {
         std::fprintf(stderr, "[gpucap] capture failed: %s\n", error.c_str()); return {};
     }
+    // A normal one-shot capture has the same temporal DS dependency as a timeline endpoint.  The
+    // renderer callback runs before this submit is executed, so these are the exact pre-submit
+    // planes consumed by depth/stencil reads in the capsule.  Timeline capture has always added
+    // them explicitly; omitting them here made F9/environment capsules replay a different frame
+    // whenever the selected submit reused persistent depth or stencil from an earlier submit.
+    if (gpu_capture_ds_seed_snapshot_available() &&
+        !capture_referenced_gpu_ds_seeds(pending->capture, error)) {
+        std::fprintf(stderr, "[gpucap] DS checkpoint capture failed: %s\n", error.c_str());
+        return {};
+    }
     std::fprintf(stderr, "[gpucap] captured %s submit %llu: %zu draws, %zu computes, "
-                         "%zu DMA copies, %zu operations, %zu blobs, %zu RTT seeds -> %s\n",
+                         "%zu DMA copies, %zu operations, %zu blobs, %zu RTT seeds, "
+                         "%zu DS seeds -> %s\n",
                  interactive ? "interactive" : "match",
                  static_cast<unsigned long long>(m.submit_index),
                  pending->capture.draws.size(), pending->capture.computes.size(),
                  pending->capture.dma_copies.size(), pending->capture.operations.size(),
                  pending->capture.blobs.size(),
-                 pending->capture.rtt_seeds.size(), pending->path.c_str());
+                 pending->capture.rtt_seeds.size(), pending->capture.ds_seeds.size(),
+                 pending->path.c_str());
     return pending;
 }
 

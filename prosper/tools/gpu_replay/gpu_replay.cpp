@@ -234,7 +234,7 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
         });
         std::printf("  %s %-7s b=%u addr=%016llx declared=%u footprint=%llu captured=%llu "
                     "nz=%zu hash=%016llx first=%08x "
-                    "fmt=%u nc=%u stride=%u %ux%ux%u tile=%u row-pitch=%u "
+                    "fmt=%u nc=%u stride=%u %ux%ux%u tile=%u row-pitch=%u layer=%u+%u "
                     "addr=%u%u%u swz=%u%u%u%u filt=%u/%u/%u "
                     "dcc=%u meta=%016llx meta-bytes=%llu/%llu meta-nz=%zu meta-unique=%zu "
                     "meta-first=%08x meta-hash=%016llx "
@@ -247,6 +247,7 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
                     static_cast<unsigned long long>(hash), first,
                     static_cast<unsigned>(r.format), r.num_components, r.stride,
                     r.width, r.height, r.depth, r.tile_mode, r.linear_row_pitch_bytes,
+                    r.layer_stride_bytes, r.layer_mip_offset_bytes,
                     r.addr_uvw[0], r.addr_uvw[1], r.addr_uvw[2],
                     r.swizzle[0], r.swizzle[1], r.swizzle[2], r.swizzle[3],
                     r.mag_filter, r.min_filter, r.mip_filter,

@@ -302,6 +302,14 @@ int main() {
         return 4 + 8 * f.draws.size();
     };
 
+    // v32: byte length of the per-resource array-layer stride/selected-mip-offset tail.
+    auto v32_tail = [](const GpuCaptureFile& f) -> size_t {
+        size_t rc = 0;
+        for (const auto& d : f.draws) rc += d.vrt.resources.size() + d.prt.resources.size();
+        for (const auto& cm : f.computes) rc += cm.resources.resources.size();
+        return 4 + 8 * rc;
+    };
+
     // v25 (#1240): byte length of the trailing resolve-state block.
     auto v25_tail = [](const GpuCaptureFile& f) -> size_t {
         size_t present_failures = 0;
@@ -333,6 +341,7 @@ int main() {
               v16_scissor_bytes.size() >= 25,
           "v17 capture serializes effective guest scissor state");
     if (v16_scissor_bytes.size() >= 25) {
+        v16_scissor_bytes.resize(v16_scissor_bytes.size() - v32_tail(v16_scissor_source));
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v31_tail(v16_scissor_source));
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v30_tail(v16_scissor_source));
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v29_tail(v16_scissor_source));
@@ -434,7 +443,7 @@ int main() {
     };
     GpuCaptureFile video_capture;
     CHECK(capture_draw_items({video_draw}, meta, video_reader, video_capture, error) &&
-              video_capture.format_version == 31 && video_capture.blobs.size() == 1 &&
+              video_capture.format_version == 32 && video_capture.blobs.size() == 1 &&
               video_capture.blobs[0].bytes.size() == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048,
@@ -444,7 +453,7 @@ int main() {
     GpuReplayFrame video_replay;
     CHECK(serialize_gpu_capture(video_capture, video_capture_bytes, error) &&
               deserialize_gpu_capture(video_capture_bytes, video_loaded, error) &&
-              video_loaded.format_version == 31 &&
+              video_loaded.format_version == 32 &&
               video_loaded.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_loaded.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
               materialize_gpu_replay(video_loaded, video_replay, error) &&
@@ -467,7 +476,7 @@ int main() {
     GpuReplayFrame upgraded_video_replay;
     CHECK(serialize_gpu_capture(legacy_video, upgraded_video_bytes, error) &&
               deserialize_gpu_capture(upgraded_video_bytes, upgraded_video, error) &&
-              upgraded_video.format_version == 31 &&
+              upgraded_video.format_version == 32 &&
               upgraded_video.draws[0].prt.resources[0].captured_size == video_chroma.size &&
               upgraded_video.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
               materialize_gpu_replay(upgraded_video, upgraded_video_replay, error) &&
@@ -506,6 +515,77 @@ int main() {
           bounded_replay.items[0].vrt->resources[0].gpu_addr == large_resource.gpu_addr &&
           bounded_replay.items[0].vrt->resources[0].host_data == nullptr,
           "metadata-only capture materializes inspectable descriptors with unavailable bytes explicit");
+    GpuCaptureFile array_layout_capture = bounded_capture;
+    ShaderResource& array_resource =
+        array_layout_capture.draws[0].vrt.resources[0].resource;
+    array_resource.cls = ResourceClass::StorageImage;
+    array_resource.gpu_addr = 0x31465d0000ull;
+    array_resource.size = 128u * 128u * 6u * 8u;
+    array_resource.format = DataFormat::Float16;
+    array_resource.num_components = 4;
+    array_resource.img_dim = 5;
+    array_resource.width = array_resource.height = 128;
+    array_resource.depth = 6;
+    array_resource.tile_mode = static_cast<uint32_t>(TileMode::Sw64KbRX);
+    array_resource.layer_stride_bytes = 720896;
+    array_resource.layer_mip_offset_bytes = 65536;
+    std::vector<uint8_t> array_layout_bytes;
+    GpuCaptureFile array_layout_loaded;
+    CHECK(gpu_capture_resource_footprint(array_resource) == 3801088u,
+          "array-mip capture footprint spans the selected level in the final full-chain slice");
+    ShaderResource linear_array_resource = array_resource;
+    linear_array_resource.width = 65;
+    linear_array_resource.height = 19;
+    linear_array_resource.depth = 3;
+    linear_array_resource.tile_mode = 0;
+    linear_array_resource.format = DataFormat::Unorm8;
+    linear_array_resource.num_components = 4;
+    linear_array_resource.size = 65u * 19u * 3u * 4u;
+    linear_array_resource.layer_stride_bytes = 62464;
+    linear_array_resource.layer_mip_offset_bytes = 8704;
+    CHECK(gpu_capture_resource_footprint(linear_array_resource) ==
+              2u * 62464u + 8704u + 512u * 19u,
+          "linear array capture includes selected-level row padding in the final slice");
+    ShaderResource plucky_volume = array_resource;
+    plucky_volume.gpu_addr = 0x3022c70000ull;
+    plucky_volume.size = 32u * 32u * 32u * 8u;
+    plucky_volume.img_dim = 2;
+    plucky_volume.width = plucky_volume.height = plucky_volume.depth = 32;
+    plucky_volume.tile_mode = static_cast<uint32_t>(TileMode::Sw64KbS);
+    plucky_volume.layer_stride_bytes = 0;
+    plucky_volume.layer_mip_offset_bytes = 0;
+    CHECK(gpu_capture_resource_footprint(plucky_volume) == 4u * 65536u,
+          "Plucky RGBA16 32-cubed S3 capture uses its four true 3D macroblocks");
+    CHECK(serialize_gpu_capture(array_layout_capture, array_layout_bytes, error) &&
+              deserialize_gpu_capture(array_layout_bytes, array_layout_loaded, error) &&
+              array_layout_loaded.format_version == 32 &&
+              array_layout_loaded.draws[0].vrt.resources[0].resource.layer_stride_bytes == 720896u &&
+              array_layout_loaded.draws[0].vrt.resources[0].resource.layer_mip_offset_bytes == 65536u,
+          "v32 capture round-trips thin-array slice stride and selected-mip offset");
+    GpuCaptureFile cube_layout_capture = array_layout_capture;
+    ShaderResource& cube_resource = cube_layout_capture.draws[0].vrt.resources[0].resource;
+    cube_resource.img_dim = 3;
+    std::vector<uint8_t> cube_layout_bytes;
+    GpuCaptureFile cube_layout_loaded;
+    CHECK(gpu_capture_resource_footprint(cube_resource) == 3801088u &&
+              serialize_gpu_capture(cube_layout_capture, cube_layout_bytes, error) &&
+              deserialize_gpu_capture(cube_layout_bytes, cube_layout_loaded, error) &&
+              cube_layout_loaded.draws[0].vrt.resources[0].resource.img_dim == 3u &&
+              cube_layout_loaded.draws[0].vrt.resources[0].resource.layer_stride_bytes == 720896u &&
+              cube_layout_loaded.draws[0].vrt.resources[0].resource.layer_mip_offset_bytes == 65536u,
+          "v32 capture round-trips cube-face stride and selected-mip offset");
+    ShaderResource small_tail_cube = cube_resource;
+    small_tail_cube.width = small_tail_cube.height = 32;
+    small_tail_cube.size = 6u * 65536u;
+    small_tail_cube.in_mip_tail = true;
+    small_tail_cube.mip_tail_offset = 32768u;
+    small_tail_cube.mip_tail_bytes = 65536u;
+    small_tail_cube.mip_tail_x = 64u;
+    small_tail_cube.mip_tail_y = 0u;
+    small_tail_cube.layer_stride_bytes = 65536u;
+    small_tail_cube.layer_mip_offset_bytes = 0;
+    CHECK(gpu_capture_resource_footprint(small_tail_cube) == 6u * 65536u,
+          "cube chain wholly in one tail block captures exactly six complete face blocks");
     set_test_env("PROSPER_GPU_CAPTURE_METADATA_ONLY", nullptr);
     set_test_env("PROSPER_GPU_CAPTURE_MAX_MB", nullptr);
 
@@ -577,6 +657,7 @@ int main() {
           "writer rejects an out-of-bounds DCC metadata reference");
     CHECK(serialize_gpu_capture(volume_capture, volume_bytes, error),
           "recreated valid v12 DCC bytes after malformed-reference check");
+    volume_bytes.resize(volume_bytes.size() - v32_tail(volume_capture));
     volume_bytes.resize(volume_bytes.size() - v31_tail(volume_capture));
     volume_bytes.resize(volume_bytes.size() - v30_tail(volume_capture));
     volume_bytes.resize(volume_bytes.size() - v29_tail(volume_capture));
@@ -668,6 +749,7 @@ int main() {
     CHECK(serialize_gpu_capture(pre_v31_source, v20_bytes, error) && v20_bytes.size() >= 21,
           "v21 capture serializes the logic-op extension");
     if (v20_bytes.size() >= 21) {
+        v20_bytes.resize(v20_bytes.size() - v32_tail(pre_v31_source));
         v20_bytes.resize(v20_bytes.size() - v31_tail(pre_v31_source));
         v20_bytes.resize(v20_bytes.size() - v30_tail(pre_v31_source));
         v20_bytes.resize(v20_bytes.size() - v29_tail(pre_v31_source));
@@ -724,15 +806,18 @@ int main() {
     std::vector<uint8_t> v24_resolve_bytes;
     GpuCaptureFile v24_resolve_loaded;
     CHECK(serialize_gpu_capture(pre_v31_source, v24_resolve_bytes, error) &&
-          v24_resolve_bytes.size() >= v31_tail(pre_v31_source) + v30_tail(pre_v31_source) +
+          v24_resolve_bytes.size() >= v32_tail(pre_v31_source) +
+              v31_tail(pre_v31_source) + v30_tail(pre_v31_source) +
               v29_tail(pre_v31_source) + v28_tail(pre_v31_source) +
               v27_tail(pre_v31_source) + v26_tail(pre_v31_source) +
               v25_tail(pre_v31_source),
           "v25 capture exposes a removable trailing resolve-state block");
-    if (v24_resolve_bytes.size() >= v31_tail(pre_v31_source) + v30_tail(pre_v31_source) +
+    if (v24_resolve_bytes.size() >= v32_tail(pre_v31_source) +
+            v31_tail(pre_v31_source) + v30_tail(pre_v31_source) +
             v29_tail(pre_v31_source) + v28_tail(pre_v31_source) +
             v27_tail(pre_v31_source) + v26_tail(pre_v31_source) +
             v25_tail(pre_v31_source)) {
+        v24_resolve_bytes.resize(v24_resolve_bytes.size() - v32_tail(pre_v31_source));
         v24_resolve_bytes.resize(v24_resolve_bytes.size() - v31_tail(pre_v31_source));
         v24_resolve_bytes.resize(v24_resolve_bytes.size() - v30_tail(pre_v31_source));
         v24_resolve_bytes.resize(v24_resolve_bytes.size() - v29_tail(pre_v31_source));
@@ -1041,6 +1126,23 @@ int main() {
               reinterpret_cast<const uint8_t*>(kDiagnosticBadPs), sizeof(kDiagnosticBadPs)),
           "failed stage retains the exact content-addressed raw stream through s_endpgm");
 
+    // Live one-shot capture receives the already-realized backend list as well as the original
+    // semantic state. A failed operation is necessarily absent from that backend list, but must not
+    // lose the exact reason/program/pipeline that the semantic realization can still diagnose.
+    request_interactive_gpu_capture("/tmp/prosper_semantic_failure_diagnostic.prgcap");
+    auto semantic_failure_pending = begin_requested_gpu_capture(
+        {}, {}, plan_submit_operations(failed_state), 640, 360, &failed_state, 101,
+        failed_state.draws.size());
+    CHECK(semantic_failure_pending && !interactive_gpu_capture_armed() &&
+          semantic_failure_pending->capture.operations.size() == 1 &&
+          !semantic_failure_pending->capture.operations[0].realized &&
+          semantic_failure_pending->capture.failure_diagnostics.size() == 1 &&
+          semantic_failure_pending->capture.failure_diagnostics[0].reason ==
+              RealizationFailureReason::ShaderRecompile &&
+          semantic_failure_pending->capture.failure_diagnostics[0].pipeline_present &&
+          semantic_failure_pending->capture.failure_diagnostics[0].stages.size() == 2,
+          "one-shot semantic capture preserves exact diagnostics for unrealized draws");
+
     std::array<uint8_t, 32> dma_memory{};
     for (size_t i = 0; i < 16; ++i) dma_memory[16 + i] = static_cast<uint8_t>(0xa0 + i);
     GpuState dma_state;
@@ -1065,11 +1167,49 @@ int main() {
     // A selected live DMA capture consumes exactly one selector match and cannot silently retarget.
     set_test_env("PROSPER_GPU_CAPTURE", "ordered-dma-selector.prgcap");
     set_test_env("PROSPER_GPU_CAPTURE_AT", "0");
+    set_test_env("PROSPER_GPU_CAPTURE_COMPUTE_ADDR", "not-an-address");
+    set_test_env("PROSPER_GPU_CAPTURE_SHADER_ADDR", "not-an-address");
+    set_test_env("PROSPER_GPU_CAPTURE_TARGET_DIM", "not-a-dimension");
+    const auto invalid_selector_pending = begin_requested_gpu_capture({}, {}, {}, 1, 1,
+                                                                      &dma_state, 98, 0);
+    set_test_env("PROSPER_GPU_CAPTURE_COMPUTE_ADDR", "0x30130f0000");
+    set_test_env("PROSPER_GPU_CAPTURE_SHADER_ADDR", "0x1");
+    auto selected_dispatch_state = std::make_shared<GpuState>();
+    selected_dispatch_state->sh[prosper::agc::Pm4::COMPUTE_PGM_LO] = 0x30130e00u;
+    selected_dispatch_state->sh[prosper::agc::Pm4::COMPUTE_PGM_HI] = 0u;
+    GpuState::Dispatch selected_dispatch;
+    selected_dispatch.state = selected_dispatch_state;
+    dma_state.dispatches.push_back(selected_dispatch);
+    auto selected_draw_state = std::make_shared<GpuState>();
+    set_pgm(*selected_draw_state, P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES,
+            kDiagnosticVs);
+    set_pgm(*selected_draw_state, P::SPI_SHADER_PGM_LO_PS, P::SPI_SHADER_PGM_HI_PS,
+            kDiagnosticBadPs);
+    selected_draw_state->cx[P::CB_TARGET_MASK] = 0xf;
+    selected_draw_state->cx[P::CB_COLOR0_ATTRIB2] = 0; // dimension-minus-one fields: 1x1
+    GpuState::Draw selected_draw{3};
+    selected_draw.state = selected_draw_state;
+    dma_state.draws.push_back(selected_draw);
+    const auto skipped_dma_pending = begin_requested_gpu_capture({}, {}, {}, 1, 1,
+                                                                 &dma_state, 99, 0);
+    selected_dispatch_state->sh[prosper::agc::Pm4::COMPUTE_PGM_LO] = 0x30130f00u;
+    char selected_shader_addr[32];
+    std::snprintf(selected_shader_addr, sizeof(selected_shader_addr), "0x%llx",
+                  static_cast<unsigned long long>(reinterpret_cast<uint64_t>(kDiagnosticBadPs)));
+    set_test_env("PROSPER_GPU_CAPTURE_SHADER_ADDR", selected_shader_addr);
+    set_test_env("PROSPER_GPU_CAPTURE_TARGET_DIM", "2x1");
+    const auto wrong_dimension_pending = begin_requested_gpu_capture({}, {}, {}, 1, 1,
+                                                                     &dma_state, 100, 1);
+    set_test_env("PROSPER_GPU_CAPTURE_TARGET_DIM", "1x1");
     const auto dma_pending = begin_requested_gpu_capture({}, {}, {}, 1, 1,
-                                                         &dma_state, 100, 0);
+                                                         &dma_state, 100, 1);
     const auto retargeted_pending = begin_requested_gpu_capture({}, {}, {}, 1, 1);
-    CHECK(dma_pending && !retargeted_pending && dma_pending->capture.dma_copies.size() == 1,
-          "selected DMA capture succeeds once and cannot retarget a later submit");
+    CHECK(!invalid_selector_pending && !skipped_dma_pending && !wrong_dimension_pending &&
+              dma_pending && !retargeted_pending && dma_pending->capture.dma_copies.size() == 1,
+          "compute/shader/target-selected DMA capture rejects invalid/nonmatches and cannot retarget");
+    set_test_env("PROSPER_GPU_CAPTURE_TARGET_DIM", nullptr);
+    set_test_env("PROSPER_GPU_CAPTURE_SHADER_ADDR", nullptr);
+    set_test_env("PROSPER_GPU_CAPTURE_COMPUTE_ADDR", nullptr);
     set_test_env("PROSPER_GPU_CAPTURE_AT", nullptr);
     set_test_env("PROSPER_GPU_CAPTURE", nullptr);
 
@@ -1137,6 +1277,7 @@ int main() {
     if (v13_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        v13_bytes.resize(v13_bytes.size() - v32_tail(legacy_source));
         v13_bytes.resize(v13_bytes.size() - v31_tail(legacy_source));
         v13_bytes.resize(v13_bytes.size() - v30_tail(legacy_source));
         v13_bytes.resize(v13_bytes.size() - v29_tail(legacy_source));
@@ -1168,6 +1309,7 @@ int main() {
     if (legacy_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        legacy_bytes.resize(legacy_bytes.size() - v32_tail(legacy_source));
         legacy_bytes.resize(legacy_bytes.size() - v31_tail(legacy_source));
         legacy_bytes.resize(legacy_bytes.size() - v30_tail(legacy_source));
         legacy_bytes.resize(legacy_bytes.size() - v29_tail(legacy_source));
@@ -1225,9 +1367,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 32;   // kVersion + 1: a future version
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 33;   // kVersion + 1: a future version
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 32",
+          error == "unsupported capture version 33",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;
@@ -1295,6 +1437,22 @@ int main() {
           referenced_ds_capture.ds_seeds.size() == 1 &&
           referenced_ds_capture.ds_seeds[0].depth_read_base == 0xa10000,
           "standalone capture retains only the exact referenced live DS checkpoint");
+    DrawItem one_shot_ds_draw = draw;
+    one_shot_ds_draw.vrt = std::make_shared<ShaderResourceTable>();
+    one_shot_ds_draw.color0_width = one_shot_ds_draw.color0_height = 2;
+    one_shot_ds_draw.draw_index = 0;
+    one_shot_ds_draw.command_order = 0;
+    one_shot_ds_draw.ps.depth_test_enable = true;
+    one_shot_ds_draw.ps.depth_read_base = one_shot_ds_draw.ps.depth_write_base = 0xa10000;
+    one_shot_ds_draw.ps.stencil_read_base = ds_seed.stencil_read_base;
+    one_shot_ds_draw.ps.stencil_write_base = ds_seed.stencil_write_base;
+    one_shot_ds_draw.ps.htile_data_base = ds_seed.htile_data_base;
+    request_interactive_gpu_capture("/tmp/prosper_interactive_ds_checkpoint.prgcap");
+    auto one_shot_ds_pending = begin_requested_gpu_capture(
+        {one_shot_ds_draw}, {}, {{SubmitOperationKind::Draw, 0, 0}}, 2, 2);
+    CHECK(one_shot_ds_pending && one_shot_ds_pending->capture.ds_seeds.size() == 1 &&
+          one_shot_ds_pending->capture.ds_seeds[0].depth_read_base == 0xa10000,
+          "interactive one-shot capture retains its referenced pre-submit DS checkpoint");
     GpuCaptureDsSeed restored_ds;
     set_gpu_replay_ds_seed_writer([&](const GpuCaptureDsSeed& seed, std::string&) {
         restored_ds = seed; return true;

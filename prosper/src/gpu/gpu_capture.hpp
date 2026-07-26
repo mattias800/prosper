@@ -310,8 +310,8 @@ const char* shader_program_stage_name(ShaderProgramStage stage);
 const char* realization_failure_reason_name(RealizationFailureReason reason);
 
 // Runtime hook used by execute_and_present. PROSPER_GPU_CAPTURE=<path> captures exactly one realized
-// submit. MIN_DRAWS/MAX_DRAWS select a semantic candidate class; PROSPER_GPU_CAPTURE_AT=N then selects
-// the zero-based matching invocation (default first match).
+// submit. MIN_DRAWS/MAX_DRAWS, COMPUTE_ADDR, SHADER_ADDR, and TARGET_DIM select a candidate class;
+// PROSPER_GPU_CAPTURE_AT=N then selects the zero-based matching invocation (default first match).
 struct PendingGpuCapture {
     std::string path;
     GpuCaptureFile capture;
