@@ -46,15 +46,22 @@ with snapshot.snapshot_run_lock("verify", ["child"], {lock_path}):
                     time.sleep(0.25)
                     self.assertIsNone(child.poll(), "second snapshot process bypassed the lock")
 
-                output, _ = child.communicate(timeout=5)
+                # Continue through the same TextIOWrapper used by readline() above. Mixing that
+                # buffered read with communicate() can lose a line that readline() prefetched
+                # from the pipe under scheduler load (#1428).
+                child.wait(timeout=5)
+                output = child.stdout.read()
                 self.assertEqual(0, child.returncode, output)
                 self.assertIn("[snapshot-lock] waiting for pid", output)
                 self.assertIn("[snapshot-lock] acquired after", output)
                 self.assertTrue(output.rstrip().endswith("acquired"), output)
             finally:
-                if child is not None and child.poll() is None:
-                    child.kill()
-                    child.wait(timeout=5)
+                if child is not None:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait(timeout=5)
+                    if child.stdout is not None:
+                        child.stdout.close()
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "PR_SET_PDEATHSIG is Linux-specific")
     def test_snapshot_child_dies_when_harness_is_killed(self):
