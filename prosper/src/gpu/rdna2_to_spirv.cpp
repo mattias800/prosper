@@ -6307,8 +6307,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // (y-1)) / 6 at base LOD (mips aren't uploaded; a >0 LOD clamps to the one level).
                 // The in-face clamp stops bilinear bleed across face seams. CONFIDENCE: MED — the
                 // coordinate convention is Mesa-verified; face memory layout is validated visually.
-                if (!is_sample && !is_sample_l && !is_sample_lz && !is_sample_b) { ok = false; return true; }
-                const uint32_t ci = is_sample_b ? 1u : 0u;              // _b: bias occupies vaddr0
+                if (!is_sample && !is_sample_l && !is_sample_lz && !is_sample_b &&
+                    !is_sample_c_lz) { ok = false; return true; }
+                // Modifier-first order: _b carries bias in vaddr0; _c_lz carries DREF there.
+                const uint32_t ci = (is_sample_b || is_sample_c_lz) ? 1u : 0u;
                 uint32_t x = vread(cvg(ci)), y = vread(cvg(ci + 1)), fid = vread(cvg(ci + 2));
                 const uint32_t one = b.uconst(fbits(1.0f)), zero = b.uconst(fbits(0.0f));
                 uint32_t uf = b.fbin(Op_FSub, x, one);
@@ -6316,8 +6318,21 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t layer = b.fext1(Glsl_RoundEven,
                                      b.fext2(Glsl_FMax, b.fext2(Glsl_FMin, fid, b.uconst(fbits(5.0f))), zero));
                 uint32_t v6 = b.fbin(Op_FMul, b.fbin(Op_FAdd, layer, vf), b.uconst(fbits(1.0f / 6.0f)));
-                b.declare_texture(res->binding, Dim_2D, uint_texture);
-                b.image_sample_lod_2d(res->binding, uf, v6, b.uconst(0), out);
+                if (is_sample_c_lz) {
+                    // Point-light shadow maps use the same cube-processed coordinates as ordinary
+                    // samples, with DREF prepended: [dref, x, y, face]. The renderer uploads cube
+                    // faces as one vertical 2D stack, so compare the transformed face coordinate
+                    // manually through its ordinary non-compare sampler (#1167/#1169).
+                    if (uint_texture || !res->depth_compare) { ok = false; return true; }
+                    b.declare_texture(res->binding, Dim_2D, false);
+                    b.image_sample_dref_manual_2d(res->binding, uf, v6, vread(cvg(0)),
+                                                  res->depth_compare_func,
+                                                  res->mag_filter != 0u, res->addr_uvw[0],
+                                                  res->addr_uvw[1], res->border_color_type, out);
+                } else {
+                    b.declare_texture(res->binding, Dim_2D, uint_texture);
+                    b.image_sample_lod_2d(res->binding, uf, v6, b.uconst(0), out);
+                }
             } else if (dim3d) {
                 // 3D: implicit-LOD / LOD-0 sample, or an integer texel FETCH (image_load — DOLL's
                 // color-grade 3D LUT, #273).
@@ -8903,7 +8918,8 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                     if (i.opcode == 0x20u || i.opcode == 0x27u || i.opcode == 0xa0u)
                         return i.mimg_dim == 1u || i.mimg_dim == 2u || i.mimg_dim == 5u;
                     if (i.opcode == 0x22u) return i.mimg_dim == 1u || i.mimg_dim == 5u;
-                    if (i.opcode == 0x2fu) return i.mimg_dim == 1u || i.mimg_dim == 5u; // IMAGE_SAMPLE_C_LZ 2D (#1271) / 2D_ARRAY
+                    if (i.opcode == 0x2fu)
+                        return i.mimg_dim == 1u || i.mimg_dim == 3u || i.mimg_dim == 5u;
                     if (i.opcode == 0x24u || i.opcode == 0x25u || i.opcode == 0x47u) return i.mimg_dim == 1u || i.mimg_dim == 5u;
                     return false;
                 }
