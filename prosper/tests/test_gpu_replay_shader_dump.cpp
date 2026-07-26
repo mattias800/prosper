@@ -94,6 +94,31 @@ int main() {
               error.find("capture predates v19 or source was unreadable") != std::string::npos,
           "missing legacy raw source is explicit instead of selecting unrelated bytes");
 
+    gpu::GpuReplayFrame shared_replay;
+    gpu::DrawItem shared_draw;
+    shared_draw.draw_index = 19;
+    shared_draw.vs = {0xaaaaaaaa};
+    shared_draw.fs = {0xbbbbbbbb};
+    shared_draw.vs_shared =
+        std::make_shared<const std::vector<uint32_t>>(std::vector<uint32_t>{0x07230203, 0x11});
+    shared_draw.fs_shared =
+        std::make_shared<const std::vector<uint32_t>>(std::vector<uint32_t>{0x07230203, 0x22, 0x33});
+    shared_replay.items.push_back(shared_draw);
+    bool shared = false;
+    const auto* stored_vs = tools::select_recompiled_shader(shared_replay, "19:vs", shared, error);
+    CHECK(stored_vs == shared_draw.vs_shared.get() && shared,
+          "recompiled VS selection reads the shared words that rendering consumes");
+    const auto* stored_fs = tools::select_recompiled_shader(shared_replay, "19:fs", shared, error);
+    CHECK(stored_fs == shared_draw.fs_shared.get() && shared,
+          "recompiled FS selection reads the shared words that rendering consumes");
+    shared_replay.items[0].vs_shared.reset();
+    const auto* owned_vs = tools::select_recompiled_shader(shared_replay, "19:vs", shared, error);
+    CHECK(owned_vs == &shared_replay.items[0].vs && !shared,
+          "recompiled shader selection retains the ordinary owned-vector path");
+    CHECK(!tools::select_recompiled_shader(shared_replay, "20:vs", shared, error) &&
+              error.find("realized draw 20 not found") != std::string::npos,
+          "recompiled shader selection rejects an absent semantic draw");
+
     std::printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }
