@@ -120,6 +120,7 @@ init:  SDL_Init(VIDEO|AUDIO|GAMECONTROLLER); create window;
        start the guest run-loop on its own thread.
 
 frame: SDL_PollEvent → on SDL_QUIT / window-close: prosper_request_stop(); break;
+       Pause / F10 toggles a guest flip-boundary wait and the SDL audio device;
        F11 / Alt+Enter toggles borderless desktop fullscreen;
        pixel-size change → recreate the Vulkan swapchain before the next present;
        if present_count() advanced since last shown:
@@ -448,10 +449,11 @@ duplicate. Until then the app is fully functional via `--test-pattern` (and any 
   shows the composited game (verified `--dump … --frames 3`).
 - **P1 — audio** ✅ **done**: `prosper-app` installs the SDL3 `AudioSink` (`sceAudioOut` → host).
 - **P2 — controllers** ✅ **done**: installs the SDL3 `PadBackend` (host gamepad → `libScePad`).
-- **P3 — polish** (in progress): resize/fullscreen, present-mode selection, and non-modal SaveData
+- **P3 — polish** (in progress): resize/fullscreen, present-mode selection, pause/resume at a guest
+  flip boundary with coherent audio, and non-modal SaveData
   percentage progress presentation and SaveData virtual-slot LIST selection are implemented. The LIST
   boundary retains only guest virtual directory names and never exposes a host file picker;
-  pause/quit UX remains.
+  quit UX remains.
   Native Windows build/run packaging is done via `scripts/run-windows.ps1`. Cooperative guest-stop
   at a flip boundary is a follow-up (today the
   guest thread is detached at window-close and reclaimed by process exit).

@@ -28,6 +28,20 @@ int main() {
     key = {};
     key.app_window = true;
     key.pressed = true;
+    key.pause = true;
+    CHECK(controls.handle_key(key) == AppWindowCommand::toggle_pause,
+          "Pause/F10 toggles guest pause");
+    key.repeat = true;
+    CHECK(controls.handle_key(key) == AppWindowCommand::none,
+          "held Pause/F10 does not toggle repeatedly");
+    key.repeat = false;
+    key.app_window = false;
+    CHECK(controls.handle_key(key) == AppWindowCommand::none,
+          "another SDL window cannot pause the game window");
+
+    key = {};
+    key.app_window = true;
+    key.pressed = true;
     key.enter = true;
     key.alt = true;
     CHECK(controls.handle_key(key) == AppWindowCommand::toggle_fullscreen,

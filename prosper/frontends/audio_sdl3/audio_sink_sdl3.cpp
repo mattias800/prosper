@@ -6,6 +6,7 @@
 // sceAudioOutOutput has on real hardware (it blocks until the audio ring has room).
 #include "audio_sdl3.hpp"
 #include "../../src/hle/audio.hpp"
+#include "../../src/host/lifecycle.hpp"
 
 #include <SDL3/SDL.h>
 
@@ -27,6 +28,7 @@ SDL_AudioFormat to_sdl_format(AudioFmt f) { return f == AudioFmt::F32 ? SDL_AUDI
 class Sdl3AudioSink : public AudioSink {
 public:
     bool init() {
+        paused_ = false;
         if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
             SDL_Log("prosper-audio: SDL_InitSubSystem(AUDIO) failed: %s", SDL_GetError());
             return false;
@@ -56,8 +58,11 @@ public:
         s.freq = info.freq;
         s.put_failed = false;
         s.next = {};   // (re)start the per-grain pacing clock on the first output()
-        if (!SDL_ResumeAudioStreamDevice(s.stream)) {
-            SDL_Log("prosper-audio: ResumeAudioStreamDevice failed: %s", SDL_GetError());
+        const bool stream_ready = paused_ ? SDL_PauseAudioStreamDevice(s.stream)
+                                          : SDL_ResumeAudioStreamDevice(s.stream);
+        if (!stream_ready) {
+            SDL_Log("prosper-audio: %sAudioStreamDevice failed: %s",
+                    paused_ ? "Pause" : "Resume", SDL_GetError());
             SDL_DestroyAudioStream(s.stream);
             s.stream = nullptr;
             return false;
@@ -72,6 +77,9 @@ public:
 
     void output(int port, const void* pcm, int frames) override {
         if (port < 1 || port > kMaxPorts) return;
+        // Block before touching the SDL queue. Pausing the device preserves samples that were
+        // already accepted; this gate prevents guest audio threads from filling it while paused.
+        if (!prosper_wait_while_paused()) return;
         int freq = 0;
         std::chrono::steady_clock::time_point target{};
         {
@@ -123,6 +131,25 @@ public:
         s.frame_bytes = s.grain_bytes = 0;
     }
 
+    void set_paused(bool paused) {
+        std::lock_guard<std::mutex> lk(mx_);
+        if (paused_ == paused) return;
+        paused_ = paused;
+        int active_streams = 0;
+        for (Slot& s : slots_) {
+            if (!s.stream) continue;
+            ++active_streams;
+            const bool ok = paused ? SDL_PauseAudioStreamDevice(s.stream)
+                                   : SDL_ResumeAudioStreamDevice(s.stream);
+            if (!ok)
+                SDL_Log("prosper-audio: %sAudioStreamDevice failed: %s",
+                        paused ? "Pause" : "Resume", SDL_GetError());
+            if (!paused) s.next = {};   // resume pacing from now; never catch up in a burst
+        }
+        SDL_Log("prosper-audio: %s %d active stream%s", paused ? "paused" : "resumed",
+                active_streams, active_streams == 1 ? "" : "s");
+    }
+
 private:
     struct Slot { SDL_AudioStream* stream = nullptr; int frame_bytes = 0; int grain_bytes = 0;
                   bool put_failed = false;
@@ -130,6 +157,7 @@ private:
                   std::chrono::steady_clock::time_point next{}; };  // per-grain pacing deadline
     std::mutex mx_;
     std::array<Slot, kMaxPorts> slots_{};
+    bool paused_ = false;
 };
 
 Sdl3AudioSink g_sink;
@@ -144,6 +172,10 @@ bool install_sdl3_audio_sink() {
     g_installed = true;
     SDL_Log("prosper-audio: SDL3 audio backend installed");
     return true;
+}
+
+void set_sdl3_audio_paused(bool paused) {
+    if (g_installed) g_sink.set_paused(paused);
 }
 
 void shutdown_sdl3_audio_sink() {

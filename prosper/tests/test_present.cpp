@@ -5,10 +5,14 @@
 // plumbing end-to-end headlessly — the surface the renderer will present real frames to.
 #include "../src/hle/dispatch.hpp"
 #include "../src/gpu/videoout_present.hpp"
+#include "../src/host/lifecycle.hpp"
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <memory>
+#include <thread>
 #include <vector>
 
 using namespace prosper;
@@ -133,6 +137,29 @@ int main() {
     CHECK(gpu::present_width() == W && gpu::present_height() == H &&
           got == FB_BYTES && out.front() == 0x22 && out.back() == 0x22,
           "set 0 flip restores its 16x8 buffer with matching geometry");
+
+    // The host pause gate lives after flip publication: the UI can keep showing the new front
+    // buffer while the guest caller waits, then resume it without interrupting mid-frame.
+    prosper_reset_stop();
+    prosper_set_paused(true);
+    const uint64_t paused_count = gpu::present_count();
+    auto paused_flip = std::async(std::launch::async, [&] {
+        flip(handle, 1, 0, 0xCAFE, 0, 0);
+        return true;
+    });
+    const auto publish_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (gpu::present_count() == paused_count &&
+           std::chrono::steady_clock::now() < publish_deadline)
+        std::this_thread::yield();
+    CHECK(gpu::present_count() == paused_count + 1 && gpu::present_front_index() == 1,
+          "paused flip publishes its completed boundary");
+    CHECK(paused_flip.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout,
+          "paused flip holds the guest caller after publication");
+    prosper_set_paused(false);
+    CHECK(paused_flip.wait_for(std::chrono::seconds(1)) == std::future_status::ready &&
+              paused_flip.get(),
+          "resume releases the guest flip caller");
+    prosper_reset_stop();
 
     // Out-of-range flip index leaves the front buffer unchanged.
     flip(handle, 99, 0, 0, 0, 0);

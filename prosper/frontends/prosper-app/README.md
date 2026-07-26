@@ -55,7 +55,8 @@ PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
 ./build-app/prosper-app --test-pattern
 ```
 
-F11 or Alt+Enter toggles borderless desktop fullscreen. Esc or closing the window quits.
+Pause or F10 pauses/resumes at a guest flip boundary and freezes the audio stream. F11 or Alt+Enter
+toggles borderless desktop fullscreen. Esc or closing the window quits.
 
 ## Options
 
