@@ -3445,6 +3445,19 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     // restricted to plain-2D RGBA8 sampled guest textures. Cube/volume stacks,
                     // storage images, RTT-backed bindings, and other formats keep one level.
                     uint32_t tex_mip_levels = 1;
+                    // PROSPER_MIPLOG=1: report every texture binding's mip-eligibility inputs —
+                    // which gate leg starves a declared chain down to one level (#1287 moiré).
+                    static const bool miplog_enabled = getenv("PROSPER_MIPLOG") != nullptr;
+                    if (miplog_enabled && r.tw >= 64 && !r.is_storage_image)
+                        fprintf(stderr,
+                                "[miplog] %ux%ux%u dim=%u declared_mips=%u fmt=%d rtt=%llu ds=%llu "
+                                "rgba=%d min_lod=%.1f max_lod=%.1f mag=%u min=%u mip=%u\n",
+                                r.tw, r.th, r.td, r.img_dim, r.declared_mip_levels,
+                                (int)r.texture_format,
+                                (unsigned long long)r.persistent_render_target_id,
+                                (unsigned long long)r.persistent_depth_target_id,
+                                r.tex_rgba != nullptr, r.min_lod, r.max_lod,
+                                r.mag_filter, r.min_filter, r.mip_filter);
                     if (!r.is_storage_image && r.img_dim == 1 && r.td == 1 &&
                         !r.persistent_render_target_id && r.tex_rgba &&
                         // Widening this format gate requires BLIT_SRC/BLIT_DST +
@@ -3818,6 +3831,22 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     if (!words || !word_count) {
                         words = &zero_buffer_word;
                         word_count = 1;
+                    }
+                    // PROSPER_BUFLOG=1: per-binding upload provenance — set/binding, word count,
+                    // and the first dwords as floats. Ground truth for "which bytes did the shader
+                    // see" when a fetch-offset defect is suspected (the #1287 palette-UV audit).
+                    static const bool buflog_enabled = getenv("PROSPER_BUFLOG") != nullptr;
+                    if (buflog_enabled) {
+                        static int buflog_count = 0;
+                        if (buflog_count++ < 400) {
+                            const float* fp = reinterpret_cast<const float*>(words);
+                            fprintf(stderr,
+                                    "[buflog] set=%u binding=%u words=%zu id=%llx f0=%g f1=%g f2=%g\n",
+                                    r.set, r.binding, word_count,
+                                    (unsigned long long)r.buffer_identity,
+                                    word_count > 0 ? fp[0] : 0.f, word_count > 1 ? fp[1] : 0.f,
+                                    word_count > 2 ? fp[2] : 0.f);
+                        }
                     }
                     ++resource_reuse_stats.buffer_references;
                     ++backend_hash_stats_totals().references;

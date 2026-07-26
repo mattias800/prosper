@@ -54,6 +54,7 @@ void usage(const char* argv0) {
                          "[--bundle-find-ds ADDR] "
                          "[--bundle-zero-boundary] "
                          "[--draw-steps PREFIX [--draw-steps-every N] [--draw-steps-target WxH]] "
+                         "[--recompile-raw] "
                          "[--prepend producer.prgcap] "
                          "[--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
                          "[--dump-rtt-seed ADDR PATH] "
@@ -1180,6 +1181,7 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
 
 int main(int argc, char** argv) {
     bool inspect = false, inspect_only = false, validate_only = false, allow_mismatch = false;
+    bool recompile_raw = false;
     bool graph_only = false, bundle_zero_boundary = false, bundle_ds_summary = false;
     bool legacy_htile_before_stencil = false, draw_with_compute_prefix = false;
     size_t bundle_tail = 0;
@@ -1216,6 +1218,7 @@ int main(int argc, char** argv) {
             graph_only = true; graph_json_path = argv[++i];
         }
         else if (std::string(argv[i]) == "--allow-mismatch") allow_mismatch = true;
+        else if (std::string(argv[i]) == "--recompile-raw") recompile_raw = true;
         else if (std::string(argv[i]) == "--legacy-htile-before-stencil")
             legacy_htile_before_stencil = true;
         else if (std::string(argv[i]) == "--bundle" && i + 1 < argc) bundle_path = argv[++i];
@@ -1377,6 +1380,42 @@ int main(int argc, char** argv) {
     prosper::gpu::GpuReplayFrame replay;
     if (!prosper::gpu::materialize_gpu_replay(capture, replay, error)) {
         std::fprintf(stderr, "gpu_replay: cannot materialize: %s\n", error.c_str()); return 2;
+    }
+    // --recompile-raw: a capsule stores already-recompiled SPIR-V, so recompiler changes are
+    // invisible to a default replay. This mode re-recompiles EVERY retained raw VS/FS with the
+    // CURRENT recompiler and substitutes the result, turning any v19+ capsule into a deterministic
+    // offline A/B vehicle for recompiler work (stored vs current output diff via the replay hash —
+    // the #1394/#1287 localization loop). Items without a retained raw stream, or whose
+    // re-recompile fails, keep their stored SPIR-V — counted and reported, never silent.
+    // PROSPER_FS_TAP is masked during the mass loop (recompile_fragment reads it per compile, so an
+    // unmasked env would tap every shader containing that pc) and restored after, so the per-draw
+    // tap block below still applies to exactly its semantic draw. Interface hints (pixel/system
+    // inputs) are not retained by captures; nullptr matches the FS-tap/geom-probe precedent and the
+    // VS/FS interface itself is re-derived deterministically from the raw streams on both sides.
+    if (recompile_raw) {
+        const char* tap_env_raw = std::getenv("PROSPER_FS_TAP");
+        const std::string tap_env = tap_env_raw ? tap_env_raw : "";
+        if (tap_env_raw) unsetenv("PROSPER_FS_TAP");
+        size_t vs_swapped = 0, fs_swapped = 0, vs_kept = 0, fs_kept = 0;
+        for (auto& it : replay.items) {
+            if (it.vs_raw_shader_index < replay.raw_shader_versions.size()) {
+                const auto& raw = replay.raw_shader_versions[it.vs_raw_shader_index];
+                auto vs = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
+                                                         it.vrt.get(), nullptr, false);
+                if (!vs.empty()) { it.vs = std::move(vs); it.vs_shared.reset(); it.vs_identity = 0; ++vs_swapped; }
+                else ++vs_kept;
+            } else ++vs_kept;
+            if (it.fs_raw_shader_index < replay.raw_shader_versions.size()) {
+                const auto& raw = replay.raw_shader_versions[it.fs_raw_shader_index];
+                auto fs = prosper::gpu::recompile_fragment(raw.words.data(), raw.words.size(),
+                                                           it.prt.get(), nullptr, UINT32_MAX, nullptr);
+                if (!fs.empty()) { it.fs = std::move(fs); it.fs_shared.reset(); it.fs_identity = 0; ++fs_swapped; }
+                else ++fs_kept;
+            } else ++fs_kept;
+        }
+        if (tap_env_raw) setenv("PROSPER_FS_TAP", tap_env.c_str(), 1);
+        std::fprintf(stderr, "[recompile-raw] substituted vs=%zu fs=%zu kept-stored vs=%zu fs=%zu of %zu draws\n",
+                     vs_swapped, fs_swapped, vs_kept, fs_kept, replay.items.size());
     }
     // Geometry probe (PROSPER_GEOM_PROBE=N): a capsule stores already-recompiled SPIR-V, so to capture
     // draw N's gl_Position via transform feedback we re-recompile its raw RDNA2 VS with xfb decorations
