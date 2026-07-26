@@ -186,7 +186,11 @@ bool native_storage_image_create_supported(VkPhysicalDevice physical, VkFormat f
            properties.maxExtent.depth >= 1 && properties.maxArrayLayers >= 1;
 }
 
-constexpr VkDeviceSize kMaxComputeImageBytes = 256ull << 20;
+// Storage images use an RGBA32_UINT interchange surface so format conversion remains bit-exact on
+// readback. A valid 10K x 2K single-channel PS5 surface consequently expands from 40 MiB of guest
+// memory to 320 MiB on the host. Keep a hard allocation guard, but leave enough room for one such
+// console-sized resource instead of rejecting it solely because of the interchange representation.
+constexpr VkDeviceSize kMaxComputeImageBytes = 512ull << 20;
 constexpr size_t kMaxCachedComputePipelines = 4096;
 
 // Large storage-image format conversions are independent per texel. Astro Bot's 4K FP16 target is
@@ -689,6 +693,9 @@ struct VulkanComputeContext {
     // tests/image_compute_runner.h, the exec-diff harness for that contract). When the device lacks
     // the features, image-binding dispatches are skipped loudly instead of creating an invalid device.
     bool image_support = false;
+    uint32_t subgroup_size = 0;
+    VkShaderStageFlags subgroup_stages = 0;
+    VkSubgroupFeatureFlags subgroup_operations = 0;
     // True when instance/device/queue were ADOPTED from the live renderer (#1091). A borrowed
     // context is owned by the renderer: destroy our own pipelines/pools/memory, never its device.
     bool borrowed = false;
@@ -1243,6 +1250,17 @@ struct VulkanComputeContext {
         return (props[family].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
     }
 
+    void query_subgroup_support() {
+        VkPhysicalDeviceSubgroupProperties subgroup{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        properties.pNext = &subgroup;
+        vkGetPhysicalDeviceProperties2(physical, &properties);
+        subgroup_size = subgroup.subgroupSize;
+        subgroup_stages = subgroup.supportedStages;
+        subgroup_operations = subgroup.supportedOperations;
+    }
+
     bool init() {
         // Adopt the live renderer's device when it published one (#1091). Sharing a device is what
         // makes it possible for a dispatch to bind a renderer-owned image at all; without it every
@@ -1265,6 +1283,7 @@ struct VulkanComputeContext {
             VkPipelineCacheCreateInfo pcci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
             if (vkCreatePipelineCache(device, &pcci, nullptr, &pipeline_cache) == VK_SUCCESS) {
                 vkGetPhysicalDeviceMemoryProperties(physical, &memory);
+                query_subgroup_support();
                 std::fprintf(stderr, "[compute] Vulkan device: adopted the renderer's device "
                                      "(shared, queue family %u)\n", queue_family);
                 return true;
@@ -1338,6 +1357,7 @@ struct VulkanComputeContext {
         if (vkCreatePipelineCache(device, &pcci, nullptr, &pipeline_cache) != VK_SUCCESS)
             return false;
         vkGetPhysicalDeviceMemoryProperties(physical, &memory);
+        query_subgroup_support();
         return true;
     }
 
@@ -1843,7 +1863,21 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     const std::vector<uint32_t>& spirv = item.spirv;
     const bool trace = trace_compute_item(item);
     const uint64_t image_validation_epoch = ++ctx.image_validation_clock;
-    // #1122 review B1: enough invocations for all texels is NECESSARY but NOT SUFFICIENT
+    const uint32_t min_subgroup = compute_spirv_min_subgroup_size(item.spirv);
+    const uint32_t effective_subgroup = item.required_subgroup_size
+        ? item.required_subgroup_size : ctx.subgroup_size;
+    if (min_subgroup &&
+        (effective_subgroup < min_subgroup ||
+         !(ctx.subgroup_stages & VK_SHADER_STAGE_COMPUTE_BIT) ||
+         !(ctx.subgroup_operations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT))) {
+        std::fprintf(stderr,
+                     "[compute] skip program 0x%llx: lane operation requires a compute subgroup "
+                     "of at least %u lanes (host=%u stages=0x%x operations=0x%x)\n",
+                     static_cast<unsigned long long>(item.code_addr), min_subgroup,
+                     effective_subgroup, ctx.subgroup_stages, ctx.subgroup_operations);
+        return false;
+    }
+    // #1122 review B1: covers_extent (dispatch grid >= image extent) is NECESSARY but NOT SUFFICIENT
     // for skipping the seed. A write-only shader can store a subset of its grid (a masked composite:
     // `if (mask) imageStore(...)`, or a scatter store), covering the grid yet leaving untouched texels
     // undefined. Skipping the seed there would pack reused-pool garbage to the guest -- silent
@@ -2623,7 +2657,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // but Float32 stays native so exposure/HDR kernels do not lose sign or dynamic range.
             const VkDeviceSize sbytes = volume_texels * texel_bytes;
             if (!sbytes || sbytes > kMaxComputeImageBytes) {
-                skip_image(r, "expanded image exceeds the 256 MiB backend bound"); break;
+                skip_image(r, "expanded image exceeds the 512 MiB backend bound"); break;
             }
             staging_bytes[i] = sbytes;
 

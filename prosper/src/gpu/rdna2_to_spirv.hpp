@@ -223,6 +223,12 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                         const ShaderResourceTable* rt,
                                         const ComputeShaderConfig& config);
 
+// DPP/permlane operations are native subgroup shuffles: quad permutations need four contiguous
+// lanes, row operations need 16, and PERMLANEX16 needs a paired 32-lane row. The backend rejects
+// (rather than miscompiles) a module on a narrower host.
+// Zero means that the module does not use a native compute-subgroup operation.
+uint32_t compute_spirv_min_subgroup_size(const std::vector<uint32_t>& spirv);
+
 // Recompile a pixel/fragment shader to a fragment SPIR-V module: run the VALU, and on EXP to MRT0/1
 // write vec4(src0..3) to the matching color output. NULL-only shaders retain discard/EXEC effects and
 // intentionally expose no color output. Returns {} if unsupported / no implemented export.

@@ -336,6 +336,13 @@ void decode_operands(Rdna2Inst& i) {
             // selects the destination half. Reuse the packed-op selector field for this family.
             if (i.opcode == 0x34Bu)
                 i.vop3p_opsel = static_cast<uint8_t>((w >> 11) & 0xFu);
+            // V_PERMLANE16_B32 / V_PERMLANEX16_B32 overload OPSEL[0] as FI and OPSEL[1] as
+            // BOUND_CTRL. OPSEL[2:3], ABS, NEG, CLAMP and OMOD remain reserved/unsupported and are
+            // rejected by the emitter so malformed encodings cannot silently lose modifiers.
+            if (i.opcode == 0x377u || i.opcode == 0x378u) {
+                i.permlane_fetch_inactive = ((w >> 11) & 1u) != 0;
+                i.permlane_bound_ctrl = ((w >> 12) & 1u) != 0;
+            }
             break;
         }
         case Rdna2Format::VOP3P: {

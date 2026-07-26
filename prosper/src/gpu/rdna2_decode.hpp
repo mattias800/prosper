@@ -67,6 +67,11 @@ struct Rdna2Inst {
     bool        has_dpp = false;
     uint16_t    dpp_ctrl = 0;
     bool        dpp_bound_ctrl = false;
+    // V_PERMLANE16_B32 / V_PERMLANEX16_B32 overload OPSEL[0:1] as Fetch-Inactive and
+    // BOUND_CTRL. Keep these separate from DPP's control word: permlane is a native VOP3 op whose
+    // 64-bit selector comes from SRC1:SRC2.
+    bool        permlane_fetch_inactive = false;
+    bool        permlane_bound_ctrl = false;
     // SDWA sub-word selects (#273): WORD_0/WORD_1 dst/src selects with UNUSED_PRESERVE — the f16
     // half-packing idiom (DOLL's box-blur: `v_mul_f16_sdwa … dst_sel:WORD_1 preserve` then
     // `v_mov_b32_sdwa … dst_sel:WORD_0 src0_sel:WORD_1`). 6 = DWORD (the default / no select);

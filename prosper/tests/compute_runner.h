@@ -9,6 +9,38 @@
 
 namespace prosper::test {
 
+struct ComputeSubgroupProperties {
+    uint32_t size = 0;
+    VkShaderStageFlags stages = 0;
+    VkSubgroupFeatureFlags operations = 0;
+};
+
+// Query the same first physical device run_compute() uses. Tests for native subgroup lowering can
+// then distinguish a valid host-width result from the stricter guest architectural requirement.
+inline ComputeSubgroupProperties default_compute_subgroup_properties() {
+    ComputeSubgroupProperties result;
+    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    app.apiVersion = VK_API_VERSION_1_1;
+    VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    ici.pApplicationInfo = &app;
+    VkInstance instance = VK_NULL_HANDLE;
+    if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS || !instance) return result;
+    uint32_t count = 0;
+    vkEnumeratePhysicalDevices(instance, &count, nullptr);
+    if (count) {
+        std::vector<VkPhysicalDevice> devices(count);
+        vkEnumeratePhysicalDevices(instance, &count, devices.data());
+        VkPhysicalDeviceSubgroupProperties subgroup{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        properties.pNext = &subgroup;
+        vkGetPhysicalDeviceProperties2(devices[0], &properties);
+        result = {subgroup.subgroupSize, subgroup.supportedStages, subgroup.supportedOperations};
+    }
+    vkDestroyInstance(instance, nullptr);
+    return result;
+}
+
 // Run `spirv` over storage buffer 0 = `input`, storage buffer 1 = output. `invocations` compute
 // threads are dispatched (default = input.size()); the output buffer holds `out_count` floats
 // (default = input.size()). Returns the output, or {} on any Vulkan failure (incl. rejected SPIR-V).

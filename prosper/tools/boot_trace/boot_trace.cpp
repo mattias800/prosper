@@ -259,9 +259,18 @@ int main(int argc, char** argv) {
 #ifdef PROSPER_HAVE_VULKAN
     // Compute is part of command submission even when frame rendering/dumping is disabled.
     // PROSPER_NO_COMPUTE=1 is a progression diagnostic only: semantic timelines still retain the
-    // dispatches, but neither graphics nor compute mutates guest GPU resources. This distinguishes
-    // host compute throughput from guest/HLE progression; it is never a correctness mode.
-    if (!getenv("PROSPER_NO_COMPUTE")) prosper::frontend::register_live_compute();
+    // dispatches, but neither graphics nor compute mutates guest GPU resources. Keep a successful
+    // no-op backend registered so async-compute submissions are acknowledged; leaving the backend
+    // absent makes execute_nonrender_submit_work report failure and UE treats the valid ACB as an
+    // invalid submission. This distinguishes host compute throughput from guest/HLE progression;
+    // it is never a correctness mode.
+    if (getenv("PROSPER_NO_COMPUTE")) {
+        prosper::gpu::set_submit_compute(
+            [](const std::vector<prosper::gpu::ComputeItem>&) { return true; });
+        std::fprintf(stderr, "[compute] progression-only no-op backend registered\n");
+    } else {
+        prosper::frontend::register_live_compute();
+    }
     // PROSPER_RENDER=1: register the live Vulkan renderer (shared with prosper-app via
     // frontends/shared/live_renderer) so execute_and_present composites every submitted Dcb with
     // draws and hands the frame to the present path; periodic BMP screenshots go to PROSPER_FRAME_DIR

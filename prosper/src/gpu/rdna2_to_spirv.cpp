@@ -55,9 +55,9 @@ enum : uint32_t {
     Op_Phi=245, Op_LoopMerge=246,
     Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Switch=251,
     Op_EmitVertex=218, Op_EndPrimitive=219,
-    Op_Kill=252, Op_Return=253, Op_GroupNonUniformAny=335,
+    Op_Kill=252, Op_Return=253, Op_ModuleProcessed=330, Op_GroupNonUniformAny=335,
+    Op_GroupNonUniformShuffle=345,
     Op_GroupNonUniformIAdd=349,
-    Op_GroupNonUniformQuadSwap=366,
 };
 // GLSL.std.450 extended-instruction numbers.
 enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Glsl_Ceil=9, Glsl_Fract=10, Glsl_Sin=13, Glsl_Cos=14,
@@ -67,7 +67,7 @@ enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Gls
                   Glsl_NMin=79, Glsl_NMax=80 };   // NaN-aware min/max: one-NaN operand -> the other operand
 enum : uint32_t {
     Cap_Shader=1, Cap_Geometry=2, Cap_Int64=11, Cap_GroupNonUniform=61, Cap_GroupNonUniformVote=62,
-    Cap_GroupNonUniformArithmetic=63, Cap_GroupNonUniformQuad=68,
+    Cap_GroupNonUniformArithmetic=63, Cap_GroupNonUniformShuffle=65,
     Cap_TransformFeedback=53,   // VK_EXT_transform_feedback (geometry-probe capture of gl_Position, gated)
     Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Geometry=3, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17, EM_Triangles=22,
@@ -203,7 +203,7 @@ uint32_t inline_float_f16_bits(int code) {
 // A compute-shader SPIR-V builder specialized for "load N floats -> compute over SSA floats ->
 // store 1 float", with helpers the VALU translator drives.
 struct SpirvCompute {
-    std::vector<uint32_t> caps, extimp, mem, entry, exec, deco, types, code;
+    std::vector<uint32_t> caps, extimp, mem, entry, exec, debug, deco, types, code;
     std::unordered_map<uint32_t, uint32_t> fconst_cache, uconst_cache;
     uint32_t next_id = 1;
     uint32_t stride = 1;
@@ -234,6 +234,8 @@ struct SpirvCompute {
     // subgroup size equal to the PS5 wave. Native votes/scans are then architecture-exact.
     uint32_t native_subgroup_size=0;
     uint32_t native_storage_format_support=0;
+    uint32_t compute_min_subgroup_size=0;             // non-semantic backend contract (4/16/32/64)
+    uint32_t fragment_required_subgroup_size=0;       // exact guest-wave contract (currently 64)
     uint32_t v_subgroup_localid=0, t_ptr_in_u32=0;
     uint32_t v_helper_invocation=0, t_ptr_in_bool=0;
     uint32_t v_internal_gds=0, t_ptr_gds_u32=0;
@@ -472,12 +474,8 @@ struct SpirvCompute {
             iface.push_back(v_subgroup_localid);
         }
         // Fragment lane ids model RDNA wave64 lanes, not the implementation's default subgroup.
-        // Arithmetic capability is also the self-contained module marker the backend reflects to
-        // enforce size 64; apply it even when an inline scalar mask only consumes the lane id.
-        if (is_fragment && !declared_subgroup_arithmetic) {
-            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
-            declared_subgroup_arithmetic = true;
-        }
+        // Record that exact-width contract as non-semantic module metadata in finish().
+        if (is_fragment) fragment_required_subgroup_size = 64;
         uint32_t lane = id();
         put(code, Op_Load, {t_u32, lane, v_subgroup_localid});
         return lane;
@@ -497,11 +495,7 @@ struct SpirvCompute {
             put(caps, Op_Capability, {Cap_GroupNonUniformVote});
             declared_subgroup_vote = true;
         }
-        // Self-contained marker reflected by fragment_spirv_required_subgroup_size().
-        if (!declared_subgroup_arithmetic) {
-            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
-            declared_subgroup_arithmetic = true;
-        }
+        fragment_required_subgroup_size = 64;
         uint32_t result = id();
         put(code, Op_GroupNonUniformAny,
             {t_bool, result, uconst(Scope_Subgroup), active_bit});
@@ -510,6 +504,10 @@ struct SpirvCompute {
     uint32_t fragment_mbcnt(uint32_t mask_bit, uint32_t acc_bits, bool lo) {
         if (!is_fragment) return 0;
         const uint32_t lane = subgroup_local_id();
+        if (!declared_subgroup_arithmetic) {
+            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
+            declared_subgroup_arithmetic = true;
+        }
         const uint32_t in_half = lo
             ? ucmp(Op_ULessThan, lane, uconst(32))
             : ucmp(Op_UGreaterThanEqual, lane, uconst(32));
@@ -643,17 +641,99 @@ struct SpirvCompute {
             {t_u32, old, uconst(Scope_Subgroup), GroupOp_Reduce, local_old});
         return old;
     }
-    bool declared_subgroup_quad = false;
-    uint32_t subgroup_quad_swap(uint32_t value, uint32_t direction) {
-        if (!declared_subgroup_quad) {
+    bool declared_subgroup_shuffle = false;
+    void mark_subgroup_min16() {
+        // DPP rows contain 16 contiguous lanes. Keep width metadata independent of SPIR-V
+        // capabilities: declaring an unused operation merely as a marker over-requires the host and
+        // confuses shaders that genuinely use that capability for unrelated work.
+        if (is_fragment) fragment_required_subgroup_size = 64;
+        else compute_min_subgroup_size = std::max(compute_min_subgroup_size, 16u);
+    }
+    void mark_subgroup_min32() {
+        // PERMLANEX16 crosses a pair of 16-lane rows.
+        if (is_fragment) fragment_required_subgroup_size = 64;
+        else compute_min_subgroup_size = std::max(compute_min_subgroup_size, 32u);
+    }
+    void mark_subgroup_min64() {
+        // V_READLANE_B32 may address every lane of a wave64.
+        if (is_fragment) fragment_required_subgroup_size = 64;
+        else compute_min_subgroup_size = std::max(compute_min_subgroup_size, 64u);
+    }
+    uint32_t subgroup_shuffle(uint32_t value, uint32_t lane) {
+        // Every supported native shuffle at least addresses an architectural quad. Wider row/wave
+        // operations raise this contract before calling the common helper.
+        if (is_fragment) fragment_required_subgroup_size = 64;
+        else compute_min_subgroup_size = std::max(compute_min_subgroup_size, 4u);
+        if (!declared_subgroup) {
             put(caps, Op_Capability, {Cap_GroupNonUniform});
-            put(caps, Op_Capability, {Cap_GroupNonUniformQuad});
-            declared_subgroup_quad = true;
+            declared_subgroup = true;
+        }
+        if (!declared_subgroup_shuffle) {
+            put(caps, Op_Capability, {Cap_GroupNonUniformShuffle});
+            declared_subgroup_shuffle = true;
         }
         uint32_t result = id();
-        put(code, Op_GroupNonUniformQuadSwap,
-            {t_u32, result, uconst(Scope_Subgroup), value, uconst(direction)});
+        put(code, Op_GroupNonUniformShuffle,
+            {t_u32, result, uconst(Scope_Subgroup), value, lane});
         return result;
+    }
+    uint32_t subgroup_quad_permute(uint32_t value, uint32_t ctrl) {
+        const uint32_t lane = subgroup_local_id();
+        const uint32_t quad_lane = ibin(Op_BitwiseAnd, lane, uconst(3));
+        uint32_t selected = uconst(ctrl & 3u);
+        for (uint32_t output_lane = 1; output_lane < 4; ++output_lane)
+            selected = sel(ucmp(Op_IEqual, quad_lane, uconst(output_lane)),
+                           uconst((ctrl >> (2u * output_lane)) & 3u), selected);
+        const uint32_t source_lane = ibin(
+            Op_BitwiseOr, ibin(Op_BitwiseAnd, lane, uconst(~3u)), selected);
+        return subgroup_shuffle(value, source_lane);
+    }
+    bool ds_swizzle_source_lane(uint32_t offset, uint32_t* source_lane) {
+        // RDNA2 ISA 12.13.1: the two basic DS_SWIZZLE modes precede rotate/FFT. The quad form
+        // (10xx...) carries four two-bit selectors; the group32 form carries AND/OR/XOR masks.
+        // Rotate and FFT remain fail-closed until their distinct mappings are implemented.
+        if (!source_lane || offset >= 0xc000u) return false;
+        const uint32_t lane = subgroup_local_id();
+        if (offset & 0x8000u) {
+            const uint32_t quad_lane = ibin(Op_BitwiseAnd, lane, uconst(3));
+            uint32_t selected = uconst(offset & 3u);
+            for (uint32_t output_lane = 1; output_lane < 4; ++output_lane)
+                selected = sel(ucmp(Op_IEqual, quad_lane, uconst(output_lane)),
+                               uconst((offset >> (2u * output_lane)) & 3u), selected);
+            *source_lane = ibin(
+                Op_BitwiseOr, ibin(Op_BitwiseAnd, lane, uconst(~3u)), selected);
+            return true;
+        }
+        mark_subgroup_min32();
+        const uint32_t and_mask = uconst(offset & 0x1fu);
+        const uint32_t or_mask = uconst((offset >> 5) & 0x1fu);
+        const uint32_t xor_mask = uconst((offset >> 10) & 0x1fu);
+        const uint32_t lane_in_group = ibin(Op_BitwiseAnd, lane, uconst(0x1fu));
+        const uint32_t selected = ibin(
+            Op_BitwiseXor,
+            ibin(Op_BitwiseOr, ibin(Op_BitwiseAnd, lane_in_group, and_mask), or_mask),
+            xor_mask);
+        *source_lane = ibin(
+            Op_BitwiseOr, ibin(Op_BitwiseAnd, lane, uconst(~0x1fu)), selected);
+        return true;
+    }
+    uint32_t subgroup_permlane16(uint32_t value, uint32_t selectors_lo,
+                                uint32_t selectors_hi, bool across_rows,
+                                uint32_t* source_lane_out = nullptr) {
+        const uint32_t lane = subgroup_local_id();
+        const uint32_t row_lane = ibin(Op_BitwiseAnd, lane, uconst(15));
+        const uint32_t selector_word = sel(
+            ucmp(Op_ULessThan, row_lane, uconst(8)), selectors_lo, selectors_hi);
+        const uint32_t selector_index = ibin(Op_BitwiseAnd, row_lane, uconst(7));
+        const uint32_t selector_shift = ibin(Op_ShiftLeftLogical, selector_index, uconst(2));
+        const uint32_t selected = ibin(
+            Op_BitwiseAnd,
+            ibin(Op_ShiftRightLogical, selector_word, selector_shift), uconst(15));
+        uint32_t row_base = ibin(Op_BitwiseAnd, lane, uconst(~15u));
+        if (across_rows) row_base = ibin(Op_BitwiseXor, row_base, uconst(16));
+        const uint32_t source_lane = ibin(Op_BitwiseOr, row_base, selected);
+        if (source_lane_out) *source_lane_out = source_lane;
+        return subgroup_shuffle(value, source_lane);
     }
     // Fragment discard: OpKill any lane where `alive` is false, survivors fall through to `mergeL`. Used to
     // lower an EXP done under a narrowed EXEC (an alpha-test / WQM discard — the surviving lanes are the
@@ -2298,8 +2378,25 @@ struct SpirvCompute {
         // to `iface` as v_interp / EXP PARAM are encountered — appear in the interface list (SPIR-V 1.3).
         { std::vector<uint32_t> o{exec_model, f_main}; pstr(o, "main");
           for (uint32_t v : iface) o.push_back(v); putv(entry, Op_EntryPoint, o); }
+        if (is_compute && compute_min_subgroup_size) {
+            char marker[64];
+            std::snprintf(marker, sizeof marker, "Prosper.ComputeSubgroupMin=%u",
+                          compute_min_subgroup_size);
+            std::vector<uint32_t> words;
+            pstr(words, marker);
+            putv(debug, Op_ModuleProcessed, words);
+        }
+        if (is_fragment && fragment_required_subgroup_size) {
+            char marker[64];
+            std::snprintf(marker, sizeof marker, "Prosper.FragmentSubgroupSize=%u",
+                          fragment_required_subgroup_size);
+            std::vector<uint32_t> words;
+            pstr(words, marker);
+            putv(debug, Op_ModuleProcessed, words);
+        }
         std::vector<uint32_t> m{0x07230203u, 0x00010300u, 0u, next_id, 0u};
-        for (auto* s : {&caps, &extimp, &mem, &entry, &exec, &deco, &types, &code}) m.insert(m.end(), s->begin(), s->end());
+        for (auto* s : {&caps, &extimp, &mem, &entry, &exec, &debug, &deco, &types, &code})
+            m.insert(m.end(), s->begin(), s->end());
         return m;
     }
 };
@@ -2618,20 +2715,24 @@ inline bool sopk_writes_scalar_data(uint32_t opcode) {
 }
 
 inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R) {
-    // A "dead by redefinition at pc P" claim is only sound if execution cannot ENTER the region
-    // (target, P] from a branch elsewhere (which would skip the redef and reach a later read).
-    auto entered_between = [&](uint32_t upto) -> bool {
-        for (const auto& br : ins) {
-            if (br.fmt != Rdna2Format::SOPP || sopp_is_noop(br)) continue;
-            if (br.opcode < 0x02 || br.opcode > 0x09 || br.opcode == 0x03) continue;   // branches only
-            uint32_t t = br.pc + br.len_dwords + (uint32_t)(int32_t)br.simm16;
-            if (t > target && t <= upto) return true;
-        }
-        return false;
-    };
-    for (const auto& in : ins) {
-        if (in.pc < target) continue;
-        if (in.is_end) return true;                        // never read past here -> dead
+    // Prove liveness over the actual scalar CFG, not just lexical order. UE4 commonly places another
+    // forward EXECZ after an if/merge and only then overwrites the scratch SGPR/VCC value. A linear
+    // scan used to reject that safe shape merely because it encountered the second branch. Explore
+    // BOTH successors of every recognized conditional branch; a read on either path fails the proof,
+    // while a redefinition/end terminates only that path. The visited set also bounds back-edges.
+    std::unordered_map<uint32_t, size_t> pc_to_index;
+    for (size_t i = 0; i < ins.size(); ++i) pc_to_index.emplace(ins[i].pc, i);
+    const auto start = pc_to_index.find(target);
+    if (start == pc_to_index.end()) return false;
+    std::vector<size_t> pending{start->second};
+    std::vector<uint8_t> visited(ins.size(), 0);
+    while (!pending.empty()) {
+        size_t index = pending.back();
+        pending.pop_back();
+        if (index >= ins.size() || visited[index]) continue;
+        visited[index] = 1;
+        const auto& in = ins[index];
+        if (in.is_end) continue;                           // this path ends without a read
         // VCC (R = 106/107) has IMPLICIT readers the operand scan can't see: the e32 VOP2 carry /
         // cndmask ops (0x01, 0x28-0x2A) and the vccz/vccnz branches. Flag those as reads up front so
         // the redef checks below are sound for VCC too (which the s_mov carve-out excludes, but the
@@ -2648,9 +2749,23 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
             case Rdna2Format::SOPP:
                 // Hint/sync SOPPs read and write nothing — scan through them (s_waitcnt is ubiquitous
                 // after the merge). A barrier is also scalar-register-transparent; it changes only
-                // workgroup execution order. Branches (and anything else) invalidate the LINEAR scan
-                // — a skipped redefinition would make the dead claim unsound — so bail conservatively.
+                // workgroup execution order. For branches, enqueue every possible successor. Unknown
+                // scalar control flow remains fail-closed.
                 if (sopp_is_noop(in) || in.opcode == 0x0a) break;
+                if (in.opcode == 0x02 ||
+                    (in.opcode >= 0x04 && in.opcode <= 0x09)) {
+                    const int64_t branch_pc = static_cast<int64_t>(in.pc) +
+                        in.len_dwords + in.simm16;
+                    const auto branch = branch_pc >= 0
+                        ? pc_to_index.find(static_cast<uint32_t>(branch_pc)) : pc_to_index.end();
+                    if (branch == pc_to_index.end()) return false;
+                    pending.push_back(branch->second);
+                    if (in.opcode != 0x02) {
+                        if (index + 1 >= ins.size()) return false;
+                        pending.push_back(index + 1);
+                    }
+                    continue;
+                }
                 return false;
             case Rdna2Format::SMEM: {
                 // s_load/s_buffer_load: reads the SBASE pair (src[0], 2 regs) + SOFFSET (src[1]);
@@ -2665,7 +2780,7 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                 if (in.src[0].value == R || in.src[0].value + 1 == R) return false;         // SBASE read
                 if ((in.src[1].kind == OperandKind::SGPR || in.src[1].kind == OperandKind::Special) &&
                     in.src[1].value == R) return false;                                     // SOFFSET read
-                if (R >= in.dst.value && R < in.dst.value + (int)n) return !entered_between(in.pc);  // redefined
+                if (R >= in.dst.value && R < in.dst.value + (int)n) continue;  // redefined: this path is dead
                 break;
             }
             case Rdna2Format::SOP1: case Rdna2Format::SOP2: case Rdna2Format::SOPC:
@@ -2690,27 +2805,28 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                 }
                 // A VOP3B carry-out (sdst) is a 64-bit mask write — reads none of R beyond its sources.
                 if (in.sdst.kind == OperandKind::SGPR &&
-                    (in.sdst.value == R || in.sdst.value + 1 == R)) return !entered_between(in.pc);   // redefined (pair)
+                    (in.sdst.value == R || in.sdst.value + 1 == R)) continue;   // redefined (pair)
                 // A non-X VOPC e32 compare writes the whole VCC pair — kills both halves. V_CMPX
                 // writes EXEC ONLY on RDNA2 (ISA 12.9: "EXEC[threadId] = ..."; no VCC/SDST dest),
                 // so it must NOT count as a VCC kill — miscounting it let safe_execz linearize a
                 // block whose vcc scratch-write hardware would have skipped.
                 if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
                     (in.dst.value == 106 || in.dst.value == 107) && (R == 106 || R == 107))
-                    return !entered_between(in.pc);
+                    continue;
                 // A redefinition kills R for a plain numbered SGPR dst (s0..s105) — and now also for
                 // VCC_LO/HI (106/107), whose implicit readers are enumerated above. EXEC/M0
                 // (124/126/127) still can't be proven dead (implicit reads everywhere). A cmpx
                 // SDWAB's decoded SGPR dst is excluded for the same reason as above (EXEC only).
                 if (in.dst.kind == OperandKind::SGPR && in.dst.value == R && R <= 107 &&
                     !(in.fmt == Rdna2Format::VOPC && vopc_is_cmpx(in.opcode)))
-                    return !entered_between(in.pc);
+                    continue;
                 break;
             default:
                 return false;   // memory/branch/interp/unknown: can't bound reads of R -> assume live
         }
+        if (index + 1 < ins.size()) pending.push_back(index + 1);
     }
-    return true;   // fell off the end without a read
+    return true;   // every reachable path hit a redefinition/end without a read
 }
 
 std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& ins) {
@@ -3145,7 +3261,7 @@ uint32_t vgpr_write_count(const Rdna2Inst& in) {
             // (0x20) / ds_wrxchg_rtn_b32 (0x2d) write VDST, ds_read_b96/b128 (0xfe/0xff) write 3/4
             // VGPRs — returning 0 for them hid their definitions from loop-header phi collection
             // and from the #615 uniformity proof's defining-write scan.
-            if (in.opcode == 0x36 || in.opcode == 0x3d || in.opcode == 0x3e || in.opcode == 0xb1 ||
+            if (in.opcode == 0x35 || in.opcode == 0x36 || in.opcode == 0x3d || in.opcode == 0x3e || in.opcode == 0xb1 ||
                 in.opcode == 0x20 || in.opcode == 0x2d) return 1;
             if (in.opcode == 0x37 || in.opcode == 0x76) return 2;
             if (in.opcode == 0xfe) return 3;
@@ -4255,7 +4371,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // mask is a single bool for this lane. EXEC=SGPR 126/127, VCC=106/107; a saved mask lives
             // in sreg_bool. These implement divergent control flow (if/endif via saveexec + restore).
             if (in.opcode == 0x04 || in.opcode == 0x08 || in.opcode == 0x0a ||
-                in.opcode == 0x24 || in.opcode == 0x25 || in.opcode == 0x37) {
+                (in.opcode >= 0x24 && in.opcode <= 0x2b) ||
+                in.opcode == 0x37 || in.opcode == 0x38) {
                 // ISA: every op here EXCEPT s_mov_b64 writes SCC=(result!=0) — a cross-lane
                 // reduction the per-invocation model cannot form. POISON the tracked SCC (SSA id 0)
                 // so a later consumer (s_cselect/s_addc/SCC-source/scc-branch emission) rejects
@@ -4380,16 +4497,37 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         if (m && !data_copied) mask_write_clobbers_pair(rs, in.dst.value);
                         if (!m && !data_copied) ok = false;
                     }
-                } else {                                    // s_and/or/andn1_saveexec_b64 sDST, src
-                    rs.sreg_bool[in.dst.value] = rs.exec;   // save current EXEC to the dest SGPR pair
-                    rs.sreg_bool_narrowed[in.dst.value] = rs.exec_narrowed;   // ...and its narrowed-state
-                    mask_write_clobbers_pair(rs, in.dst.value);
+                } else {                                    // s_*_saveexec_b64 sDST, src
+                    // All ten SAVEEXEC forms read OLD EXEC and S0 before writing either destination.
+                    // Resolve S0 first because D may itself be VCC (Plucky's exact
+                    // `s_orn2_saveexec_b64 vcc, exec`); publishing the saved mask early would change
+                    // a VCC source into OLD EXEC and silently compute a different operation.
+                    const uint32_t old_exec = rs.exec;
+                    const bool old_exec_narrowed = rs.exec_narrowed;
                     uint32_t m = src_mask(in.src[0]);
-                    if (!m) ok = false;
-                    else { rs.exec = in.opcode == 0x24 ? b.land(rs.exec, m)
-                                     : in.opcode == 0x25 ? b.lor(rs.exec, m)
-                                                        : b.land(rs.exec, b.logical_not(m));
-                           rs.exec_narrowed = true; }
+                    if (!m) { ok = false; return true; }
+                    rs.sreg_bool[in.dst.value] = old_exec;  // D = OLD_EXEC
+                    rs.sreg_bool_narrowed[in.dst.value] = old_exec_narrowed;
+                    if (in.dst.value == 106 || in.dst.value == 107) rs.vcc = old_exec;
+                    mask_write_clobbers_pair(rs, in.dst.value);
+                    const uint32_t ne = b.logical_not(old_exec);
+                    const uint32_t nm = b.logical_not(m);
+                    const uint32_t xor_em = b.bsel(old_exec, nm, m);
+                    rs.exec = in.opcode == 0x24 ? b.land(old_exec, m)       // AND
+                            : in.opcode == 0x25 ? b.lor(old_exec, m)        // OR
+                            : in.opcode == 0x26 ? xor_em                    // XOR
+                            : in.opcode == 0x27 ? b.land(m, ne)             // ANDN2: S0 & ~EXEC
+                            : in.opcode == 0x28 ? b.lor(m, ne)              // ORN2: S0 | ~EXEC
+                            : in.opcode == 0x29 ? b.lor(ne, nm)             // NAND
+                            : in.opcode == 0x2a ? b.land(ne, nm)            // NOR
+                            : in.opcode == 0x2b ? b.logical_not(xor_em)     // XNOR
+                            : in.opcode == 0x37 ? b.land(old_exec, nm)      // GFX10 ANDN1_SAVEEXEC
+                                                : b.lor(old_exec, nm);      // GFX10 ORN1_SAVEEXEC
+                    // Every non-trivial mask expression may be narrower than full EXEC. Two self
+                    // identities are exactly all-on and must clear the flag or a later forward
+                    // EXECZ guard is conservatively (and incorrectly) rejected.
+                    const bool source_is_exec = in.src[0].value == 126 || in.src[0].value == 127;
+                    rs.exec_narrowed = !((in.opcode == 0x28 || in.opcode == 0x2b) && source_is_exec);
                 }
                 return true;
             }
@@ -5107,6 +5245,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         }
         case Rdna2Format::VOP1: {
             uint32_t a = val(in.src[0]); uint32_t old_d = vreg_old(b, rs, in.dst.value);
+            uint32_t dpp_active = 0;
             // DPP16 quad_perm on src0 (#273): fragment shaders reconstruct the selected quad lane
             // from derivatives. Compute shaders use the exact subgroup quad-swap operation for the
             // three XOR permutations emitted by Astro Bot's blur kernels: horizontal (0xb1), vertical
@@ -5119,20 +5258,33 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // Every non-zero row-right shift therefore addresses a lane before the start of
                     // its row; BOUND_CTRL=1 supplies the architectural zero.  An unbounded access
                     // retains the prior destination value and cannot be represented here, so reject.
-                    if (b.is_compute || b.is_fragment || !in.dpp_bound_ctrl) {
+                    if (b.is_fragment || (!b.is_compute && !in.dpp_bound_ctrl) ||
+                        (b.is_compute && in.opcode != 0x01)) {
                         ok = false; return true;
                     }
-                    a = b.uconst(0);
+                    if (b.is_compute) {
+                        b.mark_subgroup_min16();
+                        const uint32_t shift = in.dpp_ctrl - 0x110u;
+                        const uint32_t lane = b.subgroup_local_id();
+                        const uint32_t row_lane = b.ibin(Op_BitwiseAnd, lane, b.uconst(15));
+                        dpp_active = b.ucmp(Op_UGreaterThanEqual, row_lane, b.uconst(shift));
+                        const uint32_t source_lane = b.sel(
+                            dpp_active, b.ibin(Op_ISub, lane, b.uconst(shift)), lane);
+                        const uint32_t shuffled = b.subgroup_shuffle(a, source_lane);
+                        a = in.dpp_bound_ctrl ? b.sel(dpp_active, shuffled, b.uconst(0))
+                                              : shuffled;
+                    } else {
+                        a = b.uconst(0);
+                    }
                 } else {
-                if (in.opcode != 0x01) { ok = false; return true; }
                 if (b.is_fragment) {
+                    if (in.opcode != 0x01) { ok = false; return true; }
                     a = b.dpp_quad(a, in.dpp_ctrl);
                 } else if (b.is_compute) {
-                    uint32_t direction = in.dpp_ctrl == 0xb1 ? 0u
-                                       : in.dpp_ctrl == 0x4e ? 1u
-                                       : in.dpp_ctrl == 0x1b ? 2u : UINT32_MAX;
-                    if (direction == UINT32_MAX) { ok = false; return true; }
-                    a = b.subgroup_quad_swap(a, direction);
+                    // DPP transforms SRC0 before the VOP1 operation. v_mov and the numeric
+                    // v_cvt_u32_f32 used by UE light-grid kernels are lane-pure afterward.
+                    if (in.opcode != 0x01 && in.opcode != 0x07) { ok = false; return true; }
+                    a = b.subgroup_quad_permute(a, in.dpp_ctrl);
                 } else {
                     ok = false; return true;
                 }
@@ -5352,35 +5504,55 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     break;
                 default: ok = false; break;
             }
-            if (ok) predicate_write(b, rs, in.dst.value, old_d);
+            if (ok) {
+                if (dpp_active && !in.dpp_bound_ctrl) d = b.sel(dpp_active, d, old_d);
+                predicate_write(b, rs, in.dst.value, old_d);
+            }
             return true;
         }
         case Rdna2Format::VOP2: {
             uint32_t a = val(in.src[0]), c = val(in.src[1]); uint32_t old_d = vreg_old(b, rs, in.dst.value);
+            uint32_t dpp_active = 0;
             // DPP16 quad_perm on src0 (#273): fragment FLOAT ops and compute quad swaps.  Bounded
             // ROW_SHR in the proven one-live-lane NGG projection supplies zero for lane 0.
             if (in.has_dpp) {
+                const bool fop = in.opcode == 0x03 || in.opcode == 0x04 || in.opcode == 0x05 ||
+                                 in.opcode == 0x08 || in.opcode == 0x0F || in.opcode == 0x10 ||
+                                 in.opcode == 0x1F || in.opcode == 0x2B;
                 const bool row_shr = in.dpp_ctrl >= 0x111u && in.dpp_ctrl <= 0x11Fu;
                 if (row_shr) {
-                    if (!b.ngg_one_lane || in.opcode != 0x25 || !in.dpp_bound_ctrl) {
+                    if (b.is_vertex) {
+                        if (!b.ngg_one_lane || in.opcode != 0x25 || !in.dpp_bound_ctrl) {
+                            ok = false; return true;
+                        }
+                        a = b.uconst(0);
+                    } else if (b.is_fragment || !fop) {
                         ok = false; return true;
+                    } else {
+                        // ROW_SHR:N reads SRC0 from lane-N inside each architectural 16-lane row.
+                        // BOUND_CTRL=1 substitutes zero before the row; BOUND_CTRL=0 disables the
+                        // instruction for those lanes, preserving the old destination exactly.
+                        b.mark_subgroup_min16();
+                        const uint32_t shift = in.dpp_ctrl - 0x110u;
+                        const uint32_t lane = b.subgroup_local_id();
+                        const uint32_t row_lane = b.ibin(Op_BitwiseAnd, lane, b.uconst(15));
+                        dpp_active = b.ucmp(Op_UGreaterThanEqual, row_lane, b.uconst(shift));
+                        // Never issue a shuffle with an out-of-range unsigned lane after subtraction;
+                        // inactive lanes address themselves and are then zeroed or masked off.
+                        const uint32_t source_lane = b.sel(
+                            dpp_active, b.ibin(Op_ISub, lane, b.uconst(shift)), lane);
+                        const uint32_t shuffled = b.subgroup_shuffle(a, source_lane);
+                        a = in.dpp_bound_ctrl ? b.sel(dpp_active, shuffled, b.uconst(0))
+                                              : shuffled;
                     }
-                    a = b.uconst(0);
                 } else {
-                    const bool fop = in.opcode == 0x03 || in.opcode == 0x04 || in.opcode == 0x05 ||
-                                     in.opcode == 0x08 || in.opcode == 0x0F || in.opcode == 0x10 ||
-                                     in.opcode == 0x1F || in.opcode == 0x2B;
                     if (!fop) { ok = false; return true; }
                     if (b.is_fragment) {
                         a = b.dpp_quad(a, in.dpp_ctrl);
                     } else if (b.is_compute) {
-                        // Title blur/reduction kernels use the same three XOR quad permutations as
-                        // their v_mov DPP forms. DPP transforms src0 only; src1 remains in this lane.
-                        const uint32_t direction = in.dpp_ctrl == 0xb1 ? 0u
-                                                 : in.dpp_ctrl == 0x4e ? 1u
-                                                 : in.dpp_ctrl == 0x1b ? 2u : UINT32_MAX;
-                        if (direction == UINT32_MAX) { ok = false; return true; }
-                        a = b.subgroup_quad_swap(a, direction);
+                        // DPP transforms src0 only; src1 remains in this lane. A general shuffle covers
+                        // all 256 architectural quad_perm tables, including broadcasts and duplicates.
+                        a = b.subgroup_quad_permute(a, in.dpp_ctrl);
                     } else {
                         ok = false; return true;
                     }
@@ -5569,7 +5741,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // clamp (#129/#174). The guard means this only fires for a modifier-carrying op.
                 default: ok = false; break;
             }
-            if (ok) predicate_write(b, rs, in.dst.value, old_d);
+            if (ok) {
+                if (dpp_active && !in.dpp_bound_ctrl) d = b.sel(dpp_active, d, old_d);
+                predicate_write(b, rs, in.dst.value, old_d);
+            }
             return true;
         }
         case Rdna2Format::VOPC: {                                     // v_cmp_* -> VCC; v_cmpx_* also -> EXEC
@@ -5634,6 +5809,47 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x84: cmp = b.scmp(Op_SGreaterThan, a, c); break;         // v_cmp_gt_i32
                 case 0x85: cmp = b.ucmp(Op_INotEqual, a, c); break;            // v_cmp_ne_i32 (sign-agnostic)
                 case 0x86: cmp = b.scmp(Op_SGreaterThanEqual, a, c); break;    // v_cmp_ge_i32
+                case 0x88: {                                                   // v_cmp_class_f32
+                    // CLASS compares the raw IEEE-754 category of SRC0 against the ten-bit mask
+                    // in SRC1.  Keep this in the integer domain: float comparisons cannot
+                    // distinguish signed zero, normal from denormal, or quiet from signalling NaN.
+                    const uint32_t sign_bits = b.ibin(Op_BitwiseAnd, a, b.uconst(0x80000000u));
+                    const uint32_t exp_bits  = b.ibin(Op_BitwiseAnd, a, b.uconst(0x7f800000u));
+                    const uint32_t mantissa  = b.ibin(Op_BitwiseAnd, a, b.uconst(0x007fffffu));
+                    const uint32_t negative  = b.ucmp(Op_INotEqual, sign_bits, b.uconst(0));
+                    const uint32_t positive  = b.logical_not(negative);
+                    const uint32_t exp_zero  = b.ucmp(Op_IEqual, exp_bits, b.uconst(0));
+                    const uint32_t exp_all   = b.ucmp(Op_IEqual, exp_bits, b.uconst(0x7f800000u));
+                    const uint32_t mant_zero = b.ucmp(Op_IEqual, mantissa, b.uconst(0));
+                    const uint32_t mant_nonzero = b.logical_not(mant_zero);
+                    const uint32_t finite_exp = b.land(b.logical_not(exp_zero),
+                                                       b.logical_not(exp_all));
+                    const uint32_t is_nan = b.land(exp_all, mant_nonzero);
+                    const uint32_t quiet_bit = b.ibin(Op_BitwiseAnd, mantissa,
+                                                      b.uconst(0x00400000u));
+                    const uint32_t is_quiet = b.ucmp(Op_INotEqual, quiet_bit, b.uconst(0));
+                    const uint32_t selected_classes[10] = {
+                        b.land(is_nan, b.logical_not(is_quiet)),                // signalling NaN
+                        b.land(is_nan, is_quiet),                               // quiet NaN
+                        b.land(b.land(exp_all, mant_zero), negative),           // -infinity
+                        b.land(finite_exp, negative),                           // -normal
+                        b.land(b.land(exp_zero, mant_nonzero), negative),       // -denormal
+                        b.land(b.land(exp_zero, mant_zero), negative),          // -zero
+                        b.land(b.land(exp_zero, mant_zero), positive),          // +zero
+                        b.land(b.land(exp_zero, mant_nonzero), positive),       // +denormal
+                        b.land(finite_exp, positive),                           // +normal
+                        b.land(b.land(exp_all, mant_zero), positive),           // +infinity
+                    };
+                    cmp = b.bfalse();
+                    for (uint32_t bit = 0; bit < 10; ++bit) {
+                        const uint32_t mask_bit = b.ibin(Op_BitwiseAnd, c,
+                                                         b.uconst(1u << bit));
+                        const uint32_t selected = b.ucmp(Op_INotEqual, mask_bit,
+                                                         b.uconst(0));
+                        cmp = b.lor(cmp, b.land(selected_classes[bit], selected));
+                    }
+                    break;
+                }
                 case 0xC1: cmp = b.ucmp(Op_ULessThan, a, c); break;            // v_cmp_lt_u32
                 case 0xC2: cmp = b.ucmp(Op_IEqual, a, c); break;               // v_cmp_eq_u32
                 case 0xC3: cmp = b.ucmp(Op_ULessThanEqual, a, c); break;       // v_cmp_le_u32
@@ -5708,8 +5924,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // (vgpr, lane) is a named wave-uniform scalar. The portable NGG vertex shell additionally
             // projects an ordinary VGPR read from any physical lane onto its one represented live
             // lane; this is the same collapsed-wave contract used for MBCNT and Function LDS. Other
-            // stages still reject a dynamic lane index / ordinary VGPR cross-lane read. Neither op is
-            // EXEC-predicated on hardware, so no predicate_write.
+            // compute/fragment stages use a native subgroup shuffle for ordinary VGPR reads and
+            // therefore support both scalar and inline lane selectors. Neither op is EXEC-predicated
+            // on hardware, so no predicate_write.
             // VERIFIED(round-trip llvm-mc gfx1030: 0xd761 v_writelane_b32 / 0xd760 v_readlane_b32).
             if (in.opcode == 0x361) {                                 // v_writelane_b32 vDST, sSRC, lane
                 if (in.src[1].kind != OperandKind::InlineInt || in.src[1].value < 0 || in.src[1].value > 63) {
@@ -5746,6 +5963,35 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 return true;
             }
             if (in.opcode == 0x360) {                                 // v_readlane_b32 sDST, vSRC, lane
+                auto vit = rs.vgpr_lane_slots.find(in.src[0].value);
+                auto mit = rs.vgpr_lane_mask_slots.find(in.src[0].value);
+                const bool vertex_shell = !b.is_compute && !b.is_fragment;
+                if (!vertex_shell && vit == rs.vgpr_lane_slots.end() &&
+                    mit == rs.vgpr_lane_mask_slots.end()) {
+                    auto source = rs.vreg.find(in.src[0].value);
+                    if (source == rs.vreg.end()) { ok = false; return true; }
+                    const uint32_t selector = val(in.src[1]);
+                    if (!ok) return true;
+                    if (b.wave_size == 64) b.mark_subgroup_min64();
+                    else b.mark_subgroup_min32();
+                    const uint32_t native_lane = b.subgroup_local_id();
+                    const uint32_t wave_mask = b.uconst(b.wave_size - 1u);
+                    const uint32_t wave_base = b.ibin(
+                        Op_BitwiseAnd, native_lane, b.uconst(~(b.wave_size - 1u)));
+                    const uint32_t source_lane = b.ibin(
+                        Op_BitwiseOr, wave_base, b.ibin(Op_BitwiseAnd, selector, wave_mask));
+                    const uint32_t result = b.subgroup_shuffle(source->second, source_lane);
+                    rs.sreg[in.dst.value] = result;
+                    rs.sreg_bool.erase(in.dst.value);
+                    rs.sreg_bool_narrowed.erase(in.dst.value);
+                    rs.sreg_srt.erase(in.dst.value);
+                    if (in.dst.value == 106) {
+                        const uint32_t bit = b.ibin(Op_BitwiseAnd, result, b.uconst(1));
+                        rs.vcc = b.ucmp(Op_INotEqual, bit, b.uconst(0));
+                        rs.sreg_bool_narrowed[106] = true;
+                    }
+                    return true;
+                }
                 const bool static_lane = in.src[1].kind == OperandKind::InlineInt &&
                                          in.src[1].value >= 0 && in.src[1].value <= 63;
                 const bool dynamic_absent_ngg_peer = b.ngg_one_lane &&
@@ -5755,8 +6001,6 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     ok = false; return true;
                 }
                 const int lane = static_lane ? in.src[1].value : -1;
-                auto vit = rs.vgpr_lane_slots.find(in.src[0].value);
-                auto mit = rs.vgpr_lane_mask_slots.find(in.src[0].value);
                 if (mit != rs.vgpr_lane_mask_slots.end()) {
                     auto sit = mit->second.find(lane);
                     if (sit != mit->second.end()) {
@@ -5804,6 +6048,41 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg_bool.erase(in.dst.value);
                 rs.sreg_bool_narrowed.erase(in.dst.value);
                 rs.sreg_srt.erase(in.dst.value);
+                return true;
+            }
+            if (in.opcode == 0x377 || in.opcode == 0x378) {            // v_permlane{x}16_b32
+                // AMD RDNA ISA 12.12: SRC1:SRC2 is a packed table of sixteen four-bit lane
+                // selectors. PERMLANE16 gathers within the current 16-lane row; PERMLANEX16 gathers
+                // from the paired row (0<->1, 2<->3). These are untyped operations; every ordinary
+                // VOP3 float modifier is reserved. The two overloaded OPSEL bits were retained by
+                // the decoder as FI and BOUND_CTRL.
+                const uint32_t reserved_opsel = (in.words[0] >> 13) & 3u;
+                if ((!b.is_compute && !b.is_fragment) || reserved_opsel || in.clamp || in.omod ||
+                    in.src_abs[0] || in.src_abs[1] || in.src_abs[2] ||
+                    in.src_neg[0] || in.src_neg[1] || in.src_neg[2] ||
+                    in.src[0].kind != OperandKind::VGPR ||
+                    in.src[1].kind == OperandKind::VGPR || in.src[2].kind == OperandKind::VGPR) {
+                    ok = false; return true;
+                }
+                if (in.opcode == 0x378) b.mark_subgroup_min32();
+                else b.mark_subgroup_min16();
+                uint32_t source_lane = 0;
+                const uint32_t shuffled = b.subgroup_permlane16(
+                    val(in.src[0]), val(in.src[1]), val(in.src[2]),
+                    in.opcode == 0x378, &source_lane);
+                uint32_t result = shuffled;
+                if (!in.permlane_fetch_inactive) {
+                    const uint32_t active_word = b.sel(rs.exec, b.uconst(1), b.uconst(0));
+                    const uint32_t fetched_active = b.subgroup_shuffle(active_word, source_lane);
+                    const uint32_t source_active = b.ucmp(
+                        Op_INotEqual, fetched_active, b.uconst(0));
+                    result = b.sel(source_active, shuffled,
+                                   in.permlane_bound_ctrl ? b.uconst(0)
+                                                          : vreg_old(b, rs, in.dst.value));
+                }
+                const uint32_t old_d = vreg_old(b, rs, in.dst.value);
+                vreg[in.dst.value] = result;
+                predicate_write(b, rs, in.dst.value, old_d);
                 return true;
             }
             uint32_t old_d = vreg_old(b, rs, in.dst.value);
@@ -7404,6 +7683,26 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             return true;
         }
         case Rdna2Format::DS: {
+            if (in.opcode == 0x35) {                    // ds_swizzle_b32: VDST = lane-gather(ADDR)
+                if (!b.is_compute && !b.is_fragment) { ok = false; return true; }
+                uint32_t source_lane = 0;
+                if (!b.ds_swizzle_source_lane(in.literal, &source_lane)) {
+                    ok = false; return true;
+                }
+                auto source = rs.vreg.find(in.src[0].value);
+                const uint32_t source_value =
+                    source == rs.vreg.end() ? b.uconst(0) : source->second;
+                const uint32_t shuffled = b.subgroup_shuffle(source_value, source_lane);
+                const uint32_t active_word = b.sel(rs.exec, b.uconst(1), b.uconst(0));
+                const uint32_t fetched_active = b.subgroup_shuffle(active_word, source_lane);
+                const uint32_t result = b.sel(
+                    b.ucmp(Op_INotEqual, fetched_active, b.uconst(0)),
+                    shuffled, b.uconst(0));
+                const uint32_t old = vreg_old(b, rs, in.dst.value);
+                rs.vreg[in.dst.value] = result;
+                predicate_write(b, rs, in.dst.value, old);
+                return true;
+            }
             // GDS=1 targets the device-global data share, not workgroup LDS — running it against
             // our LDS model would silently give per-workgroup semantics. Reject — EXCEPT
             // ds_append/ds_consume (0x3e/0x3d): Astro Bot's live counter words carry GDS=1
@@ -7413,7 +7712,37 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // device-global counter (exact for the exercised dispatch shapes). CONFIDENCE: MED.
             if (in.ds_gds && in.opcode != 0x3d && in.opcode != 0x3e &&
                 !(b.is_compute && in.opcode == 0x0d)) { ok = false; return true; }
-            // ds_write_addtid_b32 (0xb0) / ds_read_addtid_b32 (0xb1) in a GRAPHICS stage (#273):
+            // ds_write_addtid_b32 (0xb0) / ds_read_addtid_b32 (0xb1). AMD RDNA2 ISA 10.4:
+            //   LDS address = LDS_BASE + immediate + M0[15:0] + TID(0..63)*4.
+            // TID is the lane within the hardware wave, not the workgroup-linear invocation id.
+            // Compute therefore uses real Workgroup LDS and wraps only the lane id at wave_size;
+            // M0 supplies a distinct base when a workgroup contains more than one wave. The final
+            // address itself does not wrap (RDNA2 LDS allocations explicitly do not wrap).
+            if (b.is_compute && (in.opcode == 0xb0 || in.opcode == 0xb1)) {
+                auto m0 = rs.sreg.find(124);
+                if (m0 == rs.sreg.end()) { ok = false; return true; }
+                b.declare_lds();
+                if (!b.lds_var) { ok = false; return true; }
+                const uint32_t base = b.ibin(Op_BitwiseAnd, m0->second, b.uconst(0xffffu));
+                const uint32_t tid = b.ibin(
+                    Op_BitwiseAnd, b.linear_localid, b.uconst(b.wave_size - 1u));
+                const uint32_t byte_addr = b.ibin(
+                    Op_IAdd,
+                    b.ibin(Op_IAdd, base, b.uconst(in.literal)),
+                    b.ibin(Op_ShiftLeftLogical, tid, b.uconst(2)));
+                const uint32_t idx = b.ibin(Op_ShiftRightLogical, byte_addr, b.uconst(2));
+                if (in.opcode == 0xb0) {
+                    auto value = rs.vreg.find(in.src[1].value);
+                    b.lds_store(idx, value == rs.vreg.end() ? b.uconst(0) : value->second,
+                                rs.exec_narrowed, rs.exec);
+                } else {
+                    const uint32_t old = vreg_old(b, rs, in.dst.value);
+                    rs.vreg[in.dst.value] = b.lds_load(idx);
+                    predicate_write(b, rs, in.dst.value, old);
+                }
+                return true;
+            }
+            // In a GRAPHICS stage (#273), ADDTID is a compiler spill/reload through per-wave LDS:
             // a per-lane VGPR spill through LDS (addr = M0 + offset + tid*4) — DOLL's title post
             // PSes spill v15 before their accumulation loop and reload it after. Per-invocation the
             // slot is ONE value: track it in rs.lds_addtid keyed by (M0 SSA id, inst offset); the
@@ -7422,7 +7751,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // or a never-written slot rejects loudly. VERIFIED(round-trip llvm-mc gfx1010:
             // 0xdac00000/0x00000f00 -> ds_write_addtid_b32 v15; llvm-mc gfx1030:
             // 0xdac40000/0x0f000000 -> ds_read_addtid_b32 v15).
-            if (!b.is_compute && (in.opcode == 0xb0 || in.opcode == 0xb1)) {
+            if (in.opcode == 0xb0 || in.opcode == 0xb1) {
                 auto m0 = rs.sreg.find(124);
                 if (in.opcode == 0xb0) {
                     if (m0 != rs.sreg.end()) {
@@ -7462,12 +7791,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 predicate_write(b, rs, in.dst.value, old);
                 return true;
             }
-            // LDS (workgroup shared memory), compute-only. Byte address = ADDR VGPR + instruction
-            // offset; the backing store is dword-indexed. gfx10 ds_write2_b64 carries two independent
-            // 8-bit offsets in units of 64-bit elements, while ds_write_b64 uses the ordinary 16-bit
-            // byte offset. GDS and the remaining widths/atomics are deferred.
-            if ((!b.is_compute && !b.ngg_private_lds) || (in.opcode != 0x00 && in.opcode != 0x07 &&
-                                  in.opcode != 0x08 && in.opcode != 0x20 &&
+            // Compute uses Workgroup LDS. Only a mechanically proven NGG projection may use the
+            // private graphics backing store; every other graphics DS shape remains fail-closed.
+            if ((!b.is_compute && !b.ngg_private_lds) ||
+                (in.opcode != 0x00 && in.opcode != 0x05 && in.opcode != 0x06 &&
+                                  in.opcode != 0x07 && in.opcode != 0x08 &&
+                                  in.opcode != 0x09 && in.opcode != 0x0a &&
+                                  in.opcode != 0x0b && in.opcode != 0x20 &&
                                   in.opcode != 0x2d &&
                                   in.opcode != 0x0d && in.opcode != 0x0e &&
                                   in.opcode != 0x36 && in.opcode != 0x37 &&
@@ -7561,9 +7891,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (in.opcode == 0x00) {                     // ds_add_u32: LDS += DATA0, no VGPR return
                 b.lds_atomic(Op_AtomicIAdd, idx, vread(in.src[1].value),
                              rs.exec_narrowed, rs.exec);
-            } else if (in.opcode == 0x07 || in.opcode == 0x08) { // ds_min_u32 / ds_max_u32
-                b.lds_atomic(in.opcode == 0x07 ? Op_AtomicUMin : Op_AtomicUMax,
-                             idx, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
+            } else if (in.opcode >= 0x05 && in.opcode <= 0x0b) {
+                // Non-returning 32-bit LDS atomics map directly to SPIR-V atomics. DS_OR_B32
+                // (0x0a) occurs in Plucky's first-gameplay compute path; supporting the adjacent
+                // signed/unsigned min/max and bitwise family keeps this architectural rather than
+                // making the acceptance rule title-specific.
+                const uint32_t atomic_op =
+                    in.opcode == 0x05 ? Op_AtomicSMin :
+                    in.opcode == 0x06 ? Op_AtomicSMax :
+                    in.opcode == 0x07 ? Op_AtomicUMin :
+                    in.opcode == 0x08 ? Op_AtomicUMax :
+                    in.opcode == 0x09 ? Op_AtomicAnd  :
+                    in.opcode == 0x0a ? Op_AtomicOr   : Op_AtomicXor;
+                b.lds_atomic(atomic_op, idx, vread(in.src[1].value),
+                             rs.exec_narrowed, rs.exec);
             } else if (in.opcode == 0x20) {             // ds_add_rtn_u32: VDST = old LDS; LDS += DATA0
                 const uint32_t old = vreg_old(b, rs, in.dst.value);
                 rs.vreg[in.dst.value] = b.lds_atomic_rtn(
@@ -8174,6 +8515,7 @@ bool emit_cfg_state_machine(
     std::set<uint32_t> start_set{ins.front().pc};
     std::unordered_map<uint32_t, uint32_t> mbcnt_event_for_pc;
     std::unordered_map<uint32_t, uint32_t> append_event_for_pc;
+    std::unordered_set<uint32_t> swizzle_pcs;
     for (size_t i = 0; i < ins.size(); ++i) {
         const auto& in = ins[i];
         if (in.is_end) break;
@@ -8188,6 +8530,12 @@ bool emit_cfg_state_machine(
         if (in.fmt == Rdna2Format::DS && (in.opcode == 0x3d || in.opcode == 0x3e)) {
             append_event_for_pc.emplace(in.pc,
                 static_cast<uint32_t>(append_event_for_pc.size()));
+            start_set.insert(in.pc);
+            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
+                start_set.insert(ins[i + 1].pc);
+        }
+        if (in.fmt == Rdna2Format::DS && in.opcode == 0x35) {
+            swizzle_pcs.insert(in.pc);
             start_set.insert(in.pc);
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
@@ -8360,7 +8708,7 @@ bool emit_cfg_state_machine(
             if (in.pc < lo || in.pc >= hi) continue;
             synchronized_block[block] = synchronized_block[block] ||
                 mbcnt_event_for_pc.contains(in.pc) || append_event_for_pc.contains(in.pc) ||
-                mask_zero_compare_source(in) >= 0;
+                swizzle_pcs.contains(in.pc) || mask_zero_compare_source(in) >= 0;
             conditional_block[block] = conditional_block[block] ||
                 (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x04 && in.opcode <= 0x09 &&
                  in.opcode != 0x03);
@@ -8455,6 +8803,11 @@ bool emit_cfg_state_machine(
     const uint32_t append_idx_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t append_dst_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t append_count_var = b.function_var(b.t_u32, ptr_u32);
+    const uint32_t swizzle_pending_var = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t swizzle_active_var = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t swizzle_source_var = b.function_var(b.t_u32, ptr_u32);
+    const uint32_t swizzle_source_lane_var = b.function_var(b.t_u32, ptr_u32);
+    const uint32_t swizzle_dst_var = b.function_var(b.t_u32, ptr_u32);
 
     const uint32_t zero = b.uconst(0), no = b.bfalse(), yes = b.btrue();
     for (const auto& kv : vv) {
@@ -8492,6 +8845,9 @@ bool emit_cfg_state_machine(
     b.store_function(exec_var, initial.exec);
     b.store_function(pc_var, b.uconst(0));
     b.store_function(active_var, yes);
+    b.store_function(swizzle_source_var, zero);
+    b.store_function(swizzle_source_lane_var, zero);
+    b.store_function(swizzle_dst_var, zero);
 
     auto load_state = [&](uint32_t dispatch = UINT32_MAX) {
         RegState state;
@@ -8607,6 +8963,8 @@ bool emit_cfg_state_machine(
         b.store_function(append_idx_var, zero);
         b.store_function(append_dst_var, zero);
     }
+    b.store_function(swizzle_pending_var, no);
+    b.store_function(swizzle_active_var, no);
     b.emit_loopmerge(loop_merge, loop_continue);
     b.emit_branch(switch_header);
     b.emit_label(switch_header);
@@ -8638,6 +8996,7 @@ bool emit_cfg_state_machine(
         const Rdna2Inst* terminator = nullptr;
         const Rdna2Inst* mbcnt = nullptr;
         const Rdna2Inst* append = nullptr;
+        const Rdna2Inst* swizzle = nullptr;
         const Rdna2Inst* mask_compare = nullptr;
         const uint32_t final_block = dispatch_blocks[dispatch].back();
         const uint32_t final_hi = final_block + 1 < starts.size()
@@ -8649,6 +9008,7 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_terminator = nullptr;
             const Rdna2Inst* block_mbcnt = nullptr;
             const Rdna2Inst* block_append = nullptr;
+            const Rdna2Inst* block_swizzle = nullptr;
             const Rdna2Inst* block_mask_compare = nullptr;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi) continue;
@@ -8664,6 +9024,10 @@ bool emit_cfg_state_machine(
                 }
                 if (in.fmt == Rdna2Format::DS && (in.opcode == 0x3d || in.opcode == 0x3e)) {
                     block_append = &in;
+                    break;
+                }
+                if (in.fmt == Rdna2Format::DS && in.opcode == 0x35) {
+                    block_swizzle = &in;
                     break;
                 }
                 if (mask_zero_compare_source(in) >= 0) {
@@ -8688,7 +9052,7 @@ bool emit_cfg_state_machine(
             const bool last = member + 1 == dispatch_blocks[dispatch].size();
             if (!last) {
                 // Group construction admits only one-successor plain blocks before the tail.
-                if (block_mbcnt || block_append || block_mask_compare ||
+                if (block_mbcnt || block_append || block_swizzle || block_mask_compare ||
                     (block_terminator && (block_terminator->is_end ||
                                           block_terminator->opcode != 0x02))) return false;
                 continue; // consume an unconditional guest branch without a dispatcher round-trip
@@ -8696,6 +9060,7 @@ bool emit_cfg_state_machine(
             terminator = block_terminator;
             mbcnt = block_mbcnt;
             append = block_append;
+            swizzle = block_swizzle;
             mask_compare = block_mask_compare;
         }
         if (mbcnt) {
@@ -8775,6 +9140,19 @@ bool emit_cfg_state_machine(
                     b.uconst(static_cast<uint32_t>(append->dst.value)));
             }
         }
+        if (swizzle) {
+            if (!swizzle_pcs.contains(swizzle->pc)) return false;
+            uint32_t source_lane = 0;
+            if (!b.ds_swizzle_source_lane(swizzle->literal, &source_lane)) return false;
+            const auto source = state.vreg.find(swizzle->src[0].value);
+            b.store_function(swizzle_pending_var, yes);
+            b.store_function(swizzle_active_var, state.exec);
+            b.store_function(swizzle_source_var,
+                source == state.vreg.end() ? zero : source->second);
+            b.store_function(swizzle_source_lane_var, source_lane);
+            b.store_function(swizzle_dst_var,
+                b.uconst(static_cast<uint32_t>(swizzle->dst.value)));
+        }
         if (mask_compare) {
             if (graphics) {
                 if (getenv("PROSPER_DBG"))
@@ -8804,6 +9182,8 @@ bool emit_cfg_state_machine(
             if (!set_next(mbcnt->pc + mbcnt->len_dwords)) return false;
         } else if (append) {
             if (!set_next(append->pc + append->len_dwords)) return false;
+        } else if (swizzle) {
+            if (!set_next(swizzle->pc + swizzle->len_dwords)) return false;
         } else if (mask_compare) {
             if (!set_next(mask_compare->pc + mask_compare->len_dwords)) return false;
         } else if (!terminator) {
@@ -8883,6 +9263,50 @@ bool emit_cfg_state_machine(
     b.emit_label(switch_merge);
     b.emit_branch(loop_continue);
     b.emit_label(loop_continue);
+
+    // DS_SWIZZLE common phase. The dispatcher cases only publish source data and a lane selector;
+    // every invocation executes the actual subgroup gathers here in uniform control flow. This is
+    // required even though the instruction does not touch LDS: subgroup operations in a divergent
+    // switch arm would have undefined participation on Vulkan.
+    if (!swizzle_pcs.empty()) {
+        const uint32_t swizzle_pending = b.load_function(b.t_bool, swizzle_pending_var);
+        const uint32_t swizzle_active = b.load_function(b.t_bool, swizzle_active_var);
+        const uint32_t swizzle_lane = b.load_function(b.t_u32, swizzle_source_lane_var);
+        const uint32_t swizzle_value = b.subgroup_shuffle(
+            b.load_function(b.t_u32, swizzle_source_var), swizzle_lane);
+        const uint32_t source_active_word = b.sel(
+            b.land(swizzle_pending, swizzle_active), b.uconst(1), zero);
+        const uint32_t source_active = b.ucmp(
+            Op_INotEqual, b.subgroup_shuffle(source_active_word, swizzle_lane), zero);
+        const uint32_t swizzle_result = b.sel(source_active, swizzle_value, zero);
+        const uint32_t swizzle_dst = b.load_function(b.t_u32, swizzle_dst_var);
+        const uint32_t swizzle_write = b.land(swizzle_pending, swizzle_active);
+        for (const auto& kv : vv) {
+            const uint32_t selected = b.land(
+                swizzle_write,
+                b.ucmp(Op_IEqual, swizzle_dst,
+                       b.uconst(static_cast<uint32_t>(kv.first))));
+            const uint32_t old = b.load_function(b.t_u32, kv.second);
+            b.store_function(kv.second, b.sel(selected, swizzle_result, old));
+        }
+        // An ordinary VGPR definition ends a scalar lane-spill lifetime at that physical register.
+        for (const auto& kv : lv) {
+            const uint32_t selected = b.land(
+                swizzle_pending,
+                b.ucmp(Op_IEqual, swizzle_dst,
+                       b.uconst(static_cast<uint32_t>(kv.first.first))));
+            const uint32_t old = b.load_function(b.t_u32, kv.second);
+            b.store_function(kv.second, b.sel(selected, zero, old));
+        }
+        for (const auto& kv : lmv) {
+            const uint32_t selected = b.land(
+                swizzle_pending,
+                b.ucmp(Op_IEqual, swizzle_dst,
+                       b.uconst(static_cast<uint32_t>(kv.first.first))));
+            const uint32_t old = b.load_function(b.t_bool, kv.second);
+            b.store_function(kv.second, b.bsel(selected, no, old));
+        }
+    }
 
     if (direct_dispatch) {
         // Native wave operations and votes were already resolved in the selected case.  PC and
@@ -10523,6 +10947,8 @@ std::vector<uint32_t> recompile_fragment_wave32_for_test(
 
 uint32_t fragment_spirv_required_subgroup_size(const std::vector<uint32_t>& spirv) {
     if (spirv.size() < 5 || spirv[0] != 0x07230203u) return 0;
+    constexpr char prefix[] = "Prosper.FragmentSubgroupSize=";
+    bool legacy_arithmetic_marker = false;
     for (size_t offset = 5; offset < spirv.size();) {
         const uint32_t instruction = spirv[offset];
         const uint32_t words = instruction >> 16;
@@ -10530,10 +10956,56 @@ uint32_t fragment_spirv_required_subgroup_size(const std::vector<uint32_t>& spir
         if (!words || words > spirv.size() - offset) return 0;
         if (opcode == Op_Capability && words == 2 &&
             spirv[offset + 1] == Cap_GroupNonUniformArithmetic)
-            return 64;
+            legacy_arithmetic_marker = true;
+        if (opcode == Op_ModuleProcessed && words > 1) {
+            const char* text = reinterpret_cast<const char*>(&spirv[offset + 1]);
+            const size_t bytes = static_cast<size_t>(words - 1) * sizeof(uint32_t);
+            const void* terminator = std::memchr(text, '\0', bytes);
+            if (terminator) {
+                const size_t length = static_cast<const char*>(terminator) - text;
+                if (length > sizeof(prefix) - 1 &&
+                    std::memcmp(text, prefix, sizeof(prefix) - 1) == 0) {
+                    char* end = nullptr;
+                    const unsigned long value = std::strtoul(
+                        text + sizeof(prefix) - 1, &end, 10);
+                    if (end == text + length && value == 64) return 64;
+                }
+            }
+        }
         offset += words;
     }
-    return 0;
+    // Compatibility for cached/captured modules produced before explicit module metadata.
+    return legacy_arithmetic_marker ? 64u : 0u;
+}
+
+uint32_t compute_spirv_min_subgroup_size(const std::vector<uint32_t>& spirv) {
+    if (spirv.size() < 5 || spirv[0] != 0x07230203u) return 0;
+    constexpr char prefix[] = "Prosper.ComputeSubgroupMin=";
+    uint32_t required = 0;
+    for (size_t offset = 5; offset < spirv.size();) {
+        const uint32_t instruction = spirv[offset];
+        const uint32_t words = instruction >> 16;
+        const uint32_t opcode = instruction & 0xffffu;
+        if (!words || words > spirv.size() - offset) return 0;
+        if (opcode == Op_ModuleProcessed && words > 1) {
+            const char* text = reinterpret_cast<const char*>(&spirv[offset + 1]);
+            const size_t bytes = static_cast<size_t>(words - 1) * sizeof(uint32_t);
+            const void* terminator = std::memchr(text, '\0', bytes);
+            if (terminator) {
+                const size_t length = static_cast<const char*>(terminator) - text;
+                if (length > sizeof(prefix) - 1 &&
+                    std::memcmp(text, prefix, sizeof(prefix) - 1) == 0) {
+                    char* end = nullptr;
+                    const unsigned long value = std::strtoul(text + sizeof(prefix) - 1, &end, 10);
+                    if (end == text + length &&
+                        (value == 4 || value == 16 || value == 32 || value == 64))
+                        required = std::max(required, static_cast<uint32_t>(value));
+                }
+            }
+        }
+        offset += words;
+    }
+    return required;
 }
 
 uint32_t fragment_spirv_required_subgroup_features(const std::vector<uint32_t>& spirv) {
