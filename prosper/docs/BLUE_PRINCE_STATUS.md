@@ -55,8 +55,9 @@ The `blue-prince-title` snapshot route guards the title screen.
 
 ## Defect families (#1287) — families 1–3 and 5 RESOLVED 2026-07-26
 
-Families 1–3 below are **fixed on master**; they are retained as the resolution record so the
-evidence is not re-chased. Family 4 and the new slab item remain open.
+Families 1–3 and 5 below are **fixed on master**; they are retained as the resolution record so
+the evidence is not re-chased. Only family 4 remains open, plus the two #1427 remainders tracked
+in #1435 (a ctest-resident truncation guard, and triage of the 27 still-vanished hall draws).
 
 1. **RESOLVED — concentric ring/band moiré** radiating from lights. It was never
    light-accumulation math: the ring structure was the *palette/material atlas* sampled through
@@ -95,7 +96,7 @@ evidence is not re-chased. Family 4 and the new slab item remain open.
    (`docs/screenshots/issue-1427-oracle-before-after.png`). The old bisection range recorded here
    (operations 1100-1200) was a red herring produced by the isolated-draw depth trap — do not
    resume it. Remaining: the 27 still-vanished draws, some plausibly legitimate off-screen culling
-   (open question on #1427), and the bouquet's confetti-coloured flowers.
+   (triage tracked in #1435), and the bouquet's confetti-coloured flowers.
 
 ## Capsule & artifact inventory (`~/bp-1264/`, all run-local addresses)
 
