@@ -100,6 +100,9 @@ def _unlock_snapshot_file(lock_file):
 def _snapshot_lock_owner(lock_path):
     try:
         with open(lock_path, encoding="utf-8") as owner_file:
+            # Byte zero is the Windows lock range and cannot be read by a
+            # contender. Owner metadata intentionally starts after it.
+            owner_file.seek(1)
             owner = json.load(owner_file)
         return f"pid {owner['pid']} ({owner['command']})"
     except (OSError, ValueError, KeyError, TypeError):
@@ -118,9 +121,11 @@ def snapshot_run_lock(command, names=(), lock_path=None):
     lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     with os.fdopen(lock_fd, "r+", encoding="utf-8") as lock_file:
         # Windows byte-range locks require the byte to exist before it is locked.
+        # Reserve byte zero exclusively for the lock so contenders can still
+        # read the owner metadata which follows it.
         lock_file.seek(0, os.SEEK_END)
         if lock_file.tell() == 0:
-            lock_file.write("\n")
+            lock_file.write(" ")
             lock_file.flush()
 
         if not _try_snapshot_file_lock(lock_file):
@@ -138,7 +143,7 @@ def snapshot_run_lock(command, names=(), lock_path=None):
             "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "cwd": os.getcwd(),
         }
-        lock_file.seek(0)
+        lock_file.seek(1)
         json.dump(owner, lock_file)
         lock_file.write("\n")
         lock_file.truncate()
