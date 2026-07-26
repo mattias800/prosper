@@ -345,6 +345,33 @@ int main() {
         CHECK(pool_bypassed == shared,
               "pooled and forced-transient storage buffers render byte-identically");
 
+        // #1432: every failure in the fresh Vulkan upload path must tear down any partial objects,
+        // avoid copying through a null mapping, and bind one zero word instead. A buffer-reading VS
+        // makes that fallback observable: the valid payload covers the target red, while zeros
+        // collapse all three vertices to one point and preserve the blue clear.
+        prosper::test::BackendDraw failure_draw = d0;
+        failure_draw.R = {buffer};
+        set_env("PROSPER_NO_BACKEND_BUFFER_POOL", "1");
+        const prosper::test::RenderBufferUploadFailureStep failure_steps[] = {
+            prosper::test::RenderBufferUploadFailureStep::CreateBuffer,
+            prosper::test::RenderBufferUploadFailureStep::AllocateMemory,
+            prosper::test::RenderBufferUploadFailureStep::BindMemory,
+            prosper::test::RenderBufferUploadFailureStep::MapMemory,
+        };
+        for (const auto step : failure_steps) {
+            prosper::test::inject_render_buffer_upload_failure_once(step);
+            const std::vector<uint8_t> fallback =
+                prosper::test::render_draws_rgba({failure_draw}, W, H);
+            const uint8_t* fallback_center = center(fallback);
+            const auto fallback_stats = prosper::test::backend_resource_reuse_stats();
+            CHECK(fallback_center && fallback_center[0] < 0x40 &&
+                      fallback_center[1] < 0x40 && fallback_center[2] > 0xC0 &&
+                      fallback_stats.buffer_upload_fallbacks == 1 &&
+                      fallback_stats.unique_buffers == 1,
+                  "fresh buffer-upload failure binds a one-word zero fallback without crashing");
+        }
+        set_env("PROSPER_NO_BACKEND_BUFFER_POOL", nullptr);
+
         // #1268: buffers above the 4 KiB hash-dedup bound skip content hashing entirely (live Blue
         // Prince data: zero dedup hits across 556K hashed references at ~1.8 GiB/s of hashing).
         // Repeat references still resolve through the per-call memo, and rendering is unchanged.

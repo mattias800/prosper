@@ -255,6 +255,7 @@ inline BackendTextureUploadStats backend_texture_upload_stats() {
 struct BackendResourceReuseStats {
     size_t buffer_references = 0;
     size_t unique_buffers = 0;
+    size_t buffer_upload_fallbacks = 0;
     size_t texture_binding_references = 0;
     size_t unique_texture_bindings = 0;
     size_t descriptor_set_layout_references = 0;
@@ -1462,6 +1463,103 @@ inline void release_render_host_buffer(VkDevice device, RenderHostBuffer buffer)
     }
     for (RenderHostBuffer& old : evicted) destroy_render_host_buffer(device, old);
     if (buffer.buffer) destroy_render_host_buffer(device, buffer);
+}
+
+// Deterministic one-shot injection for the fresh storage-buffer upload regression checks. The
+// production path never arms this state; keeping it programmatic (rather than environment-driven)
+// prevents an accidental live-run setting from manufacturing allocation failures.
+enum class RenderBufferUploadFailureStep {
+    None,
+    CreateBuffer,
+    AllocateMemory,
+    BindMemory,
+    MapMemory,
+};
+
+inline RenderBufferUploadFailureStep& render_buffer_upload_failure_once_storage() {
+    static thread_local RenderBufferUploadFailureStep step =
+        RenderBufferUploadFailureStep::None;
+    return step;
+}
+
+inline void inject_render_buffer_upload_failure_once(RenderBufferUploadFailureStep step) {
+    render_buffer_upload_failure_once_storage() = step;
+}
+
+inline bool consume_render_buffer_upload_failure(RenderBufferUploadFailureStep step) {
+    RenderBufferUploadFailureStep& armed = render_buffer_upload_failure_once_storage();
+    if (armed != step) return false;
+    armed = RenderBufferUploadFailureStep::None;
+    return true;
+}
+
+inline const char* render_buffer_upload_failure_name(RenderBufferUploadFailureStep step) {
+    switch (step) {
+        case RenderBufferUploadFailureStep::CreateBuffer: return "vkCreateBuffer";
+        case RenderBufferUploadFailureStep::AllocateMemory: return "vkAllocateMemory";
+        case RenderBufferUploadFailureStep::BindMemory: return "vkBindBufferMemory";
+        case RenderBufferUploadFailureStep::MapMemory: return "vkMapMemory";
+        default: return "none";
+    }
+}
+
+// Create, populate, and unmap one transient storage buffer. Every partial failure tears down in
+// Vulkan lifetime order (buffer before any bound memory) and leaves both outputs null. Returning the
+// exact failed step lets the caller report the binding before substituting a safe zero-word buffer.
+inline RenderBufferUploadFailureStep create_transient_storage_buffer_upload(
+        const RenderVkCtx& ctx, const void* source, VkDeviceSize bytes,
+        VkBuffer& buffer, VkDeviceMemory& memory) {
+    buffer = VK_NULL_HANDLE;
+    memory = VK_NULL_HANDLE;
+    auto fail = [&](RenderBufferUploadFailureStep step) {
+        if (buffer) vkDestroyBuffer(ctx.dev, buffer, nullptr);
+        if (memory) release_transient_render_memory(ctx.dev, memory);
+        buffer = VK_NULL_HANDLE;
+        memory = VK_NULL_HANDLE;
+        return step;
+    };
+
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = bytes;
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    const VkResult create_result =
+        consume_render_buffer_upload_failure(RenderBufferUploadFailureStep::CreateBuffer)
+            ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+            : vkCreateBuffer(ctx.dev, &info, nullptr, &buffer);
+    if (create_result != VK_SUCCESS) {
+        // A failed create has no live object; the output value is not a destroyable handle.
+        buffer = VK_NULL_HANDLE;
+        return RenderBufferUploadFailureStep::CreateBuffer;
+    }
+    if (!buffer) return fail(RenderBufferUploadFailureStep::CreateBuffer);
+
+    VkMemoryRequirements requirements{};
+    vkGetBufferMemoryRequirements(ctx.dev, buffer, &requirements);
+    const uint32_t memory_type = render_memory_type(
+        ctx.phys, requirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    const bool inject_allocation_failure =
+        consume_render_buffer_upload_failure(RenderBufferUploadFailureStep::AllocateMemory);
+    if (memory_type != UINT32_MAX && !inject_allocation_failure)
+        memory = allocate_transient_render_memory(ctx.dev, requirements.size, memory_type);
+    if (!memory) return fail(RenderBufferUploadFailureStep::AllocateMemory);
+
+    const VkResult bind_result =
+        consume_render_buffer_upload_failure(RenderBufferUploadFailureStep::BindMemory)
+            ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+            : vkBindBufferMemory(ctx.dev, buffer, memory, 0);
+    if (bind_result != VK_SUCCESS) return fail(RenderBufferUploadFailureStep::BindMemory);
+
+    void* mapped = nullptr;
+    const VkResult map_result =
+        consume_render_buffer_upload_failure(RenderBufferUploadFailureStep::MapMemory)
+            ? VK_ERROR_MEMORY_MAP_FAILED
+            : vkMapMemory(ctx.dev, memory, 0, bytes, 0, &mapped);
+    if (map_result != VK_SUCCESS || !mapped)
+        return fail(RenderBufferUploadFailureStep::MapMemory);
+    std::memcpy(mapped, source, static_cast<size_t>(bytes));
+    vkUnmapMemory(ctx.dev, memory);
+    return RenderBufferUploadFailureStep::None;
 }
 
 inline const RenderHostBuffer& render_internal_gds_buffer() {
@@ -2943,6 +3041,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkDeviceMemory memory = VK_NULL_HANDLE;
         void* mapped = nullptr;
         VkDeviceSize offset = 0;
+        VkDeviceSize range = 0;
         VkDeviceSize bytes = 0;
         VkDeviceSize allocation_bytes = 0;
         bool pooled = false;
@@ -3424,6 +3523,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             std::vector<VkDescriptorBufferInfo> dbi(R.size());
             std::vector<VkDescriptorImageInfo> dii(R.size());
             std::vector<VkWriteDescriptorSet> wr(R.size());
+            bool buffer_resources_ready = true;
             for (size_t i = 0; i < R.size(); i++) {
                 const FrameResource& r = R[i];
                 lb[i] = {}; lb[i].binding = r.binding; lb[i].descriptorCount = 1;
@@ -3917,26 +4017,42 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             upload.pooled = upload.buffer && upload.memory && upload.mapped;
                         }
                         if (!upload.arena && !upload.pooled) {
-                            VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-                            buffer_info.size = bytes;
-                            buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-                            vkCreateBuffer(dev, &buffer_info, nullptr, &upload.buffer);
-                            VkMemoryRequirements requirements;
-                            vkGetBufferMemoryRequirements(dev, upload.buffer, &requirements);
-                            const uint32_t memory_type = pick(
-                                requirements.memoryTypeBits,
-                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                            upload.memory = allocate_transient_render_memory(
-                                dev, requirements.size, memory_type);
-                            vkBindBufferMemory(dev, upload.buffer, upload.memory, 0);
-                            void* mapped = nullptr;
-                            vkMapMemory(dev, upload.memory, 0, bytes, 0, &mapped);
-                            std::memcpy(mapped, words, static_cast<size_t>(bytes));
-                            vkUnmapMemory(dev, upload.memory);
+                            RenderBufferUploadFailureStep failure =
+                                create_transient_storage_buffer_upload(
+                                    ctx, words, bytes, upload.buffer, upload.memory);
+                            if (failure != RenderBufferUploadFailureStep::None) {
+                                static std::atomic<uint32_t> failure_logs{0};
+                                if (failure_logs.fetch_add(1, std::memory_order_relaxed) < 32)
+                                    std::fprintf(
+                                        stderr,
+                                        "[buffer-upload-failed] set=%u binding=%u requested=%llu "
+                                        "step=%s — substituting one zero word\n",
+                                        r.set, r.binding, (unsigned long long)bytes,
+                                        render_buffer_upload_failure_name(failure));
+                                upload = {};
+                                failure = create_transient_storage_buffer_upload(
+                                    ctx, &zero_buffer_word, sizeof(zero_buffer_word),
+                                    upload.buffer, upload.memory);
+                                if (failure != RenderBufferUploadFailureStep::None) {
+                                    if (failure_logs.fetch_add(1, std::memory_order_relaxed) < 32)
+                                        std::fprintf(
+                                            stderr,
+                                            "[buffer-upload-failed] set=%u binding=%u zero-word "
+                                            "fallback step=%s — skipping draw\n",
+                                            r.set, r.binding,
+                                            render_buffer_upload_failure_name(failure));
+                                    buffer_resources_ready = false;
+                                    break;
+                                }
+                                upload.range = sizeof(zero_buffer_word);
+                                ++resource_reuse_stats.buffer_upload_fallbacks;
+                            } else {
+                                upload.range = bytes;
+                            }
                         } else {
                             std::memcpy(static_cast<uint8_t*>(upload.mapped) + upload.offset,
                                         words, static_cast<size_t>(bytes));
+                            upload.range = bytes;
                         }
                         shared_buffers.push_back(upload);
                         shared_buffer_indices.emplace(buffer_key, buffer_index);
@@ -3947,11 +4063,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     }
                     dbi[i] = {shared_buffers[buffer_index].buffer,
                               shared_buffers[buffer_index].offset,
-                              static_cast<VkDeviceSize>(word_count) * sizeof(uint32_t)};
+                              shared_buffers[buffer_index].range};
                     wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr[i].dstBinding = r.binding; wr[i].descriptorCount = 1;
                     wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[i].pBufferInfo = &dbi[i];
                 }
             }
+            if (!buffer_resources_ready) continue;
             for (uint32_t s = 0; s < v.n_sets; s++) {
                 std::vector<VkDescriptorSetLayoutBinding> slb;
                 for (size_t i = 0; i < R.size(); i++) if (R[i].set == s) slb.push_back(lb[i]);
