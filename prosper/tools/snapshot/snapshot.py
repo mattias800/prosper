@@ -21,6 +21,8 @@ Env overrides:
   PROSPER_GAME_ROOT   dir holding the <dump> subdirs   (default: /mnt/c/Users/matti/repos/ps5ys)
   PROSPER_BOOT_TRACE  path to the boot_trace binary    (default: <prosper>/build-linux/boot_trace)
   PROSPER_SCREENSHOT  path to the screenshot binary    (default: <prosper>/build-linux/screenshot)
+  PROSPER_SNAPSHOT_LOCK path for the cross-worktree capture lock
+  PROSPER_SNAPSHOT_NO_LOCK=1 to allow an intentional concurrent capture
 
 Exact mode targets a frame with RENDER_EVERY=1 plus `frame`=F, so frame_<F>.bmp
 is the F-th draw submit's render. Pick F in a stable-content window and use
@@ -29,7 +31,8 @@ window of normal composited screenshots, requires multiple frames to meet `min_c
 require visible pixel changes. Its pass/fail contract uses SSIM and content coverage to catch major
 collapse without rejecting subtle pixel improvements.
 """
-import sys, os, json, time, hashlib, math, struct, subprocess, tempfile, shutil, signal, ctypes
+import sys, os, json, time, hashlib, math, struct, subprocess, tempfile, shutil, signal, ctypes, errno
+from contextlib import contextmanager
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROSPER_ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
@@ -40,6 +43,115 @@ GAME_ROOT = os.environ.get("PROSPER_GAME_ROOT", "/mnt/c/Users/matti/repos/ps5ys"
 
 _PR_SET_PDEATHSIG = 1
 _LIBC = ctypes.CDLL(None, use_errno=True) if sys.platform.startswith("linux") else None
+
+
+def _snapshot_lock_path():
+    override = os.environ.get("PROSPER_SNAPSHOT_LOCK")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+
+    # All worktrees of one clone share this directory, unlike PROSPER_ROOT.
+    # Keeping the lock there makes independent agent worktrees cooperate without
+    # introducing a tracked file in any checkout.
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=PROSPER_ROOT, check=True, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        common_dir = result.stdout.strip()
+        if common_dir:
+            return os.path.join(common_dir, "prosper-snapshot.lock")
+    except (OSError, subprocess.CalledProcessError):
+        pass
+
+    # Source archives have no Git common directory. Still coordinate invocations
+    # from the same extracted tree without colliding with unrelated checkouts.
+    root_key = hashlib.sha256(os.path.realpath(PROSPER_ROOT).encode()).hexdigest()[:16]
+    return os.path.join(tempfile.gettempdir(), f"prosper-snapshot-{root_key}.lock")
+
+
+def _try_snapshot_file_lock(lock_file):
+    lock_file.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError as error:
+        if error.errno in (errno.EACCES, errno.EAGAIN) or getattr(error, "winerror", None) in (33, 36):
+            return False
+        raise
+
+
+def _unlock_snapshot_file(lock_file):
+    lock_file.seek(0)
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _snapshot_lock_owner(lock_path):
+    try:
+        with open(lock_path, encoding="utf-8") as owner_file:
+            # Byte zero is the Windows lock range and cannot be read by a
+            # contender. Owner metadata intentionally starts after it.
+            owner_file.seek(1)
+            owner = json.load(owner_file)
+        return f"pid {owner['pid']} ({owner['command']})"
+    except (OSError, ValueError, KeyError, TypeError):
+        return "another snapshot process"
+
+
+@contextmanager
+def snapshot_run_lock(command, names=(), lock_path=None):
+    """Serialize resource-heavy capture commands across this clone's worktrees."""
+    if os.environ.get("PROSPER_SNAPSHOT_NO_LOCK") == "1":
+        yield
+        return
+
+    lock_path = lock_path or _snapshot_lock_path()
+    os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(lock_fd, "r+", encoding="utf-8") as lock_file:
+        # Windows byte-range locks require the byte to exist before it is locked.
+        # Reserve byte zero exclusively for the lock so contenders can still
+        # read the owner metadata which follows it.
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(" ")
+            lock_file.flush()
+
+        if not _try_snapshot_file_lock(lock_file):
+            started_waiting = time.monotonic()
+            print(f"[snapshot-lock] waiting for {_snapshot_lock_owner(lock_path)}; "
+                  f"lock={lock_path}", flush=True)
+            while not _try_snapshot_file_lock(lock_file):
+                time.sleep(0.25)
+            waited = time.monotonic() - started_waiting
+            print(f"[snapshot-lock] acquired after {waited:.1f}s", flush=True)
+
+        owner = {
+            "pid": os.getpid(),
+            "command": " ".join([command] + list(names)),
+            "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "cwd": os.getcwd(),
+        }
+        lock_file.seek(1)
+        json.dump(owner, lock_file)
+        lock_file.write("\n")
+        lock_file.truncate()
+        lock_file.flush()
+        try:
+            yield
+        finally:
+            _unlock_snapshot_file(lock_file)
 
 
 def _snapshot_child_setup(parent_pid):
@@ -865,7 +977,12 @@ def main():
         sys.exit(2)
     cmd, names = sys.argv[1], sys.argv[2:]
     m = load_manifest()
-    rc = {"check": cmd_check, "update": cmd_update, "verify": cmd_verify, "list": cmd_list}[cmd](m, names)
+    runner = {"check": cmd_check, "update": cmd_update, "verify": cmd_verify, "list": cmd_list}[cmd]
+    if cmd in ("check", "verify"):
+        with snapshot_run_lock(cmd, names):
+            rc = runner(m, names)
+    else:
+        rc = runner(m, names)
     sys.exit(rc or 0)
 
 
