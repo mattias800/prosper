@@ -1380,7 +1380,6 @@ static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned&
 // submit path (sceAgcDriverSubmitDcb) and the DOLL warmup-submit variant (w1KFAHVqpaU) below.
 // `dw_num == 0` means "length unknown" — decode_pm4 self-terminates at the first non-type-3 dword, and
 // we cap the walk at kUnknownCap dwords as a runaway guard (a bounded ring can't legitimately exceed it).
-extern "C" void prosper_gpu_set_fold_origin(uint8_t origin);   // #1226 queue-origin diagnostic
 extern "C" uint64_t prosper_guest_tsc_ns();                    // shared guest clock (hle_kernel_time)
 // #1226 POOLSHIFT window probe (PROSPER_POOLSHIFT_WINDOW=1): after each submit, scan the learned
 // TLS pool bins + global recycler slots for the byte-shifted-head poison signature and log on STATE
@@ -1409,8 +1408,8 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     std::lock_guard<std::mutex> lk(g_agc_state_mu);   // serialize with the other submit entry (#278)
     // #1226: stamp this fold's submit entry point so fence-protocol history can distinguish the
     // graphics Dcb stream from ArcRunner's async-compute Acb stream (folded into the same state).
-    prosper_gpu_set_fold_origin(strcmp(who, "SubmitAcb") == 0      ? 2
-                                : strcmp(who, "SubmitDcbFinal") == 0 ? 3 : 1);
+    gpu::prosper_gpu_set_fold_origin(strcmp(who, "SubmitAcb") == 0      ? 2
+                                     : strcmp(who, "SubmitDcbFinal") == 0 ? 3 : 1);
     // #312: flush any earlier stream paused on a WAIT_REG_MEM — this submit may be its producer.
     gpu::flush_deferred_streams();
     agc_gpu_state().draws.clear();
@@ -1507,7 +1506,7 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     const auto* p = (const Packet*)(uintptr_t)a0;
     if (!p || !p->addr || !p->dw_num) return kAgcErrInvalidArg;
     std::lock_guard<std::mutex> lk(g_agc_state_mu);   // serialize with submit_dcb_stream/w1KFAHVqpaU (#278)
-    prosper_gpu_set_fold_origin(1);   // #1226: this direct entry is the graphics SubmitDcb path
+    gpu::prosper_gpu_set_fold_origin(1);   // #1226: this direct entry is the graphics SubmitDcb path
     // Reset the per-submit draw list BEFORE folding this Dcb. The folded GpuState is process-lifetime and
     // its register files (cx/sh/uc) persist across submits (as on real hardware), but its `draws` vector
     // must NOT accumulate — otherwise it grows unbounded and every later frame re-renders stale geometry.

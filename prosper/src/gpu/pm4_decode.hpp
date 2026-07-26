@@ -58,8 +58,8 @@ struct Pm4Command {
     uint64_t stream_order = 0;          // assigned before apply and retained by deferred effects
     // #1226 diagnostic: which driver submit entry point folded this command (0=unknown, 1=SubmitDcb,
     // 2=SubmitAcb, 3=SubmitDcbFinal). Stamped by run_command_buffer from the fold origin and retained
-    // by deferred/pended effects, so fence-protocol history can show cross-queue producer/consumer
-    // pairs (ArcRunner submits real async-compute ACBs; prosper folds both queues into one stream).
+    // by deferred/pended effects, so fence-protocol history and the deferred scheduler can preserve
+    // queue-local order while ArcRunner's real async-compute ACB producers flow independently.
     uint8_t queue_origin = 0;
     uint32_t        header = 0;
     uint32_t        op = 0, r = 0, len = 0;   // op, sub-op, total dwords (incl. header)
