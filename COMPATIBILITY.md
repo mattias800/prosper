@@ -173,8 +173,8 @@ earlier: unbounded register-file growth (#1266) and per-draw full-buffer content
 
 Open: a by-eye play-through confirmation is still outstanding, the snapshot guard for the hall
 predates the geometry fix (#1433), floating black rectangles remain at the wall-lamp positions
-(#1287), 27 draws still vanish at clip pending triage (#1435), and boot remains intermittent
-(#1178).
+(#1287), and boot remains intermittent (#1178). The 27 draws that still vanish at clip were
+individually probed and confirmed as legitimate frustum culls (#1435).
 
 ## Dragon Quest VII Reimagined — `PPSA17942`
 
