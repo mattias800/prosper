@@ -1,4 +1,5 @@
-// test_shadow_compare_render — IMAGE_SAMPLE_C_LZ on a plain 2D shadow map (#1271): a recompiled
+// test_shadow_compare_render — IMAGE_SAMPLE_C_LZ on 2D/2D_ARRAY/CUBE shadow maps (#1167/#1169/#1271):
+// a recompiled
 // pixel shader interpolates UVs, moves a DREF constant into the vaddr slot BEFORE them (ISA 8.2.5
 // "{z-compare}{body}" order), issues image_sample_c_lz dim:2D dmask:0x1, and exports the compare
 // result as MRT0.R. The word0 encoding (0xf0bc0108) is byte-identical to Blue Prince's live
@@ -137,6 +138,50 @@ int main() {
             printf("  2D_ARRAY base-slice center R=%u (want 255)\n", r);
             CHECK(r > 250,
                   "2D_ARRAY base slice manually compares dref 0.5 against stored depth 0.0");
+        }
+    }
+
+    // #1167: CUBE coords are the AMD cube-processed [x,y,face] form, with DREF prepended for
+    // SAMPLE_C_LZ. The backend stores six faces vertically in one 2D image. Select the center of
+    // face 3; only that face contains passing depth, so an incorrect operand order or face transform
+    // produces black instead of the asserted white compare result.
+    const uint32_t ps_cube[] = {
+        0x7e1402f0u,                                          // v10 = 0.5 DREF
+        0x7e1602ffu, 0x3fc00000u,                             // v11 = 1.5 cube x -> u 0.5
+        0x7e1802ffu, 0x3fc00000u,                             // v12 = 1.5 cube y -> v 0.5
+        0x7e1a02ffu, 0x40400000u,                             // v13 = face 3.0
+        0xf0bc0118u, 0x0082050au,                             // c_lz v5, v[10:13], dim:CUBE
+        0xf800080fu, 0x08070605u,                             // exp mrt0 v5..v8
+        0xbf810000u,
+    };
+    ShaderResourceTable cube_rt = rt;
+    cube_rt.resources[0].img_dim = 3;
+    std::vector<uint32_t> cube_frag = recompile_fragment(
+        ps_cube, sizeof(ps_cube) / sizeof(ps_cube[0]), &cube_rt);
+    CHECK(!cube_frag.empty() && cube_frag[0] == 0x07230203u,
+          "recompiled IMAGE_SAMPLE_C_LZ dim:CUBE through the stacked-face lowering (#1167)");
+    CHECK(!has_spirv_opcode(cube_frag, 90 /* OpImageSampleDrefExplicitLod */),
+          "CUBE shadow shader contains no compare-sampler Dref instruction");
+    if (!cube_frag.empty()) {
+        std::vector<uint8_t> cube(8 * 8 * 6 * 4);
+        for (uint32_t face = 0; face < 6; face++) {
+            for (uint32_t y = 0; y < 8; y++) for (uint32_t x = 0; x < 8; x++) {
+                uint8_t* t = &cube[((face * 8 + y) * 8 + x) * 4];
+                t[0] = face == 3 ? 0 : 230; t[1] = t[2] = 0; t[3] = 255;
+            }
+        }
+        prosper::test::FrameResource cube_tex = nearest_tex;
+        cube_tex.tex_rgba = cube.data(); cube_tex.tw = 8; cube_tex.th = 8 * 6;
+        cube_tex.img_dim = 3;
+        std::vector<prosper::test::FrameResource> cube_resources{cube_tex};
+        std::vector<uint8_t> cube_px = prosper::test::render_triangle_rgba(
+            vert, cube_frag, W, H, nullptr, nullptr, nullptr, nullptr, &cube_resources);
+        CHECK(cube_px.size() == (size_t)W * H * 4,
+              "stacked CUBE shadow-compare pipeline rendered a frame");
+        if (cube_px.size() == (size_t)W * H * 4) {
+            const uint8_t r = cube_px[(((size_t)H / 2 * W + W / 2) * 4)];
+            printf("  CUBE face-3 center R=%u (want 255)\n", r);
+            CHECK(r > 250, "CUBE face 3 manually compares its selected stored depth (#1167)");
         }
     }
 
