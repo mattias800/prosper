@@ -869,21 +869,6 @@ struct SpirvCompute {
         uint32_t res   = id(); put(code, Op_ImageSampleExplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Lod, bcf(lod_bits)});
         unpack_texture_result(binding, res, out);
     }
-    // IMAGE_SAMPLE_C_LZ on a 2D array: compare the sampled depth against DREF at
-    // explicit LOD zero. Array coordinates are (u,v,layer); the comparison result is
-    // scalar and RDNA writes that value for the requested dmask component.
-    void image_sample_dref_lz_2d_array(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
-                                       uint32_t layer_bits, uint32_t dref_bits, uint32_t out[4]) {
-        uint32_t si = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
-        uint32_t coord = id();
-        put(code, Op_CompositeConstruct,
-            {t_v3f(), coord, bcf(u_bits), bcf(v_bits), bcf(layer_bits)});
-        uint32_t result = id();
-        put(code, Op_ImageSampleDrefExplicitLod,
-            {t_f32, result, si, coord, bcf(dref_bits), ImgOp_Lod, fconstf(0.0f)});
-        const uint32_t bits = bcu(result);
-        out[0] = out[1] = out[2] = out[3] = bits;
-    }
     // Compare one sampled/fetched depth value against DREF and return raw float bits containing 0/1.
     uint32_t image_dref_compare_bits(uint32_t depth, uint32_t dref_bits, uint32_t compare_func) {
         if (compare_func == 0u) return bcu(fconstf(0.0f));   // NEVER
@@ -902,7 +887,8 @@ struct SpirvCompute {
         put(code, Op_Select, {t_f32, result, cmp, fconstf(1.0f), fconstf(0.0f)});
         return bcu(result);
     }
-    // IMAGE_SAMPLE_C_LZ on a plain 2D texture, lowered as a MANUAL depth compare. The hardware path
+    // IMAGE_SAMPLE_C_LZ on a plain 2D texture (or the backend's base-slice 2D_ARRAY fallback),
+    // lowered as a MANUAL depth compare. The hardware path
     // (compareEnable sampler over a depth-format view) needs backend machinery the color-texture path
     // lacks (see the render-runner S# note). NEAREST retains the exact single sampled tap. LINEAR uses
     // four level-0 fetches, compares each independently, then bilinearly weights the booleans — the
@@ -6361,9 +6347,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // an ordinary color read.
                 if (uint_texture || !res->depth_compare) { ok = false; return true; }
                 if (in.mimg_dim == 5u) {
-                    b.declare_texture(res->binding, Dim_2D, false, true, true);
-                    b.image_sample_dref_lz_2d_array(
-                        res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(3)), vread(cvg(0)), out);
+                    // The shared graphics backend currently exposes 2D_ARRAY textures as its
+                    // documented base-slice 2D view (#325). Match every other sampled DIM=5 path:
+                    // drop the slice coordinate and use the ordinary sampler plus an in-shader
+                    // compare. The old arrayed-depth declaration emitted OpImageSampleDref* against
+                    // a non-compare 2D sampler/view — invalid Vulkan usage and undefined output
+                    // (#1169). Multi-layer selection remains the pre-existing #325 limitation.
+                    b.declare_texture(res->binding, Dim_2D, false);
+                    b.image_sample_dref_manual_2d(res->binding, vread(cvg(1)), vread(cvg(2)),
+                                                  vread(cvg(0)), res->depth_compare_func,
+                                                  res->mag_filter != 0u, res->addr_uvw[0],
+                                                  res->addr_uvw[1], res->border_color_type, out);
                 } else if (in.mimg_dim == 1u) {
                     // Plain 2D form (Blue Prince's lit-material PSes, #1271: 436 rejects/run, all
                     // op 0x2f dim 1 dmask 0x1 — the entire shadowed lighting pass dropped and the

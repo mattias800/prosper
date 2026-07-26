@@ -21,6 +21,16 @@ static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
+static bool has_spirv_opcode(const std::vector<uint32_t>& words, uint16_t opcode) {
+    for (size_t i = 5; i < words.size();) {
+        const uint16_t word_count = static_cast<uint16_t>(words[i] >> 16);
+        if (!word_count || i + word_count > words.size()) return false;
+        if (static_cast<uint16_t>(words[i]) == opcode) return true;
+        i += word_count;
+    }
+    return false;
+}
+
 int main() {
     printf("== test_shadow_compare_render ==\n");
     const uint32_t W = 128, H = 128;
@@ -91,6 +101,44 @@ int main() {
           "dref 0.5 GREATER passes (1.0) where stored depth is 0.0");
     CHECK(right_total && right_fail == right_total,
           "dref 0.5 GREATER fails (0.0) where stored depth is ~0.9");
+
+    // #1169: the remaining DIM=5 form used an arrayed depth SPIR-V image and
+    // OpImageSampleDrefExplicitLod, but the graphics backend binds an ordinary non-compare 2D
+    // sampler/view. Use the canonical NSA operand shape [dref,u,v,slice], deliberately select
+    // slice 3, and assert the established #325 base-slice fallback executes the same manual compare
+    // as DIM=1 without any Dref opcode in the module.
+    const uint32_t ps_array[] = {
+        0x7e1402f0u,                                          // v10 = 0.5 DREF
+        0x7e1602ffu, 0x3e800000u,                             // v11 = 0.25 u
+        0x7e1802f0u,                                          // v12 = 0.5 v
+        0x7e1a02ffu, 0x40400000u,                             // v13 = 3.0 slice (dropped by #325)
+        0xf0bc012au, 0x0082050au, 0x000d0c0bu,                // c_lz v5, [v10..v13], dim:2D_ARRAY
+        0xf800080fu, 0x08070605u,                             // exp mrt0 v5..v8
+        0xbf810000u,
+    };
+    ShaderResourceTable array_rt = rt;
+    array_rt.resources[0].img_dim = 5;
+    std::vector<uint32_t> array_frag = recompile_fragment(
+        ps_array, sizeof(ps_array) / sizeof(ps_array[0]), &array_rt);
+    CHECK(!array_frag.empty() && array_frag[0] == 0x07230203u,
+          "recompiled IMAGE_SAMPLE_C_LZ dim:2D_ARRAY through the base-slice fallback");
+    CHECK(!has_spirv_opcode(array_frag, 90 /* OpImageSampleDrefExplicitLod */),
+          "2D_ARRAY shadow shader contains no compare-sampler Dref instruction (#1169)");
+    if (!array_frag.empty()) {
+        prosper::test::FrameResource array_tex = nearest_tex;
+        array_tex.img_dim = 5;
+        std::vector<prosper::test::FrameResource> array_resources{array_tex};
+        std::vector<uint8_t> array_px = prosper::test::render_triangle_rgba(
+            vert, array_frag, W, H, nullptr, nullptr, nullptr, nullptr, &array_resources);
+        CHECK(array_px.size() == (size_t)W * H * 4,
+              "2D_ARRAY base-slice shadow-compare pipeline rendered a frame");
+        if (array_px.size() == (size_t)W * H * 4) {
+            const uint8_t r = array_px[(((size_t)H / 2 * W + W / 2) * 4)];
+            printf("  2D_ARRAY base-slice center R=%u (want 255)\n", r);
+            CHECK(r > 250,
+                  "2D_ARRAY base slice manually compares dref 0.5 against stored depth 0.0");
+        }
+    }
 
     // Fix #1394: hardware LINEAR comparison sampling compares all four footprint texels first and
     // only then bilinearly weights their boolean results. Pin u=v=0.5 so the 8x8 footprint straddles
