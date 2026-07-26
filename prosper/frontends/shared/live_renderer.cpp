@@ -52,6 +52,12 @@ namespace prosper::frontend {
 // this the composite samples zeros and the frame is black. We cache each submit's rendered pixels under
 // its render-target base and inject them when a subsequent draw samples a texture at a matching base.
 namespace {
+// Ceiling on a single non-texture (vertex/index/storage/constant) buffer upload, matching the
+// sampled-image ceiling used further down. A guest descriptor legitimately declares multi-megabyte
+// vertex streams; anything clamped away reads as zeros in the shader, so this bound must stay far
+// above real content and any clamp must be reported (#1427).
+constexpr uint32_t kMaxBufferUploadBytes = 64u << 20;
+
 struct RttSurf {
     std::shared_ptr<const std::vector<uint8_t>> rgba;
     uint32_t w = 0, h = 0;
@@ -252,6 +258,10 @@ struct PersistentDecodedTexture {
 
     size_t bytes() const { return source_prefix.size() + pixels.size(); }
 };
+}
+
+uint32_t buffer_upload_bytes(uint32_t declared_bytes) {
+    return std::min(declared_bytes, kMaxBufferUploadBytes) & ~3u;
 }
 
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
@@ -2272,7 +2282,28 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         if (getenv("PROSPER_ALPHA1")) fr.swizzle[3] = 1;
                     } else {
                         fr.buffer_identity = r.gpu_addr;
-                        uint32_t nb = std::min(r.size ? r.size : 256u, 1u << 20) & ~3u;   // cap 1 MB, dword-aligned
+                        // #1427: the guest's declared V#/V-buffer size is the real requirement — a
+                        // vertex fetch indexes anywhere inside it. The old 1 MiB clamp silently
+                        // truncated larger buffers, so every element past the cap read ZEROS: those
+                        // vertices all transformed to the same clip point (the MVP translation
+                        // column) and the primitive died as degenerate, with no reject and no log.
+                        // On Blue Prince's entrance hall that erased 44 of 248 scene draws —
+                        // the tile floor, the far table, most of the room — and read as a shading
+                        // defect for weeks. Use the same 64 MiB ceiling the sampled-image path
+                        // above already applies, and make any remaining truncation FAIL-VISIBLE.
+                        const uint32_t requested_bytes = r.size ? r.size : 256u;
+                        uint32_t nb = prosper::frontend::buffer_upload_bytes(requested_bytes);
+                        if (requested_bytes > kMaxBufferUploadBytes) {
+                            static std::set<uint64_t> truncated_reported;
+                            if (truncated_reported.size() < 32 &&
+                                truncated_reported.insert(r.gpu_addr).second)
+                                fprintf(stderr,
+                                        "[buffer-truncated] set=%u binding=%u addr=%llx declared=%u "
+                                        "uploaded=%u — fetches past the uploaded range read zeros and "
+                                        "collapse geometry (#1427)\n",
+                                        set, r.binding, (unsigned long long)r.gpu_addr,
+                                        requested_bytes, nb);
+                        }
                         if (use_direct_buffer_views && nb >= 4) {
                             if (const uint8_t* source = direct_resource(r.gpu_addr, nb)) {
                                 fr.dwords_view = reinterpret_cast<const uint32_t*>(source);
