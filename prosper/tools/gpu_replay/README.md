@@ -274,6 +274,31 @@ tap); inert and byte-identical when the env var is unset. The re-recompile drops
 value derived from `gl_FragCoord`/sample position reads 0 (visualise fetch/sample/colour intermediates, not
 FragCoord-dependent terms).
 
+## Offline recompiler A/B — `--recompile-raw` (does a recompiler change fix/regress this frame?)
+
+```bash
+./build-linux/gpu_replay ~/cap/frame.prgcap /tmp/stored.bmp                    # stored (capture-time) shaders
+./build-linux/gpu_replay --recompile-raw ~/cap/frame.prgcap /tmp/current.bmp   # CURRENT recompiler
+# [recompile-raw] substituted vs=1563 fs=1563 kept-stored vs=0 fs=0 of 1563 draws
+```
+
+A capsule stores already-recompiled SPIR-V, so recompiler changes are invisible to a default replay.
+`--recompile-raw` re-recompiles **every** retained raw VS/FS with the current recompiler and substitutes the
+results — any v19+ capsule becomes a deterministic ~seconds-per-iteration A/B vehicle for recompiler work
+(compare the replay hashes / BMPs), instead of a multi-minute live route per experiment. This was the
+iteration loop that localized #1394 for #1287. Items without a retained raw stream, or whose re-recompile
+fails, keep their stored SPIR-V — the `[recompile-raw]` line counts them; a nonzero `kept-stored` means the
+A/B is partial, never silent. Composes with `PROSPER_FS_TAP` (masked during the mass loop so the per-draw tap
+block keeps exclusive ownership of its semantic draw). Interface hints are re-derived from the raw streams,
+the same contract as the probes above.
+
+Two render_runner provenance logs pair with it when a capsule replay disagrees with expectations
+(both inert by default): `PROSPER_MIPLOG=1` prints each texture binding's mip-eligibility inputs
+(extent, declared chain, format, RTT/DS identity, LOD clamps, filters — which #1272 gate leg starved a
+chain), and `PROSPER_BUFLOG=1` prints each buffer binding's upload provenance (set/binding/word count/
+identity/first floats, capped) — ground truth for "which bytes did the shader actually see" (the #1287
+palette-UV audit).
+
 `--dump-shader DRAW:vs|fs PATH` writes the recompiled SPIR-V. `DRAW` is the semantic ID printed by
 `--inspect-only`, as it is for the probes above. Capture v19 adds
 `--dump-realized-shader DRAW:vs|fs PATH` for the exact bounded raw RDNA2 stream that produced that realized
