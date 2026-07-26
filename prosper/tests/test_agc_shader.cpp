@@ -45,6 +45,19 @@ struct Shader {
     uint8_t num_sh_registers;
 };
 
+struct ShaderSpecialRegs {
+    ShaderRegister ge_cntl;
+    ShaderRegister vgt_shader_stages_en;
+    uint32_t dispatch_modifier;
+    uint16_t user_data_range_start;
+    uint16_t user_data_range_end;
+    uint64_t draw_modifier;
+    ShaderRegister vgt_gs_out_prim_type;
+    ShaderRegister ge_user_vgpr_en;
+};
+
+struct SizeAlign { uint64_t size, align; };
+
 static_assert(offsetof(Shader, user_data) == 0x08 && offsetof(Shader, code) == 0x10 &&
               offsetof(Shader, specials) == 0x28 && offsetof(Shader, type) == 0x5a &&
               offsetof(Shader, num_sh_registers) == 0x5c, "test Shader layout must mirror hle_agc");
@@ -62,12 +75,105 @@ int main() {
     register_builtin_hle();
 
     HleFn create_shader = Hle::lookup("f3dg2CSgRKY");
+    HleFn fused_size = Hle::lookup("dolOmWH+huQ");
+    HleFn fused_size_320 = Hle::lookup("nQT5kYLv0cg");
+    HleFn fuse_halves = Hle::lookup("nApJjpKNBl4");
+    HleFn fuse_halves_old = Hle::lookup("fd5Bp5tGTgo");
     HleFn create_interp = Hle::lookup("dbOlWdppb4o");
     HleFn create_interp_320 = Hle::lookup("pdEV7bI6COI");
     CHECK(create_shader != nullptr, "sceAgcCreateShader registered");
+    CHECK(fused_size != nullptr && fused_size_320 != nullptr &&
+          fuse_halves != nullptr && fuse_halves_old != nullptr,
+          "fused-shader size query and SDK aliases registered");
     CHECK(create_interp != nullptr && create_interp_320 != nullptr,
           "CreateInterpolantMapping SDK aliases registered");
     if (!create_shader) return 1;
+
+    // Pathless builds GS/HS shaders from separately compiled front/back binaries. A success-only
+    // stub left its stack-local fused Shader untouched, and the later register copier interpreted
+    // unrelated stack bytes as a nonzero count paired with a null register pointer.
+    if (fused_size && fused_size_320 && fuse_halves && fuse_halves_old) {
+        using namespace prosper::agc::Pm4;
+        ShaderRegister front_regs[] = {
+            {SPI_SHADER_PGM_CHKSUM_GS, 0x11111111u},
+            {SPI_SHADER_PGM_CHKSUM_GS, 0x22222222u},
+        };
+        ShaderRegister back_regs[] = {
+            {SPI_SHADER_PGM_LO_ES, 0},
+            {SPI_SHADER_PGM_LO_ES + 1u, 0xabcdef00u},
+            {SPI_SHADER_PGM_CHKSUM_GS, 0xaaaaaaaau},
+            {SPI_SHADER_PGM_CHKSUM_GS, 0xbbbbbbbbu},
+            {0x234u, 0xccccccccu},
+        };
+        ShaderSpecialRegs front_specials{}, back_specials{};
+        Shader front{};
+        front.type = 4; // GS front
+        front.code = reinterpret_cast<const void*>(0x123456789a00ull);
+        front.sh_registers = front_regs;
+        front.num_sh_registers = (uint8_t)(sizeof(front_regs) / sizeof(front_regs[0]));
+        front.specials = &front_specials;
+        Shader back{};
+        back.type = 6; // GS back
+        back.code = reinterpret_cast<const void*>(0x20c0000000ull);
+        back.sh_registers = back_regs;
+        back.num_sh_registers = (uint8_t)(sizeof(back_regs) / sizeof(back_regs[0]));
+        back.user_data = reinterpret_cast<ShaderUserData*>(0x12345678ull);
+        back.specials = &back_specials;
+
+        SizeAlign requirements{0xdeadbeefull, 0xdeadbeefull};
+        uint64_t fused_rc = fused_size_320((uint64_t)(uintptr_t)&requirements,
+                                           (uint64_t)(uintptr_t)&front,
+                                           (uint64_t)(uintptr_t)&back, 0, 0, 0);
+        CHECK(fused_rc == 0 && requirements.size == sizeof(back_regs) && requirements.align == 4,
+              "fused-shader size query reserves one copied SH-register array");
+
+        ShaderRegister scratch[sizeof(back_regs) / sizeof(back_regs[0])]{};
+        Shader fused{};
+        fused_rc = fuse_halves((uint64_t)(uintptr_t)&fused, (uint64_t)(uintptr_t)&front,
+                               (uint64_t)(uintptr_t)&back, (uint64_t)(uintptr_t)scratch, 0, 0);
+        CHECK(fused_rc == 0 && fused.type == 2 && fused.sh_registers == scratch,
+              "GS halves produce a fused GS backed by caller scratch");
+        CHECK(fused.user_data == nullptr && fused.code == back.code && fused.specials == back.specials,
+              "fused shader inherits the back half but clears user data");
+        CHECK(scratch[0].value == 0x3456789au && scratch[1].value == 0xabcdef12u,
+              "GS fusion patches the front program address into ES registers");
+        CHECK(scratch[2].value == 0x11111111u && scratch[3].value == 0x22222222u &&
+              scratch[4].value == 0xccccccccu,
+              "GS fusion replaces both checksums without disturbing other back registers");
+        CHECK(back_regs[0].value == 0 && back_regs[2].value == 0xaaaaaaaau,
+              "GS fusion leaves the source back-half register array unchanged");
+
+        ShaderRegister hs_regs[] = {
+            {SPI_SHADER_PGM_LO_LS, 0},
+            {SPI_SHADER_PGM_LO_LS + 1u, 0x11223300u},
+        };
+        Shader hs_front{};
+        hs_front.type = 5; // HS front
+        hs_front.code = reinterpret_cast<const void*>(0x445566778800ull);
+        Shader hs_back{};
+        hs_back.type = 7; // HS back
+        hs_back.sh_registers = hs_regs;
+        hs_back.num_sh_registers = 2;
+        Shader hs_fused{};
+        fused_rc = fuse_halves_old((uint64_t)(uintptr_t)&hs_fused,
+                                   (uint64_t)(uintptr_t)&hs_front,
+                                   (uint64_t)(uintptr_t)&hs_back, 0, 0, 0);
+        CHECK(fused_rc == 0 && hs_fused.type == 3 && hs_fused.sh_registers == hs_regs &&
+              hs_regs[0].value == 0x55667788u && hs_regs[1].value == 0x11223344u,
+              "older fusion alias supports HS halves and patches LS registers in place");
+
+        Shader wrong{};
+        wrong.type = 1;
+        requirements = {0xdeadbeefull, 0xdeadbeefull};
+        fused_rc = fused_size((uint64_t)(uintptr_t)&requirements,
+                              (uint64_t)(uintptr_t)&front,
+                              (uint64_t)(uintptr_t)&wrong, 0, 0, 0);
+        CHECK(fused_rc == 0x8a6c0008ull && requirements.size == 0xdeadbeefull,
+              "mismatched shader halves are rejected without writing requirements");
+        fused_rc = fuse_halves(0, (uint64_t)(uintptr_t)&front,
+                               (uint64_t)(uintptr_t)&back, 0, 0, 0);
+        CHECK(fused_rc == kAgcErrInvalidArg, "null fused-shader output is rejected");
+    }
 
     // Cobra's eboot wrapper allocates exactly 32 ShaderRegisters, calls dbOlWdppb4o with
     // (out, producer type 2, pixel type 1), then advertises all 32 to PatchAddRegisters. A success

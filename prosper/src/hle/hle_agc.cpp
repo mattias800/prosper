@@ -68,6 +68,7 @@ constexpr uint32_t R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET =
                    R_JUMP = 0x1e, R_SET_PRED = 0x1f;
 constexpr uint32_t R_NUM = 0x40;
 constexpr uint64_t kAgcErrInvalidArg = 0x8a6c000aull;
+constexpr uint64_t kAgcErrInvalidShaderHalves = 0x8a6c0008ull;
 inline uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
     return 0xC0000000u | (((len - 2u) & 0x3fffu) << 16u) | ((op & 0xffu) << 8u) | ((r & (R_NUM - 1u)) << 2u);
 }
@@ -934,7 +935,118 @@ struct AgcShaderSpecialRegs {        // guest-visible (Kyty Shader.h:947); point
 };
 static_assert(offsetof(AgcShaderSpecialRegs, vgt_gs_out_prim_type) == 0x20, "specials layout");
 
+struct AgcSizeAlign {
+    uint64_t size;
+    uint64_t align;
+};
+
+constexpr uint8_t kAgcShaderGs = 2;
+constexpr uint8_t kAgcShaderHs = 3;
+constexpr uint8_t kAgcShaderGsFront = 4;
+constexpr uint8_t kAgcShaderHsFront = 5;
+constexpr uint8_t kAgcShaderGsBack = 6;
+constexpr uint8_t kAgcShaderHsBack = 7;
+
+bool agc_shader_halves_match(const AgcShader* front, const AgcShader* back) {
+    return front && back &&
+           ((front->type == kAgcShaderGsFront && back->type == kAgcShaderGsBack) ||
+            (front->type == kAgcShaderHsFront && back->type == kAgcShaderHsBack));
+}
+
+AgcShaderRegister* agc_find_shader_register(AgcShaderRegister* regs, uint32_t count,
+                                             uint32_t offset, uint32_t occurrence = 0) {
+    if (!regs) return nullptr;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (regs[i].offset != offset) continue;
+        if (occurrence == 0) return &regs[i];
+        --occurrence;
+    }
+    return nullptr;
+}
+
+const AgcShaderRegister* agc_find_shader_register(const AgcShaderRegister* regs, uint32_t count,
+                                                   uint32_t offset, uint32_t occurrence = 0) {
+    if (!regs) return nullptr;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (regs[i].offset != offset) continue;
+        if (occurrence == 0) return &regs[i];
+        --occurrence;
+    }
+    return nullptr;
+}
+
+void agc_patch_shader_address(AgcShaderRegister* regs, uint32_t count,
+                              uint32_t lo_offset, uint64_t address) {
+    AgcShaderRegister* lo = agc_find_shader_register(regs, count, lo_offset);
+    if (!lo || lo + 1 >= regs + count || (lo + 1)->offset != lo_offset + 1u) return;
+    lo->value = (uint32_t)((address >> 8u) & 0xffffffffu);
+    (lo + 1)->value = ((lo + 1)->value & 0xffffff00u) | (uint32_t)((address >> 40u) & 0xffu);
+}
+
 }  // namespace
+
+// sceAgcGetFusedShaderSize / sceAgcFuseShaderHalves. UE builds geometry and hull shaders from
+// separately compiled front/back halves. The size query reserves scratch space for a private copy
+// of the back half's SH-register array; fusion then patches that copy with the front program address
+// (and GS checksums), producing an ordinary type-2 GS or type-3 HS shader. Returning success without
+// these writes left UE's stack-local fused Shader uninitialized, so a later TaskGraph worker treated
+// stack bytes as num_cx_registers and called memcpy from its null cx_registers pointer (#1213).
+HLE(agc_get_fused_shader_size) {  // (SizeAlign* dst, const Shader* front, const Shader* back)
+    auto* dst = (AgcSizeAlign*)(uintptr_t)a0;
+    auto* front = (const AgcShader*)(uintptr_t)a1;
+    auto* back = (const AgcShader*)(uintptr_t)a2;
+    if (!dst || !front || !back) return kAgcErrInvalidArg;
+    if (!agc_shader_halves_match(front, back)) return kAgcErrInvalidShaderHalves;
+    dst->size = (uint64_t)back->num_sh_registers * sizeof(AgcShaderRegister);
+    dst->align = alignof(uint32_t);
+    return 0;
+}
+
+HLE(agc_fuse_shader_halves) {  // (Shader* dst, const Shader* front, const Shader* back, void* scratch)
+    auto* dst = (AgcShader*)(uintptr_t)a0;
+    auto* front = (const AgcShader*)(uintptr_t)a1;
+    auto* back = (const AgcShader*)(uintptr_t)a2;
+    void* scratch = (void*)(uintptr_t)a3;
+    if (!dst || !front || !back) return kAgcErrInvalidArg;
+    if (!agc_shader_halves_match(front, back)) return kAgcErrInvalidShaderHalves;
+
+    *dst = *back;
+    dst->type = front->type == kAgcShaderGsFront ? kAgcShaderGs : kAgcShaderHs;
+
+    auto* front_specials = (const AgcShaderSpecialRegs*)front->specials;
+    auto* back_specials = (const AgcShaderSpecialRegs*)back->specials;
+    if (front_specials && back_specials) {
+        const uint32_t mismatch_bit = front->type == kAgcShaderGsFront ? (1u << 22u) : (1u << 21u);
+        if (((front_specials->vgt_shader_stages_en.value ^
+              back_specials->vgt_shader_stages_en.value) & mismatch_bit) != 0)
+            return kAgcErrInvalidShaderHalves;
+    }
+
+    if (scratch && back->sh_registers && back->num_sh_registers) {
+        auto* copied = (AgcShaderRegister*)scratch;
+        memcpy(copied, back->sh_registers,
+               (size_t)back->num_sh_registers * sizeof(AgcShaderRegister));
+        dst->sh_registers = copied;
+    }
+
+    using namespace prosper::agc::Pm4;
+    if (front->type == kAgcShaderGsFront) {
+        for (uint32_t occurrence = 0; occurrence < 2; ++occurrence) {
+            AgcShaderRegister* out = agc_find_shader_register(
+                dst->sh_registers, dst->num_sh_registers, SPI_SHADER_PGM_CHKSUM_GS, occurrence);
+            const AgcShaderRegister* in = agc_find_shader_register(
+                front->sh_registers, front->num_sh_registers, SPI_SHADER_PGM_CHKSUM_GS, occurrence);
+            if (out && in) out->value = in->value;
+        }
+        agc_patch_shader_address(dst->sh_registers, dst->num_sh_registers,
+                                 SPI_SHADER_PGM_LO_ES, (uint64_t)(uintptr_t)front->code);
+    } else {
+        agc_patch_shader_address(dst->sh_registers, dst->num_sh_registers,
+                                 SPI_SHADER_PGM_LO_LS, (uint64_t)(uintptr_t)front->code);
+    }
+    dst->user_data = nullptr;
+    return 0;
+}
 
 // sceAgcGetDataPacketPayloadAddress (V++UgBtQhn0) — called from INSIDE eboot's static AGC code
 // (register-bank prepare, eboot+0x3af040 path, callsite +0x3af170): resolve a data packet built in
@@ -1702,6 +1814,10 @@ void register_agc_hle() {
     RN("hL7C0IRpWZI", agc_cb_eop_action_get_size);   // sceAgcCbQueueEndOfPipeActionGetSize
     RN("t7PlZ9nt5Lc", agc_cb_nop_get_size);          // sceAgcCbNopGetSize
     RN("f3dg2CSgRKY", agc_create_shader);   // sceAgcCreateShader — populates the shader registry
+    RN("dolOmWH+huQ", agc_get_fused_shader_size); // sceAgcGetFusedShaderSize (Pathless SDK)
+    RN("nQT5kYLv0cg", agc_get_fused_shader_size); // sceAgcGetFusedShaderSize (PS5 3.20)
+    RN("nApJjpKNBl4", agc_fuse_shader_halves);    // sceAgcFuseShaderHalves (PS5 3.20)
+    RN("fd5Bp5tGTgo", agc_fuse_shader_halves);    // older observed SDK alias
     RN("AOLcoIkQDgM", agc_driver_query_resource_registration_user_memory_requirements);
     RN("uJziRsODk1c", agc_driver_get_resource_registration_max_name_length);
     RN("X-Nm5KLREeg", agc_driver_register_owner);
