@@ -53,8 +53,8 @@ Not on the draw path (frame DCBs carry no draws). Full disasm + repro in #222.
   memfd physical aliasing, the `libSceAmpr` init/begin/setBuffer trio, `sceKernelGetdents`, RTC
   calendar, `pthread_create_name_np`, etc. (PR #47, #49.)
 - **`sceKernelAprResolveFilepathsToIdsAndFileSizes`** (commit 3d51097): the APR entry point.
-  ABI (live-captured): `(const char** paths, int count, uint32_t* outIds, uint64_t* outSizes,
-  uint32_t* outFlags, int)`. Called once per pak container with `/app0`-translated paths
+  ABI: `(const char** paths, int count, uint32_t* outIds, uint64_t* outSizes,
+  uint32_t* errorIndex)`. Called once per pak container with `/app0`-translated paths
   (`global.utoc/.ucas`, `pakchunkN-ps5.{pak,utoc,ucas}`). Implemented in `hle_file.cpp`
   (`f_apr_resolve`): stat the host file, assign a 1-based id, record `id -> host path`, exposed as
   `std::string prosper_apr_path_for_id(uint32_t id)`. This eliminated the entire MallocBinned

@@ -2014,13 +2014,13 @@ HLE(k_rename){ uint64_t r = f_rename(a0, a1, a2, a3, a4, a5); int e = errno; ret
 
 // --- APR (Async Page Read) file resolution -----------------------------------------------------
 // sceKernelAprResolveFilepathsToIdsAndFileSizes(const char** paths, int count, uint32_t* outIds,
-//   uint64_t* outSizes, uint32_t* outFlags, int reserved) — the entry point of UE4's IoStore/APR
+//   uint64_t* outSizes, uint32_t* errorIndex) — the entry point of UE4's IoStore/APR
 // pipeline. Live capture (PPSA17942): called once per pak container with a /app0-translated path
 // (global.utoc/.ucas, pakchunkN-ps5.pak/.utoc/.ucas). Stubbing it to EINVAL made APR proceed on
 // garbage ids/sizes and wild-write over the allocator (the "MallocBinned unrecognized block" /
 // canary corruption). Resolve each path for real: stat the host file, assign a stable id, record
-// id->host-path so the read path can pread by id. CONFIDENCE: MED (arg roles from live capture;
-// outFlags semantics unknown -> 0).
+// id->host-path so the read path can pread by id. CONFIDENCE: HIGH (argument roles and missing-path
+// error behavior agree between live ArcRunner capture and the reference implementation).
 namespace {
     PROSPER_HEAP_MUTEX(g_apr_mx);   // #707: heap-backed on macOS (APR registry mutex near the corrupted __DATA cluster)
     struct AprFile { std::string path; uint64_t size; };
@@ -2063,11 +2063,13 @@ int prosper_apr_match_by_size(uint64_t size, std::string* out_path) {
 // WithPrefix variant, DOLL (PPSA17942, UE4) the non-prefix one. Each resolved container is stat'd
 // and assigned a stable 1-based id recorded in the APR registry so the read/stat paths can find
 // its host file. Returning without populating the id/size outputs (the old EINVAL/success stub)
-// makes APR proceed on garbage ids and wild-write over the allocator, so every entry writes all
-// three outputs.
+// makes APR proceed on garbage ids and wild-write over the allocator, so every successful entry
+// writes its id and size. `error_index` is one scalar, not an output array; a missing path records
+// its index and fails the batch so callers do not construct a zero-length reader (#1226).
 static uint64_t apr_resolve_impl(const char* prefix, const char** paths, int count,
-                                 uint32_t* out_ids, uint64_t* out_sizes, uint32_t* out_flags) {
+                                 uint32_t* out_ids, uint64_t* out_sizes, uint32_t* error_index) {
     if (!paths || count <= 0) return 0x80020016ull;   // EINVAL
+    if (error_index) *error_index = 0;
     for (int i = 0; i < count; i++) {
         const char* gp = paths[i];
         std::string guest = gp ? std::string(gp) : std::string();
@@ -2104,8 +2106,14 @@ static uint64_t apr_resolve_impl(const char* prefix, const char** paths, int cou
             }
         }
         if (found) size = (uint64_t)st.st_size;
-        else { if (out_ids) out_ids[i] = 0; if (out_sizes) out_sizes[i] = 0; if (out_flags) out_flags[i] = 0;
-               if (filelog()) fprintf(stderr, "[apr] resolve MISS %s\n", guest.empty() ? "(null)" : guest.c_str()); continue; }
+        else {
+            if (out_ids) out_ids[i] = 0xffffffffu;
+            if (out_sizes) out_sizes[i] = 0;
+            if (error_index) *error_index = (uint32_t)i;
+            if (filelog()) fprintf(stderr, "[apr] resolve MISS %s\n",
+                                   guest.empty() ? "(null)" : guest.c_str());
+            return 0x80020002ull;   // ENOENT
+        }
         // Warn loudly (unconditionally) when a DIFFERENT container shares this size: the read
         // path is size-keyed (see f_apr_read_submit) and will refuse such reads as ambiguous.
         std::string clash; int same_size = prosper_apr_match_by_size(size, &clash);
@@ -2116,7 +2124,6 @@ static uint64_t apr_resolve_impl(const char* prefix, const char** paths, int cou
                     host.c_str(), clash.c_str(), (unsigned long long)size);
         if (out_ids)   out_ids[i]   = id;
         if (out_sizes) out_sizes[i] = size;
-        if (out_flags) out_flags[i] = 0;
         if (filelog()) fprintf(stderr, "[apr] resolve %s -> id=%u size=%llu\n", guest.c_str(), id, (unsigned long long)size);
     }
     return 0;
@@ -2126,25 +2133,22 @@ HLE(f_apr_resolve) {
                             (uint32_t*)P(a2), (uint64_t*)P(a3), (uint32_t*)P(a4));
 }
 // sceKernelAprResolveFilepathsToIds(pathList, count, ids, errorIndex): Sonic/CRI's smaller APR
-// resolver.  It is the same path registry operation as the size-returning variant, but its fourth
-// argument is ONE failure index rather than an array.  Do not pass it to apr_resolve_impl as flags:
-// doing so would overwrite past the scalar when count > 1.  The current tolerant resolver records
-// missing entries as id 0 and completes the batch, so a successful batch leaves errorIndex at zero.
+// resolver. It is the same path registry operation as the size-returning variant, and its fourth
+// argument is likewise one failure index rather than an array.
 HLE(f_apr_resolve_ids) {
     uint32_t* error_index = (uint32_t*)P(a3);
-    if (error_index) *error_index = 0;
     return apr_resolve_impl(nullptr, (const char**)P(a0), (int)(int64_t)a1,
-                            (uint32_t*)P(a2), nullptr, nullptr);
+                            (uint32_t*)P(a2), nullptr, error_index);
 }
 // APR builders/read commands execute eagerly in prosper.  A later WaitCommandBuffer therefore has
 // no outstanding host work and succeeds synchronously, matching the completion observed by the
 // caller without inventing an asynchronous submission object.
 HLE(f_apr_wait_command_buffer) { return 0; }
 // sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes(const char* prefix, const char** paths,
-//   int count, uint32_t* outIds, uint64_t* outSizes, uint32_t* outFlags) — GTA V's RAGE resource
+//   int count, uint32_t* outIds, uint64_t* outSizes, uint32_t* errorIndex) — GTA V's RAGE resource
 // loader entry. ABI recovered from live guest disassembly (PPSA04263, [RAGE] Main Thr): rdi=prefix
-// (empty ""), rsi=paths (paths[0]="/app0/ps5/audio/sfx/ANIMALS.rpf"), rdx=count(1), then the three
-// output arrays. Same contract as the non-prefix twin with one leading prefix arg.
+// (empty ""), rsi=paths (paths[0]="/app0/ps5/audio/sfx/ANIMALS.rpf"), rdx=count(1), then the two
+// output arrays and scalar error index. Same contract as the non-prefix twin with one leading arg.
 HLE(f_apr_resolve_with_prefix) {
     return apr_resolve_impl((const char*)P(a0), (const char**)P(a1), (int)(int64_t)a2,
                             (uint32_t*)P(a3), (uint64_t*)P(a4), (uint32_t*)P(a5));

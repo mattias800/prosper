@@ -161,7 +161,7 @@ int main() {
 
     // sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes (GTA V / PPSA04263, RAGE, issue #1130):
     // the prefix-taking twin of the plain resolve. It must prepend `prefix` to each guest path,
-    // stat the resolved container, and WRITE all three output arrays (id/size/flags). Stubbing it to
+    // stat the resolved container, and write its id/size outputs. Stubbing it to
     // success without populating the outputs makes RAGE proceed on a garbage file id (0xffffffff was
     // observed live at the next GetFileStat) and wild-write over its allocator. translate() passes a
     // non-mount path through unchanged, so a relative fixture path exercises the real handler.
@@ -185,13 +185,15 @@ int main() {
     if (resolve_prefix && resolve_plain) {
         // The prefix path is prepended: prefix="prosper-test-apr-", paths[0]="prefix.tmp".
         const char* paths[1] = { wp_tail };
-        uint32_t ids[1] = { 0xdeadbeef }; uint64_t sizes[1] = { 0xdead }; uint32_t flags[1] = { 0xdead };
+        uint32_t ids[1] = { 0xdeadbeef }; uint64_t sizes[1] = { 0xdead }; uint32_t error_index = 0xdead;
         uint64_t r = resolve_prefix((uint64_t)(uintptr_t)wp_prefix, (uint64_t)(uintptr_t)paths, 1,
-                                    (uint64_t)(uintptr_t)ids, (uint64_t)(uintptr_t)sizes, (uint64_t)(uintptr_t)flags);
+                                    (uint64_t)(uintptr_t)ids, (uint64_t)(uintptr_t)sizes,
+                                    (uint64_t)(uintptr_t)&error_index);
         CHECK(r == 0, "WithPrefix resolve returns success");
         CHECK(sizes[0] == wp_bytes.size(),
               "WithPrefix resolve prepends the prefix and stats the combined path");
-        CHECK(ids[0] >= 1 && flags[0] == 0, "WithPrefix resolve populates id and flags");
+        CHECK(ids[0] >= 1 && error_index == 0,
+              "WithPrefix resolve populates the id and clears the scalar error index");
         CHECK(prosper_apr_path_for_id(ids[0]) == wp_full,
               "WithPrefix registers the combined host path under the returned id");
 
@@ -249,24 +251,39 @@ int main() {
         // An empty prefix must behave exactly like the plain (non-prefix) resolve.
         prosper_apr_reset_for_test();
         const char* full_paths[1] = { wp_full };
-        uint32_t id_wp = 0, id_plain = 0; uint64_t sz_wp = 0, sz_plain = 0; uint32_t fl_wp = 1, fl_plain = 1;
+        uint32_t id_wp = 0, id_plain = 0; uint64_t sz_wp = 0, sz_plain = 0;
+        uint32_t err_wp = 1, err_plain = 1;
         resolve_prefix((uint64_t)(uintptr_t)"", (uint64_t)(uintptr_t)full_paths, 1,
-                       (uint64_t)(uintptr_t)&id_wp, (uint64_t)(uintptr_t)&sz_wp, (uint64_t)(uintptr_t)&fl_wp);
+                       (uint64_t)(uintptr_t)&id_wp, (uint64_t)(uintptr_t)&sz_wp,
+                       (uint64_t)(uintptr_t)&err_wp);
         prosper_apr_reset_for_test();
         resolve_plain((uint64_t)(uintptr_t)full_paths, 1,
-                      (uint64_t)(uintptr_t)&id_plain, (uint64_t)(uintptr_t)&sz_plain, (uint64_t)(uintptr_t)&fl_plain, 0);
-        CHECK(id_wp == id_plain && sz_wp == sz_plain && sz_wp == wp_bytes.size() && fl_wp == 0,
+                      (uint64_t)(uintptr_t)&id_plain, (uint64_t)(uintptr_t)&sz_plain,
+                      (uint64_t)(uintptr_t)&err_plain, 0);
+        CHECK(id_wp == id_plain && sz_wp == sz_plain && sz_wp == wp_bytes.size() &&
+                  err_wp == 0 && err_plain == 0,
               "empty prefix matches the plain resolve");
 
-        // A missing container zeroes its outputs (no garbage id) rather than failing the batch.
+        // ArcRunner asks for a loose Game.locres that lives only inside its pak. Returning success
+        // with id/size zero makes UE parse an errored reader and use stale stack data as a count,
+        // trapping startup in a multi-billion-iteration loop. Resolve the preceding valid entry,
+        // then fail at the missing entry with its scalar index and without writing past that scalar.
         prosper_apr_reset_for_test();
-        const char* miss_paths[1] = { "prosper-test-apr-does-not-exist.tmp" };
-        uint32_t miss_id = 0x55; uint64_t miss_sz = 0x55; uint32_t miss_fl = 0x55;
-        uint64_t rm = resolve_prefix((uint64_t)(uintptr_t)"", (uint64_t)(uintptr_t)miss_paths, 1,
-                                     (uint64_t)(uintptr_t)&miss_id, (uint64_t)(uintptr_t)&miss_sz,
-                                     (uint64_t)(uintptr_t)&miss_fl);
-        CHECK(rm == 0 && miss_id == 0 && miss_sz == 0 && miss_fl == 0,
-              "unresolvable container zeroes its outputs");
+        const char* miss_paths[2] = { wp_full, "prosper-test-apr-does-not-exist.tmp" };
+        uint32_t miss_ids[2] = { 0x55, 0x55 }; uint64_t miss_sizes[2] = { 0x55, 0x55 };
+        uint32_t miss_error_guard[3] = { 0x11111111u, 0xDEADBEEFu, 0x22222222u };
+        uint64_t rm = resolve_plain((uint64_t)(uintptr_t)miss_paths, 2,
+                                    (uint64_t)(uintptr_t)miss_ids,
+                                    (uint64_t)(uintptr_t)miss_sizes,
+                                    (uint64_t)(uintptr_t)&miss_error_guard[1], 0);
+        CHECK((uint32_t)rm == 0x80020002u,
+              "missing APR path returns SCE_KERNEL_ERROR_ENOENT");
+        CHECK(miss_ids[0] >= 1 && miss_sizes[0] == wp_bytes.size() &&
+                  miss_ids[1] == 0xffffffffu && miss_sizes[1] == 0,
+              "APR resolver stops with deterministic outputs at the missing entry");
+        CHECK(miss_error_guard[0] == 0x11111111u && miss_error_guard[1] == 1 &&
+                  miss_error_guard[2] == 0x22222222u,
+              "APR resolver reports the scalar failure index without an array overrun");
 
         // A null paths pointer / non-positive count is rejected without touching memory.
         CHECK((uint32_t)resolve_prefix((uint64_t)(uintptr_t)"", 0, 1, 0, 0, 0) == 0x80020016u,
