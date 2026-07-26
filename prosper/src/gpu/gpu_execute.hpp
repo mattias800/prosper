@@ -304,6 +304,12 @@ struct ComputeLaunchDimensions {
 // they are already hardware/Vulkan workgroup counts. Zero local-size registers fall back to one.
 ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& dispatch);
 
+// Read the exact bound compute program from a dispatch's retained register snapshot, falling back to
+// the submit state for hand-built records without a snapshot. Capture selectors use this before DMA-
+// ordered realization, so a target program remains discoverable even when the pre-realized list is empty.
+uint64_t compute_dispatch_code_addr(const GpuState& submit,
+                                    const GpuState::Dispatch& dispatch);
+
 struct ComputeItem {
     std::vector<uint32_t> spirv;
     std::vector<uint32_t> user_sgprs;

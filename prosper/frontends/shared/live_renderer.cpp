@@ -1727,13 +1727,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                         (unsigned long long)r.gpu_addr, tw, th, (unsigned)r.format,
                                         rtt_hit ? "HIT" : "miss", g_rtt.size());
                         }
-                        // CUBE texture (#273 — DOLL's title reflection probes / skybox): six faces,
-                        // each an independently-tiled w x h surface, laid out face-major at
-                        // gpu_addr + f*face_stride; decode each into rows [f*th, (f+1)*th) of the
-                        // stacked w x 6h image the cube-sample lowering addresses. BCn faces block-
-                        // detile + decode; anything else reads 4 B/texel with the surface detiler.
-                        // CONFIDENCE: MED on the face stride (padded tiled footprint) — visually
-                        // validated; a wrong stride garbles faces 1..5, it cannot crash (safe_copy).
+                        // CUBE texture (#273 — DOLL's title reflection probes / skybox): decode six
+                        // independent thin-2D faces into the stacked w x 6h image addressed by the
+                        // cube-sample lowering. A selected mip is not six tightly packed levels: each
+                        // face owns a complete aligned mip chain, so layer_stride/mip_offset select the
+                        // same level from each face. Packed-tail levels retain each face-chain base and
+                        // use the tail coordinates. BCn and native-width fp16 follow the same layout.
                         // GFX8-GFX10 embeds four self-contained 0/1 fast clears in DCC metadata. A
                         // uniform metadata surface means every compression block has that value, so it
                         // can be materialized without interpreting compressed base bytes. Uniform 0xff
@@ -1785,33 +1784,131 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         bool cube_done = dcc_fast_clear_done && is_cube;
                         if (is_cube && !rtt_hit && !dcc_fast_clear_done) {
                             const uint32_t cb = prosper::gpu::bc_block_bytes(r.format);
-                            const bool ctiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !getenv("PROSPER_NODETILE");
+                            const bool ctiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
+                                !getenv("PROSPER_NODETILE");
+                            auto face_base = [&](uint32_t face, size_t selected_span) {
+                                const uint64_t stride = r.layer_stride_bytes
+                                    ? r.layer_stride_bytes : selected_span;
+                                return r.gpu_addr + static_cast<uint64_t>(face) * stride;
+                            };
                             for (uint32_t fface = 0; fface < 6; fface++) {
                                 uint8_t* slice = texture_pixels.data() + (size_t)fface * tw * th * 4;
                                 if (cb) {
                                     uint32_t bw = (tw + 3) / 4, bh = (th + 3) / 4;
                                     size_t comp = (size_t)bw * bh * cb;
-                                    size_t stride = ctiled ? prosper::gpu::tiled_elements_bytes(bw, bh, cb, r.tile_mode) : comp;
+                                    const size_t surface_bytes = ctiled
+                                        ? prosper::gpu::tiled_elements_bytes(
+                                              bw, bh, cb, r.tile_mode)
+                                        : comp;
+                                    const size_t selected_span = r.in_mip_tail
+                                        ? r.mip_tail_bytes : surface_bytes;
+                                    const uint64_t selected_addr = face_base(fface, selected_span) +
+                                        (r.in_mip_tail ? 0u : r.layer_mip_offset_bytes);
                                     std::vector<uint8_t> lin(comp, 0);
                                     if (ctiled) {
-                                        std::vector<uint8_t> traw(stride, 0);
-                                        copy_resource(traw.data(), r.gpu_addr + (uint64_t)fface * stride, stride);
-                                        prosper::gpu::detile_elements(lin.data(), traw.data(), stride, bw, bh, cb, r.tile_mode);
-                                    } else copy_resource(lin.data(), r.gpu_addr + (uint64_t)fface * stride, comp);
+                                        std::vector<uint8_t> traw(selected_span, 0);
+                                        copy_resource(
+                                            traw.data(), selected_addr, selected_span);
+                                        if (r.in_mip_tail)
+                                            prosper::gpu::detile_elements_level(
+                                                lin.data(), traw.data(), traw.size(), bw, bh, cb,
+                                                r.tile_mode, r.mip_tail_x, r.mip_tail_y);
+                                        else
+                                            prosper::gpu::detile_elements(
+                                                lin.data(), traw.data(), traw.size(), bw, bh, cb,
+                                                r.tile_mode);
+                                    } else {
+                                        copy_resource(lin.data(), selected_addr, comp);
+                                    }
                                     std::vector<uint8_t> face((size_t)tw * th * 4, 0);
                                     prosper::gpu::bc_decode_surface(face.data(), lin.data(), lin.size(), tw, th, r.format);
                                     std::memcpy(slice, face.data(), face.size());
                                 } else {
-                                    size_t fb = (size_t)tw * th * 4;
-                                    size_t stride = ctiled ? prosper::gpu::tiled_surface_bytes(tw, th, r.tile_mode, 0) : fb;
+                                    const uint32_t source_bpt = bpt;
+                                    const size_t linear_bytes =
+                                        static_cast<size_t>(tw) * th * source_bpt;
+                                    const size_t surface_bytes = ctiled
+                                        ? prosper::gpu::tiled_surface_bytes(
+                                              tw, th, r.tile_mode, 0, source_bpt)
+                                        : linear_bytes;
+                                    const size_t selected_span = r.in_mip_tail
+                                        ? r.mip_tail_bytes : surface_bytes;
+                                    const uint64_t selected_addr = face_base(fface, selected_span) +
+                                        (r.in_mip_tail ? 0u : r.layer_mip_offset_bytes);
+                                    std::vector<uint8_t> linear(linear_bytes, 0);
                                     if (ctiled) {
-                                        std::vector<uint8_t> traw(stride, 0);
-                                        copy_resource(traw.data(), r.gpu_addr + (uint64_t)fface * stride, stride);
-                                        prosper::gpu::detile_surface(slice, traw.data(), tw, th, r.tile_mode, 0);
-                                    } else {
+                                        std::vector<uint8_t> traw(selected_span, 0);
                                         const size_t got = copy_resource(
-                                            slice, r.gpu_addr + (uint64_t)fface * stride, fb);
-                                        if (got < fb) std::fill(slice + got, slice + fb, 0);
+                                            traw.data(), selected_addr, selected_span);
+                                        if (got < linear.size()) {
+                                            copy_resource(
+                                                linear.data(), selected_addr, linear.size());
+                                        } else if (r.in_mip_tail) {
+                                            prosper::gpu::detile_surface_level(
+                                                linear.data(), traw.data(), got, tw, th,
+                                                r.tile_mode, source_bpt,
+                                                r.mip_tail_x, r.mip_tail_y);
+                                        } else {
+                                            prosper::gpu::detile_surface(
+                                                linear.data(), traw.data(), tw, th,
+                                                r.tile_mode, 0, source_bpt);
+                                        }
+                                    } else if (r.layer_stride_bytes) {
+                                        const size_t row_pitch = r.linear_row_pitch_bytes
+                                            ? r.linear_row_pitch_bytes
+                                            : prosper::gpu::linear_sampled_row_pitch(
+                                                  tw, source_bpt);
+                                        for (uint32_t y = 0; y < th; ++y)
+                                            copy_resource(
+                                                linear.data() + static_cast<size_t>(y) * tw * source_bpt,
+                                                selected_addr + static_cast<uint64_t>(y) * row_pitch,
+                                                static_cast<size_t>(tw) * source_bpt);
+                                    } else {
+                                        copy_resource(linear.data(), selected_addr, linear.size());
+                                    }
+                                    if (f16) {
+                                        const uint32_t nc = source_bpt / 2;
+                                        for (size_t texel = 0; texel < (size_t)tw * th; ++texel) {
+                                            uint8_t* pixel = slice + texel * 4;
+                                            for (uint32_t c = 0; c < 4; ++c) {
+                                                float value = c == 3 ? 1.0f : 0.0f;
+                                                if (c < nc) {
+                                                    uint16_t half = 0;
+                                                    std::memcpy(
+                                                        &half,
+                                                        linear.data() + texel * source_bpt + c * 2,
+                                                        sizeof(half));
+                                                    value = prosper::gpu::half_to_float(half);
+                                                }
+                                                pixel[c] = !std::isfinite(value) || value <= 0.0f
+                                                    ? 0u : (value >= 1.0f
+                                                        ? 255u
+                                                        : static_cast<uint8_t>(value * 255.0f + 0.5f));
+                                            }
+                                        }
+                                    } else if (source_bpt == 4) {
+                                        std::memcpy(slice, linear.data(), linear.size());
+                                    } else {
+                                        const uint32_t component_bytes =
+                                            prosper::gpu::data_format_bytes(r.format);
+                                        const uint32_t nc = r.num_components ? r.num_components : 1u;
+                                        for (size_t texel = 0; texel < (size_t)tw * th; ++texel) {
+                                            uint8_t* pixel = slice + texel * 4;
+                                            pixel[0] = pixel[1] = pixel[2] = 0;
+                                            pixel[3] = 255;
+                                            for (uint32_t c = 0; c < std::min(nc, 4u); ++c) {
+                                                if (component_bytes == 1) {
+                                                    pixel[c] = linear[texel * source_bpt + c];
+                                                } else if (component_bytes == 2) {
+                                                    uint16_t value = 0;
+                                                    std::memcpy(
+                                                        &value,
+                                                        linear.data() + texel * source_bpt + c * 2,
+                                                        sizeof(value));
+                                                    pixel[c] = prosper::gpu::unorm16_to_unorm8(value);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -2089,7 +2186,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         if (!rtt_hit && !dcc_fast_clear_done &&
                             r.format == prosper::gpu::DataFormat::Float10_11_11) {
                             uint8_t* tp = texture_pixels.data();
-                            for (size_t t = 0; t < volume_texels; t++) {
+                            const size_t decoded_texels = volume_texels * (cube_done ? 6u : 1u);
+                            for (size_t t = 0; t < decoded_texels; t++) {
                                 uint32_t v; std::memcpy(&v, tp + t * 4, 4);
                                 const float fc[3] = { prosper::gpu::f11_to_float((uint16_t)(v & 0x7FFu)),
                                                       prosper::gpu::f11_to_float((uint16_t)((v >> 11) & 0x7FFu)),
@@ -2106,7 +2204,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         if (!rtt_hit && !dcc_fast_clear_done &&
                             r.format == prosper::gpu::DataFormat::Unorm2_10_10_10) {
                             uint8_t* tp = texture_pixels.data();
-                            for (size_t t = 0; t < volume_texels; t++) {
+                            const size_t decoded_texels = volume_texels * (cube_done ? 6u : 1u);
+                            for (size_t t = 0; t < decoded_texels; t++) {
                                 uint32_t v; std::memcpy(&v, tp + t * 4, 4);
                                 prosper::gpu::unorm2_10_10_10_to_rgba8(v, tp + t * 4);
                             }

@@ -269,6 +269,9 @@ struct TypeInfo {
     uint32_t storage = 0;
     uint32_t image_sampled = 0;
     bool scalar_float = false;
+    uint32_t image_dim = UINT32_MAX;
+    bool image_arrayed = false;
+    bool image_multisampled = false;
     std::vector<uint32_t> members;
 };
 
@@ -344,24 +347,31 @@ SpirvDescriptorKind descriptor_kind(const VariableInfo& var,
     return SpirvDescriptorKind::Unknown;
 }
 
-bool descriptor_storage_float(const VariableInfo& var,
-                              const std::unordered_map<uint32_t, TypeInfo>& types) {
+const TypeInfo* descriptor_image_type(const VariableInfo& var,
+                                      const std::unordered_map<uint32_t, TypeInfo>& types) {
     auto pi = types.find(var.pointer_type);
-    if (pi == types.end() || pi->second.kind != TypeKind::Pointer) return false;
+    if (pi == types.end() || pi->second.kind != TypeKind::Pointer) return nullptr;
     uint32_t type = pi->second.element;
     for (uint32_t depth = 0; depth < 8; ++depth) {
         auto ti = types.find(type);
-        if (ti == types.end()) return false;
-        if (ti->second.kind == TypeKind::Array) {
+        if (ti == types.end()) return nullptr;
+        if (ti->second.kind == TypeKind::Array || ti->second.kind == TypeKind::SampledImage) {
             type = ti->second.element;
             continue;
         }
-        if (ti->second.kind != TypeKind::Image || ti->second.image_sampled != 2) return false;
-        auto sampled_type = types.find(ti->second.element);
-        return sampled_type != types.end() && sampled_type->second.kind == TypeKind::Scalar &&
-               sampled_type->second.scalar_float;
+        return ti->second.kind == TypeKind::Image ? &ti->second : nullptr;
     }
-    return false;
+    return nullptr;
+}
+
+bool descriptor_storage_float(const VariableInfo& var,
+                              const std::unordered_map<uint32_t, TypeInfo>& types) {
+    const TypeInfo* image = descriptor_image_type(var, types);
+    if (!image || image->image_sampled != 2) return false;
+    const auto sampled_type = types.find(image->element);
+    return sampled_type != types.end() &&
+           sampled_type->second.kind == TypeKind::Scalar &&
+           sampled_type->second.scalar_float;
 }
 
 SpirvDescriptorKind resource_kind(const ShaderResource& r) {
@@ -509,7 +519,16 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
                 if (n >= 3) { TypeInfo t; t.kind = TypeKind::Vector; t.element = word(in, 1); t.count = word(in, 2); types[word(in, 0)] = t; }
                 break;
             case OpTypeImage:
-                if (n >= 8) { TypeInfo t; t.kind = TypeKind::Image; t.element = word(in, 1); t.image_sampled = word(in, 6); types[word(in, 0)] = t; }
+                if (n >= 8) {
+                    TypeInfo t;
+                    t.kind = TypeKind::Image;
+                    t.element = word(in, 1);
+                    t.image_dim = word(in, 2);
+                    t.image_arrayed = word(in, 4) != 0;
+                    t.image_multisampled = word(in, 5) != 0;
+                    t.image_sampled = word(in, 6);
+                    types[word(in, 0)] = t;
+                }
                 break;
             case OpTypeSampledImage:
                 if (n >= 2) { TypeInfo t; t.kind = TypeKind::SampledImage; t.element = word(in, 1); types[word(in, 0)] = t; }
@@ -720,12 +739,23 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     for (uint32_t var : used_vars) {
         auto si = sets.find(var), bi = bindings.find(var);
         if (si == sets.end() || bi == bindings.end()) { add_malformed(report); continue; }
+        uint32_t image_dim = UINT32_MAX;
+        bool image_arrayed = false, image_multisampled = false;
+        auto vi = variables.find(var);
+        const TypeInfo* image = vi == variables.end()
+            ? nullptr : descriptor_image_type(vi->second, types);
+        if (image) {
+            image_dim = image->image_dim;
+            image_arrayed = image->image_arrayed;
+            image_multisampled = image->image_multisampled;
+        }
         report.descriptors.push_back({var, si->second, bi->second, descriptor_vars[var], stage,
                                       required[var], dynamic[var], read_vars.count(var) != 0,
                                       written_vars.count(var) != 0,
                                       normalized_sample_vars.count(var) != 0,
                                       texel_access_vars.count(var) != 0,
-                                      storage_float_vars.count(var) != 0});
+                                      storage_float_vars.count(var) != 0, image_dim,
+                                      image_arrayed, image_multisampled});
     }
     std::sort(report.descriptors.begin(), report.descriptors.end(), [](const auto& a, const auto& b) {
         return a.set != b.set ? a.set < b.set : a.binding < b.binding;

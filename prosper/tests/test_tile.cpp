@@ -394,6 +394,12 @@ int main() {
               "SW_4KB_S mip0 follows the tail and reversed smaller levels");
         CHECK(tiled_mip_level_offset(2048, 1152, 4, M, 11, 1) == 827392,
               "SW_4KB_S mip1 offset uses the same tail-first chain");
+        CHECK(tiled_mip_chain_bytes(256, 256, 8, (uint32_t)TileMode::Sw64KbRX, 8) == 720896,
+              "RGBA16F 256-square R_X array slice includes its complete tail-first mip chain");
+        CHECK(tiled_mip_chain_bytes(256, 256, 8, (uint32_t)TileMode::Sw64KbS, 8) == 720896,
+              "RGBA16F 256-square S array slice has the matching complete mip-chain stride");
+        CHECK(tiled_mip_chain_bytes(32, 32, 8, (uint32_t)TileMode::Sw64KbRX, 5) == 65536,
+              "small RGBA16F cube-face chain wholly contained by the tail occupies one block");
         CHECK(tiled_mip_level_offset(2048, 1152, 4, M, 11, 6) == 4096,
               "last non-tail mip immediately follows the shared 4KB tail");
         CHECK(tiled_mip_level_offset(2048, 1152, 4, M, 0, 0) == 0,
@@ -681,6 +687,60 @@ int main() {
         CHECK(std::memcmp(&tiled[4352], at(0, 8),  bpe) == 0, "64KB_R_X 4B golden: element (0,8) at byte 4352 (y3 -> bits 8+12)");
         CHECK(std::memcmp(&tiled[4096], at(8, 8),  bpe) == 0, "64KB_R_X 4B golden: element (8,8) at byte 4096 (pipe XOR cancels)");
         CHECK(std::memcmp(&tiled[8704], at(16, 0), bpe) == 0, "64KB_R_X 4B golden: element (16,0) at byte 8704 (x4 -> bits 9+13)");
+    }
+
+    // GFX10 standard thick 3D SW_64KB_S. AddrLib's S3 pattern interleaves X/Y/Z inside one
+    // 64 KiB macroblock instead of allocating a separate 2D block for every logical slice.
+    {
+        const uint32_t M = (uint32_t)TileMode::Sw64KbS;
+        CHECK(tile_mode_supports_volume(M), "SW_64KB_S has an explicit standard 3D pattern");
+        CHECK(tiled_volume_bytes(0, 32, 32, M, 8) == 0,
+              "zero-width SW_64KB_S3 volumes are rejected without forming a block grid");
+        CHECK(tiled_volume_bytes(32, 32, 32, M, 8) == 4 * 65536,
+              "Plucky 32-cubed RGBA16F volume uses 1x2x2 S3 macroblocks");
+
+        const uint32_t w = 32, h = 32, d = 32, bpe = 8;
+        std::vector<uint8_t> ref((size_t)w * h * d * bpe);
+        for (size_t i = 0; i < ref.size(); ++i) ref[i] = (uint8_t)((i >> 3) * 59 + i);
+        std::vector<uint8_t> tiled(tiled_volume_bytes(w, h, d, M, bpe), 0);
+        CHECK(tile_volume(tiled.data(), tiled.size(), ref.data(), w, h, d, M, bpe),
+              "Plucky 32-cubed RGBA16F volume tiles successfully");
+        auto at3 = [&](uint32_t x, uint32_t y, uint32_t z) {
+            return &ref[(((size_t)z * h + y) * w + x) * bpe];
+        };
+        CHECK(std::memcmp(&tiled[8], at3(1,0,0), bpe) == 0,
+              "64KB_S3 8B golden: x0 maps to byte-address bit 3");
+        CHECK(std::memcmp(&tiled[16], at3(0,0,1), bpe) == 0,
+              "64KB_S3 8B golden: z0 maps to byte-address bit 4");
+        CHECK(std::memcmp(&tiled[32], at3(0,1,0), bpe) == 0,
+              "64KB_S3 8B golden: y0 maps to byte-address bit 5");
+        CHECK(std::memcmp(&tiled[32768], at3(16,0,0), bpe) == 0,
+              "64KB_S3 8B golden: x4 maps to byte-address bit 15");
+        CHECK(std::memcmp(&tiled[65536], at3(0,16,0), bpe) == 0,
+              "64KB_S3 8B golden: y4 starts the next macroblock");
+        CHECK(std::memcmp(&tiled[2 * 65536], at3(0,0,16), bpe) == 0,
+              "64KB_S3 8B golden: z4 starts the next two-block slab");
+
+        auto rt_volume = [&](uint32_t bytes) {
+            static const uint32_t dims[5][3] = {
+                {64,32,32}, {32,32,32}, {32,32,16}, {32,16,16}, {16,16,16}
+            };
+            uint32_t el = 0; while ((1u << el) < bytes) ++el;
+            const uint32_t rw = dims[el][0] + 1;
+            const uint32_t rh = dims[el][1] + 1;
+            const uint32_t rd = dims[el][2] + 1;
+            std::vector<uint8_t> linear((size_t)rw * rh * rd * bytes);
+            for (size_t i = 0; i < linear.size(); ++i)
+                linear[i] = (uint8_t)((i * 3266489917u) >> 17);
+            std::vector<uint8_t> swizzled(tiled_volume_bytes(rw, rh, rd, M, bytes), 0);
+            std::vector<uint8_t> back(linear.size(), 0);
+            return tile_volume(swizzled.data(), swizzled.size(), linear.data(), rw, rh, rd,
+                               M, bytes) &&
+                   detile_volume(back.data(), swizzled.data(), swizzled.size(), rw, rh, rd,
+                                 M, bytes) && back == linear;
+        };
+        CHECK(rt_volume(1) && rt_volume(2) && rt_volume(4) && rt_volume(8) && rt_volume(16),
+              "SW_64KB_S3 round-trip is exact for every supported texel size");
     }
 
     // GFX10 thin/view-as-2D 3D SW_64KB_R_X. Each Z slice owns a padded 2D block grid, while Z

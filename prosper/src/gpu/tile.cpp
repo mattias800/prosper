@@ -867,7 +867,7 @@ constexpr uint16_t kSw64kbRXVolumeZ[16] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0x0008, 0x0004, 0x0002, 0x0001, 0, 0, 0, 0
 };
 
-size_t sw64kb_volume_bytes(uint32_t width, uint32_t height, uint32_t depth, uint32_t bpe) {
+size_t sw64kb_rx_volume_bytes(uint32_t width, uint32_t height, uint32_t depth, uint32_t bpe) {
     const uint32_t el = sw64kb_elem_log2(bpe);
     if (el == UINT32_MAX) return 0;
     const size_t slice = sw64kb_tiled_bytes(width, height, 0, bpe);
@@ -876,8 +876,8 @@ size_t sw64kb_volume_bytes(uint32_t width, uint32_t height, uint32_t depth, uint
 }
 
 template <bool ToTiled>
-bool sw64kb_volume_copy(uint8_t* dst, const uint8_t* src, size_t tiled_bytes,
-                        uint32_t width, uint32_t height, uint32_t depth, uint32_t bpe) {
+bool sw64kb_rx_volume_copy(uint8_t* dst, const uint8_t* src, size_t tiled_bytes,
+                           uint32_t width, uint32_t height, uint32_t depth, uint32_t bpe) {
     const uint32_t el = sw64kb_elem_log2(bpe);
     if (el == UINT32_MAX || sw64kb_rx_pipes_log2() != 4) return false;
     uint32_t bw = 0, bh = 0;
@@ -911,6 +911,108 @@ bool sw64kb_volume_copy(uint8_t* dst, const uint8_t* src, size_t tiled_bytes,
             for (uint32_t x = 0; x < width; x++) {
                 const uint64_t block = row + x / bw;
                 const uint64_t tiled = (block << 16) | static_cast<uint32_t>(fx[x] ^ fy[y] ^ fz[z]);
+                const size_t linear =
+                    ((static_cast<size_t>(z) * height + y) * width + x) * bpe;
+                if (ToTiled) {
+                    if (tiled + bpe <= tiled_bytes) std::memcpy(dst + tiled, src + linear, bpe);
+                } else if (tiled + bpe <= tiled_bytes) {
+                    std::memcpy(dst + linear, src + tiled, bpe);
+                } else {
+                    std::memset(dst + linear, 0, bpe);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+struct PatBit3 {
+    uint16_t x, y, z;
+};
+
+// AMD AddrLib's authoritative GFX10_SW_64K_S3 patterns for one-pipe standard 3D
+// resources. Unlike R_X's view-as-2D form above, S3 packs Z into a true 64 KiB
+// macroblock. Each row is indexed by log2(bytes-per-element), and each entry maps
+// one byte-address bit to an XOR of element-coordinate bits.
+constexpr PatBit3 kSw64kbS3[5][16] = {
+    { // 1 B: 64x32x32
+        {1,0,0}, {2,0,0}, {0,0,1}, {0,1,0}, {0,0,2}, {0,2,0}, {4,0,0}, {0,0,4},
+        {0,4,0}, {8,0,0}, {0,0,8}, {0,8,0}, {16,0,0}, {0,0,16}, {0,16,0}, {32,0,0},
+    },
+    { // 2 B: 32x32x32
+        {0,0,0}, {1,0,0}, {0,0,1}, {0,1,0}, {0,0,2}, {0,2,0}, {2,0,0}, {0,0,4},
+        {0,4,0}, {4,0,0}, {0,0,8}, {0,8,0}, {8,0,0}, {0,0,16}, {0,16,0}, {16,0,0},
+    },
+    { // 4 B: 32x32x16
+        {0,0,0}, {0,0,0}, {1,0,0}, {0,1,0}, {0,0,1}, {0,2,0}, {2,0,0}, {0,0,2},
+        {0,4,0}, {4,0,0}, {0,0,4}, {0,8,0}, {8,0,0}, {0,0,8}, {0,16,0}, {16,0,0},
+    },
+    { // 8 B: 32x16x16 (Plucky Squire's 32-cubed RGBA16F lighting volume)
+        {0,0,0}, {0,0,0}, {0,0,0}, {1,0,0}, {0,0,1}, {0,1,0}, {2,0,0}, {0,0,2},
+        {0,2,0}, {4,0,0}, {0,0,4}, {0,4,0}, {8,0,0}, {0,0,8}, {0,8,0}, {16,0,0},
+    },
+    { // 16 B: 16x16x16
+        {0,0,0}, {0,0,0}, {0,0,0}, {0,0,0}, {0,0,1}, {0,1,0}, {1,0,0}, {0,0,2},
+        {0,2,0}, {2,0,0}, {0,0,4}, {0,4,0}, {4,0,0}, {0,0,8}, {0,8,0}, {8,0,0},
+    },
+};
+
+constexpr uint32_t kSw64kbS3Dims[5][3] = {
+    {64, 32, 32}, {32, 32, 32}, {32, 32, 16}, {32, 16, 16}, {16, 16, 16},
+};
+
+size_t sw64kb_s3_volume_bytes(uint32_t width, uint32_t height, uint32_t depth, uint32_t bpe) {
+    const uint32_t el = sw64kb_elem_log2(bpe);
+    if (el == UINT32_MAX || !width || !height || !depth) return 0;
+    const uint64_t blocks_x = (static_cast<uint64_t>(width) + kSw64kbS3Dims[el][0] - 1) /
+                              kSw64kbS3Dims[el][0];
+    const uint64_t blocks_y = (static_cast<uint64_t>(height) + kSw64kbS3Dims[el][1] - 1) /
+                              kSw64kbS3Dims[el][1];
+    const uint64_t blocks_z = (static_cast<uint64_t>(depth) + kSw64kbS3Dims[el][2] - 1) /
+                              kSw64kbS3Dims[el][2];
+    if (blocks_x > SIZE_MAX / 65536u ||
+        blocks_y > SIZE_MAX / (blocks_x * 65536u) ||
+        blocks_z > SIZE_MAX / (blocks_x * blocks_y * 65536u)) return 0;
+    return static_cast<size_t>(blocks_x * blocks_y * blocks_z * 65536u);
+}
+
+template <bool ToTiled>
+bool sw64kb_s3_volume_copy(uint8_t* dst, const uint8_t* src, size_t tiled_bytes,
+                           uint32_t width, uint32_t height, uint32_t depth, uint32_t bpe) {
+    const uint32_t el = sw64kb_elem_log2(bpe);
+    if (el == UINT32_MAX) return false;
+    const uint32_t bw = kSw64kbS3Dims[el][0];
+    const uint32_t bh = kSw64kbS3Dims[el][1];
+    const uint32_t bd = kSw64kbS3Dims[el][2];
+    const uint64_t blocks_x = (static_cast<uint64_t>(width) + bw - 1) / bw;
+    const uint64_t blocks_y = (static_cast<uint64_t>(height) + bh - 1) / bh;
+    const PatBit3* pat = kSw64kbS3[el];
+    std::vector<uint16_t> fx(width), fy(height), fz(depth);
+    for (uint32_t x = 0; x < width; ++x) {
+        uint32_t v = 0;
+        for (uint32_t i = el; i < 16; ++i)
+            v |= static_cast<uint32_t>(__builtin_popcount(x & pat[i].x) & 1) << i;
+        fx[x] = static_cast<uint16_t>(v);
+    }
+    for (uint32_t y = 0; y < height; ++y) {
+        uint32_t v = 0;
+        for (uint32_t i = el; i < 16; ++i)
+            v |= static_cast<uint32_t>(__builtin_popcount(y & pat[i].y) & 1) << i;
+        fy[y] = static_cast<uint16_t>(v);
+    }
+    for (uint32_t z = 0; z < depth; ++z) {
+        uint32_t v = 0;
+        for (uint32_t i = el; i < 16; ++i)
+            v |= static_cast<uint32_t>(__builtin_popcount(z & pat[i].z) & 1) << i;
+        fz[z] = static_cast<uint16_t>(v);
+    }
+    for (uint32_t z = 0; z < depth; ++z) {
+        const uint64_t block_slab = static_cast<uint64_t>(z / bd) * blocks_y * blocks_x;
+        for (uint32_t y = 0; y < height; ++y) {
+            const uint64_t block_row = block_slab + static_cast<uint64_t>(y / bh) * blocks_x;
+            for (uint32_t x = 0; x < width; ++x) {
+                const uint64_t block = block_row + x / bw;
+                const uint64_t tiled = (block << 16) | (fx[x] ^ fy[y] ^ fz[z]);
                 const size_t linear =
                     ((static_cast<size_t>(z) * height + y) * width + x) * bpe;
                 if (ToTiled) {
@@ -1138,6 +1240,22 @@ TiledMipLevelLayout tiled_mip_level_layout(uint32_t ew, uint32_t eh, uint32_t bp
     return {};
 }
 
+size_t tiled_mip_chain_bytes(uint32_t ew, uint32_t eh, uint32_t bpe,
+                             uint32_t tile_mode, uint32_t max_mip) {
+    const TiledMipLevelLayout level_zero =
+        tiled_mip_level_layout(ew, eh, bpe, tile_mode, max_mip, 0);
+    if (!level_zero.supported) return 0;
+    // Small allocations can place every level, including level zero, in one shared macroblock.
+    // Their complete per-slice chain is exactly that tail block; rejecting it made valid small cube
+    // maps impossible to stride even though every individual level had a proven tail coordinate.
+    if (level_zero.in_tail) return level_zero.tail_block_bytes;
+    const size_t level_zero_bytes = tile_mode == 0
+        ? linear_sampled_surface_bytes(ew, eh, bpe)
+        : tiled_surface_bytes(ew, eh, tile_mode, 0, bpe);
+    if (!level_zero_bytes || level_zero.byte_offset > SIZE_MAX - level_zero_bytes) return 0;
+    return level_zero.byte_offset + level_zero_bytes;
+}
+
 size_t tiled_mip_level_offset(uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_mode,
                               uint32_t max_mip, uint32_t mip_level) {
     const TiledMipLevelLayout layout = tiled_mip_level_layout(
@@ -1220,6 +1338,7 @@ void tile_surface_level(uint8_t* dst, size_t dst_bytes, const uint8_t* src,
 
 bool tile_mode_supports_volume(uint32_t tile_mode) {
     return tile_mode == (uint32_t)TileMode::Linear ||
+           tile_mode == (uint32_t)TileMode::Sw64KbS ||
            (tile_mode == (uint32_t)TileMode::Sw64KbRX && sw64kb_rx_pipes_log2() == 4);
 }
 
@@ -1232,7 +1351,9 @@ size_t tiled_volume_bytes(uint32_t width, uint32_t height, uint32_t depth,
         return static_cast<size_t>(texels * bytes_per_texel);
     }
     if (!tile_mode_supports_volume(tile_mode)) return 0;
-    return sw64kb_volume_bytes(width, height, depth, bytes_per_texel);
+    return tile_mode == (uint32_t)TileMode::Sw64KbS
+               ? sw64kb_s3_volume_bytes(width, height, depth, bytes_per_texel)
+               : sw64kb_rx_volume_bytes(width, height, depth, bytes_per_texel);
 }
 
 bool detile_volume(uint8_t* dst, const uint8_t* src, size_t src_bytes,
@@ -1245,7 +1366,11 @@ bool detile_volume(uint8_t* dst, const uint8_t* src, size_t src_bytes,
         return true;
     }
     if (!tile_mode_supports_volume(tile_mode)) return false;
-    return sw64kb_volume_copy<false>(dst, src, src_bytes, width, height, depth, bytes_per_texel);
+    return tile_mode == (uint32_t)TileMode::Sw64KbS
+               ? sw64kb_s3_volume_copy<false>(dst, src, src_bytes, width, height, depth,
+                                               bytes_per_texel)
+               : sw64kb_rx_volume_copy<false>(dst, src, src_bytes, width, height, depth,
+                                               bytes_per_texel);
 }
 
 bool tile_volume(uint8_t* dst, size_t dst_bytes, const uint8_t* src,
@@ -1258,7 +1383,11 @@ bool tile_volume(uint8_t* dst, size_t dst_bytes, const uint8_t* src,
         return true;
     }
     std::memset(dst, 0, need);
-    return sw64kb_volume_copy<true>(dst, src, need, width, height, depth, bytes_per_texel);
+    return tile_mode == (uint32_t)TileMode::Sw64KbS
+               ? sw64kb_s3_volume_copy<true>(dst, src, need, width, height, depth,
+                                              bytes_per_texel)
+               : sw64kb_rx_volume_copy<true>(dst, src, need, width, height, depth,
+                                              bytes_per_texel);
 }
 
 } // namespace prosper::gpu

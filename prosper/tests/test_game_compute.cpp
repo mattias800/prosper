@@ -555,6 +555,20 @@ int main() {
         0xF0000F08u, 0x00000004u, 0xBF8C3F70u,
         0xF0200F08u, 0x00020004u, 0xBF810000u,
     };
+    static const uint32_t image_copy_3d[] = {
+        0x7E080300u,             // v4 = x from the shell input
+        0x7E0A0280u,             // v5 = y = 0
+        0x7E0C0280u,             // v6 = z = 0
+        0xF0000F08u, 0x00000004u, 0xBF8C3F70u,
+        0xF0200F08u, 0x00020004u, 0xBF810000u,
+    };
+    static const uint32_t image_copy_2d_array[] = {
+        0x7E080300u,             // v4 = x from the shell input
+        0x7E0A0280u,             // v5 = y = 0
+        0x7E0C0282u,             // v6 = array layer 2
+        0xF0000F28u, 0x00000004u, 0xBF8C3F70u,
+        0xF0200F28u, 0x00020004u, 0xBF810000u,
+    };
     const uint32_t W = 64;
     std::vector<uint32_t> lane_index(W);
     for (uint32_t i = 0; i < W; i++) lane_index[i] = i;      // shell input: v0 = input[gid] = gid
@@ -868,6 +882,333 @@ int main() {
         std::copy_n(tiled2d_src_linear.begin(), W * 4, tiled2d_expected.begin());
         CHECK(tiled2d_result == tiled2d_expected,
               "tiled 2D storage-image writeback matches the linear reference byte-exactly");
+    }
+
+    // Some descriptors declare a one-layer 2D array while the MIMG instruction itself uses DIM=2D.
+    // Preserve that established byte-identical lowering instead of creating a 2D-array Vulkan view
+    // that disagrees with the generated SPIR-V image type.
+    std::fill(tiled2d_dst.begin(), tiled2d_dst.end(), 0);
+    tile_surface(tiled2d_dst.data(), tiled2d_dst_initial.data(), W, TILED_H,
+                 tiled2d_mode, 0, 4);
+    ShaderResourceTable single_layer_array_rt = tiled2d_rt;
+    for (ShaderResource& resource : single_layer_array_rt.resources)
+        if (resource.binding == 4 || resource.binding == 5) resource.img_dim = 5;
+    const std::vector<uint32_t> single_layer_array_spirv = recompile_valu(
+        image_copy_2d, std::size(image_copy_2d), 1, 0, &single_layer_array_rt);
+    CHECK(!single_layer_array_spirv.empty(),
+          "DIM=2D kernel recompiles over a byte-identical one-layer array descriptor");
+    if (!single_layer_array_spirv.empty()) {
+        ComputeItem item;
+        item.spirv = single_layer_array_spirv;
+        item.resources = std::make_shared<ShaderResourceTable>(single_layer_array_rt);
+        item.launch.threads_x = W;
+        item.launch.local_x = 64;
+        item.launch.groups_x = 1;
+        item.launch.local_y = item.launch.local_z = 1;
+        item.launch.groups_y = item.launch.groups_z = 1;
+        item.code_addr = 0x590599;
+        CHECK(prosper::frontend::execute_live_compute_items({item}),
+              "one-layer array descriptor executes through its DIM=2D Vulkan view");
+        std::vector<uint8_t> actual(W * TILED_H * 4, 0);
+        detile_surface(actual.data(), tiled2d_dst.data(), W, TILED_H, tiled2d_mode, 0, 4);
+        std::vector<uint8_t> expected = tiled2d_dst_initial;
+        std::copy_n(tiled2d_src_linear.begin(), W * 4, expected.begin());
+        CHECK(actual == expected,
+              "one-layer array descriptor retains byte-exact 2D storage writeback");
+    }
+
+    // A guest allocation may be cube-shaped while the instruction and generated SPIR-V deliberately
+    // view only face zero as a plain 2D texture. This is a view contract, not a request to upload all
+    // six faces into a 2D Vulkan image. Plucky's lighting setup uses exactly this form.
+    std::vector<uint8_t> cube_faces(tiled2d_bytes * 6u, 0xa7);
+    std::copy(tiled2d_src.begin(), tiled2d_src.end(), cube_faces.begin());
+    std::fill(tiled2d_dst.begin(), tiled2d_dst.end(), 0);
+    tile_surface(tiled2d_dst.data(), tiled2d_dst_initial.data(), W, TILED_H,
+                 tiled2d_mode, 0, 4);
+    ShaderResourceTable cube_face_rt = tiled2d_rt;
+    for (ShaderResource& resource : cube_face_rt.resources) {
+        if (resource.binding == 4) {
+            resource.cls = ResourceClass::Texture;
+            resource.img_dim = 3;
+            resource.depth = 6;
+            resource.size = static_cast<uint32_t>(cube_faces.size());
+            resource.gpu_addr = reinterpret_cast<uint64_t>(cube_faces.data());
+            resource.swizzle[0] = 4;
+            resource.swizzle[1] = 5;
+            resource.swizzle[2] = 6;
+            resource.swizzle[3] = 7;
+        } else if (resource.binding == 5) {
+            resource.gpu_addr = reinterpret_cast<uint64_t>(tiled2d_dst.data());
+        }
+    }
+    const std::vector<uint32_t> cube_face_spirv = recompile_valu(
+        image_copy_2d, std::size(image_copy_2d), 1, 0, &cube_face_rt);
+    CHECK(!cube_face_spirv.empty(), "DIM=2D kernel recompiles over a cube allocation");
+    const auto cube_face_report = validate_spirv_descriptor_interface(
+        cube_face_spirv, &cube_face_rt, 0, SpirvShaderStage::Compute);
+    const auto cube_face_descriptor = std::find_if(
+        cube_face_report.descriptors.begin(), cube_face_report.descriptors.end(),
+        [](const SpirvDescriptorBinding& descriptor) { return descriptor.binding == 4; });
+    CHECK(cube_face_report.ok() && cube_face_descriptor != cube_face_report.descriptors.end() &&
+              cube_face_descriptor->image_dim == 1 && !cube_face_descriptor->image_arrayed,
+          "generated shader reflects the cube allocation binding as a non-array 2D image");
+    if (!cube_face_spirv.empty()) {
+        ComputeItem item;
+        item.spirv = cube_face_spirv;
+        item.resources = std::make_shared<ShaderResourceTable>(cube_face_rt);
+        item.launch.threads_x = W;
+        item.launch.local_x = 64;
+        item.launch.groups_x = 1;
+        item.launch.local_y = item.launch.local_z = 1;
+        item.launch.groups_y = item.launch.groups_z = 1;
+        item.code_addr = 0x59059a;
+        CHECK(prosper::frontend::execute_live_compute_items({item}),
+              "production backend binds cube face zero through the shader-declared 2D view");
+        std::vector<uint8_t> actual(W * TILED_H * 4, 0);
+        detile_surface(actual.data(), tiled2d_dst.data(), W, TILED_H, tiled2d_mode, 0, 4);
+        std::vector<uint8_t> expected = tiled2d_dst_initial;
+        std::copy_n(tiled2d_src_linear.begin(), W * 4, expected.begin());
+        CHECK(actual == expected,
+              "cube face zero reaches the 2D shader view without reading later faces");
+    }
+
+    // Plucky's lighting producer writes a true 3D SW_64KB_S RGBA16 surface. Exercise the full
+    // Vulkan storage-image path, including S3 detile/upload and readback/retile, while preserving
+    // every voxel outside the row touched by this small copy kernel.
+    constexpr uint32_t VOLUME_W = W, VOLUME_H = 32, VOLUME_D = 32;
+    constexpr uint32_t volume_mode = static_cast<uint32_t>(TileMode::Sw64KbS);
+    constexpr uint32_t volume_bpe = 8;
+    const size_t volume_linear_bytes =
+        static_cast<size_t>(VOLUME_W) * VOLUME_H * VOLUME_D * volume_bpe;
+    std::vector<uint8_t> volume_src_linear(volume_linear_bytes);
+    std::vector<uint8_t> volume_dst_initial(volume_linear_bytes);
+    for (size_t i = 0; i < volume_linear_bytes / 2; ++i) {
+        const uint16_t src_value = static_cast<uint16_t>((i * 313u) & 0xffffu);
+        const uint16_t dst_value = static_cast<uint16_t>((i * 197u + 17u) & 0xffffu);
+        std::memcpy(volume_src_linear.data() + i * 2, &src_value, 2);
+        std::memcpy(volume_dst_initial.data() + i * 2, &dst_value, 2);
+    }
+    const size_t volume_tiled_bytes = tiled_volume_bytes(
+        VOLUME_W, VOLUME_H, VOLUME_D, volume_mode, volume_bpe);
+    std::vector<uint8_t> volume_src(volume_tiled_bytes, 0);
+    std::vector<uint8_t> volume_dst(volume_tiled_bytes, 0);
+    tile_volume(volume_src.data(), volume_src.size(), volume_src_linear.data(),
+                VOLUME_W, VOLUME_H, VOLUME_D, volume_mode, volume_bpe);
+    tile_volume(volume_dst.data(), volume_dst.size(), volume_dst_initial.data(),
+                VOLUME_W, VOLUME_H, VOLUME_D, volume_mode, volume_bpe);
+    ShaderResourceTable volume_rt = tiled2d_rt;
+    for (ShaderResource& resource : volume_rt.resources) {
+        if (resource.binding != 4 && resource.binding != 5) continue;
+        resource.img_dim = 2;
+        resource.format = DataFormat::Unorm16;
+        resource.num_components = 4;
+        resource.width = VOLUME_W;
+        resource.height = VOLUME_H;
+        resource.depth = VOLUME_D;
+        resource.tile_mode = volume_mode;
+        resource.size = static_cast<uint32_t>(volume_tiled_bytes);
+        resource.gpu_addr = reinterpret_cast<uint64_t>(
+            resource.binding == 4 ? volume_src.data() : volume_dst.data());
+    }
+    const std::vector<uint32_t> volume_spirv = recompile_valu(
+        image_copy_3d, std::size(image_copy_3d), 1, 0, &volume_rt);
+    CHECK(!volume_spirv.empty(), "SW_64KB_S3 storage-volume copy kernel recompiles");
+    if (!volume_spirv.empty()) {
+        ComputeItem volume_item;
+        volume_item.spirv = volume_spirv;
+        volume_item.resources = std::make_shared<ShaderResourceTable>(volume_rt);
+        volume_item.launch.threads_x = VOLUME_W;
+        volume_item.launch.local_x = 64;
+        volume_item.launch.groups_x = 1;
+        volume_item.launch.local_y = volume_item.launch.local_z = 1;
+        volume_item.launch.groups_y = volume_item.launch.groups_z = 1;
+        volume_item.code_addr = 0x306a150000;
+        CHECK(prosper::frontend::execute_live_compute_items({volume_item}),
+              "production backend executes an SW_64KB_S3 storage-volume dispatch");
+        std::vector<uint8_t> volume_result(volume_linear_bytes, 0);
+        detile_volume(volume_result.data(), volume_dst.data(), volume_dst.size(),
+                      VOLUME_W, VOLUME_H, VOLUME_D, volume_mode, volume_bpe);
+        std::vector<uint8_t> volume_expected = volume_dst_initial;
+        std::copy_n(volume_src_linear.begin(), VOLUME_W * volume_bpe,
+                    volume_expected.begin());
+        CHECK(volume_result == volume_expected,
+              "S3 writeback updates one row and preserves all untouched 3D voxels");
+
+        // Renderer ownership is a concrete 2D image identity, not merely an address. Simulate a
+        // stale/recycled 2D cache entry at the volume destination and require the layered descriptor
+        // to use its valid guest backing without trying to read an impossible 2D snapshot.
+        tile_volume(volume_dst.data(), volume_dst.size(), volume_dst_initial.data(),
+                    VOLUME_W, VOLUME_H, VOLUME_D, volume_mode, volume_bpe);
+        const uint64_t volume_dst_addr = reinterpret_cast<uint64_t>(volume_dst.data());
+        bool layered_reader_called = false;
+        set_live_target_query(
+            [volume_dst_addr](uint64_t addr) { return addr == volume_dst_addr; });
+        set_live_target_reader(
+            [&](uint64_t, LiveTargetSnapshot&) {
+                layered_reader_called = true;
+                return false;
+            });
+        CHECK(prosper::frontend::execute_live_compute_items({volume_item}),
+              "layered resource executes when its base aliases a cached 2D render target");
+        std::fill(volume_result.begin(), volume_result.end(), 0);
+        detile_volume(volume_result.data(), volume_dst.data(), volume_dst.size(),
+                      VOLUME_W, VOLUME_H, VOLUME_D, volume_mode, volume_bpe);
+        CHECK(!layered_reader_called && volume_result == volume_expected,
+              "3D descriptor rejects address-only 2D ownership and preserves guest-backed voxels");
+        set_live_target_reader({});
+        set_live_target_query({});
+    }
+
+    // A selected mip of a 2D array is not stored as selected-level0, selected-level1, ... . Every
+    // array slice owns a complete tail-first mip chain. Exercise a real DIM=2D_ARRAY Vulkan image,
+    // seed all three selected subresources through their stride/offset, modify layer two, then prove
+    // writeback preserves the other layers and every byte outside the selected level.
+    constexpr uint32_t ARRAY_LAYERS = 3;
+    constexpr uint32_t ARRAY_BASE_W = W * 2;
+    constexpr uint32_t ARRAY_BASE_H = TILED_H * 2;
+    constexpr uint32_t ARRAY_MAX_MIP = 4;
+    constexpr uint32_t ARRAY_LEVEL = 1;
+    const TiledMipLevelLayout array_level = tiled_mip_level_layout(
+        ARRAY_BASE_W, ARRAY_BASE_H, 4, tiled2d_mode, ARRAY_MAX_MIP, ARRAY_LEVEL);
+    const size_t array_stride = tiled_mip_chain_bytes(
+        ARRAY_BASE_W, ARRAY_BASE_H, 4, tiled2d_mode, ARRAY_MAX_MIP);
+    const size_t array_selected_bytes = tiled_surface_bytes(W, TILED_H, tiled2d_mode, 0, 4);
+    std::vector<uint8_t> array_src(array_stride * ARRAY_LAYERS, 0x31);
+    std::vector<uint8_t> array_dst(array_stride * ARRAY_LAYERS, 0xA7);
+    std::vector<std::vector<uint8_t>> array_src_linear(
+        ARRAY_LAYERS, std::vector<uint8_t>(W * TILED_H * 4));
+    std::vector<std::vector<uint8_t>> array_dst_initial(
+        ARRAY_LAYERS, std::vector<uint8_t>(W * TILED_H * 4));
+    for (uint32_t layer = 0; layer < ARRAY_LAYERS; ++layer) {
+        for (size_t i = 0; i < array_src_linear[layer].size(); ++i) {
+            array_src_linear[layer][i] = static_cast<uint8_t>(i * 17 + layer * 53 + 5);
+            array_dst_initial[layer][i] = static_cast<uint8_t>(i * 29 + layer * 71 + 11);
+        }
+        tile_surface(array_src.data() + layer * array_stride + array_level.byte_offset,
+                     array_src_linear[layer].data(), W, TILED_H, tiled2d_mode, 0, 4);
+        tile_surface(array_dst.data() + layer * array_stride + array_level.byte_offset,
+                     array_dst_initial[layer].data(), W, TILED_H, tiled2d_mode, 0, 4);
+    }
+    const std::vector<uint8_t> array_dst_outside_before = array_dst;
+    ShaderResourceTable array_rt = tiled2d_rt;
+    for (ShaderResource& resource : array_rt.resources) {
+        if (resource.binding != 4 && resource.binding != 5) continue;
+        resource.img_dim = 5;
+        resource.depth = ARRAY_LAYERS;
+        resource.size = W * TILED_H * ARRAY_LAYERS * 4;
+        resource.layer_stride_bytes = static_cast<uint32_t>(array_stride);
+        resource.layer_mip_offset_bytes = static_cast<uint32_t>(array_level.byte_offset);
+        resource.gpu_addr = reinterpret_cast<uint64_t>(
+            resource.binding == 4 ? array_src.data() : array_dst.data());
+    }
+    const std::vector<uint32_t> array_spirv = recompile_valu(
+        image_copy_2d_array, std::size(image_copy_2d_array), 1, 0, &array_rt);
+    CHECK(array_level.supported && !array_level.in_tail && array_stride != 0 &&
+              !array_spirv.empty(),
+          "selected-mip 2D-array storage copy recompiles with a proven slice layout");
+    if (!array_spirv.empty()) {
+        ComputeItem array_item;
+        array_item.spirv = array_spirv;
+        array_item.resources = std::make_shared<ShaderResourceTable>(array_rt);
+        array_item.launch.threads_x = W;
+        array_item.launch.local_x = 64;
+        array_item.launch.groups_x = 1;
+        array_item.launch.local_y = array_item.launch.local_z = 1;
+        array_item.launch.groups_y = array_item.launch.groups_z = 1;
+        array_item.code_addr = 0x590597;
+        CHECK(prosper::frontend::execute_live_compute_items({array_item}),
+              "production backend executes a selected-mip 2D-array storage dispatch");
+        bool selected_levels_exact = true;
+        for (uint32_t layer = 0; layer < ARRAY_LAYERS; ++layer) {
+            std::vector<uint8_t> actual(W * TILED_H * 4, 0);
+            detile_surface(actual.data(),
+                           array_dst.data() + layer * array_stride + array_level.byte_offset,
+                           W, TILED_H, tiled2d_mode, 0, 4);
+            std::vector<uint8_t> expected = array_dst_initial[layer];
+            if (layer == 2)
+                std::copy_n(array_src_linear[2].begin(), W * 4, expected.begin());
+            selected_levels_exact &= actual == expected;
+        }
+        CHECK(selected_levels_exact,
+              "array writeback updates addressed layer two and preserves sibling selected mips");
+        bool outside_unchanged = true;
+        for (uint32_t layer = 0; layer < ARRAY_LAYERS; ++layer) {
+            const size_t selected_begin = layer * array_stride + array_level.byte_offset;
+            const size_t selected_end = selected_begin + array_selected_bytes;
+            for (size_t i = layer * array_stride; i < (layer + 1) * array_stride; ++i)
+                if ((i < selected_begin || i >= selected_end) &&
+                    array_dst[i] != array_dst_outside_before[i])
+                    outside_unchanged = false;
+        }
+        CHECK(outside_unchanged,
+              "array writeback leaves sibling mips and inter-level padding byte-exact");
+    }
+
+    // Linear mip chains use a 256-byte-aligned row pitch independently inside every slice. Use a
+    // 65-pixel selected level (260 tight bytes, 512-byte guest pitch) so a bulk tight memcpy would
+    // visibly cross both row and layer boundaries. The exact-backing comparison also proves that
+    // row padding and sibling levels survive writeback.
+    constexpr uint32_t LINEAR_W = W + 1;
+    const TiledMipLevelLayout linear_array_level = tiled_mip_level_layout(
+        LINEAR_W * 2, ARRAY_BASE_H, 4, 0, ARRAY_MAX_MIP, ARRAY_LEVEL);
+    const size_t linear_array_stride = tiled_mip_chain_bytes(
+        LINEAR_W * 2, ARRAY_BASE_H, 4, 0, ARRAY_MAX_MIP);
+    const size_t linear_array_pitch = linear_sampled_row_pitch(LINEAR_W, 4);
+    std::vector<uint8_t> linear_array_src(linear_array_stride * ARRAY_LAYERS, 0x43);
+    std::vector<uint8_t> linear_array_dst(linear_array_stride * ARRAY_LAYERS, 0xB9);
+    std::vector<uint8_t> linear_array_expected = linear_array_dst;
+    for (uint32_t layer = 0; layer < ARRAY_LAYERS; ++layer) {
+        for (uint32_t y = 0; y < TILED_H; ++y) {
+            uint8_t* src_row = linear_array_src.data() + layer * linear_array_stride +
+                linear_array_level.byte_offset + y * linear_array_pitch;
+            uint8_t* dst_row = linear_array_dst.data() + layer * linear_array_stride +
+                linear_array_level.byte_offset + y * linear_array_pitch;
+            for (uint32_t x = 0; x < LINEAR_W * 4; ++x) {
+                src_row[x] = static_cast<uint8_t>(x * 17 + y * 31 + layer * 59 + 3);
+                dst_row[x] = static_cast<uint8_t>(x * 23 + y * 37 + layer * 67 + 9);
+            }
+        }
+    }
+    linear_array_expected = linear_array_dst;
+    const size_t linear_array_layer_two = 2u * linear_array_stride;
+    std::memcpy(linear_array_expected.data() + linear_array_layer_two +
+                    linear_array_level.byte_offset,
+                linear_array_src.data() + linear_array_layer_two +
+                    linear_array_level.byte_offset,
+                W * 4);
+    ShaderResourceTable linear_array_rt = tiled2d_rt;
+    for (ShaderResource& resource : linear_array_rt.resources) {
+        if (resource.binding != 4 && resource.binding != 5) continue;
+        resource.img_dim = 5;
+        resource.width = LINEAR_W;
+        resource.height = TILED_H;
+        resource.depth = ARRAY_LAYERS;
+        resource.tile_mode = 0;
+        resource.size = LINEAR_W * TILED_H * ARRAY_LAYERS * 4;
+        resource.layer_stride_bytes = static_cast<uint32_t>(linear_array_stride);
+        resource.layer_mip_offset_bytes = static_cast<uint32_t>(linear_array_level.byte_offset);
+        resource.gpu_addr = reinterpret_cast<uint64_t>(
+            resource.binding == 4 ? linear_array_src.data() : linear_array_dst.data());
+    }
+    const std::vector<uint32_t> linear_array_spirv = recompile_valu(
+        image_copy_2d_array, std::size(image_copy_2d_array), 1, 0, &linear_array_rt);
+    CHECK(linear_array_level.supported && linear_array_stride != 0 &&
+              linear_array_pitch == 512 && !linear_array_spirv.empty(),
+          "linear selected-mip array exposes its aligned per-row and per-slice layout");
+    if (!linear_array_spirv.empty()) {
+        ComputeItem linear_array_item;
+        linear_array_item.spirv = linear_array_spirv;
+        linear_array_item.resources = std::make_shared<ShaderResourceTable>(linear_array_rt);
+        linear_array_item.launch.threads_x = W;
+        linear_array_item.launch.local_x = 64;
+        linear_array_item.launch.groups_x = 1;
+        linear_array_item.launch.local_y = linear_array_item.launch.local_z = 1;
+        linear_array_item.launch.groups_y = linear_array_item.launch.groups_z = 1;
+        linear_array_item.code_addr = 0x590598;
+        CHECK(prosper::frontend::execute_live_compute_items({linear_array_item}),
+              "production backend executes a selected-mip linear 2D-array dispatch");
+        CHECK(linear_array_dst == linear_array_expected,
+              "linear array writeback preserves aligned rows, sibling slices, mips, and padding");
     }
 
     // Exercise the wider element mappings that become default-on with tiled storage. Float16 uses

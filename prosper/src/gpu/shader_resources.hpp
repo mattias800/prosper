@@ -213,6 +213,12 @@ struct ShaderResource {
     uint32_t      mip_tail_bytes    = 0;
     uint32_t      mip_tail_x        = 0;
     uint32_t      mip_tail_y        = 0;
+    // Selected view inside a multi-layer thin-2D allocation. Zero preserves the historical tightly
+    // packed selected-level representation. When nonzero, gpu_addr is the first selected slice's
+    // allocation base and each layer's level begins at layer*stride + layer_mip_offset; packed-tail
+    // levels instead use mip_tail_x/y within each slice base.
+    uint32_t      layer_stride_bytes = 0;
+    uint32_t      layer_mip_offset_bytes = 0;
     bool          srgb              = false;              // T# is a gamma-encoded (sRGB) surface — sample with sRGB->linear (#263)
     uint32_t      sampler_sgpr_base = 0xFFFFFFFFu;
 
@@ -353,6 +359,12 @@ struct SpirvDescriptorBinding {
     // Storage-image sampled type encoded by SPIR-V. This is the backend's authoritative choice
     // between a native float VkFormat and the portable raw-uvec4 conversion path, including replay.
     bool storage_float = false;
+    // OpTypeImage shape for image descriptors (SPIR-V Dim: 0=1D, 1=2D, 2=3D, 3=Cube).
+    // UINT32_MAX denotes a non-image descriptor. Backends use this generated-shader contract when
+    // a guest T# is view-compatible but not shape-identical (for example DIM=2D over cube face 0).
+    uint32_t image_dim = UINT32_MAX;
+    bool image_arrayed = false;
+    bool image_multisampled = false;
 };
 
 enum class DescriptorIssueCode : uint32_t {

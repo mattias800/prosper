@@ -90,6 +90,13 @@ TiledMipLevelLayout tiled_mip_level_layout(uint32_t ew, uint32_t eh, uint32_t bp
                                            uint32_t tile_mode, uint32_t max_mip,
                                            uint32_t mip_level);
 
+// Byte stride between array slices that each contain a complete thin-2D mip chain. GFX10 stores
+// every slice's tail-first/reverse chain as one independently aligned unit; array/cube views need
+// this stride to select the same mip from consecutive layers without treating those levels as a
+// tightly packed image array. Returns zero when the mip layout is not modeled.
+size_t tiled_mip_chain_bytes(uint32_t ew, uint32_t eh, uint32_t bpe,
+                             uint32_t tile_mode, uint32_t max_mip);
+
 // Compatibility helper for callers interested only in non-tail placement. Tail levels intentionally
 // retain the historical zero result; use tiled_mip_level_layout when a packed-tail view is required.
 size_t tiled_mip_level_offset(uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_mode,
@@ -108,10 +115,10 @@ void detile_elements_level(uint8_t* dst, const uint8_t* src, size_t src_bytes,
                            uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_mode,
                            uint32_t tail_x, uint32_t tail_y);
 
-// GFX10 volume layout. PS5's observed 3D surfaces use SW_64KB_R_X (mode 27), which AddrLib defines
-// as a thin/view-as-2D volume: each Z slice owns a padded grid of 2D 64KB blocks, but Z still
-// participates in the pipe-XOR bits inside every block. These helpers return false/zero for tiled
-// modes whose 3D pattern is not implemented. `src_bytes` bounds detile reads.
+// GFX10 volume layouts. SW_64KB_S (mode 9) uses AddrLib's true 3D S3 macroblocks, whose XYZ extent
+// depends on bytes-per-element; SW_64KB_R_X (mode 27) is a thin/view-as-2D volume where each Z slice
+// owns a padded grid of 2D blocks and Z participates in the pipe-XOR bits. These helpers return
+// false/zero for tiled modes whose 3D pattern is not implemented. `src_bytes` bounds detile reads.
 bool tile_mode_supports_volume(uint32_t tile_mode);
 size_t tiled_volume_bytes(uint32_t width, uint32_t height, uint32_t depth,
                           uint32_t tile_mode, uint32_t bytes_per_texel);

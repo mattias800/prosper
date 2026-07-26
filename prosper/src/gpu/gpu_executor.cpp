@@ -3108,7 +3108,9 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                                 r0.in_mip_tail == view.in_mip_tail &&
                                 r0.mip_tail_offset == (view.in_mip_tail ? view.mip_offset : 0) &&
                                 r0.mip_tail_x == view.mip_tail_x &&
-                                r0.mip_tail_y == view.mip_tail_y) {
+                                r0.mip_tail_y == view.mip_tail_y &&
+                                r0.layer_stride_bytes == view.layer_stride &&
+                                r0.layer_mip_offset_bytes == view.layer_mip_offset) {
                                 if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
                                 if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
                             }
@@ -3127,6 +3129,8 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     r.mip_tail_bytes = view.mip_tail_bytes;
                     r.mip_tail_x = view.mip_tail_x;
                     r.mip_tail_y = view.mip_tail_y;
+                    r.layer_stride_bytes = static_cast<uint32_t>(view.layer_stride);
+                    r.layer_mip_offset_bytes = static_cast<uint32_t>(view.layer_mip_offset);
                     r.max_uncompressed_block_size = d.max_uncompressed_block_size;
                     r.max_compressed_block_size = d.max_compressed_block_size;
                     const bool shifted_view = view.mip_offset != 0 || view.in_mip_tail;
@@ -3320,6 +3324,17 @@ ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& d) {
     return out;
 }
 
+uint64_t compute_dispatch_code_addr(const GpuState& submit, const GpuState::Dispatch& dispatch) {
+    namespace P = prosper::agc::Pm4;
+    const GpuState& state = dispatch.state ? *dispatch.state : submit;
+    auto reg = [&](uint32_t offset) {
+        const auto it = state.sh.find(offset);
+        return it == state.sh.end() ? 0u : it->second;
+    };
+    return (static_cast<uint64_t>(reg(P::COMPUTE_PGM_LO)) << 8) |
+           (static_cast<uint64_t>(reg(P::COMPUTE_PGM_HI) & 0xffu) << 40);
+}
+
 std::vector<ComputeItem> realize_compute_dispatches(
     const GpuState& st, uint64_t submit_no,
     std::vector<OperationRealizationFailure>* failures) {
@@ -3336,8 +3351,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
     for (size_t dispatch_index = 0; dispatch_index < st.dispatches.size(); dispatch_index++) {
         const auto& dispatch = st.dispatches[dispatch_index];
         const GpuState& ds = dispatch.state ? *dispatch.state : st;
-        const uint64_t code_addr = (static_cast<uint64_t>(rd(ds.sh, P::COMPUTE_PGM_LO)) << 8) |
-                                   (static_cast<uint64_t>(rd(ds.sh, P::COMPUTE_PGM_HI) & 0xffu) << 40);
+        const uint64_t code_addr = compute_dispatch_code_addr(st, dispatch);
         OperationRealizationFailure failure;
         failure.kind = SubmitOperationKind::Dispatch;
         failure.index = dispatch_index;
@@ -3451,7 +3465,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     const DecodedImageView view = mapped_fmt
                         ? image_base_level_view(d, fi)
                         : DecodedImageView{d.base, d.width, d.height, 0, false, 0, 0, 0,
-                                           d.base_level == 0};
+                                           0, 0, d.base_level == 0};
                     if (!view.supported) {
                         warn_unsupported_image_view(d);
                         continue;
@@ -3470,7 +3484,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                 r0.in_mip_tail == view.in_mip_tail &&
                                 r0.mip_tail_offset == (view.in_mip_tail ? view.mip_offset : 0) &&
                                 r0.mip_tail_x == view.mip_tail_x &&
-                                r0.mip_tail_y == view.mip_tail_y) {
+                                r0.mip_tail_y == view.mip_tail_y &&
+                                r0.layer_stride_bytes == view.layer_stride &&
+                                r0.layer_mip_offset_bytes == view.layer_mip_offset) {
                                 if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
                                 if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
                             }
@@ -3503,6 +3519,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     r.mip_tail_bytes = view.mip_tail_bytes;
                     r.mip_tail_x = view.mip_tail_x;
                     r.mip_tail_y = view.mip_tail_y;
+                    r.layer_stride_bytes = static_cast<uint32_t>(view.layer_stride);
+                    r.layer_mip_offset_bytes = static_cast<uint32_t>(view.layer_mip_offset);
                     r.max_uncompressed_block_size = d.max_uncompressed_block_size;
                     r.max_compressed_block_size = d.max_compressed_block_size;
                     const bool shifted_view = view.mip_offset != 0 || view.in_mip_tail;
@@ -3851,17 +3869,12 @@ void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no) {
     auto rd = [](const std::unordered_map<uint32_t, uint32_t>& regs, uint32_t off) {
         auto it = regs.find(off); return it == regs.end() ? 0u : it->second;
     };
-    auto pgm_addr = [&](const GpuState& ds) {
-        uint32_t lo = rd(ds.sh, P::COMPUTE_PGM_LO), hi = rd(ds.sh, P::COMPUTE_PGM_HI);
-        return (static_cast<uint64_t>(lo) << 8) | (static_cast<uint64_t>(hi & 0xffu) << 40);
-    };
-
     size_t matched = 0;
     for (size_t i = 0; i < st.dispatches.size(); ++i) {
         const auto& d = st.dispatches[i];
         const GpuState& ds = d.state ? *d.state : st;
         const ComputeLaunchDimensions launch = resolve_compute_launch(d);
-        const uint64_t code_addr = pgm_addr(ds);
+        const uint64_t code_addr = compute_dispatch_code_addr(st, d);
         const auto* hdr = static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(code_addr));
 
         uint32_t range_start = 0;

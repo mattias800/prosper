@@ -452,6 +452,30 @@ void storage_unpack_float16x4_f16c(const uint8_t* rgba16f, size_t begin, size_t 
 }
 #endif
 
+size_t linear_array_row_pitch(const prosper::gpu::ShaderResource& resource,
+                              uint32_t bytes_per_texel) {
+    const size_t tight = static_cast<size_t>(resource.width) * bytes_per_texel;
+    const size_t pitch = resource.linear_row_pitch_bytes
+        ? resource.linear_row_pitch_bytes
+        : prosper::gpu::linear_sampled_row_pitch(resource.width, bytes_per_texel);
+    return pitch >= tight ? pitch : 0;
+}
+
+size_t linear_array_surface_bytes(const prosper::gpu::ShaderResource& resource,
+                                  uint32_t bytes_per_texel) {
+    const size_t pitch = linear_array_row_pitch(resource, bytes_per_texel);
+    if (!pitch || !resource.height || pitch > SIZE_MAX / resource.height) return 0;
+    return pitch * resource.height;
+}
+
+// A non-depth, one-layer T# array has historically been lowered as an ordinary 2D SPIR-V image:
+// its guest bytes are identical and several shaders use DIM=2D despite the descriptor type. Keep
+// that established contract while materializing real layered/depth-array views as Vulkan arrays.
+bool backend_uses_2d_array(const prosper::gpu::ShaderResource& resource) {
+    return resource.img_dim == 5 &&
+           (resource.depth_compare || resource.depth > 1 || resource.layer_stride_bytes != 0);
+}
+
 uint16_t storage_pack_unorm16(uint32_t float_bits) {
     float value;
     std::memcpy(&value, &float_bits, sizeof(value));
@@ -555,6 +579,7 @@ struct ComputeImageCacheKey {
     uint32_t width = 0, height = 0, depth = 0;
     uint32_t format = 0, components = 0, tile_mode = 0, img_dim = 0;
     uint32_t linear_row_pitch = 0;
+    uint32_t layer_stride = 0, layer_mip_offset = 0;
     uint32_t mip_tail_offset = 0, mip_tail_bytes = 0;
     uint32_t mip_tail_x = 0, mip_tail_y = 0;
     uint32_t vk_format = 0;
@@ -576,7 +601,8 @@ struct ComputeImageCacheKeyHash {
         mix(key.guest_bytes); mix(key.resource_bytes);
         mix(key.width); mix(key.height); mix(key.depth);
         mix(key.format); mix(key.components); mix(key.tile_mode); mix(key.img_dim);
-        mix(key.linear_row_pitch); mix(key.mip_tail_offset); mix(key.mip_tail_bytes);
+        mix(key.linear_row_pitch); mix(key.layer_stride); mix(key.layer_mip_offset);
+        mix(key.mip_tail_offset); mix(key.mip_tail_bytes);
         mix(key.mip_tail_x); mix(key.mip_tail_y); mix(key.vk_format);
         mix(key.storage); mix(key.in_mip_tail); mix(key.srgb); mix(key.depth_compare);
         return result;
@@ -1418,6 +1444,8 @@ struct BoundImage {
     uint32_t binding = 0;
     bool storage = false;               // storage image: read back + pack to guest after the dispatch
     bool native_float_storage = false;  // Vulkan performs exact UNORM/float conversion at native width
+    uint32_t texel_depth = 1;           // logical Z/layer count represented in the staging buffer
+    uint32_t array_layers = 1;           // Vulkan array-layer count (3D depth remains one layer)
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
@@ -2144,11 +2172,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const uint64_t key = r ? r->gpu_addr : 0;
             if (std::find(warned.begin(), warned.end(), key) == warned.end()) {
                 warned.push_back(key);
-                std::fprintf(stderr, "[compute] program 0x%llx image 0x%llx %ux%ux%u fmt=%u comps=%u "
-                                     "tile=%u size=%u: %s -> "
+                std::fprintf(stderr, "[compute] program 0x%llx image 0x%llx %ux%ux%u dim=%u "
+                                     "class=%u fmt=%u comps=%u tile=%u size=%u: %s -> "
                                      "dispatch skipped (#590)\n",
                              (unsigned long long)item.code_addr, (unsigned long long)key,
                              r ? r->width : 0, r ? r->height : 0, r ? r->depth : 0,
+                             r ? r->img_dim : 0u, r ? static_cast<unsigned>(r->cls) : 0u,
                              r ? (unsigned)r->format : 0u, r ? r->num_components : 0u,
                              r ? r->tile_mode : 0u, r ? r->size : 0u, why);
             }
@@ -2195,20 +2224,29 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // raw guest memory (empty/stale — the Dead Cells 642x362 lesson).
             const bool dim_1d = r->img_dim == 0;
             const bool dim_3d = r->img_dim == 2;
-            const bool dim_2d_array = r->img_dim == 5 && r->depth_compare;
-            // A SINGLE-LAYER 2D array (img_dim==5, depth==1, no depth-compare) is byte-identical to a
-            // plain 2D image (one layer, same tiling), so it flows through the 2D path below unchanged.
-            // The general multi-layer/array case stays deferred to #657. DOLL's post-process compute
-            // declares its mask/LUT surfaces this way; skipping them left the tonemap sampling an empty
-            // surface -> a zero mask -> black composite even though the scene renders (#319/#657).
+            const bool dim_2d_array = backend_uses_2d_array(*r);
+            const bool cube_face_as_2d = r->img_dim == 3 &&
+                image_descriptors[i].image_dim == 1 && !image_descriptors[i].image_arrayed &&
+                !image_descriptors[i].image_multisampled;
+            // A single-layer 2D array is byte-identical to plain 2D. Multi-layer views use the
+            // descriptor-derived per-slice mip-chain stride below; treating selected levels as tight
+            // layers reads a different mip after layer zero.
             const bool dim_2d_single = r->img_dim == 5 && !r->depth_compare && r->depth == 1;
-            if (!dim_1d && r->img_dim != 1 && !dim_3d && !dim_2d_array && !dim_2d_single) {
+            if (!dim_1d && r->img_dim != 1 && !dim_3d && !dim_2d_array && !dim_2d_single &&
+                !cube_face_as_2d) {
                 skip_image(r, "layered image deferred to #657"); break;
             }
             if (dim_1d && r->height != 1) { skip_image(r, "1D image has non-unit height"); break; }
-            if (!r->depth || (!dim_3d && !dim_2d_array && r->depth != 1)) {
+            if (!r->depth || (!dim_3d && !dim_2d_array && !cube_face_as_2d && r->depth != 1)) {
                 skip_image(r, "image depth does not match its dimensionality"); break;
             }
+            bi.texel_depth = (dim_3d || dim_2d_array) ? r->depth : 1u;
+            bi.array_layers = dim_2d_array ? r->depth : 1u;
+            if (cube_face_as_2d && trace)
+                std::fprintf(stderr,
+                             "[compute]   binding cube face zero as shader-declared 2D image "
+                             "binding=%u addr=0x%llx\n",
+                             bi.binding, (unsigned long long)r->gpu_addr);
             if (dim_3d && r->depth > 1 && r->tile_mode &&
                 !tile_mode_supports_volume(r->tile_mode)) {
                 skip_image(r, "3D tile mode has no volume address pattern"); break;
@@ -2245,6 +2283,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const long v = e ? std::strtol(e, nullptr, 10) : 1;
                 return v > 0 ? static_cast<uint32_t>(v) : 1u;
             }();
+            if (renderer_owned && (dim_3d || dim_2d_array || r->depth != 1)) {
+                // The renderer cache represents one concrete 2D color image. An address match from
+                // a 3D/layered descriptor is therefore a resource-lifetime alias, not that cached
+                // surface: Vulkan/guest allocators routinely recycle one base across incompatible
+                // views. Its canonical 2D pixels cannot seed the layered layout, while the new
+                // resource's guest backing is the only representation with the requested shape.
+                renderer_owned = false;
+                if (trace)
+                    std::fprintf(stderr,
+                                 "[compute]   renderer RTT dimensional-view miss binding=%u "
+                                 "addr=0x%llx requested=%ux%ux%u dim=%u -> guest backing\n",
+                                 bi.binding, (unsigned long long)r->gpu_addr,
+                                 r->width, r->height, r->depth, r->img_dim);
+            }
             // Bind the renderer's own image when it is the authoritative copy and this binding
             // matches it EXACTLY (#1095, phase 2 of #1091). RGBA8 and RGBA16F targets both have a
             // byte-identical sampled Vulkan view, so neither needs to round-trip through a CPU
@@ -2379,8 +2431,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // Proven Partial: fall through, seed normally every frame.
             }
             if (renderer_owned && !bi.imported && !bi.seed_skip) {
-                if (dim_3d || r->depth != 1 ||
-                    !read_live_render_target(r->gpu_addr, live_target) || !live_target.pixels) {
+                if (!read_live_render_target(r->gpu_addr, live_target) || !live_target.pixels) {
                     skip_image(r, "renderer-owned RTT has no readable snapshot"); break;
                 }
                 // A dimension mismatch is either (a) an exact PROSPER_RENDER_SCALE downscale (the renderer
@@ -2513,8 +2564,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const bool same_view = p && prior.storage == bi.storage &&
                     p->gpu_addr == r->gpu_addr && p->size == r->size &&
                     p->width == r->width && p->height == r->height && p->depth == r->depth &&
+                    prior.texel_depth == bi.texel_depth && prior.array_layers == bi.array_layers &&
                     p->format == r->format && p->num_components == r->num_components &&
                     p->tile_mode == r->tile_mode && p->img_dim == r->img_dim &&
+                    p->layer_stride_bytes == r->layer_stride_bytes &&
+                    p->layer_mip_offset_bytes == r->layer_mip_offset_bytes &&
+                    p->in_mip_tail == r->in_mip_tail &&
+                    p->mip_tail_x == r->mip_tail_x && p->mip_tail_y == r->mip_tail_y &&
                     p->srgb == r->srgb && p->host_data == r->host_data &&
                     p->host_data_size == r->host_data_size && same_dcc_identity;
                 bool same_sampler = true;
@@ -2536,6 +2592,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const BoundImage& owner = images[bi.alias_of];
                 bi.image = owner.image; bi.memory = owner.memory; bi.view = owner.view;
                 bi.sampler = owner.sampler; bi.guest_bytes = owner.guest_bytes;
+                bi.texel_depth = owner.texel_depth;
+                bi.array_layers = owner.array_layers;
                 bi.dcc_metadata = owner.dcc_metadata;
                 bi.dcc_metadata_bytes = owner.dcc_metadata_bytes;
                 staging_bytes[i] = staging_bytes[bi.alias_of];
@@ -2555,7 +2613,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      ComputeClock::now() - image_start).count());
                 continue;
             }
-            const VkDeviceSize volume_texels = static_cast<VkDeviceSize>(r->width) * r->height * r->depth;
+            const VkDeviceSize volume_texels =
+                static_cast<VkDeviceSize>(r->width) * r->height * bi.texel_depth;
             const uint32_t sampled_components = r->num_components ? r->num_components : 1;
             const bool sampled_depth = !bi.storage && r->depth_compare && dim_2d_array &&
                                        sampled_components == 1 &&
@@ -2682,18 +2741,78 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     const size_t slice = r->tile_mode
                         ? tiled_elements_bytes(bw, bh, sampled_bpb, r->tile_mode)
                         : static_cast<size_t>(bw) * bh * sampled_bpb;
-                    sampled_guest_need = dim_2d_array ? slice * r->depth : slice;
+                    if (cube_face_as_2d && r->layer_stride_bytes) {
+                        const size_t selected_slice = r->in_mip_tail
+                            ? r->mip_tail_bytes
+                            : (r->tile_mode
+                                   ? slice
+                                   : linear_sampled_row_pitch(bw, sampled_bpb) * bh);
+                        const size_t level_offset = r->in_mip_tail
+                            ? 0u : r->layer_mip_offset_bytes;
+                        if (!selected_slice || level_offset > SIZE_MAX - selected_slice) {
+                            skip_image(r, "sampled cube-face backing size overflows"); break;
+                        }
+                        sampled_guest_need = level_offset + selected_slice;
+                    } else if (dim_2d_array && r->depth > 1) {
+                        const size_t layer_stride = r->layer_stride_bytes
+                            ? r->layer_stride_bytes : slice;
+                        const size_t level_offset = r->in_mip_tail
+                            ? 0u : r->layer_mip_offset_bytes;
+                        if (layer_stride > SIZE_MAX / (r->depth - 1u) ||
+                            level_offset > SIZE_MAX - layer_stride * (r->depth - 1u) ||
+                            slice > SIZE_MAX -
+                                (layer_stride * (r->depth - 1u) + level_offset)) {
+                            skip_image(r, "sampled array backing size overflows"); break;
+                        }
+                        sampled_guest_need =
+                            layer_stride * (r->depth - 1u) + level_offset + slice;
+                    } else {
+                        sampled_guest_need = slice;
+                    }
                 } else if (sampled_rgba8 || sampled_uint8 || sampled_r8 || sampled_f16 ||
                            sampled_f32 || sampled_r11g11b10 || sampled_unorm8x2 ||
                            sampled_unorm16_native || sampled_uint8_native ||
                            sampled_uint16_native || sampled_uint32_native || sampled_depth) {
                     const uint32_t bpt = sampled_r11g11b10 ? 4u : sampled_cb * sampled_nc;
-                    if (r->tile_mode && dim_3d && r->depth > 1) {
+                    if (cube_face_as_2d && r->layer_stride_bytes) {
+                        const size_t selected_slice = r->in_mip_tail
+                            ? r->mip_tail_bytes
+                            : (r->tile_mode
+                                   ? tiled_surface_bytes(
+                                         r->width, r->height, r->tile_mode, 0, bpt)
+                                   : (r->linear_row_pitch_bytes
+                                          ? linear_array_surface_bytes(*r, bpt)
+                                          : static_cast<size_t>(r->width) * r->height * bpt));
+                        const size_t level_offset = r->in_mip_tail
+                            ? 0u : r->layer_mip_offset_bytes;
+                        if (!selected_slice || level_offset > SIZE_MAX - selected_slice) {
+                            skip_image(r, "sampled cube-face backing size overflows"); break;
+                        }
+                        sampled_guest_need = level_offset + selected_slice;
+                    } else if (r->tile_mode && dim_3d && r->depth > 1) {
                         sampled_guest_need = tiled_volume_bytes(
                             r->width, r->height, r->depth, r->tile_mode, bpt);
-                    } else if (r->tile_mode && dim_2d_array) {
-                        sampled_guest_need = tiled_surface_bytes(
-                            r->width, r->height, r->tile_mode, 0, bpt) * r->depth;
+                    } else if (dim_2d_array && r->depth > 1) {
+                        const size_t slice = r->in_mip_tail
+                            ? r->mip_tail_bytes
+                            : (r->tile_mode
+                                   ? tiled_surface_bytes(
+                                         r->width, r->height, r->tile_mode, 0, bpt)
+                                   : (r->layer_stride_bytes
+                                          ? linear_array_surface_bytes(*r, bpt)
+                                          : static_cast<size_t>(r->width) * r->height * bpt));
+                        const size_t layer_stride = r->layer_stride_bytes
+                            ? r->layer_stride_bytes : slice;
+                        const size_t level_offset = r->in_mip_tail
+                            ? 0u : r->layer_mip_offset_bytes;
+                        if (!slice || layer_stride > SIZE_MAX / (r->depth - 1u) ||
+                            level_offset > SIZE_MAX - layer_stride * (r->depth - 1u) ||
+                            slice > SIZE_MAX -
+                                (layer_stride * (r->depth - 1u) + level_offset)) {
+                            skip_image(r, "sampled array backing size overflows"); break;
+                        }
+                        sampled_guest_need =
+                            layer_stride * (r->depth - 1u) + level_offset + slice;
                     } else {
                         sampled_guest_need = r->tile_mode
                             ? tiled_surface_bytes(r->width, r->height, r->tile_mode, 0, bpt)
@@ -2704,7 +2823,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
                 if (!sampled_guest_need || sampled_guest_need > kMaxComputeImageBytes ||
                     sampled_guest_need > UINT32_MAX) {
-                    skip_image(r, "sampled backing exceeds the 256 MiB backend bound"); break;
+                    skip_image(r, "sampled backing exceeds the 512 MiB backend bound"); break;
                 }
                 if (sampled_bpb && dim_2d_array) {
                     skip_image(r, "block-compressed sampled arrays deferred"); break;
@@ -2738,6 +2857,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         r->width, r->height, r->depth,
                         static_cast<uint32_t>(r->format), sampled_components,
                         r->tile_mode, r->img_dim, r->linear_row_pitch_bytes,
+                        r->layer_stride_bytes, r->layer_mip_offset_bytes,
                         r->mip_tail_offset, r->mip_tail_bytes,
                         r->mip_tail_x, r->mip_tail_y,
                         static_cast<uint32_t>(image_format), bi.storage, r->in_mip_tail,
@@ -2807,15 +2927,39 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     ? 4u : (size_t)cb * nc;
                 const size_t texels = (size_t)volume_texels;
                 const uint64_t linear_guest_bytes = static_cast<uint64_t>(texels) * guest_texel;
-                const size_t guest_bytes = r->tile_mode
-                    ? (r->depth > 1
+                size_t guest_bytes = r->tile_mode
+                    ? (dim_3d && r->depth > 1
                            ? tiled_volume_bytes(r->width, r->height, r->depth, r->tile_mode,
                                                 static_cast<uint32_t>(guest_texel))
                            : tiled_surface_bytes(r->width, r->height, r->tile_mode, 0,
                                                  static_cast<uint32_t>(guest_texel)))
                     : static_cast<size_t>(linear_guest_bytes);
+                size_t array_slice_bytes = 0;
+                if (dim_2d_array && r->depth > 1) {
+                    array_slice_bytes = r->in_mip_tail
+                        ? r->mip_tail_bytes
+                        : (r->tile_mode
+                               ? tiled_surface_bytes(r->width, r->height, r->tile_mode, 0,
+                                                     static_cast<uint32_t>(guest_texel))
+                               : (r->layer_stride_bytes
+                                      ? linear_array_surface_bytes(
+                                            *r, static_cast<uint32_t>(guest_texel))
+                                      : static_cast<size_t>(r->width) * r->height * guest_texel));
+                    const size_t layer_stride = r->layer_stride_bytes
+                        ? r->layer_stride_bytes : array_slice_bytes;
+                    const size_t level_offset = r->in_mip_tail
+                        ? 0u : r->layer_mip_offset_bytes;
+                    if (!array_slice_bytes || layer_stride > SIZE_MAX / (r->depth - 1u) ||
+                        level_offset > SIZE_MAX - layer_stride * (r->depth - 1u) ||
+                        array_slice_bytes > SIZE_MAX -
+                            (layer_stride * (r->depth - 1u) + level_offset)) {
+                        skip_image(r, "storage array backing size overflows"); break;
+                    }
+                    guest_bytes = layer_stride * (r->depth - 1u) + level_offset + array_slice_bytes;
+                }
                 if (!linear_guest_bytes || linear_guest_bytes > SIZE_MAX || !guest_bytes ||
-                    guest_bytes > UINT32_MAX || (!r->tile_mode && guest_bytes > r->size)) {
+                    guest_bytes > UINT32_MAX ||
+                    (!r->tile_mode && !r->layer_stride_bytes && guest_bytes > r->size)) {
                     skip_image(r, "storage backing size is invalid"); break;
                 }
                 bi.guest_bytes = guest_bytes;
@@ -2846,6 +2990,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         r->width, r->height, r->depth,
                         static_cast<uint32_t>(r->format), sampled_components,
                         r->tile_mode, r->img_dim, r->linear_row_pitch_bytes,
+                        r->layer_stride_bytes, r->layer_mip_offset_bytes,
                         r->mip_tail_offset, r->mip_tail_bytes,
                         r->mip_tail_x, r->mip_tail_y,
                         static_cast<uint32_t>(image_format), bi.storage, r->in_mip_tail,
@@ -2864,7 +3009,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const size_t linear_size = bi.seed_skip
                     ? size_t{0} : static_cast<size_t>(linear_guest_bytes);
                 std::unique_ptr<uint8_t[]> linear;
-                if (linear_size && !renderer_owned && r->tile_mode)
+                if (linear_size && !renderer_owned &&
+                    (r->tile_mode || (dim_2d_array && r->depth > 1)))
                     linear = std::make_unique_for_overwrite<uint8_t[]>(linear_size);
                 const uint8_t* unpack_source = nullptr;
                 if (bi.seed_skip) {
@@ -2882,11 +3028,43 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      live_target.format == LiveTargetPixelFormat::Rgba16Float
                                          ? "rgba16f" : "rgba8");
                     }
-                } else if (r->tile_mode && r->depth > 1) {
+                } else if (r->tile_mode && dim_3d && r->depth > 1) {
                     if (trace) bi.before_hash = fnv1a(src, guest_bytes);
                     if (!detile_volume(linear.get(), src, guest_bytes, r->width, r->height,
                                        r->depth, r->tile_mode, static_cast<uint32_t>(guest_texel))) {
                         skip_image(r, "storage volume detile failed"); break;
+                    }
+                    unpack_source = linear.get();
+                } else if (dim_2d_array && r->depth > 1) {
+                    if (trace) bi.before_hash = fnv1a(src, guest_bytes);
+                    const size_t linear_slice = static_cast<size_t>(r->width) * r->height * guest_texel;
+                    const size_t layer_stride = r->layer_stride_bytes
+                        ? r->layer_stride_bytes : array_slice_bytes;
+                    for (uint32_t layer = 0; layer < r->depth; ++layer) {
+                        const uint8_t* layer_base = src + layer_stride * layer;
+                        if (!r->tile_mode) {
+                            const size_t row_pitch = r->layer_stride_bytes
+                                ? linear_array_row_pitch(
+                                      *r, static_cast<uint32_t>(guest_texel))
+                                : static_cast<size_t>(r->width) * guest_texel;
+                            for (uint32_t y = 0; y < r->height; ++y)
+                                std::memcpy(
+                                    linear.get() + linear_slice * layer +
+                                        static_cast<size_t>(y) * r->width * guest_texel,
+                                    layer_base + r->layer_mip_offset_bytes + y * row_pitch,
+                                    static_cast<size_t>(r->width) * guest_texel);
+                        } else if (r->in_mip_tail) {
+                            detile_surface_level(
+                                linear.get() + linear_slice * layer, layer_base,
+                                r->mip_tail_bytes, r->width, r->height, r->tile_mode,
+                                static_cast<uint32_t>(guest_texel), r->mip_tail_x, r->mip_tail_y);
+                        } else {
+                            detile_surface(
+                                linear.get() + linear_slice * layer,
+                                layer_base + r->layer_mip_offset_bytes,
+                                r->width, r->height, r->tile_mode, 0,
+                                static_cast<uint32_t>(guest_texel));
+                        }
                     }
                     unpack_source = linear.get();
                 } else if (r->tile_mode && r->in_mip_tail) {
@@ -3113,17 +3291,33 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             skip_image(r, "block-compressed sampled arrays deferred"); break;
                         }
                         std::unique_ptr<uint8_t[]> linear;
-                        const uint8_t* decode_source = src;
-                        if (r->tile_mode) {
+                        const size_t level_offset = cube_face_as_2d &&
+                                r->layer_stride_bytes && !r->in_mip_tail
+                            ? r->layer_mip_offset_bytes : 0u;
+                        const uint8_t* selected = src + level_offset;
+                        const size_t selected_bytes = need - level_offset;
+                        const bool remap = r->tile_mode ||
+                            (cube_face_as_2d && r->layer_stride_bytes);
+                        const uint8_t* decode_source = selected;
+                        if (remap) {
                             linear = std::make_unique_for_overwrite<uint8_t[]>((size_t)bw * bh * bpb);
                             decode_source = linear.get();
                         }
                         if (r->tile_mode && r->in_mip_tail)
-                            detile_elements_level(linear.get(), src, need, bw, bh, bpb,
+                            detile_elements_level(linear.get(), selected, selected_bytes,
+                                                  bw, bh, bpb,
                                                   r->tile_mode, r->mip_tail_x,
                                                   r->mip_tail_y);
                         else if (r->tile_mode)
-                            detile_elements(linear.get(), src, need, bw, bh, bpb, r->tile_mode);
+                            detile_elements(linear.get(), selected, selected_bytes,
+                                            bw, bh, bpb, r->tile_mode);
+                        else if (cube_face_as_2d && r->layer_stride_bytes) {
+                            const size_t row_pitch = linear_sampled_row_pitch(bw, bpb);
+                            for (uint32_t y = 0; y < bh; ++y)
+                                std::memcpy(linear.get() + static_cast<size_t>(y) * bw * bpb,
+                                            selected + static_cast<size_t>(y) * row_pitch,
+                                            static_cast<size_t>(bw) * bpb);
+                        }
                         if (!bc_decode_surface(upload, decode_source, (size_t)bw * bh * bpb,
                                                r->width, r->height, r->format)) {
                             skip_image(r, "BC decode unsupported"); break; }
@@ -3132,24 +3326,79 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         const size_t linear_bytes = static_cast<size_t>(volume_texels) * bpt;
                         std::unique_ptr<uint8_t[]> linear;
                         const uint8_t* sampled_source = src;
-                        if (r->tile_mode) {
+                        const bool remap = r->tile_mode ||
+                            (cube_face_as_2d && r->layer_stride_bytes) ||
+                            (dim_2d_array && r->depth > 1);
+                        if (remap) {
                             linear = std::make_unique_for_overwrite<uint8_t[]>(linear_bytes);
                             sampled_source = linear.get();
                         }
-                        if (r->tile_mode && dim_3d && r->depth > 1) {
+                        if (cube_face_as_2d && r->layer_stride_bytes) {
+                            const size_t level_offset = r->in_mip_tail
+                                ? 0u : r->layer_mip_offset_bytes;
+                            const uint8_t* selected = src + level_offset;
+                            const size_t selected_bytes = need - level_offset;
+                            if (r->tile_mode && r->in_mip_tail) {
+                                detile_surface_level(
+                                    linear.get(), selected, selected_bytes,
+                                    r->width, r->height, r->tile_mode, bpt,
+                                    r->mip_tail_x, r->mip_tail_y);
+                            } else if (r->tile_mode) {
+                                detile_surface(
+                                    linear.get(), selected, r->width, r->height,
+                                    r->tile_mode, 0, bpt);
+                            } else {
+                                const size_t row_pitch = r->linear_row_pitch_bytes
+                                    ? linear_array_row_pitch(*r, bpt)
+                                    : static_cast<size_t>(r->width) * bpt;
+                                for (uint32_t y = 0; y < r->height; ++y)
+                                    std::memcpy(
+                                        linear.get() + static_cast<size_t>(y) * r->width * bpt,
+                                        selected + static_cast<size_t>(y) * row_pitch,
+                                        static_cast<size_t>(r->width) * bpt);
+                            }
+                        } else if (r->tile_mode && dim_3d && r->depth > 1) {
                             if (!detile_volume(linear.get(), src, need,
                                                r->width, r->height, r->depth,
                                                r->tile_mode, bpt)) {
                                 skip_image(r, "sampled volume detile failed"); break;
                             }
-                        } else if (r->tile_mode && dim_2d_array) {
-                            const size_t tiled_slice = tiled_surface_bytes(
-                                r->width, r->height, r->tile_mode, 0, bpt);
+                        } else if (dim_2d_array && r->depth > 1) {
+                            const size_t selected_slice = r->in_mip_tail
+                                ? r->mip_tail_bytes
+                                : (r->tile_mode
+                                       ? tiled_surface_bytes(
+                                             r->width, r->height, r->tile_mode, 0, bpt)
+                                       : (r->layer_stride_bytes
+                                              ? linear_array_surface_bytes(*r, bpt)
+                                              : static_cast<size_t>(r->width) * r->height * bpt));
+                            const size_t layer_stride = r->layer_stride_bytes
+                                ? r->layer_stride_bytes : selected_slice;
                             const size_t linear_slice = static_cast<size_t>(r->width) * r->height * bpt;
-                            for (uint32_t layer = 0; layer < r->depth; ++layer)
-                                detile_surface(linear.get() + linear_slice * layer,
-                                               src + tiled_slice * layer,
-                                               r->width, r->height, r->tile_mode, 0, bpt);
+                            for (uint32_t layer = 0; layer < r->depth; ++layer) {
+                                const uint8_t* layer_base = src + layer_stride * layer;
+                                if (!r->tile_mode) {
+                                    const size_t row_pitch = r->layer_stride_bytes
+                                        ? linear_array_row_pitch(*r, bpt)
+                                        : static_cast<size_t>(r->width) * bpt;
+                                    for (uint32_t y = 0; y < r->height; ++y)
+                                        std::memcpy(
+                                            linear.get() + linear_slice * layer +
+                                                static_cast<size_t>(y) * r->width * bpt,
+                                            layer_base + r->layer_mip_offset_bytes + y * row_pitch,
+                                            static_cast<size_t>(r->width) * bpt);
+                                } else if (r->in_mip_tail) {
+                                    detile_surface_level(
+                                        linear.get() + linear_slice * layer, layer_base,
+                                        r->mip_tail_bytes, r->width, r->height,
+                                        r->tile_mode, bpt, r->mip_tail_x, r->mip_tail_y);
+                                } else {
+                                    detile_surface(
+                                        linear.get() + linear_slice * layer,
+                                        layer_base + r->layer_mip_offset_bytes,
+                                        r->width, r->height, r->tile_mode, 0, bpt);
+                                }
+                            }
                         } else if (r->tile_mode && r->in_mip_tail) {
                             detile_surface_level(linear.get(), src, need, r->width, r->height,
                                                  r->tile_mode, bpt, r->mip_tail_x,
@@ -3206,10 +3455,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
             ici.imageType = dim_1d ? VK_IMAGE_TYPE_1D : (dim_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D);
             ici.format = image_format;
-            ici.extent = {r->width, r->height, r->depth};
+            ici.extent = {r->width, r->height, dim_3d ? bi.texel_depth : 1u};
             ici.mipLevels = 1;
-            if (dim_2d_array) ici.extent.depth = 1;
-            ici.arrayLayers = dim_2d_array ? r->depth : 1;
+            ici.arrayLayers = bi.array_layers;
             ici.samples = VK_SAMPLE_COUNT_1_BIT;
             ici.tiling = VK_IMAGE_TILING_OPTIMAL;
             ici.usage = (bi.storage ? (VK_IMAGE_USAGE_STORAGE_BIT |
@@ -3518,7 +3766,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 to_general.srcQueueFamilyIndex = to_general.dstQueueFamilyIndex =
                     VK_QUEUE_FAMILY_IGNORED;
                 to_general.image = bi.image;
-                to_general.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                to_general.subresourceRange = {
+                    VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, bi.array_layers};
                 vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
                                      1, &to_general);
@@ -3532,17 +3781,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             to_dst.srcQueueFamilyIndex = to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             to_dst.image = bi.image;
-            const bool array_depth = r->img_dim == 5 && r->depth_compare;
             const VkImageAspectFlags aspect = r->depth_compare
                 ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-            to_dst.subresourceRange = {aspect, 0, 1, 0, array_depth ? r->depth : 1u};
+            to_dst.subresourceRange = {aspect, 0, 1, 0, bi.array_layers};
             vkCmdPipelineBarrier(command,
                                  bi.persistent ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
                                                : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_dst);
             VkBufferImageCopy region{};
-            region.imageSubresource = {aspect, 0, 0, array_depth ? r->depth : 1u};
-            region.imageExtent = {r->width, r->height, array_depth ? 1u : r->depth};
+            region.imageSubresource = {aspect, 0, 0, bi.array_layers};
+            region.imageExtent = {r->width, r->height,
+                                  bi.array_layers > 1 ? 1u : bi.texel_depth};
             vkCmdCopyBufferToImage(command, staging[i], bi.image,
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
             VkImageMemoryBarrier to_general = to_dst;
@@ -3600,12 +3849,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             to_src.srcQueueFamilyIndex = to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             to_src.image = bi.image;
-            to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            to_src.subresourceRange = {
+                VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, bi.array_layers};
             vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_src);
             VkBufferImageCopy region{};
-            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            region.imageExtent = {r->width, r->height, r->depth};
+            region.imageSubresource = {
+                VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, bi.array_layers};
+            region.imageExtent = {r->width, r->height,
+                                  bi.array_layers > 1 ? 1u : bi.texel_depth};
             vkCmdCopyImageToBuffer(command, bi.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                    staging[i], 1, &region);
             if (bi.cache_candidate || bi.persistent) {
@@ -3748,12 +4000,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const size_t texels = (size_t)r->width * r->height * r->depth;
             const size_t linear_bytes = texels * guest_texel;
             uint8_t* destination = resource_bytes_for(r, bi.guest_bytes);
+            const bool array_image = backend_uses_2d_array(*r);
             if (!r->host_data && r->gpu_addr)
                 prosper::host::guest_write_watch_notify_host_write(
                     r->gpu_addr, bi.guest_bytes);
             std::unique_ptr<uint8_t[]> linear;
             uint8_t* packed = destination;
-            if (r->tile_mode) {
+            if (r->tile_mode || (array_image && r->depth > 1)) {
                 linear = std::make_unique_for_overwrite<uint8_t[]>(linear_bytes);
                 packed = linear.get();
             }
@@ -3861,12 +4114,52 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     std::fprintf(stderr, "[compute] pack-verify first mismatch texel=%zu\n",
                                  first_bad);
             }
-            if (r->tile_mode && r->depth > 1) {
+            if (r->tile_mode && r->img_dim == 2 && r->depth > 1) {
                 if (!tile_volume(destination, bi.guest_bytes, packed, r->width, r->height,
                                  r->depth, r->tile_mode, static_cast<uint32_t>(guest_texel))) {
                     readback_ok = false;
                     ctx.unmap_memory(staging_memory[i]);
                     break;
+                }
+            } else if (array_image && r->depth > 1) {
+                const size_t linear_slice = static_cast<size_t>(r->width) * r->height * guest_texel;
+                const size_t selected_slice = r->in_mip_tail
+                    ? r->mip_tail_bytes
+                    : (r->tile_mode
+                           ? tiled_surface_bytes(r->width, r->height, r->tile_mode, 0,
+                                                 static_cast<uint32_t>(guest_texel))
+                           : (r->layer_stride_bytes
+                                  ? linear_array_surface_bytes(
+                                        *r, static_cast<uint32_t>(guest_texel))
+                                  : linear_slice));
+                const size_t layer_stride = r->layer_stride_bytes
+                    ? r->layer_stride_bytes : selected_slice;
+                for (uint32_t layer = 0; layer < r->depth; ++layer) {
+                    uint8_t* layer_base = destination + layer_stride * layer;
+                    if (!r->tile_mode) {
+                        const size_t row_pitch = r->layer_stride_bytes
+                            ? linear_array_row_pitch(
+                                  *r, static_cast<uint32_t>(guest_texel))
+                            : static_cast<size_t>(r->width) * guest_texel;
+                        for (uint32_t y = 0; y < r->height; ++y)
+                            std::memcpy(
+                                layer_base + r->layer_mip_offset_bytes + y * row_pitch,
+                                packed + linear_slice * layer +
+                                    static_cast<size_t>(y) * r->width * guest_texel,
+                                static_cast<size_t>(r->width) * guest_texel);
+                    } else if (r->in_mip_tail) {
+                        tile_surface_level(
+                            layer_base, r->mip_tail_bytes,
+                            packed + linear_slice * layer,
+                            r->width, r->height, r->tile_mode,
+                            static_cast<uint32_t>(guest_texel), r->mip_tail_x, r->mip_tail_y);
+                    } else {
+                        tile_surface(
+                            layer_base + r->layer_mip_offset_bytes,
+                            packed + linear_slice * layer,
+                            r->width, r->height, r->tile_mode, 0,
+                            static_cast<uint32_t>(guest_texel));
+                    }
                 }
             } else if (r->tile_mode && r->in_mip_tail) {
                 tile_surface_level(destination, bi.guest_bytes, packed,
