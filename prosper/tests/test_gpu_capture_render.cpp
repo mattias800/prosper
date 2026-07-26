@@ -829,6 +829,9 @@ int main() {
     // that scene run 1.4-3.0 MiB, and the draw that straddled the clamp lost precisely the vertices
     // whose offset exceeded it, so these sizes are the measured contract, not round numbers.
     {
+        // buffer_upload_bytes caches the override in a function-local static, so an exported
+        // PROSPER_MAX_BUFFER_UPLOAD_MB (the A/B shell) would otherwise fail these checks.
+        unset_env("PROSPER_MAX_BUFFER_UPLOAD_MB");
         using prosper::frontend::buffer_upload_bytes;
         CHECK(buffer_upload_bytes(454024u) == 454024u,
               "a sub-megabyte vertex stream uploads whole (unchanged behavior)");

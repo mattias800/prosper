@@ -15,8 +15,10 @@ namespace prosper::frontend {
 // descriptor declares `declared_bytes`. A vertex fetch may index anywhere inside the declared range,
 // so anything clamped away reads as zeros in the shader and collapses geometry to a point — the
 // #1427 failure, where a 1 MiB clamp erased 44 of 248 Blue Prince hall draws with no diagnostic.
-// The result is dword-aligned and bounded only by a ceiling far above real content; exceeding that
-// ceiling is reported by the caller rather than silently dropped.
+// The result is dword-aligned and bounded by a ceiling far above real content, which
+// PROSPER_MAX_BUFFER_UPLOAD_MB (1..64) may lower for a same-build A/B of the #1427 collapse. Any
+// short upload — from that ceiling or the override — is reported by the caller rather than
+// silently dropped; only the sub-dword alignment remainder is dropped without a report.
 uint32_t buffer_upload_bytes(uint32_t declared_bytes);
 
 // Register the live renderer. `frame_dir` is where periodic BMP screenshots are written; pass

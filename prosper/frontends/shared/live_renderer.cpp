@@ -52,10 +52,12 @@ namespace prosper::frontend {
 // this the composite samples zeros and the frame is black. We cache each submit's rendered pixels under
 // its render-target base and inject them when a subsequent draw samples a texture at a matching base.
 namespace {
-// Ceiling on a single non-texture (vertex/index/storage/constant) buffer upload, matching the
-// sampled-image ceiling used further down. A guest descriptor legitimately declares multi-megabyte
-// vertex streams; anything clamped away reads as zeros in the shader, so this bound must stay far
-// above real content and any clamp must be reported (#1427).
+// Default ceiling on a single non-texture (vertex/index/storage/constant) buffer upload. This is
+// not borrowed from any other path — it exists only to bound a corrupt descriptor, and it is sized
+// against what a 64 MiB read already costs elsewhere (~16K guest_readable page probes). A guest
+// descriptor legitimately declares multi-megabyte vertex streams, and anything clamped away reads
+// as zeros in the shader and collapses geometry, so the bound stays far above real content and any
+// short upload is reported (#1427). PROSPER_MAX_BUFFER_UPLOAD_MB can lower it for an A/B.
 constexpr uint32_t kMaxBufferUploadBytes = 64u << 20;
 
 struct RttSurf {
