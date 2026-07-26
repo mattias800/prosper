@@ -20,6 +20,8 @@ Inspection reports each descriptor's declared size, capture-planned footprint, a
 count separately, so a thin capsule can still expose a pathological range. Capture v28+ retains the exact
 planned span and reports the resolved `row-pitch` for linear sampled images; older captures derive the
 guest pitch while retaining their historical tight byte span.
+The `vs=` and `fs=` summaries identify whether each recompiled shader is retained as `owned` or
+`shared`; their size and hash always describe the accessor-selected words the renderer consumes.
 
 Build from `prosper/`, using the worktree-local Linux build:
 

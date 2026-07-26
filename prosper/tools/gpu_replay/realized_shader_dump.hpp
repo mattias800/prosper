@@ -14,6 +14,17 @@ struct RealizedShaderSelector {
     bool vertex = false;
 };
 
+struct RecompiledShaderView {
+    const std::vector<uint32_t>* words = nullptr;
+    bool shared = false;
+};
+
+inline RecompiledShaderView recompiled_shader_view(const gpu::DrawItem& draw,
+                                                    bool vertex) {
+    return vertex ? RecompiledShaderView{&draw.vs_words(), static_cast<bool>(draw.vs_shared)}
+                  : RecompiledShaderView{&draw.fs_words(), static_cast<bool>(draw.fs_shared)};
+}
+
 inline size_t replay_item_index_for_draw(const gpu::GpuReplayFrame& replay,
                                          uint64_t draw_index) {
     for (size_t item_index = 0; item_index < replay.items.size(); ++item_index)
@@ -49,6 +60,25 @@ inline bool parse_realized_shader_selector(const std::string& spec,
     selector.draw_index = static_cast<uint64_t>(draw);
     selector.vertex = stage == "vs";
     return true;
+}
+
+inline const std::vector<uint32_t>* select_recompiled_shader(
+    const gpu::GpuReplayFrame& replay, const std::string& spec, bool& shared,
+    std::string& error) {
+    RealizedShaderSelector selector;
+    if (!parse_realized_shader_selector(spec, selector)) {
+        error = "invalid shader selector " + spec;
+        return nullptr;
+    }
+    const size_t item_index = replay_item_index_for_draw(replay, selector.draw_index);
+    if (item_index == SIZE_MAX) {
+        error = "realized draw " + std::to_string(selector.draw_index) + " not found";
+        return nullptr;
+    }
+    const auto selection = recompiled_shader_view(replay.items[item_index], selector.vertex);
+    shared = selection.shared;
+    error.clear();
+    return selection.words;
 }
 
 inline const gpu::GpuCaptureRawShaderVersion* select_realized_raw_shader(
