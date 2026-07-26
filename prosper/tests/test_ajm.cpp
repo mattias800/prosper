@@ -83,9 +83,14 @@ int main() {
     CHECK(init(0, 0, 0, 0, 0, 0) == kInvalidParameter, "Initialize(NULL out) -> INVALID_PARAMETER");
     CHECK(init(0, 1, 0, 0, 0, 0) == kInvalidParameter,
           "Initialize(inaccessible out) -> INVALID_PARAMETER without host fault");
+    uint32_t ps5_ctx = 0xBEEF;
+    CHECK(init(0x200000000ull, (uint64_t)(uintptr_t)&ps5_ctx, 0, 0, 0, 0) == 0,
+          "Initialize(PS5 config) -> OK");
+    CHECK(ps5_ctx != 0 && ps5_ctx != 0xBEEF,
+          "Initialize(PS5 config) writes a valid non-zero context");
     uint32_t rejected_ctx = 0xCAFE;
     CHECK(init(1, (uint64_t)(uintptr_t)&rejected_ctx, 0, 0, 0, 0) == kInvalidParameter,
-          "Initialize(nonzero reserved) -> INVALID_PARAMETER");
+          "Initialize(unknown config) -> INVALID_PARAMETER");
     CHECK(rejected_ctx == 0xCAFE, "invalid Initialize leaves the context output untouched");
 
     // ModuleRegister needs a context.
