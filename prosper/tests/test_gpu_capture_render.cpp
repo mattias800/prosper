@@ -821,6 +821,36 @@ int main() {
               "oversized registered scanout still publishes its rendered pixels");
     }
 
+    // #1427: a buffer binding must upload its whole declared range. A vertex fetch indexes anywhere
+    // inside the descriptor, so a silently clamped upload makes every element past the clamp read
+    // ZEROS — those vertices then transform to one clip point and the primitive dies as degenerate,
+    // with no reject and no log. The old 1 MiB clamp did exactly that to 44 of 248 Blue Prince
+    // entrance-hall draws (the tile floor, the far table, most of the room). Real vertex streams in
+    // that scene run 1.4-3.0 MiB, and the draw that straddled the clamp lost precisely the vertices
+    // whose offset exceeded it, so these sizes are the measured contract, not round numbers.
+    {
+        // buffer_upload_bytes caches the override in a function-local static, so an exported
+        // PROSPER_MAX_BUFFER_UPLOAD_MB (the A/B shell) would otherwise fail these checks.
+        unset_env("PROSPER_MAX_BUFFER_UPLOAD_MB");
+        using prosper::frontend::buffer_upload_bytes;
+        CHECK(buffer_upload_bytes(454024u) == 454024u,
+              "a sub-megabyte vertex stream uploads whole (unchanged behavior)");
+        CHECK(buffer_upload_bytes(1662044u) == 1662044u,
+              "the 1.66 MiB stream that straddled the old clamp uploads whole (#1427)");
+        CHECK(buffer_upload_bytes(2598440u) == 2598440u,
+              "the 2.48 MiB stream that collapsed to one clip point uploads whole (#1427)");
+        CHECK(buffer_upload_bytes(1u << 20) == (1u << 20),
+              "the old clamp value itself is not a boundary any more");
+        CHECK((buffer_upload_bytes(4098u) & 3u) == 0u &&
+              buffer_upload_bytes(4098u) == 4096u,
+              "uploads stay dword-aligned by truncation");
+        CHECK(buffer_upload_bytes(0u) == 0u, "a zero declaration uploads nothing");
+        // The ceiling still exists as a bound on a pathological descriptor; the caller reports any
+        // binding that reaches it ([buffer-truncated]) instead of dropping the range in silence.
+        CHECK(buffer_upload_bytes(0xFFFFFFFCu) == (64u << 20),
+              "an absurd declaration is still bounded by the 64 MiB ceiling");
+    }
+
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n"); return 0;
 }

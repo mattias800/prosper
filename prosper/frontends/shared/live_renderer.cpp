@@ -52,6 +52,14 @@ namespace prosper::frontend {
 // this the composite samples zeros and the frame is black. We cache each submit's rendered pixels under
 // its render-target base and inject them when a subsequent draw samples a texture at a matching base.
 namespace {
+// Default ceiling on a single non-texture (vertex/index/storage/constant) buffer upload. This is
+// not borrowed from any other path — it exists only to bound a corrupt descriptor, and it is sized
+// against what a 64 MiB read already costs elsewhere (~16K guest_readable page probes). A guest
+// descriptor legitimately declares multi-megabyte vertex streams, and anything clamped away reads
+// as zeros in the shader and collapses geometry, so the bound stays far above real content and any
+// short upload is reported (#1427). PROSPER_MAX_BUFFER_UPLOAD_MB can lower it for an A/B.
+constexpr uint32_t kMaxBufferUploadBytes = 64u << 20;
+
 struct RttSurf {
     std::shared_ptr<const std::vector<uint8_t>> rgba;
     uint32_t w = 0, h = 0;
@@ -252,6 +260,19 @@ struct PersistentDecodedTexture {
 
     size_t bytes() const { return source_prefix.size() + pixels.size(); }
 };
+}
+
+uint32_t buffer_upload_bytes(uint32_t declared_bytes) {
+    // PROSPER_MAX_BUFFER_UPLOAD_MB=N lowers the ceiling (1..64 MiB) so one build can reproduce the
+    // #1427 collapse and its fix back to back; unset/invalid keeps the full ceiling.
+    static const uint32_t ceiling = [] {
+        const char* value = getenv("PROSPER_MAX_BUFFER_UPLOAD_MB");
+        if (!value || !*value) return kMaxBufferUploadBytes;
+        const unsigned long megabytes = strtoul(value, nullptr, 10);
+        if (megabytes < 1 || megabytes > 64) return kMaxBufferUploadBytes;
+        return static_cast<uint32_t>(megabytes) << 20;
+    }();
+    return std::min(declared_bytes, ceiling) & ~3u;
 }
 
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
@@ -2272,7 +2293,31 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         if (getenv("PROSPER_ALPHA1")) fr.swizzle[3] = 1;
                     } else {
                         fr.buffer_identity = r.gpu_addr;
-                        uint32_t nb = std::min(r.size ? r.size : 256u, 1u << 20) & ~3u;   // cap 1 MB, dword-aligned
+                        // #1427: the guest's declared V#/V-buffer size is the real requirement — a
+                        // vertex fetch indexes anywhere inside it. The old 1 MiB clamp silently
+                        // truncated larger buffers, so every element past the cap read ZEROS: those
+                        // vertices all transformed to the same clip point (the MVP translation
+                        // column) and the primitive died as degenerate, with no reject and no log.
+                        // On Blue Prince's entrance hall that erased 44 of 248 scene draws —
+                        // the tile floor, the far table, most of the room — and read as a shading
+                        // defect for weeks. Upload the declared range under a ceiling that exists
+                        // only to bound a corrupt descriptor (a 64 MiB read also costs ~16K
+                        // guest_readable page probes, so it must stay bounded), and make any
+                        // truncation that does happen FAIL-VISIBLE. PROSPER_MAX_BUFFER_UPLOAD_MB
+                        // lowers the ceiling for a same-build A/B of this exact defect.
+                        const uint32_t requested_bytes = r.size ? r.size : 256u;
+                        uint32_t nb = prosper::frontend::buffer_upload_bytes(requested_bytes);
+                        if (nb < (requested_bytes & ~3u)) {
+                            static std::set<uint64_t> truncated_reported;
+                            if (truncated_reported.size() < 32 &&
+                                truncated_reported.insert(r.gpu_addr).second)
+                                fprintf(stderr,
+                                        "[buffer-truncated] set=%u binding=%u addr=%llx declared=%u "
+                                        "uploaded=%u — fetches past the uploaded range read zeros and "
+                                        "collapse geometry (#1427)\n",
+                                        set, r.binding, (unsigned long long)r.gpu_addr,
+                                        requested_bytes, nb);
+                        }
                         if (use_direct_buffer_views && nb >= 4) {
                             if (const uint8_t* source = direct_resource(r.gpu_addr, nb)) {
                                 fr.dwords_view = reinterpret_cast<const uint32_t*>(source);
@@ -2403,7 +2448,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     replacement.set = set; replacement.binding = d.binding;
                     if (wants_buffer) {
                         size_t words = static_cast<size_t>((std::max<uint64_t>(d.required_bytes, 16) + 3) / 4);
-                        words = std::min<size_t>(words, 1u << 18); // same 1 MiB upload ceiling as build_R
+                        // Poison replacements stay deliberately small: this is a diagnostic
+                        // substitute for an invalid binding, not a real upload, so it does not
+                        // follow build_R's ceiling (which is now the declared range, #1427).
+                        words = std::min<size_t>(words, 1u << 18);
                         replacement.dwords.assign(words, 0x7FC0CDCDu);
                     } else {
                         replacement.tex_rgba = poison_tex; replacement.tw = 2; replacement.th = 2;

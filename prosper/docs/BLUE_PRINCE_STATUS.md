@@ -48,10 +48,16 @@ The `blue-prince-title` snapshot route guards the title screen.
   without a `[dbbase-clobber]` event; the quiet run produced 76/76 captures with 76 distinct source
   frames.
 
-## Defect families (#1287) — families 1–3 RESOLVED 2026-07-26
+- **#1427/#1429** — the silent 1 MiB buffer-upload clamp that erased 44 of 248 entrance-hall
+  draws (see family 5). Uploads now follow the descriptor's declared range; any short upload is
+  reported (`[buffer-truncated]`), and `PROSPER_MAX_BUFFER_UPLOAD_MB=N` lowers the ceiling so one
+  build reproduces the collapse and the fix back to back.
 
-Families 1–3 below are **fixed on master**; they are retained as the resolution record so the
-evidence is not re-chased. Family 4 and the new slab item remain open.
+## Defect families (#1287) — families 1–3 and 5 RESOLVED 2026-07-26
+
+Families 1–3 and 5 below are **fixed on master**; they are retained as the resolution record so
+the evidence is not re-chased. Only family 4 remains open, plus the two #1427 remainders tracked
+in #1435 (a ctest-resident truncation guard, and triage of the 27 still-vanished hall draws).
 
 1. **RESOLVED — concentric ring/band moiré** radiating from lights. It was never
    light-accumulation math: the ring structure was the *palette/material atlas* sampled through
@@ -78,14 +84,19 @@ evidence is not re-chased. Family 4 and the new slab item remain open.
    a plain linear clamp — which reads as magenta. The resolve now GPU-copies into the destination.
 4. **OPEN — floating black rectangles** at wall-lamp positions; **RGB-noise ball** center-hall.
    Untriaged.
-5. **OPEN — dark slab/plane** occluding the far room mid-right in the hall view (a large opaque
-   quad with faint vertical colour banding, hard straight edges, hanging in mid-air where the
-   oracle shows the far arch and busts). Pre-existing, not a regression from the family-1 fixes:
-   the same surface appears in pre-fix replays as a rainbow vertical stripe at the same screen
-   position. Offline bisection on `lit_frame.prgcap` places its introduction in the composite
-   between operations 1100 and 1200. Beware the prefix-extent trap when bisecting: consecutive
-   `--through-operation` prefixes can end on *different* render targets, so compare only steps
-   that resolved the same surface (`--draw-steps-target WxH`, or check the reported extent).
+5. **RESOLVED — the "dark slab" was a whole-room geometry loss** (#1427/#1429), not a misplaced
+   surface. `build_R` clamped every non-texture buffer upload to 1 MiB *in silence*; a vertex fetch
+   indexes anywhere inside its descriptor, so every element past the clamp read zeros, those
+   vertices transformed to one clip point, and their primitives died as degenerate. On this scene
+   that erased **44 of 248 draws** — the checkered tile floor, the far table with the flower pot,
+   most of the room — and what survived read as a sloped plane hovering over the missing floor.
+   Buffer size correlates exactly (454 KiB healthy; 1.45-3.0 MiB collapsed; the 1.66 MiB stream
+   that straddled the clamp lost precisely the vertices past it). Uploading the declared range
+   drops vanished draws to 27/248 and renders the hall at oracle parity
+   (`docs/screenshots/issue-1427-oracle-before-after.png`). The old bisection range recorded here
+   (operations 1100-1200) was a red herring produced by the isolated-draw depth trap — do not
+   resume it. Remaining: the 27 still-vanished draws, some plausibly legitimate off-screen culling
+   (triage tracked in #1435), and the bouquet's confetti-coloured flowers.
 
 ## Capsule & artifact inventory (`~/bp-1264/`, all run-local addresses)
 
@@ -115,6 +126,11 @@ evidence is not re-chased. Family 4 and the new slab item remain open.
 - `PROSPER_FS_TAP=DRAW:PC` on a v19+ capsule — visualize a light-FS intermediate offline; `DRAW`
   is the semantic `draw[ID]` printed by `gpu_replay --inspect-only`, not its compact `item=` offset
   (#1396 fixed the index-space confusion that made the tap silently mutate a different draw).
+- `PROSPER_DRAW_STATS=1` + `PROSPER_GEOM_PROBE=DRAW` — the pair that found #1427: draw-stats flags
+  `GEOMETRY-VANISH`, and the probe reads back post-transform clip positions
+  (`unique-pos=1 (max-mult=19236) -> COLLAPSED` is the fetch-returns-a-constant signature).
+- `PROSPER_MAX_BUFFER_UPLOAD_MB=N` (1..64) — lower the buffer-upload ceiling to reproduce a
+  truncation collapse on the same build; `[buffer-truncated]` reports every short upload.
 - `gpu_replay --recompile-raw` (#1416) — re-recompile every retained raw VS/FS with the CURRENT
   recompiler and replay: the ~5 s offline A/B that resolved family 1 against a ~8 min live route.
   Pair with `PROSPER_MIPLOG=1` (per-binding mip eligibility) and `PROSPER_BUFLOG=1` (per-binding
@@ -133,4 +149,6 @@ capture transposition, texture/descriptor decode for the Day One hold (#1287/#13
 mips/CBR/checkerboard, shadow acne, caster bias, and sampler filtering for the ring family
 (#1287 comment trail, 2026-07-25). The ring family itself is CLOSED (#1411/#1399/#1401/#1404) —
 do not reopen a light-accumulation-math hypothesis for it; if rings reappear, check the
-interpolant-resolution path first.
+interpolant-resolution path first. Likewise the "dark slab"/sloped-floor artifact is CLOSED
+(#1427) — missing geometry from a truncated buffer upload, not a misplaced or mis-transformed
+surface; if large geometry disappears again, run `PROSPER_DRAW_STATS` before any shading theory.
