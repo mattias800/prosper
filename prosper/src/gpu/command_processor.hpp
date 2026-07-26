@@ -152,7 +152,9 @@ struct GpuState {
     // TEXTURE_GRADIENT_CONTROL default write, not stale data. That is safe today (nothing reads
     // them; CONFIDENCE: MED for the virtual-register encoding itself) — but if FSR / texture-
     // gradient consumption is ever implemented, ingest for those named offsets must be re-enabled
-    // deliberately. Kept generous (64K dwords) versus the few-hundred range real packets use.
+    // deliberately. The separate 0x10000000..0x1000001f Gen5 interpolant bank is allow-listed and
+    // resolved to SPI_PS_INPUT_CNTL_0..31 before this bound. Kept generous (64K dwords) versus the
+    // few-hundred range real packets use.
     static constexpr uint32_t kRegOffsetLimit = 0x10000;
 
     // Fold one decoded command into the state. Reads register arrays via their (1:1-mapped) vaddr.
