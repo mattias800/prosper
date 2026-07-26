@@ -77,6 +77,12 @@ uint16_t float_to_half(float f) {
     return static_cast<uint16_t>(sign | (static_cast<uint32_t>(half_exponent) << 10) | rounded);
 }
 
+uint8_t unorm16_to_unorm8(uint16_t value) {
+    // Scale the complete normalized code rather than selecting either endian byte. Adding half the
+    // source denominator implements nearest rounding while preserving both endpoints exactly.
+    return static_cast<uint8_t>((static_cast<uint32_t>(value) * 255u + 32767u) / 65535u);
+}
+
 float f11_to_float(uint16_t v) {
     // 5-bit exp (bias 15) + 6-bit mantissa, unsigned. Widen the mantissa into a half's 10-bit
     // field: subnormal m/64*2^-14 == (m<<4)/1024*2^-14, normal/inf/NaN carry the exponent as-is.

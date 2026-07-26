@@ -1114,7 +1114,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         static const bool audit_cross_submit_watch =
                             getenv("PROSPER_AUDIT_CROSS_SUBMIT_TEXTURE_WRITE_WATCH") != nullptr;
                         prosper::host::GuestWriteWatch pending_source_watch;
+                        // `narrow_decode_done` prevents the generic 32-bpp detiler from touching an already
+                        // expanded narrow surface. `narrow_done` separately records the legacy coverage
+                        // broadcast whose RGBA pixels intentionally replace the T# swizzle. UNORM16 expands
+                        // to (R,0,0,1) and must retain the real descriptor swizzle, so the two facts differ.
                         bool narrow_done = false;
+                        bool narrow_decode_done = false;
                         auto reused = has_live_rtt ? decoded_textures.end()
                                                    : decoded_textures.find(decode_key);
                         DecodedTexture persistent_reuse;
@@ -1760,9 +1765,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             f16_done = true;   // read+detiled at the real element size already
                         } else if (bpt < 4) {
                             // Narrow (single/dual-channel) surface: read at the REAL element size and detile
-                            // with the matching bpe geometry (1 B -> 64x64 micro-tiles, #119), then expand
-                            // each texel to grayscale RGBA8 (replicate to R,G,B,A) so the sampling shader
-                            // reads the coverage in ANY channel it uses (.r for a font atlas, .a for a mask).
+                            // with the matching bpe geometry (1 B -> 64x64, 2 B -> 64x32 micro-tiles, #119),
+                            // then expand the first component to RGBA8. Legacy 8-bit coverage resources keep
+                            // the grayscale broadcast so shaders can read either .r or .a. A UNORM16 resource
+                            // instead receives the format-defined missing channels (R,0,0,1), after which the
+                            // real T# DST_SEL is applied below. Its R component must be normalized from both
+                            // bytes; selecting byte zero turns a smooth ramp into a repeating sawtooth (#1186).
                             std::vector<uint8_t> nlin(volume_texels * bpt, 0);
                             bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !getenv("PROSPER_NODETILE");
                             if (tiled) {
@@ -1796,12 +1804,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             } else {
                                 copy_resource(nlin.data(), r.gpu_addr, nlin.size());
                             }
+                            const bool unorm16 = r.format == prosper::gpu::DataFormat::Unorm16;
                             for (size_t t = 0; t < volume_texels; t++) {
                                 uint8_t v = nlin[t * bpt];   // first (coverage) channel
+                                if (unorm16) {
+                                    uint16_t raw;
+                                    std::memcpy(&raw, &nlin[t * bpt], sizeof(raw));
+                                    v = prosper::gpu::unorm16_to_unorm8(raw);
+                                }
                                 uint8_t* p = &texture_pixels[t * 4];
-                                p[0] = p[1] = p[2] = p[3] = v;
+                                if (unorm16) {
+                                    p[0] = v; p[1] = p[2] = 0; p[3] = 255;
+                                } else {
+                                    p[0] = p[1] = p[2] = p[3] = v;
+                                }
                             }
-                            narrow_done = true;   // already detiled+expanded; skip the 32-bpp auto-detile below
+                            narrow_decode_done = true;   // skip the generic 32-bpp detiler below
+                            narrow_done = !unorm16;      // coverage broadcast replaces swizzle; R16 does not
                         } else if (linear_padded_read) {
                             // Pitch-padded linear surface (see linear_padded_read above): read row-by-row at
                             // the 256-byte-aligned source pitch into the tight destination, dropping the
@@ -1831,7 +1850,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         bool auto_tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode);
                         const char* dt = getenv("PROSPER_DETILE");
                         // BC textures already block-detiled + decoded above; the 32-bpp detiler must not touch them.
-                        if (!rtt_hit && !cube_done && !dcc_fast_clear_done && !bcb && !narrow_done &&
+                        if (!rtt_hit && !cube_done && !dcc_fast_clear_done && !bcb && !narrow_decode_done &&
                             !f16_done && !f32_done &&
                             !getenv("PROSPER_NODETILE") &&
                             (auto_tiled || (!is_volume && dt && atoi(dt) != 0))) {
