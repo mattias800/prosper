@@ -18,7 +18,7 @@
 #include "gpu/gpu_capture.hpp"         // request_interactive_gpu_capture (F9 frame grab)
 #include "gpu/gpu_timeline.hpp"        // request_interactive_capture_bundle (F9 whole-frame grab)
 #include "present_blit.hpp"           // GPU scanout handoff: acquire/release the renderer's front image
-#include "host/lifecycle.hpp"          // prosper_request_stop / prosper_stop_requested
+#include "host/lifecycle.hpp"          // frontend-owned stop/pause gates
 #include "host/boot_program.hpp"       // boot_program (shared guest-boot path, also used by boot_trace)
 #include "host/exec_image.hpp"         // run_entry
 #include "loader/linker.hpp"           // Program
@@ -801,7 +801,7 @@ int main(int argc, char** argv) {
     prosper::input::pad_set_backend(&g_keyboard_pad);
     fprintf(stderr, "[app] keyboard: WASD/Arrows=move  J/Space=Cross(jump)  K=Square(attack)  L=Circle  "
                     "I=Triangle  U/O=L1/R1  Y/H=L2/R2  Enter=Options  "
-                    "F11/Alt+Enter=fullscreen  Esc=quit\n");
+                    "Pause/F10=pause  F11/Alt+Enter=fullscreen  Esc=quit\n");
     fprintf(stderr, "[app] F9 = grab the current frame: writes a replayable .prgbundle + a .bmp "
                     "screenshot (to PROSPER_CAPTURE_DIR, default cwd) for gpu_replay debugging "
                     "(brief hitch on press; PROSPER_CAPTURE_FRAMES>1 grabs an animation).\n");
@@ -838,6 +838,7 @@ int main(int argc, char** argv) {
     };
     bool timedDumpPending = timedDumpMs > 0;
     bool running = true;
+    bool paused = false;
     bool swapchainDirty = false;
     const SDL_WindowID appWindowId = SDL_GetWindowID(win);
     prosper::frontend::AppWindowControls windowControls;
@@ -859,6 +860,7 @@ int main(int argc, char** argv) {
                 key.pressed = ev.key.down;
                 key.repeat = ev.key.repeat;
                 key.escape = ev.key.key == SDLK_ESCAPE;
+                key.pause = ev.key.key == SDLK_PAUSE || ev.key.key == SDLK_F10;
                 key.f11 = ev.key.key == SDLK_F11;
                 key.enter = ev.key.key == SDLK_RETURN || ev.key.key == SDLK_KP_ENTER;
                 key.alt = (ev.key.mod & SDL_KMOD_ALT) != 0;
@@ -883,11 +885,31 @@ int main(int argc, char** argv) {
                 // PPSA02664 read input through sceImeUpdate, not libScePad. SDL3 scancodes ARE USB
                 // HID usage ids for the keyboard page — exactly the keycode the guest event wants.
                 // Deliver clean press/release edges (skip auto-repeat).
-                if (key.app_window && !ev.key.repeat)
+                if (key.app_window && !ev.key.repeat && !key.pause)
                     prosper::ime_push_key((uint16_t)ev.key.scancode, ev.key.down);
                 switch (windowControls.handle_key(key)) {
                 case prosper::frontend::AppWindowCommand::quit:
                     running = false;
+                    break;
+                case prosper::frontend::AppWindowCommand::toggle_pause:
+                    paused = !paused;
+                    if (paused) {
+                        // Close the producer gate before freezing queued device audio.
+                        prosper_set_paused(true);
+#ifdef PROSPER_AUDIO_SDL3
+                        prosper::set_sdl3_audio_paused(true);
+#endif
+                    } else {
+                        // Start the device before releasing producers so the first resumed grain
+                        // cannot queue behind a device that is still paused.
+#ifdef PROSPER_AUDIO_SDL3
+                        prosper::set_sdl3_audio_paused(false);
+#endif
+                        prosper_set_paused(false);
+                    }
+                    SDL_SetWindowTitle(win, paused ? (title + " — paused").c_str() : title.c_str());
+                    fprintf(stderr, "[app] %s at guest flip boundary\n",
+                            paused ? "pause requested" : "resumed");
                     break;
                 case prosper::frontend::AppWindowCommand::toggle_fullscreen: {
                     // SDL may apply fullscreen requests asynchronously. Toggle the last accepted
@@ -981,7 +1003,7 @@ int main(int argc, char** argv) {
         }
 
         static const uint32_t kPatW = 1920, kPatH = 1080;
-        if (testPattern) feed_test_pattern(kPatW, kPatH, patFrame++);
+        if (testPattern && !paused) feed_test_pattern(kPatW, kPatH, patFrame++);
 
         // Present the latest finished frame from the core's present layer.
         // The frame dimensions: from the guest's registered VideoOut display in normal use; in

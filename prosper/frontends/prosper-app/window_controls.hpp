@@ -5,6 +5,7 @@ namespace prosper::frontend {
 enum class AppWindowCommand {
     none,
     quit,
+    toggle_pause,
     toggle_fullscreen,
 };
 
@@ -13,6 +14,7 @@ struct AppWindowKey {
     bool pressed = false;
     bool repeat = false;
     bool escape = false;
+    bool pause = false;
     bool f11 = false;
     bool enter = false;
     bool alt = false;
@@ -30,6 +32,7 @@ public:
         }
         if (!key.pressed || key.repeat) return AppWindowCommand::none;
         if (key.escape) return AppWindowCommand::quit;
+        if (key.pause) return AppWindowCommand::toggle_pause;
         if (key.f11 || (key.enter && key.alt)) return AppWindowCommand::toggle_fullscreen;
         return AppWindowCommand::none;
     }

@@ -67,10 +67,12 @@ SDL3 automatically uses a connected controller as pad 0. Keyboard input is compo
 | U / O | L1 / R1 |
 | Y / H | L2 / R2 |
 | Enter | Options |
+| Pause or F10 | Pause/resume the guest and audio at a flip boundary |
 | F11 or Alt+Enter | Toggle host-window fullscreen |
 | Escape | Exit |
 
-Alt+Enter is consumed by the host window and is not forwarded as the guest Options button. Closing
+Pause/F10 is host-owned and is not forwarded to guest keyboard input. Alt+Enter is consumed by the
+host window and is not forwarded as the guest Options button. Closing
 the window also exits. Shutdown currently terminates the process after flushing logs because
 cooperative guest-thread teardown is not implemented yet.
 

@@ -1,6 +1,7 @@
 // videoout_present.cpp — see videoout_present.hpp.
 #include "videoout_present.hpp"
 #include "gpu_timeline.hpp"
+#include "host/lifecycle.hpp"
 #include <atomic>
 #include <cstring>
 #include <cstdio>
@@ -76,6 +77,11 @@ void present_flip(int buffer_index, int64_t flip_arg) {
             }
         }
     }
+
+    // The desktop app requests pause from its UI thread. Wait only after the completed flip is
+    // fully published and all local locks are gone: the app can keep presenting that last frame
+    // and pumping SDL events, while the guest resumes from an exact display boundary.
+    prosper_wait_while_paused();
 }
 
 int      present_front_index() { return videoout_front_index(); }

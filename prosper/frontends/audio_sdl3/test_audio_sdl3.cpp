@@ -5,7 +5,9 @@
 #include "../../src/hle/dispatch.hpp"
 #include "../../src/hle/nid.hpp"
 #include "../../src/hle/audio.hpp"
+#include "../../src/host/lifecycle.hpp"
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -53,6 +55,31 @@ int main() {
         CHECK(call("sceAudioOutSetVolume", (uint64_t)h, 0x3, PTR(vols)) == 0);
         CHECK(call("sceAudioOutClose", (uint64_t)h) == 0);
 
+        // A host pause freezes the device and blocks producers before they can fill its queue.
+        // Resume re-opens both gates and lets the exact pending grain complete.
+        AudioPortInfo pause_info;
+        pause_info.grain = 1;
+        AudioSink* pause_sink = audio_sink();
+        CHECK(pause_sink->open(1, pause_info));
+        int16_t pause_pcm[2] = {321, -321};
+        std::atomic<bool> pause_output_started{false};
+        std::atomic<bool> pause_output_done{false};
+        prosper_set_paused(true);
+        set_sdl3_audio_paused(true);
+        std::thread paused_output([&] {
+            pause_output_started.store(true, std::memory_order_release);
+            pause_sink->output(1, pause_pcm, 1);
+            pause_output_done.store(true, std::memory_order_release);
+        });
+        while (!pause_output_started.load(std::memory_order_acquire)) std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        CHECK(!pause_output_done.load(std::memory_order_acquire));
+        set_sdl3_audio_paused(false);
+        prosper_set_paused(false);
+        paused_output.join();
+        CHECK(pause_output_done.load(std::memory_order_acquire));
+        pause_sink->close(1);
+
         // Output and lifecycle calls can arrive from different guest audio threads. Exercise the
         // exact #855 boundary repeatedly: close/reopen must not destroy an SDL_AudioStream while
         // output() is queueing into it. Completion without a host fault is the lifetime contract;
@@ -86,6 +113,8 @@ int main() {
         shutdown_sdl3_audio_sink();
         CHECK(audio_sink() != nullptr);   // default silent sink restored
     }
+
+    prosper_reset_stop();
 
     if (fails) { printf("== FAIL: %d check(s) failed ==\n", fails); return 1; }
     printf("== PASS: SDL3 audio frontend end-to-end (dummy driver) ==\n");

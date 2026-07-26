@@ -12,6 +12,11 @@ namespace prosper {
 // could not be initialised. Safe to call once at startup after register_builtin_hle().
 bool install_sdl3_audio_sink();
 
+// Pause/resume every active stream without discarding its queued samples. The guest output side
+// also waits on the shared lifecycle gate, so no additional audio accumulates during a host pause.
+// No-op when the SDL3 sink is not installed.
+void set_sdl3_audio_paused(bool paused);
+
 // Uninstall the SDL3 sink (restores the default), closing any open streams and SDL audio.
 void shutdown_sdl3_audio_sink();
 
