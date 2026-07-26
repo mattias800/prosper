@@ -1,14 +1,14 @@
 # Blue Prince (PPSA25009, Unity/IL2CPP) — status & investigation map
 
-Last revised: 2026-07-26 (the indirect-arena root-cause audit). Prior history: #1216 (closed —
+Last revised: 2026-07-26 (materials fixed — #1287 families 1-3 resolved; see below). Prior history: #1216 (closed —
 boot/blank-frame era), #1264 (Day One hold investigation), #1287 (visuals umbrella, open).
 
 ## Ladder position
 
 **Rung 3 — gameplay with real GPU draws, sustained.** The scripted fresh-save route plays the
 intro cinematic, loads Day One, walks the manor approach, opens the front door, and explores
-Mount Holly's entrance hall/vestibule with the footstep HUD advancing. Composition is not yet
-hardware-faithful (rung 4 blocked on the #1287 families below).
+Mount Holly's entrance hall/vestibule with the footstep HUD advancing. Materials and the display chain are now hardware-faithful offline (families 1-3
+resolved 2026-07-26); rung 4 needs the live oracle side-by-side plus families 4-5.
 
 Reaching the frame loop uses the standard gated switches:
 
@@ -48,23 +48,44 @@ The `blue-prince-title` snapshot route guards the title screen.
   without a `[dbbase-clobber]` event; the quiet run produced 76/76 captures with 76 distinct source
   frames.
 
-## Open defect families (#1287)
+## Defect families (#1287) — families 1–3 RESOLVED 2026-07-26
 
-1. **Concentric ring/band moiré** radiating from lights (ceiling medallion, light pools).
-   PROVEN NOT: shadow-plane content (#1352 A/B), caster depth bias (forced-bias A/B via the
-   patch in `~/bp-1264/force-bias-diagnostic.patch`), texture mips/LOD, sampler filters (ramp +
-   cookie decode LINEAR and honored). Draw-step bisection: each additive light draw paints its
-   own ring family; the G-buffer beneath is clean. Lives in the light-accumulation/falloff math —
-   same family as Dead Cells #781 (which rejected depth/history/sampler/interp). FS-tap analysis
-   is hampered in the hall scene by additive blending into a saturated post-grade frame; next
-   productive step is a joint #781 dissection on the isolated Dead Cells pass, or a Blue Prince
-   capture before the grade flip.
-2. **Overbright/white blowout** of lit surfaces (facade patches, wallpaper striping).
-3. **Full-scene magenta grade flip** at ~frame 2973 — discrete, possibly game-intent
-   (evening→night grading?); needs a post-intro PS5 oracle from the user to judge.
-4. **Floating black rectangles** at wall-lamp positions; **RGB-noise ball** center-hall.
-   Untriaged. #1334 (MODE=3 resolve freshness, parked branch) may relate to stuck present
-   regions.
+Families 1–3 below are **fixed on master**; they are retained as the resolution record so the
+evidence is not re-chased. Family 4 and the new slab item remain open.
+
+1. **RESOLVED — concentric ring/band moiré** radiating from lights. It was never
+   light-accumulation math: the ring structure was the *palette/material atlas* sampled through
+   wrong coordinates and then modulated by lighting. Three landed fixes compose to the cure —
+   **#1411** (Gen5 virtual interpolant registers resolved at fold time; this is the decisive one:
+   the palette-UV interpolant reached the FS through a virtual register that resolved wrong, which
+   is why the vertex buffer AND the runtime SSBO both audited byte-correct while the fragment
+   stage observably received position-like sweeps), plus **#1399** (`IMAGE_SAMPLE_D` honors the
+   guest's explicit gradients instead of falling back to implicit LOD — the fine moiré overlay)
+   and **#1401**/**#1404** (LINEAR-S# dref lowered as real compare-then-filter 2×2 PCF with the
+   decoded address modes, instead of a hard-threshold single tap). Offline proof:
+   `lit_frame.prgcap` replayed through `gpu_replay --recompile-raw` renders smooth navy walls,
+   real carpet-runner art, and no rings (frame:
+   `docs/screenshots/issue-1287-hall-materials-fixed.png`, #1287 comment 2026-07-26).
+   The prior "lives in the light-accumulation/falloff math" reading was wrong — the ruled-out list
+   (shadow-plane content, caster bias, mips/LOD, sampler filters) was correct but incomplete;
+   the interpolant path had not been suspected.
+2. **RESOLVED — overbright/white blowout** of lit surfaces. Same root as family 1 (wrong sampled
+   material energy, then amplified by the light loop), plus the display-chain half in family 3.
+3. **RESOLVED — full-scene magenta flip**: NOT game intent. **#1334/#1382** — CB MODE=RESOLVE
+   shared only CPU pixels while the destination inherited `gpu_valid=true` over a never-written
+   persistent image; after the #780 CPU-copy discard the compute tonemap imported the stale image
+   and read black, the post chain cascaded, and the present fallback published raw FP16 HDR under
+   a plain linear clamp — which reads as magenta. The resolve now GPU-copies into the destination.
+4. **OPEN — floating black rectangles** at wall-lamp positions; **RGB-noise ball** center-hall.
+   Untriaged.
+5. **OPEN — dark slab/plane** occluding the far room mid-right in the hall view (a large opaque
+   quad with faint vertical colour banding, hard straight edges, hanging in mid-air where the
+   oracle shows the far arch and busts). Pre-existing, not a regression from the family-1 fixes:
+   the same surface appears in pre-fix replays as a rainbow vertical stripe at the same screen
+   position. Offline bisection on `lit_frame.prgcap` places its introduction in the composite
+   between operations 1100 and 1200. Beware the prefix-extent trap when bisecting: consecutive
+   `--through-operation` prefixes can end on *different* render targets, so compare only steps
+   that resolved the same surface (`--draw-steps-target WxH`, or check the reported extent).
 
 ## Capsule & artifact inventory (`~/bp-1264/`, all run-local addresses)
 
@@ -92,7 +113,16 @@ The `blue-prince-title` snapshot route guards the title screen.
 - `PROSPER_DSLOG=1` / `PROSPER_DSBRIDGE_LOG=1` — persistent-DS call keys and sampled-bridge
   HIT/miss (how #1352 was found).
 - `PROSPER_FS_TAP=DRAW:PC` on a v19+ capsule — visualize a light-FS intermediate offline; `DRAW`
-  is the semantic `draw[ID]` printed by `gpu_replay --inspect-only`, not its compact `item=` offset.
+  is the semantic `draw[ID]` printed by `gpu_replay --inspect-only`, not its compact `item=` offset
+  (#1396 fixed the index-space confusion that made the tap silently mutate a different draw).
+- `gpu_replay --recompile-raw` (#1416) — re-recompile every retained raw VS/FS with the CURRENT
+  recompiler and replay: the ~5 s offline A/B that resolved family 1 against a ~8 min live route.
+  Pair with `PROSPER_MIPLOG=1` (per-binding mip eligibility) and `PROSPER_BUFLOG=1` (per-binding
+  buffer upload provenance) when a replay disagrees with expectations.
+- **When a `--recompile-raw` A/B and a live route disagree, suspect neither first — check host
+  load.** The 1080p long-boot routes on this shared box slide past their capture windows above
+  load ≈4 and photograph an earlier scene (see #1417); a same-build A/B under identical load is
+  the only honest discriminator.
 - The #1352-era scissor three-stage traces are parked on branch
   `fix/issue-1335-regindirect-tags`.
 
@@ -101,4 +131,6 @@ The `blue-prince-title` snapshot route guards the title screen.
 Exonerated with evidence (do not re-chase without new contradictory evidence): present staleness,
 capture transposition, texture/descriptor decode for the Day One hold (#1287/#1334/#1335 record);
 mips/CBR/checkerboard, shadow acne, caster bias, and sampler filtering for the ring family
-(#1287 comment trail, 2026-07-25).
+(#1287 comment trail, 2026-07-25). The ring family itself is CLOSED (#1411/#1399/#1401/#1404) —
+do not reopen a light-accumulation-math hypothesis for it; if rings reappear, check the
+interpolant-resolution path first.
