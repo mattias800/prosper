@@ -76,12 +76,14 @@ int main() {
 
     HleFn create_shader = Hle::lookup("f3dg2CSgRKY");
     HleFn fused_size = Hle::lookup("dolOmWH+huQ");
+    HleFn fused_size_320 = Hle::lookup("nQT5kYLv0cg");
     HleFn fuse_halves = Hle::lookup("nApJjpKNBl4");
     HleFn fuse_halves_old = Hle::lookup("fd5Bp5tGTgo");
     HleFn create_interp = Hle::lookup("dbOlWdppb4o");
     HleFn create_interp_320 = Hle::lookup("pdEV7bI6COI");
     CHECK(create_shader != nullptr, "sceAgcCreateShader registered");
-    CHECK(fused_size != nullptr && fuse_halves != nullptr && fuse_halves_old != nullptr,
+    CHECK(fused_size != nullptr && fused_size_320 != nullptr &&
+          fuse_halves != nullptr && fuse_halves_old != nullptr,
           "fused-shader size query and SDK aliases registered");
     CHECK(create_interp != nullptr && create_interp_320 != nullptr,
           "CreateInterpolantMapping SDK aliases registered");
@@ -90,7 +92,7 @@ int main() {
     // Pathless builds GS/HS shaders from separately compiled front/back binaries. A success-only
     // stub left its stack-local fused Shader untouched, and the later register copier interpreted
     // unrelated stack bytes as a nonzero count paired with a null register pointer.
-    if (fused_size && fuse_halves && fuse_halves_old) {
+    if (fused_size && fused_size_320 && fuse_halves && fuse_halves_old) {
         using namespace prosper::agc::Pm4;
         ShaderRegister front_regs[] = {
             {SPI_SHADER_PGM_CHKSUM_GS, 0x11111111u},
@@ -119,9 +121,9 @@ int main() {
         back.specials = &back_specials;
 
         SizeAlign requirements{0xdeadbeefull, 0xdeadbeefull};
-        uint64_t fused_rc = fused_size((uint64_t)(uintptr_t)&requirements,
-                                       (uint64_t)(uintptr_t)&front,
-                                       (uint64_t)(uintptr_t)&back, 0, 0, 0);
+        uint64_t fused_rc = fused_size_320((uint64_t)(uintptr_t)&requirements,
+                                           (uint64_t)(uintptr_t)&front,
+                                           (uint64_t)(uintptr_t)&back, 0, 0, 0);
         CHECK(fused_rc == 0 && requirements.size == sizeof(back_regs) && requirements.align == 4,
               "fused-shader size query reserves one copied SH-register array");
 

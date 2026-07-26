@@ -1815,6 +1815,7 @@ void register_agc_hle() {
     RN("t7PlZ9nt5Lc", agc_cb_nop_get_size);          // sceAgcCbNopGetSize
     RN("f3dg2CSgRKY", agc_create_shader);   // sceAgcCreateShader — populates the shader registry
     RN("dolOmWH+huQ", agc_get_fused_shader_size); // sceAgcGetFusedShaderSize (Pathless SDK)
+    RN("nQT5kYLv0cg", agc_get_fused_shader_size); // sceAgcGetFusedShaderSize (PS5 3.20)
     RN("nApJjpKNBl4", agc_fuse_shader_halves);    // sceAgcFuseShaderHalves (PS5 3.20)
     RN("fd5Bp5tGTgo", agc_fuse_shader_halves);    // older observed SDK alias
     RN("AOLcoIkQDgM", agc_driver_query_resource_registration_user_memory_requirements);
