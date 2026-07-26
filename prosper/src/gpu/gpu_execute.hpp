@@ -97,7 +97,9 @@ struct DrawItem {
     // reads as "my substitution changed nothing" rather than as an error (#1434; it cost real time in
     // the #1427 investigation, and #1396 fixed the same class of confusion for the replay probes).
     // Substitute through set_vs()/set_fs(), which drop the shared value and the cache identity so
-    // persistent backend caches compare the new words instead of hitting the old entry.
+    // persistent backend caches compare the new words instead of hitting the old entry. `gs` has no
+    // shared form today; if one is ever added it needs the same accessor/setter pair, or this bug
+    // returns through the geometry stage.
     const std::vector<uint32_t>& vs_words() const { return vs_shared ? *vs_shared : vs; }
     const std::vector<uint32_t>& gs_words() const { return gs; }
     const std::vector<uint32_t>& fs_words() const { return fs_shared ? *fs_shared : fs; }

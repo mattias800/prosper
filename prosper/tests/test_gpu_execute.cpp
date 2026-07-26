@@ -689,6 +689,20 @@ int main() {
         CHECK(owned.vs_words() == std::vector<uint32_t>({0x07230203u, 7u}) &&
                   !owned.has_shadowed_shader(),
               "set_vs on an item without a shared value behaves like a plain assignment");
+
+        // BackendDraw carries the identical accessor precedence (the line #1434 originally cited),
+        // so it gets the same setters. This is the struct the frontend hands the Vulkan backend.
+        prosper::test::BackendDraw backend;
+        backend.vs_shared = std::make_shared<const std::vector<uint32_t>>(
+            std::vector<uint32_t>{0x07230203u, 111u});
+        backend.vs_identity = 0xCCCC;
+        backend.vs = {0x07230203u, 999u};
+        CHECK(backend.vs_words() == std::vector<uint32_t>({0x07230203u, 111u}),
+              "BackendDraw shows the same shadowing before substitution (#1434)");
+        backend.set_vs({0x07230203u, 999u});
+        CHECK(backend.vs_words() == std::vector<uint32_t>({0x07230203u, 999u}) &&
+                  !backend.vs_shared && backend.vs_identity == 0,
+              "BackendDraw::set_vs substitutes and clears the shared value and identity");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
