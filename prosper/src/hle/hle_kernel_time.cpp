@@ -942,10 +942,19 @@ namespace {
     constexpr int16_t EVFILT_AMPR_MODELED = -24;   // guest never reads filter; distinct on purpose
     struct AprEqReg { uint64_t eq; int64_t id; };
     // Own mutex (NOT g_eq_mx): the post path calls eq_post/eq_find, which lock g_eq_mx themselves.
-    PROSPER_HEAP_MUTEX(g_apr_mx);   // #707: heap-backed on macOS (hot APR mutex in the corrupted __DATA cluster)
-    std::vector<AprEqReg> g_apr_eq_regs;               // guarded by g_apr_mx (registration log)
-    uint64_t g_apr_ring_seq[64] = {};                  // per-ring counters for prosper-issued tokens
-    std::unordered_map<uint64_t, uint64_t> g_apr_tag_hwm; // (equeue identity, ring) -> highest counter
+    // Detached APR delivery threads can outlive main, so the mutex and every container they touch
+    // are one intentionally immortal heap object. Heap placement also keeps the hot mutex out of
+    // the macOS __DATA cluster affected by #707.
+    struct AprTokenState {
+        std::mutex mx;
+        std::vector<AprEqReg> eq_regs;
+        uint64_t ring_seq[64] = {};
+        std::unordered_map<uint64_t, uint64_t> tag_hwm;
+    };
+    AprTokenState& apr_token_state() {
+        static AprTokenState* state = new AprTokenState;
+        return *state;
+    }
     uint64_t apr_hwm_key(uint64_t eq_identity, unsigned ring) {
         return (eq_identity << 6) | (ring & 0x3f);
     }
@@ -1027,8 +1036,9 @@ void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
     uint64_t cnt = token & ((1ull << 58) - 1);
     const uint64_t hwm_key = apr_hwm_key(eq_identity, ring);
     {
-        std::lock_guard lk(g_apr_mx);
-        if (cnt > g_apr_tag_hwm[hwm_key]) g_apr_tag_hwm[hwm_key] = cnt;
+        AprTokenState& state = apr_token_state();
+        std::lock_guard lk(state.mx);
+        if (cnt > state.tag_hwm[hwm_key]) state.tag_hwm[hwm_key] = cnt;
     }
     if (evlog()) fprintf(stderr, "[ev] AprTagComplete token=0x%llx (ring=%u) -> eq=0x%llx scheduled\n",
                          (unsigned long long)token, ring, (unsigned long long)eq);
@@ -1036,7 +1046,11 @@ void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
         struct timespec ts{ 0, 2000000 };   // 2 ms
         nanosleep(&ts, nullptr);
         uint64_t hwm;
-        { std::lock_guard lk(g_apr_mx); hwm = g_apr_tag_hwm[hwm_key]; }
+        {
+            AprTokenState& state = apr_token_state();
+            std::lock_guard lk(state.mx);
+            hwm = state.tag_hwm[hwm_key];
+        }
         apr_post(eq, eq_identity, id, ring, ((uint64_t)ring << 58) | hwm);
     }).detach();
 }
@@ -1045,8 +1059,9 @@ void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
 // event is ever posted for these — see the block comment above).
 uint64_t prosper_apr_next_token(unsigned ring) {
     ring &= 0x3f;
-    std::lock_guard lk(g_apr_mx);
-    uint64_t seq = ++g_apr_ring_seq[ring];
+    AprTokenState& state = apr_token_state();
+    std::lock_guard lk(state.mx);
+    uint64_t seq = ++state.ring_seq[ring];
     return ((uint64_t)ring << 58) | (seq & ((1ull << 58) - 1));
 }
 // Record an APR completion registration (sSAUCCU1dv4 / H896Pt-yB4I target queue). Registration is
@@ -1055,10 +1070,11 @@ uint64_t prosper_apr_next_token(unsigned ring) {
 // ctor-seeded per-ring last-processed (see the block comment above; the pre-#208 replay was the
 // root cause of the #180 range-walk fault).
 void prosper_eq_add_apr(uint64_t eq, int64_t id) {
-    std::lock_guard lk(g_apr_mx);
-    for (auto& r : g_apr_eq_regs)
+    AprTokenState& state = apr_token_state();
+    std::lock_guard lk(state.mx);
+    for (auto& r : state.eq_regs)
         if (r.eq == eq && r.id == id) return;   // idempotent
-    g_apr_eq_regs.push_back({ eq, id });
+    state.eq_regs.push_back({ eq, id });
 }
 HLE(k_add_ampr_event) {   // sceKernelAddAmprEvent(eq, id, udata)
     if (a0) prosper_eq_add_apr(a0, (int64_t)a1);
