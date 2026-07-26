@@ -1,7 +1,7 @@
 # Blue Prince (PPSA25009, Unity/IL2CPP) — status & investigation map
 
-Last revised: 2026-07-25 (the depth/stencil-clear + arena-recovery session). Prior history: #1216
-(closed — boot/blank-frame era), #1264 (Day One hold investigation), #1287 (visuals umbrella, open).
+Last revised: 2026-07-26 (the indirect-arena root-cause audit). Prior history: #1216 (closed —
+boot/blank-frame era), #1264 (Day One hold investigation), #1287 (visuals umbrella, open).
 
 ## Ladder position
 
@@ -36,9 +36,17 @@ The `blue-prince-title` snapshot route guards the title screen.
 - **#1353/#1363** — shadow casters decoded `(Z_READ=P, Z_WRITE=0)` from another stale arena slot;
   lone-zero DB base halves now recover from their partner (GFX10 equal-bases contract), unifying
   the persistent-DS identities to `(P,P)`.
-- **#1364 (open)** — the family-level arena problem behind all of the above: Gen5 indirect
-  register arenas interleave non-register records inside the counted window; full anatomy and
-  the `[dbbase-clobber]` capture tool are on the issue.
+- **#1364/#1368** — the apparent family-level arena problem was an unwritten-output problem, not
+  an undocumented mixed-record format. The two suspicious stretches are exactly the 32-record
+  blocks advertised after calls to the Cobra-discovered `dbOlWdppb4o` interpolant helper. Before
+  #1368 that NID was a success stub, so the blocks retained stack contents: import and eboot return
+  addresses, heap pointers, and host pointers split into `(offset,value)` dwords. #1368 recovered
+  the SDK alias and initializes every advertised `SPI_PS_INPUT_CNTL_0..31` record; its focused test
+  poisons all 32 outputs first so a partial write cannot pass. #1411 separately resolves the other
+  live shape of that alias, Dragon Quest VII's virtual `0x10000000+n` offsets, at fold time. Two
+  fresh-save, scale-1 current-master startup routes ran through Blue Prince's intro for 380+ seconds
+  without a `[dbbase-clobber]` event; the quiet run produced 76/76 captures with 76 distinct source
+  frames.
 
 ## Open defect families (#1287)
 
@@ -69,13 +77,16 @@ The `blue-prince-title` snapshot route guards the title screen.
   for lighting work.**
 - `dayone_healthy.prgcap`, `f9grabs/dayone_v24.prgcap`, `bp2.prgtl` — Day One era artifacts
   (#1264/#1335 evidence chain).
-- `clobberdump.log` — six full arena arrays around DB-base clobbers (#1364 raw material).
+- `clobberdump.log` — six pre-#1368 arrays around DB-base clobbers; retained as the raw evidence
+  that the two 32-record interpolant outputs contained split stack/pointer residue.
 - Route scripts: `caphall*.sh` (capture-armed), `hall1.sh`/`hallfix.sh` (plain 120-shot route).
 
 ## Diagnostics cheat-sheet (all env-gated, off by default)
 
 - `PROSPER_DBBASETRACE=1` — logs cx writes to the DB Z/STENCIL base registers with fold path;
-  dumps the full array on a within-array clobber (`[dbbase-clobber]`, #1364).
+  dumps the full array on a within-array clobber (`[dbbase-clobber]`). Current-master validation
+  should produce no such dump; a recurrence should reopen producer attribution, with another
+  unwritten advertised output as one hypothesis.
 - `PROSPER_SCISSORLOG=1` — empty-combine dumps; `[scissor] degenerate SCREEN pair recovered` and
   `[render_state] lone-zero DB … recovered` fire on the two landed arena recoveries.
 - `PROSPER_DSLOG=1` / `PROSPER_DSBRIDGE_LOG=1` — persistent-DS call keys and sampled-bridge
