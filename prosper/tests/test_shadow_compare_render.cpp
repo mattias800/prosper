@@ -366,6 +366,48 @@ int main() {
                   "same-pass consumer samples attached depth while stencil remains writable (#1186)");
         }
 
+        // #1186 regression: Bendy records the depth-writing scene geometry and its later deferred
+        // light volumes in one same-target draw run. The light samples that attached scene depth.
+        // One Vulkan render pass cannot expose a writable attachment as a sampled image, so the
+        // logical draw batch must split at the write -> sample transition while retaining color,
+        // depth, and stencil between the two ordered backend passes.
+        constexpr uint64_t kBatchedDepth = 0x20d5a00000ull;
+        constexpr uint64_t kBatchedStencil = 0x20d5b00000ull;
+        ResolvedPipelineState batched_producer_state = feedback_producer;
+        batched_producer_state.depth_read_base = kBatchedDepth;
+        batched_producer_state.depth_write_base = kBatchedDepth;
+        batched_producer_state.stencil_read_base = kBatchedStencil;
+        batched_producer_state.stencil_write_base = kBatchedStencil;
+        prosper::test::BackendDraw batched_producer = feedback_pw;
+        batched_producer.ps = &batched_producer_state;
+
+        ResolvedPipelineState batched_consumer_state = feedback_state;
+        batched_consumer_state.depth_read_base = kBatchedDepth;
+        batched_consumer_state.depth_write_base = kBatchedDepth;
+        batched_consumer_state.stencil_read_base = kBatchedStencil;
+        batched_consumer_state.stencil_write_base = kBatchedStencil;
+        prosper::test::FrameResource batched_resource = feedback_resource;
+        batched_resource.persistent_depth_target_id = kBatchedDepth;
+        prosper::test::BackendDraw batched_consumer = feedback_consumer;
+        batched_consumer.ps = &batched_consumer_state;
+        batched_consumer.R = {batched_resource};
+        prosper::test::BackendColorTarget batched_color{
+            0x20d5c00000ull, true, true, VK_FORMAT_R8G8B8A8_UNORM};
+        prosper::test::BackendSubmissionBatch batched_submission;
+        std::vector<uint8_t> via_batched_feedback = prosper::test::render_draws_rgba(
+            {batched_producer, batched_consumer}, W, H, nullptr, nullptr,
+            /*persist_depth_stencil=*/true, &batched_color, nullptr, nullptr, nullptr,
+            &batched_submission, /*flush_submission_batch=*/true);
+        CHECK(via_batched_feedback.size() == (size_t)W * H * 4,
+              "depth producer and sampled-depth consumer rendered from one logical batch");
+        if (via_batched_feedback.size() == (size_t)W * H * 4) {
+            const uint8_t* batched_center =
+                &via_batched_feedback[(((size_t)H / 2) * W + W / 2) * 4];
+            printf("  batched feedback center R=%u (want ~64)\n", batched_center[0]);
+            CHECK(batched_center[0] > 56 && batched_center[0] < 72,
+                  "write/sample transition preserves produced depth instead of binding zeros (#1186)");
+        }
+
         // ---- #1287: an ineffective clear draw must not shadow the rendered plane ----
         // Blue Prince's light loop: shadow casters render depth into plane P (identity dr=P, dw=0),
         // then a fullscreen rect with DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE set but DB_DEPTH_CONTROL
