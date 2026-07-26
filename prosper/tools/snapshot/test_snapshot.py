@@ -17,6 +17,45 @@ SPEC.loader.exec_module(SNAPSHOT)
 
 
 class SnapshotContentTests(unittest.TestCase):
+    def test_snapshot_lock_serializes_independent_processes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = os.path.join(tmp, "snapshot.lock")
+            child_script = """
+import importlib.util
+import json
+import os
+
+spec = importlib.util.spec_from_file_location("snapshot_child", {snapshot_path})
+snapshot = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(snapshot)
+print("attempting", flush=True)
+with snapshot.snapshot_run_lock("verify", ["child"], {lock_path}):
+    print("acquired", flush=True)
+""".format(
+                snapshot_path=json.dumps(os.path.join(HERE, "snapshot.py")),
+                lock_path=json.dumps(lock_path),
+            )
+            child = None
+            try:
+                with SNAPSHOT.snapshot_run_lock("check", ["parent"], lock_path):
+                    child = subprocess.Popen(
+                        [sys.executable, "-c", child_script],
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                    )
+                    self.assertEqual("attempting", child.stdout.readline().strip())
+                    time.sleep(0.25)
+                    self.assertIsNone(child.poll(), "second snapshot process bypassed the lock")
+
+                output, _ = child.communicate(timeout=5)
+                self.assertEqual(0, child.returncode, output)
+                self.assertIn("[snapshot-lock] waiting for pid", output)
+                self.assertIn("[snapshot-lock] acquired after", output)
+                self.assertTrue(output.rstrip().endswith("acquired"), output)
+            finally:
+                if child is not None and child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=5)
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "PR_SET_PDEATHSIG is Linux-specific")
     def test_snapshot_child_dies_when_harness_is_killed(self):
         with tempfile.TemporaryDirectory() as tmp:

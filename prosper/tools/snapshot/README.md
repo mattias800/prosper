@@ -28,6 +28,12 @@ render state, texture decode/detiling, executor behavior, or presentation.
 representative presented PNGs, the boot log, and structured per-frame evidence
 in `tools/snapshot/failures/`.
 
+`check` and `verify` hold a cooperative lock in the clone's Git common directory,
+so snapshot runs from sibling worktrees wait instead of contending for the GPU
+and shifting long-boot capture windows. The waiter prints the owning PID and
+command. Set `PROSPER_SNAPSHOT_LOCK` to share a lock across separate clones, or
+set `PROSPER_SNAPSHOT_NO_LOCK=1` only when concurrent captures are intentional.
+
 Snapshot rendering uses the shared renderer's hardware-first Vulkan selection: discrete, integrated,
 and virtual GPUs are preferred over CPU devices, with llvmpipe used only when no usable GPU is exposed.
 The selected device is printed in each retained run log.
@@ -134,3 +140,5 @@ inspection unless they fail.
 - `PROSPER_BOOT_TRACE`: `boot_trace` path; defaults to `build-linux/boot_trace`.
 - `PROSPER_SCREENSHOT`: presented-capture frontend; defaults to
   `build-linux/screenshot`.
+- `PROSPER_SNAPSHOT_LOCK`: lockfile override, useful for coordinating separate clones.
+- `PROSPER_SNAPSHOT_NO_LOCK=1`: opt out of capture serialization explicitly.
