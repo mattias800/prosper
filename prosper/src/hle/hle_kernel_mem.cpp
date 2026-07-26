@@ -1384,6 +1384,10 @@ HLE(k_ampr_measure_write_equeue) { // sSAUCCU1dv4 = sceAmprMeasureCommandSizeWri
     if (a0) prosper_eq_add_apr(a0, (int64_t)a1);
     return 20;
 }
+// The unversioned PS5 3.20 entry point is a pure command-size query and reserves a 0x20-byte
+// kernel-event record. Keep it separate from the older `_04_00` compatibility path above: DOLL
+// passes a live queue to that legacy sizing NID and depends on its historical 20-byte result.
+HLE(k_ampr_measure_write_equeue_on_completion) { return 0x20; }
 HLE(k_apr_cb_set_equeue) {       // H896Pt-yB4I (cb, eq, id, tag, 0, flags)
     ampr_arglog("H896Pt-yB4I(CbSetEqueue)", a0, a1, a2, a3, a4, a5);
     if (a1) prosper_eq_add_apr(a1, (int64_t)a2);
@@ -1732,7 +1736,11 @@ void register_kernel_mem_hle() {
     // registered in hle_file.cpp next to the other APR read path.
     Hle::register_fn("sSAUCCU1dv4", (HleFn)k_ampr_measure_write_equeue,
                      "sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00");
+    Hle::register_fn("Zi3dBUjgyXI", (HleFn)k_ampr_measure_write_equeue_on_completion,
+                     "sceAmprMeasureCommandSizeWriteKernelEventQueueOnCompletion");
     Hle::register_fn("H896Pt-yB4I", (HleFn)k_apr_cb_set_equeue, "AprCbSetEventQueue?");
+    Hle::register_fn("o67gODLFpls", (HleFn)k_apr_cb_set_equeue,
+                     "sceAmprCommandBufferWriteKernelEventQueueOnCompletion");
     Hle::register_fn("ASoW5WE-UPo", (HleFn)k_apr_submit,        "AprSubmitCommandBuffer?");
     Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_get_current_offset,
                      "sceAmprCommandBufferGetCurrentOffset");
@@ -4250,6 +4258,7 @@ HLE(k_query_memory_protection) {
 // Windows yet. Pure size/offset queries below keep their platform-independent return contracts.
 HLE(k_ampr_ok) { return 0; }
 HLE(k_ampr_measure_write_equeue) { return 20; }
+HLE(k_ampr_measure_write_equeue_on_completion) { return 0x20; }
 HLE(k_ampr_get_current_offset) { return 0; }
 HLE(k_ampr_measure_write_address) { return 32; }
 
@@ -4424,7 +4433,11 @@ void register_kernel_mem_hle() {
     Hle::register_fn("GuchCTefuZw", (HleFn)k_ampr_ok, "sceAmprCommandBufferDestructor");
     Hle::register_fn("sSAUCCU1dv4", (HleFn)k_ampr_measure_write_equeue,
                      "sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00");
+    Hle::register_fn("Zi3dBUjgyXI", (HleFn)k_ampr_measure_write_equeue_on_completion,
+                     "sceAmprMeasureCommandSizeWriteKernelEventQueueOnCompletion");
     Hle::register_fn("H896Pt-yB4I", (HleFn)k_ampr_ok, "AprCbSetEventQueue?");
+    Hle::register_fn("o67gODLFpls", (HleFn)k_ampr_ok,
+                     "sceAmprCommandBufferWriteKernelEventQueueOnCompletion");
     Hle::register_fn("ASoW5WE-UPo", (HleFn)k_ampr_ok, "AprSubmitCommandBuffer?");
     Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_get_current_offset,
                      "sceAmprCommandBufferGetCurrentOffset");

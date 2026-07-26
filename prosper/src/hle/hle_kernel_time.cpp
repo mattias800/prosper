@@ -1040,6 +1040,12 @@ void prosper_eq_add_apr(uint64_t eq, int64_t id) {
         if (r.eq == eq && r.id == id) return;   // idempotent
     g_apr_eq_regs.push_back({ eq, id });
 }
+HLE(k_add_ampr_event) {   // sceKernelAddAmprEvent(eq, id, udata)
+    if (a0) prosper_eq_add_apr(a0, (int64_t)a1);
+    if (evlog()) fprintf(stderr, "[ev] AddAmprEvent eq=0x%llx id=%lld udata=0x%llx\n",
+        (unsigned long long)a0, (long long)a1, (unsigned long long)a2);
+    return 0;
+}
 
 // --- SceKernelEvent field accessors (Kyty EventQueue.cpp:318-378: plain field reads). The APR
 // listener consumes its events EXCLUSIVELY through sceKernelGetEventData; unimplemented-0 here made
@@ -1241,6 +1247,7 @@ void register_kernel_time_hle() {
     R("sceKernelGetEventFilter", k_get_event_filter); R("sceKernelGetEventFflags", k_get_event_fflags);
     R("sceKernelGetEventUserData", k_get_event_udata);R("sceKernelGetEventError", k_get_event_error);
     R("sceKernelAddHRTimerEvent", k_add_hrtimer_event); R("sceKernelAddUserEvent", k_add_user_event);
+    R("sceKernelAddAmprEvent", k_add_ampr_event);
     R("sceKernelAddUserEventEdge", k_add_user_event);   R("sceKernelTriggerUserEvent", k_trigger_user_event);
     R("sceKernelDeleteUserEvent", k_del_user_event);   R("sceKernelDeleteHRTimerEvent", k_del_timer_event);
     R("sceKernelDeleteTimerEvent", k_del_timer_event); R("sceKernelAddTimerEvent", k_add_timer_event);
