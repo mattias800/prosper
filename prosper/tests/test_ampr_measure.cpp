@@ -196,6 +196,12 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
         CHECK(get_count(replacement_eq, 0, 0, 0, 0, 0) == 0,
               "destroying a PS5 3.20 command buffer cancels its pending tail");
+        construct(destroyed_cb, 0, 0, 0, 0, 0);
+        uint64_t unbound_out1 = 0, unbound_out2 = 0;
+        submit(destroyed_cb, 1, (uint64_t)(uintptr_t)&unbound_out1,
+               (uint64_t)(uintptr_t)&unbound_out2, 0, 0);
+        CHECK(unbound_out1 && unbound_out1 == unbound_out2,
+              "reconstructed command buffer is unbound after PS5 3.20 destruction");
         delete_eq(replacement_eq, 0, 0, 0, 0, 0);
     }
 #endif

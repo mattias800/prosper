@@ -62,6 +62,14 @@ void ampr_cb_reset(uint64_t cb) {
     if (it != g_ampr_cb_state.end()) it->second.offset = 0;
 }
 
+void ampr_cb_destroy_320(uint64_t cb) {
+    if (!cb) return;
+    std::lock_guard<std::mutex> lock(g_ampr_cb_state_mx);
+    auto it = g_ampr_cb_state.find(cb);
+    if (it != g_ampr_cb_state.end() && it->second.tracks_offset)
+        g_ampr_cb_state.erase(it);
+}
+
 uint64_t ampr_cb_capacity(uint64_t cb) {
     std::lock_guard<std::mutex> lock(g_ampr_cb_state_mx);
     auto it = g_ampr_cb_state.find(cb);
@@ -1465,15 +1473,13 @@ namespace {
             }
         return false;
     }
-    void apr_cb_cancel_tail(uint64_t cb) {
+    void apr_cb_destroy_320_binding(uint64_t cb) {
         AprBoundState& state = apr_bound_state();
         std::lock_guard<std::mutex> lk(state.mx);
-        for (auto& b : state.cbs) {
-            if (b.cb != cb || !b.deduplicate_completion) continue;
-            b.fallback_pending = false;
-            b.completion_posted = true;
-            break;
-        }
+        auto it = std::find_if(state.cbs.begin(), state.cbs.end(), [&](const AprBoundCb& b) {
+            return b.cb == cb && b.deduplicate_completion;
+        });
+        if (it != state.cbs.end()) state.cbs.erase(it);
     }
     // Per-request "eventful" marks for UNBOUND one-shot cbs (issue #180). The engine drives two
     // flavors of sceAmprAprCommandBufferReadFile through ONE wrapper (identical guest-RA chains):
@@ -1518,7 +1524,8 @@ HLE(k_ampr_measure_write_equeue) { // sSAUCCU1dv4 = sceAmprMeasureCommandSizeWri
 }
 HLE(k_ampr_destruct_320) {
     ampr_arglog("AmprCommandBufferDestructor", a0, a1, a2, a3, a4, a5);
-    apr_cb_cancel_tail(a0);
+    apr_cb_destroy_320_binding(a0);
+    ampr_cb_destroy_320(a0);
     return 0;
 }
 // The unversioned PS5 3.20 entry point is a pure command-size query and reserves a 0x20-byte
@@ -4448,6 +4455,7 @@ HLE(k_ampr_init) {
     return 0;
 }
 HLE(k_ampr_reset) { ampr_cb_reset(a0); return 0; }
+HLE(k_ampr_destruct) { ampr_cb_destroy_320(a0); return 0; }
 HLE(k_ampr_getsize) {
     if (uint64_t capacity = ampr_cb_capacity(a0)) return capacity;
     return 0x10000;
@@ -4627,8 +4635,10 @@ void register_kernel_mem_hle() {
     Hle::register_fn("baQO9ez2gL4", (HleFn)k_ampr_reset, "sceAmprCommandBufferReset");
     Hle::register_fn("ULvXMDz56po", (HleFn)k_ampr_reset, "sceAmprCommandBufferClearBuffer");
     Hle::register_fn("tZDDEo2tE5k", (HleFn)k_ampr_getsize, "sceAmprCommandBufferGetSize");
-    Hle::register_fn("Qs1xtplKo0U", (HleFn)k_ampr_ok, "sceAmprAprCommandBufferDestructor");
-    Hle::register_fn("GuchCTefuZw", (HleFn)k_ampr_ok, "sceAmprCommandBufferDestructor");
+    Hle::register_fn("Qs1xtplKo0U", (HleFn)k_ampr_destruct,
+                     "sceAmprAprCommandBufferDestructor");
+    Hle::register_fn("GuchCTefuZw", (HleFn)k_ampr_destruct,
+                     "sceAmprCommandBufferDestructor");
     Hle::register_fn("sSAUCCU1dv4", (HleFn)k_ampr_measure_write_equeue,
                      "sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00");
     Hle::register_fn("Zi3dBUjgyXI", (HleFn)k_ampr_measure_write_equeue_on_completion,
