@@ -40,6 +40,19 @@ struct PcrelDispatchInfo {
     std::vector<uint32_t> setup_pcs;
 };
 
+// A compiler-generated vertex-fetch prolog can be installed as the hardware entry point while the
+// main vertex/NGG program remains a separate allocation. The prolog loads attributes into VGPRs and
+// tail-transfers through s_setpc_b64. This descriptor is returned only for the bounded terminal
+// `s_setpc_b64 s[6:7]` ABI shape with no export or program end in the prefix; arbitrary indirect
+// control flow remains unsupported.
+struct VertexPrologInfo {
+    bool valid = false;
+    uint32_t setpc_pc = 0;
+    size_t prefix_dwords = 0; // executable prolog words before s_setpc_b64
+};
+
+VertexPrologInfo rdna2_vertex_prolog_info(const uint32_t* code, size_t dwords);
+
 PcrelDispatchInfo rdna2_pcrel_dispatch_info(const uint32_t* code, size_t dwords);
 
 // Retain only the selected arm of a proven compiler-generated PC-relative dispatch. The fragment
@@ -246,10 +259,25 @@ uint32_t fragment_color_export_mask(const uint32_t* code, size_t dwords);
 // An optional ShaderResourceTable enables vertex fetch (buffer_load_format_*) + constant loads.
 // `capture_position` (geometry-probe, gated): decorate gl_Position for VK_EXT_transform_feedback capture
 // so the host can read back this draw's post-transform clip-space vertices. Inert to the computation.
+// `virtual_lds_dwords` is the exact SPI_SHADER_PGM_RSRC2_GS allocation for an NGG program.  The
+// portable vertex shell represents one live guest lane, so that lane's LDS is private to the host
+// invocation; zero keeps graphics DS operations fail-closed.
 std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
                                        const ShaderResourceTable* rt = nullptr,
                                        const PixelInputMapping* pixel_inputs = nullptr,
-                                       bool capture_position = false);
+                                       bool capture_position = false,
+                                       uint32_t virtual_lds_dwords = 0);
+
+// Recompile a separately-installed vertex-fetch prolog and its main shader as one architectural
+// program. The validated tail transfer is replaced by fallthrough, preserving every SGPR/VGPR value
+// produced by the prolog. Resource fetch_pc values for the main program must already be shifted by
+// VertexPrologInfo::prefix_dwords in `rt`.
+std::vector<uint32_t> recompile_vertex_chain(const uint32_t* prolog, size_t prolog_dwords,
+                                             const uint32_t* main, size_t main_dwords,
+                                             const ShaderResourceTable* rt = nullptr,
+                                             const PixelInputMapping* pixel_inputs = nullptr,
+                                             bool capture_position = false,
+                                             uint32_t virtual_lds_dwords = 0);
 
 // Test hook: allow a tiny synthetic NGG shader to reach the terminal EXEC-gated export lowering so
 // Vulkan tests can execute both active and inactive outcomes. Production recompile_vertex keeps that

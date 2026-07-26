@@ -582,6 +582,50 @@ int main() {
               stats.misses == 2 && stats.hits == 0,
           "compute cache separates the FLAT-window push-constant base SGPR");
 
+    clear_shader_recompile_cache();
+    // GFX9+ may install a vertex-fetch prolog separately from the main merged shader. Both immutable
+    // allocations form one compiled program, so repeated pairs share an entry while changing only
+    // the main allocation must miss even when the prolog and resource interface are unchanged.
+    const uint32_t vertex_prolog[] = {
+        0xBFA00003u, // s_setprio 3
+        0xBE802006u, // s_setpc_b64 s[6:7]
+    };
+    std::vector<uint32_t> chain_main(kVs, kVs + std::size(kVs));
+    uint64_t chain_first_identity = 0, chain_second_identity = 0;
+    const SharedShaderWords chain_first = recompile_vertex_chain_cached_shared(
+        vertex_prolog, std::size(vertex_prolog), chain_main.data(), chain_main.size(),
+        &table, nullptr, &chain_first_identity);
+    const SharedShaderWords chain_second = recompile_vertex_chain_cached_shared(
+        vertex_prolog, std::size(vertex_prolog), chain_main.data(), chain_main.size(),
+        &table, nullptr, &chain_second_identity);
+    stats = shader_recompile_cache_stats();
+    CHECK(chain_first && chain_first == chain_second && !chain_first->empty() &&
+              chain_first_identity != 0 && chain_first_identity == chain_second_identity &&
+              stats.misses == 1 && stats.hits == 1,
+          "identical vertex prolog/main pairs share one compiled cache entry");
+
+    const uint64_t pre_lds_misses = stats.misses;
+    uint64_t chain_lds_identity = 0;
+    const SharedShaderWords chain_with_lds = recompile_vertex_chain_cached_shared(
+        vertex_prolog, std::size(vertex_prolog), chain_main.data(), chain_main.size(),
+        &table, nullptr, &chain_lds_identity, 4);
+    stats = shader_recompile_cache_stats();
+    CHECK(chain_with_lds && chain_lds_identity != chain_first_identity &&
+              stats.misses == pre_lds_misses + 1,
+          "graphics LDS allocation participates in chained shader cache identity");
+
+    const uint64_t chain_misses = stats.misses;
+    chain_main.insert(chain_main.begin(), 0xBFA00002u); // s_setprio 2: valid, distinct main bytes
+    uint64_t changed_chain_identity = 0;
+    const SharedShaderWords changed_chain = recompile_vertex_chain_cached_shared(
+        vertex_prolog, std::size(vertex_prolog), chain_main.data(), chain_main.size(),
+        &table, nullptr, &changed_chain_identity);
+    stats = shader_recompile_cache_stats();
+    CHECK(changed_chain && !changed_chain->empty() &&
+              changed_chain_identity != chain_first_identity &&
+              stats.misses == chain_misses + 1,
+          "changing only the chained main shader invalidates compiled cache identity");
+
     if (failures) {
         std::printf("== FAIL: %d ==\n", failures);
         return 1;

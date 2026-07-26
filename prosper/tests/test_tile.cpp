@@ -1,6 +1,6 @@
-// test_tile — the GPU surface de-swizzle (tile.hpp). Verifies the SW_4KB_S detile is the exact inverse of
-// the tile (round-trip identity for arbitrary sizes), that linear mode is a passthrough, and that the
-// tiled layout is genuinely a permutation (no texel dropped/duplicated).
+// test_tile — the GPU surface de-swizzle (tile.hpp). Verifies the standard-swizzle detilers are exact
+// inverses of tiling (round-trip identity for arbitrary sizes), that linear mode is a passthrough, and
+// that tiled layouts are genuine permutations (no texel dropped/duplicated).
 #include "../src/gpu/tile.hpp"
 #include <algorithm>
 #include <cstdio>
@@ -97,6 +97,7 @@ static void reference_sw4kb_copy(uint8_t* dst, const uint8_t* src, uint32_t w, u
 int main() {
     printf("== test_tile ==\n");
 
+    CHECK(tile_mode_is_tiled((uint32_t)TileMode::Sw256BS), "tile_mode 1 (SW_256B_S) is tiled");
     CHECK(tile_mode_is_tiled((uint32_t)TileMode::Sw4KbS), "tile_mode 5 (SW_4KB_S) is tiled");
     CHECK(!tile_mode_is_tiled((uint32_t)TileMode::Linear), "tile_mode 0 (linear) is not tiled");
     CHECK(linear_sampled_row_pitch(1920, 1) == 2048 &&
@@ -118,6 +119,58 @@ int main() {
     CHECK(roundtrip_ok(64, 64),     "round-trip 64x64");
     CHECK(roundtrip_ok(1920, 1080), "round-trip 1920x1080 (the game's render target)");
     CHECK(roundtrip_ok(96, 64),     "round-trip 96x64 (non-square)");
+
+    // GFX10 SW_256B_S: small textures use 256-byte micro-tiles. The pattern is not a tight row-major
+    // image: at 16 bytes/element (BC3 blocks), y0/y1 occupy byte-address bits 4/5 and x0/x1 bits 6/7.
+    // Plucky Squire's 144x144 controller glyph is exactly a 36x36 grid of these BC3 blocks.
+    {
+        const uint32_t M = (uint32_t)TileMode::Sw256BS;
+        CHECK(tiled_elements_bytes(36, 36, 16, M) == 20736,
+              "SW_256B_S BC3: 36x36 blocks occupy 9x9 256-byte micro-tiles");
+        bool roundtrips = true;
+        struct Case { uint32_t w, h, bpe; };
+        const Case cases[] = {
+            {19, 18, 1}, {19, 11, 2}, {11, 10, 4}, {11, 7, 8}, {7, 7, 16},
+        };
+        for (const Case& c : cases) {
+            std::vector<uint8_t> ref((size_t)c.w * c.h * c.bpe);
+            for (size_t i = 0; i < ref.size(); ++i)
+                ref[i] = (uint8_t)((i * 2246822519u) >> 17);
+            const size_t bytes = tiled_elements_bytes(c.w, c.h, c.bpe, M);
+            std::vector<uint8_t> tiled(bytes, 0), back(ref.size(), 0);
+            tile_surface(tiled.data(), ref.data(), c.w, c.h, M, 0, c.bpe);
+            detile_elements(back.data(), tiled.data(), tiled.size(), c.w, c.h, c.bpe, M);
+            roundtrips &= back == ref;
+        }
+        CHECK(roundtrips, "SW_256B_S round-trip is exact at every supported element size");
+
+        const uint32_t w = 36, h = 36, bpe = 16;
+        std::vector<uint8_t> ref((size_t)w * h * bpe);
+        for (size_t i = 0; i < ref.size(); ++i) ref[i] = (uint8_t)((i >> 4) * 73 + i);
+        std::vector<uint8_t> tiled(tiled_elements_bytes(w, h, bpe, M), 0);
+        tile_surface(tiled.data(), ref.data(), w, h, M, 0, bpe);
+        auto at = [&](uint32_t x, uint32_t y) { return &ref[((size_t)y * w + x) * bpe]; };
+        CHECK(std::memcmp(&tiled[16],  at(0, 1), bpe) == 0,
+              "SW_256B_S 16B golden: element (0,1) at byte 16 (y0 -> bit 4)");
+        CHECK(std::memcmp(&tiled[32],  at(0, 2), bpe) == 0,
+              "SW_256B_S 16B golden: element (0,2) at byte 32 (y1 -> bit 5)");
+        CHECK(std::memcmp(&tiled[64],  at(1, 0), bpe) == 0,
+              "SW_256B_S 16B golden: element (1,0) at byte 64 (x0 -> bit 6)");
+        CHECK(std::memcmp(&tiled[128], at(2, 0), bpe) == 0,
+              "SW_256B_S 16B golden: element (2,0) at byte 128 (x1 -> bit 7)");
+        CHECK(std::memcmp(&tiled[256], at(4, 0), bpe) == 0,
+              "SW_256B_S 16B golden: element (4,0) starts the next block");
+        CHECK(std::memcmp(&tiled[(size_t)9 * 256], at(0, 4), bpe) == 0,
+              "SW_256B_S 16B golden: element (0,4) starts block row one");
+
+        const TiledMipLevelLayout mip0 = tiled_mip_level_layout(36, 36, 16, M, 2, 0);
+        const TiledMipLevelLayout mip1 = tiled_mip_level_layout(36, 36, 16, M, 2, 1);
+        const TiledMipLevelLayout mip2 = tiled_mip_level_layout(36, 36, 16, M, 2, 2);
+        CHECK(mip0.supported && !mip0.in_tail && mip0.byte_offset == 8704 &&
+              mip1.supported && mip1.byte_offset == 2304 &&
+              mip2.supported && mip2.byte_offset == 0,
+              "SW_256B_S mip chain is reverse-ordered and independently block-aligned");
+    }
 
     // The vector convenience overload must be safe for a NATURALLY-sized (width*height*4, unpadded)
     // tiled input: it zero-pads internally instead of reading past the vector (heap OOB). The visible

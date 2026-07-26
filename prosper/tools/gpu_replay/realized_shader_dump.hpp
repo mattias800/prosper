@@ -12,6 +12,7 @@ namespace prosper::tools {
 struct RealizedShaderSelector {
     uint64_t draw_index = 0;
     bool vertex = false;
+    bool vertex_main = false;
 };
 
 struct RecompiledShaderView {
@@ -56,9 +57,10 @@ inline bool parse_realized_shader_selector(const std::string& spec,
     if (errno == ERANGE || end != spec.c_str() + colon)
         return false;
     const std::string stage = spec.substr(colon + 1);
-    if (stage != "vs" && stage != "fs") return false;
+    if (stage != "vs" && stage != "vs-main" && stage != "fs") return false;
     selector.draw_index = static_cast<uint64_t>(draw);
-    selector.vertex = stage == "vs";
+    selector.vertex = stage == "vs" || stage == "vs-main";
+    selector.vertex_main = stage == "vs-main";
     return true;
 }
 
@@ -94,11 +96,14 @@ inline const gpu::GpuCaptureRawShaderVersion* select_realized_raw_shader(
         return nullptr;
     }
     const auto& draw = replay.items[item_index];
-    const uint32_t raw_index = selector.vertex
-        ? draw.vs_raw_shader_index : draw.fs_raw_shader_index;
+    const uint32_t raw_index = selector.vertex_main
+        ? draw.vs_chain_raw_shader_index
+        : (selector.vertex ? draw.vs_raw_shader_index : draw.fs_raw_shader_index);
     if (raw_index >= replay.raw_shader_versions.size()) {
         error = "realized shader " + spec +
-                " has no captured raw stream (capture predates v19 or source was unreadable)";
+                (selector.vertex_main
+                    ? " has no captured linked main stream (capture predates v31 or draw is not linked)"
+                    : " has no captured raw stream (capture predates v19 or source was unreadable)");
         return nullptr;
     }
     error.clear();

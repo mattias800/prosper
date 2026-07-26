@@ -568,20 +568,22 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
             i.has_sdwa = (src0 == 0xF9u);
             i.len_dwords = (max_dwords >= 2) ? 2 : 1;
             if (max_dwords >= 2) i.words[1] = code[1];
-            // DPP16 (src0 == 0xFA) QUAD_PERM subset (#273): dword1 = SRC0[7:0], DPP_CTRL[16:8]
-            // (< 0x100 = quad_perm), FI[18], BC[19], src neg/abs [23:20], bank_mask[27:24],
-            // row_mask[31:28]. A full-quad permute (masks 0xf, no neg/abs/FI) is handleable — the
-            // recompiler reconstructs the lane value from screen-space derivatives. Anything else
-            // (row shifts/broadcasts, partial masks, modifiers) keeps has_modifier -> rejected.
+            // DPP16 (src0 == 0xFA) modeled subsets (#273/#1390): dword1 = SRC0[7:0],
+            // DPP_CTRL[16:8] (< 0x100 = quad_perm; 0x111..0x11f = row_shr:1..15), FI[18],
+            // BC[19], src neg/abs [23:20], bank_mask[27:24], row_mask[31:28].  Full-mask operations
+            // without source modifiers/FI can be lowered by a supported shader-stage model.  Other
+            // row operations, partial masks, and modifiers keep has_modifier -> rejected.
             // (Field layout verified against llvm-mc gfx1010 round-trips of DOLL's live words,
             // e.g. 0x7e0802fa 0xff08a002 -> v_mov_b32_dpp v4, v2 quad_perm:[0,0,2,2]
             // row_mask:0xf bank_mask:0xf bound_ctrl:1.)
             if (src0 == 0xFAu && max_dwords >= 2 && vf != Rdna2Format::VOPC) {
                 const uint32_t d1 = code[1];
                 const uint32_t ctrl = (d1 >> 8) & 0x1FFu;
-                if (ctrl < 0x100u && ((d1 >> 28) & 0xFu) == 0xFu && ((d1 >> 24) & 0xFu) == 0xFu &&
+                const bool modeled_ctrl = ctrl < 0x100u || (ctrl >= 0x111u && ctrl <= 0x11Fu);
+                if (modeled_ctrl && ((d1 >> 28) & 0xFu) == 0xFu && ((d1 >> 24) & 0xFu) == 0xFu &&
                     ((d1 >> 20) & 0xFu) == 0u && ((d1 >> 18) & 1u) == 0u) {
                     i.has_modifier = false; i.has_dpp = true; i.dpp_ctrl = (uint16_t)ctrl;
+                    i.dpp_bound_ctrl = ((d1 >> 19) & 1u) != 0u;
                 }
                 // Astro Bot's NGG primitive packer performs two bounded row-right shifts before
                 // v_add_nc_u32. The one-lane vertex model lowers the absent neighbor to zero; admit

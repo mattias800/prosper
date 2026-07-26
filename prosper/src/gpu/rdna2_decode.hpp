@@ -60,11 +60,13 @@ struct Rdna2Inst {
     // (dst_sel defaults to DWORD=6, hardware PRESERVES the unwritten f16 half) from the SDWA
     // DWORD+UNUSED_PAD form (same field values, hardware ZERO-fills) — ISA Table 88 DST_U.
     bool        has_sdwa = false;
-    // DPP16 QUAD_PERM (#273): a full-quad permute (ctrl < 0x100, row/bank masks 0xf, no neg/abs/FI) —
-    // the manual-ddx/ddy idiom. The recompiler lowers it via screen-space derivatives (fragment only);
-    // src[0] holds the REAL source VGPR (dword1[7:0]) and dpp_ctrl the 8-bit lane selector.
+    // DPP16 QUAD_PERM/ROW_SHR (#273/#1390): a full-mask operation with no neg/abs/FI.  The
+    // recompiler lowers quad permutations through stage-appropriate lane operations and bounded row
+    // shifts in the portable one-live-lane vertex shell.  src[0] holds the REAL source VGPR
+    // (dword1[7:0]); dpp_ctrl and dpp_bound_ctrl retain the architectural control fields.
     bool        has_dpp = false;
     uint16_t    dpp_ctrl = 0;
+    bool        dpp_bound_ctrl = false;
     // SDWA sub-word selects (#273): WORD_0/WORD_1 dst/src selects with UNUSED_PRESERVE — the f16
     // half-packing idiom (DOLL's box-blur: `v_mul_f16_sdwa … dst_sel:WORD_1 preserve` then
     // `v_mov_b32_sdwa … dst_sel:WORD_0 src0_sel:WORD_1`). 6 = DWORD (the default / no select);

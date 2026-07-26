@@ -64,7 +64,8 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v29: retain resolved depth-bias state per realized and failed pipeline.
 // v30: each const-fold-resolved buffer fetch retains its proven vertex/instance/shader VADDR source.
 // This is a per-resource trailing block so every v1-v29 record prefix stays byte-exact.
-constexpr uint32_t kVersion = 30;
+// v31: retain an optional linked vertex-main raw stream and the graphics-LDS allocation per draw.
+constexpr uint32_t kVersion = 31;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -799,7 +800,8 @@ bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& er
     std::set<OperationIdentity> diagnosed;
     std::vector<bool> raw_referenced(capture.raw_shader_versions.size(), false);
     for (const auto& draw : capture.draws) {
-        for (uint32_t index : {draw.vs_raw_shader_index, draw.fs_raw_shader_index}) {
+        for (uint32_t index : {draw.vs_raw_shader_index, draw.fs_raw_shader_index,
+                               draw.vs_chain_raw_shader_index}) {
             if (index == 0xFFFFFFFFu) continue;
             if (index >= capture.raw_shader_versions.size()) {
                 error = "realized draw references an invalid raw shader";
@@ -831,7 +833,13 @@ bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& er
             error = "duplicate failed-operation diagnostic";
             return false;
         }
-        std::set<uint8_t> stage_kinds;
+        // A hardware graphics stage can be assembled from more than one separately allocated
+        // program.  In particular, AGC's NGG vertex path binds a prolog that transfers control to
+        // the separately registered main shader.  Keep both raw streams in a failed-operation
+        // diagnostic: treating the logical stage as unique made exactly the capture needed to
+        // diagnose a linked-stage failure impossible.  The (kind,address) identity must still be
+        // unique so an accidentally duplicated record remains fail-visible.
+        std::set<std::pair<uint8_t, uint64_t>> stage_programs;
         for (const auto& stage : diagnostic.stages) {
             if (stage.stage > ShaderProgramStage::Compute ||
                 (stage.raw_shader_index != 0xFFFFFFFFu &&
@@ -844,7 +852,8 @@ bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& er
                 stage.coverage.unsupported > stage.coverage.total ||
                 (!stage.resource_table_present && stage.resource_count != 0) ||
                 (!stage.program_addr && stage.raw_shader_index != 0xFFFFFFFFu) ||
-                !stage_kinds.insert(static_cast<uint8_t>(stage.stage)).second) {
+                !stage_programs.emplace(static_cast<uint8_t>(stage.stage),
+                                        stage.program_addr).second) {
                 error = "invalid failed-stage diagnostic metadata";
                 return false;
             }
@@ -1050,7 +1059,11 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
                                         c.vs_raw_shader_index, error) ||
             !capture_raw_shader_version(d.fs_guest_addr, reader, out, raw_shader_words,
                                         raw_shader_index_by_address,
-                                        c.fs_raw_shader_index, error)) return false;
+                                        c.fs_raw_shader_index, error) ||
+            !capture_raw_shader_version(d.vs_chain_guest_addr, reader, out, raw_shader_words,
+                                        raw_shader_index_by_address,
+                                        c.vs_chain_raw_shader_index, error)) return false;
+        c.vertex_lds_dwords = d.vertex_lds_dwords;
         if (!capture_table(d.vrt.get(), intervals, include_resource_data, c.vrt, error) ||
             !capture_table(d.prt.get(), intervals, include_resource_data, c.prt, error)) return false;
         out.draws.push_back(std::move(c));
@@ -1688,6 +1701,14 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         write_fetch_index_modes(draw.prt);
     }
     for (const auto& compute : c.computes) write_fetch_index_modes(compute.resources);
+    // v31 retains a separately-installed NGG vertex main stage and the exact graphics-LDS
+    // allocation. This lets diagnostic replay reconstruct linked prolog+main programs instead of
+    // incorrectly probing the fetch prolog alone. Older captures keep both fields unavailable.
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws) {
+        w.u32(draw.vs_chain_raw_shader_index);
+        w.u32(draw.vertex_lds_dwords);
+    }
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -2372,6 +2393,19 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
         for (auto& compute : c.computes)
             if (!read_fetch_index_modes(compute.resources)) return false;
     }
+    if (version >= 31) {   // linked NGG vertex main stage + graphics LDS
+        uint32_t draw_count = 0;
+        if (!r.u32(draw_count) || draw_count != c.draws.size()) {
+            error = "invalid linked-vertex draw-state count"; return false;
+        }
+        for (auto& draw : c.draws) {
+            if (!r.u32(draw.vs_chain_raw_shader_index) || !r.u32(draw.vertex_lds_dwords))
+                return false;
+            if (draw.vertex_lds_dwords > 16384u) {
+                error = "invalid linked-vertex LDS allocation"; return false;
+            }
+        }
+    }
     if (version >= 7 && !validate_failure_diagnostics(c, error)) return false;
     if (r.left) { error = "capture has trailing data"; return false; }
     return true;
@@ -2483,7 +2517,10 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         d.draw_index = x.draw_index; d.command_order = x.command_order;
         d.vs_raw_shader_index = x.vs_raw_shader_index;
         d.fs_raw_shader_index = x.fs_raw_shader_index;
+        d.vs_chain_raw_shader_index = x.vs_chain_raw_shader_index;
+        d.vertex_lds_dwords = x.vertex_lds_dwords;
         if (!table(x.vrt, d.vrt) || !table(x.prt, d.prt)) return false;
+        if (d.vrt) d.vrt->vertices_per_instance = d.vertex_count;
         out.items.push_back(std::move(d));
     }
     out.computes.reserve(c.computes.size());

@@ -14,13 +14,15 @@
 
 namespace prosper::gpu {
 
-// AGC/GFX10 T# tile_mode values we recognize. 0 = linear (no swizzle). 5 = SW_4KB_S (the RGBA render
-// target). 9 = SW_64KB_S (standard 64KB, DOLL's material textures), 24 = SW_64KB_Z_X
+// AGC/GFX10 T# tile_mode values we recognize. 0 = linear (no swizzle). 1 = SW_256B_S (small
+// standard-swizzled textures), 5 = SW_4KB_S (the RGBA render target). 9 = SW_64KB_S (standard 64KB,
+// DOLL's material textures), 24 = SW_64KB_Z_X
 // (depth/texture 64KB with pipe XOR, Astro Bot compute surfaces), and 27 = SW_64KB_R_X
 // (render-target 64KB with pipe XOR, DOLL's RT/post composites) — #288/#825.
 // Others fall through to a linear copy for now.
 enum class TileMode : uint32_t {
     Linear = 0,
+    Sw256BS = 1,
     Sw4KbS = 5,
     Sw64KbS = 9,
     Sw64KbZX = 24,

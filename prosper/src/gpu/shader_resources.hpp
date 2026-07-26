@@ -291,6 +291,10 @@ struct ShaderResource {
 // recompiler consults it while translating memory ops and the pipeline binds from it. Pure data.
 struct ShaderResourceTable {
     std::vector<ShaderResource> resources;
+    // Graphics-only draw ABI input used by the portable NGG shell. Hardware packs consecutive
+    // vertex/instance invocations into guest waves; flattening InstanceIndex therefore needs the
+    // submitted number of vertices per instance. Zero keeps standalone shader fixtures compatible.
+    uint32_t vertices_per_instance = 0;
 
     // Resolve the resource whose descriptor originates at `srt_offset` (indirect/`s_load` provenance);
     // nullptr if none. Deterministic; first match wins.

@@ -203,6 +203,19 @@ int main() {
           mtbuf_tfe.unsupported == 1 && mtbuf_tfe.first_bad_op == 0u,
           "MTBUF TFE remains explicit unsupported coverage until its status write is modeled");
 
+    // Messenger's bindless VS loads a V# through a register-offset s_load_dwordx4. The production
+    // emitter resolves it only with the per-draw resource table, so the table-less coverage pass must
+    // classify this as context-dependent (the same contract as MUBUF/MTBUF), not unsupported.
+    const uint32_t smem_descriptor[] = {
+        0xF408020Cu, 0xD6000000u, // s_load_dwordx4 s[8:11], s[24:25], vcc_hi
+        0xBF810000u,
+    };
+    RecompileCoverage smem = recompile_coverage(
+        smem_descriptor, sizeof(smem_descriptor) / sizeof(smem_descriptor[0]));
+    CHECK(smem.total == 1 && smem.table_dependent == 1 && smem.unsupported == 0 &&
+          smem.first_bad_fmt < 0,
+          "register-offset SMEM descriptor loads report resource-table dependence");
+
     // The common compiler spill/fill form uses a fixed byte offset and one unmodified scalar base.
     // The host shader maps that private storage to one per-invocation Function array.
     const uint32_t scratch_static[] = {

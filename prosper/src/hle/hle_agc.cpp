@@ -27,6 +27,7 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <unordered_map>
 
 #ifndef _WIN32
 // #312 label-slot write watch (exec_image_linux.cpp). Weak: tools that link the AGC HLE without
@@ -752,6 +753,10 @@ std::vector<AgcFusedShaderPair>& agc_fused_shader_pairs() {
     static std::vector<AgcFusedShaderPair> v;
     return v;
 }
+std::unordered_map<uint64_t, uint64_t>& agc_shader_continuations() {
+    static std::unordered_map<uint64_t, uint64_t> continuations;
+    return continuations;
+}
 
 // Relocate one self-relative pointer field in place. SDK shader blobs use small forward offsets from
 // the pointer field; linked guest pointers live above 4 GiB. Inspect the field representation rather
@@ -800,6 +805,17 @@ extern "C" const void* prosper_agc_fused_back_header_for_front(uint64_t front_co
         match = pair.back;
     }
     return match;
+}
+
+// Fusion installs the front-half program in the hardware stage's PGM registers while its terminal
+// s_setpc_b64 transfers to the separately allocated back half. Preserve that exact SDK relationship
+// at construction time: the PM4 state intentionally exposes only the installed front address, and
+// trying to infer the continuation later from another PGM register loses valid NGG vertex programs.
+extern "C" uint64_t prosper_agc_shader_continuation_for_code(uint64_t code_addr) {
+    if (!code_addr) return 0;
+    std::lock_guard<std::mutex> lk(agc_shaders_mx());
+    const auto found = agc_shader_continuations().find(code_addr);
+    return found == agc_shader_continuations().end() ? 0 : found->second;
 }
 
 // Bounded RE probe (PROSPER_PIPETRACE): log the raw pointer args of the shader/pipeline construction
@@ -1071,12 +1087,14 @@ HLE(agc_fuse_shader_halves) {  // (Shader* dst, const Shader* front, const Shade
     {
         std::lock_guard<std::mutex> lk(agc_shaders_mx());
         const uint64_t front_code = (uint64_t)(uintptr_t)front->code;
+        const uint64_t back_code = (uint64_t)(uintptr_t)back->code;
         auto& pairs = agc_fused_shader_pairs();
         auto found = std::find_if(pairs.begin(), pairs.end(), [front_code, back](const auto& pair) {
             return pair.front_code == front_code && pair.back->code == back->code;
         });
         if (found == pairs.end()) pairs.push_back({front_code, back});
         else found->back = back;
+        if (front_code && back_code) agc_shader_continuations()[front_code] = back_code;
     }
     return 0;
 }

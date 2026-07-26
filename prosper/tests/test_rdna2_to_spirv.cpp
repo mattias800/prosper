@@ -165,6 +165,35 @@ int main() {
     printf("  kernel6 mismatches=%u (out[10]=%g expect=%g)\n", bad6, got6.size()==N?got6[10]:-1, exp6[10]);
     CHECK(got6.size()==N && bad6==0, "recompiled kernel 6 computes max via compare+select correctly");
 
+    // Kernel 6b: NGG prologs merge a scalar lane-bit dword into one VCC half. Start with a false
+    // VOPC predicate, OR bit 0 into VCC_LO, and select input0 only for guest lane 0. Repeat for
+    // VCC_HI bit 0 (guest lane 32) to prove that a B32 write preserves the untouched half.
+    auto check_vcc_half_merge = [&](bool high) {
+        const uint32_t code[] = {
+            0xBE940381u,                         // s_mov_b32 s20, 1
+            0x7C000100u,                         // v_cmp_lt_f32 vcc, v0, v0 (false)
+            high ? 0x886B6B14u : 0x886A6A14u,   // s_or_b32 vcc_{hi,lo}, s20, vcc_{hi,lo}
+            0x02000101u,                         // v_cndmask_b32 v0, v1, v0, vcc
+            0xBF810000u,
+        };
+        const auto words = recompile_valu(code, std::size(code), 2, 0);
+        std::vector<float> input(64 * 2), expected(64);
+        for (uint32_t lane = 0; lane < 64; ++lane) {
+            input[lane * 2] = 10.0f;
+            input[lane * 2 + 1] = 20.0f;
+            expected[lane] = lane == (high ? 32u : 0u) ? 10.0f : 20.0f;
+        }
+        const auto output = prosper::test::run_compute(words, input, 64, 64);
+        uint32_t bad = 0;
+        for (uint32_t lane = 0; lane < output.size() && lane < expected.size(); ++lane)
+            if (std::fabs(output[lane] - expected[lane]) > 1e-3f) ++bad;
+        CHECK(!words.empty() && output.size() == 64 && bad == 0,
+              high ? "VCC_HI scalar-mask merge updates lane 32 and preserves VCC_LO"
+                   : "VCC_LO scalar-mask merge updates lane 0 and preserves VCC_HI");
+    };
+    check_vcc_half_merge(false);
+    check_vcc_half_merge(true);
+
     // Kernel 7: signed min/max/ashr. i=(int)a; range=max(i0,i1)-min(i0,i1); out=(float)(range >> (i2&31)).
     const uint32_t code7[] = {
         0x7E001100u, 0x7E021101u, 0x7E041102u, 0x22060300u, 0x24080300u, 0x4C060704u, 0x30060702u, 0x7E000B03u, 0xBF810000u,
@@ -3051,6 +3080,45 @@ int main() {
     }
     CHECK(gotT8.size()==N && badT8==0, "T8: s_mov_b64 copies a plain scalar pair");
 
+    // T8b: S_BCNT1_I32_B64 consumes both scalar dwords and writes a 32-bit population count.
+    // This is also the data-domain fallback used when the source is not a tracked wave mask.
+    const uint32_t codeT8b[] = {
+        0xbe8603ffu, 0xf0f0f0f0u,
+        0xbe8703ffu, 0x80000001u,
+        0xbe801006u,              // s_bcnt1_i32_b64 s0, s[6:7]
+        0x7e020200u,              // v_mov_b32 v1, s0
+        0xBF810000u,
+    };
+    const auto spvT8b = recompile_valu(codeT8b, std::size(codeT8b), 1, 1);
+    CHECK(!spvT8b.empty(), "recompiled T8b (s_bcnt1_i32_b64 scalar pair) -> SPIR-V");
+    const auto gotT8b = prosper::test::run_compute(spvT8b, inX, N, N);
+    uint32_t badT8b = 0;
+    for (uint32_t i = 0; i < N && gotT8b.size() == N; ++i)
+        if (bits_of(gotT8b[i]) != 18u) ++badT8b;
+    CHECK(gotT8b.size() == N && badT8b == 0,
+          "T8b: bcnt1 sums the low/high dword population counts exactly");
+
+    // T8c: GFX10's complete scalar halfword pack family.  Distinct halves catch every selector.
+    const uint32_t pack_ops[] = {0x99000706u, 0x99800706u, 0x9a000706u};
+    const uint32_t pack_expected[] = {0x77883344u, 0x55663344u, 0x55661122u};
+    for (size_t pack = 0; pack < std::size(pack_ops); ++pack) {
+        const uint32_t codeT8c[] = {
+            0xbe8603ffu, 0x11223344u,
+            0xbe8703ffu, 0x55667788u,
+            pack_ops[pack],
+            0x7e020200u,
+            0xBF810000u,
+        };
+        const auto spvT8c = recompile_valu(codeT8c, std::size(codeT8c), 1, 1);
+        CHECK(!spvT8c.empty(), "recompiled T8c (scalar halfword pack) -> SPIR-V");
+        const auto gotT8c = prosper::test::run_compute(spvT8c, inX, N, N);
+        uint32_t badT8c = 0;
+        for (uint32_t i = 0; i < N && gotT8c.size() == N; ++i)
+            if (bits_of(gotT8c[i]) != pack_expected[pack]) ++badT8c;
+        CHECK(gotT8c.size() == N && badT8c == 0,
+              "T8c: LL/LH/HH select the documented scalar halves exactly");
+    }
+
     // Kernel T9: TWO SEQUENTIAL forward uniform ifs (the DOLL color-grade PS shape, #273).
     // u=(uint)a0; scc=(3<5)=1 -> if1 RUNS (+10,+20); scc=(3<2)=0 -> if2 SKIPPED (+40).
     // out = (float)(u + 30). Previously rejected (single-forward-if only).
@@ -3958,6 +4026,43 @@ int main() {
         if (gb != bits_of(inX[i])) badA7++;
     }
     CHECK(gotA7.size()==N && badA7==0, "A7: s_bfe_u64 width 0 extracts 0 (defined result)");
+
+    // A7b (#1390): NGG merged-stage prologues build an active-lane mask with s_bfe_u64 and write it
+    // directly to EXEC. VCC_LO is scalar scratch here (the offset/width control 0x00080020), not a
+    // VOPC mask. Offset 32 also proves the inline -1 source is correctly sign-extended to a B64
+    // operand. The first eight lanes of every wave write 1.0; all other masked lanes retain 0.
+    const uint32_t codeA7b[] = {
+        0xbeea03ffu, 0x00080020u, // s_mov_b32 vcc_lo, width=8 offset=32
+        0x94fe6ac1u,              // s_bfe_u64 exec, -1, vcc
+        0x7e0202f2u,              // v_mov_b32 v1, 1.0
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvA7b = recompile_valu(codeA7b, std::size(codeA7b), 1, 1);
+    CHECK(!spvA7b.empty(), "A7b: s_bfe_u64 writing EXEC recompiles");
+    std::vector<float> gotA7b = prosper::test::run_compute(spvA7b, inX, N, N);
+    uint32_t badA7b = 0;
+    for (uint32_t i = 0; i < N && gotA7b.size() == N; ++i)
+        if (gotA7b[i] != ((i & 63u) < 8u ? 1.0f : 0.0f)) ++badA7b;
+    CHECK(gotA7b.size() == N && badA7b == 0,
+          "A7b: s_bfe_u64 updates EXEC with the extracted per-lane mask");
+
+    // A7c (#1390): the same BFE destination can be VCC. Moving that mask into EXEC must consume the
+    // freshly extracted VCC bits, not the stale per-lane condition that preceded the scalar write.
+    const uint32_t codeA7c[] = {
+        0xbeea03ffu, 0x00080000u, // s_mov_b32 vcc_lo, width=8 offset=0
+        0x94ea6ac1u,              // s_bfe_u64 vcc, -1, vcc
+        0xbefe046au,              // s_mov_b64 exec, vcc
+        0x7e0202f2u,              // v_mov_b32 v1, 1.0
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvA7c = recompile_valu(codeA7c, std::size(codeA7c), 1, 1);
+    CHECK(!spvA7c.empty(), "A7c: s_bfe_u64 writing VCC recompiles");
+    std::vector<float> gotA7c = prosper::test::run_compute(spvA7c, inX, N, N);
+    uint32_t badA7c = 0;
+    for (uint32_t i = 0; i < N && gotA7c.size() == N; ++i)
+        if (gotA7c[i] != ((i & 63u) < 8u ? 1.0f : 0.0f)) ++badA7c;
+    CHECK(gotA7c.size() == N && badA7c == 0,
+          "A7c: s_bfe_u64 updates VCC and a later mask consumer observes it");
 
     // A8 (#880): an inline float constant in a 16-bit operand supplies the f16 encoding.
     // v_cvt_f32_f16_e32 v1, 1.0 must produce 1.0f (the old raw-f32-pattern unpack gave 0.0).

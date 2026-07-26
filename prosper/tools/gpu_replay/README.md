@@ -200,8 +200,10 @@ rasterize, so "all verts clipped" is not "renders nothing"; the bbox tells them 
 
 Mechanics: on a capsule (stored SPIR-V) gpu_replay resolves semantic draw N to its compact item, then
 re-recompiles that draw's raw RDNA2 VS with `gl_Position`
-xfb-decorated (requires a v19+ capsule that retained the raw VS stream) and swaps it in for that one draw; the
-live app recompiles fresh. Requires the device to advertise `VK_EXT_transform_feedback` (RADV, lavapipe). The
+xfb-decorated and swaps it in for that one draw. A v19+ capsule is sufficient for an ordinary vertex shader;
+v31+ additionally retains a separately-installed NGG main stage and its graphics-LDS allocation, allowing
+linked prolog+main programs to be probed faithfully. The live app recompiles fresh. Requires the device to
+advertise `VK_EXT_transform_feedback` (RADV, lavapipe). The
 probed draw's rendered pixels may be inexact (the re-recompile drops pixel-input remapping), but the captured
 `gl_Position` values are faithful; inert and byte-identical when the env var is unset.
 
@@ -303,7 +305,7 @@ palette-UV audit).
 
 `--dump-shader DRAW:vs|fs PATH` writes the recompiled SPIR-V. `DRAW` is the semantic ID printed by
 `--inspect-only`, as it is for the probes above. Capture v19 adds
-`--dump-realized-shader DRAW:vs|fs PATH` for the exact bounded raw RDNA2 stream that produced that realized
+`--dump-realized-shader DRAW:vs|vs-main|fs PATH` for the exact bounded raw RDNA2 stream that produced that realized
 draw stage, suitable for `shader_inspect`. The VS/FS streams use the same content-addressed 64 KiB-per-stage,
 64 MiB-total store as failed-shader diagnostics. Captures v1-v18 remain readable; because they did not retain
 realized-stage source identities, this command reports the raw stream as unavailable instead of guessing.

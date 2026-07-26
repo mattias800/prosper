@@ -89,6 +89,9 @@ struct GpuCapturedDraw {
     uint64_t command_order = 0;
     uint32_t vs_raw_shader_index = 0xFFFFFFFFu;
     uint32_t fs_raw_shader_index = 0xFFFFFFFFu;
+    // v31: optional separately-installed vertex main stage and its exact graphics-LDS allocation.
+    uint32_t vs_chain_raw_shader_index = 0xFFFFFFFFu;
+    uint32_t vertex_lds_dwords = 0;
 };
 
 struct GpuCapturedCompute {

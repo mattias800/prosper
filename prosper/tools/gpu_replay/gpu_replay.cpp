@@ -59,7 +59,7 @@ void usage(const char* argv0) {
                          "[--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
                          "[--dump-rtt-seed ADDR PATH] "
                          "[--dump-shader DRAW:vs|fs PATH] [--dump-compute N PATH] "
-                         "[--dump-realized-shader DRAW:vs|fs PATH] "
+                         "[--dump-realized-shader DRAW:vs|vs-main|fs PATH] "
                          "[--override-compute-spv N PATH] "
                          "[--dump-failed-shader FAILURE:STAGE PATH] "
                          "[--dump-compute-resource N:BINDING PATH] "
@@ -1426,7 +1426,8 @@ int main(int argc, char** argv) {
     // Geometry probe (PROSPER_GEOM_PROBE=N): a capsule stores already-recompiled SPIR-V, so to capture
     // draw N's gl_Position via transform feedback we re-recompile its raw RDNA2 VS with xfb decorations
     // and swap it in here; render_runner then binds a TF buffer around that draw and reports where its
-    // post-transform vertices land. Requires a v19+ capsule that retained the raw VS stream.
+    // post-transform vertices land. v31+ capsules also retain separately-installed linked vertex mains
+    // and graphics LDS; earlier capsules can probe only single-stage vertex programs.
     if (const char* g = std::getenv("PROSPER_GEOM_PROBE")) {
         uint64_t n = 0;
         if (!prosper::gpu::parse_diagnostic_draw_id(g, n)) {
@@ -1443,14 +1444,27 @@ int main(int argc, char** argv) {
                 ? -1 : static_cast<long long>(operation_index);
             if (it.vs_raw_shader_index < replay.raw_shader_versions.size()) {
                 const auto& raw = replay.raw_shader_versions[it.vs_raw_shader_index];
-                auto xfb = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
-                                                          it.vrt.get(), nullptr, true);
+                std::vector<uint32_t> xfb;
+                const bool linked =
+                    it.vs_chain_raw_shader_index < replay.raw_shader_versions.size();
+                if (linked) {
+                    const auto& main =
+                        replay.raw_shader_versions[it.vs_chain_raw_shader_index];
+                    xfb = prosper::gpu::recompile_vertex_chain(
+                        raw.words.data(), raw.words.size(), main.words.data(), main.words.size(),
+                        it.vrt.get(), nullptr, true, it.vertex_lds_dwords);
+                } else {
+                    xfb = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
+                                                         it.vrt.get(), nullptr, true,
+                                                         it.vertex_lds_dwords);
+                }
                 if (!xfb.empty()) {
                     it.set_vs(std::move(xfb));
                     std::fprintf(stderr,
-                                 "[geom-probe] draw=%llu item=%zu operation=%lld VS re-recompiled "
-                                 "with xfb capture (%zu words)\n",
-                                 draw_label, item_index, operation_label, it.vs.size());
+                                 "[geom-probe] draw=%llu item=%zu operation=%lld VS%s re-recompiled "
+                                 "with xfb capture (%zu words, lds=%u dwords)\n",
+                                 draw_label, item_index, operation_label,
+                                 linked ? "+main" : "", it.vs.size(), it.vertex_lds_dwords);
                 } else {
                     std::fprintf(stderr, "[geom-probe] draw %llu: xfb re-recompile produced no VS "
                                          "(no raw stream / unsupported)\n", draw_label);
