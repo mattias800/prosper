@@ -2285,7 +2285,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                                   const float* clear_rgba1 = nullptr,
                                                   std::vector<uint8_t>* out_rgba1 = nullptr,
                                                   BackendSubmissionBatch* submission_batch = nullptr,
-                                                  bool flush_submission_batch = true) {
+                                                  bool flush_submission_batch = true,
+                                                  std::span<const BackendDraw> logical_ds_draws = {}) {
     using TimingClock = std::chrono::steady_clock;
     const bool timing_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
     const auto timing_start = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
@@ -2419,19 +2420,36 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // Use a stencil-capable depth format ONLY when a draw actually uses stencil (a UI mask). The
     // depth-only path keeps the original D32 depth-only format + aspect, so existing render tests are
     // byte-identical (#264).
+    // Physical passes created for one logical draw batch must retain the exact DS attachment that
+    // the original unsplit pass would have selected. Segment-local first states can carry aliased
+    // or partly stale DB bases (for example dr=0,dw=P followed by dr=P,dw=P); re-keying at the pass
+    // boundary would bind a newly-cleared attachment even though sampled-depth lookup still finds
+    // the producer image. The logical span is supplied only by the split wrapper below.
+    const std::span<const BackendDraw> identity_draws = logical_ds_draws.empty()
+        ? draws : logical_ds_draws;
     const prosper::gpu::ResolvedPipelineState* identity = nullptr;
-    for (const auto& d : draws)
+    bool logical_use_stencil = false;
+    for (const auto& d : identity_draws) {
+        if (d.ps && (d.ps->stencil_enable ||
+                     stencil_clear_effective(d.ps->stencil_clear_enable,
+                                             d.ps->stencil_enable,
+                                             d.ps->stencil_write_mask[0],
+                                             d.ps->stencil_write_mask[1])))
+            logical_use_stencil = true;
         if (d.ps && (d.ps->depth_test_enable || d.ps->stencil_enable ||
                      effective_depth_clear(d.ps) ||
                      stencil_clear_effective(d.ps->stencil_clear_enable, d.ps->stencil_enable,
                                              d.ps->stencil_write_mask[0],
-                                             d.ps->stencil_write_mask[1]))) { identity = d.ps; break; }
+                                             d.ps->stencil_write_mask[1])) && !identity)
+            identity = d.ps;
+    }
+    if (getenv("PROSPER_NO_STENCIL")) logical_use_stencil = false;
     const bool has_ds_identity = identity && (identity->depth_read_base || identity->depth_write_base ||
                                                identity->stencil_read_base || identity->stencil_write_base);
     const bool persistent_ds = persist_depth_stencil && use_ds && has_ds_identity;
     // A persistent attachment must keep a stable format even across a depth-only call between stencil
     // users. Nonzero stencil identity means this guest surface owns a stencil plane.
-    const bool format_has_stencil = use_stencil || (persistent_ds &&
+    const bool format_has_stencil = logical_use_stencil || (persistent_ds &&
         (identity->stencil_read_base || identity->stencil_write_base));
     const VkFormat DFMT = format_has_stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT;
     const VkImageAspectFlags DASPECT = VK_IMAGE_ASPECT_DEPTH_BIT |
@@ -5557,7 +5575,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             all.subspan(begin, end - begin), W, H, next_seed0,
             begin ? nullptr : clear_rgba, true, segment_target_ptr, next_seed1,
             begin ? nullptr : clear_rgba1, segment_out1, submission_batch,
-            final ? flush_submission_batch : false);
+            final ? flush_submission_batch : false, all);
         add_stats();
 
         if (final) {
