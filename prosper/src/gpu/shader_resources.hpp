@@ -79,6 +79,11 @@ float half_to_float(uint16_t h);
 // a format-free storage-image write targets an R16_FLOAT/R16G16B16A16_FLOAT guest surface.
 uint16_t float_to_half(float f);
 
+// Narrow one normalized 16-bit channel to the RGBA8 upload path with nearest-value scaling. Reading
+// only one byte is not an approximation: it makes a monotonic R16 gradient wrap every 256 source
+// values, which appears as repeated contour bands in sampled attenuation ramps (#1186).
+uint8_t unorm16_to_unorm8(uint16_t value);
+
 // Unsigned small-float components of a packed Float10_11_11 texel (#294). Both share binary16's
 // 5-bit exponent (bias 15) with a shortened mantissa (6 bits for the 11-bit R/G, 5 for the 10-bit B)
 // and NO sign bit — so a left-shift of the mantissa into a half's 10-bit field is an exact

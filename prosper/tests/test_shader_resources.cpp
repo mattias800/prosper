@@ -95,6 +95,19 @@ int main() {
           float_to_half(half_to_float(0x7bffu)) == 0x7bffu,
           "float16 -> float32 -> float16 round-trip is bit exact for finite values");
 
+    CHECK(unorm16_to_unorm8(0x0000u) == 0u && unorm16_to_unorm8(0x00ffu) == 1u &&
+          unorm16_to_unorm8(0x8000u) == 128u && unorm16_to_unorm8(0xffffu) == 255u,
+          "UNORM16 -> UNORM8 uses the complete little-endian value and preserves endpoints");
+    uint32_t unorm16_reversals = 0;
+    uint8_t previous_unorm8 = unorm16_to_unorm8(0);
+    for (uint32_t value = 1; value <= 0xffffu; ++value) {
+        const uint8_t current = unorm16_to_unorm8(static_cast<uint16_t>(value));
+        if (current < previous_unorm8) ++unorm16_reversals;
+        previous_unorm8 = current;
+    }
+    CHECK(unorm16_reversals == 0,
+          "UNORM16 -> UNORM8 remains monotonic instead of wrapping at byte boundaries");
+
     // A table as the front-half would build it: a float32×4 constant buffer (descriptor at SRT 0x20)
     // and a unorm8×4 vertex buffer (descriptor at SRT 0x40).
     ShaderResourceTable t;
