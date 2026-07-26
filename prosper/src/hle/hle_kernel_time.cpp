@@ -945,7 +945,10 @@ namespace {
     PROSPER_HEAP_MUTEX(g_apr_mx);   // #707: heap-backed on macOS (hot APR mutex in the corrupted __DATA cluster)
     std::vector<AprEqReg> g_apr_eq_regs;               // guarded by g_apr_mx (registration log)
     uint64_t g_apr_ring_seq[64] = {};                  // per-ring counters for prosper-issued tokens
-    uint64_t g_apr_tag_hwm[64] = {};                   // per-ring highest tag counter posted (guarded)
+    std::unordered_map<uint64_t, uint64_t> g_apr_tag_hwm; // (equeue identity, ring) -> highest counter
+    uint64_t apr_hwm_key(uint64_t eq_identity, unsigned ring) {
+        return (eq_identity << 6) | (ring & 0x3f);
+    }
     void apr_post(uint64_t eq, uint64_t eq_identity, int64_t id,
                   unsigned ring, uint64_t token) {   // no APR lock held
         SceKEvent e{}; e.ident = id + (int64_t)ring; e.filter = EVFILT_AMPR_MODELED;
@@ -962,7 +965,7 @@ namespace {
 // last+1..cnt, so the highest counter covers every pending batch on the ring).
 void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
                                int64_t id, uint64_t token) {
-    if (!eq_identity) return;
+    if (!eq_identity || prosper_eq_identity(eq) != eq_identity) return;
     // TWO tag dialects share the H896 binding call, discriminated by the binding's id (a2):
     //   id = 0x74fe+ring (the FAPREventQueueListener channel, #208): tag = (ring<<58)|counter with
     //     a ctor-seeded dense per-ring counter. The listener range-walks last+1..cnt, so the knote
@@ -1022,17 +1025,18 @@ void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
     }
     unsigned ring = (unsigned)(token >> 58) & 0x3f;
     uint64_t cnt = token & ((1ull << 58) - 1);
+    const uint64_t hwm_key = apr_hwm_key(eq_identity, ring);
     {
         std::lock_guard lk(g_apr_mx);
-        if (cnt > g_apr_tag_hwm[ring]) g_apr_tag_hwm[ring] = cnt;
+        if (cnt > g_apr_tag_hwm[hwm_key]) g_apr_tag_hwm[hwm_key] = cnt;
     }
     if (evlog()) fprintf(stderr, "[ev] AprTagComplete token=0x%llx (ring=%u) -> eq=0x%llx scheduled\n",
                          (unsigned long long)token, ring, (unsigned long long)eq);
-    std::thread([eq, eq_identity, id, ring] {
+    std::thread([eq, eq_identity, id, ring, hwm_key] {
         struct timespec ts{ 0, 2000000 };   // 2 ms
         nanosleep(&ts, nullptr);
         uint64_t hwm;
-        { std::lock_guard lk(g_apr_mx); hwm = g_apr_tag_hwm[ring]; }
+        { std::lock_guard lk(g_apr_mx); hwm = g_apr_tag_hwm[hwm_key]; }
         apr_post(eq, eq_identity, id, ring, ((uint64_t)ring << 58) | hwm);
     }).detach();
 }

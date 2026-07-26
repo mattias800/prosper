@@ -174,6 +174,18 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(40));
         CHECK(get_count(replacement_eq, 0, 0, 0, 0, 0) == 0,
               "deleted AMPR queue cannot post into a replacement lifetime");
+        constexpr uint64_t replacement_tag = tail_tag + 1;
+        prosper_eq_post_apr_token(replacement_eq, replacement_identity,
+                                  event_id, replacement_tag);
+        KEvent replacement_event{};
+        int32_t replacement_out = -1;
+        uint32_t replacement_timeout = 100000;
+        wait_eq(replacement_eq, (uint64_t)(uintptr_t)&replacement_event, 1,
+                (uint64_t)(uintptr_t)&replacement_out,
+                (uint64_t)(uintptr_t)&replacement_timeout, 0);
+        CHECK(replacement_out == 1 &&
+                  (uint64_t)replacement_event.data == replacement_tag,
+              "stale equeue lifetime cannot poison a replacement completion token");
 
         std::array<uint64_t, 8> destroyed_storage{};
         const uint64_t destroyed_cb = (uint64_t)(uintptr_t)destroyed_storage.data();
