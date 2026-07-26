@@ -366,6 +366,161 @@ int main() {
                   "same-pass consumer samples attached depth while stencil remains writable (#1186)");
         }
 
+        // #1186 regression: Bendy records the depth-writing scene geometry and its later deferred
+        // light volumes in one same-target draw run. The light samples that attached scene depth.
+        // One Vulkan render pass cannot expose a writable attachment as a sampled image, so the
+        // logical draw batch must split at the write -> sample transition while retaining color,
+        // depth, and stencil between the two ordered backend passes. The two states deliberately
+        // use different register aliases/HTILE values: selecting a segment-local persistent-DS key
+        // would give the consumer a newly-cleared attachment while its sampled descriptor still
+        // borrowed the producer image.
+        constexpr uint64_t kBatchedDepth = 0x20d5a00000ull;
+        constexpr uint64_t kBatchedStencil = 0x20d5b00000ull;
+        ResolvedPipelineState batched_producer_state = feedback_producer;
+        batched_producer_state.depth_read_base = 0;
+        batched_producer_state.depth_write_base = kBatchedDepth;
+        batched_producer_state.stencil_read_base = 0;
+        batched_producer_state.stencil_write_base = kBatchedStencil;
+        batched_producer_state.htile_data_base = 0x20d5900000ull;
+        batched_producer_state.stencil_pass_op[0] =
+            batched_producer_state.stencil_pass_op[1] = 2; // REPLACE
+        batched_producer_state.stencil_op_val[0] =
+            batched_producer_state.stencil_op_val[1] = 2;
+        batched_producer_state.stencil_write_mask[0] =
+            batched_producer_state.stencil_write_mask[1] = 0xff;
+        const uint32_t ps_green[] = {
+            0x7e000280u, 0x7e0202f2u, 0x7e040280u, 0x7e0602f2u,
+            0xf800180fu, 0x03020100u, 0xbf810000u,
+        };
+        std::vector<uint32_t> green = recompile_fragment(
+            ps_green, sizeof(ps_green) / sizeof(ps_green[0]), nullptr);
+        CHECK(!green.empty(), "recompiled batched producer color shader");
+        prosper::test::BackendDraw batched_producer = feedback_pw;
+        batched_producer.ps = &batched_producer_state;
+        batched_producer.fs = green;
+
+        ResolvedPipelineState batched_consumer_state = feedback_state;
+        batched_consumer_state.depth_read_base = kBatchedDepth;
+        batched_consumer_state.depth_write_base = kBatchedDepth;
+        batched_consumer_state.stencil_read_base = kBatchedStencil;
+        batched_consumer_state.stencil_write_base = kBatchedStencil;
+        batched_consumer_state.htile_data_base = 0x0004dfac00ull;
+        batched_consumer_state.depth_compare_op = 2; // EQUAL: prove attachment depth survived
+        batched_consumer_state.stencil_compare_op[0] =
+            batched_consumer_state.stencil_compare_op[1] = 2; // EQUAL
+        batched_consumer_state.stencil_ref[0] = batched_consumer_state.stencil_ref[1] = 2;
+        batched_consumer_state.stencil_compare_mask[0] =
+            batched_consumer_state.stencil_compare_mask[1] = 0xff;
+        batched_consumer_state.stencil_pass_op[0] =
+            batched_consumer_state.stencil_pass_op[1] = 0; // KEEP
+        batched_consumer_state.stencil_write_mask[0] =
+            batched_consumer_state.stencil_write_mask[1] = 0;
+        batched_consumer_state.blend_enable = true;
+        batched_consumer_state.src_color_blend_factor = 1; // ONE
+        batched_consumer_state.dst_color_blend_factor = 1; // ONE
+        batched_consumer_state.color_blend_op = 0;          // ADD
+        prosper::test::FrameResource batched_resource = feedback_resource;
+        batched_resource.persistent_depth_target_id = kBatchedDepth;
+        prosper::test::BackendDraw batched_consumer = feedback_consumer;
+        batched_consumer.ps = &batched_consumer_state;
+        batched_consumer.vs = vert_z;
+        batched_consumer.R = {batched_resource};
+        prosper::test::BackendColorTarget batched_color{
+            0x20d5c00000ull, true, true, VK_FORMAT_R8G8B8A8_UNORM};
+        prosper::test::BackendSubmissionBatch batched_submission;
+        std::vector<uint8_t> via_batched_feedback = prosper::test::render_draws_rgba(
+            {batched_producer, batched_consumer}, W, H, nullptr, nullptr,
+            /*persist_depth_stencil=*/true, &batched_color, nullptr, nullptr, nullptr,
+            &batched_submission, /*flush_submission_batch=*/true);
+        CHECK(via_batched_feedback.size() == (size_t)W * H * 4,
+              "depth producer and sampled-depth consumer rendered from one logical batch");
+        if (via_batched_feedback.size() == (size_t)W * H * 4) {
+            const uint8_t* batched_center =
+                &via_batched_feedback[(((size_t)H / 2) * W + W / 2) * 4];
+            printf("  batched feedback center RG=%u/%u (want ~64/255)\n",
+                   batched_center[0], batched_center[1]);
+            CHECK(batched_center[0] > 56 && batched_center[0] < 72 &&
+                      batched_center[1] > 248,
+                  "split preserves sampled depth, tested DS planes, and persistent color LOAD (#1186)");
+        }
+
+        // The non-persistent color path carries intermediate MRT pixels through CPU seeds. Keep
+        // MRT1 untouched so its exact seed proves both readback/carry legs, while MRT0 proves that
+        // the producer's green survives and the consumer additively contributes sampled depth.
+        std::vector<uint8_t> mrt1_seed((size_t)W * H * 4);
+        for (size_t i = 0; i < mrt1_seed.size(); i += 4) {
+            mrt1_seed[i + 0] = 17; mrt1_seed[i + 1] = 34;
+            mrt1_seed[i + 2] = 51; mrt1_seed[i + 3] = 255;
+        }
+        std::vector<uint8_t> carried_mrt1;
+        std::vector<uint8_t> via_transient_feedback = prosper::test::render_draws_rgba(
+            {batched_producer, batched_consumer}, W, H, nullptr, nullptr,
+            /*persist_depth_stencil=*/true, nullptr, mrt1_seed.data(), nullptr,
+            &carried_mrt1);
+        CHECK(via_transient_feedback.size() == (size_t)W * H * 4 &&
+                  carried_mrt1.size() == mrt1_seed.size(),
+              "split transient/MRT path rendered both color attachments");
+        if (via_transient_feedback.size() == (size_t)W * H * 4 &&
+            carried_mrt1.size() == mrt1_seed.size()) {
+            const uint8_t* transient_center =
+                &via_transient_feedback[(((size_t)H / 2) * W + W / 2) * 4];
+            const uint8_t* mrt1_center =
+                &carried_mrt1[(((size_t)H / 2) * W + W / 2) * 4];
+            CHECK(transient_center[0] > 56 && transient_center[0] < 72 &&
+                      transient_center[1] > 248,
+                  "split transient color carry preserves producer and consumer composition");
+            CHECK(mrt1_center[0] == 17 && mrt1_center[1] == 34 &&
+                      mrt1_center[2] == 51 && mrt1_center[3] == 255,
+                  "split MRT carry preserves an untouched secondary attachment exactly");
+        }
+
+        // Fresh-image initialization is also a logical-pass contract. An ALWAYS producer does not
+        // constrain the fallback value, so the later meaningful reverse-Z GEQUAL must choose 0.0
+        // even though the producer occupies the first physical pass. Restrict the producer to the
+        // left half: if that segment incorrectly clears fresh depth to its local default 1.0, the
+        // full-target consumer fails depth on the untouched right half and leaves the blue color.
+        constexpr uint64_t kPartialDepth = 0x20d5d00000ull;
+        ResolvedPipelineState partial_producer_state = producer;
+        partial_producer_state.color_write_mask = 0;
+        partial_producer_state.depth_read_base = kPartialDepth;
+        partial_producer_state.depth_write_base = kPartialDepth;
+        partial_producer_state.has_scissor = true;
+        partial_producer_state.scissor_left = 0;
+        partial_producer_state.scissor_top = 0;
+        partial_producer_state.scissor_right = W / 2;
+        partial_producer_state.scissor_bottom = H;
+        prosper::test::BackendDraw partial_producer = pw;
+        partial_producer.ps = &partial_producer_state;
+
+        ResolvedPipelineState reverse_consumer_state = opaque;
+        reverse_consumer_state.depth_test_enable = true;
+        reverse_consumer_state.depth_write_enable = false;
+        reverse_consumer_state.depth_compare_op = 6; // GREATER_OR_EQUAL
+        reverse_consumer_state.depth_read_base = kPartialDepth;
+        reverse_consumer_state.depth_write_base = kPartialDepth;
+        prosper::test::FrameResource partial_resource = bridged;
+        partial_resource.persistent_depth_target_id = kPartialDepth;
+        prosper::test::BackendDraw reverse_consumer = consumer;
+        reverse_consumer.vs = vert_z;
+        reverse_consumer.ps = &reverse_consumer_state;
+        reverse_consumer.R = {partial_resource};
+        prosper::test::BackendColorTarget partial_color{
+            0x20d5e00000ull, true, true, VK_FORMAT_R8G8B8A8_UNORM};
+        prosper::test::BackendSubmissionBatch partial_submission;
+        std::vector<uint8_t> partial = prosper::test::render_draws_rgba(
+            {partial_producer, reverse_consumer}, W, H, nullptr, nullptr,
+            /*persist_depth_stencil=*/true, &partial_color, nullptr, nullptr, nullptr,
+            &partial_submission, /*flush_submission_batch=*/true);
+        CHECK(partial.size() == (size_t)W * H * 4,
+              "partial depth producer and reverse-Z consumer rendered across a split");
+        if (partial.size() == (size_t)W * H * 4) {
+            const uint8_t* written = &partial[((size_t)(H / 2) * W + W / 4) * 4];
+            const uint8_t* untouched = &partial[((size_t)(H / 2) * W + 3 * W / 4) * 4];
+            CHECK(written[0] > 56 && written[0] < 72 &&
+                      untouched[0] > 56 && untouched[0] < 72 && untouched[2] < 8,
+                  "logical reverse-Z fallback lets the consumer pass on untouched depth pixels");
+        }
+
         // ---- #1287: an ineffective clear draw must not shadow the rendered plane ----
         // Blue Prince's light loop: shadow casters render depth into plane P (identity dr=P, dw=0),
         // then a fullscreen rect with DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE set but DB_DEPTH_CONTROL

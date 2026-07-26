@@ -19,6 +19,7 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -204,10 +205,9 @@ inline BackendColorTargetStats backend_color_target_stats() {
 // When `tex` is non-null, its RGBA8 texels are uploaded to a sampled VkImage and bound as a combined
 // image sampler at tex->binding — how a recompiled pixel shader's image_sample reaches a real texture.
 // One draw for the multi-draw backend: recompiled VS+PS SPIR-V, its resolved fixed-function state, its
-// set-tagged resources, vertex count, and instance count. render_draws_rgba records ALL of a submit's
-// draws into ONE
-// render pass (clear once, then per-draw pipeline+descriptors+draw) so a multi-draw frame composites
-// correctly. render_triangle_rgba is a thin single-draw wrapper (below).
+// set-tagged resources, vertex count, and instance count. render_draws_rgba preserves every draw in
+// order, normally in one render pass; an attached-depth write/sample transition is the narrow case
+// that requires an ordered pass boundary. render_triangle_rgba is a thin single-draw wrapper (below).
 struct BackendDraw {
     std::vector<uint32_t> vs, gs, fs;
     prosper::gpu::SharedShaderWords vs_shared, fs_shared;
@@ -2275,16 +2275,18 @@ inline bool restore_persistent_ds_image(const prosper::gpu::GpuCaptureDsSeed& se
 // readback may return after recording; `flush_submission_batch` submits every accumulated command
 // buffer in order, waits once, and releases all retained resources. Omitting the batch preserves the
 // synchronous test/replay contract.
-inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& draws, uint32_t W, uint32_t H,
-                                              const uint8_t* seed_rgba = nullptr,
-                                              const float* clear_rgba = nullptr,
-                                              bool persist_depth_stencil = false,
-                                              const BackendColorTarget* color_target = nullptr,
-                                              const uint8_t* seed_rgba1 = nullptr,
-                                              const float* clear_rgba1 = nullptr,
-                                              std::vector<uint8_t>* out_rgba1 = nullptr,
-                                              BackendSubmissionBatch* submission_batch = nullptr,
-                                              bool flush_submission_batch = true) {
+inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> draws,
+                                                  uint32_t W, uint32_t H,
+                                                  const uint8_t* seed_rgba = nullptr,
+                                                  const float* clear_rgba = nullptr,
+                                                  bool persist_depth_stencil = false,
+                                                  const BackendColorTarget* color_target = nullptr,
+                                                  const uint8_t* seed_rgba1 = nullptr,
+                                                  const float* clear_rgba1 = nullptr,
+                                                  std::vector<uint8_t>* out_rgba1 = nullptr,
+                                                  BackendSubmissionBatch* submission_batch = nullptr,
+                                                  bool flush_submission_batch = true,
+                                                  std::span<const BackendDraw> logical_ds_draws = {}) {
     using TimingClock = std::chrono::steady_clock;
     const bool timing_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
     const auto timing_start = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
@@ -2340,6 +2342,11 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         : 0;
     const uint32_t color_count = use_color1 ? 2u : 1u;
     const uint32_t ds_attachment = color_count;
+    // A feedback split is a physical Vulkan detail, not a guest draw-pass boundary. Attachment
+    // identity/format and fresh-image fallback values therefore come from the original logical
+    // span. Segment-local use/write/layout decisions and explicit clears remain local below.
+    const std::span<const BackendDraw> logical_draws = logical_ds_draws.empty()
+        ? draws : logical_ds_draws;
     // Depth attachment is created if ANY draw enables the depth test (the shared render pass has one
     // fixed attachment set); each draw's pipeline sets its own depthTest/Write/CompareOp. A frame with
     // no depth-using draw takes the color-only path unchanged.
@@ -2360,7 +2367,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     };
     for (const auto& d : draws) {
         if (!d.ps) continue;
-        if (d.ps->depth_test_enable || effective_depth_clear(d.ps)) { use_depth = true;
+        if (d.ps->depth_test_enable || effective_depth_clear(d.ps)) use_depth = true;
+        if (d.ps->stencil_enable ||
+            stencil_clear_effective(d.ps->stencil_clear_enable, d.ps->stencil_enable,
+                                    d.ps->stencil_write_mask[0], d.ps->stencil_write_mask[1]))
+            use_stencil = true;
+    }
+    for (const auto& d : logical_draws) {
+        if (!d.ps) continue;
+        if (d.ps->depth_test_enable || effective_depth_clear(d.ps)) {
             // DB_DEPTH_CLEAR is only consumed when DB_RENDER_CONTROL requests an actual clear. Merely
             // programming the register does not initialize a newly-created host depth image: it is
             // commonly stale state, and Astro Bot even leaves the packed 1920x1080 max coordinates
@@ -2386,7 +2401,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                d.ps->depth_compare_op == VK_COMPARE_OP_GREATER_OR_EQUAL)
                     ? 0.0f : 1.0f;
                 got_depth_clear = true;
-            } }
+            }
+        }
         // #1355: like the depth gate above, a STENCIL_CLEAR_ENABLE bit with the stencil write
         // path disabled is inert and must not force a stencil attachment or clear in-pass. The
         // initial-value latch stays reachable through stencil_enable only, mirroring the depth
@@ -2394,7 +2410,6 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         if (d.ps->stencil_enable ||
             stencil_clear_effective(d.ps->stencil_clear_enable, d.ps->stencil_enable,
                                     d.ps->stencil_write_mask[0], d.ps->stencil_write_mask[1])) {
-            use_stencil = true;
             // Mirror the depth contract (#371/#508 via #1361): DB_STENCIL_CLEAR is consumed as a
             // fresh image's initial contents only when the guest explicitly requests a clear.
             // Latching it from every stencil-using draw let a STALE register word poison a new
@@ -2402,7 +2417,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             // unknown guest contents are approximated as 0.
             if (!got_stencil_clear && d.ps->stencil_clear_enable) {
                 stencil_clear = d.ps->stencil_clear_value; got_stencil_clear = true;
-            } }
+            }
+        }
     }
     if (const char* v = getenv("PROSPER_STENCIL_CLEAR"))
         stencil_clear = static_cast<uint32_t>(strtoul(v, nullptr, 0)) & 0xFFu;
@@ -2418,19 +2434,34 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // Use a stencil-capable depth format ONLY when a draw actually uses stencil (a UI mask). The
     // depth-only path keeps the original D32 depth-only format + aspect, so existing render tests are
     // byte-identical (#264).
+    // Physical passes created for one logical draw batch must retain the exact DS attachment that
+    // the original unsplit pass would have selected. Segment-local first states can carry aliased
+    // or partly stale DB bases (for example dr=0,dw=P followed by dr=P,dw=P); re-keying at the pass
+    // boundary would bind a newly-cleared attachment even though sampled-depth lookup still finds
+    // the producer image. The logical span is supplied only by the split wrapper below.
     const prosper::gpu::ResolvedPipelineState* identity = nullptr;
-    for (const auto& d : draws)
+    bool logical_use_stencil = false;
+    for (const auto& d : logical_draws) {
+        if (d.ps && (d.ps->stencil_enable ||
+                     stencil_clear_effective(d.ps->stencil_clear_enable,
+                                             d.ps->stencil_enable,
+                                             d.ps->stencil_write_mask[0],
+                                             d.ps->stencil_write_mask[1])))
+            logical_use_stencil = true;
         if (d.ps && (d.ps->depth_test_enable || d.ps->stencil_enable ||
                      effective_depth_clear(d.ps) ||
                      stencil_clear_effective(d.ps->stencil_clear_enable, d.ps->stencil_enable,
                                              d.ps->stencil_write_mask[0],
-                                             d.ps->stencil_write_mask[1]))) { identity = d.ps; break; }
+                                             d.ps->stencil_write_mask[1])) && !identity)
+            identity = d.ps;
+    }
+    if (getenv("PROSPER_NO_STENCIL")) logical_use_stencil = false;
     const bool has_ds_identity = identity && (identity->depth_read_base || identity->depth_write_base ||
                                                identity->stencil_read_base || identity->stencil_write_base);
     const bool persistent_ds = persist_depth_stencil && use_ds && has_ds_identity;
     // A persistent attachment must keep a stable format even across a depth-only call between stencil
     // users. Nonzero stencil identity means this guest surface owns a stencil plane.
-    const bool format_has_stencil = use_stencil || (persistent_ds &&
+    const bool format_has_stencil = logical_use_stencil || (persistent_ds &&
         (identity->stencil_read_base || identity->stencil_write_base));
     const VkFormat DFMT = format_has_stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT;
     const VkImageAspectFlags DASPECT = VK_IMAGE_ASPECT_DEPTH_BIT |
@@ -5387,6 +5418,202 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     }
     // NB: dev/instance are the persistent RenderVkCtx — do NOT destroy them here (reused across calls).
     return out;
+}
+
+// A Vulkan render pass has one depth layout for every draw. If an earlier draw writes a persistent
+// guest depth plane and a later draw samples that same plane, keeping both in one pass makes the
+// attachment writable and the sampled-depth bridge must reject the alias. Split exactly at those
+// write/sample transitions (in either direction): queue order plus the persistent color/DS caches
+// preserve guest draw order, while each resulting pass has a legal, unambiguous depth layout.
+inline size_t depth_feedback_split_index(std::span<const BackendDraw> draws,
+                                         uint32_t W, uint32_t H) {
+    std::unordered_set<uint64_t> sampled_depth;
+    std::unordered_set<uint64_t> written_depth;
+    for (size_t i = 0; i < draws.size(); ++i) {
+        const BackendDraw& draw = draws[i];
+        const bool samples_prior_write = std::any_of(
+            draw.R.begin(), draw.R.end(), [&](const FrameResource& resource) {
+                return resource.persistent_depth_target_id && resource.img_dim == 1u &&
+                    resource.tw == W && resource.th == H &&
+                    written_depth.contains(resource.persistent_depth_target_id);
+            });
+        const bool writes_depth = draw.ps && persistent_ds_pass_may_write_depth(
+            draw.ps->depth_clear_enable, draw.ps->depth_test_enable,
+            draw.ps->depth_write_enable, draw.ps->depth_compare_op);
+        const bool writes_prior_sample = writes_depth &&
+            ((draw.ps->depth_read_base && sampled_depth.contains(draw.ps->depth_read_base)) ||
+             (draw.ps->depth_write_base && sampled_depth.contains(draw.ps->depth_write_base)));
+        if (i && (samples_prior_write || writes_prior_sample)) return i;
+
+        for (const FrameResource& resource : draw.R)
+            if (resource.persistent_depth_target_id && resource.img_dim == 1u &&
+                resource.tw == W && resource.th == H)
+                sampled_depth.insert(resource.persistent_depth_target_id);
+        if (writes_depth) {
+            if (draw.ps->depth_read_base) written_depth.insert(draw.ps->depth_read_base);
+            if (draw.ps->depth_write_base) written_depth.insert(draw.ps->depth_write_base);
+        }
+    }
+    return draws.size();
+}
+
+// Logical multi-draw entry. Most calls remain one Vulkan render pass. A depth feedback transition
+// becomes multiple ordered passes without copying the (often large) BackendDraw shader/resource
+// payloads. Intermediate color is retained on the GPU when possible and carried through CPU pixels
+// only on the established non-persistent/MRT path.
+inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& draws,
+                                              uint32_t W, uint32_t H,
+                                              const uint8_t* seed_rgba = nullptr,
+                                              const float* clear_rgba = nullptr,
+                                              bool persist_depth_stencil = false,
+                                              const BackendColorTarget* color_target = nullptr,
+                                              const uint8_t* seed_rgba1 = nullptr,
+                                              const float* clear_rgba1 = nullptr,
+                                              std::vector<uint8_t>* out_rgba1 = nullptr,
+                                              BackendSubmissionBatch* submission_batch = nullptr,
+                                              bool flush_submission_batch = true) {
+    const std::span<const BackendDraw> all(draws);
+    if (!persist_depth_stencil ||
+        depth_feedback_split_index(all, W, H) == all.size())
+        return render_draw_pass_rgba(all, W, H, seed_rgba, clear_rgba,
+                                     persist_depth_stencil, color_target, seed_rgba1,
+                                     clear_rgba1, out_rgba1, submission_batch,
+                                     flush_submission_batch);
+
+    BackendColorTargetStats aggregate_color{};
+    BackendTextureUploadStats aggregate_textures{};
+    BackendResourceReuseStats aggregate_resources{};
+    BackendPipelineCacheStats aggregate_pipelines{};
+    BackendRenderTimingStats aggregate_timing{};
+    std::vector<uint8_t> carried_color0;
+    std::vector<uint8_t> carried_color1;
+    const uint8_t* next_seed0 = seed_rgba;
+    const uint8_t* next_seed1 = seed_rgba1;
+
+    auto add_stats = [&] {
+        const BackendColorTargetStats color = backend_color_target_stats();
+        aggregate_color.writes += color.writes;
+        aggregate_color.write_hits += color.write_hits;
+        aggregate_color.sampled_hits += color.sampled_hits;
+        aggregate_color.readbacks += color.readbacks;
+        aggregate_color.cached_bytes = color.cached_bytes;
+        aggregate_color.cached_entries = color.cached_entries;
+
+        const BackendTextureUploadStats textures = backend_texture_upload_stats();
+        aggregate_textures.references += textures.references;
+        aggregate_textures.unique_uploads += textures.unique_uploads;
+        aggregate_textures.upload_bytes += textures.upload_bytes;
+        aggregate_textures.persistent_hits += textures.persistent_hits;
+        aggregate_textures.persistent_misses += textures.persistent_misses;
+        aggregate_textures.persistent_cached_bytes = textures.persistent_cached_bytes;
+
+        const BackendResourceReuseStats resources = backend_resource_reuse_stats();
+#define PROSPER_SUM_RESOURCE_STAT(field) aggregate_resources.field += resources.field
+        PROSPER_SUM_RESOURCE_STAT(buffer_references);
+        PROSPER_SUM_RESOURCE_STAT(unique_buffers);
+        PROSPER_SUM_RESOURCE_STAT(texture_binding_references);
+        PROSPER_SUM_RESOURCE_STAT(unique_texture_bindings);
+        PROSPER_SUM_RESOURCE_STAT(descriptor_set_layout_references);
+        PROSPER_SUM_RESOURCE_STAT(unique_descriptor_set_layouts);
+        PROSPER_SUM_RESOURCE_STAT(pipeline_layout_references);
+        PROSPER_SUM_RESOURCE_STAT(unique_pipeline_layouts);
+        PROSPER_SUM_RESOURCE_STAT(descriptor_pools);
+        PROSPER_SUM_RESOURCE_STAT(persistent_pipeline_layout_hits);
+        PROSPER_SUM_RESOURCE_STAT(persistent_pipeline_layout_misses);
+        PROSPER_SUM_RESOURCE_STAT(persistent_pipeline_layout_evictions);
+        PROSPER_SUM_RESOURCE_STAT(persistent_texture_binding_hits);
+        PROSPER_SUM_RESOURCE_STAT(persistent_texture_binding_misses);
+        PROSPER_SUM_RESOURCE_STAT(persistent_texture_binding_evictions);
+        PROSPER_SUM_RESOURCE_STAT(buffer_hash_calls);
+        PROSPER_SUM_RESOURCE_STAT(buffer_hash_dwords);
+        PROSPER_SUM_RESOURCE_STAT(buffer_hash_skipped_unique);
+        PROSPER_SUM_RESOURCE_STAT(buffer_hash_skipped_large);
+        PROSPER_SUM_RESOURCE_STAT(buffer_ref_memo_hits);
+#undef PROSPER_SUM_RESOURCE_STAT
+        aggregate_resources.persistent_pipeline_layout_entries =
+            resources.persistent_pipeline_layout_entries;
+        aggregate_resources.persistent_texture_binding_entries =
+            resources.persistent_texture_binding_entries;
+
+        const BackendPipelineCacheStats pipelines = backend_pipeline_cache_stats();
+        aggregate_pipelines.references += pipelines.references;
+        aggregate_pipelines.hits += pipelines.hits;
+        aggregate_pipelines.misses += pipelines.misses;
+        aggregate_pipelines.bypasses += pipelines.bypasses;
+        aggregate_pipelines.entries = pipelines.entries;
+        aggregate_pipelines.evictions += pipelines.evictions;
+
+        if (getenv("PROSPER_RENDER_TIMING")) {
+            const BackendRenderTimingStats timing = backend_render_timing_stats();
+#define PROSPER_SUM_TIMING_STAT(field) aggregate_timing.field += timing.field
+            PROSPER_SUM_TIMING_STAT(calls);
+            PROSPER_SUM_TIMING_STAT(draws);
+            PROSPER_SUM_TIMING_STAT(command_buffers);
+            PROSPER_SUM_TIMING_STAT(queue_submits);
+            PROSPER_SUM_TIMING_STAT(fence_waits);
+            PROSPER_SUM_TIMING_STAT(target_ms);
+            PROSPER_SUM_TIMING_STAT(draw_setup_ms);
+            PROSPER_SUM_TIMING_STAT(record_upload_ms);
+            PROSPER_SUM_TIMING_STAT(gpu_wait_ms);
+            PROSPER_SUM_TIMING_STAT(readback_ms);
+            PROSPER_SUM_TIMING_STAT(cleanup_ms);
+            PROSPER_SUM_TIMING_STAT(setup_shader_ms);
+            PROSPER_SUM_TIMING_STAT(setup_fixed_ms);
+            PROSPER_SUM_TIMING_STAT(setup_resources_ms);
+            PROSPER_SUM_TIMING_STAT(setup_pipeline_ms);
+#undef PROSPER_SUM_TIMING_STAT
+        }
+    };
+
+    size_t begin = 0;
+    while (begin < all.size()) {
+        const std::span<const BackendDraw> remaining = all.subspan(begin);
+        const size_t relative_end = depth_feedback_split_index(remaining, W, H);
+        const size_t end = begin + relative_end;
+        const bool final = end == all.size();
+
+        BackendColorTarget segment_target{};
+        const BackendColorTarget* segment_target_ptr = nullptr;
+        if (color_target) {
+            segment_target = *color_target;
+            if (begin) segment_target.load_existing = true;
+            if (!final) segment_target.readback = false;
+            segment_target_ptr = &segment_target;
+        }
+        std::vector<uint8_t> intermediate_color1;
+        std::vector<uint8_t>* segment_out1 = out_rgba1
+            ? (final ? out_rgba1 : &intermediate_color1) : nullptr;
+        std::vector<uint8_t> rendered = render_draw_pass_rgba(
+            all.subspan(begin, end - begin), W, H, next_seed0,
+            begin ? nullptr : clear_rgba, true, segment_target_ptr, next_seed1,
+            begin ? nullptr : clear_rgba1, segment_out1, submission_batch,
+            final ? flush_submission_batch : false, all);
+        add_stats();
+
+        if (final) {
+            backend_color_target_stats_storage() = aggregate_color;
+            backend_texture_upload_stats_storage() = aggregate_textures;
+            backend_resource_reuse_stats_storage() = aggregate_resources;
+            backend_pipeline_cache_stats_storage() = aggregate_pipelines;
+            if (getenv("PROSPER_RENDER_TIMING"))
+                backend_render_timing_stats_storage() = aggregate_timing;
+            return rendered;
+        }
+
+        // A persistent color target intentionally returns no pixels here; the next pass LOADs its
+        // queued image. Transient and MRT paths read back and carry their exact output as a seed.
+        if (!rendered.empty()) carried_color0 = std::move(rendered);
+        else carried_color0.clear();
+        next_seed0 = carried_color0.empty() ? nullptr : carried_color0.data();
+        if (out_rgba1) {
+            carried_color1 = std::move(intermediate_color1);
+            next_seed1 = carried_color1.empty() ? nullptr : carried_color1.data();
+        } else {
+            next_seed1 = nullptr;
+        }
+        begin = end;
+    }
+    return {};
 }
 
 // Single-draw entry — a thin wrapper over render_draws_rgba, preserving the exact signature/behavior the
