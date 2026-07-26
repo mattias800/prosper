@@ -474,6 +474,53 @@ int main() {
                   "split MRT carry preserves an untouched secondary attachment exactly");
         }
 
+        // Fresh-image initialization is also a logical-pass contract. An ALWAYS producer does not
+        // constrain the fallback value, so the later meaningful reverse-Z GEQUAL must choose 0.0
+        // even though the producer occupies the first physical pass. Restrict the producer to the
+        // left half: if that segment incorrectly clears fresh depth to its local default 1.0, the
+        // full-target consumer fails depth on the untouched right half and leaves the blue color.
+        constexpr uint64_t kPartialDepth = 0x20d5d00000ull;
+        ResolvedPipelineState partial_producer_state = producer;
+        partial_producer_state.color_write_mask = 0;
+        partial_producer_state.depth_read_base = kPartialDepth;
+        partial_producer_state.depth_write_base = kPartialDepth;
+        partial_producer_state.has_scissor = true;
+        partial_producer_state.scissor_left = 0;
+        partial_producer_state.scissor_top = 0;
+        partial_producer_state.scissor_right = W / 2;
+        partial_producer_state.scissor_bottom = H;
+        prosper::test::BackendDraw partial_producer = pw;
+        partial_producer.ps = &partial_producer_state;
+
+        ResolvedPipelineState reverse_consumer_state = opaque;
+        reverse_consumer_state.depth_test_enable = true;
+        reverse_consumer_state.depth_write_enable = false;
+        reverse_consumer_state.depth_compare_op = 6; // GREATER_OR_EQUAL
+        reverse_consumer_state.depth_read_base = kPartialDepth;
+        reverse_consumer_state.depth_write_base = kPartialDepth;
+        prosper::test::FrameResource partial_resource = bridged;
+        partial_resource.persistent_depth_target_id = kPartialDepth;
+        prosper::test::BackendDraw reverse_consumer = consumer;
+        reverse_consumer.vs = vert_z;
+        reverse_consumer.ps = &reverse_consumer_state;
+        reverse_consumer.R = {partial_resource};
+        prosper::test::BackendColorTarget partial_color{
+            0x20d5e00000ull, true, true, VK_FORMAT_R8G8B8A8_UNORM};
+        prosper::test::BackendSubmissionBatch partial_submission;
+        std::vector<uint8_t> partial = prosper::test::render_draws_rgba(
+            {partial_producer, reverse_consumer}, W, H, nullptr, nullptr,
+            /*persist_depth_stencil=*/true, &partial_color, nullptr, nullptr, nullptr,
+            &partial_submission, /*flush_submission_batch=*/true);
+        CHECK(partial.size() == (size_t)W * H * 4,
+              "partial depth producer and reverse-Z consumer rendered across a split");
+        if (partial.size() == (size_t)W * H * 4) {
+            const uint8_t* written = &partial[((size_t)(H / 2) * W + W / 4) * 4];
+            const uint8_t* untouched = &partial[((size_t)(H / 2) * W + 3 * W / 4) * 4];
+            CHECK(written[0] > 56 && written[0] < 72 &&
+                      untouched[0] > 56 && untouched[0] < 72 && untouched[2] < 8,
+                  "logical reverse-Z fallback lets the consumer pass on untouched depth pixels");
+        }
+
         // ---- #1287: an ineffective clear draw must not shadow the rendered plane ----
         // Blue Prince's light loop: shadow casters render depth into plane P (identity dr=P, dw=0),
         // then a fullscreen rect with DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE set but DB_DEPTH_CONTROL

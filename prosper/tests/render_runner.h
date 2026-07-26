@@ -2342,6 +2342,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         : 0;
     const uint32_t color_count = use_color1 ? 2u : 1u;
     const uint32_t ds_attachment = color_count;
+    // A feedback split is a physical Vulkan detail, not a guest draw-pass boundary. Attachment
+    // identity/format and fresh-image fallback values therefore come from the original logical
+    // span. Segment-local use/write/layout decisions and explicit clears remain local below.
+    const std::span<const BackendDraw> logical_draws = logical_ds_draws.empty()
+        ? draws : logical_ds_draws;
     // Depth attachment is created if ANY draw enables the depth test (the shared render pass has one
     // fixed attachment set); each draw's pipeline sets its own depthTest/Write/CompareOp. A frame with
     // no depth-using draw takes the color-only path unchanged.
@@ -2362,7 +2367,15 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     };
     for (const auto& d : draws) {
         if (!d.ps) continue;
-        if (d.ps->depth_test_enable || effective_depth_clear(d.ps)) { use_depth = true;
+        if (d.ps->depth_test_enable || effective_depth_clear(d.ps)) use_depth = true;
+        if (d.ps->stencil_enable ||
+            stencil_clear_effective(d.ps->stencil_clear_enable, d.ps->stencil_enable,
+                                    d.ps->stencil_write_mask[0], d.ps->stencil_write_mask[1]))
+            use_stencil = true;
+    }
+    for (const auto& d : logical_draws) {
+        if (!d.ps) continue;
+        if (d.ps->depth_test_enable || effective_depth_clear(d.ps)) {
             // DB_DEPTH_CLEAR is only consumed when DB_RENDER_CONTROL requests an actual clear. Merely
             // programming the register does not initialize a newly-created host depth image: it is
             // commonly stale state, and Astro Bot even leaves the packed 1920x1080 max coordinates
@@ -2388,7 +2401,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                d.ps->depth_compare_op == VK_COMPARE_OP_GREATER_OR_EQUAL)
                     ? 0.0f : 1.0f;
                 got_depth_clear = true;
-            } }
+            }
+        }
         // #1355: like the depth gate above, a STENCIL_CLEAR_ENABLE bit with the stencil write
         // path disabled is inert and must not force a stencil attachment or clear in-pass. The
         // initial-value latch stays reachable through stencil_enable only, mirroring the depth
@@ -2396,7 +2410,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (d.ps->stencil_enable ||
             stencil_clear_effective(d.ps->stencil_clear_enable, d.ps->stencil_enable,
                                     d.ps->stencil_write_mask[0], d.ps->stencil_write_mask[1])) {
-            use_stencil = true;
             // Mirror the depth contract (#371/#508 via #1361): DB_STENCIL_CLEAR is consumed as a
             // fresh image's initial contents only when the guest explicitly requests a clear.
             // Latching it from every stencil-using draw let a STALE register word poison a new
@@ -2404,7 +2417,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             // unknown guest contents are approximated as 0.
             if (!got_stencil_clear && d.ps->stencil_clear_enable) {
                 stencil_clear = d.ps->stencil_clear_value; got_stencil_clear = true;
-            } }
+            }
+        }
     }
     if (const char* v = getenv("PROSPER_STENCIL_CLEAR"))
         stencil_clear = static_cast<uint32_t>(strtoul(v, nullptr, 0)) & 0xFFu;
@@ -2425,11 +2439,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // or partly stale DB bases (for example dr=0,dw=P followed by dr=P,dw=P); re-keying at the pass
     // boundary would bind a newly-cleared attachment even though sampled-depth lookup still finds
     // the producer image. The logical span is supplied only by the split wrapper below.
-    const std::span<const BackendDraw> identity_draws = logical_ds_draws.empty()
-        ? draws : logical_ds_draws;
     const prosper::gpu::ResolvedPipelineState* identity = nullptr;
     bool logical_use_stencil = false;
-    for (const auto& d : identity_draws) {
+    for (const auto& d : logical_draws) {
         if (d.ps && (d.ps->stencil_enable ||
                      stencil_clear_effective(d.ps->stencil_clear_enable,
                                              d.ps->stencil_enable,
