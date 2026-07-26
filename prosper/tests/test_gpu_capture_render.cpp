@@ -141,6 +141,92 @@ int main() {
               "replay samples captured red texel from owned backing");
     }
 
+    // NV12 chroma arrives as an RG8 sampled texture. The narrow upload path used to broadcast only
+    // its first byte, turning (U,V) into (U,U) and giving every decoded movie a green/purple cast.
+    {
+        uint8_t rg_texels[8] = {32, 224, 32, 224, 32, 224, 32, 224};
+        DrawItem rg_draw = replay.items[0];
+        rg_draw.color0_base = 0x210000;
+        auto rg_table = std::make_shared<ShaderResourceTable>(*rg_draw.prt);
+        ShaderResource& rg = rg_table->resources[0];
+        rg.gpu_addr = 0x110000;
+        rg.format = DataFormat::Unorm8;
+        rg.num_components = 2;
+        rg.width = rg.height = 2;
+        rg.size = sizeof(rg_texels);
+        rg.linear_row_pitch_bytes = 4;
+        rg.host_data = rg_texels;
+        rg.host_data_size = sizeof(rg_texels);
+        rg.swizzle[0] = 4; rg.swizzle[1] = 5; rg.swizzle[2] = 0; rg.swizzle[3] = 1;
+        rg_draw.prt = rg_table;
+        const std::vector<uint8_t> generic_rg_pixels =
+            render_submit_items({rg_draw}, W, H);
+        bool generic_rg_broadcast =
+            generic_rg_pixels.size() == static_cast<size_t>(W) * H * 4;
+        if (generic_rg_broadcast) {
+            const uint8_t* center =
+                &generic_rg_pixels[(static_cast<size_t>(H / 2) * W + W / 2) * 4];
+            for (uint32_t channel = 0; channel < 4; ++channel)
+                generic_rg_broadcast &= center[channel] >= 24 && center[channel] <= 40;
+        }
+        CHECK(generic_rg_broadcast,
+              "ordinary narrow RG8 uploads retain the established coverage broadcast");
+
+        uint8_t luma_texels[16] = {};
+        ShaderResource luma = rg;
+        luma.binding = 5;
+        luma.gpu_addr = rg.gpu_addr - sizeof(luma_texels);
+        luma.num_components = 1;
+        luma.width = luma.height = 4;
+        luma.size = sizeof(luma_texels);
+        luma.linear_row_pitch_bytes = 4;
+        luma.host_data = luma_texels;
+        luma.host_data_size = sizeof(luma_texels);
+        rg_table->resources.push_back(luma);
+        rg_draw.prt = std::move(rg_table);
+        const std::vector<uint8_t> rg_pixels = render_submit_items({rg_draw}, W, H);
+        bool rg_preserved = rg_pixels.size() == static_cast<size_t>(W) * H * 4;
+        if (rg_preserved) {
+            const uint8_t* center =
+                &rg_pixels[(static_cast<size_t>(H / 2) * W + W / 2) * 4];
+            rg_preserved = center[0] >= 24 && center[0] <= 40 &&
+                           center[1] >= 216 && center[1] <= 232 &&
+                           center[2] < 8 && center[3] > 248;
+        }
+        CHECK(rg_preserved,
+              "narrow RG8 uploads preserve both channels and apply the descriptor swizzle");
+    }
+
+    // R8 masks historically broadcast coverage to every channel and deliberately ignore a T#
+    // remap. Keep that independent behavior while the exact AvPlayer RG8 contract preserves U/V.
+    {
+        uint8_t r_texels[4] = {96, 96, 96, 96};
+        DrawItem r_draw = replay.items[0];
+        r_draw.color0_base = 0x220000;
+        auto r_table = std::make_shared<ShaderResourceTable>(*r_draw.prt);
+        ShaderResource& r = r_table->resources[0];
+        r.gpu_addr = 0x120000;
+        r.format = DataFormat::Unorm8;
+        r.num_components = 1;
+        r.width = r.height = 2;
+        r.size = sizeof(r_texels);
+        r.linear_row_pitch_bytes = 2;
+        r.host_data = r_texels;
+        r.host_data_size = sizeof(r_texels);
+        r.swizzle[0] = 0; r.swizzle[1] = 1; r.swizzle[2] = 0; r.swizzle[3] = 1;
+        r_draw.prt = std::move(r_table);
+        const std::vector<uint8_t> r_pixels = render_submit_items({r_draw}, W, H);
+        bool r_broadcast = r_pixels.size() == static_cast<size_t>(W) * H * 4;
+        if (r_broadcast) {
+            const uint8_t* center =
+                &r_pixels[(static_cast<size_t>(H / 2) * W + W / 2) * 4];
+            for (uint32_t channel = 0; channel < 4; ++channel)
+                r_broadcast &= center[channel] >= 88 && center[channel] <= 104;
+        }
+        CHECK(r_broadcast,
+              "narrow R8 uploads retain coverage broadcast independently of descriptor swizzle");
+    }
+
     {
         const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
         const std::filesystem::path dump_dir = std::filesystem::temp_directory_path() /

@@ -160,8 +160,9 @@ struct ShaderResource {
     uint32_t      depth             = 1;
     uint32_t      tile_mode         = 0;                  // T# GFX10 TileMode; drives auto-detile of a sampled surface
     // Byte distance between rows of a linear sampled image. Zero means derive it from the live
-    // descriptor/backing: guest images use the GFX10 sampled-image alignment while ordinary host
-    // fixtures are tight. Captures persist the resolved value so replay keeps both layouts exact.
+    // descriptor/backing: exact HLE-producer provenance wins, other guest images use the GFX10
+    // sampled-image alignment, and ordinary host fixtures are tight. Captures persist the resolved
+    // value so replay keeps every layout exact.
     uint32_t      linear_row_pitch_bytes = 0;
     // A packed mip-tail view shares the allocation's first 4/64 KiB block. gpu_addr remains the
     // shared block base; the backend applies mip_tail_offset and preserves sibling levels on writes.

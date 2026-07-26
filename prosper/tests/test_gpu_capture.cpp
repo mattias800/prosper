@@ -1,5 +1,6 @@
 #include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/agc_shader_layout.hpp"
+#include "../src/gpu/guest_texture_layout.hpp"
 #include "../src/gpu/pm4_registers.hpp"
 #include "../src/gpu/tile.hpp"
 
@@ -418,6 +419,18 @@ int main() {
               materialize_gpu_replay(upgraded_video, upgraded_video_replay, error) &&
               upgraded_video_replay.items[0].prt->resources[0].host_data_size == video_chroma.size,
           "rewriting a v27 capture preserves its short span and best-effort derived pitch in v28");
+    register_guest_linear_texture_layout(video_chroma.gpu_addr, video_chroma.size, 1920);
+    GpuCaptureFile tight_video_capture;
+    CHECK(gpu_capture_resource_footprint(video_chroma) == video_chroma.size &&
+              capture_draw_items({video_draw}, meta, video_reader, tight_video_capture, error) &&
+              tight_video_capture.blobs.size() == 1 &&
+              tight_video_capture.blobs[0].bytes.size() == video_chroma.size &&
+              tight_video_capture.draws[0].prt.resources[0].captured_size == video_chroma.size &&
+              tight_video_capture.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 1920,
+          "capture preserves an exact registered tight pitch for an HLE-produced guest texture");
+    unregister_guest_linear_texture_layout(video_chroma.gpu_addr);
+    CHECK(gpu_capture_resource_footprint(video_chroma) == 2048u * 2u,
+          "unregistered guest textures return to the GFX10 aligned-pitch fallback");
     large_table->resources = {large_resource};
     DrawItem large_draw = draw;
     large_draw.vrt = large_table;

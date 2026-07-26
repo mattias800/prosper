@@ -10,6 +10,7 @@
 #include "ime_input.hpp"
 #include "platform_ui.hpp"
 #include "video_backend.hpp"   // sceAvPlayer -> host hardware-decode backend (#705)
+#include "../gpu/guest_texture_layout.hpp" // exact HLE-produced sampled-linear layouts
 #include "../host/posix_shim.hpp"   // Darwin process_vm_readv shim + asm portability
 #include <cinttypes>
 #include <cstddef>
@@ -500,6 +501,28 @@ bool avp_nv12_bytes(uint32_t width, uint32_t height, size_t& bytes) {
     return true;
 }
 
+void avp_register_frame_layout(uint8_t* base, size_t bytes, uint32_t pitch) {
+    gpu::register_guest_linear_texture_layout(
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(base)), bytes, pitch);
+}
+
+void avp_release_frame_storage(AvpPlayer& player) {
+    if (!player.frame.empty())
+        gpu::unregister_guest_linear_texture_layout(
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(player.frame.data())));
+    player.frame.clear();
+}
+
+uint8_t* avp_frame_storage(AvpPlayer& player, size_t bytes, uint32_t pitch) {
+    if (player.frame.size() != bytes) {
+        avp_release_frame_storage(player);
+        player.frame.resize(bytes);
+    }
+    if (player.frame.empty()) return nullptr;
+    avp_register_frame_layout(player.frame.data(), player.frame.size(), pitch);
+    return player.frame.data();
+}
+
 // Native decoders own their dequeue storage and may move or recycle it on the next pull. Copy the
 // visible NV12 rows into a guest texture buffer when one exists.  The host-vector fallback preserves
 // the old lifetime guarantee for native tests and titles that omit the replacement callbacks.
@@ -510,33 +533,25 @@ bool avp_stage_video(AvpPlayer& player, const prosper::video::VideoFrame& frame,
     const size_t uv_stride = frame.uv_stride ? frame.uv_stride : frame.width;
     if (y_stride < frame.width || uv_stride < frame.width) return false;
     const size_t uv_rows = (static_cast<size_t>(frame.height) + 1) / 2;
-    if (!player.texture_frames.empty()) {
-        size_t bytes = 0;
-        if (!avp_nv12_bytes(frame.width, frame.height, bytes) ||
-            bytes > player.texture_frame_bytes) return false;
-        uint8_t* dst = player.texture_frames[player.next_texture_frame++ %
-                                              player.texture_frames.size()];
-        if (!dst) return false;
-        for (uint32_t row = 0; row < frame.height; ++row)
-            memcpy(dst + static_cast<size_t>(row) * frame.width,
-                   frame.y + static_cast<size_t>(row) * y_stride, frame.width);
-        uint8_t* dst_uv = dst + static_cast<size_t>(frame.width) * frame.height;
-        for (size_t row = 0; row < uv_rows; ++row)
-            memcpy(dst_uv + row * frame.width, frame.uv + row * uv_stride, frame.width);
-        data = dst;
-        pitch = frame.width;
-        return true;
-    }
     if (y_stride > SIZE_MAX / frame.height || uv_stride > SIZE_MAX / uv_rows) return false;
-    const size_t y_bytes = y_stride * frame.height;
-    const size_t uv_bytes = uv_stride * uv_rows;
-    if (uv_bytes > SIZE_MAX - y_bytes) return false;
-    const size_t bytes = y_bytes + uv_bytes;
-    if (player.frame.size() != bytes) player.frame.resize(bytes);
-    memcpy(player.frame.data(), frame.y, y_bytes);
-    memcpy(player.frame.data() + y_bytes, frame.uv, uv_bytes);
-    data = player.frame.data();
-    pitch = static_cast<uint32_t>(y_stride);
+    size_t bytes = 0;
+    if (!avp_nv12_bytes(frame.width, frame.height, bytes)) return false;
+    uint8_t* dst = nullptr;
+    if (!player.texture_frames.empty()) {
+        if (bytes > player.texture_frame_bytes) return false;
+        dst = player.texture_frames[player.next_texture_frame++ % player.texture_frames.size()];
+    } else {
+        dst = avp_frame_storage(player, bytes, frame.width);
+    }
+    if (!dst) return false;
+    for (uint32_t row = 0; row < frame.height; ++row)
+        memcpy(dst + static_cast<size_t>(row) * frame.width,
+               frame.y + static_cast<size_t>(row) * y_stride, frame.width);
+    uint8_t* dst_uv = dst + static_cast<size_t>(frame.width) * frame.height;
+    for (size_t row = 0; row < uv_rows; ++row)
+        memcpy(dst_uv + row * frame.width, frame.uv + row * uv_stride, frame.width);
+    data = dst;
+    pitch = frame.width;
     return true;
 }
 
@@ -547,11 +562,11 @@ bool avp_stage_synthetic(AvpPlayer& player, uint8_t*& data) {
         if (need > player.texture_frame_bytes) return false;
         data = player.texture_frames[player.next_texture_frame++ % player.texture_frames.size()];
         if (!data) return false;
-        memset(data, 0, need);
-        return true;
+    } else {
+        data = avp_frame_storage(player, need, player.width);
+        if (!data) return false;
     }
-    if (player.frame.size() != need) player.frame.assign(need, 0);
-    data = player.frame.data();
+    memset(data, 0, need);
     return true;
 }
 
@@ -624,7 +639,11 @@ void avp_deallocate_texture(const AvpMemAllocator& memory, void* allocation) {
 
 void avp_release_textures(const AvpMemAllocator& memory,
                           const std::vector<uint8_t*>& textures) {
-    for (auto* texture : textures) avp_deallocate_texture(memory, texture);
+    for (auto* texture : textures) {
+        gpu::unregister_guest_linear_texture_layout(
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(texture)));
+        avp_deallocate_texture(memory, texture);
+    }
 }
 
 bool avp_build_textures(const AvpMemAllocator& memory, int32_t requested,
@@ -651,7 +670,9 @@ bool avp_build_textures(const AvpMemAllocator& memory, int32_t requested,
             texture_bytes = 0;
             return false;
         }
-        textures.push_back(static_cast<uint8_t*>(allocation));
+        auto* texture = static_cast<uint8_t*>(allocation);
+        textures.push_back(texture);
+        avp_register_frame_layout(texture, texture_bytes, width);
     }
     if (avp_log()) {
         fprintf(stderr,
@@ -815,6 +836,7 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
         memory = p.memory;
         requested_textures = p.num_fb;
         old_textures = std::move(p.texture_frames);
+        avp_release_frame_storage(p);
         p.texture_frame_bytes = 0;
         p.next_texture_frame = 0;
         p.have_source = false; p.synthetic = false; p.playing = false; p.paused = false;
@@ -1148,6 +1170,7 @@ HLE(s_avp_stop) {   // s32 sceAvPlayerStop(handle)
         backend = p.backend; backend_id = p.backend_id;
         memory = p.memory;
         textures = std::move(p.texture_frames);
+        avp_release_frame_storage(p);
         p.texture_frame_bytes = 0; p.next_texture_frame = 0;
         p.backend = nullptr; p.backend_id = -1; p.have_source = false; p.synthetic = false;
         if (p.playing && !p.stop_fired) {
@@ -1172,6 +1195,7 @@ HLE(s_avp_close) {   // s32 sceAvPlayerClose(handle)
             backend = it->second.backend; backend_id = it->second.backend_id;
             memory = it->second.memory;
             textures = std::move(it->second.texture_frames);
+            avp_release_frame_storage(it->second);
             g_avp.erase(it);
         }
     }
