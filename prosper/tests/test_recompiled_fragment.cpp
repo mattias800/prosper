@@ -713,9 +713,18 @@ int main() {
             0xD7600007u, 0x0001070Au,              // v_readlane_b32 s7, v10, 3
             0x7E000207u, 0xF800180Fu, 0x00000000u, 0xBF810000u,
         };
-        CHECK(recompile_fragment(stale_readlane,
-                                 sizeof(stale_readlane)/sizeof(stale_readlane[0])).empty(),
-              "#652: readlane rejects a lane slot invalidated by an ordinary VGPR write");
+        std::vector<uint32_t> recycled_readlane = recompile_fragment(
+            stale_readlane, sizeof(stale_readlane)/sizeof(stale_readlane[0]));
+        CHECK(!recycled_readlane.empty(),
+              "#652: readlane observes the ordinary VGPR after its spill lifetime ends");
+        if (!recycled_readlane.empty()) {
+            std::vector<uint8_t> px = prosper::test::render_triangle_rgba(
+                vert, recycled_readlane, W, H);
+            const uint8_t* center = px.empty() ? nullptr
+                : &px[((size_t)(H / 2) * W + W / 2) * 4];
+            CHECK(center && center[0] > 0xC0,
+                  "#652: recycled v10 lane 3 contains the new 1.0 value, not its stale spill");
+        }
     }
 
     // MULTI-RENDER-TARGET selection (#566 — Dead Cells world/G-buffer shaders). A 4-MRT shader emits its

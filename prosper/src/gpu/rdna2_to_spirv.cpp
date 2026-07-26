@@ -5516,10 +5516,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // DPP16 quad_perm on src0 (#273): fragment FLOAT ops and compute quad swaps.  Bounded
             // ROW_SHR in the proven one-live-lane NGG projection supplies zero for lane 0.
             if (in.has_dpp) {
+                const bool row_shr = in.dpp_ctrl >= 0x111u && in.dpp_ctrl <= 0x11Fu;
                 const bool fop = in.opcode == 0x03 || in.opcode == 0x04 || in.opcode == 0x05 ||
                                  in.opcode == 0x08 || in.opcode == 0x0F || in.opcode == 0x10 ||
                                  in.opcode == 0x1F || in.opcode == 0x2B;
-                const bool row_shr = in.dpp_ctrl >= 0x111u && in.dpp_ctrl <= 0x11Fu;
                 if (row_shr) {
                     if (b.is_vertex) {
                         if (!b.ngg_one_lane || in.opcode != 0x25 || !in.dpp_bound_ctrl) {
