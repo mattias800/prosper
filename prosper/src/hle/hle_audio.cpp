@@ -1447,6 +1447,7 @@ namespace {
     constexpr uint64_t AJM_ERR_INVALID_INSTANCE  = (uint64_t)(int64_t)(int32_t)0x80930003u;
     constexpr uint64_t AJM_ERR_INVALID_BATCH     = (uint64_t)(int64_t)(int32_t)0x80930004u;
     constexpr uint64_t AJM_ERR_INVALID_PARAMETER = (uint64_t)(int64_t)(int32_t)0x80930005u;
+    constexpr uint64_t AJM_INITIALIZE_PS5_CONFIG = 0x200000000ull;
 
     // The four pointer-returning builder exports serialize a batch from 8/16-byte chunks. These
     // layout values are shared by Sony's PS4-inherited AJM ABI and the PS5 3.20 export surface.
@@ -1583,9 +1584,10 @@ std::map<uint32_t, AjmDecodeInst> g_ajm2_inst;             // instance id -> cod
 std::map<uint64_t, std::vector<AjmDecJob>> g_ajm2_jobs;   // batchInfo -> queued decode jobs
 } // namespace
 
-// sceAjmInitialize(s64 reserved, u32* out_context): create a context. Filling out_context is the point.
+// sceAjmInitialize(u64 config, u32* out_context): create a context. PS4-style callers pass zero,
+// while PS5 titles also use the observed 0x200000000 configuration value.
 HLE(ajm_initialize) {
-    if (a0 != 0 || !a1) return AJM_ERR_INVALID_PARAMETER;
+    if ((a0 != 0 && a0 != AJM_INITIALIZE_PS5_CONFIG) || !a1) return AJM_ERR_INVALID_PARAMETER;
     if (!a2_store_u32(a1, g_ajm_next.fetch_add(1))) return AJM_ERR_INVALID_PARAMETER;
     return 0;
 }
