@@ -1,6 +1,7 @@
-// Regression guard for the libSceAmpr command-size NIDs used by Sonic Origins. These functions
-// return byte counts, not status codes. A sizing-only call must remain pure, while DOLL's older SDK
-// wrapper passes a registered APR id and relies on the same entry point to fill its destination.
+// Regression guard for the libSceAmpr command-size and completion NIDs used by Sonic Origins and
+// Pathless. Size queries return byte counts, not status codes. A sizing-only call must remain pure,
+// while DOLL's older SDK wrapper passes a registered APR id and relies on its legacy entry point to
+// fill the destination.
 #include "../src/hle/dispatch.hpp"
 #include <array>
 #include <cstdint>
@@ -24,8 +25,19 @@ int main() {
 
     HleFn write_address = Hle::lookup("4fgtGfXDrFc");
     HleFn write_equeue  = Hle::lookup("sSAUCCU1dv4");
+    HleFn write_equeue_320 = Hle::lookup("Zi3dBUjgyXI");
+    HleFn append_equeue = Hle::lookup("H896Pt-yB4I");
+    HleFn append_equeue_320 = Hle::lookup("o67gODLFpls");
+    HleFn add_ampr_event = Hle::lookup("bBfz7kMF2Ho");
     HleFn read_file     = Hle::lookup("vWU-odnS+fU");
-    CHECK(write_address && write_equeue && read_file, "AMPR measure NIDs registered");
+    CHECK(write_address && write_equeue && write_equeue_320 && append_equeue && append_equeue_320 &&
+              add_ampr_event && read_file,
+          "AMPR measure and completion-event NIDs registered");
+    CHECK(append_equeue_320 == append_equeue,
+          "PS5 3.20 kernel-equeue writer aliases the modeled completion path");
+    if (add_ampr_event)
+        CHECK(add_ampr_event(0, 0, 0, 0, 0, 0) == 0,
+              "AMPR event registration accepts a null queue as a no-op");
 
     if (write_address) {
         CHECK(write_address(8, 0, 0, 0, 0, 0) == 32,
@@ -36,6 +48,9 @@ int main() {
     if (write_equeue)
         CHECK(write_equeue(0, 0, 0, 0, 0, 0) == 20,
               "kernel-equeue command measures 20 bytes");
+    if (write_equeue_320)
+        CHECK(write_equeue_320(0, 0, 0, 0, 0, 0) == 0x20,
+              "PS5 3.20 kernel-equeue command measures a 0x20-byte record");
     if (read_file) {
         CHECK(read_file(0, 0, UINT32_MAX, 0xffffffffffull, 0, 0) == 24,
               "wide-offset read command measures 24 bytes (never EINVAL)");
