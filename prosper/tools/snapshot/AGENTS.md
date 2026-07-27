@@ -1,9 +1,12 @@
 # AGENTS.md - rendering snapshot tests
 
-This is the required local real-game rendering gate. Run the affected title
-guards after any change that can affect output: RDNA2-to-SPIR-V recompilation,
-AGC/PM4 decoding, render state, texture decode/detiling, executor behavior, or
-presentation.
+This is the local real-game rendering gate. The full matrix is required before
+every release. It is not a blanket prerequisite for opening a PR: the PR author
+decides whether affected-title guards or the full matrix are appropriate for the
+change and iteration stage, unless the task explicitly requires them. Changes
+that can affect output should consider snapshot coverage as a strong relevant
+check: RDNA2-to-SPIR-V recompilation, AGC/PM4 decoding, render state, texture
+decode/detiling, executor behavior, or presentation.
 
 ```bash
 # From prosper/, with build-linux/boot_trace built from the change.

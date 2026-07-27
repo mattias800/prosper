@@ -11,12 +11,13 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   but do not rerun it; see the mandatory merge policy in the root `CLAUDE.md`. Run
   `powershell -File tools/test-verify-pr.ps1` after changing the orchestrator; it probes exact-base
   pinning, WSL selection, rejected skip attempts, and untracked-source contamination.
-- **`snapshot/`** - routed, multi-frame **rendering regression guard**. Run
-  `python3 tools/snapshot/snapshot.py check` after any change that can affect
-  rendered output (recompiler, AGC decode, render state, detile, present). It
-  catches major scene collapse without treating subtle pixel changes as
-  regressions. New or changed baselines require two-run image inspection; see
-  `snapshot/AGENTS.md`. **Run this after touching the render path.**
+- **`snapshot/`** - routed, multi-frame **rendering regression guard**. The full
+  `python3 tools/snapshot/snapshot.py check` matrix is mandatory before every
+  release. It is not required merely to open a PR: the PR author decides whether
+  affected-title guards or the full matrix are appropriate for a render-affecting
+  change, unless the task explicitly requires them. It catches major scene collapse
+  without treating subtle pixel changes as regressions. New or changed baselines
+  require two-run image inspection; see `snapshot/AGENTS.md`.
 - **`boot_trace/`** — boots a SELF/ELF game image through the loader + HLE and
   runs it, with the fault handler, GPU executor, and (under `PROSPER_RENDER`) the
   live Vulkan renderer. The main harness for exercising a real title headlessly.

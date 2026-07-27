@@ -268,8 +268,12 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   ```
 - **Verification is agentic-first / programmatic** (`docs/VERIFICATION.md`): ctest exit code is truth;
   shaders are `spirv-val`-gated; rendered frames are asserted by pixels, hashes, or routed content
-  metrics. **After any change that can affect rendered output** (recompiler, AGC decode, render state,
-  detile, executor/present), run `python3 tools/snapshot/snapshot.py check` (local-only). Gameplay
+  metrics. Snapshot coverage is **mandatory before every release**: run the full local-only matrix with
+  `python3 tools/snapshot/snapshot.py check` against the release candidate. It is not a blanket gate for
+  opening a PR. For PRs, the author decides whether affected-title guards or the full matrix are
+  appropriate for the change and iteration stage, unless the task explicitly requires them. Changes
+  that can affect rendered output (recompiler, AGC decode, render state, detile, executor/present)
+  should consider snapshot coverage as a strong relevant check and record any runs in the PR. Gameplay
   guards inspect multiple frames in route-specific windows and use SSIM over compact luminance
   signatures from several reviewed states, looking for major collapse without rejecting subtle pixel improvements.
   Every new or materially changed baseline requires `snapshot.py verify`,
