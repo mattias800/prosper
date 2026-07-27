@@ -205,9 +205,10 @@ bool prefix_inspect_publish() {
 }
 
 // Pixel decoding is a pure function of these fields for guest-backed textures. Keep this cache local
-// to one renderer callback: graphics spans are split at compute operations, so guest texture bytes
-// cannot change within its lifetime. Live RTT inputs are excluded separately because an earlier pass
-// in the same callback can replace their pixels.
+// to one renderer callback: graphics spans are split at compute operations, so ordinary guest texture
+// bytes cannot change within its lifetime. Writable storage-image callbacks explicitly invalidate every
+// overlapping entry after publishing their results. Live RTT inputs are excluded separately because an
+// earlier pass in the same callback can replace their pixels.
 struct TextureDecodeKey {
     uint64_t gpu_addr = 0;
     uint64_t host_data = 0;
