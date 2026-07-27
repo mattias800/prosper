@@ -10192,6 +10192,33 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
     uint32_t ngg_output_gate_begin = UINT32_MAX;
     uint32_t ngg_output_gate_end = 0;
     if (ngg) {
+        // A terminal compacted-output suffix may reconstruct its values from a shader-embedded
+        // constant table. Detect those loads with the same bounded PC-relative proof used by the
+        // emitter; an arbitrary external load or any buffer write must not broaden this gate.
+        PcrelTables output_tables;
+        if (b.ngg_private_lds)
+            output_tables = detect_pcrel_tables(ins, code, dwords);
+        auto scalar_output_setup = [](const Rdna2Inst& candidate) {
+            if (candidate.fmt != Rdna2Format::SOP1 &&
+                candidate.fmt != Rdna2Format::SOP2 &&
+                candidate.fmt != Rdna2Format::SOPK)
+                return false;
+            bool wrote_data = false;
+            bool safe = !instruction_may_change_exec(candidate);
+            for_each_scalar_write(candidate, [&](int base, uint32_t width) {
+                wrote_data = true;
+                safe &= base >= 0 && base + static_cast<int>(width) <= 106;
+                safe &= !scalar_write_is_b64_mask(candidate, base);
+            });
+            return wrote_data && safe;
+        };
+        auto embedded_output_load = [&](const Rdna2Inst& candidate) {
+            if (candidate.fmt != Rdna2Format::MUBUF || candidate.mubuf_lds)
+                return false;
+            const bool read_only = candidate.opcode <= 0x03u ||
+                (candidate.opcode >= 0x0cu && candidate.opcode <= 0x0fu);
+            return read_only && output_tables.mubuf.contains(candidate.pc);
+        };
         uint32_t end_pc = UINT32_MAX;
         for (const auto& in : ins)
             if (in.is_end) { end_pc = in.pc; break; }
@@ -10226,10 +10253,11 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
                     continue;
                 }
                 // Astro's compacted-output suffix reconstructs the surviving vertex from private
-                // LDS immediately before exporting it (VOP address setup + DS reads). These remain
-                // inside the same CMPX/EXECZ-to-ENDPGM gate and their register writes are already
-                // EXEC-predicated by emit_alu. Admit them only for the byte-exact wrapper (or the
-                // explicit test hook); ordinary NGG shaders never reach this exception.
+                // LDS or a bounded shader-embedded table immediately before exporting it. Vector,
+                // DS, and table-load destination writes are EXEC-predicated by emit_alu; scalar ALU
+                // may only build ordinary data/descriptor registers. Admit them only for the
+                // byte-exact wrapper (or the explicit test hook); arbitrary NGG shaders never reach
+                // this exception, and buffer stores/external reads remain rejected.
                 const bool output_rebuild = b.ngg_private_lds || allow_test_ngg_output_gate;
                 if (output_rebuild &&
                     (candidate.fmt == Rdna2Format::VOP1 ||
@@ -10238,7 +10266,9 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
                      candidate.fmt == Rdna2Format::VOP3P ||
                      (candidate.fmt == Rdna2Format::VOPC &&
                       !vopc_is_cmpx(candidate.opcode)) ||
-                     candidate.fmt == Rdna2Format::DS))
+                     candidate.fmt == Rdna2Format::DS ||
+                     scalar_output_setup(candidate) ||
+                     embedded_output_load(candidate)))
                     continue;
                 if (candidate.fmt == Rdna2Format::SOPC) continue;
                 if (sopp_is_noop(candidate)) continue;

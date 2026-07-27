@@ -651,6 +651,49 @@ int main() {
     }
     printf("  [ok]   terminal NGG LDS output-rebuild gate produces valid SPIR-V\n");
 
+    // Astro Bot's first world-map wrapper rebuilds its surviving compacted output through a
+    // shader-embedded constant table rather than LDS. The terminal suffix is still side-effect
+    // free: scalar ALU constructs the PC-relative V#, MUBUF only reads the proven bounded table,
+    // and the results feed POS0/PARAM0 before S_ENDPGM. This is the exact captured 54-dword program
+    // plus the table tail required by those two loads.
+    const uint32_t astro_worldmap_pcrel_output_gate[] = {
+        0xbfa00003u, 0x93ebff03u, 0x00040018u, 0xbefe03c1u,
+        0x9380ff02u, 0x00090016u, 0x9381ff02u, 0x0009000cu,
+        0xbf8a0000u, 0xbf076b80u, 0xbf850004u, 0x8f6a8c00u,
+        0x887c6a01u, 0xbf800000u, 0xbf900009u, 0x8f6a856bu,
+        0xd7650001u, 0x0000d4c1u, 0x7da80200u, 0xbf880002u,
+        0xf8000941u, 0x00000000u, 0xbf8cff0fu, 0xbefe03c1u,
+        0x7da80201u, 0xbf88001bu, 0xd56a0000u, 0x00020affu,
+        0xaaaaaaabu, 0xbe8303ffu, 0x10005004u, 0xb0020048u,
+        0xbe801f00u, 0x800000ffu, 0x000000acu, 0x82010180u,
+        0x2c000081u, 0xd7460000u, 0x04010300u, 0x4c000105u,
+        0x34000083u, 0xd7460004u, 0x04010300u, 0xe0381000u,
+        0x80000004u, 0xe0341010u, 0x80000404u, 0xbf8c3f71u,
+        0xf80008cfu, 0x03020100u, 0xbf8c3f70u, 0xf8000203u,
+        0x00000504u, 0xbf810000u,
+        // Padding to byte offset 304, then the 72-byte constant table.
+        0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+        0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+        0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+        0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+        0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+        0xbf9f0000u,
+        0x00000000u, 0xbf800000u, 0xbf800000u, 0x3f800000u,
+        0x3f800000u, 0x00000000u, 0x3f800000u, 0x40400000u,
+        0xbf800000u, 0x3f800000u, 0x3f800000u, 0x40000000u,
+        0x3f800000u, 0xbf800000u, 0x40400000u, 0x3f800000u,
+        0x3f800000u, 0x00000000u, 0xbf800000u,
+    };
+    const auto astro_worldmap_pcrel_output_spv = recompile_vertex(
+        astro_worldmap_pcrel_output_gate, std::size(astro_worldmap_pcrel_output_gate));
+    if (astro_worldmap_pcrel_output_spv.empty() ||
+        !type_result_ids_are_nonzero(astro_worldmap_pcrel_output_spv, nullptr) ||
+        !phi_ids_are_nonzero(astro_worldmap_pcrel_output_spv)) {
+        printf("  [FAIL] captured Astro PC-relative NGG output gate did not emit valid SPIR-V\n");
+        return 1;
+    }
+    printf("  [ok]   captured Astro PC-relative NGG output gate emits valid SPIR-V\n");
+
     // Astro's second world-map wrapper exports POS for a surviving compacted vertex, then a regular
     // VCC compare conditionally skips only the trailing PARAM exports. Supplying those otherwise-
     // undefined varyings in the one-lane projection is safe and must not drop the complete draw.
