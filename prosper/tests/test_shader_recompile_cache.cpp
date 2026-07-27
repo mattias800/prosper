@@ -328,6 +328,31 @@ int main() {
               stats.misses == mapping_misses + 2 && stats.hits == mapping_hits + 1,
           "pixel-input mappings participate in the vertex shader cache key");
 
+    // The same mapping also selects the fragment-side interpolation interface. In particular,
+    // custom passthrough inputs consume raw triangle values instead of synthesized P10/P20 deltas.
+    static const uint32_t kInterpPs[] = {
+        0xc80e0002u, 0xc8110002u, 0xf800000fu, 0x03030303u, 0xbf810000u,
+    };
+    const uint64_t fragment_mapping_misses = stats.misses;
+    PixelInputMapping smooth_mapping;
+    smooth_mapping.valid_mask = 1;
+    const auto smooth_fragment = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kInterpPs, std::size(kInterpPs), nullptr,
+        &smooth_mapping);
+    PixelInputMapping passthrough_mapping = smooth_mapping;
+    passthrough_mapping.passthrough_mask = 1;
+    const auto passthrough_fragment = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kInterpPs, std::size(kInterpPs), nullptr,
+        &passthrough_mapping);
+    const auto passthrough_again = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kInterpPs, std::size(kInterpPs), nullptr,
+        &passthrough_mapping);
+    stats = shader_recompile_cache_stats();
+    CHECK(!smooth_fragment.empty() && !passthrough_fragment.empty() &&
+              passthrough_again == passthrough_fragment &&
+              stats.misses == fragment_mapping_misses + 2,
+          "pixel-input mappings participate in the fragment interpolation cache key");
+
     // Fragment system-input placement changes SPIR-V declarations and the initial VGPR values.
     // Both ENA and ADDR therefore belong to the cache key.
     const uint64_t system_misses = stats.misses;

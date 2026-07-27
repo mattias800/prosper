@@ -2648,24 +2648,21 @@ void install_trap_handler() {
     install_sigaltstack();
     struct sigaction sa{};
     sa.sa_sigaction = fault_handler;
-    sa.sa_flags = SA_SIGINFO;   // (SA_ONSTACK disabled by default: siglongjmp from the alt stack tripped
-                                // glibc's %fs-guarded ____longjmp_chk -> jump-to-garbage fault storm)
-    // PROSPER_FAULT_ONSTACK: run the handler on the per-thread sigaltstack. Needed to diagnose a
-    // guest-thread STACK OVERFLOW: the fault destroys the thread's own stack, so a handler without an
-    // alt stack cannot even enter (nested #PF -> forced-default SIGSEGV, killed with no report — the
-    // exact "fatal signal 11, no output" we see mid-load). On the alt stack the worker-thread fault
-    // path (which does NOT siglongjmp) can print the faulting RIP. Gated so the default boot's
-    // main-thread siglongjmp recovery is unchanged. CONFIDENCE: HIGH (mechanism).
-    // On macOS the alt stack is MANDATORY, not diagnostic: a guest fault whose access is on the
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    // Run the handler on the per-thread sigaltstack. Besides making stack-overflow diagnostics
+    // possible, this keeps page-protection write-watch faults out of a guest function's live SysV red
+    // zone. The old Linux opt-in predated the host-%fs restoration in fault_handler: siglongjmp once
+    // entered glibc with the guest TCB and its bogus stack guard, causing a jump-to-garbage storm.
+    // Recovery from wild/null/SIGFPE init faults now runs on the alt stack in
+    // test_initfault_dump_survives, proving that the repaired host-%fs path is safe by default.
+    // PROSPER_FAULT_NO_ONSTACK remains a diagnostic escape hatch and deliberately disables write
+    // watches through guest_write_watch_set_fault_onstack below.
+    // On macOS the alt stack is also mandatory: a guest fault whose access is on the
     // faulting thread's own stack (a bad indirect branch into the stack, a stack overflow) cannot
     // push a signal frame onto that same stack, so without SA_ONSTACK the kernel force-kills the
     // process with no handler entry (the "SIGSEGV, no output" we first saw). The Darwin recovery
-    // path siglongjmps out of the handler, which is safe from the alt stack (no glibc
-    // %fs-guarded ____longjmp_chk to trip, unlike Linux — that is why it stays opt-in there).
-#ifdef __APPLE__
-    sa.sa_flags |= SA_ONSTACK;
-#endif
-    if (getenv("PROSPER_FAULT_ONSTACK")) sa.sa_flags |= SA_ONSTACK;
+    // path likewise siglongjmps out of the handler safely.
+    if (getenv("PROSPER_FAULT_NO_ONSTACK")) sa.sa_flags &= ~SA_ONSTACK;
     // The texture write-watch (guest_write_watch.cpp) resolves its faults by return, not siglongjmp, so
     // it is red-zone-safe ONLY when this handler runs on the sigaltstack. Tell it whether that holds;
     // otherwise create() refuses to arm and callers keep the exact byte-comparison fallback (#1144).

@@ -652,7 +652,8 @@ int main() {
         }
 
         // Partially-overlapping loops (a back-edge into another loop's body without proper nesting)
-        // remain rejected in the fragment shell (no dispatcher fallback exists there).
+        // cannot use the compact loop structurizer, but the graphics CFG dispatcher represents the
+        // irreducible guest PC graph explicitly and must still produce structurally valid SPIR-V.
         const uint32_t overlap_ps[] = {
             0xBE800380u, 0x7E020284u,
             0x7DA20200u,               //  2: A_HDR: v_cmpx_lt_u32 s0, v1
@@ -666,8 +667,10 @@ int main() {
             0xF800180Fu, 0x05020302u,  // 10: export
             0xBF810000u,               // 12: s_endpgm
         };
-        CHECK(recompile_fragment(overlap_ps, sizeof(overlap_ps)/sizeof(overlap_ps[0])).empty(),
-              "#590: partially-overlapping loops remain REJECTED (fragment)");
+        const auto overlap_spv = recompile_fragment(
+            overlap_ps, sizeof(overlap_ps)/sizeof(overlap_ps[0]));
+        CHECK(!overlap_spv.empty() && overlap_spv.front() == 0x07230203u,
+              "partially-overlapping fragment loops use the explicit CFG dispatcher");
     }
 
     // SCALAR-SPILL lane slots (#273): v_writelane_b32 packs two scalars into v10's lanes 3/7 and

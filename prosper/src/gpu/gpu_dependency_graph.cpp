@@ -71,12 +71,17 @@ bool build_gpu_dependency_graph(const GpuReplayFrame& replay,
             const DrawItem& draw = *it->second;
             append_accesses(draw.vrt.get(), "vs", reads);
             append_accesses(draw.prt.get(), "ps", reads);
-            if (draw.color0_base && draw.color0_width && draw.color0_height)
-                writes.push_back({draw.color0_base,
-                                  static_cast<uint64_t>(draw.color0_width) * draw.color0_height * 4});
-            if (draw.color1_base && draw.color1_width && draw.color1_height)
-                writes.push_back({draw.color1_base,
-                                  static_cast<uint64_t>(draw.color1_width) * draw.color1_height * 4});
+            auto append_target = [&](uint64_t base, uint32_t width, uint32_t height) {
+                if (!base || !width || !height ||
+                    std::any_of(writes.begin(), writes.end(),
+                        [&](const auto& write) { return write.first == base; })) return;
+                writes.push_back({base, static_cast<uint64_t>(width) * height * 4});
+            };
+            for (const auto& target : draw.color_targets)
+                append_target(target.base, target.width, target.height);
+            // Direct graph callers and captures through v33 may populate only the named aliases.
+            append_target(draw.color0_base, draw.color0_width, draw.color0_height);
+            append_target(draw.color1_base, draw.color1_width, draw.color1_height);
         } else if (operation.kind == SubmitOperationKind::Dispatch) {
             auto it = computes.find(operation.source_index);
             if (it == computes.end()) {

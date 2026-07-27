@@ -21,6 +21,11 @@ static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { std::printf("FAIL: %s\n", msg); fails++; } } while (0)
 
 int main() {
+#ifdef _WIN32
+    _putenv_s("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB", "0");
+#else
+    setenv("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB", "0", 1);
+#endif
     bool half_luts_match = true;
     for (uint32_t bits = 0; bits <= 0xffffu; ++bits) {
         const uint16_t half = static_cast<uint16_t>(bits);
@@ -129,8 +134,10 @@ int main() {
     CHECK(direct_sampled_rtt_compatible(DataFormat::Unorm8, 4,
                                         LiveTargetPixelFormat::Rgba8Unorm) &&
           direct_sampled_rtt_compatible(DataFormat::Float16, 4,
-                                        LiveTargetPixelFormat::Rgba16Float),
-          "renderer RTT direct bind accepts exact RGBA8 and RGBA16F sampled views");
+                                        LiveTargetPixelFormat::Rgba16Float) &&
+          direct_sampled_rtt_compatible(DataFormat::Float10_11_11, 3,
+                                        LiveTargetPixelFormat::R11G11B10Float),
+          "renderer RTT direct bind accepts exact RGBA8, RGBA16F, and R11G11B10 views");
     CHECK(!direct_sampled_rtt_compatible(DataFormat::Float16, 4,
                                          LiveTargetPixelFormat::Rgba8Unorm) &&
           !direct_sampled_rtt_compatible(DataFormat::Unorm8, 4,
@@ -174,6 +181,17 @@ int main() {
               ((word16 >> 11) & 0x7ffu) == float_to_f11(0.5f) &&
               ((word16 >> 22) & 0x3ffu) == float_to_f10(2.0f),
               "RGBA16F reconstruction preserves HDR RGB while discarding alpha");
+
+        auto native = std::make_shared<std::vector<uint8_t>>(std::initializer_list<uint8_t>{
+            0x78, 0x56, 0x34, 0x12,
+        });
+        LiveTargetSnapshot native_snapshot{
+            1, 1, LiveTargetPixelFormat::R11G11B10Float, native};
+        std::vector<uint8_t> native_copy(4);
+        CHECK(prosper::frontend::pack_live_target_r11g11b10(
+                  native_snapshot, native_copy.data(), native_copy.size()) &&
+              native_copy == *native,
+              "native R11G11B10 renderer target remains bit-exact through CPU fallback");
 
         snapshot16.pixels = std::make_shared<std::vector<uint8_t>>(7, 0);
         CHECK(!prosper::frontend::pack_live_target_r11g11b10(
@@ -1540,27 +1558,31 @@ int main() {
     {
         static const uint32_t fill_1d[] = {
             0x7E080300u,             // v4 = v0 (x coord from the shell input)
-            0xF0200F00u, 0x00020004u,// IMAGE_STORE v0..v3 at v4 to binding 5 -- NO preceding IMAGE_LOAD
+            0x7E0A0301u,             // v5 = v1 (y local ID; zero for the one-row launch)
+            0x7E040280u,             // v2 = 0 (stored B)
+            0x7E060280u,             // v3 = 0 (stored A)
+            0xF0200F08u, 0x00020004u,// IMAGE_STORE v0..v3 at (v4,v5) -- NO preceding IMAGE_LOAD
             0xBF810000u,             // s_endpgm
         };
-        std::vector<uint32_t> fill_index(W);
-        for (uint32_t i = 0; i < W; ++i) fill_index[i] = i;   // v0 == gid == store coord -> full coverage
-        std::vector<uint32_t> fdummy(4, 0);
-        std::vector<uint8_t> fill_guest(W * 4, 0xC3);   // distinctive pre-run content
+        // A typed RGBA16F storage image exercises the same native-storage retention path as the
+        // game's 4K post-process output. Height one keeps the coverage proof compact.
+        std::vector<uint8_t> fill_guest(W * 8, 0xC3);   // distinctive pre-run content
         const std::vector<uint8_t> fill_original = fill_guest;
         ShaderResourceTable fill_rt;
-        auto fadd_buf = [&](uint32_t b, void* d, uint32_t s) {
-            ShaderResource r{}; r.cls = ResourceClass::ConstantBuffer; r.binding = b;
-            r.gpu_addr = (uint64_t)(uintptr_t)d; r.size = s; fill_rt.resources.push_back(r); };
-        fadd_buf(0, fill_index.data(), W * sizeof(uint32_t));
-        fadd_buf(1, fdummy.data(), 16); fadd_buf(2, fdummy.data(), 16); fadd_buf(3, fdummy.data(), 16);
         ShaderResource fdst{};
-        fdst.cls = ResourceClass::StorageImage; fdst.img_dim = 0; fdst.binding = 5; fdst.sgpr_base = 8;
-        fdst.format = DataFormat::Unorm8; fdst.num_components = 4; fdst.width = W; fdst.height = 1;
-        fdst.depth = 1; fdst.gpu_addr = (uint64_t)(uintptr_t)fill_guest.data(); fdst.size = W * 4;
+        fdst.cls = ResourceClass::StorageImage; fdst.img_dim = 1; fdst.binding = 5; fdst.sgpr_base = 8;
+        fdst.format = DataFormat::Float16; fdst.num_components = 4; fdst.width = W; fdst.height = 1;
+        fdst.depth = 1; fdst.gpu_addr = (uint64_t)(uintptr_t)fill_guest.data(); fdst.size = W * 8;
         fill_rt.resources.push_back(fdst);
-        std::vector<uint32_t> fill_spirv = recompile_valu(
-            fill_1d, sizeof(fill_1d) / sizeof(fill_1d[0]), 1, 0, &fill_rt);
+        ComputeShaderConfig fill_config;
+        fill_config.user_sgprs.resize(16);
+        fill_config.local_x = W;
+        fill_config.local_y = fill_config.local_z = 1;
+        fill_config.tidig_comp_cnt = 1;
+        fill_config.native_storage_format_support =
+            native_storage_format_support_bit(DataFormat::Float16, 4);
+        std::vector<uint32_t> fill_spirv = recompile_compute(
+            fill_1d, sizeof(fill_1d) / sizeof(fill_1d[0]), &fill_rt, fill_config);
         CHECK(!fill_spirv.empty(), "write-only 1D fill kernel recompiles");
         if (!fill_spirv.empty()) {
             ComputeItem it; it.spirv = fill_spirv;
@@ -1580,6 +1602,78 @@ int main() {
                   "seed-skip fast run (seed skipped) executes the proven full-coverage fill");
             CHECK(fill_guest == after_prove,
                   "seed-skipped run is byte-identical to the poison-proven run (seed is unobserved)");
+
+            uint32_t repeated_write_notifications = 0;
+            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+                if (addr == fdst.gpu_addr && size == fdst.size)
+                    ++repeated_write_notifications;
+            });
+            CHECK(prosper::frontend::execute_live_compute_items({it}),
+                  "retained full-coverage image repeats an identical dispatch");
+            set_guest_gpu_write_observer({});
+            CHECK(fill_guest == after_prove,
+                  "identical retained output leaves the exact guest result intact");
+            CHECK(repeated_write_notifications == 0,
+                  "identical retained output skips redundant guest writeback and invalidation");
+
+            // Prove a second full writer of the same format/extent on a different target, then use
+            // it on this still-valid guest mirror. The persistent image key intentionally does not
+            // contain the shader: different post-processes may reuse one target. Its GPU comparison
+            // must report the changed word exactly and force the ordinary writeback path.
+            static const uint32_t changed_fill_1d[] = {
+                0x7E080300u,             // v4 = v0 (x)
+                0x7E0A0301u,             // v5 = v1 (y)
+                0x7E0402F2u,             // v2 = 1.0f (changed stored B)
+                0x7E060280u,             // v3 = 0
+                0xF0200F08u, 0x00020004u,// IMAGE_STORE v0..v3 at (v4,v5)
+                0xBF810000u,
+            };
+            std::vector<uint8_t> changed_proof_guest(W * 8, 0x71);
+            ShaderResourceTable changed_proof_rt = fill_rt;
+            changed_proof_rt.resources.back().gpu_addr =
+                reinterpret_cast<uint64_t>(changed_proof_guest.data());
+            std::vector<uint32_t> changed_spirv = recompile_compute(
+                changed_fill_1d,
+                sizeof(changed_fill_1d) / sizeof(changed_fill_1d[0]),
+                &changed_proof_rt, fill_config);
+            CHECK(!changed_spirv.empty(), "second full-coverage fill kernel recompiles");
+            if (!changed_spirv.empty()) {
+                ComputeItem changed = it;
+                changed.spirv = changed_spirv;
+                changed.code_addr = 0x1122f12du;
+                changed.resources = std::make_shared<ShaderResourceTable>(changed_proof_rt);
+                CHECK(prosper::frontend::execute_live_compute_items({changed}),
+                      "changed fill proves full coverage on an independent target");
+                changed.resources = std::make_shared<ShaderResourceTable>(fill_rt);
+                uint32_t changed_write_notifications = 0;
+                set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+                    if (addr == fdst.gpu_addr && size == fdst.size)
+                        ++changed_write_notifications;
+                });
+                CHECK(prosper::frontend::execute_live_compute_items({changed}),
+                      "different GPU output executes against an unchanged guest mirror");
+                set_guest_gpu_write_observer({});
+                CHECK(fill_guest != after_prove,
+                      "exact GPU comparison detects and publishes a changed output");
+                CHECK(changed_write_notifications == 1,
+                      "changed GPU output forces guest writeback and invalidation");
+            }
+
+            // Guest memory no longer matches the retained source. Exact source validation must
+            // force a writeback rather than trusting only the GPU-side output baseline.
+            fill_guest[0] ^= 0xff;
+            uint32_t repaired_write_notifications = 0;
+            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+                if (addr == fdst.gpu_addr && size == fdst.size)
+                    ++repaired_write_notifications;
+            });
+            CHECK(prosper::frontend::execute_live_compute_items({it}),
+                  "externally changed guest mirror reruns the retained full-coverage dispatch");
+            set_guest_gpu_write_observer({});
+            CHECK(fill_guest == after_prove,
+                  "retained output repairs an externally changed guest mirror");
+            CHECK(repaired_write_notifications == 1,
+                  "externally changed guest mirror forces writeback and invalidation");
         }
     }
 

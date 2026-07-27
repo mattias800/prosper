@@ -51,6 +51,11 @@ enum class DataFormat : uint32_t {
     Snorm2_10_10_10,
     Uint2_10_10_10,
     Sint2_10_10_10,
+    // Integer fields converted to floating-point without normalization. GFX10's USCALED/SSCALED
+    // buffer formats are valid vertex/typed-buffer inputs (for example 8_8_USCALED format 16), but
+    // are not sampled-image formats in Prosper's current upload contract. Keep these at the end so
+    // existing capture enum values remain stable.
+    Uscaled8, Sscaled8, Uscaled16, Sscaled16,
 };
 
 // Address source for a const-fold-resolved graphics buffer fetch. Automatic preserves the legacy

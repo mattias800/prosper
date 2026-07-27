@@ -7,6 +7,7 @@
 #include "gpu/gpu_capture.hpp"
 #include "gpu/gpu_execute.hpp"
 #include "gpu/shader_resources.hpp"
+#include "gpu/spirv_builder.hpp"
 #include "gpu/tile.hpp"
 #include "gpu/writer_provenance.hpp"
 #include "host/guest_write_watch.hpp"
@@ -88,6 +89,10 @@ bool pack_live_target_r11g11b10(const prosper::gpu::LiveTargetSnapshot& snapshot
         snapshot.pixels->size() != static_cast<size_t>(texels) * source_bytes ||
         !packed || packed_size != static_cast<size_t>(texels) * sizeof(uint32_t))
         return false;
+    if (snapshot.format == prosper::gpu::LiveTargetPixelFormat::R11G11B10Float) {
+        std::memcpy(packed, snapshot.pixels->data(), packed_size);
+        return true;
+    }
     for (size_t t = 0; t < static_cast<size_t>(texels); ++t) {
         float rgb[3]{};
         if (snapshot.format == prosper::gpu::LiveTargetPixelFormat::Rgba16Float) {
@@ -137,11 +142,13 @@ bool direct_sampled_rtt_compatible(prosper::gpu::DataFormat format, uint32_t com
                                    prosper::gpu::LiveTargetPixelFormat target_format) {
     using prosper::gpu::DataFormat;
     using prosper::gpu::LiveTargetPixelFormat;
-    return components == 4 &&
-           ((format == DataFormat::Unorm8 &&
-             target_format == LiveTargetPixelFormat::Rgba8Unorm) ||
-            (format == DataFormat::Float16 &&
-             target_format == LiveTargetPixelFormat::Rgba16Float));
+    return (components == 4 &&
+            ((format == DataFormat::Unorm8 &&
+              target_format == LiveTargetPixelFormat::Rgba8Unorm) ||
+             (format == DataFormat::Float16 &&
+              target_format == LiveTargetPixelFormat::Rgba16Float))) ||
+           (components == 3 && format == DataFormat::Float10_11_11 &&
+            target_format == LiveTargetPixelFormat::R11G11B10Float);
 }
 
 namespace {
@@ -624,6 +631,20 @@ struct CachedComputeImage {
     prosper::host::GuestWriteWatch write_watch;
     prosper::gpu::GuestGpuWriteSnapshot validation_snapshot;
     std::vector<uint8_t> source_snapshot;
+    // Exact row-major bytes produced by the last storage dispatch. Full-overwrite post-processes
+    // commonly reproduce the same large target on successive frames. Retaining the result lets a
+    // later dispatch prove byte-for-byte that the guest mirror is already current before omitting
+    // its CPU pack/retile/writeback. This is deliberately not a hash: a collision must never turn a
+    // changed GPU result into a missed guest write or cache invalidation.
+    std::vector<uint8_t> result_snapshot;
+    // Exact GPU-side result baseline for native storage targets. The next dispatch compares its
+    // transfer buffer to this one word-for-word and returns a four-byte changed flag to the CPU.
+    // Keeping the baseline as a buffer avoids rereading 30-70 MiB of host-visible staging memory
+    // merely to discover that a full-screen post-process reproduced the previous frame exactly.
+    VkBuffer result_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory result_memory = VK_NULL_HANDLE;
+    VkDeviceSize result_allocation_bytes = 0;
+    VkDeviceSize result_bytes = 0;
 };
 
 bool persistent_compute_buffer_enabled(uint32_t bytes) {
@@ -647,9 +668,16 @@ VkDeviceSize persistent_compute_buffer_limit() {
 bool persistent_compute_image_enabled(VkDeviceSize bytes) {
     static const bool enabled =
         std::getenv("PROSPER_NO_PERSISTENT_COMPUTE_IMAGES") == nullptr;
+    static const VkDeviceSize minimum = []() -> VkDeviceSize {
+        const char* value = std::getenv("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB");
+        const uint64_t kib = value ? std::strtoull(value, nullptr, 10) : 1024ull;
+        if (kib > UINT64_MAX / 1024ull) return VkDeviceSize{UINT64_MAX};
+        return static_cast<VkDeviceSize>(kib) * 1024ull;
+    }();
     // The cache exists to remove full-surface detile/conversion/upload work. Tiny textures are both
-    // cheap and numerous, so leave them on the pooled transient path.
-    return enabled && bytes >= (1u << 20);
+    // cheap and numerous, so leave them on the pooled transient path. The threshold is configurable
+    // so integration tests can exercise residency without allocating a multi-megabyte target.
+    return enabled && bytes >= minimum;
 }
 
 VkDeviceSize persistent_compute_image_limit() {
@@ -714,6 +742,10 @@ struct VulkanComputeContext {
     VkDeviceSize image_cache_bytes = 0;
     uint64_t image_cache_clock = 0;
     uint64_t image_validation_clock = 0;
+    VkDescriptorSetLayout compare_descriptor_layout = VK_NULL_HANDLE;
+    VkShaderModule compare_shader = VK_NULL_HANDLE;
+    VkPipelineLayout compare_pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline compare_pipeline = VK_NULL_HANDLE;
     // Storage-image support (#590): the recompiler's storage path declares the
     // StorageImageRead/WriteWithoutFormat capabilities (raw uvec4 texel model — see
     // tests/image_compute_runner.h, the exec-diff harness for that contract). When the device lacks
@@ -733,6 +765,12 @@ struct VulkanComputeContext {
         if (dispatch_fence) vkDestroyFence(device, dispatch_fence, nullptr);
         if (command_pool) vkDestroyCommandPool(device, command_pool, nullptr);
         if (descriptor_pool) vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
+        if (compare_pipeline) vkDestroyPipeline(device, compare_pipeline, nullptr);
+        if (compare_pipeline_layout)
+            vkDestroyPipelineLayout(device, compare_pipeline_layout, nullptr);
+        if (compare_shader) vkDestroyShaderModule(device, compare_shader, nullptr);
+        if (compare_descriptor_layout)
+            vkDestroyDescriptorSetLayout(device, compare_descriptor_layout, nullptr);
         for (const auto& [key, cached] : pipelines) {
             (void)key;
             if (cached.pipeline) vkDestroyPipeline(device, cached.pipeline, nullptr);
@@ -1023,6 +1061,8 @@ struct VulkanComputeContext {
             cached.write_watch.reset();
             if (cached.image) vkDestroyImage(device, cached.image, nullptr);
             if (cached.memory) release_memory(cached.memory);
+            if (cached.result_buffer) vkDestroyBuffer(device, cached.result_buffer, nullptr);
+            if (cached.result_memory) release_memory(cached.result_memory);
         }
         image_cache.clear();
         image_cache_bytes = 0;
@@ -1169,6 +1209,10 @@ struct VulkanComputeContext {
             victim->second.write_watch.reset();
             if (victim->second.image) vkDestroyImage(device, victim->second.image, nullptr);
             if (victim->second.memory) release_memory(victim->second.memory);
+            if (victim->second.result_buffer)
+                vkDestroyBuffer(device, victim->second.result_buffer, nullptr);
+            if (victim->second.result_memory)
+                release_memory(victim->second.result_memory);
             image_cache_bytes -= victim->second.allocation_bytes;
             image_cache.erase(victim);
         }
@@ -1261,6 +1305,101 @@ struct VulkanComputeContext {
         cached.write_watch.reset();
         cached.write_watch = prosper::host::GuestWriteWatch::create(
             key.gpu_addr, key.guest_bytes);
+    }
+
+    bool cached_image_result_matches(const ComputeImageCacheKey& key,
+                                     const uint8_t* result, size_t bytes) const {
+        if (!result) return false;
+        const auto found = image_cache.find(key);
+        return found != image_cache.end() && found->second.content_valid &&
+               found->second.result_snapshot.size() == bytes &&
+               std::memcmp(found->second.result_snapshot.data(), result, bytes) == 0;
+    }
+
+    bool cached_image_result_buffer(const ComputeImageCacheKey& key, VkDeviceSize bytes,
+                                    VkBuffer& result) const {
+        const auto found = image_cache.find(key);
+        if (found == image_cache.end() || found->second.result_bytes != bytes ||
+            !found->second.result_buffer)
+            return false;
+        result = found->second.result_buffer;
+        return true;
+    }
+
+    bool retain_cached_image_result_buffer(const ComputeImageCacheKey& key,
+                                           VkBuffer& buffer, VkDeviceMemory& memory,
+                                           VkDeviceSize allocation_bytes,
+                                           VkDeviceSize result_bytes) {
+        if (!buffer || !memory || !result_bytes || (result_bytes & 3u)) return false;
+        const auto found = image_cache.find(key);
+        if (found == image_cache.end()) return false;
+        CachedComputeImage& cached = found->second;
+        if (cached.result_buffer) return false;
+        if (!make_image_cache_room(allocation_bytes)) return false;
+        cached.result_buffer = buffer;
+        cached.result_memory = memory;
+        cached.result_allocation_bytes = allocation_bytes;
+        cached.result_bytes = result_bytes;
+        cached.allocation_bytes += allocation_bytes;
+        image_cache_bytes += allocation_bytes;
+        buffer = VK_NULL_HANDLE;
+        memory = VK_NULL_HANDLE;
+        cached.result_snapshot.clear();
+        cached.result_snapshot.shrink_to_fit();
+        return true;
+    }
+
+    void remember_cached_image_result(const ComputeImageCacheKey& key,
+                                      const uint8_t* result, size_t bytes) {
+        if (!result) return;
+        const auto found = image_cache.find(key);
+        if (found == image_cache.end()) return;
+        // A retained GPU baseline is updated in the dispatch command buffer. Keep the old host
+        // snapshot only as the exact fallback for small/unaligned results that cannot use it.
+        if (!found->second.result_buffer)
+            found->second.result_snapshot.assign(result, result + bytes);
+    }
+
+    bool prepare_compare_pipeline() {
+        if (compare_pipeline) return true;
+        VkDescriptorSetLayoutBinding bindings[3]{};
+        for (uint32_t i = 0; i < 3; ++i) {
+            bindings[i].binding = i;
+            bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[i].descriptorCount = 1;
+            bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo dlci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        dlci.bindingCount = 3;
+        dlci.pBindings = bindings;
+        if (vkCreateDescriptorSetLayout(device, &dlci, nullptr,
+                                        &compare_descriptor_layout) != VK_SUCCESS)
+            return false;
+        const std::vector<uint32_t> spirv = prosper::gpu::build_compute_compare_uvec4();
+        VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        smci.codeSize = spirv.size() * sizeof(uint32_t);
+        smci.pCode = spirv.data();
+        if (vkCreateShaderModule(device, &smci, nullptr, &compare_shader) != VK_SUCCESS)
+            return false;
+        VkPushConstantRange push{};
+        push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        push.size = sizeof(uint32_t);
+        VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        plci.setLayoutCount = 1;
+        plci.pSetLayouts = &compare_descriptor_layout;
+        plci.pushConstantRangeCount = 1;
+        plci.pPushConstantRanges = &push;
+        if (vkCreatePipelineLayout(device, &plci, nullptr,
+                                   &compare_pipeline_layout) != VK_SUCCESS)
+            return false;
+        VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        cpci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        cpci.stage.module = compare_shader;
+        cpci.stage.pName = "main";
+        cpci.layout = compare_pipeline_layout;
+        return vkCreateComputePipelines(device, pipeline_cache, 1, &cpci, nullptr,
+                                        &compare_pipeline) == VK_SUCCESS;
     }
 
     // A GRAPHICS queue family is not required by spec to also advertise COMPUTE, and the renderer
@@ -1465,6 +1604,11 @@ struct BoundImage {
     bool cache_candidate = false;
     bool upload_skipped = false;         // write watch proved the cached source unchanged
     VkDeviceSize allocation_bytes = 0;
+    VkDeviceSize staging_allocation_bytes = 0;
+    VkDeviceSize linear_result_bytes = 0;
+    VkBuffer result_baseline = VK_NULL_HANDLE;
+    size_t compare_flag_index = SIZE_MAX;
+    bool gpu_result_unchanged = false;
     ComputeImageCacheKey cache_key{};
     std::vector<uint8_t> cache_source_snapshot; // first-use source captured before the transfer
     bool seed_skip = false;             // #1122: write-only full-coverage storage image; no seed needed
@@ -1763,16 +1907,6 @@ void storage_pack_range(const uint32_t* channels, prosper::gpu::DataFormat f, ui
                 for (uint32_t c = 0; c < n; ++c) p[c] = static_cast<uint8_t>(in[c]);
             }
             return;
-        case DF::Unorm16:
-            for (size_t t = 0; t < count; ++t) {
-                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
-                for (uint32_t c = 0; c < n; ++c) {
-                    const uint16_t value = storage_pack_unorm16(in[c]);
-                    p[c * 2] = static_cast<uint8_t>(value);
-                    p[c * 2 + 1] = static_cast<uint8_t>(value >> 8);
-                }
-            }
-            return;
         case DF::Uint16: case DF::Sint16:
             for (size_t t = 0; t < count; ++t) {
                 const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
@@ -1997,6 +2131,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     std::vector<VkBuffer> staging(image_descriptors.size(), VK_NULL_HANDLE);          // upload/readback
     std::vector<VkDeviceMemory> staging_memory(image_descriptors.size(), VK_NULL_HANDLE);
     std::vector<VkDeviceSize> staging_bytes(image_descriptors.size(), 0);
+    VkBuffer compare_flags = VK_NULL_HANDLE;
+    VkDeviceMemory compare_flags_memory = VK_NULL_HANDLE;
+    VkDescriptorPool compare_descriptor_pool = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> compare_descriptor_sets;
     VkDescriptorSetLayout descriptor_layout = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     bool descriptor_pool_reused = false;
@@ -2020,6 +2158,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     };
 
     auto cleanup = [&] {
+        if (compare_descriptor_pool)
+            vkDestroyDescriptorPool(ctx.device, compare_descriptor_pool, nullptr);
+        if (compare_flags) vkDestroyBuffer(ctx.device, compare_flags, nullptr);
+        if (compare_flags_memory) ctx.release_memory(compare_flags_memory);
         if (!pipeline_cached) {
             if (pipeline) vkDestroyPipeline(ctx.device, pipeline, nullptr);
             if (pipeline_layout) vkDestroyPipelineLayout(ctx.device, pipeline_layout, nullptr);
@@ -2371,7 +2513,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                          import.width, import.height,
                                          depth_import ? "depth"
                                              : import.format == LiveTargetPixelFormat::Rgba16Float
-                                                   ? "rgba16f" : "rgba8");
+                                                   ? "rgba16f"
+                                             : import.format == LiveTargetPixelFormat::R11G11B10Float
+                                                   ? "r11g11b10" : "rgba8");
                     } else {
                         // Not our exact contract (a different device or a stale aliased view).
                         release_live_render_target_image(r->gpu_addr);
@@ -2496,6 +2640,22 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     if (expected != live_target.pixels->size()) {
                         skip_image(r, "renderer-owned RTT snapshot byte count mismatch"); break;
                     }
+                }
+                if (renderer_owned &&
+                    live_target.format == LiveTargetPixelFormat::R11G11B10Float &&
+                    (r->format != DataFormat::Float10_11_11 ||
+                     (r->num_components ? r->num_components : 1u) != 3u)) {
+                    // Keep native packed targets exact. Supporting a different typed view requires
+                    // an explicit byte-compatible alias contract; interpreting these four bytes as
+                    // RGBA8/FP16 would silently corrupt the compute input.
+                    renderer_owned = false;
+                    if (trace)
+                        std::fprintf(stderr,
+                                     "[compute]   renderer RTT packed-view miss binding=%u "
+                                     "addr=0x%llx requested=f%u/c%u -> guest backing\n",
+                                     bi.binding, (unsigned long long)r->gpu_addr,
+                                     (unsigned)r->format,
+                                     r->num_components ? r->num_components : 1u);
                 }
                 if (renderer_owned && !bi.storage &&
                     (r->format == DataFormat::Float32 || r->format == DataFormat::Uint16 ||
@@ -2887,11 +3047,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (!bi.imported && !(bi.persistent && bi.upload_skipped)) {
                 VkBufferCreateInfo sci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
                 sci.size = sbytes;
-                sci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                sci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
                 if (!vk_ok(vkCreateBuffer(ctx.device, &sci, nullptr, &staging[i]),
                            "image-staging-buffer")) { images_ready = false; break; }
                 VkMemoryRequirements sreq{};
                 vkGetBufferMemoryRequirements(ctx.device, staging[i], &sreq);
+                bi.staging_allocation_bytes = sreq.size;
                 const uint32_t staging_memory_type = ctx.host_memory_type(sreq.memoryTypeBits);
                 staging_memory[i] = ctx.allocate_memory(sreq.size, staging_memory_type, true);
                 if (!vk_handle_ok(staging_memory[i], "image-staging-memory") ||
@@ -2927,6 +3089,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     ? 4u : (size_t)cb * nc;
                 const size_t texels = (size_t)volume_texels;
                 const uint64_t linear_guest_bytes = static_cast<uint64_t>(texels) * guest_texel;
+                bi.linear_result_bytes = static_cast<VkDeviceSize>(linear_guest_bytes);
                 size_t guest_bytes = r->tile_mode
                     ? (dim_3d && r->depth > 1
                            ? tiled_volume_bytes(r->width, r->height, r->depth, r->tile_mode,
@@ -2974,16 +3137,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (!readable) { skip_image(r, "storage backing unreadable"); break; }
                 // Native storage targets are byte-identical to their sampled view. Retain them after
                 // writeback so the next dispatch/frame can consume the GPU result directly instead
-                // of detiling and uploading the same multi-megabyte surface again. Poison proving
-                // deliberately stays transient: a partial proof repairs untouched texels on the CPU
-                // after readback, so its device image is not yet the repaired authoritative value.
+                // of detiling and uploading the same multi-megabyte surface again. A proven
+                // full-overwrite seed-skip is particularly safe to retain: the old image is never an
+                // input to the shader. Poison proving deliberately stays transient because a partial
+                // proof repairs untouched texels only in the CPU mirror after readback.
                 const bool dcc_cache_safe = !r->compression_enabled ||
                     (bi.dcc_metadata && bi.dcc_metadata_bytes &&
                      std::all_of(bi.dcc_metadata, bi.dcc_metadata + bi.dcc_metadata_bytes,
                                  [](uint8_t value) { return value == 0xff; }));
                 bi.cache_candidate = !renderer_owned && !r->host_data && dcc_cache_safe &&
-                    !bi.seed_skip && !bi.poison_verify &&
-                    bi.native_float_storage && persistent_compute_image_enabled(sbytes);
+                    !bi.poison_verify && bi.native_float_storage &&
+                    persistent_compute_image_enabled(sbytes);
                 if (bi.cache_candidate) {
                     bi.cache_key = {
                         r->gpu_addr, static_cast<uint32_t>(guest_bytes), r->size,
@@ -2998,6 +3162,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     bi.persistent = ctx.acquire_cached_image(
                         bi.cache_key, resource_bytes_for(r, guest_bytes), image_validation_epoch,
                         bi.image, bi.memory, bi.upload_skipped);
+                    if (bi.persistent)
+                        ctx.cached_image_result_buffer(
+                            bi.cache_key, bi.linear_result_bytes, bi.result_baseline);
                     if (trace && bi.persistent)
                         std::fprintf(stderr,
                                      "[compute]   persistent storage image binding=%u "
@@ -3163,7 +3330,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                          bi.binding, (unsigned long long)r->gpu_addr,
                                          r->width, r->height,
                                          live_target.format == LiveTargetPixelFormat::Rgba16Float
-                                             ? "16f" : "8");
+                                             ? "16f"
+                                         : live_target.format == LiveTargetPixelFormat::R11G11B10Float
+                                             ? "11g11b10" : "8");
                     } else if (sampled_float32_native || sampled_uint16_native ||
                                sampled_uint32_native) {
                         // A renderer-owned target is authoritative only when its cached texel is
@@ -3689,6 +3858,91 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
         phase_pipeline = ComputeClock::now();
 
+        // A retained native storage target has an exact prior-result buffer. Compare the current
+        // transfer result against it on the GPU, reducing millions of word equalities to one flag.
+        // The optimization is deliberately limited to whole uint32_t words; unaligned byte counts
+        // retain the collision-free CPU comparison below rather than risk an out-of-range load.
+        std::vector<size_t> compare_indices;
+        for (size_t i = 0; i < images.size(); ++i) {
+            BoundImage& image = images[i];
+            if (image.storage && image.cache_candidate && image.persistent &&
+                image.upload_skipped && image.native_float_storage && image.result_baseline &&
+                image.linear_result_bytes && !(image.linear_result_bytes & 15u) && staging[i])
+                compare_indices.push_back(i);
+        }
+        bool compare_ready = compare_indices.empty();
+        if (!compare_indices.empty() && ctx.prepare_compare_pipeline()) {
+            VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bci.size = compare_indices.size() * sizeof(uint32_t);
+            bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            compare_ready = vk_ok(vkCreateBuffer(ctx.device, &bci, nullptr, &compare_flags),
+                                  "compare-flags-buffer");
+            VkMemoryRequirements requirements{};
+            if (compare_ready) {
+                vkGetBufferMemoryRequirements(ctx.device, compare_flags, &requirements);
+                compare_flags_memory = ctx.allocate_memory(
+                    requirements.size, ctx.host_memory_type(requirements.memoryTypeBits), true);
+                compare_ready = vk_handle_ok(compare_flags_memory, "compare-flags-memory") &&
+                    vk_ok(vkBindBufferMemory(ctx.device, compare_flags,
+                                            compare_flags_memory, 0),
+                          "compare-flags-bind");
+            }
+            if (compare_ready) {
+                VkDescriptorPoolSize size{
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    static_cast<uint32_t>(compare_indices.size() * 3)};
+                VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+                dpci.maxSets = static_cast<uint32_t>(compare_indices.size());
+                dpci.poolSizeCount = 1;
+                dpci.pPoolSizes = &size;
+                compare_ready = vk_ok(vkCreateDescriptorPool(
+                    ctx.device, &dpci, nullptr, &compare_descriptor_pool),
+                    "compare-descriptor-pool");
+            }
+            if (compare_ready) {
+                compare_descriptor_sets.resize(compare_indices.size());
+                std::vector<VkDescriptorSetLayout> layouts(
+                    compare_indices.size(), ctx.compare_descriptor_layout);
+                VkDescriptorSetAllocateInfo allocate{
+                    VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+                allocate.descriptorPool = compare_descriptor_pool;
+                allocate.descriptorSetCount = static_cast<uint32_t>(layouts.size());
+                allocate.pSetLayouts = layouts.data();
+                compare_ready = vk_ok(vkAllocateDescriptorSets(
+                    ctx.device, &allocate, compare_descriptor_sets.data()),
+                    "compare-descriptor-sets");
+            }
+            if (compare_ready) {
+                std::vector<std::array<VkDescriptorBufferInfo, 3>> infos(compare_indices.size());
+                std::vector<VkWriteDescriptorSet> writes(compare_indices.size() * 3);
+                for (size_t j = 0; j < compare_indices.size(); ++j) {
+                    const size_t i = compare_indices[j];
+                    BoundImage& image = images[i];
+                    infos[j][0] = {staging[i], 0, image.linear_result_bytes};
+                    infos[j][1] = {image.result_baseline, 0, image.linear_result_bytes};
+                    infos[j][2] = {compare_flags, j * sizeof(uint32_t), sizeof(uint32_t)};
+                    for (uint32_t binding = 0; binding < 3; ++binding) {
+                        VkWriteDescriptorSet& write = writes[j * 3 + binding];
+                        write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                        write.dstSet = compare_descriptor_sets[j];
+                        write.dstBinding = binding;
+                        write.descriptorCount = 1;
+                        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                        write.pBufferInfo = &infos[j][binding];
+                    }
+                    image.compare_flag_index = j;
+                }
+                vkUpdateDescriptorSets(
+                    ctx.device, static_cast<uint32_t>(writes.size()), writes.data(),
+                    0, nullptr);
+            }
+        }
+        if (!compare_ready) {
+            for (size_t i : compare_indices) images[i].compare_flag_index = SIZE_MAX;
+            compare_indices.clear();
+        }
+
         if (!ctx.prepare_dispatch_commands()) {
             if (trace) std::fprintf(stderr, "[compute]   Vulkan failure stage=command-reuse\n");
             break;
@@ -3749,10 +4003,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      1, &to_general);
                 continue;
             }
-            if (bi.persistent && bi.upload_skipped) {
+            if (bi.persistent && (bi.upload_skipped || bi.seed_skip)) {
                 // The previous synchronous dispatch left this read-only sampled image in GENERAL,
-                // and the write watch proved its complete guest source unchanged. No transfer or
-                // layout transition is needed.
+                // and either the guest source is unchanged or the proven-full shader cannot observe
+                // that source. No transfer or layout transition is needed.
                 continue;
             }
             if (bi.seed_skip) {
@@ -3872,6 +4126,88 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      0, nullptr, 1, &to_general);
             }
         }
+        // Compare retained native results before replacing their baselines. Transfer writes from
+        // vkCmdCopyImageToBuffer become shader reads; the one atomic flag per image then becomes a
+        // four-byte host read after the fence. Irrespective of whether the guest mirror was eligible
+        // to skip, update every existing baseline to the current exact transfer bytes.
+        if (!compare_indices.empty()) {
+            vkCmdFillBuffer(command, compare_flags, 0,
+                            compare_indices.size() * sizeof(uint32_t), 0);
+            std::vector<VkBufferMemoryBarrier> before_compare;
+            before_compare.reserve(compare_indices.size() * 2 + 1);
+            for (size_t i : compare_indices) {
+                VkBufferMemoryBarrier current{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+                current.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                current.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                current.srcQueueFamilyIndex = current.dstQueueFamilyIndex =
+                    VK_QUEUE_FAMILY_IGNORED;
+                current.buffer = staging[i];
+                current.size = images[i].linear_result_bytes;
+                before_compare.push_back(current);
+                VkBufferMemoryBarrier prior = current;
+                prior.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT |
+                                      VK_ACCESS_SHADER_WRITE_BIT;
+                prior.buffer = images[i].result_baseline;
+                before_compare.push_back(prior);
+            }
+            VkBufferMemoryBarrier flags{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            flags.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            flags.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            flags.srcQueueFamilyIndex = flags.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            flags.buffer = compare_flags;
+            flags.size = compare_indices.size() * sizeof(uint32_t);
+            before_compare.push_back(flags);
+            vkCmdPipelineBarrier(command,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
+                                 static_cast<uint32_t>(before_compare.size()),
+                                 before_compare.data(), 0, nullptr);
+            vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              ctx.compare_pipeline);
+            for (size_t j = 0; j < compare_indices.size(); ++j) {
+                const BoundImage& image = images[compare_indices[j]];
+                vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                        ctx.compare_pipeline_layout, 0, 1,
+                                        &compare_descriptor_sets[j], 0, nullptr);
+                const uint32_t vectors =
+                    static_cast<uint32_t>(image.linear_result_bytes / 16u);
+                vkCmdPushConstants(command, ctx.compare_pipeline_layout,
+                                   VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(vectors), &vectors);
+                vkCmdDispatch(command, (vectors + 255u) / 256u, 1, 1);
+            }
+        }
+        for (size_t i = 0; i < images.size(); ++i) {
+            BoundImage& image = images[i];
+            if (!image.storage || !image.result_baseline || !staging[i]) continue;
+            // Compared words update the baseline in the comparator only when they differ. An
+            // identical result therefore has no redundant 66 MiB baseline copy at all.
+            if (image.compare_flag_index != SIZE_MAX) continue;
+            VkBufferMemoryBarrier current{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            current.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            current.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            current.srcQueueFamilyIndex = current.dstQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            current.buffer = staging[i];
+            current.size = image.linear_result_bytes;
+            vkCmdPipelineBarrier(
+                command,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &current, 0, nullptr);
+            VkBufferCopy copy{0, 0, image.linear_result_bytes};
+            vkCmdCopyBuffer(command, staging[i], image.result_baseline, 1, &copy);
+        }
+        if (!compare_indices.empty()) {
+            VkBufferMemoryBarrier flags{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            flags.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            flags.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            flags.srcQueueFamilyIndex = flags.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            flags.buffer = compare_flags;
+            flags.size = compare_indices.size() * sizeof(uint32_t);
+            vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &flags,
+                                 0, nullptr);
+        }
         if (!vk_ok(vkEndCommandBuffer(command), "command-end")) break;
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = 1;
@@ -3903,6 +4239,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
         if (trace) std::fprintf(stderr, "[compute]   dispatch complete\n");
         phase_dispatch = ComputeClock::now();
+
+        if (!compare_indices.empty()) {
+            void* mapped = nullptr;
+            if (ctx.map_memory(compare_flags_memory, 0,
+                               compare_indices.size() * sizeof(uint32_t), &mapped) == VK_SUCCESS) {
+                const auto* changed = static_cast<const uint32_t*>(mapped);
+                for (size_t j = 0; j < compare_indices.size(); ++j)
+                    images[compare_indices[j]].gpu_result_unchanged = changed[j] == 0;
+                ctx.unmap_memory(compare_flags_memory);
+            }
+        }
 
         // The fence proves every upload is complete and every sampled image is back in GENERAL.
         // New entries become cache-owned only here, so an earlier Vulkan failure cannot retain an
@@ -3987,11 +4334,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             BoundImage& bi = images[i];
             if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported) continue;
             const ShaderResource* r = bi.resource;
-            void* mapped = nullptr;
-            if (ctx.map_memory(staging_memory[i], 0, staging_bytes[i], &mapped) != VK_SUCCESS) {
-                readback_ok = false;
-                break;
-            }
             const uint32_t cb = data_format_bytes(r->format);
             const uint32_t nc = r->num_components ? r->num_components : 1;
             const size_t guest_texel = (r->format == DataFormat::Float10_11_11 ||
@@ -4000,10 +4342,23 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const size_t texels = (size_t)r->width * r->height * r->depth;
             const size_t linear_bytes = texels * guest_texel;
             uint8_t* destination = resource_bytes_for(r, bi.guest_bytes);
+            // GPU comparison is an exact word-for-word equality reduction and acquire_cached_image
+            // independently proved that the guest mirror still contains that baseline. This path
+            // therefore needs neither a large staging mapping nor a CPU memory pass.
+            if (bi.gpu_result_unchanged) {
+                if (trace)
+                    std::fprintf(stderr,
+                                 "[compute]   skipped GPU-identical storage writeback binding=%u "
+                                 "addr=0x%llx bytes=%zu\n",
+                                 bi.binding, (unsigned long long)r->gpu_addr, linear_bytes);
+                continue;
+            }
+            void* mapped = nullptr;
+            if (ctx.map_memory(staging_memory[i], 0, staging_bytes[i], &mapped) != VK_SUCCESS) {
+                readback_ok = false;
+                break;
+            }
             const bool array_image = backend_uses_2d_array(*r);
-            if (!r->host_data && r->gpu_addr)
-                prosper::host::guest_write_watch_notify_host_write(
-                    r->gpu_addr, bi.guest_bytes);
             std::unique_ptr<uint8_t[]> linear;
             uint8_t* packed = destination;
             if (r->tile_mode || (array_image && r->depth > 1)) {
@@ -4012,6 +4367,28 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             const uint32_t* channels = static_cast<const uint32_t*>(mapped);
             const uint8_t* native_texels = static_cast<const uint8_t*>(mapped);
+            // A retained, proven-full output can avoid the expensive CPU pack/retile and renderer
+            // invalidation when BOTH sides of the contract are exact: acquire_cached_image proved
+            // that guest memory still contains the prior result, and this dispatch reproduced the
+            // same row-major bytes. If either comparison fails, take the ordinary writeback below.
+            const bool repeated_output = bi.cache_candidate && bi.persistent &&
+                bi.upload_skipped && bi.native_float_storage &&
+                ctx.cached_image_result_matches(bi.cache_key, native_texels, linear_bytes);
+            if (repeated_output) {
+                if (trace)
+                    std::fprintf(stderr,
+                                 "[compute]   skipped identical storage writeback binding=%u "
+                                 "addr=0x%llx bytes=%zu\n",
+                                 bi.binding, (unsigned long long)r->gpu_addr, linear_bytes);
+                ctx.unmap_memory(staging_memory[i]);
+                continue;
+            }
+            // Notify page-based dirty trackers only when bytes will actually be written. Doing this
+            // before the exact repeated-output check dirtied and rearmed tens of thousands of pages
+            // even on the no-write path, defeating the validation that made that path safe.
+            if (!r->host_data && r->gpu_addr)
+                prosper::host::guest_write_watch_notify_host_write(
+                    r->gpu_addr, bi.guest_bytes);
             // #1122 proving-frame poison scan: a texel still fully poison was NOT stored by the write.
             // Zero survivors == the shader covers every texel (safe to fast-skip its seed henceforth);
             // any survivor == partial coverage (must always seed). Cache the verdict per (code,binding)
@@ -4210,8 +4587,25 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      bi.binding, (unsigned long long)r->gpu_addr,
                                      (unsigned long long)bi.allocation_bytes);
                 }
+                if (bi.persistent)
+                    ctx.remember_cached_image_result(
+                        bi.cache_key, native_texels, linear_bytes);
             }
             ctx.unmap_memory(staging_memory[i]);
+            const VkBuffer retained_result = staging[i];
+            if (bi.cache_candidate && bi.persistent && !bi.result_baseline &&
+                bi.native_float_storage && !(linear_bytes & 15u) &&
+                ctx.prepare_compare_pipeline() &&
+                ctx.retain_cached_image_result_buffer(
+                    bi.cache_key, staging[i], staging_memory[i],
+                    bi.staging_allocation_bytes, linear_bytes)) {
+                bi.result_baseline = retained_result;
+                if (trace)
+                    std::fprintf(stderr,
+                                 "[compute]   retained exact GPU result baseline binding=%u "
+                                 "addr=0x%llx bytes=%zu\n",
+                                 bi.binding, (unsigned long long)r->gpu_addr, linear_bytes);
+            }
         }
         if (!readback_ok) break;
         ok = true;
@@ -4221,12 +4615,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     if (trace)
         std::fprintf(stderr, "[compute] execute submit=%llu dispatch=%llu code=0x%llx "
                      "threads=%ux%ux%u local=%ux%ux%u groups=%ux%ux%u "
-                     "buffers=%zu images=%zu result=%s\n",
+                     "buffers=%zu images=%zu spirv=%zu/%016llx result=%s\n",
                      (unsigned long long)item.submit_no, (unsigned long long)item.dispatch_index,
                      (unsigned long long)item.code_addr, item.launch.threads_x,
                      item.launch.threads_y, item.launch.threads_z, item.launch.local_x,
                      item.launch.local_y, item.launch.local_z, item.launch.groups_x,
                      item.launch.groups_y, item.launch.groups_z, buffers.size(), images.size(),
+                     spirv.size(), (unsigned long long)gpu_capture_hash(
+                         reinterpret_cast<const uint8_t*>(spirv.data()),
+                         spirv.size() * sizeof(uint32_t)),
                      ok ? "ok" : "failed");
     if (trace) {
         for (const auto& buffer : buffers) {

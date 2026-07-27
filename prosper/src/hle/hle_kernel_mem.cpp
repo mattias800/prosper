@@ -348,6 +348,13 @@ namespace {
             g_maps.swap(out);
         }
         host::notify_guest_mapping_added(base, size, committed && (prot & 0x1));
+        // Flexible memory has no physical alias identity, but it is still ordinary guest memory
+        // whose CPU writes must invalidate persistent sampled-texture cache entries.  Use its VA as
+        // a stable synthetic physical identity.  Direct mappings are registered by map_phys_at()
+        // with their real physical offset so every alias remains covered by the same watched page.
+        if (committed && !(query_flags & kVirtualQueryDirect))
+            host::guest_write_watch_notify_direct_mapping_added(
+                base, size, base, guest_prot);
     }
     // Trim/split tracked mappings overlapping [base, base+len). munmap/BatchMap-UNMAP must remove
     // their tracking (this never happened before — g_maps only ever grew): stale "committed"

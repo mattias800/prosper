@@ -473,9 +473,9 @@ struct SpirvCompute {
             put(deco, Op_Decorate, {v_subgroup_localid, Dec_Flat});
             iface.push_back(v_subgroup_localid);
         }
-        // Fragment lane ids model RDNA wave64 lanes, not the implementation's default subgroup.
+        // Fragment lane ids model the guest RDNA wave, not the implementation's default subgroup.
         // Record that exact-width contract as non-semantic module metadata in finish().
-        if (is_fragment) fragment_required_subgroup_size = 64;
+        if (is_fragment) fragment_required_subgroup_size = wave_size;
         uint32_t lane = id();
         put(code, Op_Load, {t_u32, lane, v_subgroup_localid});
         return lane;
@@ -495,7 +495,7 @@ struct SpirvCompute {
             put(caps, Op_Capability, {Cap_GroupNonUniformVote});
             declared_subgroup_vote = true;
         }
-        fragment_required_subgroup_size = 64;
+        fragment_required_subgroup_size = wave_size;
         uint32_t result = id();
         put(code, Op_GroupNonUniformAny,
             {t_bool, result, uconst(Scope_Subgroup), active_bit});
@@ -646,23 +646,23 @@ struct SpirvCompute {
         // DPP rows contain 16 contiguous lanes. Keep width metadata independent of SPIR-V
         // capabilities: declaring an unused operation merely as a marker over-requires the host and
         // confuses shaders that genuinely use that capability for unrelated work.
-        if (is_fragment) fragment_required_subgroup_size = 64;
+        if (is_fragment) fragment_required_subgroup_size = wave_size;
         else compute_min_subgroup_size = std::max(compute_min_subgroup_size, 16u);
     }
     void mark_subgroup_min32() {
         // PERMLANEX16 crosses a pair of 16-lane rows.
-        if (is_fragment) fragment_required_subgroup_size = 64;
+        if (is_fragment) fragment_required_subgroup_size = wave_size;
         else compute_min_subgroup_size = std::max(compute_min_subgroup_size, 32u);
     }
     void mark_subgroup_min64() {
         // V_READLANE_B32 may address every lane of a wave64.
-        if (is_fragment) fragment_required_subgroup_size = 64;
+        if (is_fragment) fragment_required_subgroup_size = wave_size;
         else compute_min_subgroup_size = std::max(compute_min_subgroup_size, 64u);
     }
     uint32_t subgroup_shuffle(uint32_t value, uint32_t lane) {
         // Every supported native shuffle at least addresses an architectural quad. Wider row/wave
         // operations raise this contract before calling the common helper.
-        if (is_fragment) fragment_required_subgroup_size = 64;
+        if (is_fragment) fragment_required_subgroup_size = wave_size;
         else compute_min_subgroup_size = std::max(compute_min_subgroup_size, 4u);
         if (!declared_subgroup) {
             put(caps, Op_Capability, {Cap_GroupNonUniform});
@@ -1630,39 +1630,75 @@ struct SpirvCompute {
     uint32_t v_localid = 0, localid = 0, lds_wave = 0, t_ptr_wg_u32b = 0;
     void declare_wave_lds() {
         if (lds_wave) return;
-        uint32_t t_arr = id();  put(types, Op_TypeArray, {t_arr, t_u32, uconst(std::max(1u, local_count))});
+        // Keep one result slot per guest wave separate from the per-lane publication area.  A
+        // completed vote can then be consumed while a faster invocation starts publishing the next
+        // one, without needing a third workgroup barrier solely to protect the result.
+        const uint32_t wave_count = (local_count + wave_size - 1) / wave_size;
+        uint32_t t_arr = id();
+        put(types, Op_TypeArray,
+            {t_arr, t_u32, uconst(std::max(1u, local_count + wave_count))});
         uint32_t t_ptr = id();  put(types, Op_TypePointer, {t_ptr, SC_Workgroup, t_arr});
         lds_wave = id();        put(types, Op_Variable, {t_ptr, lds_wave, SC_Workgroup});
         t_ptr_wg_u32b = id();   put(types, Op_TypePointer, {t_ptr_wg_u32b, SC_Workgroup, t_u32});
     }
     // Exact guest-wave vote at a workgroup-uniform site. Vulkan subgroup width is implementation-
     // defined and need not match the guest's 32/64-lane wave, so publish every lane through shared
-    // scratch and reduce only lanes with the same guest-wave index. Both barriers are required: the
-    // first publishes this vote, while the second prevents a later vote from overwriting scratch
-    // before every invocation has consumed it. The caller proves the site is outside wave-divergent
-    // structured control flow.
+    // scratch and reduce only lanes with the same guest-wave index. One lane per guest wave performs
+    // the reduction and publishes it in a separate result slot.  Besides avoiding an assumption about
+    // Vulkan subgroup membership, this makes the amount of LDS work linear in the workgroup size:
+    // the old per-invocation reduction made a 256-thread group perform 65,536 loads for every vote.
+    // The first barrier publishes lane bits and the second publishes wave results. The caller proves
+    // the site is outside wave-divergent structured control flow.
     uint32_t guest_wave_any(uint32_t active_bool) {
         declare_wave_lds();
+        const uint32_t zero = uconst(0);
         const uint32_t bit = sel(active_bool, uconst(1), uconst(0));
         uint32_t p = id();
         putv(code, Op_AccessChain, {t_ptr_wg_u32b, p, lds_wave, linear_localid});
         put(code, Op_Store, {p, bit});
         barrier();
 
+        const uint32_t wave_shift = wave_size == 32 ? 5u : 6u;
         const uint32_t wave_index = ibin(
-            Op_ShiftRightLogical, linear_localid, uconst(wave_size == 32 ? 5u : 6u));
-        uint32_t any = bfalse();
-        for (uint32_t i = 0; i < local_count; ++i) {
+            Op_ShiftRightLogical, linear_localid, uconst(wave_shift));
+        const uint32_t wave_base = ibin(
+            Op_ShiftLeftLogical, wave_index, uconst(wave_shift));
+        const uint32_t lane = ibin(
+            Op_BitwiseAnd, linear_localid, uconst(wave_size - 1));
+        const uint32_t leader = id(), reduced = id();
+        const uint32_t is_leader = ucmp(Op_IEqual, lane, zero);
+        emit_selmerge(reduced);
+        emit_condbranch(is_leader, leader, reduced);
+        emit_label(leader);
+        uint32_t any_word = zero;
+        for (uint32_t i = 0; i < wave_size; ++i) {
+            const uint32_t idx = ibin(Op_IAdd, wave_base, uconst(i));
+            const uint32_t valid = ucmp(Op_ULessThan, idx, uconst(local_count));
+            // Keep the memory access in-bounds for a partial final guest wave. The selected value is
+            // ignored when idx names a padded lane, but Vulkan must never observe an OOB OpLoad.
+            const uint32_t safe_idx = sel(valid, idx, zero);
             uint32_t q = id();
-            putv(code, Op_AccessChain, {t_ptr_wg_u32b, q, lds_wave, uconst(i)});
+            putv(code, Op_AccessChain, {t_ptr_wg_u32b, q, lds_wave, safe_idx});
             uint32_t value = id();
             put(code, Op_Load, {t_u32, value, q});
-            const uint32_t same_wave = ucmp(
-                Op_IEqual, wave_index, uconst(i / wave_size));
-            any = lor(any, land(same_wave, ucmp(Op_INotEqual, value, uconst(0))));
+            any_word = ibin(Op_BitwiseOr, any_word, sel(valid, value, zero));
         }
+        const uint32_t result_index = ibin(Op_IAdd, uconst(local_count), wave_index);
+        uint32_t result_ptr = id();
+        putv(code, Op_AccessChain,
+             {t_ptr_wg_u32b, result_ptr, lds_wave, result_index});
+        put(code, Op_Store, {result_ptr, any_word});
+        emit_branch(reduced);
+        emit_label(reduced);
         barrier();
-        return any;
+        const uint32_t result_index_all = ibin(
+            Op_IAdd, uconst(local_count), wave_index);
+        uint32_t result_ptr_all = id();
+        putv(code, Op_AccessChain,
+             {t_ptr_wg_u32b, result_ptr_all, lds_wave, result_index_all});
+        uint32_t result = id();
+        put(code, Op_Load, {t_u32, result, result_ptr_all});
+        return ucmp(Op_INotEqual, result, zero);
     }
     // v_mbcnt_lo/hi: count active lanes below this one. active_bool = this lane's mask bit (EXEC); acc =
     // src1 accumulator (bits); `lo` selects the [0,32) half (lo) or [32,64) half (hi). Combined lo→hi over
@@ -4329,9 +4365,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // compute/fragment lowering needs a real wave reduction rather than scalar data.
                 uint32_t result = 0;
                 auto mask = rs.sreg_bool.find(in.src[0].value);
-                if (!b.is_compute && !b.is_fragment && mask != rs.sreg_bool.end()) {
+                if (!b.is_compute && !b.is_fragment && b.ngg_one_lane &&
+                    mask != rs.sreg_bool.end()) {
                     result = b.sel(mask->second, b.uconst(1), b.uconst(0));
                 } else {
+                    // A Boolean-domain pair is a whole wave mask, not two ordinary scalar dwords.
+                    // Only the byte-exact one-lane NGG projection above can reduce it locally.
+                    if (mask != rs.sreg_bool.end()) { ok = false; return true; }
                     auto scalar_half = [&](int reg, uint32_t& value) {
                         auto current = rs.sreg.find(reg);
                         if (current != rs.sreg.end()) { value = current->second; return true; }
@@ -10742,7 +10782,9 @@ static std::vector<uint32_t> recompile_fragment_impl(
         const PixelSystemInputMapping* system_inputs,
         uint32_t pcrel_dispatch_target,
         const FragmentInterpolationLayout* interpolation,
+        uint32_t wave_size,
         bool allow_test_wave32) {
+    if (wave_size != 32 && wave_size != 64) return {};
     std::vector<Rdna2Inst> ins;
     const size_t program_dwords = rdna2_walk(code, dwords, ins);
     if (pcrel_dispatch_target != UINT32_MAX) {
@@ -10794,6 +10836,7 @@ static std::vector<uint32_t> recompile_fragment_impl(
         return {};
     }
     SpirvCompute b;
+    b.wave_size = wave_size;
     b.begin_fragment(rt, color_mask);
     // Graphics wave mode is not yet plumbed from the stage registers. Keep low-half EXEC/VCC mask
     // semantics restricted to the complete captured Astro material shader that demonstrated the
@@ -10935,14 +10978,16 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          const ShaderResourceTable* rt,
                                          const PixelSystemInputMapping* system_inputs,
                                          uint32_t pcrel_dispatch_target,
-                                         const FragmentInterpolationLayout* interpolation) {
+                                         const FragmentInterpolationLayout* interpolation,
+                                         uint32_t wave_size) {
     return recompile_fragment_impl(code, dwords, rt, system_inputs,
-                                   pcrel_dispatch_target, interpolation, false);
+                                   pcrel_dispatch_target, interpolation, wave_size, false);
 }
 
 std::vector<uint32_t> recompile_fragment_wave32_for_test(
         const uint32_t* code, size_t dwords) {
-    return recompile_fragment_impl(code, dwords, nullptr, nullptr, UINT32_MAX, nullptr, true);
+    return recompile_fragment_impl(code, dwords, nullptr, nullptr,
+                                   UINT32_MAX, nullptr, 32, true);
 }
 
 uint32_t fragment_spirv_required_subgroup_size(const std::vector<uint32_t>& spirv) {
@@ -11383,6 +11428,11 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
     // approximations remain restricted to the byte-exact projection above.
     b.ngg_private_lds = exact_ngg_projection || (passthrough && passthrough->valid) ||
                         (ngg && allow_test_ngg_output_gate);
+    // The legacy byte-exact NGG projection and its explicit unit-test hook predate the linked-stage
+    // ABI's exact LDS allocation. Preserve their proven 16 KiB private scratch contract when no
+    // allocation was supplied; generic linked producers still require their real plumbed size.
+    if (!b.vertex_lds_dwords && (exact_ngg_projection || allow_test_ngg_output_gate))
+        b.vertex_lds_dwords = 4096;
     // Every wave/peer approximation is an exception for the one captured Astro wrapper, not a
     // property of the GS_ALLOC_REQ opcode. Other NGG programs retain only the ordinary merged-stage
     // ABI setup below and fail closed if they reach a lane-sensitive operation.

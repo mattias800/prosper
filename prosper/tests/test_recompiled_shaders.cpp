@@ -102,12 +102,12 @@ int main() {
     CHECK(lds_vert.empty(),
           "an allocation alone cannot authorize an unproven graphics-LDS projection");
     std::vector<uint32_t> mask_count_vs = {
-        0x7D8A10F9u, 0x06868680u,       // v_cmp_* s[6:7], ... (saved one-lane mask)
+        0x7D8A10F9u, 0x06868680u,       // v_cmp_* s[6:7], ... (whole-wave mask)
         0xBEEB1006u,                    // s_bcnt1_i32_b64 vcc_hi, s[6:7]
     };
     mask_count_vs.insert(mask_count_vs.end(), std::begin(vs), std::end(vs));
-    CHECK(!recompile_vertex(mask_count_vs.data(), mask_count_vs.size()).empty(),
-          "vertex bcnt1 materializes a saved one-lane VOPC mask as population 0/1");
+    CHECK(recompile_vertex(mask_count_vs.data(), mask_count_vs.size()).empty(),
+          "vertex bcnt1 rejects an unproven whole-wave VOPC population count");
     std::vector<uint32_t> bounded_dpp_vs = {
         0x4A1412FAu, 0xFF091109u,       // v_add_nc_u32 v10, v9 row_shr:1 bound_ctrl:1, v9
         0x4A1414FAu, 0xFF09120Au,       // v_add_nc_u32 v10, v10 row_shr:2 bound_ctrl:1, v10

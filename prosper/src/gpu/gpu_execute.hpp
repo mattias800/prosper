@@ -66,6 +66,13 @@ struct DrawItem {
     uint32_t fs_raw_shader_index = 0xFFFFFFFFu;
     uint32_t vs_chain_raw_shader_index = 0xFFFFFFFFu;
     uint32_t vertex_lds_dwords = 0;
+    // Exact fixed-function graphics ABI used to produce the stored modules. Raw-shader replay must
+    // use these values as a pair: shader bytes alone cannot reconstruct fragment system VGPRs or
+    // PARAM linkage after the guest register state has been folded away.
+    PixelInputMapping pixel_inputs{};
+    PixelSystemInputMapping system_inputs{};
+    bool has_pixel_inputs = false;
+    bool has_system_inputs = false;
     // Process-unique identities supplied by the exact shader-recompile cache. Zero means the
     // shader came from an external/replay path, so persistent backend caches must compare words.
     uint64_t vs_identity = 0, fs_identity = 0;
@@ -97,6 +104,11 @@ struct DrawItem {
     uint32_t color0_width = 0, color0_height = 0;
     uint64_t color1_base = 0;
     uint32_t color1_width = 0, color1_height = 0;
+    struct ColorTargetBinding {
+        uint64_t base = 0;
+        uint32_t width = 0, height = 0;
+    };
+    std::array<ColorTargetBinding, kColorTargetCount> color_targets{};
     uint64_t draw_index = 0;
     uint64_t command_order = 0;
 
@@ -454,6 +466,7 @@ struct OperationRealizationFailure {
     uint64_t color1_base = 0;
     uint32_t color1_width = 0;
     uint32_t color1_height = 0;
+    std::array<DrawItem::ColorTargetBinding, kColorTargetCount> color_targets{};
     uint32_t vertex_count = 0;
     ComputeLaunchDimensions compute_launch;
     std::vector<ShaderRealizationDiagnostic> stages;
@@ -498,7 +511,7 @@ bool have_submit_compute();
 using LiveTargetQueryFn = std::function<bool(uint64_t gpu_addr)>;
 void set_live_target_query(LiveTargetQueryFn fn);
 bool is_live_render_target(uint64_t gpu_addr);
-enum class LiveTargetPixelFormat : uint8_t { Rgba8Unorm, Rgba16Float };
+enum class LiveTargetPixelFormat : uint8_t { Rgba8Unorm, Rgba16Float, R11G11B10Float };
 struct LiveTargetSnapshot {
     uint32_t width = 0, height = 0;
     LiveTargetPixelFormat format = LiveTargetPixelFormat::Rgba8Unorm;
@@ -734,6 +747,15 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         failure->color1_base = rs.color1_base;
         failure->color1_width = rs.color1_width;
         failure->color1_height = rs.color1_height;
+        for (uint32_t slot = 0; slot < failure->color_targets.size(); ++slot) {
+            failure->color_targets[slot].base = rs.color_targets[slot].base;
+            failure->color_targets[slot].width = rs.color_targets[slot].width;
+            failure->color_targets[slot].height = rs.color_targets[slot].height;
+        }
+        failure->color_targets[0] = {
+            failure->color0_base, failure->color0_width, failure->color0_height};
+        failure->color_targets[1] = {
+            failure->color1_base, failure->color1_width, failure->color1_height};
         failure->vertex_count = vcount_hint;
     }
     auto add_stage_diagnostic = [&](ShaderProgramStage stage, uint64_t addr,
@@ -906,7 +928,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 vertex_lds_dwords);
         fs_shared = recompile_graphics_shader_cached_shared(
             ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
-            max_shader_dwords, prt.get(), nullptr, system_input_ptr, &fs_identity);
+            max_shader_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity);
     } else {
         if (vertex_chain) {
             const SharedShaderWords linked = recompile_vertex_chain_cached_shared(
@@ -922,7 +944,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         }
         fs = recompile_graphics_shader_cached(
             ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
-            max_shader_dwords, prt.get(), nullptr, system_input_ptr, &fs_identity);
+            max_shader_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity);
     }
     // CB_COLOR_CONTROL.DCC_DECOMPRESS interprets the bound AGC metadata helper, rather than its
     // ordinary fragment-color export. The operation bits can remain folded into a later graphics
@@ -1085,15 +1107,22 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // their old values even though the fragment output itself is a full vec4.
     const uint32_t exp_mask = fragment_color_export_mask(
         reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.ps_addr)), max_shader_dwords);
-    ps.color_write_mask &= exp_mask & 0xFu;
-    ps.color1_write_mask &= (exp_mask >> 4) & 0xFu;
+    for (uint32_t slot = 0; slot < ps.color_targets.size(); ++slot)
+        ps.color_targets[slot].write_mask &= (exp_mask >> (slot * 4u)) & 0xFu;
+    ps.color_write_mask = ps.color_targets[0].write_mask;
+    ps.color1_write_mask = ps.color_targets[1].write_mask;
     // Color-disabled draws are not necessarily no-ops. Depth prepasses and stencil mask writers
     // deliberately set CB_TARGET_MASK=0, then later color draws consume their DS result. Dropping
     // those writers made The Messenger clear stencil to 0 and then test for bits 1/2 that could never
     // be produced (#520). Skip only when the draw has no observable color OR depth/stencil effect.
     const bool ds_effect = has_depth_stencil_side_effect(ps);
-    if (ps.color_write_mask == 0 && ps.color1_write_mask == 0 &&
-        !ds_effect && !getenv("PROSPER_FORCE_COLORWRITE")) {
+    // A non-zero hardware write mask is itself an observable color effect. Synthetic callers and
+    // legacy captures may omit CB_COLOR_INFO and rely on the backend's established RGBA8 fallback;
+    // requiring a decoded format here would incorrectly discard those otherwise-valid draws.
+    const bool color_effect = std::any_of(
+        ps.color_targets.begin(), ps.color_targets.end(),
+        [](const auto& target) { return target.write_mask != 0; });
+    if (!color_effect && !ds_effect && !getenv("PROSPER_FORCE_COLORWRITE")) {
         if (failure) failure->reason = RealizationFailureReason::NoEffect;
         if (log) fprintf(stderr, "[exec] skip draw: no color/depth/stencil effect cb_target_mask=0x%x cb_color_control=0x%x color0_fmt=%u\n",
                          rs.cb_target_mask, rs.cb_color_control, ps.color0_format);
@@ -1330,6 +1359,10 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     out.fs_guest_addr = rs.ps_addr;
     out.vs_chain_guest_addr = vertex_chain ? chain_addr : 0;
     out.vertex_lds_dwords = vertex_lds_dwords;
+    out.has_pixel_inputs = pixel_input_ptr != nullptr;
+    if (pixel_input_ptr) out.pixel_inputs = *pixel_input_ptr;
+    out.has_system_inputs = system_input_ptr != nullptr;
+    if (system_input_ptr) out.system_inputs = *system_input_ptr;
     out.vs_identity = vs_identity; out.fs_identity = fs_identity; out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;
     // #1256: record the raw draw-packet state (pre-realization) so a capture can be checked offline for
@@ -1344,6 +1377,14 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     out.color0_width = rs.color0_width; out.color0_height = rs.color0_height; // per-target extent (#526)
     out.color1_base = rs.color1_base;
     out.color1_width = rs.color1_width; out.color1_height = rs.color1_height;
+    for (uint32_t slot = 0; slot < out.color_targets.size(); ++slot) {
+        out.color_targets[slot].base = rs.color_targets[slot].base;
+        out.color_targets[slot].width = rs.color_targets[slot].width;
+        out.color_targets[slot].height = rs.color_targets[slot].height;
+    }
+    // Preserve direct/synthetic callers that still populate only the named aliases.
+    out.color_targets[0] = {out.color0_base, out.color0_width, out.color0_height};
+    out.color_targets[1] = {out.color1_base, out.color1_width, out.color1_height};
     return true;
 }
 

@@ -3,13 +3,17 @@
 // a caller-supplied Vulkan render -> present_write_frame -> present_readback. Proves the executor entry
 // point that agc_driver_submit_dcb will call, and the scanout round-trip, end to end on llvmpipe.
 #include "../src/gpu/gpu_execute.hpp"
+#include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/videoout_present.hpp"
 #include "../src/gpu/pm4_registers.hpp"
 #include "../src/gpu/vk_translate.hpp"
 #include "render_runner.h"
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 #include <memory>
+#include <string>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -405,6 +409,8 @@ int main() {
 
     // #611: a compute fast-clear writes HTILE guest memory between graphics spans. The detached
     // Vulkan depth image must be invalidated through the core's backend-agnostic write observer.
+    // Depth and stencil live at separate guest addresses, so direct writes invalidate only the
+    // corresponding Vulkan aspect; HTILE remains conservative because it can describe both.
     {
         auto& cache = prosper::test::persistent_ds_cache();
         cache.clear();
@@ -423,8 +429,12 @@ int main() {
               "HTILE guest write invalidates both cached Vulkan DS planes");
         image.depth_valid = image.stencil_valid = true;
         notify_guest_gpu_write(0x100100, 16);
-        CHECK(!image.depth_valid && !image.stencil_valid,
-              "partial write inside a depth plane invalidates the cached Vulkan DS image");
+        CHECK(!image.depth_valid && image.stencil_valid,
+              "partial depth-plane write preserves the independent cached stencil aspect");
+        image.depth_valid = image.stencil_valid = true;
+        notify_guest_gpu_write(0x200100, 16);
+        CHECK(image.depth_valid && !image.stencil_valid,
+              "partial stencil-plane write preserves depth for a later sampled-depth pass");
         image.depth_valid = image.stencil_valid = true;
         notify_guest_gpu_write(0x400000, 0x8000);
         CHECK(image.depth_valid && image.stencil_valid,
@@ -564,6 +574,47 @@ int main() {
         set_submit_renderer({});
         CHECK(submitted_indices == std::vector<uint32_t>({0, 1, 2}),
               "DMA-backed index buffer is realized after the ordered copy in the production path");
+    }
+
+    // Compute-only and DMA-only submissions bypass presentation, but an environment capture aimed
+    // at an unsupported compute program must still retain that semantic submit.  Exercise the
+    // non-render hook with an ordered DMA operation here; the compute selector/failure closure is
+    // covered by test_gpu_capture's semantic-dispatch cases.
+    {
+        uint32_t source = 0x13579BDFu, destination = 0;
+        GpuState nonrender;
+        nonrender.dma_copies.push_back({
+            reinterpret_cast<uint64_t>(&destination), reinterpret_cast<uint64_t>(&source),
+            sizeof(source), 0, 17, 0});
+        const std::filesystem::path path =
+            std::filesystem::temp_directory_path() / "prosper_nonrender_submit_capture.prgcap";
+        std::error_code filesystem_error;
+        std::filesystem::remove(path, filesystem_error);
+#ifdef _WIN32
+        _putenv_s("PROSPER_GPU_CAPTURE", path.string().c_str());
+        _putenv_s("PROSPER_GPU_CAPTURE_METADATA_ONLY", "1");
+#else
+        setenv("PROSPER_GPU_CAPTURE", path.string().c_str(), 1);
+        setenv("PROSPER_GPU_CAPTURE_METADATA_ONLY", "1", 1);
+#endif
+        const bool executed = execute_nonrender_submit_work(nonrender, 1441);
+#ifdef _WIN32
+        _putenv_s("PROSPER_GPU_CAPTURE", "");
+        _putenv_s("PROSPER_GPU_CAPTURE_METADATA_ONLY", "");
+#else
+        unsetenv("PROSPER_GPU_CAPTURE");
+        unsetenv("PROSPER_GPU_CAPTURE_METADATA_ONLY");
+#endif
+        GpuCaptureFile captured;
+        std::string capture_error;
+        CHECK(executed && destination == source &&
+                  read_gpu_capture(path.string(), captured, capture_error) &&
+                  captured.metadata.submit_index == 1441 && captured.dma_copies.size() == 1 &&
+                  captured.operations.size() == 1 &&
+                  captured.operations[0].kind == SubmitOperationKind::DmaCopy &&
+                  !captured.expected_output_valid,
+              "environment capture retains a non-render submit without inventing an output oracle");
+        std::filesystem::remove(path, filesystem_error);
     }
 
     // Lazy realization can drop a semantic draw only after earlier spans have already executed.

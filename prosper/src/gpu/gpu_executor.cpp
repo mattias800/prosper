@@ -855,7 +855,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
         ? resources->vertices_per_instance : 0u;
     key.has_resource_table = resources != nullptr;
     key.force_position_w = getenv("PROSPER_FORCE_W") != nullptr;
-    key.has_pixel_inputs = stage == ShaderProgramStage::Vertex && pixel_inputs != nullptr;
+    key.has_pixel_inputs = stage != ShaderProgramStage::Compute && pixel_inputs != nullptr;
     if (key.has_pixel_inputs) key.pixel_inputs = *pixel_inputs;
     key.has_system_inputs = stage == ShaderProgramStage::Fragment && system_inputs != nullptr;
     if (key.has_system_inputs) key.system_inputs = *system_inputs;
@@ -975,10 +975,16 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
                                key.has_pixel_inputs ? &key.pixel_inputs : nullptr,
                                getenv("PROSPER_GEOM_PROBE") != nullptr,
                                key.vertex_lds_dwords);
-    if (stage == ShaderProgramStage::Fragment)
+    if (stage == ShaderProgramStage::Fragment) {
+        const FragmentInterpolationLayout interpolation = fragment_interpolation_layout(
+            code, code_size,
+            key.has_system_inputs ? &key.system_inputs : nullptr,
+            key.has_pixel_inputs ? &key.pixel_inputs : nullptr);
         return recompile_fragment(code, code_size, resources,
                                   key.has_system_inputs ? &key.system_inputs : nullptr,
-                                  key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX);
+                                  key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX,
+                                  &interpolation);
+    }
     return {};
 }
 
@@ -3835,16 +3841,51 @@ bool execute_compute_dispatches(const GpuState& st, uint64_t submit_no) {
     return !items.empty() && g_compute(items);
 }
 
-static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t width,
-                                                     uint32_t height, uint64_t submit_no,
-                                                     const LiveRenderFn& render,
-                                                     const LiveComputeFn& compute);
+struct OrderedGpustateCaptureTrace {
+    std::vector<DrawItem> draws;
+    std::vector<ComputeItem> computes;
+    std::vector<OperationRealizationFailure> failures;
+};
+
+static OrderedSubmitResult execute_ordered_gpustate(
+    const GpuState& st, uint32_t width, uint32_t height, uint64_t submit_no,
+    const LiveRenderFn& render, const LiveComputeFn& compute,
+    OrderedGpustateCaptureTrace* capture_trace = nullptr);
 
 bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
     if (st.dma_copies.empty() && (!g_compute || st.dispatches.empty())) return false;
     GuestReadableSubmitScope guest_readable_scope;
+    // Compute-only submits never reach execute_ordered_and_present(), but they are exactly where an
+    // unsupported dispatch can disappear before there is a realized ComputeItem to select.  Give
+    // the environment capture path the same semantic pre-submit hook as rendering submits so
+    // PROSPER_GPU_CAPTURE_COMPUTE_ADDR can retain the raw program, table snapshots, and explicit
+    // realization failure.  Interactive/F9 captures remain draw-triggered: begin_requested_gpu_capture
+    // deliberately does not consume an armed interactive request when semantic_draw_count is zero.
+    std::unique_ptr<PendingGpuCapture> pending_capture;
+    std::vector<SubmitOperation> capture_operations;
+    const bool can_defer_capture = st.dma_copies.empty();
+    if (const char* capture_path = std::getenv("PROSPER_GPU_CAPTURE");
+        capture_path && *capture_path) {
+        capture_operations = plan_submit_operations(st);
+        pending_capture = begin_requested_gpu_capture(
+            {}, {}, capture_operations, present_width(), present_height(), &st, submit_no,
+            static_cast<uint64_t>(st.draws.size()), nullptr, can_defer_capture);
+    }
+    OrderedGpustateCaptureTrace capture_trace;
     const OrderedSubmitResult result = execute_ordered_gpustate(
-        st, 0, 0, submit_no, {}, g_compute);
+        st, 0, 0, submit_no, {}, g_compute,
+        pending_capture && can_defer_capture ? &capture_trace : nullptr);
+    if (pending_capture) {
+        std::string error;
+        if (!finish_requested_gpu_capture(
+                std::move(pending_capture), {}, error,
+                can_defer_capture ? &capture_trace.draws : nullptr,
+                can_defer_capture ? &capture_trace.computes : nullptr,
+                can_defer_capture ? &capture_operations : nullptr,
+                can_defer_capture ? &st : nullptr,
+                can_defer_capture ? &capture_trace.failures : nullptr))
+            std::fprintf(stderr, "[gpucap] write failed: %s\n", error.c_str());
+    }
     return !st.dma_execution_rejected &&
            (result.compute_executed || !st.dma_copies.empty() ||
             !st.ordered_memory_effects.empty());
@@ -4667,15 +4708,25 @@ bool realize_retained_draw(const GpuState& st, size_t index, float scale_x, floa
 }
 
 bool realize_retained_compute(const GpuState& st, size_t index, uint64_t submit_no,
-                              ComputeItem& item) {
+                              ComputeItem& item,
+                              OperationRealizationFailure* failure = nullptr) {
     if (index >= st.dispatches.size()) return false;
     // DMA-bearing submits are uncommon. A one-dispatch state keeps the mature realization path
     // intact while ensuring it runs only after every preceding ordered producer has landed.
     GpuState one = st.dispatches[index].state ? *st.dispatches[index].state : st;
     one.dispatches.clear();
     one.dispatches.push_back(st.dispatches[index]);
-    std::vector<ComputeItem> realized = realize_compute_dispatches(one, submit_no);
-    if (realized.empty()) return false;
+    std::vector<OperationRealizationFailure> failures;
+    std::vector<ComputeItem> realized = realize_compute_dispatches(
+        one, submit_no, failure ? &failures : nullptr);
+    if (realized.empty()) {
+        if (failure && !failures.empty()) {
+            *failure = std::move(failures.front());
+            failure->index = index;
+            failure->command_order = st.dispatches[index].command_order;
+        }
+        return false;
+    }
     item = std::move(realized.front());
     item.dispatch_index = index;
     return true;
@@ -4685,7 +4736,8 @@ bool realize_retained_compute(const GpuState& st, size_t index, uint64_t submit_
 static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t width,
                                                      uint32_t height, uint64_t submit_no,
                                                      const LiveRenderFn& render,
-                                                     const LiveComputeFn& compute) {
+                                                     const LiveComputeFn& compute,
+                                                     OrderedGpustateCaptureTrace* capture_trace) {
     GuestGpuWriteSubmitScope guest_gpu_write_scope;
     if (st.dma_execution_rejected) {
         static std::atomic<int> warned{0};
@@ -4755,8 +4807,15 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                 flush_span();
                 if (!compute) break;
                 ComputeItem item;
-                if (realize_retained_compute(st, operation.index, submit_no, item))
+                OperationRealizationFailure failure;
+                if (realize_retained_compute(
+                        st, operation.index, submit_no, item,
+                        capture_trace ? &failure : nullptr)) {
+                    if (capture_trace) capture_trace->computes.push_back(item);
                     result.compute_executed |= compute({std::move(item)});
+                } else if (capture_trace && failure.reason != RealizationFailureReason::None) {
+                    capture_trace->failures.push_back(std::move(failure));
+                }
                 break;
             }
             case RetainedSubmitKind::DmaCopy: {

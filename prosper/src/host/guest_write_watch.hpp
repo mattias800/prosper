@@ -76,8 +76,8 @@ bool guest_write_watch_handle_fault(uint64_t addr);
 // The Linux page-protection watch (mprotect + SIGSEGV) is only red-zone-safe when the SIGSEGV handler
 // runs on a sigaltstack (SA_ONSTACK): without it the kernel writes the signal frame into the guest's
 // SysV red zone, corrupting live locals of the faulting store. exec_image_linux reports whether the
-// fault handler is installed with SA_ONSTACK; until it is, `create` refuses to arm and callers keep
-// the exact byte-comparison fallback. No-op on other platforms.
+// default-on handler has SA_ONSTACK; a diagnostic opt-out makes `create` refuse to arm so callers
+// retain the exact byte-comparison fallback. No-op on other platforms.
 void guest_write_watch_set_fault_onstack(bool on_altstack);
 
 } // namespace prosper::host

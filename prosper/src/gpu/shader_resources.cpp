@@ -16,9 +16,11 @@ uint32_t data_format_bytes(DataFormat f) {
     switch (f) {
         case DataFormat::Float32: case DataFormat::Uint32: case DataFormat::Sint32: return 4;
         case DataFormat::Float16: case DataFormat::Unorm16: case DataFormat::Snorm16:
-        case DataFormat::Uint16:  case DataFormat::Sint16:  return 2;
+        case DataFormat::Uint16:  case DataFormat::Sint16:
+        case DataFormat::Uscaled16: case DataFormat::Sscaled16: return 2;
         case DataFormat::Unorm8:  case DataFormat::Snorm8:
-        case DataFormat::Uint8:   case DataFormat::Sint8:   return 1;
+        case DataFormat::Uint8:   case DataFormat::Sint8:
+        case DataFormat::Uscaled8: case DataFormat::Sscaled8: return 1;
         default: return 0;
     }
 }
