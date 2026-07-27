@@ -62,6 +62,24 @@ static std::vector<uint32_t> image_test_spirv() {
     return s;
 }
 
+static std::vector<uint32_t> storage_image_access_test_spirv() {
+    // Two storage-image descriptors: binding 5 is read, binding 6 is independently write-only.
+    // This is the shape that permits the compute backend to skip seeding binding 6 even though the
+    // shader has an OpImageRead for binding 5.
+    std::vector<uint32_t> s = {0x07230203u, 0x00010000u, 0, 24, 0};
+    emit(s, 15, {5, 20, 0x6e69616d, 0});                    // OpEntryPoint Compute %20 "main"
+    emit(s, 21, {1, 32, 0});                               // %1 = u32
+    emit(s, 25, {2, 1, 1, 0, 0, 0, 2, 0});                // %2 = storage 2D image
+    emit(s, 32, {3, 0, 2});                                // %3 = UniformConstant pointer
+    emit(s, 59, {3, 4, 0}); emit(s, 59, {3, 5, 0});        // %4 source, %5 destination
+    emit(s, 71, {4, 34, 0}); emit(s, 71, {4, 33, 5});      // set 0 binding 5
+    emit(s, 71, {5, 34, 0}); emit(s, 71, {5, 33, 6});      // set 0 binding 6
+    emit(s, 61, {2, 6, 4}); emit(s, 61, {2, 7, 5});        // load image objects
+    emit(s, 98, {8, 9, 6, 10});                            // %9 = OpImageRead %6
+    emit(s, 99, {7, 10, 9});                               // OpImageWrite %7
+    return s;
+}
+
 static bool has_issue(const DescriptorValidationReport& r, DescriptorIssueCode code) {
     for (const auto& issue : r.issues) if (issue.code == code) return true;
     return false;
@@ -207,7 +225,8 @@ int main() {
           "reflection validates one statically-used descriptor and ignores inactive declarations");
     CHECK(vr.descriptors.size() == 1 && vr.descriptors[0].binding == 9 &&
           vr.descriptors[0].kind == SpirvDescriptorKind::StorageBuffer &&
-          vr.descriptors[0].required_bytes == 20 && !vr.descriptors[0].dynamic_access,
+          vr.descriptors[0].required_bytes == 20 && !vr.descriptors[0].dynamic_access &&
+          !vr.descriptors[0].writable,
           "constant access chain reflects storage-buffer binding 9 with a 20-byte minimum");
 
     ShaderResource atomic = good; atomic.binding = 10;
@@ -215,8 +234,9 @@ int main() {
     const DescriptorValidationReport atomic_report = validate_spirv_descriptor_interface(
         atomic_descriptor_test_spirv(), &atomic_table, 0, SpirvShaderStage::Vertex);
     CHECK(atomic_report.ok() && atomic_report.descriptors.size() == 2 &&
-              atomic_report.descriptors[1].binding == 10,
-          "write-only atomic access reflects its storage-buffer descriptor");
+              atomic_report.descriptors[1].binding == 10 &&
+              atomic_report.descriptors[1].writable,
+          "write-only atomic access reflects its writable storage-buffer descriptor");
 
     ShaderResourceTable missing;
     auto mr = validate_spirv_descriptor_interface(spv, &missing, 0, SpirvShaderStage::Vertex);
@@ -270,6 +290,25 @@ int main() {
     CHECK(ir.ok() && ir.descriptors.size() == 1 &&
           ir.descriptors[0].kind == SpirvDescriptorKind::CombinedImageSampler,
           "sampled-image reflection validates a concrete texture binding");
+    CHECK(ir.descriptors.size() == 1 && !ir.descriptors[0].writable,
+          "sampled descriptor is not mistaken for an image output");
+
+    ShaderResource storage_src{};
+    storage_src.cls = ResourceClass::StorageImage; storage_src.binding = 5;
+    storage_src.gpu_addr = 0x56790000; storage_src.size = 4;
+    storage_src.width = storage_src.height = 1;
+    storage_src.format = DataFormat::Unorm8; storage_src.num_components = 4;
+    ShaderResource storage_dst = storage_src;
+    storage_dst.binding = 6; storage_dst.gpu_addr += 0x10000;
+    ShaderResourceTable storage_table; storage_table.resources = {storage_src, storage_dst};
+    const auto storage_report = validate_spirv_descriptor_interface(
+        storage_image_access_test_spirv(), &storage_table, 0, SpirvShaderStage::Compute);
+    CHECK(storage_report.ok() && storage_report.descriptors.size() == 2,
+          "storage-image read/write fixture reflects both bindings");
+    CHECK(storage_report.descriptors.size() == 2 && storage_report.descriptors[0].readable &&
+              !storage_report.descriptors[0].writable &&
+              !storage_report.descriptors[1].readable && storage_report.descriptors[1].writable,
+          "storage-image texel access is classified per binding");
     image_table.resources[0].size = 0;
     auto izr = validate_spirv_descriptor_interface(
         image_spv, &image_table, 1, SpirvShaderStage::Fragment);

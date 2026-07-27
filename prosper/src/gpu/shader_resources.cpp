@@ -3,8 +3,10 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 
@@ -353,6 +355,42 @@ void add_malformed(DescriptorValidationReport& report) {
     report.issues.push_back({DescriptorIssueCode::MalformedSpirv, true});
 }
 
+struct DescriptorReflectionCacheEntry {
+    std::vector<uint32_t> spirv;
+    DescriptorValidationReport reflection;
+    SpirvShaderStage stage = SpirvShaderStage::Unknown;
+    uint64_t last_use = 0;
+};
+
+struct DescriptorReflectionCache {
+    std::mutex mutex;
+    std::unordered_map<uint64_t, DescriptorReflectionCacheEntry> entries;
+    uint64_t use_clock = 0;
+    uint64_t bytes = 0;
+};
+
+DescriptorReflectionCache& descriptor_reflection_cache() {
+    static DescriptorReflectionCache cache;
+    return cache;
+}
+
+uint64_t spirv_reflection_hash(const std::vector<uint32_t>& spirv) {
+    uint64_t hash = 1469598103934665603ull;
+    for (uint32_t word : spirv) {
+        hash ^= word;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+uint64_t reflection_entry_bytes(const DescriptorReflectionCacheEntry& entry) {
+    return static_cast<uint64_t>(entry.spirv.size()) * sizeof(uint32_t) +
+           static_cast<uint64_t>(entry.reflection.descriptors.size()) *
+               sizeof(SpirvDescriptorBinding) +
+           static_cast<uint64_t>(entry.reflection.issues.size()) *
+               sizeof(DescriptorValidationIssue);
+}
+
 } // namespace
 
 bool DescriptorValidationReport::ok() const {
@@ -393,6 +431,24 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     SpirvShaderStage expected_stage,
     bool report_unused) {
     DescriptorValidationReport report;
+    SpirvShaderStage stage = SpirvShaderStage::Unknown;
+    const uint64_t reflection_hash = spirv_reflection_hash(spirv);
+    bool reflection_cached = false;
+    {
+        DescriptorReflectionCache& cache = descriptor_reflection_cache();
+        std::lock_guard lock(cache.mutex);
+        auto found = cache.entries.find(reflection_hash);
+        // Equality is authoritative; the hash only selects a candidate, so collisions cannot reuse
+        // another module's descriptor contract.
+        if (found != cache.entries.end() && found->second.spirv == spirv) {
+            found->second.last_use = ++cache.use_clock;
+            report = found->second.reflection;
+            stage = found->second.stage;
+            reflection_cached = true;
+        }
+    }
+
+    if (!reflection_cached) {
     if (spirv.size() < 5 || spirv[0] != kSpirvMagic) { add_malformed(report); return report; }
 
     std::vector<Instruction> insts;
@@ -412,8 +468,6 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     std::unordered_map<uint32_t, uint32_t> sets, bindings;
     std::unordered_map<uint32_t, uint64_t> array_strides;
     std::unordered_map<uint64_t, uint64_t> member_offsets;
-    SpirvShaderStage stage = SpirvShaderStage::Unknown;
-
     auto word = [&](const Instruction& in, uint32_t operand) { return spirv[in.offset + 1u + operand]; };
     for (const Instruction& in : insts) {
         const uint32_t n = in.words - 1u;
@@ -481,30 +535,69 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     }
 
     std::set<uint32_t> used_vars;
+    std::set<uint32_t> read_vars;
+    std::set<uint32_t> written_vars;
     std::unordered_map<uint32_t, PointerAccess> accesses;
+    // Result id of OpLoad/OpSampledImage -> descriptor variable. An image descriptor load accesses
+    // the descriptor object, not its texels; only the later image opcode establishes read/write data
+    // access. Keeping that distinction makes write-only storage outputs visible to the backend even
+    // when the same shader reads a different storage image.
+    std::unordered_map<uint32_t, uint32_t> image_objects;
     std::unordered_map<uint32_t, uint64_t> required;
     std::unordered_map<uint32_t, bool> dynamic;
 
-    auto mark = [&](uint32_t var) { if (descriptor_vars.count(var)) used_vars.insert(var); };
+    auto mark = [&](uint32_t var, bool read, bool write) {
+        if (!descriptor_vars.count(var)) return;
+        used_vars.insert(var);
+        if (read) read_vars.insert(var);
+        if (write) written_vars.insert(var);
+    };
+    auto pointer_root = [&](uint32_t pointer) -> uint32_t {
+        if (descriptor_vars.count(pointer)) return pointer;
+        auto access = accesses.find(pointer);
+        return access != accesses.end() ? access->second.variable : 0u;
+    };
+    auto mark_pointer = [&](uint32_t pointer, bool read, bool write) {
+        const uint32_t root = pointer_root(pointer);
+        if (root) mark(root, read, write);
+    };
+    auto mark_image = [&](uint32_t object, bool read, bool write) {
+        auto origin = image_objects.find(object);
+        if (origin != image_objects.end()) mark(origin->second, read, write);
+    };
     for (const Instruction& in : insts) {
         const uint32_t n = in.words - 1u;
         if (in.opcode == OpLoad && n >= 3) {
-            uint32_t ptr = word(in, 2); mark(ptr);
-            auto ai = accesses.find(ptr); if (ai != accesses.end()) mark(ai->second.variable);
+            const uint32_t root = pointer_root(word(in, 2));
+            const auto descriptor = descriptor_vars.find(root);
+            const bool image_descriptor = descriptor != descriptor_vars.end() &&
+                descriptor->second != SpirvDescriptorKind::StorageBuffer;
+            mark_pointer(word(in, 2), !image_descriptor, false);
+            if (image_descriptor) image_objects[word(in, 1)] = root;
         } else if (in.opcode == OpStore && n >= 1) {
-            uint32_t ptr = word(in, 0); mark(ptr);
-            auto ai = accesses.find(ptr); if (ai != accesses.end()) mark(ai->second.variable);
-        } else if (((in.opcode >= OpAtomicLoad && in.opcode <= OpAtomicIDecrement) ||
+            mark_pointer(word(in, 0), false, true);
+        } else if (in.opcode == OpAtomicLoad && n >= 3) {
+            mark_pointer(word(in, 2), true, false);
+        } else if (((in.opcode >= OpAtomicExchange && in.opcode <= OpAtomicIDecrement) ||
                     (in.opcode >= OpAtomicIAdd && in.opcode <= OpAtomicXor) ||
                     in.opcode == OpAtomicFlagTestAndSet) && n >= 3) {
             // Result-producing atomic instructions place their pointer after result type/result id.
-            // A write-only atomic buffer is still part of the live descriptor interface.
-            uint32_t ptr = word(in, 2); mark(ptr);
-            auto ai = accesses.find(ptr); if (ai != accesses.end()) mark(ai->second.variable);
+            mark_pointer(word(in, 2), true, true);
         } else if ((in.opcode == OpAtomicStore || in.opcode == OpAtomicFlagClear) && n >= 1) {
             // The two result-less atomic instructions place the pointer first, like OpStore.
-            uint32_t ptr = word(in, 0); mark(ptr);
-            auto ai = accesses.find(ptr); if (ai != accesses.end()) mark(ai->second.variable);
+            mark_pointer(word(in, 0), false, true);
+        } else if (in.opcode == 86u /* OpSampledImage */ && n >= 3) {
+            auto origin = image_objects.find(word(in, 2));
+            if (origin != image_objects.end()) image_objects[word(in, 1)] = origin->second;
+        } else if (in.opcode >= 87u && in.opcode <= 98u && n >= 3) {
+            // All sampled/fetch/gather forms plus OpImageRead place their image object after result
+            // type/result id. The descriptor itself was loaded earlier; this is the texel read.
+            mark_image(word(in, 2), true, false);
+        } else if (in.opcode == 99u /* OpImageWrite */ && n >= 1) {
+            mark_image(word(in, 0), false, true);
+        } else if (in.opcode == 100u /* OpImage */ && n >= 3) {
+            auto origin = image_objects.find(word(in, 2));
+            if (origin != image_objects.end()) image_objects[word(in, 1)] = origin->second;
         } else if ((in.opcode == OpAccessChain || in.opcode == OpInBoundsAccessChain) && n >= 3) {
             const uint32_t result = word(in, 1), base = word(in, 2);
             PointerAccess a;
@@ -556,11 +649,47 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         auto si = sets.find(var), bi = bindings.find(var);
         if (si == sets.end() || bi == bindings.end()) { add_malformed(report); continue; }
         report.descriptors.push_back({var, si->second, bi->second, descriptor_vars[var], stage,
-                                      required[var], dynamic[var]});
+                                      required[var], dynamic[var], read_vars.count(var) != 0,
+                                      written_vars.count(var) != 0});
     }
     std::sort(report.descriptors.begin(), report.descriptors.end(), [](const auto& a, const auto& b) {
         return a.set != b.set ? a.set < b.set : a.binding < b.binding;
     });
+
+    // Reflection depends only on immutable SPIR-V. Runtime addresses, sizes, metadata, and the
+    // expected stage/set are validated below on every call. Keeping those out of this cache lets a
+    // shader dispatched against different guest allocations reuse the expensive instruction/type
+    // walk without weakening any per-dispatch checks.
+    {
+        DescriptorReflectionCache& cache = descriptor_reflection_cache();
+        std::lock_guard lock(cache.mutex);
+        DescriptorReflectionCacheEntry entry;
+        entry.spirv = spirv;
+        entry.reflection = report;
+        entry.stage = stage;
+        entry.last_use = ++cache.use_clock;
+        constexpr uint64_t kCacheLimit = 64ull * 1024 * 1024;
+        constexpr size_t kMaxEntries = 4096;
+        const uint64_t entry_bytes = reflection_entry_bytes(entry);
+        auto collision = cache.entries.find(reflection_hash);
+        if (collision != cache.entries.end()) {
+            cache.bytes -= reflection_entry_bytes(collision->second);
+            cache.entries.erase(collision);
+        }
+        while (!cache.entries.empty() &&
+               (cache.entries.size() >= kMaxEntries || cache.bytes + entry_bytes > kCacheLimit)) {
+            auto oldest = cache.entries.begin();
+            for (auto it = std::next(cache.entries.begin()); it != cache.entries.end(); ++it)
+                if (it->second.last_use < oldest->second.last_use) oldest = it;
+            cache.bytes -= reflection_entry_bytes(oldest->second);
+            cache.entries.erase(oldest);
+        }
+        if (entry_bytes <= kCacheLimit) {
+            cache.bytes += entry_bytes;
+            cache.entries.emplace(reflection_hash, std::move(entry));
+        }
+    }
+    }
 
     if (stage != expected_stage)
         report.issues.push_back({DescriptorIssueCode::StageMismatch, true, expected_set, 0});

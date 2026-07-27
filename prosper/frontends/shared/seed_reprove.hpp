@@ -4,6 +4,18 @@
 
 namespace prosper::frontend {
 
+// A write-only shader can map invocations to texels in swizzled or vectorized ways (Astro Bot's
+// bloom chain launches width*8 by height/8). Per-axis comparison therefore rejects valid full-image
+// fills. The only shape-independent prerequisite is enough total invocations; the poison proving
+// pass below establishes actual coverage before any seed is skipped.
+constexpr bool dispatch_has_enough_threads_for_texels(uint32_t threads_x, uint32_t threads_y,
+                                                       uint32_t threads_z, uint32_t width,
+                                                       uint32_t height, uint32_t depth) {
+    if (!threads_x || !threads_y || !threads_z || !width || !height || !depth) return false;
+    return static_cast<uint64_t>(threads_x) * threads_y * threads_z >=
+           static_cast<uint64_t>(width) * height * depth;
+}
+
 // #1127: the #1122 seed-skip caches a "this write-only shader covers every texel" verdict per
 // (shader, binding, extent) and trusts it forever. That is unsound for a DATA-DEPENDENT store (full
 // on the proving frame, partial on a later frame with different input): the untouched texels then pack

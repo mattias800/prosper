@@ -71,6 +71,19 @@ void rdna2_buffer_format(uint32_t fmt, DataFormat* out_fmt, uint32_t* out_compon
 // How many bytes one component of `format` occupies (0 for Unknown and block-compressed formats).
 uint32_t data_format_bytes(DataFormat f);
 
+// Formats whose storage-image conversion can be delegated exactly to a native Vulkan float image.
+// Loads return float32 components (with Vulkan's standard missing-channel defaults) and stores accept
+// float32 components, matching the PS5 image instruction's VGPR contract; the backing texels remain
+// at their native byte width. Three-channel optimal images are deliberately limited to packed
+// R11G11B10 because ordinary RGB8/RGB16/RGB32 storage support is not portable.
+constexpr bool native_float_storage_image(DataFormat format, uint32_t components, bool srgb) {
+    return !srgb &&
+           (((components == 1 || components == 2 || components == 4) &&
+             (format == DataFormat::Unorm8 || format == DataFormat::Float16 ||
+              format == DataFormat::Float32)) ||
+            (components == 3 && format == DataFormat::Float10_11_11));
+}
+
 // IEEE-754 binary16 -> binary32 (handles subnormals, +/-inf, NaN). Used by the texture upload path to
 // convert a sampled Float16 surface to the RGBA8 the backend uploads (#290). Pure + testable.
 float half_to_float(uint16_t h);
@@ -102,9 +115,9 @@ enum class ResourceClass : uint32_t {
     Texture,         // read by image_sample / image_load (sampled image + sampler)
     Sampler,         // paired with a Texture for image_sample
     StorageImage,    // read/written by image_load / image_store WITHOUT a sampler (compute copy/blit).
-                     // Bound as a Vulkan STORAGE_IMAGE; img_dim gives 1D/2D/3D. Our raw-32-bit-VGPR
-                     // model uses a uint-sampled storage image (Format=Unknown + read/write-without-
-                     // format), so texels move bit-exact (format reinterpretation lives in the descriptor).
+                     // Bound as a Vulkan STORAGE_IMAGE; img_dim gives 1D/2D/3D. Integer/packed formats
+                     // use uint texels plus host conversion; native four-channel float/UNORM formats
+                     // use float texels and Vulkan's descriptor conversion.
 };
 
 // One resource a shader accesses. FILLED BY THE FRONT-HALF from the game's real descriptors (the
@@ -298,6 +311,11 @@ struct SpirvDescriptorBinding {
     // runtime range may be addressed, so validation cannot derive an upper bound from SPIR-V alone.
     uint64_t required_bytes = 0;
     bool dynamic_access = false;
+    // Data access, distinct from merely loading the descriptor object. For buffers these follow
+    // pointer loads/stores; for images they follow OpImageRead/sample and OpImageWrite. Backends use
+    // the per-binding result to avoid seeding write-only outputs and reading back read-only inputs.
+    bool readable = false;
+    bool writable = false;
 };
 
 enum class DescriptorIssueCode : uint32_t {

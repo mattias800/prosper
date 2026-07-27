@@ -334,6 +334,17 @@ int main() {
         CHECK(prosper::test::find_persistent_ds_sampled(
                   kRecencyBase, kRecencyW, kRecencyH).image == &older,
               "a later real D32 write updates sibling ordering");
+
+        const auto scaled = prosper::test::find_persistent_ds_sampled(
+            kRecencyBase, kRecencyW * 2, kRecencyH * 2, 2);
+        CHECK(scaled.image == &older && scaled.width == kRecencyW && scaled.height == kRecencyH,
+              "configured render scale resolves native depth view to the retained image extent");
+        CHECK(!prosper::test::find_persistent_ds_sampled(
+                   kRecencyBase, kRecencyW * 2, kRecencyH * 2).image,
+              "scaled depth lookup stays disabled without the configured render scale");
+        CHECK(!prosper::test::find_persistent_ds_sampled(
+                   kRecencyBase, kRecencyW * 3, kRecencyH * 2, 2).image,
+              "non-uniform depth aliases do not enter the scaled bridge");
         cache.erase(d32_key);
         cache.erase(d32s8_key);
     }
@@ -565,6 +576,40 @@ int main() {
             CHECK(mrt1_center[0] == 17 && mrt1_center[1] == 34 &&
                       mrt1_center[2] == 51 && mrt1_center[3] == 255,
                   "split MRT carry preserves an untouched secondary attachment exactly");
+        }
+
+        // Both color attachments can remain device-local across calls. Seed MRT1 once, perform a
+        // GPU-only paired render, then LOAD and read it back on the next call. The shader writes only
+        // MRT0, so every secondary pixel must survive exactly without the former paired CPU carry.
+        prosper::test::BackendColorTarget resident_mrt{
+            0x20d5c10000ull, false, false, VK_FORMAT_R8G8B8A8_UNORM};
+        resident_mrt.persistent_id1 = 0x20d5c20000ull;
+        resident_mrt.load_existing1 = false;
+        resident_mrt.readback1 = false;
+        resident_mrt.format1 = VK_FORMAT_R8G8B8A8_UNORM;
+        std::vector<uint8_t> pending_mrt1;
+        const std::vector<uint8_t> pending_mrt = prosper::test::render_draws_rgba(
+            {batched_producer}, W, H, nullptr, nullptr,
+            /*persist_depth_stencil=*/true, &resident_mrt, mrt1_seed.data(), nullptr,
+            &pending_mrt1);
+        resident_mrt.load_existing = true;
+        resident_mrt.readback = true;
+        resident_mrt.load_existing1 = true;
+        resident_mrt.readback1 = true;
+        std::vector<uint8_t> loaded_mrt1;
+        const std::vector<uint8_t> loaded_mrt = prosper::test::render_draws_rgba(
+            {batched_producer}, W, H, nullptr, nullptr,
+            /*persist_depth_stencil=*/true, &resident_mrt, nullptr, nullptr, &loaded_mrt1);
+        CHECK(pending_mrt.empty() && pending_mrt1.empty() &&
+                  loaded_mrt.size() == (size_t)W * H * 4 &&
+                  loaded_mrt1.size() == mrt1_seed.size(),
+              "persistent MRT keeps both attachments GPU-resident until explicitly read back");
+        if (loaded_mrt1.size() == mrt1_seed.size()) {
+            const uint8_t* resident_center =
+                &loaded_mrt1[(((size_t)H / 2) * W + W / 2) * 4];
+            CHECK(resident_center[0] == 17 && resident_center[1] == 34 &&
+                      resident_center[2] == 51 && resident_center[3] == 255,
+                  "persistent MRT1 LOAD preserves its GPU-only secondary attachment exactly");
         }
 
         // Fresh-image initialization is also a logical-pass contract. An ALWAYS producer does not

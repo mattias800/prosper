@@ -484,6 +484,16 @@ int main() {
            got17d.size()==N?got17d[127]:-1);
     CHECK(got17d.size()==N && bad17d==0,
           "CFG dispatcher emulates a 64-lane wave across narrower Vulkan subgroups");
+    ComputeShaderConfig native_cfg17d;
+    native_cfg17d.local_x = 64;
+    native_cfg17d.wave_size = 64;
+    native_cfg17d.native_subgroup_size = 64;
+    const std::vector<uint32_t> native_spv17d = recompile_compute(
+        code17d, std::size(code17d), nullptr, native_cfg17d);
+    CHECK(!native_spv17d.empty() && count_spirv_opcode(native_spv17d, 335) >= 2,
+          "exact-wave CFG dispatcher lowers votes and liveness to native subgroup-any");
+    CHECK(count_spirv_opcode(native_spv17d, 224) == 0,
+          "exact-wave CFG dispatcher emits no workgroup control barrier");
 
     // Kernel 17d2: Astro's mask-priority sequence compares a VOPC-produced SGPR pair against zero,
     // then uses that wave-uniform SCC in s_cselect_b64.  Keep the irreducible prefix so this exercises
@@ -538,6 +548,11 @@ int main() {
         if (std::fabs(got17e[i] - static_cast<float>(i % 64)) > 1e-3f) ++bad17e;
     CHECK(got17e.size() == N && bad17e == 0,
           "#825: CFG dispatcher synchronizes MBCNT across each emulated wave64");
+    const std::vector<uint32_t> native_spv17e = recompile_compute(
+        code17e, std::size(code17e), nullptr, native_cfg17d);
+    CHECK(!native_spv17e.empty() && count_spirv_opcode(native_spv17e, 349) >= 1 &&
+              count_spirv_opcode(native_spv17e, 224) == 0,
+          "exact-wave CFG MBCNT uses subgroup scans without workgroup barriers");
 
     // Kernel 17f: DS_APPEND in the same generic dispatcher. The LDS initial value is intentionally
     // unspecified; this test verifies that the generated module executes to completion with the
@@ -555,6 +570,11 @@ int main() {
     std::vector<float> got17f = prosper::test::run_compute(spv17f, in17d, N, N);
     CHECK(got17f.size() == N,
           "#825: Vulkan executes dispatcher DS_APPEND with uniform barriers");
+    const std::vector<uint32_t> native_spv17f = recompile_compute(
+        code17f, std::size(code17f), nullptr, native_cfg17d);
+    CHECK(!native_spv17f.empty() && count_spirv_opcode(native_spv17f, 349) >= 3 &&
+              count_spirv_opcode(native_spv17f, 224) == 0,
+          "exact-wave CFG DS_APPEND uses subgroup reduction/broadcast without barriers");
 
     // Kernel 18: the REAL if-then idiom with a forward branch. v3=7; vcc=(u0>u1);
     // s_and_saveexec_b64 s[0:1],vcc (save exec, exec=vcc); s_cbranch_execz skip (forward -> no-op);

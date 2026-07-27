@@ -392,6 +392,48 @@ int main() {
     CHECK(shared_first && !shared_first->empty(),
           "shared shader words outlive cache reset while a realized draw retains them");
 
+    // Compute realization used to run the full RDNA2 walk/CFG/SPIR-V builder for every dispatch,
+    // even though SGPR values are supplied as push constants. Cache by code, descriptor interface,
+    // and the launch ABI fields that actually specialize the module.
+    static const uint32_t kCompute[] = {
+        0xd7460004, 0x04010c08, 0x7e000204, 0x7e020205, 0x7e040206,
+        0x7e060207, 0xe01c2000, 0x80000004, 0xbf810000,
+    };
+    ShaderResource compute_buffer;
+    compute_buffer.cls = ResourceClass::ConstantBuffer;
+    compute_buffer.format = DataFormat::Uint32;
+    compute_buffer.num_components = 4;
+    compute_buffer.binding = 2;
+    compute_buffer.stride = 16;
+    compute_buffer.sgpr_base = 0;
+    compute_buffer.size = 4096;
+    ShaderResourceTable compute_table;
+    compute_table.resources.push_back(compute_buffer);
+    ComputeShaderConfig compute_config;
+    compute_config.user_sgprs.resize(8);
+    compute_config.local_x = 64;
+    compute_config.exact_thread_extent = true;
+    compute_config.threads_x = 130;
+    compute_config.threads_y = compute_config.threads_z = 1;
+    compute_config.tgid_x_en = true;
+    const auto direct_compute = recompile_compute(
+        kCompute, std::size(kCompute), &compute_table, compute_config);
+    const auto cached_compute = recompile_compute_shader_cached(
+        kCompute, std::size(kCompute), &compute_table, compute_config);
+    ComputeShaderConfig new_push_constants = compute_config;
+    new_push_constants.user_sgprs[4] = 0x12345678;
+    const auto repeated_compute = recompile_compute_shader_cached(
+        kCompute, std::size(kCompute), &compute_table, new_push_constants);
+    ComputeShaderConfig changed_launch = compute_config;
+    changed_launch.local_x = 32;
+    const auto changed_compute = recompile_compute_shader_cached(
+        kCompute, std::size(kCompute), &compute_table, changed_launch);
+    stats = shader_recompile_cache_stats();
+    CHECK(!direct_compute.empty() && cached_compute == direct_compute &&
+              repeated_compute == direct_compute && !changed_compute.empty() &&
+              changed_compute != direct_compute && stats.misses == 2 && stats.hits == 1,
+          "compute cache reuses push-constant variants and separates launch-specialized modules");
+
     if (failures) {
         std::printf("== FAIL: %d ==\n", failures);
         return 1;
