@@ -112,6 +112,12 @@ struct FrameResource {
     // layout. Keep the flag independent of tex_rgba because both sampled and storage images upload
     // decoded pixels through that pointer.
     bool is_storage_image = false;
+    // Writable graphics storage images must publish their final linear texels before this backend call
+    // returns. The live frontend uses this to restore the guest's linear/tiled layout and notify the
+    // normal guest-write invalidation path, so later graphics, sampled aliases, compute, DMA, and CPU
+    // consumers all observe the image side effect. An empty callback keeps read-only/test fixtures on
+    // the ordinary asynchronous upload path.
+    std::function<void(const uint8_t*, size_t)> storage_image_writeback;
     // Sampler state (Texture only). Defaults = LINEAR + clamp-to-edge — the harness's prior fixed
     // sampler — so render tests that build FrameResources directly stay byte-identical. The live path
     // fills these from the decoded S# (shader_resources.hpp). filter: 0=nearest, 1=linear; addr = Gen5
@@ -176,6 +182,8 @@ inline VkFormat backend_color_format(VkFormat format) {
         return VK_FORMAT_R16G16B16A16_SFLOAT;
     if (format == VK_FORMAT_R8_UNORM)
         return VK_FORMAT_R8_UNORM;
+    if (format == VK_FORMAT_R32_UINT)
+        return VK_FORMAT_R32_UINT;
     return VK_FORMAT_R8G8B8A8_UNORM;
 }
 
@@ -3103,6 +3111,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         bool borrowed_ds_feedback = false; // same image is this pass's read-only depth attachment
         VkFormat ds_format = VK_FORMAT_UNDEFINED;
         bool direct_memory = false;
+        std::vector<std::function<void(const uint8_t*, size_t)>> storage_writebacks;
     };
     struct PersistentTextureKey {
         uint64_t id = 0;
@@ -3808,6 +3817,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             tci.usage = (r.is_storage_image ? VK_IMAGE_USAGE_STORAGE_BIT
                                                           : VK_IMAGE_USAGE_SAMPLED_BIT) |
                                         VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                        (r.is_storage_image
+                                             ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u) |
                                         (upload.key.mip_levels > 1 ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT
                                                                    : 0u);   // blit-cascade source (#1272)
                             vkCreateImage(dev, &tci, nullptr, &upload.image);
@@ -3838,7 +3849,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 static_cast<VkDeviceSize>(r.tw) * r.th * r.td *
                                 backend_color_bytes_per_pixel(r.texture_format);
                             VkBufferCreateInfo stci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-                            stci.size = tbytes; stci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+                            stci.size = tbytes;
+                            stci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                (r.is_storage_image
+                                     ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u);
                             vkCreateBuffer(dev, &stci, nullptr, &upload.staging);
                             VkMemoryRequirements sr;
                             vkGetBufferMemoryRequirements(dev, upload.staging, &sr);
@@ -3873,6 +3887,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             vkUnmapMemory(dev, upload.staging_memory);
                         }
                     }
+                    if (r.is_storage_image && r.storage_image_writeback &&
+                        texture_uploads[upload_index].storage_writebacks.empty())
+                        texture_uploads[upload_index].storage_writebacks.push_back(
+                            r.storage_image_writeback);
                     const SharedTextureUpload& upload = texture_uploads[upload_index];
                     VkImageViewCreateInfo tvci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
                     // NOTE(#263): r.srgb carries whether the T# is a gamma-encoded (sRGB) surface, but we
@@ -4514,6 +4532,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const bool readback_color1 = use_color1 &&
         (!persistent_color1 || color_target->readback1);
     const bool readback_requested = readback_color0 || readback_color1;
+    const bool storage_writeback_requested = std::any_of(
+        texture_uploads.begin(), texture_uploads.end(),
+        [](const SharedTextureUpload& upload) {
+            return !upload.storage_writebacks.empty();
+        });
+    const bool synchronous_results_requested =
+        readback_requested || storage_writeback_requested;
     const VkDeviceSize readback_color1_offset = readback_color0 ? bytes : 0;
     const VkDeviceSize readback_bytes = (readback_color0 ? bytes : 0) +
                                         (readback_color1 ? bytes1 : 0);
@@ -4799,7 +4824,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // must be recorded outside a render pass, so it happens here.
     const RenderVkCtx& ds_ctx = render_vk_ctx();
     const bool draw_stats = getenv("PROSPER_DRAW_STATS") && ds_ctx.pipeline_stats_enabled && !dv.empty()
-                            && (!submission_batch || readback_requested || flush_submission_batch);
+                            && (!submission_batch || synchronous_results_requested ||
+                                flush_submission_batch);
     VkQueryPool ds_stats_pool = VK_NULL_HANDLE, ds_occ_pool = VK_NULL_HANDLE;
     if (draw_stats) {
         const uint32_t nq = static_cast<uint32_t>(dv.size());
@@ -4848,7 +4874,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     }
     const bool geom_probe = geom_item != SIZE_MAX
                             && ds_ctx.transform_feedback_enabled
-                            && (!submission_batch || readback_requested || flush_submission_batch);
+                            && (!submission_batch || synchronous_results_requested ||
+                                flush_submission_batch);
     static auto p_bindxfb  = reinterpret_cast<PFN_vkCmdBindTransformFeedbackBuffersEXT>(
         vkGetDeviceProcAddr(dev, "vkCmdBindTransformFeedbackBuffersEXT"));
     static auto p_beginxfb = reinterpret_cast<PFN_vkCmdBeginTransformFeedbackEXT>(
@@ -4997,6 +5024,43 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &to_ds);
     }
+    // A writable graphics storage image is architecturally guest memory, not a callback-local
+    // texture. Copy its final texels back through the upload's coherent staging allocation before
+    // releasing the image. The callback below restores the guest surface layout and publishes the
+    // ordinary guest-write invalidation event. This deliberately forces one synchronization boundary
+    // for storage-image calls; retaining GPU images without alias/import/write invalidation would be
+    // faster but would still lose visibility at graphics->compute/DMA/CPU boundaries.
+    for (SharedTextureUpload& upload : texture_uploads) {
+        if (upload.storage_writebacks.empty() || !upload.image || !upload.staging) continue;
+        VkImageMemoryBarrier to_readback{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        to_readback.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        to_readback.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        to_readback.image = upload.image;
+        to_readback.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        to_readback.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        to_readback.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &to_readback);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {upload.key.width, upload.key.height, upload.key.depth};
+        vkCmdCopyImageToBuffer(cmd, upload.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               upload.staging, 1, &copy);
+        VkImageMemoryBarrier to_general{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        to_general.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        to_general.image = upload.image;
+        to_general.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        to_general.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        to_general.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &to_general);
+    }
     if (readback_requested) {
         auto transition_color_to_readback = [&](bool persistent, bool readback, VkImage image) {
             if (!persistent || !readback) return;
@@ -5128,7 +5192,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         cached_color1->valid = true;
         cached_color1->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
-    const bool flush_now = !submission_batch || readback_requested || flush_submission_batch;
+    const bool flush_now = !submission_batch || synchronous_results_requested ||
+                           flush_submission_batch;
     BackendSubmissionBatchResult batch_result;
     if (flush_now)
         batch_result = active_submission.submit_and_wait(dev, queue, backend_trace);
@@ -5334,6 +5399,26 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     }
 
+    if (storage_writeback_requested && batch_completed) {
+        for (SharedTextureUpload& upload : texture_uploads) {
+            if (upload.storage_writebacks.empty() || !upload.staging ||
+                !upload.staging_memory)
+                continue;
+            const size_t storage_bytes = static_cast<size_t>(upload.key.width) *
+                upload.key.height * upload.key.depth *
+                backend_color_bytes_per_pixel(upload.key.format);
+            void* mapped = nullptr;
+            if (!storage_bytes ||
+                vkMapMemory(dev, upload.staging_memory, 0, storage_bytes, 0,
+                            &mapped) != VK_SUCCESS ||
+                !mapped)
+                continue;
+            const auto* pixels = static_cast<const uint8_t*>(mapped);
+            for (const auto& writeback : upload.storage_writebacks)
+                writeback(pixels, storage_bytes);
+            vkUnmapMemory(dev, upload.staging_memory);
+        }
+    }
     if (readback_requested && batch_completed) {
         void* mp = nullptr; vkMapMemory(dev, bmem, 0, readback_bytes, 0, &mp);
         const auto* readback = static_cast<const uint8_t*>(mp);

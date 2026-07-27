@@ -205,9 +205,10 @@ bool prefix_inspect_publish() {
 }
 
 // Pixel decoding is a pure function of these fields for guest-backed textures. Keep this cache local
-// to one renderer callback: graphics spans are split at compute operations, so guest texture bytes
-// cannot change within its lifetime. Live RTT inputs are excluded separately because an earlier pass
-// in the same callback can replace their pixels.
+// to one renderer callback: graphics spans are split at compute operations, so ordinary guest texture
+// bytes cannot change within its lifetime. Writable storage-image callbacks explicitly invalidate every
+// overlapping entry after publishing their results. Live RTT inputs are excluded separately because an
+// earlier pass in the same callback can replace their pixels.
 struct TextureDecodeKey {
     uint64_t gpu_addr = 0;
     uint64_t host_data = 0;
@@ -964,6 +965,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             prosper::gpu::SpirvDescriptorKind::CombinedImageSampler &&
                         reflected_binding->normalized_sampling &&
                         !reflected_binding->texel_access;
+                    const bool writable_storage_image =
+                        reflected_binding != reflected.descriptors.end() &&
+                        reflected_binding->kind ==
+                            prosper::gpu::SpirvDescriptorKind::StorageImage &&
+                        reflected_binding->writable;
                     // Captured replays preserve the logical guest address for RT identity but provide
                     // owned bytes here. Production resources leave host_data null and use guest memory.
                     auto copy_resource = [&](uint8_t* dst, uint64_t addr, size_t n) -> size_t {
@@ -1115,7 +1121,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 }
                             }
                         }
-                        const bool has_cpu_live_rtt = r.img_dim == 1u && live_rtt != g_rtt.end() &&
+                        const bool has_cpu_live_rtt = !fr.is_storage_image && r.img_dim == 1u &&
+                            live_rtt != g_rtt.end() &&
                             live_rtt->second.w && live_rtt->second.h && live_rtt->second.rgba &&
                             !live_rtt->second.rgba->empty();
                         // A retained render target was created for color-attachment + sampled usage,
@@ -1227,6 +1234,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             r.format == prosper::gpu::DataFormat::Unorm8 &&
                             r.num_components == 1 && r.tile_mode == 0u &&
                             !r.compression_enabled && !linear_padded_read;
+                        // Storage-image atomics require a typed integer Vulkan view. Keep R32_UINT
+                        // texels byte-exact through the existing 4-B read/detile path instead of
+                        // silently normalizing the view to RGBA8_UNORM.
+                        const bool native_r32ui_storage =
+                            r.cls == RC::StorageImage && r.img_dim == 1u &&
+                            r.format == prosper::gpu::DataFormat::Uint32 &&
+                            r.num_components == 1 && !r.compression_enabled;
                         const bool persistent_source_matches_pixels =
                             native_r8_sampled ||
                             (persistent_unorm8_texture && r.num_components == 4 &&
@@ -1609,9 +1623,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const size_t volume_texels = (size_t)tw * th * (is_volume ? r.depth : 1u);
                         const VkFormat live_rtt_format = has_cpu_live_rtt
                             ? live_rtt->second.format
-                            : (native_r8_sampled ? VK_FORMAT_R8_UNORM
+                            : (native_r32ui_storage ? VK_FORMAT_R32_UINT
+                               : (native_r8_sampled ? VK_FORMAT_R8_UNORM
                                : (sampled_source_f32 ? VK_FORMAT_R16G16B16A16_SFLOAT
-                                                     : VK_FORMAT_R8G8B8A8_UNORM));
+                                                     : VK_FORMAT_R8G8B8A8_UNORM)));
                         fr.texture_format = live_rtt_format;
                         const uint32_t output_bpp =
                             prosper::test::backend_color_bytes_per_pixel(live_rtt_format);
@@ -1673,7 +1688,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // RTT (#167): if this texture's base is a color target we rendered into, inject those
                         // pixels (nearest-scaled to tw x th) instead of reading empty guest memory.
                         bool rtt_hit = false;
-                        if (rtt_on && !is_volume && !r.in_mip_tail) { auto rit = g_rtt.find(r.gpu_addr);
+                        if (!fr.is_storage_image && rtt_on && !is_volume && !r.in_mip_tail) {
+                            auto rit = g_rtt.find(r.gpu_addr);
                             if (rit != g_rtt.end() && rit->second.w && rit->second.h && rit->second.rgba &&
                                 !rit->second.rgba->empty()) {
                                 const RttSurf& s = rit->second;
@@ -2366,6 +2382,81 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             decoded_textures.emplace(
                                 decode_key, DecodedTexture{fr.tex_rgba, fr.th, narrow_done,
                                                           fr.persistent_texture_id});
+                        }
+                        if (native_r32ui_storage && writable_storage_image) {
+                            const uint32_t writeback_pitch = getenv("PROSPER_PITCH")
+                                ? static_cast<uint32_t>(atoi(getenv("PROSPER_PITCH"))) : 0u;
+                            const size_t linear_bytes = static_cast<size_t>(tw) * th * 4u;
+                            const bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode);
+                            const size_t guest_bytes = r.in_mip_tail
+                                ? r.mip_tail_bytes
+                                : (tiled
+                                       ? prosper::gpu::tiled_surface_bytes(
+                                             tw, th, r.tile_mode, writeback_pitch, 4u)
+                                       : linear_bytes);
+                            // The exact Astro atomic surface is a base-level 2D R32_UINT image. Keep
+                            // the callback fail-closed for malformed/short replay backing; losing a
+                            // write is preferable to overrunning an unrelated guest allocation.
+                            const bool backing_fits = guest_bytes &&
+                                (!r.host_data || guest_bytes <= r.host_data_size);
+                            if (backing_fits) {
+                                const uint64_t guest_addr = r.gpu_addr;
+                                uint8_t* const replay_data = r.host_data;
+                                const uint32_t tile_mode = r.tile_mode;
+                                const bool in_mip_tail = r.in_mip_tail;
+                                const uint32_t mip_tail_x = r.mip_tail_x;
+                                const uint32_t mip_tail_y = r.mip_tail_y;
+                                fr.storage_image_writeback =
+                                    [guest_addr, replay_data, guest_bytes, linear_bytes,
+                                     tw, th, tile_mode,
+                                     writeback_pitch, in_mip_tail, mip_tail_x,
+                                     mip_tail_y, &decoded_textures](const uint8_t* pixels,
+                                                                  size_t bytes) {
+                                        if (!pixels || bytes != linear_bytes) return;
+                                        uint8_t* destination = replay_data;
+                                        if (!destination) {
+                                            if (guest_bytes > UINT32_MAX ||
+                                                !prosper::gpu::guest_writable(
+                                                    guest_addr,
+                                                    static_cast<uint32_t>(guest_bytes)))
+                                                return;
+                                            prosper::host::guest_write_watch_notify_host_write(
+                                                guest_addr, guest_bytes);
+                                            destination = reinterpret_cast<uint8_t*>(
+                                                static_cast<uintptr_t>(guest_addr));
+                                        }
+                                        if (in_mip_tail) {
+                                            prosper::gpu::tile_surface_level(
+                                                destination, guest_bytes, pixels, tw, th,
+                                                tile_mode, 4u, mip_tail_x, mip_tail_y);
+                                        } else {
+                                            prosper::gpu::tile_surface(
+                                                destination, pixels, tw, th, tile_mode,
+                                                writeback_pitch, 4u);
+                                        }
+                                        if (guest_addr)
+                                            prosper::gpu::notify_guest_gpu_write(
+                                                guest_addr, guest_bytes);
+                                        // The same guest range can already have a sampled-image decode
+                                        // under a different cache key/class. Its pixel representation
+                                        // cannot be patched byte-for-byte from R32_UINT, so discard every
+                                        // overlapping submit-local decode and let the next pass rebuild it
+                                        // from the now-current guest bytes.
+                                        if (guest_addr) {
+                                            for (auto it = decoded_textures.begin();
+                                                 it != decoded_textures.end();) {
+                                                const uint64_t cached_addr = it->first.gpu_addr;
+                                                const uint64_t cached_bytes =
+                                                    std::max<uint64_t>(it->first.size, 1u);
+                                                const bool overlaps = cached_addr <= guest_addr
+                                                    ? guest_addr - cached_addr < cached_bytes
+                                                    : cached_addr - guest_addr < guest_bytes;
+                                                if (overlaps) it = decoded_textures.erase(it);
+                                                else ++it;
+                                            }
+                                        }
+                                    };
+                            }
                         }
                         // Carry the decoded S# sampler state (filter/wrap/mip) so the pipeline samples the
                         // way the game asked instead of a fixed LINEAR/clamp sampler (#<sampler-fix>).

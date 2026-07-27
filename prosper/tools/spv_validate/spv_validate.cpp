@@ -97,6 +97,15 @@ int main(int argc, char** argv) {
       ShaderResourceTable rt; ShaderResource t{}; t.cls=ResourceClass::Texture; t.format=DataFormat::Float32;
       t.num_components=4; t.binding=4; t.img_dim=1; t.width=2; t.height=2; t.sgpr_base=8; rt.resources.push_back(t);
       dump(dir, "fragment_texture", recompile_fragment(c, sizeof(c)/4, &rt)); }
+    // Fragment: Astro Bot R32_UINT image_atomic_swap with GLC return.
+    { const uint32_t c[] = {0x7e000280u,0x7e020280u,0x7e1202ffu,0x3f800000u,
+                            0xf03c2108u,0x00000900u,0x7e000280u,0x7e020309u,
+                            0x7e040280u,0x7e0602f2u,0xf800000fu,0x03020100u,0xbf810000u};
+      ShaderResourceTable rt; ShaderResource image{}; image.cls=ResourceClass::StorageImage;
+      image.format=DataFormat::Uint32; image.num_components=1; image.binding=4;
+      image.img_dim=1; image.width=1; image.height=1; image.depth=1; image.sgpr_base=0;
+      rt.resources.push_back(image);
+      dump(dir, "fragment_image_atomic", recompile_fragment(c, sizeof(c)/4, &rt)); }
     // Fragment: image_sample a 3D texture (3 coords) -> mrt0. (shader_028 pattern)
     { const uint32_t c[] = {0x7E0002FFu,0x3E800000u,0x7E0202FFu,0x3E800000u,0x7E0402FFu,0x3E800000u,
                             0xF0800F10u,0x00400000u,0xF800180Fu,0x03020100u,0xBF810000u};

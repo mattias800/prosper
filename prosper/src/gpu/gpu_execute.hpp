@@ -195,10 +195,9 @@ struct SrtUse {
     // has no usable key; keying the TEXTURE use by its exact instruction (ShaderResource::fetch_pc,
     // the same per-instruction provenance the vertex fetches use) is unambiguous.
     uint32_t use_pc = 0xFFFFFFFFu;   // exact consuming pc for key-less texture/buffer uses
-    // The consuming image op WRITES the image (image_store — MIMG op 0x8): the resource must be a
-    // STORAGE image, not a sampled texture (#590 — the recompiler's storage path requires
-    // ResourceClass::StorageImage). Only meaningful for kind 0.
-    bool is_store = false;
+    // The consuming image op requires a STORAGE image (image_store 0x08 or an image atomic such as
+    // IMAGE_ATOMIC_SWAP 0x0f), not a sampled texture. Only meaningful for kind 0.
+    bool is_storage_image = false;
     // The consuming MIMG opcode is a comparison/depth sample (IMAGE_SAMPLE_C*). This is a
     // property of the use, not merely the S# compare function: NEVER is a valid compare op.
     bool is_depth_compare = false;

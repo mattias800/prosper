@@ -106,6 +106,25 @@ static std::vector<uint32_t> storage_image_access_test_spirv(bool float_sampled_
     return s;
 }
 
+static std::vector<uint32_t> storage_image_atomic_test_spirv() {
+    // R32_UINT storage image -> OpImageTexelPointer -> OpAtomicExchange. The image variable is an
+    // operand of OpImageTexelPointer directly, so reflection must carry that provenance through the
+    // returned Image-storage pointer to the atomic read/write.
+    std::vector<uint32_t> s = {0x07230203u, 0x00010000u, 0, 24, 0};
+    emit(s, 15, {4, 20, 0x6e69616d, 0});                    // OpEntryPoint Fragment %20 "main"
+    emit(s, 21, {1, 32, 0});                               // %1 = u32
+    emit(s, 23, {2, 1, 2});                                // %2 = uvec2
+    emit(s, 25, {3, 1, 1, 0, 0, 0, 2, 33});               // %3 = storage 2D R32ui image
+    emit(s, 32, {4, 0, 3});                                // %4 = UniformConstant pointer to image
+    emit(s, 32, {5, 11, 1});                               // %5 = Image pointer to u32
+    emit(s, 59, {4, 6, 0});                                // %6 = image variable
+    emit(s, 71, {6, 34, 1}); emit(s, 71, {6, 33, 7});      // set 1 binding 7
+    emit(s, 43, {1, 7, 0});                                // %7 = 0 (sample/value)
+    emit(s, 60, {5, 8, 6, 9, 7});                          // %8 = OpImageTexelPointer %6
+    emit(s, 229, {1, 10, 8, 7, 7, 7});                     // %10 = atomicExchange %8
+    return s;
+}
+
 static bool has_issue(const DescriptorValidationReport& r, DescriptorIssueCode code) {
     for (const auto& issue : r.issues) if (issue.code == code) return true;
     return false;
@@ -382,6 +401,22 @@ int main() {
               float_storage_report.descriptors[0].storage_float &&
               float_storage_report.descriptors[1].storage_float,
           "storage-image reflection preserves the SPIR-V float sampled-type contract");
+    ShaderResource atomic_image = storage_src;
+    atomic_image.binding = 7;
+    atomic_image.format = DataFormat::Uint32;
+    atomic_image.num_components = 1;
+    ShaderResourceTable atomic_image_table;
+    atomic_image_table.resources = {atomic_image};
+    const auto atomic_image_report = validate_spirv_descriptor_interface(
+        storage_image_atomic_test_spirv(), &atomic_image_table, 1,
+        SpirvShaderStage::Fragment);
+    CHECK(atomic_image_report.ok() && atomic_image_report.descriptors.size() == 1 &&
+              atomic_image_report.descriptors[0].kind == SpirvDescriptorKind::StorageImage &&
+              atomic_image_report.descriptors[0].readable &&
+              atomic_image_report.descriptors[0].writable &&
+              atomic_image_report.descriptors[0].texel_access &&
+              !atomic_image_report.descriptors[0].storage_float,
+          "image-texel-pointer atomic reflects an exact readable+writable integer storage image");
     image_table.resources[0].size = 0;
     auto izr = validate_spirv_descriptor_interface(
         image_spv, &image_table, 1, SpirvShaderStage::Fragment);

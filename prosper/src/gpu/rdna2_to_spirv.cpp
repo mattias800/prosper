@@ -42,7 +42,7 @@ enum : uint32_t {
     Op_ShiftRightLogical=194, Op_ShiftRightArithmetic=195, Op_ShiftLeftLogical=196, Op_BitwiseOr=197,
     Op_BitwiseXor=198, Op_BitwiseAnd=199, Op_Not=200, Op_BitFieldSExtract=202, Op_BitFieldUExtract=203,
     Op_BitReverse=204, Op_BitCount=205, Op_UConvert=113,
-    Op_TypeImage=25, Op_TypeSampledImage=27, Op_SampledImage=86,
+    Op_TypeImage=25, Op_TypeSampledImage=27, Op_ImageTexelPointer=60, Op_SampledImage=86,
     Op_ImageSampleImplicitLod=87, Op_ImageSampleExplicitLod=88,
     Op_ImageSampleDrefImplicitLod=89, Op_ImageSampleDrefExplicitLod=90,
     Op_ImageFetch=95, Op_ImageGather=96, Op_Image=100,
@@ -73,7 +73,7 @@ enum : uint32_t {
     EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17, EM_Triangles=22,
     EM_OutputVertices=26, EM_OutputTriangleStrip=29, EM_Xfb=11,   // transform-feedback execution mode
     SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_Function=7, SC_PushConstant=9,
-    SC_StorageBuffer=12, FC_None=0,
+    SC_Image=11, SC_StorageBuffer=12, FC_None=0,
     Dim_1D=0, Dim_2D=1, Dim_3D=2,   // SPIR-V Dim. (2D coincides with the SQ_RSRC 2D dim value, but distinct.)
     Cap_Sampled1D=43, Cap_Image1D=44,   // Dim=1D needs Sampled1D; a 1D STORAGE image (read/write) also needs Image1D
     Cap_StorageImageMultisample=27,      // MS=1 storage image (read/write a multisampled image)
@@ -84,9 +84,11 @@ enum : uint32_t {
     ImgOp_Offset=0x10,                   // ImageOperands bit: dynamic texel offset (needs ImageGatherExtended)
     Img_Sampled_Storage=2,   // OpTypeImage "Sampled" operand: 2 = used WITHOUT a sampler (read/write storage image)
     ImgFmt_Unknown=0,        // OpTypeImage "Image Format": Unknown (runtime view format; needs the caps above)
+    ImgFmt_R32ui=33,         // exact uint32 storage image format required by image atomics
     ImgOp_Bias=1, ImgOp_Lod=2, ImgOp_Grad=4, ImgOp_Sample=0x40,   // ImageOperands bits.
     SC_Workgroup=4, Scope_Device=1, Scope_Workgroup=2, Scope_Subgroup=3,
-    MemSem_UniformAcqRel=0x48, MemSem_WGAcqRel=0x108,   // storage/LDS AcquireRelease memory semantics
+    MemSem_UniformAcqRel=0x48, MemSem_WGAcqRel=0x108,   // storage-buffer/LDS AcquireRelease semantics
+    MemSem_ImageAcqRel=0x808,                            // AcquireRelease | ImageMemory
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_NoPerspective=13, Dec_Flat=14,
     Dec_Centroid=16, Dec_Sample=17, Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35, Dec_XfbBuffer=36, Dec_XfbStride=37,
@@ -213,6 +215,7 @@ struct SpirvCompute {
     uint32_t v_push_constants = 0, t_ptr_push_u32 = 0;
     uint32_t linear_localid = 0, local_count = 64, wave_size = 64;
     uint32_t v_cbuf=0, v_cbuf1=0, t_ptr_sb_u32=0;   // scalar-memory constant buffers (bindings 2 and 3)
+    uint32_t t_ptr_img_u32=0;                       // OpImageTexelPointer result for R32_UINT atomics
     uint32_t guest_scratch=0, t_ptr_guest_scratch_u32=0;
     int32_t guest_scratch_min_byte=0, guest_scratch_saddr=-1;
     uint32_t guest_scratch_dwords=0;
@@ -1164,18 +1167,22 @@ struct SpirvCompute {
     uint32_t t_v4u_cache = 0;
     uint32_t t_v4u() { if (!t_v4u_cache) { t_v4u_cache = id(); put(types, Op_TypeVector, {t_v4u_cache, t_u32, 4}); } return t_v4u_cache; }
     uint32_t t_v3u_c = 0;   // integer coordinate vector type (uvec3); 2D reuses the shared t_v2u()
-    std::unordered_map<uint32_t, uint32_t> stg_img_type;   // (dim | arrayed<<8 | ms<<9 | float<<10) -> type
+    std::unordered_map<uint32_t, uint32_t> stg_img_type;   // dimension/type/format key -> OpTypeImage
+    std::unordered_map<uint32_t, uint32_t> stg_img_binding_type; // binding -> declared OpTypeImage
     std::unordered_map<uint32_t, uint32_t> stg_img_var;    // binding -> storage-image OpVariable id
     std::unordered_map<uint32_t, bool> stg_img_float;      // binding -> float (rather than uint) texels
+    std::unordered_map<uint32_t, uint32_t> stg_img_format; // binding -> SPIR-V Image Format
     bool declared_read_wo_fmt = false, declared_write_wo_fmt = false, declared_sampled1d = false, declared_ms = false, declared_msarray = false;
-    static uint32_t stg_key(uint32_t dim, bool arrayed, bool ms, bool float_texel) {
+    static uint32_t stg_key(uint32_t dim, bool arrayed, bool ms, bool float_texel,
+                            uint32_t image_format) {
         return dim | (arrayed ? 0x100u : 0u) | (ms ? 0x200u : 0u) |
-               (float_texel ? 0x400u : 0u);
+               (float_texel ? 0x400u : 0u) | (image_format << 11);
     }
     // Declare (idempotently) a storage image of SPIR-V `dim` (arrayed = layer in the coord; ms =
     // multisampled) at set 0, `binding`. Float and uint sampled types are keyed separately.
     void declare_storage_image(uint32_t binding, uint32_t dim, bool arrayed = false,
-                               bool ms = false, bool float_texel = false) {
+                               bool ms = false, bool float_texel = false,
+                               uint32_t image_format = ImgFmt_Unknown) {
         if (dim == Dim_1D && !declared_sampled1d) {   // SPIR-V: Dim=1D needs Sampled1D; storage 1D also needs Image1D
             put(caps, Op_Capability, {Cap_Sampled1D});
             put(caps, Op_Capability, {Cap_Image1D});
@@ -1183,12 +1190,12 @@ struct SpirvCompute {
         }
         if (ms && !declared_ms) { put(caps, Op_Capability, {Cap_StorageImageMultisample}); declared_ms = true; }
         if (ms && arrayed && !declared_msarray) { put(caps, Op_Capability, {Cap_ImageMSArray}); declared_msarray = true; }
-        uint32_t key = stg_key(dim, arrayed, ms, float_texel);
+        uint32_t key = stg_key(dim, arrayed, ms, float_texel, image_format);
         if (!stg_img_type.count(key)) {
             uint32_t ti = id();
             put(types, Op_TypeImage, {ti, float_texel ? t_f32 : t_u32, dim, 0,
                                       arrayed ? 1u : 0u, ms ? 1u : 0u,
-                                      Img_Sampled_Storage, ImgFmt_Unknown});
+                                      Img_Sampled_Storage, image_format});
             stg_img_type[key] = ti;
         }
         if (stg_img_var.count(binding)) return;
@@ -1196,11 +1203,10 @@ struct SpirvCompute {
         uint32_t v = id();     put(types, Op_Variable,    {t_ptr, v, SC_UniformConstant});
         put(deco, Op_Decorate, {v, Dec_DescriptorSet, desc_set});
         put(deco, Op_Decorate, {v, Dec_Binding, binding});
+        stg_img_binding_type[binding] = stg_img_type[key];
         stg_img_var[binding] = v;
         stg_img_float[binding] = float_texel;
-    }
-    uint32_t stg_img_id(uint32_t dim, bool arrayed, bool ms, bool float_texel) {
-        return stg_img_type[stg_key(dim, arrayed, ms, float_texel)];
+        stg_img_format[binding] = image_format;
     }
     // Build the integer coordinate operand from `n` raw-bit VGPR coords (u32 texel indices, incl. the
     // array layer as the last component for arrayed images). n=1 -> scalar u32; 2 -> uvec2; 3 -> uvec3.
@@ -1228,11 +1234,14 @@ struct SpirvCompute {
     // (the test harness does). The store side is instead EXEC-predicated (no robust "harmless" OOB write).
     void image_read(uint32_t binding, uint32_t dim, bool arrayed, uint32_t ncoord, const uint32_t* coords,
                     uint32_t out[4], bool ms = false, uint32_t sample = 0) {
-        if (!declared_read_wo_fmt) { put(caps, Op_Capability, {Cap_StorageImageReadWithoutFormat}); declared_read_wo_fmt = true; }
+        if (stg_img_format[binding] == ImgFmt_Unknown && !declared_read_wo_fmt) {
+            put(caps, Op_Capability, {Cap_StorageImageReadWithoutFormat});
+            declared_read_wo_fmt = true;
+        }
         const bool float_texel = stg_img_float[binding];
         const uint32_t vector_type = float_texel ? t_v4f : t_v4u();
         uint32_t img   = id(); put(code, Op_Load,
-                                   {stg_img_id(dim, arrayed, ms, float_texel), img,
+                                   {stg_img_binding_type[binding], img,
                                     stg_img_var[binding]});
         uint32_t coord = stg_coord(ncoord, coords);
         uint32_t res   = id();
@@ -1251,10 +1260,13 @@ struct SpirvCompute {
     // e.g. a grid-tail bounds check.)
     void image_write(uint32_t binding, uint32_t dim, bool arrayed, uint32_t ncoord, const uint32_t* coords,
                      const uint32_t vals[4], bool predicated = false, uint32_t pred = 0) {
-        if (!declared_write_wo_fmt) { put(caps, Op_Capability, {Cap_StorageImageWriteWithoutFormat}); declared_write_wo_fmt = true; }
+        if (stg_img_format[binding] == ImgFmt_Unknown && !declared_write_wo_fmt) {
+            put(caps, Op_Capability, {Cap_StorageImageWriteWithoutFormat});
+            declared_write_wo_fmt = true;
+        }
         const bool float_texel = stg_img_float[binding];
         uint32_t img   = id(); put(code, Op_Load,
-                                   {stg_img_id(dim, arrayed, false, float_texel), img,
+                                   {stg_img_binding_type[binding], img,
                                     stg_img_var[binding]});
         uint32_t coord = stg_coord(ncoord, coords);
         uint32_t texel = id();
@@ -1272,6 +1284,40 @@ struct SpirvCompute {
         put(code, Op_ImageWrite, {img, coord, texel});
         put(code, Op_Branch, {merge});
         put(code, Op_Label, {merge}); cur_block = merge;
+    }
+
+    // IMAGE_ATOMIC_SWAP on an R32_UINT storage image. OpImageTexelPointer consumes the descriptor
+    // variable directly (not a loaded image object) and yields an Image-storage pointer suitable for
+    // the SPIR-V atomic. Inactive EXEC lanes neither touch the image nor clobber VDATA.
+    uint32_t image_atomic_swap(uint32_t binding, uint32_t ncoord, const uint32_t* coords,
+                               uint32_t value, bool predicated, uint32_t pred,
+                               uint32_t fallback) {
+        if (!t_ptr_img_u32) {
+            t_ptr_img_u32 = id();
+            put(types, Op_TypePointer, {t_ptr_img_u32, SC_Image, t_u32});
+        }
+        auto emit = [&]() {
+            const uint32_t coord = stg_coord(ncoord, coords);
+            const uint32_t pointer = id();
+            put(code, Op_ImageTexelPointer,
+                {t_ptr_img_u32, pointer, stg_img_var[binding], coord, uconst(0)});
+            const uint32_t result = id();
+            put(code, Op_AtomicExchange,
+                {t_u32, result, pointer, uconst(Scope_Device),
+                 uconst(MemSem_ImageAcqRel), value});
+            return result;
+        };
+        if (!predicated) return emit();
+        const uint32_t entry = cur_block;
+        const uint32_t then = id(), merge = id();
+        put(code, Op_SelectionMerge, {merge, 0});
+        put(code, Op_BranchConditional, {pred, then, merge});
+        put(code, Op_Label, {then}); cur_block = then;
+        const uint32_t result = emit();
+        const uint32_t then_end = cur_block;
+        put(code, Op_Branch, {merge});
+        put(code, Op_Label, {merge}); cur_block = merge;
+        return emit_phi_2way(t_u32, result, then_end, fallback, entry);
     }
 
     // buffer element pointer: base[ gid.x*stride + k ]
@@ -6639,8 +6685,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             // Exact per-use provenance wins over table keys. A sample and store may consume the same
             // T# through a colliding offset but require different Vulkan descriptor classes.
-            if ((in.opcode == 0x08 && res && res->cls != ResourceClass::StorageImage) ||
-                (in.opcode != 0x00 && in.opcode != 0x08 && in.opcode != 0x0e &&
+            const bool storage_only_op = in.opcode == 0x08 || in.opcode == 0x0f;
+            if ((storage_only_op && res && res->cls != ResourceClass::StorageImage) ||
+                (in.opcode != 0x00 && !storage_only_op && in.opcode != 0x0e &&
                  res && res->cls != ResourceClass::Texture))
                 res = nullptr;
             if ((!res || (res->cls != ResourceClass::Texture && res->cls != ResourceClass::StorageImage))
@@ -6662,10 +6709,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                       res->format == DataFormat::Uint16 ||
                                       res->format == DataFormat::Uint32;
 
-            // --- Storage-image path: image_load (0x00) / image_store (0x08), no sampler, any dim ---
+            // --- Storage-image path: image_load (0x00), image_store (0x08), and R32_UINT
+            // image_atomic_swap (0x0f), without a sampler. ---
             if (res->cls == ResourceClass::StorageImage) {
-                const bool is_ld = (in.opcode == 0x00), is_st = (in.opcode == 0x08);
-                if (!is_ld && !is_st) { ok = false; return true; }
+                const bool is_ld = in.opcode == 0x00;
+                const bool is_st = in.opcode == 0x08;
+                const bool is_atomic_swap = in.opcode == 0x0f;
+                if (!is_ld && !is_st && !is_atomic_swap) { ok = false; return true; }
                 uint32_t dim, ncoord; bool arrayed = false, ms = false;
                 switch (in.mimg_dim) {   // SQ_RSRC dim -> SPIR-V Dim + coord count (+ array layer / MSAA sample)
                     case 0: dim = Dim_1D; ncoord = 1; break;                       // 1D
@@ -6677,15 +6727,31 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     case 7: dim = Dim_2D; ncoord = 3; arrayed = true; ms = true; break;  // 2D_MSAA_ARRAY (x,y,layer)+sample
                     default: ok = false; return true;   // cube storage images deferred
                 }
-                if (ms && is_st) { ok = false; return true; }   // per-sample MSAA store not modeled (resolve shaders read)
+                if (ms && (is_st || is_atomic_swap)) { ok = false; return true; }
                 const uint32_t components = res->num_components ? res->num_components : 1;
+                // The live Astro Bot visibility image is an ordinary 2D R32_UINT surface. Keep the
+                // first atomic implementation exact and fail-visible for every other image shape;
+                // atomics require a typed integer image in Vulkan/SPIR-V rather than Format=Unknown.
+                if (is_atomic_swap &&
+                    (in.mimg_dim != SQ_DIM_2D || arrayed || ms || in.len_dwords != 2 ||
+                     in.mimg_unorm || in.mimg_dmask != 1u ||
+                     res->img_dim != 1u || res->depth != 1u || res->depth_compare ||
+                     res->format != DataFormat::Uint32 || components != 1u)) {
+                    ok = false;
+                    return true;
+                }
                 const bool ordinary_2d = res->img_dim == 1 && res->depth == 1 &&
                                          !res->depth_compare;
                 const bool native_float = ordinary_2d && native_float_storage_image_supported(
                     res->format, components, res->srgb,
                     (b.native_storage_format_support &
                      native_storage_format_support_bit(res->format, components)) != 0);
-                b.declare_storage_image(res->binding, dim, arrayed, ms, native_float);
+                // Existing load/store-only uint images retain the raw uvec4/Format=Unknown contract
+                // used by the compute backend. The atomic's exact R32_UINT gate above is the only path
+                // that opts into a typed R32ui image.
+                const bool native_r32ui = is_atomic_swap;
+                b.declare_storage_image(res->binding, dim, arrayed, ms, native_float,
+                                        native_r32ui ? ImgFmt_R32ui : ImgFmt_Unknown);
                 // Coordinate VGPR per axis. Non-NSA (len==2): consecutive from VADDR (src[0]). NSA (len>2):
                 // split across the extra address dwords — coord0 = VADDR, coord k>=1 = byte (k-1) of
                 // words[2..3] (dword2 = addr1..4, dword3 = addr5..8). Layout verified via llvm-mc gfx1010.
@@ -6706,7 +6772,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         uint32_t old = vreg_old(b, rs, vd + w); rs.vreg[vd + w] = out[c];
                         predicate_write(b, rs, vd + w, old); w++;
                     }
-                } else {
+                } else if (is_st) {
                     // image_store: gather the VDATA VGPRs selected by dmask into an RGBA texel (channels
                     // absent from dmask store as 0). Under a narrowed EXEC (e.g. a grid-tail bounds check),
                     // the write is EXEC-predicated so inactive lanes don't write out-of-range texels.
@@ -6714,6 +6780,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     int vd = in.dst.value, w = 0;
                     for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) { vals[c] = vread(vd + w); w++; }
                     b.image_write(res->binding, dim, arrayed, ncoord, coords, vals, rs.exec_narrowed, rs.exec);
+                } else {
+                    // IMAGE_ATOMIC_SWAP reads its exchange operand from VDATA. GLC=1 overwrites that
+                    // VGPR with the pre-operation texel; GLC=0 leaves VDATA unchanged. The helper's
+                    // phi preserves the old register value for EXEC-inactive lanes.
+                    const int vd = in.dst.value;
+                    const uint32_t old = vreg_old(b, rs, vd);
+                    const uint32_t result = b.image_atomic_swap(
+                        res->binding, ncoord, coords, vread(vd),
+                        rs.exec_narrowed, rs.exec, old);
+                    if (in.mimg_glc) rs.vreg[vd] = result;
                 }
                 return true;
             }
@@ -8720,13 +8796,13 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 if (getenv("PROSPER_DBG"))
                     fprintf(stderr, "[recompile-reject] pc=%u words=%08x,%08x fmt=%d op=0x%x "
                                     "dst=%d(kind%d) src=%d(k%d),%d(k%d),%d(k%d) dmask=0x%x "
-                                    "dim=%u len=%u modifier=%d dpp=%d sdwa=%u/%u/%u/%u\n",
+                                    "dim=%u glc=%d len=%u modifier=%d dpp=%d sdwa=%u/%u/%u/%u\n",
                         in.pc, in.words[0], in.words[1], (int)in.fmt, in.opcode,
                         in.dst.value, (int)in.dst.kind,
                         in.src[0].value, (int)in.src[0].kind,
                         in.src[1].value, (int)in.src[1].kind,
                         in.src[2].value, (int)in.src[2].kind,
-                        in.mimg_dmask, in.mimg_dim, in.len_dwords, (int)in.has_modifier,
+                        in.mimg_dmask, in.mimg_dim, (int)in.mimg_glc, in.len_dwords, (int)in.has_modifier,
                         (int)in.has_dpp, in.sdwa_dst_sel, in.sdwa_dst_unused,
                         in.sdwa_src0_sel, in.sdwa_src1_sel);
                 return false;
@@ -9741,6 +9817,9 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                     const bool st_dim = i.mimg_dim <= 2u || i.mimg_dim == 4u || i.mimg_dim == 5u;
                     if (i.opcode == 0x00u) return st_dim || i.mimg_dim == 6u || i.mimg_dim == 7u;   // image_load (+ 2D_MSAA[_ARRAY])
                     if (i.opcode == 0x08u) return st_dim;                       // image_store (no per-sample MSAA store)
+                    if (i.opcode == 0x0fu)                                     // image_atomic_swap R32_UINT 2D
+                        return i.mimg_dim == 1u && i.mimg_dmask == 1u &&
+                               !i.mimg_unorm && i.len_dwords == 2u;
                     if (i.opcode == 0x0eu) return i.mimg_dim <= 2u;             // image_get_resinfo 1D/2D/3D
                     // sample*: 2D (NSA ok); plus implicit-LOD image_sample (0x20) / LOD-0 image_sample_lz
                     // (0x27) from a 3D texture; sample_b (0x25) and gather4_lz (0x47) are 2D. 2D_ARRAY (dim 5)
