@@ -826,6 +826,23 @@ int main() {
               decode_buffer_descriptor(patched_raw_uses[0].v4.data()).num_records == 1,
           "Astro patched direct raw-MUBUF V# resolves by its exact consuming pc");
 
+    // Astro Bot world-map PS consumes its direct s[16:19] V# with the raw x3 store at pc109.
+    // Discovery must publish the binding before the recompiler can emit the otherwise-supported store.
+    const uint32_t astro_store_x3[] = {
+        0xE07C2000u, 0x8004030Au,   // buffer_store_dwordx3 v[3:5], v10, s[16:19], 0 idxen
+        0xBF810000u,
+    };
+    std::vector<SrtUse> astro_store_x3_uses;
+    resolve_dynamic_fetch(astro_store_x3, std::size(astro_store_x3),
+                          patched_raw_seed, std::size(patched_raw_seed), 8,
+                          &astro_store_x3_uses);
+    CHECK(astro_store_x3_uses.size() == 1 && astro_store_x3_uses[0].kind == 1 &&
+              astro_store_x3_uses[0].use_pc == 0 &&
+              astro_store_x3_uses[0].key == 0xFFFFFFFFu &&
+              astro_store_x3_uses[0].v4[0] == patched_raw_seed[8] &&
+              astro_store_x3_uses[0].v4[1] == patched_raw_seed[9],
+          "Astro buffer_store_dwordx3 publishes its direct V# by exact consumer pc");
+
     // #636: Dead Cells' format-copy compute places its declared source V# at s0 and its otherwise
     // undeclared destination V# at s4. Resource discovery must follow the two actual MUBUF uses:
     // the load arrives through DynFetch and the store through a pc-keyed SrtUse. No all-SGPR scan is

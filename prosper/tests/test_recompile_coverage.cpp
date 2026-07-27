@@ -175,6 +175,19 @@ int main() {
           mtbuf_tfe.unsupported == 1 && mtbuf_tfe.first_bad_op == 0u,
           "MTBUF TFE remains explicit unsupported coverage until its status write is modeled");
 
+    // Astro Bot world-map PS ends with this exact raw x3 store. The table-less coverage shell uses
+    // its conventional binding 2, so accepting the instruction must classify it as handled ALU/memory
+    // rather than the shader's sole unsupported opcode.
+    const uint32_t astro_store_x3[] = {
+        0xE07C2000u, 0x8004030Au, 0xBF810000u,
+    };
+    RecompileCoverage x3_store = recompile_coverage(
+        astro_store_x3, std::size(astro_store_x3));
+    CHECK(x3_store.total == 1 && x3_store.alu == 1 &&
+              x3_store.table_dependent == 0 && x3_store.unsupported == 0 &&
+              x3_store.first_bad_fmt < 0,
+          "Astro buffer_store_dwordx3 is covered as a supported raw memory operation");
+
     // The common compiler spill/fill form uses a fixed byte offset and one unmodified scalar base.
     // The host shader maps that private storage to one per-invocation Function array.
     const uint32_t scratch_static[] = {
