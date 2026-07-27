@@ -78,8 +78,50 @@ struct PixelInputMapping {
         return mask & valid_mask;
     }
 
+    uint32_t ambiguous_passthrough_mask() const {
+        uint32_t mask = 0;
+        for (uint32_t input = 0; input < controls.size(); ++input) {
+            if (!(valid_mask & (1u << input))) continue;
+            const uint32_t control = controls[input];
+            if ((control & 0x420u) == 0x420u && (control & 0x1fu) == 0u)
+                mask |= 1u << input;
+        }
+        return mask;
+    }
+
+    void merge_compatible_passthrough(
+            const std::array<uint32_t, 32>& metadata_controls,
+            uint32_t metadata_valid_mask, uint32_t metadata_passthrough_mask) {
+        uint32_t candidates = valid_mask & metadata_valid_mask & metadata_passthrough_mask;
+        for (uint32_t input = 0; input < controls.size(); ++input) {
+            const uint32_t bit = 1u << input;
+            if (!(candidates & bit)) continue;
+            // OFFSET and FLAT_SHADE must describe the same producer PARAM. Ignore unrelated control
+            // fields so metadata can disambiguate custom PARAM0 without overriding register wiring.
+            if ((controls[input] & 0x43fu) == (metadata_controls[input] & 0x43fu))
+                passthrough_mask |= bit;
+        }
+    }
+
     bool operator==(const PixelInputMapping&) const = default;
 };
+
+// Reconcile the register-backed linkage used by a live draw with richer AGC shader metadata. The
+// registers remain authoritative whenever present; metadata only supplies the custom PARAM0 bit that
+// SPI_PS_INPUT_CNTL cannot distinguish from a flat default input.
+inline PixelInputMapping resolve_pixel_input_mapping(
+        PixelInputMapping registered, const PixelInputMapping& metadata,
+        bool* resolved_from_metadata = nullptr) {
+    const bool use_metadata = !registered.valid_mask && metadata.valid_mask;
+    if (use_metadata) {
+        registered = metadata;
+    } else if (metadata.passthrough_mask) {
+        registered.merge_compatible_passthrough(
+            metadata.controls, metadata.valid_mask, metadata.passthrough_mask);
+    }
+    if (resolved_from_metadata) *resolved_from_metadata = use_metadata;
+    return registered;
+}
 
 // Fixed-function per-pixel VGPR loads selected by SPI_PS_INPUT_ENA / SPI_PS_INPUT_ADDR. ENA says
 // which values hardware computes and loads; ADDR also reserves VGPR slots for disabled values, so it

@@ -773,18 +773,18 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     pixel_inputs.controls = rs.ps_input_cntl;
     pixel_inputs.valid_mask = rs.ps_input_cntl_valid_mask;
     bool interpolants_from_metadata = false;
-    if (!pixel_inputs.valid_mask) {
+    if (!pixel_inputs.valid_mask || pixel_inputs.ambiguous_passthrough_mask()) {
         const auto* producer = static_cast<const AgcShaderHeader*>(
             prosper_agc_shader_header_for_code(vs_program_addr));
         const auto* pixel = static_cast<const AgcShaderHeader*>(
             prosper_agc_shader_header_for_code(rs.ps_addr));
         const AgcPixelInputControls derived = derive_agc_pixel_input_controls(producer, pixel);
-        if (derived.valid_mask) {
-            pixel_inputs.controls = derived.controls;
-            pixel_inputs.valid_mask = derived.valid_mask;
-            pixel_inputs.passthrough_mask = derived.passthrough_mask;
-            interpolants_from_metadata = true;
-        }
+        PixelInputMapping metadata_inputs;
+        metadata_inputs.controls = derived.controls;
+        metadata_inputs.valid_mask = derived.valid_mask;
+        metadata_inputs.passthrough_mask = derived.passthrough_mask;
+        pixel_inputs = resolve_pixel_input_mapping(
+            pixel_inputs, metadata_inputs, &interpolants_from_metadata);
     }
     if (getenv("PROSPER_INTERPLOG")) {
         fprintf(stderr, "[interp] es=0x%llx ps=0x%llx source=%s valid=%08x ena=%08x addr=%08x",

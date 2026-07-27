@@ -244,25 +244,26 @@ int main() {
             {0x0000000fu}, {0x00000110u}, {0x00000211u}, {0x00000312u},
         };
         AgcShaderSemantic pixel_in[] = {
-            {0x0000000fu}, {0x00000012u}, {0x01000012u},
+            {0x0000000fu}, {0x00000012u}, {0x01000012u}, {0x0100000fu},
         };
         AgcShaderHeader producer{};
         producer.output_semantics = producer_out;
         producer.num_output_semantics = 4;
         AgcShaderHeader pixel{};
         pixel.input_semantics = pixel_in;
-        pixel.num_input_semantics = 3;
+        pixel.num_input_semantics = 4;
         AgcPixelInputControls mapping = derive_agc_pixel_input_controls(&producer, &pixel);
-        CHECK(mapping.valid_mask == 0x7u && mapping.controls[0] == 0u &&
+        CHECK(mapping.valid_mask == 0xfu && mapping.controls[0] == 0u &&
                   mapping.controls[1] == 3u && mapping.controls[2] == 0x423u &&
-                  mapping.passthrough_mask == 0x4u,
-              "semantic wiring distinguishes ordinary and custom PARAM3 inputs");
+                  mapping.controls[3] == 0x420u && mapping.passthrough_mask == 0xcu,
+              "semantic wiring distinguishes ordinary and custom PARAM3/PARAM0 inputs");
 
         producer.output_semantics = nullptr;
         producer.num_output_semantics = 0;
         mapping = derive_agc_pixel_input_controls(&producer, &pixel);
-        CHECK(mapping.valid_mask == 0x7u && mapping.controls[0] == 0x20u &&
+        CHECK(mapping.valid_mask == 0xfu && mapping.controls[0] == 0x20u &&
                   mapping.controls[1] == 0x20u && mapping.controls[2] == 0x20u &&
+                  mapping.controls[3] == 0x20u &&
                   mapping.passthrough_mask == 0u,
               "procedural producer with no PARAM exports materializes PS input defaults");
 
