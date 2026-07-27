@@ -7628,7 +7628,7 @@ bool emit_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
     const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
     bool allow_exec_update, bool allow_smem,
-    const std::function<bool(const Rdna2Inst&)>& exp_fn,
+    const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
     const uint32_t* code, size_t dwords) {
     const bool graphics = b.is_fragment || b.is_vertex;
     if ((!b.is_compute && !graphics) || ins.empty()) return false;
@@ -8198,7 +8198,7 @@ bool emit_cfg_state_machine(
                     break;
                 }
                 if (in.fmt == Rdna2Format::EXP) {
-                    if (!exp_fn(in)) return false;
+                    if (!exp_fn(state, in)) return false;
                     continue;
                 }
                 bool ok = true;
@@ -8681,7 +8681,7 @@ bool emit_cfg_state_machine(
 bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
                bool allow_exec_update, bool allow_smem,
-               const std::function<bool(const Rdna2Inst&)>& exp_fn,
+               const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
                const uint32_t* code = nullptr, size_t dwords = 0) {   // raw stream (forward-if target check)
     rs.max_vgpr = std::max(rs.max_vgpr, shader_max_vgpr(ins));
     // Fold PC-relative embedded-table loads (s_getpc_b64-built V#s) before the walk — emit_alu's
@@ -8704,7 +8704,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (in.is_end || in.pc >= pc_hi) break;
             if (in.pc < pc_lo) continue;
             if (dead_masks.count(in.pc)) continue;
-            if (in.fmt == Rdna2Format::EXP) { if (!exp_fn(in)) return false; continue; }
+            if (in.fmt == Rdna2Format::EXP) { if (!exp_fn(rs, in)) return false; continue; }
             bool ok = true;
             const bool handled = emit_alu(
                 b, rs, in, ok, allow_exec_update, &effective_safe, allow_smem, rt, wave_ok);
@@ -9510,7 +9510,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     for (uint32_t k = 0; k < num_inputs; k++) rs.vreg[(int)k] = b.load_input(k);
     // Compute kernels have no EXP output; reject if one appears.
     if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/true,
-                   [](const Rdna2Inst&){ return false; }, code, dwords)) return {};
+                   [](RegState&, const Rdna2Inst&){ return false; }, code, dwords)) return {};
     auto it = rs.vreg.find((int)out_vgpr);
     uint32_t outbits = it == rs.vreg.end() ? b.uconst(0) : it->second;
     // If EXEC is still narrowed (a v_cmpx with no restore), masked-off lanes keep the output slot's prior
@@ -9589,7 +9589,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);
     if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true,
-                   /*allow_smem*/true, [](const Rdna2Inst&) { return false; }, code, dwords))
+                   /*allow_smem*/true, [](RegState&, const Rdna2Inst&) { return false; }, code, dwords))
         return {};
     // The entry guard is intentionally divergent only in the final partial workgroup. Vulkan requires
     // every workgroup invocation to participate uniformly in OpControlBarrier, including barriers the
@@ -9926,26 +9926,30 @@ static std::vector<uint32_t> recompile_fragment_impl(
     // NOT added for the vertex/compute shells (their scc branches are real uniform-ifs / NGG culling).
     for (uint32_t pc : mask_test_branches(ins)) safe_branches.insert(pc);
     std::array<bool, 2> exported{};
-    auto exp_fn = [&](const Rdna2Inst& in) -> bool {         // EXP MRT0/MRT1 -> matching output
+    auto exp_fn = [&](RegState& state, const Rdna2Inst& in) -> bool { // EXP MRT0/MRT1 -> matching output
         // An export while EXEC is narrowed (lanes killed by an alpha test / v_cmpx and not restored to
         // all-on) must not write the inactive lanes. Lower it to a real fragment discard: OpKill the lanes
         // whose EXEC bit is false, then export from the survivors under full EXEC. This is exactly the
         // alpha-tested-sprite shape (image_sample -> v_cmp alpha<ref -> s_andn2 saved,saved,vcc -> s_wqm
         // exec,saved -> shade -> export): the surviving lanes are the ones that passed the test. (When EXEC
         // was never narrowed this is a no-op — the common sRGB/tonemap restore-then-export path.)
-        if (rs.exec_narrowed) { b.discard_unless(rs.exec); rs.exec = b.btrue(); rs.exec_narrowed = false; }
+        if (state.exec_narrowed) {
+            b.discard_unless(state.exec);
+            state.exec = b.btrue();
+            state.exec_narrowed = false;
+        }
         // MRTZ (target 8): the shader-exported depth. EN bit 0 enables the Z VGPR (compilers emit
         // EN=0x1); COMPR depth is unmodeled. Previously this export was silently DROPPED, leaving
         // fixed-function interpolated Z where hardware uses the shader's value (#883).
         if (in.exp_target == 8) {
             if (in.exp_compr || !(in.exp_en & 1u)) return false;
             bool eok = true;
-            const uint32_t z = operand_bits(b, rs, in, in.src[0], &eok);
+            const uint32_t z = operand_bits(b, state, in, in.src[0], &eok);
             if (!eok) return false;
             b.export_depth(z);
             return true;
         }
-        if (in.exp_target < exported.size() && !exported[in.exp_target]) {
+        if (in.exp_target < exported.size()) {
             // EN (Table 56) selects which VSRC channels the export sends; hardware does not update
             // disabled components. The executor maps this mask to Vulkan colorWriteMask, so the SPIR-V
             // value in a disabled channel is irrelevant and must not force a read of a stale VGPR.
@@ -9955,9 +9959,9 @@ static std::vector<uint32_t> recompile_fragment_impl(
                 // COMPR: the 4 channels are two f16x2 pairs — src[0] holds (r,g), src[1] holds (b,a).
                 // Unpack each half to a float and reassemble the vec4 (the pkrtz'd tonemap/sRGB output).
                 const uint32_t p0 = (in.exp_en & 0x3u)
-                    ? operand_bits(b, rs, in, in.src[0], &eok) : b.uconst(0);
+                    ? operand_bits(b, state, in, in.src[0], &eok) : b.uconst(0);
                 const uint32_t p1 = (in.exp_en & 0xCu)
-                    ? operand_bits(b, rs, in, in.src[1], &eok) : b.uconst(0);
+                    ? operand_bits(b, state, in, in.src[1], &eok) : b.uconst(0);
                 b.export_color(in.exp_target,
                                (in.exp_en & 0x1u) ? b.unpack_half(p0, 0) : b.uconst(0),
                                (in.exp_en & 0x2u) ? b.unpack_half(p0, 1) : b.uconst(0),
@@ -9965,10 +9969,10 @@ static std::vector<uint32_t> recompile_fragment_impl(
                                (in.exp_en & 0x8u) ? b.unpack_half(p1, 1) : b.uconst(0));
             } else {
                 b.export_color(in.exp_target,
-                               (in.exp_en & 0x1u) ? operand_bits(b, rs, in, in.src[0], &eok) : b.uconst(0),
-                               (in.exp_en & 0x2u) ? operand_bits(b, rs, in, in.src[1], &eok) : b.uconst(0),
-                               (in.exp_en & 0x4u) ? operand_bits(b, rs, in, in.src[2], &eok) : b.uconst(0),
-                               (in.exp_en & 0x8u) ? operand_bits(b, rs, in, in.src[3], &eok) : b.uconst(0));
+                               (in.exp_en & 0x1u) ? operand_bits(b, state, in, in.src[0], &eok) : b.uconst(0),
+                               (in.exp_en & 0x2u) ? operand_bits(b, state, in, in.src[1], &eok) : b.uconst(0),
+                               (in.exp_en & 0x4u) ? operand_bits(b, state, in, in.src[2], &eok) : b.uconst(0),
+                               (in.exp_en & 0x8u) ? operand_bits(b, state, in, in.src[3], &eok) : b.uconst(0));
             }
             if (!eok) return false;
             exported[in.exp_target] = true;
@@ -10299,7 +10303,7 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
         }
     }
     bool exported = false;
-    auto exp_fn = [&](const Rdna2Inst& in) -> bool {         // EXP POS0..3 -> gl_Position; PARAM -> varyings
+    auto exp_fn = [&](RegState& state, const Rdna2Inst& in) -> bool { // EXP POS0..3 -> gl_Position; PARAM -> varyings
         bool eok = true;   // a Special (wave-mask) source has no data value — reject, don't export 0 (#134)
         // COMPR pos/param exports carry two packed f16x2 pairs, not four f32 fields — reading the
         // VSRCs as full floats would pass packed-half bit patterns as x/y and stale registers as
@@ -10318,7 +10322,7 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
         // (fail-visibly) rather than export possibly-inactive-lane values.
         const bool terminal_ngg_output = ngg_output_gate_begin != UINT32_MAX &&
             in.pc > ngg_output_gate_begin && in.pc < ngg_output_gate_end;
-        if (rs.exec_narrowed && !terminal_ngg_output && (in.exp_target >= 32 ||
+        if (state.exec_narrowed && !terminal_ngg_output && (in.exp_target >= 32 ||
             (in.exp_target >= 12 && in.exp_target <= 16))) {
             if (getenv("PROSPER_DBG"))
                 fprintf(stderr,
@@ -10326,7 +10330,7 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
                         in.pc, in.exp_target);
             return false;
         }
-        if (in.exp_target == 12 && !exported) {
+        if (in.exp_target == 12) {
             // POS0 is the mandatory x/y/z/w position vector. POS1..POS4 carry ancillary position
             // data (clip/cull distances, point size, viewport/layer selection according to the
             // programmed position format) and must never be mistaken for gl_Position merely because
@@ -10341,20 +10345,20 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
                             in.pc, in.exp_en);
                 return false;
             }
-            uint32_t x = operand_bits(b, rs, in, in.src[0], &eok);
-            uint32_t y = operand_bits(b, rs, in, in.src[1], &eok);
-            uint32_t z = operand_bits(b, rs, in, in.src[2], &eok);
-            uint32_t w = operand_bits(b, rs, in, in.src[3], &eok);
-            if (terminal_ngg_output && rs.exec_narrowed) {
+            uint32_t x = operand_bits(b, state, in, in.src[0], &eok);
+            uint32_t y = operand_bits(b, state, in, in.src[1], &eok);
+            uint32_t z = operand_bits(b, state, in, in.src[2], &eok);
+            uint32_t w = operand_bits(b, state, in, in.src[3], &eok);
+            if (terminal_ngg_output && state.exec_narrowed) {
                 // The exact compacted-output wrapper emits a contiguous prefix of complete
                 // primitives. Map every inactive suffix invocation to one identical clip point;
                 // primitives assembled solely from that suffix are therefore degenerate instead of
                 // accidentally reusing the last active vertex. Keep the real values on the true path.
                 const uint32_t zero = b.uconst(0);
-                x = b.sel(rs.exec, x, zero);
-                y = b.sel(rs.exec, y, zero);
-                z = b.sel(rs.exec, z, zero);
-                w = b.sel(rs.exec, w, b.uconst(fbits(1.0f)));
+                x = b.sel(state.exec, x, zero);
+                y = b.sel(state.exec, y, zero);
+                z = b.sel(state.exec, z, zero);
+                w = b.sel(state.exec, w, b.uconst(fbits(1.0f)));
             }
             b.export_position(x, y, z, w);
             exported = true;
@@ -10363,14 +10367,14 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
             // EN gates which channels the export sends (vec2/vec3 varyings use EN=0x3/0x7):
             // hardware leaves disabled channels unwritten (undefined for the PS). Substitute a
             // deterministic 0.0 for them instead of exporting stale VGPR data.
-            uint32_t x = (in.exp_en & 1u) ? operand_bits(b, rs, in, in.src[0], &eok) : b.uconst(0);
-            uint32_t y = (in.exp_en & 2u) ? operand_bits(b, rs, in, in.src[1], &eok) : b.uconst(0);
-            uint32_t z = (in.exp_en & 4u) ? operand_bits(b, rs, in, in.src[2], &eok) : b.uconst(0);
-            uint32_t w = (in.exp_en & 8u) ? operand_bits(b, rs, in, in.src[3], &eok) : b.uconst(0);
-            if (terminal_ngg_output && rs.exec_narrowed) {
+            uint32_t x = (in.exp_en & 1u) ? operand_bits(b, state, in, in.src[0], &eok) : b.uconst(0);
+            uint32_t y = (in.exp_en & 2u) ? operand_bits(b, state, in, in.src[1], &eok) : b.uconst(0);
+            uint32_t z = (in.exp_en & 4u) ? operand_bits(b, state, in, in.src[2], &eok) : b.uconst(0);
+            uint32_t w = (in.exp_en & 8u) ? operand_bits(b, state, in, in.src[3], &eok) : b.uconst(0);
+            if (terminal_ngg_output && state.exec_narrowed) {
                 const uint32_t zero = b.uconst(0);
-                x = b.sel(rs.exec, x, zero); y = b.sel(rs.exec, y, zero);
-                z = b.sel(rs.exec, z, zero); w = b.sel(rs.exec, w, zero);
+                x = b.sel(state.exec, x, zero); y = b.sel(state.exec, y, zero);
+                z = b.sel(state.exec, z, zero); w = b.sel(state.exec, w, zero);
             }
             if (!pixel_inputs || source >= 32 || !(pixel_inputs->valid_mask & (1u << source)))
                 b.export_param(source, x, y, z, w);           // absent control retains identity wiring
