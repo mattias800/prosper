@@ -666,9 +666,10 @@ int main() {
         }
     }
 
-    // Astro Bot's exact IMAGE_ATOMIC_SWAP form. Every fragment exchanges the R32_UINT word with the
-    // same 1.0f bit pattern, so GLC's returned pre-operation value remains 1.0f and exports GREEN.
-    // This executes the translated OpImageTexelPointer/OpAtomicExchange against a real Vulkan image.
+    // Astro Bot's exact IMAGE_ATOMIC_SWAP form. Use a one-pixel target so exactly one fragment
+    // exchanges the R32_UINT word. The callback is the graphics->guest synchronization boundary:
+    // call one returns 0.5 and writes 1.0 to guest-visible storage; call two must then return that 1.0.
+    // This proves both real Vulkan execution and visibility across separate backend calls/CPU memory.
     {
         const uint32_t atomic_ps[] = {
             0x7e000280u,                         // v0 = x = 0
@@ -689,23 +690,43 @@ int main() {
         CHECK(!atomic_frag.empty() && atomic_frag[0] == 0x07230203u,
               "recompiled Astro image_atomic_swap fragment shader");
         if (!atomic_frag.empty()) {
-            const uint32_t initial_word = 0x3f800000u;
+            uint32_t storage_word = 0x3f000000u;   // initial 0.5f bits
             prosper::test::FrameResource resource;
             resource.binding = 4; resource.set = 1;
-            resource.tex_rgba = reinterpret_cast<const uint8_t*>(&initial_word);
+            resource.tex_rgba = reinterpret_cast<const uint8_t*>(&storage_word);
             resource.tw = 1; resource.th = 1;
             resource.texture_format = VK_FORMAT_R32_UINT;
             resource.is_storage_image = true;
+            resource.storage_image_writeback =
+                [&](const uint8_t* pixels, size_t bytes) {
+                    if (bytes == sizeof(storage_word))
+                        std::memcpy(&storage_word, pixels, sizeof(storage_word));
+                };
             prosper::test::BackendDraw draw;
             draw.vs = vert; draw.fs = atomic_frag; draw.R = {resource}; draw.vcount = 3;
-            const std::vector<uint8_t> pixels =
-                prosper::test::render_draws_rgba({draw}, W, H);
-            const uint8_t* center = pixels.size() == static_cast<size_t>(W) * H * 4
-                ? &pixels[(static_cast<size_t>(H / 2) * W + W / 2) * 4] : nullptr;
-            printf("  image_atomic_swap center=(%u,%u,%u)\n",
-                   center ? center[0] : 0, center ? center[1] : 0, center ? center[2] : 0);
-            CHECK(center && center[1] > 0x80 && center[0] < 0x40 && center[2] < 0x40,
-                  "R32_UINT image atomic executes and returns the pre-operation value to VDATA");
+            prosper::test::BackendSubmissionBatch storage_batch;
+            const std::vector<uint8_t> first =
+                prosper::test::render_draws_rgba(
+                    {draw}, 1, 1, nullptr, nullptr, false, nullptr,
+                    nullptr, nullptr, nullptr, &storage_batch, false);
+            const uint8_t* first_pixel = first.size() == 4 ? first.data() : nullptr;
+            printf("  image_atomic_swap first=(%u,%u,%u) guest=%08x\n",
+                   first_pixel ? first_pixel[0] : 0, first_pixel ? first_pixel[1] : 0,
+                   first_pixel ? first_pixel[2] : 0, storage_word);
+            CHECK(first_pixel && first_pixel[1] > 0x60 && first_pixel[1] < 0xa0 &&
+                      first_pixel[0] < 0x40 && first_pixel[2] < 0x40,
+                  "R32_UINT image atomic returns the pre-operation 0.5 value to VDATA");
+            CHECK(storage_word == 0x3f800000u,
+                  "graphics storage-image atomic writes back exact texels to CPU/guest memory");
+            CHECK(!storage_batch.pending(),
+                  "storage-image writeback flushes an otherwise deferred live-render batch");
+            draw.R[0].tex_rgba = reinterpret_cast<const uint8_t*>(&storage_word);
+            const std::vector<uint8_t> second =
+                prosper::test::render_draws_rgba({draw}, 1, 1);
+            const uint8_t* second_pixel = second.size() == 4 ? second.data() : nullptr;
+            CHECK(second_pixel && second_pixel[1] > 0xc0 &&
+                      second_pixel[0] < 0x40 && second_pixel[2] < 0x40,
+                  "a later graphics call observes the prior storage-image writeback");
         }
     }
 
