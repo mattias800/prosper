@@ -137,6 +137,7 @@ int main() {
         { P::SPI_PS_INPUT_CNTL_0, 0x00000401u }, // PS input 0 <- PARAM1, flat
         { P::SPI_PS_INPUT_CNTL_0 + 1u, 0x00000320u }, // PS input 1 <- DEFAULT_VAL 1111
         { P::SPI_PS_INPUT_ENA, 0x00000303u }, // perspective sample/center + float position X/Y
+        { P::SPI_PS_IN_CONTROL, 1u << P::SPI_PS_IN_CONTROL_PS_W32_EN_SHIFT },
         { P::SPI_PS_INPUT_ADDR, 0x000003CFu }, // reserve disabled centroid/pull-model slots
         // #531: effective scissor is the intersection of screen/window/generic/viewport. Window and
         // viewport apply (-10,+5); generic disables the offset. Right/bottom are exclusive.
@@ -182,6 +183,7 @@ int main() {
           "programmed SPI_PS_INPUT_CNTL words and presence mask are retained");
     CHECK(rs.ps_input_ena == 0x00000303u && rs.ps_input_addr == 0x000003CFu,
           "SPI_PS_INPUT_ENA/ADDR system-value VGPR controls are retained");
+    CHECK(rs.ps_wave32, "SPI_PS_IN_CONTROL.PS_W32_EN is retained as fragment wave mode");
     CHECK(rs.spi_shader_col_format == 4u && rs.sx_ps_downconvert == 5u &&
           resolve_pipeline_state(rs).spi_shader_col_format == 4u &&
           resolve_pipeline_state(rs).sx_ps_downconvert == 5u,

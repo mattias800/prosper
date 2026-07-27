@@ -343,13 +343,15 @@ std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
                                                        const ShaderResourceTable* resources = nullptr,
                                                        const PixelInputMapping* pixel_inputs = nullptr,
                                                        const PixelSystemInputMapping* system_inputs = nullptr,
-                                                       uint64_t* cache_identity = nullptr);
+                                                       uint64_t* cache_identity = nullptr,
+                                                       bool fragment_wave32 = false);
 SharedShaderWords recompile_graphics_shader_cached_shared(
     ShaderProgramStage stage, const uint32_t* code, size_t dwords,
     const ShaderResourceTable* resources = nullptr,
     const PixelInputMapping* pixel_inputs = nullptr,
     const PixelSystemInputMapping* system_inputs = nullptr,
-    uint64_t* cache_identity = nullptr);
+    uint64_t* cache_identity = nullptr,
+    bool fragment_wave32 = false);
 // Compute uses the same bounded content-addressed cache as graphics. Launch geometry that changes
 // generated SPIR-V participates in the key; per-dispatch push-constant values deliberately do not.
 std::vector<uint32_t> recompile_compute_shader_cached(
@@ -812,14 +814,16 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity);
         fs_shared = recompile_graphics_shader_cached_shared(
             ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
-            max_shader_dwords, prt.get(), nullptr, system_input_ptr, &fs_identity);
+            max_shader_dwords, prt.get(), nullptr, system_input_ptr, &fs_identity,
+            rs.ps_wave32);
     } else {
         vs = recompile_graphics_shader_cached(
             ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
             max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity);
         fs = recompile_graphics_shader_cached(
             ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
-            max_shader_dwords, prt.get(), nullptr, system_input_ptr, &fs_identity);
+            max_shader_dwords, prt.get(), nullptr, system_input_ptr, &fs_identity,
+            rs.ps_wave32);
     }
     // CB_COLOR_CONTROL.DCC_DECOMPRESS interprets the bound AGC metadata helper, rather than its
     // ordinary fragment-color export. The operation bits can remain folded into a later graphics

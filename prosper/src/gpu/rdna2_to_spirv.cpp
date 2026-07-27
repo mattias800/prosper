@@ -9889,7 +9889,7 @@ static std::vector<uint32_t> recompile_fragment_impl(
         const PixelSystemInputMapping* system_inputs,
         uint32_t pcrel_dispatch_target,
         const FragmentInterpolationLayout* interpolation,
-        bool allow_test_wave32) {
+        bool wave32) {
     std::vector<Rdna2Inst> ins;
     const size_t program_dwords = rdna2_walk(code, dwords, ins);
     if (pcrel_dispatch_target != UINT32_MAX) {
@@ -9942,10 +9942,10 @@ static std::vector<uint32_t> recompile_fragment_impl(
     }
     SpirvCompute b;
     b.begin_fragment(rt, color_mask);
-    // Graphics wave mode is not yet plumbed from the stage registers. Keep low-half EXEC/VCC mask
-    // semantics restricted to the complete captured Astro material shader that demonstrated the
-    // Wave32 idiom. Arbitrary graphics shaders retain the previous fail-visible rejection.
-    b.allow_b32_masks = allow_test_wave32 ||
+    // SPI_PS_IN_CONTROL.PS_W32_EN proves that EXEC_HI/VCC_HI are unused and the low-half mask
+    // operations below represent the complete wave. Keep the older byte-exact captured exception
+    // until every replay/capture producer carries the stage register into this entry point.
+    b.allow_b32_masks = wave32 ||
         (program_dwords == 3142 &&
          shader_program_hash(code, program_dwords) == 0x616dd4c0b241fbb1ull);
     // Fragment I/O value tap (PROSPER_FS_TAP=draw:pc): redirect the MRT0 colour export to the intermediate
@@ -10082,9 +10082,10 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          const ShaderResourceTable* rt,
                                          const PixelSystemInputMapping* system_inputs,
                                          uint32_t pcrel_dispatch_target,
-                                         const FragmentInterpolationLayout* interpolation) {
+                                         const FragmentInterpolationLayout* interpolation,
+                                         bool wave32) {
     return recompile_fragment_impl(code, dwords, rt, system_inputs,
-                                   pcrel_dispatch_target, interpolation, false);
+                                   pcrel_dispatch_target, interpolation, wave32);
 }
 
 std::vector<uint32_t> recompile_fragment_wave32_for_test(

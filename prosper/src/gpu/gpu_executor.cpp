@@ -160,6 +160,7 @@ struct ShaderCompileKey {
     PixelInputMapping pixel_inputs{};
     bool has_system_inputs = false;
     PixelSystemInputMapping system_inputs{};
+    bool fragment_wave32 = false;
     bool has_pcrel_dispatch = false;
     uint32_t pcrel_dispatch_target = UINT32_MAX;
     // Compute modules also depend on launch ABI shape. User SGPR VALUES are push constants and stay
@@ -194,6 +195,7 @@ struct ShaderCompileKey {
                pixel_inputs == other.pixel_inputs &&
                has_system_inputs == other.has_system_inputs &&
                system_inputs == other.system_inputs &&
+               fragment_wave32 == other.fragment_wave32 &&
                has_pcrel_dispatch == other.has_pcrel_dispatch &&
                pcrel_dispatch_target == other.pcrel_dispatch_target &&
                has_compute_config == other.has_compute_config &&
@@ -252,6 +254,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, key.system_inputs.ena);
             hash = hash_mix(hash, key.system_inputs.addr);
         }
+        hash = hash_mix(hash, key.fragment_wave32);
         hash = hash_mix(hash, key.has_pcrel_dispatch);
         if (key.has_pcrel_dispatch) hash = hash_mix(hash, key.pcrel_dispatch_target);
         hash = hash_mix(hash, key.has_compute_config);
@@ -827,7 +830,8 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                                          const ShaderResourceTable* resources,
                                          const PixelInputMapping* pixel_inputs,
                                          const PixelSystemInputMapping* system_inputs,
-                                         const ComputeShaderConfig* compute_config = nullptr) {
+                                         const ComputeShaderConfig* compute_config = nullptr,
+                                         bool fragment_wave32 = false) {
     ShaderCompileKey key;
     key.stage = stage;
     key.has_resource_table = resources != nullptr;
@@ -836,6 +840,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
     if (key.has_pixel_inputs) key.pixel_inputs = *pixel_inputs;
     key.has_system_inputs = stage == ShaderProgramStage::Fragment && system_inputs != nullptr;
     if (key.has_system_inputs) key.system_inputs = *system_inputs;
+    key.fragment_wave32 = stage == ShaderProgramStage::Fragment && fragment_wave32;
     key.has_compute_config = stage == ShaderProgramStage::Compute && compute_config;
     if (key.has_compute_config) {
         key.compute_user_sgpr_count = static_cast<uint32_t>(compute_config->user_sgprs.size());
@@ -939,7 +944,8 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
     if (stage == ShaderProgramStage::Fragment)
         return recompile_fragment(code, code_size, resources,
                                   key.has_system_inputs ? &key.system_inputs : nullptr,
-                                  key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX);
+                                  key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX,
+                                  nullptr, key.fragment_wave32);
     return {};
 }
 
@@ -1067,10 +1073,11 @@ FragmentInterpolationLayout fragment_interpolation_layout_cached(
 SharedShaderWords recompile_graphics_shader_cached_shared(
         ShaderProgramStage stage, const uint32_t* code, size_t dwords,
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
-        const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity) {
+        const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity,
+        bool fragment_wave32) {
     if (cache_identity) *cache_identity = 0;
     ShaderCompileKey key = make_shader_compile_key(stage, code, dwords, resources, pixel_inputs,
-                                                   system_inputs);
+                                                   system_inputs, nullptr, fragment_wave32);
     if (getenv("PROSPER_NO_SHADER_CACHE")) {
         auto& cache = shader_cache();
         {
@@ -1131,9 +1138,11 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
 std::vector<uint32_t> recompile_graphics_shader_cached(
         ShaderProgramStage stage, const uint32_t* code, size_t dwords,
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
-        const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity) {
+        const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity,
+        bool fragment_wave32) {
     SharedShaderWords words = recompile_graphics_shader_cached_shared(
-        stage, code, dwords, resources, pixel_inputs, system_inputs, cache_identity);
+        stage, code, dwords, resources, pixel_inputs, system_inputs, cache_identity,
+        fragment_wave32);
     return words ? *words : std::vector<uint32_t>{};
 }
 
