@@ -268,12 +268,16 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   ```
 - **Verification is agentic-first / programmatic** (`docs/VERIFICATION.md`): ctest exit code is truth;
   shaders are `spirv-val`-gated; rendered frames are asserted by pixels, hashes, or routed content
-  metrics. Snapshot coverage is **mandatory before every release**: run the full local-only matrix with
-  `python3 tools/snapshot/snapshot.py check` against the release candidate. It is not a blanket gate for
-  opening a PR. For PRs, the author decides whether affected-title guards or the full matrix are
-  appropriate for the change and iteration stage, unless the task explicitly requires them. Changes
-  that can affect rendered output (recompiler, AGC decode, render state, detile, executor/present)
-  should consider snapshot coverage as a strong relevant check and record any runs in the PR. Gameplay
+  metrics. Snapshots are a **release-time regression inventory**, not a day-to-day development or merge
+  gate. Before every release, run the full local-only matrix with
+  `python3 tools/snapshot/snapshot.py check` against the release candidate and review every result.
+  During normal development, including long stretches of render work, authors may skip snapshots
+  entirely or run only useful focused guards; the PR author decides, unless the task explicitly requires
+  a run. Snapshot results do not define whether master or an individual PR is acceptable: either may
+  regress a guarded title, and a correct fix may even require an intentional cross-title tradeoff. The
+  release process is where detected regressions are
+  fixed or explicitly accepted and documented before publishing artifacts. Record any snapshots that
+  were run in the PR, but do not delay routine iteration merely to keep the whole matrix green. Gameplay
   guards inspect multiple frames in route-specific windows and use SSIM over compact luminance
   signatures from several reviewed states, looking for major collapse without rejecting subtle pixel improvements.
   Every new or materially changed baseline requires `snapshot.py verify`,
