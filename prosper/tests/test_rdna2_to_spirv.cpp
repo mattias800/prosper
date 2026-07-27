@@ -133,6 +133,31 @@ int main() {
     printf("  kernel4 mismatches=%u (out[60]=%g expect=%g)\n", bad4, got4.size()==N?got4[60]:-1, exp4[60]);
     CHECK(got4.size()==N && bad4==0, "recompiled kernel 4 computes ceil(median(a0,a1,a2)) correctly");
 
+    // Kernel 4b: unsigned median-of-three. Convert the float harness inputs to u32, find the
+    // median, and convert it back so all six input orderings are checked by real Vulkan execution.
+    const uint32_t code4b[] = {
+        0x7E000F00u, 0x7E020F01u, 0x7E040F02u, 0xD5590003u, 0x040A0300u,
+        0x7E000D03u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv4b = recompile_valu(code4b, std::size(code4b), 3, 0);
+    CHECK(!spv4b.empty(), "recompiled kernel 4b (v_med3_u32) -> SPIR-V");
+    std::vector<float> in4b(N * 3), exp4b(N);
+    for (uint32_t i = 0; i < N; i++) {
+        const uint32_t u0 = (i * 37u) % 211u;
+        const uint32_t u1 = (i * 83u + 17u) % 211u;
+        const uint32_t u2 = (i * 19u + 101u) % 211u;
+        in4b[i*3+0] = (float)u0; in4b[i*3+1] = (float)u1; in4b[i*3+2] = (float)u2;
+        const uint32_t mn = std::min(u0, u1), mx = std::max(u0, u1);
+        exp4b[i] = (float)std::max(mn, std::min(mx, u2));
+    }
+    std::vector<float> got4b = prosper::test::run_compute(spv4b, in4b, N, N);
+    uint32_t bad4b = 0;
+    for (uint32_t i = 0; i < N && got4b.size() == N; i++)
+        if (got4b[i] != exp4b[i]) bad4b++;
+    printf("  kernel4b mismatches=%u (out[60]=%g expect=%g)\n",
+           bad4b, got4b.size()==N ? got4b[60] : -1, exp4b[60]);
+    CHECK(got4b.size()==N && bad4b==0, "recompiled kernel 4b computes unsigned median correctly");
+
     // Kernel 5: unsigned min/max/sub/not/and. u=(uint)a; d=(max-min) & ~u0. out=(float)d.
     const uint32_t code5[] = {
         0x7E000F00u, 0x7E020F01u, 0x26040300u, 0x28060300u, 0x4C040503u, 0x7E066F00u, 0x36040702u, 0x7E000D02u, 0xBF810000u,

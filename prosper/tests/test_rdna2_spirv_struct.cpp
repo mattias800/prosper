@@ -849,6 +849,47 @@ int main() {
     }
     printf("  [ok]   complex fragment CFG exports active state from both alternate sites\n");
 
+    // The graphics CFG dispatcher must retain the fragment shell's already-proven alpha-test
+    // linearization.  This reduced Astro Bot shape prefixes the crossing-region CFG above with a
+    // survivor-mask SCC early-out.  The SCC from s_andn2_b64 is a whole-wave reduction, not an SSA
+    // scalar boolean; the per-invocation translation drops that optimization, narrows EXEC, and
+    // OpKills failed lanes at either export.  Treating the safe branch as a dispatcher terminator
+    // instead poisoned SCC and rejected the otherwise-supported material shader.
+    const uint32_t fragment_cfg_kill_dispatch[] = {
+        0xbe82047eu,                         // pc0:  s_mov_b64 s[2:3], exec
+        0x7c020300u,                         // pc1:  v_cmp_lt_f32 vcc, v0, v1
+        0x8a826a02u,                         // pc2:  s_andn2_b64 s[2:3], s[2:3], vcc
+        0xbf840012u,                         // pc3:  s_cbranch_scc0 -> pc22 (wave early-out)
+        0xbefe0a02u,                         // pc4:  s_wqm_b64 exec, s[2:3]
+        0x7e040280u,                         // pc5:  v_mov_b32 v2, 0
+        0x7e060280u,                         // pc6:  v_mov_b32 v3, 0
+        0x7e080280u,                         // pc7:  v_mov_b32 v4, 0
+        0x7e0a0280u,                         // pc8:  v_mov_b32 v5, 0
+        0x7c020300u,                         // pc9:  v_cmp_lt_f32 vcc, v0, v1
+        0xbf860003u,                         // pc10: s_cbranch_vccz -> pc14
+        0x7c020300u,                         // pc11: v_cmp_lt_f32 vcc, v0, v1
+        0xbf860002u,                         // pc12: s_cbranch_vccz -> pc15 (crossing region)
+        0x7e040281u,                         // pc13: v_mov_b32 v2, 1
+        0x7e060281u,                         // pc14: v_mov_b32 v3, 1
+        0x7c020300u,                         // pc15: v_cmp_lt_f32 vcc, v0, v1
+        0xbf860003u,                         // pc16: s_cbranch_vccz -> alternate export at pc20
+        0xf800180fu, 0x05040302u,            // pc17: exp mrt0 v2, v3, v4, v5 done vm
+        0xbf820003u,                         // pc19: s_branch -> verified tail exit at pc23
+        0xf800180fu, 0x05040302u,            // pc20: alternate exp mrt0 v2, v3, v4, v5 done vm
+        0xbf810000u,                         // pc22: s_endpgm
+        0xbf810000u,                         // pc23: branch-target s_endpgm
+    };
+    const auto fragment_cfg_kill_spv = recompile_fragment(
+        fragment_cfg_kill_dispatch, std::size(fragment_cfg_kill_dispatch));
+    if (fragment_cfg_kill_spv.empty() || !has_opcode(fragment_cfg_kill_spv, 251) ||
+        !has_opcode(fragment_cfg_kill_spv, 252) ||
+        !type_result_ids_are_nonzero(fragment_cfg_kill_spv, nullptr) ||
+        !phi_ids_are_nonzero(fragment_cfg_kill_spv)) {
+        printf("  [FAIL] complex fragment CFG lost its proven alpha-test branch linearization\n");
+        return 1;
+    }
+    printf("  [ok]   complex fragment CFG retains alpha-test discard linearization\n");
+
     // Alpha-test discard via the SCALAR-BRANCH form (not v_cmpx): compare a sampled/interpolated value,
     // ANDN2 the survivor mask into a saved EXEC copy (SCC = "any lane survives"), and s_cbranch_scc0 skips
     // the shading if NO lane survives; the block then narrows EXEC (s_wqm exec, survivors) and shades. This

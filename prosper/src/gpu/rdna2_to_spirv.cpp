@@ -5578,6 +5578,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                          b.lor(b.fcmp(Op_FUnordNotEqual, s1, s1),
                                                b.fcmp(Op_FUnordNotEqual, s2, s2)));
                 vreg[in.dst.value] = fresult(b.sel(nan_any, min3, med));
+            } else if (in.opcode == 0x159) {                          // v_med3_u32
+                // Unsigned median of three values: max(min(a,b), min(max(a,b),c)).
+                // Astro Bot uses this to clamp a material index into [0,31] before its world-map
+                // depth prepass. VERIFIED(llvm-mc gfx1030: VOP3 0x159 = v_med3_u32).
+                const uint32_t s0 = val(in.src[0]), s1 = val(in.src[1]), s2 = val(in.src[2]);
+                const uint32_t mn = b.uext2(Glsl_UMin, s0, s1);
+                const uint32_t mx = b.uext2(Glsl_UMax, s0, s1);
+                vreg[in.dst.value] = b.uext2(Glsl_UMax, mn, b.uext2(Glsl_UMin, mx, s2));
             } else if (in.opcode == 0x151 || in.opcode == 0x154) {    // v_min3_f32 / v_max3_f32
                 // min/max of three floats (DOLL's AA-clamp PS). VERIFIED(round-trip llvm-mc gfx1010:
                 // VOP3 0x151 = v_min3_f32, 0x154 = v_max3_f32 — 0xd551…/0xd554…). NaN-aware NMin/
@@ -7710,6 +7718,16 @@ bool emit_cfg_state_machine(
     const uint32_t* code, size_t dwords) {
     const bool graphics = b.is_fragment || b.is_vertex;
     if ((!b.is_compute && !graphics) || ins.empty()) return false;
+    // `safe` branches have already been proven equivalent to straight-line predication by the
+    // stage-specific analysis (fragment alpha-test wave early-outs, safe EXECZ regions, and the
+    // bounded NGG terminal export gate).  The compact SSA emitter feeds them to emit_alu, which
+    // deliberately no-ops the scalar branch while retaining the per-invocation EXEC effect.  Do the
+    // same in the CFG fallback: treating one as a basic-block terminator makes a kill-mask SCC look
+    // like an ordinary scalar boolean, even though the mask lowering intentionally poisons that
+    // cross-lane SCC.  Astro Bot's complex material PS combines both shapes and was rejected there.
+    auto linearized_branch = [&](const Rdna2Inst& in) {
+        return graphics && in.fmt == Rdna2Format::SOPP && safe.contains(in.pc);
+    };
 
     uint32_t end_pc = UINT32_MAX;
     for (const auto& in : ins) if (in.is_end) { end_pc = in.pc; break; }
@@ -7802,7 +7820,8 @@ bool emit_cfg_state_machine(
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
         }
-        if (in.fmt != Rdna2Format::SOPP || in.opcode < 0x02 || in.opcode > 0x09 ||
+        if (linearized_branch(in) || in.fmt != Rdna2Format::SOPP ||
+            in.opcode < 0x02 || in.opcode > 0x09 ||
             in.opcode == 0x03) continue;
         const uint32_t target = branch_target(in);
         if (target <= end_pc) start_set.insert(target);
@@ -7897,8 +7916,9 @@ bool emit_cfg_state_machine(
         const Rdna2Inst* terminator = nullptr;
         for (const auto& in : ins) {
             if (in.pc < lo || in.pc >= hi) continue;
-            if (in.is_end || (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 &&
-                              in.opcode <= 0x09 && in.opcode != 0x03)) {
+            if (in.is_end || (!linearized_branch(in) && in.fmt == Rdna2Format::SOPP &&
+                              in.opcode >= 0x02 && in.opcode <= 0x09 &&
+                              in.opcode != 0x03)) {
                 terminator = &in;
                 break;
             }
@@ -7967,8 +7987,8 @@ bool emit_cfg_state_machine(
                 mbcnt_event_for_pc.contains(in.pc) || append_event_for_pc.contains(in.pc) ||
                 mask_zero_compare_source(in) >= 0;
             conditional_block[block] = conditional_block[block] ||
-                (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x04 && in.opcode <= 0x09 &&
-                 in.opcode != 0x03);
+                (!linearized_branch(in) && in.fmt == Rdna2Format::SOPP &&
+                 in.opcode >= 0x04 && in.opcode <= 0x09 && in.opcode != 0x03);
         }
     }
     for (uint32_t first = 0; first < starts.size(); ++first) {
@@ -8257,8 +8277,9 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_mask_compare = nullptr;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi) continue;
-                if (in.is_end || (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 &&
-                                  in.opcode <= 0x09 && in.opcode != 0x03)) {
+                if (in.is_end || (!linearized_branch(in) && in.fmt == Rdna2Format::SOPP &&
+                                  in.opcode >= 0x02 && in.opcode <= 0x09 &&
+                                  in.opcode != 0x03)) {
                     block_terminator = &in;
                     break;
                 }
