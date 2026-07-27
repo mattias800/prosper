@@ -10,10 +10,10 @@
 #include <cstdio>
 
 using prosper::frontend::rtt_integer_upscale_factor;
+using prosper::frontend::rtt_direct_import_compatible;
 using prosper::frontend::rtt_sampled_extent_compatible;
 using prosper::frontend::rtt_scaled_axis;
 using prosper::frontend::rtt_scaled_extent_compatible;
-using prosper::frontend::rtt_storage_bridge_extent_compatible;
 using prosper::frontend::LiveRttAuthority;
 using prosper::frontend::live_rtt_authority;
 using prosper::frontend::live_rtt_gpu_importable;
@@ -45,11 +45,16 @@ int main() {
     CHECK(rtt_integer_upscale_factor(1920, 1080, 0, 270) == 0);
     CHECK(rtt_integer_upscale_factor(0, 0, 0, 0) == 0);
 
-    CHECK(rtt_sampled_extent_compatible(1920, 1080, 1920, 1080, 1));
-    CHECK(rtt_sampled_extent_compatible(1920, 1080, 960, 540, 2));
-    CHECK(!rtt_sampled_extent_compatible(1920, 1080, 960, 540, 1));
-    CHECK(!rtt_sampled_extent_compatible(1216, 684, 960, 540, 2));
-    CHECK(!rtt_sampled_extent_compatible(1920, 1620, 960, 540, 2));
+    CHECK(rtt_sampled_extent_compatible(1920, 1080, 1920, 1080, 1, false));
+    CHECK(rtt_sampled_extent_compatible(1920, 1080, 960, 540, 2, true));
+    CHECK(!rtt_sampled_extent_compatible(1920, 1080, 960, 540, 2, false));
+    CHECK(!rtt_sampled_extent_compatible(1920, 1080, 960, 540, 1, true));
+    CHECK(!rtt_sampled_extent_compatible(1216, 684, 960, 540, 2, true));
+    CHECK(!rtt_sampled_extent_compatible(1920, 1620, 960, 540, 2, true));
+    CHECK(rtt_direct_import_compatible(false, 1920, 1080, 1920, 1080, 1, false));
+    CHECK(rtt_direct_import_compatible(false, 1920, 1080, 960, 540, 2, true));
+    CHECK(!rtt_direct_import_compatible(false, 1920, 1080, 960, 540, 2, false));
+    CHECK(!rtt_direct_import_compatible(true, 1920, 1080, 1920, 1080, 1, true));
 
     // Pass-local targets use nearest-integer division, so non-divisible native dimensions are still
     // valid renderer-owned images. This is common in Astro Bot's dynamic-resolution post chain.
@@ -57,15 +62,10 @@ int main() {
     CHECK(rtt_scaled_axis(684, 3) == 228);
     CHECK(rtt_scaled_axis(1, 3) == 1);
     CHECK(rtt_scaled_extent_compatible(1216, 684, 405, 228, 3));
-    CHECK(rtt_sampled_extent_compatible(1216, 684, 405, 228, 3));
-    CHECK(!rtt_sampled_extent_compatible(1216, 684, 406, 228, 3));
-    CHECK(!rtt_sampled_extent_compatible(1216, 684, 960, 540, 3));
-
-    CHECK(rtt_storage_bridge_extent_compatible(3840, 2160, 1920, 1080, 2));
-    CHECK(!rtt_storage_bridge_extent_compatible(1920, 1080, 1920, 1080, 2));
-    CHECK(!rtt_storage_bridge_extent_compatible(3840, 2160, 1920, 1080, 1));
-    CHECK(!rtt_storage_bridge_extent_compatible(1216, 684, 960, 540, 2));
-    CHECK(rtt_storage_bridge_extent_compatible(1216, 684, 405, 228, 3));
+    CHECK(rtt_sampled_extent_compatible(1216, 684, 405, 228, 3, true));
+    CHECK(!rtt_sampled_extent_compatible(1216, 684, 405, 228, 3, false));
+    CHECK(!rtt_sampled_extent_compatible(1216, 684, 406, 228, 3, true));
+    CHECK(!rtt_sampled_extent_compatible(1216, 684, 960, 540, 3, true));
 
     // A snapshot produced by an ordered readback mirrors a still-valid persistent GPU image; it
     // must not force a full GPU->CPU->GPU round trip on the next compute consumer. Conversely, a

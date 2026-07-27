@@ -266,6 +266,7 @@ struct TypeInfo {
     uint32_t width = 0;
     uint32_t storage = 0;
     uint32_t image_sampled = 0;
+    bool scalar_float = false;
     std::vector<uint32_t> members;
 };
 
@@ -339,6 +340,26 @@ SpirvDescriptorKind descriptor_kind(const VariableInfo& var,
         return SpirvDescriptorKind::Unknown;
     }
     return SpirvDescriptorKind::Unknown;
+}
+
+bool descriptor_storage_float(const VariableInfo& var,
+                              const std::unordered_map<uint32_t, TypeInfo>& types) {
+    auto pi = types.find(var.pointer_type);
+    if (pi == types.end() || pi->second.kind != TypeKind::Pointer) return false;
+    uint32_t type = pi->second.element;
+    for (uint32_t depth = 0; depth < 8; ++depth) {
+        auto ti = types.find(type);
+        if (ti == types.end()) return false;
+        if (ti->second.kind == TypeKind::Array) {
+            type = ti->second.element;
+            continue;
+        }
+        if (ti->second.kind != TypeKind::Image || ti->second.image_sampled != 2) return false;
+        auto sampled_type = types.find(ti->second.element);
+        return sampled_type != types.end() && sampled_type->second.kind == TypeKind::Scalar &&
+               sampled_type->second.scalar_float;
+    }
+    return false;
 }
 
 SpirvDescriptorKind resource_kind(const ShaderResource& r) {
@@ -476,8 +497,11 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
                 if (n >= 2 && stage == SpirvShaderStage::Unknown)
                     stage = static_cast<SpirvShaderStage>(word(in, 0));
                 break;
-            case OpTypeInt: case OpTypeFloat:
+            case OpTypeInt:
                 if (n >= 2) { TypeInfo t; t.kind = TypeKind::Scalar; t.width = word(in, 1); types[word(in, 0)] = t; }
+                break;
+            case OpTypeFloat:
+                if (n >= 2) { TypeInfo t; t.kind = TypeKind::Scalar; t.width = word(in, 1); t.scalar_float = true; types[word(in, 0)] = t; }
                 break;
             case OpTypeVector:
                 if (n >= 3) { TypeInfo t; t.kind = TypeKind::Vector; t.element = word(in, 1); t.count = word(in, 2); types[word(in, 0)] = t; }
@@ -529,14 +553,22 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     }
 
     std::unordered_map<uint32_t, SpirvDescriptorKind> descriptor_vars;
+    std::set<uint32_t> storage_float_vars;
     for (const auto& [id, var] : variables) {
         SpirvDescriptorKind kind = descriptor_kind(var, types);
-        if (kind != SpirvDescriptorKind::Unknown) descriptor_vars[id] = kind;
+        if (kind != SpirvDescriptorKind::Unknown) {
+            descriptor_vars[id] = kind;
+            if (kind == SpirvDescriptorKind::StorageImage &&
+                descriptor_storage_float(var, types))
+                storage_float_vars.insert(id);
+        }
     }
 
     std::set<uint32_t> used_vars;
     std::set<uint32_t> read_vars;
     std::set<uint32_t> written_vars;
+    std::set<uint32_t> normalized_sample_vars;
+    std::set<uint32_t> texel_access_vars;
     std::unordered_map<uint32_t, PointerAccess> accesses;
     // Result id of OpLoad/OpSampledImage -> descriptor variable. An image descriptor load accesses
     // the descriptor object, not its texels; only the later image opcode establishes read/write data
@@ -564,6 +596,12 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     auto mark_image = [&](uint32_t object, bool read, bool write) {
         auto origin = image_objects.find(object);
         if (origin != image_objects.end()) mark(origin->second, read, write);
+    };
+    auto mark_image_coordinate_contract = [&](uint32_t object, bool normalized) {
+        auto origin = image_objects.find(object);
+        if (origin == image_objects.end()) return;
+        if (normalized) normalized_sample_vars.insert(origin->second);
+        else texel_access_vars.insert(origin->second);
     };
     for (const Instruction& in : insts) {
         const uint32_t n = in.words - 1u;
@@ -593,11 +631,23 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
             // All sampled/fetch/gather forms plus OpImageRead place their image object after result
             // type/result id. The descriptor itself was loaded earlier; this is the texel read.
             mark_image(word(in, 2), true, false);
+            // OpImageSample* (87..94) and Gather/DrefGather (96..97) consume normalized sampler
+            // coordinates. OpImageFetch (95) and OpImageRead (98) consume integer texel coordinates
+            // and therefore cannot observe a reduced render target as if it had the native extent.
+            mark_image_coordinate_contract(
+                word(in, 2), (in.opcode >= 87u && in.opcode <= 94u) ||
+                                 in.opcode == 96u || in.opcode == 97u);
         } else if (in.opcode == 99u /* OpImageWrite */ && n >= 1) {
             mark_image(word(in, 0), false, true);
         } else if (in.opcode == 100u /* OpImage */ && n >= 3) {
             auto origin = image_objects.find(word(in, 2));
             if (origin != image_objects.end()) image_objects[word(in, 1)] = origin->second;
+        } else if (in.opcode >= 101u && in.opcode <= 107u && n >= 3) {
+            // OpImageQueryFormat/Order/SizeLod/Size/Lod/Levels/Samples all place the image object
+            // after result type/result id. Query-only descriptors must remain in the reflected
+            // layout, and their reported dimensions/LOD contract requires the guest's exact extent.
+            mark_image(word(in, 2), true, false);
+            mark_image_coordinate_contract(word(in, 2), false);
         } else if ((in.opcode == OpAccessChain || in.opcode == OpInBoundsAccessChain) && n >= 3) {
             const uint32_t result = word(in, 1), base = word(in, 2);
             PointerAccess a;
@@ -650,7 +700,10 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         if (si == sets.end() || bi == bindings.end()) { add_malformed(report); continue; }
         report.descriptors.push_back({var, si->second, bi->second, descriptor_vars[var], stage,
                                       required[var], dynamic[var], read_vars.count(var) != 0,
-                                      written_vars.count(var) != 0});
+                                      written_vars.count(var) != 0,
+                                      normalized_sample_vars.count(var) != 0,
+                                      texel_access_vars.count(var) != 0,
+                                      storage_float_vars.count(var) != 0});
     }
     std::sort(report.descriptors.begin(), report.descriptors.end(), [](const auto& a, const auto& b) {
         return a.set != b.set ? a.set < b.set : a.binding < b.binding;

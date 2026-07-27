@@ -505,6 +505,9 @@ struct LiveTargetImageRequest {
     uint32_t width = 0, height = 0;
     uint32_t render_scale = 1;
     bool allow_depth = false;
+    // True only when reflection proves this descriptor is read exclusively through normalized
+    // sample/gather operations. Integer image fetch/read must retain the exact declared extent.
+    bool normalized_sampling = false;
 };
 using LiveTargetImageImportFn = std::function<bool(
     uint64_t gpu_addr, const LiveTargetImageRequest& request, LiveTargetImageImport& import)>;
@@ -546,6 +549,10 @@ struct SharedVulkanContext {
     bool compute_subgroup_arithmetic = false;
     uint32_t min_compute_subgroup_size = 0;
     uint32_t max_compute_subgroup_size = 0;
+    // Vulkan-independent mask from native_storage_format_support_bit(). The renderer queries
+    // optimal-tiling STORAGE_IMAGE support before publishing its physical device.
+    uint32_t native_storage_format_support = 0;
+    bool compute_queue_supported = false;
     // Present unification (#1270): when present_capable, prosper-app may create its window surface on
     // `instance`, its swapchain on `device`, and present on `present_queue` -- then blit the renderer's
     // front-buffer image straight to the swapchain with no CPU round-trip. present_queue_shared means the

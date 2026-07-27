@@ -6,6 +6,7 @@
 // binary at startup, or a test via render_runner.h), so prosper_core links this without Vulkan.
 #include "gpu_execute.hpp"
 #include "gpu_capture.hpp"
+#include "gpu_timeline.hpp"
 #include "videoout_present.hpp"   // present_write_frame
 #include "agc_shader_layout.hpp"  // AgcShaderHeader + build_shader_resources
 #include "pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
@@ -139,6 +140,14 @@ struct ShaderResourceCompileKey {
     uint32_t sgpr_base = 0;
     uint32_t fetch_pc = 0;
     uint32_t fetch_index_mode = 0;
+    uint32_t flat_base_sgpr = 0;
+    bool srgb = false;
+    bool depth_compare = false;
+    uint32_t depth_compare_func = 0;
+    uint32_t mag_filter = 0;
+    uint32_t addr_u = 0;
+    uint32_t addr_v = 0;
+    uint32_t border_color_type = 0;
 
     bool operator==(const ShaderResourceCompileKey&) const = default;
 };
@@ -167,6 +176,7 @@ struct ShaderCompileKey {
     bool compute_tg_size_en = false;
     uint32_t compute_lds_bytes = 0;
     uint32_t compute_native_subgroup_size = 0;
+    uint32_t compute_native_storage_format_support = 0;
     // Aliases ShaderCodeAnalysis::code and keeps that immutable analysis alive. Warm lookups used to
     // copy and re-hash the complete raw program for every draw before reaching the shader cache.
     std::shared_ptr<const std::vector<uint32_t>> code;
@@ -203,6 +213,8 @@ struct ShaderCompileKey {
                compute_tg_size_en == other.compute_tg_size_en &&
                compute_lds_bytes == other.compute_lds_bytes &&
                compute_native_subgroup_size == other.compute_native_subgroup_size &&
+               compute_native_storage_format_support ==
+                   other.compute_native_storage_format_support &&
                resources == other.resources && same_code;
     }
 };
@@ -259,6 +271,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, key.compute_tg_size_en);
             hash = hash_mix(hash, key.compute_lds_bytes);
             hash = hash_mix(hash, key.compute_native_subgroup_size);
+            hash = hash_mix(hash, key.compute_native_storage_format_support);
         }
         hash = hash_mix(hash, key.code ? key.code->size() : 0u);
         hash = hash_mix(hash, key.code_hash);
@@ -272,6 +285,15 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.srt_offset);
             hash = hash_mix(hash, resource.sgpr_base);
             hash = hash_mix(hash, resource.fetch_pc);
+            hash = hash_mix(hash, resource.fetch_index_mode);
+            hash = hash_mix(hash, resource.flat_base_sgpr);
+            hash = hash_mix(hash, resource.srgb);
+            hash = hash_mix(hash, resource.depth_compare);
+            hash = hash_mix(hash, resource.depth_compare_func);
+            hash = hash_mix(hash, resource.mag_filter);
+            hash = hash_mix(hash, resource.addr_u);
+            hash = hash_mix(hash, resource.addr_v);
+            hash = hash_mix(hash, resource.border_color_type);
         }
         return static_cast<size_t>(hash);
     }
@@ -829,6 +851,8 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
         key.compute_tg_size_en = compute_config->tg_size_en;
         key.compute_lds_bytes = compute_config->lds_bytes;
         key.compute_native_subgroup_size = compute_config->native_subgroup_size;
+        key.compute_native_storage_format_support =
+            compute_config->native_storage_format_support;
     }
     const std::shared_ptr<const ShaderCodeAnalysis> analysis =
         code && dwords ? analyze_shader_code_cached(code, dwords) : nullptr;
@@ -876,11 +900,21 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
     if (resources) {
         key.resources.reserve(resources->resources.size());
         for (const auto& resource : resources->resources) {
+            const bool texture = resource.cls == ResourceClass::Texture;
+            const bool storage_image = resource.cls == ResourceClass::StorageImage;
+            const bool manual_compare = texture && resource.depth_compare;
             key.resources.push_back({
                 static_cast<uint32_t>(resource.cls), static_cast<uint32_t>(resource.format),
                 resource.num_components, resource.binding, resource.stride,
                 resource.srt_offset, resource.sgpr_base, resource.fetch_pc,
                 static_cast<uint32_t>(resource.fetch_index_mode),
+                resource.flat_base_sgpr, storage_image && resource.srgb,
+                manual_compare,
+                manual_compare ? resource.depth_compare_func : 0u,
+                manual_compare ? resource.mag_filter : 0u,
+                manual_compare ? resource.addr_uvw[0] : 0u,
+                manual_compare ? resource.addr_uvw[1] : 0u,
+                manual_compare ? resource.border_color_type : 0u,
             });
         }
     }
@@ -3409,7 +3443,27 @@ std::vector<ComputeItem> realize_compute_dispatches(
             P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT) &
             P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK) ? 32u : 64u;
         const SharedVulkanContext shared_vulkan = shared_vulkan_context();
-        if (!getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") &&
+        const bool shared_compute_adoptable = shared_vulkan.valid() &&
+            shared_vulkan.compute_queue_supported &&
+            shared_vulkan.storage_image_read_without_format &&
+            shared_vulkan.storage_image_write_without_format;
+        config.native_storage_format_support = shared_compute_adoptable
+            ? shared_vulkan.native_storage_format_support : 0;
+        // Realized captures store SPIR-V but not enough raw compute launch state to recompile a
+        // device-specific typed-storage module on replay. Compile capture-bound dispatches through
+        // the portable raw-uvec4 path so optional format support never becomes an artifact ABI.
+        if (std::getenv("PROSPER_GPU_CAPTURE") ||
+            std::getenv("PROSPER_GPU_TIMELINE_CAPTURE") ||
+            interactive_gpu_capture_armed() || interactive_capture_bundle_active())
+            config.native_storage_format_support = 0;
+        // RequiredSubgroupSize fixes only the subgroup WIDTH. Vulkan deliberately does not promise
+        // that SubgroupLocalInvocationId is LocalInvocationIndex modulo that width, so using native
+        // lane IDs for RDNA MBCNT/EXEC/VCC would silently change guest wave membership on a
+        // conforming implementation. Keep the portable emulation by default. This opt-in exists for
+        // driver experiments whose contiguous mapping has been validated externally; it is not a
+        // portable correctness contract.
+        if (getenv("PROSPER_ASSUME_CONTIGUOUS_COMPUTE_SUBGROUPS") &&
+            !getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") &&
             shared_vulkan.compute_subgroup_size_control &&
             shared_vulkan.compute_subgroup_vote && shared_vulkan.compute_subgroup_arithmetic &&
             config.wave_size >= shared_vulkan.min_compute_subgroup_size &&

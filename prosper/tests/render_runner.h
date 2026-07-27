@@ -784,6 +784,37 @@ inline const RenderVkCtx& render_vk_ctx() {
                 (r.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0;
             shared.min_compute_subgroup_size = r.min_subgroup_size;
             shared.max_compute_subgroup_size = r.max_subgroup_size;
+            uint32_t queue_family_count = 0;
+            vkGetPhysicalDeviceQueueFamilyProperties(r.phys, &queue_family_count, nullptr);
+            std::vector<VkQueueFamilyProperties> queue_families(queue_family_count);
+            vkGetPhysicalDeviceQueueFamilyProperties(
+                r.phys, &queue_family_count, queue_families.data());
+            shared.compute_queue_supported = r.qfi < queue_families.size() &&
+                (queue_families[r.qfi].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
+            const auto add_native_storage_format = [&](prosper::gpu::DataFormat format,
+                                                       uint32_t components,
+                                                       VkFormat vk_format) {
+                VkImageFormatProperties properties{};
+                constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                if (vkGetPhysicalDeviceImageFormatProperties(
+                        r.phys, vk_format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                        usage, 0, &properties) == VK_SUCCESS)
+                    shared.native_storage_format_support |=
+                        prosper::gpu::native_storage_format_support_bit(format, components);
+            };
+            add_native_storage_format(prosper::gpu::DataFormat::Unorm8, 1, VK_FORMAT_R8_UNORM);
+            add_native_storage_format(prosper::gpu::DataFormat::Unorm8, 2, VK_FORMAT_R8G8_UNORM);
+            add_native_storage_format(prosper::gpu::DataFormat::Unorm8, 4, VK_FORMAT_R8G8B8A8_UNORM);
+            add_native_storage_format(prosper::gpu::DataFormat::Float16, 1, VK_FORMAT_R16_SFLOAT);
+            add_native_storage_format(prosper::gpu::DataFormat::Float16, 2, VK_FORMAT_R16G16_SFLOAT);
+            add_native_storage_format(prosper::gpu::DataFormat::Float16, 4, VK_FORMAT_R16G16B16A16_SFLOAT);
+            add_native_storage_format(prosper::gpu::DataFormat::Float32, 1, VK_FORMAT_R32_SFLOAT);
+            add_native_storage_format(prosper::gpu::DataFormat::Float32, 2, VK_FORMAT_R32G32_SFLOAT);
+            add_native_storage_format(prosper::gpu::DataFormat::Float32, 4, VK_FORMAT_R32G32B32A32_SFLOAT);
+            add_native_storage_format(
+                prosper::gpu::DataFormat::Float10_11_11, 3,
+                VK_FORMAT_B10G11R11_UFLOAT_PACK32);
             // Present unification (#1270): advertise present adoption only when the instance is
             // surface-capable AND the device enabled VK_KHR_swapchain AND a present queue was resolved.
             shared.present_capable = r.present_surface_capable && r.present_swapchain_capable &&
@@ -1713,7 +1744,8 @@ struct PersistentDsSampled {
 };
 inline PersistentDsSampled find_persistent_ds_sampled(uint64_t addr, uint32_t width,
                                                       uint32_t height,
-                                                      uint32_t render_scale = 1) {
+                                                      uint32_t render_scale = 1,
+                                                      bool normalized_sampling = true) {
     if (!addr) return {};
     static const bool bridge_log = getenv("PROSPER_DSBRIDGE_LOG") != nullptr;
     // Prefer the most recently DEPTH-WRITTEN match: a surface re-keyed (D32 -> D32S8) keeps its
@@ -1722,7 +1754,7 @@ inline PersistentDsSampled find_persistent_ds_sampled(uint64_t addr, uint32_t wi
     uint64_t best_write = 0;
     for (auto& [key, image] : persistent_ds_cache()) {
         if (!prosper::frontend::rtt_sampled_extent_compatible(
-                width, height, key.w, key.h, render_scale))
+                width, height, key.w, key.h, render_scale, normalized_sampling))
             continue;
         if (key.dr != addr && key.dw != addr) continue;
         if (!image.depth_valid || !image.layout_initialized || !image.image) continue;

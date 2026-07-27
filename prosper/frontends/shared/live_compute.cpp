@@ -105,6 +105,46 @@ bool direct_sampled_rtt_compatible(prosper::gpu::DataFormat format, uint32_t com
 
 namespace {
 
+VkFormat native_storage_vk_format(prosper::gpu::DataFormat format, uint32_t components) {
+    using prosper::gpu::DataFormat;
+    switch (format) {
+    case DataFormat::Unorm8:
+        if (components == 1) return VK_FORMAT_R8_UNORM;
+        if (components == 2) return VK_FORMAT_R8G8_UNORM;
+        if (components == 4) return VK_FORMAT_R8G8B8A8_UNORM;
+        break;
+    case DataFormat::Float16:
+        if (components == 1) return VK_FORMAT_R16_SFLOAT;
+        if (components == 2) return VK_FORMAT_R16G16_SFLOAT;
+        if (components == 4) return VK_FORMAT_R16G16B16A16_SFLOAT;
+        break;
+    case DataFormat::Float32:
+        if (components == 1) return VK_FORMAT_R32_SFLOAT;
+        if (components == 2) return VK_FORMAT_R32G32_SFLOAT;
+        if (components == 4) return VK_FORMAT_R32G32B32A32_SFLOAT;
+        break;
+    case DataFormat::Float10_11_11:
+        if (components == 3) return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+        break;
+    default:
+        break;
+    }
+    return VK_FORMAT_UNDEFINED;
+}
+
+bool native_storage_image_create_supported(VkPhysicalDevice physical, VkFormat format,
+                                           uint32_t width, uint32_t height) {
+    if (!physical || format == VK_FORMAT_UNDEFINED || !width || !height) return false;
+    constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT |
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkImageFormatProperties properties{};
+    return vkGetPhysicalDeviceImageFormatProperties(
+               physical, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+               usage, 0, &properties) == VK_SUCCESS &&
+           width <= properties.maxExtent.width && height <= properties.maxExtent.height &&
+           properties.maxExtent.depth >= 1 && properties.maxArrayLayers >= 1;
+}
+
 constexpr VkDeviceSize kMaxComputeImageBytes = 256ull << 20;
 constexpr size_t kMaxCachedComputePipelines = 4096;
 
@@ -453,6 +493,7 @@ struct ComputeImageCacheKey {
     uint32_t mip_tail_offset = 0, mip_tail_bytes = 0;
     uint32_t mip_tail_x = 0, mip_tail_y = 0;
     uint32_t vk_format = 0;
+    bool storage = false;
     bool in_mip_tail = false;
     bool srgb = false;
     bool depth_compare = false;
@@ -472,7 +513,7 @@ struct ComputeImageCacheKeyHash {
         mix(key.format); mix(key.components); mix(key.tile_mode); mix(key.img_dim);
         mix(key.linear_row_pitch); mix(key.mip_tail_offset); mix(key.mip_tail_bytes);
         mix(key.mip_tail_x); mix(key.mip_tail_y); mix(key.vk_format);
-        mix(key.in_mip_tail); mix(key.srgb); mix(key.depth_compare);
+        mix(key.storage); mix(key.in_mip_tail); mix(key.srgb); mix(key.depth_compare);
         return result;
     }
 };
@@ -1311,12 +1352,6 @@ struct BoundImage {
     bool imported = false;
     bool imported_depth = false;        // borrowed persistent DS depth plane, not a color RTT
     VkFormat imported_format = VK_FORMAT_UNDEFINED;
-    // A native-resolution storage image backed by a reduced-resolution renderer RTT. `image` is a
-    // temporary compute image; `bridge_image` is the pinned renderer image. Two GPU blits replace
-    // the old CPU snapshot upscale + guest writeback while preserving integer storage coordinates.
-    bool scaled_bridge = false;
-    VkImage bridge_image = VK_NULL_HANDLE;
-    uint32_t bridge_width = 0, bridge_height = 0;
     bool persistent = false;            // guest-backed sampled image retained across dispatches
     bool cache_candidate = false;
     bool upload_skipped = false;         // write watch proved the cached source unchanged
@@ -1794,7 +1829,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (size_t i = 0; i < images.size(); i++) {
             // A pin is taken per successful import, so it is released per import -- including for a
             // binding that a later alias check folded into an earlier one (#1095).
-            if (images[i].imported || images[i].scaled_bridge)
+            if (images[i].imported)
                 release_live_render_target_image(images[i].imported_addr);
             if (images[i].alias_of != SIZE_MAX) continue;
             if (images[i].sampler) vkDestroySampler(ctx.device, images[i].sampler, nullptr);
@@ -1944,8 +1979,26 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             bi.resource = r;
             bi.binding = image_descriptors[i].binding;
             bi.storage = image_descriptors[i].kind == SpirvDescriptorKind::StorageImage;
-            bi.native_float_storage = bi.storage && native_float_storage_image(
-                r->format, r->num_components ? r->num_components : 1, r->srgb);
+            const uint32_t descriptor_components =
+                r->num_components ? r->num_components : 1;
+            const VkFormat native_storage_format =
+                native_storage_vk_format(r->format, descriptor_components);
+            const bool spirv_native_storage =
+                bi.storage && image_descriptors[i].storage_float;
+            const bool ordinary_2d_storage = r->img_dim == 1 && r->depth == 1 &&
+                                             !r->depth_compare;
+            const bool native_storage_supported = native_float_storage_image_supported(
+                r->format, descriptor_components, r->srgb,
+                ordinary_2d_storage && native_storage_image_create_supported(
+                    ctx.physical, native_storage_format, r->width, r->height));
+            if (spirv_native_storage && !native_storage_supported) {
+                skip_image(r, "compiled typed storage format is unsupported by this device");
+                break;
+            }
+            // SPIR-V is authoritative here: a raw-uvec4 module must keep the conversion path even
+            // if this replay device supports the optional typed format, while a live module is only
+            // emitted as float after the frontend's physical-device feature query.
+            bi.native_float_storage = spirv_native_storage;
             if (trace)
                 std::fprintf(stderr,
                              "[compute]   image binding=%u class=%s addr=0x%llx "
@@ -1998,9 +2051,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     bi.dcc_metadata = reinterpret_cast<uint8_t*>(uintptr_t(r->metadata_addr));
                 }
             }
-            // A renderer-owned target's current pixels are not in raw guest memory. Import its
-            // immutable CPU snapshot for sampled and storage bindings; a successful storage
-            // writeback publishes ordinary guest bytes and invalidates the renderer-owned copy.
+            // A renderer-owned target's current pixels are not in raw guest memory. Sampled
+            // descriptors may borrow its Vulkan image directly; storage descriptors use the CPU
+            // snapshot path below so their guest writeback keeps overlapping aliases coherent.
             LiveTargetSnapshot live_target;
             bool renderer_owned = !r->in_mip_tail && is_live_render_target(r->gpu_addr);
             static const uint32_t render_scale = [] {
@@ -2019,13 +2072,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 !dim_2d_array && r->depth == 1 && r->img_dim == 1 &&
                 r->format == DataFormat::Float32 &&
                 (r->num_components ? r->num_components : 1u) == 1u;
-            if ((renderer_owned || depth_import_eligible) &&
-                (!bi.storage || bi.native_float_storage) &&
+            // Persistent renderer images do not carry VK_IMAGE_USAGE_STORAGE_BIT, and a writable
+            // storage import would also leave overlapping guest buffer aliases stale. Storage
+            // descriptors therefore retain the owned-image + guest-writeback path.
+            if (!bi.storage && (renderer_owned || depth_import_eligible) &&
                 !dim_1d && !dim_3d && !dim_2d_array &&
                 r->depth == 1 && !r->depth_compare) {
                 LiveTargetImageImport import;
+                const bool normalized_sampling =
+                    image_descriptors[i].normalized_sampling &&
+                    !image_descriptors[i].texel_access;
                 const LiveTargetImageRequest import_request{
-                    r->width, r->height, render_scale, depth_import_eligible};
+                    r->width, r->height, render_scale, depth_import_eligible,
+                    normalized_sampling};
                 const bool import_available = import_live_render_target_image(
                     r->gpu_addr, import_request, import);
                 if (trace)
@@ -2053,14 +2112,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                               import.format);
                     const bool compatible_device =
                         import.device == static_cast<void*>(ctx.device);
-                    const bool direct_extent = bi.storage
-                        ? import.width == r->width && import.height == r->height
-                        : prosper::frontend::rtt_sampled_extent_compatible(
-                              r->width, r->height, import.width, import.height, render_scale);
-                    const bool bridge_extent = bi.storage && bi.native_float_storage &&
-                        image_descriptors[i].writable &&
-                        prosper::frontend::rtt_storage_bridge_extent_compatible(
-                            r->width, r->height, import.width, import.height, render_scale);
+                    const bool direct_extent =
+                        prosper::frontend::rtt_direct_import_compatible(
+                            bi.storage, r->width, r->height, import.width, import.height,
+                            render_scale, normalized_sampling);
                     if (compatible_format && direct_extent && compatible_device) {
                         bi.imported = true;
                         bi.imported_depth = depth_import;
@@ -2081,19 +2136,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                          depth_import ? "depth"
                                              : import.format == LiveTargetPixelFormat::Rgba16Float
                                                    ? "rgba16f" : "rgba8");
-                    } else if (compatible_format && bridge_extent && compatible_device) {
-                        bi.scaled_bridge = true;
-                        bi.imported_addr = r->gpu_addr;
-                        bi.imported_saved_layout = import.layout;
-                        bi.bridge_image = static_cast<VkImage>(import.image);
-                        bi.bridge_width = import.width;
-                        bi.bridge_height = import.height;
-                        if (trace)
-                            std::fprintf(stderr,
-                                         "[compute]   GPU-scaled renderer RTT bridge binding=%u "
-                                         "addr=0x%llx %ux%u <-> %ux%u\n",
-                                         bi.binding, (unsigned long long)r->gpu_addr,
-                                         import.width, import.height, r->width, r->height);
                     } else {
                         // Not our exact contract (a different device or a stale aliased view).
                         release_live_render_target_image(r->gpu_addr);
@@ -2152,7 +2194,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
                 // Proven Partial: fall through, seed normally every frame.
             }
-            if (renderer_owned && !bi.imported && !bi.scaled_bridge && !bi.seed_skip) {
+            if (renderer_owned && !bi.imported && !bi.seed_skip) {
                 if (dim_3d || r->depth != 1 ||
                     !read_live_render_target(r->gpu_addr, live_target) || !live_target.pixels) {
                     skip_image(r, "renderer-owned RTT has no readable snapshot"); break;
@@ -2514,7 +2556,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         r->tile_mode, r->img_dim, r->linear_row_pitch_bytes,
                         r->mip_tail_offset, r->mip_tail_bytes,
                         r->mip_tail_x, r->mip_tail_y,
-                        static_cast<uint32_t>(image_format), r->in_mip_tail,
+                        static_cast<uint32_t>(image_format), bi.storage, r->in_mip_tail,
                         r->srgb, r->depth_compare};
                     bi.persistent = ctx.acquire_cached_image(
                         bi.cache_key, sampled_guest_source, image_validation_epoch,
@@ -2536,10 +2578,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // directly. The old path first built a heap upload and then memcpy'd the complete result
             // here -- an extra 132 MiB CPU pass for Astro Bot's 4K RGBA32 storage representation.
             ScopedMappedMemory upload_mapping(ctx);
-            const size_t upload_size = (bi.imported || bi.scaled_bridge || bi.seed_skip)
+            const size_t upload_size = (bi.imported || bi.seed_skip)
                 ? size_t{0} : (size_t)sbytes;
-            if (!bi.imported && !bi.scaled_bridge &&
-                !(bi.persistent && bi.upload_skipped)) {
+            if (!bi.imported && !(bi.persistent && bi.upload_skipped)) {
                 VkBufferCreateInfo sci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
                 sci.size = sbytes;
                 sci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -2562,9 +2603,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
             }
             auto* upload = static_cast<uint8_t*>(upload_mapping.data);
-            if (bi.imported || bi.scaled_bridge) {
-                // The renderer's image is the source: direct imports need no transfer; scaled
-                // storage bridges are populated by an image-to-image blit in the command buffer.
+            if (bi.imported) {
+                // The renderer's sampled image is the source, so direct imports need no transfer.
                 bi.guest_bytes = 0;
             } else if (bi.storage) {
                 if (r->tile_mode && !tile_mode_is_tiled(r->tile_mode)) {
@@ -2624,7 +2664,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         r->tile_mode, r->img_dim, r->linear_row_pitch_bytes,
                         r->mip_tail_offset, r->mip_tail_bytes,
                         r->mip_tail_x, r->mip_tail_y,
-                        static_cast<uint32_t>(image_format), r->in_mip_tail,
+                        static_cast<uint32_t>(image_format), bi.storage, r->in_mip_tail,
                         r->srgb, r->depth_compare};
                     bi.persistent = ctx.acquire_cached_image(
                         bi.cache_key, resource_bytes_for(r, guest_bytes), image_validation_epoch,
@@ -2979,13 +3019,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             ici.arrayLayers = dim_2d_array ? r->depth : 1;
             ici.samples = VK_SAMPLE_COUNT_1_BIT;
             ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-            ici.usage = (bi.storage ? (VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+            ici.usage = (bi.storage ? (VK_IMAGE_USAGE_STORAGE_BIT |
                                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
                                     : VK_IMAGE_USAGE_SAMPLED_BIT) |
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-            if (!bi.storage && native_float_storage_image(
-                    r->format, sampled_components, r->srgb))
-                ici.usage |= VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
             ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             // An imported binding already holds the renderer's image; only the view/sampler below
             // are ours to create. `ici` is still filled above so the view matches its format/layers.
@@ -3249,61 +3286,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const BoundImage& bi = images[i];
             if (bi.alias_of != SIZE_MAX) continue;
             const ShaderResource* r = bi.resource;
-            if (bi.scaled_bridge) {
-                // Keep render-scale storage traffic on the GPU. The shader still sees its native
-                // extent and integer coordinates; only the renderer-owned backing is reduced.
-                VkImageMemoryBarrier barriers[2]{};
-                barriers[0] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                barriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                                            VK_ACCESS_TRANSFER_WRITE_BIT |
-                                            VK_ACCESS_SHADER_WRITE_BIT;
-                barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                barriers[0].oldLayout = static_cast<VkImageLayout>(bi.imported_saved_layout);
-                barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                barriers[0].srcQueueFamilyIndex = barriers[0].dstQueueFamilyIndex =
-                    VK_QUEUE_FAMILY_IGNORED;
-                barriers[0].image = bi.bridge_image;
-                barriers[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                barriers[1] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                barriers[1].srcAccessMask = 0;
-                barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                barriers[1].srcQueueFamilyIndex = barriers[1].dstQueueFamilyIndex =
-                    VK_QUEUE_FAMILY_IGNORED;
-                barriers[1].image = bi.image;
-                barriers[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
-                                     2, barriers);
-                VkImageBlit blit{};
-                blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                blit.srcOffsets[1] = {static_cast<int32_t>(bi.bridge_width),
-                                      static_cast<int32_t>(bi.bridge_height), 1};
-                blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                blit.dstOffsets[1] = {static_cast<int32_t>(r->width),
-                                      static_cast<int32_t>(r->height), 1};
-                vkCmdBlitImage(command, bi.bridge_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               bi.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-                               VK_FILTER_NEAREST);
-                barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                barriers[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                                            VK_ACCESS_SHADER_READ_BIT |
-                                            VK_ACCESS_TRANSFER_READ_BIT |
-                                            VK_ACCESS_TRANSFER_WRITE_BIT;
-                barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                barriers[0].newLayout = static_cast<VkImageLayout>(bi.imported_saved_layout);
-                barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                barriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
-                                            VK_ACCESS_SHADER_WRITE_BIT;
-                barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
-                                     2, barriers);
-                continue;
-            }
             if (bi.imported) {
                 if (!imported_barrier_owner(i)) continue;   // another binding transitions this image
                 // Borrowed renderer image: nothing to upload. Include shader-write access when an
@@ -3388,61 +3370,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                static_cast<uint32_t>(item.user_sgprs.size() * sizeof(uint32_t)),
                                item.user_sgprs.data());
         vkCmdDispatch(command, item.launch.groups_x, item.launch.groups_y, item.launch.groups_z);
-        // Downscale native compute output directly into its persistent render-scale target. The
-        // target is returned in exactly the layout recorded by the renderer's import contract.
-        for (const BoundImage& bi : images) {
-            if (!bi.scaled_bridge || bi.alias_of != SIZE_MAX) continue;
-            const ShaderResource* r = bi.resource;
-            VkImageMemoryBarrier barriers[2]{};
-            barriers[0] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-            barriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            barriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            barriers[0].srcQueueFamilyIndex = barriers[0].dstQueueFamilyIndex =
-                VK_QUEUE_FAMILY_IGNORED;
-            barriers[0].image = bi.image;
-            barriers[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            barriers[1] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-            barriers[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                                        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                                        VK_ACCESS_SHADER_READ_BIT |
-                                        VK_ACCESS_TRANSFER_READ_BIT |
-                                        VK_ACCESS_TRANSFER_WRITE_BIT;
-            barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            barriers[1].oldLayout = static_cast<VkImageLayout>(bi.imported_saved_layout);
-            barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            barriers[1].srcQueueFamilyIndex = barriers[1].dstQueueFamilyIndex =
-                VK_QUEUE_FAMILY_IGNORED;
-            barriers[1].image = bi.bridge_image;
-            barriers[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
-                                 2, barriers);
-            VkImageBlit blit{};
-            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            blit.srcOffsets[1] = {static_cast<int32_t>(r->width),
-                                  static_cast<int32_t>(r->height), 1};
-            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            blit.dstOffsets[1] = {static_cast<int32_t>(bi.bridge_width),
-                                  static_cast<int32_t>(bi.bridge_height), 1};
-            vkCmdBlitImage(command, bi.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           bi.bridge_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-                           VK_FILTER_LINEAR);
-            VkImageMemoryBarrier restore = barriers[1];
-            restore.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            restore.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                                    VK_ACCESS_SHADER_READ_BIT |
-                                    VK_ACCESS_TRANSFER_READ_BIT |
-                                    VK_ACCESS_TRANSFER_WRITE_BIT;
-            restore.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            restore.newLayout = static_cast<VkImageLayout>(bi.imported_saved_layout);
-            vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
-                                 1, &restore);
-        }
         // Hand every borrowed renderer image back in the layout its owner left it in (#1095), so the
         // renderer's own layout tracking stays true whether or not a dispatch consumed the target.
         for (size_t i = 0; i < images.size(); i++) {
@@ -3471,7 +3398,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // Storage images: copy the written texels back into the staging buffer for guest writeback.
         for (size_t i = 0; i < images.size(); i++) {
             const BoundImage& bi = images[i];
-            if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported || bi.scaled_bridge) continue;
+            if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported) continue;
             const ShaderResource* r = bi.resource;
             VkImageMemoryBarrier to_src{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             to_src.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -3567,17 +3494,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
         }
 
-        // A native storage binding may have written a borrowed renderer image directly. Publish the
-        // new authority before releasing its pin; no guest write notification is sent because raw
-        // guest bytes are intentionally stale while the persistent image owns the current pixels.
-        std::unordered_set<uint64_t> published_imports;
-        for (const BoundImage& image : images) {
-            if ((image.imported || image.scaled_bridge) && image.storage &&
-                image.imported_addr &&
-                published_imports.insert(image.imported_addr).second)
-                notify_live_render_target_image_written(image.imported_addr);
-        }
-
         bool readback_ok = true;
         for (auto& buffer : buffers) {
             if (buffer.alias_of != SIZE_MAX || !buffer.writable) continue;
@@ -3624,7 +3540,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // the render side exactly like the buffer path.
         for (size_t i = 0; i < images.size() && readback_ok; i++) {
             BoundImage& bi = images[i];
-            if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported || bi.scaled_bridge) continue;
+            if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported) continue;
             const ShaderResource* r = bi.resource;
             void* mapped = nullptr;
             if (ctx.map_memory(staging_memory[i], 0, staging_bytes[i], &mapped) != VK_SUCCESS) {

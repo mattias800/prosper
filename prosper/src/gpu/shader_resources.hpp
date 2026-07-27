@@ -84,6 +84,31 @@ constexpr bool native_float_storage_image(DataFormat format, uint32_t components
             (components == 3 && format == DataFormat::Float10_11_11));
 }
 
+// Native typed storage is only valid when the physical device advertises storage-image support
+// for the selected VkFormat. Keep the feature input abstract so the fallback policy can be tested
+// without requiring a particular Vulkan device or exposing Vulkan types in this shared header.
+constexpr bool native_float_storage_image_supported(DataFormat format, uint32_t components,
+                                                    bool srgb, bool storage_image_feature) {
+    return storage_image_feature && native_float_storage_image(format, components, srgb);
+}
+
+// Stable, Vulkan-independent bits used to carry per-format storage-image capabilities from the
+// device-owning frontend into the compute recompiler. Zero means the semantic format is not a native
+// typed-storage candidate; otherwise each exact VkFormat candidate has its own bit.
+constexpr uint32_t native_storage_format_support_bit(DataFormat format, uint32_t components) {
+    if (format == DataFormat::Unorm8)
+        return components == 1 ? 1u << 0 : components == 2 ? 1u << 1
+             : components == 4 ? 1u << 2 : 0u;
+    if (format == DataFormat::Float16)
+        return components == 1 ? 1u << 3 : components == 2 ? 1u << 4
+             : components == 4 ? 1u << 5 : 0u;
+    if (format == DataFormat::Float32)
+        return components == 1 ? 1u << 6 : components == 2 ? 1u << 7
+             : components == 4 ? 1u << 8 : 0u;
+    if (format == DataFormat::Float10_11_11 && components == 3) return 1u << 9;
+    return 0;
+}
+
 // IEEE-754 binary16 -> binary32 (handles subnormals, +/-inf, NaN). Used by the texture upload path to
 // convert a sampled Float16 surface to the RGBA8 the backend uploads (#290). Pure + testable.
 float half_to_float(uint16_t h);
@@ -316,6 +341,14 @@ struct SpirvDescriptorBinding {
     // the per-binding result to avoid seeding write-only outputs and reading back read-only inputs.
     bool readable = false;
     bool writable = false;
+    // Coordinate contract for sampled images. Normalized sampling (OpImageSample*/Gather) may bind a
+    // uniformly render-scaled image directly; texel-space access (OpImageFetch/Read) requires the
+    // descriptor's exact declared extent. A binding can use both, in which case exact extent wins.
+    bool normalized_sampling = false;
+    bool texel_access = false;
+    // Storage-image sampled type encoded by SPIR-V. This is the backend's authoritative choice
+    // between a native float VkFormat and the portable raw-uvec4 conversion path, including replay.
+    bool storage_float = false;
 };
 
 enum class DescriptorIssueCode : uint32_t {

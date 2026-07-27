@@ -224,6 +224,7 @@ struct SpirvCompute {
     // When non-zero, the backend promises to create this compute pipeline with an exact required
     // subgroup size equal to the PS5 wave. Native votes/scans are then architecture-exact.
     uint32_t native_subgroup_size=0;
+    uint32_t native_storage_format_support=0;
     uint32_t v_subgroup_localid=0, t_ptr_in_u32=0;
     uint32_t v_helper_invocation=0, t_ptr_in_bool=0;
     uint32_t v_internal_gds=0, t_ptr_gds_u32=0;
@@ -6277,8 +6278,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 if (ms && is_st) { ok = false; return true; }   // per-sample MSAA store not modeled (resolve shaders read)
                 const uint32_t components = res->num_components ? res->num_components : 1;
-                const bool native_float = native_float_storage_image(
-                    res->format, components, res->srgb);
+                const bool ordinary_2d = res->img_dim == 1 && res->depth == 1 &&
+                                         !res->depth_compare;
+                const bool native_float = ordinary_2d && native_float_storage_image_supported(
+                    res->format, components, res->srgb,
+                    (b.native_storage_format_support &
+                     native_storage_format_support_bit(res->format, components)) != 0);
                 b.declare_storage_image(res->binding, dim, arrayed, ms, native_float);
                 // Coordinate VGPR per axis. Non-NSA (len==2): consecutive from VADDR (src[0]). NSA (len>2):
                 // split across the extra address dwords — coord0 = VADDR, coord k>=1 = byte (k-1) of
@@ -8993,6 +8998,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const uint32_t local_z = std::max(1u, config.local_z);
     const uint32_t wave_size = config.wave_size == 32 ? 32u : 64u;
     b.native_subgroup_size = config.native_subgroup_size == wave_size ? wave_size : 0u;
+    b.native_storage_format_support = config.native_storage_format_support;
     b.begin(1, rt, local_x, local_y, local_z, wave_size,
             static_cast<uint32_t>(config.user_sgprs.size()));
     b.declare_guest_scratch(scratch);

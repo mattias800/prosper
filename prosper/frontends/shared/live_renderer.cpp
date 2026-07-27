@@ -437,32 +437,32 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                      prosper::gpu::LiveTargetImageImport& import) {
             if (!direct_bind) return false;
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
-            auto it = g_rtt.find(addr);
-            if (it == g_rtt.end()) {
-                // The color-target registry and persistent DS cache deliberately have separate
-                // authority rules. Compute still needs the same sampled-depth bridge as graphics:
-                // guest bytes are stale while the retained Vulkan depth image owns the current
-                // plane, and under PROSPER_RENDER_SCALE that image is also much smaller. Offer the
-                // synchronous compute consumer the exact image instead of detiling/uploading a 4K
-                // guest mirror. Persistent DS entries are not evicted, and compute runs in ordered
-                // submit execution, so unlike the bounded color cache this path needs no pin.
-                if (!request.allow_depth || !request.width || !request.height) return false;
+            // `allow_depth` is set only for a proven one-component Float32 2D descriptor. Prefer the
+            // matching DS plane before consulting the address-only color registry: guest allocations
+            // are reused, and a stale RttSurf at the same base must not hide the newer persistent
+            // depth image. Persistent DS entries are not evicted, and compute runs in ordered submit
+            // execution, so unlike the bounded color cache this path needs no pin.
+            if (request.allow_depth && request.width && request.height) {
                 const prosper::test::PersistentDsSampled sampled =
                     prosper::test::find_persistent_ds_sampled(
                         addr, request.width, request.height,
-                        request.render_scale ? request.render_scale : 1u);
+                        request.render_scale ? request.render_scale : 1u,
+                        request.normalized_sampling);
                 const prosper::test::RenderVkCtx& ctx = prosper::test::render_vk_ctx();
-                if (!sampled.image || !ctx.ok) return false;
-                import.width = sampled.width;
-                import.height = sampled.height;
-                import.kind = prosper::gpu::LiveTargetImageImport::Kind::Depth;
-                import.native_format = static_cast<uint32_t>(sampled.format);
-                import.image = sampled.image->image;
-                import.device = ctx.dev;
-                import.layout = static_cast<uint32_t>(
-                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-                return true;
+                if (sampled.image && ctx.ok) {
+                    import.width = sampled.width;
+                    import.height = sampled.height;
+                    import.kind = prosper::gpu::LiveTargetImageImport::Kind::Depth;
+                    import.native_format = static_cast<uint32_t>(sampled.format);
+                    import.image = sampled.image->image;
+                    import.device = ctx.dev;
+                    import.layout = static_cast<uint32_t>(
+                        VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+                    return true;
+                }
             }
+            auto it = g_rtt.find(addr);
+            if (it == g_rtt.end()) return false;
             RttSurf& surface = it->second;
             if (!surface.w || !surface.h) return false;
             const VkFormat format = prosper::test::backend_color_format(surface.format);
@@ -934,8 +934,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                const prosper::gpu::ShaderResourceTable* vrt,
                                const prosper::gpu::ShaderResourceTable* prt) {
               std::vector<prosper::test::FrameResource> R;
-              auto add = [&](const prosper::gpu::ShaderResourceTable* t, uint32_t set){
+              auto add = [&](const prosper::gpu::ShaderResourceTable* t, uint32_t set,
+                             const std::vector<uint32_t>& spirv,
+                             prosper::gpu::SpirvShaderStage stage){
                 if (!t) return;
+                const prosper::gpu::DescriptorValidationReport reflected =
+                    prosper::gpu::validate_spirv_descriptor_interface(
+                        spirv, t, set, stage, false);
                 for (auto& r : t->resources) {
                     const auto resource_timing_start = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
@@ -948,6 +953,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     bool resource_buffer_view = false;
                     prosper::test::FrameResource fr; fr.binding = r.binding; fr.set = set;
                     fr.is_storage_image = r.cls == RC::StorageImage;
+                    const auto reflected_binding = std::find_if(
+                        reflected.descriptors.begin(), reflected.descriptors.end(),
+                        [&](const auto& descriptor) {
+                            return descriptor.set == set && descriptor.binding == r.binding;
+                        });
+                    const bool normalized_sampling =
+                        reflected_binding != reflected.descriptors.end() &&
+                        reflected_binding->kind ==
+                            prosper::gpu::SpirvDescriptorKind::CombinedImageSampler &&
+                        reflected_binding->normalized_sampling &&
+                        !reflected_binding->texel_access;
                     // Captured replays preserve the logical guest address for RT identity but provide
                     // owned bytes here. Production resources leave host_data null and use guest memory.
                     auto copy_resource = [&](uint8_t* dst, uint64_t addr, size_t n) -> size_t {
@@ -1063,7 +1079,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             RttSurf& surface = live_rtt->second;
                             const bool sampled_extent_compatible =
                                 prosper::frontend::rtt_sampled_extent_compatible(
-                                    tw, th, surface.w, surface.h, render_scale);
+                                    tw, th, surface.w, surface.h, render_scale,
+                                    normalized_sampling);
                             const bool direct_serves = !fr.is_storage_image && r.img_dim == 1u &&
                                 sampled_extent_compatible &&
                                 r.gpu_addr != draw.color0_base &&
@@ -1107,7 +1124,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             r.img_dim == 1u &&
                             live_rtt != g_rtt.end() && live_rtt->second.gpu_valid &&
                             prosper::frontend::rtt_sampled_extent_compatible(
-                                tw, th, live_rtt->second.w, live_rtt->second.h, render_scale) &&
+                                tw, th, live_rtt->second.w, live_rtt->second.h, render_scale,
+                                normalized_sampling) &&
                             r.gpu_addr != draw.color0_base &&
                             prosper::test::find_persistent_color_target(
                                 r.gpu_addr, live_rtt->second.w, live_rtt->second.h,
@@ -1437,7 +1455,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             !has_live_rtt && !fr.is_storage_image && r.img_dim == 1u &&
                                     r.cls == RC::Texture
                                 ? prosper::test::find_persistent_ds_sampled(
-                                      r.gpu_addr, tw, th, render_scale)
+                                      r.gpu_addr, tw, th, render_scale, normalized_sampling)
                                 : prosper::test::PersistentDsSampled{};
                         const bool has_ds_live = sampled_ds.image != nullptr;
                         if (has_gpu_live_rtt) {
@@ -2504,7 +2522,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     R.push_back(std::move(fr));
                 }
               };
-              add(vrt, 0); add(prt, 1);   // VS resources -> descriptor set 0, PS -> set 1
+              add(vrt, 0, draw.vs_words(), prosper::gpu::SpirvShaderStage::Vertex);
+              add(prt, 1, draw.fs_words(), prosper::gpu::SpirvShaderStage::Fragment);
+              // VS resources -> descriptor set 0, PS -> set 1
               return R;
             };
             // Poison mode keeps the draw running while making invalid bindings visually/numerically
@@ -3119,7 +3139,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                         active_color1(items[later]) == target_base;
                                     const bool sampled_extent_compatible =
                                         prosper::frontend::rtt_sampled_extent_compatible(
-                                            rw, rh, gw, gh, render_scale);
+                                            rw, rh, gw, gh, render_scale, false);
                                     if (resource.img_dim == 1u && sampled_extent_compatible) {
                                         result.sampled_exact = true;
                                         result.feedback |= same_pass_target;

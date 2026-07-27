@@ -51,23 +51,23 @@ constexpr bool rtt_scaled_extent_compatible(uint32_t requested_w, uint32_t reque
 // unnormalized texel-fetch contracts must keep using exact extents at their call sites.
 constexpr bool rtt_sampled_extent_compatible(uint32_t requested_w, uint32_t requested_h,
                                              uint32_t cached_w, uint32_t cached_h,
-                                             uint32_t render_scale) {
+                                             uint32_t render_scale,
+                                             bool normalized_sampling) {
     if (requested_w == cached_w && requested_h == cached_h) return true;
-    return rtt_scaled_extent_compatible(
+    return normalized_sampling && rtt_scaled_extent_compatible(
         requested_w, requested_h, cached_w, cached_h, render_scale);
 }
 
-// A native-format storage image cannot be bound at a different extent because imageLoad/imageStore
-// use integer texel coordinates. It can, however, stay entirely on the GPU through a temporary
-// native-resolution image when the renderer owns an exact render-scale version: upscale before the
-// dispatch and downscale the result afterwards. This deliberately has the same strict geometry gate
-// as scaled sampled imports so an unrelated alias at the same guest address is never bridged.
-constexpr bool rtt_storage_bridge_extent_compatible(uint32_t requested_w, uint32_t requested_h,
-                                                    uint32_t cached_w, uint32_t cached_h,
-                                                    uint32_t render_scale) {
-    return (requested_w != cached_w || requested_h != cached_h) &&
-           rtt_scaled_extent_compatible(
-               requested_w, requested_h, cached_w, cached_h, render_scale);
+// Renderer-owned persistent color images are created for attachment/sampling/transfer use, not
+// storage descriptors. Only sampled descriptors may borrow them directly; storage bindings retain
+// an owned storage-capable image and the guest writeback path even at an exact extent.
+constexpr bool rtt_direct_import_compatible(bool storage_image,
+                                            uint32_t requested_w, uint32_t requested_h,
+                                            uint32_t cached_w, uint32_t cached_h,
+                                            uint32_t render_scale,
+                                            bool normalized_sampling) {
+    return !storage_image && rtt_sampled_extent_compatible(
+        requested_w, requested_h, cached_w, cached_h, render_scale, normalized_sampling);
 }
 
 } // namespace prosper::frontend
