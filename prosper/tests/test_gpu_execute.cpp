@@ -650,6 +650,61 @@ int main() {
     CHECK(!execute_and_present(empty, W, H), "execute_and_present skips a draw-less submit even with a renderer");
     set_submit_renderer({});  // restore inert default
 
+    // #1434: a shared shader value WINS over the owned vector, so assigning `vs`/`fs` on an item
+    // that already carries one silently keeps rendering the ORIGINAL shader. That reads as "my
+    // substitution changed nothing" rather than as an error, and it cost real time during the
+    // #1427 investigation. set_vs()/set_fs() are the safe form: they drop the shared value and the
+    // cache identity, so persistent backend caches compare the new words instead of hitting the
+    // stale entry.
+    {
+        DrawItem shadowed;
+        shadowed.vs_shared = std::make_shared<const std::vector<uint32_t>>(
+            std::vector<uint32_t>{0x07230203u, 111u});
+        shadowed.fs_shared = std::make_shared<const std::vector<uint32_t>>(
+            std::vector<uint32_t>{0x07230203u, 222u});
+        shadowed.vs_identity = 0xAAAA; shadowed.fs_identity = 0xBBBB;
+
+        shadowed.vs = {0x07230203u, 999u};          // the trap: direct assignment
+        CHECK(shadowed.vs_words() == std::vector<uint32_t>({0x07230203u, 111u}),
+              "a direct vs assignment is shadowed by vs_shared (the #1434 trap)");
+        CHECK(shadowed.has_shadowed_shader(),
+              "has_shadowed_shader() reports the shadowed assignment");
+
+        shadowed.set_vs({0x07230203u, 999u});
+        CHECK(shadowed.vs_words() == std::vector<uint32_t>({0x07230203u, 999u}) &&
+                  !shadowed.vs_shared && shadowed.vs_identity == 0,
+              "set_vs substitutes the words and clears the shared value and cache identity");
+        CHECK(shadowed.fs_words() == std::vector<uint32_t>({0x07230203u, 222u}) &&
+                  shadowed.fs_identity == 0xBBBB,
+              "set_vs leaves the fragment stage untouched");
+
+        shadowed.set_fs({0x07230203u, 888u});
+        CHECK(shadowed.fs_words() == std::vector<uint32_t>({0x07230203u, 888u}) &&
+                  !shadowed.fs_shared && shadowed.fs_identity == 0 &&
+                  !shadowed.has_shadowed_shader(),
+              "set_fs substitutes the fragment stage and clears the shadow");
+
+        DrawItem owned;                              // no shared value: unchanged behavior
+        owned.set_vs({0x07230203u, 7u});
+        CHECK(owned.vs_words() == std::vector<uint32_t>({0x07230203u, 7u}) &&
+                  !owned.has_shadowed_shader(),
+              "set_vs on an item without a shared value behaves like a plain assignment");
+
+        // BackendDraw carries the identical accessor precedence (the line #1434 originally cited),
+        // so it gets the same setters. This is the struct the frontend hands the Vulkan backend.
+        prosper::test::BackendDraw backend;
+        backend.vs_shared = std::make_shared<const std::vector<uint32_t>>(
+            std::vector<uint32_t>{0x07230203u, 111u});
+        backend.vs_identity = 0xCCCC;
+        backend.vs = {0x07230203u, 999u};
+        CHECK(backend.vs_words() == std::vector<uint32_t>({0x07230203u, 111u}),
+              "BackendDraw shows the same shadowing before substitution (#1434)");
+        backend.set_vs({0x07230203u, 999u});
+        CHECK(backend.vs_words() == std::vector<uint32_t>({0x07230203u, 999u}) &&
+                  !backend.vs_shared && backend.vs_identity == 0,
+              "BackendDraw::set_vs substitutes and clears the shared value and identity");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

@@ -1408,14 +1408,14 @@ int main(int argc, char** argv) {
                 const auto& raw = replay.raw_shader_versions[it.vs_raw_shader_index];
                 auto vs = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
                                                          it.vrt.get(), nullptr, false);
-                if (!vs.empty()) { it.vs = std::move(vs); it.vs_shared.reset(); it.vs_identity = 0; ++vs_swapped; }
+                if (!vs.empty()) { it.set_vs(std::move(vs)); ++vs_swapped; }
                 else ++vs_kept;
             } else ++vs_kept;
             if (it.fs_raw_shader_index < replay.raw_shader_versions.size()) {
                 const auto& raw = replay.raw_shader_versions[it.fs_raw_shader_index];
                 auto fs = prosper::gpu::recompile_fragment(raw.words.data(), raw.words.size(),
                                                            it.prt.get(), nullptr, UINT32_MAX, nullptr);
-                if (!fs.empty()) { it.fs = std::move(fs); it.fs_shared.reset(); it.fs_identity = 0; ++fs_swapped; }
+                if (!fs.empty()) { it.set_fs(std::move(fs)); ++fs_swapped; }
                 else ++fs_kept;
             } else ++fs_kept;
         }
@@ -1446,7 +1446,7 @@ int main(int argc, char** argv) {
                 auto xfb = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
                                                           it.vrt.get(), nullptr, true);
                 if (!xfb.empty()) {
-                    it.vs = std::move(xfb); it.vs_shared.reset(); it.vs_identity = 0;
+                    it.set_vs(std::move(xfb));
                     std::fprintf(stderr,
                                  "[geom-probe] draw=%llu item=%zu operation=%lld VS re-recompiled "
                                  "with xfb capture (%zu words)\n",
@@ -1487,7 +1487,7 @@ int main(int argc, char** argv) {
                 auto fs = prosper::gpu::recompile_fragment(raw.words.data(), raw.words.size(),
                                                            it.prt.get(), nullptr, UINT32_MAX, nullptr);
                 if (!fs.empty()) {
-                    it.fs = std::move(fs); it.fs_shared.reset(); it.fs_identity = 0;
+                    it.set_fs(std::move(fs));
                     std::fprintf(stderr,
                                  "[fs-tap] draw=%llu item=%zu operation=%lld FS re-recompiled "
                                  "at pc=%u with colour tap (%zu words)\n",

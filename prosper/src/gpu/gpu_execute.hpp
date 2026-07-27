@@ -92,9 +92,29 @@ struct DrawItem {
     uint64_t draw_index = 0;
     uint64_t command_order = 0;
 
+    // A shared value WINS over the owned vector. Assigning `vs`/`fs` on an item that already carries
+    // a shared value therefore has NO effect — the original shader keeps rendering, and the mistake
+    // reads as "my substitution changed nothing" rather than as an error (#1434; it cost real time in
+    // the #1427 investigation, and #1396 fixed the same class of confusion for the replay probes).
+    // Substitute through set_vs()/set_fs(), which drop the shared value and the cache identity so
+    // persistent backend caches compare the new words instead of hitting the old entry. `gs` has no
+    // shared form today; if one is ever added it needs the same accessor/setter pair, or this bug
+    // returns through the geometry stage.
     const std::vector<uint32_t>& vs_words() const { return vs_shared ? *vs_shared : vs; }
     const std::vector<uint32_t>& gs_words() const { return gs; }
     const std::vector<uint32_t>& fs_words() const { return fs_shared ? *fs_shared : fs; }
+
+    void set_vs(std::vector<uint32_t> words) {
+        vs = std::move(words); vs_shared.reset(); vs_identity = 0;
+    }
+    void set_fs(std::vector<uint32_t> words) {
+        fs = std::move(words); fs_shared.reset(); fs_identity = 0;
+    }
+    // True when an owned vector was assigned while a shared value still shadows it — the silent
+    // failure above. Diagnostics assert on this rather than rendering the wrong shader quietly.
+    bool has_shadowed_shader() const {
+        return (vs_shared && !vs.empty()) || (fs_shared && !fs.empty());
+    }
 };
 
 // The pluggable Vulkan backend: render the submit's draw items into one image and return W*H*4 RGBA8

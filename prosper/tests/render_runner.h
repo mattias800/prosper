@@ -226,9 +226,21 @@ struct BackendDraw {
     // plain vkCmdDraw(vcount). Both paths preserve instance_count.
     std::vector<uint32_t> indices;
 
+    // Same precedence — and same trap — as DrawItem (#1434): a shared value WINS, so assigning
+    // `vs`/`fs` on a draw that already carries one silently keeps the ORIGINAL shader. Substitute
+    // through set_vs()/set_fs(), which also clear the cache identity so the persistent pipeline
+    // cache compares the new words instead of hitting the stale entry. `gs` has no shared form; if
+    // one is ever added it needs the same accessor/setter pair.
     const std::vector<uint32_t>& vs_words() const { return vs_shared ? *vs_shared : vs; }
     const std::vector<uint32_t>& gs_words() const { return gs; }
     const std::vector<uint32_t>& fs_words() const { return fs_shared ? *fs_shared : fs; }
+
+    void set_vs(std::vector<uint32_t> words) {
+        vs = std::move(words); vs_shared.reset(); vs_identity = 0;
+    }
+    void set_fs(std::vector<uint32_t> words) {
+        fs = std::move(words); fs_shared.reset(); fs_identity = 0;
+    }
 };
 
 struct BackendTextureUploadStats {
