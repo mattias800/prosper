@@ -461,13 +461,14 @@ void decode_operands(Rdna2Inst& i) {
             // Image op. opcode is 8 bits: MSB in dword0 bit 0, low 7 bits in [24:18] (Table 100:
             // "combine bits zero and 18-24" — dropping bit 0 aliased IMAGE_MSAA_LOAD (128) onto
             // IMAGE_LOAD (0) and the _G16/BVH families onto wrong identities); dmask[11:8];
-            // unorm[12]; dim[5:3]. dword1: VADDR base[7:0]; VDATA base[15:8]; SRSRC (T# base
+            // unorm[12]; GLC[13]; dim[5:3]. dword1: VADDR base[7:0]; VDATA base[15:8]; SRSRC (T# base
             // SGPR, ×4)[20:16]; SSAMP (S# base SGPR, ×4)[25:21].
             // image_sample = opcode 0x20, image_load = 0x00. (Bit layout verified via llvm-mc gfx1030.)
             const uint32_t d1 = i.words[1];
             i.opcode     = ((w & 1u) << 7) | ((w >> 18) & 0x7Fu);
             i.mimg_dmask = (w >> 8)  & 0xFu;
             i.mimg_unorm = (w >> 12) & 0x1u;
+            i.mimg_glc   = (w >> 13) & 0x1u;
             i.mimg_dim   = (w >> 3)  & 0x7u;
             i.dst    = vgpr(d1 >> 8);                         // VDATA (dest base)
             i.src[0] = vgpr(d1 & 0xFFu);                      // VADDR (coord base VGPR)

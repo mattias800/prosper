@@ -2071,7 +2071,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         SrtUse u; u.kind = 0; u.t8 = *t8;
                         u.key = tkey;
                         u.use_pc = in.pc;
-                        u.is_store = in.opcode == 0x08;   // image_store: a STORAGE-image use (#590)
+                        u.is_storage_image = in.opcode == 0x08 || in.opcode == 0x0f;
                         u.is_depth_compare = (in.opcode >= 0x28 && in.opcode <= 0x2f) ||
                                              (in.opcode >= 0x38 && in.opcode <= 0x3f) ||
                                              (in.opcode >= 0x58 && in.opcode <= 0x5f);
@@ -2942,7 +2942,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     if (log) fprintf(stderr, "[srt] %s cbuf key=0x%x pc=%u base=0x%llx size=%u\n", is_ps ? "PS" : "VS",
                                      u.key, u.use_pc, (unsigned long long)d.base, resource_size);
                     t.resources.push_back(r);
-                } else {                                  // texture (T# [+ paired S#])
+                } else {                                  // sampled texture or storage image (T# [+ paired S#])
                     DecodedImageDescriptor d = decode_image_descriptor(u.t8.data());
                     if (g_dyntrace_force)
                         fprintf(stderr, "[dynfail] tex use pc=%u key=0x%x base=0x%llx %ux%u fmt=%u tile=%u\n",
@@ -2957,8 +2957,11 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     // if it has none yet (#273). If it already carries a DIFFERENT use's pc, fall
                     // through and create a second resource for this pc (fetch_pc holds one pc; a
                     // sample whose pc has no mapping would stay unresolved).
+                    const ResourceClass wanted = u.is_storage_image
+                        ? ResourceClass::StorageImage : ResourceClass::Texture;
                     Gen5ImageFormatInfo fi;
                     if (!gen5_image_format(d.format, &fi)) {
+                        if (wanted == ResourceClass::StorageImage) continue;
                         // Same policy as build_shader_resources: the normal per-target renderer can
                         // bind this as RGBA8 for RTT injection; legacy single-target mode skips it.
                         static const bool rtt_bind = getenv("PROSPER_RTT") != nullptr ||
@@ -2978,7 +2981,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     {
                         bool mapped = false;
                         for (auto& r0 : t.resources)
-                            if (r0.cls == ResourceClass::Texture && r0.gpu_addr == view.base &&
+                            if (r0.cls == wanted && r0.gpu_addr == view.base &&
                                 r0.width == view.width && r0.height == view.height &&
                                 r0.depth == d.depth && r0.format == fi.format && r0.img_dim == img_dim &&
                                 r0.depth_compare == u.is_depth_compare &&
@@ -2992,7 +2995,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                         if (mapped) continue;
                     }
                     ShaderResource r;
-                    r.cls = ResourceClass::Texture;
+                    r.cls = wanted;
                     r.format = fi.format; r.num_components = fi.num_components;
                     r.gpu_addr = view.base; r.width = view.width; r.height = view.height; r.depth = d.depth;
                     r.declared_mip_levels =
@@ -3026,7 +3029,9 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     r.size = static_cast<uint32_t>(backing_bytes);
                     r.srt_offset = clash ? 0xFFFFFFFFu : u.key;   // ambiguous/absent key: pc-only provenance
                     r.fetch_pc   = u.use_pc;                       // per-instruction provenance (#273)
-                    if (u.has_samp) {                     // paired S# (same SQ_IMG_SAMP decode as the sharp path)
+                    if (wanted == ResourceClass::Texture && u.has_samp) {
+                        // Paired S# (same SQ_IMG_SAMP decode as the sharp path). Storage operations do
+                        // not consume a sampler even when their SSAMP bits alias known user SGPRs.
                         const uint32_t* sm = u.s4.data();
                         r.mag_filter  = ((sm[2] >> 20) & 0x3u) ? 1u : 0u;
                         r.min_filter  = ((sm[2] >> 22) & 0x3u) ? 1u : 0u;
@@ -3044,9 +3049,12 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                         r.lod_bias           = (float)bias14 / 256.0f;
                         r.border_color_type  = (sm[3] >> 30) & 0x3u;
                     }
-                    if (log) fprintf(stderr, "[srt] %s tex key=0x%x %ux%u fmt=%u base=0x%llx tile=%u samp=%d\n",
-                                     is_ps ? "PS" : "VS", u.key, d.width, d.height, d.format,
-                                     (unsigned long long)d.base, d.tile_mode, (int)u.has_samp);
+                    if (log) fprintf(stderr, "[srt] %s %s key=0x%x %ux%u fmt=%u base=0x%llx tile=%u samp=%d\n",
+                                     is_ps ? "PS" : "VS",
+                                     wanted == ResourceClass::StorageImage ? "storage-image" : "tex",
+                                     u.key, d.width, d.height, d.format,
+                                     (unsigned long long)d.base, d.tile_mode,
+                                     (int)(wanted == ResourceClass::Texture && u.has_samp));
                     t.resources.push_back(r);
                 }
             }
@@ -3317,7 +3325,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     // Unknown sampled formats cannot be decoded. Unknown storage formats may still
                     // recompile (format-free SPIR-V), but remain explicitly Unknown so the live backend
                     // rejects them instead of silently treating arbitrary bytes as RGBA8.
-                    if (!mapped_fmt && !u.is_store) continue;
+                    if (!mapped_fmt && !u.is_storage_image) continue;
                     if (mapped_fmt && fi.block_width > 1 && fi.snorm) continue;   // signed BCn: not wired
                     const DecodedImageView view = mapped_fmt
                         ? image_base_level_view(d, fi)
@@ -3327,8 +3335,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
                         warn_unsupported_image_view(d);
                         continue;
                     }
-                    const ResourceClass wanted = u.is_store ? ResourceClass::StorageImage
-                                                           : ResourceClass::Texture;
+                    const ResourceClass wanted = u.is_storage_image ? ResourceClass::StorageImage
+                                                                   : ResourceClass::Texture;
                     const DataFormat view_format = mapped_fmt ? fi.format : DataFormat::Unknown;
                     const uint32_t img_dim = image_type_to_dim(d.type);
                     {

@@ -126,11 +126,13 @@ struct Rdna2Inst {
     // OP). Bit 16 is likewise captured so an unknown flag rejects rather than silently running
     // against workgroup LDS with device-global (GDS) semantics expected.
     bool     ds_gds = false;
-    // 2D=1, 3D=2, Cube=3, 1D_ARRAY=4, 2D_ARRAY=5, ...), and the unnormalized-coordinate flag. VDATA is
-    // in `dst`, VADDR in src[0], SRSRC (T# base SGPR) in src[1], SSAMP (S# base SGPR) in src[2].
+    // 2D=1, 3D=2, Cube=3, 1D_ARRAY=4, 2D_ARRAY=5, ...), the unnormalized-coordinate flag, and GLC
+    // (bit 13). For image atomics, GLC means return the pre-operation value to VDATA. VDATA is in
+    // `dst`, VADDR in src[0], SRSRC (T# base SGPR) in src[1], SSAMP (S# base SGPR) in src[2].
     uint32_t mimg_dmask = 0;
     uint32_t mimg_dim   = 0;
     bool     mimg_unorm = false;
+    bool     mimg_glc   = false;
 
     // VINTRP-only: the interpolated attribute (parameter location) and its component channel (0..3).
     // opcode = p1(0)/p2(1)/mov(2); dst = vdst; src[0] = vsrc (the i/j barycentric VGPR).

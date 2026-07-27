@@ -176,6 +176,8 @@ inline VkFormat backend_color_format(VkFormat format) {
         return VK_FORMAT_R16G16B16A16_SFLOAT;
     if (format == VK_FORMAT_R8_UNORM)
         return VK_FORMAT_R8_UNORM;
+    if (format == VK_FORMAT_R32_UINT)
+        return VK_FORMAT_R32_UINT;
     return VK_FORMAT_R8G8B8A8_UNORM;
 }
 

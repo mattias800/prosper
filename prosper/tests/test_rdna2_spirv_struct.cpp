@@ -971,6 +971,29 @@ int main() {
     }
     printf("  [ok]   image_get_resinfo 3D lowers to size/level image queries\n");
 
+    // Astro Bot's exact visibility-image packet: exchange v9 with R32_UINT texel (v0,v1), GLC=1.
+    // Both SPIR-V operations are essential: accepting the MIMG without a real texel pointer/atomic
+    // would merely hide the rejection while dropping the image side effect.
+    const uint32_t ps_image_atomic[] = {
+        0x7e000280u, 0x7e020280u, 0x7e120280u,
+        0xf03c2108u, 0x00000900u,
+        0x7e000280u, 0x7e020309u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u, 0xbf810000u,
+    };
+    ShaderResourceTable rt_atomic_image;
+    { ShaderResource image{}; image.cls = ResourceClass::StorageImage;
+      image.format = DataFormat::Uint32; image.num_components = 1;
+      image.binding = 4; image.img_dim = 1; image.width = 1; image.height = 1;
+      image.depth = 1; image.sgpr_base = 0; rt_atomic_image.resources.push_back(image); }
+    const std::vector<uint32_t> atomic_image_spv = recompile_fragment(
+        ps_image_atomic, std::size(ps_image_atomic), &rt_atomic_image);
+    if (atomic_image_spv.empty() || !has_opcode(atomic_image_spv, 60u) ||
+        !has_opcode(atomic_image_spv, 229u)) {
+        printf("  [FAIL] image_atomic_swap did not lower through OpImageTexelPointer/OpAtomicExchange\n");
+        return 1;
+    }
+    printf("  [ok]   image_atomic_swap lowers to a typed R32_UINT SPIR-V image atomic\n");
+
     // LDS array is sized from the shader's real allocation (#130), not a hardcoded 16 KB. A compute
     // kernel that uses ds_write/ds_read declares a Workgroup array; its length must be 4096 dwords
     // (16 KB) by default and rise to the requested size (clamped to the RDNA2 64 KB / 16384-dword max)

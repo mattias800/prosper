@@ -627,6 +627,31 @@ int main() {
           direct_uses[0].s4[0] == seed5d[8] && direct_uses[0].s4[3] == seed5d[11],
           "direct user-SGPR T#/S# dwords are preserved");
 
+    // Astro Bot's live visibility packet consumes a direct R32_UINT T# in s[0:7]. Opcode 0x0f is
+    // IMAGE_ATOMIC_SWAP, so its instruction-scoped resource must be materialized as a storage image
+    // even though the packet's unused SSAMP field aliases s0.
+    const uint32_t image_atomic_swap[] = {
+        0xf03c2108u, 0x00000900u,
+        0xbf810000u,
+    };
+    const uint32_t atomic_image_seed[8] = {
+        0x055c0100u, 0xc1400000u, 0x001fc01fu, 0x91b00204u,
+        0x00000000u, 0x00700000u, 0x00000000u, 0x00000000u,
+    };
+    std::vector<SrtUse> atomic_image_uses;
+    resolve_dynamic_fetch(image_atomic_swap, std::size(image_atomic_swap),
+                          atomic_image_seed, std::size(atomic_image_seed), 0,
+                          &atomic_image_uses);
+    const std::array<uint32_t, 8> expected_atomic_t8 = {
+        0x055c0100u, 0xc1400000u, 0x001fc01fu, 0x91b00204u,
+        0x00000000u, 0x00700000u, 0x00000000u, 0x00000000u,
+    };
+    CHECK(atomic_image_uses.size() == 1 && atomic_image_uses[0].kind == 0 &&
+              atomic_image_uses[0].use_pc == 0 &&
+              atomic_image_uses[0].is_storage_image &&
+              atomic_image_uses[0].t8 == expected_atomic_t8,
+          "image_atomic_swap publishes the live direct T# as a storage-image use");
+
     // Astro's title PS consumes a V# placed directly in s[24:27] with a scalar offset computed in
     // VCC_LO. No s_load gives that descriptor an SRT key, and AGC metadata need not publish a sharp
     // for it. The fold nevertheless knows all four entry dwords and the exact offset, so retain the

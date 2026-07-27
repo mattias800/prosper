@@ -213,6 +213,7 @@ enum : uint32_t {
     OpTypePointer = 32,
     OpConstant = 43,
     OpVariable = 59,
+    OpImageTexelPointer = 60,
     OpLoad = 61,
     OpStore = 62,
     OpAccessChain = 65,
@@ -233,6 +234,7 @@ enum : uint32_t {
 };
 enum : uint32_t {
     StorageUniformConstant = 0,
+    StorageImage = 11,
     StorageBuffer = 12,
     DecorationArrayStride = 6,
     DecorationBinding = 33,
@@ -605,7 +607,27 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     };
     for (const Instruction& in : insts) {
         const uint32_t n = in.words - 1u;
-        if (in.opcode == OpLoad && n >= 3) {
+        if (in.opcode == OpImageTexelPointer && n >= 5) {
+            // Unlike OpImageRead/Write, this instruction consumes the storage-image descriptor
+            // variable directly and returns a pointer in the Image storage class. Preserve that
+            // provenance so the following OpAtomic* marks the image readable+writable.
+            const uint32_t result_type = word(in, 0);
+            const uint32_t result = word(in, 1);
+            const uint32_t image_var = word(in, 2);
+            const auto descriptor = descriptor_vars.find(image_var);
+            const auto pointer_type = types.find(result_type);
+            if (descriptor != descriptor_vars.end() &&
+                descriptor->second == SpirvDescriptorKind::StorageImage &&
+                pointer_type != types.end() &&
+                pointer_type->second.kind == TypeKind::Pointer &&
+                pointer_type->second.storage == StorageImage) {
+                PointerAccess access;
+                access.variable = image_var;
+                access.pointee_type = pointer_type->second.element;
+                accesses[result] = access;
+                texel_access_vars.insert(image_var);
+            }
+        } else if (in.opcode == OpLoad && n >= 3) {
             const uint32_t root = pointer_root(word(in, 2));
             const auto descriptor = descriptor_vars.find(root);
             const bool image_descriptor = descriptor != descriptor_vars.end() &&

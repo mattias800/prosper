@@ -258,6 +258,14 @@ int main() {
     CHECK(n3.fmt == Rdna2Format::MIMG && n3.opcode == 0x00u && n3.len_dwords == 3 && n3.mimg_dim == 2u &&
           (n3.words[1] & 0xFFu) == 0u && (n3.words[2] & 0xFFu) == 7u && ((n3.words[2] >> 8) & 0xFFu) == 3u,
           "NSA MIMG 3D captures the extra address dword; coords decode to v0,v7,v3");
+    // Astro Bot's live image_atomic_swap packet. Bit 13 is GLC: atomically exchange v9 with the
+    // R32_UINT texel at (v0,v1), returning the pre-operation value to v9.
+    const uint32_t mimg_atomic_swap[] = { 0xf03c2108u, 0x00000900u };
+    Rdna2Inst atomic_swap = rdna2_decode_one(mimg_atomic_swap, 2);
+    CHECK(atomic_swap.fmt == Rdna2Format::MIMG && atomic_swap.opcode == 0x0fu &&
+          atomic_swap.mimg_dim == 1u && atomic_swap.mimg_dmask == 1u && atomic_swap.mimg_glc &&
+          atomic_swap.dst.value == 9 && atomic_swap.src[0].value == 0 && atomic_swap.src[1].value == 0,
+          "Astro image_atomic_swap decodes 2D/R32 data and the return-pre-op GLC flag");
 
     // inline-constant field decode: SGPR106 special, field 129 -> +1, 193 -> -1, 242 -> 1.0f
     CHECK(decode_src_field(0).kind == OperandKind::SGPR && decode_src_field(0).value == 0, "field 0 -> SGPR0");

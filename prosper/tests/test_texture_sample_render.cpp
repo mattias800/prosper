@@ -123,6 +123,9 @@ int main() {
               "native R8 sampled upload broadcasts its channel without RGBA expansion");
         CHECK(prosper::test::backend_color_bytes_per_pixel(VK_FORMAT_R8_UNORM) == 1,
               "native R8 upload accounts one byte per texel");
+        CHECK(prosper::test::backend_color_format(VK_FORMAT_R32_UINT) == VK_FORMAT_R32_UINT &&
+                  prosper::test::backend_color_bytes_per_pixel(VK_FORMAT_R32_UINT) == 4,
+              "R32_UINT storage images retain their typed four-byte Vulkan format");
     }
 
     // The live renderer commonly submits hundreds of draws that reference the same few decoded
@@ -660,6 +663,49 @@ int main() {
             const auto storage_stats = prosper::test::backend_texture_upload_stats();
             CHECK(storage_stats.references == 2 && storage_stats.unique_uploads == 2,
                   "sampled and storage descriptors never share an incompatible image upload");
+        }
+    }
+
+    // Astro Bot's exact IMAGE_ATOMIC_SWAP form. Every fragment exchanges the R32_UINT word with the
+    // same 1.0f bit pattern, so GLC's returned pre-operation value remains 1.0f and exports GREEN.
+    // This executes the translated OpImageTexelPointer/OpAtomicExchange against a real Vulkan image.
+    {
+        const uint32_t atomic_ps[] = {
+            0x7e000280u,                         // v0 = x = 0
+            0x7e020280u,                         // v1 = y = 0
+            0x7e1202ffu, 0x3f800000u,           // v9 = exchange value (1.0f bits)
+            0xf03c2108u, 0x00000900u,           // image_atomic_swap v9,[v0,v1],s[0:7] glc dmask:x 2D
+            0x7e000280u, 0x7e020309u,           // R=0, G=returned v9
+            0x7e040280u, 0x7e0602f2u,           // B=0, A=1
+            0xf800000fu, 0x03020100u, 0xbf810000u,
+        };
+        ShaderResourceTable atomic_rt;
+        { ShaderResource image{}; image.cls = ResourceClass::StorageImage;
+          image.format = DataFormat::Uint32; image.num_components = 1;
+          image.binding = 4; image.img_dim = 1; image.width = 1; image.height = 1;
+          image.depth = 1; image.sgpr_base = 0; atomic_rt.resources.push_back(image); }
+        const std::vector<uint32_t> atomic_frag = recompile_fragment(
+            atomic_ps, std::size(atomic_ps), &atomic_rt);
+        CHECK(!atomic_frag.empty() && atomic_frag[0] == 0x07230203u,
+              "recompiled Astro image_atomic_swap fragment shader");
+        if (!atomic_frag.empty()) {
+            const uint32_t initial_word = 0x3f800000u;
+            prosper::test::FrameResource resource;
+            resource.binding = 4; resource.set = 1;
+            resource.tex_rgba = reinterpret_cast<const uint8_t*>(&initial_word);
+            resource.tw = 1; resource.th = 1;
+            resource.texture_format = VK_FORMAT_R32_UINT;
+            resource.is_storage_image = true;
+            prosper::test::BackendDraw draw;
+            draw.vs = vert; draw.fs = atomic_frag; draw.R = {resource}; draw.vcount = 3;
+            const std::vector<uint8_t> pixels =
+                prosper::test::render_draws_rgba({draw}, W, H);
+            const uint8_t* center = pixels.size() == static_cast<size_t>(W) * H * 4
+                ? &pixels[(static_cast<size_t>(H / 2) * W + W / 2) * 4] : nullptr;
+            printf("  image_atomic_swap center=(%u,%u,%u)\n",
+                   center ? center[0] : 0, center ? center[1] : 0, center ? center[2] : 0);
+            CHECK(center && center[1] > 0x80 && center[0] < 0x40 && center[2] < 0x40,
+                  "R32_UINT image atomic executes and returns the pre-operation value to VDATA");
         }
     }
 

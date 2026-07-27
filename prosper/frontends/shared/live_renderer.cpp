@@ -1115,7 +1115,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 }
                             }
                         }
-                        const bool has_cpu_live_rtt = r.img_dim == 1u && live_rtt != g_rtt.end() &&
+                        const bool has_cpu_live_rtt = !fr.is_storage_image && r.img_dim == 1u &&
+                            live_rtt != g_rtt.end() &&
                             live_rtt->second.w && live_rtt->second.h && live_rtt->second.rgba &&
                             !live_rtt->second.rgba->empty();
                         // A retained render target was created for color-attachment + sampled usage,
@@ -1227,6 +1228,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             r.format == prosper::gpu::DataFormat::Unorm8 &&
                             r.num_components == 1 && r.tile_mode == 0u &&
                             !r.compression_enabled && !linear_padded_read;
+                        // Storage-image atomics require a typed integer Vulkan view. Keep R32_UINT
+                        // texels byte-exact through the existing 4-B read/detile path instead of
+                        // silently normalizing the view to RGBA8_UNORM.
+                        const bool native_r32ui_storage =
+                            r.cls == RC::StorageImage && r.img_dim == 1u &&
+                            r.format == prosper::gpu::DataFormat::Uint32 &&
+                            r.num_components == 1 && !r.compression_enabled;
                         const bool persistent_source_matches_pixels =
                             native_r8_sampled ||
                             (persistent_unorm8_texture && r.num_components == 4 &&
@@ -1609,9 +1617,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const size_t volume_texels = (size_t)tw * th * (is_volume ? r.depth : 1u);
                         const VkFormat live_rtt_format = has_cpu_live_rtt
                             ? live_rtt->second.format
-                            : (native_r8_sampled ? VK_FORMAT_R8_UNORM
+                            : (native_r32ui_storage ? VK_FORMAT_R32_UINT
+                               : (native_r8_sampled ? VK_FORMAT_R8_UNORM
                                : (sampled_source_f32 ? VK_FORMAT_R16G16B16A16_SFLOAT
-                                                     : VK_FORMAT_R8G8B8A8_UNORM));
+                                                     : VK_FORMAT_R8G8B8A8_UNORM)));
                         fr.texture_format = live_rtt_format;
                         const uint32_t output_bpp =
                             prosper::test::backend_color_bytes_per_pixel(live_rtt_format);
@@ -1673,7 +1682,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // RTT (#167): if this texture's base is a color target we rendered into, inject those
                         // pixels (nearest-scaled to tw x th) instead of reading empty guest memory.
                         bool rtt_hit = false;
-                        if (rtt_on && !is_volume && !r.in_mip_tail) { auto rit = g_rtt.find(r.gpu_addr);
+                        if (!fr.is_storage_image && rtt_on && !is_volume && !r.in_mip_tail) {
+                            auto rit = g_rtt.find(r.gpu_addr);
                             if (rit != g_rtt.end() && rit->second.w && rit->second.h && rit->second.rgba &&
                                 !rit->second.rgba->empty()) {
                                 const RttSurf& s = rit->second;
