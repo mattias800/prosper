@@ -505,6 +505,29 @@ int main() {
               ngg_wide_texture_uses[0].s4[0] == ngg_mixed_stage_data[12],
           "fused NGG x16 mixed stage-data load publishes its T# and paired S# by consuming pc");
 
+    // The x16 snapshot is only provenance. A modeled scalar patch changes the physical T# word
+    // consumed by MIMG, so the emitted use must carry the live descriptor rather than stale load-time
+    // bytes. (An unmodeled write makes that word unknown and suppresses the use instead.)
+    const uint32_t ngg_patched_wide_texture[] = {
+        0xF4100200u, 0xFA000000u,   // s_load_dwordx16 s[8:23], s[0:1], 0
+        0xBE8A0381u,                // s_mov_b32 s10, 1 (patch T#.word2)
+        0xF0800F08u, 0x00A20000u,   // image_sample v[0:3], v[0:1], s[8:15], s[20:23]
+        0xBF810000u,
+    };
+    std::vector<SrtUse> ngg_patched_texture_uses;
+    resolve_dynamic_fetch(
+        ngg_patched_wide_texture, std::size(ngg_patched_wide_texture), nullptr, 0, 8,
+        &ngg_patched_texture_uses, UINT32_MAX, nullptr, ngg_mixed_system_sgprs,
+        std::size(ngg_mixed_system_sgprs));
+    CHECK(ngg_patched_texture_uses.size() == 1 &&
+              ngg_patched_texture_uses[0].kind == 0 &&
+              ngg_patched_texture_uses[0].use_pc == 3 &&
+              ngg_patched_texture_uses[0].key == 0xFFFFFFFFu &&
+              ngg_patched_texture_uses[0].t8[0] == ngg_mixed_stage_data[0] &&
+              ngg_patched_texture_uses[0].t8[2] == 1u &&
+              ngg_patched_texture_uses[0].t8[3] == ngg_mixed_stage_data[3],
+          "patched x16 T# publishes its live eight words at the MIMG consumer");
+
     // Kernel 5n: an s_buffer_load_dwordx8 result is typeless SGPR data. A later scalar buffer load
     // may consume its first four words as a nested V#, as DOLL's post-process shader does. Since the
     // V# came through another buffer descriptor it has no immediate key; preserve it by consumer pc.

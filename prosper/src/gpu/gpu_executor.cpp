@@ -2012,25 +2012,45 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     const int samp_base = in.src[2].value;
                     const bool have_t8 = valid_reg(tbase) && descr8_known.test((size_t)tbase);
                     const bool have_key = valid_reg(tbase) && descr8_key_known.test((size_t)tbase);
-                    const std::array<uint32_t, 8>* t8 = have_t8
-                        ? &descr8[(size_t)tbase] : nullptr;
-                    std::array<uint32_t, 8> seed_t8{};
-                    const uint32_t tkey = have_key
-                        ? descr8_key[(size_t)tbase] : 0xFFFFFFFFu;
-                    bool from_seed = false;
-                    if (!t8 && untouched_seed_range(tbase, 8)) {
-                        for (int k = 0; k < 8; k++)
-                            seed_t8[k] = user_sgprs[tbase - (int)user_sgpr_base + k];
-                        DecodedImageDescriptor d = decode_image_descriptor(seed_t8.data());
-                        // A direct T# has no s_load provenance key, so it is resolved by this MIMG's
-                        // exact pc. Reject obviously non-image user data before creating that mapping.
-                        if (d.base > 0x10000 && d.width && d.height &&
+                    // MIMG itself proves that its eight SRSRC words are a T#. A table snapshot or
+                    // direct user-data range establishes provenance, but the RESOURCE MUST use the
+                    // words live at this instruction: modeled scalar patches are architectural, and
+                    // an unmodeled write makes one word unknown and therefore rejects. Falling back
+                    // to descr8's load-time bytes after either case would bind a stale texture.
+                    std::array<uint32_t, 8> live_t8{};
+                    bool live_t8_known = true;
+                    for (int k = 0; k < 8; ++k)
+                        live_t8_known &= known(tbase + k, live_t8[(size_t)k]);
+                    const bool seed_provenance = !have_t8 && untouched_seed_range(tbase, 8);
+                    bool plausible_seed = true;
+                    if (seed_provenance && live_t8_known) {
+                        const DecodedImageDescriptor d = decode_image_descriptor(live_t8.data());
+                        plausible_seed = d.base > 0x10000 && d.width && d.height &&
                             d.width <= 16384 && d.height <= 16384 &&
-                            d.type >= 8 && d.type <= 15) {
-                            t8 = &seed_t8;
-                            from_seed = true;
-                        }
+                            d.type >= 8 && d.type <= 15;
                     }
+                    const std::array<uint32_t, 8>* t8 =
+                        live_t8_known && (have_t8 || (seed_provenance && plausible_seed))
+                            ? &live_t8 : nullptr;
+                    uint32_t tkey = 0xFFFFFFFFu;
+                    if (t8 && have_key) {
+                        uint32_t common_key = 0;
+                        bool common_key_known = true;
+                        for (int k = 0; k < 8; ++k) {
+                            const size_t reg = (size_t)(tbase + k);
+                            if (!valid_reg(tbase + k) || !val_srt_key_known.test(reg)) {
+                                common_key_known = false;
+                                break;
+                            }
+                            if (k == 0) common_key = val_srt_key[reg];
+                            else if (val_srt_key[reg] != common_key) {
+                                common_key_known = false;
+                                break;
+                            }
+                        }
+                        if (common_key_known) tkey = common_key;
+                    }
+                    const bool from_seed = t8 && seed_provenance;
                     if (trc) {
                         fprintf(stderr, "[dyntrace] MIMG pc=%u op=0x%x srsrc=s%d ssamp=s%d "
                                         "have_t8=%d seed_t8=%d key=0x%x t8=",
@@ -2055,15 +2075,15 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         u.is_depth_compare = (in.opcode >= 0x28 && in.opcode <= 0x2f) ||
                                              (in.opcode >= 0x38 && in.opcode <= 0x3f) ||
                                              (in.opcode >= 0x58 && in.opcode <= 0x5f);
-                        if (valid_reg(samp_base) && descr_known.test((size_t)samp_base)) {
-                            u.has_samp = true;
-                            u.s4 = descr[(size_t)samp_base];
-                        } else if (untouched_seed_range(samp_base, 4)) {
-                            // Direct S# paired with the direct/table T#. Samplers have no address or
-                            // extent field to validate; block membership plus reload invalidation is
-                            // the conservative provenance check.
-                            for (int k = 0; k < 4; k++)
-                                u.s4[k] = user_sgprs[samp_base - (int)user_sgpr_base + k];
+                        const bool have_s4 = valid_reg(samp_base) &&
+                                             descr_known.test((size_t)samp_base);
+                        const bool seed_s4 = !have_s4 && untouched_seed_range(samp_base, 4);
+                        bool live_s4_known = true;
+                        for (int k = 0; k < 4; ++k)
+                            live_s4_known &= known(samp_base + k, u.s4[(size_t)k]);
+                        if (live_s4_known && (have_s4 || seed_s4)) {
+                            // Like the T#, sampler words are read live. This avoids retaining a stale
+                            // x16 load snapshot if scalar code patches or invalidates the paired S#.
                             u.has_samp = true;
                         }
                         srt_uses->push_back(u);

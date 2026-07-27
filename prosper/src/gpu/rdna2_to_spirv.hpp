@@ -220,6 +220,11 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          uint32_t pcrel_dispatch_target = UINT32_MAX,
                                          const FragmentInterpolationLayout* interpolation = nullptr);
 
+// Test hook for the low-half EXEC/VCC mask path. Production graphics compilation enables it only
+// for byte-exact observed Wave32 shaders until the graphics wave-mode register is carried here.
+std::vector<uint32_t> recompile_fragment_wave32_for_test(
+    const uint32_t* code, size_t dwords);
+
 // Recompiled fragment wave operations use native Vulkan subgroup instructions and therefore require
 // an exact 64-lane subgroup. Returns zero for ordinary modules and 64 for that explicit contract.
 uint32_t fragment_spirv_required_subgroup_size(const std::vector<uint32_t>& spirv);

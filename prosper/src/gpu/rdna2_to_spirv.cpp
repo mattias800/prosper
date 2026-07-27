@@ -219,6 +219,7 @@ struct SpirvCompute {
     std::map<uint32_t, uint32_t> cbuf_var;          // binding -> storage-buffer var (N-buffer model; 2/3 map to v_cbuf/v_cbuf1)
     bool     is_fragment=0;                          // true in the fragment shell (gates VINTRP interp)
     bool     is_vertex=0;                            // true in every vertex shell
+    bool     allow_b32_masks=0;                      // proven Wave32 or byte-exact graphics exception
     bool     ngg_one_lane=0;                         // exact GS_ALLOC_REQ wrapper: one guest lane/invocation
     bool     ngg_private_lds=0;                      // exact captured wrapper whose LDS projection is known
     uint32_t ngg_vertex_index_read_pc = UINT32_MAX;   // NGG wave/LDS prologue handoff -> host VertexIndex
@@ -2350,6 +2351,9 @@ struct RegState {
     std::unordered_set<int> sreg_written;
     std::unordered_map<int, uint32_t> sreg_bool;   // SGPR (pairs) holding a saved per-lane mask (bool id)
     std::unordered_map<int, bool> sreg_bool_narrowed;  // was EXEC narrowed when this mask was saved? (restores it)
+    // Wave32 saves occupy exactly one physical SGPR. Track those lifetimes separately so a later
+    // scalar-data write can invalidate the bool without also clobbering an unrelated neighbor.
+    std::unordered_set<int> sreg_bool_b32;
     std::unordered_map<int, uint32_t> sreg_srt;    // SGPR holding a descriptor -> its user_data/SRT byte offset
                                                    // (descriptor provenance: s_load_dwordx4 tags, s_buffer_load resolves)
     uint32_t vcc = 0;
@@ -3682,6 +3686,30 @@ void record_scalar_write(RegState& rs, const Rdna2Inst& in) {
         invalidate_mask_pair(in.sdst.value);
 
     for_each_scalar_write(in, [&](int base, uint32_t width) {
+        // emit_alu has already materialized the new lifetime. A scalar-data destination is present
+        // in sreg; a mask-only destination is not. End every overlapping one-word Wave32 mask
+        // lifetime on data writes, including SOP2, SOPK, SMEM, readfirstlane/readlane, and future
+        // scalar writers covered by scalar_write_width(). A pair-mask write replaces the B32 marker
+        // but retains its newly-emitted bool-domain value.
+        bool data_write = false;
+        for (uint32_t word = 0; word < width; ++word)
+            data_write |= rs.sreg.contains(base + static_cast<int>(word));
+        const bool preserves_b32_mask = width == 1 && in.fmt == Rdna2Format::SOP1 &&
+            (in.opcode == 0x03 || in.opcode == 0x09) &&
+            rs.sreg_bool_b32.contains(base) && !data_write;
+        for (uint32_t word = 0; word < width; ++word) {
+            const int reg = base + static_cast<int>(word);
+            if (!rs.sreg_bool_b32.contains(reg) || (preserves_b32_mask && reg == base))
+                continue;
+            rs.sreg_bool_b32.erase(reg);
+            if (data_write || reg != base || !rs.sreg_bool.contains(base)) {
+                rs.sreg_bool.erase(reg);
+                rs.sreg_bool_narrowed.erase(reg);
+                if (reg == 106) rs.vcc = 0;
+            }
+        }
+        if (!data_write && !preserves_b32_mask)
+            rs.sreg_bool_b32.erase(base);
         for (uint32_t word = 0; word < width; ++word) {
             const int reg = base + static_cast<int>(word);
             rs.sreg_written.insert(reg);
@@ -3862,7 +3890,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // ordinary scalar scratch when its source is ordinary data, matching the data path
             // below.  High-half moves remain unsupported: without the guest wave mode they may name
             // another lane rather than this invocation's bit.
-            if (in.opcode == 0x03) {                         // s_mov_b32
+            if (b.allow_b32_masks && in.opcode == 0x03) {   // s_mov_b32 (mask-domain form)
                 const auto data_value_present = [&](int reg) {
                     return rs.sreg.contains(reg) || rs.sreg_input.contains(reg);
                 };
@@ -3908,9 +3936,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         rs.vcc = mask;
                         rs.sreg_bool[106] = mask;
                         rs.sreg_bool_narrowed[106] = narrowed;
+                        rs.sreg_bool_b32.insert(106);
                     } else {
                         rs.sreg_bool[in.dst.value] = mask;
                         rs.sreg_bool_narrowed[in.dst.value] = narrowed;
+                        rs.sreg_bool_b32.insert(in.dst.value);
                     }
                     // A B32 move overwrites only the addressed physical word.  Remove stale scalar
                     // data/descriptor provenance for that word while leaving its neighbor intact.
@@ -3919,7 +3949,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return true;
                 }
             }
-            if (in.opcode == 0x09) {                         // s_wqm_b32
+            if (b.allow_b32_masks && in.opcode == 0x09) {   // s_wqm_b32
                 // Wave32 uses the low half of EXEC for the same whole-quad-mode idiom as
                 // s_wqm_b64.  In the per-invocation fragment model helper lanes are implicit, so
                 // widening is an identity on the tracked bool.  Keep this in the mask domain and
@@ -3964,9 +3994,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     rs.vcc = mask;
                     rs.sreg_bool[106] = mask;
                     rs.sreg_bool_narrowed[106] = true;
+                    rs.sreg_bool_b32.insert(106);
                 } else {
                     rs.sreg_bool[in.dst.value] = mask;
                     rs.sreg_bool_narrowed[in.dst.value] = true;
+                    rs.sreg_bool_b32.insert(in.dst.value);
                 }
                 rs.sreg.erase(in.dst.value);
                 rs.sreg_srt.erase(in.dst.value);
@@ -4172,6 +4204,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // let an earlier Wave32 mask save alias that new value in later mask-domain moves.
             rs.sreg_bool.erase(in.dst.value);
             rs.sreg_bool_narrowed.erase(in.dst.value);
+            rs.sreg_bool_b32.erase(in.dst.value);
             switch (in.opcode) {
                 case 0x03: {                                // s_mov_b32
                     d = a;
@@ -7546,6 +7579,23 @@ bool emit_compute_cfg_state_machine(
     if (end_pc == UINT32_MAX) return false;
     if ((b.wave_size != 32 && b.wave_size != 64) || !b.local_count || b.local_count > 1024)
         return false;
+    // The dispatcher persists a statically-shaped register file between cases. A B32 saved-mask
+    // alias can end when an ordinary scalar write reuses that word, which would require a separate
+    // per-edge validity value in addition to the bool itself. Until that state is represented, keep
+    // complex-CFG Wave32 mask programs on the fail-visible path; straight-line/structured shaders
+    // still use the exact lifetime tracking in RegState.
+    if (b.allow_b32_masks) {
+        if (!initial.sreg_bool_b32.empty()) return false;
+        for (const auto& in : ins) {
+            if (in.is_end) break;
+            if (in.fmt != Rdna2Format::SOP1) continue;
+            if (in.opcode == 0x09 ||
+                (in.opcode == 0x03 &&
+                 (in.src[0].value == 106 || in.src[0].value == 126 ||
+                  in.dst.value == 126)))
+                return false;
+        }
+    }
     const uint32_t wave_count = (b.local_count + b.wave_size - 1) / b.wave_size;
     const uint32_t padded_lanes = wave_count * b.wave_size;
     const uint32_t wave_result_base = padded_lanes;
@@ -7560,13 +7610,6 @@ bool emit_compute_cfg_state_machine(
     for (const auto& kv : initial.sreg_bool) static_mask_keys.insert(kv.first);
     for (const auto& in : ins) {
         if (in.is_end) break;
-        if (in.fmt == Rdna2Format::SOP1 &&
-            (in.opcode == 0x03 || in.opcode == 0x09) &&
-            in.dst.value <= 105 &&
-            (in.src[0].value == 126 ||
-             (in.src[0].kind == OperandKind::SGPR &&
-              static_mask_keys.count(in.src[0].value))))
-            static_mask_keys.insert(in.dst.value); // Wave32 s_mov_b32 save/copy of EXEC_LO
         if (in.fmt == Rdna2Format::SOP1 &&
             (in.opcode == 0x04 || in.opcode == 0x08 || in.opcode == 0x0a ||
              in.opcode == 0x24 || in.opcode == 0x25 || in.opcode == 0x37) &&
@@ -8725,6 +8768,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             const uint32_t then_scc = rs.scc, then_vcc = rs.vcc, then_exec = rs.exec;
             const bool then_narrowed = rs.exec_narrowed;
             const auto then_bool = rs.sreg_bool;
+            const auto then_bool_b32 = rs.sreg_bool_b32;
             const auto then_written = rs.sreg_written;
             b.emit_branch(merge_label);
 
@@ -8759,7 +8803,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
             rs.sreg_written.insert(then_written.begin(), then_written.end());
             for (int reg : then_written) rs.sreg_input.erase(reg);
-            if (then_bool != rs.sreg_bool) {
+            if (then_bool != rs.sreg_bool || then_bool_b32 != rs.sreg_bool_b32) {
                 if (getenv("PROSPER_DBG"))
                     fprintf(stderr, "[recompile-reject] counted-loop prelude changes mask domain\n");
                 return false; // no mask-domain PHIs in this narrow composition
@@ -8785,6 +8829,19 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         loop_written_regs(ins, L.header_pc, L.backedge_pc, cv, cs);
         loop_written_regs(ins, L.header_pc, L.exit_branch_pc, condv, conds);
         loop_scalar_may_writes(ins, L.header_pc, L.backedge_pc, scalar_may_writes);
+        for (int reg : rs.sreg_bool_b32)
+            if (scalar_may_writes.contains(reg)) return false;
+        if (b.allow_b32_masks)
+            for (const auto& candidate : ins) {
+                if (candidate.pc < L.header_pc || candidate.pc >= L.backedge_pc ||
+                    candidate.fmt != Rdna2Format::SOP1) continue;
+                if (candidate.opcode == 0x09 ||
+                    (candidate.opcode == 0x03 &&
+                     (candidate.src[0].value == 106 || candidate.src[0].value == 126 ||
+                      candidate.dst.value == 126 ||
+                      rs.sreg_bool_b32.contains(candidate.src[0].value))))
+                    return false;
+            }
         const uint32_t preheader = b.cur_block;
         const uint32_t hdr = b.id(), check = b.id(), body = b.id(), cont = b.id(), merge = b.id();
         b.emit_branch(hdr); b.emit_label(hdr);
@@ -9061,6 +9118,19 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             loop_written_regs(ins, L.header_pc, L.backedge_pc, cv, cs);
             loop_written_regs(ins, L.header_pc, L.exit_branch_pc, condv, conds);
             loop_scalar_may_writes(ins, L.header_pc, L.backedge_pc, scalar_may_writes);
+            for (int reg : rs.sreg_bool_b32)
+                if (scalar_may_writes.contains(reg)) return false;
+            if (b.allow_b32_masks)
+                for (const auto& candidate : ins) {
+                    if (candidate.pc < L.header_pc || candidate.pc >= L.backedge_pc ||
+                        candidate.fmt != Rdna2Format::SOP1) continue;
+                    if (candidate.opcode == 0x09 ||
+                        (candidate.opcode == 0x03 &&
+                         (candidate.src[0].value == 106 || candidate.src[0].value == 126 ||
+                          candidate.dst.value == 126 ||
+                          rs.sreg_bool_b32.contains(candidate.src[0].value))))
+                        return false;
+                }
             const uint32_t preheader = b.cur_block;
             const uint32_t hdr = b.id(), chk = b.id(), body = b.id(), cont = b.id(), merge = b.id();
             b.emit_branch(hdr); b.emit_label(hdr);
@@ -9147,6 +9217,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             for (auto it = rs.sreg_bool.begin(); it != rs.sreg_bool.end();) {
                 if (!std::binary_search(mask_keys.begin(), mask_keys.end(), it->first)) {
                     rs.sreg_bool_narrowed.erase(it->first);
+                    rs.sreg_bool_b32.erase(it->first);
                     it = rs.sreg_bool.erase(it);
                 } else ++it;
             }
@@ -9255,6 +9326,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     uint32_t then_scc = rs.scc, then_vcc = rs.vcc, then_exec = rs.exec;
                     const bool then_narrowed = rs.exec_narrowed;
                     const std::unordered_map<int,uint32_t> then_bool = rs.sreg_bool;
+                    const auto then_bool_b32 = rs.sreg_bool_b32;
                     const auto then_written = rs.sreg_written;
                     b.emit_branch(mergeL);
                     rs = pre;                               // else-arm starts from the pre-branch state
@@ -9274,6 +9346,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
                     rs.sreg_written.insert(then_written.begin(), then_written.end());
                     for (int reg : then_written) rs.sreg_input.erase(reg);
+                    if (then_bool_b32 != rs.sreg_bool_b32) return false;
                     // Merge the UNION of mask keys. A mask created in only one arm is false in the
                     // other arm; leaving that arm-local SSA id live after the merge is invalid SPIR-V.
                     std::set<int> bool_keys;
@@ -9355,6 +9428,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     b.native_storage_format_support = config.native_storage_format_support;
     b.begin(1, rt, local_x, local_y, local_z, wave_size,
             static_cast<uint32_t>(config.user_sgprs.size()));
+    b.allow_b32_masks = wave_size == 32;
     b.declare_guest_scratch(scratch);
     const bool has_partial_workgroup = config.threads_x % local_x != 0 ||
                                        config.threads_y % local_y != 0 ||
@@ -9588,6 +9662,16 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     return cov;
 }
 
+static uint64_t shader_program_hash(const uint32_t* code, size_t dwords) {
+    uint64_t hash = 1469598103934665603ull;
+    const auto* bytes = reinterpret_cast<const uint8_t*>(code);
+    for (size_t i = 0; i < dwords * sizeof(uint32_t); ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
 uint32_t fragment_color_export_mask(const uint32_t* code, size_t dwords) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
@@ -9604,13 +9688,15 @@ uint32_t fragment_color_export_mask(const uint32_t* code, size_t dwords) {
     return packed;
 }
 
-std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
-                                         const ShaderResourceTable* rt,
-                                         const PixelSystemInputMapping* system_inputs,
-                                         uint32_t pcrel_dispatch_target,
-                                         const FragmentInterpolationLayout* interpolation) {
+static std::vector<uint32_t> recompile_fragment_impl(
+        const uint32_t* code, size_t dwords,
+        const ShaderResourceTable* rt,
+        const PixelSystemInputMapping* system_inputs,
+        uint32_t pcrel_dispatch_target,
+        const FragmentInterpolationLayout* interpolation,
+        bool allow_test_wave32) {
     std::vector<Rdna2Inst> ins;
-    rdna2_walk(code, dwords, ins);
+    const size_t program_dwords = rdna2_walk(code, dwords, ins);
     if (pcrel_dispatch_target != UINT32_MAX) {
         const PcrelDispatchInfo dispatch = rdna2_pcrel_dispatch_info(code, dwords);
         if (!specialize_pcrel_dispatch(ins, dispatch, pcrel_dispatch_target)) {
@@ -9661,6 +9747,12 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
     }
     SpirvCompute b;
     b.begin_fragment(rt, color_mask);
+    // Graphics wave mode is not yet plumbed from the stage registers. Keep low-half EXEC/VCC mask
+    // semantics restricted to the complete captured Astro material shader that demonstrated the
+    // Wave32 idiom. Arbitrary graphics shaders retain the previous fail-visible rejection.
+    b.allow_b32_masks = allow_test_wave32 ||
+        (program_dwords == 3142 &&
+         shader_program_hash(code, program_dwords) == 0x616dd4c0b241fbb1ull);
     // Fragment I/O value tap (PROSPER_FS_TAP=draw:pc): redirect the MRT0 colour export to the intermediate
     // VGPR produced at that PC so the rendered frame visualises the value. The `draw:` prefix is consumed by
     // gpu_replay (which re-recompiles only that draw's FS). Parse the same complete selector here so an
@@ -9787,6 +9879,20 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
     return b.finish();
 }
 
+std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
+                                         const ShaderResourceTable* rt,
+                                         const PixelSystemInputMapping* system_inputs,
+                                         uint32_t pcrel_dispatch_target,
+                                         const FragmentInterpolationLayout* interpolation) {
+    return recompile_fragment_impl(code, dwords, rt, system_inputs,
+                                   pcrel_dispatch_target, interpolation, false);
+}
+
+std::vector<uint32_t> recompile_fragment_wave32_for_test(
+        const uint32_t* code, size_t dwords) {
+    return recompile_fragment_impl(code, dwords, nullptr, nullptr, UINT32_MAX, nullptr, true);
+}
+
 uint32_t fragment_spirv_required_subgroup_size(const std::vector<uint32_t>& spirv) {
     if (spirv.size() < 5 || spirv[0] != 0x07230203u) return 0;
     for (size_t offset = 5; offset < spirv.size();) {
@@ -9839,12 +9945,7 @@ static bool is_astro_bot_ngg_one_lane_wrapper(const uint32_t* code, size_t dword
     if (program_dwords != 54 && program_dwords != 734 && program_dwords != 3124 &&
         program_dwords != 3435 && program_dwords != 3917)
         return false;
-    uint64_t hash = 1469598103934665603ull;
-    const auto* bytes = reinterpret_cast<const uint8_t*>(code);
-    for (size_t i = 0; i < program_dwords * sizeof(uint32_t); ++i) {
-        hash ^= bytes[i];
-        hash *= 1099511628211ull;
-    }
+    const uint64_t hash = shader_program_hash(code, program_dwords);
     return (program_dwords == 54 && hash == 0x9e9d8e37bcc70607ull) ||
            (program_dwords == 734 && hash == 0x79eb2b954b07dc8eull) ||
            (program_dwords == 3124 && hash == 0x41e6ac616c18d295ull) ||
@@ -9887,6 +9988,7 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
     // property of the GS_ALLOC_REQ opcode. Other NGG programs retain only the ordinary merged-stage
     // ABI setup below and fail closed if they reach a lane-sensitive operation.
     b.ngg_one_lane = b.ngg_private_lds || (ngg && allow_test_ngg_one_lane);
+    b.allow_b32_masks = b.ngg_one_lane;
     uint32_t ngg_output_gate_begin = UINT32_MAX;
     uint32_t ngg_output_gate_end = 0;
     if (ngg) {

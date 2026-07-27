@@ -228,7 +228,12 @@ int main() {
         0xf800000fu, 0x03020100u,            // exp mrt0 v0,v1,v2,v3
         0xbf810000u,
     };
-    const auto wave32_fragment_spv = recompile_fragment(
+    if (!recompile_fragment(wave32_fragment_masks,
+                            std::size(wave32_fragment_masks)).empty()) {
+        printf("  [FAIL] ungated graphics shader accepted Wave32 EXEC_LO/VCC_LO mask moves\n");
+        return 1;
+    }
+    const auto wave32_fragment_spv = recompile_fragment_wave32_for_test(
         wave32_fragment_masks, std::size(wave32_fragment_masks));
     uint32_t wave32_fragment_bad_op = 0;
     if (wave32_fragment_spv.empty() ||
@@ -240,6 +245,27 @@ int main() {
     }
     printf("  [ok]   Wave32 fragment EXEC_LO/VCC_LO mask moves emit valid SPIR-V\n");
 
+    const uint32_t wave32_compute_masks[] = {
+        0xbe80037eu,                         // s_mov_b32 s0, exec_lo
+        0xbeea037eu,                         // s_mov_b32 vcc_lo, exec_lo
+        0xbefe0300u,                         // s_mov_b32 exec_lo, s0
+        0xbf810000u,
+    };
+    ComputeShaderConfig wave32_compute_config;
+    wave32_compute_config.wave_size = 32;
+    if (recompile_compute(wave32_compute_masks, std::size(wave32_compute_masks), nullptr,
+                          wave32_compute_config).empty()) {
+        printf("  [FAIL] proven Wave32 compute mask moves did not recompile\n");
+        return 1;
+    }
+    wave32_compute_config.wave_size = 64;
+    if (!recompile_compute(wave32_compute_masks, std::size(wave32_compute_masks), nullptr,
+                           wave32_compute_config).empty()) {
+        printf("  [FAIL] Wave64 compute accepted Wave32 low-half mask semantics\n");
+        return 1;
+    }
+    printf("  [ok]   compute low-half mask semantics require proven Wave32 launch state\n");
+
     const uint32_t wave32_fragment_wqm[] = {
         0xbe80037eu,                         // s_mov_b32 s0, exec_lo
         0xbefe0900u,                         // s_wqm_b32 exec_lo, s0
@@ -248,7 +274,7 @@ int main() {
         0xf800000fu, 0x03020100u,            // exp mrt0 v0,v1,v2,v3
         0xbf810000u,
     };
-    const auto wave32_fragment_wqm_spv = recompile_fragment(
+    const auto wave32_fragment_wqm_spv = recompile_fragment_wave32_for_test(
         wave32_fragment_wqm, std::size(wave32_fragment_wqm));
     if (wave32_fragment_wqm_spv.empty() ||
         !type_result_ids_are_nonzero(wave32_fragment_wqm_spv, nullptr) ||
@@ -266,11 +292,56 @@ int main() {
     };
     const auto wave32_vertex_spv = recompile_vertex(
         wave32_vertex_exec, std::size(wave32_vertex_exec));
-    if (wave32_vertex_spv.empty() || !phi_ids_are_nonzero(wave32_vertex_spv)) {
-        printf("  [FAIL] Wave32 vertex EXEC_LO all-lanes restore did not recompile\n");
+    if (!wave32_vertex_spv.empty()) {
+        printf("  [FAIL] ungated vertex shader accepted Wave32 EXEC_LO restore\n");
         return 1;
     }
-    printf("  [ok]   Wave32 vertex EXEC_LO all-lanes restore recompiles\n");
+    printf("  [ok]   unproven graphics Wave32 mask operations remain fail-visible\n");
+
+    // A one-word Wave32 saved-mask alias ends when that physical SGPR is reused as scalar data.
+    // v_cndmask must not prefer the old bool after either an SOPK or SOP2 writer; without a numeric
+    // B64 mask representation these deliberately reject instead of silently selecting the stale arm.
+    const uint32_t wave32_mask_then_sopk[] = {
+        0xbe80037eu,                         // s_mov_b32 s0, exec_lo
+        0xb0000000u,                         // s_movk_i32 s0, 0
+        0xb0010000u,                         // s_movk_i32 s1, 0
+        0xd5010003u, 0x0001e8f2u,            // v_cndmask_b32_e64 v3, 1.0, 2.0, s[0:1]
+        0x7e000280u, 0x7e020280u, 0x7e040280u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    if (!recompile_fragment_wave32_for_test(
+            wave32_mask_then_sopk, std::size(wave32_mask_then_sopk)).empty()) {
+        printf("  [FAIL] SOPK scalar reuse retained a stale Wave32 mask alias\n");
+        return 1;
+    }
+    const uint32_t wave32_mask_then_sop2[] = {
+        0xbe80037eu,                         // s_mov_b32 s0, exec_lo
+        0x87008080u,                         // s_and_b32 s0, 0, 0
+        0xb0010000u,                         // s_movk_i32 s1, 0
+        0xd5010003u, 0x0001e8f2u,            // v_cndmask_b32_e64 v3, 1.0, 2.0, s[0:1]
+        0x7e000280u, 0x7e020280u, 0x7e040280u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    if (!recompile_fragment_wave32_for_test(
+            wave32_mask_then_sop2, std::size(wave32_mask_then_sop2)).empty()) {
+        printf("  [FAIL] SOP2 scalar reuse retained a stale Wave32 mask alias\n");
+        return 1;
+    }
+    const uint32_t wave32_sop2_reuse_control[] = {
+        0xbe80037eu,                         // s_mov_b32 s0, exec_lo
+        0x87008080u,                         // s_and_b32 s0, 0, 0
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    if (recompile_fragment_wave32_for_test(
+            wave32_sop2_reuse_control, std::size(wave32_sop2_reuse_control)).empty()) {
+        printf("  [FAIL] SOP2 scalar-reuse control shader did not recompile\n");
+        return 1;
+    }
+    printf("  [ok]   scalar reuse invalidates saved Wave32 mask aliases\n");
 
     const uint32_t scalar_abs_compute[] = {
         0xb000ffffu,                         // s_movk_i32 s0, -1
