@@ -30,8 +30,11 @@ AgcPixelInputControls derive_agc_pixel_input_controls(const AgcShaderHeader* pro
             const AgcShaderSemantic& semantic = producer->output_semantics[i];
             const uint32_t slot = semantic.hardware_mapping() < 32u
                 ? semantic.hardware_mapping() : i;
-            out.controls[i] = slot | (semantic.is_flat_shaded() ? 0x400u : 0u);
+            const bool passthrough = semantic.is_custom();
+            out.controls[i] = slot | (passthrough ? 0x420u : 0u) |
+                              (semantic.is_flat_shaded() ? 0x400u : 0u);
             out.valid_mask |= 1u << i;
+            if (passthrough) out.passthrough_mask |= 1u << i;
         }
         return out;
     }
@@ -44,6 +47,13 @@ AgcPixelInputControls derive_agc_pixel_input_controls(const AgcShaderHeader* pro
             const AgcShaderSemantic& output = producer->output_semantics[j];
             if (output.semantic() == input.semantic() && output.hardware_mapping() < 32u) {
                 control = output.hardware_mapping();
+                if (input.is_custom()) {
+                    // GFX10 explicit interpolation selects the producer PARAM through OFFSET while
+                    // parameter-cache pass-through (OFFSET bit 5) and FLAT_SHADE expose each
+                    // triangle vertex to v_interp_mov instead of fixed-function coefficients.
+                    control |= 0x420u;
+                    out.passthrough_mask |= 1u << i;
+                }
                 break;
             }
         }

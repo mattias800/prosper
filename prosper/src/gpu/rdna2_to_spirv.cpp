@@ -2143,12 +2143,17 @@ struct SpirvCompute {
         for (uint32_t attr = 0; attr < 32; ++attr) {
             if (!attribute_inputs[attr]) continue;
             parameters[attr][2] = attribute_values[attr][0];
-            parameters[attr][0] = id();
-            put(code, Op_FSub, {t_v4f, parameters[attr][0],
-                                attribute_values[attr][1], attribute_values[attr][0]});
-            parameters[attr][1] = id();
-            put(code, Op_FSub, {t_v4f, parameters[attr][1],
-                                attribute_values[attr][2], attribute_values[attr][0]});
+            if (layout.passthrough_mask & (1u << attr)) {
+                parameters[attr][0] = attribute_values[attr][1];
+                parameters[attr][1] = attribute_values[attr][2];
+            } else {
+                parameters[attr][0] = id();
+                put(code, Op_FSub, {t_v4f, parameters[attr][0],
+                                    attribute_values[attr][1], attribute_values[attr][0]});
+                parameters[attr][1] = id();
+                put(code, Op_FSub, {t_v4f, parameters[attr][1],
+                                    attribute_values[attr][2], attribute_values[attr][0]});
+            }
         }
 
         for (uint32_t vertex = 0; vertex < 3; ++vertex) {
@@ -2271,7 +2276,8 @@ static bool extend_terminating_if_else(const uint32_t* code, size_t dwords,
 
 FragmentInterpolationLayout fragment_interpolation_layout(
         const uint32_t* code, size_t dwords,
-        const PixelSystemInputMapping* system_inputs) {
+        const PixelSystemInputMapping* system_inputs,
+        const PixelInputMapping* pixel_inputs) {
     FragmentInterpolationLayout layout;
     std::vector<Rdna2Inst> instructions;
     rdna2_walk(code, dwords, instructions);
@@ -2290,6 +2296,9 @@ FragmentInterpolationLayout fragment_interpolation_layout(
         else if (instruction.opcode == 2 && instruction.src[0].value < 3)
             selectors[attr] |= static_cast<uint8_t>(1u << instruction.src[0].value);
     }
+    if (pixel_inputs)
+        layout.passthrough_mask =
+            pixel_inputs->effective_passthrough_mask() & layout.attribute_mask;
 
     // P10/P20 have no ordinary Vulkan varying equivalent. P0 can retain the cheap Flat-input path
     // when it is the attribute's only interpolation mode; mixed P0+smooth needs the geometry copy too.
@@ -9657,6 +9666,8 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
                                                   const PixelInputMapping* pixel_inputs,
                                                   bool capture_position,
                                                   bool allow_test_ngg_output_gate) {
+    const uint32_t passthrough_mask =
+        pixel_inputs ? pixel_inputs->effective_passthrough_mask() : 0u;
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
     const StaticScratchLayout scratch = analyze_static_scratch(ins);
@@ -9931,7 +9942,9 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
             if (pixel_inputs) {
                 for (uint32_t ps_input = 0; ps_input < pixel_inputs->controls.size(); ++ps_input) {
                     if (!(pixel_inputs->valid_mask & (1u << ps_input))) continue;
-                    const uint32_t offset = pixel_inputs->controls[ps_input] & 0x3Fu;
+                    const uint32_t raw_offset = pixel_inputs->controls[ps_input] & 0x3Fu;
+                    const uint32_t offset = (passthrough_mask & (1u << ps_input))
+                        ? (raw_offset & 0x1fu) : raw_offset;
                     if (offset == source) b.export_param(ps_input, x, y, z, w);
                 }
             }
@@ -9956,7 +9969,8 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
         for (uint32_t ps_input = 0; ps_input < pixel_inputs->controls.size(); ++ps_input) {
             if (!(pixel_inputs->valid_mask & (1u << ps_input))) continue;
             const uint32_t control = pixel_inputs->controls[ps_input];
-            if ((control & 0x3Fu) != 0x20u) continue;
+            if ((passthrough_mask & (1u << ps_input)) ||
+                (control & 0x3Fu) != 0x20u) continue;
             const uint32_t one = b.uconst(0x3F800000u), zero = b.uconst(0u);
             const uint32_t default_val = (control >> 8) & 0x3u;
             const bool xyz_one = (default_val & 0x2u) != 0;

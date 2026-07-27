@@ -243,6 +243,7 @@ struct ShaderCompileKeyHash {
         hash = hash_mix(hash, key.has_pixel_inputs);
         if (key.has_pixel_inputs) {
             hash = hash_mix(hash, key.pixel_inputs.valid_mask);
+            hash = hash_mix(hash, key.pixel_inputs.passthrough_mask);
             for (uint32_t control : key.pixel_inputs.controls)
                 hash = hash_mix(hash, control);
         }
@@ -367,6 +368,7 @@ struct InterpolationCacheKey {
     uint64_t analysis_identity = 0;
     PixelSystemInputMapping system_inputs{};
     bool has_system_inputs = false;
+    uint32_t passthrough_mask = 0;
 
     bool operator==(const InterpolationCacheKey&) const = default;
 };
@@ -380,6 +382,7 @@ struct InterpolationCacheKeyHash {
             hash = hash_mix(hash, key.system_inputs.ena);
             hash = hash_mix(hash, key.system_inputs.addr);
         }
+        hash = hash_mix(hash, key.passthrough_mask);
         return static_cast<size_t>(hash);
     }
 };
@@ -1028,10 +1031,11 @@ void clear_shader_analysis_cache() {
 
 FragmentInterpolationLayout fragment_interpolation_layout_cached(
         const uint32_t* code, size_t dwords,
-        const PixelSystemInputMapping* system_inputs) {
+        const PixelSystemInputMapping* system_inputs,
+        const PixelInputMapping* pixel_inputs) {
     const auto analysis = analyze_shader_code_cached(code, dwords);
     if (!analysis || getenv("PROSPER_NO_SHADER_ANALYSIS_CACHE"))
-        return fragment_interpolation_layout(code, dwords, system_inputs);
+        return fragment_interpolation_layout(code, dwords, system_inputs, pixel_inputs);
 
     InterpolationCacheKey key;
     // Use the immutable analysis version, without retaining its shader-byte allocation beyond the
@@ -1039,6 +1043,7 @@ FragmentInterpolationLayout fragment_interpolation_layout_cached(
     key.analysis_identity = analysis->identity;
     key.has_system_inputs = system_inputs != nullptr;
     if (system_inputs) key.system_inputs = *system_inputs;
+    key.passthrough_mask = pixel_inputs ? pixel_inputs->effective_passthrough_mask() : 0u;
     auto& cache = interpolation_cache();
     std::lock_guard lock(cache.mutex);
     auto found = cache.entries.find(key);
@@ -1047,7 +1052,7 @@ FragmentInterpolationLayout fragment_interpolation_layout_cached(
         return found->second.layout;
     }
     const FragmentInterpolationLayout layout =
-        fragment_interpolation_layout(code, dwords, system_inputs);
+        fragment_interpolation_layout(code, dwords, system_inputs, pixel_inputs);
     constexpr size_t max_entries = 4096;
     while (cache.entries.size() >= max_entries && !cache.entries.empty()) {
         auto oldest = cache.entries.begin();
