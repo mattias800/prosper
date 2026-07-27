@@ -220,6 +220,11 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          uint32_t pcrel_dispatch_target = UINT32_MAX,
                                          const FragmentInterpolationLayout* interpolation = nullptr);
 
+// Test hook for the low-half EXEC/VCC mask path. Production graphics compilation enables it only
+// for byte-exact observed Wave32 shaders until the graphics wave-mode register is carried here.
+std::vector<uint32_t> recompile_fragment_wave32_for_test(
+    const uint32_t* code, size_t dwords);
+
 // Recompiled fragment wave operations use native Vulkan subgroup instructions and therefore require
 // an exact 64-lane subgroup. Returns zero for ordinary modules and 64 for that explicit contract.
 uint32_t fragment_spirv_required_subgroup_size(const std::vector<uint32_t>& spirv);
@@ -245,6 +250,11 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
 // Vulkan tests can execute both active and inactive outcomes. Production recompile_vertex keeps that
 // exception restricted to the byte-exact observed Astro wrapper.
 std::vector<uint32_t> recompile_vertex_terminal_ngg_gate_for_test(
+    const uint32_t* code, size_t dwords);
+
+// Test hook: exercise operations whose semantics depend on the exact Astro one-lane NGG projection.
+// Production recompile_vertex only enables that projection for byte-exact observed wrappers.
+std::vector<uint32_t> recompile_vertex_ngg_one_lane_for_test(
     const uint32_t* code, size_t dwords);
 
 // How much of a shader the recompiler currently covers (per-instruction), without requiring the

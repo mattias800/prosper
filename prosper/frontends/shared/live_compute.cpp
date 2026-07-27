@@ -51,6 +51,17 @@ uint8_t storage_pack_unorm8(uint32_t float_bits) {
     return static_cast<uint8_t>(whole + (scaled - static_cast<float>(whole) >= 0.5f));
 }
 
+uint16_t storage_pack_unorm16(uint32_t float_bits) {
+    float value;
+    std::memcpy(&value, &float_bits, sizeof(value));
+    if (!(value > 0.0f)) return 0; // Includes negative values and NaN.
+    if (value >= 1.0f) return 65535;
+    const float scaled = value * 65535.0f;
+    const uint32_t whole = static_cast<uint32_t>(scaled);
+    return static_cast<uint16_t>(whole +
+        (scaled - static_cast<float>(whole) >= 0.5f));
+}
+
 uint32_t storage_unpack_float16_bits(uint16_t half_bits) {
     // Full binary16 lookup: the source domain is only 64 Ki entries, while Astro Bot expands more
     // than 33 million FP16 channels for one 4K storage image. Keeping the already-converted float
@@ -1378,7 +1389,7 @@ struct BoundImage {
 // The recompiler moves image texels as RAW 32-bit VGPR channel values (uvec4 per texel; the VkImage is
 // R32G32B32A32_UINT with format-free reads/writes). Real hardware format-converts per the T#, so the
 // guest surface's bytes must be UNPACKED to channel dwords on upload and PACKED back on writeback:
-//   Unorm8  -> float(b/255) bits         <- clamp(bitcast float,0,1)*255 rounded
+//   Unorm8/16 -> float(channel/max) bits <- clamp(bitcast float,0,1)*max rounded
 //   Float16 -> half->float bits          <- round-to-nearest-even float->half
 //   Float32/Uint32/Sint32 -> raw 4-byte move both ways.
 //   Uint8/Sint8/Uint16/Sint16 -> integer channel widen (sign-extend for Sint) <- truncate to width.
@@ -1394,14 +1405,15 @@ struct BoundImage {
 // skips the dispatch loudly (never a silent wrong-layout write — correctness-first).
 bool storage_unpack_supported(prosper::gpu::DataFormat f) {
     using DF = prosper::gpu::DataFormat;
-    return f == DF::Unorm8 || f == DF::Float16 || f == DF::Float32 || f == DF::Uint32 ||
+    return f == DF::Unorm8 || f == DF::Unorm16 || f == DF::Float16 ||
+           f == DF::Float32 || f == DF::Uint32 ||
            f == DF::Sint32 || f == DF::Float10_11_11 ||
            f == DF::Uint8 || f == DF::Sint8 || f == DF::Uint16 || f == DF::Sint16 ||
            f == DF::Unorm2_10_10_10;
 }
 bool storage_pack_supported(prosper::gpu::DataFormat f) {
     using DF = prosper::gpu::DataFormat;
-    return f == DF::Unorm8 || f == DF::Float16 || f == DF::Float32 ||
+    return f == DF::Unorm8 || f == DF::Unorm16 || f == DF::Float16 || f == DF::Float32 ||
            f == DF::Uint32 || f == DF::Sint32 || f == DF::Float10_11_11 ||
            f == DF::Uint8 || f == DF::Sint8 || f == DF::Uint16 || f == DF::Sint16 ||
            f == DF::Unorm2_10_10_10;
@@ -1434,6 +1446,12 @@ void storage_unpack_texel(const uint8_t* src, prosper::gpu::DataFormat f, uint32
     for (uint32_t c = 0; c < ncomp && c < 4; c++) {
         switch (f) {
             case DF::Unorm8: { float v = src[c] / 255.0f; std::memcpy(&out[c], &v, 4); break; }
+            case DF::Unorm16: {
+                const uint16_t raw = static_cast<uint16_t>(src[c * 2] | (src[c * 2 + 1] << 8));
+                const float v = raw / 65535.0f;
+                std::memcpy(&out[c], &v, 4);
+                break;
+            }
             case DF::Float16:
                 out[c] = storage_unpack_float16_bits(
                     static_cast<uint16_t>(src[c * 2] | (src[c * 2 + 1] << 8)));
@@ -1475,6 +1493,16 @@ void storage_unpack_range(const uint8_t* src, size_t src_stride, prosper::gpu::D
             for (size_t t = 0; t < count; ++t) {
                 const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
                 for (uint32_t c = 0; c < n; ++c) { float v = p[c] / 255.0f; std::memcpy(&o[c], &v, 4); }
+            }
+            return;
+        case DF::Unorm16:
+            for (size_t t = 0; t < count; ++t) {
+                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
+                for (uint32_t c = 0; c < n; ++c) {
+                    const uint16_t raw = static_cast<uint16_t>(p[c * 2] | (p[c * 2 + 1] << 8));
+                    const float v = raw / 65535.0f;
+                    std::memcpy(&o[c], &v, 4);
+                }
             }
             return;
         case DF::Float16:
@@ -1584,6 +1612,16 @@ void storage_pack_range(const uint32_t* channels, prosper::gpu::DataFormat f, ui
                 for (uint32_t c = 0; c < n; ++c) p[c] = static_cast<uint8_t>(in[c]);
             }
             return;
+        case DF::Unorm16:
+            for (size_t t = 0; t < count; ++t) {
+                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
+                for (uint32_t c = 0; c < n; ++c) {
+                    const uint16_t value = storage_pack_unorm16(in[c]);
+                    p[c * 2] = static_cast<uint8_t>(value);
+                    p[c * 2 + 1] = static_cast<uint8_t>(value >> 8);
+                }
+            }
+            return;
         case DF::Uint16: case DF::Sint16:
             for (size_t t = 0; t < count; ++t) {
                 const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
@@ -1632,6 +1670,12 @@ void storage_pack_texel(const uint32_t in[4], prosper::gpu::DataFormat f, uint32
     for (uint32_t c = 0; c < ncomp && c < 4; c++) {
         switch (f) {
             case DF::Unorm8: dst[c] = storage_pack_unorm8(in[c]); break;
+            case DF::Unorm16: {
+                const uint16_t value = storage_pack_unorm16(in[c]);
+                dst[c * 2] = static_cast<uint8_t>(value);
+                dst[c * 2 + 1] = static_cast<uint8_t>(value >> 8);
+                break;
+            }
             case DF::Float16: { float v; std::memcpy(&v, &in[c], 4);
                                 const uint16_t h = prosper::gpu::float_to_half(v);
                                 dst[c * 2] = static_cast<uint8_t>(h);

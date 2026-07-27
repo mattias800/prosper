@@ -1532,6 +1532,15 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     if (trc && !g_dyntrace_force)
         if (const char* fa = getenv("PROSPER_DYNTRACE_ADDR"))
             trc = strtoull(fa, nullptr, 16) == (uint64_t)(uintptr_t)code;
+    // A full scalar-fold trace is intentionally verbose. Live shaders can rebuild their stage table
+    // thousands of times per scene, so permit a targeted diagnostic run to capture the first matching
+    // fold without turning every subsequent frame into gigabytes of duplicate logging.
+    if (trc && !g_dyntrace_force && getenv("PROSPER_DYNTRACE_ONCE")) {
+        static std::mutex once_mx;
+        static std::set<const uint32_t*> traced;
+        std::lock_guard<std::mutex> lk(once_mx);
+        trc = traced.insert(code).second;
+    }
     // Scalar operands encode at most 128 SGPRs. Fixed register files avoid hundreds of tiny hash/tree
     // allocations per submit while retaining exactly the same known/unknown state model.
     constexpr size_t kFoldSgprs = 128;
@@ -1963,11 +1972,22 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                               descr_key_known.set((size_t)sdst);
                 }
                 if (n == 16) {
-                    // NGG back halves commonly fetch a compact stage-data block containing four
-                    // consecutive V# descriptors with one s_load_dwordx16. Each aligned group can
-                    // subsequently be consumed by MUBUF. The load's one byte-offset key cannot
-                    // distinguish those four resources, so retain key-less descriptor provenance;
-                    // the consumer is then resolved by its exact instruction pc.
+                    // NGG back halves commonly fetch a compact stage-data block containing a mix of
+                    // one 8-dword T# and 4-dword V# descriptors with one s_load_dwordx16. SGPR loads
+                    // are typeless, so retain both aligned interpretations and let the eventual MIMG
+                    // or MUBUF consumer select the appropriate one. The load's one byte-offset key
+                    // cannot distinguish the resources inside the block, so retain key-less
+                    // descriptor provenance; each consumer is resolved by its exact instruction pc.
+                    for (uint32_t first = 0; first < n; first += 8) {
+                        const int base_reg = sdst + static_cast<int>(first);
+                        if (!valid_reg(base_reg) || !valid_reg(base_reg + 7)) continue;
+                        descr8[(size_t)base_reg] = {
+                            mem[first], mem[first + 1], mem[first + 2], mem[first + 3],
+                            mem[first + 4], mem[first + 5], mem[first + 6], mem[first + 7] };
+                        descr8_known.set((size_t)base_reg);
+                        descr8_key[(size_t)base_reg] = 0xFFFFFFFFu;
+                        descr8_key_known.set((size_t)base_reg);
+                    }
                     for (uint32_t first = 0; first < n; first += 4) {
                         const int base_reg = sdst + static_cast<int>(first);
                         if (!valid_reg(base_reg) || !valid_reg(base_reg + 3)) continue;
@@ -1992,25 +2012,45 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     const int samp_base = in.src[2].value;
                     const bool have_t8 = valid_reg(tbase) && descr8_known.test((size_t)tbase);
                     const bool have_key = valid_reg(tbase) && descr8_key_known.test((size_t)tbase);
-                    const std::array<uint32_t, 8>* t8 = have_t8
-                        ? &descr8[(size_t)tbase] : nullptr;
-                    std::array<uint32_t, 8> seed_t8{};
-                    const uint32_t tkey = have_key
-                        ? descr8_key[(size_t)tbase] : 0xFFFFFFFFu;
-                    bool from_seed = false;
-                    if (!t8 && untouched_seed_range(tbase, 8)) {
-                        for (int k = 0; k < 8; k++)
-                            seed_t8[k] = user_sgprs[tbase - (int)user_sgpr_base + k];
-                        DecodedImageDescriptor d = decode_image_descriptor(seed_t8.data());
-                        // A direct T# has no s_load provenance key, so it is resolved by this MIMG's
-                        // exact pc. Reject obviously non-image user data before creating that mapping.
-                        if (d.base > 0x10000 && d.width && d.height &&
+                    // MIMG itself proves that its eight SRSRC words are a T#. A table snapshot or
+                    // direct user-data range establishes provenance, but the RESOURCE MUST use the
+                    // words live at this instruction: modeled scalar patches are architectural, and
+                    // an unmodeled write makes one word unknown and therefore rejects. Falling back
+                    // to descr8's load-time bytes after either case would bind a stale texture.
+                    std::array<uint32_t, 8> live_t8{};
+                    bool live_t8_known = true;
+                    for (int k = 0; k < 8; ++k)
+                        live_t8_known &= known(tbase + k, live_t8[(size_t)k]);
+                    const bool seed_provenance = !have_t8 && untouched_seed_range(tbase, 8);
+                    bool plausible_seed = true;
+                    if (seed_provenance && live_t8_known) {
+                        const DecodedImageDescriptor d = decode_image_descriptor(live_t8.data());
+                        plausible_seed = d.base > 0x10000 && d.width && d.height &&
                             d.width <= 16384 && d.height <= 16384 &&
-                            d.type >= 8 && d.type <= 15) {
-                            t8 = &seed_t8;
-                            from_seed = true;
-                        }
+                            d.type >= 8 && d.type <= 15;
                     }
+                    const std::array<uint32_t, 8>* t8 =
+                        live_t8_known && (have_t8 || (seed_provenance && plausible_seed))
+                            ? &live_t8 : nullptr;
+                    uint32_t tkey = 0xFFFFFFFFu;
+                    if (t8 && have_key) {
+                        uint32_t common_key = 0;
+                        bool common_key_known = true;
+                        for (int k = 0; k < 8; ++k) {
+                            const size_t reg = (size_t)(tbase + k);
+                            if (!valid_reg(tbase + k) || !val_srt_key_known.test(reg)) {
+                                common_key_known = false;
+                                break;
+                            }
+                            if (k == 0) common_key = val_srt_key[reg];
+                            else if (val_srt_key[reg] != common_key) {
+                                common_key_known = false;
+                                break;
+                            }
+                        }
+                        if (common_key_known) tkey = common_key;
+                    }
+                    const bool from_seed = t8 && seed_provenance;
                     if (trc) {
                         fprintf(stderr, "[dyntrace] MIMG pc=%u op=0x%x srsrc=s%d ssamp=s%d "
                                         "have_t8=%d seed_t8=%d key=0x%x t8=",
@@ -2035,15 +2075,15 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         u.is_depth_compare = (in.opcode >= 0x28 && in.opcode <= 0x2f) ||
                                              (in.opcode >= 0x38 && in.opcode <= 0x3f) ||
                                              (in.opcode >= 0x58 && in.opcode <= 0x5f);
-                        if (valid_reg(samp_base) && descr_known.test((size_t)samp_base)) {
-                            u.has_samp = true;
-                            u.s4 = descr[(size_t)samp_base];
-                        } else if (untouched_seed_range(samp_base, 4)) {
-                            // Direct S# paired with the direct/table T#. Samplers have no address or
-                            // extent field to validate; block membership plus reload invalidation is
-                            // the conservative provenance check.
-                            for (int k = 0; k < 4; k++)
-                                u.s4[k] = user_sgprs[samp_base - (int)user_sgpr_base + k];
+                        const bool have_s4 = valid_reg(samp_base) &&
+                                             descr_known.test((size_t)samp_base);
+                        const bool seed_s4 = !have_s4 && untouched_seed_range(samp_base, 4);
+                        bool live_s4_known = true;
+                        for (int k = 0; k < 4; ++k)
+                            live_s4_known &= known(samp_base + k, u.s4[(size_t)k]);
+                        if (live_s4_known && (have_s4 || seed_s4)) {
+                            // Like the T#, sampler words are read live. This avoids retaining a stale
+                            // x16 load snapshot if scalar code patches or invalidates the paired S#.
                             u.has_samp = true;
                         }
                         srt_uses->push_back(u);
@@ -2070,24 +2110,14 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         current_known &= known(srsrc + k, current[(size_t)k]);
                     const bool loaded_provenance = valid_reg(srsrc) &&
                                                    descr_known.test((size_t)srsrc);
-                    bool moved_direct_provenance = valid_reg(srsrc) && valid_reg(srsrc + 3);
-                    uint32_t first_origin = 0;
-                    for (int k = 0; k < 4 && moved_direct_provenance; ++k) {
-                        const size_t reg = (size_t)(srsrc + k);
-                        if (!val_seed_origin_known.test(reg)) {
-                            moved_direct_provenance = false;
-                        } else if (k == 0) {
-                            first_origin = val_seed_origin[reg];
-                        } else if (val_seed_origin[reg] != first_origin + (uint32_t)k) {
-                            moved_direct_provenance = false;
-                        }
-                    }
-                    const bool direct_provenance = unchanged_seed_range(srsrc, 4) ||
-                                                   moved_direct_provenance;
-                    if (current_known && (loaded_provenance || direct_provenance)) {
-                        // Publish the four values LIVE at the consumer. A modeled scalar patch is
-                        // exact; an unmodeled/incompatible write becomes unknown and fails closed
-                        // instead of resurrecting the load-time descriptor snapshot.
+                    if (current_known) {
+                        // MUBUF/MTBUF itself is definitive that its four SRSRC words are a V#. Publish
+                        // the values LIVE at the consumer whenever the scalar fold knows all of them.
+                        // This also covers a direct descriptor whose NUM_RECORDS/stride is patched by
+                        // modeled scalar ALU: such a patch intentionally breaks entry-seed provenance,
+                        // but does not make the now-concrete V# any less valid. An unmodeled write makes
+                        // a word unknown and still fails closed; the shape/range checks below reject
+                        // malformed concrete values before any resource is emitted.
                         SrtUse u; u.kind = 1; u.v4 = current; u.key = 0xFFFFFFFFu; u.use_pc = in.pc;
                         if (is_mtbuf) u.instruction_format = in.mtbuf_format;
                         if (loaded_provenance) {
@@ -2919,6 +2949,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                                 u.use_pc, u.key, (unsigned long long)d.base, d.width, d.height,
                                 d.format, d.tile_mode);
                     if (d.base == 0 || d.width == 0 || d.height == 0 || d.depth == 0 ||
+                        !valid_image_type(d.type) ||
                         d.base_array != 0 ||
                         d.width > 16384 || d.height > 16384) continue;       // garbage/degenerate T#
                     // A previous use already produced a resource for this SAME selected view (address +
@@ -3278,6 +3309,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                 {                                         // T# — storage image (store) or sampled texture
                     DecodedImageDescriptor d = decode_image_descriptor(u.t8.data());
                     if (d.base == 0 || d.width == 0 || d.height == 0 || d.depth == 0 ||
+                        !valid_image_type(d.type) ||
                         d.base_array != 0 ||
                         d.width > 16384 || d.height > 16384) continue;   // garbage/degenerate T#
                     Gen5ImageFormatInfo fi;

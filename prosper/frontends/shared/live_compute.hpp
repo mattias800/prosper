@@ -10,6 +10,7 @@ namespace prosper::frontend {
 // Pack one raw float32 channel to UNORM8 using the storage-image conversion contract. Kept public
 // so the optimized scalar conversion can be checked directly against the previous lround path.
 uint8_t storage_pack_unorm8(uint32_t float_bits);
+uint16_t storage_pack_unorm16(uint32_t float_bits);
 void storage_pack_unorm8_range(const uint32_t* channels, uint32_t components,
                                size_t texels, uint8_t* packed);
 
