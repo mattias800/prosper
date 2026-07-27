@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <iterator>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -84,6 +85,62 @@ bool has_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
         i += wc;
     }
     return false;
+}
+
+struct OutputStoreStats {
+    uint32_t stores = 0;
+    uint32_t stores_with_one_repeated_source = 0;
+};
+
+// Count stores to Output variables and inspect vec4 construction through the final bitcasts. The
+// graphics CFG regression deliberately exports four independently-written VGPRs: if its callback
+// accidentally reads the entry RegState, every missing VGPR instead resolves to the same zero ID.
+OutputStoreStats output_store_stats(const std::vector<uint32_t>& spv) {
+    constexpr uint32_t OpVariable = 59, OpStore = 62, OpCompositeConstruct = 80, OpBitcast = 124;
+    constexpr uint32_t StorageClassOutput = 3;
+    std::unordered_set<uint32_t> outputs;
+    std::unordered_map<uint32_t, size_t> definitions;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return {};
+        if (op == OpVariable && wc >= 4 && spv[i + 3] == StorageClassOutput)
+            outputs.insert(spv[i + 2]);
+        if ((op == OpCompositeConstruct || op == OpBitcast) && wc >= 3)
+            definitions[spv[i + 2]] = i;
+        i += wc;
+    }
+    OutputStoreStats stats;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return {};
+        if (op == OpStore && wc == 3 && outputs.contains(spv[i + 1])) {
+            ++stats.stores;
+            const auto construct = definitions.find(spv[i + 2]);
+            if (construct != definitions.end()) {
+                const size_t ci = construct->second;
+                const uint32_t cop = spv[ci] & 0xffffu, cwc = spv[ci] >> 16u;
+                if (cop == OpCompositeConstruct && cwc == 7) {
+                    uint32_t source[4]{};
+                    bool traced = true;
+                    for (uint32_t component = 0; component < 4; ++component) {
+                        const auto bitcast = definitions.find(spv[ci + 3 + component]);
+                        if (bitcast == definitions.end()) { traced = false; break; }
+                        const size_t bi = bitcast->second;
+                        if ((spv[bi] & 0xffffu) != OpBitcast || (spv[bi] >> 16u) != 4) {
+                            traced = false;
+                            break;
+                        }
+                        source[component] = spv[bi + 3];
+                    }
+                    if (traced && source[0] == source[1] && source[1] == source[2] &&
+                        source[2] == source[3])
+                        ++stats.stores_with_one_repeated_source;
+                }
+            }
+        }
+        i += wc;
+    }
+    return stats;
 }
 
 bool binary_id_operands_are_nonzero(const std::vector<uint32_t>& spv, uint32_t opcode) {
@@ -707,6 +764,46 @@ int main() {
           return 1;
       } }
     printf("  [ok]   fragment cmpx export lowers to a discard (OpKill + export), valid SPIR-V\n");
+
+    // Astro Bot's title materials contain large reducible pixel shaders whose forward branch
+    // regions overlap rather than forming a lexical if-tree. The compact SSA structurizer must
+    // remain conservative, but the per-invocation graphics CFG dispatcher can execute the exact
+    // basic-block graph. This small crossing-region shape forces that fallback.
+    const uint32_t fragment_cfg_dispatch[] = {
+        0x7e040280u,                         // pc0:  v_mov_b32 v2, 0
+        0x7e060280u,                         // pc1:  v_mov_b32 v3, 0
+        0x7e080280u,                         // pc2:  v_mov_b32 v4, 0
+        0x7e0a0280u,                         // pc3:  v_mov_b32 v5, 0
+        0x7c020300u,                         // pc4:  v_cmp_lt_f32 vcc, v0, v1
+        0xbf860003u,                         // pc5:  s_cbranch_vccz -> pc9
+        0x7c020300u,                         // pc6:  v_cmp_lt_f32 vcc, v0, v1
+        0xbf860002u,                         // pc7:  s_cbranch_vccz -> pc10 (crosses pc5 region)
+        0x7e040281u,                         // pc8:  v_mov_b32 v2, 1
+        0x7e060281u,                         // pc9:  v_mov_b32 v3, 1
+        0x7c020300u,                         // pc10: v_cmp_lt_f32 vcc, v0, v1
+        0xbf860003u,                         // pc11: s_cbranch_vccz -> alternate export at pc15
+        0xf800180fu, 0x05040302u,            // pc12: exp mrt0 v2, v3, v4, v5 done vm
+        0xbf820003u,                         // pc14: s_branch -> verified tail exit at pc18
+        0xf800180fu, 0x05040302u,            // pc15: alternate exp mrt0 v2, v3, v4, v5 done vm
+        0xbf810000u,                         // pc17: s_endpgm
+        0xbf810000u,                         // pc18: branch-target s_endpgm
+    };
+    const auto fragment_cfg_spv = recompile_fragment(
+        fragment_cfg_dispatch, std::size(fragment_cfg_dispatch));
+    if (fragment_cfg_spv.empty() || !has_opcode(fragment_cfg_spv, 251) ||
+        !type_result_ids_are_nonzero(fragment_cfg_spv, nullptr) ||
+        !phi_ids_are_nonzero(fragment_cfg_spv)) {
+        printf("  [FAIL] complex fragment CFG did not lower through a valid OpSwitch dispatcher\n");
+        return 1;
+    }
+    const OutputStoreStats cfg_outputs = output_store_stats(fragment_cfg_spv);
+    if (cfg_outputs.stores != 2 || cfg_outputs.stores_with_one_repeated_source != 0) {
+        printf("  [FAIL] complex fragment CFG exports stale entry state or suppresses an alternate "
+               "site (stores=%u repeated-source=%u)\n",
+               cfg_outputs.stores, cfg_outputs.stores_with_one_repeated_source);
+        return 1;
+    }
+    printf("  [ok]   complex fragment CFG exports active state from both alternate sites\n");
 
     // Alpha-test discard via the SCALAR-BRANCH form (not v_cmpx): compare a sampled/interpolated value,
     // ANDN2 the survivor mask into a saved EXEC copy (SCC = "any lane survives"), and s_cbranch_scc0 skips

@@ -25,6 +25,31 @@ alignas(256) static const uint32_t kDiagnosticBadPs[] = {
     0x06000300u, 0xbf820005u, 0xBF810000u,
 };
 
+// Astro Bot's fullscreen VS addresses a 72-byte table after S_ENDPGM through an s_getpc_b64-built
+// V#. Captures must retain that proven table span: raw replay otherwise sees only the first 45 words
+// and rejects the shader even though live recompilation succeeded.
+alignas(256) static const uint32_t kDiagnosticPcrelVs[] = {
+    0xbfa00002u, 0x93eaff03u, 0x00080008u, 0x876bff03u,
+    0x000000ffu, 0x8f6a8c6au, 0x887c6a6bu, 0xbf800000u,
+    0xbf900009u, 0x906a8803u, 0x81ea6a80u, 0x90fe6ac1u,
+    0xf8000941u, 0x00000000u, 0x81ea0380u, 0xbf8cff0fu,
+    0x90fe6ac1u, 0xd56a0000u, 0x00020affu, 0xaaaaaaabu,
+    0xbe8303ffu, 0x10005004u, 0xb0020048u, 0xbe801f00u,
+    0x800000ffu, 0x00000060u, 0x82010180u, 0x2c000081u,
+    0xd7460000u, 0x04010300u, 0x4c000105u, 0x34000083u,
+    0xd7460004u, 0x04010300u, 0xe0381000u, 0x80000004u,
+    0xe0341010u, 0x80000404u, 0xbf8c3f71u, 0xf80008cfu,
+    0x03020100u, 0xbf8c3f70u, 0xf8000203u, 0x00000504u,
+    0xbf810000u,
+    // Alignment padding followed by the 18-dword table at byte offset 192.
+    0u, 0u, 0u,
+    0x3f800000u, 0x00000000u, 0x00000000u, 0x3f800000u,
+    0x00000000u, 0x3f800000u, 0x00000000u, 0x3f800000u,
+    0x3f800000u, 0x3f800000u, 0x00000000u, 0x3f800000u,
+    0x00000000u, 0x00000000u, 0x3f800000u, 0x3f800000u,
+    0x00000000u, 0x3f800000u,
+};
+
 static void set_pgm(GpuState& state, uint32_t lo_register, uint32_t hi_register,
                     const void* program) {
     const uint64_t addr = reinterpret_cast<uint64_t>(program);
@@ -59,6 +84,7 @@ int main() {
         };
         if (const size_t read = read_shader(kDiagnosticVs, sizeof(kDiagnosticVs))) return read;
         if (const size_t read = read_shader(kDiagnosticBadPs, sizeof(kDiagnosticBadPs))) return read;
+        if (const size_t read = read_shader(kDiagnosticPcrelVs, sizeof(kDiagnosticPcrelVs))) return read;
         if (addr < 0x1000 || addr >= 0x1000 + memory.size()) return 0;
         size_t off = static_cast<size_t>(addr - 0x1000), take = std::min(n, memory.size() - off);
         std::memcpy(dst, memory.data() + off, take); return take;
@@ -160,6 +186,17 @@ int main() {
           captured.raw_shader_versions[captured.draws[0].fs_raw_shader_index].words ==
               std::vector<uint32_t>(std::begin(kDiagnosticBadPs), std::end(kDiagnosticBadPs)),
           "realized draw captures exact bounded VS and FS RDNA2 streams");
+
+    DrawItem pcrel_draw = draw;
+    pcrel_draw.vs_guest_addr = reinterpret_cast<uint64_t>(kDiagnosticPcrelVs);
+    pcrel_draw.fs_guest_addr = 0;
+    GpuCaptureFile pcrel_capture;
+    CHECK(capture_draw_items({pcrel_draw}, meta, reader, pcrel_capture, error, rtt_reader) &&
+              pcrel_capture.raw_shader_versions.size() == 1 &&
+              pcrel_capture.raw_shader_versions[0].words ==
+                  std::vector<uint32_t>(std::begin(kDiagnosticPcrelVs),
+                                        std::end(kDiagnosticPcrelVs)),
+          "Astro PC-relative VS capture retains its proven post-ENDPGM table");
 
     DrawItem shared_shader_draw = draw;
     shared_shader_draw.vs_shared =
