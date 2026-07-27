@@ -278,9 +278,8 @@ int main() {
     }
     printf("  [ok]   unproven NGG rejects one-lane mask population count\n");
 
-    // A constant terminal NGG output gate cannot mix active and inactive host vertices, so it is a
-    // topology-independent fixture for the output selection. Data-dependent gates remain restricted
-    // to the byte-exact Astro wrapper and are rejected immediately below.
+    // Exercise the output-selection emitter through its explicit test hook. The production entry
+    // point restricts every terminal NGG gate to the byte-exact Astro wrapper, as checked below.
     const uint32_t ngg_output_gate[] = {
         0xBF900009u,                         // s_sendmsg GS_ALLOC_REQ (marks NGG)
         0x7C3E0300u,                         // v_cmpx_tru_f32 (uniformly narrows no lanes)
@@ -288,13 +287,18 @@ int main() {
         0xF80008CFu, 0x03020100u,            // exp pos0 v0,v1,v2,v3
         0xBF810000u,
     };
-    const auto ngg_output_gate_spv = recompile_vertex(
+    const auto ngg_output_gate_spv = recompile_vertex_terminal_ngg_gate_for_test(
         ngg_output_gate, sizeof(ngg_output_gate) / sizeof(ngg_output_gate[0]));
     if (ngg_output_gate_spv.empty() || !phi_ids_are_nonzero(ngg_output_gate_spv)) {
         printf("  [FAIL] terminal NGG compacted-vertex output gate did not produce valid SPIR-V\n");
         return 1;
     }
     printf("  [ok]   terminal NGG compacted-vertex output gate produces valid SPIR-V\n");
+    if (!recompile_vertex(ngg_output_gate, std::size(ngg_output_gate)).empty()) {
+        printf("  [FAIL] production accepted an unproven constant NGG output gate\n");
+        return 1;
+    }
+    printf("  [ok]   production rejects unproven constant NGG output gates (including points)\n");
 
     // A per-vertex CMPX under the same superficial terminal shape can create mixed active/inactive
     // primitives. Without the byte-exact Astro wrapper/topology proof it must remain rejected.

@@ -9652,10 +9652,11 @@ static bool is_astro_bot_ngg_private_lds_wrapper(const uint32_t* code, size_t dw
     return hash == 0x79eb2b954b07dc8eull;
 }
 
-std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
-                                       const ShaderResourceTable* rt,
-                                       const PixelInputMapping* pixel_inputs,
-                                       bool capture_position) {
+static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t dwords,
+                                                  const ShaderResourceTable* rt,
+                                                  const PixelInputMapping* pixel_inputs,
+                                                  bool capture_position,
+                                                  bool allow_test_ngg_output_gate) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
     const StaticScratchLayout scratch = analyze_static_scratch(ins);
@@ -9704,20 +9705,10 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
             if (ins[previous].fmt != Rdna2Format::VOPC ||
                 !vopc_is_cmpx(ins[previous].opcode))
                 continue;
-            // The observed Astro wrapper is byte-exact. For any other NGG program, accept this
-            // vertex-suppression projection only for CMPX_F/CMPX_TRU with EXEC never narrowed
-            // beforehand: every host invocation then takes the same active/inactive path, so no
-            // mixed primitive can be fabricated regardless of topology. These constant forms also
-            // provide small executable regression fixtures without widening production semantics.
-            bool exec_full_before_compare = true;
-            for (size_t j = 0; j < previous; ++j)
-                if (instruction_may_change_exec(ins[j])) {
-                    exec_full_before_compare = false;
-                    break;
-                }
-            const bool constant_whole_draw_gate = exec_full_before_compare &&
-                (ins[previous].opcode == 0x10u || ins[previous].opcode == 0x1fu);
-            if (!b.ngg_private_lds && !constant_whole_draw_gate)
+            // Production accepts data-dependent vertex suppression only for the byte-exact Astro
+            // wrapper. The explicit test hook below exercises active/inactive export selection with
+            // a tiny shader without turning that shader shape into a runtime allow-list exception.
+            if (!b.ngg_private_lds && !allow_test_ngg_output_gate)
                 continue;
             bool has_position = false;
             bool output_only = true;
@@ -9975,6 +9966,18 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
         }
     }
     return b.finish();
+}
+
+std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
+                                       const ShaderResourceTable* rt,
+                                       const PixelInputMapping* pixel_inputs,
+                                       bool capture_position) {
+    return recompile_vertex_impl(code, dwords, rt, pixel_inputs, capture_position, false);
+}
+
+std::vector<uint32_t> recompile_vertex_terminal_ngg_gate_for_test(
+    const uint32_t* code, size_t dwords) {
+    return recompile_vertex_impl(code, dwords, nullptr, nullptr, false, true);
 }
 
 } // namespace prosper::gpu

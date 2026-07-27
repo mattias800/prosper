@@ -103,9 +103,9 @@ int main() {
         0xF80008CFu, 0x01000302u,
         0xBF810000u,
     };
-    const auto active_gate_spv = recompile_vertex(
+    const auto active_gate_spv = recompile_vertex_terminal_ngg_gate_for_test(
         ngg_gate_active, std::size(ngg_gate_active));
-    const auto inactive_gate_spv = recompile_vertex(
+    const auto inactive_gate_spv = recompile_vertex_terminal_ngg_gate_for_test(
         ngg_gate_inactive, std::size(ngg_gate_inactive));
     CHECK(!active_gate_spv.empty() && !inactive_gate_spv.empty(),
           "terminal NGG output gate recompiles for active and inactive paths");
