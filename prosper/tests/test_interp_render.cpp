@@ -106,6 +106,28 @@ int main() {
               "P0 + P10*I + P20*J reconstructs the original smooth red gradient");
     }
 
+    PixelInputMapping custom_input;
+    custom_input.valid_mask = 1u;
+    custom_input.passthrough_mask = 1u;
+    const FragmentInterpolationLayout custom_layout = fragment_interpolation_layout(
+        explicit_ps, std::size(explicit_ps), &perspective_center, &custom_input);
+    const std::vector<uint32_t> custom_geom = recompile_interpolation_geometry(custom_layout);
+    auto count_spirv_opcode = [](const std::vector<uint32_t>& words, uint32_t opcode) {
+        size_t count = 0;
+        for (size_t i = 5; i < words.size();) {
+            const uint32_t word_count = words[i] >> 16;
+            if (!word_count) break;
+            if ((words[i] & 0xffffu) == opcode) ++count;
+            i += word_count;
+        }
+        return count;
+    };
+    CHECK(custom_layout.passthrough_mask == 1u && !custom_geom.empty(),
+          "custom pixel input requests raw triangle-vertex parameters from the geometry stage");
+    CHECK(count_spirv_opcode(explicit_geom, 131u) ==
+              count_spirv_opcode(custom_geom, 131u) + 2u, // OpFSub
+          "custom geometry exports two raw vertices instead of fixed-function deltas");
+
     // DOLL's live linkage shape is non-identity: PS input 1 consumes producer PARAM3. Exercise the
     // generic form here by moving this fixture's export from PARAM0 to PARAM3, then remapping logical
     // PS input 0 back to source slot 3. The unchanged attr0 PS must still receive the gradient.
@@ -129,6 +151,20 @@ int main() {
         CHECK(remapped_max - remapped_min > 40,
               "remapped PARAM3 preserves the interpolated gradient at PS input 0");
     }
+
+    PixelInputMapping custom_remap;
+    custom_remap.valid_mask = 1u;
+    custom_remap.controls[0] = 0x423u; // PARAM3 + parameter-cache pass-through + flat
+    CHECK(custom_remap.effective_passthrough_mask() == 1u,
+          "register-form custom PARAM3 recovers its pass-through mode");
+    std::vector<uint32_t> custom_remapped_vert = recompile_vertex(
+        param3_vs.data(), param3_vs.size(), nullptr, &custom_remap);
+    std::vector<uint8_t> custom_remapped_px = prosper::test::render_triangle_rgba(
+        custom_remapped_vert, frag, W, H);
+    CHECK(custom_remapped_px.size() == (size_t)W * H * 4,
+          "custom OFFSET bit does not hide the underlying PARAM3 vertex export");
+    CHECK(custom_remapped_px == remapped_px,
+          "custom register linkage preserves the exact PARAM3 varying values");
 
     // GFX10 fixed-function interpolation can replace a missing PARAM export with one of four
     // DEFAULT_VAL vectors. Vulkan has no matching pipeline state, so the vertex recompiler emits

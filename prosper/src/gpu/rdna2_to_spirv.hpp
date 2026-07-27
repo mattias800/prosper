@@ -57,10 +57,26 @@ size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords);
 // Fixed-function PS interpolant wiring captured from SPI_PS_INPUT_CNTL_0..31. A valid entry's
 // OFFSET selects the vertex PARAM export feeding that logical PS input; OFFSET=0x20 selects the
 // four hardware default vectors encoded by DEFAULT_VAL instead. Keeping this separate from
-// RenderState makes the recompiler independently unit-testable.
+// RenderState makes the recompiler independently unit-testable. `passthrough_mask` disambiguates the
+// custom PARAM0 encoding; other custom PARAM slots can also be recovered from their register control.
 struct PixelInputMapping {
     std::array<uint32_t, 32> controls{};
     uint32_t valid_mask = 0;
+    uint32_t passthrough_mask = 0;
+
+    uint32_t effective_passthrough_mask() const {
+        uint32_t mask = passthrough_mask;
+        for (uint32_t input = 0; input < controls.size(); ++input) {
+            if (!(valid_mask & (1u << input))) continue;
+            const uint32_t control = controls[input];
+            // OFFSET bit 5 + FLAT_SHADE is the register form emitted for explicit parameter-cache
+            // pass-through. A nonzero low OFFSET distinguishes it from the constant-default form;
+            // metadata's explicit mask covers the otherwise ambiguous PARAM0 encoding.
+            if ((control & 0x420u) == 0x420u && (control & 0x1fu) != 0u)
+                mask |= 1u << input;
+        }
+        return mask & valid_mask;
+    }
 
     bool operator==(const PixelInputMapping&) const = default;
 };
@@ -82,14 +98,17 @@ struct PixelSystemInputMapping {
 // subset of devices. When `requires_geometry` is true, the renderer inserts the generated geometry
 // stage returned by recompile_interpolation_geometry(). It passes ordinary smooth attributes through
 // and publishes P0, P10=(P1-P0), P20=(P2-P0), plus any requested barycentric system inputs, as a
-// packed interface understood by recompile_fragment(). Locations are capped at Vulkan's portable
-// 128-component fragment-input minimum (32 vec4 locations); `valid == false` keeps overflow visible.
+// packed interface understood by recompile_fragment(). Custom/pass-through attributes instead expose
+// the three raw vertex values that the guest shader explicitly interpolates. Locations are capped at
+// Vulkan's portable 128-component fragment-input minimum (32 vec4 locations); `valid == false` keeps
+// overflow visible.
 struct FragmentInterpolationLayout {
     static constexpr uint32_t kUnusedLocation = UINT32_MAX;
     std::array<std::array<uint32_t, 3>, 32> parameter_locations{}; // [attr][0=P10,1=P20,2=P0]
     std::array<uint32_t, 7> system_locations{};                    // PS system fields 0..6
     uint32_t attribute_mask = 0;                                  // attributes consumed by VINTRP
     uint32_t smooth_mask = 0;                                     // attributes consumed by P1/P2
+    uint32_t passthrough_mask = 0;                                // explicit inputs exposing raw vertex values
     bool requires_geometry = false;
     bool valid = true;
 
@@ -98,7 +117,8 @@ struct FragmentInterpolationLayout {
 
 FragmentInterpolationLayout fragment_interpolation_layout(
     const uint32_t* code, size_t dwords,
-    const PixelSystemInputMapping* system_inputs = nullptr);
+    const PixelSystemInputMapping* system_inputs = nullptr,
+    const PixelInputMapping* pixel_inputs = nullptr);
 
 // Generate the descriptor-free triangle geometry stage described above. Returns {} when no fallback
 // is required or the packed interface is invalid. Triangle lists, strips, fans, and the RectList

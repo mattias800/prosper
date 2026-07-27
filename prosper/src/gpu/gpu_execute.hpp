@@ -361,7 +361,8 @@ void clear_shader_recompile_cache();
 
 FragmentInterpolationLayout fragment_interpolation_layout_cached(
     const uint32_t* code, size_t dwords,
-    const PixelSystemInputMapping* system_inputs = nullptr);
+    const PixelSystemInputMapping* system_inputs = nullptr,
+    const PixelInputMapping* pixel_inputs = nullptr);
 
 struct DrawRealizationPhaseStats {
     uint64_t draws = 0;
@@ -781,6 +782,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         if (derived.valid_mask) {
             pixel_inputs.controls = derived.controls;
             pixel_inputs.valid_mask = derived.valid_mask;
+            pixel_inputs.passthrough_mask = derived.passthrough_mask;
             interpolants_from_metadata = true;
         }
     }
@@ -801,7 +803,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     const ResolvedPipelineState resolved_pipeline = resolve_pipeline_state(rs);
     const FragmentInterpolationLayout interpolation = fragment_interpolation_layout_cached(
         reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.ps_addr)),
-        max_shader_dwords, system_input_ptr);
+        max_shader_dwords, system_input_ptr, pixel_input_ptr);
     uint64_t vs_identity = 0, fs_identity = 0;
     SharedShaderWords vs_shared, fs_shared;
     std::vector<uint32_t> vs, fs;
