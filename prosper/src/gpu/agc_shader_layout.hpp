@@ -156,6 +156,11 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]);
 // long-standing 2D fallback.
 uint32_t image_type_to_dim(uint8_t type);
 
+// GFX10 image descriptors use only SQ_RSRC_IMG TYPE values 8..15. Buffer V# tables are frequently
+// eight-dword aligned too, so this discriminator is part of validating a candidate T# rather than a
+// cosmetic decode detail.
+inline bool valid_image_type(uint8_t type) { return type >= 8 && type <= 15; }
+
 // A Gen5/GFX10 T# IMG_FMT (the 9-bit combined format field) decoded to sizing + conversion info.
 // bytes_per_block is the byte size of one block_width x block_height texel block — for uncompressed
 // formats block dims are 1x1 and it equals bytes-per-texel; for BCn blocks are 4x4.

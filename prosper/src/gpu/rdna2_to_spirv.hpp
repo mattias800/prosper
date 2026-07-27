@@ -247,6 +247,11 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
 std::vector<uint32_t> recompile_vertex_terminal_ngg_gate_for_test(
     const uint32_t* code, size_t dwords);
 
+// Test hook: exercise operations whose semantics depend on the exact Astro one-lane NGG projection.
+// Production recompile_vertex only enables that projection for byte-exact observed wrappers.
+std::vector<uint32_t> recompile_vertex_ngg_one_lane_for_test(
+    const uint32_t* code, size_t dwords);
+
 // How much of a shader the recompiler currently covers (per-instruction), without requiring the
 // stream to be a complete vertex/fragment. `alu` = instructions emit_alu handles (VALU/scalar/
 // control-flow); `exports` = EXP (handled by the stage recompilers); `unsupported` = not yet handled

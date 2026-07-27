@@ -217,6 +217,110 @@ int main() {
     }
     printf("  [ok]   fragment private spill/fill emits structurally valid Function storage\n");
 
+    // Astro Bot's Wave32 graphics shaders save/copy/restore active-lane masks through the low
+    // halves of EXEC and VCC.  These are the B32 equivalents of the B64 mask moves already modeled
+    // below, not scalar-data transfers: treating EXEC_LO as ordinary data rejected the entire draw.
+    const uint32_t wave32_fragment_masks[] = {
+        0xbe80037eu,                         // s_mov_b32 s0, exec_lo
+        0xbeea037eu,                         // s_mov_b32 vcc_lo, exec_lo
+        0xbefe0300u,                         // s_mov_b32 exec_lo, s0
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,            // exp mrt0 v0,v1,v2,v3
+        0xbf810000u,
+    };
+    const auto wave32_fragment_spv = recompile_fragment(
+        wave32_fragment_masks, std::size(wave32_fragment_masks));
+    uint32_t wave32_fragment_bad_op = 0;
+    if (wave32_fragment_spv.empty() ||
+        !type_result_ids_are_nonzero(wave32_fragment_spv, &wave32_fragment_bad_op) ||
+        !phi_ids_are_nonzero(wave32_fragment_spv)) {
+        printf("  [FAIL] Wave32 fragment EXEC_LO/VCC_LO mask moves emitted invalid SPIR-V (op=%u)\n",
+               wave32_fragment_bad_op);
+        return 1;
+    }
+    printf("  [ok]   Wave32 fragment EXEC_LO/VCC_LO mask moves emit valid SPIR-V\n");
+
+    const uint32_t wave32_fragment_wqm[] = {
+        0xbe80037eu,                         // s_mov_b32 s0, exec_lo
+        0xbefe0900u,                         // s_wqm_b32 exec_lo, s0
+        0xbefe097eu,                         // s_wqm_b32 exec_lo, exec_lo
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,            // exp mrt0 v0,v1,v2,v3
+        0xbf810000u,
+    };
+    const auto wave32_fragment_wqm_spv = recompile_fragment(
+        wave32_fragment_wqm, std::size(wave32_fragment_wqm));
+    if (wave32_fragment_wqm_spv.empty() ||
+        !type_result_ids_are_nonzero(wave32_fragment_wqm_spv, nullptr) ||
+        !phi_ids_are_nonzero(wave32_fragment_wqm_spv)) {
+        printf("  [FAIL] Wave32 fragment s_wqm_b32 mask path did not recompile cleanly\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 fragment s_wqm_b32 mask path emits valid SPIR-V\n");
+
+    const uint32_t wave32_vertex_exec[] = {
+        0xbefe03c1u,                         // s_mov_b32 exec_lo, -1
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf80008cfu, 0x03020100u,            // exp pos0 v0,v1,v2,v3
+        0xbf810000u,
+    };
+    const auto wave32_vertex_spv = recompile_vertex(
+        wave32_vertex_exec, std::size(wave32_vertex_exec));
+    if (wave32_vertex_spv.empty() || !phi_ids_are_nonzero(wave32_vertex_spv)) {
+        printf("  [FAIL] Wave32 vertex EXEC_LO all-lanes restore did not recompile\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 vertex EXEC_LO all-lanes restore recompiles\n");
+
+    const uint32_t scalar_abs_compute[] = {
+        0xb000ffffu,                         // s_movk_i32 s0, -1
+        0xbe813400u,                         // s_abs_i32 s1, s0
+        0xbf850001u,                         // s_cbranch_scc1 +1
+        0xbf800000u,                         // s_nop 0
+        0xbf810000u,
+    };
+    ComputeShaderConfig scalar_abs_config;
+    const auto scalar_abs_spv = recompile_compute(
+        scalar_abs_compute, std::size(scalar_abs_compute), nullptr, scalar_abs_config);
+    if (scalar_abs_spv.empty() || !type_result_ids_are_nonzero(scalar_abs_spv, nullptr) ||
+        !phi_ids_are_nonzero(scalar_abs_spv)) {
+        printf("  [FAIL] scalar s_abs_i32/SCC path did not recompile cleanly\n");
+        return 1;
+    }
+    printf("  [ok]   scalar s_abs_i32 writes its result and SCC in valid SPIR-V\n");
+
+    // Prosper does not expose an attached GPU system debugger to guest shaders, so COND_DBG_SYS is
+    // permanently clear and s_cbranch_cdbgsys falls through. Astro's world-map NGG wrapper uses this
+    // around its position export; rejecting it drops the complete draw despite ordinary hardware also
+    // taking the fallthrough path outside a shader-debugging session.
+    const uint32_t no_system_debugger_vertex[] = {
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xbf970001u,                         // s_cbranch_cdbgsys +1 (not taken)
+        0xf80008cfu, 0x03020100u,            // exp pos0 v0,v1,v2,v3
+        0xbf810000u,
+    };
+    const auto no_system_debugger_spv = recompile_vertex(
+        no_system_debugger_vertex, std::size(no_system_debugger_vertex));
+    if (no_system_debugger_spv.empty() ||
+        !type_result_ids_are_nonzero(no_system_debugger_spv, nullptr) ||
+        !phi_ids_are_nonzero(no_system_debugger_spv)) {
+        printf("  [FAIL] s_cbranch_cdbgsys did not take the no-debugger fallthrough path\n");
+        return 1;
+    }
+    printf("  [ok]   s_cbranch_cdbgsys falls through when no GPU debugger is exposed\n");
+
+    const uint32_t unsupported_exec_hi[] = {
+        0xbeff03c1u,                         // s_mov_b32 exec_hi, -1
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf80008cfu, 0x03020100u,
+        0xbf810000u,
+    };
+    if (!recompile_vertex(unsupported_exec_hi, std::size(unsupported_exec_hi)).empty()) {
+        printf("  [FAIL] unsupported EXEC_HI B32 write was accepted\n");
+        return 1;
+    }
+    printf("  [ok]   EXEC_HI B32 writes remain fail-closed\n");
+
     const uint32_t scratch_vertex[] = {
         0xdc704010u, 0x00000000u, // scratch_store_dword off, v0, s0 offset:16
         0x7e000280u,              // v_mov_b32 v0, 0
@@ -278,6 +382,49 @@ int main() {
     }
     printf("  [ok]   unproven NGG rejects one-lane mask population count\n");
 
+    // In Astro's byte-exact one-lane NGG projection, find-first-one on a wave mask is exact:
+    // the represented lane is bit zero, so an active mask returns 0 and an empty mask returns -1.
+    // The test-only entry point exercises that lowering without broadening production acceptance.
+    const uint32_t ngg_mask_ff1[] = {
+        0xBF900009u,                         // s_sendmsg GS_ALLOC_REQ (marks NGG)
+        0xBEEA04C1u,                         // s_mov_b64 vcc, -1
+        0xBE80146Au,                         // s_ff1_i32_b64 s0, vcc
+        0x7E000C00u,                         // v_cvt_f32_u32 v0, s0
+        0x7E020280u, 0x7E040280u, 0x7E0602F2u,
+        0xF80008CFu, 0x03020100u,            // exp pos0 v0,v1,v2,v3
+        0xBF810000u,
+    };
+    const auto ngg_mask_ff1_spv = recompile_vertex_ngg_one_lane_for_test(
+        ngg_mask_ff1, std::size(ngg_mask_ff1));
+    if (ngg_mask_ff1_spv.empty() || !type_result_ids_are_nonzero(ngg_mask_ff1_spv, nullptr)) {
+        printf("  [FAIL] one-lane NGG s_ff1_i32_b64 did not emit valid SPIR-V\n");
+        return 1;
+    }
+    printf("  [ok]   one-lane NGG s_ff1_i32_b64 emits valid SPIR-V\n");
+
+    // Astro's 7f5f world-map wrapper constructs a B64 wave mask in ordinary scalar DATA registers
+    // and consumes it through v_cndmask_b32_e64. The one-lane projection represents lane zero, so
+    // the condition is exactly bit zero of the pair's low dword. Other vertex shaders still reject
+    // this wave-dependent form because they have no proven lane identity.
+    const uint32_t ngg_scalar_data_mask[] = {
+        0xBF900009u,                         // s_sendmsg GS_ALLOC_REQ (marks NGG)
+        0xBE8403FFu, 0xAAAAAAAAu,            // s_mov_b32 s4, 0xaaaaaaaa
+        0xBE850304u,                         // s_mov_b32 s5, s4
+        0xD5010005u, 0x00120AFFu, 0x00100800u, // exact v_cndmask_b32_e64 v5, lit, v5, s[4:5]
+        0x7E000305u,                         // v_mov_b32 v0, v5
+        0x7E020280u, 0x7E040280u, 0x7E0602F2u,
+        0xF80008CFu, 0x03020100u,            // exp pos0 v0,v1,v2,v3
+        0xBF810000u,
+    };
+    const auto ngg_scalar_data_mask_spv = recompile_vertex_ngg_one_lane_for_test(
+        ngg_scalar_data_mask, std::size(ngg_scalar_data_mask));
+    if (ngg_scalar_data_mask_spv.empty() ||
+        !type_result_ids_are_nonzero(ngg_scalar_data_mask_spv, nullptr)) {
+        printf("  [FAIL] one-lane NGG scalar-data mask cndmask did not emit valid SPIR-V\n");
+        return 1;
+    }
+    printf("  [ok]   one-lane NGG scalar-data mask cndmask emits valid SPIR-V\n");
+
     // Exercise the output-selection emitter through its explicit test hook. The production entry
     // point restricts every terminal NGG gate to the byte-exact Astro wrapper, as checked below.
     const uint32_t ngg_output_gate[] = {
@@ -294,6 +441,48 @@ int main() {
         return 1;
     }
     printf("  [ok]   terminal NGG compacted-vertex output gate produces valid SPIR-V\n");
+
+    // The real Astro wrapper does not export directly after its terminal CMPX gate: it computes an
+    // LDS address and reloads the compacted vertex first. Those predicated register-only operations
+    // are part of the same bounded gate and must not make its position export look unsafe.
+    const uint32_t ngg_output_rebuild_gate[] = {
+        0xBF900009u,                         // s_sendmsg GS_ALLOC_REQ (marks NGG)
+        0x7C3E0300u,                         // v_cmpx_tru_f32
+        0xBF880005u,                         // s_cbranch_execz -> s_endpgm
+        0x7E000280u,                         // v_mov_b32 v0, 0 (address/value setup)
+        0xD8D80000u, 0x00000000u,            // ds_read_b32 v0, v0
+        0xF80008CFu, 0x03020100u,            // exp pos0 v0,v1,v2,v3
+        0xBF810000u,
+    };
+    const auto ngg_output_rebuild_spv = recompile_vertex_terminal_ngg_gate_for_test(
+        ngg_output_rebuild_gate, std::size(ngg_output_rebuild_gate));
+    if (ngg_output_rebuild_spv.empty() || !phi_ids_are_nonzero(ngg_output_rebuild_spv)) {
+        printf("  [FAIL] terminal NGG LDS output-rebuild gate did not produce valid SPIR-V\n");
+        return 1;
+    }
+    printf("  [ok]   terminal NGG LDS output-rebuild gate produces valid SPIR-V\n");
+
+    // Astro's second world-map wrapper exports POS for a surviving compacted vertex, then a regular
+    // VCC compare conditionally skips only the trailing PARAM exports. Supplying those otherwise-
+    // undefined varyings in the one-lane projection is safe and must not drop the complete draw.
+    const uint32_t ngg_output_vcc_tail[] = {
+        0xBF900009u,                         // s_sendmsg GS_ALLOC_REQ (marks NGG)
+        0x7C3E0300u,                         // v_cmpx_tru_f32
+        0xBF880006u,                         // s_cbranch_execz -> s_endpgm
+        0xF80008CFu, 0x03020100u,            // exp pos0 v0,v1,v2,v3
+        0x7D8A5880u,                         // v_cmp_ne_u32 vcc, 0, v44
+        0xBF860002u,                         // s_cbranch_vccnz -> s_endpgm
+        0xF800020Fu, 0x03020100u,            // exp param0 v0,v1,v2,v3
+        0xBF810000u,
+    };
+    const auto ngg_output_vcc_tail_spv = recompile_vertex_terminal_ngg_gate_for_test(
+        ngg_output_vcc_tail, std::size(ngg_output_vcc_tail));
+    if (ngg_output_vcc_tail_spv.empty() || !phi_ids_are_nonzero(ngg_output_vcc_tail_spv)) {
+        printf("  [FAIL] terminal NGG VCC-gated PARAM tail did not produce valid SPIR-V\n");
+        return 1;
+    }
+    printf("  [ok]   terminal NGG VCC-gated PARAM tail produces valid SPIR-V\n");
+
     if (!recompile_vertex(ngg_output_gate, std::size(ngg_output_gate)).empty()) {
         printf("  [FAIL] production accepted an unproven constant NGG output gate\n");
         return 1;
@@ -458,6 +647,34 @@ int main() {
         return 1;
     }
     printf("  [ok]   vertex fetch recompiles to valid SPIR-V with a resource table (binding 3)\n");
+
+    // Astro's NGG vertex shader fetches Float16x4 records with an SGPR SOFFSET.  Even when the
+    // descriptor stride is dword-aligned, that runtime offset can select either half of a dword;
+    // all four components must be extracted relative to the complete byte address.  This exact
+    // MUBUF shape previously hit [mubuf-unaligned] and dropped the draw.
+    const uint32_t vs_fetch_half4_soffset[] = {
+        0xb0050002u,                         // s_movk_i32 s5, 2
+        0xe00c2000u, 0x05000100u,           // buffer_load_format_xyzw v[1:4], v0, s[0:3], s5 idxen
+        0xf80008cfu, 0x04030201u,            // exp pos0 v1,v2,v3,v4
+        0xbf810000u,
+    };
+    ShaderResourceTable rt_half4;
+    ShaderResource vb_half4{};
+    vb_half4.cls = ResourceClass::VertexBuffer;
+    vb_half4.format = DataFormat::Float16;
+    vb_half4.num_components = 4;
+    vb_half4.binding = 5;
+    vb_half4.stride = 36;
+    vb_half4.fetch_pc = 1;
+    vb_half4.fetch_index_mode = VertexFetchIndexMode::Shader;
+    rt_half4.resources.push_back(vb_half4);
+    const auto half4_spv = recompile_vertex(
+        vs_fetch_half4_soffset, std::size(vs_fetch_half4_soffset), &rt_half4);
+    if (half4_spv.empty() || half4_spv[0] != 0x07230203u) {
+        printf("  [FAIL] Float16x4 vertex fetch with runtime SOFFSET did not recompile\n");
+        return 1;
+    }
+    printf("  [ok]   Float16x4 vertex fetch handles a runtime SOFFSET\n");
 
     // image_sample LOD mode per execution model (#151): OpImageSampleImplicitLod is only legal in
     // the Fragment execution model — the compute and vertex shells have no derivatives, so an

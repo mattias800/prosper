@@ -628,6 +628,49 @@ int main() {
         CHECK(tt.by_sgpr_base(24) == nullptr, "unmapped IMG_FMT T# skipped (no silent RGBA8)");
     }
 
+    // Two adjacent V# buffer descriptors are also eight dwords. Astro's sharp metadata does not set the
+    // usual size hint for these entries, and their low address/format bits accidentally decode to
+    // plausible image dimensions. Shape-classify the first V# even without the hint instead of uploading
+    // two adjacent vertex buffers as one texture (the world-map checkerboarding path).
+    {
+        uint32_t vpair[32]; memset(vpair, 0, sizeof vpair);
+        make_vsharp(&vpair[0], 0x5000B441F68ull, 16, 3, 77);
+        make_vsharp(&vpair[4], 0x5000B442630ull, 16, 4, 77);
+        AgcShaderSharp fake_texture;
+        fake_texture.bits = 0; // offset_dw=0, size=0: previously sent directly to the T# path
+        AgcShaderUserData vud; memset(&vud, 0, sizeof vud);
+        vud.sharp_resource_offset[0] = &fake_texture;
+        vud.sharp_resource_count[0] = 1;
+        AgcShaderHeader vsh; memset(&vsh, 0, sizeof vsh);
+        vsh.file_header = 0x34333231u; vsh.version = 0x18; vsh.type = 2; vsh.user_data = &vud;
+
+        const DecodedImageDescriptor false_t = decode_image_descriptor(vpair);
+        CHECK(false_t.type == 0 && false_t.base != 0 && false_t.width != 0 && false_t.height != 0,
+              "adjacent Astro-shaped V#s reproduce a superficially plausible TYPE=0 T#");
+        const ShaderResourceTable vt = build_shader_resources(vsh, vpair, 32);
+        const ShaderResource* vr = vt.by_sgpr_base(0);
+        CHECK(vt.resources.size() == 1 && vr && vr->cls == ResourceClass::ConstantBuffer &&
+                  vr->gpu_addr == 0x5000B441F68ull && vr->size == 48,
+              "size-unhinted Astro V# is emitted as a buffer, not a texture");
+    }
+
+    // An invalid TYPE that does not have a valid V# shape must still be rejected outright. Keeping
+    // image validation independent of the V# classifier prevents arbitrary non-image tables from
+    // reaching either the metadata or dynamic texture paths.
+    {
+        uint32_t invalid_t[32]; memset(invalid_t, 0, sizeof invalid_t);
+        make_tsharp(invalid_t, 0xD1000000ull, 64, 64, /*fmt*/56, /*tile*/0, /*invalid type*/0);
+        AgcShaderSharp invalid_sharp;
+        invalid_sharp.bits = 0;
+        AgcShaderUserData iud; memset(&iud, 0, sizeof iud);
+        iud.sharp_resource_offset[0] = &invalid_sharp;
+        iud.sharp_resource_count[0] = 1;
+        AgcShaderHeader ish; memset(&ish, 0, sizeof ish);
+        ish.file_header = 0x34333231u; ish.version = 0x18; ish.type = 2; ish.user_data = &iud;
+        CHECK(build_shader_resources(ish, invalid_t, 32).resources.empty(),
+              "non-image SQ_RSRC TYPE is rejected instead of binding arbitrary bytes as a texture");
+    }
+
     // #382: an EUD-resident texture (T# spilled beyond the user-SGPR block) must be emitted, mirroring
     // the cbuf EUD path — the old hard `continue` dropped it, so the sampling draw rendered untextured.
     // Provenance is INDIRECT (srt_offset = the s_load immediate); sgpr_base is invalid so a stray

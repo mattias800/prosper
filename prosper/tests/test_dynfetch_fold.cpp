@@ -471,6 +471,40 @@ int main() {
               decode_buffer_descriptor(ngg_wide_uses[0].v4.data()).base == ngg_vertex_base,
           "fused NGG x16 stage-data load publishes its raw-buffer V# by consuming pc");
 
+    // Astro Bot's world-map NGG block begins with an 8-dword T# and also carries V#s later in the
+    // same x16 load. SGPR memory is typeless: preserving only the four V# interpretations makes the
+    // image_sample's s[8:15] permanently unknown and drops the main world-map draw at pc205.
+    alignas(16) static uint32_t ngg_mixed_stage_data[16] = {
+        0x01234000u, 0x00000005u, 0x00000000u, 0x00100000u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000008u,
+        0x89abcdefu, 0x01234567u, 0x76543210u, 0xfedcba98u,
+        0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u,
+    };
+    const uint32_t ngg_mixed_system_sgprs[2] = {
+        static_cast<uint32_t>(reinterpret_cast<uint64_t>(ngg_mixed_stage_data)),
+        static_cast<uint32_t>(reinterpret_cast<uint64_t>(ngg_mixed_stage_data) >> 32),
+    };
+    const uint32_t ngg_loaded_wide_texture[] = {
+        0xF4100200u, 0xFA000000u,   // s_load_dwordx16 s[8:23], s[0:1], 0
+        0xF0800F08u, 0x00A20000u,   // image_sample v[0:3], v[0:1], s[8:15], s[20:23]
+        0xBF810000u,
+    };
+    std::vector<SrtUse> ngg_wide_texture_uses;
+    resolve_dynamic_fetch(
+        ngg_loaded_wide_texture, std::size(ngg_loaded_wide_texture), nullptr, 0, 8,
+        &ngg_wide_texture_uses, UINT32_MAX, nullptr, ngg_mixed_system_sgprs,
+        std::size(ngg_mixed_system_sgprs));
+    CHECK(ngg_wide_texture_uses.size() == 1 &&
+              ngg_wide_texture_uses[0].kind == 0 &&
+              ngg_wide_texture_uses[0].use_pc == 2 &&
+              ngg_wide_texture_uses[0].key == 0xFFFFFFFFu &&
+              std::equal(ngg_wide_texture_uses[0].t8.begin(),
+                         ngg_wide_texture_uses[0].t8.end(),
+                         std::begin(ngg_mixed_stage_data)) &&
+              ngg_wide_texture_uses[0].has_samp &&
+              ngg_wide_texture_uses[0].s4[0] == ngg_mixed_stage_data[12],
+          "fused NGG x16 mixed stage-data load publishes its T# and paired S# by consuming pc");
+
     // Kernel 5n: an s_buffer_load_dwordx8 result is typeless SGPR data. A later scalar buffer load
     // may consume its first four words as a nested V#, as DOLL's post-process shader does. Since the
     // V# came through another buffer descriptor it has no immediate key; preserve it by consumer pc.
@@ -715,6 +749,34 @@ int main() {
     CHECK(direct_v_uses.size() == 1 && direct_v_uses[0].v4[0] == seed5v[0] &&
           direct_v_uses[0].v4[1] == seed5v[1] && direct_v_uses[0].v4[2] == seed5v[2],
           "direct raw-MUBUF V# preserves base/stride/record dwords");
+
+    // Astro Bot's 7f5f world-map NGG shader patches only NUM_RECORDS in its direct s[16:19] V#
+    // (`s_mov_b32 s18, 1`) before a raw buffer_load_dwordx4 at pc2761. The consumer is itself the
+    // architectural descriptor proof; requiring the four words to retain pristine entry-seed
+    // provenance dropped this fully-known live descriptor and therefore the whole draw.
+    alignas(16) static uint32_t patched_raw_payload[4]{};
+    const uint64_t patched_raw_base = reinterpret_cast<uint64_t>(patched_raw_payload);
+    uint32_t patched_raw_seed[12]{};
+    patched_raw_seed[8]  = static_cast<uint32_t>(patched_raw_base); // shader s16, user block +8
+    patched_raw_seed[9]  = (static_cast<uint32_t>(patched_raw_base >> 32) & 0xffffu) |
+                           (16u << 16);
+    patched_raw_seed[10] = 64u;
+    patched_raw_seed[11] = 0u;
+    const uint32_t patched_direct_raw[] = {
+        0xBE920381u,                // s_mov_b32 s18, 1 (live NUM_RECORDS patch)
+        0xE03C2020u, 0x8004074Cu,   // exact Astro raw buffer_load_dwordx4 ..., s[16:19]
+        0xBF810000u,
+    };
+    std::vector<SrtUse> patched_raw_uses;
+    resolve_dynamic_fetch(patched_direct_raw, std::size(patched_direct_raw),
+                          patched_raw_seed, std::size(patched_raw_seed), 8,
+                          &patched_raw_uses);
+    CHECK(patched_raw_uses.size() == 1 && patched_raw_uses[0].kind == 1 &&
+              patched_raw_uses[0].use_pc == 1 &&
+              patched_raw_uses[0].key == 0xFFFFFFFFu &&
+              decode_buffer_descriptor(patched_raw_uses[0].v4.data()).base == patched_raw_base &&
+              decode_buffer_descriptor(patched_raw_uses[0].v4.data()).num_records == 1,
+          "Astro patched direct raw-MUBUF V# resolves by its exact consuming pc");
 
     // #636: Dead Cells' format-copy compute places its declared source V# at s0 and its otherwise
     // undeclared destination V# at s4. Resource discovery must follow the two actual MUBUF uses:

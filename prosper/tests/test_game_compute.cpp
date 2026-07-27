@@ -222,6 +222,32 @@ int main() {
     }
     CHECK(unorm8_matches, "fast UNORM8 pack is equivalent to the lround reference");
 
+    auto reference_unorm16 = [](uint32_t bits) {
+        float value;
+        std::memcpy(&value, &bits, sizeof(value));
+        if (std::isnan(value)) value = 0.0f;
+        value = value < 0.0f ? 0.0f : (value > 1.0f ? 1.0f : value);
+        return static_cast<uint16_t>(std::lround(value * 65535.0f));
+    };
+    bool unorm16_matches = true;
+    for (uint32_t raw = 0; raw <= 0xffffu; ++raw) {
+        const float value = raw / 65535.0f;
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        if (prosper::frontend::storage_pack_unorm16(bits) != raw) {
+            unorm16_matches = false;
+            break;
+        }
+    }
+    for (uint32_t bits : pack_channels) {
+        if (prosper::frontend::storage_pack_unorm16(bits) != reference_unorm16(bits)) {
+            unorm16_matches = false;
+            break;
+        }
+    }
+    CHECK(unorm16_matches,
+          "UNORM16 pack preserves all quantized channels and matches lround for float inputs");
+
     bool storage_unorm8_range_matches = true;
     constexpr size_t unorm_texels = pack_channels_count / 4;
     for (uint32_t components : {1u, 2u, 3u, 4u}) {
@@ -591,6 +617,16 @@ int main() {
         for (uint32_t i = 0; i < s.size(); i++) s[i] = (uint8_t)(i * 71 + 11);
         CHECK(run_format_copy(DataFormat::Unorm8, 2, 2, s) == s,
               "Unorm8x2 storage copy round-trips native RG8 texels bit-exact (#590)");
+    }
+    {   // Astro Bot's title composite writes a tiled 256x64 RGBA16-UNORM surface.
+        std::vector<uint8_t> s(W * 8);
+        for (uint32_t t = 0; t < W * 4; ++t) {
+            const uint16_t value = static_cast<uint16_t>(t * 251u + 17u);
+            s[t * 2] = static_cast<uint8_t>(value);
+            s[t * 2 + 1] = static_cast<uint8_t>(value >> 8);
+        }
+        CHECK(run_format_copy(DataFormat::Unorm16, 4, 8, s) == s,
+              "Unorm16x4 storage copy round-trips guest channels bit-exact (#590)");
     }
     {   // Uint16 x1 (fmt=7): 16-bit integer widen on load, low-16-bit truncate on store
         std::vector<uint8_t> s(W * 2);
