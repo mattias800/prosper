@@ -3669,6 +3669,33 @@ void for_each_scalar_write(const Rdna2Inst& in, Visitor&& visit) {
         visit(in.sdst.value, 2);
 }
 
+// True when this explicit scalar destination is written in the per-lane B64 mask domain.  Keep
+// this classification independent of the post-emission SSA maps: folded/data writers such as
+// s_getpc_b64 intentionally leave no scalar value behind, so absence from `sreg` cannot identify a
+// mask write.  VOP3B's SDST is a mask/carry pair even though the instruction's primary VDST is data.
+bool scalar_write_is_b64_mask(const Rdna2Inst& in, int base) {
+    if (in.fmt == Rdna2Format::SOP1 && in.dst.value == base) {
+        switch (in.opcode) {
+            case 0x04: case 0x08: case 0x0a: case 0x24: case 0x25: case 0x37:
+                return true;
+            default: break;
+        }
+    }
+    if (in.fmt == Rdna2Format::SOP2 && in.dst.value == base) {
+        switch (in.opcode) {
+            case 0x0b: case 0x0f: case 0x11: case 0x13: case 0x15:
+            case 0x17: case 0x19: case 0x1b: case 0x1d: case 0x25:
+                return true;
+            default: break;
+        }
+    }
+    if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
+        in.dst.kind == OperandKind::SGPR && in.dst.value == base && base <= 105)
+        return true;
+    return in.fmt == Rdna2Format::VOP3 && in.sdst.kind == OperandKind::SGPR &&
+           in.sdst.value == base;
+}
+
 void record_scalar_write(RegState& rs, const Rdna2Inst& in) {
     // VOPC/VOP3 mask destinations live in sreg_bool, but they still overwrite the physical SGPR
     // pair. Drop any scalar-data value or SRT descriptor tag left by that pair's earlier lifetime;
@@ -3686,30 +3713,27 @@ void record_scalar_write(RegState& rs, const Rdna2Inst& in) {
         invalidate_mask_pair(in.sdst.value);
 
     for_each_scalar_write(in, [&](int base, uint32_t width) {
-        // emit_alu has already materialized the new lifetime. A scalar-data destination is present
-        // in sreg; a mask-only destination is not. End every overlapping one-word Wave32 mask
-        // lifetime on data writes, including SOP2, SOPK, SMEM, readfirstlane/readlane, and future
-        // scalar writers covered by scalar_write_width(). A pair-mask write replaces the B32 marker
-        // but retains its newly-emitted bool-domain value.
-        bool data_write = false;
-        for (uint32_t word = 0; word < width; ++word)
-            data_write |= rs.sreg.contains(base + static_cast<int>(word));
-        const bool preserves_b32_mask = width == 1 && in.fmt == Rdna2Format::SOP1 &&
+        // emit_alu has already materialized the new lifetime. Classify mask writers from the
+        // instruction itself rather than inferring them from `sreg`: s_getpc_b64's folded form
+        // deliberately erases both data SSA words, but hardware still overwrites the pair. End every
+        // overlapping one-word Wave32 alias on all non-mask writes. A B64 mask replacement retains
+        // its newly-emitted bool-domain value while dropping the obsolete B32 width marker.
+        const bool writes_b32_mask = width == 1 && in.fmt == Rdna2Format::SOP1 &&
             (in.opcode == 0x03 || in.opcode == 0x09) &&
-            rs.sreg_bool_b32.contains(base) && !data_write;
+            rs.sreg_bool_b32.contains(base);
+        const bool writes_b64_mask = width == 2 && scalar_write_is_b64_mask(in, base);
         for (uint32_t word = 0; word < width; ++word) {
             const int reg = base + static_cast<int>(word);
-            if (!rs.sreg_bool_b32.contains(reg) || (preserves_b32_mask && reg == base))
+            if (!rs.sreg_bool_b32.contains(reg) || (writes_b32_mask && reg == base))
                 continue;
             rs.sreg_bool_b32.erase(reg);
-            if (data_write || reg != base || !rs.sreg_bool.contains(base)) {
+            if (!writes_b64_mask || reg != base) {
                 rs.sreg_bool.erase(reg);
                 rs.sreg_bool_narrowed.erase(reg);
                 if (reg == 106) rs.vcc = 0;
             }
         }
-        if (!data_write && !preserves_b32_mask)
-            rs.sreg_bool_b32.erase(base);
+        if (!writes_b32_mask) rs.sreg_bool_b32.erase(base);
         for (uint32_t word = 0; word < width; ++word) {
             const int reg = base + static_cast<int>(word);
             rs.sreg_written.insert(reg);
@@ -3738,6 +3762,37 @@ void invalidate_loop_descriptor_provenance(RegState& rs, const std::set<int>& sr
         rs.sreg_input.erase(reg);
         rs.sreg_srt.erase(reg);
     }
+}
+
+// Complex CFG dispatch and the narrow loop structurizers persist B64 mask values, but not the
+// separate one-word-validity state required by Wave32 aliases. Conservatively find any B32 mask
+// copy that the region could create. The source set is deliberately path-insensitive: a pair made a
+// mask on any path may reach a later copy on another dispatcher edge, and rejecting an impossible
+// ordering is safer than silently restoring a stale Boolean.
+bool has_unpersisted_b32_mask_lifetime(const std::vector<Rdna2Inst>& ins,
+                                      uint32_t lo, uint32_t hi,
+                                      const RegState& entry) {
+    std::set<int> possible_mask_sources{106, 126}; // VCC_LO and EXEC_LO
+    for (const auto& kv : entry.sreg_bool) possible_mask_sources.insert(kv.first);
+    for (int reg : entry.sreg_bool_b32) possible_mask_sources.insert(reg);
+    for (const auto& in : ins) {
+        if (in.is_end || in.pc < lo || in.pc >= hi) continue;
+        for_each_scalar_write(in, [&](int base, uint32_t) {
+            if (scalar_write_is_b64_mask(in, base)) possible_mask_sources.insert(base);
+        });
+    }
+    for (const auto& in : ins) {
+        if (in.is_end || in.pc < lo || in.pc >= hi || in.fmt != Rdna2Format::SOP1)
+            continue;
+        if (in.opcode == 0x09) return true; // s_wqm_b32 creates/consumes the same width state
+        if (in.opcode != 0x03) continue;
+        const bool register_source = in.src[0].kind == OperandKind::SGPR ||
+                                     in.src[0].kind == OperandKind::Special;
+        if ((register_source && possible_mask_sources.contains(in.src[0].value)) ||
+            in.dst.value == 126)
+            return true;
+    }
+    return false;
 }
 
 } // namespace
@@ -7584,18 +7639,10 @@ bool emit_compute_cfg_state_machine(
     // per-edge validity value in addition to the bool itself. Until that state is represented, keep
     // complex-CFG Wave32 mask programs on the fail-visible path; straight-line/structured shaders
     // still use the exact lifetime tracking in RegState.
-    if (b.allow_b32_masks) {
-        if (!initial.sreg_bool_b32.empty()) return false;
-        for (const auto& in : ins) {
-            if (in.is_end) break;
-            if (in.fmt != Rdna2Format::SOP1) continue;
-            if (in.opcode == 0x09 ||
-                (in.opcode == 0x03 &&
-                 (in.src[0].value == 106 || in.src[0].value == 126 ||
-                  in.dst.value == 126)))
-                return false;
-        }
-    }
+    if (b.allow_b32_masks &&
+        (!initial.sreg_bool_b32.empty() ||
+         has_unpersisted_b32_mask_lifetime(ins, 0, UINT32_MAX, initial)))
+        return false;
     const uint32_t wave_count = (b.local_count + b.wave_size - 1) / b.wave_size;
     const uint32_t padded_lanes = wave_count * b.wave_size;
     const uint32_t wave_result_base = padded_lanes;
@@ -7610,22 +7657,10 @@ bool emit_compute_cfg_state_machine(
     for (const auto& kv : initial.sreg_bool) static_mask_keys.insert(kv.first);
     for (const auto& in : ins) {
         if (in.is_end) break;
-        if (in.fmt == Rdna2Format::SOP1 &&
-            (in.opcode == 0x04 || in.opcode == 0x08 || in.opcode == 0x0a ||
-             in.opcode == 0x24 || in.opcode == 0x25 || in.opcode == 0x37) &&
-            in.dst.value != 126 && in.dst.value != 127)
-            static_mask_keys.insert(in.dst.value);
-        if (in.fmt == Rdna2Format::SOP2 &&
-            (in.opcode == 0x0b || in.opcode == 0x0f || in.opcode == 0x11 ||
-             in.opcode == 0x13 || in.opcode == 0x15 || in.opcode == 0x17 ||
-             in.opcode == 0x19 || in.opcode == 0x1b || in.opcode == 0x1d ||
-             in.opcode == 0x25) &&
-            in.dst.value != 106 && in.dst.value != 107 &&
-            in.dst.value != 126 && in.dst.value != 127)
-            static_mask_keys.insert(in.dst.value);
-        if (in.fmt == Rdna2Format::VOPC && in.dst.kind == OperandKind::SGPR &&
-            in.dst.value <= 105)
-            static_mask_keys.insert(in.dst.value);
+        for_each_scalar_write(in, [&](int base, uint32_t) {
+            if (base <= 105 && scalar_write_is_b64_mask(in, base))
+                static_mask_keys.insert(base);
+        });
     }
     auto mask_zero_compare_source = [&](const Rdna2Inst& in) -> int {
         if (in.fmt != Rdna2Format::SOPC || (in.opcode != 0x12 && in.opcode != 0x13))
@@ -8831,17 +8866,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         loop_scalar_may_writes(ins, L.header_pc, L.backedge_pc, scalar_may_writes);
         for (int reg : rs.sreg_bool_b32)
             if (scalar_may_writes.contains(reg)) return false;
-        if (b.allow_b32_masks)
-            for (const auto& candidate : ins) {
-                if (candidate.pc < L.header_pc || candidate.pc >= L.backedge_pc ||
-                    candidate.fmt != Rdna2Format::SOP1) continue;
-                if (candidate.opcode == 0x09 ||
-                    (candidate.opcode == 0x03 &&
-                     (candidate.src[0].value == 106 || candidate.src[0].value == 126 ||
-                      candidate.dst.value == 126 ||
-                      rs.sreg_bool_b32.contains(candidate.src[0].value))))
-                    return false;
-            }
+        if (b.allow_b32_masks &&
+            has_unpersisted_b32_mask_lifetime(
+                ins, L.header_pc, L.backedge_pc, rs))
+            return false;
         const uint32_t preheader = b.cur_block;
         const uint32_t hdr = b.id(), check = b.id(), body = b.id(), cont = b.id(), merge = b.id();
         b.emit_branch(hdr); b.emit_label(hdr);
@@ -9120,17 +9148,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             loop_scalar_may_writes(ins, L.header_pc, L.backedge_pc, scalar_may_writes);
             for (int reg : rs.sreg_bool_b32)
                 if (scalar_may_writes.contains(reg)) return false;
-            if (b.allow_b32_masks)
-                for (const auto& candidate : ins) {
-                    if (candidate.pc < L.header_pc || candidate.pc >= L.backedge_pc ||
-                        candidate.fmt != Rdna2Format::SOP1) continue;
-                    if (candidate.opcode == 0x09 ||
-                        (candidate.opcode == 0x03 &&
-                         (candidate.src[0].value == 106 || candidate.src[0].value == 126 ||
-                          candidate.dst.value == 126 ||
-                          rs.sreg_bool_b32.contains(candidate.src[0].value))))
-                        return false;
-                }
+            if (b.allow_b32_masks &&
+                has_unpersisted_b32_mask_lifetime(
+                    ins, L.header_pc, L.backedge_pc, rs))
+                return false;
             const uint32_t preheader = b.cur_block;
             const uint32_t hdr = b.id(), chk = b.id(), body = b.id(), cont = b.id(), merge = b.id();
             b.emit_branch(hdr); b.emit_label(hdr);

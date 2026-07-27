@@ -3,6 +3,7 @@
 #include "../src/gpu/shader_resources.hpp"
 #include <cstdint>
 #include <cstdio>
+#include <iterator>
 #include <unordered_map>
 #include <vector>
 
@@ -342,6 +343,44 @@ int main() {
         return 1;
     }
     printf("  [ok]   scalar reuse invalidates saved Wave32 mask aliases\n");
+
+    // A folded s_getpc_b64 has no runtime scalar SSA result, but it still overwrites both physical
+    // SGPR words. Keep an independent valid embedded-table chain in the shader so the first getpc is
+    // accepted, then prove that it kills the old B32 mask rather than letting v_cndmask see it.
+    const uint32_t wave32_mask_then_folded_getpc[] = {
+        0xbe80037eu,                         // pc0: s_mov_b32 s0, exec_lo
+        0xbe801f00u,                         // pc1: s_getpc_b64 s[0:1] (overwrites saved mask)
+        0xb0060010u,                         // pc2: s_movk_i32 s6, 16-byte table
+        0xbe8703ffu, 0x10005004u,            // pc3: s_mov_b32 s7, V# config
+        0xbe841f00u,                         // pc5: s_getpc_b64 s[4:5] (next byte 24)
+        0x800404b4u,                         // pc6: s_add_u32 s4, 52, s4 (table byte 76)
+        0x82050580u,                         // pc7: s_addc_u32 s5, 0, s5
+        0x7e020280u,                         // pc8: v_mov_b32 v1, 0 (table byte offset)
+        0xe0301000u, 0x80010101u,            // pc9: buffer_load_dword v1,v1,s[4:7]
+        0xbf8c3f70u,                         // pc11: s_waitcnt vmcnt(0)
+        0xd5010003u, 0x0001e8f2u,            // pc12: v_cndmask v3,1.0,2.0,s[0:1]
+        0x7e000280u, 0x7e040280u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+        7u, 11u, 13u, 17u,
+    };
+    std::vector<uint32_t> wave32_folded_getpc_control(
+        std::begin(wave32_mask_then_folded_getpc),
+        std::end(wave32_mask_then_folded_getpc));
+    wave32_folded_getpc_control[13] = 0x01a9e8f2u; // consume live VCC, not overwritten s[0:1]
+    if (recompile_fragment_wave32_for_test(
+            wave32_folded_getpc_control.data(),
+            wave32_folded_getpc_control.size()).empty()) {
+        printf("  [FAIL] folded s_getpc_b64 control shader did not recompile\n");
+        return 1;
+    }
+    if (!recompile_fragment_wave32_for_test(
+            wave32_mask_then_folded_getpc,
+            std::size(wave32_mask_then_folded_getpc)).empty()) {
+        printf("  [FAIL] folded s_getpc_b64 retained a stale Wave32 mask alias\n");
+        return 1;
+    }
+    printf("  [ok]   folded s_getpc_b64 invalidates saved Wave32 mask aliases\n");
 
     const uint32_t scalar_abs_compute[] = {
         0xb000ffffu,                         // s_movk_i32 s0, -1
