@@ -9289,6 +9289,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     uint32_t pre_scc = rs.scc, pre_vcc = rs.vcc, pre_exec = rs.exec;
                     const bool pre_narrowed = rs.exec_narrowed;
                     const std::unordered_map<int,uint32_t> pre_bool = rs.sreg_bool;   // mask-domain snapshot
+                    const auto pre_bool_b32 = rs.sreg_bool_b32;
                     uint32_t thenL = b.id(), mergeL = b.id();
                     b.emit_selmerge(mergeL); b.emit_condbranch(exec_cond, thenL, mergeL);
                     b.emit_label(thenL);
@@ -9299,6 +9300,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     for (int r : ifs) then_s[r] = sget(r);
                     uint32_t then_scc = rs.scc, then_vcc = rs.vcc, then_exec = rs.exec;
                     const bool then_narrowed = rs.exec_narrowed;
+                    // The skipped edge retains the entry-time physical-word lifetime. A B32 mask
+                    // created or invalidated only in the taken arm therefore needs a validity phi,
+                    // which this narrow merge does not represent. Reject rather than attach the
+                    // taken arm's marker to the synthesized bool value on both paths.
+                    if (rs.sreg_bool_b32 != pre_bool_b32) return false;
                     b.emit_branch(mergeL); b.emit_label(mergeL);
                     for (int r : ifv) rs.vreg[r] = b.emit_phi_2way(b.t_u32,  pre_v[r], preblock, then_v[r], thenEnd);
                     for (int r : ifs) rs.sreg[r] = b.emit_phi_2way(b.t_u32,  pre_s[r], preblock, then_s[r], thenEnd);

@@ -382,6 +382,27 @@ int main() {
     }
     printf("  [ok]   folded s_getpc_b64 invalidates saved Wave32 mask aliases\n");
 
+    // A no-else forward arm has a skipped predecessor at its merge. If only the taken arm creates a
+    // B32 saved mask, the physical-word validity differs between predecessors and cannot be modeled
+    // by a bool-value phi alone. Keep the post-merge mask consumer fail-visible.
+    const uint32_t wave32_conditional_mask_save[] = {
+        0xbe800380u,                         // pc0: s_mov_b32 s0, 0
+        0xbf060000u,                         // pc1: s_cmp_eq_u32 s0, s0
+        0xbf840001u,                         // pc2: s_cbranch_scc0 -> pc4
+        0xbe82037eu,                         // pc3: s_mov_b32 s2, exec_lo (taken arm only)
+        0xd5010003u, 0x0009e8f2u,            // pc4: v_cndmask v3,1.0,2.0,s[2:3]
+        0x7e000280u, 0x7e020280u, 0x7e040280u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    if (!recompile_fragment_wave32_for_test(
+            wave32_conditional_mask_save,
+            std::size(wave32_conditional_mask_save)).empty()) {
+        printf("  [FAIL] forward-if leaked a path-dependent Wave32 mask lifetime\n");
+        return 1;
+    }
+    printf("  [ok]   forward-if rejects path-dependent Wave32 mask lifetimes\n");
+
     const uint32_t scalar_abs_compute[] = {
         0xb000ffffu,                         // s_movk_i32 s0, -1
         0xbe813400u,                         // s_abs_i32 s1, s0
