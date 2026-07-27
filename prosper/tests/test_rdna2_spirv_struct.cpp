@@ -708,6 +708,38 @@ int main() {
       } }
     printf("  [ok]   fragment cmpx export lowers to a discard (OpKill + export), valid SPIR-V\n");
 
+    // Astro Bot's title materials contain large reducible pixel shaders whose forward branch
+    // regions overlap rather than forming a lexical if-tree. The compact SSA structurizer must
+    // remain conservative, but the per-invocation graphics CFG dispatcher can execute the exact
+    // basic-block graph. This small crossing-region shape forces that fallback.
+    const uint32_t fragment_cfg_dispatch[] = {
+        0x7e040280u,                         // pc0:  v_mov_b32 v2, 0
+        0x7e060280u,                         // pc1:  v_mov_b32 v3, 0
+        0x7e080280u,                         // pc2:  v_mov_b32 v4, 0
+        0x7e0a0280u,                         // pc3:  v_mov_b32 v5, 0
+        0x7c020300u,                         // pc4:  v_cmp_lt_f32 vcc, v0, v1
+        0xbf860003u,                         // pc5:  s_cbranch_vccz -> pc9
+        0x7c020300u,                         // pc6:  v_cmp_lt_f32 vcc, v0, v1
+        0xbf860002u,                         // pc7:  s_cbranch_vccz -> pc10 (crosses pc5 region)
+        0x7e040281u,                         // pc8:  v_mov_b32 v2, 1
+        0x7e060281u,                         // pc9:  v_mov_b32 v3, 1
+        0x7c020300u,                         // pc10: v_cmp_lt_f32 vcc, v0, v1
+        0xbf860004u,                         // pc11: s_cbranch_vccz -> verified tail exit at pc16
+        0x7e080281u,                         // pc12: v_mov_b32 v4, 1
+        0xf800180fu, 0x05040302u,            // pc13: exp mrt0 v2, v3, v4, v5 done vm
+        0xbf810000u,                         // pc15: s_endpgm
+        0xbf810000u,                         // pc16: branch-target s_endpgm
+    };
+    const auto fragment_cfg_spv = recompile_fragment(
+        fragment_cfg_dispatch, std::size(fragment_cfg_dispatch));
+    if (fragment_cfg_spv.empty() || !has_opcode(fragment_cfg_spv, 251) ||
+        !type_result_ids_are_nonzero(fragment_cfg_spv, nullptr) ||
+        !phi_ids_are_nonzero(fragment_cfg_spv)) {
+        printf("  [FAIL] complex fragment CFG did not lower through a valid OpSwitch dispatcher\n");
+        return 1;
+    }
+    printf("  [ok]   complex fragment CFG lowers through a valid per-invocation dispatcher\n");
+
     // Alpha-test discard via the SCALAR-BRANCH form (not v_cmpx): compare a sampled/interpolated value,
     // ANDN2 the survivor mask into a saved EXEC copy (SCC = "any lane survives"), and s_cbranch_scc0 skips
     // the shading if NO lane survives; the block then narrows EXEC (s_wqm exec, survivors) and shades. This
