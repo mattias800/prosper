@@ -187,6 +187,17 @@ int main() {
     Rdna2Inst sd = rdna2_decode_one(sdwa, 2);
     CHECK(sd.fmt == Rdna2Format::VOP2 && sd.len_dwords == 2 && sd.has_modifier,
           "VOP2 SDWA form is 2 dwords and flagged has_modifier");
+    const uint32_t ngg_byte_shift[] = { 0x340018f9u, 0x02860682u };
+    Rdna2Inst nbs = rdna2_decode_one(ngg_byte_shift, 2);
+    CHECK(nbs.fmt == Rdna2Format::VOP2 && nbs.opcode == 0x1Au && !nbs.has_modifier &&
+          isV(nbs.dst, 0) && nbs.src[0].kind == OperandKind::InlineInt &&
+          nbs.src[0].value == 2 && isV(nbs.src[1], 12) && nbs.sdwa_src1_sel == 2u,
+          "Astro NGG byte-select v_lshlrev SDWA packet is admitted exactly");
+    const uint32_t ngg_word_shift[] = { 0x34001ef9u, 0x05860682u };
+    Rdna2Inst nws = rdna2_decode_one(ngg_word_shift, 2);
+    CHECK(nws.fmt == Rdna2Format::VOP2 && nws.opcode == 0x1Au && !nws.has_modifier &&
+          isV(nws.src[1], 15) && nws.sdwa_src1_sel == 5u,
+          "Astro NGG word-select v_lshlrev SDWA packet is admitted exactly");
     const uint32_t f16cmp[] = { 0x7db900f9u, 0x86050007u };
     Rdna2Inst fc = rdna2_decode_one(f16cmp, 2);
     CHECK(fc.fmt == Rdna2Format::VOPC && fc.opcode == 0xDCu && !fc.has_modifier &&
@@ -206,6 +217,11 @@ int main() {
     Rdna2Inst dp = rdna2_decode_one(dpp16, 2);
     CHECK(dp.fmt == Rdna2Format::VOP2 && dp.len_dwords == 2 && dp.has_modifier,
           "VOP2 DPP16 form is 2 dwords and flagged has_modifier");
+    const uint32_t ngg_row_shift[] = { 0x4a1e1efau, 0xff09110fu };
+    Rdna2Inst nrs = rdna2_decode_one(ngg_row_shift, 2);
+    CHECK(nrs.fmt == Rdna2Format::VOP2 && nrs.opcode == 0x25u && !nrs.has_modifier &&
+          nrs.has_dpp && nrs.dpp_ctrl == 0x111u && isV(nrs.src[0], 15) && isV(nrs.src[1], 15),
+          "Astro NGG bounded DPP row-right add is admitted exactly");
     const uint32_t dpp8[] = { 0x4a0e0ce9u, 0xfac68806u };    // v_add_nc_u32_dpp v7, v6, v6 dpp8:[...]
     Rdna2Inst d8 = rdna2_decode_one(dpp8, 2);
     CHECK(d8.fmt == Rdna2Format::VOP2 && d8.len_dwords == 2 && d8.has_modifier,

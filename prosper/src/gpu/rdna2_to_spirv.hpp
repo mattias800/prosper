@@ -179,6 +179,12 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
                                        const PixelInputMapping* pixel_inputs = nullptr,
                                        bool capture_position = false);
 
+// Test hook: allow a tiny synthetic NGG shader to reach the terminal EXEC-gated export lowering so
+// Vulkan tests can execute both active and inactive outcomes. Production recompile_vertex keeps that
+// exception restricted to the byte-exact observed Astro wrapper.
+std::vector<uint32_t> recompile_vertex_terminal_ngg_gate_for_test(
+    const uint32_t* code, size_t dwords);
+
 // How much of a shader the recompiler currently covers (per-instruction), without requiring the
 // stream to be a complete vertex/fragment. `alu` = instructions emit_alu handles (VALU/scalar/
 // control-flow); `exports` = EXP (handled by the stage recompilers); `unsupported` = not yet handled

@@ -28,6 +28,7 @@
 #include <set>
 
 extern "C" const void* prosper_agc_shader_header_for_code(uint64_t code_addr);
+extern "C" const void* prosper_agc_fused_back_header_for_front(uint64_t front_code_addr);
 
 namespace prosper::gpu {
 
@@ -207,7 +208,9 @@ std::vector<DynFetch> resolve_dynamic_fetch(const uint32_t* code, size_t dwords,
                                             uint32_t user_sgpr_base,
                                             std::vector<SrtUse>* srt_uses = nullptr,
                                             uint32_t pcrel_dispatch_target = UINT32_MAX,
-                                            const PcrelDispatchInfo* pcrel_dispatch = nullptr);
+                                            const PcrelDispatchInfo* pcrel_dispatch = nullptr,
+                                            const uint32_t* system_sgprs = nullptr,
+                                            uint32_t nsystem_sgprs = 0);
 
 // Add instruction-provenance compute buffer resources to a metadata-built table. This is the exact
 // buffer-discovery path used by realize_compute_dispatches; it is exposed so tests can assert the
@@ -737,10 +740,15 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                          (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr);
         return false;
     }
+    const auto* fused_back = static_cast<const AgcShaderHeader*>(
+        prosper_agc_fused_back_header_for_front(rs.es_addr));
+    const uint64_t vs_program_addr = fused_back && fused_back->type == 6 && fused_back->code
+        ? static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fused_back->code))
+        : rs.es_addr;
     const bool phase_timing = getenv("PROSPER_RENDER_TIMING") != nullptr;
     const auto table_start = phase_timing
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    std::shared_ptr<ShaderResourceTable> vrt = build_stage_table(ds, rs.es_addr, false, vcount_hint);
+    std::shared_ptr<ShaderResourceTable> vrt = build_stage_table(ds, vs_program_addr, false, vcount_hint);
     std::shared_ptr<ShaderResourceTable> prt = build_stage_table(ds, rs.ps_addr, true, vcount_hint);
     const auto table_done = phase_timing
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -766,7 +774,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     bool interpolants_from_metadata = false;
     if (!pixel_inputs.valid_mask) {
         const auto* producer = static_cast<const AgcShaderHeader*>(
-            prosper_agc_shader_header_for_code(rs.es_addr));
+            prosper_agc_shader_header_for_code(vs_program_addr));
         const auto* pixel = static_cast<const AgcShaderHeader*>(
             prosper_agc_shader_header_for_code(rs.ps_addr));
         const AgcPixelInputControls derived = derive_agc_pixel_input_controls(producer, pixel);
@@ -799,14 +807,14 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     std::vector<uint32_t> vs, fs;
     if (retain_shared_shader_words) {
         vs_shared = recompile_graphics_shader_cached_shared(
-            ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)rs.es_addr,
+            ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
             max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity);
         fs_shared = recompile_graphics_shader_cached_shared(
             ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
             max_shader_dwords, prt.get(), nullptr, system_input_ptr, &fs_identity);
     } else {
         vs = recompile_graphics_shader_cached(
-            ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)rs.es_addr,
+            ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
             max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity);
         fs = recompile_graphics_shader_cached(
             ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
@@ -856,16 +864,16 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             std::chrono::duration<double, std::milli>(table_done - table_start).count(),
             std::chrono::duration<double, std::milli>(shader_done - table_done).count());
     }
-    add_stage_diagnostic(ShaderProgramStage::Vertex, rs.es_addr, vrt, vs_words);
+    add_stage_diagnostic(ShaderProgramStage::Vertex, vs_program_addr, vrt, vs_words);
     add_stage_diagnostic(ShaderProgramStage::Fragment, rs.ps_addr, prt, fs_words);
     if (const char* dd = getenv("PROSPER_VS_DUMP")) {   // diag: dump successful VS SPIR-V + raw RDNA2 for inspection
         static int nd = 0;
         if (nd < 3 && !vs_words.empty()) {
             char fn[512];
-            snprintf(fn, sizeof fn, "%s/vs_%d_%llx.spv", dd, nd, (unsigned long long)rs.es_addr);
+            snprintf(fn, sizeof fn, "%s/vs_%d_%llx.spv", dd, nd, (unsigned long long)vs_program_addr);
             if (FILE* f = fopen(fn, "wb")) { fwrite(vs_words.data(), 4, vs_words.size(), f); fclose(f); }
-            snprintf(fn, sizeof fn, "%s/vs_%d_%llx.bin", dd, nd, (unsigned long long)rs.es_addr);
-            if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)rs.es_addr, 1, 4096, f); fclose(f); }
+            snprintf(fn, sizeof fn, "%s/vs_%d_%llx.bin", dd, nd, (unsigned long long)vs_program_addr);
+            if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)vs_program_addr, 1, 4096, f); fclose(f); }
             // Also dump the paired PS raw RDNA2 (the recompile-guard fixture needs both stages, #228).
             snprintf(fn, sizeof fn, "%s/ps_%d_%llx.bin", dd, nd, (unsigned long long)rs.ps_addr);
             if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)rs.ps_addr, 1, 4096, f); fclose(f); }
@@ -879,11 +887,11 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         // failing draw's exact seeding/s_load chain is captured without knowing its address up front.
         if (vs_words.empty() && getenv("PROSPER_DYNTRACE_FAIL")) {
             static std::set<uint64_t> traced;
-            if (traced.insert(rs.es_addr).second) {
+            if (traced.insert(vs_program_addr).second) {
                 fprintf(stderr, "[dynfail] replaying VS 0x%llx resource build with trace:\n",
-                        (unsigned long long)rs.es_addr);
+                        (unsigned long long)vs_program_addr);
                 g_dyntrace_force = true;
-                (void)build_stage_table(ds, rs.es_addr, false, vcount_hint);
+                (void)build_stage_table(ds, vs_program_addr, false, vcount_hint);
                 g_dyntrace_force = false;
             }
         }
@@ -903,15 +911,16 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             should_log_recompile_reject(rs.es_addr, rs.ps_addr,
                                         vs_words.size(), gs.size(), fs_words.size(),
                                         &reject_occurrence))
-            fprintf(stderr, "[exec-recompile-reject] es=0x%llx ps=0x%llx vs=%zu gs=%zu fs=%zu "
+            fprintf(stderr, "[exec-recompile-reject] es=0x%llx gs-pgm=0x%llx hs-pgm=0x%llx ps=0x%llx vs=%zu gs=%zu fs=%zu "
                             "prim=%u topo=%u ena=%08x addr=%08x order=%llu occurrence=%llu\n",
-                    (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
+                    (unsigned long long)rs.es_addr, (unsigned long long)rs.gs_addr,
+                    (unsigned long long)rs.hs_addr, (unsigned long long)rs.ps_addr,
                     vs_words.size(), gs.size(), fs_words.size(), rs.prim_type, resolved_pipeline.topology,
                     rs.ps_input_ena, rs.ps_input_addr,
                     (unsigned long long)(draw ? draw->command_order : 0),
                     (unsigned long long)reject_occurrence);
         if (const char* dd = getenv("PROSPER_SHADER_DUMP")) {
-            for (auto [tag, addr] : {std::pair{"vs", rs.es_addr}, std::pair{"ps", rs.ps_addr}}) {
+            for (auto [tag, addr] : {std::pair{"vs", vs_program_addr}, std::pair{"ps", rs.ps_addr}}) {
                 if (!addr || !guest_readable(addr, sizeof(uint32_t))) continue;
                 const size_t dump_dwords = rdna2_recompile_code_span(
                     reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(addr)),
@@ -943,7 +952,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                     (int)rs.stencil_enable, (int)rs.stencil_clear_enable, rs.stencil_clear_value,
                     (unsigned long long)rs.stencil_read_base,
                     (unsigned long long)rs.stencil_write_base);
-            for (auto [tag, addr] : {std::pair{"vs", rs.es_addr}, std::pair{"ps", rs.ps_addr}}) {
+            for (auto [tag, addr] : {std::pair{"vs", vs_program_addr}, std::pair{"ps", rs.ps_addr}}) {
                 RecompileCoverage c = recompile_coverage((const uint32_t*)(uintptr_t)addr, max_shader_dwords);
                 fprintf(stderr, "[exec]   %s coverage: total=%u alu=%u exp=%u tabledep=%u unsupported=%u "
                                 "first_bad fmt=%d op=0x%x\n", tag, c.total, c.alu, c.exports,
@@ -1208,7 +1217,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     }
     out.vs = std::move(vs); out.gs = std::move(gs); out.fs = std::move(fs);
     out.vs_shared = std::move(vs_shared); out.fs_shared = std::move(fs_shared);
-    out.vs_guest_addr = rs.es_addr; out.fs_guest_addr = rs.ps_addr;
+    out.vs_guest_addr = vs_program_addr; out.fs_guest_addr = rs.ps_addr;
     out.vs_identity = vs_identity; out.fs_identity = fs_identity; out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;
     // #1256: record the raw draw-packet state (pre-realization) so a capture can be checked offline for

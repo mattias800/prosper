@@ -1909,6 +1909,31 @@ int main() {
     printf("  kernel37 mismatches=%u (out[5]=%g expect=%g)\n", bad37, got37.size()==N?got37[5]:-1, exp37[5]);
     CHECK(got37.size()==N && bad37==0, "recompiled kernel 37 (s_movk_i32 -100) computes a0-100");
 
+    // Kernel 37a: s_cmpk_le_u32 compares the SGPR named by SOPK's SDST field against the raw
+    // unsigned 16-bit immediate and writes SCC without changing that SGPR. Cover both sides of the
+    // 0xffff boundary used by Astro Bot's NGG primitive-count setup.
+    const uint32_t code37a_true[] = {
+        0xB000007Bu, 0xB700FFFFu, 0x850287AAu, 0x7E000C02u, 0xBF810000u,
+    };
+    const uint32_t code37a_false[] = {
+        0xB000FFFFu, 0xB700FFFFu, 0x850287AAu, 0x7E000C02u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv37a_true = recompile_valu(
+        code37a_true, std::size(code37a_true), 1, 0);
+    std::vector<uint32_t> spv37a_false = recompile_valu(
+        code37a_false, std::size(code37a_false), 1, 0);
+    CHECK(!spv37a_true.empty() && !spv37a_false.empty(),
+          "recompiled kernel 37a (s_cmpk_le_u32, both SCC paths) -> SPIR-V");
+    std::vector<float> got37a_true = prosper::test::run_compute(spv37a_true, in37, N, N);
+    std::vector<float> got37a_false = prosper::test::run_compute(spv37a_false, in37, N, N);
+    uint32_t bad37a = 0;
+    for (uint32_t i=0;i<N&&got37a_true.size()==N;i++)
+        if (got37a_true[i] != 42.0f) bad37a++;
+    for (uint32_t i=0;i<N&&got37a_false.size()==N;i++)
+        if (got37a_false[i] != 7.0f) bad37a++;
+    CHECK(got37a_true.size()==N && got37a_false.size()==N && bad37a==0,
+          "kernel 37a: s_cmpk_le_u32 treats 0xffff as unsigned and drives s_cselect");
+
     // Astro Bot's loading composite starts with s_brev_b32 s16,1 to construct 0x80000000.
     // AMD ISA 70648 also specifies that S_BREV does not set SCC. Seed SCC=true, reverse bit 0,
     // then select the reversed value through SCC so the test covers both contracts.
@@ -1994,6 +2019,21 @@ int main() {
     uint32_t bad42 = 0; for (uint32_t i=0;i<N&&got42.size()==N;i++) if (std::fabs(got42[i]-268435456.0f)>16.0f) bad42++;
     printf("  kernel42 mismatches=%u (out[5]=%g expect=268435456)\n", bad42, got42.size()==N?got42[5]:-1);
     CHECK(got42.size()==N && bad42==0, "recompiled kernel 42 (s_mul_hi_u32) computes hi(2^60)=2^28");
+
+    // Astro Bot's NGG primitive packer combines two 16-bit population counts with
+    // s_pack_ll_b32_b16. Pack 1 and 2 -> 0x00020001, then convert to an exactly representable f32.
+    const uint32_t code42b[] = {
+        0xB0000001u, 0xB0010002u, 0x99020100u, 0x7E000C02u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv42b = recompile_valu(
+        code42b, sizeof(code42b) / sizeof(code42b[0]), 0, 0);
+    CHECK(!spv42b.empty(), "recompiled kernel 42b (s_pack_ll_b32_b16) -> SPIR-V");
+    std::vector<float> got42b = prosper::test::run_compute(spv42b, in42, N, N);
+    uint32_t bad42b = 0;
+    for (uint32_t i = 0; i < N && got42b.size() == N; ++i)
+        if (got42b[i] != 131073.0f) ++bad42b;
+    CHECK(got42b.size() == N && bad42b == 0,
+          "s_pack_ll_b32_b16 packs {S1.low16,S0.low16}");
 
     // Kernel 43: a real COUNTED LOOP reconstructed as structured SPIR-V (OpLoopMerge + OpPhi for the
     //   loop-carried s0 and v1). sum=0; for (i=0; i<5; i++) sum+=i;  =>  sum = 0+1+2+3+4 = 10.

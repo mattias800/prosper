@@ -1482,7 +1482,8 @@ std::vector<DynFetch>
 resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_sgprs, uint32_t nsgpr,
                       uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses,
                       uint32_t pcrel_dispatch_target,
-                      const PcrelDispatchInfo* pcrel_dispatch) {
+                      const PcrelDispatchInfo* pcrel_dispatch,
+                      const uint32_t* system_sgprs, uint32_t nsystem_sgprs) {
     using FoldClock = std::chrono::steady_clock;
     static const bool profile_fold = std::getenv("PROSPER_STAGE_FOLD_PROFILE") != nullptr;
     const auto fold_start = profile_fold ? FoldClock::now() : FoldClock::time_point{};
@@ -1588,6 +1589,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             mask_state[(size_t)r] = FoldMask::Unknown;
         }
     };
+    for (uint32_t i = 0; system_sgprs && i < nsystem_sgprs && i < kFoldSgprs; ++i)
+        set_value(static_cast<int>(i), system_sgprs[i]);
     for (uint32_t i = 0; i < nsgpr; i++) {
         const int reg = (int)(user_sgpr_base + i);
         set_value(reg, user_sgprs[i]);
@@ -1953,6 +1956,22 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                               descr_known.set((size_t)sdst);
                               descr_key[(size_t)sdst] = descr8_key[(size_t)sdst];
                               descr_key_known.set((size_t)sdst);
+                }
+                if (n == 16) {
+                    // NGG back halves commonly fetch a compact stage-data block containing four
+                    // consecutive V# descriptors with one s_load_dwordx16. Each aligned group can
+                    // subsequently be consumed by MUBUF. The load's one byte-offset key cannot
+                    // distinguish those four resources, so retain key-less descriptor provenance;
+                    // the consumer is then resolved by its exact instruction pc.
+                    for (uint32_t first = 0; first < n; first += 4) {
+                        const int base_reg = sdst + static_cast<int>(first);
+                        if (!valid_reg(base_reg) || !valid_reg(base_reg + 3)) continue;
+                        descr[(size_t)base_reg] = {
+                            mem[first], mem[first + 1], mem[first + 2], mem[first + 3] };
+                        descr_known.set((size_t)base_reg);
+                        descr_key[(size_t)base_reg] = 0xFFFFFFFFu;
+                        descr_key_known.set((size_t)base_reg);
+                    }
                 }
                 break;
             }
@@ -2664,8 +2683,20 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     } else {
         // NGG merged VS/GS: s0..s7 are system SGPRs, user data starts at s8 (confirmed by matching the
         // shader's s[8:11]/s[24:25] descriptor pointers to the register file at GS_0+offset).
+        uint32_t system_sgprs[2] = {};
+        uint32_t system_count = 0;
+        if (hdr->type == 6) { // fused GS back: s[0:1] points at the driver stage-data table
+            const auto sh_value = [&](uint32_t reg) {
+                const auto found = st.sh.find(reg);
+                return found == st.sh.end() ? 0u : found->second;
+            };
+            system_sgprs[0] = sh_value(P::SPI_SHADER_USER_DATA_ADDR_LO_GS);
+            system_sgprs[1] = sh_value(P::SPI_SHADER_USER_DATA_ADDR_HI_GS);
+            system_count = (system_sgprs[0] || system_sgprs[1]) ? 2u : 0u;
+        }
         dyn_vb = resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
-                                       primary_sgprs, kUserSgprs, 8, &srt_uses);
+                                       primary_sgprs, kUserSgprs, 8, &srt_uses,
+                                       UINT32_MAX, nullptr, system_sgprs, system_count);
         if (getenv("PROSPER_GFXLOG") || getenv("PROSPER_RESDUMP")) {
             fprintf(stderr, "[dynvb] VS resolved %zu dynamic vertex-fetch descriptor(s):\n", dyn_vb.size());
             for (auto& kv : dyn_vb) {

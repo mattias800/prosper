@@ -744,6 +744,14 @@ static_assert(offsetof(AgcShader, user_data) == 0x08 && offsetof(AgcShader, code
 // store mid-iteration — a use-after-free read, not the "benign stale read" it was assumed to be.
 std::mutex&                      agc_shaders_mx() { static std::mutex m; return m; }
 std::vector<const AgcShader*>&   agc_shaders()   { static std::vector<const AgcShader*> v; return v; }
+struct AgcFusedShaderPair {
+    uint64_t front_code = 0;
+    const AgcShader* back = nullptr;
+};
+std::vector<AgcFusedShaderPair>& agc_fused_shader_pairs() {
+    static std::vector<AgcFusedShaderPair> v;
+    return v;
+}
 
 // Relocate one self-relative pointer field in place. SDK shader blobs use small forward offsets from
 // the pointer field; linked guest pointers live above 4 GiB. Inspect the field representation rather
@@ -777,6 +785,21 @@ extern "C" const void* prosper_agc_shader_header_for_code(uint64_t code_addr) {
     for (const AgcShader* h : agc_shaders())
         if (h && (uint64_t)(uintptr_t)h->code == code_addr) return h;
     return nullptr;
+}
+
+// A fused GS/HS programs the front-half address into the stage register while retaining the actual
+// shader body in the back-half header. Preserve that association for the Vulkan executor, which sees
+// only the bound front address after PM4 decoding.
+extern "C" const void* prosper_agc_fused_back_header_for_front(uint64_t front_code_addr) {
+    if (!front_code_addr) return nullptr;
+    std::lock_guard<std::mutex> lk(agc_shaders_mx());
+    const AgcShader* match = nullptr;
+    for (const auto& pair : agc_fused_shader_pairs()) {
+        if (pair.front_code != front_code_addr) continue;
+        if (match && match->code != pair.back->code) return nullptr; // ambiguous reuse: fail closed
+        match = pair.back;
+    }
+    return match;
 }
 
 // Bounded RE probe (PROSPER_PIPETRACE): log the raw pointer args of the shader/pipeline construction
@@ -1045,6 +1068,16 @@ HLE(agc_fuse_shader_halves) {  // (Shader* dst, const Shader* front, const Shade
                                  SPI_SHADER_PGM_LO_LS, (uint64_t)(uintptr_t)front->code);
     }
     dst->user_data = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(agc_shaders_mx());
+        const uint64_t front_code = (uint64_t)(uintptr_t)front->code;
+        auto& pairs = agc_fused_shader_pairs();
+        auto found = std::find_if(pairs.begin(), pairs.end(), [front_code, back](const auto& pair) {
+            return pair.front_code == front_code && pair.back->code == back->code;
+        });
+        if (found == pairs.end()) pairs.push_back({front_code, back});
+        else found->back = back;
+    }
     return 0;
 }
 

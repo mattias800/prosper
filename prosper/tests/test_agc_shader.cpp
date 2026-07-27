@@ -69,6 +69,7 @@ int fails = 0;
 } // namespace
 
 extern "C" size_t prosper_agc_shader_count();
+extern "C" const void* prosper_agc_fused_back_header_for_front(uint64_t front_code_addr);
 
 int main() {
     printf("== test_agc_shader ==\n");
@@ -142,6 +143,9 @@ int main() {
               "GS fusion replaces both checksums without disturbing other back registers");
         CHECK(back_regs[0].value == 0 && back_regs[2].value == 0xaaaaaaaau,
               "GS fusion leaves the source back-half register array unchanged");
+        CHECK(prosper_agc_fused_back_header_for_front(
+                  reinterpret_cast<uint64_t>(front.code)) == &back,
+              "GS fusion publishes the back-half body for the bound front address");
 
         ShaderRegister hs_regs[] = {
             {SPI_SHADER_PGM_LO_LS, 0},

@@ -85,6 +85,21 @@ bool has_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
     return false;
 }
 
+bool binary_id_operands_are_nonzero(const std::vector<uint32_t>& spv, uint32_t opcode) {
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t word = spv[i];
+        const uint32_t op = word & 0xffffu, wc = word >> 16u;
+        if (wc == 0 || i + wc > spv.size()) return false;
+        // Integer binary operations are {result type, result id, operand 1 id, operand 2 id}.
+        if (op == opcode && (wc != 5 || !spv[i + 1] || !spv[i + 2] ||
+                             !spv[i + 3] || !spv[i + 4]))
+            return false;
+        i += wc;
+    }
+    return true;
+}
+
 bool phi_ids_are_nonzero(const std::vector<uint32_t>& spv) {
     constexpr uint32_t OpPhi = 245;
     if (spv.size() < 5) return false;
@@ -244,6 +259,115 @@ int main() {
         return 1;
     }
     printf("  [ok]   NGG EXEC wave-pack control flow emits only valid nonzero OpPhi ids\n");
+
+    // A GS_ALLOC_REQ marker alone does not prove the one-lane model. An unrelated NGG shader that
+    // reaches a wave population count must remain fail-closed rather than silently counting lane 0.
+    const uint32_t ngg_mask_count[] = {
+        0xBF900009u,                         // s_sendmsg GS_ALLOC_REQ (marks NGG)
+        0xBEEA04C1u,                         // s_mov_b64 vcc, -1
+        0xBE80106Au,                         // s_bcnt1_i32_b64 s0, vcc
+        0x7E000C00u,                         // v_cvt_f32_u32 v0, s0
+        0x7E020280u, 0x7E040280u, 0x7E0602F2u,
+        0xF80008CFu, 0x03020100u,            // exp pos0 v0,v1,v2,v3
+        0xBF810000u,
+    };
+    if (!recompile_vertex(ngg_mask_count,
+                          sizeof(ngg_mask_count) / sizeof(ngg_mask_count[0])).empty()) {
+        printf("  [FAIL] unproven NGG accepted one-lane mask population count\n");
+        return 1;
+    }
+    printf("  [ok]   unproven NGG rejects one-lane mask population count\n");
+
+    // Exercise the output-selection emitter through its explicit test hook. The production entry
+    // point restricts every terminal NGG gate to the byte-exact Astro wrapper, as checked below.
+    const uint32_t ngg_output_gate[] = {
+        0xBF900009u,                         // s_sendmsg GS_ALLOC_REQ (marks NGG)
+        0x7C3E0300u,                         // v_cmpx_tru_f32 (uniformly narrows no lanes)
+        0xBF880002u,                         // s_cbranch_execz -> s_endpgm
+        0xF80008CFu, 0x03020100u,            // exp pos0 v0,v1,v2,v3
+        0xBF810000u,
+    };
+    const auto ngg_output_gate_spv = recompile_vertex_terminal_ngg_gate_for_test(
+        ngg_output_gate, sizeof(ngg_output_gate) / sizeof(ngg_output_gate[0]));
+    if (ngg_output_gate_spv.empty() || !phi_ids_are_nonzero(ngg_output_gate_spv)) {
+        printf("  [FAIL] terminal NGG compacted-vertex output gate did not produce valid SPIR-V\n");
+        return 1;
+    }
+    printf("  [ok]   terminal NGG compacted-vertex output gate produces valid SPIR-V\n");
+    if (!recompile_vertex(ngg_output_gate, std::size(ngg_output_gate)).empty()) {
+        printf("  [FAIL] production accepted an unproven constant NGG output gate\n");
+        return 1;
+    }
+    printf("  [ok]   production rejects unproven constant NGG output gates (including points)\n");
+
+    // A per-vertex CMPX under the same superficial terminal shape can create mixed active/inactive
+    // primitives. Without the byte-exact Astro wrapper/topology proof it must remain rejected.
+    const uint32_t unproven_ngg_output_gate[] = {
+        0xBF900009u,
+        0x7DA80300u,                         // data-dependent v_cmpx_*
+        0xBF880002u,
+        0xF80008CFu, 0x03020100u,
+        0xBF810000u,
+    };
+    if (!recompile_vertex(unproven_ngg_output_gate,
+                          std::size(unproven_ngg_output_gate)).empty()) {
+        printf("  [FAIL] unproven NGG accepted a mixed terminal output gate\n");
+        return 1;
+    }
+    printf("  [ok]   unproven NGG mixed terminal output gate remains fail-closed\n");
+
+    // Small inline B64 masks are also lane-sensitive. Merely resembling an NGG wrapper cannot opt a
+    // shader into the captured Astro program's lane-zero projection.
+    const uint32_t ngg_inline_mask[] = {
+        0xBF900009u,                         // s_sendmsg GS_ALLOC_REQ (marks NGG)
+        0x92EA8081u,                         // s_bfm_b64 vcc, 1, 0 (lane-zero mask)
+        0xBEFE0481u,                         // s_mov_b64 exec, 1
+        0xBEFE04C1u,                         // s_mov_b64 exec, -1 (restore before export)
+        0xF80008CFu, 0x03020100u,            // exp pos0 v0,v1,v2,v3
+        0xBF810000u,
+    };
+    if (!recompile_vertex(ngg_inline_mask,
+                          sizeof(ngg_inline_mask) / sizeof(ngg_inline_mask[0])).empty()) {
+        printf("  [FAIL] unproven NGG accepted lane-zero inline-mask semantics\n");
+        return 1;
+    }
+    printf("  [ok]   unproven NGG rejects lane-zero inline-mask semantics\n");
+
+    // The same wave shortcut is not valid for an ordinary vertex shader: without the exact NGG
+    // allocation message there is no proof that a Vulkan invocation represents guest lane zero.
+    const uint32_t ordinary_vertex_mask_count[] = {
+        0xBEEA04C1u,                         // s_mov_b64 vcc, -1
+        0xBE80106Au,                         // s_bcnt1_i32_b64 s0, vcc
+        0x7E000C00u,                         // v_cvt_f32_u32 v0, s0
+        0x7E020280u, 0x7E040280u, 0x7E0602F2u,
+        0xF80008CFu, 0x03020100u,
+        0xBF810000u,
+    };
+    if (!recompile_vertex(ordinary_vertex_mask_count,
+                          std::size(ordinary_vertex_mask_count)).empty()) {
+        printf("  [FAIL] ordinary vertex shader accepted NGG lane-zero mask semantics\n");
+        return 1;
+    }
+    printf("  [ok]   ordinary vertex shader rejects NGG-only lane-zero mask semantics\n");
+
+    // Even an exact GS_ALLOC_REQ marker does not make arbitrary LDS lane-local. A peer-addressed
+    // write/barrier/read shape must stay fail-closed unless the complete observed Astro wrapper is
+    // selected by its byte-exact fingerprint.
+    const uint32_t unproven_ngg_peer_lds[] = {
+        0xBF900009u,                         // s_sendmsg GS_ALLOC_REQ
+        0x7E000280u, 0x7E020281u,            // v0=0 byte address, v1=1 data
+        0xD8340000u, 0x00000100u,            // ds_write_b32 v0, v1
+        0xBF8A0000u,                         // s_barrier
+        0xD8D80000u, 0x02000000u,            // ds_read_b32 v2, v0
+        0x7E060280u, 0x7E0802F2u,
+        0xF80008CFu, 0x04030302u,
+        0xBF810000u,
+    };
+    if (!recompile_vertex(unproven_ngg_peer_lds, std::size(unproven_ngg_peer_lds)).empty()) {
+        printf("  [FAIL] unproven NGG peer-LDS shader accepted private one-lane LDS semantics\n");
+        return 1;
+    }
+    printf("  [ok]   unproven NGG peer-LDS shader remains fail-closed\n");
 
     // v_cmpx_* narrows EXEC. A FRAGMENT export under a narrowed EXEC is a discard (alpha test / kill): it
     // now lowers to a per-invocation OpKill of the inactive lanes followed by an export from the survivors,
