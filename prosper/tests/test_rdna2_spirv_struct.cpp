@@ -85,6 +85,21 @@ bool has_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
     return false;
 }
 
+bool binary_id_operands_are_nonzero(const std::vector<uint32_t>& spv, uint32_t opcode) {
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t word = spv[i];
+        const uint32_t op = word & 0xffffu, wc = word >> 16u;
+        if (wc == 0 || i + wc > spv.size()) return false;
+        // Integer binary operations are {result type, result id, operand 1 id, operand 2 id}.
+        if (op == opcode && (wc != 5 || !spv[i + 1] || !spv[i + 2] ||
+                             !spv[i + 3] || !spv[i + 4]))
+            return false;
+        i += wc;
+    }
+    return true;
+}
+
 bool phi_ids_are_nonzero(const std::vector<uint32_t>& spv) {
     constexpr uint32_t OpPhi = 245;
     if (spv.size() < 5) return false;
@@ -244,6 +259,64 @@ int main() {
         return 1;
     }
     printf("  [ok]   NGG EXEC wave-pack control flow emits only valid nonzero OpPhi ids\n");
+
+    // In a one-lane NGG vertex invocation, s_bcnt1_i32_b64 of a wave mask is the integer value of
+    // that lane's Boolean bit (0/1). Astro Bot uses this in its final primitive packing arithmetic.
+    const uint32_t ngg_mask_count[] = {
+        0xBF900009u,                         // s_sendmsg GS_ALLOC_REQ (marks NGG)
+        0xBEEA04C1u,                         // s_mov_b64 vcc, -1
+        0xBE80106Au,                         // s_bcnt1_i32_b64 s0, vcc
+        0x7E000C00u,                         // v_cvt_f32_u32 v0, s0
+        0x7E020280u, 0x7E040280u, 0x7E0602F2u,
+        0xF80008CFu, 0x03020100u,            // exp pos0 v0,v1,v2,v3
+        0xBF810000u,
+    };
+    const auto ngg_mask_count_spv = recompile_vertex(
+        ngg_mask_count, sizeof(ngg_mask_count) / sizeof(ngg_mask_count[0]));
+    if (ngg_mask_count_spv.empty() || !phi_ids_are_nonzero(ngg_mask_count_spv)) {
+        printf("  [FAIL] NGG one-lane mask population count did not produce valid SPIR-V\n");
+        return 1;
+    }
+    printf("  [ok]   NGG one-lane mask population count produces valid SPIR-V\n");
+
+    // The terminal NGG output gate is a compacted-vertex ownership test. Unlike a general vertex
+    // CMPX/export (tested below), this exact output-only branch may retain the narrowed EXEC while
+    // exporting from the one-lane Vulkan representation.
+    const uint32_t ngg_output_gate[] = {
+        0xBF900009u,                         // s_sendmsg GS_ALLOC_REQ (marks NGG)
+        0x7DA80300u,                         // v_cmpx_* (narrows EXEC)
+        0xBF880002u,                         // s_cbranch_execz -> s_endpgm
+        0xF80008CFu, 0x03020100u,            // exp pos0 v0,v1,v2,v3
+        0xBF810000u,
+    };
+    const auto ngg_output_gate_spv = recompile_vertex(
+        ngg_output_gate, sizeof(ngg_output_gate) / sizeof(ngg_output_gate[0]));
+    if (ngg_output_gate_spv.empty() || !phi_ids_are_nonzero(ngg_output_gate_spv)) {
+        printf("  [FAIL] terminal NGG compacted-vertex output gate did not produce valid SPIR-V\n");
+        return 1;
+    }
+    printf("  [ok]   terminal NGG compacted-vertex output gate produces valid SPIR-V\n");
+
+    // NGG uses small inline B64 masks (1/3/15) while packing its final partial wave. Vertex SPIR-V
+    // has no LocalInvocationIndex; the one-lane model must read bit zero directly rather than emit an
+    // integer operation with the compute-only built-in's absent (zero) ID.
+    const uint32_t ngg_inline_mask[] = {
+        0xBF900009u,                         // s_sendmsg GS_ALLOC_REQ (marks NGG)
+        0x92EA8081u,                         // s_bfm_b64 vcc, 1, 0 (lane-zero mask)
+        0xBEFE0481u,                         // s_mov_b64 exec, 1
+        0xBEFE04C1u,                         // s_mov_b64 exec, -1 (restore before export)
+        0xF80008CFu, 0x03020100u,            // exp pos0 v0,v1,v2,v3
+        0xBF810000u,
+    };
+    const auto ngg_inline_mask_spv = recompile_vertex(
+        ngg_inline_mask, sizeof(ngg_inline_mask) / sizeof(ngg_inline_mask[0]));
+    constexpr uint32_t OpBitwiseAnd = 199;
+    if (ngg_inline_mask_spv.empty() ||
+        !binary_id_operands_are_nonzero(ngg_inline_mask_spv, OpBitwiseAnd)) {
+        printf("  [FAIL] NGG inline mask referenced an absent vertex local-invocation id\n");
+        return 1;
+    }
+    printf("  [ok]   NGG inline mask uses the modeled lane-zero bit without invalid ids\n");
 
     // v_cmpx_* narrows EXEC. A FRAGMENT export under a narrowed EXEC is a discard (alpha test / kill): it
     // now lowers to a per-invocation OpKill of the inactive lanes followed by an export from the survivors,

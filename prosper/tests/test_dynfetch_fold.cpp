@@ -419,6 +419,58 @@ int main() {
     CHECK(have_cbuf, "kernel 5 s_buffer_load reports a ConstantBuffer table-use keyed by the V# load imm");
     CHECK(cbuf_ok,   "kernel 5 V# dwords match the table as loaded");
 
+    // A fused NGG back shader receives a driver stage-data pointer in system s[0:1], before user
+    // data begins at s8. Its prologue loads the live V# from that table into s[8:11]. Preserve those
+    // system seeds so the exact consuming MUBUF can be resolved like any other loaded descriptor.
+    static uint32_t ngg_stage_data[4];
+    static uint32_t ngg_vertices[16];
+    const uint64_t ngg_vertex_base = reinterpret_cast<uint64_t>(ngg_vertices);
+    ngg_stage_data[0] = static_cast<uint32_t>(ngg_vertex_base);
+    ngg_stage_data[1] = static_cast<uint32_t>(ngg_vertex_base >> 32);
+    ngg_stage_data[2] = 16;
+    ngg_stage_data[3] = 0;
+    const uint32_t ngg_system_sgprs[2] = {
+        static_cast<uint32_t>(reinterpret_cast<uint64_t>(ngg_stage_data)),
+        static_cast<uint32_t>(reinterpret_cast<uint64_t>(ngg_stage_data) >> 32),
+    };
+    const uint32_t ngg_loaded_vsharp[] = {
+        0xF4080200u, 0xFA000000u,   // s_load_dwordx4 s[8:11], s[0:1], 0
+        0xE0002000u, 0x80020100u,   // buffer_load_format_x v1, v0, s[8:11], 0 idxen
+        0xBF810000u,
+    };
+    const auto ngg_fetches = resolve_dynamic_fetch(
+        ngg_loaded_vsharp, std::size(ngg_loaded_vsharp), nullptr, 0, 8, nullptr,
+        UINT32_MAX, nullptr, ngg_system_sgprs, std::size(ngg_system_sgprs));
+    CHECK(ngg_fetches.size() == 1 && ngg_fetches[0].fetch_pc == 2 &&
+              ngg_fetches[0].desc.base == ngg_vertex_base,
+          "fused NGG system stage-data pointer resolves its loaded vertex descriptor");
+
+    // Astro Bot loads four consecutive V# descriptors from the same stage-data pointer in one
+    // s_load_dwordx16, then consumes the first with an untyped MUBUF operation. The wide load is
+    // still descriptor provenance, but must resolve by consuming pc because its one immediate
+    // offset cannot identify which of the four V#s was selected.
+    alignas(16) static uint32_t ngg_wide_stage_data[16]{};
+    std::copy(std::begin(ngg_stage_data), std::end(ngg_stage_data),
+              std::begin(ngg_wide_stage_data));
+    const uint32_t ngg_wide_system_sgprs[2] = {
+        static_cast<uint32_t>(reinterpret_cast<uint64_t>(ngg_wide_stage_data)),
+        static_cast<uint32_t>(reinterpret_cast<uint64_t>(ngg_wide_stage_data) >> 32),
+    };
+    const uint32_t ngg_loaded_wide_vsharp[] = {
+        0xF4100200u, 0xFA000000u,   // s_load_dwordx16 s[8:23], s[0:1], 0
+        0xE0382020u, 0x80020509u,   // buffer_load_dwordx4 v[5:8], v9, s[8:11], s2 offen
+        0xBF810000u,
+    };
+    std::vector<SrtUse> ngg_wide_uses;
+    resolve_dynamic_fetch(
+        ngg_loaded_wide_vsharp, std::size(ngg_loaded_wide_vsharp), nullptr, 0, 8,
+        &ngg_wide_uses, UINT32_MAX, nullptr, ngg_wide_system_sgprs,
+        std::size(ngg_wide_system_sgprs));
+    CHECK(ngg_wide_uses.size() == 1 && ngg_wide_uses[0].use_pc == 2 &&
+              ngg_wide_uses[0].key == 0xFFFFFFFFu &&
+              decode_buffer_descriptor(ngg_wide_uses[0].v4.data()).base == ngg_vertex_base,
+          "fused NGG x16 stage-data load publishes its raw-buffer V# by consuming pc");
+
     // Kernel 5n: an s_buffer_load_dwordx8 result is typeless SGPR data. A later scalar buffer load
     // may consume its first four words as a nested V#, as DOLL's post-process shader does. Since the
     // V# came through another buffer descriptor it has no immediate key; preserve it by consumer pc.
