@@ -260,8 +260,8 @@ int main() {
     }
     printf("  [ok]   NGG EXEC wave-pack control flow emits only valid nonzero OpPhi ids\n");
 
-    // In a one-lane NGG vertex invocation, s_bcnt1_i32_b64 of a wave mask is the integer value of
-    // that lane's Boolean bit (0/1). Astro Bot uses this in its final primitive packing arithmetic.
+    // A GS_ALLOC_REQ marker alone does not prove the one-lane model. An unrelated NGG shader that
+    // reaches a wave population count must remain fail-closed rather than silently counting lane 0.
     const uint32_t ngg_mask_count[] = {
         0xBF900009u,                         // s_sendmsg GS_ALLOC_REQ (marks NGG)
         0xBEEA04C1u,                         // s_mov_b64 vcc, -1
@@ -271,20 +271,19 @@ int main() {
         0xF80008CFu, 0x03020100u,            // exp pos0 v0,v1,v2,v3
         0xBF810000u,
     };
-    const auto ngg_mask_count_spv = recompile_vertex(
-        ngg_mask_count, sizeof(ngg_mask_count) / sizeof(ngg_mask_count[0]));
-    if (ngg_mask_count_spv.empty() || !phi_ids_are_nonzero(ngg_mask_count_spv)) {
-        printf("  [FAIL] NGG one-lane mask population count did not produce valid SPIR-V\n");
+    if (!recompile_vertex(ngg_mask_count,
+                          sizeof(ngg_mask_count) / sizeof(ngg_mask_count[0])).empty()) {
+        printf("  [FAIL] unproven NGG accepted one-lane mask population count\n");
         return 1;
     }
-    printf("  [ok]   NGG one-lane mask population count produces valid SPIR-V\n");
+    printf("  [ok]   unproven NGG rejects one-lane mask population count\n");
 
-    // The terminal NGG output gate is a compacted-vertex ownership test. Unlike a general vertex
-    // CMPX/export (tested below), this exact output-only branch may retain the narrowed EXEC while
-    // exporting from the one-lane Vulkan representation.
+    // A constant terminal NGG output gate cannot mix active and inactive host vertices, so it is a
+    // topology-independent fixture for the output selection. Data-dependent gates remain restricted
+    // to the byte-exact Astro wrapper and are rejected immediately below.
     const uint32_t ngg_output_gate[] = {
         0xBF900009u,                         // s_sendmsg GS_ALLOC_REQ (marks NGG)
-        0x7DA80300u,                         // v_cmpx_* (narrows EXEC)
+        0x7C3E0300u,                         // v_cmpx_tru_f32 (uniformly narrows no lanes)
         0xBF880002u,                         // s_cbranch_execz -> s_endpgm
         0xF80008CFu, 0x03020100u,            // exp pos0 v0,v1,v2,v3
         0xBF810000u,
@@ -297,9 +296,24 @@ int main() {
     }
     printf("  [ok]   terminal NGG compacted-vertex output gate produces valid SPIR-V\n");
 
-    // NGG uses small inline B64 masks (1/3/15) while packing its final partial wave. Vertex SPIR-V
-    // has no LocalInvocationIndex; the one-lane model must read bit zero directly rather than emit an
-    // integer operation with the compute-only built-in's absent (zero) ID.
+    // A per-vertex CMPX under the same superficial terminal shape can create mixed active/inactive
+    // primitives. Without the byte-exact Astro wrapper/topology proof it must remain rejected.
+    const uint32_t unproven_ngg_output_gate[] = {
+        0xBF900009u,
+        0x7DA80300u,                         // data-dependent v_cmpx_*
+        0xBF880002u,
+        0xF80008CFu, 0x03020100u,
+        0xBF810000u,
+    };
+    if (!recompile_vertex(unproven_ngg_output_gate,
+                          std::size(unproven_ngg_output_gate)).empty()) {
+        printf("  [FAIL] unproven NGG accepted a mixed terminal output gate\n");
+        return 1;
+    }
+    printf("  [ok]   unproven NGG mixed terminal output gate remains fail-closed\n");
+
+    // Small inline B64 masks are also lane-sensitive. Merely resembling an NGG wrapper cannot opt a
+    // shader into the captured Astro program's lane-zero projection.
     const uint32_t ngg_inline_mask[] = {
         0xBF900009u,                         // s_sendmsg GS_ALLOC_REQ (marks NGG)
         0x92EA8081u,                         // s_bfm_b64 vcc, 1, 0 (lane-zero mask)
@@ -308,15 +322,12 @@ int main() {
         0xF80008CFu, 0x03020100u,            // exp pos0 v0,v1,v2,v3
         0xBF810000u,
     };
-    const auto ngg_inline_mask_spv = recompile_vertex(
-        ngg_inline_mask, sizeof(ngg_inline_mask) / sizeof(ngg_inline_mask[0]));
-    constexpr uint32_t OpBitwiseAnd = 199;
-    if (ngg_inline_mask_spv.empty() ||
-        !binary_id_operands_are_nonzero(ngg_inline_mask_spv, OpBitwiseAnd)) {
-        printf("  [FAIL] NGG inline mask referenced an absent vertex local-invocation id\n");
+    if (!recompile_vertex(ngg_inline_mask,
+                          sizeof(ngg_inline_mask) / sizeof(ngg_inline_mask[0])).empty()) {
+        printf("  [FAIL] unproven NGG accepted lane-zero inline-mask semantics\n");
         return 1;
     }
-    printf("  [ok]   NGG inline mask uses the modeled lane-zero bit without invalid ids\n");
+    printf("  [ok]   unproven NGG rejects lane-zero inline-mask semantics\n");
 
     // The same wave shortcut is not valid for an ordinary vertex shader: without the exact NGG
     // allocation message there is no proof that a Vulkan invocation represents guest lane zero.

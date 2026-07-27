@@ -9677,8 +9677,11 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
     for (const auto& in : ins) { if (in.is_end) break;
         if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x10 &&
             in.words[0] == 0xBF900009u) { ngg = true; break; } }
-    b.ngg_one_lane = ngg;
     b.ngg_private_lds = ngg && is_astro_bot_ngg_private_lds_wrapper(code, dwords);
+    // Every wave/peer approximation is an exception for the one captured Astro wrapper, not a
+    // property of the GS_ALLOC_REQ opcode. Other NGG programs retain only the ordinary merged-stage
+    // ABI setup below and fail closed if they reach a lane-sensitive operation.
+    b.ngg_one_lane = b.ngg_private_lds;
     uint32_t ngg_output_gate_begin = UINT32_MAX;
     uint32_t ngg_output_gate_end = 0;
     if (ngg) {
@@ -9700,6 +9703,21 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
             do { --previous; } while (previous > 0 && sopp_is_noop(ins[previous]));
             if (ins[previous].fmt != Rdna2Format::VOPC ||
                 !vopc_is_cmpx(ins[previous].opcode))
+                continue;
+            // The observed Astro wrapper is byte-exact. For any other NGG program, accept this
+            // vertex-suppression projection only for CMPX_F/CMPX_TRU with EXEC never narrowed
+            // beforehand: every host invocation then takes the same active/inactive path, so no
+            // mixed primitive can be fabricated regardless of topology. These constant forms also
+            // provide small executable regression fixtures without widening production semantics.
+            bool exec_full_before_compare = true;
+            for (size_t j = 0; j < previous; ++j)
+                if (instruction_may_change_exec(ins[j])) {
+                    exec_full_before_compare = false;
+                    break;
+                }
+            const bool constant_whole_draw_gate = exec_full_before_compare &&
+                (ins[previous].opcode == 0x10u || ins[previous].opcode == 0x1fu);
+            if (!b.ngg_private_lds && !constant_whole_draw_gate)
                 continue;
             bool has_position = false;
             bool output_only = true;

@@ -85,8 +85,8 @@ int main() {
         0x7E000280u, 0x7E0202F2u,
         0x36040482u, 0x4A0606C1u, 0x4A0404C1u,
         0x7E060B03u, 0x7E040B02u,           // triangle position in v2,v3,v0,v1
-        0x7E280281u, 0x7E2A0280u,           // v20=1, v21=0
-        0x7DA82B14u,                         // v_cmpx_gt_u32 v20, v21 -> true
+        0x7E280281u, 0x7E2A0280u,
+        0x7C3E2B14u,                         // v_cmpx_tru_f32 -> every invocation active
         0xBF880002u,                         // s_cbranch_execz -> end
         0xF80008CFu, 0x01000302u,
         0xBF810000u,
@@ -98,7 +98,7 @@ int main() {
         0x36040482u, 0x4A0606C1u, 0x4A0404C1u,
         0x7E060B03u, 0x7E040B02u,
         0x7E280280u, 0x7E2A0280u,           // v20=0, v21=0
-        0x7DA82B14u,                         // v_cmpx_gt_u32 v20, v21 -> false
+        0x7C202B14u,                         // v_cmpx_f_f32 -> every invocation inactive
         0xBF880002u,
         0xF80008CFu, 0x01000302u,
         0xBF810000u,
