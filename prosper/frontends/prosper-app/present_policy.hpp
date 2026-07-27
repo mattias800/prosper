@@ -25,6 +25,7 @@ enum class PresentAttempt {
     presented,    // the rendered frame reached the swapchain
     skipped,      // no swapchain image available within the bounded acquire (occluded/minimized) — retry
     out_of_date,  // swapchain is stale/lost/unusable — recreate it before the next present
+    failed,       // device/synchronization recovery failed — stop instead of waiting forever
 };
 
 // What present_frame should do after a BOUNDED vkAcquireNextImageKHR.

@@ -24,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
@@ -128,16 +129,29 @@ void parallel_compute_texels(size_t count, size_t work_bytes, Body&& body) {
         return;
     }
     const size_t chunk = (count + threads - 1) / threads;
-    std::vector<std::thread> workers;
+    // jthread makes a partially-created set exception-safe: if the next OS thread cannot be
+    // created, already-started workers are still joined. Finish the unspawned ranges on this
+    // thread so transient resource pressure degrades to less parallelism instead of aborting.
+    std::vector<std::jthread> workers;
     workers.reserve(threads - 1);
-    for (unsigned worker = 1; worker < threads; ++worker) {
-        const size_t begin = static_cast<size_t>(worker) * chunk;
-        const size_t end = std::min(count, begin + chunk);
-        if (begin >= end) break;
-        workers.emplace_back([&body, begin, end] { body(begin, end); });
+    unsigned next_worker = 1;
+    try {
+        for (; next_worker < threads; ++next_worker) {
+            const size_t begin = static_cast<size_t>(next_worker) * chunk;
+            const size_t end = std::min(count, begin + chunk);
+            if (begin >= end) break;
+            workers.emplace_back([&body, begin, end] { body(begin, end); });
+        }
+    } catch (const std::system_error&) {
+        // Fall through: ranges that did not get a worker run synchronously below.
     }
     body(size_t{0}, std::min(count, chunk));
-    for (auto& worker : workers) worker.join();
+    for (; next_worker < threads; ++next_worker) {
+        const size_t begin = static_cast<size_t>(next_worker) * chunk;
+        const size_t end = std::min(count, begin + chunk);
+        if (begin >= end) break;
+        body(begin, end);
+    }
 }
 
 #if defined(PROSPER_HAVE_TARGET_F16C)
@@ -463,6 +477,26 @@ struct VulkanComputeContext {
         return enabled;
     }
 
+    size_t release_available_memory() {
+        if (!device) return 0;
+        std::lock_guard<std::mutex> lock(memory_pool.mutex);
+        size_t released = 0;
+        for (const auto& [key, allocations] : memory_pool.available) {
+            (void)key;
+            for (VkDeviceMemory allocation : allocations) {
+                if (memory_pool.persistent_mappings.erase(allocation))
+                    vkUnmapMemory(device, allocation);
+                vkFreeMemory(device, allocation, nullptr);
+                ++released;
+            }
+        }
+        memory_pool.available.clear();
+        memory_pool.cached_bytes = 0;
+        memory_pool.cached_allocations = 0;
+        memory_pool.discarded += released;
+        return released;
+    }
+
     VkDeviceMemory allocate_memory(VkDeviceSize bytes, uint32_t memory_type,
                                    bool persistently_map = false) {
         if (memory_type == UINT32_MAX) return VK_NULL_HANDLE;
@@ -518,8 +552,19 @@ struct VulkanComputeContext {
         allocation.allocationSize = bytes;
         allocation.memoryTypeIndex = memory_type;
         VkDeviceMemory result = VK_NULL_HANDLE;
-        if (vkAllocateMemory(device, &allocation, nullptr, &result) != VK_SUCCESS)
-            return VK_NULL_HANDLE;
+        VkResult allocation_result = vkAllocateMemory(device, &allocation, nullptr, &result);
+        if (allocation_result != VK_SUCCESS && compute_memory_pool_enabled()) {
+            // Cached allocations are expendable. Under real heap pressure, release them before
+            // propagating OOM so an enlarged reuse cache can never strand memory needed now.
+            const size_t released = release_available_memory();
+            if (released) {
+                fprintf(stderr,
+                        "[compute] allocation failed (%d); evicted %zu cached allocation(s) and retrying\n",
+                        static_cast<int>(allocation_result), released);
+                allocation_result = vkAllocateMemory(device, &allocation, nullptr, &result);
+            }
+        }
+        if (allocation_result != VK_SUCCESS) return VK_NULL_HANDLE;
         if (compute_memory_pool_enabled()) {
             std::lock_guard<std::mutex> lock(memory_pool.mutex);
             memory_pool.active.emplace(result, key);

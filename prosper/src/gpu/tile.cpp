@@ -9,6 +9,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <system_error>
 #include <vector>
 
 #if (defined(__x86_64__) || defined(__i386__)) && \
@@ -427,16 +428,28 @@ template <class Body>
 inline void parallel_rows(uint32_t eh, unsigned nthreads, Body&& body) {
     if (nthreads <= 1 || eh == 0) { if (eh) body(0u, eh); return; }
     const uint32_t chunk = (eh + nthreads - 1) / nthreads;
-    std::vector<std::thread> workers;
+    // Auto-joining workers keep a partially-created set safe when the OS refuses another thread.
+    // Any ranges that could not get a worker are completed synchronously below.
+    std::vector<std::jthread> workers;
     workers.reserve(nthreads - 1);
-    for (unsigned worker = 1; worker < nthreads; ++worker) {
-        const uint32_t begin = worker * chunk;
-        const uint32_t end = std::min(eh, begin + chunk);
-        if (begin >= end) break;
-        workers.emplace_back([&body, begin, end] { body(begin, end); });
+    unsigned next_worker = 1;
+    try {
+        for (; next_worker < nthreads; ++next_worker) {
+            const uint32_t begin = next_worker * chunk;
+            const uint32_t end = std::min(eh, begin + chunk);
+            if (begin >= end) break;
+            workers.emplace_back([&body, begin, end] { body(begin, end); });
+        }
+    } catch (const std::system_error&) {
+        // Fall through: ranges that did not get a worker run synchronously below.
     }
     body(0u, std::min(eh, chunk));
-    for (auto& worker : workers) worker.join();
+    for (; next_worker < nthreads; ++next_worker) {
+        const uint32_t begin = next_worker * chunk;
+        const uint32_t end = std::min(eh, begin + chunk);
+        if (begin >= end) break;
+        body(begin, end);
+    }
 }
 
 inline void copy_swizzled_element(uint8_t* dst, const uint8_t* src, uint32_t bpe) {
@@ -611,17 +624,27 @@ void sw64kb_copy(uint8_t* dst, const uint8_t* src, uint32_t ew, uint32_t eh, uin
                                 // Up through 8-byte elements, x0 is the first swizzle bit above the
                                 // byte-within-element bits. Since block x origins and ix are even,
                                 // the next texel immediately follows this one in both layouts.
-                                const uint32_t run = paired_copy && bpe <= 8 && ix + 1 < columns
+                                uint32_t run = paired_copy && bpe <= 8 && ix + 1 < columns
                                     ? 2u : 1u;
-                                const uint32_t bytes = run * bpe;
+                                uint32_t bytes = run * bpe;
+                                // A bounded source can end between otherwise-adjacent texels. Keep
+                                // the first valid element instead of rejecting/zeroing the whole pair;
+                                // the next loop iteration handles the truncated neighbor separately.
+                                if (!full_block && run == 2 &&
+                                    (tiled > tiled_bytes || bytes > tiled_bytes - tiled)) {
+                                    run = 1;
+                                    bytes = bpe;
+                                }
                                 if constexpr (ToTiled) {
-                                    if (full_block || tiled + bytes <= tiled_bytes)
+                                    if (full_block ||
+                                        (tiled <= tiled_bytes && bytes <= tiled_bytes - tiled))
                                         copy_swizzled_element(dst + tiled,
                                                               src + (static_cast<size_t>(y) * ew +
                                                                      x0 + ix) * bpe,
                                                               bytes);
                                 } else {
-                                    if (full_block || tiled + bytes <= tiled_bytes)
+                                    if (full_block ||
+                                        (tiled <= tiled_bytes && bytes <= tiled_bytes - tiled))
                                         copy_swizzled_element(
                                             linear + static_cast<size_t>(ix) * bpe,
                                             src + tiled, bytes);

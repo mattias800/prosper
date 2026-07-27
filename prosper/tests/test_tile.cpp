@@ -487,6 +487,32 @@ int main() {
         CHECK(rt64(S, 3840, 2160, 4), "SW_64KB_S round-trip 3840x2160 @ 4 B (row-parallel, native 4K)");
     }
 
+    // Bounded SW_64KB reads may end between a pair of adjacent texels. The paired fast path must
+    // preserve the first complete texel and zero only the truncated neighbor, exactly like the
+    // original per-element walk. A cutoff after texel (0,0) exercises this edge for every paired
+    // element size.
+    {
+        const uint32_t M = (uint32_t)TileMode::Sw64KbS;
+        bool split_pair_matches = true;
+        for (uint32_t bpe : {1u, 2u, 4u, 8u}) {
+            const uint32_t ew = 128, eh = 64;
+            std::vector<uint8_t> linear((size_t)ew * eh * bpe);
+            for (size_t i = 0; i < linear.size(); ++i)
+                linear[i] = static_cast<uint8_t>(0x31u + i * 17u);
+            std::vector<uint8_t> tiled(tiled_elements_bytes(ew, eh, bpe, M), 0);
+            tile_surface(tiled.data(), linear.data(), ew, eh, M, 0, bpe);
+
+            std::vector<uint8_t> actual(linear.size(), 0xcc);
+            detile_elements(actual.data(), tiled.data(), bpe, ew, eh, bpe, M);
+            split_pair_matches &=
+                std::memcmp(actual.data(), linear.data(), bpe) == 0 &&
+                std::all_of(actual.begin() + bpe, actual.end(),
+                            [](uint8_t value) { return value == 0; });
+        }
+        CHECK(split_pair_matches,
+              "64KB bounded detile preserves a complete texel when its paired neighbor is truncated");
+    }
+
     // AMD AddrLib GFX10_SW_64K_Z_X_1xaa golden, 16 pipes, 4 bpe. The selected pattern is
     // nibble01[10] + nibble2[74] + nibble3[31]: low Morton pairs, four pipe-XOR bits, then
     // y3/x4/y6/x6. These independent positions pin both the Z order and the pipe rotation used
