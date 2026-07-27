@@ -131,6 +131,13 @@ int main(int argc, char** argv) {
       ShaderResourceTable rt; ShaderResource vb{}; vb.cls=ResourceClass::VertexBuffer; vb.format=DataFormat::Float32;
       vb.num_components=1; vb.binding=3; vb.stride=4; vb.sgpr_base=8; rt.resources.push_back(vb);
       dump(dir, "compute_store", recompile_valu(c, sizeof(c)/4, 1, 0, &rt)); }
+    // Astro Bot exact raw buffer_store_dwordx3 packet.
+    { const uint32_t c[] = {0x7e140f00u,0x7e060281u,0x7e080282u,0x7e0a0283u,
+                            0xe07c2000u,0x8004030au,0xbf810000u};
+      ShaderResourceTable rt; ShaderResource dst{}; dst.cls=ResourceClass::ConstantBuffer;
+      dst.format=DataFormat::Uint32; dst.num_components=1; dst.binding=3;
+      dst.stride=12; dst.sgpr_base=16; rt.resources.push_back(dst);
+      dump(dir, "compute_store_x3", recompile_valu(c, sizeof(c)/4, 1, 0, &rt)); }
     // Compute EXEC-predicated store (v_cmpx + guard execz + store).
     { const uint32_t c[] = {0x7e040f00u,0x06060100u,0x7e0a0284u,0x7da20b02u,0xbf880002u,0xe0102000u,0x80020302u,0xbf810000u};
       ShaderResourceTable rt; ShaderResource vb{}; vb.cls=ResourceClass::VertexBuffer; vb.format=DataFormat::Float32;

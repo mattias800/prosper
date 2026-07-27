@@ -1309,6 +1309,32 @@ int main() {
       printf("  kernel29 mismatches=%u (buf[5]=%g expect=10)\n", bad29, f5); }
     CHECK(stored_out.size() == N && bad29 == 0, "recompiled kernel 29 (MUBUF store writes buffer[gid]=2*gid) correct");
 
+    // Astro Bot world-map PS exact final MUBUF packet. Every lane writes three consecutive raw
+    // dwords to one 12-byte record, proving both the unusual x3 component count and IDXEN stride.
+    const uint32_t code29x3[] = {
+        0x7e140f00u,                         // v10 = (uint)v0 = invocation index
+        0x7e060281u, 0x7e080282u, 0x7e0a0283u, // v3/v4/v5 = 1/2/3
+        0xe07c2000u, 0x8004030au,           // exact Astro buffer_store_dwordx3 packet
+        0xbf810000u,
+    };
+    ShaderResourceTable rt29x3;
+    { ShaderResource dst{}; dst.cls = ResourceClass::ConstantBuffer;
+      dst.format = DataFormat::Uint32; dst.num_components = 1;
+      dst.binding = 3; dst.stride = 12; dst.sgpr_base = 16;
+      rt29x3.resources.push_back(dst); }
+    std::vector<uint32_t> spv29x3 = recompile_valu(
+        code29x3, std::size(code29x3), 1, 0, &rt29x3);
+    CHECK(!spv29x3.empty(),
+          "recompiled exact Astro buffer_store_dwordx3 packet -> SPIR-V");
+    std::vector<uint32_t> stored29x3(N * 3, 0u), stored29x3_out;
+    prosper::test::run_compute(spv29x3, in29, N, N, {}, stored29x3, &stored29x3_out);
+    uint32_t bad29x3 = 0;
+    for (uint32_t lane = 0; lane < N && stored29x3_out.size() == N * 3; ++lane)
+        for (uint32_t component = 0; component < 3; ++component)
+            bad29x3 += stored29x3_out[lane * 3 + component] != component + 1;
+    CHECK(stored29x3_out.size() == N * 3 && bad29x3 == 0,
+          "buffer_store_dwordx3 writes all three dwords of every indexed record");
+
     const uint32_t code29mt[] = {
         0x7e040f00u, 0x06060100u, 0xe8b42000u, 0x80020302u, 0xbf810000u,
     };

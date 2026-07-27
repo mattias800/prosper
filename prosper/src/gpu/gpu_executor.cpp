@@ -2099,7 +2099,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // live at the instruction and resolves by exact pc, avoiding a duplicate stale SRT use.
                 const bool raw_buffer_use = !is_mtbuf &&
                     ((in.opcode >= 0x08 && in.opcode <= 0x0F) ||
-                     (in.opcode >= 0x1C && in.opcode <= 0x1E));
+                     (in.opcode >= 0x1C && in.opcode <= 0x1F));
                 const bool format_store_use = in.opcode >= 0x04 && in.opcode <= 0x07;
                 const bool atomic_buffer_use = in.opcode == 0x38; // buffer_atomic_umax
                 if (srt_uses && (format_store_use || raw_buffer_use || atomic_buffer_use)) {

@@ -6142,6 +6142,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x1C: n = 1; is_store = true; break;   // buffer_store_dword
                 case 0x1D: n = 2; is_store = true; break;   // buffer_store_dwordx2
                 case 0x1E: n = 4; is_store = true; break;   // buffer_store_dwordx4
+                case 0x1F: n = 3; is_store = true; break;   // buffer_store_dwordx3 (like loads,
+                                                            // x3 sorts after x4 in this ISA)
                 case 0x4: n = 1; is_format = true; is_store = true; break;   // buffer_store_format_x
                 case 0x5: n = 2; is_format = true; is_store = true; break;   // buffer_store_format_xy
                 case 0x6: n = 3; is_format = true; is_store = true; break;   // buffer_store_format_xyz
