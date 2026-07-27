@@ -11,8 +11,9 @@
 // a real guest frame takes. P0b wires the actual guest boot in front of this (the same present
 // path, no changes here).
 //
-// Two Vulkan contexts by design (docs/FRONTEND_APP.md): the core keeps its headless render device;
-// THIS is a separate presentation device, and frames cross as shared immutable CPU pixels.
+// Real game boots normally adopt the renderer's Vulkan device and pass its front image directly to
+// the swapchain. Test-pattern boots, an explicit override, or failed adoption retain the original
+// two-device path, where frames cross as shared immutable CPU pixels.
 #include "gpu/videoout_present.hpp"   // present_acquire_rendered_frame / present_write_frame
 #include "gpu/gpu_execute.hpp"         // shared_vulkan_context / gpu-present activation (#1270)
 #include "gpu/gpu_capture.hpp"         // request_interactive_gpu_capture (F9 frame grab)
@@ -771,10 +772,11 @@ int main(int argc, char** argv) {
     if (!win) { fprintf(stderr, "[app] SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
 
     Vk vk;
-    // Present unification (#1270, opt-in): prefer presenting on the renderer's shared device so we can
-    // GPU-blit its front-buffer image. Only for a real boot (the renderer produces front buffers); the
-    // test pattern and any adoption failure fall back to a private device + CPU pixels (unchanged path).
-    const bool wantGpuPresent = getenv("PROSPER_APP_GPU_PRESENT") != nullptr && !testPattern && !dump.empty();
+    // Present unification (#1270): prefer the renderer's shared device for real game boots so we can
+    // GPU-blit its front-buffer image. The test pattern, PROSPER_APP_GPU_PRESENT=0, and any adoption
+    // failure fall back to a private device + CPU pixels.
+    const bool wantGpuPresent = prosper::frontend::request_gpu_present(
+        getenv("PROSPER_APP_GPU_PRESENT"), testPattern, !dump.empty());
     if (!wantGpuPresent || !try_adopt_shared_present(vk, win)) {
         if (!create_instance(vk, win) || !pick_device(vk)) return 1;
     }

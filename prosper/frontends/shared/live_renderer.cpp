@@ -1817,17 +1817,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             } else {
                                 copy_resource(hlin.data(), r.gpu_addr, hlin.size());
                             }
-                            for (size_t t = 0; t < volume_texels; t++) {
-                                uint8_t* p = &texture_pixels[t * 4];
-                                for (uint32_t c = 0; c < 4; c++) {
-                                    if (c < nc) {
-                                        uint16_t hv; std::memcpy(&hv, &hlin[t * bpt + c * 2], 2);
-                                        float f = prosper::gpu::half_to_float(hv);
-                                        p[c] = (f != f || f <= 0.f) ? 0                     // NaN/neg -> 0
-                                             : (f >= 1.f ? 255 : (uint8_t)(f * 255.f + 0.5f));
-                                    } else p[c] = (c == 3) ? 255 : 0;       // absent: (.,0,0,1)
-                                }
-                            }
+                            // Same NaN/negative/positive-infinity clamp and absent-channel defaults
+                            // as the historical scalar loop, exhaustively checked over all binary16
+                            // inputs by test_game_compute. Large dynamic textures convert in parallel.
+                            sampled_float16_to_unorm8_range(
+                                hlin.data(), nc, volume_texels, texture_pixels.data());
                             f16_done = true;   // read+detiled at the real element size already
                         } else if (bpt < 4) {
                             // Narrow (single/dual-channel) surface: read at the REAL element size and detile
@@ -2649,6 +2643,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 return g.empty() ? nullptr : g.front()->ps.clear_color;
             };
             std::shared_ptr<const std::vector<uint8_t>> selected_pixels;
+            bool published_gpu = false;
             if (pertarget) {
                 // PER-TARGET RTT: a real frame is a sequence of passes, each rendering into a specific
                 // color target (CB_COLOR0_BASE), and a final composite pass SAMPLES the earlier targets.
@@ -3596,7 +3591,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 // through to the CPU readback below, which still publishes a CPU frame; prosper-app
                 // presents that CPU frame when no GPU frame was published (main.cpp), so a miss degrades to
                 // the CPU present path rather than freezing the window.
-                bool published_gpu = false;
                 if (front >= 0 && prosper::gpu::gpu_present_active()) {
                     const uint64_t front_va = prosper_vo_buffer_addr(front);
                     auto rit = g_rtt.find(front_va);
@@ -3674,7 +3668,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                                 return e ? (int)atol(e) : 0; }();
             size_t px_nz = 0;
             if (dump_bmps || nzlog_every) for (uint8_t b : px) px_nz += (b != 0);
-            if (px.empty()) {
+            if (px.empty() && !published_gpu) {
                 fprintf(stderr, "[render] frame %d: Vulkan render FAILED (%ux%u)\n", n, w, h);
             } else if (dump_bmps && ((content_thr && px_nz >= content_thr) || (!content_thr && (n < 60 || n % 10 == 0)))) {
                 char fn[512]; snprintf(fn, sizeof fn, "%s/frame_%04d.bmp", frame_dir.c_str(), n);
