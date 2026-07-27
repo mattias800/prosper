@@ -2297,62 +2297,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         fr.tex_rgba = texture_pixels.data(); fr.tw = tw; fr.th = cube_done ? th * 6u : th;
                         fr.td = is_volume ? r.depth : 1u;
                         fr.img_dim = r.img_dim;
-                        if (native_r32ui_storage && writable_storage_image) {
-                            const uint32_t writeback_pitch = getenv("PROSPER_PITCH")
-                                ? static_cast<uint32_t>(atoi(getenv("PROSPER_PITCH"))) : 0u;
-                            const size_t linear_bytes = static_cast<size_t>(tw) * th * 4u;
-                            const bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode);
-                            const size_t guest_bytes = r.in_mip_tail
-                                ? r.mip_tail_bytes
-                                : (tiled
-                                       ? prosper::gpu::tiled_surface_bytes(
-                                             tw, th, r.tile_mode, writeback_pitch, 4u)
-                                       : linear_bytes);
-                            // The exact Astro atomic surface is a base-level 2D R32_UINT image. Keep
-                            // the callback fail-closed for malformed/short replay backing; losing a
-                            // write is preferable to overrunning an unrelated guest allocation.
-                            const bool backing_fits = guest_bytes &&
-                                (!r.host_data || guest_bytes <= r.host_data_size);
-                            if (backing_fits) {
-                                const uint64_t guest_addr = r.gpu_addr;
-                                uint8_t* const replay_data = r.host_data;
-                                const uint32_t tile_mode = r.tile_mode;
-                                const bool in_mip_tail = r.in_mip_tail;
-                                const uint32_t mip_tail_x = r.mip_tail_x;
-                                const uint32_t mip_tail_y = r.mip_tail_y;
-                                fr.storage_image_writeback =
-                                    [guest_addr, replay_data, guest_bytes, linear_bytes,
-                                     tw, th, tile_mode, writeback_pitch, in_mip_tail,
-                                     mip_tail_x, mip_tail_y](const uint8_t* pixels,
-                                                            size_t bytes) {
-                                        if (!pixels || bytes != linear_bytes) return;
-                                        uint8_t* destination = replay_data;
-                                        if (!destination) {
-                                            if (guest_bytes > UINT32_MAX ||
-                                                !prosper::gpu::guest_writable(
-                                                    guest_addr,
-                                                    static_cast<uint32_t>(guest_bytes)))
-                                                return;
-                                            prosper::host::guest_write_watch_notify_host_write(
-                                                guest_addr, guest_bytes);
-                                            destination = reinterpret_cast<uint8_t*>(
-                                                static_cast<uintptr_t>(guest_addr));
-                                        }
-                                        if (in_mip_tail) {
-                                            prosper::gpu::tile_surface_level(
-                                                destination, guest_bytes, pixels, tw, th,
-                                                tile_mode, 4u, mip_tail_x, mip_tail_y);
-                                        } else {
-                                            prosper::gpu::tile_surface(
-                                                destination, pixels, tw, th, tile_mode,
-                                                writeback_pitch, 4u);
-                                        }
-                                        if (guest_addr)
-                                            prosper::gpu::notify_guest_gpu_write(
-                                                guest_addr, guest_bytes);
-                                    };
-                            }
-                        }
                         // #1272: see the reuse path — plain 2D guest textures only.
                         if (!is_volume && !cube_done)
                             fr.declared_mip_levels = r.declared_mip_levels;
@@ -2437,6 +2381,81 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             decoded_textures.emplace(
                                 decode_key, DecodedTexture{fr.tex_rgba, fr.th, narrow_done,
                                                           fr.persistent_texture_id});
+                        }
+                        if (native_r32ui_storage && writable_storage_image) {
+                            const uint32_t writeback_pitch = getenv("PROSPER_PITCH")
+                                ? static_cast<uint32_t>(atoi(getenv("PROSPER_PITCH"))) : 0u;
+                            const size_t linear_bytes = static_cast<size_t>(tw) * th * 4u;
+                            const bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode);
+                            const size_t guest_bytes = r.in_mip_tail
+                                ? r.mip_tail_bytes
+                                : (tiled
+                                       ? prosper::gpu::tiled_surface_bytes(
+                                             tw, th, r.tile_mode, writeback_pitch, 4u)
+                                       : linear_bytes);
+                            // The exact Astro atomic surface is a base-level 2D R32_UINT image. Keep
+                            // the callback fail-closed for malformed/short replay backing; losing a
+                            // write is preferable to overrunning an unrelated guest allocation.
+                            const bool backing_fits = guest_bytes &&
+                                (!r.host_data || guest_bytes <= r.host_data_size);
+                            if (backing_fits) {
+                                const uint64_t guest_addr = r.gpu_addr;
+                                uint8_t* const replay_data = r.host_data;
+                                const uint32_t tile_mode = r.tile_mode;
+                                const bool in_mip_tail = r.in_mip_tail;
+                                const uint32_t mip_tail_x = r.mip_tail_x;
+                                const uint32_t mip_tail_y = r.mip_tail_y;
+                                fr.storage_image_writeback =
+                                    [guest_addr, replay_data, guest_bytes, linear_bytes,
+                                     tw, th, tile_mode,
+                                     writeback_pitch, in_mip_tail, mip_tail_x,
+                                     mip_tail_y, &decoded_textures](const uint8_t* pixels,
+                                                                  size_t bytes) {
+                                        if (!pixels || bytes != linear_bytes) return;
+                                        uint8_t* destination = replay_data;
+                                        if (!destination) {
+                                            if (guest_bytes > UINT32_MAX ||
+                                                !prosper::gpu::guest_writable(
+                                                    guest_addr,
+                                                    static_cast<uint32_t>(guest_bytes)))
+                                                return;
+                                            prosper::host::guest_write_watch_notify_host_write(
+                                                guest_addr, guest_bytes);
+                                            destination = reinterpret_cast<uint8_t*>(
+                                                static_cast<uintptr_t>(guest_addr));
+                                        }
+                                        if (in_mip_tail) {
+                                            prosper::gpu::tile_surface_level(
+                                                destination, guest_bytes, pixels, tw, th,
+                                                tile_mode, 4u, mip_tail_x, mip_tail_y);
+                                        } else {
+                                            prosper::gpu::tile_surface(
+                                                destination, pixels, tw, th, tile_mode,
+                                                writeback_pitch, 4u);
+                                        }
+                                        if (guest_addr)
+                                            prosper::gpu::notify_guest_gpu_write(
+                                                guest_addr, guest_bytes);
+                                        // The same guest range can already have a sampled-image decode
+                                        // under a different cache key/class. Its pixel representation
+                                        // cannot be patched byte-for-byte from R32_UINT, so discard every
+                                        // overlapping submit-local decode and let the next pass rebuild it
+                                        // from the now-current guest bytes.
+                                        if (guest_addr) {
+                                            for (auto it = decoded_textures.begin();
+                                                 it != decoded_textures.end();) {
+                                                const uint64_t cached_addr = it->first.gpu_addr;
+                                                const uint64_t cached_bytes =
+                                                    std::max<uint64_t>(it->first.size, 1u);
+                                                const bool overlaps = cached_addr <= guest_addr
+                                                    ? guest_addr - cached_addr < cached_bytes
+                                                    : cached_addr - guest_addr < guest_bytes;
+                                                if (overlaps) it = decoded_textures.erase(it);
+                                                else ++it;
+                                            }
+                                        }
+                                    };
+                            }
                         }
                         // Carry the decoded S# sampler state (filter/wrap/mip) so the pipeline samples the
                         // way the game asked instead of a fixed LINEAR/clamp sampler (#<sampler-fix>).

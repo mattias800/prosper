@@ -690,37 +690,52 @@ int main() {
         CHECK(!atomic_frag.empty() && atomic_frag[0] == 0x07230203u,
               "recompiled Astro image_atomic_swap fragment shader");
         if (!atomic_frag.empty()) {
-            uint32_t storage_word = 0x3f000000u;   // initial 0.5f bits
+            uint32_t return_word = 0x3f000000u;   // initial 0.5f bits
             prosper::test::FrameResource resource;
             resource.binding = 4; resource.set = 1;
-            resource.tex_rgba = reinterpret_cast<const uint8_t*>(&storage_word);
+            resource.tex_rgba = reinterpret_cast<const uint8_t*>(&return_word);
             resource.tw = 1; resource.th = 1;
             resource.texture_format = VK_FORMAT_R32_UINT;
             resource.is_storage_image = true;
-            resource.storage_image_writeback =
-                [&](const uint8_t* pixels, size_t bytes) {
-                    if (bytes == sizeof(storage_word))
-                        std::memcpy(&storage_word, pixels, sizeof(storage_word));
-                };
             prosper::test::BackendDraw draw;
             draw.vs = vert; draw.fs = atomic_frag; draw.R = {resource}; draw.vcount = 3;
-            prosper::test::BackendSubmissionBatch storage_batch;
-            const std::vector<uint8_t> first =
-                prosper::test::render_draws_rgba(
-                    {draw}, 1, 1, nullptr, nullptr, false, nullptr,
-                    nullptr, nullptr, nullptr, &storage_batch, false);
-            const uint8_t* first_pixel = first.size() == 4 ? first.data() : nullptr;
-            printf("  image_atomic_swap first=(%u,%u,%u) guest=%08x\n",
-                   first_pixel ? first_pixel[0] : 0, first_pixel ? first_pixel[1] : 0,
-                   first_pixel ? first_pixel[2] : 0, storage_word);
-            CHECK(first_pixel && first_pixel[1] > 0x60 && first_pixel[1] < 0xa0 &&
-                      first_pixel[0] < 0x40 && first_pixel[2] < 0x40,
+            const std::vector<uint8_t> returned =
+                prosper::test::render_draws_rgba({draw}, 1, 1);
+            const uint8_t* returned_pixel = returned.size() == 4 ? returned.data() : nullptr;
+            CHECK(returned_pixel && returned_pixel[1] > 0x60 &&
+                      returned_pixel[1] < 0xa0 && returned_pixel[0] < 0x40 &&
+                      returned_pixel[2] < 0x40,
                   "R32_UINT image atomic returns the pre-operation 0.5 value to VDATA");
-            CHECK(storage_word == 0x3f800000u,
+
+            // Keep the upload source distinct from the callback destination. This prevents the test
+            // from passing merely because a mutable source variable was updated in place.
+            const uint32_t upload_word = 0x3f000000u;
+            uint32_t guest_word = upload_word;
+            resource.tex_rgba = reinterpret_cast<const uint8_t*>(&upload_word);
+            resource.storage_image_writeback =
+                [&](const uint8_t* pixels, size_t bytes) {
+                    if (bytes == sizeof(guest_word))
+                        std::memcpy(&guest_word, pixels, sizeof(guest_word));
+                };
+            draw.vs = vert; draw.fs = atomic_frag; draw.R = {resource}; draw.vcount = 3;
+            constexpr uint64_t storage_target_id = 0x41544f4d49430001ull;
+            prosper::test::BackendColorTarget storage_target{
+                storage_target_id, false, false};
+            prosper::test::BackendSubmissionBatch storage_batch;
+            const std::vector<uint8_t> storage_only =
+                prosper::test::render_draws_rgba(
+                    {draw}, 1, 1, nullptr, nullptr, false, &storage_target,
+                    nullptr, nullptr, nullptr, &storage_batch, false);
+            const auto storage_stats = prosper::test::backend_color_target_stats();
+            printf("  image_atomic_swap storage-only guest=%08x source=%08x\n",
+                   guest_word, upload_word);
+            CHECK(storage_only.empty() && storage_stats.readbacks == 0,
+                  "storage-image synchronization does not rely on a color readback");
+            CHECK(upload_word == 0x3f000000u && guest_word == 0x3f800000u,
                   "graphics storage-image atomic writes back exact texels to CPU/guest memory");
             CHECK(!storage_batch.pending(),
                   "storage-image writeback flushes an otherwise deferred live-render batch");
-            draw.R[0].tex_rgba = reinterpret_cast<const uint8_t*>(&storage_word);
+            draw.R[0].tex_rgba = reinterpret_cast<const uint8_t*>(&guest_word);
             const std::vector<uint8_t> second =
                 prosper::test::render_draws_rgba({draw}, 1, 1);
             const uint8_t* second_pixel = second.size() == 4 ? second.data() : nullptr;
