@@ -132,6 +132,14 @@ struct ComputeShaderConfig {
     bool tgid_x_en = false, tgid_y_en = false, tgid_z_en = false;
     bool tg_size_en = false;
     uint32_t lds_bytes = 0;
+    // Non-zero only when the live backend can REQUIRE this exact Vulkan subgroup size. Complex
+    // guest-wave CFGs may then replace their portable workgroup-scratch vote/scan emulation with
+    // native subgroup operations without changing the PS5 wave domain.
+    uint32_t native_subgroup_size = 0;
+    // Per-format VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT support published by the device-owning
+    // frontend. Offline callers default to the portable raw path; live execution supplies the exact
+    // physical-device mask so unsupported typed formats compile to the raw uvec4 fallback.
+    uint32_t native_storage_format_support = 0;
 };
 
 // Translate a game compute program without the synthetic binding-0 input / binding-1 output used by

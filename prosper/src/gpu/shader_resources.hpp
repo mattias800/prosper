@@ -71,6 +71,44 @@ void rdna2_buffer_format(uint32_t fmt, DataFormat* out_fmt, uint32_t* out_compon
 // How many bytes one component of `format` occupies (0 for Unknown and block-compressed formats).
 uint32_t data_format_bytes(DataFormat f);
 
+// Formats whose storage-image conversion can be delegated exactly to a native Vulkan float image.
+// Loads return float32 components (with Vulkan's standard missing-channel defaults) and stores accept
+// float32 components, matching the PS5 image instruction's VGPR contract; the backing texels remain
+// at their native byte width. Three-channel optimal images are deliberately limited to packed
+// R11G11B10 because ordinary RGB8/RGB16/RGB32 storage support is not portable.
+constexpr bool native_float_storage_image(DataFormat format, uint32_t components, bool srgb) {
+    return !srgb &&
+           (((components == 1 || components == 2 || components == 4) &&
+             (format == DataFormat::Unorm8 || format == DataFormat::Float16 ||
+              format == DataFormat::Float32)) ||
+            (components == 3 && format == DataFormat::Float10_11_11));
+}
+
+// Native typed storage is only valid when the physical device advertises storage-image support
+// for the selected VkFormat. Keep the feature input abstract so the fallback policy can be tested
+// without requiring a particular Vulkan device or exposing Vulkan types in this shared header.
+constexpr bool native_float_storage_image_supported(DataFormat format, uint32_t components,
+                                                    bool srgb, bool storage_image_feature) {
+    return storage_image_feature && native_float_storage_image(format, components, srgb);
+}
+
+// Stable, Vulkan-independent bits used to carry per-format storage-image capabilities from the
+// device-owning frontend into the compute recompiler. Zero means the semantic format is not a native
+// typed-storage candidate; otherwise each exact VkFormat candidate has its own bit.
+constexpr uint32_t native_storage_format_support_bit(DataFormat format, uint32_t components) {
+    if (format == DataFormat::Unorm8)
+        return components == 1 ? 1u << 0 : components == 2 ? 1u << 1
+             : components == 4 ? 1u << 2 : 0u;
+    if (format == DataFormat::Float16)
+        return components == 1 ? 1u << 3 : components == 2 ? 1u << 4
+             : components == 4 ? 1u << 5 : 0u;
+    if (format == DataFormat::Float32)
+        return components == 1 ? 1u << 6 : components == 2 ? 1u << 7
+             : components == 4 ? 1u << 8 : 0u;
+    if (format == DataFormat::Float10_11_11 && components == 3) return 1u << 9;
+    return 0;
+}
+
 // IEEE-754 binary16 -> binary32 (handles subnormals, +/-inf, NaN). Used by the texture upload path to
 // convert a sampled Float16 surface to the RGBA8 the backend uploads (#290). Pure + testable.
 float half_to_float(uint16_t h);
@@ -102,9 +140,9 @@ enum class ResourceClass : uint32_t {
     Texture,         // read by image_sample / image_load (sampled image + sampler)
     Sampler,         // paired with a Texture for image_sample
     StorageImage,    // read/written by image_load / image_store WITHOUT a sampler (compute copy/blit).
-                     // Bound as a Vulkan STORAGE_IMAGE; img_dim gives 1D/2D/3D. Our raw-32-bit-VGPR
-                     // model uses a uint-sampled storage image (Format=Unknown + read/write-without-
-                     // format), so texels move bit-exact (format reinterpretation lives in the descriptor).
+                     // Bound as a Vulkan STORAGE_IMAGE; img_dim gives 1D/2D/3D. Integer/packed formats
+                     // use uint texels plus host conversion; native four-channel float/UNORM formats
+                     // use float texels and Vulkan's descriptor conversion.
 };
 
 // One resource a shader accesses. FILLED BY THE FRONT-HALF from the game's real descriptors (the
@@ -298,6 +336,19 @@ struct SpirvDescriptorBinding {
     // runtime range may be addressed, so validation cannot derive an upper bound from SPIR-V alone.
     uint64_t required_bytes = 0;
     bool dynamic_access = false;
+    // Data access, distinct from merely loading the descriptor object. For buffers these follow
+    // pointer loads/stores; for images they follow OpImageRead/sample and OpImageWrite. Backends use
+    // the per-binding result to avoid seeding write-only outputs and reading back read-only inputs.
+    bool readable = false;
+    bool writable = false;
+    // Coordinate contract for sampled images. Normalized sampling (OpImageSample*/Gather) may bind a
+    // uniformly render-scaled image directly; texel-space access (OpImageFetch/Read) requires the
+    // descriptor's exact declared extent. A binding can use both, in which case exact extent wins.
+    bool normalized_sampling = false;
+    bool texel_access = false;
+    // Storage-image sampled type encoded by SPIR-V. This is the backend's authoritative choice
+    // between a native float VkFormat and the portable raw-uvec4 conversion path, including replay.
+    bool storage_float = false;
 };
 
 enum class DescriptorIssueCode : uint32_t {

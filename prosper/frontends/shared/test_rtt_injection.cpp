@@ -27,6 +27,32 @@ int main() {
     CHECK(std::equal(scaled.begin(), scaled.begin() + 8, fp16_source.begin()));
     CHECK(std::equal(scaled.begin() + 8, scaled.end(), fp16_source.begin() + 16));
 
+    // The integer render-scale fast path expands pixels and rows without changing nearest-neighbor
+    // selection. Distinct values in both axes catch accidental row/pixel replication mixups.
+    const std::vector<uint8_t> rgba_source = {
+        1, 2, 3, 4,  5, 6, 7, 8,
+        9,10,11,12, 13,14,15,16,
+    };
+    std::vector<uint8_t> rgba_scaled;
+    CHECK(inject_rtt_pixels(rgba_scaled, 4, 4, rgba_source, 2, 2, 4));
+    const std::vector<uint8_t> rgba_expected = {
+        1,2,3,4, 1,2,3,4, 5,6,7,8, 5,6,7,8,
+        1,2,3,4, 1,2,3,4, 5,6,7,8, 5,6,7,8,
+        9,10,11,12, 9,10,11,12, 13,14,15,16, 13,14,15,16,
+        9,10,11,12, 9,10,11,12, 13,14,15,16, 13,14,15,16,
+    };
+    CHECK(rgba_scaled == rgba_expected);
+
+    // Keep a non-integer scale covered as well; this takes the generic specialized-width loop.
+    std::vector<uint8_t> odd_scaled;
+    CHECK(inject_rtt_pixels(odd_scaled, 3, 3, rgba_source, 2, 2, 4));
+    const std::vector<uint8_t> odd_expected = {
+        1,2,3,4, 1,2,3,4, 5,6,7,8,
+        1,2,3,4, 1,2,3,4, 5,6,7,8,
+        9,10,11,12, 9,10,11,12, 13,14,15,16,
+    };
+    CHECK(odd_scaled == odd_expected);
+
     std::vector<uint8_t> malformed(7), fallback_bytes = {0xaa, 0xbb, 0xcc, 0xdd};
     consumer = fallback_bytes;
     CHECK(!inject_rtt_pixels(consumer, 1, 1, malformed, 1, 1, 8));

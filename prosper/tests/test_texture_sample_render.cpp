@@ -98,6 +98,33 @@ int main() {
     printf("  (0.75,0.25) center=(%u,%u,%u)\n", ok1?rgb[0]:0, ok1?rgb[1]:0, ok1?rgb[2]:0);
     CHECK(ok1 && rgb[1] > 0x80 && rgb[0] < 0x40 && rgb[2] < 0x40, "sampling texel (1,0) yields GREEN (proves u routing)");
 
+    // Dynamic single-channel textures (notably Astro Bot's FMV planes) stay R8 through upload. The
+    // component mapping reproduces the live frontend's historical coverage broadcast without a 4x
+    // CPU expansion to RGBA8.
+    {
+        std::vector<uint32_t> ps(ps_template, ps_template + sizeof(ps_template)/sizeof(ps_template[0]));
+        ps[1] = C025; ps[3] = C025;
+        std::vector<uint32_t> frag = recompile_fragment(ps.data(), ps.size(), &rt);
+        const uint8_t r8_texels[4] = {32, 96, 160, 224};
+        prosper::test::FrameResource resource;
+        resource.binding = 4; resource.set = 1;
+        resource.tex_rgba = r8_texels; resource.tw = 2; resource.th = 2;
+        resource.texture_format = VK_FORMAT_R8_UNORM;
+        resource.swizzle[0] = resource.swizzle[1] =
+            resource.swizzle[2] = resource.swizzle[3] = 4;
+        prosper::test::BackendDraw draw;
+        draw.vs = vert; draw.fs = frag; draw.R = {resource}; draw.vcount = 3;
+        const std::vector<uint8_t> pixels =
+            prosper::test::render_draws_rgba({draw}, W, H);
+        const uint8_t* center = pixels.size() == static_cast<size_t>(W) * H * 4
+            ? &pixels[(static_cast<size_t>(H / 2) * W + W / 2) * 4] : nullptr;
+        CHECK(center && center[0] >= 31 && center[0] <= 33 &&
+                         center[1] == center[0] && center[2] == center[0],
+              "native R8 sampled upload broadcasts its channel without RGBA expansion");
+        CHECK(prosper::test::backend_color_bytes_per_pixel(VK_FORMAT_R8_UNORM) == 1,
+              "native R8 upload accounts one byte per texel");
+    }
+
     // The live renderer commonly submits hundreds of draws that reference the same few decoded
     // textures. The backend must upload identical pixels once per call while preserving the legacy
     // rendered bytes and separate per-descriptor views/samplers.

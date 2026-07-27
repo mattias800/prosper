@@ -220,7 +220,11 @@ struct SpirvCompute {
     bool     is_fragment=0;                          // true in the fragment shell (gates VINTRP interp)
     bool     is_compute=0;                            // true in the compute shell (gates LDS / s_barrier)
     bool     uses_barrier=0;                          // guest or synthesized workgroup barrier emitted
-    bool     declared_subgroup=0, declared_subgroup_arithmetic=0;
+    bool     declared_subgroup=0, declared_subgroup_vote=0, declared_subgroup_arithmetic=0;
+    // When non-zero, the backend promises to create this compute pipeline with an exact required
+    // subgroup size equal to the PS5 wave. Native votes/scans are then architecture-exact.
+    uint32_t native_subgroup_size=0;
+    uint32_t native_storage_format_support=0;
     uint32_t v_subgroup_localid=0, t_ptr_in_u32=0;
     uint32_t v_helper_invocation=0, t_ptr_in_bool=0;
     uint32_t v_internal_gds=0, t_ptr_gds_u32=0;
@@ -480,6 +484,37 @@ struct SpirvCompute {
         // with fragment GDS append/consume's non-helper population.
         const uint32_t guest_lane = land(mask_bit, logical_not(helper_invocation()));
         const uint32_t selected = sel(land(guest_lane, in_half), uconst(1), uconst(0));
+        uint32_t prefix = id();
+        put(code, Op_GroupNonUniformIAdd,
+            {t_u32, prefix, uconst(Scope_Subgroup), GroupOp_ExclusiveScan, selected});
+        return ibin(Op_IAdd, acc_bits, prefix);
+    }
+    uint32_t native_wave_any(uint32_t value) {
+        if (!native_subgroup_size) return 0;
+        if (!declared_subgroup) {
+            put(caps, Op_Capability, {Cap_GroupNonUniform});
+            declared_subgroup = true;
+        }
+        if (!declared_subgroup_vote) {
+            put(caps, Op_Capability, {Cap_GroupNonUniformVote});
+            declared_subgroup_vote = true;
+        }
+        uint32_t result = id();
+        put(code, Op_GroupNonUniformAny,
+            {t_bool, result, uconst(Scope_Subgroup), value});
+        return result;
+    }
+    uint32_t native_compute_mbcnt(uint32_t mask_bit, uint32_t acc_bits, uint32_t lo) {
+        if (!native_subgroup_size) return 0;
+        const uint32_t lane = subgroup_local_id();
+        if (!declared_subgroup_arithmetic) {
+            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
+            declared_subgroup_arithmetic = true;
+        }
+        const uint32_t in_half = bsel(
+            lo, ucmp(Op_ULessThan, lane, uconst(32)),
+            ucmp(Op_UGreaterThanEqual, lane, uconst(32)));
+        const uint32_t selected = sel(land(mask_bit, in_half), uconst(1), uconst(0));
         uint32_t prefix = id();
         put(code, Op_GroupNonUniformIAdd,
             {t_u32, prefix, uconst(Scope_Subgroup), GroupOp_ExclusiveScan, selected});
@@ -1114,19 +1149,27 @@ struct SpirvCompute {
     }
 
     // --- STORAGE images (MIMG image_load / image_store WITHOUT a sampler; compute copy/blit) ---
-    // Modeled with a UINT-sampled OpTypeImage, Format=Unknown, Sampled=2 (storage), so OpImageRead/Write
-    // move raw 32-bit texels — an exact fit for our untyped-VGPR model (any real format reinterpretation
-    // lives in the bound image view / T# descriptor). Requires the read/write-without-format caps.
+    // Integer/packed formats use a UINT-sampled OpTypeImage and the host converts between raw VGPR
+    // channels and guest texels. Four-channel UNORM8/FLOAT16/FLOAT32 use a FLOAT-sampled image instead:
+    // Vulkan then performs exactly the descriptor's normalized/float load-store conversion and the
+    // host can stage the guest texels at their native width. VGPRs remain raw u32 bits; float image
+    // components are bitcast at this boundary. Both paths use Format=Unknown and therefore require
+    // the read/write-without-format capabilities.
     uint32_t t_v4u_cache = 0;
     uint32_t t_v4u() { if (!t_v4u_cache) { t_v4u_cache = id(); put(types, Op_TypeVector, {t_v4u_cache, t_u32, 4}); } return t_v4u_cache; }
     uint32_t t_v3u_c = 0;   // integer coordinate vector type (uvec3); 2D reuses the shared t_v2u()
-    std::unordered_map<uint32_t, uint32_t> stg_img_type;   // (dim | arrayed<<8 | ms<<9) -> OpTypeImage id
+    std::unordered_map<uint32_t, uint32_t> stg_img_type;   // (dim | arrayed<<8 | ms<<9 | float<<10) -> type
     std::unordered_map<uint32_t, uint32_t> stg_img_var;    // binding -> storage-image OpVariable id
+    std::unordered_map<uint32_t, bool> stg_img_float;      // binding -> float (rather than uint) texels
     bool declared_read_wo_fmt = false, declared_write_wo_fmt = false, declared_sampled1d = false, declared_ms = false, declared_msarray = false;
-    static uint32_t stg_key(uint32_t dim, bool arrayed, bool ms) { return dim | (arrayed ? 0x100u : 0u) | (ms ? 0x200u : 0u); }
-    // Declare (idempotently) a uint storage image of SPIR-V `dim` (arrayed = layer in the coord; ms =
-    // multisampled) at set 0, `binding`. Each (dim,arrayed,ms) is a distinct OpTypeImage, keyed separately.
-    void declare_storage_image(uint32_t binding, uint32_t dim, bool arrayed = false, bool ms = false) {
+    static uint32_t stg_key(uint32_t dim, bool arrayed, bool ms, bool float_texel) {
+        return dim | (arrayed ? 0x100u : 0u) | (ms ? 0x200u : 0u) |
+               (float_texel ? 0x400u : 0u);
+    }
+    // Declare (idempotently) a storage image of SPIR-V `dim` (arrayed = layer in the coord; ms =
+    // multisampled) at set 0, `binding`. Float and uint sampled types are keyed separately.
+    void declare_storage_image(uint32_t binding, uint32_t dim, bool arrayed = false,
+                               bool ms = false, bool float_texel = false) {
         if (dim == Dim_1D && !declared_sampled1d) {   // SPIR-V: Dim=1D needs Sampled1D; storage 1D also needs Image1D
             put(caps, Op_Capability, {Cap_Sampled1D});
             put(caps, Op_Capability, {Cap_Image1D});
@@ -1134,10 +1177,12 @@ struct SpirvCompute {
         }
         if (ms && !declared_ms) { put(caps, Op_Capability, {Cap_StorageImageMultisample}); declared_ms = true; }
         if (ms && arrayed && !declared_msarray) { put(caps, Op_Capability, {Cap_ImageMSArray}); declared_msarray = true; }
-        uint32_t key = stg_key(dim, arrayed, ms);
+        uint32_t key = stg_key(dim, arrayed, ms, float_texel);
         if (!stg_img_type.count(key)) {
             uint32_t ti = id();
-            put(types, Op_TypeImage, {ti, t_u32, dim, 0, arrayed ? 1u : 0u, ms ? 1u : 0u, Img_Sampled_Storage, ImgFmt_Unknown});
+            put(types, Op_TypeImage, {ti, float_texel ? t_f32 : t_u32, dim, 0,
+                                      arrayed ? 1u : 0u, ms ? 1u : 0u,
+                                      Img_Sampled_Storage, ImgFmt_Unknown});
             stg_img_type[key] = ti;
         }
         if (stg_img_var.count(binding)) return;
@@ -1146,8 +1191,11 @@ struct SpirvCompute {
         put(deco, Op_Decorate, {v, Dec_DescriptorSet, desc_set});
         put(deco, Op_Decorate, {v, Dec_Binding, binding});
         stg_img_var[binding] = v;
+        stg_img_float[binding] = float_texel;
     }
-    uint32_t stg_img_id(uint32_t dim, bool arrayed, bool ms = false) { return stg_img_type[stg_key(dim, arrayed, ms)]; }
+    uint32_t stg_img_id(uint32_t dim, bool arrayed, bool ms, bool float_texel) {
+        return stg_img_type[stg_key(dim, arrayed, ms, float_texel)];
+    }
     // Build the integer coordinate operand from `n` raw-bit VGPR coords (u32 texel indices, incl. the
     // array layer as the last component for arrayed images). n=1 -> scalar u32; 2 -> uvec2; 3 -> uvec3.
     uint32_t stg_coord(uint32_t n, const uint32_t* c) {
@@ -1175,12 +1223,20 @@ struct SpirvCompute {
     void image_read(uint32_t binding, uint32_t dim, bool arrayed, uint32_t ncoord, const uint32_t* coords,
                     uint32_t out[4], bool ms = false, uint32_t sample = 0) {
         if (!declared_read_wo_fmt) { put(caps, Op_Capability, {Cap_StorageImageReadWithoutFormat}); declared_read_wo_fmt = true; }
-        uint32_t img   = id(); put(code, Op_Load,      {stg_img_id(dim, arrayed, ms), img, stg_img_var[binding]});
+        const bool float_texel = stg_img_float[binding];
+        const uint32_t vector_type = float_texel ? t_v4f : t_v4u();
+        uint32_t img   = id(); put(code, Op_Load,
+                                   {stg_img_id(dim, arrayed, ms, float_texel), img,
+                                    stg_img_var[binding]});
         uint32_t coord = stg_coord(ncoord, coords);
         uint32_t res   = id();
-        if (ms) put(code, Op_ImageRead, {t_v4u(), res, img, coord, ImgOp_Sample, sample});  // MSAA: read sample `sample`
-        else    put(code, Op_ImageRead, {t_v4u(), res, img, coord});
-        for (uint32_t c = 0; c < 4; c++) { uint32_t e = id(); put(code, Op_CompositeExtract, {t_u32, e, res, c}); out[c] = e; }
+        if (ms) put(code, Op_ImageRead, {vector_type, res, img, coord, ImgOp_Sample, sample});
+        else    put(code, Op_ImageRead, {vector_type, res, img, coord});
+        for (uint32_t c = 0; c < 4; c++) {
+            uint32_t e = id();
+            put(code, Op_CompositeExtract, {float_texel ? t_f32 : t_u32, e, res, c});
+            out[c] = float_texel ? bcu(e) : e;
+        }
     }
     // image_store: OpImageWrite raw-bit VGPR components vals[0..3] as a uvec4 texel to the storage image.
     // When `predicated` (narrowed EXEC), the write is wrapped in a selection merge on `pred` (the per-lane
@@ -1190,9 +1246,18 @@ struct SpirvCompute {
     void image_write(uint32_t binding, uint32_t dim, bool arrayed, uint32_t ncoord, const uint32_t* coords,
                      const uint32_t vals[4], bool predicated = false, uint32_t pred = 0) {
         if (!declared_write_wo_fmt) { put(caps, Op_Capability, {Cap_StorageImageWriteWithoutFormat}); declared_write_wo_fmt = true; }
-        uint32_t img   = id(); put(code, Op_Load, {stg_img_id(dim, arrayed), img, stg_img_var[binding]});
+        const bool float_texel = stg_img_float[binding];
+        uint32_t img   = id(); put(code, Op_Load,
+                                   {stg_img_id(dim, arrayed, false, float_texel), img,
+                                    stg_img_var[binding]});
         uint32_t coord = stg_coord(ncoord, coords);
-        uint32_t texel = id(); put(code, Op_CompositeConstruct, {t_v4u(), texel, vals[0], vals[1], vals[2], vals[3]});
+        uint32_t texel = id();
+        if (float_texel)
+            put(code, Op_CompositeConstruct,
+                {t_v4f, texel, bcf(vals[0]), bcf(vals[1]), bcf(vals[2]), bcf(vals[3])});
+        else
+            put(code, Op_CompositeConstruct,
+                {t_v4u(), texel, vals[0], vals[1], vals[2], vals[3]});
         if (!predicated) { put(code, Op_ImageWrite, {img, coord, texel}); return; }
         uint32_t then = id(), merge = id();
         put(code, Op_SelectionMerge, {merge, 0});
@@ -1486,6 +1551,39 @@ struct SpirvCompute {
         uint32_t result = id(); put(code, Op_Load, {t_u32, result, result_ptr});
         barrier();
         return result;
+    }
+    uint32_t native_wave_append(uint32_t lds_idx, uint32_t active_bool,
+                                uint32_t consume) {
+        if (!native_subgroup_size) return 0;
+        (void)subgroup_local_id();
+        if (!declared_subgroup_arithmetic) {
+            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
+            declared_subgroup_arithmetic = true;
+        }
+        const uint32_t contribution = sel(active_bool, uconst(1), uconst(0));
+        uint32_t count = id();
+        put(code, Op_GroupNonUniformIAdd,
+            {t_u32, count, uconst(Scope_Subgroup), GroupOp_Reduce, contribution});
+        uint32_t prefix = id();
+        put(code, Op_GroupNonUniformIAdd,
+            {t_u32, prefix, uconst(Scope_Subgroup), GroupOp_ExclusiveScan, contribution});
+        const uint32_t elected = land(active_bool, ucmp(Op_IEqual, prefix, uconst(0)));
+        const uint32_t entry = cur_block, leader = id(), merge = id();
+        emit_selmerge(merge);
+        emit_condbranch(elected, leader, merge);
+        emit_label(leader);
+        const uint32_t delta = sel(consume, ibin(Op_ISub, uconst(0), count), count);
+        const uint32_t leader_old = lds_atomic_rtn(
+            Op_AtomicIAdd, lds_idx, delta, false, btrue(), uconst(0));
+        const uint32_t leader_end = cur_block;
+        emit_branch(merge);
+        emit_label(merge);
+        const uint32_t local_old = emit_phi_2way(
+            t_u32, leader_old, leader_end, uconst(0), entry);
+        uint32_t old = id();
+        put(code, Op_GroupNonUniformIAdd,
+            {t_u32, old, uconst(Scope_Subgroup), GroupOp_Reduce, local_old});
+        return old;
     }
     uint32_t b_iadd(uint32_t a, uint32_t b_) { uint32_t r = id(); put(code, Op_IAdd, {t_u32, r, a, b_}); return r; }
     // Declare the two scalar-memory constant/vertex buffers (bindings 2 & 3) that SMEM / buffer_load_
@@ -6179,7 +6277,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     default: ok = false; return true;   // cube storage images deferred
                 }
                 if (ms && is_st) { ok = false; return true; }   // per-sample MSAA store not modeled (resolve shaders read)
-                b.declare_storage_image(res->binding, dim, arrayed, ms);
+                const uint32_t components = res->num_components ? res->num_components : 1;
+                const bool ordinary_2d = res->img_dim == 1 && res->depth == 1 &&
+                                         !res->depth_compare;
+                const bool native_float = ordinary_2d && native_float_storage_image_supported(
+                    res->format, components, res->srgb,
+                    (b.native_storage_format_support &
+                     native_storage_format_support_bit(res->format, components)) != 0);
+                b.declare_storage_image(res->binding, dim, arrayed, ms, native_float);
                 // Coordinate VGPR per axis. Non-NSA (len==2): consecutive from VADDR (src[0]). NSA (len>2):
                 // split across the extra address dwords — coord0 = VADDR, coord k>=1 = byte (k-1) of
                 // words[2..3] (dword2 = addr1..4, dword3 = addr5..8). Layout verified via llvm-mc gfx1010.
@@ -7115,7 +7220,8 @@ bool emit_compute_cfg_state_machine(
     const uint32_t padded_lanes = wave_count * b.wave_size;
     const uint32_t wave_result_base = padded_lanes;
     const uint32_t group_active_slot = wave_result_base + wave_count;
-    b.declare_cfg_scratch(group_active_slot + 1);
+    if (!b.native_subgroup_size)
+        b.declare_cfg_scratch(group_active_slot + 1);
 
     // Discover every scalar pair that lives in the per-lane mask domain.  Besides defining the
     // dispatcher variables below, this identifies s_cmp_{eq,lg}_u64 mask,0: its SCC result is a
@@ -7240,12 +7346,37 @@ bool emit_compute_cfg_state_machine(
     // path. Entry-rooted reachability excludes writes in dead blocks, while backedges participate in
     // the fixed point and prevent stale fallback on later loop iterations.
     std::vector<std::unordered_set<int>> scalar_writes(starts.size());
+    std::vector<std::set<int>> vector_writes(starts.size());
+    std::vector<std::set<int>> vector_reads(starts.size());
     std::vector<std::vector<uint32_t>> successors(starts.size());
     for (uint32_t block = 0; block < starts.size(); ++block) {
         const uint32_t lo = starts[block];
         const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
+        std::set<int> ignored_scalar_writes;
+        loop_written_regs(ins, lo, hi, vector_writes[block], ignored_scalar_writes);
+        vector_reads[block] = vector_writes[block];
+        bool reads_dynamic_vector_range = false;
         for (const auto& in : ins) {
             if (in.pc < lo || in.pc >= hi) continue;
+            for (uint32_t source = 0; source < in.n_src; ++source) {
+                if (in.src[source].kind == OperandKind::VGPR) {
+                    // DS read/write2 and 64/96/128-bit transfers consume consecutive VGPRs that the
+                    // packet represents by their base register. Four is a safe architectural upper
+                    // bound for the forms accepted by emit_alu.
+                    const uint32_t words = in.fmt == Rdna2Format::DS ? 4u : 1u;
+                    for (uint32_t word = 0; word < words; ++word)
+                        vector_reads[block].insert(
+                            in.src[source].value + static_cast<int>(word));
+                }
+            }
+            // Buffer/image packets have format- and dmask-dependent implicit register ranges (and
+            // stores encode VDATA in the decoded destination field). Relative VGPR reads similarly
+            // select from a runtime range. Keep those uncommon blocks fully conservative; ordinary
+            // ALU/branch blocks can still avoid loading the rest of the vector register file.
+            reads_dynamic_vector_range |=
+                in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF ||
+                in.fmt == Rdna2Format::MIMG || in.fmt == Rdna2Format::FLAT ||
+                (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43);
             for_each_scalar_write(in, [&](int base, uint32_t width) {
                 for (uint32_t word = 0; word < width; ++word)
                     scalar_writes[block].insert(base + static_cast<int>(word));
@@ -7263,7 +7394,9 @@ bool emit_compute_cfg_state_machine(
         }
         auto add_successor = [&](uint32_t pc) {
             auto next = block_for_pc.find(pc);
-            if (pc <= end_pc && next != block_for_pc.end())
+            if (pc <= end_pc && next != block_for_pc.end() &&
+                std::find(successors[block].begin(), successors[block].end(), next->second) ==
+                    successors[block].end())
                 successors[block].push_back(next->second);
         };
         if (!terminator) {
@@ -7273,6 +7406,7 @@ bool emit_compute_cfg_state_machine(
             if (terminator->opcode != 0x02)
                 add_successor(terminator->pc + terminator->len_dwords);
         }
+        if (reads_dynamic_vector_range) vector_reads[block] = vregs;
     }
     std::vector<std::unordered_set<int>> scalar_may_write_in(starts.size());
     std::vector<bool> scalar_reachable(starts.size(), false);
@@ -7296,6 +7430,60 @@ bool emit_compute_cfg_state_machine(
                 scalar_may_write_in[successor].insert(out.begin(), out.end());
                 provenance_changed |= scalar_may_write_in[successor].size() != before;
             }
+        }
+    }
+
+    // The native exact-wave path does not need to return to a synchronized common phase after a
+    // plain unconditional edge.  Fuse maximal forward chains whose successor has no other
+    // predecessor; the successor cannot be entered from outside the chain, so keeping its register
+    // state in SSA is equivalent to a dispatcher save/reload without duplicating guest code.  Keep
+    // backward edges as dispatcher iterations (they form loops), and end a chain at every wave op
+    // that must execute as one uniform switch case.
+    std::vector<std::vector<uint32_t>> dispatch_blocks;
+    std::vector<uint32_t> dispatch_for_block(starts.size(), UINT32_MAX);
+    std::vector<uint32_t> predecessor_count(starts.size(), 0);
+    for (const auto& edges : successors)
+        for (uint32_t successor : edges)
+            if (successor < predecessor_count.size()) ++predecessor_count[successor];
+    std::vector<bool> synchronized_block(starts.size(), false);
+    for (uint32_t block = 0; block < starts.size(); ++block) {
+        const uint32_t lo = starts[block];
+        const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
+        for (const auto& in : ins) {
+            if (in.pc < lo || in.pc >= hi) continue;
+            synchronized_block[block] = synchronized_block[block] ||
+                mbcnt_event_for_pc.contains(in.pc) || append_event_for_pc.contains(in.pc) ||
+                mask_zero_compare_source(in) >= 0;
+        }
+    }
+    for (uint32_t first = 0; first < starts.size(); ++first) {
+        if (dispatch_for_block[first] != UINT32_MAX) continue;
+        const uint32_t dispatch = static_cast<uint32_t>(dispatch_blocks.size());
+        dispatch_blocks.push_back({});
+        uint32_t block = first;
+        while (true) {
+            dispatch_for_block[block] = dispatch;
+            dispatch_blocks.back().push_back(block);
+            if (!b.native_subgroup_size || synchronized_block[block] ||
+                successors[block].size() != 1) break;
+            const uint32_t successor = successors[block].front();
+            if (successor <= block || predecessor_count[successor] != 1 ||
+                dispatch_for_block[successor] != UINT32_MAX) break;
+            block = successor;
+        }
+    }
+
+    std::vector<std::set<int>> dispatch_vector_reads(dispatch_blocks.size());
+    std::vector<std::set<int>> dispatch_vector_writes(dispatch_blocks.size());
+    std::vector<std::unordered_set<int>> dispatch_scalar_writes(dispatch_blocks.size());
+    for (uint32_t dispatch = 0; dispatch < dispatch_blocks.size(); ++dispatch) {
+        for (uint32_t block : dispatch_blocks[dispatch]) {
+            dispatch_vector_reads[dispatch].insert(
+                vector_reads[block].begin(), vector_reads[block].end());
+            dispatch_vector_writes[dispatch].insert(
+                vector_writes[block].begin(), vector_writes[block].end());
+            dispatch_scalar_writes[dispatch].insert(
+                scalar_writes[block].begin(), scalar_writes[block].end());
         }
     }
 
@@ -7395,10 +7583,14 @@ bool emit_compute_cfg_state_machine(
     b.store_function(pc_var, b.uconst(0));
     b.store_function(active_var, yes);
 
-    auto load_state = [&]() {
+    auto load_state = [&](uint32_t dispatch = UINT32_MAX) {
         RegState state;
         state.sreg_input = initial.sreg_input;
-        for (const auto& kv : vv) state.vreg[kv.first] = b.load_function(b.t_u32, kv.second);
+        for (const auto& kv : vv) {
+            if (dispatch != UINT32_MAX &&
+                !dispatch_vector_reads[dispatch].contains(kv.first)) continue;
+            state.vreg[kv.first] = b.load_function(b.t_u32, kv.second);
+        }
         for (const auto& kv : sv) state.sreg[kv.first] = b.load_function(b.t_u32, kv.second);
         for (const auto& kv : mv) {
             state.sreg_bool[kv.first] = b.load_function(b.t_bool, kv.second);
@@ -7418,16 +7610,27 @@ bool emit_compute_cfg_state_machine(
         state.smem_pcrel_tables = initial.smem_pcrel_tables;
         return state;
     };
-    auto save_state = [&](const RegState& state) {
+    auto save_state = [&](const RegState& state, uint32_t dispatch) {
+        // A dispatcher case starts from the persistent register file, executes exactly one guest
+        // basic block, then returns to the common loop.  Only registers WRITTEN by that block need
+        // to be copied back.  Saving every tracked VGPR/SGPR at every edge generated thousands of
+        // redundant Function-memory stores for large kernels (Astro Bot's title compute shader has
+        // around one hundred tracked registers and dozens of cases), creating severe register
+        // pressure and scratch traffic in the host driver.  The conservative static writer sets
+        // include multi-register loads and secondary scalar destinations; unchanged variables keep
+        // the value loaded at the preceding dispatcher edge.
         for (const auto& kv : vv) {
+            if (!dispatch_vector_writes[dispatch].contains(kv.first)) continue;
             auto it = state.vreg.find(kv.first);
             b.store_function(kv.second, it == state.vreg.end() ? zero : it->second);
         }
         for (const auto& kv : sv) {
+            if (!dispatch_scalar_writes[dispatch].contains(kv.first)) continue;
             auto it = state.sreg.find(kv.first);
             b.store_function(kv.second, it == state.sreg.end() ? zero : it->second);
         }
         for (const auto& kv : mv) {
+            if (!dispatch_scalar_writes[dispatch].contains(kv.first)) continue;
             auto it = state.sreg_bool.find(kv.first);
             b.store_function(kv.second, it == state.sreg_bool.end() ? no : it->second);
         }
@@ -7458,9 +7661,9 @@ bool emit_compute_cfg_state_machine(
 
     const uint32_t loop_header = b.id(), switch_header = b.id(), switch_merge = b.id();
     const uint32_t loop_continue = b.id(), loop_merge = b.id(), fallback = b.id();
-    std::vector<uint32_t> labels(starts.size());
+    std::vector<uint32_t> labels(dispatch_blocks.size());
     std::vector<std::pair<uint32_t, uint32_t>> switch_cases;
-    for (uint32_t i = 0; i < starts.size(); ++i) {
+    for (uint32_t i = 0; i < dispatch_blocks.size(); ++i) {
         labels[i] = b.id();
         switch_cases.emplace_back(i, labels[i]);
     }
@@ -7468,25 +7671,32 @@ bool emit_compute_cfg_state_machine(
     b.emit_label(loop_header);
     // Every live hardware wave executes one guest basic block per dispatcher iteration. Inactive
     // invocations remain in the loop as synchronization participants until all waves finish.
-    b.store_function(vote_pending_var, no);
-    b.store_function(vote_value_var, no);
-    b.store_function(vote_invert_var, no);
-    b.store_function(vote_to_scc_var, no);
-    b.store_function(vote_taken_var, zero);
-    b.store_function(vote_next_var, zero);
-    b.store_function(mbcnt_pending_var, no);
-    b.store_function(mbcnt_mask_var, no);
-    b.store_function(mbcnt_low_var, no);
-    b.store_function(mbcnt_write_var, no);
-    b.store_function(mbcnt_event_var, zero);
-    b.store_function(mbcnt_acc_var, zero);
-    b.store_function(mbcnt_dst_var, zero);
-    b.store_function(append_pending_var, no);
-    b.store_function(append_active_var, no);
-    b.store_function(append_event_var, zero);
-    b.store_function(append_consume_var, no);
-    b.store_function(append_idx_var, zero);
-    b.store_function(append_dst_var, zero);
+    // With an exact native subgroup, one host subgroup is one guest wave and its scalar PC is
+    // uniform.  Cross-lane operations can therefore execute directly in their switch case.  The
+    // old publish/merge phase remains necessary only for the portable workgroup-scratch fallback;
+    // resetting all of its mailboxes on every native dispatcher iteration was a surprisingly large
+    // SALU/function-memory tax for branch-heavy kernels.
+    if (!b.native_subgroup_size) {
+        b.store_function(vote_pending_var, no);
+        b.store_function(vote_value_var, no);
+        b.store_function(vote_invert_var, no);
+        b.store_function(vote_to_scc_var, no);
+        b.store_function(vote_taken_var, zero);
+        b.store_function(vote_next_var, zero);
+        b.store_function(mbcnt_pending_var, no);
+        b.store_function(mbcnt_mask_var, no);
+        b.store_function(mbcnt_low_var, no);
+        b.store_function(mbcnt_write_var, no);
+        b.store_function(mbcnt_event_var, zero);
+        b.store_function(mbcnt_acc_var, zero);
+        b.store_function(mbcnt_dst_var, zero);
+        b.store_function(append_pending_var, no);
+        b.store_function(append_active_var, no);
+        b.store_function(append_event_var, zero);
+        b.store_function(append_consume_var, no);
+        b.store_function(append_idx_var, zero);
+        b.store_function(append_dst_var, zero);
+    }
     b.emit_loopmerge(loop_merge, loop_continue);
     b.emit_branch(switch_header);
     b.emit_label(switch_header);
@@ -7498,14 +7708,13 @@ bool emit_compute_cfg_state_machine(
     auto set_next = [&](uint32_t pc) {
         auto found = block_for_pc.find(pc);
         if (pc > end_pc || found == block_for_pc.end()) b.store_function(active_var, no);
-        else b.store_function(pc_var, b.uconst(found->second));
+        else b.store_function(pc_var, b.uconst(dispatch_for_block[found->second]));
     };
-    for (uint32_t block = 0; block < starts.size(); ++block) {
-        const uint32_t lo = starts[block];
-        const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
-        b.emit_label(labels[block]);
-        RegState state = load_state();
-        state.sreg_written = scalar_may_write_in[block];
+    for (uint32_t dispatch = 0; dispatch < dispatch_blocks.size(); ++dispatch) {
+        const uint32_t entry_block = dispatch_blocks[dispatch].front();
+        b.emit_label(labels[dispatch]);
+        RegState state = load_state(dispatch);
+        state.sreg_written = scalar_may_write_in[entry_block];
         for (int reg : state.sreg_written) state.sreg_input.erase(reg);
         if (!direct_descriptor_sregs.empty()) {
             for (int reg : direct_descriptor_sregs)
@@ -7515,40 +7724,64 @@ bool emit_compute_cfg_state_machine(
         const Rdna2Inst* mbcnt = nullptr;
         const Rdna2Inst* append = nullptr;
         const Rdna2Inst* mask_compare = nullptr;
-        for (const auto& in : ins) {
-            if (in.pc < lo || in.pc >= hi) continue;
-            if (in.is_end || (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 &&
-                              in.opcode <= 0x09 && in.opcode != 0x03)) {
-                terminator = &in;
-                break;
+        const uint32_t final_block = dispatch_blocks[dispatch].back();
+        const uint32_t final_hi = final_block + 1 < starts.size()
+            ? starts[final_block + 1] : UINT32_MAX;
+        for (size_t member = 0; member < dispatch_blocks[dispatch].size(); ++member) {
+            const uint32_t block = dispatch_blocks[dispatch][member];
+            const uint32_t lo = starts[block];
+            const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
+            const Rdna2Inst* block_terminator = nullptr;
+            const Rdna2Inst* block_mbcnt = nullptr;
+            const Rdna2Inst* block_append = nullptr;
+            const Rdna2Inst* block_mask_compare = nullptr;
+            for (const auto& in : ins) {
+                if (in.pc < lo || in.pc >= hi) continue;
+                if (in.is_end || (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 &&
+                                  in.opcode <= 0x09 && in.opcode != 0x03)) {
+                    block_terminator = &in;
+                    break;
+                }
+                if (in.fmt == Rdna2Format::VOP3 &&
+                    (in.opcode == 0x365 || in.opcode == 0x366)) {
+                    block_mbcnt = &in;
+                    break;
+                }
+                if (in.fmt == Rdna2Format::DS && (in.opcode == 0x3d || in.opcode == 0x3e)) {
+                    block_append = &in;
+                    break;
+                }
+                if (mask_zero_compare_source(in) >= 0) {
+                    block_mask_compare = &in;
+                    break;
+                }
+                if (in.fmt == Rdna2Format::EXP) {
+                    if (!exp_fn(in)) return false;
+                    continue;
+                }
+                bool ok = true;
+                const bool handled = emit_alu(b, state, in, ok, allow_exec_update, &safe,
+                                              allow_smem, rt, /*allow_wave*/false);
+                if (handled && ok) record_scalar_write(state, in);
+                if (!handled || !ok) {
+                    if (getenv("PROSPER_DBG"))
+                        std::fprintf(stderr, "[cfg-recompile-reject] pc=%u fmt=%d op=0x%x\n",
+                                     in.pc, static_cast<int>(in.fmt), in.opcode);
+                    return false;
+                }
             }
-            if (in.fmt == Rdna2Format::VOP3 &&
-                (in.opcode == 0x365 || in.opcode == 0x366)) {
-                mbcnt = &in;
-                break;
+            const bool last = member + 1 == dispatch_blocks[dispatch].size();
+            if (!last) {
+                // Group construction admits only one-successor plain blocks before the tail.
+                if (block_mbcnt || block_append || block_mask_compare ||
+                    (block_terminator && (block_terminator->is_end ||
+                                          block_terminator->opcode != 0x02))) return false;
+                continue; // consume an unconditional guest branch without a dispatcher round-trip
             }
-            if (in.fmt == Rdna2Format::DS && (in.opcode == 0x3d || in.opcode == 0x3e)) {
-                append = &in;
-                break;
-            }
-            if (mask_zero_compare_source(in) >= 0) {
-                mask_compare = &in;
-                break;
-            }
-            if (in.fmt == Rdna2Format::EXP) {
-                if (!exp_fn(in)) return false;
-                continue;
-            }
-            bool ok = true;
-            const bool handled = emit_alu(b, state, in, ok, allow_exec_update, &safe,
-                                          allow_smem, rt, /*allow_wave*/false);
-            if (handled && ok) record_scalar_write(state, in);
-            if (!handled || !ok) {
-                if (getenv("PROSPER_DBG"))
-                    std::fprintf(stderr, "[cfg-recompile-reject] pc=%u fmt=%d op=0x%x\n",
-                                 in.pc, static_cast<int>(in.fmt), in.opcode);
-                return false;
-            }
+            terminator = block_terminator;
+            mbcnt = block_mbcnt;
+            append = block_append;
+            mask_compare = block_mask_compare;
         }
         if (mbcnt) {
             bool operand_ok = true;
@@ -7557,15 +7790,32 @@ bool emit_compute_cfg_state_machine(
             const uint32_t acc = operand_bits(b, state, *mbcnt, mbcnt->src[1], &operand_ok);
             const auto event = mbcnt_event_for_pc.find(mbcnt->pc);
             if (!mask || !operand_ok || event == mbcnt_event_for_pc.end()) return false;
-            b.store_function(mbcnt_pending_var, yes);
-            b.store_function(mbcnt_mask_var, mask);
-            b.store_function(mbcnt_low_var, mbcnt->opcode == 0x365 ? yes : no);
-            // load_state conservatively marks EXEC narrowed. Writing under the current per-lane EXEC
-            // is equivalent for a known-full mask and preserves inactive VGPR lanes for divergent code.
-            b.store_function(mbcnt_write_var, state.exec);
-            b.store_function(mbcnt_event_var, b.uconst(event->second));
-            b.store_function(mbcnt_acc_var, acc);
-            b.store_function(mbcnt_dst_var, b.uconst(static_cast<uint32_t>(mbcnt->dst.value)));
+            if (b.native_subgroup_size) {
+                // The switch selector is scalar within this exact-size subgroup, so every guest
+                // lane reaches the same case.  Execute the wave prefix count here and retain masked-
+                // off lanes exactly as an RDNA VGPR write does, instead of dynamically selecting a
+                // destination across the entire persistent register file in the common phase.
+                const uint32_t result = b.native_compute_mbcnt(
+                    mask, acc, mbcnt->opcode == 0x365 ? yes : no);
+                const int dst = mbcnt->dst.value;
+                const auto old = state.vreg.find(dst);
+                state.vreg[dst] = b.sel(
+                    state.exec, result, old == state.vreg.end() ? zero : old->second);
+                for (auto& vg : state.vgpr_lane_slots)
+                    if (vg.first == dst) for (auto& slot : vg.second) slot.second = zero;
+                for (auto& vg : state.vgpr_lane_mask_slots)
+                    if (vg.first == dst) for (auto& slot : vg.second) slot.second = no;
+            } else {
+                b.store_function(mbcnt_pending_var, yes);
+                b.store_function(mbcnt_mask_var, mask);
+                b.store_function(mbcnt_low_var, mbcnt->opcode == 0x365 ? yes : no);
+                // load_state conservatively marks EXEC narrowed. Writing under the current per-lane EXEC
+                // is equivalent for a known-full mask and preserves inactive VGPR lanes for divergent code.
+                b.store_function(mbcnt_write_var, state.exec);
+                b.store_function(mbcnt_event_var, b.uconst(event->second));
+                b.store_function(mbcnt_acc_var, acc);
+                b.store_function(mbcnt_dst_var, b.uconst(static_cast<uint32_t>(mbcnt->dst.value)));
+            }
         }
         if (append) {
             const auto m0 = state.sreg.find(124);
@@ -7574,27 +7824,46 @@ bool emit_compute_cfg_state_machine(
             b.declare_lds();
             const uint32_t base = b.ibin(Op_BitwiseAnd, m0->second, b.uconst(0xffffu));
             const uint32_t byte_addr = b.ibin(Op_IAdd, base, b.uconst(append->literal));
-            b.store_function(append_pending_var, yes);
-            b.store_function(append_active_var, state.exec);
-            b.store_function(append_event_var, b.uconst(event->second));
-            b.store_function(append_consume_var, append->opcode == 0x3d ? yes : no);
-            b.store_function(append_idx_var,
-                b.ibin(Op_ShiftRightLogical, byte_addr, b.uconst(2)));
-            b.store_function(append_dst_var,
-                b.uconst(static_cast<uint32_t>(append->dst.value)));
+            const uint32_t idx = b.ibin(Op_ShiftRightLogical, byte_addr, b.uconst(2));
+            if (b.native_subgroup_size) {
+                const uint32_t result = b.native_wave_append(
+                    idx, state.exec, append->opcode == 0x3d ? yes : no);
+                const int dst = append->dst.value;
+                const auto old = state.vreg.find(dst);
+                state.vreg[dst] = b.sel(
+                    state.exec, result, old == state.vreg.end() ? zero : old->second);
+                for (auto& vg : state.vgpr_lane_slots)
+                    if (vg.first == dst) for (auto& slot : vg.second) slot.second = zero;
+                for (auto& vg : state.vgpr_lane_mask_slots)
+                    if (vg.first == dst) for (auto& slot : vg.second) slot.second = no;
+            } else {
+                b.store_function(append_pending_var, yes);
+                b.store_function(append_active_var, state.exec);
+                b.store_function(append_event_var, b.uconst(event->second));
+                b.store_function(append_consume_var, append->opcode == 0x3d ? yes : no);
+                b.store_function(append_idx_var, idx);
+                b.store_function(append_dst_var,
+                    b.uconst(static_cast<uint32_t>(append->dst.value)));
+            }
         }
         if (mask_compare) {
             const int source = mask_zero_compare_source(*mask_compare);
             const auto value = state.sreg_bool.find(source);
             if (value == state.sreg_bool.end()) return false;
-            b.store_function(vote_pending_var, yes);
-            b.store_function(vote_value_var, value->second);
-            // EQ mask,0 means !any(mask); LG mask,0 means any(mask).
-            b.store_function(vote_invert_var,
-                mask_compare->opcode == 0x12 ? yes : no);
-            b.store_function(vote_to_scc_var, yes);
+            if (b.native_subgroup_size) {
+                const uint32_t wave_any = b.native_wave_any(value->second);
+                // EQ mask,0 means !any(mask); LG mask,0 means any(mask).
+                state.scc = mask_compare->opcode == 0x12
+                    ? b.logical_not(wave_any) : wave_any;
+            } else {
+                b.store_function(vote_pending_var, yes);
+                b.store_function(vote_value_var, value->second);
+                b.store_function(vote_invert_var,
+                    mask_compare->opcode == 0x12 ? yes : no);
+                b.store_function(vote_to_scc_var, yes);
+            }
         }
-        save_state(state);
+        save_state(state, dispatch);
         if (mbcnt) {
             set_next(mbcnt->pc + mbcnt->len_dwords);
         } else if (append) {
@@ -7602,7 +7871,7 @@ bool emit_compute_cfg_state_machine(
         } else if (mask_compare) {
             set_next(mask_compare->pc + mask_compare->len_dwords);
         } else if (!terminator) {
-            set_next(hi);
+            set_next(final_hi);
         } else if (terminator->is_end) {
             b.store_function(active_var, no);
         } else if (terminator->opcode == 0x02) {
@@ -7624,17 +7893,27 @@ bool emit_compute_cfg_state_machine(
             const uint32_t fallthrough = terminator->pc + terminator->len_dwords;
             auto taken = block_for_pc.find(target), next = block_for_pc.find(fallthrough);
             if (taken == block_for_pc.end() || next == block_for_pc.end()) return false;
+            const uint32_t taken_dispatch = dispatch_for_block[taken->second];
+            const uint32_t next_dispatch = dispatch_for_block[next->second];
             if (terminator->opcode == 0x04 || terminator->opcode == 0x05) {
                 b.store_function(pc_var,
-                    b.sel(condition, b.uconst(taken->second), b.uconst(next->second)));
+                    b.sel(condition, b.uconst(taken_dispatch), b.uconst(next_dispatch)));
+            } else if (b.native_subgroup_size) {
+                const uint32_t wave_any = b.native_wave_any(
+                    terminator->opcode <= 0x07 ? state.vcc : state.exec);
+                const uint32_t wave_condition =
+                    terminator->opcode == 0x06 || terminator->opcode == 0x08
+                        ? b.logical_not(wave_any) : wave_any;
+                b.store_function(pc_var,
+                    b.sel(wave_condition, b.uconst(taken_dispatch), b.uconst(next_dispatch)));
             } else {
                 b.store_function(vote_pending_var, yes);
                 b.store_function(vote_value_var,
                     terminator->opcode <= 0x07 ? state.vcc : state.exec);
                 b.store_function(vote_invert_var,
                     terminator->opcode == 0x06 || terminator->opcode == 0x08 ? yes : no);
-                b.store_function(vote_taken_var, b.uconst(taken->second));
-                b.store_function(vote_next_var, b.uconst(next->second));
+                b.store_function(vote_taken_var, b.uconst(taken_dispatch));
+                b.store_function(vote_next_var, b.uconst(next_dispatch));
             }
         }
         b.emit_branch(switch_merge);
@@ -7646,6 +7925,14 @@ bool emit_compute_cfg_state_machine(
     b.emit_branch(loop_continue);
     b.emit_label(loop_continue);
 
+    if (b.native_subgroup_size) {
+        // Native wave operations and votes were already resolved in the selected case.  PC and
+        // ACTIVE are scalar guest-wave state, so every invocation in this exact-size subgroup has
+        // the same value; another subgroup in the workgroup may still leave independently because
+        // this path contains no workgroup barriers.
+        b.emit_condbranch(b.load_function(b.t_bool, active_var),
+                          loop_header, loop_merge);
+    } else {
     // MBCNT common phase. Cases publish an event-tagged mask bit and accumulator, but never emit a
     // barrier themselves. Every invocation—including ended waves and lanes currently at a different
     // guest block—therefore executes these two barriers in identical structured control flow. Event
@@ -7891,6 +8178,7 @@ bool emit_compute_cfg_state_machine(
     const uint32_t group_active = b.ucmp(
         Op_INotEqual, b.cfg_scratch_load(b.uconst(group_active_slot)), zero);
     b.emit_condbranch(group_active, loop_header, loop_merge);
+    }
     b.emit_label(loop_merge);
 
     // Expose the final emulated state to the caller (compute currently consumes no register output,
@@ -8709,6 +8997,8 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const uint32_t local_y = std::max(1u, config.local_y);
     const uint32_t local_z = std::max(1u, config.local_z);
     const uint32_t wave_size = config.wave_size == 32 ? 32u : 64u;
+    b.native_subgroup_size = config.native_subgroup_size == wave_size ? wave_size : 0u;
+    b.native_storage_format_support = config.native_storage_format_support;
     b.begin(1, rt, local_x, local_y, local_z, wave_size,
             static_cast<uint32_t>(config.user_sgprs.size()));
     b.declare_guest_scratch(scratch);

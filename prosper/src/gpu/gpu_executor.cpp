@@ -6,6 +6,7 @@
 // binary at startup, or a test via render_runner.h), so prosper_core links this without Vulkan.
 #include "gpu_execute.hpp"
 #include "gpu_capture.hpp"
+#include "gpu_timeline.hpp"
 #include "videoout_present.hpp"   // present_write_frame
 #include "agc_shader_layout.hpp"  // AgcShaderHeader + build_shader_resources
 #include "pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
@@ -139,6 +140,14 @@ struct ShaderResourceCompileKey {
     uint32_t sgpr_base = 0;
     uint32_t fetch_pc = 0;
     uint32_t fetch_index_mode = 0;
+    uint32_t flat_base_sgpr = 0;
+    bool srgb = false;
+    bool depth_compare = false;
+    uint32_t depth_compare_func = 0;
+    uint32_t mag_filter = 0;
+    uint32_t addr_u = 0;
+    uint32_t addr_v = 0;
+    uint32_t border_color_type = 0;
 
     bool operator==(const ShaderResourceCompileKey&) const = default;
 };
@@ -153,6 +162,21 @@ struct ShaderCompileKey {
     PixelSystemInputMapping system_inputs{};
     bool has_pcrel_dispatch = false;
     uint32_t pcrel_dispatch_target = UINT32_MAX;
+    // Compute modules also depend on launch ABI shape. User SGPR VALUES are push constants and stay
+    // runtime data; only their count changes declarations. Exact thread extents matter because a
+    // partial final workgroup emits a literal invocation guard into SPIR-V.
+    bool has_compute_config = false;
+    uint32_t compute_user_sgpr_count = 0;
+    uint32_t compute_local_x = 1, compute_local_y = 1, compute_local_z = 1;
+    bool compute_exact_thread_extent = false;
+    uint32_t compute_threads_x = 0, compute_threads_y = 0, compute_threads_z = 0;
+    uint32_t compute_wave_size = 64;
+    uint32_t compute_tidig_comp_cnt = 0;
+    bool compute_tgid_x_en = false, compute_tgid_y_en = false, compute_tgid_z_en = false;
+    bool compute_tg_size_en = false;
+    uint32_t compute_lds_bytes = 0;
+    uint32_t compute_native_subgroup_size = 0;
+    uint32_t compute_native_storage_format_support = 0;
     // Aliases ShaderCodeAnalysis::code and keeps that immutable analysis alive. Warm lookups used to
     // copy and re-hash the complete raw program for every draw before reaching the shader cache.
     std::shared_ptr<const std::vector<uint32_t>> code;
@@ -172,6 +196,25 @@ struct ShaderCompileKey {
                system_inputs == other.system_inputs &&
                has_pcrel_dispatch == other.has_pcrel_dispatch &&
                pcrel_dispatch_target == other.pcrel_dispatch_target &&
+               has_compute_config == other.has_compute_config &&
+               compute_user_sgpr_count == other.compute_user_sgpr_count &&
+               compute_local_x == other.compute_local_x &&
+               compute_local_y == other.compute_local_y &&
+               compute_local_z == other.compute_local_z &&
+               compute_exact_thread_extent == other.compute_exact_thread_extent &&
+               compute_threads_x == other.compute_threads_x &&
+               compute_threads_y == other.compute_threads_y &&
+               compute_threads_z == other.compute_threads_z &&
+               compute_wave_size == other.compute_wave_size &&
+               compute_tidig_comp_cnt == other.compute_tidig_comp_cnt &&
+               compute_tgid_x_en == other.compute_tgid_x_en &&
+               compute_tgid_y_en == other.compute_tgid_y_en &&
+               compute_tgid_z_en == other.compute_tgid_z_en &&
+               compute_tg_size_en == other.compute_tg_size_en &&
+               compute_lds_bytes == other.compute_lds_bytes &&
+               compute_native_subgroup_size == other.compute_native_subgroup_size &&
+               compute_native_storage_format_support ==
+                   other.compute_native_storage_format_support &&
                resources == other.resources && same_code;
     }
 };
@@ -210,6 +253,26 @@ struct ShaderCompileKeyHash {
         }
         hash = hash_mix(hash, key.has_pcrel_dispatch);
         if (key.has_pcrel_dispatch) hash = hash_mix(hash, key.pcrel_dispatch_target);
+        hash = hash_mix(hash, key.has_compute_config);
+        if (key.has_compute_config) {
+            hash = hash_mix(hash, key.compute_user_sgpr_count);
+            hash = hash_mix(hash, key.compute_local_x);
+            hash = hash_mix(hash, key.compute_local_y);
+            hash = hash_mix(hash, key.compute_local_z);
+            hash = hash_mix(hash, key.compute_exact_thread_extent);
+            hash = hash_mix(hash, key.compute_threads_x);
+            hash = hash_mix(hash, key.compute_threads_y);
+            hash = hash_mix(hash, key.compute_threads_z);
+            hash = hash_mix(hash, key.compute_wave_size);
+            hash = hash_mix(hash, key.compute_tidig_comp_cnt);
+            hash = hash_mix(hash, key.compute_tgid_x_en);
+            hash = hash_mix(hash, key.compute_tgid_y_en);
+            hash = hash_mix(hash, key.compute_tgid_z_en);
+            hash = hash_mix(hash, key.compute_tg_size_en);
+            hash = hash_mix(hash, key.compute_lds_bytes);
+            hash = hash_mix(hash, key.compute_native_subgroup_size);
+            hash = hash_mix(hash, key.compute_native_storage_format_support);
+        }
         hash = hash_mix(hash, key.code ? key.code->size() : 0u);
         hash = hash_mix(hash, key.code_hash);
         hash = hash_mix(hash, key.resources.size());
@@ -222,6 +285,15 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.srt_offset);
             hash = hash_mix(hash, resource.sgpr_base);
             hash = hash_mix(hash, resource.fetch_pc);
+            hash = hash_mix(hash, resource.fetch_index_mode);
+            hash = hash_mix(hash, resource.flat_base_sgpr);
+            hash = hash_mix(hash, resource.srgb);
+            hash = hash_mix(hash, resource.depth_compare);
+            hash = hash_mix(hash, resource.depth_compare_func);
+            hash = hash_mix(hash, resource.mag_filter);
+            hash = hash_mix(hash, resource.addr_u);
+            hash = hash_mix(hash, resource.addr_v);
+            hash = hash_mix(hash, resource.border_color_type);
         }
         return static_cast<size_t>(hash);
     }
@@ -751,7 +823,8 @@ PcrelDispatchSelection select_pcrel_dispatch(const uint32_t* code, size_t dwords
 ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_t* code, size_t dwords,
                                          const ShaderResourceTable* resources,
                                          const PixelInputMapping* pixel_inputs,
-                                         const PixelSystemInputMapping* system_inputs) {
+                                         const PixelSystemInputMapping* system_inputs,
+                                         const ComputeShaderConfig* compute_config = nullptr) {
     ShaderCompileKey key;
     key.stage = stage;
     key.has_resource_table = resources != nullptr;
@@ -760,6 +833,27 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
     if (key.has_pixel_inputs) key.pixel_inputs = *pixel_inputs;
     key.has_system_inputs = stage == ShaderProgramStage::Fragment && system_inputs != nullptr;
     if (key.has_system_inputs) key.system_inputs = *system_inputs;
+    key.has_compute_config = stage == ShaderProgramStage::Compute && compute_config;
+    if (key.has_compute_config) {
+        key.compute_user_sgpr_count = static_cast<uint32_t>(compute_config->user_sgprs.size());
+        key.compute_local_x = compute_config->local_x;
+        key.compute_local_y = compute_config->local_y;
+        key.compute_local_z = compute_config->local_z;
+        key.compute_exact_thread_extent = compute_config->exact_thread_extent;
+        key.compute_threads_x = compute_config->threads_x;
+        key.compute_threads_y = compute_config->threads_y;
+        key.compute_threads_z = compute_config->threads_z;
+        key.compute_wave_size = compute_config->wave_size;
+        key.compute_tidig_comp_cnt = compute_config->tidig_comp_cnt;
+        key.compute_tgid_x_en = compute_config->tgid_x_en;
+        key.compute_tgid_y_en = compute_config->tgid_y_en;
+        key.compute_tgid_z_en = compute_config->tgid_z_en;
+        key.compute_tg_size_en = compute_config->tg_size_en;
+        key.compute_lds_bytes = compute_config->lds_bytes;
+        key.compute_native_subgroup_size = compute_config->native_subgroup_size;
+        key.compute_native_storage_format_support =
+            compute_config->native_storage_format_support;
+    }
     const std::shared_ptr<const ShaderCodeAnalysis> analysis =
         code && dwords ? analyze_shader_code_cached(code, dwords) : nullptr;
     if (stage == ShaderProgramStage::Fragment && code && dwords && resources) {
@@ -806,11 +900,21 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
     if (resources) {
         key.resources.reserve(resources->resources.size());
         for (const auto& resource : resources->resources) {
+            const bool texture = resource.cls == ResourceClass::Texture;
+            const bool storage_image = resource.cls == ResourceClass::StorageImage;
+            const bool manual_compare = texture && resource.depth_compare;
             key.resources.push_back({
                 static_cast<uint32_t>(resource.cls), static_cast<uint32_t>(resource.format),
                 resource.num_components, resource.binding, resource.stride,
                 resource.srt_offset, resource.sgpr_base, resource.fetch_pc,
                 static_cast<uint32_t>(resource.fetch_index_mode),
+                resource.flat_base_sgpr, storage_image && resource.srgb,
+                manual_compare,
+                manual_compare ? resource.depth_compare_func : 0u,
+                manual_compare ? resource.mag_filter : 0u,
+                manual_compare ? resource.addr_uvw[0] : 0u,
+                manual_compare ? resource.addr_uvw[1] : 0u,
+                manual_compare ? resource.border_color_type : 0u,
             });
         }
     }
@@ -1026,6 +1130,72 @@ std::vector<uint32_t> recompile_graphics_shader_cached(
     SharedShaderWords words = recompile_graphics_shader_cached_shared(
         stage, code, dwords, resources, pixel_inputs, system_inputs, cache_identity);
     return words ? *words : std::vector<uint32_t>{};
+}
+
+std::vector<uint32_t> recompile_compute_shader_cached(
+        const uint32_t* code, size_t dwords, const ShaderResourceTable* resources,
+        const ComputeShaderConfig& config, uint64_t* cache_identity) {
+    if (cache_identity) *cache_identity = 0;
+    ShaderCompileKey key = make_shader_compile_key(
+        ShaderProgramStage::Compute, code, dwords, resources, nullptr, nullptr, &config);
+    auto compile = [&] {
+        const uint32_t* owned_code = !key.code || key.code->empty() ? nullptr : key.code->data();
+        const size_t owned_dwords = key.code ? key.code->size() : 0u;
+        return recompile_compute(owned_code, owned_dwords, resources, config);
+    };
+    if (getenv("PROSPER_NO_SHADER_CACHE")) {
+        auto& cache = shader_cache();
+        {
+            std::lock_guard lock(cache.mutex);
+            ++cache.stats.bypasses;
+        }
+        std::vector<uint32_t> spirv = compile();
+        maybe_dump_successful_shader(ShaderProgramStage::Compute, key, spirv);
+        return spirv;
+    }
+
+    auto& cache = shader_cache();
+    std::lock_guard lock(cache.mutex);
+    auto found = cache.entries.find(key);
+    if (found != cache.entries.end()) {
+        ++cache.stats.hits;
+        found->second.last_use = ++cache.use_counter;
+        if (cache_identity) *cache_identity = found->second.identity;
+        maybe_dump_successful_shader(ShaderProgramStage::Compute, key, *found->second.spirv);
+        return *found->second.spirv;
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    auto spirv = std::make_shared<const std::vector<uint32_t>>(compile());
+    maybe_dump_successful_shader(ShaderProgramStage::Compute, key, *spirv);
+    const auto end = std::chrono::steady_clock::now();
+    ++cache.stats.misses;
+    cache.stats.compile_ms += std::chrono::duration<double, std::milli>(end - start).count();
+
+    constexpr size_t max_entries = 4096;
+    const uint64_t bytes = shader_cache_entry_bytes(key, *spirv);
+    const uint64_t limit = shader_cache_limit_bytes();
+    while (!cache.entries.empty() &&
+           (cache.entries.size() >= max_entries || cache.stats.bytes + bytes > limit)) {
+        auto oldest = cache.entries.begin();
+        for (auto it = std::next(cache.entries.begin()); it != cache.entries.end(); ++it)
+            if (it->second.last_use < oldest->second.last_use) oldest = it;
+        cache.stats.bytes -= oldest->second.bytes;
+        cache.entries.erase(oldest);
+        ++cache.stats.evictions;
+    }
+    if (bytes <= limit && max_entries != 0) {
+        CachedShader value;
+        value.spirv = spirv;
+        value.identity = cache.next_identity++;
+        value.last_use = ++cache.use_counter;
+        value.bytes = bytes;
+        if (cache_identity) *cache_identity = value.identity;
+        cache.stats.bytes += bytes;
+        cache.entries.emplace(std::move(key), std::move(value));
+    }
+    cache.stats.entries = cache.entries.size();
+    return *spirv;
 }
 
 ShaderRecompileCacheStats shader_recompile_cache_stats() {
@@ -3272,6 +3442,33 @@ std::vector<ComputeItem> realize_compute_dispatches(
         config.wave_size = ((dispatch.modifier >>
             P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT) &
             P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK) ? 32u : 64u;
+        const SharedVulkanContext shared_vulkan = shared_vulkan_context();
+        const bool shared_compute_adoptable = shared_vulkan.valid() &&
+            shared_vulkan.compute_queue_supported &&
+            shared_vulkan.storage_image_read_without_format &&
+            shared_vulkan.storage_image_write_without_format;
+        config.native_storage_format_support = shared_compute_adoptable
+            ? shared_vulkan.native_storage_format_support : 0;
+        // Realized captures store SPIR-V but not enough raw compute launch state to recompile a
+        // device-specific typed-storage module on replay. Compile capture-bound dispatches through
+        // the portable raw-uvec4 path so optional format support never becomes an artifact ABI.
+        if (std::getenv("PROSPER_GPU_CAPTURE") ||
+            std::getenv("PROSPER_GPU_TIMELINE_CAPTURE") ||
+            interactive_gpu_capture_armed() || interactive_capture_bundle_active())
+            config.native_storage_format_support = 0;
+        // RequiredSubgroupSize fixes only the subgroup WIDTH. Vulkan deliberately does not promise
+        // that SubgroupLocalInvocationId is LocalInvocationIndex modulo that width, so using native
+        // lane IDs for RDNA MBCNT/EXEC/VCC would silently change guest wave membership on a
+        // conforming implementation. Keep the portable emulation by default. This opt-in exists for
+        // driver experiments whose contiguous mapping has been validated externally; it is not a
+        // portable correctness contract.
+        if (getenv("PROSPER_ASSUME_CONTIGUOUS_COMPUTE_SUBGROUPS") &&
+            !getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") &&
+            shared_vulkan.compute_subgroup_size_control &&
+            shared_vulkan.compute_subgroup_vote && shared_vulkan.compute_subgroup_arithmetic &&
+            config.wave_size >= shared_vulkan.min_compute_subgroup_size &&
+            config.wave_size <= shared_vulkan.max_compute_subgroup_size)
+            config.native_subgroup_size = config.wave_size;
         config.tgid_x_en = tgid_x_en;
         config.tgid_y_en = tgid_y_en;
         config.tgid_z_en = tgid_z_en;
@@ -3283,16 +3480,10 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                  P::COMPUTE_PGM_RSRC2_LDS_SIZE_MASK) * 512u;
 
         ComputeItem item;
-        item.spirv = recompile_compute((const uint32_t*)(uintptr_t)code_addr, 0x10000,
-                                       table.get(), config);
+        item.spirv = recompile_compute_shader_cached(
+            (const uint32_t*)(uintptr_t)code_addr, 0x10000, table.get(), config);
         item.user_sgprs = config.user_sgprs;
-        if (!item.spirv.empty() && getenv("PROSPER_SHADER_DUMP_SUCCESS")) {
-            const ShaderCompileKey dump_key = make_shader_compile_key(
-                ShaderProgramStage::Compute,
-                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
-                0x10000, table.get(), nullptr, nullptr);
-            maybe_dump_successful_shader(ShaderProgramStage::Compute, dump_key, item.spirv);
-        }
+        item.required_subgroup_size = config.native_subgroup_size;
         item.resources = std::move(table);
         item.launch = launch;
         item.code_addr = code_addr;
@@ -4413,15 +4604,23 @@ void set_live_target_reader(LiveTargetReaderFn fn) { g_live_target_reader = std:
 
 static LiveTargetImageImportFn g_live_target_image_import;
 static LiveTargetImageReleaseFn g_live_target_image_release;
+static LiveTargetImageWrittenFn g_live_target_image_written;
 void set_live_target_image_importer(LiveTargetImageImportFn import_fn,
                                     LiveTargetImageReleaseFn release_fn) {
     g_live_target_image_import = std::move(import_fn);
     g_live_target_image_release = std::move(release_fn);
 }
-bool import_live_render_target_image(uint64_t gpu_addr, LiveTargetImageImport& import) {
+void set_live_target_image_written_notifier(LiveTargetImageWrittenFn written_fn) {
+    g_live_target_image_written = std::move(written_fn);
+}
+bool import_live_render_target_image(uint64_t gpu_addr, const LiveTargetImageRequest& request,
+                                     LiveTargetImageImport& import) {
     import = LiveTargetImageImport{};
     if (!g_live_target_image_import) return false;
-    if (!g_live_target_image_import(gpu_addr, import)) { import = LiveTargetImageImport{}; return false; }
+    if (!g_live_target_image_import(gpu_addr, request, import)) {
+        import = LiveTargetImageImport{};
+        return false;
+    }
     if (!import.valid()) {
         // The importer pinned the entry before returning true; drop that pin rather than leaking a
         // permanently un-evictable cache entry if a future importer breaks the contract.
@@ -4433,6 +4632,9 @@ bool import_live_render_target_image(uint64_t gpu_addr, LiveTargetImageImport& i
 }
 void release_live_render_target_image(uint64_t gpu_addr) {
     if (g_live_target_image_release) g_live_target_image_release(gpu_addr);
+}
+void notify_live_render_target_image_written(uint64_t gpu_addr) {
+    if (g_live_target_image_written) g_live_target_image_written(gpu_addr);
 }
 static SharedVulkanContext g_shared_vulkan;
 void set_shared_vulkan_context(const SharedVulkanContext& context) { g_shared_vulkan = context; }

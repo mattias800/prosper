@@ -296,6 +296,7 @@ struct ComputeItem {
     uint64_t dispatch_index = 0;
     uint64_t submit_no = 0;
     uint64_t command_order = 0;
+    uint32_t required_subgroup_size = 0;
 };
 
 enum class SubmitOperationKind : uint8_t { Draw, Dispatch, DmaCopy };
@@ -347,6 +348,11 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     const PixelInputMapping* pixel_inputs = nullptr,
     const PixelSystemInputMapping* system_inputs = nullptr,
     uint64_t* cache_identity = nullptr);
+// Compute uses the same bounded content-addressed cache as graphics. Launch geometry that changes
+// generated SPIR-V participates in the key; per-dispatch push-constant values deliberately do not.
+std::vector<uint32_t> recompile_compute_shader_cached(
+    const uint32_t* code, size_t dwords, const ShaderResourceTable* resources,
+    const ComputeShaderConfig& config, uint64_t* cache_identity = nullptr);
 ShaderRecompileCacheStats shader_recompile_cache_stats();
 void clear_shader_recompile_cache();
 
@@ -474,29 +480,48 @@ bool read_live_render_target(uint64_t gpu_addr, LiveTargetSnapshot& snapshot);
 // renderer's persistent image in place instead of forcing a GPU->CPU readback and an immediate
 // re-upload of the very same pixels to the very same device.
 //
-// AUTHORITY RULE: the import is offered only while the persistent Vulkan image is the authoritative
-// copy of the surface -- exactly the case where read_live_render_target() would have had to
-// materialize it. Whenever a CPU RTT snapshot already exists it may be the NEWER truth (a guest GPU
-// write discards the CPU copy and invalidates the GPU target independently, #780), so the caller
-// must fall back to the snapshot path rather than assume the two agree.
+// AUTHORITY RULE: the import is offered only while the persistent Vulkan image is current. An
+// ordered GPU readback may leave an equivalent CPU snapshot beside it; that mirror does not make the
+// image stale. CPU-newer publications clear gpu_valid, and guest GPU writes invalidate the cache
+// entry before import (#780), so neither can expose an obsolete image through this contract.
 //
 // The image is BORROWED: the caller must not destroy it, must restore `layout` before returning, and
 // must call release_live_render_target_image() to drop the pin that keeps the renderer's cache from
 // evicting the entry mid-dispatch. Handles stay opaque so this layer keeps no Vulkan dependency.
 struct LiveTargetImageImport {
+    enum class Kind : uint8_t { Color, Depth };
     uint32_t width = 0, height = 0;
     LiveTargetPixelFormat format = LiveTargetPixelFormat::Rgba8Unorm;
+    Kind kind = Kind::Color;
+    // Opaque VkFormat for depth imports. Color imports keep using `format`, whose deliberately
+    // small enum is part of the renderer/compute numeric-compatibility contract.
+    uint32_t native_format = 0;
     void* image = nullptr;    // VkImage owned by the live renderer
     void* device = nullptr;   // VkDevice it belongs to; the caller must be running on that device
     uint32_t layout = 0;      // VkImageLayout the renderer left it in -- restore it after the dispatch
     bool valid() const { return image && device && width && height; }
 };
-using LiveTargetImageImportFn = std::function<bool(uint64_t gpu_addr, LiveTargetImageImport& import)>;
+struct LiveTargetImageRequest {
+    uint32_t width = 0, height = 0;
+    uint32_t render_scale = 1;
+    bool allow_depth = false;
+    // True only when reflection proves this descriptor is read exclusively through normalized
+    // sample/gather operations. Integer image fetch/read must retain the exact declared extent.
+    bool normalized_sampling = false;
+};
+using LiveTargetImageImportFn = std::function<bool(
+    uint64_t gpu_addr, const LiveTargetImageRequest& request, LiveTargetImageImport& import)>;
 using LiveTargetImageReleaseFn = std::function<void(uint64_t gpu_addr)>;
+using LiveTargetImageWrittenFn = std::function<void(uint64_t gpu_addr)>;
 void set_live_target_image_importer(LiveTargetImageImportFn import_fn,
                                     LiveTargetImageReleaseFn release_fn);
-bool import_live_render_target_image(uint64_t gpu_addr, LiveTargetImageImport& import);
+void set_live_target_image_written_notifier(LiveTargetImageWrittenFn written_fn);
+bool import_live_render_target_image(uint64_t gpu_addr, const LiveTargetImageRequest& request,
+                                     LiveTargetImageImport& import);
 void release_live_render_target_image(uint64_t gpu_addr);
+// Publish that a borrowed renderer image was modified in place. The renderer keeps the Vulkan image
+// authoritative and discards any older CPU readback mirror; guest bytes intentionally stay deferred.
+void notify_live_render_target_image_written(uint64_t gpu_addr);
 // Shared Vulkan device (#1091 phase 1). live_compute historically created its own VkInstance/VkDevice,
 // so a renderer-owned image could never be bound to a dispatch and had to round-trip through host
 // memory. The live renderer publishes its already-created device here; the compute backend ADOPTS it
@@ -516,6 +541,18 @@ struct SharedVulkanContext {
     // Features the compute backend requires; when false it must decline the shared device.
     bool storage_image_read_without_format = false;
     bool storage_image_write_without_format = false;
+    // Exact compute-wave acceleration. These describe features ENABLED on the borrowed device, not
+    // merely physical support. The recompiler opts in only when the requested guest wave is inside
+    // this range and both vote and arithmetic subgroup operations are available.
+    bool compute_subgroup_size_control = false;
+    bool compute_subgroup_vote = false;
+    bool compute_subgroup_arithmetic = false;
+    uint32_t min_compute_subgroup_size = 0;
+    uint32_t max_compute_subgroup_size = 0;
+    // Vulkan-independent mask from native_storage_format_support_bit(). The renderer queries
+    // optimal-tiling STORAGE_IMAGE support before publishing its physical device.
+    uint32_t native_storage_format_support = 0;
+    bool compute_queue_supported = false;
     // Present unification (#1270): when present_capable, prosper-app may create its window surface on
     // `instance`, its swapchain on `device`, and present on `present_queue` -- then blit the renderer's
     // front-buffer image straight to the swapchain with no CPU round-trip. present_queue_shared means the

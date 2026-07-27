@@ -144,6 +144,13 @@ int main() {
     // re-proven within N fast-skips instead of trusting a stale "covers every texel" verdict forever.
     {
         using prosper::frontend::seed_reprove_due;
+        using prosper::frontend::dispatch_has_enough_threads_for_texels;
+        CHECK(dispatch_has_enough_threads_for_texels(15360, 135, 1, 1920, 1080, 1),
+              "vectorized/swizzled dispatch with one invocation per texel can prove coverage");
+        CHECK(!dispatch_has_enough_threads_for_texels(1919, 1080, 1, 1920, 1080, 1),
+              "dispatch with fewer total invocations than texels cannot prove coverage");
+        CHECK(!dispatch_has_enough_threads_for_texels(0, 1080, 1, 1920, 1080, 1),
+              "degenerate dispatch cannot prove coverage");
         uint32_t s = 0;
         CHECK(!seed_reprove_due(s, 0) && !seed_reprove_due(s, 0) && s == 0,
               "interval 0 never re-proves and leaves the counter untouched (prove-once)");
@@ -579,6 +586,12 @@ int main() {
         CHECK(run_format_copy(DataFormat::Uint8, 4, 4, s) == s,
               "Uint8x4 storage copy round-trips guest bytes bit-exact (#590)");
     }
+    {   // Unorm8 x2: native RG8 storage keeps its two-byte texel width and conversion contract
+        std::vector<uint8_t> s(W * 2);
+        for (uint32_t i = 0; i < s.size(); i++) s[i] = (uint8_t)(i * 71 + 11);
+        CHECK(run_format_copy(DataFormat::Unorm8, 2, 2, s) == s,
+              "Unorm8x2 storage copy round-trips native RG8 texels bit-exact (#590)");
+    }
     {   // Uint16 x1 (fmt=7): 16-bit integer widen on load, low-16-bit truncate on store
         std::vector<uint8_t> s(W * 2);
         for (uint32_t i = 0; i < s.size(); i++) s[i] = (uint8_t)(i * 29 + 3);
@@ -590,6 +603,20 @@ int main() {
         for (uint32_t t = 0; t < W; t++) { uint32_t p = t * 2654435761u; std::memcpy(&s[t * 4], &p, 4); }
         CHECK(run_format_copy(DataFormat::Unorm2_10_10_10, 4, 4, s) == s,
               "Unorm2_10_10_10 storage copy round-trips packed guest word bit-exact (#590)");
+    }
+    {   // R11G11B10 UFLOAT: native float storage conversion must preserve quantized finite texels
+        std::vector<uint8_t> s(W * 4);
+        for (uint32_t t = 0; t < W; ++t) {
+            const float r = static_cast<float>((t * 17u) % 97u) / 13.0f;
+            const float g = static_cast<float>((t * 29u) % 89u) / 11.0f;
+            const float b = static_cast<float>((t * 43u) % 83u) / 9.0f;
+            const uint32_t packed = static_cast<uint32_t>(float_to_f11(r)) |
+                                    (static_cast<uint32_t>(float_to_f11(g)) << 11) |
+                                    (static_cast<uint32_t>(float_to_f10(b)) << 22);
+            std::memcpy(&s[t * 4], &packed, sizeof(packed));
+        }
+        CHECK(run_format_copy(DataFormat::Float10_11_11, 3, 4, s) == s,
+              "R11G11B10 storage copy round-trips native packed texels bit-exact (#590)");
     }
 
     // The backend publishes ordinary tiled texels, not hardware-compressed blocks. Prove that a
