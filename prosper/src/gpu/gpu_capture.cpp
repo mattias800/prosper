@@ -746,7 +746,13 @@ bool capture_raw_shader_version(uint64_t addr, const CaptureMemoryReader& reader
     }
     std::vector<Rdna2Inst> instructions;
     const size_t consumed = rdna2_walk(words.data(), words.size(), instructions);
-    if (consumed && consumed < words.size()) words.resize(consumed);
+    // A few compiler-generated shaders address constant tables stored after S_ENDPGM through an
+    // s_getpc_b64-built descriptor. Keep the same proven code span as the live recompiler cache so
+    // an offline raw replay sees every byte that affected the generated SPIR-V. The span helper is
+    // deliberately fail-closed: unrelated post-program guest memory is still discarded.
+    const size_t recompile_span = rdna2_recompile_code_span(words.data(), words.size());
+    const size_t captured_span = std::max(consumed, recompile_span);
+    if (captured_span && captured_span < words.size()) words.resize(captured_span);
     const bool has_endpgm = !instructions.empty() && instructions.back().is_end;
     const uint64_t hash = shader_hash(words);
     auto existing = std::find_if(capture.raw_shader_versions.begin(),
