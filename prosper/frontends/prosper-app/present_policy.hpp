@@ -2,24 +2,30 @@
 
 #include <vulkan/vulkan_core.h>
 
-// Present policy for prosper-app (#1182). The app owns its OWN Vulkan device/queue, separate from the
-// core live renderer's headless device (main.cpp: "two Vulkan contexts by design"). The guest↔app frame
-// handoff is a lock-free CPU shared_ptr copy (present_acquire_rendered_frame), so the guest is NOT
-// back-pressured by the app present at the Vulkan level. The one place the app can hurt the guest — and
-// itself — is a BLOCKING swapchain acquire: `vkAcquireNextImageKHR(..., UINT64_MAX, ...)` blocks the app
-// main thread indefinitely when the compositor releases no image (window occluded/minimized). That
-// freezes visible output, stops SDL event/close handling, and (on the shared physical GPU) can stall the
-// guest. The fix is to bound the acquire and treat a timeout as a benign SKIP, not an error: the main
-// loop stays responsive and the guest keeps running. This header holds the pure result-classification so
-// it is unit-testable without a device (Vulkan headers only, no loader).
+// Present policy for prosper-app (#1182). Real game boots normally share the renderer's Vulkan device;
+// the private-device fallback hands frames across as a lock-free CPU shared_ptr copy. Neither path
+// should let a BLOCKING swapchain acquire (`vkAcquireNextImageKHR(..., UINT64_MAX, ...)`) freeze event
+// handling and stall the guest when the compositor releases no image (for example, while occluded or
+// minimized). Bound the acquire and treat a timeout as a benign SKIP, not an error. This header holds
+// the pure result classification so it is unit-testable without a device (Vulkan headers only).
 
 namespace prosper::frontend {
+
+// Real game boots prefer the renderer's shared-device scanout path: it avoids a full-frame GPU->CPU
+// readback followed by a CPU->GPU upload. Adoption still validates all Vulkan prerequisites and falls
+// back to the private-device path on failure. `PROSPER_APP_GPU_PRESENT=0` is the explicit recovery/A-B
+// switch; test-pattern and no-game runs have no renderer-owned scanout to adopt.
+constexpr bool request_gpu_present(const char* setting, bool test_pattern, bool has_game) {
+    const bool explicitly_disabled = setting && setting[0] == '0' && setting[1] == '\0';
+    return has_game && !test_pattern && !explicitly_disabled;
+}
 
 // Outcome of one present_frame attempt.
 enum class PresentAttempt {
     presented,    // the rendered frame reached the swapchain
     skipped,      // no swapchain image available within the bounded acquire (occluded/minimized) — retry
     out_of_date,  // swapchain is stale/lost/unusable — recreate it before the next present
+    failed,       // device/synchronization recovery failed — stop instead of waiting forever
 };
 
 // What present_frame should do after a BOUNDED vkAcquireNextImageKHR.

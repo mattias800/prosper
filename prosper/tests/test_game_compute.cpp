@@ -21,6 +21,124 @@ static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { std::printf("FAIL: %s\n", msg); fails++; } } while (0)
 
 int main() {
+    bool half_luts_match = true;
+    for (uint32_t bits = 0; bits <= 0xffffu; ++bits) {
+        const uint16_t half = static_cast<uint16_t>(bits);
+        const float value = half_to_float(half);
+        uint32_t float_bits = 0;
+        std::memcpy(&float_bits, &value, sizeof(float_bits));
+        half_luts_match &= prosper::frontend::storage_unpack_float16_bits(half) == float_bits;
+
+        float normalized = value;
+        if (std::isnan(normalized)) normalized = 0.0f;
+        normalized = normalized < 0.0f ? 0.0f : (normalized > 1.0f ? 1.0f : normalized);
+        const uint8_t reference = static_cast<uint8_t>(std::lround(normalized * 255.0f));
+        half_luts_match &= prosper::frontend::sampled_float16_to_unorm8(half) == reference;
+    }
+    CHECK(half_luts_match,
+          "binary16 lookup conversions are exhaustive bit-exact matches for storage and sampling");
+
+    std::vector<uint8_t> half_source(65536u * sizeof(uint16_t));
+    std::vector<uint8_t> half_rgba(65536u * 4u);
+    for (uint32_t bits = 0; bits <= 0xffffu; ++bits) {
+        const uint16_t half = static_cast<uint16_t>(bits);
+        std::memcpy(half_source.data() + bits * sizeof(half), &half, sizeof(half));
+    }
+    prosper::frontend::sampled_float16_to_unorm8_range(
+        half_source.data(), 1, 65536u, half_rgba.data());
+    bool half_range_matches = true;
+    for (uint32_t bits = 0; bits <= 0xffffu; ++bits) {
+        half_range_matches &=
+            half_rgba[bits * 4] == prosper::frontend::sampled_float16_to_unorm8(
+                                       static_cast<uint16_t>(bits)) &&
+            half_rgba[bits * 4 + 1] == 0 && half_rgba[bits * 4 + 2] == 0 &&
+            half_rgba[bits * 4 + 3] == 255;
+    }
+    CHECK(half_range_matches,
+          "parallel binary16 sampled range matches every scalar value and fills (R,0,0,1)");
+
+    // Exercise the packed RGBA fast path with every binary16 bit pattern. On x86 this runtime-
+    // dispatches through F16C/AVX2 when available; elsewhere it proves the identical scalar fallback.
+    std::vector<uint8_t> half_source_x4(65536u * sizeof(uint16_t));
+    std::vector<uint8_t> half_rgba_x4(65536u);
+    for (uint32_t bits = 0; bits <= 0xffffu; ++bits) {
+        const uint16_t half = static_cast<uint16_t>(bits);
+        std::memcpy(half_source_x4.data() + bits * sizeof(half), &half, sizeof(half));
+    }
+    prosper::frontend::sampled_float16_to_unorm8_range(
+        half_source_x4.data(), 4, 65536u / 4u, half_rgba_x4.data());
+    bool half_range_x4_matches = true;
+    for (uint32_t bits = 0; bits <= 0xffffu; ++bits)
+        half_range_x4_matches &= half_rgba_x4[bits] ==
+            prosper::frontend::sampled_float16_to_unorm8(static_cast<uint16_t>(bits));
+    CHECK(half_range_x4_matches,
+          "packed RGBA binary16 sampled range matches every scalar lookup value");
+
+    std::vector<uint32_t> half_storage_x4(65536u);
+    prosper::frontend::storage_unpack_float16x4_range(
+        half_source_x4.data(), 65536u / 4u, half_storage_x4.data());
+    bool half_storage_x4_matches = true;
+    for (uint32_t bits = 0; bits <= 0xffffu; ++bits)
+        half_storage_x4_matches &= half_storage_x4[bits] ==
+            prosper::frontend::storage_unpack_float16_bits(static_cast<uint16_t>(bits));
+    CHECK(half_storage_x4_matches,
+          "packed RGBA16F storage range preserves every scalar float bit pattern");
+
+    // The storage writeback fast path converts two RGBA32F texels per F16C instruction. Compare a
+    // million deterministic float bit patterns, including explicit overflow/subnormal/NaN payload
+    // edges, against the established scalar round-to-nearest-even converter.
+    constexpr size_t pack_channels_count = 1u << 20;
+    std::vector<uint32_t> pack_channels(pack_channels_count);
+    const uint32_t pack_edges[] = {
+        0x00000000u, 0x80000000u, 0x00000001u, 0x80000001u,
+        0x33000000u, 0x33000001u, 0x387fc000u, 0x38800000u,
+        0x477fe000u, 0x477ff000u, 0x47800000u, 0xc7800000u,
+        0x7f800000u, 0xff800000u, 0x7fc00000u, 0x7f800001u,
+        0x7fffffffu, 0xff800001u, 0x3f800000u, 0xbf800000u,
+    };
+    size_t pack_at = 0;
+    for (uint32_t bits : pack_edges) pack_channels[pack_at++] = bits;
+    uint32_t pack_random = 0x91e10da5u;
+    while (pack_at < pack_channels.size()) {
+        pack_random ^= pack_random << 13;
+        pack_random ^= pack_random >> 17;
+        pack_random ^= pack_random << 5;
+        pack_channels[pack_at++] = pack_random;
+    }
+    std::vector<uint8_t> packed_half(pack_channels_count * sizeof(uint16_t));
+    prosper::frontend::storage_pack_float16x4_range(
+        pack_channels.data(), pack_channels_count / 4, packed_half.data());
+    bool storage_half_range_matches = true;
+    for (size_t i = 0; i < pack_channels.size(); ++i) {
+        float value;
+        std::memcpy(&value, &pack_channels[i], sizeof(value));
+        const uint16_t expected = prosper::gpu::float_to_half(value);
+        uint16_t actual = 0;
+        std::memcpy(&actual, packed_half.data() + i * sizeof(actual), sizeof(actual));
+        if (actual != expected) {
+            std::printf("Float16 pack mismatch index=%zu f32=%08x expected=%04x actual=%04x\n",
+                        i, pack_channels[i], expected, actual);
+            storage_half_range_matches = false;
+            break;
+        }
+    }
+    CHECK(storage_half_range_matches,
+          "packed RGBA32F storage range matches scalar Float16 rounding and NaN payloads");
+
+    using prosper::frontend::direct_sampled_rtt_compatible;
+    CHECK(direct_sampled_rtt_compatible(DataFormat::Unorm8, 4,
+                                        LiveTargetPixelFormat::Rgba8Unorm) &&
+          direct_sampled_rtt_compatible(DataFormat::Float16, 4,
+                                        LiveTargetPixelFormat::Rgba16Float),
+          "renderer RTT direct bind accepts exact RGBA8 and RGBA16F sampled views");
+    CHECK(!direct_sampled_rtt_compatible(DataFormat::Float16, 4,
+                                         LiveTargetPixelFormat::Rgba8Unorm) &&
+          !direct_sampled_rtt_compatible(DataFormat::Unorm8, 4,
+                                         LiveTargetPixelFormat::Rgba16Float) &&
+          !direct_sampled_rtt_compatible(DataFormat::Float16, 2,
+                                         LiveTargetPixelFormat::Rgba16Float),
+          "renderer RTT direct bind rejects format conversion and component aliases");
+
     // #1127: the seed-skip re-prove counter (seed_reprove.hpp). interval 0 disables (old prove-once);
     // interval N fires on the Nth fast-skip and resets, so a Full-cached data-dependent shader is
     // re-proven within N fast-skips instead of trusting a stale "covers every texel" verdict forever.
@@ -96,6 +214,32 @@ int main() {
         }
     }
     CHECK(unorm8_matches, "fast UNORM8 pack is equivalent to the lround reference");
+
+    bool storage_unorm8_range_matches = true;
+    constexpr size_t unorm_texels = pack_channels_count / 4;
+    for (uint32_t components : {1u, 2u, 3u, 4u}) {
+        std::vector<uint8_t> packed_unorm8(unorm_texels * components);
+        prosper::frontend::storage_pack_unorm8_range(
+            pack_channels.data(), components, unorm_texels, packed_unorm8.data());
+        for (size_t texel = 0; texel < unorm_texels; ++texel) {
+            for (uint32_t channel = 0; channel < components; ++channel) {
+                const size_t source = texel * 4 + channel;
+                const uint8_t expected =
+                    prosper::frontend::storage_pack_unorm8(pack_channels[source]);
+                const uint8_t actual = packed_unorm8[texel * components + channel];
+                if (actual == expected) continue;
+                std::printf("UNORM8 pack mismatch n=%u texel=%zu channel=%u f32=%08x "
+                            "expected=%02x actual=%02x\n",
+                            components, texel, channel, pack_channels[source], expected, actual);
+                storage_unorm8_range_matches = false;
+                break;
+            }
+            if (!storage_unorm8_range_matches) break;
+        }
+        if (!storage_unorm8_range_matches) break;
+    }
+    CHECK(storage_unorm8_range_matches,
+          "packed one-, two-, three-, and four-channel UNORM8 ranges match scalar clamp and rounding");
 
     // Dead Cells' bound startup fill kernel, copied verbatim from eboot.elf at runtime address
     // 0x401aec200. It stores s4-s7 to record `(TGID_X << 6) + local_id_x` through the V# in s0-s3.

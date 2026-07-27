@@ -13,6 +13,7 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -20,11 +21,20 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
+
+#if (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#define PROSPER_HAVE_TARGET_F16C 1
+#endif
 
 namespace prosper::frontend {
 
@@ -38,10 +48,287 @@ uint8_t storage_pack_unorm8(uint32_t float_bits) {
     return static_cast<uint8_t>(whole + (scaled - static_cast<float>(whole) >= 0.5f));
 }
 
+uint32_t storage_unpack_float16_bits(uint16_t half_bits) {
+    // Full binary16 lookup: the source domain is only 64 Ki entries, while Astro Bot expands more
+    // than 33 million FP16 channels for one 4K storage image. Keeping the already-converted float
+    // bits in a 256 KiB table removes the branchy scalar decoder from that inner loop without
+    // changing a single NaN payload, signed zero, subnormal, or infinity bit.
+    static const std::array<uint32_t, 65536> table = [] {
+        std::array<uint32_t, 65536> result{};
+        for (uint32_t bits = 0; bits < result.size(); ++bits) {
+            const float value = prosper::gpu::half_to_float(static_cast<uint16_t>(bits));
+            std::memcpy(&result[bits], &value, sizeof(value));
+        }
+        return result;
+    }();
+    return table[half_bits];
+}
+
+namespace {
+
+const std::array<uint8_t, 65536>& sampled_float16_unorm8_table() {
+    static const std::array<uint8_t, 65536> table = [] {
+        std::array<uint8_t, 65536> result{};
+        for (uint32_t bits = 0; bits < result.size(); ++bits) {
+            float value = prosper::gpu::half_to_float(static_cast<uint16_t>(bits));
+            if (std::isnan(value)) value = 0.0f;
+            value = value < 0.0f ? 0.0f : (value > 1.0f ? 1.0f : value);
+            result[bits] = static_cast<uint8_t>(std::lround(value * 255.0f));
+        }
+        return result;
+    }();
+    return table;
+}
+
+} // namespace
+
+uint8_t sampled_float16_to_unorm8(uint16_t half_bits) {
+    // The guest-backed sampled fallback maps NaN/negative to zero and positive infinity to one,
+    // matching its historical scalar clamp exactly. Cache every possible input so it avoids
+    // half_to_float + lround for every channel. Direct-bound renderer targets bypass this entirely.
+    return sampled_float16_unorm8_table()[half_bits];
+}
+
+bool direct_sampled_rtt_compatible(prosper::gpu::DataFormat format, uint32_t components,
+                                   prosper::gpu::LiveTargetPixelFormat target_format) {
+    using prosper::gpu::DataFormat;
+    using prosper::gpu::LiveTargetPixelFormat;
+    return components == 4 &&
+           ((format == DataFormat::Unorm8 &&
+             target_format == LiveTargetPixelFormat::Rgba8Unorm) ||
+            (format == DataFormat::Float16 &&
+             target_format == LiveTargetPixelFormat::Rgba16Float));
+}
+
 namespace {
 
 constexpr VkDeviceSize kMaxComputeImageBytes = 256ull << 20;
 constexpr size_t kMaxCachedComputePipelines = 4096;
+
+// Large storage-image format conversions are independent per texel. Astro Bot's 4K FP16 target is
+// 8.3 million texels, so leaving its lookup/pack walk on one core made a ~5 ms GPU dispatch wait on
+// hundreds of milliseconds of host work. Keep small surfaces scalar and cap large conversions at
+// sixteen workers because both the detiler and these loops eventually become memory-bandwidth-bound.
+// Astro Bot's 4K path is still measurably faster at 16 on a 16-core Strix Halo; 32 regresses.
+template <class Body>
+void parallel_compute_texels(size_t count, size_t work_bytes, Body&& body) {
+    if (!count) return;
+    static const unsigned configured = [] {
+        const char* value = std::getenv("PROSPER_COMPUTE_CONVERSION_THREADS");
+        if (!value || !*value) return 0u;
+        const unsigned long parsed = std::strtoul(value, nullptr, 10);
+        return static_cast<unsigned>(std::min(parsed, 32ul));
+    }();
+    const unsigned hardware = std::thread::hardware_concurrency();
+    const unsigned wanted = configured ? configured : std::min(hardware ? hardware : 4u, 16u);
+    const unsigned by_work = static_cast<unsigned>(std::min<size_t>(
+        count, std::max<size_t>(1, work_bytes / (512u * 1024u))));
+    const unsigned threads = std::max(1u, std::min(wanted ? wanted : 1u, by_work));
+    if (threads <= 1) {
+        body(size_t{0}, count);
+        return;
+    }
+    const size_t chunk = (count + threads - 1) / threads;
+    // jthread makes a partially-created set exception-safe: if the next OS thread cannot be
+    // created, already-started workers are still joined. Finish the unspawned ranges on this
+    // thread so transient resource pressure degrades to less parallelism instead of aborting.
+    std::vector<std::jthread> workers;
+    workers.reserve(threads - 1);
+    unsigned next_worker = 1;
+    try {
+        for (; next_worker < threads; ++next_worker) {
+            const size_t begin = static_cast<size_t>(next_worker) * chunk;
+            const size_t end = std::min(count, begin + chunk);
+            if (begin >= end) break;
+            workers.emplace_back([&body, begin, end] { body(begin, end); });
+        }
+    } catch (const std::system_error&) {
+        // Fall through: ranges that did not get a worker run synchronously below.
+    }
+    body(size_t{0}, std::min(count, chunk));
+    for (; next_worker < threads; ++next_worker) {
+        const size_t begin = static_cast<size_t>(next_worker) * chunk;
+        const size_t end = std::min(count, begin + chunk);
+        if (begin >= end) break;
+        body(begin, end);
+    }
+}
+
+#if defined(PROSPER_HAVE_TARGET_F16C)
+__attribute__((target("avx2")))
+__m128i storage_pack_unorm8x8_avx2(__m256 values) {
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 scale = _mm256_set1_ps(255.0f);
+    const __m256 half = _mm256_set1_ps(0.5f);
+    // Reproduce storage_pack_unorm8 exactly: unordered/negative/zero -> 0, >=1 -> 255,
+    // otherwise multiply in float32 and round a .5 tie upward. Clamp before CVTTPS2DQ so NaN
+    // and infinities never raise an invalid-conversion exception.
+    const __m256 positive = _mm256_cmp_ps(values, zero, _CMP_GT_OQ);
+    const __m256 upper = _mm256_cmp_ps(values, one, _CMP_GE_OQ);
+    __m256 bounded = _mm256_blendv_ps(zero, values, positive);
+    bounded = _mm256_blendv_ps(bounded, one, upper);
+    const __m256 scaled = _mm256_mul_ps(bounded, scale);
+    const __m256i whole = _mm256_cvttps_epi32(scaled);
+    const __m256 fraction = _mm256_sub_ps(scaled, _mm256_cvtepi32_ps(whole));
+    const __m256i increment = _mm256_castps_si256(
+        _mm256_cmp_ps(fraction, half, _CMP_GE_OQ));
+    const __m256i rounded = _mm256_sub_epi32(whole, increment); // true mask is -1
+    const __m128i words = _mm_packus_epi32(
+        _mm256_castsi256_si128(rounded), _mm256_extracti128_si256(rounded, 1));
+    return _mm_packus_epi16(words, _mm_setzero_si128());
+}
+
+__attribute__((target("avx2")))
+void storage_pack_unorm8_avx2(const uint32_t* channels, uint32_t components,
+                              size_t begin, size_t end, uint8_t* packed) {
+    size_t texel = begin;
+    size_t step = 0;
+    if (components == 2) {
+        step = 4;
+    } else if (components == 4) {
+        step = 2;
+    }
+    for (; step && texel + step <= end; texel += step) {
+        __m256i bits;
+        if (components == 4) {
+            bits = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(channels + texel * 4));
+        } else {
+            const uint32_t* source = channels + texel * 4;
+            const __m128i texels01 = _mm_unpacklo_epi64(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(source)),
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(source + 4)));
+            const __m128i texels23 = _mm_unpacklo_epi64(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(source + 8)),
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(source + 12)));
+            bits = _mm256_inserti128_si256(_mm256_castsi128_si256(texels01), texels23, 1);
+        }
+        const __m256 values = _mm256_castsi256_ps(bits);
+        const __m128i bytes = storage_pack_unorm8x8_avx2(values);
+        _mm_storel_epi64(
+            reinterpret_cast<__m128i*>(packed + texel * components), bytes);
+    }
+    for (; texel < end; ++texel)
+        for (uint32_t channel = 0; channel < components; ++channel)
+            packed[texel * components + channel] =
+                storage_pack_unorm8(channels[texel * 4 + channel]);
+}
+
+__attribute__((target("avx2,f16c")))
+void sampled_float16x4_to_unorm8_f16c(const uint8_t* source, size_t begin, size_t end,
+                                      uint8_t* rgba,
+                                      const std::array<uint8_t, 65536>& fallback_table) {
+    size_t channel = begin * 4;
+    const size_t channel_end = end * 4;
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 scale = _mm256_set1_ps(255.0f);
+    const __m256 rounding = _mm256_set1_ps(0.5f);
+    for (; channel + 8 <= channel_end; channel += 8) {
+        const __m128i half = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(source + channel * sizeof(uint16_t)));
+        __m256 value = _mm256_cvtph_ps(half);
+        // Match the scalar contract exactly: NaN/negative -> 0, +infinity/>1 -> 1, then
+        // round non-negative value*255 halfway away from zero (floor(x + 0.5)).
+        value = _mm256_and_ps(value, _mm256_cmp_ps(value, value, _CMP_ORD_Q));
+        value = _mm256_min_ps(_mm256_max_ps(value, zero), one);
+        const __m256i integers = _mm256_cvttps_epi32(
+            _mm256_add_ps(_mm256_mul_ps(value, scale), rounding));
+        const __m128i words = _mm_packus_epi32(
+            _mm256_castsi256_si128(integers), _mm256_extracti128_si256(integers, 1));
+        const __m128i bytes = _mm_packus_epi16(words, _mm_setzero_si128());
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(rgba + channel), bytes);
+    }
+    for (; channel < channel_end; ++channel) {
+        uint16_t half = 0;
+        std::memcpy(&half, source + channel * sizeof(half), sizeof(half));
+        rgba[channel] = fallback_table[half];
+    }
+}
+
+__attribute__((target("avx2,f16c")))
+void storage_pack_float16x4_f16c(const uint32_t* channels, size_t begin, size_t end,
+                                 uint8_t* rgba16f) {
+    size_t texel = begin;
+    for (; texel + 2 <= end; texel += 2) {
+        const __m256 values = _mm256_castsi256_ps(_mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(channels + texel * 4)));
+        const __m128i half = _mm256_cvtps_ph(
+            values, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(rgba16f + texel * 8), half);
+
+        // CVTPS2PH quiets signaling NaNs, while the established scalar contract preserves the top
+        // payload bits verbatim. That scalar also historically keeps an odd half exponent unchanged
+        // when mantissa rounding carries into bit 10 (rather than incrementing it). Preserve both
+        // observable behaviors by repairing only those rare lanes after the vector conversion.
+        for (unsigned lane = 0; lane < 8; ++lane) {
+            const uint32_t bits = channels[texel * 4 + lane];
+            const uint32_t exponent = (bits >> 23) & 0xffu;
+            const uint32_t mantissa = bits & 0x7fffffu;
+            bool scalar_lane = exponent == 0xffu && mantissa != 0;
+            const int32_t half_exponent = static_cast<int32_t>(exponent) - 127 + 15;
+            if (!scalar_lane && half_exponent > 0 && half_exponent < 31 &&
+                (half_exponent & 1) && (mantissa >> 13) == 0x3ffu) {
+                const uint32_t remainder = mantissa & 0x1fffu;
+                scalar_lane = remainder >= 0x1000u; // tie rounds up: 0x3ff is odd
+            }
+            if (!scalar_lane) continue;
+            float value;
+            std::memcpy(&value, &bits, sizeof(value));
+            const uint16_t scalar = prosper::gpu::float_to_half(value);
+            std::memcpy(rgba16f + texel * 8 + lane * sizeof(scalar), &scalar, sizeof(scalar));
+        }
+    }
+    for (; texel < end; ++texel) {
+        for (uint32_t channel = 0; channel < 4; ++channel) {
+            float value;
+            std::memcpy(&value, channels + texel * 4 + channel, sizeof(value));
+            const uint16_t half = prosper::gpu::float_to_half(value);
+            std::memcpy(rgba16f + texel * 8 + channel * sizeof(half), &half, sizeof(half));
+        }
+    }
+}
+
+__attribute__((target("avx2,f16c")))
+void storage_unpack_float16x4_f16c(const uint8_t* rgba16f, size_t begin, size_t end,
+                                   uint32_t* channels) {
+    size_t texel = begin;
+    const __m128i exponent_mask = _mm_set1_epi16(0x7c00);
+    const __m128i mantissa_mask = _mm_set1_epi16(0x03ff);
+    for (; texel + 2 <= end; texel += 2) {
+        const __m128i half = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(rgba16f + texel * 8));
+        const __m256 values = _mm256_cvtph_ps(half);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(channels + texel * 4),
+                            _mm256_castps_si256(values));
+
+        // CVTPH2PS quiets signaling NaNs; half_to_float intentionally preserves their payload bits.
+        // Detect the uncommon NaN lanes as packed 16-bit values and repair only those through the
+        // exhaustive table. Normal numbers, subnormals, infinities and quiet NaNs are already exact.
+        const __m128i exponent = _mm_and_si128(half, exponent_mask);
+        const __m128i mantissa = _mm_and_si128(half, mantissa_mask);
+        const __m128i exponent_all_ones = _mm_cmpeq_epi16(exponent, exponent_mask);
+        const __m128i mantissa_zero = _mm_cmpeq_epi16(mantissa, _mm_setzero_si128());
+        const __m128i nan_lanes = _mm_andnot_si128(mantissa_zero, exponent_all_ones);
+        if (_mm_movemask_epi8(nan_lanes)) {
+            for (unsigned lane = 0; lane < 8; ++lane) {
+                uint16_t bits = 0;
+                std::memcpy(&bits, rgba16f + texel * 8 + lane * sizeof(bits), sizeof(bits));
+                if ((bits & 0x7c00u) == 0x7c00u && (bits & 0x03ffu) != 0)
+                    channels[texel * 4 + lane] = storage_unpack_float16_bits(bits);
+            }
+        }
+    }
+    for (; texel < end; ++texel) {
+        for (uint32_t channel = 0; channel < 4; ++channel) {
+            uint16_t bits = 0;
+            std::memcpy(&bits, rgba16f + texel * 8 + channel * sizeof(bits), sizeof(bits));
+            channels[texel * 4 + channel] = storage_unpack_float16_bits(bits);
+        }
+    }
+}
+#endif
 
 struct ComputeMemoryKey {
     VkDeviceSize bytes = 0;
@@ -62,6 +349,7 @@ struct ComputeMemoryPool {
     std::mutex mutex;
     std::unordered_map<ComputeMemoryKey, std::vector<VkDeviceMemory>, ComputeMemoryKeyHash> available;
     std::unordered_map<VkDeviceMemory, ComputeMemoryKey> active;
+    std::unordered_map<VkDeviceMemory, void*> persistent_mappings;
     VkDeviceSize cached_bytes = 0;
     size_t cached_allocations = 0;
     uint64_t hits = 0;
@@ -92,7 +380,11 @@ bool compute_memory_pool_enabled() {
 VkDeviceSize compute_memory_pool_limit() {
     static const VkDeviceSize limit = []() -> VkDeviceSize {
         const char* value = std::getenv("PROSPER_COMPUTE_MEMORY_POOL_MB");
-        const uint64_t mib = value ? std::strtoull(value, nullptr, 10) : 256ull;
+        // Astro Bot's first 120 frames stabilize at about 614 MiB of differently-sized image and
+        // staging allocations. A 256 MiB cache discarded about 200 allocations and repeatedly paid
+        // AMD BO page initialization; 640 MiB holds that measured working set with zero discards,
+        // while remaining a bounded fraction of the renderer's persistent-target budget.
+        const uint64_t mib = value ? std::strtoull(value, nullptr, 10) : 640ull;
         if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
         return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
     }();
@@ -105,6 +397,10 @@ struct VulkanComputeContext {
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    uint32_t descriptor_buffer_capacity = 0;
+    uint32_t descriptor_sampled_capacity = 0;
+    uint32_t descriptor_storage_capacity = 0;
     std::unordered_map<std::string, CachedComputePipeline> pipelines;
     uint32_t queue_family = UINT32_MAX;
     VkPhysicalDeviceMemoryProperties memory{};
@@ -120,6 +416,7 @@ struct VulkanComputeContext {
 
     ~VulkanComputeContext() {
         release_cached_memory();
+        if (descriptor_pool) vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
         for (const auto& [key, cached] : pipelines) {
             (void)key;
             if (cached.pipeline) vkDestroyPipeline(device, cached.pipeline, nullptr);
@@ -135,20 +432,117 @@ struct VulkanComputeContext {
         if (instance) vkDestroyInstance(instance, nullptr);
     }
 
-    VkDeviceMemory allocate_memory(VkDeviceSize bytes, uint32_t memory_type) {
+    static bool descriptor_pool_reuse_enabled() {
+        static const bool enabled = std::getenv("PROSPER_NO_DESCRIPTOR_POOL_REUSE") == nullptr;
+        return enabled;
+    }
+
+    VkDescriptorPool prepare_descriptor_pool(uint32_t buffers, uint32_t sampled,
+                                             uint32_t storage) {
+        if (!descriptor_pool_reuse_enabled()) return VK_NULL_HANDLE;
+        if (descriptor_pool && buffers <= descriptor_buffer_capacity &&
+            sampled <= descriptor_sampled_capacity && storage <= descriptor_storage_capacity) {
+            if (vkResetDescriptorPool(device, descriptor_pool, 0) == VK_SUCCESS)
+                return descriptor_pool;
+            vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
+            descriptor_pool = VK_NULL_HANDLE;
+        } else if (descriptor_pool) {
+            vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
+            descriptor_pool = VK_NULL_HANDLE;
+        }
+        descriptor_buffer_capacity = std::max(buffers, descriptor_buffer_capacity);
+        descriptor_sampled_capacity = std::max(sampled, descriptor_sampled_capacity);
+        descriptor_storage_capacity = std::max(storage, descriptor_storage_capacity);
+        VkDescriptorPoolSize sizes[3];
+        uint32_t count = 0;
+        if (descriptor_buffer_capacity)
+            sizes[count++] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, descriptor_buffer_capacity};
+        if (descriptor_sampled_capacity)
+            sizes[count++] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                              descriptor_sampled_capacity};
+        if (descriptor_storage_capacity)
+            sizes[count++] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, descriptor_storage_capacity};
+        VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        info.maxSets = 1;
+        info.poolSizeCount = count;
+        info.pPoolSizes = sizes;
+        if (!count || vkCreateDescriptorPool(device, &info, nullptr, &descriptor_pool) != VK_SUCCESS)
+            descriptor_pool = VK_NULL_HANDLE;
+        return descriptor_pool;
+    }
+
+    static bool persistent_mapping_enabled() {
+        static const bool enabled =
+            std::getenv("PROSPER_NO_PERSISTENT_COMPUTE_MAP") == nullptr;
+        return enabled;
+    }
+
+    size_t release_available_memory() {
+        if (!device) return 0;
+        std::lock_guard<std::mutex> lock(memory_pool.mutex);
+        size_t released = 0;
+        for (const auto& [key, allocations] : memory_pool.available) {
+            (void)key;
+            for (VkDeviceMemory allocation : allocations) {
+                if (memory_pool.persistent_mappings.erase(allocation))
+                    vkUnmapMemory(device, allocation);
+                vkFreeMemory(device, allocation, nullptr);
+                ++released;
+            }
+        }
+        memory_pool.available.clear();
+        memory_pool.cached_bytes = 0;
+        memory_pool.cached_allocations = 0;
+        memory_pool.discarded += released;
+        return released;
+    }
+
+    VkDeviceMemory allocate_memory(VkDeviceSize bytes, uint32_t memory_type,
+                                   bool persistently_map = false) {
         if (memory_type == UINT32_MAX) return VK_NULL_HANDLE;
         const ComputeMemoryKey key{bytes, memory_type};
+        static const bool best_fit_reuse =
+            std::getenv("PROSPER_COMPUTE_MEMORY_POOL_EXACT") == nullptr;
         if (compute_memory_pool_enabled()) {
             std::lock_guard<std::mutex> lock(memory_pool.mutex);
             auto found = memory_pool.available.find(key);
+            // Vulkan permits binding an allocation larger than the resource's memory requirement.
+            // Exact-size-only reuse fragmented Astro Bot's 256 MiB pool across many nearly-identical
+            // image/staging sizes, forcing hundreds of fresh AMD BO allocations and kernel page-zero
+            // passes. On an exact miss, reuse the smallest available allocation of the same memory
+            // type that is large enough. Keep its REAL size in active so release/accounting remain
+            // exact and a large allocation is never accidentally treated as a smaller one.
+            if ((found == memory_pool.available.end() || found->second.empty()) &&
+                best_fit_reuse) {
+                auto best = memory_pool.available.end();
+                for (auto candidate = memory_pool.available.begin();
+                     candidate != memory_pool.available.end(); ++candidate) {
+                    if (candidate->second.empty() || candidate->first.memory_type != memory_type ||
+                        candidate->first.bytes < bytes)
+                        continue;
+                    if (best == memory_pool.available.end() ||
+                        candidate->first.bytes < best->first.bytes)
+                        best = candidate;
+                }
+                found = best;
+            }
             if (found != memory_pool.available.end() && !found->second.empty()) {
+                const ComputeMemoryKey allocation_key = found->first;
                 const VkDeviceMemory allocation = found->second.back();
                 found->second.pop_back();
                 if (found->second.empty()) memory_pool.available.erase(found);
-                memory_pool.cached_bytes -= bytes;
+                memory_pool.cached_bytes -= allocation_key.bytes;
                 --memory_pool.cached_allocations;
                 ++memory_pool.hits;
-                memory_pool.active.emplace(allocation, key);
+                memory_pool.active.emplace(allocation, allocation_key);
+                if (persistently_map && persistent_mapping_enabled() &&
+                    memory_pool.persistent_mappings.find(allocation) ==
+                        memory_pool.persistent_mappings.end()) {
+                    void* mapping = nullptr;
+                    if (vkMapMemory(device, allocation, 0, allocation_key.bytes, 0, &mapping) ==
+                        VK_SUCCESS)
+                        memory_pool.persistent_mappings.emplace(allocation, mapping);
+                }
                 return allocation;
             }
             ++memory_pool.misses;
@@ -158,13 +552,52 @@ struct VulkanComputeContext {
         allocation.allocationSize = bytes;
         allocation.memoryTypeIndex = memory_type;
         VkDeviceMemory result = VK_NULL_HANDLE;
-        if (vkAllocateMemory(device, &allocation, nullptr, &result) != VK_SUCCESS)
-            return VK_NULL_HANDLE;
+        VkResult allocation_result = vkAllocateMemory(device, &allocation, nullptr, &result);
+        if (allocation_result != VK_SUCCESS && compute_memory_pool_enabled()) {
+            // Cached allocations are expendable. Under real heap pressure, release them before
+            // propagating OOM so an enlarged reuse cache can never strand memory needed now.
+            const size_t released = release_available_memory();
+            if (released) {
+                fprintf(stderr,
+                        "[compute] allocation failed (%d); evicted %zu cached allocation(s) and retrying\n",
+                        static_cast<int>(allocation_result), released);
+                allocation_result = vkAllocateMemory(device, &allocation, nullptr, &result);
+            }
+        }
+        if (allocation_result != VK_SUCCESS) return VK_NULL_HANDLE;
         if (compute_memory_pool_enabled()) {
             std::lock_guard<std::mutex> lock(memory_pool.mutex);
             memory_pool.active.emplace(result, key);
+            if (persistently_map && persistent_mapping_enabled()) {
+                void* mapping = nullptr;
+                if (vkMapMemory(device, result, 0, bytes, 0, &mapping) == VK_SUCCESS)
+                    memory_pool.persistent_mappings.emplace(result, mapping);
+            }
         }
         return result;
+    }
+
+    VkResult map_memory(VkDeviceMemory allocation, VkDeviceSize offset, VkDeviceSize bytes,
+                        void** mapping) {
+        if (compute_memory_pool_enabled() && persistent_mapping_enabled()) {
+            std::lock_guard<std::mutex> lock(memory_pool.mutex);
+            const auto found = memory_pool.persistent_mappings.find(allocation);
+            if (found != memory_pool.persistent_mappings.end()) {
+                *mapping = static_cast<uint8_t*>(found->second) + offset;
+                return VK_SUCCESS;
+            }
+        }
+        return vkMapMemory(device, allocation, offset, bytes, 0, mapping);
+    }
+
+    void unmap_memory(VkDeviceMemory allocation) {
+        if (compute_memory_pool_enabled() && persistent_mapping_enabled()) {
+            std::lock_guard<std::mutex> lock(memory_pool.mutex);
+            if (memory_pool.persistent_mappings.find(allocation) !=
+                memory_pool.persistent_mappings.end())
+                return;
+        }
+        vkUnmapMemory(device, allocation);
     }
 
     void release_memory(VkDeviceMemory allocation) {
@@ -176,6 +609,8 @@ struct VulkanComputeContext {
         std::lock_guard<std::mutex> lock(memory_pool.mutex);
         auto found = memory_pool.active.find(allocation);
         if (found == memory_pool.active.end()) {
+            if (memory_pool.persistent_mappings.erase(allocation))
+                vkUnmapMemory(device, allocation);
             vkFreeMemory(device, allocation, nullptr);
             return;
         }
@@ -187,6 +622,8 @@ struct VulkanComputeContext {
             ? limit - memory_pool.cached_bytes : 0;
         if (memory_pool.cached_allocations >= max_cached_allocations || key.bytes > remaining) {
             ++memory_pool.discarded;
+            if (memory_pool.persistent_mappings.erase(allocation))
+                vkUnmapMemory(device, allocation);
             vkFreeMemory(device, allocation, nullptr);
             return;
         }
@@ -206,15 +643,21 @@ struct VulkanComputeContext {
         std::lock_guard<std::mutex> lock(memory_pool.mutex);
         for (const auto& [key, allocations] : memory_pool.available) {
             (void)key;
-            for (VkDeviceMemory allocation : allocations)
+            for (VkDeviceMemory allocation : allocations) {
+                if (memory_pool.persistent_mappings.erase(allocation))
+                    vkUnmapMemory(device, allocation);
                 vkFreeMemory(device, allocation, nullptr);
+            }
         }
         for (const auto& [allocation, key] : memory_pool.active) {
             (void)key;
+            if (memory_pool.persistent_mappings.erase(allocation))
+                vkUnmapMemory(device, allocation);
             vkFreeMemory(device, allocation, nullptr);
         }
         memory_pool.available.clear();
         memory_pool.active.clear();
+        memory_pool.persistent_mappings.clear();
         memory_pool.cached_bytes = 0;
         memory_pool.cached_allocations = 0;
     }
@@ -353,6 +796,25 @@ struct BoundBuffer {
     uint64_t changed_bytes = 0;
 };
 
+// Image conversion writes straight into the host-visible Vulkan staging allocation. Keep the map
+// scoped so every validation/error exit unmaps it before cleanup releases the pooled memory.
+struct ScopedMappedMemory {
+    explicit ScopedMappedMemory(VulkanComputeContext& c) : context(c) {}
+    ~ScopedMappedMemory() { unmap(); }
+    ScopedMappedMemory(const ScopedMappedMemory&) = delete;
+    ScopedMappedMemory& operator=(const ScopedMappedMemory&) = delete;
+
+    void unmap() {
+        if (!data) return;
+        context.unmap_memory(memory);
+        data = nullptr;
+    }
+
+    VulkanComputeContext& context;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* data = nullptr;
+};
+
 // One image binding (#590): a sampled texture (usually RGBA8, with native UINT8x4 and R11G11B10F
 // views where shader-visible numeric semantics require them) or a storage image (R32G32B32A32_UINT
 // texels — the recompiler's format-free contract, exec-diff proven by tests/image_compute_runner.h).
@@ -449,9 +911,10 @@ void storage_unpack_texel(const uint8_t* src, prosper::gpu::DataFormat f, uint32
     for (uint32_t c = 0; c < ncomp && c < 4; c++) {
         switch (f) {
             case DF::Unorm8: { float v = src[c] / 255.0f; std::memcpy(&out[c], &v, 4); break; }
-            case DF::Float16: { float v = prosper::gpu::half_to_float(
-                                    (uint16_t)(src[c * 2] | (src[c * 2 + 1] << 8)));
-                                std::memcpy(&out[c], &v, 4); break; }
+            case DF::Float16:
+                out[c] = storage_unpack_float16_bits(
+                    static_cast<uint16_t>(src[c * 2] | (src[c * 2 + 1] << 8)));
+                break;
             // Integer formats carry the raw channel value; a UINT/SINT image_load reads the stored
             // integer directly (zero-extend for Uint, sign-extend for Sint). No normalization.
             case DF::Uint8:  out[c] = src[c]; break;
@@ -492,14 +955,21 @@ void storage_unpack_range(const uint8_t* src, size_t src_stride, prosper::gpu::D
             }
             return;
         case DF::Float16:
-            for (size_t t = 0; t < count; ++t) {
-                const uint8_t* p = src + t * src_stride; uint32_t* o = out + t * 4; defaults(o);
-                for (uint32_t c = 0; c < n; ++c) {
-                    float v = prosper::gpu::half_to_float(
-                        static_cast<uint16_t>(p[c * 2] | (p[c * 2 + 1] << 8)));
-                    std::memcpy(&o[c], &v, 4);
-                }
+            if (n == 4 && src_stride == 8) {
+                storage_unpack_float16x4_range(src, count, out);
+                return;
             }
+            parallel_compute_texels(count, count * (src_stride + sizeof(uint32_t) * 4),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint8_t* p = src + t * src_stride;
+                        uint32_t* o = out + t * 4;
+                        defaults(o);
+                        for (uint32_t c = 0; c < n; ++c)
+                            o[c] = storage_unpack_float16_bits(
+                                static_cast<uint16_t>(p[c * 2] | (p[c * 2 + 1] << 8)));
+                    }
+                });
             return;
         case DF::Uint8:
             for (size_t t = 0; t < count; ++t) {
@@ -552,21 +1022,38 @@ void storage_pack_range(const uint32_t* channels, prosper::gpu::DataFormat f, ui
     const uint32_t n = ncomp < 4u ? ncomp : 4u;
     switch (f) {
         case DF::Unorm8:
-            for (size_t t = 0; t < count; ++t) {
-                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
-                for (uint32_t c = 0; c < n; ++c) p[c] = storage_pack_unorm8(in[c]);
+            if (dst_stride == n && n >= 1 && n <= 4) {
+                storage_pack_unorm8_range(channels, n, count, dst);
+                return;
             }
+            parallel_compute_texels(count, count * (sizeof(uint32_t) * 4 + dst_stride),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint32_t* in = channels + t * 4;
+                        uint8_t* p = dst + t * dst_stride;
+                        for (uint32_t c = 0; c < n; ++c)
+                            p[c] = storage_pack_unorm8(in[c]);
+                    }
+                });
             return;
         case DF::Float16:
-            for (size_t t = 0; t < count; ++t) {
-                const uint32_t* in = channels + t * 4; uint8_t* p = dst + t * dst_stride;
-                for (uint32_t c = 0; c < n; ++c) {
-                    float v; std::memcpy(&v, &in[c], 4);
-                    const uint16_t h = prosper::gpu::float_to_half(v);
-                    p[c * 2] = static_cast<uint8_t>(h);
-                    p[c * 2 + 1] = static_cast<uint8_t>(h >> 8);
-                }
+            if (n == 4 && dst_stride == 8) {
+                storage_pack_float16x4_range(channels, count, dst);
+                return;
             }
+            parallel_compute_texels(count, count * (sizeof(uint32_t) * 4 + dst_stride),
+                [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const uint32_t* in = channels + t * 4;
+                        uint8_t* p = dst + t * dst_stride;
+                        for (uint32_t c = 0; c < n; ++c) {
+                            float v; std::memcpy(&v, &in[c], 4);
+                            const uint16_t h = prosper::gpu::float_to_half(v);
+                            p[c * 2] = static_cast<uint8_t>(h);
+                            p[c * 2 + 1] = static_cast<uint8_t>(h >> 8);
+                        }
+                    }
+                });
             return;
         case DF::Uint8: case DF::Sint8:
             for (size_t t = 0; t < count; ++t) {
@@ -786,6 +1273,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     std::vector<VkDeviceSize> staging_bytes(image_descriptors.size(), 0);
     VkDescriptorSetLayout descriptor_layout = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    bool descriptor_pool_reused = false;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     VkShaderModule shader = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
@@ -817,7 +1305,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (descriptor_layout)
                 vkDestroyDescriptorSetLayout(ctx.device, descriptor_layout, nullptr);
         }
-        if (descriptor_pool) vkDestroyDescriptorPool(ctx.device, descriptor_pool, nullptr);
+        if (descriptor_pool && !descriptor_pool_reused)
+            vkDestroyDescriptorPool(ctx.device, descriptor_pool, nullptr);
         for (auto& buffer : buffers) {
             if (buffer.alias_of != SIZE_MAX) continue;
             if (buffer.buffer) vkDestroyBuffer(ctx.device, buffer.buffer, nullptr);
@@ -879,11 +1368,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 vkGetBufferMemoryRequirements(ctx.device, buffers[i].buffer, &requirements);
                 const uint32_t memory_type = ctx.host_memory_type(requirements.memoryTypeBits);
                 if (memory_type == UINT32_MAX) break;
-                buffers[i].memory = ctx.allocate_memory(requirements.size, memory_type);
+                buffers[i].memory = ctx.allocate_memory(requirements.size, memory_type, true);
                 if (!buffers[i].memory) break;
                 if (vkBindBufferMemory(ctx.device, buffers[i].buffer, buffers[i].memory, 0) != VK_SUCCESS) break;
                 void* mapped = nullptr;
-                if (vkMapMemory(ctx.device, buffers[i].memory, 0, resource->size, 0, &mapped) != VK_SUCCESS) break;
+                if (ctx.map_memory(buffers[i].memory, 0, resource->size, &mapped) != VK_SUCCESS)
+                    break;
                 const uint8_t* source = resource_bytes(resource);
                 if (trace) buffers[i].before_hash = fnv1a(source, resource->size);
                 // Pooled host-visible allocations retain their previous contents. Compare them with
@@ -892,7 +1382,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // still takes the ordinary full-copy path.
                 if (std::memcmp(mapped, source, resource->size) != 0)
                     std::memcpy(mapped, source, resource->size);
-                vkUnmapMemory(ctx.device, buffers[i].memory);
+                ctx.unmap_memory(buffers[i].memory);
             }
 
             layout_bindings[i].binding = descriptors[i].binding;
@@ -992,17 +1482,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             LiveTargetSnapshot live_target;
             bool renderer_owned = !r->in_mip_tail && is_live_render_target(r->gpu_addr);
             // Bind the renderer's own image when it is the authoritative copy and this binding
-            // matches it EXACTLY (#1095, phase 2 of #1091). Restricted to a sampled Unorm8x4 view of
-            // an rgba8 target because that is the one shape whose host path is a plain memcpy into a
-            // VK_FORMAT_R8G8B8A8_UNORM image -- the direct bind is then byte-identical, and it skips
-            // a full readback plus a re-upload of those same pixels to the same device. Every other
-            // shape (notably rgba16f, which the host path converts down to UNORM8) keeps that path.
+            // matches it EXACTLY (#1095, phase 2 of #1091). RGBA8 and RGBA16F targets both have a
+            // byte-identical sampled Vulkan view, so neither needs to round-trip through a CPU
+            // snapshot. The FP16 case is especially important for full-resolution post processing:
+            // converting a 4K target down to UNORM8 cost more than the compute dispatch itself and
+            // also discarded HDR values. Aliases and numerically converted views keep the snapshot
+            // path below.
             if (renderer_owned && !bi.storage && !dim_1d && !dim_3d && !dim_2d_array &&
-                r->depth == 1 && !r->depth_compare && r->format == DataFormat::Unorm8 &&
-                (r->num_components ? r->num_components : 1) == 4) {
+                r->depth == 1 && !r->depth_compare) {
                 LiveTargetImageImport import;
                 if (import_live_render_target_image(r->gpu_addr, import)) {
-                    if (import.format == LiveTargetPixelFormat::Rgba8Unorm &&
+                    if (direct_sampled_rtt_compatible(
+                            r->format, r->num_components ? r->num_components : 1,
+                            import.format) &&
                         import.width == r->width && import.height == r->height &&
                         import.device == static_cast<void*>(ctx.device)) {
                         bi.imported = true;
@@ -1015,9 +1507,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         if (trace)
                             std::fprintf(stderr,
                                          "[compute]   bound renderer RTT in place binding=%u "
-                                         "addr=0x%llx extent=%ux%u format=rgba8\n",
+                                         "addr=0x%llx extent=%ux%u format=%s\n",
                                          bi.binding, (unsigned long long)r->gpu_addr,
-                                         r->width, r->height);
+                                         r->width, r->height,
+                                         import.format == LiveTargetPixelFormat::Rgba16Float
+                                             ? "rgba16f" : "rgba8");
                     } else {
                         // Not our exact contract (a different device or a stale aliased view).
                         release_live_render_target_image(r->gpu_addr);
@@ -1256,6 +1750,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const bool sampled_float32 = !bi.storage && !sampled_depth &&
                                          r->format == DataFormat::Float32 &&
                                          sampled_components >= 1 && sampled_components <= 4;
+            // Imported renderer-owned RGBA16F is already the exact native sampled representation.
+            // Guest-backed FP16 retains the historical RGBA8 conversion until its independent
+            // upload-format contract is changed.
+            const bool sampled_float16_native = !bi.storage && bi.imported &&
+                                                r->format == DataFormat::Float16 &&
+                                                sampled_components == 4;
             const bool sampled_unorm8x2 = !bi.storage && r->format == DataFormat::Unorm8 &&
                                           sampled_components == 2;
             const bool sampled_unorm16_native = !bi.storage && r->format == DataFormat::Unorm16 &&
@@ -1272,6 +1772,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                                 sampled_components == 4);
             const uint32_t texel_bytes = bi.storage || sampled_float32 ? 16u
                                          : sampled_depth ? data_format_bytes(r->format)
+                                         : sampled_float16_native ? 8u
                                          : sampled_uint32_native ? sampled_components * 4u
                                          : sampled_uint16_native ? sampled_components * 2u
                                          : sampled_unorm16_native ? sampled_components * 2u
@@ -1285,8 +1786,34 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             staging_bytes[i] = sbytes;
 
-            // Fill the upload staging bytes.
-            std::vector<uint8_t> upload((bi.imported || bi.seed_skip) ? size_t{0} : (size_t)sbytes, 0);
+            // Allocate the host-visible staging buffer before conversion and write into its mapping
+            // directly. The old path first built a heap upload and then memcpy'd the complete result
+            // here -- an extra 132 MiB CPU pass for Astro Bot's 4K RGBA32 storage representation.
+            ScopedMappedMemory upload_mapping(ctx);
+            const size_t upload_size = (bi.imported || bi.seed_skip) ? size_t{0} : (size_t)sbytes;
+            if (!bi.imported) {
+                VkBufferCreateInfo sci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+                sci.size = sbytes;
+                sci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                if (!vk_ok(vkCreateBuffer(ctx.device, &sci, nullptr, &staging[i]),
+                           "image-staging-buffer")) { images_ready = false; break; }
+                VkMemoryRequirements sreq{};
+                vkGetBufferMemoryRequirements(ctx.device, staging[i], &sreq);
+                const uint32_t staging_memory_type = ctx.host_memory_type(sreq.memoryTypeBits);
+                staging_memory[i] = ctx.allocate_memory(sreq.size, staging_memory_type, true);
+                if (!vk_handle_ok(staging_memory[i], "image-staging-memory") ||
+                    !vk_ok(vkBindBufferMemory(ctx.device, staging[i], staging_memory[i], 0),
+                           "image-staging-bind")) {
+                    images_ready = false; break;
+                }
+                upload_mapping.memory = staging_memory[i];
+                if (!bi.seed_skip &&
+                    !vk_ok(ctx.map_memory(staging_memory[i], 0, sbytes,
+                                          &upload_mapping.data), "image-staging-map")) {
+                    images_ready = false; break;
+                }
+            }
+            auto* upload = static_cast<uint8_t*>(upload_mapping.data);
             if (bi.imported) {
                 // The renderer's image is the source: there is nothing to convert or stage.
                 bi.guest_bytes = 0;
@@ -1328,15 +1855,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                       (r->host_data && r->host_data_size >= guest_bytes) ||
                                       guest_readable(r->gpu_addr, static_cast<uint32_t>(guest_bytes));
                 if (!readable) { skip_image(r, "storage backing unreadable"); break; }
-                std::vector<uint8_t> linear(bi.seed_skip ? size_t{0}
-                                            : (size_t)linear_guest_bytes, 0);
+                const size_t linear_size = bi.seed_skip
+                    ? size_t{0} : static_cast<size_t>(linear_guest_bytes);
+                std::unique_ptr<uint8_t[]> linear;
+                if (linear_size && !renderer_owned && r->tile_mode)
+                    linear = std::make_unique_for_overwrite<uint8_t[]>(linear_size);
+                const uint8_t* unpack_source = nullptr;
                 if (bi.seed_skip) {
                     // #1122: write-only full-coverage target -- the shader overwrites every texel, so
                     // the image is created but never seeded, uploaded, or read. Nothing to fill.
                 } else if (renderer_owned) {
-                    std::memcpy(linear.data(), live_target.pixels->data(), linear.size());
+                    unpack_source = live_target.pixels->data();
                     if (trace) {
-                        bi.before_hash = fnv1a(linear.data(), linear.size());
+                        bi.before_hash = fnv1a(unpack_source, linear_size);
                         std::fprintf(stderr,
                                      "[compute]   imported writable renderer RTT binding=%u "
                                      "addr=0x%llx extent=%ux%u format=%s\n",
@@ -1347,33 +1878,38 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     }
                 } else if (r->tile_mode && r->depth > 1) {
                     if (trace) bi.before_hash = fnv1a(src, guest_bytes);
-                    if (!detile_volume(linear.data(), src, guest_bytes, r->width, r->height,
+                    if (!detile_volume(linear.get(), src, guest_bytes, r->width, r->height,
                                        r->depth, r->tile_mode, static_cast<uint32_t>(guest_texel))) {
                         skip_image(r, "storage volume detile failed"); break;
                     }
+                    unpack_source = linear.get();
                 } else if (r->tile_mode && r->in_mip_tail) {
                     if (trace) bi.before_hash = fnv1a(src, guest_bytes);
-                    detile_surface_level(linear.data(), src, guest_bytes,
+                    detile_surface_level(linear.get(), src, guest_bytes,
                                          r->width, r->height, r->tile_mode,
                                          static_cast<uint32_t>(guest_texel),
                                          r->mip_tail_x, r->mip_tail_y);
+                    unpack_source = linear.get();
                 } else if (r->tile_mode) {
                     if (trace) bi.before_hash = fnv1a(src, guest_bytes);
-                    detile_surface(linear.data(), src, r->width, r->height, r->tile_mode, 0,
+                    detile_surface(linear.get(), src, r->width, r->height, r->tile_mode, 0,
                                    static_cast<uint32_t>(guest_texel));
+                    unpack_source = linear.get();
                 } else {
                     if (trace) bi.before_hash = fnv1a(src, guest_bytes);
-                    std::memcpy(linear.data(), src, linear.size());
+                    // Linear guest storage is already in the row-major layout consumed by unpack.
+                    // Decode it in place instead of copying the complete surface to a temporary first.
+                    unpack_source = src;
                 }
                 if (!bi.seed_skip)
-                    storage_unpack_range(linear.data(), guest_texel, r->format, nc, texels,
-                                         reinterpret_cast<uint32_t*>(upload.data()));
+                    storage_unpack_range(unpack_source, guest_texel, r->format, nc, texels,
+                                         reinterpret_cast<uint32_t*>(upload));
                 if (bi.poison_verify) {   // #1122 coverage proof: poison every uvec4 channel
                     // Keep the clean detiled guest seed: on a partial-coverage proving frame the
                     // writeback restores every un-stored (still-poison) texel from it, so proving
                     // never corrupts the guest -- only the GPU `upload` is poisoned, `linear` is not.
-                    bi.seed_linear = linear;
-                    uint32_t* pp = reinterpret_cast<uint32_t*>(upload.data());
+                    bi.seed_linear.assign(unpack_source, unpack_source + linear_size);
+                    uint32_t* pp = reinterpret_cast<uint32_t*>(upload);
                     for (size_t t = 0; t < texels * 4; ++t) pp[t] = 0xDEADBEEFu;
                 }
                 static const bool verify_unpack =
@@ -1384,10 +1920,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     // and identifies the binding, and logs the clean case too so a verified run is
                     // self-proving rather than merely silent.
                     uint32_t expect[4];
-                    const uint32_t* got = reinterpret_cast<const uint32_t*>(upload.data());
+                    const uint32_t* got = reinterpret_cast<const uint32_t*>(upload);
                     size_t bad = 0, first_bad = 0;
                     for (size_t t = 0; t < texels; ++t) {
-                        storage_unpack_texel(linear.data() + t * guest_texel, r->format, nc, expect);
+                        storage_unpack_texel(unpack_source + t * guest_texel,
+                                             r->format, nc, expect);
                         if (std::memcmp(expect, got + t * 4, sizeof expect) != 0) {
                             if (!bad) first_bad = t;
                             ++bad;
@@ -1423,7 +1960,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         // byte-identical to the UINT view.  Sonic aliases an RGBA16F render target
                         // as RGBA16_UINT for a compute resolve: those eight bytes must be
                         // reinterpreted, not numerically converted through float or UNORM.
-                        std::memcpy(upload.data(), pixels.data(), upload.size());
+                        std::memcpy(upload, pixels.data(), upload_size);
                     } else if (sampled_uint8_native) {
                         const size_t texels = static_cast<size_t>(volume_texels);
                         for (size_t t = 0; t < texels; ++t) {
@@ -1473,30 +2010,34 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                     else if (f >= 1.0f) f = 1.0f;
                                     value = static_cast<uint16_t>(std::lround(f * 65535.0f));
                                 }
-                                std::memcpy(upload.data() +
+                                std::memcpy(upload +
                                                 (t * sampled_components + c) * sizeof(value),
                                             &value, sizeof(value));
                             }
                         }
                     } else if (f32) {
                         const size_t texels = static_cast<size_t>(volume_texels);
-                        for (size_t t = 0; t < texels; ++t) {
-                            for (uint32_t c = 0; c < 4; ++c) {
-                                float value = 0.0f;
-                                if (live_target.format == LiveTargetPixelFormat::Rgba8Unorm) {
-                                    value = pixels[t * 4 + c] / 255.0f;
-                                } else {
-                                    uint16_t half = 0;
-                                    std::memcpy(&half, pixels.data() + t * 8 + c * 2, sizeof(half));
-                                    value = half_to_float(half);
-                                    if (std::isnan(value)) value = 0.0f;
+                        parallel_compute_texels(texels, texels * (16u + 8u),
+                            [&](size_t begin, size_t end) {
+                                for (size_t t = begin; t < end; ++t) {
+                                    for (uint32_t c = 0; c < 4; ++c) {
+                                        float value = 0.0f;
+                                        if (live_target.format == LiveTargetPixelFormat::Rgba8Unorm) {
+                                            value = pixels[t * 4 + c] / 255.0f;
+                                        } else {
+                                            uint16_t half = 0;
+                                            std::memcpy(&half, pixels.data() + t * 8 + c * 2,
+                                                        sizeof(half));
+                                            value = half_to_float(half);
+                                            if (std::isnan(value)) value = 0.0f;
+                                        }
+                                        std::memcpy(upload + (t * 4 + c) * sizeof(float),
+                                                    &value, sizeof(value));
+                                    }
                                 }
-                                std::memcpy(upload.data() + (t * 4 + c) * sizeof(float),
-                                            &value, sizeof(value));
-                            }
-                        }
+                            });
                     } else if (live_target.format == LiveTargetPixelFormat::Rgba8Unorm) {
-                        std::memcpy(upload.data(), pixels.data(), upload.size());
+                        std::memcpy(upload, pixels.data(), upload_size);
                     } else {
                         const size_t texels = static_cast<size_t>(volume_texels);
                         for (size_t t = 0; t < texels; ++t) {
@@ -1565,23 +2106,33 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         if (dim_2d_array) {
                             skip_image(r, "block-compressed sampled arrays deferred"); break;
                         }
-                        std::vector<uint8_t> lin((size_t)bw * bh * bpb, 0);
+                        std::unique_ptr<uint8_t[]> linear;
+                        const uint8_t* decode_source = src;
+                        if (r->tile_mode) {
+                            linear = std::make_unique_for_overwrite<uint8_t[]>((size_t)bw * bh * bpb);
+                            decode_source = linear.get();
+                        }
                         if (r->tile_mode && r->in_mip_tail)
-                            detile_elements_level(lin.data(), src, need, bw, bh, bpb,
+                            detile_elements_level(linear.get(), src, need, bw, bh, bpb,
                                                   r->tile_mode, r->mip_tail_x,
                                                   r->mip_tail_y);
                         else if (r->tile_mode)
-                            detile_elements(lin.data(), src, need, bw, bh, bpb, r->tile_mode);
-                        else
-                            std::memcpy(lin.data(), src, lin.size());
-                        if (!bc_decode_surface(upload.data(), lin.data(), lin.size(),
+                            detile_elements(linear.get(), src, need, bw, bh, bpb, r->tile_mode);
+                        if (!bc_decode_surface(upload, decode_source, (size_t)bw * bh * bpb,
                                                r->width, r->height, r->format)) {
                             skip_image(r, "BC decode unsupported"); break; }
                     } else {
                         const uint32_t bpt = r11g11b10 ? 4u : cb * nc;
-                        std::vector<uint8_t> lin((size_t)volume_texels * bpt, 0);
+                        const size_t linear_bytes = static_cast<size_t>(volume_texels) * bpt;
+                        std::unique_ptr<uint8_t[]> linear;
+                        const uint8_t* sampled_source = src;
+                        if (r->tile_mode) {
+                            linear = std::make_unique_for_overwrite<uint8_t[]>(linear_bytes);
+                            sampled_source = linear.get();
+                        }
                         if (r->tile_mode && dim_3d && r->depth > 1) {
-                            if (!detile_volume(lin.data(), src, need, r->width, r->height, r->depth,
+                            if (!detile_volume(linear.get(), src, need,
+                                               r->width, r->height, r->depth,
                                                r->tile_mode, bpt)) {
                                 skip_image(r, "sampled volume detile failed"); break;
                             }
@@ -1590,84 +2141,59 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                 r->width, r->height, r->tile_mode, 0, bpt);
                             const size_t linear_slice = static_cast<size_t>(r->width) * r->height * bpt;
                             for (uint32_t layer = 0; layer < r->depth; ++layer)
-                                detile_surface(lin.data() + linear_slice * layer,
+                                detile_surface(linear.get() + linear_slice * layer,
                                                src + tiled_slice * layer,
                                                r->width, r->height, r->tile_mode, 0, bpt);
                         } else if (r->tile_mode && r->in_mip_tail) {
-                            detile_surface_level(lin.data(), src, need, r->width, r->height,
+                            detile_surface_level(linear.get(), src, need, r->width, r->height,
                                                  r->tile_mode, bpt, r->mip_tail_x,
                                                  r->mip_tail_y);
                         } else if (r->tile_mode) {
-                            detile_surface(lin.data(), src, r->width, r->height, r->tile_mode, 0, bpt);
-                        } else {
-                            std::memcpy(lin.data(), src, lin.size());
+                            detile_surface(linear.get(), src, r->width, r->height,
+                                           r->tile_mode, 0, bpt);
                         }
                         const size_t texels = (size_t)volume_texels;
                         if (rgba8 || uint8 || r11g11b10 ||
                             sampled_unorm8x2 || sampled_unorm16_native ||
                             sampled_uint8_native || sampled_uint16_native ||
                             sampled_uint32_native || sampled_depth) {   // Native sampled texels
-                            std::memcpy(upload.data(), lin.data(), lin.size());
+                            std::memcpy(upload, sampled_source, linear_bytes);
                         } else if (f32) {                           // Native float channels + default fill
-                            for (size_t t = 0; t < texels; ++t) {
-                                for (uint32_t c = 0; c < 4; ++c) {
-                                    float value = c == 3 ? 1.0f : 0.0f;
-                                    if (c < nc)
-                                        std::memcpy(&value, lin.data() + (t * nc + c) * sizeof(float),
+                            parallel_compute_texels(texels, linear_bytes + texels * 16u,
+                                [&](size_t begin, size_t end) {
+                                    for (size_t t = begin; t < end; ++t) {
+                                        for (uint32_t c = 0; c < 4; ++c) {
+                                            float value = c == 3 ? 1.0f : 0.0f;
+                                            if (c < nc)
+                                                std::memcpy(
+                                                    &value,
+                                                    sampled_source + (t * nc + c) * sizeof(float),
                                                     sizeof(value));
-                                    std::memcpy(upload.data() + (t * 4 + c) * sizeof(float),
+                                            std::memcpy(
+                                                upload + (t * 4 + c) * sizeof(float),
                                                 &value, sizeof(value));
-                                }
-                            }
-                        } else if (r8) {                            // R8: broadcast coverage to RGBA
-                            for (size_t t = 0; t < texels; t++) {
-                                const uint8_t v = lin[t];
-                                upload[t * 4 + 0] = v; upload[t * 4 + 1] = v;
-                                upload[t * 4 + 2] = v; upload[t * 4 + 3] = v;
-                            }
-                        } else {                                    // Float16: half -> UNORM8 + default fill
-                            const uint16_t* hp = reinterpret_cast<const uint16_t*>(lin.data());
-                            for (size_t t = 0; t < texels; t++) {
-                                for (uint32_t c = 0; c < 4; c++) {
-                                    if (c >= nc) {
-                                        upload[t * 4 + c] = c == 3 ? 255 : 0;
-                                        continue;
+                                        }
                                     }
-                                    float v = half_to_float(hp[t * nc + c]);
-                                    if (std::isnan(v)) v = 0.f;
-                                    v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
-                                    upload[t * 4 + c] = (uint8_t)std::lround(v * 255.0f);
-                                }
-                            }
+                                });
+                        } else if (r8) {                            // R8: broadcast coverage to RGBA
+                            parallel_compute_texels(texels, linear_bytes + texels * 4u,
+                                [&](size_t begin, size_t end) {
+                                    for (size_t t = begin; t < end; ++t) {
+                                        const uint8_t v = sampled_source[t];
+                                        upload[t * 4 + 0] = v; upload[t * 4 + 1] = v;
+                                        upload[t * 4 + 2] = v; upload[t * 4 + 3] = v;
+                                    }
+                                });
+                        } else {                                    // Float16: half -> UNORM8 + default fill
+                            sampled_float16_to_unorm8_range(
+                                sampled_source, nc, texels, upload);
                         }
                     }
                 }
             }
 
-            // Staging buffer (host-visible) holding the upload bytes; reused for storage
-            // readback. An imported renderer image supplies its own pixels, so it needs none.
-            if (!bi.imported) {
-                VkBufferCreateInfo sci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-                sci.size = sbytes;
-                sci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-                if (!vk_ok(vkCreateBuffer(ctx.device, &sci, nullptr, &staging[i]),
-                           "image-staging-buffer")) { images_ready = false; break; }
-                VkMemoryRequirements sreq{};
-                vkGetBufferMemoryRequirements(ctx.device, staging[i], &sreq);
-                const uint32_t staging_memory_type = ctx.host_memory_type(sreq.memoryTypeBits);
-                staging_memory[i] = ctx.allocate_memory(sreq.size, staging_memory_type);
-                if (!vk_handle_ok(staging_memory[i], "image-staging-memory") ||
-                    !vk_ok(vkBindBufferMemory(ctx.device, staging[i], staging_memory[i], 0),
-                           "image-staging-bind")) {
-                    images_ready = false; break; }
-                if (!bi.seed_skip) {   // seed-skip (#1122): image is never uploaded, staging stays for writeback
-                  void* mapped = nullptr;
-                  if (!vk_ok(vkMapMemory(ctx.device, staging_memory[i], 0, sbytes, 0, &mapped),
-                             "image-staging-map")) {
-                      images_ready = false; break; }
-                  std::memcpy(mapped, upload.data(), (size_t)sbytes);
-                  vkUnmapMemory(ctx.device, staging_memory[i]); }
-            }
+            // Host writes are complete before this allocation is consumed by vkCmdCopyBufferToImage.
+            upload_mapping.unmap();
 
             // Device-local image.
             VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -1679,6 +2205,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                     : (sampled_depth
                                            ? (r->format == DataFormat::Float32
                                                   ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_D16_UNORM)
+                                       : sampled_float16_native
+                                           ? VK_FORMAT_R16G16B16A16_SFLOAT
                                        : sampled_uint8_native
                                            ? (sampled_components == 1 ? VK_FORMAT_R8_UINT
                                               : sampled_components == 2 ? VK_FORMAT_R8G8_UINT
@@ -1834,12 +2362,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             pool_sizes[pool_size_count++] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sampled_count};
         if (storage_image_count)
             pool_sizes[pool_size_count++] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, storage_image_count};
-        VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        dpci.maxSets = 1;
-        dpci.poolSizeCount = pool_size_count;
-        dpci.pPoolSizes = pool_sizes;
-        if (!vk_ok(vkCreateDescriptorPool(ctx.device, &dpci, nullptr, &descriptor_pool),
-                   "descriptor-pool")) break;
+        if (VulkanComputeContext::descriptor_pool_reuse_enabled()) {
+            descriptor_pool = ctx.prepare_descriptor_pool(
+                static_cast<uint32_t>(buffers.size()), sampled_count, storage_image_count);
+            descriptor_pool_reused = descriptor_pool != VK_NULL_HANDLE;
+            if (!vk_handle_ok(descriptor_pool, "descriptor-pool-reuse")) break;
+        } else {
+            VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            dpci.maxSets = 1;
+            dpci.poolSizeCount = pool_size_count;
+            dpci.pPoolSizes = pool_sizes;
+            if (!vk_ok(vkCreateDescriptorPool(ctx.device, &dpci, nullptr, &descriptor_pool),
+                       "descriptor-pool")) break;
+        }
         VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         dsai.descriptorPool = descriptor_pool;
         dsai.descriptorSetCount = 1;
@@ -2091,7 +2626,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (auto& buffer : buffers) {
             if (buffer.alias_of != SIZE_MAX) continue;
             void* mapped = nullptr;
-            if (vkMapMemory(ctx.device, buffer.memory, 0, buffer.resource->size, 0, &mapped) != VK_SUCCESS) {
+            if (ctx.map_memory(buffer.memory, 0, buffer.resource->size, &mapped) != VK_SUCCESS) {
                 readback_ok = false;
                 break;
             }
@@ -2111,7 +2646,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // RAM even when consecutive compute readbacks contain identical bytes.
             if (changed)
                 std::memcpy(destination, result, buffer.resource->size);
-            vkUnmapMemory(ctx.device, buffer.memory);
+            ctx.unmap_memory(buffer.memory);
             if (buffer.resource->gpu_addr)
                 notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.resource->size);
             if (!buffer.resource->host_data && writer_provenance_enabled())
@@ -2129,7 +2664,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (!bi.storage || bi.alias_of != SIZE_MAX) continue;
             const ShaderResource* r = bi.resource;
             void* mapped = nullptr;
-            if (vkMapMemory(ctx.device, staging_memory[i], 0, staging_bytes[i], 0, &mapped) != VK_SUCCESS) {
+            if (ctx.map_memory(staging_memory[i], 0, staging_bytes[i], &mapped) != VK_SUCCESS) {
                 readback_ok = false;
                 break;
             }
@@ -2139,7 +2674,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                         r->format == DataFormat::Unorm2_10_10_10)
                 ? 4u : (size_t)cb * nc;
             const size_t texels = (size_t)r->width * r->height * r->depth;
-            std::vector<uint8_t> linear(texels * guest_texel, 0);
+            const size_t linear_bytes = texels * guest_texel;
+            uint8_t* destination = resource_bytes_for(r, bi.guest_bytes);
+            std::unique_ptr<uint8_t[]> linear;
+            uint8_t* packed = destination;
+            if (r->tile_mode) {
+                linear = std::make_unique_for_overwrite<uint8_t[]>(linear_bytes);
+                packed = linear.get();
+            }
             const uint32_t* channels = static_cast<const uint32_t*>(mapped);
             // #1122 proving-frame poison scan: a texel still fully poison was NOT stored by the write.
             // Zero survivors == the shader covers every texel (safe to fast-skip its seed henceforth);
@@ -2175,21 +2717,21 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const auto pack_start = ComputeClock::now();
             static const bool pack_range_enabled = !std::getenv("PROSPER_NO_PACK_RANGE");
             if (pack_range_enabled) {
-                storage_pack_range(channels, r->format, nc, texels, linear.data(), guest_texel);
+                storage_pack_range(channels, r->format, nc, texels, packed, guest_texel);
             } else {
                 for (size_t t = 0; t < texels; t++)
                     storage_pack_texel(channels + t * 4, r->format, nc,
-                                       linear.data() + t * guest_texel);
+                                       packed + t * guest_texel);
             }
             // #1122: a proving frame that turned out partial-coverage packed poison garbage into the
             // un-stored texels. Restore each from the clean seed so the guest keeps its real prior
             // content (exactly a partial write's contract). Full-coverage proving frames have no
             // survivors, so this is a no-op there. bi.seed_linear shares this row-major texel layout.
             if (bi.poison_verify && !poison_texel.empty() &&
-                bi.seed_linear.size() == linear.size()) {
+                bi.seed_linear.size() == linear_bytes) {
                 for (size_t t = 0; t < texels; ++t) {
                     if (poison_texel[t])
-                        std::memcpy(linear.data() + t * guest_texel,
+                        std::memcpy(packed + t * guest_texel,
                                     bi.seed_linear.data() + t * guest_texel, guest_texel);
                 }
             }
@@ -2204,7 +2746,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 for (size_t t = 0; t < texels; ++t) {
                     std::memset(expect.data(), 0, expect.size());
                     storage_pack_texel(channels + t * 4, r->format, nc, expect.data());
-                    if (std::memcmp(expect.data(), linear.data() + t * guest_texel,
+                    if (std::memcmp(expect.data(), packed + t * guest_texel,
                                     guest_texel) != 0) {
                         if (!bad) first_bad = t;
                         ++bad;
@@ -2219,24 +2761,21 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     std::fprintf(stderr, "[compute] pack-verify first mismatch texel=%zu\n",
                                  first_bad);
             }
-            uint8_t* destination = resource_bytes_for(r, bi.guest_bytes);
             if (r->tile_mode && r->depth > 1) {
-                if (!tile_volume(destination, bi.guest_bytes, linear.data(), r->width, r->height,
+                if (!tile_volume(destination, bi.guest_bytes, packed, r->width, r->height,
                                  r->depth, r->tile_mode, static_cast<uint32_t>(guest_texel))) {
                     readback_ok = false;
-                    vkUnmapMemory(ctx.device, staging_memory[i]);
+                    ctx.unmap_memory(staging_memory[i]);
                     break;
                 }
             } else if (r->tile_mode && r->in_mip_tail) {
-                tile_surface_level(destination, bi.guest_bytes, linear.data(),
+                tile_surface_level(destination, bi.guest_bytes, packed,
                                    r->width, r->height, r->tile_mode,
                                    static_cast<uint32_t>(guest_texel),
                                    r->mip_tail_x, r->mip_tail_y);
             } else if (r->tile_mode) {
-                tile_surface(destination, linear.data(), r->width, r->height, r->tile_mode, 0,
+                tile_surface(destination, packed, r->width, r->height, r->tile_mode, 0,
                              static_cast<uint32_t>(guest_texel));
-            } else {
-                std::memcpy(destination, linear.data(), linear.size());
             }
             const auto layout_done = ComputeClock::now();
             pack_ms += std::chrono::duration<double, std::milli>(pack_done - pack_start).count();
@@ -2262,7 +2801,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  bi.binding, (unsigned long long)r->metadata_addr,
                                  bi.dcc_metadata_bytes);
             }
-            vkUnmapMemory(ctx.device, staging_memory[i]);
+            ctx.unmap_memory(staging_memory[i]);
         }
         if (!readback_ok) break;
         ok = true;
@@ -2341,6 +2880,115 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
 }
 
 } // namespace
+
+void storage_pack_unorm8_range(const uint32_t* channels, uint32_t components,
+                               size_t texels, uint8_t* packed) {
+    if (!channels || !packed || !texels || !components || components > 4) return;
+#if defined(PROSPER_HAVE_TARGET_F16C)
+    static const bool use_avx2 = std::getenv("PROSPER_NO_AVX2_UNORM8_PACK") == nullptr &&
+                                  __builtin_cpu_supports("avx2");
+#endif
+    parallel_compute_texels(texels, texels * (sizeof(uint32_t) * 4u + components),
+        [&](size_t begin, size_t end) {
+#if defined(PROSPER_HAVE_TARGET_F16C)
+            if (use_avx2) {
+                storage_pack_unorm8_avx2(channels, components, begin, end, packed);
+                return;
+            }
+#endif
+            for (size_t texel = begin; texel < end; ++texel)
+                for (uint32_t channel = 0; channel < components; ++channel)
+                    packed[texel * components + channel] =
+                        storage_pack_unorm8(channels[texel * 4 + channel]);
+        });
+}
+
+void storage_unpack_float16x4_range(const uint8_t* rgba16f, size_t texels, uint32_t* channels) {
+    if (!rgba16f || !channels || !texels) return;
+#if defined(PROSPER_HAVE_TARGET_F16C)
+    static const bool use_f16c = std::getenv("PROSPER_NO_F16C_STORAGE_UNPACK") == nullptr &&
+                                 __builtin_cpu_supports("avx2") &&
+                                 __builtin_cpu_supports("f16c");
+#endif
+    parallel_compute_texels(texels, texels * (sizeof(uint16_t) * 4u + sizeof(uint32_t) * 4u),
+        [&](size_t begin, size_t end) {
+#if defined(PROSPER_HAVE_TARGET_F16C)
+            if (use_f16c) {
+                storage_unpack_float16x4_f16c(rgba16f, begin, end, channels);
+                return;
+            }
+#endif
+            for (size_t texel = begin; texel < end; ++texel)
+                for (uint32_t channel = 0; channel < 4; ++channel) {
+                    uint16_t bits = 0;
+                    std::memcpy(&bits,
+                                rgba16f + texel * 8 + channel * sizeof(bits), sizeof(bits));
+                    channels[texel * 4 + channel] = storage_unpack_float16_bits(bits);
+                }
+        });
+}
+
+void storage_pack_float16x4_range(const uint32_t* channels, size_t texels, uint8_t* rgba16f) {
+    if (!channels || !rgba16f || !texels) return;
+#if defined(PROSPER_HAVE_TARGET_F16C)
+    static const bool use_f16c = std::getenv("PROSPER_NO_F16C_STORAGE_PACK") == nullptr &&
+                                 __builtin_cpu_supports("avx2") &&
+                                 __builtin_cpu_supports("f16c");
+#endif
+    parallel_compute_texels(texels, texels * (sizeof(uint32_t) * 4u + sizeof(uint16_t) * 4u),
+        [&](size_t begin, size_t end) {
+#if defined(PROSPER_HAVE_TARGET_F16C)
+            if (use_f16c) {
+                storage_pack_float16x4_f16c(channels, begin, end, rgba16f);
+                return;
+            }
+#endif
+            for (size_t texel = begin; texel < end; ++texel) {
+                for (uint32_t channel = 0; channel < 4; ++channel) {
+                    float value;
+                    std::memcpy(&value, channels + texel * 4 + channel, sizeof(value));
+                    const uint16_t half = prosper::gpu::float_to_half(value);
+                    std::memcpy(rgba16f + texel * 8 + channel * sizeof(half),
+                                &half, sizeof(half));
+                }
+            }
+        });
+}
+
+void sampled_float16_to_unorm8_range(const uint8_t* source, uint32_t components,
+                                     size_t texels, uint8_t* rgba) {
+    if (!source || !rgba || !components || components > 4) return;
+    const auto& table = sampled_float16_unorm8_table();
+#if defined(PROSPER_HAVE_TARGET_F16C)
+    static const bool use_f16c = std::getenv("PROSPER_NO_F16C_SAMPLED") == nullptr &&
+                                 __builtin_cpu_supports("avx2") &&
+                                 __builtin_cpu_supports("f16c");
+#else
+    constexpr bool use_f16c = false;
+#endif
+    parallel_compute_texels(texels, texels * (components * 2u + 4u),
+        [&](size_t begin, size_t end) {
+#if defined(PROSPER_HAVE_TARGET_F16C)
+            if (components == 4 && use_f16c) {
+                sampled_float16x4_to_unorm8_f16c(source, begin, end, rgba, table);
+                return;
+            }
+#endif
+            for (size_t texel = begin; texel < end; ++texel) {
+                for (uint32_t channel = 0; channel < 4; ++channel) {
+                    if (channel >= components) {
+                        rgba[texel * 4 + channel] = channel == 3 ? 255 : 0;
+                        continue;
+                    }
+                    uint16_t half = 0;
+                    std::memcpy(&half,
+                                source + (texel * components + channel) * sizeof(half),
+                                sizeof(half));
+                    rgba[texel * 4 + channel] = table[half];
+                }
+            }
+        });
+}
 
 bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& items) {
     // Keep the Vulkan device alive across dispatch spans. Constructing an instance, device, and queue for
