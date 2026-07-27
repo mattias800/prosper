@@ -288,11 +288,12 @@ int main() {
     };
     if (!recompile_fragment(wave32_fragment_masks,
                             std::size(wave32_fragment_masks)).empty()) {
-        printf("  [FAIL] ungated graphics shader accepted Wave32 EXEC_LO/VCC_LO mask moves\n");
+        printf("  [FAIL] Wave64/default graphics shader accepted Wave32 EXEC_LO/VCC_LO masks\n");
         return 1;
     }
-    const auto wave32_fragment_spv = recompile_fragment_wave32_for_test(
-        wave32_fragment_masks, std::size(wave32_fragment_masks));
+    const auto wave32_fragment_spv = recompile_fragment(
+        wave32_fragment_masks, std::size(wave32_fragment_masks), nullptr, nullptr,
+        UINT32_MAX, nullptr, true);
     uint32_t wave32_fragment_bad_op = 0;
     if (wave32_fragment_spv.empty() ||
         !type_result_ids_are_nonzero(wave32_fragment_spv, &wave32_fragment_bad_op) ||
@@ -301,7 +302,7 @@ int main() {
                wave32_fragment_bad_op);
         return 1;
     }
-    printf("  [ok]   Wave32 fragment EXEC_LO/VCC_LO mask moves emit valid SPIR-V\n");
+    printf("  [ok]   registered Wave32 fragment EXEC_LO/VCC_LO mask moves emit valid SPIR-V\n");
 
     const uint32_t wave32_compute_masks[] = {
         0xbe80037eu,                         // s_mov_b32 s0, exec_lo

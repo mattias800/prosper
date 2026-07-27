@@ -344,6 +344,27 @@ int main() {
               stats.misses == system_misses + 2,
           "pixel-system ENA/ADDR mappings participate in the fragment shader cache key");
 
+    // SPI_PS_IN_CONTROL.PS_W32_EN changes low-half EXEC/VCC semantics, so the same program and
+    // descriptor interface must not reuse a Wave64/default module under Wave32 (or vice versa).
+    const uint64_t wave_mode_hits = stats.hits;
+    const uint64_t wave_mode_misses = stats.misses;
+    uint64_t wave64_identity = 0, wave32_identity = 0, repeated_wave32_identity = 0;
+    const auto wave64_ps = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kPs, std::size(kPs), nullptr, nullptr, nullptr,
+        &wave64_identity, false);
+    const auto wave32_ps = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kPs, std::size(kPs), nullptr, nullptr, nullptr,
+        &wave32_identity, true);
+    const auto repeated_wave32_ps = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kPs, std::size(kPs), nullptr, nullptr, nullptr,
+        &repeated_wave32_identity, true);
+    stats = shader_recompile_cache_stats();
+    CHECK(!wave64_ps.empty() && wave32_ps == wave64_ps && repeated_wave32_ps == wave32_ps &&
+              wave64_identity != 0 && wave32_identity != 0 &&
+              wave32_identity != wave64_identity && repeated_wave32_identity == wave32_identity &&
+              stats.hits == wave_mode_hits + 2 && stats.misses == wave_mode_misses + 1,
+          "fragment Wave32 mode participates in the shader cache key");
+
     const uint64_t identity_before_clear = first_identity;
     clear_shader_recompile_cache();
     stats = shader_recompile_cache_stats();

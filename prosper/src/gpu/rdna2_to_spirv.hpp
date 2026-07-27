@@ -218,10 +218,11 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          const ShaderResourceTable* rt = nullptr,
                                          const PixelSystemInputMapping* system_inputs = nullptr,
                                          uint32_t pcrel_dispatch_target = UINT32_MAX,
-                                         const FragmentInterpolationLayout* interpolation = nullptr);
+                                         const FragmentInterpolationLayout* interpolation = nullptr,
+                                         bool wave32 = false);
 
-// Test hook for the low-half EXEC/VCC mask path. Production graphics compilation enables it only
-// for byte-exact observed Wave32 shaders until the graphics wave-mode register is carried here.
+// Test hook for the low-half EXEC/VCC mask path. Production fragment compilation supplies the same
+// mode from SPI_PS_IN_CONTROL.PS_W32_EN.
 std::vector<uint32_t> recompile_fragment_wave32_for_test(
     const uint32_t* code, size_t dwords);
 
