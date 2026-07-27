@@ -218,7 +218,9 @@ struct SpirvCompute {
     uint32_t guest_scratch_dwords=0;
     std::map<uint32_t, uint32_t> cbuf_var;          // binding -> storage-buffer var (N-buffer model; 2/3 map to v_cbuf/v_cbuf1)
     bool     is_fragment=0;                          // true in the fragment shell (gates VINTRP interp)
-    bool     is_vertex=0;                            // true in the vertex shell (NGG single-invocation model)
+    bool     is_vertex=0;                            // true in every vertex shell
+    bool     ngg_one_lane=0;                         // exact GS_ALLOC_REQ wrapper: one guest lane/invocation
+    bool     ngg_private_lds=0;                      // exact captured wrapper whose LDS projection is known
     uint32_t ngg_vertex_index_read_pc = UINT32_MAX;   // NGG wave/LDS prologue handoff -> host VertexIndex
     uint32_t ngg_vertex_index_value = 0;
     bool     is_compute=0;                            // true in the compute shell (gates LDS / s_barrier)
@@ -1358,6 +1360,8 @@ struct SpirvCompute {
         uint32_t len = uconst(lds_dwords);
         uint32_t t_arr = id();        put(types, Op_TypeArray, {t_arr, t_u32, len});
         if (is_vertex) {
+            // Vertex-stage LDS is only legal for the exact NGG wrapper selected by recompile_vertex.
+            // All other vertex DS shapes reject before reaching this declaration.
             uint32_t t_ptr_fn_arr = 0;
             lds_var = function_var(t_arr, t_ptr_fn_arr);
             t_ptr_wg_u32 = id();
@@ -1429,7 +1433,7 @@ struct SpirvCompute {
     }
     // s_barrier: workgroup execution + memory barrier (OpControlBarrier).
     void barrier() {
-        if (is_vertex) return; // one modeled NGG lane has no peer whose LDS access must be synchronized
+        if (ngg_private_lds) return; // exact one-lane wrapper has no peer requiring synchronization
         uses_barrier = true;
         put(code, Op_ControlBarrier, {uconst(Scope_Workgroup), uconst(Scope_Workgroup), uconst(MemSem_WGAcqRel)});
     }
@@ -2408,8 +2412,9 @@ uint32_t inline_int_mask_bit(SpirvCompute& b, int value) {
     // A Vulkan vertex invocation is the single guest lane retained by the NGG approximation. It is
     // lane zero, so an inline B64 mask contributes exactly its low bit; vertex modules do not declare
     // LocalInvocationIndex, and trying to use that compute-only ID emitted invalid SPIR-V ID zero.
-    if (b.is_vertex)
+    if (b.ngg_one_lane)
         return (static_cast<uint32_t>(value) & 1u) ? b.btrue() : b.bfalse();
+    if (b.is_vertex) return 0; // an ordinary VS has no proven lane identity for a partial wave mask
     const uint32_t lane_id = b.is_fragment ? b.subgroup_local_id() : b.linear_localid;
     const uint32_t lane = b.ibin(Op_BitwiseAnd, lane_id,
                                   b.uconst(b.wave_size - 1));
@@ -2427,7 +2432,8 @@ uint32_t inline_int_mask_bit(SpirvCompute& b, int value) {
 // operand. Lanes < 32 never contribute to the HI window, so their bit is 0.
 uint32_t inline_int_mask_bit_hi(SpirvCompute& b, int value) {
     if (value == 0) return b.bfalse();
-    if (b.is_vertex) return b.bfalse(); // the modeled NGG lane is lane zero, never in the HI window
+    if (b.ngg_one_lane) return b.bfalse(); // the modeled NGG lane is lane zero, never in the HI window
+    if (b.is_vertex) return 0;
     const uint32_t lane_id = b.is_fragment ? b.subgroup_local_id() : b.linear_localid;
     const uint32_t lane = b.ibin(Op_BitwiseAnd, lane_id, b.uconst(b.wave_size - 1));
     const uint32_t high = b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32));
@@ -3994,7 +4000,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             }
-            if (in.opcode == 0x10 && b.is_vertex) { // s_bcnt1_i32_b64
+            if (in.opcode == 0x10 && b.ngg_one_lane) { // s_bcnt1_i32_b64
                 // NGG's final primitive packing counts active bits in a saved wave mask. A Vulkan
                 // vertex invocation models one guest lane, so the population count of that lane's
                 // Boolean mask is exactly 0 or 1. Keep the result in the ordinary scalar-data domain
@@ -4047,6 +4053,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         }
         case Rdna2Format::SOP2: {
             if (in.opcode == 0x25) {   // s_bfm_b64: D=((1ULL<<(S0&63))-1)<<(S1&63)
+                if (b.is_vertex && !b.ngg_one_lane) { ok = false; return true; }
                 // Wave masks are represented as one bool per SPIR-V invocation.  Constructing the
                 // architectural 64-bit integer and then splitting it would lose that domain, so test
                 // the current lane directly: bits [offset, offset+width) are set, truncated at bit 63.
@@ -4055,7 +4062,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t offset = b.ibin(Op_BitwiseAnd, val(in.src[1]), b.uconst(63));
                 // Vertex NGG is the same one-lane approximation as the inline-mask helpers: its
                 // represented guest lane is lane zero and it has no compute LocalInvocationIndex.
-                const uint32_t lane = b.is_vertex ? b.uconst(0) :
+                const uint32_t lane = b.ngg_one_lane ? b.uconst(0) :
                     b.ibin(Op_BitwiseAnd, b.linear_localid, b.uconst(b.wave_size - 1));
                 const uint32_t at_or_after = b.ucmp(Op_UGreaterThanEqual, lane, offset);
                 const uint32_t within_width = b.ucmp(
@@ -4699,7 +4706,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const bool fop = in.opcode == 0x03 || in.opcode == 0x04 || in.opcode == 0x05 ||
                                  in.opcode == 0x08 || in.opcode == 0x0F || in.opcode == 0x10 ||
                                  in.opcode == 0x1F || in.opcode == 0x2B;
-                const bool ngg_row_shift = b.is_vertex && in.opcode == 0x25 &&
+                const bool ngg_row_shift = b.ngg_one_lane && in.opcode == 0x25 &&
                                            in.dpp_ctrl >= 0x111u && in.dpp_ctrl <= 0x11Fu;
                 if (!fop && !ngg_row_shift) { ok = false; return true; }
                 if (ngg_row_shift) {
@@ -5065,7 +5072,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (in.opcode == 0x360) {                                 // v_readlane_b32 sDST, vSRC, lane
                 const bool static_lane = in.src[1].kind == OperandKind::InlineInt &&
                                          in.src[1].value >= 0 && in.src[1].value <= 63;
-                const bool dynamic_absent_ngg_peer = b.is_vertex &&
+                const bool dynamic_absent_ngg_peer = b.ngg_one_lane &&
                     in.src[1].kind == OperandKind::Special &&
                     in.src[1].value >= 106 && in.src[1].value <= 124;
                 if (!static_lane && !dynamic_absent_ngg_peer) {
@@ -5099,7 +5106,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // from an ordinary VGPR. A Vulkan vertex invocation models guest lane zero: a
                     // lane-zero read returns this invocation's source, while every absent peer reads
                     // zero. The dynamic form remains exact by selecting on its scalar lane index.
-                    if (!b.is_vertex) { ok = false; return true; }
+                    if (!b.ngg_one_lane) { ok = false; return true; }
                     const uint32_t source = val(in.src[0]);
                     uint32_t reads_self = 0;
                     if (static_lane) {
@@ -5424,7 +5431,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (in.sdst.value == 106 || in.sdst.value == 107) rs.vcc = cout_masked;
                     else if (in.sdst.kind == OperandKind::SGPR) rs.sreg_bool[in.sdst.value] = cout_masked;
                 }
-            } else if ((in.opcode == 0x365 || in.opcode == 0x366) && b.is_vertex) {
+            } else if ((in.opcode == 0x365 || in.opcode == 0x366) && b.ngg_one_lane) {
                 // NGG is deliberately lowered as one guest lane per Vulkan vertex invocation. No
                 // lane precedes that invocation, so either half of MBCNT contributes zero and leaves
                 // its accumulator unchanged. This is the scalar counterpart of recompile_vertex's
@@ -5512,7 +5519,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     else if (rs.exec_narrowed && (!safe_execz || !safe_execz->count(in.pc))) ok = false;
                     break;                                          // forward = no-op (predication covers it)
                 case 0x0a:                                          // s_barrier
-                    if (b.is_compute || b.is_vertex) b.barrier();   // NGG vertex = one modeled lane
+                    if (b.is_compute || b.ngg_private_lds) b.barrier();
                     else ok = false;                                // barrier only meaningful in compute
                     break;
                 case 0x04: case 0x05:                              // s_cbranch_scc0 / scc1
@@ -6728,7 +6735,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // offset; the backing store is dword-indexed. gfx10 ds_write2_b64 carries two independent
             // 8-bit offsets in units of 64-bit elements, while ds_write_b64 uses the ordinary 16-bit
             // byte offset. GDS and the remaining widths/atomics are deferred.
-            if ((!b.is_compute && !b.is_vertex) || (in.opcode != 0x00 && in.opcode != 0x07 &&
+            if ((!b.is_compute && !b.ngg_private_lds) || (in.opcode != 0x00 && in.opcode != 0x07 &&
                                   in.opcode != 0x08 && in.opcode != 0x20 &&
                                   in.opcode != 0x2d &&
                                   in.opcode != 0x0d && in.opcode != 0x36 && in.opcode != 0x37 &&
@@ -6783,7 +6790,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             }
-            if (b.is_vertex && in.opcode == 0x36 &&
+            if (b.ngg_private_lds && in.opcode == 0x36 &&
                 in.pc == b.ngg_vertex_index_read_pc && b.ngg_vertex_index_value) {
                 // The merged NGG prologue distributes hardware vertex ids between wave lanes through
                 // LDS, then the ES consumes that value as its first MUBUF index. In the one-invocation
@@ -6803,8 +6810,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 b.compute_gds_store(idx, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
                 return true;
             }
-            if (b.is_vertex && (in.opcode == 0x00 || in.opcode == 0x07 || in.opcode == 0x08 ||
-                                in.opcode == 0x20 || in.opcode == 0x2d)) {
+            if (b.ngg_private_lds && (in.opcode == 0x00 || in.opcode == 0x07 || in.opcode == 0x08 ||
+                                     in.opcode == 0x20 || in.opcode == 0x2d)) {
                 // Cross-lane/atomic NGG LDS effects do not have a proven single-lane reduction yet.
                 ok = false; return true;
             }
@@ -8574,7 +8581,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // one independent Vulkan invocation, however, so its EXEC bit is an ordinary per-invocation
         // Boolean. Carry that bit through the loop just like SCC/VCC instead of rejecting Astro Bot's
         // fixed-trip culling loop merely because some guest lanes were masked before its header.
-        const bool carry_vertex_exec = b.is_vertex && rs.exec_narrowed;
+        const bool carry_vertex_exec = b.ngg_one_lane && rs.exec_narrowed;
         if (rs.exec_narrowed && !guarded_narrow_entry && !carry_vertex_exec) {
             if (getenv("PROSPER_DBG"))
                 fprintf(stderr, "[recompile-reject] counted-loop enters with narrowed EXEC\n");
@@ -9629,6 +9636,22 @@ bool fragment_spirv_uses_internal_gds(const std::vector<uint32_t>& spirv) {
     return false;
 }
 
+// Astro Bot's fused 2,936-byte NGG body uses real wave-shared LDS for culling and compaction. The
+// current Vulkan vertex shell intentionally projects that one observed wrapper to one private guest
+// lane; applying the projection to an arbitrary NGG program would silently miscompile peer-lane LDS.
+// Keep the exception byte-exact and fail closed for every other vertex DS shape. The hash is FNV-1a
+// over the complete little-endian shader bytes, matching the raw hash in successful-shader dumps.
+static bool is_astro_bot_ngg_private_lds_wrapper(const uint32_t* code, size_t dwords) {
+    if (!code || dwords != 734) return false;
+    uint64_t hash = 1469598103934665603ull;
+    const auto* bytes = reinterpret_cast<const uint8_t*>(code);
+    for (size_t i = 0; i < dwords * sizeof(uint32_t); ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    return hash == 0x79eb2b954b07dc8eull;
+}
+
 std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
                                        const ShaderResourceTable* rt,
                                        const PixelInputMapping* pixel_inputs,
@@ -9647,12 +9670,15 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);   // readfirstlane waterfalls (#273)
-    // NGG vertex shaders (s_sendmsg GS_ALLOC_REQ present) carry the vertex index in v5, not v0, and wrap
+    // NGG vertex shaders (the exact GS_ALLOC_REQ message present) carry the vertex index in v5, not v0, and wrap
     // the body in wave-packing plumbing (s_sendmsg / exp prim / s_lshr_b64 exec) that lowers to no-ops in
     // our per-invocation model. Detect NGG and bind the index to v5 as well.
     bool ngg = false;
     for (const auto& in : ins) { if (in.is_end) break;
-        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x10) { ngg = true; break; } }
+        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x10 &&
+            in.words[0] == 0xBF900009u) { ngg = true; break; } }
+    b.ngg_one_lane = ngg;
+    b.ngg_private_lds = ngg && is_astro_bot_ngg_private_lds_wrapper(code, dwords);
     uint32_t ngg_output_gate_begin = UINT32_MAX;
     uint32_t ngg_output_gate_end = 0;
     if (ngg) {
@@ -9860,18 +9886,37 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
                             in.pc, in.exp_en);
                 return false;
             }
-            b.export_position(operand_bits(b, rs, in, in.src[0], &eok), operand_bits(b, rs, in, in.src[1], &eok),
-                              operand_bits(b, rs, in, in.src[2], &eok), operand_bits(b, rs, in, in.src[3], &eok));
+            uint32_t x = operand_bits(b, rs, in, in.src[0], &eok);
+            uint32_t y = operand_bits(b, rs, in, in.src[1], &eok);
+            uint32_t z = operand_bits(b, rs, in, in.src[2], &eok);
+            uint32_t w = operand_bits(b, rs, in, in.src[3], &eok);
+            if (terminal_ngg_output && rs.exec_narrowed) {
+                // The exact compacted-output wrapper emits a contiguous prefix of complete
+                // primitives. Map every inactive suffix invocation to one identical clip point;
+                // primitives assembled solely from that suffix are therefore degenerate instead of
+                // accidentally reusing the last active vertex. Keep the real values on the true path.
+                const uint32_t zero = b.uconst(0);
+                x = b.sel(rs.exec, x, zero);
+                y = b.sel(rs.exec, y, zero);
+                z = b.sel(rs.exec, z, zero);
+                w = b.sel(rs.exec, w, b.uconst(fbits(1.0f)));
+            }
+            b.export_position(x, y, z, w);
             exported = true;
         } else if (in.exp_target >= 32) {                    // PARAM0.. -> remapped PS input varying
             const uint32_t source = in.exp_target - 32;
             // EN gates which channels the export sends (vec2/vec3 varyings use EN=0x3/0x7):
             // hardware leaves disabled channels unwritten (undefined for the PS). Substitute a
             // deterministic 0.0 for them instead of exporting stale VGPR data.
-            const uint32_t x = (in.exp_en & 1u) ? operand_bits(b, rs, in, in.src[0], &eok) : b.uconst(0);
-            const uint32_t y = (in.exp_en & 2u) ? operand_bits(b, rs, in, in.src[1], &eok) : b.uconst(0);
-            const uint32_t z = (in.exp_en & 4u) ? operand_bits(b, rs, in, in.src[2], &eok) : b.uconst(0);
-            const uint32_t w = (in.exp_en & 8u) ? operand_bits(b, rs, in, in.src[3], &eok) : b.uconst(0);
+            uint32_t x = (in.exp_en & 1u) ? operand_bits(b, rs, in, in.src[0], &eok) : b.uconst(0);
+            uint32_t y = (in.exp_en & 2u) ? operand_bits(b, rs, in, in.src[1], &eok) : b.uconst(0);
+            uint32_t z = (in.exp_en & 4u) ? operand_bits(b, rs, in, in.src[2], &eok) : b.uconst(0);
+            uint32_t w = (in.exp_en & 8u) ? operand_bits(b, rs, in, in.src[3], &eok) : b.uconst(0);
+            if (terminal_ngg_output && rs.exec_narrowed) {
+                const uint32_t zero = b.uconst(0);
+                x = b.sel(rs.exec, x, zero); y = b.sel(rs.exec, y, zero);
+                z = b.sel(rs.exec, z, zero); w = b.sel(rs.exec, w, zero);
+            }
             if (!pixel_inputs || source >= 32 || !(pixel_inputs->valid_mask & (1u << source)))
                 b.export_param(source, x, y, z, w);           // absent control retains identity wiring
             if (pixel_inputs) {

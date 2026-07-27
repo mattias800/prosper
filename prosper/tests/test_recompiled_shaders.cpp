@@ -8,6 +8,7 @@
 #include "render_runner.h"
 #include <cstdio>
 #include <cstdint>
+#include <iterator>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -72,6 +73,57 @@ int main() {
         printf("  NGG: inside(16,16)green=%d outside(60,60)notgreen=%d\n", inside_green, outside_not);
         CHECK(npx.size()==(size_t)W*H*4, "pipeline accepted the recompiled NGG VS + rendered");
         CHECK(inside_green && outside_not, "NGG VS geometry correct (v5->lower-left-half triangle)");
+    }
+
+    // Terminal NGG compaction gates its POS/PARAM exports with CMPX + EXECZ. The vertex shell cannot
+    // suppress a Vulkan invocation, so inactive suffix vertices must be mapped to one degenerate clip
+    // point while active vertices retain their real positions. Exercise both Boolean outcomes through
+    // the real rasterizer: active renders the same lower-left triangle; inactive renders no fragments.
+    const uint32_t ngg_gate_active[] = {
+        0xBF900009u,                         // s_sendmsg GS_ALLOC_REQ
+        0x34040A81u, 0x36060AC2u,           // v2/v3 from NGG v5 vertex index
+        0x7E000280u, 0x7E0202F2u,
+        0x36040482u, 0x4A0606C1u, 0x4A0404C1u,
+        0x7E060B03u, 0x7E040B02u,           // triangle position in v2,v3,v0,v1
+        0x7E280281u, 0x7E2A0280u,           // v20=1, v21=0
+        0x7DA82B14u,                         // v_cmpx_gt_u32 v20, v21 -> true
+        0xBF880002u,                         // s_cbranch_execz -> end
+        0xF80008CFu, 0x01000302u,
+        0xBF810000u,
+    };
+    const uint32_t ngg_gate_inactive[] = {
+        0xBF900009u,
+        0x34040A81u, 0x36060AC2u,
+        0x7E000280u, 0x7E0202F2u,
+        0x36040482u, 0x4A0606C1u, 0x4A0404C1u,
+        0x7E060B03u, 0x7E040B02u,
+        0x7E280280u, 0x7E2A0280u,           // v20=0, v21=0
+        0x7DA82B14u,                         // v_cmpx_gt_u32 v20, v21 -> false
+        0xBF880002u,
+        0xF80008CFu, 0x01000302u,
+        0xBF810000u,
+    };
+    const auto active_gate_spv = recompile_vertex(
+        ngg_gate_active, std::size(ngg_gate_active));
+    const auto inactive_gate_spv = recompile_vertex(
+        ngg_gate_inactive, std::size(ngg_gate_inactive));
+    CHECK(!active_gate_spv.empty() && !inactive_gate_spv.empty(),
+          "terminal NGG output gate recompiles for active and inactive paths");
+    if (!active_gate_spv.empty() && !inactive_gate_spv.empty()) {
+        const auto active_px = prosper::test::render_triangle_rgba(active_gate_spv, frag, W, H);
+        const auto inactive_px = prosper::test::render_triangle_rgba(inactive_gate_spv, frag, W, H);
+        auto green_pixels = [&](const std::vector<uint8_t>& pixels) {
+            size_t count = 0;
+            for (size_t i = 0; i + 3 < pixels.size(); i += 4)
+                count += pixels[i + 1] > 0x80 && pixels[i] < 0x40 && pixels[i + 2] < 0x40;
+            return count;
+        };
+        const size_t active_green = green_pixels(active_px);
+        const size_t inactive_green = green_pixels(inactive_px);
+        printf("  NGG gate: active-green=%zu inactive-green=%zu\n",
+               active_green, inactive_green);
+        CHECK(active_green > 0, "active terminal NGG output path retains real geometry");
+        CHECK(inactive_green == 0, "inactive terminal NGG output path degenerates the vertex tail");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
