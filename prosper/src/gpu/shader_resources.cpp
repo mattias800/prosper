@@ -268,6 +268,9 @@ struct TypeInfo {
     uint32_t width = 0;
     uint32_t storage = 0;
     uint32_t image_sampled = 0;
+    uint32_t image_dim = 0xFFFFFFFFu;
+    bool image_arrayed = false;
+    bool image_depth = false;
     bool scalar_float = false;
     std::vector<uint32_t> members;
 };
@@ -362,6 +365,36 @@ bool descriptor_storage_float(const VariableInfo& var,
                sampled_type->second.scalar_float;
     }
     return false;
+}
+
+struct DescriptorImageShape {
+    uint32_t dim = 0xFFFFFFFFu;
+    bool arrayed = false;
+    bool depth = false;
+};
+
+DescriptorImageShape descriptor_image_shape(
+    const VariableInfo& var, const std::unordered_map<uint32_t, TypeInfo>& types) {
+    auto pi = types.find(var.pointer_type);
+    if (pi == types.end() || pi->second.kind != TypeKind::Pointer) return {};
+    uint32_t type = pi->second.element;
+    for (uint32_t depth = 0; depth < 8; ++depth) {
+        auto ti = types.find(type);
+        if (ti == types.end()) return {};
+        if (ti->second.kind == TypeKind::Array) {
+            type = ti->second.element;
+            continue;
+        }
+        if (ti->second.kind == TypeKind::SampledImage) {
+            type = ti->second.element;
+            continue;
+        }
+        if (ti->second.kind == TypeKind::Image)
+            return {ti->second.image_dim, ti->second.image_arrayed,
+                    ti->second.image_depth};
+        return {};
+    }
+    return {};
 }
 
 SpirvDescriptorKind resource_kind(const ShaderResource& r) {
@@ -509,7 +542,10 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
                 if (n >= 3) { TypeInfo t; t.kind = TypeKind::Vector; t.element = word(in, 1); t.count = word(in, 2); types[word(in, 0)] = t; }
                 break;
             case OpTypeImage:
-                if (n >= 8) { TypeInfo t; t.kind = TypeKind::Image; t.element = word(in, 1); t.image_sampled = word(in, 6); types[word(in, 0)] = t; }
+                if (n >= 8) { TypeInfo t; t.kind = TypeKind::Image; t.element = word(in, 1);
+                    t.image_dim = word(in, 2); t.image_depth = word(in, 3) == 1u;
+                    t.image_arrayed = word(in, 4) != 0;
+                    t.image_sampled = word(in, 6); types[word(in, 0)] = t; }
                 break;
             case OpTypeSampledImage:
                 if (n >= 2) { TypeInfo t; t.kind = TypeKind::SampledImage; t.element = word(in, 1); types[word(in, 0)] = t; }
@@ -720,12 +756,14 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     for (uint32_t var : used_vars) {
         auto si = sets.find(var), bi = bindings.find(var);
         if (si == sets.end() || bi == bindings.end()) { add_malformed(report); continue; }
+        const auto image_shape = descriptor_image_shape(variables[var], types);
         report.descriptors.push_back({var, si->second, bi->second, descriptor_vars[var], stage,
                                       required[var], dynamic[var], read_vars.count(var) != 0,
                                       written_vars.count(var) != 0,
                                       normalized_sample_vars.count(var) != 0,
                                       texel_access_vars.count(var) != 0,
-                                      storage_float_vars.count(var) != 0});
+                                      storage_float_vars.count(var) != 0,
+                                      image_shape.dim, image_shape.arrayed, image_shape.depth});
     }
     std::sort(report.descriptors.begin(), report.descriptors.end(), [](const auto& a, const auto& b) {
         return a.set != b.set ? a.set < b.set : a.binding < b.binding;

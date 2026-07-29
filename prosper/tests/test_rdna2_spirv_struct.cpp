@@ -1079,6 +1079,126 @@ int main() {
     }
     printf("  [ok]   image_atomic_swap lowers to a typed R32_UINT SPIR-V image atomic\n");
 
+    // Astro Bot's world-map visibility kernel uses the adjacent GFX10 IMAGE_ATOMIC_ADD opcode.
+    const uint32_t cs_image_atomic_add[] = {
+        0x7e000280u, 0x7e020280u, 0x7e120281u,
+        0xf0442108u, 0x00000900u,
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> atomic_add_spv = recompile_valu(
+        cs_image_atomic_add, std::size(cs_image_atomic_add), 0, 0, &rt_atomic_image);
+    if (atomic_add_spv.empty() || !has_opcode(atomic_add_spv, 60u) ||
+        !has_opcode(atomic_add_spv, 234u)) {
+        printf("  [FAIL] image_atomic_add did not lower through OpImageTexelPointer/OpAtomicIAdd\n");
+        return 1;
+    }
+    printf("  [ok]   image_atomic_add lowers to a typed R32_UINT SPIR-V image atomic\n");
+
+    // Astro Bot's visibility kernel sanitizes a generated coordinate with an explicit-SDST
+    // v_cmp_class_f32 SDWA (mask 3 = sNaN|qNaN), followed by v_cndmask reading s[8:9]. Rejecting
+    // the compare used to discard the entire 1,954-dword world-map compute shader.
+    const uint32_t cs_class_nan[] = {
+        0x7e0202ffu, 0x7fc00000u,           // v_mov_b32 v1, qNaN
+        0x7d1106f9u, 0x86068801u,           // v_cmp_class_f32_sdwa s8, v1, 3
+        0xd5010000u, 0x00210101u,           // v_cndmask_b32_e64 v0, v1, 0, s[8:9]
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> class_nan_spv = recompile_valu(
+        cs_class_nan, std::size(cs_class_nan), 1, 0, nullptr);
+    if (class_nan_spv.empty() || !has_opcode(class_nan_spv, 199u) ||
+        !has_opcode(class_nan_spv, 171u) || !has_opcode(class_nan_spv, 169u) ||
+        !type_result_ids_are_nonzero(class_nan_spv, nullptr)) {
+        printf("  [FAIL] v_cmp_class_f32 did not lower to raw IEEE class selection/compare\n");
+        return 1;
+    }
+    printf("  [ok]   v_cmp_class_f32 lowers raw IEEE classes and feeds its explicit SGPR mask\n");
+
+    // Astro Bot's world-map shader samples a 192-layer BC6H 2D array with explicit LOD. The layer
+    // coordinate must survive in OpTypeImage so the live backend creates a matching 2D-array view.
+    ShaderResourceTable rt_array;
+    { ShaderResource texture{}; texture.cls = ResourceClass::Texture;
+      texture.format = DataFormat::Bc6; texture.num_components = 3;
+      texture.binding = 4; texture.sgpr_base = 0; texture.img_dim = 5;
+      texture.width = 4; texture.height = 4; texture.depth = 2;
+      texture.gpu_addr = 0x100000; texture.size = 32;
+      rt_array.resources.push_back(texture); }
+    const uint32_t cs_sample_array_l[] = {
+        0x7e0002ffu, 0x3f000000u, 0x7e0202ffu, 0x3f000000u,
+        0x7e0402ffu, 0x3f800000u, 0x7e060280u,
+        0xf0900f28u, 0x00400000u,         // image_sample_l dim:2D_ARRAY [u,v,slice,lod]
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> array_l_spv = recompile_valu(
+        cs_sample_array_l, std::size(cs_sample_array_l), 4, 0, &rt_array);
+    const DescriptorValidationReport array_l_report = validate_spirv_descriptor_interface(
+        array_l_spv, &rt_array, 0, SpirvShaderStage::Compute);
+    const SpirvDescriptorBinding* array_l_descriptor = nullptr;
+    for (const auto& descriptor : array_l_report.descriptors)
+        if (descriptor.binding == 4u &&
+            descriptor.kind == SpirvDescriptorKind::CombinedImageSampler)
+            array_l_descriptor = &descriptor;
+    if (array_l_spv.empty() || !array_l_descriptor ||
+        array_l_descriptor->image_dim != 1u || !array_l_descriptor->image_arrayed ||
+        !array_l_descriptor->normalized_sampling) {
+        printf("  [FAIL] 2D-array image_sample_l dropped its reflected layer contract\n");
+        return 1;
+    }
+    printf("  [ok]   2D-array image_sample_l retains its layer coordinate and reflected view shape\n");
+
+    // The same map kernel reads its two-layer RGBA atlas with the NSA SAMPLE_LZ form. Its third
+    // coordinate is still a layer, despite the fixed level zero, and must select an array view too.
+    const uint32_t cs_sample_array_lz[] = {
+        0x7e0002ffu, 0x3f000000u, 0x7e0202ffu, 0x3f000000u,
+        0x7e0402ffu, 0x3f800000u,
+        0xf09c0f2au, 0x00400000u, 0x00000201u,
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> array_lz_spv = recompile_valu(
+        cs_sample_array_lz, std::size(cs_sample_array_lz), 4, 0, &rt_array);
+    const DescriptorValidationReport array_lz_report = validate_spirv_descriptor_interface(
+        array_lz_spv, &rt_array, 0, SpirvShaderStage::Compute);
+    const SpirvDescriptorBinding* array_lz_descriptor = nullptr;
+    for (const auto& descriptor : array_lz_report.descriptors)
+        if (descriptor.binding == 4u &&
+            descriptor.kind == SpirvDescriptorKind::CombinedImageSampler)
+            array_lz_descriptor = &descriptor;
+    if (array_lz_spv.empty() || !array_lz_descriptor ||
+        array_lz_descriptor->image_dim != 1u || !array_lz_descriptor->image_arrayed ||
+        !array_lz_descriptor->normalized_sampling) {
+        printf("  [FAIL] 2D-array image_sample_lz dropped its reflected layer contract\n");
+        return 1;
+    }
+    printf("  [ok]   2D-array image_sample_lz retains its layer coordinate and reflected view shape\n");
+
+    // The visibility half of the same kernel comparison-samples a sixteen-layer shadow array.
+    // Compute keeps its slice and performs the compare manually over a color-sampled array image.
+    ShaderResourceTable rt_array_dref = rt_array;
+    rt_array_dref.resources[0].depth_compare = true;
+    rt_array_dref.resources[0].depth_compare_func = 4;
+    const uint32_t cs_sample_array_c_lz[] = {
+        0x7e1402f0u, 0x7e1602f0u, 0x7e1802f0u,
+        0x7e1a02ffu, 0x3f800000u,
+        0xf0bc012au, 0x0040050au, 0x000d0c0bu,
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> array_c_lz_spv = recompile_valu(
+        cs_sample_array_c_lz, std::size(cs_sample_array_c_lz), 4, 0, &rt_array_dref);
+    const DescriptorValidationReport array_c_lz_report = validate_spirv_descriptor_interface(
+        array_c_lz_spv, &rt_array_dref, 0, SpirvShaderStage::Compute);
+    const SpirvDescriptorBinding* array_c_lz_descriptor = nullptr;
+    for (const auto& descriptor : array_c_lz_report.descriptors)
+        if (descriptor.binding == 4u &&
+            descriptor.kind == SpirvDescriptorKind::CombinedImageSampler)
+            array_c_lz_descriptor = &descriptor;
+    if (array_c_lz_spv.empty() || !array_c_lz_descriptor ||
+        array_c_lz_descriptor->image_dim != 1u || !array_c_lz_descriptor->image_arrayed ||
+        array_c_lz_descriptor->image_depth ||
+        has_opcode(array_c_lz_spv, 90u)) {
+        printf("  [FAIL] compute 2D-array image_sample_c_lz lost its manual array contract\n");
+        return 1;
+    }
+    printf("  [ok]   compute 2D-array image_sample_c_lz preserves slice without a Dref sampler\n");
+
     // LDS array is sized from the shader's real allocation (#130), not a hardcoded 16 KB. A compute
     // kernel that uses ds_write/ds_read declares a Workgroup array; its length must be 4096 dwords
     // (16 KB) by default and rise to the requested size (clamped to the RDNA2 64 KB / 16384-dword max)

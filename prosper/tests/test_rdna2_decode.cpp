@@ -211,6 +211,14 @@ int main() {
     CHECK(fc.fmt == Rdna2Format::VOPC && fc.opcode == 0xDCu && !fc.has_modifier &&
           fc.sdwa_src0_sel == 5u && fc.sdwa_src1_sel == 6u,
           "VOPC f16 SDWA WORD_1 source select is decoded for recompilation");
+    // Exact packet at pc1933 in Astro Bot's world-map visibility compute shader.
+    const uint32_t class_f32[] = { 0x7d1106f9u, 0x86068801u };
+    Rdna2Inst cf = rdna2_decode_one(class_f32, 2);
+    CHECK(cf.fmt == Rdna2Format::VOPC && cf.opcode == 0x88u && cf.len_dwords == 2u &&
+          !cf.has_modifier && isS(cf.dst, 8) && isV(cf.src[0], 1) &&
+          cf.src[1].kind == OperandKind::InlineInt && cf.src[1].value == 3 &&
+          cf.sdwa_src0_sel == 6u && cf.sdwa_src1_sel == 6u,
+          "Astro v_cmp_class_f32 SDWA packet retains s[8:9], v1, and NaN class mask 3");
     const uint32_t cvt_byte[] = { 0x7e0a0cf9u, 0x0000160bu };
     Rdna2Inst cb = rdna2_decode_one(cvt_byte, 2);
     CHECK(cb.fmt == Rdna2Format::VOP1 && cb.opcode == 0x06u && !cb.has_modifier &&
@@ -274,6 +282,13 @@ int main() {
           atomic_swap.mimg_dim == 1u && atomic_swap.mimg_dmask == 1u && atomic_swap.mimg_glc &&
           atomic_swap.dst.value == 9 && atomic_swap.src[0].value == 0 && atomic_swap.src[1].value == 0,
           "Astro image_atomic_swap decodes 2D/R32 data and the return-pre-op GLC flag");
+    // Astro's world-map visibility kernel uses the corresponding GFX10 IMAGE_ATOMIC_ADD encoding.
+    const uint32_t mimg_atomic_add[] = { 0xf0442108u, 0x00070104u };
+    Rdna2Inst atomic_add = rdna2_decode_one(mimg_atomic_add, 2);
+    CHECK(atomic_add.fmt == Rdna2Format::MIMG && atomic_add.opcode == 0x11u &&
+          atomic_add.mimg_dim == 1u && atomic_add.mimg_dmask == 1u && atomic_add.mimg_glc &&
+          atomic_add.dst.value == 1 && atomic_add.src[0].value == 4 && atomic_add.src[1].value == 28,
+          "Astro image_atomic_add decodes the live 2D/R32 visibility packet");
 
     // inline-constant field decode: SGPR106 special, field 129 -> +1, 193 -> -1, 242 -> 1.0f
     CHECK(decode_src_field(0).kind == OperandKind::SGPR && decode_src_field(0).value == 0, "field 0 -> SGPR0");

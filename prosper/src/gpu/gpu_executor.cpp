@@ -1556,7 +1556,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     std::array<uint32_t, kFoldSgprs> val{};                 // concrete SGPR values
     std::bitset<kFoldSgprs> val_known;
     // Entry-user-data identity attached to an otherwise ordinary scalar value. This is narrower
-    // than descriptor provenance: it only proves that four s_mov_b32 copies reassembled four
+    // than descriptor provenance: it only proves that s_mov_b32/s_mov_b64 copies reassembled
     // consecutive entry dwords, without arithmetic or a load changing any word.
     std::array<uint32_t, kFoldSgprs> val_seed_origin{};
     std::bitset<kFoldSgprs> val_seed_origin_known;
@@ -1649,6 +1649,21 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         }
         return true;
     };
+    auto consecutive_seed_copy_range = [&](int first, int count) {
+        if (!user_sgprs || count <= 0 || !valid_reg(first) || !valid_reg(first + count - 1) ||
+            !val_seed_origin_known.test((size_t)first)) return false;
+        const uint32_t first_origin = val_seed_origin[(size_t)first];
+        if (first_origin + (uint32_t)count > nsgpr) return false;
+        for (int k = 0; k < count; ++k) {
+            const int reg = first + k;
+            uint32_t current = 0;
+            if (!val_seed_origin_known.test((size_t)reg) ||
+                val_seed_origin[(size_t)reg] != first_origin + (uint32_t)k ||
+                !known(reg, current) || current != user_sgprs[first_origin + (uint32_t)k])
+                return false;
+        }
+        return true;
+    };
     // Resolve an ALU source operand to a concrete value (SGPR / inline int / literal / a vcc Special).
     // vcc_lo/hi (106/107) are written by ALU dsts as SGPR 106/107 but read back as Special operands with
     // the same field value, so map them onto the same val[] keys. Other Specials (EXEC/M0/...) stay unknown.
@@ -1725,9 +1740,49 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             val_seed_origin_known.set((size_t)in.dst.value);
                         }
                     } else forget(in.dst.value);
+                } else if (in.opcode == 0x04 &&                 // s_mov_b64
+                           in.dst.kind == OperandKind::SGPR &&
+                           in.src[0].kind == OperandKind::SGPR) {
+                    // Capture both source lanes before touching either destination: source and
+                    // destination pairs may overlap. Only an entirely known SGPR pair is modeled;
+                    // special/inline sources and partial pairs retain the previous fail-closed erase.
+                    std::array<uint32_t, 2> source_values{};
+                    std::array<uint32_t, 2> source_keys{};
+                    std::array<uint32_t, 2> source_origins{};
+                    std::array<bool, 2> source_key_known{};
+                    std::array<bool, 2> source_origin_known{};
+                    bool source_known = true;
+                    for (int k = 0; k < 2; ++k) {
+                        const int src = in.src[0].value + k;
+                        source_known &= known(src, source_values[(size_t)k]);
+                        source_key_known[(size_t)k] = valid_reg(src) &&
+                            val_srt_key_known.test((size_t)src);
+                        if (source_key_known[(size_t)k])
+                            source_keys[(size_t)k] = val_srt_key[(size_t)src];
+                        source_origin_known[(size_t)k] = valid_reg(src) &&
+                            val_seed_origin_known.test((size_t)src);
+                        if (source_origin_known[(size_t)k])
+                            source_origins[(size_t)k] = val_seed_origin[(size_t)src];
+                    }
+                    for (int k = 0; k < 2; ++k) {
+                        const int dst = in.dst.value + k;
+                        if (!source_known) {
+                            forget(dst);
+                            continue;
+                        }
+                        set_value(dst, source_values[(size_t)k]);
+                        if (source_key_known[(size_t)k] && valid_reg(dst)) {
+                            val_srt_key[(size_t)dst] = source_keys[(size_t)k];
+                            val_srt_key_known.set((size_t)dst);
+                        }
+                        if (source_origin_known[(size_t)k] && valid_reg(dst)) {
+                            val_seed_origin[(size_t)dst] = source_origins[(size_t)k];
+                            val_seed_origin_known.set((size_t)dst);
+                        }
+                    }
                 } else if (in.dst.kind == OperandKind::SGPR) {
-                    // Not the modeled s_mov_b32 -> the dest is unknown. Erase the PAIR: 64-bit SOP1 ops
-                    // (s_mov_b64, s_getpc_b64, s_and/or/xor/not_b64, s_*_saveexec_b64, …) write
+                    // Not a modeled scalar move -> the dest is unknown. Erase the PAIR: 64-bit SOP1 ops
+                    // (s_getpc_b64, s_and/or/xor/not_b64, s_*_saveexec_b64, …) write
                     // S[dst:dst+1], so leaving a stale "known" val[dst+1] let a later instruction fold a
                     // confidently-wrong 64-bit base/offset -> a wrong V#/T# read from the wrong guest
                     // address (#460). Over-erasing dst+1 for a 32-bit SOP1 only loses a fold opportunity
@@ -2030,7 +2085,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     bool live_t8_known = true;
                     for (int k = 0; k < 8; ++k)
                         live_t8_known &= known(tbase + k, live_t8[(size_t)k]);
-                    const bool seed_provenance = !have_t8 && untouched_seed_range(tbase, 8);
+                    const bool seed_provenance = !have_t8 &&
+                        (untouched_seed_range(tbase, 8) ||
+                         consecutive_seed_copy_range(tbase, 8));
                     bool plausible_seed = true;
                     if (seed_provenance && live_t8_known) {
                         const DecodedImageDescriptor d = decode_image_descriptor(live_t8.data());
@@ -2080,7 +2137,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         SrtUse u; u.kind = 0; u.t8 = *t8;
                         u.key = tkey;
                         u.use_pc = in.pc;
-                        u.is_storage_image = in.opcode == 0x08 || in.opcode == 0x0f;
+                        u.is_storage_image = in.opcode == 0x08 || in.opcode == 0x0f ||
+                                             in.opcode == 0x11;
                         u.is_depth_compare = (in.opcode >= 0x28 && in.opcode <= 0x2f) ||
                                              (in.opcode >= 0x38 && in.opcode <= 0x3f) ||
                                              (in.opcode >= 0x58 && in.opcode <= 0x5f);
