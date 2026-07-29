@@ -87,6 +87,36 @@ bool has_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
     return false;
 }
 
+bool has_explicit_lod_constant(const std::vector<uint32_t>& spv, uint32_t expected) {
+    constexpr uint32_t OpConstant = 43, OpImageSampleExplicitLod = 88, OpBitcast = 124;
+    constexpr uint32_t ImageOperandsLod = 0x2;
+    std::unordered_map<uint32_t, uint32_t> constants;
+    std::unordered_map<uint32_t, uint32_t> bitcasts;
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpConstant && wc == 4) constants[spv[i + 2]] = spv[i + 3];
+        if (op == OpBitcast && wc == 4) bitcasts[spv[i + 2]] = spv[i + 3];
+        i += wc;
+    }
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        // {result type, result, sampled image, coordinate, image-operands mask, lod}
+        if (op == OpImageSampleExplicitLod && wc >= 7 &&
+            (spv[i + 5] & ImageOperandsLod) != 0) {
+            uint32_t value_id = spv[i + 6];
+            if (const auto bitcast = bitcasts.find(value_id); bitcast != bitcasts.end())
+                value_id = bitcast->second;
+            const auto value = constants.find(value_id);
+            if (value != constants.end() && value->second == expected) return true;
+        }
+        i += wc;
+    }
+    return false;
+}
+
 struct OutputStoreStats {
     uint32_t stores = 0;
     uint32_t stores_with_one_repeated_source = 0;
@@ -1263,6 +1293,33 @@ int main() {
         return 1;
     }
     printf("  [ok]   mixed compute SAMPLE/SAMPLE_L shares one 2D-array image contract\n");
+
+    // The graphics renderer still exposes DIM=5 textures through its established base-slice 2D
+    // view. Keep that descriptor non-arrayed, but consume SAMPLE_L's fourth address as the LOD
+    // rather than mistaking the discarded third (slice) address for the LOD.
+    const uint32_t ps_sample_array_l[] = {
+        0x7e0002ffu, 0x3f000000u, 0x7e0202ffu, 0x3f000000u,
+        0x7e0402ffu, 0x3f800000u, 0x7e060280u,
+        0xf0900f28u, 0x00400000u,
+        0xf800000fu, 0x03020100u, 0xbf810000u,
+    };
+    const std::vector<uint32_t> graphics_array_l_spv = recompile_fragment(
+        ps_sample_array_l, std::size(ps_sample_array_l), &rt_array);
+    const DescriptorValidationReport graphics_array_l_report =
+        validate_spirv_descriptor_interface(
+            graphics_array_l_spv, &rt_array, 0, SpirvShaderStage::Fragment);
+    const SpirvDescriptorBinding* graphics_array_l_descriptor = nullptr;
+    for (const auto& descriptor : graphics_array_l_report.descriptors)
+        if (descriptor.binding == 4u &&
+            descriptor.kind == SpirvDescriptorKind::CombinedImageSampler)
+            graphics_array_l_descriptor = &descriptor;
+    if (graphics_array_l_spv.empty() || !graphics_array_l_descriptor ||
+        graphics_array_l_descriptor->image_arrayed ||
+        !has_explicit_lod_constant(graphics_array_l_spv, 0u)) {
+        printf("  [FAIL] graphics DIM=5 image_sample_l violated its base-slice 2D contract\n");
+        return 1;
+    }
+    printf("  [ok]   graphics DIM=5 image_sample_l keeps a 2D view and its fourth-address LOD\n");
 
     // The visibility half of the same kernel comparison-samples a sixteen-layer shadow array.
     // Compute keeps its slice and performs the compare manually over a color-sampled array image.

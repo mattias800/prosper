@@ -7199,8 +7199,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             } else {
-                const bool array_sample = in.mimg_dim == 5u && res->img_dim == 5u &&
-                    (is_sample_l || is_sample_lz || (b.is_compute && is_sample));
+                const bool array_sample = b.is_compute && in.mimg_dim == 5u &&
+                    res->img_dim == 5u && (is_sample || is_sample_l || is_sample_lz);
                 if (!b.declare_texture(res->binding, Dim_2D, uint_texture, array_sample)) {
                     ok = false; return true;
                 }
@@ -7223,9 +7223,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     uint32_t cu = vread(cvg(0)), cv = vread(cvg(1));
                     if (is_sample)         b.image_sample_2d(res->binding, cu, cv, out);
                     else if (is_sample_lz) b.image_sample_lod_2d(res->binding, cu, cv, b.uconst(0), out);      // LOD 0
-                    // Explicit-LOD plain 2D: vaddr = [u, v, lod]. The array form was handled above.
+                    // Explicit-LOD plain 2D uses [u,v,lod]. Graphics keeps the established
+                    // base-slice view for DIM=5, whose address is [u,v,slice,lod].
                     else if (is_sample_l)  b.image_sample_lod_2d(res->binding, cu, cv,
-                                                                 vread(cvg(2)), out);
+                        vread(cvg(in.mimg_dim == 5u && res->img_dim == 5u ? 3u : 2u)), out);
                     else                   b.image_fetch_2d (res->binding, cu, cv, out);
                 }
             }
