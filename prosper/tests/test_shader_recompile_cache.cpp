@@ -519,6 +519,46 @@ int main() {
               stats.misses == 3 && stats.hits == 1 && stats.entries == 3,
           "compute cache separates device-gated typed storage from the raw fallback and sRGB state");
 
+    // Compute image atomics embed the runtime R32_UINT extent in the linearized SSBO index and
+    // bounds guard. Reusing a module across extents would retain a stale row stride or bounds.
+    clear_shader_recompile_cache();
+    static const uint32_t kImageAtomicCompute[] = {
+        0x7e000280u, 0x7e020280u, 0x7e120281u,
+        0xf0442108u, 0x00000900u, 0xbf810000u,
+    };
+    uint32_t atomic_pixels[32] = {};
+    ShaderResource atomic_image;
+    atomic_image.cls = ResourceClass::StorageImage;
+    atomic_image.format = DataFormat::Uint32;
+    atomic_image.num_components = 1;
+    atomic_image.binding = 4;
+    atomic_image.sgpr_base = 0;
+    atomic_image.img_dim = 1;
+    atomic_image.width = 4;
+    atomic_image.height = 2;
+    atomic_image.depth = 1;
+    atomic_image.size = sizeof(atomic_pixels);
+    atomic_image.host_data = reinterpret_cast<uint8_t*>(atomic_pixels);
+    atomic_image.host_data_size = sizeof(atomic_pixels);
+    ShaderResourceTable atomic_table;
+    atomic_table.resources.push_back(atomic_image);
+    ComputeShaderConfig atomic_config;
+    atomic_config.user_sgprs.resize(8);
+    atomic_config.local_x = 1;
+    const auto atomic_4x2 = recompile_compute_shader_cached(
+        kImageAtomicCompute, std::size(kImageAtomicCompute), &atomic_table, atomic_config);
+    atomic_table.resources[0].width = 8;
+    const auto atomic_8x2 = recompile_compute_shader_cached(
+        kImageAtomicCompute, std::size(kImageAtomicCompute), &atomic_table, atomic_config);
+    atomic_table.resources[0].width = 4;
+    const auto atomic_4x2_again = recompile_compute_shader_cached(
+        kImageAtomicCompute, std::size(kImageAtomicCompute), &atomic_table, atomic_config);
+    stats = shader_recompile_cache_stats();
+    CHECK(!atomic_4x2.empty() && !atomic_8x2.empty() &&
+              atomic_4x2 != atomic_8x2 && atomic_4x2_again == atomic_4x2 &&
+              stats.misses == 2 && stats.hits == 1 && stats.entries == 2,
+          "compute cache separates image-atomic modules with different embedded extents");
+
     // Manual shadow comparison bakes the enable, compare op, filter mode, address modes, and border
     // color into SPIR-V. In particular depth_compare=false must not reuse a previously successful
     // module: that descriptor contract is supposed to reject this comparison-sample shader.
