@@ -29,6 +29,16 @@ uint32_t buffer_upload_bytes(uint32_t declared_bytes);
 size_t texture_decode_cache_limit_bytes(const char* override_mib,
                                         uint64_t physical_memory_bytes);
 
+// Decide whether guest bytes are the authoritative source for a sampled-texture decode. Retained
+// color and depth targets are already represented by Vulkan images and must bypass CPU decode-cache
+// validation; captured host backing and non-2D/non-texture resources follow their dedicated paths.
+bool texture_decode_cache_candidate(bool has_live_color_target,
+                                    bool has_live_depth_target,
+                                    bool has_captured_host_data,
+                                    uint32_t image_dimension,
+                                    bool is_sampled_texture,
+                                    bool format_supported);
+
 // Register the live renderer. `frame_dir` is where periodic BMP screenshots are written; pass
 // `dump_bmps = false` (the frontend app) to suppress them — a windowed app presents to screen and
 // doesn't want the periodic disk writes the headless runner uses for verification.

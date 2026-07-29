@@ -935,6 +935,14 @@ int main() {
               "an 8 GiB device keeps the 1 GiB sampled-image ceiling");
         CHECK(prosper::test::persistent_texture_cache_budget_for_heap(16ull * GiB) == 2ull * GiB,
               "a capable device admits the 2 GiB sampled-image ceiling");
+
+        using prosper::frontend::texture_decode_cache_candidate;
+        CHECK(texture_decode_cache_candidate(false, false, false, 1u, true, true),
+              "an ordinary supported guest 2D texture uses the decoded-texture cache");
+        CHECK(!texture_decode_cache_candidate(false, true, false, 1u, true, true),
+              "a retained sampled-depth image bypasses guest-byte decode-cache work");
+        CHECK(!texture_decode_cache_candidate(true, false, false, 1u, true, true),
+              "a retained color image bypasses guest-byte decode-cache work");
     }
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }

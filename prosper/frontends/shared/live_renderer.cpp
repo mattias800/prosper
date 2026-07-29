@@ -381,6 +381,17 @@ size_t texture_decode_cache_limit_bytes(const char* override_mib,
     return static_cast<size_t>(std::min<uint64_t>(bytes, SIZE_MAX));
 }
 
+bool texture_decode_cache_candidate(bool has_live_color_target,
+                                    bool has_live_depth_target,
+                                    bool has_captured_host_data,
+                                    uint32_t image_dimension,
+                                    bool is_sampled_texture,
+                                    bool format_supported) {
+    return !has_live_color_target && !has_live_depth_target &&
+        !has_captured_host_data && image_dimension == 1u &&
+        is_sampled_texture && format_supported;
+}
+
 uint32_t buffer_upload_bytes(uint32_t declared_bytes) {
     // PROSPER_MAX_BUFFER_UPLOAD_MB=N lowers the ceiling (1..64 MiB) so one build can reproduce the
     // #1427 collapse and its fix back to back; unset/invalid keeps the full ceiling.
@@ -1334,6 +1345,20 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 r.gpu_addr, live_rtt->second.w, live_rtt->second.h,
                                 live_rtt->second.format) != nullptr;
                         const bool has_live_rtt = has_cpu_live_rtt || has_gpu_live_rtt;
+                        // Resolve renderer-owned depth before considering guest-byte texture
+                        // decoding. A sampled depth attachment has no authoritative color payload
+                        // in guest memory: the retained Vulkan image is the source of truth. The old
+                        // ordering first copied DCC metadata and probed the persistent CPU decode
+                        // cache for every such binding, then discarded that work when this bridge
+                        // won below. Deferred workloads can bind hundreds of depth views per submit,
+                        // so select the exact GPU path up front.
+                        const prosper::test::PersistentDsSampled sampled_ds =
+                            !has_live_rtt && !fr.is_storage_image && r.img_dim == 1u &&
+                                    r.cls == RC::Texture
+                                ? prosper::test::find_persistent_ds_sampled(
+                                      r.gpu_addr, tw, th, render_scale, normalized_sampling)
+                                : prosper::test::PersistentDsSampled{};
+                        const bool has_ds_live = sampled_ds.image != nullptr;
                         const bool is_cube = r.img_dim == 3u;   // CUBE: six faces stacked vertically (#273)
                         const bool is_volume = r.img_dim == 2u;
                         const uint32_t persistent_pitch = getenv("PROSPER_PITCH")
@@ -1391,12 +1416,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         if (sampled_source_bpt == 0 ||
                             (sampled_source_bpt > 4 && !sampled_source_f16 && !sampled_source_f32))
                             sampled_source_bpt = 4;
-                        const bool persistent_sampled_texture =
-                            !has_live_rtt && !r.host_data && r.img_dim == 1u &&
-                            r.cls == RC::Texture &&
-                            (persistent_unorm8_texture || persistent_fp16_texture ||
-                             persistent_fp32_texture || persistent_packed32_texture ||
-                             persistent_bc_block_bytes != 0);
+                        const bool persistent_sampled_texture = texture_decode_cache_candidate(
+                            has_live_rtt, has_ds_live, r.host_data != nullptr, r.img_dim,
+                            r.cls == RC::Texture,
+                            persistent_unorm8_texture || persistent_fp16_texture ||
+                                persistent_fp32_texture || persistent_packed32_texture ||
+                                persistent_bc_block_bytes != 0);
                         const bool persistent_source_is_tiled =
                             persistent_sampled_texture && !getenv("PROSPER_NODETILE") &&
                             prosper::gpu::tile_mode_is_tiled(r.tile_mode);
@@ -1489,7 +1514,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // provided we re-check the complete metadata plane before every reuse.  Other
                         // metadata states remain on the existing fast-clear/unsupported paths: caching
                         // them from base bytes alone would miss a metadata-only content transition.
-                        const uint64_t sampled_dcc_metadata_size = r.compression_enabled
+                        const uint64_t sampled_dcc_metadata_size =
+                            !has_ds_live && r.compression_enabled
                             ? prosper::gpu::gpu_capture_dcc_metadata_footprint(r)
                             : 0u;
                         std::vector<uint8_t> sampled_dcc_metadata(
@@ -1726,13 +1752,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // is uniformly smaller; normalized depth sampling maps onto that image just
                         // like the color-target bridge above. Keep the actual image extent in the
                         // backend resource so its exact cache lookup remains unambiguous.
-                        const prosper::test::PersistentDsSampled sampled_ds =
-                            !has_live_rtt && !fr.is_storage_image && r.img_dim == 1u &&
-                                    r.cls == RC::Texture
-                                ? prosper::test::find_persistent_ds_sampled(
-                                      r.gpu_addr, tw, th, render_scale, normalized_sampling)
-                                : prosper::test::PersistentDsSampled{};
-                        const bool has_ds_live = sampled_ds.image != nullptr;
                         if (has_gpu_live_rtt) {
                             fr.persistent_render_target_id = r.gpu_addr;
                             fr.tw = live_rtt->second.w;

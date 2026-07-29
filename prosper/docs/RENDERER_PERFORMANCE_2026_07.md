@@ -78,6 +78,14 @@ not preallocations. Both defaults now use one eighth of their relevant physical/
 clamped to 1-2 GiB, so an 8 GiB host or GPU retains the historical 1 GiB behavior and both explicit
 MiB overrides retain precedence.
 
+A follow-up 4 GiB frontend A/B showed that the remaining roughly 300 reported cold misses per submit
+were not capacity misses: fewer than 3,000 actual decodes occurred over 800 frames. They were sampled
+depth attachments whose authoritative pixels already lived in retained Vulkan images. The frontend
+was probing the guest-byte decode cache and copying DCC metadata before the sampled-depth bridge won
+later in the same resource path. Resolving that bridge first reduced the false misses to effectively
+zero and lowered steady texture resource handling from about 5.6-6.3 ms to 3.7-4.2 ms per submit,
+without changing the cache budget or depth-image binding contract.
+
 ## Cobra Float32 sampled-texture retention (2026-07-25)
 
 Cobra's title and cinematic repeatedly sample large guest-backed Float32 post-process inputs. The live
