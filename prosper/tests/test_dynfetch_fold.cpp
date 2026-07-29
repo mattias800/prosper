@@ -419,6 +419,115 @@ int main() {
     CHECK(have_cbuf, "kernel 5 s_buffer_load reports a ConstantBuffer table-use keyed by the V# load imm");
     CHECK(cbuf_ok,   "kernel 5 V# dwords match the table as loaded");
 
+    // A fused NGG back shader receives a driver stage-data pointer in system s[0:1], before user
+    // data begins at s8. Its prologue loads the live V# from that table into s[8:11]. Preserve those
+    // system seeds so the exact consuming MUBUF can be resolved like any other loaded descriptor.
+    static uint32_t ngg_stage_data[4];
+    static uint32_t ngg_vertices[16];
+    const uint64_t ngg_vertex_base = reinterpret_cast<uint64_t>(ngg_vertices);
+    ngg_stage_data[0] = static_cast<uint32_t>(ngg_vertex_base);
+    ngg_stage_data[1] = static_cast<uint32_t>(ngg_vertex_base >> 32);
+    ngg_stage_data[2] = 16;
+    ngg_stage_data[3] = 0;
+    const uint32_t ngg_system_sgprs[2] = {
+        static_cast<uint32_t>(reinterpret_cast<uint64_t>(ngg_stage_data)),
+        static_cast<uint32_t>(reinterpret_cast<uint64_t>(ngg_stage_data) >> 32),
+    };
+    const uint32_t ngg_loaded_vsharp[] = {
+        0xF4080200u, 0xFA000000u,   // s_load_dwordx4 s[8:11], s[0:1], 0
+        0xE0002000u, 0x80020100u,   // buffer_load_format_x v1, v0, s[8:11], 0 idxen
+        0xBF810000u,
+    };
+    const auto ngg_fetches = resolve_dynamic_fetch(
+        ngg_loaded_vsharp, std::size(ngg_loaded_vsharp), nullptr, 0, 8, nullptr,
+        UINT32_MAX, nullptr, ngg_system_sgprs, std::size(ngg_system_sgprs));
+    CHECK(ngg_fetches.size() == 1 && ngg_fetches[0].fetch_pc == 2 &&
+              ngg_fetches[0].desc.base == ngg_vertex_base,
+          "fused NGG system stage-data pointer resolves its loaded vertex descriptor");
+
+    // Astro Bot loads four consecutive V# descriptors from the same stage-data pointer in one
+    // s_load_dwordx16, then consumes the first with an untyped MUBUF operation. The wide load is
+    // still descriptor provenance, but must resolve by consuming pc because its one immediate
+    // offset cannot identify which of the four V#s was selected.
+    alignas(16) static uint32_t ngg_wide_stage_data[16]{};
+    std::copy(std::begin(ngg_stage_data), std::end(ngg_stage_data),
+              std::begin(ngg_wide_stage_data));
+    const uint32_t ngg_wide_system_sgprs[2] = {
+        static_cast<uint32_t>(reinterpret_cast<uint64_t>(ngg_wide_stage_data)),
+        static_cast<uint32_t>(reinterpret_cast<uint64_t>(ngg_wide_stage_data) >> 32),
+    };
+    const uint32_t ngg_loaded_wide_vsharp[] = {
+        0xF4100200u, 0xFA000000u,   // s_load_dwordx16 s[8:23], s[0:1], 0
+        0xE0382020u, 0x80020509u,   // buffer_load_dwordx4 v[5:8], v9, s[8:11], s2 offen
+        0xBF810000u,
+    };
+    std::vector<SrtUse> ngg_wide_uses;
+    resolve_dynamic_fetch(
+        ngg_loaded_wide_vsharp, std::size(ngg_loaded_wide_vsharp), nullptr, 0, 8,
+        &ngg_wide_uses, UINT32_MAX, nullptr, ngg_wide_system_sgprs,
+        std::size(ngg_wide_system_sgprs));
+    CHECK(ngg_wide_uses.size() == 1 && ngg_wide_uses[0].use_pc == 2 &&
+              ngg_wide_uses[0].key == 0xFFFFFFFFu &&
+              decode_buffer_descriptor(ngg_wide_uses[0].v4.data()).base == ngg_vertex_base,
+          "fused NGG x16 stage-data load publishes its raw-buffer V# by consuming pc");
+
+    // Astro Bot's world-map NGG block begins with an 8-dword T# and also carries V#s later in the
+    // same x16 load. SGPR memory is typeless: preserving only the four V# interpretations makes the
+    // image_sample's s[8:15] permanently unknown and drops the main world-map draw at pc205.
+    alignas(16) static uint32_t ngg_mixed_stage_data[16] = {
+        0x01234000u, 0x00000005u, 0x00000000u, 0x00100000u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000008u,
+        0x89abcdefu, 0x01234567u, 0x76543210u, 0xfedcba98u,
+        0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u,
+    };
+    const uint32_t ngg_mixed_system_sgprs[2] = {
+        static_cast<uint32_t>(reinterpret_cast<uint64_t>(ngg_mixed_stage_data)),
+        static_cast<uint32_t>(reinterpret_cast<uint64_t>(ngg_mixed_stage_data) >> 32),
+    };
+    const uint32_t ngg_loaded_wide_texture[] = {
+        0xF4100200u, 0xFA000000u,   // s_load_dwordx16 s[8:23], s[0:1], 0
+        0xF0800F08u, 0x00A20000u,   // image_sample v[0:3], v[0:1], s[8:15], s[20:23]
+        0xBF810000u,
+    };
+    std::vector<SrtUse> ngg_wide_texture_uses;
+    resolve_dynamic_fetch(
+        ngg_loaded_wide_texture, std::size(ngg_loaded_wide_texture), nullptr, 0, 8,
+        &ngg_wide_texture_uses, UINT32_MAX, nullptr, ngg_mixed_system_sgprs,
+        std::size(ngg_mixed_system_sgprs));
+    CHECK(ngg_wide_texture_uses.size() == 1 &&
+              ngg_wide_texture_uses[0].kind == 0 &&
+              ngg_wide_texture_uses[0].use_pc == 2 &&
+              ngg_wide_texture_uses[0].key == 0xFFFFFFFFu &&
+              std::equal(ngg_wide_texture_uses[0].t8.begin(),
+                         ngg_wide_texture_uses[0].t8.end(),
+                         std::begin(ngg_mixed_stage_data)) &&
+              ngg_wide_texture_uses[0].has_samp &&
+              ngg_wide_texture_uses[0].s4[0] == ngg_mixed_stage_data[12],
+          "fused NGG x16 mixed stage-data load publishes its T# and paired S# by consuming pc");
+
+    // The x16 snapshot is only provenance. A modeled scalar patch changes the physical T# word
+    // consumed by MIMG, so the emitted use must carry the live descriptor rather than stale load-time
+    // bytes. (An unmodeled write makes that word unknown and suppresses the use instead.)
+    const uint32_t ngg_patched_wide_texture[] = {
+        0xF4100200u, 0xFA000000u,   // s_load_dwordx16 s[8:23], s[0:1], 0
+        0xBE8A0381u,                // s_mov_b32 s10, 1 (patch T#.word2)
+        0xF0800F08u, 0x00A20000u,   // image_sample v[0:3], v[0:1], s[8:15], s[20:23]
+        0xBF810000u,
+    };
+    std::vector<SrtUse> ngg_patched_texture_uses;
+    resolve_dynamic_fetch(
+        ngg_patched_wide_texture, std::size(ngg_patched_wide_texture), nullptr, 0, 8,
+        &ngg_patched_texture_uses, UINT32_MAX, nullptr, ngg_mixed_system_sgprs,
+        std::size(ngg_mixed_system_sgprs));
+    CHECK(ngg_patched_texture_uses.size() == 1 &&
+              ngg_patched_texture_uses[0].kind == 0 &&
+              ngg_patched_texture_uses[0].use_pc == 3 &&
+              ngg_patched_texture_uses[0].key == 0xFFFFFFFFu &&
+              ngg_patched_texture_uses[0].t8[0] == ngg_mixed_stage_data[0] &&
+              ngg_patched_texture_uses[0].t8[2] == 1u &&
+              ngg_patched_texture_uses[0].t8[3] == ngg_mixed_stage_data[3],
+          "patched x16 T# publishes its live eight words at the MIMG consumer");
+
     // Kernel 5n: an s_buffer_load_dwordx8 result is typeless SGPR data. A later scalar buffer load
     // may consume its first four words as a nested V#, as DOLL's post-process shader does. Since the
     // V# came through another buffer descriptor it has no immediate key; preserve it by consumer pc.
@@ -517,6 +626,110 @@ int main() {
           direct_uses[0].t8[7] == seed5d[7] && direct_uses[0].has_samp &&
           direct_uses[0].s4[0] == seed5d[8] && direct_uses[0].s4[3] == seed5d[11],
           "direct user-SGPR T#/S# dwords are preserved");
+
+    // Astro Bot's live visibility packet consumes a direct R32_UINT T# in s[0:7]. Opcode 0x0f is
+    // IMAGE_ATOMIC_SWAP, so its instruction-scoped resource must be materialized as a storage image
+    // even though the packet's unused SSAMP field aliases s0.
+    const uint32_t image_atomic_swap[] = {
+        0xf03c2108u, 0x00000900u,
+        0xbf810000u,
+    };
+    const uint32_t atomic_image_seed[8] = {
+        0x055c0100u, 0xc1400000u, 0x001fc01fu, 0x91b00204u,
+        0x00000000u, 0x00700000u, 0x00000000u, 0x00000000u,
+    };
+    std::vector<SrtUse> atomic_image_uses;
+    resolve_dynamic_fetch(image_atomic_swap, std::size(image_atomic_swap),
+                          atomic_image_seed, std::size(atomic_image_seed), 0,
+                          &atomic_image_uses);
+    const std::array<uint32_t, 8> expected_atomic_t8 = {
+        0x055c0100u, 0xc1400000u, 0x001fc01fu, 0x91b00204u,
+        0x00000000u, 0x00700000u, 0x00000000u, 0x00000000u,
+    };
+    CHECK(atomic_image_uses.size() == 1 && atomic_image_uses[0].kind == 0 &&
+              atomic_image_uses[0].use_pc == 0 &&
+              atomic_image_uses[0].is_storage_image &&
+              atomic_image_uses[0].t8 == expected_atomic_t8,
+          "image_atomic_swap publishes the live direct T# as a storage-image use");
+    const uint32_t image_atomic_add[] = {
+        0xf0442108u, 0x00000900u,
+        0xbf810000u,
+    };
+    std::vector<SrtUse> atomic_add_uses;
+    resolve_dynamic_fetch(image_atomic_add, std::size(image_atomic_add),
+                          atomic_image_seed, std::size(atomic_image_seed), 0,
+                          &atomic_add_uses);
+    CHECK(atomic_add_uses.size() == 1 && atomic_add_uses[0].kind == 0 &&
+              atomic_add_uses[0].use_pc == 0 &&
+              atomic_add_uses[0].is_storage_image &&
+              atomic_add_uses[0].t8 == expected_atomic_t8,
+          "image_atomic_add publishes the live direct T# as a storage-image use");
+
+    // The same live Astro visibility kernel assembles a sampled T# in s[44:51] from four
+    // consecutive entry-user-data pairs before image_load. Preserve both lanes of s_mov_b64 and
+    // accept the reassembled descriptor only while all eight entry origins remain consecutive.
+    uint32_t moved_image_seed[14] = {};
+    std::copy(std::begin(atomic_image_seed), std::end(atomic_image_seed),
+              moved_image_seed + 2);
+    const uint32_t moved_direct_image[] = {
+        0xbeac0402u, 0xbeae0404u, 0xbeb00406u, 0xbeb20408u,
+        0xf0000108u, 0x000b0707u, // image_load v7, [v7,v8], s[44:51] dmask:x 2D
+        0xbf810000u,
+    };
+    std::vector<SrtUse> moved_image_uses;
+    resolve_dynamic_fetch(moved_direct_image, std::size(moved_direct_image),
+                          moved_image_seed, std::size(moved_image_seed), 0,
+                          &moved_image_uses);
+    CHECK(moved_image_uses.size() == 1 && moved_image_uses[0].kind == 0 &&
+              moved_image_uses[0].use_pc == 4 &&
+              moved_image_uses[0].t8 == expected_atomic_t8,
+          "Astro moved consecutive entry pairs publish the image_load T# by exact pc");
+
+    // Keep the assembled bytes identical and plausible, but source the high half from a disjoint
+    // second copy. Shape checks alone would accept this; non-consecutive origins must not fabricate
+    // moved-descriptor provenance.
+    std::copy(std::begin(atomic_image_seed) + 4, std::end(atomic_image_seed),
+              moved_image_seed + 10);
+    const uint32_t moved_gapped_image[] = {
+        0xbeac0402u, 0xbeae0404u, 0xbeb0040au, 0xbeb2040cu,
+        0xf0000108u, 0x000b0707u,
+        0xbf810000u,
+    };
+    std::vector<SrtUse> moved_gapped_image_uses;
+    resolve_dynamic_fetch(moved_gapped_image, std::size(moved_gapped_image),
+                          moved_image_seed, std::size(moved_image_seed), 0,
+                          &moved_gapped_image_uses);
+    CHECK(moved_gapped_image_uses.empty(),
+          "gapped entry pairs do not fabricate moved image-descriptor provenance");
+
+    // Astro Bot's world-map compaction kernel keeps an x8 descriptor-table pointer in s[14:15],
+    // while s_abs_i32 writes the adjacent s13 immediately before the load. S_ABS has a 32-bit
+    // destination: the scalar fold must not erase s14 as though this were an unknown pair write,
+    // or the second image_store's exact descriptor disappears.
+    alignas(16) uint32_t abs_adjacent_image[8];
+    std::copy(std::begin(atomic_image_seed), std::end(atomic_image_seed),
+              std::begin(abs_adjacent_image));
+    const uint64_t abs_adjacent_image_addr =
+        reinterpret_cast<uint64_t>(abs_adjacent_image);
+    uint32_t abs_adjacent_seed[25]{};
+    abs_adjacent_seed[14] = static_cast<uint32_t>(abs_adjacent_image_addr);
+    abs_adjacent_seed[15] = static_cast<uint32_t>(abs_adjacent_image_addr >> 32);
+    abs_adjacent_seed[24] = 17u;
+    const uint32_t abs_adjacent_load[] = {
+        0xbe8d3418u,                // s_abs_i32 s13, s24 (must leave s14 untouched)
+        0xf40c0907u, 0xfa000000u,   // s_load_dwordx8 s[36:43], s[14:15], 0
+        0xf0200108u, 0x00090600u,   // image_store v6, v0, s[36:43] dmask:x 2D
+        0xbf810000u,
+    };
+    std::vector<SrtUse> abs_adjacent_uses;
+    resolve_dynamic_fetch(abs_adjacent_load, std::size(abs_adjacent_load),
+                          abs_adjacent_seed, std::size(abs_adjacent_seed), 0,
+                          &abs_adjacent_uses);
+    CHECK(abs_adjacent_uses.size() == 1 && abs_adjacent_uses[0].kind == 0 &&
+              abs_adjacent_uses[0].use_pc == 3 &&
+              abs_adjacent_uses[0].is_storage_image &&
+              abs_adjacent_uses[0].t8 == expected_atomic_t8,
+          "Astro s_abs_i32 preserves the adjacent x8 image-table pointer");
 
     // Astro's title PS consumes a V# placed directly in s[24:27] with a scalar offset computed in
     // VCC_LO. No s_load gives that descriptor an SRT key, and AGC metadata need not publish a sharp
@@ -663,6 +876,51 @@ int main() {
     CHECK(direct_v_uses.size() == 1 && direct_v_uses[0].v4[0] == seed5v[0] &&
           direct_v_uses[0].v4[1] == seed5v[1] && direct_v_uses[0].v4[2] == seed5v[2],
           "direct raw-MUBUF V# preserves base/stride/record dwords");
+
+    // Astro Bot's 7f5f world-map NGG shader patches only NUM_RECORDS in its direct s[16:19] V#
+    // (`s_mov_b32 s18, 1`) before a raw buffer_load_dwordx4 at pc2761. The consumer is itself the
+    // architectural descriptor proof; requiring the four words to retain pristine entry-seed
+    // provenance dropped this fully-known live descriptor and therefore the whole draw.
+    alignas(16) static uint32_t patched_raw_payload[4]{};
+    const uint64_t patched_raw_base = reinterpret_cast<uint64_t>(patched_raw_payload);
+    uint32_t patched_raw_seed[12]{};
+    patched_raw_seed[8]  = static_cast<uint32_t>(patched_raw_base); // shader s16, user block +8
+    patched_raw_seed[9]  = (static_cast<uint32_t>(patched_raw_base >> 32) & 0xffffu) |
+                           (16u << 16);
+    patched_raw_seed[10] = 64u;
+    patched_raw_seed[11] = 0u;
+    const uint32_t patched_direct_raw[] = {
+        0xBE920381u,                // s_mov_b32 s18, 1 (live NUM_RECORDS patch)
+        0xE03C2020u, 0x8004074Cu,   // exact Astro raw buffer_load_dwordx4 ..., s[16:19]
+        0xBF810000u,
+    };
+    std::vector<SrtUse> patched_raw_uses;
+    resolve_dynamic_fetch(patched_direct_raw, std::size(patched_direct_raw),
+                          patched_raw_seed, std::size(patched_raw_seed), 8,
+                          &patched_raw_uses);
+    CHECK(patched_raw_uses.size() == 1 && patched_raw_uses[0].kind == 1 &&
+              patched_raw_uses[0].use_pc == 1 &&
+              patched_raw_uses[0].key == 0xFFFFFFFFu &&
+              decode_buffer_descriptor(patched_raw_uses[0].v4.data()).base == patched_raw_base &&
+              decode_buffer_descriptor(patched_raw_uses[0].v4.data()).num_records == 1,
+          "Astro patched direct raw-MUBUF V# resolves by its exact consuming pc");
+
+    // Astro Bot world-map PS consumes its direct s[16:19] V# with the raw x3 store at pc109.
+    // Discovery must publish the binding before the recompiler can emit the otherwise-supported store.
+    const uint32_t astro_store_x3[] = {
+        0xE07C2000u, 0x8004030Au,   // buffer_store_dwordx3 v[3:5], v10, s[16:19], 0 idxen
+        0xBF810000u,
+    };
+    std::vector<SrtUse> astro_store_x3_uses;
+    resolve_dynamic_fetch(astro_store_x3, std::size(astro_store_x3),
+                          patched_raw_seed, std::size(patched_raw_seed), 8,
+                          &astro_store_x3_uses);
+    CHECK(astro_store_x3_uses.size() == 1 && astro_store_x3_uses[0].kind == 1 &&
+              astro_store_x3_uses[0].use_pc == 0 &&
+              astro_store_x3_uses[0].key == 0xFFFFFFFFu &&
+              astro_store_x3_uses[0].v4[0] == patched_raw_seed[8] &&
+              astro_store_x3_uses[0].v4[1] == patched_raw_seed[9],
+          "Astro buffer_store_dwordx3 publishes its direct V# by exact consumer pc");
 
     // #636: Dead Cells' format-copy compute places its declared source V# at s0 and its otherwise
     // undeclared destination V# at s4. Resource discovery must follow the two actual MUBUF uses:

@@ -28,6 +28,7 @@
 #include <set>
 
 extern "C" const void* prosper_agc_shader_header_for_code(uint64_t code_addr);
+extern "C" const void* prosper_agc_fused_back_header_for_front(uint64_t front_code_addr);
 
 namespace prosper::gpu {
 
@@ -92,9 +93,29 @@ struct DrawItem {
     uint64_t draw_index = 0;
     uint64_t command_order = 0;
 
+    // A shared value WINS over the owned vector. Assigning `vs`/`fs` on an item that already carries
+    // a shared value therefore has NO effect — the original shader keeps rendering, and the mistake
+    // reads as "my substitution changed nothing" rather than as an error (#1434; it cost real time in
+    // the #1427 investigation, and #1396 fixed the same class of confusion for the replay probes).
+    // Substitute through set_vs()/set_fs(), which drop the shared value and the cache identity so
+    // persistent backend caches compare the new words instead of hitting the old entry. `gs` has no
+    // shared form today; if one is ever added it needs the same accessor/setter pair, or this bug
+    // returns through the geometry stage.
     const std::vector<uint32_t>& vs_words() const { return vs_shared ? *vs_shared : vs; }
     const std::vector<uint32_t>& gs_words() const { return gs; }
     const std::vector<uint32_t>& fs_words() const { return fs_shared ? *fs_shared : fs; }
+
+    void set_vs(std::vector<uint32_t> words) {
+        vs = std::move(words); vs_shared.reset(); vs_identity = 0;
+    }
+    void set_fs(std::vector<uint32_t> words) {
+        fs = std::move(words); fs_shared.reset(); fs_identity = 0;
+    }
+    // True when an owned vector was assigned while a shared value still shadows it — the silent
+    // failure above. Diagnostics assert on this rather than rendering the wrong shader quietly.
+    bool has_shadowed_shader() const {
+        return (vs_shared && !vs.empty()) || (fs_shared && !fs.empty());
+    }
 };
 
 // The pluggable Vulkan backend: render the submit's draw items into one image and return W*H*4 RGBA8
@@ -174,10 +195,9 @@ struct SrtUse {
     // has no usable key; keying the TEXTURE use by its exact instruction (ShaderResource::fetch_pc,
     // the same per-instruction provenance the vertex fetches use) is unambiguous.
     uint32_t use_pc = 0xFFFFFFFFu;   // exact consuming pc for key-less texture/buffer uses
-    // The consuming image op WRITES the image (image_store — MIMG op 0x8): the resource must be a
-    // STORAGE image, not a sampled texture (#590 — the recompiler's storage path requires
-    // ResourceClass::StorageImage). Only meaningful for kind 0.
-    bool is_store = false;
+    // The consuming image op requires a STORAGE image (image_store 0x08 or an image atomic such as
+    // IMAGE_ATOMIC_SWAP 0x0f), not a sampled texture. Only meaningful for kind 0.
+    bool is_storage_image = false;
     // The consuming MIMG opcode is a comparison/depth sample (IMAGE_SAMPLE_C*). This is a
     // property of the use, not merely the S# compare function: NEVER is a valid compare op.
     bool is_depth_compare = false;
@@ -187,7 +207,9 @@ std::vector<DynFetch> resolve_dynamic_fetch(const uint32_t* code, size_t dwords,
                                             uint32_t user_sgpr_base,
                                             std::vector<SrtUse>* srt_uses = nullptr,
                                             uint32_t pcrel_dispatch_target = UINT32_MAX,
-                                            const PcrelDispatchInfo* pcrel_dispatch = nullptr);
+                                            const PcrelDispatchInfo* pcrel_dispatch = nullptr,
+                                            const uint32_t* system_sgprs = nullptr,
+                                            uint32_t nsystem_sgprs = 0);
 
 // Add instruction-provenance compute buffer resources to a metadata-built table. This is the exact
 // buffer-discovery path used by realize_compute_dispatches; it is exposed so tests can assert the
@@ -276,6 +298,7 @@ struct ComputeItem {
     uint64_t dispatch_index = 0;
     uint64_t submit_no = 0;
     uint64_t command_order = 0;
+    uint32_t required_subgroup_size = 0;
 };
 
 enum class SubmitOperationKind : uint8_t { Draw, Dispatch, DmaCopy };
@@ -320,19 +343,27 @@ std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
                                                        const ShaderResourceTable* resources = nullptr,
                                                        const PixelInputMapping* pixel_inputs = nullptr,
                                                        const PixelSystemInputMapping* system_inputs = nullptr,
-                                                       uint64_t* cache_identity = nullptr);
+                                                       uint64_t* cache_identity = nullptr,
+                                                       bool fragment_wave32 = false);
 SharedShaderWords recompile_graphics_shader_cached_shared(
     ShaderProgramStage stage, const uint32_t* code, size_t dwords,
     const ShaderResourceTable* resources = nullptr,
     const PixelInputMapping* pixel_inputs = nullptr,
     const PixelSystemInputMapping* system_inputs = nullptr,
-    uint64_t* cache_identity = nullptr);
+    uint64_t* cache_identity = nullptr,
+    bool fragment_wave32 = false);
+// Compute uses the same bounded content-addressed cache as graphics. Launch geometry that changes
+// generated SPIR-V participates in the key; per-dispatch push-constant values deliberately do not.
+std::vector<uint32_t> recompile_compute_shader_cached(
+    const uint32_t* code, size_t dwords, const ShaderResourceTable* resources,
+    const ComputeShaderConfig& config, uint64_t* cache_identity = nullptr);
 ShaderRecompileCacheStats shader_recompile_cache_stats();
 void clear_shader_recompile_cache();
 
 FragmentInterpolationLayout fragment_interpolation_layout_cached(
     const uint32_t* code, size_t dwords,
-    const PixelSystemInputMapping* system_inputs = nullptr);
+    const PixelSystemInputMapping* system_inputs = nullptr,
+    const PixelInputMapping* pixel_inputs = nullptr);
 
 struct DrawRealizationPhaseStats {
     uint64_t draws = 0;
@@ -454,29 +485,59 @@ bool read_live_render_target(uint64_t gpu_addr, LiveTargetSnapshot& snapshot);
 // renderer's persistent image in place instead of forcing a GPU->CPU readback and an immediate
 // re-upload of the very same pixels to the very same device.
 //
-// AUTHORITY RULE: the import is offered only while the persistent Vulkan image is the authoritative
-// copy of the surface -- exactly the case where read_live_render_target() would have had to
-// materialize it. Whenever a CPU RTT snapshot already exists it may be the NEWER truth (a guest GPU
-// write discards the CPU copy and invalidates the GPU target independently, #780), so the caller
-// must fall back to the snapshot path rather than assume the two agree.
+// AUTHORITY RULE: the import is offered only while the persistent Vulkan image is current. An
+// ordered GPU readback may leave an equivalent CPU snapshot beside it; that mirror does not make the
+// image stale. CPU-newer publications clear gpu_valid, and guest GPU writes invalidate the cache
+// entry before import (#780), so neither can expose an obsolete image through this contract.
 //
 // The image is BORROWED: the caller must not destroy it, must restore `layout` before returning, and
 // must call release_live_render_target_image() to drop the pin that keeps the renderer's cache from
 // evicting the entry mid-dispatch. Handles stay opaque so this layer keeps no Vulkan dependency.
 struct LiveTargetImageImport {
+    enum class Kind : uint8_t { Color, Depth };
     uint32_t width = 0, height = 0;
     LiveTargetPixelFormat format = LiveTargetPixelFormat::Rgba8Unorm;
+    Kind kind = Kind::Color;
+    // Opaque VkFormat for depth imports. Color imports keep using `format`, whose deliberately
+    // small enum is part of the renderer/compute numeric-compatibility contract.
+    uint32_t native_format = 0;
     void* image = nullptr;    // VkImage owned by the live renderer
     void* device = nullptr;   // VkDevice it belongs to; the caller must be running on that device
     uint32_t layout = 0;      // VkImageLayout the renderer left it in -- restore it after the dispatch
+    // Explicit image-creation contract: a sampled import is not otherwise guaranteed to carry
+    // VK_IMAGE_USAGE_TRANSFER_DST_BIT, which the compute-result mirror requires.
+    bool transfer_dst = false;
     bool valid() const { return image && device && width && height; }
 };
-using LiveTargetImageImportFn = std::function<bool(uint64_t gpu_addr, LiveTargetImageImport& import)>;
+struct LiveTargetImageRequest {
+    uint32_t width = 0, height = 0;
+    uint32_t render_scale = 1;
+    bool allow_depth = false;
+    // True only when reflection proves this descriptor is read exclusively through normalized
+    // sample/gather operations. Integer image fetch/read must retain the exact declared extent.
+    bool normalized_sampling = false;
+};
+using LiveTargetImageImportFn = std::function<bool(
+    uint64_t gpu_addr, const LiveTargetImageRequest& request, LiveTargetImageImport& import)>;
 using LiveTargetImageReleaseFn = std::function<void(uint64_t gpu_addr)>;
+struct LiveTargetImageWrite {
+    uint64_t gpu_addr = 0;
+    uint32_t width = 0, height = 0;
+    LiveTargetPixelFormat format = LiveTargetPixelFormat::Rgba8Unorm;
+    bool valid() const { return gpu_addr && width && height; }
+};
+using LiveTargetImageWrittenFn = std::function<void(const LiveTargetImageWrite& write)>;
 void set_live_target_image_importer(LiveTargetImageImportFn import_fn,
                                     LiveTargetImageReleaseFn release_fn);
-bool import_live_render_target_image(uint64_t gpu_addr, LiveTargetImageImport& import);
+void set_live_target_image_written_notifier(LiveTargetImageWrittenFn written_fn);
+bool import_live_render_target_image(uint64_t gpu_addr, const LiveTargetImageRequest& request,
+                                     LiveTargetImageImport& import);
 void release_live_render_target_image(uint64_t gpu_addr);
+// Publish that a borrowed renderer image received the completed compute result. The caller may also
+// have written the exact guest bytes for alias correctness; the renderer processes that normal
+// invalidation first, then re-authorizes only this exact image identity and discards an older CPU
+// readback mirror.
+void notify_live_render_target_image_written(const LiveTargetImageWrite& write);
 // Shared Vulkan device (#1091 phase 1). live_compute historically created its own VkInstance/VkDevice,
 // so a renderer-owned image could never be bound to a dispatch and had to round-trip through host
 // memory. The live renderer publishes its already-created device here; the compute backend ADOPTS it
@@ -496,6 +557,23 @@ struct SharedVulkanContext {
     // Features the compute backend requires; when false it must decline the shared device.
     bool storage_image_read_without_format = false;
     bool storage_image_write_without_format = false;
+    // Exact compute-wave acceleration. These describe features ENABLED on the borrowed device, not
+    // merely physical support. The recompiler opts in only when the requested guest wave is inside
+    // this range, full compute subgroups can be required, and both vote and arithmetic subgroup
+    // operations are available.
+    bool compute_subgroup_size_control = false;
+    bool compute_full_subgroups = false;
+    bool compute_subgroup_vote = false;
+    bool compute_subgroup_arithmetic = false;
+    uint32_t min_compute_subgroup_size = 0;
+    uint32_t max_compute_subgroup_size = 0;
+    uint32_t max_compute_workgroup_subgroups = 0;
+    uint32_t max_compute_workgroup_size_x = 0;
+    uint32_t max_compute_workgroup_invocations = 0;
+    // Vulkan-independent mask from native_storage_format_support_bit(). The renderer queries
+    // optimal-tiling STORAGE_IMAGE support before publishing its physical device.
+    uint32_t native_storage_format_support = 0;
+    bool compute_queue_supported = false;
     // Present unification (#1270): when present_capable, prosper-app may create its window surface on
     // `instance`, its swapchain on `device`, and present on `present_queue` -- then blit the renderer's
     // front-buffer image straight to the swapchain with no CPU round-trip. present_queue_shared means the
@@ -507,6 +585,12 @@ struct SharedVulkanContext {
     bool present_queue_shared = false;
     bool valid() const { return instance && physical && device && queue && queue_family != UINT32_MAX; }
 };
+// Select the exact native subgroup contract only when the renderer device can actually be adopted
+// by compute and every required-subgroup workgroup bound is satisfied. `capture_bound` keeps saved
+// artifacts device-portable; `disabled` is the explicit diagnostic/compatibility opt-out.
+uint32_t select_native_compute_subgroup_size(const SharedVulkanContext& context,
+                                             const ComputeShaderConfig& config,
+                                             bool capture_bound, bool disabled);
 void set_shared_vulkan_context(const SharedVulkanContext& context);
 SharedVulkanContext shared_vulkan_context();
 
@@ -680,10 +764,15 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                          (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr);
         return false;
     }
+    const auto* fused_back = static_cast<const AgcShaderHeader*>(
+        prosper_agc_fused_back_header_for_front(rs.es_addr));
+    const uint64_t vs_program_addr = fused_back && fused_back->type == 6 && fused_back->code
+        ? static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fused_back->code))
+        : rs.es_addr;
     const bool phase_timing = getenv("PROSPER_RENDER_TIMING") != nullptr;
     const auto table_start = phase_timing
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    std::shared_ptr<ShaderResourceTable> vrt = build_stage_table(ds, rs.es_addr, false, vcount_hint);
+    std::shared_ptr<ShaderResourceTable> vrt = build_stage_table(ds, vs_program_addr, false, vcount_hint);
     std::shared_ptr<ShaderResourceTable> prt = build_stage_table(ds, rs.ps_addr, true, vcount_hint);
     const auto table_done = phase_timing
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -707,17 +796,18 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     pixel_inputs.controls = rs.ps_input_cntl;
     pixel_inputs.valid_mask = rs.ps_input_cntl_valid_mask;
     bool interpolants_from_metadata = false;
-    if (!pixel_inputs.valid_mask) {
+    if (!pixel_inputs.valid_mask || pixel_inputs.ambiguous_passthrough_mask()) {
         const auto* producer = static_cast<const AgcShaderHeader*>(
-            prosper_agc_shader_header_for_code(rs.es_addr));
+            prosper_agc_shader_header_for_code(vs_program_addr));
         const auto* pixel = static_cast<const AgcShaderHeader*>(
             prosper_agc_shader_header_for_code(rs.ps_addr));
         const AgcPixelInputControls derived = derive_agc_pixel_input_controls(producer, pixel);
-        if (derived.valid_mask) {
-            pixel_inputs.controls = derived.controls;
-            pixel_inputs.valid_mask = derived.valid_mask;
-            interpolants_from_metadata = true;
-        }
+        PixelInputMapping metadata_inputs;
+        metadata_inputs.controls = derived.controls;
+        metadata_inputs.valid_mask = derived.valid_mask;
+        metadata_inputs.passthrough_mask = derived.passthrough_mask;
+        pixel_inputs = resolve_pixel_input_mapping(
+            pixel_inputs, metadata_inputs, &interpolants_from_metadata);
     }
     if (getenv("PROSPER_INTERPLOG")) {
         fprintf(stderr, "[interp] es=0x%llx ps=0x%llx source=%s valid=%08x ena=%08x addr=%08x",
@@ -736,24 +826,26 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     const ResolvedPipelineState resolved_pipeline = resolve_pipeline_state(rs);
     const FragmentInterpolationLayout interpolation = fragment_interpolation_layout_cached(
         reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.ps_addr)),
-        max_shader_dwords, system_input_ptr);
+        max_shader_dwords, system_input_ptr, pixel_input_ptr);
     uint64_t vs_identity = 0, fs_identity = 0;
     SharedShaderWords vs_shared, fs_shared;
     std::vector<uint32_t> vs, fs;
     if (retain_shared_shader_words) {
         vs_shared = recompile_graphics_shader_cached_shared(
-            ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)rs.es_addr,
+            ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
             max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity);
         fs_shared = recompile_graphics_shader_cached_shared(
             ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
-            max_shader_dwords, prt.get(), nullptr, system_input_ptr, &fs_identity);
+            max_shader_dwords, prt.get(), nullptr, system_input_ptr, &fs_identity,
+            rs.ps_wave32);
     } else {
         vs = recompile_graphics_shader_cached(
-            ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)rs.es_addr,
+            ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
             max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity);
         fs = recompile_graphics_shader_cached(
             ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
-            max_shader_dwords, prt.get(), nullptr, system_input_ptr, &fs_identity);
+            max_shader_dwords, prt.get(), nullptr, system_input_ptr, &fs_identity,
+            rs.ps_wave32);
     }
     // CB_COLOR_CONTROL.DCC_DECOMPRESS interprets the bound AGC metadata helper, rather than its
     // ordinary fragment-color export. The operation bits can remain folded into a later graphics
@@ -799,16 +891,16 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             std::chrono::duration<double, std::milli>(table_done - table_start).count(),
             std::chrono::duration<double, std::milli>(shader_done - table_done).count());
     }
-    add_stage_diagnostic(ShaderProgramStage::Vertex, rs.es_addr, vrt, vs_words);
+    add_stage_diagnostic(ShaderProgramStage::Vertex, vs_program_addr, vrt, vs_words);
     add_stage_diagnostic(ShaderProgramStage::Fragment, rs.ps_addr, prt, fs_words);
     if (const char* dd = getenv("PROSPER_VS_DUMP")) {   // diag: dump successful VS SPIR-V + raw RDNA2 for inspection
         static int nd = 0;
         if (nd < 3 && !vs_words.empty()) {
             char fn[512];
-            snprintf(fn, sizeof fn, "%s/vs_%d_%llx.spv", dd, nd, (unsigned long long)rs.es_addr);
+            snprintf(fn, sizeof fn, "%s/vs_%d_%llx.spv", dd, nd, (unsigned long long)vs_program_addr);
             if (FILE* f = fopen(fn, "wb")) { fwrite(vs_words.data(), 4, vs_words.size(), f); fclose(f); }
-            snprintf(fn, sizeof fn, "%s/vs_%d_%llx.bin", dd, nd, (unsigned long long)rs.es_addr);
-            if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)rs.es_addr, 1, 4096, f); fclose(f); }
+            snprintf(fn, sizeof fn, "%s/vs_%d_%llx.bin", dd, nd, (unsigned long long)vs_program_addr);
+            if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)vs_program_addr, 1, 4096, f); fclose(f); }
             // Also dump the paired PS raw RDNA2 (the recompile-guard fixture needs both stages, #228).
             snprintf(fn, sizeof fn, "%s/ps_%d_%llx.bin", dd, nd, (unsigned long long)rs.ps_addr);
             if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)rs.ps_addr, 1, 4096, f); fclose(f); }
@@ -822,11 +914,11 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         // failing draw's exact seeding/s_load chain is captured without knowing its address up front.
         if (vs_words.empty() && getenv("PROSPER_DYNTRACE_FAIL")) {
             static std::set<uint64_t> traced;
-            if (traced.insert(rs.es_addr).second) {
+            if (traced.insert(vs_program_addr).second) {
                 fprintf(stderr, "[dynfail] replaying VS 0x%llx resource build with trace:\n",
-                        (unsigned long long)rs.es_addr);
+                        (unsigned long long)vs_program_addr);
                 g_dyntrace_force = true;
-                (void)build_stage_table(ds, rs.es_addr, false, vcount_hint);
+                (void)build_stage_table(ds, vs_program_addr, false, vcount_hint);
                 g_dyntrace_force = false;
             }
         }
@@ -846,15 +938,16 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             should_log_recompile_reject(rs.es_addr, rs.ps_addr,
                                         vs_words.size(), gs.size(), fs_words.size(),
                                         &reject_occurrence))
-            fprintf(stderr, "[exec-recompile-reject] es=0x%llx ps=0x%llx vs=%zu gs=%zu fs=%zu "
+            fprintf(stderr, "[exec-recompile-reject] es=0x%llx gs-pgm=0x%llx hs-pgm=0x%llx ps=0x%llx vs=%zu gs=%zu fs=%zu "
                             "prim=%u topo=%u ena=%08x addr=%08x order=%llu occurrence=%llu\n",
-                    (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
+                    (unsigned long long)rs.es_addr, (unsigned long long)rs.gs_addr,
+                    (unsigned long long)rs.hs_addr, (unsigned long long)rs.ps_addr,
                     vs_words.size(), gs.size(), fs_words.size(), rs.prim_type, resolved_pipeline.topology,
                     rs.ps_input_ena, rs.ps_input_addr,
                     (unsigned long long)(draw ? draw->command_order : 0),
                     (unsigned long long)reject_occurrence);
         if (const char* dd = getenv("PROSPER_SHADER_DUMP")) {
-            for (auto [tag, addr] : {std::pair{"vs", rs.es_addr}, std::pair{"ps", rs.ps_addr}}) {
+            for (auto [tag, addr] : {std::pair{"vs", vs_program_addr}, std::pair{"ps", rs.ps_addr}}) {
                 if (!addr || !guest_readable(addr, sizeof(uint32_t))) continue;
                 const size_t dump_dwords = rdna2_recompile_code_span(
                     reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(addr)),
@@ -886,7 +979,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                     (int)rs.stencil_enable, (int)rs.stencil_clear_enable, rs.stencil_clear_value,
                     (unsigned long long)rs.stencil_read_base,
                     (unsigned long long)rs.stencil_write_base);
-            for (auto [tag, addr] : {std::pair{"vs", rs.es_addr}, std::pair{"ps", rs.ps_addr}}) {
+            for (auto [tag, addr] : {std::pair{"vs", vs_program_addr}, std::pair{"ps", rs.ps_addr}}) {
                 RecompileCoverage c = recompile_coverage((const uint32_t*)(uintptr_t)addr, max_shader_dwords);
                 fprintf(stderr, "[exec]   %s coverage: total=%u alu=%u exp=%u tabledep=%u unsupported=%u "
                                 "first_bad fmt=%d op=0x%x\n", tag, c.total, c.alu, c.exports,
@@ -1151,7 +1244,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     }
     out.vs = std::move(vs); out.gs = std::move(gs); out.fs = std::move(fs);
     out.vs_shared = std::move(vs_shared); out.fs_shared = std::move(fs_shared);
-    out.vs_guest_addr = rs.es_addr; out.fs_guest_addr = rs.ps_addr;
+    out.vs_guest_addr = vs_program_addr; out.fs_guest_addr = rs.ps_addr;
     out.vs_identity = vs_identity; out.fs_identity = fs_identity; out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;
     // #1256: record the raw draw-packet state (pre-realization) so a capture can be checked offline for

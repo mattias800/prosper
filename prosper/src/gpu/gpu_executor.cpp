@@ -6,6 +6,7 @@
 // binary at startup, or a test via render_runner.h), so prosper_core links this without Vulkan.
 #include "gpu_execute.hpp"
 #include "gpu_capture.hpp"
+#include "gpu_timeline.hpp"
 #include "videoout_present.hpp"   // present_write_frame
 #include "agc_shader_layout.hpp"  // AgcShaderHeader + build_shader_resources
 #include "pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
@@ -133,12 +134,26 @@ struct ShaderResourceCompileKey {
     uint32_t cls = 0;
     uint32_t format = 0;
     uint32_t num_components = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t depth = 0;
+    uint32_t img_dim = 0;
+    bool in_mip_tail = false;
+    bool compression_enabled = false;
     uint32_t binding = 0;
     uint32_t stride = 0;
     uint32_t srt_offset = 0;
     uint32_t sgpr_base = 0;
     uint32_t fetch_pc = 0;
     uint32_t fetch_index_mode = 0;
+    uint32_t flat_base_sgpr = 0;
+    bool srgb = false;
+    bool depth_compare = false;
+    uint32_t depth_compare_func = 0;
+    uint32_t mag_filter = 0;
+    uint32_t addr_u = 0;
+    uint32_t addr_v = 0;
+    uint32_t border_color_type = 0;
 
     bool operator==(const ShaderResourceCompileKey&) const = default;
 };
@@ -151,8 +166,24 @@ struct ShaderCompileKey {
     PixelInputMapping pixel_inputs{};
     bool has_system_inputs = false;
     PixelSystemInputMapping system_inputs{};
+    bool fragment_wave32 = false;
     bool has_pcrel_dispatch = false;
     uint32_t pcrel_dispatch_target = UINT32_MAX;
+    // Compute modules also depend on launch ABI shape. User SGPR VALUES are push constants and stay
+    // runtime data; only their count changes declarations. Exact thread extents matter because a
+    // partial final workgroup emits a literal invocation guard into SPIR-V.
+    bool has_compute_config = false;
+    uint32_t compute_user_sgpr_count = 0;
+    uint32_t compute_local_x = 1, compute_local_y = 1, compute_local_z = 1;
+    bool compute_exact_thread_extent = false;
+    uint32_t compute_threads_x = 0, compute_threads_y = 0, compute_threads_z = 0;
+    uint32_t compute_wave_size = 64;
+    uint32_t compute_tidig_comp_cnt = 0;
+    bool compute_tgid_x_en = false, compute_tgid_y_en = false, compute_tgid_z_en = false;
+    bool compute_tg_size_en = false;
+    uint32_t compute_lds_bytes = 0;
+    uint32_t compute_native_subgroup_size = 0;
+    uint32_t compute_native_storage_format_support = 0;
     // Aliases ShaderCodeAnalysis::code and keeps that immutable analysis alive. Warm lookups used to
     // copy and re-hash the complete raw program for every draw before reaching the shader cache.
     std::shared_ptr<const std::vector<uint32_t>> code;
@@ -170,8 +201,28 @@ struct ShaderCompileKey {
                pixel_inputs == other.pixel_inputs &&
                has_system_inputs == other.has_system_inputs &&
                system_inputs == other.system_inputs &&
+               fragment_wave32 == other.fragment_wave32 &&
                has_pcrel_dispatch == other.has_pcrel_dispatch &&
                pcrel_dispatch_target == other.pcrel_dispatch_target &&
+               has_compute_config == other.has_compute_config &&
+               compute_user_sgpr_count == other.compute_user_sgpr_count &&
+               compute_local_x == other.compute_local_x &&
+               compute_local_y == other.compute_local_y &&
+               compute_local_z == other.compute_local_z &&
+               compute_exact_thread_extent == other.compute_exact_thread_extent &&
+               compute_threads_x == other.compute_threads_x &&
+               compute_threads_y == other.compute_threads_y &&
+               compute_threads_z == other.compute_threads_z &&
+               compute_wave_size == other.compute_wave_size &&
+               compute_tidig_comp_cnt == other.compute_tidig_comp_cnt &&
+               compute_tgid_x_en == other.compute_tgid_x_en &&
+               compute_tgid_y_en == other.compute_tgid_y_en &&
+               compute_tgid_z_en == other.compute_tgid_z_en &&
+               compute_tg_size_en == other.compute_tg_size_en &&
+               compute_lds_bytes == other.compute_lds_bytes &&
+               compute_native_subgroup_size == other.compute_native_subgroup_size &&
+               compute_native_storage_format_support ==
+                   other.compute_native_storage_format_support &&
                resources == other.resources && same_code;
     }
 };
@@ -200,6 +251,7 @@ struct ShaderCompileKeyHash {
         hash = hash_mix(hash, key.has_pixel_inputs);
         if (key.has_pixel_inputs) {
             hash = hash_mix(hash, key.pixel_inputs.valid_mask);
+            hash = hash_mix(hash, key.pixel_inputs.passthrough_mask);
             for (uint32_t control : key.pixel_inputs.controls)
                 hash = hash_mix(hash, control);
         }
@@ -208,8 +260,29 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, key.system_inputs.ena);
             hash = hash_mix(hash, key.system_inputs.addr);
         }
+        hash = hash_mix(hash, key.fragment_wave32);
         hash = hash_mix(hash, key.has_pcrel_dispatch);
         if (key.has_pcrel_dispatch) hash = hash_mix(hash, key.pcrel_dispatch_target);
+        hash = hash_mix(hash, key.has_compute_config);
+        if (key.has_compute_config) {
+            hash = hash_mix(hash, key.compute_user_sgpr_count);
+            hash = hash_mix(hash, key.compute_local_x);
+            hash = hash_mix(hash, key.compute_local_y);
+            hash = hash_mix(hash, key.compute_local_z);
+            hash = hash_mix(hash, key.compute_exact_thread_extent);
+            hash = hash_mix(hash, key.compute_threads_x);
+            hash = hash_mix(hash, key.compute_threads_y);
+            hash = hash_mix(hash, key.compute_threads_z);
+            hash = hash_mix(hash, key.compute_wave_size);
+            hash = hash_mix(hash, key.compute_tidig_comp_cnt);
+            hash = hash_mix(hash, key.compute_tgid_x_en);
+            hash = hash_mix(hash, key.compute_tgid_y_en);
+            hash = hash_mix(hash, key.compute_tgid_z_en);
+            hash = hash_mix(hash, key.compute_tg_size_en);
+            hash = hash_mix(hash, key.compute_lds_bytes);
+            hash = hash_mix(hash, key.compute_native_subgroup_size);
+            hash = hash_mix(hash, key.compute_native_storage_format_support);
+        }
         hash = hash_mix(hash, key.code ? key.code->size() : 0u);
         hash = hash_mix(hash, key.code_hash);
         hash = hash_mix(hash, key.resources.size());
@@ -217,11 +290,26 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.cls);
             hash = hash_mix(hash, resource.format);
             hash = hash_mix(hash, resource.num_components);
+            hash = hash_mix(hash, resource.width);
+            hash = hash_mix(hash, resource.height);
+            hash = hash_mix(hash, resource.depth);
+            hash = hash_mix(hash, resource.img_dim);
+            hash = hash_mix(hash, resource.in_mip_tail);
+            hash = hash_mix(hash, resource.compression_enabled);
             hash = hash_mix(hash, resource.binding);
             hash = hash_mix(hash, resource.stride);
             hash = hash_mix(hash, resource.srt_offset);
             hash = hash_mix(hash, resource.sgpr_base);
             hash = hash_mix(hash, resource.fetch_pc);
+            hash = hash_mix(hash, resource.fetch_index_mode);
+            hash = hash_mix(hash, resource.flat_base_sgpr);
+            hash = hash_mix(hash, resource.srgb);
+            hash = hash_mix(hash, resource.depth_compare);
+            hash = hash_mix(hash, resource.depth_compare_func);
+            hash = hash_mix(hash, resource.mag_filter);
+            hash = hash_mix(hash, resource.addr_u);
+            hash = hash_mix(hash, resource.addr_v);
+            hash = hash_mix(hash, resource.border_color_type);
         }
         return static_cast<size_t>(hash);
     }
@@ -295,6 +383,7 @@ struct InterpolationCacheKey {
     uint64_t analysis_identity = 0;
     PixelSystemInputMapping system_inputs{};
     bool has_system_inputs = false;
+    uint32_t passthrough_mask = 0;
 
     bool operator==(const InterpolationCacheKey&) const = default;
 };
@@ -308,6 +397,7 @@ struct InterpolationCacheKeyHash {
             hash = hash_mix(hash, key.system_inputs.ena);
             hash = hash_mix(hash, key.system_inputs.addr);
         }
+        hash = hash_mix(hash, key.passthrough_mask);
         return static_cast<size_t>(hash);
     }
 };
@@ -751,7 +841,9 @@ PcrelDispatchSelection select_pcrel_dispatch(const uint32_t* code, size_t dwords
 ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_t* code, size_t dwords,
                                          const ShaderResourceTable* resources,
                                          const PixelInputMapping* pixel_inputs,
-                                         const PixelSystemInputMapping* system_inputs) {
+                                         const PixelSystemInputMapping* system_inputs,
+                                         const ComputeShaderConfig* compute_config = nullptr,
+                                         bool fragment_wave32 = false) {
     ShaderCompileKey key;
     key.stage = stage;
     key.has_resource_table = resources != nullptr;
@@ -760,6 +852,28 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
     if (key.has_pixel_inputs) key.pixel_inputs = *pixel_inputs;
     key.has_system_inputs = stage == ShaderProgramStage::Fragment && system_inputs != nullptr;
     if (key.has_system_inputs) key.system_inputs = *system_inputs;
+    key.fragment_wave32 = stage == ShaderProgramStage::Fragment && fragment_wave32;
+    key.has_compute_config = stage == ShaderProgramStage::Compute && compute_config;
+    if (key.has_compute_config) {
+        key.compute_user_sgpr_count = static_cast<uint32_t>(compute_config->user_sgprs.size());
+        key.compute_local_x = compute_config->local_x;
+        key.compute_local_y = compute_config->local_y;
+        key.compute_local_z = compute_config->local_z;
+        key.compute_exact_thread_extent = compute_config->exact_thread_extent;
+        key.compute_threads_x = compute_config->threads_x;
+        key.compute_threads_y = compute_config->threads_y;
+        key.compute_threads_z = compute_config->threads_z;
+        key.compute_wave_size = compute_config->wave_size;
+        key.compute_tidig_comp_cnt = compute_config->tidig_comp_cnt;
+        key.compute_tgid_x_en = compute_config->tgid_x_en;
+        key.compute_tgid_y_en = compute_config->tgid_y_en;
+        key.compute_tgid_z_en = compute_config->tgid_z_en;
+        key.compute_tg_size_en = compute_config->tg_size_en;
+        key.compute_lds_bytes = compute_config->lds_bytes;
+        key.compute_native_subgroup_size = compute_config->native_subgroup_size;
+        key.compute_native_storage_format_support =
+            compute_config->native_storage_format_support;
+    }
     const std::shared_ptr<const ShaderCodeAnalysis> analysis =
         code && dwords ? analyze_shader_code_cached(code, dwords) : nullptr;
     if (stage == ShaderProgramStage::Fragment && code && dwords && resources) {
@@ -806,12 +920,36 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
     if (resources) {
         key.resources.reserve(resources->resources.size());
         for (const auto& resource : resources->resources) {
-            key.resources.push_back({
-                static_cast<uint32_t>(resource.cls), static_cast<uint32_t>(resource.format),
-                resource.num_components, resource.binding, resource.stride,
-                resource.srt_offset, resource.sgpr_base, resource.fetch_pc,
-                static_cast<uint32_t>(resource.fetch_index_mode),
-            });
+            const bool texture = resource.cls == ResourceClass::Texture;
+            const bool storage_image = resource.cls == ResourceClass::StorageImage;
+            const bool manual_compare = texture && resource.depth_compare;
+            const bool atomic_extent = storage_image &&
+                resource.format == DataFormat::Uint32 && resource.num_components == 1;
+            ShaderResourceCompileKey compiled;
+            compiled.cls = static_cast<uint32_t>(resource.cls);
+            compiled.format = static_cast<uint32_t>(resource.format);
+            compiled.num_components = resource.num_components;
+            compiled.width = atomic_extent ? resource.width : 0u;
+            compiled.height = atomic_extent ? resource.height : 0u;
+            compiled.depth = storage_image ? resource.depth : 0u;
+            compiled.img_dim = (texture || storage_image) ? resource.img_dim : 0u;
+            compiled.in_mip_tail = storage_image && resource.in_mip_tail;
+            compiled.compression_enabled = storage_image && resource.compression_enabled;
+            compiled.binding = resource.binding;
+            compiled.stride = resource.stride;
+            compiled.srt_offset = resource.srt_offset;
+            compiled.sgpr_base = resource.sgpr_base;
+            compiled.fetch_pc = resource.fetch_pc;
+            compiled.fetch_index_mode = static_cast<uint32_t>(resource.fetch_index_mode);
+            compiled.flat_base_sgpr = resource.flat_base_sgpr;
+            compiled.srgb = storage_image && resource.srgb;
+            compiled.depth_compare = (manual_compare || storage_image) && resource.depth_compare;
+            compiled.depth_compare_func = manual_compare ? resource.depth_compare_func : 0u;
+            compiled.mag_filter = manual_compare ? resource.mag_filter : 0u;
+            compiled.addr_u = manual_compare ? resource.addr_uvw[0] : 0u;
+            compiled.addr_v = manual_compare ? resource.addr_uvw[1] : 0u;
+            compiled.border_color_type = manual_compare ? resource.border_color_type : 0u;
+            key.resources.push_back(compiled);
         }
     }
     key.cached_hash = ShaderCompileKeyHash::compute(key);
@@ -832,7 +970,8 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
     if (stage == ShaderProgramStage::Fragment)
         return recompile_fragment(code, code_size, resources,
                                   key.has_system_inputs ? &key.system_inputs : nullptr,
-                                  key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX);
+                                  key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX,
+                                  nullptr, key.fragment_wave32);
     return {};
 }
 
@@ -924,10 +1063,11 @@ void clear_shader_analysis_cache() {
 
 FragmentInterpolationLayout fragment_interpolation_layout_cached(
         const uint32_t* code, size_t dwords,
-        const PixelSystemInputMapping* system_inputs) {
+        const PixelSystemInputMapping* system_inputs,
+        const PixelInputMapping* pixel_inputs) {
     const auto analysis = analyze_shader_code_cached(code, dwords);
     if (!analysis || getenv("PROSPER_NO_SHADER_ANALYSIS_CACHE"))
-        return fragment_interpolation_layout(code, dwords, system_inputs);
+        return fragment_interpolation_layout(code, dwords, system_inputs, pixel_inputs);
 
     InterpolationCacheKey key;
     // Use the immutable analysis version, without retaining its shader-byte allocation beyond the
@@ -935,6 +1075,7 @@ FragmentInterpolationLayout fragment_interpolation_layout_cached(
     key.analysis_identity = analysis->identity;
     key.has_system_inputs = system_inputs != nullptr;
     if (system_inputs) key.system_inputs = *system_inputs;
+    key.passthrough_mask = pixel_inputs ? pixel_inputs->effective_passthrough_mask() : 0u;
     auto& cache = interpolation_cache();
     std::lock_guard lock(cache.mutex);
     auto found = cache.entries.find(key);
@@ -943,7 +1084,7 @@ FragmentInterpolationLayout fragment_interpolation_layout_cached(
         return found->second.layout;
     }
     const FragmentInterpolationLayout layout =
-        fragment_interpolation_layout(code, dwords, system_inputs);
+        fragment_interpolation_layout(code, dwords, system_inputs, pixel_inputs);
     constexpr size_t max_entries = 4096;
     while (cache.entries.size() >= max_entries && !cache.entries.empty()) {
         auto oldest = cache.entries.begin();
@@ -958,10 +1099,11 @@ FragmentInterpolationLayout fragment_interpolation_layout_cached(
 SharedShaderWords recompile_graphics_shader_cached_shared(
         ShaderProgramStage stage, const uint32_t* code, size_t dwords,
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
-        const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity) {
+        const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity,
+        bool fragment_wave32) {
     if (cache_identity) *cache_identity = 0;
     ShaderCompileKey key = make_shader_compile_key(stage, code, dwords, resources, pixel_inputs,
-                                                   system_inputs);
+                                                   system_inputs, nullptr, fragment_wave32);
     if (getenv("PROSPER_NO_SHADER_CACHE")) {
         auto& cache = shader_cache();
         {
@@ -1022,10 +1164,78 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
 std::vector<uint32_t> recompile_graphics_shader_cached(
         ShaderProgramStage stage, const uint32_t* code, size_t dwords,
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
-        const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity) {
+        const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity,
+        bool fragment_wave32) {
     SharedShaderWords words = recompile_graphics_shader_cached_shared(
-        stage, code, dwords, resources, pixel_inputs, system_inputs, cache_identity);
+        stage, code, dwords, resources, pixel_inputs, system_inputs, cache_identity,
+        fragment_wave32);
     return words ? *words : std::vector<uint32_t>{};
+}
+
+std::vector<uint32_t> recompile_compute_shader_cached(
+        const uint32_t* code, size_t dwords, const ShaderResourceTable* resources,
+        const ComputeShaderConfig& config, uint64_t* cache_identity) {
+    if (cache_identity) *cache_identity = 0;
+    ShaderCompileKey key = make_shader_compile_key(
+        ShaderProgramStage::Compute, code, dwords, resources, nullptr, nullptr, &config);
+    auto compile = [&] {
+        const uint32_t* owned_code = !key.code || key.code->empty() ? nullptr : key.code->data();
+        const size_t owned_dwords = key.code ? key.code->size() : 0u;
+        return recompile_compute(owned_code, owned_dwords, resources, config);
+    };
+    if (getenv("PROSPER_NO_SHADER_CACHE")) {
+        auto& cache = shader_cache();
+        {
+            std::lock_guard lock(cache.mutex);
+            ++cache.stats.bypasses;
+        }
+        std::vector<uint32_t> spirv = compile();
+        maybe_dump_successful_shader(ShaderProgramStage::Compute, key, spirv);
+        return spirv;
+    }
+
+    auto& cache = shader_cache();
+    std::lock_guard lock(cache.mutex);
+    auto found = cache.entries.find(key);
+    if (found != cache.entries.end()) {
+        ++cache.stats.hits;
+        found->second.last_use = ++cache.use_counter;
+        if (cache_identity) *cache_identity = found->second.identity;
+        maybe_dump_successful_shader(ShaderProgramStage::Compute, key, *found->second.spirv);
+        return *found->second.spirv;
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    auto spirv = std::make_shared<const std::vector<uint32_t>>(compile());
+    maybe_dump_successful_shader(ShaderProgramStage::Compute, key, *spirv);
+    const auto end = std::chrono::steady_clock::now();
+    ++cache.stats.misses;
+    cache.stats.compile_ms += std::chrono::duration<double, std::milli>(end - start).count();
+
+    constexpr size_t max_entries = 4096;
+    const uint64_t bytes = shader_cache_entry_bytes(key, *spirv);
+    const uint64_t limit = shader_cache_limit_bytes();
+    while (!cache.entries.empty() &&
+           (cache.entries.size() >= max_entries || cache.stats.bytes + bytes > limit)) {
+        auto oldest = cache.entries.begin();
+        for (auto it = std::next(cache.entries.begin()); it != cache.entries.end(); ++it)
+            if (it->second.last_use < oldest->second.last_use) oldest = it;
+        cache.stats.bytes -= oldest->second.bytes;
+        cache.entries.erase(oldest);
+        ++cache.stats.evictions;
+    }
+    if (bytes <= limit && max_entries != 0) {
+        CachedShader value;
+        value.spirv = spirv;
+        value.identity = cache.next_identity++;
+        value.last_use = ++cache.use_counter;
+        value.bytes = bytes;
+        if (cache_identity) *cache_identity = value.identity;
+        cache.stats.bytes += bytes;
+        cache.entries.emplace(std::move(key), std::move(value));
+    }
+    cache.stats.entries = cache.entries.size();
+    return *spirv;
 }
 
 ShaderRecompileCacheStats shader_recompile_cache_stats() {
@@ -1312,7 +1522,8 @@ std::vector<DynFetch>
 resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_sgprs, uint32_t nsgpr,
                       uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses,
                       uint32_t pcrel_dispatch_target,
-                      const PcrelDispatchInfo* pcrel_dispatch) {
+                      const PcrelDispatchInfo* pcrel_dispatch,
+                      const uint32_t* system_sgprs, uint32_t nsystem_sgprs) {
     using FoldClock = std::chrono::steady_clock;
     static const bool profile_fold = std::getenv("PROSPER_STAGE_FOLD_PROFILE") != nullptr;
     const auto fold_start = profile_fold ? FoldClock::now() : FoldClock::time_point{};
@@ -1356,13 +1567,22 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     if (trc && !g_dyntrace_force)
         if (const char* fa = getenv("PROSPER_DYNTRACE_ADDR"))
             trc = strtoull(fa, nullptr, 16) == (uint64_t)(uintptr_t)code;
+    // A full scalar-fold trace is intentionally verbose. Live shaders can rebuild their stage table
+    // thousands of times per scene, so permit a targeted diagnostic run to capture the first matching
+    // fold without turning every subsequent frame into gigabytes of duplicate logging.
+    if (trc && !g_dyntrace_force && getenv("PROSPER_DYNTRACE_ONCE")) {
+        static std::mutex once_mx;
+        static std::set<const uint32_t*> traced;
+        std::lock_guard<std::mutex> lk(once_mx);
+        trc = traced.insert(code).second;
+    }
     // Scalar operands encode at most 128 SGPRs. Fixed register files avoid hundreds of tiny hash/tree
     // allocations per submit while retaining exactly the same known/unknown state model.
     constexpr size_t kFoldSgprs = 128;
     std::array<uint32_t, kFoldSgprs> val{};                 // concrete SGPR values
     std::bitset<kFoldSgprs> val_known;
     // Entry-user-data identity attached to an otherwise ordinary scalar value. This is narrower
-    // than descriptor provenance: it only proves that four s_mov_b32 copies reassembled four
+    // than descriptor provenance: it only proves that s_mov_b32/s_mov_b64 copies reassembled
     // consecutive entry dwords, without arithmetic or a load changing any word.
     std::array<uint32_t, kFoldSgprs> val_seed_origin{};
     std::bitset<kFoldSgprs> val_seed_origin_known;
@@ -1418,6 +1638,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             mask_state[(size_t)r] = FoldMask::Unknown;
         }
     };
+    for (uint32_t i = 0; system_sgprs && i < nsystem_sgprs && i < kFoldSgprs; ++i)
+        set_value(static_cast<int>(i), system_sgprs[i]);
     for (uint32_t i = 0; i < nsgpr; i++) {
         const int reg = (int)(user_sgpr_base + i);
         set_value(reg, user_sgprs[i]);
@@ -1450,6 +1672,21 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             uint32_t current = 0;
             if (!known(r, current) ||
                 current != user_sgprs[r - (int)user_sgpr_base]) return false;
+        }
+        return true;
+    };
+    auto consecutive_seed_copy_range = [&](int first, int count) {
+        if (!user_sgprs || count <= 0 || !valid_reg(first) || !valid_reg(first + count - 1) ||
+            !val_seed_origin_known.test((size_t)first)) return false;
+        const uint32_t first_origin = val_seed_origin[(size_t)first];
+        if (first_origin + (uint32_t)count > nsgpr) return false;
+        for (int k = 0; k < count; ++k) {
+            const int reg = first + k;
+            uint32_t current = 0;
+            if (!val_seed_origin_known.test((size_t)reg) ||
+                val_seed_origin[(size_t)reg] != first_origin + (uint32_t)k ||
+                !known(reg, current) || current != user_sgprs[first_origin + (uint32_t)k])
+                return false;
         }
         return true;
     };
@@ -1529,9 +1766,63 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             val_seed_origin_known.set((size_t)in.dst.value);
                         }
                     } else forget(in.dst.value);
+                } else if (in.opcode == 0x34) {                 // s_abs_i32
+                    // This is a 32-bit destination. Treating every unmodeled SOP1 as a possible
+                    // 64-bit pair write erased the untouched adjacent SGPR; Astro Bot keeps the
+                    // high half of a descriptor-table pointer there immediately before an x8 load.
+                    // Compute abs in unsigned arithmetic so INT_MIN remains 0x80000000 without C++
+                    // signed-overflow undefined behaviour. Arithmetic deliberately drops seed/SRT
+                    // provenance through set_value().
+                    uint32_t v = 0;
+                    const bool source_known = in.src[0].kind == OperandKind::Literal
+                        ? (v = in.literal, true) : srcval(in.src[0], v);
+                    if (source_known)
+                        set_value(in.dst.value, static_cast<int32_t>(v) < 0 ? 0u - v : v);
+                    else
+                        forget(in.dst.value);
+                } else if (in.opcode == 0x04 &&                 // s_mov_b64
+                           in.dst.kind == OperandKind::SGPR &&
+                           in.src[0].kind == OperandKind::SGPR) {
+                    // Capture both source lanes before touching either destination: source and
+                    // destination pairs may overlap. Only an entirely known SGPR pair is modeled;
+                    // special/inline sources and partial pairs retain the previous fail-closed erase.
+                    std::array<uint32_t, 2> source_values{};
+                    std::array<uint32_t, 2> source_keys{};
+                    std::array<uint32_t, 2> source_origins{};
+                    std::array<bool, 2> source_key_known{};
+                    std::array<bool, 2> source_origin_known{};
+                    bool source_known = true;
+                    for (int k = 0; k < 2; ++k) {
+                        const int src = in.src[0].value + k;
+                        source_known &= known(src, source_values[(size_t)k]);
+                        source_key_known[(size_t)k] = valid_reg(src) &&
+                            val_srt_key_known.test((size_t)src);
+                        if (source_key_known[(size_t)k])
+                            source_keys[(size_t)k] = val_srt_key[(size_t)src];
+                        source_origin_known[(size_t)k] = valid_reg(src) &&
+                            val_seed_origin_known.test((size_t)src);
+                        if (source_origin_known[(size_t)k])
+                            source_origins[(size_t)k] = val_seed_origin[(size_t)src];
+                    }
+                    for (int k = 0; k < 2; ++k) {
+                        const int dst = in.dst.value + k;
+                        if (!source_known) {
+                            forget(dst);
+                            continue;
+                        }
+                        set_value(dst, source_values[(size_t)k]);
+                        if (source_key_known[(size_t)k] && valid_reg(dst)) {
+                            val_srt_key[(size_t)dst] = source_keys[(size_t)k];
+                            val_srt_key_known.set((size_t)dst);
+                        }
+                        if (source_origin_known[(size_t)k] && valid_reg(dst)) {
+                            val_seed_origin[(size_t)dst] = source_origins[(size_t)k];
+                            val_seed_origin_known.set((size_t)dst);
+                        }
+                    }
                 } else if (in.dst.kind == OperandKind::SGPR) {
-                    // Not the modeled s_mov_b32 -> the dest is unknown. Erase the PAIR: 64-bit SOP1 ops
-                    // (s_mov_b64, s_getpc_b64, s_and/or/xor/not_b64, s_*_saveexec_b64, …) write
+                    // Not a modeled scalar move -> the dest is unknown. Erase the PAIR: 64-bit SOP1 ops
+                    // (s_getpc_b64, s_and/or/xor/not_b64, s_*_saveexec_b64, …) write
                     // S[dst:dst+1], so leaving a stale "known" val[dst+1] let a later instruction fold a
                     // confidently-wrong 64-bit base/offset -> a wrong V#/T# read from the wrong guest
                     // address (#460). Over-erasing dst+1 for a 32-bit SOP1 only loses a fold opportunity
@@ -1784,6 +2075,33 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                               descr_key[(size_t)sdst] = descr8_key[(size_t)sdst];
                               descr_key_known.set((size_t)sdst);
                 }
+                if (n == 16) {
+                    // NGG back halves commonly fetch a compact stage-data block containing a mix of
+                    // one 8-dword T# and 4-dword V# descriptors with one s_load_dwordx16. SGPR loads
+                    // are typeless, so retain both aligned interpretations and let the eventual MIMG
+                    // or MUBUF consumer select the appropriate one. The load's one byte-offset key
+                    // cannot distinguish the resources inside the block, so retain key-less
+                    // descriptor provenance; each consumer is resolved by its exact instruction pc.
+                    for (uint32_t first = 0; first < n; first += 8) {
+                        const int base_reg = sdst + static_cast<int>(first);
+                        if (!valid_reg(base_reg) || !valid_reg(base_reg + 7)) continue;
+                        descr8[(size_t)base_reg] = {
+                            mem[first], mem[first + 1], mem[first + 2], mem[first + 3],
+                            mem[first + 4], mem[first + 5], mem[first + 6], mem[first + 7] };
+                        descr8_known.set((size_t)base_reg);
+                        descr8_key[(size_t)base_reg] = 0xFFFFFFFFu;
+                        descr8_key_known.set((size_t)base_reg);
+                    }
+                    for (uint32_t first = 0; first < n; first += 4) {
+                        const int base_reg = sdst + static_cast<int>(first);
+                        if (!valid_reg(base_reg) || !valid_reg(base_reg + 3)) continue;
+                        descr[(size_t)base_reg] = {
+                            mem[first], mem[first + 1], mem[first + 2], mem[first + 3] };
+                        descr_known.set((size_t)base_reg);
+                        descr_key[(size_t)base_reg] = 0xFFFFFFFFu;
+                        descr_key_known.set((size_t)base_reg);
+                    }
+                }
                 break;
             }
             case Rdna2Format::MIMG: {
@@ -1798,25 +2116,47 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     const int samp_base = in.src[2].value;
                     const bool have_t8 = valid_reg(tbase) && descr8_known.test((size_t)tbase);
                     const bool have_key = valid_reg(tbase) && descr8_key_known.test((size_t)tbase);
-                    const std::array<uint32_t, 8>* t8 = have_t8
-                        ? &descr8[(size_t)tbase] : nullptr;
-                    std::array<uint32_t, 8> seed_t8{};
-                    const uint32_t tkey = have_key
-                        ? descr8_key[(size_t)tbase] : 0xFFFFFFFFu;
-                    bool from_seed = false;
-                    if (!t8 && untouched_seed_range(tbase, 8)) {
-                        for (int k = 0; k < 8; k++)
-                            seed_t8[k] = user_sgprs[tbase - (int)user_sgpr_base + k];
-                        DecodedImageDescriptor d = decode_image_descriptor(seed_t8.data());
-                        // A direct T# has no s_load provenance key, so it is resolved by this MIMG's
-                        // exact pc. Reject obviously non-image user data before creating that mapping.
-                        if (d.base > 0x10000 && d.width && d.height &&
+                    // MIMG itself proves that its eight SRSRC words are a T#. A table snapshot or
+                    // direct user-data range establishes provenance, but the RESOURCE MUST use the
+                    // words live at this instruction: modeled scalar patches are architectural, and
+                    // an unmodeled write makes one word unknown and therefore rejects. Falling back
+                    // to descr8's load-time bytes after either case would bind a stale texture.
+                    std::array<uint32_t, 8> live_t8{};
+                    bool live_t8_known = true;
+                    for (int k = 0; k < 8; ++k)
+                        live_t8_known &= known(tbase + k, live_t8[(size_t)k]);
+                    const bool seed_provenance = !have_t8 &&
+                        (untouched_seed_range(tbase, 8) ||
+                         consecutive_seed_copy_range(tbase, 8));
+                    bool plausible_seed = true;
+                    if (seed_provenance && live_t8_known) {
+                        const DecodedImageDescriptor d = decode_image_descriptor(live_t8.data());
+                        plausible_seed = d.base > 0x10000 && d.width && d.height &&
                             d.width <= 16384 && d.height <= 16384 &&
-                            d.type >= 8 && d.type <= 15) {
-                            t8 = &seed_t8;
-                            from_seed = true;
-                        }
+                            d.type >= 8 && d.type <= 15;
                     }
+                    const std::array<uint32_t, 8>* t8 =
+                        live_t8_known && (have_t8 || (seed_provenance && plausible_seed))
+                            ? &live_t8 : nullptr;
+                    uint32_t tkey = 0xFFFFFFFFu;
+                    if (t8 && have_key) {
+                        uint32_t common_key = 0;
+                        bool common_key_known = true;
+                        for (int k = 0; k < 8; ++k) {
+                            const size_t reg = (size_t)(tbase + k);
+                            if (!valid_reg(tbase + k) || !val_srt_key_known.test(reg)) {
+                                common_key_known = false;
+                                break;
+                            }
+                            if (k == 0) common_key = val_srt_key[reg];
+                            else if (val_srt_key[reg] != common_key) {
+                                common_key_known = false;
+                                break;
+                            }
+                        }
+                        if (common_key_known) tkey = common_key;
+                    }
+                    const bool from_seed = t8 && seed_provenance;
                     if (trc) {
                         fprintf(stderr, "[dyntrace] MIMG pc=%u op=0x%x srsrc=s%d ssamp=s%d "
                                         "have_t8=%d seed_t8=%d key=0x%x t8=",
@@ -1837,19 +2177,20 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         SrtUse u; u.kind = 0; u.t8 = *t8;
                         u.key = tkey;
                         u.use_pc = in.pc;
-                        u.is_store = in.opcode == 0x08;   // image_store: a STORAGE-image use (#590)
+                        u.is_storage_image = in.opcode == 0x08 || in.opcode == 0x0f ||
+                                             in.opcode == 0x11;
                         u.is_depth_compare = (in.opcode >= 0x28 && in.opcode <= 0x2f) ||
                                              (in.opcode >= 0x38 && in.opcode <= 0x3f) ||
                                              (in.opcode >= 0x58 && in.opcode <= 0x5f);
-                        if (valid_reg(samp_base) && descr_known.test((size_t)samp_base)) {
-                            u.has_samp = true;
-                            u.s4 = descr[(size_t)samp_base];
-                        } else if (untouched_seed_range(samp_base, 4)) {
-                            // Direct S# paired with the direct/table T#. Samplers have no address or
-                            // extent field to validate; block membership plus reload invalidation is
-                            // the conservative provenance check.
-                            for (int k = 0; k < 4; k++)
-                                u.s4[k] = user_sgprs[samp_base - (int)user_sgpr_base + k];
+                        const bool have_s4 = valid_reg(samp_base) &&
+                                             descr_known.test((size_t)samp_base);
+                        const bool seed_s4 = !have_s4 && untouched_seed_range(samp_base, 4);
+                        bool live_s4_known = true;
+                        for (int k = 0; k < 4; ++k)
+                            live_s4_known &= known(samp_base + k, u.s4[(size_t)k]);
+                        if (live_s4_known && (have_s4 || seed_s4)) {
+                            // Like the T#, sampler words are read live. This avoids retaining a stale
+                            // x16 load snapshot if scalar code patches or invalidates the paired S#.
                             u.has_samp = true;
                         }
                         srt_uses->push_back(u);
@@ -1865,7 +2206,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // live at the instruction and resolves by exact pc, avoiding a duplicate stale SRT use.
                 const bool raw_buffer_use = !is_mtbuf &&
                     ((in.opcode >= 0x08 && in.opcode <= 0x0F) ||
-                     (in.opcode >= 0x1C && in.opcode <= 0x1E));
+                     (in.opcode >= 0x1C && in.opcode <= 0x1F));
                 const bool format_store_use = in.opcode >= 0x04 && in.opcode <= 0x07;
                 const bool atomic_buffer_use = in.opcode == 0x38; // buffer_atomic_umax
                 if (srt_uses && (format_store_use || raw_buffer_use || atomic_buffer_use)) {
@@ -1876,24 +2217,14 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         current_known &= known(srsrc + k, current[(size_t)k]);
                     const bool loaded_provenance = valid_reg(srsrc) &&
                                                    descr_known.test((size_t)srsrc);
-                    bool moved_direct_provenance = valid_reg(srsrc) && valid_reg(srsrc + 3);
-                    uint32_t first_origin = 0;
-                    for (int k = 0; k < 4 && moved_direct_provenance; ++k) {
-                        const size_t reg = (size_t)(srsrc + k);
-                        if (!val_seed_origin_known.test(reg)) {
-                            moved_direct_provenance = false;
-                        } else if (k == 0) {
-                            first_origin = val_seed_origin[reg];
-                        } else if (val_seed_origin[reg] != first_origin + (uint32_t)k) {
-                            moved_direct_provenance = false;
-                        }
-                    }
-                    const bool direct_provenance = unchanged_seed_range(srsrc, 4) ||
-                                                   moved_direct_provenance;
-                    if (current_known && (loaded_provenance || direct_provenance)) {
-                        // Publish the four values LIVE at the consumer. A modeled scalar patch is
-                        // exact; an unmodeled/incompatible write becomes unknown and fails closed
-                        // instead of resurrecting the load-time descriptor snapshot.
+                    if (current_known) {
+                        // MUBUF/MTBUF itself is definitive that its four SRSRC words are a V#. Publish
+                        // the values LIVE at the consumer whenever the scalar fold knows all of them.
+                        // This also covers a direct descriptor whose NUM_RECORDS/stride is patched by
+                        // modeled scalar ALU: such a patch intentionally breaks entry-seed provenance,
+                        // but does not make the now-concrete V# any less valid. An unmodeled write makes
+                        // a word unknown and still fails closed; the shape/range checks below reject
+                        // malformed concrete values before any resource is emitted.
                         SrtUse u; u.kind = 1; u.v4 = current; u.key = 0xFFFFFFFFu; u.use_pc = in.pc;
                         if (is_mtbuf) u.instruction_format = in.mtbuf_format;
                         if (loaded_provenance) {
@@ -2494,8 +2825,20 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     } else {
         // NGG merged VS/GS: s0..s7 are system SGPRs, user data starts at s8 (confirmed by matching the
         // shader's s[8:11]/s[24:25] descriptor pointers to the register file at GS_0+offset).
+        uint32_t system_sgprs[2] = {};
+        uint32_t system_count = 0;
+        if (hdr->type == 6) { // fused GS back: s[0:1] points at the driver stage-data table
+            const auto sh_value = [&](uint32_t reg) {
+                const auto found = st.sh.find(reg);
+                return found == st.sh.end() ? 0u : found->second;
+            };
+            system_sgprs[0] = sh_value(P::SPI_SHADER_USER_DATA_ADDR_LO_GS);
+            system_sgprs[1] = sh_value(P::SPI_SHADER_USER_DATA_ADDR_HI_GS);
+            system_count = (system_sgprs[0] || system_sgprs[1]) ? 2u : 0u;
+        }
         dyn_vb = resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
-                                       primary_sgprs, kUserSgprs, 8, &srt_uses);
+                                       primary_sgprs, kUserSgprs, 8, &srt_uses,
+                                       UINT32_MAX, nullptr, system_sgprs, system_count);
         if (getenv("PROSPER_GFXLOG") || getenv("PROSPER_RESDUMP")) {
             fprintf(stderr, "[dynvb] VS resolved %zu dynamic vertex-fetch descriptor(s):\n", dyn_vb.size());
             for (auto& kv : dyn_vb) {
@@ -2706,13 +3049,14 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     if (log) fprintf(stderr, "[srt] %s cbuf key=0x%x pc=%u base=0x%llx size=%u\n", is_ps ? "PS" : "VS",
                                      u.key, u.use_pc, (unsigned long long)d.base, resource_size);
                     t.resources.push_back(r);
-                } else {                                  // texture (T# [+ paired S#])
+                } else {                                  // sampled texture or storage image (T# [+ paired S#])
                     DecodedImageDescriptor d = decode_image_descriptor(u.t8.data());
                     if (g_dyntrace_force)
                         fprintf(stderr, "[dynfail] tex use pc=%u key=0x%x base=0x%llx %ux%u fmt=%u tile=%u\n",
                                 u.use_pc, u.key, (unsigned long long)d.base, d.width, d.height,
                                 d.format, d.tile_mode);
                     if (d.base == 0 || d.width == 0 || d.height == 0 || d.depth == 0 ||
+                        !valid_image_type(d.type) ||
                         d.base_array != 0 ||
                         d.width > 16384 || d.height > 16384) continue;       // garbage/degenerate T#
                     // A previous use already produced a resource for this SAME selected view (address +
@@ -2720,8 +3064,11 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     // if it has none yet (#273). If it already carries a DIFFERENT use's pc, fall
                     // through and create a second resource for this pc (fetch_pc holds one pc; a
                     // sample whose pc has no mapping would stay unresolved).
+                    const ResourceClass wanted = u.is_storage_image
+                        ? ResourceClass::StorageImage : ResourceClass::Texture;
                     Gen5ImageFormatInfo fi;
                     if (!gen5_image_format(d.format, &fi)) {
+                        if (wanted == ResourceClass::StorageImage) continue;
                         // Same policy as build_shader_resources: the normal per-target renderer can
                         // bind this as RGBA8 for RTT injection; legacy single-target mode skips it.
                         static const bool rtt_bind = getenv("PROSPER_RTT") != nullptr ||
@@ -2741,7 +3088,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     {
                         bool mapped = false;
                         for (auto& r0 : t.resources)
-                            if (r0.cls == ResourceClass::Texture && r0.gpu_addr == view.base &&
+                            if (r0.cls == wanted && r0.gpu_addr == view.base &&
                                 r0.width == view.width && r0.height == view.height &&
                                 r0.depth == d.depth && r0.format == fi.format && r0.img_dim == img_dim &&
                                 r0.depth_compare == u.is_depth_compare &&
@@ -2755,7 +3102,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                         if (mapped) continue;
                     }
                     ShaderResource r;
-                    r.cls = ResourceClass::Texture;
+                    r.cls = wanted;
                     r.format = fi.format; r.num_components = fi.num_components;
                     r.gpu_addr = view.base; r.width = view.width; r.height = view.height; r.depth = d.depth;
                     r.declared_mip_levels =
@@ -2789,7 +3136,9 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     r.size = static_cast<uint32_t>(backing_bytes);
                     r.srt_offset = clash ? 0xFFFFFFFFu : u.key;   // ambiguous/absent key: pc-only provenance
                     r.fetch_pc   = u.use_pc;                       // per-instruction provenance (#273)
-                    if (u.has_samp) {                     // paired S# (same SQ_IMG_SAMP decode as the sharp path)
+                    if (wanted == ResourceClass::Texture && u.has_samp) {
+                        // Paired S# (same SQ_IMG_SAMP decode as the sharp path). Storage operations do
+                        // not consume a sampler even when their SSAMP bits alias known user SGPRs.
                         const uint32_t* sm = u.s4.data();
                         r.mag_filter  = ((sm[2] >> 20) & 0x3u) ? 1u : 0u;
                         r.min_filter  = ((sm[2] >> 22) & 0x3u) ? 1u : 0u;
@@ -2807,9 +3156,12 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                         r.lod_bias           = (float)bias14 / 256.0f;
                         r.border_color_type  = (sm[3] >> 30) & 0x3u;
                     }
-                    if (log) fprintf(stderr, "[srt] %s tex key=0x%x %ux%u fmt=%u base=0x%llx tile=%u samp=%d\n",
-                                     is_ps ? "PS" : "VS", u.key, d.width, d.height, d.format,
-                                     (unsigned long long)d.base, d.tile_mode, (int)u.has_samp);
+                    if (log) fprintf(stderr, "[srt] %s %s key=0x%x %ux%u fmt=%u base=0x%llx tile=%u samp=%d\n",
+                                     is_ps ? "PS" : "VS",
+                                     wanted == ResourceClass::StorageImage ? "storage-image" : "tex",
+                                     u.key, d.width, d.height, d.format,
+                                     (unsigned long long)d.base, d.tile_mode,
+                                     (int)(wanted == ResourceClass::Texture && u.has_samp));
                     t.resources.push_back(r);
                 }
             }
@@ -3072,6 +3424,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                 {                                         // T# — storage image (store) or sampled texture
                     DecodedImageDescriptor d = decode_image_descriptor(u.t8.data());
                     if (d.base == 0 || d.width == 0 || d.height == 0 || d.depth == 0 ||
+                        !valid_image_type(d.type) ||
                         d.base_array != 0 ||
                         d.width > 16384 || d.height > 16384) continue;   // garbage/degenerate T#
                     Gen5ImageFormatInfo fi;
@@ -3079,7 +3432,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     // Unknown sampled formats cannot be decoded. Unknown storage formats may still
                     // recompile (format-free SPIR-V), but remain explicitly Unknown so the live backend
                     // rejects them instead of silently treating arbitrary bytes as RGBA8.
-                    if (!mapped_fmt && !u.is_store) continue;
+                    if (!mapped_fmt && !u.is_storage_image) continue;
                     if (mapped_fmt && fi.block_width > 1 && fi.snorm) continue;   // signed BCn: not wired
                     const DecodedImageView view = mapped_fmt
                         ? image_base_level_view(d, fi)
@@ -3089,8 +3442,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
                         warn_unsupported_image_view(d);
                         continue;
                     }
-                    const ResourceClass wanted = u.is_store ? ResourceClass::StorageImage
-                                                           : ResourceClass::Texture;
+                    const ResourceClass wanted = u.is_storage_image ? ResourceClass::StorageImage
+                                                                   : ResourceClass::Texture;
                     const DataFormat view_format = mapped_fmt ? fi.format : DataFormat::Unknown;
                     const uint32_t img_dim = image_type_to_dim(d.type);
                     {
@@ -3272,6 +3625,29 @@ std::vector<ComputeItem> realize_compute_dispatches(
         config.wave_size = ((dispatch.modifier >>
             P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT) &
             P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK) ? 32u : 64u;
+        const SharedVulkanContext shared_vulkan = shared_vulkan_context();
+        const bool shared_compute_adoptable = shared_vulkan.valid() &&
+            shared_vulkan.compute_queue_supported &&
+            shared_vulkan.storage_image_read_without_format &&
+            shared_vulkan.storage_image_write_without_format;
+        config.native_storage_format_support = shared_compute_adoptable
+            ? shared_vulkan.native_storage_format_support : 0;
+        // Realized captures store SPIR-V but not enough raw compute launch state to recompile a
+        // device-specific typed-storage module on replay. Compile capture-bound dispatches through
+        // the portable raw-uvec4 path so optional format support never becomes an artifact ABI.
+        const bool capture_bound = std::getenv("PROSPER_GPU_CAPTURE") ||
+            std::getenv("PROSPER_GPU_TIMELINE_CAPTURE") ||
+            interactive_gpu_capture_armed() || interactive_capture_bundle_active();
+        if (capture_bound)
+            config.native_storage_format_support = 0;
+        // Full exact-size subgroups let the translator assign guest local coordinates in
+        // SubgroupId/SubgroupLocalInvocationId order. That avoids assuming any relationship between
+        // Vulkan's implementation-defined LocalInvocationIndex order and subgroup lane order while
+        // still making each native subgroup exactly one RDNA wave. Captures remain portable until
+        // their schema records the required-subgroup/full-subgroup pipeline contract.
+        config.native_subgroup_size = select_native_compute_subgroup_size(
+            shared_vulkan, config, capture_bound,
+            getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") != nullptr);
         config.tgid_x_en = tgid_x_en;
         config.tgid_y_en = tgid_y_en;
         config.tgid_z_en = tgid_z_en;
@@ -3283,16 +3659,10 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                  P::COMPUTE_PGM_RSRC2_LDS_SIZE_MASK) * 512u;
 
         ComputeItem item;
-        item.spirv = recompile_compute((const uint32_t*)(uintptr_t)code_addr, 0x10000,
-                                       table.get(), config);
+        item.spirv = recompile_compute_shader_cached(
+            (const uint32_t*)(uintptr_t)code_addr, 0x10000, table.get(), config);
         item.user_sgprs = config.user_sgprs;
-        if (!item.spirv.empty() && getenv("PROSPER_SHADER_DUMP_SUCCESS")) {
-            const ShaderCompileKey dump_key = make_shader_compile_key(
-                ShaderProgramStage::Compute,
-                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
-                0x10000, table.get(), nullptr, nullptr);
-            maybe_dump_successful_shader(ShaderProgramStage::Compute, dump_key, item.spirv);
-        }
+        item.required_subgroup_size = config.native_subgroup_size;
         item.resources = std::move(table);
         item.launch = launch;
         item.code_addr = code_addr;
@@ -4413,15 +4783,23 @@ void set_live_target_reader(LiveTargetReaderFn fn) { g_live_target_reader = std:
 
 static LiveTargetImageImportFn g_live_target_image_import;
 static LiveTargetImageReleaseFn g_live_target_image_release;
+static LiveTargetImageWrittenFn g_live_target_image_written;
 void set_live_target_image_importer(LiveTargetImageImportFn import_fn,
                                     LiveTargetImageReleaseFn release_fn) {
     g_live_target_image_import = std::move(import_fn);
     g_live_target_image_release = std::move(release_fn);
 }
-bool import_live_render_target_image(uint64_t gpu_addr, LiveTargetImageImport& import) {
+void set_live_target_image_written_notifier(LiveTargetImageWrittenFn written_fn) {
+    g_live_target_image_written = std::move(written_fn);
+}
+bool import_live_render_target_image(uint64_t gpu_addr, const LiveTargetImageRequest& request,
+                                     LiveTargetImageImport& import) {
     import = LiveTargetImageImport{};
     if (!g_live_target_image_import) return false;
-    if (!g_live_target_image_import(gpu_addr, import)) { import = LiveTargetImageImport{}; return false; }
+    if (!g_live_target_image_import(gpu_addr, request, import)) {
+        import = LiveTargetImageImport{};
+        return false;
+    }
     if (!import.valid()) {
         // The importer pinned the entry before returning true; drop that pin rather than leaking a
         // permanently un-evictable cache entry if a future importer breaks the contract.
@@ -4434,9 +4812,46 @@ bool import_live_render_target_image(uint64_t gpu_addr, LiveTargetImageImport& i
 void release_live_render_target_image(uint64_t gpu_addr) {
     if (g_live_target_image_release) g_live_target_image_release(gpu_addr);
 }
+void notify_live_render_target_image_written(const LiveTargetImageWrite& write) {
+    if (g_live_target_image_written && write.valid()) g_live_target_image_written(write);
+}
 static SharedVulkanContext g_shared_vulkan;
 void set_shared_vulkan_context(const SharedVulkanContext& context) { g_shared_vulkan = context; }
 SharedVulkanContext shared_vulkan_context() { return g_shared_vulkan; }
+
+uint32_t select_native_compute_subgroup_size(const SharedVulkanContext& context,
+                                             const ComputeShaderConfig& config,
+                                             bool capture_bound, bool disabled) {
+    const bool adoptable = context.valid() && context.compute_queue_supported &&
+        context.storage_image_read_without_format &&
+        context.storage_image_write_without_format;
+    if (capture_bound || disabled || !adoptable ||
+        !context.compute_subgroup_size_control || !context.compute_full_subgroups ||
+        !context.compute_subgroup_vote || !context.compute_subgroup_arithmetic ||
+        !context.max_compute_workgroup_subgroups || !context.max_compute_workgroup_size_x ||
+        !context.max_compute_workgroup_invocations || !config.local_x || !config.local_y ||
+        !config.local_z || (config.wave_size != 32u && config.wave_size != 64u) ||
+        config.wave_size < context.min_compute_subgroup_size ||
+        config.wave_size > context.max_compute_subgroup_size)
+        return 0;
+
+    // The native shader declares a flattened LocalSize=(guest X*Y*Z,1,1), then reconstructs the
+    // guest 3D local/global IDs from SubgroupId/SubgroupLocalInvocationId. Besides avoiding any
+    // implementation-defined lane ordering, this makes Vulkan's REQUIRE_FULL_SUBGROUPS X-dimension
+    // rule explicit. Keep the multiplication and maxComputeWorkgroupSubgroups bound overflow-safe.
+    const uint64_t xy = static_cast<uint64_t>(config.local_x) * config.local_y;
+    if (xy > UINT64_MAX / config.local_z) return 0;
+    const uint64_t local_invocations = xy * config.local_z;
+    const uint64_t subgroup_capacity = static_cast<uint64_t>(config.wave_size) *
+        context.max_compute_workgroup_subgroups;
+    if (local_invocations % config.wave_size != 0 ||
+        local_invocations > subgroup_capacity ||
+        local_invocations > context.max_compute_workgroup_size_x ||
+        local_invocations > context.max_compute_workgroup_invocations ||
+        local_invocations > UINT32_MAX)
+        return 0;
+    return config.wave_size;
+}
 
 // Present unification (#1270): see gpu_execute.hpp. The atomic gates the lock so the common (headless /
 // non-shared / app-not-yet-adopted) path pays only a single acquire load and takes no lock. Set true

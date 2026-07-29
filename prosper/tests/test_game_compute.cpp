@@ -21,11 +21,152 @@ static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { std::printf("FAIL: %s\n", msg); fails++; } } while (0)
 
 int main() {
+    CHECK(prosper::frontend::storage_writeback_can_tile_mapped_bytes(
+              true, 27, false, false),
+          "native tiled storage can feed mapped bytes directly to the tiler");
+    CHECK(!prosper::frontend::storage_writeback_can_tile_mapped_bytes(
+              false, 27, false, false),
+          "converted storage retains its mutable packed buffer");
+    CHECK(!prosper::frontend::storage_writeback_can_tile_mapped_bytes(
+              true, 0, false, false),
+          "linear guest storage still copies mapped bytes into guest memory");
+    CHECK(!prosper::frontend::storage_writeback_can_tile_mapped_bytes(
+              true, 27, true, false),
+          "poison proving retains a mutable copy for untouched-texel restoration");
+    CHECK(!prosper::frontend::storage_writeback_can_tile_mapped_bytes(
+              true, 27, false, true),
+          "the recovery switch restores the copied writeback path");
+
+    bool half_luts_match = true;
+    for (uint32_t bits = 0; bits <= 0xffffu; ++bits) {
+        const uint16_t half = static_cast<uint16_t>(bits);
+        const float value = half_to_float(half);
+        uint32_t float_bits = 0;
+        std::memcpy(&float_bits, &value, sizeof(float_bits));
+        half_luts_match &= prosper::frontend::storage_unpack_float16_bits(half) == float_bits;
+
+        float normalized = value;
+        if (std::isnan(normalized)) normalized = 0.0f;
+        normalized = normalized < 0.0f ? 0.0f : (normalized > 1.0f ? 1.0f : normalized);
+        const uint8_t reference = static_cast<uint8_t>(std::lround(normalized * 255.0f));
+        half_luts_match &= prosper::frontend::sampled_float16_to_unorm8(half) == reference;
+    }
+    CHECK(half_luts_match,
+          "binary16 lookup conversions are exhaustive bit-exact matches for storage and sampling");
+
+    std::vector<uint8_t> half_source(65536u * sizeof(uint16_t));
+    std::vector<uint8_t> half_rgba(65536u * 4u);
+    for (uint32_t bits = 0; bits <= 0xffffu; ++bits) {
+        const uint16_t half = static_cast<uint16_t>(bits);
+        std::memcpy(half_source.data() + bits * sizeof(half), &half, sizeof(half));
+    }
+    prosper::frontend::sampled_float16_to_unorm8_range(
+        half_source.data(), 1, 65536u, half_rgba.data());
+    bool half_range_matches = true;
+    for (uint32_t bits = 0; bits <= 0xffffu; ++bits) {
+        half_range_matches &=
+            half_rgba[bits * 4] == prosper::frontend::sampled_float16_to_unorm8(
+                                       static_cast<uint16_t>(bits)) &&
+            half_rgba[bits * 4 + 1] == 0 && half_rgba[bits * 4 + 2] == 0 &&
+            half_rgba[bits * 4 + 3] == 255;
+    }
+    CHECK(half_range_matches,
+          "parallel binary16 sampled range matches every scalar value and fills (R,0,0,1)");
+
+    // Exercise the packed RGBA fast path with every binary16 bit pattern. On x86 this runtime-
+    // dispatches through F16C/AVX2 when available; elsewhere it proves the identical scalar fallback.
+    std::vector<uint8_t> half_source_x4(65536u * sizeof(uint16_t));
+    std::vector<uint8_t> half_rgba_x4(65536u);
+    for (uint32_t bits = 0; bits <= 0xffffu; ++bits) {
+        const uint16_t half = static_cast<uint16_t>(bits);
+        std::memcpy(half_source_x4.data() + bits * sizeof(half), &half, sizeof(half));
+    }
+    prosper::frontend::sampled_float16_to_unorm8_range(
+        half_source_x4.data(), 4, 65536u / 4u, half_rgba_x4.data());
+    bool half_range_x4_matches = true;
+    for (uint32_t bits = 0; bits <= 0xffffu; ++bits)
+        half_range_x4_matches &= half_rgba_x4[bits] ==
+            prosper::frontend::sampled_float16_to_unorm8(static_cast<uint16_t>(bits));
+    CHECK(half_range_x4_matches,
+          "packed RGBA binary16 sampled range matches every scalar lookup value");
+
+    std::vector<uint32_t> half_storage_x4(65536u);
+    prosper::frontend::storage_unpack_float16x4_range(
+        half_source_x4.data(), 65536u / 4u, half_storage_x4.data());
+    bool half_storage_x4_matches = true;
+    for (uint32_t bits = 0; bits <= 0xffffu; ++bits)
+        half_storage_x4_matches &= half_storage_x4[bits] ==
+            prosper::frontend::storage_unpack_float16_bits(static_cast<uint16_t>(bits));
+    CHECK(half_storage_x4_matches,
+          "packed RGBA16F storage range preserves every scalar float bit pattern");
+
+    // The storage writeback fast path converts two RGBA32F texels per F16C instruction. Compare a
+    // million deterministic float bit patterns, including explicit overflow/subnormal/NaN payload
+    // edges, against the established scalar round-to-nearest-even converter.
+    constexpr size_t pack_channels_count = 1u << 20;
+    std::vector<uint32_t> pack_channels(pack_channels_count);
+    const uint32_t pack_edges[] = {
+        0x00000000u, 0x80000000u, 0x00000001u, 0x80000001u,
+        0x33000000u, 0x33000001u, 0x387fc000u, 0x38800000u,
+        0x477fe000u, 0x477ff000u, 0x47800000u, 0xc7800000u,
+        0x7f800000u, 0xff800000u, 0x7fc00000u, 0x7f800001u,
+        0x7fffffffu, 0xff800001u, 0x3f800000u, 0xbf800000u,
+    };
+    size_t pack_at = 0;
+    for (uint32_t bits : pack_edges) pack_channels[pack_at++] = bits;
+    uint32_t pack_random = 0x91e10da5u;
+    while (pack_at < pack_channels.size()) {
+        pack_random ^= pack_random << 13;
+        pack_random ^= pack_random >> 17;
+        pack_random ^= pack_random << 5;
+        pack_channels[pack_at++] = pack_random;
+    }
+    std::vector<uint8_t> packed_half(pack_channels_count * sizeof(uint16_t));
+    prosper::frontend::storage_pack_float16x4_range(
+        pack_channels.data(), pack_channels_count / 4, packed_half.data());
+    bool storage_half_range_matches = true;
+    for (size_t i = 0; i < pack_channels.size(); ++i) {
+        float value;
+        std::memcpy(&value, &pack_channels[i], sizeof(value));
+        const uint16_t expected = prosper::gpu::float_to_half(value);
+        uint16_t actual = 0;
+        std::memcpy(&actual, packed_half.data() + i * sizeof(actual), sizeof(actual));
+        if (actual != expected) {
+            std::printf("Float16 pack mismatch index=%zu f32=%08x expected=%04x actual=%04x\n",
+                        i, pack_channels[i], expected, actual);
+            storage_half_range_matches = false;
+            break;
+        }
+    }
+    CHECK(storage_half_range_matches,
+          "packed RGBA32F storage range matches scalar Float16 rounding and NaN payloads");
+
+    using prosper::frontend::direct_sampled_rtt_compatible;
+    CHECK(direct_sampled_rtt_compatible(DataFormat::Unorm8, 4,
+                                        LiveTargetPixelFormat::Rgba8Unorm) &&
+          direct_sampled_rtt_compatible(DataFormat::Float16, 4,
+                                        LiveTargetPixelFormat::Rgba16Float),
+          "renderer RTT direct bind accepts exact RGBA8 and RGBA16F sampled views");
+    CHECK(!direct_sampled_rtt_compatible(DataFormat::Float16, 4,
+                                         LiveTargetPixelFormat::Rgba8Unorm) &&
+          !direct_sampled_rtt_compatible(DataFormat::Unorm8, 4,
+                                         LiveTargetPixelFormat::Rgba16Float) &&
+          !direct_sampled_rtt_compatible(DataFormat::Float16, 2,
+                                         LiveTargetPixelFormat::Rgba16Float),
+          "renderer RTT direct bind rejects format conversion and component aliases");
+
     // #1127: the seed-skip re-prove counter (seed_reprove.hpp). interval 0 disables (old prove-once);
     // interval N fires on the Nth fast-skip and resets, so a Full-cached data-dependent shader is
     // re-proven within N fast-skips instead of trusting a stale "covers every texel" verdict forever.
     {
         using prosper::frontend::seed_reprove_due;
+        using prosper::frontend::dispatch_has_enough_threads_for_texels;
+        CHECK(dispatch_has_enough_threads_for_texels(15360, 135, 1, 1920, 1080, 1),
+              "vectorized/swizzled dispatch with one invocation per texel can prove coverage");
+        CHECK(!dispatch_has_enough_threads_for_texels(1919, 1080, 1, 1920, 1080, 1),
+              "dispatch with fewer total invocations than texels cannot prove coverage");
+        CHECK(!dispatch_has_enough_threads_for_texels(0, 1080, 1, 1920, 1080, 1),
+              "degenerate dispatch cannot prove coverage");
         uint32_t s = 0;
         CHECK(!seed_reprove_due(s, 0) && !seed_reprove_due(s, 0) && s == 0,
               "interval 0 never re-proves and leaves the counter untouched (prove-once)");
@@ -96,6 +237,58 @@ int main() {
         }
     }
     CHECK(unorm8_matches, "fast UNORM8 pack is equivalent to the lround reference");
+
+    auto reference_unorm16 = [](uint32_t bits) {
+        float value;
+        std::memcpy(&value, &bits, sizeof(value));
+        if (std::isnan(value)) value = 0.0f;
+        value = value < 0.0f ? 0.0f : (value > 1.0f ? 1.0f : value);
+        return static_cast<uint16_t>(std::lround(value * 65535.0f));
+    };
+    bool unorm16_matches = true;
+    for (uint32_t raw = 0; raw <= 0xffffu; ++raw) {
+        const float value = raw / 65535.0f;
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        if (prosper::frontend::storage_pack_unorm16(bits) != raw) {
+            unorm16_matches = false;
+            break;
+        }
+    }
+    for (uint32_t bits : pack_channels) {
+        if (prosper::frontend::storage_pack_unorm16(bits) != reference_unorm16(bits)) {
+            unorm16_matches = false;
+            break;
+        }
+    }
+    CHECK(unorm16_matches,
+          "UNORM16 pack preserves all quantized channels and matches lround for float inputs");
+
+    bool storage_unorm8_range_matches = true;
+    constexpr size_t unorm_texels = pack_channels_count / 4;
+    for (uint32_t components : {1u, 2u, 3u, 4u}) {
+        std::vector<uint8_t> packed_unorm8(unorm_texels * components);
+        prosper::frontend::storage_pack_unorm8_range(
+            pack_channels.data(), components, unorm_texels, packed_unorm8.data());
+        for (size_t texel = 0; texel < unorm_texels; ++texel) {
+            for (uint32_t channel = 0; channel < components; ++channel) {
+                const size_t source = texel * 4 + channel;
+                const uint8_t expected =
+                    prosper::frontend::storage_pack_unorm8(pack_channels[source]);
+                const uint8_t actual = packed_unorm8[texel * components + channel];
+                if (actual == expected) continue;
+                std::printf("UNORM8 pack mismatch n=%u texel=%zu channel=%u f32=%08x "
+                            "expected=%02x actual=%02x\n",
+                            components, texel, channel, pack_channels[source], expected, actual);
+                storage_unorm8_range_matches = false;
+                break;
+            }
+            if (!storage_unorm8_range_matches) break;
+        }
+        if (!storage_unorm8_range_matches) break;
+    }
+    CHECK(storage_unorm8_range_matches,
+          "packed one-, two-, three-, and four-channel UNORM8 ranges match scalar clamp and rounding");
 
     // Dead Cells' bound startup fill kernel, copied verbatim from eboot.elf at runtime address
     // 0x401aec200. It stores s4-s7 to record `(TGID_X << 6) + local_id_x` through the V# in s0-s3.
@@ -435,6 +628,22 @@ int main() {
         CHECK(run_format_copy(DataFormat::Uint8, 4, 4, s) == s,
               "Uint8x4 storage copy round-trips guest bytes bit-exact (#590)");
     }
+    {   // Unorm8 x2: native RG8 storage keeps its two-byte texel width and conversion contract
+        std::vector<uint8_t> s(W * 2);
+        for (uint32_t i = 0; i < s.size(); i++) s[i] = (uint8_t)(i * 71 + 11);
+        CHECK(run_format_copy(DataFormat::Unorm8, 2, 2, s) == s,
+              "Unorm8x2 storage copy round-trips native RG8 texels bit-exact (#590)");
+    }
+    {   // Astro Bot's title composite writes a tiled 256x64 RGBA16-UNORM surface.
+        std::vector<uint8_t> s(W * 8);
+        for (uint32_t t = 0; t < W * 4; ++t) {
+            const uint16_t value = static_cast<uint16_t>(t * 251u + 17u);
+            s[t * 2] = static_cast<uint8_t>(value);
+            s[t * 2 + 1] = static_cast<uint8_t>(value >> 8);
+        }
+        CHECK(run_format_copy(DataFormat::Unorm16, 4, 8, s) == s,
+              "Unorm16x4 storage copy round-trips guest channels bit-exact (#590)");
+    }
     {   // Uint16 x1 (fmt=7): 16-bit integer widen on load, low-16-bit truncate on store
         std::vector<uint8_t> s(W * 2);
         for (uint32_t i = 0; i < s.size(); i++) s[i] = (uint8_t)(i * 29 + 3);
@@ -446,6 +655,20 @@ int main() {
         for (uint32_t t = 0; t < W; t++) { uint32_t p = t * 2654435761u; std::memcpy(&s[t * 4], &p, 4); }
         CHECK(run_format_copy(DataFormat::Unorm2_10_10_10, 4, 4, s) == s,
               "Unorm2_10_10_10 storage copy round-trips packed guest word bit-exact (#590)");
+    }
+    {   // R11G11B10 UFLOAT: native float storage conversion must preserve quantized finite texels
+        std::vector<uint8_t> s(W * 4);
+        for (uint32_t t = 0; t < W; ++t) {
+            const float r = static_cast<float>((t * 17u) % 97u) / 13.0f;
+            const float g = static_cast<float>((t * 29u) % 89u) / 11.0f;
+            const float b = static_cast<float>((t * 43u) % 83u) / 9.0f;
+            const uint32_t packed = static_cast<uint32_t>(float_to_f11(r)) |
+                                    (static_cast<uint32_t>(float_to_f11(g)) << 11) |
+                                    (static_cast<uint32_t>(float_to_f10(b)) << 22);
+            std::memcpy(&s[t * 4], &packed, sizeof(packed));
+        }
+        CHECK(run_format_copy(DataFormat::Float10_11_11, 3, 4, s) == s,
+              "R11G11B10 storage copy round-trips native packed texels bit-exact (#590)");
     }
 
     // The backend publishes ordinary tiled texels, not hardware-compressed blocks. Prove that a

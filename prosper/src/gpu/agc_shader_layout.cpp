@@ -30,8 +30,11 @@ AgcPixelInputControls derive_agc_pixel_input_controls(const AgcShaderHeader* pro
             const AgcShaderSemantic& semantic = producer->output_semantics[i];
             const uint32_t slot = semantic.hardware_mapping() < 32u
                 ? semantic.hardware_mapping() : i;
-            out.controls[i] = slot | (semantic.is_flat_shaded() ? 0x400u : 0u);
+            const bool passthrough = semantic.is_custom();
+            out.controls[i] = slot | (passthrough ? 0x420u : 0u) |
+                              (semantic.is_flat_shaded() ? 0x400u : 0u);
             out.valid_mask |= 1u << i;
+            if (passthrough) out.passthrough_mask |= 1u << i;
         }
         return out;
     }
@@ -44,6 +47,13 @@ AgcPixelInputControls derive_agc_pixel_input_controls(const AgcShaderHeader* pro
             const AgcShaderSemantic& output = producer->output_semantics[j];
             if (output.semantic() == input.semantic() && output.hardware_mapping() < 32u) {
                 control = output.hardware_mapping();
+                if (input.is_custom()) {
+                    // GFX10 explicit interpolation selects the producer PARAM through OFFSET while
+                    // parameter-cache pass-through (OFFSET bit 5) and FLAT_SHADE expose each
+                    // triangle vertex to v_interp_mov instead of fixed-function coefficients.
+                    control |= 0x420u;
+                    out.passthrough_mask |= 1u << i;
+                }
                 break;
             }
         }
@@ -530,19 +540,18 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
         }
     }
 
-    // Read-only buffer entries share sharp[0] with textures. A 4-dword V# carries the sharp size bit,
-    // but that bit is only a hint: live UE4 T# entries can carry it too. Source 258's size=1 direct
-    // entry at offset_dw=8 decodes as base=0x10c109ac60, stride=16, records=7 (112 bytes) and is
-    // consumed by s_buffer_load_dwordx8/x4. Treating every sharp[0] entry as a T# fabricated a tiny
-    // texture and left those scalar loads on the unrelated binding-2 fallback, which then failed the
-    // descriptor contract (required 48, available 32). EUD-resident size=1 entries use the same SRT
+    // Read-only buffer entries share sharp[0] with textures. A 4-dword V# usually carries the sharp
+    // size bit, but it is only a hint in both directions: live UE4 T# entries can carry it, while Astro
+    // Bot publishes valid V# entries without it. Classify every entry by the conservative V# shape
+    // below. A T# reinterpreted as V# normally loses its <<8 address scale and fails the guest-VA floor;
+    // the size/stride bounds reject the remaining false positives. EUD entries use the same SRT
     // provenance as the writable/category-1 and constant/category-3 buffers.
     const AgcShaderSharp* readonly_resources = ud->sharp_resource_offset[0];
     std::vector<bool> readonly_buffer_slots(ud->sharp_resource_count[0], false);
     if (arr_ok(readonly_resources, ud->sharp_resource_count[0], sizeof(AgcShaderSharp))) {
         for (uint16_t slot = 0; slot < ud->sharp_resource_count[0]; slot++) {
             const AgcShaderSharp& s = readonly_resources[slot];
-            if (s.empty() || !s.size()) continue;
+            if (s.empty()) continue;
             const uint32_t off = s.offset_dw();
             uint32_t vv[4];
             const uint32_t srt = load_sharp(off, 4, vv);
@@ -591,6 +600,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             const bool tex_in_eud = (uint64_t)off + 8 > num_user_sgprs;
             DecodedImageDescriptor d = decode_image_descriptor(tv);
             if (d.base == 0 || d.width == 0 || d.height == 0 || d.depth == 0 ||
+                !valid_image_type(d.type) ||
                 d.base_array != 0 ||
                 d.width > 16384 || d.height > 16384) continue;  // skip a garbage/degenerate T#
             // PROSPER_DUMP_TILERAW (issue #282 derivation): dump the raw guest texel bytes of a tiled

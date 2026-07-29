@@ -344,6 +344,27 @@ int main() {
               stats.misses == system_misses + 2,
           "pixel-system ENA/ADDR mappings participate in the fragment shader cache key");
 
+    // SPI_PS_IN_CONTROL.PS_W32_EN changes low-half EXEC/VCC semantics, so the same program and
+    // descriptor interface must not reuse a Wave64/default module under Wave32 (or vice versa).
+    const uint64_t wave_mode_hits = stats.hits;
+    const uint64_t wave_mode_misses = stats.misses;
+    uint64_t wave64_identity = 0, wave32_identity = 0, repeated_wave32_identity = 0;
+    const auto wave64_ps = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kPs, std::size(kPs), nullptr, nullptr, nullptr,
+        &wave64_identity, false);
+    const auto wave32_ps = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kPs, std::size(kPs), nullptr, nullptr, nullptr,
+        &wave32_identity, true);
+    const auto repeated_wave32_ps = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kPs, std::size(kPs), nullptr, nullptr, nullptr,
+        &repeated_wave32_identity, true);
+    stats = shader_recompile_cache_stats();
+    CHECK(!wave64_ps.empty() && wave32_ps == wave64_ps && repeated_wave32_ps == wave32_ps &&
+              wave64_identity != 0 && wave32_identity != 0 &&
+              wave32_identity != wave64_identity && repeated_wave32_identity == wave32_identity &&
+              stats.hits == wave_mode_hits + 2 && stats.misses == wave_mode_misses + 1,
+          "fragment Wave32 mode participates in the shader cache key");
+
     const uint64_t identity_before_clear = first_identity;
     clear_shader_recompile_cache();
     stats = shader_recompile_cache_stats();
@@ -391,6 +412,236 @@ int main() {
     clear_shader_recompile_cache();
     CHECK(shared_first && !shared_first->empty(),
           "shared shader words outlive cache reset while a realized draw retains them");
+
+    // Compute realization used to run the full RDNA2 walk/CFG/SPIR-V builder for every dispatch,
+    // even though SGPR values are supplied as push constants. Cache by code, descriptor interface,
+    // and the launch ABI fields that actually specialize the module.
+    static const uint32_t kCompute[] = {
+        0xd7460004, 0x04010c08, 0x7e000204, 0x7e020205, 0x7e040206,
+        0x7e060207, 0xe01c2000, 0x80000004, 0xbf810000,
+    };
+    ShaderResource compute_buffer;
+    compute_buffer.cls = ResourceClass::ConstantBuffer;
+    compute_buffer.format = DataFormat::Uint32;
+    compute_buffer.num_components = 4;
+    compute_buffer.binding = 2;
+    compute_buffer.stride = 16;
+    compute_buffer.sgpr_base = 0;
+    compute_buffer.size = 4096;
+    ShaderResourceTable compute_table;
+    compute_table.resources.push_back(compute_buffer);
+    ComputeShaderConfig compute_config;
+    compute_config.user_sgprs.resize(8);
+    compute_config.local_x = 64;
+    compute_config.exact_thread_extent = true;
+    compute_config.threads_x = 130;
+    compute_config.threads_y = compute_config.threads_z = 1;
+    compute_config.tgid_x_en = true;
+    const auto direct_compute = recompile_compute(
+        kCompute, std::size(kCompute), &compute_table, compute_config);
+    const auto cached_compute = recompile_compute_shader_cached(
+        kCompute, std::size(kCompute), &compute_table, compute_config);
+    ComputeShaderConfig new_push_constants = compute_config;
+    new_push_constants.user_sgprs[4] = 0x12345678;
+    const auto repeated_compute = recompile_compute_shader_cached(
+        kCompute, std::size(kCompute), &compute_table, new_push_constants);
+    ComputeShaderConfig changed_launch = compute_config;
+    changed_launch.local_x = 32;
+    const auto changed_compute = recompile_compute_shader_cached(
+        kCompute, std::size(kCompute), &compute_table, changed_launch);
+    stats = shader_recompile_cache_stats();
+    CHECK(!direct_compute.empty() && cached_compute == direct_compute &&
+              repeated_compute == direct_compute && !changed_compute.empty() &&
+              changed_compute != direct_compute && stats.misses == 2 && stats.hits == 1,
+          "compute cache reuses push-constant variants and separates launch-specialized modules");
+
+    // Resource descriptor fields that specialize SPIR-V must participate in the cache identity.
+    // Storage-image sRGB state changes whether the module declares a native float image or the raw
+    // uint-channel fallback, even when the guest code and every binding/provenance field are equal.
+    clear_shader_recompile_cache();
+    static const uint32_t kStorageCompute[] = {
+        0x7e080300u, 0xf0000f00u, 0x00000004u, 0xbf8c3f70u,
+        0xf0200f00u, 0x00020004u, 0xbf810000u,
+    };
+    ShaderResourceTable storage_table;
+    for (uint32_t i = 0; i < 2; ++i) {
+        ShaderResource image;
+        image.cls = ResourceClass::StorageImage;
+        image.format = DataFormat::Float32;
+        image.num_components = 4;
+        image.binding = 4 + i;
+        image.sgpr_base = i * 8;
+        storage_table.resources.push_back(image);
+    }
+    ComputeShaderConfig storage_config;
+    storage_config.user_sgprs.resize(16);
+    storage_config.local_x = 64;
+    storage_config.native_storage_format_support =
+        native_storage_format_support_bit(DataFormat::Float32, 4);
+    uint64_t native_storage_identity = 0;
+    const auto native_storage = recompile_compute_shader_cached(
+        kStorageCompute, std::size(kStorageCompute), &storage_table, storage_config,
+        &native_storage_identity);
+    storage_config.native_storage_format_support = 0;
+    uint64_t raw_storage_identity = 0;
+    const auto raw_storage = recompile_compute_shader_cached(
+        kStorageCompute, std::size(kStorageCompute), &storage_table, storage_config,
+        &raw_storage_identity);
+    storage_config.native_storage_format_support =
+        native_storage_format_support_bit(DataFormat::Float32, 4);
+    storage_table.resources[0].srgb = true;
+    uint64_t srgb_storage_identity = 0;
+    const auto srgb_storage = recompile_compute_shader_cached(
+        kStorageCompute, std::size(kStorageCompute), &storage_table, storage_config,
+        &srgb_storage_identity);
+    storage_table.resources[0].srgb = false;
+    uint64_t repeated_storage_identity = 0;
+    const auto repeated_storage = recompile_compute_shader_cached(
+        kStorageCompute, std::size(kStorageCompute), &storage_table, storage_config,
+        &repeated_storage_identity);
+    stats = shader_recompile_cache_stats();
+    const auto native_report = validate_spirv_descriptor_interface(
+        native_storage, &storage_table, 0, SpirvShaderStage::Compute, false);
+    const auto raw_report = validate_spirv_descriptor_interface(
+        raw_storage, &storage_table, 0, SpirvShaderStage::Compute, false);
+    CHECK(!native_storage.empty() && !raw_storage.empty() && !srgb_storage.empty() &&
+              native_storage != raw_storage && native_storage != srgb_storage &&
+              repeated_storage == native_storage &&
+              native_storage_identity != 0 && raw_storage_identity != 0 &&
+              srgb_storage_identity != 0 &&
+              native_storage_identity != srgb_storage_identity &&
+              native_storage_identity != raw_storage_identity &&
+              repeated_storage_identity == native_storage_identity &&
+              native_report.descriptors.size() == 2 &&
+              native_report.descriptors[0].storage_float &&
+              raw_report.descriptors.size() == 2 &&
+              !raw_report.descriptors[0].storage_float &&
+              stats.misses == 3 && stats.hits == 1 && stats.entries == 3,
+          "compute cache separates device-gated typed storage from the raw fallback and sRGB state");
+
+    // Compute image atomics embed the runtime R32_UINT extent in the linearized SSBO index and
+    // bounds guard. Reusing a module across extents would retain a stale row stride or bounds.
+    clear_shader_recompile_cache();
+    static const uint32_t kImageAtomicCompute[] = {
+        0x7e000280u, 0x7e020280u, 0x7e120281u,
+        0xf0442108u, 0x00000900u, 0xbf810000u,
+    };
+    uint32_t atomic_pixels[32] = {};
+    ShaderResource atomic_image;
+    atomic_image.cls = ResourceClass::StorageImage;
+    atomic_image.format = DataFormat::Uint32;
+    atomic_image.num_components = 1;
+    atomic_image.binding = 4;
+    atomic_image.sgpr_base = 0;
+    atomic_image.img_dim = 1;
+    atomic_image.width = 4;
+    atomic_image.height = 2;
+    atomic_image.depth = 1;
+    atomic_image.size = sizeof(atomic_pixels);
+    atomic_image.host_data = reinterpret_cast<uint8_t*>(atomic_pixels);
+    atomic_image.host_data_size = sizeof(atomic_pixels);
+    ShaderResourceTable atomic_table;
+    atomic_table.resources.push_back(atomic_image);
+    ComputeShaderConfig atomic_config;
+    atomic_config.user_sgprs.resize(8);
+    atomic_config.local_x = 1;
+    const auto atomic_4x2 = recompile_compute_shader_cached(
+        kImageAtomicCompute, std::size(kImageAtomicCompute), &atomic_table, atomic_config);
+    atomic_table.resources[0].width = 8;
+    const auto atomic_8x2 = recompile_compute_shader_cached(
+        kImageAtomicCompute, std::size(kImageAtomicCompute), &atomic_table, atomic_config);
+    atomic_table.resources[0].width = 4;
+    const auto atomic_4x2_again = recompile_compute_shader_cached(
+        kImageAtomicCompute, std::size(kImageAtomicCompute), &atomic_table, atomic_config);
+    stats = shader_recompile_cache_stats();
+    CHECK(!atomic_4x2.empty() && !atomic_8x2.empty() &&
+              atomic_4x2 != atomic_8x2 && atomic_4x2_again == atomic_4x2 &&
+              stats.misses == 2 && stats.hits == 1 && stats.entries == 2,
+          "compute cache separates image-atomic modules with different embedded extents");
+
+    // Manual shadow comparison bakes the enable, compare op, filter mode, address modes, and border
+    // color into SPIR-V. In particular depth_compare=false must not reuse a previously successful
+    // module: that descriptor contract is supposed to reject this comparison-sample shader.
+    clear_shader_recompile_cache();
+    static const uint32_t kShadowPs[] = {
+        0xc8080000u, 0xc8090001u, 0xc80c0100u, 0xc80d0101u,
+        0x7e0202f0u, 0xf0bc0108u, 0x00820401u,
+        0xf800080fu, 0x07060504u, 0xbf810000u,
+    };
+    ShaderResource shadow;
+    shadow.cls = ResourceClass::Texture;
+    shadow.format = DataFormat::Unorm8;
+    shadow.num_components = 4;
+    shadow.binding = 4;
+    shadow.sgpr_base = 8;
+    shadow.depth_compare = true;
+    shadow.depth_compare_func = 4;
+    shadow.mag_filter = 0;
+    ShaderResourceTable shadow_table;
+    shadow_table.resources.push_back(shadow);
+    uint64_t shadow_identity = 0, shadow_repeat_identity = 0, disabled_identity = 0;
+    uint64_t function_identity = 0, filter_identity = 0, address_identity = 0, border_identity = 0;
+    const auto shadow_spv = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kShadowPs, std::size(kShadowPs), &shadow_table,
+        nullptr, nullptr, &shadow_identity);
+    const auto shadow_repeat = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kShadowPs, std::size(kShadowPs), &shadow_table,
+        nullptr, nullptr, &shadow_repeat_identity);
+    shadow_table.resources[0].depth_compare = false;
+    const auto disabled_shadow = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kShadowPs, std::size(kShadowPs), &shadow_table,
+        nullptr, nullptr, &disabled_identity);
+    shadow_table.resources[0].depth_compare = true;
+    shadow_table.resources[0].depth_compare_func = 1;
+    const auto function_shadow = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kShadowPs, std::size(kShadowPs), &shadow_table,
+        nullptr, nullptr, &function_identity);
+    shadow_table.resources[0].mag_filter = 1;
+    const auto filter_shadow = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kShadowPs, std::size(kShadowPs), &shadow_table,
+        nullptr, nullptr, &filter_identity);
+    shadow_table.resources[0].addr_uvw[0] = 6;
+    const auto address_shadow = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kShadowPs, std::size(kShadowPs), &shadow_table,
+        nullptr, nullptr, &address_identity);
+    shadow_table.resources[0].border_color_type = 2;
+    const auto border_shadow = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kShadowPs, std::size(kShadowPs), &shadow_table,
+        nullptr, nullptr, &border_identity);
+    stats = shader_recompile_cache_stats();
+    CHECK(!shadow_spv.empty() && shadow_repeat == shadow_spv && disabled_shadow.empty() &&
+              !function_shadow.empty() && !filter_shadow.empty() && !address_shadow.empty() &&
+              !border_shadow.empty() && shadow_identity == shadow_repeat_identity &&
+              shadow_identity != function_identity && function_identity != filter_identity &&
+              filter_identity != address_identity && address_identity != border_identity &&
+              stats.misses == 6 && stats.hits == 1 && stats.entries == 6,
+          "shader cache separates every manual shadow-comparison codegen field");
+
+    // A FLAT-window's base push-constant index is embedded in the module. Keep it in the key even
+    // though both variants use the same binding and exact fetch PC.
+    clear_shader_recompile_cache();
+    static const uint32_t kFlatCompute[] = {
+        0xd70f6a01u, 0x00020c0cu, 0x50041af9u, 0x86860680u,
+        0xdc200000u, 0x007d0001u, 0xbf810000u,
+    };
+    ComputeShaderConfig flat_config;
+    flat_config.user_sgprs.resize(16);
+    ShaderResource flat_window;
+    flat_window.cls = ResourceClass::ConstantBuffer;
+    flat_window.binding = 4;
+    flat_window.fetch_pc = 4;
+    flat_window.flat_base_sgpr = 12;
+    ShaderResourceTable flat_table;
+    flat_table.resources.push_back(flat_window);
+    const auto flat_s12 = recompile_compute_shader_cached(
+        kFlatCompute, std::size(kFlatCompute), &flat_table, flat_config);
+    flat_table.resources[0].flat_base_sgpr = 10;
+    const auto flat_s10 = recompile_compute_shader_cached(
+        kFlatCompute, std::size(kFlatCompute), &flat_table, flat_config);
+    stats = shader_recompile_cache_stats();
+    CHECK(!flat_s12.empty() && !flat_s10.empty() && flat_s12 != flat_s10 &&
+              stats.misses == 2 && stats.hits == 0,
+          "compute cache separates the FLAT-window push-constant base SGPR");
 
     if (failures) {
         std::printf("== FAIL: %d ==\n", failures);

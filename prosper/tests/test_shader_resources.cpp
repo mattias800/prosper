@@ -59,6 +59,69 @@ static std::vector<uint32_t> image_test_spirv() {
     emit(s, 59, {4, 5, 0});                                // %5 = image variable
     emit(s, 71, {5, 34, 1}); emit(s, 71, {5, 33, 4});      // set 1 binding 4
     emit(s, 61, {3, 6, 5});                                // %6 = load %5
+    emit(s, 87, {1, 7, 6, 8});                             // %7 = OpImageSampleImplicitLod %6
+    return s;
+}
+
+static std::vector<uint32_t> image_fetch_test_spirv() {
+    std::vector<uint32_t> s = image_test_spirv();
+    // Replace the terminal normalized sample with OpImageFetch. Reflection only needs the image
+    // object's provenance and opcode class; the fixture is not submitted to a SPIR-V implementation.
+    s[s.size() - 5] = (5u << 16) | 95u;
+    return s;
+}
+
+static std::vector<uint32_t> image_query_test_spirv() {
+    std::vector<uint32_t> s = {0x07230203u, 0x00010000u, 0, 16, 0};
+    emit(s, 15, {5, 12, 0x6e69616d, 0});                    // OpEntryPoint Compute %12 "main"
+    emit(s, 21, {1, 32, 0});                               // %1 = u32
+    emit(s, 25, {2, 1, 1, 0, 0, 0, 1, 0});                // %2 = sampled 2D image
+    emit(s, 27, {3, 2});                                   // %3 = sampled-image %2
+    emit(s, 32, {4, 0, 3});                                // %4 = UniformConstant pointer
+    emit(s, 59, {4, 5, 0});                                // %5 = image variable
+    emit(s, 71, {5, 34, 0}); emit(s, 71, {5, 33, 4});      // set 0 binding 4
+    emit(s, 61, {3, 6, 5});                                // %6 = load sampled image
+    emit(s, 100, {2, 7, 6});                               // %7 = OpImage %6
+    emit(s, 106, {1, 8, 7});                               // %8 = OpImageQueryLevels %7
+    emit(s, 103, {1, 9, 7, 10});                           // %9 = OpImageQuerySizeLod %7 %10
+    return s;
+}
+
+static std::vector<uint32_t> storage_image_access_test_spirv(bool float_sampled_type = false) {
+    // Two storage-image descriptors: binding 5 is read, binding 6 is independently write-only.
+    // This is the shape that permits the compute backend to skip seeding binding 6 even though the
+    // shader has an OpImageRead for binding 5.
+    std::vector<uint32_t> s = {0x07230203u, 0x00010000u, 0, 24, 0};
+    emit(s, 15, {5, 20, 0x6e69616d, 0});                    // OpEntryPoint Compute %20 "main"
+    if (float_sampled_type) emit(s, 22, {1, 32});           // %1 = f32
+    else emit(s, 21, {1, 32, 0});                          // %1 = u32
+    emit(s, 25, {2, 1, 1, 0, 0, 0, 2, 0});                // %2 = storage 2D image
+    emit(s, 32, {3, 0, 2});                                // %3 = UniformConstant pointer
+    emit(s, 59, {3, 4, 0}); emit(s, 59, {3, 5, 0});        // %4 source, %5 destination
+    emit(s, 71, {4, 34, 0}); emit(s, 71, {4, 33, 5});      // set 0 binding 5
+    emit(s, 71, {5, 34, 0}); emit(s, 71, {5, 33, 6});      // set 0 binding 6
+    emit(s, 61, {2, 6, 4}); emit(s, 61, {2, 7, 5});        // load image objects
+    emit(s, 98, {8, 9, 6, 10});                            // %9 = OpImageRead %6
+    emit(s, 99, {7, 10, 9});                               // OpImageWrite %7
+    return s;
+}
+
+static std::vector<uint32_t> storage_image_atomic_test_spirv() {
+    // R32_UINT storage image -> OpImageTexelPointer -> OpAtomicExchange. The image variable is an
+    // operand of OpImageTexelPointer directly, so reflection must carry that provenance through the
+    // returned Image-storage pointer to the atomic read/write.
+    std::vector<uint32_t> s = {0x07230203u, 0x00010000u, 0, 24, 0};
+    emit(s, 15, {4, 20, 0x6e69616d, 0});                    // OpEntryPoint Fragment %20 "main"
+    emit(s, 21, {1, 32, 0});                               // %1 = u32
+    emit(s, 23, {2, 1, 2});                                // %2 = uvec2
+    emit(s, 25, {3, 1, 1, 0, 0, 0, 2, 33});               // %3 = storage 2D R32ui image
+    emit(s, 32, {4, 0, 3});                                // %4 = UniformConstant pointer to image
+    emit(s, 32, {5, 11, 1});                               // %5 = Image pointer to u32
+    emit(s, 59, {4, 6, 0});                                // %6 = image variable
+    emit(s, 71, {6, 34, 1}); emit(s, 71, {6, 33, 7});      // set 1 binding 7
+    emit(s, 43, {1, 7, 0});                                // %7 = 0 (sample/value)
+    emit(s, 60, {5, 8, 6, 9, 7});                          // %8 = OpImageTexelPointer %6
+    emit(s, 229, {1, 10, 8, 7, 7, 7});                     // %10 = atomicExchange %8
     return s;
 }
 
@@ -189,6 +252,30 @@ int main() {
           data_format_bytes(DataFormat::Sint2_10_10_10) == 0,
           "packed 2_10_10_10 vertex variants have no uniform per-component byte size");
 
+    CHECK(native_float_storage_image_supported(DataFormat::Unorm8, 1, false, true) &&
+              native_float_storage_image_supported(DataFormat::Unorm8, 2, false, true) &&
+              native_float_storage_image_supported(
+                  DataFormat::Float10_11_11, 3, false, true),
+          "native typed storage accepts supported R8, RG8, and packed R11G11B10 formats");
+    CHECK(!native_float_storage_image_supported(DataFormat::Unorm8, 1, false, false) &&
+              !native_float_storage_image_supported(DataFormat::Unorm8, 2, false, false) &&
+              !native_float_storage_image_supported(
+                  DataFormat::Float10_11_11, 3, false, false),
+          "missing Vulkan storage-image support forces optional typed formats to the raw fallback");
+    CHECK(!native_float_storage_image_supported(DataFormat::Unorm8, 4, true, true) &&
+              !native_float_storage_image_supported(DataFormat::Float16, 3, false, true),
+          "device support cannot override semantic native-storage exclusions");
+    const uint32_t r8_storage =
+        native_storage_format_support_bit(DataFormat::Unorm8, 1);
+    const uint32_t rg8_storage =
+        native_storage_format_support_bit(DataFormat::Unorm8, 2);
+    const uint32_t packed_storage =
+        native_storage_format_support_bit(DataFormat::Float10_11_11, 3);
+    CHECK(r8_storage && rg8_storage && packed_storage && r8_storage != rg8_storage &&
+              rg8_storage != packed_storage &&
+              native_storage_format_support_bit(DataFormat::Float16, 3) == 0,
+          "native storage capability bits distinguish exact typed VkFormat candidates");
+
     uint8_t rgba10[4] = {};
     unorm2_10_10_10_to_rgba8(0xFFFFFFFFu, rgba10);
     CHECK(rgba10[0] == 255 && rgba10[1] == 255 && rgba10[2] == 255 && rgba10[3] == 255,
@@ -207,7 +294,8 @@ int main() {
           "reflection validates one statically-used descriptor and ignores inactive declarations");
     CHECK(vr.descriptors.size() == 1 && vr.descriptors[0].binding == 9 &&
           vr.descriptors[0].kind == SpirvDescriptorKind::StorageBuffer &&
-          vr.descriptors[0].required_bytes == 20 && !vr.descriptors[0].dynamic_access,
+          vr.descriptors[0].required_bytes == 20 && !vr.descriptors[0].dynamic_access &&
+          !vr.descriptors[0].writable,
           "constant access chain reflects storage-buffer binding 9 with a 20-byte minimum");
 
     ShaderResource atomic = good; atomic.binding = 10;
@@ -215,8 +303,25 @@ int main() {
     const DescriptorValidationReport atomic_report = validate_spirv_descriptor_interface(
         atomic_descriptor_test_spirv(), &atomic_table, 0, SpirvShaderStage::Vertex);
     CHECK(atomic_report.ok() && atomic_report.descriptors.size() == 2 &&
-              atomic_report.descriptors[1].binding == 10,
-          "write-only atomic access reflects its storage-buffer descriptor");
+              atomic_report.descriptors[1].binding == 10 &&
+              atomic_report.descriptors[1].writable,
+          "write-only atomic access reflects its writable storage-buffer descriptor");
+    ShaderResource graphics_atomic_image = atomic;
+    graphics_atomic_image.cls = ResourceClass::StorageImage;
+    graphics_atomic_image.format = DataFormat::Uint32;
+    graphics_atomic_image.num_components = 1;
+    graphics_atomic_image.img_dim = 1;
+    graphics_atomic_image.width = graphics_atomic_image.height = 1;
+    graphics_atomic_image.depth = 1;
+    ShaderResourceTable graphics_atomic_mismatch;
+    graphics_atomic_mismatch.resources = {good, graphics_atomic_image};
+    const DescriptorValidationReport graphics_atomic_mismatch_report =
+        validate_spirv_descriptor_interface(
+            atomic_descriptor_test_spirv(), &graphics_atomic_mismatch, 0,
+            SpirvShaderStage::Vertex);
+    CHECK(!graphics_atomic_mismatch_report.ok() &&
+              has_issue(graphics_atomic_mismatch_report, DescriptorIssueCode::WrongType),
+          "graphics atomic buffers cannot use the compute-only storage-image exception");
 
     ShaderResourceTable missing;
     auto mr = validate_spirv_descriptor_interface(spv, &missing, 0, SpirvShaderStage::Vertex);
@@ -268,8 +373,66 @@ int main() {
     auto ir = validate_spirv_descriptor_interface(
         image_spv, &image_table, 1, SpirvShaderStage::Fragment);
     CHECK(ir.ok() && ir.descriptors.size() == 1 &&
-          ir.descriptors[0].kind == SpirvDescriptorKind::CombinedImageSampler,
+          ir.descriptors[0].kind == SpirvDescriptorKind::CombinedImageSampler &&
+          ir.descriptors[0].normalized_sampling && !ir.descriptors[0].texel_access,
           "sampled-image reflection validates a concrete texture binding");
+    CHECK(ir.descriptors.size() == 1 && !ir.descriptors[0].writable,
+          "sampled descriptor is not mistaken for an image output");
+    const auto fetch_report = validate_spirv_descriptor_interface(
+        image_fetch_test_spirv(), &image_table, 1, SpirvShaderStage::Fragment);
+    CHECK(fetch_report.ok() && fetch_report.descriptors.size() == 1 &&
+              !fetch_report.descriptors[0].normalized_sampling &&
+              fetch_report.descriptors[0].texel_access,
+          "OpImageFetch reflection requires the descriptor's exact texel extent");
+    const auto query_report = validate_spirv_descriptor_interface(
+        image_query_test_spirv(), &image_table, 0, SpirvShaderStage::Compute);
+    CHECK(query_report.ok() && query_report.descriptors.size() == 1 &&
+              query_report.descriptors[0].readable &&
+              !query_report.descriptors[0].normalized_sampling &&
+              query_report.descriptors[0].texel_access,
+          "query-only sampled images stay reflected and require their exact guest extent");
+
+    ShaderResource storage_src{};
+    storage_src.cls = ResourceClass::StorageImage; storage_src.binding = 5;
+    storage_src.gpu_addr = 0x56790000; storage_src.size = 4;
+    storage_src.width = storage_src.height = 1;
+    storage_src.format = DataFormat::Unorm8; storage_src.num_components = 4;
+    ShaderResource storage_dst = storage_src;
+    storage_dst.binding = 6; storage_dst.gpu_addr += 0x10000;
+    ShaderResourceTable storage_table; storage_table.resources = {storage_src, storage_dst};
+    const auto storage_report = validate_spirv_descriptor_interface(
+        storage_image_access_test_spirv(), &storage_table, 0, SpirvShaderStage::Compute);
+    CHECK(storage_report.ok() && storage_report.descriptors.size() == 2,
+          "storage-image read/write fixture reflects both bindings");
+    CHECK(storage_report.descriptors.size() == 2 && storage_report.descriptors[0].readable &&
+              !storage_report.descriptors[0].writable &&
+              !storage_report.descriptors[1].readable && storage_report.descriptors[1].writable &&
+              storage_report.descriptors[0].texel_access &&
+              !storage_report.descriptors[0].normalized_sampling &&
+              !storage_report.descriptors[0].storage_float,
+          "storage-image texel access is classified per binding");
+    const auto float_storage_report = validate_spirv_descriptor_interface(
+        storage_image_access_test_spirv(true), &storage_table, 0, SpirvShaderStage::Compute);
+    CHECK(float_storage_report.ok() && float_storage_report.descriptors.size() == 2 &&
+              float_storage_report.descriptors[0].storage_float &&
+              float_storage_report.descriptors[1].storage_float,
+          "storage-image reflection preserves the SPIR-V float sampled-type contract");
+    ShaderResource atomic_image = storage_src;
+    atomic_image.binding = 7;
+    atomic_image.format = DataFormat::Uint32;
+    atomic_image.num_components = 1;
+    ShaderResourceTable atomic_image_table;
+    atomic_image_table.resources = {atomic_image};
+    const auto atomic_image_report = validate_spirv_descriptor_interface(
+        storage_image_atomic_test_spirv(), &atomic_image_table, 1,
+        SpirvShaderStage::Fragment);
+    CHECK(atomic_image_report.ok() && atomic_image_report.descriptors.size() == 1 &&
+              atomic_image_report.descriptors[0].kind == SpirvDescriptorKind::StorageImage &&
+              atomic_image_report.descriptors[0].readable &&
+              atomic_image_report.descriptors[0].writable &&
+              atomic_image_report.descriptors[0].texel_access &&
+              !atomic_image_report.descriptors[0].storage_float,
+          "image-texel-pointer atomic reflects an exact readable+writable integer storage image");
     image_table.resources[0].size = 0;
     auto izr = validate_spirv_descriptor_interface(
         image_spv, &image_table, 1, SpirvShaderStage::Fragment);

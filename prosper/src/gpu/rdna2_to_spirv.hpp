@@ -57,13 +57,71 @@ size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords);
 // Fixed-function PS interpolant wiring captured from SPI_PS_INPUT_CNTL_0..31. A valid entry's
 // OFFSET selects the vertex PARAM export feeding that logical PS input; OFFSET=0x20 selects the
 // four hardware default vectors encoded by DEFAULT_VAL instead. Keeping this separate from
-// RenderState makes the recompiler independently unit-testable.
+// RenderState makes the recompiler independently unit-testable. `passthrough_mask` disambiguates the
+// custom PARAM0 encoding; other custom PARAM slots can also be recovered from their register control.
 struct PixelInputMapping {
     std::array<uint32_t, 32> controls{};
     uint32_t valid_mask = 0;
+    uint32_t passthrough_mask = 0;
+
+    uint32_t effective_passthrough_mask() const {
+        uint32_t mask = passthrough_mask;
+        for (uint32_t input = 0; input < controls.size(); ++input) {
+            if (!(valid_mask & (1u << input))) continue;
+            const uint32_t control = controls[input];
+            // OFFSET bit 5 + FLAT_SHADE is the register form emitted for explicit parameter-cache
+            // pass-through. A nonzero low OFFSET distinguishes it from the constant-default form;
+            // metadata's explicit mask covers the otherwise ambiguous PARAM0 encoding.
+            if ((control & 0x420u) == 0x420u && (control & 0x1fu) != 0u)
+                mask |= 1u << input;
+        }
+        return mask & valid_mask;
+    }
+
+    uint32_t ambiguous_passthrough_mask() const {
+        uint32_t mask = 0;
+        for (uint32_t input = 0; input < controls.size(); ++input) {
+            if (!(valid_mask & (1u << input))) continue;
+            const uint32_t control = controls[input];
+            if ((control & 0x420u) == 0x420u && (control & 0x1fu) == 0u)
+                mask |= 1u << input;
+        }
+        return mask;
+    }
+
+    void merge_compatible_passthrough(
+            const std::array<uint32_t, 32>& metadata_controls,
+            uint32_t metadata_valid_mask, uint32_t metadata_passthrough_mask) {
+        uint32_t candidates = valid_mask & metadata_valid_mask & metadata_passthrough_mask;
+        for (uint32_t input = 0; input < controls.size(); ++input) {
+            const uint32_t bit = 1u << input;
+            if (!(candidates & bit)) continue;
+            // OFFSET and FLAT_SHADE must describe the same producer PARAM. Ignore unrelated control
+            // fields so metadata can disambiguate custom PARAM0 without overriding register wiring.
+            if ((controls[input] & 0x43fu) == (metadata_controls[input] & 0x43fu))
+                passthrough_mask |= bit;
+        }
+    }
 
     bool operator==(const PixelInputMapping&) const = default;
 };
+
+// Reconcile the register-backed linkage used by a live draw with richer AGC shader metadata. The
+// registers remain authoritative whenever present; metadata only supplies the custom PARAM0 bit that
+// SPI_PS_INPUT_CNTL cannot distinguish from a flat default input.
+inline PixelInputMapping resolve_pixel_input_mapping(
+        PixelInputMapping registered, const PixelInputMapping& metadata,
+        bool* resolved_from_metadata = nullptr) {
+    const bool use_metadata = !registered.valid_mask && metadata.valid_mask;
+    if (use_metadata) {
+        registered = metadata;
+    } else if (metadata.passthrough_mask) {
+        registered.merge_compatible_passthrough(
+            metadata.controls, metadata.valid_mask, metadata.passthrough_mask);
+    }
+    if (resolved_from_metadata) *resolved_from_metadata = use_metadata;
+    return registered;
+}
 
 // Fixed-function per-pixel VGPR loads selected by SPI_PS_INPUT_ENA / SPI_PS_INPUT_ADDR. ENA says
 // which values hardware computes and loads; ADDR also reserves VGPR slots for disabled values, so it
@@ -82,14 +140,17 @@ struct PixelSystemInputMapping {
 // subset of devices. When `requires_geometry` is true, the renderer inserts the generated geometry
 // stage returned by recompile_interpolation_geometry(). It passes ordinary smooth attributes through
 // and publishes P0, P10=(P1-P0), P20=(P2-P0), plus any requested barycentric system inputs, as a
-// packed interface understood by recompile_fragment(). Locations are capped at Vulkan's portable
-// 128-component fragment-input minimum (32 vec4 locations); `valid == false` keeps overflow visible.
+// packed interface understood by recompile_fragment(). Custom/pass-through attributes instead expose
+// the three raw vertex values that the guest shader explicitly interpolates. Locations are capped at
+// Vulkan's portable 128-component fragment-input minimum (32 vec4 locations); `valid == false` keeps
+// overflow visible.
 struct FragmentInterpolationLayout {
     static constexpr uint32_t kUnusedLocation = UINT32_MAX;
     std::array<std::array<uint32_t, 3>, 32> parameter_locations{}; // [attr][0=P10,1=P20,2=P0]
     std::array<uint32_t, 7> system_locations{};                    // PS system fields 0..6
     uint32_t attribute_mask = 0;                                  // attributes consumed by VINTRP
     uint32_t smooth_mask = 0;                                     // attributes consumed by P1/P2
+    uint32_t passthrough_mask = 0;                                // explicit inputs exposing raw vertex values
     bool requires_geometry = false;
     bool valid = true;
 
@@ -98,7 +159,8 @@ struct FragmentInterpolationLayout {
 
 FragmentInterpolationLayout fragment_interpolation_layout(
     const uint32_t* code, size_t dwords,
-    const PixelSystemInputMapping* system_inputs = nullptr);
+    const PixelSystemInputMapping* system_inputs = nullptr,
+    const PixelInputMapping* pixel_inputs = nullptr);
 
 // Generate the descriptor-free triangle geometry stage described above. Returns {} when no fallback
 // is required or the packed interface is invalid. Triangle lists, strips, fans, and the RectList
@@ -132,6 +194,15 @@ struct ComputeShaderConfig {
     bool tgid_x_en = false, tgid_y_en = false, tgid_z_en = false;
     bool tg_size_en = false;
     uint32_t lds_bytes = 0;
+    // Non-zero only when the live backend can REQUIRE this exact Vulkan subgroup size and full
+    // compute subgroups. The shell remaps guest local coordinates into subgroup lane order, so
+    // complex guest-wave CFGs may replace portable workgroup-scratch vote/scan emulation with native
+    // subgroup operations without assuming Vulkan's LocalInvocationIndex ordering.
+    uint32_t native_subgroup_size = 0;
+    // Per-format VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT support published by the device-owning
+    // frontend. Offline callers default to the portable raw path; live execution supplies the exact
+    // physical-device mask so unsupported typed formats compile to the raw uvec4 fallback.
+    uint32_t native_storage_format_support = 0;
 };
 
 // Translate a game compute program without the synthetic binding-0 input / binding-1 output used by
@@ -148,7 +219,13 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          const ShaderResourceTable* rt = nullptr,
                                          const PixelSystemInputMapping* system_inputs = nullptr,
                                          uint32_t pcrel_dispatch_target = UINT32_MAX,
-                                         const FragmentInterpolationLayout* interpolation = nullptr);
+                                         const FragmentInterpolationLayout* interpolation = nullptr,
+                                         bool wave32 = false);
+
+// Test hook for the low-half EXEC/VCC mask path. Production fragment compilation supplies the same
+// mode from SPI_PS_IN_CONTROL.PS_W32_EN.
+std::vector<uint32_t> recompile_fragment_wave32_for_test(
+    const uint32_t* code, size_t dwords);
 
 // Recompiled fragment wave operations use native Vulkan subgroup instructions and therefore require
 // an exact 64-lane subgroup. Returns zero for ordinary modules and 64 for that explicit contract.
@@ -170,6 +247,17 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
                                        const ShaderResourceTable* rt = nullptr,
                                        const PixelInputMapping* pixel_inputs = nullptr,
                                        bool capture_position = false);
+
+// Test hook: allow a tiny synthetic NGG shader to reach the terminal EXEC-gated export lowering so
+// Vulkan tests can execute both active and inactive outcomes. Production recompile_vertex keeps that
+// exception restricted to the byte-exact observed Astro wrapper.
+std::vector<uint32_t> recompile_vertex_terminal_ngg_gate_for_test(
+    const uint32_t* code, size_t dwords);
+
+// Test hook: exercise operations whose semantics depend on the exact Astro one-lane NGG projection.
+// Production recompile_vertex only enables that projection for byte-exact observed wrappers.
+std::vector<uint32_t> recompile_vertex_ngg_one_lane_for_test(
+    const uint32_t* code, size_t dwords);
 
 // How much of a shader the recompiler currently covers (per-instruction), without requiring the
 // stream to be a complete vertex/fragment. `alu` = instructions emit_alu handles (VALU/scalar/

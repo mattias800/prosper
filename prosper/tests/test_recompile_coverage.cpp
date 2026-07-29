@@ -175,6 +175,19 @@ int main() {
           mtbuf_tfe.unsupported == 1 && mtbuf_tfe.first_bad_op == 0u,
           "MTBUF TFE remains explicit unsupported coverage until its status write is modeled");
 
+    // Astro Bot world-map PS ends with this exact raw x3 store. The table-less coverage shell uses
+    // its conventional binding 2, so accepting the instruction must classify it as handled ALU/memory
+    // rather than the shader's sole unsupported opcode.
+    const uint32_t astro_store_x3[] = {
+        0xE07C2000u, 0x8004030Au, 0xBF810000u,
+    };
+    RecompileCoverage x3_store = recompile_coverage(
+        astro_store_x3, std::size(astro_store_x3));
+    CHECK(x3_store.total == 1 && x3_store.alu == 1 &&
+              x3_store.table_dependent == 0 && x3_store.unsupported == 0 &&
+              x3_store.first_bad_fmt < 0,
+          "Astro buffer_store_dwordx3 is covered as a supported raw memory operation");
+
     // The common compiler spill/fill form uses a fixed byte offset and one unmodified scalar base.
     // The host shader maps that private storage to one per-invocation Function array.
     const uint32_t scratch_static[] = {
@@ -302,6 +315,22 @@ int main() {
                           sizeof(compute_cfg_dispatch)/sizeof(compute_cfg_dispatch[0]), 0, 0,
                           &dispatch_rt).empty(),
           "a nested varying-VCC compute CFG preserves spilled EXEC and lowers through the dispatcher");
+    ComputeShaderConfig wave32_dispatch_config;
+    wave32_dispatch_config.wave_size = 32;
+    CHECK(!recompile_compute(compute_cfg_dispatch, std::size(compute_cfg_dispatch),
+                             &dispatch_rt, wave32_dispatch_config).empty(),
+          "the complex compute CFG dispatcher supports Wave32 without B32 mask aliases");
+    std::vector<uint32_t> compute_cfg_dispatch_created_b32 = {
+        0x7D8802F9u, 0x06068000u, // v_cmp_lt_f32_sdwa s[0:1], v0, v0
+        0xBE820300u,              // s_mov_b32 s2, s0 (new one-word mask alias)
+    };
+    compute_cfg_dispatch_created_b32.insert(
+        compute_cfg_dispatch_created_b32.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(recompile_compute(compute_cfg_dispatch_created_b32.data(),
+                            compute_cfg_dispatch_created_b32.size(), &dispatch_rt,
+                            wave32_dispatch_config).empty(),
+          "a dispatcher rejects B32 aliases of mask pairs produced inside its CFG");
     // The dispatcher includes branch-target/fallthrough blocks even when no entry path can reach
     // them. This dead block overwrites half of direct V# s[8:11] and then targets the live entry;
     // provenance at the reachable fetch must not include a write hardware can never execute.
@@ -416,6 +445,21 @@ int main() {
     CHECK(recompile_valu(compute_vcc_loop_barrier,
                          sizeof(compute_vcc_loop_barrier)/sizeof(compute_vcc_loop_barrier[0]), 0, 0).empty(),
           "a uniform VCCZ-exit loop containing s_barrier still rejects in the compute shell");
+
+    // The narrow loop structurizers likewise do not carry the validity bit for a one-word Wave32
+    // mask alias. This loop creates an SGPR-pair mask with VOPC and copies its low word before the
+    // back-edge; reject until that extra loop state has an explicit phi.
+    const uint32_t compute_vcc_loop_created_b32[] = {
+        0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7D020200u, 0xBF860007u,
+        0x060000FFu, 0x3E800000u, 0x81008100u,
+        0x7D8802F9u, 0x06068200u, // v_cmp_lt_f32_sdwa s[2:3], v0, v0
+        0xBE840302u,              // s_mov_b32 s4, s2
+        0xBF82FFF7u, 0xBF810000u,
+    };
+    CHECK(recompile_compute(compute_vcc_loop_created_b32,
+                            std::size(compute_vcc_loop_created_b32), nullptr,
+                            wave32_dispatch_config).empty(),
+          "a structured loop rejects B32 aliases of mask pairs produced in-loop");
 
     // A FORWARD vccz if with the same proven-uniform compare also structurizes in compute (#590 —
     // DOLL's blocked lighting/fill kernels are forward vccz if/else trees, not loops). Same shape as

@@ -321,6 +321,8 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
     }
     for (size_t i = 0; i < replay.items.size(); ++i) {
         const auto& d = replay.items[i];
+        const auto vs = prosper::tools::recompiled_shader_view(d, true);
+        const auto fs = prosper::tools::recompiled_shader_view(d, false);
         // #1256: raw-vs-realized draw-count check. The capture retains the raw DrawIndexAuto/DrawIndex
         // index_count (raw_draw_count) decoded from the guest; for a non-indexed draw the realized
         // vertex_count MUST equal it, and for an indexed draw the fetched index count must equal it.
@@ -346,7 +348,7 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                     "depth=%d/%d/%u stencil=%d blend=%d raster=%u/%u/%u bias=%u/%g/%g/%g "
                     "viewport=%d %.1f,%.1f %.1fx%.1f "
                     "scissor=%d [%d,%d)-[%d,%d) export=%08x downconvert=%08x "
-                    "vs=%zu/%016llx fs=%zu/%016llx\n",
+                    "vs=%zu/%016llx/%s fs=%zu/%016llx/%s\n",
                     static_cast<unsigned long long>(d.draw_index), i,
                     static_cast<unsigned long long>(d.color0_base), d.color0_width, d.color0_height,
                     d.ps.color0_format, d.ps.color_write_mask,
@@ -362,10 +364,12 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                     d.ps.has_scissor, d.ps.scissor_left, d.ps.scissor_top,
                     d.ps.scissor_right, d.ps.scissor_bottom,
                     d.ps.spi_shader_col_format, d.ps.sx_ps_downconvert,
-                    d.vs.size(), static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(
-                        reinterpret_cast<const uint8_t*>(d.vs.data()), d.vs.size() * 4)),
-                    d.fs.size(), static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(
-                        reinterpret_cast<const uint8_t*>(d.fs.data()), d.fs.size() * 4)));
+                    vs.words->size(), static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(
+                        reinterpret_cast<const uint8_t*>(vs.words->data()), vs.words->size() * 4)),
+                    vs.shared ? "shared" : "owned",
+                    fs.words->size(), static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(
+                        reinterpret_cast<const uint8_t*>(fs.words->data()), fs.words->size() * 4)),
+                    fs.shared ? "shared" : "owned");
         // Blend detail: UI compositing correctness hangs on the exact color AND alpha factor
         // programming (a separate-alpha UI backdrop writes a different alpha than its color
         // factors imply — #320's dialogue overlay), so make the full equation inspectable.
@@ -528,6 +532,8 @@ bool validate_frame(const prosper::gpu::GpuReplayFrame& replay) {
     bool valid = true;
     for (size_t i = 0; i < replay.items.size(); ++i) {
         const auto& d = replay.items[i];
+        const auto vs = prosper::tools::recompiled_shader_view(d, true);
+        const auto fs = prosper::tools::recompiled_shader_view(d, false);
         struct StageInput {
             const char* name;
             const std::vector<uint32_t>* spirv;
@@ -535,8 +541,8 @@ bool validate_frame(const prosper::gpu::GpuReplayFrame& replay) {
             uint32_t set;
             prosper::gpu::SpirvShaderStage stage;
         } stages[] = {
-            {"VS", &d.vs, d.vrt.get(), 0, prosper::gpu::SpirvShaderStage::Vertex},
-            {"PS", &d.fs, d.prt.get(), 1, prosper::gpu::SpirvShaderStage::Fragment},
+            {"VS", vs.words, d.vrt.get(), 0, prosper::gpu::SpirvShaderStage::Vertex},
+            {"PS", fs.words, d.prt.get(), 1, prosper::gpu::SpirvShaderStage::Fragment},
         };
         for (const auto& s : stages) {
             auto report = prosper::gpu::validate_spirv_descriptor_interface(
@@ -1402,14 +1408,14 @@ int main(int argc, char** argv) {
                 const auto& raw = replay.raw_shader_versions[it.vs_raw_shader_index];
                 auto vs = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
                                                          it.vrt.get(), nullptr, false);
-                if (!vs.empty()) { it.vs = std::move(vs); it.vs_shared.reset(); it.vs_identity = 0; ++vs_swapped; }
+                if (!vs.empty()) { it.set_vs(std::move(vs)); ++vs_swapped; }
                 else ++vs_kept;
             } else ++vs_kept;
             if (it.fs_raw_shader_index < replay.raw_shader_versions.size()) {
                 const auto& raw = replay.raw_shader_versions[it.fs_raw_shader_index];
                 auto fs = prosper::gpu::recompile_fragment(raw.words.data(), raw.words.size(),
                                                            it.prt.get(), nullptr, UINT32_MAX, nullptr);
-                if (!fs.empty()) { it.fs = std::move(fs); it.fs_shared.reset(); it.fs_identity = 0; ++fs_swapped; }
+                if (!fs.empty()) { it.set_fs(std::move(fs)); ++fs_swapped; }
                 else ++fs_kept;
             } else ++fs_kept;
         }
@@ -1440,7 +1446,7 @@ int main(int argc, char** argv) {
                 auto xfb = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
                                                           it.vrt.get(), nullptr, true);
                 if (!xfb.empty()) {
-                    it.vs = std::move(xfb); it.vs_shared.reset(); it.vs_identity = 0;
+                    it.set_vs(std::move(xfb));
                     std::fprintf(stderr,
                                  "[geom-probe] draw=%llu item=%zu operation=%lld VS re-recompiled "
                                  "with xfb capture (%zu words)\n",
@@ -1481,7 +1487,7 @@ int main(int argc, char** argv) {
                 auto fs = prosper::gpu::recompile_fragment(raw.words.data(), raw.words.size(),
                                                            it.prt.get(), nullptr, UINT32_MAX, nullptr);
                 if (!fs.empty()) {
-                    it.fs = std::move(fs); it.fs_shared.reset(); it.fs_identity = 0;
+                    it.set_fs(std::move(fs));
                     std::fprintf(stderr,
                                  "[fs-tap] draw=%llu item=%zu operation=%lld FS re-recompiled "
                                  "at pc=%u with colour tap (%zu words)\n",
@@ -1623,26 +1629,19 @@ int main(int argc, char** argv) {
                      static_cast<unsigned long long>(found->host_data_size), dump_path.c_str());
     }
     if (!shader_spec.empty()) {
-        size_t colon = shader_spec.find(':');
-        char* draw_end = nullptr;
-        const unsigned long long draw_index = std::strtoull(shader_spec.c_str(), &draw_end, 0);
-        const size_t di = colon != std::string::npos && shader_spec[0] != '-' &&
-                                  draw_end == shader_spec.c_str() + colon
-            ? prosper::tools::replay_item_index_for_draw(replay, draw_index) : SIZE_MAX;
-        std::string stage =
-            colon == std::string::npos ? std::string{} : shader_spec.substr(colon + 1);
-        if (colon == std::string::npos || di == SIZE_MAX ||
-            (stage != "vs" && stage != "fs")) {
-            std::fprintf(stderr, "gpu_replay: invalid shader selector %s\n", shader_spec.c_str()); return 2;
+        bool shared = false;
+        const auto* words = prosper::tools::select_recompiled_shader(
+            replay, shader_spec, shared, error);
+        if (!words) {
+            std::fprintf(stderr, "gpu_replay: %s\n", error.c_str()); return 2;
         }
-        const auto& words = stage == "vs" ? replay.items[di].vs : replay.items[di].fs;
-        FILE* f = std::fopen(shader_path.c_str(), "wb"); size_t bytes = words.size() * sizeof(uint32_t);
-        if (!f || std::fwrite(words.data(), 1, bytes, f) != bytes) {
+        FILE* f = std::fopen(shader_path.c_str(), "wb"); size_t bytes = words->size() * sizeof(uint32_t);
+        if (!f || std::fwrite(words->data(), 1, bytes, f) != bytes) {
             if (f) std::fclose(f); std::fprintf(stderr, "gpu_replay: cannot write %s\n", shader_path.c_str()); return 2;
         }
         std::fclose(f);
-        std::fprintf(stderr, "[gpureplay] dumped %s (%zu bytes) to %s\n", shader_spec.c_str(), bytes,
-                     shader_path.c_str());
+        std::fprintf(stderr, "[gpureplay] dumped %s (%zu bytes, %s) to %s\n", shader_spec.c_str(),
+                     bytes, shared ? "shared" : "owned", shader_path.c_str());
     }
     if (!realized_shader_spec.empty()) {
         const auto* raw = prosper::tools::select_realized_raw_shader(

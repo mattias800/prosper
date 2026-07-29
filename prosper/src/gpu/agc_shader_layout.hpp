@@ -55,6 +55,7 @@ struct AgcShaderSemantic {
     uint32_t semantic()         const { return  bits        & 0xffu; }
     uint32_t hardware_mapping() const { return (bits >>  8) & 0xffu; }
     bool     is_flat_shaded()   const { return ((bits >> 22) & 1u) != 0; }
+    bool     is_custom()        const { return ((bits >> 24) & 1u) != 0; }
     uint32_t default_value()    const { return (bits >> 28) & 0x3u; }
     uint32_t default_value_hi() const { return (bits >> 30) & 0x3u; }
 };
@@ -90,10 +91,12 @@ static_assert(offsetof(AgcShaderHeader, input_semantics) == 0x30 &&
 
 // Hardware SPI_PS_INPUT_CNTL values derived from an ES/GS producer and a PS consumer's semantic
 // metadata. Each valid control maps one logical PS input either to the matching producer PARAM slot
-// or to OFFSET=0x20 + DEFAULT_VAL when the producer does not export that semantic.
+// or to OFFSET=0x20 + DEFAULT_VAL when the producer does not export that semantic. Custom inputs also
+// set the explicit parameter-cache pass-through mask used by the portable interpolation fallback.
 struct AgcPixelInputControls {
     std::array<uint32_t, 32> controls{};
     uint32_t valid_mask = 0;
+    uint32_t passthrough_mask = 0;
 };
 AgcPixelInputControls derive_agc_pixel_input_controls(const AgcShaderHeader* producer,
                                                       const AgcShaderHeader* pixel);
@@ -152,6 +155,11 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]);
 // Convert SQ_RSRC_IMG TYPE (8..15) to the MIMG dim convention (0..7). Unknown values retain the
 // long-standing 2D fallback.
 uint32_t image_type_to_dim(uint8_t type);
+
+// GFX10 image descriptors use only SQ_RSRC_IMG TYPE values 8..15. Buffer V# tables are frequently
+// eight-dword aligned too, so this discriminator is part of validating a candidate T# rather than a
+// cosmetic decode detail.
+inline bool valid_image_type(uint8_t type) { return type >= 8 && type <= 15; }
 
 // A Gen5/GFX10 T# IMG_FMT (the 9-bit combined format field) decoded to sizing + conversion info.
 // bytes_per_block is the byte size of one block_width x block_height texel block — for uncompressed

@@ -1,9 +1,13 @@
 # AGENTS.md - rendering snapshot tests
 
-This is the required local real-game rendering gate. Run the affected title
-guards after any change that can affect output: RDNA2-to-SPIR-V recompilation,
-AGC/PM4 decoding, render state, texture decode/detiling, executor behavior, or
-presentation.
+This is the local real-game rendering regression inventory. Run and review the
+full matrix before every release. It is not a day-to-day development or merge
+gate: a PR author may skip snapshots entirely during long iterations or run only
+useful focused guards, unless the task explicitly requires a run. Snapshot results
+do not define whether master or a PR is acceptable; either may contain a detected
+regression, including an intentional cross-title
+tradeoff from an otherwise correct fix. Release review decides whether to fix the
+regression or explicitly accept and document it before publishing artifacts.
 
 ```bash
 # From prosper/, with build-linux/boot_trace built from the change.

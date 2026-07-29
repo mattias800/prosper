@@ -22,6 +22,14 @@ static int failures = 0;
     } while (0)
 
 int main() {
+    // GPU presentation is the normal game policy because adoption has a safe CPU fallback. Keep the
+    // explicit zero override for driver diagnosis and never request it without a renderer-owned game.
+    CHECK(request_gpu_present(nullptr, false, true));
+    CHECK(request_gpu_present("1", false, true));
+    CHECK(!request_gpu_present("0", false, true));
+    CHECK(!request_gpu_present(nullptr, true, true));
+    CHECK(!request_gpu_present(nullptr, false, false));
+
     // Acquire: a usable image (SUCCESS or SUBOPTIMAL) → proceed to blit+present.
     CHECK(classify_acquire(VK_SUCCESS) == AcquireAction::proceed);
     CHECK(classify_acquire(VK_SUBOPTIMAL_KHR) == AcquireAction::proceed);

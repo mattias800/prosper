@@ -3,8 +3,10 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 
@@ -211,6 +213,7 @@ enum : uint32_t {
     OpTypePointer = 32,
     OpConstant = 43,
     OpVariable = 59,
+    OpImageTexelPointer = 60,
     OpLoad = 61,
     OpStore = 62,
     OpAccessChain = 65,
@@ -231,6 +234,7 @@ enum : uint32_t {
 };
 enum : uint32_t {
     StorageUniformConstant = 0,
+    StorageImage = 11,
     StorageBuffer = 12,
     DecorationArrayStride = 6,
     DecorationBinding = 33,
@@ -264,6 +268,10 @@ struct TypeInfo {
     uint32_t width = 0;
     uint32_t storage = 0;
     uint32_t image_sampled = 0;
+    uint32_t image_dim = 0xFFFFFFFFu;
+    bool image_arrayed = false;
+    bool image_depth = false;
+    bool scalar_float = false;
     std::vector<uint32_t> members;
 };
 
@@ -339,6 +347,56 @@ SpirvDescriptorKind descriptor_kind(const VariableInfo& var,
     return SpirvDescriptorKind::Unknown;
 }
 
+bool descriptor_storage_float(const VariableInfo& var,
+                              const std::unordered_map<uint32_t, TypeInfo>& types) {
+    auto pi = types.find(var.pointer_type);
+    if (pi == types.end() || pi->second.kind != TypeKind::Pointer) return false;
+    uint32_t type = pi->second.element;
+    for (uint32_t depth = 0; depth < 8; ++depth) {
+        auto ti = types.find(type);
+        if (ti == types.end()) return false;
+        if (ti->second.kind == TypeKind::Array) {
+            type = ti->second.element;
+            continue;
+        }
+        if (ti->second.kind != TypeKind::Image || ti->second.image_sampled != 2) return false;
+        auto sampled_type = types.find(ti->second.element);
+        return sampled_type != types.end() && sampled_type->second.kind == TypeKind::Scalar &&
+               sampled_type->second.scalar_float;
+    }
+    return false;
+}
+
+struct DescriptorImageShape {
+    uint32_t dim = 0xFFFFFFFFu;
+    bool arrayed = false;
+    bool depth = false;
+};
+
+DescriptorImageShape descriptor_image_shape(
+    const VariableInfo& var, const std::unordered_map<uint32_t, TypeInfo>& types) {
+    auto pi = types.find(var.pointer_type);
+    if (pi == types.end() || pi->second.kind != TypeKind::Pointer) return {};
+    uint32_t type = pi->second.element;
+    for (uint32_t depth = 0; depth < 8; ++depth) {
+        auto ti = types.find(type);
+        if (ti == types.end()) return {};
+        if (ti->second.kind == TypeKind::Array) {
+            type = ti->second.element;
+            continue;
+        }
+        if (ti->second.kind == TypeKind::SampledImage) {
+            type = ti->second.element;
+            continue;
+        }
+        if (ti->second.kind == TypeKind::Image)
+            return {ti->second.image_dim, ti->second.image_arrayed,
+                    ti->second.image_depth};
+        return {};
+    }
+    return {};
+}
+
 SpirvDescriptorKind resource_kind(const ShaderResource& r) {
     switch (r.cls) {
         case ResourceClass::ConstantBuffer:
@@ -351,6 +409,42 @@ SpirvDescriptorKind resource_kind(const ShaderResource& r) {
 
 void add_malformed(DescriptorValidationReport& report) {
     report.issues.push_back({DescriptorIssueCode::MalformedSpirv, true});
+}
+
+struct DescriptorReflectionCacheEntry {
+    std::vector<uint32_t> spirv;
+    DescriptorValidationReport reflection;
+    SpirvShaderStage stage = SpirvShaderStage::Unknown;
+    uint64_t last_use = 0;
+};
+
+struct DescriptorReflectionCache {
+    std::mutex mutex;
+    std::unordered_map<uint64_t, DescriptorReflectionCacheEntry> entries;
+    uint64_t use_clock = 0;
+    uint64_t bytes = 0;
+};
+
+DescriptorReflectionCache& descriptor_reflection_cache() {
+    static DescriptorReflectionCache cache;
+    return cache;
+}
+
+uint64_t spirv_reflection_hash(const std::vector<uint32_t>& spirv) {
+    uint64_t hash = 1469598103934665603ull;
+    for (uint32_t word : spirv) {
+        hash ^= word;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+uint64_t reflection_entry_bytes(const DescriptorReflectionCacheEntry& entry) {
+    return static_cast<uint64_t>(entry.spirv.size()) * sizeof(uint32_t) +
+           static_cast<uint64_t>(entry.reflection.descriptors.size()) *
+               sizeof(SpirvDescriptorBinding) +
+           static_cast<uint64_t>(entry.reflection.issues.size()) *
+               sizeof(DescriptorValidationIssue);
 }
 
 } // namespace
@@ -393,6 +487,24 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     SpirvShaderStage expected_stage,
     bool report_unused) {
     DescriptorValidationReport report;
+    SpirvShaderStage stage = SpirvShaderStage::Unknown;
+    const uint64_t reflection_hash = spirv_reflection_hash(spirv);
+    bool reflection_cached = false;
+    {
+        DescriptorReflectionCache& cache = descriptor_reflection_cache();
+        std::lock_guard lock(cache.mutex);
+        auto found = cache.entries.find(reflection_hash);
+        // Equality is authoritative; the hash only selects a candidate, so collisions cannot reuse
+        // another module's descriptor contract.
+        if (found != cache.entries.end() && found->second.spirv == spirv) {
+            found->second.last_use = ++cache.use_clock;
+            report = found->second.reflection;
+            stage = found->second.stage;
+            reflection_cached = true;
+        }
+    }
+
+    if (!reflection_cached) {
     if (spirv.size() < 5 || spirv[0] != kSpirvMagic) { add_malformed(report); return report; }
 
     std::vector<Instruction> insts;
@@ -412,8 +524,6 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     std::unordered_map<uint32_t, uint32_t> sets, bindings;
     std::unordered_map<uint32_t, uint64_t> array_strides;
     std::unordered_map<uint64_t, uint64_t> member_offsets;
-    SpirvShaderStage stage = SpirvShaderStage::Unknown;
-
     auto word = [&](const Instruction& in, uint32_t operand) { return spirv[in.offset + 1u + operand]; };
     for (const Instruction& in : insts) {
         const uint32_t n = in.words - 1u;
@@ -422,14 +532,20 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
                 if (n >= 2 && stage == SpirvShaderStage::Unknown)
                     stage = static_cast<SpirvShaderStage>(word(in, 0));
                 break;
-            case OpTypeInt: case OpTypeFloat:
+            case OpTypeInt:
                 if (n >= 2) { TypeInfo t; t.kind = TypeKind::Scalar; t.width = word(in, 1); types[word(in, 0)] = t; }
+                break;
+            case OpTypeFloat:
+                if (n >= 2) { TypeInfo t; t.kind = TypeKind::Scalar; t.width = word(in, 1); t.scalar_float = true; types[word(in, 0)] = t; }
                 break;
             case OpTypeVector:
                 if (n >= 3) { TypeInfo t; t.kind = TypeKind::Vector; t.element = word(in, 1); t.count = word(in, 2); types[word(in, 0)] = t; }
                 break;
             case OpTypeImage:
-                if (n >= 8) { TypeInfo t; t.kind = TypeKind::Image; t.element = word(in, 1); t.image_sampled = word(in, 6); types[word(in, 0)] = t; }
+                if (n >= 8) { TypeInfo t; t.kind = TypeKind::Image; t.element = word(in, 1);
+                    t.image_dim = word(in, 2); t.image_depth = word(in, 3) == 1u;
+                    t.image_arrayed = word(in, 4) != 0;
+                    t.image_sampled = word(in, 6); types[word(in, 0)] = t; }
                 break;
             case OpTypeSampledImage:
                 if (n >= 2) { TypeInfo t; t.kind = TypeKind::SampledImage; t.element = word(in, 1); types[word(in, 0)] = t; }
@@ -475,36 +591,124 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     }
 
     std::unordered_map<uint32_t, SpirvDescriptorKind> descriptor_vars;
+    std::set<uint32_t> storage_float_vars;
     for (const auto& [id, var] : variables) {
         SpirvDescriptorKind kind = descriptor_kind(var, types);
-        if (kind != SpirvDescriptorKind::Unknown) descriptor_vars[id] = kind;
+        if (kind != SpirvDescriptorKind::Unknown) {
+            descriptor_vars[id] = kind;
+            if (kind == SpirvDescriptorKind::StorageImage &&
+                descriptor_storage_float(var, types))
+                storage_float_vars.insert(id);
+        }
     }
 
     std::set<uint32_t> used_vars;
+    std::set<uint32_t> read_vars;
+    std::set<uint32_t> written_vars;
+    std::set<uint32_t> atomic_vars;
+    std::set<uint32_t> normalized_sample_vars;
+    std::set<uint32_t> texel_access_vars;
     std::unordered_map<uint32_t, PointerAccess> accesses;
+    // Result id of OpLoad/OpSampledImage -> descriptor variable. An image descriptor load accesses
+    // the descriptor object, not its texels; only the later image opcode establishes read/write data
+    // access. Keeping that distinction makes write-only storage outputs visible to the backend even
+    // when the same shader reads a different storage image.
+    std::unordered_map<uint32_t, uint32_t> image_objects;
     std::unordered_map<uint32_t, uint64_t> required;
     std::unordered_map<uint32_t, bool> dynamic;
 
-    auto mark = [&](uint32_t var) { if (descriptor_vars.count(var)) used_vars.insert(var); };
+    auto mark = [&](uint32_t var, bool read, bool write) {
+        if (!descriptor_vars.count(var)) return;
+        used_vars.insert(var);
+        if (read) read_vars.insert(var);
+        if (write) written_vars.insert(var);
+    };
+    auto pointer_root = [&](uint32_t pointer) -> uint32_t {
+        if (descriptor_vars.count(pointer)) return pointer;
+        auto access = accesses.find(pointer);
+        return access != accesses.end() ? access->second.variable : 0u;
+    };
+    auto mark_pointer = [&](uint32_t pointer, bool read, bool write) {
+        const uint32_t root = pointer_root(pointer);
+        if (root) mark(root, read, write);
+    };
+    auto mark_image = [&](uint32_t object, bool read, bool write) {
+        auto origin = image_objects.find(object);
+        if (origin != image_objects.end()) mark(origin->second, read, write);
+    };
+    auto mark_image_coordinate_contract = [&](uint32_t object, bool normalized) {
+        auto origin = image_objects.find(object);
+        if (origin == image_objects.end()) return;
+        if (normalized) normalized_sample_vars.insert(origin->second);
+        else texel_access_vars.insert(origin->second);
+    };
     for (const Instruction& in : insts) {
         const uint32_t n = in.words - 1u;
-        if (in.opcode == OpLoad && n >= 3) {
-            uint32_t ptr = word(in, 2); mark(ptr);
-            auto ai = accesses.find(ptr); if (ai != accesses.end()) mark(ai->second.variable);
+        if (in.opcode == OpImageTexelPointer && n >= 5) {
+            // Unlike OpImageRead/Write, this instruction consumes the storage-image descriptor
+            // variable directly and returns a pointer in the Image storage class. Preserve that
+            // provenance so the following OpAtomic* marks the image readable+writable.
+            const uint32_t result_type = word(in, 0);
+            const uint32_t result = word(in, 1);
+            const uint32_t image_var = word(in, 2);
+            const auto descriptor = descriptor_vars.find(image_var);
+            const auto pointer_type = types.find(result_type);
+            if (descriptor != descriptor_vars.end() &&
+                descriptor->second == SpirvDescriptorKind::StorageImage &&
+                pointer_type != types.end() &&
+                pointer_type->second.kind == TypeKind::Pointer &&
+                pointer_type->second.storage == StorageImage) {
+                PointerAccess access;
+                access.variable = image_var;
+                access.pointee_type = pointer_type->second.element;
+                accesses[result] = access;
+                texel_access_vars.insert(image_var);
+            }
+        } else if (in.opcode == OpLoad && n >= 3) {
+            const uint32_t root = pointer_root(word(in, 2));
+            const auto descriptor = descriptor_vars.find(root);
+            const bool image_descriptor = descriptor != descriptor_vars.end() &&
+                descriptor->second != SpirvDescriptorKind::StorageBuffer;
+            mark_pointer(word(in, 2), !image_descriptor, false);
+            if (image_descriptor) image_objects[word(in, 1)] = root;
         } else if (in.opcode == OpStore && n >= 1) {
-            uint32_t ptr = word(in, 0); mark(ptr);
-            auto ai = accesses.find(ptr); if (ai != accesses.end()) mark(ai->second.variable);
-        } else if (((in.opcode >= OpAtomicLoad && in.opcode <= OpAtomicIDecrement) ||
+            mark_pointer(word(in, 0), false, true);
+        } else if (in.opcode == OpAtomicLoad && n >= 3) {
+            mark_pointer(word(in, 2), true, false);
+        } else if (((in.opcode >= OpAtomicExchange && in.opcode <= OpAtomicIDecrement) ||
                     (in.opcode >= OpAtomicIAdd && in.opcode <= OpAtomicXor) ||
                     in.opcode == OpAtomicFlagTestAndSet) && n >= 3) {
             // Result-producing atomic instructions place their pointer after result type/result id.
-            // A write-only atomic buffer is still part of the live descriptor interface.
-            uint32_t ptr = word(in, 2); mark(ptr);
-            auto ai = accesses.find(ptr); if (ai != accesses.end()) mark(ai->second.variable);
+            const uint32_t root = pointer_root(word(in, 2));
+            if (root) atomic_vars.insert(root);
+            mark_pointer(word(in, 2), true, true);
         } else if ((in.opcode == OpAtomicStore || in.opcode == OpAtomicFlagClear) && n >= 1) {
             // The two result-less atomic instructions place the pointer first, like OpStore.
-            uint32_t ptr = word(in, 0); mark(ptr);
-            auto ai = accesses.find(ptr); if (ai != accesses.end()) mark(ai->second.variable);
+            mark_pointer(word(in, 0), false, true);
+        } else if (in.opcode == 86u /* OpSampledImage */ && n >= 3) {
+            auto origin = image_objects.find(word(in, 2));
+            if (origin != image_objects.end()) image_objects[word(in, 1)] = origin->second;
+        } else if (in.opcode >= 87u && in.opcode <= 98u && n >= 3) {
+            // All sampled/fetch/gather forms plus OpImageRead place their image object after result
+            // type/result id. The descriptor itself was loaded earlier; this is the texel read.
+            mark_image(word(in, 2), true, false);
+            // OpImageSample* (87..94) and Gather/DrefGather (96..97) consume normalized sampler
+            // coordinates. OpImageFetch (95) and OpImageRead (98) consume integer texel coordinates
+            // and therefore cannot observe a reduced render target as if it had the native extent.
+            mark_image_coordinate_contract(
+                word(in, 2), (in.opcode >= 87u && in.opcode <= 94u) ||
+                                 in.opcode == 96u || in.opcode == 97u);
+        } else if (in.opcode == 99u /* OpImageWrite */ && n >= 1) {
+            mark_image(word(in, 0), false, true);
+        } else if (in.opcode == 100u /* OpImage */ && n >= 3) {
+            auto origin = image_objects.find(word(in, 2));
+            if (origin != image_objects.end()) image_objects[word(in, 1)] = origin->second;
+        } else if (in.opcode >= 101u && in.opcode <= 107u && n >= 3) {
+            // OpImageQueryFormat/Order/SizeLod/Size/Lod/Levels/Samples all place the image object
+            // after result type/result id. Query-only descriptors must remain in the reflected
+            // layout, and their reported dimensions/LOD contract requires the guest's exact extent.
+            mark_image(word(in, 2), true, false);
+            mark_image_coordinate_contract(word(in, 2), false);
         } else if ((in.opcode == OpAccessChain || in.opcode == OpInBoundsAccessChain) && n >= 3) {
             const uint32_t result = word(in, 1), base = word(in, 2);
             PointerAccess a;
@@ -555,12 +759,54 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     for (uint32_t var : used_vars) {
         auto si = sets.find(var), bi = bindings.find(var);
         if (si == sets.end() || bi == bindings.end()) { add_malformed(report); continue; }
+        const auto image_shape = descriptor_image_shape(variables[var], types);
         report.descriptors.push_back({var, si->second, bi->second, descriptor_vars[var], stage,
-                                      required[var], dynamic[var]});
+                                      required[var], dynamic[var], read_vars.count(var) != 0,
+                                      written_vars.count(var) != 0,
+                                      normalized_sample_vars.count(var) != 0,
+                                      texel_access_vars.count(var) != 0,
+                                      storage_float_vars.count(var) != 0,
+                                      image_shape.dim, image_shape.arrayed, image_shape.depth,
+                                      atomic_vars.count(var) != 0});
     }
     std::sort(report.descriptors.begin(), report.descriptors.end(), [](const auto& a, const auto& b) {
         return a.set != b.set ? a.set < b.set : a.binding < b.binding;
     });
+
+    // Reflection depends only on immutable SPIR-V. Runtime addresses, sizes, metadata, and the
+    // expected stage/set are validated below on every call. Keeping those out of this cache lets a
+    // shader dispatched against different guest allocations reuse the expensive instruction/type
+    // walk without weakening any per-dispatch checks.
+    {
+        DescriptorReflectionCache& cache = descriptor_reflection_cache();
+        std::lock_guard lock(cache.mutex);
+        DescriptorReflectionCacheEntry entry;
+        entry.spirv = spirv;
+        entry.reflection = report;
+        entry.stage = stage;
+        entry.last_use = ++cache.use_clock;
+        constexpr uint64_t kCacheLimit = 64ull * 1024 * 1024;
+        constexpr size_t kMaxEntries = 4096;
+        const uint64_t entry_bytes = reflection_entry_bytes(entry);
+        auto collision = cache.entries.find(reflection_hash);
+        if (collision != cache.entries.end()) {
+            cache.bytes -= reflection_entry_bytes(collision->second);
+            cache.entries.erase(collision);
+        }
+        while (!cache.entries.empty() &&
+               (cache.entries.size() >= kMaxEntries || cache.bytes + entry_bytes > kCacheLimit)) {
+            auto oldest = cache.entries.begin();
+            for (auto it = std::next(cache.entries.begin()); it != cache.entries.end(); ++it)
+                if (it->second.last_use < oldest->second.last_use) oldest = it;
+            cache.bytes -= reflection_entry_bytes(oldest->second);
+            cache.entries.erase(oldest);
+        }
+        if (entry_bytes <= kCacheLimit) {
+            cache.bytes += entry_bytes;
+            cache.entries.emplace(reflection_hash, std::move(entry));
+        }
+    }
+    }
 
     if (stage != expected_stage)
         report.issues.push_back({DescriptorIssueCode::StageMismatch, true, expected_set, 0});
@@ -591,7 +837,16 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         }
         const ShaderResource& r = *matches.front();
         SpirvDescriptorKind actual = resource_kind(r);
-        if (actual != d.kind) {
+        const bool atomic_image_buffer =
+            expected_stage == SpirvShaderStage::Compute &&
+            d.kind == SpirvDescriptorKind::StorageBuffer && d.atomic_access &&
+            actual == SpirvDescriptorKind::StorageImage &&
+            r.format == DataFormat::Uint32 && r.num_components == 1 &&
+            r.img_dim == 1 && r.depth == 1 && !r.depth_compare &&
+            !r.in_mip_tail && !r.compression_enabled &&
+            r.width && r.height &&
+            static_cast<uint64_t>(r.width) * r.height * sizeof(uint32_t) <= r.size;
+        if (actual != d.kind && !atomic_image_buffer) {
             report.issues.push_back({DescriptorIssueCode::WrongType, true, d.set, d.binding,
                                      d.kind, actual, d.required_bytes, r.size});
             continue;

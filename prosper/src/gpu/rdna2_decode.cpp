@@ -211,6 +211,21 @@ void decode_operands(Rdna2Inst& i) {
                         i.has_modifier = false;
                     }
                 }
+                // NGG culling extracts three packed byte indices and converts them to LDS byte
+                // addresses with `v_lshlrev_b32_sdwa ..., 2, vN src1_sel:BYTE_k`. Admit the exact
+                // zero-extending form: full-dword destination/shift amount, one byte from src1, and
+                // no sign/float/output modifiers.
+                else if (((w >> 25) & 0x3Fu) == 0x1Au) {
+                    const uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
+                    const uint32_t s0sel = (sd >> 16) & 7u, s1sel = (sd >> 24) & 7u;
+                    if (dsel == 6u && dun == 0u && s0sel == 6u && s1sel <= 5u &&
+                        !((sd >> 19) & 0xFu) && !((sd >> 27) & 0xFu) &&
+                        !i.clamp && !i.omod) {
+                        i.sdwa_src0_sel = static_cast<uint8_t>(s0sel);
+                        i.sdwa_src1_sel = static_cast<uint8_t>(s1sel);
+                        i.has_modifier = false;
+                    }
+                }
             } else if (i.has_dpp) {   // DPP16: real SRC0 in dw1[7:0]; SRC1 stays the dword0 VGPR field
                 i.src[0] = vgpr(i.words[1]); i.src[1] = vgpr(w >> 9); i.n_src = 2;
             } else { i.src[0] = decode_src_field(w & 0x1FFu); i.src[1] = vgpr(w >> 9); i.n_src = 2; }
@@ -446,13 +461,14 @@ void decode_operands(Rdna2Inst& i) {
             // Image op. opcode is 8 bits: MSB in dword0 bit 0, low 7 bits in [24:18] (Table 100:
             // "combine bits zero and 18-24" — dropping bit 0 aliased IMAGE_MSAA_LOAD (128) onto
             // IMAGE_LOAD (0) and the _G16/BVH families onto wrong identities); dmask[11:8];
-            // unorm[12]; dim[5:3]. dword1: VADDR base[7:0]; VDATA base[15:8]; SRSRC (T# base
+            // unorm[12]; GLC[13]; dim[5:3]. dword1: VADDR base[7:0]; VDATA base[15:8]; SRSRC (T# base
             // SGPR, ×4)[20:16]; SSAMP (S# base SGPR, ×4)[25:21].
             // image_sample = opcode 0x20, image_load = 0x00. (Bit layout verified via llvm-mc gfx1030.)
             const uint32_t d1 = i.words[1];
             i.opcode     = ((w & 1u) << 7) | ((w >> 18) & 0x7Fu);
             i.mimg_dmask = (w >> 8)  & 0xFu;
             i.mimg_unorm = (w >> 12) & 0x1u;
+            i.mimg_glc   = (w >> 13) & 0x1u;
             i.mimg_dim   = (w >> 3)  & 0x7u;
             i.dst    = vgpr(d1 >> 8);                         // VDATA (dest base)
             i.src[0] = vgpr(d1 & 0xFFu);                      // VADDR (coord base VGPR)
@@ -540,6 +556,16 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
                 const uint32_t ctrl = (d1 >> 8) & 0x1FFu;
                 if (ctrl < 0x100u && ((d1 >> 28) & 0xFu) == 0xFu && ((d1 >> 24) & 0xFu) == 0xFu &&
                     ((d1 >> 20) & 0xFu) == 0u && ((d1 >> 18) & 1u) == 0u) {
+                    i.has_modifier = false; i.has_dpp = true; i.dpp_ctrl = (uint16_t)ctrl;
+                }
+                // Astro Bot's NGG primitive packer performs two bounded row-right shifts before
+                // v_add_nc_u32. The one-lane vertex model lowers the absent neighbor to zero; admit
+                // only that exact integer-add form with full row/bank masks and BOUND_CTRL=1.
+                else if (vf == Rdna2Format::VOP2 && ((w >> 25) & 0x3Fu) == 0x25u &&
+                         ctrl >= 0x111u && ctrl <= 0x11Fu &&
+                         ((d1 >> 28) & 0xFu) == 0xFu && ((d1 >> 24) & 0xFu) == 0xFu &&
+                         ((d1 >> 20) & 0xFu) == 0u && ((d1 >> 19) & 1u) == 1u &&
+                         ((d1 >> 18) & 1u) == 0u) {
                     i.has_modifier = false; i.has_dpp = true; i.dpp_ctrl = (uint16_t)ctrl;
                 }
             }

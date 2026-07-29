@@ -98,6 +98,36 @@ int main() {
     printf("  (0.75,0.25) center=(%u,%u,%u)\n", ok1?rgb[0]:0, ok1?rgb[1]:0, ok1?rgb[2]:0);
     CHECK(ok1 && rgb[1] > 0x80 && rgb[0] < 0x40 && rgb[2] < 0x40, "sampling texel (1,0) yields GREEN (proves u routing)");
 
+    // Dynamic single-channel textures (notably Astro Bot's FMV planes) stay R8 through upload. The
+    // component mapping reproduces the live frontend's historical coverage broadcast without a 4x
+    // CPU expansion to RGBA8.
+    {
+        std::vector<uint32_t> ps(ps_template, ps_template + sizeof(ps_template)/sizeof(ps_template[0]));
+        ps[1] = C025; ps[3] = C025;
+        std::vector<uint32_t> frag = recompile_fragment(ps.data(), ps.size(), &rt);
+        const uint8_t r8_texels[4] = {32, 96, 160, 224};
+        prosper::test::FrameResource resource;
+        resource.binding = 4; resource.set = 1;
+        resource.tex_rgba = r8_texels; resource.tw = 2; resource.th = 2;
+        resource.texture_format = VK_FORMAT_R8_UNORM;
+        resource.swizzle[0] = resource.swizzle[1] =
+            resource.swizzle[2] = resource.swizzle[3] = 4;
+        prosper::test::BackendDraw draw;
+        draw.vs = vert; draw.fs = frag; draw.R = {resource}; draw.vcount = 3;
+        const std::vector<uint8_t> pixels =
+            prosper::test::render_draws_rgba({draw}, W, H);
+        const uint8_t* center = pixels.size() == static_cast<size_t>(W) * H * 4
+            ? &pixels[(static_cast<size_t>(H / 2) * W + W / 2) * 4] : nullptr;
+        CHECK(center && center[0] >= 31 && center[0] <= 33 &&
+                         center[1] == center[0] && center[2] == center[0],
+              "native R8 sampled upload broadcasts its channel without RGBA expansion");
+        CHECK(prosper::test::backend_color_bytes_per_pixel(VK_FORMAT_R8_UNORM) == 1,
+              "native R8 upload accounts one byte per texel");
+        CHECK(prosper::test::backend_color_format(VK_FORMAT_R32_UINT) == VK_FORMAT_R32_UINT &&
+                  prosper::test::backend_color_bytes_per_pixel(VK_FORMAT_R32_UINT) == 4,
+              "R32_UINT storage images retain their typed four-byte Vulkan format");
+    }
+
     // The live renderer commonly submits hundreds of draws that reference the same few decoded
     // textures. The backend must upload identical pixels once per call while preserving the legacy
     // rendered bytes and separate per-descriptor views/samplers.
@@ -633,6 +663,85 @@ int main() {
             const auto storage_stats = prosper::test::backend_texture_upload_stats();
             CHECK(storage_stats.references == 2 && storage_stats.unique_uploads == 2,
                   "sampled and storage descriptors never share an incompatible image upload");
+        }
+    }
+
+    // Astro Bot's exact IMAGE_ATOMIC_SWAP form. Use a one-pixel target so exactly one fragment
+    // exchanges the R32_UINT word. The callback is the graphics->guest synchronization boundary:
+    // call one returns 0.5 and writes 1.0 to guest-visible storage; call two must then return that 1.0.
+    // This proves both real Vulkan execution and visibility across separate backend calls/CPU memory.
+    {
+        const uint32_t atomic_ps[] = {
+            0x7e000280u,                         // v0 = x = 0
+            0x7e020280u,                         // v1 = y = 0
+            0x7e1202ffu, 0x3f800000u,           // v9 = exchange value (1.0f bits)
+            0xf03c2108u, 0x00000900u,           // image_atomic_swap v9,[v0,v1],s[0:7] glc dmask:x 2D
+            0x7e000280u, 0x7e020309u,           // R=0, G=returned v9
+            0x7e040280u, 0x7e0602f2u,           // B=0, A=1
+            0xf800000fu, 0x03020100u, 0xbf810000u,
+        };
+        ShaderResourceTable atomic_rt;
+        { ShaderResource image{}; image.cls = ResourceClass::StorageImage;
+          image.format = DataFormat::Uint32; image.num_components = 1;
+          image.binding = 4; image.img_dim = 1; image.width = 1; image.height = 1;
+          image.depth = 1; image.sgpr_base = 0; atomic_rt.resources.push_back(image); }
+        const std::vector<uint32_t> atomic_frag = recompile_fragment(
+            atomic_ps, std::size(atomic_ps), &atomic_rt);
+        CHECK(!atomic_frag.empty() && atomic_frag[0] == 0x07230203u,
+              "recompiled Astro image_atomic_swap fragment shader");
+        if (!atomic_frag.empty()) {
+            uint32_t return_word = 0x3f000000u;   // initial 0.5f bits
+            prosper::test::FrameResource resource;
+            resource.binding = 4; resource.set = 1;
+            resource.tex_rgba = reinterpret_cast<const uint8_t*>(&return_word);
+            resource.tw = 1; resource.th = 1;
+            resource.texture_format = VK_FORMAT_R32_UINT;
+            resource.is_storage_image = true;
+            prosper::test::BackendDraw draw;
+            draw.vs = vert; draw.fs = atomic_frag; draw.R = {resource}; draw.vcount = 3;
+            const std::vector<uint8_t> returned =
+                prosper::test::render_draws_rgba({draw}, 1, 1);
+            const uint8_t* returned_pixel = returned.size() == 4 ? returned.data() : nullptr;
+            CHECK(returned_pixel && returned_pixel[1] > 0x60 &&
+                      returned_pixel[1] < 0xa0 && returned_pixel[0] < 0x40 &&
+                      returned_pixel[2] < 0x40,
+                  "R32_UINT image atomic returns the pre-operation 0.5 value to VDATA");
+
+            // Keep the upload source distinct from the callback destination. This prevents the test
+            // from passing merely because a mutable source variable was updated in place.
+            const uint32_t upload_word = 0x3f000000u;
+            uint32_t guest_word = upload_word;
+            resource.tex_rgba = reinterpret_cast<const uint8_t*>(&upload_word);
+            resource.storage_image_writeback =
+                [&](const uint8_t* pixels, size_t bytes) {
+                    if (bytes == sizeof(guest_word))
+                        std::memcpy(&guest_word, pixels, sizeof(guest_word));
+                };
+            draw.vs = vert; draw.fs = atomic_frag; draw.R = {resource}; draw.vcount = 3;
+            constexpr uint64_t storage_target_id = 0x41544f4d49430001ull;
+            prosper::test::BackendColorTarget storage_target{
+                storage_target_id, false, false};
+            prosper::test::BackendSubmissionBatch storage_batch;
+            const std::vector<uint8_t> storage_only =
+                prosper::test::render_draws_rgba(
+                    {draw}, 1, 1, nullptr, nullptr, false, &storage_target,
+                    nullptr, nullptr, nullptr, &storage_batch, false);
+            const auto storage_stats = prosper::test::backend_color_target_stats();
+            printf("  image_atomic_swap storage-only guest=%08x source=%08x\n",
+                   guest_word, upload_word);
+            CHECK(storage_only.empty() && storage_stats.readbacks == 0,
+                  "storage-image synchronization does not rely on a color readback");
+            CHECK(upload_word == 0x3f000000u && guest_word == 0x3f800000u,
+                  "graphics storage-image atomic writes back exact texels to CPU/guest memory");
+            CHECK(!storage_batch.pending(),
+                  "storage-image writeback flushes an otherwise deferred live-render batch");
+            draw.R[0].tex_rgba = reinterpret_cast<const uint8_t*>(&guest_word);
+            const std::vector<uint8_t> second =
+                prosper::test::render_draws_rgba({draw}, 1, 1);
+            const uint8_t* second_pixel = second.size() == 4 ? second.data() : nullptr;
+            CHECK(second_pixel && second_pixel[1] > 0xc0 &&
+                      second_pixel[0] < 0x40 && second_pixel[2] < 0x40,
+                  "a later graphics call observes the prior storage-image writeback");
         }
     }
 

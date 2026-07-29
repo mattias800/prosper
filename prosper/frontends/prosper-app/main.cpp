@@ -11,8 +11,9 @@
 // a real guest frame takes. P0b wires the actual guest boot in front of this (the same present
 // path, no changes here).
 //
-// Two Vulkan contexts by design (docs/FRONTEND_APP.md): the core keeps its headless render device;
-// THIS is a separate presentation device, and frames cross as shared immutable CPU pixels.
+// Real game boots normally adopt the renderer's Vulkan device and pass its front image directly to
+// the swapchain. Test-pattern boots, an explicit override, or failed adoption retain the original
+// two-device path, where frames cross as shared immutable CPU pixels.
 #include "gpu/videoout_present.hpp"   // present_acquire_rendered_frame / present_write_frame
 #include "gpu/gpu_execute.hpp"         // shared_vulkan_context / gpu-present activation (#1270)
 #include "gpu/gpu_capture.hpp"         // request_interactive_gpu_capture (F9 frame grab)
@@ -282,7 +283,9 @@ bool ensure_stage(Vk& vk, uint32_t w, uint32_t h) {
     vk.stageW = w; vk.stageH = h; vk.stageCap = (VkDeviceSize)w * h * 4;
 
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bi.size = vk.stageCap; bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    bi.size = vk.stageCap;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VKCHECK(vkCreateBuffer(vk.device, &bi, nullptr, &vk.stageBuf), "stage buffer");
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(vk.device, vk.stageBuf, &mr);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -314,6 +317,41 @@ void barrier(VkCommandBuffer c, VkImage img, VkImageLayout from, VkImageLayout t
     b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     vkCmdPipelineBarrier(c, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+// A failed queue submit leaves inFlight unsignaled and the acquired-image semaphore unusable for a
+// second acquire. Replace the whole sync trio before asking the main loop to rebuild the swapchain;
+// otherwise the next frame would wait forever on a fence that no submit can signal. The abandoned
+// handles are deliberately retained until process teardown: the acquire signal operation may still
+// be pending, so destroying them here would itself violate Vulkan lifetime rules. This path is rare
+// and bounded by a fatal device/driver error.
+bool replace_present_sync(Vk& vk) {
+    VkSemaphore acquire = VK_NULL_HANDLE;
+    VkSemaphore present = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    VkSemaphoreCreateInfo semi{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    if (vkCreateSemaphore(vk.device, &semi, nullptr, &acquire) != VK_SUCCESS ||
+        vkCreateSemaphore(vk.device, &semi, nullptr, &present) != VK_SUCCESS ||
+        vkCreateFence(vk.device, &fci, nullptr, &fence) != VK_SUCCESS) {
+        if (fence) vkDestroyFence(vk.device, fence, nullptr);
+        if (present) vkDestroySemaphore(vk.device, present, nullptr);
+        if (acquire) vkDestroySemaphore(vk.device, acquire, nullptr);
+        return false;
+    }
+    vk.acquireSem = acquire;
+    vk.presentSem = present;
+    vk.inFlight = fence;
+    return true;
+}
+
+prosper::frontend::PresentAttempt recover_submit_failure(Vk& vk, VkResult result) {
+    fprintf(stderr, "[app] vkQueueSubmit failed (%d); replacing present synchronization\n",
+            static_cast<int>(result));
+    if (replace_present_sync(vk)) return prosper::frontend::PresentAttempt::out_of_date;
+    fprintf(stderr, "[app] could not replace present synchronization; stopping\n");
+    return prosper::frontend::PresentAttempt::failed;
 }
 
 // Interactive frame grab (F9): write a small BGR bottom-up BMP of a presented RGBA frame next to the
@@ -403,15 +441,17 @@ prosper::frontend::PresentAttempt present_frame(Vk& vk, const uint8_t* rgba, uin
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &vk.presentSem;
     pi.swapchainCount = 1; pi.pSwapchains = &vk.swapchain; pi.pImageIndices = &imgIndex;
-    VkResult pr;
+    VkResult submitResult;
+    VkResult pr = VK_SUCCESS;
     {
         // #1270: when this CPU present runs on the renderer's shared queue (the GPU-present miss fallback),
         // serialize the submit + present CALLS against the renderer's submits. No-op on a private device.
         std::unique_lock<std::mutex> lk(gpu::shared_present_submit_mutex(), std::defer_lock);
         if (gpu::shared_present_active()) lk.lock();
-        vkQueueSubmit(vk.queue, 1, &su, vk.inFlight);
-        pr = vkQueuePresentKHR(vk.queue, &pi);
+        submitResult = vkQueueSubmit(vk.queue, 1, &su, vk.inFlight);
+        if (submitResult == VK_SUCCESS) pr = vkQueuePresentKHR(vk.queue, &pi);
     }
+    if (submitResult != VK_SUCCESS) return recover_submit_failure(vk, submitResult);
     return prosper::frontend::classify_present(pr);
 }
 
@@ -461,9 +501,16 @@ bool try_adopt_shared_present(Vk& vk, SDL_Window* win) {
 // GPU read is complete once inFlight signals below, so it is released then. Updates prevSlot to the slot
 // now in flight and returns the acquire/present outcome.
 prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::frontend::GpuScanoutFrame& gf,
-                                                    int& prevSlot) {
+                                                    int& prevSlot, bool requestReadback,
+                                                    bool& readbackReady) {
+    readbackReady = false;
     vkWaitForFences(vk.device, 1, &vk.inFlight, VK_TRUE, UINT64_MAX);   // previous present's read complete
     if (prevSlot >= 0) { prosper::frontend::present_blit_release(prevSlot); prevSlot = -1; }
+    if (requestReadback && !ensure_stage(vk, gf.width, gf.height)) {
+        prosper::frontend::present_blit_release(gf.slot);
+        fprintf(stderr, "[grab] could not allocate the gpu-present readback buffer\n");
+        return prosper::frontend::PresentAttempt::failed;
+    }
 
     uint32_t imgIndex = 0;
     constexpr uint64_t kAcquireTimeoutNs = 100ull * 1000 * 1000;
@@ -492,6 +539,24 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
     blit.dstOffsets[1] = {(int32_t)vk.scExtent.width, (int32_t)vk.scExtent.height, 1};
     vkCmdBlitImage(vk.cmd, gf.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    vk.scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    if (requestReadback) {
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {gf.width, gf.height, 1};
+        vkCmdCopyImageToBuffer(vk.cmd, gf.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               vk.stageBuf, 1, &copy);
+        VkBufferMemoryBarrier hostBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        hostBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        hostBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        hostBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        hostBarrier.buffer = vk.stageBuf;
+        hostBarrier.offset = 0;
+        hostBarrier.size = vk.stageCap;
+        vkCmdPipelineBarrier(vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &hostBarrier,
+                             0, nullptr);
+    }
     barrier(vk.cmd, vk.scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0,
             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
@@ -505,15 +570,31 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &vk.presentSem;
     pi.swapchainCount = 1; pi.pSwapchains = &vk.swapchain; pi.pImageIndices = &imgIndex;
-    VkResult pr;
+    VkResult submitResult;
+    VkResult pr = VK_SUCCESS;
     {
         // Serialize the present submit + present CALL against the renderer's submits on a shared queue.
         std::unique_lock<std::mutex> lk(gpu::shared_present_submit_mutex(), std::defer_lock);
         if (vk.queue_shared) lk.lock();
-        vkQueueSubmit(vk.queue, 1, &su, vk.inFlight);
-        pr = vkQueuePresentKHR(vk.queue, &pi);
+        submitResult = vkQueueSubmit(vk.queue, 1, &su, vk.inFlight);
+        if (submitResult == VK_SUCCESS) pr = vkQueuePresentKHR(vk.queue, &pi);
+    }
+    if (submitResult != VK_SUCCESS) {
+        prosper::frontend::present_blit_release(gf.slot);
+        return recover_submit_failure(vk, submitResult);
     }
     prevSlot = gf.slot;
+    if (requestReadback) {
+        const VkResult waitResult = vkWaitForFences(vk.device, 1, &vk.inFlight, VK_TRUE, UINT64_MAX);
+        if (waitResult != VK_SUCCESS) {
+            fprintf(stderr, "[grab] gpu-present readback wait failed (%d)\n",
+                    static_cast<int>(waitResult));
+            return prosper::frontend::PresentAttempt::failed;
+        }
+        prosper::frontend::present_blit_release(prevSlot);
+        prevSlot = -1;
+        readbackReady = true;
+    }
     return prosper::frontend::classify_present(pr);
 }
 
@@ -974,10 +1055,11 @@ int main(int argc, char** argv) {
     if (!win) { fprintf(stderr, "[app] SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
 
     Vk vk;
-    // Present unification (#1270, opt-in): prefer presenting on the renderer's shared device so we can
-    // GPU-blit its front-buffer image. Only for a real boot (the renderer produces front buffers); the
-    // test pattern and any adoption failure fall back to a private device + CPU pixels (unchanged path).
-    const bool wantGpuPresent = getenv("PROSPER_APP_GPU_PRESENT") != nullptr && !testPattern && !dump.empty();
+    // Present unification (#1270): prefer the renderer's shared device for real game boots so we can
+    // GPU-blit its front-buffer image. The test pattern, PROSPER_APP_GPU_PRESENT=0, and any adoption
+    // failure fall back to a private device + CPU pixels.
+    const bool wantGpuPresent = prosper::frontend::request_gpu_present(
+        getenv("PROSPER_APP_GPU_PRESENT"), testPattern, !dump.empty());
     if (!wantGpuPresent || !try_adopt_shared_present(vk, win)) {
         if (!create_instance(vk, win) || !pick_device(vk)) return 1;
     }
@@ -991,11 +1073,10 @@ int main(int argc, char** argv) {
     VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     cai.commandPool = vk.cmdPool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
     vkAllocateCommandBuffers(vk.device, &cai, &vk.cmd);
-    VkSemaphoreCreateInfo semi{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    vkCreateSemaphore(vk.device, &semi, nullptr, &vk.acquireSem);
-    vkCreateSemaphore(vk.device, &semi, nullptr, &vk.presentSem);
-    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    vkCreateFence(vk.device, &fci, nullptr, &vk.inFlight);
+    if (!replace_present_sync(vk)) {
+        fprintf(stderr, "[app] could not create present synchronization\n");
+        return 1;
+    }
 
     fprintf(stderr, "[app] window up (%s). Close the window or press Esc to quit.\n",
             testPattern ? "test-pattern" : "waiting for guest frames");
@@ -1353,20 +1434,20 @@ int main(int argc, char** argv) {
             // GPU present (#1270): blit the renderer's front-buffer image straight to the swapchain.
             prosper::frontend::GpuScanoutFrame gf;
             if (prosper::frontend::present_blit_acquire(gf)) {
-                PresentAttempt attempt = present_frame_gpu(vk, gf, gpuPrevSlot);
+                bool grabReady = false;
+                PresentAttempt attempt = present_frame_gpu(
+                    vk, gf, gpuPrevSlot, !pendingGrabScreenshot.empty(), grabReady);
+                if (grabReady)
+                    flushGrabScreenshot(static_cast<const uint8_t*>(vk.stageMapped),
+                                        gf.width, gf.height);
                 if (attempt == PresentAttempt::out_of_date) {
                     swapchainDirty = true;
                 } else if (attempt == PresentAttempt::skipped) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                } else if (attempt == PresentAttempt::failed) {
+                    running = false;
                 } else {
                     shown++; lastFrameProgress = std::chrono::steady_clock::now();
-                    // GPU-present mode has no CPU pixels here for the F9 screenshot; drop the pending
-                    // request rather than letting it leak into a later CPU-present-miss frame (the
-                    // .prgbundle oracle is the authoritative image anyway).
-                    if (!pendingGrabScreenshot.empty()) {
-                        std::fprintf(stderr, "[grab] screenshot skipped (gpu-present); use the .prgbundle\n");
-                        pendingGrabScreenshot.clear();
-                    }
                     static auto t0 = std::chrono::steady_clock::now(); static uint64_t mark = 0;
                     if (shown - mark >= 60) {
                         auto now = std::chrono::steady_clock::now();
@@ -1389,6 +1470,7 @@ int main(int argc, char** argv) {
                     if (gpuPrevSlot >= 0) { prosper::frontend::present_blit_release(gpuPrevSlot); gpuPrevSlot = -1; }
                     if (a == PresentAttempt::out_of_date) swapchainDirty = true;
                     else if (a == PresentAttempt::skipped) std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                    else if (a == PresentAttempt::failed) running = false;
                     else { lastFrameSeq = cf.frame_seq; shown++; lastFrameProgress = std::chrono::steady_clock::now();
                            flushGrabScreenshot(cf.rgba->data(), cf.width, cf.height); }
                 } else {
@@ -1414,6 +1496,8 @@ int main(int argc, char** argv) {
                     // Leave lastFrameSeq unchanged so we present the freshest frame once the window is
                     // visible again, and do not mark the swapchain dirty. The guest keeps running.
                     std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                } else if (attempt == PresentAttempt::failed) {
+                    running = false;
                 } else {
                     lastFrameSeq = frame.frame_seq; shown++;
                     lastFrameProgress = std::chrono::steady_clock::now();

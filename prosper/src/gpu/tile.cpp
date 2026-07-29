@@ -9,7 +9,14 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <system_error>
 #include <vector>
+
+#if (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#define PROSPER_HAVE_TARGET_AVX2 1
+#endif
 
 namespace prosper::gpu {
 
@@ -398,7 +405,8 @@ size_t sw64kb_tiled_bytes(uint32_t ew, uint32_t eh, uint32_t pitch, uint32_t bpe
 // threads is race-free. Uses per-call std::thread (not a pool): this gates on large surfaces where the
 // spawn cost is amortized by the 4K detile work, and it avoids any pool-reuse synchronization hazard.
 // Small surfaces and PROSPER_DETILE_SINGLE_THREADED / PROSPER_DETILE_THREADS=1 stay single-threaded;
-// detiling is memory-bandwidth-bound, so the auto thread count is capped low (~8).
+// detiling is memory-bandwidth-bound, so the auto thread count is capped at 16. Astro Bot's 4K
+// surfaces improve from 8 to 16 workers on a 16-core Strix Halo, while 32 regresses.
 inline unsigned detile_row_threads(size_t work_bytes, uint32_t eh) {
     static const int env = [] {
         const char* s = getenv("PROSPER_DETILE_THREADS");
@@ -409,7 +417,7 @@ inline unsigned detile_row_threads(size_t work_bytes, uint32_t eh) {
     if (work_bytes < (size_t)512 * 1024) return 1u;            // small surface: spawn not worth it
     const unsigned hw = std::thread::hardware_concurrency();
     const unsigned want = env > 1 ? std::min((unsigned)env, 32u)   // clamp an over-large override
-                                  : std::min(hw ? hw : 4u, 8u);    // memory-bound -> cap ~8
+                                  : std::min(hw ? hw : 4u, 16u);   // memory-bound -> cap at 16
     const unsigned by_rows = eh / 32u;                             // keep >= 32 rows per thread
     return std::max(1u, std::min(want, by_rows));
 }
@@ -420,16 +428,117 @@ template <class Body>
 inline void parallel_rows(uint32_t eh, unsigned nthreads, Body&& body) {
     if (nthreads <= 1 || eh == 0) { if (eh) body(0u, eh); return; }
     const uint32_t chunk = (eh + nthreads - 1) / nthreads;
-    std::vector<std::thread> ts;
-    ts.reserve(nthreads - 1);
-    for (unsigned i = 1; i < nthreads; i++) {
-        const uint32_t b = i * chunk, e = std::min(eh, b + chunk);
-        if (b >= e) break;
-        ts.emplace_back([&body, b, e] { body(b, e); });
+    // Auto-joining workers keep a partially-created set safe when the OS refuses another thread.
+    // Any ranges that could not get a worker are completed synchronously below.
+    std::vector<std::jthread> workers;
+    workers.reserve(nthreads - 1);
+    unsigned next_worker = 1;
+    try {
+        for (; next_worker < nthreads; ++next_worker) {
+            const uint32_t begin = next_worker * chunk;
+            const uint32_t end = std::min(eh, begin + chunk);
+            if (begin >= end) break;
+            workers.emplace_back([&body, begin, end] { body(begin, end); });
+        }
+    } catch (const std::system_error&) {
+        // Fall through: ranges that did not get a worker run synchronously below.
     }
-    body(0u, std::min(eh, chunk));   // the calling thread runs chunk 0
-    for (auto& t : ts) t.join();
+    body(0u, std::min(eh, chunk));
+    for (; next_worker < nthreads; ++next_worker) {
+        const uint32_t begin = next_worker * chunk;
+        const uint32_t end = std::min(eh, begin + chunk);
+        if (begin >= end) break;
+        body(begin, end);
+    }
 }
+
+inline void copy_swizzled_element(uint8_t* dst, const uint8_t* src, uint32_t bpe) {
+    switch (bpe) {
+        case 1: *dst = *src; break;
+        case 2: std::memcpy(dst, src, 2); break;
+        case 4: std::memcpy(dst, src, 4); break;
+        case 8: std::memcpy(dst, src, 8); break;
+        case 16: std::memcpy(dst, src, 16); break;
+        default: std::memcpy(dst, src, bpe); break;
+    }
+}
+
+inline void zero_swizzled_element(uint8_t* dst, uint32_t bpe) {
+    switch (bpe) {
+        case 1: *dst = 0; break;
+        case 2: std::memset(dst, 0, 2); break;
+        case 4: std::memset(dst, 0, 4); break;
+        case 8: std::memset(dst, 0, 8); break;
+        case 16: std::memset(dst, 0, 16); break;
+        default: std::memset(dst, 0, bpe); break;
+    }
+}
+
+#if defined(PROSPER_HAVE_TARGET_AVX2)
+// A complete 64KB block has no per-element bounds failures. For the dominant element sizes, gather
+// precomputed swizzle offsets and write one contiguous linear span at a time. The low x bit maps to
+// the first address bit above elemLog2 in every supported pattern, so aligned 2/4-byte texel pairs
+// are adjacent in tiled memory and can share one 4/8-byte gather lane. Astro Bot moves about 3.7 GiB
+// of 8-byte, 2.5 GiB of 4-byte, and 580 MiB of 2-byte elements through this path in 120 frames.
+__attribute__((target("avx2")))
+void detile_full_block_row_avx2(uint8_t* dst, const uint8_t* tiled_block,
+                                const uint16_t* x_offsets, uint16_t y_offset,
+                                uint32_t columns, uint32_t bpe) {
+    uint32_t x = 0;
+    const __m128i y = _mm_set1_epi16(static_cast<int16_t>(y_offset));
+    static const bool paired_gathers =
+        std::getenv("PROSPER_NO_PAIRED_AVX2_DETILE") == nullptr;
+    const __m128i even_offsets = _mm_setr_epi8(
+        0, 1, 4, 5, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1);
+    if (bpe == 2 && paired_gathers) {
+        for (; x + 8 <= columns; x += 8) {
+            const __m128i offsets16 = _mm_xor_si128(
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(x_offsets + x)), y);
+            const __m128i pair_offsets16 = _mm_shuffle_epi8(offsets16, even_offsets);
+            const __m128i pair_offsets32 = _mm_cvtepu16_epi32(pair_offsets16);
+            const __m128i values = _mm_i32gather_epi32(
+                reinterpret_cast<const int*>(tiled_block), pair_offsets32, 1);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + static_cast<size_t>(x) * 2),
+                             values);
+        }
+    } else if (bpe == 4 && paired_gathers) {
+        for (; x + 8 <= columns; x += 8) {
+            const __m128i offsets16 = _mm_xor_si128(
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(x_offsets + x)), y);
+            const __m128i pair_offsets16 = _mm_shuffle_epi8(offsets16, even_offsets);
+            const __m256i pair_offsets64 = _mm256_cvtepu16_epi64(pair_offsets16);
+            const __m256i values = _mm256_i64gather_epi64(
+                reinterpret_cast<const long long*>(tiled_block), pair_offsets64, 1);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + static_cast<size_t>(x) * 4),
+                                values);
+        }
+    } else if (bpe == 4) {
+        for (; x + 8 <= columns; x += 8) {
+            const __m128i offsets16 = _mm_xor_si128(
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(x_offsets + x)), y);
+            const __m256i offsets32 = _mm256_cvtepu16_epi32(offsets16);
+            const __m256i values = _mm256_i32gather_epi32(
+                reinterpret_cast<const int*>(tiled_block), offsets32, 1);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + static_cast<size_t>(x) * 4),
+                                values);
+        }
+    } else if (bpe == 8) {
+        for (; x + 4 <= columns; x += 4) {
+            const __m128i offsets16 = _mm_xor_si128(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(x_offsets + x)), y);
+            const __m256i offsets64 = _mm256_cvtepu16_epi64(offsets16);
+            const __m256i values = _mm256_i64gather_epi64(
+                reinterpret_cast<const long long*>(tiled_block), offsets64, 1);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + static_cast<size_t>(x) * 8),
+                                values);
+        }
+    }
+    for (; x < columns; ++x)
+        copy_swizzled_element(dst + static_cast<size_t>(x) * bpe,
+                              tiled_block + (x_offsets[x] ^ y_offset), bpe);
+}
+
+#endif
 
 // The 64KB tiled<->linear walk. The pattern offset is XOR-separable in x and y (each offset bit is
 // parity(x&xm)^parity(y&ym)), so precompute fx[] / fy[] per coordinate and each element's in-block
@@ -441,10 +550,9 @@ void sw64kb_copy(uint8_t* dst, const uint8_t* src, uint32_t ew, uint32_t eh, uin
                  uint32_t bpe, size_t tiled_bytes, uint32_t tile_mode,
                  size_t tiled_origin = 0) {
     uint32_t el = sw64kb_elem_log2(bpe);
-    if (el == UINT32_MAX) {                                    // unsupported bpe -> straight copy
-        size_t n = (size_t)ew * eh * bpe;
-        if (ToTiled) std::memcpy(dst, src, std::min(n, tiled_bytes));
-        else         std::memcpy(dst, src, std::min(n, tiled_bytes));
+    if (el == UINT32_MAX) {
+        const size_t n = (size_t)ew * eh * bpe;
+        std::memcpy(dst, src, std::min(n, tiled_bytes));
         return;
     }
     uint32_t bw = 0, bh = 0; sw64kb_dims(el, bw, bh);
@@ -462,6 +570,99 @@ void sw64kb_copy(uint8_t* dst, const uint8_t* src, uint32_t ew, uint32_t eh, uin
         for (uint32_t i = el; i < 16; i++) v |= (uint32_t)(__builtin_popcount(y & pat[i].y) & 1) << i;
         fy[y] = (uint16_t)v;
     }
+    // Detiling in linear row order revisits every 64KB source block once per output row. A 4K
+    // RGBA16F surface has thirty-four block columns, so that walk cycles through more than 2 MiB
+    // before returning to the next few bytes of any block. Finish one 64KB block at a time instead:
+    // source reads then remain cache-local while each output row still receives a contiguous span.
+    // Split on whole block rows so workers write disjoint output rows and cannot false-share. The
+    // same order also lowers the CPU cost of guest writeback; either direction can be restored to
+    // the older row-major walk independently for diagnosis.
+    static const bool row_major_detile = std::getenv("PROSPER_DETILE_ROW_MAJOR") != nullptr;
+    static const bool row_major_tile = std::getenv("PROSPER_TILE_ROW_MAJOR") != nullptr;
+    if ((!ToTiled && !row_major_detile) || (ToTiled && !row_major_tile)) {
+#if defined(PROSPER_HAVE_TARGET_AVX2)
+        static const bool use_avx2_gather =
+            std::getenv("PROSPER_NO_AVX2_DETILE") == nullptr &&
+            __builtin_cpu_supports("avx2");
+#endif
+            const uint32_t surface_block_rows = (eh + bh - 1) / bh;
+            const uint32_t surface_block_cols = (ew + bw - 1) / bw;
+            static const bool paired_copy =
+                std::getenv("PROSPER_NO_PAIRED_TILE_COPY") == nullptr;
+            auto process_block_rows = [&](uint32_t block_row0, uint32_t block_row1) {
+                for (uint32_t block_y = block_row0; block_y < block_row1; ++block_y) {
+                    const uint32_t y0 = block_y * bh;
+                    const uint32_t rows = std::min(bh, eh - y0);
+                    for (uint32_t block_x = 0; block_x < surface_block_cols; ++block_x) {
+                        const uint32_t x0 = block_x * bw;
+                        const uint32_t columns = std::min(bw, ew - x0);
+                        const uint64_t block =
+                            static_cast<uint64_t>(block_y) * blocks_per_row + block_x;
+                        const uint64_t block_base = tiled_origin + (block << 16);
+                        const bool full_block = block_base <= tiled_bytes &&
+                            tiled_bytes - static_cast<size_t>(block_base) >= 65536u;
+                        for (uint32_t iy = 0; iy < rows; ++iy) {
+                            const uint32_t y = y0 + iy;
+                            const uint16_t y_offset = fy[y];
+                            uint8_t* linear = nullptr;
+                            if constexpr (!ToTiled)
+                                linear = dst + (static_cast<size_t>(y) * ew + x0) * bpe;
+#if defined(PROSPER_HAVE_TARGET_AVX2)
+                            if constexpr (!ToTiled) {
+                                if (full_block && (bpe == 2 || bpe == 4 || bpe == 8)) {
+                                    if (use_avx2_gather) {
+                                        detile_full_block_row_avx2(linear, src + block_base,
+                                                                  fx.data() + x0, y_offset,
+                                                                  columns, bpe);
+                                        continue;
+                                    }
+                                }
+                            }
+#endif
+                            for (uint32_t ix = 0; ix < columns;) {
+                                const uint64_t tiled = block_base + (fx[x0 + ix] ^ y_offset);
+                                // Up through 8-byte elements, x0 is the first swizzle bit above the
+                                // byte-within-element bits. Since block x origins and ix are even,
+                                // the next texel immediately follows this one in both layouts.
+                                uint32_t run = paired_copy && bpe <= 8 && ix + 1 < columns
+                                    ? 2u : 1u;
+                                uint32_t bytes = run * bpe;
+                                // A bounded source can end between otherwise-adjacent texels. Keep
+                                // the first valid element instead of rejecting/zeroing the whole pair;
+                                // the next loop iteration handles the truncated neighbor separately.
+                                if (!full_block && run == 2 &&
+                                    (tiled > tiled_bytes || bytes > tiled_bytes - tiled)) {
+                                    run = 1;
+                                    bytes = bpe;
+                                }
+                                if constexpr (ToTiled) {
+                                    if (full_block ||
+                                        (tiled <= tiled_bytes && bytes <= tiled_bytes - tiled))
+                                        copy_swizzled_element(dst + tiled,
+                                                              src + (static_cast<size_t>(y) * ew +
+                                                                     x0 + ix) * bpe,
+                                                              bytes);
+                                } else {
+                                    if (full_block ||
+                                        (tiled <= tiled_bytes && bytes <= tiled_bytes - tiled))
+                                        copy_swizzled_element(
+                                            linear + static_cast<size_t>(ix) * bpe,
+                                            src + tiled, bytes);
+                                    else
+                                        zero_swizzled_element(
+                                            linear + static_cast<size_t>(ix) * bpe, bytes);
+                                }
+                                ix += run;
+                            }
+                        }
+                    }
+                }
+            };
+            const unsigned threads = std::min(
+                detile_row_threads((size_t)ew * eh * bpe, eh), surface_block_rows);
+            parallel_rows(surface_block_rows, threads, process_block_rows);
+            return;
+    }
     auto process_rows = [&](uint32_t y0, uint32_t y1) {
         for (uint32_t y = y0; y < y1; y++) {
             uint64_t brow = (uint64_t)(y / bh) * blocks_per_row;
@@ -469,9 +670,15 @@ void sw64kb_copy(uint8_t* dst, const uint8_t* src, uint32_t ew, uint32_t eh, uin
                 uint64_t t = tiled_origin +
                              (((brow + x / bw) << 16) | (uint32_t)(fx[x] ^ fy[y]));
                 size_t   l = ((size_t)y * ew + x) * bpe;
-                if (ToTiled) { if (t + bpe <= tiled_bytes) std::memcpy(dst + t, src + l, bpe); }
-                else         { if (t + bpe <= tiled_bytes) std::memcpy(dst + l, src + t, bpe);
-                               else                        std::memset(dst + l, 0, bpe); }
+                if (ToTiled) {
+                    if (t + bpe <= tiled_bytes)
+                        copy_swizzled_element(dst + t, src + l, bpe);
+                } else {
+                    if (t + bpe <= tiled_bytes)
+                        copy_swizzled_element(dst + l, src + t, bpe);
+                    else
+                        zero_swizzled_element(dst + l, bpe);
+                }
             }
         }
     };

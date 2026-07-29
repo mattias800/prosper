@@ -49,6 +49,34 @@ static size_t count_spirv_opcode(const std::vector<uint32_t>& spv, uint16_t opco
     }
     return matches;
 }
+static bool has_spirv_builtin(const std::vector<uint32_t>& spv, uint32_t builtin) {
+    constexpr uint16_t OpDecorate = 71;
+    constexpr uint32_t DecorationBuiltIn = 11;
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        if (!count || word + count > spv.size()) return false;
+        if ((spv[word] & 0xFFFFu) == OpDecorate && count >= 4 &&
+            spv[word + 2] == DecorationBuiltIn && spv[word + 3] == builtin)
+            return true;
+        word += count;
+    }
+    return false;
+}
+static bool has_spirv_local_size(const std::vector<uint32_t>& spv,
+                                 uint32_t x, uint32_t y, uint32_t z) {
+    constexpr uint16_t OpExecutionMode = 16;
+    constexpr uint32_t ExecutionModeLocalSize = 17;
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        if (!count || word + count > spv.size()) return false;
+        if ((spv[word] & 0xFFFFu) == OpExecutionMode && count == 6 &&
+            spv[word + 2] == ExecutionModeLocalSize && spv[word + 3] == x &&
+            spv[word + 4] == y && spv[word + 5] == z)
+            return true;
+        word += count;
+    }
+    return false;
+}
 
 int main() {
     printf("== test_rdna2_to_spirv ==\n");
@@ -132,6 +160,31 @@ int main() {
     uint32_t bad4 = 0; for (uint32_t i=0;i<N&&got4.size()==N;i++) if (std::fabs(got4[i]-exp4[i])>1e-3f) bad4++;
     printf("  kernel4 mismatches=%u (out[60]=%g expect=%g)\n", bad4, got4.size()==N?got4[60]:-1, exp4[60]);
     CHECK(got4.size()==N && bad4==0, "recompiled kernel 4 computes ceil(median(a0,a1,a2)) correctly");
+
+    // Kernel 4b: unsigned median-of-three. Convert the float harness inputs to u32, find the
+    // median, and convert it back so all six input orderings are checked by real Vulkan execution.
+    const uint32_t code4b[] = {
+        0x7E000F00u, 0x7E020F01u, 0x7E040F02u, 0xD5590003u, 0x040A0300u,
+        0x7E000D03u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv4b = recompile_valu(code4b, std::size(code4b), 3, 0);
+    CHECK(!spv4b.empty(), "recompiled kernel 4b (v_med3_u32) -> SPIR-V");
+    std::vector<float> in4b(N * 3), exp4b(N);
+    for (uint32_t i = 0; i < N; i++) {
+        const uint32_t u0 = (i * 37u) % 211u;
+        const uint32_t u1 = (i * 83u + 17u) % 211u;
+        const uint32_t u2 = (i * 19u + 101u) % 211u;
+        in4b[i*3+0] = (float)u0; in4b[i*3+1] = (float)u1; in4b[i*3+2] = (float)u2;
+        const uint32_t mn = std::min(u0, u1), mx = std::max(u0, u1);
+        exp4b[i] = (float)std::max(mn, std::min(mx, u2));
+    }
+    std::vector<float> got4b = prosper::test::run_compute(spv4b, in4b, N, N);
+    uint32_t bad4b = 0;
+    for (uint32_t i = 0; i < N && got4b.size() == N; i++)
+        if (got4b[i] != exp4b[i]) bad4b++;
+    printf("  kernel4b mismatches=%u (out[60]=%g expect=%g)\n",
+           bad4b, got4b.size()==N ? got4b[60] : -1, exp4b[60]);
+    CHECK(got4b.size()==N && bad4b==0, "recompiled kernel 4b computes unsigned median correctly");
 
     // Kernel 5: unsigned min/max/sub/not/and. u=(uint)a; d=(max-min) & ~u0. out=(float)d.
     const uint32_t code5[] = {
@@ -484,6 +537,24 @@ int main() {
            got17d.size()==N?got17d[127]:-1);
     CHECK(got17d.size()==N && bad17d==0,
           "CFG dispatcher emulates a 64-lane wave across narrower Vulkan subgroups");
+    ComputeShaderConfig native_cfg17d;
+    native_cfg17d.local_x = 8;
+    native_cfg17d.local_y = 8;
+    native_cfg17d.wave_size = 64;
+    native_cfg17d.native_subgroup_size = 64;
+    const std::vector<uint32_t> native_spv17d = recompile_compute(
+        code17d, std::size(code17d), nullptr, native_cfg17d);
+    CHECK(!native_spv17d.empty() && count_spirv_opcode(native_spv17d, 335) >= 2,
+          "exact-wave CFG dispatcher lowers votes and liveness to native subgroup-any");
+    CHECK(count_spirv_opcode(native_spv17d, 224) == 0,
+          "exact-wave CFG dispatcher emits no workgroup control barrier");
+    CHECK(has_spirv_builtin(native_spv17d, 40) &&
+              has_spirv_builtin(native_spv17d, 41) &&
+              count_spirv_opcode(native_spv17d, 134) >= 2 &&
+              count_spirv_opcode(native_spv17d, 137) >= 2,
+          "exact-wave compute remaps local coordinates in full-subgroup lane order");
+    CHECK(has_spirv_local_size(native_spv17d, 64, 1, 1),
+          "multidimensional guest wave flattens Vulkan LocalSize X for full subgroups");
 
     // Kernel 17d2: Astro's mask-priority sequence compares a VOPC-produced SGPR pair against zero,
     // then uses that wave-uniform SCC in s_cselect_b64.  Keep the irreducible prefix so this exercises
@@ -538,6 +609,11 @@ int main() {
         if (std::fabs(got17e[i] - static_cast<float>(i % 64)) > 1e-3f) ++bad17e;
     CHECK(got17e.size() == N && bad17e == 0,
           "#825: CFG dispatcher synchronizes MBCNT across each emulated wave64");
+    const std::vector<uint32_t> native_spv17e = recompile_compute(
+        code17e, std::size(code17e), nullptr, native_cfg17d);
+    CHECK(!native_spv17e.empty() && count_spirv_opcode(native_spv17e, 349) >= 1 &&
+              count_spirv_opcode(native_spv17e, 224) == 0,
+          "exact-wave CFG MBCNT uses subgroup scans without workgroup barriers");
 
     // Kernel 17f: DS_APPEND in the same generic dispatcher. The LDS initial value is intentionally
     // unspecified; this test verifies that the generated module executes to completion with the
@@ -555,6 +631,11 @@ int main() {
     std::vector<float> got17f = prosper::test::run_compute(spv17f, in17d, N, N);
     CHECK(got17f.size() == N,
           "#825: Vulkan executes dispatcher DS_APPEND with uniform barriers");
+    const std::vector<uint32_t> native_spv17f = recompile_compute(
+        code17f, std::size(code17f), nullptr, native_cfg17d);
+    CHECK(!native_spv17f.empty() && count_spirv_opcode(native_spv17f, 349) >= 3 &&
+              count_spirv_opcode(native_spv17f, 224) == 0,
+          "exact-wave CFG DS_APPEND uses subgroup reduction/broadcast without barriers");
 
     // Kernel 18: the REAL if-then idiom with a forward branch. v3=7; vcc=(u0>u1);
     // s_and_saveexec_b64 s[0:1],vcc (save exec, exec=vcc); s_cbranch_execz skip (forward -> no-op);
@@ -1289,6 +1370,32 @@ int main() {
       printf("  kernel29 mismatches=%u (buf[5]=%g expect=10)\n", bad29, f5); }
     CHECK(stored_out.size() == N && bad29 == 0, "recompiled kernel 29 (MUBUF store writes buffer[gid]=2*gid) correct");
 
+    // Astro Bot world-map PS exact final MUBUF packet. Every lane writes three consecutive raw
+    // dwords to one 12-byte record, proving both the unusual x3 component count and IDXEN stride.
+    const uint32_t code29x3[] = {
+        0x7e140f00u,                         // v10 = (uint)v0 = invocation index
+        0x7e060281u, 0x7e080282u, 0x7e0a0283u, // v3/v4/v5 = 1/2/3
+        0xe07c2000u, 0x8004030au,           // exact Astro buffer_store_dwordx3 packet
+        0xbf810000u,
+    };
+    ShaderResourceTable rt29x3;
+    { ShaderResource dst{}; dst.cls = ResourceClass::ConstantBuffer;
+      dst.format = DataFormat::Uint32; dst.num_components = 1;
+      dst.binding = 3; dst.stride = 12; dst.sgpr_base = 16;
+      rt29x3.resources.push_back(dst); }
+    std::vector<uint32_t> spv29x3 = recompile_valu(
+        code29x3, std::size(code29x3), 1, 0, &rt29x3);
+    CHECK(!spv29x3.empty(),
+          "recompiled exact Astro buffer_store_dwordx3 packet -> SPIR-V");
+    std::vector<uint32_t> stored29x3(N * 3, 0u), stored29x3_out;
+    prosper::test::run_compute(spv29x3, in29, N, N, {}, stored29x3, &stored29x3_out);
+    uint32_t bad29x3 = 0;
+    for (uint32_t lane = 0; lane < N && stored29x3_out.size() == N * 3; ++lane)
+        for (uint32_t component = 0; component < 3; ++component)
+            bad29x3 += stored29x3_out[lane * 3 + component] != component + 1;
+    CHECK(stored29x3_out.size() == N * 3 && bad29x3 == 0,
+          "buffer_store_dwordx3 writes all three dwords of every indexed record");
+
     const uint32_t code29mt[] = {
         0x7e040f00u, 0x06060100u, 0xe8b42000u, 0x80020302u, 0xbf810000u,
     };
@@ -1393,6 +1500,78 @@ int main() {
     std::vector<float> got32b2 = prosper::test::run_compute(spv32b2, std::vector<float>(1), 1, 1);
     CHECK(got32b2.size()==1 && std::fabs(got32b2[0]-10.0f)<1e-3f,
           "kernel 32b2 DS_READ2_B32 applies both packed dword offsets exactly");
+
+    // Kernel 32b2w: Astro Bot's world-map reduction pairs that read with DS_WRITE2_B32. Use its
+    // exact offset0/1=(0,1), DATA0=v2, DATA1=v1 instruction, then expose OFFSET0 alone. A
+    // position-sensitive result proves DATA0/DATA1 are not swapped or treated as one VGPR pair.
+    const uint32_t code32b2w[] = {
+        0x7e000280u, 0x7e020281u, 0x7e040282u,
+        0xd8380100u, 0x00010200u, 0xbf8a0000u,
+        0xd8dc0100u, 0x03000000u,
+        0x7e0a0d03u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32b2w = recompile_valu(
+        code32b2w, std::size(code32b2w), 0, 5);
+    CHECK(!spv32b2w.empty(), "recompiled kernel 32b2w (Astro DS_WRITE2_B32 word) -> SPIR-V");
+    std::vector<float> got32b2w = prosper::test::run_compute(
+        spv32b2w, std::vector<float>(1), 1, 1);
+    CHECK(got32b2w.size()==1 && std::fabs(got32b2w[0]-2.0f)<1e-3f,
+          "kernel 32b2w DS_WRITE2_B32 keeps DATA0 at packed OFFSET0");
+
+    // Equal offsets are one access, not two ordered writes: DATA0 wins and DATA1 is ignored.
+    const uint32_t code32b2weq[] = {
+        0x7e000280u, 0x7e020281u, 0x7e040282u,
+        0xd8380000u, 0x00010200u, 0xbf8a0000u,
+        0xd8d80000u, 0x03000000u,
+        0x7e0a0d03u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32b2weq = recompile_valu(
+        code32b2weq, std::size(code32b2weq), 0, 5);
+    CHECK(!spv32b2weq.empty(),
+          "recompiled kernel 32b2weq (DS_WRITE2_B32 equal offsets) -> SPIR-V");
+    std::vector<float> got32b2weq = prosper::test::run_compute(
+        spv32b2weq, std::vector<float>(1), 1, 1);
+    CHECK(got32b2weq.size()==1 && std::fabs(got32b2weq[0]-2.0f)<1e-3f,
+          "kernel 32b2weq equal offsets perform one DATA0 access");
+
+    // Kernel 32b2a: Astro Bot's large world-map compute program spills each wave lane through
+    // DS_WRITE_ADDTID_B32 and reloads it with DS_READ_ADDTID_B32. Unique per-lane input values prove
+    // the translation uses lane*4 rather than racing every invocation through one LDS dword.
+    const uint32_t code32b2a[] = {
+        0xb07c0000u,                // s_movk_i32 m0, 0
+        0xdac00700u, 0x00000000u,   // ds_write_addtid_b32 v0 offset:0x700
+        0xbf8a0000u,                // s_barrier
+        0xdac40700u, 0x01000000u,   // ds_read_addtid_b32 v1 offset:0x700
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32b2a = recompile_valu(
+        code32b2a, std::size(code32b2a), 1, 1);
+    CHECK(!spv32b2a.empty(),
+          "recompiled kernel 32b2a (Astro DS_WRITE/READ_ADDTID_B32 words) -> SPIR-V");
+    std::vector<float> in32b2a(64);
+    for (uint32_t i = 0; i < in32b2a.size(); ++i) in32b2a[i] = 1000.0f + (float)i;
+    std::vector<float> got32b2a = prosper::test::run_compute(
+        spv32b2a, in32b2a, (uint32_t)in32b2a.size(), (uint32_t)in32b2a.size());
+    CHECK(got32b2a == in32b2a,
+          "kernel 32b2a ADDTID round-trips every lane through its own LDS dword");
+
+    // ADDTID addresses use only M0[15:0]. Cross-check the write against an ordinary DS read so the
+    // test cannot pass merely because ADDTID write and read share the same incorrect formula.
+    const uint32_t code32b2amw[] = {
+        0xbefc03ffu, 0x00010000u,   // s_mov_b32 m0, 0x10000 (low 16 bits are zero)
+        0xdac00700u, 0x00000000u,   // ds_write_addtid_b32 v0 offset:0x700
+        0xbf8a0000u,
+        0x7e0402ffu, 0x00000700u,   // v_mov_b32 v2, 0x700
+        0xd8d80000u, 0x01000002u,   // ds_read_b32 v1, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32b2amw = recompile_valu(
+        code32b2amw, std::size(code32b2amw), 1, 1);
+    CHECK(!spv32b2amw.empty(), "recompiled kernel 32b2amw (ADDTID write M0 mask) -> SPIR-V");
+    std::vector<float> got32b2amw = prosper::test::run_compute(
+        spv32b2amw, std::vector<float>{1234.0f}, 1, 1);
+    CHECK(got32b2amw == std::vector<float>{1234.0f},
+          "kernel 32b2amw masks M0 to 16 bits before ADDTID write");
 
     // Kernel 32b3: three other exact words from Astro's loading compute shaders. V_MUL_U32_U24
     // must mask both operands to 24 bits, while V_CVT_FLR_I32_F32 must round negative values toward
@@ -1889,6 +2068,47 @@ int main() {
     printf("  kernel37 mismatches=%u (out[5]=%g expect=%g)\n", bad37, got37.size()==N?got37[5]:-1, exp37[5]);
     CHECK(got37.size()==N && bad37==0, "recompiled kernel 37 (s_movk_i32 -100) computes a0-100");
 
+    // Astro Bot's world-map material kernel scales a scalar-table index with this exact SOPK word.
+    // VCC_LO is used as ordinary scalar data here; 3*276 must survive as the following VALU source.
+    const uint32_t code37m[] = {
+        0xbeea03ffu, 0x00000003u,   // s_mov_b32 vcc_lo, 3
+        0xb86a0114u,                // s_mulk_i32 vcc_lo, 276
+        0x7e000a6au,                // v_cvt_f32_u32 v0, vcc_lo
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv37m = recompile_valu(
+        code37m, std::size(code37m), 0, 0);
+    CHECK(!spv37m.empty(), "recompiled kernel 37m (Astro s_mulk_i32 word) -> SPIR-V");
+    std::vector<float> got37m = prosper::test::run_compute(
+        spv37m, std::vector<float>(1), 1, 1);
+    CHECK(got37m.size()==1 && got37m[0]==828.0f,
+          "kernel 37m multiplies scalar data by the signed SOPK immediate exactly");
+
+    // Kernel 37a: s_cmpk_le_u32 compares the SGPR named by SOPK's SDST field against the raw
+    // unsigned 16-bit immediate and writes SCC without changing that SGPR. Cover both sides of the
+    // 0xffff boundary used by Astro Bot's NGG primitive-count setup.
+    const uint32_t code37a_true[] = {
+        0xB000007Bu, 0xB700FFFFu, 0x850287AAu, 0x7E000C02u, 0xBF810000u,
+    };
+    const uint32_t code37a_false[] = {
+        0xB000FFFFu, 0xB700FFFFu, 0x850287AAu, 0x7E000C02u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv37a_true = recompile_valu(
+        code37a_true, std::size(code37a_true), 1, 0);
+    std::vector<uint32_t> spv37a_false = recompile_valu(
+        code37a_false, std::size(code37a_false), 1, 0);
+    CHECK(!spv37a_true.empty() && !spv37a_false.empty(),
+          "recompiled kernel 37a (s_cmpk_le_u32, both SCC paths) -> SPIR-V");
+    std::vector<float> got37a_true = prosper::test::run_compute(spv37a_true, in37, N, N);
+    std::vector<float> got37a_false = prosper::test::run_compute(spv37a_false, in37, N, N);
+    uint32_t bad37a = 0;
+    for (uint32_t i=0;i<N&&got37a_true.size()==N;i++)
+        if (got37a_true[i] != 42.0f) bad37a++;
+    for (uint32_t i=0;i<N&&got37a_false.size()==N;i++)
+        if (got37a_false[i] != 7.0f) bad37a++;
+    CHECK(got37a_true.size()==N && got37a_false.size()==N && bad37a==0,
+          "kernel 37a: s_cmpk_le_u32 treats 0xffff as unsigned and drives s_cselect");
+
     // Astro Bot's loading composite starts with s_brev_b32 s16,1 to construct 0x80000000.
     // AMD ISA 70648 also specifies that S_BREV does not set SCC. Seed SCC=true, reverse bit 0,
     // then select the reversed value through SCC so the test covers both contracts.
@@ -1974,6 +2194,21 @@ int main() {
     uint32_t bad42 = 0; for (uint32_t i=0;i<N&&got42.size()==N;i++) if (std::fabs(got42[i]-268435456.0f)>16.0f) bad42++;
     printf("  kernel42 mismatches=%u (out[5]=%g expect=268435456)\n", bad42, got42.size()==N?got42[5]:-1);
     CHECK(got42.size()==N && bad42==0, "recompiled kernel 42 (s_mul_hi_u32) computes hi(2^60)=2^28");
+
+    // Astro Bot's NGG primitive packer combines two 16-bit population counts with
+    // s_pack_ll_b32_b16. Pack 1 and 2 -> 0x00020001, then convert to an exactly representable f32.
+    const uint32_t code42b[] = {
+        0xB0000001u, 0xB0010002u, 0x99020100u, 0x7E000C02u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv42b = recompile_valu(
+        code42b, sizeof(code42b) / sizeof(code42b[0]), 0, 0);
+    CHECK(!spv42b.empty(), "recompiled kernel 42b (s_pack_ll_b32_b16) -> SPIR-V");
+    std::vector<float> got42b = prosper::test::run_compute(spv42b, in42, N, N);
+    uint32_t bad42b = 0;
+    for (uint32_t i = 0; i < N && got42b.size() == N; ++i)
+        if (got42b[i] != 131073.0f) ++bad42b;
+    CHECK(got42b.size() == N && bad42b == 0,
+          "s_pack_ll_b32_b16 packs {S1.low16,S0.low16}");
 
     // Kernel 43: a real COUNTED LOOP reconstructed as structured SPIR-V (OpLoopMerge + OpPhi for the
     //   loop-carried s0 and v1). sum=0; for (i=0; i<5; i++) sum+=i;  =>  sum = 0+1+2+3+4 = 10.
