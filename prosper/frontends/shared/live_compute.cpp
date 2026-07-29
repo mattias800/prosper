@@ -3765,8 +3765,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (!r->host_data && r->gpu_addr)
                 prosper::host::guest_write_watch_notify_host_write(
                     r->gpu_addr, bi.guest_bytes);
+            static const bool direct_tiled_writeback_disabled =
+                std::getenv("PROSPER_NO_DIRECT_TILED_WRITEBACK") != nullptr;
             const bool tile_mapped_bytes = storage_writeback_can_tile_mapped_bytes(
-                bi.native_float_storage, r->tile_mode, bi.poison_verify);
+                bi.native_float_storage, r->tile_mode, bi.poison_verify,
+                direct_tiled_writeback_disabled);
             std::unique_ptr<uint8_t[]> linear;
             uint8_t* packed = destination;
             if (r->tile_mode && !tile_mapped_bytes) {

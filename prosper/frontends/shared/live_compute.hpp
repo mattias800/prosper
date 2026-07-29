@@ -32,8 +32,9 @@ void storage_pack_float16x4_range(const uint32_t* channels, size_t texels, uint8
 // poison-proving dispatch still needs a mutable linear copy to restore untouched texels.
 constexpr bool storage_writeback_can_tile_mapped_bytes(bool native_float_storage,
                                                        uint32_t tile_mode,
-                                                       bool poison_verify) {
-    return native_float_storage && tile_mode != 0 && !poison_verify;
+                                                       bool poison_verify,
+                                                       bool disabled) {
+    return native_float_storage && tile_mode != 0 && !poison_verify && !disabled;
 }
 
 // Whether a sampled guest view can bind a renderer-owned target without a CPU readback/conversion.
