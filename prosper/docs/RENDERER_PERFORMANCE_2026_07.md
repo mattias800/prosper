@@ -139,6 +139,24 @@ than a repeatable speedup. This is therefore primarily a memory/capacity improve
 frame-rate claim. Dirty or unknown watches deliberately re-decode rather than using a hash, and
 `PROSPER_KEEP_TEXTURE_SOURCE_SNAPSHOTS=1` restores the control behavior for audit/performance comparisons.
 
+## Plucky Squire unused descriptor materialization (2026-07-29)
+
+A later MainLevel probe found repeated 16-24 ms buffer-resource spikes even though the backend never
+consumed the affected binding. The guest fold had conservatively retained a broad original V# with an
+absurd 0xffffffff-byte declaration, while the final recompiler emitted separate pc-specific scalar
+bindings for every actual access. SPIR-V reflection consequently reported binding 32 as an unused runtime
+extra and bindings 33-52 as the shader's statically used interface. The frontend nevertheless built every
+runtime table entry, probing and zero-allocating the full 64 MiB corrupt-descriptor safety ceiling once per
+draw. Other invalid candidates at addresses zero and four took the same fallback.
+
+The live renderer now materializes only bindings present in the final reflected SPIR-V interface. This is
+not a size heuristic: used dynamic buffers still retain their complete declared range, including the
+multi-megabyte Blue Prince streams from #1427. A definitely unmapped used buffer keeps the established
+all-zero semantics in a small reflection-sized robust buffer instead of allocating its corrupt declaration.
+The same scripted diagnostic still recovered the pathological runtime descriptors, but emitted zero slow
+buffer materializations after the change. A full-resolution Plucky replay retained output hash
+`1c5241d9475e752d`, and its before/after BMP files were byte-identical.
+
 ## Cobra Float32 sampled-texture retention (2026-07-25)
 
 Cobra's title and cinematic repeatedly sample large guest-backed Float32 post-process inputs. The live

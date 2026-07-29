@@ -421,6 +421,12 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     SpirvShaderStage expected_stage,
     bool report_unused = true);
 
+// Locate one binding in the reflected, statically-used descriptor interface. Runtime tables can
+// retain descriptor candidates recovered while folding the guest shader even when the final SPIR-V
+// does not reference them; consumers should not materialize those unused candidates.
+const SpirvDescriptorBinding* find_spirv_descriptor_binding(
+    const DescriptorValidationReport& report, uint32_t set, uint32_t binding);
+
 const char* spirv_descriptor_kind_name(SpirvDescriptorKind kind);
 const char* descriptor_issue_name(DescriptorIssueCode code);
 

@@ -1255,6 +1255,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     prosper::gpu::validate_spirv_descriptor_interface(
                         spirv, t, set, stage, false);
                 for (auto& r : t->resources) {
+                    const prosper::gpu::SpirvDescriptorBinding* reflected_binding =
+                        prosper::gpu::find_spirv_descriptor_binding(
+                            reflected, set, r.binding);
+                    // The front half deliberately retains every descriptor candidate it can prove
+                    // while folding guest code. The final recompiler can use only a subset (for
+                    // example, pc-specific scalar loads supersede the original broad V#). Extra
+                    // runtime bindings are harmless to validation, but materializing one absurd
+                    // unused declaration can allocate and zero the 64 MiB safety ceiling per draw.
+                    // The generated SPIR-V is authoritative about which bindings the backend needs.
+                    if (!reflected_binding) continue;
                     const auto resource_timing_start = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
                     bool resource_rtt_hit = false;
@@ -1264,21 +1274,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     bool resource_persistent_miss = false;
                     bool resource_persistent_invalidation = false;
                     bool resource_buffer_view = false;
+                    double resource_buffer_probe_ms = 0.0;
+                    double resource_buffer_copy_ms = 0.0;
                     prosper::test::FrameResource fr; fr.binding = r.binding; fr.set = set;
                     fr.is_storage_image = r.cls == RC::StorageImage;
-                    const auto reflected_binding = std::find_if(
-                        reflected.descriptors.begin(), reflected.descriptors.end(),
-                        [&](const auto& descriptor) {
-                            return descriptor.set == set && descriptor.binding == r.binding;
-                        });
                     const bool normalized_sampling =
-                        reflected_binding != reflected.descriptors.end() &&
                         reflected_binding->kind ==
                             prosper::gpu::SpirvDescriptorKind::CombinedImageSampler &&
                         reflected_binding->normalized_sampling &&
                         !reflected_binding->texel_access;
                     const bool writable_storage_image =
-                        reflected_binding != reflected.descriptors.end() &&
                         reflected_binding->kind ==
                             prosper::gpu::SpirvDescriptorKind::StorageImage &&
                         reflected_binding->writable;
@@ -3109,14 +3114,36 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                         set, r.binding, (unsigned long long)r.gpu_addr,
                                         requested_bytes, nb);
                         }
-                        if (use_direct_buffer_views && nb >= 4) {
+                        // A definitely unmapped source cannot contribute a byte. Preserve the
+                        // renderer's established all-zero fallback without allocating/probing the
+                        // descriptor's potentially corrupt declared size; robust buffer access makes
+                        // accesses beyond this minimum zero as well. Static reflection tells us how
+                        // much in-bounds storage the shader can definitely address.
+                        const bool unavailable_guest_buffer = !r.host_data &&
+                            (r.gpu_addr < 0x1000 ||
+                             prosper_reserved_range_state(r.gpu_addr) == 0);
+                        if (unavailable_guest_buffer) {
+                            const uint64_t minimum_bytes = std::min<uint64_t>(
+                                std::max<uint64_t>(reflected_binding->required_bytes, 256u),
+                                kMaxBufferUploadBytes);
+                            fr.dwords.assign(static_cast<size_t>((minimum_bytes + 3u) / 4u), 0);
+                        } else if (use_direct_buffer_views && nb >= 4) {
+                            const auto probe_start = timing_enabled
+                                ? RenderClock::now() : RenderClock::time_point{};
                             if (const uint8_t* source = direct_resource(r.gpu_addr, nb)) {
                                 fr.dwords_view = reinterpret_cast<const uint32_t*>(source);
                                 fr.dwords_view_count = nb / sizeof(uint32_t);
                                 resource_buffer_view = true;
                             }
+                            if (timing_enabled)
+                                resource_buffer_probe_ms =
+                                    std::chrono::duration<double, std::milli>(
+                                        RenderClock::now() - probe_start).count();
                         }
-                        if (!fr.dwords_view_count && use_direct_buffer_views) {
+                        const auto copy_start = timing_enabled
+                            ? RenderClock::now() : RenderClock::time_point{};
+                        if (!unavailable_guest_buffer && !fr.dwords_view_count &&
+                            use_direct_buffer_views) {
                             if (nb >= 4) {
                                 fr.dwords.assign(nb / sizeof(uint32_t), 0);
                                 if (!copy_resource(reinterpret_cast<uint8_t*>(fr.dwords.data()),
@@ -3124,7 +3151,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     fr.dwords.clear();
                             }
                             if (fr.dwords.empty()) fr.dwords.assign(64, 0);
-                        } else if (!use_direct_buffer_views) {
+                        } else if (!unavailable_guest_buffer && !use_direct_buffer_views) {
                             if (nb >= 4) {
                                 std::vector<uint8_t> tmp(nb, 0);
                                 if (copy_resource(tmp.data(), r.gpu_addr, nb) > 0)
@@ -3134,6 +3161,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             }
                             if (fr.dwords.empty()) fr.dwords.assign(64, 0);
                         }
+                        if (timing_enabled)
+                            resource_buffer_copy_ms = std::chrono::duration<double, std::milli>(
+                                RenderClock::now() - copy_start).count();
                         if (const char* mode = getenv("PROSPER_RENDER_TIMING");
                             mode && strcmp(mode, "detail") == 0) {
                             const uint64_t detail_min_submit =
@@ -3147,11 +3177,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             if (static_cast<uint64_t>(g_this_submit) >= detail_min_submit &&
                                 elapsed >= 0.5 && detail_buffer_lines++ < 250) {
                                 fprintf(stderr,
-                                        "[render-timing] buffer addr=0x%llx declared=%u "
-                                        "uploaded=%u class=%u direct=%d %.2f ms\n",
+                                        "[render-timing] buffer draw=%llu set=%u binding=%u "
+                                        "addr=0x%llx declared=%u uploaded=%u class=%u direct=%d "
+                                        "probe=%.2f copy=%.2f total=%.2f ms\n",
+                                        (unsigned long long)draw.draw_index, set, r.binding,
                                         (unsigned long long)r.gpu_addr, requested_bytes, nb,
                                         static_cast<unsigned>(r.cls),
-                                        static_cast<int>(resource_buffer_view), elapsed);
+                                        static_cast<int>(resource_buffer_view),
+                                        resource_buffer_probe_ms, resource_buffer_copy_ms, elapsed);
                             }
                         }
                         // PROSPER_CBLOG: log each constant buffer's first 4 dwords as floats, once per

@@ -453,6 +453,9 @@ int main() {
     auto ur = validate_spirv_descriptor_interface(spv, &extra, 0, SpirvShaderStage::Vertex);
     CHECK(ur.ok() && has_issue(ur, DescriptorIssueCode::UnusedRuntimeBinding),
           "unused runtime binding is reported as a non-fatal warning");
+    CHECK(find_spirv_descriptor_binding(ur, 0, good.binding) != nullptr &&
+              find_spirv_descriptor_binding(ur, 0, unused.binding) == nullptr,
+          "reflected binding lookup distinguishes shader-used resources from runtime extras");
 
     auto setr = validate_spirv_descriptor_interface(spv, &valid, 1, SpirvShaderStage::Fragment);
     CHECK(!setr.ok() && has_issue(setr, DescriptorIssueCode::SetMismatch) &&

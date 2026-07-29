@@ -434,6 +434,16 @@ bool DescriptorValidationReport::ok() const {
     return true;
 }
 
+const SpirvDescriptorBinding* find_spirv_descriptor_binding(
+    const DescriptorValidationReport& report, uint32_t set, uint32_t binding) {
+    const auto found = std::find_if(
+        report.descriptors.begin(), report.descriptors.end(),
+        [&](const SpirvDescriptorBinding& descriptor) {
+            return descriptor.set == set && descriptor.binding == binding;
+        });
+    return found == report.descriptors.end() ? nullptr : &*found;
+}
+
 const char* spirv_descriptor_kind_name(SpirvDescriptorKind kind) {
     switch (kind) {
         case SpirvDescriptorKind::StorageBuffer:        return "storage-buffer";
