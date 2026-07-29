@@ -890,13 +890,15 @@ int main() {
     //     back-edge) are unreachable. detect_divergent_loops collects back-edges without a
     //     reachability filter, so the pair check still sees the overlap and rejects. If that pass
     //     ever gains reachability pruning, the accept assertion below fails for a GOOD reason.
-    //   * The rejection is OVER-DETERMINED: pc3's execz targets 10, past A's exit at 8, so pass 2's
-    //     "conditional jump past the loop" rule would reject this stream even with the overlap check
-    //     deleted. Neither this assertion nor the pre-#1474 one isolates overlap as the sole cause.
+    //   * The rejection is OVER-DETERMINED: pc3's execz targets 10, past A's exit_pc of 8 (the dword
+    //     after A's back-edge, not A's exit target), so pass 2's "conditional jump past the loop" rule
+    //     would reject this stream even with the overlap check deleted. Neither this assertion nor the
+    //     pre-#1474 one isolates overlap as the sole cause of rejection.
     //
     // Both directions are pinned here, in the DEVICE-FREE test, rather than only in the
-    // Vulkan-execution tests: those are gated on find_package(Vulkan) succeeding, and CI disables
-    // Vulkan discovery outright, so a guard living only there never runs in CI at all.
+    // Vulkan-execution tests: those are gated on find_package(Vulkan) succeeding, and every CI job
+    // that runs ctest either disables Vulkan discovery (Linux, Windows MinGW, macOS) or runs a
+    // three-test seam subset (Windows App), so a guard living only there never runs in CI at all.
     const uint32_t overlapping_loops[] = {
         0xbe800380u,               //  0: s_mov_b32 s0, 0
         0x7e020284u,               //  1: v_mov_b32 v1, 4
@@ -923,13 +925,17 @@ int main() {
     // Lowering is not enough: a dispatcher that emitted the block graph but dropped the export would
     // satisfy every check above, and the device-side test only asserts the readback's size — that is
     // exactly the "silent skip drops real rendered content" failure the charter warns about. This
-    // stream has one export site, so it must produce exactly one output store.
-    if (output_store_stats(overlapping_spv).stores != 1) {
-        printf("  [FAIL] #1474: dispatcher-lowered overlapping loops dropped the export (stores=%u)\n",
-               output_store_stats(overlapping_spv).stores);
+    // stream has one EXP site, so it must produce exactly one output store. The count is exact rather
+    // than >= 1 so a DOUBLED export (which would write MRT0 twice) fails too; the neighbouring
+    // two-site test asserting stores == 2 is the cross-check that this counts sites, not components.
+    const OutputStoreStats overlapping_outputs = output_store_stats(overlapping_spv);
+    if (overlapping_outputs.stores != 1) {
+        printf("  [FAIL] #1474: dispatcher-lowered overlapping loops did not export exactly once "
+               "(stores=%u)\n", overlapping_outputs.stores);
         return 1;
     }
-    printf("  [ok]   #1474: partially-overlapping fragment loops lower through the CFG dispatcher\n");
+    printf("  [ok]   #1474: partially-overlapping fragment loops lower through the CFG dispatcher, "
+           "exporting exactly once\n");
 
     // The fail-visible backstop still has to work. A cross-lane MBCNT inside the same region
     // disqualifies the per-invocation dispatcher — inside a dispatcher case the lanes of one subgroup
