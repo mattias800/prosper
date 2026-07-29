@@ -270,10 +270,11 @@ struct TypeInfo {
     uint32_t width = 0;
     uint32_t storage = 0;
     uint32_t image_sampled = 0;
-    bool scalar_float = false;
-    uint32_t image_dim = UINT32_MAX;
+    uint32_t image_dim = 0xFFFFFFFFu;
     bool image_arrayed = false;
+    bool image_depth = false;
     bool image_multisampled = false;
+    bool scalar_float = false;
     std::vector<uint32_t> members;
 };
 
@@ -526,6 +527,7 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
                     t.kind = TypeKind::Image;
                     t.element = word(in, 1);
                     t.image_dim = word(in, 2);
+                    t.image_depth = word(in, 3) == 1u;
                     t.image_arrayed = word(in, 4) != 0;
                     t.image_multisampled = word(in, 5) != 0;
                     t.image_sampled = word(in, 6);
@@ -590,6 +592,7 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     std::set<uint32_t> used_vars;
     std::set<uint32_t> read_vars;
     std::set<uint32_t> written_vars;
+    std::set<uint32_t> atomic_vars;
     std::set<uint32_t> normalized_sample_vars;
     std::set<uint32_t> texel_access_vars;
     std::unordered_map<uint32_t, PointerAccess> accesses;
@@ -663,6 +666,8 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
                     (in.opcode >= OpAtomicIAdd && in.opcode <= OpAtomicXor) ||
                     in.opcode == OpAtomicFlagTestAndSet) && n >= 3) {
             // Result-producing atomic instructions place their pointer after result type/result id.
+            const uint32_t root = pointer_root(word(in, 2));
+            if (root) atomic_vars.insert(root);
             mark_pointer(word(in, 2), true, true);
         } else if ((in.opcode == OpAtomicStore || in.opcode == OpAtomicFlagClear) && n >= 1) {
             // The two result-less atomic instructions place the pointer first, like OpStore.
@@ -742,7 +747,7 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         auto si = sets.find(var), bi = bindings.find(var);
         if (si == sets.end() || bi == bindings.end()) { add_malformed(report); continue; }
         uint32_t image_dim = UINT32_MAX;
-        bool image_arrayed = false, image_multisampled = false;
+        bool image_arrayed = false, image_multisampled = false, image_depth = false;
         auto vi = variables.find(var);
         const TypeInfo* image = vi == variables.end()
             ? nullptr : descriptor_image_type(vi->second, types);
@@ -750,6 +755,7 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
             image_dim = image->image_dim;
             image_arrayed = image->image_arrayed;
             image_multisampled = image->image_multisampled;
+            image_depth = image->image_depth;
         }
         report.descriptors.push_back({var, si->second, bi->second, descriptor_vars[var], stage,
                                       required[var], dynamic[var], read_vars.count(var) != 0,
@@ -757,7 +763,8 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
                                       normalized_sample_vars.count(var) != 0,
                                       texel_access_vars.count(var) != 0,
                                       storage_float_vars.count(var) != 0, image_dim,
-                                      image_arrayed, image_multisampled});
+                                      image_arrayed, image_multisampled, image_depth,
+                                      atomic_vars.count(var) != 0});
     }
     std::sort(report.descriptors.begin(), report.descriptors.end(), [](const auto& a, const auto& b) {
         return a.set != b.set ? a.set < b.set : a.binding < b.binding;
@@ -827,7 +834,16 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         }
         const ShaderResource& r = *matches.front();
         SpirvDescriptorKind actual = resource_kind(r);
-        if (actual != d.kind) {
+        const bool atomic_image_buffer =
+            expected_stage == SpirvShaderStage::Compute &&
+            d.kind == SpirvDescriptorKind::StorageBuffer && d.atomic_access &&
+            actual == SpirvDescriptorKind::StorageImage &&
+            r.format == DataFormat::Uint32 && r.num_components == 1 &&
+            r.img_dim == 1 && r.depth == 1 && !r.depth_compare &&
+            !r.in_mip_tail && !r.compression_enabled &&
+            r.width && r.height &&
+            static_cast<uint64_t>(r.width) * r.height * sizeof(uint32_t) <= r.size;
+        if (actual != d.kind && !atomic_image_buffer) {
             report.issues.push_back({DescriptorIssueCode::WrongType, true, d.set, d.binding,
                                      d.kind, actual, d.required_bytes, r.size});
             continue;

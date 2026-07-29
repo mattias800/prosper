@@ -666,6 +666,56 @@ int main() {
               atomic_image_uses[0].is_storage_image &&
               atomic_image_uses[0].t8 == expected_atomic_t8,
           "image_atomic_swap publishes the live direct T# as a storage-image use");
+    const uint32_t image_atomic_add[] = {
+        0xf0442108u, 0x00000900u,
+        0xbf810000u,
+    };
+    std::vector<SrtUse> atomic_add_uses;
+    resolve_dynamic_fetch(image_atomic_add, std::size(image_atomic_add),
+                          atomic_image_seed, std::size(atomic_image_seed), 0,
+                          &atomic_add_uses);
+    CHECK(atomic_add_uses.size() == 1 && atomic_add_uses[0].kind == 0 &&
+              atomic_add_uses[0].use_pc == 0 &&
+              atomic_add_uses[0].is_storage_image &&
+              atomic_add_uses[0].t8 == expected_atomic_t8,
+          "image_atomic_add publishes the live direct T# as a storage-image use");
+
+    // The same live Astro visibility kernel assembles a sampled T# in s[44:51] from four
+    // consecutive entry-user-data pairs before image_load. Preserve both lanes of s_mov_b64 and
+    // accept the reassembled descriptor only while all eight entry origins remain consecutive.
+    uint32_t moved_image_seed[14] = {};
+    std::copy(std::begin(atomic_image_seed), std::end(atomic_image_seed),
+              moved_image_seed + 2);
+    const uint32_t moved_direct_image[] = {
+        0xbeac0402u, 0xbeae0404u, 0xbeb00406u, 0xbeb20408u,
+        0xf0000108u, 0x000b0707u, // image_load v7, [v7,v8], s[44:51] dmask:x 2D
+        0xbf810000u,
+    };
+    std::vector<SrtUse> moved_image_uses;
+    resolve_dynamic_fetch(moved_direct_image, std::size(moved_direct_image),
+                          moved_image_seed, std::size(moved_image_seed), 0,
+                          &moved_image_uses);
+    CHECK(moved_image_uses.size() == 1 && moved_image_uses[0].kind == 0 &&
+              moved_image_uses[0].use_pc == 4 &&
+              moved_image_uses[0].t8 == expected_atomic_t8,
+          "Astro moved consecutive entry pairs publish the image_load T# by exact pc");
+
+    // Keep the assembled bytes identical and plausible, but source the high half from a disjoint
+    // second copy. Shape checks alone would accept this; non-consecutive origins must not fabricate
+    // moved-descriptor provenance.
+    std::copy(std::begin(atomic_image_seed) + 4, std::end(atomic_image_seed),
+              moved_image_seed + 10);
+    const uint32_t moved_gapped_image[] = {
+        0xbeac0402u, 0xbeae0404u, 0xbeb0040au, 0xbeb2040cu,
+        0xf0000108u, 0x000b0707u,
+        0xbf810000u,
+    };
+    std::vector<SrtUse> moved_gapped_image_uses;
+    resolve_dynamic_fetch(moved_gapped_image, std::size(moved_gapped_image),
+                          moved_image_seed, std::size(moved_image_seed), 0,
+                          &moved_gapped_image_uses);
+    CHECK(moved_gapped_image_uses.empty(),
+          "gapped entry pairs do not fabricate moved image-descriptor provenance");
 
     // Astro's title PS consumes a V# placed directly in s[24:27] with a scalar offset computed in
     // VCC_LO. No s_load gives that descriptor an SRT key, and AGC metadata need not publish a sharp

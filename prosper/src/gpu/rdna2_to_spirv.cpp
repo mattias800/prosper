@@ -47,7 +47,8 @@ enum : uint32_t {
     Op_ImageSampleImplicitLod=87, Op_ImageSampleExplicitLod=88,
     Op_ImageSampleDrefImplicitLod=89, Op_ImageSampleDrefExplicitLod=90,
     Op_ImageFetch=95, Op_ImageGather=96, Op_Image=100,
-    Op_ImageRead=98, Op_ImageWrite=99, Op_ImageQuerySizeLod=103, Op_ImageQueryLevels=106,
+    Op_ImageRead=98, Op_ImageWrite=99, Op_ImageQuerySizeLod=103, Op_ImageQuerySize=104,
+    Op_ImageQueryLevels=106,
     Op_TypeArray=28, Op_ControlBarrier=224, Op_AtomicExchange=229, Op_AtomicIAdd=234,
     Op_AtomicISub=235,
     Op_AtomicSMin=236, Op_AtomicUMin=237, Op_AtomicSMax=238, Op_AtomicUMax=239,
@@ -216,6 +217,7 @@ struct SpirvCompute {
     uint32_t v_push_constants = 0, t_ptr_push_u32 = 0;
     uint32_t linear_localid = 0, local_count = 64, wave_size = 64;
     uint32_t v_cbuf=0, v_cbuf1=0, t_ptr_sb_u32=0;   // scalar-memory constant buffers (bindings 2 and 3)
+    uint32_t t_ptr_sb_struct_u=0;                    // shared runtime-u32 Block pointer type
     uint32_t t_ptr_img_u32=0;                       // OpImageTexelPointer result for R32_UINT atomics
     uint32_t guest_scratch=0, t_ptr_guest_scratch_u32=0;
     int32_t guest_scratch_min_byte=0, guest_scratch_saddr=-1;
@@ -947,6 +949,7 @@ struct SpirvCompute {
     std::unordered_map<uint32_t, uint32_t> tex_binding_simg;
     std::unordered_map<uint32_t, uint32_t> tex_binding_img;
     std::unordered_map<uint32_t, bool> tex_binding_uint;
+    std::unordered_map<uint32_t, uint32_t> tex_binding_key;
     uint32_t t_v3f_cache = 0;
     uint32_t t_v3f() { if (!t_v3f_cache) { t_v3f_cache = id(); put(types, Op_TypeVector, {t_v3f_cache, t_f32, 3}); } return t_v3f_cache; }
     uint32_t t_v3i_cache = 0;
@@ -966,11 +969,11 @@ struct SpirvCompute {
         tex_simg_type[key] = si; tex_img_type[key] = ti; return si;
     }
     // Declare (idempotently) a combined image+sampler of SPIR-V `dim` at descriptor-set 0, `binding`.
-    void declare_texture(uint32_t binding, uint32_t dim = Dim_2D, bool is_uint = false,
+    bool declare_texture(uint32_t binding, uint32_t dim = Dim_2D, bool is_uint = false,
                          bool arrayed = false, bool depth = false) {
         const uint32_t key = sampled_image_key(dim, is_uint, arrayed, depth);
         uint32_t simg = sampled_image_type(dim, is_uint, arrayed, depth);
-        if (tex_var.count(binding)) return;
+        if (tex_var.count(binding)) return tex_binding_key[binding] == key;
         uint32_t t_ptr = id(); put(types, Op_TypePointer, {t_ptr, SC_UniformConstant, simg});
         uint32_t v = id();     put(types, Op_Variable,    {t_ptr, v, SC_UniformConstant});
         put(deco, Op_Decorate, {v, Dec_DescriptorSet, desc_set});
@@ -979,6 +982,8 @@ struct SpirvCompute {
         tex_binding_simg[binding] = simg;
         tex_binding_img[binding] = tex_img_type[key];
         tex_binding_uint[binding] = is_uint;
+        tex_binding_key[binding] = key;
+        return true;
     }
     uint32_t texture_vec4(uint32_t binding) {
         return tex_binding_uint[binding] ? t_v4u() : t_v4f;
@@ -1039,6 +1044,18 @@ struct SpirvCompute {
         uint32_t res   = id(); put(code, Op_ImageSampleExplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Lod, bcf(lod_bits)});
         unpack_texture_result(binding, res, out);
     }
+    // A real 2D-array explicit-LOD sample. The layer is the third float coordinate; keeping it in
+    // SPIR-V makes reflection require a matching 2D-array view instead of silently sampling layer 0.
+    void image_sample_lod_2d_array(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
+                                   uint32_t layer_bits, uint32_t lod_bits, uint32_t out[4]) {
+        uint32_t si = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
+        uint32_t coord = id(); put(code, Op_CompositeConstruct,
+                                   {t_v3f(), coord, bcf(u_bits), bcf(v_bits), bcf(layer_bits)});
+        uint32_t res = id(); put(code, Op_ImageSampleExplicitLod,
+                                 {texture_vec4(binding), res, si, coord,
+                                  ImgOp_Lod, bcf(lod_bits)});
+        unpack_texture_result(binding, res, out);
+    }
     // image_sample_lz from a 3D texture: explicit LOD (usually 0) on a (u,v,w) coord. Stage-agnostic.
     void image_sample_lod_3d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t w_bits,
                              uint32_t lod_bits, uint32_t out[4]) {
@@ -1079,7 +1096,8 @@ struct SpirvCompute {
     void image_sample_dref_manual_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
                                      uint32_t dref_bits, uint32_t compare_func,
                                      bool linear_filter, uint32_t addr_u, uint32_t addr_v,
-                                     uint32_t border_color_type, uint32_t out[4]) {
+                                     uint32_t border_color_type, uint32_t out[4],
+                                     bool arrayed = false, uint32_t layer_bits = 0) {
         uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
         if (linear_filter) {
             if (!declared_image_query) {
@@ -1087,7 +1105,8 @@ struct SpirvCompute {
                 declared_image_query = true;
             }
             uint32_t img = id(); put(code, Op_Image, {tex_binding_img[binding], img, si});
-            uint32_t size = id(); put(code, Op_ImageQuerySizeLod, {t_v2i(), size, img, uconst(0)});
+            uint32_t size = id(); put(code, Op_ImageQuerySizeLod,
+                                      {arrayed ? t_v3i() : t_v2i(), size, img, uconst(0)});
             uint32_t w_i = id(); put(code, Op_CompositeExtract, {t_i32, w_i, size, 0});
             uint32_t h_i = id(); put(code, Op_CompositeExtract, {t_i32, h_i, size, 1});
             const uint32_t w = i2u(w_i), h = i2u(h_i);
@@ -1142,7 +1161,11 @@ struct SpirvCompute {
 
             auto compare_fetch = [&](uint32_t tx, uint32_t ty, uint32_t outside_border) {
                 uint32_t coord = id();
-                put(code, Op_CompositeConstruct, {t_v2u(), coord, tx, ty});
+                if (arrayed)
+                    put(code, Op_CompositeConstruct,
+                        {t_v3u_fetch(), coord, tx, ty, i2u(cvt_f2i(bcf(layer_bits)))});
+                else
+                    put(code, Op_CompositeConstruct, {t_v2u(), coord, tx, ty});
                 uint32_t texel = id();
                 put(code, Op_ImageFetch,
                     {t_v4f, texel, img, coord, ImgOp_Lod, uconst(0)});
@@ -1167,7 +1190,13 @@ struct SpirvCompute {
             return;
         }
 
-        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+        uint32_t coord = id();
+        if (arrayed)
+            put(code, Op_CompositeConstruct,
+                {t_v3f(), coord, bcf(u_bits), bcf(v_bits), bcf(layer_bits)});
+        else
+            put(code, Op_CompositeConstruct,
+                {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
         uint32_t res   = id(); put(code, Op_ImageSampleExplicitLod,
                                    {t_v4f, res, si, coord, ImgOp_Lod, fconstf(0.0f)});
         uint32_t depth = id(); put(code, Op_CompositeExtract, {t_f32, depth, res, 0});
@@ -1421,32 +1450,50 @@ struct SpirvCompute {
         put(code, Op_Label, {merge}); cur_block = merge;
     }
 
-    // IMAGE_ATOMIC_SWAP on an R32_UINT storage image. OpImageTexelPointer consumes the descriptor
+    // An integer atomic on an R32_UINT 2D storage image. OpImageTexelPointer consumes the descriptor
     // variable directly (not a loaded image object) and yields an Image-storage pointer suitable for
-    // the SPIR-V atomic. Inactive EXEC lanes neither touch the image nor clobber VDATA.
-    uint32_t image_atomic_swap(uint32_t binding, uint32_t ncoord, const uint32_t* coords,
-                               uint32_t value, bool predicated, uint32_t pred,
-                               uint32_t fallback) {
+    // the SPIR-V atomic. Vulkan leaves an out-of-bounds image atomic undefined (robust image access
+    // does not cover atomics), and RADV can spend seconds in such an atomic before resetting the GPU.
+    // Query the bound view and put BOTH the texel pointer and atomic behind an explicit bounds/EXEC
+    // branch. A skipped lane leaves VDATA unchanged, matching the no-operation EXEC fallback.
+    uint32_t image_atomic_u32(uint16_t opcode, uint32_t binding, uint32_t ncoord,
+                              const uint32_t* coords, uint32_t value, bool predicated,
+                              uint32_t pred, uint32_t fallback) {
+        // The decoder/resource gate currently accepts only non-arrayed 2D R32_UINT atomics.
+        if (ncoord != 2) return fallback;
         if (!t_ptr_img_u32) {
             t_ptr_img_u32 = id();
             put(types, Op_TypePointer, {t_ptr_img_u32, SC_Image, t_u32});
         }
+        if (!declared_image_query) {
+            put(caps, Op_Capability, {Cap_ImageQuery});
+            declared_image_query = true;
+        }
+        const uint32_t image = id();
+        put(code, Op_Load, {stg_img_binding_type[binding], image, stg_img_var[binding]});
+        const uint32_t size = id();
+        put(code, Op_ImageQuerySize, {t_v2i(), size, image});
+        const uint32_t width_i = id(), height_i = id();
+        put(code, Op_CompositeExtract, {t_i32, width_i, size, 0});
+        put(code, Op_CompositeExtract, {t_i32, height_i, size, 1});
+        uint32_t in_bounds = ucmp(Op_ULessThan, coords[0], i2u(width_i));
+        in_bounds = land(in_bounds, ucmp(Op_ULessThan, coords[1], i2u(height_i)));
+        const uint32_t active = predicated ? land(pred, in_bounds) : in_bounds;
         auto emit = [&]() {
             const uint32_t coord = stg_coord(ncoord, coords);
             const uint32_t pointer = id();
             put(code, Op_ImageTexelPointer,
                 {t_ptr_img_u32, pointer, stg_img_var[binding], coord, uconst(0)});
             const uint32_t result = id();
-            put(code, Op_AtomicExchange,
+            put(code, opcode,
                 {t_u32, result, pointer, uconst(Scope_Device),
                  uconst(MemSem_ImageAcqRel), value});
             return result;
         };
-        if (!predicated) return emit();
         const uint32_t entry = cur_block;
         const uint32_t then = id(), merge = id();
         put(code, Op_SelectionMerge, {merge, 0});
-        put(code, Op_BranchConditional, {pred, then, merge});
+        put(code, Op_BranchConditional, {active, then, merge});
         put(code, Op_Label, {then}); cur_block = then;
         const uint32_t result = emit();
         const uint32_t then_end = cur_block;
@@ -1523,6 +1570,19 @@ struct SpirvCompute {
         put(code, Op_Branch, {merge});
         put(code, Op_Label, {merge}); cur_block = merge;
         return emit_phi_2way(t_u32, result, then_end, fallback, entry);
+    }
+    // RADV currently hangs/reset-poisons the device on Astro Bot's compute R32_UINT image atomic.
+    // Compute lowers that exact 2D resource through a detiled storage-buffer view instead. The live
+    // backend recognizes the reflected atomic buffer over a StorageImage resource, detiles before
+    // dispatch, and tiles the result back afterwards. Graphics retains the native image-atomic path.
+    bool declare_compute_atomic_image_buffer(uint32_t binding) {
+        if (!is_compute || !t_ptr_sb_struct_u || cbuf_var.count(binding)) return false;
+        const uint32_t variable = id();
+        put(deco, Op_Decorate, {variable, Dec_DescriptorSet, desc_set});
+        put(deco, Op_Decorate, {variable, Dec_Binding, binding});
+        put(types, Op_Variable, {t_ptr_sb_struct_u, variable, SC_StorageBuffer});
+        cbuf_var[binding] = variable;
+        return true;
     }
     // LDS (Local Data Share) — a workgroup-shared u32 array for compute ds_read/ds_write. NGG shaders
     // are lowered as one independent Vulkan vertex invocation, so their LDS becomes Function-private:
@@ -1834,7 +1894,8 @@ struct SpirvCompute {
     // format_* read. Called by every shell (compute/vertex/fragment) so cbuf_load works in each.
     // Requires t_u32 to already be declared. Unused by shaders without memory ops.
     void declare_cbufs(const ShaderResourceTable* rt = nullptr) {
-        uint32_t t_rta_u = id(), t_struct_u = id(), t_ptr_sb_struct_u = id();
+        uint32_t t_rta_u = id(), t_struct_u = id();
+        t_ptr_sb_struct_u = id();
         v_cbuf = id(); v_cbuf1 = id(); t_ptr_sb_u32 = id();
         put(deco, Op_Decorate, {t_rta_u, Dec_ArrayStride, 4});
         put(deco, Op_MemberDecorate, {t_struct_u, 0, Dec_Offset, 0});
@@ -5901,44 +5962,43 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x85: cmp = b.ucmp(Op_INotEqual, a, c); break;            // v_cmp_ne_i32 (sign-agnostic)
                 case 0x86: cmp = b.scmp(Op_SGreaterThanEqual, a, c); break;    // v_cmp_ge_i32
                 case 0x88: {                                                   // v_cmp_class_f32
-                    // CLASS compares the raw IEEE-754 category of SRC0 against the ten-bit mask
-                    // in SRC1.  Keep this in the integer domain: float comparisons cannot
-                    // distinguish signed zero, normal from denormal, or quiet from signalling NaN.
-                    const uint32_t sign_bits = b.ibin(Op_BitwiseAnd, a, b.uconst(0x80000000u));
-                    const uint32_t exp_bits  = b.ibin(Op_BitwiseAnd, a, b.uconst(0x7f800000u));
-                    const uint32_t mantissa  = b.ibin(Op_BitwiseAnd, a, b.uconst(0x007fffffu));
-                    const uint32_t negative  = b.ucmp(Op_INotEqual, sign_bits, b.uconst(0));
-                    const uint32_t positive  = b.logical_not(negative);
-                    const uint32_t exp_zero  = b.ucmp(Op_IEqual, exp_bits, b.uconst(0));
-                    const uint32_t exp_all   = b.ucmp(Op_IEqual, exp_bits, b.uconst(0x7f800000u));
-                    const uint32_t mant_zero = b.ucmp(Op_IEqual, mantissa, b.uconst(0));
-                    const uint32_t mant_nonzero = b.logical_not(mant_zero);
-                    const uint32_t finite_exp = b.land(b.logical_not(exp_zero),
-                                                       b.logical_not(exp_all));
-                    const uint32_t is_nan = b.land(exp_all, mant_nonzero);
-                    const uint32_t quiet_bit = b.ibin(Op_BitwiseAnd, mantissa,
-                                                      b.uconst(0x00400000u));
-                    const uint32_t is_quiet = b.ucmp(Op_INotEqual, quiet_bit, b.uconst(0));
-                    const uint32_t selected_classes[10] = {
-                        b.land(is_nan, b.logical_not(is_quiet)),                // signalling NaN
-                        b.land(is_nan, is_quiet),                               // quiet NaN
-                        b.land(b.land(exp_all, mant_zero), negative),           // -infinity
-                        b.land(finite_exp, negative),                           // -normal
-                        b.land(b.land(exp_zero, mant_nonzero), negative),       // -denormal
-                        b.land(b.land(exp_zero, mant_zero), negative),          // -zero
-                        b.land(b.land(exp_zero, mant_zero), positive),          // +zero
-                        b.land(b.land(exp_zero, mant_nonzero), positive),       // +denormal
-                        b.land(finite_exp, positive),                           // +normal
-                        b.land(b.land(exp_all, mant_zero), positive),           // +infinity
-                    };
-                    cmp = b.bfalse();
-                    for (uint32_t bit = 0; bit < 10; ++bit) {
-                        const uint32_t mask_bit = b.ibin(Op_BitwiseAnd, c,
-                                                         b.uconst(1u << bit));
-                        const uint32_t selected = b.ucmp(Op_INotEqual, mask_bit,
-                                                         b.uconst(0));
-                        cmp = b.lor(cmp, b.land(selected_classes[bit], selected));
-                    }
+                    // CLASS tests the raw IEEE-754 category rather than doing a floating-point
+                    // comparison. Keep this entirely in the integer domain so signalling/quiet
+                    // NaNs and the sign of zero/NaN survive on every SPIR-V target.
+                    uint32_t class_raw = ra;
+                    if (in.src_abs[0])
+                        class_raw = b.ibin(Op_BitwiseAnd, class_raw, b.uconst(0x7fffffffu));
+                    if (in.src_neg[0])
+                        class_raw = b.ibin(Op_BitwiseXor, class_raw, b.uconst(0x80000000u));
+                    const uint32_t sign = b.ucmp(
+                        Op_INotEqual,
+                        b.ibin(Op_BitwiseAnd, class_raw, b.uconst(0x80000000u)), b.uconst(0));
+                    const uint32_t exponent =
+                        b.ibin(Op_BitwiseAnd, class_raw, b.uconst(0x7f800000u));
+                    const uint32_t mantissa =
+                        b.ibin(Op_BitwiseAnd, class_raw, b.uconst(0x007fffffu));
+                    const uint32_t exponent_zero = b.ucmp(Op_IEqual, exponent, b.uconst(0));
+                    const uint32_t exponent_all = b.ucmp(Op_IEqual, exponent, b.uconst(0x7f800000u));
+                    const uint32_t mantissa_zero = b.ucmp(Op_IEqual, mantissa, b.uconst(0));
+                    const uint32_t quiet_nan = b.ucmp(
+                        Op_INotEqual,
+                        b.ibin(Op_BitwiseAnd, mantissa, b.uconst(0x00400000u)), b.uconst(0));
+
+                    // AMD's mask order is sNaN, qNaN, -Inf, -normal, -subnormal, -zero,
+                    // +zero, +subnormal, +normal, +Inf. Select the input's one-hot class bit,
+                    // then test it against SRC1 (Astro's live packet uses 3 = either NaN).
+                    const uint32_t nan_class = b.sel(quiet_nan, b.uconst(2), b.uconst(1));
+                    const uint32_t inf_class = b.sel(sign, b.uconst(4), b.uconst(512));
+                    const uint32_t exp_all_class = b.sel(mantissa_zero, inf_class, nan_class);
+                    const uint32_t zero_class = b.sel(sign, b.uconst(32), b.uconst(64));
+                    const uint32_t subnormal_class = b.sel(sign, b.uconst(16), b.uconst(128));
+                    const uint32_t exp_zero_class = b.sel(mantissa_zero, zero_class, subnormal_class);
+                    const uint32_t normal_class = b.sel(sign, b.uconst(8), b.uconst(256));
+                    const uint32_t class_bit = b.sel(
+                        exponent_all, exp_all_class,
+                        b.sel(exponent_zero, exp_zero_class, normal_class));
+                    cmp = b.ucmp(Op_INotEqual,
+                                 b.ibin(Op_BitwiseAnd, rc, class_bit), b.uconst(0));
                     break;
                 }
                 case 0xC1: cmp = b.ucmp(Op_ULessThan, a, c); break;            // v_cmp_lt_u32
@@ -7463,7 +7523,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             // Exact per-use provenance wins over table keys. A sample and store may consume the same
             // T# through a colliding offset but require different Vulkan descriptor classes.
-            const bool storage_only_op = in.opcode == 0x08 || in.opcode == 0x0f;
+            const bool storage_only_op = in.opcode == 0x08 || in.opcode == 0x0f ||
+                                         in.opcode == 0x11;
             if ((storage_only_op && res && res->cls != ResourceClass::StorageImage) ||
                 (in.opcode != 0x00 && !storage_only_op && in.opcode != 0x0e &&
                  res && res->cls != ResourceClass::Texture))
@@ -7488,12 +7549,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                       res->format == DataFormat::Uint32;
 
             // --- Storage-image path: image_load (0x00), image_store (0x08), and R32_UINT
-            // image_atomic_swap (0x0f), without a sampler. ---
+            // image_atomic_swap/add (0x0f/0x11), without a sampler. ---
             if (res->cls == ResourceClass::StorageImage) {
                 const bool is_ld = in.opcode == 0x00;
                 const bool is_st = in.opcode == 0x08;
                 const bool is_atomic_swap = in.opcode == 0x0f;
-                if (!is_ld && !is_st && !is_atomic_swap) { ok = false; return true; }
+                const bool is_atomic_add = in.opcode == 0x11;
+                const bool is_atomic = is_atomic_swap || is_atomic_add;
+                if (!is_ld && !is_st && !is_atomic) { ok = false; return true; }
                 uint32_t dim, ncoord; bool arrayed = false, ms = false;
                 switch (in.mimg_dim) {   // SQ_RSRC dim -> SPIR-V Dim + coord count (+ array layer / MSAA sample)
                     case 0: dim = Dim_1D; ncoord = 1; break;                       // 1D
@@ -7505,16 +7568,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     case 7: dim = Dim_2D; ncoord = 3; arrayed = true; ms = true; break;  // 2D_MSAA_ARRAY (x,y,layer)+sample
                     default: ok = false; return true;   // cube storage images deferred
                 }
-                if (ms && (is_st || is_atomic_swap)) { ok = false; return true; }
+                if (ms && (is_st || is_atomic)) { ok = false; return true; }
                 const uint32_t components = res->num_components ? res->num_components : 1;
                 // The live Astro Bot visibility image is an ordinary 2D R32_UINT surface. Keep the
                 // first atomic implementation exact and fail-visible for every other image shape;
                 // atomics require a typed integer image in Vulkan/SPIR-V rather than Format=Unknown.
-                if (is_atomic_swap &&
+                if (is_atomic &&
                     (in.mimg_dim != SQ_DIM_2D || arrayed || ms || in.len_dwords != 2 ||
                      in.mimg_unorm || in.mimg_dmask != 1u ||
                      res->img_dim != 1u || res->depth != 1u || res->depth_compare ||
-                     res->format != DataFormat::Uint32 || components != 1u)) {
+                     res->format != DataFormat::Uint32 || components != 1u ||
+                     !res->width || !res->height || res->in_mip_tail ||
+                     res->compression_enabled)) {
                     ok = false;
                     return true;
                 }
@@ -7527,9 +7592,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // Existing load/store-only uint images retain the raw uvec4/Format=Unknown contract
                 // used by the compute backend. The atomic's exact R32_UINT gate above is the only path
                 // that opts into a typed R32ui image.
-                const bool native_r32ui = is_atomic_swap;
-                b.declare_storage_image(res->binding, dim, arrayed, ms, native_float,
-                                        native_r32ui ? ImgFmt_R32ui : ImgFmt_Unknown);
+                const bool compute_atomic_buffer = is_atomic && b.is_compute;
+                if (compute_atomic_buffer) {
+                    if (!b.declare_compute_atomic_image_buffer(res->binding)) {
+                        ok = false;
+                        return true;
+                    }
+                } else {
+                    const bool native_r32ui = is_atomic;
+                    b.declare_storage_image(res->binding, dim, arrayed, ms, native_float,
+                                            native_r32ui ? ImgFmt_R32ui : ImgFmt_Unknown);
+                }
                 // Coordinate VGPR per axis. Non-NSA (len==2): consecutive from VADDR (src[0]). NSA (len>2):
                 // split across the extra address dwords — coord0 = VADDR, coord k>=1 = byte (k-1) of
                 // words[2..3] (dword2 = addr1..4, dword3 = addr5..8). Layout verified via llvm-mc gfx1010.
@@ -7559,14 +7632,29 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) { vals[c] = vread(vd + w); w++; }
                     b.image_write(res->binding, dim, arrayed, ncoord, coords, vals, rs.exec_narrowed, rs.exec);
                 } else {
-                    // IMAGE_ATOMIC_SWAP reads its exchange operand from VDATA. GLC=1 overwrites that
-                    // VGPR with the pre-operation texel; GLC=0 leaves VDATA unchanged. The helper's
-                    // phi preserves the old register value for EXEC-inactive lanes.
+                    // IMAGE_ATOMIC_SWAP/ADD reads its operand from VDATA. GLC=1 overwrites that VGPR
+                    // with the pre-operation texel; GLC=0 leaves VDATA unchanged. The helper's phi
+                    // preserves the old register value for EXEC-inactive lanes.
                     const int vd = in.dst.value;
                     const uint32_t old = vreg_old(b, rs, vd);
-                    const uint32_t result = b.image_atomic_swap(
-                        res->binding, ncoord, coords, vread(vd),
-                        rs.exec_narrowed, rs.exec, old);
+                    const uint16_t atomic_op = is_atomic_add ? Op_AtomicIAdd : Op_AtomicExchange;
+                    uint32_t result;
+                    if (compute_atomic_buffer) {
+                        const uint32_t index = b.ibin(
+                            Op_IAdd, coords[0],
+                            b.ibin(Op_IMul, coords[1], b.uconst(res->width)));
+                        uint32_t active = b.land(
+                            b.ucmp(Op_ULessThan, coords[0], b.uconst(res->width)),
+                            b.ucmp(Op_ULessThan, coords[1], b.uconst(res->height)));
+                        if (rs.exec_narrowed) active = b.land(rs.exec, active);
+                        result = b.cbuf_atomic_rtn(
+                            atomic_op, index, vread(vd), res->binding,
+                            true, active, old);
+                    } else {
+                        result = b.image_atomic_u32(
+                            atomic_op, res->binding, ncoord, coords, vread(vd),
+                            rs.exec_narrowed, rs.exec, old);
+                    }
                     if (in.mimg_glc) rs.vreg[vd] = result;
                 }
                 return true;
@@ -7583,7 +7671,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 else if (in.mimg_dim == 2u) dim = Dim_3D;
                 else { ok = false; return true; }
                 if (res->cls != ResourceClass::Texture) { ok = false; return true; }
-                b.declare_texture(res->binding, dim, uint_texture);
+                if (!b.declare_texture(res->binding, dim, uint_texture)) {
+                    ok = false; return true;
+                }
                 uint32_t out[4]; b.image_get_resinfo(res->binding, dim, vread(in.src[0].value), out);
                 int vd = in.dst.value, w = 0;
                 for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) {
@@ -7631,11 +7721,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // CONFIDENCE: HIGH — operand order is ISA-defined and an execution regression distinguishes the
             // requested gradient-selected mip from the implicit-derivative result.
             const bool is_sample_d = (in.opcode == 0x22);
-            // 2D_ARRAY (dim=5) is sampled here as its base 2D slice: the (u,v) coords are read as usual and
-            // the array-index coord is dropped, so the shader RECOMPILES instead of being rejected (previously
-            // dim!=1&&dim!=2 -> ok=false, silently SKIPPING the whole draw — real content loss, #325). Correct
-            // for single-layer arrays (e.g. Unity's default textures, which are 4x4x1); a multi-layer array is
-            // sampled at slice 0, a documented limitation pending full VK_IMAGE_VIEW_TYPE_2D_ARRAY support.
+            // Most 2D_ARRAY forms retain the historical base-slice fallback (#325). Explicit-LOD
+            // SAMPLE_L/LZ is different: Astro Bot's world-map kernel selects both layers of a wide
+            // texture atlas, so dropping cvg(2) destroys the lookup. Those forms use a real array below.
             const bool dim2d = (in.mimg_dim == 1u || in.mimg_dim == 5u), dim3d = (in.mimg_dim == 2u);
             const bool dimcube = (in.mimg_dim == 3u);   // CUBE: stacked-face 2D lowering (#273, below)
             if (in.mimg_dim == 5u && getenv("PROSPER_GFXLOG"))
@@ -7684,20 +7772,26 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // faces as one vertical 2D stack, so compare the transformed face coordinate
                     // manually through its ordinary non-compare sampler (#1167/#1169).
                     if (uint_texture || !res->depth_compare) { ok = false; return true; }
-                    b.declare_texture(res->binding, Dim_2D, false);
+                    if (!b.declare_texture(res->binding, Dim_2D, false)) {
+                        ok = false; return true;
+                    }
                     b.image_sample_dref_manual_2d(res->binding, uf, v6, vread(cvg(0)),
                                                   res->depth_compare_func,
                                                   res->mag_filter != 0u, res->addr_uvw[0],
                                                   res->addr_uvw[1], res->border_color_type, out);
                 } else {
-                    b.declare_texture(res->binding, Dim_2D, uint_texture);
+                    if (!b.declare_texture(res->binding, Dim_2D, uint_texture)) {
+                        ok = false; return true;
+                    }
                     b.image_sample_lod_2d(res->binding, uf, v6, b.uconst(0), out);
                 }
             } else if (dim3d) {
                 // 3D: implicit-LOD / LOD-0 sample, or an integer texel FETCH (image_load — DOLL's
                 // color-grade 3D LUT, #273).
                 if (!is_sample && !is_sample_lz && !is_load) { ok = false; return true; }
-                b.declare_texture(res->binding, Dim_3D, uint_texture);
+                if (!b.declare_texture(res->binding, Dim_3D, uint_texture)) {
+                    ok = false; return true;
+                }
                 if (is_sample)      b.image_sample_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
                 else if (is_load)   b.image_fetch_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
                 else                b.image_sample_lod_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)),
@@ -7722,24 +7816,40 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // an ordinary color read.
                 if (uint_texture || !res->depth_compare) { ok = false; return true; }
                 if (in.mimg_dim == 5u) {
-                    // The shared graphics backend currently exposes 2D_ARRAY textures as its
-                    // documented base-slice 2D view (#325). Match every other sampled DIM=5 path:
-                    // drop the slice coordinate and use the ordinary sampler plus an in-shader
-                    // compare. The old arrayed-depth declaration emitted OpImageSampleDref* against
-                    // a non-compare 2D sampler/view — invalid Vulkan usage and undefined output
-                    // (#1169). Multi-layer selection remains the pre-existing #325 limitation.
-                    b.declare_texture(res->binding, Dim_2D, false);
-                    b.image_sample_dref_manual_2d(res->binding, vread(cvg(1)), vread(cvg(2)),
-                                                  vread(cvg(0)), res->depth_compare_func,
-                                                  res->mag_filter != 0u, res->addr_uvw[0],
-                                                  res->addr_uvw[1], res->border_color_type, out);
+                    if (b.is_compute) {
+                        // Compute has a backend-reflected 2D-array path. Preserve [dref,u,v,slice]
+                        // and perform the comparison manually over an ordinary color sampler, so no
+                        // compare-sampler/Dref Vulkan contract is required. Astro Bot's world-map
+                        // visibility shader selects among sixteen depth layers here.
+                        if (!b.declare_texture(res->binding, Dim_2D, false, true)) {
+                            ok = false; return true;
+                        }
+                        b.image_sample_dref_manual_2d(
+                            res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(0)),
+                            res->depth_compare_func, res->mag_filter != 0u,
+                            res->addr_uvw[0], res->addr_uvw[1], res->border_color_type,
+                            out, true, vread(cvg(3)));
+                    } else {
+                        // The shared graphics backend currently exposes 2D_ARRAY textures as its
+                        // documented base-slice 2D view (#325). Keep that established fallback for
+                        // graphics until its resource uploader can create matching array views.
+                        if (!b.declare_texture(res->binding, Dim_2D, false)) {
+                            ok = false; return true;
+                        }
+                        b.image_sample_dref_manual_2d(
+                            res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(0)),
+                            res->depth_compare_func, res->mag_filter != 0u,
+                            res->addr_uvw[0], res->addr_uvw[1], res->border_color_type, out);
+                    }
                 } else if (in.mimg_dim == 1u) {
                     // Plain 2D form (Blue Prince's lit-material PSes, #1271: 436 rejects/run, all
                     // op 0x2f dim 1 dmask 0x1 — the entire shadowed lighting pass dropped and the
                     // scene rendered unattenuated/blown-out). Same 8.2.5 vaddr order with no array
                     // slice: [dref, u, v]. Lowered as a manual compare against the color-sampled
                     // shadow map (see image_sample_dref_manual_2d for why not a compare sampler).
-                    b.declare_texture(res->binding, Dim_2D, false);
+                    if (!b.declare_texture(res->binding, Dim_2D, false)) {
+                        ok = false; return true;
+                    }
                     b.image_sample_dref_manual_2d(res->binding, vread(cvg(1)), vread(cvg(2)),
                                                   vread(cvg(0)), res->depth_compare_func,
                                                   res->mag_filter != 0u, res->addr_uvw[0],
@@ -7751,7 +7861,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t dm = in.mimg_dmask;
                 if (dm != 1u && dm != 2u && dm != 4u && dm != 8u) { ok = false; return true; }
                 uint32_t comp = dm == 1u ? 0u : dm == 2u ? 1u : dm == 4u ? 2u : 3u;
-                b.declare_texture(res->binding, Dim_2D, uint_texture);
+                if (!b.declare_texture(res->binding, Dim_2D, uint_texture)) {
+                    ok = false; return true;
+                }
                 if (is_gather_lz_o)   // vaddr order for _o: [packed offset, u, v]
                     b.image_gather_offset_2d(res->binding, vread(cvg(1)), vread(cvg(2)), comp, vread(cvg(0)), out);
                 else
@@ -7764,8 +7876,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             } else {
-                b.declare_texture(res->binding, Dim_2D, uint_texture);
-                if (is_sample_b) {      // vaddr order for _b: [bias, u, v]
+                const bool array_sample = b.is_compute && in.mimg_dim == 5u &&
+                    res->img_dim == 5u && (is_sample || is_sample_l || is_sample_lz);
+                if (!b.declare_texture(res->binding, Dim_2D, uint_texture, array_sample)) {
+                    ok = false; return true;
+                }
+                if (array_sample) {
+                    // Compute SAMPLE and SAMPLE_LZ both resolve level zero; SAMPLE_L supplies its
+                    // explicit LOD. All retain the 2D-array slice in the SPIR-V coordinate.
+                    b.image_sample_lod_2d_array(
+                        res->binding, vread(cvg(0)), vread(cvg(1)),
+                        vread(cvg(2)),
+                        is_sample_l ? vread(cvg(3)) : b.uconst(fbits(0.0f)), out);
+                } else if (is_sample_b) {      // vaddr order for _b: [bias, u, v]
                     b.image_sample_bias_2d(res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(0)), out);
                 } else if (is_sample_lz_o) {   // vaddr order for _o: [packed offset, u, v]
                     b.image_sample_lz_offset_2d(res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(0)), out);
@@ -7777,12 +7900,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     uint32_t cu = vread(cvg(0)), cv = vread(cvg(1));
                     if (is_sample)         b.image_sample_2d(res->binding, cu, cv, out);
                     else if (is_sample_lz) b.image_sample_lod_2d(res->binding, cu, cv, b.uconst(0), out);      // LOD 0
-                    // Explicit-LOD sample: LOD is the coord AFTER the spatial (+ array) coords. Plain 2D
-                    // vaddr = [u, v, lod] -> cvg(2); 2D_ARRAY (dim 5) vaddr = [u, v, slice, lod] -> cvg(3).
-                    // The slice sits at cvg(2), so reading LOD from cvg(2) on a 2D_ARRAY took the array
-                    // index as the LOD (#373). (Slice itself is still dropped — 2D lowering, #325.)
+                    // Explicit-LOD plain 2D uses [u,v,lod]. Graphics keeps the established
+                    // base-slice view for DIM=5, whose address is [u,v,slice,lod].
                     else if (is_sample_l)  b.image_sample_lod_2d(res->binding, cu, cv,
-                                                                 vread(cvg(in.mimg_dim == 5u ? 3 : 2)), out);
+                        vread(cvg(in.mimg_dim == 5u && res->img_dim == 5u ? 3u : 2u)), out);
                     else                   b.image_fetch_2d (res->binding, cu, cv, out);
                 }
             }
@@ -10796,7 +10917,7 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                     const bool st_dim = i.mimg_dim <= 2u || i.mimg_dim == 4u || i.mimg_dim == 5u;
                     if (i.opcode == 0x00u) return st_dim || i.mimg_dim == 6u || i.mimg_dim == 7u;   // image_load (+ 2D_MSAA[_ARRAY])
                     if (i.opcode == 0x08u) return st_dim;                       // image_store (no per-sample MSAA store)
-                    if (i.opcode == 0x0fu)                                     // image_atomic_swap R32_UINT 2D
+                    if (i.opcode == 0x0fu || i.opcode == 0x11u)                // image_atomic_swap/add R32_UINT 2D
                         return i.mimg_dim == 1u && i.mimg_dmask == 1u &&
                                !i.mimg_unorm && i.len_dwords == 2u;
                     if (i.opcode == 0x0eu) return i.mimg_dim <= 2u;             // image_get_resinfo 1D/2D/3D

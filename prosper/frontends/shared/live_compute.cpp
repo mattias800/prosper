@@ -1762,7 +1762,9 @@ struct BoundBuffer {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     size_t alias_of = SIZE_MAX;         // exact guest range sharing an earlier storage buffer
+    size_t bytes = 0;                   // Vulkan buffer bytes (may be a detiled image view)
     bool writable = false;              // reflected OpStore/writing-atomic reachability
+    bool atomic_image = false;           // R32_UINT StorageImage exposed as a linear atomic SSBO
     bool persistent = false;
     bool upload_skipped = false;
     VkBuffer result_baseline = VK_NULL_HANDLE;
@@ -1771,6 +1773,7 @@ struct BoundBuffer {
     uint32_t dirty_watch_chunks = 0;
     uint32_t total_watch_chunks = 0;
     ComputeBufferCacheKey cache_key{};
+    std::vector<uint8_t> linear_seed;    // detiled upload for an atomic-image buffer
     uint64_t before_hash = 0, after_hash = 0;
     uint64_t changed_bytes = 0;
 };
@@ -1804,6 +1807,9 @@ struct BoundImage {
     bool native_float_storage = false;  // Vulkan performs exact UNORM/float conversion at native width
     uint32_t texel_depth = 1;           // logical Z/layer count represented in the staging buffer
     uint32_t array_layers = 1;           // Vulkan array-layer count (3D depth remains one layer)
+    bool arrayed_2d = false;            // SPIR-V requires a real 2D-array view (not base-slice fallback)
+    bool stacked_cube = false;          // cube lowering addresses six faces as one w x 6h 2D image
+    bool depth_view = false;             // reflected SPIR-V uses a true depth image/sampler contract
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
@@ -2463,10 +2469,36 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                  !guest_readable(resource->gpu_addr, resource->size))) break;
             buffers[i].resource = resource;
             buffers[i].writable = descriptors[i].writable;
+            buffers[i].atomic_image = descriptors[i].atomic_access &&
+                resource->cls == ResourceClass::StorageImage &&
+                resource->format == DataFormat::Uint32 && resource->num_components == 1 &&
+                resource->img_dim == 1 && resource->depth == 1 &&
+                !resource->depth_compare && !resource->in_mip_tail &&
+                !resource->compression_enabled && resource->width && resource->height;
+            const uint64_t linear_image_bytes = static_cast<uint64_t>(resource->width) *
+                resource->height * sizeof(uint32_t);
+            if (buffers[i].atomic_image) {
+                const size_t tight_pitch = static_cast<size_t>(resource->width) * sizeof(uint32_t);
+                const size_t guest_image_bytes = resource->tile_mode
+                    ? tiled_surface_bytes(resource->width, resource->height,
+                                          resource->tile_mode, 0, sizeof(uint32_t))
+                    : (resource->linear_row_pitch_bytes
+                           ? static_cast<size_t>(resource->linear_row_pitch_bytes)
+                           : tight_pitch) * resource->height;
+                if (linear_image_bytes > UINT32_MAX ||
+                    (!resource->tile_mode && resource->linear_row_pitch_bytes &&
+                     resource->linear_row_pitch_bytes < tight_pitch) ||
+                    !guest_image_bytes || guest_image_bytes > resource->size)
+                    break;
+            }
+            buffers[i].bytes = buffers[i].atomic_image
+                ? static_cast<size_t>(linear_image_bytes) : resource->size;
             for (size_t j = 0; j < i; ++j) {
                 const ShaderResource* prior = buffers[j].resource;
                 if (!prior || prior->gpu_addr != resource->gpu_addr ||
                     prior->size != resource->size ||
+                    buffers[j].atomic_image != buffers[i].atomic_image ||
+                    buffers[j].bytes != buffers[i].bytes ||
                     prior->host_data != resource->host_data ||
                     prior->host_data_size != resource->host_data_size)
                     continue;
@@ -2479,11 +2511,36 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             if (buffers[i].alias_of == SIZE_MAX) {
                 const uint8_t* source = resource_bytes(resource);
-                if (trace) buffers[i].before_hash = fnv1a(source, resource->size);
+                if (buffers[i].atomic_image) {
+                    buffers[i].linear_seed.resize(buffers[i].bytes);
+                    if (resource->tile_mode) {
+                        detile_surface(buffers[i].linear_seed.data(), source,
+                                       resource->width, resource->height,
+                                       resource->tile_mode, 0, sizeof(uint32_t));
+                    } else {
+                        const size_t tight_pitch = static_cast<size_t>(resource->width) * 4u;
+                        const size_t source_pitch = resource->linear_row_pitch_bytes
+                            ? resource->linear_row_pitch_bytes : tight_pitch;
+                        for (uint32_t y = 0; y < resource->height; ++y)
+                            std::memcpy(buffers[i].linear_seed.data() + y * tight_pitch,
+                                        source + y * source_pitch, tight_pitch);
+                    }
+                    source = buffers[i].linear_seed.data();
+                    if (trace)
+                        std::fprintf(stderr,
+                                     "[compute]   atomic-image buffer binding=%u addr=0x%llx "
+                                     "extent=%ux%u tile=%u bytes=%zu\n",
+                                     resource->binding,
+                                     (unsigned long long)resource->gpu_addr,
+                                     resource->width, resource->height,
+                                     resource->tile_mode, buffers[i].bytes);
+                }
+                if (trace) buffers[i].before_hash = fnv1a(source, buffers[i].bytes);
                 buffers[i].cache_key = {
                     resource->gpu_addr, reinterpret_cast<uintptr_t>(resource->host_data),
-                    resource->size};
-                const bool cache_candidate = persistent_compute_buffer_enabled(resource->size);
+                    static_cast<uint32_t>(buffers[i].bytes)};
+                const bool cache_candidate = !buffers[i].atomic_image &&
+                    persistent_compute_buffer_enabled(static_cast<uint32_t>(buffers[i].bytes));
                 if (cache_candidate && ctx.acquire_cached_buffer(
                         buffers[i].cache_key, source, buffers[i].buffer, buffers[i].memory,
                         buffers[i].upload_skipped, buffers[i].dirty_watch_chunks,
@@ -2491,7 +2548,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     buffers[i].persistent = true;
                 } else {
                     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-                    bci.size = resource->size;
+                    bci.size = buffers[i].bytes;
                     // A persistent buffer may later become writable through an exact alias binding
                     // and need to copy into its result baseline after an external guest update.
                     // Keep one canonical representation transfer-source capable from allocation.
@@ -2509,12 +2566,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         VK_SUCCESS)
                         break;
                     void* mapped = nullptr;
-                    if (ctx.map_memory(buffers[i].memory, 0, resource->size, &mapped) != VK_SUCCESS)
+                    if (ctx.map_memory(buffers[i].memory, 0, buffers[i].bytes, &mapped) != VK_SUCCESS)
                         break;
                     // Pooled host-visible allocations retain their previous contents. Compare them
                     // with current guest memory before uploading: any mutation takes the exact copy.
-                    if (!compute_buffers_equal(mapped, source, resource->size))
-                        copy_compute_buffer(mapped, source, resource->size);
+                    if (!compute_buffers_equal(mapped, source, buffers[i].bytes))
+                        copy_compute_buffer(mapped, source, buffers[i].bytes);
                     ctx.unmap_memory(buffers[i].memory);
                     if (cache_candidate && ctx.retain_buffer(
                             buffers[i].cache_key, buffers[i].buffer, buffers[i].memory,
@@ -2618,23 +2675,44 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // raw guest memory (empty/stale — the Dead Cells 642x362 lesson).
             const bool dim_1d = r->img_dim == 0;
             const bool dim_3d = r->img_dim == 2;
-            const bool dim_2d_array = backend_uses_2d_array(*r);
-            const bool cube_face_as_2d = r->img_dim == 3 &&
-                image_descriptors[i].image_dim == 1 && !image_descriptors[i].image_arrayed &&
-                !image_descriptors[i].image_multisampled;
-            // A single-layer 2D array is byte-identical to plain 2D. Multi-layer views use the
-            // descriptor-derived per-slice mip-chain stride below; treating selected levels as tight
-            // layers reads a different mip after layer zero.
-            const bool dim_2d_single = r->img_dim == 5 && !r->depth_compare && r->depth == 1;
-            if (!dim_1d && r->img_dim != 1 && !dim_3d && !dim_2d_array && !dim_2d_single &&
-                !cube_face_as_2d) {
+            const bool dim_2d_array = r->img_dim == 5 &&
+                                      image_descriptors[i].image_dim == 1u &&
+                                      image_descriptors[i].image_arrayed;
+            bi.arrayed_2d = dim_2d_array;
+            // The recompiler's established cube lowering converts AMD's cube-processed
+            // [x, y, face] coordinates to a plain 2D sample over six vertically stacked faces.
+            // Compute must expose the same w x 6h image contract as live_renderer. Astro Bot's
+            // world-map irradiance kernel binds a 192-face BC6H probe atlas but this packet samples
+            // its first cube, so only the six addressed faces need to be materialized here.
+            const bool shader_2d_cube_view = r->img_dim == 3 && !bi.storage &&
+                                             image_descriptors[i].image_dim == 1u &&
+                                             !image_descriptors[i].image_arrayed &&
+                                             !image_descriptors[i].image_multisampled;
+            // Cube-array sampling lowers one addressed cube to six vertically stacked faces. A
+            // single six-face allocation can also be deliberately viewed by a DIM=2D instruction;
+            // retain that established face-zero contract instead of consuming sibling faces.
+            const bool dim_cube_stacked = shader_2d_cube_view && r->depth > 6u;
+            const bool cube_face_as_2d = shader_2d_cube_view && !dim_cube_stacked;
+            bi.stacked_cube = dim_cube_stacked;
+            // A SINGLE-LAYER 2D array (img_dim==5, depth==1, no depth-compare) is byte-identical to a
+            // plain 2D image (one layer, same tiling), so it flows through the 2D path below unchanged.
+            // Reflection distinguishes that fallback from a shader which retains the layer coordinate.
+            const bool dim_2d_single = r->img_dim == 5 && !image_descriptors[i].image_arrayed &&
+                                       r->depth == 1;
+            if (!dim_1d && r->img_dim != 1 && !dim_3d && !dim_2d_array &&
+                !dim_2d_single && !dim_cube_stacked && !cube_face_as_2d) {
                 skip_image(r, "layered image deferred to #657"); break;
             }
             if (dim_1d && r->height != 1) { skip_image(r, "1D image has non-unit height"); break; }
-            if (!r->depth || (!dim_3d && !dim_2d_array && !cube_face_as_2d && r->depth != 1)) {
-                skip_image(r, "image depth does not match its dimensionality"); break;
+            if (!r->depth || (!dim_3d && !dim_2d_array && !dim_cube_stacked && r->depth != 1)) {
+                if (!cube_face_as_2d) {
+                    skip_image(r, "image depth does not match its dimensionality"); break;
+                }
             }
-            bi.texel_depth = (dim_3d || dim_2d_array) ? r->depth : 1u;
+            if (dim_cube_stacked && (r->depth < 6 || r->height > UINT32_MAX / 6u)) {
+                skip_image(r, "cube image does not contain six valid faces"); break;
+            }
+            bi.texel_depth = dim_3d ? r->depth : 1u;
             bi.array_layers = dim_2d_array ? r->depth : 1u;
             if (cube_face_as_2d && trace)
                 std::fprintf(stderr,
@@ -3065,14 +3143,22 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      ComputeClock::now() - image_start).count());
                 continue;
             }
-            const VkDeviceSize volume_texels =
-                static_cast<VkDeviceSize>(r->width) * r->height * bi.texel_depth;
+            const uint32_t sampled_layers = dim_cube_stacked ? 6u
+                                            : dim_2d_array ? r->depth : 1u;
+            const VkDeviceSize volume_texels = static_cast<VkDeviceSize>(r->width) * r->height *
+                                               (dim_3d ? r->depth : sampled_layers);
             const uint32_t sampled_components = r->num_components ? r->num_components : 1;
-            const bool sampled_depth = !bi.storage && r->depth_compare && dim_2d_array &&
+            // ShaderResource::depth_compare describes the guest MIMG operation, not the Vulkan
+            // descriptor type. Manual IMAGE_SAMPLE_C* lowering declares an ordinary color image
+            // and compares its R channel in SPIR-V; only an actual Depth=1 OpTypeImage may use a
+            // depth view and compare-enabled sampler here.
+            const bool sampled_depth = !bi.storage && image_descriptors[i].image_depth &&
+                                       dim_2d_array &&
                                        sampled_components == 1 &&
                                        (r->format == DataFormat::Float32 ||
                                         r->format == DataFormat::Unorm16);
-            if (r->depth_compare && !sampled_depth) {
+            bi.depth_view = sampled_depth;
+            if (image_descriptors[i].image_depth && !sampled_depth) {
                 skip_image(r, "depth-compare image format/dimension unsupported"); break;
             }
             const bool sampled_float32 = !bi.storage && !sampled_depth &&
@@ -3205,19 +3291,22 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             skip_image(r, "sampled cube-face backing size overflows"); break;
                         }
                         sampled_guest_need = level_offset + selected_slice;
-                    } else if (dim_2d_array && r->depth > 1) {
+                    } else if ((dim_2d_array || dim_cube_stacked) && sampled_layers > 1) {
+                        const size_t selected_slice = r->in_mip_tail
+                            ? r->mip_tail_bytes : slice;
                         const size_t layer_stride = r->layer_stride_bytes
-                            ? r->layer_stride_bytes : slice;
+                            ? r->layer_stride_bytes : selected_slice;
                         const size_t level_offset = r->in_mip_tail
                             ? 0u : r->layer_mip_offset_bytes;
-                        if (layer_stride > SIZE_MAX / (r->depth - 1u) ||
-                            level_offset > SIZE_MAX - layer_stride * (r->depth - 1u) ||
-                            slice > SIZE_MAX -
-                                (layer_stride * (r->depth - 1u) + level_offset)) {
+                        if (!selected_slice ||
+                            layer_stride > SIZE_MAX / (sampled_layers - 1u) ||
+                            level_offset > SIZE_MAX - layer_stride * (sampled_layers - 1u) ||
+                            selected_slice > SIZE_MAX -
+                                (layer_stride * (sampled_layers - 1u) + level_offset)) {
                             skip_image(r, "sampled array backing size overflows"); break;
                         }
                         sampled_guest_need =
-                            layer_stride * (r->depth - 1u) + level_offset + slice;
+                            layer_stride * (sampled_layers - 1u) + level_offset + selected_slice;
                     } else {
                         sampled_guest_need = slice;
                     }
@@ -3244,7 +3333,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     } else if (r->tile_mode && dim_3d && r->depth > 1) {
                         sampled_guest_need = tiled_volume_bytes(
                             r->width, r->height, r->depth, r->tile_mode, bpt);
-                    } else if (dim_2d_array && r->depth > 1) {
+                    } else if ((dim_2d_array || dim_cube_stacked) && sampled_layers > 1) {
                         const size_t slice = r->in_mip_tail
                             ? r->mip_tail_bytes
                             : (r->tile_mode
@@ -3257,14 +3346,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             ? r->layer_stride_bytes : slice;
                         const size_t level_offset = r->in_mip_tail
                             ? 0u : r->layer_mip_offset_bytes;
-                        if (!slice || layer_stride > SIZE_MAX / (r->depth - 1u) ||
-                            level_offset > SIZE_MAX - layer_stride * (r->depth - 1u) ||
+                        if (!slice || layer_stride > SIZE_MAX / (sampled_layers - 1u) ||
+                            level_offset > SIZE_MAX - layer_stride * (sampled_layers - 1u) ||
                             slice > SIZE_MAX -
-                                (layer_stride * (r->depth - 1u) + level_offset)) {
+                                (layer_stride * (sampled_layers - 1u) + level_offset)) {
                             skip_image(r, "sampled array backing size overflows"); break;
                         }
                         sampled_guest_need =
-                            layer_stride * (r->depth - 1u) + level_offset + slice;
+                            layer_stride * (sampled_layers - 1u) + level_offset + slice;
                     } else {
                         sampled_guest_need = r->tile_mode
                             ? tiled_surface_bytes(r->width, r->height, r->tile_mode, 0, bpt)
@@ -3276,9 +3365,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (!sampled_guest_need || sampled_guest_need > kMaxComputeImageBytes ||
                     sampled_guest_need > UINT32_MAX) {
                     skip_image(r, "sampled backing exceeds the 512 MiB backend bound"); break;
-                }
-                if (sampled_bpb && dim_2d_array) {
-                    skip_image(r, "block-compressed sampled arrays deferred"); break;
                 }
                 bi.guest_bytes = sampled_guest_need;
                 sampled_guest_source = resource_bytes_for(r, sampled_guest_need);
@@ -3756,40 +3842,59 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     const uint8_t* src = sampled_guest_source;
                     if (!bi.upload_skipped && bpb) {                 // BCn: (block-detile ->) decode
                         const uint32_t bw = (r->width + 3) / 4, bh = (r->height + 3) / 4;
-                        if (dim_2d_array) {
-                            skip_image(r, "block-compressed sampled arrays deferred"); break;
-                        }
+                        const size_t linear_slice = static_cast<size_t>(bw) * bh * bpb;
+                        const uint32_t layers = sampled_layers;
                         std::unique_ptr<uint8_t[]> linear;
-                        const size_t level_offset = cube_face_as_2d &&
-                                r->layer_stride_bytes && !r->in_mip_tail
-                            ? r->layer_mip_offset_bytes : 0u;
-                        const uint8_t* selected = src + level_offset;
-                        const size_t selected_bytes = need - level_offset;
-                        const bool remap = r->tile_mode ||
-                            (cube_face_as_2d && r->layer_stride_bytes);
-                        const uint8_t* decode_source = selected;
+                        const bool layered = layers > 1;
+                        const size_t selected_slice = r->in_mip_tail
+                            ? r->mip_tail_bytes
+                            : (r->tile_mode
+                                   ? tiled_elements_bytes(bw, bh, bpb, r->tile_mode)
+                                   : linear_slice);
+                        const size_t layer_stride = r->layer_stride_bytes
+                            ? r->layer_stride_bytes : selected_slice;
+                        const size_t level_offset = r->in_mip_tail
+                            ? 0u : r->layer_mip_offset_bytes;
+                        const bool padded_linear = !r->tile_mode &&
+                            (r->layer_stride_bytes || r->linear_row_pitch_bytes);
+                        const bool remap = r->tile_mode || padded_linear || level_offset ||
+                            (layered && layer_stride != linear_slice);
+                        const uint8_t* decode_source = src;
                         if (remap) {
-                            linear = std::make_unique_for_overwrite<uint8_t[]>((size_t)bw * bh * bpb);
+                            linear = std::make_unique_for_overwrite<uint8_t[]>(linear_slice * layers);
                             decode_source = linear.get();
                         }
-                        if (r->tile_mode && r->in_mip_tail)
-                            detile_elements_level(linear.get(), selected, selected_bytes,
-                                                  bw, bh, bpb,
-                                                  r->tile_mode, r->mip_tail_x,
-                                                  r->mip_tail_y);
-                        else if (r->tile_mode)
-                            detile_elements(linear.get(), selected, selected_bytes,
-                                            bw, bh, bpb, r->tile_mode);
-                        else if (cube_face_as_2d && r->layer_stride_bytes) {
-                            const size_t row_pitch = linear_sampled_row_pitch(bw, bpb);
-                            for (uint32_t y = 0; y < bh; ++y)
-                                std::memcpy(linear.get() + static_cast<size_t>(y) * bw * bpb,
+                        if (remap) {
+                            for (uint32_t layer = 0; layer < layers; ++layer) {
+                                const uint8_t* selected = src + layer_stride * layer + level_offset;
+                                uint8_t* linear_layer = linear.get() + linear_slice * layer;
+                                if (r->tile_mode && r->in_mip_tail) {
+                                    detile_elements_level(
+                                        linear_layer, selected, selected_slice,
+                                        bw, bh, bpb, r->tile_mode,
+                                        r->mip_tail_x, r->mip_tail_y);
+                                } else if (r->tile_mode) {
+                                    detile_elements(linear_layer, selected, selected_slice,
+                                                    bw, bh, bpb, r->tile_mode);
+                                } else {
+                                    const size_t row_pitch = linear_sampled_row_pitch(bw, bpb);
+                                    for (uint32_t y = 0; y < bh; ++y)
+                                        std::memcpy(
+                                            linear_layer + static_cast<size_t>(y) * bw * bpb,
                                             selected + static_cast<size_t>(y) * row_pitch,
                                             static_cast<size_t>(bw) * bpb);
+                                }
+                            }
                         }
-                        if (!bc_decode_surface(upload, decode_source, (size_t)bw * bh * bpb,
-                                               r->width, r->height, r->format)) {
-                            skip_image(r, "BC decode unsupported"); break; }
+                        for (uint32_t layer = 0; layer < layers; ++layer) {
+                            if (!bc_decode_surface(
+                                    upload + static_cast<size_t>(layer) * r->width * r->height * 4u,
+                                    decode_source + linear_slice * layer, linear_slice,
+                                    r->width, r->height, r->format)) {
+                                skip_image(r, "BC decode unsupported"); break;
+                            }
+                        }
+                        if (!images_ready) break;
                     } else if (!bi.upload_skipped) {
                         const uint32_t bpt = r11g11b10 ? 4u : cb * nc;
                         const size_t linear_bytes = static_cast<size_t>(volume_texels) * bpt;
@@ -3832,7 +3937,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                                r->tile_mode, bpt)) {
                                 skip_image(r, "sampled volume detile failed"); break;
                             }
-                        } else if (dim_2d_array && r->depth > 1) {
+                        } else if ((dim_2d_array || dim_cube_stacked) && sampled_layers > 1) {
                             const size_t selected_slice = r->in_mip_tail
                                 ? r->mip_tail_bytes
                                 : (r->tile_mode
@@ -3844,7 +3949,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             const size_t layer_stride = r->layer_stride_bytes
                                 ? r->layer_stride_bytes : selected_slice;
                             const size_t linear_slice = static_cast<size_t>(r->width) * r->height * bpt;
-                            for (uint32_t layer = 0; layer < r->depth; ++layer) {
+                            for (uint32_t layer = 0; layer < sampled_layers; ++layer) {
                                 const uint8_t* layer_base = src + layer_stride * layer;
                                 if (!r->tile_mode) {
                                     const size_t row_pitch = r->layer_stride_bytes
@@ -3924,7 +4029,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
             ici.imageType = dim_1d ? VK_IMAGE_TYPE_1D : (dim_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D);
             ici.format = image_format;
-            ici.extent = {r->width, r->height, dim_3d ? bi.texel_depth : 1u};
+            ici.extent = {r->width, dim_cube_stacked ? r->height * 6u : r->height,
+                          dim_3d ? bi.texel_depth : 1u};
             ici.mipLevels = 1;
             ici.arrayLayers = bi.array_layers;
             ici.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -4095,7 +4201,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         std::vector<VkDescriptorImageInfo> image_infos(images.size());
         std::vector<VkWriteDescriptorSet> writes(buffers.size() + images.size());
         for (size_t i = 0; i < buffers.size(); i++) {
-            buffer_infos[i] = {buffers[i].buffer, 0, buffers[i].resource->size};
+            buffer_infos[i] = {buffers[i].buffer, 0, buffers[i].bytes};
             writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             writes[i].dstSet = descriptor_set;
             writes[i].dstBinding = descriptors[i].binding;
@@ -4411,7 +4517,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             to_dst.srcQueueFamilyIndex = to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             to_dst.image = bi.image;
-            const VkImageAspectFlags aspect = r->depth_compare
+            const VkImageAspectFlags aspect = bi.depth_view
                 ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
             to_dst.subresourceRange = {aspect, 0, 1, 0, bi.array_layers};
             vkCmdPipelineBarrier(command,
@@ -4420,7 +4526,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_dst);
             VkBufferImageCopy region{};
             region.imageSubresource = {aspect, 0, 0, bi.array_layers};
-            region.imageExtent = {r->width, r->height,
+            region.imageExtent = {r->width, bi.stacked_cube ? r->height * 6u : r->height,
                                   bi.array_layers > 1 ? 1u : bi.texel_depth};
             vkCmdCopyBufferToImage(command, staging[i], bi.image,
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
@@ -4759,17 +4865,48 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 continue;
             }
             void* mapped = nullptr;
-            if (ctx.map_memory(buffer.memory, 0, buffer.resource->size, &mapped) != VK_SUCCESS) {
+            if (ctx.map_memory(buffer.memory, 0, buffer.bytes, &mapped) != VK_SUCCESS) {
                 readback_ok = false;
                 break;
             }
             uint8_t* destination = resource_bytes(buffer.resource);
             const auto* result = static_cast<const uint8_t*>(mapped);
+            if (buffer.atomic_image) {
+                if (trace) {
+                    buffer.after_hash = fnv1a(result, buffer.bytes);
+                    for (size_t i = 0; i < buffer.bytes; ++i)
+                        buffer.changed_bytes += buffer.linear_seed[i] != result[i];
+                }
+                if (!buffer.resource->host_data && buffer.resource->gpu_addr)
+                    prosper::host::guest_write_watch_notify_host_write(
+                        buffer.resource->gpu_addr, buffer.resource->size);
+                if (buffer.resource->tile_mode) {
+                    tile_surface(destination, result,
+                                 buffer.resource->width, buffer.resource->height,
+                                 buffer.resource->tile_mode, 0, sizeof(uint32_t));
+                } else {
+                    const size_t tight_pitch = static_cast<size_t>(buffer.resource->width) * 4u;
+                    const size_t destination_pitch = buffer.resource->linear_row_pitch_bytes
+                        ? buffer.resource->linear_row_pitch_bytes : tight_pitch;
+                    for (uint32_t y = 0; y < buffer.resource->height; ++y)
+                        std::memcpy(destination + y * destination_pitch,
+                                    result + y * tight_pitch, tight_pitch);
+                }
+                ctx.unmap_memory(buffer.memory);
+                if (buffer.resource->gpu_addr)
+                    notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.resource->size);
+                if (!buffer.resource->host_data && writer_provenance_enabled())
+                    record_guest_write(GuestWriterKind::ComputeBuffer,
+                                       buffer.resource->gpu_addr, buffer.resource->size,
+                                       item.submit_no, item.dispatch_index,
+                                       item.command_order, item.code_addr);
+                continue;
+            }
             const bool changed = !compute_buffers_equal(
-                destination, result, buffer.resource->size);
+                destination, result, buffer.bytes);
             if (trace) {
-                buffer.after_hash = fnv1a(result, buffer.resource->size);
-                for (uint32_t i = 0; i < buffer.resource->size; i++)
+                buffer.after_hash = fnv1a(result, buffer.bytes);
+                for (size_t i = 0; i < buffer.bytes; i++)
                     buffer.changed_bytes += destination[i] != result[i];
             }
             // Synchronous Unity maintenance kernels commonly rewrite a large persistent buffer with
@@ -4782,7 +4919,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (!buffer.resource->host_data && buffer.resource->gpu_addr)
                     prosper::host::guest_write_watch_notify_host_write(
                         buffer.resource->gpu_addr, buffer.resource->size);
-                copy_compute_buffer(destination, result, buffer.resource->size);
+                copy_compute_buffer(destination, result, buffer.bytes);
             }
             if (buffer.persistent && !buffer.result_baseline &&
                 ctx.retain_cached_buffer_result(buffer.cache_key, result) && trace)

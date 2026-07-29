@@ -364,12 +364,20 @@ struct SpirvDescriptorBinding {
     // Storage-image sampled type encoded by SPIR-V. This is the backend's authoritative choice
     // between a native float VkFormat and the portable raw-uvec4 conversion path, including replay.
     bool storage_float = false;
-    // OpTypeImage shape for image descriptors (SPIR-V Dim: 0=1D, 1=2D, 2=3D, 3=Cube).
-    // UINT32_MAX denotes a non-image descriptor. Backends use this generated-shader contract when
-    // a guest T# is view-compatible but not shape-identical (for example DIM=2D over cube face 0).
+    // Exact OpTypeImage shape. Backends use this instead of guessing from the guest T#: a DIM=5
+    // packet may deliberately compile either as the historical base-slice 2D fallback or as a real
+    // 2D-array image whose layer coordinate must match a VK_IMAGE_VIEW_TYPE_2D_ARRAY view. It also
+    // distinguishes a guest cube descriptor compiled as an ordinary 2D face view.
     uint32_t image_dim = UINT32_MAX;
     bool image_arrayed = false;
     bool image_multisampled = false;
+    // OpTypeImage Depth. IMAGE_SAMPLE_C* currently lowers to an in-shader comparison over an
+    // ordinary color sampler, so this remains false even when ShaderResource::depth_compare says
+    // that the guest instruction performs a comparison. Backends must follow the SPIR-V type here.
+    bool image_depth = false;
+    // The descriptor is reached by an OpAtomic*. Compute uses this to recognize the deliberately
+    // buffer-backed view of an exact R32_UINT StorageImage (the RADV image-atomic workaround).
+    bool atomic_access = false;
 };
 
 enum class DescriptorIssueCode : uint32_t {

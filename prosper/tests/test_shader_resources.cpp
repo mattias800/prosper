@@ -306,6 +306,22 @@ int main() {
               atomic_report.descriptors[1].binding == 10 &&
               atomic_report.descriptors[1].writable,
           "write-only atomic access reflects its writable storage-buffer descriptor");
+    ShaderResource graphics_atomic_image = atomic;
+    graphics_atomic_image.cls = ResourceClass::StorageImage;
+    graphics_atomic_image.format = DataFormat::Uint32;
+    graphics_atomic_image.num_components = 1;
+    graphics_atomic_image.img_dim = 1;
+    graphics_atomic_image.width = graphics_atomic_image.height = 1;
+    graphics_atomic_image.depth = 1;
+    ShaderResourceTable graphics_atomic_mismatch;
+    graphics_atomic_mismatch.resources = {good, graphics_atomic_image};
+    const DescriptorValidationReport graphics_atomic_mismatch_report =
+        validate_spirv_descriptor_interface(
+            atomic_descriptor_test_spirv(), &graphics_atomic_mismatch, 0,
+            SpirvShaderStage::Vertex);
+    CHECK(!graphics_atomic_mismatch_report.ok() &&
+              has_issue(graphics_atomic_mismatch_report, DescriptorIssueCode::WrongType),
+          "graphics atomic buffers cannot use the compute-only storage-image exception");
 
     ShaderResourceTable missing;
     auto mr = validate_spirv_descriptor_interface(spv, &missing, 0, SpirvShaderStage::Vertex);
