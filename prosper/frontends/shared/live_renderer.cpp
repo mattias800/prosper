@@ -1276,6 +1276,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     bool resource_buffer_view = false;
                     double resource_buffer_probe_ms = 0.0;
                     double resource_buffer_copy_ms = 0.0;
+                    double resource_texture_validation_ms = 0.0;
+                    size_t resource_texture_validated_bytes = 0;
+                    size_t resource_texture_source_bytes = 0;
+                    int resource_texture_submit_query = -1;
+                    int resource_texture_watch_query = -1;
+                    uint32_t resource_texture_watch_stability = 0;
+                    bool resource_texture_exact_validation = false;
+                    bool resource_texture_watch_active = false;
+                    bool resource_texture_watch_disabled = false;
+                    bool resource_texture_watch_only = false;
                     prosper::test::FrameResource fr; fr.binding = r.binding; fr.set = set;
                     fr.is_storage_image = r.cls == RC::StorageImage;
                     const bool normalized_sampling =
@@ -1673,6 +1683,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             ? r.metadata_addr : r.gpu_addr;
                         const size_t persistent_source_size = persistent_dcc_fast_clear
                             ? sampled_dcc_metadata.size() : persistent_base_source_size;
+                        resource_texture_source_bytes = persistent_source_size;
                         auto copy_persistent_source = [&](uint8_t* dst, size_t bytes) {
                             return persistent_dcc_fast_clear
                                 ? copy_dcc_metadata(dst, bytes)
@@ -1729,11 +1740,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             if (cached != persistent_decoded_textures.end() &&
                                 cached->second.source_addr == persistent_source_addr &&
                                 cached->second.source_size == persistent_source_size) {
+                                resource_texture_watch_active =
+                                    static_cast<bool>(cached->second.source_watch);
+                                resource_texture_watch_disabled =
+                                    cached->second.source_watch_disabled;
+                                resource_texture_watch_only = cached->second.source_watch_only;
+                                resource_texture_watch_stability =
+                                    cached->second.source_watch_stable_validations;
                                 auto validate_exact = [&] {
                                     // A successfully promoted Linux watch may own the mutation proof
                                     // without retaining a second encoded copy. Dirty/Unknown must miss;
                                     // there is deliberately no probabilistic hash fallback here.
                                     if (cached->second.source_watch_only) return false;
+                                    resource_texture_exact_validation = true;
+                                    const auto validation_start = timing_enabled
+                                        ? RenderClock::now() : RenderClock::time_point{};
                                     bool matches = false;
                                     size_t validated_bytes = 0;
                                     if (cached->second.source_matches_pixels) {
@@ -1768,6 +1789,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     if (timing_enabled) {
                                         pending_timing.persistent_validations++;
                                         pending_timing.persistent_validation_bytes += validated_bytes;
+                                        resource_texture_validated_bytes += validated_bytes;
+                                        resource_texture_validation_ms +=
+                                            std::chrono::duration<double, std::milli>(
+                                                RenderClock::now() - validation_start).count();
                                     }
                                     return matches;
                                 };
@@ -1775,16 +1800,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     !getenv("PROSPER_NO_SUBMIT_TEXTURE_VALIDATION_REUSE");
                                 static const bool audit_submit_reuse =
                                     getenv("PROSPER_AUDIT_SUBMIT_TEXTURE_VALIDATION_REUSE") != nullptr;
-                                const bool submit_unchanged = submit_reuse_enabled &&
-                                    prosper::gpu::guest_gpu_writes_since(
+                                const prosper::gpu::GuestGpuWriteQuery submit_query =
+                                    submit_reuse_enabled
+                                    ? prosper::gpu::guest_gpu_writes_since(
                                         cached->second.validation_snapshot, persistent_source_addr,
-                                        persistent_source_size) ==
-                                        prosper::gpu::GuestGpuWriteQuery::Unchanged;
+                                        persistent_source_size)
+                                    : prosper::gpu::GuestGpuWriteQuery::Unknown;
+                                resource_texture_submit_query =
+                                    static_cast<int>(submit_query);
+                                const bool submit_unchanged = submit_reuse_enabled &&
+                                    submit_query == prosper::gpu::GuestGpuWriteQuery::Unchanged;
                                 prosper::host::GuestWriteWatchQuery watch_query =
                                     prosper::host::GuestWriteWatchQuery::Unknown;
                                 if (!submit_unchanged && cross_submit_watch_eligible &&
                                     !cached->second.source_watch_disabled) {
                                     watch_query = cached->second.source_watch.query();
+                                    resource_texture_watch_query =
+                                        static_cast<int>(watch_query);
                                     if (timing_enabled) {
                                         if (watch_query == prosper::host::GuestWriteWatchQuery::Dirty)
                                             pending_timing.persistent_watch_dirty++;
@@ -1859,6 +1891,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                             content_matches,
                                             cross_submit_watch_promotion_validations);
                                 }
+                                resource_texture_watch_active =
+                                    static_cast<bool>(cached->second.source_watch);
+                                resource_texture_watch_disabled =
+                                    cached->second.source_watch_disabled;
+                                resource_texture_watch_only = cached->second.source_watch_only;
+                                resource_texture_watch_stability =
+                                    cached->second.source_watch_stable_validations;
                                 if (content_matches) {
                                     cached->second.last_use = decode_generation;
                                     cached->second.validation_snapshot =
@@ -3225,16 +3264,56 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                         (resource_persistent_hit ? "persistent-hit" :
                                         (resource_persistent_invalidation ? "persistent-invalid" :
                                         (resource_persistent_miss ? "persistent-miss" : "uncached")))));
+                                    auto submit_query_name = [](int query) {
+                                        switch (query) {
+                                            case static_cast<int>(
+                                                prosper::gpu::GuestGpuWriteQuery::Unchanged):
+                                                return "unchanged";
+                                            case static_cast<int>(
+                                                prosper::gpu::GuestGpuWriteQuery::Overlap):
+                                                return "overlap";
+                                            case static_cast<int>(
+                                                prosper::gpu::GuestGpuWriteQuery::Unknown):
+                                                return "unknown";
+                                            default: return "none";
+                                        }
+                                    };
+                                    auto watch_query_name = [](int query) {
+                                        switch (query) {
+                                            case static_cast<int>(
+                                                prosper::host::GuestWriteWatchQuery::Unchanged):
+                                                return "unchanged";
+                                            case static_cast<int>(
+                                                prosper::host::GuestWriteWatchQuery::Dirty):
+                                                return "dirty";
+                                            case static_cast<int>(
+                                                prosper::host::GuestWriteWatchQuery::Unknown):
+                                                return "unknown";
+                                            default: return "none";
+                                        }
+                                    };
                                     fprintf(stderr,
                                             "[render-timing] texture addr=0x%llx %ux%u out=%ux%u "
                                             "fmt=%u comps=%u tile=%u class=%u storage=%d compressed=%d "
-                                            "cache=%s id=%llu %.2f ms\n",
+                                            "cache=%s id=%llu validate=%s %.2fms/%zuB/%zuB "
+                                            "submit=%s watch=%s active=%d disabled=%d only=%d stable=%u "
+                                            "total=%.2f ms\n",
                                             (unsigned long long)r.gpu_addr, r.width, r.height,
                                             fr.tw, fr.th, (unsigned)r.format, r.num_components,
                                             r.tile_mode, static_cast<unsigned>(r.cls),
                                             static_cast<int>(fr.is_storage_image),
                                             static_cast<int>(r.compression_enabled), cache_state,
-                                            (unsigned long long)fr.persistent_texture_id, elapsed);
+                                            (unsigned long long)fr.persistent_texture_id,
+                                            resource_texture_exact_validation ? "exact" : "skip",
+                                            resource_texture_validation_ms,
+                                            resource_texture_validated_bytes,
+                                            resource_texture_source_bytes,
+                                            submit_query_name(resource_texture_submit_query),
+                                            watch_query_name(resource_texture_watch_query),
+                                            static_cast<int>(resource_texture_watch_active),
+                                            static_cast<int>(resource_texture_watch_disabled),
+                                            static_cast<int>(resource_texture_watch_only),
+                                            resource_texture_watch_stability, elapsed);
                                 }
                             }
                         } else {

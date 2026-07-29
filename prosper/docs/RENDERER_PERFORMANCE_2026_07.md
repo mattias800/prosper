@@ -157,6 +157,31 @@ The same scripted diagnostic still recovered the pathological runtime descriptor
 buffer materializations after the change. A full-resolution Plucky replay retained output hash
 `1c5241d9475e752d`, and its before/after BMP files were byte-identical.
 
+## Plucky Squire texture-validation attribution (2026-07-29)
+
+After unused buffer materialization was removed, `PROSPER_RENDER_TIMING=detail` still attributed the
+late route's largest frontend spikes to full-resolution sampled textures. Detail output now separates
+exact-validation time and copied/expected byte counts from total resource time, and reports both the
+submit-local GPU-write query and cross-submit page-watch state. This distinguishes an expensive proof
+of unchanged bytes from an actual decode without changing the cache policy.
+
+The resulting live trace identified two different costs. One 3840x2160 packed-float source was last
+written by compute program `0x3015770000` around submit 1116 and remained unchanged while consumers
+continued beyond submit 2989. Its page watch had disabled during the earlier dynamic phase, so each
+later callback compared the complete 33,423,360-byte source in roughly 3.5-5.8 ms. In contrast,
+same-frame outputs from programs `0x30180d0000` and `0x3015770000` were still being written at their
+consumer submits. Their conservative invalidations caused 64-90 ms BC/packed-float decode paths;
+some packed-float validations copied zero of the expected 33,423,360 bytes because the guest range
+was no longer completely mapped.
+
+A disabled-watch recovery experiment was rejected. Three stable exact matches were insufficient:
+GPU-identical compute dispatches deliberately preserve architectural write notification even when
+they skip guest writeback, so re-arming a 64 MiB page watch cost about 165 ms and the next notification
+made it dirty again. A longer 32/64-hit delay merely reduced the frequency of that cycle and could not
+prove the producer had stopped. The next optimization must therefore carry exact cross-submit GPU
+write/result evidence or bind a retained compute result directly; equality of guest bytes alone is not
+a sound trigger for restoring page protection.
+
 ## Cobra Float32 sampled-texture retention (2026-07-25)
 
 Cobra's title and cinematic repeatedly sample large guest-backed Float32 post-process inputs. The live
