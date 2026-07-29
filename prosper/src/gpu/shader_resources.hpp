@@ -358,6 +358,9 @@ struct SpirvDescriptorBinding {
     // ordinary color sampler, so this remains false even when ShaderResource::depth_compare says
     // that the guest instruction performs a comparison. Backends must follow the SPIR-V type here.
     bool image_depth = false;
+    // The descriptor is reached by an OpAtomic*. Compute uses this to recognize the deliberately
+    // buffer-backed view of an exact R32_UINT StorageImage (the RADV image-atomic workaround).
+    bool atomic_access = false;
 };
 
 enum class DescriptorIssueCode : uint32_t {

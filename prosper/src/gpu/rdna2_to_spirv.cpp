@@ -47,7 +47,8 @@ enum : uint32_t {
     Op_ImageSampleImplicitLod=87, Op_ImageSampleExplicitLod=88,
     Op_ImageSampleDrefImplicitLod=89, Op_ImageSampleDrefExplicitLod=90,
     Op_ImageFetch=95, Op_ImageGather=96, Op_Image=100,
-    Op_ImageRead=98, Op_ImageWrite=99, Op_ImageQuerySizeLod=103, Op_ImageQueryLevels=106,
+    Op_ImageRead=98, Op_ImageWrite=99, Op_ImageQuerySizeLod=103, Op_ImageQuerySize=104,
+    Op_ImageQueryLevels=106,
     Op_TypeArray=28, Op_ControlBarrier=224, Op_AtomicExchange=229, Op_AtomicIAdd=234,
     Op_AtomicISub=235,
     Op_AtomicSMin=236, Op_AtomicUMin=237, Op_AtomicSMax=238, Op_AtomicUMax=239,
@@ -216,6 +217,7 @@ struct SpirvCompute {
     uint32_t v_push_constants = 0, t_ptr_push_u32 = 0;
     uint32_t linear_localid = 0, local_count = 64, wave_size = 64;
     uint32_t v_cbuf=0, v_cbuf1=0, t_ptr_sb_u32=0;   // scalar-memory constant buffers (bindings 2 and 3)
+    uint32_t t_ptr_sb_struct_u=0;                    // shared runtime-u32 Block pointer type
     uint32_t t_ptr_img_u32=0;                       // OpImageTexelPointer result for R32_UINT atomics
     uint32_t guest_scratch=0, t_ptr_guest_scratch_u32=0;
     int32_t guest_scratch_min_byte=0, guest_scratch_saddr=-1;
@@ -1333,16 +1335,35 @@ struct SpirvCompute {
         put(code, Op_Label, {merge}); cur_block = merge;
     }
 
-    // An integer atomic on an R32_UINT storage image. OpImageTexelPointer consumes the descriptor
+    // An integer atomic on an R32_UINT 2D storage image. OpImageTexelPointer consumes the descriptor
     // variable directly (not a loaded image object) and yields an Image-storage pointer suitable for
-    // the SPIR-V atomic. Inactive EXEC lanes neither touch the image nor clobber VDATA.
+    // the SPIR-V atomic. Vulkan leaves an out-of-bounds image atomic undefined (robust image access
+    // does not cover atomics), and RADV can spend seconds in such an atomic before resetting the GPU.
+    // Query the bound view and put BOTH the texel pointer and atomic behind an explicit bounds/EXEC
+    // branch. A skipped lane leaves VDATA unchanged, matching the no-operation EXEC fallback.
     uint32_t image_atomic_u32(uint16_t opcode, uint32_t binding, uint32_t ncoord,
                               const uint32_t* coords, uint32_t value, bool predicated,
                               uint32_t pred, uint32_t fallback) {
+        // The decoder/resource gate currently accepts only non-arrayed 2D R32_UINT atomics.
+        if (ncoord != 2) return fallback;
         if (!t_ptr_img_u32) {
             t_ptr_img_u32 = id();
             put(types, Op_TypePointer, {t_ptr_img_u32, SC_Image, t_u32});
         }
+        if (!declared_image_query) {
+            put(caps, Op_Capability, {Cap_ImageQuery});
+            declared_image_query = true;
+        }
+        const uint32_t image = id();
+        put(code, Op_Load, {stg_img_binding_type[binding], image, stg_img_var[binding]});
+        const uint32_t size = id();
+        put(code, Op_ImageQuerySize, {t_v2i(), size, image});
+        const uint32_t width_i = id(), height_i = id();
+        put(code, Op_CompositeExtract, {t_i32, width_i, size, 0});
+        put(code, Op_CompositeExtract, {t_i32, height_i, size, 1});
+        uint32_t in_bounds = ucmp(Op_ULessThan, coords[0], i2u(width_i));
+        in_bounds = land(in_bounds, ucmp(Op_ULessThan, coords[1], i2u(height_i)));
+        const uint32_t active = predicated ? land(pred, in_bounds) : in_bounds;
         auto emit = [&]() {
             const uint32_t coord = stg_coord(ncoord, coords);
             const uint32_t pointer = id();
@@ -1354,11 +1375,10 @@ struct SpirvCompute {
                  uconst(MemSem_ImageAcqRel), value});
             return result;
         };
-        if (!predicated) return emit();
         const uint32_t entry = cur_block;
         const uint32_t then = id(), merge = id();
         put(code, Op_SelectionMerge, {merge, 0});
-        put(code, Op_BranchConditional, {pred, then, merge});
+        put(code, Op_BranchConditional, {active, then, merge});
         put(code, Op_Label, {then}); cur_block = then;
         const uint32_t result = emit();
         const uint32_t then_end = cur_block;
@@ -1435,6 +1455,19 @@ struct SpirvCompute {
         put(code, Op_Branch, {merge});
         put(code, Op_Label, {merge}); cur_block = merge;
         return emit_phi_2way(t_u32, result, then_end, fallback, entry);
+    }
+    // RADV currently hangs/reset-poisons the device on Astro Bot's compute R32_UINT image atomic.
+    // Compute lowers that exact 2D resource through a detiled storage-buffer view instead. The live
+    // backend recognizes the reflected atomic buffer over a StorageImage resource, detiles before
+    // dispatch, and tiles the result back afterwards. Graphics retains the native image-atomic path.
+    bool declare_compute_atomic_image_buffer(uint32_t binding) {
+        if (!is_compute || !t_ptr_sb_struct_u || cbuf_var.count(binding)) return false;
+        const uint32_t variable = id();
+        put(deco, Op_Decorate, {variable, Dec_DescriptorSet, desc_set});
+        put(deco, Op_Decorate, {variable, Dec_Binding, binding});
+        put(types, Op_Variable, {t_ptr_sb_struct_u, variable, SC_StorageBuffer});
+        cbuf_var[binding] = variable;
+        return true;
     }
     // LDS (Local Data Share) — a workgroup-shared u32 array for compute ds_read/ds_write. NGG shaders
     // are lowered as one independent Vulkan vertex invocation, so their LDS becomes Function-private:
@@ -1702,7 +1735,8 @@ struct SpirvCompute {
     // format_* read. Called by every shell (compute/vertex/fragment) so cbuf_load works in each.
     // Requires t_u32 to already be declared. Unused by shaders without memory ops.
     void declare_cbufs(const ShaderResourceTable* rt = nullptr) {
-        uint32_t t_rta_u = id(), t_struct_u = id(), t_ptr_sb_struct_u = id();
+        uint32_t t_rta_u = id(), t_struct_u = id();
+        t_ptr_sb_struct_u = id();
         v_cbuf = id(); v_cbuf1 = id(); t_ptr_sb_u32 = id();
         put(deco, Op_Decorate, {t_rta_u, Dec_ArrayStride, 4});
         put(deco, Op_MemberDecorate, {t_struct_u, 0, Dec_Offset, 0});
@@ -6855,7 +6889,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     (in.mimg_dim != SQ_DIM_2D || arrayed || ms || in.len_dwords != 2 ||
                      in.mimg_unorm || in.mimg_dmask != 1u ||
                      res->img_dim != 1u || res->depth != 1u || res->depth_compare ||
-                     res->format != DataFormat::Uint32 || components != 1u)) {
+                     res->format != DataFormat::Uint32 || components != 1u ||
+                     !res->width || !res->height)) {
                     ok = false;
                     return true;
                 }
@@ -6868,9 +6903,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // Existing load/store-only uint images retain the raw uvec4/Format=Unknown contract
                 // used by the compute backend. The atomic's exact R32_UINT gate above is the only path
                 // that opts into a typed R32ui image.
-                const bool native_r32ui = is_atomic;
-                b.declare_storage_image(res->binding, dim, arrayed, ms, native_float,
-                                        native_r32ui ? ImgFmt_R32ui : ImgFmt_Unknown);
+                const bool compute_atomic_buffer = is_atomic && b.is_compute;
+                if (compute_atomic_buffer) {
+                    if (!b.declare_compute_atomic_image_buffer(res->binding)) {
+                        ok = false;
+                        return true;
+                    }
+                } else {
+                    const bool native_r32ui = is_atomic;
+                    b.declare_storage_image(res->binding, dim, arrayed, ms, native_float,
+                                            native_r32ui ? ImgFmt_R32ui : ImgFmt_Unknown);
+                }
                 // Coordinate VGPR per axis. Non-NSA (len==2): consecutive from VADDR (src[0]). NSA (len>2):
                 // split across the extra address dwords — coord0 = VADDR, coord k>=1 = byte (k-1) of
                 // words[2..3] (dword2 = addr1..4, dword3 = addr5..8). Layout verified via llvm-mc gfx1010.
@@ -6906,9 +6949,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     const int vd = in.dst.value;
                     const uint32_t old = vreg_old(b, rs, vd);
                     const uint16_t atomic_op = is_atomic_add ? Op_AtomicIAdd : Op_AtomicExchange;
-                    const uint32_t result = b.image_atomic_u32(
-                        atomic_op, res->binding, ncoord, coords, vread(vd),
-                        rs.exec_narrowed, rs.exec, old);
+                    uint32_t result;
+                    if (compute_atomic_buffer) {
+                        const uint32_t index = b.ibin(
+                            Op_IAdd, coords[0],
+                            b.ibin(Op_IMul, coords[1], b.uconst(res->width)));
+                        uint32_t active = b.land(
+                            b.ucmp(Op_ULessThan, coords[0], b.uconst(res->width)),
+                            b.ucmp(Op_ULessThan, coords[1], b.uconst(res->height)));
+                        if (rs.exec_narrowed) active = b.land(rs.exec, active);
+                        result = b.cbuf_atomic_rtn(
+                            atomic_op, index, vread(vd), res->binding,
+                            true, active, old);
+                    } else {
+                        result = b.image_atomic_u32(
+                            atomic_op, res->binding, ncoord, coords, vread(vd),
+                            rs.exec_narrowed, rs.exec, old);
+                    }
                     if (in.mimg_glc) rs.vreg[vd] = result;
                 }
                 return true;

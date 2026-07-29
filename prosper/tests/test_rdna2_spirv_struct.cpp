@@ -1066,10 +1066,13 @@ int main() {
         0xf800000fu, 0x03020100u, 0xbf810000u,
     };
     ShaderResourceTable rt_atomic_image;
+    uint32_t atomic_image_pixel = 0;
     { ShaderResource image{}; image.cls = ResourceClass::StorageImage;
       image.format = DataFormat::Uint32; image.num_components = 1;
       image.binding = 4; image.img_dim = 1; image.width = 1; image.height = 1;
-      image.depth = 1; image.sgpr_base = 0; rt_atomic_image.resources.push_back(image); }
+      image.depth = 1; image.sgpr_base = 0; image.size = sizeof(atomic_image_pixel);
+      image.host_data = reinterpret_cast<uint8_t*>(&atomic_image_pixel);
+      image.host_data_size = sizeof(atomic_image_pixel); rt_atomic_image.resources.push_back(image); }
     const std::vector<uint32_t> atomic_image_spv = recompile_fragment(
         ps_image_atomic, std::size(ps_image_atomic), &rt_atomic_image);
     if (atomic_image_spv.empty() || !has_opcode(atomic_image_spv, 60u) ||
@@ -1085,14 +1088,35 @@ int main() {
         0xf0442108u, 0x00000900u,
         0xbf810000u,
     };
-    const std::vector<uint32_t> atomic_add_spv = recompile_valu(
-        cs_image_atomic_add, std::size(cs_image_atomic_add), 0, 0, &rt_atomic_image);
-    if (atomic_add_spv.empty() || !has_opcode(atomic_add_spv, 60u) ||
-        !has_opcode(atomic_add_spv, 234u)) {
-        printf("  [FAIL] image_atomic_add did not lower through OpImageTexelPointer/OpAtomicIAdd\n");
+    ComputeShaderConfig atomic_add_config;
+    atomic_add_config.local_x = 1;
+    const std::vector<uint32_t> atomic_add_spv = recompile_compute(
+        cs_image_atomic_add, std::size(cs_image_atomic_add),
+        &rt_atomic_image, atomic_add_config);
+    const DescriptorValidationReport atomic_add_report = validate_spirv_descriptor_interface(
+        atomic_add_spv, &rt_atomic_image, 0, SpirvShaderStage::Compute, false);
+    if (atomic_add_spv.empty() || has_opcode(atomic_add_spv, 60u) ||
+        !has_opcode(atomic_add_spv, 65u) || !has_opcode(atomic_add_spv, 234u) ||
+        !has_opcode(atomic_add_spv, 176u) || !has_opcode(atomic_add_spv, 167u) ||
+        !has_opcode(atomic_add_spv, 250u) || !has_opcode(atomic_add_spv, 245u) ||
+        !atomic_add_report.ok() || atomic_add_report.descriptors.size() != 1 ||
+        atomic_add_report.descriptors[0].kind != SpirvDescriptorKind::StorageBuffer ||
+        !atomic_add_report.descriptors[0].atomic_access) {
+        printf("  [FAIL] compute image_atomic_add lacks its guarded atomic-buffer lowering\n");
         return 1;
     }
-    printf("  [ok]   image_atomic_add lowers to a typed R32_UINT SPIR-V image atomic\n");
+    printf("  [ok]   compute image_atomic_add uses a bounds-checked atomic buffer view\n");
+    ShaderResourceTable undersized_atomic_image = rt_atomic_image;
+    undersized_atomic_image.resources[0].size = sizeof(atomic_image_pixel) - 1;
+    const DescriptorValidationReport undersized_atomic_report =
+        validate_spirv_descriptor_interface(
+            atomic_add_spv, &undersized_atomic_image, 0,
+            SpirvShaderStage::Compute, false);
+    if (undersized_atomic_report.ok()) {
+        printf("  [FAIL] compute atomic-buffer view accepted an undersized image backing\n");
+        return 1;
+    }
+    printf("  [ok]   compute atomic-buffer view rejects an undersized image backing\n");
 
     // Astro Bot's visibility kernel sanitizes a generated coordinate with an explicit-SDST
     // v_cmp_class_f32 SDWA (mask 3 = sNaN|qNaN), followed by v_cndmask reading s[8:9]. Rejecting

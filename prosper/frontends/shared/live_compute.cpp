@@ -1324,12 +1324,15 @@ struct BoundBuffer {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     size_t alias_of = SIZE_MAX;         // exact guest range sharing an earlier storage buffer
+    size_t bytes = 0;                   // Vulkan buffer bytes (may be a detiled image view)
     bool writable = false;              // reflected OpStore/writing-atomic reachability
+    bool atomic_image = false;           // R32_UINT StorageImage exposed as a linear atomic SSBO
     bool persistent = false;
     bool upload_skipped = false;
     uint32_t dirty_watch_chunks = 0;
     uint32_t total_watch_chunks = 0;
     ComputeBufferCacheKey cache_key{};
+    std::vector<uint8_t> linear_seed;    // detiled upload for an atomic-image buffer
     uint64_t before_hash = 0, after_hash = 0;
     uint64_t changed_bytes = 0;
 };
@@ -1942,10 +1945,35 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                  !guest_readable(resource->gpu_addr, resource->size))) break;
             buffers[i].resource = resource;
             buffers[i].writable = descriptors[i].writable;
+            buffers[i].atomic_image = descriptors[i].atomic_access &&
+                resource->cls == ResourceClass::StorageImage &&
+                resource->format == DataFormat::Uint32 && resource->num_components == 1 &&
+                resource->img_dim == 1 && resource->depth == 1 &&
+                !resource->depth_compare && resource->width && resource->height;
+            const uint64_t linear_image_bytes = static_cast<uint64_t>(resource->width) *
+                resource->height * sizeof(uint32_t);
+            if (buffers[i].atomic_image) {
+                const size_t tight_pitch = static_cast<size_t>(resource->width) * sizeof(uint32_t);
+                const size_t guest_image_bytes = resource->tile_mode
+                    ? tiled_surface_bytes(resource->width, resource->height,
+                                          resource->tile_mode, 0, sizeof(uint32_t))
+                    : (resource->linear_row_pitch_bytes
+                           ? static_cast<size_t>(resource->linear_row_pitch_bytes)
+                           : tight_pitch) * resource->height;
+                if (linear_image_bytes > UINT32_MAX ||
+                    (!resource->tile_mode && resource->linear_row_pitch_bytes &&
+                     resource->linear_row_pitch_bytes < tight_pitch) ||
+                    !guest_image_bytes || guest_image_bytes > resource->size)
+                    break;
+            }
+            buffers[i].bytes = buffers[i].atomic_image
+                ? static_cast<size_t>(linear_image_bytes) : resource->size;
             for (size_t j = 0; j < i; ++j) {
                 const ShaderResource* prior = buffers[j].resource;
                 if (!prior || prior->gpu_addr != resource->gpu_addr ||
                     prior->size != resource->size ||
+                    buffers[j].atomic_image != buffers[i].atomic_image ||
+                    buffers[j].bytes != buffers[i].bytes ||
                     prior->host_data != resource->host_data ||
                     prior->host_data_size != resource->host_data_size)
                     continue;
@@ -1958,11 +1986,36 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             if (buffers[i].alias_of == SIZE_MAX) {
                 const uint8_t* source = resource_bytes(resource);
-                if (trace) buffers[i].before_hash = fnv1a(source, resource->size);
+                if (buffers[i].atomic_image) {
+                    buffers[i].linear_seed.resize(buffers[i].bytes);
+                    if (resource->tile_mode) {
+                        detile_surface(buffers[i].linear_seed.data(), source,
+                                       resource->width, resource->height,
+                                       resource->tile_mode, 0, sizeof(uint32_t));
+                    } else {
+                        const size_t tight_pitch = static_cast<size_t>(resource->width) * 4u;
+                        const size_t source_pitch = resource->linear_row_pitch_bytes
+                            ? resource->linear_row_pitch_bytes : tight_pitch;
+                        for (uint32_t y = 0; y < resource->height; ++y)
+                            std::memcpy(buffers[i].linear_seed.data() + y * tight_pitch,
+                                        source + y * source_pitch, tight_pitch);
+                    }
+                    source = buffers[i].linear_seed.data();
+                    if (trace)
+                        std::fprintf(stderr,
+                                     "[compute]   atomic-image buffer binding=%u addr=0x%llx "
+                                     "extent=%ux%u tile=%u bytes=%zu\n",
+                                     resource->binding,
+                                     (unsigned long long)resource->gpu_addr,
+                                     resource->width, resource->height,
+                                     resource->tile_mode, buffers[i].bytes);
+                }
+                if (trace) buffers[i].before_hash = fnv1a(source, buffers[i].bytes);
                 buffers[i].cache_key = {
                     resource->gpu_addr, reinterpret_cast<uintptr_t>(resource->host_data),
-                    resource->size};
-                const bool cache_candidate = persistent_compute_buffer_enabled(resource->size);
+                    static_cast<uint32_t>(buffers[i].bytes)};
+                const bool cache_candidate = !buffers[i].atomic_image &&
+                    persistent_compute_buffer_enabled(static_cast<uint32_t>(buffers[i].bytes));
                 if (cache_candidate && ctx.acquire_cached_buffer(
                         buffers[i].cache_key, source, buffers[i].buffer, buffers[i].memory,
                         buffers[i].upload_skipped, buffers[i].dirty_watch_chunks,
@@ -1970,7 +2023,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     buffers[i].persistent = true;
                 } else {
                     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-                    bci.size = resource->size;
+                    bci.size = buffers[i].bytes;
                     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
                     if (vkCreateBuffer(ctx.device, &bci, nullptr, &buffers[i].buffer) != VK_SUCCESS)
                         break;
@@ -1984,12 +2037,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         VK_SUCCESS)
                         break;
                     void* mapped = nullptr;
-                    if (ctx.map_memory(buffers[i].memory, 0, resource->size, &mapped) != VK_SUCCESS)
+                    if (ctx.map_memory(buffers[i].memory, 0, buffers[i].bytes, &mapped) != VK_SUCCESS)
                         break;
                     // Pooled host-visible allocations retain their previous contents. Compare them
                     // with current guest memory before uploading: any mutation takes the exact copy.
-                    if (!compute_buffers_equal(mapped, source, resource->size))
-                        copy_compute_buffer(mapped, source, resource->size);
+                    if (!compute_buffers_equal(mapped, source, buffers[i].bytes))
+                        copy_compute_buffer(mapped, source, buffers[i].bytes);
                     ctx.unmap_memory(buffers[i].memory);
                     if (cache_candidate && ctx.retain_buffer(
                             buffers[i].cache_key, buffers[i].buffer, buffers[i].memory,
@@ -3341,7 +3394,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         std::vector<VkDescriptorImageInfo> image_infos(images.size());
         std::vector<VkWriteDescriptorSet> writes(buffers.size() + images.size());
         for (size_t i = 0; i < buffers.size(); i++) {
-            buffer_infos[i] = {buffers[i].buffer, 0, buffers[i].resource->size};
+            buffer_infos[i] = {buffers[i].buffer, 0, buffers[i].bytes};
             writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             writes[i].dstSet = descriptor_set;
             writes[i].dstBinding = descriptors[i].binding;
@@ -3747,17 +3800,48 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (auto& buffer : buffers) {
             if (buffer.alias_of != SIZE_MAX || !buffer.writable) continue;
             void* mapped = nullptr;
-            if (ctx.map_memory(buffer.memory, 0, buffer.resource->size, &mapped) != VK_SUCCESS) {
+            if (ctx.map_memory(buffer.memory, 0, buffer.bytes, &mapped) != VK_SUCCESS) {
                 readback_ok = false;
                 break;
             }
             uint8_t* destination = resource_bytes(buffer.resource);
             const auto* result = static_cast<const uint8_t*>(mapped);
+            if (buffer.atomic_image) {
+                if (trace) {
+                    buffer.after_hash = fnv1a(result, buffer.bytes);
+                    for (size_t i = 0; i < buffer.bytes; ++i)
+                        buffer.changed_bytes += buffer.linear_seed[i] != result[i];
+                }
+                if (!buffer.resource->host_data && buffer.resource->gpu_addr)
+                    prosper::host::guest_write_watch_notify_host_write(
+                        buffer.resource->gpu_addr, buffer.resource->size);
+                if (buffer.resource->tile_mode) {
+                    tile_surface(destination, result,
+                                 buffer.resource->width, buffer.resource->height,
+                                 buffer.resource->tile_mode, 0, sizeof(uint32_t));
+                } else {
+                    const size_t tight_pitch = static_cast<size_t>(buffer.resource->width) * 4u;
+                    const size_t destination_pitch = buffer.resource->linear_row_pitch_bytes
+                        ? buffer.resource->linear_row_pitch_bytes : tight_pitch;
+                    for (uint32_t y = 0; y < buffer.resource->height; ++y)
+                        std::memcpy(destination + y * destination_pitch,
+                                    result + y * tight_pitch, tight_pitch);
+                }
+                ctx.unmap_memory(buffer.memory);
+                if (buffer.resource->gpu_addr)
+                    notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.resource->size);
+                if (!buffer.resource->host_data && writer_provenance_enabled())
+                    record_guest_write(GuestWriterKind::ComputeBuffer,
+                                       buffer.resource->gpu_addr, buffer.resource->size,
+                                       item.submit_no, item.dispatch_index,
+                                       item.command_order, item.code_addr);
+                continue;
+            }
             const bool changed = !compute_buffers_equal(
-                destination, result, buffer.resource->size);
+                destination, result, buffer.bytes);
             if (trace) {
-                buffer.after_hash = fnv1a(result, buffer.resource->size);
-                for (uint32_t i = 0; i < buffer.resource->size; i++)
+                buffer.after_hash = fnv1a(result, buffer.bytes);
+                for (size_t i = 0; i < buffer.bytes; i++)
                     buffer.changed_bytes += destination[i] != result[i];
             }
             // Synchronous Unity maintenance kernels commonly rewrite a large persistent buffer with
@@ -3770,7 +3854,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (!buffer.resource->host_data && buffer.resource->gpu_addr)
                     prosper::host::guest_write_watch_notify_host_write(
                         buffer.resource->gpu_addr, buffer.resource->size);
-                copy_compute_buffer(destination, result, buffer.resource->size);
+                copy_compute_buffer(destination, result, buffer.bytes);
             }
             ctx.unmap_memory(buffer.memory);
             if (buffer.resource->gpu_addr)
