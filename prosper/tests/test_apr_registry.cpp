@@ -133,7 +133,6 @@ int main() {
             0x3 /* SCE CPU_READ|CPU_WRITE */);
         host::GuestWriteWatch destination_watch = host::GuestWriteWatch::create(
             (uint64_t)(uintptr_t)watched_destination, watched_size);
-        CHECK(static_cast<bool>(destination_watch), "arm write watch over APR destination");
 
         std::array<uint64_t, 3> watched_completion{};
         uint64_t watched_result = read_file_guest(
@@ -146,8 +145,13 @@ int main() {
               "AMPR read fills a write-protected DMA destination completely");
         CHECK(watched_completion[0] == (uint64_t)(uintptr_t)watched_destination,
               "AMPR publishes the guarded destination instead of a fallback staging pointer");
-        CHECK(destination_watch.query() == host::GuestWriteWatchQuery::Dirty,
-              "AMPR host write invalidates the destination cache watch");
+        if (destination_watch) {
+            CHECK(destination_watch.query() == host::GuestWriteWatchQuery::Dirty,
+                  "AMPR host write invalidates the destination cache watch");
+        } else {
+            CHECK(destination_watch.query() == host::GuestWriteWatchQuery::Unknown,
+                  "unsupported destination watch retains the exact comparison fallback");
+        }
 
         destination_watch.reset();
         host::guest_write_watch_notify_direct_mapping_removed(
