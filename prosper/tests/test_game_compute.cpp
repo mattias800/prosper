@@ -23,8 +23,10 @@ static int fails = 0;
 int main() {
 #ifdef _WIN32
     _putenv_s("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB", "0");
+    _putenv_s("PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB", "1");
 #else
     setenv("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB", "0", 1);
+    setenv("PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB", "1", 1);
 #endif
     bool half_luts_match = true;
     for (uint32_t bits = 0; bits <= 0xffffu; ++bits) {
@@ -440,6 +442,53 @@ int main() {
     set_guest_gpu_write_observer({});
     CHECK(unchanged_write_notifications == 1,
           "idempotent compute writes still invalidate divergent renderer-resident state");
+
+    // Plucky Squire binds the same 32 MiB writable lighting buffer to consecutive kernels even
+    // when their output is byte-identical to the previous frame. Exercise the production cache at
+    // its one-MiB retention threshold: the second dispatch can use the exact GPU-side baseline,
+    // while a later external guest mutation must defeat that shortcut and be repaired normally.
+    {
+        constexpr uint32_t large_buffer_bytes = 1u << 20;
+        std::vector<uint32_t> large_result(large_buffer_bytes / sizeof(uint32_t), 0xababababu);
+        ShaderResource large_buffer = buffer;
+        large_buffer.gpu_addr = reinterpret_cast<uint64_t>(large_result.data());
+        large_buffer.size = large_buffer_bytes;
+        ShaderResourceTable large_rt;
+        large_rt.resources.push_back(large_buffer);
+        ComputeItem large_item = item;
+        large_item.resources = std::make_shared<ShaderResourceTable>(large_rt);
+        large_item.code_addr = 0x401aec210;
+
+        CHECK(prosper::frontend::execute_live_compute_items({large_item}),
+              "large writable buffer dispatch establishes an exact retained result");
+        const std::vector<uint32_t> large_expected = large_result;
+        const uint64_t buffer_skips_before =
+            prosper::frontend::live_compute_buffer_gpu_result_skips();
+        uint32_t large_repeat_notifications = 0;
+        set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+            if (addr == large_buffer.gpu_addr && size == large_buffer.size)
+                ++large_repeat_notifications;
+        });
+        CHECK(prosper::frontend::execute_live_compute_items({large_item}),
+              "large writable buffer repeats against its exact GPU baseline");
+        set_guest_gpu_write_observer({});
+        CHECK(large_result == large_expected && large_repeat_notifications == 1,
+              "GPU-identical buffer output preserves bytes and architectural invalidation");
+        CHECK(prosper::frontend::live_compute_buffer_gpu_result_skips() > buffer_skips_before,
+              "large idempotent buffer takes the exact GPU result-comparison fast path");
+
+        large_result[0] ^= 0xffffffffu;
+        uint32_t large_repair_notifications = 0;
+        set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+            if (addr == large_buffer.gpu_addr && size == large_buffer.size)
+                ++large_repair_notifications;
+        });
+        CHECK(prosper::frontend::execute_live_compute_items({large_item}),
+              "externally changed buffer reruns with exact source validation");
+        set_guest_gpu_write_observer({});
+        CHECK(large_result == large_expected && large_repair_notifications == 1,
+              "external buffer mutation forces exact guest repair and invalidation");
+    }
 
     std::fill(result.begin(), result.end(), 0xeeeeeeee);
     item.user_sgprs = alternate_config.user_sgprs;

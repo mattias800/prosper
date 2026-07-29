@@ -1029,6 +1029,48 @@ cross-frame guest-memory cache. Correctness is therefore pinned by the raw 3D pr
 it proves full coverage, establishes an exact baseline, skips an identical third write, then mutates
 the guest mirror and requires one exact repair write and invalidation.
 
+## Plucky Squire: repeated large writable buffers
+
+A clean live profile (phase timing only; no `PROSPER_COMPUTELOG` hashing) found two consecutive
+lighting kernels spending about **1.53 ms/frame** in buffer writeback: program `0x30179b0000` had a
+0.98 ms median and `0x30179d0000` had a 0.55 ms median. Guest relocation names those same programs
+`0x3017970000` and `0x3017990000` in the corresponding capture and live A/B. The capture shows the
+first kernel's writable result is a 33,423,360-byte buffer that is byte-identical on repeated
+dispatches. The old path still mapped and compared every byte on the CPU before learning that no guest
+copy was needed.
+
+Large persistent writable buffers now retain a second exact storage buffer as their previous result.
+When guest GPU-write provenance or the host write watch proves the guest mirror unchanged, the shared
+GPU comparator checks current versus baseline and returns one changed flag. An equal flag omits the
+large host mapping/comparison but preserves the architectural GPU-write notification. If guest memory
+changed externally, source validation disables the shortcut; the ordinary CPU comparison repairs the
+guest exactly, while a transfer advances the GPU baseline to the new result. This is the same
+collision-free contract used by retained storage images, not a content hash.
+
+An 80-repeat isolated replay of capture compute 22 measured the following medians after discarding the
+first five iterations:
+
+| | exact GPU result comparison | CPU result comparison |
+|---|---:|---:|
+| writeback | 0.02 ms | 0.77 ms |
+| dispatch (including comparator) | 0.65 ms | 0.27 ms |
+| total | **1.66 ms** | **1.96 ms** |
+
+The replay owns resource bytes as `host_data`, so its repeated setup scan is not representative of the
+live guest-write-provenance fast path; the comparison isolates the result-side tradeoff. The adjacent
+8,355,840-byte result was neutral (2.02 versus 2.04 ms total), so GPU result baselines default to a
+measured **16 MiB crossover** instead of doubling every persistent buffer. Set
+`PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB` to retune it, or
+`PROSPER_NO_PERSISTENT_COMPUTE_BUFFER_RESULTS=1` for an exact A/B. The production-backend test runs an
+idempotent one-MiB buffer with the test threshold lowered, requires the normal invalidation on the
+GPU-identical repeat, mutates guest memory, and requires byte-exact repair on the next dispatch.
+
+A subsequent live matched-switch check confirmed the dispatch-local result over 780+ samples per arm:
+the 33 MiB kernel changed from **1.27 to 0.85 ms total** (writeback 0.99 -> 0.09 ms, dispatch including
+the comparator 0.13 -> 0.59 ms). The adjacent 8 MiB kernel stayed **0.82 versus 0.81 ms**, confirming
+the crossover gate. Whole-route FPS varied by more than this sub-millisecond saving between the two
+sequential runs, so these numbers support the local optimization only, not a frame-rate claim.
+
 ## Next renderer step
 
 Bring up a representative Unreal/3D workload and collect the same stage timings plus a corrected

@@ -43,6 +43,10 @@ bool pack_live_target_r11g11b10(const prosper::gpu::LiveTargetSnapshot& snapshot
 // Execute already-realized compute items synchronously. Exposed for the production-backend test.
 bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& items);
 
+// Monotonic diagnostic count of writable-buffer results whose exact GPU comparison avoided a host
+// mapping/scan. Exposed so the production-backend test can prove that optimization path executes.
+uint64_t live_compute_buffer_gpu_result_skips();
+
 // Register the synchronous Vulkan compute backend used by AGC submit processing.
 void register_live_compute();
 
