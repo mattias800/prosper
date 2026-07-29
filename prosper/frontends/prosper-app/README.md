@@ -68,9 +68,11 @@ binary by argv, and that path is unchanged. Someone who runs a released build wi
 otherwise face an empty window, so a dump path can also arrive interactively (#1469):
 
 - **Drop a game folder on the window.** The app0 root, a file inside it (`eboot.bin`), `sce_sys`, or a
-  file one level deeper all resolve to the title.
-- **Ctrl+O** opens the host's native folder picker. Available only while no game is running: once a
-  guest boots it owns the keyboard (O is its R1).
+  file one level deeper all resolve to the title. One game is taken per drop, so dropping several
+  folders at once does not start one and immediately switch away from it.
+- **Ctrl+O** opens the host's native folder picker. Available only while no game is running — once a
+  guest boots it owns the keyboard (O is its R1) — and not under `--test-pattern`, which already has
+  something feeding the present layer.
 - **A launch with no arguments at all** opens that picker straight away, so a double-clicked app is not
   a dead end. `--pick` forces it for any launch; `--no-pick` disables it entirely.
 
@@ -78,10 +80,14 @@ A PS5 title is a *directory*, so this is a folder picker, not a file picker. A f
 title is reported and changes nothing — including the folder that merely *contains* your games, which
 a library view would scan but this does not.
 
-Only one game runs per process: `run_entry` does not observe `prosper_request_stop()` yet (#352), so a
-booted guest cannot be torn down. Opening a title while one is running therefore starts a second
-process with the new game and shuts this one down. That path appends `--dump <new title>` to the
-current run's own arguments, which works because `--dump` is last-wins.
+**One boot per launch.** `run_entry` does not observe `prosper_request_stop()` yet (#352), so a booted
+guest cannot be torn down. Opening a title after this process has already tried to boot one therefore
+starts a second process with the new game and shuts this one down. That path appends
+`--dump <new title>` to the current run's own arguments, which works because `--dump` is last-wins.
+
+It is the boot *attempt* that is spent, not the success: a title that fails to load also uses up the
+launch, because the boot appends into shared state and re-runs one-shot global setup. Picking another
+game after a failure is still fine — it just goes to a fresh process, same as switching titles.
 
 This is the *user* opening a game they chose. It does not change what a **guest** can ask for: the SDL
 dialog backend below still never lets a title open a host file picker or see a host path.

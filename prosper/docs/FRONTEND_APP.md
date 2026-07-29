@@ -114,11 +114,20 @@ Two constraints shape the design:
 - **A PS5 title is a directory**, so the host dialog is `SDL_ShowOpenFolderDialog`. SDL ships it; the
   build simply enables `SDL_DIALOG` when `PROSPER_APP` is on. The audio- and pad-only frontends have
   no window to parent a dialog to and keep it out.
-- **One boot per process.** `run_entry` never observes `prosper_request_stop()`, so the app exits
-  rather than joining a guest (see the lifecycle seam above, and #352). Opening a title while one runs
-  therefore starts a fresh process — `relaunch_with_dump()` appends `--dump <new title>` to this run's
-  own arguments, which selects the new game because `--dump` is last-wins. When the cooperative stop
-  lands, that call site is the single place that becomes an in-process teardown plus `start_guest()`.
+- **One boot ATTEMPT per process.** `run_entry` never observes `prosper_request_stop()`, so the app
+  exits rather than joining a guest (see the lifecycle seam above, and #352). Opening a title after
+  the attempt is spent starts a fresh process — `relaunch_with_dump()` appends `--dump <new title>`
+  to this run's own arguments, which selects the new game because `--dump` is last-wins. When the
+  cooperative stop lands, that call site is the single place that becomes an in-process teardown
+  plus `start_guest()`.
+
+  The attempt latches *before* `boot_program()` runs, not on its success, and `start_guest()` enforces
+  that itself rather than trusting callers. A failed boot is exactly as unrepeatable as a successful
+  one: `link_program` appends into the `Program` it is given (`src/loader/linker.cpp`) and never
+  resets it, and the surrounding setup — `register_builtin_hle`, `set_module_exports`,
+  `set_app0_root`, `install_trap_handler`, the live renderer, the host backends — is one-shot. A
+  second in-process call would link the new title behind the failed one's modules and leave `imgs[0]`,
+  the image the guest thread actually enters, pointing at the title that failed.
 
 The idle window paints a flat colour through the ordinary `present_frame` path rather than leaving
 undefined swapchain contents on screen, and stops as soon as `present_frame_seq()` shows anything has

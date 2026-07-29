@@ -9,6 +9,7 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace prosper::frontend {
 
@@ -60,8 +61,12 @@ inline bool is_app0_root(const std::string& dir, const GamePathProbe& probe) {
 // Resolve whatever the user handed us to an app0 root, or "" when the path is not part of a title.
 // A drop carries whichever entry the file manager happened to be showing, so accept the root
 // itself, a file in it (eboot.bin), a directory in it (sce_sys), or a file one level deeper
-// (sce_sys/param.json). The walk stops at the grandparent: searching further up would let a drop
-// from deep inside a title's assets silently boot whatever unrelated title sits above it.
+// (sce_sys/param.json).
+//
+// The walk examines a starting directory and its two ancestors, and no further; a picked *file*
+// starts at the directory holding it, so it reaches one level deeper than a picked directory does.
+// The bound is the point: searching all the way up would let a drop from deep inside a title's
+// assets silently boot whatever unrelated title happens to sit above it.
 inline std::string resolve_app0_root(const std::string& picked, const GamePathProbe& probe) {
     const std::string p = strip_trailing_separators(picked);
     if (p.empty() || !probe.is_dir || !probe.is_file) return "";
@@ -76,9 +81,49 @@ inline std::string resolve_app0_root(const std::string& picked, const GamePathPr
 
 // A guest cannot be torn down in-process: run_entry() never observes prosper_request_stop(), so the
 // app exits rather than joining it (#352). Until that lands, a second title needs a second process.
-inline GameOpenAction decide_open_action(const std::string& app0_root, bool guest_started) {
+//
+// It is the boot ATTEMPT that is spent, not the success. boot_program() appends into the Program it
+// is given and re-runs one-shot global setup (HLE registration, export table, trap handler, host
+// backends), so calling it twice would link the second title behind the first attempt's leftover
+// modules and leave imgs[0] — the image the guest thread actually enters — pointing at the failed
+// title. Anything after the first attempt therefore goes to a fresh process.
+inline GameOpenAction decide_open_action(const std::string& app0_root, bool boot_attempted) {
     if (app0_root.empty()) return GameOpenAction::ignore;
-    return guest_started ? GameOpenAction::relaunch : GameOpenAction::boot_in_process;
+    return boot_attempted ? GameOpenAction::relaunch : GameOpenAction::boot_in_process;
+}
+
+// Quote one argument for a Windows command line, following the rule CommandLineToArgvW and the CRT
+// parse: a backslash is literal except in the run immediately preceding a double quote, where each
+// one must be doubled. Getting this wrong corrupts any argument that ENDS in a backslash, because
+// the closing quote is then read as escaped and the argument swallows the tokens after it — and a
+// tab-completed directory, or a title sitting at a drive root ("D:\"), ends in exactly that.
+inline std::string quote_windows_argument(const std::string& arg) {
+    std::string out = "\"";
+    size_t backslashes = 0;
+    for (const char c : arg) {
+        if (c == '\\') { ++backslashes; continue; }
+        if (c == '"') {
+            out.append(2 * backslashes + 1, '\\');   // double the run, then escape the quote itself
+            backslashes = 0;
+        } else {
+            out.append(backslashes, '\\');           // not before a quote: the run stays literal
+            backslashes = 0;
+        }
+        out += c;
+    }
+    out.append(2 * backslashes, '\\');               // the run before the closing quote is doubled
+    out += '"';
+    return out;
+}
+
+// Join arguments into the single command line CreateProcess takes.
+inline std::string windows_command_line(const std::vector<std::string>& args) {
+    std::string cmdline;
+    for (size_t i = 0; i < args.size(); i++) {
+        if (i) cmdline += ' ';
+        cmdline += quote_windows_argument(args[i]);
+    }
+    return cmdline;
 }
 
 struct StartupPickInputs {

@@ -12,9 +12,11 @@ using prosper::frontend::StartupPickInputs;
 using prosper::frontend::decide_open_action;
 using prosper::frontend::is_app0_root;
 using prosper::frontend::parent_directory;
+using prosper::frontend::quote_windows_argument;
 using prosper::frontend::resolve_app0_root;
 using prosper::frontend::should_pick_at_startup;
 using prosper::frontend::strip_trailing_separators;
+using prosper::frontend::windows_command_line;
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
@@ -28,6 +30,7 @@ static int fails = 0;
 static const std::set<std::string> kDirs = {
     "/games",
     "/games/PPSA24651-app0", "/games/PPSA24651-app0/sce_sys", "/games/PPSA24651-app0/Media",
+    "/games/PPSA24651-app0/Media/sub", "/games/PPSA24651-app0/Media/sub/deep",
     "/games/PPSA13579-app0", "/games/PPSA13579-app0/sce_sys",
     "/games/notes",
 };
@@ -35,6 +38,7 @@ static const std::set<std::string> kFiles = {
     "/games/PPSA24651-app0/eboot.bin",
     "/games/PPSA24651-app0/sce_sys/param.json",
     "/games/PPSA24651-app0/Media/movie.bin",
+    "/games/PPSA24651-app0/Media/sub/deep/asset.bin",
     "/games/PPSA13579-app0/sce_sys/param.json",
     "/games/notes/readme.txt",
 };
@@ -99,10 +103,18 @@ int main() {
           "a file in an ordinary folder does not resolve");
     CHECK(resolve_app0_root("/does/not/exist", probe).empty(), "a missing path does not resolve");
     CHECK(resolve_app0_root("", probe).empty(), "an empty path does not resolve");
-    // The walk is bounded: /games is only two levels above Media's contents and is not a root, so a
-    // deep drop cannot climb past the title it belongs to and pick up a sibling.
     CHECK(resolve_app0_root("/games/PPSA24651-app0/Media", probe) == kRoot,
           "a directory one level below the root still resolves to that root");
+    // The walk is BOUNDED, and these are the assertions that pin the bound: widening it would let a
+    // drop from deep inside one title's assets climb out and boot whatever sits above.
+    CHECK(resolve_app0_root("/games/PPSA24651-app0/Media/sub/deep", probe).empty(),
+          "a directory three levels below the root does NOT resolve (walk is bounded)");
+    CHECK(resolve_app0_root("/games/PPSA24651-app0/Media/sub/deep/asset.bin", probe).empty(),
+          "a file four levels below the root does NOT resolve (walk is bounded)");
+    // ...and this pins the far edge that still must work: a picked file starts at its containing
+    // directory, so it reaches exactly one level deeper than a picked directory.
+    CHECK(resolve_app0_root("/games/PPSA24651-app0/Media/sub", probe) == kRoot,
+          "a directory two levels below the root is the deepest that still resolves");
 
     // A probe with no callbacks must be inert rather than crash.
     const GamePathProbe empty_probe;
@@ -110,14 +122,37 @@ int main() {
     CHECK(!is_app0_root(kRoot, empty_probe), "an unpopulated probe identifies no root");
 
     // --- decide_open_action --------------------------------------------------------------------
-    CHECK(decide_open_action(kRoot, /*guest_started=*/false) == GameOpenAction::boot_in_process,
-          "with no guest yet, a title boots on this process");
-    CHECK(decide_open_action(kRoot, /*guest_started=*/true) == GameOpenAction::relaunch,
-          "with a guest already running, a second title needs a fresh process (#352)");
-    CHECK(decide_open_action("", /*guest_started=*/false) == GameOpenAction::ignore,
+    CHECK(decide_open_action(kRoot, /*boot_attempted=*/false) == GameOpenAction::boot_in_process,
+          "with no boot attempted yet, a title boots on this process");
+    // The attempt is what is spent, not the success: boot_program() appends into its Program and
+    // re-runs one-shot global setup, so a second in-process call would link behind the leftovers of
+    // the first and enter the wrong image. A FAILED boot must therefore relaunch, exactly like a
+    // successful one — this is the assertion that pins that.
+    CHECK(decide_open_action(kRoot, /*boot_attempted=*/true) == GameOpenAction::relaunch,
+          "once a boot has been attempted — successful OR failed — a title needs a fresh process");
+    CHECK(decide_open_action("", /*boot_attempted=*/false) == GameOpenAction::ignore,
           "an unresolved path is ignored, not booted");
-    CHECK(decide_open_action("", /*guest_started=*/true) == GameOpenAction::ignore,
+    CHECK(decide_open_action("", /*boot_attempted=*/true) == GameOpenAction::ignore,
           "an unresolved path never relaunches a running game");
+
+    // --- quote_windows_argument / windows_command_line ------------------------------------------
+    // The relaunch's Windows command line. A trailing backslash is the dangerous case: a
+    // tab-completed directory has one, and so does a title at a drive root.
+    CHECK(quote_windows_argument("plain") == "\"plain\"", "an ordinary argument is just quoted");
+    CHECK(quote_windows_argument("with space") == "\"with space\"", "a space needs no escaping inside quotes");
+    CHECK(quote_windows_argument("C:\\games\\PPSA24651-app0") == "\"C:\\games\\PPSA24651-app0\"",
+          "interior backslashes stay literal");
+    CHECK(quote_windows_argument("C:\\games\\PPSA24651-app0\\") == "\"C:\\games\\PPSA24651-app0\\\\\"",
+          "a trailing backslash is doubled so it cannot escape the closing quote");
+    CHECK(quote_windows_argument("D:\\") == "\"D:\\\\\"", "a drive root's backslash is doubled");
+    CHECK(quote_windows_argument("ends\\\\") == "\"ends\\\\\\\\\"", "a trailing RUN of backslashes is fully doubled");
+    CHECK(quote_windows_argument("a\"b") == "\"a\\\"b\"", "an embedded quote is escaped");
+    CHECK(quote_windows_argument("a\\\"b") == "\"a\\\\\\\"b\"",
+          "backslashes before an embedded quote are doubled, then the quote is escaped");
+    CHECK(quote_windows_argument("") == "\"\"", "an empty argument survives as an empty quoted token");
+    CHECK(windows_command_line({"exe", "--dump", "C:\\g\\t\\"}) == "\"exe\" \"--dump\" \"C:\\g\\t\\\\\"",
+          "the joined command line quotes every argument and preserves the trailing separator");
+    CHECK(windows_command_line({}).empty(), "no arguments produce an empty command line");
 
     // --- should_pick_at_startup ------------------------------------------------------------------
     StartupPickInputs in{};

@@ -81,6 +81,8 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#include <spawn.h>                     // posix_spawn: reports exec failure without forking the guest
+extern char** environ;                 // the child inherits this process's environment
 #ifdef __APPLE__
 #include <mach-o/dyld.h>               // _NSGetExecutablePath (macOS has no /proc/self/exe)
 #endif
@@ -620,16 +622,19 @@ static std::string read_game_title(const std::string& dump) {
 // folder dropped on the window, and the host folder picker. Only the first is available before the
 // window exists, so the boot itself is factored out here and every source runs the identical code.
 
-// The host side of game_path.hpp's injected probe.
+// The host side of game_path.hpp's injected probe. Both lambdas go through resolve_host_path_case()
+// for the same reason boot_program does (#1006/#1226): the PS5 filesystem namespace is
+// case-insensitive and titles disagree on casing, so an exact-case probe on a case-sensitive host
+// would reject a dump that boot_program would then have loaded perfectly well.
 static prosper::frontend::GamePathProbe host_path_probe() {
     prosper::frontend::GamePathProbe probe;
     probe.is_dir = [](const std::string& p) {
         struct stat st{};
-        return ::stat(p.c_str(), &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR;
+        return ::stat(resolve_host_path_case(p).c_str(), &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR;
     };
     probe.is_file = [](const std::string& p) {
         struct stat st{};
-        return ::stat(p.c_str(), &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG;
+        return ::stat(resolve_host_path_case(p).c_str(), &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG;
     };
     return probe;
 }
@@ -650,11 +655,20 @@ static std::string window_title_for(const std::string& dump, bool test_pattern) 
 }
 
 // The guest, and the one boot this process gets. run_entry() never observes prosper_request_stop(),
-// so a booted guest cannot be torn down (#352) — hence `g_guest_started`, and hence the relaunch
-// below rather than a second call to start_guest().
+// so a booted guest cannot be torn down (#352) — hence the relaunch below rather than a second call
+// to start_guest().
+//
+// The two flags are deliberately distinct. `g_guest_started` says a guest is live (the idle painter
+// and the test-pattern feeder stop, the window title changes). `g_boot_attempted` says this
+// process's single boot has been SPENT — it latches before boot_program() runs and is never
+// cleared, because a failed attempt is just as unrepeatable as a successful one: boot_program
+// appends into g_prog and re-runs one-shot global setup, so a second call would link the new title
+// behind the failed one's modules and leave imgs[0] — what the guest thread enters — stale.
+// Every open decision uses g_boot_attempted.
 Program g_prog;
 std::thread g_guest_thread;
 bool g_guest_started = false;
+bool g_boot_attempted = false;
 
 // Install the host frontends (audio out, controller in, dialogs) at the same point boot_trace does:
 // right after the built-in HLE is registered, before the guest runs. Each is built in only when its
@@ -714,9 +728,18 @@ static void install_host_backends() {
 }
 
 // Register the live renderer, boot the title at `app0_root`, and run its frame loop on its own
-// thread. Returns false with *err set on a link/map/stub failure; call it at most once per process.
+// thread. Returns false with *err set on a link/map/stub failure.
+//
+// At most one call per process succeeds OR fails: the guard latches on the attempt, not the result,
+// so a caller that ignored a failure cannot corrupt g_prog by trying again. Callers reach the
+// second-title case through relaunch_with_dump() instead.
 static bool start_guest(const std::string& app0_root, std::string* err) {
-    if (g_guest_started) { if (err) *err = "a game is already running"; return false; }
+    if (g_boot_attempted) {
+        if (err) *err = g_guest_started ? "a game is already running"
+                                        : "this process has already used its one boot attempt";
+        return false;
+    }
+    g_boot_attempted = true;
 #ifdef PROSPER_HAVE_LIVE_RENDERER
     prosper::frontend::register_live_renderer(
         getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".",
@@ -812,17 +835,14 @@ static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_ro
     args.emplace_back("--dump");
     args.push_back(app0_root);
 #ifdef _WIN32
-    // CreateProcess takes one command line, so quote every argument: dump paths routinely contain
-    // spaces. Embedded quotes are not escaped — no PS5 content-id directory contains one.
-    std::string cmdline;
-    for (size_t i = 0; i < args.size(); i++) {
-        if (i) cmdline += ' ';
-        cmdline += '"' + args[i] + '"';
-    }
+    // CreateProcess takes a single command line, so every argument is quoted — dump paths routinely
+    // contain spaces, and a trailing backslash would otherwise escape the closing quote.
+    std::string cmdline = prosper::frontend::windows_command_line(args);
     STARTUPINFOA si{}; si.cb = sizeof si;
     PROCESS_INFORMATION pi{};
     if (!CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr,
                         &si, &pi)) {
+        fprintf(stderr, "[app] CreateProcess failed: %lu\n", (unsigned long)GetLastError());
         return false;
     }
     CloseHandle(pi.hThread);
@@ -833,13 +853,15 @@ static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_ro
     cargv.reserve(args.size() + 1);
     for (auto& a : args) cargv.push_back(a.data());
     cargv.push_back(nullptr);
-    const pid_t pid = ::fork();
-    if (pid < 0) return false;
-    if (pid == 0) {
-        // Between fork and exec only async-signal-safe calls are allowed — guest threads may hold
-        // the allocator lock in the parent. Everything above is already built.
-        ::execv(cargv[0], cargv.data());
-        _Exit(127);
+    // posix_spawn rather than fork+exec, for two reasons. It reports an exec failure (a bad path, a
+    // binary replaced underneath us) synchronously, so a failed relaunch can be shown to the user
+    // instead of this process quitting into nothing; and it avoids duplicating the page tables of a
+    // guest holding multi-gigabyte fixed mappings, which is slow and can hit ENOMEM.
+    pid_t child = 0;
+    const int rc = ::posix_spawn(&child, cargv[0], nullptr, nullptr, cargv.data(), environ);
+    if (rc != 0) {
+        fprintf(stderr, "[app] could not start %s: %s\n", cargv[0], strerror(rc));
+        return false;
     }
     return true;
 #endif
@@ -1026,44 +1048,60 @@ int main(int argc, char** argv) {
     // Open a title the user handed the window — a dropped folder, or the folder picker's result
     // (#1469). argv never comes through here; it booted before the window existed.
     const prosper::frontend::GamePathProbe pathProbe = host_path_probe();
-    auto open_game = [&](const std::string& picked) {
+    // Returns true when the path actually started something (booted here, or handed off to a new
+    // process) — false when it was rejected or the start failed, so a caller can tell an ignored
+    // path from a consumed one.
+    auto open_game = [&](const std::string& picked) -> bool {
         const std::string root = prosper::frontend::resolve_app0_root(picked, pathProbe);
-        switch (prosper::frontend::decide_open_action(root, g_guest_started)) {
+        switch (prosper::frontend::decide_open_action(root, g_boot_attempted)) {
         case prosper::frontend::GameOpenAction::ignore:
             fprintf(stderr, "[app] not a PS5 title: %s\n", picked.c_str());
-            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "prosper",
-                ("That is not a PS5 game:\n\n" + picked +
-                 "\n\nChoose the game's app0 folder — the one holding eboot.bin and sce_sys.").c_str(),
-                win);
-            break;
+            // The message box is modal and blocks this loop until dismissed. That is fine over an
+            // idle window, but freezing a running game — including its guest dialog pump — over a
+            // mis-aimed drag is not; there the log line is enough.
+            if (!g_guest_started) {
+                SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "prosper",
+                    ("That is not a PS5 game:\n\n" + picked +
+                     "\n\nChoose the game's app0 folder — the one holding eboot.bin and sce_sys.").c_str(),
+                    win);
+            }
+            return false;
         case prosper::frontend::GameOpenAction::relaunch:
-            // The running guest cannot be stopped in-process (#352), so hand the new title to a
-            // fresh process and let this one shut down normally.
-            fprintf(stderr, "[app] a game is already running; starting a new process for %s\n",
+            // This process has spent its one boot (#352), so hand the new title to a fresh process
+            // and let this one shut down normally.
+            fprintf(stderr, "[app] this process has already booted; starting a new one for %s\n",
                     root.c_str());
             if (relaunch_with_dump(argc, argv, root)) {
                 running = false;
-            } else {
-                fprintf(stderr, "[app] could not start the new process\n");
-                SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "prosper",
-                    "prosper runs one game per launch, and starting a second process failed.\n\n"
-                    "Quit and start prosper again with the other game.", win);
+                return true;
             }
-            break;
+            fprintf(stderr, "[app] could not start the new process\n");
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "prosper",
+                "prosper runs one game per launch, and starting a second process failed.\n\n"
+                "Quit and start prosper again with the other game.", win);
+            return false;
         case prosper::frontend::GameOpenAction::boot_in_process: {
             fprintf(stderr, "[app] opening %s\n", root.c_str());
+            // boot_program links and maps the whole module set inline, which takes seconds on a
+            // large title and pumps no events meanwhile. Say so in the title bar first, or the
+            // window just stops responding.
+            SDL_SetWindowTitle(win, "prosper — loading…");
             std::string err;
             if (!start_guest(root, &err)) {
                 fprintf(stderr, "[app] boot failed: %s\n", err.c_str());
+                SDL_SetWindowTitle(win, title.c_str());
                 SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "prosper",
-                    ("Could not start that game.\n\n" + err).c_str(), win);
-                break;
+                    ("Could not start that game.\n\n" + err +
+                     "\n\nprosper gets one boot per launch, so open the next one from a fresh"
+                     " start.").c_str(), win);
+                return false;
             }
             title = window_title_for(root, false);
             SDL_SetWindowTitle(win, title.c_str());
-            break;
+            return true;
         }
         }
+        return false;
     };
 
     // A launch that was not told what to show would otherwise be a dead end for anyone who did not
@@ -1074,6 +1112,7 @@ int main(int argc, char** argv) {
     }
 
     while (running && !prosper_stop_requested()) {
+        bool openedThisBatch = false;   // at most one game is opened per poll batch (multi-drop)
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_EVENT_QUIT) running = false;
@@ -1112,8 +1151,11 @@ int main(int argc, char** argv) {
                 // Ctrl+O opens a title in the empty window (#1469). Deliberately unavailable once a
                 // game is running: the guest owns the keyboard from that point (O is its R1), and a
                 // second title needs a new process anyway — drop a folder on the window for that.
+                // Excluded under --test-pattern too, matching should_pick_at_startup: that run has a
+                // producer feeding the present layer already, and a guest would fight it.
                 if (ev.type == SDL_EVENT_KEY_DOWN && key.app_window && !ev.key.repeat &&
-                    ev.key.key == SDLK_O && (ev.key.mod & SDL_KMOD_CTRL) && !g_guest_started) {
+                    ev.key.key == SDLK_O && (ev.key.mod & SDL_KMOD_CTRL) &&
+                    !g_guest_started && !testPattern) {
                     open_folder_picker(win);
                     continue;
                 }
@@ -1182,17 +1224,34 @@ int main(int argc, char** argv) {
             } else if (ev.type == SDL_EVENT_DROP_FILE && ev.drop.windowID == appWindowId) {
                 // A game folder dropped on the window (#1469). Works whether or not one is running:
                 // with a game up this relaunches, which is the only way to switch titles today.
-                if (ev.drop.data) open_game(ev.drop.data);
+                // Excluded under --test-pattern, which already has a frame producer.
+                // SDL emits one event per dropped URI, so a multi-folder drop must not start the
+                // first and immediately relaunch into the second — `openedThisBatch` takes only the
+                // first one that lands. A REJECTED drop does not consume the batch, so a stray file
+                // alongside a real title is harmless.
+                if (ev.drop.data && !openedThisBatch && !testPattern)
+                    openedThisBatch = open_game(ev.drop.data);
             }
         }
         if (!running) break;
 
         // The folder picker answers asynchronously and possibly on another thread, so it parks its
         // result. Consume it here, between frames, where booting is safe.
+        //
+        // Discard the answer if a game started while the dialog was open — on the zenity backend the
+        // dialog is a separate process and the window stays interactive, so a folder can be dropped
+        // meanwhile; honouring the dialog afterwards would relaunch straight back out of the game it
+        // just started. A *failed* boot deliberately does not discard: no game is running, and
+        // picking again is exactly how the user recovers (it relaunches into a fresh process).
         {
             std::string picked;
             { std::lock_guard<std::mutex> lock(g_picked_mutex); picked.swap(g_picked_path); }
-            if (!picked.empty()) open_game(picked);
+            if (!picked.empty()) {
+                if (g_guest_started)
+                    fprintf(stderr, "[app] ignoring the folder picker's answer: a game started first.\n");
+                else
+                    open_game(picked);
+            }
             if (!running) break;
         }
 
