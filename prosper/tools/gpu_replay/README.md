@@ -11,6 +11,15 @@ Capsules contain title-derived shaders, resource bytes, addresses, ordered DMA e
 pixels, and optional exact persistent Vulkan depth/stencil checkpoint planes.
 They are gitignored local artifacts and must never be committed or shared as project fixtures.
 
+For a long scripted route, first set `PROSPER_CAPTURE_SCREENSHOT_AT_FRAME=N` to read back the Nth
+successfully presented host frame without paying the cost of a command capture. The one-shot writes
+`scheduled_frame_N.bmp` under `PROSPER_CAPTURE_DIR`; set `PROSPER_CAPTURE_SCREENSHOT=/path/out.bmp`
+to choose an exact path. Use that visual checkpoint to select the nearby
+`PROSPER_CAPTURE_BUNDLE_AT_PRESENT` value on the next run, then replay the resulting bundle normally.
+The app logs both the guest-present count saved when it arms the screenshot and the count observed after
+the readback finishes. Use the armed count, not the host frame number or later written count: swapchain
+presents and guest VideoOut flips are separate clocks, and the guest can advance during readback.
+
 Normal capture preflights merged resource ranges and rejects plans above 512 MiB before allocating.
 `PROSPER_GPU_CAPTURE_MAX_MB=1..3072` overrides that bound. If descriptor metadata is the evidence you
 need, `PROSPER_GPU_CAPTURE_METADATA_ONLY=1` writes a thin capsule with shaders, operations, pipeline

@@ -29,7 +29,7 @@ enum class PresentAttempt {
 };
 
 // What present_frame should do after a BOUNDED vkAcquireNextImageKHR.
-enum class AcquireAction { proceed, skip, recreate };
+enum class AcquireAction { proceed, skip, recreate, fail };
 
 // Classify vkAcquireNextImageKHR under a bounded (non-infinite) timeout.
 //  - VK_SUCCESS / VK_SUBOPTIMAL_KHR: an image was acquired (SUBOPTIMAL still yields a usable image) —
@@ -46,6 +46,8 @@ constexpr AcquireAction classify_acquire(VkResult r) {
     case VK_TIMEOUT:
     case VK_NOT_READY:
         return AcquireAction::skip;
+    case VK_ERROR_DEVICE_LOST:
+        return AcquireAction::fail;
     default:
         return AcquireAction::recreate;
     }
@@ -56,7 +58,16 @@ constexpr AcquireAction classify_acquire(VkResult r) {
 // preserves the pre-#1182 contract, where present_frame returned false (→ recreate) on anything but
 // VK_SUCCESS.
 constexpr PresentAttempt classify_present(VkResult r) {
-    return r == VK_SUCCESS ? PresentAttempt::presented : PresentAttempt::out_of_date;
+    if (r == VK_SUCCESS) return PresentAttempt::presented;
+    if (r == VK_ERROR_DEVICE_LOST) return PresentAttempt::failed;
+    return PresentAttempt::out_of_date;
+}
+
+// A failed submit normally abandons the acquired image and rebuilds the swapchain/synchronization.
+// Device loss is different: no Vulkan object recreation on that device can succeed, so retrying only
+// floods logs and spins the host CPU. Stop the frontend cleanly on that terminal result.
+constexpr PresentAttempt classify_submit_failure(VkResult r) {
+    return r == VK_ERROR_DEVICE_LOST ? PresentAttempt::failed : PresentAttempt::out_of_date;
 }
 
 } // namespace prosper::frontend
