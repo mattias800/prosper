@@ -174,13 +174,16 @@ consumer submits. Their conservative invalidations caused 64-90 ms BC/packed-flo
 some packed-float validations copied zero of the expected 33,423,360 bytes because the guest range
 was no longer completely mapped.
 
-A disabled-watch recovery experiment was rejected. Three stable exact matches were insufficient:
-GPU-identical compute dispatches deliberately preserve architectural write notification even when
-they skip guest writeback, so re-arming a 64 MiB page watch cost about 165 ms and the next notification
-made it dirty again. A longer 32/64-hit delay merely reduced the frequency of that cycle and could not
-prove the producer had stopped. The next optimization must therefore carry exact cross-submit GPU
-write/result evidence or bind a retained compute result directly; equality of guest bytes alone is not
-a sound trigger for restoring page protection.
+A disabled-watch recovery experiment remains rejected after byte-preserving buffer notifications were
+fixed. A conservative 64-match rerun recovered six smaller sources, but the two 66.8 MiB gameplay sources
+reached only 13 and six matches before their scene lifetime ended. A deliberate 16-match stress run then
+forced recovery: several 3 MiB sources were dirtied, disabled, and recovered a second time within two
+reporting windows, while both 66.8 MiB sources also entered the expensive recovery path. This proves that
+an exact-equality streak still cannot establish that every producer has stopped; the corrected buffer path
+removed one false invalidation source, not real later writes or other producer classes. A longer delay only
+reduces the frequency of the cycle. The next optimization must therefore carry exact cross-submit GPU
+write/result evidence or bind a retained compute result directly; equality of guest bytes alone is not a
+sound trigger for restoring page protection.
 
 ## Cobra Float32 sampled-texture retention (2026-07-25)
 
