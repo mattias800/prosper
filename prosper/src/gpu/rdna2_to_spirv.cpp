@@ -225,6 +225,7 @@ struct SpirvCompute {
     bool     is_vertex=0;                            // true in every vertex shell
     bool     allow_b32_masks=0;                      // proven Wave32 or byte-exact graphics exception
     bool     ngg_one_lane=0;                         // exact GS_ALLOC_REQ wrapper: one guest lane/invocation
+    bool     ngg_logical_lane=0;                     // proven wave64 no-GS producer uses flattened guest lane
     bool     ngg_private_lds=0;                      // exact captured wrapper whose LDS projection is known
     uint32_t ngg_vertex_index_read_pc = UINT32_MAX;   // NGG wave/LDS prologue handoff -> host VertexIndex
     uint32_t ngg_vertex_index_value = 0;
@@ -6484,6 +6485,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (in.sdst.value == 106 || in.sdst.value == 107) rs.vcc = cout_masked;
                     else if (in.sdst.kind == OperandKind::SGPR) rs.sreg_bool[in.sdst.value] = cout_masked;
                 }
+            } else if ((in.opcode == 0x365 || in.opcode == 0x366) && b.ngg_logical_lane &&
+                       in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
+                // A proven no-GS passthrough executes only the logical vertex producer; Vulkan's
+                // flattened vertex/instance invocation is the corresponding guest ES lane.  For
+                // the canonical all-ones MBCNT pair, LOW contributes min(lane, 32) and HIGH
+                // contributes max(lane - 32, 0). General masks remain fail-closed because a vertex
+                // invocation has no peer-lane mask state from which to reconstruct them.
+                const uint32_t lane = b.guest_lane_id();
+                const uint32_t high = b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32));
+                const uint32_t count = in.opcode == 0x365
+                    ? b.sel(high, b.uconst(32), lane)
+                    : b.sel(high, b.ibin(Op_ISub, lane, b.uconst(32)), b.uconst(0));
+                vreg[in.dst.value] = b.ibin(Op_IAdd, val(in.src[1]), count);
             } else if ((in.opcode == 0x365 || in.opcode == 0x366) && b.ngg_one_lane) {
                 // NGG is deliberately lowered as one guest lane per Vulkan vertex invocation. No
                 // lane precedes that invocation, so either half of MBCNT contributes zero and leaves
@@ -11300,10 +11314,20 @@ NggLdsSource ngg_terminal_lds_source(const std::vector<Rdna2Inst>& ins, size_t l
         if (writer.dst.kind != OperandKind::VGPR ||
             static_cast<uint32_t>(writer.dst.value) != address_vgpr)
             continue;
-        if (writer.fmt != Rdna2Format::VOP3 || writer.opcode != 0x143u ||
-            writer.has_modifier || !writer.has_literal)
-            return {};
-        // v_mad_u32_u24 addr, stride, exporter, constant.  The first two operands may be swapped.
+        // The compacted record address has either of the two canonical compiler forms below:
+        //
+        //   v_mad_u32_u24 addr, stride, exporter, constant
+        //   v_mul_u32_u24 addr, stride, exporter; ds_read ... offset:constant
+        //
+        // The latter avoids a MAD when the entire constant fits in the DS instruction's immediate.
+        // Both prove the same `stride * exporter + constant` identity; accepting only these exact
+        // integer-u24 forms keeps arbitrary wrapper address arithmetic fail-closed.
+        const bool mad = writer.fmt == Rdna2Format::VOP3 && writer.opcode == 0x143u &&
+                         !writer.has_modifier && writer.has_literal;
+        const bool mul = writer.fmt == Rdna2Format::VOP2 && writer.opcode == 0x0bu &&
+                         !writer.has_modifier && !writer.has_literal;
+        if (!mad && !mul) return {};
+        // The first two operands may be swapped.
         int stride_src = -1, index_src = -1;
         for (int k = 0; k < 2; ++k) {
             if (writer.src[k].kind == OperandKind::InlineInt && writer.src[k].value > 0)
@@ -11311,13 +11335,14 @@ NggLdsSource ngg_terminal_lds_source(const std::vector<Rdna2Inst>& ins, size_t l
             else if (writer.src[k].kind == OperandKind::VGPR)
                 index_src = k;
         }
-        if (stride_src < 0 || index_src < 0 || writer.src[2].kind != OperandKind::Literal)
+        if (stride_src < 0 || index_src < 0 ||
+            (mad && writer.src[2].kind != OperandKind::Literal))
             return {};
         const uint32_t stride = static_cast<uint32_t>(writer.src[stride_src].value);
         if ((stride & 3u) || stride < 16u || stride > 4096u ||
-            writer.literal > UINT32_MAX - component_byte)
+            (mad && writer.literal > UINT32_MAX - component_byte))
             return {};
-        return {true, writer.literal + component_byte, stride,
+        return {true, (mad ? writer.literal : 0u) + component_byte, stride,
                 static_cast<uint32_t>(writer.src[index_src].value)};
     }
     return {};
@@ -11408,9 +11433,10 @@ NggPassthroughLayout analyze_ngg_passthrough(const uint32_t* prolog, size_t pref
         if (in.fmt != Rdna2Format::EXP) continue;
         if (in.exp_target == 20u) { saw_primitive_export = true; continue; }
         if (in.exp_target != 12u && in.exp_target < 32u) continue;
-        if (in.exp_compr) return {};
+        if (in.exp_compr) return reject("terminal output uses a compressed export");
         if (in.exp_target == 12u) {
-            if (saw_position || in.exp_en != 0xfu) return {};
+            if (saw_position || in.exp_en != 0xfu)
+                return reject("POS0 is duplicated or incomplete");
             saw_position = true;
             for (uint32_t component = 0; component < 4; ++component) {
                 if (!accept_source(ngg_find_terminal_output(
@@ -11420,7 +11446,8 @@ NggPassthroughLayout analyze_ngg_passthrough(const uint32_t* prolog, size_t pref
             }
         } else {
             const uint32_t param = in.exp_target - 32u;
-            if (param >= out.params.size() || (out.param_mask & (1u << param))) return {};
+            if (param >= out.params.size() || (out.param_mask & (1u << param)))
+                return reject("PARAM export is out of range or duplicated");
             out.param_mask |= 1u << param;
             for (uint32_t component = 0; component < 4; ++component) {
                 if (!(in.exp_en & (1u << component))) continue;
@@ -11512,6 +11539,24 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
     // property of the GS_ALLOC_REQ opcode. Other NGG programs retain only the ordinary merged-stage
     // ABI setup below and fail closed if they reach a lane-sensitive operation.
     b.ngg_one_lane = exact_ngg_projection || (ngg && allow_test_ngg_one_lane);
+    // A LO+HI all-ones pair is the compiler's explicit wave64 lane-index construction. Infer the
+    // width from that machine-code proof instead of assuming every NGG program is wave64. A low-only
+    // producer may be wave32 or may use only half of a wave64 mask, so it remains fail-closed until
+    // the graphics wave-size contract is plumbed independently.
+    bool logical_mbcnt_lo = false, logical_mbcnt_hi = false, logical_mbcnt_invalid = false;
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt != Rdna2Format::VOP3 || (in.opcode != 0x365 && in.opcode != 0x366))
+            continue;
+        const bool all_ones = in.src[0].kind == OperandKind::InlineInt &&
+                              in.src[0].value == -1;
+        logical_mbcnt_invalid |= !all_ones;
+        logical_mbcnt_lo |= all_ones && in.opcode == 0x365;
+        logical_mbcnt_hi |= all_ones && in.opcode == 0x366;
+    }
+    b.ngg_logical_lane = passthrough && passthrough->valid && !logical_mbcnt_invalid &&
+                         logical_mbcnt_lo && logical_mbcnt_hi;
+    if (b.ngg_logical_lane) b.wave_size = 64;
     b.allow_b32_masks = b.ngg_one_lane;
     uint32_t ngg_output_gate_begin = UINT32_MAX;
     uint32_t ngg_output_gate_end = 0;

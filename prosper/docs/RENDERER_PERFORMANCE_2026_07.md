@@ -1135,9 +1135,48 @@ whole-app claim. A clean combined-policy confirmation kept `0x30180d0000` native
 `0x3015770000` portable at 5.27 ms over 378+ samples, with 425 frames presented and no dispatch skip,
 renderer failure, or shutdown error.
 
+## Plucky split no-GS NGG producer coverage
+
+The same startup submit exposed three real draws that both live rendering and capture previously dropped.
+They share a split no-GS NGG vertex program: a fetch/vertex producer writes one 28-byte LDS record, while a
+compiler-generated wrapper compacts the guest wave and exports that record. The existing structural
+passthrough proof already recognized wrapper addresses expressed as
+`v_mad_u32_u24(stride, exporter, constant)`. This compiler emitted one equivalent field address as
+`v_mul_u32_u24(stride, exporter)` plus a DS-read immediate, so the otherwise-proven wrapper fell back to
+unsupported cross-lane execution.
+
+The recognizer now accepts both exact unsigned-u24 address forms and still requires a single stride/index,
+direct terminal LDS loads, matching producer fields, the allocation/primitive-export shape, and complete
+POS0. In the proven producer only, canonical all-ones `v_mbcnt_lo/hi` derives the guest lane from the
+flattened Vulkan vertex/instance invocation. Other masks remain rejected because their peer-lane state is
+not available in a vertex invocation. Synthetic coverage renders the MAD and multiply-plus-DS forms,
+checks the resulting geometry, and verifies that replacing the all-ones mask with a partial mask fails
+closed.
+
+A fresh live capture of the same 43-draw / 27-dispatch submit moved from **37 to 40 realized draws** and
+reported the generic proof (`base=v5`, stride 28, one parameter export). The three new operations are the
+two 48x48 targets at semantic draws 5/6 and the 32x32 target at draw 35. Exact replay pipeline statistics
+showed real geometry and fragment work:
+
+| semantic draw | vertices | primitives / after clip | fragment invocations / passed samples |
+|---:|---:|---:|---:|
+| 5 | 192 | 96 / 96 | 110,592 / 110,592 |
+| 6 | 192 | 96 / 96 | 110,592 / 110,592 |
+| 35 | 128 | 64 / 64 | 32,768 / 32,768 |
+
+The only remaining unrealized entries are two decoded no-effect draws and one draw with no fragment
+program whose captured pipeline also has no color/depth/stencil write state. This closes the concrete
+shader-translation gap; it does not turn the startup capsule into a full-frame oracle.
+
+An initial seven-submit bundle confirmed why: although all 78 realized compute/graphics operations execute,
+the window starts at process submit 1 and still has 39 read-before-write image versions with neither a prior
+GPU producer nor a serialized RTT seed. Its selected 3840x2160 replay is black, and final-capsule export
+correctly refuses to invent the missing seed. The exact module, pipeline, and per-draw statistics above are
+valid; the bundle image is explicitly not correctness evidence.
+
 ## Next renderer step
 
-Capture a seeded temporal window around the Plucky title/gameplay transition so the remaining shader
-experiments have a full pixel oracle as well as exact compute pipeline contracts. Keep the exact-byte
-and disable-switch A/B discipline used here, and preserve screenshot/capture correctness while reducing
-the synchronous boundaries.
+Capture a later rolling temporal window around the Plucky title/gameplay transition, after the relevant RTT
+family has real producer history, so shader and composition work gains a full pixel oracle as well as exact
+compute pipeline contracts. Keep the exact-byte and disable-switch A/B discipline used here, and preserve
+screenshot/capture correctness while reducing the synchronous boundaries.

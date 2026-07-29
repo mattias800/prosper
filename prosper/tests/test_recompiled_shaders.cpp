@@ -227,6 +227,8 @@ int main() {
     // exports read the same fields from a compacted record at a different LDS base.  The chain
     // recognizer must prove the matching offsets and export the producer record directly.
     const uint32_t passthrough_producer[] = {
+        0xD765000Au, 0x000100C1u,            // v_mbcnt_lo v10, -1, 0
+        0xD766000Au, 0x000214C1u,            // v_mbcnt_hi v10, -1, v10
         0x34040A81u, 0x36060AC2u, 0x7E000280u, 0x7E0202F2u,
         0x36040482u, 0x4A0606C1u, 0x4A0404C1u, 0x7E060B03u, 0x7E040B02u,
         0x7E0C0280u,                         // v6 = record byte address 0 (private per invocation)
@@ -234,6 +236,8 @@ int main() {
         0xD8380100u, 0x00080706u,            // record dword 0/1 = v7/v8
         0xD8380302u, 0x00030206u,            // record dword 2/3 = position x/y
         0xD8380504u, 0x00010006u,            // record dword 4/5 = position z/w
+        0x7E120280u,                         // v9 = 0
+        0xD8340018u, 0x00000906u,            // record dword 6 = PARAM1.x
         0xBF8A0000u,
         0xBE802006u,                         // transfer to separately installed wrapper
     };
@@ -248,14 +252,17 @@ int main() {
         0xD5430000u, 0x03FE249Cu, 0x00000720u, // 28*v18 + compacted base
         0xD8DC0100u, 0x00000000u,            // PARAM0.xy
         0xF8000203u, 0x00000100u,            // exp param0 v[0:1]
+        0x1608249Cu,                         // v_mul_u32_u24 v4, 28, v18
+        0xD8D80738u, 0x04000004u,            // v4 = LDS[28*v18 + 0x738]
+        0xF8000211u, 0x00000004u,            // exp param1.x v4
         0xBF810000u,
     };
     const auto passthrough_vert = recompile_vertex_chain(
         passthrough_producer, std::size(passthrough_producer),
         passthrough_wrapper, std::size(passthrough_wrapper),
-        nullptr, nullptr, false, 6);
+        nullptr, nullptr, false, 7);
     CHECK(!passthrough_vert.empty(),
-          "split no-GS NGG producer/wrapper recompiles through proven LDS-record passthrough");
+          "split no-GS NGG producer/wrapper accepts MAD and mul-plus-DS record addresses");
     if (!passthrough_vert.empty()) {
         const auto ppx = prosper::test::render_triangle_rgba(passthrough_vert, frag, W, H);
         auto grn = [&](uint32_t x, uint32_t y) {
@@ -265,6 +272,14 @@ int main() {
         CHECK(ppx.size() == (size_t)W * H * 4 && grn(16, 16) && !grn(60, 60),
               "no-GS NGG passthrough preserves logical vertex geometry across all host invocations");
     }
+    std::vector<uint32_t> masked_lane_producer(
+        std::begin(passthrough_producer), std::end(passthrough_producer));
+    masked_lane_producer[1] = 0x00010081u;            // v_mbcnt_lo v10, 1, 0
+    const auto masked_lane_vert = recompile_vertex_chain(
+        masked_lane_producer.data(), masked_lane_producer.size(),
+        passthrough_wrapper, std::size(passthrough_wrapper), nullptr, nullptr, false, 7);
+    CHECK(masked_lane_vert.empty(),
+          "no-GS logical-lane projection rejects non-canonical MBCNT masks");
     const uint32_t arbitrary_jump[] = {0xBFA00003u, 0xBE802008u};
     CHECK(!rdna2_vertex_prolog_info(arbitrary_jump, std::size(arbitrary_jump)).valid,
           "arbitrary indirect s_setpc targets remain rejected");
