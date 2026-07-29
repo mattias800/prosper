@@ -879,6 +879,67 @@ int main() {
     }
     printf("  [ok]   complex fragment CFG exports active state from both alternate sites\n");
 
+    // #1474: partially-overlapping LOOPS in the fragment shell. Two back-edges whose ranges cross
+    // without nesting (B's header lies inside A's body, B's back-edge outside it) are what the narrow
+    // pattern structurizer calls unstructured and rejects. Since the graphics CFG dispatcher above
+    // exists, that rejection is no longer the end of the road: the per-invocation dispatcher executes
+    // the exact block graph, so the region lowers instead of dropping the draw. Both directions are
+    // pinned here, in the DEVICE-FREE test, because the Vulkan-execution tests are not built where no
+    // Vulkan device is available — a guard that only runs on a developer GPU is not a guard.
+    const uint32_t overlapping_loops[] = {
+        0xbe800380u,               //  0: s_mov_b32 s0, 0
+        0x7e020284u,               //  1: v_mov_b32 v1, 4
+        0x7da20200u,               //  2: A_HDR: v_cmpx_lt_u32 s0, v1
+        0xbf880006u,               //  3: s_cbranch_execz +6 -> 10 (export)
+        0x7da20200u,               //  4: B_HDR: v_cmpx_lt_u32 s0, v1
+        0xbf880006u,               //  5: s_cbranch_execz +6 -> 12 (endpgm)
+        0x81008100u,               //  6: s0++
+        0xbf82fffau,               //  7: s_branch -6 -> 2  (A back-edge; A = [2,7])
+        0x81008100u,               //  8: s0++
+        0xbf82fffau,               //  9: s_branch -6 -> 4  (B back-edge; B = [4,9] crosses A)
+        0xf800180fu, 0x05020302u,  // 10: exp mrt0
+        0xbf810000u,               // 12: s_endpgm
+    };
+    const auto overlapping_spv =
+        recompile_fragment(overlapping_loops, std::size(overlapping_loops));
+    if (overlapping_spv.empty() || !has_opcode(overlapping_spv, 251) ||
+        !type_result_ids_are_nonzero(overlapping_spv, nullptr) ||
+        !phi_ids_are_nonzero(overlapping_spv)) {
+        printf("  [FAIL] #1474: partially-overlapping fragment loops did not lower through a valid "
+               "OpSwitch dispatcher\n");
+        return 1;
+    }
+    printf("  [ok]   #1474: partially-overlapping fragment loops lower through the CFG dispatcher\n");
+
+    // The fail-visible backstop still has to work. A cross-lane MBCNT inside the same region
+    // disqualifies the per-invocation dispatcher — one guest lane cannot answer for the whole wave —
+    // and with the narrow structurizer already rejecting, the only remaining outcome is a loud
+    // reject. This mirrors how the compute-side #590 case keeps an s_barrier in its region for
+    // exactly the same reason (test_rdna2_to_spirv.cpp). Branch offsets are re-based for the MBCNT's
+    // two dwords; dropping the MBCNT makes this region lower, which is what makes the guard real.
+    const uint32_t overlapping_loops_cross_lane[] = {
+        0xbe800380u,               //  0: s_mov_b32 s0, 0
+        0x7e020284u,               //  1: v_mov_b32 v1, 4
+        0x7da20200u,               //  2: A_HDR: v_cmpx_lt_u32 s0, v1
+        0xbf880008u,               //  3: s_cbranch_execz +8 -> 12 (export)
+        0x7da20200u,               //  4: B_HDR: v_cmpx_lt_u32 s0, v1
+        0xbf880008u,               //  5: s_cbranch_execz +8 -> 14 (endpgm)
+        0xd7650004u, 0x000100c1u,  //  6: v_mbcnt_lo_u32_b32 v4, -1, 0  (cross-lane)
+        0x81008100u,               //  8: s0++
+        0xbf82fff8u,               //  9: s_branch -8 -> 2  (A back-edge; A = [2,9])
+        0x81008100u,               // 10: s0++
+        0xbf82fff8u,               // 11: s_branch -8 -> 4  (B back-edge; B = [4,11] crosses A)
+        0xf800180fu, 0x05020302u,  // 12: exp mrt0
+        0xbf810000u,               // 14: s_endpgm
+    };
+    if (!recompile_fragment(overlapping_loops_cross_lane,
+                            std::size(overlapping_loops_cross_lane)).empty()) {
+        printf("  [FAIL] #1474: cross-lane MBCNT inside an unstructured fragment region must "
+               "REJECT, not lower through the per-invocation dispatcher\n");
+        return 1;
+    }
+    printf("  [ok]   #1474: cross-lane op in an unstructured fragment region still rejects loudly\n");
+
     // The graphics CFG dispatcher must retain the fragment shell's already-proven alpha-test
     // linearization.  This reduced Astro Bot shape prefixes the crossing-region CFG above with a
     // survivor-mask SCC early-out.  The SCC from s_andn2_b64 is a whole-wave reduction, not an SSA

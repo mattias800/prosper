@@ -553,8 +553,13 @@ int main() {
             }
         }
 
-        // Partially-overlapping loops (a back-edge into another loop's body without proper nesting)
-        // remain rejected in the fragment shell (no dispatcher fallback exists there).
+        // Partially-overlapping loops (a back-edge into another loop's body without proper nesting).
+        // The narrow pattern structurizer still calls this unstructured and rejects it, but the
+        // graphics CFG dispatcher added for Astro Bot's materials then executes the exact block graph
+        // per invocation, so the region lowers rather than dropping the draw (#1474). This test owns
+        // the half that needs a device: a real driver has to accept the module. The accept/reject
+        // contract itself is pinned device-free in test_rdna2_spirv_struct, because these
+        // Vulkan-execution tests are not built where no Vulkan device is available.
         const uint32_t overlap_ps[] = {
             0xBE800380u, 0x7E020284u,
             0x7DA20200u,               //  2: A_HDR: v_cmpx_lt_u32 s0, v1
@@ -568,8 +573,18 @@ int main() {
             0xF800180Fu, 0x05020302u,  // 10: export
             0xBF810000u,               // 12: s_endpgm
         };
-        CHECK(recompile_fragment(overlap_ps, sizeof(overlap_ps)/sizeof(overlap_ps[0])).empty(),
-              "#590: partially-overlapping loops remain REJECTED (fragment)");
+        std::vector<uint32_t> overlap_frag =
+            recompile_fragment(overlap_ps, sizeof(overlap_ps)/sizeof(overlap_ps[0]));
+        CHECK(!overlap_frag.empty() && overlap_frag[0] == 0x07230203u,
+              "#1474: partially-overlapping fragment loops lower to a SPIR-V module");
+        if (!overlap_frag.empty()) {
+            // Pipeline creation is the assertion: the driver validates the dispatcher's output, so a
+            // structurally invalid lowering fails here rather than silently producing a module.
+            std::vector<uint8_t> overlap_px =
+                prosper::test::render_triangle_rgba(vert, overlap_frag, W, H);
+            CHECK(overlap_px.size() == (size_t)W * H * 4,
+                  "#1474: a real driver accepts the dispatcher-lowered overlapping-loop shader");
+        }
     }
 
     // SCALAR-SPILL lane slots (#273): v_writelane_b32 packs two scalars into v10's lanes 3/7 and
