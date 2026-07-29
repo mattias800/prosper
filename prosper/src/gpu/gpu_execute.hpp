@@ -548,8 +548,10 @@ struct SharedVulkanContext {
     bool storage_image_write_without_format = false;
     // Exact compute-wave acceleration. These describe features ENABLED on the borrowed device, not
     // merely physical support. The recompiler opts in only when the requested guest wave is inside
-    // this range and both vote and arithmetic subgroup operations are available.
+    // this range, full compute subgroups can be required, and both vote and arithmetic subgroup
+    // operations are available.
     bool compute_subgroup_size_control = false;
+    bool compute_full_subgroups = false;
     bool compute_subgroup_vote = false;
     bool compute_subgroup_arithmetic = false;
     uint32_t min_compute_subgroup_size = 0;

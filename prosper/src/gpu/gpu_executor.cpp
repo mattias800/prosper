@@ -3537,20 +3537,23 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // Realized captures store SPIR-V but not enough raw compute launch state to recompile a
         // device-specific typed-storage module on replay. Compile capture-bound dispatches through
         // the portable raw-uvec4 path so optional format support never becomes an artifact ABI.
-        if (std::getenv("PROSPER_GPU_CAPTURE") ||
+        const bool capture_bound = std::getenv("PROSPER_GPU_CAPTURE") ||
             std::getenv("PROSPER_GPU_TIMELINE_CAPTURE") ||
-            interactive_gpu_capture_armed() || interactive_capture_bundle_active())
+            interactive_gpu_capture_armed() || interactive_capture_bundle_active();
+        if (capture_bound)
             config.native_storage_format_support = 0;
-        // RequiredSubgroupSize fixes only the subgroup WIDTH. Vulkan deliberately does not promise
-        // that SubgroupLocalInvocationId is LocalInvocationIndex modulo that width, so using native
-        // lane IDs for RDNA MBCNT/EXEC/VCC would silently change guest wave membership on a
-        // conforming implementation. Keep the portable emulation by default. This opt-in exists for
-        // driver experiments whose contiguous mapping has been validated externally; it is not a
-        // portable correctness contract.
-        if (getenv("PROSPER_ASSUME_CONTIGUOUS_COMPUTE_SUBGROUPS") &&
-            !getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") &&
+        // Full exact-size subgroups let the translator assign guest local coordinates in
+        // SubgroupId/SubgroupLocalInvocationId order. That avoids assuming any relationship between
+        // Vulkan's implementation-defined LocalInvocationIndex order and subgroup lane order while
+        // still making each native subgroup exactly one RDNA wave. Captures remain portable until
+        // their schema records the required-subgroup/full-subgroup pipeline contract.
+        const uint64_t local_invocations = static_cast<uint64_t>(config.local_x) *
+            config.local_y * config.local_z;
+        if (!capture_bound && !getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") &&
             shared_vulkan.compute_subgroup_size_control &&
+            shared_vulkan.compute_full_subgroups &&
             shared_vulkan.compute_subgroup_vote && shared_vulkan.compute_subgroup_arithmetic &&
+            local_invocations && local_invocations % config.wave_size == 0 &&
             config.wave_size >= shared_vulkan.min_compute_subgroup_size &&
             config.wave_size <= shared_vulkan.max_compute_subgroup_size)
             config.native_subgroup_size = config.wave_size;

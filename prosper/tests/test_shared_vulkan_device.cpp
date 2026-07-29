@@ -55,6 +55,8 @@ int main() {
     CHECK(shared.storage_image_write_without_format ==
               (supported.shaderStorageImageWriteWithoutFormat == VK_TRUE),
           "published storage-image WRITE flag reflects the device");
+    CHECK(shared.compute_full_subgroups == ctx.compute_full_subgroups,
+          "published full-compute-subgroup flag reflects the enabled device feature");
 
     // Adopting a queue family without COMPUTE would make every dispatch invalid usage.
     uint32_t count = 0;

@@ -49,6 +49,19 @@ static size_t count_spirv_opcode(const std::vector<uint32_t>& spv, uint16_t opco
     }
     return matches;
 }
+static bool has_spirv_builtin(const std::vector<uint32_t>& spv, uint32_t builtin) {
+    constexpr uint16_t OpDecorate = 71;
+    constexpr uint32_t DecorationBuiltIn = 11;
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        if (!count || word + count > spv.size()) return false;
+        if ((spv[word] & 0xFFFFu) == OpDecorate && count >= 4 &&
+            spv[word + 2] == DecorationBuiltIn && spv[word + 3] == builtin)
+            return true;
+        word += count;
+    }
+    return false;
+}
 
 int main() {
     printf("== test_rdna2_to_spirv ==\n");
@@ -519,6 +532,11 @@ int main() {
           "exact-wave CFG dispatcher lowers votes and liveness to native subgroup-any");
     CHECK(count_spirv_opcode(native_spv17d, 224) == 0,
           "exact-wave CFG dispatcher emits no workgroup control barrier");
+    CHECK(has_spirv_builtin(native_spv17d, 40) &&
+              has_spirv_builtin(native_spv17d, 41) &&
+              count_spirv_opcode(native_spv17d, 134) >= 2 &&
+              count_spirv_opcode(native_spv17d, 137) >= 2,
+          "exact-wave compute remaps local coordinates in full-subgroup lane order");
 
     // Kernel 17d2: Astro's mask-priority sequence compares a VOPC-produced SGPR pair against zero,
     // then uses that wave-uniform SCC in s_cselect_b64.  Keep the irreducible prefix so this exercises

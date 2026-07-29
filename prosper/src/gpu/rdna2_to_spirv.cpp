@@ -35,6 +35,7 @@ enum : uint32_t {
     Op_Load=61, Op_Store=62, Op_AccessChain=65, Op_Decorate=71, Op_MemberDecorate=72,
     Op_ConvertFToU=109, Op_ConvertFToS=110, Op_ConvertSToF=111, Op_ConvertUToF=112, Op_Bitcast=124,
     Op_CompositeConstruct=80, Op_CompositeExtract=81, Op_IAdd=128, Op_FAdd=129, Op_ISub=130, Op_FSub=131, Op_IMul=132, Op_FMul=133,
+    Op_UDiv=134, Op_UMod=137,
     Op_UMulExtended=151, Op_SMulExtended=152,   // {lo,hi} struct results (for mul_hi)
     Op_FDiv=136, Op_SMod=139, Op_IEqual=170, Op_INotEqual=171, Op_UGreaterThan=172, Op_SGreaterThan=173,
     Op_UGreaterThanEqual=174, Op_SGreaterThanEqual=175, Op_ULessThan=176, Op_SLessThan=177,
@@ -94,7 +95,7 @@ enum : uint32_t {
     Dec_DescriptorSet=34, Dec_Offset=35, Dec_XfbBuffer=36, Dec_XfbStride=37,
     BI_Position=0, BI_FragCoord=15, BI_FragDepth=22, BI_HelperInvocation=23,
     BI_WorkgroupId=26, BI_LocalInvocationId=27,
-    BI_GlobalInvocationId=28, BI_SubgroupLocalInvocationId=41,
+    BI_GlobalInvocationId=28, BI_SubgroupId=40, BI_SubgroupLocalInvocationId=41,
     BI_VertexIndex=42, BI_InstanceIndex=43,
     GroupOp_Reduce=0, GroupOp_ExclusiveScan=2,
 };
@@ -234,7 +235,7 @@ struct SpirvCompute {
     // subgroup size equal to the PS5 wave. Native votes/scans are then architecture-exact.
     uint32_t native_subgroup_size=0;
     uint32_t native_storage_format_support=0;
-    uint32_t v_subgroup_localid=0, t_ptr_in_u32=0;
+    uint32_t v_subgroupid=0, v_subgroup_localid=0, t_ptr_in_u32=0;
     uint32_t v_helper_invocation=0, t_ptr_in_bool=0;
     uint32_t v_internal_gds=0, t_ptr_gds_u32=0;
     // Descriptor set for this stage's resources. VS and PS share ONE Vulkan pipeline, so they must NOT
@@ -462,8 +463,10 @@ struct SpirvCompute {
             declared_subgroup = true;
         }
         if (!v_subgroup_localid) {
-            t_ptr_in_u32 = id();
-            put(types, Op_TypePointer, {t_ptr_in_u32, SC_Input, t_u32});
+            if (!t_ptr_in_u32) {
+                t_ptr_in_u32 = id();
+                put(types, Op_TypePointer, {t_ptr_in_u32, SC_Input, t_u32});
+            }
             v_subgroup_localid = id();
             put(types, Op_Variable, {t_ptr_in_u32, v_subgroup_localid, SC_Input});
             put(deco, Op_Decorate,
@@ -481,6 +484,26 @@ struct SpirvCompute {
         uint32_t lane = id();
         put(code, Op_Load, {t_u32, lane, v_subgroup_localid});
         return lane;
+    }
+    uint32_t subgroup_id() {
+        if (!declared_subgroup) {
+            put(caps, Op_Capability, {Cap_GroupNonUniform});
+            declared_subgroup = true;
+        }
+        if (!v_subgroupid) {
+            if (!t_ptr_in_u32) {
+                t_ptr_in_u32 = id();
+                put(types, Op_TypePointer, {t_ptr_in_u32, SC_Input, t_u32});
+            }
+            v_subgroupid = id();
+            put(types, Op_Variable, {t_ptr_in_u32, v_subgroupid, SC_Input});
+            put(deco, Op_Decorate, {v_subgroupid, Dec_BuiltIn, BI_SubgroupId});
+            put(deco, Op_Decorate, {v_subgroupid, Dec_Flat});
+            iface.push_back(v_subgroupid);
+        }
+        uint32_t subgroup = id();
+        put(code, Op_Load, {t_u32, subgroup, v_subgroupid});
+        return subgroup;
     }
     uint32_t fragment_mbcnt(uint32_t mask_bit, uint32_t acc_bits, bool lo) {
         if (!is_fragment) return 0;
@@ -1777,28 +1800,47 @@ struct SpirvCompute {
         put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
         put(code, Op_Label, {lbl}); cur_block = lbl;
         function_var_insert = code.size();
-        uint32_t ld = id(); put(code, Op_Load, {t_v3u, ld, v_gid});
-        for (uint32_t c = 0; c < 3; c++) {
-            globalid_comp[c] = id();
-            put(code, Op_CompositeExtract, {t_u32, globalid_comp[c], ld, c});
-        }
-        gidx = globalid_comp[0];
-        uint32_t ldl = id(); put(code, Op_Load, {t_v3u, ldl, v_localid});
-        for (uint32_t c = 0; c < 3; c++) {
-            localid_comp[c] = id();
-            put(code, Op_CompositeExtract, {t_u32, localid_comp[c], ldl, c});
-        }
-        localid = localid_comp[0];   // wave lane index
-        // Vulkan and RDNA both linearize X fastest, then Y, then Z. Keep the legacy X-only lane id
-        // for the older 64x1 wave helpers, but retain the exact linear id for 2D/3D dispatcher waves.
-        uint32_t yz = ibin(Op_IMul, localid_comp[2], uconst(local_y));
-        yz = ibin(Op_IAdd, yz, localid_comp[1]);
-        linear_localid = ibin(Op_IAdd, ibin(Op_IMul, yz, uconst(local_x)), localid_comp[0]);
         uint32_t ldg = id(); put(code, Op_Load, {t_v3u, ldg, v_groupid});
         for (uint32_t c = 0; c < 3; c++) {
             groupid[c] = id();
             put(code, Op_CompositeExtract, {t_u32, groupid[c], ldg, c});
         }
+        if (native_subgroup_size) {
+            // Vulkan does not promise that LocalInvocationIndex follows subgroup lane order.  A
+            // full, exact-size subgroup does promise that SubgroupId/SubgroupLocalInvocationId
+            // identify every workgroup invocation once, so assign guest coordinates in that order.
+            // This makes one Vulkan subgroup exactly one consecutive RDNA wave without depending on
+            // the implementation's otherwise-unspecified local-invocation mapping.
+            linear_localid = ibin(Op_IAdd,
+                ibin(Op_IMul, subgroup_id(), uconst(native_subgroup_size)),
+                subgroup_local_id());
+            localid_comp[0] = ibin(Op_UMod, linear_localid, uconst(local_x));
+            const uint32_t linear_yz = ibin(Op_UDiv, linear_localid, uconst(local_x));
+            localid_comp[1] = ibin(Op_UMod, linear_yz, uconst(local_y));
+            localid_comp[2] = ibin(Op_UDiv, linear_yz, uconst(local_y));
+            const uint32_t local_size[3] = {local_x, local_y, local_z};
+            for (uint32_t c = 0; c < 3; ++c)
+                globalid_comp[c] = ibin(Op_IAdd,
+                    ibin(Op_IMul, groupid[c], uconst(local_size[c])), localid_comp[c]);
+        } else {
+            uint32_t ld = id(); put(code, Op_Load, {t_v3u, ld, v_gid});
+            for (uint32_t c = 0; c < 3; c++) {
+                globalid_comp[c] = id();
+                put(code, Op_CompositeExtract, {t_u32, globalid_comp[c], ld, c});
+            }
+            uint32_t ldl = id(); put(code, Op_Load, {t_v3u, ldl, v_localid});
+            for (uint32_t c = 0; c < 3; c++) {
+                localid_comp[c] = id();
+                put(code, Op_CompositeExtract, {t_u32, localid_comp[c], ldl, c});
+            }
+            // Vulkan and RDNA both linearize X fastest, then Y, then Z.
+            uint32_t yz = ibin(Op_IMul, localid_comp[2], uconst(local_y));
+            yz = ibin(Op_IAdd, yz, localid_comp[1]);
+            linear_localid = ibin(
+                Op_IAdd, ibin(Op_IMul, yz, uconst(local_x)), localid_comp[0]);
+        }
+        gidx = globalid_comp[0];
+        localid = localid_comp[0];
     }
     // AGC thread-dimension mode can request a non-multiple of the shader's local size. Vulkan still
     // launches the final complete workgroup, so make its excess invocations branch directly to the

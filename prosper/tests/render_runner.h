@@ -535,6 +535,7 @@ struct RenderVkCtx {
     // Geometry-probe (PROSPER_GEOM_PROBE): VK_EXT_transform_feedback for capturing gl_Position.
     bool transform_feedback_enabled = false;
     bool subgroup_size_control = false;
+    bool compute_full_subgroups = false;
     uint32_t min_subgroup_size = 0, max_subgroup_size = 0;
     VkShaderStageFlags required_subgroup_size_stages = 0;
     VkShaderStageFlags subgroup_stages = 0;
@@ -711,6 +712,7 @@ inline const RenderVkCtx& render_vk_ctx() {
                       dci.pNext = &subgroup_features;
                       dev_exts.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
                       r.subgroup_size_control = true;
+                      r.compute_full_subgroups = subgroup_features.computeFullSubgroups;
                       r.min_subgroup_size = subgroup_properties.minSubgroupSize;
                       r.max_subgroup_size = subgroup_properties.maxSubgroupSize;
                       r.required_subgroup_size_stages =
@@ -786,6 +788,7 @@ inline const RenderVkCtx& render_vk_ctx() {
             shared.compute_subgroup_size_control = r.subgroup_size_control &&
                 (r.required_subgroup_size_stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
                 (r.subgroup_stages & VK_SHADER_STAGE_COMPUTE_BIT);
+            shared.compute_full_subgroups = r.compute_full_subgroups;
             shared.compute_subgroup_vote =
                 (r.subgroup_operations & VK_SUBGROUP_FEATURE_VOTE_BIT) != 0;
             shared.compute_subgroup_arithmetic =

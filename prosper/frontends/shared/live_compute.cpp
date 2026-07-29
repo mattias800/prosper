@@ -3310,6 +3310,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (item.required_subgroup_size) {
                 required_subgroup.requiredSubgroupSize = item.required_subgroup_size;
                 cpci.stage.pNext = &required_subgroup;
+                cpci.stage.flags |=
+                    VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
             }
             cpci.layout = pipeline_layout;
             if (trace) std::fprintf(stderr, "[compute]   creating compute pipeline\n");
