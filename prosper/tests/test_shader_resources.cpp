@@ -374,8 +374,10 @@ int main() {
         image_spv, &image_table, 1, SpirvShaderStage::Fragment);
     CHECK(ir.ok() && ir.descriptors.size() == 1 &&
           ir.descriptors[0].kind == SpirvDescriptorKind::CombinedImageSampler &&
-          ir.descriptors[0].normalized_sampling && !ir.descriptors[0].texel_access,
-          "sampled-image reflection validates a concrete texture binding");
+          ir.descriptors[0].normalized_sampling && !ir.descriptors[0].texel_access &&
+          ir.descriptors[0].image_dim == 1 && !ir.descriptors[0].image_arrayed &&
+          !ir.descriptors[0].image_multisampled,
+          "sampled-image reflection validates its concrete 2D non-array texture binding");
     CHECK(ir.descriptors.size() == 1 && !ir.descriptors[0].writable,
           "sampled descriptor is not mistaken for an image output");
     const auto fetch_report = validate_spirv_descriptor_interface(
@@ -451,6 +453,9 @@ int main() {
     auto ur = validate_spirv_descriptor_interface(spv, &extra, 0, SpirvShaderStage::Vertex);
     CHECK(ur.ok() && has_issue(ur, DescriptorIssueCode::UnusedRuntimeBinding),
           "unused runtime binding is reported as a non-fatal warning");
+    CHECK(find_spirv_descriptor_binding(ur, 0, good.binding) != nullptr &&
+              find_spirv_descriptor_binding(ur, 0, unused.binding) == nullptr,
+          "reflected binding lookup distinguishes shader-used resources from runtime extras");
 
     auto setr = validate_spirv_descriptor_interface(spv, &valid, 1, SpirvShaderStage::Fragment);
     CHECK(!setr.ok() && has_issue(setr, DescriptorIssueCode::SetMismatch) &&

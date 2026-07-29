@@ -14,6 +14,7 @@
 #include "rdna2_to_spirv.hpp"     // recompile_compute
 #include "writer_provenance.hpp"
 #include "../host/guest_memory_map.hpp"
+#include "../host/guest_write_watch.hpp"
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
@@ -184,16 +185,25 @@ struct ShaderCompileKey {
     uint32_t compute_lds_bytes = 0;
     uint32_t compute_native_subgroup_size = 0;
     uint32_t compute_native_storage_format_support = 0;
+    uint32_t vertex_lds_dwords = 0;
+    uint32_t vertices_per_instance = 0;
     // Aliases ShaderCodeAnalysis::code and keeps that immutable analysis alive. Warm lookups used to
     // copy and re-hash the complete raw program for every draw before reaching the shader cache.
     std::shared_ptr<const std::vector<uint32_t>> code;
     uint64_t code_hash = 0;
+    // Optional main program reached by a separately-installed vertex-fetch prolog. It remains a
+    // distinct immutable analysis so cache identity covers both allocations without constructing a
+    // transient concatenated buffer on every warm draw.
+    std::shared_ptr<const std::vector<uint32_t>> chain_code;
+    uint64_t chain_code_hash = 0;
     std::vector<ShaderResourceCompileKey> resources;
     size_t cached_hash = 0;
 
     bool operator==(const ShaderCompileKey& other) const {
         const bool same_code = code == other.code ||
             (code && other.code && *code == *other.code);
+        const bool same_chain_code = chain_code == other.chain_code ||
+            (chain_code && other.chain_code && *chain_code == *other.chain_code);
         return stage == other.stage &&
                has_resource_table == other.has_resource_table &&
                force_position_w == other.force_position_w &&
@@ -223,7 +233,9 @@ struct ShaderCompileKey {
                compute_native_subgroup_size == other.compute_native_subgroup_size &&
                compute_native_storage_format_support ==
                    other.compute_native_storage_format_support &&
-               resources == other.resources && same_code;
+               vertex_lds_dwords == other.vertex_lds_dwords &&
+               vertices_per_instance == other.vertices_per_instance &&
+               resources == other.resources && same_code && same_chain_code;
     }
 };
 
@@ -283,8 +295,12 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, key.compute_native_subgroup_size);
             hash = hash_mix(hash, key.compute_native_storage_format_support);
         }
+        hash = hash_mix(hash, key.vertex_lds_dwords);
+        hash = hash_mix(hash, key.vertices_per_instance);
         hash = hash_mix(hash, key.code ? key.code->size() : 0u);
         hash = hash_mix(hash, key.code_hash);
+        hash = hash_mix(hash, key.chain_code ? key.chain_code->size() : 0u);
+        hash = hash_mix(hash, key.chain_code_hash);
         hash = hash_mix(hash, key.resources.size());
         for (const auto& resource : key.resources) {
             hash = hash_mix(hash, resource.cls);
@@ -779,6 +795,7 @@ uint64_t shader_cache_limit_bytes() {
 
 uint64_t shader_cache_entry_bytes(const ShaderCompileKey& key, const std::vector<uint32_t>& spirv) {
     return static_cast<uint64_t>(key.code ? key.code->size() : 0u) * sizeof(uint32_t) +
+           static_cast<uint64_t>(key.chain_code ? key.chain_code->size() : 0u) * sizeof(uint32_t) +
            static_cast<uint64_t>(key.resources.size()) * sizeof(ShaderResourceCompileKey) +
            (key.has_pixel_inputs ? sizeof(PixelInputMapping) : 0u) +
            (key.has_system_inputs ? sizeof(PixelSystemInputMapping) : 0u) +
@@ -842,13 +859,20 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                                          const ShaderResourceTable* resources,
                                          const PixelInputMapping* pixel_inputs,
                                          const PixelSystemInputMapping* system_inputs,
+                                         const uint32_t* chain_code = nullptr,
+                                         size_t chain_dwords = 0,
+                                         uint32_t vertex_lds_dwords = 0,
                                          const ComputeShaderConfig* compute_config = nullptr,
                                          bool fragment_wave32 = false) {
     ShaderCompileKey key;
     key.stage = stage;
+    key.vertex_lds_dwords = stage == ShaderProgramStage::Vertex
+        ? std::min(vertex_lds_dwords, 16384u) : 0u;
+    key.vertices_per_instance = stage == ShaderProgramStage::Vertex && resources
+        ? resources->vertices_per_instance : 0u;
     key.has_resource_table = resources != nullptr;
     key.force_position_w = getenv("PROSPER_FORCE_W") != nullptr;
-    key.has_pixel_inputs = stage == ShaderProgramStage::Vertex && pixel_inputs != nullptr;
+    key.has_pixel_inputs = stage != ShaderProgramStage::Compute && pixel_inputs != nullptr;
     if (key.has_pixel_inputs) key.pixel_inputs = *pixel_inputs;
     key.has_system_inputs = stage == ShaderProgramStage::Fragment && system_inputs != nullptr;
     if (key.has_system_inputs) key.system_inputs = *system_inputs;
@@ -917,6 +941,15 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
         key.code = std::shared_ptr<const std::vector<uint32_t>>(analysis, &analysis->code);
         key.code_hash = analysis->code_hash;
     }
+    if (stage == ShaderProgramStage::Vertex && chain_code && chain_dwords) {
+        const std::shared_ptr<const ShaderCodeAnalysis> chain_analysis =
+            analyze_shader_code_cached(chain_code, chain_dwords);
+        if (chain_analysis) {
+            key.chain_code = std::shared_ptr<const std::vector<uint32_t>>(
+                chain_analysis, &chain_analysis->code);
+            key.chain_code_hash = chain_analysis->code_hash;
+        }
+    }
     if (resources) {
         key.resources.reserve(resources->resources.size());
         for (const auto& resource : resources->resources) {
@@ -964,14 +997,26 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
         // Geometry probe (PROSPER_GEOM_PROBE): decorate gl_Position for transform-feedback capture on
         // the LIVE path (which recompiles here). Capsule replay substitutes an xfb VS in gpu_replay,
         // because a capsule stores already-recompiled SPIR-V. Inert to the shader's computation.
-        return recompile_vertex(code, code_size, resources,
-                                key.has_pixel_inputs ? &key.pixel_inputs : nullptr,
-                                getenv("PROSPER_GEOM_PROBE") != nullptr);
-    if (stage == ShaderProgramStage::Fragment)
+        return key.chain_code
+            ? recompile_vertex_chain(code, code_size, key.chain_code->data(),
+                                     key.chain_code->size(), resources,
+                                     key.has_pixel_inputs ? &key.pixel_inputs : nullptr,
+                                     getenv("PROSPER_GEOM_PROBE") != nullptr,
+                                     key.vertex_lds_dwords)
+            : recompile_vertex(code, code_size, resources,
+                               key.has_pixel_inputs ? &key.pixel_inputs : nullptr,
+                               getenv("PROSPER_GEOM_PROBE") != nullptr,
+                               key.vertex_lds_dwords);
+    if (stage == ShaderProgramStage::Fragment) {
+        const FragmentInterpolationLayout interpolation = fragment_interpolation_layout(
+            code, code_size,
+            key.has_system_inputs ? &key.system_inputs : nullptr,
+            key.has_pixel_inputs ? &key.pixel_inputs : nullptr);
         return recompile_fragment(code, code_size, resources,
                                   key.has_system_inputs ? &key.system_inputs : nullptr,
                                   key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX,
-                                  nullptr, key.fragment_wave32);
+                                  &interpolation, key.fragment_wave32);
+    }
     return {};
 }
 
@@ -984,10 +1029,15 @@ void maybe_dump_successful_shader(ShaderProgramStage stage, const ShaderCompileK
         reinterpret_cast<const uint8_t*>(spirv.data()), spirv.size() * sizeof(uint32_t));
     const uint64_t raw_hash = gpu_capture_hash(
         reinterpret_cast<const uint8_t*>(key.code->data()), key.code->size() * sizeof(uint32_t));
+    const uint64_t chain_hash = key.chain_code && !key.chain_code->empty()
+        ? gpu_capture_hash(reinterpret_cast<const uint8_t*>(key.chain_code->data()),
+                           key.chain_code->size() * sizeof(uint32_t))
+        : 0;
     static std::mutex dump_mutex;
-    static std::set<std::tuple<uint32_t, uint64_t, uint64_t>> dumped;
+    static std::set<std::tuple<uint32_t, uint64_t, uint64_t, uint64_t>> dumped;
     std::lock_guard lock(dump_mutex);
-    if (!dumped.emplace(static_cast<uint32_t>(stage), spirv_hash, raw_hash).second) return;
+    if (!dumped.emplace(static_cast<uint32_t>(stage), spirv_hash, raw_hash, chain_hash).second)
+        return;
 
     std::error_code ec;
     std::filesystem::create_directories(directory, ec);
@@ -997,26 +1047,100 @@ void maybe_dump_successful_shader(ShaderProgramStage stage, const ShaderCompileK
     }
     const char* tag = stage == ShaderProgramStage::Vertex ? "vs" :
                       stage == ShaderProgramStage::Fragment ? "ps" : "cs";
-    char raw_path[1024], spirv_path[1024];
+    char raw_path[1024], chain_path[1024], spirv_path[1024];
     snprintf(raw_path, sizeof(raw_path), "%s/success_%s_%016llx_%016llx.bin", directory, tag,
              static_cast<unsigned long long>(spirv_hash),
              static_cast<unsigned long long>(raw_hash));
+    snprintf(chain_path, sizeof(chain_path), "%s/success_%s_%016llx_%016llx_main_%016llx.bin",
+             directory, tag, static_cast<unsigned long long>(spirv_hash),
+             static_cast<unsigned long long>(raw_hash),
+             static_cast<unsigned long long>(chain_hash));
     snprintf(spirv_path, sizeof(spirv_path), "%s/success_%s_%016llx_%016llx.spv", directory, tag,
              static_cast<unsigned long long>(spirv_hash),
              static_cast<unsigned long long>(raw_hash));
     FILE* raw = fopen(raw_path, "wb");
+    FILE* chain = chain_hash ? fopen(chain_path, "wb") : nullptr;
     FILE* translated = fopen(spirv_path, "wb");
     const size_t raw_bytes = key.code->size() * sizeof(uint32_t);
+    const size_t chain_bytes = chain_hash ? key.chain_code->size() * sizeof(uint32_t) : 0;
     const size_t spirv_bytes = spirv.size() * sizeof(uint32_t);
     const bool ok = raw && translated &&
         fwrite(key.code->data(), 1, raw_bytes, raw) == raw_bytes &&
+        (!chain_hash || (chain && fwrite(key.chain_code->data(), 1, chain_bytes, chain) ==
+                                     chain_bytes)) &&
         fwrite(spirv.data(), 1, spirv_bytes, translated) == spirv_bytes;
     if (raw) fclose(raw);
+    if (chain) fclose(chain);
     if (translated) fclose(translated);
-    fprintf(stderr, "[shader-dump] %s spv=%016llx raw=%016llx words=%zu/%zu result=%s\n", tag,
+    fprintf(stderr,
+            "[shader-dump] %s spv=%016llx raw=%016llx main=%016llx words=%zu+%zu/%zu "
+            "result=%s\n", tag,
             static_cast<unsigned long long>(spirv_hash),
-            static_cast<unsigned long long>(raw_hash), key.code->size(), spirv.size(),
+            static_cast<unsigned long long>(raw_hash),
+            static_cast<unsigned long long>(chain_hash), key.code->size(),
+            key.chain_code ? key.chain_code->size() : 0u, spirv.size(),
             ok ? "written" : "failed");
+}
+
+SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, ShaderCompileKey key,
+                                                  const ShaderResourceTable* resources,
+                                                  uint64_t* cache_identity) {
+    if (cache_identity) *cache_identity = 0;
+    if (getenv("PROSPER_NO_SHADER_CACHE")) {
+        auto& cache = shader_cache();
+        {
+            std::lock_guard lock(cache.mutex);
+            ++cache.stats.bypasses;
+        }
+        auto spirv = std::make_shared<const std::vector<uint32_t>>(
+            compile_graphics_shader(stage, key, resources));
+        maybe_dump_successful_shader(stage, key, *spirv);
+        return spirv;
+    }
+
+    auto& cache = shader_cache();
+    std::lock_guard lock(cache.mutex);
+    auto found = cache.entries.find(key);
+    if (found != cache.entries.end()) {
+        ++cache.stats.hits;
+        found->second.last_use = ++cache.use_counter;
+        if (cache_identity) *cache_identity = found->second.identity;
+        maybe_dump_successful_shader(stage, key, *found->second.spirv);
+        return found->second.spirv;
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    auto spirv = std::make_shared<const std::vector<uint32_t>>(
+        compile_graphics_shader(stage, key, resources));
+    maybe_dump_successful_shader(stage, key, *spirv);
+    const auto end = std::chrono::steady_clock::now();
+    ++cache.stats.misses;
+    cache.stats.compile_ms += std::chrono::duration<double, std::milli>(end - start).count();
+
+    constexpr size_t max_entries = 4096;
+    const uint64_t bytes = shader_cache_entry_bytes(key, *spirv);
+    const uint64_t limit = shader_cache_limit_bytes();
+    while (!cache.entries.empty() &&
+           (cache.entries.size() >= max_entries || cache.stats.bytes + bytes > limit)) {
+        auto oldest = cache.entries.begin();
+        for (auto it = std::next(cache.entries.begin()); it != cache.entries.end(); ++it)
+            if (it->second.last_use < oldest->second.last_use) oldest = it;
+        cache.stats.bytes -= oldest->second.bytes;
+        cache.entries.erase(oldest);
+        ++cache.stats.evictions;
+    }
+    if (bytes <= limit && max_entries != 0) {
+        CachedShader value;
+        value.spirv = spirv;
+        value.identity = cache.next_identity++;
+        value.last_use = ++cache.use_counter;
+        value.bytes = bytes;
+        if (cache_identity) *cache_identity = value.identity;
+        cache.stats.bytes += bytes;
+        cache.entries.emplace(std::move(key), std::move(value));
+    }
+    cache.stats.entries = cache.entries.size();
+    return spirv;
 }
 
 } // namespace
@@ -1100,75 +1224,38 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
         ShaderProgramStage stage, const uint32_t* code, size_t dwords,
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
         const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity,
-        bool fragment_wave32) {
-    if (cache_identity) *cache_identity = 0;
+        bool fragment_wave32, uint32_t vertex_lds_dwords) {
     ShaderCompileKey key = make_shader_compile_key(stage, code, dwords, resources, pixel_inputs,
-                                                   system_inputs, nullptr, fragment_wave32);
-    if (getenv("PROSPER_NO_SHADER_CACHE")) {
-        auto& cache = shader_cache();
-        {
-            std::lock_guard lock(cache.mutex);
-            ++cache.stats.bypasses;
-        }
-        auto spirv = std::make_shared<const std::vector<uint32_t>>(
-            compile_graphics_shader(stage, key, resources));
-        maybe_dump_successful_shader(stage, key, *spirv);
-        return spirv;
-    }
+                                                   system_inputs, nullptr, 0,
+                                                   vertex_lds_dwords, nullptr,
+                                                   fragment_wave32);
+    return cache_compiled_graphics_shader(stage, std::move(key), resources, cache_identity);
+}
 
-    auto& cache = shader_cache();
-    std::lock_guard lock(cache.mutex);
-    auto found = cache.entries.find(key);
-    if (found != cache.entries.end()) {
-        ++cache.stats.hits;
-        found->second.last_use = ++cache.use_counter;
-        if (cache_identity) *cache_identity = found->second.identity;
-        maybe_dump_successful_shader(stage, key, *found->second.spirv);
-        return found->second.spirv;
+SharedShaderWords recompile_vertex_chain_cached_shared(
+        const uint32_t* prolog, size_t prolog_dwords,
+        const uint32_t* main, size_t main_dwords,
+        const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
+        uint64_t* cache_identity, uint32_t vertex_lds_dwords) {
+    ShaderCompileKey key = make_shader_compile_key(
+        ShaderProgramStage::Vertex, prolog, prolog_dwords, resources, pixel_inputs, nullptr,
+        main, main_dwords, vertex_lds_dwords);
+    if (!key.chain_code) {
+        if (cache_identity) *cache_identity = 0;
+        return {};
     }
-
-    const auto start = std::chrono::steady_clock::now();
-    auto spirv = std::make_shared<const std::vector<uint32_t>>(
-        compile_graphics_shader(stage, key, resources));
-    maybe_dump_successful_shader(stage, key, *spirv);
-    const auto end = std::chrono::steady_clock::now();
-    ++cache.stats.misses;
-    cache.stats.compile_ms += std::chrono::duration<double, std::milli>(end - start).count();
-
-    constexpr size_t max_entries = 4096;
-    const uint64_t bytes = shader_cache_entry_bytes(key, *spirv);
-    const uint64_t limit = shader_cache_limit_bytes();
-    while (!cache.entries.empty() &&
-           (cache.entries.size() >= max_entries || cache.stats.bytes + bytes > limit)) {
-        auto oldest = cache.entries.begin();
-        for (auto it = std::next(cache.entries.begin()); it != cache.entries.end(); ++it)
-            if (it->second.last_use < oldest->second.last_use) oldest = it;
-        cache.stats.bytes -= oldest->second.bytes;
-        cache.entries.erase(oldest);
-        ++cache.stats.evictions;
-    }
-    if (bytes <= limit && max_entries != 0) {
-        CachedShader value;
-        value.spirv = spirv;
-        value.identity = cache.next_identity++;
-        value.last_use = ++cache.use_counter;
-        value.bytes = bytes;
-        if (cache_identity) *cache_identity = value.identity;
-        cache.stats.bytes += bytes;
-        cache.entries.emplace(std::move(key), std::move(value));
-    }
-    cache.stats.entries = cache.entries.size();
-    return spirv;
+    return cache_compiled_graphics_shader(ShaderProgramStage::Vertex, std::move(key), resources,
+                                          cache_identity);
 }
 
 std::vector<uint32_t> recompile_graphics_shader_cached(
         ShaderProgramStage stage, const uint32_t* code, size_t dwords,
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
         const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity,
-        bool fragment_wave32) {
+        bool fragment_wave32, uint32_t vertex_lds_dwords) {
     SharedShaderWords words = recompile_graphics_shader_cached_shared(
         stage, code, dwords, resources, pixel_inputs, system_inputs, cache_identity,
-        fragment_wave32);
+        fragment_wave32, vertex_lds_dwords);
     return words ? *words : std::vector<uint32_t>{};
 }
 
@@ -1177,7 +1264,8 @@ std::vector<uint32_t> recompile_compute_shader_cached(
         const ComputeShaderConfig& config, uint64_t* cache_identity) {
     if (cache_identity) *cache_identity = 0;
     ShaderCompileKey key = make_shader_compile_key(
-        ShaderProgramStage::Compute, code, dwords, resources, nullptr, nullptr, &config);
+        ShaderProgramStage::Compute, code, dwords, resources, nullptr, nullptr,
+        nullptr, 0, 0, &config);
     auto compile = [&] {
         const uint32_t* owned_code = !key.code || key.code->empty() ? nullptr : key.code->data();
         const size_t owned_dwords = key.code ? key.code->size() : 0u;
@@ -1648,6 +1736,15 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_seed_origin_known.set((size_t)reg);
         }
     }
+    if (explicit_ngg_index_provenance) {
+        // Match recompile_vertex's merged GS/ES ABI model: s3[7:0] is the active ES-vertex
+        // count and s3[15:8] the GS-primitive count.  The Vulkan vertex shell represents one
+        // active ES vertex and no GS primitive, so s3=1.  Fetch prologues use this value to
+        // choose and patch V# descriptors before their MUBUF loads; leaving it unknown made the
+        // dynamic resource walk drop otherwise valid scene-geometry fetches even though the
+        // translator itself already compiled the same prologue with s3=1.
+        set_value(3, 1u);
+    }
 
     // A direct sharp lives in the initial user-data SGPR block rather than arriving through an
     // s_load. It remains a usable load-time descriptor only while none of its SGPRs has subsequently
@@ -1866,7 +1963,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     case 0x1E: r = a << (c & 31); break;                    // s_lshl_b32
                     case 0x20: r = a >> (c & 31); break;                    // s_lshr_b32
                     case 0x26: r = a * c; break;                            // s_mul_i32
-                    case 0x31: r = (a << 4) + c; break;                     // s_lshl4_add_u32
+                    case 0x2E: case 0x2F: case 0x30: case 0x31:
+                        r = (a << (in.opcode - 0x2Du)) + c; break;           // s_lshl{1,2,3,4}_add_u32
                     case 0x27: { uint32_t off = c & 0x1f, wid = (c >> 16) & 0x7f;   // s_bfe_u32
                                  r = wid == 0 ? 0 : (wid >= 32 ? (a >> off) : ((a >> off) & ((1u << wid) - 1))); break; }
                     case 0x0A:   // s_cselect_b32: dst = SCC ? src0 : src1 (the vertex-fetch format patch's tail)
@@ -2701,6 +2799,32 @@ void assign_convention_bindings(ShaderResourceTable& t, uint32_t first) {
             r.binding = tex_next++;
 }
 
+std::shared_ptr<ShaderResourceTable> merge_vertex_chain_resource_tables(
+        const std::shared_ptr<ShaderResourceTable>& prolog,
+        const std::shared_ptr<ShaderResourceTable>& main,
+        uint32_t main_pc_offset) {
+    if (!prolog && !main) return nullptr;
+    auto merged = std::make_shared<ShaderResourceTable>();
+    if (prolog) {
+        merged->resources = prolog->resources;
+        merged->vertices_per_instance = prolog->vertices_per_instance;
+    }
+    if (main) {
+        if (!merged->vertices_per_instance)
+            merged->vertices_per_instance = main->vertices_per_instance;
+        merged->resources.reserve(merged->resources.size() + main->resources.size());
+        for (ShaderResource resource : main->resources) {
+            if (resource.fetch_pc != 0xFFFFFFFFu) {
+                if (resource.fetch_pc > UINT32_MAX - main_pc_offset) return nullptr;
+                resource.fetch_pc += main_pc_offset;
+            }
+            merged->resources.push_back(std::move(resource));
+        }
+    }
+    assign_convention_bindings(*merged, 2u);
+    return merged;
+}
+
 std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint64_t code_addr,
                                                        bool is_ps, uint32_t draw_vertex_count) {
     if (!code_addr) return nullptr;
@@ -3095,7 +3219,9 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                                 r0.in_mip_tail == view.in_mip_tail &&
                                 r0.mip_tail_offset == (view.in_mip_tail ? view.mip_offset : 0) &&
                                 r0.mip_tail_x == view.mip_tail_x &&
-                                r0.mip_tail_y == view.mip_tail_y) {
+                                r0.mip_tail_y == view.mip_tail_y &&
+                                r0.layer_stride_bytes == view.layer_stride &&
+                                r0.layer_mip_offset_bytes == view.layer_mip_offset) {
                                 if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
                                 if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
                             }
@@ -3114,6 +3240,8 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     r.mip_tail_bytes = view.mip_tail_bytes;
                     r.mip_tail_x = view.mip_tail_x;
                     r.mip_tail_y = view.mip_tail_y;
+                    r.layer_stride_bytes = static_cast<uint32_t>(view.layer_stride);
+                    r.layer_mip_offset_bytes = static_cast<uint32_t>(view.layer_mip_offset);
                     r.max_uncompressed_block_size = d.max_uncompressed_block_size;
                     r.max_compressed_block_size = d.max_compressed_block_size;
                     const bool shifted_view = view.mip_offset != 0 || view.in_mip_tail;
@@ -3167,6 +3295,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             }
         }
         if (t.resources.empty()) continue;
+        t.vertices_per_instance = is_ps ? 0u : draw_vertex_count;
         assign_convention_bindings(t, is_ps ? kPsBindingBase : 2u);
         if (log) {
             fprintf(stderr, "[restab] %s code=0x%llx base=0x%x -> %zu resources:\n",
@@ -3306,6 +3435,17 @@ ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& d) {
     return out;
 }
 
+uint64_t compute_dispatch_code_addr(const GpuState& submit, const GpuState::Dispatch& dispatch) {
+    namespace P = prosper::agc::Pm4;
+    const GpuState& state = dispatch.state ? *dispatch.state : submit;
+    auto reg = [&](uint32_t offset) {
+        const auto it = state.sh.find(offset);
+        return it == state.sh.end() ? 0u : it->second;
+    };
+    return (static_cast<uint64_t>(reg(P::COMPUTE_PGM_LO)) << 8) |
+           (static_cast<uint64_t>(reg(P::COMPUTE_PGM_HI) & 0xffu) << 40);
+}
+
 std::vector<ComputeItem> realize_compute_dispatches(
     const GpuState& st, uint64_t submit_no,
     std::vector<OperationRealizationFailure>* failures) {
@@ -3322,8 +3462,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
     for (size_t dispatch_index = 0; dispatch_index < st.dispatches.size(); dispatch_index++) {
         const auto& dispatch = st.dispatches[dispatch_index];
         const GpuState& ds = dispatch.state ? *dispatch.state : st;
-        const uint64_t code_addr = (static_cast<uint64_t>(rd(ds.sh, P::COMPUTE_PGM_LO)) << 8) |
-                                   (static_cast<uint64_t>(rd(ds.sh, P::COMPUTE_PGM_HI) & 0xffu) << 40);
+        const uint64_t code_addr = compute_dispatch_code_addr(st, dispatch);
         OperationRealizationFailure failure;
         failure.kind = SubmitOperationKind::Dispatch;
         failure.index = dispatch_index;
@@ -3437,7 +3576,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     const DecodedImageView view = mapped_fmt
                         ? image_base_level_view(d, fi)
                         : DecodedImageView{d.base, d.width, d.height, 0, false, 0, 0, 0,
-                                           d.base_level == 0};
+                                           0, 0, d.base_level == 0};
                     if (!view.supported) {
                         warn_unsupported_image_view(d);
                         continue;
@@ -3456,7 +3595,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                 r0.in_mip_tail == view.in_mip_tail &&
                                 r0.mip_tail_offset == (view.in_mip_tail ? view.mip_offset : 0) &&
                                 r0.mip_tail_x == view.mip_tail_x &&
-                                r0.mip_tail_y == view.mip_tail_y) {
+                                r0.mip_tail_y == view.mip_tail_y &&
+                                r0.layer_stride_bytes == view.layer_stride &&
+                                r0.layer_mip_offset_bytes == view.layer_mip_offset) {
                                 if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
                                 if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
                             }
@@ -3489,6 +3630,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     r.mip_tail_bytes = view.mip_tail_bytes;
                     r.mip_tail_x = view.mip_tail_x;
                     r.mip_tail_y = view.mip_tail_y;
+                    r.layer_stride_bytes = static_cast<uint32_t>(view.layer_stride);
+                    r.layer_mip_offset_bytes = static_cast<uint32_t>(view.layer_mip_offset);
                     r.max_uncompressed_block_size = d.max_uncompressed_block_size;
                     r.max_compressed_block_size = d.max_compressed_block_size;
                     const bool shifted_view = view.mip_offset != 0 || view.in_mip_tail;
@@ -3643,10 +3786,11 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // Full exact-size subgroups let the translator assign guest local coordinates in
         // SubgroupId/SubgroupLocalInvocationId order. That avoids assuming any relationship between
         // Vulkan's implementation-defined LocalInvocationIndex order and subgroup lane order while
-        // still making each native subgroup exactly one RDNA wave. Captures remain portable until
-        // their schema records the required-subgroup/full-subgroup pipeline contract.
+        // still making each native subgroup exactly one RDNA wave. Capture v37 records this exact
+        // module's required-subgroup/full-subgroups pipeline contract for faithful replay.
         config.native_subgroup_size = select_native_compute_subgroup_size(
-            shared_vulkan, config, capture_bound,
+            shared_vulkan, config,
+            getenv("PROSPER_NATIVE_COMPUTE_MULTIWAVE") != nullptr,
             getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") != nullptr);
         config.tgid_x_en = tgid_x_en;
         config.tgid_y_en = tgid_y_en;
@@ -3799,16 +3943,51 @@ bool execute_compute_dispatches(const GpuState& st, uint64_t submit_no) {
     return !items.empty() && g_compute(items);
 }
 
-static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t width,
-                                                     uint32_t height, uint64_t submit_no,
-                                                     const LiveRenderFn& render,
-                                                     const LiveComputeFn& compute);
+struct OrderedGpustateCaptureTrace {
+    std::vector<DrawItem> draws;
+    std::vector<ComputeItem> computes;
+    std::vector<OperationRealizationFailure> failures;
+};
+
+static OrderedSubmitResult execute_ordered_gpustate(
+    const GpuState& st, uint32_t width, uint32_t height, uint64_t submit_no,
+    const LiveRenderFn& render, const LiveComputeFn& compute,
+    OrderedGpustateCaptureTrace* capture_trace = nullptr);
 
 bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
     if (st.dma_copies.empty() && (!g_compute || st.dispatches.empty())) return false;
     GuestReadableSubmitScope guest_readable_scope;
+    // Compute-only submits never reach execute_ordered_and_present(), but they are exactly where an
+    // unsupported dispatch can disappear before there is a realized ComputeItem to select.  Give
+    // the environment capture path the same semantic pre-submit hook as rendering submits so
+    // PROSPER_GPU_CAPTURE_COMPUTE_ADDR can retain the raw program, table snapshots, and explicit
+    // realization failure.  Interactive/F9 captures remain draw-triggered: begin_requested_gpu_capture
+    // deliberately does not consume an armed interactive request when semantic_draw_count is zero.
+    std::unique_ptr<PendingGpuCapture> pending_capture;
+    std::vector<SubmitOperation> capture_operations;
+    const bool can_defer_capture = st.dma_copies.empty();
+    if (const char* capture_path = std::getenv("PROSPER_GPU_CAPTURE");
+        capture_path && *capture_path) {
+        capture_operations = plan_submit_operations(st);
+        pending_capture = begin_requested_gpu_capture(
+            {}, {}, capture_operations, present_width(), present_height(), &st, submit_no,
+            static_cast<uint64_t>(st.draws.size()), nullptr, can_defer_capture);
+    }
+    OrderedGpustateCaptureTrace capture_trace;
     const OrderedSubmitResult result = execute_ordered_gpustate(
-        st, 0, 0, submit_no, {}, g_compute);
+        st, 0, 0, submit_no, {}, g_compute,
+        pending_capture && can_defer_capture ? &capture_trace : nullptr);
+    if (pending_capture) {
+        std::string error;
+        if (!finish_requested_gpu_capture(
+                std::move(pending_capture), {}, error,
+                can_defer_capture ? &capture_trace.draws : nullptr,
+                can_defer_capture ? &capture_trace.computes : nullptr,
+                can_defer_capture ? &capture_operations : nullptr,
+                can_defer_capture ? &st : nullptr,
+                can_defer_capture ? &capture_trace.failures : nullptr))
+            std::fprintf(stderr, "[gpucap] write failed: %s\n", error.c_str());
+    }
     return !st.dma_execution_rejected &&
            (result.compute_executed || !st.dma_copies.empty() ||
             !st.ordered_memory_effects.empty());
@@ -3833,17 +4012,12 @@ void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no) {
     auto rd = [](const std::unordered_map<uint32_t, uint32_t>& regs, uint32_t off) {
         auto it = regs.find(off); return it == regs.end() ? 0u : it->second;
     };
-    auto pgm_addr = [&](const GpuState& ds) {
-        uint32_t lo = rd(ds.sh, P::COMPUTE_PGM_LO), hi = rd(ds.sh, P::COMPUTE_PGM_HI);
-        return (static_cast<uint64_t>(lo) << 8) | (static_cast<uint64_t>(hi & 0xffu) << 40);
-    };
-
     size_t matched = 0;
     for (size_t i = 0; i < st.dispatches.size(); ++i) {
         const auto& d = st.dispatches[i];
         const GpuState& ds = d.state ? *d.state : st;
         const ComputeLaunchDimensions launch = resolve_compute_launch(d);
-        const uint64_t code_addr = pgm_addr(ds);
+        const uint64_t code_addr = compute_dispatch_code_addr(st, d);
         const auto* hdr = static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(code_addr));
 
         uint32_t range_start = 0;
@@ -4636,15 +4810,25 @@ bool realize_retained_draw(const GpuState& st, size_t index, float scale_x, floa
 }
 
 bool realize_retained_compute(const GpuState& st, size_t index, uint64_t submit_no,
-                              ComputeItem& item) {
+                              ComputeItem& item,
+                              OperationRealizationFailure* failure = nullptr) {
     if (index >= st.dispatches.size()) return false;
     // DMA-bearing submits are uncommon. A one-dispatch state keeps the mature realization path
     // intact while ensuring it runs only after every preceding ordered producer has landed.
     GpuState one = st.dispatches[index].state ? *st.dispatches[index].state : st;
     one.dispatches.clear();
     one.dispatches.push_back(st.dispatches[index]);
-    std::vector<ComputeItem> realized = realize_compute_dispatches(one, submit_no);
-    if (realized.empty()) return false;
+    std::vector<OperationRealizationFailure> failures;
+    std::vector<ComputeItem> realized = realize_compute_dispatches(
+        one, submit_no, failure ? &failures : nullptr);
+    if (realized.empty()) {
+        if (failure && !failures.empty()) {
+            *failure = std::move(failures.front());
+            failure->index = index;
+            failure->command_order = st.dispatches[index].command_order;
+        }
+        return false;
+    }
     item = std::move(realized.front());
     item.dispatch_index = index;
     return true;
@@ -4654,7 +4838,8 @@ bool realize_retained_compute(const GpuState& st, size_t index, uint64_t submit_
 static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t width,
                                                      uint32_t height, uint64_t submit_no,
                                                      const LiveRenderFn& render,
-                                                     const LiveComputeFn& compute) {
+                                                     const LiveComputeFn& compute,
+                                                     OrderedGpustateCaptureTrace* capture_trace) {
     GuestGpuWriteSubmitScope guest_gpu_write_scope;
     if (st.dma_execution_rejected) {
         static std::atomic<int> warned{0};
@@ -4724,8 +4909,15 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                 flush_span();
                 if (!compute) break;
                 ComputeItem item;
-                if (realize_retained_compute(st, operation.index, submit_no, item))
+                OperationRealizationFailure failure;
+                if (realize_retained_compute(
+                        st, operation.index, submit_no, item,
+                        capture_trace ? &failure : nullptr)) {
+                    if (capture_trace) capture_trace->computes.push_back(item);
                     result.compute_executed |= compute({std::move(item)});
+                } else if (capture_trace && failure.reason != RealizationFailureReason::None) {
+                    capture_trace->failures.push_back(std::move(failure));
+                }
                 break;
             }
             case RetainedSubmitKind::DmaCopy: {
@@ -4821,11 +5013,11 @@ SharedVulkanContext shared_vulkan_context() { return g_shared_vulkan; }
 
 uint32_t select_native_compute_subgroup_size(const SharedVulkanContext& context,
                                              const ComputeShaderConfig& config,
-                                             bool capture_bound, bool disabled) {
+                                             bool allow_multiwave, bool disabled) {
     const bool adoptable = context.valid() && context.compute_queue_supported &&
         context.storage_image_read_without_format &&
         context.storage_image_write_without_format;
-    if (capture_bound || disabled || !adoptable ||
+    if (disabled || !adoptable ||
         !context.compute_subgroup_size_control || !context.compute_full_subgroups ||
         !context.compute_subgroup_vote || !context.compute_subgroup_arithmetic ||
         !context.max_compute_workgroup_subgroups || !context.max_compute_workgroup_size_x ||
@@ -4844,7 +5036,11 @@ uint32_t select_native_compute_subgroup_size(const SharedVulkanContext& context,
     const uint64_t local_invocations = xy * config.local_z;
     const uint64_t subgroup_capacity = static_cast<uint64_t>(config.wave_size) *
         context.max_compute_workgroup_subgroups;
+    // One guest wave removes the portable shell without adding inter-subgroup coordinate recovery.
+    // Multi-wave kernels can be faster or slower depending on their LDS/barrier shape, so retain
+    // the portable default until a diagnostic run opts into the exact experimental contract.
     if (local_invocations % config.wave_size != 0 ||
+        (!allow_multiwave && local_invocations != config.wave_size) ||
         local_invocations > subgroup_capacity ||
         local_invocations > context.max_compute_workgroup_size_x ||
         local_invocations > context.max_compute_workgroup_invocations ||
@@ -4897,12 +5093,26 @@ void set_guest_gpu_write_observer(GuestGpuWriteObserver observer) {
 }
 void notify_guest_gpu_write(uint64_t addr, uint64_t size) {
     if (!addr || !size) return;
+    // Page-protection watches observe guest CPU stores, but device/DMA writes can mutate the same
+    // direct-memory pages without a CPU protection fault. Mark the virtual range dirty as part of the
+    // existing authoritative GPU-write notification so cross-submit texture/compute caches never trust
+    // an Unchanged watch over bytes written by the GPU. This may run after a host-mirrored write and
+    // is deliberately idempotent.
+    prosper::host::guest_write_watch_notify_gpu_write(addr, size);
     if (g_guest_gpu_writes.active) {
         if (g_guest_gpu_writes.writes.size() < kGuestGpuWriteJournalCapacity)
             g_guest_gpu_writes.writes.push_back({addr, size});
         else
             g_guest_gpu_writes.overflowed = true;
     }
+    if (g_guest_gpu_write_observer) g_guest_gpu_write_observer(addr, size);
+}
+void notify_guest_gpu_write_preserving_bytes(uint64_t addr, uint64_t size) {
+    if (!addr || !size) return;
+    // The observer owns renderer-resident aliases (color/depth targets and their CPU snapshots),
+    // which may differ from the exact guest bytes even when a compute result does not. Guest-memory
+    // caches, page watches, and the submit journal remain valid because the caller proved that those
+    // bytes were not modified.
     if (g_guest_gpu_write_observer) g_guest_gpu_write_observer(addr, size);
 }
 GuestGpuWriteSnapshot guest_gpu_write_snapshot() {

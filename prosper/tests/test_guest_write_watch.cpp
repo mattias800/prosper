@@ -1,6 +1,7 @@
 #include "host/guest_write_watch.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 
 using prosper::host::GuestWriteWatch;
@@ -106,6 +107,8 @@ void seg_handler(int sig, siginfo_t* si, void*) {
 int main() {
     const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     const size_t size = page * 4;
+    CHECK(setenv("PROSPER_WRITE_WATCH_MAX_KB", "1024", 1) == 0,
+          "write-watch size policy fixed for the test");
 
     int fd = memfd_create("prosper-ww-test", 0);
     CHECK(fd >= 0, "memfd created");
@@ -143,6 +146,37 @@ int main() {
     CHECK(!static_cast<bool>(off), "create refuses to arm when the handler is not on the sigaltstack");
 
     prosper::host::guest_write_watch_set_fault_onstack(true);
+
+    // Large resources use the renderer's existing exact-comparison fallback instead of creating
+    // per-page fault state. Level streaming can otherwise register millions of pages and spend most
+    // of its time changing page protections. Exercise the policy with a valid dmem-style mapping.
+    {
+        const size_t oversized_size = (1u << 20) + page;
+        int large_fd = memfd_create("prosper-ww-oversized", 0);
+        CHECK(large_fd >= 0, "oversized memfd created");
+        if (large_fd >= 0) {
+            CHECK(ftruncate(large_fd, static_cast<off_t>(oversized_size)) == 0,
+                  "oversized memfd sized");
+            auto* large = static_cast<uint8_t*>(
+                mmap(nullptr, oversized_size, PROT_READ | PROT_WRITE, MAP_SHARED, large_fd, 0));
+            CHECK(large != MAP_FAILED, "oversized mapping");
+            if (large != MAP_FAILED) {
+                constexpr uint64_t kLargePhys = 0x1000000;
+                prosper::host::guest_write_watch_notify_direct_mapping_added(
+                    reinterpret_cast<uint64_t>(large), oversized_size, kLargePhys, kCpuRw);
+                GuestWriteWatch oversized = GuestWriteWatch::create(
+                    reinterpret_cast<uint64_t>(large), oversized_size);
+                CHECK(!static_cast<bool>(oversized),
+                      "oversized watch selects exact-comparison fallback");
+                CHECK(oversized.query() == GuestWriteWatchQuery::Unknown,
+                      "oversized watch reports Unknown for exact comparison");
+                prosper::host::guest_write_watch_notify_direct_mapping_removed(
+                    reinterpret_cast<uint64_t>(large), oversized_size);
+                munmap(large, oversized_size);
+            }
+            close(large_fd);
+        }
+    }
 
     // Arm a watch over the whole range and confirm it starts Unchanged.
     GuestWriteWatch watch = GuestWriteWatch::create(reinterpret_cast<uint64_t>(a), size);
@@ -271,6 +305,7 @@ int main() {
     CHECK(stats.registrations >= 1, "at least one watch armed");
     CHECK(stats.faults >= 2, "both alias-A and alias-B write faults were handled");
     CHECK(stats.rearms >= 2, "rearm path exercised");
+    CHECK(stats.create_oversized >= 1, "oversized exact-comparison fallback is observable");
 
     munmap(a, size); munmap(b, size); close(fd);
     if (failures) return 1;

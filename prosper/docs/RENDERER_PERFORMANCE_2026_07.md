@@ -57,9 +57,133 @@ The persistent texture cache now covers guest-backed linear/tiled 2D sampled `Un
 `Float32` textures with supported component counts, plus BC1-BC7 textures. It excludes render targets,
 storage images, cube/volume and DCC surfaces, captured host backing, and unsupported formats. Every hit
 validates the complete native, padded-tiled, or compressed-block source range, so address reuse and
-in-place mutation invalidate the entry. Its default 1 GiB budget covers Evergate's measured 835 MiB
-decoded working set. Disable it with `PROSPER_NO_TEXTURE_DECODE_CACHE=1`; the budget is controlled by
+in-place mutation invalidate the entry. Its memory-aware default is one eighth of host physical
+memory, clamped to 1-2 GiB. Disable it with `PROSPER_NO_TEXTURE_DECODE_CACHE=1`; the budget is controlled by
 `PROSPER_TEXTURE_DECODE_CACHE_MB`.
+
+## Plucky Squire maximum-size atlas retention (2026-07-29)
+
+Plucky Squire exposed a capacity cliff rather than a decode-kernel regression. The title first holds
+about 590 MiB of decoded textures, then introduces a valid 14,208x13,552 BC3 atlas. Its compressed
+source plus RGBA8 decode occupies about 930 MiB, so the former fixed 1 GiB frontend budget could not
+retain both sets. It repeatedly decoded 3.1-3.5 GiB of texture references per submit, spent
+0.7-2.9 seconds in frontend resource building, and recreated write watches over millions of pages.
+The app fell from 15-20 FPS to 0.4-0.8 FPS despite zero render-target readbacks.
+
+Matched native-cadence A/B runs showed that a 2 GiB frontend ceiling retained the measured
+1.52-1.64 GiB hot set: after one cold decode, frontend resource building returned to about 5-7 ms.
+Raising the independent backend sampled-image ceiling to 2 GiB then reduced steady backend resource
+setup from about 10-20 ms to 1.2-1.4 ms, producing roughly 17-20 FPS in the same scene. These are caps,
+not preallocations. Both defaults now use one eighth of their relevant physical/device-local memory,
+clamped to 1-2 GiB, so an 8 GiB host or GPU retains the historical 1 GiB behavior and both explicit
+MiB overrides retain precedence.
+
+A follow-up 4 GiB frontend A/B showed that the remaining roughly 300 reported cold misses per submit
+were not capacity misses: fewer than 3,000 actual decodes occurred over 800 frames. They were sampled
+depth attachments whose authoritative pixels already lived in retained Vulkan images. The frontend
+was probing the guest-byte decode cache and copying DCC metadata before the sampled-depth bridge won
+later in the same resource path. Resolving that bridge first reduced the false misses to effectively
+zero and lowered steady texture resource handling from about 5.6-6.3 ms to 3.7-4.2 ms per submit,
+without changing the cache budget or depth-image binding contract.
+
+## Plucky Squire pipeline working set (2026-07-29)
+
+Plucky's desk-loading scene uses about 2,500 distinct exact graphics-pipeline contracts. The former
+1,024-entry backend limit continuously evicted hot pipelines after the scene crossed that boundary:
+matched 25-submit windows reported 2-10 evictions per submit and recurring multi-millisecond pipeline
+setup spikes. This was cache-capacity churn, not shader recompilation or a correctness failure.
+
+A matched scripted A/B with a 4,096-entry limit grew to 2,482 resident pipelines with zero evictions.
+Once the compulsory creations completed, pipeline setup fell to about 0.07 ms per submit window; the
+loading scene improved from roughly 3-4 FPS to 4.5-5.6 FPS on the Radeon 8060S test laptop. The larger
+limit retains exact keys and LRU behavior, allocates nothing until a distinct contract is encountered,
+and remains configurable through `PROSPER_PIPELINE_CACHE_ENTRIES`.
+
+## Plucky Squire adaptive write watches and sampled volumes (2026-07-29)
+
+The desk-loading route initially registered page-protection watches for every large texture and compute
+source as soon as it entered a persistent cache. By the first MainLevel frames this had cumulatively
+registered millions of pages and reduced presentation to about 1.8 FPS. A hard 1 MiB watch ceiling proved
+the diagnosis (roughly 4.6 FPS) but made every larger stable source pay an exact comparison forever.
+
+Large sources now start with exact validation and promote only after three unchanged comparisons, under an
+8 MiB promotion budget per graphics/compute call; Linux also coalesces adjacent `mprotect` ranges. On the
+same route, registered pages fell from about 4.4 million to 263 thousand at the matched checkpoint, menu
+cadence rose to 16-17 FPS, and the first MainLevel windows reached about 4.8-5.2 FPS. The policy is generic,
+keeps exact comparison as the unsupported/failed-watch fallback, and exposes the promotion thresholds for
+A/B through the frontend variables documented above.
+
+Decode-reason accounting (`PROSPER_DETILE_STATS=1`) then identified four immutable 48x48x48 RGBA16F volume
+lookup textures and one 128x32 two-channel UNORM16 input being decoded essentially once per callback. The
+volume detiler already handled their exact source layout; only cross-submit retention excluded them.
+Extending the exact-byte cache to supported volume spans and UNORM16 removed those five repeated misses.
+Matched menu windows reduced texture construction from roughly 14-16 ms to 11-12 ms per callback and
+progressed around 2-3 presented frames per second faster. A six-submit full-resolution GPU replay remained
+visually correct. A separate Float16 cube-retention experiment was rejected: the late loading route churned
+the 2 GiB cache, grew from 218 to 411 cumulative write watches, and fell from 3.8 to 1.7 FPS in a matched
+2,640-frame A/B. Cubes therefore remain on their dedicated layer-aware decode path.
+
+Deferring every texture watch at or above 1 MiB was also rejected. It finished with essentially the same
+watch footprint and 3.8 FPS late checkpoint as the mixed policy, while cumulative exact validation rose
+from 69.7 to 79.2 GiB. Stable 1-8 MiB sources therefore continue to arm immediately; larger sources retain
+the exact-first promotion rule.
+
+Once a source has a working write watch, retaining its complete encoded bytes duplicates information:
+Unchanged proves reuse, while Dirty/Unknown can conservatively invalidate. Releasing only those protected
+snapshots (never audit baselines or sources that are also the decoded pixels) saved 267 MiB at the end of a
+matched 2,650-frame route. The cache held 485 decoded entries instead of 253 under the same 2 GiB ceiling.
+Average frontend resource construction fell from 24.1 to 21.5 ms per submit and total frontend time from
+50.3 to 46.6 ms per submit. Exact validation traffic changed only slightly (76.8 to 75.7 GiB) after GPU/DMA
+writes were correctly wired into persistent-watch invalidation, and late checkpoint FPS was mixed rather
+than a repeatable speedup. This is therefore primarily a memory/capacity improvement, not a validation or
+frame-rate claim. Dirty or unknown watches deliberately re-decode rather than using a hash, and
+`PROSPER_KEEP_TEXTURE_SOURCE_SNAPSHOTS=1` restores the control behavior for audit/performance comparisons.
+
+## Plucky Squire unused descriptor materialization (2026-07-29)
+
+A later MainLevel probe found repeated 16-24 ms buffer-resource spikes even though the backend never
+consumed the affected binding. The guest fold had conservatively retained a broad original V# with an
+absurd 0xffffffff-byte declaration, while the final recompiler emitted separate pc-specific scalar
+bindings for every actual access. SPIR-V reflection consequently reported binding 32 as an unused runtime
+extra and bindings 33-52 as the shader's statically used interface. The frontend nevertheless built every
+runtime table entry, probing and zero-allocating the full 64 MiB corrupt-descriptor safety ceiling once per
+draw. Other invalid candidates at addresses zero and four took the same fallback.
+
+The live renderer now materializes only bindings present in the final reflected SPIR-V interface. This is
+not a size heuristic: used dynamic buffers still retain their complete declared range, including the
+multi-megabyte Blue Prince streams from #1427. A definitely unmapped used buffer keeps the established
+all-zero semantics in a small reflection-sized robust buffer instead of allocating its corrupt declaration.
+The same scripted diagnostic still recovered the pathological runtime descriptors, but emitted zero slow
+buffer materializations after the change. A full-resolution Plucky replay retained output hash
+`1c5241d9475e752d`, and its before/after BMP files were byte-identical.
+
+## Plucky Squire texture-validation attribution (2026-07-29)
+
+After unused buffer materialization was removed, `PROSPER_RENDER_TIMING=detail` still attributed the
+late route's largest frontend spikes to full-resolution sampled textures. Detail output now separates
+exact-validation time and copied/expected byte counts from total resource time, and reports both the
+submit-local GPU-write query and cross-submit page-watch state. This distinguishes an expensive proof
+of unchanged bytes from an actual decode without changing the cache policy.
+
+The resulting live trace identified two different costs. One 3840x2160 packed-float source was last
+written by compute program `0x3015770000` around submit 1116 and remained unchanged while consumers
+continued beyond submit 2989. Its page watch had disabled during the earlier dynamic phase, so each
+later callback compared the complete 33,423,360-byte source in roughly 3.5-5.8 ms. In contrast,
+same-frame outputs from programs `0x30180d0000` and `0x3015770000` were still being written at their
+consumer submits. Their conservative invalidations caused 64-90 ms BC/packed-float decode paths;
+some packed-float validations copied zero of the expected 33,423,360 bytes because the guest range
+was no longer completely mapped.
+
+A disabled-watch recovery experiment remains rejected after byte-preserving buffer notifications were
+fixed. A conservative 64-match rerun recovered six smaller sources, but the two 66.8 MiB gameplay sources
+reached only 13 and six matches before their scene lifetime ended. A deliberate 16-match stress run then
+forced recovery: several 3 MiB sources were dirtied, disabled, and recovered a second time within two
+reporting windows, while both 66.8 MiB sources also entered the expensive recovery path. This proves that
+an exact-equality streak still cannot establish that every producer has stopped; the corrected buffer path
+removed one false invalidation source, not real later writes or other producer classes. A longer delay only
+reduces the frequency of the cycle. The next optimization must therefore carry exact cross-submit GPU
+write/result evidence or bind a retained compute result directly; equality of guest bytes alone is not a
+sound trigger for restoring page protection.
 
 ## Cobra Float32 sampled-texture retention (2026-07-25)
 
@@ -979,9 +1103,225 @@ decomposition and #1106's scoping possible.
   contract for storage-image writeback and invisible guest texture writes; deferred to a review-gated
   change.
 
+## Plucky Squire: repeated raw 3D storage results
+
+Plucky's program `0x3013930000` dispatches a 48x48x48 lighting-grid kernel every frame and writes four
+tiled RGBA16F volumes. The Vulkan dispatch itself is small; the raw storage fallback previously copied
+four RGBA32_UINT interchange images to the CPU, packed them to FP16, and retiled them even when the
+result was byte-for-byte unchanged. In the measured title/game route this one dispatch had a **3.74 ms
+median total**, of which **3.21 ms** was writeback (22,264 samples from the baseline timing run).
+
+The retained-result contract now also covers raw storage images when the existing seed-skip proof says
+the shader is both write-only and full-coverage. That restriction is essential: raw RGBA32_UINT values
+are not canonical guest-format values and cannot generally be reused as a later image-load seed. For a
+full writer the previous image is unobservable, so the backend can safely retain it and compare the
+next transfer to an exact GPU-side baseline. The CPU receives only a four-byte changed flag. Guest
+write tracking remains authoritative: an external change disables the skip and forces ordinary exact
+pack, retile, notification, and baseline repair.
+
+On the same machine and route, the updated live run reduced the program to a **0.68 ms median total**
+and **0.00 ms writeback** (81 samples). This is a targeted before/after rather than an alternating
+whole-route benchmark, so it supports the dispatch-local result but not a standalone frame-rate claim.
+The realized capture `/tmp/plucky-393-78922522.prgcap` records the exact four-volume shape and shader,
+but replay materializes resources as owned `host_data`; by design that does not enter the live
+cross-frame guest-memory cache. Correctness is therefore pinned by the raw 3D production-backend test:
+it proves full coverage, establishes an exact baseline, skips an identical third write, then mutates
+the guest mirror and requires one exact repair write and invalidation.
+
+## Plucky Squire: repeated large writable buffers
+
+A clean live profile (phase timing only; no `PROSPER_COMPUTELOG` hashing) found two consecutive
+lighting kernels spending about **1.53 ms/frame** in buffer writeback: program `0x30179b0000` had a
+0.98 ms median and `0x30179d0000` had a 0.55 ms median. Guest relocation names those same programs
+`0x3017970000` and `0x3017990000` in the corresponding capture and live A/B. The capture shows the
+first kernel's writable result is a 33,423,360-byte buffer that is byte-identical on repeated
+dispatches. The old path still mapped and compared every byte on the CPU before learning that no guest
+copy was needed.
+
+Large persistent writable buffers now retain a second exact storage buffer as their previous result.
+When guest GPU-write provenance or the host write watch proves the guest mirror unchanged, the shared
+GPU comparator checks current versus baseline and returns one changed flag. An equal flag omits the
+large host mapping/comparison but preserves the architectural GPU-write notification. If guest memory
+changed externally, source validation disables the shortcut; the ordinary CPU comparison repairs the
+guest exactly, while a transfer advances the GPU baseline to the new result. This is the same
+collision-free contract used by retained storage images, not a content hash.
+
+An 80-repeat isolated replay of capture compute 22 measured the following medians after discarding the
+first five iterations:
+
+| | exact GPU result comparison | CPU result comparison |
+|---|---:|---:|
+| writeback | 0.02 ms | 0.77 ms |
+| dispatch (including comparator) | 0.65 ms | 0.27 ms |
+| total | **1.66 ms** | **1.96 ms** |
+
+The replay owns resource bytes as `host_data`, so its repeated setup scan is not representative of the
+live guest-write-provenance fast path; the comparison isolates the result-side tradeoff. The adjacent
+8,355,840-byte result was neutral (2.02 versus 2.04 ms total), so GPU result baselines default to a
+measured **16 MiB crossover** instead of doubling every persistent buffer. Set
+`PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB` to retune it, or
+`PROSPER_NO_PERSISTENT_COMPUTE_BUFFER_RESULTS=1` for an exact A/B. The production-backend test runs an
+idempotent one-MiB buffer with the test threshold lowered, requires the normal invalidation on the
+GPU-identical repeat, mutates guest memory, and requires byte-exact repair on the next dispatch.
+
+A subsequent live matched-switch check confirmed the dispatch-local result over 780+ samples per arm:
+the 33 MiB kernel changed from **1.27 to 0.85 ms total** (writeback 0.99 -> 0.09 ms, dispatch including
+the comparator 0.13 -> 0.59 ms). The adjacent 8 MiB kernel stayed **0.82 versus 0.81 ms**, confirming
+the crossover gate. Whole-route FPS varied by more than this sub-millisecond saving between the two
+sequential runs, so these numbers support the local optimization only, not a frame-rate claim.
+
+## Plucky Squire: small repeated storage mip results
+
+Plucky runs the same mip-generation compute program twice per frame. The first invocation writes a
+large chain and already qualifies for persistent image residency. The second writes 32 KiB, 8 KiB,
+2 KiB, and 512-byte native storage results. The historical one-MiB image threshold left all four on
+the transient path, so a roughly 0.2 ms dispatch still paid about 1.5 ms to map, pack, and retile its
+small outputs every frame.
+
+Sampled inputs and writable outputs have different retention economics. Tiny sampled images are
+numerous and cheap to upload, while a repeated storage image pays a writeback/layout boundary even
+when its result is unchanged. The cache policy therefore keeps the sampled default at 1 MiB and gives
+storage images an independent one-page (4 KiB) crossover. Existing
+`PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB` overrides remain compatible for both roles;
+`PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB` retunes only storage residency.
+
+Matched 35-second live sweeps measured the second invocation after submit 100:
+
+| storage crossover | samples | median writeback | median layout | median total |
+|---|---:|---:|---:|---:|
+| 1 MiB (historical control) | 477 | 1.51 ms | 1.16 ms | 2.11 ms |
+| 32 KiB | 498 | 0.70 ms | 0.35 ms | 1.45 ms |
+| 4 KiB | 514 | 0.16 ms | 0.08 ms | **0.83 ms** |
+| 1 KiB | 481 | 0.16 ms | 0.02 ms | 0.89 ms |
+
+The 4 KiB and 1 KiB totals are within run noise; one page is the narrower general policy because it
+does not retain sub-page Vulkan objects. Frame progression stayed healthy across the matched control
+and broad candidate runs (527 and 529 presented frames). These were sequential dispatch-local sweeps,
+not an alternating whole-route benchmark, so they support the retained-output crossover rather than a
+standalone FPS claim. GPU replay cannot exercise this live residency path because replay resources are
+owned `host_data`; the production-backend test instead pins the temporal contract, and the pure policy
+checks pin both exact default boundaries.
+
+## Plucky native-subgroup replay fidelity
+
+Plucky's two remaining heavy compute programs exposed a profiling artifact: live rendering selected
+the exact wave32/wave64 subgroup path, while arming capture forced the translator back to its portable
+lane-emulation shell. The resulting capsule was internally replayable but did not contain the shader
+whose live performance was under investigation. Capture v37 now retains the required subgroup size
+beside the stored SPIR-V and replay recreates the required-size/full-subgroups pipeline contract.
+Pre-v37 captures remain readable with `subgroup=0`; unsupported replay devices reject a native contract
+instead of silently executing it with a different subgroup width.
+
+Radeon GPU Analyzer also ruled out generic SPIR-V dead-code cleanup as the next optimization. For the
+`0x3015770000` program, original and DCE variants compiled to byte-identical gfx1151 ISA. For
+`0x30180d0000`, DCE only reordered two independent scalar moves while leaving the 85-VGPR and 7,176-byte
+ISA totals unchanged. Rewrites that reduced reported VGPR use to 62 regressed measured replay dispatch
+time, so they are retained as negative evidence rather than production changes. A fresh v37 capsule
+then retained the live `0x30180d0000` and `0x3015770000` modules with `subgroup=64`; compute-only replay
+created and ran both exact pipeline contracts. The standalone startup capsule still has six unrealized
+operations and no temporal RTT seeds, so its final pixel oracle and live compute result do not match.
+It is valid evidence for module/pipeline analysis, not for a full-frame correctness claim.
+
+A matched live switch test separated the two remaining kernels. Native lowering reduced
+`0x30180d0000` from a 5.65 ms to 3.22 ms median GPU dispatch, but the four-wave, LDS/barrier-heavy
+`0x3015770000` kernel moved from 5.21 ms to 5.62 ms. Every other eligible Plucky dispatch in the route
+used exactly one 64-lane guest wave; those were neutral or faster, including a repeated mip kernel at
+0.44 ms native versus 0.86 ms portable. Native lowering therefore defaults to exact single-wave
+workgroups. `PROSPER_NATIVE_COMPUTE_MULTIWAVE=1` retains the exact, captureable multi-wave experiment;
+`PROSPER_NO_NATIVE_COMPUTE_SUBGROUP=1` remains the full portable control. These are sequential
+dispatch-local runs; 441 versus 418 presented frames is supporting route progression, not a standalone
+whole-app claim. A clean combined-policy confirmation kept `0x30180d0000` native at 3.08 ms and
+`0x3015770000` portable at 5.27 ms over 378+ samples, with 425 frames presented and no dispatch skip,
+renderer failure, or shutdown error.
+
+## Plucky split no-GS NGG producer coverage
+
+The same startup submit exposed three real draws that both live rendering and capture previously dropped.
+They share a split no-GS NGG vertex program: a fetch/vertex producer writes one 28-byte LDS record, while a
+compiler-generated wrapper compacts the guest wave and exports that record. The existing structural
+passthrough proof already recognized wrapper addresses expressed as
+`v_mad_u32_u24(stride, exporter, constant)`. This compiler emitted one equivalent field address as
+`v_mul_u32_u24(stride, exporter)` plus a DS-read immediate, so the otherwise-proven wrapper fell back to
+unsupported cross-lane execution.
+
+The recognizer now accepts both exact unsigned-u24 address forms and still requires a single stride/index,
+direct terminal LDS loads, matching producer fields, the allocation/primitive-export shape, and complete
+POS0. In the proven producer only, canonical all-ones `v_mbcnt_lo/hi` derives the guest lane from the
+flattened Vulkan vertex/instance invocation. Other masks remain rejected because their peer-lane state is
+not available in a vertex invocation. Synthetic coverage renders the MAD and multiply-plus-DS forms,
+checks the resulting geometry, and verifies that replacing the all-ones mask with a partial mask fails
+closed.
+
+A fresh live capture of the same 43-draw / 27-dispatch submit moved from **37 to 40 realized draws** and
+reported the generic proof (`base=v5`, stride 28, one parameter export). The three new operations are the
+two 48x48 targets at semantic draws 5/6 and the 32x32 target at draw 35. Exact replay pipeline statistics
+showed real geometry and fragment work:
+
+| semantic draw | vertices | primitives / after clip | fragment invocations / passed samples |
+|---:|---:|---:|---:|
+| 5 | 192 | 96 / 96 | 110,592 / 110,592 |
+| 6 | 192 | 96 / 96 | 110,592 / 110,592 |
+| 35 | 128 | 64 / 64 | 32,768 / 32,768 |
+
+The only remaining unrealized entries are two decoded no-effect draws and one draw with no fragment
+program whose captured pipeline also has no color/depth/stencil write state. This closes the concrete
+shader-translation gap; it does not turn the startup capsule into a full-frame oracle.
+
+An initial seven-submit bundle confirmed why: although all 78 realized compute/graphics operations execute,
+the window starts at process submit 1 and still has 39 read-before-write image versions with neither a prior
+GPU producer nor a serialized RTT seed. Its selected 3840x2160 replay is black, and final-capsule export
+correctly refuses to invent the missing seed. The exact module, pipeline, and per-draw statistics above are
+valid; the bundle image is explicitly not correctness evidence.
+
+## Plucky title replay closure and scalar RTT snapshots
+
+An older six-submit title bundle exposed a separate capture-tool failure before a later live comparison could
+be trusted. The live RTT cache could retain CPU bytes from an earlier extent or format after a GPU-only render,
+and capture silently described unsupported scalar `R8_UNORM` and `R32_UINT` surfaces as RGBA8. Capture v38
+adds their native seed formats, validates every snapshot against its current identity, reads back an
+authoritative GPU-only surface when necessary, and skips only entries that have no current authoritative
+contents.
+
+Fixing the snapshot exposed three false edges in the bundle graph. It had treated every compute binding as
+both read and written, matched distinct images by interior byte overlap, and counted programmed color targets
+whose effective write mask was zero. The graph now uses reflected per-binding read/write facts, exact guest
+bases for image-to-image dependencies, byte overlap only where buffers or DMA require it, and non-zero target
+write masks.
+
+With those generic rules, the old bundle exports a final capsule with 39 color and three depth/stencil seeds.
+The bundle and standalone capsule both render 33,177,600 bytes at 3840x2160 with output hash
+`92f7a0c3b31a909b`; their BMP files are byte-identical with SHA-256
+`3b627f822192a0152c26d864f0ac9ffe22087f98916699d4745439e80c7dccf6`. The image is the complete Plucky title
+screen. This proves deterministic bundle-to-capsule closure, not native correctness: two earlier 48x48 volume
+reads remain unresolved because that old bundle skipped their then-unsupported typed-storage dispatches.
+
+## Byte-preserving compute-buffer notifications
+
+The retained compute-buffer path already had two independent exact proofs before suppressing a
+writeback: source validation proved that guest RAM still matched the retained input, and the GPU
+comparator proved that the dispatch output matched the retained result byte for byte. Despite writing
+no guest bytes, that fast path still used the ordinary GPU-write notification. It unnecessarily dirtied
+cross-submit guest-byte watches and entered the range in the submit-local mutation journal.
+The exact CPU-comparison fallback had the same issue whenever it proved equality and skipped its host copy.
+
+The byte-preserving notification now reaches only the renderer alias observer. Color/depth targets and
+CPU RTT snapshots overlapping the range are still invalidated because they can diverge from guest RAM,
+while decoded guest-byte caches, compute source watches, and the submit journal remain valid. A Linux
+production-backend regression checks both paths: a sub-threshold buffer that takes the CPU comparison and
+a retained one-MiB buffer that takes the exact GPU comparator. Restoring either old notifier makes its
+corresponding assertion fail; a later real guest mutation still defeats the comparator shortcut and is
+repaired normally.
+
+This is a generic coherency correction, not a measured Plucky speedup. A targeted 145-second full-resolution
+route recorded zero buffer-result skips in the selected window. It did record 1,981 storage-image skips,
+including 1,003 exact 33,177,600-byte skips for the repeated 3840x2160 packed-float output. Storage-image
+skips already avoid guest-write notification, so they are deliberately unaffected by this change. That
+trace instead keeps the disabled texture-watch and incomplete guest-range cases below as the active Plucky
+bottleneck.
+
 ## Next renderer step
 
-Bring up a representative Unreal/3D workload and collect the same stage timings plus a corrected
-mixed-operation capture. Then design one cross-engine persistent-resource change around measured
-resource identities and dependencies. Keep the exact-byte and disable-switch A/B discipline used
-here, and preserve screenshot/capture correctness while reducing the synchronous boundaries.
+Capture a fresh v38 rolling temporal window on current code around the Plucky title/gameplay transition. It
+must include the producers for the two 48x48 volumes and close with zero unresolved leaves, providing a native
+pixel oracle as well as exact compute pipeline contracts. Keep the exact-byte and disable-switch A/B
+discipline used here, and preserve screenshot/capture correctness while reducing the synchronous boundaries.

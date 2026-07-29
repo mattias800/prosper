@@ -85,26 +85,29 @@ int main() {
     CHECK(prosper::gpu::select_native_compute_subgroup_size(
               one_subgroup, multidimensional, false, false) == 64 &&
           prosper::gpu::select_native_compute_subgroup_size(
-              one_subgroup, two_waves, false, false) == 0,
+              one_subgroup, two_waves, true, false) == 0,
           "native subgroup selection enforces maxComputeWorkgroupSubgroups boundary");
+    CHECK(prosper::gpu::select_native_compute_subgroup_size(
+              eligible, two_waves, false, false) == 0 &&
+          prosper::gpu::select_native_compute_subgroup_size(
+              eligible, two_waves, true, false) == 64,
+          "multi-wave native compute requires an explicit experimental opt-in");
     auto narrow_flattened_x = eligible;
     narrow_flattened_x.max_compute_workgroup_size_x = 128;
     auto guest_16x16 = multidimensional;
     guest_16x16.local_x = 16;
     guest_16x16.local_y = 16;
     CHECK(prosper::gpu::select_native_compute_subgroup_size(
-              narrow_flattened_x, guest_16x16, false, false) == 0,
+              narrow_flattened_x, guest_16x16, true, false) == 0,
           "native subgroup selection rejects flattened X beyond the device limit");
     auto low_invocation_limit = eligible;
     low_invocation_limit.max_compute_workgroup_invocations = 64;
     CHECK(prosper::gpu::select_native_compute_subgroup_size(
-              low_invocation_limit, two_waves, false, false) == 0,
+              low_invocation_limit, two_waves, true, false) == 0,
           "native subgroup selection enforces the core workgroup invocation limit");
     CHECK(prosper::gpu::select_native_compute_subgroup_size(
-              eligible, multidimensional, true, false) == 0 &&
-          prosper::gpu::select_native_compute_subgroup_size(
               eligible, multidimensional, false, true) == 0,
-          "captures and explicit opt-out retain the portable compute shell");
+          "explicit opt-out retains the portable compute shell");
 
     // Nothing published before the renderer initializes: headless compute-only use must keep
     // creating its own device (tests/test_game_compute.cpp depends on this).

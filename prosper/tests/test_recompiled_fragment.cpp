@@ -105,6 +105,8 @@ int main() {
         (wave_ctx.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
         (wave_ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
         (wave_ctx.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT);
+    const bool supports_fragment_wave64_vote = supports_fragment_wave64 &&
+        (wave_ctx.subgroup_operations & VK_SUBGROUP_FEATURE_VOTE_BIT);
     const bool supports_fragment_gds =
         supports_fragment_wave64 && wave_ctx.fragment_stores_atomics;
     std::vector<uint8_t> wave_px = prosper::test::render_triangle_rgba(vert, wave_frag, W, H);
@@ -383,6 +385,9 @@ int main() {
     std::vector<uint32_t> fragT = recompile_fragment(psTaken.data(),   psTaken.size());
     std::vector<uint32_t> fragX = recompile_fragment(psSkipped.data(), psSkipped.size());
     CHECK(!fragT.empty() && !fragX.empty(), "recompiled divergent-execz PS (both variants) -> SPIR-V");
+    CHECK(fragment_spirv_required_subgroup_size(fragT) == 64 &&
+              (fragment_spirv_required_subgroup_features(fragT) & kFragmentSubgroupVote),
+          "fragment EXECZ branch advertises its exact wave64 vote requirement");
     if (!fragT.empty() && !fragX.empty()) {
         std::vector<uint8_t> pxT = prosper::test::render_triangle_rgba(vert, fragT, W, H);
         std::vector<uint8_t> pxX = prosper::test::render_triangle_rgba(vert, fragX, W, H);
@@ -392,9 +397,102 @@ int main() {
             const uint8_t* cx = &pxX[((size_t)(H/2) * W + W/2) * 4];
             printf("  execz taken center=(%u,%u,%u,%u) skipped center=(%u,%u,%u,%u)\n",
                    ct[0],ct[1],ct[2],ct[3], cx[0],cx[1],cx[2],cx[3]);
-            CHECK(ct[0] > 0x80 && ct[1] > 0x80 && ct[2] > 0x80, "execz taken: center WHITE (block ran, s5 -> v1)");
-            CHECK(cx[2] > 0x80 && cx[0] < 0x40 && cx[1] < 0x40, "execz skipped: center stays BLUE clear (all lanes inactive)");
+            CHECK(supports_fragment_wave64_vote
+                      ? ct[0] > 0x80 && ct[1] > 0x80 && ct[2] > 0x80
+                      : ct[2] > 0x80 && ct[0] < 0x40 && ct[1] < 0x40,
+                  supports_fragment_wave64_vote
+                      ? "execz taken: one wave-wide vote runs the block for the complete wave"
+                      : "device without fragment wave64 vote skips the draw fail-visible");
+            CHECK(cx[2] > 0x80 && cx[0] < 0x40 && cx[1] < 0x40,
+                  "execz skipped: center stays BLUE clear (all lanes inactive)");
         }
+    }
+
+    // Plucky Squire's material PS compares a vector-produced VCC mask with a saved EXEC pair through
+    // s_cmp_lg_u64. Model a sparse mask directly (`vcc = 1`: only guest lane zero) and prove the
+    // scalar SCC result observes all 64 bits, rather than trying to read VCC_LO as scalar data or
+    // comparing this invocation alone. SCC=true selects green for the complete draw.
+    const uint32_t wave_mask_compare_ps[] = {
+        0xBE80047Eu,              // s_mov_b64 s[0:1], exec
+        0xBEEA0481u,              // s_mov_b64 vcc, 1 (only lane zero set)
+        0xBF13006Au,              // s_cmp_lg_u64 vcc, s[0:1]
+        0x850580F2u,              // s_cselect_b32 s5, 1.0, 0.0
+        0x7E000280u, 0x7E020205u, 0x7E040280u, 0x7E0602F2u,
+        0xF800180Fu, 0x03020100u, 0xBF810000u,
+    };
+    std::vector<uint32_t> wave_mask_compare = recompile_fragment(
+        wave_mask_compare_ps, std::size(wave_mask_compare_ps));
+    CHECK(!wave_mask_compare.empty() &&
+              fragment_spirv_required_subgroup_size(wave_mask_compare) == 64 &&
+              (fragment_spirv_required_subgroup_features(wave_mask_compare) &
+               kFragmentSubgroupVote),
+          "recompiled sparse VCC-vs-EXEC u64 compare through an exact wave64 vote");
+    if (!wave_mask_compare.empty()) {
+        std::vector<uint8_t> mask_px = prosper::test::render_triangle_rgba(
+            vert, wave_mask_compare, W, H);
+        const uint8_t* mask_center = mask_px.size() == static_cast<size_t>(W) * H * 4
+            ? &mask_px[((static_cast<size_t>(H) / 2) * W + W / 2) * 4] : nullptr;
+        if (mask_center)
+            std::printf("  wave-mask compare center=(%u,%u,%u,%u)\n",
+                        mask_center[0], mask_center[1], mask_center[2], mask_center[3]);
+        CHECK(mask_center && (supports_fragment_wave64_vote
+                  ? mask_center[1] > 0x80 && mask_center[0] < 0x40
+                  : mask_center[2] > 0x80 && mask_center[0] < 0x40 && mask_center[1] < 0x40),
+              supports_fragment_wave64_vote
+                  ? "s_cmp_lg_u64 detects bits missing outside the sparse VCC lane"
+                  : "device without fragment wave64 vote skips the mask-compare draw fail-visible");
+    }
+    std::vector<uint32_t> equal_mask_ps(
+        std::begin(wave_mask_compare_ps), std::end(wave_mask_compare_ps));
+    equal_mask_ps[1] = 0xBEEA04C1u;  // s_mov_b64 vcc, -1: exactly the full entry EXEC mask
+    std::vector<uint32_t> equal_mask_compare = recompile_fragment(
+        equal_mask_ps.data(), equal_mask_ps.size());
+    CHECK(!equal_mask_compare.empty(),
+          "recompiled equal VCC-vs-EXEC u64 comparison for the opposite SCC outcome");
+    if (!equal_mask_compare.empty()) {
+        std::vector<uint8_t> equal_px = prosper::test::render_triangle_rgba(
+            vert, equal_mask_compare, W, H);
+        const uint8_t* equal_center = equal_px.size() == static_cast<size_t>(W) * H * 4
+            ? &equal_px[((static_cast<size_t>(H) / 2) * W + W / 2) * 4] : nullptr;
+        CHECK(equal_center && (supports_fragment_wave64_vote
+                  ? equal_center[0] < 0x20 && equal_center[1] < 0x20 && equal_center[2] < 0x20
+                  : equal_center[2] > 0x80 && equal_center[0] < 0x40 && equal_center[1] < 0x40),
+              supports_fragment_wave64_vote
+                  ? "s_cmp_lg_u64 clears SCC when all 64 VCC and EXEC bits match"
+                  : "device without fragment wave64 vote also skips the equal-mask draw");
+    }
+
+    // A second Plucky material loop uses an unconditional back-edge plus a whole-wave VCCZ break.
+    // VCCZ does not clear EXEC, so the old per-lane shortcut could neither reach the loop merge nor
+    // safely use the back-edge (it rejected the 2.6 KiB shader at its outer EXECZ). This reduced
+    // form enters with full EXEC, clears VCC, and must break before the white write instead of looping.
+    const uint32_t direct_vcc_break_ps[] = {
+        0xBE80047Eu,              // s_mov_b64 s[0:1], exec
+        0x7E020280u, 0x7E040280u, 0x7E0602F2u,  // black RGB seed, alpha=1
+        0xBF880004u,              // loop: s_cbranch_execz exit
+        0xBEEA0480u,              // s_mov_b64 vcc, 0
+        0xBF860002u,              // s_cbranch_vccz exit (whole-wave direct break)
+        0x7E0202F2u,              // must not run: v1 = 1.0
+        0xBF82FFFBu,              // s_branch loop
+        0xBEFE0400u,              // exit: restore exec
+        0xF800180Fu, 0x03010101u, 0xBF810000u,
+    };
+    std::vector<uint32_t> direct_vcc_break = recompile_fragment(
+        direct_vcc_break_ps, std::size(direct_vcc_break_ps));
+    CHECK(!direct_vcc_break.empty() &&
+              fragment_spirv_required_subgroup_size(direct_vcc_break) == 64,
+          "recompiled unconditional-backedge loop with a direct wave-wide VCCZ break");
+    if (!direct_vcc_break.empty()) {
+        std::vector<uint8_t> break_px = prosper::test::render_triangle_rgba(
+            vert, direct_vcc_break, W, H);
+        const uint8_t* break_center = break_px.size() == static_cast<size_t>(W) * H * 4
+            ? &break_px[((static_cast<size_t>(H) / 2) * W + W / 2) * 4] : nullptr;
+        CHECK(break_center && (supports_fragment_wave64_vote
+                  ? break_center[0] < 0x20 && break_center[1] < 0x20 && break_center[2] < 0x20
+                  : break_center[2] > 0x80 && break_center[0] < 0x40 && break_center[1] < 0x40),
+              supports_fragment_wave64_vote
+                  ? "VCCZ exits the complete wave before the guarded write and back-edge"
+                  : "device without fragment wave64 vote skips the direct-break draw");
     }
 
     // DIVERGENT EXECZ-EXIT LOOP (#273 — DOLL's title post-process accumulation PS shape).
@@ -465,21 +563,21 @@ int main() {
         uint32_t varying_chain_ps[std::size(scalar_chain_ps)];
         std::copy(std::begin(scalar_chain_ps), std::end(scalar_chain_ps), varying_chain_ps);
         varying_chain_ps[1] = 0x7E020302u;  // v1 = unresolved lane-varying v2 before the same chain
-        CHECK(recompile_fragment(varying_chain_ps, std::size(varying_chain_ps)).empty(),
-              "a lane-varying input remains rejected through the VOP chain");
+        CHECK(!recompile_fragment(varying_chain_ps, std::size(varying_chain_ps)).empty(),
+              "fragment wave64 vote accepts a lane-varying VCC loop bound exactly");
 
         uint32_t varying_ps[sizeof(ps)/sizeof(ps[0])];
         std::copy(std::begin(ps), std::end(ps), varying_ps);
         varying_ps[2] = 0x7E020302u;  // v_mov_b32 v1,v2: a lane-varying/unproven loop bound
-        CHECK(recompile_fragment(varying_ps, sizeof(varying_ps)/sizeof(varying_ps[0])).empty(),
-              "a varying-VCC loop remains rejected (wave-empty branch is not lane-local)");
+        CHECK(!recompile_fragment(varying_ps, sizeof(varying_ps)/sizeof(varying_ps[0])).empty(),
+              "fragment wave64 vote keeps a varying-VCC loop wave-uniform");
 
         uint32_t exec_mutating_ps[sizeof(ps)/sizeof(ps[0])];
         std::copy(std::begin(ps), std::end(ps), exec_mutating_ps);
         exec_mutating_ps[3] = 0xBEFE04C1u;  // s_mov_b64 exec,-1 between the bound definition and compare
-        CHECK(recompile_fragment(exec_mutating_ps,
-                                 sizeof(exec_mutating_ps)/sizeof(exec_mutating_ps[0])).empty(),
-              "a VCC loop with intervening EXEC mutation remains rejected");
+        CHECK(!recompile_fragment(exec_mutating_ps,
+                                  sizeof(exec_mutating_ps)/sizeof(exec_mutating_ps[0])).empty(),
+              "fragment wave64 vote tracks a VCC loop across an EXEC restore");
     }
 
     // EXECNZ-back-edge loop with a mid-body vccz BREAK (#273 — DOLL's scalar-indexed unroll shape):
@@ -633,9 +731,18 @@ int main() {
             0xD7600007u, 0x0001070Au,              // v_readlane_b32 s7, v10, 3
             0x7E000207u, 0xF800180Fu, 0x00000000u, 0xBF810000u,
         };
-        CHECK(recompile_fragment(stale_readlane,
-                                 sizeof(stale_readlane)/sizeof(stale_readlane[0])).empty(),
-              "#652: readlane rejects a lane slot invalidated by an ordinary VGPR write");
+        std::vector<uint32_t> recycled_readlane = recompile_fragment(
+            stale_readlane, sizeof(stale_readlane)/sizeof(stale_readlane[0]));
+        CHECK(!recycled_readlane.empty(),
+              "#652: readlane observes the ordinary VGPR after its spill lifetime ends");
+        if (!recycled_readlane.empty()) {
+            std::vector<uint8_t> px = prosper::test::render_triangle_rgba(
+                vert, recycled_readlane, W, H);
+            const uint8_t* center = px.empty() ? nullptr
+                : &px[((size_t)(H / 2) * W + W / 2) * 4];
+            CHECK(center && center[0] > 0xC0,
+                  "#652: recycled v10 lane 3 contains the new 1.0 value, not its stale spill");
+        }
     }
 
     // MULTI-RENDER-TARGET selection (#566 — Dead Cells world/G-buffer shaders). A 4-MRT shader emits its

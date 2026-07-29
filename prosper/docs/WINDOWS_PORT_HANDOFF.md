@@ -215,8 +215,8 @@ bytes plus descriptor-interface semantics; `PROSPER_NO_SHADER_CACHE=1` disables 
 miss compilation time. Run `test_shader_recompile_cache` after changing the key or recompiler contract.
 Frontend windows also report texture resource uses as `textures` and callback-local duplicate decodes
 avoided as `reused`, plus exact-byte cross-submit `texture_cache` hits/misses/invalidations. The persistent
-cache covers guest-backed linear/tiled 2D `Unorm8` (1-4 components) and BC1-BC7 sampled textures and
-defaults to 1 GiB; use
+cache covers guest-backed linear/tiled 2D `Unorm8` (1-4 components) and BC1-BC7 sampled textures. Its
+default ceiling is one eighth of host physical memory, clamped to 1-2 GiB; use
 `PROSPER_NO_TEXTURE_DECODE_CACHE=1` for an A/B or `PROSPER_TEXTURE_DECODE_CACHE_MB=<MiB>` to change the
 budget. Do not infer descriptor-table
 identity from shader/user-SGPR values alone:

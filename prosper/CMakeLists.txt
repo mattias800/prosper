@@ -340,6 +340,10 @@ if(TARGET prosper_core)
   target_include_directories(test_prosper_app_window_controls PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_window_controls COMMAND test_prosper_app_window_controls)
 
+  add_executable(test_prosper_app_capture_schedule frontends/prosper-app/test_capture_schedule.cpp)
+  target_include_directories(test_prosper_app_capture_schedule PRIVATE frontends/prosper-app)
+  add_test(NAME prosper_app_capture_schedule COMMAND test_prosper_app_capture_schedule)
+
   add_executable(test_prosper_app_present_mode frontends/prosper-app/test_present_mode.cpp)
   target_include_directories(test_prosper_app_present_mode PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_present_mode COMMAND test_prosper_app_present_mode)
@@ -371,6 +375,10 @@ if(TARGET prosper_core)
   add_executable(test_readback_policy frontends/shared/test_readback_policy.cpp)
   target_include_directories(test_readback_policy PRIVATE frontends/shared)
   add_test(NAME readback_policy COMMAND test_readback_policy)
+
+  add_executable(test_write_watch_policy frontends/shared/test_write_watch_policy.cpp)
+  target_include_directories(test_write_watch_policy PRIVATE frontends/shared)
+  add_test(NAME write_watch_policy COMMAND test_write_watch_policy)
 
   # Bounded-acquire present classification (#1182). Needs Vulkan HEADERS only (VkResult enum), no loader
   # call — link Vulkan::Vulkan purely for its include dirs. Guarded so a headers-less host skips it

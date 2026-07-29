@@ -1,0 +1,30 @@
+# The Plucky Squire (PPSA15319): fresh-save route through title, slot, and play-style menus.
+# Full 4K rendering advances at less than one flip per second on some hosts, so use wall-clock
+# windows rather than frame numbers. Five-second Cross pulses tolerate slow menu transitions and
+# retain broad neutral gaps. Surplus pulses become ordinary gameplay actions after the last menu.
+20-25:cross
+40-45:cross
+60-65:cross
+80-85:cross
+100-105:cross
+120-125:cross
+140-145:cross
+160-165:cross
+180-185:cross
+200-205:cross
+220-225:cross
+240-245:cross
+260-265:cross
+280-285:cross
+300-305:cross
+320-325:cross
+340-345:cross
+360-365:cross
+380-385:cross
+400-405:cross
+420-425:cross
+440-445:cross
+460-465:cross
+480-485:cross
+500-505:cross
+520-525:cross

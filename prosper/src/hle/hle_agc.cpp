@@ -27,6 +27,7 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <unordered_map>
 
 #ifndef _WIN32
 // #312 label-slot write watch (exec_image_linux.cpp). Weak: tools that link the AGC HLE without
@@ -752,6 +753,10 @@ std::vector<AgcFusedShaderPair>& agc_fused_shader_pairs() {
     static std::vector<AgcFusedShaderPair> v;
     return v;
 }
+std::unordered_map<uint64_t, uint64_t>& agc_shader_continuations() {
+    static std::unordered_map<uint64_t, uint64_t> continuations;
+    return continuations;
+}
 
 // Relocate one self-relative pointer field in place. SDK shader blobs use small forward offsets from
 // the pointer field; linked guest pointers live above 4 GiB. Inspect the field representation rather
@@ -800,6 +805,17 @@ extern "C" const void* prosper_agc_fused_back_header_for_front(uint64_t front_co
         match = pair.back;
     }
     return match;
+}
+
+// Fusion installs the front-half program in the hardware stage's PGM registers while its terminal
+// s_setpc_b64 transfers to the separately allocated back half. Preserve that exact SDK relationship
+// at construction time: the PM4 state intentionally exposes only the installed front address, and
+// trying to infer the continuation later from another PGM register loses valid NGG vertex programs.
+extern "C" uint64_t prosper_agc_shader_continuation_for_code(uint64_t code_addr) {
+    if (!code_addr) return 0;
+    std::lock_guard<std::mutex> lk(agc_shaders_mx());
+    const auto found = agc_shader_continuations().find(code_addr);
+    return found == agc_shader_continuations().end() ? 0 : found->second;
 }
 
 // Bounded RE probe (PROSPER_PIPETRACE): log the raw pointer args of the shader/pipeline construction
@@ -1071,12 +1087,14 @@ HLE(agc_fuse_shader_halves) {  // (Shader* dst, const Shader* front, const Shade
     {
         std::lock_guard<std::mutex> lk(agc_shaders_mx());
         const uint64_t front_code = (uint64_t)(uintptr_t)front->code;
+        const uint64_t back_code = (uint64_t)(uintptr_t)back->code;
         auto& pairs = agc_fused_shader_pairs();
         auto found = std::find_if(pairs.begin(), pairs.end(), [front_code, back](const auto& pair) {
             return pair.front_code == front_code && pair.back->code == back->code;
         });
         if (found == pairs.end()) pairs.push_back({front_code, back});
         else found->back = back;
+        if (front_code && back_code) agc_shader_continuations()[front_code] = back_code;
     }
     return 0;
 }
@@ -1235,7 +1253,14 @@ HLE(agc_create_interpolant_mapping_sdk_alias) {
 // happens here yet; this is the semantic execution of the submit, observable via PROSPER_GFXLOG and
 // prosper_agc_submit_stats(). The Dcb address is a guest pointer, valid 1:1 in-process.
 namespace {
-gpu::GpuState& agc_gpu_state() { static gpu::GpuState st; return st; }
+gpu::GpuState& agc_graphics_state() { static gpu::GpuState st; return st; }
+gpu::GpuState& agc_compute_state(uint64_t queue) {
+    // Every hardware async-compute queue owns its register context. Queue ids are driver handles,
+    // so retain state lazily for exactly the ids a title submits instead of assuming one global ACB.
+    static std::unordered_map<uint64_t, gpu::GpuState> states;
+    return states.try_emplace(queue).first->second;
+}
+gpu::GpuState& agc_gpu_state() { return agc_graphics_state(); }
 uint64_t g_submit_count = 0;
 // Serializes every access to the shared GpuState (fold + render + stats). DOLL's UE4 RHI submits
 // from TWO guest threads concurrently (core-proven, issue #278: one thread inside
@@ -1294,6 +1319,19 @@ extern "C" void prosper_agc_submit_stats(uint64_t* submits, uint64_t* draws) {
     std::lock_guard<std::mutex> lk(g_agc_state_mu);
     if (submits) *submits = g_submit_count;
     if (draws)   *draws   = (uint64_t)agc_gpu_state().draws.size();
+}
+
+// Focused state probe used by the submit regression. Keeping the graphics and async-compute
+// register files distinct is architectural state, not a title workaround: the two hardware queues
+// may use the same numeric SH-register offsets concurrently without changing each other's bindings.
+extern "C" bool prosper_agc_submit_sh_reg(uint64_t queue, uint32_t offset, uint32_t* value) {
+    if (!value) return false;
+    std::lock_guard<std::mutex> lk(g_agc_state_mu);
+    const auto& sh = queue ? agc_compute_state(queue).sh : agc_graphics_state().sh;
+    const auto it = sh.find(offset);
+    if (it == sh.end()) return false;
+    *value = it->second;
+    return true;
 }
 
 namespace {
@@ -1434,29 +1472,34 @@ static void poolshift_window_probe(uint64_t submit_no) {
         last_found = found;
     }
 }
-static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const char* who) {
+static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const char* who,
+                                  uint64_t queue_id = 0) {
     if (!addr) return 0;
     constexpr uint32_t kUnknownCap = 0x80000;   // 512 KiB of dwords — well past any real Dcb
     uint32_t walk = dw_num ? dw_num : kUnknownCap;
     std::lock_guard<std::mutex> lk(g_agc_state_mu);   // serialize with the other submit entry (#278)
+    const bool async_compute = strcmp(who, "SubmitAcb") == 0;
+    gpu::GpuState& state = async_compute ? agc_compute_state(queue_id) : agc_graphics_state();
     // #1226: stamp this fold's submit entry point so fence-protocol history can distinguish the
-    // graphics Dcb stream from ArcRunner's async-compute Acb stream (folded into the same state).
-    gpu::prosper_gpu_set_fold_origin(strcmp(who, "SubmitAcb") == 0      ? 2
+    // graphics Dcb stream from the async-compute Acb stream. The queues share ordered memory
+    // effects, but not register files: folding Acb SH writes into graphics state overwrote live
+    // vertex user-data bindings before the next Dcb draw (Plucky's first gameplay scene).
+    gpu::prosper_gpu_set_fold_origin(async_compute                         ? 2
                                      : strcmp(who, "SubmitDcbFinal") == 0 ? 3 : 1);
     // #312: flush any earlier stream paused on a WAIT_REG_MEM — this submit may be its producer.
     gpu::flush_deferred_streams();
-    agc_gpu_state().draws.clear();
-    agc_gpu_state().dispatches.clear();
-    agc_gpu_state().dma_copies.clear();
-    agc_gpu_state().dma_execution_rejected = false;
-    agc_gpu_state().ordered_memory_effects.clear();
+    state.draws.clear();
+    state.dispatches.clear();
+    state.dma_copies.clear();
+    state.dma_execution_rejected = false;
+    state.ordered_memory_effects.clear();
     gpu::begin_gpu_timeline_submit(g_submit_count + 1);
-    size_t applied = gpu::run_command_buffer(addr, walk, agc_gpu_state());
+    size_t applied = gpu::run_command_buffer(addr, walk, state);
     g_submit_count++;
-    gpu::diagnose_compute_dispatches(agc_gpu_state(), g_submit_count);
+    gpu::diagnose_compute_dispatches(state, g_submit_count);
     static unsigned draw_submits2 = 0;
-    execute_submit_work(agc_gpu_state(), g_submit_count, draw_submits2);
-    gpu::diagnose_resource_provenance(agc_gpu_state(), g_submit_count);
+    execute_submit_work(state, g_submit_count, draw_submits2);
+    gpu::diagnose_resource_provenance(state, g_submit_count);
     // #312 EOP visibility contract: the pulse fires immediately only when no gated writes are
     // pending; otherwise it is OWED and delivered when the tail drains (the guest's completion
     // scan must never observe a half-retired frame — see command_processor.cpp). The flip and the
@@ -1464,7 +1507,7 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     // stays alive (the naive always-pulse variant let the scan free live labels; the naive
     // never-pulse variant starved the pacer — both measured).
     gpu::flush_deferred_streams();
-    gpu::submit_completion_pulse(agc_gpu_state().dma_execution_rejected);
+    gpu::submit_completion_pulse(state.dma_execution_rejected);
     // Watchdog keys off PENDING streams, not just this fold: streams can outlive their fold (and
     // the Jump-recursion flag reset once hid a deferring fold entirely — the wedge class).
     if (gpu::deferred_pending()) start_defer_watchdog();
@@ -1472,9 +1515,9 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc] %s #%llu: %u dwords (walk=%u) -> %zu packets applied (draws: %zu, dispatches: %llu)\n",
                 who, (unsigned long long)g_submit_count, dw_num, walk, applied,
-                agc_gpu_state().draws.size(), (unsigned long long)agc_gpu_state().dispatch_count);
-    progress_heartbeat(agc_gpu_state().draws.size(), g_submit_count,
-                       (uint64_t)agc_gpu_state().dispatch_count);
+                state.draws.size(), (unsigned long long)state.dispatch_count);
+    progress_heartbeat(state.draws.size(), g_submit_count,
+                       (uint64_t)state.dispatch_count);
     return 0;
 }
 
@@ -1622,6 +1665,19 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
 HLE(agc_driver_submit_acb) {  // sceAgcDriverSubmitAcb(queue, const AcbPacket*, ...)
     // Paired with this NID's generated post-handler return hook, including invalid calls.
     prosper_gpu_submit_scope_begin();
+    auto reject = [&](const char* reason, uint64_t stream = 0, uint64_t count = 0,
+                      uint32_t header = 0) -> uint64_t {
+        static std::atomic<unsigned> logged{0};
+        if (logged.fetch_add(1) < 16)
+            fprintf(stderr,
+                    "[agc] SubmitAcb reject=%s args=[0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx] "
+                    "stream=0x%llx count=0x%llx header=0x%08x\n",
+                    reason, (unsigned long long)a0, (unsigned long long)a1,
+                    (unsigned long long)a2, (unsigned long long)a3,
+                    (unsigned long long)a4, (unsigned long long)a5,
+                    (unsigned long long)stream, (unsigned long long)count, header);
+        return kAgcErrInvalidArg;
+    };
     if (getenv("PROSPER_GFXLOG")) {
         static std::atomic<unsigned> logged{0};
         if (logged.fetch_add(1) < 16) {
@@ -1639,35 +1695,33 @@ HLE(agc_driver_submit_acb) {  // sceAgcDriverSubmitAcb(queue, const AcbPacket*, 
                     (unsigned long long)words[7]);
         }
     }
-    // Live Astro Bot ABI: a0 is the hardware async-queue id (0x40/0x48); a1 points to a larger
-    // submission record whose first two qwords are {stream address, dword count}. a3 repeats the
-    // count. Validate both copies and the PM4 header before allowing the fold.
-    if (!a1 || !gpu::guest_readable(a1, 16)) return kAgcErrInvalidArg;
-    uint64_t stream = 0, count64 = 0;
+    // Live submissions share a 16-byte record: {stream address, uint32 dword_count, uint32 flags}.
+    // Astro Bot left FLAGS zero, which made the last two fields look like one qword count; Plucky sets
+    // FLAGS=1 and exposed that accidental interpretation as count 0x10000000088 instead of 0x88.
+    // Read the fields at their architectural widths, then validate the stream and optional count mirror.
+    if (!a1 || !gpu::guest_readable(a1, 16)) return reject("record-unreadable");
+    uint64_t stream = 0;
+    uint32_t count32 = 0, submit_flags = 0;
     memcpy(&stream, (const void*)(uintptr_t)a1, 8);
-    memcpy(&count64, (const void*)(uintptr_t)(a1 + 8), 8);
+    memcpy(&count32, (const void*)(uintptr_t)(a1 + 8), 4);
+    memcpy(&submit_flags, (const void*)(uintptr_t)(a1 + 12), 4);
+    (void)submit_flags; // retained for the validated ABI layout; no observed flag changes fold semantics
+    const uint64_t count64 = count32;
     if (!stream || count64 == 0 || count64 > 0x400000ull)
-        return kAgcErrInvalidArg;
-    // word[1] of the record is the authoritative dword count (further validated below via stream
-    // readability + the PM4 header). A redundant count copy is ALSO passed in a register as a sanity
-    // cross-check, but WHICH register holds it varies by the AgcDriver::submitAsyncCompute ABI:
-    // Astro Bot puts the count in a3 (queue id in a0); ArcRunner (UE4 4.27) puts the count in a2 and
-    // mirrors the queue id in a3. Accept the count-mirror in EITHER register; only reject when BOTH
-    // register copies are present and BOTH disagree with word[1] -- a genuinely inconsistent submit.
-    // The previous `a3 == count64` check was Astro-Bot-specific and wrongly rejected ArcRunner's valid
-    // submissions (a3 == queue id 0x20 != count 0x7a) -> sceAgcDriverSubmitAcb returned kAgcErrInvalidArg
-    // and UE4 aborted with `Agc::submitAsyncCompute(...) failed 0x8a6c000a`. CONFIDENCE: HIGH.
+        return reject("record-fields", stream, count64);
+    // The count mirror slot differs by adapter: Astro Bot uses a3; ArcRunner and Plucky use a2 while
+    // a3 mirrors the queue id. Both non-zero register values disagreeing with the record is invalid.
     if (a2 && a3 && a2 != count64 && a3 != count64)
-        return kAgcErrInvalidArg;
+        return reject("count-mirror", stream, count64);
     // The decoder consumes every advertised dword.  Checking only the header allowed a stream at
     // the end of a readable page to fault as soon as decode crossed into the following guard page.
     const uint64_t stream_bytes = count64 * sizeof(uint32_t);  // bounded above, cannot overflow
     if (!gpu::guest_readable(stream, (size_t)stream_bytes))
-        return kAgcErrInvalidArg;
+        return reject("stream-unreadable", stream, count64);
     uint32_t header = 0; memcpy(&header, (const void*)(uintptr_t)stream, sizeof header);
     if ((header & 0xc0000000u) != 0xc0000000u && header != 0x80000000u)
-        return kAgcErrInvalidArg;
-    return submit_dcb_stream((const uint32_t*)(uintptr_t)stream, (uint32_t)count64, "SubmitAcb");
+        return reject("stream-header", stream, count64, header);
+    return submit_dcb_stream((const uint32_t*)(uintptr_t)stream, count32, "SubmitAcb", a0);
 }
 
 // --- Indirect-register patch helpers: modify a packet returned by a Set*RegsIndirect call.

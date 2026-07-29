@@ -18,6 +18,7 @@
 #include "gpu/gpu_execute.hpp"         // shared_vulkan_context / gpu-present activation (#1270)
 #include "gpu/gpu_capture.hpp"         // request_interactive_gpu_capture (F9 frame grab)
 #include "gpu/gpu_timeline.hpp"        // request_interactive_capture_bundle (F9 whole-frame grab)
+#include "capture_schedule.hpp"        // exact host-frame screenshot calibration trigger
 #include "present_blit.hpp"           // GPU scanout handoff: acquire/release the renderer's front image
 #include "host/lifecycle.hpp"          // frontend-owned stop/pause gates
 #include "host/boot_program.hpp"       // boot_program (shared guest-boot path, also used by boot_trace)
@@ -347,6 +348,12 @@ bool replace_present_sync(Vk& vk) {
 }
 
 prosper::frontend::PresentAttempt recover_submit_failure(Vk& vk, VkResult result) {
+    if (prosper::frontend::classify_submit_failure(result) ==
+        prosper::frontend::PresentAttempt::failed) {
+        fprintf(stderr, "[app] vkQueueSubmit failed (%d); device lost, stopping\n",
+                static_cast<int>(result));
+        return prosper::frontend::PresentAttempt::failed;
+    }
     fprintf(stderr, "[app] vkQueueSubmit failed (%d); replacing present synchronization\n",
             static_cast<int>(result));
     if (replace_present_sync(vk)) return prosper::frontend::PresentAttempt::out_of_date;
@@ -386,7 +393,13 @@ prosper::frontend::PresentAttempt present_frame(Vk& vk, const uint8_t* rgba, uin
     if (!ensure_stage(vk, w, h)) return PresentAttempt::out_of_date;
     memcpy(vk.stageMapped, rgba, (size_t)w * h * 4);
 
-    vkWaitForFences(vk.device, 1, &vk.inFlight, VK_TRUE, UINT64_MAX);
+    const VkResult waitResult = vkWaitForFences(
+        vk.device, 1, &vk.inFlight, VK_TRUE, UINT64_MAX);
+    if (waitResult != VK_SUCCESS) {
+        fprintf(stderr, "[app] present fence wait failed (%d); stopping\n",
+                static_cast<int>(waitResult));
+        return PresentAttempt::failed;
+    }
     uint32_t imgIndex = 0;
     // Bound the acquire (#1182): an occluded/minimized window releases no swapchain image, and an
     // infinite wait here would block the app main thread — freezing visible output, stalling SDL
@@ -399,6 +412,7 @@ prosper::frontend::PresentAttempt present_frame(Vk& vk, const uint8_t* rgba, uin
     switch (prosper::frontend::classify_acquire(acq)) {
     case prosper::frontend::AcquireAction::skip:     return PresentAttempt::skipped;
     case prosper::frontend::AcquireAction::recreate: return PresentAttempt::out_of_date;
+    case prosper::frontend::AcquireAction::fail:     return PresentAttempt::failed;
     case prosper::frontend::AcquireAction::proceed:  break;
     }
     // Load-bearing ordering: vkResetFences MUST stay after the skip/recreate early-returns above. A skip
@@ -504,7 +518,18 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
                                                     int& prevSlot, bool requestReadback,
                                                     bool& readbackReady) {
     readbackReady = false;
-    vkWaitForFences(vk.device, 1, &vk.inFlight, VK_TRUE, UINT64_MAX);   // previous present's read complete
+    const VkResult previousWait = vkWaitForFences(
+        vk.device, 1, &vk.inFlight, VK_TRUE, UINT64_MAX);   // previous present's read complete
+    if (previousWait != VK_SUCCESS) {
+        prosper::frontend::present_blit_release(gf.slot);
+        if (prevSlot >= 0) {
+            prosper::frontend::present_blit_release(prevSlot);
+            prevSlot = -1;
+        }
+        fprintf(stderr, "[app] gpu-present fence wait failed (%d); stopping\n",
+                static_cast<int>(previousWait));
+        return prosper::frontend::PresentAttempt::failed;
+    }
     if (prevSlot >= 0) { prosper::frontend::present_blit_release(prevSlot); prevSlot = -1; }
     if (requestReadback && !ensure_stage(vk, gf.width, gf.height)) {
         prosper::frontend::present_blit_release(gf.slot);
@@ -521,6 +546,8 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
         prosper::frontend::present_blit_release(gf.slot); return prosper::frontend::PresentAttempt::skipped;
     case prosper::frontend::AcquireAction::recreate:
         prosper::frontend::present_blit_release(gf.slot); return prosper::frontend::PresentAttempt::out_of_date;
+    case prosper::frontend::AcquireAction::fail:
+        prosper::frontend::present_blit_release(gf.slot); return prosper::frontend::PresentAttempt::failed;
     case prosper::frontend::AcquireAction::proceed: break;
     }
     vkResetFences(vk.device, 1, &vk.inFlight);
@@ -1113,13 +1140,35 @@ int main(int argc, char** argv) {
     const std::string grabDir = getenv("PROSPER_CAPTURE_DIR") ? getenv("PROSPER_CAPTURE_DIR") : ".";
     unsigned grabCounter = 0;
     std::string pendingGrabScreenshot;   // non-empty => write the next presented CPU frame to this path
+    uint64_t pendingGrabGuestPresent = 0;
     auto flushGrabScreenshot = [&](const uint8_t* rgba, uint32_t w, uint32_t h) {
         if (pendingGrabScreenshot.empty()) return;
         const bool ok = write_frame_bmp(pendingGrabScreenshot, rgba, w, h);
-        std::fprintf(stderr, "[grab] screenshot%s -> %s\n", ok ? "" : " write FAILED",
+        std::fprintf(stderr,
+                     "[grab] screenshot%s armed at guest present %llu "
+                     "(written at guest present %llu) -> %s\n",
+                     ok ? "" : " write FAILED",
+                     static_cast<unsigned long long>(pendingGrabGuestPresent),
+                     static_cast<unsigned long long>(gpu::present_count()),
                      pendingGrabScreenshot.c_str());
         pendingGrabScreenshot.clear();
+        pendingGrabGuestPresent = 0;
     };
+    const uint64_t scheduledScreenshotFrame = prosper::frontend::parse_capture_frame(
+        getenv("PROSPER_CAPTURE_SCREENSHOT_AT_FRAME"));
+    std::string scheduledScreenshotPath;
+    if (scheduledScreenshotFrame) {
+        if (const char* configured = getenv("PROSPER_CAPTURE_SCREENSHOT")) {
+            scheduledScreenshotPath = configured;
+        } else {
+            scheduledScreenshotPath = grabDir + "/scheduled_frame_" +
+                std::to_string(scheduledScreenshotFrame) + ".bmp";
+        }
+        fprintf(stderr, "[grab] screenshot scheduled at host frame %llu -> %s\n",
+                static_cast<unsigned long long>(scheduledScreenshotFrame),
+                scheduledScreenshotPath.c_str());
+    }
+    bool scheduledScreenshotArmed = false;
     bool timedDumpPending = timedDumpMs > 0;
     bool running = true;
     bool paused = false;
@@ -1236,6 +1285,7 @@ int main(int argc, char** argv) {
                     std::snprintf(base, sizeof base, "%s/frame_grab_%03u", grabDir.c_str(), ++grabCounter);
                     prosper::gpu::request_interactive_capture_bundle(std::string(base) + ".prgbundle");
                     pendingGrabScreenshot = std::string(base) + ".bmp";
+                    pendingGrabGuestPresent = gpu::present_count();
                     std::fprintf(stderr,
                         "[grab] F9: arming a whole-frame capture -> %s.prgbundle (+ .bmp screenshot)\n",
                         base);
@@ -1421,6 +1471,21 @@ int main(int argc, char** argv) {
 
         static const uint32_t kPatW = 1920, kPatH = 1080;
         if (testPattern && !paused) feed_test_pattern(kPatW, kPatH, patFrame++);
+
+        // Cheap calibration companion to a heavyweight F9 bundle. Read back exactly one presented
+        // frame, with no GPU command capture, so long routes can locate a visual checkpoint before
+        // scheduling the replayable bundle there. Do not overwrite an interactive F9 screenshot;
+        // if both coincide, the scheduled shot remains eligible for the following real present.
+        if (pendingGrabScreenshot.empty() && prosper::frontend::capture_frame_due(
+                scheduledScreenshotFrame, shown, scheduledScreenshotArmed)) {
+            pendingGrabScreenshot = scheduledScreenshotPath;
+            pendingGrabGuestPresent = gpu::present_count();
+            scheduledScreenshotArmed = true;
+            fprintf(stderr,
+                    "[grab] scheduled screenshot armed at host frame %llu (guest present %llu)\n",
+                    static_cast<unsigned long long>(shown + 1),
+                    static_cast<unsigned long long>(pendingGrabGuestPresent));
+        }
 
         // Present the latest finished frame from the core's present layer.
         // The frame dimensions: from the guest's registered VideoOut display in normal use; in

@@ -258,9 +258,7 @@ int main(int argc, char** argv) {
 
 #ifdef PROSPER_HAVE_VULKAN
     // Compute is part of command submission even when frame rendering/dumping is disabled.
-    // PROSPER_NO_COMPUTE=1 is a progression diagnostic only: semantic timelines still retain the
-    // dispatches, but neither graphics nor compute mutates guest GPU resources. This distinguishes
-    // host compute throughput from guest/HLE progression; it is never a correctness mode.
+    // Compute translation-only diagnostics still realize shaders/resources but submit no Vulkan work.
     if (getenv("PROSPER_COMPUTE_TRANSLATE_ONLY")) {
         // Shared-machine shader diagnostics need the normal resource discovery/recompiler path but
         // no Vulkan allocation or submission. A non-null callback makes the executor realize every
@@ -269,7 +267,14 @@ int main(int argc, char** argv) {
         prosper::gpu::set_submit_compute(
             [](const std::vector<prosper::gpu::ComputeItem>& items) { return !items.empty(); });
         std::fprintf(stderr, "[compute] translate-only diagnostic backend registered\n");
-    } else if (!getenv("PROSPER_NO_COMPUTE")) {
+    } else if (getenv("PROSPER_NO_COMPUTE")) {
+        // Progression-only mode retains semantic dispatches but mutates no guest GPU resources. Keep
+        // a successful no-op backend registered so async submissions are acknowledged; leaving it
+        // absent makes execute_nonrender_submit_work reject an otherwise valid ACB.
+        prosper::gpu::set_submit_compute(
+            [](const std::vector<prosper::gpu::ComputeItem>&) { return true; });
+        std::fprintf(stderr, "[compute] progression-only no-op backend registered\n");
+    } else {
         prosper::frontend::register_live_compute();
     }
     // PROSPER_RENDER=1: register the live Vulkan renderer (shared with prosper-app via

@@ -85,6 +85,10 @@ void present_flip(int buffer_index, int64_t flip_arg) {
 }
 
 int      present_front_index() { return videoout_front_index(); }
+uint64_t present_front_address() {
+    VideoOutBufferSnapshot snapshot;
+    return current_scanout(snapshot) ? snapshot.address : 0;
+}
 uint64_t present_count()       { return g_present_count.load(std::memory_order_relaxed); }
 uint32_t present_width()       { VideoOutBufferSnapshot s; return current_scanout(s) ? s.width : 0; }
 uint32_t present_height()      { VideoOutBufferSnapshot s; return current_scanout(s) ? s.height : 0; }

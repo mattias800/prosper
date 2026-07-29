@@ -19,7 +19,12 @@
 
 namespace {
 bool call_open(prosper::HleFn open, void* pointer) {
-    return open(1, 0xdcdfb7a0, reinterpret_cast<uintptr_t>(pointer), 1, 0x83, 0) == 0;
+    // sceImeKeyboardOpen now consumes its second argument as a real keyboard parameter. Keep that
+    // ABI input valid while argument 2 remains the deliberately unreadable value exercised by the
+    // service logger below.
+    uint64_t keyboard_param[4]{};
+    return open(1, reinterpret_cast<uintptr_t>(keyboard_param),
+                reinterpret_cast<uintptr_t>(pointer), 1, 0x83, 0) == 0;
 }
 
 bool logs_full_values(prosper::HleFn open, void* pointer) {
@@ -51,9 +56,10 @@ bool logs_full_values(prosper::HleFn open, void* pointer) {
         return false;
     }
 
-    const bool called =
-        open(1, 0xdcdfb7a0, reinterpret_cast<uintptr_t>(pointer), 1, 0x83,
-             0x1122334455667788ull) == 0;
+    uint64_t keyboard_param[4]{};
+    const bool called = open(1, reinterpret_cast<uintptr_t>(keyboard_param),
+                             reinterpret_cast<uintptr_t>(pointer), 1, 0x83,
+                             0x1122334455667788ull) == 0;
     const bool flushed = std::fflush(stderr) == 0;
 #ifdef _WIN32
     const bool restored = _dup2(saved_stderr, stderr_fd) == 0;
@@ -119,8 +125,8 @@ int main() {
     void* guard_page = protected_page;
 #endif
 
-    // The remaining literals came from a Blasphemous 2 call. Each address is pointer-shaped but
-    // cannot safely be dereferenced for every requested word.
+    // The deliberately supplied argument-2 values are pointer-shaped but cannot safely be
+    // dereferenced for every requested word.
     bool ok = call_open(open, reserved) && call_open(open, protected_page) &&
               call_open(open, guard_page) && logs_full_values(open, boundary + page_size - 8);
 

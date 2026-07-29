@@ -73,6 +73,11 @@ struct AtomicStats {
     std::atomic<uint64_t> registered_pages{0};
     std::atomic<uint64_t> create_no_mapping{0};
     std::atomic<uint64_t> create_incomplete_aliases{0};
+    std::atomic<uint64_t> create_oversized{0};
+    std::atomic<uint64_t> create_bytes_le_1m{0};
+    std::atomic<uint64_t> create_bytes_le_8m{0};
+    std::atomic<uint64_t> create_bytes_le_32m{0};
+    std::atomic<uint64_t> create_bytes_gt_32m{0};
     std::atomic<uint64_t> create_protect_failures{0};
     std::atomic<uint64_t> queries{0};
     std::atomic<uint64_t> unchanged{0};
@@ -263,7 +268,14 @@ GuestWriteWatch& GuestWriteWatch::operator=(GuestWriteWatch&& other) noexcept {
 GuestWriteWatch GuestWriteWatch::create(uint64_t addr, uint64_t size) {
     stats().create_attempts.fetch_add(1, std::memory_order_relaxed);
     (void)addr;
-    (void)size;
+    if (size <= (1ull << 20))
+        stats().create_bytes_le_1m.fetch_add(1, std::memory_order_relaxed);
+    else if (size <= (8ull << 20))
+        stats().create_bytes_le_8m.fetch_add(1, std::memory_order_relaxed);
+    else if (size <= (32ull << 20))
+        stats().create_bytes_le_32m.fetch_add(1, std::memory_order_relaxed);
+    else
+        stats().create_bytes_gt_32m.fetch_add(1, std::memory_order_relaxed);
     // Windows constructs an exception-dispatch frame below the interrupted RSP before a vectored
     // handler can restore a watched page. Guest code follows the SysV ABI and may keep live locals
     // in that 128-byte red zone, so page-protection write watches can silently corrupt the guest.
@@ -316,6 +328,11 @@ GuestWriteWatchStats guest_write_watch_stats() {
         value.registered_pages.load(std::memory_order_relaxed),
         value.create_no_mapping.load(std::memory_order_relaxed),
         value.create_incomplete_aliases.load(std::memory_order_relaxed),
+        value.create_oversized.load(std::memory_order_relaxed),
+        value.create_bytes_le_1m.load(std::memory_order_relaxed),
+        value.create_bytes_le_8m.load(std::memory_order_relaxed),
+        value.create_bytes_le_32m.load(std::memory_order_relaxed),
+        value.create_bytes_gt_32m.load(std::memory_order_relaxed),
         value.create_protect_failures.load(std::memory_order_relaxed),
         value.queries.load(std::memory_order_relaxed),
         value.unchanged.load(std::memory_order_relaxed),
@@ -403,6 +420,7 @@ void guest_write_watch_invalidate_all() {
 
 // Windows never arms pages (create() always refuses), so a host/kernel write can never EFAULT here.
 void guest_write_watch_notify_host_write(uint64_t, uint64_t) {}
+void guest_write_watch_notify_gpu_write(uint64_t, uint64_t) {}
 
 bool guest_write_watch_handle_fault(uint64_t addr) {
     (void)addr;
@@ -454,7 +472,11 @@ struct WatchedPage {
     std::vector<PageAlias> aliases;
 };
 struct RegistrationPage { WatchedPage* page = nullptr; uint64_t generation = 0; };
-struct Registration { std::vector<RegistrationPage> pages; };
+struct Registration {
+    std::vector<RegistrationPage> pages;
+    uint64_t begin = 0, end = 0;
+    bool gpu_dirty = false;
+};
 
 struct WatchState {
     std::mutex mutex;
@@ -469,7 +491,10 @@ WatchState& state() { static WatchState* value = new WatchState; return *value; 
 
 struct AtomicStats {
     std::atomic<uint64_t> create_attempts{0}, registrations{0}, registered_pages{0},
-        create_no_mapping{0}, create_incomplete_aliases{0}, create_protect_failures{0},
+        create_no_mapping{0}, create_incomplete_aliases{0}, create_oversized{0},
+        create_bytes_le_1m{0}, create_bytes_le_8m{0}, create_bytes_le_32m{0},
+        create_bytes_gt_32m{0},
+        create_protect_failures{0},
         queries{0}, unchanged{0}, dirty{0}, unknown{0}, faults{0}, physical_writes{0}, rearms{0};
 };
 AtomicStats& stats() { static AtomicStats* value = new AtomicStats; return *value; }
@@ -498,28 +523,63 @@ bool collect_aliases(const WatchState& w, uint64_t phys, std::vector<PageAlias>&
     return !out.empty();
 }
 
+struct ProtectionRun {
+    uint64_t addr = 0;
+    uint64_t size = 0;
+    int from = 0;
+    int to = 0;
+};
+
+// Coalesce adjacent pages before changing their protection. Texture and compute-cache watches commonly
+// cover tens of MiB, so issuing one mprotect per 4 KiB page makes registration spend thousands of
+// syscalls and global TLB shootdowns on a range the kernel can protect in one operation.
+std::vector<ProtectionRun> protection_runs(const std::vector<WatchedPage*>& pages, bool arm) {
+    std::vector<ProtectionRun> runs;
+    for (WatchedPage* page : pages) {
+        if (!page || page->armed == arm) continue;
+        for (const PageAlias& alias : page->aliases) {
+            if (!cpu_writable(alias.prot)) continue;
+            const int full = host_prot(alias.prot);
+            runs.push_back({alias.addr, kPage,
+                            arm ? full : (full & ~PROT_WRITE),
+                            arm ? (full & ~PROT_WRITE) : full});
+        }
+    }
+    std::sort(runs.begin(), runs.end(), [](const ProtectionRun& a, const ProtectionRun& b) {
+        if (a.from != b.from) return a.from < b.from;
+        if (a.to != b.to) return a.to < b.to;
+        return a.addr < b.addr;
+    });
+    std::vector<ProtectionRun> merged;
+    merged.reserve(runs.size());
+    for (const ProtectionRun& run : runs) {
+        if (!merged.empty() && merged.back().from == run.from && merged.back().to == run.to &&
+            merged.back().addr + merged.back().size == run.addr) {
+            merged.back().size += run.size;
+        } else {
+            merged.push_back(run);
+        }
+    }
+    return merged;
+}
+
 // mprotect every writable alias of `pages` to read-only (arm) or back to its guest prot (disarm).
 // Read-only / PROT_NONE aliases are left untouched (a CPU store can't dirty them). Returns false and
 // rolls back on the first mprotect failure so the guest is never left with a wrong protection.
 bool set_pages_armed(const std::vector<WatchedPage*>& pages, bool arm) {
-    std::vector<std::pair<uint64_t, int>> done;   // (addr, prot-to-restore-on-rollback)
-    auto rollback = [&] {
-        for (auto it = done.rbegin(); it != done.rend(); ++it)
-            mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(it->first)), kPage, it->second);
-    };
-    for (WatchedPage* page : pages) {
-        if (!page || page->armed == arm) continue;
-        for (const PageAlias& al : page->aliases) {
-            if (!cpu_writable(al.prot)) continue;
-            const int full = host_prot(al.prot);
-            const int want = arm ? (full & ~PROT_WRITE) : full;
-            const int back = arm ? full : (full & ~PROT_WRITE);
-            if (mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(al.addr)), kPage, want) != 0) {
-                rollback();
-                return false;
+    const std::vector<ProtectionRun> runs = protection_runs(pages, arm);
+    size_t changed = 0;
+    for (const ProtectionRun& run : runs) {
+        if (mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(run.addr)),
+                     static_cast<size_t>(run.size), run.to) != 0) {
+            while (changed) {
+                const ProtectionRun& prior = runs[--changed];
+                mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(prior.addr)),
+                         static_cast<size_t>(prior.size), prior.from);
             }
-            done.push_back({al.addr, back});
+            return false;
         }
+        ++changed;
     }
     for (WatchedPage* page : pages) if (page && page->armed != arm) page->armed = arm;
     return true;
@@ -605,7 +665,32 @@ GuestWriteWatch GuestWriteWatch::create(uint64_t addr, uint64_t size) {
     if (!w.fault_onstack.load(std::memory_order_acquire)) { bump(stats().create_no_mapping); return {}; }
 
     const uint64_t begin = addr & ~(kPage - 1);
-    const uint64_t end = (addr + size + kPage - 1) & ~(kPage - 1);
+    const uint64_t raw_end = addr + size;
+    if (raw_end > UINT64_MAX - (kPage - 1)) return {};
+    const uint64_t end = (raw_end + kPage - 1) & ~(kPage - 1);
+    const uint64_t watch_bytes = end - begin;
+    if (watch_bytes <= (1ull << 20))
+        bump(stats().create_bytes_le_1m);
+    else if (watch_bytes <= (8ull << 20))
+        bump(stats().create_bytes_le_8m);
+    else if (watch_bytes <= (32ull << 20))
+        bump(stats().create_bytes_le_32m);
+    else
+        bump(stats().create_bytes_gt_32m);
+    // Every watched page carries alias/generation state and must be indexed for the SIGSEGV path.
+    // For large streaming textures that fixed per-page cost is substantially higher than the callers'
+    // exact byte-comparison fallback (and can register millions of pages while a level loads). Keep
+    // dirty tracking for ranges where it amortizes; zero makes the diagnostic limit unbounded.
+    static const uint64_t max_watch_bytes = [] {
+        const char* value = std::getenv("PROSPER_WRITE_WATCH_MAX_KB");
+        const uint64_t kib = value ? std::strtoull(value, nullptr, 10) : 0ull;
+        if (!kib) return uint64_t{UINT64_MAX};
+        return kib > UINT64_MAX / 1024ull ? uint64_t{UINT64_MAX} : uint64_t{kib * 1024ull};
+    }();
+    if (watch_bytes > max_watch_bytes) {
+        bump(stats().create_oversized);
+        return {};
+    }
     std::lock_guard lock(w.mutex);
 
     // First pass: resolve every guest page to a physical page whose full alias set is known. Any gap
@@ -624,6 +709,8 @@ GuestWriteWatch GuestWriteWatch::create(uint64_t addr, uint64_t size) {
     // Second pass: get-or-create the WatchedPage per phys, arm newly-referenced pages, build the reg.
     const uint64_t id = ++w.next_id;
     Registration reg;
+    reg.begin = addr;
+    reg.end = raw_end;
     std::vector<WatchedPage*> to_arm;
     for (Resolved& r : resolved) {
         auto it = w.pages_by_phys.find(r.phys);
@@ -665,6 +752,10 @@ GuestWriteWatchQuery GuestWriteWatch::query() const {
     std::lock_guard lock(w.mutex);
     auto found = w.registrations.find(id_);
     if (found == w.registrations.end()) { bump(stats().unknown); return GuestWriteWatchQuery::Unknown; }
+    if (found->second.gpu_dirty) {
+        bump(stats().dirty);
+        return GuestWriteWatchQuery::Dirty;
+    }
     for (const RegistrationPage& rp : found->second.pages) {
         if (!rp.page || !rp.page->armed || rp.page->generation != rp.generation) {
             bump(stats().dirty);
@@ -685,6 +776,7 @@ bool GuestWriteWatch::rearm() {
     for (const RegistrationPage& rp : found->second.pages) if (rp.page) pages.push_back(rp.page);
     if (!set_pages_armed(pages, true)) return false;   // couldn't re-protect -> caller re-creates
     for (RegistrationPage& rp : found->second.pages) if (rp.page) rp.generation = rp.page->generation;
+    found->second.gpu_dirty = false;
     bump(stats().rearms);
     return true;
 }
@@ -702,7 +794,10 @@ GuestWriteWatchStats guest_write_watch_stats() {
     AtomicStats& v = stats();
     return {v.create_attempts.load(), v.registrations.load(), v.registered_pages.load(),
             v.create_no_mapping.load(), v.create_incomplete_aliases.load(),
-            v.create_protect_failures.load(), v.queries.load(), v.unchanged.load(), v.dirty.load(),
+            v.create_oversized.load(), v.create_bytes_le_1m.load(),
+            v.create_bytes_le_8m.load(), v.create_bytes_le_32m.load(),
+            v.create_bytes_gt_32m.load(), v.create_protect_failures.load(),
+            v.queries.load(), v.unchanged.load(), v.dirty.load(),
             v.unknown.load(), v.faults.load(), v.physical_writes.load(), v.rearms.load()};
 }
 
@@ -825,6 +920,19 @@ void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size) {
     if (hit.empty()) return;
     set_pages_armed(hit, false);
     for (WatchedPage* page : hit) page->generation++;
+}
+
+void guest_write_watch_notify_gpu_write(uint64_t addr, uint64_t size) {
+    if (!addr || !size || addr > UINT64_MAX - size) return;
+    WatchState& w = state();
+    if (!w.fault_onstack.load(std::memory_order_acquire)) return;
+    const uint64_t end = addr + size;
+    std::lock_guard lock(w.mutex);
+    for (auto& [id, registration] : w.registrations) {
+        (void)id;
+        if (registration.begin < end && addr < registration.end)
+            registration.gpu_dirty = true;
+    }
 }
 
 void guest_write_watch_invalidate_all() {

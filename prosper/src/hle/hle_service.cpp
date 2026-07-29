@@ -1377,7 +1377,7 @@ HLE(s_mouse_read)     { if (a1) memset(PW(a1), 0, 0x18); return 0; }
 // advanced (injected pad input was inert — the game wasn't reading the pad).
 //
 // Event ABI derived directly from the guest handler at eboot+0xf2c540 (PPSA02664 disassembly):
-//   handler(rdi=arg, rsi=SceImeEvent*)   — rdi is unused by this title's handler.
+//   handler(rdi=arg, rsi=SceImeEvent*)
 //   SceImeEvent:  +0x00 u32 id   (0x101 = KEY_DOWN, 0x102 = KEY_UP; 0x103..0x106 = other kbd events)
 //                 +0x08 u16 keycode  (USB HID usage id; indexes the guest's keycode->bit table)
 //                 +0x0a u16 (modifier/char)   +0x0c u32 (status)
@@ -1386,10 +1386,30 @@ HLE(s_mouse_read)     { if (a1) memset(PW(a1), 0, 0x18); return 0; }
 // CONFIDENCE: HIGH on the id/keycode/offset layout (read from the guest handler + its HID table).
 namespace {
 struct ImeKeyEvent { uint16_t hid; bool down; };
+// OrbisImeKeyboardParam, shared by the PS4 compatibility API exposed on PS5. The callback context is
+// supplied at open time, while sceImeUpdate supplies the callback function used for that pump. Keeping
+// only the callback and dropping `arg` happened to work for handlers that ignored rdi, but faults any
+// normal C++ thunk that expects its object pointer there.
+struct ImeKeyboardParam {
+    uint32_t option;
+    uint32_t reserved1;
+    uint64_t arg;
+    uint64_t handler;
+    uint64_t reserved2;
+};
+static_assert(sizeof(ImeKeyboardParam) == 0x20 && offsetof(ImeKeyboardParam, arg) == 0x08 &&
+              offsetof(ImeKeyboardParam, handler) == 0x10);
+struct ImeKeyboardContext {
+    bool open = false;
+    int32_t user_id = -1;
+    uint64_t arg = 0;
+    uint64_t handler = 0;
+};
 std::mutex g_ime_mx;
 std::deque<ImeKeyEvent> g_ime_queue;
+ImeKeyboardContext g_ime_keyboard;
 
-void ime_deliver(uint64_t handler, const ImeKeyEvent& ev, uint64_t guest_fs) {
+void ime_deliver(uint64_t handler, uint64_t arg, const ImeKeyEvent& ev, uint64_t guest_fs) {
     if (!handler) return;
     alignas(16) uint8_t e[0x40] = {0};
     *(uint32_t*)(e + 0x00) = ev.down ? 0x101u : 0x102u;
@@ -1401,7 +1421,7 @@ void ime_deliver(uint64_t handler, const ImeKeyEvent& ev, uint64_t guest_fs) {
     // transition on a key press) faulted at a near-null address — Evergate's SIGSEGV at eboot+0xaf8431
     // (#1286). Restore the caller's guest %fs (recovered from the import-stub frame) for the duration of
     // the call, then swap back to host %fs. Linux-only: only Linux swaps hardware %fs at the import
-    // boundary (guest_fs is 0 on Windows/macOS -> unchanged direct call). arg (rdi) is passed 0 as before.
+    // boundary (guest_fs is 0 on Windows/macOS -> unchanged direct call).
 #if defined(__linux__) && !defined(__APPLE__)
     uint64_t saved_fs = 0; bool swapped = false;
     if (guest_fs) {
@@ -1412,7 +1432,7 @@ void ime_deliver(uint64_t handler, const ImeKeyEvent& ev, uint64_t guest_fs) {
 #else
     (void)guest_fs;
 #endif
-    ((void (PROSPER_SYSV_ABI *)(uint64_t, void*))(uintptr_t)handler)(0, e);
+    ((void (PROSPER_SYSV_ABI *)(uint64_t, void*))(uintptr_t)handler)(arg, e);
 #if defined(__linux__) && !defined(__APPLE__)
     if (swapped) __asm__ volatile("wrfsbase %0" : : "r"(saved_fs));
 #endif
@@ -1424,7 +1444,7 @@ void ime_deliver(uint64_t handler, const ImeKeyEvent& ev, uint64_t guest_fs) {
 // the HID usage (default 0x28 Enter) and accepts a comma-separated LIST (e.g. "0x28,0x2c,0x1d") that
 // is cycled one key per press-window — so a single headless run can probe which key a dialog accepts.
 // Cadence: down, then up two ticks later, then the next key in the list two windows later.
-void ime_autokey_tick(uint64_t handler, uint64_t guest_fs) {
+void ime_autokey_tick(uint64_t handler, uint64_t arg, uint64_t guest_fs) {
     static const int on = [] { const char* e = getenv("PROSPER_IME_AUTOKEY");
                                return e && strtol(e, nullptr, 0) != 0 ? 1 : 0; }();
     if (!on) return;
@@ -1444,10 +1464,10 @@ void ime_autokey_tick(uint64_t handler, uint64_t guest_fs) {
     uint64_t t = tick.fetch_add(1);
     const uint16_t hid = hids[(t / 90) % hids.size()];
     if ((t % 90) == 0) {
-        ime_deliver(handler, {hid, true}, guest_fs);
+        ime_deliver(handler, arg, {hid, true}, guest_fs);
         if (svclog()) fprintf(stderr, "[ime-autokey] deliver hid=0x%x down\n", hid);
     } else if ((t % 90) == 2) {
-        ime_deliver(handler, {hid, false}, guest_fs);
+        ime_deliver(handler, arg, {hid, false}, guest_fs);
     }
 }
 
@@ -1534,7 +1554,7 @@ public:
         if (!error.empty()) fprintf(stderr, "[ime] PROSPER_IME_SCRIPT: %s\n", error.c_str());
     }
 
-    void tick(uint64_t handler, uint64_t guest_fs) {
+    void tick(uint64_t handler, uint64_t arg, uint64_t guest_fs) {
         if (!handler || entries_.empty()) return;
         bool become_dispatcher = false;
         {
@@ -1545,10 +1565,10 @@ public:
                     std::find(next.begin(), next.end(), e.hid) == next.end()) next.push_back(e.hid);
             for (uint16_t hid : active_)
                 if (std::find(next.begin(), next.end(), hid) == next.end())
-                    pending_.push_back({handler, guest_fs, {hid, false}});
+                    pending_.push_back({handler, arg, guest_fs, {hid, false}});
             for (uint16_t hid : next)
                 if (std::find(active_.begin(), active_.end(), hid) == active_.end())
-                    pending_.push_back({handler, guest_fs, {hid, true}});
+                    pending_.push_back({handler, arg, guest_fs, {hid, true}});
             active_ = std::move(next);
             ++tick_;
             if (!dispatching_ && !pending_.empty()) { dispatching_ = true; become_dispatcher = true; }
@@ -1564,12 +1584,12 @@ public:
             }
             // Never retain the runtime mutex across a call into guest code. A reentrant tick queues
             // behind transitions already published by this tick; this outer dispatcher drains it.
-            ime_deliver(transition.handler, transition.ev, transition.guest_fs);
+            ime_deliver(transition.handler, transition.arg, transition.ev, transition.guest_fs);
         }
     }
 
 private:
-    struct Pending { uint64_t handler = 0, guest_fs = 0; ImeKeyEvent ev{}; };
+    struct Pending { uint64_t handler = 0, arg = 0, guest_fs = 0; ImeKeyEvent ev{}; };
     std::vector<ImeScriptWindow> entries_;
     std::vector<uint16_t> active_;
     std::deque<Pending> pending_;
@@ -1578,23 +1598,28 @@ private:
     std::mutex mutex_;
 };
 
-void ime_script_tick(uint64_t handler, uint64_t guest_fs) {
+void ime_script_tick(uint64_t handler, uint64_t arg, uint64_t guest_fs) {
     static ImeScriptRuntime runtime;
-    runtime.tick(handler, guest_fs);
+    runtime.tick(handler, arg, guest_fs);
 }
 
 // Shared sceImeUpdate body: fire the autokey pulse (if enabled) then drain the queued keys, dispatching
 // each on the caller's guest %fs (guest_fs == 0 => no swap, the Windows/macOS path). The queue mutex is
 // released before every guest handler call (never held across guest code).
 void ime_update_run(uint64_t handler, uint64_t guest_fs) {
-    ime_autokey_tick(handler, guest_fs);        // handler = the guest event handler
-    ime_script_tick(handler, guest_fs);
+    uint64_t arg = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_ime_mx);
+        if (g_ime_keyboard.open) arg = g_ime_keyboard.arg;
+    }
+    ime_autokey_tick(handler, arg, guest_fs);        // handler = the guest event handler
+    ime_script_tick(handler, arg, guest_fs);
     for (;;) {
         ImeKeyEvent ev;
         { std::lock_guard<std::mutex> lk(g_ime_mx);
           if (g_ime_queue.empty()) break;
           ev = g_ime_queue.front(); g_ime_queue.pop_front(); }
-        ime_deliver(handler, ev, guest_fs);
+        ime_deliver(handler, arg, ev, guest_fs);
     }
 }
 } // namespace
@@ -1615,7 +1640,23 @@ void ime_push_key(uint16_t hid_usage, bool down) {
     g_ime_queue.push_back({hid_usage, down});
 }
 
-HLE(s_ime_kbd_open) { svc_log("sceImeKeyboardOpen", a0,a1,a2,a3,a4,a5); return 0; }  // handler comes via sceImeUpdate
+HLE(s_ime_kbd_open) {
+    svc_log("sceImeKeyboardOpen", a0,a1,a2,a3,a4,a5);
+    ImeKeyboardParam param{};
+    // Some older bring-up callers omitted the optional keyboard parameter entirely; retain their
+    // successful no-input behavior. A supplied pointer, however, must be readable because its `arg`
+    // is part of the callback ABI and remains live until KeyboardClose/re-open.
+    if (a1 && !svc_copy_bytes(a1, &param, sizeof param)) return 0x80BC0031ull;
+    std::lock_guard<std::mutex> lk(g_ime_mx);
+    g_ime_keyboard = {true, (int32_t)a0, param.arg, param.handler};
+    return 0;
+}
+HLE(s_ime_kbd_close) {
+    svc_log("sceImeKeyboardClose", a0,a1,a2,a3,a4,a5);
+    std::lock_guard<std::mutex> lk(g_ime_mx);
+    if (g_ime_keyboard.open && g_ime_keyboard.user_id == (int32_t)a0) g_ime_keyboard = {};
+    return 0;
+}
 // sceImeUpdate invokes the guest event handler (guest code), so it must restore the caller's guest %fs
 // around each dispatch (see ime_deliver / #1286). On Linux/macOS the import stub swapped this thread to
 // host %fs, so recover the caller's guest %fs from the import-stub frame via the entry-stack trampoline
@@ -3058,6 +3099,7 @@ void register_service_hle() {
     R("sceSystemServiceHideSplashScreen", s_ok);
     // libSceIme keyboard API (#186): no physical keyboard -> consistent "none connected" state. Raw NIDs.
     Hle::register_fn("eaFXjfJv3xs", (HleFn)s_ime_kbd_open,  "sceImeKeyboardOpen");
+    Hle::register_fn("PMVehSlfZ94", (HleFn)s_ime_kbd_close, "sceImeKeyboardClose");
 #ifdef _WIN32
     Hle::register_fn("-4GCfYdNF1s", (HleFn)s_ime_update, "sceImeUpdate");         // plain handler (guest_fs=0)
 #else

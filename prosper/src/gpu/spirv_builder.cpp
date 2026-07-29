@@ -14,12 +14,14 @@ enum : uint32_t {
     Op_TypeRuntimeArray=29, Op_TypeStruct=30, Op_TypePointer=32, Op_TypeFunction=33,
     Op_Constant=43, Op_Function=54, Op_FunctionEnd=56, Op_Variable=59,
     Op_Load=61, Op_Store=62, Op_AccessChain=65, Op_Decorate=71, Op_MemberDecorate=72,
-    Op_CompositeExtract=81, Op_FAdd=129, Op_FMul=133, Op_Label=248, Op_Return=253,
+    Op_CompositeExtract=81, Op_FAdd=129, Op_FMul=133, Op_Any=154, Op_INotEqual=171,
+    Op_ULessThan=176, Op_AtomicExchange=229, Op_SelectionMerge=247, Op_Label=248,
+    Op_Branch=249, Op_BranchConditional=250, Op_Return=253,
 };
 // Enumerants.
 enum : uint32_t {
     Cap_Shader=1, Addr_Logical=0, Mem_GLSL450=1, Exec_GLCompute=5, EM_LocalSize=17,
-    SC_Input=1, SC_StorageBuffer=12, FC_None=0,
+    SC_Input=1, SC_PushConstant=9, SC_StorageBuffer=12, FC_None=0,
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_Binding=33, Dec_DescriptorSet=34, Dec_Offset=35,
     BI_GlobalInvocationId=28,
 };
@@ -124,6 +126,123 @@ std::vector<uint32_t> build_compute_scale_bias(float scale, float bias) {
     uint32_t res    = e.id(); Emitter::put(e.code, Op_FAdd, {t_f32, res, mul, c_bias});
     uint32_t p_b    = e.id(); Emitter::putv(e.code, Op_AccessChain, {t_ptr_sb_f32, p_b, v_out, c_u0, gidx});
     Emitter::put(e.code, Op_Store, {p_b, res});
+    Emitter::put(e.code, Op_Return, {});
+    Emitter::put(e.code, Op_FunctionEnd, {});
+
+    return e.assemble();
+}
+
+std::vector<uint32_t> build_compute_compare_uvec4() {
+    Emitter e;
+
+    const uint32_t t_void = e.id(), t_fn = e.id(), t_bool = e.id(), t_u32 = e.id();
+    const uint32_t t_v3u = e.id(), t_v4u = e.id(), t_v4bool = e.id();
+    const uint32_t t_ptr_in_v3u = e.id(), v_gid = e.id();
+    const uint32_t t_rta = e.id(), t_buffer = e.id(), t_ptr_buffer = e.id();
+    const uint32_t v_a = e.id(), v_b = e.id(), v_flag = e.id();
+    const uint32_t t_ptr_buffer_u32 = e.id(), t_ptr_buffer_v4u = e.id();
+    const uint32_t t_push = e.id(), t_ptr_push = e.id(), v_push = e.id();
+    const uint32_t t_ptr_push_u32 = e.id();
+    const uint32_t c_u0 = e.id(), c_u1 = e.id(), c_scope_device = e.id();
+    const uint32_t c_semantics_none = e.id();
+    const uint32_t f_main = e.id(), lbl_entry = e.id(), lbl_compare = e.id();
+    const uint32_t lbl_different = e.id(), lbl_equal = e.id(), lbl_done = e.id();
+
+    Emitter::put(e.caps, Op_Capability, {Cap_Shader});
+    Emitter::put(e.mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
+    {
+        std::vector<uint32_t> o{Exec_GLCompute, f_main};
+        push_string(o, "main");
+        o.push_back(v_gid);
+        Emitter::putv(e.entry, Op_EntryPoint, o);
+    }
+    Emitter::put(e.exec, Op_ExecutionMode, {f_main, EM_LocalSize, 256, 1, 1});
+
+    Emitter::put(e.deco, Op_Decorate, {v_gid, Dec_BuiltIn, BI_GlobalInvocationId});
+    Emitter::put(e.deco, Op_Decorate, {t_rta, Dec_ArrayStride, 16});
+    Emitter::put(e.deco, Op_MemberDecorate, {t_buffer, 0, Dec_Offset, 0});
+    Emitter::put(e.deco, Op_Decorate, {t_buffer, Dec_Block});
+    for (const auto [variable, binding] :
+         {std::pair{v_a, 0u}, std::pair{v_b, 1u}, std::pair{v_flag, 2u}}) {
+        Emitter::put(e.deco, Op_Decorate, {variable, Dec_DescriptorSet, 0});
+        Emitter::put(e.deco, Op_Decorate, {variable, Dec_Binding, binding});
+    }
+    Emitter::put(e.deco, Op_MemberDecorate, {t_push, 0, Dec_Offset, 0});
+    Emitter::put(e.deco, Op_Decorate, {t_push, Dec_Block});
+
+    Emitter::put(e.types, Op_TypeVoid, {t_void});
+    Emitter::put(e.types, Op_TypeFunction, {t_fn, t_void});
+    Emitter::put(e.types, Op_TypeInt, {t_u32, 32, 0});
+    // OpTypeBool is opcode 20. Keep the tiny emitter's enum limited to opcodes shared by users.
+    Emitter::put(e.types, 20, {t_bool});
+    Emitter::put(e.types, Op_TypeVector, {t_v3u, t_u32, 3});
+    Emitter::put(e.types, Op_TypeVector, {t_v4u, t_u32, 4});
+    Emitter::put(e.types, Op_TypeVector, {t_v4bool, t_bool, 4});
+    Emitter::put(e.types, Op_TypePointer, {t_ptr_in_v3u, SC_Input, t_v3u});
+    Emitter::put(e.types, Op_Variable, {t_ptr_in_v3u, v_gid, SC_Input});
+    Emitter::put(e.types, Op_TypeRuntimeArray, {t_rta, t_v4u});
+    Emitter::put(e.types, Op_TypeStruct, {t_buffer, t_rta});
+    Emitter::put(e.types, Op_TypePointer, {t_ptr_buffer, SC_StorageBuffer, t_buffer});
+    Emitter::put(e.types, Op_Variable, {t_ptr_buffer, v_a, SC_StorageBuffer});
+    Emitter::put(e.types, Op_Variable, {t_ptr_buffer, v_b, SC_StorageBuffer});
+    Emitter::put(e.types, Op_Variable, {t_ptr_buffer, v_flag, SC_StorageBuffer});
+    Emitter::put(e.types, Op_TypePointer, {t_ptr_buffer_u32, SC_StorageBuffer, t_u32});
+    Emitter::put(e.types, Op_TypePointer, {t_ptr_buffer_v4u, SC_StorageBuffer, t_v4u});
+    Emitter::put(e.types, Op_TypeStruct, {t_push, t_u32});
+    Emitter::put(e.types, Op_TypePointer, {t_ptr_push, SC_PushConstant, t_push});
+    Emitter::put(e.types, Op_Variable, {t_ptr_push, v_push, SC_PushConstant});
+    Emitter::put(e.types, Op_TypePointer, {t_ptr_push_u32, SC_PushConstant, t_u32});
+    Emitter::put(e.types, Op_Constant, {t_u32, c_u0, 0});
+    Emitter::put(e.types, Op_Constant, {t_u32, c_u1, 1});
+    Emitter::put(e.types, Op_Constant, {t_u32, c_scope_device, 1});
+    Emitter::put(e.types, Op_Constant, {t_u32, c_semantics_none, 0});
+
+    Emitter::put(e.code, Op_Function, {t_void, f_main, FC_None, t_fn});
+    Emitter::put(e.code, Op_Label, {lbl_entry});
+    const uint32_t ld_gid = e.id();
+    Emitter::put(e.code, Op_Load, {t_v3u, ld_gid, v_gid});
+    const uint32_t index = e.id();
+    Emitter::put(e.code, Op_CompositeExtract, {t_u32, index, ld_gid, 0});
+    const uint32_t p_count = e.id();
+    Emitter::putv(e.code, Op_AccessChain, {t_ptr_push_u32, p_count, v_push, c_u0});
+    const uint32_t count = e.id();
+    Emitter::put(e.code, Op_Load, {t_u32, count, p_count});
+    const uint32_t in_range = e.id();
+    Emitter::put(e.code, Op_ULessThan, {t_bool, in_range, index, count});
+    Emitter::put(e.code, Op_SelectionMerge, {lbl_done, 0});
+    Emitter::put(e.code, Op_BranchConditional, {in_range, lbl_compare, lbl_done});
+
+    Emitter::put(e.code, Op_Label, {lbl_compare});
+    const uint32_t p_a = e.id();
+    Emitter::putv(e.code, Op_AccessChain, {t_ptr_buffer_v4u, p_a, v_a, c_u0, index});
+    const uint32_t a = e.id();
+    Emitter::put(e.code, Op_Load, {t_v4u, a, p_a});
+    const uint32_t p_b = e.id();
+    Emitter::putv(e.code, Op_AccessChain, {t_ptr_buffer_v4u, p_b, v_b, c_u0, index});
+    const uint32_t b = e.id();
+    Emitter::put(e.code, Op_Load, {t_v4u, b, p_b});
+    const uint32_t component_differences = e.id();
+    Emitter::put(e.code, Op_INotEqual, {t_v4bool, component_differences, a, b});
+    const uint32_t different = e.id();
+    Emitter::put(e.code, Op_Any, {t_bool, different, component_differences});
+    Emitter::put(e.code, Op_SelectionMerge, {lbl_equal, 0});
+    Emitter::put(e.code, Op_BranchConditional, {different, lbl_different, lbl_equal});
+
+    Emitter::put(e.code, Op_Label, {lbl_different});
+    // Fold baseline maintenance into the comparison. Identical results issue no large transfer;
+    // changed words update themselves while the flag preserves the CPU-visible reduction.
+    Emitter::put(e.code, Op_Store, {p_b, a});
+    const uint32_t p_flag = e.id();
+    Emitter::putv(e.code, Op_AccessChain,
+                  {t_ptr_buffer_u32, p_flag, v_flag, c_u0, c_u0});
+    const uint32_t old_flag = e.id();
+    Emitter::put(e.code, Op_AtomicExchange,
+                 {t_u32, old_flag, p_flag, c_scope_device, c_semantics_none, c_u1});
+    Emitter::put(e.code, Op_Branch, {lbl_equal});
+
+    Emitter::put(e.code, Op_Label, {lbl_equal});
+    Emitter::put(e.code, Op_Branch, {lbl_done});
+    Emitter::put(e.code, Op_Label, {lbl_done});
     Emitter::put(e.code, Op_Return, {});
     Emitter::put(e.code, Op_FunctionEnd, {});
 

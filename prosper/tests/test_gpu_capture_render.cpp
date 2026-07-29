@@ -919,6 +919,49 @@ int main() {
               "an absurd declaration is still bounded by the 64 MiB ceiling");
     }
 
+    // A cache ceiling is not a preallocation. Scale capable hosts/devices to 2 GiB so one large
+    // immutable atlas cannot evict the rest of a frame's hot set, while an 8 GiB machine retains the
+    // historical 1 GiB bound. Explicit overrides remain exact for diagnostics and constrained hosts.
+    {
+        constexpr uint64_t GiB = 1024ull * 1024ull * 1024ull;
+        using prosper::frontend::texture_decode_cache_limit_bytes;
+        CHECK(texture_decode_cache_limit_bytes(nullptr, 8ull * GiB) == 1ull * GiB,
+              "an 8 GiB host keeps the 1 GiB decoded-texture ceiling");
+        CHECK(texture_decode_cache_limit_bytes(nullptr, 16ull * GiB) == 2ull * GiB,
+              "a capable host admits the 2 GiB decoded-texture ceiling");
+        CHECK(texture_decode_cache_limit_bytes("512", 128ull * GiB) == 512ull * 1024ull * 1024ull,
+              "the decoded-texture MiB override takes precedence over host memory");
+        CHECK(prosper::test::persistent_texture_cache_budget_for_heap(8ull * GiB) == 1ull * GiB,
+              "an 8 GiB device keeps the 1 GiB sampled-image ceiling");
+        CHECK(prosper::test::persistent_texture_cache_budget_for_heap(16ull * GiB) == 2ull * GiB,
+              "a capable device admits the 2 GiB sampled-image ceiling");
+
+        using prosper::frontend::texture_decode_cache_candidate;
+        CHECK(texture_decode_cache_candidate(false, false, false, 1u, true, true),
+              "an ordinary supported guest 2D texture uses the decoded-texture cache");
+        CHECK(texture_decode_cache_candidate(false, false, false, 2u, true, true),
+              "a supported guest 3D volume uses the decoded-texture cache");
+        CHECK(!texture_decode_cache_candidate(false, false, false, 3u, true, true),
+              "a cube texture stays on its layer-aware decode path");
+        CHECK(!texture_decode_cache_candidate(false, true, false, 1u, true, true),
+              "a retained sampled-depth image bypasses guest-byte decode-cache work");
+        CHECK(!texture_decode_cache_candidate(true, false, false, 1u, true, true),
+              "a retained color image bypasses guest-byte decode-cache work");
+
+        using prosper::frontend::texture_source_snapshot_can_follow_watch;
+        CHECK(texture_source_snapshot_can_follow_watch(false, false, true, 4096u, 4096u),
+              "an exact encoded snapshot becomes redundant behind an armed write watch");
+        CHECK(!texture_source_snapshot_can_follow_watch(true, false, true, 0u, 4096u),
+              "decoded pixels that are also the exact source baseline remain retained");
+        CHECK(!texture_source_snapshot_can_follow_watch(false, true, true, 4096u, 4096u),
+              "validation audit mode retains the exact source baseline");
+        CHECK(!texture_source_snapshot_can_follow_watch(false, false, false, 4096u, 4096u),
+              "an unsupported write watch keeps exact source validation available");
+        CHECK(!texture_source_snapshot_can_follow_watch(false, false, true, 2048u, 4096u),
+              "a partial source snapshot is never discarded as a complete baseline");
+
+    }
+
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n"); return 0;
 }

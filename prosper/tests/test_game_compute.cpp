@@ -2,6 +2,7 @@
 #include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/shader_resources.hpp"
 #include "../src/gpu/tile.hpp"
+#include "../src/host/guest_write_watch.hpp"
 #include "live_compute.hpp"
 #include "seed_reprove.hpp"
 
@@ -15,12 +16,38 @@
 #include <limits>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
+
 using namespace prosper::gpu;
 
 static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { std::printf("FAIL: %s\n", msg); fails++; } } while (0)
 
 int main() {
+#ifdef _WIN32
+    _putenv_s("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB", "0");
+    _putenv_s("PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB", "1");
+#else
+    setenv("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB", "0", 1);
+    setenv("PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB", "1", 1);
+#endif
+    using prosper::frontend::ComputeImageCacheClass;
+    CHECK(prosper::frontend::compute_image_cache_default_minimum_bytes(
+              ComputeImageCacheClass::sampled) == 1024ull * 1024ull &&
+          prosper::frontend::compute_image_cache_default_minimum_bytes(
+              ComputeImageCacheClass::storage) == 4ull * 1024ull,
+          "sampled and storage images retain independent default cache crossovers");
+    CHECK(!prosper::frontend::compute_image_cache_default_eligible(
+              1024ull * 1024ull - 1, ComputeImageCacheClass::sampled) &&
+          prosper::frontend::compute_image_cache_default_eligible(
+              1024ull * 1024ull, ComputeImageCacheClass::sampled) &&
+          !prosper::frontend::compute_image_cache_default_eligible(
+              4ull * 1024ull - 1, ComputeImageCacheClass::storage) &&
+          prosper::frontend::compute_image_cache_default_eligible(
+              4ull * 1024ull, ComputeImageCacheClass::storage),
+          "image residency policy includes each crossover exactly without caching smaller inputs");
     CHECK(prosper::frontend::storage_writeback_can_tile_mapped_bytes(
               true, 27, false, false),
           "native tiled storage can feed mapped bytes directly to the tiler");
@@ -145,8 +172,10 @@ int main() {
     CHECK(direct_sampled_rtt_compatible(DataFormat::Unorm8, 4,
                                         LiveTargetPixelFormat::Rgba8Unorm) &&
           direct_sampled_rtt_compatible(DataFormat::Float16, 4,
-                                        LiveTargetPixelFormat::Rgba16Float),
-          "renderer RTT direct bind accepts exact RGBA8 and RGBA16F sampled views");
+                                        LiveTargetPixelFormat::Rgba16Float) &&
+          direct_sampled_rtt_compatible(DataFormat::Float10_11_11, 3,
+                                        LiveTargetPixelFormat::R11G11B10Float),
+          "renderer RTT direct bind accepts exact RGBA8, RGBA16F, and R11G11B10 views");
     CHECK(!direct_sampled_rtt_compatible(DataFormat::Float16, 4,
                                          LiveTargetPixelFormat::Rgba8Unorm) &&
           !direct_sampled_rtt_compatible(DataFormat::Unorm8, 4,
@@ -154,6 +183,59 @@ int main() {
           !direct_sampled_rtt_compatible(DataFormat::Float16, 2,
                                          LiveTargetPixelFormat::Rgba16Float),
           "renderer RTT direct bind rejects format conversion and component aliases");
+    // A renderer-owned target is stored canonically as RGBA8 or RGBA16F, while a later compute
+    // descriptor can alias it as packed R11G11B10. Reconstruct the descriptor-visible words rather
+    // than sampling stale guest backing or dropping the dispatch.
+    {
+        auto rgba8 = std::make_shared<std::vector<uint8_t>>(std::initializer_list<uint8_t>{
+            255, 0, 128, 17, 0, 255, 64, 99,
+        });
+        LiveTargetSnapshot snapshot8{2, 1, LiveTargetPixelFormat::Rgba8Unorm, rgba8};
+        std::vector<uint8_t> packed8(8);
+        CHECK(prosper::frontend::pack_live_target_r11g11b10(
+                  snapshot8, packed8.data(), packed8.size()),
+              "RGBA8 renderer target reconstructs as two packed R11G11B10 texels");
+        uint32_t words8[2]{};
+        if (packed8.size() == sizeof(words8)) std::memcpy(words8, packed8.data(), sizeof(words8));
+        CHECK((words8[0] & 0x7ffu) == float_to_f11(1.0f) &&
+              ((words8[0] >> 11) & 0x7ffu) == float_to_f11(0.0f) &&
+              ((words8[0] >> 22) & 0x3ffu) == float_to_f10(128.0f / 255.0f),
+              "RGBA8 reconstruction quantizes RGB through the unsigned 11/11/10 float contract");
+
+        auto rgba16 = std::make_shared<std::vector<uint8_t>>(8, 0);
+        const float values[4] = {4.0f, 0.5f, 2.0f, 1.0f};
+        for (uint32_t c = 0; c < 4; ++c) {
+            const uint16_t half = float_to_half(values[c]);
+            std::memcpy(rgba16->data() + c * 2, &half, sizeof(half));
+        }
+        LiveTargetSnapshot snapshot16{1, 1, LiveTargetPixelFormat::Rgba16Float, rgba16};
+        std::vector<uint8_t> packed16(4);
+        CHECK(prosper::frontend::pack_live_target_r11g11b10(
+                  snapshot16, packed16.data(), packed16.size()),
+              "RGBA16F renderer target reconstructs as packed R11G11B10");
+        uint32_t word16 = 0;
+        if (packed16.size() == sizeof(word16)) std::memcpy(&word16, packed16.data(), sizeof(word16));
+        CHECK((word16 & 0x7ffu) == float_to_f11(4.0f) &&
+              ((word16 >> 11) & 0x7ffu) == float_to_f11(0.5f) &&
+              ((word16 >> 22) & 0x3ffu) == float_to_f10(2.0f),
+              "RGBA16F reconstruction preserves HDR RGB while discarding alpha");
+
+        auto native = std::make_shared<std::vector<uint8_t>>(std::initializer_list<uint8_t>{
+            0x78, 0x56, 0x34, 0x12,
+        });
+        LiveTargetSnapshot native_snapshot{
+            1, 1, LiveTargetPixelFormat::R11G11B10Float, native};
+        std::vector<uint8_t> native_copy(4);
+        CHECK(prosper::frontend::pack_live_target_r11g11b10(
+                  native_snapshot, native_copy.data(), native_copy.size()) &&
+              native_copy == *native,
+              "native R11G11B10 renderer target remains bit-exact through CPU fallback");
+
+        snapshot16.pixels = std::make_shared<std::vector<uint8_t>>(7, 0);
+        CHECK(!prosper::frontend::pack_live_target_r11g11b10(
+                  snapshot16, packed16.data(), packed16.size()),
+              "R11G11B10 reconstruction rejects a malformed renderer snapshot");
+    }
 
     // #1127: the seed-skip re-prove counter (seed_reprove.hpp). interval 0 disables (old prove-once);
     // interval N fires on the Nth fast-skip and resets, so a Full-cached data-dependent shader is
@@ -397,6 +479,115 @@ int main() {
     CHECK(unchanged_write_notifications == 1,
           "idempotent compute writes still invalidate divergent renderer-resident state");
 
+    // Plucky Squire binds the same 32 MiB writable lighting buffer to consecutive kernels even
+    // when their output is byte-identical to the previous frame. Exercise the production cache at
+    // its one-MiB retention threshold: the second dispatch can use the exact GPU-side baseline,
+    // while a later external guest mutation must defeat that shortcut and be repaired normally.
+    {
+        constexpr uint32_t large_buffer_bytes = 1u << 20;
+        constexpr size_t large_words = large_buffer_bytes / sizeof(uint32_t);
+        std::vector<uint32_t> large_result_storage;
+        uint32_t* large_result = nullptr;
+#if defined(__linux__)
+        void* large_mapping = mmap(nullptr, large_buffer_bytes, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(large_mapping != MAP_FAILED, "map large writable compute-buffer regression range");
+        if (large_mapping == MAP_FAILED) return fails ? fails : 1;
+        large_result = static_cast<uint32_t*>(large_mapping);
+        prosper::host::guest_write_watch_set_fault_onstack(true);
+        prosper::host::guest_write_watch_notify_direct_mapping_added(
+            reinterpret_cast<uint64_t>(large_result), large_buffer_bytes, 0x6b0000,
+            0x3 /* SCE CPU_READ|CPU_WRITE */);
+#else
+        large_result_storage.resize(large_words);
+        large_result = large_result_storage.data();
+#endif
+#if defined(__linux__)
+        // The ordinary CPU-comparison fallback is used below the persistent-buffer threshold. It
+        // also has an exact unchanged result and must use the byte-preserving notification, not
+        // merely the retained GPU-comparator path exercised below.
+        std::fill_n(large_result, buffer.size / sizeof(uint32_t), 0xccccccccu);
+        ShaderResource watched_small_buffer = buffer;
+        watched_small_buffer.gpu_addr = reinterpret_cast<uint64_t>(large_result);
+        ShaderResourceTable watched_small_rt;
+        watched_small_rt.resources.push_back(watched_small_buffer);
+        ComputeItem watched_small_item = item;
+        watched_small_item.resources = std::make_shared<ShaderResourceTable>(watched_small_rt);
+        CHECK(prosper::frontend::execute_live_compute_items({watched_small_item}),
+              "small writable buffer establishes its CPU-comparison result");
+        auto unchanged_small_watch = prosper::host::GuestWriteWatch::create(
+            reinterpret_cast<uint64_t>(large_result), buffer.size);
+        CHECK(prosper::frontend::execute_live_compute_items({watched_small_item}),
+              "small writable buffer repeats through CPU comparison");
+        CHECK(static_cast<bool>(unchanged_small_watch) &&
+                  unchanged_small_watch.query() ==
+                      prosper::host::GuestWriteWatchQuery::Unchanged,
+              "CPU-identical production dispatch keeps guest-byte watches clean");
+        unchanged_small_watch.reset();
+#endif
+        std::fill_n(large_result, large_words, 0xababababu);
+        ShaderResource large_buffer = buffer;
+        large_buffer.gpu_addr = reinterpret_cast<uint64_t>(large_result);
+        large_buffer.size = large_buffer_bytes;
+        ShaderResourceTable large_rt;
+        large_rt.resources.push_back(large_buffer);
+        ComputeItem large_item = item;
+        large_item.resources = std::make_shared<ShaderResourceTable>(large_rt);
+        large_item.code_addr = 0x401aec210;
+
+        CHECK(prosper::frontend::execute_live_compute_items({large_item}),
+              "large writable buffer dispatch establishes an exact retained result");
+        const std::vector<uint32_t> large_expected(large_result, large_result + large_words);
+        const uint64_t buffer_skips_before =
+            prosper::frontend::live_compute_buffer_gpu_result_skips();
+#if defined(__linux__)
+        auto unchanged_result_watch = prosper::host::GuestWriteWatch::create(
+            reinterpret_cast<uint64_t>(large_result), large_buffer_bytes);
+        CHECK(static_cast<bool>(unchanged_result_watch) &&
+                  unchanged_result_watch.query() ==
+                      prosper::host::GuestWriteWatchQuery::Unchanged,
+              "arm guest-byte watch around retained compute-buffer result");
+#endif
+        uint32_t large_repeat_notifications = 0;
+        set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+            if (addr == large_buffer.gpu_addr && size == large_buffer.size)
+                ++large_repeat_notifications;
+        });
+        CHECK(prosper::frontend::execute_live_compute_items({large_item}),
+              "large writable buffer repeats against its exact GPU baseline");
+        set_guest_gpu_write_observer({});
+        CHECK(std::equal(large_result, large_result + large_words, large_expected.begin()) &&
+                  large_repeat_notifications == 1,
+              "GPU-identical buffer output preserves bytes and architectural invalidation");
+        CHECK(prosper::frontend::live_compute_buffer_gpu_result_skips() > buffer_skips_before,
+              "large idempotent buffer takes the exact GPU result-comparison fast path");
+#if defined(__linux__)
+        CHECK(unchanged_result_watch.query() ==
+                  prosper::host::GuestWriteWatchQuery::Unchanged,
+              "GPU-identical production dispatch keeps guest-byte watches clean");
+        unchanged_result_watch.reset();
+#endif
+
+        large_result[0] ^= 0xffffffffu;
+        uint32_t large_repair_notifications = 0;
+        set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+            if (addr == large_buffer.gpu_addr && size == large_buffer.size)
+                ++large_repair_notifications;
+        });
+        CHECK(prosper::frontend::execute_live_compute_items({large_item}),
+              "externally changed buffer reruns with exact source validation");
+        set_guest_gpu_write_observer({});
+        CHECK(std::equal(large_result, large_result + large_words, large_expected.begin()) &&
+                  large_repair_notifications == 1,
+              "external buffer mutation forces exact guest repair and invalidation");
+#if defined(__linux__)
+        prosper::host::guest_write_watch_notify_direct_mapping_removed(
+            reinterpret_cast<uint64_t>(large_result), large_buffer_bytes);
+        prosper::host::guest_write_watch_set_fault_onstack(false);
+        munmap(large_result, large_buffer_bytes);
+#endif
+    }
+
     std::fill(result.begin(), result.end(), 0xeeeeeeee);
     item.user_sgprs = alternate_config.user_sgprs;
     CHECK(prosper::frontend::execute_live_compute_items({item}),
@@ -529,6 +720,20 @@ int main() {
         0xF0000F08u, 0x00000004u, 0xBF8C3F70u,
         0xF0200F08u, 0x00020004u, 0xBF810000u,
     };
+    static const uint32_t image_copy_3d[] = {
+        0x7E080300u,             // v4 = x from the shell input
+        0x7E0A0280u,             // v5 = y = 0
+        0x7E0C0280u,             // v6 = z = 0
+        0xF0000F08u, 0x00000004u, 0xBF8C3F70u,
+        0xF0200F08u, 0x00020004u, 0xBF810000u,
+    };
+    static const uint32_t image_copy_2d_array[] = {
+        0x7E080300u,             // v4 = x from the shell input
+        0x7E0A0280u,             // v5 = y = 0
+        0x7E0C0282u,             // v6 = array layer 2
+        0xF0000F28u, 0x00000004u, 0xBF8C3F70u,
+        0xF0200F28u, 0x00020004u, 0xBF810000u,
+    };
     const uint32_t W = 64;
     std::vector<uint32_t> lane_index(W);
     for (uint32_t i = 0; i < W; i++) lane_index[i] = i;      // shell input: v0 = input[gid] = gid
@@ -649,6 +854,38 @@ int main() {
         for (uint32_t i = 0; i < s.size(); i++) s[i] = (uint8_t)(i * 29 + 3);
         CHECK(run_format_copy(DataFormat::Uint16, 1, 2, s) == s,
               "Uint16x1 storage copy round-trips guest bytes bit-exact (#590)");
+    }
+    {   // Unorm16 x1 (fmt=4): normalized conversion preserves every quantized source value
+        std::vector<uint8_t> s(W * 2);
+        for (uint32_t t = 0; t < W; ++t) {
+            const uint16_t value = static_cast<uint16_t>(t * 1040u);
+            std::memcpy(&s[t * 2], &value, sizeof(value));
+        }
+        CHECK(run_format_copy(DataFormat::Unorm16, 1, 2, s) == s,
+              "Unorm16x1 storage copy round-trips normalized guest values");
+    }
+    {   // Snorm8 x1 (fmt=9): -128 and -127 both represent -1 and write back canonically as -127
+        const int8_t values[] = {-128, -127, -96, -64, -1, 0, 1, 63, 96, 127};
+        std::vector<uint8_t> s(W), expected(W);
+        for (uint32_t t = 0; t < W; ++t) {
+            const int8_t value = values[t % std::size(values)];
+            s[t] = static_cast<uint8_t>(value);
+            expected[t] = static_cast<uint8_t>(value == -128 ? -127 : value);
+        }
+        CHECK(run_format_copy(DataFormat::Snorm8, 1, 1, s) == expected,
+              "Snorm8x1 storage copy normalizes and canonicalizes the negative endpoint");
+    }
+    {   // Snorm16 x1 (fmt=5): The Plucky Squire uses this storage surface in its title path
+        const int16_t values[] = {-32768, -32767, -24576, -16384, -1, 0, 1, 16383, 24576, 32767};
+        std::vector<uint8_t> s(W * 2), expected(W * 2);
+        for (uint32_t t = 0; t < W; ++t) {
+            const int16_t value = values[t % std::size(values)];
+            const int16_t canonical = value == -32768 ? -32767 : value;
+            std::memcpy(&s[t * 2], &value, sizeof(value));
+            std::memcpy(&expected[t * 2], &canonical, sizeof(canonical));
+        }
+        CHECK(run_format_copy(DataFormat::Snorm16, 1, 2, s) == expected,
+              "Snorm16x1 storage copy normalizes and canonicalizes the negative endpoint");
     }
     {   // Unorm2_10_10_10 x4 (fmt=21): packed 10/10/10/2, quantized word stable under unpack->pack
         std::vector<uint8_t> s(W * 4);
@@ -810,6 +1047,333 @@ int main() {
         std::copy_n(tiled2d_src_linear.begin(), W * 4, tiled2d_expected.begin());
         CHECK(tiled2d_result == tiled2d_expected,
               "tiled 2D storage-image writeback matches the linear reference byte-exactly");
+    }
+
+    // Some descriptors declare a one-layer 2D array while the MIMG instruction itself uses DIM=2D.
+    // Preserve that established byte-identical lowering instead of creating a 2D-array Vulkan view
+    // that disagrees with the generated SPIR-V image type.
+    std::fill(tiled2d_dst.begin(), tiled2d_dst.end(), 0);
+    tile_surface(tiled2d_dst.data(), tiled2d_dst_initial.data(), W, TILED_H,
+                 tiled2d_mode, 0, 4);
+    ShaderResourceTable single_layer_array_rt = tiled2d_rt;
+    for (ShaderResource& resource : single_layer_array_rt.resources)
+        if (resource.binding == 4 || resource.binding == 5) resource.img_dim = 5;
+    const std::vector<uint32_t> single_layer_array_spirv = recompile_valu(
+        image_copy_2d, std::size(image_copy_2d), 1, 0, &single_layer_array_rt);
+    CHECK(!single_layer_array_spirv.empty(),
+          "DIM=2D kernel recompiles over a byte-identical one-layer array descriptor");
+    if (!single_layer_array_spirv.empty()) {
+        ComputeItem item;
+        item.spirv = single_layer_array_spirv;
+        item.resources = std::make_shared<ShaderResourceTable>(single_layer_array_rt);
+        item.launch.threads_x = W;
+        item.launch.local_x = 64;
+        item.launch.groups_x = 1;
+        item.launch.local_y = item.launch.local_z = 1;
+        item.launch.groups_y = item.launch.groups_z = 1;
+        item.code_addr = 0x590599;
+        CHECK(prosper::frontend::execute_live_compute_items({item}),
+              "one-layer array descriptor executes through its DIM=2D Vulkan view");
+        std::vector<uint8_t> actual(W * TILED_H * 4, 0);
+        detile_surface(actual.data(), tiled2d_dst.data(), W, TILED_H, tiled2d_mode, 0, 4);
+        std::vector<uint8_t> expected = tiled2d_dst_initial;
+        std::copy_n(tiled2d_src_linear.begin(), W * 4, expected.begin());
+        CHECK(actual == expected,
+              "one-layer array descriptor retains byte-exact 2D storage writeback");
+    }
+
+    // A guest allocation may be cube-shaped while the instruction and generated SPIR-V deliberately
+    // view only face zero as a plain 2D texture. This is a view contract, not a request to upload all
+    // six faces into a 2D Vulkan image. Plucky's lighting setup uses exactly this form.
+    std::vector<uint8_t> cube_faces(tiled2d_bytes * 6u, 0xa7);
+    std::copy(tiled2d_src.begin(), tiled2d_src.end(), cube_faces.begin());
+    std::fill(tiled2d_dst.begin(), tiled2d_dst.end(), 0);
+    tile_surface(tiled2d_dst.data(), tiled2d_dst_initial.data(), W, TILED_H,
+                 tiled2d_mode, 0, 4);
+    ShaderResourceTable cube_face_rt = tiled2d_rt;
+    for (ShaderResource& resource : cube_face_rt.resources) {
+        if (resource.binding == 4) {
+            resource.cls = ResourceClass::Texture;
+            resource.img_dim = 3;
+            resource.depth = 6;
+            resource.size = static_cast<uint32_t>(cube_faces.size());
+            resource.gpu_addr = reinterpret_cast<uint64_t>(cube_faces.data());
+            resource.swizzle[0] = 4;
+            resource.swizzle[1] = 5;
+            resource.swizzle[2] = 6;
+            resource.swizzle[3] = 7;
+        } else if (resource.binding == 5) {
+            resource.gpu_addr = reinterpret_cast<uint64_t>(tiled2d_dst.data());
+        }
+    }
+    const std::vector<uint32_t> cube_face_spirv = recompile_valu(
+        image_copy_2d, std::size(image_copy_2d), 1, 0, &cube_face_rt);
+    CHECK(!cube_face_spirv.empty(), "DIM=2D kernel recompiles over a cube allocation");
+    const auto cube_face_report = validate_spirv_descriptor_interface(
+        cube_face_spirv, &cube_face_rt, 0, SpirvShaderStage::Compute);
+    const auto cube_face_descriptor = std::find_if(
+        cube_face_report.descriptors.begin(), cube_face_report.descriptors.end(),
+        [](const SpirvDescriptorBinding& descriptor) { return descriptor.binding == 4; });
+    CHECK(cube_face_report.ok() && cube_face_descriptor != cube_face_report.descriptors.end() &&
+              cube_face_descriptor->image_dim == 1 && !cube_face_descriptor->image_arrayed,
+          "generated shader reflects the cube allocation binding as a non-array 2D image");
+    if (!cube_face_spirv.empty()) {
+        ComputeItem item;
+        item.spirv = cube_face_spirv;
+        item.resources = std::make_shared<ShaderResourceTable>(cube_face_rt);
+        item.launch.threads_x = W;
+        item.launch.local_x = 64;
+        item.launch.groups_x = 1;
+        item.launch.local_y = item.launch.local_z = 1;
+        item.launch.groups_y = item.launch.groups_z = 1;
+        item.code_addr = 0x59059a;
+        CHECK(prosper::frontend::execute_live_compute_items({item}),
+              "production backend binds cube face zero through the shader-declared 2D view");
+        std::vector<uint8_t> actual(W * TILED_H * 4, 0);
+        detile_surface(actual.data(), tiled2d_dst.data(), W, TILED_H, tiled2d_mode, 0, 4);
+        std::vector<uint8_t> expected = tiled2d_dst_initial;
+        std::copy_n(tiled2d_src_linear.begin(), W * 4, expected.begin());
+        CHECK(actual == expected,
+              "cube face zero reaches the 2D shader view without reading later faces");
+    }
+
+    // Plucky's lighting producer writes a true 3D SW_64KB_S RGBA16 surface. Exercise the full
+    // Vulkan storage-image path, including S3 detile/upload and readback/retile, while preserving
+    // every voxel outside the row touched by this small copy kernel.
+    constexpr uint32_t VOLUME_W = W, VOLUME_H = 32, VOLUME_D = 32;
+    constexpr uint32_t volume_mode = static_cast<uint32_t>(TileMode::Sw64KbS);
+    constexpr uint32_t volume_bpe = 8;
+    const size_t volume_linear_bytes =
+        static_cast<size_t>(VOLUME_W) * VOLUME_H * VOLUME_D * volume_bpe;
+    std::vector<uint8_t> volume_src_linear(volume_linear_bytes);
+    std::vector<uint8_t> volume_dst_initial(volume_linear_bytes);
+    for (size_t i = 0; i < volume_linear_bytes / 2; ++i) {
+        const uint16_t src_value = static_cast<uint16_t>((i * 313u) & 0xffffu);
+        const uint16_t dst_value = static_cast<uint16_t>((i * 197u + 17u) & 0xffffu);
+        std::memcpy(volume_src_linear.data() + i * 2, &src_value, 2);
+        std::memcpy(volume_dst_initial.data() + i * 2, &dst_value, 2);
+    }
+    const size_t volume_tiled_bytes = tiled_volume_bytes(
+        VOLUME_W, VOLUME_H, VOLUME_D, volume_mode, volume_bpe);
+    std::vector<uint8_t> volume_src(volume_tiled_bytes, 0);
+    std::vector<uint8_t> volume_dst(volume_tiled_bytes, 0);
+    tile_volume(volume_src.data(), volume_src.size(), volume_src_linear.data(),
+                VOLUME_W, VOLUME_H, VOLUME_D, volume_mode, volume_bpe);
+    tile_volume(volume_dst.data(), volume_dst.size(), volume_dst_initial.data(),
+                VOLUME_W, VOLUME_H, VOLUME_D, volume_mode, volume_bpe);
+    ShaderResourceTable volume_rt = tiled2d_rt;
+    for (ShaderResource& resource : volume_rt.resources) {
+        if (resource.binding != 4 && resource.binding != 5) continue;
+        resource.img_dim = 2;
+        resource.format = DataFormat::Unorm16;
+        resource.num_components = 4;
+        resource.width = VOLUME_W;
+        resource.height = VOLUME_H;
+        resource.depth = VOLUME_D;
+        resource.tile_mode = volume_mode;
+        resource.size = static_cast<uint32_t>(volume_tiled_bytes);
+        resource.gpu_addr = reinterpret_cast<uint64_t>(
+            resource.binding == 4 ? volume_src.data() : volume_dst.data());
+    }
+    const std::vector<uint32_t> volume_spirv = recompile_valu(
+        image_copy_3d, std::size(image_copy_3d), 1, 0, &volume_rt);
+    CHECK(!volume_spirv.empty(), "SW_64KB_S3 storage-volume copy kernel recompiles");
+    if (!volume_spirv.empty()) {
+        ComputeItem volume_item;
+        volume_item.spirv = volume_spirv;
+        volume_item.resources = std::make_shared<ShaderResourceTable>(volume_rt);
+        volume_item.launch.threads_x = VOLUME_W;
+        volume_item.launch.local_x = 64;
+        volume_item.launch.groups_x = 1;
+        volume_item.launch.local_y = volume_item.launch.local_z = 1;
+        volume_item.launch.groups_y = volume_item.launch.groups_z = 1;
+        volume_item.code_addr = 0x306a150000;
+        CHECK(prosper::frontend::execute_live_compute_items({volume_item}),
+              "production backend executes an SW_64KB_S3 storage-volume dispatch");
+        std::vector<uint8_t> volume_result(volume_linear_bytes, 0);
+        detile_volume(volume_result.data(), volume_dst.data(), volume_dst.size(),
+                      VOLUME_W, VOLUME_H, VOLUME_D, volume_mode, volume_bpe);
+        std::vector<uint8_t> volume_expected = volume_dst_initial;
+        std::copy_n(volume_src_linear.begin(), VOLUME_W * volume_bpe,
+                    volume_expected.begin());
+        CHECK(volume_result == volume_expected,
+              "S3 writeback updates one row and preserves all untouched 3D voxels");
+
+        // Renderer ownership is a concrete 2D image identity, not merely an address. Simulate a
+        // stale/recycled 2D cache entry at the volume destination and require the layered descriptor
+        // to use its valid guest backing without trying to read an impossible 2D snapshot.
+        tile_volume(volume_dst.data(), volume_dst.size(), volume_dst_initial.data(),
+                    VOLUME_W, VOLUME_H, VOLUME_D, volume_mode, volume_bpe);
+        const uint64_t volume_dst_addr = reinterpret_cast<uint64_t>(volume_dst.data());
+        bool layered_reader_called = false;
+        set_live_target_query(
+            [volume_dst_addr](uint64_t addr) { return addr == volume_dst_addr; });
+        set_live_target_reader(
+            [&](uint64_t, LiveTargetSnapshot&) {
+                layered_reader_called = true;
+                return false;
+            });
+        CHECK(prosper::frontend::execute_live_compute_items({volume_item}),
+              "layered resource executes when its base aliases a cached 2D render target");
+        std::fill(volume_result.begin(), volume_result.end(), 0);
+        detile_volume(volume_result.data(), volume_dst.data(), volume_dst.size(),
+                      VOLUME_W, VOLUME_H, VOLUME_D, volume_mode, volume_bpe);
+        CHECK(!layered_reader_called && volume_result == volume_expected,
+              "3D descriptor rejects address-only 2D ownership and preserves guest-backed voxels");
+        set_live_target_reader({});
+        set_live_target_query({});
+    }
+
+    // A selected mip of a 2D array is not stored as selected-level0, selected-level1, ... . Every
+    // array slice owns a complete tail-first mip chain. Exercise a real DIM=2D_ARRAY Vulkan image,
+    // seed all three selected subresources through their stride/offset, modify layer two, then prove
+    // writeback preserves the other layers and every byte outside the selected level.
+    constexpr uint32_t ARRAY_LAYERS = 3;
+    constexpr uint32_t ARRAY_BASE_W = W * 2;
+    constexpr uint32_t ARRAY_BASE_H = TILED_H * 2;
+    constexpr uint32_t ARRAY_MAX_MIP = 4;
+    constexpr uint32_t ARRAY_LEVEL = 1;
+    const TiledMipLevelLayout array_level = tiled_mip_level_layout(
+        ARRAY_BASE_W, ARRAY_BASE_H, 4, tiled2d_mode, ARRAY_MAX_MIP, ARRAY_LEVEL);
+    const size_t array_stride = tiled_mip_chain_bytes(
+        ARRAY_BASE_W, ARRAY_BASE_H, 4, tiled2d_mode, ARRAY_MAX_MIP);
+    const size_t array_selected_bytes = tiled_surface_bytes(W, TILED_H, tiled2d_mode, 0, 4);
+    std::vector<uint8_t> array_src(array_stride * ARRAY_LAYERS, 0x31);
+    std::vector<uint8_t> array_dst(array_stride * ARRAY_LAYERS, 0xA7);
+    std::vector<std::vector<uint8_t>> array_src_linear(
+        ARRAY_LAYERS, std::vector<uint8_t>(W * TILED_H * 4));
+    std::vector<std::vector<uint8_t>> array_dst_initial(
+        ARRAY_LAYERS, std::vector<uint8_t>(W * TILED_H * 4));
+    for (uint32_t layer = 0; layer < ARRAY_LAYERS; ++layer) {
+        for (size_t i = 0; i < array_src_linear[layer].size(); ++i) {
+            array_src_linear[layer][i] = static_cast<uint8_t>(i * 17 + layer * 53 + 5);
+            array_dst_initial[layer][i] = static_cast<uint8_t>(i * 29 + layer * 71 + 11);
+        }
+        tile_surface(array_src.data() + layer * array_stride + array_level.byte_offset,
+                     array_src_linear[layer].data(), W, TILED_H, tiled2d_mode, 0, 4);
+        tile_surface(array_dst.data() + layer * array_stride + array_level.byte_offset,
+                     array_dst_initial[layer].data(), W, TILED_H, tiled2d_mode, 0, 4);
+    }
+    const std::vector<uint8_t> array_dst_outside_before = array_dst;
+    ShaderResourceTable array_rt = tiled2d_rt;
+    for (ShaderResource& resource : array_rt.resources) {
+        if (resource.binding != 4 && resource.binding != 5) continue;
+        resource.img_dim = 5;
+        resource.depth = ARRAY_LAYERS;
+        resource.size = W * TILED_H * ARRAY_LAYERS * 4;
+        resource.layer_stride_bytes = static_cast<uint32_t>(array_stride);
+        resource.layer_mip_offset_bytes = static_cast<uint32_t>(array_level.byte_offset);
+        resource.gpu_addr = reinterpret_cast<uint64_t>(
+            resource.binding == 4 ? array_src.data() : array_dst.data());
+    }
+    const std::vector<uint32_t> array_spirv = recompile_valu(
+        image_copy_2d_array, std::size(image_copy_2d_array), 1, 0, &array_rt);
+    CHECK(array_level.supported && !array_level.in_tail && array_stride != 0 &&
+              !array_spirv.empty(),
+          "selected-mip 2D-array storage copy recompiles with a proven slice layout");
+    if (!array_spirv.empty()) {
+        ComputeItem array_item;
+        array_item.spirv = array_spirv;
+        array_item.resources = std::make_shared<ShaderResourceTable>(array_rt);
+        array_item.launch.threads_x = W;
+        array_item.launch.local_x = 64;
+        array_item.launch.groups_x = 1;
+        array_item.launch.local_y = array_item.launch.local_z = 1;
+        array_item.launch.groups_y = array_item.launch.groups_z = 1;
+        array_item.code_addr = 0x590597;
+        CHECK(prosper::frontend::execute_live_compute_items({array_item}),
+              "production backend executes a selected-mip 2D-array storage dispatch");
+        bool selected_levels_exact = true;
+        for (uint32_t layer = 0; layer < ARRAY_LAYERS; ++layer) {
+            std::vector<uint8_t> actual(W * TILED_H * 4, 0);
+            detile_surface(actual.data(),
+                           array_dst.data() + layer * array_stride + array_level.byte_offset,
+                           W, TILED_H, tiled2d_mode, 0, 4);
+            std::vector<uint8_t> expected = array_dst_initial[layer];
+            if (layer == 2)
+                std::copy_n(array_src_linear[2].begin(), W * 4, expected.begin());
+            selected_levels_exact &= actual == expected;
+        }
+        CHECK(selected_levels_exact,
+              "array writeback updates addressed layer two and preserves sibling selected mips");
+        bool outside_unchanged = true;
+        for (uint32_t layer = 0; layer < ARRAY_LAYERS; ++layer) {
+            const size_t selected_begin = layer * array_stride + array_level.byte_offset;
+            const size_t selected_end = selected_begin + array_selected_bytes;
+            for (size_t i = layer * array_stride; i < (layer + 1) * array_stride; ++i)
+                if ((i < selected_begin || i >= selected_end) &&
+                    array_dst[i] != array_dst_outside_before[i])
+                    outside_unchanged = false;
+        }
+        CHECK(outside_unchanged,
+              "array writeback leaves sibling mips and inter-level padding byte-exact");
+    }
+
+    // Linear mip chains use a 256-byte-aligned row pitch independently inside every slice. Use a
+    // 65-pixel selected level (260 tight bytes, 512-byte guest pitch) so a bulk tight memcpy would
+    // visibly cross both row and layer boundaries. The exact-backing comparison also proves that
+    // row padding and sibling levels survive writeback.
+    constexpr uint32_t LINEAR_W = W + 1;
+    const TiledMipLevelLayout linear_array_level = tiled_mip_level_layout(
+        LINEAR_W * 2, ARRAY_BASE_H, 4, 0, ARRAY_MAX_MIP, ARRAY_LEVEL);
+    const size_t linear_array_stride = tiled_mip_chain_bytes(
+        LINEAR_W * 2, ARRAY_BASE_H, 4, 0, ARRAY_MAX_MIP);
+    const size_t linear_array_pitch = linear_sampled_row_pitch(LINEAR_W, 4);
+    std::vector<uint8_t> linear_array_src(linear_array_stride * ARRAY_LAYERS, 0x43);
+    std::vector<uint8_t> linear_array_dst(linear_array_stride * ARRAY_LAYERS, 0xB9);
+    std::vector<uint8_t> linear_array_expected = linear_array_dst;
+    for (uint32_t layer = 0; layer < ARRAY_LAYERS; ++layer) {
+        for (uint32_t y = 0; y < TILED_H; ++y) {
+            uint8_t* src_row = linear_array_src.data() + layer * linear_array_stride +
+                linear_array_level.byte_offset + y * linear_array_pitch;
+            uint8_t* dst_row = linear_array_dst.data() + layer * linear_array_stride +
+                linear_array_level.byte_offset + y * linear_array_pitch;
+            for (uint32_t x = 0; x < LINEAR_W * 4; ++x) {
+                src_row[x] = static_cast<uint8_t>(x * 17 + y * 31 + layer * 59 + 3);
+                dst_row[x] = static_cast<uint8_t>(x * 23 + y * 37 + layer * 67 + 9);
+            }
+        }
+    }
+    linear_array_expected = linear_array_dst;
+    const size_t linear_array_layer_two = 2u * linear_array_stride;
+    std::memcpy(linear_array_expected.data() + linear_array_layer_two +
+                    linear_array_level.byte_offset,
+                linear_array_src.data() + linear_array_layer_two +
+                    linear_array_level.byte_offset,
+                W * 4);
+    ShaderResourceTable linear_array_rt = tiled2d_rt;
+    for (ShaderResource& resource : linear_array_rt.resources) {
+        if (resource.binding != 4 && resource.binding != 5) continue;
+        resource.img_dim = 5;
+        resource.width = LINEAR_W;
+        resource.height = TILED_H;
+        resource.depth = ARRAY_LAYERS;
+        resource.tile_mode = 0;
+        resource.size = LINEAR_W * TILED_H * ARRAY_LAYERS * 4;
+        resource.layer_stride_bytes = static_cast<uint32_t>(linear_array_stride);
+        resource.layer_mip_offset_bytes = static_cast<uint32_t>(linear_array_level.byte_offset);
+        resource.gpu_addr = reinterpret_cast<uint64_t>(
+            resource.binding == 4 ? linear_array_src.data() : linear_array_dst.data());
+    }
+    const std::vector<uint32_t> linear_array_spirv = recompile_valu(
+        image_copy_2d_array, std::size(image_copy_2d_array), 1, 0, &linear_array_rt);
+    CHECK(linear_array_level.supported && linear_array_stride != 0 &&
+              linear_array_pitch == 512 && !linear_array_spirv.empty(),
+          "linear selected-mip array exposes its aligned per-row and per-slice layout");
+    if (!linear_array_spirv.empty()) {
+        ComputeItem linear_array_item;
+        linear_array_item.spirv = linear_array_spirv;
+        linear_array_item.resources = std::make_shared<ShaderResourceTable>(linear_array_rt);
+        linear_array_item.launch.threads_x = W;
+        linear_array_item.launch.local_x = 64;
+        linear_array_item.launch.groups_x = 1;
+        linear_array_item.launch.local_y = linear_array_item.launch.local_z = 1;
+        linear_array_item.launch.groups_y = linear_array_item.launch.groups_z = 1;
+        linear_array_item.code_addr = 0x590598;
+        CHECK(prosper::frontend::execute_live_compute_items({linear_array_item}),
+              "production backend executes a selected-mip linear 2D-array dispatch");
+        CHECK(linear_array_dst == linear_array_expected,
+              "linear array writeback preserves aligned rows, sibling slices, mips, and padding");
     }
 
     // Exercise the wider element mappings that become default-on with tiled storage. Float16 uses
@@ -1141,27 +1705,54 @@ int main() {
     {
         static const uint32_t fill_1d[] = {
             0x7E080300u,             // v4 = v0 (x coord from the shell input)
-            0xF0200F00u, 0x00020004u,// IMAGE_STORE v0..v3 at v4 to binding 5 -- NO preceding IMAGE_LOAD
+            0x7E0A0301u,             // v5 = v1 (y local ID; zero for the one-row launch)
+            0x7E040280u,             // v2 = 0 (stored B)
+            0x7E060280u,             // v3 = 0 (stored A)
+            0xF0200F08u, 0x00020004u,// IMAGE_STORE v0..v3 at (v4,v5) -- NO preceding IMAGE_LOAD
             0xBF810000u,             // s_endpgm
         };
-        std::vector<uint32_t> fill_index(W);
-        for (uint32_t i = 0; i < W; ++i) fill_index[i] = i;   // v0 == gid == store coord -> full coverage
-        std::vector<uint32_t> fdummy(4, 0);
-        std::vector<uint8_t> fill_guest(W * 4, 0xC3);   // distinctive pre-run content
-        const std::vector<uint8_t> fill_original = fill_guest;
+        // A typed RGBA16F storage image exercises the same native-storage retention path as the
+        // game's 4K post-process output. Height one keeps the coverage proof compact.
+        const size_t fill_guest_bytes = W * 8;
+        const size_t fill_mapping_bytes = 4096;
+        std::vector<uint8_t> fill_guest_storage;
+        uint8_t* fill_guest = nullptr;
+#if defined(__linux__)
+        void* fill_mapping = mmap(nullptr, fill_mapping_bytes, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(fill_mapping != MAP_FAILED, "map typed storage-image regression range");
+        if (fill_mapping == MAP_FAILED) return fails ? fails : 1;
+        fill_guest = static_cast<uint8_t*>(fill_mapping);
+        prosper::host::guest_write_watch_set_fault_onstack(true);
+        prosper::host::guest_write_watch_notify_direct_mapping_added(
+            reinterpret_cast<uint64_t>(fill_guest), fill_mapping_bytes, 0x7c0000,
+            0x3 /* SCE CPU_READ|CPU_WRITE */);
+#else
+        fill_guest_storage.resize(fill_guest_bytes);
+        fill_guest = fill_guest_storage.data();
+#endif
+        std::fill_n(fill_guest, fill_guest_bytes, 0xC3);   // distinctive pre-run content
+        const std::vector<uint8_t> fill_original(fill_guest, fill_guest + fill_guest_bytes);
+        auto fill_equals = [&](const std::vector<uint8_t>& expected) {
+            return expected.size() == fill_guest_bytes &&
+                   std::equal(fill_guest, fill_guest + fill_guest_bytes, expected.begin());
+        };
         ShaderResourceTable fill_rt;
-        auto fadd_buf = [&](uint32_t b, void* d, uint32_t s) {
-            ShaderResource r{}; r.cls = ResourceClass::ConstantBuffer; r.binding = b;
-            r.gpu_addr = (uint64_t)(uintptr_t)d; r.size = s; fill_rt.resources.push_back(r); };
-        fadd_buf(0, fill_index.data(), W * sizeof(uint32_t));
-        fadd_buf(1, fdummy.data(), 16); fadd_buf(2, fdummy.data(), 16); fadd_buf(3, fdummy.data(), 16);
         ShaderResource fdst{};
-        fdst.cls = ResourceClass::StorageImage; fdst.img_dim = 0; fdst.binding = 5; fdst.sgpr_base = 8;
-        fdst.format = DataFormat::Unorm8; fdst.num_components = 4; fdst.width = W; fdst.height = 1;
-        fdst.depth = 1; fdst.gpu_addr = (uint64_t)(uintptr_t)fill_guest.data(); fdst.size = W * 4;
+        fdst.cls = ResourceClass::StorageImage; fdst.img_dim = 1; fdst.binding = 5; fdst.sgpr_base = 8;
+        fdst.format = DataFormat::Float16; fdst.num_components = 4; fdst.width = W; fdst.height = 1;
+        fdst.depth = 1; fdst.gpu_addr = (uint64_t)(uintptr_t)fill_guest;
+        fdst.size = static_cast<uint32_t>(fill_guest_bytes);
         fill_rt.resources.push_back(fdst);
-        std::vector<uint32_t> fill_spirv = recompile_valu(
-            fill_1d, sizeof(fill_1d) / sizeof(fill_1d[0]), 1, 0, &fill_rt);
+        ComputeShaderConfig fill_config;
+        fill_config.user_sgprs.resize(16);
+        fill_config.local_x = W;
+        fill_config.local_y = fill_config.local_z = 1;
+        fill_config.tidig_comp_cnt = 1;
+        fill_config.native_storage_format_support =
+            native_storage_format_support_bit(DataFormat::Float16, 4);
+        std::vector<uint32_t> fill_spirv = recompile_compute(
+            fill_1d, sizeof(fill_1d) / sizeof(fill_1d[0]), &fill_rt, fill_config);
         CHECK(!fill_spirv.empty(), "write-only 1D fill kernel recompiles");
         if (!fill_spirv.empty()) {
             ComputeItem it; it.spirv = fill_spirv;
@@ -1173,15 +1764,230 @@ int main() {
             it.code_addr = 0x1122f11du;   // fresh code -> first run proves, second run seed-skips
             CHECK(prosper::frontend::execute_live_compute_items({it}),
                   "seed-skip proving run (poison-seeded) executes a full-coverage 1D fill");
-            const std::vector<uint8_t> after_prove = fill_guest;
-            CHECK(after_prove != fill_original,
+            const std::vector<uint8_t> after_prove(fill_guest, fill_guest + fill_guest_bytes);
+            CHECK(!fill_equals(fill_original),
                   "full-coverage fill overwrites the guest content (kernel ran)");
-            std::fill(fill_guest.begin(), fill_guest.end(), 0x00);  // scrub between runs
+            std::fill_n(fill_guest, fill_guest_bytes, 0x00);  // scrub between runs
             CHECK(prosper::frontend::execute_live_compute_items({it}),
                   "seed-skip fast run (seed skipped) executes the proven full-coverage fill");
-            CHECK(fill_guest == after_prove,
+            CHECK(fill_equals(after_prove),
                   "seed-skipped run is byte-identical to the poison-proven run (seed is unobserved)");
+
+#if defined(__linux__)
+            auto repeated_write_watch = prosper::host::GuestWriteWatch::create(
+                reinterpret_cast<uint64_t>(fill_guest), fill_guest_bytes);
+#endif
+            uint32_t repeated_write_notifications = 0;
+            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+                if (addr == fdst.gpu_addr && size == fdst.size)
+                    ++repeated_write_notifications;
+            });
+            CHECK(prosper::frontend::execute_live_compute_items({it}),
+                  "retained full-coverage image repeats an identical dispatch");
+            set_guest_gpu_write_observer({});
+            CHECK(fill_equals(after_prove),
+                  "identical retained output leaves the exact guest result intact");
+            CHECK(repeated_write_notifications == 1,
+                  "identical retained output invalidates renderer aliases without rewriting bytes");
+#if defined(__linux__)
+            CHECK(static_cast<bool>(repeated_write_watch) && repeated_write_watch.query() ==
+                      prosper::host::GuestWriteWatchQuery::Unchanged,
+                  "identical retained output leaves guest-byte dirty tracking clean");
+            repeated_write_watch.reset();
+#endif
+
+            // Prove a second full writer of the same format/extent on a different target, then use
+            // it on this still-valid guest mirror. The persistent image key intentionally does not
+            // contain the shader: different post-processes may reuse one target. Its GPU comparison
+            // must report the changed word exactly and force the ordinary writeback path.
+            static const uint32_t changed_fill_1d[] = {
+                0x7E080300u,             // v4 = v0 (x)
+                0x7E0A0301u,             // v5 = v1 (y)
+                0x7E0402F2u,             // v2 = 1.0f (changed stored B)
+                0x7E060280u,             // v3 = 0
+                0xF0200F08u, 0x00020004u,// IMAGE_STORE v0..v3 at (v4,v5)
+                0xBF810000u,
+            };
+            std::vector<uint8_t> changed_proof_guest(W * 8, 0x71);
+            ShaderResourceTable changed_proof_rt = fill_rt;
+            changed_proof_rt.resources.back().gpu_addr =
+                reinterpret_cast<uint64_t>(changed_proof_guest.data());
+            std::vector<uint32_t> changed_spirv = recompile_compute(
+                changed_fill_1d,
+                sizeof(changed_fill_1d) / sizeof(changed_fill_1d[0]),
+                &changed_proof_rt, fill_config);
+            CHECK(!changed_spirv.empty(), "second full-coverage fill kernel recompiles");
+            if (!changed_spirv.empty()) {
+                ComputeItem changed = it;
+                changed.spirv = changed_spirv;
+                changed.code_addr = 0x1122f12du;
+                changed.resources = std::make_shared<ShaderResourceTable>(changed_proof_rt);
+                CHECK(prosper::frontend::execute_live_compute_items({changed}),
+                      "changed fill proves full coverage on an independent target");
+                const std::vector<uint8_t> changed_expected = changed_proof_guest;
+                changed.resources = std::make_shared<ShaderResourceTable>(fill_rt);
+
+                prosper::frontend::live_compute_fail_next_storage_readback_for_test();
+                CHECK(!prosper::frontend::execute_live_compute_items({changed}),
+                      "injected post-submit storage readback failure is reported");
+                CHECK(fill_equals(after_prove),
+                      "failed storage readback does not publish newer image bytes to the guest");
+                uint32_t changed_write_notifications = 0;
+                set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+                    if (addr == fdst.gpu_addr && size == fdst.size)
+                        ++changed_write_notifications;
+                });
+                CHECK(prosper::frontend::execute_live_compute_items({changed}),
+                      "storage image retries after a failed post-submit readback");
+                set_guest_gpu_write_observer({});
+                CHECK(fill_equals(changed_expected) && !fill_equals(after_prove),
+                      "retry invalidates the stale baseline and publishes the changed output");
+                CHECK(changed_write_notifications == 1,
+                      "recovered storage output forces guest writeback and invalidation");
+            }
+
+            // Guest memory no longer matches the retained source. Exact source validation must
+            // force a writeback rather than trusting only the GPU-side output baseline.
+            fill_guest[0] ^= 0xff;
+            uint32_t repaired_write_notifications = 0;
+            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+                if (addr == fdst.gpu_addr && size == fdst.size)
+                    ++repaired_write_notifications;
+            });
+            CHECK(prosper::frontend::execute_live_compute_items({it}),
+                  "externally changed guest mirror reruns the retained full-coverage dispatch");
+            set_guest_gpu_write_observer({});
+            CHECK(fill_equals(after_prove),
+                  "retained output repairs an externally changed guest mirror");
+            CHECK(repaired_write_notifications == 1,
+                  "externally changed guest mirror forces writeback and invalidation");
         }
+#if defined(__linux__)
+        prosper::host::guest_write_watch_notify_direct_mapping_removed(
+            reinterpret_cast<uint64_t>(fill_guest), fill_mapping_bytes);
+        prosper::host::guest_write_watch_set_fault_onstack(false);
+        munmap(fill_guest, fill_mapping_bytes);
+#endif
+    }
+
+    // A proven-full write-only raw storage image may retain its RGBA32_UINT interchange result even
+    // though that representation is not canonical guest data: the old raw texels are unobservable.
+    // This is the Plucky Squire lighting-grid shape (3D tiled FP16), reduced to one 4x4x4 workgroup.
+    // The third identical dispatch must compare the raw transfer on-GPU and omit pack/retile and the
+    // guest invalidation, while an external guest-memory change must still force exact writeback.
+    {
+        static const uint32_t fill_3d[] = {
+            0x7E080300u,             // v4 = v0 (x)
+            0x7E0A0301u,             // v5 = v1 (y)
+            0x7E0C0302u,             // v6 = v2 (z)
+            0xF0200F10u, 0x00020004u,// IMAGE_STORE v0..v3 at (v4,v5,v6), dim:3D, no load
+            0xBF810000u,
+        };
+        constexpr uint32_t RW = 4, RH = 4, RD = 4;
+        constexpr uint32_t raw_mode = static_cast<uint32_t>(TileMode::Sw64KbS);
+        const size_t raw_guest_bytes = tiled_volume_bytes(RW, RH, RD, raw_mode, 8);
+        std::vector<uint8_t> raw_guest_storage;
+        uint8_t* raw_guest = nullptr;
+#if defined(__linux__)
+        void* raw_mapping = mmap(nullptr, raw_guest_bytes, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(raw_mapping != MAP_FAILED, "map raw storage-image regression range");
+        if (raw_mapping == MAP_FAILED) return fails ? fails : 1;
+        raw_guest = static_cast<uint8_t*>(raw_mapping);
+        prosper::host::guest_write_watch_set_fault_onstack(true);
+        prosper::host::guest_write_watch_notify_direct_mapping_added(
+            reinterpret_cast<uint64_t>(raw_guest), raw_guest_bytes, 0x7d0000,
+            0x3 /* SCE CPU_READ|CPU_WRITE */);
+#else
+        raw_guest_storage.resize(raw_guest_bytes);
+        raw_guest = raw_guest_storage.data();
+#endif
+        std::fill_n(raw_guest, raw_guest_bytes, 0x9d);
+        ShaderResourceTable raw_rt;
+        ShaderResource raw_dst{};
+        raw_dst.cls = ResourceClass::StorageImage;
+        raw_dst.img_dim = 2;
+        raw_dst.binding = 5;
+        raw_dst.sgpr_base = 8;
+        raw_dst.format = DataFormat::Float16;
+        raw_dst.num_components = 4;
+        raw_dst.width = RW;
+        raw_dst.height = RH;
+        raw_dst.depth = RD;
+        raw_dst.tile_mode = raw_mode;
+        raw_dst.gpu_addr = reinterpret_cast<uint64_t>(raw_guest);
+        raw_dst.size = static_cast<uint32_t>(raw_guest_bytes);
+        raw_rt.resources.push_back(raw_dst);
+        ComputeShaderConfig raw_config;
+        raw_config.user_sgprs.resize(16);
+        raw_config.local_x = RW;
+        raw_config.local_y = RH;
+        raw_config.local_z = RD;
+        raw_config.tidig_comp_cnt = 2;
+        // Keep the raw fallback used by true 3D images even on devices supporting typed FP16.
+        raw_config.native_storage_format_support = 0;
+        const std::vector<uint32_t> raw_spirv = recompile_compute(
+            fill_3d, std::size(fill_3d), &raw_rt, raw_config);
+        CHECK(!raw_spirv.empty(), "write-only raw 3D fill kernel recompiles");
+        if (!raw_spirv.empty()) {
+            ComputeItem raw_item;
+            raw_item.spirv = raw_spirv;
+            raw_item.resources = std::make_shared<ShaderResourceTable>(raw_rt);
+            raw_item.launch.threads_x = RW;
+            raw_item.launch.threads_y = RH;
+            raw_item.launch.threads_z = RD;
+            raw_item.launch.local_x = RW;
+            raw_item.launch.local_y = RH;
+            raw_item.launch.local_z = RD;
+            raw_item.launch.groups_x = raw_item.launch.groups_y = raw_item.launch.groups_z = 1;
+            raw_item.code_addr = 0x1122f13du;
+            CHECK(prosper::frontend::execute_live_compute_items({raw_item}),
+                  "raw 3D fill proves complete write coverage");
+            const std::vector<uint8_t> raw_expected(raw_guest,
+                                                    raw_guest + raw_guest_bytes);
+            CHECK(prosper::frontend::execute_live_compute_items({raw_item}),
+                  "raw 3D fill establishes a retained exact result baseline");
+#if defined(__linux__)
+            auto raw_repeat_watch = prosper::host::GuestWriteWatch::create(
+                reinterpret_cast<uint64_t>(raw_guest), raw_guest_bytes);
+#endif
+            uint32_t raw_repeat_notifications = 0;
+            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+                if (addr == raw_dst.gpu_addr && size == raw_guest_bytes)
+                    ++raw_repeat_notifications;
+            });
+            CHECK(prosper::frontend::execute_live_compute_items({raw_item}),
+                  "retained raw 3D fill repeats an identical dispatch");
+            set_guest_gpu_write_observer({});
+            CHECK(std::equal(raw_guest, raw_guest + raw_guest_bytes, raw_expected.begin()) &&
+                      raw_repeat_notifications == 1,
+                  "GPU-identical raw 3D output skips pack/retile but invalidates renderer aliases");
+#if defined(__linux__)
+            CHECK(static_cast<bool>(raw_repeat_watch) && raw_repeat_watch.query() ==
+                      prosper::host::GuestWriteWatchQuery::Unchanged,
+                  "GPU-identical raw 3D output leaves guest-byte dirty tracking clean");
+            raw_repeat_watch.reset();
+#endif
+
+            raw_guest[0] ^= 0xff;
+            uint32_t raw_repair_notifications = 0;
+            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+                if (addr == raw_dst.gpu_addr && size == raw_guest_bytes)
+                    ++raw_repair_notifications;
+            });
+            CHECK(prosper::frontend::execute_live_compute_items({raw_item}),
+                  "externally changed raw 3D mirror reruns the retained dispatch");
+            set_guest_gpu_write_observer({});
+            CHECK(std::equal(raw_guest, raw_guest + raw_guest_bytes, raw_expected.begin()) &&
+                      raw_repair_notifications == 1,
+                  "external raw 3D mirror change forces exact writeback and invalidation");
+        }
+#if defined(__linux__)
+        prosper::host::guest_write_watch_notify_direct_mapping_removed(
+            reinterpret_cast<uint64_t>(raw_guest), raw_guest_bytes);
+        prosper::host::guest_write_watch_set_fault_onstack(false);
+        munmap(raw_guest, raw_guest_bytes);
+#endif
     }
 
     // (b) PARTIAL store under a FULL grid (reviewer B1): a write-only 2D kernel that always stores to

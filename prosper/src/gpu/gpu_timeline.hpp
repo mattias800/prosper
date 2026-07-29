@@ -209,9 +209,11 @@ void close_gpu_timeline();
 // frame (every submit between two presents) into a replayable .prgbundle at `path`. Unlike a single
 // .prgcap, the bundle re-runs the frame's producer submits on replay, so renderer-owned RTTs regenerate
 // instead of replaying black (which they do for a deferred renderer). max_mb (0 = default) caps the
-// deduplicated bundle size. Armed from the app main thread; the frame is captured on the render thread
-// between the next two presents. On-demand: near-zero cost (one atomic load per submit) until armed.
-void request_interactive_capture_bundle(const std::string& path, uint32_t max_mb = 0);
+// deduplicated bundle size and the resource closure of each constituent submit. Armed from the app main
+// thread; the frame is captured on the render thread between the next two presents. On-demand: near-zero
+// cost (one atomic load per submit) until armed.
+void request_interactive_capture_bundle(const std::string& path, uint32_t max_mb = 0,
+                                        uint32_t delay_presents = 0);
 bool interactive_capture_bundle_active();
 
 } // namespace prosper::gpu

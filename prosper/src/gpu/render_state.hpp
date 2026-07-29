@@ -14,7 +14,26 @@
 
 namespace prosper::gpu {
 
+constexpr uint32_t kColorTargetCount = 8;
+
+// One RDNA2 CB_COLORn surface plus its per-target blend state. The named MRT0/MRT1 fields below
+// remain as compatibility aliases while backends migrate to this complete hardware-sized array.
+struct ColorTargetState {
+    uint64_t base = 0;
+    uint32_t format = 0, number_type = 0, comp_swap = 0;
+    bool has_extent = false;
+    uint32_t width = 0, height = 0;
+    bool has_clear = false;
+    uint32_t clear_word0 = 0, clear_word1 = 0;
+    bool blend_enable = false;
+    uint32_t color_src_blend = 0, color_dst_blend = 0, color_comb_fcn = 0;
+    bool separate_alpha_blend = false;
+    uint32_t alpha_src_blend = 0, alpha_dst_blend = 0, alpha_comb_fcn = 0;
+    bool disable_rop3 = false;
+};
+
 struct RenderState {
+    std::array<ColorTargetState, kColorTargetCount> color_targets{};
     // Shader program GPU addresses per stage (byte address; 0 if that stage's PGM regs were unset).
     uint64_t ps_addr = 0;   // pixel  (SPI_SHADER_PGM_{LO,HI}_PS)
     uint64_t gs_addr = 0;   // geometry (…_GS)
@@ -52,8 +71,8 @@ struct RenderState {
     bool     color0_has_clear   = false;
     uint32_t color0_clear_word0 = 0, color0_clear_word1 = 0;
 
-    // Color MRT 1. The first two targets are enough for UE4's DOLL scene dependency; later MRTs stay
-    // fail-visible until their attachment semantics are implemented.
+    // Color MRT 1 compatibility aliases. Complete hardware state for MRT0..7 lives in
+    // color_targets above; these named fields preserve source and old-capture compatibility.
     uint64_t color1_base        = 0;
     uint32_t color1_format      = 0;
     uint32_t color1_number_type = 0;
@@ -288,6 +307,21 @@ struct ResolvedPipelineState {
     // blending remains active; logic_op values are the VkLogicOp enumerants.
     bool logic_op_enable = false;
     uint32_t logic_op = 3; // VK_LOGIC_OP_COPY
+
+    struct ColorTarget {
+        uint32_t format = 0;  // == VkFormat
+        bool has_clear = false;
+        float clear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        bool blend_enable = false;
+        uint32_t src_color_blend_factor = 0, dst_color_blend_factor = 0;
+        uint32_t color_blend_op = 0;
+        uint32_t src_alpha_blend_factor = 0, dst_alpha_blend_factor = 0;
+        uint32_t alpha_blend_op = 0;
+        uint32_t write_mask = 0;
+        bool disable_rop3 = false;
+    };
+    // Complete hardware MRT state. Slots 0/1 mirror the legacy named fields above.
+    std::array<ColorTarget, kColorTargetCount> color_targets{};
 };
 
 // A color-disabled draw must still execute when it can change the depth/stencil attachment consumed

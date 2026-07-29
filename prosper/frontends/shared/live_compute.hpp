@@ -7,6 +7,24 @@
 
 namespace prosper::frontend {
 
+enum class ComputeImageCacheClass : uint8_t { sampled, storage };
+
+// Read-only sampled inputs are often tiny, numerous, and cheap to upload; retaining all of them
+// wastes cache identities and device memory. A storage target has a different cost model: even a
+// small repeated output otherwise incurs staging readback, guest-format packing, and layout work.
+// One 4 KiB host page is the measured storage crossover and avoids retaining sub-page Vulkan
+// objects. Keep the default crossover policy explicit and independently testable.
+constexpr uint64_t compute_image_cache_default_minimum_bytes(
+    ComputeImageCacheClass image_class) {
+    return image_class == ComputeImageCacheClass::storage ? 4ull * 1024ull
+                                                          : 1024ull * 1024ull;
+}
+
+constexpr bool compute_image_cache_default_eligible(
+    uint64_t bytes, ComputeImageCacheClass image_class) {
+    return bytes >= compute_image_cache_default_minimum_bytes(image_class);
+}
+
 // Pack one raw float32 channel to UNORM8 using the storage-image conversion contract. Kept public
 // so the optimized scalar conversion can be checked directly against the previous lround path.
 uint8_t storage_pack_unorm8(uint32_t float_bits);
@@ -43,8 +61,23 @@ constexpr bool storage_writeback_can_tile_mapped_bytes(bool native_float_storage
 bool direct_sampled_rtt_compatible(prosper::gpu::DataFormat format, uint32_t components,
                                    prosper::gpu::LiveTargetPixelFormat target_format);
 
+// Reconstruct a packed R11G11B10 sampled surface from the renderer's canonical color snapshot.
+// The renderer keeps float targets as RGBA16F and ordinary targets as RGBA8; compute descriptors
+// can subsequently alias that same target as GFX10 10_11_11_FLOAT. This conversion restores the
+// descriptor-visible texel representation without reading stale guest backing.
+bool pack_live_target_r11g11b10(const prosper::gpu::LiveTargetSnapshot& snapshot,
+                                uint8_t* packed, size_t packed_size);
+
 // Execute already-realized compute items synchronously. Exposed for the production-backend test.
 bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& items);
+
+// Monotonic diagnostic count of writable-buffer results whose exact GPU comparison avoided a host
+// mapping/scan. Exposed so the production-backend test can prove that optimization path executes.
+uint64_t live_compute_buffer_gpu_result_skips();
+
+// Deterministic failure injection for the storage-image recovery regression test. The next storage
+// readback fails after dispatch, exercising retained-image invalidation without a Vulkan fault.
+void live_compute_fail_next_storage_readback_for_test();
 
 // Register the synchronous Vulkan compute backend used by AGC submit processing.
 void register_live_compute();

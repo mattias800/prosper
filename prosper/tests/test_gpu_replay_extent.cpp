@@ -60,6 +60,15 @@ int main() {
     CHECK(extent.width == 320 && extent.height == 180,
           "later realized draw replaces the ordered-prefix extent");
 
+    extent = replay_output_extent(
+        replay, OutputExtentMode::Capture, static_cast<size_t>(320) * 180 * 4);
+    CHECK(extent.width == 320 && extent.height == 180,
+          "full replay uses the final realized target when bytes disprove the capture-header extent");
+    extent = replay_output_extent(
+        replay, OutputExtentMode::Capture, static_cast<size_t>(3840) * 2160 * 4);
+    CHECK(extent.width == 3840 && extent.height == 2160,
+          "full replay preserves capture resolution when its exact byte count matches");
+
     replay.items.back().color0_width = 0;
     replay.items.back().color0_height = 0;
     extent = replay_output_extent(
