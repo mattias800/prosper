@@ -200,10 +200,12 @@ The core window also reports graphics-shader cache hits, misses, bypasses, and a
 The older independent 25-backend-call timing windows are disabled by default because their multi-line logging
 can materially perturb the target call charged for printing them on Windows. Set
 `PROSPER_BACKEND_TIMING_WINDOWS=1` only when that cross-submit legacy view or its memory-pool line is needed.
-Use `PROSPER_RENDER_TIMING=detail` to additionally print individual texture decodes taking at least
-0.5 ms (capped at 250 lines). Set `PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT=N` to begin those detail
-lines at renderer submit N, so boot textures do not consume the cap before the scene under study. Each
-line identifies local reuse, persistent hit/miss/invalidation, RTT sourcing, or an uncached decode. The
+Use `PROSPER_RENDER_TIMING=detail` to additionally print individual texture and buffer resource builds
+taking at least 0.5 ms (each capped at 250 lines). Set
+`PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT=N` to begin those detail lines at renderer submit N, so boot
+textures do not consume the cap before the scene under study. Each
+texture lines identify local reuse, persistent hit/miss/invalidation, RTT sourcing, or an uncached decode;
+buffer lines include the declared/uploaded range and whether direct guest backing was used. The
 aggregate output also reports retained RTT bytes, decode-scratch capacity, and validation-scratch capacity;
 use those figures before treating a process-memory increase as an unbounded cache.
 Set `PROSPER_RTT_TIMING=1` with timing enabled to print one lightweight `[rtt-timing]` line per rendered target
@@ -222,8 +224,19 @@ this preserves one parseable line per target without paying a Windows console wr
 
 Ordered graphics/compute submits retain a bounded journal of exact guest-memory ranges written by the
 compute backend. A persistent texture validated in an earlier graphics span can therefore skip its repeated
-full-byte scan when no later write overlaps it. Cross-submit texture validation currently uses exact byte
-comparison on every platform. Windows protection-fault watches are deliberately unsupported: the Windows
+full-byte scan when no later write overlaps it. Across submits, exact byte comparison is the initial
+fail-closed source of truth. Linux may promote a repeatedly unchanged direct-memory source to a
+page-protection write watch: texture sources below 1 MiB stay on exact comparison, 1-8 MiB sources arm
+immediately, and larger
+sources arm after three exact unchanged validations. Promotions are limited to 8 MiB per ordered submit,
+with at most one source larger than that limit, and adjacent pages are protected in coalesced runs. Set
+`PROSPER_TEXTURE_WRITE_WATCH_DEFER_MIN_KB`, `PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_HITS`, or
+`PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_MB` for controlled A/B runs. Compute buffer/image residency uses the
+same exact-first rule, with `PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS` and
+`PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_MB`. `PROSPER_WRITE_WATCH_MAX_KB` is an emergency host-wide range
+limit (zero/unset is unbounded); a declined watch always returns to exact comparison.
+
+Windows protection-fault watches are deliberately unsupported: the Windows
 exception dispatcher writes below the interrupted stack pointer before a vectored handler runs, which can
 corrupt the guest's valid SysV red-zone locals. Timing therefore reports those watch attempts as `unknown`
 and the remaining exact validation bytes; do not re-enable page-fault watches without an exception-delivery
@@ -292,13 +305,16 @@ fallback. Set `PROSPER_NO_FRONTEND_BUFFER_VIEW=1` to restore per-reference mater
 Renderer timing reports buffer `views`, logical bytes, and bytes that still required materialization.
 
 Within one renderer callback, repeated guest-backed texture descriptions reuse the first decoded
-pixel buffer. A bounded process-wide cache also covers guest-backed linear and tiled 2D sampled
-textures in `Unorm8` component widths 1-4 and BC1-BC7 formats. Every cross-submit lookup validates
+pixel buffer. A bounded process-wide cache also covers supported guest-backed linear and tiled 2D sampled
+textures (`Unorm8`, one/two-channel `Unorm16`, `Float16`, `Float32`, packed 32-bit, and BC formats),
+and supported uncompressed volume inputs. Every cross-submit lookup validates
 the exact source range before reusing decoded pixels: direct narrow sources compare their native
 bytes, tiled sources retain the padded tiled range, and block-compressed sources use their exact
-block dimensions and block size. Changed bytes, mapping/readability changes, or address reuse
-invalidates the entry and creates a new content-version ID. Live render targets, storage images,
-captured host backing, cube/volume textures, DCC surfaces, and other formats remain excluded. The
+block dimensions and block size. Volume sources retain the complete tiled 3D span. The decode key includes
+the selected mip-tail and layer layout so distinct views cannot alias. Changed bytes,
+mapping/readability changes, or address reuse invalidates the entry and creates a new content-version ID.
+Live render targets, storage images,
+captured host backing, unsupported cube/volume formats, and unresolved DCC states remain excluded. The
 default ceiling is one eighth of host physical memory, clamped to 1-2 GiB; use
 `PROSPER_TEXTURE_DECODE_CACHE_MB=<MiB>` to change it or
 `PROSPER_NO_TEXTURE_DECODE_CACHE=1` for an A/B run. Timing reports cross-submit `texture_cache`
@@ -308,6 +324,12 @@ Complete readable source ranges are compared directly against the cache's retain
 partial sparse ranges keep the guarded scratch-copy fallback. This preserves the same exact byte and
 readability checks without copying large texture sources before comparing them. Set
 `PROSPER_TEXTURE_VALIDATION_SCRATCH_COPY=1` for an A/B against the previous copy-then-compare path.
+After an exact validation successfully promotes a Linux source to a write watch, the cache releases
+its redundant encoded snapshot. Guest GPU/DMA write notifications dirty the same watch as CPU faults.
+An unchanged watch permits reuse; Dirty/Unknown conservatively invalidates and re-decodes instead of
+relying on a hash. Set
+`PROSPER_KEEP_TEXTURE_SOURCE_SNAPSHOTS=1` for a same-build memory/performance A/B. Validation audit
+modes retain the snapshot they need for byte-exact checking.
 
 The Vulkan backend may retain an optimal sampled image only when that exact frontend validation
 supplies a nonzero content-version ID. Cache hits skip image allocation, staging allocation, pixel
@@ -354,7 +376,7 @@ process-unique, never-recycled identity from the exact shader cache, so a hot lo
 hash complete SPIR-V modules. Capture, replay, and test draws without those identities fall back to an
 exact full-module key. The rest of the key contains the descriptor-layout contract and every baked
 fixed-function value; equality still compares the complete key after hashing. The cache is bounded to
-1024 entries by default. Set `PROSPER_PIPELINE_CACHE_ENTRIES=<N>` to change the entry limit or
+4096 entries by default. Set `PROSPER_PIPELINE_CACHE_ENTRIES=<N>` to change the entry limit or
 `PROSPER_NO_BACKEND_PIPELINE_CACHE=1` for a transient-pipeline A/B. With `PROSPER_RENDER_TIMING=1`,
 the backend and submit-aligned windows report references, hits, misses, bypasses, current entries, and
 evictions. A pipeline hit also skips temporary Vulkan shader-module creation.

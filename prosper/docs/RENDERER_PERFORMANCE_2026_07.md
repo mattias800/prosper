@@ -86,6 +86,59 @@ later in the same resource path. Resolving that bridge first reduced the false m
 zero and lowered steady texture resource handling from about 5.6-6.3 ms to 3.7-4.2 ms per submit,
 without changing the cache budget or depth-image binding contract.
 
+## Plucky Squire pipeline working set (2026-07-29)
+
+Plucky's desk-loading scene uses about 2,500 distinct exact graphics-pipeline contracts. The former
+1,024-entry backend limit continuously evicted hot pipelines after the scene crossed that boundary:
+matched 25-submit windows reported 2-10 evictions per submit and recurring multi-millisecond pipeline
+setup spikes. This was cache-capacity churn, not shader recompilation or a correctness failure.
+
+A matched scripted A/B with a 4,096-entry limit grew to 2,482 resident pipelines with zero evictions.
+Once the compulsory creations completed, pipeline setup fell to about 0.07 ms per submit window; the
+loading scene improved from roughly 3-4 FPS to 4.5-5.6 FPS on the Radeon 8060S test laptop. The larger
+limit retains exact keys and LRU behavior, allocates nothing until a distinct contract is encountered,
+and remains configurable through `PROSPER_PIPELINE_CACHE_ENTRIES`.
+
+## Plucky Squire adaptive write watches and sampled volumes (2026-07-29)
+
+The desk-loading route initially registered page-protection watches for every large texture and compute
+source as soon as it entered a persistent cache. By the first MainLevel frames this had cumulatively
+registered millions of pages and reduced presentation to about 1.8 FPS. A hard 1 MiB watch ceiling proved
+the diagnosis (roughly 4.6 FPS) but made every larger stable source pay an exact comparison forever.
+
+Large sources now start with exact validation and promote only after three unchanged comparisons, under an
+8 MiB promotion budget per graphics/compute call; Linux also coalesces adjacent `mprotect` ranges. On the
+same route, registered pages fell from about 4.4 million to 263 thousand at the matched checkpoint, menu
+cadence rose to 16-17 FPS, and the first MainLevel windows reached about 4.8-5.2 FPS. The policy is generic,
+keeps exact comparison as the unsupported/failed-watch fallback, and exposes the promotion thresholds for
+A/B through the frontend variables documented above.
+
+Decode-reason accounting (`PROSPER_DETILE_STATS=1`) then identified four immutable 48x48x48 RGBA16F volume
+lookup textures and one 128x32 two-channel UNORM16 input being decoded essentially once per callback. The
+volume detiler already handled their exact source layout; only cross-submit retention excluded them.
+Extending the exact-byte cache to supported volume spans and UNORM16 removed those five repeated misses.
+Matched menu windows reduced texture construction from roughly 14-16 ms to 11-12 ms per callback and
+progressed around 2-3 presented frames per second faster. A six-submit full-resolution GPU replay remained
+visually correct. A separate Float16 cube-retention experiment was rejected: the late loading route churned
+the 2 GiB cache, grew from 218 to 411 cumulative write watches, and fell from 3.8 to 1.7 FPS in a matched
+2,640-frame A/B. Cubes therefore remain on their dedicated layer-aware decode path.
+
+Deferring every texture watch at or above 1 MiB was also rejected. It finished with essentially the same
+watch footprint and 3.8 FPS late checkpoint as the mixed policy, while cumulative exact validation rose
+from 69.7 to 79.2 GiB. Stable 1-8 MiB sources therefore continue to arm immediately; larger sources retain
+the exact-first promotion rule.
+
+Once a source has a working write watch, retaining its complete encoded bytes duplicates information:
+Unchanged proves reuse, while Dirty/Unknown can conservatively invalidate. Releasing only those protected
+snapshots (never audit baselines or sources that are also the decoded pixels) saved 267 MiB at the end of a
+matched 2,650-frame route. The cache held 485 decoded entries instead of 253 under the same 2 GiB ceiling.
+Average frontend resource construction fell from 24.1 to 21.5 ms per submit and total frontend time from
+50.3 to 46.6 ms per submit. Exact validation traffic changed only slightly (76.8 to 75.7 GiB) after GPU/DMA
+writes were correctly wired into persistent-watch invalidation, and late checkpoint FPS was mixed rather
+than a repeatable speedup. This is therefore primarily a memory/capacity improvement, not a validation or
+frame-rate claim. Dirty or unknown watches deliberately re-decode rather than using a hash, and
+`PROSPER_KEEP_TEXTURE_SOURCE_SNAPSHOTS=1` restores the control behavior for audit/performance comparisons.
+
 ## Cobra Float32 sampled-texture retention (2026-07-25)
 
 Cobra's title and cinematic repeatedly sample large guest-backed Float32 post-process inputs. The live
