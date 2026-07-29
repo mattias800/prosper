@@ -76,7 +76,10 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v36: retain the resolved SPI_PS_INPUT_CNTL linkage (including metadata-only PARAM0 passthrough)
 // and SPI_PS_INPUT_ENA/ADDR system-VGPR ABI for every realized draw. Raw graphics replay otherwise
 // invents a different module even when the captured RDNA2 bytes are exact.
-constexpr uint32_t kVersion = 36;
+// v37: retain the required compute subgroup size. Native-subgroup SPIR-V reconstructs guest wave
+// membership from SubgroupId/SubgroupLocalInvocationId and therefore must replay with the same
+// required-size/full-subgroups pipeline contract used when the module was created.
+constexpr uint32_t kVersion = 37;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -1249,6 +1252,7 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.dispatch_index = compute.dispatch_index;
         c.submit_no = compute.submit_no;
         c.command_order = compute.command_order;
+        c.required_subgroup_size = compute.required_subgroup_size;
         if (!capture_table(compute.resources.get(), intervals, include_resource_data,
                            c.resources, error)) return false;
         out.computes.push_back(std::move(c));
@@ -1964,6 +1968,18 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
             w.u32(draw.system_inputs.ena);
             w.u32(draw.system_inputs.addr);
         }
+    }
+    // v37 keeps the pipeline-stage contract beside the already-stored native-subgroup module.
+    // The realized translator only emits wave32/wave64 modules; reject invented values here so a
+    // malformed capsule cannot ask Vulkan for an unrelated device-specific subgroup width.
+    w.u32(static_cast<uint32_t>(c.computes.size()));
+    for (const auto& compute : c.computes) {
+        if (compute.required_subgroup_size != 0 && compute.required_subgroup_size != 32 &&
+            compute.required_subgroup_size != 64) {
+            error = "invalid compute required-subgroup size";
+            return false;
+        }
+        w.u32(compute.required_subgroup_size);
     }
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
@@ -2766,6 +2782,19 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             }
         }
     }
+    if (version >= 37) {   // exact required-size/full-subgroups compute pipeline contract
+        uint32_t compute_count = 0;
+        if (!r.u32(compute_count) || compute_count != c.computes.size()) {
+            error = "invalid compute subgroup-contract count"; return false;
+        }
+        for (auto& compute : c.computes) {
+            if (!r.u32(compute.required_subgroup_size)) return false;
+            if (compute.required_subgroup_size != 0 && compute.required_subgroup_size != 32 &&
+                compute.required_subgroup_size != 64) {
+                error = "invalid compute required-subgroup size"; return false;
+            }
+        }
+    }
     for (auto& draw : c.draws) restore_legacy_color_target_aliases(draw);
     for (auto& diagnostic : c.failure_diagnostics)
         restore_legacy_color_target_aliases(diagnostic);
@@ -2902,6 +2931,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         compute.dispatch_index = x.dispatch_index;
         compute.submit_no = x.submit_no;
         compute.command_order = x.command_order;
+        compute.required_subgroup_size = x.required_subgroup_size;
         if (!table(x.resources, compute.resources)) return false;
         out.computes.push_back(std::move(compute));
     }

@@ -443,6 +443,13 @@ Version 14 appends address-backed `DMA_DATA` records with exact source and desti
 counts, PM4 order, and content-addressed endpoint blob references. Replay mutates the same owned resource
 instances used by later draws and dispatches and invalidates renderer caches for the guest destination range;
 v1..v13 capsules remain readable and do not invent DMA operations.
+Version 37 appends each realized compute module's required subgroup size. A non-zero value recreates the exact
+`VkPipelineShaderStageRequiredSubgroupSizeCreateInfo` plus full-subgroups contract used by live rendering;
+inspection reports it as `subgroup=32` or `subgroup=64`. This lets captures retain native-wave compute modules
+instead of recompiling a different portable emulation solely because capture is armed. Older capsules default
+to `subgroup=0`, and replay fails visibly when a host cannot satisfy a captured native contract. Native lowering
+defaults to one guest wave per workgroup; `PROSPER_NATIVE_COMPUTE_MULTIWAVE=1` enables the exact experimental
+multi-wave contract and records it the same way.
 `--inspect-only` reports the RTT format and the planned/captured byte counts, non-zero and unique-byte counts,
 first control word, and content hash. A software DCC decode is still not inferred. The capsule's standalone
 output must match the bundle's final hash before using it for fast `--draw`, operation-prefix, resource, or

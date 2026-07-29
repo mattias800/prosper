@@ -1103,9 +1103,41 @@ standalone FPS claim. GPU replay cannot exercise this live residency path becaus
 owned `host_data`; the production-backend test instead pins the temporal contract, and the pure policy
 checks pin both exact default boundaries.
 
+## Plucky native-subgroup replay fidelity
+
+Plucky's two remaining heavy compute programs exposed a profiling artifact: live rendering selected
+the exact wave32/wave64 subgroup path, while arming capture forced the translator back to its portable
+lane-emulation shell. The resulting capsule was internally replayable but did not contain the shader
+whose live performance was under investigation. Capture v37 now retains the required subgroup size
+beside the stored SPIR-V and replay recreates the required-size/full-subgroups pipeline contract.
+Pre-v37 captures remain readable with `subgroup=0`; unsupported replay devices reject a native contract
+instead of silently executing it with a different subgroup width.
+
+Radeon GPU Analyzer also ruled out generic SPIR-V dead-code cleanup as the next optimization. For the
+`0x3015770000` program, original and DCE variants compiled to byte-identical gfx1151 ISA. For
+`0x30180d0000`, DCE only reordered two independent scalar moves while leaving the 85-VGPR and 7,176-byte
+ISA totals unchanged. Rewrites that reduced reported VGPR use to 62 regressed measured replay dispatch
+time, so they are retained as negative evidence rather than production changes. A fresh v37 capsule
+then retained the live `0x30180d0000` and `0x3015770000` modules with `subgroup=64`; compute-only replay
+created and ran both exact pipeline contracts. The standalone startup capsule still has six unrealized
+operations and no temporal RTT seeds, so its final pixel oracle and live compute result do not match.
+It is valid evidence for module/pipeline analysis, not for a full-frame correctness claim.
+
+A matched live switch test separated the two remaining kernels. Native lowering reduced
+`0x30180d0000` from a 5.65 ms to 3.22 ms median GPU dispatch, but the four-wave, LDS/barrier-heavy
+`0x3015770000` kernel moved from 5.21 ms to 5.62 ms. Every other eligible Plucky dispatch in the route
+used exactly one 64-lane guest wave; those were neutral or faster, including a repeated mip kernel at
+0.44 ms native versus 0.86 ms portable. Native lowering therefore defaults to exact single-wave
+workgroups. `PROSPER_NATIVE_COMPUTE_MULTIWAVE=1` retains the exact, captureable multi-wave experiment;
+`PROSPER_NO_NATIVE_COMPUTE_SUBGROUP=1` remains the full portable control. These are sequential
+dispatch-local runs; 441 versus 418 presented frames is supporting route progression, not a standalone
+whole-app claim. A clean combined-policy confirmation kept `0x30180d0000` native at 3.08 ms and
+`0x3015770000` portable at 5.27 ms over 378+ samples, with 425 frames presented and no dispatch skip,
+renderer failure, or shutdown error.
+
 ## Next renderer step
 
-Bring up a representative Unreal/3D workload and collect the same stage timings plus a corrected
-mixed-operation capture. Then design one cross-engine persistent-resource change around measured
-resource identities and dependencies. Keep the exact-byte and disable-switch A/B discipline used
-here, and preserve screenshot/capture correctness while reducing the synchronous boundaries.
+Capture a seeded temporal window around the Plucky title/gameplay transition so the remaining shader
+experiments have a full pixel oracle as well as exact compute pipeline contracts. Keep the exact-byte
+and disable-switch A/B discipline used here, and preserve screenshot/capture correctness while reducing
+the synchronous boundaries.

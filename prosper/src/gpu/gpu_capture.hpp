@@ -121,6 +121,9 @@ struct GpuCapturedCompute {
     uint64_t dispatch_index = 0;
     uint64_t submit_no = 0;
     uint64_t command_order = 0;
+    // v37: exact VkPipeline required-subgroup/full-subgroups contract used by the stored module.
+    // Zero retains the historical portable shader path.
+    uint32_t required_subgroup_size = 0;
 };
 
 struct GpuCapturedOperation {

@@ -477,12 +477,12 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
     for (size_t i = 0; i < replay.computes.size(); ++i) {
         const auto& c = replay.computes[i];
         std::printf("compute[%zu] source=%llu order=%llu code=%016llx groups=%ux%ux%u local=%ux%ux%u "
-                    "shader=%zu/%016llx\n",
+                    "subgroup=%u shader=%zu/%016llx\n",
                     i, static_cast<unsigned long long>(c.dispatch_index),
                     static_cast<unsigned long long>(c.command_order),
                     static_cast<unsigned long long>(c.code_addr), c.launch.groups_x,
                     c.launch.groups_y, c.launch.groups_z, c.launch.local_x, c.launch.local_y,
-                    c.launch.local_z, c.spirv.size(),
+                    c.launch.local_z, c.required_subgroup_size, c.spirv.size(),
                     static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(
                         reinterpret_cast<const uint8_t*>(c.spirv.data()), c.spirv.size() * 4)));
         inspect_table("CS", c.resources.get(), replay.rtt_seeds);

@@ -629,11 +629,12 @@ struct SharedVulkanContext {
     bool valid() const { return instance && physical && device && queue && queue_family != UINT32_MAX; }
 };
 // Select the exact native subgroup contract only when the renderer device can actually be adopted
-// by compute and every required-subgroup workgroup bound is satisfied. `capture_bound` keeps saved
-// artifacts device-portable; `disabled` is the explicit diagnostic/compatibility opt-out.
+// by compute and every required-subgroup workgroup bound is satisfied. Single-wave workgroups are
+// the default proven fast path; `allow_multiwave` is the explicit experimental opt-in and `disabled`
+// is the diagnostic/compatibility opt-out.
 uint32_t select_native_compute_subgroup_size(const SharedVulkanContext& context,
                                              const ComputeShaderConfig& config,
-                                             bool capture_bound, bool disabled);
+                                             bool allow_multiwave, bool disabled);
 void set_shared_vulkan_context(const SharedVulkanContext& context);
 SharedVulkanContext shared_vulkan_context();
 

@@ -3687,10 +3687,11 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // Full exact-size subgroups let the translator assign guest local coordinates in
         // SubgroupId/SubgroupLocalInvocationId order. That avoids assuming any relationship between
         // Vulkan's implementation-defined LocalInvocationIndex order and subgroup lane order while
-        // still making each native subgroup exactly one RDNA wave. Captures remain portable until
-        // their schema records the required-subgroup/full-subgroup pipeline contract.
+        // still making each native subgroup exactly one RDNA wave. Capture v37 records this exact
+        // module's required-subgroup/full-subgroups pipeline contract for faithful replay.
         config.native_subgroup_size = select_native_compute_subgroup_size(
-            shared_vulkan, config, capture_bound,
+            shared_vulkan, config,
+            getenv("PROSPER_NATIVE_COMPUTE_MULTIWAVE") != nullptr,
             getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") != nullptr);
         config.tgid_x_en = tgid_x_en;
         config.tgid_y_en = tgid_y_en;
@@ -4913,11 +4914,11 @@ SharedVulkanContext shared_vulkan_context() { return g_shared_vulkan; }
 
 uint32_t select_native_compute_subgroup_size(const SharedVulkanContext& context,
                                              const ComputeShaderConfig& config,
-                                             bool capture_bound, bool disabled) {
+                                             bool allow_multiwave, bool disabled) {
     const bool adoptable = context.valid() && context.compute_queue_supported &&
         context.storage_image_read_without_format &&
         context.storage_image_write_without_format;
-    if (capture_bound || disabled || !adoptable ||
+    if (disabled || !adoptable ||
         !context.compute_subgroup_size_control || !context.compute_full_subgroups ||
         !context.compute_subgroup_vote || !context.compute_subgroup_arithmetic ||
         !context.max_compute_workgroup_subgroups || !context.max_compute_workgroup_size_x ||
@@ -4936,7 +4937,11 @@ uint32_t select_native_compute_subgroup_size(const SharedVulkanContext& context,
     const uint64_t local_invocations = xy * config.local_z;
     const uint64_t subgroup_capacity = static_cast<uint64_t>(config.wave_size) *
         context.max_compute_workgroup_subgroups;
+    // One guest wave removes the portable shell without adding inter-subgroup coordinate recovery.
+    // Multi-wave kernels can be faster or slower depending on their LDS/barrier shape, so retain
+    // the portable default until a diagnostic run opts into the exact experimental contract.
     if (local_invocations % config.wave_size != 0 ||
+        (!allow_multiwave && local_invocations != config.wave_size) ||
         local_invocations > subgroup_capacity ||
         local_invocations > context.max_compute_workgroup_size_x ||
         local_invocations > context.max_compute_workgroup_invocations ||
