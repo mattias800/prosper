@@ -298,6 +298,19 @@ int main() {
             CHECK(static_cast<bool>(watch) &&
                       watch.query() == prosper::host::GuestWriteWatchQuery::Unchanged,
                   "arm cross-submit watch before GPU notification");
+            bool preserving_write_observed = false;
+            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+                preserving_write_observed =
+                    addr == reinterpret_cast<uint64_t>(watched) + logical_offset + 8u &&
+                    size == 16u;
+            });
+            notify_guest_gpu_write_preserving_bytes(
+                reinterpret_cast<uint64_t>(watched) + logical_offset + 8u, 16u);
+            set_guest_gpu_write_observer({});
+            CHECK(preserving_write_observed,
+                  "byte-preserving GPU result still notifies renderer-resident aliases");
+            CHECK(watch.query() == prosper::host::GuestWriteWatchQuery::Unchanged,
+                  "byte-preserving GPU result keeps the exact guest source watch clean");
             notify_guest_gpu_write(reinterpret_cast<uint64_t>(watched) + 32u, 16u);
             CHECK(watch.query() == prosper::host::GuestWriteWatchQuery::Unchanged,
                   "adjacent same-page GPU write does not dirty a nonoverlapping logical source");

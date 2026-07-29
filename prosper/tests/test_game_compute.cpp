@@ -2,6 +2,7 @@
 #include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/shader_resources.hpp"
 #include "../src/gpu/tile.hpp"
+#include "../src/host/guest_write_watch.hpp"
 #include "live_compute.hpp"
 #include "seed_reprove.hpp"
 
@@ -14,6 +15,10 @@
 #include <cstring>
 #include <limits>
 #include <vector>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 using namespace prosper::gpu;
 
@@ -480,9 +485,26 @@ int main() {
     // while a later external guest mutation must defeat that shortcut and be repaired normally.
     {
         constexpr uint32_t large_buffer_bytes = 1u << 20;
-        std::vector<uint32_t> large_result(large_buffer_bytes / sizeof(uint32_t), 0xababababu);
+        constexpr size_t large_words = large_buffer_bytes / sizeof(uint32_t);
+        std::vector<uint32_t> large_result_storage;
+        uint32_t* large_result = nullptr;
+#if defined(__linux__)
+        void* large_mapping = mmap(nullptr, large_buffer_bytes, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(large_mapping != MAP_FAILED, "map large writable compute-buffer regression range");
+        if (large_mapping == MAP_FAILED) return fails ? fails : 1;
+        large_result = static_cast<uint32_t*>(large_mapping);
+        prosper::host::guest_write_watch_set_fault_onstack(true);
+        prosper::host::guest_write_watch_notify_direct_mapping_added(
+            reinterpret_cast<uint64_t>(large_result), large_buffer_bytes, 0x6b0000,
+            0x3 /* SCE CPU_READ|CPU_WRITE */);
+#else
+        large_result_storage.resize(large_words);
+        large_result = large_result_storage.data();
+#endif
+        std::fill_n(large_result, large_words, 0xababababu);
         ShaderResource large_buffer = buffer;
-        large_buffer.gpu_addr = reinterpret_cast<uint64_t>(large_result.data());
+        large_buffer.gpu_addr = reinterpret_cast<uint64_t>(large_result);
         large_buffer.size = large_buffer_bytes;
         ShaderResourceTable large_rt;
         large_rt.resources.push_back(large_buffer);
@@ -492,9 +514,17 @@ int main() {
 
         CHECK(prosper::frontend::execute_live_compute_items({large_item}),
               "large writable buffer dispatch establishes an exact retained result");
-        const std::vector<uint32_t> large_expected = large_result;
+        const std::vector<uint32_t> large_expected(large_result, large_result + large_words);
         const uint64_t buffer_skips_before =
             prosper::frontend::live_compute_buffer_gpu_result_skips();
+#if defined(__linux__)
+        auto unchanged_result_watch = prosper::host::GuestWriteWatch::create(
+            reinterpret_cast<uint64_t>(large_result), large_buffer_bytes);
+        CHECK(static_cast<bool>(unchanged_result_watch) &&
+                  unchanged_result_watch.query() ==
+                      prosper::host::GuestWriteWatchQuery::Unchanged,
+              "arm guest-byte watch around retained compute-buffer result");
+#endif
         uint32_t large_repeat_notifications = 0;
         set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
             if (addr == large_buffer.gpu_addr && size == large_buffer.size)
@@ -503,10 +533,17 @@ int main() {
         CHECK(prosper::frontend::execute_live_compute_items({large_item}),
               "large writable buffer repeats against its exact GPU baseline");
         set_guest_gpu_write_observer({});
-        CHECK(large_result == large_expected && large_repeat_notifications == 1,
+        CHECK(std::equal(large_result, large_result + large_words, large_expected.begin()) &&
+                  large_repeat_notifications == 1,
               "GPU-identical buffer output preserves bytes and architectural invalidation");
         CHECK(prosper::frontend::live_compute_buffer_gpu_result_skips() > buffer_skips_before,
               "large idempotent buffer takes the exact GPU result-comparison fast path");
+#if defined(__linux__)
+        CHECK(unchanged_result_watch.query() ==
+                  prosper::host::GuestWriteWatchQuery::Unchanged,
+              "GPU-identical production dispatch keeps guest-byte watches clean");
+        unchanged_result_watch.reset();
+#endif
 
         large_result[0] ^= 0xffffffffu;
         uint32_t large_repair_notifications = 0;
@@ -517,8 +554,15 @@ int main() {
         CHECK(prosper::frontend::execute_live_compute_items({large_item}),
               "externally changed buffer reruns with exact source validation");
         set_guest_gpu_write_observer({});
-        CHECK(large_result == large_expected && large_repair_notifications == 1,
+        CHECK(std::equal(large_result, large_result + large_words, large_expected.begin()) &&
+                  large_repair_notifications == 1,
               "external buffer mutation forces exact guest repair and invalidation");
+#if defined(__linux__)
+        prosper::host::guest_write_watch_notify_direct_mapping_removed(
+            reinterpret_cast<uint64_t>(large_result), large_buffer_bytes);
+        prosper::host::guest_write_watch_set_fault_onstack(false);
+        munmap(large_result, large_buffer_bytes);
+#endif
     }
 
     std::fill(result.begin(), result.end(), 0xeeeeeeee);

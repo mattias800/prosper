@@ -5107,6 +5107,14 @@ void notify_guest_gpu_write(uint64_t addr, uint64_t size) {
     }
     if (g_guest_gpu_write_observer) g_guest_gpu_write_observer(addr, size);
 }
+void notify_guest_gpu_write_preserving_bytes(uint64_t addr, uint64_t size) {
+    if (!addr || !size) return;
+    // The observer owns renderer-resident aliases (color/depth targets and their CPU snapshots),
+    // which may differ from the exact guest bytes even when a compute result does not. Guest-memory
+    // caches, page watches, and the submit journal remain valid because the caller proved that those
+    // bytes were not modified.
+    if (g_guest_gpu_write_observer) g_guest_gpu_write_observer(addr, size);
+}
 GuestGpuWriteSnapshot guest_gpu_write_snapshot() {
     if (!g_guest_gpu_writes.active || g_guest_gpu_writes.overflowed) return {};
     return {g_guest_gpu_writes.submit_serial, g_guest_gpu_writes.writes.size()};

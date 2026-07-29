@@ -482,6 +482,10 @@ using LiveComputeFn = std::function<bool(const std::vector<ComputeItem>& items)>
 using GuestGpuWriteObserver = std::function<void(uint64_t addr, uint64_t size)>;
 void set_guest_gpu_write_observer(GuestGpuWriteObserver observer);
 void notify_guest_gpu_write(uint64_t addr, uint64_t size);
+// A backend can prove that a dispatched write reproduced the exact guest bytes while renderer-owned
+// aliases at the same address may still hold divergent state. Notify those alias owners without
+// dirtying guest-byte watches or the in-submit mutation journal.
+void notify_guest_gpu_write_preserving_bytes(uint64_t addr, uint64_t size);
 
 // A validation snapshot is meaningful only inside one synchronous execute_ordered_items call.
 // It lets a backend prove that no retained GPU operation wrote a resource between graphics spans;

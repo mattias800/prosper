@@ -4853,7 +4853,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  (unsigned long long)buffer.resource->gpu_addr,
                                  buffer.resource->size);
                 if (buffer.resource->gpu_addr)
-                    notify_guest_gpu_write(
+                    notify_guest_gpu_write_preserving_bytes(
                         buffer.resource->gpu_addr, buffer.resource->size);
                 if (buffer.persistent)
                     ctx.validate_cached_buffer_source(buffer.cache_key);
