@@ -113,6 +113,21 @@ void decode_operands(Rdna2Inst& i) {
                         i.has_modifier = false;
                     }
                 }
+                // v_cvt_i32_f32_sdwa may write only one destination word while preserving the
+                // other. Astro's world-map material uses WORD_0 + UNUSED_PRESERVE from a full
+                // DWORD f32 source before packing two integer results into one VGPR.
+                else if (((w >> 9) & 0xFFu) == 0x08u) {
+                    const uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
+                    const uint32_t s0sel = (sd >> 16) & 7u;
+                    if ((dsel == 4u || dsel == 5u) && dun == 2u && s0sel == 6u &&
+                        !((sd >> 19) & 0x9u) && !i.clamp && !i.omod &&
+                        !i.src_neg[0] && !i.src_abs[0]) {
+                        i.sdwa_dst_sel = static_cast<uint8_t>(dsel);
+                        i.sdwa_dst_unused = static_cast<uint8_t>(dun);
+                        i.sdwa_src0_sel = static_cast<uint8_t>(s0sel);
+                        i.has_modifier = false;
+                    }
+                }
                 // Integer-to-f32 conversion may select a byte/word before conversion. Unsigned
                 // conversion zero-extends it; signed conversion honors SDWA SEXT (bit 19). Astro's
                 // title post PS uses WORD_1+SEXT for v_cvt_f32_i32.
