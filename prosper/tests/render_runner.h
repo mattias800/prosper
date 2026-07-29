@@ -1144,6 +1144,51 @@ inline void init_persistent_color_target_device_budget(
             (unsigned long long)(heap / (1024ull * 1024ull)));
 }
 
+// Sampled images and color targets are independent residency pools. A large immutable source can
+// legitimately approach one GiB by itself (for example a maximum-size block-compressed atlas after
+// expansion), so the historical fixed 1 GiB image budget can continuously evict the rest of a hot
+// set. Keep small GPUs at that old bound while allowing capable devices up to 2 GiB. Unlike an
+// allocation, this is only a ceiling; memory is committed on exact-version cache insertion.
+inline VkDeviceSize persistent_texture_cache_budget_for_heap(VkDeviceSize heap) {
+    constexpr VkDeviceSize min_bytes = 1024ull * 1024ull * 1024ull;
+    constexpr VkDeviceSize max_bytes = 2048ull * 1024ull * 1024ull;
+    return std::clamp<VkDeviceSize>(heap / 8u, min_bytes, max_bytes);
+}
+
+inline VkDeviceSize& persistent_texture_cache_device_budget() {
+    static VkDeviceSize budget = 0;
+    return budget;
+}
+
+inline void init_persistent_texture_cache_device_budget(
+    const VkPhysicalDeviceMemoryProperties& memp) {
+    if (persistent_texture_cache_device_budget() != 0) return;
+    VkDeviceSize heap = 0;
+    for (uint32_t i = 0; i < memp.memoryHeapCount; ++i)
+        if (memp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            heap = std::max(heap, memp.memoryHeaps[i].size);
+    persistent_texture_cache_device_budget() =
+        persistent_texture_cache_budget_for_heap(heap);
+    fprintf(stderr, "[render] persistent texture-image residency budget = %llu MiB "
+            "(device-local heap %llu MiB)\n",
+            (unsigned long long)(persistent_texture_cache_device_budget() /
+                                 (1024ull * 1024ull)),
+            (unsigned long long)(heap / (1024ull * 1024ull)));
+}
+
+inline VkDeviceSize persistent_texture_cache_limit() {
+    static const bool have_env = getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB") != nullptr;
+    static const VkDeviceSize env_limit = []() -> VkDeviceSize {
+        const char* value = getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB");
+        const uint64_t mib = value ? strtoull(value, nullptr, 10) : 1024ull;
+        if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
+        return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
+    }();
+    if (have_env) return env_limit;
+    const VkDeviceSize device_budget = persistent_texture_cache_device_budget();
+    return device_budget ? device_budget : 1024ull * 1024ull * 1024ull;
+}
+
 // Max number of distinct render targets kept GPU-resident (sampleable) at once. A target that would
 // exceed this count is created non-resident (no SAMPLED_BIT), forcing every later sample of it onto the
 // CPU detile path. At 4K a deferred renderer (G-buffer MRTs + lighting + post chain) easily needs more
@@ -2510,6 +2555,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const bool aniso_enabled = ctx.aniso_enabled; const float max_aniso_limit = ctx.max_aniso_limit;
     VkPhysicalDeviceMemoryProperties memp; vkGetPhysicalDeviceMemoryProperties(phys, &memp);
     init_persistent_color_target_device_budget(memp);   // size the residency budget once (#1177)
+    init_persistent_texture_cache_device_budget(memp);
     auto pick = [&](uint32_t bits, VkMemoryPropertyFlags want) -> uint32_t {
         for (uint32_t i = 0; i < memp.memoryTypeCount; i++)
             if ((bits & (1u << i)) && (memp.memoryTypes[i].propertyFlags & want) == want) return i;
@@ -3238,12 +3284,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const uint64_t texture_generation = ++persistent_texture_generation;
     const bool persistent_textures_enabled =
         getenv("PROSPER_NO_BACKEND_PERSISTENT_TEXTURES") == nullptr;
-    const VkDeviceSize persistent_texture_limit = []() -> VkDeviceSize {
-        const char* value = getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB");
-        const uint64_t mib = value ? strtoull(value, nullptr, 10) : 1024ull;
-        if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
-        return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
-    }();
+    const VkDeviceSize persistent_texture_limit = persistent_texture_cache_limit();
     const bool share_backend_resources =
         getenv("PROSPER_NO_BACKEND_RESOURCE_SHARE") == nullptr;
     const bool reuse_host_buffers = render_host_buffer_pool_enabled();
@@ -4624,11 +4665,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     }
 
     const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
-    // A complete MRT result is one coherent contract: capture every active attachment. Single-target
-    // passes retain the persistent no-readback fast path.
-    const bool readback_color0 = color_count > 1 || !persistent_color || color_target->readback;
-    const bool readback_color1 = use_color1;
-    const bool readback_requested = readback_color0 || readback_color1;
+    // Persistent MRT0/MRT1 attachments retain their independent readback contracts. In particular,
+    // merely requesting the complete MRT shape must not materialize either GPU-resident image on the
+    // CPU. Slots 2+ are currently transient backend attachments, so a caller requesting them through
+    // BackendMrtOutputs still needs those planes copied before the images are released.
+    const bool readback_color0 = !persistent_color || color_target->readback;
+    const bool readback_color1 = use_color1 &&
+        (!persistent_color1 || color_target->readback1);
+    const bool readback_requested = readback_color0 || readback_color1 || color_count > 2;
     const bool storage_writeback_requested = std::any_of(
         texture_uploads.begin(), texture_uploads.end(),
         [](const SharedTextureUpload& upload) {

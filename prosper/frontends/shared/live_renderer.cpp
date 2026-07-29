@@ -35,6 +35,15 @@
 #include <set>
 #include <unordered_map>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 // Classify a guest address: 0 => not within a reserved/committed guest mapping (see hle_kernel_mem).
 extern "C" int prosper_reserved_range_state(uint64_t addr);
 #ifdef _WIN32
@@ -339,6 +348,37 @@ struct PersistentDecodedTexture {
 
     size_t bytes() const { return source_prefix.size() + pixels.size(); }
 };
+
+uint64_t host_physical_memory_bytes() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    return GlobalMemoryStatusEx(&status) ? status.ullTotalPhys : 0;
+#else
+    const long pages = sysconf(_SC_PHYS_PAGES);
+    const long page_bytes = sysconf(_SC_PAGESIZE);
+    if (pages <= 0 || page_bytes <= 0) return 0;
+    const uint64_t count = static_cast<uint64_t>(pages);
+    const uint64_t bytes = static_cast<uint64_t>(page_bytes);
+    return count <= UINT64_MAX / bytes ? count * bytes : UINT64_MAX;
+#endif
+}
+}
+
+size_t texture_decode_cache_limit_bytes(const char* override_mib,
+                                        uint64_t physical_memory_bytes) {
+    constexpr uint64_t kMiB = 1024ull * 1024ull;
+    constexpr uint64_t kMinBytes = 1024ull * kMiB;
+    constexpr uint64_t kMaxBytes = 2048ull * kMiB;
+    uint64_t bytes = kMinBytes;
+    if (override_mib) {
+        const uint64_t mib = strtoull(override_mib, nullptr, 10);
+        bytes = std::min<uint64_t>(mib, SIZE_MAX / kMiB) * kMiB;
+    } else if (physical_memory_bytes) {
+        bytes = std::clamp(physical_memory_bytes / 8u, kMinBytes, kMaxBytes);
+        bytes -= bytes % kMiB;
+    }
+    return static_cast<size_t>(std::min<uint64_t>(bytes, SIZE_MAX));
 }
 
 uint32_t buffer_upload_bytes(uint32_t declared_bytes) {
@@ -1063,11 +1103,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             const uint64_t decode_generation = ++persistent_decode_generation;
             static uint64_t persistent_texture_id = 0;
             static std::vector<uint8_t> persistent_validation_scratch;
-            const size_t persistent_decode_limit = [] {
-                const char* value = getenv("PROSPER_TEXTURE_DECODE_CACHE_MB");
-                const uint64_t mib = value ? strtoull(value, nullptr, 10) : 1024ull;
-                return static_cast<size_t>(std::min<uint64_t>(mib, SIZE_MAX / (1024ull * 1024ull))) *
-                       1024ull * 1024ull;
+            static const size_t persistent_decode_limit = [] {
+                const uint64_t physical_bytes = host_physical_memory_bytes();
+                const size_t limit = texture_decode_cache_limit_bytes(
+                    getenv("PROSPER_TEXTURE_DECODE_CACHE_MB"), physical_bytes);
+                fprintf(stderr,
+                        "[render] decoded texture cache budget = %.1f MiB "
+                        "(host physical %.1f GiB)\n",
+                        limit / (1024.0 * 1024.0),
+                        physical_bytes / (1024.0 * 1024.0 * 1024.0));
+                return limit;
             }();
             uint32_t resource_hash_w = 0, resource_hash_h = 0;
             if (const char* dim = getenv("PROSPER_RESOURCE_HASH_DIM"))

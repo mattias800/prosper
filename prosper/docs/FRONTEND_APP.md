@@ -299,7 +299,7 @@ bytes, tiled sources retain the padded tiled range, and block-compressed sources
 block dimensions and block size. Changed bytes, mapping/readability changes, or address reuse
 invalidates the entry and creates a new content-version ID. Live render targets, storage images,
 captured host backing, cube/volume textures, DCC surfaces, and other formats remain excluded. The
-default budget is 1 GiB, which covers Evergate's measured 835 MiB working set; use
+default ceiling is one eighth of host physical memory, clamped to 1-2 GiB; use
 `PROSPER_TEXTURE_DECODE_CACHE_MB=<MiB>` to change it or
 `PROSPER_NO_TEXTURE_DECODE_CACHE=1` for an A/B run. Timing reports cross-submit `texture_cache`
 hits/misses/invalidations separately from `textures` (all texture uses) and `reused` (both local and
@@ -314,7 +314,8 @@ supplies a nonzero content-version ID. Cache hits skip image allocation, staging
 copy, transfer commands, and upload barriers. Exact image-view and sampler contracts over a retained
 image remain resident with that image, under a 32-contract per-image bound; set
 `PROSPER_NO_BACKEND_PERSISTENT_TEXTURE_BINDINGS=1` to retain images while restoring callback-local
-bindings for an A/B. The image cache is bounded to 1 GiB and 1024 allocations by default. Set
+bindings for an A/B. Its default byte ceiling is one eighth of the largest device-local heap,
+clamped to 1-2 GiB, with at most 1024 allocations. Set
 `PROSPER_BACKEND_TEXTURE_CACHE_MB=<MiB>` to change the byte budget or
 `PROSPER_NO_BACKEND_PERSISTENT_TEXTURES=1` for a forced-upload A/B. Backend timing reports
 `persistent=hits/misses` and the current cache bytes. The frontend decoded-pixel budget and backend

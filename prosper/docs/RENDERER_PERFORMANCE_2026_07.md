@@ -57,9 +57,26 @@ The persistent texture cache now covers guest-backed linear/tiled 2D sampled `Un
 `Float32` textures with supported component counts, plus BC1-BC7 textures. It excludes render targets,
 storage images, cube/volume and DCC surfaces, captured host backing, and unsupported formats. Every hit
 validates the complete native, padded-tiled, or compressed-block source range, so address reuse and
-in-place mutation invalidate the entry. Its default 1 GiB budget covers Evergate's measured 835 MiB
-decoded working set. Disable it with `PROSPER_NO_TEXTURE_DECODE_CACHE=1`; the budget is controlled by
+in-place mutation invalidate the entry. Its memory-aware default is one eighth of host physical
+memory, clamped to 1-2 GiB. Disable it with `PROSPER_NO_TEXTURE_DECODE_CACHE=1`; the budget is controlled by
 `PROSPER_TEXTURE_DECODE_CACHE_MB`.
+
+## Plucky Squire maximum-size atlas retention (2026-07-29)
+
+Plucky Squire exposed a capacity cliff rather than a decode-kernel regression. The title first holds
+about 590 MiB of decoded textures, then introduces a valid 14,208x13,552 BC3 atlas. Its compressed
+source plus RGBA8 decode occupies about 930 MiB, so the former fixed 1 GiB frontend budget could not
+retain both sets. It repeatedly decoded 3.1-3.5 GiB of texture references per submit, spent
+0.7-2.9 seconds in frontend resource building, and recreated write watches over millions of pages.
+The app fell from 15-20 FPS to 0.4-0.8 FPS despite zero render-target readbacks.
+
+Matched native-cadence A/B runs showed that a 2 GiB frontend ceiling retained the measured
+1.52-1.64 GiB hot set: after one cold decode, frontend resource building returned to about 5-7 ms.
+Raising the independent backend sampled-image ceiling to 2 GiB then reduced steady backend resource
+setup from about 10-20 ms to 1.2-1.4 ms, producing roughly 17-20 FPS in the same scene. These are caps,
+not preallocations. Both defaults now use one eighth of their relevant physical/device-local memory,
+clamped to 1-2 GiB, so an 8 GiB host or GPU retains the historical 1 GiB behavior and both explicit
+MiB overrides retain precedence.
 
 ## Cobra Float32 sampled-texture retention (2026-07-25)
 

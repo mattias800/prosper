@@ -919,6 +919,24 @@ int main() {
               "an absurd declaration is still bounded by the 64 MiB ceiling");
     }
 
+    // A cache ceiling is not a preallocation. Scale capable hosts/devices to 2 GiB so one large
+    // immutable atlas cannot evict the rest of a frame's hot set, while an 8 GiB machine retains the
+    // historical 1 GiB bound. Explicit overrides remain exact for diagnostics and constrained hosts.
+    {
+        constexpr uint64_t GiB = 1024ull * 1024ull * 1024ull;
+        using prosper::frontend::texture_decode_cache_limit_bytes;
+        CHECK(texture_decode_cache_limit_bytes(nullptr, 8ull * GiB) == 1ull * GiB,
+              "an 8 GiB host keeps the 1 GiB decoded-texture ceiling");
+        CHECK(texture_decode_cache_limit_bytes(nullptr, 16ull * GiB) == 2ull * GiB,
+              "a capable host admits the 2 GiB decoded-texture ceiling");
+        CHECK(texture_decode_cache_limit_bytes("512", 128ull * GiB) == 512ull * 1024ull * 1024ull,
+              "the decoded-texture MiB override takes precedence over host memory");
+        CHECK(prosper::test::persistent_texture_cache_budget_for_heap(8ull * GiB) == 1ull * GiB,
+              "an 8 GiB device keeps the 1 GiB sampled-image ceiling");
+        CHECK(prosper::test::persistent_texture_cache_budget_for_heap(16ull * GiB) == 2ull * GiB,
+              "a capable device admits the 2 GiB sampled-image ceiling");
+    }
+
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n"); return 0;
 }

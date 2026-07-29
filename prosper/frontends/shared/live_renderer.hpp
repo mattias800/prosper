@@ -6,6 +6,7 @@
 // present layer (present_write_frame → present_readback). All the boot-time diagnostics
 // (PROSPER_RENDER_*, PROSPER_DUMP_*, PROSPER_TESTTEX, …) are preserved and remain env-gated.
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -20,6 +21,13 @@ namespace prosper::frontend {
 // short upload — from that ceiling or the override — is reported by the caller rather than
 // silently dropped; only the sub-dword alignment remainder is dropped without a report.
 uint32_t buffer_upload_bytes(uint32_t declared_bytes);
+
+// Resolve the bounded decoded-texture cache budget. An explicit MiB string preserves the
+// PROSPER_TEXTURE_DECODE_CACHE_MB contract; without one, the budget follows one eighth of host
+// physical memory, clamped to [1 GiB, 2 GiB]. Keeping this policy pure makes the memory tradeoff
+// directly testable without constructing a renderer or depending on the test host's RAM size.
+size_t texture_decode_cache_limit_bytes(const char* override_mib,
+                                        uint64_t physical_memory_bytes);
 
 // Register the live renderer. `frame_dir` is where periodic BMP screenshots are written; pass
 // `dump_bmps = false` (the frontend app) to suppress them — a windowed app presents to screen and
