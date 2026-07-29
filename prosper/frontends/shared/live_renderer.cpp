@@ -1048,8 +1048,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         std::vector<uint8_t> metadata(static_cast<size_t>(metadata_bytes));
                         size_t copied = 0;
                         if (resource.dcc_metadata_host_data) {
-                            copied = std::min(metadata.size(),
-                                resource.dcc_metadata_host_data_size);
+                            copied = static_cast<size_t>(std::min<uint64_t>(
+                                metadata.size(), resource.dcc_metadata_host_data_size));
                             std::memcpy(metadata.data(), resource.dcc_metadata_host_data, copied);
                         } else {
                             copied = safe_copy(metadata.data(), resource.metadata_addr,
