@@ -62,6 +62,21 @@ static bool has_spirv_builtin(const std::vector<uint32_t>& spv, uint32_t builtin
     }
     return false;
 }
+static bool has_spirv_local_size(const std::vector<uint32_t>& spv,
+                                 uint32_t x, uint32_t y, uint32_t z) {
+    constexpr uint16_t OpExecutionMode = 16;
+    constexpr uint32_t ExecutionModeLocalSize = 17;
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        if (!count || word + count > spv.size()) return false;
+        if ((spv[word] & 0xFFFFu) == OpExecutionMode && count == 6 &&
+            spv[word + 2] == ExecutionModeLocalSize && spv[word + 3] == x &&
+            spv[word + 4] == y && spv[word + 5] == z)
+            return true;
+        word += count;
+    }
+    return false;
+}
 
 int main() {
     printf("== test_rdna2_to_spirv ==\n");
@@ -523,7 +538,8 @@ int main() {
     CHECK(got17d.size()==N && bad17d==0,
           "CFG dispatcher emulates a 64-lane wave across narrower Vulkan subgroups");
     ComputeShaderConfig native_cfg17d;
-    native_cfg17d.local_x = 64;
+    native_cfg17d.local_x = 8;
+    native_cfg17d.local_y = 8;
     native_cfg17d.wave_size = 64;
     native_cfg17d.native_subgroup_size = 64;
     const std::vector<uint32_t> native_spv17d = recompile_compute(
@@ -537,6 +553,8 @@ int main() {
               count_spirv_opcode(native_spv17d, 134) >= 2 &&
               count_spirv_opcode(native_spv17d, 137) >= 2,
           "exact-wave compute remaps local coordinates in full-subgroup lane order");
+    CHECK(has_spirv_local_size(native_spv17d, 64, 1, 1),
+          "multidimensional guest wave flattens Vulkan LocalSize X for full subgroups");
 
     // Kernel 17d2: Astro's mask-priority sequence compares a VOPC-produced SGPR pair against zero,
     // then uses that wave-uniform SCC in s_cselect_b64.  Keep the irreducible prefix so this exercises

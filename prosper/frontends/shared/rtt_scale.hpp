@@ -70,4 +70,12 @@ constexpr bool rtt_direct_import_compatible(bool storage_image,
         requested_w, requested_h, cached_w, cached_h, render_scale, normalized_sampling);
 }
 
+// On-device image copies do not scale. A normalized sampled descriptor may legally borrow a
+// renderer image reduced by PROSPER_RENDER_SCALE, but that image cannot seed a native-resolution
+// writable storage image with vkCmdCopyImage unless the actual Vulkan extents match exactly.
+constexpr bool rtt_gpu_seed_import_extent_compatible(uint32_t storage_w, uint32_t storage_h,
+                                                      uint32_t imported_w, uint32_t imported_h) {
+    return storage_w && storage_h && storage_w == imported_w && storage_h == imported_h;
+}
+
 } // namespace prosper::frontend

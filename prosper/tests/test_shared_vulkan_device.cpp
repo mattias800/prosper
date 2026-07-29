@@ -16,6 +16,66 @@ static int fails = 0;
                               else         { printf("  [ok]   %s\n", msg); } } while (0)
 
 int main() {
+    // Device-contract selection is pure and must reject capability bits that cannot belong to the
+    // context compute will actually execute on. A multidimensional 8x8 guest group remains eligible:
+    // the native shader flattens its Vulkan LocalSize to 64x1x1 before requiring full subgroups.
+    prosper::gpu::SharedVulkanContext eligible;
+    eligible.instance = eligible.physical = eligible.device = eligible.queue =
+        reinterpret_cast<void*>(1);
+    eligible.queue_family = 0;
+    eligible.storage_image_read_without_format = true;
+    eligible.storage_image_write_without_format = true;
+    eligible.compute_queue_supported = true;
+    eligible.compute_subgroup_size_control = true;
+    eligible.compute_full_subgroups = true;
+    eligible.compute_subgroup_vote = true;
+    eligible.compute_subgroup_arithmetic = true;
+    eligible.min_compute_subgroup_size = 32;
+    eligible.max_compute_subgroup_size = 64;
+    eligible.max_compute_workgroup_subgroups = 4;
+    eligible.max_compute_workgroup_size_x = 256;
+    eligible.max_compute_workgroup_invocations = 256;
+    prosper::gpu::ComputeShaderConfig multidimensional;
+    multidimensional.local_x = 8;
+    multidimensional.local_y = 8;
+    multidimensional.local_z = 1;
+    multidimensional.wave_size = 64;
+    CHECK(prosper::gpu::select_native_compute_subgroup_size(
+              eligible, multidimensional, false, false) == 64,
+          "8x8 guest wave selects a flattened full-subgroup compute shell");
+    auto no_compute_queue = eligible;
+    no_compute_queue.compute_queue_supported = false;
+    CHECK(prosper::gpu::select_native_compute_subgroup_size(
+              no_compute_queue, multidimensional, false, false) == 0,
+          "native subgroup path rejects a renderer context compute cannot adopt");
+    auto one_subgroup = eligible;
+    one_subgroup.max_compute_workgroup_subgroups = 1;
+    auto two_waves = multidimensional;
+    two_waves.local_y = 16;
+    CHECK(prosper::gpu::select_native_compute_subgroup_size(
+              one_subgroup, multidimensional, false, false) == 64 &&
+          prosper::gpu::select_native_compute_subgroup_size(
+              one_subgroup, two_waves, false, false) == 0,
+          "native subgroup selection enforces maxComputeWorkgroupSubgroups boundary");
+    auto narrow_flattened_x = eligible;
+    narrow_flattened_x.max_compute_workgroup_size_x = 128;
+    auto guest_16x16 = multidimensional;
+    guest_16x16.local_x = 16;
+    guest_16x16.local_y = 16;
+    CHECK(prosper::gpu::select_native_compute_subgroup_size(
+              narrow_flattened_x, guest_16x16, false, false) == 0,
+          "native subgroup selection rejects flattened X beyond the device limit");
+    auto low_invocation_limit = eligible;
+    low_invocation_limit.max_compute_workgroup_invocations = 64;
+    CHECK(prosper::gpu::select_native_compute_subgroup_size(
+              low_invocation_limit, two_waves, false, false) == 0,
+          "native subgroup selection enforces the core workgroup invocation limit");
+    CHECK(prosper::gpu::select_native_compute_subgroup_size(
+              eligible, multidimensional, true, false) == 0 &&
+          prosper::gpu::select_native_compute_subgroup_size(
+              eligible, multidimensional, false, true) == 0,
+          "captures and explicit opt-out retain the portable compute shell");
+
     // Nothing published before the renderer initializes: headless compute-only use must keep
     // creating its own device (tests/test_game_compute.cpp depends on this).
     CHECK(!prosper::gpu::shared_vulkan_context().valid(),
@@ -57,6 +117,12 @@ int main() {
           "published storage-image WRITE flag reflects the device");
     CHECK(shared.compute_full_subgroups == ctx.compute_full_subgroups,
           "published full-compute-subgroup flag reflects the enabled device feature");
+    CHECK(shared.max_compute_workgroup_subgroups == ctx.max_compute_workgroup_subgroups,
+          "published full-subgroup workgroup bound reflects the physical-device property");
+    CHECK(shared.max_compute_workgroup_size_x == ctx.max_compute_workgroup_size_x &&
+              shared.max_compute_workgroup_invocations ==
+                  ctx.max_compute_workgroup_invocations,
+          "published flattened-workgroup limits reflect the physical-device properties");
 
     // Adopting a queue family without COMPUTE would make every dispatch invalid usage.
     uint32_t count = 0;

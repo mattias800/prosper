@@ -639,6 +639,11 @@ struct VulkanComputeContext {
     // tests/image_compute_runner.h, the exec-diff harness for that contract). When the device lacks
     // the features, image-binding dispatches are skipped loudly instead of creating an invalid device.
     bool image_support = false;
+    // Exact-subgroup pipelines are valid only on an adopted renderer device that enabled the
+    // published size-control/full-subgroup contract. Private fallback devices deliberately do not
+    // enable that optional extension.
+    bool native_subgroup_contract = false;
+    uint32_t min_native_subgroup_size = 0, max_native_subgroup_size = 0;
     // True when instance/device/queue were ADOPTED from the live renderer (#1091). A borrowed
     // context is owned by the renderer: destroy our own pipelines/pools/memory, never its device.
     bool borrowed = false;
@@ -1212,6 +1217,11 @@ struct VulkanComputeContext {
             queue_family = shared.queue_family;
             borrowed = true;
             image_support = true;
+            native_subgroup_contract = shared.compute_subgroup_size_control &&
+                shared.compute_full_subgroups && shared.compute_subgroup_vote &&
+                shared.compute_subgroup_arithmetic;
+            min_native_subgroup_size = shared.min_compute_subgroup_size;
+            max_native_subgroup_size = shared.max_compute_subgroup_size;
             VkPipelineCacheCreateInfo pcci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
             if (vkCreatePipelineCache(device, &pcci, nullptr, &pipeline_cache) == VK_SUCCESS) {
                 vkGetPhysicalDeviceMemoryProperties(physical, &memory);
@@ -1226,6 +1236,8 @@ struct VulkanComputeContext {
             instance = VK_NULL_HANDLE; physical = VK_NULL_HANDLE;
             device = VK_NULL_HANDLE; queue = VK_NULL_HANDLE;
             queue_family = UINT32_MAX; borrowed = false; image_support = false;
+            native_subgroup_contract = false;
+            min_native_subgroup_size = max_native_subgroup_size = 0;
             pipeline_cache = VK_NULL_HANDLE;
         }
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -1375,6 +1387,7 @@ struct BoundImage {
     std::vector<uint8_t> seed_linear;   // #1122: detiled guest seed, kept on a proving frame so any
                                         // texel the write leaves untouched is restored (not corrupted)
     uint64_t imported_addr = 0;
+    uint32_t imported_width = 0, imported_height = 0; // actual renderer VkImage extent
     uint32_t imported_saved_layout = 0;      // VkImageLayout the renderer left the image in
     // Several bindings can borrow the SAME renderer image without being folded together, because
     // the import contract is looser than the alias contract (it ignores sampler state, T# size and
@@ -1737,6 +1750,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     double layout_ms = 0.0;
     const std::vector<uint32_t>& spirv = item.spirv;
     const bool trace = trace_compute_item(item);
+    if (item.required_subgroup_size &&
+        (!ctx.borrowed || !ctx.native_subgroup_contract ||
+         item.required_subgroup_size < ctx.min_native_subgroup_size ||
+         item.required_subgroup_size > ctx.max_native_subgroup_size)) {
+        std::fprintf(stderr,
+                     "[compute] program 0x%llx requires subgroup=%u on a context without "
+                     "that enabled contract -> dispatch skipped\n",
+                     (unsigned long long)item.code_addr, item.required_subgroup_size);
+        return false;
+    }
     const uint64_t image_validation_epoch = ++ctx.image_validation_clock;
     // #1122 review B1: enough invocations for all texels is NECESSARY but NOT SUFFICIENT
     // for skipping the seed. A write-only shader can store a subset of its grid (a masked composite:
@@ -2166,6 +2189,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         bi.imported_depth = depth_import;
                         bi.imported_format = depth_import ? depth_format : VK_FORMAT_UNDEFINED;
                         bi.imported_addr = r->gpu_addr;
+                        bi.imported_width = import.width;
+                        bi.imported_height = import.height;
                         bi.imported_saved_layout = import.layout;
                         bi.image = static_cast<VkImage>(import.image);
                         live_target.width = import.width;
@@ -2254,6 +2279,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     if (p->gpu_addr != r->gpu_addr || p->width != r->width ||
                         p->height != r->height || p->depth != r->depth ||
                         p->format != r->format || p->num_components != r->num_components)
+                        continue;
+                    if (!prosper::frontend::rtt_gpu_seed_import_extent_compatible(
+                            r->width, r->height,
+                            source.imported_width, source.imported_height))
                         continue;
                     bi.seed_from_imported = j;
                     if (trace)

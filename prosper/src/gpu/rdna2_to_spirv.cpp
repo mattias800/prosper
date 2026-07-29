@@ -1752,7 +1752,15 @@ struct SpirvCompute {
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
         is_compute = true;
         exec_model = Exec_GLCompute; iface = {v_gid, v_groupid, v_localid};   // EntryPoint deferred to finish()
-        put(exec, Op_ExecutionMode, {f_main, EM_LocalSize, local_x, local_y, local_z});
+        // REQUIRE_FULL_SUBGROUPS constrains LocalSize X, not merely the total workgroup size. The
+        // native shell never consumes Vulkan's LocalInvocationId: it reconstructs the original guest
+        // x/y/z coordinates below from the exact subgroup lane order. Declare the equivalent Vulkan
+        // workgroup flattened on X so 8x8 and other multidimensional guest waves satisfy that rule.
+        const uint32_t vulkan_local_x = native_subgroup_size ? local_count : local_x;
+        const uint32_t vulkan_local_y = native_subgroup_size ? 1u : local_y;
+        const uint32_t vulkan_local_z = native_subgroup_size ? 1u : local_z;
+        put(exec, Op_ExecutionMode,
+            {f_main, EM_LocalSize, vulkan_local_x, vulkan_local_y, vulkan_local_z});
         put(deco, Op_Decorate, {v_gid, Dec_BuiltIn, BI_GlobalInvocationId});
         put(deco, Op_Decorate, {v_groupid, Dec_BuiltIn, BI_WorkgroupId});
         put(deco, Op_Decorate, {v_localid, Dec_BuiltIn, BI_LocalInvocationId});   // wave lane index (.x)
@@ -9679,7 +9687,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const uint32_t local_y = std::max(1u, config.local_y);
     const uint32_t local_z = std::max(1u, config.local_z);
     const uint32_t wave_size = config.wave_size == 32 ? 32u : 64u;
-    b.native_subgroup_size = config.native_subgroup_size == wave_size ? wave_size : 0u;
+    const uint64_t local_count = static_cast<uint64_t>(local_x) * local_y * local_z;
+    b.native_subgroup_size = config.native_subgroup_size == wave_size &&
+        local_count <= UINT32_MAX && local_count % wave_size == 0 ? wave_size : 0u;
     b.native_storage_format_support = config.native_storage_format_support;
     b.begin(1, rt, local_x, local_y, local_z, wave_size,
             static_cast<uint32_t>(config.user_sgprs.size()));
