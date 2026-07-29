@@ -236,7 +236,7 @@ int main() {
         0xD8380100u, 0x00080706u,            // record dword 0/1 = v7/v8
         0xD8380302u, 0x00030206u,            // record dword 2/3 = position x/y
         0xD8380504u, 0x00010006u,            // record dword 4/5 = position z/w
-        0x7E120280u,                         // v9 = 0
+        0x7E12030Au,                         // v9 = v10 (make the MBCNT lane observable as PARAM1.x)
         0xD8340018u, 0x00000906u,            // record dword 6 = PARAM1.x
         0xBF8A0000u,
         0xBE802006u,                         // transfer to separately installed wrapper
@@ -257,10 +257,12 @@ int main() {
         0xF8000211u, 0x00000004u,            // exp param1.x v4
         0xBF810000u,
     };
+    ShaderResourceTable passthrough_rt;
+    passthrough_rt.vertices_per_instance = 3;
     const auto passthrough_vert = recompile_vertex_chain(
         passthrough_producer, std::size(passthrough_producer),
         passthrough_wrapper, std::size(passthrough_wrapper),
-        nullptr, nullptr, false, 7);
+        &passthrough_rt, nullptr, false, 7);
     CHECK(!passthrough_vert.empty(),
           "split no-GS NGG producer/wrapper accepts MAD and mul-plus-DS record addresses");
     if (!passthrough_vert.empty()) {
@@ -271,6 +273,44 @@ int main() {
         };
         CHECK(ppx.size() == (size_t)W * H * 4 && grn(16, 16) && !grn(60, 60),
               "no-GS NGG passthrough preserves logical vertex geometry across all host invocations");
+
+        // Consume flat PARAM1.x in the fragment shader, convert its integer lane value to red, and
+        // select each triangle's provoking vertex by rotating its indices. Repeated instances then
+        // exercise both MBCNT halves at 31/32/63 and prove that the next guest wave wraps to lane 0.
+        const uint32_t lane_ps[] = {
+            0xC8020402u,                         // v_interp_mov_f32 v0, p0, attr1.x
+            0x7E000D00u,                         // v_cvt_f32_u32 v0, v0
+            0x100000FFu, 0x3C800000u,            // v_mul_f32 v0, 1/64, v0
+            0x7E020280u, 0x7E040280u, 0x7E0602F2u,
+            0xF800180Fu, 0x03020100u, 0xBF810000u,
+        };
+        const auto lane_frag = recompile_fragment(lane_ps, std::size(lane_ps));
+        CHECK(!lane_frag.empty(), "flat NGG logical-lane varying is consumed by the fragment stage");
+        auto rendered_lane_red = [&](uint32_t instances,
+                                     std::vector<uint32_t> indices) -> int {
+            prosper::test::BackendDraw draw;
+            draw.vs = passthrough_vert;
+            draw.fs = lane_frag;
+            draw.indices = std::move(indices);
+            draw.instance_count = instances;
+            const auto pixels = prosper::test::render_draws_rgba({std::move(draw)}, W, H);
+            return pixels.size() == static_cast<size_t>(W) * H * 4
+                ? pixels[((size_t)16 * W + 16) * 4] : -1;
+        };
+        auto lane_matches = [&](uint32_t lane, uint32_t instances,
+                                std::vector<uint32_t> indices) {
+            const int red = rendered_lane_red(instances, std::move(indices));
+            const int expected = static_cast<int>((lane * 255u + 32u) / 64u);
+            return red >= expected - 2 && red <= expected + 2;
+        };
+        CHECK(!lane_frag.empty() && lane_matches(31, 11, {1, 2, 0}),
+              "NGG MBCNT exposes logical lane 31 at the low-half boundary");
+        CHECK(!lane_frag.empty() && lane_matches(32, 11, {2, 0, 1}),
+              "NGG MBCNT combines low/high halves into logical lane 32");
+        CHECK(!lane_frag.empty() && lane_matches(63, 22, {0, 1, 2}),
+              "NGG MBCNT combines low/high halves into logical lane 63");
+        CHECK(!lane_frag.empty() && lane_matches(0, 22, {1, 2, 0}),
+              "NGG MBCNT wraps the first invocation of the second guest wave to lane 0");
     }
     std::vector<uint32_t> masked_lane_producer(
         std::begin(passthrough_producer), std::end(passthrough_producer));
