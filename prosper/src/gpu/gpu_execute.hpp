@@ -504,6 +504,9 @@ struct LiveTargetImageImport {
     void* image = nullptr;    // VkImage owned by the live renderer
     void* device = nullptr;   // VkDevice it belongs to; the caller must be running on that device
     uint32_t layout = 0;      // VkImageLayout the renderer left it in -- restore it after the dispatch
+    // Explicit image-creation contract: a sampled import is not otherwise guaranteed to carry
+    // VK_IMAGE_USAGE_TRANSFER_DST_BIT, which the compute-result mirror requires.
+    bool transfer_dst = false;
     bool valid() const { return image && device && width && height; }
 };
 struct LiveTargetImageRequest {
@@ -517,16 +520,24 @@ struct LiveTargetImageRequest {
 using LiveTargetImageImportFn = std::function<bool(
     uint64_t gpu_addr, const LiveTargetImageRequest& request, LiveTargetImageImport& import)>;
 using LiveTargetImageReleaseFn = std::function<void(uint64_t gpu_addr)>;
-using LiveTargetImageWrittenFn = std::function<void(uint64_t gpu_addr)>;
+struct LiveTargetImageWrite {
+    uint64_t gpu_addr = 0;
+    uint32_t width = 0, height = 0;
+    LiveTargetPixelFormat format = LiveTargetPixelFormat::Rgba8Unorm;
+    bool valid() const { return gpu_addr && width && height; }
+};
+using LiveTargetImageWrittenFn = std::function<void(const LiveTargetImageWrite& write)>;
 void set_live_target_image_importer(LiveTargetImageImportFn import_fn,
                                     LiveTargetImageReleaseFn release_fn);
 void set_live_target_image_written_notifier(LiveTargetImageWrittenFn written_fn);
 bool import_live_render_target_image(uint64_t gpu_addr, const LiveTargetImageRequest& request,
                                      LiveTargetImageImport& import);
 void release_live_render_target_image(uint64_t gpu_addr);
-// Publish that a borrowed renderer image was modified in place. The renderer keeps the Vulkan image
-// authoritative and discards any older CPU readback mirror; guest bytes intentionally stay deferred.
-void notify_live_render_target_image_written(uint64_t gpu_addr);
+// Publish that a borrowed renderer image received the completed compute result. The caller may also
+// have written the exact guest bytes for alias correctness; the renderer processes that normal
+// invalidation first, then re-authorizes only this exact image identity and discards an older CPU
+// readback mirror.
+void notify_live_render_target_image_written(const LiveTargetImageWrite& write);
 // Shared Vulkan device (#1091 phase 1). live_compute historically created its own VkInstance/VkDevice,
 // so a renderer-owned image could never be bound to a dispatch and had to round-trip through host
 // memory. The live renderer publishes its already-created device here; the compute backend ADOPTS it

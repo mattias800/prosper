@@ -16,6 +16,36 @@ static int fails = 0;
                               else         { printf("  [ok]   %s\n", msg); } } while (0)
 
 int main() {
+    // Mirrored compute publication invalidates every overlapping cached interpretation, then
+    // re-authorizes only the exact renderer image that received the device-local copy.
+    {
+        auto& cache = prosper::test::persistent_color_target_cache();
+        cache.clear();
+        constexpr uint64_t base = 0x500000;
+        const prosper::test::PersistentColorTargetKey exact{
+            base, 3840, 2160, VK_FORMAT_R16G16B16A16_SFLOAT};
+        const prosper::test::PersistentColorTargetKey overlapping_alias{
+            base + 0x1000, 1920, 1080, VK_FORMAT_R8G8B8A8_UNORM};
+        cache[exact].image = reinterpret_cast<VkImage>(uintptr_t{1});
+        cache[exact].layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        cache[exact].valid = true;
+        cache[overlapping_alias].image = reinterpret_cast<VkImage>(uintptr_t{2});
+        cache[overlapping_alias].layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        cache[overlapping_alias].valid = true;
+        auto& exact_target = cache.at(exact);
+        auto& alias_target = cache.at(overlapping_alias);
+        prosper::test::invalidate_persistent_color_target_guest_write(
+            base, static_cast<uint64_t>(3840) * 2160 * 8);
+        CHECK(!exact_target.valid && !alias_target.valid,
+              "guest write invalidates the exact target and every overlapping alias first");
+        CHECK(prosper::test::restore_persistent_color_target_after_mirrored_write(
+                  exact.id, exact.width, exact.height, exact.format),
+              "completed device-local mirror restores the exact renderer target");
+        CHECK(exact_target.valid && !alias_target.valid,
+              "mirrored publication does not resurrect an overlapping non-identical alias");
+        cache.clear();
+    }
+
     // Device-contract selection is pure and must reject capability bits that cannot belong to the
     // context compute will actually execute on. A multidimensional 8x8 guest group remains eligible:
     // the native shader flattens its Vulkan LocalSize to 64x1x1 before requiring full subgroups.

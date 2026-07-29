@@ -4714,8 +4714,8 @@ bool import_live_render_target_image(uint64_t gpu_addr, const LiveTargetImageReq
 void release_live_render_target_image(uint64_t gpu_addr) {
     if (g_live_target_image_release) g_live_target_image_release(gpu_addr);
 }
-void notify_live_render_target_image_written(uint64_t gpu_addr) {
-    if (g_live_target_image_written) g_live_target_image_written(gpu_addr);
+void notify_live_render_target_image_written(const LiveTargetImageWrite& write) {
+    if (g_live_target_image_written && write.valid()) g_live_target_image_written(write);
 }
 static SharedVulkanContext g_shared_vulkan;
 void set_shared_vulkan_context(const SharedVulkanContext& context) { g_shared_vulkan = context; }

@@ -18,6 +18,8 @@ using prosper::frontend::rtt_scaled_extent_compatible;
 using prosper::frontend::LiveRttAuthority;
 using prosper::frontend::live_rtt_authority;
 using prosper::frontend::live_rtt_gpu_importable;
+using prosper::frontend::live_rtt_compute_mirror_eligible;
+using prosper::frontend::live_rtt_mirror_identity_matches;
 
 static int failures = 0;
 #define CHECK(cond) do { if (!(cond)) { \
@@ -82,6 +84,18 @@ int main() {
     CHECK(live_rtt_gpu_importable(true, true));
     CHECK(!live_rtt_gpu_importable(false, true));
     CHECK(!live_rtt_gpu_importable(false, false));
+    CHECK(live_rtt_mirror_identity_matches(
+        0x100000, 3840, 2160, 97, 0x100000, 3840, 2160, 97));
+    CHECK(!live_rtt_mirror_identity_matches(
+        0x100000, 3840, 2160, 97, 0x100000, 1920, 4320, 97));
+    CHECK(!live_rtt_mirror_identity_matches(
+        0x100000, 3840, 2160, 97, 0x100000, 3840, 2160, 37));
+    CHECK(!live_rtt_mirror_identity_matches(
+        0x100000, 3840, 2160, 97, 0x100800, 3840, 2160, 97));
+    CHECK(live_rtt_compute_mirror_eligible(true, true, false));
+    CHECK(!live_rtt_compute_mirror_eligible(false, true, false));
+    CHECK(!live_rtt_compute_mirror_eligible(true, false, false));
+    CHECK(!live_rtt_compute_mirror_eligible(true, true, true));
 
     if (failures == 0) std::printf("rtt_scale: OK\n");
     return failures == 0 ? 0 : 1;

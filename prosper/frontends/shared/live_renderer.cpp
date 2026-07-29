@@ -509,6 +509,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             import.image = target->image;
             import.device = ctx.dev;
             import.layout = static_cast<uint32_t>(target->layout);
+            import.transfer_dst = true;
             return true;
         },
         [](uint64_t addr) {
@@ -518,14 +519,36 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             prosper::test::unpin_persistent_color_target(addr, pin.width, pin.height, pin.format);
             if (--pin.count == 0) pinned_imports.erase(pinned);
         });
-    prosper::gpu::set_live_target_image_written_notifier([](uint64_t addr) {
-        auto it = g_rtt.find(addr);
-        if (it == g_rtt.end()) return;
-        // The compute dispatch wrote the persistent image itself. Keep it authoritative and discard
-        // the now-older ordered readback mirror without publishing stale guest bytes over the image.
-        it->second.rgba.reset();
-        it->second.gpu_valid = true;
-    });
+    prosper::gpu::set_live_target_image_written_notifier(
+        [invalidate_ds](const prosper::gpu::LiveTargetImageWrite& write) {
+            auto it = g_rtt.find(write.gpu_addr);
+            if (it == g_rtt.end()) return;
+            const VkFormat format =
+                write.format == prosper::gpu::LiveTargetPixelFormat::Rgba16Float
+                    ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+            if (!prosper::frontend::live_rtt_mirror_identity_matches(
+                    it->first, it->second.w, it->second.h,
+                    static_cast<uint32_t>(
+                        prosper::test::backend_color_format(it->second.format)),
+                    write.gpu_addr, write.width, write.height,
+                    static_cast<uint32_t>(format)))
+                return;
+
+            // The compute backend also wrote exact guest bytes. Process that ordinary notification
+            // first so every color/depth/view alias becomes stale, then restore only the persistent
+            // image that received the queue-ordered device copy. If the image disappeared, leave the
+            // invalidation in force and let the next graphics use rebuild from the correct guest bytes.
+            drain_guest_gpu_writes(g_rtt, invalidate_ds);
+            if (!prosper::test::restore_persistent_color_target_after_mirrored_write(
+                    write.gpu_addr, write.width, write.height, format))
+                return;
+            RttSurf& published = g_rtt[write.gpu_addr];
+            published.rgba.reset();
+            published.w = write.width;
+            published.h = write.height;
+            published.format = format;
+            published.gpu_valid = true;
+        });
     prosper::gpu::set_live_target_byte_range_reader(
         [invalidate_ds](uint64_t addr, uint32_t bytes, std::vector<uint8_t>& output) {
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
