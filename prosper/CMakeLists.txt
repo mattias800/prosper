@@ -348,6 +348,12 @@ if(TARGET prosper_core)
   target_include_directories(test_prosper_app_present_mode PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_present_mode COMMAND test_prosper_app_present_mode)
 
+  # The interactive open path's path-resolution + action decisions (#1469): pure and SDL-free, so
+  # the drag-and-drop / folder-picker behaviour is covered in normal CI without a window.
+  add_executable(test_prosper_app_game_path frontends/prosper-app/test_game_path.cpp)
+  target_include_directories(test_prosper_app_game_path PRIVATE frontends/prosper-app)
+  add_test(NAME prosper_app_game_path COMMAND test_prosper_app_game_path)
+
   # Fault-safe guest-pointer read in the PROSPER_AMPRLOG diagnostic (#1154): an unmapped, aligned,
   # > 0xffff pointer (GTA V's 0x302200) must report unreadable, not SIGSEGV. POSIX-only
   # (process_vm_readv / mmap); ampr_arglog lives in the __linux__||__APPLE__ half of hle_kernel_mem.
@@ -1192,7 +1198,13 @@ if((PROSPER_AUDIO_SDL3 OR PROSPER_PAD_SDL3 OR PROSPER_APP) AND TARGET prosper_co
     set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
     set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
     set(SDL_POWER OFF CACHE BOOL "" FORCE)
-    set(SDL_DIALOG OFF CACHE BOOL "" FORCE)
+    # The app frontend opens a title with the host's native folder picker (#1469); the audio- and
+    # pad-only builds have no window to parent a dialog to, so they keep SDL's dialog code out.
+    if(PROSPER_APP)
+      set(SDL_DIALOG ON CACHE BOOL "" FORCE)
+    else()
+      set(SDL_DIALOG OFF CACHE BOOL "" FORCE)
+    endif()
     # Gamepad support is needed ONLY by the pad frontend — enable JOYSTICK + HIDAPI whenever it's on,
     # regardless of which frontend triggers the (single) fetch. This is the union that fixes the
     # combined-build trap: an AUDIO+PAD build now gets a joystick-capable SDL.
