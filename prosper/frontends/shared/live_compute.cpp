@@ -156,6 +156,7 @@ bool direct_sampled_rtt_compatible(prosper::gpu::DataFormat format, uint32_t com
 namespace {
 
 std::atomic<uint64_t> g_buffer_gpu_result_skips{0};
+std::atomic<bool> g_fail_next_storage_readback_for_test{false};
 
 VkFormat native_storage_vk_format(prosper::gpu::DataFormat format, uint32_t components) {
     using prosper::gpu::DataFormat;
@@ -1498,6 +1499,17 @@ struct VulkanComputeContext {
         if (found != image_cache.end() && found->second.pins) --found->second.pins;
     }
 
+    void invalidate_cached_image_source(const ComputeImageCacheKey& key) {
+        const auto found = image_cache.find(key);
+        if (found == image_cache.end()) return;
+        CachedComputeImage& cached = found->second;
+        cached.content_valid = false;
+        // acquire_cached_image may otherwise reuse a same-submit validation result before checking
+        // content_valid. A failed post-submit readback invalidates both forms of authority.
+        cached.validation_epoch = 0;
+        cached.validation_result = false;
+    }
+
     void validate_cached_image_source(const ComputeImageCacheKey& key,
                                       const uint8_t* current_source = nullptr) {
         auto found = image_cache.find(key);
@@ -2438,6 +2450,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (images[i].sampler) vkDestroySampler(ctx.device, images[i].sampler, nullptr);
             if (images[i].view) vkDestroyImageView(ctx.device, images[i].view, nullptr);
             if (images[i].persistent) {
+                // A failed submit/readback can leave the retained VkImage and its exact-result
+                // baseline newer than guest memory. Force the retry to upload and publish again;
+                // otherwise it could compare against that newer baseline and skip forever.
+                if (!ok) ctx.invalidate_cached_image_source(images[i].cache_key);
                 ctx.release_cached_image(images[i].cache_key);
             } else {
             // An imported image belongs to the live renderer: release the pin, destroy nothing.
@@ -4971,9 +4987,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  "addr=0x%llx bytes=%llu\n",
                                  bi.binding, (unsigned long long)r->gpu_addr,
                                  (unsigned long long)bi.exact_result_bytes);
+                if (r->gpu_addr)
+                    notify_guest_gpu_write_preserving_bytes(r->gpu_addr, bi.guest_bytes);
                 continue;
             }
             void* mapped = nullptr;
+            if (g_fail_next_storage_readback_for_test.exchange(
+                    false, std::memory_order_acq_rel)) {
+                if (trace)
+                    std::fprintf(stderr,
+                                 "[compute]   injected storage readback failure binding=%u\n",
+                                 bi.binding);
+                readback_ok = false;
+                break;
+            }
             if (ctx.map_memory(staging_memory[i], 0, staging_bytes[i], &mapped) != VK_SUCCESS) {
                 readback_ok = false;
                 break;
@@ -5008,6 +5035,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  bi.binding, (unsigned long long)r->gpu_addr,
                                  (unsigned long long)bi.exact_result_bytes);
                 ctx.unmap_memory(staging_memory[i]);
+                if (r->gpu_addr)
+                    notify_guest_gpu_write_preserving_bytes(r->gpu_addr, bi.guest_bytes);
                 continue;
             }
             // Notify page-based dirty trackers only when bytes will actually be written. Doing this
@@ -5334,6 +5363,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
 
 uint64_t live_compute_buffer_gpu_result_skips() {
     return g_buffer_gpu_result_skips.load(std::memory_order_relaxed);
+}
+
+void live_compute_fail_next_storage_readback_for_test() {
+    g_fail_next_storage_readback_for_test.store(true, std::memory_order_release);
 }
 
 void storage_pack_unorm8_range(const uint32_t* channels, uint32_t components,
