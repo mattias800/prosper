@@ -4030,6 +4030,22 @@ int main() {
     }
     CHECK(gotA2.size()==N && badA2==0, "A2: s_lshl4_add_u32 SCC = full 64-bit carry (1 then 0)");
 
+    // Astro world-map PC1918: s_lshl1_add_u32 uses the same full-width carry rule. A high bit in
+    // 0x80000000<<1 carries out -> 11; 2<<1+1 stays in range -> 4. out = bits+15.
+    const uint32_t codeA2b[] = { 0xbe8103ffu, 0x80000000u, 0x97028101u, 0x8503848bu,
+                                 0xbe810382u, 0x97028101u, 0x8504848bu,
+                                 0x4a020003u, 0x4a020204u, 0xBF810000u };
+    std::vector<uint32_t> spvA2b = recompile_valu(codeA2b, std::size(codeA2b), 1, 1);
+    CHECK(!spvA2b.empty(), "recompiled Astro s_lshl1_add_u32 carry kernel -> SPIR-V");
+    std::vector<float> gotA2b = prosper::test::run_compute(spvA2b, inX, N, N);
+    uint32_t badA2b = 0;
+    for (uint32_t i = 0; i < N && gotA2b.size() == N; i++) {
+        uint32_t gb; std::memcpy(&gb, &gotA2b[i], 4);
+        if (gb != bits_of(inX[i]) + 15u) badA2b++;
+    }
+    CHECK(gotA2b.size()==N && badA2b==0,
+          "Astro s_lshl1_add_u32 SCC = full 64-bit carry (1 then 0)");
+
     // A3 (#880): the NEG modifier is a sign-bit toggle: neg(+0.0) = -0.0. v_add_f32_e64
     // v1, -v0, -v0 with v0=+0.0 must produce -0.0 (bits 0x80000000); the old FSub(0,x)
     // lowering produced +0.0. (llvm-mc gfx1010: 0xd5030001 0x60020100.)

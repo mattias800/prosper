@@ -4678,6 +4678,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x22: { uint32_t sh = b.ibin(Op_BitwiseAnd, c, b.uconst(31));   // s_ashr_i32
                              d = b.sbin(Op_ShiftRightArithmetic, a, sh); scc_nz(d); break; }  // dst = src0 >>a (src1 & 31)
                 case 0x26: d = b.ibin(Op_IMul, a, c); break;         // s_mul_i32 (low 32 bits; no SCC)
+                case 0x2E: {   // s_lshl1_add_u32 = (src0<<1)+src1; SCC = unsigned carry-out of the
+                               // full 64-bit sum, matching the established shift-by-four sibling.
+                               // Astro's world-map PS uses this to advance a wave-uniform table index
+                               // held in VCC_HI before a register-SOFFSET scalar buffer load.
+                    uint32_t shifted = b.ibin(Op_ShiftLeftLogical, a, b.uconst(1));
+                    d = b.ibin(Op_IAdd, shifted, c);
+                    uint32_t shifted_out = b.ucmp(Op_INotEqual,
+                        b.ibin(Op_ShiftRightLogical, a, b.uconst(31)), b.uconst(0));
+                    uint32_t wrapped = b.ucmp(Op_ULessThan, d, c);
+                    rs.scc = b.bsel(shifted_out, b.btrue(), wrapped); break;
+                }
                 case 0x31: {   // s_lshl4_add_u32 = (src0<<4)+src1; SCC = unsigned carry-out of the
                                // FULL 64-bit sum (ISA op 49: ((u64)S0<<4)+S1 >= 2^32). If S0[31:28]
                                // is nonzero the shifted value alone reaches 2^32; otherwise the

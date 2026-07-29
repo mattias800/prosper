@@ -1866,6 +1866,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     case 0x1E: r = a << (c & 31); break;                    // s_lshl_b32
                     case 0x20: r = a >> (c & 31); break;                    // s_lshr_b32
                     case 0x26: r = a * c; break;                            // s_mul_i32
+                    case 0x2E: r = (a << 1) + c; break;                     // s_lshl1_add_u32
                     case 0x31: r = (a << 4) + c; break;                     // s_lshl4_add_u32
                     case 0x27: { uint32_t off = c & 0x1f, wid = (c >> 16) & 0x7f;   // s_bfe_u32
                                  r = wid == 0 ? 0 : (wid >= 32 ? (a >> off) : ((a >> off) & ((1u << wid) - 1))); break; }
