@@ -969,6 +969,98 @@ int main() {
         return 1;
     }
     printf("  [ok]   Astro fragment DPP/PERMLANEX/readlane reduction uses exact wave64 shuffles\n");
+    // #1474: partially-overlapping LOOPS in the fragment shell. Two back-edges whose ranges cross
+    // without nesting (B's header lies inside A's body, B's back-edge outside it) are what the narrow
+    // pattern structurizer calls unstructured and rejects. Since the graphics CFG dispatcher above
+    // exists, that rejection is no longer the end of the road: the per-invocation dispatcher executes
+    // the exact block graph, so the region lowers instead of dropping the draw.
+    //
+    // Two properties of this stream are worth stating, because both are easy to misread:
+    //   * The crossing pair is SYNTACTIC only — pc7 is an unconditional s_branch, so pc8/pc9 (B's
+    //     back-edge) are unreachable. detect_divergent_loops collects back-edges without a
+    //     reachability filter, so the pair check still sees the overlap and rejects. If that pass
+    //     ever gains reachability pruning, the accept assertion below fails for a GOOD reason.
+    //   * The rejection is OVER-DETERMINED: pc3's execz targets 10, past A's exit_pc of 8 (the dword
+    //     after A's back-edge, not A's exit target), so pass 2's "conditional jump past the loop" rule
+    //     would reject this stream even with the overlap check deleted. Neither this assertion nor the
+    //     pre-#1474 one isolates overlap as the sole cause of rejection.
+    //
+    // Both directions are pinned here, in the DEVICE-FREE test, rather than only in the
+    // Vulkan-execution tests: those are gated on find_package(Vulkan) succeeding, and every CI job
+    // that runs ctest either disables Vulkan discovery (Linux, Windows MinGW, macOS) or runs a
+    // three-test seam subset (Windows App), so a guard living only there never runs in CI at all.
+    const uint32_t overlapping_loops[] = {
+        0xbe800380u,               //  0: s_mov_b32 s0, 0
+        0x7e020284u,               //  1: v_mov_b32 v1, 4
+        0x7da20200u,               //  2: A_HDR: v_cmpx_lt_u32 s0, v1
+        0xbf880006u,               //  3: s_cbranch_execz +6 -> 10 (export)
+        0x7da20200u,               //  4: B_HDR: v_cmpx_lt_u32 s0, v1
+        0xbf880006u,               //  5: s_cbranch_execz +6 -> 12 (endpgm)
+        0x81008100u,               //  6: s0++
+        0xbf82fffau,               //  7: s_branch -6 -> 2  (A back-edge; A = [2,7])
+        0x81008100u,               //  8: s0++
+        0xbf82fffau,               //  9: s_branch -6 -> 4  (B back-edge; B = [4,9] crosses A)
+        0xf800180fu, 0x05020302u,  // 10: exp mrt0
+        0xbf810000u,               // 12: s_endpgm
+    };
+    const auto overlapping_spv =
+        recompile_fragment(overlapping_loops, std::size(overlapping_loops));
+    if (overlapping_spv.empty() || !has_opcode(overlapping_spv, 251) ||
+        !type_result_ids_are_nonzero(overlapping_spv, nullptr) ||
+        !phi_ids_are_nonzero(overlapping_spv)) {
+        printf("  [FAIL] #1474: partially-overlapping fragment loops did not lower through a valid "
+               "OpSwitch dispatcher\n");
+        return 1;
+    }
+    // Lowering is not enough: a dispatcher that emitted the block graph but dropped the export would
+    // satisfy every check above, and the device-side test only asserts the readback's size — that is
+    // exactly the "silent skip drops real rendered content" failure the charter warns about. This
+    // stream has one EXP site, so it must produce exactly one output store. The count is exact rather
+    // than >= 1 so a DOUBLED export (which would write MRT0 twice) fails too; the neighbouring
+    // two-site test asserting stores == 2 is the cross-check that this counts sites, not components.
+    const OutputStoreStats overlapping_outputs = output_store_stats(overlapping_spv);
+    if (overlapping_outputs.stores != 1) {
+        printf("  [FAIL] #1474: dispatcher-lowered overlapping loops did not export exactly once "
+               "(stores=%u)\n", overlapping_outputs.stores);
+        return 1;
+    }
+    printf("  [ok]   #1474: partially-overlapping fragment loops lower through the CFG dispatcher, "
+           "exporting exactly once\n");
+
+    // The fail-visible backstop still has to work. A cross-lane MBCNT inside the same region
+    // disqualifies the per-invocation dispatcher — inside a dispatcher case the lanes of one subgroup
+    // sit at different guest blocks, so MBCNT's subgroup exclusive scan would be answering for a wave
+    // that is not there. See the `reason=mbcnt-cross-lane` reject in rdna2_to_spirv.cpp; if graphics
+    // ever gains a synchronized common phase that closes the gap, this assertion fails LOUDLY rather
+    // than silently losing the reject coverage. With the narrow structurizer already rejecting, a
+    // loud reject is the only remaining outcome. The compute-side #590 case keeps an s_barrier in its
+    // region for the same purpose (test_rdna2_to_spirv.cpp).
+    //
+    // Branch offsets are re-based for the MBCNT's two dwords, and the MBCNT sits on the REACHABLE
+    // path (pc5's fallthrough), not in the dead region above. Dropping it makes this stream lower,
+    // which is what makes the guard real rather than decorative.
+    const uint32_t overlapping_loops_cross_lane[] = {
+        0xbe800380u,               //  0: s_mov_b32 s0, 0
+        0x7e020284u,               //  1: v_mov_b32 v1, 4
+        0x7da20200u,               //  2: A_HDR: v_cmpx_lt_u32 s0, v1
+        0xbf880008u,               //  3: s_cbranch_execz +8 -> 12 (export)
+        0x7da20200u,               //  4: B_HDR: v_cmpx_lt_u32 s0, v1
+        0xbf880008u,               //  5: s_cbranch_execz +8 -> 14 (endpgm)
+        0xd7650004u, 0x000100c1u,  //  6: v_mbcnt_lo_u32_b32 v4, -1, 0  (cross-lane)
+        0x81008100u,               //  8: s0++
+        0xbf82fff8u,               //  9: s_branch -8 -> 2  (A back-edge; A = [2,9])
+        0x81008100u,               // 10: s0++
+        0xbf82fff8u,               // 11: s_branch -8 -> 4  (B back-edge; B = [4,11] crosses A)
+        0xf800180fu, 0x05020302u,  // 12: exp mrt0
+        0xbf810000u,               // 14: s_endpgm
+    };
+    if (!recompile_fragment(overlapping_loops_cross_lane,
+                            std::size(overlapping_loops_cross_lane)).empty()) {
+        printf("  [FAIL] #1474: cross-lane MBCNT inside an unstructured fragment region must "
+               "REJECT, not lower through the per-invocation dispatcher\n");
+        return 1;
+    }
+    printf("  [ok]   #1474: cross-lane op in an unstructured fragment region still rejects loudly\n");
 
     // The graphics CFG dispatcher must retain the fragment shell's already-proven alpha-test
     // linearization.  This reduced Astro Bot shape prefixes the crossing-region CFG above with a
