@@ -558,8 +558,10 @@ int main() {
         // graphics CFG dispatcher added for Astro Bot's materials then executes the exact block graph
         // per invocation, so the region lowers rather than dropping the draw (#1474). This test owns
         // the half that needs a device: a real driver has to accept the module. The accept/reject
-        // contract itself is pinned device-free in test_rdna2_spirv_struct, because these
-        // Vulkan-execution tests are not built where no Vulkan device is available.
+        // contract itself — including that the export survives the lowering — is pinned device-free in
+        // test_rdna2_spirv_struct, because these Vulkan-execution tests are gated on
+        // find_package(Vulkan) succeeding and CI disables Vulkan discovery outright, so nothing here
+        // runs in CI.
         const uint32_t overlap_ps[] = {
             0xBE800380u, 0x7E020284u,
             0x7DA20200u,               //  2: A_HDR: v_cmpx_lt_u32 s0, v1

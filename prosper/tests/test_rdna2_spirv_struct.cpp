@@ -883,9 +883,20 @@ int main() {
     // without nesting (B's header lies inside A's body, B's back-edge outside it) are what the narrow
     // pattern structurizer calls unstructured and rejects. Since the graphics CFG dispatcher above
     // exists, that rejection is no longer the end of the road: the per-invocation dispatcher executes
-    // the exact block graph, so the region lowers instead of dropping the draw. Both directions are
-    // pinned here, in the DEVICE-FREE test, because the Vulkan-execution tests are not built where no
-    // Vulkan device is available — a guard that only runs on a developer GPU is not a guard.
+    // the exact block graph, so the region lowers instead of dropping the draw.
+    //
+    // Two properties of this stream are worth stating, because both are easy to misread:
+    //   * The crossing pair is SYNTACTIC only — pc7 is an unconditional s_branch, so pc8/pc9 (B's
+    //     back-edge) are unreachable. detect_divergent_loops collects back-edges without a
+    //     reachability filter, so the pair check still sees the overlap and rejects. If that pass
+    //     ever gains reachability pruning, the accept assertion below fails for a GOOD reason.
+    //   * The rejection is OVER-DETERMINED: pc3's execz targets 10, past A's exit at 8, so pass 2's
+    //     "conditional jump past the loop" rule would reject this stream even with the overlap check
+    //     deleted. Neither this assertion nor the pre-#1474 one isolates overlap as the sole cause.
+    //
+    // Both directions are pinned here, in the DEVICE-FREE test, rather than only in the
+    // Vulkan-execution tests: those are gated on find_package(Vulkan) succeeding, and CI disables
+    // Vulkan discovery outright, so a guard living only there never runs in CI at all.
     const uint32_t overlapping_loops[] = {
         0xbe800380u,               //  0: s_mov_b32 s0, 0
         0x7e020284u,               //  1: v_mov_b32 v1, 4
@@ -909,14 +920,29 @@ int main() {
                "OpSwitch dispatcher\n");
         return 1;
     }
+    // Lowering is not enough: a dispatcher that emitted the block graph but dropped the export would
+    // satisfy every check above, and the device-side test only asserts the readback's size — that is
+    // exactly the "silent skip drops real rendered content" failure the charter warns about. This
+    // stream has one export site, so it must produce exactly one output store.
+    if (output_store_stats(overlapping_spv).stores != 1) {
+        printf("  [FAIL] #1474: dispatcher-lowered overlapping loops dropped the export (stores=%u)\n",
+               output_store_stats(overlapping_spv).stores);
+        return 1;
+    }
     printf("  [ok]   #1474: partially-overlapping fragment loops lower through the CFG dispatcher\n");
 
     // The fail-visible backstop still has to work. A cross-lane MBCNT inside the same region
-    // disqualifies the per-invocation dispatcher — one guest lane cannot answer for the whole wave —
-    // and with the narrow structurizer already rejecting, the only remaining outcome is a loud
-    // reject. This mirrors how the compute-side #590 case keeps an s_barrier in its region for
-    // exactly the same reason (test_rdna2_to_spirv.cpp). Branch offsets are re-based for the MBCNT's
-    // two dwords; dropping the MBCNT makes this region lower, which is what makes the guard real.
+    // disqualifies the per-invocation dispatcher — inside a dispatcher case the lanes of one subgroup
+    // sit at different guest blocks, so MBCNT's subgroup exclusive scan would be answering for a wave
+    // that is not there. See the `reason=mbcnt-cross-lane` reject in rdna2_to_spirv.cpp; if graphics
+    // ever gains a synchronized common phase that closes the gap, this assertion fails LOUDLY rather
+    // than silently losing the reject coverage. With the narrow structurizer already rejecting, a
+    // loud reject is the only remaining outcome. The compute-side #590 case keeps an s_barrier in its
+    // region for the same purpose (test_rdna2_to_spirv.cpp).
+    //
+    // Branch offsets are re-based for the MBCNT's two dwords, and the MBCNT sits on the REACHABLE
+    // path (pc5's fallthrough), not in the dead region above. Dropping it makes this stream lower,
+    // which is what makes the guard real rather than decorative.
     const uint32_t overlapping_loops_cross_lane[] = {
         0xbe800380u,               //  0: s_mov_b32 s0, 0
         0x7e020284u,               //  1: v_mov_b32 v1, 4
