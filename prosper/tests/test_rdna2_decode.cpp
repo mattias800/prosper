@@ -249,6 +249,18 @@ int main() {
     CHECK(nrs.fmt == Rdna2Format::VOP2 && nrs.opcode == 0x25u && !nrs.has_modifier &&
           nrs.has_dpp && nrs.dpp_ctrl == 0x111u && isV(nrs.src[0], 15) && isV(nrs.src[1], 15),
           "Astro NGG bounded DPP row-right add is admitted exactly");
+    const uint32_t fragment_row_or[] = { 0x381414fau, 0xff01110au };
+    Rdna2Inst fro = rdna2_decode_one(fragment_row_or, 2);
+    CHECK(fro.fmt == Rdna2Format::VOP2 && fro.opcode == 0x1cu && !fro.has_modifier &&
+          fro.has_dpp && fro.dpp_ctrl == 0x111u && isV(fro.src[0], 10) && isV(fro.src[1], 10),
+          "Astro fragment DPP row-right OR is admitted exactly");
+    const uint32_t fragment_permlanex[] = { 0xd7781009u, 0x0305830au };
+    Rdna2Inst fpx = rdna2_decode_one(fragment_permlanex, 2);
+    CHECK(fpx.fmt == Rdna2Format::VOP3 && fpx.opcode == 0x378u && isV(fpx.dst, 9) &&
+          isV(fpx.src[0], 10) && fpx.src[1].kind == OperandKind::InlineInt &&
+          fpx.src[1].value == -1 && fpx.src[2].kind == OperandKind::InlineInt &&
+          fpx.src[2].value == -1,
+          "Astro fragment PERMLANEX16 adjacent-row broadcast decodes exactly");
     const uint32_t dpp8[] = { 0x4a0e0ce9u, 0xfac68806u };    // v_add_nc_u32_dpp v7, v6, v6 dpp8:[...]
     Rdna2Inst d8 = rdna2_decode_one(dpp8, 2);
     CHECK(d8.fmt == Rdna2Format::VOP2 && d8.len_dwords == 2 && d8.has_modifier,

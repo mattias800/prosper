@@ -58,6 +58,7 @@ enum : uint32_t {
     Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Switch=251,
     Op_EmitVertex=218, Op_EndPrimitive=219,
     Op_Kill=252, Op_Return=253, Op_GroupNonUniformAny=335,
+    Op_GroupNonUniformShuffle=345,
     Op_GroupNonUniformIAdd=349,
     Op_GroupNonUniformQuadSwap=366,
 };
@@ -69,7 +70,7 @@ enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Gls
                   Glsl_NMin=79, Glsl_NMax=80 };   // NaN-aware min/max: one-NaN operand -> the other operand
 enum : uint32_t {
     Cap_Shader=1, Cap_Geometry=2, Cap_Int64=11, Cap_GroupNonUniform=61, Cap_GroupNonUniformVote=62,
-    Cap_GroupNonUniformArithmetic=63, Cap_GroupNonUniformQuad=68,
+    Cap_GroupNonUniformArithmetic=63, Cap_GroupNonUniformShuffle=65, Cap_GroupNonUniformQuad=68,
     Cap_TransformFeedback=53,   // VK_EXT_transform_feedback (geometry-probe capture of gl_Position, gated)
     Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Geometry=3, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17, EM_Triangles=22,
@@ -524,7 +525,7 @@ struct SpirvCompute {
         return ibin(Op_IAdd, acc_bits, prefix);
     }
     uint32_t native_wave_any(uint32_t value) {
-        if (!native_subgroup_size) return 0;
+        if (!native_subgroup_size && !is_fragment) return 0;
         if (!declared_subgroup) {
             put(caps, Op_Capability, {Cap_GroupNonUniform});
             declared_subgroup = true;
@@ -532,6 +533,12 @@ struct SpirvCompute {
         if (!declared_subgroup_vote) {
             put(caps, Op_Capability, {Cap_GroupNonUniformVote});
             declared_subgroup_vote = true;
+        }
+        // Fragment mask votes are exact only with one Vulkan subgroup per PS5 wave. The arithmetic
+        // capability is Prosper's module marker for requesting that required subgroup size.
+        if (is_fragment && !declared_subgroup_arithmetic) {
+            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
+            declared_subgroup_arithmetic = true;
         }
         uint32_t result = id();
         put(code, Op_GroupNonUniformAny,
@@ -654,6 +661,53 @@ struct SpirvCompute {
         put(code, Op_GroupNonUniformQuadSwap,
             {t_u32, result, uconst(Scope_Subgroup), value, uconst(direction)});
         return result;
+    }
+    bool declared_subgroup_shuffle = false;
+    uint32_t subgroup_shuffle(uint32_t value, uint32_t source_lane) {
+        if (!declared_subgroup_shuffle) {
+            put(caps, Op_Capability, {Cap_GroupNonUniform});
+            put(caps, Op_Capability, {Cap_GroupNonUniformShuffle});
+            declared_subgroup_shuffle = true;
+        }
+        // Fragment lane numbers are guest wave64 lane numbers. Keep the same self-contained module
+        // marker used by fragment MBCNT so the Vulkan backend requests an exact 64-lane subgroup.
+        if (is_fragment && !declared_subgroup_arithmetic) {
+            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
+            declared_subgroup_arithmetic = true;
+        }
+        uint32_t shuffled = id();
+        put(code, Op_GroupNonUniformShuffle,
+            {t_u32, shuffled, uconst(Scope_Subgroup), value, source_lane});
+        return shuffled;
+    }
+    uint32_t subgroup_row_shr(uint32_t value, uint32_t active, uint32_t amount) {
+        const uint32_t lane = subgroup_local_id();
+        const uint32_t row_lane = ibin(Op_BitwiseAnd, lane, uconst(15));
+        const uint32_t in_bounds = ucmp(Op_UGreaterThanEqual, row_lane, uconst(amount));
+        // Keep the shuffle index valid even for row-leading lanes. DPP BOUND_CTRL=0 retains the
+        // unpermuted source for those lanes. FI=0 also makes an EXEC-inactive source invalid.
+        const uint32_t source_lane = sel(in_bounds,
+            ibin(Op_ISub, lane, uconst(amount)), lane);
+        const uint32_t shifted = subgroup_shuffle(value, source_lane);
+        const uint32_t source_active = subgroup_shuffle(
+            sel(active, uconst(1), uconst(0)), source_lane);
+        const uint32_t valid = land(in_bounds,
+            ucmp(Op_INotEqual, source_active, uconst(0)));
+        return sel(valid, shifted, value);
+    }
+    uint32_t subgroup_permlanex16_last(uint32_t value, uint32_t active) {
+        const uint32_t lane = subgroup_local_id();
+        const uint32_t row = ibin(Op_ShiftRightLogical, lane, uconst(4));
+        // S1=S2=-1 chooses lane 15. PERMLANEX swaps adjacent 16-lane rows: 0<->1, 2<->3.
+        const uint32_t source_lane = ibin(Op_BitwiseOr,
+            ibin(Op_ShiftLeftLogical,
+                ibin(Op_BitwiseXor, row, uconst(1)), uconst(4)),
+            uconst(15));
+        const uint32_t shuffled = subgroup_shuffle(value, source_lane);
+        const uint32_t source_active = subgroup_shuffle(
+            sel(active, uconst(1), uconst(0)), source_lane);
+        // Live OP_SEL=[FI=0,BOUND_CTRL=1]: an inactive source returns zero.
+        return sel(ucmp(Op_INotEqual, source_active, uconst(0)), shuffled, uconst(0));
     }
     // Fragment discard: OpKill any lane where `alive` is false, survivors fall through to `mergeL`. Used to
     // lower an EXP done under a narrowed EXEC (an alpha-test / WQM discard — the surviving lanes are the
@@ -3227,7 +3281,8 @@ bool instruction_may_change_exec(const Rdna2Inst& in) {
     if (in.fmt == Rdna2Format::VOPC && vopc_is_cmpx(in.opcode)) return true;
     // saveexec writes EXEC implicitly while its explicit destination receives the previous mask.
     if (in.fmt == Rdna2Format::SOP1 &&
-        (in.opcode == 0x24 || in.opcode == 0x25 || in.opcode == 0x37)) return true;
+        (in.opcode == 0x24 || in.opcode == 0x25 || in.opcode == 0x28 ||
+         in.opcode == 0x37)) return true;
     auto is_exec = [](const Operand& operand) {
         return (operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special) &&
                (operand.value == 126 || operand.value == 127);
@@ -3783,7 +3838,7 @@ uint32_t scalar_write_width(const Rdna2Inst& in) {
             if (in.opcode == 0x20) return 0; // s_setpc_b64 reads its decoded "dst" field.
             switch (in.opcode) {
                 case 0x04: case 0x08: case 0x0a: case 0x1f:
-                case 0x24: case 0x25: case 0x37:
+                case 0x24: case 0x25: case 0x28: case 0x37:
                     return 2; // B64 data/mask writes
                 default: return 1;
             }
@@ -3833,7 +3888,8 @@ void for_each_scalar_write(const Rdna2Inst& in, Visitor&& visit) {
 bool scalar_write_is_b64_mask(const Rdna2Inst& in, int base) {
     if (in.fmt == Rdna2Format::SOP1 && in.dst.value == base) {
         switch (in.opcode) {
-            case 0x04: case 0x08: case 0x0a: case 0x24: case 0x25: case 0x37:
+            case 0x04: case 0x08: case 0x0a: case 0x24: case 0x25: case 0x28:
+            case 0x37:
                 return true;
             default: break;
         }
@@ -4220,7 +4276,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // mask is a single bool for this lane. EXEC=SGPR 126/127, VCC=106/107; a saved mask lives
             // in sreg_bool. These implement divergent control flow (if/endif via saveexec + restore).
             if (in.opcode == 0x04 || in.opcode == 0x08 || in.opcode == 0x0a ||
-                in.opcode == 0x24 || in.opcode == 0x25 || in.opcode == 0x37) {
+                in.opcode == 0x24 || in.opcode == 0x25 || in.opcode == 0x28 ||
+                in.opcode == 0x37) {
                 // ISA: every op here EXCEPT s_mov_b64 writes SCC=(result!=0) — a cross-lane
                 // reduction the per-invocation model cannot form. POISON the tracked SCC (SSA id 0)
                 // so a later consumer (s_cselect/s_addc/SCC-source/scc-branch emission) rejects
@@ -4345,15 +4402,22 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         if (m && !data_copied) mask_write_clobbers_pair(rs, in.dst.value);
                         if (!m && !data_copied) ok = false;
                     }
-                } else {                                    // s_and/or/andn1_saveexec_b64 sDST, src
-                    rs.sreg_bool[in.dst.value] = rs.exec;   // save current EXEC to the dest SGPR pair
+                } else {                                    // s_{and,or,orn2,andn1}_saveexec_b64
+                    const uint32_t old_exec = rs.exec;
+                    rs.sreg_bool[in.dst.value] = old_exec;  // save current EXEC to the dest SGPR pair
                     rs.sreg_bool_narrowed[in.dst.value] = rs.exec_narrowed;   // ...and its narrowed-state
+                    // VCC is both an addressable scalar pair and the implicit condition mask used by
+                    // VCC branches/moves. Keep both views synchronized when SAVEEXEC targets VCC.
+                    if (in.dst.value == 106 || in.dst.value == 107) rs.vcc = old_exec;
                     mask_write_clobbers_pair(rs, in.dst.value);
                     uint32_t m = src_mask(in.src[0]);
                     if (!m) ok = false;
-                    else { rs.exec = in.opcode == 0x24 ? b.land(rs.exec, m)
-                                     : in.opcode == 0x25 ? b.lor(rs.exec, m)
-                                                        : b.land(rs.exec, b.logical_not(m));
+                    else { rs.exec = in.opcode == 0x24 ? b.land(old_exec, m)
+                                     : in.opcode == 0x25 ? b.lor(old_exec, m)
+                                     // RDNA2 ISA 12.3: S_ORN2_SAVEEXEC_B64 computes
+                                     // EXEC = S0 | ~old_EXEC after saving old_EXEC to D.
+                                     : in.opcode == 0x28 ? b.lor(m, b.logical_not(old_exec))
+                                                        : b.land(old_exec, b.logical_not(m));
                            rs.exec_narrowed = true; }
                 }
                 return true;
@@ -5120,8 +5184,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                  in.opcode == 0x1F || in.opcode == 0x2B;
                 const bool ngg_row_shift = b.ngg_one_lane && in.opcode == 0x25 &&
                                            in.dpp_ctrl >= 0x111u && in.dpp_ctrl <= 0x11Fu;
-                if (!fop && !ngg_row_shift) { ok = false; return true; }
-                if (ngg_row_shift) {
+                const bool fragment_row_or = b.is_fragment && in.opcode == 0x1C &&
+                                             in.dpp_ctrl >= 0x111u && in.dpp_ctrl <= 0x11Fu;
+                if (!fop && !ngg_row_shift && !fragment_row_or) { ok = false; return true; }
+                if (fragment_row_or) {
+                    a = b.subgroup_row_shr(a, rs.exec, in.dpp_ctrl - 0x110u);
+                } else if (ngg_row_shift) {
                     // One modeled NGG lane has no preceding row neighbor. BOUND_CTRL=1 on the only
                     // admitted packets makes the shifted source zero, so add_nc retains src1.
                     a = b.uconst(0);
@@ -5554,6 +5622,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                 }
                 if (vit == rs.vgpr_lane_slots.end()) {
+                    // Fragment shaders execute in an enforced 64-lane Vulkan subgroup, so a static
+                    // hardware v_readlane maps exactly to a subgroup shuffle. Unlike ordinary VALU,
+                    // v_readlane ignores EXEC; do not mask the source or predicate the scalar write.
+                    if (b.is_fragment && static_lane) {
+                        rs.sreg[in.dst.value] = b.subgroup_shuffle(
+                            val(in.src[0]), b.uconst(static_cast<uint32_t>(lane)));
+                        rs.sreg_bool.erase(in.dst.value);
+                        rs.sreg_bool_narrowed.erase(in.dst.value);
+                        rs.sreg_srt.erase(in.dst.value);
+                        return true;
+                    }
                     // NGG's final wave-packing tail reads peer lanes (Astro Bot uses lanes 63 and 3)
                     // from an ordinary VGPR. A Vulkan vertex invocation models guest lane zero: a
                     // lane-zero read returns this invocation's source, while every absent peer reads
@@ -5580,6 +5659,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg_bool.erase(in.dst.value);
                 rs.sreg_bool_narrowed.erase(in.dst.value);
                 rs.sreg_srt.erase(in.dst.value);
+                return true;
+            }
+            if (in.opcode == 0x378) {                                // v_permlanex16_b32
+                // Exact Astro world-map reduction form: S1=S2=-1 selects lane 15 from the adjacent
+                // 16-lane row (0<->1, 2<->3). OP_SEL[0]=FI=0 and OP_SEL[1]=BOUND_CTRL=1, so an
+                // EXEC-inactive source contributes zero. Other select tables/modifiers stay rejected.
+                const bool exact_material_reduce = b.is_fragment &&
+                    in.src[0].kind == OperandKind::VGPR &&
+                    in.src[1].kind == OperandKind::InlineInt && in.src[1].value == -1 &&
+                    in.src[2].kind == OperandKind::InlineInt && in.src[2].value == -1 &&
+                    (in.words[0] & 0x0000ff00u) == 0x00001000u &&
+                    (in.words[1] & 0xf8000000u) == 0;
+                if (!exact_material_reduce) { ok = false; return true; }
+                const uint32_t old_d = vreg_old(b, rs, in.dst.value);
+                rs.vreg[in.dst.value] = b.subgroup_permlanex16_last(
+                    val(in.src[0]), rs.exec);
+                predicate_write(b, rs, in.dst.value, old_d);
                 return true;
             }
             uint32_t old_d = vreg_old(b, rs, in.dst.value);
@@ -6074,7 +6170,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             }
-            if (!allow_smem) { ok = false; return true; }
+            if (!allow_smem) {
+                if (getenv("PROSPER_DBG"))
+                    fprintf(stderr, "[smem-reject] pc=%u reason=graphics-disabled op=0x%x\n",
+                            in.pc, in.opcode);
+                ok = false; return true;
+            }
             // SOFFSET handling. Immediate-only loads encode SOFFSET = SGPR_NULL (125). A register
             // SOFFSET adds an SGPR-computed byte offset:
             //  * a DESCRIPTOR s_load (x4/x8 = V#/T#) with a computed offset is the bindless fetch's
@@ -6104,7 +6205,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         soff_bits = b.uconst((uint32_t)in.src[1].value); tracked = true;
                     }
                 }
-                if (!tracked) { ok = false; return true; }
+                if (!tracked) {
+                    if (getenv("PROSPER_DBG"))
+                        fprintf(stderr,
+                                "[smem-reject] pc=%u reason=untracked-soffset op=0x%x "
+                                "src1-kind=%d src1=%d\n",
+                                in.pc, in.opcode, static_cast<int>(in.src[1].kind),
+                                in.src[1].value);
+                    ok = false; return true;
+                }
                 soff_dyn = true;
             } else if ((int32_t)in.literal < 0) { ok = false; return true; }   // negative imm-only would wrap
             uint32_t base_idx = soff_dyn ? 0 : in.literal >> 2;    // immediate byte offset -> dword index
@@ -6155,7 +6264,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                (resource.cls == ResourceClass::ConstantBuffer ||
                                 resource.cls == ResourceClass::VertexBuffer);
                     });
-                if (!fallback_bound) { ok = false; return true; }
+                if (!fallback_bound) {
+                    if (getenv("PROSPER_DBG"))
+                        fprintf(stderr,
+                                "[smem-reject] pc=%u reason=unresolved-cbuf op=0x%x "
+                                "src0=s%d dyn=%d\n",
+                                in.pc, in.opcode, in.src[0].value, (int)soff_dyn);
+                    ok = false; return true;
+                }
             }
             if (soff_dyn) {
                 // Dynamic dword index: (soffset + signed imm) >> 2 (uint add == two's-complement add).
@@ -8667,7 +8783,7 @@ bool emit_cfg_state_machine(
             }
         }
         if (mask_compare) {
-            if (graphics) {
+            if (b.is_vertex) {
                 if (getenv("PROSPER_DBG"))
                     std::fprintf(stderr,
                                  "[graphics-cfg-reject] pc=%u reason=wave-mask-compare\n",
@@ -8677,8 +8793,9 @@ bool emit_cfg_state_machine(
             const int source = mask_zero_compare_source(*mask_compare);
             const auto value = state.sreg_bool.find(source);
             if (value == state.sreg_bool.end()) return false;
-            if (b.native_subgroup_size) {
+            if (b.native_subgroup_size || b.is_fragment) {
                 const uint32_t wave_any = b.native_wave_any(value->second);
+                if (!wave_any) return false;
                 // EQ mask,0 means !any(mask); LG mask,0 means any(mask).
                 state.scc = mask_compare->opcode == 0x12
                     ? b.logical_not(wave_any) : wave_any;

@@ -546,8 +546,10 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
             // DPP16 (src0 == 0xFA) QUAD_PERM subset (#273): dword1 = SRC0[7:0], DPP_CTRL[16:8]
             // (< 0x100 = quad_perm), FI[18], BC[19], src neg/abs [23:20], bank_mask[27:24],
             // row_mask[31:28]. A full-quad permute (masks 0xf, no neg/abs/FI) is handleable — the
-            // recompiler reconstructs the lane value from screen-space derivatives. Anything else
-            // (row shifts/broadcasts, partial masks, modifiers) keeps has_modifier -> rejected.
+            // recompiler reconstructs the lane value from screen-space derivatives. The fragment
+            // recompiler also has an exact subgroup-shuffle lowering for full-mask v_or_b32
+            // row_shr (Astro's 16-lane material-mask reduction). Anything else (other row
+            // shifts/broadcasts, partial masks, modifiers) keeps has_modifier -> rejected.
             // (Field layout verified against llvm-mc gfx1010 round-trips of DOLL's live words,
             // e.g. 0x7e0802fa 0xff08a002 -> v_mov_b32_dpp v4, v2 quad_perm:[0,0,2,2]
             // row_mask:0xf bank_mask:0xf bound_ctrl:1.)
@@ -556,6 +558,16 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
                 const uint32_t ctrl = (d1 >> 8) & 0x1FFu;
                 if (ctrl < 0x100u && ((d1 >> 28) & 0xFu) == 0xFu && ((d1 >> 24) & 0xFu) == 0xFu &&
                     ((d1 >> 20) & 0xFu) == 0u && ((d1 >> 18) & 1u) == 0u) {
+                    i.has_modifier = false; i.has_dpp = true; i.dpp_ctrl = (uint16_t)ctrl;
+                }
+                // Astro's world-map material PS OR-reduces a lane value across each 16-lane row
+                // with row_shr:{1,2,4,8}. BOUND_CTRL=0 retains src0 for an out-of-row fetch, which
+                // is exact in the subgroup-shuffle lowering and is also the OR identity here.
+                else if (vf == Rdna2Format::VOP2 && ((w >> 25) & 0x3Fu) == 0x1Cu &&
+                         ctrl >= 0x111u && ctrl <= 0x11Fu &&
+                         ((d1 >> 28) & 0xFu) == 0xFu && ((d1 >> 24) & 0xFu) == 0xFu &&
+                         ((d1 >> 20) & 0xFu) == 0u && ((d1 >> 19) & 1u) == 0u &&
+                         ((d1 >> 18) & 1u) == 0u) {
                     i.has_modifier = false; i.has_dpp = true; i.dpp_ctrl = (uint16_t)ctrl;
                 }
                 // Astro Bot's NGG primitive packer performs two bounded row-right shifts before

@@ -778,6 +778,41 @@ int main() {
                                  &direct_sbuffer_table, direct_sbuffer_config).empty(),
           "#1029: pc-keyed direct scalar buffer is bound and recompiles");
 
+    // Astro's world-map PS derives VCC_LO from v_readfirstlane. That value is uniform at runtime
+    // and the SPIR-V translator tracks it, but the CPU descriptor fold intentionally cannot assign
+    // a concrete value to a VGPR read. Retain the exact bounded V# with required_size=0: production
+    // uploads the descriptor's complete declared range and the translated SMEM performs the dynamic
+    // index. Never substituting offset zero is the important distinction from an unsafe const-fold.
+    const uint32_t wave_offset_sbuffer[] = {
+        0x7ed40500u,              // v_readfirstlane_b32 vcc_lo, v0
+        0xf420000cu, 0xd4000000u, // s_buffer_load_dword s0, s[24:27], vcc_lo
+        0xbf810000u,
+    };
+    std::vector<SrtUse> wave_offset_sbuffer_uses;
+    resolve_dynamic_fetch(wave_offset_sbuffer, std::size(wave_offset_sbuffer),
+                          direct_sbuffer_seed, std::size(direct_sbuffer_seed), 0,
+                          &wave_offset_sbuffer_uses);
+    CHECK(wave_offset_sbuffer_uses.size() == 1 &&
+              wave_offset_sbuffer_uses[0].kind == 1 &&
+              wave_offset_sbuffer_uses[0].key == 0xffffffffu &&
+              wave_offset_sbuffer_uses[0].use_pc == 1 &&
+              wave_offset_sbuffer_uses[0].required_size == 0 &&
+              wave_offset_sbuffer_uses[0].v4[0] == direct_sbuffer_seed[24] &&
+              wave_offset_sbuffer_uses[0].v4[1] == direct_sbuffer_seed[25],
+          "Astro wave-derived SOFFSET retains the full bounded direct V# by exact pc");
+    ShaderResourceTable wave_offset_sbuffer_table;
+    add_compute_buffer_resources(wave_offset_sbuffer_table, wave_offset_sbuffer,
+                                 std::size(wave_offset_sbuffer), direct_sbuffer_seed,
+                                 std::size(direct_sbuffer_seed));
+    assign_convention_bindings(wave_offset_sbuffer_table, 2);
+    CHECK(wave_offset_sbuffer_table.resources.size() == 1 &&
+              wave_offset_sbuffer_table.by_fetch_pc(1) &&
+              wave_offset_sbuffer_table.by_fetch_pc(1)->size ==
+                  sizeof(direct_sbuffer_payload) &&
+              !recompile_compute(wave_offset_sbuffer, std::size(wave_offset_sbuffer),
+                                 &wave_offset_sbuffer_table, direct_sbuffer_config).empty(),
+          "Astro wave-derived SOFFSET binds its descriptor range and recompiles dynamically");
+
     // Evergate's title PS uses a bounded PC-relative dispatch. An omitted alternative reloads the
     // same T# SGPRs that the selected arm consumes directly; a linear fold used to walk that reload
     // and attach the alternative texture to the selected image_sample's pc. Specialize the fold to

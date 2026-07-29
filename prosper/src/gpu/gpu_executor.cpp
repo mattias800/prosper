@@ -1998,6 +1998,15 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                  is_buffer ? "bufload" : "load", sdst, sbase, (unsigned long long)base, base_ok,
                                  soff_field, soff_val, soff_ok, in.literal, n);
                 if (n == 0 || !base_ok || !soff_ok) {
+                    // A wave-derived scalar SOFFSET (for example v_readfirstlane -> VCC_LO) is
+                    // deliberately not concrete in this CPU-side fold. The V# can still be exact,
+                    // though: publish its full bounded buffer by consuming-PC provenance and let
+                    // the SPIR-V recompiler evaluate the dynamic dword index at runtime. The stage
+                    // resource builder below accepts this zero-required-size use only when V# itself
+                    // carries a conventional valid size, so an unknown offset never invents a range
+                    // or gets folded to zero.
+                    if (have_pending_srt_use && n != 0 && base_ok && !soff_ok)
+                        srt_uses->push_back(pending_srt_use);
                     for (uint32_t k = 0; k < n; k++) forget(sdst + (int)k);
                     break;
                 }

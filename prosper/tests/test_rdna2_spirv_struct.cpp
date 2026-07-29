@@ -879,6 +879,97 @@ int main() {
     }
     printf("  [ok]   complex fragment CFG exports active state from both alternate sites\n");
 
+    // The live world-map PS writes an explicit SGPR mask with VOPC, then compares that whole B64
+    // wave mask against zero inside the same dispatcher. SCC is a wave vote, not this invocation's
+    // mask bit; fragment pipelines enforce wave64 and can lower it to subgroup-any exactly.
+    const uint32_t fragment_mask_compare_prelude[] = {
+        0x7e120280u,                         // v_mov_b32 v9, 0
+        0x7c0212f9u, 0x06868480u,            // v_cmp_lt_f32_sdwa s[4:5], 0, v9
+        0xbf138004u,                         // s_cmp_lg_u64 s[4:5], 0
+    };
+    std::vector<uint32_t> fragment_cfg_mask_compare(
+        std::begin(fragment_mask_compare_prelude), std::end(fragment_mask_compare_prelude));
+    fragment_cfg_mask_compare.insert(fragment_cfg_mask_compare.end(),
+        std::begin(fragment_cfg_dispatch), std::end(fragment_cfg_dispatch));
+    const auto fragment_cfg_mask_compare_spv = recompile_fragment(
+        fragment_cfg_mask_compare.data(), fragment_cfg_mask_compare.size());
+    if (fragment_cfg_mask_compare_spv.empty() ||
+        !has_opcode(fragment_cfg_mask_compare_spv, 251) ||
+        !has_opcode(fragment_cfg_mask_compare_spv, 335) ||
+        fragment_spirv_required_subgroup_size(fragment_cfg_mask_compare_spv) != 64 ||
+        !type_result_ids_are_nonzero(fragment_cfg_mask_compare_spv, nullptr) ||
+        !phi_ids_are_nonzero(fragment_cfg_mask_compare_spv)) {
+        printf("  [FAIL] complex fragment CFG rejected a wave-mask zero comparison\n");
+        return 1;
+    }
+    printf("  [ok]   complex fragment CFG lowers wave-mask comparisons to exact wave64 votes\n");
+
+    // Astro Bot's world-map material PS reaches the same graphics CFG dispatcher with an
+    // s_orn2_saveexec_b64 whose destination is VCC. Keep a saved EXEC source live across dispatcher
+    // cases, update both the explicit VCC SGPR pair and the implicit VCC condition, then restore EXEC.
+    // The crossing branch regions below force the fallback which rejected the live shader at this op.
+    const uint32_t fragment_cfg_orn2_saveexec[] = {
+        0xbe82047eu,                         // pc0:  s_mov_b64 s[2:3], exec
+        0xbeea2802u,                         // pc1:  s_orn2_saveexec_b64 vcc, s[2:3]
+        0xbefe046au,                         // pc2:  s_mov_b64 exec, vcc (restore saved EXEC)
+        0x7e040280u,                         // pc3:  v_mov_b32 v2, 0
+        0x7e060280u,                         // pc4:  v_mov_b32 v3, 0
+        0x7e080280u,                         // pc5:  v_mov_b32 v4, 0
+        0x7e0a0280u,                         // pc6:  v_mov_b32 v5, 0
+        0x7c020300u,                         // pc7:  v_cmp_lt_f32 vcc, v0, v1
+        0xbf860003u,                         // pc8:  s_cbranch_vccz -> pc12
+        0x7c020300u,                         // pc9:  v_cmp_lt_f32 vcc, v0, v1
+        0xbf860002u,                         // pc10: s_cbranch_vccz -> pc13 (crossing region)
+        0x7e040281u,                         // pc11: v_mov_b32 v2, 1
+        0x7e060281u,                         // pc12: v_mov_b32 v3, 1
+        0x7c020300u,                         // pc13: v_cmp_lt_f32 vcc, v0, v1
+        0xbf860003u,                         // pc14: s_cbranch_vccz -> alternate export at pc18
+        0xf800180fu, 0x05040302u,            // pc15: exp mrt0 v2, v3, v4, v5 done vm
+        0xbf820003u,                         // pc17: s_branch -> verified tail exit at pc21
+        0xf800180fu, 0x05040302u,            // pc18: alternate exp mrt0 v2, v3, v4, v5 done vm
+        0xbf810000u,                         // pc20: s_endpgm
+        0xbf810000u,                         // pc21: branch-target s_endpgm
+    };
+    const auto fragment_cfg_orn2_spv = recompile_fragment(
+        fragment_cfg_orn2_saveexec, std::size(fragment_cfg_orn2_saveexec));
+    if (fragment_cfg_orn2_spv.empty() || !has_opcode(fragment_cfg_orn2_spv, 251) ||
+        !type_result_ids_are_nonzero(fragment_cfg_orn2_spv, nullptr) ||
+        !phi_ids_are_nonzero(fragment_cfg_orn2_spv)) {
+        printf("  [FAIL] complex fragment CFG rejected s_orn2_saveexec_b64 VCC form\n");
+        return 1;
+    }
+    printf("  [ok]   complex fragment CFG preserves Astro ORN2-saveexec VCC state\n");
+
+    // Astro's world-map material PS folds a lane-local mask across every 16-lane hardware row.
+    // These are the four exact live packets following ORN2-saveexec. They require subgroup shuffle
+    // (not the derivative-based FLOAT quad-perm approximation) and a 64-lane fragment subgroup.
+    const uint32_t fragment_dpp_row_or[] = {
+        0x7e1402c1u,                         // v_mov_b32 v10, -1
+        0x381414fau, 0xff01110au,            // v_or_b32_dpp v10,v10,v10 row_shr:1
+        0x381414fau, 0xff01120au,            // row_shr:2
+        0x381414fau, 0xff01140au,            // row_shr:4
+        0x381414fau, 0xff01180au,            // row_shr:8
+        0xd7781009u, 0x0305830au,            // v_permlanex16 v9,v10,-1,-1 BC=1
+        0x3814130au,                         // v_or_b32 v10,v10,v9
+        0xd7600000u, 0x00013f0au,            // v_readlane_b32 s0,v10,31
+        0xd7600001u, 0x00017f0au,            // v_readlane_b32 s1,v10,63
+        0x883f0100u,                         // s_or_b32 s63,s0,s1
+        0xf800000fu, 0x0a0a0a0au,            // exp mrt0 v10,v10,v10,v10
+        0xbf810000u,
+    };
+    const auto fragment_dpp_row_or_spv = recompile_fragment(
+        fragment_dpp_row_or, std::size(fragment_dpp_row_or));
+    if (fragment_dpp_row_or_spv.empty() ||
+        !has_opcode(fragment_dpp_row_or_spv, 345) ||
+        !has_builtin(fragment_dpp_row_or_spv, 41) ||
+        fragment_spirv_required_subgroup_size(fragment_dpp_row_or_spv) != 64 ||
+        !type_result_ids_are_nonzero(fragment_dpp_row_or_spv, nullptr) ||
+        !phi_ids_are_nonzero(fragment_dpp_row_or_spv)) {
+        printf("  [FAIL] Astro fragment DPP row-right OR reduction did not emit valid subgroup SPIR-V\n");
+        return 1;
+    }
+    printf("  [ok]   Astro fragment DPP/PERMLANEX/readlane reduction uses exact wave64 shuffles\n");
+
     // The graphics CFG dispatcher must retain the fragment shell's already-proven alpha-test
     // linearization.  This reduced Astro Bot shape prefixes the crossing-region CFG above with a
     // survivor-mask SCC early-out.  The SCC from s_andn2_b64 is a whole-wave reduction, not an SSA
