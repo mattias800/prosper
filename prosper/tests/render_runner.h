@@ -426,10 +426,14 @@ inline bool persistent_pipeline_cache_enabled() {
     return getenv("PROSPER_NO_BACKEND_PIPELINE_CACHE") == nullptr;
 }
 
+inline size_t persistent_pipeline_cache_limit_value(const char* value) {
+    return value ? static_cast<size_t>(strtoull(value, nullptr, 10)) : size_t{4096};
+}
+
 inline size_t persistent_pipeline_cache_limit() {
     static const size_t limit = [] {
-        const char* value = getenv("PROSPER_PIPELINE_CACHE_ENTRIES");
-        return value ? static_cast<size_t>(strtoull(value, nullptr, 10)) : size_t{1024};
+        return persistent_pipeline_cache_limit_value(
+            getenv("PROSPER_PIPELINE_CACHE_ENTRIES"));
     }();
     return limit;
 }

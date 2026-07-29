@@ -31,13 +31,23 @@ size_t texture_decode_cache_limit_bytes(const char* override_mib,
 
 // Decide whether guest bytes are the authoritative source for a sampled-texture decode. Retained
 // color and depth targets are already represented by Vulkan images and must bypass CPU decode-cache
-// validation; captured host backing and non-2D/non-texture resources follow their dedicated paths.
+// validation; captured host backing, cube textures, and non-texture resources follow their dedicated
+// paths. Supported 3D volume inputs are pure guest-byte decodes and may be retained like 2D inputs.
 bool texture_decode_cache_candidate(bool has_live_color_target,
                                     bool has_live_depth_target,
                                     bool has_captured_host_data,
                                     uint32_t image_dimension,
                                     bool is_sampled_texture,
                                     bool format_supported);
+
+// Once an exact source has been validated while a working write watch is armed, the retained encoded
+// copy is redundant: Unchanged permits reuse, while Dirty/Unknown conservatively forces a re-decode.
+// Sources that double as decoded pixels and audit modes still need their byte-exact baseline.
+bool texture_source_snapshot_can_follow_watch(bool source_matches_pixels,
+                                              bool validation_audit_enabled,
+                                              bool watch_active,
+                                              size_t retained_source_bytes,
+                                              size_t expected_source_bytes);
 
 // Register the live renderer. `frame_dir` is where periodic BMP screenshots are written; pass
 // `dump_bmps = false` (the frontend app) to suppress them — a windowed app presents to screen and

@@ -32,6 +32,10 @@ static void set_env(const char* name, const char* value) {
 
 int main() {
     printf("== test_multidraw_render ==\n");
+    CHECK(prosper::test::persistent_pipeline_cache_limit_value(nullptr) == 4096,
+          "pipeline cache default covers modern deferred-renderer working sets");
+    CHECK(prosper::test::persistent_pipeline_cache_limit_value("17") == 17,
+          "pipeline cache entry override remains exact");
     set_env("PROSPER_RENDER_TIMING", "1");
     set_env("PROSPER_PIPELINE_LAYOUT_CACHE_ENTRIES", "2");
     const uint32_t W = 64, H = 64;

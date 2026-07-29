@@ -5,6 +5,7 @@
 #include "rtt_injection.hpp"
 #include "rtt_scale.hpp"
 #include "readback_policy.hpp"
+#include "write_watch_policy.hpp"
 #include "live_compute.hpp"
 
 #include "gpu/gpu_execute.hpp"          // DrawItem, set_submit_renderer
@@ -306,11 +307,14 @@ struct TextureDecodeKey {
     uint32_t tile_mode = 0;
     uint32_t linear_row_pitch_bytes = 0;
     uint32_t img_dim = 0;
+    uint32_t mip_tail_bytes = 0, mip_tail_x = 0, mip_tail_y = 0;
+    uint32_t layer_stride_bytes = 0, layer_mip_offset_bytes = 0;
     uint32_t max_uncompressed_block_size = 0, max_compressed_block_size = 0;
     uint32_t dcc_flags = 0;
     uint64_t metadata_addr = 0;
     uint64_t metadata_host_data = 0;
     uint64_t metadata_host_data_size = 0;
+    bool in_mip_tail = false;
     bool preserve_narrow_channels = false;
     bool operator==(const TextureDecodeKey&) const = default;
 };
@@ -327,9 +331,12 @@ struct TextureDecodeKeyHash {
         mix(key.gpu_addr); mix(key.host_data); mix(key.host_data_size); mix(key.size);
         mix(key.cls); mix(key.format); mix(key.num_components); mix(key.width); mix(key.height); mix(key.depth);
         mix(key.tile_mode); mix(key.linear_row_pitch_bytes); mix(key.img_dim);
+        mix(key.mip_tail_bytes); mix(key.mip_tail_x); mix(key.mip_tail_y);
+        mix(key.layer_stride_bytes); mix(key.layer_mip_offset_bytes);
         mix(key.max_uncompressed_block_size);
         mix(key.max_compressed_block_size); mix(key.dcc_flags); mix(key.metadata_addr);
         mix(key.metadata_host_data); mix(key.metadata_host_data_size);
+        mix(key.in_mip_tail);
         mix(key.preserve_narrow_channels);
         return hash;
     }
@@ -356,6 +363,8 @@ struct PersistentDecodedTexture {
     prosper::gpu::GuestGpuWriteSnapshot validation_snapshot;
     prosper::host::GuestWriteWatch source_watch;
     uint32_t source_watch_dirty_count = 0;
+    uint32_t source_watch_stable_validations = 0;
+    bool source_watch_only = false;
     bool source_watch_disabled = false;
 
     size_t bytes() const { return source_prefix.size() + pixels.size(); }
@@ -400,8 +409,17 @@ bool texture_decode_cache_candidate(bool has_live_color_target,
                                     bool is_sampled_texture,
                                     bool format_supported) {
     return !has_live_color_target && !has_live_depth_target &&
-        !has_captured_host_data && image_dimension == 1u &&
+        !has_captured_host_data && (image_dimension == 1u || image_dimension == 2u) &&
         is_sampled_texture && format_supported;
+}
+
+bool texture_source_snapshot_can_follow_watch(bool source_matches_pixels,
+                                              bool validation_audit_enabled,
+                                              bool watch_active,
+                                              size_t retained_source_bytes,
+                                              size_t expected_source_bytes) {
+    return !source_matches_pixels && !validation_audit_enabled && watch_active &&
+        expected_source_bytes != 0 && retained_source_bytes == expected_source_bytes;
 }
 
 uint32_t buffer_upload_bytes(uint32_t declared_bytes) {
@@ -837,6 +855,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             register_cpu_rtt_dcc_metadata(g_rtt, items);
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
             const prosper::gpu::LiveRenderPhase phase = prosper::gpu::live_render_phase();
+            static const size_t write_watch_promotion_budget_bytes = [] {
+                const char* value = getenv("PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_MB");
+                const uint64_t mib = value ? strtoull(value, nullptr, 10) : 8ull;
+                return static_cast<size_t>(
+                    std::min<uint64_t>(mib, SIZE_MAX / (1024ull * 1024ull)) *
+                    (1024ull * 1024ull));
+            }();
+            static thread_local prosper::frontend::WriteWatchPromotionBudget
+                write_watch_promotion_budget;
+            if (phase.first_span)
+                write_watch_promotion_budget.reset(write_watch_promotion_budget_bytes);
             struct PinnedScanout {
                 uint64_t id = 0;
                 uint32_t width = 0, height = 0;
@@ -1336,6 +1365,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             r.host_data_size, r.size, static_cast<uint32_t>(r.cls),
                             static_cast<uint32_t>(r.format), r.num_components, tw, th, r.depth,
                             r.tile_mode, r.linear_row_pitch_bytes, r.img_dim,
+                            r.mip_tail_bytes, r.mip_tail_x, r.mip_tail_y,
+                            r.layer_stride_bytes, r.layer_mip_offset_bytes,
                             r.compression_enabled ? r.max_uncompressed_block_size : 0u,
                             r.compression_enabled ? r.max_compressed_block_size : 0u,
                             r.compression_enabled
@@ -1350,6 +1381,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                       r.dcc_metadata_host_data))
                                 : 0u,
                             r.compression_enabled ? r.dcc_metadata_host_data_size : 0u,
+                            r.in_mip_tail,
                             avplayer_chroma_layout,
                         };
                         auto live_rtt = rtt_on ? g_rtt.find(r.gpu_addr) : g_rtt.end();
@@ -1448,6 +1480,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const bool persistent_unorm8_texture =
                             r.format == prosper::gpu::DataFormat::Unorm8 &&
                             r.num_components >= 1 && r.num_components <= 4;
+                        // UNORM16 inputs follow the same deterministic guest-byte decode contract.
+                        // Retaining the already-decoded pixels does not change the existing channel
+                        // expansion/swizzle semantics; it only avoids repeating them for immutable data.
+                        const bool persistent_unorm16_texture =
+                            r.format == prosper::gpu::DataFormat::Unorm16 &&
+                            r.num_components >= 1 && r.num_components <= 2;
                         // Float16/HDR sampled textures decode to RGBA8 via a dedicated branch below but were
                         // excluded from the persistent decode cache, so HDR art was re-detiled every frame
                         // (#1177, the largest `notsampled` bucket). The cache machinery is format-agnostic —
@@ -1496,12 +1534,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         if (sampled_source_bpt == 0 ||
                             (sampled_source_bpt > 4 && !sampled_source_f16 && !sampled_source_f32))
                             sampled_source_bpt = 4;
+                        const bool persistent_format_supported =
+                            persistent_unorm8_texture || persistent_fp16_texture ||
+                            persistent_unorm16_texture || persistent_fp32_texture ||
+                            persistent_packed32_texture ||
+                            (persistent_bc_block_bytes != 0 && !is_volume);
                         const bool persistent_sampled_texture = texture_decode_cache_candidate(
                             has_live_rtt, has_ds_live, r.host_data != nullptr, r.img_dim,
-                            r.cls == RC::Texture,
-                            persistent_unorm8_texture || persistent_fp16_texture ||
-                                persistent_fp32_texture || persistent_packed32_texture ||
-                                persistent_bc_block_bytes != 0);
+                            r.cls == RC::Texture, persistent_format_supported);
                         const bool persistent_source_is_tiled =
                             persistent_sampled_texture && !getenv("PROSPER_NODETILE") &&
                             prosper::gpu::tile_mode_is_tiled(r.tile_mode);
@@ -1570,16 +1610,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             }
                             if (persistent_packed32_texture)
                                 return persistent_source_is_tiled
-                                    ? prosper::gpu::tiled_surface_bytes(
-                                          tw, th, r.tile_mode, persistent_pitch, 4u)
-                                    : static_cast<size_t>(tw) * th * 4u;
-                            // fp32/fp16 sources are 4/2 B per component; unorm8 is 1 B/component.
+                                    ? (is_volume
+                                           ? prosper::gpu::tiled_volume_bytes(
+                                                 tw, th, r.depth, r.tile_mode, 4u)
+                                           : prosper::gpu::tiled_surface_bytes(
+                                                 tw, th, r.tile_mode, persistent_pitch, 4u))
+                                    : static_cast<size_t>(tw) * th *
+                                          (is_volume ? r.depth : 1u) * 4u;
+                            // fp32 sources are 4 B/component, fp16/unorm16 are 2, and unorm8 is 1.
                             const uint32_t source_component_bytes = persistent_fp32_texture ? 4u
-                                : (persistent_fp16_texture ? 2u : 1u);
+                                : ((persistent_fp16_texture || persistent_unorm16_texture) ? 2u : 1u);
                             const uint32_t source_bpt = r.num_components * source_component_bytes;
                             if (persistent_source_is_tiled)
-                                return prosper::gpu::tiled_surface_bytes(
-                                    tw, th, r.tile_mode, persistent_pitch, source_bpt);
+                                return is_volume
+                                    ? prosper::gpu::tiled_volume_bytes(
+                                          tw, th, r.depth, r.tile_mode, source_bpt)
+                                    : prosper::gpu::tiled_surface_bytes(
+                                          tw, th, r.tile_mode, persistent_pitch, source_bpt);
                             // Forced detiling treats a nominally linear Unorm8x4 descriptor as tiled; its
                             // decode source is then not the linear byte range computed here. This exclusion
                             // is unorm8-specific — fp16 (which can also land at source_bpt==4 for RG16F)
@@ -1587,7 +1634,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             if (persistent_unorm8_texture && source_bpt == 4 &&
                                 !persistent_source_matches_pixels) return size_t{0};
                             if (linear_padded_read) return linear_src_row * th;
-                            return static_cast<size_t>(tw) * th * source_bpt;
+                            return static_cast<size_t>(tw) * th *
+                                (is_volume ? r.depth : 1u) * source_bpt;
                         }();
                         // DCC code 0xff means the base allocation contains ordinary uncompressed
                         // texels.  Such an image is just as cacheable as a descriptor with DCC disabled,
@@ -1645,6 +1693,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         }();
                         const bool cross_submit_watch_eligible = cross_submit_watch_enabled &&
                             persistent_source_size >= cross_submit_watch_min_bytes;
+                        static const size_t cross_submit_watch_defer_min_bytes = [] {
+                            const char* value = getenv("PROSPER_TEXTURE_WRITE_WATCH_DEFER_MIN_KB");
+                            const uint64_t kib = value ? strtoull(value, nullptr, 10) : 8192ull;
+                            return static_cast<size_t>(
+                                std::min<uint64_t>(kib, SIZE_MAX / 1024ull) * 1024ull);
+                        }();
+                        static const uint32_t cross_submit_watch_promotion_validations = [] {
+                            const char* value = getenv("PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_HITS");
+                            const uint64_t hits = value ? strtoull(value, nullptr, 10) : 3ull;
+                            return static_cast<uint32_t>(std::min<uint64_t>(hits, UINT32_MAX));
+                        }();
                         static const bool audit_cross_submit_watch =
                             getenv("PROSPER_AUDIT_CROSS_SUBMIT_TEXTURE_WRITE_WATCH") != nullptr;
                         prosper::host::GuestWriteWatch pending_source_watch;
@@ -1666,6 +1725,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 cached->second.source_addr == persistent_source_addr &&
                                 cached->second.source_size == persistent_source_size) {
                                 auto validate_exact = [&] {
+                                    // A successfully promoted Linux watch may own the mutation proof
+                                    // without retaining a second encoded copy. Dirty/Unknown must miss;
+                                    // there is deliberately no probabilistic hash fallback here.
+                                    if (cached->second.source_watch_only) return false;
                                     bool matches = false;
                                     size_t validated_bytes = 0;
                                     if (cached->second.source_matches_pixels) {
@@ -1736,9 +1799,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 }
                                 const bool watch_unchanged = !submit_unchanged &&
                                     watch_query == prosper::host::GuestWriteWatchQuery::Unchanged;
+                                const bool watch_ready =
+                                    prosper::frontend::should_promote_write_watch(
+                                        persistent_source_size,
+                                        cached->second.source_watch_stable_validations,
+                                        cross_submit_watch_defer_min_bytes,
+                                        cross_submit_watch_promotion_validations);
+                                const bool may_arm_watch = cached->second.source_watch ||
+                                    (!submit_unchanged && !watch_unchanged &&
+                                     cross_submit_watch_eligible &&
+                                     !cached->second.source_watch_disabled && watch_ready &&
+                                     write_watch_promotion_budget.try_consume(
+                                         persistent_source_size));
                                 if (!submit_unchanged && !watch_unchanged &&
                                     cross_submit_watch_eligible &&
-                                    !cached->second.source_watch_disabled) {
+                                    !cached->second.source_watch_disabled &&
+                                    may_arm_watch) {
                                     // Arm before reading. A concurrent CPU write during or after the
                                     // authoritative comparison then dirties this registration instead of
                                     // landing in an unprotected compare-to-rearm window.
@@ -1771,10 +1847,31 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 } else {
                                     content_matches = validate_exact();
                                 }
+                                if (!submit_unchanged && !watch_unchanged) {
+                                    cached->second.source_watch_stable_validations =
+                                        prosper::frontend::update_write_watch_stability(
+                                            cached->second.source_watch_stable_validations,
+                                            content_matches,
+                                            cross_submit_watch_promotion_validations);
+                                }
                                 if (content_matches) {
                                     cached->second.last_use = decode_generation;
                                     cached->second.validation_snapshot =
                                         prosper::gpu::guest_gpu_write_snapshot();
+                                    static const bool keep_source_snapshots =
+                                        getenv("PROSPER_KEEP_TEXTURE_SOURCE_SNAPSHOTS") != nullptr;
+                                    if (!keep_source_snapshots &&
+                                        texture_source_snapshot_can_follow_watch(
+                                            cached->second.source_matches_pixels,
+                                            audit_submit_reuse || audit_cross_submit_watch,
+                                            static_cast<bool>(cached->second.source_watch),
+                                            cached->second.source_prefix.size(),
+                                            cached->second.source_size)) {
+                                        const size_t released = cached->second.source_prefix.size();
+                                        std::vector<uint8_t>().swap(cached->second.source_prefix);
+                                        cached->second.source_watch_only = true;
+                                        persistent_decoded_texture_bytes -= released;
+                                    }
                                     persistent_reuse = {cached->second.pixels.data(),
                                                         cached->second.output_height,
                                                         cached->second.narrow,
@@ -1790,7 +1887,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 // Establish the mutation boundary before the initial source read/decode.
                                 // If registration is unsupported, the empty watch keeps all later reuse on
                                 // the exact fallback.
-                                if (cross_submit_watch_eligible)
+                                if (cross_submit_watch_eligible &&
+                                    prosper::frontend::should_promote_write_watch(
+                                        persistent_source_size, 0,
+                                        cross_submit_watch_defer_min_bytes,
+                                        cross_submit_watch_promotion_validations))
                                     pending_source_watch = prosper::host::GuestWriteWatch::create(
                                         persistent_source_addr, persistent_source_size);
                                 if (timing_enabled) {
@@ -1888,7 +1989,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // surface is re-detiled every frame (a cache-key instability / live-RTT re-decode);
                         // if counts stay near 1 the cost is a large one-time working set instead.
                         if (getenv("PROSPER_DETILE_STATS")) {
+                            struct DecodeShape {
+                                uint32_t width = 0, height = 0, depth = 0;
+                                uint32_t image_dimension = 0, format = 0, components = 0;
+                                uint32_t tile_mode = 0, declared_bytes = 0;
+                            };
                             static std::unordered_map<uint64_t, uint64_t> ds_count;  // guest addr -> times decoded
+                            static std::unordered_map<uint64_t, DecodeShape> ds_shape;
                             static uint64_t ds_total = 0;
                             // Classify WHY this decode reached the miss path (so the redundancy is actionable):
                             // rtt          - a renderer-owned RTT decoded on the CPU (has_live_rtt)
@@ -1910,7 +2017,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             // ones, to see whether FP16/HDR art dominates (a cache-eligibility gap, #1177).
                             static uint64_t ns_hostdata = 0, ns_notdim1 = 0, ns_notclass = 0, ns_fmt = 0;
                             static std::unordered_map<uint32_t, uint64_t> ns_fmt_hist;
-                            ds_count[r.gpu_addr]++; ds_total++;
+                            ds_count[r.gpu_addr]++;
+                            ds_shape[r.gpu_addr] = {
+                                tw, th, r.depth, r.img_dim, static_cast<uint32_t>(r.format),
+                                r.num_components, r.tile_mode, r.size};
+                            ds_total++;
                             if (has_live_rtt) {
                                 r_rtt++;
                                 if (fr.is_storage_image) rtt_storage++;
@@ -1951,9 +2062,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                           [](auto& a, auto& b) { return a.second > b.second; });
                                 fprintf(stderr, "[detile-stats] %llu decodes, %zu distinct addrs; top re-decoded:",
                                         (unsigned long long)ds_total, ds_count.size());
-                                for (int i = 0; i < 8 && i < (int)v.size(); i++)
-                                    fprintf(stderr, " 0x%llx x%llu",
-                                            (unsigned long long)v[i].first, (unsigned long long)v[i].second);
+                                for (int i = 0; i < 8 && i < (int)v.size(); i++) {
+                                    const DecodeShape& shape = ds_shape[v[i].first];
+                                    fprintf(stderr,
+                                            " 0x%llx x%llu[%ux%ux%u dim=%u fmt=%u/%u tile=%u "
+                                            "decl=%u]",
+                                            (unsigned long long)v[i].first,
+                                            (unsigned long long)v[i].second,
+                                            shape.width, shape.height, shape.depth,
+                                            shape.image_dimension, shape.format, shape.components,
+                                            shape.tile_mode, shape.declared_bytes);
+                                }
                                 fprintf(stderr, "\n[detile-stats] miss reasons: rtt=%llu notsampled=%llu "
                                         "compression=%llu size0=%llu invalidated=%llu cold=%llu other=%llu\n",
                                         (unsigned long long)r_rtt, (unsigned long long)r_notsampled,
@@ -2766,6 +2885,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             }
                             auto old = persistent_decoded_textures.find(decode_key);
                             uint32_t inherited_watch_dirty_count = 0;
+                            uint32_t inherited_watch_stable_validations = 0;
                             bool inherited_watch_disabled = false;
                             prosper::host::GuestWriteWatch inherited_source_watch =
                                 std::move(pending_source_watch);
@@ -2773,6 +2893,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 old->second.source_addr == persistent_source_addr &&
                                 old->second.source_size == persistent_source_size) {
                                 inherited_watch_dirty_count = old->second.source_watch_dirty_count;
+                                inherited_watch_stable_validations =
+                                    old->second.source_watch_stable_validations;
                                 inherited_watch_disabled = old->second.source_watch_disabled;
                                 if (!inherited_watch_disabled)
                                     inherited_source_watch = std::move(old->second.source_watch);
@@ -2824,6 +2946,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 cached.validation_snapshot =
                                     prosper::gpu::guest_gpu_write_snapshot();
                                 cached.source_watch_dirty_count = inherited_watch_dirty_count;
+                                cached.source_watch_stable_validations =
+                                    inherited_watch_stable_validations;
                                 cached.source_watch_disabled = inherited_watch_disabled;
                                 cached.source_watch = std::move(inherited_source_watch);
                                 auto [inserted, ok] = persistent_decoded_textures.emplace(
@@ -3009,6 +3133,26 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                         reinterpret_cast<const uint32_t*>(tmp.data() + nb));
                             }
                             if (fr.dwords.empty()) fr.dwords.assign(64, 0);
+                        }
+                        if (const char* mode = getenv("PROSPER_RENDER_TIMING");
+                            mode && strcmp(mode, "detail") == 0) {
+                            const uint64_t detail_min_submit =
+                                getenv("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT")
+                                    ? strtoull(getenv(
+                                          "PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT"), nullptr, 0)
+                                    : 0;
+                            const double elapsed = std::chrono::duration<double, std::milli>(
+                                RenderClock::now() - resource_timing_start).count();
+                            static uint64_t detail_buffer_lines = 0;
+                            if (static_cast<uint64_t>(g_this_submit) >= detail_min_submit &&
+                                elapsed >= 0.5 && detail_buffer_lines++ < 250) {
+                                fprintf(stderr,
+                                        "[render-timing] buffer addr=0x%llx declared=%u "
+                                        "uploaded=%u class=%u direct=%d %.2f ms\n",
+                                        (unsigned long long)r.gpu_addr, requested_bytes, nb,
+                                        static_cast<unsigned>(r.cls),
+                                        static_cast<int>(resource_buffer_view), elapsed);
+                            }
                         }
                         // PROSPER_CBLOG: log each constant buffer's first 4 dwords as floats, once per
                         // address. If a scene draw's color/tint CB is (0,0,0,0), the PS outputs black
@@ -4607,11 +4751,25 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             totals.buffer_bytes / (1024.0 * 1024.0),
                             totals.buffer_materialized_bytes / (1024.0 * 1024.0),
                             totals.buffer_ms / nsub);
+                    size_t persistent_source_bytes = 0;
+                    size_t persistent_pixel_bytes = 0;
+                    size_t persistent_watch_only_entries = 0;
+                    size_t persistent_watch_only_saved_bytes = 0;
+                    for (const auto& [key, texture] : persistent_decoded_textures) {
+                        (void)key;
+                        persistent_source_bytes += texture.source_prefix.size();
+                        persistent_pixel_bytes += texture.pixels.size();
+                        if (texture.source_watch_only) {
+                            ++persistent_watch_only_entries;
+                            persistent_watch_only_saved_bytes += texture.source_prefix_size;
+                        }
+                    }
                     fprintf(stderr,
                             "[render-timing] texture_cache hits=%llu submit_reuse=%llu misses=%llu "
                             "watch_reuse=%llu watch_dirty=%llu watch_unknown=%llu watch_disabled=%llu "
                             "invalid=%llu "
-                            "validations=%llu %.1f GiB entries=%zu %.1f MiB\n",
+                            "validations=%llu %.1f GiB entries=%zu %.1f MiB "
+                            "(source=%.1f pixels=%.1f MiB watch-only=%zu saved=%.1f MiB)\n",
                             (unsigned long long)totals.persistent_hits,
                             (unsigned long long)totals.persistent_submit_reuses,
                             (unsigned long long)totals.persistent_misses,
@@ -4623,7 +4781,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             (unsigned long long)totals.persistent_validations,
                             totals.persistent_validation_bytes / (1024.0 * 1024.0 * 1024.0),
                             persistent_decoded_textures.size(),
-                            persistent_decoded_texture_bytes / (1024.0 * 1024.0));
+                            persistent_decoded_texture_bytes / (1024.0 * 1024.0),
+                            persistent_source_bytes / (1024.0 * 1024.0),
+                            persistent_pixel_bytes / (1024.0 * 1024.0),
+                            persistent_watch_only_entries,
+                            persistent_watch_only_saved_bytes / (1024.0 * 1024.0));
                     size_t rtt_bytes = 0;
                     for (const auto& [addr, surface] : g_rtt) {
                         (void)addr;
@@ -4641,13 +4803,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     const auto write_watch = prosper::host::guest_write_watch_stats();
                     fprintf(stderr,
                             "[render-timing] write_watch create=%llu ok=%llu pages=%llu no_map=%llu "
-                            "alias=%llu protect=%llu query=%llu unchanged=%llu dirty=%llu "
+                            "alias=%llu oversized=%llu sizes=%llu/%llu/%llu/%llu protect=%llu "
+                            "query=%llu unchanged=%llu dirty=%llu "
                             "unknown=%llu faults=%llu physical=%llu rearms=%llu\n",
                             (unsigned long long)write_watch.create_attempts,
                             (unsigned long long)write_watch.registrations,
                             (unsigned long long)write_watch.registered_pages,
                             (unsigned long long)write_watch.create_no_mapping,
                             (unsigned long long)write_watch.create_incomplete_aliases,
+                            (unsigned long long)write_watch.create_oversized,
+                            (unsigned long long)write_watch.create_bytes_le_1m,
+                            (unsigned long long)write_watch.create_bytes_le_8m,
+                            (unsigned long long)write_watch.create_bytes_le_32m,
+                            (unsigned long long)write_watch.create_bytes_gt_32m,
                             (unsigned long long)write_watch.create_protect_failures,
                             (unsigned long long)write_watch.queries,
                             (unsigned long long)write_watch.unchanged,

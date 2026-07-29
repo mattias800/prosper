@@ -939,10 +939,27 @@ int main() {
         using prosper::frontend::texture_decode_cache_candidate;
         CHECK(texture_decode_cache_candidate(false, false, false, 1u, true, true),
               "an ordinary supported guest 2D texture uses the decoded-texture cache");
+        CHECK(texture_decode_cache_candidate(false, false, false, 2u, true, true),
+              "a supported guest 3D volume uses the decoded-texture cache");
+        CHECK(!texture_decode_cache_candidate(false, false, false, 3u, true, true),
+              "a cube texture stays on its layer-aware decode path");
         CHECK(!texture_decode_cache_candidate(false, true, false, 1u, true, true),
               "a retained sampled-depth image bypasses guest-byte decode-cache work");
         CHECK(!texture_decode_cache_candidate(true, false, false, 1u, true, true),
               "a retained color image bypasses guest-byte decode-cache work");
+
+        using prosper::frontend::texture_source_snapshot_can_follow_watch;
+        CHECK(texture_source_snapshot_can_follow_watch(false, false, true, 4096u, 4096u),
+              "an exact encoded snapshot becomes redundant behind an armed write watch");
+        CHECK(!texture_source_snapshot_can_follow_watch(true, false, true, 0u, 4096u),
+              "decoded pixels that are also the exact source baseline remain retained");
+        CHECK(!texture_source_snapshot_can_follow_watch(false, true, true, 4096u, 4096u),
+              "validation audit mode retains the exact source baseline");
+        CHECK(!texture_source_snapshot_can_follow_watch(false, false, false, 4096u, 4096u),
+              "an unsupported write watch keeps exact source validation available");
+        CHECK(!texture_source_snapshot_can_follow_watch(false, false, true, 2048u, 4096u),
+              "a partial source snapshot is never discarded as a complete baseline");
+
     }
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
