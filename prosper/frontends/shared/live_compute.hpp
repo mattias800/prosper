@@ -7,6 +7,24 @@
 
 namespace prosper::frontend {
 
+enum class ComputeImageCacheClass : uint8_t { sampled, storage };
+
+// Read-only sampled inputs are often tiny, numerous, and cheap to upload; retaining all of them
+// wastes cache identities and device memory. A storage target has a different cost model: even a
+// small repeated output otherwise incurs staging readback, guest-format packing, and layout work.
+// One 4 KiB host page is the measured storage crossover and avoids retaining sub-page Vulkan
+// objects. Keep the default crossover policy explicit and independently testable.
+constexpr uint64_t compute_image_cache_default_minimum_bytes(
+    ComputeImageCacheClass image_class) {
+    return image_class == ComputeImageCacheClass::storage ? 4ull * 1024ull
+                                                          : 1024ull * 1024ull;
+}
+
+constexpr bool compute_image_cache_default_eligible(
+    uint64_t bytes, ComputeImageCacheClass image_class) {
+    return bytes >= compute_image_cache_default_minimum_bytes(image_class);
+}
+
 // Pack one raw float32 channel to UNORM8 using the storage-image conversion contract. Kept public
 // so the optimized scalar conversion can be checked directly against the previous lround path.
 uint8_t storage_pack_unorm8(uint32_t float_bits);

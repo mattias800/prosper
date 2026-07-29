@@ -697,18 +697,38 @@ VkDeviceSize persistent_compute_buffer_limit() {
     return limit;
 }
 
-bool persistent_compute_image_enabled(VkDeviceSize bytes) {
+VkDeviceSize compute_image_cache_minimum(const char* value, VkDeviceSize fallback) {
+    if (!value || !*value) return fallback;
+    char* end = nullptr;
+    const uint64_t kib = std::strtoull(value, &end, 10);
+    if (!end || *end) return fallback;
+    if (kib > UINT64_MAX / 1024ull) return VkDeviceSize{UINT64_MAX};
+    return static_cast<VkDeviceSize>(kib) * 1024ull;
+}
+
+bool persistent_compute_image_enabled(VkDeviceSize bytes,
+                                      ComputeImageCacheClass image_class) {
     static const bool enabled =
         std::getenv("PROSPER_NO_PERSISTENT_COMPUTE_IMAGES") == nullptr;
-    static const VkDeviceSize minimum = []() -> VkDeviceSize {
-        const char* value = std::getenv("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB");
-        const uint64_t kib = value ? std::strtoull(value, nullptr, 10) : 1024ull;
-        if (kib > UINT64_MAX / 1024ull) return VkDeviceSize{UINT64_MAX};
-        return static_cast<VkDeviceSize>(kib) * 1024ull;
+    static const VkDeviceSize sampled_minimum = [] {
+        return compute_image_cache_minimum(
+            std::getenv("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB"),
+            compute_image_cache_default_minimum_bytes(ComputeImageCacheClass::sampled));
     }();
-    // The cache exists to remove full-surface detile/conversion/upload work. Tiny textures are both
-    // cheap and numerous, so leave them on the pooled transient path. The threshold is configurable
-    // so integration tests can exercise residency without allocating a multi-megabyte target.
+    static const VkDeviceSize storage_minimum = [] {
+        const char* value = std::getenv("PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB");
+        // The historical generic override applied to both image roles. Preserve that contract when
+        // no storage-specific value is supplied, while allowing the production defaults to diverge.
+        if (!value || !*value)
+            value = std::getenv("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB");
+        return compute_image_cache_minimum(
+            value,
+            compute_image_cache_default_minimum_bytes(ComputeImageCacheClass::storage));
+    }();
+    const VkDeviceSize minimum = image_class == ComputeImageCacheClass::storage
+        ? storage_minimum : sampled_minimum;
+    // Both thresholds are configurable so production-backend tests can exercise residency without
+    // large allocations and device-specific profiling can retune either crossover independently.
     return enabled && bytes >= minimum;
 }
 
@@ -3203,7 +3223,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                     [](uint8_t value) { return value == 0xff; });
                 }
                 bi.cache_candidate = !r->host_data && dcc_cache_safe &&
-                    persistent_compute_image_enabled(sbytes);
+                    persistent_compute_image_enabled(sbytes, ComputeImageCacheClass::sampled);
                 if (bi.cache_candidate) {
                     bi.cache_key = {
                         r->gpu_addr, static_cast<uint32_t>(sampled_guest_need), r->size,
@@ -3345,7 +3365,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  [](uint8_t value) { return value == 0xff; }));
                 bi.cache_candidate = !renderer_owned && !r->host_data && dcc_cache_safe &&
                     !bi.poison_verify && (bi.native_float_storage || bi.seed_skip) &&
-                    persistent_compute_image_enabled(sbytes);
+                    persistent_compute_image_enabled(sbytes, ComputeImageCacheClass::storage);
                 if (bi.cache_candidate) {
                     bi.cache_key = {
                         r->gpu_addr, static_cast<uint32_t>(guest_bytes), r->size,

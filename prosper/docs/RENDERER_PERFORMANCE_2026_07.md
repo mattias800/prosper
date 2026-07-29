@@ -1071,6 +1071,38 @@ the comparator 0.13 -> 0.59 ms). The adjacent 8 MiB kernel stayed **0.82 versus 
 the crossover gate. Whole-route FPS varied by more than this sub-millisecond saving between the two
 sequential runs, so these numbers support the local optimization only, not a frame-rate claim.
 
+## Plucky Squire: small repeated storage mip results
+
+Plucky runs the same mip-generation compute program twice per frame. The first invocation writes a
+large chain and already qualifies for persistent image residency. The second writes 32 KiB, 8 KiB,
+2 KiB, and 512-byte native storage results. The historical one-MiB image threshold left all four on
+the transient path, so a roughly 0.2 ms dispatch still paid about 1.5 ms to map, pack, and retile its
+small outputs every frame.
+
+Sampled inputs and writable outputs have different retention economics. Tiny sampled images are
+numerous and cheap to upload, while a repeated storage image pays a writeback/layout boundary even
+when its result is unchanged. The cache policy therefore keeps the sampled default at 1 MiB and gives
+storage images an independent one-page (4 KiB) crossover. Existing
+`PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB` overrides remain compatible for both roles;
+`PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB` retunes only storage residency.
+
+Matched 35-second live sweeps measured the second invocation after submit 100:
+
+| storage crossover | samples | median writeback | median layout | median total |
+|---|---:|---:|---:|---:|
+| 1 MiB (historical control) | 477 | 1.51 ms | 1.16 ms | 2.11 ms |
+| 32 KiB | 498 | 0.70 ms | 0.35 ms | 1.45 ms |
+| 4 KiB | 514 | 0.16 ms | 0.08 ms | **0.83 ms** |
+| 1 KiB | 481 | 0.16 ms | 0.02 ms | 0.89 ms |
+
+The 4 KiB and 1 KiB totals are within run noise; one page is the narrower general policy because it
+does not retain sub-page Vulkan objects. Frame progression stayed healthy across the matched control
+and broad candidate runs (527 and 529 presented frames). These were sequential dispatch-local sweeps,
+not an alternating whole-route benchmark, so they support the retained-output crossover rather than a
+standalone FPS claim. GPU replay cannot exercise this live residency path because replay resources are
+owned `host_data`; the production-backend test instead pins the temporal contract, and the pure policy
+checks pin both exact default boundaries.
+
 ## Next renderer step
 
 Bring up a representative Unreal/3D workload and collect the same stage timings plus a corrected

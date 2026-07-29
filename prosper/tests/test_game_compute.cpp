@@ -28,6 +28,22 @@ int main() {
     setenv("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB", "0", 1);
     setenv("PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB", "1", 1);
 #endif
+    using prosper::frontend::ComputeImageCacheClass;
+    CHECK(prosper::frontend::compute_image_cache_default_minimum_bytes(
+              ComputeImageCacheClass::sampled) == 1024ull * 1024ull &&
+          prosper::frontend::compute_image_cache_default_minimum_bytes(
+              ComputeImageCacheClass::storage) == 4ull * 1024ull,
+          "sampled and storage images retain independent default cache crossovers");
+    CHECK(!prosper::frontend::compute_image_cache_default_eligible(
+              1024ull * 1024ull - 1, ComputeImageCacheClass::sampled) &&
+          prosper::frontend::compute_image_cache_default_eligible(
+              1024ull * 1024ull, ComputeImageCacheClass::sampled) &&
+          !prosper::frontend::compute_image_cache_default_eligible(
+              4ull * 1024ull - 1, ComputeImageCacheClass::storage) &&
+          prosper::frontend::compute_image_cache_default_eligible(
+              4ull * 1024ull, ComputeImageCacheClass::storage),
+          "image residency policy includes each crossover exactly without caching smaller inputs");
+
     bool half_luts_match = true;
     for (uint32_t bits = 0; bits <= 0xffffu; ++bits) {
         const uint16_t half = static_cast<uint16_t>(bits);
