@@ -7268,11 +7268,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 auto m0 = rs.sreg.find(124);
                 if (m0 == rs.sreg.end()) { ok = false; return true; }
                 b.declare_lds();
+                // The instruction uses M0[15:0]; the upper half is ignored by hardware.
+                const uint32_t m0_low = b.ibin(
+                    Op_BitwiseAnd, m0->second, b.uconst(0xFFFFu));
                 const uint32_t lane = b.ibin(
                     Op_BitwiseAnd, b.linear_localid, b.uconst(b.wave_size - 1));
                 const uint32_t byte_addr = b.ibin(
                     Op_IAdd,
-                    b.ibin(Op_IAdd, m0->second, b.uconst(in.literal)),
+                    b.ibin(Op_IAdd, m0_low, b.uconst(in.literal)),
                     b.ibin(Op_ShiftLeftLogical, lane, b.uconst(2)));
                 const uint32_t idx = b.ibin(Op_ShiftRightLogical, byte_addr, b.uconst(2));
                 if (in.opcode == 0xb0) {
@@ -7360,7 +7363,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst(in.literal & 0xFFu));
                 const uint32_t idx1 = b.ibin(Op_IAdd, base, b.uconst((in.literal >> 8) & 0xFFu));
                 b.lds_store(idx0, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
-                b.lds_store(idx1, vread(in.src[2].value), rs.exec_narrowed, rs.exec);
+                // Equal offsets encode one memory access and use DATA0; DATA1 is ignored.
+                if ((in.literal & 0xFFu) != ((in.literal >> 8) & 0xFFu))
+                    b.lds_store(idx1, vread(in.src[2].value), rs.exec_narrowed, rs.exec);
                 return true;
             }
             if (in.opcode == 0x4e) {                    // ds_write2_b64: two VGPR pairs at offset0/offset1

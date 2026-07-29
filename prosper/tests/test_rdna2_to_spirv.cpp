@@ -1502,21 +1502,37 @@ int main() {
           "kernel 32b2 DS_READ2_B32 applies both packed dword offsets exactly");
 
     // Kernel 32b2w: Astro Bot's world-map reduction pairs that read with DS_WRITE2_B32. Use its
-    // exact offset0/1=(0,1), DATA0=v2, DATA1=v1 instruction, read both slots back, and expose their
-    // sum. This also proves DATA0/DATA1 are not accidentally treated as one consecutive VGPR pair.
+    // exact offset0/1=(0,1), DATA0=v2, DATA1=v1 instruction, then expose OFFSET0 alone. A
+    // position-sensitive result proves DATA0/DATA1 are not swapped or treated as one VGPR pair.
     const uint32_t code32b2w[] = {
         0x7e000280u, 0x7e020281u, 0x7e040282u,
         0xd8380100u, 0x00010200u, 0xbf8a0000u,
         0xd8dc0100u, 0x03000000u,
-        0x7e060d03u, 0x7e080d04u, 0x060a0903u, 0xbf810000u,
+        0x7e0a0d03u, 0xbf810000u,
     };
     std::vector<uint32_t> spv32b2w = recompile_valu(
         code32b2w, std::size(code32b2w), 0, 5);
     CHECK(!spv32b2w.empty(), "recompiled kernel 32b2w (Astro DS_WRITE2_B32 word) -> SPIR-V");
     std::vector<float> got32b2w = prosper::test::run_compute(
         spv32b2w, std::vector<float>(1), 1, 1);
-    CHECK(got32b2w.size()==1 && std::fabs(got32b2w[0]-3.0f)<1e-3f,
-          "kernel 32b2w DS_WRITE2_B32 stores DATA0/1 at both packed dword offsets");
+    CHECK(got32b2w.size()==1 && std::fabs(got32b2w[0]-2.0f)<1e-3f,
+          "kernel 32b2w DS_WRITE2_B32 keeps DATA0 at packed OFFSET0");
+
+    // Equal offsets are one access, not two ordered writes: DATA0 wins and DATA1 is ignored.
+    const uint32_t code32b2weq[] = {
+        0x7e000280u, 0x7e020281u, 0x7e040282u,
+        0xd8380000u, 0x00010200u, 0xbf8a0000u,
+        0xd8d80000u, 0x03000000u,
+        0x7e0a0d03u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32b2weq = recompile_valu(
+        code32b2weq, std::size(code32b2weq), 0, 5);
+    CHECK(!spv32b2weq.empty(),
+          "recompiled kernel 32b2weq (DS_WRITE2_B32 equal offsets) -> SPIR-V");
+    std::vector<float> got32b2weq = prosper::test::run_compute(
+        spv32b2weq, std::vector<float>(1), 1, 1);
+    CHECK(got32b2weq.size()==1 && std::fabs(got32b2weq[0]-2.0f)<1e-3f,
+          "kernel 32b2weq equal offsets perform one DATA0 access");
 
     // Kernel 32b2a: Astro Bot's large world-map compute program spills each wave lane through
     // DS_WRITE_ADDTID_B32 and reloads it with DS_READ_ADDTID_B32. Unique per-lane input values prove
@@ -1538,6 +1554,24 @@ int main() {
         spv32b2a, in32b2a, (uint32_t)in32b2a.size(), (uint32_t)in32b2a.size());
     CHECK(got32b2a == in32b2a,
           "kernel 32b2a ADDTID round-trips every lane through its own LDS dword");
+
+    // ADDTID addresses use only M0[15:0]. Cross-check the write against an ordinary DS read so the
+    // test cannot pass merely because ADDTID write and read share the same incorrect formula.
+    const uint32_t code32b2amw[] = {
+        0xbefc03ffu, 0x00010000u,   // s_mov_b32 m0, 0x10000 (low 16 bits are zero)
+        0xdac00700u, 0x00000000u,   // ds_write_addtid_b32 v0 offset:0x700
+        0xbf8a0000u,
+        0x7e0402ffu, 0x00000700u,   // v_mov_b32 v2, 0x700
+        0xd8d80000u, 0x01000002u,   // ds_read_b32 v1, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32b2amw = recompile_valu(
+        code32b2amw, std::size(code32b2amw), 1, 1);
+    CHECK(!spv32b2amw.empty(), "recompiled kernel 32b2amw (ADDTID write M0 mask) -> SPIR-V");
+    std::vector<float> got32b2amw = prosper::test::run_compute(
+        spv32b2amw, std::vector<float>{1234.0f}, 1, 1);
+    CHECK(got32b2amw == std::vector<float>{1234.0f},
+          "kernel 32b2amw masks M0 to 16 bits before ADDTID write");
 
     // Kernel 32b3: three other exact words from Astro's loading compute shaders. V_MUL_U32_U24
     // must mask both operands to 24 bits, while V_CVT_FLR_I32_F32 must round negative values toward
