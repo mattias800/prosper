@@ -17,6 +17,11 @@ struct GuestWriteWatchStats {
     uint64_t registered_pages = 0;
     uint64_t create_no_mapping = 0;
     uint64_t create_incomplete_aliases = 0;
+    uint64_t create_oversized = 0;
+    uint64_t create_bytes_le_1m = 0;
+    uint64_t create_bytes_le_8m = 0;
+    uint64_t create_bytes_le_32m = 0;
+    uint64_t create_bytes_gt_32m = 0;
     uint64_t create_protect_failures = 0;
     uint64_t queries = 0;
     uint64_t unchanged = 0;
@@ -65,9 +70,13 @@ void guest_write_watch_invalidate_all();
 
 // Called by the HLE, by guest VA range, immediately BEFORE a host/kernel store into guest memory (e.g. a
 // read()/pread() that streams bytes straight into a guest dmem buffer). Restores write on any armed pages
-// the range overlaps so the store does not EFAULT, and marks them Dirty (the bytes are about to change).
-// No-op on Windows/macOS (no pages are ever armed there).
+// the range overlaps and marks them Dirty. No-op on Windows/macOS (no pages are ever armed there).
 void guest_write_watch_notify_host_write(uint64_t addr, uint64_t size);
+
+// Device/DMA writes already carry an exact guest VA range. Mark only registrations whose logical
+// source overlaps that range; unlike a CPU protection fault, an adjacent write on the same host page
+// need not create a false dirty result.
+void guest_write_watch_notify_gpu_write(uint64_t addr, uint64_t size);
 
 // Retained for the platform-neutral VEH interface; Windows currently returns false because
 // page-fault write watches are unsafe for SysV guest code.

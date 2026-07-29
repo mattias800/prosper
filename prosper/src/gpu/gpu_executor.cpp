@@ -14,6 +14,7 @@
 #include "rdna2_to_spirv.hpp"     // recompile_compute
 #include "writer_provenance.hpp"
 #include "../host/guest_memory_map.hpp"
+#include "../host/guest_write_watch.hpp"
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
@@ -4994,6 +4995,12 @@ void set_guest_gpu_write_observer(GuestGpuWriteObserver observer) {
 }
 void notify_guest_gpu_write(uint64_t addr, uint64_t size) {
     if (!addr || !size) return;
+    // Page-protection watches observe guest CPU stores, but device/DMA writes can mutate the same
+    // direct-memory pages without a CPU protection fault. Mark the virtual range dirty as part of the
+    // existing authoritative GPU-write notification so cross-submit texture/compute caches never trust
+    // an Unchanged watch over bytes written by the GPU. This may run after a host-mirrored write and
+    // is deliberately idempotent.
+    prosper::host::guest_write_watch_notify_gpu_write(addr, size);
     if (g_guest_gpu_writes.active) {
         if (g_guest_gpu_writes.writes.size() < kGuestGpuWriteJournalCapacity)
             g_guest_gpu_writes.writes.push_back({addr, size});

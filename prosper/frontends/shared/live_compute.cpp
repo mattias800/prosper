@@ -3,6 +3,7 @@
 #include "rtt_authority.hpp"
 #include "seed_reprove.hpp"
 #include "vulkan_device_select.hpp"
+#include "write_watch_policy.hpp"
 
 #include "gpu/bc_decode.hpp"
 #include "gpu/gpu_capture.hpp"
@@ -580,6 +581,7 @@ struct CachedComputeBuffer {
     // registrations so an exact refresh only scans chunks containing a dirtied page. An unavailable
     // chunk watch remains fail-closed: acquire_cached_buffer falls back to the full byte comparison.
     std::vector<ComputeBufferWriteWatchChunk> write_watches;
+    uint32_t write_watch_stable_validations = 0;
     prosper::gpu::GuestGpuWriteSnapshot validation_snapshot;
     // Exact previous writable result. Persistent buffers are host-visible because their ordinary
     // fallback must publish guest bytes, but mapping and comparing a 32 MiB result every frame is
@@ -640,6 +642,7 @@ struct CachedComputeImage {
     uint64_t validation_epoch = 0;
     bool validation_result = false;
     prosper::host::GuestWriteWatch write_watch;
+    uint32_t write_watch_stable_validations = 0;
     prosper::gpu::GuestGpuWriteSnapshot validation_snapshot;
     std::vector<uint8_t> source_snapshot;
     // Exact row-major bytes produced by the last storage dispatch. Full-overwrite post-processes
@@ -742,6 +745,26 @@ VkDeviceSize persistent_compute_image_limit() {
     return limit;
 }
 
+uint32_t compute_write_watch_promotion_validations() {
+    static const uint32_t value = [] {
+        const char* text = std::getenv("PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_HITS");
+        const uint64_t parsed = text ? std::strtoull(text, nullptr, 10) : 3ull;
+        return static_cast<uint32_t>(std::min<uint64_t>(parsed, UINT32_MAX));
+    }();
+    return value;
+}
+
+size_t compute_write_watch_promotion_budget_bytes() {
+    static const size_t value = [] {
+        const char* text = std::getenv("PROSPER_COMPUTE_WRITE_WATCH_PROMOTE_MB");
+        const uint64_t mib = text ? std::strtoull(text, nullptr, 10) : 8ull;
+        return static_cast<size_t>(
+            std::min<uint64_t>(mib, SIZE_MAX / (1024ull * 1024ull)) *
+            (1024ull * 1024ull));
+    }();
+    return value;
+}
+
 struct CachedComputePipeline {
     VkDescriptorSetLayout descriptor_layout = VK_NULL_HANDLE;
     VkShaderModule shader = VK_NULL_HANDLE;
@@ -794,6 +817,7 @@ struct VulkanComputeContext {
     VkDeviceSize image_cache_bytes = 0;
     uint64_t image_cache_clock = 0;
     uint64_t image_validation_clock = 0;
+    WriteWatchPromotionBudget write_watch_promotion_budget;
     VkDescriptorSetLayout compare_descriptor_layout = VK_NULL_HANDLE;
     VkShaderModule compare_shader = VK_NULL_HANDLE;
     VkPipelineLayout compare_pipeline_layout = VK_NULL_HANDLE;
@@ -1127,6 +1151,22 @@ struct VulkanComputeContext {
         image_cache_bytes = 0;
     }
 
+    void begin_write_watch_promotions() {
+        write_watch_promotion_budget.reset(compute_write_watch_promotion_budget_bytes());
+    }
+
+    bool may_promote_write_watch_before_exact(size_t source_bytes,
+                                              uint32_t stable_validations) {
+        const uint32_t promotion_validations =
+            compute_write_watch_promotion_validations();
+        const uint32_t prospective_stability = update_write_watch_stability(
+            stable_validations, true, promotion_validations);
+        return should_promote_write_watch(
+                   source_bytes, prospective_stability, 1,
+                   promotion_validations) &&
+               write_watch_promotion_budget.try_consume(source_bytes);
+    }
+
     bool make_buffer_cache_room(VkDeviceSize bytes) {
         const VkDeviceSize limit = persistent_compute_buffer_limit();
         if (bytes > limit) return false;
@@ -1182,6 +1222,10 @@ struct VulkanComputeContext {
         dirty_watch_chunks = static_cast<uint32_t>(dirty_chunks.size());
         upload_skipped = submit_unchanged || (watches_complete && dirty_chunks.empty());
         if (!upload_skipped) {
+            // Establish the mutation boundary before the authoritative guest-byte comparison.
+            // Arming after memcmp would leave a compare-to-arm gap where a concurrent guest CPU
+            // write could become permanently invisible to this cache entry.
+            prepare_cached_buffer_write_watches_before_exact(key);
             void* mapped = nullptr;
             if (map_memory(cached.memory, 0, key.bytes, &mapped) != VK_SUCCESS) {
                 --cached.pins;
@@ -1208,7 +1252,8 @@ struct VulkanComputeContext {
             }
             unmap_memory(cached.memory);
             cached.content_valid = true;
-            if (!key.host_data) validate_cached_buffer_source(key);
+            if (!key.host_data)
+                validate_cached_buffer_source(key, upload_skipped, true);
         }
         return true;
     }
@@ -1222,16 +1267,6 @@ struct VulkanComputeContext {
         cached.allocation_bytes = allocation_bytes;
         cached.last_use = ++buffer_cache_clock;
         cached.pins = 1;
-        if (!key.host_data) {
-            for (uint32_t offset = 0; offset < key.bytes;) {
-                const uint32_t bytes = std::min(kComputeBufferWriteWatchChunkBytes,
-                                                key.bytes - offset);
-                cached.write_watches.push_back({
-                    offset, bytes,
-                    prosper::host::GuestWriteWatch::create(key.gpu_addr + offset, bytes)});
-                offset += bytes;
-            }
-        }
         if (!key.host_data)
             cached.validation_snapshot = prosper::gpu::guest_gpu_write_snapshot();
         auto [it, inserted] = buffer_cache.emplace(key, std::move(cached));
@@ -1245,12 +1280,45 @@ struct VulkanComputeContext {
         if (found != buffer_cache.end() && found->second.pins) --found->second.pins;
     }
 
-    void validate_cached_buffer_source(const ComputeBufferCacheKey& key) {
+    void prepare_cached_buffer_write_watches_before_exact(
+        const ComputeBufferCacheKey& key) {
+        auto found = buffer_cache.find(key);
+        if (found == buffer_cache.end() || key.host_data) return;
+        CachedComputeBuffer& cached = found->second;
+        if (cached.write_watches.empty()) {
+            if (!may_promote_write_watch_before_exact(
+                    key.bytes, cached.write_watch_stable_validations))
+                return;
+            for (uint32_t offset = 0; offset < key.bytes;) {
+                const uint32_t bytes = std::min(kComputeBufferWriteWatchChunkBytes,
+                                                key.bytes - offset);
+                cached.write_watches.push_back({
+                    offset, bytes,
+                    prosper::host::GuestWriteWatch::create(key.gpu_addr + offset, bytes)});
+                offset += bytes;
+            }
+            return;
+        }
+        for (ComputeBufferWriteWatchChunk& chunk : cached.write_watches) {
+            if (chunk.watch && chunk.watch.rearm()) continue;
+            chunk.watch.reset();
+            chunk.watch = prosper::host::GuestWriteWatch::create(
+                key.gpu_addr + chunk.offset, chunk.bytes);
+        }
+    }
+
+    void validate_cached_buffer_source(const ComputeBufferCacheKey& key,
+                                       bool content_unchanged = false,
+                                       bool watch_prepared_before_validation = false) {
         auto found = buffer_cache.find(key);
         if (found == buffer_cache.end() || key.host_data) return;
         CachedComputeBuffer& cached = found->second;
         cached.content_valid = true;
         cached.validation_snapshot = prosper::gpu::guest_gpu_write_snapshot();
+        cached.write_watch_stable_validations = update_write_watch_stability(
+            cached.write_watch_stable_validations, content_unchanged,
+            compute_write_watch_promotion_validations());
+        if (watch_prepared_before_validation || cached.write_watches.empty()) return;
         for (ComputeBufferWriteWatchChunk& chunk : cached.write_watches) {
             if (chunk.watch && chunk.watch.rearm()) continue;
             chunk.watch.reset();
@@ -1367,9 +1435,24 @@ struct VulkanComputeContext {
             prosper::gpu::guest_gpu_writes_since(cached.validation_snapshot,
                                                   key.gpu_addr, key.guest_bytes) ==
                 prosper::gpu::GuestGpuWriteQuery::Unchanged;
-        const bool watch_unchanged = !submit_unchanged && cached.content_valid &&
-            cached.write_watch &&
-            cached.write_watch.query() == prosper::host::GuestWriteWatchQuery::Unchanged;
+        const prosper::host::GuestWriteWatchQuery watch_query =
+            !submit_unchanged && cached.content_valid && cached.write_watch
+                ? cached.write_watch.query()
+                : prosper::host::GuestWriteWatchQuery::Unknown;
+        const bool watch_unchanged = !submit_unchanged &&
+            watch_query == prosper::host::GuestWriteWatchQuery::Unchanged;
+        if (cached.content_valid && !submit_unchanged && !watch_unchanged && source) {
+            // Rearm a dirtied watch, or promote a repeatedly stable exact source, before memcmp.
+            // A write racing the comparison then remains Dirty for the next acquisition instead of
+            // being erased by a post-comparison rearm.
+            if (cached.write_watch && !cached.write_watch.rearm())
+                cached.write_watch.reset();
+            if (!cached.write_watch && may_promote_write_watch_before_exact(
+                    key.guest_bytes, cached.write_watch_stable_validations)) {
+                cached.write_watch = prosper::host::GuestWriteWatch::create(
+                    key.gpu_addr, key.guest_bytes);
+            }
+        }
         const bool exact_unchanged = cached.content_valid && !submit_unchanged &&
             !watch_unchanged && source &&
             cached.source_snapshot.size() == key.guest_bytes &&
@@ -1379,12 +1462,11 @@ struct VulkanComputeContext {
         cached.validation_result = upload_skipped;
         if (exact_unchanged) {
             cached.validation_snapshot = prosper::gpu::guest_gpu_write_snapshot();
-            if (!cached.write_watch || !cached.write_watch.rearm()) {
-                cached.write_watch.reset();
-                cached.write_watch = prosper::host::GuestWriteWatch::create(
-                    key.gpu_addr, key.guest_bytes);
-            }
+            cached.write_watch_stable_validations = update_write_watch_stability(
+                cached.write_watch_stable_validations, true,
+                compute_write_watch_promotion_validations());
         } else if (!upload_skipped && source) {
+            cached.write_watch_stable_validations = 0;
             cached.source_snapshot.assign(source, source + key.guest_bytes);
             // Do not trust the new mirror until the corresponding transfer completes. A failed
             // submit leaves this false, so the next use refreshes instead of skipping stale pixels.
@@ -1402,8 +1484,6 @@ struct VulkanComputeContext {
         cached.allocation_bytes = allocation_bytes;
         cached.last_use = ++image_cache_clock;
         cached.pins = 1;
-        cached.write_watch = prosper::host::GuestWriteWatch::create(
-            key.gpu_addr, key.guest_bytes);
         cached.validation_snapshot = prosper::gpu::guest_gpu_write_snapshot();
         if (source)
             cached.source_snapshot.assign(source, source + key.guest_bytes);
@@ -1431,10 +1511,9 @@ struct VulkanComputeContext {
                                           current_source + key.guest_bytes);
         cached.content_valid = true;
         cached.validation_snapshot = prosper::gpu::guest_gpu_write_snapshot();
+        cached.write_watch_stable_validations = 0;
         if (cached.write_watch && cached.write_watch.rearm()) return;
         cached.write_watch.reset();
-        cached.write_watch = prosper::host::GuestWriteWatch::create(
-            key.gpu_addr, key.guest_bytes);
     }
 
     bool cached_image_result_matches(const ComputeImageCacheKey& key,
@@ -5237,6 +5316,7 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
     const bool timing_enabled = std::getenv("PROSPER_RENDER_TIMING") != nullptr;
     const auto timing_start = timing_enabled
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    context.begin_write_watch_promotions();
     // Dispatches are independent PM4-order operations: one item failing (e.g. an image shape the
     // backend can't bind yet, #590) must not abort the rest of the batch — that would regress
     // dispatches that executed before image bindings existed. Run all; report all-succeeded.

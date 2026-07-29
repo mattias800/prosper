@@ -7,6 +7,7 @@
 #include "../src/gpu/videoout_present.hpp"
 #include "../src/gpu/pm4_registers.hpp"
 #include "../src/gpu/vk_translate.hpp"
+#include "../src/host/guest_write_watch.hpp"
 #include "render_runner.h"
 #include <cstdio>
 #include <cstdint>
@@ -15,6 +16,9 @@
 #include <memory>
 #include <string>
 #include <vector>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 using namespace prosper::gpu;
 namespace P = prosper::agc::Pm4;
@@ -271,6 +275,44 @@ int main() {
         CHECK(guest_gpu_writes_since(validation, 0x4000, 16) == GuestGpuWriteQuery::Unknown,
               "write journal snapshots cannot suppress validation after submit completion");
     }
+
+#if defined(__linux__)
+    // The in-submit journal expires by design. A persistent page watch must still become Dirty when
+    // the same GPU/DMA notification occurs between submits, or a cross-submit decoded-texture cache
+    // could trust stale guest bytes after releasing its redundant exact source snapshot.
+    {
+        constexpr size_t watch_bytes = 0x1000;
+        auto* watched = static_cast<uint8_t*>(mmap(
+            nullptr, watch_bytes, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        CHECK(watched != MAP_FAILED, "map GPU-write watch regression page");
+        if (watched != MAP_FAILED) {
+            prosper::host::guest_write_watch_set_fault_onstack(true);
+            prosper::host::guest_write_watch_notify_direct_mapping_added(
+                reinterpret_cast<uint64_t>(watched), watch_bytes, 0x6a0000,
+                0x3 /* SCE CPU_READ|CPU_WRITE */);
+            constexpr uint64_t logical_offset = 128;
+            constexpr uint64_t logical_bytes = 64;
+            auto watch = prosper::host::GuestWriteWatch::create(
+                reinterpret_cast<uint64_t>(watched) + logical_offset, logical_bytes);
+            CHECK(static_cast<bool>(watch) &&
+                      watch.query() == prosper::host::GuestWriteWatchQuery::Unchanged,
+                  "arm cross-submit watch before GPU notification");
+            notify_guest_gpu_write(reinterpret_cast<uint64_t>(watched) + 32u, 16u);
+            CHECK(watch.query() == prosper::host::GuestWriteWatchQuery::Unchanged,
+                  "adjacent same-page GPU write does not dirty a nonoverlapping logical source");
+            notify_guest_gpu_write(
+                reinterpret_cast<uint64_t>(watched) + logical_offset + 16u, 16u);
+            CHECK(watch.query() == prosper::host::GuestWriteWatchQuery::Dirty,
+                  "guest GPU write notification invalidates a persistent page watch");
+            watch.reset();
+            prosper::host::guest_write_watch_notify_direct_mapping_removed(
+                reinterpret_cast<uint64_t>(watched), watch_bytes);
+            prosper::host::guest_write_watch_set_fault_onstack(false);
+            munmap(watched, watch_bytes);
+        }
+    }
+#endif
 
     // #189: address-backed DMA is an in-stream producer, not a completion write. It must split a
     // graphics span so an earlier consumer sees old bytes and a later consumer sees copied bytes.
