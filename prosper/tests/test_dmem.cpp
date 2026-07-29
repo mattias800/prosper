@@ -6,10 +6,10 @@
 // own process, so the process-global direct-memory pool starts empty here.
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
+#include "../src/host/guest_write_watch.hpp"
 #ifdef _WIN32
 #include "../src/host/exec_image.hpp"
 #include "../src/host/guest_memory_map.hpp"
-#include "../src/host/guest_write_watch.hpp"
 #include "../src/gpu/gpu_execute.hpp"
 #include <windows.h>
 extern "C" int prosper_try_commit_dmem(uint64_t addr, uint64_t len, int write);
@@ -18,7 +18,9 @@ extern "C" int prosper_try_commit_dmem(uint64_t addr, uint64_t len, int write);
 #include <cstdint>
 #include <cstring>
 #ifdef __linux__
+#include <csignal>
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 using namespace prosper;
@@ -36,6 +38,32 @@ using Hle7Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t,
 #ifdef _WIN32
 static constexpr uint64_t kGuestAutoVaMin = 0x2000000000ull;
 static constexpr uint64_t kGuestAutoVaMax = 0xfbffffffffull;
+#elif defined(__linux__)
+namespace {
+void texture_watch_segv_handler(int sig, siginfo_t* si, void*) {
+    if (sig == SIGSEGV && si->si_addr &&
+        host::guest_write_watch_handle_fault(reinterpret_cast<uint64_t>(si->si_addr)))
+        return;
+    const char message[] = "test_dmem: unexpected SIGSEGV\n";
+    (void)!write(STDERR_FILENO, message, sizeof(message) - 1);
+    _exit(2);
+}
+
+bool install_texture_watch_handler() {
+    static uint8_t alternate_stack[128 * 1024];
+    stack_t stack{};
+    stack.ss_sp = alternate_stack;
+    stack.ss_size = sizeof(alternate_stack);
+    struct sigaction action{};
+    action.sa_sigaction = texture_watch_segv_handler;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&action.sa_mask);
+    if (sigaltstack(&stack, nullptr) != 0 || sigaction(SIGSEGV, &action, nullptr) != 0)
+        return false;
+    host::guest_write_watch_set_fault_onstack(true);
+    return true;
+}
+} // namespace
 #endif
 
 int main() {
@@ -673,6 +701,7 @@ int main() {
     register_builtin_hle();
 
     auto avail   = Hle::lookup(nid_hash("sceKernelAvailableDirectMemorySize"));
+    auto flexible = Hle::lookup(nid_hash("sceKernelMapFlexibleMemory"));
     auto alloc   = Hle::lookup(nid_hash("sceKernelAllocateDirectMemory"));
     auto alloc_main = Hle::lookup(nid_hash("sceKernelAllocateMainDirectMemory"));
     auto map     = Hle::lookup(nid_hash("sceKernelMapDirectMemory"));
@@ -688,12 +717,35 @@ int main() {
           "sceKernelMapDirectMemory2 hashes to the PS5 3.20 import NID");
     CHECK(nid_hash("sceKernelGetDirectMemoryType") == "BC+OG5m9+bw",
           "sceKernelGetDirectMemoryType hashes to the PS5 3.20 import NID");
-    CHECK(avail && alloc && alloc_main && map && map2 && query && unmap && mtypeprotect && batch &&
+    CHECK(avail && flexible && alloc && alloc_main && map && map2 && query && unmap && mtypeprotect && batch &&
               release && get_type,
           "dmem fns registered");
-    if (!(avail && alloc && alloc_main && map && map2 && query && unmap && mtypeprotect && batch &&
+    if (!(avail && flexible && alloc && alloc_main && map && map2 && query && unmap && mtypeprotect && batch &&
           release && get_type)) {
         printf("== FAIL ==\n"); return 1;
+    }
+
+    // Persistent texture reuse must be able to trust unchanged flexible-memory assets too.  Linux
+    // previously registered only direct-memory mappings with the page-fault write watcher, forcing
+    // every flexible texture to take the exact byte-comparison fallback on every submit.
+    CHECK(install_texture_watch_handler(),
+          "install red-zone-safe texture write-watch handler");
+    uint64_t flexible_va = 0;
+    CHECK(flexible((uint64_t)(uintptr_t)&flexible_va, 0x10000, 0x2 /* CPU_RW */,
+                   0, 0, 0) == 0 && flexible_va,
+          "map flexible memory for texture write-watch coverage");
+    if (flexible_va) {
+        auto watch = host::GuestWriteWatch::create(flexible_va + 0x100, 0x2000);
+        CHECK(static_cast<bool>(watch),
+              "flexible guest mapping is registered with the texture write-watch");
+        CHECK(watch.query() == host::GuestWriteWatchQuery::Unchanged,
+              "fresh flexible texture watch is unchanged");
+        *(volatile uint8_t*)(uintptr_t)(flexible_va + 0x180) = 0x5a;
+        CHECK(watch.query() == host::GuestWriteWatchQuery::Dirty,
+              "CPU write dirties a watched flexible texture");
+        watch.reset();
+        CHECK(unmap(flexible_va, 0x10000, 0, 0, 0, 0) == 0,
+              "unmap watched flexible memory cleanly");
     }
 
     // sceKernelDirectMemoryQuery enumeration contract (issue #1129). GTA V (PPSA04263) walks

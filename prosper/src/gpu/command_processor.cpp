@@ -1520,13 +1520,21 @@ bool wait_regmem_satisfied(const Pm4Command& c) {
     }
 }
 uint64_t defer_now_ms() {
-    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
+    // The submit path executes shader translation, pipeline creation, dispatches, and rendering
+    // synchronously while holding the queue mutex. Real hardware performs that work after returning
+    // from submit, so another guest submit cannot deliver a WAIT_REG_MEM producer during this host-
+    // only interval. The shared guest/GPU clock excludes excess HostGpuClockScope time; using raw
+    // steady_clock here aged a healthy barrier past the liveness timeout while its producer was
+    // prevented from entering the queue, then deliberately violated ordering as soon as rendering
+    // returned (Plucky's first gameplay scene needed 1-2 s of first-use pipeline work). Keep the
+    // timeout on the emulated timeline where the guest and producer can actually make progress.
+    return prosper_guest_tsc_ns() / 1000000ull;
 }
 struct DeferItem {
     Pm4Command cmd;                    // barrier (WaitRegMem) or effect (ReleaseMem/EventWrite/WriteData/Flip)
     std::vector<uint32_t> wd_copy;     // owns a WriteData payload (cmd.wd_data repointed into this)
     uint64_t first_blocked_ms = 0;     // barrier only: when it was first found unsatisfied
+    bool first_blocked_recorded = false; // guest clock legitimately starts at zero after compensation
 };
 struct DeferredStream {
     std::vector<DeferItem> items;
@@ -1764,7 +1772,7 @@ int flush_deferred_streams() {
                 // The label page can be unmapped by the time we re-check (freed mid-defer):
                 // treat as never-satisfiable and take the timeout path immediately.
                 bool readable = guest_readable(it.cmd.wm_addr, 8);
-                if (readable && it.first_blocked_ms && wait_regmem_satisfied(it.cmd)) {
+                if (readable && it.first_blocked_recorded && wait_regmem_satisfied(it.cmd)) {
                     // Barrier-latency telemetry (bounded): how long do REAL producers take? This
                     // is the data the timeout default is tuned against.
                     uint64_t waited = defer_now_ms() - it.first_blocked_ms;
@@ -1779,7 +1787,10 @@ int flush_deferred_streams() {
                 }
                 if (!readable || !wait_regmem_satisfied(it.cmd)) {
                     uint64_t now = defer_now_ms();
-                    if (!it.first_blocked_ms) it.first_blocked_ms = now;
+                    if (!it.first_blocked_recorded) {
+                        it.first_blocked_ms = now;
+                        it.first_blocked_recorded = true;
+                    }
                     if (readable && !force && now - it.first_blocked_ms < defer_timeout_ms()) {
                         blocked = true; break;
                     }

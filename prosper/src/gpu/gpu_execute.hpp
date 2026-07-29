@@ -29,6 +29,7 @@
 
 extern "C" const void* prosper_agc_shader_header_for_code(uint64_t code_addr);
 extern "C" const void* prosper_agc_fused_back_header_for_front(uint64_t front_code_addr);
+extern "C" uint64_t prosper_agc_shader_continuation_for_code(uint64_t code_addr);
 
 namespace prosper::gpu {
 
@@ -55,10 +56,23 @@ struct DrawItem {
     // equivalent; a shared value is immutable and remains valid if its cache entry is evicted.
     SharedShaderWords vs_shared, fs_shared;
     uint64_t vs_guest_addr = 0, fs_guest_addr = 0;    // diagnostic/source identity in guest VA space
+    // Some GFX10 vertex programs install a fetch prolog at vs_guest_addr and transfer to a
+    // separately allocated NGG main program. Capture retains that raw continuation as well so
+    // diagnostic replay can recompile the same complete architectural program.
+    uint64_t vs_chain_guest_addr = 0;
     // Content-addressed raw RDNA2 versions owned by a materialized capture. Live draw items leave
     // these unset; capture assigns them from the guest addresses above and replay restores them.
     uint32_t vs_raw_shader_index = 0xFFFFFFFFu;
     uint32_t fs_raw_shader_index = 0xFFFFFFFFu;
+    uint32_t vs_chain_raw_shader_index = 0xFFFFFFFFu;
+    uint32_t vertex_lds_dwords = 0;
+    // Exact fixed-function graphics ABI used to produce the stored modules. Raw-shader replay must
+    // use these values as a pair: shader bytes alone cannot reconstruct fragment system VGPRs or
+    // PARAM linkage after the guest register state has been folded away.
+    PixelInputMapping pixel_inputs{};
+    PixelSystemInputMapping system_inputs{};
+    bool has_pixel_inputs = false;
+    bool has_system_inputs = false;
     // Process-unique identities supplied by the exact shader-recompile cache. Zero means the
     // shader came from an external/replay path, so persistent backend caches must compare words.
     uint64_t vs_identity = 0, fs_identity = 0;
@@ -90,6 +104,11 @@ struct DrawItem {
     uint32_t color0_width = 0, color0_height = 0;
     uint64_t color1_base = 0;
     uint32_t color1_width = 0, color1_height = 0;
+    struct ColorTargetBinding {
+        uint64_t base = 0;
+        uint32_t width = 0, height = 0;
+    };
+    std::array<ColorTargetBinding, kColorTargetCount> color_targets{};
     uint64_t draw_index = 0;
     uint64_t command_order = 0;
 
@@ -263,6 +282,14 @@ extern bool g_dyntrace_force;
 // texture-first shader can't collide two descriptor types at one binding (#157). Exposed for testing.
 void assign_convention_bindings(ShaderResourceTable& t, uint32_t first);
 
+// Join the resource contracts for a separately-installed vertex-fetch prolog and main shader.
+// Per-instruction provenance in the main table is rebased to its linked PC, then the complete table
+// receives one collision-free VS binding layout. Null inputs are accepted.
+std::shared_ptr<ShaderResourceTable> merge_vertex_chain_resource_tables(
+    const std::shared_ptr<ShaderResourceTable>& prolog,
+    const std::shared_ptr<ShaderResourceTable>& main,
+    uint32_t main_pc_offset);
+
 // Build a shader stage's resource table from the folded GpuState: look up the registered shader header
 // by its bound code address, read its user-data SGPR block from the sh register file, decode the V#/T#/S#
 // descriptors, and assign bindings matching the recompiler+backend convention (constant buffer -> binding
@@ -288,6 +315,12 @@ struct ComputeLaunchDimensions {
 // the API values are total threads and must be ceil-divided by COMPUTE_NUM_THREAD_*; when clear,
 // they are already hardware/Vulkan workgroup counts. Zero local-size registers fall back to one.
 ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& dispatch);
+
+// Read the exact bound compute program from a dispatch's retained register snapshot, falling back to
+// the submit state for hand-built records without a snapshot. Capture selectors use this before DMA-
+// ordered realization, so a target program remains discoverable even when the pre-realized list is empty.
+uint64_t compute_dispatch_code_addr(const GpuState& submit,
+                                    const GpuState::Dispatch& dispatch);
 
 struct ComputeItem {
     std::vector<uint32_t> spirv;
@@ -344,19 +377,28 @@ std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
                                                        const PixelInputMapping* pixel_inputs = nullptr,
                                                        const PixelSystemInputMapping* system_inputs = nullptr,
                                                        uint64_t* cache_identity = nullptr,
-                                                       bool fragment_wave32 = false);
+                                                       bool fragment_wave32 = false,
+                                                       uint32_t vertex_lds_dwords = 0);
 SharedShaderWords recompile_graphics_shader_cached_shared(
     ShaderProgramStage stage, const uint32_t* code, size_t dwords,
     const ShaderResourceTable* resources = nullptr,
     const PixelInputMapping* pixel_inputs = nullptr,
     const PixelSystemInputMapping* system_inputs = nullptr,
     uint64_t* cache_identity = nullptr,
-    bool fragment_wave32 = false);
+    bool fragment_wave32 = false,
+    uint32_t vertex_lds_dwords = 0);
 // Compute uses the same bounded content-addressed cache as graphics. Launch geometry that changes
 // generated SPIR-V participates in the key; per-dispatch push-constant values deliberately do not.
 std::vector<uint32_t> recompile_compute_shader_cached(
     const uint32_t* code, size_t dwords, const ShaderResourceTable* resources,
     const ComputeShaderConfig& config, uint64_t* cache_identity = nullptr);
+SharedShaderWords recompile_vertex_chain_cached_shared(
+    const uint32_t* prolog, size_t prolog_dwords,
+    const uint32_t* main, size_t main_dwords,
+    const ShaderResourceTable* resources = nullptr,
+    const PixelInputMapping* pixel_inputs = nullptr,
+    uint64_t* cache_identity = nullptr,
+    uint32_t vertex_lds_dwords = 0);
 ShaderRecompileCacheStats shader_recompile_cache_stats();
 void clear_shader_recompile_cache();
 
@@ -426,6 +468,7 @@ struct OperationRealizationFailure {
     uint64_t color1_base = 0;
     uint32_t color1_width = 0;
     uint32_t color1_height = 0;
+    std::array<DrawItem::ColorTargetBinding, kColorTargetCount> color_targets{};
     uint32_t vertex_count = 0;
     ComputeLaunchDimensions compute_launch;
     std::vector<ShaderRealizationDiagnostic> stages;
@@ -439,6 +482,10 @@ using LiveComputeFn = std::function<bool(const std::vector<ComputeItem>& items)>
 using GuestGpuWriteObserver = std::function<void(uint64_t addr, uint64_t size)>;
 void set_guest_gpu_write_observer(GuestGpuWriteObserver observer);
 void notify_guest_gpu_write(uint64_t addr, uint64_t size);
+// A backend can prove that a dispatched write reproduced the exact guest bytes while renderer-owned
+// aliases at the same address may still hold divergent state. Notify those alias owners without
+// dirtying guest-byte watches or the in-submit mutation journal.
+void notify_guest_gpu_write_preserving_bytes(uint64_t addr, uint64_t size);
 
 // A validation snapshot is meaningful only inside one synchronous execute_ordered_items call.
 // It lets a backend prove that no retained GPU operation wrote a resource between graphics spans;
@@ -470,7 +517,7 @@ bool have_submit_compute();
 using LiveTargetQueryFn = std::function<bool(uint64_t gpu_addr)>;
 void set_live_target_query(LiveTargetQueryFn fn);
 bool is_live_render_target(uint64_t gpu_addr);
-enum class LiveTargetPixelFormat : uint8_t { Rgba8Unorm, Rgba16Float };
+enum class LiveTargetPixelFormat : uint8_t { Rgba8Unorm, Rgba16Float, R11G11B10Float };
 struct LiveTargetSnapshot {
     uint32_t width = 0, height = 0;
     LiveTargetPixelFormat format = LiveTargetPixelFormat::Rgba8Unorm;
@@ -586,11 +633,12 @@ struct SharedVulkanContext {
     bool valid() const { return instance && physical && device && queue && queue_family != UINT32_MAX; }
 };
 // Select the exact native subgroup contract only when the renderer device can actually be adopted
-// by compute and every required-subgroup workgroup bound is satisfied. `capture_bound` keeps saved
-// artifacts device-portable; `disabled` is the explicit diagnostic/compatibility opt-out.
+// by compute and every required-subgroup workgroup bound is satisfied. Single-wave workgroups are
+// the default proven fast path; `allow_multiwave` is the explicit experimental opt-in and `disabled`
+// is the diagnostic/compatibility opt-out.
 uint32_t select_native_compute_subgroup_size(const SharedVulkanContext& context,
                                              const ComputeShaderConfig& config,
-                                             bool capture_bound, bool disabled);
+                                             bool allow_multiwave, bool disabled);
 void set_shared_vulkan_context(const SharedVulkanContext& context);
 SharedVulkanContext shared_vulkan_context();
 
@@ -728,6 +776,15 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         failure->color1_base = rs.color1_base;
         failure->color1_width = rs.color1_width;
         failure->color1_height = rs.color1_height;
+        for (uint32_t slot = 0; slot < failure->color_targets.size(); ++slot) {
+            failure->color_targets[slot].base = rs.color_targets[slot].base;
+            failure->color_targets[slot].width = rs.color_targets[slot].width;
+            failure->color_targets[slot].height = rs.color_targets[slot].height;
+        }
+        failure->color_targets[0] = {
+            failure->color0_base, failure->color0_width, failure->color0_height};
+        failure->color_targets[1] = {
+            failure->color1_base, failure->color1_width, failure->color1_height};
         failure->vertex_count = vcount_hint;
     }
     auto add_stage_diagnostic = [&](ShaderProgramStage stage, uint64_t addr,
@@ -766,13 +823,70 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     }
     const auto* fused_back = static_cast<const AgcShaderHeader*>(
         prosper_agc_fused_back_header_for_front(rs.es_addr));
-    const uint64_t vs_program_addr = fused_back && fused_back->type == 6 && fused_back->code
-        ? static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fused_back->code))
-        : rs.es_addr;
     const bool phase_timing = getenv("PROSPER_RENDER_TIMING") != nullptr;
     const auto table_start = phase_timing
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    std::shared_ptr<ShaderResourceTable> vrt = build_stage_table(ds, vs_program_addr, false, vcount_hint);
+    const auto* vertex_header = static_cast<const AgcShaderHeader*>(
+        prosper_agc_shader_header_for_code(rs.es_addr));
+    uint64_t chain_addr = prosper_agc_shader_continuation_for_code(rs.es_addr);
+    if (!chain_addr && rs.gs_addr && rs.gs_addr != rs.es_addr) chain_addr = rs.gs_addr;
+    const auto* chain_header = chain_addr
+        ? static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(chain_addr))
+        : nullptr;
+    auto bounded_shader_dwords = [&](uint64_t address, const AgcShaderHeader* header) -> size_t {
+        if (!address || !header || !header->shader_size) return 0;
+        const size_t dwords = std::min<size_t>(max_shader_dwords, header->shader_size / sizeof(uint32_t));
+        if (!dwords || dwords > UINT32_MAX / sizeof(uint32_t) ||
+            !guest_readable(address, static_cast<uint32_t>(dwords * sizeof(uint32_t))))
+            return 0;
+        return dwords;
+    };
+    const size_t vertex_dwords = bounded_shader_dwords(rs.es_addr, vertex_header);
+    const VertexPrologInfo vertex_prolog = rdna2_vertex_prolog_info(
+        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)), vertex_dwords);
+    const size_t chain_dwords = vertex_prolog.valid
+        ? bounded_shader_dwords(chain_addr, chain_header) : 0;
+    const bool vertex_chain = vertex_prolog.valid && chain_dwords != 0;
+    // GFX10 encodes graphics LDS in 512-byte units.  The vertex recompiler's portable NGG model
+    // represents one live guest lane and therefore needs the exact allocation as per-invocation
+    // Function memory; an absent/zero register deliberately leaves graphics DS fail-closed.
+    uint32_t vertex_lds_dwords = 0;
+    const auto vertex_lds_state = ds.sh.find(prosper::agc::Pm4::SPI_SHADER_PGM_RSRC2_GS);
+    if (vertex_lds_state != ds.sh.end()) {
+        const uint32_t encoded =
+            (vertex_lds_state->second >>
+             prosper::agc::Pm4::SPI_SHADER_PGM_RSRC2_GS_LDS_SIZE_SHIFT) &
+            prosper::agc::Pm4::SPI_SHADER_PGM_RSRC2_GS_LDS_SIZE_MASK;
+        vertex_lds_dwords = std::min(encoded * 128u, 16384u);
+    }
+
+    // A proven fetch-prolog chain is linked explicitly.  Other fused programs retain the newer
+    // fail-closed AGC association and compile the registered back-half body directly.
+    const uint64_t fused_back_addr = fused_back && fused_back->type == 6 && fused_back->code
+        ? static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fused_back->code))
+        : rs.es_addr;
+    const uint64_t vs_program_addr = vertex_chain ? rs.es_addr : fused_back_addr;
+    std::shared_ptr<ShaderResourceTable> vrt = build_stage_table(
+        ds, vertex_chain ? rs.es_addr : vs_program_addr, false, vcount_hint);
+    std::shared_ptr<ShaderResourceTable> chain_vrt;
+    if (vertex_chain) {
+        const size_t prolog_resource_count = vrt ? vrt->resources.size() : 0;
+        chain_vrt = build_stage_table(ds, chain_addr, false, vcount_hint);
+        vrt = merge_vertex_chain_resource_tables(vrt, chain_vrt,
+                                                  static_cast<uint32_t>(vertex_prolog.prefix_dwords));
+        if (getenv("PROSPER_DBG")) {
+            static std::set<std::pair<uint64_t, uint64_t>> logged;
+            if (logged.emplace(rs.es_addr, chain_addr).second)
+                fprintf(stderr,
+                        "[vertex-chain] prolog=0x%llx words=%zu setpc=%u main=0x%llx words=%zu "
+                        "resources=%zu+%zu lds=%u dwords\n",
+                        (unsigned long long)rs.es_addr, vertex_dwords, vertex_prolog.setpc_pc,
+                        (unsigned long long)chain_addr, chain_dwords,
+                        prolog_resource_count,
+                        chain_vrt ? chain_vrt->resources.size() : 0,
+                        vertex_lds_dwords);
+            }
+    }
     std::shared_ptr<ShaderResourceTable> prt = build_stage_table(ds, rs.ps_addr, true, vcount_hint);
     const auto table_done = phase_timing
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -797,7 +911,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     pixel_inputs.valid_mask = rs.ps_input_cntl_valid_mask;
     bool interpolants_from_metadata = false;
     if (!pixel_inputs.valid_mask || pixel_inputs.ambiguous_passthrough_mask()) {
-        const auto* producer = static_cast<const AgcShaderHeader*>(
+        const auto* producer = vertex_chain ? chain_header : static_cast<const AgcShaderHeader*>(
             prosper_agc_shader_header_for_code(vs_program_addr));
         const auto* pixel = static_cast<const AgcShaderHeader*>(
             prosper_agc_shader_header_for_code(rs.ps_addr));
@@ -831,20 +945,36 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     SharedShaderWords vs_shared, fs_shared;
     std::vector<uint32_t> vs, fs;
     if (retain_shared_shader_words) {
-        vs_shared = recompile_graphics_shader_cached_shared(
-            ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
-            max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity);
+        if (vertex_chain)
+            vs_shared = recompile_vertex_chain_cached_shared(
+                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)), vertex_dwords,
+                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(chain_addr)), chain_dwords,
+                vrt.get(), pixel_input_ptr, &vs_identity, vertex_lds_dwords);
+        else
+            vs_shared = recompile_graphics_shader_cached_shared(
+                ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
+                max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity,
+                false, vertex_lds_dwords);
         fs_shared = recompile_graphics_shader_cached_shared(
             ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
-            max_shader_dwords, prt.get(), nullptr, system_input_ptr, &fs_identity,
+            max_shader_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
             rs.ps_wave32);
     } else {
-        vs = recompile_graphics_shader_cached(
-            ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
-            max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity);
+        if (vertex_chain) {
+            const SharedShaderWords linked = recompile_vertex_chain_cached_shared(
+                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)), vertex_dwords,
+                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(chain_addr)), chain_dwords,
+                vrt.get(), pixel_input_ptr, &vs_identity, vertex_lds_dwords);
+            if (linked) vs = *linked;
+        } else {
+            vs = recompile_graphics_shader_cached(
+                ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
+                max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity,
+                false, vertex_lds_dwords);
+        }
         fs = recompile_graphics_shader_cached(
             ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
-            max_shader_dwords, prt.get(), nullptr, system_input_ptr, &fs_identity,
+            max_shader_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
             rs.ps_wave32);
     }
     // CB_COLOR_CONTROL.DCC_DECOMPRESS interprets the bound AGC metadata helper, rather than its
@@ -891,7 +1021,12 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             std::chrono::duration<double, std::milli>(table_done - table_start).count(),
             std::chrono::duration<double, std::milli>(shader_done - table_done).count());
     }
-    add_stage_diagnostic(ShaderProgramStage::Vertex, vs_program_addr, vrt, vs_words);
+    add_stage_diagnostic(ShaderProgramStage::Vertex,
+                         vertex_chain ? rs.es_addr : vs_program_addr, vrt, vs_words);
+    // Retain the separately allocated main program in failed-operation captures. Without this second
+    // address a replay can inspect only the fetch prolog and cannot reproduce/debug the linked stage.
+    if (vertex_chain)
+        add_stage_diagnostic(ShaderProgramStage::Vertex, chain_addr, vrt, vs_words);
     add_stage_diagnostic(ShaderProgramStage::Fragment, rs.ps_addr, prt, fs_words);
     if (const char* dd = getenv("PROSPER_VS_DUMP")) {   // diag: dump successful VS SPIR-V + raw RDNA2 for inspection
         static int nd = 0;
@@ -1003,15 +1138,22 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // their old values even though the fragment output itself is a full vec4.
     const uint32_t exp_mask = fragment_color_export_mask(
         reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.ps_addr)), max_shader_dwords);
-    ps.color_write_mask &= exp_mask & 0xFu;
-    ps.color1_write_mask &= (exp_mask >> 4) & 0xFu;
+    for (uint32_t slot = 0; slot < ps.color_targets.size(); ++slot)
+        ps.color_targets[slot].write_mask &= (exp_mask >> (slot * 4u)) & 0xFu;
+    ps.color_write_mask = ps.color_targets[0].write_mask;
+    ps.color1_write_mask = ps.color_targets[1].write_mask;
     // Color-disabled draws are not necessarily no-ops. Depth prepasses and stencil mask writers
     // deliberately set CB_TARGET_MASK=0, then later color draws consume their DS result. Dropping
     // those writers made The Messenger clear stencil to 0 and then test for bits 1/2 that could never
     // be produced (#520). Skip only when the draw has no observable color OR depth/stencil effect.
     const bool ds_effect = has_depth_stencil_side_effect(ps);
-    if (ps.color_write_mask == 0 && ps.color1_write_mask == 0 &&
-        !ds_effect && !getenv("PROSPER_FORCE_COLORWRITE")) {
+    // A non-zero hardware write mask is itself an observable color effect. Synthetic callers and
+    // legacy captures may omit CB_COLOR_INFO and rely on the backend's established RGBA8 fallback;
+    // requiring a decoded format here would incorrectly discard those otherwise-valid draws.
+    const bool color_effect = std::any_of(
+        ps.color_targets.begin(), ps.color_targets.end(),
+        [](const auto& target) { return target.write_mask != 0; });
+    if (!color_effect && !ds_effect && !getenv("PROSPER_FORCE_COLORWRITE")) {
         if (failure) failure->reason = RealizationFailureReason::NoEffect;
         if (log) fprintf(stderr, "[exec] skip draw: no color/depth/stencil effect cb_target_mask=0x%x cb_color_control=0x%x color0_fmt=%u\n",
                          rs.cb_target_mask, rs.cb_color_control, ps.color0_format);
@@ -1244,7 +1386,14 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     }
     out.vs = std::move(vs); out.gs = std::move(gs); out.fs = std::move(fs);
     out.vs_shared = std::move(vs_shared); out.fs_shared = std::move(fs_shared);
-    out.vs_guest_addr = vs_program_addr; out.fs_guest_addr = rs.ps_addr;
+    out.vs_guest_addr = vertex_chain ? rs.es_addr : vs_program_addr;
+    out.fs_guest_addr = rs.ps_addr;
+    out.vs_chain_guest_addr = vertex_chain ? chain_addr : 0;
+    out.vertex_lds_dwords = vertex_lds_dwords;
+    out.has_pixel_inputs = pixel_input_ptr != nullptr;
+    if (pixel_input_ptr) out.pixel_inputs = *pixel_input_ptr;
+    out.has_system_inputs = system_input_ptr != nullptr;
+    if (system_input_ptr) out.system_inputs = *system_input_ptr;
     out.vs_identity = vs_identity; out.fs_identity = fs_identity; out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;
     // #1256: record the raw draw-packet state (pre-realization) so a capture can be checked offline for
@@ -1259,6 +1408,14 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     out.color0_width = rs.color0_width; out.color0_height = rs.color0_height; // per-target extent (#526)
     out.color1_base = rs.color1_base;
     out.color1_width = rs.color1_width; out.color1_height = rs.color1_height;
+    for (uint32_t slot = 0; slot < out.color_targets.size(); ++slot) {
+        out.color_targets[slot].base = rs.color_targets[slot].base;
+        out.color_targets[slot].width = rs.color_targets[slot].width;
+        out.color_targets[slot].height = rs.color_targets[slot].height;
+    }
+    // Preserve direct/synthetic callers that still populate only the named aliases.
+    out.color_targets[0] = {out.color0_base, out.color0_width, out.color0_height};
+    out.color_targets[1] = {out.color1_base, out.color1_width, out.color1_height};
     return true;
 }
 

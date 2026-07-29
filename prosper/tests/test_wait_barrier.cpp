@@ -22,6 +22,7 @@
 #include "../src/gpu/command_processor.hpp"
 #include "../src/gpu/gpu_execute.hpp"
 #include "../src/gpu/pm4_decode.hpp"
+#include "../src/hle/hle_kernel_time.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -30,6 +31,7 @@
 #include <chrono>
 
 using namespace prosper::gpu;
+extern "C" uint64_t prosper_guest_tsc_ns();
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
@@ -71,15 +73,13 @@ static size_t run_cb(const uint32_t* buf, size_t dwords, GpuState& st) {
 }
 
 int main() {
-    // Enable the (opt-in) model, and set a generous release timeout so the gating assertions
-    // below are not raced by the liveness backstop (test 5 sleeps past it deliberately). Both
-    // must be set before the first fold caches them.
+    // Enable the opt-in model. The default one-second release timeout is generous enough that the
+    // ordering assertions below do not race it; the two liveness tests deliberately sleep past it.
+    // The model gate must be set before the first fold caches it.
 #ifdef _WIN32
     _putenv_s("PROSPER_WAIT_DEFER", "1");
-    _putenv_s("PROSPER_WAIT_TIMEOUT_MS", "400");
 #else
     setenv("PROSPER_WAIT_DEFER", "1", 1);
-    setenv("PROSPER_WAIT_TIMEOUT_MS", "400", 1);
 #endif
     printf("== test_wait_barrier ==\n");
 
@@ -213,7 +213,37 @@ int main() {
         CHECK(in_jump == 1 && post == 1, "both released in order once the condition held");
     }
 
-    // 5: liveness backstop — a condition NOBODY ever satisfies releases via the bounded timeout.
+    // 5: synchronous host GPU work is not guest queue progress. A first-use pipeline compile can
+    // exceed the liveness timeout while the submit mutex prevents the producer from entering; that
+    // interval must not force the barrier through. HostGpuClockScope is the same compensation used
+    // by execute_submit_work around translation/rendering.
+    {
+        volatile uint64_t cond = 0;
+        uint64_t label = 0;
+        uint32_t buf[8 + 7];
+        emit_wait_eq(buf, (uint64_t)(uintptr_t)&cond, 1);
+        emit_release(buf + 8, (uint64_t)(uintptr_t)&label, 1);
+        GpuState st;
+        run_cb(buf, 15, st);
+        flush_deferred_streams();
+        const uint64_t guest_before_host_work = prosper_guest_tsc_ns();
+        {
+            prosper::HostGpuClockScope host_gpu_work(0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+            flush_deferred_streams();
+        }
+        const uint64_t guest_after_host_work = prosper_guest_tsc_ns();
+        CHECK(label == 0,
+              "host GPU work longer than the timeout does not violate a blocked queue wait");
+        CHECK(guest_after_host_work - guest_before_host_work < 100000000ull,
+              "host GPU work is excluded from the guest queue clock");
+        cond = 1;
+        flush_deferred_streams();
+        CHECK(label == 1 && !deferred_pending(),
+              "barrier still releases normally after compensated host GPU work");
+    }
+
+    // 6: liveness backstop — a condition NOBODY ever satisfies releases via the bounded timeout.
     {
         volatile uint64_t cond = 0;                  // never written
         uint64_t label = 0;
@@ -224,13 +254,17 @@ int main() {
         run_cb(buf, 15, st);
         flush_deferred_streams();
         CHECK(label == 0, "gated before the timeout");
-        std::this_thread::sleep_for(std::chrono::milliseconds(450));   // > PROSPER_WAIT_TIMEOUT_MS
+        const uint64_t guest_before_timeout = prosper_guest_tsc_ns();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));   // > default timeout
+        const uint64_t guest_after_timeout = prosper_guest_tsc_ns();
+        CHECK(guest_after_timeout - guest_before_timeout >= 1000000000ull,
+              "ordinary guest time advances through the liveness window");
         flush_deferred_streams();
         CHECK(label == 1, "timeout released the gated write (liveness backstop)");
         CHECK(!deferred_pending(), "timed-out stream completed");
     }
 
-    // 6: a SATISFIED wait is a pass-through — nothing defers (the healthy-frame fast path).
+    // 7: a SATISFIED wait is a pass-through — nothing defers (the healthy-frame fast path).
     {
         volatile uint64_t cond = 1;
         uint64_t label = 0;

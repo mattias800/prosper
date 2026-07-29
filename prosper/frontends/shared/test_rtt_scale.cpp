@@ -17,7 +17,10 @@ using prosper::frontend::rtt_scaled_axis;
 using prosper::frontend::rtt_scaled_extent_compatible;
 using prosper::frontend::LiveRttAuthority;
 using prosper::frontend::live_rtt_authority;
+using prosper::frontend::live_rtt_cpu_snapshot_matches;
 using prosper::frontend::live_rtt_gpu_importable;
+using prosper::frontend::LiveRttGuestWriteEffect;
+using prosper::frontend::live_rtt_guest_write_effect;
 using prosper::frontend::live_rtt_compute_mirror_eligible;
 using prosper::frontend::live_rtt_mirror_identity_matches;
 
@@ -84,6 +87,10 @@ int main() {
     CHECK(live_rtt_gpu_importable(true, true));
     CHECK(!live_rtt_gpu_importable(false, true));
     CHECK(!live_rtt_gpu_importable(false, false));
+    CHECK(live_rtt_cpu_snapshot_matches(1920, 1080, 8, 1920ull * 1080 * 8));
+    CHECK(!live_rtt_cpu_snapshot_matches(1920, 1080, 8, 1920ull * 1080 * 4));
+    CHECK(!live_rtt_cpu_snapshot_matches(0, 1080, 8, 0));
+    CHECK(!live_rtt_cpu_snapshot_matches(1920, 1080, 0, 0));
     CHECK(live_rtt_mirror_identity_matches(
         0x100000, 3840, 2160, 97, 0x100000, 3840, 2160, 97));
     CHECK(!live_rtt_mirror_identity_matches(
@@ -96,6 +103,34 @@ int main() {
     CHECK(!live_rtt_compute_mirror_eligible(false, true, false));
     CHECK(!live_rtt_compute_mirror_eligible(true, false, false));
     CHECK(!live_rtt_compute_mirror_eligible(true, true, true));
+
+    // A compute fast-clear can touch only a target's DCC allocation. That must revoke both cached
+    // pixel copies while preserving enough target identity to decode the clear. Ordinary color
+    // writes retain the stronger erase-the-entry behavior, including if ranges overlap both planes.
+    constexpr uint64_t target = 0x30f36d0000ull;
+    constexpr uint64_t target_bytes = 3840ull * 2160ull * 4ull;
+    constexpr uint64_t metadata = 0x304d780000ull;
+    constexpr uint64_t metadata_bytes = 163840;
+    CHECK(live_rtt_guest_write_effect(target, target_bytes, metadata, metadata_bytes,
+                                      metadata, metadata_bytes) ==
+          LiveRttGuestWriteEffect::dcc_metadata);
+    CHECK(live_rtt_guest_write_effect(target, target_bytes, metadata, metadata_bytes,
+                                      target + 4096, 64) ==
+          LiveRttGuestWriteEffect::color_plane);
+    CHECK(live_rtt_guest_write_effect(target, target_bytes, target + 1024, metadata_bytes,
+                                      target + 2048, 64) ==
+          LiveRttGuestWriteEffect::color_plane);
+    CHECK(live_rtt_guest_write_effect(target, target_bytes, metadata, metadata_bytes,
+                                      metadata + metadata_bytes, 1) ==
+          LiveRttGuestWriteEffect::none);
+    CHECK(live_rtt_guest_write_effect(target, target_bytes, metadata, metadata_bytes,
+                                      0, metadata_bytes) ==
+          LiveRttGuestWriteEffect::none);
+    CHECK(live_rtt_guest_write_effect(
+              std::numeric_limits<uint64_t>::max() - 31, 64,
+              metadata, metadata_bytes,
+              std::numeric_limits<uint64_t>::max() - 1, 1) ==
+          LiveRttGuestWriteEffect::color_plane);
 
     if (failures == 0) std::printf("rtt_scale: OK\n");
     return failures == 0 ? 0 : 1;

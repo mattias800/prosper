@@ -187,6 +187,11 @@ struct DecodedImageView {
     bool in_mip_tail = false;
     uint32_t mip_tail_bytes = 0;
     uint32_t mip_tail_x = 0, mip_tail_y = 0;
+    // Multi-layer thin arrays and cube faces keep gpu_addr at the selected first slice's allocation
+    // base. Each layer owns one complete mip chain, so backends select this view at
+    // base + layer*layer_stride + layer_mip_offset (or use the tail coordinates for a packed tail).
+    size_t layer_stride = 0;
+    size_t layer_mip_offset = 0;
     // False when BASE_LEVEL selects a mip whose layout this helper cannot prove. Callers must reject
     // the binding instead of silently sampling the allocation's base level with the wrong dimensions.
     bool supported = true;

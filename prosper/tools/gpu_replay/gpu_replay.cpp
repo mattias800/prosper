@@ -46,8 +46,10 @@ void usage(const char* argv0) {
     std::fprintf(stderr, "usage: %s [--inspect|--inspect-only|--validate|--graph] "
                          "[--graph-json PATH] [--draw N[:M]] [--draw-with-compute-prefix] "
                          "[--through-operation N] [--compute-only N] [--warmup-repeats N] "
-                         "[--bundle capture.prgbundle] [--bundle-tail N] [--bundle-compact PATH] "
+                         "[--bundle capture.prgbundle] [--bundle-tail N] "
+                         "[--bundle-through-submit N] [--bundle-compact PATH] "
                          "[--bundle-intermediate-through-target WxH] "
+                         "[--bundle-output-target WxH] "
                          "[--bundle-final-capsule PATH] "
                          "[--bundle-extract-submit N PATH] "
                          "[--bundle-ds-summary] "
@@ -59,9 +61,10 @@ void usage(const char* argv0) {
                          "[--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
                          "[--dump-rtt-seed ADDR PATH] "
                          "[--dump-shader DRAW:vs|fs PATH] [--dump-compute N PATH] "
-                         "[--dump-realized-shader DRAW:vs|fs PATH] "
+                         "[--dump-realized-shader DRAW:vs|vs-main|fs PATH] "
                          "[--override-compute-spv N PATH] "
                          "[--dump-failed-shader FAILURE:STAGE PATH] "
+                         "[--retry-failed-stage FAILURE:STAGE] "
                          "[--dump-compute-resource N:BINDING PATH] "
                          "[--legacy-htile-before-stencil] "
                          "<capture.prgcap> [output.bmp]\n", argv0);
@@ -72,6 +75,47 @@ std::vector<uint8_t> inspect_rtt_seed(const prosper::gpu::GpuCaptureRttSeed& see
     if (seed.format == prosper::gpu::GpuCaptureColorFormat::Rgba8Unorm &&
         seed.rgba.size() == texels * 4)
         return seed.rgba;
+    if (seed.format == prosper::gpu::GpuCaptureColorFormat::R11G11B10Float &&
+        seed.rgba.size() == texels * 4) {
+        std::vector<uint8_t> rgba(texels * 4);
+        for (size_t texel = 0; texel < texels; ++texel) {
+            uint32_t packed = 0;
+            std::memcpy(&packed, seed.rgba.data() + texel * 4, sizeof(packed));
+            const float values[3] = {
+                prosper::gpu::f11_to_float(static_cast<uint16_t>(packed)),
+                prosper::gpu::f11_to_float(static_cast<uint16_t>(packed >> 11)),
+                prosper::gpu::f10_to_float(static_cast<uint16_t>(packed >> 22)),
+            };
+            for (uint32_t channel = 0; channel < 3; ++channel) {
+                const float value = values[channel];
+                rgba[texel * 4 + channel] = !std::isfinite(value) || value <= 0.0f ? 0
+                    : value >= 1.0f ? 255 : static_cast<uint8_t>(value * 255.0f + 0.5f);
+            }
+            rgba[texel * 4 + 3] = 255;
+        }
+        return rgba;
+    }
+    if (seed.format == prosper::gpu::GpuCaptureColorFormat::R8Unorm &&
+        seed.rgba.size() == texels) {
+        std::vector<uint8_t> rgba(texels * 4);
+        for (size_t texel = 0; texel < texels; ++texel) {
+            rgba[texel * 4] = rgba[texel * 4 + 1] = rgba[texel * 4 + 2] = seed.rgba[texel];
+            rgba[texel * 4 + 3] = 255;
+        }
+        return rgba;
+    }
+    if (seed.format == prosper::gpu::GpuCaptureColorFormat::R32Uint &&
+        seed.rgba.size() == texels * 4) {
+        std::vector<uint8_t> rgba(texels * 4);
+        for (size_t texel = 0; texel < texels; ++texel) {
+            uint32_t value = 0;
+            std::memcpy(&value, seed.rgba.data() + texel * 4, sizeof(value));
+            const uint8_t visible = static_cast<uint8_t>(std::min(value, 255u));
+            rgba[texel * 4] = rgba[texel * 4 + 1] = rgba[texel * 4 + 2] = visible;
+            rgba[texel * 4 + 3] = 255;
+        }
+        return rgba;
+    }
     if (seed.format != prosper::gpu::GpuCaptureColorFormat::Rgba16Float ||
         seed.rgba.size() != texels * 8)
         return {};
@@ -87,6 +131,26 @@ std::vector<uint8_t> inspect_rtt_seed(const prosper::gpu::GpuCaptureRttSeed& see
         }
     }
     return rgba;
+}
+
+std::vector<uint8_t> inspect_live_target(const prosper::gpu::LiveTargetSnapshot& snapshot) {
+    if (!snapshot.pixels) return {};
+    prosper::gpu::GpuCaptureRttSeed seed;
+    seed.width = snapshot.width;
+    seed.height = snapshot.height;
+    seed.rgba = *snapshot.pixels;
+    switch (snapshot.format) {
+        case prosper::gpu::LiveTargetPixelFormat::Rgba8Unorm:
+            seed.format = prosper::gpu::GpuCaptureColorFormat::Rgba8Unorm;
+            break;
+        case prosper::gpu::LiveTargetPixelFormat::Rgba16Float:
+            seed.format = prosper::gpu::GpuCaptureColorFormat::Rgba16Float;
+            break;
+        case prosper::gpu::LiveTargetPixelFormat::R11G11B10Float:
+            seed.format = prosper::gpu::GpuCaptureColorFormat::R11G11B10Float;
+            break;
+    }
+    return inspect_rtt_seed(seed);
 }
 
 std::vector<uint8_t> execute_frame(const prosper::gpu::GpuReplayFrame& replay,
@@ -234,7 +298,7 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
         });
         std::printf("  %s %-7s b=%u addr=%016llx declared=%u footprint=%llu captured=%llu "
                     "nz=%zu hash=%016llx first=%08x "
-                    "fmt=%u nc=%u stride=%u %ux%ux%u tile=%u row-pitch=%u "
+                    "fmt=%u nc=%u stride=%u %ux%ux%u tile=%u row-pitch=%u layer=%u+%u "
                     "addr=%u%u%u swz=%u%u%u%u filt=%u/%u/%u "
                     "dcc=%u meta=%016llx meta-bytes=%llu/%llu meta-nz=%zu meta-unique=%zu "
                     "meta-first=%08x meta-hash=%016llx "
@@ -247,6 +311,7 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
                     static_cast<unsigned long long>(hash), first,
                     static_cast<unsigned>(r.format), r.num_components, r.stride,
                     r.width, r.height, r.depth, r.tile_mode, r.linear_row_pitch_bytes,
+                    r.layer_stride_bytes, r.layer_mip_offset_bytes,
                     r.addr_uvw[0], r.addr_uvw[1], r.addr_uvw[2],
                     r.swizzle[0], r.swizzle[1], r.swizzle[2], r.swizzle[3],
                     r.mag_filter, r.min_filter, r.mip_filter,
@@ -275,7 +340,13 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
     for (const auto& seed : replay.rtt_seeds) {
         const uint64_t hash = prosper::gpu::gpu_capture_hash(seed.rgba);
         const char* format = seed.format == prosper::gpu::GpuCaptureColorFormat::Rgba16Float
-            ? "rgba16f" : "rgba8";
+            ? "rgba16f"
+            : seed.format == prosper::gpu::GpuCaptureColorFormat::R11G11B10Float
+                ? "r11g11b10f"
+                : seed.format == prosper::gpu::GpuCaptureColorFormat::R8Unorm
+                    ? "r8"
+                    : seed.format == prosper::gpu::GpuCaptureColorFormat::R32Uint
+                        ? "r32ui" : "rgba8";
         std::printf("rtt-seed addr=%016llx extent=%ux%u format=%s bytes=%zu hash=%016llx\n",
                     static_cast<unsigned long long>(seed.guest_addr), seed.width, seed.height,
                     format, seed.rgba.size(), static_cast<unsigned long long>(hash));
@@ -377,6 +448,19 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                     d.ps.src_color_blend_factor, d.ps.dst_color_blend_factor, d.ps.color_blend_op,
                     d.ps.src_alpha_blend_factor, d.ps.dst_alpha_blend_factor, d.ps.alpha_blend_op,
                     d.ps.logic_op_enable, d.ps.logic_op);
+        for (uint32_t slot = 2; slot < d.color_targets.size(); ++slot) {
+            const auto& target = d.color_targets[slot];
+            const auto& pipeline = d.ps.color_targets[slot];
+            if (!target.base && !pipeline.format && !pipeline.write_mask) continue;
+            std::printf("  target%u=%016llx extent=%ux%u fmt=%u cwm=%x "
+                        "blend=%d %u,%u/%u %u,%u/%u clear=%d disable-rop3=%d\n",
+                        slot, static_cast<unsigned long long>(target.base),
+                        target.width, target.height, pipeline.format, pipeline.write_mask,
+                        pipeline.blend_enable, pipeline.src_color_blend_factor,
+                        pipeline.dst_color_blend_factor, pipeline.color_blend_op,
+                        pipeline.src_alpha_blend_factor, pipeline.dst_alpha_blend_factor,
+                        pipeline.alpha_blend_op, pipeline.has_clear, pipeline.disable_rop3);
+        }
         std::printf("  stencil clear=%u cmp=%u/%u fail=%u/%u pass=%u/%u zfail=%u/%u "
                     "ref=%u/%u opval=%u/%u cmask=%02x/%02x wmask=%02x/%02x\n",
                     d.ps.stencil_clear_value, d.ps.stencil_compare_op[0], d.ps.stencil_compare_op[1],
@@ -418,12 +502,12 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
     for (size_t i = 0; i < replay.computes.size(); ++i) {
         const auto& c = replay.computes[i];
         std::printf("compute[%zu] source=%llu order=%llu code=%016llx groups=%ux%ux%u local=%ux%ux%u "
-                    "shader=%zu/%016llx\n",
+                    "subgroup=%u shader=%zu/%016llx\n",
                     i, static_cast<unsigned long long>(c.dispatch_index),
                     static_cast<unsigned long long>(c.command_order),
                     static_cast<unsigned long long>(c.code_addr), c.launch.groups_x,
                     c.launch.groups_y, c.launch.groups_z, c.launch.local_x, c.launch.local_y,
-                    c.launch.local_z, c.spirv.size(),
+                    c.launch.local_z, c.required_subgroup_size, c.spirv.size(),
                     static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(
                         reinterpret_cast<const uint8_t*>(c.spirv.data()), c.spirv.size() * 4)));
         inspect_table("CS", c.resources.get(), replay.rtt_seeds);
@@ -524,6 +608,22 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                 std::printf(" first-reject pc=%u fmt=%d op=0x%x", stage.coverage.first_bad_pc,
                             stage.coverage.first_bad_fmt, stage.coverage.first_bad_op);
             std::printf("\n");
+            for (size_t resource_index = 0;
+                 resource_index < stage.resource_table.resources.size(); ++resource_index) {
+                const auto& resource =
+                    stage.resource_table.resources[resource_index].resource;
+                std::printf("    resource[%zu] cls=%u binding=%u addr=%016llx size=%u "
+                            "stride=%u fmt=%u comps=%u srt=%08x sgpr=%08x fetch=%08x "
+                            "index-mode=%u\n",
+                            resource_index, static_cast<unsigned>(resource.cls),
+                            resource.binding,
+                            static_cast<unsigned long long>(resource.gpu_addr),
+                            resource.size, resource.stride,
+                            static_cast<unsigned>(resource.format),
+                            resource.num_components, resource.srt_offset,
+                            resource.sgpr_base, resource.fetch_pc,
+                            static_cast<unsigned>(resource.fetch_index_mode));
+            }
         }
     }
 }
@@ -770,8 +870,10 @@ int summarize_bundle_ds(const prosper::gpu::GpuCaptureBundle& bundle,
 }
 
 int replay_bundle(const std::string& path, const char* output_path, bool zero_boundary,
-                  size_t tail_count, const std::string& compact_path,
+                  size_t tail_count, uint64_t through_submit_no,
+                  const std::string& compact_path,
                   uint32_t intermediate_target_width, uint32_t intermediate_target_height,
+                  uint32_t output_target_width, uint32_t output_target_height,
                   const std::string& final_capsule_path,
                   uint64_t extract_submit_no, const std::string& extract_submit_path,
                   uint64_t find_ds_addr, bool ds_summary) {
@@ -779,6 +881,21 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
     std::string error;
     if (!prosper::gpu::read_gpu_capture_bundle(path, bundle, error)) {
         std::fprintf(stderr, "gpu_replay: cannot read bundle: %s\n", error.c_str()); return 2;
+    }
+    if (through_submit_no) {
+        const auto selected = std::find_if(bundle.submits.begin(), bundle.submits.end(),
+                                           [&](const auto& submit) {
+                                               return submit.submit_index == through_submit_no;
+                                           });
+        if (selected == bundle.submits.end()) {
+            std::fprintf(stderr, "gpu_replay: bundle has no submit %llu\n",
+                         static_cast<unsigned long long>(through_submit_no));
+            return 2;
+        }
+        bundle.submits.erase(selected + 1, bundle.submits.end());
+        bundle.logical_bytes = 0;
+        for (const auto& submit : bundle.submits)
+            bundle.logical_bytes += submit.logical_bytes;
     }
     const uint64_t unique_bytes = prosper::gpu::gpu_capture_bundle_unique_bytes(bundle);
     const auto stats = prosper::gpu::gpu_capture_bundle_stats(bundle);
@@ -911,6 +1028,7 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
 
     std::vector<BundleTarget> prior_targets;
     std::vector<uint8_t> final_pixels;
+    prosper::gpu::replay_tool::OutputTarget selected_output_target;
     uint64_t temporal_resolved = 0, temporal_seeded = 0, temporal_bounded = 0, temporal_unresolved = 0;
     for (size_t i = first_submit_index; i < bundle.submits.size(); ++i) {
         prosper::gpu::GpuCaptureFile capture;
@@ -924,6 +1042,16 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
                          static_cast<unsigned long long>(capture.metadata.submit_index), error.c_str());
             return 2;
         }
+        // Renderer metadata is submit-local. In particular, front-buffer identity changes when a
+        // title rotates its VideoOut buffers inside a multi-frame bundle; applying only the final
+        // manifest before the loop makes every earlier present select the wrong surface.
+        for (const auto& [name, value] : capture.metadata.renderer_env)
+            if (!set_environment(name, value)) {
+                std::fprintf(stderr, "gpu_replay: cannot set %s for bundle submit %llu\n",
+                             name.c_str(),
+                             static_cast<unsigned long long>(capture.metadata.submit_index));
+                return 2;
+            }
         prosper::gpu::GpuDependencyGraph graph;
         if (!prosper::gpu::build_gpu_dependency_graph(replay, graph, error)) {
             std::fprintf(stderr, "gpu_replay: cannot graph bundle submit %llu: %s\n",
@@ -1122,6 +1250,11 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
             return 2;
         }
         final_pixels = execute_frame(replay, false, operation_limit);
+        if (output_target_width) {
+            const auto target = prosper::gpu::replay_tool::replay_last_target_matching_extent(
+                replay, output_target_width, output_target_height, operation_limit);
+            if (target) selected_output_target = target;
+        }
         if (final_capsule_prepared) {
             if (final_pixels.empty()) {
                 std::fprintf(stderr, "gpu_replay: final submit produced no checkpoint oracle\n");
@@ -1154,10 +1287,11 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
             const auto item = draw_item_by_index.find(operation.source_index);
             if (item == draw_item_by_index.end()) continue;
             const auto& draw = replay.items[item->second];
-            if (draw.color0_base && draw.color0_width && draw.color0_height)
-                prior_targets.push_back({draw.color0_base,
-                    static_cast<uint64_t>(draw.color0_width) * draw.color0_height * 4,
-                    capture.metadata.submit_index});
+            for (const auto& target : draw.color_targets)
+                if (target.base && target.width && target.height)
+                    prior_targets.push_back({target.base,
+                        static_cast<uint64_t>(target.width) * target.height * 4,
+                        capture.metadata.submit_index});
         }
         std::fprintf(stderr, "[gpureplay] bundle-submit=%llu operations=%zu/%zu output_bytes=%zu hash=%016llx\n",
                      static_cast<unsigned long long>(capture.metadata.submit_index),
@@ -1170,12 +1304,47 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
                  static_cast<unsigned long long>(temporal_seeded),
                  static_cast<unsigned long long>(temporal_bounded),
                  static_cast<unsigned long long>(temporal_unresolved));
+    if (output_target_width) {
+        if (!selected_output_target) {
+            std::fprintf(stderr, "gpu_replay: bundle prefix has no realized %ux%u color target\n",
+                         output_target_width, output_target_height);
+            return 2;
+        }
+        prosper::gpu::LiveTargetSnapshot snapshot;
+        if (!prosper::gpu::read_live_render_target(selected_output_target.guest_addr, snapshot) ||
+            snapshot.width != output_target_width || snapshot.height != output_target_height) {
+            std::fprintf(stderr,
+                         "gpu_replay: cannot read selected %ux%u target addr=%016llx draw=%llu\n",
+                         output_target_width, output_target_height,
+                         static_cast<unsigned long long>(selected_output_target.guest_addr),
+                         static_cast<unsigned long long>(selected_output_target.draw_index));
+            return 2;
+        }
+        final_pixels = inspect_live_target(snapshot);
+        if (final_pixels.size() != static_cast<uint64_t>(output_target_width) *
+                                   output_target_height * 4) {
+            std::fprintf(stderr,
+                         "gpu_replay: cannot convert selected %ux%u target addr=%016llx\n",
+                         output_target_width, output_target_height,
+                         static_cast<unsigned long long>(selected_output_target.guest_addr));
+            return 2;
+        }
+        std::fprintf(stderr,
+                     "[gpureplay] selected output target=%ux%u addr=%016llx draw=%llu "
+                     "output_bytes=%zu hash=%016llx\n",
+                     output_target_width, output_target_height,
+                     static_cast<unsigned long long>(selected_output_target.guest_addr),
+                     static_cast<unsigned long long>(selected_output_target.draw_index),
+                     final_pixels.size(),
+                     static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(final_pixels)));
+    }
     if (output_path && !final_pixels.empty() &&
         !prosper::test::dump_bmp(output_path, final_pixels,
-                                 final_metadata.width, final_metadata.height)) {
+                                 output_target_width ? output_target_width : final_metadata.width,
+                                 output_target_height ? output_target_height : final_metadata.height)) {
         std::fprintf(stderr, "gpu_replay: cannot write %s\n", output_path); return 2;
     }
-    if (expected_output_valid &&
+    if (!output_target_width && expected_output_valid &&
         (final_pixels.size() != expected_output_bytes ||
          prosper::gpu::gpu_capture_hash(final_pixels) != expected_output_hash)) {
         std::fprintf(stderr, "gpu_replay: bundle output mismatch\n"); return 1;
@@ -1191,7 +1360,9 @@ int main(int argc, char** argv) {
     bool graph_only = false, bundle_zero_boundary = false, bundle_ds_summary = false;
     bool legacy_htile_before_stencil = false, draw_with_compute_prefix = false;
     size_t bundle_tail = 0;
+    uint64_t bundle_through_submit_no = 0;
     uint32_t bundle_intermediate_target_width = 0, bundle_intermediate_target_height = 0;
+    uint32_t bundle_output_target_width = 0, bundle_output_target_height = 0;
     bool draw_selected = false;
     uint64_t draw_first = 0, draw_last = 0;
     int through_operation = -1;
@@ -1205,6 +1376,7 @@ int main(int argc, char** argv) {
     std::string compute_override_spec, compute_override_path;
     std::string compute_resource_spec, compute_resource_path;
     std::string failed_shader_spec, failed_shader_path;
+    std::string retry_failed_stage_spec;
     std::string realized_shader_spec, realized_shader_path;
     std::string rtt_seed_path;
     std::string graph_json_path, prepend_path;
@@ -1238,12 +1410,24 @@ int main(int argc, char** argv) {
             if (!end || *end || !value || value > SIZE_MAX) { usage(argv[0]); return 2; }
             bundle_tail = static_cast<size_t>(value);
         }
+        else if (std::string(argv[i]) == "--bundle-through-submit" && i + 1 < argc) {
+            char* end = nullptr;
+            bundle_through_submit_no = std::strtoull(argv[++i], &end, 0);
+            if (!end || *end || !bundle_through_submit_no) { usage(argv[0]); return 2; }
+        }
         else if (std::string(argv[i]) == "--bundle-intermediate-through-target" && i + 1 < argc) {
             unsigned width = 0, height = 0; char tail = 0;
             if (std::sscanf(argv[++i], "%ux%u%c", &width, &height, &tail) != 2 ||
                 !width || !height) { usage(argv[0]); return 2; }
             bundle_intermediate_target_width = width;
             bundle_intermediate_target_height = height;
+        }
+        else if (std::string(argv[i]) == "--bundle-output-target" && i + 1 < argc) {
+            unsigned width = 0, height = 0; char tail = 0;
+            if (std::sscanf(argv[++i], "%ux%u%c", &width, &height, &tail) != 2 ||
+                !width || !height) { usage(argv[0]); return 2; }
+            bundle_output_target_width = width;
+            bundle_output_target_height = height;
         }
         else if (std::string(argv[i]) == "--bundle-final-capsule" && i + 1 < argc)
             bundle_final_capsule_path = argv[++i];
@@ -1323,6 +1507,8 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--dump-failed-shader" && i + 2 < argc) {
             failed_shader_spec = argv[++i]; failed_shader_path = argv[++i];
         }
+        else if (std::string(argv[i]) == "--retry-failed-stage" && i + 1 < argc)
+            retry_failed_stage_spec = argv[++i];
         else positional.push_back(argv[i]);
     }
     if (legacy_htile_before_stencil)
@@ -1341,17 +1527,22 @@ int main(int argc, char** argv) {
             usage(argv[0]); return 2;
         }
         return replay_bundle(bundle_path, positional.empty() ? nullptr : positional[0],
-                             bundle_zero_boundary, bundle_tail, bundle_compact_path,
+                             bundle_zero_boundary, bundle_tail, bundle_through_submit_no,
+                             bundle_compact_path,
                              bundle_intermediate_target_width,
                              bundle_intermediate_target_height,
+                             bundle_output_target_width,
+                             bundle_output_target_height,
                              bundle_final_capsule_path,
                              bundle_extract_submit_no,
                              bundle_extract_submit_path,
                              bundle_find_ds_addr,
                              bundle_ds_summary);
     }
-    if (bundle_zero_boundary || bundle_tail || !bundle_compact_path.empty() ||
+    if (bundle_zero_boundary || bundle_tail || bundle_through_submit_no ||
+        !bundle_compact_path.empty() ||
         bundle_intermediate_target_width || !bundle_final_capsule_path.empty() ||
+        bundle_output_target_width ||
         !bundle_extract_submit_path.empty() || bundle_find_ds_addr || bundle_ds_summary) {
         usage(argv[0]); return 2;
     }
@@ -1389,35 +1580,72 @@ int main(int argc, char** argv) {
     }
     // --recompile-raw: a capsule stores already-recompiled SPIR-V, so recompiler changes are
     // invisible to a default replay. This mode re-recompiles EVERY retained raw VS/FS with the
-    // CURRENT recompiler and substitutes the result, turning any v19+ capsule into a deterministic
+    // CURRENT recompiler and substitutes the result. v36+ capsules retain the fixed-function
+    // pixel-stage ABI needed to make that recompilation deterministic; older captures keep their
+    // stored modules and report why no substitution was attempted.
     // offline A/B vehicle for recompiler work (stored vs current output diff via the replay hash —
     // the #1394/#1287 localization loop). Items without a retained raw stream, or whose
     // re-recompile fails, keep their stored SPIR-V — counted and reported, never silent.
     // PROSPER_FS_TAP is masked during the mass loop (recompile_fragment reads it per compile, so an
     // unmasked env would tap every shader containing that pc) and restored after, so the per-draw
-    // tap block below still applies to exactly its semantic draw. Interface hints (pixel/system
-    // inputs) are not retained by captures; nullptr matches the FS-tap/geom-probe precedent and the
-    // VS/FS interface itself is re-derived deterministically from the raw streams on both sides.
-    if (recompile_raw) {
+    // tap block below still applies to exactly its semantic draw.
+    if (recompile_raw && capture.format_version < 36) {
+        std::fprintf(stderr,
+                     "[recompile-raw] capture v%u predates v36 pixel-stage ABI state; "
+                     "keeping all stored graphics modules\n",
+                     capture.format_version);
+    } else if (recompile_raw) {
+        uint32_t fragment_wave_size = 64;
+        if (const char* wave = std::getenv("PROSPER_GPU_REPLAY_FRAGMENT_WAVE_SIZE")) {
+            const unsigned long parsed = std::strtoul(wave, nullptr, 0);
+            if (parsed == 32 || parsed == 64) fragment_wave_size = static_cast<uint32_t>(parsed);
+        }
         const char* tap_env_raw = std::getenv("PROSPER_FS_TAP");
         const std::string tap_env = tap_env_raw ? tap_env_raw : "";
         if (tap_env_raw) unsetenv("PROSPER_FS_TAP");
         size_t vs_swapped = 0, fs_swapped = 0, vs_kept = 0, fs_kept = 0;
         for (auto& it : replay.items) {
+            const auto* pixel_inputs = it.has_pixel_inputs ? &it.pixel_inputs : nullptr;
+            const auto* system_inputs = it.has_system_inputs ? &it.system_inputs : nullptr;
+            std::vector<uint32_t> vs, fs, gs;
+            bool requires_geometry = false;
             if (it.vs_raw_shader_index < replay.raw_shader_versions.size()) {
                 const auto& raw = replay.raw_shader_versions[it.vs_raw_shader_index];
-                auto vs = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
-                                                         it.vrt.get(), nullptr, false);
-                if (!vs.empty()) { it.set_vs(std::move(vs)); ++vs_swapped; }
-                else ++vs_kept;
+                if (it.vs_chain_raw_shader_index < replay.raw_shader_versions.size()) {
+                    const auto& main = replay.raw_shader_versions[it.vs_chain_raw_shader_index];
+                    vs = prosper::gpu::recompile_vertex_chain(
+                        raw.words.data(), raw.words.size(), main.words.data(), main.words.size(),
+                        it.vrt.get(), pixel_inputs, false, it.vertex_lds_dwords);
+                } else {
+                    vs = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
+                                                        it.vrt.get(), pixel_inputs, false,
+                                                        it.vertex_lds_dwords);
+                }
             } else ++vs_kept;
             if (it.fs_raw_shader_index < replay.raw_shader_versions.size()) {
                 const auto& raw = replay.raw_shader_versions[it.fs_raw_shader_index];
-                auto fs = prosper::gpu::recompile_fragment(raw.words.data(), raw.words.size(),
-                                                           it.prt.get(), nullptr, UINT32_MAX, nullptr);
-                if (!fs.empty()) { it.set_fs(std::move(fs)); ++fs_swapped; }
-                else ++fs_kept;
+                const auto interpolation = prosper::gpu::fragment_interpolation_layout(
+                    raw.words.data(), raw.words.size(), system_inputs, pixel_inputs);
+                if (interpolation.valid) {
+                    requires_geometry = interpolation.requires_geometry;
+                    fs = prosper::gpu::recompile_fragment(
+                        raw.words.data(), raw.words.size(), it.prt.get(), system_inputs,
+                        UINT32_MAX, &interpolation, fragment_wave_size);
+                    if (interpolation.requires_geometry && it.ps.topology >= 3u &&
+                        it.ps.topology <= 5u)
+                        gs = prosper::gpu::recompile_interpolation_geometry(interpolation);
+                }
             } else ++fs_kept;
+            if (!vs.empty() && !fs.empty() && (!requires_geometry || !gs.empty())) {
+                it.set_vs(std::move(vs));
+                it.set_fs(std::move(fs));
+                it.gs = std::move(gs);
+                ++vs_swapped;
+                ++fs_swapped;
+            } else {
+                if (it.vs_raw_shader_index < replay.raw_shader_versions.size()) ++vs_kept;
+                if (it.fs_raw_shader_index < replay.raw_shader_versions.size()) ++fs_kept;
+            }
         }
         if (tap_env_raw) setenv("PROSPER_FS_TAP", tap_env.c_str(), 1);
         std::fprintf(stderr, "[recompile-raw] substituted vs=%zu fs=%zu kept-stored vs=%zu fs=%zu of %zu draws\n",
@@ -1426,8 +1654,15 @@ int main(int argc, char** argv) {
     // Geometry probe (PROSPER_GEOM_PROBE=N): a capsule stores already-recompiled SPIR-V, so to capture
     // draw N's gl_Position via transform feedback we re-recompile its raw RDNA2 VS with xfb decorations
     // and swap it in here; render_runner then binds a TF buffer around that draw and reports where its
-    // post-transform vertices land. Requires a v19+ capsule that retained the raw VS stream.
+    // post-transform vertices land. v31+ capsules also retain separately-installed linked vertex mains
+    // and graphics LDS; earlier capsules can probe only single-stage vertex programs.
     if (const char* g = std::getenv("PROSPER_GEOM_PROBE")) {
+        if (capture.format_version < 36) {
+            std::fprintf(stderr,
+                         "[geom-probe] capture v%u predates v36 pixel-stage ABI state\n",
+                         capture.format_version);
+            return 2;
+        }
         uint64_t n = 0;
         if (!prosper::gpu::parse_diagnostic_draw_id(g, n)) {
             std::fprintf(stderr, "[geom-probe] invalid semantic draw selector '%s'\n", g);
@@ -1443,14 +1678,30 @@ int main(int argc, char** argv) {
                 ? -1 : static_cast<long long>(operation_index);
             if (it.vs_raw_shader_index < replay.raw_shader_versions.size()) {
                 const auto& raw = replay.raw_shader_versions[it.vs_raw_shader_index];
-                auto xfb = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
-                                                          it.vrt.get(), nullptr, true);
+                std::vector<uint32_t> xfb;
+                const bool linked =
+                    it.vs_chain_raw_shader_index < replay.raw_shader_versions.size();
+                if (linked) {
+                    const auto& main =
+                        replay.raw_shader_versions[it.vs_chain_raw_shader_index];
+                    xfb = prosper::gpu::recompile_vertex_chain(
+                        raw.words.data(), raw.words.size(), main.words.data(), main.words.size(),
+                        it.vrt.get(), it.has_pixel_inputs ? &it.pixel_inputs : nullptr, true,
+                        it.vertex_lds_dwords);
+                } else {
+                    xfb = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
+                                                         it.vrt.get(),
+                                                         it.has_pixel_inputs ? &it.pixel_inputs : nullptr,
+                                                         true,
+                                                         it.vertex_lds_dwords);
+                }
                 if (!xfb.empty()) {
                     it.set_vs(std::move(xfb));
                     std::fprintf(stderr,
-                                 "[geom-probe] draw=%llu item=%zu operation=%lld VS re-recompiled "
-                                 "with xfb capture (%zu words)\n",
-                                 draw_label, item_index, operation_label, it.vs.size());
+                                 "[geom-probe] draw=%llu item=%zu operation=%lld VS%s re-recompiled "
+                                 "with xfb capture (%zu words, lds=%u dwords)\n",
+                                 draw_label, item_index, operation_label,
+                                 linked ? "+main" : "", it.vs.size(), it.vertex_lds_dwords);
                 } else {
                     std::fprintf(stderr, "[geom-probe] draw %llu: xfb re-recompile produced no VS "
                                          "(no raw stream / unsupported)\n", draw_label);
@@ -1468,6 +1719,17 @@ int main(int argc, char** argv) {
     // pc after the ':' and redirects its MRT0 colour export to the intermediate value at that PC) and swap it
     // in, so that draw's rendered pixels visualise the tapped value. Requires a v19+ capsule with the raw FS.
     if (const char* f = std::getenv("PROSPER_FS_TAP")) {
+        if (capture.format_version < 36) {
+            std::fprintf(stderr,
+                         "[fs-tap] capture v%u predates v36 pixel-stage ABI state\n",
+                         capture.format_version);
+            return 2;
+        }
+        uint32_t fragment_wave_size = 64;
+        if (const char* wave = std::getenv("PROSPER_GPU_REPLAY_FRAGMENT_WAVE_SIZE")) {
+            const unsigned long parsed = std::strtoul(wave, nullptr, 0);
+            if (parsed == 32 || parsed == 64) fragment_wave_size = static_cast<uint32_t>(parsed);
+        }
         uint64_t n = 0;
         uint32_t tap_pc = 0;
         if (!prosper::gpu::parse_fragment_tap_selector(f, n, tap_pc)) {
@@ -1484,8 +1746,15 @@ int main(int argc, char** argv) {
                 ? -1 : static_cast<long long>(operation_index);
             if (it.fs_raw_shader_index < replay.raw_shader_versions.size()) {
                 const auto& raw = replay.raw_shader_versions[it.fs_raw_shader_index];
+                const auto interpolation = prosper::gpu::fragment_interpolation_layout(
+                    raw.words.data(), raw.words.size(),
+                    it.has_system_inputs ? &it.system_inputs : nullptr,
+                    it.has_pixel_inputs ? &it.pixel_inputs : nullptr);
                 auto fs = prosper::gpu::recompile_fragment(raw.words.data(), raw.words.size(),
-                                                           it.prt.get(), nullptr, UINT32_MAX, nullptr);
+                                                           it.prt.get(),
+                                                           it.has_system_inputs ? &it.system_inputs : nullptr,
+                                                           UINT32_MAX, &interpolation,
+                                                           fragment_wave_size);
                 if (!fs.empty()) {
                     it.set_fs(std::move(fs));
                     std::fprintf(stderr,
@@ -1587,7 +1856,13 @@ int main(int argc, char** argv) {
                      "[gpureplay] dumped RTT seed %016llx %ux%u format=%s -> %s\n",
                      static_cast<unsigned long long>(seed->guest_addr), seed->width, seed->height,
                      seed->format == prosper::gpu::GpuCaptureColorFormat::Rgba16Float
-                         ? "rgba16f" : "rgba8",
+                         ? "rgba16f"
+                         : seed->format == prosper::gpu::GpuCaptureColorFormat::R11G11B10Float
+                             ? "r11g11b10f"
+                             : seed->format == prosper::gpu::GpuCaptureColorFormat::R8Unorm
+                                 ? "r8"
+                                 : seed->format == prosper::gpu::GpuCaptureColorFormat::R32Uint
+                                     ? "r32ui" : "rgba8",
                      rtt_seed_path.c_str());
     }
     if (graph_only) {
@@ -1697,6 +1972,68 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[gpureplay] dumped failed shader %s (%zu bytes) to %s\n",
                      failed_shader_spec.c_str(), bytes, failed_shader_path.c_str());
         if (positional.size() == 1 && !inspect) return 0;
+    }
+    if (!retry_failed_stage_spec.empty()) {
+        const size_t colon = retry_failed_stage_spec.find(':');
+        char* failure_end = nullptr;
+        const long failure_index = std::strtol(
+            retry_failed_stage_spec.c_str(), &failure_end, 0);
+        char* stage_end = nullptr;
+        const long stage_index = colon == std::string::npos ? -1 :
+            std::strtol(retry_failed_stage_spec.c_str() + colon + 1, &stage_end, 0);
+        if (colon == std::string::npos ||
+            failure_end != retry_failed_stage_spec.c_str() + colon ||
+            !stage_end || *stage_end || failure_index < 0 || stage_index < 0 ||
+            static_cast<size_t>(failure_index) >= replay.failure_diagnostics.size() ||
+            static_cast<size_t>(stage_index) >= replay.failure_diagnostics[
+                static_cast<size_t>(failure_index)].stages.size()) {
+            std::fprintf(stderr, "gpu_replay: invalid failed-stage selector %s\n",
+                         retry_failed_stage_spec.c_str());
+            return 2;
+        }
+        const auto& stage = replay.failure_diagnostics[static_cast<size_t>(failure_index)]
+                                .stages[static_cast<size_t>(stage_index)];
+        if (stage.raw_shader_index >= replay.raw_shader_versions.size()) {
+            std::fprintf(stderr, "gpu_replay: failed stage %s has no captured raw stream\n",
+                         retry_failed_stage_spec.c_str());
+            return 2;
+        }
+        if (stage.resource_table_present != stage.resource_table.present ||
+            stage.resource_count != stage.resource_table.resources.size()) {
+            std::fprintf(stderr,
+                         "gpu_replay: failed stage %s lacks exact resource metadata "
+                         "(capture predates v35)\n", retry_failed_stage_spec.c_str());
+            return 2;
+        }
+        prosper::gpu::ShaderResourceTable table;
+        table.resources.reserve(stage.resource_table.resources.size());
+        for (const auto& captured : stage.resource_table.resources)
+            table.resources.push_back(captured.resource);
+        const auto& raw = replay.raw_shader_versions[stage.raw_shader_index];
+        const prosper::gpu::ShaderResourceTable* resources =
+            stage.resource_table.present ? &table : nullptr;
+        std::vector<uint32_t> spirv;
+        switch (stage.stage) {
+            case prosper::gpu::ShaderProgramStage::Vertex:
+                spirv = prosper::gpu::recompile_vertex(
+                    raw.words.data(), raw.words.size(), resources);
+                break;
+            case prosper::gpu::ShaderProgramStage::Fragment:
+                spirv = prosper::gpu::recompile_fragment(
+                    raw.words.data(), raw.words.size(), resources);
+                break;
+            case prosper::gpu::ShaderProgramStage::Compute:
+                std::fprintf(stderr,
+                             "gpu_replay: failed compute retry needs its launch/user-SGPR "
+                             "specialization, which v35 does not retain\n");
+                return 2;
+        }
+        std::fprintf(stderr,
+                     "[retry-failed-stage] %s %s resources=%zu spirv-dwords=%zu\n",
+                     retry_failed_stage_spec.c_str(),
+                     spirv.empty() ? "rejected" : "recompiled",
+                     table.resources.size(), spirv.size());
+        if (positional.size() == 1 && !inspect) return spirv.empty() ? 1 : 0;
     }
     if (!compute_shader_spec.empty()) {
         char* end = nullptr;
@@ -1850,7 +2187,8 @@ int main(int argc, char** argv) {
         }
         std::vector<uint8_t> predecessor_pixels = execute_frame(prepend);
         for (const auto& draw : prepend.items)
-            if (draw.color0_base) predecessor_targets.insert(draw.color0_base);
+            for (const auto& target : draw.color_targets)
+                if (target.base) predecessor_targets.insert(target.base);
         std::fprintf(stderr, "[gpureplay] prepended submit=%llu operations=%zu targets=%zu "
                              "output_bytes=%zu hash=%016llx\n",
                      static_cast<unsigned long long>(prepend.metadata.submit_index),

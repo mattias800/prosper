@@ -11,6 +11,15 @@ Capsules contain title-derived shaders, resource bytes, addresses, ordered DMA e
 pixels, and optional exact persistent Vulkan depth/stencil checkpoint planes.
 They are gitignored local artifacts and must never be committed or shared as project fixtures.
 
+For a long scripted route, first set `PROSPER_CAPTURE_SCREENSHOT_AT_FRAME=N` to read back the Nth
+successfully presented host frame without paying the cost of a command capture. The one-shot writes
+`scheduled_frame_N.bmp` under `PROSPER_CAPTURE_DIR`; set `PROSPER_CAPTURE_SCREENSHOT=/path/out.bmp`
+to choose an exact path. Use that visual checkpoint to select the nearby
+`PROSPER_CAPTURE_BUNDLE_AT_PRESENT` value on the next run, then replay the resulting bundle normally.
+The app logs both the guest-present count saved when it arms the screenshot and the count observed after
+the readback finishes. Use the armed count, not the host frame number or later written count: swapchain
+presents and guest VideoOut flips are separate clocks, and the guest can advance during readback.
+
 Normal capture preflights merged resource ranges and rejects plans above 512 MiB before allocating.
 `PROSPER_GPU_CAPTURE_MAX_MB=1..3072` overrides that bound. If descriptor metadata is the evidence you
 need, `PROSPER_GPU_CAPTURE_METADATA_ONLY=1` writes a thin capsule with shaders, operations, pipeline
@@ -200,8 +209,10 @@ rasterize, so "all verts clipped" is not "renders nothing"; the bbox tells them 
 
 Mechanics: on a capsule (stored SPIR-V) gpu_replay resolves semantic draw N to its compact item, then
 re-recompiles that draw's raw RDNA2 VS with `gl_Position`
-xfb-decorated (requires a v19+ capsule that retained the raw VS stream) and swaps it in for that one draw; the
-live app recompiles fresh. Requires the device to advertise `VK_EXT_transform_feedback` (RADV, lavapipe). The
+xfb-decorated and swaps it in for that one draw. A v19+ capsule is sufficient for an ordinary vertex shader;
+v31+ additionally retains a separately-installed NGG main stage and its graphics-LDS allocation, allowing
+linked prolog+main programs to be probed faithfully. The live app recompiles fresh. Requires the device to
+advertise `VK_EXT_transform_feedback` (RADV, lavapipe). The
 probed draw's rendered pixels may be inexact (the re-recompile drops pixel-input remapping), but the captured
 `gl_Position` values are faithful; inert and byte-identical when the env var is unset.
 
@@ -303,7 +314,7 @@ palette-UV audit).
 
 `--dump-shader DRAW:vs|fs PATH` writes the recompiled SPIR-V. `DRAW` is the semantic ID printed by
 `--inspect-only`, as it is for the probes above. Capture v19 adds
-`--dump-realized-shader DRAW:vs|fs PATH` for the exact bounded raw RDNA2 stream that produced that realized
+`--dump-realized-shader DRAW:vs|vs-main|fs PATH` for the exact bounded raw RDNA2 stream that produced that realized
 draw stage, suitable for `shader_inspect`. The VS/FS streams use the same content-addressed 64 KiB-per-stage,
 64 MiB-total store as failed-shader diagnostics. Captures v1-v18 remain readable; because they did not retain
 realized-stage source identities, this command reports the raw stream as unavailable instead of guessing.
@@ -411,14 +422,23 @@ and continue if it also has temporal leaves.
 ascending order through one renderer instance, and releases each materialized submit before the next.
 The summary reports logical versus unique bytes, per-submit output hashes, and every temporal image leaf:
 
-- `stop=included-producer` names the earlier bundled submit whose target overlaps the leaf.
+- `stop=included-producer` names the earlier bundled submit whose target matches the leaf's resource
+  contract.
 - `stop=initialized-seed` means serialized RTT pixels establish the version without another submit.
 - `stop=configured-bound` means the earliest bundled submit still needs older history.
-- `stop=unresolved-producer` means a later submit has no overlapping earlier bundled target; a contiguous
+- `stop=unresolved-producer` means a later submit has no matching earlier bundled target; a contiguous
   bundle should not produce this and the capture/replay evidence is incomplete.
 
 A successful replay with `configured-bound` is an explicitly partial closure, not a faithful pixel oracle.
 Bundle files use `.prgbundle`, contain title-derived data, are gitignored, and must not be committed.
+
+The dependency graph follows the renderer's resource contract rather than treating every overlapping byte
+range as interchangeable. Reflected compute descriptors contribute only their proven read and/or write
+access; legacy or unreflectable modules retain the conservative read/write fallback. Image producers match a
+consumer's exact programmed guest base, while buffers and `DMA_DATA` retain byte-range overlap. A programmed
+color attachment is a producer only when its resolved target write mask is non-zero. These rules keep bundle
+closure from inventing temporal leaves for write-only compute outputs, neighboring image allocations, or
+disabled MRT slots.
 
 `--bundle-tail N` replays only the latest `N` manifests while retaining the bundle's exact shared resource
 dictionary. Use it when lifetime evidence proves that earlier submits cannot be target producers; the first
@@ -441,6 +461,17 @@ Version 14 appends address-backed `DMA_DATA` records with exact source and desti
 counts, PM4 order, and content-addressed endpoint blob references. Replay mutates the same owned resource
 instances used by later draws and dispatches and invalidates renderer caches for the guest destination range;
 v1..v13 capsules remain readable and do not invent DMA operations.
+Version 37 appends each realized compute module's required subgroup size. A non-zero value recreates the exact
+`VkPipelineShaderStageRequiredSubgroupSizeCreateInfo` plus full-subgroups contract used by live rendering;
+inspection reports it as `subgroup=32` or `subgroup=64`. This lets captures retain native-wave compute modules
+instead of recompiling a different portable emulation solely because capture is armed. Older capsules default
+to `subgroup=0`, and replay fails visibly when a host cannot satisfy a captured native contract. Native lowering
+defaults to one guest wave per workgroup; `PROSPER_NATIVE_COMPUTE_MULTIWAVE=1` enables the exact experimental
+multi-wave contract and records it the same way.
+Version 38 extends the append-only RTT-seed format enum with native `r8` and `r32ui` surfaces. Capture now
+validates every CPU mirror against the surface's current extent and bytes per pixel, materializes an
+authoritative GPU-only target before export, and never labels an unsupported or stale scalar surface as
+RGBA8. Version 37 and older capsules retain their existing enum values and byte layout.
 `--inspect-only` reports the RTT format and the planned/captured byte counts, non-zero and unique-byte counts,
 first control word, and content hash. A software DCC decode is still not inferred. The capsule's standalone
 output must match the bundle's final hash before using it for fast `--draw`, operation-prefix, resource, or
