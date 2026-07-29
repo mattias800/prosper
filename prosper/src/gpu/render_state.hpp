@@ -52,6 +52,7 @@ struct RenderState {
     // are retained for the fragment recompiler.
     uint32_t ps_input_ena = 0;
     uint32_t ps_input_addr = 0;
+    bool ps_wave32 = false; // SPI_PS_IN_CONTROL.PS_W32_EN
 
     // Color MRT 0. format/number_type/comp_swap together select the VkFormat (see vk_translate).
     uint64_t color0_base        = 0;   // byte address (CB_COLOR0_BASE + BASE_EXT)

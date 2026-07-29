@@ -103,6 +103,14 @@ int main() {
           isS(mb.src[1], 8) && ((mb.literal >> 12) & 1u), "buffer_load_dwordx4 MUBUF op/VDATA/VADDR/SRSRC/offen");
     CHECK(mb.src[2].kind == OperandKind::InlineInt && mb.src[2].value == 0,
           "MUBUF SOFFSET 0x80 decodes as inline 0, not SGPR s0");
+    // Astro Bot world-map PS, exact final packet: buffer_store_dwordx3
+    // v[3:5], v10, s[16:19], 0 idxen. Raw x3 stores use opcode 0x1f, after x4.
+    const uint32_t astro_store_x3[] = { 0xe07c2000u, 0x8004030au };
+    Rdna2Inst store_x3 = rdna2_decode_one(astro_store_x3, 2);
+    CHECK(store_x3.fmt == Rdna2Format::MUBUF && store_x3.opcode == 0x1fu &&
+              isV(store_x3.dst, 3) && isV(store_x3.src[0], 10) &&
+              isS(store_x3.src[1], 16) && ((store_x3.literal >> 13) & 1u),
+          "Astro buffer_store_dwordx3 decodes VDATA/VADDR/SRSRC and IDXEN exactly");
     // gfx1030 llvm-mc: tbuffer_load_format_xy v[4:5], v2, s[8:11], s12
     // format:[BUF_FMT_16_16_FLOAT] offen offset:52. MTBUF uses the Gen5 combined format 29,
     // not the old split DFMT=13/NFMT=1 interpretation of those same seven bits.

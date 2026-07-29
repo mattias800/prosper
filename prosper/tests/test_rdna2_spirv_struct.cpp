@@ -288,11 +288,12 @@ int main() {
     };
     if (!recompile_fragment(wave32_fragment_masks,
                             std::size(wave32_fragment_masks)).empty()) {
-        printf("  [FAIL] ungated graphics shader accepted Wave32 EXEC_LO/VCC_LO mask moves\n");
+        printf("  [FAIL] Wave64/default graphics shader accepted Wave32 EXEC_LO/VCC_LO masks\n");
         return 1;
     }
-    const auto wave32_fragment_spv = recompile_fragment_wave32_for_test(
-        wave32_fragment_masks, std::size(wave32_fragment_masks));
+    const auto wave32_fragment_spv = recompile_fragment(
+        wave32_fragment_masks, std::size(wave32_fragment_masks), nullptr, nullptr,
+        UINT32_MAX, nullptr, true);
     uint32_t wave32_fragment_bad_op = 0;
     if (wave32_fragment_spv.empty() ||
         !type_result_ids_are_nonzero(wave32_fragment_spv, &wave32_fragment_bad_op) ||
@@ -301,7 +302,7 @@ int main() {
                wave32_fragment_bad_op);
         return 1;
     }
-    printf("  [ok]   Wave32 fragment EXEC_LO/VCC_LO mask moves emit valid SPIR-V\n");
+    printf("  [ok]   registered Wave32 fragment EXEC_LO/VCC_LO mask moves emit valid SPIR-V\n");
 
     const uint32_t wave32_compute_masks[] = {
         0xbe80037eu,                         // s_mov_b32 s0, exec_lo
@@ -650,6 +651,49 @@ int main() {
     }
     printf("  [ok]   terminal NGG LDS output-rebuild gate produces valid SPIR-V\n");
 
+    // Astro Bot's first world-map wrapper rebuilds its surviving compacted output through a
+    // shader-embedded constant table rather than LDS. The terminal suffix is still side-effect
+    // free: scalar ALU constructs the PC-relative V#, MUBUF only reads the proven bounded table,
+    // and the results feed POS0/PARAM0 before S_ENDPGM. This is the exact captured 54-dword program
+    // plus the table tail required by those two loads.
+    const uint32_t astro_worldmap_pcrel_output_gate[] = {
+        0xbfa00003u, 0x93ebff03u, 0x00040018u, 0xbefe03c1u,
+        0x9380ff02u, 0x00090016u, 0x9381ff02u, 0x0009000cu,
+        0xbf8a0000u, 0xbf076b80u, 0xbf850004u, 0x8f6a8c00u,
+        0x887c6a01u, 0xbf800000u, 0xbf900009u, 0x8f6a856bu,
+        0xd7650001u, 0x0000d4c1u, 0x7da80200u, 0xbf880002u,
+        0xf8000941u, 0x00000000u, 0xbf8cff0fu, 0xbefe03c1u,
+        0x7da80201u, 0xbf88001bu, 0xd56a0000u, 0x00020affu,
+        0xaaaaaaabu, 0xbe8303ffu, 0x10005004u, 0xb0020048u,
+        0xbe801f00u, 0x800000ffu, 0x000000acu, 0x82010180u,
+        0x2c000081u, 0xd7460000u, 0x04010300u, 0x4c000105u,
+        0x34000083u, 0xd7460004u, 0x04010300u, 0xe0381000u,
+        0x80000004u, 0xe0341010u, 0x80000404u, 0xbf8c3f71u,
+        0xf80008cfu, 0x03020100u, 0xbf8c3f70u, 0xf8000203u,
+        0x00000504u, 0xbf810000u,
+        // Padding to byte offset 304, then the 72-byte constant table.
+        0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+        0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+        0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+        0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+        0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+        0xbf9f0000u,
+        0x00000000u, 0xbf800000u, 0xbf800000u, 0x3f800000u,
+        0x3f800000u, 0x00000000u, 0x3f800000u, 0x40400000u,
+        0xbf800000u, 0x3f800000u, 0x3f800000u, 0x40000000u,
+        0x3f800000u, 0xbf800000u, 0x40400000u, 0x3f800000u,
+        0x3f800000u, 0x00000000u, 0xbf800000u,
+    };
+    const auto astro_worldmap_pcrel_output_spv = recompile_vertex(
+        astro_worldmap_pcrel_output_gate, std::size(astro_worldmap_pcrel_output_gate));
+    if (astro_worldmap_pcrel_output_spv.empty() ||
+        !type_result_ids_are_nonzero(astro_worldmap_pcrel_output_spv, nullptr) ||
+        !phi_ids_are_nonzero(astro_worldmap_pcrel_output_spv)) {
+        printf("  [FAIL] captured Astro PC-relative NGG output gate did not emit valid SPIR-V\n");
+        return 1;
+    }
+    printf("  [ok]   captured Astro PC-relative NGG output gate emits valid SPIR-V\n");
+
     // Astro's second world-map wrapper exports POS for a surviving compacted vertex, then a regular
     // VCC compare conditionally skips only the trailing PARAM exports. Supplying those otherwise-
     // undefined varyings in the one-lane projection is safe and must not drop the complete draw.
@@ -804,6 +848,47 @@ int main() {
         return 1;
     }
     printf("  [ok]   complex fragment CFG exports active state from both alternate sites\n");
+
+    // The graphics CFG dispatcher must retain the fragment shell's already-proven alpha-test
+    // linearization.  This reduced Astro Bot shape prefixes the crossing-region CFG above with a
+    // survivor-mask SCC early-out.  The SCC from s_andn2_b64 is a whole-wave reduction, not an SSA
+    // scalar boolean; the per-invocation translation drops that optimization, narrows EXEC, and
+    // OpKills failed lanes at either export.  Treating the safe branch as a dispatcher terminator
+    // instead poisoned SCC and rejected the otherwise-supported material shader.
+    const uint32_t fragment_cfg_kill_dispatch[] = {
+        0xbe82047eu,                         // pc0:  s_mov_b64 s[2:3], exec
+        0x7c020300u,                         // pc1:  v_cmp_lt_f32 vcc, v0, v1
+        0x8a826a02u,                         // pc2:  s_andn2_b64 s[2:3], s[2:3], vcc
+        0xbf840012u,                         // pc3:  s_cbranch_scc0 -> pc22 (wave early-out)
+        0xbefe0a02u,                         // pc4:  s_wqm_b64 exec, s[2:3]
+        0x7e040280u,                         // pc5:  v_mov_b32 v2, 0
+        0x7e060280u,                         // pc6:  v_mov_b32 v3, 0
+        0x7e080280u,                         // pc7:  v_mov_b32 v4, 0
+        0x7e0a0280u,                         // pc8:  v_mov_b32 v5, 0
+        0x7c020300u,                         // pc9:  v_cmp_lt_f32 vcc, v0, v1
+        0xbf860003u,                         // pc10: s_cbranch_vccz -> pc14
+        0x7c020300u,                         // pc11: v_cmp_lt_f32 vcc, v0, v1
+        0xbf860002u,                         // pc12: s_cbranch_vccz -> pc15 (crossing region)
+        0x7e040281u,                         // pc13: v_mov_b32 v2, 1
+        0x7e060281u,                         // pc14: v_mov_b32 v3, 1
+        0x7c020300u,                         // pc15: v_cmp_lt_f32 vcc, v0, v1
+        0xbf860003u,                         // pc16: s_cbranch_vccz -> alternate export at pc20
+        0xf800180fu, 0x05040302u,            // pc17: exp mrt0 v2, v3, v4, v5 done vm
+        0xbf820003u,                         // pc19: s_branch -> verified tail exit at pc23
+        0xf800180fu, 0x05040302u,            // pc20: alternate exp mrt0 v2, v3, v4, v5 done vm
+        0xbf810000u,                         // pc22: s_endpgm
+        0xbf810000u,                         // pc23: branch-target s_endpgm
+    };
+    const auto fragment_cfg_kill_spv = recompile_fragment(
+        fragment_cfg_kill_dispatch, std::size(fragment_cfg_kill_dispatch));
+    if (fragment_cfg_kill_spv.empty() || !has_opcode(fragment_cfg_kill_spv, 251) ||
+        !has_opcode(fragment_cfg_kill_spv, 252) ||
+        !type_result_ids_are_nonzero(fragment_cfg_kill_spv, nullptr) ||
+        !phi_ids_are_nonzero(fragment_cfg_kill_spv)) {
+        printf("  [FAIL] complex fragment CFG lost its proven alpha-test branch linearization\n");
+        return 1;
+    }
+    printf("  [ok]   complex fragment CFG retains alpha-test discard linearization\n");
 
     // Alpha-test discard via the SCALAR-BRANCH form (not v_cmpx): compare a sampled/interpolated value,
     // ANDN2 the survivor mask into a saved EXEC copy (SCC = "any lane survives"), and s_cbranch_scc0 skips

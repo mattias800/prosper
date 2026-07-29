@@ -52,4 +52,20 @@ constexpr LiveRttGuestWriteEffect live_rtt_guest_write_effect(
     return LiveRttGuestWriteEffect::none;
 }
 
+// A mirrored guest write may re-authorize only the exact renderer image that actually received the
+// same completed GPU result. Address overlap or an equal byte footprint is insufficient: reused
+// allocations can expose different shapes/formats at one base address.
+constexpr bool live_rtt_mirror_identity_matches(
+    uint64_t target_addr, uint32_t target_width, uint32_t target_height, uint32_t target_format,
+    uint64_t mirror_addr, uint32_t mirror_width, uint32_t mirror_height, uint32_t mirror_format) {
+    return target_addr && target_width && target_height &&
+        target_addr == mirror_addr && target_width == mirror_width &&
+        target_height == mirror_height && target_format == mirror_format;
+}
+
+constexpr bool live_rtt_compute_mirror_eligible(
+    bool exact_import_seed, bool imported_transfer_dst, bool disabled) {
+    return exact_import_seed && imported_transfer_dst && !disabled;
+}
+
 } // namespace prosper::frontend

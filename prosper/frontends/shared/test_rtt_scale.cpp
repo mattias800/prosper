@@ -11,6 +11,7 @@
 
 using prosper::frontend::rtt_integer_upscale_factor;
 using prosper::frontend::rtt_direct_import_compatible;
+using prosper::frontend::rtt_gpu_seed_import_extent_compatible;
 using prosper::frontend::rtt_sampled_extent_compatible;
 using prosper::frontend::rtt_scaled_axis;
 using prosper::frontend::rtt_scaled_extent_compatible;
@@ -19,6 +20,8 @@ using prosper::frontend::live_rtt_authority;
 using prosper::frontend::live_rtt_gpu_importable;
 using prosper::frontend::LiveRttGuestWriteEffect;
 using prosper::frontend::live_rtt_guest_write_effect;
+using prosper::frontend::live_rtt_compute_mirror_eligible;
+using prosper::frontend::live_rtt_mirror_identity_matches;
 
 static int failures = 0;
 #define CHECK(cond) do { if (!(cond)) { \
@@ -57,6 +60,9 @@ int main() {
     CHECK(rtt_direct_import_compatible(false, 1920, 1080, 960, 540, 2, true));
     CHECK(!rtt_direct_import_compatible(false, 1920, 1080, 960, 540, 2, false));
     CHECK(!rtt_direct_import_compatible(true, 1920, 1080, 1920, 1080, 1, true));
+    CHECK(rtt_gpu_seed_import_extent_compatible(1920, 1080, 1920, 1080));
+    CHECK(!rtt_gpu_seed_import_extent_compatible(1920, 1080, 960, 540));
+    CHECK(!rtt_gpu_seed_import_extent_compatible(0, 1080, 0, 1080));
 
     // Pass-local targets use nearest-integer division, so non-divisible native dimensions are still
     // valid renderer-owned images. This is common in Astro Bot's dynamic-resolution post chain.
@@ -80,6 +86,18 @@ int main() {
     CHECK(live_rtt_gpu_importable(true, true));
     CHECK(!live_rtt_gpu_importable(false, true));
     CHECK(!live_rtt_gpu_importable(false, false));
+    CHECK(live_rtt_mirror_identity_matches(
+        0x100000, 3840, 2160, 97, 0x100000, 3840, 2160, 97));
+    CHECK(!live_rtt_mirror_identity_matches(
+        0x100000, 3840, 2160, 97, 0x100000, 1920, 4320, 97));
+    CHECK(!live_rtt_mirror_identity_matches(
+        0x100000, 3840, 2160, 97, 0x100000, 3840, 2160, 37));
+    CHECK(!live_rtt_mirror_identity_matches(
+        0x100000, 3840, 2160, 97, 0x100800, 3840, 2160, 97));
+    CHECK(live_rtt_compute_mirror_eligible(true, true, false));
+    CHECK(!live_rtt_compute_mirror_eligible(false, true, false));
+    CHECK(!live_rtt_compute_mirror_eligible(true, false, false));
+    CHECK(!live_rtt_compute_mirror_eligible(true, true, true));
 
     // A compute fast-clear can touch only a target's DCC allocation. That must revoke both cached
     // pixel copies while preserving enough target identity to decode the clear. Ordinary color

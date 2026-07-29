@@ -207,9 +207,10 @@ struct ComputeShaderConfig {
     bool tgid_x_en = false, tgid_y_en = false, tgid_z_en = false;
     bool tg_size_en = false;
     uint32_t lds_bytes = 0;
-    // Non-zero only when the live backend can REQUIRE this exact Vulkan subgroup size. Complex
-    // guest-wave CFGs may then replace their portable workgroup-scratch vote/scan emulation with
-    // native subgroup operations without changing the PS5 wave domain.
+    // Non-zero only when the live backend can REQUIRE this exact Vulkan subgroup size and full
+    // compute subgroups. The shell remaps guest local coordinates into subgroup lane order, so
+    // complex guest-wave CFGs may replace portable workgroup-scratch vote/scan emulation with native
+    // subgroup operations without assuming Vulkan's LocalInvocationIndex ordering.
     uint32_t native_subgroup_size = 0;
     // Per-format VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT support published by the device-owning
     // frontend. Offline callers default to the portable raw path; live execution supplies the exact
@@ -238,10 +239,10 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          const PixelSystemInputMapping* system_inputs = nullptr,
                                          uint32_t pcrel_dispatch_target = UINT32_MAX,
                                          const FragmentInterpolationLayout* interpolation = nullptr,
-                                         uint32_t wave_size = 64);
+                                         bool wave32 = false);
 
-// Test hook for the low-half EXEC/VCC mask path. Production graphics compilation enables it only
-// for byte-exact observed Wave32 shaders until the graphics wave-mode register is carried here.
+// Test hook for the low-half EXEC/VCC mask path. Production fragment compilation supplies the same
+// mode from SPI_PS_IN_CONTROL.PS_W32_EN.
 std::vector<uint32_t> recompile_fragment_wave32_for_test(
     const uint32_t* code, size_t dwords);
 

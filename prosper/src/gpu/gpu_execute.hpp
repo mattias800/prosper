@@ -377,6 +377,7 @@ std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
                                                        const PixelInputMapping* pixel_inputs = nullptr,
                                                        const PixelSystemInputMapping* system_inputs = nullptr,
                                                        uint64_t* cache_identity = nullptr,
+                                                       bool fragment_wave32 = false,
                                                        uint32_t vertex_lds_dwords = 0);
 SharedShaderWords recompile_graphics_shader_cached_shared(
     ShaderProgramStage stage, const uint32_t* code, size_t dwords,
@@ -384,6 +385,7 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     const PixelInputMapping* pixel_inputs = nullptr,
     const PixelSystemInputMapping* system_inputs = nullptr,
     uint64_t* cache_identity = nullptr,
+    bool fragment_wave32 = false,
     uint32_t vertex_lds_dwords = 0);
 // Compute uses the same bounded content-addressed cache as graphics. Launch geometry that changes
 // generated SPIR-V participates in the key; per-dispatch push-constant values deliberately do not.
@@ -545,6 +547,9 @@ struct LiveTargetImageImport {
     void* image = nullptr;    // VkImage owned by the live renderer
     void* device = nullptr;   // VkDevice it belongs to; the caller must be running on that device
     uint32_t layout = 0;      // VkImageLayout the renderer left it in -- restore it after the dispatch
+    // Explicit image-creation contract: a sampled import is not otherwise guaranteed to carry
+    // VK_IMAGE_USAGE_TRANSFER_DST_BIT, which the compute-result mirror requires.
+    bool transfer_dst = false;
     bool valid() const { return image && device && width && height; }
 };
 struct LiveTargetImageRequest {
@@ -558,16 +563,24 @@ struct LiveTargetImageRequest {
 using LiveTargetImageImportFn = std::function<bool(
     uint64_t gpu_addr, const LiveTargetImageRequest& request, LiveTargetImageImport& import)>;
 using LiveTargetImageReleaseFn = std::function<void(uint64_t gpu_addr)>;
-using LiveTargetImageWrittenFn = std::function<void(uint64_t gpu_addr)>;
+struct LiveTargetImageWrite {
+    uint64_t gpu_addr = 0;
+    uint32_t width = 0, height = 0;
+    LiveTargetPixelFormat format = LiveTargetPixelFormat::Rgba8Unorm;
+    bool valid() const { return gpu_addr && width && height; }
+};
+using LiveTargetImageWrittenFn = std::function<void(const LiveTargetImageWrite& write)>;
 void set_live_target_image_importer(LiveTargetImageImportFn import_fn,
                                     LiveTargetImageReleaseFn release_fn);
 void set_live_target_image_written_notifier(LiveTargetImageWrittenFn written_fn);
 bool import_live_render_target_image(uint64_t gpu_addr, const LiveTargetImageRequest& request,
                                      LiveTargetImageImport& import);
 void release_live_render_target_image(uint64_t gpu_addr);
-// Publish that a borrowed renderer image was modified in place. The renderer keeps the Vulkan image
-// authoritative and discards any older CPU readback mirror; guest bytes intentionally stay deferred.
-void notify_live_render_target_image_written(uint64_t gpu_addr);
+// Publish that a borrowed renderer image received the completed compute result. The caller may also
+// have written the exact guest bytes for alias correctness; the renderer processes that normal
+// invalidation first, then re-authorizes only this exact image identity and discards an older CPU
+// readback mirror.
+void notify_live_render_target_image_written(const LiveTargetImageWrite& write);
 // Shared Vulkan device (#1091 phase 1). live_compute historically created its own VkInstance/VkDevice,
 // so a renderer-owned image could never be bound to a dispatch and had to round-trip through host
 // memory. The live renderer publishes its already-created device here; the compute backend ADOPTS it
@@ -589,12 +602,17 @@ struct SharedVulkanContext {
     bool storage_image_write_without_format = false;
     // Exact compute-wave acceleration. These describe features ENABLED on the borrowed device, not
     // merely physical support. The recompiler opts in only when the requested guest wave is inside
-    // this range and both vote and arithmetic subgroup operations are available.
+    // this range, full compute subgroups can be required, and both vote and arithmetic subgroup
+    // operations are available.
     bool compute_subgroup_size_control = false;
+    bool compute_full_subgroups = false;
     bool compute_subgroup_vote = false;
     bool compute_subgroup_arithmetic = false;
     uint32_t min_compute_subgroup_size = 0;
     uint32_t max_compute_subgroup_size = 0;
+    uint32_t max_compute_workgroup_subgroups = 0;
+    uint32_t max_compute_workgroup_size_x = 0;
+    uint32_t max_compute_workgroup_invocations = 0;
     // Vulkan-independent mask from native_storage_format_support_bit(). The renderer queries
     // optimal-tiling STORAGE_IMAGE support before publishing its physical device.
     uint32_t native_storage_format_support = 0;
@@ -610,6 +628,12 @@ struct SharedVulkanContext {
     bool present_queue_shared = false;
     bool valid() const { return instance && physical && device && queue && queue_family != UINT32_MAX; }
 };
+// Select the exact native subgroup contract only when the renderer device can actually be adopted
+// by compute and every required-subgroup workgroup bound is satisfied. `capture_bound` keeps saved
+// artifacts device-portable; `disabled` is the explicit diagnostic/compatibility opt-out.
+uint32_t select_native_compute_subgroup_size(const SharedVulkanContext& context,
+                                             const ComputeShaderConfig& config,
+                                             bool capture_bound, bool disabled);
 void set_shared_vulkan_context(const SharedVulkanContext& context);
 SharedVulkanContext shared_vulkan_context();
 
@@ -925,10 +949,11 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             vs_shared = recompile_graphics_shader_cached_shared(
                 ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
                 max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity,
-                vertex_lds_dwords);
+                false, vertex_lds_dwords);
         fs_shared = recompile_graphics_shader_cached_shared(
             ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
-            max_shader_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity);
+            max_shader_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
+            rs.ps_wave32);
     } else {
         if (vertex_chain) {
             const SharedShaderWords linked = recompile_vertex_chain_cached_shared(
@@ -940,11 +965,12 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             vs = recompile_graphics_shader_cached(
                 ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
                 max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity,
-                vertex_lds_dwords);
+                false, vertex_lds_dwords);
         }
         fs = recompile_graphics_shader_cached(
             ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
-            max_shader_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity);
+            max_shader_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
+            rs.ps_wave32);
     }
     // CB_COLOR_CONTROL.DCC_DECOMPRESS interprets the bound AGC metadata helper, rather than its
     // ordinary fragment-color export. The operation bits can remain folded into a later graphics

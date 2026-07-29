@@ -544,7 +544,11 @@ struct RenderVkCtx {
     // Geometry-probe (PROSPER_GEOM_PROBE): VK_EXT_transform_feedback for capturing gl_Position.
     bool transform_feedback_enabled = false;
     bool subgroup_size_control = false;
+    bool compute_full_subgroups = false;
     uint32_t min_subgroup_size = 0, max_subgroup_size = 0;
+    uint32_t max_compute_workgroup_subgroups = 0;
+    uint32_t max_compute_workgroup_size_x = 0;
+    uint32_t max_compute_workgroup_invocations = 0;
     VkShaderStageFlags required_subgroup_size_stages = 0;
     VkShaderStageFlags subgroup_stages = 0;
     VkSubgroupFeatureFlags subgroup_operations = 0;
@@ -654,6 +658,8 @@ inline const RenderVkCtx& render_vk_ctx() {
         // samplerAnisotropy (#275): enable only if advertised; maxSamplerAnisotropy is the clamp ceiling.
         VkPhysicalDeviceFeatures supported{}; vkGetPhysicalDeviceFeatures(r.phys, &supported);
         VkPhysicalDeviceProperties phys_props{}; vkGetPhysicalDeviceProperties(r.phys, &phys_props);
+        r.max_compute_workgroup_size_x = phys_props.limits.maxComputeWorkGroupSize[0];
+        r.max_compute_workgroup_invocations = phys_props.limits.maxComputeWorkGroupInvocations;
         r.storage_buffer_alignment = std::max<VkDeviceSize>(
             1, phys_props.limits.minStorageBufferOffsetAlignment);
         r.aniso_enabled = supported.samplerAnisotropy;
@@ -720,8 +726,11 @@ inline const RenderVkCtx& render_vk_ctx() {
                       dci.pNext = &subgroup_features;
                       dev_exts.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
                       r.subgroup_size_control = true;
+                      r.compute_full_subgroups = subgroup_features.computeFullSubgroups;
                       r.min_subgroup_size = subgroup_properties.minSubgroupSize;
                       r.max_subgroup_size = subgroup_properties.maxSubgroupSize;
+                      r.max_compute_workgroup_subgroups =
+                          subgroup_properties.maxComputeWorkgroupSubgroups;
                       r.required_subgroup_size_stages =
                           subgroup_properties.requiredSubgroupSizeStages;
                       r.subgroup_stages = subgroup_core_properties.supportedStages;
@@ -795,12 +804,17 @@ inline const RenderVkCtx& render_vk_ctx() {
             shared.compute_subgroup_size_control = r.subgroup_size_control &&
                 (r.required_subgroup_size_stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
                 (r.subgroup_stages & VK_SHADER_STAGE_COMPUTE_BIT);
+            shared.compute_full_subgroups = r.compute_full_subgroups;
             shared.compute_subgroup_vote =
                 (r.subgroup_operations & VK_SUBGROUP_FEATURE_VOTE_BIT) != 0;
             shared.compute_subgroup_arithmetic =
                 (r.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0;
             shared.min_compute_subgroup_size = r.min_subgroup_size;
             shared.max_compute_subgroup_size = r.max_subgroup_size;
+            shared.max_compute_workgroup_subgroups = r.max_compute_workgroup_subgroups;
+            shared.max_compute_workgroup_size_x = r.max_compute_workgroup_size_x;
+            shared.max_compute_workgroup_invocations =
+                r.max_compute_workgroup_invocations;
             uint32_t queue_family_count = 0;
             vkGetPhysicalDeviceQueueFamilyProperties(r.phys, &queue_family_count, nullptr);
             std::vector<VkQueueFamilyProperties> queue_families(queue_family_count);
@@ -1251,6 +1265,19 @@ inline void invalidate_persistent_color_target_guest_write(uint64_t addr, uint64
         const uint64_t target_end = bytes > UINT64_MAX - key.id ? UINT64_MAX : key.id + bytes;
         if (addr < target_end && key.id < end) target.valid = false;
     }
+}
+
+// A compute dispatch can publish both exact guest bytes and an equivalent device-local result into
+// one borrowed renderer target. Normal guest-write invalidation runs first so every overlapping alias
+// becomes stale; only the image proven to have received that result may then regain authority.
+inline bool restore_persistent_color_target_after_mirrored_write(
+    uint64_t id, uint32_t width, uint32_t height, VkFormat format) {
+    PersistentColorTargetImage* target = find_persistent_color_target(
+        id, width, height, backend_color_format(format), false);
+    if (!target || !target->image || target->layout == VK_IMAGE_LAYOUT_UNDEFINED) return false;
+    target->valid = true;
+    target->last_use = ++persistent_color_target_generation();
+    return true;
 }
 
 inline void destroy_persistent_color_target(const RenderVkCtx& ctx,

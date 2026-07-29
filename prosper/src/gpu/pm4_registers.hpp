@@ -319,6 +319,10 @@ constexpr uint32_t SPI_PS_INPUT_ENA       = 0x1B3;
 constexpr uint32_t SPI_PS_INPUT_ADDR      = 0x1B4;
 constexpr uint32_t SPI_INTERP_CONTROL_0   = 0x1B5;
 constexpr uint32_t SPI_PS_IN_CONTROL      = 0x1B6;
+// GFX10/RDNA: PS_W32_EN selects Wave32 fragment execution. Clear selects Wave64. This is the
+// authoritative mode for low-half EXEC/VCC mask instructions (AMD/LLVM S_0286D8_PS_W32_EN).
+constexpr uint32_t SPI_PS_IN_CONTROL_PS_W32_EN_SHIFT = 15;
+constexpr uint32_t SPI_PS_IN_CONTROL_PS_W32_EN_MASK  = 0x1;
 constexpr uint32_t SPI_BARYC_CNTL         = 0x1B8;
 constexpr uint32_t SPI_TMPRING_SIZE       = 0x1BA;
 constexpr uint32_t SPI_SHADER_IDX_FORMAT  = 0x1C2;

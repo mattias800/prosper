@@ -35,6 +35,7 @@ enum : uint32_t {
     Op_Load=61, Op_Store=62, Op_AccessChain=65, Op_Decorate=71, Op_MemberDecorate=72,
     Op_ConvertFToU=109, Op_ConvertFToS=110, Op_ConvertSToF=111, Op_ConvertUToF=112, Op_Bitcast=124,
     Op_CompositeConstruct=80, Op_CompositeExtract=81, Op_IAdd=128, Op_FAdd=129, Op_ISub=130, Op_FSub=131, Op_IMul=132, Op_FMul=133,
+    Op_UDiv=134, Op_UMod=137,
     Op_UMulExtended=151, Op_SMulExtended=152,   // {lo,hi} struct results (for mul_hi)
     Op_FDiv=136, Op_SMod=139, Op_IEqual=170, Op_INotEqual=171, Op_UGreaterThan=172, Op_SGreaterThan=173,
     Op_UGreaterThanEqual=174, Op_SGreaterThanEqual=175, Op_ULessThan=176, Op_SLessThan=177,
@@ -94,7 +95,7 @@ enum : uint32_t {
     Dec_DescriptorSet=34, Dec_Offset=35, Dec_XfbBuffer=36, Dec_XfbStride=37,
     BI_Position=0, BI_FragCoord=15, BI_FragDepth=22, BI_HelperInvocation=23,
     BI_WorkgroupId=26, BI_LocalInvocationId=27,
-    BI_GlobalInvocationId=28, BI_SubgroupLocalInvocationId=41,
+    BI_GlobalInvocationId=28, BI_SubgroupId=40, BI_SubgroupLocalInvocationId=41,
     BI_VertexIndex=42, BI_InstanceIndex=43,
     GroupOp_Reduce=0, GroupOp_ExclusiveScan=2,
 };
@@ -236,7 +237,7 @@ struct SpirvCompute {
     uint32_t native_storage_format_support=0;
     uint32_t compute_min_subgroup_size=0;             // non-semantic backend contract (4/16/32/64)
     uint32_t fragment_required_subgroup_size=0;       // exact guest-wave contract (currently 64)
-    uint32_t v_subgroup_localid=0, t_ptr_in_u32=0;
+    uint32_t v_subgroupid=0, v_subgroup_localid=0, t_ptr_in_u32=0;
     uint32_t v_helper_invocation=0, t_ptr_in_bool=0;
     uint32_t v_internal_gds=0, t_ptr_gds_u32=0;
     // Descriptor set for this stage's resources. VS and PS share ONE Vulkan pipeline, so they must NOT
@@ -464,8 +465,10 @@ struct SpirvCompute {
             declared_subgroup = true;
         }
         if (!v_subgroup_localid) {
-            t_ptr_in_u32 = id();
-            put(types, Op_TypePointer, {t_ptr_in_u32, SC_Input, t_u32});
+            if (!t_ptr_in_u32) {
+                t_ptr_in_u32 = id();
+                put(types, Op_TypePointer, {t_ptr_in_u32, SC_Input, t_u32});
+            }
             v_subgroup_localid = id();
             put(types, Op_Variable, {t_ptr_in_u32, v_subgroup_localid, SC_Input});
             put(deco, Op_Decorate,
@@ -500,6 +503,26 @@ struct SpirvCompute {
         put(code, Op_GroupNonUniformAny,
             {t_bool, result, uconst(Scope_Subgroup), active_bit});
         return result;
+    }
+    uint32_t subgroup_id() {
+        if (!declared_subgroup) {
+            put(caps, Op_Capability, {Cap_GroupNonUniform});
+            declared_subgroup = true;
+        }
+        if (!v_subgroupid) {
+            if (!t_ptr_in_u32) {
+                t_ptr_in_u32 = id();
+                put(types, Op_TypePointer, {t_ptr_in_u32, SC_Input, t_u32});
+            }
+            v_subgroupid = id();
+            put(types, Op_Variable, {t_ptr_in_u32, v_subgroupid, SC_Input});
+            put(deco, Op_Decorate, {v_subgroupid, Dec_BuiltIn, BI_SubgroupId});
+            put(deco, Op_Decorate, {v_subgroupid, Dec_Flat});
+            iface.push_back(v_subgroupid);
+        }
+        uint32_t subgroup = id();
+        put(code, Op_Load, {t_u32, subgroup, v_subgroupid});
+        return subgroup;
     }
     uint32_t fragment_mbcnt(uint32_t mask_bit, uint32_t acc_bits, bool lo) {
         if (!is_fragment) return 0;
@@ -1884,7 +1907,15 @@ struct SpirvCompute {
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
         is_compute = true;
         exec_model = Exec_GLCompute; iface = {v_gid, v_groupid, v_localid};   // EntryPoint deferred to finish()
-        put(exec, Op_ExecutionMode, {f_main, EM_LocalSize, local_x, local_y, local_z});
+        // REQUIRE_FULL_SUBGROUPS constrains LocalSize X, not merely the total workgroup size. The
+        // native shell never consumes Vulkan's LocalInvocationId: it reconstructs the original guest
+        // x/y/z coordinates below from the exact subgroup lane order. Declare the equivalent Vulkan
+        // workgroup flattened on X so 8x8 and other multidimensional guest waves satisfy that rule.
+        const uint32_t vulkan_local_x = native_subgroup_size ? local_count : local_x;
+        const uint32_t vulkan_local_y = native_subgroup_size ? 1u : local_y;
+        const uint32_t vulkan_local_z = native_subgroup_size ? 1u : local_z;
+        put(exec, Op_ExecutionMode,
+            {f_main, EM_LocalSize, vulkan_local_x, vulkan_local_y, vulkan_local_z});
         put(deco, Op_Decorate, {v_gid, Dec_BuiltIn, BI_GlobalInvocationId});
         put(deco, Op_Decorate, {v_groupid, Dec_BuiltIn, BI_WorkgroupId});
         put(deco, Op_Decorate, {v_localid, Dec_BuiltIn, BI_LocalInvocationId});   // wave lane index (.x)
@@ -1932,28 +1963,47 @@ struct SpirvCompute {
         put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
         put(code, Op_Label, {lbl}); cur_block = lbl;
         function_var_insert = code.size();
-        uint32_t ld = id(); put(code, Op_Load, {t_v3u, ld, v_gid});
-        for (uint32_t c = 0; c < 3; c++) {
-            globalid_comp[c] = id();
-            put(code, Op_CompositeExtract, {t_u32, globalid_comp[c], ld, c});
-        }
-        gidx = globalid_comp[0];
-        uint32_t ldl = id(); put(code, Op_Load, {t_v3u, ldl, v_localid});
-        for (uint32_t c = 0; c < 3; c++) {
-            localid_comp[c] = id();
-            put(code, Op_CompositeExtract, {t_u32, localid_comp[c], ldl, c});
-        }
-        localid = localid_comp[0];   // wave lane index
-        // Vulkan and RDNA both linearize X fastest, then Y, then Z. Keep the legacy X-only lane id
-        // for the older 64x1 wave helpers, but retain the exact linear id for 2D/3D dispatcher waves.
-        uint32_t yz = ibin(Op_IMul, localid_comp[2], uconst(local_y));
-        yz = ibin(Op_IAdd, yz, localid_comp[1]);
-        linear_localid = ibin(Op_IAdd, ibin(Op_IMul, yz, uconst(local_x)), localid_comp[0]);
         uint32_t ldg = id(); put(code, Op_Load, {t_v3u, ldg, v_groupid});
         for (uint32_t c = 0; c < 3; c++) {
             groupid[c] = id();
             put(code, Op_CompositeExtract, {t_u32, groupid[c], ldg, c});
         }
+        if (native_subgroup_size) {
+            // Vulkan does not promise that LocalInvocationIndex follows subgroup lane order.  A
+            // full, exact-size subgroup does promise that SubgroupId/SubgroupLocalInvocationId
+            // identify every workgroup invocation once, so assign guest coordinates in that order.
+            // This makes one Vulkan subgroup exactly one consecutive RDNA wave without depending on
+            // the implementation's otherwise-unspecified local-invocation mapping.
+            linear_localid = ibin(Op_IAdd,
+                ibin(Op_IMul, subgroup_id(), uconst(native_subgroup_size)),
+                subgroup_local_id());
+            localid_comp[0] = ibin(Op_UMod, linear_localid, uconst(local_x));
+            const uint32_t linear_yz = ibin(Op_UDiv, linear_localid, uconst(local_x));
+            localid_comp[1] = ibin(Op_UMod, linear_yz, uconst(local_y));
+            localid_comp[2] = ibin(Op_UDiv, linear_yz, uconst(local_y));
+            const uint32_t local_size[3] = {local_x, local_y, local_z};
+            for (uint32_t c = 0; c < 3; ++c)
+                globalid_comp[c] = ibin(Op_IAdd,
+                    ibin(Op_IMul, groupid[c], uconst(local_size[c])), localid_comp[c]);
+        } else {
+            uint32_t ld = id(); put(code, Op_Load, {t_v3u, ld, v_gid});
+            for (uint32_t c = 0; c < 3; c++) {
+                globalid_comp[c] = id();
+                put(code, Op_CompositeExtract, {t_u32, globalid_comp[c], ld, c});
+            }
+            uint32_t ldl = id(); put(code, Op_Load, {t_v3u, ldl, v_localid});
+            for (uint32_t c = 0; c < 3; c++) {
+                localid_comp[c] = id();
+                put(code, Op_CompositeExtract, {t_u32, localid_comp[c], ldl, c});
+            }
+            // Vulkan and RDNA both linearize X fastest, then Y, then Z.
+            uint32_t yz = ibin(Op_IMul, localid_comp[2], uconst(local_y));
+            yz = ibin(Op_IAdd, yz, localid_comp[1]);
+            linear_localid = ibin(
+                Op_IAdd, ibin(Op_IMul, yz, uconst(local_x)), localid_comp[0]);
+        }
+        gidx = globalid_comp[0];
+        localid = localid_comp[0];
     }
     // AGC thread-dimension mode can request a non-multiple of the shader's local size. Vulkan still
     // launches the final complete workgroup, so make its excess invocations branch directly to the
@@ -6282,6 +6332,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                          b.lor(b.fcmp(Op_FUnordNotEqual, s1, s1),
                                                b.fcmp(Op_FUnordNotEqual, s2, s2)));
                 vreg[in.dst.value] = fresult(b.sel(nan_any, min3, med));
+            } else if (in.opcode == 0x159) {                          // v_med3_u32
+                // Unsigned median of three values: max(min(a,b), min(max(a,b),c)).
+                // Astro Bot uses this to clamp a material index into [0,31] before its world-map
+                // depth prepass. VERIFIED(llvm-mc gfx1030: VOP3 0x159 = v_med3_u32).
+                const uint32_t s0 = val(in.src[0]), s1 = val(in.src[1]), s2 = val(in.src[2]);
+                const uint32_t mn = b.uext2(Glsl_UMin, s0, s1);
+                const uint32_t mx = b.uext2(Glsl_UMax, s0, s1);
+                vreg[in.dst.value] = b.uext2(Glsl_UMax, mn, b.uext2(Glsl_UMin, mx, s2));
             } else if (in.opcode == 0x151 || in.opcode == 0x154) {    // v_min3_f32 / v_max3_f32
                 // min/max of three floats (DOLL's AA-clamp PS). VERIFIED(round-trip llvm-mc gfx1010:
                 // VOP3 0x151 = v_min3_f32, 0x154 = v_max3_f32 — 0xd551…/0xd554…). NaN-aware NMin/
@@ -6846,6 +6904,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x1C: n = 1; is_store = true; break;   // buffer_store_dword
                 case 0x1D: n = 2; is_store = true; break;   // buffer_store_dwordx2
                 case 0x1E: n = 4; is_store = true; break;   // buffer_store_dwordx4
+                case 0x1F: n = 3; is_store = true; break;   // buffer_store_dwordx3 (like loads,
+                                                            // x3 sorts after x4 in this ISA)
                 case 0x4: n = 1; is_format = true; is_store = true; break;   // buffer_store_format_x
                 case 0x5: n = 2; is_format = true; is_store = true; break;   // buffer_store_format_xy
                 case 0x6: n = 3; is_format = true; is_store = true; break;   // buffer_store_format_xyz
@@ -8486,6 +8546,16 @@ bool emit_cfg_state_machine(
     const uint32_t* code, size_t dwords) {
     const bool graphics = b.is_fragment || b.is_vertex;
     if ((!b.is_compute && !graphics) || ins.empty()) return false;
+    // `safe` branches have already been proven equivalent to straight-line predication by the
+    // stage-specific analysis (fragment alpha-test wave early-outs, safe EXECZ regions, and the
+    // bounded NGG terminal export gate).  The compact SSA emitter feeds them to emit_alu, which
+    // deliberately no-ops the scalar branch while retaining the per-invocation EXEC effect.  Do the
+    // same in the CFG fallback: treating one as a basic-block terminator makes a kill-mask SCC look
+    // like an ordinary scalar boolean, even though the mask lowering intentionally poisons that
+    // cross-lane SCC.  Astro Bot's complex material PS combines both shapes and was rejected there.
+    auto linearized_branch = [&](const Rdna2Inst& in) {
+        return graphics && in.fmt == Rdna2Format::SOPP && safe.contains(in.pc);
+    };
 
     uint32_t end_pc = UINT32_MAX;
     for (const auto& in : ins) if (in.is_end) { end_pc = in.pc; break; }
@@ -8585,7 +8655,8 @@ bool emit_cfg_state_machine(
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
         }
-        if (in.fmt != Rdna2Format::SOPP || in.opcode < 0x02 || in.opcode > 0x09 ||
+        if (linearized_branch(in) || in.fmt != Rdna2Format::SOPP ||
+            in.opcode < 0x02 || in.opcode > 0x09 ||
             in.opcode == 0x03) continue;
         const uint32_t target = branch_target(in);
         if (target <= end_pc) start_set.insert(target);
@@ -8680,8 +8751,9 @@ bool emit_cfg_state_machine(
         const Rdna2Inst* terminator = nullptr;
         for (const auto& in : ins) {
             if (in.pc < lo || in.pc >= hi) continue;
-            if (in.is_end || (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 &&
-                              in.opcode <= 0x09 && in.opcode != 0x03)) {
+            if (in.is_end || (!linearized_branch(in) && in.fmt == Rdna2Format::SOPP &&
+                              in.opcode >= 0x02 && in.opcode <= 0x09 &&
+                              in.opcode != 0x03)) {
                 terminator = &in;
                 break;
             }
@@ -8750,8 +8822,8 @@ bool emit_cfg_state_machine(
                 mbcnt_event_for_pc.contains(in.pc) || append_event_for_pc.contains(in.pc) ||
                 swizzle_pcs.contains(in.pc) || mask_zero_compare_source(in) >= 0;
             conditional_block[block] = conditional_block[block] ||
-                (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x04 && in.opcode <= 0x09 &&
-                 in.opcode != 0x03);
+                (!linearized_branch(in) && in.fmt == Rdna2Format::SOPP &&
+                 in.opcode >= 0x04 && in.opcode <= 0x09 && in.opcode != 0x03);
         }
     }
     for (uint32_t first = 0; first < starts.size(); ++first) {
@@ -9052,8 +9124,9 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_mask_compare = nullptr;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi) continue;
-                if (in.is_end || (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 &&
-                                  in.opcode <= 0x09 && in.opcode != 0x03)) {
+                if (in.is_end || (!linearized_branch(in) && in.fmt == Rdna2Format::SOPP &&
+                                  in.opcode >= 0x02 && in.opcode <= 0x09 &&
+                                  in.opcode != 0x03)) {
                     block_terminator = &in;
                     break;
                 }
@@ -10504,7 +10577,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const uint32_t local_y = std::max(1u, config.local_y);
     const uint32_t local_z = std::max(1u, config.local_z);
     const uint32_t wave_size = config.wave_size == 32 ? 32u : 64u;
-    b.native_subgroup_size = config.native_subgroup_size == wave_size ? wave_size : 0u;
+    const uint64_t local_count = static_cast<uint64_t>(local_x) * local_y * local_z;
+    b.native_subgroup_size = config.native_subgroup_size == wave_size &&
+        local_count <= UINT32_MAX && local_count % wave_size == 0 ? wave_size : 0u;
     b.native_storage_format_support = config.native_storage_format_support;
     b.begin(1, rt, local_x, local_y, local_z, wave_size,
             static_cast<uint32_t>(config.user_sgprs.size()));
@@ -10782,8 +10857,7 @@ static std::vector<uint32_t> recompile_fragment_impl(
         const PixelSystemInputMapping* system_inputs,
         uint32_t pcrel_dispatch_target,
         const FragmentInterpolationLayout* interpolation,
-        uint32_t wave_size,
-        bool allow_test_wave32) {
+        uint32_t wave_size) {
     if (wave_size != 32 && wave_size != 64) return {};
     std::vector<Rdna2Inst> ins;
     const size_t program_dwords = rdna2_walk(code, dwords, ins);
@@ -10838,10 +10912,10 @@ static std::vector<uint32_t> recompile_fragment_impl(
     SpirvCompute b;
     b.wave_size = wave_size;
     b.begin_fragment(rt, color_mask);
-    // Graphics wave mode is not yet plumbed from the stage registers. Keep low-half EXEC/VCC mask
-    // semantics restricted to the complete captured Astro material shader that demonstrated the
-    // Wave32 idiom. Arbitrary graphics shaders retain the previous fail-visible rejection.
-    b.allow_b32_masks = allow_test_wave32 ||
+    // SPI_PS_IN_CONTROL.PS_W32_EN proves that EXEC_HI/VCC_HI are unused and the low-half mask
+    // operations below represent the complete wave. Keep the older byte-exact captured exception
+    // until every replay/capture producer carries the stage register into this entry point.
+    b.allow_b32_masks = wave_size == 32 ||
         (program_dwords == 3142 &&
          shader_program_hash(code, program_dwords) == 0x616dd4c0b241fbb1ull);
     // Fragment I/O value tap (PROSPER_FS_TAP=draw:pc): redirect the MRT0 colour export to the intermediate
@@ -10979,15 +11053,16 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          const PixelSystemInputMapping* system_inputs,
                                          uint32_t pcrel_dispatch_target,
                                          const FragmentInterpolationLayout* interpolation,
-                                         uint32_t wave_size) {
+                                         bool wave32) {
     return recompile_fragment_impl(code, dwords, rt, system_inputs,
-                                   pcrel_dispatch_target, interpolation, wave_size, false);
+                                   pcrel_dispatch_target, interpolation,
+                                   wave32 ? 32u : 64u);
 }
 
 std::vector<uint32_t> recompile_fragment_wave32_for_test(
         const uint32_t* code, size_t dwords) {
     return recompile_fragment_impl(code, dwords, nullptr, nullptr,
-                                   UINT32_MAX, nullptr, 32, true);
+                                   UINT32_MAX, nullptr, 32);
 }
 
 uint32_t fragment_spirv_required_subgroup_size(const std::vector<uint32_t>& spirv) {
@@ -11441,6 +11516,33 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
     uint32_t ngg_output_gate_begin = UINT32_MAX;
     uint32_t ngg_output_gate_end = 0;
     if (ngg) {
+        // A terminal compacted-output suffix may reconstruct its values from a shader-embedded
+        // constant table. Detect those loads with the same bounded PC-relative proof used by the
+        // emitter; an arbitrary external load or any buffer write must not broaden this gate.
+        PcrelTables output_tables;
+        if (b.ngg_private_lds)
+            output_tables = detect_pcrel_tables(ins, code, dwords);
+        auto scalar_output_setup = [](const Rdna2Inst& candidate) {
+            if (candidate.fmt != Rdna2Format::SOP1 &&
+                candidate.fmt != Rdna2Format::SOP2 &&
+                candidate.fmt != Rdna2Format::SOPK)
+                return false;
+            bool wrote_data = false;
+            bool safe = !instruction_may_change_exec(candidate);
+            for_each_scalar_write(candidate, [&](int base, uint32_t width) {
+                wrote_data = true;
+                safe &= base >= 0 && base + static_cast<int>(width) <= 106;
+                safe &= !scalar_write_is_b64_mask(candidate, base);
+            });
+            return wrote_data && safe;
+        };
+        auto embedded_output_load = [&](const Rdna2Inst& candidate) {
+            if (candidate.fmt != Rdna2Format::MUBUF || candidate.mubuf_lds)
+                return false;
+            const bool read_only = candidate.opcode <= 0x03u ||
+                (candidate.opcode >= 0x0cu && candidate.opcode <= 0x0fu);
+            return read_only && output_tables.mubuf.contains(candidate.pc);
+        };
         uint32_t end_pc = UINT32_MAX;
         for (const auto& in : ins)
             if (in.is_end) { end_pc = in.pc; break; }
@@ -11475,10 +11577,11 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
                     continue;
                 }
                 // Astro's compacted-output suffix reconstructs the surviving vertex from private
-                // LDS immediately before exporting it (VOP address setup + DS reads). These remain
-                // inside the same CMPX/EXECZ-to-ENDPGM gate and their register writes are already
-                // EXEC-predicated by emit_alu. Admit them only for the byte-exact wrapper (or the
-                // explicit test hook); ordinary NGG shaders never reach this exception.
+                // LDS or a bounded shader-embedded table immediately before exporting it. Vector,
+                // DS, and table-load destination writes are EXEC-predicated by emit_alu; scalar ALU
+                // may only build ordinary data/descriptor registers. Admit them only for the
+                // byte-exact wrapper (or the explicit test hook); arbitrary NGG shaders never reach
+                // this exception, and buffer stores/external reads remain rejected.
                 const bool output_rebuild = b.ngg_private_lds || allow_test_ngg_output_gate;
                 if (output_rebuild &&
                     (candidate.fmt == Rdna2Format::VOP1 ||
@@ -11487,7 +11590,9 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
                      candidate.fmt == Rdna2Format::VOP3P ||
                      (candidate.fmt == Rdna2Format::VOPC &&
                       !vopc_is_cmpx(candidate.opcode)) ||
-                     candidate.fmt == Rdna2Format::DS))
+                     candidate.fmt == Rdna2Format::DS ||
+                     scalar_output_setup(candidate) ||
+                     embedded_output_load(candidate)))
                     continue;
                 if (candidate.fmt == Rdna2Format::SOPC) continue;
                 if (sopp_is_noop(candidate)) continue;

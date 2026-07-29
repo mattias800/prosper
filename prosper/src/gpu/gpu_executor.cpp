@@ -160,6 +160,7 @@ struct ShaderCompileKey {
     PixelInputMapping pixel_inputs{};
     bool has_system_inputs = false;
     PixelSystemInputMapping system_inputs{};
+    bool fragment_wave32 = false;
     bool has_pcrel_dispatch = false;
     uint32_t pcrel_dispatch_target = UINT32_MAX;
     // Compute modules also depend on launch ABI shape. User SGPR VALUES are push constants and stay
@@ -203,6 +204,7 @@ struct ShaderCompileKey {
                pixel_inputs == other.pixel_inputs &&
                has_system_inputs == other.has_system_inputs &&
                system_inputs == other.system_inputs &&
+               fragment_wave32 == other.fragment_wave32 &&
                has_pcrel_dispatch == other.has_pcrel_dispatch &&
                pcrel_dispatch_target == other.pcrel_dispatch_target &&
                has_compute_config == other.has_compute_config &&
@@ -263,6 +265,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, key.system_inputs.ena);
             hash = hash_mix(hash, key.system_inputs.addr);
         }
+        hash = hash_mix(hash, key.fragment_wave32);
         hash = hash_mix(hash, key.has_pcrel_dispatch);
         if (key.has_pcrel_dispatch) hash = hash_mix(hash, key.pcrel_dispatch_target);
         hash = hash_mix(hash, key.has_compute_config);
@@ -846,7 +849,8 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                                          const uint32_t* chain_code = nullptr,
                                          size_t chain_dwords = 0,
                                          uint32_t vertex_lds_dwords = 0,
-                                         const ComputeShaderConfig* compute_config = nullptr) {
+                                         const ComputeShaderConfig* compute_config = nullptr,
+                                         bool fragment_wave32 = false) {
     ShaderCompileKey key;
     key.stage = stage;
     key.vertex_lds_dwords = stage == ShaderProgramStage::Vertex
@@ -859,6 +863,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
     if (key.has_pixel_inputs) key.pixel_inputs = *pixel_inputs;
     key.has_system_inputs = stage == ShaderProgramStage::Fragment && system_inputs != nullptr;
     if (key.has_system_inputs) key.system_inputs = *system_inputs;
+    key.fragment_wave32 = stage == ShaderProgramStage::Fragment && fragment_wave32;
     key.has_compute_config = stage == ShaderProgramStage::Compute && compute_config;
     if (key.has_compute_config) {
         key.compute_user_sgpr_count = static_cast<uint32_t>(compute_config->user_sgprs.size());
@@ -983,7 +988,7 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
         return recompile_fragment(code, code_size, resources,
                                   key.has_system_inputs ? &key.system_inputs : nullptr,
                                   key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX,
-                                  &interpolation);
+                                  &interpolation, key.fragment_wave32);
     }
     return {};
 }
@@ -1192,10 +1197,11 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
         ShaderProgramStage stage, const uint32_t* code, size_t dwords,
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
         const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity,
-        uint32_t vertex_lds_dwords) {
+        bool fragment_wave32, uint32_t vertex_lds_dwords) {
     ShaderCompileKey key = make_shader_compile_key(stage, code, dwords, resources, pixel_inputs,
                                                    system_inputs, nullptr, 0,
-                                                   vertex_lds_dwords);
+                                                   vertex_lds_dwords, nullptr,
+                                                   fragment_wave32);
     return cache_compiled_graphics_shader(stage, std::move(key), resources, cache_identity);
 }
 
@@ -1219,10 +1225,10 @@ std::vector<uint32_t> recompile_graphics_shader_cached(
         ShaderProgramStage stage, const uint32_t* code, size_t dwords,
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
         const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity,
-        uint32_t vertex_lds_dwords) {
+        bool fragment_wave32, uint32_t vertex_lds_dwords) {
     SharedShaderWords words = recompile_graphics_shader_cached_shared(
         stage, code, dwords, resources, pixel_inputs, system_inputs, cache_identity,
-        vertex_lds_dwords);
+        fragment_wave32, vertex_lds_dwords);
     return words ? *words : std::vector<uint32_t>{};
 }
 
@@ -2199,7 +2205,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // live at the instruction and resolves by exact pc, avoiding a duplicate stale SRT use.
                 const bool raw_buffer_use = !is_mtbuf &&
                     ((in.opcode >= 0x08 && in.opcode <= 0x0F) ||
-                     (in.opcode >= 0x1C && in.opcode <= 0x1E));
+                     (in.opcode >= 0x1C && in.opcode <= 0x1F));
                 const bool format_store_use = in.opcode >= 0x04 && in.opcode <= 0x07;
                 const bool atomic_buffer_use = in.opcode == 0x38; // buffer_atomic_umax
                 if (srt_uses && (format_store_use || raw_buffer_use || atomic_buffer_use)) {
@@ -3673,23 +3679,19 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // Realized captures store SPIR-V but not enough raw compute launch state to recompile a
         // device-specific typed-storage module on replay. Compile capture-bound dispatches through
         // the portable raw-uvec4 path so optional format support never becomes an artifact ABI.
-        if (std::getenv("PROSPER_GPU_CAPTURE") ||
+        const bool capture_bound = std::getenv("PROSPER_GPU_CAPTURE") ||
             std::getenv("PROSPER_GPU_TIMELINE_CAPTURE") ||
-            interactive_gpu_capture_armed() || interactive_capture_bundle_active())
+            interactive_gpu_capture_armed() || interactive_capture_bundle_active();
+        if (capture_bound)
             config.native_storage_format_support = 0;
-        // RequiredSubgroupSize fixes only the subgroup WIDTH. Vulkan deliberately does not promise
-        // that SubgroupLocalInvocationId is LocalInvocationIndex modulo that width, so using native
-        // lane IDs for RDNA MBCNT/EXEC/VCC would silently change guest wave membership on a
-        // conforming implementation. Keep the portable emulation by default. This opt-in exists for
-        // driver experiments whose contiguous mapping has been validated externally; it is not a
-        // portable correctness contract.
-        if (getenv("PROSPER_ASSUME_CONTIGUOUS_COMPUTE_SUBGROUPS") &&
-            !getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") &&
-            shared_vulkan.compute_subgroup_size_control &&
-            shared_vulkan.compute_subgroup_vote && shared_vulkan.compute_subgroup_arithmetic &&
-            config.wave_size >= shared_vulkan.min_compute_subgroup_size &&
-            config.wave_size <= shared_vulkan.max_compute_subgroup_size)
-            config.native_subgroup_size = config.wave_size;
+        // Full exact-size subgroups let the translator assign guest local coordinates in
+        // SubgroupId/SubgroupLocalInvocationId order. That avoids assuming any relationship between
+        // Vulkan's implementation-defined LocalInvocationIndex order and subgroup lane order while
+        // still making each native subgroup exactly one RDNA wave. Captures remain portable until
+        // their schema records the required-subgroup/full-subgroup pipeline contract.
+        config.native_subgroup_size = select_native_compute_subgroup_size(
+            shared_vulkan, config, capture_bound,
+            getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") != nullptr);
         config.tgid_x_en = tgid_x_en;
         config.tgid_y_en = tgid_y_en;
         config.tgid_z_en = tgid_z_en;
@@ -4902,12 +4904,46 @@ bool import_live_render_target_image(uint64_t gpu_addr, const LiveTargetImageReq
 void release_live_render_target_image(uint64_t gpu_addr) {
     if (g_live_target_image_release) g_live_target_image_release(gpu_addr);
 }
-void notify_live_render_target_image_written(uint64_t gpu_addr) {
-    if (g_live_target_image_written) g_live_target_image_written(gpu_addr);
+void notify_live_render_target_image_written(const LiveTargetImageWrite& write) {
+    if (g_live_target_image_written && write.valid()) g_live_target_image_written(write);
 }
 static SharedVulkanContext g_shared_vulkan;
 void set_shared_vulkan_context(const SharedVulkanContext& context) { g_shared_vulkan = context; }
 SharedVulkanContext shared_vulkan_context() { return g_shared_vulkan; }
+
+uint32_t select_native_compute_subgroup_size(const SharedVulkanContext& context,
+                                             const ComputeShaderConfig& config,
+                                             bool capture_bound, bool disabled) {
+    const bool adoptable = context.valid() && context.compute_queue_supported &&
+        context.storage_image_read_without_format &&
+        context.storage_image_write_without_format;
+    if (capture_bound || disabled || !adoptable ||
+        !context.compute_subgroup_size_control || !context.compute_full_subgroups ||
+        !context.compute_subgroup_vote || !context.compute_subgroup_arithmetic ||
+        !context.max_compute_workgroup_subgroups || !context.max_compute_workgroup_size_x ||
+        !context.max_compute_workgroup_invocations || !config.local_x || !config.local_y ||
+        !config.local_z || (config.wave_size != 32u && config.wave_size != 64u) ||
+        config.wave_size < context.min_compute_subgroup_size ||
+        config.wave_size > context.max_compute_subgroup_size)
+        return 0;
+
+    // The native shader declares a flattened LocalSize=(guest X*Y*Z,1,1), then reconstructs the
+    // guest 3D local/global IDs from SubgroupId/SubgroupLocalInvocationId. Besides avoiding any
+    // implementation-defined lane ordering, this makes Vulkan's REQUIRE_FULL_SUBGROUPS X-dimension
+    // rule explicit. Keep the multiplication and maxComputeWorkgroupSubgroups bound overflow-safe.
+    const uint64_t xy = static_cast<uint64_t>(config.local_x) * config.local_y;
+    if (xy > UINT64_MAX / config.local_z) return 0;
+    const uint64_t local_invocations = xy * config.local_z;
+    const uint64_t subgroup_capacity = static_cast<uint64_t>(config.wave_size) *
+        context.max_compute_workgroup_subgroups;
+    if (local_invocations % config.wave_size != 0 ||
+        local_invocations > subgroup_capacity ||
+        local_invocations > context.max_compute_workgroup_size_x ||
+        local_invocations > context.max_compute_workgroup_invocations ||
+        local_invocations > UINT32_MAX)
+        return 0;
+    return config.wave_size;
+}
 
 // Present unification (#1270): see gpu_execute.hpp. The atomic gates the lock so the common (headless /
 // non-shared / app-not-yet-adopted) path pays only a single acquire load and takes no lock. Set true

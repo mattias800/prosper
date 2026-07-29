@@ -147,6 +147,7 @@ jobs:
           fi
 
       - name: Package Windows app
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         run: |
           $stage = Join-Path $env:RUNNER_TEMP 'prosper-windows-x64'
@@ -165,6 +166,7 @@ jobs:
           "$hash  prosper-windows-x64.zip" | Set-Content "$zip.sha256" -Encoding ascii
 
       - name: Upload Windows app
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
         with:
           name: prosper-windows-x64

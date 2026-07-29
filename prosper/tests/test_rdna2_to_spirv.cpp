@@ -49,6 +49,34 @@ static size_t count_spirv_opcode(const std::vector<uint32_t>& spv, uint16_t opco
     }
     return matches;
 }
+static bool has_spirv_builtin(const std::vector<uint32_t>& spv, uint32_t builtin) {
+    constexpr uint16_t OpDecorate = 71;
+    constexpr uint32_t DecorationBuiltIn = 11;
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        if (!count || word + count > spv.size()) return false;
+        if ((spv[word] & 0xFFFFu) == OpDecorate && count >= 4 &&
+            spv[word + 2] == DecorationBuiltIn && spv[word + 3] == builtin)
+            return true;
+        word += count;
+    }
+    return false;
+}
+static bool has_spirv_local_size(const std::vector<uint32_t>& spv,
+                                 uint32_t x, uint32_t y, uint32_t z) {
+    constexpr uint16_t OpExecutionMode = 16;
+    constexpr uint32_t ExecutionModeLocalSize = 17;
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        if (!count || word + count > spv.size()) return false;
+        if ((spv[word] & 0xFFFFu) == OpExecutionMode && count == 6 &&
+            spv[word + 2] == ExecutionModeLocalSize && spv[word + 3] == x &&
+            spv[word + 4] == y && spv[word + 5] == z)
+            return true;
+        word += count;
+    }
+    return false;
+}
 
 int main() {
     printf("== test_rdna2_to_spirv ==\n");
@@ -132,6 +160,31 @@ int main() {
     uint32_t bad4 = 0; for (uint32_t i=0;i<N&&got4.size()==N;i++) if (std::fabs(got4[i]-exp4[i])>1e-3f) bad4++;
     printf("  kernel4 mismatches=%u (out[60]=%g expect=%g)\n", bad4, got4.size()==N?got4[60]:-1, exp4[60]);
     CHECK(got4.size()==N && bad4==0, "recompiled kernel 4 computes ceil(median(a0,a1,a2)) correctly");
+
+    // Kernel 4b: unsigned median-of-three. Convert the float harness inputs to u32, find the
+    // median, and convert it back so all six input orderings are checked by real Vulkan execution.
+    const uint32_t code4b[] = {
+        0x7E000F00u, 0x7E020F01u, 0x7E040F02u, 0xD5590003u, 0x040A0300u,
+        0x7E000D03u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv4b = recompile_valu(code4b, std::size(code4b), 3, 0);
+    CHECK(!spv4b.empty(), "recompiled kernel 4b (v_med3_u32) -> SPIR-V");
+    std::vector<float> in4b(N * 3), exp4b(N);
+    for (uint32_t i = 0; i < N; i++) {
+        const uint32_t u0 = (i * 37u) % 211u;
+        const uint32_t u1 = (i * 83u + 17u) % 211u;
+        const uint32_t u2 = (i * 19u + 101u) % 211u;
+        in4b[i*3+0] = (float)u0; in4b[i*3+1] = (float)u1; in4b[i*3+2] = (float)u2;
+        const uint32_t mn = std::min(u0, u1), mx = std::max(u0, u1);
+        exp4b[i] = (float)std::max(mn, std::min(mx, u2));
+    }
+    std::vector<float> got4b = prosper::test::run_compute(spv4b, in4b, N, N);
+    uint32_t bad4b = 0;
+    for (uint32_t i = 0; i < N && got4b.size() == N; i++)
+        if (got4b[i] != exp4b[i]) bad4b++;
+    printf("  kernel4b mismatches=%u (out[60]=%g expect=%g)\n",
+           bad4b, got4b.size()==N ? got4b[60] : -1, exp4b[60]);
+    CHECK(got4b.size()==N && bad4b==0, "recompiled kernel 4b computes unsigned median correctly");
 
     // Kernel 5: unsigned min/max/sub/not/and. u=(uint)a; d=(max-min) & ~u0. out=(float)d.
     const uint32_t code5[] = {
@@ -514,7 +567,8 @@ int main() {
     CHECK(got17d.size()==N && bad17d==0,
           "CFG dispatcher emulates a 64-lane wave across narrower Vulkan subgroups");
     ComputeShaderConfig native_cfg17d;
-    native_cfg17d.local_x = 64;
+    native_cfg17d.local_x = 8;
+    native_cfg17d.local_y = 8;
     native_cfg17d.wave_size = 64;
     native_cfg17d.native_subgroup_size = 64;
     const std::vector<uint32_t> native_spv17d = recompile_compute(
@@ -523,6 +577,13 @@ int main() {
           "exact-wave CFG dispatcher lowers votes and liveness to native subgroup-any");
     CHECK(count_spirv_opcode(native_spv17d, 224) == 0,
           "exact-wave CFG dispatcher emits no workgroup control barrier");
+    CHECK(has_spirv_builtin(native_spv17d, 40) &&
+              has_spirv_builtin(native_spv17d, 41) &&
+              count_spirv_opcode(native_spv17d, 134) >= 2 &&
+              count_spirv_opcode(native_spv17d, 137) >= 2,
+          "exact-wave compute remaps local coordinates in full-subgroup lane order");
+    CHECK(has_spirv_local_size(native_spv17d, 64, 1, 1),
+          "multidimensional guest wave flattens Vulkan LocalSize X for full subgroups");
 
     // Kernel 17d2: Astro's mask-priority sequence compares a VOPC-produced SGPR pair against zero,
     // then uses that wave-uniform SCC in s_cselect_b64.  Keep the irreducible prefix so this exercises
@@ -1337,6 +1398,32 @@ int main() {
     { float f5 = 0; if (stored_out.size()==N) std::memcpy(&f5, &stored_out[5], 4);
       printf("  kernel29 mismatches=%u (buf[5]=%g expect=10)\n", bad29, f5); }
     CHECK(stored_out.size() == N && bad29 == 0, "recompiled kernel 29 (MUBUF store writes buffer[gid]=2*gid) correct");
+
+    // Astro Bot world-map PS exact final MUBUF packet. Every lane writes three consecutive raw
+    // dwords to one 12-byte record, proving both the unusual x3 component count and IDXEN stride.
+    const uint32_t code29x3[] = {
+        0x7e140f00u,                         // v10 = (uint)v0 = invocation index
+        0x7e060281u, 0x7e080282u, 0x7e0a0283u, // v3/v4/v5 = 1/2/3
+        0xe07c2000u, 0x8004030au,           // exact Astro buffer_store_dwordx3 packet
+        0xbf810000u,
+    };
+    ShaderResourceTable rt29x3;
+    { ShaderResource dst{}; dst.cls = ResourceClass::ConstantBuffer;
+      dst.format = DataFormat::Uint32; dst.num_components = 1;
+      dst.binding = 3; dst.stride = 12; dst.sgpr_base = 16;
+      rt29x3.resources.push_back(dst); }
+    std::vector<uint32_t> spv29x3 = recompile_valu(
+        code29x3, std::size(code29x3), 1, 0, &rt29x3);
+    CHECK(!spv29x3.empty(),
+          "recompiled exact Astro buffer_store_dwordx3 packet -> SPIR-V");
+    std::vector<uint32_t> stored29x3(N * 3, 0u), stored29x3_out;
+    prosper::test::run_compute(spv29x3, in29, N, N, {}, stored29x3, &stored29x3_out);
+    uint32_t bad29x3 = 0;
+    for (uint32_t lane = 0; lane < N && stored29x3_out.size() == N * 3; ++lane)
+        for (uint32_t component = 0; component < 3; ++component)
+            bad29x3 += stored29x3_out[lane * 3 + component] != component + 1;
+    CHECK(stored29x3_out.size() == N * 3 && bad29x3 == 0,
+          "buffer_store_dwordx3 writes all three dwords of every indexed record");
 
     const uint32_t code29mt[] = {
         0x7e040f00u, 0x06060100u, 0xe8b42000u, 0x80020302u, 0xbf810000u,
