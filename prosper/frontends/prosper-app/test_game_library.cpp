@@ -31,6 +31,9 @@ static int fails = 0;
 //   /games/PPSA13579-app0   metadata, NO icon           -> "Blasphemous 2"
 //   /games/PPSA00001-app0   eboot only, no param.json   -> falls back to the directory name
 //   /games/PPSA00002-app0   param.json with no titleName-> falls back to the directory name
+//   /games/PPSA00003-app0   titleName "astro bot"       -> pins the case-insensitive sort
+//   /games/PPSA00004-app0   titleName "Same Name"       -> pins the content-id tie-break
+//   /games/PPSA00005-app0   titleName "Same Name"       -> ...its partner
 //   /games/notes            not a title                 -> skipped
 //   /games/loose.txt        a file                      -> skipped
 static const std::set<std::string> kDirs = {
@@ -39,6 +42,9 @@ static const std::set<std::string> kDirs = {
     "/games/PPSA13579-app0", "/games/PPSA13579-app0/sce_sys",
     "/games/PPSA00001-app0",
     "/games/PPSA00002-app0", "/games/PPSA00002-app0/sce_sys",
+    "/games/PPSA00003-app0", "/games/PPSA00003-app0/sce_sys",
+    "/games/PPSA00004-app0", "/games/PPSA00004-app0/sce_sys",
+    "/games/PPSA00005-app0", "/games/PPSA00005-app0/sce_sys",
     "/games/notes",
     "/empty",
 };
@@ -49,12 +55,16 @@ static const std::set<std::string> kFiles = {
     "/games/PPSA13579-app0/sce_sys/param.json",
     "/games/PPSA00001-app0/eboot.bin",
     "/games/PPSA00002-app0/sce_sys/param.json",
+    "/games/PPSA00003-app0/sce_sys/param.json",
+    "/games/PPSA00004-app0/sce_sys/param.json",
+    "/games/PPSA00005-app0/sce_sys/param.json",
     "/games/notes/readme.txt",
     "/games/loose.txt",
 };
 static const std::map<std::string, std::vector<std::string>> kChildren = {
     {"/games", {"PPSA13579-app0", "notes", "PPSA24651-app0", "loose.txt", "PPSA00001-app0",
-                "PPSA00002-app0"}},   // deliberately unsorted
+                "PPSA00002-app0", "PPSA00005-app0", "PPSA00003-app0", "PPSA00004-app0"}},
+    // ^ deliberately unsorted, and PPSA00005 deliberately before the two it ties with
     {"/empty", {}},
 };
 // Real shape: defaultLanguage plus several localized entries, the wanted one NOT first.
@@ -87,6 +97,26 @@ static const std::string kPluckyJson = R"({
     }
 })";
 static const std::string kNoNameJson = R"({ "titleId": "PPSA00002" })";
+// Lowercase display name: sorts FIRST case-insensitively but LAST by raw bytes ('a' = 0x61 > 'T'),
+// so this is what pins the fold in game_entry_display_less.
+static const std::string kLowerJson = R"({ "titleId": "PPSA00003", "titleName": "astro bot" })";
+// Two titles sharing a display name, to pin the content-id tie-break.
+static const std::string kTieAJson = R"({ "titleId": "PPSA00004", "titleName": "Same Name" })";
+static const std::string kTieBJson = R"({ "titleId": "PPSA00005", "titleName": "Same Name" })";
+// defaultLanguage's own object carries NO titleName. This distinguishes a BOUNDED lookup from an
+// unbounded one: searching forward from the en-US key with no limit finds fr-FR's name ("After"),
+// whereas bounding the lookup to en-US's own object finds nothing there and falls back to the first
+// name in localizedParameters ("Before"). The bounded result is the deterministic one — document order
+// rather than "whichever language happens to follow the default key".
+static const std::string kMissingNameJson = R"({
+    "titleId": "PPSA00006",
+    "localizedParameters": {
+        "de-DE": { "titleName": "Before" },
+        "defaultLanguage": "en-US",
+        "en-US": { "someOtherField": 1 },
+        "fr-FR": { "titleName": "After" }
+    }
+})";
 
 static GamePathProbe fake_probe() {
     GamePathProbe p;
@@ -104,6 +134,9 @@ static GameLibraryIo fake_io() {
         if (p == "/games/PPSA24651-app0/sce_sys/param.json") return kMessengerJson;
         if (p == "/games/PPSA13579-app0/sce_sys/param.json") return kBlasphemousJson;
         if (p == "/games/PPSA00002-app0/sce_sys/param.json") return kNoNameJson;
+        if (p == "/games/PPSA00003-app0/sce_sys/param.json") return kLowerJson;
+        if (p == "/games/PPSA00004-app0/sce_sys/param.json") return kTieAJson;
+        if (p == "/games/PPSA00005-app0/sce_sys/param.json") return kTieBJson;
         return "";
     };
     return io;
@@ -148,8 +181,21 @@ int main() {
           "a defaultLanguage with no matching object falls back to the first titleName");
     CHECK(parse_param_title_name("{\"titleName\": \"Quote \\\" and backslash \\\\ here\"}")
               == "Quote \" and backslash \\ here",
-          "escaped quotes and backslashes are unescaped");
+          "escaped quotes and backslashes are unescaped (\\n etc. are NOT interpreted)");
     CHECK(parse_param_title_name("{\"titleName\":\"\"}").empty(), "an empty titleName reads as empty");
+    // Bounded to defaultLanguage's OWN object. A dump whose default language carries no titleName is
+    // malformed; showing some real name still beats showing a content-id directory, so the documented
+    // fallback applies — but it must be the deterministic document-order one, not whatever language
+    // happens to sit after the default key. An unbounded search would answer "After" here.
+    CHECK(parse_param_title_name(kMissingNameJson) == "Before",
+          "#1471: an empty defaultLanguage object falls back in document order, not to the next "
+          "language after it");
+    // A language-keyed object OUTSIDE localizedParameters must not be mistaken for a title entry.
+    CHECK(parse_param_title_name(
+              "{\"share\":{\"en-US\":{\"titleName\":\"Share Blurb\"}},"
+              "\"localizedParameters\":{\"defaultLanguage\":\"en-US\","
+              "\"en-US\":{\"titleName\":\"Real Title\"}}}") == "Real Title",
+          "#1471: lookups are anchored inside localizedParameters");
 
     // --- path_basename --------------------------------------------------------------------------
     CHECK(path_basename("/games/PPSA24651-app0") == "PPSA24651-app0", "basename of a path");
@@ -161,21 +207,26 @@ int main() {
     const GamePathProbe probe = fake_probe();
     const GameLibraryIo io = fake_io();
     const std::vector<GameEntry> games = scan_game_library("/games", probe, io);
-    CHECK(games.size() == 4, "exactly the four titles are found (non-titles and files skipped)");
-    if (games.size() == 4) {
-        // Display order is case-insensitive by name: Blasphemous 2, PPSA00001-app0, PPSA00002-app0,
-        // The Messenger. Note this proves list_dir's order does not leak through.
-        CHECK(games[0].title_name == "Blasphemous 2", "sorted by display name (1st)");
-        CHECK(games[1].title_name == "PPSA00001-app0", "a title with no param.json falls back to its directory name");
-        CHECK(games[2].title_name == "PPSA00002-app0", "a title with no titleName falls back to its directory name");
-        CHECK(games[3].title_name == "The Messenger", "sorted by display name (last)");
+    CHECK(games.size() == 7, "exactly the seven titles are found (non-titles and files skipped)");
+    if (games.size() == 7) {
+        // Case-insensitive display order: astro bot, Blasphemous 2, PPSA00001, PPSA00002, Same Name
+        // (PPSA00004), Same Name (PPSA00005), The Messenger. Two things are pinned here that a raw
+        // byte sort would get wrong: "astro bot" leads despite 'a' > 'T', and the tie between the two
+        // "Same Name" entries breaks on content id even though list_dir returned PPSA00005 first.
+        CHECK(games[0].title_name == "astro bot", "the sort folds case ('astro bot' leads, not trails)");
+        CHECK(games[1].title_name == "Blasphemous 2", "sorted by display name");
+        CHECK(games[2].title_name == "PPSA00001-app0", "a title with no param.json falls back to its directory name");
+        CHECK(games[3].title_name == "PPSA00002-app0", "a title with no titleName falls back to its directory name");
+        CHECK(games[4].title_id == "PPSA00004" && games[5].title_id == "PPSA00005",
+              "equal display names break the tie on content id, not on list_dir order");
+        CHECK(games[6].title_name == "The Messenger", "sorted by display name (last)");
 
-        CHECK(games[3].app0_root == "/games/PPSA24651-app0", "app0 root is what boot_program wants");
-        CHECK(games[3].title_id == "PPSA24651", "content id captured");
-        CHECK(games[3].icon_path == "/games/PPSA24651-app0/sce_sys/icon0.png", "icon located");
-        CHECK(games[0].icon_path.empty(), "a title with no icon0.png reports no icon, not a bad path");
-        CHECK(games[1].title_id.empty(), "no param.json means no content id");
-        CHECK(games[2].title_id == "PPSA00002", "content id survives a missing titleName");
+        CHECK(games[6].app0_root == "/games/PPSA24651-app0", "app0 root is what boot_program wants");
+        CHECK(games[6].title_id == "PPSA24651", "content id captured");
+        CHECK(games[6].icon_path == "/games/PPSA24651-app0/sce_sys/icon0.png", "icon located");
+        CHECK(games[1].icon_path.empty(), "a title with no icon0.png reports no icon, not a bad path");
+        CHECK(games[2].title_id.empty(), "no param.json means no content id");
+        CHECK(games[3].title_id == "PPSA00002", "content id survives a missing titleName");
     }
 
     // --- scan_game_library: what must NOT happen ------------------------------------------------
@@ -186,9 +237,32 @@ int main() {
     // pointing this at a single app0 folder yields nothing rather than one oddly-named entry.
     CHECK(scan_game_library("/games/PPSA24651-app0", probe, io).empty(),
           "a title root used as the games dir yields nothing (children only)");
-    CHECK(scan_game_library("/games/", probe, io).size() == 4, "a trailing separator is tolerated");
+    CHECK(scan_game_library("/games/", probe, io).size() == 7, "a trailing separator is tolerated");
     const GameLibraryIo empty_io;
     CHECK(scan_game_library("/games", probe, empty_io).empty(), "an unpopulated io scans nothing");
+
+    // --- describe_game: the recorded icon path must be one that opens -----------------------------
+    {
+        GamePathProbe casey;                      // accepts the icon only via a case correction
+        casey.is_dir  = [](const std::string& d) { return d == "/g/T-app0"; };
+        casey.is_file = [](const std::string& f) {
+            return f == "/g/T-app0/SCE_SYS/ICON0.PNG" || f == "/g/T-app0/sce_sys/icon0.png";
+        };
+        GameLibraryIo casey_io;
+        casey_io.read_file = [](const std::string&) { return std::string(); };
+        casey_io.resolve_case = [](const std::string& want) {
+            return want == "/g/T-app0/sce_sys/icon0.png" ? std::string("/g/T-app0/SCE_SYS/ICON0.PNG")
+                                                         : want;
+        };
+        CHECK(prosper::frontend::describe_game("/g/T-app0", casey, casey_io).icon_path ==
+                  "/g/T-app0/SCE_SYS/ICON0.PNG",
+              "icon_path records the real on-disk spelling, not the requested one");
+        GameLibraryIo plain_io;
+        plain_io.read_file = [](const std::string&) { return std::string(); };
+        CHECK(prosper::frontend::describe_game("/g/T-app0", casey, plain_io).icon_path ==
+                  "/g/T-app0/sce_sys/icon0.png",
+              "with no resolver the requested path is recorded unchanged");
+    }
 
     // --- config parsing -------------------------------------------------------------------------
     CHECK(parse_app_config("games_dir = /games").games_dir == "/games", "a setting is read");
@@ -199,6 +273,10 @@ int main() {
     CHECK(parse_app_config("games_dir = /a\ngames_dir = /b").games_dir == "/b", "a later duplicate wins");
     CHECK(parse_app_config("future_key = 1\ngames_dir = /games").games_dir == "/games",
           "an unknown key does not break parsing");
+    CHECK(parse_app_config("future_key = 1").unknown_lines.size() == 1,
+          "an unknown key is retained rather than discarded");
+    CHECK(parse_app_config("games_dir = /g").unknown_lines.empty(),
+          "a known key is not also retained as unknown");
     CHECK(parse_app_config("games_dir = /my games/ps5 = final # 1").games_dir == "/my games/ps5 = final # 1",
           "the value is literal after the first = (spaces, =, and # all survive)");
     CHECK(parse_app_config("").games_dir.empty(), "an empty file sets nothing");
@@ -212,6 +290,18 @@ int main() {
           "serialize -> parse round-trips a path with spaces");
     CHECK(parse_app_config(serialize_app_config(AppConfig{})).games_dir.empty(),
           "an unset config round-trips as unset");
+    // --set-games-dir rewrites the whole file, so a key a NEWER build stored (stage 2 will add some)
+    // must survive being read and written by an older one. Without unknown_lines this silently
+    // deletes the user's other settings.
+    {
+        const AppConfig newer = parse_app_config("games_dir = /old\nui_scale = 1.5\n");
+        AppConfig rewritten = newer;
+        rewritten.games_dir = "/new";
+        const AppConfig after = parse_app_config(serialize_app_config(rewritten));
+        CHECK(after.games_dir == "/new", "a rewrite updates the setting it owns");
+        CHECK(after.unknown_lines.size() == 1 && after.unknown_lines[0] == "ui_scale = 1.5",
+              "a rewrite preserves a setting this build does not understand");
+    }
 
     // --- precedence -----------------------------------------------------------------------------
     AppConfig from_file; from_file.games_dir = "/from-file";

@@ -12,11 +12,17 @@
 // stays in main.cpp.
 
 #include <string>
+#include <vector>
 
 namespace prosper::frontend {
 
 struct AppConfig {
     std::string games_dir;   // "" = not set
+
+    // Settings this build does not understand, kept verbatim so a round trip does not destroy them.
+    // Reading tolerating unknown keys is not enough on its own: --set-games-dir rewrites the whole
+    // file, so without this a release build would silently delete whatever a newer build had stored.
+    std::vector<std::string> unknown_lines;
 };
 
 // Trim ASCII spaces and tabs from both ends.
@@ -44,6 +50,7 @@ inline AppConfig parse_app_config(const std::string& text) {
         const std::string key = config_trim(line.substr(0, eq));
         const std::string value = config_trim(line.substr(eq + 1));
         if (key == "games_dir") cfg.games_dir = value;
+        else cfg.unknown_lines.push_back(line);   // preserved across a rewrite
         if (nl == text.size()) break;
     }
     return cfg;
@@ -51,9 +58,11 @@ inline AppConfig parse_app_config(const std::string& text) {
 
 inline std::string serialize_app_config(const AppConfig& cfg) {
     std::string out =
-        "# prosper-app settings. Written by the app; safe to edit by hand.\n"
-        "# A --games-dir argument or PROSPER_GAMES_DIR in the environment overrides this.\n";
+        "# prosper-app settings. Written by the app.\n"
+        "# A --games-dir argument or PROSPER_GAMES_DIR in the environment overrides games_dir.\n"
+        "# Editing by hand is fine; the app rewrites this file, so comments are not preserved.\n";
     if (!cfg.games_dir.empty()) out += "games_dir = " + cfg.games_dir + "\n";
+    for (const std::string& line : cfg.unknown_lines) out += line + "\n";
     return out;
 }
 

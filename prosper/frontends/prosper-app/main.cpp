@@ -657,7 +657,6 @@ void poll_keyboard(const bool* keyboard, bool enter_maps_to_options) {
     g_keyboard_pad.set_keyboard_state(st);
 }
 
-
 // ---- opening a game (#1469) --------------------------------------------------------------------
 // A dump path reaches the boot from three places: argv (the primary, agentic path — unchanged), a
 // folder dropped on the window, and the host folder picker. Only the first is available before the
@@ -685,12 +684,23 @@ static prosper::frontend::GameLibraryIo host_library_io() {
     prosper::frontend::GameLibraryIo io;
     io.list_dir = [](const std::string& dir) {
         std::vector<std::string> names;
-        std::error_code ec;                                   // error_code overload: a missing or
-        for (const auto& e : std::filesystem::directory_iterator(dir, ec))  // unreadable dir yields
-            names.push_back(e.path().filename().string());                 // end(), never throws
+        // Both the construction AND the increment take an error_code: the throwing operator++ is
+        // reachable when a directory is removed or becomes unreadable mid-scan, and that must not
+        // escape as an exception out of an ordinary listing.
+        std::error_code ec;
+        std::filesystem::directory_iterator it(dir, ec);
+        const std::filesystem::directory_iterator end;
+        while (!ec && it != end) {
+            names.push_back(it->path().filename().string());
+            it.increment(ec);
+        }
         return names;
     };
-    io.read_file = [](const std::string& path) {
+    io.read_file = [](const std::string& want) {
+        // Case-correct like boot_program does (#1006/#1226): a dump shipping SCE_SYS/PARAM.JSON on a
+        // case-sensitive host would otherwise pass the probe and then read as empty, silently
+        // demoting the title to its directory name.
+        const std::string path = resolve_host_path_case(want);
         std::string out;
         FILE* f = std::fopen(path.c_str(), "rb");
         if (!f) return out;
@@ -699,6 +709,7 @@ static prosper::frontend::GameLibraryIo host_library_io() {
         std::fclose(f);
         return out;
     };
+    io.resolve_case = [](const std::string& want) { return resolve_host_path_case(want); };
     return io;
 }
 
@@ -990,6 +1001,7 @@ int main(int argc, char** argv) {
     // The game library (#1471): where to look, and whether to just print what is there and exit.
     std::string gamesDirFlag;
     std::string setGamesDir;
+    bool setGamesDirSeen = false;
     bool listGames = false;
     // Whether to offer the host folder picker at startup (#1469); resolved by should_pick_at_startup.
     prosper::frontend::StartupPickInputs pick{};
@@ -1004,9 +1016,22 @@ int main(int argc, char** argv) {
         else if (a == "--dump" && i + 1 < argc) dump = argv[++i];                // boot the game at this app0 dir
         else if (a == "--pick") pick.forced = true;         // open the folder picker at startup
         else if (a == "--no-pick") pick.suppressed = true;  // never open it (scripts, CI, kiosk runs)
-        else if (a == "--games-dir" && i + 1 < argc) gamesDirFlag = argv[++i];  // where the titles are
-        else if (a == "--list-games") listGames = true;     // print the library and exit (headless)
-        else if (a == "--set-games-dir" && i + 1 < argc) setGamesDir = argv[++i];  // persist and exit
+        else if (a == "--games-dir") {                       // where the titles are, this run only
+            if (i + 1 >= argc || !*argv[i + 1]) {
+                fprintf(stderr, "prosper-app: --games-dir requires a path\n");
+                return 2;
+            }
+            gamesDirFlag = argv[++i];
+        }
+        else if (a == "--list-games") listGames = true;      // print the library and exit (headless)
+        else if (a == "--set-games-dir") {                   // persist and exit
+            if (i + 1 >= argc) {
+                fprintf(stderr, "prosper-app: --set-games-dir requires a path (\"\" clears it)\n");
+                return 2;
+            }
+            setGamesDir = argv[++i];
+            setGamesDirSeen = true;   // an empty value is meaningful here: it clears the setting
+        }
         else if (a == "--present-mode") {
             if (i + 1 >= argc ||
                 !prosper::frontend::parse_present_mode(argv[++i], requestedPresentMode)) {
@@ -1058,12 +1083,19 @@ int main(int argc, char** argv) {
     // --set-games-dir: record the games directory for future launches and exit. Persisting is always
     // an explicit act — nothing here infers a library location from a folder the user happened to open,
     // because guessing wrong would silently point the library somewhere they never chose.
-    if (!setGamesDir.empty()) {
-        prosper::frontend::AppConfig cfg = load_app_config();
+    if (setGamesDirSeen) {
+        prosper::frontend::AppConfig cfg = load_app_config();   // keeps keys this build does not know
         cfg.games_dir = prosper::frontend::strip_trailing_separators(setGamesDir);
+        // Warn but still store: configuring a path before mounting it is plausible, and refusing
+        // would be more annoying than saying so.
+        if (!cfg.games_dir.empty() && !host_path_probe().is_dir(cfg.games_dir))
+            fprintf(stderr, "prosper-app: warning: %s is not a directory\n", cfg.games_dir.c_str());
         if (!save_app_config(cfg)) return 1;
-        fprintf(stderr, "prosper-app: games directory set to %s (%s)\n", cfg.games_dir.c_str(),
-                app_config_path().c_str());
+        if (cfg.games_dir.empty())
+            fprintf(stderr, "prosper-app: games directory cleared (%s)\n", app_config_path().c_str());
+        else
+            fprintf(stderr, "prosper-app: games directory set to %s (%s)\n", cfg.games_dir.c_str(),
+                    app_config_path().c_str());
         return 0;
     }
 
@@ -1082,6 +1114,12 @@ int main(int argc, char** argv) {
             fprintf(stderr, "prosper-app: no games directory. Pass --games-dir <path>, set "
                             "PROSPER_GAMES_DIR, or record one in %s\n",
                     app_config_path().empty() ? "the settings file" : app_config_path().c_str());
+            return 2;
+        }
+        if (!host_path_probe().is_dir(gamesDir)) {
+            // Distinguish a wrong path from a real but empty library: both would otherwise print
+            // "0 title(s)" and exit 1, which hides a typo.
+            fprintf(stderr, "prosper-app: not a directory: %s\n", gamesDir.c_str());
             return 2;
         }
         const std::vector<prosper::frontend::GameEntry> games =

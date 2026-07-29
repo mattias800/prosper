@@ -26,6 +26,10 @@ namespace prosper::frontend {
 struct GameLibraryIo {
     std::function<std::vector<std::string>(const std::string&)> list_dir;
     std::function<std::string(const std::string&)> read_file;
+    // Optional: map a path to the real on-disk spelling, correcting case-only differences the way
+    // boot_program does (#1006/#1226). Used so a recorded icon_path is one that actually opens on a
+    // case-sensitive host. Identity when unset.
+    std::function<std::string(const std::string&)> resolve_case;
 };
 
 struct GameEntry {
@@ -35,10 +39,15 @@ struct GameEntry {
     std::string icon_path;   // sce_sys/icon0.png, or "" when absent
 };
 
-// The JSON string value following the first "titleName" at or after `from`. Returns "" when absent.
-inline std::string param_title_name_after(const std::string& json, size_t from) {
+// The JSON string value following the first "titleName" in [from, limit). Returns "" when absent.
+//
+// `limit` is what keeps a bounded lookup honest: without it a language object that omits titleName
+// would silently yield the NEXT language's name, which is the same class of quiet mislabelling this
+// file exists to fix. Callers that legitimately want a document-wide search pass npos.
+inline std::string param_title_name_after(const std::string& json, size_t from,
+                                          size_t limit = std::string::npos) {
     size_t k = json.find("\"titleName\"", from);
-    if (k == std::string::npos) return "";
+    if (k == std::string::npos || k >= limit) return "";
     k = json.find(':', k); if (k == std::string::npos) return "";
     k = json.find('"', k); if (k == std::string::npos) return "";
     std::string out;
@@ -53,16 +62,43 @@ inline std::string param_title_name_after(const std::string& json, size_t from) 
 // distinction matters because the language name also appears as defaultLanguage's own value
 // (`"defaultLanguage": "en-US"`), and matching that instead reads the wrong title. A key is identified
 // by what follows it: optional space, a colon, optional space, then `{`.
-inline size_t find_language_object(const std::string& json, const std::string& lang) {
+// Reports the object's opening brace in `brace_out` so the caller can bound its search to that object.
+inline size_t find_language_object(const std::string& json, const std::string& lang,
+                                   size_t from = 0, size_t* brace_out = nullptr) {
     if (lang.empty()) return std::string::npos;
     const std::string needle = "\"" + lang + "\"";
-    for (size_t k = json.find(needle); k != std::string::npos; k = json.find(needle, k + 1)) {
+    for (size_t k = json.find(needle, from); k != std::string::npos;
+         k = json.find(needle, k + 1)) {
         size_t c = k + needle.size();
         while (c < json.size() && std::isspace((unsigned char)json[c])) ++c;
         if (c >= json.size() || json[c] != ':') continue;
         ++c;
         while (c < json.size() && std::isspace((unsigned char)json[c])) ++c;
-        if (c < json.size() && json[c] == '{') return k;
+        if (c < json.size() && json[c] == '{') {
+            if (brace_out) *brace_out = c;
+            return k;
+        }
+    }
+    return std::string::npos;
+}
+
+// The offset just past the object that opens at `brace` (which must index a '{'), or npos if the
+// braces never balance. String contents are skipped so a '}' inside a value cannot end the object
+// early.
+inline size_t json_object_end(const std::string& json, size_t brace) {
+    if (brace >= json.size() || json[brace] != '{') return std::string::npos;
+    int depth = 0;
+    for (size_t i = brace; i < json.size(); ++i) {
+        const char ch = json[i];
+        if (ch == '"') {                                  // skip a string, honouring escapes
+            for (++i; i < json.size(); ++i) {
+                if (json[i] == '\\') { ++i; continue; }
+                if (json[i] == '"') break;
+            }
+            continue;
+        }
+        if (ch == '{') ++depth;
+        else if (ch == '}' && --depth == 0) return i + 1;
     }
     return std::string::npos;
 }
@@ -79,21 +115,37 @@ inline size_t find_language_object(const std::string& json, const std::string& l
 // The Plucky Squire (PPSA15319) ships exactly that order and read as "DER KÜHNE KNAPPE" (de-DE)
 // instead of "The Plucky Squire" (#1471).
 inline std::string parse_param_title_name(const std::string& json) {
+    // Anchor both lookups inside localizedParameters when it is present, so a language-keyed object
+    // elsewhere in the document cannot be mistaken for a title entry. Falls back to the whole document
+    // if that key is absent, which keeps hand-written or trimmed metadata working.
+    const size_t lp = json.find("\"localizedParameters\"");
+    size_t scope_begin = 0, scope_end = std::string::npos;
+    if (lp != std::string::npos) {
+        const size_t brace = json.find('{', lp);
+        if (brace != std::string::npos) {
+            scope_begin = brace;
+            scope_end = json_object_end(json, brace);
+        }
+    }
     std::string title;
-    const size_t dl = json.find("\"defaultLanguage\"");
-    if (dl != std::string::npos) {
+    const size_t dl = json.find("\"defaultLanguage\"", scope_begin);
+    if (dl != std::string::npos && dl < scope_end) {
         const size_t c = json.find(':', dl);
         const size_t q = (c == std::string::npos) ? std::string::npos : json.find('"', c);
         if (q != std::string::npos) {
             const size_t qe = json.find('"', q + 1);
             if (qe != std::string::npos) {
                 const std::string lang = json.substr(q + 1, qe - q - 1);
-                const size_t lk = find_language_object(json, lang);
-                if (lk != std::string::npos) title = param_title_name_after(json, lk);
+                size_t brace = std::string::npos;
+                const size_t lk = find_language_object(json, lang, scope_begin, &brace);
+                // Bounded to that language's own object: if it carries no titleName we must report
+                // nothing for it rather than borrow the next language's name.
+                if (lk != std::string::npos && lk < scope_end)
+                    title = param_title_name_after(json, lk, json_object_end(json, brace));
             }
         }
     }
-    if (title.empty()) title = param_title_name_after(json, 0);
+    if (title.empty()) title = param_title_name_after(json, scope_begin, scope_end);
     return title;
 }
 
@@ -129,8 +181,11 @@ inline GameEntry describe_game(const std::string& app0_root, const GamePathProbe
         entry.title_name = parse_param_title_name(json);
     }
     if (entry.title_name.empty()) entry.title_name = path_basename(entry.app0_root);
+    // Record the resolved spelling, not the requested one: the probe corrects case, so storing the
+    // literal path could hand the caller something that will not open.
     const std::string icon = entry.app0_root + "/sce_sys/icon0.png";
-    if (probe.is_file && probe.is_file(icon)) entry.icon_path = icon;
+    if (probe.is_file && probe.is_file(icon))
+        entry.icon_path = io.resolve_case ? io.resolve_case(icon) : icon;
     return entry;
 }
 
