@@ -1174,9 +1174,31 @@ GPU producer nor a serialized RTT seed. Its selected 3840x2160 replay is black, 
 correctly refuses to invent the missing seed. The exact module, pipeline, and per-draw statistics above are
 valid; the bundle image is explicitly not correctness evidence.
 
+## Plucky title replay closure and scalar RTT snapshots
+
+An older six-submit title bundle exposed a separate capture-tool failure before a later live comparison could
+be trusted. The live RTT cache could retain CPU bytes from an earlier extent or format after a GPU-only render,
+and capture silently described unsupported scalar `R8_UNORM` and `R32_UINT` surfaces as RGBA8. Capture v38
+adds their native seed formats, validates every snapshot against its current identity, reads back an
+authoritative GPU-only surface when necessary, and skips only entries that have no current authoritative
+contents.
+
+Fixing the snapshot exposed three false edges in the bundle graph. It had treated every compute binding as
+both read and written, matched distinct images by interior byte overlap, and counted programmed color targets
+whose effective write mask was zero. The graph now uses reflected per-binding read/write facts, exact guest
+bases for image-to-image dependencies, byte overlap only where buffers or DMA require it, and non-zero target
+write masks.
+
+With those generic rules, the old bundle exports a final capsule with 39 color and three depth/stencil seeds.
+The bundle and standalone capsule both render 33,177,600 bytes at 3840x2160 with output hash
+`92f7a0c3b31a909b`; their BMP files are byte-identical with SHA-256
+`3b627f822192a0152c26d864f0ac9ffe22087f98916699d4745439e80c7dccf6`. The image is the complete Plucky title
+screen. This proves deterministic bundle-to-capsule closure, not native correctness: two earlier 48x48 volume
+reads remain unresolved because that old bundle skipped their then-unsupported typed-storage dispatches.
+
 ## Next renderer step
 
-Capture a later rolling temporal window around the Plucky title/gameplay transition, after the relevant RTT
-family has real producer history, so shader and composition work gains a full pixel oracle as well as exact
-compute pipeline contracts. Keep the exact-byte and disable-switch A/B discipline used here, and preserve
-screenshot/capture correctness while reducing the synchronous boundaries.
+Capture a fresh v38 rolling temporal window on current code around the Plucky title/gameplay transition. It
+must include the producers for the two 48x48 volumes and close with zero unresolved leaves, providing a native
+pixel oracle as well as exact compute pipeline contracts. Keep the exact-byte and disable-switch A/B
+discipline used here, and preserve screenshot/capture correctness while reducing the synchronous boundaries.

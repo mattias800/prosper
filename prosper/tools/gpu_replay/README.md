@@ -413,14 +413,23 @@ and continue if it also has temporal leaves.
 ascending order through one renderer instance, and releases each materialized submit before the next.
 The summary reports logical versus unique bytes, per-submit output hashes, and every temporal image leaf:
 
-- `stop=included-producer` names the earlier bundled submit whose target overlaps the leaf.
+- `stop=included-producer` names the earlier bundled submit whose target matches the leaf's resource
+  contract.
 - `stop=initialized-seed` means serialized RTT pixels establish the version without another submit.
 - `stop=configured-bound` means the earliest bundled submit still needs older history.
-- `stop=unresolved-producer` means a later submit has no overlapping earlier bundled target; a contiguous
+- `stop=unresolved-producer` means a later submit has no matching earlier bundled target; a contiguous
   bundle should not produce this and the capture/replay evidence is incomplete.
 
 A successful replay with `configured-bound` is an explicitly partial closure, not a faithful pixel oracle.
 Bundle files use `.prgbundle`, contain title-derived data, are gitignored, and must not be committed.
+
+The dependency graph follows the renderer's resource contract rather than treating every overlapping byte
+range as interchangeable. Reflected compute descriptors contribute only their proven read and/or write
+access; legacy or unreflectable modules retain the conservative read/write fallback. Image producers match a
+consumer's exact programmed guest base, while buffers and `DMA_DATA` retain byte-range overlap. A programmed
+color attachment is a producer only when its resolved target write mask is non-zero. These rules keep bundle
+closure from inventing temporal leaves for write-only compute outputs, neighboring image allocations, or
+disabled MRT slots.
 
 `--bundle-tail N` replays only the latest `N` manifests while retaining the bundle's exact shared resource
 dictionary. Use it when lifetime evidence proves that earlier submits cannot be target producers; the first
@@ -450,6 +459,10 @@ instead of recompiling a different portable emulation solely because capture is 
 to `subgroup=0`, and replay fails visibly when a host cannot satisfy a captured native contract. Native lowering
 defaults to one guest wave per workgroup; `PROSPER_NATIVE_COMPUTE_MULTIWAVE=1` enables the exact experimental
 multi-wave contract and records it the same way.
+Version 38 extends the append-only RTT-seed format enum with native `r8` and `r32ui` surfaces. Capture now
+validates every CPU mirror against the surface's current extent and bytes per pixel, materializes an
+authoritative GPU-only target before export, and never labels an unsupported or stale scalar surface as
+RGBA8. Version 37 and older capsules retain their existing enum values and byte layout.
 `--inspect-only` reports the RTT format and the planned/captured byte counts, non-zero and unique-byte counts,
 first control word, and content hash. A software DCC decode is still not inferred. The capsule's standalone
 output must match the bundle's final hash before using it for fast `--draw`, operation-prefix, resource, or

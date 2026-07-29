@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 
@@ -21,6 +22,15 @@ constexpr LiveRttAuthority live_rtt_authority(bool gpu_valid, bool has_cpu_snaps
 constexpr bool live_rtt_gpu_importable(bool gpu_valid, bool has_cpu_snapshot) {
     const LiveRttAuthority authority = live_rtt_authority(gpu_valid, has_cpu_snapshot);
     return authority == LiveRttAuthority::gpu || authority == LiveRttAuthority::mirrored;
+}
+
+constexpr bool live_rtt_cpu_snapshot_matches(uint32_t width, uint32_t height,
+                                             uint32_t bytes_per_pixel,
+                                             size_t snapshot_bytes) {
+    if (!width || !height || !bytes_per_pixel) return false;
+    const uint64_t pixels = static_cast<uint64_t>(width) * height;
+    if (pixels > std::numeric_limits<uint64_t>::max() / bytes_per_pixel) return false;
+    return pixels * bytes_per_pixel == snapshot_bytes;
 }
 
 // Guest GPU writes can replace a renderer-owned target through either its ordinary color plane or

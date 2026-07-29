@@ -498,7 +498,7 @@ int main() {
     };
     GpuCaptureFile video_capture;
     CHECK(capture_draw_items({video_draw}, meta, video_reader, video_capture, error) &&
-              video_capture.format_version == 37 && video_capture.blobs.size() == 1 &&
+              video_capture.format_version == 38 && video_capture.blobs.size() == 1 &&
               video_capture.blobs[0].bytes.size() == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048,
@@ -508,7 +508,7 @@ int main() {
     GpuReplayFrame video_replay;
     CHECK(serialize_gpu_capture(video_capture, video_capture_bytes, error) &&
               deserialize_gpu_capture(video_capture_bytes, video_loaded, error) &&
-              video_loaded.format_version == 37 &&
+              video_loaded.format_version == 38 &&
               video_loaded.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_loaded.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
               materialize_gpu_replay(video_loaded, video_replay, error) &&
@@ -531,7 +531,7 @@ int main() {
     GpuReplayFrame upgraded_video_replay;
     CHECK(serialize_gpu_capture(legacy_video, upgraded_video_bytes, error) &&
               deserialize_gpu_capture(upgraded_video_bytes, upgraded_video, error) &&
-              upgraded_video.format_version == 37 &&
+              upgraded_video.format_version == 38 &&
               upgraded_video.draws[0].prt.resources[0].captured_size == video_chroma.size &&
               upgraded_video.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
               materialize_gpu_replay(upgraded_video, upgraded_video_replay, error) &&
@@ -613,7 +613,7 @@ int main() {
           "Plucky RGBA16 32-cubed S3 capture uses its four true 3D macroblocks");
     CHECK(serialize_gpu_capture(array_layout_capture, array_layout_bytes, error) &&
               deserialize_gpu_capture(array_layout_bytes, array_layout_loaded, error) &&
-              array_layout_loaded.format_version == 37 &&
+              array_layout_loaded.format_version == 38 &&
               array_layout_loaded.draws[0].vrt.resources[0].resource.layer_stride_bytes == 720896u &&
               array_layout_loaded.draws[0].vrt.resources[0].resource.layer_mip_offset_bytes == 65536u,
           "v32 capture round-trips thin-array slice stride and selected-mip offset");
@@ -953,6 +953,41 @@ int main() {
           fp16_loaded.rtt_seeds[0].format == GpuCaptureColorFormat::Rgba16Float &&
           fp16_loaded.rtt_seeds[0].rgba == fp16_capture.rtt_seeds[0].rgba,
           "native FP16 RTT seed format and bytes round-trip");
+    GpuCaptureFile scalar_seed_capture = captured;
+    scalar_seed_capture.rtt_seeds[0].format = GpuCaptureColorFormat::R8Unorm;
+    scalar_seed_capture.rtt_seeds[0].rgba.assign(2 * 2, 0x7f);
+    std::vector<uint8_t> scalar_bytes;
+    GpuCaptureFile scalar_loaded;
+    CHECK(serialize_gpu_capture(scalar_seed_capture, scalar_bytes, error) &&
+          deserialize_gpu_capture(scalar_bytes, scalar_loaded, error) &&
+          scalar_loaded.rtt_seeds.size() == 1 &&
+          scalar_loaded.rtt_seeds[0].format == GpuCaptureColorFormat::R8Unorm &&
+          scalar_loaded.rtt_seeds[0].rgba == scalar_seed_capture.rtt_seeds[0].rgba,
+          "native R8 RTT seed format and bytes round-trip");
+    scalar_seed_capture.rtt_seeds[0].format = GpuCaptureColorFormat::R32Uint;
+    scalar_seed_capture.rtt_seeds[0].rgba.assign(2 * 2 * 4, 0x42);
+    CHECK(serialize_gpu_capture(scalar_seed_capture, scalar_bytes, error) &&
+          deserialize_gpu_capture(scalar_bytes, scalar_loaded, error) &&
+          scalar_loaded.rtt_seeds.size() == 1 &&
+          scalar_loaded.rtt_seeds[0].format == GpuCaptureColorFormat::R32Uint &&
+          scalar_loaded.rtt_seeds[0].rgba == scalar_seed_capture.rtt_seeds[0].rgba,
+          "native R32_UINT RTT seed format and bytes round-trip");
+    std::vector<uint8_t> v37_compatible_bytes;
+    GpuCaptureFile v37_compatible_loaded;
+    CHECK(serialize_gpu_capture(captured, v37_compatible_bytes, error) &&
+              v37_compatible_bytes.size() >= 12,
+          "current capture prepares the layout-compatible v37 fixture");
+    if (v37_compatible_bytes.size() >= 12) {
+        v37_compatible_bytes[8] = 37;
+        v37_compatible_bytes[9] = v37_compatible_bytes[10] =
+            v37_compatible_bytes[11] = 0;
+    }
+    CHECK(deserialize_gpu_capture(v37_compatible_bytes, v37_compatible_loaded, error) &&
+              v37_compatible_loaded.format_version == 37 &&
+              v37_compatible_loaded.rtt_seeds.size() == 1 &&
+              v37_compatible_loaded.rtt_seeds[0].format ==
+                  GpuCaptureColorFormat::Rgba8Unorm,
+          "v37 capsules remain readable because v38 only appends seed format values");
     CHECK(loaded.ds_seeds.size() == 1 && loaded.ds_seeds[0].depth == ds_seed.depth &&
           loaded.ds_seeds[0].stencil == ds_seed.stencil && loaded.ds_seeds[0].depth_valid &&
           loaded.ds_seeds[0].stencil_valid,
@@ -1485,9 +1520,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 38;   // kVersion + 1: a future version
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 39;   // kVersion + 1: a future version
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 38",
+          error == "unsupported capture version 39",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

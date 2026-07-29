@@ -95,6 +95,27 @@ std::vector<uint8_t> inspect_rtt_seed(const prosper::gpu::GpuCaptureRttSeed& see
         }
         return rgba;
     }
+    if (seed.format == prosper::gpu::GpuCaptureColorFormat::R8Unorm &&
+        seed.rgba.size() == texels) {
+        std::vector<uint8_t> rgba(texels * 4);
+        for (size_t texel = 0; texel < texels; ++texel) {
+            rgba[texel * 4] = rgba[texel * 4 + 1] = rgba[texel * 4 + 2] = seed.rgba[texel];
+            rgba[texel * 4 + 3] = 255;
+        }
+        return rgba;
+    }
+    if (seed.format == prosper::gpu::GpuCaptureColorFormat::R32Uint &&
+        seed.rgba.size() == texels * 4) {
+        std::vector<uint8_t> rgba(texels * 4);
+        for (size_t texel = 0; texel < texels; ++texel) {
+            uint32_t value = 0;
+            std::memcpy(&value, seed.rgba.data() + texel * 4, sizeof(value));
+            const uint8_t visible = static_cast<uint8_t>(std::min(value, 255u));
+            rgba[texel * 4] = rgba[texel * 4 + 1] = rgba[texel * 4 + 2] = visible;
+            rgba[texel * 4 + 3] = 255;
+        }
+        return rgba;
+    }
     if (seed.format != prosper::gpu::GpuCaptureColorFormat::Rgba16Float ||
         seed.rgba.size() != texels * 8)
         return {};
@@ -321,7 +342,11 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
         const char* format = seed.format == prosper::gpu::GpuCaptureColorFormat::Rgba16Float
             ? "rgba16f"
             : seed.format == prosper::gpu::GpuCaptureColorFormat::R11G11B10Float
-                ? "r11g11b10f" : "rgba8";
+                ? "r11g11b10f"
+                : seed.format == prosper::gpu::GpuCaptureColorFormat::R8Unorm
+                    ? "r8"
+                    : seed.format == prosper::gpu::GpuCaptureColorFormat::R32Uint
+                        ? "r32ui" : "rgba8";
         std::printf("rtt-seed addr=%016llx extent=%ux%u format=%s bytes=%zu hash=%016llx\n",
                     static_cast<unsigned long long>(seed.guest_addr), seed.width, seed.height,
                     format, seed.rgba.size(), static_cast<unsigned long long>(hash));
@@ -1833,7 +1858,11 @@ int main(int argc, char** argv) {
                      seed->format == prosper::gpu::GpuCaptureColorFormat::Rgba16Float
                          ? "rgba16f"
                          : seed->format == prosper::gpu::GpuCaptureColorFormat::R11G11B10Float
-                             ? "r11g11b10f" : "rgba8",
+                             ? "r11g11b10f"
+                             : seed->format == prosper::gpu::GpuCaptureColorFormat::R8Unorm
+                                 ? "r8"
+                                 : seed->format == prosper::gpu::GpuCaptureColorFormat::R32Uint
+                                     ? "r32ui" : "rgba8",
                      rtt_seed_path.c_str());
     }
     if (graph_only) {

@@ -188,13 +188,21 @@ void drain_guest_gpu_writes(RttCache& cache, bool invalidate_ds) {
     }
 }
 
-prosper::gpu::GpuCaptureColorFormat capture_color_format(VkFormat format) {
+bool capture_color_format(VkFormat format, prosper::gpu::GpuCaptureColorFormat& captured) {
     format = prosper::test::backend_color_format(format);
-    if (format == VK_FORMAT_R16G16B16A16_SFLOAT)
-        return prosper::gpu::GpuCaptureColorFormat::Rgba16Float;
-    if (format == VK_FORMAT_B10G11R11_UFLOAT_PACK32)
-        return prosper::gpu::GpuCaptureColorFormat::R11G11B10Float;
-    return prosper::gpu::GpuCaptureColorFormat::Rgba8Unorm;
+    if (format == VK_FORMAT_R8G8B8A8_UNORM)
+        captured = prosper::gpu::GpuCaptureColorFormat::Rgba8Unorm;
+    else if (format == VK_FORMAT_R16G16B16A16_SFLOAT)
+        captured = prosper::gpu::GpuCaptureColorFormat::Rgba16Float;
+    else if (format == VK_FORMAT_B10G11R11_UFLOAT_PACK32)
+        captured = prosper::gpu::GpuCaptureColorFormat::R11G11B10Float;
+    else if (format == VK_FORMAT_R8_UNORM)
+        captured = prosper::gpu::GpuCaptureColorFormat::R8Unorm;
+    else if (format == VK_FORMAT_R32_UINT)
+        captured = prosper::gpu::GpuCaptureColorFormat::R32Uint;
+    else
+        return false;
+    return true;
 }
 
 VkFormat replay_color_format(prosper::gpu::GpuCaptureColorFormat format) {
@@ -202,6 +210,10 @@ VkFormat replay_color_format(prosper::gpu::GpuCaptureColorFormat format) {
         return VK_FORMAT_R16G16B16A16_SFLOAT;
     if (format == prosper::gpu::GpuCaptureColorFormat::R11G11B10Float)
         return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    if (format == prosper::gpu::GpuCaptureColorFormat::R8Unorm)
+        return VK_FORMAT_R8_UNORM;
+    if (format == prosper::gpu::GpuCaptureColorFormat::R32Uint)
+        return VK_FORMAT_R32_UINT;
     return VK_FORMAT_R8G8B8A8_UNORM;
 }
 
@@ -441,23 +453,65 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
     // Without the seed, a submit that samples a deferred/temporal renderer-owned RGBA16F target (Blue
     // Prince's presenting pass) replays black because that input is captured as all-zeros (#1291).
     {
-        prosper::gpu::set_gpu_capture_rtt_seed_reader([invalidate_ds](uint64_t addr, prosper::gpu::GpuCaptureRttSeed& seed) {
-            drain_guest_gpu_writes(g_rtt, invalidate_ds);
-            auto it = g_rtt.find(addr); if (it == g_rtt.end()) return false;
-            if (!it->second.rgba) return false;
-            seed.guest_addr = addr; seed.width = it->second.w; seed.height = it->second.h;
-            seed.format = capture_color_format(it->second.format);
-            seed.rgba = *it->second.rgba; return true;
-        });
+        auto materialize_current_rtt = [](uint64_t addr, RttSurf& surface,
+                                          std::string& error) {
+            const VkFormat format = prosper::test::backend_color_format(surface.format);
+            const uint32_t bytes_per_pixel =
+                prosper::test::backend_color_bytes_per_pixel(format);
+            if (surface.rgba && prosper::frontend::live_rtt_cpu_snapshot_matches(
+                    surface.w, surface.h, bytes_per_pixel, surface.rgba->size()))
+                return true;
+            if (!surface.gpu_valid) return false;
+            std::vector<uint8_t> materialized;
+            if (!prosper::test::readback_persistent_color_target(
+                    addr, surface.w, surface.h, format, materialized, error))
+                return false;
+            if (!prosper::frontend::live_rtt_cpu_snapshot_matches(
+                    surface.w, surface.h, bytes_per_pixel, materialized.size())) {
+                error = "persistent RTT readback byte count does not match its current identity";
+                return false;
+            }
+            surface.rgba = std::make_shared<const std::vector<uint8_t>>(
+                std::move(materialized));
+            return true;
+        };
+        prosper::gpu::set_gpu_capture_rtt_seed_reader(
+            [invalidate_ds, materialize_current_rtt](
+                uint64_t addr, prosper::gpu::GpuCaptureRttSeed& seed) {
+                drain_guest_gpu_writes(g_rtt, invalidate_ds);
+                auto it = g_rtt.find(addr); if (it == g_rtt.end()) return false;
+                prosper::gpu::GpuCaptureColorFormat captured_format;
+                if (!capture_color_format(it->second.format, captured_format)) return false;
+                std::string error;
+                if (!materialize_current_rtt(addr, it->second, error)) return false;
+                seed.guest_addr = addr; seed.width = it->second.w; seed.height = it->second.h;
+                seed.format = captured_format;
+                seed.rgba = *it->second.rgba; return true;
+            });
         prosper::gpu::set_gpu_capture_rtt_seed_snapshot_reader(
-            [invalidate_ds](std::vector<prosper::gpu::GpuCaptureRttSeed>& seeds, std::string&) {
+            [invalidate_ds, materialize_current_rtt](
+                std::vector<prosper::gpu::GpuCaptureRttSeed>& seeds, std::string& error) {
                 drain_guest_gpu_writes(g_rtt, invalidate_ds);
                 seeds.reserve(g_rtt.size());
-                for (const auto& [addr, surface] : g_rtt) {
-                    if (!surface.rgba) continue;
+                for (auto& [addr, surface] : g_rtt) {
+                    prosper::gpu::GpuCaptureColorFormat captured_format;
+                    if (!capture_color_format(surface.format, captured_format)) continue;
+                    std::string readback_error;
+                    if (!materialize_current_rtt(addr, surface, readback_error)) {
+                        if (!readback_error.empty()) {
+                            char detail[256];
+                            std::snprintf(detail, sizeof(detail),
+                                          "RTT 0x%llx %ux%u snapshot failed: %s",
+                                          static_cast<unsigned long long>(addr),
+                                          surface.w, surface.h, readback_error.c_str());
+                            error = detail;
+                            return false;
+                        }
+                        continue;
+                    }
                     prosper::gpu::GpuCaptureRttSeed seed;
                     seed.guest_addr = addr; seed.width = surface.w; seed.height = surface.h;
-                    seed.format = capture_color_format(surface.format);
+                    seed.format = captured_format;
                     seed.rgba = *surface.rgba; seeds.push_back(std::move(seed));
                 }
                 return true;
@@ -1353,7 +1407,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const bool has_cpu_live_rtt = !fr.is_storage_image && r.img_dim == 1u &&
                             live_rtt != g_rtt.end() &&
                             live_rtt->second.w && live_rtt->second.h && live_rtt->second.rgba &&
-                            !live_rtt->second.rgba->empty();
+                            prosper::frontend::live_rtt_cpu_snapshot_matches(
+                                live_rtt->second.w, live_rtt->second.h,
+                                prosper::test::backend_color_bytes_per_pixel(
+                                    prosper::test::backend_color_format(live_rtt->second.format)),
+                                live_rtt->second.rgba->size());
                         // A retained render target was created for color-attachment + sampled usage,
                         // not storage usage. Storage images therefore take the decoded/upload path.
                         const bool has_gpu_live_rtt = !fr.is_storage_image && live_gpu_targets &&
@@ -3859,7 +3917,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         surface.gpu_valid = prosper::test::find_persistent_color_target(
                             base, gw, gh, pass_format) != nullptr;
                         if (!pass_pixels->empty()) surface.rgba = pass_pixels;
-                        else if (surface.gpu_valid) surface.rgba.reset();
+                        else surface.rgba.reset();
                         if (defer_readback && is_vo && surface.gpu_valid) {
                             const auto already_pinned = std::find_if(
                                 pinned_scanouts.begin(), pinned_scanouts.end(),
@@ -3921,7 +3979,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         if (!pixels.empty())
                             surface.rgba = std::make_shared<const std::vector<uint8_t>>(
                                 std::move(pixels));
-                        else if (surface.gpu_valid)
+                        else
                             surface.rgba.reset();
                     }
                     const std::vector<uint8_t>& rendered_pixels = *pass_pixels;

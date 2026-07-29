@@ -79,7 +79,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v37: retain the required compute subgroup size. Native-subgroup SPIR-V reconstructs guest wave
 // membership from SubgroupId/SubgroupLocalInvocationId and therefore must replay with the same
 // required-size/full-subgroups pipeline contract used when the module was created.
-constexpr uint32_t kVersion = 37;
+// v38: extend the existing RTT-seed color-format enum with R8_UNORM and R32_UINT. No record layout
+// changes: older versions never contain the new append-only enum values.
+constexpr uint32_t kVersion = 38;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -710,6 +712,8 @@ bool validate_rtt_seed(const GpuCaptureRttSeed& seed, std::string& error) {
         case GpuCaptureColorFormat::Rgba8Unorm: bytes_per_pixel = 4; break;
         case GpuCaptureColorFormat::Rgba16Float: bytes_per_pixel = 8; break;
         case GpuCaptureColorFormat::R11G11B10Float: bytes_per_pixel = 4; break;
+        case GpuCaptureColorFormat::R8Unorm: bytes_per_pixel = 1; break;
+        case GpuCaptureColorFormat::R32Uint: bytes_per_pixel = 4; break;
         default: error = "RTT seed has an unsupported color format"; return false;
     }
     const uint64_t pixels = checked_mul(seed.width, seed.height);

@@ -11,6 +11,9 @@ struct Writer {
     uint32_t operation = 0;
     uint64_t addr = 0;
     uint64_t size = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool image = false;
 };
 
 uint64_t span_end(uint64_t addr, uint64_t size) {
@@ -20,6 +23,17 @@ uint64_t span_end(uint64_t addr, uint64_t size) {
 
 bool overlaps(uint64_t a_addr, uint64_t a_size, uint64_t b_addr, uint64_t b_size) {
     return a_addr < span_end(b_addr, b_size) && b_addr < span_end(a_addr, a_size);
+}
+
+bool writer_matches(const GpuDependencyAccess& access, const Writer& writer) {
+    const bool image_access = access.width && access.height &&
+        (access.resource_class == ResourceClass::Texture ||
+         access.resource_class == ResourceClass::StorageImage);
+    // The live RTT cache and replay seed contract identify images by their programmed base. An
+    // interior byte overlap with another image allocation cannot be imported as that texture and
+    // must not be advertised as a closed temporal dependency.
+    if (image_access && writer.image) return access.addr == writer.addr;
+    return overlaps(access.addr, access.size, writer.addr, writer.size);
 }
 
 uint64_t resource_size(const ShaderResource& resource) {
@@ -39,6 +53,38 @@ void append_accesses(const ShaderResourceTable* table, const char* stage,
         accesses.push_back({resource.gpu_addr, size, resource.width, resource.height,
                             resource.binding, resource.cls, stage});
     }
+}
+
+void append_compute_accesses(const ComputeItem& compute,
+                             std::vector<GpuDependencyAccess>& reads,
+                             std::vector<Writer>& writes) {
+    const ShaderResourceTable* table = compute.resources.get();
+    if (!table) return;
+    const DescriptorValidationReport reflected = validate_spirv_descriptor_interface(
+        compute.spirv, table, 0, SpirvShaderStage::Compute, false);
+    if (!compute.spirv.empty() && reflected.ok()) {
+        for (const auto& descriptor : reflected.descriptors) {
+            const ShaderResource* resource = table->by_binding(descriptor.binding);
+            if (!resource) continue;  // reflected.ok() normally makes this unreachable
+            const uint64_t size = resource_size(*resource);
+            if (!resource->gpu_addr || !size) continue;
+            if (descriptor.readable)
+                reads.push_back({resource->gpu_addr, size, resource->width, resource->height,
+                                 resource->binding, resource->cls, "cs"});
+            if (descriptor.writable)
+                writes.push_back({0, resource->gpu_addr, size, resource->width,
+                                  resource->height,
+                                  resource->cls == ResourceClass::StorageImage});
+        }
+        return;
+    }
+
+    // Hand-built fixtures and legacy diagnostic captures may not carry a reflectable module.
+    // Preserve their historical conservative graph instead of hiding every resource.
+    append_accesses(table, "cs", reads);
+    for (const auto& access : reads)
+        writes.push_back({0, access.addr, access.size, access.width, access.height,
+                          access.resource_class == ResourceClass::StorageImage});
 }
 
 } // namespace
@@ -61,7 +107,7 @@ bool build_gpu_dependency_graph(const GpuReplayFrame& replay,
         if (!operation.realized) continue;
 
         std::vector<GpuDependencyAccess> reads;
-        std::vector<std::pair<uint64_t, uint64_t>> writes;
+        std::vector<Writer> writes;
         if (operation.kind == SubmitOperationKind::Draw) {
             auto it = draws.find(operation.source_index);
             if (it == draws.end()) {
@@ -71,25 +117,31 @@ bool build_gpu_dependency_graph(const GpuReplayFrame& replay,
             const DrawItem& draw = *it->second;
             append_accesses(draw.vrt.get(), "vs", reads);
             append_accesses(draw.prt.get(), "ps", reads);
-            auto append_target = [&](uint64_t base, uint32_t width, uint32_t height) {
-                if (!base || !width || !height ||
+            auto append_target = [&](uint64_t base, uint32_t width, uint32_t height,
+                                     uint32_t write_mask) {
+                if (!write_mask || !base || !width || !height ||
                     std::any_of(writes.begin(), writes.end(),
-                        [&](const auto& write) { return write.first == base; })) return;
-                writes.push_back({base, static_cast<uint64_t>(width) * height * 4});
+                        [&](const auto& write) { return write.addr == base; })) return;
+                writes.push_back({0, base, static_cast<uint64_t>(width) * height * 4,
+                                  width, height, true});
             };
-            for (const auto& target : draw.color_targets)
-                append_target(target.base, target.width, target.height);
+            for (size_t slot = 0; slot < draw.color_targets.size(); ++slot) {
+                const auto& target = draw.color_targets[slot];
+                append_target(target.base, target.width, target.height,
+                              draw.ps.color_targets[slot].write_mask);
+            }
             // Direct graph callers and captures through v33 may populate only the named aliases.
-            append_target(draw.color0_base, draw.color0_width, draw.color0_height);
-            append_target(draw.color1_base, draw.color1_width, draw.color1_height);
+            append_target(draw.color0_base, draw.color0_width, draw.color0_height,
+                          draw.ps.color_write_mask);
+            append_target(draw.color1_base, draw.color1_width, draw.color1_height,
+                          draw.ps.color1_write_mask);
         } else if (operation.kind == SubmitOperationKind::Dispatch) {
             auto it = computes.find(operation.source_index);
             if (it == computes.end()) {
                 error = "realized dispatch operation has no materialized item";
                 return false;
             }
-            append_accesses(it->second->resources.get(), "cs", reads);
-            for (const auto& access : reads) writes.push_back({access.addr, access.size});
+            append_compute_accesses(*it->second, reads, writes);
         } else {
             if (operation.source_index >= replay.dma_copies.size()) {
                 error = "realized DMA operation has no materialized copy";
@@ -98,12 +150,12 @@ bool build_gpu_dependency_graph(const GpuReplayFrame& replay,
             const ReplayDmaCopy& copy = replay.dma_copies[operation.source_index];
             reads.push_back({copy.src, copy.bytes, 0, 0, 0,
                              ResourceClass::ConstantBuffer, "dma-src"});
-            writes.push_back({copy.dst, copy.bytes});
+            writes.push_back({0, copy.dst, copy.bytes, 0, 0, false});
         }
 
         for (const auto& access : reads) {
             auto producer = std::find_if(writers.rbegin(), writers.rend(), [&](const Writer& writer) {
-                return overlaps(access.addr, access.size, writer.addr, writer.size);
+                return writer_matches(access, writer);
             });
             if (producer == writers.rend()) {
                 auto leaf = std::find_if(graph.external_leaves.begin(), graph.external_leaves.end(),
@@ -118,15 +170,17 @@ bool build_gpu_dependency_graph(const GpuReplayFrame& replay,
             } else
                 graph.edges.push_back({producer->operation, static_cast<uint32_t>(operation_index), access});
         }
-        for (const auto& write : writes)
-            if (write.first && write.second)
-                writers.push_back({static_cast<uint32_t>(operation_index), write.first, write.second});
+        for (auto write : writes)
+            if (write.addr && write.size) {
+                write.operation = static_cast<uint32_t>(operation_index);
+                writers.push_back(write);
+            }
     }
     for (auto& leaf : graph.external_leaves) {
         const uint32_t first_consumer = leaf.consumer_operations.front();
         auto future = std::find_if(writers.begin(), writers.end(), [&](const Writer& writer) {
             return writer.operation >= first_consumer &&
-                   overlaps(leaf.access.addr, leaf.access.size, writer.addr, writer.size);
+                   writer_matches(leaf.access, writer);
         });
         if (future != writers.end()) leaf.first_future_writer = future->operation;
     }
