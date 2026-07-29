@@ -4912,9 +4912,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // Synchronous Unity maintenance kernels commonly rewrite a large persistent buffer with
             // the values it already contains. Terminator 2D's startup kernel binds 8,847,360 bytes;
             // after its first dispatch all later readbacks are identical. Avoiding the redundant host
-            // write removes one full pass over both source and destination. Cache invalidation and
-            // writer provenance remain unconditional: renderer-resident state can differ from guest
-            // RAM even when consecutive compute readbacks contain identical bytes.
+            // write removes one full pass over both source and destination. Renderer-alias
+            // invalidation and writer provenance remain unconditional: renderer-resident state can
+            // differ from guest RAM even when consecutive compute readbacks contain identical bytes.
             if (changed) {
                 if (!buffer.resource->host_data && buffer.resource->gpu_addr)
                     prosper::host::guest_write_watch_notify_host_write(
@@ -4930,8 +4930,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              (unsigned long long)buffer.resource->gpu_addr,
                              buffer.resource->size);
             ctx.unmap_memory(buffer.memory);
-            if (buffer.resource->gpu_addr)
-                notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.resource->size);
+            if (buffer.resource->gpu_addr) {
+                if (changed)
+                    notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.resource->size);
+                else
+                    notify_guest_gpu_write_preserving_bytes(
+                        buffer.resource->gpu_addr, buffer.resource->size);
+            }
             if (buffer.persistent)
                 ctx.validate_cached_buffer_source(buffer.cache_key);
             if (!buffer.resource->host_data && writer_provenance_enabled())

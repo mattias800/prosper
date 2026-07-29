@@ -1299,13 +1299,15 @@ writeback: source validation proved that guest RAM still matched the retained in
 comparator proved that the dispatch output matched the retained result byte for byte. Despite writing
 no guest bytes, that fast path still used the ordinary GPU-write notification. It unnecessarily dirtied
 cross-submit guest-byte watches and entered the range in the submit-local mutation journal.
+The exact CPU-comparison fallback had the same issue whenever it proved equality and skipped its host copy.
 
 The byte-preserving notification now reaches only the renderer alias observer. Color/depth targets and
 CPU RTT snapshots overlapping the range are still invalidated because they can diverge from guest RAM,
 while decoded guest-byte caches, compute source watches, and the submit journal remain valid. A Linux
-production-backend regression arms a page watch around a retained one-MiB writable buffer and checks the
-exact GPU-identical dispatch itself. Restoring the old notifier makes that regression fail; a later real
-guest mutation still defeats the comparator shortcut and is repaired normally.
+production-backend regression checks both paths: a sub-threshold buffer that takes the CPU comparison and
+a retained one-MiB buffer that takes the exact GPU comparator. Restoring either old notifier makes its
+corresponding assertion fail; a later real guest mutation still defeats the comparator shortcut and is
+repaired normally.
 
 This is a generic coherency correction, not a measured Plucky speedup. A targeted 145-second full-resolution
 route recorded zero buffer-result skips in the selected window. It did record 1,981 storage-image skips,

@@ -502,6 +502,29 @@ int main() {
         large_result_storage.resize(large_words);
         large_result = large_result_storage.data();
 #endif
+#if defined(__linux__)
+        // The ordinary CPU-comparison fallback is used below the persistent-buffer threshold. It
+        // also has an exact unchanged result and must use the byte-preserving notification, not
+        // merely the retained GPU-comparator path exercised below.
+        std::fill_n(large_result, buffer.size / sizeof(uint32_t), 0xccccccccu);
+        ShaderResource watched_small_buffer = buffer;
+        watched_small_buffer.gpu_addr = reinterpret_cast<uint64_t>(large_result);
+        ShaderResourceTable watched_small_rt;
+        watched_small_rt.resources.push_back(watched_small_buffer);
+        ComputeItem watched_small_item = item;
+        watched_small_item.resources = std::make_shared<ShaderResourceTable>(watched_small_rt);
+        CHECK(prosper::frontend::execute_live_compute_items({watched_small_item}),
+              "small writable buffer establishes its CPU-comparison result");
+        auto unchanged_small_watch = prosper::host::GuestWriteWatch::create(
+            reinterpret_cast<uint64_t>(large_result), buffer.size);
+        CHECK(prosper::frontend::execute_live_compute_items({watched_small_item}),
+              "small writable buffer repeats through CPU comparison");
+        CHECK(static_cast<bool>(unchanged_small_watch) &&
+                  unchanged_small_watch.query() ==
+                      prosper::host::GuestWriteWatchQuery::Unchanged,
+              "CPU-identical production dispatch keeps guest-byte watches clean");
+        unchanged_small_watch.reset();
+#endif
         std::fill_n(large_result, large_words, 0xababababu);
         ShaderResource large_buffer = buffer;
         large_buffer.gpu_addr = reinterpret_cast<uint64_t>(large_result);
