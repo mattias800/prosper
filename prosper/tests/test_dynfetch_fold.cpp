@@ -702,6 +702,35 @@ int main() {
     CHECK(moved_gapped_image_uses.empty(),
           "gapped entry pairs do not fabricate moved image-descriptor provenance");
 
+    // Astro Bot's world-map compaction kernel keeps an x8 descriptor-table pointer in s[14:15],
+    // while s_abs_i32 writes the adjacent s13 immediately before the load. S_ABS has a 32-bit
+    // destination: the scalar fold must not erase s14 as though this were an unknown pair write,
+    // or the second image_store's exact descriptor disappears.
+    alignas(16) uint32_t abs_adjacent_image[8];
+    std::copy(std::begin(atomic_image_seed), std::end(atomic_image_seed),
+              std::begin(abs_adjacent_image));
+    const uint64_t abs_adjacent_image_addr =
+        reinterpret_cast<uint64_t>(abs_adjacent_image);
+    uint32_t abs_adjacent_seed[25]{};
+    abs_adjacent_seed[14] = static_cast<uint32_t>(abs_adjacent_image_addr);
+    abs_adjacent_seed[15] = static_cast<uint32_t>(abs_adjacent_image_addr >> 32);
+    abs_adjacent_seed[24] = 17u;
+    const uint32_t abs_adjacent_load[] = {
+        0xbe8d3418u,                // s_abs_i32 s13, s24 (must leave s14 untouched)
+        0xf40c0907u, 0xfa000000u,   // s_load_dwordx8 s[36:43], s[14:15], 0
+        0xf0200108u, 0x00090600u,   // image_store v6, v0, s[36:43] dmask:x 2D
+        0xbf810000u,
+    };
+    std::vector<SrtUse> abs_adjacent_uses;
+    resolve_dynamic_fetch(abs_adjacent_load, std::size(abs_adjacent_load),
+                          abs_adjacent_seed, std::size(abs_adjacent_seed), 0,
+                          &abs_adjacent_uses);
+    CHECK(abs_adjacent_uses.size() == 1 && abs_adjacent_uses[0].kind == 0 &&
+              abs_adjacent_uses[0].use_pc == 3 &&
+              abs_adjacent_uses[0].is_storage_image &&
+              abs_adjacent_uses[0].t8 == expected_atomic_t8,
+          "Astro s_abs_i32 preserves the adjacent x8 image-table pointer");
+
     // Astro's title PS consumes a V# placed directly in s[24:27] with a scalar offset computed in
     // VCC_LO. No s_load gives that descriptor an SRT key, and AGC metadata need not publish a sharp
     // for it. The fold nevertheless knows all four entry dwords and the exact offset, so retain the

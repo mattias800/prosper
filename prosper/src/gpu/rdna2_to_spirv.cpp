@@ -4816,6 +4816,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     rs.sreg[in.dst.value] = b.uconst((uint32_t)in.simm16);
                     rs.sreg_srt.erase(in.dst.value);
                     break;
+                case 0x10: {                                // s_mulk_i32 (read-modify-write)
+                    // D = low32(D * sign_extend(SIMM16)). Unlike s_addk_i32, MULK does not write
+                    // SCC. Astro Bot uses the exact `s_mulk_i32 vcc_lo, 276` word to turn a
+                    // scalar table index into a byte offset before s_buffer_load_dwordx4.
+                    const uint32_t a = val(in.dst);
+                    rs.sreg[in.dst.value] = b.ibin(
+                        Op_IMul, a, b.uconst(static_cast<uint32_t>(in.simm16)));
+                    rs.sreg_srt.erase(in.dst.value);
+                    break;
+                }
                 case 0x03: case 0x04: case 0x05: case 0x06:
                 case 0x07: case 0x08: {                      // s_cmpk_{eq,lg,gt,ge,lt,le}_i32
                     const uint32_t a = val(in.dst);
@@ -7250,7 +7260,34 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // device-global counter (exact for the exercised dispatch shapes). CONFIDENCE: MED.
             if (in.ds_gds && in.opcode != 0x3d && in.opcode != 0x3e &&
                 !(b.is_compute && in.opcode == 0x0d)) { ok = false; return true; }
-            // ds_write_addtid_b32 (0xb0) / ds_read_addtid_b32 (0xb1) in a GRAPHICS stage (#273):
+            // ds_write_addtid_b32 (0xb0) / ds_read_addtid_b32 (0xb1). In compute, ADDR is the
+            // wave lane's private dword at M0 + OFFSET + lane*4, backed by ordinary workgroup LDS.
+            // Astro Bot's world-map material kernel uses several such lane arrays before reducing
+            // them through explicit DS reads and barriers.
+            if (b.is_compute && (in.opcode == 0xb0 || in.opcode == 0xb1)) {
+                auto m0 = rs.sreg.find(124);
+                if (m0 == rs.sreg.end()) { ok = false; return true; }
+                b.declare_lds();
+                const uint32_t lane = b.ibin(
+                    Op_BitwiseAnd, b.linear_localid, b.uconst(b.wave_size - 1));
+                const uint32_t byte_addr = b.ibin(
+                    Op_IAdd,
+                    b.ibin(Op_IAdd, m0->second, b.uconst(in.literal)),
+                    b.ibin(Op_ShiftLeftLogical, lane, b.uconst(2)));
+                const uint32_t idx = b.ibin(Op_ShiftRightLogical, byte_addr, b.uconst(2));
+                if (in.opcode == 0xb0) {
+                    auto value = rs.vreg.find(in.src[1].value);
+                    b.lds_store(idx, value != rs.vreg.end() ? value->second : b.uconst(0),
+                                rs.exec_narrowed, rs.exec);
+                } else {
+                    const uint32_t old = vreg_old(b, rs, in.dst.value);
+                    rs.vreg[in.dst.value] = b.lds_load(idx);
+                    predicate_write(b, rs, in.dst.value, old);
+                }
+                return true;
+            }
+            // In a GRAPHICS stage (#273), ADDTID is a per-lane VGPR spill through LDS. The
+            // per-invocation graphics projection can track the matching slot directly:
             // a per-lane VGPR spill through LDS (addr = M0 + offset + tid*4) — DOLL's title post
             // PSes spill v15 before their accumulation loop and reload it after. Per-invocation the
             // slot is ONE value: track it in rs.lds_addtid keyed by (M0 SSA id, inst offset); the
@@ -7300,13 +7337,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 return true;
             }
             // LDS (workgroup shared memory), compute-only. Byte address = ADDR VGPR + instruction
-            // offset; the backing store is dword-indexed. gfx10 ds_write2_b64 carries two independent
-            // 8-bit offsets in units of 64-bit elements, while ds_write_b64 uses the ordinary 16-bit
-            // byte offset. GDS and the remaining widths/atomics are deferred.
+            // offset; the backing store is dword-indexed. gfx10 ds_write2_b32/b64 carry two independent
+            // 8-bit offsets in units of 32-/64-bit elements, while the single-address wide stores use
+            // the ordinary 16-bit byte offset. GDS and the remaining widths/atomics are deferred.
             if ((!b.is_compute && !b.ngg_private_lds) || (in.opcode != 0x00 && in.opcode != 0x07 &&
                                   in.opcode != 0x08 && in.opcode != 0x20 &&
                                   in.opcode != 0x2d &&
-                                  in.opcode != 0x0d && in.opcode != 0x36 && in.opcode != 0x37 &&
+                                  in.opcode != 0x0d && in.opcode != 0x0e &&
+                                  in.opcode != 0x36 && in.opcode != 0x37 &&
                                   in.opcode != 0x3d && in.opcode != 0x3e && in.opcode != 0x4d && in.opcode != 0x4e &&
                                   in.opcode != 0x76 && in.opcode != 0x77 &&
                                   in.opcode != 0xde && in.opcode != 0xdf &&
@@ -7315,6 +7353,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             b.declare_lds();
             auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
+            if (in.opcode == 0x0e) {                    // ds_write2_b32: two dwords at offset0/offset1
+                // AMD RDNA2 ISA 12.13: MEM[ADDR + OFFSET0/1 * 4] = DATA0/1. The packed offsets
+                // mirror ds_read2_b32 below; Astro Bot's world-map reduction uses both operations.
+                const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
+                const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst(in.literal & 0xFFu));
+                const uint32_t idx1 = b.ibin(Op_IAdd, base, b.uconst((in.literal >> 8) & 0xFFu));
+                b.lds_store(idx0, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
+                b.lds_store(idx1, vread(in.src[2].value), rs.exec_narrowed, rs.exec);
+                return true;
+            }
             if (in.opcode == 0x4e) {                    // ds_write2_b64: two VGPR pairs at offset0/offset1
                 const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
                 const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst((in.literal & 0xFFu) * 2u));
