@@ -1677,6 +1677,91 @@ int main() {
         }
     }
 
+    // A proven-full write-only raw storage image may retain its RGBA32_UINT interchange result even
+    // though that representation is not canonical guest data: the old raw texels are unobservable.
+    // This is the Plucky Squire lighting-grid shape (3D tiled FP16), reduced to one 4x4x4 workgroup.
+    // The third identical dispatch must compare the raw transfer on-GPU and omit pack/retile and the
+    // guest invalidation, while an external guest-memory change must still force exact writeback.
+    {
+        static const uint32_t fill_3d[] = {
+            0x7E080300u,             // v4 = v0 (x)
+            0x7E0A0301u,             // v5 = v1 (y)
+            0x7E0C0302u,             // v6 = v2 (z)
+            0xF0200F10u, 0x00020004u,// IMAGE_STORE v0..v3 at (v4,v5,v6), dim:3D, no load
+            0xBF810000u,
+        };
+        constexpr uint32_t RW = 4, RH = 4, RD = 4;
+        constexpr uint32_t raw_mode = static_cast<uint32_t>(TileMode::Sw64KbS);
+        const size_t raw_guest_bytes = tiled_volume_bytes(RW, RH, RD, raw_mode, 8);
+        std::vector<uint8_t> raw_guest(raw_guest_bytes, 0x9d);
+        ShaderResourceTable raw_rt;
+        ShaderResource raw_dst{};
+        raw_dst.cls = ResourceClass::StorageImage;
+        raw_dst.img_dim = 2;
+        raw_dst.binding = 5;
+        raw_dst.sgpr_base = 8;
+        raw_dst.format = DataFormat::Float16;
+        raw_dst.num_components = 4;
+        raw_dst.width = RW;
+        raw_dst.height = RH;
+        raw_dst.depth = RD;
+        raw_dst.tile_mode = raw_mode;
+        raw_dst.gpu_addr = reinterpret_cast<uint64_t>(raw_guest.data());
+        raw_dst.size = static_cast<uint32_t>(raw_guest.size());
+        raw_rt.resources.push_back(raw_dst);
+        ComputeShaderConfig raw_config;
+        raw_config.user_sgprs.resize(16);
+        raw_config.local_x = RW;
+        raw_config.local_y = RH;
+        raw_config.local_z = RD;
+        raw_config.tidig_comp_cnt = 2;
+        // Keep the raw fallback used by true 3D images even on devices supporting typed FP16.
+        raw_config.native_storage_format_support = 0;
+        const std::vector<uint32_t> raw_spirv = recompile_compute(
+            fill_3d, std::size(fill_3d), &raw_rt, raw_config);
+        CHECK(!raw_spirv.empty(), "write-only raw 3D fill kernel recompiles");
+        if (!raw_spirv.empty()) {
+            ComputeItem raw_item;
+            raw_item.spirv = raw_spirv;
+            raw_item.resources = std::make_shared<ShaderResourceTable>(raw_rt);
+            raw_item.launch.threads_x = RW;
+            raw_item.launch.threads_y = RH;
+            raw_item.launch.threads_z = RD;
+            raw_item.launch.local_x = RW;
+            raw_item.launch.local_y = RH;
+            raw_item.launch.local_z = RD;
+            raw_item.launch.groups_x = raw_item.launch.groups_y = raw_item.launch.groups_z = 1;
+            raw_item.code_addr = 0x1122f13du;
+            CHECK(prosper::frontend::execute_live_compute_items({raw_item}),
+                  "raw 3D fill proves complete write coverage");
+            const std::vector<uint8_t> raw_expected = raw_guest;
+            CHECK(prosper::frontend::execute_live_compute_items({raw_item}),
+                  "raw 3D fill establishes a retained exact result baseline");
+            uint32_t raw_repeat_notifications = 0;
+            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+                if (addr == raw_dst.gpu_addr && size == raw_guest.size())
+                    ++raw_repeat_notifications;
+            });
+            CHECK(prosper::frontend::execute_live_compute_items({raw_item}),
+                  "retained raw 3D fill repeats an identical dispatch");
+            set_guest_gpu_write_observer({});
+            CHECK(raw_guest == raw_expected && raw_repeat_notifications == 0,
+                  "GPU-identical raw 3D output skips pack, retile, and guest invalidation");
+
+            raw_guest[0] ^= 0xff;
+            uint32_t raw_repair_notifications = 0;
+            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+                if (addr == raw_dst.gpu_addr && size == raw_guest.size())
+                    ++raw_repair_notifications;
+            });
+            CHECK(prosper::frontend::execute_live_compute_items({raw_item}),
+                  "externally changed raw 3D mirror reruns the retained dispatch");
+            set_guest_gpu_write_observer({});
+            CHECK(raw_guest == raw_expected && raw_repair_notifications == 1,
+                  "external raw 3D mirror change forces exact writeback and invalidation");
+        }
+    }
+
     // (b) PARTIAL store under a FULL grid (reviewer B1): a write-only 2D kernel that always stores to
     // row 0 (v5 hard-zero), dispatched over a W x 2 grid so covers_extent is TRUE while row 1 is never
     // written. The proof must detect the survivor, NOT fast-skip, and preserve row 1's prior content.

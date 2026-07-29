@@ -1004,6 +1004,31 @@ decomposition and #1106's scoping possible.
   contract for storage-image writeback and invisible guest texture writes; deferred to a review-gated
   change.
 
+## Plucky Squire: repeated raw 3D storage results
+
+Plucky's program `0x3013930000` dispatches a 48x48x48 lighting-grid kernel every frame and writes four
+tiled RGBA16F volumes. The Vulkan dispatch itself is small; the raw storage fallback previously copied
+four RGBA32_UINT interchange images to the CPU, packed them to FP16, and retiled them even when the
+result was byte-for-byte unchanged. In the measured title/game route this one dispatch had a **3.74 ms
+median total**, of which **3.21 ms** was writeback (22,264 samples from the baseline timing run).
+
+The retained-result contract now also covers raw storage images when the existing seed-skip proof says
+the shader is both write-only and full-coverage. That restriction is essential: raw RGBA32_UINT values
+are not canonical guest-format values and cannot generally be reused as a later image-load seed. For a
+full writer the previous image is unobservable, so the backend can safely retain it and compare the
+next transfer to an exact GPU-side baseline. The CPU receives only a four-byte changed flag. Guest
+write tracking remains authoritative: an external change disables the skip and forces ordinary exact
+pack, retile, notification, and baseline repair.
+
+On the same machine and route, the updated live run reduced the program to a **0.68 ms median total**
+and **0.00 ms writeback** (81 samples). This is a targeted before/after rather than an alternating
+whole-route benchmark, so it supports the dispatch-local result but not a standalone frame-rate claim.
+The realized capture `/tmp/plucky-393-78922522.prgcap` records the exact four-volume shape and shader,
+but replay materializes resources as owned `host_data`; by design that does not enter the live
+cross-frame guest-memory cache. Correctness is therefore pinned by the raw 3D production-backend test:
+it proves full coverage, establishes an exact baseline, skips an identical third write, then mutates
+the guest mirror and requires one exact repair write and invalidation.
+
 ## Next renderer step
 
 Bring up a representative Unreal/3D workload and collect the same stage timings plus a corrected

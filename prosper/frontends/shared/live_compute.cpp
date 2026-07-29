@@ -637,8 +637,9 @@ struct CachedComputeImage {
     // its CPU pack/retile/writeback. This is deliberately not a hash: a collision must never turn a
     // changed GPU result into a missed guest write or cache invalidation.
     std::vector<uint8_t> result_snapshot;
-    // Exact GPU-side result baseline for native storage targets. The next dispatch compares its
-    // transfer buffer to this one word-for-word and returns a four-byte changed flag to the CPU.
+    // Exact GPU-side result baseline for native storage targets and proven-full raw write-only
+    // targets. The next dispatch compares its transfer buffer to this one word-for-word and returns
+    // a four-byte changed flag to the CPU.
     // Keeping the baseline as a buffer avoids rereading 30-70 MiB of host-visible staging memory
     // merely to discover that a full-screen post-process reproduced the previous frame exactly.
     VkBuffer result_buffer = VK_NULL_HANDLE;
@@ -1605,7 +1606,11 @@ struct BoundImage {
     bool upload_skipped = false;         // write watch proved the cached source unchanged
     VkDeviceSize allocation_bytes = 0;
     VkDeviceSize staging_allocation_bytes = 0;
-    VkDeviceSize linear_result_bytes = 0;
+    // Exact bytes copied from the Vulkan image into staging. Native typed storage already has the
+    // guest's row-major byte width; the raw-uvec4 fallback has four uint32_t channels per texel.
+    // The latter is safe to retain/compare only for proven-full write-only outputs, whose previous
+    // raw image contents cannot be observed by the guest shader.
+    VkDeviceSize exact_result_bytes = 0;
     VkBuffer result_baseline = VK_NULL_HANDLE;
     size_t compare_flag_index = SIZE_MAX;
     bool gpu_result_unchanged = false;
@@ -3044,7 +3049,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             ScopedMappedMemory upload_mapping(ctx);
             const size_t upload_size = (bi.imported || bi.seed_skip)
                 ? size_t{0} : (size_t)sbytes;
-            if (!bi.imported && !(bi.persistent && bi.upload_skipped)) {
+            // A retained storage image still needs a fresh destination for its post-dispatch
+            // transfer. Only a read-only sampled cache hit can omit staging altogether.
+            if (!bi.imported && (bi.storage || !(bi.persistent && bi.upload_skipped))) {
                 VkBufferCreateInfo sci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
                 sci.size = sbytes;
                 sci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -3062,7 +3069,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     images_ready = false; break;
                 }
                 upload_mapping.memory = staging_memory[i];
-                if (!bi.seed_skip &&
+                if (!bi.seed_skip && !(bi.persistent && bi.upload_skipped) &&
                     !vk_ok(ctx.map_memory(staging_memory[i], 0, sbytes,
                                           &upload_mapping.data), "image-staging-map")) {
                     images_ready = false; break;
@@ -3089,7 +3096,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     ? 4u : (size_t)cb * nc;
                 const size_t texels = (size_t)volume_texels;
                 const uint64_t linear_guest_bytes = static_cast<uint64_t>(texels) * guest_texel;
-                bi.linear_result_bytes = static_cast<VkDeviceSize>(linear_guest_bytes);
+                bi.exact_result_bytes = bi.native_float_storage
+                    ? static_cast<VkDeviceSize>(linear_guest_bytes) : sbytes;
                 size_t guest_bytes = r->tile_mode
                     ? (dim_3d && r->depth > 1
                            ? tiled_volume_bytes(r->width, r->height, r->depth, r->tile_mode,
@@ -3135,18 +3143,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                       (r->host_data && r->host_data_size >= guest_bytes) ||
                                       guest_readable(r->gpu_addr, static_cast<uint32_t>(guest_bytes));
                 if (!readable) { skip_image(r, "storage backing unreadable"); break; }
-                // Native storage targets are byte-identical to their sampled view. Retain them after
-                // writeback so the next dispatch/frame can consume the GPU result directly instead
-                // of detiling and uploading the same multi-megabyte surface again. A proven
-                // full-overwrite seed-skip is particularly safe to retain: the old image is never an
-                // input to the shader. Poison proving deliberately stays transient because a partial
-                // proof repairs untouched texels only in the CPU mirror after readback.
+                // Native storage targets are byte-identical to their sampled view. A raw-uvec4
+                // target is also safe to retain when seed_skip proves the shader is a full, write-only
+                // producer: the previous raw values are then unobservable, while retaining them lets
+                // the exact GPU comparator recognize a repeated result before CPU pack/retile.
+                // Poison proving deliberately stays transient because a partial proof repairs
+                // untouched texels only in the CPU mirror after readback.
                 const bool dcc_cache_safe = !r->compression_enabled ||
                     (bi.dcc_metadata && bi.dcc_metadata_bytes &&
                      std::all_of(bi.dcc_metadata, bi.dcc_metadata + bi.dcc_metadata_bytes,
                                  [](uint8_t value) { return value == 0xff; }));
                 bi.cache_candidate = !renderer_owned && !r->host_data && dcc_cache_safe &&
-                    !bi.poison_verify && bi.native_float_storage &&
+                    !bi.poison_verify && (bi.native_float_storage || bi.seed_skip) &&
                     persistent_compute_image_enabled(sbytes);
                 if (bi.cache_candidate) {
                     bi.cache_key = {
@@ -3164,7 +3172,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         bi.image, bi.memory, bi.upload_skipped);
                     if (bi.persistent)
                         ctx.cached_image_result_buffer(
-                            bi.cache_key, bi.linear_result_bytes, bi.result_baseline);
+                            bi.cache_key, bi.exact_result_bytes, bi.result_baseline);
                     if (trace && bi.persistent)
                         std::fprintf(stderr,
                                      "[compute]   persistent storage image binding=%u "
@@ -3858,16 +3866,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
         phase_pipeline = ComputeClock::now();
 
-        // A retained native storage target has an exact prior-result buffer. Compare the current
-        // transfer result against it on the GPU, reducing millions of word equalities to one flag.
+        // A retained storage target has an exact prior-result buffer. Native typed bytes are
+        // canonical; raw-uvec4 bytes enter this path only for proven-full write-only targets.
+        // Compare the current transfer result against it on the GPU, reducing millions of word
+        // equalities to one flag.
         // The optimization is deliberately limited to whole uint32_t words; unaligned byte counts
         // retain the collision-free CPU comparison below rather than risk an out-of-range load.
         std::vector<size_t> compare_indices;
         for (size_t i = 0; i < images.size(); ++i) {
             BoundImage& image = images[i];
             if (image.storage && image.cache_candidate && image.persistent &&
-                image.upload_skipped && image.native_float_storage && image.result_baseline &&
-                image.linear_result_bytes && !(image.linear_result_bytes & 15u) && staging[i])
+                image.upload_skipped && image.result_baseline &&
+                image.exact_result_bytes && !(image.exact_result_bytes & 15u) && staging[i])
                 compare_indices.push_back(i);
         }
         bool compare_ready = compare_indices.empty();
@@ -3919,8 +3929,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 for (size_t j = 0; j < compare_indices.size(); ++j) {
                     const size_t i = compare_indices[j];
                     BoundImage& image = images[i];
-                    infos[j][0] = {staging[i], 0, image.linear_result_bytes};
-                    infos[j][1] = {image.result_baseline, 0, image.linear_result_bytes};
+                    infos[j][0] = {staging[i], 0, image.exact_result_bytes};
+                    infos[j][1] = {image.result_baseline, 0, image.exact_result_bytes};
                     infos[j][2] = {compare_flags, j * sizeof(uint32_t), sizeof(uint32_t)};
                     for (uint32_t binding = 0; binding < 3; ++binding) {
                         VkWriteDescriptorSet& write = writes[j * 3 + binding];
@@ -4126,7 +4136,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      0, nullptr, 1, &to_general);
             }
         }
-        // Compare retained native results before replacing their baselines. Transfer writes from
+        // Compare retained exact results before replacing their baselines. Transfer writes from
         // vkCmdCopyImageToBuffer become shader reads; the one atomic flag per image then becomes a
         // four-byte host read after the fence. Irrespective of whether the guest mirror was eligible
         // to skip, update every existing baseline to the current exact transfer bytes.
@@ -4142,7 +4152,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 current.srcQueueFamilyIndex = current.dstQueueFamilyIndex =
                     VK_QUEUE_FAMILY_IGNORED;
                 current.buffer = staging[i];
-                current.size = images[i].linear_result_bytes;
+                current.size = images[i].exact_result_bytes;
                 before_compare.push_back(current);
                 VkBufferMemoryBarrier prior = current;
                 prior.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT |
@@ -4171,7 +4181,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                         ctx.compare_pipeline_layout, 0, 1,
                                         &compare_descriptor_sets[j], 0, nullptr);
                 const uint32_t vectors =
-                    static_cast<uint32_t>(image.linear_result_bytes / 16u);
+                    static_cast<uint32_t>(image.exact_result_bytes / 16u);
                 vkCmdPushConstants(command, ctx.compare_pipeline_layout,
                                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(vectors), &vectors);
                 vkCmdDispatch(command, (vectors + 255u) / 256u, 1, 1);
@@ -4189,12 +4199,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             current.srcQueueFamilyIndex = current.dstQueueFamilyIndex =
                 VK_QUEUE_FAMILY_IGNORED;
             current.buffer = staging[i];
-            current.size = image.linear_result_bytes;
+            current.size = image.exact_result_bytes;
             vkCmdPipelineBarrier(
                 command,
                 VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &current, 0, nullptr);
-            VkBufferCopy copy{0, 0, image.linear_result_bytes};
+            VkBufferCopy copy{0, 0, image.exact_result_bytes};
             vkCmdCopyBuffer(command, staging[i], image.result_baseline, 1, &copy);
         }
         if (!compare_indices.empty()) {
@@ -4349,8 +4359,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (trace)
                     std::fprintf(stderr,
                                  "[compute]   skipped GPU-identical storage writeback binding=%u "
-                                 "addr=0x%llx bytes=%zu\n",
-                                 bi.binding, (unsigned long long)r->gpu_addr, linear_bytes);
+                                 "addr=0x%llx bytes=%llu\n",
+                                 bi.binding, (unsigned long long)r->gpu_addr,
+                                 (unsigned long long)bi.exact_result_bytes);
                 continue;
             }
             void* mapped = nullptr;
@@ -4378,8 +4389,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (trace)
                     std::fprintf(stderr,
                                  "[compute]   skipped identical storage writeback binding=%u "
-                                 "addr=0x%llx bytes=%zu\n",
-                                 bi.binding, (unsigned long long)r->gpu_addr, linear_bytes);
+                                 "addr=0x%llx bytes=%llu\n",
+                                 bi.binding, (unsigned long long)r->gpu_addr,
+                                 (unsigned long long)bi.exact_result_bytes);
                 ctx.unmap_memory(staging_memory[i]);
                 continue;
             }
@@ -4589,16 +4601,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
                 if (bi.persistent)
                     ctx.remember_cached_image_result(
-                        bi.cache_key, native_texels, linear_bytes);
+                        bi.cache_key, native_texels,
+                        static_cast<size_t>(bi.exact_result_bytes));
             }
             ctx.unmap_memory(staging_memory[i]);
             const VkBuffer retained_result = staging[i];
             if (bi.cache_candidate && bi.persistent && !bi.result_baseline &&
-                bi.native_float_storage && !(linear_bytes & 15u) &&
+                bi.exact_result_bytes && !(bi.exact_result_bytes & 15u) &&
                 ctx.prepare_compare_pipeline() &&
                 ctx.retain_cached_image_result_buffer(
                     bi.cache_key, staging[i], staging_memory[i],
-                    bi.staging_allocation_bytes, linear_bytes)) {
+                    bi.staging_allocation_bytes, bi.exact_result_bytes)) {
                 bi.result_baseline = retained_result;
                 if (trace)
                     std::fprintf(stderr,
