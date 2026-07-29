@@ -53,15 +53,55 @@ PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
 
 # Window/swapchain smoke without a dump:
 ./build-app/prosper-app --test-pattern
+
+# No game on the command line: the window opens empty and asks for one (see below).
+./build-app/prosper-app
 ```
 
 Pause or F10 pauses/resumes at a guest flip boundary and freezes the audio stream. F11 or Alt+Enter
 toggles borderless desktop fullscreen. Esc or closing the window quits.
 
+## Opening a game from the app
+
+The command line stays the primary way in — every agent route, snapshot run, and CI check drives this
+binary by argv, and that path is unchanged. Someone who runs a released build without one would
+otherwise face an empty window, so a dump path can also arrive interactively (#1469):
+
+- **Drop a game folder on the window.** The app0 root, a file inside it (`eboot.bin`), `sce_sys`, or a
+  file one level deeper all resolve to the title. One game is taken per drop, so dropping several
+  folders at once does not start one and immediately switch away from it. Not accepted under
+  `--test-pattern`, which already has something feeding the present layer.
+- **Ctrl+O** opens the host's native folder picker. Available only while no game is running — once a
+  guest boots it owns the keyboard (O is its R1) — and not under `--test-pattern`, which already has
+  something feeding the present layer.
+- **A launch with no arguments at all** opens that picker straight away, so a double-clicked app is not
+  a dead end. `--pick` forces it for any launch; `--no-pick` disables it entirely.
+
+A PS5 title is a *directory*, so this is a folder picker, not a file picker. A folder that is not a
+title is reported and changes nothing — including the folder that merely *contains* your games, which
+a library view would scan but this does not.
+
+**One boot per launch.** `run_entry` does not observe `prosper_request_stop()` yet (#352), so a booted
+guest cannot be torn down. Opening a title after this process has already tried to boot one therefore
+starts a second process with the new game and shuts this one down. That path appends
+`--dump <new title>` to the current run's own arguments, which works because `--dump` is last-wins.
+
+It is the boot *attempt* that is spent, not the success: a title that fails to load also uses up the
+launch, because the boot appends into shared state and re-runs one-shot global setup. Picking another
+game after a failure is still fine — it just goes to a fresh process, same as switching titles.
+
+This is the *user* opening a game they chose. It does not change what a **guest** can ask for: the SDL
+dialog backend below still never lets a title open a host file picker or see a host path.
+
 ## Options
 
 - `--dump <app0>` — boot and display the PS5 title at this app0 directory (positional path also works).
+  Last-wins: a later `--dump` overrides an earlier one, and a positional path applies only while no
+  dump has been given.
 - `--test-pattern` — feed a synthetic animated frame through the real present path (no guest).
+- `--pick` — open the host folder picker at startup even though arguments were given. Ignored when the
+  run already has a game (`--dump`/positional) or `--test-pattern`.
+- `--no-pick` — never open the picker at startup, including on a no-argument launch. Wins over `--pick`.
 - `--frames N` — present N frames then exit 0 (non-interactive smoke; exit 1 if it couldn't).
 - `--present-mode fifo|mailbox|immediate` — choose swapchain latency behavior. FIFO is the default;
   mailbox is low-latency vsync, and immediate may tear. Unsupported optional modes fall back to FIFO.
