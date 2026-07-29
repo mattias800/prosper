@@ -3537,23 +3537,19 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // Realized captures store SPIR-V but not enough raw compute launch state to recompile a
         // device-specific typed-storage module on replay. Compile capture-bound dispatches through
         // the portable raw-uvec4 path so optional format support never becomes an artifact ABI.
-        if (std::getenv("PROSPER_GPU_CAPTURE") ||
+        const bool capture_bound = std::getenv("PROSPER_GPU_CAPTURE") ||
             std::getenv("PROSPER_GPU_TIMELINE_CAPTURE") ||
-            interactive_gpu_capture_armed() || interactive_capture_bundle_active())
+            interactive_gpu_capture_armed() || interactive_capture_bundle_active();
+        if (capture_bound)
             config.native_storage_format_support = 0;
-        // RequiredSubgroupSize fixes only the subgroup WIDTH. Vulkan deliberately does not promise
-        // that SubgroupLocalInvocationId is LocalInvocationIndex modulo that width, so using native
-        // lane IDs for RDNA MBCNT/EXEC/VCC would silently change guest wave membership on a
-        // conforming implementation. Keep the portable emulation by default. This opt-in exists for
-        // driver experiments whose contiguous mapping has been validated externally; it is not a
-        // portable correctness contract.
-        if (getenv("PROSPER_ASSUME_CONTIGUOUS_COMPUTE_SUBGROUPS") &&
-            !getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") &&
-            shared_vulkan.compute_subgroup_size_control &&
-            shared_vulkan.compute_subgroup_vote && shared_vulkan.compute_subgroup_arithmetic &&
-            config.wave_size >= shared_vulkan.min_compute_subgroup_size &&
-            config.wave_size <= shared_vulkan.max_compute_subgroup_size)
-            config.native_subgroup_size = config.wave_size;
+        // Full exact-size subgroups let the translator assign guest local coordinates in
+        // SubgroupId/SubgroupLocalInvocationId order. That avoids assuming any relationship between
+        // Vulkan's implementation-defined LocalInvocationIndex order and subgroup lane order while
+        // still making each native subgroup exactly one RDNA wave. Captures remain portable until
+        // their schema records the required-subgroup/full-subgroup pipeline contract.
+        config.native_subgroup_size = select_native_compute_subgroup_size(
+            shared_vulkan, config, capture_bound,
+            getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") != nullptr);
         config.tgid_x_en = tgid_x_en;
         config.tgid_y_en = tgid_y_en;
         config.tgid_z_en = tgid_z_en;
@@ -4724,6 +4720,40 @@ void notify_live_render_target_image_written(uint64_t gpu_addr) {
 static SharedVulkanContext g_shared_vulkan;
 void set_shared_vulkan_context(const SharedVulkanContext& context) { g_shared_vulkan = context; }
 SharedVulkanContext shared_vulkan_context() { return g_shared_vulkan; }
+
+uint32_t select_native_compute_subgroup_size(const SharedVulkanContext& context,
+                                             const ComputeShaderConfig& config,
+                                             bool capture_bound, bool disabled) {
+    const bool adoptable = context.valid() && context.compute_queue_supported &&
+        context.storage_image_read_without_format &&
+        context.storage_image_write_without_format;
+    if (capture_bound || disabled || !adoptable ||
+        !context.compute_subgroup_size_control || !context.compute_full_subgroups ||
+        !context.compute_subgroup_vote || !context.compute_subgroup_arithmetic ||
+        !context.max_compute_workgroup_subgroups || !context.max_compute_workgroup_size_x ||
+        !context.max_compute_workgroup_invocations || !config.local_x || !config.local_y ||
+        !config.local_z || (config.wave_size != 32u && config.wave_size != 64u) ||
+        config.wave_size < context.min_compute_subgroup_size ||
+        config.wave_size > context.max_compute_subgroup_size)
+        return 0;
+
+    // The native shader declares a flattened LocalSize=(guest X*Y*Z,1,1), then reconstructs the
+    // guest 3D local/global IDs from SubgroupId/SubgroupLocalInvocationId. Besides avoiding any
+    // implementation-defined lane ordering, this makes Vulkan's REQUIRE_FULL_SUBGROUPS X-dimension
+    // rule explicit. Keep the multiplication and maxComputeWorkgroupSubgroups bound overflow-safe.
+    const uint64_t xy = static_cast<uint64_t>(config.local_x) * config.local_y;
+    if (xy > UINT64_MAX / config.local_z) return 0;
+    const uint64_t local_invocations = xy * config.local_z;
+    const uint64_t subgroup_capacity = static_cast<uint64_t>(config.wave_size) *
+        context.max_compute_workgroup_subgroups;
+    if (local_invocations % config.wave_size != 0 ||
+        local_invocations > subgroup_capacity ||
+        local_invocations > context.max_compute_workgroup_size_x ||
+        local_invocations > context.max_compute_workgroup_invocations ||
+        local_invocations > UINT32_MAX)
+        return 0;
+    return config.wave_size;
+}
 
 // Present unification (#1270): see gpu_execute.hpp. The atomic gates the lock so the common (headless /
 // non-shared / app-not-yet-adopted) path pays only a single acquire load and takes no lock. Set true
