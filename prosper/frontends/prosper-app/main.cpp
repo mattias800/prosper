@@ -69,8 +69,9 @@
 #include <mutex>
 #include <sys/stat.h>                  // the host filesystem probe behind resolve_app0_root()
 
-// Starting the replacement process for a second title (#1469): CreateProcess on Windows, fork+execv
-// elsewhere. Guarded the same way as the rest of the tree so windows.h cannot redefine std::max.
+// Starting the replacement process for a second title (#1469): CreateProcess on Windows,
+// posix_spawn elsewhere. Guarded the same way as the rest of the tree so windows.h cannot
+// redefine std::max.
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -853,10 +854,13 @@ static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_ro
     cargv.reserve(args.size() + 1);
     for (auto& a : args) cargv.push_back(a.data());
     cargv.push_back(nullptr);
-    // posix_spawn rather than fork+exec, for two reasons. It reports an exec failure (a bad path, a
-    // binary replaced underneath us) synchronously, so a failed relaunch can be shown to the user
-    // instead of this process quitting into nothing; and it avoids duplicating the page tables of a
-    // guest holding multi-gigabyte fixed mappings, which is slow and can hit ENOMEM.
+    // posix_spawn rather than fork+exec, for two reasons. It avoids duplicating the page tables of a
+    // guest holding multi-gigabyte fixed mappings, which is slow and can hit ENOMEM; and on every
+    // libc this builds against (glibc >= 2.24, musl, Darwin) it reports an exec failure — a bad
+    // path, a binary replaced underneath us — synchronously, so a failed relaunch can be shown to
+    // the user instead of this process quitting into nothing. POSIX permits an implementation to
+    // return 0 and let the child exit 127 instead; there the relaunch would degrade to the old
+    // silent behaviour rather than misbehave.
     pid_t child = 0;
     const int rc = ::posix_spawn(&child, cargv[0], nullptr, nullptr, cargv.data(), environ);
     if (rc != 0) {
@@ -1048,6 +1052,12 @@ int main(int argc, char** argv) {
     // Open a title the user handed the window — a dropped folder, or the folder picker's result
     // (#1469). argv never comes through here; it booted before the window existed.
     const prosper::frontend::GamePathProbe pathProbe = host_path_probe();
+    // Per poll batch: at most one game is opened (a multi-folder drop must not start the first and
+    // immediately switch away from it) and at most one "not a PS5 game" box is shown (dragging in a
+    // folder of photos should not mean a dialog per file). Reset at the top of each batch.
+    bool openedThisBatch = false;
+    bool rejectedThisBatch = false;
+
     // Returns true when the path actually started something (booted here, or handed off to a new
     // process) — false when it was rejected or the start failed, so a caller can tell an ignored
     // path from a consumed one.
@@ -1058,8 +1068,10 @@ int main(int argc, char** argv) {
             fprintf(stderr, "[app] not a PS5 title: %s\n", picked.c_str());
             // The message box is modal and blocks this loop until dismissed. That is fine over an
             // idle window, but freezing a running game — including its guest dialog pump — over a
-            // mis-aimed drag is not; there the log line is enough.
-            if (!g_guest_started) {
+            // mis-aimed drag is not; there the log line is enough. One box per batch either way:
+            // dragging a folder of photos in should not mean a dialog per file.
+            if (!g_guest_started && !rejectedThisBatch) {
+                rejectedThisBatch = true;
                 SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "prosper",
                     ("That is not a PS5 game:\n\n" + picked +
                      "\n\nChoose the game's app0 folder — the one holding eboot.bin and sce_sys.").c_str(),
@@ -1112,7 +1124,7 @@ int main(int argc, char** argv) {
     }
 
     while (running && !prosper_stop_requested()) {
-        bool openedThisBatch = false;   // at most one game is opened per poll batch (multi-drop)
+        openedThisBatch = rejectedThisBatch = false;
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_EVENT_QUIT) running = false;
@@ -1246,7 +1258,7 @@ int main(int argc, char** argv) {
         {
             std::string picked;
             { std::lock_guard<std::mutex> lock(g_picked_mutex); picked.swap(g_picked_path); }
-            if (!picked.empty()) {
+            if (!picked.empty() && !testPattern) {
                 if (g_guest_started)
                     fprintf(stderr, "[app] ignoring the folder picker's answer: a game started first.\n");
                 else

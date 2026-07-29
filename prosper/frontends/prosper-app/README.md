@@ -69,7 +69,8 @@ otherwise face an empty window, so a dump path can also arrive interactively (#1
 
 - **Drop a game folder on the window.** The app0 root, a file inside it (`eboot.bin`), `sce_sys`, or a
   file one level deeper all resolve to the title. One game is taken per drop, so dropping several
-  folders at once does not start one and immediately switch away from it.
+  folders at once does not start one and immediately switch away from it. Not accepted under
+  `--test-pattern`, which already has something feeding the present layer.
 - **Ctrl+O** opens the host's native folder picker. Available only while no game is running — once a
   guest boots it owns the keyboard (O is its R1) — and not under `--test-pattern`, which already has
   something feeding the present layer.
