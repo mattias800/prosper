@@ -89,6 +89,41 @@ guest caused a reproducible Windows access violation when static teardown raced 
 The remaining lifecycle work is a guest flip-boundary check followed by a real join and normal
 teardown (#352).
 
+## Where the dump path comes from (#1469)
+
+`boot_program()` needs an app0 directory. Argv supplies it for every agent route, snapshot run, and CI
+check, and that remains the primary path — it runs before the window exists, so the guest is already
+up by the time the swapchain is created. Nothing about it changed when interactive sources were added.
+
+A released build also reaches people who never type a command line, so two more sources feed the same
+`start_guest()`:
+
+```
+argv  ──────────────────────────────┐
+window drop (SDL_EVENT_DROP_FILE) ──┼─> resolve_app0_root ─> decide_open_action ─> start_guest
+host folder picker (SDL dialog) ────┘         (game_path.hpp — pure, unit-tested)
+```
+
+`game_path.hpp` holds the whole decision surface behind an injected filesystem probe, so path
+resolution and the open/reject/relaunch choice are covered by `test_game_path.cpp` in ordinary CI
+without a window, a picker, or a real dump — the same pure-seam pattern as `present_mode.hpp` and
+`window_controls.hpp`.
+
+Two constraints shape the design:
+
+- **A PS5 title is a directory**, so the host dialog is `SDL_ShowOpenFolderDialog`. SDL ships it; the
+  build simply enables `SDL_DIALOG` when `PROSPER_APP` is on. The audio- and pad-only frontends have
+  no window to parent a dialog to and keep it out.
+- **One boot per process.** `run_entry` never observes `prosper_request_stop()`, so the app exits
+  rather than joining a guest (see the lifecycle seam above, and #352). Opening a title while one runs
+  therefore starts a fresh process — `relaunch_with_dump()` appends `--dump <new title>` to this run's
+  own arguments, which selects the new game because `--dump` is last-wins. When the cooperative stop
+  lands, that call site is the single place that becomes an in-process teardown plus `start_guest()`.
+
+The idle window paints a flat colour through the ordinary `present_frame` path rather than leaving
+undefined swapchain contents on screen, and stops as soon as `present_frame_seq()` shows anything has
+been published. Those frames do not count toward `--frames`, which asserts real content.
+
 ## The Vulkan-context decision: two contexts, one shared CPU frame
 
 **The frontend owns its own Vulkan context (instance + device + swapchain on the window surface).

@@ -28,6 +28,7 @@
 #include "present_mode.hpp"             // explicit swapchain latency/vsync policy, pure regression seam
 #include "present_policy.hpp"           // bounded-acquire present classification (#1182), pure seam
 #include "window_controls.hpp"           // debounced app-window shortcuts, pure regression seam
+#include "game_path.hpp"                 // dropped/picked path -> app0 root + open action, pure seam
 #ifdef PROSPER_HAVE_LIVE_RENDERER
 #include "live_renderer.hpp"           // shared DrawItem->Vulkan compositor (register_live_renderer)
 #endif
@@ -51,6 +52,7 @@
 #endif
 
 #include <SDL3/SDL.h>
+#include <SDL3/SDL_dialog.h>           // SDL_ShowOpenFolderDialog: the host's native folder picker
 #include <SDL3/SDL_vulkan.h>
 #include <vulkan/vulkan.h>
 
@@ -65,6 +67,21 @@
 #include <chrono>
 #include <thread>
 #include <mutex>
+#include <sys/stat.h>                  // the host filesystem probe behind resolve_app0_root()
+
+// Starting the replacement process for a second title (#1469): CreateProcess on Windows, fork+execv
+// elsewhere. Guarded the same way as the rest of the tree so windows.h cannot redefine std::max.
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 using namespace prosper;
 
@@ -248,6 +265,11 @@ bool create_swapchain(Vk& vk, uint32_t w, uint32_t h,
 // (Re)create the staging buffer + image sized to the guest frame (w*h RGBA).
 bool ensure_stage(Vk& vk, uint32_t w, uint32_t h) {
     if (vk.stageW == w && vk.stageH == h && vk.stageBuf) return true;
+    // The last presented frame may still be reading these objects, so a resize must not free them
+    // under a submitted command buffer. Only the resize path pays the wait; the steady state above
+    // returns before it. Reachable whenever the source dimensions change — a guest that
+    // reconfigures VideoOut, or the idle window handing over to a booted game (#1469).
+    if (vk.stageBuf || vk.stageImg) vkWaitForFences(vk.device, 1, &vk.inFlight, VK_TRUE, UINT64_MAX);
     if (vk.stageBuf)   { vkDestroyBuffer(vk.device, vk.stageBuf, nullptr); vkFreeMemory(vk.device, vk.stageMem, nullptr); }
     if (vk.stageImg)   { vkDestroyImage(vk.device, vk.stageImg, nullptr);  vkFreeMemory(vk.device, vk.stageImgMem, nullptr); }
     vk.stageBuf = VK_NULL_HANDLE; vk.stageImg = VK_NULL_HANDLE; vk.stageMapped = nullptr;
@@ -590,17 +612,248 @@ static std::string read_game_title(const std::string& dump) {
     return title;
 }
 
+// ---- opening a game (#1469) --------------------------------------------------------------------
+// A dump path reaches the boot from three places: argv (the primary, agentic path — unchanged), a
+// folder dropped on the window, and the host folder picker. Only the first is available before the
+// window exists, so the boot itself is factored out here and every source runs the identical code.
+
+// The host side of game_path.hpp's injected probe.
+static prosper::frontend::GamePathProbe host_path_probe() {
+    prosper::frontend::GamePathProbe probe;
+    probe.is_dir = [](const std::string& p) {
+        struct stat st{};
+        return ::stat(p.c_str(), &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR;
+    };
+    probe.is_file = [](const std::string& p) {
+        struct stat st{};
+        return ::stat(p.c_str(), &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG;
+    };
+    return probe;
+}
+
+// "prosper — <game name>" for a booted game (name from param.json, falling back to the app0
+// basename), else a label that says what the empty window is waiting for.
+static std::string window_title_for(const std::string& dump, bool test_pattern) {
+    if (!dump.empty()) {
+        std::string name = read_game_title(dump);
+        if (name.empty()) {
+            const auto sl = dump.find_last_of("/\\");
+            name = (sl == std::string::npos ? dump : dump.substr(sl + 1));
+        }
+        return "prosper — " + name;
+    }
+    if (test_pattern) return "prosper — test pattern";
+    return "prosper — no game (drop a game folder here, or press Ctrl+O)";
+}
+
+// The guest, and the one boot this process gets. run_entry() never observes prosper_request_stop(),
+// so a booted guest cannot be torn down (#352) — hence `g_guest_started`, and hence the relaunch
+// below rather than a second call to start_guest().
+Program g_prog;
+std::thread g_guest_thread;
+bool g_guest_started = false;
+
+// Install the host frontends (audio out, controller in, dialogs) at the same point boot_trace does:
+// right after the built-in HLE is registered, before the guest runs. Each is built in only when its
+// SDL3 frontend is enabled; a window app wants them all on by default.
+static void install_host_backends() {
+#ifdef PROSPER_AUDIO_FFMPEG
+    if (prosper::ajm::install_ffmpeg_decoder_backend())
+        fprintf(stderr, "[app] FFmpeg AJM audio decoder installed.\n");
+    else
+        fprintf(stderr, "[app] FFmpeg AJM audio decoder unavailable.\n");
+#endif
+#ifdef PROSPER_VIDEO_MF
+    if (!getenv("PROSPER_APP_DISABLE_VIDEO")) {
+        if (prosper::video::install_media_foundation_backend())
+            fprintf(stderr, "[app] Media Foundation video backend installed.\n");
+        else
+            fprintf(stderr, "[app] Media Foundation video backend unavailable.\n");
+    } else {
+        fprintf(stderr, "[app] native video backend disabled.\n");
+    }
+#endif
+#ifdef PROSPER_VIDEO_VAAPI
+    if (!getenv("PROSPER_APP_DISABLE_VIDEO")) {
+        if (prosper::video::install_vaapi_backend())
+            fprintf(stderr, "[app] FFmpeg/VA-API video backend installed.\n");
+        else
+            fprintf(stderr, "[app] FFmpeg/VA-API video backend unavailable.\n");
+    } else {
+        fprintf(stderr, "[app] native video backend disabled.\n");
+    }
+#endif
+#ifdef PROSPER_AUDIO_SDL3
+    if (!getenv("PROSPER_APP_DISABLE_AUDIO")) {
+        prosper::install_sdl3_audio_sink();
+    } else {
+        fprintf(stderr, "[app] SDL audio backend disabled; using the realtime silent sink.\n");
+    }
+#endif
+#ifdef PROSPER_PAD_SDL3
+    if (!getenv("PROSPER_APP_DISABLE_PAD")) {
+        if (prosper::install_sdl3_pad_backend()) {
+            g_keyboard_pad.set_fallback(prosper::input::pad_backend());
+            fprintf(stderr, "[app] controller backend installed.\n");
+        }
+    } else {
+        fprintf(stderr, "[app] SDL controller backend disabled; keyboard and scripted input remain available.\n");
+    }
+#endif
+#ifdef PROSPER_HAVE_DIALOG_SDL3
+    if (!getenv("PROSPER_APP_DISABLE_DIALOG")) {
+        prosper::install_sdl3_platform_ui();   // real SDL message boxes for MsgDialog/ErrorDialog (#347)
+        fprintf(stderr, "[app] dialog backend installed.\n");
+    } else {
+        fprintf(stderr, "[app] SDL dialog backend disabled; using headless auto-dismiss.\n");
+    }
+#endif
+}
+
+// Register the live renderer, boot the title at `app0_root`, and run its frame loop on its own
+// thread. Returns false with *err set on a link/map/stub failure; call it at most once per process.
+static bool start_guest(const std::string& app0_root, std::string* err) {
+    if (g_guest_started) { if (err) *err = "a game is already running"; return false; }
+#ifdef PROSPER_HAVE_LIVE_RENDERER
+    prosper::frontend::register_live_renderer(
+        getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".",
+        getenv("PROSPER_APP_DUMP_FRAMES") != nullptr);
+#else
+    fprintf(stderr, "[app] built without the live renderer; the window will stay blank.\n");
+#endif
+    if (!boot_program(app0_root, g_prog, err, install_host_backends)) return false;
+    g_guest_started = true;
+    g_guest_thread = std::thread([]{
+        const BootResult result = run_entry(g_prog.imgs[0]);
+        fprintf(stderr,
+                "[app] guest thread ended: kind=%d detail=%s rip=0x%llx addr=0x%llx "
+                "rax=0x%llx rbx=0x%llx rdi=0x%llx rsi=0x%llx rdx=0x%llx "
+                "rbp=0x%llx rsp=0x%llx\n",
+                result.kind, result.detail.c_str(),
+                static_cast<unsigned long long>(result.fault_rip),
+                static_cast<unsigned long long>(result.fault_addr),
+                static_cast<unsigned long long>(result.rax),
+                static_cast<unsigned long long>(result.rbx),
+                static_cast<unsigned long long>(result.rdi),
+                static_cast<unsigned long long>(result.rsi),
+                static_cast<unsigned long long>(result.rdx),
+                static_cast<unsigned long long>(result.rbp),
+                static_cast<unsigned long long>(result.rsp));
+        if (result.kind != 0)
+            dump_guest_exception_trace();
+        for (uint64_t address : result.backtrace)
+            fprintf(stderr, "[app] guest backtrace: 0x%llx\n",
+                    static_cast<unsigned long long>(address));
+    });   // runs the guest frame loop
+    fprintf(stderr, "[app] guest booted; presenting its frames.\n");
+    return true;
+}
+
+// The host folder picker. SDL may deliver the result on another thread, so the callback only parks
+// the chosen path; the event loop consumes it between frames, where booting is safe.
+std::mutex g_picked_mutex;
+std::string g_picked_path;
+bool g_picker_open = false;
+
+static void picked_folder_cb(void* /*userdata*/, const char* const* filelist, int /*filter*/) {
+    std::lock_guard<std::mutex> lock(g_picked_mutex);
+    g_picker_open = false;
+    if (!filelist) { fprintf(stderr, "[app] folder picker failed: %s\n", SDL_GetError()); return; }
+    if (!filelist[0]) { fprintf(stderr, "[app] folder picker cancelled.\n"); return; }
+    g_picked_path = filelist[0];
+}
+
+static void open_folder_picker(SDL_Window* win) {
+    {
+        std::lock_guard<std::mutex> lock(g_picked_mutex);
+        if (g_picker_open) return;   // one dialog at a time
+        g_picker_open = true;
+    }
+    SDL_ShowOpenFolderDialog(picked_folder_cb, nullptr, win, nullptr, /*allow_many=*/false);
+}
+
+// Take the path this process was started from. argv[0] is a fallback: it is only a valid execv
+// target when it carries a path and the working directory has not moved.
+static std::string this_executable(const char* argv0) {
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    const DWORD n = GetModuleFileNameA(nullptr, buf, sizeof buf);
+    if (n > 0 && n < sizeof buf) return std::string(buf, n);
+#else
+    char buf[4096];
+    const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof buf - 1);
+    if (n > 0) { buf[n] = '\0'; return std::string(buf, (size_t)n); }
+#endif
+    return argv0 ? std::string(argv0) : std::string();
+}
+
+// Start a second process for `app0_root`, keeping this run's other arguments. `--dump` is parsed
+// last-wins, and a positional path only applies while no dump was given, so appending one always
+// selects the new game without having to filter what the user originally passed.
+//
+// A second in-process boot is not available: the app cannot tear down a running guest (#352). Until
+// that lands, a fresh process is the honest way to switch titles.
+static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_root) {
+    const std::string exe = this_executable(argc > 0 ? argv[0] : nullptr);
+    if (exe.empty()) return false;
+    std::vector<std::string> args;
+    args.push_back(exe);
+    for (int i = 1; i < argc; i++) args.emplace_back(argv[i]);
+    args.emplace_back("--dump");
+    args.push_back(app0_root);
+#ifdef _WIN32
+    // CreateProcess takes one command line, so quote every argument: dump paths routinely contain
+    // spaces. Embedded quotes are not escaped — no PS5 content-id directory contains one.
+    std::string cmdline;
+    for (size_t i = 0; i < args.size(); i++) {
+        if (i) cmdline += ' ';
+        cmdline += '"' + args[i] + '"';
+    }
+    STARTUPINFOA si{}; si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr,
+                        &si, &pi)) {
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+#else
+    std::vector<char*> cargv;
+    cargv.reserve(args.size() + 1);
+    for (auto& a : args) cargv.push_back(a.data());
+    cargv.push_back(nullptr);
+    const pid_t pid = ::fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        // Between fork and exec only async-signal-safe calls are allowed — guest threads may hold
+        // the allocator lock in the parent. Everything above is already built.
+        ::execv(cargv[0], cargv.data());
+        _Exit(127);
+    }
+    return true;
+#endif
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     bool testPattern = false; int exitAfter = 0; uint32_t winW = 1280, winH = 720;
     prosper::frontend::AppPresentMode requestedPresentMode = prosper::frontend::AppPresentMode::fifo;
     std::string dump;
+    // Whether to offer the host folder picker at startup (#1469); resolved by should_pick_at_startup.
+    prosper::frontend::StartupPickInputs pick{};
+    pick.bare_launch = (argc <= 1);
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--test-pattern") testPattern = true;
         else if (a == "--frames" && i + 1 < argc) exitAfter = atoi(argv[++i]);   // present N frames then exit (CI/smoke)
+        // --dump is LAST-WINS, and the positional form below applies only while no dump was given.
+        // relaunch_with_dump() depends on that: it appends "--dump <new title>" to this run's own
+        // arguments and needs the appended one to override whatever selected the current game.
         else if (a == "--dump" && i + 1 < argc) dump = argv[++i];                // boot the game at this app0 dir
+        else if (a == "--pick") pick.forced = true;         // open the folder picker at startup
+        else if (a == "--no-pick") pick.suppressed = true;  // never open it (scripts, CI, kiosk runs)
         else if (a == "--present-mode") {
             if (i + 1 >= argc ||
                 !prosper::frontend::parse_present_mode(argv[++i], requestedPresentMode)) {
@@ -646,104 +899,24 @@ int main(int argc, char** argv) {
         }
         else if (a[0] != '-' && dump.empty()) dump = a;                          // positional dump path
     }
+    pick.has_dump = !dump.empty();
+    pick.test_pattern = testPattern;
 
-    // Boot the game (unless test-pattern): register the shared live renderer so the guest's GPU
-    // submits composite to frames on the present layer, then the shared boot_program path sets the
-    // guest up and it runs on its own thread while this thread owns the window + present. Reaching
-    // the frame loop needs PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct in the environment
-    // (same as boot_trace).
-    std::thread guestThread;
+    // Boot the game (unless test-pattern): the shared start_guest() path registers the live renderer
+    // so the guest's GPU submits composite to frames on the present layer, boots through
+    // boot_program, and runs the guest on its own thread while this thread owns the window +
+    // present. Reaching the frame loop needs PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct
+    // in the environment (same as boot_trace).
+    //
+    // This is the argv path and it keeps its original position: the guest is up before the window
+    // exists. A title opened later (drop / picker, #1469) boots from inside the event loop instead,
+    // through this same start_guest().
     if (!testPattern && !dump.empty()) {
-#ifdef PROSPER_HAVE_LIVE_RENDERER
-        prosper::frontend::register_live_renderer(
-            getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".",
-            getenv("PROSPER_APP_DUMP_FRAMES") != nullptr);
-#else
-        fprintf(stderr, "[app] built without the live renderer; the window will stay blank.\n");
-#endif
-        static Program prog; std::string err;
-        // Install host frontends (audio out, controller in) at the same point boot_trace does —
-        // right after the built-in HLE is registered, before the guest runs. Built in only when the
-        // corresponding SDL3 frontend is enabled; a window app wants both on by default.
-        auto install_backends = []{
-#ifdef PROSPER_AUDIO_FFMPEG
-            if (prosper::ajm::install_ffmpeg_decoder_backend())
-                fprintf(stderr, "[app] FFmpeg AJM audio decoder installed.\n");
-            else
-                fprintf(stderr, "[app] FFmpeg AJM audio decoder unavailable.\n");
-#endif
-#ifdef PROSPER_VIDEO_MF
-            if (!getenv("PROSPER_APP_DISABLE_VIDEO")) {
-                if (prosper::video::install_media_foundation_backend())
-                    fprintf(stderr, "[app] Media Foundation video backend installed.\n");
-                else
-                    fprintf(stderr, "[app] Media Foundation video backend unavailable.\n");
-            } else {
-                fprintf(stderr, "[app] native video backend disabled.\n");
-            }
-#endif
-#ifdef PROSPER_VIDEO_VAAPI
-            if (!getenv("PROSPER_APP_DISABLE_VIDEO")) {
-                if (prosper::video::install_vaapi_backend())
-                    fprintf(stderr, "[app] FFmpeg/VA-API video backend installed.\n");
-                else
-                    fprintf(stderr, "[app] FFmpeg/VA-API video backend unavailable.\n");
-            } else {
-                fprintf(stderr, "[app] native video backend disabled.\n");
-            }
-#endif
-#ifdef PROSPER_AUDIO_SDL3
-            if (!getenv("PROSPER_APP_DISABLE_AUDIO")) {
-                prosper::install_sdl3_audio_sink();
-            } else {
-                fprintf(stderr, "[app] SDL audio backend disabled; using the realtime silent sink.\n");
-            }
-#endif
-#ifdef PROSPER_PAD_SDL3
-            if (!getenv("PROSPER_APP_DISABLE_PAD")) {
-                if (prosper::install_sdl3_pad_backend()) {
-                    g_keyboard_pad.set_fallback(prosper::input::pad_backend());
-                    fprintf(stderr, "[app] controller backend installed.\n");
-                }
-            } else {
-                fprintf(stderr, "[app] SDL controller backend disabled; keyboard and scripted input remain available.\n");
-            }
-#endif
-#ifdef PROSPER_HAVE_DIALOG_SDL3
-            if (!getenv("PROSPER_APP_DISABLE_DIALOG")) {
-                prosper::install_sdl3_platform_ui();   // real SDL message boxes for MsgDialog/ErrorDialog (#347)
-                fprintf(stderr, "[app] dialog backend installed.\n");
-            } else {
-                fprintf(stderr, "[app] SDL dialog backend disabled; using headless auto-dismiss.\n");
-            }
-#endif
-        };
-        if (!boot_program(dump, prog, &err, install_backends)) { fprintf(stderr, "[app] boot failed: %s\n", err.c_str()); return 1; }
-        guestThread = std::thread([]{
-            const BootResult result = run_entry(prog.imgs[0]);
-            fprintf(stderr,
-                    "[app] guest thread ended: kind=%d detail=%s rip=0x%llx addr=0x%llx "
-                    "rax=0x%llx rbx=0x%llx rdi=0x%llx rsi=0x%llx rdx=0x%llx "
-                    "rbp=0x%llx rsp=0x%llx\n",
-                    result.kind, result.detail.c_str(),
-                    static_cast<unsigned long long>(result.fault_rip),
-                    static_cast<unsigned long long>(result.fault_addr),
-                    static_cast<unsigned long long>(result.rax),
-                    static_cast<unsigned long long>(result.rbx),
-                    static_cast<unsigned long long>(result.rdi),
-                    static_cast<unsigned long long>(result.rsi),
-                    static_cast<unsigned long long>(result.rdx),
-                    static_cast<unsigned long long>(result.rbp),
-                    static_cast<unsigned long long>(result.rsp));
-            if (result.kind != 0)
-                dump_guest_exception_trace();
-            for (uint64_t address : result.backtrace)
-                fprintf(stderr, "[app] guest backtrace: 0x%llx\n",
-                        static_cast<unsigned long long>(address));
-        });   // runs the guest frame loop
-        fprintf(stderr, "[app] guest booted; presenting its frames.\n");
+        std::string err;
+        if (!start_guest(dump, &err)) { fprintf(stderr, "[app] boot failed: %s\n", err.c_str()); return 1; }
     } else if (!testPattern) {
-        fprintf(stderr, "[app] no dump given and not --test-pattern; waiting for external present frames.\n");
+        fprintf(stderr, "[app] no game given; the window opens empty and can be given one "
+                        "(drop a game folder on it, or press Ctrl+O).\n");
     }
 
     if (!SDL_Init(SDL_INIT_VIDEO)) { fprintf(stderr, "[app] SDL_Init: %s\n", SDL_GetError()); return 1; }
@@ -757,15 +930,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 #endif
-    // Title: "prosper — <game name>" for a booted game (name from param.json; falls back to the app0 basename),
-    // else a plain label.
-    std::string title = "prosper";
-    if (!dump.empty()) {
-        std::string name = read_game_title(dump);
-        if (name.empty()) { auto sl = dump.find_last_of("/\\"); name = (sl == std::string::npos ? dump : dump.substr(sl + 1)); }
-        title += " — " + name;
-    }
-    else if (testPattern) title += " — test pattern";
+    // Title: "prosper — <game name>" for a booted game, else a label saying what the empty window
+    // is waiting for. A title opened later replaces this (#1469).
+    std::string title = window_title_for(dump, testPattern);
     fprintf(stderr, "[app] window title: \"%s\"\n", title.c_str());
     SDL_Window* win = SDL_CreateWindow(title.c_str(), (int)winW, (int)winH, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
     if (!win) { fprintf(stderr, "[app] SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
@@ -845,6 +1012,57 @@ int main(int argc, char** argv) {
     const SDL_WindowFlags initialWindowFlags = SDL_GetWindowFlags(win);
     bool fullscreenRequested = (initialWindowFlags & SDL_WINDOW_FULLSCREEN) != 0;
     windowControls.set_app_focus((initialWindowFlags & SDL_WINDOW_INPUT_FOCUS) != 0);
+
+    // Open a title the user handed the window — a dropped folder, or the folder picker's result
+    // (#1469). argv never comes through here; it booted before the window existed.
+    const prosper::frontend::GamePathProbe pathProbe = host_path_probe();
+    auto open_game = [&](const std::string& picked) {
+        const std::string root = prosper::frontend::resolve_app0_root(picked, pathProbe);
+        switch (prosper::frontend::decide_open_action(root, g_guest_started)) {
+        case prosper::frontend::GameOpenAction::ignore:
+            fprintf(stderr, "[app] not a PS5 title: %s\n", picked.c_str());
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "prosper",
+                ("That is not a PS5 game:\n\n" + picked +
+                 "\n\nChoose the game's app0 folder — the one holding eboot.bin and sce_sys.").c_str(),
+                win);
+            break;
+        case prosper::frontend::GameOpenAction::relaunch:
+            // The running guest cannot be stopped in-process (#352), so hand the new title to a
+            // fresh process and let this one shut down normally.
+            fprintf(stderr, "[app] a game is already running; starting a new process for %s\n",
+                    root.c_str());
+            if (relaunch_with_dump(argc, argv, root)) {
+                running = false;
+            } else {
+                fprintf(stderr, "[app] could not start the new process\n");
+                SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "prosper",
+                    "prosper runs one game per launch, and starting a second process failed.\n\n"
+                    "Quit and start prosper again with the other game.", win);
+            }
+            break;
+        case prosper::frontend::GameOpenAction::boot_in_process: {
+            fprintf(stderr, "[app] opening %s\n", root.c_str());
+            std::string err;
+            if (!start_guest(root, &err)) {
+                fprintf(stderr, "[app] boot failed: %s\n", err.c_str());
+                SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "prosper",
+                    ("Could not start that game.\n\n" + err).c_str(), win);
+                break;
+            }
+            title = window_title_for(root, false);
+            SDL_SetWindowTitle(win, title.c_str());
+            break;
+        }
+        }
+    };
+
+    // A launch that was not told what to show would otherwise be a dead end for anyone who did not
+    // arrive through a command line.
+    if (prosper::frontend::should_pick_at_startup(pick)) {
+        fprintf(stderr, "[app] no game given; opening the folder picker.\n");
+        open_folder_picker(win);
+    }
+
     while (running && !prosper_stop_requested()) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
@@ -879,6 +1097,14 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr,
                         "[grab] F9: arming a whole-frame capture -> %s.prgbundle (+ .bmp screenshot)\n",
                         base);
+                    continue;
+                }
+                // Ctrl+O opens a title in the empty window (#1469). Deliberately unavailable once a
+                // game is running: the guest owns the keyboard from that point (O is its R1), and a
+                // second title needs a new process anyway — drop a folder on the window for that.
+                if (ev.type == SDL_EVENT_KEY_DOWN && key.app_window && !ev.key.repeat &&
+                    ev.key.key == SDLK_O && (ev.key.mod & SDL_KMOD_CTRL) && !g_guest_started) {
+                    open_folder_picker(win);
                     continue;
                 }
                 // #1093: forward app-window keys to the guest's IME keyboard path. Titles like
@@ -943,9 +1169,22 @@ int main(int argc, char** argv) {
             } else if (ev.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN &&
                        ev.window.windowID == appWindowId) {
                 fullscreenRequested = false;
+            } else if (ev.type == SDL_EVENT_DROP_FILE && ev.drop.windowID == appWindowId) {
+                // A game folder dropped on the window (#1469). Works whether or not one is running:
+                // with a game up this relaunches, which is the only way to switch titles today.
+                if (ev.drop.data) open_game(ev.drop.data);
             }
         }
         if (!running) break;
+
+        // The folder picker answers asynchronously and possibly on another thread, so it parks its
+        // result. Consume it here, between frames, where booting is safe.
+        {
+            std::string picked;
+            { std::lock_guard<std::mutex> lock(g_picked_mutex); picked.swap(g_picked_path); }
+            if (!picked.empty()) open_game(picked);
+            if (!running) break;
+        }
 
         // Snapshot input before any minimized-window early exit. This clears released guest
         // buttons even while swapchain recreation has to wait for a non-zero pixel extent.
@@ -1000,6 +1239,22 @@ int main(int argc, char** argv) {
                 nextTimedDump = loopNow + std::chrono::milliseconds(timedDumpIntervalMs);
             else
                 timedDumpPending = false;
+        }
+
+        // No game yet and no test pattern: nothing is producing frames, so paint the window a flat
+        // colour instead of leaving it on undefined swapchain contents while it waits (#1469).
+        // present_frame blits to the whole swapchain extent, so a 4x4 source fills any window size.
+        // present_frame_seq() counts every frame handed to the present layer, so the moment anything
+        // publishes one — a game opened here, or an external producer — the real path takes over.
+        // These frames deliberately do not count toward --frames: that gate asserts real content.
+        if (!testPattern && !g_guest_started && gpu::present_frame_seq() == 0) {
+            static const uint8_t kIdlePixel[4] = {0x1e, 0x1e, 0x1e, 0xff};
+            static uint8_t kIdleFrame[4 * 4 * 4];
+            for (size_t i = 0; i < sizeof kIdleFrame; i++) kIdleFrame[i] = kIdlePixel[i % 4];
+            if (present_frame(vk, kIdleFrame, 4, 4) == PresentAttempt::out_of_date)
+                swapchainDirty = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            continue;
         }
 
         static const uint32_t kPatW = 1920, kPatH = 1080;
@@ -1135,8 +1390,8 @@ int main(int argc, char** argv) {
     // state while guest threads still use it (a short --frames run reliably ended in 0xC0000005 on
     // Windows). Until the flip-boundary cooperative stop is implemented, terminate directly and
     // let the OS reclaim process state without running destructors under the live guest.
-    if (guestThread.joinable()) {
-        guestThread.detach();
+    if (g_guest_thread.joinable()) {
+        g_guest_thread.detach();
         fflush(nullptr);
         std::_Exit(exitCode);
     }
