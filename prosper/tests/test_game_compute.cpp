@@ -21,6 +21,15 @@ static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { std::printf("FAIL: %s\n", msg); fails++; } } while (0)
 
 int main() {
+    CHECK(prosper::frontend::storage_writeback_can_tile_mapped_bytes(true, 27, false),
+          "native tiled storage can feed mapped bytes directly to the tiler");
+    CHECK(!prosper::frontend::storage_writeback_can_tile_mapped_bytes(false, 27, false),
+          "converted storage retains its mutable packed buffer");
+    CHECK(!prosper::frontend::storage_writeback_can_tile_mapped_bytes(true, 0, false),
+          "linear guest storage still copies mapped bytes into guest memory");
+    CHECK(!prosper::frontend::storage_writeback_can_tile_mapped_bytes(true, 27, true),
+          "poison proving retains a mutable copy for untouched-texel restoration");
+
     bool half_luts_match = true;
     for (uint32_t bits = 0; bits <= 0xffffu; ++bits) {
         const uint16_t half = static_cast<uint16_t>(bits);

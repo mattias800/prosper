@@ -3765,9 +3765,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (!r->host_data && r->gpu_addr)
                 prosper::host::guest_write_watch_notify_host_write(
                     r->gpu_addr, bi.guest_bytes);
+            const bool tile_mapped_bytes = storage_writeback_can_tile_mapped_bytes(
+                bi.native_float_storage, r->tile_mode, bi.poison_verify);
             std::unique_ptr<uint8_t[]> linear;
             uint8_t* packed = destination;
-            if (r->tile_mode) {
+            if (r->tile_mode && !tile_mapped_bytes) {
                 linear = std::make_unique_for_overwrite<uint8_t[]>(linear_bytes);
                 packed = linear.get();
             }
@@ -3823,13 +3825,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             static const bool pack_range_enabled = !std::getenv("PROSPER_NO_PACK_RANGE");
             if (bi.native_float_storage) {
                 // The typed Vulkan image has already applied the PS5 descriptor's UNORM/float
-                // conversion. Its transfer bytes are the guest's exact row-major texels.
-                parallel_compute_texels(texels, linear_bytes * 2,
-                    [&](size_t begin, size_t end) {
-                        std::memcpy(packed + begin * guest_texel,
-                                    native_texels + begin * guest_texel,
-                                    (end - begin) * guest_texel);
-                    });
+                // conversion. Its transfer bytes are the guest's exact row-major texels. A tiled
+                // non-proving write can feed those bytes straight to the tiler, avoiding a second
+                // full-surface allocation and memcpy (66.8 MiB for Astro Bot's 4K RGBA16F target).
+                if (!tile_mapped_bytes)
+                    parallel_compute_texels(texels, linear_bytes * 2,
+                        [&](size_t begin, size_t end) {
+                            std::memcpy(packed + begin * guest_texel,
+                                        native_texels + begin * guest_texel,
+                                        (end - begin) * guest_texel);
+                        });
             } else if (pack_range_enabled) {
                 storage_pack_range(channels, r->format, nc, texels, packed, guest_texel);
             } else {
@@ -3875,20 +3880,21 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     std::fprintf(stderr, "[compute] pack-verify first mismatch texel=%zu\n",
                                  first_bad);
             }
+            const uint8_t* layout_source = tile_mapped_bytes ? native_texels : packed;
             if (r->tile_mode && r->depth > 1) {
-                if (!tile_volume(destination, bi.guest_bytes, packed, r->width, r->height,
+                if (!tile_volume(destination, bi.guest_bytes, layout_source, r->width, r->height,
                                  r->depth, r->tile_mode, static_cast<uint32_t>(guest_texel))) {
                     readback_ok = false;
                     ctx.unmap_memory(staging_memory[i]);
                     break;
                 }
             } else if (r->tile_mode && r->in_mip_tail) {
-                tile_surface_level(destination, bi.guest_bytes, packed,
+                tile_surface_level(destination, bi.guest_bytes, layout_source,
                                    r->width, r->height, r->tile_mode,
                                    static_cast<uint32_t>(guest_texel),
                                    r->mip_tail_x, r->mip_tail_y);
             } else if (r->tile_mode) {
-                tile_surface(destination, packed, r->width, r->height, r->tile_mode, 0,
+                tile_surface(destination, layout_source, r->width, r->height, r->tile_mode, 0,
                              static_cast<uint32_t>(guest_texel));
             }
             const auto layout_done = ComputeClock::now();
