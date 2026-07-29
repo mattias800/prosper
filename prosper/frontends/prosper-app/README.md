@@ -154,8 +154,9 @@ this build; the data and the command-line surface are.
   run already has a game (`--dump`/positional) or `--test-pattern`.
 - `--no-pick` — never open the picker at startup, including on a no-argument launch. Wins over `--pick`.
 - `--games-dir <path>` — where your PS5 titles live, for this run only. See "The game library" above.
+  A missing or empty path is an error (exit 2).
 - `--set-games-dir <path>` — record that directory for future launches, then exit. An empty path
-  (`--set-games-dir ""`) clears the stored setting.
+  (`--set-games-dir ""`) clears the stored setting; a missing one is an error (exit 2).
 - `--list-games` — print the library as plain text and exit, with no window, no Vulkan and no guest.
 - `--frames N` — present N frames then exit 0 (non-interactive smoke; exit 1 if it couldn't).
 - `--present-mode fifo|mailbox|immediate` — choose swapchain latency behavior. FIFO is the default;

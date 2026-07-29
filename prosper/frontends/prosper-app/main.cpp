@@ -679,6 +679,17 @@ static prosper::frontend::GamePathProbe host_path_probe() {
     return probe;
 }
 
+// Read a file whole, exactly as named. Returns "" when it cannot be opened.
+static std::string read_whole_file(const std::string& path) {
+    std::string out;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return out;
+    char buf[8192]; size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
+    std::fclose(f);
+    return out;
+}
+
 // The host side of game_library.hpp's injected IO.
 static prosper::frontend::GameLibraryIo host_library_io() {
     prosper::frontend::GameLibraryIo io;
@@ -694,20 +705,15 @@ static prosper::frontend::GameLibraryIo host_library_io() {
             names.push_back(it->path().filename().string());
             it.increment(ec);
         }
+        // A partial listing is the right recovery, but showing fewer games with no explanation is not.
+        if (ec) fprintf(stderr, "[app] listing %s stopped early: %s\n", dir.c_str(), ec.message().c_str());
         return names;
     };
     io.read_file = [](const std::string& want) {
         // Case-correct like boot_program does (#1006/#1226): a dump shipping SCE_SYS/PARAM.JSON on a
         // case-sensitive host would otherwise pass the probe and then read as empty, silently
-        // demoting the title to its directory name.
-        const std::string path = resolve_host_path_case(want);
-        std::string out;
-        FILE* f = std::fopen(path.c_str(), "rb");
-        if (!f) return out;
-        char buf[8192]; size_t n;
-        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
-        std::fclose(f);
-        return out;
+        // demoting the title to its directory name. GUEST paths only — see read_whole_file.
+        return read_whole_file(resolve_host_path_case(want));
     };
     io.resolve_case = [](const std::string& want) { return resolve_host_path_case(want); };
     return io;
@@ -742,7 +748,10 @@ static std::string app_config_path() {
 static prosper::frontend::AppConfig load_app_config() {
     const std::string path = app_config_path();
     if (path.empty()) return {};
-    return prosper::frontend::parse_app_config(host_library_io().read_file(path));
+    // Read exactly, NOT through the case-correcting guest-path reader: this file's spelling is ours,
+    // and case-correcting a path that usually does not exist scans its ancestor directories on every
+    // first launch for no benefit.
+    return prosper::frontend::parse_app_config(read_whole_file(path));
 }
 
 // Persist the settings. Best-effort: failing to write is reported and otherwise ignored, since the

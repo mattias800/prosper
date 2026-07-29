@@ -174,8 +174,13 @@ inline GameEntry describe_game(const std::string& app0_root, const GamePathProbe
                                const GameLibraryIo& io) {
     GameEntry entry;
     entry.app0_root = strip_trailing_separators(app0_root);
-    const std::string json = io.read_file ? io.read_file(entry.app0_root + "/sce_sys/param.json")
-                                          : std::string();
+    // Ask the probe before reading. A title accepted on eboot.bin alone has no param.json, and the
+    // host reader case-corrects — which, on a miss, enumerates the directories it searched. That is a
+    // scan of a whole title root to learn something the probe already knows.
+    const std::string param = entry.app0_root + "/sce_sys/param.json";
+    const std::string json = (io.read_file && probe.is_file && probe.is_file(param))
+                                 ? io.read_file(param)
+                                 : std::string();
     if (!json.empty()) {
         entry.title_id = parse_param_title_id(json);
         entry.title_name = parse_param_title_name(json);
