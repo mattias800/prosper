@@ -1949,7 +1949,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 resource->cls == ResourceClass::StorageImage &&
                 resource->format == DataFormat::Uint32 && resource->num_components == 1 &&
                 resource->img_dim == 1 && resource->depth == 1 &&
-                !resource->depth_compare && resource->width && resource->height;
+                !resource->depth_compare && !resource->in_mip_tail &&
+                !resource->compression_enabled && resource->width && resource->height;
             const uint64_t linear_image_bytes = static_cast<uint64_t>(resource->width) *
                 resource->height * sizeof(uint32_t);
             if (buffers[i].atomic_image) {

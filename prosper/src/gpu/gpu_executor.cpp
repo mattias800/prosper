@@ -134,6 +134,12 @@ struct ShaderResourceCompileKey {
     uint32_t cls = 0;
     uint32_t format = 0;
     uint32_t num_components = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t depth = 0;
+    uint32_t img_dim = 0;
+    bool in_mip_tail = false;
+    bool compression_enabled = false;
     uint32_t binding = 0;
     uint32_t stride = 0;
     uint32_t srt_offset = 0;
@@ -284,6 +290,12 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.cls);
             hash = hash_mix(hash, resource.format);
             hash = hash_mix(hash, resource.num_components);
+            hash = hash_mix(hash, resource.width);
+            hash = hash_mix(hash, resource.height);
+            hash = hash_mix(hash, resource.depth);
+            hash = hash_mix(hash, resource.img_dim);
+            hash = hash_mix(hash, resource.in_mip_tail);
+            hash = hash_mix(hash, resource.compression_enabled);
             hash = hash_mix(hash, resource.binding);
             hash = hash_mix(hash, resource.stride);
             hash = hash_mix(hash, resource.srt_offset);
@@ -911,19 +923,33 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             const bool texture = resource.cls == ResourceClass::Texture;
             const bool storage_image = resource.cls == ResourceClass::StorageImage;
             const bool manual_compare = texture && resource.depth_compare;
-            key.resources.push_back({
-                static_cast<uint32_t>(resource.cls), static_cast<uint32_t>(resource.format),
-                resource.num_components, resource.binding, resource.stride,
-                resource.srt_offset, resource.sgpr_base, resource.fetch_pc,
-                static_cast<uint32_t>(resource.fetch_index_mode),
-                resource.flat_base_sgpr, storage_image && resource.srgb,
-                manual_compare,
-                manual_compare ? resource.depth_compare_func : 0u,
-                manual_compare ? resource.mag_filter : 0u,
-                manual_compare ? resource.addr_uvw[0] : 0u,
-                manual_compare ? resource.addr_uvw[1] : 0u,
-                manual_compare ? resource.border_color_type : 0u,
-            });
+            const bool atomic_extent = storage_image &&
+                resource.format == DataFormat::Uint32 && resource.num_components == 1;
+            ShaderResourceCompileKey compiled;
+            compiled.cls = static_cast<uint32_t>(resource.cls);
+            compiled.format = static_cast<uint32_t>(resource.format);
+            compiled.num_components = resource.num_components;
+            compiled.width = atomic_extent ? resource.width : 0u;
+            compiled.height = atomic_extent ? resource.height : 0u;
+            compiled.depth = storage_image ? resource.depth : 0u;
+            compiled.img_dim = (texture || storage_image) ? resource.img_dim : 0u;
+            compiled.in_mip_tail = storage_image && resource.in_mip_tail;
+            compiled.compression_enabled = storage_image && resource.compression_enabled;
+            compiled.binding = resource.binding;
+            compiled.stride = resource.stride;
+            compiled.srt_offset = resource.srt_offset;
+            compiled.sgpr_base = resource.sgpr_base;
+            compiled.fetch_pc = resource.fetch_pc;
+            compiled.fetch_index_mode = static_cast<uint32_t>(resource.fetch_index_mode);
+            compiled.flat_base_sgpr = resource.flat_base_sgpr;
+            compiled.srgb = storage_image && resource.srgb;
+            compiled.depth_compare = (manual_compare || storage_image) && resource.depth_compare;
+            compiled.depth_compare_func = manual_compare ? resource.depth_compare_func : 0u;
+            compiled.mag_filter = manual_compare ? resource.mag_filter : 0u;
+            compiled.addr_u = manual_compare ? resource.addr_uvw[0] : 0u;
+            compiled.addr_v = manual_compare ? resource.addr_uvw[1] : 0u;
+            compiled.border_color_type = manual_compare ? resource.border_color_type : 0u;
+            key.resources.push_back(compiled);
         }
     }
     key.cached_hash = ShaderCompileKeyHash::compute(key);

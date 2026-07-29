@@ -219,6 +219,17 @@ int main() {
           cf.src[1].kind == OperandKind::InlineInt && cf.src[1].value == 3 &&
           cf.sdwa_src0_sel == 6u && cf.sdwa_src1_sel == 6u,
           "Astro v_cmp_class_f32 SDWA packet retains s[8:9], v1, and NaN class mask 3");
+    const uint32_t class_neg_f32[] = { 0x7d1108f9u, 0x86168801u };
+    Rdna2Inst cnf = rdna2_decode_one(class_neg_f32, 2);
+    CHECK(cnf.fmt == Rdna2Format::VOPC && cnf.opcode == 0x88u &&
+          cnf.src_neg[0] && !cnf.src_abs[0] && isV(cnf.src[0], 1) &&
+          cnf.src[1].kind == OperandKind::InlineInt && cnf.src[1].value == 4,
+          "v_cmp_class_f32 SDWA retains the valid source NEG modifier");
+    const uint32_t class_abs_f32[] = { 0x7d1108f9u, 0x86268801u };
+    Rdna2Inst caf = rdna2_decode_one(class_abs_f32, 2);
+    CHECK(caf.fmt == Rdna2Format::VOPC && caf.opcode == 0x88u &&
+          !caf.src_neg[0] && caf.src_abs[0] && isV(caf.src[0], 1),
+          "v_cmp_class_f32 SDWA retains the valid source ABS modifier");
     const uint32_t cvt_byte[] = { 0x7e0a0cf9u, 0x0000160bu };
     Rdna2Inst cb = rdna2_decode_one(cvt_byte, 2);
     CHECK(cb.fmt == Rdna2Format::VOP1 && cb.opcode == 0x06u && !cb.has_modifier &&

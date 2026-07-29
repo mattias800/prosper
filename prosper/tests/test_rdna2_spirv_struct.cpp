@@ -1117,6 +1117,31 @@ int main() {
         return 1;
     }
     printf("  [ok]   compute atomic-buffer view rejects an undersized image backing\n");
+    ShaderResourceTable compressed_atomic_image = rt_atomic_image;
+    compressed_atomic_image.resources[0].compression_enabled = true;
+    const DescriptorValidationReport compressed_atomic_report =
+        validate_spirv_descriptor_interface(
+            atomic_add_spv, &compressed_atomic_image, 0,
+            SpirvShaderStage::Compute, false);
+    if (compressed_atomic_report.ok() ||
+        !recompile_compute(cs_image_atomic_add, std::size(cs_image_atomic_add),
+                           &compressed_atomic_image, atomic_add_config).empty()) {
+        printf("  [FAIL] compute atomic-buffer view accepted a DCC-compressed image\n");
+        return 1;
+    }
+    ShaderResourceTable tail_atomic_image = rt_atomic_image;
+    tail_atomic_image.resources[0].in_mip_tail = true;
+    const DescriptorValidationReport tail_atomic_report =
+        validate_spirv_descriptor_interface(
+            atomic_add_spv, &tail_atomic_image, 0,
+            SpirvShaderStage::Compute, false);
+    if (tail_atomic_report.ok() ||
+        !recompile_compute(cs_image_atomic_add, std::size(cs_image_atomic_add),
+                           &tail_atomic_image, atomic_add_config).empty()) {
+        printf("  [FAIL] compute atomic-buffer view accepted a mip-tail image\n");
+        return 1;
+    }
+    printf("  [ok]   compute atomic-buffer view rejects compressed and mip-tail images\n");
 
     // Astro Bot's visibility kernel sanitizes a generated coordinate with an explicit-SDST
     // v_cmp_class_f32 SDWA (mask 3 = sNaN|qNaN), followed by v_cndmask reading s[8:9]. Rejecting
@@ -1136,6 +1161,22 @@ int main() {
         return 1;
     }
     printf("  [ok]   v_cmp_class_f32 lowers raw IEEE classes and feeds its explicit SGPR mask\n");
+    const uint32_t cs_class_modifiers[] = {
+        0x7e0202ffu, 0x7f800000u,           // v_mov_b32 v1, +Inf
+        0x7d1108f9u, 0x86168801u,           // v_cmp_class_f32_sdwa s8, -v1, 4 (-Inf)
+        0x7d1108f9u, 0x86268801u,           // v_cmp_class_f32_sdwa s8, |v1|, 4
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> class_modifier_spv = recompile_valu(
+        cs_class_modifiers, std::size(cs_class_modifiers), 1, 0, nullptr);
+    bool has_abs_sign_mask = false;
+    for (uint32_t word : class_modifier_spv) has_abs_sign_mask |= word == 0x7fffffffu;
+    if (class_modifier_spv.empty() || !has_opcode(class_modifier_spv, 198u) ||
+        !has_abs_sign_mask || !type_result_ids_are_nonzero(class_modifier_spv, nullptr)) {
+        printf("  [FAIL] v_cmp_class_f32 dropped raw ABS/NEG sign-bit modifiers\n");
+        return 1;
+    }
+    printf("  [ok]   v_cmp_class_f32 applies ABS/NEG without canonicalizing raw NaN bits\n");
 
     // Astro Bot's world-map shader samples a 192-layer BC6H 2D array with explicit LOD. The layer
     // coordinate must survive in OpTypeImage so the live backend creates a matching 2D-array view.
@@ -1193,6 +1234,35 @@ int main() {
         return 1;
     }
     printf("  [ok]   2D-array image_sample_lz retains its layer coordinate and reflected view shape\n");
+
+    // A single binding can be sampled with both ordinary SAMPLE and explicit SAMPLE_L. Compute has
+    // no derivatives, so both use explicit LOD while preserving the common array coordinate/type.
+    const uint32_t cs_sample_array_mixed[] = {
+        0x7e0002ffu, 0x3f000000u, 0x7e0202ffu, 0x3f000000u,
+        0x7e0402ffu, 0x3f800000u, 0x7e060280u,
+        0xf0800f2au, 0x00400000u, 0x00000201u,
+        0xf0900f2au, 0x00400000u, 0x00030201u,
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> array_mixed_spv = recompile_valu(
+        cs_sample_array_mixed, std::size(cs_sample_array_mixed), 4, 0, &rt_array);
+    const DescriptorValidationReport array_mixed_report = validate_spirv_descriptor_interface(
+        array_mixed_spv, &rt_array, 0, SpirvShaderStage::Compute);
+    const SpirvDescriptorBinding* array_mixed_descriptor = nullptr;
+    size_t array_mixed_texture_count = 0;
+    for (const auto& descriptor : array_mixed_report.descriptors) {
+        if (descriptor.binding == 4u &&
+            descriptor.kind == SpirvDescriptorKind::CombinedImageSampler) {
+            array_mixed_descriptor = &descriptor;
+            array_mixed_texture_count++;
+        }
+    }
+    if (array_mixed_spv.empty() || array_mixed_texture_count != 1u ||
+        !array_mixed_descriptor || !array_mixed_descriptor->image_arrayed) {
+        printf("  [FAIL] mixed compute SAMPLE/SAMPLE_L produced incompatible image types\n");
+        return 1;
+    }
+    printf("  [ok]   mixed compute SAMPLE/SAMPLE_L shares one 2D-array image contract\n");
 
     // The visibility half of the same kernel comparison-samples a sixteen-layer shadow array.
     // Compute keeps its slice and performs the compare manually over a color-sampled array image.

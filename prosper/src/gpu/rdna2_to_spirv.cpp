@@ -837,6 +837,7 @@ struct SpirvCompute {
     std::unordered_map<uint32_t, uint32_t> tex_binding_simg;
     std::unordered_map<uint32_t, uint32_t> tex_binding_img;
     std::unordered_map<uint32_t, bool> tex_binding_uint;
+    std::unordered_map<uint32_t, uint32_t> tex_binding_key;
     uint32_t t_v3f_cache = 0;
     uint32_t t_v3f() { if (!t_v3f_cache) { t_v3f_cache = id(); put(types, Op_TypeVector, {t_v3f_cache, t_f32, 3}); } return t_v3f_cache; }
     uint32_t t_v3i_cache = 0;
@@ -856,11 +857,11 @@ struct SpirvCompute {
         tex_simg_type[key] = si; tex_img_type[key] = ti; return si;
     }
     // Declare (idempotently) a combined image+sampler of SPIR-V `dim` at descriptor-set 0, `binding`.
-    void declare_texture(uint32_t binding, uint32_t dim = Dim_2D, bool is_uint = false,
+    bool declare_texture(uint32_t binding, uint32_t dim = Dim_2D, bool is_uint = false,
                          bool arrayed = false, bool depth = false) {
         const uint32_t key = sampled_image_key(dim, is_uint, arrayed, depth);
         uint32_t simg = sampled_image_type(dim, is_uint, arrayed, depth);
-        if (tex_var.count(binding)) return;
+        if (tex_var.count(binding)) return tex_binding_key[binding] == key;
         uint32_t t_ptr = id(); put(types, Op_TypePointer, {t_ptr, SC_UniformConstant, simg});
         uint32_t v = id();     put(types, Op_Variable,    {t_ptr, v, SC_UniformConstant});
         put(deco, Op_Decorate, {v, Dec_DescriptorSet, desc_set});
@@ -869,6 +870,8 @@ struct SpirvCompute {
         tex_binding_simg[binding] = simg;
         tex_binding_img[binding] = tex_img_type[key];
         tex_binding_uint[binding] = is_uint;
+        tex_binding_key[binding] = key;
+        return true;
     }
     uint32_t texture_vec4(uint32_t binding) {
         return tex_binding_uint[binding] ? t_v4u() : t_v4f;
@@ -5365,10 +5368,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // CLASS tests the raw IEEE-754 category rather than doing a floating-point
                     // comparison. Keep this entirely in the integer domain so signalling/quiet
                     // NaNs and the sign of zero/NaN survive on every SPIR-V target.
+                    uint32_t class_raw = ra;
+                    if (in.src_abs[0])
+                        class_raw = b.ibin(Op_BitwiseAnd, class_raw, b.uconst(0x7fffffffu));
+                    if (in.src_neg[0])
+                        class_raw = b.ibin(Op_BitwiseXor, class_raw, b.uconst(0x80000000u));
                     const uint32_t sign = b.ucmp(
-                        Op_INotEqual, b.ibin(Op_BitwiseAnd, ra, b.uconst(0x80000000u)), b.uconst(0));
-                    const uint32_t exponent = b.ibin(Op_BitwiseAnd, ra, b.uconst(0x7f800000u));
-                    const uint32_t mantissa = b.ibin(Op_BitwiseAnd, ra, b.uconst(0x007fffffu));
+                        Op_INotEqual,
+                        b.ibin(Op_BitwiseAnd, class_raw, b.uconst(0x80000000u)), b.uconst(0));
+                    const uint32_t exponent =
+                        b.ibin(Op_BitwiseAnd, class_raw, b.uconst(0x7f800000u));
+                    const uint32_t mantissa =
+                        b.ibin(Op_BitwiseAnd, class_raw, b.uconst(0x007fffffu));
                     const uint32_t exponent_zero = b.ucmp(Op_IEqual, exponent, b.uconst(0));
                     const uint32_t exponent_all = b.ucmp(Op_IEqual, exponent, b.uconst(0x7f800000u));
                     const uint32_t mantissa_zero = b.ucmp(Op_IEqual, mantissa, b.uconst(0));
@@ -6890,7 +6901,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                      in.mimg_unorm || in.mimg_dmask != 1u ||
                      res->img_dim != 1u || res->depth != 1u || res->depth_compare ||
                      res->format != DataFormat::Uint32 || components != 1u ||
-                     !res->width || !res->height)) {
+                     !res->width || !res->height || res->in_mip_tail ||
+                     res->compression_enabled)) {
                     ok = false;
                     return true;
                 }
@@ -6982,7 +6994,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 else if (in.mimg_dim == 2u) dim = Dim_3D;
                 else { ok = false; return true; }
                 if (res->cls != ResourceClass::Texture) { ok = false; return true; }
-                b.declare_texture(res->binding, dim, uint_texture);
+                if (!b.declare_texture(res->binding, dim, uint_texture)) {
+                    ok = false; return true;
+                }
                 uint32_t out[4]; b.image_get_resinfo(res->binding, dim, vread(in.src[0].value), out);
                 int vd = in.dst.value, w = 0;
                 for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) {
@@ -7081,20 +7095,26 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // faces as one vertical 2D stack, so compare the transformed face coordinate
                     // manually through its ordinary non-compare sampler (#1167/#1169).
                     if (uint_texture || !res->depth_compare) { ok = false; return true; }
-                    b.declare_texture(res->binding, Dim_2D, false);
+                    if (!b.declare_texture(res->binding, Dim_2D, false)) {
+                        ok = false; return true;
+                    }
                     b.image_sample_dref_manual_2d(res->binding, uf, v6, vread(cvg(0)),
                                                   res->depth_compare_func,
                                                   res->mag_filter != 0u, res->addr_uvw[0],
                                                   res->addr_uvw[1], res->border_color_type, out);
                 } else {
-                    b.declare_texture(res->binding, Dim_2D, uint_texture);
+                    if (!b.declare_texture(res->binding, Dim_2D, uint_texture)) {
+                        ok = false; return true;
+                    }
                     b.image_sample_lod_2d(res->binding, uf, v6, b.uconst(0), out);
                 }
             } else if (dim3d) {
                 // 3D: implicit-LOD / LOD-0 sample, or an integer texel FETCH (image_load — DOLL's
                 // color-grade 3D LUT, #273).
                 if (!is_sample && !is_sample_lz && !is_load) { ok = false; return true; }
-                b.declare_texture(res->binding, Dim_3D, uint_texture);
+                if (!b.declare_texture(res->binding, Dim_3D, uint_texture)) {
+                    ok = false; return true;
+                }
                 if (is_sample)      b.image_sample_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
                 else if (is_load)   b.image_fetch_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
                 else                b.image_sample_lod_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)),
@@ -7124,7 +7144,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         // and perform the comparison manually over an ordinary color sampler, so no
                         // compare-sampler/Dref Vulkan contract is required. Astro Bot's world-map
                         // visibility shader selects among sixteen depth layers here.
-                        b.declare_texture(res->binding, Dim_2D, false, true);
+                        if (!b.declare_texture(res->binding, Dim_2D, false, true)) {
+                            ok = false; return true;
+                        }
                         b.image_sample_dref_manual_2d(
                             res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(0)),
                             res->depth_compare_func, res->mag_filter != 0u,
@@ -7134,7 +7156,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         // The shared graphics backend currently exposes 2D_ARRAY textures as its
                         // documented base-slice 2D view (#325). Keep that established fallback for
                         // graphics until its resource uploader can create matching array views.
-                        b.declare_texture(res->binding, Dim_2D, false);
+                        if (!b.declare_texture(res->binding, Dim_2D, false)) {
+                            ok = false; return true;
+                        }
                         b.image_sample_dref_manual_2d(
                             res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(0)),
                             res->depth_compare_func, res->mag_filter != 0u,
@@ -7146,7 +7170,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // scene rendered unattenuated/blown-out). Same 8.2.5 vaddr order with no array
                     // slice: [dref, u, v]. Lowered as a manual compare against the color-sampled
                     // shadow map (see image_sample_dref_manual_2d for why not a compare sampler).
-                    b.declare_texture(res->binding, Dim_2D, false);
+                    if (!b.declare_texture(res->binding, Dim_2D, false)) {
+                        ok = false; return true;
+                    }
                     b.image_sample_dref_manual_2d(res->binding, vread(cvg(1)), vread(cvg(2)),
                                                   vread(cvg(0)), res->depth_compare_func,
                                                   res->mag_filter != 0u, res->addr_uvw[0],
@@ -7158,7 +7184,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t dm = in.mimg_dmask;
                 if (dm != 1u && dm != 2u && dm != 4u && dm != 8u) { ok = false; return true; }
                 uint32_t comp = dm == 1u ? 0u : dm == 2u ? 1u : dm == 4u ? 2u : 3u;
-                b.declare_texture(res->binding, Dim_2D, uint_texture);
+                if (!b.declare_texture(res->binding, Dim_2D, uint_texture)) {
+                    ok = false; return true;
+                }
                 if (is_gather_lz_o)   // vaddr order for _o: [packed offset, u, v]
                     b.image_gather_offset_2d(res->binding, vread(cvg(1)), vread(cvg(2)), comp, vread(cvg(0)), out);
                 else
@@ -7171,12 +7199,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             } else {
-                const bool array_sample_lod = in.mimg_dim == 5u &&
-                                              (is_sample_l || is_sample_lz);
-                b.declare_texture(res->binding, Dim_2D, uint_texture, array_sample_lod);
-                if (array_sample_lod) {
-                    // SAMPLE_L vaddr = [u, v, slice, lod]; SAMPLE_LZ uses [u, v, slice]
-                    // and an implicit level zero. Slice remains a float array coordinate in SPIR-V.
+                const bool array_sample = in.mimg_dim == 5u && res->img_dim == 5u &&
+                    (is_sample_l || is_sample_lz || (b.is_compute && is_sample));
+                if (!b.declare_texture(res->binding, Dim_2D, uint_texture, array_sample)) {
+                    ok = false; return true;
+                }
+                if (array_sample) {
+                    // Compute SAMPLE and SAMPLE_LZ both resolve level zero; SAMPLE_L supplies its
+                    // explicit LOD. All retain the 2D-array slice in the SPIR-V coordinate.
                     b.image_sample_lod_2d_array(
                         res->binding, vread(cvg(0)), vread(cvg(1)),
                         vread(cvg(2)),

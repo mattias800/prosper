@@ -838,10 +838,12 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         const ShaderResource& r = *matches.front();
         SpirvDescriptorKind actual = resource_kind(r);
         const bool atomic_image_buffer =
+            expected_stage == SpirvShaderStage::Compute &&
             d.kind == SpirvDescriptorKind::StorageBuffer && d.atomic_access &&
             actual == SpirvDescriptorKind::StorageImage &&
             r.format == DataFormat::Uint32 && r.num_components == 1 &&
             r.img_dim == 1 && r.depth == 1 && !r.depth_compare &&
+            !r.in_mip_tail && !r.compression_enabled &&
             r.width && r.height &&
             static_cast<uint64_t>(r.width) * r.height * sizeof(uint32_t) <= r.size;
         if (actual != d.kind && !atomic_image_buffer) {
