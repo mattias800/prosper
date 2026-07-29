@@ -2356,6 +2356,14 @@ extern "C" int prosper_apr_dest_scan(uint64_t lo, uint64_t hi, char* out, size_t
 static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
     if (!size) return true;
     apr_dest_record(dst, size);
+    // APR is a DMA-style producer: its host-side copy must be able to write a destination page
+    // even when the renderer/compute caches currently have that guest page write-protected for
+    // dirty tracking.  read_full() and the vectored-read path disarm the same watches before they
+    // enter the host kernel.  Without doing so here, process_vm_writev returns EFAULT, ReadFile
+    // publishes its fallback staging pointer, and page-oriented guest consumers can observe only
+    // a prefix of a multi-page read.  Notify before the first attempt both restores write access
+    // and marks every overlapping cache registration dirty.
+    host::guest_write_watch_notify_host_write(dst, size);
     struct iovec l { buf, (size_t)size }, r { (void*)(uintptr_t)dst, (size_t)size };
     if (process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size) return true;
     bool committed = false;
