@@ -261,7 +261,17 @@ int main(int argc, char** argv) {
     // PROSPER_NO_COMPUTE=1 is a progression diagnostic only: semantic timelines still retain the
     // dispatches, but neither graphics nor compute mutates guest GPU resources. This distinguishes
     // host compute throughput from guest/HLE progression; it is never a correctness mode.
-    if (!getenv("PROSPER_NO_COMPUTE")) prosper::frontend::register_live_compute();
+    if (getenv("PROSPER_COMPUTE_TRANSLATE_ONLY")) {
+        // Shared-machine shader diagnostics need the normal resource discovery/recompiler path but
+        // no Vulkan allocation or submission. A non-null callback makes the executor realize every
+        // dispatch (including PROSPER_SHADER_DUMP failures), then deliberately discards successful
+        // items. Guest GPU resources are not mutated; this is never a correctness/progression mode.
+        prosper::gpu::set_submit_compute(
+            [](const std::vector<prosper::gpu::ComputeItem>& items) { return !items.empty(); });
+        std::fprintf(stderr, "[compute] translate-only diagnostic backend registered\n");
+    } else if (!getenv("PROSPER_NO_COMPUTE")) {
+        prosper::frontend::register_live_compute();
+    }
     // PROSPER_RENDER=1: register the live Vulkan renderer (shared with prosper-app via
     // frontends/shared/live_renderer) so execute_and_present composites every submitted Dcb with
     // draws and hands the frame to the present path; periodic BMP screenshots go to PROSPER_FRAME_DIR

@@ -3914,6 +3914,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             // PROSPER_DUMP_CONTENT=<min-nonzero-bytes>: dump ONLY frames whose framebuffer has at least
             // that many nonzero bytes — catches the intermittent content submits the periodic dump misses.
             size_t content_thr = 0; if (const char* c = getenv("PROSPER_DUMP_CONTENT")) content_thr = (size_t)atol(c);
+            // Sparse long-route captures can override the default first-60/every-10 cadence. This is
+            // particularly useful for 4K titles, where capturing itself would otherwise add gigabytes
+            // of readback I/O before the scene under investigation is reached. Zero disables a phase.
+            static const int dump_first = [] { const char* e = getenv("PROSPER_FRAME_DUMP_FIRST");
+                                                return e ? (int)atol(e) : 60; }();
+            static const int dump_every = [] { const char* e = getenv("PROSPER_FRAME_DUMP_EVERY");
+                                                return e ? (int)atol(e) : 10; }();
             // PROSPER_PRESENT_NZLOG=N: log the presented frame's nonzero-byte count every N frames WITHOUT
             // writing any image. A memory-safe content proxy for long progression runs — dumping BMPs to a
             // tmpfs frame dir exhausts RAM, this does not. 0/unset disables.
@@ -3923,7 +3930,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             if (dump_bmps || nzlog_every) for (uint8_t b : px) px_nz += (b != 0);
             if (px.empty() && !published_gpu) {
                 fprintf(stderr, "[render] frame %d: Vulkan render FAILED (%ux%u)\n", n, w, h);
-            } else if (dump_bmps && ((content_thr && px_nz >= content_thr) || (!content_thr && (n < 60 || n % 10 == 0)))) {
+            } else if (dump_bmps && ((content_thr && px_nz >= content_thr) ||
+                       (!content_thr && ((dump_first > 0 && n < dump_first) ||
+                                         (dump_every > 0 && n % dump_every == 0))))) {
                 char fn[512]; snprintf(fn, sizeof fn, "%s/frame_%04d.bmp", frame_dir.c_str(), n);
                 prosper::test::dump_bmp(fn, px, w, h);
                 fprintf(stderr, "[render] frame %d rendered (%ux%u) nz=%zu -> %s\n", n, w, h, px_nz, fn);
