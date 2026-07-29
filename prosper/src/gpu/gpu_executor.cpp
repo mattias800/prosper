@@ -1863,6 +1863,20 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             val_seed_origin_known.set((size_t)in.dst.value);
                         }
                     } else forget(in.dst.value);
+                } else if (in.opcode == 0x34) {                 // s_abs_i32
+                    // This is a 32-bit destination. Treating every unmodeled SOP1 as a possible
+                    // 64-bit pair write erased the untouched adjacent SGPR; Astro Bot keeps the
+                    // high half of a descriptor-table pointer there immediately before an x8 load.
+                    // Compute abs in unsigned arithmetic so INT_MIN remains 0x80000000 without C++
+                    // signed-overflow undefined behaviour. Arithmetic deliberately drops seed/SRT
+                    // provenance through set_value().
+                    uint32_t v = 0;
+                    const bool source_known = in.src[0].kind == OperandKind::Literal
+                        ? (v = in.literal, true) : srcval(in.src[0], v);
+                    if (source_known)
+                        set_value(in.dst.value, static_cast<int32_t>(v) < 0 ? 0u - v : v);
+                    else
+                        forget(in.dst.value);
                 } else if (in.opcode == 0x04 &&                 // s_mov_b64
                            in.dst.kind == OperandKind::SGPR &&
                            in.src[0].kind == OperandKind::SGPR) {

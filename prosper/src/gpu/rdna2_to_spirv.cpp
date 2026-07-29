@@ -5355,6 +5355,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     rs.sreg[in.dst.value] = b.uconst((uint32_t)in.simm16);
                     rs.sreg_srt.erase(in.dst.value);
                     break;
+                case 0x10: {                                // s_mulk_i32 (read-modify-write)
+                    // D = low32(D * sign_extend(SIMM16)). Unlike s_addk_i32, MULK does not write
+                    // SCC. Astro Bot uses the exact `s_mulk_i32 vcc_lo, 276` word to turn a
+                    // scalar table index into a byte offset before s_buffer_load_dwordx4.
+                    const uint32_t a = val(in.dst);
+                    rs.sreg[in.dst.value] = b.ibin(
+                        Op_IMul, a, b.uconst(static_cast<uint32_t>(in.simm16)));
+                    rs.sreg_srt.erase(in.dst.value);
+                    break;
+                }
                 case 0x03: case 0x04: case 0x05: case 0x06:
                 case 0x07: case 0x08: {                      // s_cmpk_{eq,lg,gt,ge,lt,le}_i32
                     const uint32_t a = val(in.dst);
@@ -7953,6 +7963,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // Compute therefore uses real Workgroup LDS and wraps only the lane id at wave_size;
             // M0 supplies a distinct base when a workgroup contains more than one wave. The final
             // address itself does not wrap (RDNA2 LDS allocations explicitly do not wrap).
+            // Astro Bot's world-map material kernel uses several such lane arrays before reducing
+            // them through explicit DS reads and barriers.
             if (b.is_compute && (in.opcode == 0xb0 || in.opcode == 0xb1)) {
                 auto m0 = rs.sreg.find(124);
                 if (m0 == rs.sreg.end()) { ok = false; return true; }
@@ -8045,6 +8057,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             b.declare_lds();
             if (!b.lds_var) { ok = false; return true; }
             auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
+            if (in.opcode == 0x0e) {                    // ds_write2_b32: two dwords at offset0/offset1
+                // AMD RDNA2 ISA 12.13: MEM[ADDR + OFFSET0/1 * 4] = DATA0/1. The packed offsets
+                // mirror ds_read2_b32 below; Astro Bot's world-map reduction uses both operations.
+                const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
+                const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst(in.literal & 0xFFu));
+                const uint32_t idx1 = b.ibin(Op_IAdd, base, b.uconst((in.literal >> 8) & 0xFFu));
+                b.lds_store(idx0, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
+                // Equal offsets encode one memory access and use DATA0; DATA1 is ignored.
+                if ((in.literal & 0xFFu) != ((in.literal >> 8) & 0xFFu))
+                    b.lds_store(idx1, vread(in.src[2].value), rs.exec_narrowed, rs.exec);
+                return true;
+            }
             if (in.opcode == 0x4e) {                    // ds_write2_b64: two VGPR pairs at offset0/offset1
                 const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
                 const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst((in.literal & 0xFFu) * 2u));
