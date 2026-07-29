@@ -1213,6 +1213,19 @@ inline void invalidate_persistent_color_target_guest_write(uint64_t addr, uint64
     }
 }
 
+// A compute dispatch can publish both exact guest bytes and an equivalent device-local result into
+// one borrowed renderer target. Normal guest-write invalidation runs first so every overlapping alias
+// becomes stale; only the image proven to have received that result may then regain authority.
+inline bool restore_persistent_color_target_after_mirrored_write(
+    uint64_t id, uint32_t width, uint32_t height, VkFormat format) {
+    PersistentColorTargetImage* target = find_persistent_color_target(
+        id, width, height, backend_color_format(format), false);
+    if (!target || !target->image || target->layout == VK_IMAGE_LAYOUT_UNDEFINED) return false;
+    target->valid = true;
+    target->last_use = ++persistent_color_target_generation();
+    return true;
+}
+
 inline void destroy_persistent_color_target(const RenderVkCtx& ctx,
                                             PersistentColorTargetImage& target) {
     if (target.view) vkDestroyImageView(ctx.dev, target.view, nullptr);
