@@ -327,10 +327,13 @@ int main() {
     compute_cfg_dispatch_created_b32.insert(
         compute_cfg_dispatch_created_b32.end(), compute_cfg_dispatch,
         compute_cfg_dispatch + std::size(compute_cfg_dispatch));
-    CHECK(recompile_compute(compute_cfg_dispatch_created_b32.data(),
-                            compute_cfg_dispatch_created_b32.size(), &dispatch_rt,
-                            wave32_dispatch_config).empty(),
-          "a dispatcher rejects B32 aliases of mask pairs produced inside its CFG");
+    // The generic dispatcher now carries an unambiguous one-word mask domain at every basic-block
+    // boundary. This formerly-negative fixture is the smallest compute regression for the same
+    // dataflow used by Astro's complex Wave32 fragment shader.
+    CHECK(!recompile_compute(compute_cfg_dispatch_created_b32.data(),
+                             compute_cfg_dispatch_created_b32.size(), &dispatch_rt,
+                             wave32_dispatch_config).empty(),
+          "a dispatcher preserves B32 aliases of masks produced inside its CFG");
     // The dispatcher includes branch-target/fallthrough blocks even when no entry path can reach
     // them. This dead block overwrites half of direct V# s[8:11] and then targets the live entry;
     // provenance at the reachable fetch must not include a write hardware can never execute.
