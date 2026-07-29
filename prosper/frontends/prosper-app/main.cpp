@@ -81,6 +81,9 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>               // _NSGetExecutablePath (macOS has no /proc/self/exe)
+#endif
 #endif
 
 using namespace prosper;
@@ -772,13 +775,20 @@ static void open_folder_picker(SDL_Window* win) {
     SDL_ShowOpenFolderDialog(picked_folder_cb, nullptr, win, nullptr, /*allow_many=*/false);
 }
 
-// Take the path this process was started from. argv[0] is a fallback: it is only a valid execv
-// target when it carries a path and the working directory has not moved.
+// Take the path this process was started from. Each platform has its own authoritative answer;
+// argv[0] is only the fallback, since it is a valid execv target just when it carries a path and the
+// working directory has not moved.
 static std::string this_executable(const char* argv0) {
-#ifdef _WIN32
+#if defined(_WIN32)
     char buf[MAX_PATH];
     const DWORD n = GetModuleFileNameA(nullptr, buf, sizeof buf);
     if (n > 0 && n < sizeof buf) return std::string(buf, n);
+#elif defined(__APPLE__)
+    // There is no /proc on macOS. _NSGetExecutablePath may hand back an unresolved path (symlinks,
+    // "." components), which execv accepts.
+    char buf[4096];
+    uint32_t n = sizeof buf;
+    if (_NSGetExecutablePath(buf, &n) == 0) return std::string(buf);
 #else
     char buf[4096];
     const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof buf - 1);
