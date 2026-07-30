@@ -325,6 +325,69 @@ int main() {
         }
     }
 
+    // Indirect work retains argument addresses instead of reading them during command folding. The
+    // executor consumes them later, after any preceding compute producer has completed.
+    {
+        auto set_index_buffer = Hle::lookup("l4fM9K-Lyks");
+        auto set_indirect_base = Hle::lookup("RmaJwLtc8rY");
+        auto stall_parser = Hle::lookup("u2T2DiA5hRI");
+        auto draw_indirect = Hle::lookup("t1vNu082-jM");
+        auto dispatch_indirect = Hle::lookup("CtB+A9-VxO0");
+        CHECK(set_index_buffer && set_indirect_base && stall_parser && draw_indirect &&
+              dispatch_indirect, "indirect AGC builders registered");
+        if (set_index_buffer && set_indirect_base && stall_parser && draw_indirect &&
+            dispatch_indirect) {
+            alignas(4) uint32_t graphics_args[8] = {};
+            alignas(4) uint32_t compute_args[8] = {};
+            alignas(4) uint16_t indices[16] = {};
+            uint32_t indirect_buffer[64] = {};
+            Dcb indirect_dcb{};
+            indirect_dcb.bottom = indirect_buffer;
+            indirect_dcb.top = indirect_buffer + 64;
+            indirect_dcb.cursor_up = indirect_buffer;
+            indirect_dcb.cursor_down = indirect_buffer + 64;
+            const uint64_t ID = reinterpret_cast<uint64_t>(&indirect_dcb);
+            idx(ID, /*16-bit*/ 0, 0, 0, 0, 0);
+            set_index_buffer(ID, reinterpret_cast<uint64_t>(indices), 0, 0, 0, 0);
+            set_indirect_base(ID, /*graphics*/ 0,
+                              reinterpret_cast<uint64_t>(graphics_args), 0, 0, 0);
+            stall_parser(ID, 0, 0, 0, 0, 0);
+            draw_indirect(ID, /*byte offset*/ 4, 0x80000000ull, 0, 0, 0);
+            set_indirect_base(ID, /*compute*/ 1,
+                              reinterpret_cast<uint64_t>(compute_args), 0, 0, 0);
+            dispatch_indirect(ID, /*byte offset*/ 8, 1, 0, 0, 0);
+            set_indirect_base(ID, /*compute low-only aperture update*/ 1,
+                              reinterpret_cast<uint64_t>(compute_args) & UINT32_MAX, 0, 0, 0);
+            dispatch_indirect(ID, /*byte offset*/ 12, 1, 0, 0, 0);
+            GpuState indirect_state;
+            run_cb(indirect_buffer, 64, indirect_state);
+            CHECK(indirect_state.indirect_graphics_base == reinterpret_cast<uint64_t>(graphics_args) &&
+                  indirect_state.indirect_compute_base == reinterpret_cast<uint64_t>(compute_args),
+                  "graphics and compute indirect bases retain independently");
+            CHECK(indirect_state.draws.size() == 1 && indirect_state.draws[0].indirect &&
+                  indirect_state.draws[0].indexed &&
+                  indirect_state.draws[0].index_base == reinterpret_cast<uint64_t>(indices) &&
+                  indirect_state.draws[0].indirect_args_addr ==
+                      reinterpret_cast<uint64_t>(graphics_args) + 4 &&
+                  indirect_state.draws[0].modifier == 0x80000000ull,
+                  "indexed indirect draw retains base+offset, index binding, and modifier");
+            CHECK(indirect_state.dispatches.size() == 2 &&
+                  indirect_state.dispatches[0].indirect &&
+                  indirect_state.dispatches[0].indirect_args_addr ==
+                      reinterpret_cast<uint64_t>(compute_args) + 8 &&
+                  indirect_state.dispatches[0].modifier == 1,
+                  "indirect dispatch retains compute base+offset and modifier");
+            CHECK(indirect_state.dispatches.size() == 2 &&
+                  indirect_state.dispatches[1].indirect_args_addr ==
+                      reinterpret_cast<uint64_t>(compute_args) + 12,
+                  "low-only indirect base update retains the established GPU-VA aperture");
+            CHECK(indirect_state.draws.size() == 1 && indirect_state.dispatches.size() == 2 &&
+                  indirect_state.draws[0].command_order <
+                      indirect_state.dispatches[0].command_order,
+                  "indirect operations retain PM4 stream order");
+        }
+    }
+
     // Compute is not executed yet, but each DispatchDirect must retain its exact register state so
     // producer-provenance diagnostics can resolve the bound shader and resources (#524).
     {

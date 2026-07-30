@@ -651,7 +651,7 @@ int main() {
         0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u,
         0x7d840100u, 0xbf870001u, 0xbf82fffdu,
         0xbefc0380u,                          // s_mov_b32 m0, 0
-        0xd8fa0008u, 0x03000000u,           // ds_append v3 offset:8
+        0xd8f80008u, 0x03000000u,           // ds_append v3 offset:8 (LDS)
         0x7e060d03u, 0xbf810000u,
     };
     std::vector<uint32_t> spv17f = recompile_valu(
@@ -1744,7 +1744,26 @@ int main() {
               compute_gds_spv, &compute_gds_table, 0, SpirvShaderStage::Compute, false).ok(),
           "compute GDS module binds the persistent backend-owned buffer");
 
-    // Kernel 32b5: Astro's exact DS_APPEND word. Initialize the LDS counter to 10, narrow EXEC to
+    // Astro Bot's indirect-argument producer uses device-global append counters. Routing this exact
+    // GDS form through workgroup LDS made every dispatch begin with undefined counter values and
+    // produced random indirect counts. The descriptor contract proves the append targets the
+    // persistent backend-owned GDS buffer rather than a Workgroup array.
+    const uint32_t compute_gds_append[] = {
+        0xbefc0380u,              // s_mov_b32 m0, 0
+        0xd8fa0010u, 0x00000000u, // ds_append v0 offset:16 gds
+        0xbf810000u,
+    };
+    std::vector<uint32_t> compute_gds_append_spv = recompile_compute(
+        compute_gds_append, std::size(compute_gds_append), &compute_gds_table,
+        compute_gds_config);
+    CHECK(!compute_gds_append_spv.empty(),
+          "compute GDS ds_append recompiles to SPIR-V");
+    CHECK(validate_spirv_descriptor_interface(
+              compute_gds_append_spv, &compute_gds_table, 0,
+              SpirvShaderStage::Compute, false).ok(),
+          "compute GDS ds_append binds the persistent backend-owned buffer");
+
+    // Kernel 32b5: ordinary LDS DS_APPEND. Initialize the LDS counter to 10, narrow EXEC to
     // the first 32 lanes, then append. Hardware performs one atomic +32 and broadcasts old=10 only
     // to active lanes; inactive lanes preserve their old v8=99. Reading the new counter (42) makes
     // both effects observable: active output=52, inactive output=141.
@@ -1757,13 +1776,13 @@ int main() {
         0xd8340010u, 0x00000203u,  // ds_write_b32 v3, v2 offset:0x10
         0xbefe04c1u, 0xbf8a0000u,  // restore EXEC; barrier
         0x7e0202a0u, 0x7da20300u,  // v1=32; v_cmpx_lt_u32 v0,v1
-        0xd8fa0010u, 0x08000000u,  // live: ds_append v8 offset:0x10
+        0xd8f80010u, 0x08000000u,  // ds_append v8 offset:0x10 (LDS)
         0xbefe04c1u, 0xbf8a0000u,  // restore EXEC; barrier
         0xd8d80010u, 0x09000003u,  // ds_read_b32 v9, v3 offset:0x10
         0x7e100d08u, 0x7e120d09u, 0x06101308u, 0xbf810000u,
     };
     std::vector<uint32_t> spv32b5 = recompile_valu(code32b5, std::size(code32b5), 1, 8);
-    CHECK(!spv32b5.empty(), "recompiled kernel 32b5 (Astro DS_APPEND word) -> SPIR-V");
+    CHECK(!spv32b5.empty(), "recompiled kernel 32b5 (LDS DS_APPEND word) -> SPIR-V");
     std::vector<float> in32b5(WG); for (uint32_t i = 0; i < WG; ++i) in32b5[i] = (float)i;
     std::vector<float> got32b5 = prosper::test::run_compute(spv32b5, in32b5, WG, WG);
     uint32_t bad32b5 = 0;
@@ -1780,7 +1799,7 @@ int main() {
     CHECK(got32b5.size()==WG && bad32b5==0,
           "kernel 32b5 atomically adds popcount(EXEC), broadcasts old counter, and predicates VDST");
 
-    // Kernel 32b6: Astro's exact DS_CONSUME word is the inverse operation. Start at 50, make the
+    // Kernel 32b6: ordinary LDS DS_CONSUME is the inverse operation. Start at 50, make the
     // first 16 lanes valid, and consume once. Active lanes observe old=50 and all lanes read the new
     // counter=34, while inactive lanes preserve their fallback destination value of 99.
     const uint32_t code32b6[] = {
@@ -1793,14 +1812,14 @@ int main() {
         0xd8340004u, 0x00000203u,            // ds_write_b32 v3, v2 offset:4
         0xbefe04c1u, 0xbf8a0000u,            // restore EXEC; barrier
         0x7e020290u, 0x7da20300u,            // v1=16; v_cmpx_lt_u32 v0,v1
-        0xd8f60004u, 0x0c000000u,            // live: ds_consume v12 offset:4
+        0xd8f40004u, 0x0c000000u,            // ds_consume v12 offset:4 (LDS)
         0xbefe04c1u, 0xbf8a0000u,            // restore EXEC; barrier
         0xd8d80004u, 0x0d000003u,            // ds_read_b32 v13, v3 offset:4
         0x7e180d0cu, 0x7e1a0d0du,            // uint -> float
         0x06181b0cu, 0xbf810000u,             // v12 += v13; end
     };
     std::vector<uint32_t> spv32b6 = recompile_valu(code32b6, std::size(code32b6), 1, 12);
-    CHECK(!spv32b6.empty(), "recompiled kernel 32b6 (Astro DS_CONSUME word) -> SPIR-V");
+    CHECK(!spv32b6.empty(), "recompiled kernel 32b6 (LDS DS_CONSUME word) -> SPIR-V");
     std::vector<float> got32b6 = prosper::test::run_compute(spv32b6, in32b5, WG, WG);
     uint32_t bad32b6 = 0;
     for (uint32_t i = 0; i < WG && got32b6.size() == WG; ++i) {

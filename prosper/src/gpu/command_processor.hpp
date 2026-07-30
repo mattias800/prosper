@@ -30,6 +30,11 @@ struct GpuState {
     // submit (as on hardware) until re-set.
     uint64_t index_base = 0;                             // last SetIndexBuffer address
     uint32_t index_num  = 0;                             // last SetIndexCount
+    // Current Gen5 indirect-argument bases. These are command-processor state, like index_base,
+    // and persist across submits until the guest replaces them. Shader type 0 selects graphics;
+    // type 1 selects compute.
+    uint64_t indirect_graphics_base = 0;
+    uint64_t indirect_compute_base = 0;
     // A draw + the register state AT THE DRAW. A submit changes shaders/mask/blend between its draws,
     // so the state a draw actually uses is the register values when its packet executes — NOT the
     // end-of-submit fold. `state` is a snapshot captured at the draw (shared between consecutive draws
@@ -60,6 +65,13 @@ struct GpuState {
         uint32_t index_offset = 0;
         bool     from_offset  = false;
         uint64_t command_order = 0;
+        // DrawIndexIndirect retains the address rather than eagerly reading its five dwords: a
+        // preceding compute dispatch commonly generates them in the same submit. The ordered
+        // executor resolves these fields immediately before realizing the draw.
+        bool     indirect = false;
+        uint64_t indirect_args_addr = 0;
+        int32_t  indirect_vertex_offset = 0;
+        bool     has_vertex_offset_override = false;
     };
     std::vector<Draw> draws;                             // one per DrawIndexAuto / DrawIndex
     // Compute dispatch + register state AT the packet. Compute is not executed yet, but retaining
@@ -71,6 +83,8 @@ struct GpuState {
         uint64_t modifier = 0;
         std::shared_ptr<const GpuState> state;
         uint64_t command_order = 0;
+        bool indirect = false;
+        uint64_t indirect_args_addr = 0;
     };
     std::vector<Dispatch> dispatches;                     // current submit's DispatchDirect packets
     // Address-backed DMA_DATA memory effects execute in the same ordered backend timeline as

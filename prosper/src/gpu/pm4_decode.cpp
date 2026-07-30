@@ -147,6 +147,26 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                     // zero-initialized value, whose documented interpretation is workgroup mode.
                     if (npl >= 5) c.dispatch_modifier = (uint64_t)pl[3] | ((uint64_t)pl[4] << 32);
                     break;
+                case R_SET_BASE_INDIRECT_ARGS:
+                    c.kind = K::SetBaseIndirectArgs;
+                    if (npl >= 3) {
+                        c.indirect_shader_type = pl[0];
+                        c.indirect_base = lo_hi(pl + 1);
+                    }
+                    break;
+                case R_STALL_COMMAND_BUFFER_PARSER:
+                    c.kind = K::StallCommandBufferParser;
+                    break;
+                case R_DRAW_INDEX_INDIRECT:
+                    c.kind = K::DrawIndexIndirect;
+                    if (npl >= 1) c.indirect_offset = pl[0];
+                    if (npl >= 3) c.di_modifier = lo_hi(pl + 1);
+                    break;
+                case R_DISPATCH_INDIRECT:
+                    c.kind = K::DispatchIndirect;
+                    if (npl >= 1) c.indirect_offset = pl[0];
+                    if (npl >= 3) c.dispatch_modifier = lo_hi(pl + 1);
+                    break;
                 case R_INDEX_BASE:
                     // sceAgcDcbSetIndexBuffer -> bind the index buffer base address. payload: [0..1]=addr.
                     c.kind = K::SetIndexBase;

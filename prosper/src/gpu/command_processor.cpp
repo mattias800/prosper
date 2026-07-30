@@ -2057,6 +2057,27 @@ void GpuState::apply(const Pm4Command& c) {
         case K::SetIndexCount:
             index_num = c.index_count;   // bind index count (issue #232)
             break;
+        case K::SetBaseIndirectArgs:
+            // Live SDK-13 streams use both full GPU virtual addresses and 32-bit updates within the
+            // already-selected aperture (Astro alternates 0x5074063c0 and 0x074063c0 for the same
+            // compute argument allocation). Low guest GPU VAs are not valid mappings, so retain the
+            // last explicit upper half for a low-only update; without prior aperture state the low
+            // value remains fail-closed and will be rejected as unreadable by the executor.
+            {
+                if (c.indirect_shader_type > 1) break;
+                uint64_t& current = c.indirect_shader_type == 0
+                    ? indirect_graphics_base : indirect_compute_base;
+                uint64_t base = c.indirect_base;
+                if (base <= UINT32_MAX && current > UINT32_MAX)
+                    base |= current & ~static_cast<uint64_t>(UINT32_MAX);
+                current = base;
+            }
+            break;
+        case K::StallCommandBufferParser:
+            // The semantic packet is itself an ordering point. The ordered executor completes any
+            // preceding compute batch before it reaches a later indirect consumer, so no additional
+            // folded-state mutation is necessary here.
+            break;
         case K::DrawIndexOffset: {
             // Gen5 indexed draw (issue #232). Uses the bound index base + count; DrawIndexOffset's own
             // count (c.index_count) overrides the SetIndexCount state when non-zero. The element size is
@@ -2118,6 +2139,26 @@ void GpuState::apply(const Pm4Command& c) {
             }
             draws.push_back(std::move(d));
             draws.back().command_order = command_order;
+            break;
+        }
+        case K::DrawIndexIndirect: {
+            if (state_dirty_ || !last_snapshot_) {
+                auto snap = std::make_shared<GpuState>();
+                snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
+                snap->num_instances = num_instances;
+                last_snapshot_ = std::move(snap);
+                state_dirty_ = false;
+            }
+            Draw d;
+            d.state = last_snapshot_;
+            d.indexed = true;
+            d.modifier = c.di_modifier;
+            d.index_base = index_base;
+            d.indirect = true;
+            if (indirect_graphics_base <= UINT64_MAX - c.indirect_offset)
+                d.indirect_args_addr = indirect_graphics_base + c.indirect_offset;
+            d.command_order = command_order;
+            draws.push_back(std::move(d));
             break;
         }
         case K::ReleaseMem:
@@ -2275,6 +2316,25 @@ void GpuState::apply(const Pm4Command& c) {
                                   c.dispatch_modifier, last_snapshot_, command_order});
             dispatch_count++;
             break;
+        case K::DispatchIndirect: {
+            if (state_dirty_ || !last_snapshot_) {
+                auto snap = std::make_shared<GpuState>();
+                snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
+                snap->num_instances = num_instances;
+                last_snapshot_ = std::move(snap);
+                state_dirty_ = false;
+            }
+            Dispatch d;
+            d.modifier = c.dispatch_modifier;
+            d.state = last_snapshot_;
+            d.command_order = command_order;
+            d.indirect = true;
+            if (indirect_compute_base <= UINT64_MAX - c.indirect_offset)
+                d.indirect_args_addr = indirect_compute_base + c.indirect_offset;
+            dispatches.push_back(std::move(d));
+            dispatch_count++;
+            break;
+        }
         case K::SetPredication:
             // Begin/end a GPU predication window (#319). The begin form carries the condition
             // address; the end form carries 0. A short-decoded packet conservatively ENDS the

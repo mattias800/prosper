@@ -625,10 +625,23 @@ struct SpirvCompute {
         put(code, Op_Branch, {merge});
         put(code, Op_Label, {merge}); cur_block = merge;
     }
-    // Fragment GDS append/consume is one device-global atomic per hardware wave. Helper
-    // invocations participate in the subgroup operations but cannot consume guest counter slots.
-    uint32_t fragment_gds_append(uint32_t index, uint32_t exec_bit, bool consume) {
-        declare_internal_gds();
+    uint32_t compute_gds_atomic_rtn(uint32_t op, uint32_t index, uint32_t value) {
+        declare_internal_gds(0, kComputeInternalGdsBinding);
+        uint32_t pointer = id();
+        putv(code, Op_AccessChain,
+             {t_ptr_gds_u32, pointer, v_internal_gds, uconst(0), index});
+        uint32_t result = id();
+        put(code, op,
+            {t_u32, result, pointer, uconst(Scope_Device),
+             uconst(MemSem_UniformAcqRel), value});
+        return result;
+    }
+    // Native-subgroup GDS append/consume is one device-global atomic per hardware wave. Fragment
+    // helper invocations participate in subgroup operations but cannot consume guest counter slots;
+    // compute has no helper lanes. Callers use this only when one host subgroup is one guest wave.
+    uint32_t native_gds_append(uint32_t index, uint32_t exec_bit, bool consume) {
+        declare_internal_gds(is_compute ? 0 : 1,
+                             is_compute ? kComputeInternalGdsBinding : 0);
         if (!declared_subgroup) {
             put(caps, Op_Capability, {Cap_GroupNonUniform});
             declared_subgroup = true;
@@ -637,7 +650,8 @@ struct SpirvCompute {
             put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
             declared_subgroup_arithmetic = true;
         }
-        const uint32_t active_bit = land(exec_bit, logical_not(helper_invocation()));
+        const uint32_t active_bit = is_fragment
+            ? land(exec_bit, logical_not(helper_invocation())) : exec_bit;
         const uint32_t contribution = sel(active_bit, uconst(1), uconst(0));
         uint32_t count = id();
         put(code, Op_GroupNonUniformIAdd,
@@ -1831,11 +1845,14 @@ struct SpirvCompute {
         return b_iadd(acc_bits, sum);
     }
     // DS_APPEND/DS_CONSUME: one atomic add/subtract per emulated hardware wave, changing the counter
-    // by popcount(EXEC), with the old value broadcast to every lane. Every Vulkan invocation participates in the barriers;
+    // by popcount(EXEC), with the old value broadcast to every lane. GDS operations target the
+    // backend-owned persistent device buffer; ordinary operations target workgroup LDS. Every
+    // Vulkan invocation participates in the barriers;
     // the per-lane EXEC bool only contributes 0/1 to the reduction. A partial final hardware wave
     // (including a one-thread workgroup) contains only the launched lanes; every scratch read remains
     // statically in-bounds and absent hardware lanes contribute zero.
-    uint32_t wave_append(uint32_t lds_idx, uint32_t active_bool, bool consume = false) {
+    uint32_t wave_append(uint32_t index, uint32_t active_bool, bool consume = false,
+                         bool gds = false) {
         declare_wave_lds();
         const uint32_t active = sel(active_bool, uconst(1), uconst(0));
         uint32_t p = id(); putv(code, Op_AccessChain,
@@ -1861,8 +1878,10 @@ struct SpirvCompute {
         emit_selmerge(reduced);
         emit_condbranch(is_leader, leader, reduced);
         emit_label(leader);
-        const uint32_t old = lds_atomic_rtn(consume ? Op_AtomicISub : Op_AtomicIAdd, lds_idx, count,
-                                             false, btrue(), uconst(0));
+        const uint32_t old = gds
+            ? compute_gds_atomic_rtn(consume ? Op_AtomicISub : Op_AtomicIAdd, index, count)
+            : lds_atomic_rtn(consume ? Op_AtomicISub : Op_AtomicIAdd, index, count,
+                             false, btrue(), uconst(0));
         uint32_t result_slot = id(); putv(code, Op_AccessChain,
             {t_ptr_wg_u32b, result_slot, lds_wave, wave_base});
         put(code, Op_Store, {result_slot, old});
@@ -8530,12 +8549,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t idx = b.ibin(Op_ShiftRightLogical, byte_addr, b.uconst(2));
                 const uint32_t old = vreg_old(b, rs, in.dst.value);
                 if (b.is_fragment && in.ds_gds) {
-                    rs.vreg[in.dst.value] = b.fragment_gds_append(
+                    rs.vreg[in.dst.value] = b.native_gds_append(
                         idx, rs.exec, in.opcode == 0x3d);
                 } else if (b.is_compute) {
-                    b.declare_lds();
+                    if (!in.ds_gds) b.declare_lds();
                     rs.vreg[in.dst.value] = b.wave_append(
-                        idx, rs.exec, in.opcode == 0x3d);
+                        idx, rs.exec, in.opcode == 0x3d, in.ds_gds);
                 } else {
                     ok = false; return true;
                 }
@@ -9290,6 +9309,8 @@ bool emit_cfg_state_machine(
     std::set<uint32_t> start_set{ins.front().pc};
     std::unordered_map<uint32_t, uint32_t> mbcnt_event_for_pc;
     std::unordered_map<uint32_t, uint32_t> append_event_for_pc;
+    bool has_gds_append = false;
+    bool has_lds_append = false;
     std::unordered_set<uint32_t> swizzle_pcs;
     for (size_t i = 0; i < ins.size(); ++i) {
         const auto& in = ins[i];
@@ -9305,6 +9326,8 @@ bool emit_cfg_state_machine(
         if (in.fmt == Rdna2Format::DS && (in.opcode == 0x3d || in.opcode == 0x3e)) {
             append_event_for_pc.emplace(in.pc,
                 static_cast<uint32_t>(append_event_for_pc.size()));
+            if (in.ds_gds) has_gds_append = true;
+            else has_lds_append = true;
             start_set.insert(in.pc);
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
@@ -9788,6 +9811,7 @@ bool emit_cfg_state_machine(
     const uint32_t append_active_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t append_event_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t append_consume_var = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t append_gds_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t append_idx_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t append_dst_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t append_count_var = b.function_var(b.t_u32, ptr_u32);
@@ -9967,6 +9991,7 @@ bool emit_cfg_state_machine(
         b.store_function(append_active_var, no);
         b.store_function(append_event_var, zero);
         b.store_function(append_consume_var, no);
+        b.store_function(append_gds_var, no);
         b.store_function(append_idx_var, zero);
         b.store_function(append_dst_var, zero);
     }
@@ -10124,13 +10149,15 @@ bool emit_cfg_state_machine(
             const auto m0 = state.sreg.find(124);
             const auto event = append_event_for_pc.find(append->pc);
             if (m0 == state.sreg.end() || event == append_event_for_pc.end()) return false;
-            b.declare_lds();
+            if (!append->ds_gds) b.declare_lds();
             const uint32_t base = b.ibin(Op_BitwiseAnd, m0->second, b.uconst(0xffffu));
             const uint32_t byte_addr = b.ibin(Op_IAdd, base, b.uconst(append->literal));
             const uint32_t idx = b.ibin(Op_ShiftRightLogical, byte_addr, b.uconst(2));
             if (b.native_subgroup_size) {
-                const uint32_t result = b.native_wave_append(
-                    idx, state.exec, append->opcode == 0x3d ? yes : no);
+                const uint32_t result = append->ds_gds
+                    ? b.native_gds_append(idx, state.exec, append->opcode == 0x3d)
+                    : b.native_wave_append(
+                          idx, state.exec, append->opcode == 0x3d ? yes : no);
                 const int dst = append->dst.value;
                 const auto old = state.vreg.find(dst);
                 state.vreg[dst] = b.sel(
@@ -10144,6 +10171,7 @@ bool emit_cfg_state_machine(
                 b.store_function(append_active_var, state.exec);
                 b.store_function(append_event_var, b.uconst(event->second));
                 b.store_function(append_consume_var, append->opcode == 0x3d ? yes : no);
+                b.store_function(append_gds_var, append->ds_gds ? yes : no);
                 b.store_function(append_idx_var, idx);
                 b.store_function(append_dst_var,
                     b.uconst(static_cast<uint32_t>(append->dst.value)));
@@ -10471,9 +10499,33 @@ bool emit_cfg_state_machine(
     const uint32_t append_delta = b.sel(
         b.load_function(b.t_bool, append_consume_var),
         b.ibin(Op_ISub, zero, append_count_value), append_count_value);
-    const uint32_t append_old = b.lds_atomic_rtn(
-        Op_AtomicIAdd, b.load_function(b.t_u32, append_idx_var),
-        append_delta, false, yes, zero);
+    const uint32_t append_index = b.load_function(b.t_u32, append_idx_var);
+    uint32_t append_old = 0;
+    if (has_gds_append && has_lds_append) {
+        const uint32_t gds_block = b.id(), lds_block = b.id(), memory_merge = b.id();
+        b.emit_selmerge(memory_merge);
+        b.emit_condbranch(b.load_function(b.t_bool, append_gds_var),
+                          gds_block, lds_block);
+        b.emit_label(gds_block);
+        const uint32_t gds_old = b.compute_gds_atomic_rtn(
+            Op_AtomicIAdd, append_index, append_delta);
+        const uint32_t gds_end = b.cur_block;
+        b.emit_branch(memory_merge);
+        b.emit_label(lds_block);
+        const uint32_t lds_old = b.lds_atomic_rtn(
+            Op_AtomicIAdd, append_index, append_delta, false, yes, zero);
+        const uint32_t lds_end = b.cur_block;
+        b.emit_branch(memory_merge);
+        b.emit_label(memory_merge);
+        append_old = b.emit_phi_2way(
+            b.t_u32, gds_old, gds_end, lds_old, lds_end);
+    } else if (has_gds_append) {
+        append_old = b.compute_gds_atomic_rtn(
+            Op_AtomicIAdd, append_index, append_delta);
+    } else {
+        append_old = b.lds_atomic_rtn(
+            Op_AtomicIAdd, append_index, append_delta, false, yes, zero);
+    }
     b.cfg_scratch_store(
         b.ibin(Op_IAdd, b.uconst(wave_result_base), mbcnt_wave_index), append_old);
     b.emit_branch(append_reduced);

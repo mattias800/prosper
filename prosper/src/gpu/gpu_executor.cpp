@@ -3758,7 +3758,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
                 decoded, reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
                 shader_dwords);
             const bool uses_gds = std::any_of(decoded.begin(), decoded.end(), [](const auto& in) {
-                return in.fmt == Rdna2Format::DS && in.ds_gds && in.opcode == 0x0d;
+                return in.fmt == Rdna2Format::DS && in.ds_gds &&
+                       (in.opcode == 0x0d || in.opcode == 0x3d || in.opcode == 0x3e);
             });
             if (uses_gds) {
                 ShaderResource gds;
@@ -4818,12 +4819,118 @@ bool retained_draw_selected(const GpuState& st, size_t index) {
     return use_per_draw_policy(st) || index + 1 == st.draws.size();
 }
 
+bool resolve_indirect_draw_arguments(const GpuState& submit, const GpuState::Draw& source,
+                                     GpuState::Draw& resolved) {
+    resolved = source;
+    if (!source.indirect) return true;
+    constexpr uint32_t kArgumentBytes = 5u * sizeof(uint32_t);
+    if (!source.indirect_args_addr || (source.indirect_args_addr & 3u) ||
+        !guest_readable(source.indirect_args_addr, kArgumentBytes)) {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 24)
+            std::fprintf(stderr, "[agc] indexed indirect draw skipped: unreadable arguments at 0x%llx\n",
+                         static_cast<unsigned long long>(source.indirect_args_addr));
+        return false;
+    }
+    uint32_t args[5] = {};
+    std::memcpy(args, reinterpret_cast<const void*>(source.indirect_args_addr), sizeof(args));
+    const uint32_t index_count = args[0];
+    const uint32_t instance_count = args[1];
+    const uint32_t first_index = args[2];
+    const int32_t vertex_offset = static_cast<int32_t>(args[3]);
+    const uint32_t first_instance = args[4];
+    constexpr uint32_t kMaxIndirectCount = 1u << 20;
+    if (!index_count || !instance_count) return false;  // hardware no-op
+    if (index_count > kMaxIndirectCount || instance_count > kMaxIndirectCount ||
+        first_instance != 0 || !source.index_base) {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 24)
+            std::fprintf(stderr,
+                         "[agc] indexed indirect draw skipped: count=%u instances=%u first=%u "
+                         "vertex_offset=%d first_instance=%u index_base=0x%llx\n",
+                         index_count, instance_count, first_index, vertex_offset, first_instance,
+                         static_cast<unsigned long long>(source.index_base));
+        return false;
+    }
+    const GpuState& draw_state = source.state ? *source.state : submit;
+    const uint64_t element_bytes = index_elem_bytes(draw_state.index_type);
+    if (!element_bytes) return false;
+    if (first_index > (UINT64_MAX - source.index_base) / element_bytes) return false;
+    resolved.index_count = index_count;
+    resolved.instance_count = instance_count;
+    resolved.indexed = true;
+    resolved.index_offset = first_index;
+    resolved.index_addr = source.index_base + static_cast<uint64_t>(first_index) * element_bytes;
+    resolved.from_offset = true;
+    resolved.indirect_vertex_offset = vertex_offset;
+    resolved.has_vertex_offset_override = true;
+    resolved.indirect = false;
+    if (std::getenv("PROSPER_INDIRECTLOG")) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 256)
+            std::fprintf(stderr,
+                         "[agc-indirect] draw args=0x%llx count=%u instances=%u first=%u "
+                         "vertex_offset=%d index_base=0x%llx\n",
+                         static_cast<unsigned long long>(source.indirect_args_addr), index_count,
+                         instance_count, first_index, vertex_offset,
+                         static_cast<unsigned long long>(source.index_base));
+    }
+    return true;
+}
+
+bool resolve_indirect_dispatch_arguments(const GpuState::Dispatch& source,
+                                         GpuState::Dispatch& resolved) {
+    resolved = source;
+    if (!source.indirect) return true;
+    constexpr uint32_t kArgumentBytes = 3u * sizeof(uint32_t);
+    if (!source.indirect_args_addr || (source.indirect_args_addr & 3u) ||
+        !guest_readable(source.indirect_args_addr, kArgumentBytes)) {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 24)
+            std::fprintf(stderr, "[agc] indirect dispatch skipped: unreadable arguments at 0x%llx\n",
+                         static_cast<unsigned long long>(source.indirect_args_addr));
+        return false;
+    }
+    uint32_t args[3] = {};
+    std::memcpy(args, reinterpret_cast<const void*>(source.indirect_args_addr), sizeof(args));
+    if (!args[0] || !args[1] || !args[2]) return false;  // hardware no-op
+    resolved.threads_x = args[0];
+    resolved.threads_y = args[1];
+    resolved.threads_z = args[2];
+    resolved.indirect = false;
+    const ComputeLaunchDimensions launch = resolve_compute_launch(resolved);
+    constexpr uint32_t kPortableMaxWorkgroups = 65535;
+    if (!launch.groups_x || !launch.groups_y || !launch.groups_z ||
+        launch.groups_x > kPortableMaxWorkgroups ||
+        launch.groups_y > kPortableMaxWorkgroups ||
+        launch.groups_z > kPortableMaxWorkgroups) {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 24)
+            std::fprintf(stderr,
+                         "[agc] indirect dispatch skipped: dimensions=%ux%ux%u resolve to "
+                         "%ux%ux%u workgroups\n",
+                         args[0], args[1], args[2], launch.groups_x, launch.groups_y,
+                         launch.groups_z);
+        return false;
+    }
+    if (std::getenv("PROSPER_INDIRECTLOG")) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 256)
+            std::fprintf(stderr,
+                         "[agc-indirect] dispatch args=0x%llx dims=%ux%ux%u groups=%ux%ux%u\n",
+                         static_cast<unsigned long long>(source.indirect_args_addr), args[0], args[1],
+                         args[2], launch.groups_x, launch.groups_y, launch.groups_z);
+    }
+    return true;
+}
+
 bool realize_retained_draw(const GpuState& st, size_t index, float scale_x, float scale_y,
                            DrawItem& item) {
     if (index >= st.draws.size() || !retained_draw_selected(st, index)) return false;
     const bool per_draw = use_per_draw_policy(st);
     const GpuState& draw_state = per_draw ? st.state_at_draw(index) : st;
-    const GpuState::Draw& draw = st.draws[index];
+    GpuState::Draw draw;
+    if (!resolve_indirect_draw_arguments(st, st.draws[index], draw)) return false;
     const bool log = getenv("PROSPER_GFXLOG") != nullptr || getenv("PROSPER_EXECLOG") != nullptr;
     if (!realize_draw_item(draw_state, &draw, draw.index_count, 0x10000, log, item,
                            nullptr, true)) return false;
@@ -4842,7 +4949,9 @@ bool realize_retained_compute(const GpuState& st, size_t index, uint64_t submit_
     // intact while ensuring it runs only after every preceding ordered producer has landed.
     GpuState one = st.dispatches[index].state ? *st.dispatches[index].state : st;
     one.dispatches.clear();
-    one.dispatches.push_back(st.dispatches[index]);
+    GpuState::Dispatch dispatch;
+    if (!resolve_indirect_dispatch_arguments(st.dispatches[index], dispatch)) return false;
+    one.dispatches.push_back(std::move(dispatch));
     std::vector<OperationRealizationFailure> failures;
     std::vector<ComputeItem> realized = realize_compute_dispatches(
         one, submit_no, failure ? &failures : nullptr);
@@ -4926,8 +5035,10 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
             case RetainedSubmitKind::Draw: {
                 if (!render) break;
                 DrawItem item;
-                if (realize_retained_draw(st, operation.index, scale_x, scale_y, item))
+                if (realize_retained_draw(st, operation.index, scale_x, scale_y, item)) {
+                    if (capture_trace) capture_trace->draws.push_back(item);
                     span.push_back(std::move(item));
+                }
                 break;
             }
             case RetainedSubmitKind::Dispatch: {
@@ -5194,9 +5305,14 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     float sx = fw ? (float)width / (float)fw : 1.0f;
     float sy = fh ? (float)height / (float)fh : 1.0f;
     const bool has_ordered_dma = !st.dma_copies.empty();
-    // A DMA-bearing submit realizes consumers at their ordered position below. Pre-realizing here
-    // would snapshot old indices/descriptors/shader bytes before the copy updates their backing.
-    std::vector<DrawItem> draws = !has_ordered_dma && g_live && width && height
+    const bool has_indirect = std::any_of(st.draws.begin(), st.draws.end(),
+                                         [](const auto& draw) { return draw.indirect; }) ||
+                              std::any_of(st.dispatches.begin(), st.dispatches.end(),
+                                         [](const auto& dispatch) { return dispatch.indirect; });
+    const bool needs_ordered_realization = has_ordered_dma || has_indirect;
+    // DMA and indirect consumers must be realized at their ordered position below. Pre-realizing
+    // would snapshot bytes before an earlier copy or compute shader updates their backing.
+    std::vector<DrawItem> draws = !needs_ordered_realization && g_live && width && height
         ? realize_gpustate_draws(st, 0x10000, sx, sy, nullptr, true)
         : std::vector<DrawItem>{};
     const ShaderRecompileCacheStats shader_after = timing_enabled
@@ -5210,7 +5326,7 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     const ParallelDrawRealizationStats parallel_after = timing_enabled
         ? parallel_draw_realization_stats() : ParallelDrawRealizationStats{};
     const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
-    std::vector<ComputeItem> computes = !has_ordered_dma && g_compute
+    std::vector<ComputeItem> computes = !needs_ordered_realization && g_compute
         ? realize_compute_dispatches(st, submit_no) : std::vector<ComputeItem>{};
     const auto timing_compute_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
 
@@ -5220,16 +5336,25 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     // even though live execution deliberately realizes their consumers only at ordered positions.
     auto pending_capture = begin_requested_gpu_capture(
         draws, computes, operations, width, height, &st, submit_no,
-        static_cast<uint64_t>(st.draws.size()));
-    OrderedSubmitResult result = has_ordered_dma
-        ? execute_ordered_gpustate(st, width, height, submit_no, g_live, g_compute)
+        static_cast<uint64_t>(st.draws.size()), nullptr,
+        /*defer_materialization=*/has_indirect);
+    OrderedGpustateCaptureTrace capture_trace;
+    OrderedSubmitResult result = needs_ordered_realization
+        ? execute_ordered_gpustate(st, width, height, submit_no, g_live, g_compute,
+                                   pending_capture ? &capture_trace : nullptr)
         : execute_ordered_items(operations, draws, computes, g_live, g_compute, width, height);
     const auto timing_backend_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     const std::vector<uint8_t>& px = result.frame.bytes();
 
     if (pending_capture) {
         std::string error;
-        if (!finish_requested_gpu_capture(std::move(pending_capture), px, error))
+        const std::vector<DrawItem>* capture_draws = needs_ordered_realization
+            ? &capture_trace.draws : &draws;
+        const std::vector<ComputeItem>* capture_computes = needs_ordered_realization
+            ? &capture_trace.computes : &computes;
+        if (!finish_requested_gpu_capture(std::move(pending_capture), px, error,
+                                          capture_draws, capture_computes, &operations, &st,
+                                          needs_ordered_realization ? &capture_trace.failures : nullptr))
             std::fprintf(stderr, "[gpucap] write failed: %s\n", error.c_str());
     }
     const bool frame_ready = px.size() == static_cast<size_t>(width) * height * 4;

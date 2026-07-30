@@ -631,6 +631,50 @@ int main() {
               "DMA-backed index buffer is realized after the ordered copy in the production path");
     }
 
+    // Indirect arguments are generated memory, not command-fold inputs. Supply them through an
+    // earlier ordered copy and verify that the production path reads the five-dword indexed draw
+    // only after that producer, including instance count and signed vertex offset.
+    {
+        alignas(4) uint32_t generated_args[5] = {3, 2, 0, 7, 0};
+        alignas(4) uint32_t consumed_args[5] = {};
+        uint16_t indirect_indices[3] = {0, 1, 2};
+        GpuState ordered = st;
+        ordered.index_type = 0;
+        ordered.draws.clear();
+        ordered.dispatches.clear();
+        ordered.dma_copies.clear();
+        ordered.ordered_memory_effects.clear();
+        GpuState::Draw draw;
+        draw.indexed = true;
+        draw.index_base = reinterpret_cast<uint64_t>(indirect_indices);
+        draw.indirect = true;
+        draw.indirect_args_addr = reinterpret_cast<uint64_t>(consumed_args);
+        draw.command_order = 200;
+        ordered.draws.push_back(draw);
+        ordered.dma_copies.push_back({
+            reinterpret_cast<uint64_t>(consumed_args),
+            reinterpret_cast<uint64_t>(generated_args), sizeof(consumed_args), 0, 100, 0});
+        std::vector<uint32_t> submitted_indices;
+        uint32_t submitted_instances = 0;
+        int32_t submitted_vertex_offset = 0;
+        uint32_t submitted_raw_count = 0;
+        set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+            if (!items.empty()) {
+                submitted_indices = items.front().indices;
+                submitted_instances = items.front().instance_count;
+                submitted_vertex_offset = items.front().vertex_offset;
+                submitted_raw_count = items.front().raw_draw_count;
+            }
+            return RenderedFrame{};
+        });
+        execute_ordered_and_present(ordered, W, H, 78, /*publish=*/false);
+        set_submit_renderer({});
+        CHECK(submitted_indices == std::vector<uint32_t>({0, 1, 2}) &&
+              submitted_instances == 2 && submitted_vertex_offset == 7 &&
+              submitted_raw_count == 3,
+              "indexed indirect arguments resolve lazily after their ordered producer");
+    }
+
     // Compute-only and DMA-only submissions bypass presentation, but an environment capture aimed
     // at an unsupported compute program must still retain that semantic submit.  Exercise the
     // non-render hook with an ordered DMA operation here; the compute selector/failure closure is

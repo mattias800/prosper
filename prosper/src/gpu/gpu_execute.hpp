@@ -1410,7 +1410,9 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // realization divergence. vcount_hint is the DrawIndexAuto/DrawIndex index_count decoded from the guest.
     out.raw_draw_count = vcount_hint; out.raw_indexed = (draw && draw->indexed);
     out.raw_draw_modifier = draw ? draw->modifier : 0;
-    out.vertex_offset = static_cast<int32_t>(rs.ge_indx_offset);
+    out.vertex_offset = draw && draw->has_vertex_offset_override
+        ? draw->indirect_vertex_offset
+        : static_cast<int32_t>(rs.ge_indx_offset);
     // The draw record is authoritative even in folded mode: register state may change after the
     // last draw, while IT_NUM_INSTANCES belongs to the draw at the moment it executes.
     out.instance_count = draw ? draw->instance_count : ds.num_instances;
