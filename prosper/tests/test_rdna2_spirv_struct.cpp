@@ -538,6 +538,29 @@ int main() {
     }
     printf("  [ok]   Wave32 mask-branch proof does not cross control-flow joins\n");
 
+    // Reduced Astro world-map PS PC9..33 preamble: s64 is a saved mask before a real EXECZ
+    // conditional. The fall-through arm refines it with an explicit VOPC mask and immediately votes
+    // through SCC. Provenance on that arm is valid even though the EXECZ target bypasses the block.
+    const uint32_t wave32_mask_through_execz_fallthrough[] = {
+        0xbec0037eu,                         // pc0: s_mov_b32 s64, exec_lo
+        0x7c220b31u,                         // pc1: v_cmpx_lt_f32 vcc, v49, v5
+        0xbf880004u,                         // pc2: s_cbranch_execz -> merge at PC7
+        0x7c0862f9u, 0x0686eb25u,            // pc3: v_cmp_lt_f32_sdwa vcc_hi, s37, v49
+        0x8a406b40u,                         // pc5: s_andn2_b32 s64, s64, vcc_hi
+        0xbf840001u,                         // pc6: s_cbranch_scc0 -> terminal tail
+        0xbf810000u,                         // pc7: merge
+    };
+    bool found_fallthrough_vote = false;
+    for (uint32_t pc : mask_test_branches_for_test(
+             wave32_mask_through_execz_fallthrough,
+             std::size(wave32_mask_through_execz_fallthrough), true))
+        if (pc == 6) found_fallthrough_vote = true;
+    if (!found_fallthrough_vote) {
+        printf("  [FAIL] valid fall-through Wave32 mask provenance was lost at EXECZ\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 mask proof preserves valid conditional fall-through provenance\n");
+
     // The same live shader selects EXEC_LO or an empty mask into VCC_HI from an ordinary scalar
     // comparison. This is s_cselect_b32's mask-domain form, not a scalar integer selection.
     const uint32_t wave32_fragment_b32_cselect[] = {

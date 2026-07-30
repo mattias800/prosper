@@ -3125,37 +3125,135 @@ uint32_t scalar_write_width(const Rdna2Inst& in);
 std::unordered_set<uint32_t> mask_test_branches(const std::vector<Rdna2Inst>& ins,
                                                 bool allow_b32_masks = false) {
     std::unordered_set<uint32_t> out;
-    std::unordered_set<int> b32_masks;
     std::unordered_set<uint32_t> b32_mask_writer_pcs;
     std::unordered_set<uint32_t> block_entries;
-    if (allow_b32_masks) {
-        for (const auto& candidate : ins) {
-            if (candidate.is_end) break;
-            if (candidate.fmt != Rdna2Format::SOPP ||
-                (candidate.opcode != 0x02 &&
-                 (candidate.opcode < 0x04 || candidate.opcode > 0x09)))
-                continue;
-            const int64_t target = static_cast<int64_t>(candidate.pc) +
-                candidate.len_dwords + candidate.simm16;
-            if (target >= 0 && target <= UINT32_MAX)
-                block_entries.insert(static_cast<uint32_t>(target));
+    size_t active_count = 0;
+    while (active_count < ins.size() && !ins[active_count].is_end) ++active_count;
+    std::unordered_map<uint32_t, size_t> index_by_pc;
+    for (size_t i = 0; i < active_count; ++i) index_by_pc.emplace(ins[i].pc, i);
+    auto is_scalar_branch = [](const Rdna2Inst& candidate) {
+        return candidate.fmt == Rdna2Format::SOPP &&
+            (candidate.opcode == 0x02 ||
+             (candidate.opcode >= 0x04 && candidate.opcode <= 0x09));
+    };
+    auto branch_target_pc = [](const Rdna2Inst& candidate) -> int64_t {
+        return static_cast<int64_t>(candidate.pc) + candidate.len_dwords + candidate.simm16;
+    };
+    for (size_t i = 0; i < active_count; ++i) {
+        if (!is_scalar_branch(ins[i])) continue;
+        const int64_t target = branch_target_pc(ins[i]);
+        if (target >= 0 && target <= UINT32_MAX)
+            block_entries.insert(static_cast<uint32_t>(target));
+    }
+
+    // Transfer one instruction's one-word Wave32-mask provenance. The domain is a MUST fact: an
+    // SGPR is present only when every path reaching this instruction proves that it contains a
+    // complete Wave32 lane mask. This preserves masks through a conditional fall-through (the live
+    // Astro alpha-test preamble) while intersecting away a compare performed on only one predecessor.
+    auto transfer_b32_masks = [&](const Rdna2Inst& in,
+                                  const std::unordered_set<int>& incoming,
+                                  bool* mask_writer) {
+        std::unordered_set<int> masks = incoming;
+        auto tracked_mask_source = [&](const Operand& source) {
+            return source.value == 126 ||
+                   ((source.kind == OperandKind::SGPR ||
+                     source.kind == OperandKind::Special) &&
+                    incoming.contains(source.value));
+        };
+        bool writes_b32_mask = false;
+        int mask_dst = -1;
+        if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode)) {
+            mask_dst = in.dst.kind == OperandKind::SGPR ? in.dst.value : 106;
+            writes_b32_mask = true;
+        } else if (in.fmt == Rdna2Format::SOP1 &&
+                   (in.opcode == 0x03 || in.opcode == 0x09 ||
+                    in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44)) {
+            writes_b32_mask = tracked_mask_source(in.src[0]) && in.dst.value != 127;
+            mask_dst = in.dst.value;
+        } else if (in.fmt == Rdna2Format::SOP2 &&
+                   (in.opcode == 0x0a ||
+                    (in.opcode >= 0x0e && in.opcode <= 0x1c &&
+                     (in.opcode & 1u) == 0))) {
+            const bool real_mask_source = tracked_mask_source(in.src[0]) ||
+                                          tracked_mask_source(in.src[1]);
+            auto representable = [&](const Operand& source) {
+                return tracked_mask_source(source) || source.kind == OperandKind::InlineInt;
+            };
+            writes_b32_mask = real_mask_source && representable(in.src[0]) &&
+                              representable(in.src[1]) && in.dst.value != 127;
+            mask_dst = in.dst.value;
+        } else if (in.fmt == Rdna2Format::VOP3 &&
+                   in.opcode >= 0x128 && in.opcode <= 0x12a &&
+                   in.sdst.kind == OperandKind::SGPR) {
+            writes_b32_mask = tracked_mask_source(in.src[2]);
+            mask_dst = in.sdst.value;
+        }
+
+        auto erase_written_words = [&](int base, uint32_t width) {
+            for (uint32_t word = 0; word < width; ++word)
+                masks.erase(base + static_cast<int>(word));
+        };
+        const uint32_t dst_width = scalar_write_width(in);
+        if (dst_width) erase_written_words(in.dst.value, dst_width);
+        if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
+            in.dst.kind == OperandKind::SGPR && in.dst.value <= 105)
+            erase_written_words(in.dst.value, 1);
+        if (in.fmt == Rdna2Format::VOP3 && in.sdst.kind == OperandKind::SGPR)
+            erase_written_words(in.sdst.value,
+                in.opcode >= 0x128 && in.opcode <= 0x12a ? 1u : 2u);
+        if (writes_b32_mask && mask_dst >= 0 && mask_dst != 126)
+            masks.insert(mask_dst);
+        if (mask_writer) *mask_writer = writes_b32_mask && mask_dst >= 0 && mask_dst != 126;
+        return masks;
+    };
+
+    if (allow_b32_masks && active_count) {
+        std::vector<std::unordered_set<int>> incoming(active_count);
+        std::vector<bool> reachable(active_count, false);
+        std::vector<size_t> worklist{0};
+        reachable[0] = true;
+        auto merge_into = [&](size_t successor, const std::unordered_set<int>& masks) {
+            if (!reachable[successor]) {
+                incoming[successor] = masks;
+                reachable[successor] = true;
+                worklist.push_back(successor);
+                return;
+            }
+            std::unordered_set<int> intersection;
+            for (int reg : incoming[successor])
+                if (masks.contains(reg)) intersection.insert(reg);
+            if (intersection != incoming[successor]) {
+                incoming[successor] = std::move(intersection);
+                worklist.push_back(successor);
+            }
+        };
+        for (size_t cursor = 0; cursor < worklist.size(); ++cursor) {
+            const size_t i = worklist[cursor];
+            const auto outgoing = transfer_b32_masks(ins[i], incoming[i], nullptr);
+            auto merge_pc = [&](int64_t pc) {
+                if (pc < 0 || pc > UINT32_MAX) return;
+                const auto found = index_by_pc.find(static_cast<uint32_t>(pc));
+                if (found != index_by_pc.end()) merge_into(found->second, outgoing);
+            };
+            if (is_scalar_branch(ins[i])) {
+                merge_pc(branch_target_pc(ins[i]));
+                if (ins[i].opcode != 0x02 && i + 1 < active_count)
+                    merge_into(i + 1, outgoing);
+            } else if (i + 1 < active_count) {
+                merge_into(i + 1, outgoing);
+            }
+        }
+        for (size_t i = 0; i < active_count; ++i) {
+            if (!reachable[i]) continue;
+            bool writes_mask = false;
+            (void)transfer_b32_masks(ins[i], incoming[i], &writes_mask);
+            if (writes_mask) b32_mask_writer_pcs.insert(ins[i].pc);
         }
     }
-    auto tracked_mask_source = [&](const Operand& source) {
-        return source.value == 126 ||
-               ((source.kind == OperandKind::SGPR ||
-                 source.kind == OperandKind::Special) &&
-                b32_masks.contains(source.value));
-    };
+
     const Rdna2Inst* prev = nullptr;
     for (const auto& in : ins) {
-        // B32 mask provenance is intentionally basic-block local. A linear scan cannot prove which
-        // predecessor supplied an SGPR at a join, so carrying one arm's compare into the merge can
-        // make an ordinary scalar SCC branch look like a disposable whole-wave vote.
-        if (allow_b32_masks && block_entries.contains(in.pc)) {
-            b32_masks.clear();
-            prev = nullptr;
-        }
+        if (block_entries.contains(in.pc)) prev = nullptr;
         if (in.is_end) break;
         if (sopp_is_noop(in)) continue;                         // hints don't break the mask->branch pairing
         if (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x04 || in.opcode == 0x05) && in.simm16 > 0) {
@@ -3188,65 +3286,7 @@ std::unordered_set<uint32_t> mask_test_branches(const std::vector<Rdna2Inst>& in
             }
         }
 
-        if (allow_b32_masks) {
-            bool writes_b32_mask = false;
-            int mask_dst = -1;
-            if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode)) {
-                mask_dst = in.dst.kind == OperandKind::SGPR ? in.dst.value : 106;
-                writes_b32_mask = true;
-            } else if (in.fmt == Rdna2Format::SOP1 &&
-                       (in.opcode == 0x03 || in.opcode == 0x09 ||
-                        in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44)) {
-                writes_b32_mask = tracked_mask_source(in.src[0]) && in.dst.value != 127;
-                mask_dst = in.dst.value;
-            } else if (in.fmt == Rdna2Format::SOP2 &&
-                       (in.opcode == 0x0a ||
-                        (in.opcode >= 0x0e && in.opcode <= 0x1c &&
-                         (in.opcode & 1u) == 0))) {
-                const bool real_mask_source = tracked_mask_source(in.src[0]) ||
-                                              tracked_mask_source(in.src[1]);
-                auto representable = [&](const Operand& source) {
-                    return tracked_mask_source(source) || source.kind == OperandKind::InlineInt;
-                };
-                writes_b32_mask = real_mask_source && representable(in.src[0]) &&
-                                  representable(in.src[1]) && in.dst.value != 127;
-                mask_dst = in.dst.value;
-            } else if (in.fmt == Rdna2Format::VOP3 &&
-                       in.opcode >= 0x128 && in.opcode <= 0x12a &&
-                       in.sdst.kind == OperandKind::SGPR) {
-                writes_b32_mask = tracked_mask_source(in.src[2]);
-                mask_dst = in.sdst.value;
-            }
-
-            // End every overwritten word's prior lifetime before publishing a newly-proven mask
-            // result. In particular, a B64 write must invalidate an independently tracked Wave32
-            // mask in its high word; otherwise a later ordinary B32 ALU op can inherit stale mask
-            // provenance and make us drop a real SCC branch.
-            auto erase_written_words = [&](int base, uint32_t width) {
-                for (uint32_t word = 0; word < width; ++word)
-                    b32_masks.erase(base + static_cast<int>(word));
-            };
-            const uint32_t dst_width = scalar_write_width(in);
-            if (dst_width) erase_written_words(in.dst.value, dst_width);
-            if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
-                in.dst.kind == OperandKind::SGPR && in.dst.value <= 105)
-                erase_written_words(in.dst.value, 1);
-            if (in.fmt == Rdna2Format::VOP3 && in.sdst.kind == OperandKind::SGPR)
-                erase_written_words(in.sdst.value,
-                    in.opcode >= 0x128 && in.opcode <= 0x12a ? 1u : 2u);
-            if (writes_b32_mask && mask_dst >= 0 && mask_dst != 126) {
-                b32_masks.insert(mask_dst);
-                b32_mask_writer_pcs.insert(in.pc);
-            }
-        }
-        const bool ends_block = in.fmt == Rdna2Format::SOPP &&
-            (in.opcode == 0x02 || (in.opcode >= 0x04 && in.opcode <= 0x09));
-        if (allow_b32_masks && ends_block) {
-            b32_masks.clear();
-            prev = nullptr;
-        } else {
-            prev = &in;
-        }
+        prev = is_scalar_branch(in) ? nullptr : &in;
     }
     return out;
 }
