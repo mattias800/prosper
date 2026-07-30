@@ -870,6 +870,11 @@ inline const RenderVkCtx& render_vk_ctx() {
                         usage, 0, &properties) == VK_SUCCESS)
                     shared.native_storage_format_support |=
                         prosper::gpu::native_storage_format_support_bit(format, components);
+                if (vkGetPhysicalDeviceImageFormatProperties(
+                        r.phys, vk_format, VK_IMAGE_TYPE_3D, VK_IMAGE_TILING_OPTIMAL,
+                        usage, 0, &properties) == VK_SUCCESS)
+                    shared.native_storage_format_support |=
+                        prosper::gpu::native_storage_3d_format_support_bit(format, components);
             };
             add_native_storage_format(prosper::gpu::DataFormat::Unorm8, 1, VK_FORMAT_R8_UNORM);
             add_native_storage_format(prosper::gpu::DataFormat::Unorm8, 2, VK_FORMAT_R8G8_UNORM);

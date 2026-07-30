@@ -2652,6 +2652,125 @@ int main() {
                       raw_repair_notifications == 1,
                   "external raw 3D mirror change forces exact writeback and invalidation");
         }
+
+        // The same 3D FP16 resource can stay at its exact eight-byte native width when the device
+        // advertises dimension-specific support. This is Astro Bot's 240x135x64 ping-pong shape;
+        // reflection must select float storage rather than the sixteen-byte raw-uvec4 interchange.
+        ComputeShaderConfig native_3d_config = raw_config;
+        native_3d_config.native_storage_format_support =
+            native_storage_3d_format_support_bit(DataFormat::Float16, 4);
+        const std::vector<uint32_t> native_3d_spirv = recompile_compute(
+            fill_3d, std::size(fill_3d), &raw_rt, native_3d_config);
+        CHECK(!native_3d_spirv.empty(), "native typed 3D fill kernel recompiles");
+        if (!native_3d_spirv.empty()) {
+            const DescriptorValidationReport native_3d_report =
+                validate_spirv_descriptor_interface(
+                    native_3d_spirv, &raw_rt, 0, SpirvShaderStage::Compute, false);
+            const SpirvDescriptorBinding* native_3d_binding =
+                find_spirv_descriptor_binding(native_3d_report, 0, raw_dst.binding);
+            CHECK(native_3d_report.ok() && native_3d_binding &&
+                      native_3d_binding->kind == SpirvDescriptorKind::StorageImage &&
+                      native_3d_binding->storage_float && native_3d_binding->image_dim == 2,
+                  "dimension-capable FP16 volume reflects exact float 3D storage");
+
+#if defined(__linux__)
+            const bool native_3d_runtime_supported =
+                prosper::frontend::live_compute_native_storage_3d_supported(
+                    DataFormat::Float16, 4, RW, RH, RD);
+#else
+            constexpr bool native_3d_runtime_supported = false;
+#endif
+            if (native_3d_runtime_supported &&
+                adaptive_storage_result_validation_enabled) {
+#if defined(__linux__)
+                prosper::host::guest_write_watch_notify_host_write(
+                    reinterpret_cast<uint64_t>(raw_guest), raw_guest_bytes);
+#endif
+                std::fill_n(raw_guest, raw_guest_bytes, 0x3a);
+                ComputeItem native_3d_item;
+                native_3d_item.spirv = native_3d_spirv;
+                native_3d_item.resources = std::make_shared<ShaderResourceTable>(raw_rt);
+                native_3d_item.launch.threads_x = RW;
+                native_3d_item.launch.threads_y = RH;
+                native_3d_item.launch.threads_z = RD;
+                native_3d_item.launch.local_x = RW;
+                native_3d_item.launch.local_y = RH;
+                native_3d_item.launch.local_z = RD;
+                native_3d_item.launch.groups_x = native_3d_item.launch.groups_y =
+                    native_3d_item.launch.groups_z = 1;
+                native_3d_item.code_addr = 0x1122f14du;
+                CHECK(prosper::frontend::execute_live_compute_items({native_3d_item}),
+                      "native typed 3D fill executes at exact guest width");
+                const std::vector<uint8_t> native_3d_expected(
+                    raw_guest, raw_guest + raw_guest_bytes);
+                CHECK(std::any_of(native_3d_expected.begin(), native_3d_expected.end(),
+                                  [](uint8_t byte) { return byte != 0x3a; }),
+                      "native typed 3D fill overwrites its guest volume");
+                CHECK(prosper::frontend::execute_live_compute_items({native_3d_item}) &&
+                          std::equal(raw_guest, raw_guest + raw_guest_bytes,
+                                     native_3d_expected.begin()),
+                      "retained native 3D result is byte-exact across repeated dispatches");
+#if defined(__linux__)
+                // The first successful dispatch proves full coverage and the second retains the
+                // image. Force one exact repair so the retained result establishes the cross-submit
+                // page watch that authorizes the following device-local sampled copy.
+                raw_guest[0] ^= 0x5a;
+                CHECK(prosper::frontend::execute_live_compute_items({native_3d_item}) &&
+                          std::equal(raw_guest, raw_guest + raw_guest_bytes,
+                                     native_3d_expected.begin()),
+                      "native 3D result repairs an external mirror write before transfer");
+#endif
+
+                static const uint32_t sampled_copy_3d[] = {
+                    0x7E080300u,             // v4 = v0 (x)
+                    0x7E0A0301u,             // v5 = v1 (y)
+                    0x7E0C0302u,             // v6 = v2 (z)
+                    0xF0000F10u, 0x00000004u,// IMAGE_LOAD v0..v3 at (v4,v5,v6), dim:3D
+                    0xBF8C3F70u,             // s_waitcnt vmcnt(0)
+                    0xF0200F10u, 0x00020004u,// IMAGE_STORE to a distinct 3D destination
+                    0xBF810000u,
+                };
+                std::vector<uint8_t> native_copy_guest(raw_guest_bytes, 0x71);
+                ShaderResourceTable native_copy_rt;
+                ShaderResource native_copy_src = raw_dst;
+                native_copy_src.cls = ResourceClass::Texture;
+                native_copy_src.binding = 4;
+                native_copy_src.sgpr_base = 0;
+                native_copy_rt.resources.push_back(native_copy_src);
+                ShaderResource native_copy_dst = raw_dst;
+                native_copy_dst.gpu_addr =
+                    reinterpret_cast<uint64_t>(native_copy_guest.data());
+                native_copy_rt.resources.push_back(native_copy_dst);
+                const std::vector<uint32_t> native_copy_spirv = recompile_compute(
+                    sampled_copy_3d, std::size(sampled_copy_3d),
+                    &native_copy_rt, native_3d_config);
+                CHECK(!native_copy_spirv.empty(),
+                      "sampled-to-storage native 3D copy kernel recompiles");
+                if (!native_copy_spirv.empty()) {
+                    ComputeItem native_copy_item = native_3d_item;
+                    native_copy_item.spirv = native_copy_spirv;
+                    native_copy_item.resources =
+                        std::make_shared<ShaderResourceTable>(native_copy_rt);
+                    native_copy_item.code_addr = 0x1122f15du;
+                    const uint64_t transfer_seeds_before =
+                        prosper::frontend::live_compute_storage_transfer_seeds();
+                    CHECK(prosper::frontend::execute_live_compute_items({native_copy_item}),
+                          "sampled 3D consumer executes from retained native storage output");
+                    CHECK(prosper::frontend::live_compute_storage_transfer_seeds() >
+                              transfer_seeds_before,
+                          "sampled 3D consumer seeds on-GPU without a guest upload");
+                    std::vector<uint8_t> native_source_linear(RW * RH * RD * 8u);
+                    std::vector<uint8_t> native_copy_linear(native_source_linear.size());
+                    CHECK(detile_volume(native_source_linear.data(), raw_guest,
+                                        raw_guest_bytes, RW, RH, RD, raw_mode, 8) &&
+                              detile_volume(native_copy_linear.data(),
+                                            native_copy_guest.data(), raw_guest_bytes,
+                                            RW, RH, RD, raw_mode, 8) &&
+                              native_copy_linear == native_source_linear,
+                          "device-local native 3D seed preserves every logical FP16 voxel");
+                }
+            }
+        }
 #if defined(__linux__)
         prosper::host::guest_write_watch_notify_direct_mapping_removed(
             reinterpret_cast<uint64_t>(raw_guest), raw_guest_bytes);

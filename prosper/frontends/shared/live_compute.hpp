@@ -113,6 +113,15 @@ uint64_t live_compute_buffer_gpu_result_skips();
 // Monotonic diagnostic count of retained sampled-image hits whose validated source omitted upload.
 // Capture/replay tests use this to prove residency without relying on timing-sensitive assertions.
 uint64_t live_compute_sampled_image_upload_skips();
+// Monotonic count of sampled 3D images seeded from an exact retained native storage result with a
+// device-local image copy instead of a guest-memory conversion/upload.
+uint64_t live_compute_storage_transfer_seeds();
+// Query the initialized live backend for the exact typed 3D storage+transfer image contract. Tests
+// use this to exercise native-volume execution only on devices that can create the Vulkan image.
+bool live_compute_native_storage_3d_supported(prosper::gpu::DataFormat format,
+                                              uint32_t components,
+                                              uint32_t width, uint32_t height,
+                                              uint32_t depth);
 // Monotonic count of exact compute fills executed by the structurally guarded CPU path. Tests use
 // the delta to distinguish the intended bypass from a successful Vulkan fallback.
 uint64_t live_compute_cpu_fill_dispatches();

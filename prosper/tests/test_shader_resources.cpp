@@ -285,10 +285,15 @@ int main() {
         native_storage_format_support_bit(DataFormat::Unorm8, 2);
     const uint32_t packed_storage =
         native_storage_format_support_bit(DataFormat::Float10_11_11, 3);
-    CHECK(r8_storage && rg8_storage && packed_storage && r8_storage != rg8_storage &&
+    const uint32_t fp16_3d_storage =
+        native_storage_3d_format_support_bit(DataFormat::Float16, 4);
+    CHECK(r8_storage && rg8_storage && packed_storage && fp16_3d_storage &&
+              r8_storage != rg8_storage &&
               rg8_storage != packed_storage &&
+              !(fp16_3d_storage & ((1u << 10) - 1u)) &&
+              !(fp16_3d_storage & ~kNativeStorageFormatSupportMask) &&
               native_storage_format_support_bit(DataFormat::Float16, 3) == 0,
-          "native storage capability bits distinguish exact typed VkFormat candidates");
+          "native storage capability bits distinguish exact typed VkFormat and dimension candidates");
 
     uint8_t rgba10[4] = {};
     unorm2_10_10_10_to_rgba8(0xFFFFFFFFu, rgba10);
