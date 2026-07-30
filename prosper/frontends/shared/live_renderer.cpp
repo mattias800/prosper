@@ -390,7 +390,7 @@ size_t texture_decode_cache_limit_bytes(const char* override_mib,
                                         uint64_t physical_memory_bytes) {
     constexpr uint64_t kMiB = 1024ull * 1024ull;
     constexpr uint64_t kMinBytes = 1024ull * kMiB;
-    constexpr uint64_t kMaxBytes = 2048ull * kMiB;
+    constexpr uint64_t kMaxBytes = 4096ull * kMiB;
     uint64_t bytes = kMinBytes;
     if (override_mib) {
         const uint64_t mib = strtoull(override_mib, nullptr, 10);
