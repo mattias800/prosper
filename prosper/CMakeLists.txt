@@ -354,6 +354,12 @@ if(TARGET prosper_core)
   target_include_directories(test_prosper_app_game_path PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_game_path COMMAND test_prosper_app_game_path)
 
+  # The game library scan, param.json metadata, and settings precedence (#1471): filesystem access is
+  # injected, so the whole scan runs in normal CI with no window, no ImGui and no real dump.
+  add_executable(test_prosper_app_game_library frontends/prosper-app/test_game_library.cpp)
+  target_include_directories(test_prosper_app_game_library PRIVATE frontends/prosper-app)
+  add_test(NAME prosper_app_game_library COMMAND test_prosper_app_game_library)
+
   # Fault-safe guest-pointer read in the PROSPER_AMPRLOG diagnostic (#1154): an unmapped, aligned,
   # > 0xffff pointer (GTA V's 0x302200) must report unreadable, not SIGSEGV. POSIX-only
   # (process_vm_readv / mmap); ampr_arglog lives in the __linux__||__APPLE__ half of hle_kernel_mem.
