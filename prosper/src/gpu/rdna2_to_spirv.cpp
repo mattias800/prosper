@@ -887,6 +887,11 @@ struct SpirvCompute {
         uint32_t hs = id(); put(code, Op_ShiftLeftLogical, {t_u64(), hs, h, uconst64(32)});
         uint32_t r = id(); put(code, Op_BitwiseOr, {t_u64(), r, l, hs}); return r;
     }
+    uint32_t u64_shift(uint32_t op, uint32_t value, uint32_t amount) {
+        // Keep the shift operand u64-typed for the same cross-driver reason as uconst64 above.
+        uint32_t shift = id(); put(code, Op_UConvert, {t_u64(), shift, amount});
+        uint32_t result = id(); put(code, op, {t_u64(), result, value, shift}); return result;
+    }
     uint32_t bfe_u64(uint32_t base64, uint32_t off, uint32_t cnt) {   // 64-bit unsigned bitfield extract
         // res = (base << (64-off-cnt)) >> (64-cnt), all logical u64 (portable — OpBitFieldUExtract on a
         // 64-bit base isn't reliably supported, e.g. llvmpipe returns 0). The 7-bit width field
@@ -4411,7 +4416,8 @@ uint32_t scalar_write_width(const Rdna2Inst& in) {
         case Rdna2Format::SOP2:
             switch (in.opcode) {
                 case 0x0b: case 0x0f: case 0x11: case 0x13: case 0x15:
-                case 0x17: case 0x19: case 0x1b: case 0x1d: case 0x25: case 0x29:
+                case 0x17: case 0x19: case 0x1b: case 0x1d:
+                case 0x1f: case 0x21: case 0x25: case 0x29:
                     return 2; // B64 data/mask writes
                 default: return 1;
             }
@@ -4671,8 +4677,11 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
                 // s_lshr_b64 -> EXEC is modeled only in the per-lane mask domain. It does not
                 // produce scalar SGPR data, so carrying a scalar value through a loop/if merge is
                 // both unnecessary and semantically wrong.
-                if (in.opcode != 0x21 || (in.dst.value != 126 && in.dst.value != 127))
+                if (in.opcode != 0x21 || (in.dst.value != 126 && in.dst.value != 127)) {
                     sregs.insert(in.dst.value);
+                    if (in.opcode == 0x1f || in.opcode == 0x21)
+                        sregs.insert(in.dst.value + 1);
+                }
                 break;
             case Rdna2Format::SMEM: {                                      // s_load/s_buffer_load: N consecutive SGPRs
                 uint32_t n = 1; switch (in.opcode) { case 0x1: case 0x9: n=2; break; case 0x2: case 0xA: n=4; break;
@@ -5559,14 +5568,83 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                        mask_write_clobbers_pair(rs, in.dst.value); }
                 return true;
             }
-            // s_lshr_b64 — only the NGG wave-packing form (dst = EXEC) is modeled: it sets EXEC to
-            // the count of active vertices/primitives in the wave. A per-invocation SPIR-V shader has
-            // no wave to pack, so leave EXEC full. Handle this before taking an operator[] reference
-            // to rs.sreg[dst]: inserting a default SSA id 0 leaked into a later OpPhi and produced
-            // invalid SPIR-V (and an NVIDIA Windows driver crash during pipeline creation).
+            // The NGG wave-packing s_lshr_b64 form (dst = EXEC) sets EXEC to the count of active
+            // vertices/primitives in the wave. A per-invocation SPIR-V shader has no wave to pack,
+            // so leave EXEC full. Handle that special form before the ordinary scalar-pair shift.
             if (in.opcode == 0x21) {
-                if (in.dst.value != 126 && in.dst.value != 127) ok = false;
-                rs.scc = 0;   // poison: hardware SCC=(result!=0) over the packed mask is cross-lane
+                if (in.dst.value == 126 || in.dst.value == 127) {
+                    rs.scc = 0; // poison: hardware SCC=(result!=0) over the packed mask is cross-lane
+                    return true;
+                }
+            }
+            if (in.opcode == 0x1f || in.opcode == 0x21) {
+                // Ordinary s_lshl/lshr_b64 operates on a complete scalar-data pair. Generated
+                // compute shaders frequently borrow VCC_LO/HI for 64-bit address arithmetic; that
+                // lifetime coexists with VCC's per-lane predicate view, so retain both exactly.
+                auto scalar_word = [&](int reg, uint32_t& value) {
+                    auto current = rs.sreg.find(reg);
+                    if (current != rs.sreg.end()) { value = current->second; return true; }
+                    auto input = rs.sreg_input.find(reg);
+                    if (input != rs.sreg_input.end()) { value = input->second; return true; }
+                    return false;
+                };
+                uint32_t source_lo = 0, source_hi = 0;
+                const Operand& source = in.src[0];
+                if (source.kind == OperandKind::SGPR ||
+                    (source.kind == OperandKind::Special &&
+                     source.value >= 106 && source.value < 124)) {
+                    if (!scalar_word(source.value, source_lo) ||
+                        !scalar_word(source.value + 1, source_hi)) {
+                        ok = false; return true;
+                    }
+                } else if (source.kind == OperandKind::InlineInt) {
+                    source_lo = b.uconst(static_cast<uint32_t>(source.value));
+                    source_hi = b.uconst(source.value < 0 ? UINT32_MAX : 0u);
+                } else if (source.kind == OperandKind::Literal) {
+                    source_lo = b.uconst(in.literal);
+                    source_hi = b.uconst(0);
+                } else {
+                    ok = false; return true;
+                }
+                const uint32_t amount = b.ibin(
+                    Op_BitwiseAnd, val(in.src[1]), b.uconst(63));
+                if (!ok) return true;
+                const uint32_t result = b.u64_shift(
+                    in.opcode == 0x1f ? Op_ShiftLeftLogical : Op_ShiftRightLogical,
+                    b.u64_from_lohi(source_lo, source_hi), amount);
+                const uint32_t lo = b.u64_lo(result), hi = b.u64_hi(result);
+                rs.scc = b.ucmp(
+                    Op_INotEqual, b.ibin(Op_BitwiseOr, lo, hi), b.uconst(0));
+                const bool writes_exec = in.dst.value == 126 || in.dst.value == 127;
+                const bool writes_vcc = in.dst.value == 106 || in.dst.value == 107;
+                if (writes_exec || writes_vcc) {
+                    uint32_t lane = b.ibin(
+                        Op_BitwiseAnd, b.guest_lane_id(), b.uconst(b.wave_size - 1));
+                    const uint32_t mask_bit = b.u64_bit(result, lane);
+                    if (writes_exec) {
+                        rs.exec = mask_bit;
+                        rs.exec_narrowed = true;
+                        rs.sreg.erase(in.dst.value);
+                        rs.sreg.erase(in.dst.value + 1);
+                    } else {
+                        rs.vcc = mask_bit;
+                        rs.sreg_bool[in.dst.value] = mask_bit;
+                        rs.sreg_bool_narrowed[in.dst.value] = true;
+                        rs.sreg[in.dst.value] = lo;
+                        rs.sreg[in.dst.value + 1] = hi;
+                    }
+                } else {
+                    rs.sreg[in.dst.value] = lo;
+                    rs.sreg[in.dst.value + 1] = hi;
+                    rs.sreg_bool.erase(in.dst.value);
+                    rs.sreg_bool.erase(in.dst.value + 1);
+                    rs.sreg_bool_narrowed.erase(in.dst.value);
+                    rs.sreg_bool_narrowed.erase(in.dst.value + 1);
+                }
+                rs.sreg_bool_b32.erase(in.dst.value);
+                rs.sreg_bool_b32.erase(in.dst.value + 1);
+                rs.sreg_srt.erase(in.dst.value);
+                rs.sreg_srt.erase(in.dst.value + 1);
                 return true;
             }
             if (in.opcode == 0x29) {   // s_bfe_u64
@@ -9712,6 +9790,12 @@ bool emit_cfg_state_machine(
         if (in.fmt == Rdna2Format::SOPC && (in.opcode == 0x12 || in.opcode == 0x13))
             for (uint32_t k = 0; k < 2; ++k)
                 if (in.src[k].kind == OperandKind::SGPR) sregs.insert(in.src[k].value + 1);
+        if (in.fmt == Rdna2Format::SOP2 &&
+            (in.opcode == 0x1f || in.opcode == 0x21) &&
+            (in.src[0].kind == OperandKind::SGPR ||
+             (in.src[0].kind == OperandKind::Special &&
+              in.src[0].value >= 106 && in.src[0].value < 124)))
+            sregs.insert(in.src[0].value + 1);
     }
     for (const auto& kv : initial.vreg) vregs.insert(kv.first);
     for (const auto& kv : initial.sreg) sregs.insert(kv.first);

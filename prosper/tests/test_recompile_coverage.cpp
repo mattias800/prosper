@@ -471,6 +471,18 @@ int main() {
                              compute_cfg_dispatch_bitset.size(), &dispatch_rt,
                              wave32_dispatch_config).empty(),
           "the dispatcher preserves an in-place scalar bitset update");
+    std::vector<uint32_t> compute_cfg_dispatch_scalar_shift = {
+        0xBEEA0381u, // s_mov_b32 vcc_lo, 1 (scalar-data lifetime)
+        0xBEEB0380u, // s_mov_b32 vcc_hi, 0
+        0x8FEA876Au, // s_lshl_b64 vcc, vcc, 7
+    };
+    compute_cfg_dispatch_scalar_shift.insert(
+        compute_cfg_dispatch_scalar_shift.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_scalar_shift.data(),
+                             compute_cfg_dispatch_scalar_shift.size(), &dispatch_rt,
+                             wave32_dispatch_config).empty(),
+          "the dispatcher preserves 64-bit scalar address shifts through VCC");
     wave32_dispatch_config.native_subgroup_size = 0;
     // The dispatcher includes branch-target/fallthrough blocks even when no entry path can reach
     // them. This dead block overwrites half of direct V# s[8:11] and then targets the live entry;
