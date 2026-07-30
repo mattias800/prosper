@@ -3026,6 +3026,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             (!timing_trace_only || trace);
         for (size_t i = 0; i < image_descriptors.size() && images_ready; i++) {
             const auto image_start = ComputeClock::now();
+            double import_ms = 0.0;
+            double view_ms = 0.0;
+            double sampler_ms = 0.0;
             const ShaderResource* r = item.resources->by_binding(image_descriptors[i].binding);
             if (!r || !r->width || !r->height) { skip_image(r, "no/degenerate resource"); break; }
             BoundImage& bi = images[i];
@@ -3044,10 +3047,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 r->format == DataFormat::Float10_11_11 && descriptor_components == 3;
             const bool ordinary_2d_storage = r->img_dim == 1 && r->depth == 1 &&
                                              !r->depth_compare;
-            const bool native_storage_supported = native_float_storage_image_supported(
-                r->format, descriptor_components, r->srgb,
-                ordinary_2d_storage && native_storage_image_create_supported(
-                    ctx.physical, native_storage_format, r->width, r->height));
+            // vkGetPhysicalDeviceImageFormatProperties is a driver query, not a cheap metadata
+            // lookup. Sampled and raw-uvec4 descriptors cannot take this typed-storage path, so do
+            // not repeat that query for every one of their per-frame bindings.
+            const bool native_storage_supported = spirv_native_storage &&
+                native_float_storage_image_supported(
+                    r->format, descriptor_components, r->srgb,
+                    ordinary_2d_storage && native_storage_image_create_supported(
+                        ctx.physical, native_storage_format, r->width, r->height));
             if (spirv_native_storage && !native_storage_supported) {
                 skip_image(r, "compiled typed storage format is unsupported by this device");
                 break;
@@ -3198,8 +3205,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const LiveTargetImageRequest import_request{
                     r->width, r->height, render_scale, depth_import_eligible,
                     scalable_normalized_sampling};
+                const auto import_start = ComputeClock::now();
                 const bool import_available = import_live_render_target_image(
                     r->gpu_addr, import_request, import);
+                import_ms = std::chrono::duration<double, std::milli>(
+                    ComputeClock::now() - import_start).count();
                 if (trace)
                     std::fprintf(stderr,
                                  "[compute]   direct RTT candidate binding=%u addr=0x%llx "
@@ -4528,8 +4538,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const VkImageAspectFlags image_aspect = (sampled_depth || bi.imported_depth)
                 ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
             vci.subresourceRange = {image_aspect, 0, 1, 0, ici.arrayLayers};
+            const auto view_start = ComputeClock::now();
             if (!vk_ok(vkCreateImageView(ctx.device, &vci, nullptr, &bi.view),
                        "image-view")) { images_ready = false; break; }
+            view_ms = std::chrono::duration<double, std::milli>(
+                ComputeClock::now() - view_start).count();
             if (!bi.storage) {
                 // Sampler from the decoded S# (mag/min filter, SQ_TEX CLAMP wrap enums) — the same
                 // fields the renderer honors; defaults reproduce LINEAR/clamp.
@@ -4558,14 +4571,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 smci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
                 smci.compareEnable = sampled_depth ? VK_TRUE : VK_FALSE;
                 smci.compareOp = static_cast<VkCompareOp>(r->depth_compare_func & 0x7u);
+                const auto sampler_start = ComputeClock::now();
                 if (!vk_ok(vkCreateSampler(ctx.device, &smci, nullptr, &bi.sampler), "image-sampler")) {
                     images_ready = false; break; }
+                sampler_ms = std::chrono::duration<double, std::milli>(
+                    ComputeClock::now() - sampler_start).count();
             }
             if (image_timing)
                 std::fprintf(stderr,
                              "[compute-image] code=0x%llx binding=%u class=%s imported=%u "
                              "extent=%ux%ux%u guest=%zu staging=%llu "
-                             "normalized=%u texel=%u sampled-float=%u rgba8-reuse=%u ms=%.3f\n",
+                             "normalized=%u texel=%u sampled-float=%u rgba8-reuse=%u "
+                             "import_ms=%.3f view_ms=%.3f sampler_ms=%.3f ms=%.3f\n",
                              (unsigned long long)item.code_addr, bi.binding,
                              bi.storage ? "storage" : "sampled", bi.imported ? 1u : 0u,
                              r->width, r->height, r->depth, bi.guest_bytes,
@@ -4574,6 +4591,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              image_descriptors[i].texel_access ? 1u : 0u,
                              image_descriptors[i].sampled_float ? 1u : 0u,
                              bi.unorm_rtt_value_reuse ? 1u : 0u,
+                             import_ms, view_ms, sampler_ms,
                              std::chrono::duration<double, std::milli>(
                                  ComputeClock::now() - image_start).count());
         }

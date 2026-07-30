@@ -31,6 +31,14 @@ constexpr bool live_rtt_compute_authoritative(bool gpu_valid, bool has_cpu_snaps
     return live_rtt_authority(gpu_valid, has_cpu_snapshot) != LiveRttAuthority::none;
 }
 
+// Pixel-inspection and mutation diagnostics operate on the renderer's owned CPU texture copy.
+// Uniform fast-clears normally bypass that copy, but the opt-in diagnostic contract takes
+// precedence so dumps and override probes observe the same pixels as ordinary RTT snapshots.
+constexpr bool live_rtt_uniform_uses_cpu_diagnostic_path(bool has_uniform_color,
+                                                         bool cpu_copy_diagnostics) {
+    return has_uniform_color && cpu_copy_diagnostics;
+}
+
 constexpr bool live_rtt_cpu_snapshot_matches(uint32_t width, uint32_t height,
                                              uint32_t bytes_per_pixel,
                                              size_t snapshot_bytes) {

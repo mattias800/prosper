@@ -20,6 +20,7 @@ using prosper::frontend::live_rtt_authority;
 using prosper::frontend::live_rtt_compute_authoritative;
 using prosper::frontend::live_rtt_cpu_snapshot_matches;
 using prosper::frontend::live_rtt_gpu_importable;
+using prosper::frontend::live_rtt_uniform_uses_cpu_diagnostic_path;
 using prosper::frontend::LiveRttGuestWriteEffect;
 using prosper::frontend::live_rtt_guest_write_effect;
 using prosper::frontend::live_rtt_compute_mirror_eligible;
@@ -92,6 +93,9 @@ int main() {
     CHECK(live_rtt_compute_authoritative(true, true));
     CHECK(live_rtt_compute_authoritative(false, true));
     CHECK(!live_rtt_compute_authoritative(false, false));
+    CHECK(live_rtt_uniform_uses_cpu_diagnostic_path(true, true));
+    CHECK(!live_rtt_uniform_uses_cpu_diagnostic_path(true, false));
+    CHECK(!live_rtt_uniform_uses_cpu_diagnostic_path(false, true));
     CHECK(live_rtt_cpu_snapshot_matches(1920, 1080, 8, 1920ull * 1080 * 8));
     CHECK(!live_rtt_cpu_snapshot_matches(1920, 1080, 8, 1920ull * 1080 * 4));
     CHECK(!live_rtt_cpu_snapshot_matches(0, 1080, 8, 0));

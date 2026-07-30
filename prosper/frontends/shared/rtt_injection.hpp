@@ -12,6 +12,23 @@
 
 namespace prosper::frontend {
 
+// Fill an already-sized byte buffer with one repeated native-format pixel. Growing the initialized
+// prefix exponentially keeps the operation to O(log(bytes)) bulk copies instead of one tiny memcpy
+// per texel. Source and destination ranges are disjoint on every iteration.
+inline bool fill_repeating_pixel(std::vector<uint8_t>& destination,
+                                 const uint8_t* pixel, size_t pixel_bytes) {
+    if (!pixel || !pixel_bytes || destination.size() % pixel_bytes) return false;
+    if (destination.empty()) return true;
+    std::memcpy(destination.data(), pixel, pixel_bytes);
+    size_t initialized = pixel_bytes;
+    while (initialized < destination.size()) {
+        const size_t copy = std::min(initialized, destination.size() - initialized);
+        std::memcpy(destination.data() + initialized, destination.data(), copy);
+        initialized += copy;
+    }
+    return true;
+}
+
 // An immutable CPU RTT snapshot can back a FrameResource directly only when the consumer uses the
 // producer's exact extent and byte layout. Scaled views still need their owned nearest-neighbor copy;
 // malformed snapshots stay on the guest-decode fallback.
