@@ -954,8 +954,14 @@ public:
     }
 
     void add_cleanup(std::function<void()> cleanup) {
-        if (!pending_resources_abandoned_)
+        if (!pending_resources_abandoned_) {
             cleanups_.push_back(std::move(cleanup));
+            return;
+        }
+        // Some resources are bundled only after submission diagnostics finish. If completion was
+        // already found indeterminate, destroying this late closure would release those resources
+        // (including borrowed-image leases) while the submitted command may still use them.
+        (void)new std::function<void()>(std::move(cleanup));
     }
 
     // Persistent attachment state is updated speculatively so later command buffers in the same
