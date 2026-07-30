@@ -3749,10 +3749,14 @@ std::vector<ComputeItem> realize_compute_dispatches(
             }
         }
         assign_convention_bindings(*table, 2);
+        bool native_multiwave_wave_work = false;
         {
             std::vector<Rdna2Inst> decoded;
             rdna2_walk(reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
                        shader_dwords, decoded);
+            native_multiwave_wave_work = compute_shader_prefers_native_multiwave(
+                decoded, reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+                shader_dwords);
             const bool uses_gds = std::any_of(decoded.begin(), decoded.end(), [](const auto& in) {
                 return in.fmt == Rdna2Format::DS && in.ds_gds && in.opcode == 0x0d;
             });
@@ -3804,9 +3808,14 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // Vulkan's implementation-defined LocalInvocationIndex order and subgroup lane order while
         // still making each native subgroup exactly one RDNA wave. Capture v37 records this exact
         // module's required-subgroup/full-subgroups pipeline contract for faithful replay.
+        // Repeated scratch-emulated wave scans/votes are a structural exception to the conservative
+        // multi-wave default: the exact subgroup shell removes their workgroup barriers while
+        // preserving one native subgroup per guest wave. Keep the environment switch as an explicit
+        // experiment for every other multi-wave shape; this automatic path is shader-address/title
+        // independent and remains subject to all device and workgroup bounds below.
         config.native_subgroup_size = select_native_compute_subgroup_size(
             shared_vulkan, config,
-            getenv("PROSPER_NATIVE_COMPUTE_MULTIWAVE") != nullptr,
+            native_multiwave_wave_work || getenv("PROSPER_NATIVE_COMPUTE_MULTIWAVE") != nullptr,
             getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") != nullptr);
         config.tgid_x_en = tgid_x_en;
         config.tgid_y_en = tgid_y_en;
