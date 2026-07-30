@@ -459,12 +459,23 @@ uint64_t resource_footprint_impl(const ShaderResource& r, bool legacy_linear_tig
     bool decoded_is_volume = false;
     if (bc) {
         uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
-        decoded = tile_mode_is_tiled(r.tile_mode) ? tiled_elements_bytes(bw, bh, bc, r.tile_mode)
-                                                  : checked_mul(checked_mul(bw, bh), bc);
+        if (tile_mode_is_tiled(r.tile_mode)) {
+            decoded = tiled_elements_bytes(bw, bh, bc, r.tile_mode);
+        } else if (r.tile_mode == static_cast<uint32_t>(TileMode::Linear) &&
+                   r.cls == ResourceClass::Texture &&
+                   (r.img_dim == 1u ||
+                    ((r.img_dim == 3u || r.img_dim == 5u) && r.layer_stride_bytes)) &&
+                   !r.compression_enabled && !legacy_linear_tight) {
+            const uint32_t row_pitch = resolved_linear_row_pitch(r, bw, bc);
+            decoded = checked_mul(row_pitch, bh);
+        } else {
+            decoded = checked_mul(checked_mul(bw, bh), bc);
+        }
     } else {
         uint32_t bpt = data_format_bytes(r.format) * (r.num_components ? r.num_components : 1);
         const bool native_wide = r.cls == ResourceClass::StorageImage ||
-            (r.format == DataFormat::Float16 && (bpt == 2 || bpt == 4 || bpt == 8));
+            (r.format == DataFormat::Float16 && (bpt == 2 || bpt == 4 || bpt == 8)) ||
+            (r.format == DataFormat::Float32 && (bpt == 4 || bpt == 8 || bpt == 16));
         if (bpt == 0 || (bpt > 4 && !native_wide)) bpt = 4;
         if (tile_mode_is_tiled(r.tile_mode)) {
             if (r.img_dim == 2u && r.depth > 1u) {
@@ -480,9 +491,7 @@ uint64_t resource_footprint_impl(const ShaderResource& r, bool legacy_linear_tig
             // Guest-backed linear sampled images default to GFX10's 256-byte row alignment. Exact
             // HLE-producer provenance may override it (AvPlayer's CPU-staged NV12 is tight). Capturing
             // only width*height*bpt made genuinely padded video planes drift and omitted their tail.
-            const uint32_t row_pitch = (r.img_dim == 3u || r.img_dim == 5u)
-                ? static_cast<uint32_t>(linear_sampled_row_pitch(w, bpt))
-                : resolved_linear_row_pitch(r, w, bpt);
+            const uint32_t row_pitch = resolved_linear_row_pitch(r, w, bpt);
             decoded = checked_mul(row_pitch, h);
         } else {
             decoded = checked_mul(checked_mul(w, h), bpt);
@@ -643,16 +652,23 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
     for (const auto& r : src->resources) {
         GpuCapturedResource c;
         c.resource = r;
-        if (r.cls == ResourceClass::Texture && r.img_dim == 1u &&
+        if (r.cls == ResourceClass::Texture &&
+            (r.img_dim == 1u || (r.img_dim == 5u && r.layer_stride_bytes)) &&
             r.tile_mode == static_cast<uint32_t>(TileMode::Linear) &&
-            !r.compression_enabled && !bc_block_bytes(r.format)) {
-            uint32_t bpt = data_format_bytes(r.format) *
-                           (r.num_components ? r.num_components : 1u);
-            const bool f16 = r.format == DataFormat::Float16 &&
-                             (bpt == 2 || bpt == 4 || bpt == 8);
-            if (bpt == 0 || (bpt > 4 && !f16)) bpt = 4;
+            !r.compression_enabled) {
+            const uint32_t bc = bc_block_bytes(r.format);
+            const uint32_t resource_width = r.width ? r.width : 4u;
+            const uint32_t pitch_width = bc
+                ? resource_width / 4u + static_cast<uint32_t>(resource_width % 4u != 0u)
+                : resource_width;
+            uint32_t bpt = bc ? bc : data_format_bytes(r.format) *
+                (r.num_components ? r.num_components : 1u);
+            const bool native_wide =
+                (r.format == DataFormat::Float16 && (bpt == 2 || bpt == 4 || bpt == 8)) ||
+                (r.format == DataFormat::Float32 && (bpt == 4 || bpt == 8 || bpt == 16));
+            if (bpt == 0 || (bpt > 4 && !native_wide && !bc)) bpt = 4;
             c.resource.linear_row_pitch_bytes = resolved_linear_row_pitch(
-                r, r.width ? r.width : 4u, bpt);
+                r, pitch_width, bpt);
         }
         c.resource.host_data = nullptr; c.resource.host_data_size = 0;
         c.resource.dcc_metadata_host_data = nullptr;

@@ -461,8 +461,19 @@ bool texture_decode_cache_candidate(bool has_live_color_target,
                                     bool is_sampled_texture,
                                     bool format_supported) {
     return !has_live_color_target && !has_live_depth_target &&
-        !has_captured_host_data && (image_dimension == 1u || image_dimension == 2u) &&
+        !has_captured_host_data &&
+        (image_dimension == 1u || image_dimension == 2u || image_dimension == 5u) &&
         is_sampled_texture && format_supported;
+}
+
+uint64_t texture_decode_source_address(uint64_t gpu_address,
+                                       uint32_t image_dimension,
+                                       bool in_mip_tail,
+                                       uint32_t layer_mip_offset_bytes) {
+    if (image_dimension != 5u || in_mip_tail ||
+        gpu_address > UINT64_MAX - layer_mip_offset_bytes)
+        return gpu_address;
+    return gpu_address + layer_mip_offset_bytes;
 }
 
 bool texture_source_snapshot_can_follow_watch(bool source_matches_pixels,
@@ -1368,6 +1379,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     bool resource_texture_watch_active = false;
                     bool resource_texture_watch_disabled = false;
                     bool resource_texture_watch_only = false;
+                    bool resource_has_live_rtt = false;
+                    bool resource_has_ds_live = false;
+                    bool resource_persistent_candidate = false;
+                    size_t resource_persistent_source_size = 0;
                     prosper::test::FrameResource fr; fr.binding = r.binding; fr.set = set;
                     fr.is_storage_image = r.cls == RC::StorageImage;
                     const bool normalized_sampling =
@@ -1457,6 +1472,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             }
                             return false;
                         }();
+                        const uint64_t sampled_source_addr = texture_decode_source_address(
+                            r.gpu_addr, r.img_dim, r.in_mip_tail,
+                            r.layer_mip_offset_bytes);
+                        const bool sampled_2d_view = r.img_dim == 1u || r.img_dim == 5u;
                         const TextureDecodeKey decode_key{
                             r.gpu_addr, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(r.host_data)),
                             r.host_data_size, r.size, static_cast<uint32_t>(r.cls),
@@ -1481,7 +1500,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             r.in_mip_tail,
                             avplayer_chroma_layout,
                         };
-                        auto live_rtt = rtt_on ? g_rtt.find(r.gpu_addr) : g_rtt.end();
+                        auto live_rtt = rtt_on ? g_rtt.find(sampled_source_addr) : g_rtt.end();
                         static const uint32_t render_scale = [] {
                             const char* e = std::getenv("PROSPER_RENDER_SCALE");
                             const long v = e ? std::strtol(e, nullptr, 10) : 1;
@@ -1501,9 +1520,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     normalized_sampling);
                             const bool direct_serves = !fr.is_storage_image && r.img_dim == 1u &&
                                 sampled_extent_compatible &&
-                                r.gpu_addr != draw.color0_base &&
+                                sampled_source_addr != draw.color0_base &&
                                 prosper::test::find_persistent_color_target(
-                                    r.gpu_addr, surface.w, surface.h, surface.format) != nullptr;
+                                    sampled_source_addr, surface.w, surface.h,
+                                    surface.format) != nullptr;
                             const VkFormat surface_format =
                                 prosper::test::backend_color_format(surface.format);
                             const uint32_t surface_bpp =
@@ -1517,7 +1537,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 std::vector<uint8_t> materialized;
                                 std::string error;
                                 if (prosper::test::readback_persistent_color_target(
-                                        r.gpu_addr, surface.w, surface.h, surface_format,
+                                        sampled_source_addr, surface.w, surface.h, surface_format,
                                         materialized, error) &&
                                     materialized.size() == surface_texels * surface_bpp) {
                                     surface.rgba = std::make_shared<const std::vector<uint8_t>>(
@@ -1528,7 +1548,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                         fprintf(stderr,
                                                 "[rtt] lazy sampled target readback failed: "
                                                 "base=0x%llx extent=%ux%u error=%s\n",
-                                                (unsigned long long)r.gpu_addr, surface.w,
+                                                (unsigned long long)sampled_source_addr, surface.w,
                                                 surface.h, error.c_str());
                                 }
                             }
@@ -1552,7 +1572,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 cpu_rtt_copy_diagnostics);
                         if (uniform_cpu_diagnostic_path)
                             materialize_uniform_rtt(live_rtt->second);
-                        const bool has_cpu_live_rtt = !fr.is_storage_image && r.img_dim == 1u &&
+                        const bool has_cpu_live_rtt = !fr.is_storage_image && sampled_2d_view &&
+                            !r.in_mip_tail &&
                             live_rtt != g_rtt.end() &&
                             live_rtt->second.w && live_rtt->second.h && live_rtt->second.rgba &&
                             prosper::frontend::live_rtt_cpu_snapshot_matches(
@@ -1580,20 +1601,28 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             prosper::frontend::rtt_sampled_extent_compatible(
                                 tw, th, live_rtt->second.w, live_rtt->second.h, render_scale,
                                 normalized_sampling) &&
-                            r.gpu_addr != draw.color0_base &&
+                            sampled_source_addr != draw.color0_base &&
                             prosper::test::find_persistent_color_target(
-                                r.gpu_addr, live_rtt->second.w, live_rtt->second.h,
+                                sampled_source_addr, live_rtt->second.w, live_rtt->second.h,
                                 live_rtt->second.format) != nullptr;
                         const bool has_uniform_live_rtt = !fr.is_storage_image &&
-                            !uniform_cpu_diagnostic_path && r.img_dim == 1u &&
+                            !uniform_cpu_diagnostic_path && sampled_2d_view &&
                             !r.in_mip_tail && live_rtt != g_rtt.end() &&
                             live_rtt->second.has_uniform_color && live_rtt->second.w &&
                             live_rtt->second.h &&
                             prosper::frontend::rtt_sampled_extent_compatible(
                                 tw, th, live_rtt->second.w, live_rtt->second.h, render_scale,
-                                normalized_sampling) && r.gpu_addr != draw.color0_base;
+                                normalized_sampling) && sampled_source_addr != draw.color0_base;
                         const bool has_live_rtt =
                             has_cpu_live_rtt || has_gpu_live_rtt || has_uniform_live_rtt;
+                        // A dim-5 base-slice view may need the CPU injection path rather than a direct
+                        // Vulkan bind, but the selected renderer target is still authoritative even if
+                        // an on-demand readback cannot currently materialize it. Never validate/cache a
+                        // guest decode for that identity: renderer-only writes cannot dirty guest pages.
+                        const bool has_live_rtt_authority = has_live_rtt ||
+                            (!fr.is_storage_image && r.img_dim == 5u && !r.in_mip_tail &&
+                             live_rtt != g_rtt.end());
+                        resource_has_live_rtt = has_live_rtt_authority;
                         // Resolve renderer-owned depth before considering guest-byte texture
                         // decoding. A sampled depth attachment has no authoritative color payload
                         // in guest memory: the retained Vulkan image is the source of truth. The old
@@ -1608,6 +1637,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                       r.gpu_addr, tw, th, render_scale, normalized_sampling)
                                 : prosper::test::PersistentDsSampled{};
                         const bool has_ds_live = sampled_ds.image != nullptr;
+                        resource_has_ds_live = has_ds_live;
                         const bool is_cube = r.img_dim == 3u;   // CUBE: six faces stacked vertically (#273)
                         const bool is_volume = r.img_dim == 2u;
                         const uint32_t persistent_pitch = getenv("PROSPER_PITCH")
@@ -1677,26 +1707,36 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             persistent_packed32_texture ||
                             (persistent_bc_block_bytes != 0 && !is_volume);
                         const bool persistent_sampled_texture = texture_decode_cache_candidate(
-                            has_live_rtt, has_ds_live, r.host_data != nullptr, r.img_dim,
+                            has_live_rtt_authority, has_ds_live, r.host_data != nullptr, r.img_dim,
                             r.cls == RC::Texture, persistent_format_supported);
+                        resource_persistent_candidate = persistent_sampled_texture;
                         const bool persistent_source_is_tiled =
                             persistent_sampled_texture && !getenv("PROSPER_NODETILE") &&
                             prosper::gpu::tile_mode_is_tiled(r.tile_mode);
-                        // A sampled LINEAR (tile_mode 0) 2D surface whose tight row is not 256-aligned
+                        // A sampled LINEAR (tile_mode 0) 2D surface (or the selected base slice of a
+                        // 2D array) whose tight row is not 256-aligned
                         // is pitch-padded: RDNA2 requires a sampled linear texture's row pitch to be aligned
-                        // (256 B here), so its real pitch is align(tw*bytes_per_texel,256). The decode
-                        // below must read it row-by-row at that pitch (else every row drifts -> horizontal
-                        // scramble, e.g. Dead Cells' 348-wide Motion Twin splash whose real pitch is 384
-                        // texels). Guards keep
-                        // this narrow and regression-safe: 2D only (volume/cube layouts untouched); tile_mode
-                        // == 0 exactly, so unrecognized/actually-tiled modes are NOT strided (they fall to the
-                        // contiguous read + auto-detile pass); exact HLE-producer provenance can select a
-                        // tight guest layout (AvPlayer NV12); !host_data keeps ordinary CPU-uploaded test
-                        // fixtures contiguous unless capture replay supplies an explicit guest-layout pitch.
+                        // (256 B here), so its real pitch aligns either texel rows or BC block rows. The
+                        // decode below must read it row-by-row at that pitch (else every row drifts ->
+                        // horizontal scramble, e.g. Dead Cells' 348-wide Motion Twin splash whose real
+                        // pitch is 384 texels). Guards keep
+                        // this narrow and regression-safe: 2D or the already-selected 2D-array base slice
+                        // only (volume/cube layouts untouched); tile_mode == 0 exactly, so
+                        // unrecognized/actually-tiled modes are NOT strided (they fall to the contiguous
+                        // read + auto-detile pass); exact HLE-producer provenance can select a tight guest
+                        // layout (AvPlayer NV12); !host_data keeps ordinary CPU-uploaded test fixtures
+                        // contiguous unless capture replay supplies an explicit guest-layout pitch.
                         // The tightly-packed
                         // LINEAR_GENERAL layout is a buffer/copy layout, not a sampled-texture layout, so it
                         // does not reach here. r.size is the TIGHT extent (tw*th*bpp), so it cannot gate this.
-                        const size_t linear_dst_row = (size_t)tw * sampled_source_bpt;
+                        const uint32_t linear_row_width = persistent_bc_block_bytes
+                            ? tw / 4u + static_cast<uint32_t>(tw % 4u != 0u) : tw;
+                        const uint32_t linear_row_count = persistent_bc_block_bytes
+                            ? th / 4u + static_cast<uint32_t>(th % 4u != 0u) : th;
+                        const uint32_t linear_row_element_bytes = persistent_bc_block_bytes
+                            ? persistent_bc_block_bytes : sampled_source_bpt;
+                        const size_t linear_dst_row =
+                            static_cast<size_t>(linear_row_width) * linear_row_element_bytes;
                         const uint32_t registered_linear_pitch = linear_dst_row <= UINT32_MAX
                             ? prosper::gpu::guest_linear_texture_row_pitch(
                                   r.gpu_addr, static_cast<uint32_t>(linear_dst_row))
@@ -1705,13 +1745,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             ? r.linear_row_pitch_bytes
                             : (registered_linear_pitch
                                    ? registered_linear_pitch
-                                   : prosper::gpu::linear_sampled_row_pitch(tw, sampled_source_bpt));
+                                   : prosper::gpu::linear_sampled_row_pitch(
+                                         linear_row_width, linear_row_element_bytes));
                         if (const char* lp = getenv("PROSPER_LINPITCH"))
-                            linear_src_row = (size_t)strtoull(lp, nullptr, 0) * sampled_source_bpt;
+                            linear_src_row =
+                                (size_t)strtoull(lp, nullptr, 0) * linear_row_element_bytes;
                         const bool linear_padded_read =
-                            r.cls == RC::Texture && r.img_dim == 1u && r.tile_mode == 0 &&
+                            r.cls == RC::Texture && (r.img_dim == 1u || r.img_dim == 5u) &&
+                            r.tile_mode == 0 &&
                             (!r.host_data || r.linear_row_pitch_bytes != 0) &&
-                            !r.compression_enabled && persistent_bc_block_bytes == 0 &&
+                            !r.compression_enabled &&
                             linear_dst_row != 0 && linear_src_row > linear_dst_row;
                         // Dynamic single-channel video/coverage surfaces are already exactly what a
                         // VK_FORMAT_R8_UNORM sampled image consumes. Expanding every byte to RGBA on the
@@ -1747,7 +1790,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 return persistent_source_is_tiled
                                     ? prosper::gpu::tiled_elements_bytes(
                                           bw, bh, persistent_bc_block_bytes, r.tile_mode)
-                                    : static_cast<size_t>(bw) * bh * persistent_bc_block_bytes;
+                                    : (linear_padded_read
+                                           ? linear_src_row * linear_row_count
+                                           : static_cast<size_t>(bw) * bh *
+                                                 persistent_bc_block_bytes);
                             }
                             if (persistent_packed32_texture)
                                 return persistent_source_is_tiled
@@ -1806,9 +1852,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 sampled_dcc_metadata.data(), sampled_dcc_metadata.size(),
                                 r.num_components, r.alpha_is_on_msb);
                         const uint64_t persistent_source_addr = persistent_dcc_fast_clear
-                            ? r.metadata_addr : r.gpu_addr;
+                            ? r.metadata_addr : sampled_source_addr;
                         const size_t persistent_source_size = persistent_dcc_fast_clear
                             ? sampled_dcc_metadata.size() : persistent_base_source_size;
+                        resource_persistent_source_size = persistent_source_size;
                         resource_texture_source_bytes = persistent_source_size;
                         // A successful typed-storage compute dispatch may still own this exact
                         // sampled image on the shared Vulkan device. Prefer that image only for the
@@ -1851,7 +1898,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         auto copy_persistent_source = [&](uint8_t* dst, size_t bytes) {
                             return persistent_dcc_fast_clear
                                 ? copy_dcc_metadata(dst, bytes)
-                                : copy_resource(dst, r.gpu_addr, bytes);
+                                : copy_resource(dst, sampled_source_addr, bytes);
                         };
                         const bool persistent_cache_eligible = !resource_compute_image_hit &&
                             !fr.is_storage_image &&
@@ -2146,7 +2193,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // like the color-target bridge above. Keep the actual image extent in the
                         // backend resource so its exact cache lookup remains unambiguous.
                         if (has_gpu_live_rtt) {
-                            fr.persistent_render_target_id = r.gpu_addr;
+                            fr.persistent_render_target_id = sampled_source_addr;
                             fr.tw = live_rtt->second.w;
                             fr.th = live_rtt->second.h;
                             fr.td = 1; fr.img_dim = r.img_dim;
@@ -2264,9 +2311,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 else if (!live_rtt->second.gpu_valid) rtt_notvalid++;
                                 else if (live_rtt->second.w != tw || live_rtt->second.h != th)
                                     rtt_dimmismatch++;
-                                else if (r.gpu_addr == draw.color0_base) rtt_self++;
+                                else if (sampled_source_addr == draw.color0_base) rtt_self++;
                                 else if (prosper::test::find_persistent_color_target(
-                                             r.gpu_addr, tw, th, live_rtt->second.format) == nullptr)
+                                             sampled_source_addr, tw, th,
+                                             live_rtt->second.format) == nullptr)
                                     rtt_noptarget++;   // evicted from / absent in the backend target cache
                                 else rtt_unknown++;
                             }
@@ -2353,12 +2401,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         std::vector<uint8_t>& texture_pixels = texstore[texstore_used++];
                         if (retain_cpu_live_rtt) texture_pixels.clear();
                         else texture_pixels.resize(nb);
-                        auto copy_linear_padded_rows = [&](uint8_t* dst, size_t dst_row) {
+                        auto copy_linear_padded_rows = [&](uint8_t* dst, size_t dst_row,
+                                                           uint32_t rows) {
                             size_t total = 0;
-                            for (uint32_t y = 0; y < th; ++y) {
+                            for (uint32_t y = 0; y < rows; ++y) {
                                 uint8_t* drow = dst + (size_t)y * dst_row;
                                 const size_t got = copy_resource(
-                                    drow, r.gpu_addr + (uint64_t)y * linear_src_row, dst_row);
+                                    drow, sampled_source_addr + (uint64_t)y * linear_src_row,
+                                    dst_row);
                                 total += got;
                                 if (got < dst_row) std::fill(drow + got, drow + dst_row, 0);
                             }
@@ -2370,7 +2420,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // touched, so we read zeros -> the scene samples black (#300 black-gameplay probe).
                         if (getenv("PROSPER_TEXCOMMIT")) {
                             const size_t PG = 0x10000; size_t committed = 0;
-                            for (uint64_t a = r.gpu_addr; a < r.gpu_addr + nb; a += PG)
+                            for (uint64_t a = sampled_source_addr;
+                                 a < sampled_source_addr + nb; a += PG)
                                 if (a >= 0x1000 && prosper_reserved_range_state(a) != 0) committed += PG;
                             static std::set<uint64_t> tcseen;
                             if (tcseen.insert(r.gpu_addr).second) {
@@ -2380,7 +2431,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 // problem. tile_mode tells tiled vs linear.
                                 uint32_t w0[8] = {0}; size_t nzb = 0;
                                 if (committed) {
-                                    const uint8_t* p = (const uint8_t*)(uintptr_t)r.gpu_addr;
+                                    const uint8_t* p =
+                                        (const uint8_t*)(uintptr_t)sampled_source_addr;
                                     for (int i = 0; i < 8; i++) w0[i] = ((const uint32_t*)p)[i];
                                     for (size_t i = 0; i < nb; i += 997) nzb += (p[i] != 0);   // sparse scan
                                 }
@@ -2407,7 +2459,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // pixels (nearest-scaled to tw x th) instead of reading empty guest memory.
                         bool rtt_hit = false;
                         if (!fr.is_storage_image && rtt_on && !is_volume && !r.in_mip_tail) {
-                            auto rit = g_rtt.find(r.gpu_addr);
+                            auto rit = g_rtt.find(sampled_source_addr);
                             if (rit != g_rtt.end() && rit->second.w && rit->second.h && rit->second.rgba &&
                                 !rit->second.rgba->empty()) {
                                 const RttSurf& s = rit->second;
@@ -2430,7 +2482,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     // composite/tint that darkens otherwise-correct input.
                                     if (getenv("PROSPER_DUMP_SAMPLED_RTT")) {
                                         static std::set<uint64_t> seen;
-                                        if (seen.insert(r.gpu_addr).second) {
+                                        if (seen.insert(sampled_source_addr).second) {
                                             const std::vector<uint8_t> inspected = inspection_rgba8(
                                                 texture_pixels, tw, th, s.format);
                                             size_t nz = 0, rgbnz = 0;
@@ -2443,14 +2495,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                                                    dd ? dd : ".", (unsigned long long)r.gpu_addr, tw, th);
                                             prosper::test::dump_bmp(fn, inspected, tw, th);
                                             fprintf(stderr, "[sampledrtt] addr=0x%llx %ux%u rgb_nonblack=%zu/%u -> %s\n",
-                                                    (unsigned long long)r.gpu_addr, tw, th, rgbnz, tw*th, fn);
+                                                    (unsigned long long)sampled_source_addr,
+                                                    tw, th, rgbnz, tw*th, fn);
                                         }
                                     }
                                 } // malformed/incomplete RTT bytes => miss; decode guest backing below
                             }
                             if (rtt_log)
                                 fprintf(stderr, "[rtt] sample tex addr=0x%llx %ux%u fmt=%u -> %s (cache_size=%zu)\n",
-                                        (unsigned long long)r.gpu_addr, tw, th, (unsigned)r.format,
+                                        (unsigned long long)sampled_source_addr, tw, th,
+                                        (unsigned)r.format,
                                         rtt_hit ? "HIT" : "miss", g_rtt.size());
                         }
                         // CUBE texture (#273 — DOLL's title reflection probes / skybox): decode six
@@ -2652,7 +2706,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             if (tiled) {
                                 size_t tbytes = prosper::gpu::tiled_elements_bytes(bw, bh, bcb, r.tile_mode);
                                 std::vector<uint8_t> traw(tbytes, 0);
-                                copy_resource(traw.data(), r.gpu_addr, tbytes);
+                                copy_resource(traw.data(), sampled_source_addr, tbytes);
                                 if (r.in_mip_tail)
                                     prosper::gpu::detile_elements_level(
                                         lin.data(), traw.data(), tbytes, bw, bh, bcb,
@@ -2660,8 +2714,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 else
                                     prosper::gpu::detile_elements(
                                         lin.data(), traw.data(), tbytes, bw, bh, bcb, r.tile_mode);
+                            } else if (linear_padded_read) {
+                                copy_linear_padded_rows(
+                                    lin.data(), static_cast<size_t>(bw) * bcb, bh);
                             } else {
-                                copy_resource(lin.data(), r.gpu_addr, comp_bytes);
+                                copy_resource(lin.data(), sampled_source_addr, comp_bytes);
                             }
                             if (!prosper::gpu::bc_decode_surface(
                                     texture_pixels.data(), lin.data(), lin.size(), tw, th, r.format))
@@ -2686,9 +2743,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                           tw, th, r.tile_mode, 0, bpt);
                                 std::vector<uint8_t> traw(tbytes, 0);
                                 const size_t got = copy_resource(
-                                    traw.data(), r.gpu_addr, tbytes);
+                                    traw.data(), sampled_source_addr, tbytes);
                                 if (got < flin.size()) {
-                                    copy_resource(flin.data(), r.gpu_addr, flin.size());
+                                    copy_resource(flin.data(), sampled_source_addr, flin.size());
                                 } else if (is_volume) {
                                     prosper::gpu::detile_volume(
                                         flin.data(), traw.data(), got, tw, th, r.depth,
@@ -2702,9 +2759,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                         flin.data(), traw.data(), tw, th, r.tile_mode, 0, bpt);
                                 }
                             } else if (linear_padded_read) {
-                                copy_linear_padded_rows(flin.data(), (size_t)tw * bpt);
+                                copy_linear_padded_rows(flin.data(), (size_t)tw * bpt, th);
                             } else {
-                                copy_resource(flin.data(), r.gpu_addr, flin.size());
+                                copy_resource(flin.data(), sampled_source_addr, flin.size());
                             }
                             for (size_t t = 0; t < volume_texels; ++t) {
                                 for (uint32_t c = 0; c < 4; ++c) {
@@ -2736,8 +2793,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     ? prosper::gpu::tiled_volume_bytes(tw, th, r.depth, r.tile_mode, bpt)
                                     : prosper::gpu::tiled_surface_bytes(tw, th, r.tile_mode, 0, bpt);
                                 std::vector<uint8_t> traw(tbytes, 0);
-                                size_t got = copy_resource(traw.data(), r.gpu_addr, tbytes);
-                                if (got < hlin.size()) copy_resource(hlin.data(), r.gpu_addr, hlin.size());  // short backing -> linear fallback
+                                size_t got = copy_resource(
+                                    traw.data(), sampled_source_addr, tbytes);
+                                if (got < hlin.size())
+                                    copy_resource(hlin.data(), sampled_source_addr, hlin.size());  // short backing -> linear fallback
                                 else if (is_volume) prosper::gpu::detile_volume(
                                     hlin.data(), traw.data(), got, tw, th, r.depth, r.tile_mode, bpt);
                                 else if (r.in_mip_tail) prosper::gpu::detile_surface_level(
@@ -2746,9 +2805,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 else prosper::gpu::detile_surface(
                                     hlin.data(), traw.data(), tw, th, r.tile_mode, 0, bpt);
                             } else if (linear_padded_read) {
-                                copy_linear_padded_rows(hlin.data(), (size_t)tw * bpt);
+                                copy_linear_padded_rows(hlin.data(), (size_t)tw * bpt, th);
                             } else {
-                                copy_resource(hlin.data(), r.gpu_addr, hlin.size());
+                                copy_resource(hlin.data(), sampled_source_addr, hlin.size());
                             }
                             // Same NaN/negative/positive-infinity clamp and absent-channel defaults
                             // as the historical scalar loop, exhaustively checked over all binary16
@@ -2761,7 +2820,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             // copy feeds the backend's 1-byte staging upload; the view swizzle below makes
                             // every sampled component equal R, byte-for-byte matching the old RGBA result.
                             linear_source_prefix_size = copy_resource(
-                                texture_pixels.data(), r.gpu_addr, texture_pixels.size());
+                                texture_pixels.data(), sampled_source_addr,
+                                texture_pixels.size());
                             if (linear_source_prefix_size < texture_pixels.size())
                                 std::fill(texture_pixels.begin() + linear_source_prefix_size,
                                           texture_pixels.end(), 0);
@@ -2770,7 +2830,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         } else if (native_rg8_sampled) {
                             // Tight RG8 is already the backend's two-byte sampled representation.
                             linear_source_prefix_size = copy_resource(
-                                texture_pixels.data(), r.gpu_addr, texture_pixels.size());
+                                texture_pixels.data(), sampled_source_addr,
+                                texture_pixels.size());
                             if (linear_source_prefix_size < texture_pixels.size())
                                 std::fill(texture_pixels.begin() + linear_source_prefix_size,
                                           texture_pixels.end(), 0);
@@ -2792,7 +2853,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     ? prosper::gpu::tiled_volume_bytes(tw, th, r.depth, r.tile_mode, bpt)
                                     : prosper::gpu::tiled_surface_bytes(tw, th, r.tile_mode, 0, bpt);
                                 std::vector<uint8_t> traw(tbytes, 0);
-                                size_t got = copy_resource(traw.data(), r.gpu_addr, tbytes);
+                                size_t got = copy_resource(
+                                    traw.data(), sampled_source_addr, tbytes);
                                 // PROSPER_DUMP_RAWTILE (narrow path): the single/dual-channel RAW TILED bytes,
                                 // once per address, for offline 8-bpp de-swizzle sweeps (the SDF font atlas).
                                 if (getenv("PROSPER_DUMP_RAWTILE") && got >= nlin.size() && tw <= 2048 && th <= 1024) {
@@ -2805,7 +2867,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                             fprintf(stderr, "[render] narrow raw tiled -> %s (%zu, bpt=%u)\n", bn, traw.size(), bpt); fflush(stderr); }
                                     }
                                 }
-                                if (got < nlin.size()) copy_resource(nlin.data(), r.gpu_addr, nlin.size());  // short backing -> linear fallback
+                                if (got < nlin.size())
+                                    copy_resource(nlin.data(), sampled_source_addr, nlin.size());  // short backing -> linear fallback
                                 else if (is_volume) prosper::gpu::detile_volume(
                                     nlin.data(), traw.data(), got, tw, th, r.depth, r.tile_mode, bpt);
                                 else if (r.in_mip_tail) prosper::gpu::detile_surface_level(
@@ -2814,9 +2877,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 else prosper::gpu::detile_surface(
                                     nlin.data(), traw.data(), tw, th, r.tile_mode, 0, bpt);
                             } else if (linear_padded_read) {
-                                copy_linear_padded_rows(nlin.data(), (size_t)tw * bpt);
+                                copy_linear_padded_rows(nlin.data(), (size_t)tw * bpt, th);
                             } else {
-                                copy_resource(nlin.data(), r.gpu_addr, nlin.size());
+                                copy_resource(nlin.data(), sampled_source_addr, nlin.size());
                             }
                             const bool unorm16 = r.format == prosper::gpu::DataFormat::Unorm16;
                             for (size_t t = 0; t < volume_texels; t++) {
@@ -2847,9 +2910,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             // per-row padding. copy_resource is fault-safe when an old capture has a short
                             // backing because its pre-v28 writer omitted the final padded rows.
                             linear_source_prefix_size = copy_linear_padded_rows(
-                                texture_pixels.data(), linear_dst_row);
+                                texture_pixels.data(), linear_dst_row, th);
                         } else {
-                            const size_t got = copy_resource(texture_pixels.data(), r.gpu_addr, nb);
+                            const size_t got = copy_resource(
+                                texture_pixels.data(), sampled_source_addr, nb);
                             linear_source_prefix_size = got;
                             if (got < nb)
                                 std::fill(texture_pixels.begin() + got, texture_pixels.end(), 0);
@@ -2880,7 +2944,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 ? prosper::gpu::tiled_volume_bytes(tw, th, r.depth, tmode, 4)
                                 : prosper::gpu::tiled_surface_bytes(tw, th, tmode, pitch);
                             std::vector<uint8_t> tiled(tiled_bytes, 0);
-                            size_t got = copy_resource(tiled.data(), r.gpu_addr, tiled_bytes);
+                            size_t got = copy_resource(
+                                tiled.data(), sampled_source_addr, tiled_bytes);
                             if (got < nb)
                                 // The padded tiled buffer's tail (th rounded to whole 32-row tiles) runs past
                                 // the real backing: fall back to the width*height linear bytes copied above
@@ -2947,7 +3012,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             const size_t raw_size = std::min<size_t>(
                                 r.size ? r.size : volume_texels * 4, 64u << 20);
                             std::vector<uint8_t> raw(raw_size, 0);
-                            const size_t raw_got = copy_resource(raw.data(), r.gpu_addr, raw.size());
+                            const size_t raw_got = copy_resource(
+                                raw.data(), sampled_source_addr, raw.size());
                             auto fnv = [](const uint8_t* data, size_t size) {
                                 uint64_t hash = 1469598103934665603ull;
                                 for (size_t i = 0; i < size; ++i) {
@@ -2967,7 +3033,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 alpha_nonzero += inspected[p + 3] != 0;
                             }
                             const auto writer = prosper::gpu::last_guest_write_overlap(
-                                r.gpu_addr, raw_size);
+                                sampled_source_addr, raw_size);
                             fprintf(stderr,
                                     "[resource-version] render-submit=%llu draw=%llu order=%llu set=%u bind=%u "
                                     "addr=0x%llx dims=%ux%u class=%u fmt=%u tile=%u dcc=%u meta=0x%llx rtt=%d "
@@ -3529,15 +3595,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                         }
                                     };
                                     fprintf(stderr,
-                                            "[render-timing] texture addr=0x%llx %ux%u out=%ux%u "
-                                            "fmt=%u comps=%u tile=%u class=%u storage=%d compressed=%d "
+                                            "[render-timing] texture addr=0x%llx %ux%ux%u out=%ux%ux%u "
+                                            "dim=%u fmt=%u comps=%u tile=%u class=%u storage=%d "
+                                            "host=%d live=%d depth-live=%d candidate=%d source=%zu "
+                                            "compressed=%d "
                                             "cache=%s id=%llu validate=%s %.2fms/%zuB/%zuB "
                                             "submit=%s watch=%s active=%d disabled=%d only=%d stable=%u "
                                             "total=%.2f ms\n",
                                             (unsigned long long)r.gpu_addr, r.width, r.height,
-                                            fr.tw, fr.th, (unsigned)r.format, r.num_components,
+                                            r.depth, fr.tw, fr.th, fr.td, r.img_dim,
+                                            (unsigned)r.format, r.num_components,
                                             r.tile_mode, static_cast<unsigned>(r.cls),
                                             static_cast<int>(fr.is_storage_image),
+                                            static_cast<int>(r.host_data != nullptr),
+                                            static_cast<int>(resource_has_live_rtt),
+                                            static_cast<int>(resource_has_ds_live),
+                                            static_cast<int>(resource_persistent_candidate),
+                                            resource_persistent_source_size,
                                             static_cast<int>(r.compression_enabled), cache_state,
                                             (unsigned long long)fr.persistent_texture_id,
                                             resource_texture_exact_validation ? "exact" : "skip",

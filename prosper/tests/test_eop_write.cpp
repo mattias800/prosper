@@ -14,6 +14,7 @@
 #include <cstring>
 #include <chrono>
 #include <thread>
+#include <vector>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -119,6 +120,51 @@ int main() {
         prosper_gpu_drain_completion_writes();
         CHECK(label == 0xfedcba9876543210ull,
               "ordered label initialization and fence become visible after submit scope end");
+    }
+
+    // Renderer drains routinely encounter hundreds of resource uploads behind thousands of private
+    // completion labels. Exercise the stable batched extraction: every unrelated write must land in
+    // packet order while the overlapping label initialization/release pair remains hidden.
+    {
+        constexpr uint32_t resource_count = 256;
+        uint64_t label = 0x123456789abcdef0ull;
+        std::vector<uint32_t> resources(resource_count, 0);
+        std::vector<uint32_t> stream;
+        stream.reserve(13u + resource_count * 6u);
+        auto append_write = [&](uint64_t addr, uint32_t value) {
+            stream.push_back(PM4(6, IT_NOP, R_WRITE_DATA));
+            stream.push_back(0);
+            stream.push_back(static_cast<uint32_t>(addr));
+            stream.push_back(static_cast<uint32_t>(addr >> 32));
+            stream.push_back(1);
+            stream.push_back(value);
+        };
+        append_write(reinterpret_cast<uint64_t>(&label), 0);
+        stream.push_back(PM4(7, IT_NOP, R_RELEASE_MEM));
+        stream.push_back(static_cast<uint32_t>(reinterpret_cast<uint64_t>(&label)));
+        stream.push_back(static_cast<uint32_t>(reinterpret_cast<uint64_t>(&label) >> 32));
+        stream.push_back(2);
+        stream.push_back(0x76543210u);
+        stream.push_back(0xfedcba98u);
+        stream.push_back(0x04);
+        for (uint32_t i = 0; i < resource_count; ++i)
+            append_write(reinterpret_cast<uint64_t>(&resources[i]), 0x61000000u + i);
+
+        GpuState st;
+        prosper_gpu_submit_scope_begin();
+        const size_t n = run_command_buffer(stream.data(), stream.size(), st);
+        prosper_gpu_drain_renderer_writes();
+        bool resources_ready = true;
+        for (uint32_t i = 0; i < resource_count; ++i)
+            resources_ready &= resources[i] == 0x61000000u + i;
+        CHECK(n == resource_count + 2u && resources_ready,
+              "batched renderer drain applies every unrelated resource write");
+        CHECK(label == 0x123456789abcdef0ull,
+              "batched renderer drain keeps overlapping completion writes private");
+        prosper_gpu_submit_scope_end();
+        prosper_gpu_drain_completion_writes();
+        CHECK(label == 0xfedcba9876543210ull,
+              "batched drain preserves the private label pair's completion order");
     }
 
     // A RELEASE_MEM writing a 64-bit fence value (data_sel==2) to a label, exactly as agc_cb_release_mem

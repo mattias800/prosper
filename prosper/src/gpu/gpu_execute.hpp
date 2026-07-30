@@ -844,6 +844,31 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                          (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr);
         return false;
     }
+    const ResolvedPipelineState resolved_pipeline = failure
+        ? failure->pipeline : resolve_pipeline_state(rs);
+    // CB_TARGET_MASK/CB_SHADER_MASK are upstream hardware gates: a fragment export can narrow these
+    // masks, but cannot enable a component that they already disabled.  When fixed-function state also
+    // has no depth/stencil side effect, shader/resource realization cannot change the no-op verdict.
+    // Astro's late FMV/world-map submits contain hundreds of these draws, so rejecting them here avoids
+    // building resource tables, walking RDNA programs, and copying cached SPIR-V merely to discard them.
+    const bool preexport_color_effect = std::any_of(
+        resolved_pipeline.color_targets.begin(), resolved_pipeline.color_targets.end(),
+        [](const auto& target) { return target.write_mask != 0; });
+    if (!preexport_color_effect && !has_depth_stencil_side_effect(resolved_pipeline) &&
+        !getenv("PROSPER_FORCE_COLORWRITE") && !getenv("PROSPER_NO_EARLY_NO_EFFECT")) {
+        if (failure) {
+            failure->reason = RealizationFailureReason::NoEffect;
+            // Keep the bound program addresses in captures without performing shader analysis.  A
+            // no-effect operation does not need compiled modules or descriptor tables for replay.
+            add_stage_diagnostic(ShaderProgramStage::Vertex, rs.es_addr, {}, {});
+            add_stage_diagnostic(ShaderProgramStage::Fragment, rs.ps_addr, {}, {});
+        }
+        if (log) fprintf(stderr, "[exec] skip draw early: no color/depth/stencil effect "
+                                "cb_target_mask=0x%x cb_color_control=0x%x color0_fmt=%u\n",
+                         rs.cb_target_mask, rs.cb_color_control,
+                         resolved_pipeline.color0_format);
+        return false;
+    }
     const auto* fused_back = static_cast<const AgcShaderHeader*>(
         prosper_agc_fused_back_header_for_front(rs.es_addr));
     const bool phase_timing = getenv("PROSPER_RENDER_TIMING") != nullptr;
@@ -960,7 +985,6 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     PixelSystemInputMapping system_inputs{rs.ps_input_ena, rs.ps_input_addr};
     const PixelSystemInputMapping* system_input_ptr =
         (system_inputs.ena || system_inputs.addr) ? &system_inputs : nullptr;
-    const ResolvedPipelineState resolved_pipeline = resolve_pipeline_state(rs);
     const FragmentInterpolationLayout interpolation = fragment_interpolation_layout_cached(
         reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.ps_addr)),
         max_shader_dwords, system_input_ptr, pixel_input_ptr);
