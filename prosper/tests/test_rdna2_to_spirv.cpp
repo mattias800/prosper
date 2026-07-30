@@ -5016,6 +5016,28 @@ int main() {
         CHECK(gotBarrierReduction.size() == 128 && badBarrierReduction == 0,
               "barrier-separated reductions perform independent exact 64-lane guest-wave votes");
 
+        // A generated compute kernel may wrap those phases in one workgroup-uniform scalar
+        // early-out and follow them with control flow that needs an exact native wave. The outer
+        // branch makes the guest barriers non-top-level in the whole stream, but peeling the guard
+        // leaves independent barrier-free phases. Keep the native policy and phase splitter in sync.
+        std::vector<uint32_t> guardedBarrierReduction = {
+            0xBF060000u, // s_cmp_eq_u32 s0, s0 (workgroup-uniform, always true)
+            0u,          // s_cbranch_scc0 -> terminal s_endpgm (filled below)
+        };
+        guardedBarrierReduction.insert(
+            guardedBarrierReduction.end(), std::begin(barrier_reduction_cs),
+            std::end(barrier_reduction_cs));
+        const uint32_t guarded_end_pc =
+            static_cast<uint32_t>(guardedBarrierReduction.size() - 1);
+        guardedBarrierReduction[1] = 0xBF840000u |
+            static_cast<uint16_t>(guarded_end_pc - 2u);
+        CHECK(compute_shader_prefers_native_multiwave(
+                  guardedBarrierReduction.data(), guardedBarrierReduction.size()) &&
+                  !recompile_compute(guardedBarrierReduction.data(),
+                                     guardedBarrierReduction.size(), nullptr,
+                                     nativeStructuredWaveConfig).empty(),
+              "terminal scalar guard preserves native barrier-phased compute translation");
+
         // The automatic multi-wave policy must follow translated structure, not raw opcode counts.
         // Four valid sequential top-level wave votes each cost two synchronized scratch barriers in
         // portable lowering and none in exact-subgroup lowering. The two-vote kernel above remains

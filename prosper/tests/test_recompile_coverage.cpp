@@ -162,6 +162,25 @@ int main() {
                                             std::size(vcc_scratch_guard)), 1u),
           "a VCC_LO vector read does not keep the dead VCC_HI scalar scratch word live");
 
+    // The scalar inputs of a buffer packet are completely decoded: its four-dword SRSRC and
+    // one-dword SOFFSET. A buffer access through unrelated s[32:35] between the merge and the VCC
+    // overwrite must therefore not make a temporary VCC_HI write look live. This is the shape that
+    // gates Astro Bot's world-map compute setup shaders.
+    const uint32_t vcc_scratch_with_buffer[] = {
+        0x7C220080u,                 //  0: v_cmpx_neq_f32 exec, 0, v0
+        0xBF880002u,                 //  1: s_cbranch_execz -> pc=4
+        0xF4241A84u, 0xFA000020u,    //  2: s_buffer_load_dwordx2 vcc, s[8:11], 0x20
+        0xF4201A84u, 0xFA000000u,    //  4: s_buffer_load_dword vcc_lo, s[8:11], 0
+        0xE0383000u, 0x80080202u,    //  6: buffer_load_dwordx4 v[2:5], v2, s[32:35], 0
+        0x100600F9u, 0x0696066Au,    //  8: v_mul_f32 v3, vcc_lo, v0
+        0x7D880E23u,                 // 10: v_cmp_* vcc, s35, v7 (kills both halves)
+        0x87866A06u,                 // 11: s_and_b64 s[6:7], s[6:7], vcc
+        0xBF810000u,
+    };
+    CHECK(has(safe_execz_branches_for_test(vcc_scratch_with_buffer,
+                                            std::size(vcc_scratch_with_buffer)), 1u),
+          "an unrelated decoded buffer descriptor does not keep VCC_HI scratch live");
+
     uint32_t live_vcc_hi_guard[std::size(vcc_scratch_guard)];
     std::copy(std::begin(vcc_scratch_guard), std::end(vcc_scratch_guard),
               std::begin(live_vcc_hi_guard));
@@ -170,6 +189,24 @@ int main() {
     CHECK(!has(safe_execz_branches_for_test(live_vcc_hi_guard,
                                              std::size(live_vcc_hi_guard)), 1u),
           "a real VCC_HI vector read keeps the guarded scalar write non-linearizable");
+
+    // Wave32 kernels use one-word mask instructions around EXEC: compare into VCC_LO, invert that
+    // mask, copy it to EXEC_LO, then restore EXEC_LO. These are mask-domain operations, not scalar
+    // reads of an unrepresentable VCC dword.
+    const uint32_t wave32_half_mask[] = {
+        0x7C000000u, // v_cmp_f_f32 vcc, v0, v0
+        0xBEEA076Au, // s_not_b32 vcc_lo, vcc_lo
+        0xBEFE036Au, // s_mov_b32 exec_lo, vcc_lo
+        0x7E000281u, // v_mov_b32 v0, 1 (EXEC-predicated)
+        0xBEFE03C1u, // s_mov_b32 exec_lo, -1
+        0xBF810000u,
+    };
+    ComputeShaderConfig wave32_half_mask_config;
+    wave32_half_mask_config.wave_size = 32;
+    wave32_half_mask_config.native_subgroup_size = 32;
+    CHECK(!recompile_compute(wave32_half_mask, std::size(wave32_half_mask), nullptr,
+                             wave32_half_mask_config).empty(),
+          "Wave32 VCC_LO inversion/copy/EXEC restore recompiles in the mask domain");
 
     // tbuffer_load_format_x v0, v0, s[8:11], 0 format:32_FLOAT ; s_endpgm.
     // MTBUF needs a resolved V# binding, so the table-less coverage pass must classify it as
@@ -375,6 +412,109 @@ int main() {
                              compute_cfg_dispatch_created_b32.size(), &dispatch_rt,
                              wave32_dispatch_config).empty(),
           "a dispatcher preserves B32 aliases of masks produced inside its CFG");
+    // Astro's world-map kernel materializes a Wave32 VCC predicate, then asks whether the physical
+    // VCC_LO dword is greater than zero before a scalar branch. That is an exact guest-wave any vote,
+    // not a per-invocation integer read. Exercise both the structured and dispatcher paths.
+    const uint32_t wave32_vcc_gt_zero[] = {
+        0x7C022880u, // v_cmp_eq_f32 vcc, 0, v20
+        0xBF08806Au, // s_cmp_gt_u32 vcc_lo, 0
+        0xBF810000u,
+    };
+    wave32_dispatch_config.native_subgroup_size = 32;
+    CHECK(!recompile_compute(wave32_vcc_gt_zero, std::size(wave32_vcc_gt_zero), nullptr,
+                             wave32_dispatch_config).empty(),
+          "Wave32 VCC_LO > 0 lowers to an exact native guest-wave vote");
+    std::vector<uint32_t> compute_cfg_dispatch_vcc_gt_zero(
+        std::begin(wave32_vcc_gt_zero), std::end(wave32_vcc_gt_zero) - 1);
+    compute_cfg_dispatch_vcc_gt_zero.insert(
+        compute_cfg_dispatch_vcc_gt_zero.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_vcc_gt_zero.data(),
+                             compute_cfg_dispatch_vcc_gt_zero.size(), &dispatch_rt,
+                             wave32_dispatch_config).empty(),
+          "the complex dispatcher preserves Wave32 VCC_LO > 0 scalar mask semantics");
+    // A physical VCC half may hold ordinary scalar data before a later block starts a mask lifetime
+    // in the same word. Block discovery must not retroactively reinterpret the earlier comparison as
+    // a wave vote after the B32 dataflow learns about that later lifetime (Astro world-map PC436).
+    std::vector<uint32_t> compute_cfg_dispatch_recycled_vcc_hi = {
+        0xBEEB0300u, // s_mov_b32 vcc_hi, s0 (ordinary scalar data)
+        0xBF076B80u, // s_cmp_lg_u32 0, vcc_hi
+        0x856B807Eu, // s_cselect_b32 vcc_hi, exec_lo, 0 (new mask lifetime)
+    };
+    compute_cfg_dispatch_recycled_vcc_hi.insert(
+        compute_cfg_dispatch_recycled_vcc_hi.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_recycled_vcc_hi.data(),
+                             compute_cfg_dispatch_recycled_vcc_hi.size(), &dispatch_rt,
+                             wave32_dispatch_config).empty(),
+          "the dispatcher keeps recycled VCC scalar and mask lifetimes distinct");
+    std::vector<uint32_t> compute_cfg_dispatch_trap = {
+        0xBF070000u, // s_cmp_lg_u32 s0, s0 (false)
+        0xBF840001u, // s_cbranch_scc0 +1 (valid data skips the assertion trap)
+        0xBF920001u, // s_trap 1
+    };
+    compute_cfg_dispatch_trap.insert(
+        compute_cfg_dispatch_trap.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_trap.data(),
+                             compute_cfg_dispatch_trap.size(), &dispatch_rt,
+                             wave32_dispatch_config).empty(),
+          "the dispatcher terminates an assertion-trap arm without rejecting its valid bypass");
+    std::vector<uint32_t> compute_cfg_dispatch_bitset = {
+        0xBE850380u, // s_mov_b32 s5, 0
+        0xBE851D9Fu, // s_bitset1_b32 s5, 31 (in-place scalar read/modify/write)
+    };
+    compute_cfg_dispatch_bitset.insert(
+        compute_cfg_dispatch_bitset.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_bitset.data(),
+                             compute_cfg_dispatch_bitset.size(), &dispatch_rt,
+                             wave32_dispatch_config).empty(),
+          "the dispatcher preserves an in-place scalar bitset update");
+    std::vector<uint32_t> compute_cfg_dispatch_scalar_shift = {
+        0xBEEA0381u, // s_mov_b32 vcc_lo, 1 (scalar-data lifetime)
+        0xBEEB0380u, // s_mov_b32 vcc_hi, 0
+        0x8FEA876Au, // s_lshl_b64 vcc, vcc, 7
+    };
+    compute_cfg_dispatch_scalar_shift.insert(
+        compute_cfg_dispatch_scalar_shift.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_scalar_shift.data(),
+                             compute_cfg_dispatch_scalar_shift.size(), &dispatch_rt,
+                             wave32_dispatch_config).empty(),
+          "the dispatcher preserves 64-bit scalar address shifts through VCC");
+    std::vector<uint32_t> compute_cfg_dispatch_saved_mask_not = {
+        0xBE94037Eu, // s_mov_b32 s20, exec_lo (complete Wave32 mask)
+        0xBEEA0381u, // s_mov_b32 vcc_lo, 1 (older scalar-data lifetime)
+        0xBF070000u, // s_cmp_lg_u32 s0, s0 (false)
+        0xBF850003u, // s_cbranch_scc1 +3 -> mask merge
+        0x856B807Eu, // s_cselect_b32 vcc_hi, exec_lo, 0
+        0xBEEA0714u, // s_not_b32 vcc_lo, s20
+        0x8D6A6B6Au, // s_nor_b32 vcc_lo, vcc_lo, vcc_hi
+    };
+    compute_cfg_dispatch_saved_mask_not.insert(
+        compute_cfg_dispatch_saved_mask_not.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_saved_mask_not.data(),
+                             compute_cfg_dispatch_saved_mask_not.size(), &dispatch_rt,
+                             wave32_dispatch_config).empty(),
+          "the dispatcher inverts a saved Wave32 SGPR mask before recombining VCC");
+    std::vector<uint32_t> compute_cfg_dispatch_saved_mask_not_boundary = {
+        0xBE94037Eu, // s_mov_b32 s20, exec_lo (complete Wave32 mask)
+        0xBE950714u, // s_not_b32 s21, s20
+        0xBF060000u, // s_cmp_eq_u32 s0, s0 (true; creates a conditional CFG edge)
+        0xBF850001u, // s_cbranch_scc1 +1 -> consumer
+        0xBF800000u, // unreachable s_nop 0 fallthrough arm
+        0xBEFE0315u, // s_mov_b32 exec_lo, s21 (mask-only consumer)
+    };
+    compute_cfg_dispatch_saved_mask_not_boundary.insert(
+        compute_cfg_dispatch_saved_mask_not_boundary.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_saved_mask_not_boundary.data(),
+                             compute_cfg_dispatch_saved_mask_not_boundary.size(), &dispatch_rt,
+                             wave32_dispatch_config).empty(),
+          "the dispatcher persists a saved Wave32 mask inverted before a block boundary");
+    wave32_dispatch_config.native_subgroup_size = 0;
     // The dispatcher includes branch-target/fallthrough blocks even when no entry path can reach
     // them. This dead block overwrites half of direct V# s[8:11] and then targets the live entry;
     // provenance at the reachable fetch must not include a write hardware can never execute.

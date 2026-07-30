@@ -871,6 +871,7 @@ struct VulkanComputeContext {
     uint32_t subgroup_size = 0;
     VkShaderStageFlags subgroup_stages = 0;
     VkSubgroupFeatureFlags subgroup_operations = 0;
+    std::array<uint32_t, 3> max_compute_workgroup_count{};
     // Exact-subgroup pipelines are valid only on an adopted renderer device that enabled the
     // published size-control/full-subgroup contract. Private fallback devices deliberately do not
     // enable that optional extension.
@@ -1732,6 +1733,8 @@ struct VulkanComputeContext {
         subgroup_size = subgroup.subgroupSize;
         subgroup_stages = subgroup.supportedStages;
         subgroup_operations = subgroup.supportedOperations;
+        std::copy_n(properties.properties.limits.maxComputeWorkGroupCount, 3,
+                    max_compute_workgroup_count.begin());
     }
 
     bool init() {
@@ -2383,6 +2386,24 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      "[compute] program 0x%llx requires subgroup=%u on a context without "
                      "that enabled contract -> dispatch skipped\n",
                      (unsigned long long)item.code_addr, item.required_subgroup_size);
+        return false;
+    }
+    const uint32_t dispatch_groups[3] = {
+        item.launch.groups_x, item.launch.groups_y, item.launch.groups_z};
+    for (uint32_t axis = 0; axis < 3; ++axis) {
+        if (dispatch_groups[axis] &&
+            dispatch_groups[axis] <= ctx.max_compute_workgroup_count[axis])
+            continue;
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 24)
+            std::fprintf(stderr,
+                         "[compute] program 0x%llx dispatch=%ux%ux%u exceeds device "
+                         "workgroup-count limit=%ux%ux%u -> dispatch skipped\n",
+                         (unsigned long long)item.code_addr,
+                         item.launch.groups_x, item.launch.groups_y, item.launch.groups_z,
+                         ctx.max_compute_workgroup_count[0],
+                         ctx.max_compute_workgroup_count[1],
+                         ctx.max_compute_workgroup_count[2]);
         return false;
     }
     const uint64_t image_validation_epoch = ++ctx.image_validation_clock;

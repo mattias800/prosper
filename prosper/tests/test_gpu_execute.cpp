@@ -831,6 +831,34 @@ int main() {
                   !captured.expected_output_valid,
               "environment capture retains the exact executed direct-compute submit");
         std::filesystem::remove(path, filesystem_error);
+
+        // Vulkan guarantees only 65,535 workgroups per axis, but real devices may advertise more
+        // (RADV exposes UINT32_MAX in X). Astro Bot emits indirect 1D dispatches above the portable
+        // minimum during world-map loading, after already using a 131,072-group direct dispatch.
+        // Resolution is device-independent: retain the guest count here and let the Vulkan backend
+        // compare it with the selected physical device's actual maxComputeWorkGroupCount.
+        alignas(4) uint32_t large_indirect_args[3] = {80266, 1, 1};
+        GpuState indirect = nonrender;
+        indirect.dispatches.clear();
+        GpuState::Dispatch indirect_dispatch;
+        indirect_dispatch.indirect = true;
+        indirect_dispatch.indirect_args_addr =
+            reinterpret_cast<uint64_t>(large_indirect_args);
+        indirect_dispatch.command_order = 18;
+        indirect.dispatches.push_back(indirect_dispatch);
+        ComputeLaunchDimensions resolved_large{};
+        compute_calls = 0;
+        set_submit_compute([&](const std::vector<ComputeItem>& items) {
+            compute_calls += static_cast<uint32_t>(items.size());
+            if (!items.empty()) resolved_large = items.front().launch;
+            return !items.empty();
+        });
+        const bool indirect_executed = execute_nonrender_submit_work(indirect, 1442);
+        set_submit_compute({});
+        CHECK(indirect_executed && compute_calls == 1 &&
+                  resolved_large.groups_x == large_indirect_args[0] &&
+                  resolved_large.groups_y == 1 && resolved_large.groups_z == 1,
+              "indirect dispatch retains workgroup counts above Vulkan's portable minimum");
     }
 
     // Lazy realization can drop a semantic draw only after earlier spans have already executed.

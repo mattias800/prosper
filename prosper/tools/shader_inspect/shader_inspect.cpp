@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -99,6 +100,10 @@ int main(int argc, char** argv) {
             spirv = recompile_fragment(words.data(), words.size());
         } else {
             ComputeShaderConfig config;
+            if (const char* wave = std::getenv("PROSPER_SHADER_INSPECT_WAVE_SIZE"))
+                config.wave_size = static_cast<uint32_t>(std::strtoul(wave, nullptr, 0));
+            if (const char* native = std::getenv("PROSPER_SHADER_INSPECT_NATIVE_SUBGROUP"))
+                config.native_subgroup_size = static_cast<uint32_t>(std::strtoul(native, nullptr, 0));
             spirv = recompile_compute(words.data(), words.size(), nullptr, config);
         }
         stage_ok = !spirv.empty();
