@@ -640,6 +640,38 @@ int main() {
               stats.misses == 2 && stats.hits == 1 && stats.entries == 2,
           "compute cache separates image-atomic modules with different embedded extents");
 
+    // BVH BOX_GROW is embedded as the slab-test far-edge multiplier. A descriptor change must
+    // compile a distinct module even when the BVH allocation and instruction provenance match.
+    clear_shader_recompile_cache();
+    static const uint32_t kBvhCompute[] = {
+        0xf1989f07u, 0x00040303u, 0x43440d3fu, 0x46424140u, 0x00004847u,
+        0xbf810000u,
+    };
+    ShaderResource bvh;
+    bvh.cls = ResourceClass::ConstantBuffer;
+    bvh.format = DataFormat::Uint32;
+    bvh.num_components = 1;
+    bvh.binding = 4;
+    bvh.size = 128;
+    bvh.fetch_pc = 0;
+    ShaderResourceTable bvh_table;
+    bvh_table.resources.push_back(bvh);
+    ComputeShaderConfig bvh_config;
+    bvh_config.local_x = 1;
+    const auto bvh_grow_0 = recompile_compute_shader_cached(
+        kBvhCompute, std::size(kBvhCompute), &bvh_table, bvh_config);
+    bvh_table.resources[0].bvh_box_grow = 6;
+    const auto bvh_grow_6 = recompile_compute_shader_cached(
+        kBvhCompute, std::size(kBvhCompute), &bvh_table, bvh_config);
+    bvh_table.resources[0].bvh_box_grow = 0;
+    const auto bvh_grow_0_again = recompile_compute_shader_cached(
+        kBvhCompute, std::size(kBvhCompute), &bvh_table, bvh_config);
+    stats = shader_recompile_cache_stats();
+    CHECK(!bvh_grow_0.empty() && !bvh_grow_6.empty() &&
+              bvh_grow_0 != bvh_grow_6 && bvh_grow_0_again == bvh_grow_0 &&
+              stats.misses == 2 && stats.hits == 1 && stats.entries == 2,
+          "compute cache separates descriptor-selected BVH box growth");
+
     // Manual shadow comparison bakes the enable, compare op, filter mode, address modes, and border
     // color into SPIR-V. In particular depth_compare=false must not reuse a previously successful
     // module: that descriptor contract is supposed to reject this comparison-sample shader.

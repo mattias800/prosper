@@ -4,6 +4,7 @@
 #include "rdna2_decode.hpp"
 #include "shader_resources.hpp"
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -5323,6 +5324,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t in_half = in.dst.value == 106
                     ? b.ucmp(Op_ULessThan, lane, b.uconst(32))
                     : b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32));
+                if (!rs.vcc) { ok = false; return true; }
                 rs.vcc = b.bsel(in_half, b.logical_not(rs.vcc), rs.vcc);
                 rs.sreg_bool[in.dst.value] = rs.vcc;
                 rs.sreg_bool_narrowed[in.dst.value] = true;
@@ -5891,6 +5893,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         b.ibin(Op_BitwiseAnd,
                                b.ibin(Op_ShiftRightLogical, result, bit), b.uconst(1)),
                         b.uconst(0));
+                    if (!rs.vcc) { ok = false; return true; }
                     rs.vcc = b.bsel(in_written_half, result_bit, rs.vcc);
                     rs.sreg_bool[in.dst.value] = rs.vcc;
                     rs.sreg_bool_narrowed[in.dst.value] = true;
@@ -5931,6 +5934,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                       : in.opcode == 0x18 ? b.lor(n0, n1)
                                       : in.opcode == 0x1a ? b.land(n0, n1)
                                       : b.logical_not(x);
+                if (!rs.vcc) { ok = false; return true; }
                 rs.vcc = b.bsel(in_written_half, result, rs.vcc);
                 rs.sreg_bool[in.dst.value] = rs.vcc;
                 rs.sreg_bool_narrowed[in.dst.value] = true;
@@ -6661,6 +6665,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             uint32_t& d = vreg[in.dst.value];
             switch (in.opcode) {
                 case 0x01: {                                         // v_cndmask_b32: dst = vcc ? src1 : src0
+                    if (!vcc) { ok = false; return true; }
                     if (in.sdwa_dst_sel == 6) { d = b.sel(vcc, c, a); break; }
                     auto word = [&](uint32_t raw, uint8_t sel) {
                         if (sel == 5) raw = b.ibin(Op_ShiftRightLogical, raw, b.uconst(16));
@@ -6713,6 +6718,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // Carry ops (VOP2 e32 form): carry-in + carry-out are VCC. v_add_co_ci(0x28)/
                 // v_sub_co_ci(0x29)/v_subrev_co_ci(0x2a). Mirrors the VOP3B 0x128/129/12A logic with VCC.
                 case 0x28: case 0x29: case 0x2A: {
+                    if (!vcc) { ok = false; return true; }
                     uint32_t cin = b.sel(vcc, b.uconst(1), b.uconst(0));
                     uint32_t carry;
                     if (in.opcode == 0x28) {                          // (a + c) + cin
@@ -8566,6 +8572,201 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (!allow_smem || !rt) { ok = false; return true; }
             const uint32_t SQ_DIM_2D = 1u;
             auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
+
+            // IMAGE_BVH_INTERSECT_RAY (GFX10 opcode 0xe6) has an image encoding but consumes a
+            // four-dword BVH descriptor and eleven NSA VGPR operands. Vulkan ray-query support is
+            // not available on every backend/device Prosper supports, so lower the exact RTIP 1.1
+            // contract used by Astro Bot to ordinary read-only SSBO loads and scalar ALU. The
+            // front-half admits only TYPE=8, triangle-return-mode=1, unsorted descriptors; keeping
+            // the instruction gate equally narrow makes every unverified variant fail visibly.
+            if (in.opcode == 0xe6u) {
+                const ShaderResource* bvh = rt->by_fetch_pc(in.pc);
+                if (in.words[0] != 0xf1989f07u || in.len_dwords != 5u ||
+                    in.mimg_dmask != 0xfu || !in.mimg_unorm || in.mimg_dim != 0u ||
+                    in.mimg_glc || in.src[2].value != 0 || (in.words[4] & 0xffff0000u) != 0u ||
+                    !bvh || bvh->cls != ResourceClass::ConstantBuffer ||
+                    bvh->format != DataFormat::Uint32 || bvh->num_components != 1u ||
+                    bvh->size < 128u || (bvh->size & 3u) != 0u) {
+                    ok = false;
+                    return true;
+                }
+
+                auto addr_vgpr = [&](uint32_t k) -> int {
+                    if (k == 0u) return in.src[0].value;
+                    const uint32_t j = k - 1u;
+                    return static_cast<int>((in.words[2u + j / 4u] >> (8u * (j % 4u))) & 0xffu);
+                };
+                uint32_t a[11]{};
+                for (uint32_t k = 0; k < 11; ++k) a[k] = vread(addr_vgpr(k));
+
+                const uint32_t node = a[0];
+                const uint32_t node_type = b.ibin(Op_BitwiseAnd, node, b.uconst(7u));
+                const uint32_t node_offset = b.ibin(Op_BitwiseAnd, node, b.uconst(~7u));
+                const uint32_t word_base = b.ibin(Op_ShiftLeftLogical, node_offset, b.uconst(1u));
+                const uint32_t dword_count = bvh->size / 4u;
+                const uint32_t valid64 = b.ucmp(
+                    Op_ULessThanEqual, node_offset, b.uconst((bvh->size - 64u) / 8u));
+                const uint32_t valid128 = b.ucmp(
+                    Op_ULessThanEqual, node_offset, b.uconst((bvh->size - 128u) / 8u));
+
+                // Every speculative load is independently clamped to dword zero. Results from a
+                // malformed/out-of-range pointer are discarded below, but the clamp also prevents
+                // an invalid guest pointer from becoming an out-of-bounds Vulkan SSBO access.
+                auto load_node = [&](uint32_t rel) {
+                    const uint32_t idx = rel
+                        ? b.ibin(Op_IAdd, word_base, b.uconst(rel)) : word_base;
+                    const uint32_t safe_idx = b.sel(
+                        b.ucmp(Op_ULessThan, idx, b.uconst(dword_count)), idx, b.uconst(0u));
+                    return b.cbuf_load(safe_idx, bvh->binding);
+                };
+                uint32_t w[28]{};
+                for (uint32_t k = 0; k < 28; ++k) w[k] = load_node(k);
+
+                const uint32_t zero = b.uconst(0u);
+                const uint32_t one = b.uconst(fbits(1.0f));
+                const uint32_t invalid = b.uconst(0xffffffffu);
+                const uint32_t is_tri0 = b.ucmp(Op_IEqual, node_type, b.uconst(0u));
+                const uint32_t is_tri1 = b.ucmp(Op_IEqual, node_type, b.uconst(1u));
+                const uint32_t is_box16 = b.ucmp(Op_IEqual, node_type, b.uconst(4u));
+                const uint32_t is_box32 = b.ucmp(Op_IEqual, node_type, b.uconst(5u));
+                const uint32_t tri_valid = b.land(b.lor(is_tri0, is_tri1), valid64);
+                const uint32_t box_valid = b.lor(b.land(is_box16, valid64),
+                                                 b.land(is_box32, valid128));
+
+                auto fadd = [&](uint32_t x, uint32_t y) { return b.fbin(Op_FAdd, x, y); };
+                auto fsub = [&](uint32_t x, uint32_t y) { return b.fbin(Op_FSub, x, y); };
+                auto fmul = [&](uint32_t x, uint32_t y) { return b.fbin(Op_FMul, x, y); };
+                auto dot3 = [&](const uint32_t x[3], const uint32_t y[3]) {
+                    return fadd(fadd(fmul(x[0], y[0]), fmul(x[1], y[1])), fmul(x[2], y[2]));
+                };
+                auto cross3 = [&](const uint32_t x[3], const uint32_t y[3], uint32_t out[3]) {
+                    out[0] = fsub(fmul(x[1], y[2]), fmul(x[2], y[1]));
+                    out[1] = fsub(fmul(x[2], y[0]), fmul(x[0], y[2]));
+                    out[2] = fsub(fmul(x[0], y[1]), fmul(x[1], y[0]));
+                };
+
+                // Triangle node types 0 and 1 share a 64-byte quad. Type 0 selects V0,V1,V2;
+                // type 1 selects V1,V3,V2. The four hardware return values are the unnormalised
+                // t numerator, determinant, I numerator and J numerator (mode 1).
+                uint32_t tv0[3] = {
+                    b.sel(is_tri1, w[3], w[0]),
+                    b.sel(is_tri1, w[4], w[1]),
+                    b.sel(is_tri1, w[5], w[2]),
+                };
+                uint32_t tv1[3] = {
+                    b.sel(is_tri1, w[9], w[3]),
+                    b.sel(is_tri1, w[10], w[4]),
+                    b.sel(is_tri1, w[11], w[5]),
+                };
+                uint32_t tv2[3] = {w[6], w[7], w[8]};
+                uint32_t edge1[3], edge2[3], from_v0[3];
+                for (uint32_t k = 0; k < 3; ++k) {
+                    edge1[k] = fsub(tv1[k], tv0[k]);
+                    edge2[k] = fsub(tv2[k], tv0[k]);
+                    from_v0[k] = fsub(a[2u + k], tv0[k]);
+                }
+                uint32_t ray_dir[3] = {a[5], a[6], a[7]};
+                uint32_t s1[3], s2[3];
+                cross3(ray_dir, edge2, s1);
+                cross3(from_v0, edge1, s2);
+                const uint32_t t_num = dot3(edge2, s2);
+                const uint32_t t_denom = dot3(s1, edge1);
+                const uint32_t i_num = dot3(from_v0, s1);
+                const uint32_t j_num = dot3(ray_dir, s2);
+                const uint32_t t = b.fbin(Op_FDiv, t_num, t_denom);
+                const uint32_t bary_i = b.fbin(Op_FDiv, i_num, t_denom);
+                const uint32_t bary_j = b.fbin(Op_FDiv, j_num, t_denom);
+                uint32_t tri_miss = b.lor(
+                    b.fcmp(Op_FOrdLessThan, bary_i, zero),
+                    b.fcmp(Op_FOrdGreaterThan, bary_i, one));
+                tri_miss = b.lor(tri_miss, b.fcmp(Op_FOrdLessThan, bary_j, zero));
+                tri_miss = b.lor(tri_miss,
+                    b.fcmp(Op_FOrdGreaterThan, fadd(bary_i, bary_j), one));
+                tri_miss = b.lor(tri_miss, b.fcmp(Op_FOrdLessThan, t, zero));
+                uint32_t tri_out[4] = {
+                    b.sel(tri_miss, b.uconst(0x7f800000u), t_num),
+                    b.sel(tri_miss, one, t_denom),
+                    i_num,
+                    j_num,
+                };
+
+                // Undo the pair-compression vertex rotation encoded in the final triangle-node
+                // dword. The two 2-bit fields select from {1-I-J, I, J}; valid RTIP 1.1 nodes never
+                // use selector 3, whose conservative fallback here is 1-I-J.
+                const uint32_t bary0_num = fsub(fsub(tri_out[1], i_num), j_num);
+                const uint32_t tri_shift = b.ibin(
+                    Op_ShiftLeftLogical,
+                    b.ibin(Op_BitwiseAnd, node_type, b.uconst(3u)), b.uconst(3u));
+                const uint32_t i_selector = b.ibin(
+                    Op_BitwiseAnd,
+                    b.ibin(Op_ShiftRightLogical, w[15], tri_shift), b.uconst(3u));
+                const uint32_t j_selector = b.ibin(
+                    Op_BitwiseAnd,
+                    b.ibin(Op_ShiftRightLogical, w[15],
+                           b.ibin(Op_IAdd, tri_shift, b.uconst(2u))),
+                    b.uconst(3u));
+                auto swizzled_bary = [&](uint32_t selector) {
+                    return b.sel(b.ucmp(Op_IEqual, selector, b.uconst(1u)), i_num,
+                        b.sel(b.ucmp(Op_IEqual, selector, b.uconst(2u)), j_num,
+                              bary0_num));
+                };
+                tri_out[2] = swizzled_bary(i_selector);
+                tri_out[3] = swizzled_bary(j_selector);
+
+                // Convert each FP16 box payload to the same six-float representation as an FP32
+                // box, then apply the slab test to all four children. Sorting is deliberately absent:
+                // the admitted Astro descriptor has BOX_SORT_EN=0, so architectural order is kept.
+                uint32_t box_out[4]{};
+                uint32_t ray_inv[3] = {a[8], a[9], a[10]};
+                for (uint32_t child = 0; child < 4; ++child) {
+                    const uint32_t hbase = 4u + child * 3u;
+                    uint32_t fp16_bounds[6] = {
+                        b.unpack_half(w[hbase], 0u), b.unpack_half(w[hbase], 1u),
+                        b.unpack_half(w[hbase + 1u], 0u), b.unpack_half(w[hbase + 1u], 1u),
+                        b.unpack_half(w[hbase + 2u], 0u), b.unpack_half(w[hbase + 2u], 1u),
+                    };
+                    const uint32_t fbase = 4u + child * 6u;
+                    uint32_t bmin[3], bmax[3];
+                    for (uint32_t axis = 0; axis < 3; ++axis) {
+                        bmin[axis] = b.sel(is_box16, fp16_bounds[axis], w[fbase + axis]);
+                        bmax[axis] = b.sel(is_box16, fp16_bounds[3u + axis], w[fbase + 3u + axis]);
+                    }
+                    uint32_t near_axis[3], far_axis[3];
+                    for (uint32_t axis = 0; axis < 3; ++axis) {
+                        const uint32_t t0 = fmul(fsub(bmin[axis], a[2u + axis]), ray_inv[axis]);
+                        const uint32_t t1 = fmul(fsub(bmax[axis], a[2u + axis]), ray_inv[axis]);
+                        const uint32_t positive = b.fcmp(Op_FOrdGreaterThanEqual, ray_inv[axis], zero);
+                        near_axis[axis] = b.sel(positive, t0, t1);
+                        far_axis[axis] = b.sel(positive, t1, t0);
+                    }
+                    const uint32_t near_unclamped = b.fext2(
+                        Glsl_FMax, b.fext2(Glsl_FMax, near_axis[0], near_axis[1]), near_axis[2]);
+                    const uint32_t far_unclamped = b.fext2(
+                        Glsl_FMin, b.fext2(Glsl_FMin, far_axis[0], far_axis[1]), far_axis[2]);
+                    const uint32_t near_t = b.fext2(Glsl_FMax, near_unclamped, zero);
+                    const uint32_t far_t = b.fext2(Glsl_FMin, far_unclamped, a[1]);
+                    const uint32_t nan_interval = b.lor(
+                        b.fcmp(Op_FUnordNotEqual, near_unclamped, near_unclamped),
+                        b.fcmp(Op_FUnordNotEqual, far_unclamped, far_unclamped));
+                    const float box_multiplier = 1.0f +
+                        static_cast<float>(bvh->bvh_box_grow) * (1.0f / 16777216.0f);
+                    const uint32_t hit = b.land(
+                        b.logical_not(nan_interval),
+                        b.fcmp(Op_FOrdLessThanEqual, near_t,
+                               fmul(far_t, b.uconst(std::bit_cast<uint32_t>(box_multiplier)))));
+                    box_out[child] = b.sel(b.land(box_valid, hit), w[child], invalid);
+                }
+
+                for (uint32_t k = 0; k < 4; ++k) {
+                    const uint32_t result = b.sel(tri_valid, tri_out[k], box_out[k]);
+                    const int vd = in.dst.value + static_cast<int>(k);
+                    const uint32_t old = vreg_old(b, rs, vd);
+                    rs.vreg[vd] = result;
+                    predicate_write(b, rs, vd, old);
+                }
+                return true;
+            }
+
             // Resolve the T#/U# via SRSRC (src[1]) provenance: s_load tag (indirect) else user-data SGPR.
             const ShaderResource* res = rt->by_fetch_pc(in.pc);
             if (!res || (res->cls != ResourceClass::Texture && res->cls != ResourceClass::StorageImage)) {
@@ -10448,7 +10649,10 @@ bool emit_cfg_state_machine(
         }
         b.store_function(kv.second, value);
     }
-    b.store_function(scc_var, initial.scc);
+    b.store_function(scc_var, initial.scc ? initial.scc : no);
+    // The dispatcher has no runtime type tag for a physical VCC word recycled as scalar data.
+    // Keep that unsupported join fail-visible instead of persisting an invented false mask.
+    if (!initial.vcc) return false;
     b.store_function(vcc_var, initial.vcc);
     b.store_function(exec_var, initial.exec);
     b.store_function(pc_var, b.uconst(0));
@@ -10837,6 +11041,8 @@ bool emit_cfg_state_machine(
                 b.store_function(vote_to_scc_var, yes);
             }
         }
+        if (!state.vcc)
+            return reject_cfg(starts[final_block], "poisoned-vcc-boundary");
         save_state(state, dispatch);
         if (mbcnt) {
             if (!set_next(mbcnt->pc + mbcnt->len_dwords))
@@ -11599,6 +11805,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // the last architectural SCC writer, unrepresentable per-lane) must reject — this is
             // exactly the non-adjacent stale-SCC consumer from the ISA audit (#879).
             if (!F.on_exec && !F.on_vcc && !rs.scc) return false;
+            if (F.on_vcc && !rs.vcc) return false;
             uint32_t condition = F.on_exec ? rs.exec : (F.on_vcc ? rs.vcc : rs.scc);
             if (b.is_fragment && (F.on_exec || F.on_vcc))
                 condition = b.fragment_wave_any(condition);
@@ -11656,7 +11863,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 rs.scc = b.emit_phi_2way(b.t_bool, then_scc ? then_scc : b.bfalse(), then_block,
                                          rs.scc ? rs.scc : b.bfalse(), else_block);
             if (then_vcc != rs.vcc)
-                rs.vcc = b.emit_phi_2way(b.t_bool, then_vcc, then_block, rs.vcc, else_block);
+                rs.vcc = !then_vcc || !rs.vcc ? 0u : b.emit_phi_2way(
+                    b.t_bool, then_vcc, then_block, rs.vcc, else_block);
             if (then_exec != rs.exec)
                 rs.exec = b.emit_phi_2way(b.t_bool, then_exec, then_block, rs.exec, else_block);
             rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
@@ -11704,7 +11912,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // A poisoned (0) SCC live-in degrades to bfalse — the loop shapes re-produce SCC via their
         // in-loop s_cmp before any read, so the phi seed is dead in practice; 0 would be invalid SSA.
         { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc ? rs.scc : b.bfalse(), preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
-        { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.vcc, preheader, p); rs.vcc = ph; phis.push_back({0, 3, ph, p}); }
+        if (rs.vcc) { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.vcc, preheader, p); rs.vcc = ph; phis.push_back({0, 3, ph, p}); }
         if (carry_vertex_exec) {
             size_t p;
             uint32_t ph = b.emit_phi2(b.t_bool, rs.exec, preheader, p);
@@ -11746,7 +11954,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         : pr.dom == 1 ? sget(pr.reg)
                         : pr.dom == 2 ? rs.scc
                         : pr.dom == 3 ? rs.vcc : rs.exec;
-            if (!nv && pr.dom == 2) nv = b.bfalse();   // poisoned SCC back-edge value: bfalse (dead in practice)
+            if (!nv && pr.dom == 3) return false;
+            if (!nv && pr.dom == 2)
+                nv = b.bfalse(); // poisoned SCC back-edge value: false when dead in practice
             b.patch_phi(pr.patch, nv, cont);
         }
         b.emit_branch(hdr);
@@ -12003,7 +12213,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // A poisoned (0) SCC live-in degrades to bfalse (invalid as an SSA phi input; dead in
             // practice — the loop shapes re-produce SCC before any read).
             { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc ? rs.scc : b.bfalse(), preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
-            { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.vcc, preheader, p); rs.vcc = ph; phis.push_back({0, 3, ph, p}); }
+            if (rs.vcc) { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.vcc, preheader, p); rs.vcc = ph; phis.push_back({0, 3, ph, p}); }
             { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.exec, preheader, p); rs.exec = ph; phis.push_back({0, 4, ph, p}); }
             std::vector<int> mask_keys;                        // saved masks live at entry: loop-carried bools
             for (auto& kv : rs.sreg_bool) mask_keys.push_back(kv.first);
@@ -12023,6 +12233,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             const uint32_t exec_chk = rs.exec, vcc_chk = rs.vcc, scc_chk = rs.scc;
             const std::unordered_map<int, uint32_t> bool_chk = rs.sreg_bool;
             uint32_t loop_cond = L.condition == DivLoop::Condition::Exec ? rs.exec : rs.vcc;
+            if (!loop_cond) return false;
             // EXECZ/VCCZ are scalar wave decisions. Keeping every fragment invocation in the loop
             // until the complete guest wave becomes empty makes scalar state and nested wave votes
             // exact; vector writes remain predicated by the per-lane EXEC bool.
@@ -12063,12 +12274,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                             : pr.dom == 3 ? rs.vcc
                             : pr.dom == 4 ? rs.exec
                             : (rs.sreg_bool.count(pr.reg) ? rs.sreg_bool[pr.reg] : pr.phi);
-                if (!nv && pr.dom == 2) nv = b.bfalse();   // poisoned SCC back-edge value
+                if (!nv && pr.dom == 3) return false;
+                if (!nv && pr.dom == 2) nv = b.bfalse();
                 b.patch_phi(pr.patch, nv, cont);
             }
             b.emit_branch(hdr);
             b.emit_label(merge);
             for (auto& pr : phis) {
+                if (pr.dom == 3 && (!vcc_chk || !rs.vcc)) return false;
                 uint32_t chk_value = pr.dom == 0 ? (condv.count(pr.reg) ? condv_val[pr.reg] : pr.phi)
                                    : pr.dom == 1 ? (conds.count(pr.reg) ? conds_val[pr.reg] : pr.phi)
                                    : pr.dom == 2 ? (scc_chk ? scc_chk : b.bfalse())
@@ -12129,6 +12342,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 // A poisoned SCC (0: last written by a 64-bit mask op) cannot condition a real
                 // structured if — reject (the ISA-audit #879 stale-SCC consumer).
                 if (!F.on_exec && !F.on_vcc && !rs.scc) return false;
+                if (F.on_vcc && !rs.vcc) return false;
                 // Compute VCC/EXEC branches normally return through the exact guest-wave dispatcher.
                 // The narrow structured-wave path above accepts only top-level vote sites, where all
                 // workgroup invocations may participate in the scratch barriers uniformly.
@@ -12198,7 +12412,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     if (then_scc != pre_scc)   // poisoned (0) inputs degrade to bfalse across the merge
                         rs.scc = b.emit_phi_2way(b.t_bool, pre_scc ? pre_scc : b.bfalse(), preblock,
                                                  then_scc ? then_scc : b.bfalse(), thenEnd);
-                    if (then_vcc != pre_vcc) rs.vcc = b.emit_phi_2way(b.t_bool, pre_vcc, preblock, then_vcc, thenEnd);
+                    if (then_vcc != pre_vcc)
+                        rs.vcc = !pre_vcc || !then_vcc ? 0u : b.emit_phi_2way(
+                            b.t_bool, pre_vcc, preblock, then_vcc, thenEnd);
                     // EXEC changed inside the arm (saveexec / v_cmpx / restore): merge it like any value.
                     // Narrowed-ness is sticky (either edge narrowed → post-merge writes stay predicated).
                     if (then_exec != pre_exec) rs.exec = b.emit_phi_2way(b.t_bool, pre_exec, preblock, then_exec, thenEnd);
@@ -12265,7 +12481,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     if (then_scc != rs.scc)   // poisoned (0) inputs degrade to bfalse across the merge
                         rs.scc = b.emit_phi_2way(b.t_bool, then_scc ? then_scc : b.bfalse(), thenEnd,
                                                  rs.scc ? rs.scc : b.bfalse(), elseEnd);
-                    if (then_vcc != rs.vcc) rs.vcc = b.emit_phi_2way(b.t_bool, then_vcc, thenEnd, rs.vcc, elseEnd);
+                    if (then_vcc != rs.vcc)
+                        rs.vcc = !then_vcc || !rs.vcc ? 0u : b.emit_phi_2way(
+                            b.t_bool, then_vcc, thenEnd, rs.vcc, elseEnd);
                     if (then_exec != rs.exec) rs.exec = b.emit_phi_2way(b.t_bool, then_exec, thenEnd, rs.exec, elseEnd);
                     rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
                     rs.sreg_written.insert(then_written.begin(), then_written.end());

@@ -84,7 +84,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v39: retain each realized compute program's raw RDNA2 stream plus its semantic launch/recompiler
 // inputs. This lets gpu_replay --recompile-raw exercise current compute translation instead of the
 // stored capture-safe SPIR-V, including native-width storage formats supported by the replay device.
-constexpr uint32_t kVersion = 39;
+// v40: retain the BVH descriptor BOX_GROW value for every resource table. The software RTIP 1.1
+// lowering uses it to reproduce the guest's conservative box-interval expansion exactly.
+constexpr uint32_t kVersion = 40;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -2062,6 +2064,40 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         w.u32(config.native_subgroup_size);
         w.u32(config.native_storage_format_support);
     }
+    // v40 keeps the BVH BOX_GROW descriptor field in deterministic resource-table order. Failed
+    // stages are included because raw diagnostic replay may recompile those tables later.
+    uint64_t bvh_resource_count = resource_depth_count;
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            bvh_resource_count += stage.resource_table.resources.size();
+    if (bvh_resource_count > UINT32_MAX) {
+        error = "invalid BVH resource-state count";
+        return false;
+    }
+    w.u32(static_cast<uint32_t>(bvh_resource_count));
+    auto write_bvh_box_grow = [&](const GpuCapturedTable& table) {
+        for (const auto& captured : table.resources) {
+            if (captured.resource.bvh_box_grow > 0xFFu) return false;
+            w.u32(captured.resource.bvh_box_grow);
+        }
+        return true;
+    };
+    for (const auto& draw : c.draws)
+        if (!write_bvh_box_grow(draw.vrt) || !write_bvh_box_grow(draw.prt)) {
+            error = "invalid BVH box-grow value";
+            return false;
+        }
+    for (const auto& compute : c.computes)
+        if (!write_bvh_box_grow(compute.resources)) {
+            error = "invalid BVH box-grow value";
+            return false;
+        }
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            if (!write_bvh_box_grow(stage.resource_table)) {
+                error = "invalid BVH box-grow value";
+                return false;
+            }
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -2912,6 +2948,35 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             config.packed_r11_storage = (flags & 16u) != 0;
             if (!validate_compute_recompile_state(compute, error)) return false;
         }
+    }
+    if (version >= 40) {   // BVH descriptor BOX_GROW per resource
+        size_t expected = 0;
+        for (const auto& draw : c.draws)
+            expected += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes)
+            expected += compute.resources.resources.size();
+        for (const auto& diagnostic : c.failure_diagnostics)
+            for (const auto& stage : diagnostic.stages)
+                expected += stage.resource_table.resources.size();
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) {
+            error = "invalid BVH resource-state count";
+            return false;
+        }
+        auto read_bvh_box_grow = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources)
+                if (!r.u32(captured.resource.bvh_box_grow) ||
+                    captured.resource.bvh_box_grow > 0xFFu)
+                    return false;
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_bvh_box_grow(draw.vrt) || !read_bvh_box_grow(draw.prt)) return false;
+        for (auto& compute : c.computes)
+            if (!read_bvh_box_grow(compute.resources)) return false;
+        for (auto& diagnostic : c.failure_diagnostics)
+            for (auto& stage : diagnostic.stages)
+                if (!read_bvh_box_grow(stage.resource_table)) return false;
     }
     for (auto& draw : c.draws) restore_legacy_color_target_aliases(draw);
     for (auto& diagnostic : c.failure_diagnostics)

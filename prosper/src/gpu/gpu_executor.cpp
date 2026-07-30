@@ -148,6 +148,7 @@ struct ShaderResourceCompileKey {
     uint32_t fetch_pc = 0;
     uint32_t fetch_index_mode = 0;
     uint32_t flat_base_sgpr = 0;
+    uint32_t bvh_box_grow = 0;
     bool srgb = false;
     bool depth_compare = false;
     uint32_t depth_compare_func = 0;
@@ -325,6 +326,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.fetch_pc);
             hash = hash_mix(hash, resource.fetch_index_mode);
             hash = hash_mix(hash, resource.flat_base_sgpr);
+            hash = hash_mix(hash, resource.bvh_box_grow);
             hash = hash_mix(hash, resource.srgb);
             hash = hash_mix(hash, resource.depth_compare);
             hash = hash_mix(hash, resource.depth_compare_func);
@@ -984,6 +986,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             compiled.fetch_pc = resource.fetch_pc;
             compiled.fetch_index_mode = static_cast<uint32_t>(resource.fetch_index_mode);
             compiled.flat_base_sgpr = resource.flat_base_sgpr;
+            compiled.bvh_box_grow = resource.bvh_box_grow;
             compiled.srgb = storage_image && resource.srgb;
             compiled.depth_compare = (manual_compare || storage_image) && resource.depth_compare;
             compiled.depth_compare_func = manual_compare ? resource.depth_compare_func : 0u;
@@ -1965,22 +1968,76 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 kc = (in.src[1].kind == OperandKind::Literal) ? (c = in.literal, true) : srcval(in.src[1], c);
                 int d = in.dst.value; bool ok = ka && kc; uint32_t r = 0;
                 uint32_t hi64 = 0; bool wrote_pair = false;
+                int next_scc = scc;
                 if (ok) switch (in.opcode) {
-                    case 0x00: case 0x02: r = a + c; break;                 // s_add_u32 / s_add_i32
-                    case 0x01: case 0x03: r = a - c; break;                 // s_sub_u32 / s_sub_i32
-                    case 0x0E: r = a & c; break;                            // s_and_b32
-                    case 0x10: r = a | c; break;                            // s_or_b32
-                    case 0x12: r = a ^ c; break;                            // s_xor_b32
-                    case 0x1E: r = a << (c & 31); break;                    // s_lshl_b32
-                    case 0x20: r = a >> (c & 31); break;                    // s_lshr_b32
+                    case 0x00: {                                           // s_add_u32
+                        const uint64_t sum = static_cast<uint64_t>(a) + c;
+                        r = static_cast<uint32_t>(sum);
+                        next_scc = static_cast<int>(sum >> 32);
+                        break;
+                    }
+                    case 0x01:                                             // s_sub_u32
+                        r = a - c; next_scc = a < c; break;
+                    case 0x02: {                                           // s_add_i32
+                        r = a + c;
+                        next_scc = ((~(a ^ c) & (a ^ r)) >> 31) != 0;
+                        break;
+                    }
+                    case 0x03:                                             // s_sub_i32
+                        r = a - c; next_scc = (((a ^ c) & (a ^ r)) >> 31) != 0; break;
+                    case 0x04: {                                           // s_addc_u32
+                        if (scc < 0) { ok = false; break; }
+                        const uint64_t sum = static_cast<uint64_t>(a) + c +
+                                             static_cast<uint32_t>(scc);
+                        r = static_cast<uint32_t>(sum);
+                        next_scc = static_cast<int>(sum >> 32);
+                        break;
+                    }
+                    case 0x0E: r = a & c; next_scc = r != 0; break;         // s_and_b32
+                    case 0x10: r = a | c; next_scc = r != 0; break;         // s_or_b32
+                    case 0x12: r = a ^ c; next_scc = r != 0; break;         // s_xor_b32
+                    case 0x1E:                                             // s_lshl_b32
+                        r = a << (c & 31); next_scc = r != 0; break;
+                    case 0x20:                                             // s_lshr_b32
+                        r = a >> (c & 31); next_scc = r != 0; break;
                     case 0x26: r = a * c; break;                            // s_mul_i32
-                    case 0x2E: case 0x2F: case 0x30: case 0x31:
-                        r = (a << (in.opcode - 0x2Du)) + c; break;           // s_lshl{1,2,3,4}_add_u32
+                    case 0x2E: case 0x2F: case 0x30: case 0x31: {           // s_lshl{1,2,3,4}_add_u32
+                        const uint32_t shift = in.opcode - 0x2Du;
+                        const uint64_t sum = (static_cast<uint64_t>(a) << shift) + c;
+                        r = static_cast<uint32_t>(sum);
+                        next_scc = sum >= (uint64_t{1} << 32);
+                        break;
+                    }
                     case 0x27: { uint32_t off = c & 0x1f, wid = (c >> 16) & 0x7f;   // s_bfe_u32
-                                 r = wid == 0 ? 0 : (wid >= 32 ? (a >> off) : ((a >> off) & ((1u << wid) - 1))); break; }
+                                 r = wid == 0 ? 0 : (wid >= 32 ? (a >> off) : ((a >> off) & ((1u << wid) - 1)));
+                                 next_scc = r != 0; break; }
                     case 0x0A:   // s_cselect_b32: dst = SCC ? src0 : src1 (the vertex-fetch format patch's tail)
                         if (scc < 0) ok = false; else r = scc ? a : c;
                         break;
+                    case 0x1F: case 0x21: {  // s_lshl_b64 / s_lshr_b64
+                        uint32_t ahi = 0;
+                        bool khi = false;
+                        if (in.src[0].kind == OperandKind::SGPR)
+                            khi = known(in.src[0].value + 1, ahi);
+                        else if (in.src[0].kind == OperandKind::InlineInt) {
+                            ahi = in.src[0].value < 0 ? UINT32_MAX : 0u;
+                            khi = true;
+                        } else if (in.src[0].kind == OperandKind::Literal) {
+                            ahi = 0;
+                            khi = true;
+                        }
+                        if (!khi) { ok = false; wrote_pair = true; break; }
+                        const uint64_t src64 = static_cast<uint64_t>(a) |
+                                               (static_cast<uint64_t>(ahi) << 32);
+                        const uint32_t shift = c & 63u;
+                        const uint64_t result = in.opcode == 0x1Fu
+                            ? src64 << shift : src64 >> shift;
+                        r = static_cast<uint32_t>(result);
+                        hi64 = static_cast<uint32_t>(result >> 32);
+                        wrote_pair = true;
+                        next_scc = result != 0;
+                        break;
+                    }
                     case 0x29: {  // s_bfe_u64: dst[63:0] = bitfield of src0[63:0] (format patch reads a small field)
                         uint32_t off = c & 0x3f, wid = (c >> 16) & 0x7f, ahi = 0;
                         // src0's high dword (RDNA2 ISA 64-bit scalar-operand rules, #155): the next SGPR
@@ -1998,20 +2055,20 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         if (!khi && wid != 0 && off + wid > 32) { ok = false; wrote_pair = true; break; }
                         uint64_t src64 = (uint64_t)a | ((uint64_t)ahi << 32);
                         uint64_t res = wid == 0 ? 0 : (wid >= 64 ? (src64 >> off) : ((src64 >> off) & (((uint64_t)1 << wid) - 1)));
-                        r = (uint32_t)res; hi64 = (uint32_t)(res >> 32); wrote_pair = true; break;
+                        r = (uint32_t)res; hi64 = (uint32_t)(res >> 32); wrote_pair = true;
+                        next_scc = res != 0; break;
                     }
                     default: ok = false; break;                            // SCC-dependent / unmodeled -> unknown
                 }
                 if (trc)   // unfiltered like the SMEM/MUBUF traces (one shader walk — volume is bounded)
                     fprintf(stderr, "[dyntrace]   SOP2 pc=%u op=0x%x dst=s%d src0=%d(k%d) src1=%d(k%d) ok=%d r=0x%x\n",
                             in.pc, in.opcode, d, in.src[0].value, ka, in.src[1].value, kc, ok, r);
-                // Every SOP2 ALU op except s_cselect writes SCC to a value we don't track here — invalidate so a
-                // later s_cselect only trusts SCC set by an immediately-preceding s_cmp.
-                if (in.opcode != 0x0A) scc = -1;
+                scc = ok ? next_scc : -1;
                 if (ok) { set_value(d, r); if (wrote_pair) set_value(d + 1, hi64); }
-                // A 64-bit-dst op (s_bfe_u64) invalidates BOTH dwords even when its sources were
-                // unknown (the opcode switch never ran, so wrote_pair may still be false).
-                else    { forget(d); if (wrote_pair || in.opcode == 0x29) forget(d + 1); }
+                // A 64-bit-dst op invalidates BOTH dwords even when its source was unknown (the
+                // opcode switch may not have reached the point that marks wrote_pair).
+                else    { forget(d); if (wrote_pair || in.opcode == 0x1F || in.opcode == 0x21 ||
+                                         in.opcode == 0x29) forget(d + 1); }
                 break;
             }
             case Rdna2Format::SOPC: {   // scalar compare -> SCC (feeds the format patch's s_cselect)
@@ -2223,6 +2280,51 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 break;
             }
             case Rdna2Format::MIMG: {
+                // IMAGE_BVH_INTERSECT_RAY consumes a four-dword BVH descriptor, not an eight-dword
+                // image T#. Preserve the words live at this exact instruction and materialize the
+                // acceleration-structure bytes as a raw read-only SSBO for software lowering.
+                if (in.opcode == 0xE6u) {
+                    if (srt_uses) {
+                        const int bbase = in.src[1].value;
+                        std::array<uint32_t, 4> live_bvh{};
+                        bool live_known = valid_reg(bbase) && valid_reg(bbase + 3);
+                        for (int k = 0; live_known && k < 4; ++k)
+                            live_known &= known(bbase + k, live_bvh[(size_t)k]);
+                        const bool snapshot_provenance = valid_reg(bbase) &&
+                            descr_known.test((size_t)bbase);
+                        const bool seed_provenance = !snapshot_provenance &&
+                            (untouched_seed_range(bbase, 4) ||
+                             consecutive_seed_copy_range(bbase, 4));
+                        const DecodedBvhDescriptor d = live_known
+                            ? decode_bvh_descriptor(live_bvh.data()) : DecodedBvhDescriptor{};
+                        const bool plausible = live_known && (snapshot_provenance || seed_provenance) &&
+                            d.type == 8u && d.base > 0x10000u && d.size_bytes != 0;
+                        if (trc) {
+                            fprintf(stderr,
+                                    "[dyntrace] BVH pc=%u srsrc=s%d snapshot=%d seed=%d bvh=",
+                                    in.pc, bbase, snapshot_provenance, seed_provenance);
+                            if (plausible) {
+                                for (uint32_t word : live_bvh) fprintf(stderr, "%08x ", word);
+                                fprintf(stderr, "-> base=0x%llx size=0x%llx type=%u tri_mode=%u grow=%u",
+                                        (unsigned long long)d.base,
+                                        (unsigned long long)d.size_bytes, d.type,
+                                        d.triangle_return_mode, d.box_grow);
+                            } else {
+                                fprintf(stderr, "<unknown>");
+                            }
+                            fputc('\n', stderr);
+                        }
+                        if (plausible) {
+                            SrtUse u;
+                            u.kind = 2;
+                            u.key = 0xFFFFFFFFu;
+                            u.bvh4 = live_bvh;
+                            u.use_pc = in.pc;
+                            srt_uses->push_back(u);
+                        }
+                    }
+                    break;
+                }
                 // Descriptor-table use (#294): an image op's SRSRC (src[1]) is an 8-dword T#; if it was
                 // snapshotted from a table load, report it as a Texture use — with the paired SSAMP
                 // (src[2]) S# when that 4-dword load also resolved. VGPR-only dest: no SGPR state.
@@ -2742,6 +2844,35 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
 
     std::set<uint64_t> seen;
     for (const auto& u : srt_uses) {
+        if (u.kind == 2) {
+            const DecodedBvhDescriptor d = decode_bvh_descriptor(u.bvh4.data());
+            if (d.type != 8u || d.base <= 0x10000u || d.size_bytes == 0 ||
+                d.size_bytes > 0x10000000u || d.size_bytes > UINT32_MAX ||
+                !d.triangle_return_mode || d.box_node_64b || d.sort_enabled)
+                continue;
+            const uint64_t dk = 0x8000000200000000ull | u.use_pc;
+            if (!seen.insert(dk).second) continue;
+            bool mapped = false;
+            for (auto& r0 : table.resources) {
+                if (r0.cls != ResourceClass::ConstantBuffer || r0.gpu_addr != d.base ||
+                    r0.size != static_cast<uint32_t>(d.size_bytes) ||
+                    r0.bvh_box_grow != d.box_grow)
+                    continue;
+                if (r0.fetch_pc == 0xFFFFFFFFu) r0.fetch_pc = u.use_pc;
+                if (r0.fetch_pc == u.use_pc) { mapped = true; break; }
+            }
+            if (mapped) continue;
+            ShaderResource r;
+            r.cls = ResourceClass::ConstantBuffer;
+            r.format = DataFormat::Uint32;
+            r.num_components = 1;
+            r.gpu_addr = d.base;
+            r.size = static_cast<uint32_t>(d.size_bytes);
+            r.fetch_pc = u.use_pc;
+            r.bvh_box_grow = d.box_grow;
+            table.resources.push_back(r);
+            continue;
+        }
         if (u.kind != 1) continue;
         if (u.use_pc == proven_linear_store_pc) continue;
         if (u.instruction_format != UINT32_MAX && ((u.v4[3] >> 12) & 0x7Fu) == 0)
@@ -3914,7 +4045,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                          "t8=%08x:%08x:%08x:%08x:%08x:%08x:%08x:%08x\n",
                                          u.key, u.use_pc, u.t8[0], u.t8[1], u.t8[2], u.t8[3],
                                          u.t8[4], u.t8[5], u.t8[6], u.t8[7]);
-                        } else {
+                        } else if (u.kind == 1) {
                             const DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
                             std::fprintf(stderr,
                                          "[dynfail]     BUF(v4) key=0x%x use_pc=%u "
@@ -3923,6 +4054,18 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                          u.key, u.use_pc, u.v4[0], u.v4[1], u.v4[2], u.v4[3],
                                          (unsigned long long)d.base, d.stride, d.num_records,
                                          d.size_bytes, u.required_size);
+                        } else {
+                            const DecodedBvhDescriptor d = decode_bvh_descriptor(u.bvh4.data());
+                            std::fprintf(stderr,
+                                         "[dynfail]     BVH(bvh4) use_pc=%u "
+                                         "bvh4=%08x:%08x:%08x:%08x base=0x%llx size=%llu "
+                                         "type=%u tri_mode=%u box64=%u sort=%u grow=%u\n",
+                                         u.use_pc, u.bvh4[0], u.bvh4[1], u.bvh4[2], u.bvh4[3],
+                                         (unsigned long long)d.base,
+                                         (unsigned long long)d.size_bytes, d.type,
+                                         (unsigned)d.triangle_return_mode,
+                                         (unsigned)d.box_node_64b, (unsigned)d.sort_enabled,
+                                         (unsigned)d.box_grow);
                         }
                     }
                 }
@@ -4011,7 +4154,8 @@ struct OrderedGpustateCaptureTrace {
 static OrderedSubmitResult execute_ordered_gpustate(
     const GpuState& st, uint32_t width, uint32_t height, uint64_t submit_no,
     const LiveRenderFn& render, const LiveComputeFn& compute,
-    OrderedGpustateCaptureTrace* capture_trace = nullptr);
+    OrderedGpustateCaptureTrace* capture_trace = nullptr,
+    const std::vector<DrawItem>* eager_draws = nullptr);
 
 bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
     if (st.dma_copies.empty() && (!g_compute || st.dispatches.empty())) return false;
@@ -5014,7 +5158,8 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                                                      uint32_t height, uint64_t submit_no,
                                                      const LiveRenderFn& render,
                                                      const LiveComputeFn& compute,
-                                                     OrderedGpustateCaptureTrace* capture_trace) {
+                                                     OrderedGpustateCaptureTrace* capture_trace,
+                                                     const std::vector<DrawItem>* eager_draws) {
     GuestGpuWriteSubmitScope guest_gpu_write_scope;
     if (st.dma_execution_rejected) {
         static std::atomic<int> warned{0};
@@ -5043,6 +5188,11 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     std::stable_sort(executable.begin(), executable.end(), [](const auto& a, const auto& b) {
         return a.command_order < b.command_order;
     });
+
+    std::unordered_map<size_t, size_t> eager_draw_by_index;
+    if (eager_draws)
+        for (size_t i = 0; i < eager_draws->size(); ++i)
+            eager_draw_by_index[static_cast<size_t>((*eager_draws)[i].draw_index)] = i;
 
     size_t total_spans = 0;
     bool in_draw_span = false;
@@ -5090,7 +5240,18 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     break;
                 }
                 DrawItem item;
-                if (realize_retained_draw(st, operation.index, scale_x, scale_y, item)) {
+                bool realized = false;
+                if (eager_draws) {
+                    const auto found = eager_draw_by_index.find(operation.index);
+                    if (found != eager_draw_by_index.end()) {
+                        item = (*eager_draws)[found->second];
+                        realized = true;
+                    }
+                } else {
+                    realized = realize_retained_draw(
+                        st, operation.index, scale_x, scale_y, item);
+                }
+                if (realized) {
                     if (capture_trace) capture_trace->draws.push_back(item);
                     span.push_back(std::move(item));
                 }
@@ -5403,10 +5564,13 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
                                          [](const auto& draw) { return draw.indirect; }) ||
                               std::any_of(st.dispatches.begin(), st.dispatches.end(),
                                          [](const auto& dispatch) { return dispatch.indirect; });
-    const bool needs_ordered_realization = has_ordered_dma || has_indirect;
-    // DMA and indirect consumers must be realized at their ordered position below. Pre-realizing
-    // would snapshot bytes before an earlier copy or compute shader updates their backing.
-    std::vector<DrawItem> draws = !needs_ordered_realization && g_live && width && height
+    const bool needs_ordered_realization = has_ordered_dma || has_indirect || !st.dispatches.empty();
+    // Draws without DMA/indirect arguments remain safe to prepare in parallel. Compute resources,
+    // however, are always realized at their ordered position: a preceding dispatch in the same
+    // submit can write a pointer or descriptor consumed by the next dispatch (Astro Bot's BVH root
+    // is one such dependency). Pre-realizing every compute snapshots stale guest bytes.
+    const bool can_eagerly_realize_draws = !has_ordered_dma && !has_indirect;
+    std::vector<DrawItem> draws = can_eagerly_realize_draws && g_live && width && height
         ? realize_gpustate_draws(st, 0x10000, sx, sy, nullptr, true)
         : std::vector<DrawItem>{};
     const ShaderRecompileCacheStats shader_after = timing_enabled
@@ -5431,13 +5595,14 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     auto pending_capture = begin_requested_gpu_capture(
         draws, computes, operations, width, height, &st, submit_no,
         static_cast<uint64_t>(st.draws.size()), nullptr,
-        /*defer_materialization=*/has_indirect);
+        /*defer_materialization=*/needs_ordered_realization);
     snapshot_pending_gpu_capture_compute_gds(
         pending_capture.get(), g_compute_gds.data(), g_compute_gds.size());
     OrderedGpustateCaptureTrace capture_trace;
     OrderedSubmitResult result = needs_ordered_realization
         ? execute_ordered_gpustate(st, width, height, submit_no, g_live, g_compute,
-                                   pending_capture ? &capture_trace : nullptr)
+                                   pending_capture ? &capture_trace : nullptr,
+                                   can_eagerly_realize_draws ? &draws : nullptr)
         : execute_ordered_items(operations, draws, computes, g_live, g_compute, width, height);
     const auto timing_backend_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     const std::vector<uint8_t>& px = result.frame.bytes();

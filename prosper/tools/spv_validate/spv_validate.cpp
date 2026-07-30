@@ -138,6 +138,15 @@ int main(int argc, char** argv) {
       dst.format=DataFormat::Uint32; dst.num_components=1; dst.binding=3;
       dst.stride=12; dst.sgpr_base=16; rt.resources.push_back(dst);
       dump(dir, "compute_store_x3", recompile_valu(c, sizeof(c)/4, 1, 0, &rt)); }
+    // Astro Bot's exact RTIP 1.1 BVH instruction. The software intersection path is intentionally
+    // scalar/SSBO SPIR-V so it does not require Vulkan ray-query capabilities.
+    { const uint32_t c[] = {0xf1989f07u,0x00040303u,0x43440d3fu,0x46424140u,0x00004847u,
+                            0xbf810000u};
+      ShaderResourceTable rt; ShaderResource bvh{}; bvh.cls=ResourceClass::ConstantBuffer;
+      bvh.format=DataFormat::Uint32; bvh.num_components=1; bvh.binding=4;
+      bvh.size=128; bvh.fetch_pc=0; rt.resources.push_back(bvh);
+      ComputeShaderConfig cfg; cfg.local_x=1;
+      dump(dir, "compute_bvh_intersect", recompile_compute(c, sizeof(c)/4, &rt, cfg)); }
     // Compute EXEC-predicated store (v_cmpx + guard execz + store).
     { const uint32_t c[] = {0x7e040f00u,0x06060100u,0x7e0a0284u,0x7da20b02u,0xbf880002u,0xe0102000u,0x80020302u,0xbf810000u};
       ShaderResourceTable rt; ShaderResource vb{}; vb.cls=ResourceClass::VertexBuffer; vb.format=DataFormat::Float32;

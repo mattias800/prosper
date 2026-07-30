@@ -2451,6 +2451,31 @@ bool trace_compute_item(const prosper::gpu::ComputeItem& item) {
     return true;
 }
 
+void maybe_dump_traced_compute_spirv(const prosper::gpu::ComputeItem& item, bool trace) {
+    const char* path = std::getenv("PROSPER_COMPUTELOG_SPIRV");
+    if (!trace || !path || !*path || item.spirv.empty()) return;
+    uint64_t module_hash = 1469598103934665603ull;
+    for (uint32_t word : item.spirv) {
+        module_hash ^= word;
+        module_hash *= 1099511628211ull;
+    }
+    static std::mutex mutex;
+    static std::unordered_set<uint64_t> dumped;
+    std::lock_guard lock(mutex);
+    if (dumped.contains(module_hash)) return;
+    FILE* file = std::fopen(path, "wb");
+    const size_t bytes = item.spirv.size() * sizeof(uint32_t);
+    const bool ok = file && std::fwrite(item.spirv.data(), 1, bytes, file) == bytes;
+    if (file) std::fclose(file);
+    if (ok) dumped.insert(module_hash);
+    std::fprintf(stderr,
+                 "[compute]   traced SPIR-V program=0x%llx module=%016llx words=%zu "
+                 "path=%s result=%s\n",
+                 static_cast<unsigned long long>(item.code_addr),
+                 static_cast<unsigned long long>(module_hash), item.spirv.size(), path,
+                 ok ? "written" : "failed");
+}
+
 std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item) {
     using prosper::gpu::ComputeCpuFastPath;
     using prosper::gpu::ResourceClass;
@@ -2542,6 +2567,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     double writeback_publish_ms = 0.0;
     const std::vector<uint32_t>& spirv = item.spirv;
     const bool trace = trace_compute_item(item);
+    maybe_dump_traced_compute_spirv(item, trace);
     if (item.required_subgroup_size &&
         (!ctx.borrowed || !ctx.native_subgroup_contract ||
          item.required_subgroup_size < ctx.min_native_subgroup_size ||
@@ -4680,7 +4706,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
             }
             cpci.layout = pipeline_layout;
-            if (trace) std::fprintf(stderr, "[compute]   creating compute pipeline\n");
+            if (trace)
+                std::fprintf(stderr,
+                             "[compute]   creating compute pipeline words=%zu descriptors=%zu "
+                             "subgroup=%u\n",
+                             spirv.size(), descriptors.size(), item.required_subgroup_size);
             if (!vk_ok(vkCreateComputePipelines(ctx.device, ctx.pipeline_cache, 1, &cpci, nullptr,
                                                 &pipeline), "compute-pipeline")) break;
             if (trace) std::fprintf(stderr, "[compute]   compute pipeline ready\n");

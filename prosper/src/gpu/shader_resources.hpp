@@ -184,6 +184,11 @@ struct ShaderResource {
     uint32_t      fetch_pc      = 0xFFFFFFFFu;
     VertexFetchIndexMode fetch_index_mode = VertexFetchIndexMode::Automatic;
 
+    // BVH descriptor BOX_GROW (bits 62:55). IMAGE_BVH_INTERSECT_RAY expands box intervals by
+    // this many 2^-24 increments; zero is exact/no growth. Meaningful only for the per-fetch raw
+    // ConstantBuffer view created from a validated BVH descriptor.
+    uint32_t      bvh_box_grow  = 0;
+
     // FLAT-window (#1171) provenance: for a general flat_load whose 64-bit source pointer lives in the
     // consecutive user SGPRs s[flat_base_sgpr : +1], the executor binds the containing guest allocation
     // as this SSBO (keyed by the load's fetch_pc) and the emitter lowers the load to an indexed read at

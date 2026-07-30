@@ -44,6 +44,7 @@ alignas(256) static const uint32_t kDccPs[] = {
     0x7E000280u, 0xF8001803u, 0x00000000u, 0xBF810000u,
 };
 alignas(256) static const uint32_t kNoopCs[] = {0xBF810000u};
+alignas(256) static uint32_t kOrderedLateCs[] = {0u};
 static void set_pgm(GpuState& st, uint32_t lo_off, uint32_t hi_off, const void* p) {
     uint64_t a = (uint64_t)(uintptr_t)p;
     st.sh[lo_off] = (uint32_t)((a >> 8) & 0xFFFFFFFFu);
@@ -925,6 +926,62 @@ int main() {
                   resolved_large.groups_x == large_indirect_args[0] &&
                   resolved_large.groups_y == 1 && resolved_large.groups_z == 1,
               "indirect dispatch retains workgroup counts above Vulkan's portable minimum");
+
+        // Direct compute packets also need ordered realization. The first backend call stands in for
+        // a producer that updates guest-visible shader/resource bytes; the later direct dispatch must
+        // be realized only after that producer completes. Eager whole-submit realization would reject
+        // kOrderedLateCs while it still contains an unsupported zero word and invoke the backend once.
+        ShaderReg late_registers[2] = {
+            {P::COMPUTE_PGM_LO, 0}, {P::COMPUTE_PGM_HI, 0},
+        };
+        AgcShaderHeader late_header{};
+        late_header.file_header = 0x34333231u;
+        late_header.version = 0x18;
+        late_header.sh_registers = late_registers;
+        late_header.shader_size = sizeof(kOrderedLateCs);
+        late_header.type = 0;
+        late_header.num_sh_registers = 2;
+        registered_shader = nullptr;
+        kOrderedLateCs[0] = 0u;
+        CHECK(create_shader &&
+                  create_shader(reinterpret_cast<uint64_t>(&registered_shader),
+                                reinterpret_cast<uint64_t>(&late_header),
+                                reinterpret_cast<uint64_t>(kOrderedLateCs), 0, 0, 0) == 0 &&
+                  registered_shader == &late_header,
+              "register a mutable late compute consumer for ordered realization");
+        GpuState direct_ordered;
+        auto first_state = std::make_shared<GpuState>();
+        first_state->sh[P::COMPUTE_PGM_LO] = compute_registers[0].value;
+        first_state->sh[P::COMPUTE_PGM_HI] = compute_registers[1].value;
+        auto late_state = std::make_shared<GpuState>();
+        late_state->sh[P::COMPUTE_PGM_LO] = late_registers[0].value;
+        late_state->sh[P::COMPUTE_PGM_HI] = late_registers[1].value;
+        GpuState::Dispatch first_direct;
+        first_direct.threads_x = first_direct.threads_y = first_direct.threads_z = 1;
+        first_direct.command_order = 10;
+        first_direct.state = first_state;
+        GpuState::Dispatch late_direct = first_direct;
+        late_direct.command_order = 20;
+        late_direct.state = late_state;
+        direct_ordered.dispatches = {first_direct, late_direct};
+        uint32_t ordered_compute_calls = 0;
+        bool late_consumer_executed = false;
+        set_submit_compute([&](const std::vector<ComputeItem>& items) {
+            if (items.empty()) return false;
+            ++ordered_compute_calls;
+            if (items.front().code_addr == reinterpret_cast<uint64_t>(kNoopCs)) {
+                kOrderedLateCs[0] = 0xBF810000u;
+            } else if (items.front().code_addr ==
+                       reinterpret_cast<uint64_t>(kOrderedLateCs)) {
+                late_consumer_executed = true;
+            }
+            return true;
+        });
+        execute_ordered_and_present(direct_ordered, W, H, 1443, /*publish=*/false);
+        set_submit_compute({});
+        CHECK(ordered_compute_calls == 2 && late_consumer_executed,
+              "direct compute consumer is realized after its in-submit producer completes");
+        kOrderedLateCs[0] = 0u;
     }
 
     // Lazy realization can drop a semantic draw only after earlier spans have already executed.
