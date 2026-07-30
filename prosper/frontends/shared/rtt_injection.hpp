@@ -126,9 +126,10 @@ inline bool inject_rtt_pixels(std::vector<uint8_t>& dst, uint32_t dst_w, uint32_
 }
 
 // One immutable producer snapshot is commonly bound through the same scaled view by many draws and
-// bindings in a submit. Materialize each (snapshot identity, source shape, destination shape, stride)
-// only once. The retained source owner prevents allocator address reuse from aliasing a live key; the
-// retained output lets FrameResource copies and the backend's raw-pointer upload key share the bytes.
+// bindings in a submit. Materialize each (snapshot identity, source shape, destination shape,
+// bytes-per-pixel) only once. The retained source owner prevents allocator address reuse from aliasing
+// a live key; the retained output lets FrameResource copies and the backend's raw-pointer upload key
+// share the bytes.
 class RttInjectionCache {
 public:
     std::shared_ptr<const std::vector<uint8_t>> materialize(
