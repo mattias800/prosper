@@ -966,12 +966,6 @@ static bool open_folder_picker(SDL_Window* win) {
     return true;
 }
 
-// Whether a folder dialog is still outstanding.
-static bool folder_picker_open() {
-    std::lock_guard<std::mutex> lock(g_picked_mutex);
-    return g_picker_open;
-}
-
 // Take the path this process was started from. Each platform has its own authoritative answer;
 // argv[0] is only the fallback, since it is a valid execv target just when it carries a path and the
 // working directory has not moved.
@@ -1583,11 +1577,19 @@ int main(int argc, char** argv) {
         // picking again is exactly how the user recovers (it relaunches into a fresh process).
         {
             std::string picked;
-            { std::lock_guard<std::mutex> lock(g_picked_mutex); picked.swap(g_picked_path); }
+            bool pickerStillOpen = false;
+            // One critical section: the callback takes the same mutex, so it runs strictly before or
+            // strictly after this, and the "empty path but closed dialog" state cannot be observed
+            // while an answer is in flight.
+            {
+                std::lock_guard<std::mutex> lock(g_picked_mutex);
+                picked.swap(g_picked_path);
+                pickerStillOpen = g_picker_open;
+            }
 #ifdef PROSPER_HAVE_LIBRARY_UI
             // The dialog closed without an answer (cancelled, or it failed to open): disarm, or the
             // flag would still be set when some later, unrelated pick arrives.
-            if (libraryBrowsePending && picked.empty() && !folder_picker_open())
+            if (libraryBrowsePending && picked.empty() && !pickerStillOpen)
                 libraryBrowsePending = false;
             // The library asked for this folder, so its answer names a games DIRECTORY to remember, not
             // a title to boot. Without this the result went to open_game(), which resolves an app0 root

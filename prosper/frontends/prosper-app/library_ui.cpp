@@ -463,8 +463,8 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
         const int columns = library_columns_for_width(avail, kCellWidth);
         const int count = static_cast<int>(games_.size());
 
-        // Keyboard/controller selection. ImGui's own nav does not know about the grid, so movement is
-        // decided by the unit-tested rules and the scroll follows the selection.
+        // Selection. ImGui's own nav does not know about the grid, so movement is decided by the
+        // unit-tested rules in library_nav.hpp and the scroll follows the selection.
         // Keyboard only. Controller navigation is NOT implemented: ImGui's gamepad nav is off (it
         // fights these rules), and nothing initialises SDL's gamepad subsystem while the library is
         // alive — the pad backend does that inside start_guest, by which point the library is gone.
