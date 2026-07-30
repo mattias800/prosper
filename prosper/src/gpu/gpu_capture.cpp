@@ -3376,6 +3376,7 @@ bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
                 failure.index >= semantic_state->dispatches.size())
                 continue;
             const GpuState::Dispatch& dispatch = semantic_state->dispatches[failure.index];
+            if (failure.command_order != dispatch.command_order) continue;
             GpuState diagnostic_state = dispatch.state ? *dispatch.state : *semantic_state;
             diagnostic_state.dispatches.clear();
             diagnostic_state.dispatches.push_back(dispatch);
@@ -3387,11 +3388,16 @@ bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
                 stage.stage = ShaderProgramStage::Compute;
                 stage.program_addr = semantic_items.front().code_addr;
                 stage.resources = semantic_items.front().resources;
-                stage.recompiled = !semantic_items.front().spirv.empty();
                 failure.stages.push_back(std::move(stage));
             } else if (!semantic_failures.empty() &&
                        !semantic_failures.front().stages.empty()) {
-                failure.stages = std::move(semantic_failures.front().stages);
+                const ShaderRealizationDiagnostic& semantic_stage =
+                    semantic_failures.front().stages.front();
+                ShaderRealizationDiagnostic stage;
+                stage.stage = semantic_stage.stage;
+                stage.program_addr = semantic_stage.program_addr;
+                stage.resources = semantic_stage.resources;
+                failure.stages.push_back(std::move(stage));
             }
         }
     }

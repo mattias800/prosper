@@ -795,6 +795,11 @@ int main() {
         direct_dispatch.threads_x = direct_dispatch.threads_y = direct_dispatch.threads_z = 1;
         direct_dispatch.command_order = 17;
         nonrender.dispatches.push_back(direct_dispatch);
+        GpuState::Dispatch unresolved_dispatch;
+        unresolved_dispatch.indirect = true;
+        unresolved_dispatch.indirect_args_addr = 0xdead00000000ull;
+        unresolved_dispatch.command_order = 19;
+        nonrender.dispatches.push_back(unresolved_dispatch);
         const std::filesystem::path path =
             std::filesystem::temp_directory_path() / "prosper_nonrender_submit_capture.prgcap";
         std::error_code filesystem_error;
@@ -822,63 +827,75 @@ int main() {
 #endif
         GpuCaptureFile captured;
         std::string capture_error;
-        CHECK(executed && compute_calls == 1 &&
-                  read_gpu_capture(path.string(), captured, capture_error) &&
+        const bool captured_read = read_gpu_capture(path.string(), captured, capture_error);
+        const GpuCapturedOperationFailure* unresolved_failure = captured.failure_diagnostics.empty()
+            ? nullptr : &captured.failure_diagnostics.front();
+        const GpuCapturedStageDiagnostic* unresolved_stage = unresolved_failure &&
+            unresolved_failure->stages.size() == 1
+                ? &unresolved_failure->stages.front() : nullptr;
+        CHECK(executed && compute_calls == 1 && captured_read &&
                   captured.metadata.submit_index == 1441 && captured.computes.size() == 1 &&
                   captured.computes[0].code_addr == reinterpret_cast<uint64_t>(kNoopCs) &&
-                  captured.operations.size() == 1 && captured.operations[0].realized &&
+                  captured.operations.size() == 2 && captured.operations[0].realized &&
                   captured.operations[0].kind == SubmitOperationKind::Dispatch &&
-                  !captured.expected_output_valid,
-              "environment capture retains the exact executed direct-compute submit");
-        std::filesystem::remove(path, filesystem_error);
-
-        // A failed producer can leave an indirect dispatch's argument buffer empty before the
-        // selected operation is reached. The exact ordered trace correctly keeps that dispatch
-        // unrealized, but capture must still retain the program from its semantic register snapshot
-        // so the shader can be dumped and inspected without another title boot.
-        alignas(4) uint32_t unavailable_indirect_args[3] = {};
-        GpuState unresolved = nonrender;
-        unresolved.dispatches.clear();
-        GpuState::Dispatch unresolved_dispatch;
-        unresolved_dispatch.indirect = true;
-        unresolved_dispatch.indirect_args_addr =
-            reinterpret_cast<uint64_t>(unavailable_indirect_args);
-        unresolved_dispatch.command_order = 19;
-        unresolved.dispatches.push_back(unresolved_dispatch);
-        const std::vector<SubmitOperation> unresolved_operations = {
-            {SubmitOperationKind::Dispatch, 0, unresolved_dispatch.command_order},
-        };
-        auto unresolved_pending = std::make_unique<PendingGpuCapture>();
-        unresolved_pending->materialized = false;
-        unresolved_pending->path = path.string();
-        unresolved_pending->capture.metadata.submit_index = 1442;
-        const std::vector<DrawItem> no_draws;
-        const std::vector<ComputeItem> no_computes;
-        // Argument resolution failed before the ordered trace could populate the exact failure
-        // list. Capture must create and enrich the missing dispatch diagnostic itself.
-        const std::vector<OperationRealizationFailure> unresolved_failures;
-        const bool unresolved_written = finish_requested_gpu_capture(
-            std::move(unresolved_pending), {}, capture_error, &no_draws, &no_computes,
-            &unresolved_operations, &unresolved, &unresolved_failures);
-        GpuCaptureFile unresolved_capture;
-        const bool unresolved_read = unresolved_written &&
-            read_gpu_capture(path.string(), unresolved_capture, capture_error);
-        const GpuCapturedStageDiagnostic* unresolved_stage = unresolved_read &&
-            unresolved_capture.failure_diagnostics.size() == 1 &&
-            unresolved_capture.failure_diagnostics[0].stages.size() == 1
-                ? &unresolved_capture.failure_diagnostics[0].stages[0] : nullptr;
-        CHECK(unresolved_stage && unresolved_capture.computes.empty() &&
-                  unresolved_capture.operations.size() == 1 &&
-                  !unresolved_capture.operations[0].realized &&
-                  unresolved_capture.failure_diagnostics[0].reason ==
+                  captured.operations[0].source_index == 0 &&
+                  captured.operations[0].command_order == direct_dispatch.command_order &&
+                  !captured.operations[1].realized &&
+                  captured.operations[1].kind == SubmitOperationKind::Dispatch &&
+                  captured.operations[1].source_index == 1 &&
+                  captured.operations[1].command_order == unresolved_dispatch.command_order &&
+                  captured.failure_diagnostics.size() == 1 && unresolved_failure &&
+                  unresolved_failure->kind == SubmitOperationKind::Dispatch &&
+                  unresolved_failure->source_index == 1 &&
+                  unresolved_failure->command_order == unresolved_dispatch.command_order &&
+                  unresolved_failure->reason ==
                       RealizationFailureReason::Unknown &&
+                  unresolved_failure->compute_launch.groups_x == 0 &&
+                  unresolved_failure->compute_launch.groups_y == 0 &&
+                  unresolved_failure->compute_launch.groups_z == 0 &&
+                  unresolved_stage && !unresolved_stage->recompiled &&
                   unresolved_stage->stage == ShaderProgramStage::Compute &&
                   unresolved_stage->program_addr == reinterpret_cast<uint64_t>(kNoopCs) &&
                   unresolved_stage->raw_shader_index <
-                      unresolved_capture.raw_shader_versions.size() &&
-                  unresolved_capture.raw_shader_versions[unresolved_stage->raw_shader_index].words ==
-                      std::vector<uint32_t>(std::begin(kNoopCs), std::end(kNoopCs)),
-              "deferred capture retains the shader for an unresolved indirect dispatch");
+                      captured.raw_shader_versions.size() &&
+                  captured.raw_shader_versions[unresolved_stage->raw_shader_index].words ==
+                      std::vector<uint32_t>(std::begin(kNoopCs), std::end(kNoopCs)) &&
+                  !captured.expected_output_valid,
+              "ordered capture retains exact direct and unresolved indirect compute evidence");
+        std::filesystem::remove(path, filesystem_error);
+
+        // A partial exact trace can identify an operation whose source index happens to exist in
+        // the semantic state but whose command order does not. Never attach that other dispatch's
+        // program or resources to the exact failure.
+        constexpr uint64_t kMismatchedOrder = 20;
+        auto mismatched_pending = std::make_unique<PendingGpuCapture>();
+        mismatched_pending->materialized = false;
+        mismatched_pending->path = path.string();
+        mismatched_pending->capture.metadata.submit_index = 1442;
+        const std::vector<SubmitOperation> mismatched_operations = {
+            {SubmitOperationKind::Dispatch, 1, kMismatchedOrder},
+        };
+        const std::vector<OperationRealizationFailure> mismatched_failures = {
+            {SubmitOperationKind::Dispatch, 1, kMismatchedOrder,
+             RealizationFailureReason::Unknown},
+        };
+        const std::vector<DrawItem> no_draws;
+        const std::vector<ComputeItem> no_computes;
+        const bool mismatched_written = finish_requested_gpu_capture(
+            std::move(mismatched_pending), {}, capture_error, &no_draws, &no_computes,
+            &mismatched_operations, &nonrender, &mismatched_failures);
+        GpuCaptureFile mismatched_capture;
+        const bool mismatched_read = mismatched_written &&
+            read_gpu_capture(path.string(), mismatched_capture, capture_error);
+        CHECK(mismatched_read && mismatched_capture.operations.size() == 1 &&
+                  mismatched_capture.operations[0].source_index == 1 &&
+                  mismatched_capture.operations[0].command_order == kMismatchedOrder &&
+                  !mismatched_capture.operations[0].realized &&
+                  mismatched_capture.failure_diagnostics.size() == 1 &&
+                  mismatched_capture.failure_diagnostics[0].source_index == 1 &&
+                  mismatched_capture.failure_diagnostics[0].command_order == kMismatchedOrder &&
+                  mismatched_capture.failure_diagnostics[0].stages.empty(),
+              "semantic stage enrichment requires exact dispatch command-order identity");
         std::filesystem::remove(path, filesystem_error);
 
         // Vulkan guarantees only 65,535 workgroups per axis, but real devices may advertise more
