@@ -270,6 +270,7 @@ struct TypeInfo {
     uint32_t width = 0;
     uint32_t storage = 0;
     uint32_t image_sampled = 0;
+    uint32_t image_format = 0;
     uint32_t image_dim = 0xFFFFFFFFu;
     bool image_arrayed = false;
     bool image_depth = false;
@@ -541,6 +542,7 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
                     t.image_arrayed = word(in, 4) != 0;
                     t.image_multisampled = word(in, 5) != 0;
                     t.image_sampled = word(in, 6);
+                    t.image_format = word(in, 7);
                     types[word(in, 0)] = t;
                 }
                 break;
@@ -757,12 +759,14 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         auto si = sets.find(var), bi = bindings.find(var);
         if (si == sets.end() || bi == bindings.end()) { add_malformed(report); continue; }
         uint32_t image_dim = UINT32_MAX;
+        uint32_t image_format = 0;
         bool image_arrayed = false, image_multisampled = false, image_depth = false;
         auto vi = variables.find(var);
         const TypeInfo* image = vi == variables.end()
             ? nullptr : descriptor_image_type(vi->second, types);
         if (image) {
             image_dim = image->image_dim;
+            image_format = image->image_format;
             image_arrayed = image->image_arrayed;
             image_multisampled = image->image_multisampled;
             image_depth = image->image_depth;
@@ -772,7 +776,7 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
                                       written_vars.count(var) != 0,
                                       normalized_sample_vars.count(var) != 0,
                                       texel_access_vars.count(var) != 0,
-                                      storage_float_vars.count(var) != 0, image_dim,
+                                      storage_float_vars.count(var) != 0, image_format, image_dim,
                                       image_arrayed, image_multisampled, image_depth,
                                       atomic_vars.count(var) != 0});
     }

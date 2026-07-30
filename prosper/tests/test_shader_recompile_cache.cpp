@@ -544,6 +544,62 @@ int main() {
               stats.misses == 3 && stats.hits == 1 && stats.entries == 3,
           "compute cache separates device-gated typed storage from the raw fallback and sRGB state");
 
+    // The device-independent R11G11B10 path is an explicit A/B contract: enabled modules use one
+    // typed R32ui word per texel, while the recovery switch restores formatless uvec4 conversion.
+    clear_shader_recompile_cache();
+    static const uint32_t kPackedStorageCompute[] = {
+        0x7e080300u, 0x7e0a0280u,
+        0xf0000f08u, 0x00000004u, 0xbf8c3f70u,
+        0xf0200f08u, 0x00020004u, 0xbf810000u,
+    };
+    ShaderResourceTable packed_storage_table;
+    for (uint32_t i = 0; i < 2; ++i) {
+        ShaderResource image;
+        image.cls = ResourceClass::StorageImage;
+        image.format = DataFormat::Float10_11_11;
+        image.num_components = 3;
+        image.img_dim = 1;
+        image.width = 64;
+        image.height = image.depth = 1;
+        image.size = 64 * sizeof(uint32_t);
+        image.binding = 4 + i;
+        image.sgpr_base = i * 8;
+        packed_storage_table.resources.push_back(image);
+    }
+    ComputeShaderConfig packed_storage_config;
+    packed_storage_config.user_sgprs.resize(16);
+    packed_storage_config.local_x = 64;
+    uint64_t packed_storage_identity = 0;
+    const auto packed_storage = recompile_compute_shader_cached(
+        kPackedStorageCompute, std::size(kPackedStorageCompute), &packed_storage_table,
+        packed_storage_config, &packed_storage_identity);
+    packed_storage_config.packed_r11_storage = false;
+    uint64_t converted_storage_identity = 0;
+    const auto converted_storage = recompile_compute_shader_cached(
+        kPackedStorageCompute, std::size(kPackedStorageCompute), &packed_storage_table,
+        packed_storage_config, &converted_storage_identity);
+    packed_storage_config.packed_r11_storage = true;
+    uint64_t repeated_packed_storage_identity = 0;
+    const auto repeated_packed_storage = recompile_compute_shader_cached(
+        kPackedStorageCompute, std::size(kPackedStorageCompute), &packed_storage_table,
+        packed_storage_config, &repeated_packed_storage_identity);
+    const auto packed_storage_report = validate_spirv_descriptor_interface(
+        packed_storage, &packed_storage_table, 0, SpirvShaderStage::Compute, false);
+    const auto converted_storage_report = validate_spirv_descriptor_interface(
+        converted_storage, &packed_storage_table, 0, SpirvShaderStage::Compute, false);
+    stats = shader_recompile_cache_stats();
+    CHECK(!packed_storage.empty() && !converted_storage.empty() &&
+              packed_storage != converted_storage && repeated_packed_storage == packed_storage &&
+              packed_storage_identity != 0 && converted_storage_identity != 0 &&
+              packed_storage_identity != converted_storage_identity &&
+              repeated_packed_storage_identity == packed_storage_identity &&
+              packed_storage_report.descriptors.size() == 2 &&
+              packed_storage_report.descriptors[0].storage_image_format == kSpirvImageFormatR32ui &&
+              converted_storage_report.descriptors.size() == 2 &&
+              converted_storage_report.descriptors[0].storage_image_format == 0 &&
+              stats.misses == 2 && stats.hits == 1 && stats.entries == 2,
+          "compute cache separates exact packed R11 storage from its raw conversion recovery path");
+
     // Compute image atomics embed the runtime R32_UINT extent in the linearized SSBO index and
     // bounds guard. Reusing a module across extents would retain a stale row stride or bounds.
     clear_shader_recompile_cache();
