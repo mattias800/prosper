@@ -127,6 +127,10 @@ int main() {
               "native R8 sampled upload broadcasts its channel without RGBA expansion");
         CHECK(prosper::test::backend_color_bytes_per_pixel(VK_FORMAT_R8_UNORM) == 1,
               "native R8 upload accounts one byte per texel");
+        CHECK(prosper::test::backend_color_format(VK_FORMAT_R8G8_UNORM) ==
+                  VK_FORMAT_R8G8_UNORM &&
+                  prosper::test::backend_color_bytes_per_pixel(VK_FORMAT_R8G8_UNORM) == 2,
+              "native RG8 upload retains two channels and accounts two bytes per texel");
         CHECK(prosper::test::backend_color_format(VK_FORMAT_R32_UINT) == VK_FORMAT_R32_UINT &&
                   prosper::test::backend_color_bytes_per_pixel(VK_FORMAT_R32_UINT) == 4,
               "R32_UINT storage images retain their typed four-byte Vulkan format");
@@ -201,6 +205,31 @@ int main() {
         prosper::test::BackendDraw draw;
         draw.vs = vert; draw.fs = frag; draw.R = {resource}; draw.vcount = 3;
 
+        // A first upload is published to the persistent map while its command buffer is merely
+        // queued, so a discarded batch must invalidate that speculative image. Retrying the same
+        // version must upload again rather than sampling undefined contents as an exact-version hit.
+        prosper::test::FrameResource failed_resource = resource;
+        failed_resource.persistent_texture_id = 0x70200000000000f1ull;
+        failed_resource.persistent_texture_version = 1;
+        prosper::test::BackendDraw failed_draw = draw;
+        failed_draw.R = {failed_resource};
+        constexpr uint64_t failed_target_id = 0x75900000000000f1ull;
+        prosper::test::BackendColorTarget failed_target{failed_target_id, false, false};
+        prosper::test::BackendSubmissionBatch failed_batch;
+        const std::vector<uint8_t> failed_pending = prosper::test::render_draws_rgba(
+            {failed_draw}, W, H, nullptr, nullptr, false, &failed_target,
+            nullptr, nullptr, nullptr, &failed_batch, false);
+        failed_batch.discard();
+        failed_batch.complete();
+        const std::vector<uint8_t> failed_retry = prosper::test::render_draws_rgba(
+            {failed_draw}, W, H);
+        const auto failed_retry_stats = prosper::test::backend_texture_upload_stats();
+        CHECK(failed_pending.empty() && !failed_batch.pending() &&
+                  failed_retry_stats.persistent_misses == 1 &&
+                  failed_retry_stats.unique_uploads == 1 && !failed_retry.empty(),
+              "a discarded first versioned upload is rebuilt before reuse");
+        prosper::test::invalidate_persistent_color_target(failed_target_id);
+
         std::vector<uint8_t> first = prosper::test::render_draws_rgba({draw}, W, H);
         const auto first_stats = prosper::test::backend_texture_upload_stats();
         std::vector<uint8_t> reused = prosper::test::render_draws_rgba({draw}, W, H);
@@ -261,7 +290,27 @@ int main() {
         std::memcpy(changed_texels, texels, sizeof(texels));
         changed_texels[4] = 255;  // sampled top-right texel: green -> yellow
         resource.tex_rgba = changed_texels;
+        resource.persistent_texture_version = 1;
+        draw.R = {resource};
+        std::vector<uint8_t> refreshed = prosper::test::render_draws_rgba({draw}, W, H);
+        const auto refreshed_stats = prosper::test::backend_texture_upload_stats();
+        std::vector<uint8_t> refreshed_reuse = prosper::test::render_draws_rgba({draw}, W, H);
+        const auto refreshed_reuse_stats = prosper::test::backend_texture_upload_stats();
+        CHECK(refreshed_stats.persistent_misses == 1 &&
+                  refreshed_stats.unique_uploads == 1 &&
+                  refreshed_stats.persistent_cached_bytes == reused_stats.persistent_cached_bytes,
+              "a newer validated version refreshes its existing persistent image allocation");
+        CHECK(refreshed_reuse_stats.persistent_hits == 1 &&
+                  refreshed_reuse_stats.unique_uploads == 0 &&
+                  refreshed_reuse_stats.persistent_cached_bytes ==
+                      reused_stats.persistent_cached_bytes,
+              "the refreshed version skips its next callback upload without growing the cache");
+        CHECK(!refreshed.empty() && refreshed != reused && refreshed == refreshed_reuse,
+              "versioned persistent refresh renders changed pixels and then reuses them exactly");
+
+        resource.tex_rgba = changed_texels;
         resource.persistent_texture_id = 0x7020000000000002ull;
+        resource.persistent_texture_version = 0;
         draw.R = {resource};
         std::vector<uint8_t> changed = prosper::test::render_draws_rgba({draw}, W, H);
         const auto changed_stats = prosper::test::backend_texture_upload_stats();
