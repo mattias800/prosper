@@ -1848,7 +1848,7 @@ int main() {
                 prosper::host::guest_write_watch_set_fault_onstack(true);
                 prosper::host::guest_write_watch_notify_direct_mapping_added(
                     reinterpret_cast<uint64_t>(import_guest), import_mapping_bytes,
-                    0x7c0000, 0x3 /* SCE CPU_READ|CPU_WRITE */);
+                    0x7e0000, 0x3 /* SCE CPU_READ|CPU_WRITE */);
                 ShaderResourceTable import_rt = fill_rt;
                 ShaderResource& import_dst = import_rt.resources.back();
                 import_dst.gpu_addr = reinterpret_cast<uint64_t>(import_guest);
