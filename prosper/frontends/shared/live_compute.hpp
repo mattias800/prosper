@@ -98,6 +98,10 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
 // mapping/scan. Exposed so the production-backend test can prove that optimization path executes.
 uint64_t live_compute_buffer_gpu_result_skips();
 
+// Deterministic failure injection for the storage-image recovery regression test. The next storage
+// readback fails after dispatch, exercising retained-image invalidation without a Vulkan fault.
+void live_compute_fail_next_storage_readback_for_test();
+
 // Register the synchronous Vulkan compute backend used by AGC submit processing.
 void register_live_compute();
 

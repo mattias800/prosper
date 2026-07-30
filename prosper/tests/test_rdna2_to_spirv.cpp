@@ -710,6 +710,32 @@ int main() {
     CHECK(got18b.size()==N && bad18b==0,
           "kernel 18b saves EXEC, applies ~VCC, and restores the original mask");
 
+    // Astro Bot's world-map material PS uses the exact gfx1030 ORN2 form with VCC as the saved
+    // destination. Start with EXEC=M, deliberately replace VCC with !M, then ORN2-save through an
+    // all-on source: the operation must save M back into VCC and widen EXEC to all lanes. The first
+    // write therefore reaches everyone; restoring EXEC from VCC restricts the second write to M.
+    const uint32_t code18c[] = {
+        0x7e000f00u, 0x7e020f01u, 0x7e060280u, 0x7d880300u,
+        0xbe82246au, 0xbeea086au, 0xbeea2802u, 0x7e060285u,
+        0xbefe046au, 0x7e060287u, 0xbefe0402u, 0x7e060d03u,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv18c = recompile_valu(
+        code18c, std::size(code18c), 2, /*out_vgpr*/3);
+    CHECK(!spv18c.empty(),
+          "recompiled kernel 18c (Astro s_orn2_saveexec_b64 VCC form) -> SPIR-V");
+    std::vector<float> exp18c(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        const uint32_t u0 = i % 17, u1 = i % 13;
+        exp18c[i] = (u0 > u1) ? 7.0f : 5.0f;
+    }
+    std::vector<float> got18c = prosper::test::run_compute(spv18c, in18, N, N);
+    uint32_t bad18c = 0;
+    for (uint32_t i=0;i<N&&got18c.size()==N;i++)
+        if (std::fabs(got18c[i]-exp18c[i])>1e-3f) ++bad18c;
+    CHECK(got18c.size()==N && bad18c==0,
+          "kernel 18c widens EXEC with S0|~EXEC and saves the old mask into VCC");
+
     // Kernel 19: scalar s_bfe_u32. s0=0xF0; s1=bfe_u(s0, off=4,width=4)=(0xF0>>4)&0xF=0xF=15;
     // v2=(float)s1; out = a0 + 15. Proves scalar bitfield-extract (a top real-shader blocker).
     const uint32_t code19[] = {
@@ -4513,6 +4539,23 @@ int main() {
         if (gb != bits_of(inX[i]) + 15u) badA2++;
     }
     CHECK(gotA2.size()==N && badA2==0, "A2: s_lshl4_add_u32 SCC = full 64-bit carry (1 then 0)");
+
+    // Astro world-map PC1918: s_lshl1_add_u32 uses the same full-width carry rule. A high bit in
+    // 0x80000000<<1 carries out -> 11; 2<<1+1 stays in range -> 4. out = bits+15.
+    const uint32_t codeA2Astro[] = { 0xbe8103ffu, 0x80000000u, 0x97028101u, 0x8503848bu,
+                                 0xbe810382u, 0x97028101u, 0x8504848bu,
+                                 0x4a020003u, 0x4a020204u, 0xBF810000u };
+    std::vector<uint32_t> spvA2Astro = recompile_valu(
+        codeA2Astro, std::size(codeA2Astro), 1, 1);
+    CHECK(!spvA2Astro.empty(), "recompiled Astro s_lshl1_add_u32 carry kernel -> SPIR-V");
+    std::vector<float> gotA2Astro = prosper::test::run_compute(spvA2Astro, inX, N, N);
+    uint32_t badA2Astro = 0;
+    for (uint32_t i = 0; i < N && gotA2Astro.size() == N; i++) {
+        uint32_t gb; std::memcpy(&gb, &gotA2Astro[i], 4);
+        if (gb != bits_of(inX[i]) + 15u) badA2Astro++;
+    }
+    CHECK(gotA2Astro.size()==N && badA2Astro==0,
+          "Astro s_lshl1_add_u32 SCC = full 64-bit carry (1 then 0)");
 
     // A2b (#1390): exercise the complete gfx10 s_lshl{1,2,3,4}_add_u32 opcode family. Each
     // instruction computes (1 << N) + 1 without carry; sum 3+5+9+17 = 34. The first word is the

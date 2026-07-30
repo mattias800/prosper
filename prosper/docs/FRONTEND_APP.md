@@ -133,6 +133,50 @@ The idle window paints a flat colour through the ordinary `present_frame` path r
 undefined swapchain contents on screen, and stops as soon as `present_frame_seq()` shows anything has
 been published. Those frames do not count toward `--frames`, which asserts real content.
 
+## The game library (#1471)
+
+Stage 1 adds the data behind a library view — and the app's first **persistent user state**.
+
+```
+--games-dir  ─┐
+PROSPER_GAMES_DIR ─┼─> resolve_games_dir ─> scan_game_library ─> [GameEntry]  ─> --list-games
+config file  ─┘        (app_config.hpp)      (game_library.hpp)                  and, later, a grid
+```
+
+Both headers are pure with injected filesystem IO, so the scan, the param.json metadata reading, and the
+settings precedence are unit-tested in the default core build — no window, no ImGui, no real dump. They
+live under `frontends/`, header-only, and `prosper_core` is untouched: the dependency arrow above is
+unchanged.
+
+Design points that are deliberate rather than incidental:
+
+- **Precedence is `--games-dir` > `PROSPER_GAMES_DIR` > persisted setting.** The persisted value exists
+  only so a GUI user is not asked for a folder every launch; it must never override a command line. This
+  keeps the project's existing convention (a `PROSPER_*` override in front of a default) authoritative.
+- **Persistence is only ever explicit** (`--set-games-dir`). Nothing infers a library location from a
+  folder the user happened to open — that inference is wrong as often as right, and being wrong points
+  the library somewhere the user never chose.
+- **Unknown settings are carried through a rewrite.** `--set-games-dir` rewrites the whole file, so
+  tolerating unknown keys on *read* is not enough: without preserving them, a release build would delete
+  whatever a newer build had stored.
+- **`scan_game_library` reuses `resolve_app0_root()`** from the interactive-open path above, so all three
+  entry points agree on what a title is. The listing is "what a drop or the picker would accept", which
+  is not identical to "will boot" — the gate accepts `sce_sys/param.json` alone.
+- **`--list-games` is the headless contract:** tab-separated records on stdout, commentary on stderr,
+  exit 0 / 1 (empty) / 2 (unset or not a directory), and it returns before any window or Vulkan exists.
+
+`param.json` name selection is worth knowing about, because it was silently wrong before this work. The
+display name is the entry for the dump's own `defaultLanguage`, and the language object is located by
+*shape* — `"lang"` followed by `:` then `{` — anchored inside `localizedParameters` and bounded to that
+object. The previous logic required the object to appear textually before the `"defaultLanguage"` line,
+which fails on dumps that declare the default first: the first match is then defaultLanguage's own
+*value*, and the fallback returned whichever language came first in the file. The Plucky Squire
+(PPSA15319) read as "DER KÜHNE KNAPPE". The same function drives the window title, so that was wrong
+there too.
+
+Stage 2 vendors Dear ImGui under `third_party/` (frontend-only) and draws the grid and a settings view on
+top of this data.
+
 ## The Vulkan-context decision: two contexts, one shared CPU frame
 
 **The frontend owns its own Vulkan context (instance + device + swapchain on the window surface).

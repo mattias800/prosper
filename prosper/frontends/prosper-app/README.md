@@ -93,6 +93,57 @@ game after a failure is still fine — it just goes to a fresh process, same as 
 This is the *user* opening a game they chose. It does not change what a **guest** can ask for: the SDL
 dialog backend below still never lets a title open a host file picker or see a host path.
 
+## The game library
+
+Point the app at a directory holding your titles and it can enumerate them — content id, display name,
+and cover icon — instead of asking for a folder every time.
+
+```bash
+./build-app/prosper-app --list-games --games-dir /path/to/games
+#   PPSA13579	Blasphemous 2	/path/to/games/PPSA13579-app0
+#   PPSA24651	The Messenger	/path/to/games/PPSA24651-app0
+
+./build-app/prosper-app --set-games-dir /path/to/games   # remember it for next time
+```
+
+`--list-games` writes one tab-separated record per line — content id, display name, app0 path — to
+**stdout**, with everything explanatory on stderr, so a script or an agent can consume it directly. It
+exits 0 when it found titles, 1 when the directory held none, and 2 when the directory is unset or is
+not a directory. It never opens a window, initializes Vulkan, or boots a guest.
+
+Split records on tabs rather than whitespace: the first field is **empty** for a title with no
+readable `param.json`, and display names contain spaces.
+
+Where the directory comes from, highest priority first:
+
+1. `--games-dir <path>`
+2. `PROSPER_GAMES_DIR` in the environment
+3. the persisted setting, written by `--set-games-dir`
+
+Persistence exists only so someone who chose a folder in the GUI is not asked again next launch; it
+never overrides what a command line or a script asked for. The settings file lives at
+`$XDG_CONFIG_HOME/prosper/prosper-app.conf` (falling back to `~/.config/prosper/`, and `%APPDATA%\prosper\`
+on Windows), overridable with `PROSPER_APP_CONFIG`. It is a plain `key = value` file you can edit by
+hand. Settings a build does not recognize are carried through unchanged when it rewrites the file, so an
+older build will not delete a newer build's settings — but comments are not preserved, since the app
+regenerates its own header.
+
+The scan looks **one level deep** and accepts a child directory as a title when
+`resolve_app0_root()` does — the same test the drop and picker paths use. A title's own asset
+subdirectories are therefore never mistaken for separate games, and the games directory itself is not
+considered even when it happens to be a title root (use `--dump` or the picker for one specific game).
+Names come from `sce_sys/param.json`, preferring the entry for the dump's own `defaultLanguage`; a title
+with no readable metadata still appears, named after its directory, since the name is presentation and
+`boot_program` only needs `eboot.bin`.
+
+The listing is therefore "what the drop and picker paths would accept", not a guarantee that every entry
+boots: that gate accepts `sce_sys/param.json` on its own, so a metadata-only folder with no `eboot.bin`
+is listed and will fail when opened. Keeping one definition of "is this a title" across all three entry
+points is worth more than pre-filtering the list.
+
+The library **view** — a grid with cover art, and a settings screen — is stage 2 of #1471 and not in
+this build; the data and the command-line surface are.
+
 ## Options
 
 - `--dump <app0>` — boot and display the PS5 title at this app0 directory (positional path also works).
@@ -102,6 +153,11 @@ dialog backend below still never lets a title open a host file picker or see a h
 - `--pick` — open the host folder picker at startup even though arguments were given. Ignored when the
   run already has a game (`--dump`/positional) or `--test-pattern`.
 - `--no-pick` — never open the picker at startup, including on a no-argument launch. Wins over `--pick`.
+- `--games-dir <path>` — where your PS5 titles live, for this run only. See "The game library" above.
+  A missing or empty path is an error (exit 2).
+- `--set-games-dir <path>` — record that directory for future launches, then exit. An empty path
+  (`--set-games-dir ""`) clears the stored setting; a missing one is an error (exit 2).
+- `--list-games` — print the library as plain text and exit, with no window, no Vulkan and no guest.
 - `--frames N` — present N frames then exit 0 (non-interactive smoke; exit 1 if it couldn't).
 - `--present-mode fifo|mailbox|immediate` — choose swapchain latency behavior. FIFO is the default;
   mailbox is low-latency vsync, and immediate may tear. Unsupported optional modes fall back to FIFO.

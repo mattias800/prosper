@@ -87,6 +87,28 @@ bool has_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
     return false;
 }
 
+bool has_select_with_false_constant(const std::vector<uint32_t>& spv, uint32_t literal) {
+    constexpr uint32_t OpConstant = 43, OpSelect = 169;
+    std::unordered_set<uint32_t> matching_constants;
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpConstant && wc == 4 && spv[i + 3] == literal)
+            matching_constants.insert(spv[i + 2]);
+        i += wc;
+    }
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        // OpSelect {result-type, result, condition, true-object, false-object}.
+        if (op == OpSelect && wc == 6 && matching_constants.contains(spv[i + 5]))
+            return true;
+        i += wc;
+    }
+    return false;
+}
+
 bool has_explicit_lod_constant(const std::vector<uint32_t>& spv, uint32_t expected) {
     constexpr uint32_t OpConstant = 43, OpImageSampleExplicitLod = 88, OpBitcast = 124;
     constexpr uint32_t ImageOperandsLod = 0x2;
@@ -186,6 +208,37 @@ bool binary_id_operands_are_nonzero(const std::vector<uint32_t>& spv, uint32_t o
         i += wc;
     }
     return true;
+}
+
+// ANDN1_SAVEEXEC must compute old_EXEC & ~source.  With source=false, the emitted boolean graph
+// therefore contains LogicalNot(false) as an operand of LogicalAnd.  The formerly reversed
+// lowering (~old_EXEC & source) instead fed false directly to the AND and silently killed all lanes.
+bool logical_not_of_false_feeds_and(const std::vector<uint32_t>& spv) {
+    constexpr uint32_t OpConstantFalse = 42, OpLogicalAnd = 167, OpLogicalNot = 168;
+    uint32_t false_id = 0;
+    std::unordered_map<uint32_t, uint32_t> logical_not_sources;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpConstantFalse && wc == 3) false_id = spv[i + 2];
+        if (op == OpLogicalNot && wc == 4)
+            logical_not_sources[spv[i + 2]] = spv[i + 3];
+        i += wc;
+    }
+    if (!false_id) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpLogicalAnd && wc == 5) {
+            const auto left = logical_not_sources.find(spv[i + 3]);
+            const auto right = logical_not_sources.find(spv[i + 4]);
+            if ((left != logical_not_sources.end() && left->second == false_id) ||
+                (right != logical_not_sources.end() && right->second == false_id))
+                return true;
+        }
+        i += wc;
+    }
+    return false;
 }
 
 bool phi_ids_are_nonzero(const std::vector<uint32_t>& spv) {
@@ -334,6 +387,15 @@ int main() {
     }
     printf("  [ok]   registered Wave32 fragment EXEC_LO/VCC_LO mask moves emit valid SPIR-V\n");
 
+    if (fragment_effective_wave_size_for_test(
+            64, 3142, 0x616dd4c0b241fbb1ull) != 32 ||
+        fragment_effective_wave_size_for_test(
+            64, 3142, 0x616dd4c0b241fbb0ull) != 64) {
+        printf("  [FAIL] legacy Astro Wave32 capture did not select one coherent subgroup contract\n");
+        return 1;
+    }
+    printf("  [ok]   legacy Astro Wave32 capture selects a 32-lane subgroup and mask contract\n");
+
     const uint32_t wave32_compute_masks[] = {
         0xbe80037eu,                         // s_mov_b32 s0, exec_lo
         0xbeea037eu,                         // s_mov_b32 vcc_lo, exec_lo
@@ -372,6 +434,305 @@ int main() {
         return 1;
     }
     printf("  [ok]   Wave32 fragment s_wqm_b32 mask path emits valid SPIR-V\n");
+
+    // Exact Astro world-map PC1060..1064 shape. LLVM gfx1030 disassembly identifies the compare as
+    // `v_cmp_eq_f32_sdwa vcc_hi, 0, v7`; in Wave32 that explicit one-word destination is an
+    // independent saved mask consumed by s_andn2_b32 before WQM restores EXEC_LO.
+    const uint32_t wave32_fragment_b32_logic[] = {
+        0xbec0037eu,                         // s_mov_b32 s64, exec_lo
+        0x7e0e0280u,                         // v_mov_b32 v7, 0
+        0x7c040ef9u, 0x0686eb80u,            // v_cmp_eq_f32_sdwa vcc_hi, 0, v7
+        0x8a406b40u,                         // s_andn2_b32 s64, s64, vcc_hi
+        0xbf840008u,                         // s_cbranch_scc0 -> terminal null-export tail
+        0xbefe0940u,                         // s_wqm_b32 exec_lo, s64
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+        0xbefe0380u,                         // tail: s_mov_b64 exec, 0
+        0xf8001c00u, 0x00000000u,            // exp null off, off, off, off done vm
+        0xbf810000u,
+    };
+    const auto wave32_fragment_b32_logic_spv = recompile_fragment_wave32_for_test(
+        wave32_fragment_b32_logic, std::size(wave32_fragment_b32_logic));
+    if (wave32_fragment_b32_logic_spv.empty() ||
+        !has_opcode(wave32_fragment_b32_logic_spv, 335) ||
+        fragment_spirv_required_subgroup_size(wave32_fragment_b32_logic_spv) != 32 ||
+        !type_result_ids_are_nonzero(wave32_fragment_b32_logic_spv, nullptr) ||
+        !phi_ids_are_nonzero(wave32_fragment_b32_logic_spv)) {
+        printf("  [FAIL] Wave32 VCC_HI compare/B32 mask logic did not recompile cleanly "
+               "(words=%zu vote=%d marker=%d subgroup=%u)\n",
+               wave32_fragment_b32_logic_spv.size(),
+               has_opcode(wave32_fragment_b32_logic_spv, 335),
+               has_opcode(wave32_fragment_b32_logic_spv, 330),
+               fragment_spirv_required_subgroup_size(wave32_fragment_b32_logic_spv));
+        return 1;
+    }
+    printf("  [ok]   Wave32 B32 alpha-test vote linearizes its terminal null-export branch\n");
+
+    const auto wave32_mask_branches = mask_test_branches_for_test(
+        wave32_fragment_b32_logic, std::size(wave32_fragment_b32_logic), true);
+    bool found_mask_branch = false;
+    for (const uint32_t pc : wave32_mask_branches)
+        if (pc == 5) found_mask_branch = true;
+    if (!found_mask_branch) {
+        printf("  [FAIL] proven Wave32 B32 mask vote was not recognized at PC5\n");
+        return 1;
+    }
+    const uint32_t wave32_scalar_scc_branch[] = {
+        0x87008104u,                         // s_and_b32 s0, s4, 1 (ordinary scalar data)
+        0xbf840002u,                         // s_cbranch_scc0
+        0xbf810000u,
+    };
+    if (!mask_test_branches_for_test(wave32_scalar_scc_branch,
+                                     std::size(wave32_scalar_scc_branch), true).empty()) {
+        printf("  [FAIL] ordinary Wave32 scalar SCC branch was mistaken for a mask vote\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 branch linearization requires proven mask provenance\n");
+
+    // A wide scalar write kills every physical SGPR word it covers. Keep the compare in s1
+    // deliberately adjacent to s0: if s_mov_b64 only invalidates its low word, the stale s1 mask
+    // provenance infects the ordinary s_and_b32 and makes its real SCC branch look disposable.
+    const uint32_t wave32_mask_overwritten_by_b64[] = {
+        0x7d865cf9u, 0x06868104u,            // v_cmp_le_u32_sdwa s1, s4, v46
+        0xbe800480u,                         // s_mov_b64 s[0:1], 0
+        0x87008101u,                         // s_and_b32 s0, s1, 1 (ordinary scalar data)
+        0xbf840002u,                         // s_cbranch_scc0
+        0xbf810000u,
+    };
+    if (!mask_test_branches_for_test(wave32_mask_overwritten_by_b64,
+                                     std::size(wave32_mask_overwritten_by_b64), true).empty()) {
+        printf("  [FAIL] B64 scalar overwrite retained stale high-word mask provenance\n");
+        return 1;
+    }
+    printf("  [ok]   B64 scalar writes invalidate every covered Wave32 mask word\n");
+
+    const uint32_t wave32_mask_overwritten_by_saveexec[] = {
+        0x7d865cf9u, 0x06868104u,            // v_cmp_le_u32_sdwa s1, s4, v46
+        0xbe802680u,                         // s_xor_saveexec_b64 s[0:1], 0
+        0x87008101u,                         // s_and_b32 s0, s1, 1 (ordinary scalar data)
+        0xbf840002u,                         // s_cbranch_scc0
+        0xbf810000u,
+    };
+    if (!mask_test_branches_for_test(wave32_mask_overwritten_by_saveexec,
+                                     std::size(wave32_mask_overwritten_by_saveexec), true).empty()) {
+        printf("  [FAIL] B64 SAVEEXEC overwrite retained stale high-word mask provenance\n");
+        return 1;
+    }
+    printf("  [ok]   every supported B64 SAVEEXEC form has a two-word write lifetime\n");
+
+    // The compare executes only on the fall-through predecessor. At the join, s1 is not proven to
+    // be a mask on every path, so the following scalar SCC branch must remain real control flow.
+    const uint32_t wave32_path_dependent_branch_mask[] = {
+        0xbf060000u,                         // s_cmp_eq_u32 s0, s0
+        0xbf840002u,                         // s_cbranch_scc0 -> join at PC4
+        0x7d865cf9u, 0x06868104u,            // v_cmp_le_u32_sdwa s1, s4, v46
+        0x87008101u,                         // join: s_and_b32 s0, s1, 1
+        0xbf840002u,                         // real s_cbranch_scc0
+        0xbf810000u,
+    };
+    if (!mask_test_branches_for_test(wave32_path_dependent_branch_mask,
+                                     std::size(wave32_path_dependent_branch_mask), true).empty()) {
+        printf("  [FAIL] path-dependent B32 mask provenance escaped its predecessor block\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 mask-branch proof does not cross control-flow joins\n");
+
+    // The same live shader selects EXEC_LO or an empty mask into VCC_HI from an ordinary scalar
+    // comparison. This is s_cselect_b32's mask-domain form, not a scalar integer selection.
+    const uint32_t wave32_fragment_b32_cselect[] = {
+        0xbec0037eu,                         // s_mov_b32 s64, exec_lo
+        0xbf060000u,                         // s_cmp_eq_u32 s0, s0
+        0x856b807eu,                         // s_cselect_b32 vcc_hi, exec_lo, 0
+        0x8a406b40u,                         // s_andn2_b32 s64, s64, vcc_hi
+        0xbefe0940u,                         // s_wqm_b32 exec_lo, s64
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    const auto wave32_fragment_b32_cselect_spv = recompile_fragment_wave32_for_test(
+        wave32_fragment_b32_cselect, std::size(wave32_fragment_b32_cselect));
+    if (wave32_fragment_b32_cselect_spv.empty() ||
+        fragment_spirv_required_subgroup_size(wave32_fragment_b32_cselect_spv) != 32 ||
+        !type_result_ids_are_nonzero(wave32_fragment_b32_cselect_spv, nullptr) ||
+        !phi_ids_are_nonzero(wave32_fragment_b32_cselect_spv)) {
+        printf("  [FAIL] Wave32 s_cselect_b32 did not preserve its VCC_HI mask result\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 s_cselect_b32 preserves its selected VCC_HI mask\n");
+
+    // Explicit Wave32 VOPC destinations are one-word masks even when they name ordinary SGPRs.
+    // The live barycentric block compares into s0 and VCC_HI, writes an independent carry mask to
+    // VCC_LO, then ANDs s0 and the still-live VCC_HI mask back into VCC_LO.
+    const uint32_t wave32_fragment_explicit_vopc_masks[] = {
+        0x7d8654f9u, 0x06868004u,            // v_cmp_le_u32_sdwa s0, s4, v42
+        0x7d865cf9u, 0x0686eb04u,            // v_cmp_le_u32_sdwa vcc_hi, s4, v46
+        0xd5286a29u, 0x00025880u,            // v_add_co_ci_u32 v41, vcc_lo, 0, v44, s0
+        0x876a6b00u,                         // s_and_b32 vcc_lo, s0, vcc_hi
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    const auto wave32_fragment_explicit_vopc_masks_spv = recompile_fragment_wave32_for_test(
+        wave32_fragment_explicit_vopc_masks,
+        std::size(wave32_fragment_explicit_vopc_masks));
+    if (wave32_fragment_explicit_vopc_masks_spv.empty() ||
+        !has_opcode(wave32_fragment_explicit_vopc_masks_spv, 335) ||
+        fragment_spirv_required_subgroup_size(wave32_fragment_explicit_vopc_masks_spv) != 32 ||
+        !type_result_ids_are_nonzero(wave32_fragment_explicit_vopc_masks_spv, nullptr) ||
+        !phi_ids_are_nonzero(wave32_fragment_explicit_vopc_masks_spv)) {
+        printf("  [FAIL] explicit Wave32 VOPC SGPR destinations lost their B32 mask domain\n");
+        return 1;
+    }
+    printf("  [ok]   explicit Wave32 VOPC SGPR destinations feed B32 mask logic\n");
+
+    // A VOPC write to s0 must not erase the adjacent, independently-live s1 mask. In Wave32 each
+    // explicit compare destination occupies exactly one scalar word; the old generic inventory
+    // incorrectly treated both compares as two-word writes.
+    const uint32_t wave32_fragment_adjacent_vopc_masks[] = {
+        0x7d865cf9u, 0x06868104u,            // v_cmp_le_u32_sdwa s1, s4, v46
+        0x7d8654f9u, 0x06868004u,            // v_cmp_le_u32_sdwa s0, s4, v42
+        0x876a0100u,                         // s_and_b32 vcc_lo, s0, s1
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    if (recompile_fragment_wave32_for_test(
+            wave32_fragment_adjacent_vopc_masks,
+            std::size(wave32_fragment_adjacent_vopc_masks)).empty()) {
+        printf("  [FAIL] adjacent explicit Wave32 VOPC masks clobbered each other\n");
+        return 1;
+    }
+    printf("  [ok]   explicit Wave32 VOPC destinations preserve adjacent SGPR masks\n");
+
+    // VCC_LO/HI remain physical scalar scratch registers too. A B32 ALU destination alone does not
+    // prove mask-domain use: the live shader builds M0 from ordinary integer data through VCC_LO.
+    const uint32_t wave32_fragment_vcc_scratch[] = {
+        0x876a8744u,                         // s_and_b32 vcc_lo, s68, 7
+        0x936a856au,                         // s_lshl_b32 vcc_lo, vcc_lo, 5
+        0xbefc036au,                         // s_mov_b32 m0, vcc_lo
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    if (recompile_fragment_wave32_for_test(
+            wave32_fragment_vcc_scratch,
+            std::size(wave32_fragment_vcc_scratch)).empty()) {
+        printf("  [FAIL] Wave32 VCC_LO scalar-scratch chain was mistaken for a wave mask\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 VCC_LO remains available for ordinary scalar scratch data\n");
+
+    // Inline constants 0/1 use numeric operand values that also happen to name s0/s1. Even while
+    // s0 is a saved Wave32 mask, an all-inline cselect into VCC_HI is ordinary scalar data.
+    const uint32_t wave32_fragment_inline_cselect_data[] = {
+        0xbe80037eu,                         // s_mov_b32 s0, exec_lo (mask-domain s0)
+        0xbf060000u,                         // s_cmp_eq_u32 s0, s0
+        0x856b8081u,                         // s_cselect_b32 vcc_hi, 1, 0 (data-domain)
+        0xbf060000u,                         // s_cmp_eq_u32 s0, s0
+        0x8801fd6bu,                         // s_or_b32 s1, vcc_hi, scc
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    if (recompile_fragment_wave32_for_test(
+            wave32_fragment_inline_cselect_data,
+            std::size(wave32_fragment_inline_cselect_data)).empty()) {
+        printf("  [FAIL] Wave32 inline cselect constants aliased saved-mask register numbers\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 inline cselect constants remain ordinary scalar data\n");
+
+    // Exact PC790..803 control idiom: save EXEC_LO into VCC_HI while narrowing through VCC_LO,
+    // then restore that independently tracked saved mask through a B32 move.
+    const uint32_t wave32_fragment_and_saveexec[] = {
+        0xbeea037eu,                         // s_mov_b32 vcc_lo, exec_lo
+        0xbeeb3c6au,                         // s_and_saveexec_b32 vcc_hi, vcc_lo
+        0xbefe036bu,                         // s_mov_b32 exec_lo, vcc_hi
+        0xbeea446au,                         // s_andn1_saveexec_b32 vcc_lo, vcc_lo
+        0xbefe036au,                         // s_mov_b32 exec_lo, vcc_lo
+        0xbea0037eu,                         // s_mov_b32 s32, exec_lo
+        0xbeea4020u,                         // s_orn2_saveexec_b32 vcc_lo, s32
+        0xbefe036au,                         // s_mov_b32 exec_lo, vcc_lo
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    const auto wave32_fragment_and_saveexec_spv = recompile_fragment_wave32_for_test(
+        wave32_fragment_and_saveexec, std::size(wave32_fragment_and_saveexec));
+    if (wave32_fragment_and_saveexec_spv.empty() ||
+        !has_opcode(wave32_fragment_and_saveexec_spv, 335) ||
+        fragment_spirv_required_subgroup_size(wave32_fragment_and_saveexec_spv) != 32 ||
+        !type_result_ids_are_nonzero(wave32_fragment_and_saveexec_spv, nullptr) ||
+        !phi_ids_are_nonzero(wave32_fragment_and_saveexec_spv)) {
+        printf("  [FAIL] Wave32 B32 saveexec family did not preserve VCC/EXEC masks\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 AND/ORN2/ANDN1 saveexec family preserves saved EXEC\n");
+
+    // Use a distinct dynamic old EXEC and a false source so the operand order is observable in the
+    // emitted SPIR-V, rather than merely checking that the saveexec family can be translated.
+    const uint32_t wave32_fragment_andn1_saveexec[] = {
+        0x7c220300u,                         // v_cmpx_lt_f32 v0, v1
+        0xbe804480u,                         // s_andn1_saveexec_b32 s0, 0
+        0xbefe0300u,                         // s_mov_b32 exec_lo, s0
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    const auto wave32_fragment_andn1_saveexec_spv = recompile_fragment_wave32_for_test(
+        wave32_fragment_andn1_saveexec, std::size(wave32_fragment_andn1_saveexec));
+    if (wave32_fragment_andn1_saveexec_spv.empty() ||
+        !logical_not_of_false_feeds_and(wave32_fragment_andn1_saveexec_spv)) {
+        printf("  [FAIL] s_andn1_saveexec_b32 did not compute old_EXEC & ~source\n");
+        return 1;
+    }
+    printf("  [ok]   s_andn1_saveexec_b32 negates its source operand\n");
+
+    const uint32_t wave32_fragment_readlane31[] = {
+        0x7e140280u,                         // v_mov_b32 v10, 0
+        0xd7600000u, 0x00013f0au,            // v_readlane_b32 s0, v10, 31
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    const auto wave32_fragment_readlane31_spv = recompile_fragment_wave32_for_test(
+        wave32_fragment_readlane31, std::size(wave32_fragment_readlane31));
+    if (wave32_fragment_readlane31_spv.empty() ||
+        fragment_spirv_required_subgroup_size(wave32_fragment_readlane31_spv) != 32) {
+        printf("  [FAIL] Wave32 fragment v_readlane requested the wrong subgroup size\n");
+        return 1;
+    }
+    const uint32_t wave32_fragment_readlane32[] = {
+        0x7e140280u,                         // v_mov_b32 v10, 0
+        0xd7600000u, 0x0001410au,            // v_readlane_b32 s0, v10, 32 (out of range)
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    if (!recompile_fragment_wave32_for_test(
+            wave32_fragment_readlane32,
+            std::size(wave32_fragment_readlane32)).empty()) {
+        printf("  [FAIL] Wave32 fragment v_readlane accepted lane 32\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 fragment v_readlane retains a 32-lane subgroup contract\n");
+
+    const uint32_t fragment_cvt_i32_word_sdwa[] = {
+        0x7e1a10f9u, 0x0006140du,            // v_cvt_i32_f32_sdwa v13,v13 WORD_0/PRESERVE
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    const auto fragment_cvt_i32_word_sdwa_spv = recompile_fragment(
+        fragment_cvt_i32_word_sdwa, std::size(fragment_cvt_i32_word_sdwa));
+    if (fragment_cvt_i32_word_sdwa_spv.empty() ||
+        !type_result_ids_are_nonzero(fragment_cvt_i32_word_sdwa_spv, nullptr) ||
+        !phi_ids_are_nonzero(fragment_cvt_i32_word_sdwa_spv)) {
+        printf("  [FAIL] WORD-preserving v_cvt_i32_f32_sdwa did not emit valid SPIR-V\n");
+        return 1;
+    }
+    printf("  [ok]   WORD-preserving v_cvt_i32_f32_sdwa emits valid SPIR-V\n");
 
     const uint32_t wave32_vertex_exec[] = {
         0xbefe03c1u,                         // s_mov_b32 exec_lo, -1
@@ -878,6 +1239,250 @@ int main() {
         return 1;
     }
     printf("  [ok]   complex fragment CFG exports active state from both alternate sites\n");
+
+    // Astro Bot's second world-map material is Wave32 and carries saved one-word masks through the
+    // same non-lexical branch graph. The explicit VOPC writes below intentionally target adjacent
+    // s1 then s0: both independent masks must survive every dispatcher case and feed the later EXEC
+    // restore. Treating either compare as a two-word write erases s1 or persists it as scalar zero.
+    const uint32_t wave32_fragment_cfg_masks[] = {
+        0x7d865cf9u, 0x06868104u,            // pc0:  v_cmp_le_u32_sdwa s1, s4, v46
+        0x7d8654f9u, 0x06868004u,            // pc2:  v_cmp_le_u32_sdwa s0, s4, v42
+        0xbefe097eu,                         // pc4:  s_wqm_b32 exec_lo, exec_lo
+        0x7e040280u,                         // pc5:  v_mov_b32 v2, 0
+        0x7e060280u,                         // pc6:  v_mov_b32 v3, 0
+        0x7e080280u,                         // pc7:  v_mov_b32 v4, 0
+        0x7e0a0280u,                         // pc8:  v_mov_b32 v5, 0
+        0x7c020300u,                         // pc9:  v_cmp_lt_f32 vcc, v0, v1
+        0xbf860003u,                         // pc10: s_cbranch_vccz -> pc14
+        0x7c020300u,                         // pc11: v_cmp_lt_f32 vcc, v0, v1
+        0xbf860002u,                         // pc12: s_cbranch_vccz -> pc15 (crosses pc10 region)
+        0x7e040281u,                         // pc13: v_mov_b32 v2, 1
+        0x7e060281u,                         // pc14: v_mov_b32 v3, 1
+        0x7c020300u,                         // pc15: v_cmp_lt_f32 vcc, v0, v1
+        0xbf860004u,                         // pc16: s_cbranch_vccz -> alternate restore at pc21
+        0x877e0100u,                         // pc17: s_and_b32 exec_lo, s0, s1
+        0xf800180fu, 0x05040302u,            // pc18: exp mrt0 v2, v3, v4, v5 done vm
+        0xbf820004u,                         // pc20: s_branch -> verified tail exit at pc25
+        0x877e0100u,                         // pc21: alternate s_and_b32 exec_lo, s0, s1
+        0xf800180fu, 0x05040302u,            // pc22: alternate exp mrt0 v2, v3, v4, v5 done vm
+        0xbf810000u,                         // pc24: s_endpgm
+        0xbf810000u,                         // pc25: branch-target s_endpgm
+    };
+    const auto wave32_fragment_cfg_spv = recompile_fragment_wave32_for_test(
+        wave32_fragment_cfg_masks, std::size(wave32_fragment_cfg_masks));
+    if (wave32_fragment_cfg_spv.empty() || !has_opcode(wave32_fragment_cfg_spv, 251) ||
+        !type_result_ids_are_nonzero(wave32_fragment_cfg_spv, nullptr) ||
+        !phi_ids_are_nonzero(wave32_fragment_cfg_spv)) {
+        printf("  [FAIL] complex Wave32 fragment CFG lost saved-mask state across cases\n");
+        return 1;
+    }
+    printf("  [ok]   complex Wave32 fragment CFG persists unambiguous saved-mask lifetimes\n");
+
+    // The live world-map PS writes an explicit SGPR mask with VOPC, then compares that whole B64
+    // wave mask against zero inside the same dispatcher. SCC is a wave vote, not this invocation's
+    // mask bit; fragment pipelines enforce wave64 and can lower it to subgroup-any exactly.
+    const uint32_t fragment_mask_compare_prelude[] = {
+        0x7e120280u,                         // v_mov_b32 v9, 0
+        0x7c0212f9u, 0x06868480u,            // v_cmp_lt_f32_sdwa s[4:5], 0, v9
+        0xbf138004u,                         // s_cmp_lg_u64 s[4:5], 0
+    };
+    std::vector<uint32_t> fragment_cfg_mask_compare(
+        std::begin(fragment_mask_compare_prelude), std::end(fragment_mask_compare_prelude));
+    fragment_cfg_mask_compare.insert(fragment_cfg_mask_compare.end(),
+        std::begin(fragment_cfg_dispatch), std::end(fragment_cfg_dispatch));
+    const auto fragment_cfg_mask_compare_spv = recompile_fragment(
+        fragment_cfg_mask_compare.data(), fragment_cfg_mask_compare.size());
+    if (fragment_cfg_mask_compare_spv.empty() ||
+        !has_opcode(fragment_cfg_mask_compare_spv, 251) ||
+        !has_opcode(fragment_cfg_mask_compare_spv, 335) ||
+        fragment_spirv_required_subgroup_size(fragment_cfg_mask_compare_spv) != 64 ||
+        !type_result_ids_are_nonzero(fragment_cfg_mask_compare_spv, nullptr) ||
+        !phi_ids_are_nonzero(fragment_cfg_mask_compare_spv)) {
+        printf("  [FAIL] complex fragment CFG rejected a wave-mask zero comparison\n");
+        return 1;
+    }
+    printf("  [ok]   complex fragment CFG lowers wave-mask comparisons to exact wave64 votes\n");
+
+    // Astro Bot's world-map material PS reaches the same graphics CFG dispatcher with an
+    // s_orn2_saveexec_b64 whose destination is VCC. Keep a saved EXEC source live across dispatcher
+    // cases, update both the explicit VCC SGPR pair and the implicit VCC condition, then restore EXEC.
+    // The crossing branch regions below force the fallback which rejected the live shader at this op.
+    const uint32_t fragment_cfg_orn2_saveexec[] = {
+        0xbe82047eu,                         // pc0:  s_mov_b64 s[2:3], exec
+        0xbeea2802u,                         // pc1:  s_orn2_saveexec_b64 vcc, s[2:3]
+        0xbefe046au,                         // pc2:  s_mov_b64 exec, vcc (restore saved EXEC)
+        0x7e040280u,                         // pc3:  v_mov_b32 v2, 0
+        0x7e060280u,                         // pc4:  v_mov_b32 v3, 0
+        0x7e080280u,                         // pc5:  v_mov_b32 v4, 0
+        0x7e0a0280u,                         // pc6:  v_mov_b32 v5, 0
+        0x7c020300u,                         // pc7:  v_cmp_lt_f32 vcc, v0, v1
+        0xbf860003u,                         // pc8:  s_cbranch_vccz -> pc12
+        0x7c020300u,                         // pc9:  v_cmp_lt_f32 vcc, v0, v1
+        0xbf860002u,                         // pc10: s_cbranch_vccz -> pc13 (crossing region)
+        0x7e040281u,                         // pc11: v_mov_b32 v2, 1
+        0x7e060281u,                         // pc12: v_mov_b32 v3, 1
+        0x7c020300u,                         // pc13: v_cmp_lt_f32 vcc, v0, v1
+        0xbf860003u,                         // pc14: s_cbranch_vccz -> alternate export at pc18
+        0xf800180fu, 0x05040302u,            // pc15: exp mrt0 v2, v3, v4, v5 done vm
+        0xbf820003u,                         // pc17: s_branch -> verified tail exit at pc21
+        0xf800180fu, 0x05040302u,            // pc18: alternate exp mrt0 v2, v3, v4, v5 done vm
+        0xbf810000u,                         // pc20: s_endpgm
+        0xbf810000u,                         // pc21: branch-target s_endpgm
+    };
+    const auto fragment_cfg_orn2_spv = recompile_fragment(
+        fragment_cfg_orn2_saveexec, std::size(fragment_cfg_orn2_saveexec));
+    if (fragment_cfg_orn2_spv.empty() || !has_opcode(fragment_cfg_orn2_spv, 251) ||
+        !type_result_ids_are_nonzero(fragment_cfg_orn2_spv, nullptr) ||
+        !phi_ids_are_nonzero(fragment_cfg_orn2_spv)) {
+        printf("  [FAIL] complex fragment CFG rejected s_orn2_saveexec_b64 VCC form\n");
+        return 1;
+    }
+    printf("  [ok]   complex fragment CFG preserves Astro ORN2-saveexec VCC state\n");
+
+    // Astro's world-map material PS folds a lane-local mask across every 16-lane hardware row.
+    // These are the four exact live packets following ORN2-saveexec. They require subgroup shuffle
+    // (not the derivative-based FLOAT quad-perm approximation) and a 64-lane fragment subgroup.
+    const uint32_t fragment_dpp_row_or[] = {
+        0x7e1402c1u,                         // v_mov_b32 v10, -1
+        0x381414fau, 0xff01110au,            // v_or_b32_dpp v10,v10,v10 row_shr:1
+        0x381414fau, 0xff01120au,            // row_shr:2
+        0x381414fau, 0xff01140au,            // row_shr:4
+        0x381414fau, 0xff01180au,            // row_shr:8
+        0xd7781009u, 0x0305830au,            // v_permlanex16 v9,v10,-1,-1 BC=1
+        0x3814130au,                         // v_or_b32 v10,v10,v9
+        0xd7600000u, 0x00013f0au,            // v_readlane_b32 s0,v10,31
+        0xd7600001u, 0x00017f0au,            // v_readlane_b32 s1,v10,63
+        0x883f0100u,                         // s_or_b32 s63,s0,s1
+        0xf800000fu, 0x0a0a0a0au,            // exp mrt0 v10,v10,v10,v10
+        0xbf810000u,
+    };
+    const auto fragment_dpp_row_or_spv = recompile_fragment(
+        fragment_dpp_row_or, std::size(fragment_dpp_row_or));
+    if (fragment_dpp_row_or_spv.empty() ||
+        !has_opcode(fragment_dpp_row_or_spv, 345) ||
+        !has_builtin(fragment_dpp_row_or_spv, 41) ||
+        fragment_spirv_required_subgroup_size(fragment_dpp_row_or_spv) != 64 ||
+        !type_result_ids_are_nonzero(fragment_dpp_row_or_spv, nullptr) ||
+        !phi_ids_are_nonzero(fragment_dpp_row_or_spv)) {
+        printf("  [FAIL] Astro fragment DPP row-right OR reduction did not emit valid subgroup SPIR-V\n");
+        return 1;
+    }
+    printf("  [ok]   Astro fragment DPP/PERMLANEX/readlane reduction uses exact wave64 shuffles\n");
+
+    const uint32_t fragment_dpp_distinct_row_or[] = {
+        0x7e000281u,                         // v_mov_b32 v0, 1
+        0x7e020282u,                         // v_mov_b32 v1, 2
+        0x7e0402ffu, 0x12345678u,            // v_mov_b32 v2, unique old destination
+        0x380402fau, 0xff011100u,            // v_or_b32_dpp v2,v0,v1 row_shr:1 BC:0
+        0xf800000fu, 0x02020202u,
+        0xbf810000u,
+    };
+    const auto fragment_dpp_distinct_spv = recompile_fragment(
+        fragment_dpp_distinct_row_or, std::size(fragment_dpp_distinct_row_or));
+    const uint32_t fragment_dpp_features =
+        fragment_spirv_required_subgroup_features(fragment_dpp_distinct_spv);
+    if (fragment_dpp_distinct_spv.empty() ||
+        !has_select_with_false_constant(fragment_dpp_distinct_spv, 0x12345678u) ||
+        !(fragment_dpp_features & kFragmentSubgroupShuffle) ||
+        fragment_subgroup_features_supported(
+            fragment_dpp_features,
+            kFragmentSubgroupVote | kFragmentSubgroupArithmetic)) {
+        printf("  [FAIL] unbounded fragment DPP did not preserve VDST/gate subgroup shuffle\n");
+        return 1;
+    }
+    printf("  [ok]   unbounded fragment DPP preserves VDST and requires host shuffle support\n");
+    // #1474: partially-overlapping LOOPS in the fragment shell. Two back-edges whose ranges cross
+    // without nesting (B's header lies inside A's body, B's back-edge outside it) are what the narrow
+    // pattern structurizer calls unstructured and rejects. Since the graphics CFG dispatcher above
+    // exists, that rejection is no longer the end of the road: the per-invocation dispatcher executes
+    // the exact block graph, so the region lowers instead of dropping the draw.
+    //
+    // Two properties of this stream are worth stating, because both are easy to misread:
+    //   * The crossing pair is SYNTACTIC only — pc7 is an unconditional s_branch, so pc8/pc9 (B's
+    //     back-edge) are unreachable. detect_divergent_loops collects back-edges without a
+    //     reachability filter, so the pair check still sees the overlap and rejects. If that pass
+    //     ever gains reachability pruning, the accept assertion below fails for a GOOD reason.
+    //   * The rejection is OVER-DETERMINED: pc3's execz targets 10, past A's exit_pc of 8 (the dword
+    //     after A's back-edge, not A's exit target), so pass 2's "conditional jump past the loop" rule
+    //     would reject this stream even with the overlap check deleted. Neither this assertion nor the
+    //     pre-#1474 one isolates overlap as the sole cause of rejection.
+    //
+    // Both directions are pinned here, in the DEVICE-FREE test, rather than only in the
+    // Vulkan-execution tests: those are gated on find_package(Vulkan) succeeding, and every CI job
+    // that runs ctest either disables Vulkan discovery (Linux, Windows MinGW, macOS) or runs a
+    // three-test seam subset (Windows App), so a guard living only there never runs in CI at all.
+    const uint32_t overlapping_loops[] = {
+        0xbe800380u,               //  0: s_mov_b32 s0, 0
+        0x7e020284u,               //  1: v_mov_b32 v1, 4
+        0x7da20200u,               //  2: A_HDR: v_cmpx_lt_u32 s0, v1
+        0xbf880006u,               //  3: s_cbranch_execz +6 -> 10 (export)
+        0x7da20200u,               //  4: B_HDR: v_cmpx_lt_u32 s0, v1
+        0xbf880006u,               //  5: s_cbranch_execz +6 -> 12 (endpgm)
+        0x81008100u,               //  6: s0++
+        0xbf82fffau,               //  7: s_branch -6 -> 2  (A back-edge; A = [2,7])
+        0x81008100u,               //  8: s0++
+        0xbf82fffau,               //  9: s_branch -6 -> 4  (B back-edge; B = [4,9] crosses A)
+        0xf800180fu, 0x05020302u,  // 10: exp mrt0
+        0xbf810000u,               // 12: s_endpgm
+    };
+    const auto overlapping_spv =
+        recompile_fragment(overlapping_loops, std::size(overlapping_loops));
+    if (overlapping_spv.empty() || !has_opcode(overlapping_spv, 251) ||
+        !type_result_ids_are_nonzero(overlapping_spv, nullptr) ||
+        !phi_ids_are_nonzero(overlapping_spv)) {
+        printf("  [FAIL] #1474: partially-overlapping fragment loops did not lower through a valid "
+               "OpSwitch dispatcher\n");
+        return 1;
+    }
+    // Lowering is not enough: a dispatcher that emitted the block graph but dropped the export would
+    // satisfy every check above, and the device-side test only asserts the readback's size — that is
+    // exactly the "silent skip drops real rendered content" failure the charter warns about. This
+    // stream has one EXP site, so it must produce exactly one output store. The count is exact rather
+    // than >= 1 so a DOUBLED export (which would write MRT0 twice) fails too; the neighbouring
+    // two-site test asserting stores == 2 is the cross-check that this counts sites, not components.
+    const OutputStoreStats overlapping_outputs = output_store_stats(overlapping_spv);
+    if (overlapping_outputs.stores != 1) {
+        printf("  [FAIL] #1474: dispatcher-lowered overlapping loops did not export exactly once "
+               "(stores=%u)\n", overlapping_outputs.stores);
+        return 1;
+    }
+    printf("  [ok]   #1474: partially-overlapping fragment loops lower through the CFG dispatcher, "
+           "exporting exactly once\n");
+
+    // The fail-visible backstop still has to work. A cross-lane MBCNT inside the same region
+    // disqualifies the per-invocation dispatcher — inside a dispatcher case the lanes of one subgroup
+    // sit at different guest blocks, so MBCNT's subgroup exclusive scan would be answering for a wave
+    // that is not there. See the `reason=mbcnt-cross-lane` reject in rdna2_to_spirv.cpp; if graphics
+    // ever gains a synchronized common phase that closes the gap, this assertion fails LOUDLY rather
+    // than silently losing the reject coverage. With the narrow structurizer already rejecting, a
+    // loud reject is the only remaining outcome. The compute-side #590 case keeps an s_barrier in its
+    // region for the same purpose (test_rdna2_to_spirv.cpp).
+    //
+    // Branch offsets are re-based for the MBCNT's two dwords, and the MBCNT sits on the REACHABLE
+    // path (pc5's fallthrough), not in the dead region above. Dropping it makes this stream lower,
+    // which is what makes the guard real rather than decorative.
+    const uint32_t overlapping_loops_cross_lane[] = {
+        0xbe800380u,               //  0: s_mov_b32 s0, 0
+        0x7e020284u,               //  1: v_mov_b32 v1, 4
+        0x7da20200u,               //  2: A_HDR: v_cmpx_lt_u32 s0, v1
+        0xbf880008u,               //  3: s_cbranch_execz +8 -> 12 (export)
+        0x7da20200u,               //  4: B_HDR: v_cmpx_lt_u32 s0, v1
+        0xbf880008u,               //  5: s_cbranch_execz +8 -> 14 (endpgm)
+        0xd7650004u, 0x000100c1u,  //  6: v_mbcnt_lo_u32_b32 v4, -1, 0  (cross-lane)
+        0x81008100u,               //  8: s0++
+        0xbf82fff8u,               //  9: s_branch -8 -> 2  (A back-edge; A = [2,9])
+        0x81008100u,               // 10: s0++
+        0xbf82fff8u,               // 11: s_branch -8 -> 4  (B back-edge; B = [4,11] crosses A)
+        0xf800180fu, 0x05020302u,  // 12: exp mrt0
+        0xbf810000u,               // 14: s_endpgm
+    };
+    if (!recompile_fragment(overlapping_loops_cross_lane,
+                            std::size(overlapping_loops_cross_lane)).empty()) {
+        printf("  [FAIL] #1474: cross-lane MBCNT inside an unstructured fragment region must "
+               "REJECT, not lower through the per-invocation dispatcher\n");
+        return 1;
+    }
+    printf("  [ok]   #1474: cross-lane op in an unstructured fragment region still rejects loudly\n");
 
     // The graphics CFG dispatcher must retain the fragment shell's already-proven alpha-test
     // linearization.  This reduced Astro Bot shape prefixes the crossing-region CFG above with a

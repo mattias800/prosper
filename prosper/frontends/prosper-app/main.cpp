@@ -31,6 +31,8 @@
 #include "present_policy.hpp"           // bounded-acquire present classification (#1182), pure seam
 #include "window_controls.hpp"           // debounced app-window shortcuts, pure regression seam
 #include "game_path.hpp"                 // dropped/picked path -> app0 root + open action, pure seam
+#include "game_library.hpp"              // scan a games dir -> titles + metadata, pure seam
+#include "app_config.hpp"                // persisted settings (games_dir), pure seam
 #ifdef PROSPER_HAVE_LIVE_RENDERER
 #include "live_renderer.hpp"           // shared DrawItem->Vulkan compositor (register_live_renderer)
 #endif
@@ -70,6 +72,7 @@
 #include <thread>
 #include <mutex>
 #include <sys/stat.h>                  // the host filesystem probe behind resolve_app0_root()
+#include <filesystem>                  // directory listing behind the library scan
 
 // Starting the replacement process for a second title (#1469): CreateProcess on Windows,
 // posix_spawn elsewhere. Guarded the same way as the rest of the tree so windows.h cannot
@@ -681,51 +684,6 @@ void poll_keyboard(const bool* keyboard, bool enter_maps_to_options) {
     g_keyboard_pad.set_keyboard_state(st);
 }
 
-// Read the human-readable game name from the dump's PS5 param.json so the window title shows e.g.
-// "Bendy and the Ink Machine" instead of the PPSA content-id directory. PS5 param.json stores the name under
-// localizedParameters.<lang>.titleName; we prefer the defaultLanguage's entry and fall back to the first
-// titleName found. Dependency-free string scan (no JSON lib in-tree); returns "" if the file/field is absent.
-static std::string read_game_title(const std::string& dump) {
-    std::string path = dump + "/sce_sys/param.json";
-    FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) return "";
-    std::string s; char buf[8192]; size_t n;
-    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) s.append(buf, n);
-    std::fclose(f);
-    // Extract the JSON string value that follows the first "titleName" at or after `from`.
-    auto title_after = [&](size_t from) -> std::string {
-        size_t k = s.find("\"titleName\"", from);
-        if (k == std::string::npos) return "";
-        k = s.find(':', k); if (k == std::string::npos) return "";
-        k = s.find('"', k); if (k == std::string::npos) return "";
-        std::string out;
-        for (size_t e = k + 1; e < s.size() && s[e] != '"'; ++e) {
-            if (s[e] == '\\' && e + 1 < s.size()) { ++e; out += s[e]; }  // unescape \" \\ etc. (title is plain ASCII)
-            else out += s[e];
-        }
-        return out;
-    };
-    // Prefer the default language's titleName: find defaultLanguage's value, then that language object's key.
-    std::string title;
-    size_t dl = s.find("\"defaultLanguage\"");
-    if (dl != std::string::npos) {
-        size_t c = s.find(':', dl);
-        size_t q = (c == std::string::npos) ? std::string::npos : s.find('"', c);
-        if (q != std::string::npos) {
-            size_t qe = s.find('"', q + 1);
-            if (qe != std::string::npos) {
-                std::string lang = s.substr(q + 1, qe - q - 1);
-                // The language OBJECT key ("en-US":{ ... }) appears before the defaultLanguage line, so search
-                // from the top for the key and take the titleName inside its object.
-                size_t lk = s.find("\"" + lang + "\"");
-                if (lk != std::string::npos && lk < dl) title = title_after(lk);
-            }
-        }
-    }
-    if (title.empty()) title = title_after(0);
-    return title;
-}
-
 // ---- opening a game (#1469) --------------------------------------------------------------------
 // A dump path reaches the boot from three places: argv (the primary, agentic path — unchanged), a
 // folder dropped on the window, and the host folder picker. Only the first is available before the
@@ -746,6 +704,97 @@ static prosper::frontend::GamePathProbe host_path_probe() {
         return ::stat(resolve_host_path_case(p).c_str(), &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG;
     };
     return probe;
+}
+
+// Read a file whole, exactly as named. Returns "" when it cannot be opened.
+static std::string read_whole_file(const std::string& path) {
+    std::string out;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return out;
+    char buf[8192]; size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
+    std::fclose(f);
+    return out;
+}
+
+// The host side of game_library.hpp's injected IO.
+static prosper::frontend::GameLibraryIo host_library_io() {
+    prosper::frontend::GameLibraryIo io;
+    io.list_dir = [](const std::string& dir) {
+        std::vector<std::string> names;
+        // Both the construction AND the increment take an error_code: the throwing operator++ is
+        // reachable when a directory is removed or becomes unreadable mid-scan, and that must not
+        // escape as an exception out of an ordinary listing.
+        std::error_code ec;
+        std::filesystem::directory_iterator it(dir, ec);
+        const std::filesystem::directory_iterator end;
+        while (!ec && it != end) {
+            names.push_back(it->path().filename().string());
+            it.increment(ec);
+        }
+        // A partial listing is the right recovery, but showing fewer games with no explanation is not.
+        if (ec) fprintf(stderr, "[app] listing %s stopped early: %s\n", dir.c_str(), ec.message().c_str());
+        return names;
+    };
+    io.read_file = [](const std::string& want) {
+        // Case-correct like boot_program does (#1006/#1226): a dump shipping SCE_SYS/PARAM.JSON on a
+        // case-sensitive host would otherwise pass the probe and then read as empty, silently
+        // demoting the title to its directory name. GUEST paths only — see read_whole_file.
+        return read_whole_file(resolve_host_path_case(want));
+    };
+    io.resolve_case = [](const std::string& want) { return resolve_host_path_case(want); };
+    return io;
+}
+
+// Read the human-readable game name from the dump's PS5 param.json so the window title shows e.g.
+// "Bendy and the Ink Machine" instead of the PPSA content-id directory. PS5 param.json stores the name under
+// localizedParameters.<lang>.titleName; we prefer the defaultLanguage's entry and fall back to the first
+// titleName found. Dependency-free string scan (no JSON lib in-tree); returns "" if the file/field is absent.
+static std::string read_game_title(const std::string& dump) {
+    // The parse lives in game_library.hpp so the library view and this window title read param.json
+    // through exactly one implementation — and so that logic is unit-tested, which it never was while
+    // it lived here (#1471).
+    return prosper::frontend::parse_param_title_name(
+        host_library_io().read_file(dump + "/sce_sys/param.json"));
+}
+
+// Where the persisted settings live. PROSPER_APP_CONFIG overrides it outright; otherwise the
+// platform's per-user config location. Same shape as the project's other host paths
+// (PROSPER_SAVEDATA_DIR, PROSPER_CAPTURE_DIR): an env override in front of a sensible default.
+static std::string app_config_path() {
+    if (const char* e = getenv("PROSPER_APP_CONFIG")) return e;
+#ifdef _WIN32
+    if (const char* appdata = getenv("APPDATA")) return std::string(appdata) + "\\prosper\\prosper-app.conf";
+#else
+    if (const char* xdg = getenv("XDG_CONFIG_HOME")) return std::string(xdg) + "/prosper/prosper-app.conf";
+    if (const char* home = getenv("HOME")) return std::string(home) + "/.config/prosper/prosper-app.conf";
+#endif
+    return "";   // nowhere sensible to put it: run without persistence rather than guessing
+}
+
+static prosper::frontend::AppConfig load_app_config() {
+    const std::string path = app_config_path();
+    if (path.empty()) return {};
+    // Read exactly, NOT through the case-correcting guest-path reader: this file's spelling is ours,
+    // and case-correcting a path that usually does not exist scans its ancestor directories on every
+    // first launch for no benefit.
+    return prosper::frontend::parse_app_config(read_whole_file(path));
+}
+
+// Persist the settings. Best-effort: failing to write is reported and otherwise ignored, since the
+// app is perfectly usable without persistence and a read-only home must not stop a game running.
+static bool save_app_config(const prosper::frontend::AppConfig& cfg) {
+    const std::string path = app_config_path();
+    if (path.empty()) return false;
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    const std::string text = prosper::frontend::serialize_app_config(cfg);
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) { fprintf(stderr, "[app] could not write settings to %s\n", path.c_str()); return false; }
+    const bool ok = std::fwrite(text.data(), 1, text.size(), f) == text.size();
+    std::fclose(f);
+    if (!ok) fprintf(stderr, "[app] settings write to %s was incomplete\n", path.c_str());
+    return ok;
 }
 
 // "prosper — <game name>" for a booted game (name from param.json, falling back to the app0
@@ -985,6 +1034,11 @@ int main(int argc, char** argv) {
     bool testPattern = false; int exitAfter = 0; uint32_t winW = 1280, winH = 720;
     prosper::frontend::AppPresentMode requestedPresentMode = prosper::frontend::AppPresentMode::fifo;
     std::string dump;
+    // The game library (#1471): where to look, and whether to just print what is there and exit.
+    std::string gamesDirFlag;
+    std::string setGamesDir;
+    bool setGamesDirSeen = false;
+    bool listGames = false;
     // Whether to offer the host folder picker at startup (#1469); resolved by should_pick_at_startup.
     prosper::frontend::StartupPickInputs pick{};
     pick.bare_launch = (argc <= 1);
@@ -998,6 +1052,22 @@ int main(int argc, char** argv) {
         else if (a == "--dump" && i + 1 < argc) dump = argv[++i];                // boot the game at this app0 dir
         else if (a == "--pick") pick.forced = true;         // open the folder picker at startup
         else if (a == "--no-pick") pick.suppressed = true;  // never open it (scripts, CI, kiosk runs)
+        else if (a == "--games-dir") {                       // where the titles are, this run only
+            if (i + 1 >= argc || !*argv[i + 1]) {
+                fprintf(stderr, "prosper-app: --games-dir requires a path\n");
+                return 2;
+            }
+            gamesDirFlag = argv[++i];
+        }
+        else if (a == "--list-games") listGames = true;      // print the library and exit (headless)
+        else if (a == "--set-games-dir") {                   // persist and exit
+            if (i + 1 >= argc) {
+                fprintf(stderr, "prosper-app: --set-games-dir requires a path (\"\" clears it)\n");
+                return 2;
+            }
+            setGamesDir = argv[++i];
+            setGamesDirSeen = true;   // an empty value is meaningful here: it clears the setting
+        }
         else if (a == "--present-mode") {
             if (i + 1 >= argc ||
                 !prosper::frontend::parse_present_mode(argv[++i], requestedPresentMode)) {
@@ -1046,6 +1116,56 @@ int main(int argc, char** argv) {
     pick.has_dump = !dump.empty();
     pick.test_pattern = testPattern;
 
+    // --set-games-dir: record the games directory for future launches and exit. Persisting is always
+    // an explicit act — nothing here infers a library location from a folder the user happened to open,
+    // because guessing wrong would silently point the library somewhere they never chose.
+    if (setGamesDirSeen) {
+        prosper::frontend::AppConfig cfg = load_app_config();   // keeps keys this build does not know
+        cfg.games_dir = prosper::frontend::strip_trailing_separators(setGamesDir);
+        // Warn but still store: configuring a path before mounting it is plausible, and refusing
+        // would be more annoying than saying so.
+        if (!cfg.games_dir.empty() && !host_path_probe().is_dir(cfg.games_dir))
+            fprintf(stderr, "prosper-app: warning: %s is not a directory\n", cfg.games_dir.c_str());
+        if (!save_app_config(cfg)) return 1;
+        if (cfg.games_dir.empty())
+            fprintf(stderr, "prosper-app: games directory cleared (%s)\n", app_config_path().c_str());
+        else
+            fprintf(stderr, "prosper-app: games directory set to %s (%s)\n", cfg.games_dir.c_str(),
+                    app_config_path().c_str());
+        return 0;
+    }
+
+    // The games directory, by the documented precedence: --games-dir, then PROSPER_GAMES_DIR, then the
+    // persisted setting. Resolved before anything opens a window so --list-games stays headless.
+    const prosper::frontend::AppConfig appConfig = load_app_config();
+    const char* gamesDirEnv = getenv("PROSPER_GAMES_DIR");
+    const std::string gamesDir = prosper::frontend::resolve_games_dir(
+        gamesDirFlag, gamesDirEnv ? gamesDirEnv : "", appConfig);
+
+    // --list-games: print the library as plain text and exit, with no window, no Vulkan and no guest.
+    // One tab-separated record per line on stdout (content id, display name, app0 path) so a script or
+    // an agent can consume it; everything explanatory goes to stderr.
+    if (listGames) {
+        if (gamesDir.empty()) {
+            fprintf(stderr, "prosper-app: no games directory. Pass --games-dir <path>, set "
+                            "PROSPER_GAMES_DIR, or record one in %s\n",
+                    app_config_path().empty() ? "the settings file" : app_config_path().c_str());
+            return 2;
+        }
+        if (!host_path_probe().is_dir(gamesDir)) {
+            // Distinguish a wrong path from a real but empty library: both would otherwise print
+            // "0 title(s)" and exit 1, which hides a typo.
+            fprintf(stderr, "prosper-app: not a directory: %s\n", gamesDir.c_str());
+            return 2;
+        }
+        const std::vector<prosper::frontend::GameEntry> games =
+            prosper::frontend::scan_game_library(gamesDir, host_path_probe(), host_library_io());
+        for (const auto& g : games)
+            printf("%s\t%s\t%s\n", g.title_id.c_str(), g.title_name.c_str(), g.app0_root.c_str());
+        fprintf(stderr, "prosper-app: %zu title(s) in %s\n", games.size(), gamesDir.c_str());
+        return games.empty() ? 1 : 0;
+    }
+
     // Boot the game (unless test-pattern): the shared start_guest() path registers the live renderer
     // so the guest's GPU submits composite to frames on the present layer, boots through
     // boot_program, and runs the guest on its own thread while this thread owns the window +
@@ -1059,6 +1179,14 @@ int main(int argc, char** argv) {
         std::string err;
         if (!start_guest(dump, &err)) { fprintf(stderr, "[app] boot failed: %s\n", err.c_str()); return 1; }
     } else if (!testPattern) {
+        // The library view that will draw these is #1471 stage 2; for now report what was found so a
+        // misconfigured games_dir is visible without waiting for the UI.
+        if (!gamesDir.empty()) {
+            const size_t found = prosper::frontend::scan_game_library(
+                gamesDir, host_path_probe(), host_library_io()).size();
+            fprintf(stderr, "[app] games directory %s holds %zu title(s); --list-games prints them.\n",
+                    gamesDir.c_str(), found);
+        }
         fprintf(stderr, "[app] no game given; the window opens empty and can be given one "
                         "(drop a game folder on it, or press Ctrl+O).\n");
     }

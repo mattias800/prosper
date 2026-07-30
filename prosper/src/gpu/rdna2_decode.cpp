@@ -113,6 +113,21 @@ void decode_operands(Rdna2Inst& i) {
                         i.has_modifier = false;
                     }
                 }
+                // v_cvt_i32_f32_sdwa may write only one destination word while preserving the
+                // other. Astro's world-map material uses WORD_0 + UNUSED_PRESERVE from a full
+                // DWORD f32 source before packing two integer results into one VGPR.
+                else if (((w >> 9) & 0xFFu) == 0x08u) {
+                    const uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
+                    const uint32_t s0sel = (sd >> 16) & 7u;
+                    if ((dsel == 4u || dsel == 5u) && dun == 2u && s0sel == 6u &&
+                        !((sd >> 19) & 0x9u) && !i.clamp && !i.omod &&
+                        !i.src_neg[0] && !i.src_abs[0]) {
+                        i.sdwa_dst_sel = static_cast<uint8_t>(dsel);
+                        i.sdwa_dst_unused = static_cast<uint8_t>(dun);
+                        i.sdwa_src0_sel = static_cast<uint8_t>(s0sel);
+                        i.has_modifier = false;
+                    }
+                }
                 // Integer-to-f32 conversion may select a byte/word before conversion. Unsigned
                 // conversion zero-extends it; signed conversion honors SDWA SEXT (bit 19). Astro's
                 // title post PS uses WORD_1+SEXT for v_cvt_f32_i32.
@@ -578,7 +593,8 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
             // DPP16 (src0 == 0xFA) modeled subsets (#273/#1390): dword1 = SRC0[7:0],
             // DPP_CTRL[16:8] (< 0x100 = quad_perm; 0x111..0x11f = row_shr:1..15), FI[18],
             // BC[19], src neg/abs [23:20], bank_mask[27:24], row_mask[31:28].  Full-mask operations
-            // without source modifiers/FI can be lowered by a supported shader-stage model.  Other
+            // without source modifiers/FI can be lowered by a supported shader-stage model,
+            // including Astro's fragment row reduction and Plucky's bounded compute shift. Other
             // row operations, partial masks, and modifiers keep has_modifier -> rejected.
             // (Field layout verified against llvm-mc gfx1010 round-trips of DOLL's live words,
             // e.g. 0x7e0802fa 0xff08a002 -> v_mov_b32_dpp v4, v2 quad_perm:[0,0,2,2]
@@ -591,6 +607,16 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
                     ((d1 >> 20) & 0xFu) == 0u && ((d1 >> 18) & 1u) == 0u) {
                     i.has_modifier = false; i.has_dpp = true; i.dpp_ctrl = (uint16_t)ctrl;
                     i.dpp_bound_ctrl = ((d1 >> 19) & 1u) != 0u;
+                }
+                // Astro's world-map material PS OR-reduces a lane value across each 16-lane row
+                // with row_shr:{1,2,4,8}. BOUND_CTRL=0 retains src0 for an out-of-row fetch, which
+                // is exact in the subgroup-shuffle lowering and is also the OR identity here.
+                else if (vf == Rdna2Format::VOP2 && ((w >> 25) & 0x3Fu) == 0x1Cu &&
+                         ctrl >= 0x111u && ctrl <= 0x11Fu &&
+                         ((d1 >> 28) & 0xFu) == 0xFu && ((d1 >> 24) & 0xFu) == 0xFu &&
+                         ((d1 >> 20) & 0xFu) == 0u && ((d1 >> 19) & 1u) == 0u &&
+                         ((d1 >> 18) & 1u) == 0u) {
+                    i.has_modifier = false; i.has_dpp = true; i.dpp_ctrl = (uint16_t)ctrl;
                 }
                 // Astro Bot's NGG primitive packer performs two bounded row-right shifts before
                 // v_add_nc_u32. The one-lane vertex model lowers the absent neighbor to zero; admit

@@ -1713,13 +1713,36 @@ int main() {
         };
         // A typed RGBA16F storage image exercises the same native-storage retention path as the
         // game's 4K post-process output. Height one keeps the coverage proof compact.
-        std::vector<uint8_t> fill_guest(W * 8, 0xC3);   // distinctive pre-run content
-        const std::vector<uint8_t> fill_original = fill_guest;
+        const size_t fill_guest_bytes = W * 8;
+        const size_t fill_mapping_bytes = 4096;
+        std::vector<uint8_t> fill_guest_storage;
+        uint8_t* fill_guest = nullptr;
+#if defined(__linux__)
+        void* fill_mapping = mmap(nullptr, fill_mapping_bytes, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(fill_mapping != MAP_FAILED, "map typed storage-image regression range");
+        if (fill_mapping == MAP_FAILED) return fails ? fails : 1;
+        fill_guest = static_cast<uint8_t*>(fill_mapping);
+        prosper::host::guest_write_watch_set_fault_onstack(true);
+        prosper::host::guest_write_watch_notify_direct_mapping_added(
+            reinterpret_cast<uint64_t>(fill_guest), fill_mapping_bytes, 0x7c0000,
+            0x3 /* SCE CPU_READ|CPU_WRITE */);
+#else
+        fill_guest_storage.resize(fill_guest_bytes);
+        fill_guest = fill_guest_storage.data();
+#endif
+        std::fill_n(fill_guest, fill_guest_bytes, 0xC3);   // distinctive pre-run content
+        const std::vector<uint8_t> fill_original(fill_guest, fill_guest + fill_guest_bytes);
+        auto fill_equals = [&](const std::vector<uint8_t>& expected) {
+            return expected.size() == fill_guest_bytes &&
+                   std::equal(fill_guest, fill_guest + fill_guest_bytes, expected.begin());
+        };
         ShaderResourceTable fill_rt;
         ShaderResource fdst{};
         fdst.cls = ResourceClass::StorageImage; fdst.img_dim = 1; fdst.binding = 5; fdst.sgpr_base = 8;
         fdst.format = DataFormat::Float16; fdst.num_components = 4; fdst.width = W; fdst.height = 1;
-        fdst.depth = 1; fdst.gpu_addr = (uint64_t)(uintptr_t)fill_guest.data(); fdst.size = W * 8;
+        fdst.depth = 1; fdst.gpu_addr = (uint64_t)(uintptr_t)fill_guest;
+        fdst.size = static_cast<uint32_t>(fill_guest_bytes);
         fill_rt.resources.push_back(fdst);
         ComputeShaderConfig fill_config;
         fill_config.user_sgprs.resize(16);
@@ -1741,15 +1764,19 @@ int main() {
             it.code_addr = 0x1122f11du;   // fresh code -> first run proves, second run seed-skips
             CHECK(prosper::frontend::execute_live_compute_items({it}),
                   "seed-skip proving run (poison-seeded) executes a full-coverage 1D fill");
-            const std::vector<uint8_t> after_prove = fill_guest;
-            CHECK(after_prove != fill_original,
+            const std::vector<uint8_t> after_prove(fill_guest, fill_guest + fill_guest_bytes);
+            CHECK(!fill_equals(fill_original),
                   "full-coverage fill overwrites the guest content (kernel ran)");
-            std::fill(fill_guest.begin(), fill_guest.end(), 0x00);  // scrub between runs
+            std::fill_n(fill_guest, fill_guest_bytes, 0x00);  // scrub between runs
             CHECK(prosper::frontend::execute_live_compute_items({it}),
                   "seed-skip fast run (seed skipped) executes the proven full-coverage fill");
-            CHECK(fill_guest == after_prove,
+            CHECK(fill_equals(after_prove),
                   "seed-skipped run is byte-identical to the poison-proven run (seed is unobserved)");
 
+#if defined(__linux__)
+            auto repeated_write_watch = prosper::host::GuestWriteWatch::create(
+                reinterpret_cast<uint64_t>(fill_guest), fill_guest_bytes);
+#endif
             uint32_t repeated_write_notifications = 0;
             set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
                 if (addr == fdst.gpu_addr && size == fdst.size)
@@ -1758,10 +1785,16 @@ int main() {
             CHECK(prosper::frontend::execute_live_compute_items({it}),
                   "retained full-coverage image repeats an identical dispatch");
             set_guest_gpu_write_observer({});
-            CHECK(fill_guest == after_prove,
+            CHECK(fill_equals(after_prove),
                   "identical retained output leaves the exact guest result intact");
-            CHECK(repeated_write_notifications == 0,
-                  "identical retained output skips redundant guest writeback and invalidation");
+            CHECK(repeated_write_notifications == 1,
+                  "identical retained output invalidates renderer aliases without rewriting bytes");
+#if defined(__linux__)
+            CHECK(static_cast<bool>(repeated_write_watch) && repeated_write_watch.query() ==
+                      prosper::host::GuestWriteWatchQuery::Unchanged,
+                  "identical retained output leaves guest-byte dirty tracking clean");
+            repeated_write_watch.reset();
+#endif
 
             // The live draw immediately following a compute producer is inside the same ordered
             // guest submit. Its mutation journal is an exact authority even before a cross-submit
@@ -1879,19 +1912,26 @@ int main() {
                 changed.resources = std::make_shared<ShaderResourceTable>(changed_proof_rt);
                 CHECK(prosper::frontend::execute_live_compute_items({changed}),
                       "changed fill proves full coverage on an independent target");
+                const std::vector<uint8_t> changed_expected = changed_proof_guest;
                 changed.resources = std::make_shared<ShaderResourceTable>(fill_rt);
+
+                prosper::frontend::live_compute_fail_next_storage_readback_for_test();
+                CHECK(!prosper::frontend::execute_live_compute_items({changed}),
+                      "injected post-submit storage readback failure is reported");
+                CHECK(fill_equals(after_prove),
+                      "failed storage readback does not publish newer image bytes to the guest");
                 uint32_t changed_write_notifications = 0;
                 set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
                     if (addr == fdst.gpu_addr && size == fdst.size)
                         ++changed_write_notifications;
                 });
                 CHECK(prosper::frontend::execute_live_compute_items({changed}),
-                      "different GPU output executes against an unchanged guest mirror");
+                      "storage image retries after a failed post-submit readback");
                 set_guest_gpu_write_observer({});
-                CHECK(fill_guest != after_prove,
-                      "exact GPU comparison detects and publishes a changed output");
+                CHECK(fill_equals(changed_expected) && !fill_equals(after_prove),
+                      "retry invalidates the stale baseline and publishes the changed output");
                 CHECK(changed_write_notifications == 1,
-                      "changed GPU output forces guest writeback and invalidation");
+                      "recovered storage output forces guest writeback and invalidation");
             }
 
             // Guest memory no longer matches the retained source. Exact source validation must
@@ -1905,11 +1945,17 @@ int main() {
             CHECK(prosper::frontend::execute_live_compute_items({it}),
                   "externally changed guest mirror reruns the retained full-coverage dispatch");
             set_guest_gpu_write_observer({});
-            CHECK(fill_guest == after_prove,
+            CHECK(fill_equals(after_prove),
                   "retained output repairs an externally changed guest mirror");
             CHECK(repaired_write_notifications == 1,
                   "externally changed guest mirror forces writeback and invalidation");
         }
+#if defined(__linux__)
+        prosper::host::guest_write_watch_notify_direct_mapping_removed(
+            reinterpret_cast<uint64_t>(fill_guest), fill_mapping_bytes);
+        prosper::host::guest_write_watch_set_fault_onstack(false);
+        munmap(fill_guest, fill_mapping_bytes);
+#endif
     }
 
     // A proven-full write-only raw storage image may retain its RGBA32_UINT interchange result even
@@ -1928,7 +1974,23 @@ int main() {
         constexpr uint32_t RW = 4, RH = 4, RD = 4;
         constexpr uint32_t raw_mode = static_cast<uint32_t>(TileMode::Sw64KbS);
         const size_t raw_guest_bytes = tiled_volume_bytes(RW, RH, RD, raw_mode, 8);
-        std::vector<uint8_t> raw_guest(raw_guest_bytes, 0x9d);
+        std::vector<uint8_t> raw_guest_storage;
+        uint8_t* raw_guest = nullptr;
+#if defined(__linux__)
+        void* raw_mapping = mmap(nullptr, raw_guest_bytes, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(raw_mapping != MAP_FAILED, "map raw storage-image regression range");
+        if (raw_mapping == MAP_FAILED) return fails ? fails : 1;
+        raw_guest = static_cast<uint8_t*>(raw_mapping);
+        prosper::host::guest_write_watch_set_fault_onstack(true);
+        prosper::host::guest_write_watch_notify_direct_mapping_added(
+            reinterpret_cast<uint64_t>(raw_guest), raw_guest_bytes, 0x7d0000,
+            0x3 /* SCE CPU_READ|CPU_WRITE */);
+#else
+        raw_guest_storage.resize(raw_guest_bytes);
+        raw_guest = raw_guest_storage.data();
+#endif
+        std::fill_n(raw_guest, raw_guest_bytes, 0x9d);
         ShaderResourceTable raw_rt;
         ShaderResource raw_dst{};
         raw_dst.cls = ResourceClass::StorageImage;
@@ -1941,8 +2003,8 @@ int main() {
         raw_dst.height = RH;
         raw_dst.depth = RD;
         raw_dst.tile_mode = raw_mode;
-        raw_dst.gpu_addr = reinterpret_cast<uint64_t>(raw_guest.data());
-        raw_dst.size = static_cast<uint32_t>(raw_guest.size());
+        raw_dst.gpu_addr = reinterpret_cast<uint64_t>(raw_guest);
+        raw_dst.size = static_cast<uint32_t>(raw_guest_bytes);
         raw_rt.resources.push_back(raw_dst);
         ComputeShaderConfig raw_config;
         raw_config.user_sgprs.resize(16);
@@ -1969,32 +2031,51 @@ int main() {
             raw_item.code_addr = 0x1122f13du;
             CHECK(prosper::frontend::execute_live_compute_items({raw_item}),
                   "raw 3D fill proves complete write coverage");
-            const std::vector<uint8_t> raw_expected = raw_guest;
+            const std::vector<uint8_t> raw_expected(raw_guest,
+                                                    raw_guest + raw_guest_bytes);
             CHECK(prosper::frontend::execute_live_compute_items({raw_item}),
                   "raw 3D fill establishes a retained exact result baseline");
+#if defined(__linux__)
+            auto raw_repeat_watch = prosper::host::GuestWriteWatch::create(
+                reinterpret_cast<uint64_t>(raw_guest), raw_guest_bytes);
+#endif
             uint32_t raw_repeat_notifications = 0;
             set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
-                if (addr == raw_dst.gpu_addr && size == raw_guest.size())
+                if (addr == raw_dst.gpu_addr && size == raw_guest_bytes)
                     ++raw_repeat_notifications;
             });
             CHECK(prosper::frontend::execute_live_compute_items({raw_item}),
                   "retained raw 3D fill repeats an identical dispatch");
             set_guest_gpu_write_observer({});
-            CHECK(raw_guest == raw_expected && raw_repeat_notifications == 0,
-                  "GPU-identical raw 3D output skips pack, retile, and guest invalidation");
+            CHECK(std::equal(raw_guest, raw_guest + raw_guest_bytes, raw_expected.begin()) &&
+                      raw_repeat_notifications == 1,
+                  "GPU-identical raw 3D output skips pack/retile but invalidates renderer aliases");
+#if defined(__linux__)
+            CHECK(static_cast<bool>(raw_repeat_watch) && raw_repeat_watch.query() ==
+                      prosper::host::GuestWriteWatchQuery::Unchanged,
+                  "GPU-identical raw 3D output leaves guest-byte dirty tracking clean");
+            raw_repeat_watch.reset();
+#endif
 
             raw_guest[0] ^= 0xff;
             uint32_t raw_repair_notifications = 0;
             set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
-                if (addr == raw_dst.gpu_addr && size == raw_guest.size())
+                if (addr == raw_dst.gpu_addr && size == raw_guest_bytes)
                     ++raw_repair_notifications;
             });
             CHECK(prosper::frontend::execute_live_compute_items({raw_item}),
                   "externally changed raw 3D mirror reruns the retained dispatch");
             set_guest_gpu_write_observer({});
-            CHECK(raw_guest == raw_expected && raw_repair_notifications == 1,
+            CHECK(std::equal(raw_guest, raw_guest + raw_guest_bytes, raw_expected.begin()) &&
+                      raw_repair_notifications == 1,
                   "external raw 3D mirror change forces exact writeback and invalidation");
         }
+#if defined(__linux__)
+        prosper::host::guest_write_watch_notify_direct_mapping_removed(
+            reinterpret_cast<uint64_t>(raw_guest), raw_guest_bytes);
+        prosper::host::guest_write_watch_set_fault_onstack(false);
+        munmap(raw_guest, raw_guest_bytes);
+#endif
     }
 
     // (b) PARTIAL store under a FULL grid (reviewer B1): a write-only 2D kernel that always stores to
