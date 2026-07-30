@@ -3163,10 +3163,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // if this replay device supports the optional typed format, while a live module is only
             // emitted as float after the frontend's physical-device feature query.
             bi.native_float_storage = spirv_native_storage;
-            bi.graphics_sampled_usage = bi.native_float_storage && ordinary_2d_storage &&
+            bi.graphics_sampled_usage = bi.native_float_storage &&
+                (ordinary_2d_storage || ordinary_3d_storage) &&
                 native_storage_image_create_supported(
-                    ctx.physical, native_storage_format, VK_IMAGE_TYPE_2D,
-                    r->width, r->height, 1u, 1u,
+                    ctx.physical, native_storage_format, native_storage_type,
+                    r->width, r->height, ordinary_3d_storage ? r->depth : 1u, 1u,
                     VK_IMAGE_USAGE_SAMPLED_BIT);
             if (trace)
                 std::fprintf(stderr,
@@ -5971,8 +5972,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         const auto writeback_publish_start = ComputeClock::now();
         // Every storage image is back in GENERAL, all exact guest writebacks/notifications have
         // completed, and a failed dispatch cannot reach here. Native results may seed a later
-        // sampled cache with a device-local copy; only 2D images created with SAMPLED usage may also
-        // be exported directly to graphics. Raw interchange images are compatible with neither.
+        // sampled cache with a device-local copy; exact 2D/3D images created with SAMPLED usage may
+        // also be exported directly to graphics. Raw interchange images are compatible with neither.
         for (const BoundImage& image : images) {
             if (!image.storage || !image.native_float_storage ||
                 image.alias_of != SIZE_MAX || !image.cache_candidate || !image.persistent)
@@ -6075,7 +6076,8 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
     if (!context || !context->device || !sampled_resource.gpu_addr ||
         sampled_resource.cls != prosper::gpu::ResourceClass::Texture ||
         sampled_resource.host_data || !guest_bytes || guest_bytes > UINT32_MAX ||
-        sampled_resource.img_dim != 1 || sampled_resource.depth != 1 ||
+        !((sampled_resource.img_dim == 1 && sampled_resource.depth == 1) ||
+          (sampled_resource.img_dim == 2 && sampled_resource.depth != 0)) ||
         sampled_resource.declared_mip_levels != 1 || sampled_resource.in_mip_tail ||
         sampled_resource.srgb ||
         sampled_resource.depth_compare)

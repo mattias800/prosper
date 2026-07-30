@@ -2721,6 +2721,22 @@ int main() {
                       "native 3D result repairs an external mirror write before transfer");
 #endif
 
+                ShaderResource sampled_native_3d = raw_dst;
+                sampled_native_3d.cls = ResourceClass::Texture;
+                prosper::frontend::LiveComputeImageImport graphics_import;
+                CHECK(prosper::frontend::import_live_compute_storage_image(
+                          sampled_native_3d, raw_guest_bytes, graphics_import) &&
+                          graphics_import.valid() && graphics_import.width == RW &&
+                          graphics_import.height == RH && graphics_import.depth == RD,
+                      "validated native 3D storage result can be leased by graphics");
+                ShaderResource mismatched_native_3d = sampled_native_3d;
+                --mismatched_native_3d.depth;
+                prosper::frontend::LiveComputeImageImport rejected_graphics_import;
+                CHECK(!prosper::frontend::import_live_compute_storage_image(
+                          mismatched_native_3d, raw_guest_bytes, rejected_graphics_import),
+                      "graphics volume import requires exact 3D descriptor identity");
+                graphics_import = {};
+
                 static const uint32_t sampled_copy_3d[] = {
                     0x7E080300u,             // v4 = v0 (x)
                     0x7E0A0301u,             // v5 = v1 (y)
