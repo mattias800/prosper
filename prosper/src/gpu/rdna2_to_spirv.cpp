@@ -3127,6 +3127,20 @@ std::unordered_set<uint32_t> mask_test_branches(const std::vector<Rdna2Inst>& in
     std::unordered_set<uint32_t> out;
     std::unordered_set<int> b32_masks;
     std::unordered_set<uint32_t> b32_mask_writer_pcs;
+    std::unordered_set<uint32_t> block_entries;
+    if (allow_b32_masks) {
+        for (const auto& candidate : ins) {
+            if (candidate.is_end) break;
+            if (candidate.fmt != Rdna2Format::SOPP ||
+                (candidate.opcode != 0x02 &&
+                 (candidate.opcode < 0x04 || candidate.opcode > 0x09)))
+                continue;
+            const int64_t target = static_cast<int64_t>(candidate.pc) +
+                candidate.len_dwords + candidate.simm16;
+            if (target >= 0 && target <= UINT32_MAX)
+                block_entries.insert(static_cast<uint32_t>(target));
+        }
+    }
     auto tracked_mask_source = [&](const Operand& source) {
         return source.value == 126 ||
                ((source.kind == OperandKind::SGPR ||
@@ -3135,6 +3149,13 @@ std::unordered_set<uint32_t> mask_test_branches(const std::vector<Rdna2Inst>& in
     };
     const Rdna2Inst* prev = nullptr;
     for (const auto& in : ins) {
+        // B32 mask provenance is intentionally basic-block local. A linear scan cannot prove which
+        // predecessor supplied an SGPR at a join, so carrying one arm's compare into the merge can
+        // make an ordinary scalar SCC branch look like a disposable whole-wave vote.
+        if (allow_b32_masks && block_entries.contains(in.pc)) {
+            b32_masks.clear();
+            prev = nullptr;
+        }
         if (in.is_end) break;
         if (sopp_is_noop(in)) continue;                         // hints don't break the mask->branch pairing
         if (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x04 || in.opcode == 0x05) && in.simm16 > 0) {
@@ -3218,7 +3239,14 @@ std::unordered_set<uint32_t> mask_test_branches(const std::vector<Rdna2Inst>& in
                 b32_mask_writer_pcs.insert(in.pc);
             }
         }
-        prev = &in;
+        const bool ends_block = in.fmt == Rdna2Format::SOPP &&
+            (in.opcode == 0x02 || (in.opcode >= 0x04 && in.opcode <= 0x09));
+        if (allow_b32_masks && ends_block) {
+            b32_masks.clear();
+            prev = nullptr;
+        } else {
+            prev = &in;
+        }
     }
     return out;
 }
@@ -4133,7 +4161,9 @@ uint32_t scalar_write_width(const Rdna2Inst& in) {
             if (in.opcode == 0x20) return 0; // s_setpc_b64 reads its decoded "dst" field.
             switch (in.opcode) {
                 case 0x04: case 0x08: case 0x0a: case 0x1f:
-                case 0x24: case 0x25: case 0x28: case 0x37:
+                case 0x24: case 0x25: case 0x26: case 0x27:
+                case 0x28: case 0x29: case 0x2a: case 0x2b:
+                case 0x37: case 0x38:
                     return 2; // B64 data/mask writes
                 default: return 1;
             }
@@ -4184,8 +4214,10 @@ void for_each_scalar_write(const Rdna2Inst& in, Visitor&& visit,
 bool scalar_write_is_b64_mask(const Rdna2Inst& in, int base) {
     if (in.fmt == Rdna2Format::SOP1 && in.dst.value == base) {
         switch (in.opcode) {
-            case 0x04: case 0x08: case 0x0a: case 0x24: case 0x25: case 0x28:
-            case 0x37:
+            case 0x04: case 0x08: case 0x0a:
+            case 0x24: case 0x25: case 0x26: case 0x27:
+            case 0x28: case 0x29: case 0x2a: case 0x2b:
+            case 0x37: case 0x38:
                 return true;
             default: break;
         }

@@ -507,6 +507,37 @@ int main() {
     }
     printf("  [ok]   B64 scalar writes invalidate every covered Wave32 mask word\n");
 
+    const uint32_t wave32_mask_overwritten_by_saveexec[] = {
+        0x7d865cf9u, 0x06868104u,            // v_cmp_le_u32_sdwa s1, s4, v46
+        0xbe802680u,                         // s_xor_saveexec_b64 s[0:1], 0
+        0x87008101u,                         // s_and_b32 s0, s1, 1 (ordinary scalar data)
+        0xbf840002u,                         // s_cbranch_scc0
+        0xbf810000u,
+    };
+    if (!mask_test_branches_for_test(wave32_mask_overwritten_by_saveexec,
+                                     std::size(wave32_mask_overwritten_by_saveexec), true).empty()) {
+        printf("  [FAIL] B64 SAVEEXEC overwrite retained stale high-word mask provenance\n");
+        return 1;
+    }
+    printf("  [ok]   every supported B64 SAVEEXEC form has a two-word write lifetime\n");
+
+    // The compare executes only on the fall-through predecessor. At the join, s1 is not proven to
+    // be a mask on every path, so the following scalar SCC branch must remain real control flow.
+    const uint32_t wave32_path_dependent_branch_mask[] = {
+        0xbf060000u,                         // s_cmp_eq_u32 s0, s0
+        0xbf840002u,                         // s_cbranch_scc0 -> join at PC4
+        0x7d865cf9u, 0x06868104u,            // v_cmp_le_u32_sdwa s1, s4, v46
+        0x87008101u,                         // join: s_and_b32 s0, s1, 1
+        0xbf840002u,                         // real s_cbranch_scc0
+        0xbf810000u,
+    };
+    if (!mask_test_branches_for_test(wave32_path_dependent_branch_mask,
+                                     std::size(wave32_path_dependent_branch_mask), true).empty()) {
+        printf("  [FAIL] path-dependent B32 mask provenance escaped its predecessor block\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 mask-branch proof does not cross control-flow joins\n");
+
     // The same live shader selects EXEC_LO or an empty mask into VCC_HI from an ordinary scalar
     // comparison. This is s_cselect_b32's mask-domain form, not a scalar integer selection.
     const uint32_t wave32_fragment_b32_cselect[] = {
