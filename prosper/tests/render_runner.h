@@ -4845,6 +4845,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         });
     const bool synchronous_results_requested =
         readback_requested || storage_writeback_requested;
+    const bool flush_now = !submission_batch || synchronous_results_requested ||
+                           flush_submission_batch;
     VkBuffer rb = VK_NULL_HANDLE;
     VkDeviceMemory bmem = VK_NULL_HANDLE;
     if (readback_requested) {
@@ -5165,13 +5167,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // Per-draw "fragment funnel" (PROSPER_DRAW_STATS): wrap each recorded draw in pipeline-statistics
     // + occlusion queries to show WHERE its pixels vanish (geometry clipped away, never rasterized,
     // depth/stencil-rejected, or survived) — objective per-draw truth, no oracle needed. Read-only, and
-    // only active with the env var AND a real flush in THIS call (so the results are ready to read back;
-    // the flush condition below is identical to `flush_now` computed after the pass). Query-pool RESET
-    // must be recorded outside a render pass, so it happens here.
+    // only active with the env var AND a real flush in THIS call (so the results are ready to read back).
+    // Query-pool RESET must be recorded outside a render pass, so it happens here.
     const RenderVkCtx& ds_ctx = render_vk_ctx();
-    const bool draw_stats = getenv("PROSPER_DRAW_STATS") && ds_ctx.pipeline_stats_enabled && !dv.empty()
-                            && (!submission_batch || synchronous_results_requested ||
-                                flush_submission_batch);
+    const bool draw_stats = getenv("PROSPER_DRAW_STATS") && ds_ctx.pipeline_stats_enabled &&
+                            !dv.empty() && flush_now;
     VkQueryPool ds_stats_pool = VK_NULL_HANDLE, ds_occ_pool = VK_NULL_HANDLE;
     if (draw_stats) {
         const uint32_t nq = static_cast<uint32_t>(dv.size());
@@ -5218,10 +5218,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             }) && geom_target < draws.size())
             geom_item = static_cast<size_t>(geom_target);
     }
-    const bool geom_probe = geom_item != SIZE_MAX
-                            && ds_ctx.transform_feedback_enabled
-                            && (!submission_batch || synchronous_results_requested ||
-                                flush_submission_batch);
+    const bool geom_probe = geom_item != SIZE_MAX &&
+                            ds_ctx.transform_feedback_enabled && flush_now;
     static auto p_bindxfb  = reinterpret_cast<PFN_vkCmdBindTransformFeedbackBuffersEXT>(
         vkGetDeviceProcAddr(dev, "vkCmdBindTransformFeedbackBuffersEXT"));
     static auto p_beginxfb = reinterpret_cast<PFN_vkCmdBeginTransformFeedbackEXT>(
@@ -5478,7 +5476,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         restore_persistent_color(persistent_color, readback_color0, img);
         restore_persistent_color(persistent_color1, readback_color1, img1);
     }
-    if (timing_enabled && flush_submission_batch)
+    if (timing_enabled && flush_now)
         active_submission.end_gpu_timestamp(cmd);
     vkEndCommandBuffer(cmd);
 
@@ -5564,8 +5562,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         cached_color1->valid = true;
         cached_color1->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
-    const bool flush_now = !submission_batch || synchronous_results_requested ||
-                           flush_submission_batch;
     BackendSubmissionBatchResult batch_result;
     if (flush_now)
         batch_result = active_submission.submit_and_wait(dev, queue, backend_trace);
