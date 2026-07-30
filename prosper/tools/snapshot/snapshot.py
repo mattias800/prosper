@@ -18,7 +18,7 @@ Usage:
   snapshot.py list
 
 Env overrides:
-  PROSPER_GAME_ROOT   dir holding the <dump> subdirs   (default: /mnt/c/Users/matti/repos/ps5ys)
+  PROSPER_GAME_ROOT   dir holding the <dump> subdirs   (default: the main checkout root)
   PROSPER_BOOT_TRACE  path to the boot_trace binary    (default: <prosper>/build-linux/boot_trace)
   PROSPER_SCREENSHOT  path to the screenshot binary    (default: <prosper>/build-linux/screenshot)
   PROSPER_SNAPSHOT_LOCK path for the cross-worktree capture lock
@@ -39,7 +39,22 @@ PROSPER_ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 MANIFEST = os.path.join(HERE, "snapshots.json")
 FAIL_DIR = os.path.join(HERE, "failures")
 REVIEW_DIR = os.path.join(HERE, "review")
-GAME_ROOT = os.environ.get("PROSPER_GAME_ROOT", "/mnt/c/Users/matti/repos/ps5ys")
+# The dumps live beside the MAIN checkout root, so derive the default instead of hard-coding one
+# developer's absolute path into a public repository. Use git's common dir rather than
+# <prosper>/..: everyone here works in worktrees under .claude/worktrees/, where <prosper>/..
+# is the worktree root and holds no dumps, while --git-common-dir always names the main .git.
+def _default_game_root():
+    try:
+        common = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=PROSPER_ROOT, capture_output=True, text=True, timeout=10)
+        if common.returncode == 0 and common.stdout.strip():
+            return os.path.dirname(common.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return os.path.normpath(os.path.join(PROSPER_ROOT, ".."))
+
+GAME_ROOT = os.environ.get("PROSPER_GAME_ROOT") or _default_game_root()
 
 _PR_SET_PDEATHSIG = 1
 _LIBC = ctypes.CDLL(None, use_errno=True) if sys.platform.startswith("linux") else None
