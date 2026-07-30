@@ -682,6 +682,41 @@ int main() {
               astro_bvh_table.resources[0].fetch_pc == 0,
           "Astro BVH bytes materialize as the instruction-scoped read-only compute buffer");
 
+    // Recreate the live descriptor builder rather than seeding its final words: the header pointer
+    // is stored in 8-byte units, the allocation count is loaded from byte offset 0x58, and a
+    // carry-propagating subtract produces the 64-byte count-minus-one before TYPE/mode are ORed in.
+    // Dropping either S_LSHL_B64's high half or S_ADDC_U32's carry leaves this use unresolved.
+    astro_bvh_backing[22] = 64u;
+    astro_bvh_backing[23] = 0u;
+    const uint32_t astro_bvh_builder[] = {
+        0x8F88831Cu,                         // pc0:  s_lshl_b64 s[8:9], s[28:29], 3
+        0xF4100404u, 0xFA000000u,            // pc1:  s_load_dwordx16 s[16:31], s[8:9], 0
+        0xF4080904u, 0xFA000058u,            // pc3:  s_load_dwordx4 s[36:39], s[8:9], 0x58
+        0x8012C124u,                         // pc5:  s_add_u32 s18, s36, -1
+        0x8213C125u,                         // pc6:  s_addc_u32 s19, s37, -1
+        0x876A13FFu, 0x000003FFu,            // pc7:  s_and_b32 s106, 0x3ff, s19
+        0x9490FF08u, 0x00280008u,            // pc9:  s_bfe_u64 s[16:17], s[8:9], 8:40
+        0x8813FF6Au, 0x81000000u,            // pc11: s_or_b32 s19, s106, TYPE/mode
+        0xF1989F07u, 0x00040303u, 0x43440D3Fu, 0x46424140u, 0x00004847u,
+        0xBF810000u,
+    };
+    std::array<uint32_t, 40> astro_builder_seed{};
+    const uint64_t astro_bvh_base8 = astro_bvh_base >> 3;
+    astro_builder_seed[28] = static_cast<uint32_t>(astro_bvh_base8);
+    astro_builder_seed[29] = static_cast<uint32_t>(astro_bvh_base8 >> 32);
+    std::vector<SrtUse> astro_builder_uses;
+    resolve_dynamic_fetch(astro_bvh_builder, std::size(astro_bvh_builder),
+                          astro_builder_seed.data(), astro_builder_seed.size(), 0,
+                          &astro_builder_uses);
+    const DecodedBvhDescriptor built_bvh = astro_builder_uses.size() == 1
+        ? decode_bvh_descriptor(astro_builder_uses[0].bvh4.data())
+        : DecodedBvhDescriptor{};
+    CHECK(astro_builder_uses.size() == 1 && astro_builder_uses[0].kind == 2 &&
+              built_bvh.base == astro_bvh_base &&
+              built_bvh.size_bytes == sizeof(astro_bvh_backing) &&
+              built_bvh.type == 8u && built_bvh.triangle_return_mode,
+          "Astro's carry/shift descriptor builder resolves the exact BVH binding");
+
     // Astro Bot's live visibility packet consumes a direct R32_UINT T# in s[0:7]. Opcode 0x0f is
     // IMAGE_ATOMIC_SWAP, so its instruction-scoped resource must be materialized as a storage image
     // even though the packet's unused SSAMP field aliases s0.

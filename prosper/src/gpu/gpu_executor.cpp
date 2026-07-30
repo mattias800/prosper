@@ -1965,22 +1965,76 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 kc = (in.src[1].kind == OperandKind::Literal) ? (c = in.literal, true) : srcval(in.src[1], c);
                 int d = in.dst.value; bool ok = ka && kc; uint32_t r = 0;
                 uint32_t hi64 = 0; bool wrote_pair = false;
+                int next_scc = scc;
                 if (ok) switch (in.opcode) {
-                    case 0x00: case 0x02: r = a + c; break;                 // s_add_u32 / s_add_i32
-                    case 0x01: case 0x03: r = a - c; break;                 // s_sub_u32 / s_sub_i32
-                    case 0x0E: r = a & c; break;                            // s_and_b32
-                    case 0x10: r = a | c; break;                            // s_or_b32
-                    case 0x12: r = a ^ c; break;                            // s_xor_b32
-                    case 0x1E: r = a << (c & 31); break;                    // s_lshl_b32
-                    case 0x20: r = a >> (c & 31); break;                    // s_lshr_b32
+                    case 0x00: {                                           // s_add_u32
+                        const uint64_t sum = static_cast<uint64_t>(a) + c;
+                        r = static_cast<uint32_t>(sum);
+                        next_scc = static_cast<int>(sum >> 32);
+                        break;
+                    }
+                    case 0x01:                                             // s_sub_u32
+                        r = a - c; next_scc = a < c; break;
+                    case 0x02: {                                           // s_add_i32
+                        r = a + c;
+                        next_scc = ((~(a ^ c) & (a ^ r)) >> 31) != 0;
+                        break;
+                    }
+                    case 0x03:                                             // s_sub_i32
+                        r = a - c; next_scc = (((a ^ c) & (a ^ r)) >> 31) != 0; break;
+                    case 0x04: {                                           // s_addc_u32
+                        if (scc < 0) { ok = false; break; }
+                        const uint64_t sum = static_cast<uint64_t>(a) + c +
+                                             static_cast<uint32_t>(scc);
+                        r = static_cast<uint32_t>(sum);
+                        next_scc = static_cast<int>(sum >> 32);
+                        break;
+                    }
+                    case 0x0E: r = a & c; next_scc = r != 0; break;         // s_and_b32
+                    case 0x10: r = a | c; next_scc = r != 0; break;         // s_or_b32
+                    case 0x12: r = a ^ c; next_scc = r != 0; break;         // s_xor_b32
+                    case 0x1E:                                             // s_lshl_b32
+                        r = a << (c & 31); next_scc = r != 0; break;
+                    case 0x20:                                             // s_lshr_b32
+                        r = a >> (c & 31); next_scc = r != 0; break;
                     case 0x26: r = a * c; break;                            // s_mul_i32
-                    case 0x2E: case 0x2F: case 0x30: case 0x31:
-                        r = (a << (in.opcode - 0x2Du)) + c; break;           // s_lshl{1,2,3,4}_add_u32
+                    case 0x2E: case 0x2F: case 0x30: case 0x31: {           // s_lshl{1,2,3,4}_add_u32
+                        const uint32_t shift = in.opcode - 0x2Du;
+                        const uint64_t sum = (static_cast<uint64_t>(a) << shift) + c;
+                        r = static_cast<uint32_t>(sum);
+                        next_scc = sum >= (uint64_t{1} << 32);
+                        break;
+                    }
                     case 0x27: { uint32_t off = c & 0x1f, wid = (c >> 16) & 0x7f;   // s_bfe_u32
-                                 r = wid == 0 ? 0 : (wid >= 32 ? (a >> off) : ((a >> off) & ((1u << wid) - 1))); break; }
+                                 r = wid == 0 ? 0 : (wid >= 32 ? (a >> off) : ((a >> off) & ((1u << wid) - 1)));
+                                 next_scc = r != 0; break; }
                     case 0x0A:   // s_cselect_b32: dst = SCC ? src0 : src1 (the vertex-fetch format patch's tail)
                         if (scc < 0) ok = false; else r = scc ? a : c;
                         break;
+                    case 0x1F: case 0x21: {  // s_lshl_b64 / s_lshr_b64
+                        uint32_t ahi = 0;
+                        bool khi = false;
+                        if (in.src[0].kind == OperandKind::SGPR)
+                            khi = known(in.src[0].value + 1, ahi);
+                        else if (in.src[0].kind == OperandKind::InlineInt) {
+                            ahi = in.src[0].value < 0 ? UINT32_MAX : 0u;
+                            khi = true;
+                        } else if (in.src[0].kind == OperandKind::Literal) {
+                            ahi = 0;
+                            khi = true;
+                        }
+                        if (!khi) { ok = false; wrote_pair = true; break; }
+                        const uint64_t src64 = static_cast<uint64_t>(a) |
+                                               (static_cast<uint64_t>(ahi) << 32);
+                        const uint32_t shift = c & 63u;
+                        const uint64_t result = in.opcode == 0x1Fu
+                            ? src64 << shift : src64 >> shift;
+                        r = static_cast<uint32_t>(result);
+                        hi64 = static_cast<uint32_t>(result >> 32);
+                        wrote_pair = true;
+                        next_scc = result != 0;
+                        break;
+                    }
                     case 0x29: {  // s_bfe_u64: dst[63:0] = bitfield of src0[63:0] (format patch reads a small field)
                         uint32_t off = c & 0x3f, wid = (c >> 16) & 0x7f, ahi = 0;
                         // src0's high dword (RDNA2 ISA 64-bit scalar-operand rules, #155): the next SGPR
@@ -1998,20 +2052,20 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         if (!khi && wid != 0 && off + wid > 32) { ok = false; wrote_pair = true; break; }
                         uint64_t src64 = (uint64_t)a | ((uint64_t)ahi << 32);
                         uint64_t res = wid == 0 ? 0 : (wid >= 64 ? (src64 >> off) : ((src64 >> off) & (((uint64_t)1 << wid) - 1)));
-                        r = (uint32_t)res; hi64 = (uint32_t)(res >> 32); wrote_pair = true; break;
+                        r = (uint32_t)res; hi64 = (uint32_t)(res >> 32); wrote_pair = true;
+                        next_scc = res != 0; break;
                     }
                     default: ok = false; break;                            // SCC-dependent / unmodeled -> unknown
                 }
                 if (trc)   // unfiltered like the SMEM/MUBUF traces (one shader walk — volume is bounded)
                     fprintf(stderr, "[dyntrace]   SOP2 pc=%u op=0x%x dst=s%d src0=%d(k%d) src1=%d(k%d) ok=%d r=0x%x\n",
                             in.pc, in.opcode, d, in.src[0].value, ka, in.src[1].value, kc, ok, r);
-                // Every SOP2 ALU op except s_cselect writes SCC to a value we don't track here — invalidate so a
-                // later s_cselect only trusts SCC set by an immediately-preceding s_cmp.
-                if (in.opcode != 0x0A) scc = -1;
+                scc = ok ? next_scc : -1;
                 if (ok) { set_value(d, r); if (wrote_pair) set_value(d + 1, hi64); }
-                // A 64-bit-dst op (s_bfe_u64) invalidates BOTH dwords even when its sources were
-                // unknown (the opcode switch never ran, so wrote_pair may still be false).
-                else    { forget(d); if (wrote_pair || in.opcode == 0x29) forget(d + 1); }
+                // A 64-bit-dst op invalidates BOTH dwords even when its source was unknown (the
+                // opcode switch may not have reached the point that marks wrote_pair).
+                else    { forget(d); if (wrote_pair || in.opcode == 0x1F || in.opcode == 0x21 ||
+                                         in.opcode == 0x29) forget(d + 1); }
                 break;
             }
             case Rdna2Format::SOPC: {   // scalar compare -> SCC (feeds the format patch's s_cselect)
