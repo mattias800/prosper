@@ -95,7 +95,10 @@ counts matching invocations that reach the registered renderer, after the normal
 sampling. Aim the live run near the target first; the capture itself writes once.
 `PROSPER_GPU_CAPTURE_COMPUTE_ADDR=0x...` additionally requires the exact compute program address.
 Use it for a late or intermittent compute fault when predicting a renderer invocation or semantic
-submit number would be fragile.
+submit number would be fragile. If an earlier producer failure leaves a selected indirect dispatch's
+arguments unavailable, the capsule keeps that operation unrealized with its zero/unknown launch but
+still retains the semantic program's bounded raw shader and descriptor metadata. Inspect or dump that
+failed stage offline instead of rerunning the title merely to recover its shader bytes.
 `PROSPER_GPU_CAPTURE_SHADER_ADDR=0x...` does the same for any realized or semantic draw stage,
 including a shader whose draw failed realization and therefore never reached the renderer.
 `PROSPER_GPU_CAPTURE_TARGET_DIM=WxH` requires at least one realized or semantic color target with the
