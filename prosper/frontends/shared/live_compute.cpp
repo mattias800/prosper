@@ -170,6 +170,9 @@ namespace {
 std::atomic<uint64_t> g_buffer_gpu_result_skips{0};
 std::atomic<uint64_t> g_compute_storage_transfer_seeds{0};
 std::atomic<bool> g_fail_next_storage_readback_for_test{false};
+std::atomic<bool> g_zero_next_cold_storage_snapshot_minimum_for_test{false};
+std::atomic<bool> g_force_next_image_result_host_fallback_for_test{false};
+std::atomic<bool> g_fail_next_image_result_buffer_retain_for_test{false};
 
 VkFormat native_storage_vk_format(prosper::gpu::DataFormat format, uint32_t components) {
     using prosper::gpu::DataFormat;
@@ -838,6 +841,22 @@ bool native_3d_transfer_enabled() {
     return enabled;
 }
 
+size_t cold_storage_result_snapshot_defer_min_bytes() {
+    if (g_zero_next_cold_storage_snapshot_minimum_for_test.exchange(
+            false, std::memory_order_acq_rel))
+        return 0;
+    static const size_t bytes = [] {
+        const char* value = std::getenv("PROSPER_COLD_STORAGE_SNAPSHOT_MIN_MB");
+        char* end = nullptr;
+        const uint64_t parsed = value ? std::strtoull(value, &end, 10) : 16ull;
+        const uint64_t mib = value && (!end || *end) ? 16ull : parsed;
+        return static_cast<size_t>(
+            std::min<uint64_t>(mib, SIZE_MAX / (1024ull * 1024ull)) *
+            (1024ull * 1024ull));
+    }();
+    return bytes;
+}
+
 struct CachedComputePipeline {
     VkDescriptorSetLayout descriptor_layout = VK_NULL_HANDLE;
     VkShaderModule shader = VK_NULL_HANDLE;
@@ -895,6 +914,8 @@ struct VulkanComputeContext {
     uint64_t image_source_snapshot_bytes = 0;
     uint64_t storage_result_snapshot_copies = 0;
     uint64_t storage_result_snapshot_bytes = 0;
+    uint64_t image_result_snapshot_copies = 0;
+    uint64_t image_result_snapshot_bytes = 0;
     VkDescriptorSetLayout compare_descriptor_layout = VK_NULL_HANDLE;
     VkShaderModule compare_shader = VK_NULL_HANDLE;
     VkPipelineLayout compare_pipeline_layout = VK_NULL_HANDLE;
@@ -1658,6 +1679,36 @@ struct VulkanComputeContext {
     }
 
     bool retain_image(const ComputeImageCacheKey& key, VkImage image, VkDeviceMemory memory,
+                      VkDeviceSize allocation_bytes,
+                      std::vector<uint8_t>&& prepared_source_snapshot) {
+        if (!prepared_source_snapshot.empty() &&
+            prepared_source_snapshot.size() != key.guest_bytes)
+            return false;
+        if (!make_image_cache_room(allocation_bytes)) return false;
+        CachedComputeImage cached;
+        cached.image = image;
+        cached.memory = memory;
+        cached.allocation_bytes = allocation_bytes;
+        cached.last_use = ++image_cache_clock;
+        cached.pins = 1;
+        if (!key.host_data)
+            cached.validation_snapshot = prosper::gpu::guest_gpu_write_snapshot();
+        if (!prepared_source_snapshot.empty()) {
+            cached.source_snapshot = std::move(prepared_source_snapshot);
+            ++image_source_snapshot_copies;
+            image_source_snapshot_bytes += key.guest_bytes;
+            if (key.storage) {
+                ++storage_result_snapshot_copies;
+                storage_result_snapshot_bytes += key.guest_bytes;
+            }
+        }
+        auto [it, inserted] = image_cache.emplace(key, std::move(cached));
+        if (!inserted) return false;
+        image_cache_bytes += allocation_bytes;
+        return true;
+    }
+
+    bool retain_image(const ComputeImageCacheKey& key, VkImage image, VkDeviceMemory memory,
                       VkDeviceSize allocation_bytes, const uint8_t* source) {
         if (!make_image_cache_room(allocation_bytes)) return false;
         CachedComputeImage cached;
@@ -1813,6 +1864,15 @@ struct VulkanComputeContext {
         if (found == image_cache.end()) return false;
         CachedComputeImage& cached = found->second;
         if (cached.result_buffer) return false;
+        // This staging buffer contains the current dispatch result. Once the caller chooses it as
+        // the replacement baseline, an older host fallback is no longer authoritative even when
+        // ownership fails (for example because every cache entry is pinned). Leaving that fallback
+        // behind could let a later A result match stale A after failed result B remained in guest
+        // memory, incorrectly suppressing the required A writeback.
+        std::vector<uint8_t>().swap(cached.result_snapshot);
+        if (g_fail_next_image_result_buffer_retain_for_test.exchange(
+                false, std::memory_order_acq_rel))
+            return false;
         if (!make_image_cache_room(allocation_bytes)) return false;
         cached.result_buffer = buffer;
         cached.result_memory = memory;
@@ -1822,8 +1882,6 @@ struct VulkanComputeContext {
         image_cache_bytes += allocation_bytes;
         buffer = VK_NULL_HANDLE;
         memory = VK_NULL_HANDLE;
-        cached.result_snapshot.clear();
-        cached.result_snapshot.shrink_to_fit();
         return true;
     }
 
@@ -1834,8 +1892,11 @@ struct VulkanComputeContext {
         if (found == image_cache.end()) return;
         // A retained GPU baseline is updated in the dispatch command buffer. Keep the old host
         // snapshot only as the exact fallback for small/unaligned results that cannot use it.
-        if (!found->second.result_buffer)
+        if (!found->second.result_buffer) {
             found->second.result_snapshot.assign(result, result + bytes);
+            ++image_result_snapshot_copies;
+            image_result_snapshot_bytes += bytes;
+        }
     }
 
     bool prepare_compare_pipeline() {
@@ -2656,6 +2717,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     double writeback_buffers_ms = 0.0;
     double writeback_images_ms = 0.0;
     double writeback_publish_ms = 0.0;
+    double image_map_ms = 0.0;
+    double image_prepare_ms = 0.0;
+    double image_watch_ms = 0.0;
+    double image_notify_ms = 0.0;
+    double image_cache_ms = 0.0;
     const std::vector<uint32_t>& spirv = item.spirv;
     const bool trace = trace_compute_item(item);
     maybe_dump_traced_compute_spirv(item, trace);
@@ -5511,10 +5577,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         ctx.validate_cached_image_source(image.cache_key);
                 }
             } else if (image.image && image.memory && image.allocation_bytes &&
-                       ctx.retain_image(image.cache_key, image.image, image.memory,
-                                        image.allocation_bytes,
-                                        image.cache_source_snapshot.empty()
-                                            ? nullptr : image.cache_source_snapshot.data())) {
+                       (image.cache_source_snapshot.empty()
+                            ? ctx.retain_image(image.cache_key, image.image, image.memory,
+                                               image.allocation_bytes,
+                                               static_cast<const uint8_t*>(nullptr))
+                            : ctx.retain_image(image.cache_key, image.image, image.memory,
+                                               image.allocation_bytes,
+                                               std::move(image.cache_source_snapshot)))) {
                 image.persistent = true;
                 if (trace)
                     std::fprintf(stderr,
@@ -5650,6 +5719,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (size_t i = 0; i < images.size() && readback_ok; i++) {
             BoundImage& bi = images[i];
             if (!bi.storage || bi.alias_of != SIZE_MAX || bi.imported) continue;
+            const auto image_writeback_start = ComputeClock::now();
+            const bool image_cache_hit = bi.persistent;
             const ShaderResource* r = bi.resource;
             const uint32_t cb = data_format_bytes(r->format);
             const uint32_t nc = r->num_components ? r->num_components : 1;
@@ -5674,6 +5745,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 continue;
             }
             void* mapped = nullptr;
+            const auto map_start = ComputeClock::now();
             if (g_fail_next_storage_readback_for_test.exchange(
                     false, std::memory_order_acq_rel)) {
                 if (trace)
@@ -5687,6 +5759,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 readback_ok = false;
                 break;
             }
+            const auto map_done = ComputeClock::now();
             const bool array_image = backend_uses_2d_array(*r);
             static const bool direct_tiled_writeback_disabled =
                 std::getenv("PROSPER_NO_DIRECT_TILED_WRITEBACK") != nullptr;
@@ -5709,6 +5782,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const bool repeated_output = bi.cache_candidate && bi.persistent &&
                 bi.upload_skipped && bi.exact_storage_bytes() &&
                 ctx.cached_image_result_matches(bi.cache_key, native_texels, linear_bytes);
+            const auto prepare_done = ComputeClock::now();
             if (repeated_output) {
                 if (trace)
                     std::fprintf(stderr,
@@ -5727,6 +5801,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (!r->host_data && r->gpu_addr)
                 prosper::host::guest_write_watch_notify_host_write(
                     r->gpu_addr, bi.guest_bytes);
+            const auto watch_done = ComputeClock::now();
             // #1122 proving-frame poison scan: a texel still fully poison was NOT stored by the write.
             // Zero survivors == the shader covers every texel (safe to fast-skip its seed henceforth);
             // any survivor == partial coverage (must always seed). Cache the verdict per (code,binding)
@@ -5893,6 +5968,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             pack_ms += std::chrono::duration<double, std::milli>(pack_done - pack_start).count();
             layout_ms += std::chrono::duration<double, std::milli>(layout_done - pack_done).count();
             if (trace) bi.after_hash = fnv1a(destination, bi.guest_bytes);
+            const auto notify_start = ComputeClock::now();
             notify_guest_gpu_write(r->gpu_addr, bi.guest_bytes);
             if (!r->host_data && writer_provenance_enabled())
                 record_guest_write(GuestWriterKind::ComputeBuffer,
@@ -5925,6 +6001,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  bi.binding, (unsigned long long)r->gpu_addr,
                                  mirror.imported_width, mirror.imported_height);
             }
+            const auto notify_done = ComputeClock::now();
+            bool retain_gpu_result_baseline = false;
             if (bi.cache_candidate) {
                 if (bi.persistent) {
                     // Guest bytes now mirror the retained image again. A changing full-overwrite
@@ -5936,7 +6014,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             native_3d_transfer_enabled());
                 } else if (bi.image && bi.memory && bi.allocation_bytes &&
                            ctx.retain_image(bi.cache_key, bi.image, bi.memory,
-                                            bi.allocation_bytes, destination)) {
+                                            bi.allocation_bytes,
+                                            (adaptive_storage_result_validation_enabled() &&
+                                             cold_storage_result_snapshot_can_defer(
+                                                 r->host_data != nullptr, bi.seed_skip,
+                                                 bi.guest_bytes,
+                                                 cold_storage_result_snapshot_defer_min_bytes()))
+                                                ? nullptr : destination)) {
                     bi.persistent = true;
                     if (trace)
                         std::fprintf(stderr,
@@ -5945,16 +6029,28 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      bi.binding, (unsigned long long)r->gpu_addr,
                                      (unsigned long long)bi.allocation_bytes);
                 }
-                if (bi.persistent)
+                // An aligned exact result is retained as the staging buffer immediately below.
+                // Copying it into a host vector first only to clear that vector after ownership
+                // transfer is pure churn (66.4 MiB for a native 4K RGBA16F target). Unavailable GPU
+                // setup keeps the exact current host fallback; a failed ownership attempt invalidates
+                // any older fallback so the next dispatch takes the ordinary writeback path.
+                const bool force_host_result_fallback =
+                    bi.persistent && !bi.result_baseline && bi.exact_result_bytes &&
+                    !(bi.exact_result_bytes & 15u) &&
+                    g_force_next_image_result_host_fallback_for_test.exchange(
+                        false, std::memory_order_acq_rel);
+                retain_gpu_result_baseline = bi.persistent && !bi.result_baseline &&
+                    bi.exact_result_bytes && !(bi.exact_result_bytes & 15u) &&
+                    !force_host_result_fallback && ctx.prepare_compare_pipeline();
+                if (bi.persistent && !retain_gpu_result_baseline)
                     ctx.remember_cached_image_result(
                         bi.cache_key, native_texels,
                         static_cast<size_t>(bi.exact_result_bytes));
             }
+            const auto cache_done = ComputeClock::now();
             ctx.unmap_memory(staging_memory[i]);
             const VkBuffer retained_result = staging[i];
-            if (bi.cache_candidate && bi.persistent && !bi.result_baseline &&
-                bi.exact_result_bytes && !(bi.exact_result_bytes & 15u) &&
-                ctx.prepare_compare_pipeline() &&
+            if (retain_gpu_result_baseline &&
                 ctx.retain_cached_image_result_buffer(
                     bi.cache_key, staging[i], staging_memory[i],
                     bi.staging_allocation_bytes, bi.exact_result_bytes)) {
@@ -5965,6 +6061,34 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  "addr=0x%llx bytes=%zu\n",
                                  bi.binding, (unsigned long long)r->gpu_addr, linear_bytes);
             }
+            const auto image_writeback_done = ComputeClock::now();
+            const auto image_milliseconds = [](auto begin, auto end) {
+                return std::chrono::duration<double, std::milli>(end - begin).count();
+            };
+            image_map_ms += image_milliseconds(map_start, map_done);
+            image_prepare_ms += image_milliseconds(map_done, prepare_done);
+            image_watch_ms += image_milliseconds(prepare_done, watch_done);
+            image_notify_ms += image_milliseconds(notify_start, notify_done);
+            image_cache_ms += image_milliseconds(notify_done, cache_done);
+            if (image_timing)
+                std::fprintf(stderr,
+                             "[compute-image-writeback] code=0x%llx binding=%u addr=0x%llx "
+                             "fmt=%u comps=%u tile=%u bytes=%zu cache-hit=%u seed-skip=%u "
+                             "poison=%u map_ms=%.3f prepare_ms=%.3f watch_ms=%.3f "
+                             "pack_ms=%.3f layout_ms=%.3f notify_ms=%.3f cache_ms=%.3f "
+                             "total_ms=%.3f\n",
+                             (unsigned long long)item.code_addr, bi.binding,
+                             (unsigned long long)r->gpu_addr, (unsigned)r->format, nc,
+                             r->tile_mode, bi.guest_bytes, image_cache_hit ? 1u : 0u,
+                             bi.seed_skip ? 1u : 0u, bi.poison_verify ? 1u : 0u,
+                             image_milliseconds(map_start, map_done),
+                             image_milliseconds(map_done, prepare_done),
+                             image_milliseconds(prepare_done, watch_done),
+                             image_milliseconds(pack_start, pack_done),
+                             image_milliseconds(pack_done, layout_done),
+                             image_milliseconds(notify_start, notify_done),
+                             image_milliseconds(notify_done, cache_done),
+                             image_milliseconds(image_writeback_start, image_writeback_done));
         }
         writeback_images_ms = std::chrono::duration<double, std::milli>(
             ComputeClock::now() - writeback_images_start).count();
@@ -6049,7 +6173,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      "pipeline_ms=%.2f dispatch_ms=%.2f "
                      "writeback_ms=%.2f writeback_prepare_ms=%.2f "
                      "writeback_buffers_ms=%.2f writeback_images_ms=%.2f "
-                     "writeback_publish_ms=%.2f pack_ms=%.2f layout_ms=%.2f "
+                     "writeback_publish_ms=%.2f map_ms=%.2f prepare_ms=%.2f watch_ms=%.2f "
+                     "pack_ms=%.2f layout_ms=%.2f notify_ms=%.2f cache_ms=%.2f "
                      "cleanup_ms=%.2f total_ms=%.2f subgroup=%u\n",
                      (unsigned long long)item.submit_no, (unsigned long long)item.code_addr,
                      ok ? 1u : 0u, milliseconds(phase_start, phase_setup),
@@ -6059,7 +6184,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      milliseconds(phase_dispatch, phase_writeback),
                      writeback_prepare_ms, writeback_buffers_ms,
                      writeback_images_ms, writeback_publish_ms,
-                     pack_ms, layout_ms,
+                     image_map_ms, image_prepare_ms, image_watch_ms,
+                     pack_ms, layout_ms, image_notify_ms, image_cache_ms,
                      milliseconds(phase_writeback, phase_cleanup),
                      milliseconds(phase_start, phase_cleanup), item.required_subgroup_size);
     }
@@ -6143,8 +6269,30 @@ uint64_t live_compute_storage_result_snapshot_bytes() {
     return g_live_compute_context ? g_live_compute_context->storage_result_snapshot_bytes : 0;
 }
 
+uint64_t live_compute_image_result_snapshot_bytes() {
+    return g_live_compute_context ? g_live_compute_context->image_result_snapshot_bytes : 0;
+}
+
+bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
+                                            size_t guest_bytes, size_t minimum_bytes) {
+    return !host_data && full_overwrite && guest_bytes >= minimum_bytes;
+}
+
 void live_compute_fail_next_storage_readback_for_test() {
     g_fail_next_storage_readback_for_test.store(true, std::memory_order_release);
+}
+
+void live_compute_zero_next_cold_storage_snapshot_minimum_for_test() {
+    g_zero_next_cold_storage_snapshot_minimum_for_test.store(
+        true, std::memory_order_release);
+}
+
+void live_compute_force_next_image_result_host_fallback_for_test() {
+    g_force_next_image_result_host_fallback_for_test.store(true, std::memory_order_release);
+}
+
+void live_compute_fail_next_image_result_buffer_retain_for_test() {
+    g_fail_next_image_result_buffer_retain_for_test.store(true, std::memory_order_release);
 }
 
 void storage_pack_unorm8_range(const uint32_t* channels, uint32_t components,
@@ -6314,12 +6462,16 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
                          (unsigned long long)pool.discarded);
             std::fprintf(stderr,
                          "[render-timing] compute_image_source snapshots=%llu %.1f MiB "
-                         "storage_results=%llu %.1f MiB gpu_transfer_seeds=%llu\n",
+                         "storage_results=%llu %.1f MiB result_fallbacks=%llu %.1f MiB "
+                         "gpu_transfer_seeds=%llu\n",
                          (unsigned long long)context.image_source_snapshot_copies,
                          static_cast<double>(context.image_source_snapshot_bytes) /
                              (1024.0 * 1024.0),
                          (unsigned long long)context.storage_result_snapshot_copies,
                          static_cast<double>(context.storage_result_snapshot_bytes) /
+                             (1024.0 * 1024.0),
+                         (unsigned long long)context.image_result_snapshot_copies,
+                         static_cast<double>(context.image_result_snapshot_bytes) /
                              (1024.0 * 1024.0),
                          (unsigned long long)g_compute_storage_transfer_seeds.load(
                              std::memory_order_relaxed));

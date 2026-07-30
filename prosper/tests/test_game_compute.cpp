@@ -35,6 +35,8 @@ int main() {
 #endif
     const bool adaptive_storage_result_validation_enabled =
         std::getenv("PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION") == nullptr;
+    const bool cold_storage_snapshot_deferral_enabled =
+        adaptive_storage_result_validation_enabled;
     using prosper::frontend::ComputeImageCacheClass;
     CHECK(prosper::frontend::compute_image_cache_default_minimum_bytes(
               ComputeImageCacheClass::sampled) == 1024ull * 1024ull &&
@@ -2531,6 +2533,133 @@ int main() {
                 }
             }
 #endif
+
+            // The first dispatch to a new target is the cache-churn shape seen in full-resolution
+            // post-processing: the shader/extent already has a Full proof, but this address has no
+            // retained image yet. A dedicated invocation lowers the production crossover to zero so
+            // this reduced target exercises the real deferring branch without a 64 MiB allocation;
+            // the ordinary and disable-switch invocations retain the previous immediate baseline.
+            std::vector<uint8_t> cold_guest(W * 8, 0x6b);
+            ShaderResourceTable cold_rt = fill_rt;
+            cold_rt.resources.back().gpu_addr =
+                reinterpret_cast<uint64_t>(cold_guest.data());
+            ComputeItem cold_item = it;
+            cold_item.resources = std::make_shared<ShaderResourceTable>(cold_rt);
+            const uint64_t cold_source_snapshots_before =
+                prosper::frontend::live_compute_storage_result_snapshot_bytes();
+            const uint64_t cold_result_snapshots_before =
+                prosper::frontend::live_compute_image_result_snapshot_bytes();
+            prosper::frontend::live_compute_zero_next_cold_storage_snapshot_minimum_for_test();
+            CHECK(prosper::frontend::execute_live_compute_items({cold_item}),
+                  "proven-full writer executes on a cold retained target");
+            const uint64_t cold_source_snapshots_after =
+                prosper::frontend::live_compute_storage_result_snapshot_bytes();
+            const uint64_t cold_result_snapshots_after =
+                prosper::frontend::live_compute_image_result_snapshot_bytes();
+            if (cold_storage_snapshot_deferral_enabled) {
+                CHECK(cold_source_snapshots_after == cold_source_snapshots_before,
+                      "deferring policy admits a cold proven-full target without a source copy");
+
+                // A later standalone backend invocation has no same-submit journal authority. The
+                // first repeat therefore cannot trust the deferred source: it must take ordinary
+                // writeback and establish the exact baseline used by later source validation.
+                const std::vector<uint8_t> cold_expected = cold_guest;
+                const uint64_t repeat_snapshots_before =
+                    prosper::frontend::live_compute_storage_result_snapshot_bytes();
+                CHECK(prosper::frontend::execute_live_compute_items({cold_item}),
+                      "first invalidated repeat repairs a deferred cold target");
+                CHECK(cold_guest == cold_expected &&
+                          prosper::frontend::live_compute_storage_result_snapshot_bytes() >=
+                              repeat_snapshots_before + fill_guest_bytes,
+                      "first invalidated repeat establishes exact source authority");
+
+                cold_guest[0] ^= 0xff;
+                CHECK(cold_guest != cold_expected,
+                      "external mutation changes the deferred target fixture");
+                CHECK(prosper::frontend::execute_live_compute_items({cold_item}) &&
+                          cold_guest == cold_expected,
+                      "external mutation forces deferred target writeback and exact repair");
+            } else {
+                CHECK(cold_source_snapshots_after >=
+                          cold_source_snapshots_before + fill_guest_bytes,
+                      "default or disabled policy retains the cold source immediately");
+            }
+            CHECK(cold_result_snapshots_after == cold_result_snapshots_before,
+                  "cold exact target retains its GPU baseline without a transient host copy");
+            CHECK(prosper::frontend::cold_storage_result_snapshot_can_defer(
+                      false, true, 64u << 20, 16u << 20) &&
+                      !prosper::frontend::cold_storage_result_snapshot_can_defer(
+                          true, true, 64u << 20, 16u << 20) &&
+                      !prosper::frontend::cold_storage_result_snapshot_can_defer(
+                          false, false, 64u << 20, 16u << 20) &&
+                      !prosper::frontend::cold_storage_result_snapshot_can_defer(
+                          false, true, 8u << 20, 16u << 20),
+                  "cold snapshot deferral is limited to large proven-full guest targets");
+
+            // Model the exact stale-fallback sequence from the review: transient setup stores host
+            // result A, result B reaches guest memory but GPU-baseline ownership fails, then A runs
+            // again. The failed B ownership attempt must invalidate host A; otherwise the final A
+            // can be misclassified as repeated and leave B in architectural guest memory.
+            if (!changed_spirv.empty()) {
+                std::vector<uint8_t> fallback_guest(W * 8, 0x42);
+                ShaderResourceTable fallback_rt = fill_rt;
+                fallback_rt.resources.back().gpu_addr =
+                    reinterpret_cast<uint64_t>(fallback_guest.data());
+                ComputeItem fallback_a = it;
+                fallback_a.resources = std::make_shared<ShaderResourceTable>(fallback_rt);
+                ComputeItem fallback_b = fallback_a;
+                fallback_b.spirv = changed_spirv;
+                fallback_b.code_addr = 0x1122f12du;
+                fallback_b.dispatch_index = 51;
+                fallback_b.command_order = 10;
+                fallback_a.dispatch_index = 52;
+                fallback_a.command_order = 20;
+
+                const uint64_t fallback_snapshots_before =
+                    prosper::frontend::live_compute_image_result_snapshot_bytes();
+                prosper::frontend::live_compute_force_next_image_result_host_fallback_for_test();
+                CHECK(prosper::frontend::execute_live_compute_items({fallback_a}),
+                      "transient baseline setup fallback publishes result A");
+                const uint64_t fallback_snapshots_after_a =
+                    prosper::frontend::live_compute_image_result_snapshot_bytes();
+                CHECK(std::equal(fallback_guest.begin(), fallback_guest.end(),
+                                 after_prove.begin()) &&
+                          fallback_snapshots_after_a >=
+                              fallback_snapshots_before + fill_guest_bytes,
+                      "transient setup fallback retains exact host result A");
+
+                prosper::frontend::live_compute_fail_next_image_result_buffer_retain_for_test();
+                size_t fallback_dispatches = 0;
+                bool fallback_dispatches_ok = true;
+                bool failed_retain_published_b = false;
+                const OrderedSubmitResult fallback_submit = execute_ordered_items(
+                    {{SubmitOperationKind::Dispatch, fallback_b.dispatch_index,
+                      fallback_b.command_order},
+                     {SubmitOperationKind::Dispatch, fallback_a.dispatch_index,
+                      fallback_a.command_order}},
+                    {}, {fallback_b, fallback_a},
+                    [](const std::vector<DrawItem>&, uint32_t, uint32_t) {
+                        return RenderedFrame{};
+                    },
+                    [&](const std::vector<ComputeItem>& items) {
+                        const bool ok = prosper::frontend::execute_live_compute_items(items);
+                        fallback_dispatches_ok &= ok;
+                        if (fallback_dispatches++ == 0)
+                            failed_retain_published_b = std::equal(
+                                fallback_guest.begin(), fallback_guest.end(),
+                                changed_proof_guest.begin()) &&
+                                prosper::frontend::live_compute_image_result_snapshot_bytes() ==
+                                    fallback_snapshots_after_a;
+                        return ok;
+                    },
+                    1, 1);
+                CHECK(fallback_submit.compute_executed && fallback_dispatches_ok &&
+                          fallback_dispatches == 2 && failed_retain_published_b,
+                      "result B survives injected GPU-baseline ownership failure");
+                CHECK(std::equal(fallback_guest.begin(), fallback_guest.end(),
+                                 after_prove.begin()),
+                      "stale host result A cannot suppress required A-after-B writeback");
+            }
         }
 #if defined(__linux__)
         prosper::host::guest_write_watch_notify_direct_mapping_removed(

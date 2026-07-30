@@ -1455,10 +1455,62 @@ bounded at 5.92 ms p95 and 15.47 ms maximum, with no recurrence of the experimen
 Different submit counts reflect real route progression, so these are supporting live measurements rather
 than a standalone FPS or pixel-equality claim.
 
+## Plucky cold image-cache snapshot copies
+
+Per-image timing on the full-resolution gameplay route localized the remaining
+`0x30180d0000` writeback cost more precisely. Its 3840x2160 RGBA16F output spent only about
+8-10 ms in the required tiled guest layout, while cache admission spent a 41.61 ms median copying
+66,846,720 bytes. The two large sampled inputs had a second copy after the fence as well: setup had
+already captured each exact guest source before transfer, but `retain_image` copied that owned vector
+again instead of adopting it.
+
+Two generic lifetime fixes remove those copies. A cold proven-full write-only guest target at least
+16 MiB defers its source snapshot until a later use actually needs exact source authority; the old seed
+is unobservable, and a later external guest write still forces ordinary exact repair before an identical
+GPU result may skip writeback. An aligned exact storage result also goes directly into its retained GPU
+comparison buffer instead of first filling a host vector that the successful ownership transfer
+immediately clears. If that ownership transfer fails, any older host result fallback is invalidated so
+it cannot suppress a later changed writeback. Separately, sampled-image admission now moves its
+already-snapshotted source into the cache. Small, partial/readable, replay-owned, failed-recovery, and
+non-GPU-comparable paths retain their prior snapshots. `PROSPER_COLD_STORAGE_SNAPSHOT_MIN_MB` tunes the
+cold crossover, while
+`PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1` remains the complete storage-source control.
+
+Matched 160-second native-resolution runs used the same build, route, audio/input frontends, and timing
+settings. Filtering to the gameplay form of `0x30180d0000` (`setup_ms > 50`) avoids mixing its much
+smaller title-screen use:
+
+| state | setup median | writeback median | total median | samples |
+|---|---:|---:|---:|---:|
+| merged baseline | 88.01 ms | 113.17 ms | 206.61 ms | 103 |
+| cold-result copies removed | 95.19 ms | 68.98 ms | 168.42 ms | 103 |
+| sampled snapshots moved too | 91.53 ms | 12.79 ms | 110.25 ms | 115 |
+
+These measurements predate the adaptive image-cache sizing merged in #1519. That change raises the
+historical 512 MiB default to one eighth of the largest device-local heap, capped at 2 GiB, and should
+reduce how often the same Plucky identities become cold. The table therefore measures the cost of an
+observed cold dispatch, not the frequency or whole-route impact on the current combined renderer; those
+must be measured again on the rebased exact head.
+
+The final dispatch-local total is 46.6% below the merged baseline; writeback is 88.7% lower. Presented
+frame totals varied with route progression (2,430 / 2,209 / 2,544), so they are recorded only as a
+progression sanity check. Both normal and disabled adaptive production-backend variants pass, including
+the failure-repair, external-mutation, direct-import, partial-write, and raw-volume contracts. Timing now
+also attributes map, result preparation, guest-watch, notification, cache, and host result-fallback
+snapshot costs, so later cache churn cannot hide inside the aggregate writeback phase again.
+
+The production-backend suite also runs a reduced cold target with the real crossover set to zero. It
+proves first admission omits the source copy, the first invalidated repeat repairs and establishes exact
+authority, an external mutation forces writeback, and the disable switch preserves immediate snapshots.
+An alternating A/B/A regression injects GPU-baseline ownership failure after B and proves an older host A
+fallback cannot leave B in guest memory when A returns.
+
 ## Next renderer step
 
-Attribute the remaining compute-image source snapshots by cache entry and distinguish unavoidable readable
-storage inputs from cache churn. In parallel, capture a fresh v39 rolling temporal window around the Plucky
+The remaining gameplay form of `0x30180d0000` spends roughly 60-70 ms converting two guest-backed
+3840x2160 Float16 inputs to RGBA8 on the CPU. Measure a generic raw-FP16 upload/GPU conversion or exact
+native-sampling alternative against the known RADV regression that originally selected RGBA8; do not simply
+re-enable native FP16 globally. In parallel, capture a fresh v39 rolling temporal window around the Plucky
 title/gameplay transition. It must include the producers for the two 48x48 volumes and close with zero
 unresolved leaves, providing a native pixel oracle as well as exact compute pipeline contracts. Keep the
 exact-byte and disable-switch A/B discipline used here, and preserve screenshot/capture correctness while

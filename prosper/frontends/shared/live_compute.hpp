@@ -128,10 +128,27 @@ uint64_t live_compute_cpu_fill_dispatches();
 // Monotonic attribution for storage-result source validation. Production-backend tests use this to
 // prove that changing proven-full results do not copy a redundant guest-byte snapshot.
 uint64_t live_compute_storage_result_snapshot_bytes();
+// Monotonic attribution for the collision-free host fallback used when a retained storage result
+// cannot keep an exact GPU comparison buffer. Eligible GPU baselines must not be copied here first.
+uint64_t live_compute_image_result_snapshot_bytes();
+// A cold, proven-full guest target has no observable old seed. Large targets may defer their exact
+// source baseline until an address actually repeats; replay-owned and partial targets may not.
+bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
+                                            size_t guest_bytes, size_t minimum_bytes);
 
 // Deterministic failure injection for the storage-image recovery regression test. The next storage
 // readback fails after dispatch, exercising retained-image invalidation without a Vulkan fault.
 void live_compute_fail_next_storage_readback_for_test();
+
+// Deterministically lower the next eligible cold storage admission crossover to zero. This lets a
+// compact production-backend fixture execute the real deferral predicate and retention branch.
+void live_compute_zero_next_cold_storage_snapshot_minimum_for_test();
+
+// Deterministic setup/ownership failure injection for the storage-result fallback regression. The
+// pair models a transient compare-pipeline failure followed by a cache-capacity failure without
+// relying on driver behavior.
+void live_compute_force_next_image_result_host_fallback_for_test();
+void live_compute_fail_next_image_result_buffer_retain_for_test();
 
 // Register the synchronous Vulkan compute backend used by AGC submit processing.
 void register_live_compute();
