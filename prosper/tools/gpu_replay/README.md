@@ -338,6 +338,13 @@ stage is fault-safely read once, content-deduplicated, capped at 64 KiB, and sto
 outnumber semantic operations, and every reference/hash is validated while reading. Captures v1-v6 remain
 readable and print `failure-diagnostics: unavailable (capture predates v7)` rather than inventing evidence.
 
+`--retry-failed-stage FAILURE:STAGE` reruns one retained stage through the current recompiler with its exact
+captured resource table. For split vertex programs, `--retry-failed-chain FAILURE` instead reconstructs the
+first two retained vertex stages as one prolog/main chain and calls the production chain recompiler. Both modes
+exit successfully only when SPIR-V is produced and avoid Vulkan rendering, so they are the fast feedback path
+after a translator change. Chain retry requires the exact resource metadata added in capture v35 and rejects
+older or incomplete diagnostics explicitly.
+
 Capture v8 adds persistent depth/stencil checkpoints. Each seed stores the renderer's complete guest cache
 identity (depth/stencil read/write bases, HTILE base, extent, and D32/D32S8 format), independent depth/stencil
 validity, and raw valid-plane bytes. Counts, extents, formats, duplicate identities, per-plane lengths, and a
