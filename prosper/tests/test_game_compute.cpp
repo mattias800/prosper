@@ -486,6 +486,80 @@ int main() {
     CHECK(unchanged_write_notifications == 1,
           "idempotent compute writes still invalidate divergent renderer-resident state");
 
+    // Astro Bot's world-map visibility kernel lowers IMAGE_ATOMIC_ADD on a tiled R32_UINT image
+    // to a linear SSBO atomic. The descriptor's declared size is the logical texel count, while a
+    // Sw64KbRX backing includes whole-tile padding and can therefore be larger. Replay provides that
+    // physical capture through host_data_size; rejecting it against the logical size skipped the
+    // entire visibility pass.
+    {
+        static const uint32_t image_atomic_add[] = {
+            0x7e000280u, 0x7e020280u, 0x7e120281u,
+            0xf0442108u, 0x00000900u, 0xbf810000u,
+        };
+        constexpr uint32_t atomic_width = 2048;
+        constexpr uint32_t atomic_height = 64;
+        constexpr uint32_t atomic_tile = static_cast<uint32_t>(TileMode::Sw64KbRX);
+        constexpr size_t atomic_logical_bytes =
+            static_cast<size_t>(atomic_width) * atomic_height * sizeof(uint32_t);
+        const size_t atomic_guest_bytes = tiled_surface_bytes(
+            atomic_width, atomic_height, atomic_tile, 0, sizeof(uint32_t));
+        CHECK(atomic_guest_bytes > atomic_logical_bytes,
+              "world-map atomic image fixture includes physical tile padding");
+        std::vector<uint8_t> atomic_guest(atomic_guest_bytes, 0);
+
+        ShaderResourceTable atomic_rt;
+        ShaderResource atomic_image;
+        atomic_image.cls = ResourceClass::StorageImage;
+        atomic_image.format = DataFormat::Uint32;
+        atomic_image.num_components = 1;
+        atomic_image.binding = 4;
+        atomic_image.sgpr_base = 0;
+        atomic_image.img_dim = 1;
+        atomic_image.width = atomic_width;
+        atomic_image.height = atomic_height;
+        atomic_image.depth = 1;
+        atomic_image.tile_mode = atomic_tile;
+        atomic_image.size = static_cast<uint32_t>(atomic_logical_bytes);
+        atomic_image.gpu_addr = reinterpret_cast<uint64_t>(atomic_guest.data());
+        atomic_image.host_data = atomic_guest.data();
+        atomic_image.host_data_size = atomic_guest.size();
+        atomic_rt.resources.push_back(atomic_image);
+
+        ComputeShaderConfig atomic_config;
+        atomic_config.local_x = 1;
+        const std::vector<uint32_t> atomic_spirv = recompile_compute(
+            image_atomic_add, std::size(image_atomic_add), &atomic_rt, atomic_config);
+        CHECK(!atomic_spirv.empty(), "world-map tiled image-atomic kernel recompiles");
+        if (!atomic_spirv.empty()) {
+            ComputeItem atomic_item;
+            atomic_item.spirv = atomic_spirv;
+            atomic_item.resources = std::make_shared<ShaderResourceTable>(atomic_rt);
+            atomic_item.launch.threads_x = atomic_item.launch.threads_y =
+                atomic_item.launch.threads_z = 1;
+            atomic_item.launch.local_x = atomic_item.launch.local_y =
+                atomic_item.launch.local_z = 1;
+            atomic_item.launch.groups_x = atomic_item.launch.groups_y =
+                atomic_item.launch.groups_z = 1;
+            atomic_item.code_addr = 0x500525200;
+
+            uint64_t atomic_notified_bytes = 0;
+            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t bytes) {
+                if (addr == atomic_image.gpu_addr) atomic_notified_bytes = bytes;
+            });
+            CHECK(prosper::frontend::execute_live_compute_items({atomic_item}),
+                  "world-map tiled image-atomic dispatch accepts its physical backing");
+            set_guest_gpu_write_observer({});
+
+            std::vector<uint32_t> atomic_linear(atomic_width * atomic_height, 0);
+            detile_surface(reinterpret_cast<uint8_t*>(atomic_linear.data()), atomic_guest.data(),
+                           atomic_width, atomic_height, atomic_tile, 0, sizeof(uint32_t));
+            CHECK(atomic_linear[0] == 1,
+                  "world-map tiled image-atomic dispatch publishes its atomic result");
+            CHECK(atomic_notified_bytes == atomic_guest_bytes,
+                  "world-map tiled image-atomic write invalidates the full physical backing");
+        }
+    }
+
     // Plucky Squire binds the same 32 MiB writable lighting buffer to consecutive kernels even
     // when their output is byte-identical to the previous frame. Exercise the production cache at
     // its one-MiB retention threshold: the second dispatch can use the exact GPU-side baseline,
