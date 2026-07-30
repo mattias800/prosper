@@ -121,9 +121,15 @@ correctly, and the metadata is only stale because prosper never writes DCC keys 
 
 ### Defect 2 — the 4K composite underneath is massively over-exposed (#1486)
 
-Operations 118–122 reach mean 247/255 with the title scene's structure clearly visible (sky gradient,
-sun disc, horizon, ocean bands) but blown out. Even with defect 1 resolved the frame would be wrong.
-One compute program is still skipped at the title:
+Operations 118–122 are the scanout buffer (`…9fc0000000`) after the tonemap and the first Slate quad,
+and they reach mean 247/255 with the title scene's structure clearly visible (sky gradient, sun disc,
+horizon, ocean bands) but blown out.
+
+How much this matters depends on defect 1: draw 95 covers the entire viewport, so if its texture is the
+game's real full-screen layer then the over-exposed buffer underneath is never visible and this is not a
+separate defect. Settle defect 1 first, then re-measure. Either way one compute program is still skipped
+at the title, and it is not one of this frame's 28 dispatches (all 28 are realized) — it belongs to
+another submit:
 
 ```
 [mubuf-unresolved] pc=3 srsrc=s0 srt_tag=NONE 0x0 key_res=null (0 res)
