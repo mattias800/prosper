@@ -50,6 +50,17 @@ int main() {
           prosper::frontend::compute_image_cache_default_eligible(
               4ull * 1024ull, ComputeImageCacheClass::storage),
           "image residency policy includes each crossover exactly without caching smaller inputs");
+    CHECK(prosper::frontend::compute_image_cache_default_limit_bytes(0) ==
+              512ull * 1024ull * 1024ull &&
+          prosper::frontend::compute_image_cache_default_limit_bytes(
+              4ull * 1024ull * 1024ull * 1024ull) == 512ull * 1024ull * 1024ull &&
+          prosper::frontend::compute_image_cache_default_limit_bytes(
+              8ull * 1024ull * 1024ull * 1024ull) == 1024ull * 1024ull * 1024ull &&
+          prosper::frontend::compute_image_cache_default_limit_bytes(
+              16ull * 1024ull * 1024ull * 1024ull) == 2048ull * 1024ull * 1024ull &&
+          prosper::frontend::compute_image_cache_default_limit_bytes(UINT64_MAX) ==
+              2048ull * 1024ull * 1024ull,
+          "image cache limit scales with local memory and retains bounded floor and ceiling");
     CHECK(prosper::frontend::storage_writeback_can_tile_mapped_bytes(
               true, 27, false, false),
           "exact-width tiled storage can feed mapped bytes directly to the tiler");
@@ -423,6 +434,17 @@ int main() {
         code, sizeof(code) / sizeof(code[0]), &rt, config);
     CHECK(!spirv.empty(), "real Dead Cells compute kernel recompiles");
     if (spirv.empty()) return 1;
+    CHECK(classify_compute_cpu_fast_path(code, std::size(code)) ==
+              ComputeCpuFastPath::FillSgprUvec4 &&
+          classify_compute_cpu_fast_path(code, std::size(code) - 1) ==
+              ComputeCpuFastPath::None,
+          "buffer-fill CPU fast path requires the complete exact RDNA2 program");
+    std::array<uint32_t, std::size(code)> altered_fill_code{};
+    std::copy_n(code, std::size(code), altered_fill_code.begin());
+    altered_fill_code[6] ^= 1u;
+    CHECK(classify_compute_cpu_fast_path(altered_fill_code.data(), altered_fill_code.size()) ==
+              ComputeCpuFastPath::None,
+          "buffer-fill CPU fast path rejects a one-bit instruction change");
     ComputeShaderConfig alternate_config = config;
     alternate_config.user_sgprs[4] ^= 0xffffffffu;
     alternate_config.user_sgprs[7] ^= 0x13579bdfu;
@@ -445,6 +467,7 @@ int main() {
     item.user_sgprs = config.user_sgprs;
     item.resources = std::make_shared<ShaderResourceTable>(rt);
     item.launch.threads_x = records;
+    item.launch.threads_y = item.launch.threads_z = 1;
     item.launch.local_x = 64;
     item.launch.groups_x = 3;
     item.launch.local_y = item.launch.local_z = 1;
@@ -453,6 +476,8 @@ int main() {
     item.dispatch_index = 7;
     item.submit_no = 11;
     item.command_order = 70;
+    item.recompile_config = config;
+    item.recompile_config_available = true;
     CHECK(prosper::frontend::execute_live_compute_items({item}),
           "production live backend executes the game kernel");
     CHECK(result.size() == launched_records * 4, "compute resource retains its padded declared size");
@@ -476,6 +501,75 @@ int main() {
             padded_lanes_untouched &= result[record * 4 + component] == 0xcccccccc;
     CHECK(padded_lanes_untouched,
           "partial workgroup suppresses all 62 padded invocations without a guest bounds check");
+
+    std::fill(result.begin(), result.end(), 0xddddddddu);
+    ComputeItem cpu_fill_item = item;
+    cpu_fill_item.cpu_fast_path = ComputeCpuFastPath::FillSgprUvec4;
+    uint32_t cpu_fill_write_notifications = 0;
+    set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+        if (addr == buffer.gpu_addr && size == buffer.size)
+            ++cpu_fill_write_notifications;
+    });
+    const uint64_t cpu_fills_before =
+        prosper::frontend::live_compute_cpu_fill_dispatches();
+    CHECK(prosper::frontend::execute_live_compute_items({cpu_fill_item}),
+          "exact buffer-fill program executes through the CPU fast path");
+    set_guest_gpu_write_observer({});
+    bool cpu_fill_matches = true;
+    for (uint32_t record = 0; record < records && cpu_fill_matches; ++record)
+        for (uint32_t component = 0; component < 4; ++component)
+            cpu_fill_matches &= result[record * 4 + component] == expected[component];
+    bool cpu_fill_padding_untouched = true;
+    for (uint32_t record = records; record < launched_records; ++record)
+        for (uint32_t component = 0; component < 4; ++component)
+            cpu_fill_padding_untouched &= result[record * 4 + component] == 0xddddddddu;
+    CHECK(cpu_fill_matches && cpu_fill_padding_untouched &&
+              cpu_fill_write_notifications == 1 &&
+              prosper::frontend::live_compute_cpu_fill_dispatches() ==
+                  cpu_fills_before + 1,
+          "CPU fill matches Vulkan, preserves padded lanes, and invalidates the declared range");
+
+    ShaderResourceTable narrow_stride_rt = rt;
+    narrow_stride_rt.resources[0].stride = 8;
+    const std::vector<uint32_t> narrow_stride_spirv = recompile_compute(
+        code, std::size(code), &narrow_stride_rt, config);
+    CHECK(!narrow_stride_spirv.empty(), "alternate-stride fill kernel recompiles");
+    if (!narrow_stride_spirv.empty()) {
+        std::fill(result.begin(), result.end(), 0xabababab);
+        ComputeItem narrow_stride_item = cpu_fill_item;
+        narrow_stride_item.spirv = narrow_stride_spirv;
+        narrow_stride_item.resources =
+            std::make_shared<ShaderResourceTable>(narrow_stride_rt);
+        const uint64_t narrow_stride_fills_before =
+            prosper::frontend::live_compute_cpu_fill_dispatches();
+        CHECK(prosper::frontend::execute_live_compute_items({narrow_stride_item}),
+              "noncanonical fill descriptor falls back to Vulkan");
+        CHECK(result[300] == 0xabababab &&
+                  prosper::frontend::live_compute_cpu_fill_dispatches() ==
+                      narrow_stride_fills_before,
+              "CPU fast path does not replace the descriptor's eight-byte stride semantics");
+    }
+
+    ComputeShaderConfig extra_user_config = config;
+    extra_user_config.user_sgprs.push_back(0);
+    const std::vector<uint32_t> extra_user_spirv = recompile_compute(
+        code, std::size(code), &rt, extra_user_config);
+    CHECK(!extra_user_spirv.empty(), "alternate user-SGPR fill kernel recompiles");
+    if (!extra_user_spirv.empty()) {
+        std::fill(result.begin(), result.end(), 0xcdcdcdcdu);
+        ComputeItem extra_user_item = cpu_fill_item;
+        extra_user_item.spirv = extra_user_spirv;
+        extra_user_item.user_sgprs = extra_user_config.user_sgprs;
+        extra_user_item.recompile_config = extra_user_config;
+        const uint64_t extra_user_fills_before =
+            prosper::frontend::live_compute_cpu_fill_dispatches();
+        CHECK(prosper::frontend::execute_live_compute_items({extra_user_item}),
+              "shifted TGID input fill falls back to Vulkan");
+        CHECK(result[100 * 4] == 0xcdcdcdcdu &&
+                  prosper::frontend::live_compute_cpu_fill_dispatches() ==
+                      extra_user_fills_before,
+              "CPU fast path requires TGID.x to occupy the shader's exact s8 input");
+    }
 
     uint32_t unchanged_write_notifications = 0;
     set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {

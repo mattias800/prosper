@@ -28,6 +28,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -776,14 +777,25 @@ bool persistent_compute_image_enabled(VkDeviceSize bytes,
     return enabled && bytes >= minimum;
 }
 
-VkDeviceSize persistent_compute_image_limit() {
-    static const VkDeviceSize limit = []() -> VkDeviceSize {
+VkDeviceSize persistent_compute_image_limit(
+    const VkPhysicalDeviceMemoryProperties& memory) {
+    static const std::optional<VkDeviceSize> override_limit = []()
+        -> std::optional<VkDeviceSize> {
         const char* value = std::getenv("PROSPER_COMPUTE_IMAGE_CACHE_MB");
-        const uint64_t mib = value ? std::strtoull(value, nullptr, 10) : 512ull;
+        if (!value) return std::nullopt;
+        const uint64_t mib = std::strtoull(value, nullptr, 10);
         if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
         return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
     }();
-    return limit;
+    if (override_limit) return *override_limit;
+
+    VkDeviceSize largest_local_heap = 0;
+    for (uint32_t index = 0; index < memory.memoryHeapCount; ++index) {
+        if (memory.memoryHeaps[index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            largest_local_heap = std::max(largest_local_heap,
+                                          memory.memoryHeaps[index].size);
+    }
+    return compute_image_cache_default_limit_bytes(largest_local_heap);
 }
 
 uint32_t compute_write_watch_promotion_validations() {
@@ -1458,7 +1470,7 @@ struct VulkanComputeContext {
     }
 
     bool make_image_cache_room(VkDeviceSize bytes) {
-        const VkDeviceSize limit = persistent_compute_image_limit();
+        const VkDeviceSize limit = persistent_compute_image_limit(memory);
         if (bytes > limit) return false;
         while (image_cache_bytes > limit - bytes) {
             auto victim = image_cache.end();
@@ -1933,6 +1945,7 @@ struct VulkanComputeContext {
 
 VulkanComputeContext* g_live_compute_context = nullptr;
 std::atomic<uint64_t> g_sampled_image_upload_skips{0};
+std::atomic<uint64_t> g_cpu_fill_dispatches{0};
 
 struct BorrowedComputeImageLease {
     VulkanComputeContext* context = nullptr;
@@ -2438,6 +2451,81 @@ bool trace_compute_item(const prosper::gpu::ComputeItem& item) {
     return true;
 }
 
+std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item) {
+    using prosper::gpu::ComputeCpuFastPath;
+    using prosper::gpu::ResourceClass;
+    if (item.cpu_fast_path == ComputeCpuFastPath::None) return std::nullopt;
+    if (item.cpu_fast_path != ComputeCpuFastPath::FillSgprUvec4 ||
+        !item.resources || item.resources->resources.size() != 1 ||
+        item.user_sgprs.size() != 8 || !item.recompile_config_available ||
+        !item.recompile_config.tgid_x_en || item.recompile_config.tgid_y_en ||
+        item.recompile_config.tgid_z_en ||
+        item.launch.local_x != 64 || item.launch.local_y != 1 || item.launch.local_z != 1 ||
+        !item.launch.groups_x || item.launch.groups_y != 1 || item.launch.groups_z != 1 ||
+        item.launch.threads_y != 1 || item.launch.threads_z != 1)
+        return std::nullopt;
+
+    const prosper::gpu::ShaderResource* resource = item.resources->by_binding(2);
+    // The matched MUBUF instruction uses idxen with the direct V# in s[0:3]. Its element address and
+    // store conversion therefore still depend on the live descriptor: only the observed 16-byte,
+    // four-dword contract is equivalent to the raw record writes below. Similar shaders bound to a
+    // different descriptor must retain the normal translator/backend semantics.
+    if (!resource || !resource->size || resource->cls != ResourceClass::ConstantBuffer ||
+        resource->sgpr_base != 0 || item.resources->by_sgpr_base(0) != resource ||
+        resource->stride != 16 ||
+        resource->num_components != 4 ||
+        prosper::gpu::data_format_bytes(resource->format) != sizeof(uint32_t))
+        return std::nullopt;
+
+    const uint64_t dispatched_records =
+        static_cast<uint64_t>(item.launch.groups_x) * item.launch.local_x;
+    const uint64_t records = item.launch.threads_x
+        ? std::min<uint64_t>(item.launch.threads_x, dispatched_records)
+        : dispatched_records;
+    if (!records || records > UINT64_MAX / 16u) return std::nullopt;
+    const uint64_t written_bytes = records * 16u;
+    if (written_bytes > resource->size || written_bytes > SIZE_MAX) return std::nullopt;
+
+    uint8_t* destination = nullptr;
+    if (resource->host_data && resource->host_data_size >= written_bytes) {
+        destination = resource->host_data;
+    } else if (resource->gpu_addr && written_bytes <= UINT32_MAX &&
+               prosper::gpu::guest_writable(
+                   resource->gpu_addr, static_cast<uint32_t>(written_bytes))) {
+        destination = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(resource->gpu_addr));
+    }
+    if (!destination) return std::nullopt;
+
+    if (!resource->host_data && resource->gpu_addr)
+        prosper::host::guest_write_watch_notify_host_write(
+            resource->gpu_addr, static_cast<size_t>(written_bytes));
+    const uint32_t pattern[4] = {
+        item.user_sgprs[4], item.user_sgprs[5], item.user_sgprs[6], item.user_sgprs[7]};
+    if (!(pattern[0] | pattern[1] | pattern[2] | pattern[3])) {
+        std::memset(destination, 0, static_cast<size_t>(written_bytes));
+    } else {
+        for (uint64_t record = 0; record < records; ++record)
+            std::memcpy(destination + record * sizeof(pattern), pattern, sizeof(pattern));
+    }
+    // Match the Vulkan path's conservative invalidation contract: padding beyond the exact launch
+    // remains untouched, but every alias of the declared resource must be considered stale.
+    if (resource->gpu_addr)
+        prosper::gpu::notify_guest_gpu_write(resource->gpu_addr, resource->size);
+    if (!resource->host_data && prosper::gpu::writer_provenance_enabled())
+        prosper::gpu::record_guest_write(
+            prosper::gpu::GuestWriterKind::ComputeBuffer,
+            resource->gpu_addr, resource->size, item.submit_no, item.dispatch_index,
+            item.command_order, item.code_addr);
+    g_cpu_fill_dispatches.fetch_add(1, std::memory_order_relaxed);
+    if (trace_compute_item(item))
+        std::fprintf(stderr,
+                     "[compute] CPU fill program 0x%llx records=%llu bytes=%llu\n",
+                     static_cast<unsigned long long>(item.code_addr),
+                     static_cast<unsigned long long>(records),
+                     static_cast<unsigned long long>(written_bytes));
+    return true;
+}
+
 bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& item) {
     using namespace prosper::gpu;
     using ComputeClock = std::chrono::steady_clock;
@@ -2448,6 +2536,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     auto phase_writeback = phase_start;
     double pack_ms = 0.0;
     double layout_ms = 0.0;
+    double writeback_prepare_ms = 0.0;
+    double writeback_buffers_ms = 0.0;
+    double writeback_images_ms = 0.0;
+    double writeback_publish_ms = 0.0;
     const std::vector<uint32_t>& spirv = item.spirv;
     const bool trace = trace_compute_item(item);
     if (item.required_subgroup_size &&
@@ -2565,7 +2657,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         });
     // The phase timer is also useful for buffer-only kernels. Astro Bot's heaviest dispatcher writes
     // buffers exclusively, so the historical storage-image gate hid the actual frame bottleneck.
-    const bool phase_timing = std::getenv("PROSPER_COMPUTE_PHASE_TIMING") != nullptr;
+    const bool timing_trace_only =
+        std::getenv("PROSPER_COMPUTE_TIMING_TRACE_ONLY") != nullptr;
+    const bool phase_timing =
+        std::getenv("PROSPER_COMPUTE_PHASE_TIMING") != nullptr &&
+        (!timing_trace_only || trace);
     if (has_storage_images && !ctx.image_support) {
         static bool warned = false;
         if (!warned) { warned = true;
@@ -2899,7 +2995,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             images_ready = false;
         };
-        const bool image_timing = std::getenv("PROSPER_COMPUTE_IMAGE_TIMING") != nullptr;
+        const bool image_timing =
+            std::getenv("PROSPER_COMPUTE_IMAGE_TIMING") != nullptr &&
+            (!timing_trace_only || trace);
         for (size_t i = 0; i < image_descriptors.size() && images_ready; i++) {
             const auto image_start = ComputeClock::now();
             const ShaderResource* r = item.resources->by_binding(image_descriptors[i].binding);
@@ -5124,6 +5222,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
         if (trace) std::fprintf(stderr, "[compute]   dispatch complete\n");
         phase_dispatch = ComputeClock::now();
+        const auto writeback_prepare_start = phase_dispatch;
 
         if (!compare_targets.empty()) {
             void* mapped = nullptr;
@@ -5174,6 +5273,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
         }
 
+        writeback_prepare_ms = std::chrono::duration<double, std::milli>(
+            ComputeClock::now() - writeback_prepare_start).count();
+        const auto writeback_buffers_start = ComputeClock::now();
         bool readback_ok = true;
         for (auto& buffer : buffers) {
             if (buffer.alias_of != SIZE_MAX || !buffer.writable) continue;
@@ -5285,7 +5387,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                    item.submit_no, item.dispatch_index,
                                    item.command_order, item.code_addr);
         }
+        writeback_buffers_ms = std::chrono::duration<double, std::milli>(
+            ComputeClock::now() - writeback_buffers_start).count();
         if (!readback_ok) break;
+        const auto writeback_images_start = ComputeClock::now();
         // Storage-image writeback (#590): copy exact-width texels or pack raw uvec4 channels back
         // into the guest format, then restore its linear or 3D tiled address layout and notify the
         // render side exactly like the buffer path.
@@ -5606,7 +5711,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  bi.binding, (unsigned long long)r->gpu_addr, linear_bytes);
             }
         }
+        writeback_images_ms = std::chrono::duration<double, std::milli>(
+            ComputeClock::now() - writeback_images_start).count();
         if (!readback_ok) break;
+        const auto writeback_publish_start = ComputeClock::now();
         // Every storage image is back in GENERAL, all exact guest writebacks/notifications have
         // completed, and a failed dispatch cannot reach here. Publish only retained native results;
         // raw interchange images are never descriptor-compatible with a graphics sampled view.
@@ -5616,6 +5724,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 image.cache_candidate && image.persistent)
                 ctx.authorize_cached_image_export(image.cache_key);
         }
+        writeback_publish_ms = std::chrono::duration<double, std::milli>(
+            ComputeClock::now() - writeback_publish_start).count();
         ok = true;
         phase_writeback = ComputeClock::now();
     } while (false);
@@ -5679,7 +5789,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      "[compute-phase] submit=%llu code=0x%llx ok=%u "
                      "setup_ms=%.2f setup_validate_ms=%.2f setup_buffers_ms=%.2f "
                      "pipeline_ms=%.2f dispatch_ms=%.2f "
-                     "writeback_ms=%.2f pack_ms=%.2f layout_ms=%.2f "
+                     "writeback_ms=%.2f writeback_prepare_ms=%.2f "
+                     "writeback_buffers_ms=%.2f writeback_images_ms=%.2f "
+                     "writeback_publish_ms=%.2f pack_ms=%.2f layout_ms=%.2f "
                      "cleanup_ms=%.2f total_ms=%.2f subgroup=%u\n",
                      (unsigned long long)item.submit_no, (unsigned long long)item.code_addr,
                      ok ? 1u : 0u, milliseconds(phase_start, phase_setup),
@@ -5687,6 +5799,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      milliseconds(phase_setup, phase_pipeline),
                      milliseconds(phase_pipeline, phase_dispatch),
                      milliseconds(phase_dispatch, phase_writeback),
+                     writeback_prepare_ms, writeback_buffers_ms,
+                     writeback_images_ms, writeback_publish_ms,
                      pack_ms, layout_ms,
                      milliseconds(phase_writeback, phase_cleanup),
                      milliseconds(phase_start, phase_cleanup), item.required_subgroup_size);
@@ -5744,6 +5858,10 @@ uint64_t live_compute_buffer_gpu_result_skips() {
 
 uint64_t live_compute_sampled_image_upload_skips() {
     return g_sampled_image_upload_skips.load(std::memory_order_relaxed);
+}
+
+uint64_t live_compute_cpu_fill_dispatches() {
+    return g_cpu_fill_dispatches.load(std::memory_order_relaxed);
 }
 
 uint64_t live_compute_storage_result_snapshot_bytes() {
@@ -5882,8 +6000,12 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
     // backend can't bind yet, #590) must not abort the rest of the batch — that would regress
     // dispatches that executed before image bindings existed. Run all; report all-succeeded.
     bool all_ok = true;
-    for (const auto& item : items)
-        all_ok &= execute_item(context, item);
+    for (const auto& item : items) {
+        if (const std::optional<bool> cpu_result = execute_cpu_fast_path(item))
+            all_ok &= *cpu_result;
+        else
+            all_ok &= execute_item(context, item);
+    }
     if (timing_enabled) {
         struct TimingTotals { uint64_t calls = 0, dispatches = 0; double milliseconds = 0; };
         static TimingTotals totals;
@@ -5903,6 +6025,10 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
                          (unsigned long long)totals.calls,
                          (unsigned long long)totals.dispatches,
                          totals.milliseconds / static_cast<double>(totals.calls));
+            std::fprintf(stderr,
+                         "[render-timing] compute_cpu_fast fills=%llu\n",
+                         (unsigned long long)g_cpu_fill_dispatches.load(
+                             std::memory_order_relaxed));
             const ComputeMemoryPoolStats pool = context.memory_pool_stats();
             std::fprintf(stderr,
                          "[render-timing] compute_memory_pool hits=%llu misses=%llu cached=%zu "
