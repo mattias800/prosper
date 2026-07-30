@@ -920,8 +920,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 uint64_t backend_calls = 0, backend_draws = 0;
                 uint64_t backend_command_buffers = 0, backend_queue_submits = 0;
                 uint64_t backend_fence_waits = 0;
+                uint64_t backend_gpu_timestamp_samples = 0;
                 double backend_target_ms = 0, backend_draw_setup_ms = 0;
                 double backend_record_upload_ms = 0, backend_gpu_wait_ms = 0;
+                double backend_gpu_device_ms = 0;
                 double backend_readback_ms = 0, backend_cleanup_ms = 0;
                 double backend_setup_shader_ms = 0, backend_setup_fixed_ms = 0;
                 double backend_setup_resources_ms = 0, backend_setup_pipeline_ms = 0;
@@ -971,10 +973,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 pending_timing.backend_command_buffers += backend.command_buffers;
                 pending_timing.backend_queue_submits += backend.queue_submits;
                 pending_timing.backend_fence_waits += backend.fence_waits;
+                pending_timing.backend_gpu_timestamp_samples += backend.gpu_timestamp_samples;
                 pending_timing.backend_target_ms += backend.target_ms;
                 pending_timing.backend_draw_setup_ms += backend.draw_setup_ms;
                 pending_timing.backend_record_upload_ms += backend.record_upload_ms;
                 pending_timing.backend_gpu_wait_ms += backend.gpu_wait_ms;
+                pending_timing.backend_gpu_device_ms += backend.gpu_device_ms;
                 pending_timing.backend_readback_ms += backend.readback_ms;
                 pending_timing.backend_cleanup_ms += backend.cleanup_ms;
                 pending_timing.backend_setup_shader_ms += backend.setup_shader_ms;
@@ -997,7 +1001,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     "[rtt-timing] submit=%d target=0x%llx extent=%ux%u draws=%zu "
                     "span=%d/%d authoritative=%d deferred=%d cmd=%llu submit=%llu wait=%llu "
                     "measured=%.2f detail=%.2f other=%.2f target_setup=%.2f "
-                    "draw_setup=%.2f record_upload=%.2f gpu_wait=%.2f "
+                    "draw_setup=%.2f record_upload=%.2f batch_wait=%.2f "
+                    "batch_device=%.2f batch_overhead=%.2f batch_timestamps=%llu "
                     "readback=%.2f cleanup=%.2f gpu_target=%llu load=%llu sample=%llu cpu=%llu\n",
                     record.submit, (unsigned long long)record.target,
                     record.width, record.height, record.draws,
@@ -1009,7 +1014,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     record.measured_ms, detail_ms,
                     record.measured_ms - detail_ms,
                     timing.target_ms, timing.draw_setup_ms, timing.record_upload_ms,
-                    timing.gpu_wait_ms, timing.readback_ms, timing.cleanup_ms,
+                    timing.gpu_wait_ms, timing.gpu_device_ms,
+                    std::max(0.0, timing.gpu_wait_ms - timing.gpu_device_ms),
+                    (unsigned long long)timing.gpu_timestamp_samples,
+                    timing.readback_ms, timing.cleanup_ms,
                     (unsigned long long)record.color_target.writes,
                     (unsigned long long)record.color_target.write_hits,
                     (unsigned long long)record.color_target.sampled_hits,
@@ -4769,8 +4777,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     uint64_t backend_calls = 0, backend_draws = 0;
                     uint64_t backend_command_buffers = 0, backend_queue_submits = 0;
                     uint64_t backend_fence_waits = 0;
+                    uint64_t backend_gpu_timestamp_samples = 0;
                     double backend_target_ms = 0, backend_draw_setup_ms = 0;
                     double backend_record_upload_ms = 0, backend_gpu_wait_ms = 0;
+                    double backend_gpu_device_ms = 0;
                     double backend_readback_ms = 0, backend_cleanup_ms = 0;
                     double backend_setup_shader_ms = 0, backend_setup_fixed_ms = 0;
                     double backend_setup_resources_ms = 0, backend_setup_pipeline_ms = 0;
@@ -4803,10 +4813,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     timing.backend_command_buffers += pending_timing.backend_command_buffers;
                     timing.backend_queue_submits += pending_timing.backend_queue_submits;
                     timing.backend_fence_waits += pending_timing.backend_fence_waits;
+                    timing.backend_gpu_timestamp_samples += pending_timing.backend_gpu_timestamp_samples;
                     timing.backend_target_ms += pending_timing.backend_target_ms;
                     timing.backend_draw_setup_ms += pending_timing.backend_draw_setup_ms;
                     timing.backend_record_upload_ms += pending_timing.backend_record_upload_ms;
                     timing.backend_gpu_wait_ms += pending_timing.backend_gpu_wait_ms;
+                    timing.backend_gpu_device_ms += pending_timing.backend_gpu_device_ms;
                     timing.backend_readback_ms += pending_timing.backend_readback_ms;
                     timing.backend_cleanup_ms += pending_timing.backend_cleanup_ms;
                     timing.backend_setup_shader_ms += pending_timing.backend_setup_shader_ms;
@@ -4864,19 +4876,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     fprintf(stderr,
                             "[render-timing] backend-submit calls=%.2f draws=%.1f avg_ms: measured=%.2f "
                             "detail=%.2f target=%.2f draw_setup=%.2f record_upload=%.2f "
-                            "gpu_wait=%.2f readback=%.2f cleanup=%.2f other=%.2f\n",
+                            "gpu_wait=%.2f gpu_device=%.2f gpu_overhead=%.2f readback=%.2f "
+                            "cleanup=%.2f other=%.2f\n",
                             totals.backend_calls / nsub, totals.backend_draws / nsub,
                             totals.backend_ms / nsub, backend_detail_ms / nsub,
                             totals.backend_target_ms / nsub, totals.backend_draw_setup_ms / nsub,
                             totals.backend_record_upload_ms / nsub, totals.backend_gpu_wait_ms / nsub,
+                            totals.backend_gpu_device_ms / nsub,
+                            std::max(0.0, totals.backend_gpu_wait_ms - totals.backend_gpu_device_ms) / nsub,
                             totals.backend_readback_ms / nsub, totals.backend_cleanup_ms / nsub,
                             (totals.backend_ms - backend_detail_ms) / nsub);
                     fprintf(stderr,
                             "[render-timing] backend-submit synchronization command_buffers=%.2f "
-                            "queue_submits=%.2f fence_waits=%.2f\n",
+                            "queue_submits=%.2f fence_waits=%.2f timestamps=%.2f\n",
                             totals.backend_command_buffers / nsub,
                             totals.backend_queue_submits / nsub,
-                            totals.backend_fence_waits / nsub);
+                            totals.backend_fence_waits / nsub,
+                            totals.backend_gpu_timestamp_samples / nsub);
                     fprintf(stderr,
                             "[render-timing] backend-submit draw_setup avg_ms: shaders=%.2f fixed=%.2f "
                             "resources=%.2f pipeline=%.2f\n",
@@ -5025,19 +5041,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     fprintf(stderr,
                             "[render-window] backend-submit calls=%.2f draws=%.1f avg_ms: measured=%.2f "
                             "detail=%.2f target=%.2f draw_setup=%.2f record_upload=%.2f "
-                            "gpu_wait=%.2f readback=%.2f cleanup=%.2f other=%.2f\n",
+                            "gpu_wait=%.2f gpu_device=%.2f gpu_overhead=%.2f readback=%.2f "
+                            "cleanup=%.2f other=%.2f\n",
                             window.backend_calls / wn, window.backend_draws / wn,
                             window.backend_ms / wn, window_backend_detail_ms / wn,
                             window.backend_target_ms / wn, window.backend_draw_setup_ms / wn,
                             window.backend_record_upload_ms / wn, window.backend_gpu_wait_ms / wn,
+                            window.backend_gpu_device_ms / wn,
+                            std::max(0.0, window.backend_gpu_wait_ms - window.backend_gpu_device_ms) / wn,
                             window.backend_readback_ms / wn, window.backend_cleanup_ms / wn,
                             (window.backend_ms - window_backend_detail_ms) / wn);
                     fprintf(stderr,
                             "[render-window] backend-submit synchronization command_buffers=%.2f "
-                            "queue_submits=%.2f fence_waits=%.2f\n",
+                            "queue_submits=%.2f fence_waits=%.2f timestamps=%.2f\n",
                             window.backend_command_buffers / wn,
                             window.backend_queue_submits / wn,
-                            window.backend_fence_waits / wn);
+                            window.backend_fence_waits / wn,
+                            window.backend_gpu_timestamp_samples / wn);
                     fprintf(stderr,
                             "[render-window] backend-submit draw_setup avg_ms: shaders=%.2f fixed=%.2f "
                             "resources=%.2f pipeline=%.2f\n",

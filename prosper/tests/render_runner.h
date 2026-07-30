@@ -493,10 +493,14 @@ struct BackendRenderTimingStats {
     uint64_t command_buffers = 0;
     uint64_t queue_submits = 0;
     uint64_t fence_waits = 0;
+    uint64_t gpu_timestamp_samples = 0;
     double target_ms = 0;
     double draw_setup_ms = 0;
     double record_upload_ms = 0;
     double gpu_wait_ms = 0;
+    // One device timestamp envelope covers the batch from the first command buffer starting through
+    // the final command buffer finishing. It is a subset of the submit/fence wall-clock interval.
+    double gpu_device_ms = 0;
     double readback_ms = 0;
     double cleanup_ms = 0;
     double setup_shader_ms = 0;
@@ -545,6 +549,8 @@ struct RenderVkCtx {
     VkInstance inst = VK_NULL_HANDLE; VkPhysicalDevice phys = VK_NULL_HANDLE;
     VkDevice dev = VK_NULL_HANDLE; VkQueue queue = VK_NULL_HANDLE; uint32_t qfi = UINT32_MAX;
     VkDeviceSize storage_buffer_alignment = 1;
+    double timestamp_period_ns = 0.0;
+    uint32_t timestamp_valid_bits = 0;
     bool aniso_enabled = false; float max_aniso_limit = 1.0f;
     bool depth_bias_clamp_enabled = false;   // VkPhysicalDeviceFeatures::depthBiasClamp (#1349)
     bool logic_op_enabled = false; bool ok = false;
@@ -655,7 +661,10 @@ inline const RenderVkCtx& render_vk_ctx() {
             if (nq) {
                 std::vector<VkQueueFamilyProperties> qfp(nq);
                 vkGetPhysicalDeviceQueueFamilyProperties(r.phys, &nq, qfp.data());
-                if (r.qfi < nq) family_queue_count = qfp[r.qfi].queueCount;
+                if (r.qfi < nq) {
+                    family_queue_count = qfp[r.qfi].queueCount;
+                    r.timestamp_valid_bits = qfp[r.qfi].timestampValidBits;
+                }
             }
         }
         float prio[2] = {1.0f, 1.0f};
@@ -674,6 +683,7 @@ inline const RenderVkCtx& render_vk_ctx() {
         r.max_compute_workgroup_invocations = phys_props.limits.maxComputeWorkGroupInvocations;
         r.storage_buffer_alignment = std::max<VkDeviceSize>(
             1, phys_props.limits.minStorageBufferOffsetAlignment);
+        r.timestamp_period_ns = phys_props.limits.timestampPeriod;
         r.aniso_enabled = supported.samplerAnisotropy;
         r.depth_bias_clamp_enabled = supported.depthBiasClamp;
         if (r.depth_bias_clamp_enabled) feats.depthBiasClamp = VK_TRUE;
@@ -898,7 +908,17 @@ struct BackendSubmissionBatchResult {
     uint64_t command_buffers = 0;
     uint64_t queue_submits = 0;
     uint64_t fence_waits = 0;
+    uint64_t gpu_timestamp_samples = 0;
+    double gpu_device_ms = 0.0;
 };
+
+inline constexpr uint64_t backend_timestamp_delta(uint64_t begin, uint64_t end,
+                                                   uint32_t valid_bits) {
+    if (!valid_bits || valid_bits > 64) return 0;
+    if (valid_bits == 64) return end - begin;
+    const uint64_t mask = (uint64_t{1} << valid_bits) - 1u;
+    return (end - begin) & mask;
+}
 
 // A successful queue submit followed by failed fence and queue-idle waits is not an ordinary
 // failure: Vulkan still owns every referenced resource, so those objects must be retained.
@@ -953,6 +973,36 @@ public:
             commands_.push_back(command);
     }
 
+    void begin_gpu_timestamp(VkDevice dev, VkCommandBuffer command,
+                             double period_ns, uint32_t valid_bits) {
+        if (pending_resources_abandoned_ || !commands_.empty() || gpu_timestamp_.pool ||
+            !dev || !command || period_ns <= 0.0 || !valid_bits)
+            return;
+        VkQueryPoolCreateInfo query_info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        query_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        query_info.queryCount = 2;
+        VkQueryPool pool = VK_NULL_HANDLE;
+        if (vkCreateQueryPool(dev, &query_info, nullptr, &pool) != VK_SUCCESS || !pool)
+            return;
+        gpu_timestamp_ = {dev, pool, period_ns, valid_bits, false};
+        vkCmdResetQueryPool(command, pool, 0, 2);
+        vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pool, 0);
+    }
+
+    void end_gpu_timestamp(VkCommandBuffer command) {
+        if (pending_resources_abandoned_ || !gpu_timestamp_.pool || gpu_timestamp_.ended || !command)
+            return;
+        // Command buffers in one queue submission may overlap. Make the final timestamp depend on
+        // every earlier command in the batch, so this is one envelope rather than a sum of overlapping
+        // per-command intervals.
+        vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+                             0, nullptr, 0, nullptr, 0, nullptr);
+        vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            gpu_timestamp_.pool, 1);
+        gpu_timestamp_.ended = true;
+    }
+
     void add_cleanup(std::function<void()> cleanup) {
         if (!pending_resources_abandoned_) {
             cleanups_.push_back(std::move(cleanup));
@@ -974,6 +1024,7 @@ public:
 
     void discard() {
         commands_.clear();
+        release_gpu_timestamp();
         finish_persistent_state(false);
     }
 
@@ -986,6 +1037,9 @@ public:
     // (registration follows diagnostics).
     void abandon_pending_resources() {
         commands_.clear();
+        // Vulkan may still own this query pool. Deliberately leak it with the other submitted
+        // resources; destroying it after unproven completion would violate object lifetime.
+        gpu_timestamp_ = {};
         finish_persistent_state(false);
         pending_resources_abandoned_ = true;
         backend_mark_unproven_submission();
@@ -1054,6 +1108,19 @@ public:
             result.submit_result == VK_SUCCESS,
             result.submit_result == VK_SUCCESS && result.wait_result == VK_SUCCESS);
         if (state != BackendSubmissionState::Pending) {
+            if (state == BackendSubmissionState::Complete && gpu_timestamp_.ended) {
+                uint64_t values[2]{};
+                if (vkGetQueryPoolResults(
+                        dev, gpu_timestamp_.pool, 0, 2, sizeof(values), values,
+                        sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+                    const uint64_t ticks = backend_timestamp_delta(
+                        values[0], values[1], gpu_timestamp_.valid_bits);
+                    result.gpu_device_ms =
+                        static_cast<double>(ticks) * gpu_timestamp_.period_ns / 1'000'000.0;
+                    result.gpu_timestamp_samples = 1;
+                }
+            }
+            release_gpu_timestamp();
             vkDestroyFence(dev, fence, nullptr);
             commands_.clear();
             finish_persistent_state(state == BackendSubmissionState::Complete);
@@ -1069,11 +1136,26 @@ public:
 
     void complete() {
         if (pending_resources_abandoned_) return;
+        if (commands_.empty()) release_gpu_timestamp();
         for (auto& cleanup : cleanups_) cleanup();
         cleanups_.clear();
     }
 
 private:
+    struct GpuTimestamp {
+        VkDevice dev = VK_NULL_HANDLE;
+        VkQueryPool pool = VK_NULL_HANDLE;
+        double period_ns = 0.0;
+        uint32_t valid_bits = 0;
+        bool ended = false;
+    };
+
+    void release_gpu_timestamp() {
+        if (gpu_timestamp_.pool)
+            vkDestroyQueryPool(gpu_timestamp_.dev, gpu_timestamp_.pool, nullptr);
+        gpu_timestamp_ = {};
+    }
+
     void finish_persistent_state(bool completed) {
         if (!completed)
             for (auto cleanup = failure_cleanups_.rbegin();
@@ -1083,6 +1165,7 @@ private:
     }
 
     std::vector<VkCommandBuffer> commands_;
+    GpuTimestamp gpu_timestamp_;
     std::vector<std::function<void()>> cleanups_;
     std::vector<std::function<void()>> failure_cleanups_;
     bool pending_resources_abandoned_ = false;
@@ -4762,6 +4845,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         });
     const bool synchronous_results_requested =
         readback_requested || storage_writeback_requested;
+    const bool flush_now = !submission_batch || synchronous_results_requested ||
+                           flush_submission_batch;
     VkBuffer rb = VK_NULL_HANDLE;
     VkDeviceMemory bmem = VK_NULL_HANDLE;
     if (readback_requested) {
@@ -4791,6 +4876,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     VkCommandBuffer cmd; vkAllocateCommandBuffers(dev, &cbai, &cmd);
     VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &cbbi);
+    if (timing_enabled)
+        active_submission.begin_gpu_timestamp(
+            dev, cmd, ctx.timestamp_period_ns, ctx.timestamp_valid_bits);
     if (load_cached_color) {
         VkImageMemoryBarrier load{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         load.oldLayout = cached_color->layout;
@@ -5079,13 +5167,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // Per-draw "fragment funnel" (PROSPER_DRAW_STATS): wrap each recorded draw in pipeline-statistics
     // + occlusion queries to show WHERE its pixels vanish (geometry clipped away, never rasterized,
     // depth/stencil-rejected, or survived) — objective per-draw truth, no oracle needed. Read-only, and
-    // only active with the env var AND a real flush in THIS call (so the results are ready to read back;
-    // the flush condition below is identical to `flush_now` computed after the pass). Query-pool RESET
-    // must be recorded outside a render pass, so it happens here.
+    // only active with the env var AND a real flush in THIS call (so the results are ready to read back).
+    // Query-pool RESET must be recorded outside a render pass, so it happens here.
     const RenderVkCtx& ds_ctx = render_vk_ctx();
-    const bool draw_stats = getenv("PROSPER_DRAW_STATS") && ds_ctx.pipeline_stats_enabled && !dv.empty()
-                            && (!submission_batch || synchronous_results_requested ||
-                                flush_submission_batch);
+    const bool draw_stats = getenv("PROSPER_DRAW_STATS") && ds_ctx.pipeline_stats_enabled &&
+                            !dv.empty() && flush_now;
     VkQueryPool ds_stats_pool = VK_NULL_HANDLE, ds_occ_pool = VK_NULL_HANDLE;
     if (draw_stats) {
         const uint32_t nq = static_cast<uint32_t>(dv.size());
@@ -5132,10 +5218,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             }) && geom_target < draws.size())
             geom_item = static_cast<size_t>(geom_target);
     }
-    const bool geom_probe = geom_item != SIZE_MAX
-                            && ds_ctx.transform_feedback_enabled
-                            && (!submission_batch || synchronous_results_requested ||
-                                flush_submission_batch);
+    const bool geom_probe = geom_item != SIZE_MAX &&
+                            ds_ctx.transform_feedback_enabled && flush_now;
     static auto p_bindxfb  = reinterpret_cast<PFN_vkCmdBindTransformFeedbackBuffersEXT>(
         vkGetDeviceProcAddr(dev, "vkCmdBindTransformFeedbackBuffersEXT"));
     static auto p_beginxfb = reinterpret_cast<PFN_vkCmdBeginTransformFeedbackEXT>(
@@ -5392,6 +5476,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         restore_persistent_color(persistent_color, readback_color0, img);
         restore_persistent_color(persistent_color1, readback_color1, img1);
     }
+    if (timing_enabled && flush_now)
+        active_submission.end_gpu_timestamp(cmd);
     vkEndCommandBuffer(cmd);
 
     // Publish newly uploaded exact-version textures before a later command buffer in the same batch
@@ -5476,8 +5562,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         cached_color1->valid = true;
         cached_color1->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
-    const bool flush_now = !submission_batch || synchronous_results_requested ||
-                           flush_submission_batch;
     BackendSubmissionBatchResult batch_result;
     if (flush_now)
         batch_result = active_submission.submit_and_wait(dev, queue, backend_trace);
@@ -5968,10 +6052,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         call_timing.command_buffers = batch_result.command_buffers;
         call_timing.queue_submits = batch_result.queue_submits;
         call_timing.fence_waits = batch_result.fence_waits;
+        call_timing.gpu_timestamp_samples = batch_result.gpu_timestamp_samples;
         call_timing.target_ms = ms(timing_start, timing_target_ready);
         call_timing.draw_setup_ms = ms(timing_target_ready, timing_draws_ready);
         call_timing.record_upload_ms = ms(timing_draws_ready, timing_recorded);
         call_timing.gpu_wait_ms = ms(timing_recorded, timing_gpu_done);
+        call_timing.gpu_device_ms = batch_result.gpu_device_ms;
         call_timing.readback_ms = ms(timing_gpu_done, timing_readback_done);
         call_timing.cleanup_ms = ms(timing_readback_done, timing_done);
         call_timing.setup_shader_ms = setup_shader_ms;
@@ -5981,6 +6067,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         struct TimingTotals {
             uint64_t calls = 0, draws = 0;
             uint64_t command_buffers = 0, queue_submits = 0, fence_waits = 0;
+            uint64_t gpu_timestamp_samples = 0;
             uint64_t texture_references = 0, texture_uploads = 0, texture_upload_bytes = 0;
             uint64_t persistent_hits = 0, persistent_misses = 0, persistent_cached_bytes = 0;
             uint64_t texture_binding_references = 0, unique_texture_bindings = 0;
@@ -5989,7 +6076,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             uint64_t pipeline_layout_references = 0, unique_pipeline_layouts = 0;
             uint64_t pipeline_references = 0, pipeline_hits = 0, pipeline_misses = 0;
             uint64_t pipeline_bypasses = 0, pipeline_entries = 0, pipeline_evictions = 0;
-            double target = 0, draw_setup = 0, record = 0, gpu_wait = 0, readback = 0, cleanup = 0;
+            double target = 0, draw_setup = 0, record = 0, gpu_wait = 0, gpu_device = 0;
+            double readback = 0, cleanup = 0;
             double setup_shader = 0, setup_fixed = 0, setup_resources = 0, setup_pipeline = 0;
         };
         static TimingTotals totals;
@@ -6000,6 +6088,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             timing.command_buffers += call_timing.command_buffers;
             timing.queue_submits += call_timing.queue_submits;
             timing.fence_waits += call_timing.fence_waits;
+            timing.gpu_timestamp_samples += call_timing.gpu_timestamp_samples;
             timing.texture_references += texture_stats.references;
             timing.texture_uploads += texture_stats.unique_uploads;
             timing.texture_upload_bytes += texture_stats.upload_bytes;
@@ -6026,6 +6115,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             timing.draw_setup += call_timing.draw_setup_ms;
             timing.record += call_timing.record_upload_ms;
             timing.gpu_wait += call_timing.gpu_wait_ms;
+            timing.gpu_device += call_timing.gpu_device_ms;
             timing.readback += call_timing.readback_ms;
             timing.cleanup += call_timing.cleanup_ms;
             timing.setup_shader += call_timing.setup_shader_ms;
@@ -6043,16 +6133,20 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                  totals.gpu_wait + totals.readback + totals.cleanup;
             fprintf(stderr,
                     "[render-timing] backend calls=%llu draws=%llu avg_ms: total=%.2f target=%.2f "
-                    "draw_setup=%.2f record_upload=%.2f gpu_wait=%.2f readback=%.2f cleanup=%.2f\n",
+                    "draw_setup=%.2f record_upload=%.2f gpu_wait=%.2f gpu_device=%.2f "
+                    "gpu_overhead=%.2f readback=%.2f cleanup=%.2f\n",
                     (unsigned long long)totals.calls, (unsigned long long)totals.draws, total / n,
                     totals.target / n, totals.draw_setup / n, totals.record / n,
-                    totals.gpu_wait / n, totals.readback / n, totals.cleanup / n);
+                    totals.gpu_wait / n, totals.gpu_device / n,
+                    std::max(0.0, totals.gpu_wait - totals.gpu_device) / n,
+                    totals.readback / n, totals.cleanup / n);
             fprintf(stderr,
                     "[render-timing] backend synchronization command_buffers=%llu queue_submits=%llu "
-                    "fence_waits=%llu\n",
+                    "fence_waits=%llu gpu_timestamps=%llu\n",
                     (unsigned long long)totals.command_buffers,
                     (unsigned long long)totals.queue_submits,
-                    (unsigned long long)totals.fence_waits);
+                    (unsigned long long)totals.fence_waits,
+                    (unsigned long long)totals.gpu_timestamp_samples);
             fprintf(stderr,
                     "[render-timing] draw_setup avg_ms: shaders=%.2f fixed=%.2f resources=%.2f pipeline=%.2f\n",
                     totals.setup_shader / n, totals.setup_fixed / n,
@@ -6097,15 +6191,18 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                         window.gpu_wait + window.readback + window.cleanup;
             fprintf(stderr,
                     "[render-window] backend calls=%llu draws=%.1f avg_ms: total=%.2f target=%.2f "
-                    "draw_setup=%.2f record_upload=%.2f gpu_wait=%.2f readback=%.2f cleanup=%.2f\n",
+                    "draw_setup=%.2f record_upload=%.2f gpu_wait=%.2f gpu_device=%.2f "
+                    "gpu_overhead=%.2f readback=%.2f cleanup=%.2f\n",
                     (unsigned long long)window.calls, window.draws / wn, window_total / wn,
                     window.target / wn, window.draw_setup / wn, window.record / wn,
-                    window.gpu_wait / wn, window.readback / wn, window.cleanup / wn);
+                    window.gpu_wait / wn, window.gpu_device / wn,
+                    std::max(0.0, window.gpu_wait - window.gpu_device) / wn,
+                    window.readback / wn, window.cleanup / wn);
             fprintf(stderr,
                     "[render-window] backend synchronization command_buffers=%.1f queue_submits=%.1f "
-                    "fence_waits=%.1f\n",
+                    "fence_waits=%.1f gpu_timestamps=%.1f\n",
                     window.command_buffers / wn, window.queue_submits / wn,
-                    window.fence_waits / wn);
+                    window.fence_waits / wn, window.gpu_timestamp_samples / wn);
             fprintf(stderr,
                     "[render-window] draw_setup avg_ms: shaders=%.2f fixed=%.2f resources=%.2f pipeline=%.2f\n",
                     window.setup_shader / wn, window.setup_fixed / wn,
@@ -6273,10 +6370,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             PROSPER_SUM_TIMING_STAT(command_buffers);
             PROSPER_SUM_TIMING_STAT(queue_submits);
             PROSPER_SUM_TIMING_STAT(fence_waits);
+            PROSPER_SUM_TIMING_STAT(gpu_timestamp_samples);
             PROSPER_SUM_TIMING_STAT(target_ms);
             PROSPER_SUM_TIMING_STAT(draw_setup_ms);
             PROSPER_SUM_TIMING_STAT(record_upload_ms);
             PROSPER_SUM_TIMING_STAT(gpu_wait_ms);
+            PROSPER_SUM_TIMING_STAT(gpu_device_ms);
             PROSPER_SUM_TIMING_STAT(readback_ms);
             PROSPER_SUM_TIMING_STAT(cleanup_ms);
             PROSPER_SUM_TIMING_STAT(setup_shader_ms);
