@@ -2,7 +2,7 @@
 # Run DOLL for N seconds with full logging, then summarize draw evidence.
 SECS=${1:-300}
 LOG=${2:-/root/scene2.log}
-cd /mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-ae005ba42de93cd40/prosper
+cd "${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-ae005ba42de93cd40/prosper"
 PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1 PROSPER_RENDER=1 PROSPER_GFXLOG=1 PROSPER_FILELOG=1 PROSPER_EVLOG=1 \
   timeout "$SECS" ./build-linux/boot_trace /root/PPSA17942-app0 > "$LOG" 2>&1
 echo "run done rc=$?"

@@ -273,12 +273,12 @@ Interpreted as floats:
 The local-only artifacts on the originating Windows machine are:
 
 ```text
-C:\Users\matti\Downloads\AstroBot-Linux-handoff-tail-probe.bin
-C:\Users\matti\Downloads\AstroBot-Linux-handoff-tail-probe.log
-C:\Users\matti\Downloads\AstroBot-shaders-current\exec_ps_5002af200.bin
-C:\Users\matti\Downloads\AstroBot-Linux-1030-title-diag.log
-C:\Users\matti\Downloads\AstroBot-Linux-1030-title-diag\
-C:\Users\matti\Downloads\AstroBot-linux-60-20260719-183308\
+%USERPROFILE%\Downloads\AstroBot-Linux-handoff-tail-probe.bin
+%USERPROFILE%\Downloads\AstroBot-Linux-handoff-tail-probe.log
+%USERPROFILE%\Downloads\AstroBot-shaders-current\exec_ps_5002af200.bin
+%USERPROFILE%\Downloads\AstroBot-Linux-1030-title-diag.log
+%USERPROFILE%\Downloads\AstroBot-Linux-1030-title-diag\
+%USERPROFILE%\Downloads\AstroBot-linux-60-20260719-183308\
 ```
 
 These contain title-derived data and remain gitignored/local-only. Do not commit them. Transfer the

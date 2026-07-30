@@ -44,7 +44,7 @@ Boot + render chain (Linux 45/45, Windows 20/20):
 
 ### Reproduce
 ```bash
-cd /mnt/c/Users/matti/repos/ps5ys/prosper/build-linux
+cd <REPO_ROOT>/prosper/build-linux
 cmake --build . --target boot_trace -j8
 PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
   PROSPER_GFXLOG=1 PROSPER_RENDER=1 PROSPER_FRAME_DIR=/tmp/frames \
@@ -160,5 +160,5 @@ This mirrors how real drivers stage a fetch shader. Needs the draw's vertex-buff
 | Repro switches | `PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 PROSPER_GFXLOG=1 PROSPER_RESDUMP=1 PROSPER_SHADER_DUMP=/tmp PROSPER_FRAME_DIR=/tmp/frames` |
 
 **Environment:** build/run in WSL Ubuntu-24.04 as root; game dump at
-`/mnt/c/Users/matti/repos/ps5ys/PPSA24651-app0` (gitignored, never commit). `llvm-mc`, `spirv-val`,
+`<DUMP_ROOT>/PPSA24651-app0` (gitignored, never commit). `llvm-mc`, `spirv-val`,
 `glslangValidator`, ImageMagick, Vulkan/llvmpipe are installed.

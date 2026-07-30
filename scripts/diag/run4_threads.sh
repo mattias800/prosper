@@ -2,7 +2,7 @@
 # DOLL progression probe, run 4: boot no-render to steady state, then gdb-attach twice (60 s apart)
 # and dump every thread's name/pc/guest-RAs — is anything blocked, and does the picture CHANGE?
 set -u
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-aa922b2bc59375888
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-aa922b2bc59375888"
 BT="$WT/prosper/build-linux/boot_trace"
 DUMP=/root/PPSA17942-app0
 LOG=/root/doll_r4.log

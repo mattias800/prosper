@@ -1,6 +1,6 @@
 #!/bin/bash
 # Issue #232: boot DOLL and live-catch the savedata mount-wrapper callers with gdb.
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-a2d51084866d8d045/prosper
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-a2d51084866d8d045/prosper"
 cd "$WT" || exit 1
 export PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1 PROSPER_RENDER=1 PROSPER_GFXLOG=1 PROSPER_FILELOG=1 PROSPER_SVCLOG=1
 pkill -9 boot_trace; sleep 1

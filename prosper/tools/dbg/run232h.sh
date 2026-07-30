@@ -2,7 +2,7 @@
 # Issue #232: does the w1KFAHVqpaU submit-fold advance DOLL past the RenderThread fence wall?
 # Run 360 s, track flips/submits over time (should NOT plateau at ~178 now), and check for draws.
 SECS=${1:-360}
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-af9660f2dbcb26e7d/prosper
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-af9660f2dbcb26e7d/prosper"
 cd "$WT" || exit 1
 export PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1 PROSPER_RENDER=1 PROSPER_GFXLOG=1 PROSPER_FILELOG=1 PROSPER_EVLOG=1
 timeout "$SECS" ./build-linux/boot_trace /root/PPSA17942-app0 > /root/d232h.log 2>&1 &

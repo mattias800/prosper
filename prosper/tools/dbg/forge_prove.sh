@@ -2,7 +2,7 @@
 # #312 forge-guard proof: N synchronous menu-drive runs (no MB3WATCH, undistorted timing) with the
 # REL1-FORGE guard (default ON unless GUARD=0 passed). Tallies fatal/clean/oom + DOLL progression.
 # Usage: forge_prove.sh <N> <timeout_s> [GUARD]   (GUARD=0 to A/B the baseline)
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-a48ff9e03b626cc45/prosper
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-a48ff9e03b626cc45/prosper"
 cd "$WT" || exit 1
 N=${1:-8}; TMO=${2:-150}; GUARD=${3:-1}
 SCRIPT="15:cross;20:start;25:cross;30:start;35:cross;40:cross;45:start;50:cross;60:cross;70:start;80:cross;90:cross;100:cross;110:cross;120:cross;130:cross"

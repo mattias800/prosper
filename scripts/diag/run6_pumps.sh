@@ -1,7 +1,7 @@
 #!/bin/bash
 # DOLL progression probe, run 6: identify the guest callers of the per-frame unimplemented pumps.
 set -u
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-aa922b2bc59375888
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-aa922b2bc59375888"
 cp -f "$WT/prosper/build-linux/boot_trace" /root/bt_diag
 DUMP=/root/PPSA17942-app0
 LOG=/root/doll_r6.log

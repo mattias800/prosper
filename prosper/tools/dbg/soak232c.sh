@@ -1,7 +1,7 @@
 #!/bin/bash
 # Issue #232 session 6: boot DOLL to steady state, leave running. PID -> /root/pid232s6.txt.
 # NO pkill (other agents run boot_trace on this WSL); kill only our own recorded pid.
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-ac66b5fec5918f7aa/prosper
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-ac66b5fec5918f7aa/prosper"
 LOG=/root/${1:-s6}.log
 cd "$WT" || exit 1
 export PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1 PROSPER_RENDER=1 PROSPER_GFXLOG=1 PROSPER_FILELOG=1 PROSPER_SVCLOG=1

@@ -2,7 +2,7 @@
 # #312 free-canary-guard A/B. Runs N baseline (guard=0) + N guard-on (guard=1) boots, timeout-bounded,
 # tallies MallocBinned3 fatals per arm. All logic in this FILE so claude's wsl.exe $VAR-stripping
 # does not apply. Usage: poolstomp_ab.sh <N> <timeout_s>
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-a5d8efe035816c6c7/prosper
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-a5d8efe035816c6c7/prosper"
 cd "$WT" || exit 1
 N=${1:-4}; TMO=${2:-110}
 SCRIPT="15:cross;20:start;25:cross;30:start;35:cross;40:cross;45:start;50:cross;60:cross;70:start;80:cross;90:cross;100:cross;110:cross"

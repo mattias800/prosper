@@ -1,7 +1,7 @@
 #!/bin/bash
 # #312 poolstomp multi-run harness. Variables live in this FILE (bash reads them), so the
 # claude wsl.exe cmdline-stripping of $VAR does not apply. Usage: poolstomp_run.sh <first> <count> [extra env...]
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-a5d8efe035816c6c7/prosper
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-a5d8efe035816c6c7/prosper"
 cd "$WT" || exit 1
 FIRST=${1:-1}; COUNT=${2:-1}; shift 2 2>/dev/null
 SCRIPT="15:cross;20:start;25:cross;30:start;35:cross;40:cross;45:start;50:cross;60:cross;70:start;80:cross;90:cross;100:cross;110:cross"

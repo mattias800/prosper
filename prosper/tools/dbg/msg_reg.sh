@@ -1,10 +1,10 @@
 #!/bin/bash
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-a48ff9e03b626cc45/prosper
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-a48ff9e03b626cc45/prosper"
 cd "$WT" || exit 1
 pkill -9 boot_trace 2>/dev/null; sleep 1
 L=/root/msg_reg.log
 timeout 130 env PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
-  ./build-linux/boot_trace /mnt/c/Users/matti/repos/ps5ys/PPSA24651-app0 > "$L" 2>&1
+  ./build-linux/boot_trace "${PROSPER_REPO_ROOT:?set to your checkout root}/PPSA24651-app0" > "$L" 2>&1
 echo "rc=$?"
 echo "lines=$(wc -l < $L)"
 echo "vcount: $(grep -oE 'vcount=[0-9]+' $L | tail -1)"

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Issue #232: boot to the FlushAsyncLoading stall, then probe FAsyncLoadingThread2 state.
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-a9e9a0302ab3fc359/prosper
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-a9e9a0302ab3fc359/prosper"
 cd "$WT" || exit 1
 export PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1 PROSPER_RENDER=1 PROSPER_GFXLOG=1 PROSPER_FILELOG=1 PROSPER_EVLOG=1
 PID=

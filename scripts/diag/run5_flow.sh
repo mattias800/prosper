@@ -1,7 +1,7 @@
 #!/bin/bash
 # DOLL progression probe, run 5: boot no-render to steady state, attach gdb with flow5.py.
 set -u
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-aa922b2bc59375888
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-aa922b2bc59375888"
 # Run under a different binary name: sibling agents' cleanup scripts pkill 'boot_trace' and have
 # killed our diagnostic boots mid-probe.
 cp -f "$WT/prosper/build-linux/boot_trace" /root/bt_diag

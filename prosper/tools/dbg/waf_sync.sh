@@ -1,7 +1,7 @@
 #!/bin/bash
 # #312: test whether SYNCHRONOUS fence writes (PROSPER_EOP_WRITE_SYNC=1, no pend deferral) + the WAF
 # guard close the gate. Usage: waf_sync.sh <first> <N> <timeout_s> [SYNC] [GUARD]
-WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-a8f10a7598f626404/prosper
+WT="${PROSPER_REPO_ROOT:?set to your checkout root}/.claude/worktrees/agent-a8f10a7598f626404/prosper"
 cd "$WT" || exit 1
 FIRST=${1:-1}; N=${2:-3}; TMO=${3:-120}; SYNC=${4:-1}; GUARD=${5:-1}
 SCRIPT="15:cross;20:start;25:cross;30:start;35:cross;40:cross;45:start;50:cross;60:cross;70:start;80:cross;90:cross;100:cross;110:cross;120:cross;130:cross"
