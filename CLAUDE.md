@@ -266,6 +266,27 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   cd /mnt/c/Users/matti/repos/ps5ys/prosper/build-linux
   cmake --build . -j8 && ctest        # 99/99 expected green on Linux
   ```
+- **Write run artifacts and build temporaries to the real disk, never `/tmp`.** On the Linux box `/tmp`
+  is a **RAM-backed tmpfs sized at 50% of RAM, with a per-user quota shared by every concurrent agent**.
+  A single `.prgcap` is 200 MB–2.7 GB, a 4K `.bmp` is 24 MB, and a `PROSPER_GFXLOG`/`PROSPER_DBG` run log
+  reaches 1.5 GB, so a few sessions of ordinary capture work exhaust the quota. When that happens it does
+  not just fail your write — it **eats the machine's RAM and kills the Bash tool outright for every
+  agent**, because the harness stores each command's output under `$TMPDIR`. Put captures, frame dumps,
+  screenshots and logs in a gitignored worktree-local directory or under `/var/tmp` (real disk, and
+  `systemd-tmpfiles` already ages it), and always build with `TMPDIR` off the tmpfs — gcc's compile
+  temporaries are large enough on their own to break a `-j8` build with
+  `error writing to /tmp/ccXXXX.s: Disk quota exceeded`:
+  ```bash
+  mkdir -p <worktree>/build/tmpdir
+  distrobox enter ps5ys -- bash -lc "cd <worktree> && TMPDIR=\$PWD/build/tmpdir cmake --build build -j6"
+  ```
+  **Diagnosing an exhausted `/tmp`:** every Bash call returns exit 1 with no output — including `true`
+  and `echo hello`, foreground or background — which looks identical to a dead working directory. The
+  tell is the **Write tool returning `EDQUOT`** for a path under `/tmp` (if Write to `/tmp` succeeds, it
+  is the cwd instead). It is recoverable from inside the session: the commands still *execute*, only the
+  output capture fails, so redirect stdout **and** stderr to a file on the real disk, end with `exit 0`,
+  read that file, and `rm -rf` scratch that is a day or more old. Leave `/tmp/claude-*` and anything
+  touched in the last few hours alone — other agents are live.
 - **Verification is agentic-first / programmatic** (`docs/VERIFICATION.md`): ctest exit code is truth;
   shaders are `spirv-val`-gated; rendered frames are asserted by pixels, hashes, or routed content
   metrics. Snapshots are a **release-time regression inventory**, not a day-to-day development or merge

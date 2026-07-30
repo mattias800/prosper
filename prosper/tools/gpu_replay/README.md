@@ -187,7 +187,7 @@ Works on both `gpu_replay` and the live app because it lives in the shared rende
 
 ```bash
 PROSPER_GEOM_PROBE=4 ./build-linux/gpu_replay /tmp/submit.prgcap /tmp/out.bmp
-# [geom-probe] draw 4 VS re-recompiled with xfb capture (1700 words)
+# [geom-probe] draw=4 item=2 operation=19 reused stored VS with xfb in GS (1700 VS words, 676 GS words)
 # [geom-probe] draw=4 verts=1024 finite=1024 on-screen=0 clipped=1024 (offscreen=1023 w<=0=1 nan/inf=0)
 # [geom-probe]   clip-bbox x[-4.86,0] y[-1.14,3.81] z[0,0] w[0,1] -> ALL-VERTS-OUTSIDE-CLIP-CUBE(...)
 # [geom-probe]   v0 = (-2.9, -0.771, 0, 1) ...
@@ -208,13 +208,14 @@ owns *where the geometry is* — a large full-screen quad can have every vertex 
 rasterize, so "all verts clipped" is not "renders nothing"; the bbox tells them apart.
 
 Mechanics: on a capsule (stored SPIR-V) gpu_replay resolves semantic draw N to its compact item, then
-re-recompiles that draw's raw RDNA2 VS with `gl_Position`
-xfb-decorated and swaps it in for that one draw. A v19+ capsule is sufficient for an ordinary vertex shader;
-v31+ additionally retains a separately-installed NGG main stage and its graphics-LDS allocation, allowing
-linked prolog+main programs to be probed faithfully. The live app recompiles fresh. Requires the device to
-advertise `VK_EXT_transform_feedback` (RADV, lavapipe). The
-probed draw's rendered pixels may be inexact (the re-recompile drops pixel-input remapping), but the captured
-`gl_Position` values are faithful; inert and byte-identical when the env var is unset.
+decorates the **last pre-rasterization stage** for XFB. That is normally a recompiled raw RDNA2 VS. If explicit
+fragment interpolation inserted Prosper's generated GS, gpu_replay rebuilds that GS with XFB output and
+reuses the stored VS instead; Vulkan sources transform feedback only from the final such stage.
+A v19+ capsule is sufficient for an ordinary vertex shader; v31+ additionally retains a separately-installed
+NGG main stage and its graphics-LDS allocation, allowing linked prolog+main programs to be probed faithfully.
+Existing guest geometry stages cannot yet be rebuilt and are rejected visibly. The live app follows the same
+stage selection while recompiling fresh. Requires `VK_EXT_transform_feedback` (RADV, lavapipe). The captured
+final `gl_Position` values are faithful; inert and byte-identical when the env var is unset.
 
 ### Geometry-health line (`[geom-health]`, printed alongside the probe)
 
@@ -293,17 +294,29 @@ FragCoord-dependent terms).
 ./build-linux/gpu_replay ~/cap/frame.prgcap /tmp/stored.bmp                    # stored (capture-time) shaders
 ./build-linux/gpu_replay --recompile-raw ~/cap/frame.prgcap /tmp/current.bmp   # CURRENT recompiler
 # [recompile-raw] substituted vs=1563 fs=1563 kept-stored vs=0 fs=0 of 1563 draws
+# [recompile-raw] substituted compute=52 kept-stored=0 of 52 dispatches device-formats=0x3ff
 ```
 
 A capsule stores already-recompiled SPIR-V, so recompiler changes are invisible to a default replay.
 `--recompile-raw` re-recompiles **every** retained raw VS/FS with the current recompiler and substitutes the
-results — any v19+ capsule becomes a deterministic ~seconds-per-iteration A/B vehicle for recompiler work
+results — any v19+ capsule becomes a deterministic ~seconds-per-iteration A/B vehicle for graphics work
 (compare the replay hashes / BMPs), instead of a multi-minute live route per experiment. This was the
 iteration loop that localized #1394 for #1287. Items without a retained raw stream, or whose re-recompile
 fails, keep their stored SPIR-V — the `[recompile-raw]` line counts them; a nonzero `kept-stored` means the
 A/B is partial, never silent. Composes with `PROSPER_FS_TAP` (masked during the mass loop so the per-draw tap
 block keeps exclusive ownership of its semantic draw). Interface hints are re-derived from the raw streams,
 the same contract as the probes above.
+
+Capture v39 extends the same loop to realized compute dispatches. It retains the bounded raw RDNA2 stream,
+user SGPR push constants, launch/thread ABI, wave/TGID/LDS controls, and the capture host's optional typed-
+storage capability mask. A rendering replay initializes Vulkan before recompilation and selects storage
+formats and subgroup contracts from the replay device's actually enabled capabilities. Non-rendering
+`--inspect-only`, `--validate`, and `--graph` invocations can rebuild without Vulkan using the recorded
+capture-host policy; combine `--dump-compute` with `--inspect-only` for the same offline-only behavior. The
+stored SPIR-V remains the default replay artifact. Capture-bound live translation deliberately stores its
+portable module, so the stored/current A/B directly measures device-specific native-width paths without
+making them mandatory for other replay hosts. Pre-v39 captures stay readable and report that their compute
+modules were kept rather than inventing raw source or launch state.
 
 Two render_runner provenance logs pair with it when a capsule replay disagrees with expectations
 (both inert by default): `PROSPER_MIPLOG=1` prints each texture binding's mip-eligibility inputs
@@ -338,15 +351,24 @@ stage is fault-safely read once, content-deduplicated, capped at 64 KiB, and sto
 outnumber semantic operations, and every reference/hash is validated while reading. Captures v1-v6 remain
 readable and print `failure-diagnostics: unavailable (capture predates v7)` rather than inventing evidence.
 
+`--retry-failed-stage FAILURE:STAGE` reruns one retained stage through the current recompiler with its exact
+captured resource table. For split vertex programs, `--retry-failed-chain FAILURE` instead reconstructs the
+first two retained vertex stages as one prolog/main chain and calls the production chain recompiler. Both modes
+exit successfully only when SPIR-V is produced and avoid Vulkan rendering, so they are the fast feedback path
+after a translator change. Chain retry requires the exact resource metadata added in capture v35 and rejects
+older or incomplete diagnostics explicitly.
+
 Capture v8 adds persistent depth/stencil checkpoints. Each seed stores the renderer's complete guest cache
 identity (depth/stencil read/write bases, HTILE base, extent, and D32/D32S8 format), independent depth/stencil
 validity, and raw valid-plane bytes. Counts, extents, formats, duplicate identities, per-plane lengths, and a
 1 GiB total are validated before allocation or Vulkan upload. Captures v1-v7 remain readable with zero DS
 seeds. `--inspect-only` prints every seed's identity, validity, byte counts, and content hashes.
 
-Compute selectors use the realized compute index printed by `--inspect-only`. The resource selector is
+Compute selectors use the realized compute index printed by `--inspect-only`; v39 also prints `raw=yes` when
+that dispatch has complete current-translator replay state. The resource selector is
 `COMPUTE:BINDING`; it writes the captured pre-dispatch storage-buffer bytes, while `--dump-compute` writes
-the exact specialized SPIR-V executed by replay. `--compute-only N` retains just that realized dispatch and
+the exact specialized SPIR-V executed by replay (the rebuilt module when combined with `--recompile-raw`).
+`--compute-only N` retains just that realized dispatch and
 its captured resources, making a driver or recompiler failure deterministic without running unrelated draws
 or dispatches. `--override-compute-spv N PATH` replaces that dispatch's module after capture materialization;
 the input must be a 20-byte-to-16-MiB SPIR-V binary with the standard magic word. Overrides intentionally

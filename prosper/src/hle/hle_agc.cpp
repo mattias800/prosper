@@ -66,7 +66,9 @@ constexpr uint32_t R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET =
                    R_ACQUIRE_MEM = 0x14, R_WRITE_DATA = 0x15, R_WAIT_MEM_64 = 0x16, R_FLIP = 0x17,
                    R_RELEASE_MEM = 0x18, R_DMA_DATA = 0x19, R_DISPATCH_DIRECT = 0x1a,
                    R_INDEX_BASE = 0x1b, R_INDEX_COUNT = 0x1c, R_DRAW_INDEX_OFFSET = 0x1d,
-                   R_JUMP = 0x1e, R_SET_PRED = 0x1f;
+                   R_JUMP = 0x1e, R_SET_PRED = 0x1f,
+                   R_SET_BASE_INDIRECT_ARGS = 0x20, R_STALL_COMMAND_BUFFER_PARSER = 0x21,
+                   R_DRAW_INDEX_INDIRECT = 0x22, R_DISPATCH_INDIRECT = 0x23;
 constexpr uint32_t R_NUM = 0x40;
 constexpr uint64_t kAgcErrInvalidArg = 0x8a6c000aull;
 constexpr uint64_t kAgcErrInvalidShaderHalves = 0x8a6c0008ull;
@@ -1642,6 +1644,10 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
                 case K::DrawIndexOffset: return "DrawIndexOffset";
                 case K::Jump:            return "Jump";
                 case K::SetPredication:  return "SetPredication";
+                case K::SetBaseIndirectArgs: return "SetBaseIndirectArgs";
+                case K::StallCommandBufferParser: return "StallCommandBufferParser";
+                case K::DrawIndexIndirect: return "DrawIndexIndirect";
+                case K::DispatchIndirect: return "DispatchIndirect";
                 case K::DmaData:         return "DmaData";
                 case K::Unknown:         return "Unknown";
             }
@@ -1873,6 +1879,40 @@ HLE(agc_cb_dispatch) {  // (buf, dimension_x, dimension_y, dimension_z, dispatch
     return (uint64_t)(uintptr_t)cmd;
 }
 
+// Indirect work is built as three ordered commands: select a graphics/compute argument base,
+// synchronize the command-buffer parser with prior shader writes, then consume an offset from that
+// base. Astro Bot's live callsites pin the ABI as (dcb, shaderType, baseAddress) followed by
+// (dcb, byteOffset, modifier); shaderType is 0 for indexed graphics and 1 for compute. Preserve the
+// address and offset in semantic packets so the executor can read the arguments only after earlier
+// compute dispatches have completed and written them back to guest memory.
+HLE(agc_dcb_set_base_indirect_args) {
+    if (a1 > 1) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, 4, IT_NOP, R_SET_BASE_INDIRECT_ARGS, &cmd)) return 0;
+    cmd[1] = static_cast<uint32_t>(a1);
+    cmd[2] = static_cast<uint32_t>(a2);
+    cmd[3] = static_cast<uint32_t>(a2 >> 32u);
+    return reinterpret_cast<uint64_t>(cmd);
+}
+HLE(agc_dcb_stall_command_buffer_parser) {
+    uint32_t* cmd; if (!begin_packet(a0, 2, IT_NOP, R_STALL_COMMAND_BUFFER_PARSER, &cmd)) return 0;
+    cmd[1] = 0;
+    return reinterpret_cast<uint64_t>(cmd);
+}
+HLE(agc_dcb_draw_index_indirect) {
+    uint32_t* cmd; if (!begin_packet(a0, 4, IT_NOP, R_DRAW_INDEX_INDIRECT, &cmd)) return 0;
+    cmd[1] = static_cast<uint32_t>(a1);
+    cmd[2] = static_cast<uint32_t>(a2);
+    cmd[3] = static_cast<uint32_t>(a2 >> 32u);
+    return reinterpret_cast<uint64_t>(cmd);
+}
+HLE(agc_cb_dispatch_indirect) {
+    uint32_t* cmd; if (!begin_packet(a0, 4, IT_NOP, R_DISPATCH_INDIRECT, &cmd)) return 0;
+    cmd[1] = static_cast<uint32_t>(a1);
+    cmd[2] = static_cast<uint32_t>(a2);
+    cmd[3] = static_cast<uint32_t>(a2 >> 32u);
+    return reinterpret_cast<uint64_t>(cmd);
+}
+
 // AGC command-buffer size queries (GTA V / PPSA04263, RAGE, issue #1137). A GetSize returns how many
 // BYTES a command will occupy so the guest can size its DrawCommandBuffer before building. RAGE's
 // render thread (eboot+0x2bfef.. / +0x2bffd..) sums these across a workload, some used directly as a
@@ -1971,6 +2011,11 @@ void register_agc_hle() {
     RN("3KDcnM3lrcU", agc_patch_wait_reg_mem_addr);  // WaitRegMem packet: set label address
     RN("0fWWK5uG9rQ", agc_patch_release_mem_addr);   // ReleaseMem packet: set label address
     RN("k3GhuSNmBLU", agc_cb_dispatch);              // sceAgcCbDispatch (dimensions x/y/z, modifier)
+    RN("RmaJwLtc8rY", agc_dcb_set_base_indirect_args);       // graphics/compute indirect base
+    RN("u2T2DiA5hRI", agc_dcb_stall_command_buffer_parser); // parser visibility barrier
+    RN("t1vNu082-jM", agc_dcb_draw_index_indirect);         // indexed indirect draw
+    RN("CtB+A9-VxO0", agc_cb_dispatch_indirect);            // DCB indirect compute dispatch
+    RN("j3EtxFkSIhQ", agc_cb_dispatch_indirect);            // ACB sibling
     RN("WmAc2MEj6Io", agc_dcb_dma_data);        // sceAgcDcbDmaData — append DMA_DATA packet (#117/#312)
     RN("-RnpfpxIhec", agc_acb_dma_data);        // sceAgcAcbDmaData — async-compute sibling (#312)
     RN("IxYiarKlXxM", agc_patch_dma_data_dst);  // sceAgcDmaDataPatchSetDstAddressOrOffset

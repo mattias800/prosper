@@ -7,8 +7,10 @@
 #include "../src/gpu/videoout_present.hpp"
 #include "../src/gpu/pm4_registers.hpp"
 #include "../src/gpu/vk_translate.hpp"
+#include "../src/hle/dispatch.hpp"
 #include "../src/host/guest_write_watch.hpp"
 #include "render_runner.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -41,6 +43,7 @@ alignas(256) static const uint32_t kPs[] = {
 alignas(256) static const uint32_t kDccPs[] = {
     0x7E000280u, 0xF8001803u, 0x00000000u, 0xBF810000u,
 };
+alignas(256) static const uint32_t kNoopCs[] = {0xBF810000u};
 static void set_pgm(GpuState& st, uint32_t lo_off, uint32_t hi_off, const void* p) {
     uint64_t a = (uint64_t)(uintptr_t)p;
     st.sh[lo_off] = (uint32_t)((a >> 8) & 0xFFFFFFFFu);
@@ -49,6 +52,7 @@ static void set_pgm(GpuState& st, uint32_t lo_off, uint32_t hi_off, const void* 
 
 int main() {
     printf("== test_gpu_execute ==\n");
+    prosper::register_agc_hle();
     const uint32_t W = 64, H = 64;
 
     uint64_t occurrence = 0;
@@ -631,16 +635,166 @@ int main() {
               "DMA-backed index buffer is realized after the ordered copy in the production path");
     }
 
-    // Compute-only and DMA-only submissions bypass presentation, but an environment capture aimed
-    // at an unsupported compute program must still retain that semantic submit.  Exercise the
-    // non-render hook with an ordered DMA operation here; the compute selector/failure closure is
-    // covered by test_gpu_capture's semantic-dispatch cases.
+    // Indirect arguments are generated memory, not command-fold inputs. Supply them through an
+    // earlier ordered copy and verify that the production path reads the five-dword indexed draw
+    // only after that producer, including instance count and signed vertex offset.
     {
-        uint32_t source = 0x13579BDFu, destination = 0;
+        alignas(4) uint32_t generated_args[5] = {3, 2, 0, 7, 0};
+        alignas(4) uint32_t consumed_args[5] = {};
+        uint16_t indirect_indices[3] = {0, 1, 2};
+        GpuState ordered = st;
+        ordered.index_type = 0;
+        ordered.draws.clear();
+        ordered.dispatches.clear();
+        ordered.dma_copies.clear();
+        ordered.ordered_memory_effects.clear();
+        GpuState::Draw draw;
+        draw.indexed = true;
+        draw.index_base = reinterpret_cast<uint64_t>(indirect_indices);
+        draw.indirect = true;
+        draw.indirect_args_addr = reinterpret_cast<uint64_t>(consumed_args);
+        draw.command_order = 200;
+        ordered.draws.push_back(draw);
+        ordered.dma_copies.push_back({
+            reinterpret_cast<uint64_t>(consumed_args),
+            reinterpret_cast<uint64_t>(generated_args), sizeof(consumed_args), 0, 100, 0});
+        const std::filesystem::path capture_path =
+            std::filesystem::temp_directory_path() /
+            "prosper_dma_indirect_draw_capture.prgcap";
+        std::error_code capture_filesystem_error;
+        std::filesystem::remove(capture_path, capture_filesystem_error);
+        request_interactive_gpu_capture(capture_path.string());
+        std::vector<uint32_t> submitted_indices;
+        uint32_t submitted_instances = 0;
+        int32_t submitted_vertex_offset = 0;
+        uint32_t submitted_raw_count = 0;
+        set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+            if (!items.empty()) {
+                submitted_indices = items.front().indices;
+                submitted_instances = items.front().instance_count;
+                submitted_vertex_offset = items.front().vertex_offset;
+                submitted_raw_count = items.front().raw_draw_count;
+            }
+            return RenderedFrame{};
+        });
+        execute_ordered_and_present(ordered, W, H, 78, /*publish=*/false);
+        set_submit_renderer({});
+        CHECK(submitted_indices == std::vector<uint32_t>({0, 1, 2}) &&
+              submitted_instances == 2 && submitted_vertex_offset == 7 &&
+              submitted_raw_count == 3,
+              "indexed indirect arguments resolve lazily after their ordered producer");
+        GpuCaptureFile indirect_capture;
+        GpuReplayFrame indirect_replay;
+        std::string indirect_capture_error;
+        const bool captured = read_gpu_capture(
+            capture_path.string(), indirect_capture, indirect_capture_error);
+        const bool destination_was_zero = captured && indirect_capture.dma_copies.size() == 1 &&
+            indirect_capture.dma_copies[0].destination_blob_index <
+                indirect_capture.blobs.size() && [&] {
+                    const auto& dma = indirect_capture.dma_copies[0];
+                    const auto& blob = indirect_capture.blobs[dma.destination_blob_index];
+                    if (dma.destination_blob_offset + sizeof(consumed_args) > blob.bytes.size())
+                        return false;
+                    return std::all_of(
+                        blob.bytes.begin() + static_cast<ptrdiff_t>(dma.destination_blob_offset),
+                        blob.bytes.begin() + static_cast<ptrdiff_t>(
+                            dma.destination_blob_offset + sizeof(consumed_args)),
+                        [](uint8_t value) { return value == 0; });
+                }();
+        CHECK(captured && indirect_capture.draws.size() == 1 &&
+                  indirect_capture.draws[0].raw_draw_count == 3 &&
+                  indirect_capture.draws[0].instance_count == 2 &&
+                  indirect_capture.draws[0].vertex_offset == 7 &&
+                  indirect_capture.dma_copies.size() == 1 && destination_was_zero &&
+                  materialize_gpu_replay(indirect_capture, indirect_replay,
+                                         indirect_capture_error) &&
+                  indirect_replay.items.size() == 1 &&
+                  indirect_replay.items[0].raw_draw_count == 3 &&
+                  indirect_replay.items[0].instance_count == 2 &&
+                  indirect_replay.items[0].vertex_offset == 7,
+              "deferred capture combines exact post-DMA indirect draw fields with pre-submit bytes");
+        std::filesystem::remove(capture_path, capture_filesystem_error);
+    }
+
+    // A parser stall makes later indirect packets depend on every producer in the preceding epoch.
+    // Valid stale argument bytes must never leak through when that producer failed: doing so can
+    // turn last frame's plausible counts into a real backend draw.
+    for (bool failed_dma : {false, true}) {
+        alignas(4) uint32_t stale_args[5] = {3, 1, 0, 0, 0};
+        uint16_t stale_indices[3] = {0, 1, 2};
+        uint8_t dma_destination = 0;
+        GpuState dependent = st;
+        dependent.index_type = 0;
+        dependent.draws.clear();
+        dependent.dispatches.clear();
+        dependent.dma_copies.clear();
+        dependent.parser_stalls.clear();
+        dependent.ordered_memory_effects.clear();
+        if (failed_dma) {
+            dependent.dma_copies.push_back({
+                reinterpret_cast<uint64_t>(&dma_destination), 0xdead00000000ull,
+                1, 0, 50, 0});
+        } else {
+            GpuState::Dispatch failed_dispatch;
+            failed_dispatch.threads_x = failed_dispatch.threads_y =
+                failed_dispatch.threads_z = 1;
+            failed_dispatch.command_order = 50;
+            dependent.dispatches.push_back(failed_dispatch);
+        }
+        dependent.parser_stalls.push_back({100});
+        dependent.parser_stalls.push_back({110});
+        GpuState::Draw dependent_draw;
+        dependent_draw.indexed = true;
+        dependent_draw.index_base = reinterpret_cast<uint64_t>(stale_indices);
+        dependent_draw.indirect = true;
+        dependent_draw.indirect_args_addr = reinterpret_cast<uint64_t>(stale_args);
+        dependent_draw.command_order = 150;
+        dependent.draws.push_back(dependent_draw);
+        uint32_t backend_draws = 0;
+        set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+            backend_draws += static_cast<uint32_t>(items.size());
+            return RenderedFrame{};
+        });
+        set_submit_compute([](const std::vector<ComputeItem>&) { return true; });
+        execute_ordered_and_present(dependent, W, H, failed_dma ? 80 : 79,
+                                    /*publish=*/false);
+        set_submit_renderer({});
+        set_submit_compute({});
+        CHECK(backend_draws == 0,
+              failed_dma
+                  ? "failed DMA producer poisons the stalled indirect consumer"
+                  : "failed compute realization poisons the stalled indirect consumer");
+    }
+
+    // Compute-only submissions bypass presentation. Their capture must remain deferred even without
+    // DMA so finish receives the exact realized/executed compute rather than eagerly materializing
+    // the intentionally empty pre-execution lists as an unrealized operation.
+    {
+        auto create_shader = prosper::Hle::lookup("f3dg2CSgRKY");
+        ShaderReg compute_registers[2] = {
+            {P::COMPUTE_PGM_LO, 0}, {P::COMPUTE_PGM_HI, 0},
+        };
+        AgcShaderHeader compute_header{};
+        compute_header.file_header = 0x34333231u;
+        compute_header.version = 0x18;
+        compute_header.sh_registers = compute_registers;
+        compute_header.shader_size = sizeof(kNoopCs);
+        compute_header.type = 0;
+        compute_header.num_sh_registers = 2;
+        void* registered_shader = nullptr;
+        CHECK(create_shader &&
+                  create_shader(reinterpret_cast<uint64_t>(&registered_shader),
+                                reinterpret_cast<uint64_t>(&compute_header),
+                                reinterpret_cast<uint64_t>(kNoopCs), 0, 0, 0) == 0 &&
+                  registered_shader == &compute_header,
+              "register a descriptor-free compute shader for non-render capture");
         GpuState nonrender;
-        nonrender.dma_copies.push_back({
-            reinterpret_cast<uint64_t>(&destination), reinterpret_cast<uint64_t>(&source),
-            sizeof(source), 0, 17, 0});
+        nonrender.sh[P::COMPUTE_PGM_LO] = compute_registers[0].value;
+        nonrender.sh[P::COMPUTE_PGM_HI] = compute_registers[1].value;
+        GpuState::Dispatch direct_dispatch;
+        direct_dispatch.threads_x = direct_dispatch.threads_y = direct_dispatch.threads_z = 1;
+        direct_dispatch.command_order = 17;
+        nonrender.dispatches.push_back(direct_dispatch);
         const std::filesystem::path path =
             std::filesystem::temp_directory_path() / "prosper_nonrender_submit_capture.prgcap";
         std::error_code filesystem_error;
@@ -652,7 +806,13 @@ int main() {
         setenv("PROSPER_GPU_CAPTURE", path.string().c_str(), 1);
         setenv("PROSPER_GPU_CAPTURE_METADATA_ONLY", "1", 1);
 #endif
+        uint32_t compute_calls = 0;
+        set_submit_compute([&](const std::vector<ComputeItem>& items) {
+            compute_calls += static_cast<uint32_t>(items.size());
+            return !items.empty();
+        });
         const bool executed = execute_nonrender_submit_work(nonrender, 1441);
+        set_submit_compute({});
 #ifdef _WIN32
         _putenv_s("PROSPER_GPU_CAPTURE", "");
         _putenv_s("PROSPER_GPU_CAPTURE_METADATA_ONLY", "");
@@ -662,13 +822,14 @@ int main() {
 #endif
         GpuCaptureFile captured;
         std::string capture_error;
-        CHECK(executed && destination == source &&
+        CHECK(executed && compute_calls == 1 &&
                   read_gpu_capture(path.string(), captured, capture_error) &&
-                  captured.metadata.submit_index == 1441 && captured.dma_copies.size() == 1 &&
-                  captured.operations.size() == 1 &&
-                  captured.operations[0].kind == SubmitOperationKind::DmaCopy &&
+                  captured.metadata.submit_index == 1441 && captured.computes.size() == 1 &&
+                  captured.computes[0].code_addr == reinterpret_cast<uint64_t>(kNoopCs) &&
+                  captured.operations.size() == 1 && captured.operations[0].realized &&
+                  captured.operations[0].kind == SubmitOperationKind::Dispatch &&
                   !captured.expected_output_valid,
-              "environment capture retains a non-render submit without inventing an output oracle");
+              "environment capture retains the exact executed direct-compute submit");
         std::filesystem::remove(path, filesystem_error);
     }
 

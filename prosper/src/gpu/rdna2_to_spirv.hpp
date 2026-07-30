@@ -177,9 +177,10 @@ FragmentInterpolationLayout fragment_interpolation_layout(
 
 // Generate the descriptor-free triangle geometry stage described above. Returns {} when no fallback
 // is required or the packed interface is invalid. Triangle lists, strips, fans, and the RectList
-// triangle-strip lowering all feed Vulkan's `Triangles` geometry input primitive.
+// triangle-strip lowering all feed Vulkan's `Triangles` geometry input primitive. The optional
+// capture flag decorates this final pre-rasterization stage for the geometry diagnostic only.
 std::vector<uint32_t> recompile_interpolation_geometry(
-    const FragmentInterpolationLayout& layout);
+    const FragmentInterpolationLayout& layout, bool capture_position = false);
 
 // Translate a straight-line float-VALU RDNA2 stream to a compute-shader SPIR-V module.
 // Returns {} if the stream contains an opcode/format this stage does not yet handle. An optional
@@ -216,6 +217,10 @@ struct ComputeShaderConfig {
     // frontend. Offline callers default to the portable raw path; live execution supplies the exact
     // physical-device mask so unsupported typed formats compile to the raw uvec4 fallback.
     uint32_t native_storage_format_support = 0;
+    // Use an exact typed R32_UINT storage image for R11G11B10 when the device cannot store that
+    // packed float format natively. The generated shader packs/unpacks the guest word in SPIR-V,
+    // avoiding the portable but much wider RGBA32_UINT CPU-conversion interchange format.
+    bool packed_r11_storage = true;
 };
 
 // Translate a game compute program without the synthetic binding-0 input / binding-1 output used by
@@ -223,6 +228,15 @@ struct ComputeShaderConfig {
 std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                         const ShaderResourceTable* rt,
                                         const ComputeShaderConfig& config);
+
+// True when the program contains enough proven wave work to justify an exact multi-wave subgroup
+// shell: either the canonical low/high MBCNT pair, or at least four VCC/EXEC branches accepted by the
+// structured compute emitter in a shader containing only top-level guest workgroup barriers. Portable
+// compute lowers those operations through synchronized workgroup scratch; native compute uses subgroup
+// scans/votes. This deliberately conservative structural signal is independent of title and address.
+bool compute_shader_prefers_native_multiwave(const uint32_t* code, size_t dwords);
+bool compute_shader_prefers_native_multiwave(const std::vector<Rdna2Inst>& instructions,
+                                             const uint32_t* code, size_t dwords);
 
 // DPP/permlane operations are native subgroup shuffles: quad permutations need four contiguous
 // lanes, row operations need 16, and PERMLANEX16 needs a paired 32-lane row. The backend rejects

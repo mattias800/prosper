@@ -86,7 +86,7 @@ enum : uint32_t {
     ImgOp_Offset=0x10,                   // ImageOperands bit: dynamic texel offset (needs ImageGatherExtended)
     Img_Sampled_Storage=2,   // OpTypeImage "Sampled" operand: 2 = used WITHOUT a sampler (read/write storage image)
     ImgFmt_Unknown=0,        // OpTypeImage "Image Format": Unknown (runtime view format; needs the caps above)
-    ImgFmt_R32ui=33,         // exact uint32 storage image format required by image atomics
+    ImgFmt_R32ui=kSpirvImageFormatR32ui, // exact uint32 storage image format required by image atomics
     ImgOp_Bias=1, ImgOp_Lod=2, ImgOp_Grad=4, ImgOp_Sample=0x40,   // ImageOperands bits.
     SC_Workgroup=4, Scope_Device=1, Scope_Workgroup=2, Scope_Subgroup=3,
     MemSem_UniformAcqRel=0x48, MemSem_WGAcqRel=0x108,   // storage-buffer/LDS AcquireRelease semantics
@@ -238,6 +238,7 @@ struct SpirvCompute {
     // subgroup size equal to the PS5 wave. Native votes/scans are then architecture-exact.
     uint32_t native_subgroup_size=0;
     uint32_t native_storage_format_support=0;
+    bool packed_r11_storage=true;
     uint32_t compute_min_subgroup_size=0;             // non-semantic backend contract (4/16/32/64)
     uint32_t fragment_required_subgroup_size=0;       // exact guest-wave contract (32 or 64)
     uint32_t v_subgroupid=0, v_subgroup_localid=0, t_ptr_in_u32=0;
@@ -625,10 +626,23 @@ struct SpirvCompute {
         put(code, Op_Branch, {merge});
         put(code, Op_Label, {merge}); cur_block = merge;
     }
-    // Fragment GDS append/consume is one device-global atomic per hardware wave. Helper
-    // invocations participate in the subgroup operations but cannot consume guest counter slots.
-    uint32_t fragment_gds_append(uint32_t index, uint32_t exec_bit, bool consume) {
-        declare_internal_gds();
+    uint32_t compute_gds_atomic_rtn(uint32_t op, uint32_t index, uint32_t value) {
+        declare_internal_gds(0, kComputeInternalGdsBinding);
+        uint32_t pointer = id();
+        putv(code, Op_AccessChain,
+             {t_ptr_gds_u32, pointer, v_internal_gds, uconst(0), index});
+        uint32_t result = id();
+        put(code, op,
+            {t_u32, result, pointer, uconst(Scope_Device),
+             uconst(MemSem_UniformAcqRel), value});
+        return result;
+    }
+    // Native-subgroup GDS append/consume is one device-global atomic per hardware wave. Fragment
+    // helper invocations participate in subgroup operations but cannot consume guest counter slots;
+    // compute has no helper lanes. Callers use this only when one host subgroup is one guest wave.
+    uint32_t native_gds_append(uint32_t index, uint32_t exec_bit, bool consume) {
+        declare_internal_gds(is_compute ? 0 : 1,
+                             is_compute ? kComputeInternalGdsBinding : 0);
         if (!declared_subgroup) {
             put(caps, Op_Capability, {Cap_GroupNonUniform});
             declared_subgroup = true;
@@ -637,7 +651,8 @@ struct SpirvCompute {
             put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
             declared_subgroup_arithmetic = true;
         }
-        const uint32_t active_bit = land(exec_bit, logical_not(helper_invocation()));
+        const uint32_t active_bit = is_fragment
+            ? land(exec_bit, logical_not(helper_invocation())) : exec_bit;
         const uint32_t contribution = sel(active_bit, uconst(1), uconst(0));
         uint32_t count = id();
         put(code, Op_GroupNonUniformIAdd,
@@ -941,6 +956,77 @@ struct SpirvCompute {
         uint32_t raw = bfe_u(dword, uconst(bit_off), uconst(bits));
         uint32_t half = ibin(Op_ShiftLeftLogical, raw, uconst(bits == 11 ? 4u : 5u));
         return unpack_half(half, 0);
+    }
+    // Round a 24-bit significand right by a dynamic amount using round-to-nearest-even. SPIR-V
+    // shifts by the word width are undefined, so clamp the executed shift and select zero for the
+    // large-shift case (the significand is then strictly below halfway).
+    uint32_t round_shift_even_u32(uint32_t value, uint32_t shift) {
+        const uint32_t safe_shift = uext2(Glsl_UMin, shift, uconst(31));
+        const uint32_t nonzero_shift = uext2(Glsl_UMax, safe_shift, uconst(1));
+        const uint32_t rounded = ibin(Op_ShiftRightLogical, value, nonzero_shift);
+        const uint32_t one_shifted = ibin(Op_ShiftLeftLogical, uconst(1), nonzero_shift);
+        const uint32_t remainder = ibin(
+            Op_BitwiseAnd, value, ibin(Op_ISub, one_shifted, uconst(1)));
+        const uint32_t halfway_shift = ibin(Op_ISub, nonzero_shift, uconst(1));
+        const uint32_t halfway = ibin(Op_ShiftLeftLogical, uconst(1), halfway_shift);
+        const uint32_t above = ucmp(Op_UGreaterThan, remainder, halfway);
+        const uint32_t tie = land(
+            ucmp(Op_IEqual, remainder, halfway),
+            ucmp(Op_INotEqual, ibin(Op_BitwiseAnd, rounded, uconst(1)), uconst(0)));
+        const uint32_t incremented = ibin(Op_IAdd, rounded, sel(lor(above, tie), uconst(1), uconst(0)));
+        const uint32_t finite = sel(ucmp(Op_IEqual, shift, uconst(0)), value, incremented);
+        return sel(ucmp(Op_UGreaterThanEqual, shift, uconst(32)), uconst(0), finite);
+    }
+    // Exact inverse of unpack_ufloat for R11G11B10 stores. This mirrors float_to_f11/f10 without
+    // going through binary16, which would double-round values near the shortened-mantissa ties.
+    uint32_t pack_ufloat(uint32_t bits, uint32_t mantissa_bits) {
+        const uint32_t exponent = bfe_u(bits, uconst(23), uconst(8));
+        const uint32_t mantissa = ibin(Op_BitwiseAnd, bits, uconst(0x7fffff));
+        const uint32_t sign = ibin(Op_ShiftRightLogical, bits, uconst(31));
+        const uint32_t exponent_bits = uconst(0x1fu << mantissa_bits);
+        const uint32_t mantissa_mask = uconst((1u << mantissa_bits) - 1u);
+
+        const uint32_t payload_shifted = ibin(
+            Op_ShiftRightLogical, mantissa, uconst(23u - mantissa_bits));
+        const uint32_t payload = sel(
+            ucmp(Op_IEqual, payload_shifted, uconst(0)), uconst(1), payload_shifted);
+        const uint32_t special = sel(
+            ucmp(Op_IEqual, mantissa, uconst(0)), exponent_bits,
+            ibin(Op_BitwiseOr, exponent_bits, payload));
+
+        const uint32_t significand = ibin(Op_BitwiseOr, uconst(0x800000), mantissa);
+        const uint32_t sub_shift = ibin(
+            Op_ISub, uconst(136u - mantissa_bits), exponent);
+        const uint32_t sub_rounded = round_shift_even_u32(significand, sub_shift);
+        const uint32_t subnormal = sel(
+            ucmp(Op_UGreaterThanEqual, sub_rounded, uconst(1u << mantissa_bits)),
+            uconst(1u << mantissa_bits), sub_rounded);
+
+        const uint32_t normal_rounded = round_shift_even_u32(
+            significand, uconst(23u - mantissa_bits));
+        const uint32_t carry = ucmp(
+            Op_IEqual, normal_rounded, uconst(1u << (mantissa_bits + 1u)));
+        const uint32_t target_exponent = ibin(Op_ISub, exponent, uconst(112));
+        const uint32_t carried_exponent = ibin(
+            Op_IAdd, target_exponent, sel(carry, uconst(1), uconst(0)));
+        const uint32_t carried_mantissa = sel(
+            carry, uconst(0), ibin(Op_BitwiseAnd, normal_rounded, mantissa_mask));
+        const uint32_t normal_finite = ibin(
+            Op_BitwiseOr,
+            ibin(Op_ShiftLeftLogical, carried_exponent, uconst(mantissa_bits)),
+            carried_mantissa);
+        const uint32_t normal = sel(
+            ucmp(Op_UGreaterThanEqual, carried_exponent, uconst(31)),
+            exponent_bits, normal_finite);
+
+        const uint32_t finite = sel(
+            ucmp(Op_ULessThanEqual, exponent, uconst(112)), subnormal,
+            sel(ucmp(Op_UGreaterThanEqual, exponent, uconst(143)), exponent_bits, normal));
+        const uint32_t invalid = lor(
+            ucmp(Op_INotEqual, sign, uconst(0)), ucmp(Op_IEqual, exponent, uconst(0)));
+        const uint32_t ordinary = sel(invalid, uconst(0), finite);
+        // Infinity and NaN are handled before the sign clamp, matching the guest conversion.
+        return sel(ucmp(Op_IEqual, exponent, uconst(0xff)), special, ordinary);
     }
     // Inverse of unpack_norm: pack a float VGPR (bits) into a `bits`-wide UNORM/SNORM integer field:
     // clamp to [0,1] (unsigned) or [-1,1] (signed), scale by `norm`, round-to-nearest-even, mask to width.
@@ -1341,8 +1427,9 @@ struct SpirvCompute {
     }
 
     // --- STORAGE images (MIMG image_load / image_store WITHOUT a sampler; compute copy/blit) ---
-    // Integer/packed formats use a UINT-sampled OpTypeImage and the host converts between raw VGPR
-    // channels and guest texels. Four-channel UNORM8/FLOAT16/FLOAT32 use a FLOAT-sampled image instead:
+    // Integer/packed formats use a UINT-sampled OpTypeImage. The portable host path converts between
+    // raw VGPR channels and guest texels; the exact R11G11B10 fallback instead packs one R32ui word
+    // in the shader. Four-channel UNORM8/FLOAT16/FLOAT32 use a FLOAT-sampled image instead:
     // Vulkan then performs exactly the descriptor's normalized/float load-store conversion and the
     // host can stage the guest texels at their native width. VGPRs remain raw u32 bits; float image
     // components are bitcast at this boundary. Both paths use Format=Unknown and therefore require
@@ -1355,6 +1442,7 @@ struct SpirvCompute {
     std::unordered_map<uint32_t, uint32_t> stg_img_var;    // binding -> storage-image OpVariable id
     std::unordered_map<uint32_t, bool> stg_img_float;      // binding -> float (rather than uint) texels
     std::unordered_map<uint32_t, uint32_t> stg_img_format; // binding -> SPIR-V Image Format
+    std::unordered_map<uint32_t, bool> stg_img_packed_r11; // binding -> R11G11B10 packed in R32ui
     bool declared_read_wo_fmt = false, declared_write_wo_fmt = false, declared_sampled1d = false, declared_ms = false, declared_msarray = false;
     static uint32_t stg_key(uint32_t dim, bool arrayed, bool ms, bool float_texel,
                             uint32_t image_format) {
@@ -1365,7 +1453,8 @@ struct SpirvCompute {
     // multisampled) at set 0, `binding`. Float and uint sampled types are keyed separately.
     void declare_storage_image(uint32_t binding, uint32_t dim, bool arrayed = false,
                                bool ms = false, bool float_texel = false,
-                               uint32_t image_format = ImgFmt_Unknown) {
+                               uint32_t image_format = ImgFmt_Unknown,
+                               bool packed_r11 = false) {
         if (dim == Dim_1D && !declared_sampled1d) {   // SPIR-V: Dim=1D needs Sampled1D; storage 1D also needs Image1D
             put(caps, Op_Capability, {Cap_Sampled1D});
             put(caps, Op_Capability, {Cap_Image1D});
@@ -1390,6 +1479,7 @@ struct SpirvCompute {
         stg_img_var[binding] = v;
         stg_img_float[binding] = float_texel;
         stg_img_format[binding] = image_format;
+        stg_img_packed_r11[binding] = packed_r11;
     }
     // Build the integer coordinate operand from `n` raw-bit VGPR coords (u32 texel indices, incl. the
     // array layer as the last component for arrayed images). n=1 -> scalar u32; 2 -> uvec2; 3 -> uvec3.
@@ -1430,6 +1520,15 @@ struct SpirvCompute {
         uint32_t res   = id();
         if (ms) put(code, Op_ImageRead, {vector_type, res, img, coord, ImgOp_Sample, sample});
         else    put(code, Op_ImageRead, {vector_type, res, img, coord});
+        if (stg_img_packed_r11[binding]) {
+            uint32_t packed = id();
+            put(code, Op_CompositeExtract, {t_u32, packed, res, 0});
+            out[0] = unpack_ufloat(packed, 0, 11);
+            out[1] = unpack_ufloat(packed, 11, 11);
+            out[2] = unpack_ufloat(packed, 22, 10);
+            out[3] = bcu(fconstf(1.0f));
+            return;
+        }
         for (uint32_t c = 0; c < 4; c++) {
             uint32_t e = id();
             put(code, Op_CompositeExtract, {float_texel ? t_f32 : t_u32, e, res, c});
@@ -1453,7 +1552,14 @@ struct SpirvCompute {
                                     stg_img_var[binding]});
         uint32_t coord = stg_coord(ncoord, coords);
         uint32_t texel = id();
-        if (float_texel)
+        if (stg_img_packed_r11[binding]) {
+            const uint32_t r = pack_ufloat(vals[0], 6);
+            const uint32_t g = ibin(Op_ShiftLeftLogical, pack_ufloat(vals[1], 6), uconst(11));
+            const uint32_t b = ibin(Op_ShiftLeftLogical, pack_ufloat(vals[2], 5), uconst(22));
+            const uint32_t packed = ibin(Op_BitwiseOr, ibin(Op_BitwiseOr, r, g), b);
+            put(code, Op_CompositeConstruct,
+                {t_v4u(), texel, packed, uconst(0), uconst(0), uconst(0)});
+        } else if (float_texel)
             put(code, Op_CompositeConstruct,
                 {t_v4f, texel, bcf(vals[0]), bcf(vals[1]), bcf(vals[2]), bcf(vals[3])});
         else
@@ -1831,11 +1937,14 @@ struct SpirvCompute {
         return b_iadd(acc_bits, sum);
     }
     // DS_APPEND/DS_CONSUME: one atomic add/subtract per emulated hardware wave, changing the counter
-    // by popcount(EXEC), with the old value broadcast to every lane. Every Vulkan invocation participates in the barriers;
+    // by popcount(EXEC), with the old value broadcast to every lane. GDS operations target the
+    // backend-owned persistent device buffer; ordinary operations target workgroup LDS. Every
+    // Vulkan invocation participates in the barriers;
     // the per-lane EXEC bool only contributes 0/1 to the reduction. A partial final hardware wave
     // (including a one-thread workgroup) contains only the launched lanes; every scratch read remains
     // statically in-bounds and absent hardware lanes contribute zero.
-    uint32_t wave_append(uint32_t lds_idx, uint32_t active_bool, bool consume = false) {
+    uint32_t wave_append(uint32_t index, uint32_t active_bool, bool consume = false,
+                         bool gds = false) {
         declare_wave_lds();
         const uint32_t active = sel(active_bool, uconst(1), uconst(0));
         uint32_t p = id(); putv(code, Op_AccessChain,
@@ -1861,8 +1970,10 @@ struct SpirvCompute {
         emit_selmerge(reduced);
         emit_condbranch(is_leader, leader, reduced);
         emit_label(leader);
-        const uint32_t old = lds_atomic_rtn(consume ? Op_AtomicISub : Op_AtomicIAdd, lds_idx, count,
-                                             false, btrue(), uconst(0));
+        const uint32_t old = gds
+            ? compute_gds_atomic_rtn(consume ? Op_AtomicISub : Op_AtomicIAdd, index, count)
+            : lds_atomic_rtn(consume ? Op_AtomicISub : Op_AtomicIAdd, index, count,
+                             false, btrue(), uconst(0));
         uint32_t result_slot = id(); putv(code, Op_AccessChain,
             {t_ptr_wg_u32b, result_slot, lds_wave, wave_base});
         put(code, Op_Store, {result_slot, old});
@@ -2374,12 +2485,13 @@ struct SpirvCompute {
     // Descriptor-free geometry pass-through used when a fragment program asks for AMD's explicit
     // P0/P10/P20 vertex parameters on a Vulkan device without a barycentric/vertex-parameter
     // extension. Input assembly has already decomposed lists/strips/fans into triangles here.
-    std::vector<uint32_t> build_interpolation_geometry(const FragmentInterpolationLayout& layout) {
+    std::vector<uint32_t> build_interpolation_geometry(
+            const FragmentInterpolationLayout& layout, bool capture_geometry_position) {
         if (!layout.requires_geometry || !layout.valid) return {};
 
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
         t_v4f = id();
-        const uint32_t t_per_vertex = id();
+        const uint32_t t_input_per_vertex = id(), t_output_per_vertex = id();
         const uint32_t c_three = id();
         const uint32_t t_input_positions = id(), t_input_varyings = id();
         const uint32_t ptr_in_positions = id(), ptr_in_varyings = id();
@@ -2405,6 +2517,7 @@ struct SpirvCompute {
 
         put(caps, Op_Capability, {Cap_Shader});
         put(caps, Op_Capability, {Cap_Geometry});
+        if (capture_geometry_position) put(caps, Op_Capability, {Cap_TransformFeedback});
         { std::vector<uint32_t> operands{glsl}; pstr(operands, "GLSL.std.450");
           putv(extimp, Op_ExtInstImport, operands); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
@@ -2412,9 +2525,17 @@ struct SpirvCompute {
         put(exec, Op_ExecutionMode, {f_main, EM_Triangles});
         put(exec, Op_ExecutionMode, {f_main, EM_OutputTriangleStrip});
         put(exec, Op_ExecutionMode, {f_main, EM_OutputVertices, 3});
+        if (capture_geometry_position) put(exec, Op_ExecutionMode, {f_main, EM_Xfb});
 
-        put(deco, Op_MemberDecorate, {t_per_vertex, 0, Dec_BuiltIn, BI_Position});
-        put(deco, Op_Decorate, {t_per_vertex, Dec_Block});
+        put(deco, Op_MemberDecorate, {t_input_per_vertex, 0, Dec_BuiltIn, BI_Position});
+        put(deco, Op_Decorate, {t_input_per_vertex, Dec_Block});
+        put(deco, Op_MemberDecorate, {t_output_per_vertex, 0, Dec_BuiltIn, BI_Position});
+        put(deco, Op_Decorate, {t_output_per_vertex, Dec_Block});
+        if (capture_geometry_position) {
+            put(deco, Op_MemberDecorate, {t_output_per_vertex, 0, Dec_XfbBuffer, 0});
+            put(deco, Op_MemberDecorate, {t_output_per_vertex, 0, Dec_XfbStride, 16});
+            put(deco, Op_MemberDecorate, {t_output_per_vertex, 0, Dec_Offset, 0});
+        }
         for (uint32_t attr = 0; attr < 32; ++attr) {
             if (attribute_inputs[attr]) {
                 put(deco, Op_Decorate, {attribute_inputs[attr], Dec_Location, attr});
@@ -2451,14 +2572,15 @@ struct SpirvCompute {
         put(types, Op_TypeInt, {t_i32, 32, 1});
         put(types, Op_TypeBool, {t_bool});
         put(types, Op_TypeVector, {t_v4f, t_f32, 4});
-        put(types, Op_TypeStruct, {t_per_vertex, t_v4f});
+        put(types, Op_TypeStruct, {t_input_per_vertex, t_v4f});
+        put(types, Op_TypeStruct, {t_output_per_vertex, t_v4f});
         put(types, Op_Constant, {t_u32, c_three, 3});
-        put(types, Op_TypeArray, {t_input_positions, t_per_vertex, c_three});
+        put(types, Op_TypeArray, {t_input_positions, t_input_per_vertex, c_three});
         put(types, Op_TypeArray, {t_input_varyings, t_v4f, c_three});
         put(types, Op_TypePointer, {ptr_in_positions, SC_Input, t_input_positions});
         put(types, Op_TypePointer, {ptr_in_varyings, SC_Input, t_input_varyings});
         put(types, Op_TypePointer, {ptr_in_v4f, SC_Input, t_v4f});
-        put(types, Op_TypePointer, {ptr_out_position, SC_Output, t_per_vertex});
+        put(types, Op_TypePointer, {ptr_out_position, SC_Output, t_output_per_vertex});
         put(types, Op_TypePointer, {ptr_out_v4f, SC_Output, t_v4f});
         put(types, Op_Variable, {ptr_in_positions, input_position, SC_Input});
         put(types, Op_Variable, {ptr_out_position, output_position, SC_Output});
@@ -2693,9 +2815,9 @@ FragmentInterpolationLayout fragment_interpolation_layout(
 }
 
 std::vector<uint32_t> recompile_interpolation_geometry(
-        const FragmentInterpolationLayout& layout) {
+        const FragmentInterpolationLayout& layout, bool capture_position) {
     SpirvCompute builder;
-    return builder.build_interpolation_geometry(layout);
+    return builder.build_interpolation_geometry(layout, capture_position);
 }
 
 // Machine state during recompilation: the VGPR and SGPR files (VGPR/SGPR number -> current SSA bits
@@ -7044,13 +7166,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // (126/127) -> this lane's exec bool; inline -1 (all-ones) -> always set (mbcnt = lane
                 // index, the common "get my lane id" idiom, e.g. shader 037); inline 0 -> never; an SGPR
                 // pair -> that saved mask's bool. A general computed 32-bit mask VALUE isn't representable
-                // per-lane, so reject that. Compute uses LDS+barriers at barrier-uniform sites;
-                // fragment uses a native exclusive subgroup sum with an enforced wave64 pipeline.
+                // per-lane, so reject that. Portable compute uses LDS+barriers at barrier-uniform sites;
+                // exact-size compute subgroups and fragments use a native exclusive subgroup sum.
                 const uint32_t active = mbcnt_source_bit(
                     b, rs, in.src[0], in.opcode == 0x366);
-                if (active) vreg[in.dst.value] = b.is_fragment
-                    ? b.fragment_mbcnt(active, val(in.src[1]), in.opcode == 0x365)
-                    : b.mbcnt(active, val(in.src[1]), in.opcode == 0x365);
+                if (active) {
+                    const uint32_t acc = val(in.src[1]);
+                    const uint32_t lo = in.opcode == 0x365 ? b.btrue() : b.bfalse();
+                    vreg[in.dst.value] = b.is_fragment
+                        ? b.fragment_mbcnt(active, acc, in.opcode == 0x365)
+                        : (b.native_subgroup_size
+                            ? b.native_compute_mbcnt(active, acc, lo)
+                            : b.mbcnt(active, acc, in.opcode == 0x365));
+                }
                 else ok = false;
             } else if (in.opcode == 0x12F) {                          // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
                 vreg[in.dst.value] = b.pack_half2x16_rtz(fv(0), fv(1)); // v_cvt_pkrtz VOP3: RTZ clamp (#452)
@@ -8092,6 +8220,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     res->format, components, res->srgb,
                     (b.native_storage_format_support &
                      native_storage_format_support_bit(res->format, components)) != 0);
+                const bool packed_r11 = !native_float && b.packed_r11_storage && ordinary_2d &&
+                    !arrayed && !ms && !is_atomic &&
+                    res->format == DataFormat::Float10_11_11 && components == 3;
                 // Existing load/store-only uint images retain the raw uvec4/Format=Unknown contract
                 // used by the compute backend. The atomic's exact R32_UINT gate above is the only path
                 // that opts into a typed R32ui image.
@@ -8104,7 +8235,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 } else {
                     const bool native_r32ui = is_atomic;
                     b.declare_storage_image(res->binding, dim, arrayed, ms, native_float,
-                                            native_r32ui ? ImgFmt_R32ui : ImgFmt_Unknown);
+                                            (native_r32ui || packed_r11)
+                                                ? ImgFmt_R32ui : ImgFmt_Unknown,
+                                            packed_r11);
                 }
                 // Coordinate VGPR per axis. Non-NSA (len==2): consecutive from VADDR (src[0]). NSA (len>2):
                 // split across the extra address dwords — coord0 = VADDR, coord k>=1 = byte (k-1) of
@@ -8519,12 +8652,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t idx = b.ibin(Op_ShiftRightLogical, byte_addr, b.uconst(2));
                 const uint32_t old = vreg_old(b, rs, in.dst.value);
                 if (b.is_fragment && in.ds_gds) {
-                    rs.vreg[in.dst.value] = b.fragment_gds_append(
+                    rs.vreg[in.dst.value] = b.native_gds_append(
                         idx, rs.exec, in.opcode == 0x3d);
                 } else if (b.is_compute) {
-                    b.declare_lds();
+                    if (!in.ds_gds) b.declare_lds();
                     rs.vreg[in.dst.value] = b.wave_append(
-                        idx, rs.exec, in.opcode == 0x3d);
+                        idx, rs.exec, in.opcode == 0x3d, in.ds_gds);
                 } else {
                     ok = false; return true;
                 }
@@ -9279,6 +9412,8 @@ bool emit_cfg_state_machine(
     std::set<uint32_t> start_set{ins.front().pc};
     std::unordered_map<uint32_t, uint32_t> mbcnt_event_for_pc;
     std::unordered_map<uint32_t, uint32_t> append_event_for_pc;
+    bool has_gds_append = false;
+    bool has_lds_append = false;
     std::unordered_set<uint32_t> swizzle_pcs;
     for (size_t i = 0; i < ins.size(); ++i) {
         const auto& in = ins[i];
@@ -9294,6 +9429,8 @@ bool emit_cfg_state_machine(
         if (in.fmt == Rdna2Format::DS && (in.opcode == 0x3d || in.opcode == 0x3e)) {
             append_event_for_pc.emplace(in.pc,
                 static_cast<uint32_t>(append_event_for_pc.size()));
+            if (in.ds_gds) has_gds_append = true;
+            else has_lds_append = true;
             start_set.insert(in.pc);
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
@@ -9777,6 +9914,7 @@ bool emit_cfg_state_machine(
     const uint32_t append_active_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t append_event_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t append_consume_var = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t append_gds_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t append_idx_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t append_dst_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t append_count_var = b.function_var(b.t_u32, ptr_u32);
@@ -9956,6 +10094,7 @@ bool emit_cfg_state_machine(
         b.store_function(append_active_var, no);
         b.store_function(append_event_var, zero);
         b.store_function(append_consume_var, no);
+        b.store_function(append_gds_var, no);
         b.store_function(append_idx_var, zero);
         b.store_function(append_dst_var, zero);
     }
@@ -10113,13 +10252,15 @@ bool emit_cfg_state_machine(
             const auto m0 = state.sreg.find(124);
             const auto event = append_event_for_pc.find(append->pc);
             if (m0 == state.sreg.end() || event == append_event_for_pc.end()) return false;
-            b.declare_lds();
+            if (!append->ds_gds) b.declare_lds();
             const uint32_t base = b.ibin(Op_BitwiseAnd, m0->second, b.uconst(0xffffu));
             const uint32_t byte_addr = b.ibin(Op_IAdd, base, b.uconst(append->literal));
             const uint32_t idx = b.ibin(Op_ShiftRightLogical, byte_addr, b.uconst(2));
             if (b.native_subgroup_size) {
-                const uint32_t result = b.native_wave_append(
-                    idx, state.exec, append->opcode == 0x3d ? yes : no);
+                const uint32_t result = append->ds_gds
+                    ? b.native_gds_append(idx, state.exec, append->opcode == 0x3d)
+                    : b.native_wave_append(
+                          idx, state.exec, append->opcode == 0x3d ? yes : no);
                 const int dst = append->dst.value;
                 const auto old = state.vreg.find(dst);
                 state.vreg[dst] = b.sel(
@@ -10133,6 +10274,7 @@ bool emit_cfg_state_machine(
                 b.store_function(append_active_var, state.exec);
                 b.store_function(append_event_var, b.uconst(event->second));
                 b.store_function(append_consume_var, append->opcode == 0x3d ? yes : no);
+                b.store_function(append_gds_var, append->ds_gds ? yes : no);
                 b.store_function(append_idx_var, idx);
                 b.store_function(append_dst_var,
                     b.uconst(static_cast<uint32_t>(append->dst.value)));
@@ -10460,9 +10602,33 @@ bool emit_cfg_state_machine(
     const uint32_t append_delta = b.sel(
         b.load_function(b.t_bool, append_consume_var),
         b.ibin(Op_ISub, zero, append_count_value), append_count_value);
-    const uint32_t append_old = b.lds_atomic_rtn(
-        Op_AtomicIAdd, b.load_function(b.t_u32, append_idx_var),
-        append_delta, false, yes, zero);
+    const uint32_t append_index = b.load_function(b.t_u32, append_idx_var);
+    uint32_t append_old = 0;
+    if (has_gds_append && has_lds_append) {
+        const uint32_t gds_block = b.id(), lds_block = b.id(), memory_merge = b.id();
+        b.emit_selmerge(memory_merge);
+        b.emit_condbranch(b.load_function(b.t_bool, append_gds_var),
+                          gds_block, lds_block);
+        b.emit_label(gds_block);
+        const uint32_t gds_old = b.compute_gds_atomic_rtn(
+            Op_AtomicIAdd, append_index, append_delta);
+        const uint32_t gds_end = b.cur_block;
+        b.emit_branch(memory_merge);
+        b.emit_label(lds_block);
+        const uint32_t lds_old = b.lds_atomic_rtn(
+            Op_AtomicIAdd, append_index, append_delta, false, yes, zero);
+        const uint32_t lds_end = b.cur_block;
+        b.emit_branch(memory_merge);
+        b.emit_label(memory_merge);
+        append_old = b.emit_phi_2way(
+            b.t_u32, gds_old, gds_end, lds_old, lds_end);
+    } else if (has_gds_append) {
+        append_old = b.compute_gds_atomic_rtn(
+            Op_AtomicIAdd, append_index, append_delta);
+    } else {
+        append_old = b.lds_atomic_rtn(
+            Op_AtomicIAdd, append_index, append_delta, false, yes, zero);
+    }
     b.cfg_scratch_store(
         b.ibin(Op_IAdd, b.uconst(wave_result_base), mbcnt_wave_index), append_old);
     b.emit_branch(append_reduced);
@@ -10716,9 +10882,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (branch.pc < L.header_pc && target >= L.exit_pc) guarded_narrow_entry = true;
         }
         // 1. Pre-loop body. A compiler may place one ordinary uniform if/else before the canonical
-        // counted loop (Evergate selects one of two constant blocks this way). Structure that choice
-        // with the same two-arm PHIs as the general forward-if path, then enter the existing counted
-        // loop lowering. Anything nested/more complex stays unsupported and rejects visibly.
+        // counted loop (Evergate selects one of two constant blocks this way; Astro's NGG culling
+        // prelude also has a one-arm conditional). Structure that choice with the same two-arm PHIs
+        // as the general forward-if path, then enter the existing counted-loop lowering. Anything
+        // nested/more complex stays unsupported and rejects visibly.
         std::vector<Rdna2Inst> preloop;
         for (const auto& in : ins) {
             if (in.pc >= L.header_pc) break;
@@ -10738,9 +10905,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         const std::vector<ForwardIf> preloop_ifs = detect_forward_ifs(
             preloop, /*allow_vcc*/!b.is_compute, code, dwords, &effective_safe, nullptr,
             &preloop_rejected, /*compute_wave_branches*/b.is_compute);
-        if (preloop_rejected || preloop_ifs.size() > 1 ||
-            (!preloop_ifs.empty() && (!preloop_ifs[0].has_else ||
-                                      preloop_ifs[0].merge_pc > L.header_pc))) {
+        // detect_forward_ifs clamps a branch to an immediate s_endpgm at its artificial end marker
+        // and records it as early_out. In this truncated prelude that can be a real branch over the
+        // entire counted loop, so it cannot be structured as an ordinary one-arm conditional.
+        const bool preloop_if_unsupported = !preloop_ifs.empty() &&
+            (preloop_ifs[0].early_out ||
+             (preloop_ifs[0].has_else ? preloop_ifs[0].merge_pc : preloop_ifs[0].target_pc) >
+                 L.header_pc);
+        if (preloop_rejected || preloop_ifs.size() > 1 || preloop_if_unsupported) {
             if (getenv("PROSPER_DBG"))
                 fprintf(stderr,
                         "[recompile-reject] counted-loop prelude cfg rejected=%u ifs=%zu header=%u\n",
@@ -10764,16 +10936,21 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             condition = F.on_scc0 ? condition : b.logical_not(condition);
             const RegState before = rs;
             std::set<int> written_v, written_s;
-            loop_written_regs(ins, F.branch_pc + 1, F.sb_pc, written_v, written_s);
-            loop_written_regs(ins, F.target_pc, F.merge_pc, written_v, written_s);
+            const uint32_t then_end = F.has_else ? F.sb_pc : F.target_pc;
+            const uint32_t merge_pc = F.has_else ? F.merge_pc : F.target_pc;
+            loop_written_regs(ins, F.branch_pc + 1, then_end, written_v, written_s);
+            if (F.has_else)
+                loop_written_regs(ins, F.target_pc, merge_pc, written_v, written_s);
             const uint32_t then_label = b.id(), else_label = b.id(), merge_label = b.id();
             b.emit_selmerge(merge_label);
             b.emit_condbranch(condition, then_label, else_label);
 
             b.emit_label(then_label);
-            if (!emit_range(F.branch_pc + 1, F.sb_pc)) return false;
-            if (idx >= ins.size() || ins[idx].pc != F.sb_pc) return false;
-            ++idx; // consume the then arm's jump to the merge
+            if (!emit_range(F.branch_pc + 1, then_end)) return false;
+            if (F.has_else) {
+                if (idx >= ins.size() || ins[idx].pc != F.sb_pc) return false;
+                ++idx; // consume the then arm's jump to the merge
+            }
             const uint32_t then_block = b.cur_block;
             std::unordered_map<int, uint32_t> then_v, then_s;
             for (int reg : written_v) then_v[reg] = vget(reg);
@@ -10787,7 +10964,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
 
             rs = before;
             b.emit_label(else_label);
-            if (!emit_range(F.target_pc, F.merge_pc)) return false;
+            if (F.has_else && !emit_range(F.target_pc, merge_pc)) return false;
             const uint32_t else_block = b.cur_block;
             b.emit_branch(merge_label);
             b.emit_label(merge_label);
@@ -10821,7 +10998,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     fprintf(stderr, "[recompile-reject] counted-loop prelude changes mask domain\n");
                 return false; // no mask-domain PHIs in this narrow composition
             }
-            if (!emit_range(F.merge_pc, L.header_pc)) return false;
+            if (!emit_range(merge_pc, L.header_pc)) return false;
         }
         // Ordinary counted loops require full EXEC at entry. An NGG vertex is already represented by
         // one independent Vulkan invocation, however, so its EXEC bit is an ordinary per-invocation
@@ -11285,7 +11462,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     return false;
                 uint32_t cond_reg = F.on_exec ? rs.exec : (F.on_vcc ? rs.vcc : rs.scc);
                 if (b.is_compute && (F.on_exec || F.on_vcc))
-                    cond_reg = b.guest_wave_any(cond_reg);
+                    cond_reg = b.native_subgroup_size
+                        ? b.native_wave_any(cond_reg)
+                        : b.guest_wave_any(cond_reg);
                 else if (b.is_fragment && (F.on_exec || F.on_vcc))
                     cond_reg = b.fragment_wave_any(cond_reg);
                 uint32_t exec_cond = F.on_scc0 ? cond_reg : b.bsel(cond_reg, b.bfalse(), b.btrue());
@@ -11476,6 +11655,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     b.native_subgroup_size = config.native_subgroup_size == wave_size &&
         local_count <= UINT32_MAX && local_count % wave_size == 0 ? wave_size : 0u;
     b.native_storage_format_support = config.native_storage_format_support;
+    b.packed_r11_storage = config.packed_r11_storage;
     b.begin(1, rt, local_x, local_y, local_z, wave_size,
             static_cast<uint32_t>(config.user_sgprs.size()));
     b.allow_b32_masks = wave_size == 32;
@@ -11533,6 +11713,67 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     // a module that could deadlock or observe undefined workgroup-memory behavior.
     if (has_partial_workgroup && b.uses_barrier) return {};
     return b.finish();
+}
+
+bool compute_shader_prefers_native_multiwave(const std::vector<Rdna2Inst>& ins,
+                                             const uint32_t* code, size_t dwords) {
+    bool low = false;
+    bool high = false;
+    bool guest_barrier = false;
+    for (const Rdna2Inst& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt == Rdna2Format::VOP3) {
+            low |= in.opcode == 0x365;
+            high |= in.opcode == 0x366;
+        }
+        guest_barrier |= in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a;
+        if (low && high) return true;
+    }
+    if (!guest_barrier || !code) return false;
+
+    // Mirror the conservative, acyclic subset of emit_body's structured-compute admission. Counting
+    // raw VCC/EXEC opcodes is insufficient: kill-mask branches may be safely linearized, loop exits
+    // are owned by another emitter, and rejected CFGs never reach guest_wave_any. Requiring the same
+    // accepted ForwardIf regions proves that portable lowering really emits two scratch barriers per
+    // counted vote and that exact-subgroup lowering removes them. Loops deliberately stay behind the
+    // explicit experiment until their additional compute guards are shared with this analysis.
+    auto safe = safe_execz_branches(ins);
+    for (uint32_t pc : waterfall_branches(ins)) safe.insert(pc);
+    const std::vector<DivLoop> loops = detect_divergent_loops(ins, safe, /*fragment*/false);
+    if (!loops.empty()) return false;
+
+    bool rejected = false;
+    const std::vector<ForwardIf> branches = detect_forward_ifs(
+        ins, /*allow_vcc*/false, code, dwords, &safe, nullptr, &rejected,
+        /*compute_wave_branches*/true);
+    if (rejected) return false;
+
+    auto top_level_pc = [&](uint32_t pc) {
+        for (const ForwardIf& parent : branches) {
+            const uint32_t parent_end = parent.has_else ? parent.merge_pc : parent.target_pc;
+            if (parent.branch_pc < pc && pc < parent_end) return false;
+        }
+        return true;
+    };
+    const bool barriers_are_top_level = std::all_of(ins.begin(), ins.end(), [&](const Rdna2Inst& in) {
+        return in.fmt != Rdna2Format::SOPP || in.opcode != 0x0a || top_level_pc(in.pc);
+    });
+    if (!barriers_are_top_level) return false;
+
+    size_t structured_wave_votes = 0;
+    for (const ForwardIf& branch : branches) {
+        if (!branch.on_exec && !branch.on_vcc) continue;
+        if (!top_level_pc(branch.branch_pc)) return false;
+        ++structured_wave_votes;
+    }
+    // Four proven scratch-emulated votes keep the default narrower than the all-multi-wave experiment.
+    return structured_wave_votes >= 4;
+}
+
+bool compute_shader_prefers_native_multiwave(const uint32_t* code, size_t dwords) {
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code, dwords, ins);
+    return compute_shader_prefers_native_multiwave(ins, code, dwords);
 }
 
 // See FlatLoadInfo / analyze_flat_loads in the header (#1171). A `base + offset` flat address VGPR pair
@@ -12105,14 +12346,20 @@ static bool is_astro_bot_ngg_one_lane_wrapper(const uint32_t* code, size_t dword
     if (!code) return false;
     std::vector<Rdna2Inst> instructions;
     const size_t program_dwords = rdna2_walk(code, dwords, instructions);
-    if (program_dwords != 54 && program_dwords != 734 && program_dwords != 3124 &&
-        program_dwords != 3435 && program_dwords != 3917)
+    if (program_dwords != 54 && program_dwords != 734 && program_dwords != 749 &&
+        program_dwords != 3124 && program_dwords != 3435 && program_dwords != 3455 &&
+        program_dwords != 3917)
         return false;
     const uint64_t hash = shader_program_hash(code, program_dwords);
     return (program_dwords == 54 && hash == 0x9e9d8e37bcc70607ull) ||
            (program_dwords == 734 && hash == 0x79eb2b954b07dc8eull) ||
+           // The same 734-word culling wrapper is live-linked after its exact 15-word fetch prolog.
+           (program_dwords == 749 && hash == 0xb440349937df751eull) ||
            (program_dwords == 3124 && hash == 0x41e6ac616c18d295ull) ||
            (program_dwords == 3435 && hash == 0xfad7a9f486523cfcull) ||
+           // The same 3435-word wrapper is live-linked after its exact 20-word fetch prolog.
+           // Hashing the complete concatenated program keeps the one-lane projection byte-exact.
+           (program_dwords == 3455 && hash == 0x562ce5ad01c4c6e3ull) ||
            (program_dwords == 3917 && hash == 0x7f5f2349e2816f5eull);
 }
 

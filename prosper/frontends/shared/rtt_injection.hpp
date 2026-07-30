@@ -8,6 +8,20 @@
 
 namespace prosper::frontend {
 
+// An immutable CPU RTT snapshot can back a FrameResource directly only when the consumer uses the
+// producer's exact extent and byte layout. Scaled views still need their owned nearest-neighbor copy;
+// malformed snapshots stay on the guest-decode fallback.
+inline bool exact_rtt_snapshot_borrowable(uint32_t dst_w, uint32_t dst_h,
+                                          uint32_t src_w, uint32_t src_h,
+                                          uint32_t bytes_per_pixel,
+                                          size_t source_bytes) {
+    if (!dst_w || !dst_h || dst_w != src_w || dst_h != src_h || !bytes_per_pixel)
+        return false;
+    const uint64_t texels = static_cast<uint64_t>(src_w) * src_h;
+    if (texels > std::numeric_limits<size_t>::max() / bytes_per_pixel) return false;
+    return source_bytes == static_cast<size_t>(texels) * bytes_per_pixel;
+}
+
 namespace detail {
 
 template <size_t BytesPerPixel>

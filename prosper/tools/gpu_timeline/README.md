@@ -56,6 +56,7 @@ PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE=/tmp/dead-cells-gameplay.prgbundle \
 PROSPER_GPU_TIMELINE_CAPTURE_DEPTH=1000 \
 PROSPER_GPU_TIMELINE_CAPTURE_MAX_UNIQUE_MB=1024 \
 PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DIM=642x362 \
+PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DRAW_INDEX=0:8 \
 PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM=636x420 \
 PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX=77:85 \
 PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS=91 \
@@ -88,7 +89,9 @@ native-speed run. For timing-sensitive routes, use the semantic
 `PROSPER_GPU_TIMELINE_MRT_MIN_DRAWS`, `MAX_DRAWS`, `MIN_DISPATCHES`, and `MAX_DISPATCHES` predicates
 instead; only their first matching submit is logged. For every semantic draw in the selected submit,
 the recorder prints all eight raw `CB_COLOR` addresses, formats, extents, target write masks, and
-shader export masks. Use this to prove whether a GPU-only input was produced through MRT1..7 before
+shader export masks. It also reports raw `CB_COLOR_CONTROL` and its mode, so a zero effective write
+mask can be separated from color writes disabled by the global color mode. Use this to prove whether
+a GPU-only input was produced through MRT1..7 before
 proposing multi-attachment renderer work. The diagnostic does not realize shaders, copy resource
 bytes, or invoke Vulkan. Exact submit numbers are run-local, so prefer predicates derived from prior
 positive and nearby negative `.prgtl` samples when timing can move the endpoint.
@@ -188,6 +191,11 @@ unique-byte budget enforcement remains authoritative.
 that writes a target with that extent. Use it when native-speed lifetime evidence identifies the beginning of
 the relevant surface family; earlier submits remain in the timeline but do not perturb progression or consume
 bundle budget. The matching start submit is included.
+
+`PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DRAW_INDEX=MIN:MAX` additionally requires that the start extent
+occur in the zero-based semantic draw-index window. Use it when an extent is shared by unrelated boot and
+gameplay passes; it prevents the earlier pass from starting an expensive rolling capture. It requires
+`PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DIM` and does not change the independent endpoint selector.
 
 `PROSPER_GPU_TIMELINE_EXIT_AFTER_CAPTURE=1` terminates the process after the selected standalone
 capsule and any requested bundle have been installed successfully. Use it for long captures instead of a

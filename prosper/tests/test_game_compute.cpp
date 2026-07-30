@@ -50,7 +50,7 @@ int main() {
           "image residency policy includes each crossover exactly without caching smaller inputs");
     CHECK(prosper::frontend::storage_writeback_can_tile_mapped_bytes(
               true, 27, false, false),
-          "native tiled storage can feed mapped bytes directly to the tiler");
+          "exact-width tiled storage can feed mapped bytes directly to the tiler");
     CHECK(!prosper::frontend::storage_writeback_can_tile_mapped_bytes(
               false, 27, false, false),
           "converted storage retains its mutable packed buffer");
@@ -170,19 +170,26 @@ int main() {
 
     using prosper::frontend::direct_sampled_rtt_compatible;
     CHECK(direct_sampled_rtt_compatible(DataFormat::Unorm8, 4,
-                                        LiveTargetPixelFormat::Rgba8Unorm) &&
+                                        LiveTargetPixelFormat::Rgba8Unorm, false) &&
           direct_sampled_rtt_compatible(DataFormat::Float16, 4,
-                                        LiveTargetPixelFormat::Rgba16Float) &&
+                                        LiveTargetPixelFormat::Rgba16Float, false) &&
           direct_sampled_rtt_compatible(DataFormat::Float10_11_11, 3,
-                                        LiveTargetPixelFormat::R11G11B10Float),
+                                        LiveTargetPixelFormat::R11G11B10Float, false),
           "renderer RTT direct bind accepts exact RGBA8, RGBA16F, and R11G11B10 views");
     CHECK(!direct_sampled_rtt_compatible(DataFormat::Float16, 4,
-                                         LiveTargetPixelFormat::Rgba8Unorm) &&
+                                         LiveTargetPixelFormat::Rgba8Unorm, true) &&
           !direct_sampled_rtt_compatible(DataFormat::Unorm8, 4,
-                                         LiveTargetPixelFormat::Rgba16Float) &&
+                                         LiveTargetPixelFormat::Rgba16Float, true) &&
           !direct_sampled_rtt_compatible(DataFormat::Float16, 2,
-                                         LiveTargetPixelFormat::Rgba16Float),
+                                         LiveTargetPixelFormat::Rgba16Float, true),
           "renderer RTT direct bind rejects format conversion and component aliases");
+    CHECK(direct_sampled_rtt_compatible(DataFormat::Unorm16, 4,
+                                        LiveTargetPixelFormat::Rgba8Unorm, true) &&
+          !direct_sampled_rtt_compatible(DataFormat::Unorm16, 4,
+                                         LiveTargetPixelFormat::Rgba8Unorm, false) &&
+          !direct_sampled_rtt_compatible(DataFormat::Unorm16, 2,
+                                         LiveTargetPixelFormat::Rgba8Unorm, true),
+          "float RGBA16-UNORM sampled values may reuse RGBA8 without widening texels");
     // A renderer-owned target is stored canonically as RGBA8 or RGBA16F, while a later compute
     // descriptor can alias it as packed R11G11B10. Reconstruct the descriptor-visible words rather
     // than sampling stale guest backing or dropping the dispatch.
@@ -479,6 +486,80 @@ int main() {
     CHECK(unchanged_write_notifications == 1,
           "idempotent compute writes still invalidate divergent renderer-resident state");
 
+    // Astro Bot's world-map visibility kernel lowers IMAGE_ATOMIC_ADD on a tiled R32_UINT image
+    // to a linear SSBO atomic. The descriptor's declared size is the logical texel count, while a
+    // Sw64KbRX backing includes whole-tile padding and can therefore be larger. Replay provides that
+    // physical capture through host_data_size; rejecting it against the logical size skipped the
+    // entire visibility pass.
+    {
+        static const uint32_t image_atomic_add[] = {
+            0x7e000280u, 0x7e020280u, 0x7e120281u,
+            0xf0442108u, 0x00000900u, 0xbf810000u,
+        };
+        constexpr uint32_t atomic_width = 2048;
+        constexpr uint32_t atomic_height = 64;
+        constexpr uint32_t atomic_tile = static_cast<uint32_t>(TileMode::Sw64KbRX);
+        constexpr size_t atomic_logical_bytes =
+            static_cast<size_t>(atomic_width) * atomic_height * sizeof(uint32_t);
+        const size_t atomic_guest_bytes = tiled_surface_bytes(
+            atomic_width, atomic_height, atomic_tile, 0, sizeof(uint32_t));
+        CHECK(atomic_guest_bytes > atomic_logical_bytes,
+              "world-map atomic image fixture includes physical tile padding");
+        std::vector<uint8_t> atomic_guest(atomic_guest_bytes, 0);
+
+        ShaderResourceTable atomic_rt;
+        ShaderResource atomic_image;
+        atomic_image.cls = ResourceClass::StorageImage;
+        atomic_image.format = DataFormat::Uint32;
+        atomic_image.num_components = 1;
+        atomic_image.binding = 4;
+        atomic_image.sgpr_base = 0;
+        atomic_image.img_dim = 1;
+        atomic_image.width = atomic_width;
+        atomic_image.height = atomic_height;
+        atomic_image.depth = 1;
+        atomic_image.tile_mode = atomic_tile;
+        atomic_image.size = static_cast<uint32_t>(atomic_logical_bytes);
+        atomic_image.gpu_addr = reinterpret_cast<uint64_t>(atomic_guest.data());
+        atomic_image.host_data = atomic_guest.data();
+        atomic_image.host_data_size = atomic_guest.size();
+        atomic_rt.resources.push_back(atomic_image);
+
+        ComputeShaderConfig atomic_config;
+        atomic_config.local_x = 1;
+        const std::vector<uint32_t> atomic_spirv = recompile_compute(
+            image_atomic_add, std::size(image_atomic_add), &atomic_rt, atomic_config);
+        CHECK(!atomic_spirv.empty(), "world-map tiled image-atomic kernel recompiles");
+        if (!atomic_spirv.empty()) {
+            ComputeItem atomic_item;
+            atomic_item.spirv = atomic_spirv;
+            atomic_item.resources = std::make_shared<ShaderResourceTable>(atomic_rt);
+            atomic_item.launch.threads_x = atomic_item.launch.threads_y =
+                atomic_item.launch.threads_z = 1;
+            atomic_item.launch.local_x = atomic_item.launch.local_y =
+                atomic_item.launch.local_z = 1;
+            atomic_item.launch.groups_x = atomic_item.launch.groups_y =
+                atomic_item.launch.groups_z = 1;
+            atomic_item.code_addr = 0x500525200;
+
+            uint64_t atomic_notified_bytes = 0;
+            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t bytes) {
+                if (addr == atomic_image.gpu_addr) atomic_notified_bytes = bytes;
+            });
+            CHECK(prosper::frontend::execute_live_compute_items({atomic_item}),
+                  "world-map tiled image-atomic dispatch accepts its physical backing");
+            set_guest_gpu_write_observer({});
+
+            std::vector<uint32_t> atomic_linear(atomic_width * atomic_height, 0);
+            detile_surface(reinterpret_cast<uint8_t*>(atomic_linear.data()), atomic_guest.data(),
+                           atomic_width, atomic_height, atomic_tile, 0, sizeof(uint32_t));
+            CHECK(atomic_linear[0] == 1,
+                  "world-map tiled image-atomic dispatch publishes its atomic result");
+            CHECK(atomic_notified_bytes == atomic_guest_bytes,
+                  "world-map tiled image-atomic write invalidates the full physical backing");
+        }
+    }
+
     // Plucky Squire binds the same 32 MiB writable lighting buffer to consecutive kernels even
     // when their output is byte-identical to the previous frame. Exercise the production cache at
     // its one-MiB retention threshold: the second dispatch can use the exact GPU-side baseline,
@@ -678,6 +759,42 @@ int main() {
         {SubmitOperationKind::Dispatch, 10, 10},
         {SubmitOperationKind::Dispatch, 20, 20},
     };
+    // Deferred runtime capture finishes after the backend mutates this shared table. Its replay
+    // input must nevertheless be the pre-submit GDS bytes, paired with the exact realized compute
+    // list obtained after execution.
+    constexpr uint32_t kGdsPreSubmitSentinel = 0x10293847u;
+    constexpr uint32_t kGdsPostSubmitSentinel = 0xfedcba98u;
+    std::memcpy(gds_initial.data(), &kGdsPreSubmitSentinel,
+                sizeof(kGdsPreSubmitSentinel));
+    auto deferred_gds_pending = std::make_unique<PendingGpuCapture>();
+    deferred_gds_pending->materialized = false;
+    deferred_gds_pending->path = "/tmp/prosper_deferred_gds_capture.prgcap";
+    snapshot_pending_gpu_capture_compute_gds(
+        deferred_gds_pending.get(), gds_initial.data(), gds_initial.size());
+    std::memcpy(gds_initial.data(), &kGdsPostSubmitSentinel,
+                sizeof(kGdsPostSubmitSentinel));
+    const std::vector<DrawItem> deferred_gds_draws;
+    const std::vector<ComputeItem> deferred_gds_computes = {gds_first, gds_second};
+    CHECK(finish_requested_gpu_capture(
+              std::move(deferred_gds_pending), {}, gds_error, &deferred_gds_draws,
+              &deferred_gds_computes, &gds_operations),
+          "deferred capture writes exact compute operations with snapshotted GDS input");
+    GpuCaptureFile deferred_gds_capture;
+    GpuReplayFrame deferred_gds_replay;
+    const bool deferred_gds_reopened = read_gpu_capture(
+        "/tmp/prosper_deferred_gds_capture.prgcap", deferred_gds_capture, gds_error) &&
+        materialize_gpu_replay(deferred_gds_capture, deferred_gds_replay, gds_error);
+    const uint32_t* deferred_gds_words = deferred_gds_reopened &&
+        !deferred_gds_replay.computes.empty() &&
+        deferred_gds_replay.computes[0].resources &&
+        !deferred_gds_replay.computes[0].resources->resources.empty()
+            ? reinterpret_cast<const uint32_t*>(
+                  deferred_gds_replay.computes[0].resources->resources[0].host_data)
+            : nullptr;
+    CHECK(deferred_gds_words && deferred_gds_words[0] == kGdsPreSubmitSentinel,
+          "deferred capture replay restores pre-submit persistent GDS, not post-submit bytes");
+    std::remove("/tmp/prosper_deferred_gds_capture.prgcap");
+    gds_initial.fill(0);
     CHECK(capture_submit_items({}, {gds_first, gds_second}, gds_operations, gds_metadata,
                                [](uint64_t, uint8_t*, size_t) { return size_t{0}; },
                                gds_capture, gds_error),
@@ -906,6 +1023,119 @@ int main() {
         }
         CHECK(run_format_copy(DataFormat::Float10_11_11, 3, 4, s) == s,
               "R11G11B10 storage copy round-trips native packed texels bit-exact (#590)");
+    }
+    {   // No native R11 storage: shader-side R32_UINT packing must preserve every f11 code.
+        constexpr uint32_t PACKED_W = 2048;
+        std::vector<uint32_t> indices(PACKED_W), src(PACKED_W), dst(PACKED_W, 0x5a5a5a5au);
+        for (uint32_t t = 0; t < PACKED_W; ++t) {
+            indices[t] = t;
+            src[t] = t | (((t * 1031u) & 0x7ffu) << 11) | ((t & 0x3ffu) << 22);
+        }
+        ShaderResourceTable packed_rt = irt;
+        for (ShaderResource& resource : packed_rt.resources) {
+            if (resource.binding == 0) {
+                resource.gpu_addr = reinterpret_cast<uint64_t>(indices.data());
+                resource.size = static_cast<uint32_t>(indices.size() * sizeof(uint32_t));
+            }
+            if (resource.binding != 4 && resource.binding != 5) continue;
+            resource.img_dim = 1;
+            resource.format = DataFormat::Float10_11_11;
+            resource.num_components = 3;
+            resource.width = PACKED_W;
+            resource.height = resource.depth = 1;
+            resource.tile_mode = 0;
+            resource.gpu_addr = reinterpret_cast<uint64_t>(
+                resource.binding == 4 ? src.data() : dst.data());
+            resource.size = PACKED_W * sizeof(uint32_t);
+        }
+        const std::vector<uint32_t> packed_spirv = recompile_valu(
+            image_copy_2d, std::size(image_copy_2d), 1, 0, &packed_rt);
+        const auto packed_report = validate_spirv_descriptor_interface(
+            packed_spirv, &packed_rt, 0, SpirvShaderStage::Compute, false);
+        CHECK(!packed_spirv.empty() && packed_report.ok() &&
+                  packed_report.descriptors.size() == 4 &&
+                  packed_report.descriptors[2].storage_image_format == kSpirvImageFormatR32ui &&
+                  packed_report.descriptors[3].storage_image_format == kSpirvImageFormatR32ui,
+              "R11G11B10 fallback recompiles both 2D storage views as typed R32ui");
+        if (!packed_spirv.empty()) {
+            ComputeItem packed_item;
+            packed_item.spirv = packed_spirv;
+            packed_item.resources = std::make_shared<ShaderResourceTable>(packed_rt);
+            packed_item.launch.threads_x = PACKED_W;
+            packed_item.launch.local_x = 64;
+            packed_item.launch.groups_x = PACKED_W / 64;
+            packed_item.launch.local_y = packed_item.launch.local_z = 1;
+            packed_item.launch.groups_y = packed_item.launch.groups_z = 1;
+            packed_item.code_addr = 0x590b10;
+            const bool packed_executed =
+                prosper::frontend::execute_live_compute_items({packed_item});
+            if (packed_executed && dst != src) {
+                const auto mismatch = std::mismatch(src.begin(), src.end(), dst.begin());
+                const size_t index = static_cast<size_t>(mismatch.first - src.begin());
+                std::printf("  packed R11 mismatch texel=%zu src=%08x dst=%08x\n",
+                            index, src[index], dst[index]);
+            }
+            CHECK(packed_executed && dst == src,
+                  "shader-side R11G11B10 pack/unpack round-trips every encoded f11 value exactly");
+        }
+
+        // Also compare arbitrary raw f32 channel bits against the CPU's exact RNE oracle. The
+        // representable-code round-trip above cannot exercise values on either side of a packing
+        // boundary, negative clamping, f32 underflow, overflow, or payload truncation.
+        std::vector<uint32_t> float_channels(PACKED_W * 4), expected(PACKED_W);
+        const uint32_t edge_bits[] = {
+            0x00000000u, 0x00000001u, 0x007fffffu, 0x00800000u,
+            0x80000000u, 0xbf800000u, 0x3f800000u, 0x3f810000u,
+            0x477fe000u, 0x477ff000u, 0x47800000u, 0x7f800000u,
+            0xff800000u, 0x7f800001u, 0x7fc12345u, 0xffc54321u,
+        };
+        auto bits_float = [](uint32_t bits) {
+            float value = 0.0f;
+            std::memcpy(&value, &bits, sizeof(value));
+            return value;
+        };
+        for (uint32_t t = 0; t < PACKED_W; ++t) {
+            for (uint32_t c = 0; c < 4; ++c)
+                float_channels[t * 4 + c] = t < std::size(edge_bits)
+                    ? edge_bits[(t + c * 5u) % std::size(edge_bits)]
+                    : (t * 2654435761u + c * 2246822519u);
+            expected[t] = static_cast<uint32_t>(float_to_f11(
+                              bits_float(float_channels[t * 4 + 0]))) |
+                          (static_cast<uint32_t>(float_to_f11(
+                              bits_float(float_channels[t * 4 + 1]))) << 11) |
+                          (static_cast<uint32_t>(float_to_f10(
+                              bits_float(float_channels[t * 4 + 2]))) << 22);
+        }
+        std::fill(dst.begin(), dst.end(), 0x5a5a5a5au);
+        ShaderResourceTable conversion_rt = packed_rt;
+        for (ShaderResource& resource : conversion_rt.resources) {
+            if (resource.binding != 4 && resource.binding != 5) continue;
+            resource.gpu_addr = reinterpret_cast<uint64_t>(
+                resource.binding == 4 ? float_channels.data() : dst.data());
+            if (resource.binding == 4) {
+                resource.format = DataFormat::Float32;
+                resource.num_components = 4;
+                resource.size = static_cast<uint32_t>(float_channels.size() * sizeof(uint32_t));
+            }
+        }
+        const std::vector<uint32_t> conversion_spirv = recompile_valu(
+            image_copy_2d, std::size(image_copy_2d), 1, 0, &conversion_rt);
+        if (!conversion_spirv.empty()) {
+            ComputeItem conversion_item;
+            conversion_item.spirv = conversion_spirv;
+            conversion_item.resources = std::make_shared<ShaderResourceTable>(conversion_rt);
+            conversion_item.launch.threads_x = PACKED_W;
+            conversion_item.launch.local_x = 64;
+            conversion_item.launch.groups_x = PACKED_W / 64;
+            conversion_item.launch.local_y = conversion_item.launch.local_z = 1;
+            conversion_item.launch.groups_y = conversion_item.launch.groups_z = 1;
+            conversion_item.code_addr = 0x590b11;
+            CHECK(prosper::frontend::execute_live_compute_items({conversion_item}) &&
+                      dst == expected,
+                  "shader-side R11G11B10 packing matches the CPU oracle for arbitrary f32 bits");
+        } else {
+            CHECK(false, "mixed Float32-to-R11G11B10 storage conversion recompiles");
+        }
     }
 
     // The backend publishes ordinary tiled texels, not hardware-compressed blocks. Prove that a
@@ -1583,6 +1813,72 @@ int main() {
     set_live_target_reader({});
     set_live_target_query({});
 
+    // The exact packed fallback must obey the same authority rule. Keep stale zeroes in guest RAM,
+    // publish distinct R11G11B10 renderer pixels, overwrite only row zero, and require every other
+    // row to survive from the snapshot rather than the stale allocation.
+    std::vector<uint32_t> packed_rtt_source(W * TILED_H);
+    std::vector<uint32_t> packed_rtt_guest(W * TILED_H, 0);
+    auto packed_rtt = std::make_shared<std::vector<uint8_t>>(W * TILED_H * sizeof(uint32_t));
+    std::vector<uint32_t> packed_rtt_expected(W * TILED_H);
+    for (size_t t = 0; t < packed_rtt_source.size(); ++t) {
+        packed_rtt_source[t] = static_cast<uint32_t>(float_to_f11((t % 19u) * 0.25f)) |
+            (static_cast<uint32_t>(float_to_f11((t % 23u) * 0.375f)) << 11) |
+            (static_cast<uint32_t>(float_to_f10((t % 29u) * 0.5f)) << 22);
+        const uint32_t live_word = static_cast<uint32_t>(float_to_f11((t % 31u) * 0.125f)) |
+            (static_cast<uint32_t>(float_to_f11((t % 37u) * 0.1875f)) << 11) |
+            (static_cast<uint32_t>(float_to_f10((t % 41u) * 0.3125f)) << 22);
+        std::memcpy(packed_rtt->data() + t * sizeof(live_word), &live_word, sizeof(live_word));
+        packed_rtt_expected[t] = live_word;
+    }
+    std::copy_n(packed_rtt_source.begin(), W, packed_rtt_expected.begin());
+    ShaderResourceTable packed_writable_rt = tiled2d_rt;
+    for (ShaderResource& resource : packed_writable_rt.resources) {
+        if (resource.binding != 4 && resource.binding != 5) continue;
+        resource.format = DataFormat::Float10_11_11;
+        resource.num_components = 3;
+        resource.tile_mode = 0;
+        resource.size = W * TILED_H * sizeof(uint32_t);
+        resource.gpu_addr = reinterpret_cast<uint64_t>(
+            resource.binding == 4 ? packed_rtt_source.data() : packed_rtt_guest.data());
+    }
+    const uint64_t packed_writable_addr =
+        reinterpret_cast<uint64_t>(packed_rtt_guest.data());
+    set_live_target_query(
+        [packed_writable_addr](uint64_t addr) { return addr == packed_writable_addr; });
+    set_live_target_reader(
+        [packed_writable_addr, packed_rtt](uint64_t addr, LiveTargetSnapshot& snapshot) {
+            if (addr != packed_writable_addr) return false;
+            snapshot.width = W;
+            snapshot.height = TILED_H;
+            snapshot.format = LiveTargetPixelFormat::R11G11B10Float;
+            snapshot.pixels = packed_rtt;
+            return true;
+        });
+    const std::vector<uint32_t> packed_writable_spirv = recompile_valu(
+        image_copy_2d, std::size(image_copy_2d), 1, 0, &packed_writable_rt);
+    CHECK(!packed_writable_spirv.empty(),
+          "partial R11G11B10 renderer RTT copy kernel recompiles");
+    if (!packed_writable_spirv.empty()) {
+        ComputeItem item;
+        item.spirv = packed_writable_spirv;
+        item.resources = std::make_shared<ShaderResourceTable>(packed_writable_rt);
+        item.launch.threads_x = W;
+        item.launch.local_x = 64;
+        item.launch.groups_x = 1;
+        item.launch.local_y = item.launch.local_z = 1;
+        item.launch.groups_y = item.launch.groups_z = 1;
+        item.code_addr = 0x590b12;
+        CHECK(prosper::frontend::execute_live_compute_items({item}),
+              "live backend partially writes an authoritative packed renderer RTT");
+        CHECK(packed_rtt_guest == packed_rtt_expected,
+              "packed renderer RTT seeds from live pixels and preserves every untouched row");
+        CHECK(std::any_of(packed_rtt_guest.begin() + W, packed_rtt_guest.end(),
+                          [](uint32_t word) { return word != 0; }),
+              "packed renderer RTT never falls back to its stale zeroed guest backing");
+    }
+    set_live_target_reader({});
+    set_live_target_query({});
+
     // UE4's exposure chain samples tiny tiled Float32 surfaces. Preserve those values natively:
     // normalizing through RGBA8 would clamp negative and HDR channels before the compute shader sees
     // them. Copy a tiled Float32x4 source through the production sampled-image path into the existing
@@ -1691,6 +1987,85 @@ int main() {
     CHECK(sampled_uint_roundtrip(DataFormat::Uint16, 4, 8, 0x590164),
           "tiled RGBA16_UINT sampled values reach storage writeback byte-exactly");
 
+    // GPU captures preserve descriptor addresses but materialize resource bytes in owned host
+    // arrays. Warm replay must retain those sampled images just like the live guest-backed path,
+    // while validating by exact bytes because host_data mutations never enter the guest journal or
+    // page write-watch system. Prove both the unchanged hit and a direct unreported mutation.
+    {
+        constexpr uint32_t host_texel_bytes = 4;
+        std::vector<uint8_t> linear_src(W * host_texel_bytes);
+        std::vector<uint8_t> linear_dst(W * host_texel_bytes, 0xA5);
+        for (size_t i = 0; i < linear_src.size(); ++i)
+            linear_src[i] = static_cast<uint8_t>(i * 41 + 13);
+        const size_t tiled_size = tiled_surface_bytes(
+            W, 1, dcc_tile, 0, host_texel_bytes);
+        std::vector<uint8_t> capture_owned_src(tiled_size, 0);
+        tile_surface(capture_owned_src.data(), linear_src.data(), W, 1,
+                     dcc_tile, 0, host_texel_bytes);
+
+        ShaderResourceTable host_rt = irt;
+        for (ShaderResource& resource : host_rt.resources) {
+            if (resource.binding != 4 && resource.binding != 5) continue;
+            resource.img_dim = 1;
+            resource.format = DataFormat::Uint8;
+            resource.num_components = 4;
+            resource.width = W;
+            resource.height = resource.depth = 1;
+            if (resource.binding == 4) {
+                resource.cls = ResourceClass::Texture;
+                resource.tile_mode = dcc_tile;
+                resource.gpu_addr = 0x71c0000000ull;
+                resource.size = static_cast<uint32_t>(capture_owned_src.size());
+                resource.host_data = capture_owned_src.data();
+                resource.host_data_size = capture_owned_src.size();
+                resource.swizzle[0] = 4;
+                resource.swizzle[1] = 5;
+                resource.swizzle[2] = 6;
+                resource.swizzle[3] = 7;
+            } else {
+                resource.tile_mode = 0;
+                resource.gpu_addr = reinterpret_cast<uint64_t>(linear_dst.data());
+                resource.size = static_cast<uint32_t>(linear_dst.size());
+            }
+        }
+        const std::vector<uint32_t> host_spirv = recompile_valu(
+            image_copy_2d, std::size(image_copy_2d), 1, 0, &host_rt);
+        CHECK(!host_spirv.empty(),
+              "capture-owned sampled-image copy kernel recompiles");
+        if (!host_spirv.empty()) {
+            ComputeItem host_item;
+            host_item.spirv = host_spirv;
+            host_item.resources = std::make_shared<ShaderResourceTable>(host_rt);
+            host_item.launch.threads_x = W;
+            host_item.launch.local_x = 64;
+            host_item.launch.groups_x = 1;
+            host_item.launch.local_y = host_item.launch.local_z = 1;
+            host_item.launch.groups_y = host_item.launch.groups_z = 1;
+            host_item.code_addr = 0x590ca9;
+            CHECK(prosper::frontend::execute_live_compute_items({host_item}) &&
+                      linear_dst == linear_src,
+                  "capture-owned sampled image establishes an exact retained source");
+
+            const uint64_t skips_before =
+                prosper::frontend::live_compute_sampled_image_upload_skips();
+            CHECK(prosper::frontend::execute_live_compute_items({host_item}) &&
+                      prosper::frontend::live_compute_sampled_image_upload_skips() >
+                          skips_before,
+                  "unchanged capture-owned sampled image skips its warm-replay upload");
+
+            linear_src[0] ^= 0xff;
+            tile_surface(capture_owned_src.data(), linear_src.data(), W, 1,
+                         dcc_tile, 0, host_texel_bytes);
+            const uint64_t skips_before_mutation =
+                prosper::frontend::live_compute_sampled_image_upload_skips();
+            CHECK(prosper::frontend::execute_live_compute_items({host_item}) &&
+                      linear_dst == linear_src &&
+                      prosper::frontend::live_compute_sampled_image_upload_skips() ==
+                          skips_before_mutation,
+                  "direct capture-owned mutation refreshes the retained sampled image exactly");
+        }
+    }
+
     // --- #1122 seed-skip coverage proof. A write-only storage image whose dispatch fully covers the
     // extent can skip the (expensive) seed -- BUT ONLY after proving the write actually stores every
     // texel. covers_extent is necessary, not sufficient: a shader that stores a SUBSET of a covering
@@ -1794,6 +2169,124 @@ int main() {
                       prosper::host::GuestWriteWatchQuery::Unchanged,
                   "identical retained output leaves guest-byte dirty tracking clean");
             repeated_write_watch.reset();
+#endif
+
+            // The live draw immediately following a compute producer is inside the same ordered
+            // guest submit. Its mutation journal is an exact authority even before a cross-submit
+            // page watch has accumulated enough stable validations to be promoted.
+            std::vector<uint8_t> journal_guest(W * 8, 0x51);
+            ShaderResourceTable journal_rt = fill_rt;
+            ShaderResource& journal_dst = journal_rt.resources.back();
+            journal_dst.gpu_addr = reinterpret_cast<uint64_t>(journal_guest.data());
+            ComputeItem journal_item = it;
+            journal_item.resources = std::make_shared<ShaderResourceTable>(journal_rt);
+            journal_item.dispatch_index = 31;
+            journal_item.command_order = 10;
+            DrawItem journal_consumer;
+            journal_consumer.draw_index = 47;
+            journal_consumer.command_order = 20;
+            bool journal_imported = false;
+            const OrderedSubmitResult journal_result = execute_ordered_items(
+                {{SubmitOperationKind::Dispatch, journal_item.dispatch_index,
+                  journal_item.command_order},
+                 {SubmitOperationKind::Draw, journal_consumer.draw_index,
+                  journal_consumer.command_order}},
+                {journal_consumer}, {journal_item},
+                [&](const std::vector<DrawItem>&, uint32_t, uint32_t) {
+                    ShaderResource sampled = journal_dst;
+                    sampled.cls = ResourceClass::Texture;
+                    prosper::frontend::LiveComputeImageImport compute_import;
+                    journal_imported = prosper::frontend::import_live_compute_storage_image(
+                        sampled, journal_dst.size, compute_import) && compute_import.valid();
+                    return RenderedFrame{};
+                },
+                [&](const std::vector<ComputeItem>& items) {
+                    return prosper::frontend::execute_live_compute_items(items);
+                },
+                1, 1);
+            CHECK(journal_result.compute_executed && journal_result.render_spans == 1 &&
+                      journal_imported,
+                  "same-submit journal authorizes the first retained compute-image consumer");
+
+#if defined(__linux__)
+            // Use a dedicated mapping so page protection cannot alias unrelated malloc metadata.
+            // Outside an ordered submit there is no submit-local journal, so a successful import
+            // here specifically proves the cross-submit write-watch authority path.
+            constexpr size_t import_mapping_bytes = 4096;
+            auto* import_guest = static_cast<uint8_t*>(mmap(
+                nullptr, import_mapping_bytes, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+            CHECK(import_guest != MAP_FAILED,
+                  "allocate dedicated typed-storage import mapping");
+            if (import_guest != MAP_FAILED) {
+                std::memset(import_guest, 0x37, import_mapping_bytes);
+                prosper::host::guest_write_watch_set_fault_onstack(true);
+                prosper::host::guest_write_watch_notify_direct_mapping_added(
+                    reinterpret_cast<uint64_t>(import_guest), import_mapping_bytes,
+                    0x7e0000, 0x3 /* SCE CPU_READ|CPU_WRITE */);
+                ShaderResourceTable import_rt = fill_rt;
+                ShaderResource& import_dst = import_rt.resources.back();
+                import_dst.gpu_addr = reinterpret_cast<uint64_t>(import_guest);
+                ComputeItem import_item = it;
+                import_item.resources = std::make_shared<ShaderResourceTable>(import_rt);
+                CHECK(prosper::frontend::execute_live_compute_items({import_item}) &&
+                          prosper::frontend::execute_live_compute_items({import_item}) &&
+                          prosper::frontend::execute_live_compute_items({import_item}) &&
+                          prosper::frontend::execute_live_compute_items({import_item}),
+                      "repeated typed-storage output promotes its exact source watch");
+                ShaderResource sampled_fill = import_dst;
+                sampled_fill.cls = ResourceClass::Texture;
+                prosper::frontend::LiveComputeImageImport compute_import;
+                CHECK(prosper::frontend::import_live_compute_storage_image(
+                          sampled_fill, import_dst.size, compute_import) &&
+                          compute_import.valid() && compute_import.width == W &&
+                          compute_import.height == 1 && compute_import.depth == 1 &&
+                          compute_import.native_format && compute_import.layout,
+                      "validated typed-storage result can be leased by an exact sampled descriptor");
+                prosper::frontend::LiveComputeImageImport rejected_import;
+                ShaderResource mismatched_fill = sampled_fill;
+                ++mismatched_fill.width;
+                const bool rejected_extent =
+                    !prosper::frontend::import_live_compute_storage_image(
+                        mismatched_fill, import_dst.size, rejected_import);
+                mismatched_fill = sampled_fill;
+                ++mismatched_fill.tile_mode;
+                const bool rejected_layout =
+                    !prosper::frontend::import_live_compute_storage_image(
+                        mismatched_fill, import_dst.size, rejected_import);
+                mismatched_fill = sampled_fill;
+                mismatched_fill.host_data = import_guest;
+                mismatched_fill.host_data_size = import_dst.size;
+                const bool rejected_replay =
+                    !prosper::frontend::import_live_compute_storage_image(
+                        mismatched_fill, import_dst.size, rejected_import);
+                mismatched_fill = sampled_fill;
+                mismatched_fill.srgb = true;
+                const bool rejected_srgb =
+                    !prosper::frontend::import_live_compute_storage_image(
+                        mismatched_fill, import_dst.size, rejected_import);
+                mismatched_fill = sampled_fill;
+                mismatched_fill.declared_mip_levels = 2;
+                const bool rejected_mips =
+                    !prosper::frontend::import_live_compute_storage_image(
+                        mismatched_fill, import_dst.size, rejected_import);
+                CHECK(rejected_extent && rejected_layout && rejected_replay && rejected_srgb &&
+                          rejected_mips,
+                      "compute-image import requires full identity and keeps replay/mip/sRGB fallback");
+                compute_import = {};
+                // This binary does not install the emulator's SIGSEGV write-fault handler. Mark the
+                // same page dirty through the DMA/GPU side of the watch API; the importer must not
+                // trust the retained image after any architectural writer invalidates its bytes.
+                prosper::host::guest_write_watch_notify_gpu_write(
+                    reinterpret_cast<uint64_t>(import_guest), import_dst.size);
+                CHECK(!prosper::frontend::import_live_compute_storage_image(
+                          sampled_fill, import_dst.size, compute_import),
+                      "guest mutation revokes a cross-submit compute-image import");
+                prosper::host::guest_write_watch_notify_direct_mapping_removed(
+                    reinterpret_cast<uint64_t>(import_guest), import_mapping_bytes);
+                prosper::host::guest_write_watch_set_fault_onstack(false);
+                munmap(import_guest, import_mapping_bytes);
+            }
 #endif
 
             // Prove a second full writer of the same format/extent on a different target, then use

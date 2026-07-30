@@ -390,7 +390,7 @@ size_t texture_decode_cache_limit_bytes(const char* override_mib,
                                         uint64_t physical_memory_bytes) {
     constexpr uint64_t kMiB = 1024ull * 1024ull;
     constexpr uint64_t kMinBytes = 1024ull * kMiB;
-    constexpr uint64_t kMaxBytes = 2048ull * kMiB;
+    constexpr uint64_t kMaxBytes = 4096ull * kMiB;
     uint64_t bytes = kMinBytes;
     if (override_mib) {
         const uint64_t mib = strtoull(override_mib, nullptr, 10);
@@ -920,8 +920,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 uint64_t backend_calls = 0, backend_draws = 0;
                 uint64_t backend_command_buffers = 0, backend_queue_submits = 0;
                 uint64_t backend_fence_waits = 0;
+                uint64_t backend_gpu_timestamp_samples = 0;
                 double backend_target_ms = 0, backend_draw_setup_ms = 0;
                 double backend_record_upload_ms = 0, backend_gpu_wait_ms = 0;
+                double backend_gpu_device_ms = 0;
                 double backend_readback_ms = 0, backend_cleanup_ms = 0;
                 double backend_setup_shader_ms = 0, backend_setup_fixed_ms = 0;
                 double backend_setup_resources_ms = 0, backend_setup_pipeline_ms = 0;
@@ -971,10 +973,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 pending_timing.backend_command_buffers += backend.command_buffers;
                 pending_timing.backend_queue_submits += backend.queue_submits;
                 pending_timing.backend_fence_waits += backend.fence_waits;
+                pending_timing.backend_gpu_timestamp_samples += backend.gpu_timestamp_samples;
                 pending_timing.backend_target_ms += backend.target_ms;
                 pending_timing.backend_draw_setup_ms += backend.draw_setup_ms;
                 pending_timing.backend_record_upload_ms += backend.record_upload_ms;
                 pending_timing.backend_gpu_wait_ms += backend.gpu_wait_ms;
+                pending_timing.backend_gpu_device_ms += backend.gpu_device_ms;
                 pending_timing.backend_readback_ms += backend.readback_ms;
                 pending_timing.backend_cleanup_ms += backend.cleanup_ms;
                 pending_timing.backend_setup_shader_ms += backend.setup_shader_ms;
@@ -997,7 +1001,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     "[rtt-timing] submit=%d target=0x%llx extent=%ux%u draws=%zu "
                     "span=%d/%d authoritative=%d deferred=%d cmd=%llu submit=%llu wait=%llu "
                     "measured=%.2f detail=%.2f other=%.2f target_setup=%.2f "
-                    "draw_setup=%.2f record_upload=%.2f gpu_wait=%.2f "
+                    "draw_setup=%.2f record_upload=%.2f batch_wait=%.2f "
+                    "batch_device=%.2f batch_overhead=%.2f batch_timestamps=%llu "
                     "readback=%.2f cleanup=%.2f gpu_target=%llu load=%llu sample=%llu cpu=%llu\n",
                     record.submit, (unsigned long long)record.target,
                     record.width, record.height, record.draws,
@@ -1009,7 +1014,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     record.measured_ms, detail_ms,
                     record.measured_ms - detail_ms,
                     timing.target_ms, timing.draw_setup_ms, timing.record_upload_ms,
-                    timing.gpu_wait_ms, timing.readback_ms, timing.cleanup_ms,
+                    timing.gpu_wait_ms, timing.gpu_device_ms,
+                    std::max(0.0, timing.gpu_wait_ms - timing.gpu_device_ms),
+                    (unsigned long long)timing.gpu_timestamp_samples,
+                    timing.readback_ms, timing.cleanup_ms,
                     (unsigned long long)record.color_target.writes,
                     (unsigned long long)record.color_target.write_hits,
                     (unsigned long long)record.color_target.sampled_hits,
@@ -1268,6 +1276,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     const auto resource_timing_start = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
                     bool resource_rtt_hit = false;
+                    bool resource_compute_image_hit = false;
                     bool resource_local_reuse = false;
                     bool resource_persistent_hit = false;
                     bool resource_persistent_submit_reuse = false;
@@ -1458,6 +1467,25 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 live_rtt->second.w, live_rtt->second.h,
                                 prosper::test::backend_color_bytes_per_pixel(
                                     prosper::test::backend_color_format(live_rtt->second.format)),
+                                live_rtt->second.rgba->size());
+                        static const bool borrow_exact_cpu_rtt =
+                            getenv("PROSPER_NO_RTT_SNAPSHOT_BORROW") == nullptr;
+                        // Pixel-mutating/inspection diagnostics intentionally retain their owned
+                        // scratch copy. The normal exact-extent path can borrow the immutable RTT
+                        // snapshot and avoid copying it into texstore before the backend upload.
+                        static const bool cpu_rtt_copy_diagnostics =
+                            getenv("PROSPER_DUMP_SAMPLED_RTT") || getenv("PROSPER_DUMP_RAWTEX") ||
+                            getenv("PROSPER_GFXLOG") || getenv("PROSPER_RESOURCE_HASH_DIM") ||
+                            getenv("PROSPER_PALETTELOG") || getenv("PROSPER_TESTTEX") ||
+                            getenv("PROSPER_TESTLUT") || getenv("PROSPER_TESTLUT32") ||
+                            getenv("PROSPER_DUMP_TEX") || getenv("PROSPER_DUMP_ATLAS") ||
+                            getenv("PROSPER_KILL_RING");
+                        const bool borrow_cpu_live_rtt = has_cpu_live_rtt &&
+                            borrow_exact_cpu_rtt && !cpu_rtt_copy_diagnostics &&
+                            prosper::frontend::exact_rtt_snapshot_borrowable(
+                                tw, th, live_rtt->second.w, live_rtt->second.h,
+                                prosper::test::backend_color_bytes_per_pixel(
+                                    live_rtt->second.format),
                                 live_rtt->second.rgba->size());
                         // A retained render target was created for color-attachment + sampled usage,
                         // not storage usage. Storage images therefore take the decoded/upload path.
@@ -1684,12 +1712,51 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const size_t persistent_source_size = persistent_dcc_fast_clear
                             ? sampled_dcc_metadata.size() : persistent_base_source_size;
                         resource_texture_source_bytes = persistent_source_size;
+                        // A successful typed-storage compute dispatch may still own this exact
+                        // sampled image on the shared Vulkan device. Prefer that image only for the
+                        // two native formats the graphics backend preserves today. The compute cache
+                        // independently requires the complete descriptor key plus a current-submit
+                        // journal or page-watch proof; a miss falls through to the existing exact
+                        // guest-byte decode/cache path.
+                        prosper::frontend::LiveComputeImageImport compute_image_import;
+                        VkFormat compute_image_format = VK_FORMAT_UNDEFINED;
+                        if (r.format == prosper::gpu::DataFormat::Float16 &&
+                            r.num_components == 4)
+                            compute_image_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+                        else if (r.format == prosper::gpu::DataFormat::Float10_11_11 &&
+                                 r.num_components == 3)
+                            compute_image_format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+                        const bool compute_image_candidate =
+                            !getenv("PROSPER_NO_DIRECT_COMPUTE_IMAGE_BIND") &&
+                            !has_live_rtt && !has_ds_live && r.cls == RC::Texture &&
+                            r.img_dim == 1u && r.depth == 1u && !r.in_mip_tail &&
+                            r.declared_mip_levels == 1u && !r.srgb &&
+                            !r.depth_compare && !r.host_data &&
+                            persistent_source_size &&
+                            (!r.compression_enabled || persistent_dcc_uncompressed) &&
+                            compute_image_format != VK_FORMAT_UNDEFINED;
+                        if (compute_image_candidate &&
+                            prosper::frontend::import_live_compute_storage_image(
+                                r, persistent_source_size, compute_image_import)) {
+                            const prosper::test::RenderVkCtx& render_context =
+                                prosper::test::render_vk_ctx();
+                            resource_compute_image_hit = compute_image_import.valid() &&
+                                compute_image_import.native_format ==
+                                    static_cast<uint32_t>(compute_image_format) &&
+                                compute_image_import.width == tw &&
+                                compute_image_import.height == th &&
+                                compute_image_import.depth == 1u && render_context.ok &&
+                                compute_image_import.device ==
+                                    static_cast<void*>(render_context.dev);
+                            if (!resource_compute_image_hit) compute_image_import = {};
+                        }
                         auto copy_persistent_source = [&](uint8_t* dst, size_t bytes) {
                             return persistent_dcc_fast_clear
                                 ? copy_dcc_metadata(dst, bytes)
                                 : copy_resource(dst, r.gpu_addr, bytes);
                         };
-                        const bool persistent_cache_eligible = !fr.is_storage_image &&
+                        const bool persistent_cache_eligible = !resource_compute_image_hit &&
+                            !fr.is_storage_image &&
                             !getenv("PROSPER_NO_TEXTURE_DECODE_CACHE") &&
                             (!r.compression_enabled || persistent_dcc_uncompressed ||
                              persistent_dcc_fast_clear) &&
@@ -1729,8 +1796,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // to (R,0,0,1) and must retain the real descriptor swizzle, so the two facts differ.
                         bool narrow_done = false;
                         bool narrow_decode_done = false;
-                        auto reused = has_live_rtt ? decoded_textures.end()
-                                                   : decoded_textures.find(decode_key);
+                        auto reused = (has_live_rtt || resource_compute_image_hit)
+                            ? decoded_textures.end() : decoded_textures.find(decode_key);
                         DecodedTexture persistent_reuse;
                         const DecodedTexture* decoded_reuse = reused != decoded_textures.end()
                             ? &reused->second : nullptr;
@@ -1959,6 +2026,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                         tw, th, r.img_dim, (unsigned)r.format,
                                         has_gpu_live_rtt          ? "gpu-bind"
                                         : has_cpu_live_rtt        ? "cpu-rtt"
+                                        : resource_compute_image_hit ? "compute-bind"
                                         : decoded_reuse           ? "decode-cache"
                                                                   : "decode",
                                         live_rtt != g_rtt.end() ? live_rtt->second.w : 0,
@@ -1984,6 +2052,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             fr.td = 1; fr.img_dim = r.img_dim;
                             fr.texture_format = live_rtt->second.format;
                             resource_rtt_hit = true;
+                        } else if (resource_compute_image_hit) {
+                            fr.borrowed_compute_image = compute_image_import.image;
+                            fr.borrowed_compute_device = compute_image_import.device;
+                            fr.borrowed_compute_image_layout = compute_image_import.layout;
+                            fr.borrowed_compute_image_lease =
+                                std::move(compute_image_import.lease);
+                            fr.tw = compute_image_import.width;
+                            fr.th = compute_image_import.height;
+                            fr.td = compute_image_import.depth;
+                            fr.img_dim = r.img_dim;
+                            fr.texture_format = compute_image_format;
                         } else if (has_ds_live) {
                             fr.persistent_depth_target_id = r.gpu_addr;
                             fr.tw = sampled_ds.width;
@@ -2158,7 +2237,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         size_t linear_source_prefix_size = 0;
                         if (texstore_used == texstore.size()) texstore.emplace_back();
                         std::vector<uint8_t>& texture_pixels = texstore[texstore_used++];
-                        texture_pixels.resize(nb);
+                        if (borrow_cpu_live_rtt) texture_pixels.clear();
+                        else texture_pixels.resize(nb);
                         auto copy_linear_padded_rows = [&](uint8_t* dst, size_t dst_row) {
                             size_t total = 0;
                             for (uint32_t y = 0; y < th; ++y) {
@@ -2218,8 +2298,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 !rit->second.rgba->empty()) {
                                 const RttSurf& s = rit->second;
                                 const uint32_t rtt_bpp = prosper::test::backend_color_bytes_per_pixel(s.format);
-                                if (prosper::frontend::inject_rtt_pixels(
-                                        texture_pixels, tw, th, *s.rgba, s.w, s.h, rtt_bpp)) {
+                                if (borrow_cpu_live_rtt) {
+                                    fr.tex_rgba_owner = s.rgba;
+                                    fr.tex_rgba = s.rgba->data();
+                                    fr.texture_format = s.format;
+                                    rtt_hit = true;
+                                    resource_rtt_hit = true;
+                                } else if (prosper::frontend::inject_rtt_pixels(
+                                               texture_pixels, tw, th, *s.rgba,
+                                               s.w, s.h, rtt_bpp)) {
                                     fr.texture_format = s.format;
                                     rtt_hit = true;
                                     resource_rtt_hit = true;
@@ -2913,7 +3000,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         if (getenv("PROSPER_KILL_RING") && tw == 1024 && th == 1024 &&
                             r.num_components == 1 && r.cls == RC::Texture)
                             std::fill(texture_pixels.begin(), texture_pixels.end(), 0);
-                        fr.tex_rgba = texture_pixels.data(); fr.tw = tw; fr.th = cube_done ? th * 6u : th;
+                        if (!fr.tex_rgba) fr.tex_rgba = texture_pixels.data();
+                        fr.tw = tw; fr.th = cube_done ? th * 6u : th;
                         fr.td = is_volume ? r.depth : 1u;
                         fr.img_dim = r.img_dim;
                         // #1272: see the reuse path — plain 2D guest textures only.
@@ -3003,7 +3091,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 }
                             }
                         }
-                        if (!resource_rtt_hit && !has_live_rtt)
+                        if (!resource_rtt_hit && !resource_compute_image_hit && !has_live_rtt)
                             decoded_textures.emplace(
                                 decode_key, DecodedTexture{fr.tex_rgba, fr.th, narrow_done,
                                                           fr.persistent_texture_id});
@@ -3256,14 +3344,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 mode && strcmp(mode, "detail") == 0 &&
                                 static_cast<uint64_t>(g_this_submit) >= detail_min_submit) {
                                 static uint64_t detail_lines = 0;
-                                if ((elapsed >= 0.5 || resource_persistent_invalidation) &&
+                                if ((elapsed >= 0.5 || resource_persistent_invalidation ||
+                                     resource_compute_image_hit) &&
                                     detail_lines++ < 250) {
                                     const char* cache_state = resource_rtt_hit ? "rtt" :
+                                        (resource_compute_image_hit ? "compute-image" :
                                         (resource_local_reuse ? "local" :
                                         (resource_persistent_submit_reuse ? "persistent-submit" :
                                         (resource_persistent_hit ? "persistent-hit" :
                                         (resource_persistent_invalidation ? "persistent-invalid" :
-                                        (resource_persistent_miss ? "persistent-miss" : "uncached")))));
+                                        (resource_persistent_miss ? "persistent-miss" : "uncached"))))));
                                     auto submit_query_name = [](int query) {
                                         switch (query) {
                                             case static_cast<int>(
@@ -4715,8 +4805,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     uint64_t backend_calls = 0, backend_draws = 0;
                     uint64_t backend_command_buffers = 0, backend_queue_submits = 0;
                     uint64_t backend_fence_waits = 0;
+                    uint64_t backend_gpu_timestamp_samples = 0;
                     double backend_target_ms = 0, backend_draw_setup_ms = 0;
                     double backend_record_upload_ms = 0, backend_gpu_wait_ms = 0;
+                    double backend_gpu_device_ms = 0;
                     double backend_readback_ms = 0, backend_cleanup_ms = 0;
                     double backend_setup_shader_ms = 0, backend_setup_fixed_ms = 0;
                     double backend_setup_resources_ms = 0, backend_setup_pipeline_ms = 0;
@@ -4749,10 +4841,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     timing.backend_command_buffers += pending_timing.backend_command_buffers;
                     timing.backend_queue_submits += pending_timing.backend_queue_submits;
                     timing.backend_fence_waits += pending_timing.backend_fence_waits;
+                    timing.backend_gpu_timestamp_samples += pending_timing.backend_gpu_timestamp_samples;
                     timing.backend_target_ms += pending_timing.backend_target_ms;
                     timing.backend_draw_setup_ms += pending_timing.backend_draw_setup_ms;
                     timing.backend_record_upload_ms += pending_timing.backend_record_upload_ms;
                     timing.backend_gpu_wait_ms += pending_timing.backend_gpu_wait_ms;
+                    timing.backend_gpu_device_ms += pending_timing.backend_gpu_device_ms;
                     timing.backend_readback_ms += pending_timing.backend_readback_ms;
                     timing.backend_cleanup_ms += pending_timing.backend_cleanup_ms;
                     timing.backend_setup_shader_ms += pending_timing.backend_setup_shader_ms;
@@ -4810,19 +4904,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     fprintf(stderr,
                             "[render-timing] backend-submit calls=%.2f draws=%.1f avg_ms: measured=%.2f "
                             "detail=%.2f target=%.2f draw_setup=%.2f record_upload=%.2f "
-                            "gpu_wait=%.2f readback=%.2f cleanup=%.2f other=%.2f\n",
+                            "gpu_wait=%.2f gpu_device=%.2f gpu_overhead=%.2f readback=%.2f "
+                            "cleanup=%.2f other=%.2f\n",
                             totals.backend_calls / nsub, totals.backend_draws / nsub,
                             totals.backend_ms / nsub, backend_detail_ms / nsub,
                             totals.backend_target_ms / nsub, totals.backend_draw_setup_ms / nsub,
                             totals.backend_record_upload_ms / nsub, totals.backend_gpu_wait_ms / nsub,
+                            totals.backend_gpu_device_ms / nsub,
+                            std::max(0.0, totals.backend_gpu_wait_ms - totals.backend_gpu_device_ms) / nsub,
                             totals.backend_readback_ms / nsub, totals.backend_cleanup_ms / nsub,
                             (totals.backend_ms - backend_detail_ms) / nsub);
                     fprintf(stderr,
                             "[render-timing] backend-submit synchronization command_buffers=%.2f "
-                            "queue_submits=%.2f fence_waits=%.2f\n",
+                            "queue_submits=%.2f fence_waits=%.2f timestamps=%.2f\n",
                             totals.backend_command_buffers / nsub,
                             totals.backend_queue_submits / nsub,
-                            totals.backend_fence_waits / nsub);
+                            totals.backend_fence_waits / nsub,
+                            totals.backend_gpu_timestamp_samples / nsub);
                     fprintf(stderr,
                             "[render-timing] backend-submit draw_setup avg_ms: shaders=%.2f fixed=%.2f "
                             "resources=%.2f pipeline=%.2f\n",
@@ -4971,19 +5069,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     fprintf(stderr,
                             "[render-window] backend-submit calls=%.2f draws=%.1f avg_ms: measured=%.2f "
                             "detail=%.2f target=%.2f draw_setup=%.2f record_upload=%.2f "
-                            "gpu_wait=%.2f readback=%.2f cleanup=%.2f other=%.2f\n",
+                            "gpu_wait=%.2f gpu_device=%.2f gpu_overhead=%.2f readback=%.2f "
+                            "cleanup=%.2f other=%.2f\n",
                             window.backend_calls / wn, window.backend_draws / wn,
                             window.backend_ms / wn, window_backend_detail_ms / wn,
                             window.backend_target_ms / wn, window.backend_draw_setup_ms / wn,
                             window.backend_record_upload_ms / wn, window.backend_gpu_wait_ms / wn,
+                            window.backend_gpu_device_ms / wn,
+                            std::max(0.0, window.backend_gpu_wait_ms - window.backend_gpu_device_ms) / wn,
                             window.backend_readback_ms / wn, window.backend_cleanup_ms / wn,
                             (window.backend_ms - window_backend_detail_ms) / wn);
                     fprintf(stderr,
                             "[render-window] backend-submit synchronization command_buffers=%.2f "
-                            "queue_submits=%.2f fence_waits=%.2f\n",
+                            "queue_submits=%.2f fence_waits=%.2f timestamps=%.2f\n",
                             window.backend_command_buffers / wn,
                             window.backend_queue_submits / wn,
-                            window.backend_fence_waits / wn);
+                            window.backend_fence_waits / wn,
+                            window.backend_gpu_timestamp_samples / wn);
                     fprintf(stderr,
                             "[render-window] backend-submit draw_setup avg_ms: shaders=%.2f fixed=%.2f "
                             "resources=%.2f pipeline=%.2f\n",

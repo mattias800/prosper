@@ -8,8 +8,10 @@
 #include "sync_futex.hpp"   // shared futex wake + waiter registration (also used by the GPU's label wake)
 #include "../host/guest_memory_map.hpp"
 #include "../host/guest_write_watch.hpp"
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <iterator>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -170,6 +172,16 @@ namespace {
     };
     std::mutex g_mx;
     std::vector<Mapping> g_maps;
+    // Tracking writers split away every overlap. Keep the remaining intervals in base order so
+    // the signal-handler/resource safety probe can find one containing range logarithmically.
+    void insert_mapping_by_base(std::vector<Mapping>& mappings, const Mapping& mapping) {
+        const auto insertion = std::lower_bound(
+            mappings.begin(), mappings.end(), mapping.base,
+            [](const Mapping& candidate, uint64_t address) {
+                return candidate.base < address;
+            });
+        mappings.insert(insertion, mapping);
+    }
     // Direct ("physical") memory: a bump allocator over a FINITE pool. The pool size is what
     // sceKernelGetDirectMemorySize advertises, and exhaustion MUST fail with ENOMEM like real
     // hardware: guests rely on it — UE4 (PPSA17942) sizes its pool requests from
@@ -344,7 +356,7 @@ namespace {
             m.query_flags = query_flags;
             m.committed = committed;
             if (nm) { strncpy(m.name, nm, sizeof m.name - 1); }
-            out.push_back(m);
+            insert_mapping_by_base(out, m);
             g_maps.swap(out);
         }
         host::notify_guest_mapping_added(base, size, committed && (prot & 0x1));
@@ -427,7 +439,7 @@ namespace {
                 changed.guest_prot = guest_prot;
                 changed.committed = true;
                 if (nm) strncpy(changed.name, nm, sizeof changed.name - 1);
-                out.push_back(changed);
+                insert_mapping_by_base(out, changed);
                 retagged.push_back(changed);
             }
             g_maps.swap(out);
@@ -1784,11 +1796,15 @@ HLE(k_release_dmem) {
 // entry points take it, briefly); a contended lock just waits for the other thread's release.
 extern "C" int prosper_reserved_range_state(uint64_t addr) {
     std::lock_guard<std::mutex> lk(g_mx);
-    const Mapping* best = nullptr;
-    for (auto& m : g_maps)
-        if (addr >= m.base && addr < m.base + m.size)
-            if (!best || m.base > best->base) best = &m;
-    return best ? (best->committed ? 2 : 1) : 0;
+    const auto after = std::upper_bound(
+        g_maps.begin(), g_maps.end(), addr,
+        [](uint64_t address, const Mapping& mapping) {
+            return address < mapping.base;
+        });
+    if (after == g_maps.begin()) return 0;
+    const Mapping& mapping = *std::prev(after);
+    const bool contains = addr >= mapping.base && addr - mapping.base < mapping.size;
+    return contains ? (mapping.committed ? 2 : 1) : 0;
 }
 
 // sceKernelBatchMap(SceKernelBatchMapEntry* entries, int numberOfEntries, int* numberOfEntriesOut)
@@ -2048,6 +2064,16 @@ namespace {
     };
     std::mutex g_mx;
     std::vector<Mapping> g_maps;
+    // Keep parity with the POSIX tracker: non-overlapping intervals stay base-ordered for the
+    // fault/resource probe's logarithmic containing-range lookup.
+    void insert_mapping_by_base(std::vector<Mapping>& mappings, const Mapping& mapping) {
+        const auto insertion = std::lower_bound(
+            mappings.begin(), mappings.end(), mapping.base,
+            [](const Mapping& candidate, uint64_t address) {
+                return candidate.base < address;
+            });
+        mappings.insert(insertion, mapping);
+    }
     bool sparse_dmem_view_overlaps(uint64_t begin, uint64_t end);
     constexpr uint64_t kDmemBase  = 0x10000000;
     // Direct-memory budget the pool holds AND sceKernelGetDirectMemorySize advertises. Real PS5
@@ -2195,7 +2221,7 @@ namespace {
             m.query_flags = query_flags;
             m.committed = committed;
             if (nm) { strncpy(m.name, nm, sizeof m.name - 1); }
-            out.push_back(m);
+            insert_mapping_by_base(out, m);
             g_maps.swap(out);
         }
         host::notify_guest_mapping_added(base, size,
@@ -2261,7 +2287,7 @@ namespace {
                 changed.guest_prot = guest_prot;
                 changed.committed = true;
                 if (nm) strncpy(changed.name, nm, sizeof changed.name - 1);
-                out.push_back(changed);
+                insert_mapping_by_base(out, changed);
                 retagged.push_back(changed);
             }
             g_maps.swap(out);
@@ -4097,12 +4123,16 @@ extern "C" int prosper_reserved_range_state(uint64_t addr) {
     bool committed = false;
     {
         std::lock_guard<std::mutex> lk(g_mx);
-        const Mapping* best = nullptr;
-        for (auto& m : g_maps)
-            if (addr >= m.base && addr < m.base + m.size)
-                if (!best || m.base > best->base) best = &m;
-        tracked = best != nullptr;
-        committed = best && best->committed;
+        const auto after = std::upper_bound(
+            g_maps.begin(), g_maps.end(), addr,
+            [](uint64_t address, const Mapping& mapping) {
+                return address < mapping.base;
+            });
+        if (after != g_maps.begin()) {
+            const Mapping& mapping = *std::prev(after);
+            tracked = addr >= mapping.base && addr - mapping.base < mapping.size;
+            committed = tracked && mapping.committed;
+        }
     }
     if (!tracked) return 0;
     if (!committed) return 1;

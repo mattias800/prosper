@@ -163,6 +163,7 @@ struct ShaderCompileKey {
     ShaderProgramStage stage = ShaderProgramStage::Vertex;
     bool has_resource_table = false;
     bool force_position_w = false;
+    bool capture_position = false;
     bool has_pixel_inputs = false;
     PixelInputMapping pixel_inputs{};
     bool has_system_inputs = false;
@@ -185,6 +186,7 @@ struct ShaderCompileKey {
     uint32_t compute_lds_bytes = 0;
     uint32_t compute_native_subgroup_size = 0;
     uint32_t compute_native_storage_format_support = 0;
+    bool compute_packed_r11_storage = true;
     uint32_t vertex_lds_dwords = 0;
     uint32_t vertices_per_instance = 0;
     // Aliases ShaderCodeAnalysis::code and keeps that immutable analysis alive. Warm lookups used to
@@ -207,6 +209,7 @@ struct ShaderCompileKey {
         return stage == other.stage &&
                has_resource_table == other.has_resource_table &&
                force_position_w == other.force_position_w &&
+               capture_position == other.capture_position &&
                has_pixel_inputs == other.has_pixel_inputs &&
                pixel_inputs == other.pixel_inputs &&
                has_system_inputs == other.has_system_inputs &&
@@ -233,6 +236,7 @@ struct ShaderCompileKey {
                compute_native_subgroup_size == other.compute_native_subgroup_size &&
                compute_native_storage_format_support ==
                    other.compute_native_storage_format_support &&
+               compute_packed_r11_storage == other.compute_packed_r11_storage &&
                vertex_lds_dwords == other.vertex_lds_dwords &&
                vertices_per_instance == other.vertices_per_instance &&
                resources == other.resources && same_code && same_chain_code;
@@ -260,6 +264,7 @@ struct ShaderCompileKeyHash {
         hash = hash_mix(hash, static_cast<uint32_t>(key.stage));
         hash = hash_mix(hash, key.has_resource_table);
         hash = hash_mix(hash, key.force_position_w);
+        hash = hash_mix(hash, key.capture_position);
         hash = hash_mix(hash, key.has_pixel_inputs);
         if (key.has_pixel_inputs) {
             hash = hash_mix(hash, key.pixel_inputs.valid_mask);
@@ -294,6 +299,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, key.compute_lds_bytes);
             hash = hash_mix(hash, key.compute_native_subgroup_size);
             hash = hash_mix(hash, key.compute_native_storage_format_support);
+            hash = hash_mix(hash, key.compute_packed_r11_storage);
         }
         hash = hash_mix(hash, key.vertex_lds_dwords);
         hash = hash_mix(hash, key.vertices_per_instance);
@@ -863,7 +869,8 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                                          size_t chain_dwords = 0,
                                          uint32_t vertex_lds_dwords = 0,
                                          const ComputeShaderConfig* compute_config = nullptr,
-                                         bool fragment_wave32 = false) {
+                                         bool fragment_wave32 = false,
+                                         bool capture_position = false) {
     ShaderCompileKey key;
     key.stage = stage;
     key.vertex_lds_dwords = stage == ShaderProgramStage::Vertex
@@ -872,6 +879,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
         ? resources->vertices_per_instance : 0u;
     key.has_resource_table = resources != nullptr;
     key.force_position_w = getenv("PROSPER_FORCE_W") != nullptr;
+    key.capture_position = stage == ShaderProgramStage::Vertex && capture_position;
     key.has_pixel_inputs = stage != ShaderProgramStage::Compute && pixel_inputs != nullptr;
     if (key.has_pixel_inputs) key.pixel_inputs = *pixel_inputs;
     key.has_system_inputs = stage == ShaderProgramStage::Fragment && system_inputs != nullptr;
@@ -897,6 +905,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
         key.compute_native_subgroup_size = compute_config->native_subgroup_size;
         key.compute_native_storage_format_support =
             compute_config->native_storage_format_support;
+        key.compute_packed_r11_storage = compute_config->packed_r11_storage;
     }
     const std::shared_ptr<const ShaderCodeAnalysis> analysis =
         code && dwords ? analyze_shader_code_cached(code, dwords) : nullptr;
@@ -994,18 +1003,17 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
     const uint32_t* code = !key.code || key.code->empty() ? nullptr : key.code->data();
     const size_t code_size = key.code ? key.code->size() : 0u;
     if (stage == ShaderProgramStage::Vertex)
-        // Geometry probe (PROSPER_GEOM_PROBE): decorate gl_Position for transform-feedback capture on
-        // the LIVE path (which recompiles here). Capsule replay substitutes an xfb VS in gpu_replay,
-        // because a capsule stores already-recompiled SPIR-V. Inert to the shader's computation.
+        // Geometry probe: decorate gl_Position only when the caller proved the VS is the last
+        // pre-rasterization stage. Generated interpolation geometry stages own XFB themselves.
         return key.chain_code
             ? recompile_vertex_chain(code, code_size, key.chain_code->data(),
                                      key.chain_code->size(), resources,
                                      key.has_pixel_inputs ? &key.pixel_inputs : nullptr,
-                                     getenv("PROSPER_GEOM_PROBE") != nullptr,
+                                     key.capture_position,
                                      key.vertex_lds_dwords)
             : recompile_vertex(code, code_size, resources,
                                key.has_pixel_inputs ? &key.pixel_inputs : nullptr,
-                               getenv("PROSPER_GEOM_PROBE") != nullptr,
+                               key.capture_position,
                                key.vertex_lds_dwords);
     if (stage == ShaderProgramStage::Fragment) {
         const FragmentInterpolationLayout interpolation = fragment_interpolation_layout(
@@ -1224,11 +1232,12 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
         ShaderProgramStage stage, const uint32_t* code, size_t dwords,
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
         const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity,
-        bool fragment_wave32, uint32_t vertex_lds_dwords) {
+        bool fragment_wave32, uint32_t vertex_lds_dwords,
+        bool vertex_capture_position) {
     ShaderCompileKey key = make_shader_compile_key(stage, code, dwords, resources, pixel_inputs,
                                                    system_inputs, nullptr, 0,
                                                    vertex_lds_dwords, nullptr,
-                                                   fragment_wave32);
+                                                   fragment_wave32, vertex_capture_position);
     return cache_compiled_graphics_shader(stage, std::move(key), resources, cache_identity);
 }
 
@@ -1236,10 +1245,11 @@ SharedShaderWords recompile_vertex_chain_cached_shared(
         const uint32_t* prolog, size_t prolog_dwords,
         const uint32_t* main, size_t main_dwords,
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
-        uint64_t* cache_identity, uint32_t vertex_lds_dwords) {
+        uint64_t* cache_identity, uint32_t vertex_lds_dwords,
+        bool capture_position) {
     ShaderCompileKey key = make_shader_compile_key(
         ShaderProgramStage::Vertex, prolog, prolog_dwords, resources, pixel_inputs, nullptr,
-        main, main_dwords, vertex_lds_dwords);
+        main, main_dwords, vertex_lds_dwords, nullptr, false, capture_position);
     if (!key.chain_code) {
         if (cache_identity) *cache_identity = 0;
         return {};
@@ -1252,10 +1262,11 @@ std::vector<uint32_t> recompile_graphics_shader_cached(
         ShaderProgramStage stage, const uint32_t* code, size_t dwords,
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
         const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity,
-        bool fragment_wave32, uint32_t vertex_lds_dwords) {
+        bool fragment_wave32, uint32_t vertex_lds_dwords,
+        bool vertex_capture_position) {
     SharedShaderWords words = recompile_graphics_shader_cached_shared(
         stage, code, dwords, resources, pixel_inputs, system_inputs, cache_identity,
-        fragment_wave32, vertex_lds_dwords);
+        fragment_wave32, vertex_lds_dwords, vertex_capture_position);
     return words ? *words : std::vector<uint32_t>{};
 }
 
@@ -3742,12 +3753,17 @@ std::vector<ComputeItem> realize_compute_dispatches(
             }
         }
         assign_convention_bindings(*table, 2);
+        bool native_multiwave_wave_work = false;
         {
             std::vector<Rdna2Inst> decoded;
             rdna2_walk(reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
                        shader_dwords, decoded);
+            native_multiwave_wave_work = compute_shader_prefers_native_multiwave(
+                decoded, reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+                shader_dwords);
             const bool uses_gds = std::any_of(decoded.begin(), decoded.end(), [](const auto& in) {
-                return in.fmt == Rdna2Format::DS && in.ds_gds && in.opcode == 0x0d;
+                return in.fmt == Rdna2Format::DS && in.ds_gds &&
+                       (in.opcode == 0x0d || in.opcode == 0x3d || in.opcode == 0x3e);
             });
             if (uses_gds) {
                 ShaderResource gds;
@@ -3784,9 +3800,14 @@ std::vector<ComputeItem> realize_compute_dispatches(
             shared_vulkan.storage_image_write_without_format;
         config.native_storage_format_support = shared_compute_adoptable
             ? shared_vulkan.native_storage_format_support : 0;
-        // Realized captures store SPIR-V but not enough raw compute launch state to recompile a
-        // device-specific typed-storage module on replay. Compile capture-bound dispatches through
-        // the portable raw-uvec4 path so optional format support never becomes an artifact ABI.
+        const uint32_t replay_native_storage_format_support =
+            config.native_storage_format_support;
+        config.packed_r11_storage =
+            std::getenv("PROSPER_NO_PACKED_R11_STORAGE") == nullptr;
+        // Keep the stored capture module portable by compiling capture-bound dispatches through
+        // device-independent storage paths (raw uvec4 or exact packed R32ui), so optional format
+        // support never becomes an artifact ABI. Capture v39 also retains the raw shader and
+        // semantic launch ABI, allowing --recompile-raw to reconstruct a device-specific module.
         const bool capture_bound = std::getenv("PROSPER_GPU_CAPTURE") ||
             std::getenv("PROSPER_GPU_TIMELINE_CAPTURE") ||
             interactive_gpu_capture_armed() || interactive_capture_bundle_active();
@@ -3797,9 +3818,14 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // Vulkan's implementation-defined LocalInvocationIndex order and subgroup lane order while
         // still making each native subgroup exactly one RDNA wave. Capture v37 records this exact
         // module's required-subgroup/full-subgroups pipeline contract for faithful replay.
+        // Repeated scratch-emulated wave scans/votes are a structural exception to the conservative
+        // multi-wave default: the exact subgroup shell removes their workgroup barriers while
+        // preserving one native subgroup per guest wave. Keep the environment switch as an explicit
+        // experiment for every other multi-wave shape; this automatic path is shader-address/title
+        // independent and remains subject to all device and workgroup bounds below.
         config.native_subgroup_size = select_native_compute_subgroup_size(
             shared_vulkan, config,
-            getenv("PROSPER_NATIVE_COMPUTE_MULTIWAVE") != nullptr,
+            native_multiwave_wave_work || getenv("PROSPER_NATIVE_COMPUTE_MULTIWAVE") != nullptr,
             getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") != nullptr);
         config.tgid_x_en = tgid_x_en;
         config.tgid_y_en = tgid_y_en;
@@ -3816,6 +3842,12 @@ std::vector<ComputeItem> realize_compute_dispatches(
             (const uint32_t*)(uintptr_t)code_addr, 0x10000, table.get(), config);
         item.user_sgprs = config.user_sgprs;
         item.required_subgroup_size = config.native_subgroup_size;
+        item.recompile_config = config;
+        // Capture-bound SPIR-V deliberately uses the device-independent storage path, but v39 raw
+        // replay needs the capability mask that a normal live dispatch would have used.
+        item.recompile_config.native_storage_format_support =
+            replay_native_storage_format_support;
+        item.recompile_config_available = true;
         item.resources = std::move(table);
         item.launch = launch;
         item.code_addr = code_addr;
@@ -3974,7 +4006,12 @@ bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
     // deliberately does not consume an armed interactive request when semantic_draw_count is zero.
     std::unique_ptr<PendingGpuCapture> pending_capture;
     std::vector<SubmitOperation> capture_operations;
-    const bool can_defer_capture = st.dma_copies.empty();
+    const bool has_indirect_dispatch = std::any_of(
+        st.dispatches.begin(), st.dispatches.end(),
+        [](const GpuState::Dispatch& dispatch) { return dispatch.indirect; });
+    // Preserve the established exact-trace path for ordinary no-DMA compute submits, and extend it
+    // to DMA-backed indirect consumers whose arguments cannot be realized until after the copy.
+    const bool can_defer_capture = st.dma_copies.empty() || has_indirect_dispatch;
     if (const char* capture_path = std::getenv("PROSPER_GPU_CAPTURE");
         capture_path && *capture_path) {
         capture_operations = plan_submit_operations(st);
@@ -3982,6 +4019,8 @@ bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
             {}, {}, capture_operations, present_width(), present_height(), &st, submit_no,
             static_cast<uint64_t>(st.draws.size()), nullptr, can_defer_capture);
     }
+    snapshot_pending_gpu_capture_compute_gds(
+        pending_capture.get(), g_compute_gds.data(), g_compute_gds.size());
     OrderedGpustateCaptureTrace capture_trace;
     const OrderedSubmitResult result = execute_ordered_gpustate(
         st, 0, 0, submit_no, {}, g_compute,
@@ -4785,7 +4824,7 @@ std::vector<DrawItem> realize_gpustate_draws_parallel(
 }
 
 namespace {
-enum class RetainedSubmitKind : uint8_t { Draw, Dispatch, DmaCopy, MemoryEffect };
+enum class RetainedSubmitKind : uint8_t { Draw, Dispatch, DmaCopy, ParserStall, MemoryEffect };
 struct RetainedSubmitOperation {
     RetainedSubmitKind kind;
     size_t index;
@@ -4802,12 +4841,118 @@ bool retained_draw_selected(const GpuState& st, size_t index) {
     return use_per_draw_policy(st) || index + 1 == st.draws.size();
 }
 
+bool resolve_indirect_draw_arguments(const GpuState& submit, const GpuState::Draw& source,
+                                     GpuState::Draw& resolved) {
+    resolved = source;
+    if (!source.indirect) return true;
+    constexpr uint32_t kArgumentBytes = 5u * sizeof(uint32_t);
+    if (!source.indirect_args_addr || (source.indirect_args_addr & 3u) ||
+        !guest_readable(source.indirect_args_addr, kArgumentBytes)) {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 24)
+            std::fprintf(stderr, "[agc] indexed indirect draw skipped: unreadable arguments at 0x%llx\n",
+                         static_cast<unsigned long long>(source.indirect_args_addr));
+        return false;
+    }
+    uint32_t args[5] = {};
+    std::memcpy(args, reinterpret_cast<const void*>(source.indirect_args_addr), sizeof(args));
+    const uint32_t index_count = args[0];
+    const uint32_t instance_count = args[1];
+    const uint32_t first_index = args[2];
+    const int32_t vertex_offset = static_cast<int32_t>(args[3]);
+    const uint32_t first_instance = args[4];
+    constexpr uint32_t kMaxIndirectCount = 1u << 20;
+    if (!index_count || !instance_count) return false;  // hardware no-op
+    if (index_count > kMaxIndirectCount || instance_count > kMaxIndirectCount ||
+        first_instance != 0 || !source.index_base) {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 24)
+            std::fprintf(stderr,
+                         "[agc] indexed indirect draw skipped: count=%u instances=%u first=%u "
+                         "vertex_offset=%d first_instance=%u index_base=0x%llx\n",
+                         index_count, instance_count, first_index, vertex_offset, first_instance,
+                         static_cast<unsigned long long>(source.index_base));
+        return false;
+    }
+    const GpuState& draw_state = source.state ? *source.state : submit;
+    const uint64_t element_bytes = index_elem_bytes(draw_state.index_type);
+    if (!element_bytes) return false;
+    if (first_index > (UINT64_MAX - source.index_base) / element_bytes) return false;
+    resolved.index_count = index_count;
+    resolved.instance_count = instance_count;
+    resolved.indexed = true;
+    resolved.index_offset = first_index;
+    resolved.index_addr = source.index_base + static_cast<uint64_t>(first_index) * element_bytes;
+    resolved.from_offset = true;
+    resolved.indirect_vertex_offset = vertex_offset;
+    resolved.has_vertex_offset_override = true;
+    resolved.indirect = false;
+    if (std::getenv("PROSPER_INDIRECTLOG")) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 256)
+            std::fprintf(stderr,
+                         "[agc-indirect] draw args=0x%llx count=%u instances=%u first=%u "
+                         "vertex_offset=%d index_base=0x%llx\n",
+                         static_cast<unsigned long long>(source.indirect_args_addr), index_count,
+                         instance_count, first_index, vertex_offset,
+                         static_cast<unsigned long long>(source.index_base));
+    }
+    return true;
+}
+
+bool resolve_indirect_dispatch_arguments(const GpuState::Dispatch& source,
+                                         GpuState::Dispatch& resolved) {
+    resolved = source;
+    if (!source.indirect) return true;
+    constexpr uint32_t kArgumentBytes = 3u * sizeof(uint32_t);
+    if (!source.indirect_args_addr || (source.indirect_args_addr & 3u) ||
+        !guest_readable(source.indirect_args_addr, kArgumentBytes)) {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 24)
+            std::fprintf(stderr, "[agc] indirect dispatch skipped: unreadable arguments at 0x%llx\n",
+                         static_cast<unsigned long long>(source.indirect_args_addr));
+        return false;
+    }
+    uint32_t args[3] = {};
+    std::memcpy(args, reinterpret_cast<const void*>(source.indirect_args_addr), sizeof(args));
+    if (!args[0] || !args[1] || !args[2]) return false;  // hardware no-op
+    resolved.threads_x = args[0];
+    resolved.threads_y = args[1];
+    resolved.threads_z = args[2];
+    resolved.indirect = false;
+    const ComputeLaunchDimensions launch = resolve_compute_launch(resolved);
+    constexpr uint32_t kPortableMaxWorkgroups = 65535;
+    if (!launch.groups_x || !launch.groups_y || !launch.groups_z ||
+        launch.groups_x > kPortableMaxWorkgroups ||
+        launch.groups_y > kPortableMaxWorkgroups ||
+        launch.groups_z > kPortableMaxWorkgroups) {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 24)
+            std::fprintf(stderr,
+                         "[agc] indirect dispatch skipped: dimensions=%ux%ux%u resolve to "
+                         "%ux%ux%u workgroups\n",
+                         args[0], args[1], args[2], launch.groups_x, launch.groups_y,
+                         launch.groups_z);
+        return false;
+    }
+    if (std::getenv("PROSPER_INDIRECTLOG")) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 256)
+            std::fprintf(stderr,
+                         "[agc-indirect] dispatch args=0x%llx dims=%ux%ux%u groups=%ux%ux%u\n",
+                         static_cast<unsigned long long>(source.indirect_args_addr), args[0], args[1],
+                         args[2], launch.groups_x, launch.groups_y, launch.groups_z);
+    }
+    return true;
+}
+
 bool realize_retained_draw(const GpuState& st, size_t index, float scale_x, float scale_y,
                            DrawItem& item) {
     if (index >= st.draws.size() || !retained_draw_selected(st, index)) return false;
     const bool per_draw = use_per_draw_policy(st);
     const GpuState& draw_state = per_draw ? st.state_at_draw(index) : st;
-    const GpuState::Draw& draw = st.draws[index];
+    GpuState::Draw draw;
+    if (!resolve_indirect_draw_arguments(st, st.draws[index], draw)) return false;
     const bool log = getenv("PROSPER_GFXLOG") != nullptr || getenv("PROSPER_EXECLOG") != nullptr;
     if (!realize_draw_item(draw_state, &draw, draw.index_count, 0x10000, log, item,
                            nullptr, true)) return false;
@@ -4826,7 +4971,9 @@ bool realize_retained_compute(const GpuState& st, size_t index, uint64_t submit_
     // intact while ensuring it runs only after every preceding ordered producer has landed.
     GpuState one = st.dispatches[index].state ? *st.dispatches[index].state : st;
     one.dispatches.clear();
-    one.dispatches.push_back(st.dispatches[index]);
+    GpuState::Dispatch dispatch;
+    if (!resolve_indirect_dispatch_arguments(st.dispatches[index], dispatch)) return false;
+    one.dispatches.push_back(std::move(dispatch));
     std::vector<OperationRealizationFailure> failures;
     std::vector<ComputeItem> realized = realize_compute_dispatches(
         one, submit_no, failure ? &failures : nullptr);
@@ -4860,7 +5007,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     }
     std::vector<RetainedSubmitOperation> executable;
     executable.reserve(st.draws.size() + st.dispatches.size() + st.dma_copies.size() +
-                       st.ordered_memory_effects.size());
+                       st.parser_stalls.size() + st.ordered_memory_effects.size());
     for (size_t i = 0; i < st.draws.size(); ++i)
         if (retained_draw_selected(st, i))
             executable.push_back({RetainedSubmitKind::Draw, i, st.draws[i].command_order});
@@ -4868,6 +5015,9 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
         executable.push_back({RetainedSubmitKind::Dispatch, i, st.dispatches[i].command_order});
     for (size_t i = 0; i < st.dma_copies.size(); ++i)
         executable.push_back({RetainedSubmitKind::DmaCopy, i, st.dma_copies[i].command_order});
+    for (size_t i = 0; i < st.parser_stalls.size(); ++i)
+        executable.push_back({RetainedSubmitKind::ParserStall, i,
+                              st.parser_stalls[i].command_order});
     for (size_t i = 0; i < st.ordered_memory_effects.size(); ++i)
         executable.push_back({RetainedSubmitKind::MemoryEffect, i,
                               st.ordered_memory_effects[i].cmd.stream_order});
@@ -4890,6 +5040,8 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     const float scale_x = full_width ? static_cast<float>(width) / full_width : 1.0f;
     const float scale_y = full_height ? static_cast<float>(height) / full_height : 1.0f;
     OrderedSubmitResult result;
+    bool producer_epoch_ok = true;
+    bool indirect_dependencies_ok = true;
     bool final_callback_sent = false;
     std::vector<DrawItem> span;
     auto flush_span = [&](bool authoritative_readback = false) {
@@ -4909,23 +5061,64 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
         switch (operation.kind) {
             case RetainedSubmitKind::Draw: {
                 if (!render) break;
+                if (st.draws[operation.index].indirect &&
+                    (!indirect_dependencies_ok || !producer_epoch_ok)) {
+                    if (capture_trace) {
+                        capture_trace->failures.push_back({
+                            SubmitOperationKind::Draw, operation.index,
+                            operation.command_order, RealizationFailureReason::Unknown});
+                    }
+                    break;
+                }
                 DrawItem item;
-                if (realize_retained_draw(st, operation.index, scale_x, scale_y, item))
+                if (realize_retained_draw(st, operation.index, scale_x, scale_y, item)) {
+                    if (capture_trace) capture_trace->draws.push_back(item);
                     span.push_back(std::move(item));
+                }
                 break;
             }
             case RetainedSubmitKind::Dispatch: {
                 flush_span();
-                if (!compute) break;
+                const bool indirect = st.dispatches[operation.index].indirect;
+                if (indirect && (!indirect_dependencies_ok || !producer_epoch_ok)) {
+                    if (capture_trace) {
+                        capture_trace->failures.push_back({
+                            SubmitOperationKind::Dispatch, operation.index,
+                            operation.command_order, RealizationFailureReason::Unknown});
+                    }
+                    producer_epoch_ok = false;
+                    break;
+                }
+                if (!compute) {
+                    if (capture_trace) {
+                        capture_trace->failures.push_back({
+                            SubmitOperationKind::Dispatch, operation.index,
+                            operation.command_order, RealizationFailureReason::Unknown});
+                    }
+                    producer_epoch_ok = false;
+                    break;
+                }
                 ComputeItem item;
                 OperationRealizationFailure failure;
                 if (realize_retained_compute(
                         st, operation.index, submit_no, item,
                         capture_trace ? &failure : nullptr)) {
-                    if (capture_trace) capture_trace->computes.push_back(item);
-                    result.compute_executed |= compute({std::move(item)});
+                    const bool executed = capture_trace
+                        ? compute({item}) : compute({std::move(item)});
+                    if (capture_trace && executed)
+                        capture_trace->computes.push_back(std::move(item));
+                    if (capture_trace && !executed) {
+                        capture_trace->failures.push_back({
+                            SubmitOperationKind::Dispatch, operation.index,
+                            operation.command_order, RealizationFailureReason::Unknown});
+                    }
+                    result.compute_executed |= executed;
+                    producer_epoch_ok &= executed;
                 } else if (capture_trace && failure.reason != RealizationFailureReason::None) {
                     capture_trace->failures.push_back(std::move(failure));
+                    producer_epoch_ok = false;
+                } else {
+                    producer_epoch_ok = false;
                 }
                 break;
             }
@@ -4941,13 +5134,22 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                         std::fprintf(stderr,
                                      "[agc] DMA_DATA live-target source range invalid: src=0x%llx bytes=%u\n",
                                      static_cast<unsigned long long>(copy.src), copy.bytes);
+                    producer_epoch_ok = false;
                     break;
                 }
-                execute_ordered_dma_copy(
+                const bool executed = execute_ordered_dma_copy(
                     copy, source_result == LiveTargetByteReadResult::Success
                               ? current_source.data() : nullptr);
+                producer_epoch_ok &= executed;
                 break;
             }
+            case RetainedSubmitKind::ParserStall:
+                flush_span();
+                // Once an argument-producing epoch fails, a later empty/redundant stall cannot
+                // make the stale bytes trustworthy again. Keep the submit poisoned until it ends.
+                indirect_dependencies_ok &= producer_epoch_ok;
+                producer_epoch_ok = true;
+                break;
             case RetainedSubmitKind::MemoryEffect:
                 flush_span();
                 execute_ordered_memory_effect(st.ordered_memory_effects[operation.index]);
@@ -5178,9 +5380,14 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     float sx = fw ? (float)width / (float)fw : 1.0f;
     float sy = fh ? (float)height / (float)fh : 1.0f;
     const bool has_ordered_dma = !st.dma_copies.empty();
-    // A DMA-bearing submit realizes consumers at their ordered position below. Pre-realizing here
-    // would snapshot old indices/descriptors/shader bytes before the copy updates their backing.
-    std::vector<DrawItem> draws = !has_ordered_dma && g_live && width && height
+    const bool has_indirect = std::any_of(st.draws.begin(), st.draws.end(),
+                                         [](const auto& draw) { return draw.indirect; }) ||
+                              std::any_of(st.dispatches.begin(), st.dispatches.end(),
+                                         [](const auto& dispatch) { return dispatch.indirect; });
+    const bool needs_ordered_realization = has_ordered_dma || has_indirect;
+    // DMA and indirect consumers must be realized at their ordered position below. Pre-realizing
+    // would snapshot bytes before an earlier copy or compute shader updates their backing.
+    std::vector<DrawItem> draws = !needs_ordered_realization && g_live && width && height
         ? realize_gpustate_draws(st, 0x10000, sx, sy, nullptr, true)
         : std::vector<DrawItem>{};
     const ShaderRecompileCacheStats shader_after = timing_enabled
@@ -5194,7 +5401,7 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     const ParallelDrawRealizationStats parallel_after = timing_enabled
         ? parallel_draw_realization_stats() : ParallelDrawRealizationStats{};
     const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
-    std::vector<ComputeItem> computes = !has_ordered_dma && g_compute
+    std::vector<ComputeItem> computes = !needs_ordered_realization && g_compute
         ? realize_compute_dispatches(st, submit_no) : std::vector<ComputeItem>{};
     const auto timing_compute_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
 
@@ -5204,16 +5411,27 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     // even though live execution deliberately realizes their consumers only at ordered positions.
     auto pending_capture = begin_requested_gpu_capture(
         draws, computes, operations, width, height, &st, submit_no,
-        static_cast<uint64_t>(st.draws.size()));
-    OrderedSubmitResult result = has_ordered_dma
-        ? execute_ordered_gpustate(st, width, height, submit_no, g_live, g_compute)
+        static_cast<uint64_t>(st.draws.size()), nullptr,
+        /*defer_materialization=*/has_indirect);
+    snapshot_pending_gpu_capture_compute_gds(
+        pending_capture.get(), g_compute_gds.data(), g_compute_gds.size());
+    OrderedGpustateCaptureTrace capture_trace;
+    OrderedSubmitResult result = needs_ordered_realization
+        ? execute_ordered_gpustate(st, width, height, submit_no, g_live, g_compute,
+                                   pending_capture ? &capture_trace : nullptr)
         : execute_ordered_items(operations, draws, computes, g_live, g_compute, width, height);
     const auto timing_backend_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     const std::vector<uint8_t>& px = result.frame.bytes();
 
     if (pending_capture) {
         std::string error;
-        if (!finish_requested_gpu_capture(std::move(pending_capture), px, error))
+        const std::vector<DrawItem>* capture_draws = needs_ordered_realization
+            ? &capture_trace.draws : &draws;
+        const std::vector<ComputeItem>* capture_computes = needs_ordered_realization
+            ? &capture_trace.computes : &computes;
+        if (!finish_requested_gpu_capture(std::move(pending_capture), px, error,
+                                          capture_draws, capture_computes, &operations, &st,
+                                          needs_ordered_realization ? &capture_trace.failures : nullptr))
             std::fprintf(stderr, "[gpucap] write failed: %s\n", error.c_str());
     }
     const bool frame_ready = px.size() == static_cast<size_t>(width) * height * 4;

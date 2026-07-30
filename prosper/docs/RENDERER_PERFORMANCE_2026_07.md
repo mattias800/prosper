@@ -1222,17 +1222,39 @@ created and ran both exact pipeline contracts. The standalone startup capsule st
 operations and no temporal RTT seeds, so its final pixel oracle and live compute result do not match.
 It is valid evidence for module/pipeline analysis, not for a full-frame correctness claim.
 
-A matched live switch test separated the two remaining kernels. Native lowering reduced
+A matched live switch test first separated the two remaining kernels. Native lowering reduced
 `0x30180d0000` from a 5.65 ms to 3.22 ms median GPU dispatch, but the four-wave, LDS/barrier-heavy
-`0x3015770000` kernel moved from 5.21 ms to 5.62 ms. Every other eligible Plucky dispatch in the route
-used exactly one 64-lane guest wave; those were neutral or faster, including a repeated mip kernel at
-0.44 ms native versus 0.86 ms portable. Native lowering therefore defaults to exact single-wave
-workgroups. `PROSPER_NATIVE_COMPUTE_MULTIWAVE=1` retains the exact, captureable multi-wave experiment;
-`PROSPER_NO_NATIVE_COMPUTE_SUBGROUP=1` remains the full portable control. These are sequential
-dispatch-local runs; 441 versus 418 presented frames is supporting route progression, not a standalone
-whole-app claim. A clean combined-policy confirmation kept `0x30180d0000` native at 3.08 ms and
-`0x3015770000` portable at 5.27 ms over 378+ samples, with 425 frames presented and no dispatch skip,
-renderer failure, or shutdown error.
+`0x3015770000` kernel moved from 5.21 ms to 5.62 ms. The reason was structural rather than an inherent
+multi-wave cost: its exact-subgroup module still contained the portable structured-control-flow wave
+votes, including 20 synthetic workgroup barriers in addition to the program's three real barriers.
+Every other eligible Plucky dispatch in that route used exactly one 64-lane guest wave; those were
+neutral or faster, including a repeated mip kernel at 0.44 ms native versus 0.86 ms portable. The
+interim policy therefore defaulted to exact single-wave workgroups and retained
+`PROSPER_NATIVE_COMPUTE_MULTIWAVE=1` as an experiment.
+
+The follow-up on 2026-07-30 made the exact-subgroup contract consistent across all translator paths.
+Straight-line MBCNT now uses subgroup exclusive scans, as the CFG dispatcher already did, and the
+structured compute path uses subgroup-any instead of the portable workgroup vote. The captured
+`0x3015770000` module fell from 32,076 to 8,026 SPIR-V words and now contains ten subgroup votes plus
+only the three guest barriers. A matched 55-second full-resolution live A/B measured steady submits
+after submit 100:
+
+| program | portable median | native median | samples (portable/native) |
+|---|---:|---:|---:|
+| `0x30180d0000` | 6.230 ms | 3.615 ms | 726 / 800 |
+| `0x3015770000` | 5.880 ms | 1.630 ms | 724 / 799 |
+
+The default remains conservative and title-independent: multi-wave workgroups are admitted
+automatically only when the decoded shader contains the canonical MBCNT low/high pair or at least four
+VCC/EXEC branches accepted as top-level regions by the structured compute emitter alongside top-level
+guest workgroup barriers. That structural proof guarantees portable lowering really emits the repeated
+scratch-emulated votes which justify the exact subgroup shell; raw branch opcodes alone do not qualify.
+Other multi-wave shapes still require `PROSPER_NATIVE_COMPUTE_MULTIWAVE=1`, and
+`PROSPER_NO_NATIVE_COMPUTE_SUBGROUP=1` remains the complete portable control. A default-policy run
+selected subgroup64 for both heavy programs, presented 265 frames, and produced no renderer or dispatch
+failure. A fresh four-present bundle replayed all 12 submits and 56/56 operations in the heavy submit;
+its 3840x2160 output was pixel-identical to the independently scheduled live screenshot (infinite PSNR).
+Frame counts remain supporting route progression rather than a standalone FPS claim.
 
 ## Plucky split no-GS NGG producer coverage
 
@@ -1319,9 +1341,80 @@ skips already avoid guest-write notification, so they are deliberately unaffecte
 trace instead keeps the disabled texture-watch and incomplete guest-range cases below as the active Plucky
 bottleneck.
 
+## Plucky direct compute-image sampling prototype (issue #1477)
+
+The remaining large sampled-texture spikes had an exact GPU authority that the renderer did not consume.
+A successful typed-storage compute dispatch already retained its native Vulkan image on the graphics
+device, then mirrored the same result into tiled guest memory. A later graphics span nevertheless validated,
+detiled, and uploaded those guest bytes again. The observed full-resolution outputs are 33,423,360-byte
+R11G11B10 and 66,846,720-byte RGBA16F surfaces; cold or invalidated fallback references have taken roughly
+64-90 ms to materialize.
+
+The issue #1477 prototype publishes only successful native typed-storage results created with sampled usage.
+The graphics import reconstructs the complete compute-cache identity and borrows the image only while the
+current-submit GPU-write journal or a clean cross-submit page watch proves that no later architectural writer
+overlapped its guest mirror. Every attempted storage dispatch revokes the previous authority before command
+recording, and only complete dispatch/writeback/layout success republishes it. A shared lease pins the cache
+entry until the graphics fence cleanup; graphics transitions the borrowed image from `GENERAL` to shader-read
+and restores `GENERAL` without destroying the image. Raw-uvec4 interchange images, replay `host_data`, depth,
+sRGB, mip-tail/array/volume views, and DCC surfaces without an exact all-`0xff` uncompressed proof remain on
+the existing path. `PROSPER_NO_DIRECT_COMPUTE_IMAGE_BIND=1` is the control switch.
+
+Focused production-backend coverage proves cross-submit watch authorization, rejects an import after an
+architectural GPU/DMA write dirties the watched guest range, and holds the lease through submission cleanup.
+The renderer execution test compares borrowed native FP16 and R11G11B10 images against the existing CPU
+readback/upload route byte for byte, then samples the owner again to prove its layout and lifetime were
+restored. Restoring the fallback importer or omitting either native-format bridge makes those tests fail.
+
+A 135-second full-resolution, normal-cadence Plucky route exercised the bridge on the real 4K outputs. The
+explicit detail log reached its 250-line cap with direct hits; individual frontend resource decisions took
+approximately 0.00-0.11 ms and copied or validated zero guest bytes. At submit 1,100, cumulative texture
+resource construction was 8.22 ms per submit with the bridge and 9.20 ms in the sequential disabled control;
+cumulative frontend time was 34.49 versus 35.04 ms. The enabled run produced a clean native 3840x2160 Play
+Style screenshot and completed 1,508 presents, versus 1,367 in the control. The scheduled control screenshot
+landed ten guest presents earlier during the menu's black fade, so it is not a pixel oracle and the route
+progression difference is supporting evidence rather than a standalone FPS claim. GPU replay cannot exercise
+this temporal residency boundary because replay resources intentionally own `host_data`; the production tests,
+live disable switch, and the unchanged replay fallback divide that verification responsibility explicitly.
+
+After merging current master, a fresh 140-second exact-head A/B repeated the result with identical build,
+route, full-resolution, audio, input, and timing settings. The enabled run logged 250 direct decisions,
+including a 3840x2160 RGBA16F result at 0.09 ms, and reached 2,220 presents; the single-switch disabled run
+logged no direct decisions and reached 2,040. Their final 25-submit texture-resource windows were 6.45 ms and
+10.62 ms respectively. Both native 3840x2160 checkpoints were visually clean. They armed at the same guest
+present (1,058) but asynchronous readback completed on different later presents and captured different menu
+states, so they remain independent correctness/progression evidence rather than a pixel-equality oracle.
+
+### Raw compute replay closes the portable-capture profiling gap
+
+The next measured Plucky hotspot was program `0x30180d0000`, binding 30: a 3840x2160 RGBA16F
+storage result whose captured portable module expands 66,846,720 guest bytes into a 132,710,400-byte
+RGBA32_UINT interchange image. Inspection proved that this is not necessarily the live steady-state path.
+The renderer device advertises RGBA16F storage support and ordinary uncaptured execution already emits the
+native-width float image, but capture-bound translation intentionally stores portable SPIR-V. Realized
+compute captures retained neither raw RDNA2 nor the semantic launch ABI, so replay could not regenerate the
+current/device-specific module and its timing overstated live cost.
+
+Capture v39 now retains that missing source and ABI state. `gpu_replay --recompile-raw` rebuilds compute as
+well as graphics, substitutes only successful modules, restores captured push constants, and selects typed
+storage/subgroup capabilities from the initialized replay device when rendering. Tests cover v39 roundtrip,
+owned materialization, current-SPIR-V substitution, missing-source fallback, malformed state, and pre-v39
+compatibility. This makes a fresh capture an honest stored-portable versus current-live A/B for the remaining
+Plucky compute work.
+
+A fresh targeted v39 capsule of submit 7 then retained raw state for all 27 realized dispatches. The current
+replay rebuilt all 27 on the Radeon device (`device-formats=0x3ff`), and both generated BMPs were byte-identical
+(`sha256 9e2733eda3327c11ae662cd59708b9d5b344fa59f2b694009c9854755a59745e`). For `0x30180d0000`
+binding 30, validated SPIR-V changed from a `%uint` portable storage image to a `%float` native storage image;
+staging fell from 132,710,400 to 66,355,200 bytes and setup from 68.69 ms to 53.77 ms. The same A/B exposed a
+larger aggregate win in the `0x30194e0000` mip dispatch: 49.10 ms to 32.74 ms. The single-submit replay still
+selects a 512x512 fallback instead of the capture's 3840x2160 live oracle because this early endpoint has no RTT
+seed window, so the equal BMPs are deterministic stored/current regression evidence, not a claim that this
+capsule reproduces the complete live frame. A rolling producer window remains the next correctness oracle.
+
 ## Next renderer step
 
-Capture a fresh v38 rolling temporal window on current code around the Plucky title/gameplay transition. It
+Capture a fresh v39 rolling temporal window on current code around the Plucky title/gameplay transition. It
 must include the producers for the two 48x48 volumes and close with zero unresolved leaves, providing a native
 pixel oracle as well as exact compute pipeline contracts. Keep the exact-byte and disable-switch A/B
 discipline used here, and preserve screenshot/capture correctness while reducing the synchronous boundaries.

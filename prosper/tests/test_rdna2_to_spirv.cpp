@@ -651,7 +651,7 @@ int main() {
         0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u,
         0x7d840100u, 0xbf870001u, 0xbf82fffdu,
         0xbefc0380u,                          // s_mov_b32 m0, 0
-        0xd8fa0008u, 0x03000000u,           // ds_append v3 offset:8
+        0xd8f80008u, 0x03000000u,           // ds_append v3 offset:8 (LDS)
         0x7e060d03u, 0xbf810000u,
     };
     std::vector<uint32_t> spv17f = recompile_valu(
@@ -1740,11 +1740,42 @@ int main() {
         compute_gds_write, std::size(compute_gds_write), &compute_gds_table,
         compute_gds_config);
     CHECK(!compute_gds_spv.empty(), "compute GDS ds_write_b32 recompiles to SPIR-V");
-    CHECK(validate_spirv_descriptor_interface(
-              compute_gds_spv, &compute_gds_table, 0, SpirvShaderStage::Compute, false).ok(),
-          "compute GDS module binds the persistent backend-owned buffer");
+    const DescriptorValidationReport compute_gds_report = validate_spirv_descriptor_interface(
+        compute_gds_spv, &compute_gds_table, 0, SpirvShaderStage::Compute, false);
+    const SpirvDescriptorBinding* compute_gds_binding = find_spirv_descriptor_binding(
+        compute_gds_report, 0, kComputeInternalGdsBinding);
+    CHECK(compute_gds_report.ok() && compute_gds_binding &&
+              compute_gds_binding->kind == SpirvDescriptorKind::StorageBuffer &&
+              compute_gds_binding->writable,
+          "compute GDS module reflects its writable persistent storage-buffer binding");
 
-    // Kernel 32b5: Astro's exact DS_APPEND word. Initialize the LDS counter to 10, narrow EXEC to
+    // Astro Bot's indirect-argument producer uses device-global append counters. Routing this exact
+    // GDS form through workgroup LDS made every dispatch begin with undefined counter values and
+    // produced random indirect counts. The descriptor contract proves the append targets the
+    // persistent backend-owned GDS buffer rather than a Workgroup array.
+    const uint32_t compute_gds_append[] = {
+        0xbefc0380u,              // s_mov_b32 m0, 0
+        0xd8fa0010u, 0x00000000u, // ds_append v0 offset:16 gds
+        0xbf810000u,
+    };
+    std::vector<uint32_t> compute_gds_append_spv = recompile_compute(
+        compute_gds_append, std::size(compute_gds_append), &compute_gds_table,
+        compute_gds_config);
+    CHECK(!compute_gds_append_spv.empty(),
+          "compute GDS ds_append recompiles to SPIR-V");
+    const DescriptorValidationReport compute_gds_append_report =
+        validate_spirv_descriptor_interface(
+            compute_gds_append_spv, &compute_gds_table, 0,
+            SpirvShaderStage::Compute, false);
+    const SpirvDescriptorBinding* compute_gds_append_binding = find_spirv_descriptor_binding(
+        compute_gds_append_report, 0, kComputeInternalGdsBinding);
+    CHECK(compute_gds_append_report.ok() && compute_gds_append_binding &&
+              compute_gds_append_binding->kind == SpirvDescriptorKind::StorageBuffer &&
+              compute_gds_append_binding->readable && compute_gds_append_binding->writable &&
+              compute_gds_append_binding->atomic_access,
+          "compute GDS ds_append reflects a read/write atomic persistent buffer contract");
+
+    // Kernel 32b5: ordinary LDS DS_APPEND. Initialize the LDS counter to 10, narrow EXEC to
     // the first 32 lanes, then append. Hardware performs one atomic +32 and broadcasts old=10 only
     // to active lanes; inactive lanes preserve their old v8=99. Reading the new counter (42) makes
     // both effects observable: active output=52, inactive output=141.
@@ -1757,13 +1788,13 @@ int main() {
         0xd8340010u, 0x00000203u,  // ds_write_b32 v3, v2 offset:0x10
         0xbefe04c1u, 0xbf8a0000u,  // restore EXEC; barrier
         0x7e0202a0u, 0x7da20300u,  // v1=32; v_cmpx_lt_u32 v0,v1
-        0xd8fa0010u, 0x08000000u,  // live: ds_append v8 offset:0x10
+        0xd8f80010u, 0x08000000u,  // ds_append v8 offset:0x10 (LDS)
         0xbefe04c1u, 0xbf8a0000u,  // restore EXEC; barrier
         0xd8d80010u, 0x09000003u,  // ds_read_b32 v9, v3 offset:0x10
         0x7e100d08u, 0x7e120d09u, 0x06101308u, 0xbf810000u,
     };
     std::vector<uint32_t> spv32b5 = recompile_valu(code32b5, std::size(code32b5), 1, 8);
-    CHECK(!spv32b5.empty(), "recompiled kernel 32b5 (Astro DS_APPEND word) -> SPIR-V");
+    CHECK(!spv32b5.empty(), "recompiled kernel 32b5 (LDS DS_APPEND word) -> SPIR-V");
     std::vector<float> in32b5(WG); for (uint32_t i = 0; i < WG; ++i) in32b5[i] = (float)i;
     std::vector<float> got32b5 = prosper::test::run_compute(spv32b5, in32b5, WG, WG);
     uint32_t bad32b5 = 0;
@@ -1780,7 +1811,7 @@ int main() {
     CHECK(got32b5.size()==WG && bad32b5==0,
           "kernel 32b5 atomically adds popcount(EXEC), broadcasts old counter, and predicates VDST");
 
-    // Kernel 32b6: Astro's exact DS_CONSUME word is the inverse operation. Start at 50, make the
+    // Kernel 32b6: ordinary LDS DS_CONSUME is the inverse operation. Start at 50, make the
     // first 16 lanes valid, and consume once. Active lanes observe old=50 and all lanes read the new
     // counter=34, while inactive lanes preserve their fallback destination value of 99.
     const uint32_t code32b6[] = {
@@ -1793,14 +1824,14 @@ int main() {
         0xd8340004u, 0x00000203u,            // ds_write_b32 v3, v2 offset:4
         0xbefe04c1u, 0xbf8a0000u,            // restore EXEC; barrier
         0x7e020290u, 0x7da20300u,            // v1=16; v_cmpx_lt_u32 v0,v1
-        0xd8f60004u, 0x0c000000u,            // live: ds_consume v12 offset:4
+        0xd8f40004u, 0x0c000000u,            // ds_consume v12 offset:4 (LDS)
         0xbefe04c1u, 0xbf8a0000u,            // restore EXEC; barrier
         0xd8d80004u, 0x0d000003u,            // ds_read_b32 v13, v3 offset:4
         0x7e180d0cu, 0x7e1a0d0du,            // uint -> float
         0x06181b0cu, 0xbf810000u,             // v12 += v13; end
     };
     std::vector<uint32_t> spv32b6 = recompile_valu(code32b6, std::size(code32b6), 1, 12);
-    CHECK(!spv32b6.empty(), "recompiled kernel 32b6 (Astro DS_CONSUME word) -> SPIR-V");
+    CHECK(!spv32b6.empty(), "recompiled kernel 32b6 (LDS DS_CONSUME word) -> SPIR-V");
     std::vector<float> got32b6 = prosper::test::run_compute(spv32b6, in32b5, WG, WG);
     uint32_t bad32b6 = 0;
     for (uint32_t i = 0; i < WG && got32b6.size() == WG; ++i) {
@@ -2388,6 +2419,46 @@ int main() {
     printf("  kernel43 mismatches=%u (out[5]=%g expect=10)\n", bad43, got43.size()==N?got43[5]:-1);
     CHECK(got43.size()==N && bad43==0, "recompiled kernel 43 (counted loop sum 0..4) computes 10");
 
+    // Kernel 43a: one ordinary uniform if immediately before a counted loop. Astro Bot's NGG culling
+    // shader uses this composition in its setup; the two constructs were individually supported, but
+    // the counted-loop prelude previously admitted only if/else. Exercise both PHI inputs by changing
+    // the constant comparison: the taken form seeds sum=7, while the skipped form retains sum=0.
+    const uint32_t code43a_taken[] = {
+        0xBE800383u, 0xBE810385u, 0xBF0A0100u, 0x7E020280u, 0xBF840001u, 0x7E020287u,
+        0xB0020005u, 0xBE800380u, 0xBF0A0200u, 0xBF840003u, 0x4A020200u, 0x81008100u,
+        0xBF82FFFBu, 0x7E000D01u, 0xBF810000u,
+    };
+    const uint32_t code43a_skipped[] = {
+        0xBE800385u, 0xBE810383u, 0xBF0A0100u, 0x7E020280u, 0xBF840001u, 0x7E020287u,
+        0xB0020005u, 0xBE800380u, 0xBF0A0200u, 0xBF840003u, 0x4A020200u, 0x81008100u,
+        0xBF82FFFBu, 0x7E000D01u, 0xBF810000u,
+    };
+    const auto spv43a_taken = recompile_valu(
+        code43a_taken, std::size(code43a_taken), 0, 0);
+    const auto spv43a_skipped = recompile_valu(
+        code43a_skipped, std::size(code43a_skipped), 0, 0);
+    CHECK(!spv43a_taken.empty() && !spv43a_skipped.empty(),
+          "recompiled kernel 43a (one-arm pre-loop if + counted loop) -> SPIR-V");
+    const auto got43a_taken = prosper::test::run_compute(spv43a_taken, in43, N, N);
+    const auto got43a_skipped = prosper::test::run_compute(spv43a_skipped, in43, N, N);
+    uint32_t bad43a = 0;
+    for (uint32_t i = 0; i < N && got43a_taken.size() == N && got43a_skipped.size() == N; ++i)
+        if (got43a_taken[i] != 17.0f || got43a_skipped[i] != 10.0f) ++bad43a;
+    CHECK(got43a_taken.size() == N && got43a_skipped.size() == N && bad43a == 0,
+          "kernel 43a merges taken/skipped pre-loop values into the counted loop exactly");
+
+    // Kernel 43b: a pre-loop conditional that jumps over the complete counted loop to s_endpgm.
+    // The prelude CFG scan uses the loop header as an artificial end marker, so it must preserve the
+    // early-out classification and reject rather than silently execute the loop on both outcomes.
+    const uint32_t code43b[] = {
+        0xBE800385u, 0xBE810383u, 0xBF0A0100u, 0xBF840009u, 0xB0020005u,
+        0xBE800380u, 0x7E020280u, 0xBF0A0200u, 0xBF840003u, 0x4A020200u,
+        0x81008100u, 0xBF82FFFBu, 0x7E000D01u, 0xBF810000u,
+    };
+    const auto spv43b = recompile_valu(code43b, std::size(code43b), 0, 0);
+    CHECK(spv43b.empty(),
+          "kernel 43b rejects a pre-loop early-out that skips the counted loop");
+
     // Kernel 44: a value advanced in the CONDITION region and read after the loop. s0 is incremented by
     //   10 at the header (which runs on the exiting iteration too), so hardware yields 40, not the phi's
     //   back-edge value 30. Regression guard for the condition-region-vs-body merge-value distinction.
@@ -2871,6 +2942,21 @@ int main() {
     printf("  kernel63 mismatches=%u (out[5]=%g exp=%g out[70]=%g exp=%g)\n", bad63,
            got63.size()==N?got63[5]:-1, exp63[5], got63.size()==N?got63[70]:-1, exp63[70]);
     CHECK(got63.size()==N && bad63==0, "recompiled kernel 63 (v_mbcnt full-exec = localid) correct");
+
+    ComputeShaderConfig native_cfg63;
+    native_cfg63.local_x = 8;
+    native_cfg63.local_y = 8;
+    native_cfg63.wave_size = 64;
+    native_cfg63.native_subgroup_size = 64;
+    const std::vector<uint32_t> native_spv63 = recompile_compute(
+        code63, std::size(code63), nullptr, native_cfg63);
+    CHECK(compute_shader_prefers_native_multiwave(code63, std::size(code63)) &&
+              !compute_shader_prefers_native_multiwave(code62, std::size(code62)),
+          "multi-wave policy recognizes scan-heavy shaders without title-specific identity");
+    CHECK(!native_spv63.empty() && count_spirv_opcode(native_spv63, 349) == 2,
+          "straight-line exact-wave MBCNT lowers both halves to subgroup scans");
+    CHECK(count_spirv_opcode(native_spv63, 224) == 0,
+          "straight-line exact-wave MBCNT emits no workgroup control barrier");
 
     // Kernel 64: v_mbcnt with DIVERGENT exec — the real compaction use. v_cmpx narrows exec to (a>thr);
     // then mbcnt gives each active lane its index among active lanes. Even lanes active (a=1>0.5), odd
@@ -4876,6 +4962,20 @@ int main() {
         CHECK(gotStructuredWave.size() == 128 && badStructuredWave == 0,
               "#1373: structured branch performs one exact 64-lane guest-wave vote");
 
+        ComputeShaderConfig nativeStructuredWaveConfig;
+        nativeStructuredWaveConfig.local_x = 8;
+        nativeStructuredWaveConfig.local_y = 8;
+        nativeStructuredWaveConfig.wave_size = 64;
+        nativeStructuredWaveConfig.native_subgroup_size = 64;
+        const std::vector<uint32_t> nativeStructuredWaveSpv = recompile_compute(
+            structured_wave_cs, std::size(structured_wave_cs), nullptr,
+            nativeStructuredWaveConfig);
+        CHECK(!nativeStructuredWaveSpv.empty() &&
+                  count_spirv_opcode(nativeStructuredWaveSpv, 335) >= 1,
+              "structured exact-wave branch lowers its vote to subgroup-any");
+        CHECK(count_spirv_opcode(nativeStructuredWaveSpv, 224) == 1,
+              "structured exact-wave branch retains only its guest workgroup barrier");
+
         // UE4 reduction kernels also use sequential top-level EXEC tests separated by workgroup
         // barriers, with no loop in the shader. A scalar write in each arm makes the result visible
         // to every invocation in the complete guest wave, not merely the host subgroup containing
@@ -4915,6 +5015,80 @@ int main() {
             if (gotBarrierReduction[i] != expBarrierReduction[i]) ++badBarrierReduction;
         CHECK(gotBarrierReduction.size() == 128 && badBarrierReduction == 0,
               "barrier-separated reductions perform independent exact 64-lane guest-wave votes");
+
+        // The automatic multi-wave policy must follow translated structure, not raw opcode counts.
+        // Four valid sequential top-level wave votes each cost two synchronized scratch barriers in
+        // portable lowering and none in exact-subgroup lowering. The two-vote kernel above remains
+        // below the conservative threshold.
+        const uint32_t vote_heavy_policy_cs[] = {
+            0xBE800380u,               //  0: s_mov_b32 s0, 0
+            0xBE810380u,               //  1: s_mov_b32 s1, 0
+            0x7DA20200u,               //  2: v_cmpx_lt_u32 exec, s0, v1
+            0xBF880001u,               //  3: s_cbranch_execz +1 -> 5
+            0xBE800381u,               //  4: s_mov_b32 s0, 1
+            0xBEFE04C1u,               //  5: s_mov_b64 exec, -1
+            0xBF8A0000u,               //  6: s_barrier
+            0x7DA20600u,               //  7: v_cmpx_lt_u32 exec, s0, v3
+            0xBF880001u,               //  8: s_cbranch_execz +1 -> 10
+            0xBE810382u,               //  9: s_mov_b32 s1, 2
+            0xBEFE04C1u,               // 10: s_mov_b64 exec, -1
+            0xBF8A0000u,               // 11: s_barrier
+            0x7DA20200u,               // 12: v_cmpx_lt_u32 exec, s0, v1
+            0xBF880001u,               // 13: s_cbranch_execz +1 -> 15
+            0xBE800383u,               // 14: s_mov_b32 s0, 3
+            0xBEFE04C1u,               // 15: s_mov_b64 exec, -1
+            0xBF8A0000u,               // 16: s_barrier
+            0x7DA20600u,               // 17: v_cmpx_lt_u32 exec, s0, v3
+            0xBF880001u,               // 18: s_cbranch_execz +1 -> 20
+            0xBE810384u,               // 19: s_mov_b32 s1, 4
+            0xBEFE04C1u,               // 20: s_mov_b64 exec, -1
+            0xBF8A0000u,               // 21: s_barrier
+            0x80020100u,               // 22: s_add_u32 s2, s0, s1
+            0x7E040C02u,               // 23: v_cvt_f32_u32 v2, s2
+            0xBF810000u,               // 24: s_endpgm
+        };
+        ComputeShaderConfig portableVotePolicyConfig;
+        portableVotePolicyConfig.local_x = 8;
+        portableVotePolicyConfig.local_y = 8;
+        portableVotePolicyConfig.wave_size = 64;
+        ComputeShaderConfig nativeVotePolicyConfig = portableVotePolicyConfig;
+        nativeVotePolicyConfig.native_subgroup_size = 64;
+        const std::vector<uint32_t> portableVotePolicySpv = recompile_compute(
+            vote_heavy_policy_cs, std::size(vote_heavy_policy_cs), nullptr,
+            portableVotePolicyConfig);
+        const std::vector<uint32_t> nativeVotePolicySpv = recompile_compute(
+            vote_heavy_policy_cs, std::size(vote_heavy_policy_cs), nullptr,
+            nativeVotePolicyConfig);
+        const uint32_t linearized_vote_policy_cs[] = {
+            0xBF8A0000u,               //  0: s_barrier (uniform, before all guarded work)
+            0x7DA20200u,               //  1: v_cmpx_lt_u32 exec, s0, v1
+            0xBF880007u,               //  2: s_cbranch_execz +7 -> 10 (safe guard to end)
+            0x7DA20200u,               //  3: v_cmpx_lt_u32 exec, s0, v1
+            0xBF880005u,               //  4: s_cbranch_execz +5 -> 10 (safe guard to end)
+            0x7DA20200u,               //  5: v_cmpx_lt_u32 exec, s0, v1
+            0xBF880003u,               //  6: s_cbranch_execz +3 -> 10 (safe guard to end)
+            0x7DA20200u,               //  7: v_cmpx_lt_u32 exec, s0, v1
+            0xBF880001u,               //  8: s_cbranch_execz +1 -> 10 (safe guard to end)
+            0x7E040C00u,               //  9: v_cvt_f32_u32 v2, s0
+            0xBF810000u,               // 10: s_endpgm
+        };
+        const std::vector<uint32_t> linearizedVotePolicySpv = recompile_compute(
+            linearized_vote_policy_cs, std::size(linearized_vote_policy_cs), nullptr,
+            portableVotePolicyConfig);
+        CHECK(compute_shader_prefers_native_multiwave(
+                  vote_heavy_policy_cs, std::size(vote_heavy_policy_cs)) &&
+                  !compute_shader_prefers_native_multiwave(
+                      barrier_reduction_cs, std::size(barrier_reduction_cs)) &&
+                  !compute_shader_prefers_native_multiwave(
+                      linearized_vote_policy_cs, std::size(linearized_vote_policy_cs)),
+              "multi-wave vote policy counts accepted structured wave branches");
+        CHECK(!portableVotePolicySpv.empty() && !nativeVotePolicySpv.empty() &&
+                  count_spirv_opcode(portableVotePolicySpv, 224) ==
+                      count_spirv_opcode(nativeVotePolicySpv, 224) + 8,
+              "multi-wave vote policy proves exact lowering removes eight scratch barriers");
+        CHECK(!linearizedVotePolicySpv.empty() &&
+                  count_spirv_opcode(linearizedVotePolicySpv, 224) == 1,
+              "raw branch density alone does not opt a linearized shader into multi-wave mode");
 
         std::vector<uint32_t> divergentBarrierStructuredWave(
             std::begin(structured_wave_cs), std::end(structured_wave_cs));

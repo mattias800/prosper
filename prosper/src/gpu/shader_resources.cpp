@@ -270,6 +270,7 @@ struct TypeInfo {
     uint32_t width = 0;
     uint32_t storage = 0;
     uint32_t image_sampled = 0;
+    uint32_t image_format = 0;
     uint32_t image_dim = 0xFFFFFFFFu;
     bool image_arrayed = false;
     bool image_depth = false;
@@ -367,10 +368,10 @@ const TypeInfo* descriptor_image_type(const VariableInfo& var,
     return nullptr;
 }
 
-bool descriptor_storage_float(const VariableInfo& var,
-                              const std::unordered_map<uint32_t, TypeInfo>& types) {
+bool descriptor_image_float(const VariableInfo& var,
+                            const std::unordered_map<uint32_t, TypeInfo>& types) {
     const TypeInfo* image = descriptor_image_type(var, types);
-    if (!image || image->image_sampled != 2) return false;
+    if (!image) return false;
     const auto sampled_type = types.find(image->element);
     return sampled_type != types.end() &&
            sampled_type->second.kind == TypeKind::Scalar &&
@@ -541,6 +542,7 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
                     t.image_arrayed = word(in, 4) != 0;
                     t.image_multisampled = word(in, 5) != 0;
                     t.image_sampled = word(in, 6);
+                    t.image_format = word(in, 7);
                     types[word(in, 0)] = t;
                 }
                 break;
@@ -588,14 +590,18 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     }
 
     std::unordered_map<uint32_t, SpirvDescriptorKind> descriptor_vars;
+    std::set<uint32_t> sampled_float_vars;
     std::set<uint32_t> storage_float_vars;
     for (const auto& [id, var] : variables) {
         SpirvDescriptorKind kind = descriptor_kind(var, types);
         if (kind != SpirvDescriptorKind::Unknown) {
             descriptor_vars[id] = kind;
-            if (kind == SpirvDescriptorKind::StorageImage &&
-                descriptor_storage_float(var, types))
-                storage_float_vars.insert(id);
+            if (descriptor_image_float(var, types)) {
+                if (kind == SpirvDescriptorKind::CombinedImageSampler)
+                    sampled_float_vars.insert(id);
+                else if (kind == SpirvDescriptorKind::StorageImage)
+                    storage_float_vars.insert(id);
+            }
         }
     }
 
@@ -692,9 +698,9 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
             // OpImageSample* (87..94) and Gather/DrefGather (96..97) consume normalized sampler
             // coordinates. OpImageFetch (95) and OpImageRead (98) consume integer texel coordinates
             // and therefore cannot observe a reduced render target as if it had the native extent.
-            mark_image_coordinate_contract(
-                word(in, 2), (in.opcode >= 87u && in.opcode <= 94u) ||
-                                 in.opcode == 96u || in.opcode == 97u);
+            const bool normalized = (in.opcode >= 87u && in.opcode <= 94u) ||
+                                    in.opcode == 96u || in.opcode == 97u;
+            mark_image_coordinate_contract(word(in, 2), normalized);
         } else if (in.opcode == 99u /* OpImageWrite */ && n >= 1) {
             mark_image(word(in, 0), false, true);
         } else if (in.opcode == 100u /* OpImage */ && n >= 3) {
@@ -757,12 +763,14 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         auto si = sets.find(var), bi = bindings.find(var);
         if (si == sets.end() || bi == bindings.end()) { add_malformed(report); continue; }
         uint32_t image_dim = UINT32_MAX;
+        uint32_t image_format = 0;
         bool image_arrayed = false, image_multisampled = false, image_depth = false;
         auto vi = variables.find(var);
         const TypeInfo* image = vi == variables.end()
             ? nullptr : descriptor_image_type(vi->second, types);
         if (image) {
             image_dim = image->image_dim;
+            image_format = image->image_format;
             image_arrayed = image->image_arrayed;
             image_multisampled = image->image_multisampled;
             image_depth = image->image_depth;
@@ -772,7 +780,8 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
                                       written_vars.count(var) != 0,
                                       normalized_sample_vars.count(var) != 0,
                                       texel_access_vars.count(var) != 0,
-                                      storage_float_vars.count(var) != 0, image_dim,
+                                      sampled_float_vars.count(var) != 0,
+                                      storage_float_vars.count(var) != 0, image_format, image_dim,
                                       image_arrayed, image_multisampled, image_depth,
                                       atomic_vars.count(var) != 0});
     }

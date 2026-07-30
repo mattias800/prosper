@@ -124,6 +124,12 @@ struct GpuCapturedCompute {
     // v37: exact VkPipeline required-subgroup/full-subgroups contract used by the stored module.
     // Zero retains the historical portable shader path.
     uint32_t required_subgroup_size = 0;
+    // v39: source and semantic launch ABI for deterministic current-translator replay. The optional
+    // device capability fields describe the capture host; rendering intersects/replaces them with
+    // the replay device's actual capabilities before recompiling.
+    uint32_t raw_shader_index = 0xFFFFFFFFu;
+    ComputeShaderConfig recompile_config{};
+    bool recompile_config_available = false;
 };
 
 struct GpuCapturedOperation {
@@ -354,6 +360,11 @@ const char* realization_failure_reason_name(RealizationFailureReason reason);
 // submit. MIN_DRAWS/MAX_DRAWS, COMPUTE_ADDR, SHADER_ADDR, and TARGET_DIM select a candidate class;
 // PROSPER_GPU_CAPTURE_AT=N then selects the zero-based matching invocation (default first match).
 struct PendingGpuCapture {
+    struct MemorySnapshot {
+        uint64_t guest_addr = 0;
+        size_t bytes_read = 0;
+        std::vector<uint8_t> bytes;
+    };
     std::string path;
     GpuCaptureFile capture;
     // Hand-built pending captures used by tests/tools already carry a complete capture. Runtime
@@ -362,7 +373,14 @@ struct PendingGpuCapture {
     bool output_triggered = false;
     size_t output_min_nonzero = 0;
     size_t output_max_nonzero = 0;
+    // Deferred captures finish after ordered producers have mutated memory. Preserve the known
+    // pre-submit DMA endpoints and backend-owned GDS here, then combine them with the exact
+    // post-producer operation realization during finish.
+    std::vector<MemorySnapshot> pre_submit_memory;
+    std::vector<uint8_t> pre_submit_compute_gds;
 };
+void snapshot_pending_gpu_capture_compute_gds(PendingGpuCapture* pending,
+                                              const uint8_t* data, size_t bytes);
 std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     const std::vector<DrawItem>& draws, const std::vector<ComputeItem>& computes,
     const std::vector<SubmitOperation>& operations, uint32_t width, uint32_t height,
