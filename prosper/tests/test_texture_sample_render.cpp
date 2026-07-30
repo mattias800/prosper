@@ -353,6 +353,39 @@ int main() {
                   borrowed_followup == cpu_roundtrip,
               "borrowed compute-image sampling preserves pixels, owner layout, and image lifetime");
 
+        // A live renderer span can retain resources while later target passes are still being
+        // recorded into the same queue batch. Drop every caller-owned lease reference before the
+        // fence: only the backend cleanup scope may keep the borrowed VkImage pinned at that point.
+        bool pending_lease_released = false;
+        prosper::test::FrameResource pending_borrow = borrowed_resource;
+        pending_borrow.borrowed_compute_image_lease = std::shared_ptr<void>(
+            new int(1), [&](void* allocation) {
+                pending_lease_released = true;
+                delete static_cast<int*>(allocation);
+            });
+        prosper::test::BackendDraw pending_sample = cpu_sample;
+        pending_sample.R = {pending_borrow};
+        constexpr uint64_t pending_target_id = 0x7590000000000002ull;
+        prosper::test::BackendColorTarget pending_target{
+            pending_target_id, false, false};
+        prosper::test::BackendSubmissionBatch pending_batch;
+        const std::vector<uint8_t> pending_result = prosper::test::render_draws_rgba(
+            {pending_sample}, W, H, nullptr, nullptr, false, &pending_target,
+            nullptr, nullptr, nullptr, &pending_batch, false);
+        pending_borrow.borrowed_compute_image_lease.reset();
+        pending_sample.R.clear();
+        CHECK(pending_result.empty() && pending_batch.pending() && !pending_lease_released,
+              "pending graphics submission retains the borrowed compute-image lease");
+        const prosper::test::BackendSubmissionBatchResult pending_submit =
+            pending_batch.submit_and_wait(
+                prosper::test::render_vk_ctx().dev,
+                prosper::test::render_vk_ctx().queue, false);
+        pending_batch.complete();
+        CHECK(pending_submit.submit_result == VK_SUCCESS &&
+                  pending_submit.wait_result == VK_SUCCESS && pending_lease_released,
+              "borrowed compute-image lease releases only after graphics completion");
+        prosper::test::invalidate_persistent_color_target(pending_target_id);
+
         // Multiple ordered target calls may record into one queue submission. The producer returns no
         // CPU pixels; the consumer samples that not-yet-submitted target, then its requested readback
         // flushes both command buffers behind one fence.

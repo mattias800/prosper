@@ -1355,6 +1355,14 @@ progression difference is supporting evidence rather than a standalone FPS claim
 this temporal residency boundary because replay resources intentionally own `host_data`; the production tests,
 live disable switch, and the unchanged replay fallback divide that verification responsibility explicitly.
 
+After merging current master, a fresh 140-second exact-head A/B repeated the result with identical build,
+route, full-resolution, audio, input, and timing settings. The enabled run logged 250 direct decisions,
+including a 3840x2160 RGBA16F result at 0.09 ms, and reached 2,220 presents; the single-switch disabled run
+logged no direct decisions and reached 2,040. Their final 25-submit texture-resource windows were 6.45 ms and
+10.62 ms respectively. Both native 3840x2160 checkpoints were visually clean. They armed at the same guest
+present (1,058) but asynchronous readback completed on different later presents and captured different menu
+states, so they remain independent correctness/progression evidence rather than a pixel-equality oracle.
+
 ## Next renderer step
 
 Capture a fresh v38 rolling temporal window on current code around the Plucky title/gameplay transition. It

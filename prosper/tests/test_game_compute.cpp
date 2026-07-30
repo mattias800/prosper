@@ -1868,6 +1868,30 @@ int main() {
                           compute_import.height == 1 && compute_import.depth == 1 &&
                           compute_import.native_format && compute_import.layout,
                       "validated typed-storage result can be leased by an exact sampled descriptor");
+                prosper::frontend::LiveComputeImageImport rejected_import;
+                ShaderResource mismatched_fill = sampled_fill;
+                ++mismatched_fill.width;
+                const bool rejected_extent =
+                    !prosper::frontend::import_live_compute_storage_image(
+                        mismatched_fill, import_dst.size, rejected_import);
+                mismatched_fill = sampled_fill;
+                ++mismatched_fill.tile_mode;
+                const bool rejected_layout =
+                    !prosper::frontend::import_live_compute_storage_image(
+                        mismatched_fill, import_dst.size, rejected_import);
+                mismatched_fill = sampled_fill;
+                mismatched_fill.host_data = import_guest;
+                mismatched_fill.host_data_size = import_dst.size;
+                const bool rejected_replay =
+                    !prosper::frontend::import_live_compute_storage_image(
+                        mismatched_fill, import_dst.size, rejected_import);
+                mismatched_fill = sampled_fill;
+                mismatched_fill.srgb = true;
+                const bool rejected_srgb =
+                    !prosper::frontend::import_live_compute_storage_image(
+                        mismatched_fill, import_dst.size, rejected_import);
+                CHECK(rejected_extent && rejected_layout && rejected_replay && rejected_srgb,
+                      "compute-image import requires full identity and keeps replay/sRGB fallback");
                 compute_import = {};
                 // This binary does not install the emulator's SIGSEGV write-fault handler. Mark the
                 // same page dirty through the DMA/GPU side of the watch API; the importer must not
