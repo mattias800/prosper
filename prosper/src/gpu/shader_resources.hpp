@@ -341,6 +341,10 @@ enum class SpirvShaderStage : uint32_t {
     Unknown = 0xFFFFFFFFu,
 };
 
+// SPIR-V Image Format operand used by the exact one-word storage fallback. Keep this public so the
+// recompiler, reflection, live backend, and their contract tests cannot drift through magic values.
+constexpr uint32_t kSpirvImageFormatR32ui = 33;
+
 struct SpirvDescriptorBinding {
     uint32_t variable_id = 0;
     uint32_t set = 0;
@@ -364,6 +368,9 @@ struct SpirvDescriptorBinding {
     // Storage-image sampled type encoded by SPIR-V. This is the backend's authoritative choice
     // between a native float VkFormat and the portable raw-uvec4 conversion path, including replay.
     bool storage_float = false;
+    // Raw SPIR-V Image Format operand. Format=R32ui distinguishes exact single-word storage
+    // fallbacks from the wider formatless uvec4 contract during offline replay.
+    uint32_t storage_image_format = 0;
     // Exact OpTypeImage shape. Backends use this instead of guessing from the guest T#: a DIM=5
     // packet may deliberately compile either as the historical base-slice 2D fallback or as a real
     // 2D-array image whose layer coordinate must match a VK_IMAGE_VIEW_TYPE_2D_ARRAY view. It also

@@ -217,6 +217,10 @@ struct ComputeShaderConfig {
     // frontend. Offline callers default to the portable raw path; live execution supplies the exact
     // physical-device mask so unsupported typed formats compile to the raw uvec4 fallback.
     uint32_t native_storage_format_support = 0;
+    // Use an exact typed R32_UINT storage image for R11G11B10 when the device cannot store that
+    // packed float format natively. The generated shader packs/unpacks the guest word in SPIR-V,
+    // avoiding the portable but much wider RGBA32_UINT CPU-conversion interchange format.
+    bool packed_r11_storage = true;
 };
 
 // Translate a game compute program without the synthetic binding-0 input / binding-1 output used by

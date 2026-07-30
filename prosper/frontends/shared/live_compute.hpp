@@ -49,11 +49,11 @@ void storage_pack_float16x4_range(const uint32_t* channels, size_t texels, uint8
 // A typed Vulkan storage image already exposes the guest format as exact row-major bytes. For a
 // tiled guest surface the tiler can therefore read the mapped staging image directly, unless a
 // poison-proving dispatch still needs a mutable linear copy to restore untouched texels.
-constexpr bool storage_writeback_can_tile_mapped_bytes(bool native_float_storage,
+constexpr bool storage_writeback_can_tile_mapped_bytes(bool exact_storage_bytes,
                                                        uint32_t tile_mode,
                                                        bool poison_verify,
                                                        bool disabled) {
-    return native_float_storage && tile_mode != 0 && !poison_verify && !disabled;
+    return exact_storage_bytes && tile_mode != 0 && !poison_verify && !disabled;
 }
 
 // Whether a sampled guest view can bind a renderer-owned target without a CPU readback/conversion.
