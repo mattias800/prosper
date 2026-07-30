@@ -376,6 +376,14 @@ int main() {
                                0x2 /* RW */, 0, source_name, 0) == 0 && source_va,
               "persistent BC test maps guest-readable source memory");
         if (source_va) {
+            auto mapped_reader = [&](uint64_t addr, uint8_t* dst, size_t bytes) -> size_t {
+                if (addr < source_va) return 0;
+                const uint64_t offset = addr - source_va;
+                if (offset > source_mapping_size || bytes > source_mapping_size - offset)
+                    return 0;
+                std::memcpy(dst, reinterpret_cast<const void*>(addr), bytes);
+                return bytes;
+            };
             const uint8_t bc3_red[16] = {
                 0xff, 0x00, 0x88, 0xc6, 0xfa, 0x88, 0xc6, 0xfa,
                 0x00, 0xf8, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -496,7 +504,7 @@ int main() {
             array_resource.depth = 4;
             array_resource.layer_stride_bytes = 0x1000;
             array_resource.layer_mip_offset_bytes = 0x100;
-            array_resource.linear_row_pitch_bytes = array_row_pitch;
+            array_resource.linear_row_pitch_bytes = 0;
             array_draw.prt = std::move(array_table);
 
             const std::vector<uint8_t> first_array =
@@ -523,6 +531,145 @@ int main() {
                   "unchanged 2D-array base slice reuses its decoded and uploaded image");
             CHECK(!first_array.empty() && first_array == reused_array,
                   "2D-array base-slice cache preserves the selected pixels");
+
+            GpuCaptureFile array_capture;
+            error.clear();
+            const bool array_captured = capture_draw_items(
+                {array_draw}, meta, mapped_reader, array_capture, error);
+            CHECK(array_captured &&
+                      array_capture.draws[0].prt.resources[0]
+                              .resource.linear_row_pitch_bytes == array_row_pitch,
+                  "capture derives the aligned row pitch from a normal dim-5 descriptor");
+            GpuReplayFrame array_replay;
+            const bool array_materialized = array_captured &&
+                materialize_gpu_replay(array_capture, array_replay, error);
+            const std::vector<uint8_t> replayed_array = array_materialized
+                ? render_submit_items(array_replay.items, W, H) : std::vector<uint8_t>{};
+            CHECK(array_materialized &&
+                      array_replay.items[0].prt->resources[0].linear_row_pitch_bytes ==
+                          array_row_pitch &&
+                      replayed_array == first_array,
+                  "captured dim-5 base slice replays the same padded selected rows");
+
+            // BC levels apply the same row alignment to their block grid. Keep the two useful
+            // 32-byte rows 256 bytes apart so a tight block copy sees zero padding instead of row 1.
+            uint8_t* bc_array_base = reinterpret_cast<uint8_t*>(source_va + 0x4000);
+            uint8_t* bc_array_selected = bc_array_base + 0x400;
+            uint8_t bc3_green[sizeof(bc3_red)];
+            std::memcpy(bc3_green, bc3_red, sizeof(bc3_red));
+            bc3_green[8] = 0xe0;
+            bc3_green[9] = 0x07;
+            for (uint32_t block = 0; block < 2; ++block) {
+                std::memcpy(bc_array_selected + block * sizeof(bc3_red),
+                            bc3_red, sizeof(bc3_red));
+                std::memcpy(bc_array_selected + array_row_pitch +
+                                block * sizeof(bc3_green),
+                            bc3_green, sizeof(bc3_green));
+            }
+            DrawItem bc_array_draw = bc_draw;
+            bc_array_draw.color0_base = 0xda0000;
+            auto bc_array_table =
+                std::make_shared<ShaderResourceTable>(*bc_array_draw.prt);
+            ShaderResource& bc_array_resource = bc_array_table->resources[0];
+            bc_array_resource.gpu_addr = reinterpret_cast<uint64_t>(bc_array_base);
+            bc_array_resource.size = 2u * 0x1000u;
+            bc_array_resource.width = bc_array_resource.height = 8;
+            bc_array_resource.depth = 2;
+            bc_array_resource.img_dim = 5;
+            bc_array_resource.tile_mode = 0;
+            bc_array_resource.layer_stride_bytes = 0x1000;
+            bc_array_resource.layer_mip_offset_bytes = 0x400;
+            bc_array_resource.linear_row_pitch_bytes = 0;
+            bc_array_draw.prt = std::move(bc_array_table);
+            const uint32_t ps_rdna_lower[] = {
+                0x7e0002ffu, 0x3e800000u, 0x7e0202ffu, 0x3f400000u,
+                0xf0800f08u, 0x00820000u, 0xf800000fu, 0x03020100u,
+                0xbf810000u,
+            };
+            DrawItem bc_array_lower_draw = bc_array_draw;
+            bc_array_lower_draw.color0_base = 0xdb0000;
+            bc_array_lower_draw.fs = recompile_fragment(
+                ps_rdna_lower, std::size(ps_rdna_lower), bc_array_lower_draw.prt.get());
+            const std::vector<uint8_t> first_bc_array =
+                render_submit_items({bc_array_draw}, W, H);
+            const std::vector<uint8_t> first_bc_array_lower =
+                render_submit_items({bc_array_lower_draw}, W, H);
+            const std::vector<uint8_t> reused_bc_array =
+                render_submit_items({bc_array_draw}, W, H);
+            auto pixel_at = [&](const std::vector<uint8_t>& image,
+                                uint32_t x, uint32_t y) -> const uint8_t* {
+                return image.size() != static_cast<size_t>(W) * H * 4u ? nullptr
+                    : &image[(static_cast<size_t>(y) * W + x) * 4u];
+            };
+            const auto red = [](const uint8_t* pixel) {
+                return pixel && pixel[0] > 192 && pixel[1] < 64 && pixel[2] < 64;
+            };
+            const auto green = [](const uint8_t* pixel) {
+                return pixel && pixel[0] < 64 && pixel[1] > 192 && pixel[2] < 64;
+            };
+            CHECK(!bc_array_lower_draw.fs.empty() &&
+                      red(pixel_at(first_bc_array, W / 2, H / 2)) &&
+                      green(pixel_at(first_bc_array_lower, W / 2, H / 2)) &&
+                      reused_bc_array == first_bc_array,
+                  "linear BC array decodes and caches both padded block rows");
+            GpuCaptureFile bc_array_capture;
+            error.clear();
+            const bool bc_array_captured = capture_draw_items(
+                {bc_array_lower_draw}, meta, mapped_reader, bc_array_capture, error);
+            GpuReplayFrame bc_array_replay;
+            const bool bc_array_materialized = bc_array_captured &&
+                materialize_gpu_replay(bc_array_capture, bc_array_replay, error);
+            const std::vector<uint8_t> replayed_bc_array = bc_array_materialized
+                ? render_submit_items(bc_array_replay.items, W, H) : std::vector<uint8_t>{};
+            CHECK(bc_array_materialized &&
+                      bc_array_capture.draws[0].prt.resources[0]
+                              .resource.linear_row_pitch_bytes == array_row_pitch &&
+                      replayed_bc_array == first_bc_array_lower,
+                  "captured BC array preserves its padded block-row pitch and pixels");
+
+            // A live render target at the selected nonzero mip address is authoritative over the
+            // unchanged guest bytes. Re-render it with a new color and prove the array consumer does
+            // not reuse the prior frame from the guest-keyed persistent decode cache.
+            const uint8_t producer_red[16] = {
+                255, 0, 0, 255, 255, 0, 0, 255,
+                255, 0, 0, 255, 255, 0, 0, 255,
+            };
+            const uint8_t producer_green[16] = {
+                0, 255, 0, 255, 0, 255, 0, 255,
+                0, 255, 0, 255, 0, 255, 0, 255,
+            };
+            DrawItem array_rtt_producer = replay.items[0];
+            array_rtt_producer.color0_base =
+                reinterpret_cast<uint64_t>(array_selected);
+            array_rtt_producer.color0_width = array_rtt_producer.color0_height = 2;
+            auto producer_table =
+                std::make_shared<ShaderResourceTable>(*array_rtt_producer.prt);
+            ShaderResource& producer_resource = producer_table->resources[0];
+            producer_resource.gpu_addr = 0xf10000;
+            producer_resource.host_data = const_cast<uint8_t*>(producer_red);
+            producer_resource.host_data_size = sizeof(producer_red);
+            producer_resource.size = sizeof(producer_red);
+            producer_resource.width = producer_resource.height = 2;
+            producer_resource.depth = 1;
+            producer_resource.img_dim = 1;
+            producer_resource.tile_mode = 0;
+            producer_resource.linear_row_pitch_bytes = 8;
+            producer_resource.format = DataFormat::Unorm8;
+            producer_resource.num_components = 4;
+            array_rtt_producer.prt = std::move(producer_table);
+            render_submit_items({array_rtt_producer}, W, H);
+            const std::vector<uint8_t> red_array_rtt =
+                render_submit_items({array_draw}, W, H);
+            producer_resource.host_data = const_cast<uint8_t*>(producer_green);
+            producer_resource.host_data_size = sizeof(producer_green);
+            render_submit_items({array_rtt_producer}, W, H);
+            const std::vector<uint8_t> green_array_rtt =
+                render_submit_items({array_draw}, W, H);
+            const uint8_t* red_center = pixel_at(red_array_rtt, W / 2, H / 2);
+            const uint8_t* green_center = pixel_at(green_array_rtt, W / 2, H / 2);
+            CHECK(red(red_center) && green(green_center) &&
+                      red_array_rtt != green_array_rtt,
+                  "dim-5 selected-address RTT sampling follows renderer-only pixel changes");
             CHECK(unmap(source_va, source_mapping_size, 0, 0, 0, 0) == 0,
                   "persistent BC test unmaps its guest source");
         }
