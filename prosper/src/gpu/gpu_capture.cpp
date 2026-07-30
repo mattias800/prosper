@@ -81,7 +81,10 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // required-size/full-subgroups pipeline contract used when the module was created.
 // v38: extend the existing RTT-seed color-format enum with R8_UNORM and R32_UINT. No record layout
 // changes: older versions never contain the new append-only enum values.
-constexpr uint32_t kVersion = 38;
+// v39: retain each realized compute program's raw RDNA2 stream plus its semantic launch/recompiler
+// inputs. This lets gpu_replay --recompile-raw exercise current compute translation instead of the
+// stored capture-safe SPIR-V, including native-width storage formats supported by the replay device.
+constexpr uint32_t kVersion = 39;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -911,6 +914,41 @@ bool capture_raw_shader_version(uint64_t addr, const CaptureMemoryReader& reader
     return true;
 }
 
+bool validate_compute_recompile_state(const GpuCapturedCompute& compute,
+                                      std::string& error) {
+    if (!compute.recompile_config_available) {
+        if (compute.raw_shader_index != 0xFFFFFFFFu) {
+            error = "compute raw shader has no recompile state";
+            return false;
+        }
+        return true;
+    }
+    const ComputeShaderConfig& config = compute.recompile_config;
+    constexpr uint32_t kNativeStorageFormatMask = (1u << 10) - 1u;
+    const bool subgroup_valid = config.native_subgroup_size == 0 ||
+        config.native_subgroup_size == 32 || config.native_subgroup_size == 64;
+    if ((compute.required_subgroup_size != 0 && compute.required_subgroup_size != 32 &&
+         compute.required_subgroup_size != 64) || !subgroup_valid) {
+        error = "invalid compute required-subgroup size";
+        return false;
+    }
+    if (config.user_sgprs.size() > 32 || !config.local_x || !config.local_y ||
+        !config.local_z || config.local_x != compute.launch.local_x ||
+        config.local_y != compute.launch.local_y || config.local_z != compute.launch.local_z ||
+        config.threads_x != compute.launch.threads_x ||
+        config.threads_y != compute.launch.threads_y ||
+        config.threads_z != compute.launch.threads_z ||
+        (config.wave_size != 32 && config.wave_size != 64) ||
+        config.tidig_comp_cnt > 3 || config.lds_bytes > 65536 ||
+        (config.lds_bytes & 511u) ||
+        config.native_subgroup_size != compute.required_subgroup_size ||
+        (config.native_storage_format_support & ~kNativeStorageFormatMask)) {
+        error = "invalid compute recompile state";
+        return false;
+    }
+    return true;
+}
+
 bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& error) {
     if (capture.raw_shader_versions.size() > kMaxResources ||
         capture.failure_diagnostics.size() > kMaxOperations) {
@@ -943,6 +981,15 @@ bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& er
             }
             raw_referenced[index] = true;
         }
+    }
+    for (const auto& compute : capture.computes) {
+        if (!validate_compute_recompile_state(compute, error)) return false;
+        if (compute.raw_shader_index == 0xFFFFFFFFu) continue;
+        if (compute.raw_shader_index >= capture.raw_shader_versions.size()) {
+            error = "realized compute references an invalid raw shader";
+            return false;
+        }
+        raw_referenced[compute.raw_shader_index] = true;
     }
     for (const auto& diagnostic : capture.failure_diagnostics) {
         if (diagnostic.kind > SubmitOperationKind::Dispatch ||
@@ -1257,6 +1304,12 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.submit_no = compute.submit_no;
         c.command_order = compute.command_order;
         c.required_subgroup_size = compute.required_subgroup_size;
+        c.recompile_config = compute.recompile_config;
+        c.recompile_config_available = compute.recompile_config_available;
+        if (c.recompile_config_available &&
+            !capture_raw_shader_version(compute.code_addr, reader, out, raw_shader_words,
+                                        raw_shader_index_by_address,
+                                        c.raw_shader_index, error)) return false;
         if (!capture_table(compute.resources.get(), intervals, include_resource_data,
                            c.resources, error)) return false;
         out.computes.push_back(std::move(c));
@@ -1984,6 +2037,30 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
             return false;
         }
         w.u32(compute.required_subgroup_size);
+    }
+    // v39 makes realized compute modules rebuildable. Keep this after every historical tail so
+    // lowering the version and removing this block reproduces a byte-valid v38 capsule.
+    w.u32(static_cast<uint32_t>(c.computes.size()));
+    for (const auto& compute : c.computes) {
+        if (!validate_compute_recompile_state(compute, error)) return false;
+        w.u8(compute.recompile_config_available ? 1u : 0u);
+        w.u32(compute.raw_shader_index);
+        if (!compute.recompile_config_available) continue;
+        const ComputeShaderConfig& config = compute.recompile_config;
+        w.words(config.user_sgprs);
+        w.u32(config.local_x); w.u32(config.local_y); w.u32(config.local_z);
+        w.u8(config.exact_thread_extent ? 1u : 0u);
+        w.u32(config.threads_x); w.u32(config.threads_y); w.u32(config.threads_z);
+        w.u32(config.wave_size); w.u32(config.tidig_comp_cnt);
+        const uint8_t flags = (config.tgid_x_en ? 1u : 0u) |
+                              (config.tgid_y_en ? 2u : 0u) |
+                              (config.tgid_z_en ? 4u : 0u) |
+                              (config.tg_size_en ? 8u : 0u) |
+                              (config.packed_r11_storage ? 16u : 0u);
+        w.u8(flags);
+        w.u32(config.lds_bytes);
+        w.u32(config.native_subgroup_size);
+        w.u32(config.native_storage_format_support);
     }
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
@@ -2799,6 +2876,43 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             }
         }
     }
+    if (version >= 39) {   // raw realized compute program + semantic recompile state
+        uint32_t compute_count = 0;
+        if (!r.u32(compute_count) || compute_count != c.computes.size()) {
+            error = "invalid compute recompile-state count"; return false;
+        }
+        for (auto& compute : c.computes) {
+            uint8_t available = 0;
+            if (!r.u8(available) || available > 1 || !r.u32(compute.raw_shader_index)) {
+                error = "invalid compute recompile-state availability"; return false;
+            }
+            compute.recompile_config_available = available != 0;
+            if (!compute.recompile_config_available) {
+                if (compute.raw_shader_index != 0xFFFFFFFFu) {
+                    error = "compute raw shader has no recompile state"; return false;
+                }
+                continue;
+            }
+            ComputeShaderConfig& config = compute.recompile_config;
+            uint8_t exact = 0, flags = 0;
+            if (!r.words_bounded(config.user_sgprs, 32,
+                                 "invalid compute user-SGPR count") ||
+                !r.u32(config.local_x) || !r.u32(config.local_y) ||
+                !r.u32(config.local_z) || !r.u8(exact) || exact > 1 ||
+                !r.u32(config.threads_x) || !r.u32(config.threads_y) ||
+                !r.u32(config.threads_z) || !r.u32(config.wave_size) ||
+                !r.u32(config.tidig_comp_cnt) || !r.u8(flags) || (flags & ~0x1fu) ||
+                !r.u32(config.lds_bytes) || !r.u32(config.native_subgroup_size) ||
+                !r.u32(config.native_storage_format_support)) return false;
+            config.exact_thread_extent = exact != 0;
+            config.tgid_x_en = (flags & 1u) != 0;
+            config.tgid_y_en = (flags & 2u) != 0;
+            config.tgid_z_en = (flags & 4u) != 0;
+            config.tg_size_en = (flags & 8u) != 0;
+            config.packed_r11_storage = (flags & 16u) != 0;
+            if (!validate_compute_recompile_state(compute, error)) return false;
+        }
+    }
     for (auto& draw : c.draws) restore_legacy_color_target_aliases(draw);
     for (auto& diagnostic : c.failure_diagnostics)
         restore_legacy_color_target_aliases(diagnostic);
@@ -2936,6 +3050,11 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         compute.submit_no = x.submit_no;
         compute.command_order = x.command_order;
         compute.required_subgroup_size = x.required_subgroup_size;
+        compute.raw_shader_index = x.raw_shader_index;
+        compute.recompile_config = x.recompile_config;
+        compute.recompile_config_available = x.recompile_config_available;
+        if (compute.recompile_config_available)
+            compute.user_sgprs = compute.recompile_config.user_sgprs;
         if (!table(x.resources, compute.resources)) return false;
         out.computes.push_back(std::move(compute));
     }

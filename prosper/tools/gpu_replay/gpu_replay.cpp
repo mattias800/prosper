@@ -6,6 +6,7 @@
 #include "gpu/shader_resources.hpp"
 #include "live_renderer.hpp"
 #include "replay_output_extent.hpp"
+#include "compute_recompile.hpp"
 #include "realized_shader_dump.hpp"
 #include "render_runner.h"
 
@@ -502,15 +503,18 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
     }
     for (size_t i = 0; i < replay.computes.size(); ++i) {
         const auto& c = replay.computes[i];
+        const bool raw_available = c.recompile_config_available &&
+            c.raw_shader_index < replay.raw_shader_versions.size();
         std::printf("compute[%zu] source=%llu order=%llu code=%016llx groups=%ux%ux%u local=%ux%ux%u "
-                    "subgroup=%u shader=%zu/%016llx\n",
+                    "subgroup=%u shader=%zu/%016llx raw=%s\n",
                     i, static_cast<unsigned long long>(c.dispatch_index),
                     static_cast<unsigned long long>(c.command_order),
                     static_cast<unsigned long long>(c.code_addr), c.launch.groups_x,
                     c.launch.groups_y, c.launch.groups_z, c.launch.local_x, c.launch.local_y,
                     c.launch.local_z, c.required_subgroup_size, c.spirv.size(),
                     static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(
-                        reinterpret_cast<const uint8_t*>(c.spirv.data()), c.spirv.size() * 4)));
+                        reinterpret_cast<const uint8_t*>(c.spirv.data()), c.spirv.size() * 4)),
+                    raw_available ? "yes" : "no");
         inspect_table("CS", c.resources.get(), replay.rtt_seeds);
     }
     for (size_t i = 0; i < replay.dma_copies.size(); ++i) {
@@ -1582,17 +1586,42 @@ int main(int argc, char** argv) {
     if (!prosper::gpu::materialize_gpu_replay(capture, replay, error)) {
         std::fprintf(stderr, "gpu_replay: cannot materialize: %s\n", error.c_str()); return 2;
     }
+    const bool metadata_only = std::any_of(
+        replay.metadata.renderer_env.begin(), replay.metadata.renderer_env.end(),
+        [](const auto& entry) {
+            return entry.first == "PROSPER_GPU_CAPTURE_METADATA_ONLY" &&
+                   !entry.second.empty() && entry.second != "0" && entry.second != "off";
+        });
     // --recompile-raw: a capsule stores already-recompiled SPIR-V, so recompiler changes are
-    // invisible to a default replay. This mode re-recompiles EVERY retained raw VS/FS with the
-    // CURRENT recompiler and substitutes the result. v36+ capsules retain the fixed-function
-    // pixel-stage ABI needed to make that recompilation deterministic; older captures keep their
-    // stored modules and report why no substitution was attempted.
+    // invisible to a default replay. This mode re-recompiles every retained raw graphics shader and,
+    // for v39+, every retained compute shader with the CURRENT recompiler. v36 keeps the graphics
+    // pixel ABI; v39 keeps compute's semantic launch ABI and user SGPRs.
     // offline A/B vehicle for recompiler work (stored vs current output diff via the replay hash —
     // the #1394/#1287 localization loop). Items without a retained raw stream, or whose
     // re-recompile fails, keep their stored SPIR-V — counted and reported, never silent.
     // PROSPER_FS_TAP is masked during the mass loop (recompile_fragment reads it per compile, so an
     // unmasked env would tap every shader containing that pc) and restored after, so the per-draw
     // tap block below still applies to exactly its semantic draw.
+    bool renderer_registered = false;
+    // Rendering a raw-compute replay must compile against capabilities enabled on this exact Vulkan
+    // device. register_live_renderer publishes them up front; commands which provably return before
+    // renderer execution use the capture host's recorded mask without requiring a GPU.
+    prosper::tools::ReplayRenderIntent render_intent;
+    render_intent.metadata_only = metadata_only;
+    render_intent.graph_only = graph_only;
+    render_intent.validate_only = validate_only;
+    render_intent.inspect_only = inspect_only;
+    render_intent.inspect = inspect;
+    render_intent.positional_count = positional.size();
+    render_intent.realized_shader_dump = !realized_shader_spec.empty();
+    render_intent.failed_shader_dump = !failed_shader_spec.empty();
+    render_intent.retry_failed_chain = !retry_failed_chain_spec.empty();
+    render_intent.retry_failed_stage = !retry_failed_stage_spec.empty();
+    if (recompile_raw && capture.format_version >= 39 &&
+        prosper::tools::replay_will_render(render_intent)) {
+        prosper::frontend::register_live_renderer(".", false);
+        renderer_registered = true;
+    }
     if (recompile_raw && capture.format_version < 36) {
         std::fprintf(stderr,
                      "[recompile-raw] capture v%u predates v36 pixel-stage ABI state; "
@@ -1654,6 +1683,33 @@ int main(int argc, char** argv) {
         if (tap_env_raw) setenv("PROSPER_FS_TAP", tap_env.c_str(), 1);
         std::fprintf(stderr, "[recompile-raw] substituted vs=%zu fs=%zu kept-stored vs=%zu fs=%zu of %zu draws\n",
                      vs_swapped, fs_swapped, vs_kept, fs_kept, replay.items.size());
+    }
+    if (recompile_raw && capture.format_version < 39) {
+        std::fprintf(stderr,
+                     "[recompile-raw] capture v%u predates v39 compute source/ABI state; "
+                     "keeping all %zu stored compute modules\n",
+                     capture.format_version, replay.computes.size());
+    } else if (recompile_raw) {
+        size_t compute_swapped = 0, compute_kept = 0;
+        const prosper::gpu::SharedVulkanContext replay_device =
+            prosper::gpu::shared_vulkan_context();
+        for (auto& compute : replay.computes) {
+            if (!prosper::tools::recompile_captured_compute(
+                    compute, replay.raw_shader_versions,
+                    replay_device.valid() ? &replay_device : nullptr,
+                    std::getenv("PROSPER_NATIVE_COMPUTE_MULTIWAVE") != nullptr,
+                    std::getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") != nullptr,
+                    std::getenv("PROSPER_NO_PACKED_R11_STORAGE") == nullptr)) {
+                ++compute_kept;
+                continue;
+            }
+            ++compute_swapped;
+        }
+        std::fprintf(stderr,
+                     "[recompile-raw] substituted compute=%zu kept-stored=%zu of %zu dispatches "
+                     "device-formats=0x%x\n",
+                     compute_swapped, compute_kept, replay.computes.size(),
+                     replay_device.valid() ? replay_device.native_storage_format_support : 0u);
     }
     // Geometry probe (PROSPER_GEOM_PROBE=N): a capsule stores already-recompiled SPIR-V, so rebuild
     // draw N from its raw RDNA2 and decorate the last pre-rasterization stage for transform feedback.
@@ -2233,11 +2289,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[gpureplay] executing through mixed operation %d\n", through_operation);
     }
     const auto& m = replay.metadata;
-    const bool metadata_only = std::any_of(
-        m.renderer_env.begin(), m.renderer_env.end(), [](const auto& entry) {
-            return entry.first == "PROSPER_GPU_CAPTURE_METADATA_ONLY" &&
-                   !entry.second.empty() && entry.second != "0" && entry.second != "off";
-        });
     std::fprintf(stderr, "[gpureplay] rev=%s title=%s submit=%llu %ux%u draws=%zu computes=%zu "
                          "operations=%zu shaders=%zu failed=%zu raw-shaders=%zu blobs=%zu "
                          "RTT-seeds=%zu DS-seeds=%zu oracle=%s resource-data=%s\n",
@@ -2260,7 +2311,8 @@ int main(int argc, char** argv) {
         set_environment("PROSPER_GPU_REPLAY_RTT_SEEDS", "1");
     if (!replay.ds_seeds.empty() || !prepend.ds_seeds.empty())
         set_environment("PROSPER_GPU_REPLAY_DS_SEEDS", "1");
-    prosper::frontend::register_live_renderer(".", false);
+    if (!renderer_registered)
+        prosper::frontend::register_live_renderer(".", false);
     std::unordered_set<uint64_t> predecessor_targets;
     if (!prepend_path.empty()) {
         if (!prosper::gpu::restore_gpu_replay_rtt_seeds(prepend.rtt_seeds, error)) {

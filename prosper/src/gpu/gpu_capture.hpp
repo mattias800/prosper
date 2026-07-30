@@ -124,6 +124,12 @@ struct GpuCapturedCompute {
     // v37: exact VkPipeline required-subgroup/full-subgroups contract used by the stored module.
     // Zero retains the historical portable shader path.
     uint32_t required_subgroup_size = 0;
+    // v39: source and semantic launch ABI for deterministic current-translator replay. The optional
+    // device capability fields describe the capture host; rendering intersects/replaces them with
+    // the replay device's actual capabilities before recompiling.
+    uint32_t raw_shader_index = 0xFFFFFFFFu;
+    ComputeShaderConfig recompile_config{};
+    bool recompile_config_available = false;
 };
 
 struct GpuCapturedOperation {

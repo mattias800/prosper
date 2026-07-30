@@ -1,4 +1,5 @@
 #include "../tools/gpu_replay/realized_shader_dump.hpp"
+#include "../tools/gpu_replay/compute_recompile.hpp"
 #include "../src/gpu/diagnostic_selectors.hpp"
 
 #include <cstdio>
@@ -141,6 +142,110 @@ int main() {
     CHECK(!tools::select_recompiled_shader(shared_replay, "20:vs", shared, error) &&
               error.find("realized draw 20 not found") != std::string::npos,
           "recompiled shader selection rejects an absent semantic draw");
+
+    gpu::ComputeItem raw_compute;
+    raw_compute.spirv = {0x07230203u, 0u};
+    raw_compute.launch.local_x = 64;
+    raw_compute.recompile_config_available = true;
+    raw_compute.recompile_config.local_x = 64;
+    raw_compute.recompile_config.user_sgprs = {0x12345678u};
+    raw_compute.raw_shader_index = 0;
+    std::vector<gpu::GpuCaptureRawShaderVersion> compute_raw = {
+        {0, true, {0xbf810000u}}, // s_endpgm
+    };
+    CHECK(tools::recompile_captured_compute(
+              raw_compute, compute_raw, nullptr, false, false, true) &&
+              raw_compute.spirv.size() > 5 &&
+              raw_compute.spirv[0] == 0x07230203u &&
+              raw_compute.user_sgprs == raw_compute.recompile_config.user_sgprs,
+          "capture v39 raw compute replay substitutes current SPIR-V and push constants");
+    raw_compute.raw_shader_index = 1;
+    CHECK(!tools::recompile_captured_compute(
+              raw_compute, compute_raw, nullptr, false, false, true),
+          "raw compute replay keeps the stored module when source is unavailable");
+
+    tools::ReplayRenderIntent render_intent;
+    render_intent.positional_count = 1;
+    CHECK(tools::replay_will_render(render_intent),
+          "one-capsule replay without an output path still initializes its renderer");
+    render_intent.inspect_only = true;
+    CHECK(!tools::replay_will_render(render_intent),
+          "inspect-only raw recompilation stays Vulkan-independent");
+    render_intent.inspect_only = false;
+    render_intent.graph_only = true;
+    CHECK(!tools::replay_will_render(render_intent),
+          "dependency-graph raw recompilation stays Vulkan-independent");
+    render_intent.graph_only = false;
+    render_intent.realized_shader_dump = true;
+    CHECK(!tools::replay_will_render(render_intent),
+          "terminal one-capsule raw-shader dump stays Vulkan-independent");
+    render_intent.inspect = true;
+    CHECK(tools::replay_will_render(render_intent),
+          "inspecting after a raw-shader dump preserves the command's renderer execution");
+
+    // Rendering must replace, not intersect with or trust, the capture host's optional format and
+    // subgroup policy. Use opaque non-null handles: the selection helper only inspects the published
+    // feature contract and does not call Vulkan.
+    static const uint32_t storage_compute_code[] = {
+        0x7e080300u, 0xf0000f00u, 0x00000004u, 0xbf8c3f70u,
+        0xf0200f00u, 0x00020004u, 0xbf810000u,
+    };
+    auto storage_resources = std::make_shared<gpu::ShaderResourceTable>();
+    for (uint32_t i = 0; i < 2; ++i) {
+        gpu::ShaderResource image;
+        image.cls = gpu::ResourceClass::StorageImage;
+        image.format = gpu::DataFormat::Float16;
+        image.num_components = 4;
+        image.binding = 4 + i;
+        image.sgpr_base = i * 8;
+        storage_resources->resources.push_back(image);
+    }
+    gpu::ComputeItem device_compute;
+    device_compute.spirv = {0x07230203u, 0u};
+    device_compute.resources = storage_resources;
+    device_compute.raw_shader_index = 0;
+    device_compute.recompile_config_available = true;
+    device_compute.recompile_config.user_sgprs.resize(16);
+    device_compute.recompile_config.local_x = 8;
+    device_compute.recompile_config.local_y = 8;
+    device_compute.recompile_config.wave_size = 64;
+    device_compute.recompile_config.native_storage_format_support =
+        gpu::native_storage_format_support_bit(gpu::DataFormat::Float32, 4);
+    std::vector<gpu::GpuCaptureRawShaderVersion> storage_raw = {
+        {0, true, std::vector<uint32_t>(std::begin(storage_compute_code),
+                                       std::end(storage_compute_code))},
+    };
+    gpu::SharedVulkanContext capable;
+    capable.instance = capable.physical = capable.device = capable.queue =
+        reinterpret_cast<void*>(1);
+    capable.queue_family = 0;
+    capable.compute_queue_supported = true;
+    capable.storage_image_read_without_format = true;
+    capable.storage_image_write_without_format = true;
+    capable.native_storage_format_support =
+        gpu::native_storage_format_support_bit(gpu::DataFormat::Float16, 4);
+    capable.compute_subgroup_size_control = true;
+    capable.compute_full_subgroups = true;
+    capable.compute_subgroup_vote = true;
+    capable.compute_subgroup_arithmetic = true;
+    capable.min_compute_subgroup_size = 32;
+    capable.max_compute_subgroup_size = 64;
+    capable.max_compute_workgroup_subgroups = 4;
+    capable.max_compute_workgroup_size_x = 256;
+    capable.max_compute_workgroup_invocations = 256;
+    auto device_native_compute = device_compute;
+    CHECK(tools::recompile_captured_compute(
+              device_native_compute, storage_raw, &capable, false, false, true) &&
+              device_native_compute.required_subgroup_size == 64,
+          "rendering raw replay selects the replay device's native format and subgroup policy");
+    auto non_adoptable = capable;
+    non_adoptable.storage_image_write_without_format = false;
+    auto device_portable_compute = device_compute;
+    CHECK(tools::recompile_captured_compute(
+              device_portable_compute, storage_raw, &non_adoptable, false, false, true) &&
+              device_portable_compute.required_subgroup_size == 0 &&
+              device_portable_compute.spirv != device_native_compute.spirv,
+          "non-adoptable replay device replaces capture-host policy with portable compute");
 
     std::printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;

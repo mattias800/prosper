@@ -3799,12 +3799,14 @@ std::vector<ComputeItem> realize_compute_dispatches(
             shared_vulkan.storage_image_write_without_format;
         config.native_storage_format_support = shared_compute_adoptable
             ? shared_vulkan.native_storage_format_support : 0;
+        const uint32_t replay_native_storage_format_support =
+            config.native_storage_format_support;
         config.packed_r11_storage =
             std::getenv("PROSPER_NO_PACKED_R11_STORAGE") == nullptr;
-        // Realized captures store SPIR-V but not enough raw compute launch state to recompile a
-        // device-specific typed-storage module on replay. Compile capture-bound dispatches through
+        // Keep the stored capture module portable by compiling capture-bound dispatches through
         // device-independent storage paths (raw uvec4 or exact packed R32ui), so optional format
-        // support never becomes an artifact ABI.
+        // support never becomes an artifact ABI. Capture v39 also retains the raw shader and
+        // semantic launch ABI, allowing --recompile-raw to reconstruct a device-specific module.
         const bool capture_bound = std::getenv("PROSPER_GPU_CAPTURE") ||
             std::getenv("PROSPER_GPU_TIMELINE_CAPTURE") ||
             interactive_gpu_capture_armed() || interactive_capture_bundle_active();
@@ -3839,6 +3841,12 @@ std::vector<ComputeItem> realize_compute_dispatches(
             (const uint32_t*)(uintptr_t)code_addr, 0x10000, table.get(), config);
         item.user_sgprs = config.user_sgprs;
         item.required_subgroup_size = config.native_subgroup_size;
+        item.recompile_config = config;
+        // Capture-bound SPIR-V deliberately uses the device-independent storage path, but v39 raw
+        // replay needs the capability mask that a normal live dispatch would have used.
+        item.recompile_config.native_storage_format_support =
+            replay_native_storage_format_support;
+        item.recompile_config_available = true;
         item.resources = std::move(table);
         item.launch = launch;
         item.code_addr = code_addr;
