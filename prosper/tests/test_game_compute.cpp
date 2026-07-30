@@ -189,7 +189,7 @@ int main() {
                                          LiveTargetPixelFormat::Rgba8Unorm, false) &&
           !direct_sampled_rtt_compatible(DataFormat::Unorm16, 2,
                                          LiveTargetPixelFormat::Rgba8Unorm, true),
-          "normalized-only RGBA16-UNORM sampling may reuse RGBA8 without widening texels");
+          "float RGBA16-UNORM sampled values may reuse RGBA8 without widening texels");
     // A renderer-owned target is stored canonically as RGBA8 or RGBA16F, while a later compute
     // descriptor can alias it as packed R11G11B10. Reconstruct the descriptor-visible words rather
     // than sampling stale guest backing or dropping the dispatch.

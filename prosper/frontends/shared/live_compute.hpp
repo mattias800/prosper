@@ -58,10 +58,11 @@ constexpr bool storage_writeback_can_tile_mapped_bytes(bool exact_storage_bytes,
 
 // Whether a sampled guest view can bind a renderer-owned target without a CPU readback/conversion.
 // Exact Vulkan formats may always be reused. The sole cross-format case is RGBA16_UNORM backed by
-// canonical RGBA8 values, and only when reflection proves a normalized sample/gather-only contract.
+// canonical RGBA8 values, and only when reflection proves that the sampled image returns float
+// values. Exact-extent checks remain a separate coordinate contract for texel fetch and queries.
 bool direct_sampled_rtt_compatible(prosper::gpu::DataFormat format, uint32_t components,
                                    prosper::gpu::LiveTargetPixelFormat target_format,
-                                   bool normalized_sampling);
+                                   bool float_sampled_values);
 
 // Reconstruct a packed R11G11B10 sampled surface from the renderer's canonical color snapshot.
 // The renderer keeps float targets as RGBA16F and ordinary targets as RGBA8; compute descriptors
