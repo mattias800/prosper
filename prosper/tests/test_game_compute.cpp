@@ -2355,14 +2355,36 @@ int main() {
 #if defined(__linux__)
                 const uint64_t storage_snapshots_after =
                     prosper::frontend::live_compute_storage_result_snapshot_bytes();
-                if (adaptive_storage_result_validation_enabled) {
-                    CHECK(storage_snapshots_after == storage_snapshots_before,
-                          "changed full-overwrite recovery avoids a redundant result snapshot");
-                } else {
-                    CHECK(storage_snapshots_after >=
-                              storage_snapshots_before + fill_guest_bytes,
-                          "disabled adaptive policy retains the exact recovered result");
-                }
+                CHECK(storage_snapshots_after >=
+                          storage_snapshots_before + fill_guest_bytes,
+                      "post-failure repair replaces its invalidated exact result baseline");
+
+                auto recovered_write_watch = prosper::host::GuestWriteWatch::create(
+                    reinterpret_cast<uint64_t>(fill_guest), fill_guest_bytes);
+                const uint64_t recovered_snapshots_before =
+                    prosper::frontend::live_compute_storage_result_snapshot_bytes();
+#endif
+                uint32_t recovered_repeat_notifications = 0;
+                set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+                    if (addr == fdst.gpu_addr && size == fdst.size)
+                        ++recovered_repeat_notifications;
+                });
+                CHECK(prosper::frontend::execute_live_compute_items({changed}),
+                      "recovered storage image repeats an identical dispatch");
+                set_guest_gpu_write_observer({});
+                CHECK(fill_equals(changed_expected),
+                      "post-recovery identical dispatch preserves the repaired guest result");
+                CHECK(recovered_repeat_notifications == 1,
+                      "post-recovery identical result still invalidates renderer aliases");
+#if defined(__linux__)
+                CHECK(static_cast<bool>(recovered_write_watch) &&
+                          recovered_write_watch.query() ==
+                              prosper::host::GuestWriteWatchQuery::Unchanged,
+                      "post-recovery identical result does not rewrite guest bytes");
+                CHECK(prosper::frontend::live_compute_storage_result_snapshot_bytes() ==
+                          recovered_snapshots_before,
+                      "post-recovery identical result does not recopy its repaired baseline");
+                recovered_write_watch.reset();
 #endif
             }
 

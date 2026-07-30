@@ -1613,8 +1613,13 @@ struct VulkanComputeContext {
         if (found == image_cache.end()) return;
         CachedComputeImage& cached = found->second;
         cached.content_valid = false;
+        cached.graphics_export_valid = false;
+        cached.write_watch.reset();
+        if (!cached.source_snapshot.empty())
+            std::vector<uint8_t>().swap(cached.source_snapshot);
         // acquire_cached_image may otherwise reuse a same-submit validation result before checking
-        // content_valid. A failed post-submit readback invalidates both forms of authority.
+        // content_valid. A failed post-submit readback can leave the retained image/result buffer
+        // newer than guest memory, so every source/export authority must be rebuilt by the retry.
         cached.validation_epoch = 0;
         cached.validation_result = false;
     }
@@ -1626,6 +1631,7 @@ struct VulkanComputeContext {
         auto found = image_cache.find(key);
         if (found == image_cache.end()) return;
         CachedComputeImage& cached = found->second;
+        const bool source_was_valid = cached.content_valid;
         // A storage dispatch replaces both the image and its guest-memory mirror. Retain those
         // result bytes as the exact comparison baseline; keeping the pre-dispatch input here could
         // misclassify a later guest write that restores that old input as "unchanged".
@@ -1666,7 +1672,14 @@ struct VulkanComputeContext {
         // post-process targets. A repeated result keeps one collision-free baseline; an identical
         // GPU skip never reaches this function, so that baseline is not recopied.
         cached.write_watch.reset();
-        if (result_unchanged) {
+        if (!source_was_valid) {
+            // A failed dispatch/readback may have advanced the retained GPU result while leaving
+            // guest memory at the old baseline. The successful repair must replace that invalidated
+            // authority even when the GPU comparator calls the retried result "unchanged".
+            if (current_source)
+                remember_image_source_snapshot(
+                    cached, current_source, key.guest_bytes, true);
+        } else if (result_unchanged) {
             if (current_source && cached.source_snapshot.empty())
                 remember_image_source_snapshot(
                     cached, current_source, key.guest_bytes, true);
