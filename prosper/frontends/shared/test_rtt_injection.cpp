@@ -5,12 +5,21 @@
 #include <vector>
 
 using prosper::frontend::inject_rtt_pixels;
+using prosper::frontend::exact_rtt_snapshot_borrowable;
 
 static int failures = 0;
 #define CHECK(cond) do { if (!(cond)) { \
     std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); ++failures; } } while (0)
 
 int main() {
+    CHECK(exact_rtt_snapshot_borrowable(4, 2, 4, 2, 8, 4 * 2 * 8));
+    CHECK(!exact_rtt_snapshot_borrowable(2, 1, 4, 2, 8, 4 * 2 * 8));
+    CHECK(!exact_rtt_snapshot_borrowable(4, 2, 4, 2, 8, 4 * 2 * 8 - 1));
+    CHECK(!exact_rtt_snapshot_borrowable(4, 2, 4, 2, 0, 0));
+    CHECK(!exact_rtt_snapshot_borrowable(
+        UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, 16,
+        std::numeric_limits<size_t>::max()));
+
     // #1293: a 1D consumer was provisionally allocated at RGBA8 (4 B/px), then an exact-size FP16
     // RTT injection memcpy'd 8 B/px into it. The helper must resize from the producer's real stride.
     std::vector<uint8_t> fp16_source(4 * 2 * 8);

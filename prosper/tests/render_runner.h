@@ -99,6 +99,9 @@ struct FrameResource {
     // zero-initialized 64 KiB allocation shared across ordered render calls.
     bool is_internal_gds = false;
     const uint8_t* tex_rgba = nullptr;   // non-null => a texture; then tw/th are its dimensions
+    // Optional immutable owner for borrowed frontend pixels. Keeping this beside the raw pointer
+    // makes FrameResource copies/moves retain the source through synchronous backend upload setup.
+    std::shared_ptr<const std::vector<uint8_t>> tex_rgba_owner;
     uint32_t tw = 0, th = 0, td = 1;
     // T#-declared mip-chain length (#1272). 1 (default) = single-level upload, the historical
     // behavior. >1 lets the backend generate a box-filtered chain — bounded by this declared count —

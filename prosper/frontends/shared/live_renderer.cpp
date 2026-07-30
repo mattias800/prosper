@@ -1468,6 +1468,25 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 prosper::test::backend_color_bytes_per_pixel(
                                     prosper::test::backend_color_format(live_rtt->second.format)),
                                 live_rtt->second.rgba->size());
+                        static const bool borrow_exact_cpu_rtt =
+                            getenv("PROSPER_NO_RTT_SNAPSHOT_BORROW") == nullptr;
+                        // Pixel-mutating/inspection diagnostics intentionally retain their owned
+                        // scratch copy. The normal exact-extent path can borrow the immutable RTT
+                        // snapshot and avoid copying it into texstore before the backend upload.
+                        static const bool cpu_rtt_copy_diagnostics =
+                            getenv("PROSPER_DUMP_SAMPLED_RTT") || getenv("PROSPER_DUMP_RAWTEX") ||
+                            getenv("PROSPER_GFXLOG") || getenv("PROSPER_RESOURCE_HASH_DIM") ||
+                            getenv("PROSPER_PALETTELOG") || getenv("PROSPER_TESTTEX") ||
+                            getenv("PROSPER_TESTLUT") || getenv("PROSPER_TESTLUT32") ||
+                            getenv("PROSPER_DUMP_TEX") || getenv("PROSPER_DUMP_ATLAS") ||
+                            getenv("PROSPER_KILL_RING");
+                        const bool borrow_cpu_live_rtt = has_cpu_live_rtt &&
+                            borrow_exact_cpu_rtt && !cpu_rtt_copy_diagnostics &&
+                            prosper::frontend::exact_rtt_snapshot_borrowable(
+                                tw, th, live_rtt->second.w, live_rtt->second.h,
+                                prosper::test::backend_color_bytes_per_pixel(
+                                    live_rtt->second.format),
+                                live_rtt->second.rgba->size());
                         // A retained render target was created for color-attachment + sampled usage,
                         // not storage usage. Storage images therefore take the decoded/upload path.
                         const bool has_gpu_live_rtt = !fr.is_storage_image && live_gpu_targets &&
@@ -2218,7 +2237,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         size_t linear_source_prefix_size = 0;
                         if (texstore_used == texstore.size()) texstore.emplace_back();
                         std::vector<uint8_t>& texture_pixels = texstore[texstore_used++];
-                        texture_pixels.resize(nb);
+                        if (borrow_cpu_live_rtt) texture_pixels.clear();
+                        else texture_pixels.resize(nb);
                         auto copy_linear_padded_rows = [&](uint8_t* dst, size_t dst_row) {
                             size_t total = 0;
                             for (uint32_t y = 0; y < th; ++y) {
@@ -2278,8 +2298,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 !rit->second.rgba->empty()) {
                                 const RttSurf& s = rit->second;
                                 const uint32_t rtt_bpp = prosper::test::backend_color_bytes_per_pixel(s.format);
-                                if (prosper::frontend::inject_rtt_pixels(
-                                        texture_pixels, tw, th, *s.rgba, s.w, s.h, rtt_bpp)) {
+                                if (borrow_cpu_live_rtt) {
+                                    fr.tex_rgba_owner = s.rgba;
+                                    fr.tex_rgba = s.rgba->data();
+                                    fr.texture_format = s.format;
+                                    rtt_hit = true;
+                                    resource_rtt_hit = true;
+                                } else if (prosper::frontend::inject_rtt_pixels(
+                                               texture_pixels, tw, th, *s.rgba,
+                                               s.w, s.h, rtt_bpp)) {
                                     fr.texture_format = s.format;
                                     rtt_hit = true;
                                     resource_rtt_hit = true;
@@ -2973,7 +3000,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         if (getenv("PROSPER_KILL_RING") && tw == 1024 && th == 1024 &&
                             r.num_components == 1 && r.cls == RC::Texture)
                             std::fill(texture_pixels.begin(), texture_pixels.end(), 0);
-                        fr.tex_rgba = texture_pixels.data(); fr.tw = tw; fr.th = cube_done ? th * 6u : th;
+                        if (!fr.tex_rgba) fr.tex_rgba = texture_pixels.data();
+                        fr.tw = tw; fr.th = cube_done ? th * 6u : th;
                         fr.td = is_volume ? r.depth : 1u;
                         fr.img_dim = r.img_dim;
                         // #1272: see the reuse path — plain 2D guest textures only.
