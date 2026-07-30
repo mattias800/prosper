@@ -91,7 +91,7 @@ int main() {
               eligible, two_waves, false, false) == 0 &&
           prosper::gpu::select_native_compute_subgroup_size(
               eligible, two_waves, true, false) == 64,
-          "multi-wave native compute requires an explicit experimental opt-in");
+          "multi-wave native compute remains gated by the caller's structural or experimental proof");
     auto narrow_flattened_x = eligible;
     narrow_flattened_x.max_compute_workgroup_size_x = 128;
     auto guest_16x16 = multidimensional;

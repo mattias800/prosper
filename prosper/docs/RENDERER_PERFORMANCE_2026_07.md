@@ -1222,17 +1222,38 @@ created and ran both exact pipeline contracts. The standalone startup capsule st
 operations and no temporal RTT seeds, so its final pixel oracle and live compute result do not match.
 It is valid evidence for module/pipeline analysis, not for a full-frame correctness claim.
 
-A matched live switch test separated the two remaining kernels. Native lowering reduced
+A matched live switch test first separated the two remaining kernels. Native lowering reduced
 `0x30180d0000` from a 5.65 ms to 3.22 ms median GPU dispatch, but the four-wave, LDS/barrier-heavy
-`0x3015770000` kernel moved from 5.21 ms to 5.62 ms. Every other eligible Plucky dispatch in the route
-used exactly one 64-lane guest wave; those were neutral or faster, including a repeated mip kernel at
-0.44 ms native versus 0.86 ms portable. Native lowering therefore defaults to exact single-wave
-workgroups. `PROSPER_NATIVE_COMPUTE_MULTIWAVE=1` retains the exact, captureable multi-wave experiment;
-`PROSPER_NO_NATIVE_COMPUTE_SUBGROUP=1` remains the full portable control. These are sequential
-dispatch-local runs; 441 versus 418 presented frames is supporting route progression, not a standalone
-whole-app claim. A clean combined-policy confirmation kept `0x30180d0000` native at 3.08 ms and
-`0x3015770000` portable at 5.27 ms over 378+ samples, with 425 frames presented and no dispatch skip,
-renderer failure, or shutdown error.
+`0x3015770000` kernel moved from 5.21 ms to 5.62 ms. The reason was structural rather than an inherent
+multi-wave cost: its exact-subgroup module still contained the portable structured-control-flow wave
+votes, including 20 synthetic workgroup barriers in addition to the program's three real barriers.
+Every other eligible Plucky dispatch in that route used exactly one 64-lane guest wave; those were
+neutral or faster, including a repeated mip kernel at 0.44 ms native versus 0.86 ms portable. The
+interim policy therefore defaulted to exact single-wave workgroups and retained
+`PROSPER_NATIVE_COMPUTE_MULTIWAVE=1` as an experiment.
+
+The follow-up on 2026-07-30 made the exact-subgroup contract consistent across all translator paths.
+Straight-line MBCNT now uses subgroup exclusive scans, as the CFG dispatcher already did, and the
+structured compute path uses subgroup-any instead of the portable workgroup vote. The captured
+`0x3015770000` module fell from 32,076 to 8,026 SPIR-V words and now contains ten subgroup votes plus
+only the three guest barriers. A matched 55-second full-resolution live A/B measured steady submits
+after submit 100:
+
+| program | portable median | native median | samples (portable/native) |
+|---|---:|---:|---:|
+| `0x30180d0000` | 6.230 ms | 3.615 ms | 726 / 800 |
+| `0x3015770000` | 5.880 ms | 1.630 ms | 724 / 799 |
+
+The default remains conservative and title-independent: multi-wave workgroups are admitted
+automatically only when the decoded shader contains the canonical MBCNT low/high pair or at least four
+VCC/EXEC scalar branches alongside a guest workgroup barrier, where repeated scratch-emulated
+scans/votes justify the exact subgroup shell.
+Other multi-wave shapes still require `PROSPER_NATIVE_COMPUTE_MULTIWAVE=1`, and
+`PROSPER_NO_NATIVE_COMPUTE_SUBGROUP=1` remains the complete portable control. A default-policy run
+selected subgroup64 for both heavy programs, presented 265 frames, and produced no renderer or dispatch
+failure. A fresh four-present bundle replayed all 12 submits and 56/56 operations in the heavy submit;
+its 3840x2160 output was pixel-identical to the independently scheduled live screenshot (infinite PSNR).
+Frame counts remain supporting route progression rather than a standalone FPS claim.
 
 ## Plucky split no-GS NGG producer coverage
 

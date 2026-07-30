@@ -7038,13 +7038,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // (126/127) -> this lane's exec bool; inline -1 (all-ones) -> always set (mbcnt = lane
                 // index, the common "get my lane id" idiom, e.g. shader 037); inline 0 -> never; an SGPR
                 // pair -> that saved mask's bool. A general computed 32-bit mask VALUE isn't representable
-                // per-lane, so reject that. Compute uses LDS+barriers at barrier-uniform sites;
-                // fragment uses a native exclusive subgroup sum with an enforced wave64 pipeline.
+                // per-lane, so reject that. Portable compute uses LDS+barriers at barrier-uniform sites;
+                // exact-size compute subgroups and fragments use a native exclusive subgroup sum.
                 const uint32_t active = mbcnt_source_bit(
                     b, rs, in.src[0], in.opcode == 0x366);
-                if (active) vreg[in.dst.value] = b.is_fragment
-                    ? b.fragment_mbcnt(active, val(in.src[1]), in.opcode == 0x365)
-                    : b.mbcnt(active, val(in.src[1]), in.opcode == 0x365);
+                if (active) {
+                    const uint32_t acc = val(in.src[1]);
+                    const uint32_t lo = in.opcode == 0x365 ? b.btrue() : b.bfalse();
+                    vreg[in.dst.value] = b.is_fragment
+                        ? b.fragment_mbcnt(active, acc, in.opcode == 0x365)
+                        : (b.native_subgroup_size
+                            ? b.native_compute_mbcnt(active, acc, lo)
+                            : b.mbcnt(active, acc, in.opcode == 0x365));
+                }
                 else ok = false;
             } else if (in.opcode == 0x12F) {                          // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
                 vreg[in.dst.value] = b.pack_half2x16_rtz(fv(0), fv(1)); // v_cvt_pkrtz VOP3: RTZ clamp (#452)
@@ -11279,7 +11285,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     return false;
                 uint32_t cond_reg = F.on_exec ? rs.exec : (F.on_vcc ? rs.vcc : rs.scc);
                 if (b.is_compute && (F.on_exec || F.on_vcc))
-                    cond_reg = b.guest_wave_any(cond_reg);
+                    cond_reg = b.native_subgroup_size
+                        ? b.native_wave_any(cond_reg)
+                        : b.guest_wave_any(cond_reg);
                 else if (b.is_fragment && (F.on_exec || F.on_vcc))
                     cond_reg = b.fragment_wave_any(cond_reg);
                 uint32_t exec_cond = F.on_scc0 ? cond_reg : b.bsel(cond_reg, b.bfalse(), b.btrue());
@@ -11527,6 +11535,35 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     // a module that could deadlock or observe undefined workgroup-memory behavior.
     if (has_partial_workgroup && b.uses_barrier) return {};
     return b.finish();
+}
+
+bool compute_shader_prefers_native_multiwave(const std::vector<Rdna2Inst>& ins) {
+    bool low = false;
+    bool high = false;
+    bool guest_barrier = false;
+    uint32_t wave_branches = 0;
+    for (const Rdna2Inst& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt == Rdna2Format::VOP3) {
+            low |= in.opcode == 0x365;
+            high |= in.opcode == 0x366;
+        }
+        if (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x06 && in.opcode <= 0x09)
+            ++wave_branches;
+        guest_barrier |= in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a;
+        if (low && high) return true;
+    }
+    // Four raw wave branches plus a real workgroup barrier are intentionally required: simple
+    // if/loop shapes may be lowered per invocation without scratch, while barrier-separated,
+    // branch-dense structured shaders repeatedly pay for exact guest-wave votes. This keeps the
+    // default narrower than the all-multi-wave experiment.
+    return guest_barrier && wave_branches >= 4;
+}
+
+bool compute_shader_prefers_native_multiwave(const uint32_t* code, size_t dwords) {
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code, dwords, ins);
+    return compute_shader_prefers_native_multiwave(ins);
 }
 
 // See FlatLoadInfo / analyze_flat_loads in the header (#1171). A `base + offset` flat address VGPR pair

@@ -634,8 +634,9 @@ struct SharedVulkanContext {
 };
 // Select the exact native subgroup contract only when the renderer device can actually be adopted
 // by compute and every required-subgroup workgroup bound is satisfied. Single-wave workgroups are
-// the default proven fast path; `allow_multiwave` is the explicit experimental opt-in and `disabled`
-// is the diagnostic/compatibility opt-out.
+// the default proven fast path; the caller may allow a multi-wave program based on a structural
+// shader proof or the explicit experimental opt-in. `disabled` is the diagnostic/compatibility
+// opt-out.
 uint32_t select_native_compute_subgroup_size(const SharedVulkanContext& context,
                                              const ComputeShaderConfig& config,
                                              bool allow_multiwave, bool disabled);

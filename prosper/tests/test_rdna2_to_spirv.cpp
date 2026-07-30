@@ -2872,6 +2872,31 @@ int main() {
            got63.size()==N?got63[5]:-1, exp63[5], got63.size()==N?got63[70]:-1, exp63[70]);
     CHECK(got63.size()==N && bad63==0, "recompiled kernel 63 (v_mbcnt full-exec = localid) correct");
 
+    ComputeShaderConfig native_cfg63;
+    native_cfg63.local_x = 8;
+    native_cfg63.local_y = 8;
+    native_cfg63.wave_size = 64;
+    native_cfg63.native_subgroup_size = 64;
+    const std::vector<uint32_t> native_spv63 = recompile_compute(
+        code63, std::size(code63), nullptr, native_cfg63);
+    const uint32_t vote_heavy_policy_code[] = {
+        0xbf880000u, 0xbf860000u, 0xbf890000u, 0xbf870000u, 0xbf8a0000u, 0xbf810000u,
+    };
+    const uint32_t vote_light_policy_code[] = {
+        0xbf880000u, 0xbf860000u, 0xbf890000u, 0xbf8a0000u, 0xbf810000u,
+    };
+    CHECK(compute_shader_prefers_native_multiwave(code63, std::size(code63)) &&
+              compute_shader_prefers_native_multiwave(
+                  vote_heavy_policy_code, std::size(vote_heavy_policy_code)) &&
+              !compute_shader_prefers_native_multiwave(
+                  vote_light_policy_code, std::size(vote_light_policy_code)) &&
+              !compute_shader_prefers_native_multiwave(code62, std::size(code62)),
+          "multi-wave policy recognizes scan/vote-heavy shaders without title-specific identity");
+    CHECK(!native_spv63.empty() && count_spirv_opcode(native_spv63, 349) == 2,
+          "straight-line exact-wave MBCNT lowers both halves to subgroup scans");
+    CHECK(count_spirv_opcode(native_spv63, 224) == 0,
+          "straight-line exact-wave MBCNT emits no workgroup control barrier");
+
     // Kernel 64: v_mbcnt with DIVERGENT exec — the real compaction use. v_cmpx narrows exec to (a>thr);
     // then mbcnt gives each active lane its index among active lanes. Even lanes active (a=1>0.5), odd
     // inactive (a=0): active lane L -> L/2 (count of active lanes below); inactive lanes keep 0 (the
@@ -4875,6 +4900,20 @@ int main() {
                    gotStructuredWave[64], gotStructuredWave[127]);
         CHECK(gotStructuredWave.size() == 128 && badStructuredWave == 0,
               "#1373: structured branch performs one exact 64-lane guest-wave vote");
+
+        ComputeShaderConfig nativeStructuredWaveConfig;
+        nativeStructuredWaveConfig.local_x = 8;
+        nativeStructuredWaveConfig.local_y = 8;
+        nativeStructuredWaveConfig.wave_size = 64;
+        nativeStructuredWaveConfig.native_subgroup_size = 64;
+        const std::vector<uint32_t> nativeStructuredWaveSpv = recompile_compute(
+            structured_wave_cs, std::size(structured_wave_cs), nullptr,
+            nativeStructuredWaveConfig);
+        CHECK(!nativeStructuredWaveSpv.empty() &&
+                  count_spirv_opcode(nativeStructuredWaveSpv, 335) >= 1,
+              "structured exact-wave branch lowers its vote to subgroup-any");
+        CHECK(count_spirv_opcode(nativeStructuredWaveSpv, 224) == 1,
+              "structured exact-wave branch retains only its guest workgroup barrier");
 
         // UE4 reduction kernels also use sequential top-level EXEC tests separated by workgroup
         // barriers, with no loop in the shader. A scalar write in each arm makes the result visible
