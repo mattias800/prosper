@@ -1763,6 +1763,94 @@ int main() {
             CHECK(repeated_write_notifications == 0,
                   "identical retained output skips redundant guest writeback and invalidation");
 
+            // The live draw immediately following a compute producer is inside the same ordered
+            // guest submit. Its mutation journal is an exact authority even before a cross-submit
+            // page watch has accumulated enough stable validations to be promoted.
+            std::vector<uint8_t> journal_guest(W * 8, 0x51);
+            ShaderResourceTable journal_rt = fill_rt;
+            ShaderResource& journal_dst = journal_rt.resources.back();
+            journal_dst.gpu_addr = reinterpret_cast<uint64_t>(journal_guest.data());
+            ComputeItem journal_item = it;
+            journal_item.resources = std::make_shared<ShaderResourceTable>(journal_rt);
+            journal_item.dispatch_index = 31;
+            journal_item.command_order = 10;
+            DrawItem journal_consumer;
+            journal_consumer.draw_index = 47;
+            journal_consumer.command_order = 20;
+            bool journal_imported = false;
+            const OrderedSubmitResult journal_result = execute_ordered_items(
+                {{SubmitOperationKind::Dispatch, journal_item.dispatch_index,
+                  journal_item.command_order},
+                 {SubmitOperationKind::Draw, journal_consumer.draw_index,
+                  journal_consumer.command_order}},
+                {journal_consumer}, {journal_item},
+                [&](const std::vector<DrawItem>&, uint32_t, uint32_t) {
+                    ShaderResource sampled = journal_dst;
+                    sampled.cls = ResourceClass::Texture;
+                    prosper::frontend::LiveComputeImageImport compute_import;
+                    journal_imported = prosper::frontend::import_live_compute_storage_image(
+                        sampled, journal_dst.size, compute_import) && compute_import.valid();
+                    return RenderedFrame{};
+                },
+                [&](const std::vector<ComputeItem>& items) {
+                    return prosper::frontend::execute_live_compute_items(items);
+                },
+                1, 1);
+            CHECK(journal_result.compute_executed && journal_result.render_spans == 1 &&
+                      journal_imported,
+                  "same-submit journal authorizes the first retained compute-image consumer");
+
+#if defined(__linux__)
+            // Use a dedicated mapping so page protection cannot alias unrelated malloc metadata.
+            // Outside an ordered submit there is no submit-local journal, so a successful import
+            // here specifically proves the cross-submit write-watch authority path.
+            constexpr size_t import_mapping_bytes = 4096;
+            auto* import_guest = static_cast<uint8_t*>(mmap(
+                nullptr, import_mapping_bytes, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+            CHECK(import_guest != MAP_FAILED,
+                  "allocate dedicated typed-storage import mapping");
+            if (import_guest != MAP_FAILED) {
+                std::memset(import_guest, 0x37, import_mapping_bytes);
+                prosper::host::guest_write_watch_set_fault_onstack(true);
+                prosper::host::guest_write_watch_notify_direct_mapping_added(
+                    reinterpret_cast<uint64_t>(import_guest), import_mapping_bytes,
+                    0x7c0000, 0x3 /* SCE CPU_READ|CPU_WRITE */);
+                ShaderResourceTable import_rt = fill_rt;
+                ShaderResource& import_dst = import_rt.resources.back();
+                import_dst.gpu_addr = reinterpret_cast<uint64_t>(import_guest);
+                ComputeItem import_item = it;
+                import_item.resources = std::make_shared<ShaderResourceTable>(import_rt);
+                CHECK(prosper::frontend::execute_live_compute_items({import_item}) &&
+                          prosper::frontend::execute_live_compute_items({import_item}) &&
+                          prosper::frontend::execute_live_compute_items({import_item}) &&
+                          prosper::frontend::execute_live_compute_items({import_item}),
+                      "repeated typed-storage output promotes its exact source watch");
+                ShaderResource sampled_fill = import_dst;
+                sampled_fill.cls = ResourceClass::Texture;
+                prosper::frontend::LiveComputeImageImport compute_import;
+                CHECK(prosper::frontend::import_live_compute_storage_image(
+                          sampled_fill, import_dst.size, compute_import) &&
+                          compute_import.valid() && compute_import.width == W &&
+                          compute_import.height == 1 && compute_import.depth == 1 &&
+                          compute_import.native_format && compute_import.layout,
+                      "validated typed-storage result can be leased by an exact sampled descriptor");
+                compute_import = {};
+                // This binary does not install the emulator's SIGSEGV write-fault handler. Mark the
+                // same page dirty through the DMA/GPU side of the watch API; the importer must not
+                // trust the retained image after any architectural writer invalidates its bytes.
+                prosper::host::guest_write_watch_notify_gpu_write(
+                    reinterpret_cast<uint64_t>(import_guest), import_dst.size);
+                CHECK(!prosper::frontend::import_live_compute_storage_image(
+                          sampled_fill, import_dst.size, compute_import),
+                      "guest mutation revokes a cross-submit compute-image import");
+                prosper::host::guest_write_watch_notify_direct_mapping_removed(
+                    reinterpret_cast<uint64_t>(import_guest), import_mapping_bytes);
+                prosper::host::guest_write_watch_set_fault_onstack(false);
+                munmap(import_guest, import_mapping_bytes);
+            }
+#endif
+
             // Prove a second full writer of the same format/extent on a different target, then use
             // it on this still-valid guest mirror. The persistent image key intentionally does not
             // contain the shader: different post-processes may reuse one target. Its GPU comparison

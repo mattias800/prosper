@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace prosper::frontend {
@@ -70,6 +71,28 @@ bool pack_live_target_r11g11b10(const prosper::gpu::LiveTargetSnapshot& snapshot
 
 // Execute already-realized compute items synchronously. Exposed for the production-backend test.
 bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& items);
+
+// Borrow an exact native storage result for a later sampled graphics binding. The import is
+// deliberately narrower than the compute image cache: only a successful typed-storage dispatch can
+// publish one, the complete descriptor identity must match, and either the current submit journal or
+// the cache's page watch must prove that no later guest write overlapped the result. The lease pins
+// the Vulkan image until the graphics submission has completed. Handles remain opaque here so this
+// shared interface does not expose Vulkan types.
+struct LiveComputeImageImport {
+    uint32_t width = 0, height = 0, depth = 0;
+    uint32_t native_format = 0; // opaque VkFormat
+    uint32_t layout = 0;        // opaque VkImageLayout; currently GENERAL
+    void* image = nullptr;      // borrowed VkImage
+    void* device = nullptr;     // VkDevice that owns image
+    std::shared_ptr<void> lease;
+
+    bool valid() const {
+        return width && height && depth && native_format && image && device && lease;
+    }
+};
+bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampled_resource,
+                                       uint64_t guest_bytes,
+                                       LiveComputeImageImport& import);
 
 // Monotonic diagnostic count of writable-buffer results whose exact GPU comparison avoided a host
 // mapping/scan. Exposed so the production-backend test can prove that optimization path executes.
