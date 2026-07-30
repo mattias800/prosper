@@ -1987,6 +1987,85 @@ int main() {
     CHECK(sampled_uint_roundtrip(DataFormat::Uint16, 4, 8, 0x590164),
           "tiled RGBA16_UINT sampled values reach storage writeback byte-exactly");
 
+    // GPU captures preserve descriptor addresses but materialize resource bytes in owned host
+    // arrays. Warm replay must retain those sampled images just like the live guest-backed path,
+    // while validating by exact bytes because host_data mutations never enter the guest journal or
+    // page write-watch system. Prove both the unchanged hit and a direct unreported mutation.
+    {
+        constexpr uint32_t host_texel_bytes = 4;
+        std::vector<uint8_t> linear_src(W * host_texel_bytes);
+        std::vector<uint8_t> linear_dst(W * host_texel_bytes, 0xA5);
+        for (size_t i = 0; i < linear_src.size(); ++i)
+            linear_src[i] = static_cast<uint8_t>(i * 41 + 13);
+        const size_t tiled_size = tiled_surface_bytes(
+            W, 1, dcc_tile, 0, host_texel_bytes);
+        std::vector<uint8_t> capture_owned_src(tiled_size, 0);
+        tile_surface(capture_owned_src.data(), linear_src.data(), W, 1,
+                     dcc_tile, 0, host_texel_bytes);
+
+        ShaderResourceTable host_rt = irt;
+        for (ShaderResource& resource : host_rt.resources) {
+            if (resource.binding != 4 && resource.binding != 5) continue;
+            resource.img_dim = 1;
+            resource.format = DataFormat::Uint8;
+            resource.num_components = 4;
+            resource.width = W;
+            resource.height = resource.depth = 1;
+            if (resource.binding == 4) {
+                resource.cls = ResourceClass::Texture;
+                resource.tile_mode = dcc_tile;
+                resource.gpu_addr = 0x71c0000000ull;
+                resource.size = static_cast<uint32_t>(capture_owned_src.size());
+                resource.host_data = capture_owned_src.data();
+                resource.host_data_size = capture_owned_src.size();
+                resource.swizzle[0] = 4;
+                resource.swizzle[1] = 5;
+                resource.swizzle[2] = 6;
+                resource.swizzle[3] = 7;
+            } else {
+                resource.tile_mode = 0;
+                resource.gpu_addr = reinterpret_cast<uint64_t>(linear_dst.data());
+                resource.size = static_cast<uint32_t>(linear_dst.size());
+            }
+        }
+        const std::vector<uint32_t> host_spirv = recompile_valu(
+            image_copy_2d, std::size(image_copy_2d), 1, 0, &host_rt);
+        CHECK(!host_spirv.empty(),
+              "capture-owned sampled-image copy kernel recompiles");
+        if (!host_spirv.empty()) {
+            ComputeItem host_item;
+            host_item.spirv = host_spirv;
+            host_item.resources = std::make_shared<ShaderResourceTable>(host_rt);
+            host_item.launch.threads_x = W;
+            host_item.launch.local_x = 64;
+            host_item.launch.groups_x = 1;
+            host_item.launch.local_y = host_item.launch.local_z = 1;
+            host_item.launch.groups_y = host_item.launch.groups_z = 1;
+            host_item.code_addr = 0x590ca9;
+            CHECK(prosper::frontend::execute_live_compute_items({host_item}) &&
+                      linear_dst == linear_src,
+                  "capture-owned sampled image establishes an exact retained source");
+
+            const uint64_t skips_before =
+                prosper::frontend::live_compute_sampled_image_upload_skips();
+            CHECK(prosper::frontend::execute_live_compute_items({host_item}) &&
+                      prosper::frontend::live_compute_sampled_image_upload_skips() >
+                          skips_before,
+                  "unchanged capture-owned sampled image skips its warm-replay upload");
+
+            linear_src[0] ^= 0xff;
+            tile_surface(capture_owned_src.data(), linear_src.data(), W, 1,
+                         dcc_tile, 0, host_texel_bytes);
+            const uint64_t skips_before_mutation =
+                prosper::frontend::live_compute_sampled_image_upload_skips();
+            CHECK(prosper::frontend::execute_live_compute_items({host_item}) &&
+                      linear_dst == linear_src &&
+                      prosper::frontend::live_compute_sampled_image_upload_skips() ==
+                          skips_before_mutation,
+                  "direct capture-owned mutation refreshes the retained sampled image exactly");
+        }
+    }
+
     // --- #1122 seed-skip coverage proof. A write-only storage image whose dispatch fully covers the
     // extent can skip the (expensive) seed -- BUT ONLY after proving the write actually stores every
     // texel. covers_extent is necessary, not sufficient: a shader that stores a SUBSET of a covering

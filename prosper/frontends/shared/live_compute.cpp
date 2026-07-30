@@ -607,6 +607,11 @@ struct CachedComputeBuffer {
 
 struct ComputeImageCacheKey {
     uint64_t gpu_addr = 0;
+    // Replay/capture resources preserve the architectural address for descriptor identity, but
+    // expose their bytes through owned host storage. Keep that storage identity in the key just as
+    // the persistent buffer cache does: two loaded captures may reuse a guest address while their
+    // owned byte arrays have unrelated lifetimes.
+    uintptr_t host_data = 0;
     uint32_t guest_bytes = 0;
     uint32_t resource_bytes = 0;
     uint32_t width = 0, height = 0, depth = 0;
@@ -631,7 +636,7 @@ struct ComputeImageCacheKeyHash {
             result ^= std::hash<uint64_t>{}(value) + 0x9e3779b97f4a7c15ull +
                       (result << 6) + (result >> 2);
         };
-        mix(key.guest_bytes); mix(key.resource_bytes);
+        mix(key.host_data); mix(key.guest_bytes); mix(key.resource_bytes);
         mix(key.width); mix(key.height); mix(key.depth);
         mix(key.format); mix(key.components); mix(key.tile_mode); mix(key.img_dim);
         mix(key.linear_row_pitch); mix(key.layer_stride); mix(key.layer_mip_offset);
@@ -646,7 +651,8 @@ ComputeImageCacheKey storage_image_cache_key(const prosper::gpu::ShaderResource&
                                               uint32_t guest_bytes,
                                               VkFormat native_format) {
     return {
-        resource.gpu_addr, guest_bytes, resource.size,
+        resource.gpu_addr, reinterpret_cast<uintptr_t>(resource.host_data),
+        guest_bytes, resource.size,
         resource.width, resource.height, resource.depth,
         static_cast<uint32_t>(resource.format),
         resource.num_components ? resource.num_components : 1u,
@@ -1462,21 +1468,27 @@ struct VulkanComputeContext {
         ++cached.pins;
         image = cached.image;
         memory = cached.memory;
-        if (validation_epoch && cached.validation_epoch == validation_epoch) {
+        if (!key.host_data && validation_epoch && cached.validation_epoch == validation_epoch) {
             upload_skipped = cached.validation_result;
             return true;
         }
-        const bool submit_unchanged = cached.content_valid &&
+        // Capture-owned bytes are not architectural guest mappings: direct writes to host_data do
+        // not enter the submit journal and cannot be protected by GuestWriteWatch. Validate those
+        // entries only against their exact retained snapshot. This makes warm replay exercise the
+        // same image residency as live execution without ever trusting an unrelated guest address.
+        const bool exact_source_only = key.host_data != 0;
+        const bool submit_unchanged = cached.content_valid && !exact_source_only &&
             prosper::gpu::guest_gpu_writes_since(cached.validation_snapshot,
                                                   key.gpu_addr, key.guest_bytes) ==
                 prosper::gpu::GuestGpuWriteQuery::Unchanged;
         const prosper::host::GuestWriteWatchQuery watch_query =
-            !submit_unchanged && cached.content_valid && cached.write_watch
+            !exact_source_only && !submit_unchanged && cached.content_valid && cached.write_watch
                 ? cached.write_watch.query()
                 : prosper::host::GuestWriteWatchQuery::Unknown;
         const bool watch_unchanged = !submit_unchanged &&
             watch_query == prosper::host::GuestWriteWatchQuery::Unchanged;
-        if (cached.content_valid && !submit_unchanged && !watch_unchanged && source) {
+        if (!exact_source_only && cached.content_valid && !submit_unchanged &&
+            !watch_unchanged && source) {
             // Rearm a dirtied watch, or promote a repeatedly stable exact source, before memcmp.
             // A write racing the comparison then remains Dirty for the next acquisition instead of
             // being erased by a post-comparison rearm.
@@ -1496,10 +1508,12 @@ struct VulkanComputeContext {
         cached.validation_epoch = validation_epoch;
         cached.validation_result = upload_skipped;
         if (exact_unchanged) {
-            cached.validation_snapshot = prosper::gpu::guest_gpu_write_snapshot();
-            cached.write_watch_stable_validations = update_write_watch_stability(
-                cached.write_watch_stable_validations, true,
-                compute_write_watch_promotion_validations());
+            if (!exact_source_only) {
+                cached.validation_snapshot = prosper::gpu::guest_gpu_write_snapshot();
+                cached.write_watch_stable_validations = update_write_watch_stability(
+                    cached.write_watch_stable_validations, true,
+                    compute_write_watch_promotion_validations());
+            }
         } else if (!upload_skipped && source) {
             cached.write_watch_stable_validations = 0;
             cached.source_snapshot.assign(source, source + key.guest_bytes);
@@ -1552,7 +1566,8 @@ struct VulkanComputeContext {
         cached.allocation_bytes = allocation_bytes;
         cached.last_use = ++image_cache_clock;
         cached.pins = 1;
-        cached.validation_snapshot = prosper::gpu::guest_gpu_write_snapshot();
+        if (!key.host_data)
+            cached.validation_snapshot = prosper::gpu::guest_gpu_write_snapshot();
         if (source)
             cached.source_snapshot.assign(source, source + key.guest_bytes);
         auto [it, inserted] = image_cache.emplace(key, std::move(cached));
@@ -1589,8 +1604,13 @@ struct VulkanComputeContext {
             cached.source_snapshot.assign(current_source,
                                           current_source + key.guest_bytes);
         cached.content_valid = true;
-        cached.validation_snapshot = prosper::gpu::guest_gpu_write_snapshot();
+        if (!key.host_data)
+            cached.validation_snapshot = prosper::gpu::guest_gpu_write_snapshot();
         cached.write_watch_stable_validations = 0;
+        if (key.host_data) {
+            cached.write_watch.reset();
+            return;
+        }
         if (cached.write_watch && cached.write_watch.rearm()) return;
         cached.write_watch.reset();
     }
@@ -1837,6 +1857,7 @@ struct VulkanComputeContext {
 };
 
 VulkanComputeContext* g_live_compute_context = nullptr;
+std::atomic<uint64_t> g_sampled_image_upload_skips{0};
 
 struct BorrowedComputeImageLease {
     VulkanComputeContext* context = nullptr;
@@ -3592,11 +3613,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         std::all_of(metadata, metadata + metadata_bytes,
                                     [](uint8_t value) { return value == 0xff; });
                 }
-                bi.cache_candidate = !r->host_data && dcc_cache_safe &&
+                bi.cache_candidate = dcc_cache_safe &&
                     persistent_compute_image_enabled(sbytes, ComputeImageCacheClass::sampled);
                 if (bi.cache_candidate) {
                     bi.cache_key = {
-                        r->gpu_addr, static_cast<uint32_t>(sampled_guest_need), r->size,
+                        r->gpu_addr, reinterpret_cast<uintptr_t>(r->host_data),
+                        static_cast<uint32_t>(sampled_guest_need), r->size,
                         r->width, r->height, r->depth,
                         static_cast<uint32_t>(r->format), sampled_components,
                         r->tile_mode, r->img_dim, r->linear_row_pitch_bytes,
@@ -3608,6 +3630,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     bi.persistent = ctx.acquire_cached_image(
                         bi.cache_key, sampled_guest_source, image_validation_epoch,
                         bi.image, bi.memory, bi.upload_skipped);
+                    if (bi.persistent && bi.upload_skipped)
+                        g_sampled_image_upload_skips.fetch_add(1, std::memory_order_relaxed);
                     if (trace && bi.persistent)
                         std::fprintf(stderr,
                                      "[compute]   persistent sampled image binding=%u "
@@ -3733,7 +3757,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     (bi.dcc_metadata && bi.dcc_metadata_bytes &&
                      std::all_of(bi.dcc_metadata, bi.dcc_metadata + bi.dcc_metadata_bytes,
                                  [](uint8_t value) { return value == 0xff; }));
-                bi.cache_candidate = !renderer_owned && !r->host_data && dcc_cache_safe &&
+                bi.cache_candidate = !renderer_owned && dcc_cache_safe &&
                     !bi.poison_verify && (bi.exact_storage_bytes() || bi.seed_skip) &&
                     persistent_compute_image_enabled(sbytes, ComputeImageCacheClass::storage);
                 if (bi.cache_candidate) {
@@ -5618,6 +5642,10 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
 
 uint64_t live_compute_buffer_gpu_result_skips() {
     return g_buffer_gpu_result_skips.load(std::memory_order_relaxed);
+}
+
+uint64_t live_compute_sampled_image_upload_skips() {
+    return g_sampled_image_upload_skips.load(std::memory_order_relaxed);
 }
 
 void live_compute_fail_next_storage_readback_for_test() {
