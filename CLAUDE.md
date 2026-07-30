@@ -449,6 +449,21 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   **Do NOT add "Generated with Claude Code" attribution lines** (the 🤖 badge, "Generated with
   [Claude Code](...)" footers, session links) to PR bodies, commit messages, issue text, or
   comments — anywhere. They are noise in the project record; the co-author trailer alone is enough.
+- **Never publish the developer machine's local paths.** This repository is public. An absolute path
+  leaks the account name and the private directory layout of someone's computer, and it is never the
+  information a reader needs — the *shape* of the command is. So keep absolute host paths out of commit
+  messages, PR titles/bodies/comments, issue text and review comments, and out of committed files
+  (docs, scripts, tests, code comments). Use placeholders instead, or a path relative to the repository:
+  ```text
+  <REPO_ROOT>    the checkout root          <WORKTREE>   a worktree root
+  <DUMP_ROOT>    where the game dumps live  ~/           the developer's home
+  ```
+  So write `-DGAME_DUMP=<DUMP_ROOT>/PPSA24651-app0`, not the real path, and
+  `cd <WORKTREE> && cmake --build build -j6`. Paths *inside* the repo (`prosper/src/gpu/…`) and generic
+  system paths (`/usr/lib64/libc.so.6`, `/tmp`, `/var/tmp`) are fine — the rule is about the private
+  part above the repository root. This is a privacy matter, not a security one: nothing here is secret,
+  and it still should not be published. Sanitize before you post; if something already published slipped
+  through, edit it (`gh api -X PATCH repos/OWNER/REPO/issues/comments/<id> -f body=…` edits a comment).
 - **Track work in GitHub issues** (`gh issue ...`). The rules:
   - **Any bug you find but do not fix in the same session gets an issue, immediately**, while the
     context is fresh: exact `file:line`, the concrete failure scenario (inputs/state → wrong
