@@ -35,11 +35,8 @@ int main() {
 #endif
     const bool adaptive_storage_result_validation_enabled =
         std::getenv("PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION") == nullptr;
-    const char* cold_storage_snapshot_min_mb =
-        std::getenv("PROSPER_COLD_STORAGE_SNAPSHOT_MIN_MB");
     const bool cold_storage_snapshot_deferral_enabled =
-        adaptive_storage_result_validation_enabled && cold_storage_snapshot_min_mb &&
-        std::strcmp(cold_storage_snapshot_min_mb, "0") == 0;
+        adaptive_storage_result_validation_enabled;
     using prosper::frontend::ComputeImageCacheClass;
     CHECK(prosper::frontend::compute_image_cache_default_minimum_bytes(
               ComputeImageCacheClass::sampled) == 1024ull * 1024ull &&
@@ -2552,6 +2549,7 @@ int main() {
                 prosper::frontend::live_compute_storage_result_snapshot_bytes();
             const uint64_t cold_result_snapshots_before =
                 prosper::frontend::live_compute_image_result_snapshot_bytes();
+            prosper::frontend::live_compute_zero_next_cold_storage_snapshot_minimum_for_test();
             CHECK(prosper::frontend::execute_live_compute_items({cold_item}),
                   "proven-full writer executes on a cold retained target");
             const uint64_t cold_source_snapshots_after =

@@ -170,6 +170,7 @@ namespace {
 std::atomic<uint64_t> g_buffer_gpu_result_skips{0};
 std::atomic<uint64_t> g_compute_storage_transfer_seeds{0};
 std::atomic<bool> g_fail_next_storage_readback_for_test{false};
+std::atomic<bool> g_zero_next_cold_storage_snapshot_minimum_for_test{false};
 std::atomic<bool> g_force_next_image_result_host_fallback_for_test{false};
 std::atomic<bool> g_fail_next_image_result_buffer_retain_for_test{false};
 
@@ -841,6 +842,9 @@ bool native_3d_transfer_enabled() {
 }
 
 size_t cold_storage_result_snapshot_defer_min_bytes() {
+    if (g_zero_next_cold_storage_snapshot_minimum_for_test.exchange(
+            false, std::memory_order_acq_rel))
+        return 0;
     static const size_t bytes = [] {
         const char* value = std::getenv("PROSPER_COLD_STORAGE_SNAPSHOT_MIN_MB");
         char* end = nullptr;
@@ -6276,6 +6280,11 @@ bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
 
 void live_compute_fail_next_storage_readback_for_test() {
     g_fail_next_storage_readback_for_test.store(true, std::memory_order_release);
+}
+
+void live_compute_zero_next_cold_storage_snapshot_minimum_for_test() {
+    g_zero_next_cold_storage_snapshot_minimum_for_test.store(
+        true, std::memory_order_release);
 }
 
 void live_compute_force_next_image_result_host_fallback_for_test() {

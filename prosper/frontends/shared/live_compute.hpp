@@ -140,6 +140,10 @@ bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
 // readback fails after dispatch, exercising retained-image invalidation without a Vulkan fault.
 void live_compute_fail_next_storage_readback_for_test();
 
+// Deterministically lower the next eligible cold storage admission crossover to zero. This lets a
+// compact production-backend fixture execute the real deferral predicate and retention branch.
+void live_compute_zero_next_cold_storage_snapshot_minimum_for_test();
+
 // Deterministic setup/ownership failure injection for the storage-result fallback regression. The
 // pair models a transient compare-pipeline failure followed by a cache-capacity failure without
 // relying on driver behavior.
