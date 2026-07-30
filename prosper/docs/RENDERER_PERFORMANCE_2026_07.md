@@ -1412,9 +1412,49 @@ selects a 512x512 fallback instead of the capture's 3840x2160 live oracle becaus
 seed window, so the equal BMPs are deterministic stored/current regression evidence, not a claim that this
 capsule reproduces the complete live frame. A rolling producer window remains the next correctness oracle.
 
+## Plucky storage-result validation snapshots
+
+Profiling the full-resolution gameplay route found another synchronous CPU copy outside the Vulkan
+dispatch itself. After every successful persistent storage-image writeback, compute retained an exact
+copy of the complete guest target as its next source-validation baseline. This is necessary for a
+read/modify/write storage image on platforms without page watches, but it duplicated 30-70 MiB every
+frame even for a proven-full write-only target whose seed is unobservable.
+
+Directly replacing every result snapshot with a Linux page-protection watch was not a valid fix. It
+improved several stable post-processes, but program `0x3017be0000` changes its 1920x1080 result every
+frame. Disarming and rearming that large range at each writeback raised its steady writeback from about
+3 ms to 50-61 ms. The final policy instead keeps one initial exact snapshot, runs the existing
+collision-free GPU result comparison independently of source authority, and promotes a page watch only
+after two consecutive repeated GPU results. A changing proven-full output releases its redundant source
+snapshot and remains on ordinary writeback; a partial/readable storage target retains the exact fallback.
+Two dirty external-write observations permanently disable the watch for that cache entry. The recovery
+switch `PROSPER_NO_STORAGE_RESULT_WRITE_WATCH=1` restores the prior exact-snapshot policy.
+
+The production-backend regression covers all three boundaries: a stable repeated result promotes a
+watch without another snapshot copy, an external guest mutation still forces exact repair, and
+alternating proven-full writers neither snapshot nor rearm their changing target. The existing injected
+post-submit readback failure continues to prove that a GPU baseline cannot publish stale guest bytes.
+
+A matched 180-second native-resolution Plucky A/B used the same binary, route, audio/input frontends,
+and timing settings; the control changed only the recovery switch. Storage-result snapshots fell from
+174,957.6 MiB to 29,481.9 MiB (83.1%). Representative complete-dispatch timings were:
+
+| program | control median | adaptive median | samples (control/adaptive) |
+|---|---:|---:|---:|
+| `0x3017be0000` | 4.93 ms | 3.64 ms | 104 / 121 |
+| `0x30180d0000` | 14.11 ms | 9.01 ms | 1,354 / 1,777 |
+| `0x3017580000` | 34.06 ms | 25.80 ms | 104 / 121 |
+
+The adaptive `0x3017be0000` distribution remained bounded across all 121 samples: 5.69 ms p95 and
+15.91 ms maximum, with no recurrence of the experimental 50-61 ms watch-rearm state. Different submit
+counts reflect real route progression under the performance difference, so these are supporting live
+measurements rather than a standalone FPS or pixel-equality claim.
+
 ## Next renderer step
 
-Capture a fresh v39 rolling temporal window on current code around the Plucky title/gameplay transition. It
-must include the producers for the two 48x48 volumes and close with zero unresolved leaves, providing a native
-pixel oracle as well as exact compute pipeline contracts. Keep the exact-byte and disable-switch A/B
-discipline used here, and preserve screenshot/capture correctness while reducing the synchronous boundaries.
+Attribute the remaining compute-image source snapshots by cache entry and distinguish unavoidable readable
+storage inputs from cache churn. In parallel, capture a fresh v39 rolling temporal window around the Plucky
+title/gameplay transition. It must include the producers for the two 48x48 volumes and close with zero
+unresolved leaves, providing a native pixel oracle as well as exact compute pipeline contracts. Keep the
+exact-byte and disable-switch A/B discipline used here, and preserve screenshot/capture correctness while
+reducing the synchronous boundaries.

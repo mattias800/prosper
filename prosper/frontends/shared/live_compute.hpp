@@ -102,6 +102,11 @@ uint64_t live_compute_buffer_gpu_result_skips();
 // Monotonic diagnostic count of retained sampled-image hits whose validated source omitted upload.
 // Capture/replay tests use this to prove residency without relying on timing-sensitive assertions.
 uint64_t live_compute_sampled_image_upload_skips();
+// Monotonic attribution for storage-result source validation. Linux production-backend tests use
+// these to prove that an armed result watch replaces the redundant guest-byte snapshot copy.
+uint64_t live_compute_storage_result_snapshot_bytes();
+uint64_t live_compute_storage_result_watch_promotions();
+uint64_t live_compute_storage_result_watch_rearms();
 
 // Deterministic failure injection for the storage-image recovery regression test. The next storage
 // readback fails after dispatch, exercising retained-image invalidation without a Vulkan fault.
