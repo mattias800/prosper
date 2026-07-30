@@ -10710,9 +10710,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (branch.pc < L.header_pc && target >= L.exit_pc) guarded_narrow_entry = true;
         }
         // 1. Pre-loop body. A compiler may place one ordinary uniform if/else before the canonical
-        // counted loop (Evergate selects one of two constant blocks this way). Structure that choice
-        // with the same two-arm PHIs as the general forward-if path, then enter the existing counted
-        // loop lowering. Anything nested/more complex stays unsupported and rejects visibly.
+        // counted loop (Evergate selects one of two constant blocks this way; Astro's NGG culling
+        // prelude also has a one-arm conditional). Structure that choice with the same two-arm PHIs
+        // as the general forward-if path, then enter the existing counted-loop lowering. Anything
+        // nested/more complex stays unsupported and rejects visibly.
         std::vector<Rdna2Inst> preloop;
         for (const auto& in : ins) {
             if (in.pc >= L.header_pc) break;
@@ -10732,9 +10733,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         const std::vector<ForwardIf> preloop_ifs = detect_forward_ifs(
             preloop, /*allow_vcc*/!b.is_compute, code, dwords, &effective_safe, nullptr,
             &preloop_rejected, /*compute_wave_branches*/b.is_compute);
-        if (preloop_rejected || preloop_ifs.size() > 1 ||
-            (!preloop_ifs.empty() && (!preloop_ifs[0].has_else ||
-                                      preloop_ifs[0].merge_pc > L.header_pc))) {
+        const bool preloop_if_escapes = !preloop_ifs.empty() &&
+            (preloop_ifs[0].has_else ? preloop_ifs[0].merge_pc : preloop_ifs[0].target_pc) >
+                L.header_pc;
+        if (preloop_rejected || preloop_ifs.size() > 1 || preloop_if_escapes) {
             if (getenv("PROSPER_DBG"))
                 fprintf(stderr,
                         "[recompile-reject] counted-loop prelude cfg rejected=%u ifs=%zu header=%u\n",
@@ -10758,16 +10760,21 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             condition = F.on_scc0 ? condition : b.logical_not(condition);
             const RegState before = rs;
             std::set<int> written_v, written_s;
-            loop_written_regs(ins, F.branch_pc + 1, F.sb_pc, written_v, written_s);
-            loop_written_regs(ins, F.target_pc, F.merge_pc, written_v, written_s);
+            const uint32_t then_end = F.has_else ? F.sb_pc : F.target_pc;
+            const uint32_t merge_pc = F.has_else ? F.merge_pc : F.target_pc;
+            loop_written_regs(ins, F.branch_pc + 1, then_end, written_v, written_s);
+            if (F.has_else)
+                loop_written_regs(ins, F.target_pc, merge_pc, written_v, written_s);
             const uint32_t then_label = b.id(), else_label = b.id(), merge_label = b.id();
             b.emit_selmerge(merge_label);
             b.emit_condbranch(condition, then_label, else_label);
 
             b.emit_label(then_label);
-            if (!emit_range(F.branch_pc + 1, F.sb_pc)) return false;
-            if (idx >= ins.size() || ins[idx].pc != F.sb_pc) return false;
-            ++idx; // consume the then arm's jump to the merge
+            if (!emit_range(F.branch_pc + 1, then_end)) return false;
+            if (F.has_else) {
+                if (idx >= ins.size() || ins[idx].pc != F.sb_pc) return false;
+                ++idx; // consume the then arm's jump to the merge
+            }
             const uint32_t then_block = b.cur_block;
             std::unordered_map<int, uint32_t> then_v, then_s;
             for (int reg : written_v) then_v[reg] = vget(reg);
@@ -10781,7 +10788,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
 
             rs = before;
             b.emit_label(else_label);
-            if (!emit_range(F.target_pc, F.merge_pc)) return false;
+            if (F.has_else && !emit_range(F.target_pc, merge_pc)) return false;
             const uint32_t else_block = b.cur_block;
             b.emit_branch(merge_label);
             b.emit_label(merge_label);
@@ -10815,7 +10822,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     fprintf(stderr, "[recompile-reject] counted-loop prelude changes mask domain\n");
                 return false; // no mask-domain PHIs in this narrow composition
             }
-            if (!emit_range(F.merge_pc, L.header_pc)) return false;
+            if (!emit_range(merge_pc, L.header_pc)) return false;
         }
         // Ordinary counted loops require full EXEC at entry. An NGG vertex is already represented by
         // one independent Vulkan invocation, however, so its EXEC bit is an ordinary per-invocation
@@ -12099,14 +12106,20 @@ static bool is_astro_bot_ngg_one_lane_wrapper(const uint32_t* code, size_t dword
     if (!code) return false;
     std::vector<Rdna2Inst> instructions;
     const size_t program_dwords = rdna2_walk(code, dwords, instructions);
-    if (program_dwords != 54 && program_dwords != 734 && program_dwords != 3124 &&
-        program_dwords != 3435 && program_dwords != 3917)
+    if (program_dwords != 54 && program_dwords != 734 && program_dwords != 749 &&
+        program_dwords != 3124 && program_dwords != 3435 && program_dwords != 3455 &&
+        program_dwords != 3917)
         return false;
     const uint64_t hash = shader_program_hash(code, program_dwords);
     return (program_dwords == 54 && hash == 0x9e9d8e37bcc70607ull) ||
            (program_dwords == 734 && hash == 0x79eb2b954b07dc8eull) ||
+           // The same 734-word culling wrapper is live-linked after its exact 15-word fetch prolog.
+           (program_dwords == 749 && hash == 0xb440349937df751eull) ||
            (program_dwords == 3124 && hash == 0x41e6ac616c18d295ull) ||
            (program_dwords == 3435 && hash == 0xfad7a9f486523cfcull) ||
+           // The same 3435-word wrapper is live-linked after its exact 20-word fetch prolog.
+           // Hashing the complete concatenated program keeps the one-lane projection byte-exact.
+           (program_dwords == 3455 && hash == 0x562ce5ad01c4c6e3ull) ||
            (program_dwords == 3917 && hash == 0x7f5f2349e2816f5eull);
 }
 
