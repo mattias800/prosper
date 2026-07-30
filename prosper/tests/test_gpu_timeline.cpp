@@ -211,6 +211,7 @@ int main() {
     _putenv_s("PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE", bundle_capture.c_str());
     _putenv_s("PROSPER_GPU_TIMELINE_CAPTURE_DEPTH", "2");
     _putenv_s("PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DIM", "642x362");
+    _putenv_s("PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DRAW_INDEX", "1:1");
     _putenv_s("PROSPER_GPU_TIMELINE_CAPTURE_CHECKPOINT_EVERY", "1");
 #else
     setenv("PROSPER_GPU_TIMELINE", runtime.c_str(), 1);
@@ -221,9 +222,14 @@ int main() {
     setenv("PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE", bundle_capture.c_str(), 1);
     setenv("PROSPER_GPU_TIMELINE_CAPTURE_DEPTH", "2", 1);
     setenv("PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DIM", "642x362", 1);
+    setenv("PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DRAW_INDEX", "1:1", 1);
     setenv("PROSPER_GPU_TIMELINE_CAPTURE_CHECKPOINT_EVERY", "1", 1);
 #endif
     GpuState prestart_state;
+    prestart_state.cx[prosper::agc::Pm4::CB_COLOR0_ATTRIB2] =
+        ((642u - 1u) << 14) | (362u - 1u);
+    prestart_state.draws.push_back({3});
+    prestart_state.draws.back().command_order = 104;
     prestart_state.command_order = 105;
     prestart_state.dma_copies.push_back({0x200000, 0x100000000ull, 16, 0, 104, 0});
     begin_gpu_timeline_submit(40);
@@ -237,6 +243,9 @@ int main() {
     predecessor_state.cx[prosper::agc::Pm4::DB_HTILE_DATA_BASE] = 0x8200;
     predecessor_state.cx[prosper::agc::Pm4::DB_DEPTH_SIZE_XY] = 0x01690281;
     predecessor_state.draws.push_back({3});
+    predecessor_state.draws.back().command_order = 119;
+    predecessor_state.draws.push_back({3});
+    predecessor_state.draws.back().command_order = 120;
     predecessor_state.command_order = 120;
     begin_gpu_timeline_submit(41);
     record_gpu_timeline_submit(predecessor_state, 41);
@@ -267,11 +276,11 @@ int main() {
     CHECK(runtime_timeline.submits[1].depth_surfaces.size() == 1 &&
           runtime_timeline.submits[1].depth_surfaces[0].depth_read_base == 0x700000 &&
           runtime_timeline.submits[1].depth_surfaces[0].htile_data_base == 0x820000 &&
-          runtime_timeline.submits[1].depth_surfaces[0].depth_test_count == 1,
+          runtime_timeline.submits[1].depth_surfaces[0].depth_test_count == 2,
           "runtime timeline extracts compact DS programming without realizing resources");
     CHECK(runtime_timeline.submits[1].target_spans.size() == 1 &&
           runtime_timeline.submits[1].target_spans[0].first_draw == 0 &&
-          runtime_timeline.submits[1].target_spans[0].draw_count == 1 &&
+          runtime_timeline.submits[1].target_spans[0].draw_count == 2 &&
           runtime_timeline.submits[1].target_spans[0].width == 642 &&
           runtime_timeline.submits[1].target_spans[0].height == 362,
           "runtime timeline records compact semantic target spans");
@@ -288,7 +297,7 @@ int main() {
           runtime_bundle.submits[1].submit_index == 42,
           "exact submit selection writes an ordered same-run capture bundle");
     CHECK(runtime_bundle.submits.front().submit_index == 41,
-          "bundle start target excludes earlier nonmatching submits and includes the first writer");
+          "bundle start target draw window excludes an earlier matching extent and includes the first writer");
 
     const auto compat_v2 = base.string() + "-compat-v2.prgtl";
     GpuTimelineWriter compat_writer;

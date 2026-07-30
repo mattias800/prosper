@@ -242,6 +242,8 @@ struct RuntimeDetailRequest {
     uint32_t bundle_target_height = 0;
     uint32_t bundle_start_target_width = 0;
     uint32_t bundle_start_target_height = 0;
+    uint32_t bundle_start_target_min_index = 0;
+    uint32_t bundle_start_target_max_index = UINT32_MAX;
     uint32_t bundle_checkpoint_interval = 0;
     uint32_t select_target_width = 0;
     uint32_t select_target_height = 0;
@@ -326,6 +328,21 @@ struct RuntimeDetailRequest {
                 } else {
                     bundle_start_target_width = width;
                     bundle_start_target_height = height;
+                }
+            }
+            if (const char* range = std::getenv(
+                    "PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DRAW_INDEX")) {
+                unsigned first = 0, last = 0; char tail = 0;
+                if (!bundle_start_target_width ||
+                    std::sscanf(range, "%u:%u%c", &first, &last, &tail) != 2 ||
+                    first > last) {
+                    std::fprintf(stderr,
+                                 "[timeline] capture start target draw index requires "
+                                 "START_TARGET_DIM and a MIN:MAX range\n");
+                    bundle_path.clear(); bundle_depth = 0;
+                } else {
+                    bundle_start_target_min_index = first;
+                    bundle_start_target_max_index = last;
                 }
             }
             if (const char* interval = std::getenv(
@@ -715,9 +732,11 @@ bool hash_guest_backing(uint64_t addr, uint64_t size, uint64_t& hash) {
     return true;
 }
 
-bool runtime_submit_has_target(const GpuState& state, uint32_t width, uint32_t height) {
+bool runtime_submit_has_target(const GpuState& state, uint32_t width, uint32_t height,
+                               uint32_t min_draw = 0, uint32_t max_draw = UINT32_MAX) {
     if (!width || !height) return false;
     for (size_t i = 0; i < state.draws.size(); ++i) {
+        if (i < min_draw || i > max_draw) continue;
         const RenderState rs = extract_render_state(state.state_at_draw(i));
         if (rs.color0_width == width && rs.color0_height == height) return true;
     }
@@ -1756,11 +1775,16 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
     RuntimeProducerHistory& history = runtime_producer_history();
     if (request.valid && request.bundle_start_target_width && !request.bundle_start_reached &&
         runtime_submit_has_target(state, request.bundle_start_target_width,
-                                  request.bundle_start_target_height)) {
+                                  request.bundle_start_target_height,
+                                  request.bundle_start_target_min_index,
+                                  request.bundle_start_target_max_index)) {
         request.bundle_start_reached = true;
-        std::fprintf(stderr, "[timeline] capture bundle start reached submit=%llu target=%ux%u\n",
+        std::fprintf(stderr, "[timeline] capture bundle start reached submit=%llu "
+                     "target=%ux%u target-index=%u..%u\n",
                      static_cast<unsigned long long>(submit_no),
-                     request.bundle_start_target_width, request.bundle_start_target_height);
+                     request.bundle_start_target_width, request.bundle_start_target_height,
+                     request.bundle_start_target_min_index,
+                     request.bundle_start_target_max_index);
     }
     const bool capture_endpoint = request.valid &&
         runtime_capture_endpoint_matches(request, submit, state);
