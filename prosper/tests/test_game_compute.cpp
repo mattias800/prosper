@@ -29,12 +29,12 @@ int main() {
 #ifdef _WIN32
     _putenv_s("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB", "0");
     _putenv_s("PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB", "1");
-    _putenv_s("PROSPER_COMPUTE_STORAGE_WRITE_WATCH_MIN_KB", "0");
 #else
     setenv("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB", "0", 1);
     setenv("PROSPER_COMPUTE_BUFFER_RESULT_MIN_MB", "1", 1);
-    setenv("PROSPER_COMPUTE_STORAGE_WRITE_WATCH_MIN_KB", "0", 1);
 #endif
+    const bool adaptive_storage_result_validation_enabled =
+        std::getenv("PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION") == nullptr;
     using prosper::frontend::ComputeImageCacheClass;
     CHECK(prosper::frontend::compute_image_cache_default_minimum_bytes(
               ComputeImageCacheClass::sampled) == 1024ull * 1024ull &&
@@ -2153,6 +2153,8 @@ int main() {
 #if defined(__linux__)
             auto repeated_write_watch = prosper::host::GuestWriteWatch::create(
                 reinterpret_cast<uint64_t>(fill_guest), fill_guest_bytes);
+            const uint64_t repeated_snapshots_before =
+                prosper::frontend::live_compute_storage_result_snapshot_bytes();
 #endif
             uint32_t repeated_write_notifications = 0;
             set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
@@ -2170,6 +2172,9 @@ int main() {
             CHECK(static_cast<bool>(repeated_write_watch) && repeated_write_watch.query() ==
                       prosper::host::GuestWriteWatchQuery::Unchanged,
                   "identical retained output leaves guest-byte dirty tracking clean");
+            CHECK(prosper::frontend::live_compute_storage_result_snapshot_bytes() ==
+                      repeated_snapshots_before,
+                  "identical retained output does not recopy its guest-byte baseline");
             repeated_write_watch.reset();
 #endif
 
@@ -2335,13 +2340,10 @@ int main() {
 #if defined(__linux__)
                 // The nested compute-import fixture temporarily disables the synthetic fault
                 // handler when it tears down. Restore the outer mapping's emulator contract before
-                // checking result-watch rearming on this target.
+                // exercising this target again.
                 prosper::host::guest_write_watch_set_fault_onstack(true);
                 const uint64_t storage_snapshots_before =
                     prosper::frontend::live_compute_storage_result_snapshot_bytes();
-                const uint64_t storage_watches_before =
-                    prosper::frontend::live_compute_storage_result_watch_promotions() +
-                    prosper::frontend::live_compute_storage_result_watch_rearms();
 #endif
                 CHECK(prosper::frontend::execute_live_compute_items({changed}),
                       "storage image retries after a failed post-submit readback");
@@ -2351,13 +2353,16 @@ int main() {
                 CHECK(changed_write_notifications == 1,
                       "recovered storage output forces guest writeback and invalidation");
 #if defined(__linux__)
-                CHECK(prosper::frontend::live_compute_storage_result_snapshot_bytes() ==
-                          storage_snapshots_before &&
-                      prosper::frontend::live_compute_storage_result_watch_promotions() +
-                          prosper::frontend::live_compute_storage_result_watch_rearms() >
-                              storage_watches_before,
-                      "stable recovered storage result rearms exact dirty tracking without "
-                      "copying a redundant guest-byte snapshot");
+                const uint64_t storage_snapshots_after =
+                    prosper::frontend::live_compute_storage_result_snapshot_bytes();
+                if (adaptive_storage_result_validation_enabled) {
+                    CHECK(storage_snapshots_after == storage_snapshots_before,
+                          "changed full-overwrite recovery avoids a redundant result snapshot");
+                } else {
+                    CHECK(storage_snapshots_after >=
+                              storage_snapshots_before + fill_guest_bytes,
+                          "disabled adaptive policy retains the exact recovered result");
+                }
 #endif
             }
 
@@ -2385,10 +2390,9 @@ int main() {
                   "externally changed guest mirror forces writeback and invalidation");
 
 #if defined(__linux__)
-            // Once the formerly stable target starts changing every dispatch, page protection is
-            // pure overhead: each writeback would disarm and rearm the complete surface. Alternate
-            // two proven-full writers and verify that the dynamic target stays on the no-snapshot,
-            // no-watch path after the first transition retires its old stable watch.
+            // Alternate two proven-full writers and verify that a changing target carries no exact
+            // source snapshot: its old seed is unobservable, and the next GPU result comparison is
+            // independently collision-free.
             if (!changed_spirv.empty()) {
                 ComputeItem alternating_changed = it;
                 alternating_changed.spirv = changed_spirv;
@@ -2396,18 +2400,19 @@ int main() {
                 alternating_changed.resources = std::make_shared<ShaderResourceTable>(fill_rt);
                 const uint64_t dynamic_snapshots_before =
                     prosper::frontend::live_compute_storage_result_snapshot_bytes();
-                const uint64_t dynamic_watches_before =
-                    prosper::frontend::live_compute_storage_result_watch_promotions() +
-                    prosper::frontend::live_compute_storage_result_watch_rearms();
                 CHECK(prosper::frontend::execute_live_compute_items({alternating_changed}) &&
                           prosper::frontend::execute_live_compute_items({it}),
                       "alternating full-coverage storage results execute");
-                CHECK(prosper::frontend::live_compute_storage_result_snapshot_bytes() ==
-                          dynamic_snapshots_before &&
-                      prosper::frontend::live_compute_storage_result_watch_promotions() +
-                          prosper::frontend::live_compute_storage_result_watch_rearms() ==
-                          dynamic_watches_before,
-                      "dynamic full-overwrite result avoids redundant snapshots and watch rearms");
+                const uint64_t dynamic_snapshots_after =
+                    prosper::frontend::live_compute_storage_result_snapshot_bytes();
+                if (adaptive_storage_result_validation_enabled) {
+                    CHECK(dynamic_snapshots_after == dynamic_snapshots_before,
+                          "dynamic full-overwrite result avoids redundant snapshots");
+                } else {
+                    CHECK(dynamic_snapshots_after >=
+                              dynamic_snapshots_before + 2 * fill_guest_bytes,
+                          "disabled adaptive policy preserves exact dynamic snapshots");
+                }
             }
 #endif
         }

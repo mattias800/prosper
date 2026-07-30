@@ -1417,38 +1417,43 @@ capsule reproduces the complete live frame. A rolling producer window remains th
 Profiling the full-resolution gameplay route found another synchronous CPU copy outside the Vulkan
 dispatch itself. After every successful persistent storage-image writeback, compute retained an exact
 copy of the complete guest target as its next source-validation baseline. This is necessary for a
-read/modify/write storage image on platforms without page watches, but it duplicated 30-70 MiB every
-frame even for a proven-full write-only target whose seed is unobservable.
+read/modify/write storage image, but it duplicated 30-70 MiB every frame even for a proven-full
+write-only target whose seed is unobservable.
 
 Directly replacing every result snapshot with a Linux page-protection watch was not a valid fix. It
-improved several stable post-processes, but program `0x3017be0000` changes its 1920x1080 result every
-frame. Disarming and rearming that large range at each writeback raised its steady writeback from about
-3 ms to 50-61 ms. The final policy instead keeps one initial exact snapshot, runs the existing
-collision-free GPU result comparison independently of source authority, and promotes a page watch only
-after two consecutive repeated GPU results. A changing proven-full output releases its redundant source
-snapshot and remains on ordinary writeback; a partial/readable storage target retains the exact fallback.
-Two dirty external-write observations permanently disable the watch for that cache entry. The recovery
-switch `PROSPER_NO_STORAGE_RESULT_WRITE_WATCH=1` restores the prior exact-snapshot policy.
+regressed changing targets through repeated protection churn: an early version raised
+`0x3017be0000` writeback from about 3 ms to 50-61 ms. A later same-binary A/B that promoted only stable
+results still raised `0x30180d0000` setup from 1.02 to 5.27 ms median because querying a large watch
+walked its host-page records. It also failed to reduce total snapshot traffic materially.
 
-The production-backend regression covers all three boundaries: a stable repeated result promotes a
-watch without another snapshot copy, an external guest mutation still forces exact repair, and
-alternating proven-full writers neither snapshot nor rearm their changing target. The existing injected
+The final policy uses no new page watches. For a proven-full write-only target, the existing exact GPU
+result comparison runs even when no source baseline is available. A changing result is written back
+normally and releases the unobservable source snapshot. The first repeated result repairs the guest
+mirror and retains one exact byte baseline; later GPU-identical skips neither rewrite the guest nor
+recopy that baseline. Read/modify/write, partial, and replay-owned targets keep the old exact-snapshot
+contract. `PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1` restores the complete prior policy.
+
+The production-backend regression covers all three boundaries: identical skipped output does not
+recopy its baseline, an external guest mutation still forces exact repair, and alternating proven-full
+writers carry no result snapshots. A second invocation under the recovery switch proves the disabled
+path preserves old snapshot behavior without adding copies to identical skips. The existing injected
 post-submit readback failure continues to prove that a GPU baseline cannot publish stale guest bytes.
 
 A matched 180-second native-resolution Plucky A/B used the same binary, route, audio/input frontends,
-and timing settings; the control changed only the recovery switch. Storage-result snapshots fell from
-174,957.6 MiB to 29,481.9 MiB (83.1%). Representative complete-dispatch timings were:
+and timing settings; the control changed only the recovery switch. Storage-result snapshot traffic fell
+from 33,478.7 MiB to 30,125.3 MiB (10.0%). Representative complete-dispatch timings were:
 
 | program | control median | adaptive median | samples (control/adaptive) |
 |---|---:|---:|---:|
-| `0x3017be0000` | 4.93 ms | 3.64 ms | 104 / 121 |
-| `0x30180d0000` | 14.11 ms | 9.01 ms | 1,354 / 1,777 |
-| `0x3017580000` | 34.06 ms | 25.80 ms | 104 / 121 |
+| `0x3017be0000` | 4.75 ms | 3.73 ms | 124 / 124 |
+| `0x30180d0000` | 4.05 ms | 4.24 ms | 2,058 / 2,032 |
+| `0x3017bb0000` | 10.54 ms | 9.16 ms | 121 / 121 |
 
-The adaptive `0x3017be0000` distribution remained bounded across all 121 samples: 5.69 ms p95 and
-15.91 ms maximum, with no recurrence of the experimental 50-61 ms watch-rearm state. Different submit
-counts reflect real route progression under the performance difference, so these are supporting live
-measurements rather than a standalone FPS or pixel-equality claim.
+The dominant stable title dispatch therefore remains neutral instead of paying page-watch query cost,
+while the changing 1920x1080 writer improves by 21.5% at the median. Its 124 adaptive samples remained
+bounded at 5.92 ms p95 and 15.47 ms maximum, with no recurrence of the experimental 50-61 ms state.
+Different submit counts reflect real route progression, so these are supporting live measurements rather
+than a standalone FPS or pixel-equality claim.
 
 ## Next renderer step
 

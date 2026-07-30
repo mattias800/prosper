@@ -678,9 +678,6 @@ struct CachedComputeImage {
     bool validation_result = false;
     prosper::host::GuestWriteWatch write_watch;
     uint32_t write_watch_stable_validations = 0;
-    uint32_t write_watch_dirty_count = 0;
-    bool write_watch_disabled = false;
-    uint32_t storage_result_stable_count = 0;
     prosper::gpu::GuestGpuWriteSnapshot validation_snapshot;
     // A successful typed-storage dispatch leaves `image` in GENERAL with the exact result. Graphics
     // may borrow it only while a current-submit journal or this watch proves that no later guest
@@ -809,9 +806,9 @@ size_t compute_write_watch_promotion_budget_bytes() {
     return value;
 }
 
-bool storage_result_write_watch_enabled() {
+bool adaptive_storage_result_validation_enabled() {
     static const bool enabled =
-        std::getenv("PROSPER_NO_STORAGE_RESULT_WRITE_WATCH") == nullptr;
+        std::getenv("PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION") == nullptr;
     return enabled;
 }
 
@@ -872,8 +869,6 @@ struct VulkanComputeContext {
     uint64_t image_source_snapshot_bytes = 0;
     uint64_t storage_result_snapshot_copies = 0;
     uint64_t storage_result_snapshot_bytes = 0;
-    uint64_t storage_result_watch_promotions = 0;
-    uint64_t storage_result_watch_rearms = 0;
     VkDescriptorSetLayout compare_descriptor_layout = VK_NULL_HANDLE;
     VkShaderModule compare_shader = VK_NULL_HANDLE;
     VkPipelineLayout compare_pipeline_layout = VK_NULL_HANDLE;
@@ -1237,39 +1232,6 @@ struct VulkanComputeContext {
         }
     }
 
-    bool arm_storage_result_write_watch(CachedComputeImage& cached,
-                                        const ComputeImageCacheKey& key) {
-        static const size_t minimum_bytes = [] {
-            const char* value =
-                std::getenv("PROSPER_COMPUTE_STORAGE_WRITE_WATCH_MIN_KB");
-            const uint64_t kib = value ? std::strtoull(value, nullptr, 10) : 1024ull;
-            return static_cast<size_t>(
-                std::min<uint64_t>(kib, SIZE_MAX / 1024ull) * 1024ull);
-        }();
-        if (!storage_result_write_watch_enabled() || cached.write_watch_disabled ||
-            key.guest_bytes < minimum_bytes)
-            return false;
-        if (cached.write_watch) {
-            if (cached.write_watch.query() ==
-                prosper::host::GuestWriteWatchQuery::Unchanged)
-                return true;
-            if (cached.write_watch.rearm()) {
-                ++storage_result_watch_rearms;
-                return true;
-            }
-            cached.write_watch.reset();
-        }
-        // Repeated output establishes an exact mutation boundary and demonstrates that future
-        // result comparisons can actually omit writeback. The shared budget still admits at most
-        // one oversized promotion in this compute span.
-        if (!write_watch_promotion_budget.try_consume(key.guest_bytes)) return false;
-        cached.write_watch = prosper::host::GuestWriteWatch::create(
-            key.gpu_addr, key.guest_bytes);
-        if (!cached.write_watch) return false;
-        ++storage_result_watch_promotions;
-        return true;
-    }
-
     bool make_buffer_cache_room(VkDeviceSize bytes) {
         const VkDeviceSize limit = persistent_compute_buffer_limit();
         if (bytes > limit) return false;
@@ -1544,22 +1506,10 @@ struct VulkanComputeContext {
             prosper::gpu::guest_gpu_writes_since(cached.validation_snapshot,
                                                   key.gpu_addr, key.guest_bytes) ==
                 prosper::gpu::GuestGpuWriteQuery::Unchanged;
-        prosper::host::GuestWriteWatchQuery watch_query =
+        const prosper::host::GuestWriteWatchQuery watch_query =
             !exact_source_only && !submit_unchanged && cached.content_valid && cached.write_watch
                 ? cached.write_watch.query()
                 : prosper::host::GuestWriteWatchQuery::Unknown;
-        if (watch_query == prosper::host::GuestWriteWatchQuery::Dirty) {
-            if (++cached.write_watch_dirty_count >= 2) {
-                // A target the guest actively writes is a poor page-protection candidate: every
-                // touched page faults before exact validation falls back anyway. Match the graphics
-                // cache's two-strike policy and keep this entry on byte snapshots thereafter.
-                cached.write_watch.reset();
-                cached.write_watch_disabled = true;
-                watch_query = prosper::host::GuestWriteWatchQuery::Unknown;
-            }
-        } else if (watch_query == prosper::host::GuestWriteWatchQuery::Unchanged) {
-            cached.write_watch_dirty_count = 0;
-        }
         const bool watch_unchanged = !submit_unchanged &&
             watch_query == prosper::host::GuestWriteWatchQuery::Unchanged;
         if (!exact_source_only && cached.content_valid && !submit_unchanged &&
@@ -1569,8 +1519,7 @@ struct VulkanComputeContext {
             // being erased by a post-comparison rearm.
             if (cached.write_watch && !cached.write_watch.rearm())
                 cached.write_watch.reset();
-            if (!cached.write_watch && !cached.write_watch_disabled &&
-                may_promote_write_watch_before_exact(
+            if (!cached.write_watch && may_promote_write_watch_before_exact(
                     key.guest_bytes, cached.write_watch_stable_validations)) {
                 cached.write_watch = prosper::host::GuestWriteWatch::create(
                     key.gpu_addr, key.guest_bytes);
@@ -1691,11 +1640,10 @@ struct VulkanComputeContext {
             cached.write_watch.reset();
             return;
         }
-        if (!storage_result_write_watch_enabled()) {
+        if (!adaptive_storage_result_validation_enabled()) {
             // Diagnostic/control path matching the pre-optimization policy: every successful
             // storage writeback retains exact guest bytes, and only an already-existing generic
             // source watch may be rearmed.
-            cached.storage_result_stable_count = 0;
             if (current_source)
                 remember_image_source_snapshot(
                     cached, current_source, key.guest_bytes, true);
@@ -1703,30 +1651,28 @@ struct VulkanComputeContext {
             cached.write_watch.reset();
             return;
         }
-        if (result_unchanged) {
-            cached.storage_result_stable_count = std::min<uint32_t>(
-                cached.storage_result_stable_count + 1, 2);
-        } else {
-            cached.storage_result_stable_count = 0;
-            // A changing output would disarm and rearm a large range every frame before the watch
-            // could save a writeback. Keep it on the exact fallback until the GPU comparator proves
-            // two consecutive repeated results.
+        if (source_snapshot_required) {
+            // Read/modify/write and partial storage targets still need the ordinary exact source
+            // contract because their prior guest bytes are observable by the next dispatch.
+            if (current_source)
+                remember_image_source_snapshot(
+                    cached, current_source, key.guest_bytes, true);
+            if (cached.write_watch && cached.write_watch.rearm()) return;
             cached.write_watch.reset();
-        }
-        if (current_source && cached.storage_result_stable_count >= 2 &&
-            arm_storage_result_write_watch(cached, key)) {
-            // The armed page watch now provides exact dirty/unchanged authority. Release the
-            // redundant byte baseline so this successful result does not copy or retain a second
-            // full target. A later Dirty/Unknown result simply takes the ordinary upload path.
-            if (!cached.source_snapshot.empty())
-                std::vector<uint8_t>().swap(cached.source_snapshot);
             return;
         }
-        if (current_source && source_snapshot_required)
-            remember_image_source_snapshot(
-                cached, current_source, key.guest_bytes, true);
-        else if (!source_snapshot_required && !cached.source_snapshot.empty())
+        // Storage-result adaptation deliberately uses exact bytes, not a page watch. Page-watch
+        // queries walk one record per host page and were slower than memcmp for Plucky's stable
+        // post-process targets. A repeated result keeps one collision-free baseline; an identical
+        // GPU skip never reaches this function, so that baseline is not recopied.
+        cached.write_watch.reset();
+        if (result_unchanged) {
+            if (current_source && cached.source_snapshot.empty())
+                remember_image_source_snapshot(
+                    cached, current_source, key.guest_bytes, true);
+        } else if (!cached.source_snapshot.empty()) {
             std::vector<uint8_t>().swap(cached.source_snapshot);
+        }
     }
 
     bool cached_image_result_matches(const ComputeImageCacheKey& key,
@@ -3900,7 +3846,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     bi.persistent = ctx.acquire_cached_image(
                         bi.cache_key, resource_bytes_for(r, guest_bytes), image_validation_epoch,
                         bi.image, bi.memory, bi.upload_skipped,
-                        !bi.seed_skip || !storage_result_write_watch_enabled());
+                        !bi.seed_skip || !adaptive_storage_result_validation_enabled());
                     if (bi.persistent)
                         ctx.cached_image_result_buffer(
                             bi.cache_key, bi.exact_result_bytes, bi.result_baseline);
@@ -4660,7 +4606,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (size_t i = 0; i < images.size(); ++i) {
             BoundImage& image = images[i];
             if (image.storage && image.cache_candidate && image.persistent &&
-                (image.upload_skipped || storage_result_write_watch_enabled()) &&
+                (image.upload_skipped ||
+                 (image.seed_skip && adaptive_storage_result_validation_enabled())) &&
                 image.result_baseline && image.exact_result_bytes &&
                 !(image.exact_result_bytes & 15u) && staging[i])
                 compare_targets.push_back({
@@ -5353,11 +5300,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  (unsigned long long)bi.exact_result_bytes);
                 if (r->gpu_addr)
                     notify_guest_gpu_write_preserving_bytes(r->gpu_addr, bi.guest_bytes);
-                // An exact retained snapshot may have provided source authority for this result.
-                // Two stable GPU results promote it to a page watch without an intervening write;
-                // an existing unchanged watch returns immediately without re-protecting the range.
-                ctx.validate_cached_image_source(
-                    bi.cache_key, destination, true, !bi.seed_skip);
                 continue;
             }
             void* mapped = nullptr;
@@ -5614,9 +5556,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             if (bi.cache_candidate) {
                 if (bi.persistent) {
-                    // Guest bytes now mirror the retained image again. Changing full-overwrite
-                    // targets need no source snapshot; a watch is promoted only after the exact GPU
-                    // comparator observes two repeated results, where it can save future writeback.
+                    // Guest bytes now mirror the retained image again. A changing full-overwrite
+                    // target needs no source snapshot; the first repeated result retains one exact
+                    // baseline, and subsequent identical GPU skips do not recopy it.
                     ctx.validate_cached_image_source(
                         bi.cache_key, destination, bi.gpu_result_unchanged, !bi.seed_skip);
                 } else if (bi.image && bi.memory && bi.allocation_bytes &&
@@ -5795,14 +5737,6 @@ uint64_t live_compute_storage_result_snapshot_bytes() {
     return g_live_compute_context ? g_live_compute_context->storage_result_snapshot_bytes : 0;
 }
 
-uint64_t live_compute_storage_result_watch_promotions() {
-    return g_live_compute_context ? g_live_compute_context->storage_result_watch_promotions : 0;
-}
-
-uint64_t live_compute_storage_result_watch_rearms() {
-    return g_live_compute_context ? g_live_compute_context->storage_result_watch_rearms : 0;
-}
-
 void live_compute_fail_next_storage_readback_for_test() {
     g_fail_next_storage_readback_for_test.store(true, std::memory_order_release);
 }
@@ -5966,15 +5900,13 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
                          (unsigned long long)pool.discarded);
             std::fprintf(stderr,
                          "[render-timing] compute_image_source snapshots=%llu %.1f MiB "
-                         "storage_results=%llu %.1f MiB watches=%llu rearms=%llu\n",
+                         "storage_results=%llu %.1f MiB\n",
                          (unsigned long long)context.image_source_snapshot_copies,
                          static_cast<double>(context.image_source_snapshot_bytes) /
                              (1024.0 * 1024.0),
                          (unsigned long long)context.storage_result_snapshot_copies,
                          static_cast<double>(context.storage_result_snapshot_bytes) /
-                             (1024.0 * 1024.0),
-                         (unsigned long long)context.storage_result_watch_promotions,
-                         (unsigned long long)context.storage_result_watch_rearms);
+                             (1024.0 * 1024.0));
             std::fprintf(stderr,
                          "[render-window] compute calls=%llu dispatches=%.1f avg_ms=%.2f\n",
                          (unsigned long long)window.calls,
