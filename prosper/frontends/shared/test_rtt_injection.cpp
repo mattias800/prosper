@@ -66,6 +66,7 @@ int main() {
     // A submit-scoped cache returns the immutable producer itself for exact views and one shared
     // nearest-scaled materialization for every repeated consumer of the same version and shape.
     auto shared_source = std::make_shared<const std::vector<uint8_t>>(rgba_source);
+    std::weak_ptr<const std::vector<uint8_t>> retained_source = shared_source;
     RttInjectionCache cache;
     CHECK(cache.materialize(shared_source, 2, 2, 2, 2, 4) == shared_source);
     auto cached_scaled = cache.materialize(shared_source, 4, 4, 2, 2, 4);
@@ -80,6 +81,8 @@ int main() {
     auto new_version_scaled = cache.materialize(equal_new_version, 4, 4, 2, 2, 4);
     CHECK(new_version_scaled && *new_version_scaled == rgba_expected &&
           new_version_scaled != cached_scaled && cache.size() == 3);
+    shared_source.reset();
+    CHECK(!retained_source.expired());
 
     std::vector<uint8_t> malformed(7), fallback_bytes = {0xaa, 0xbb, 0xcc, 0xdd};
     consumer = fallback_bytes;
@@ -87,6 +90,7 @@ int main() {
     CHECK(consumer == fallback_bytes); // rejection preserves the caller's guest-decode fallback buffer
     CHECK(!cache.materialize(
         std::make_shared<const std::vector<uint8_t>>(malformed), 1, 1, 1, 1, 8));
+    CHECK(cache.size() == 3);
 
     if (!failures) std::printf("rtt_injection: OK\n");
     return failures ? 1 : 0;
