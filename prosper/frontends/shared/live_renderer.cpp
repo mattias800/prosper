@@ -1533,14 +1533,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 }
                             }
                         }
-                        const bool has_cpu_live_rtt = !fr.is_storage_image && r.img_dim == 1u &&
-                            live_rtt != g_rtt.end() &&
-                            live_rtt->second.w && live_rtt->second.h && live_rtt->second.rgba &&
-                            prosper::frontend::live_rtt_cpu_snapshot_matches(
-                                live_rtt->second.w, live_rtt->second.h,
-                                prosper::test::backend_color_bytes_per_pixel(
-                                    prosper::test::backend_color_format(live_rtt->second.format)),
-                                live_rtt->second.rgba->size());
                         static const bool retain_cpu_rtt_snapshots =
                             getenv("PROSPER_NO_RTT_SNAPSHOT_BORROW") == nullptr;
                         // Pixel-mutating/inspection diagnostics intentionally retain their owned
@@ -1553,6 +1545,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             getenv("PROSPER_TESTLUT") || getenv("PROSPER_TESTLUT32") ||
                             getenv("PROSPER_DUMP_TEX") || getenv("PROSPER_DUMP_ATLAS") ||
                             getenv("PROSPER_KILL_RING");
+                        const bool uniform_cpu_diagnostic_path =
+                            live_rtt != g_rtt.end() &&
+                            prosper::frontend::live_rtt_uniform_uses_cpu_diagnostic_path(
+                                live_rtt->second.has_uniform_color,
+                                cpu_rtt_copy_diagnostics);
+                        if (uniform_cpu_diagnostic_path)
+                            materialize_uniform_rtt(live_rtt->second);
+                        const bool has_cpu_live_rtt = !fr.is_storage_image && r.img_dim == 1u &&
+                            live_rtt != g_rtt.end() &&
+                            live_rtt->second.w && live_rtt->second.h && live_rtt->second.rgba &&
+                            prosper::frontend::live_rtt_cpu_snapshot_matches(
+                                live_rtt->second.w, live_rtt->second.h,
+                                prosper::test::backend_color_bytes_per_pixel(
+                                    prosper::test::backend_color_format(live_rtt->second.format)),
+                                live_rtt->second.rgba->size());
                         // Match the established CPU injection gate below. Cube descriptors and
                         // mismatched 2D views can also retain identical materialized bytes; 3D
                         // volumes, storage images, and mip tails remain on their specialized paths.
@@ -1578,7 +1585,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 r.gpu_addr, live_rtt->second.w, live_rtt->second.h,
                                 live_rtt->second.format) != nullptr;
                         const bool has_uniform_live_rtt = !fr.is_storage_image &&
-                            r.img_dim == 1u && !r.in_mip_tail && live_rtt != g_rtt.end() &&
+                            !uniform_cpu_diagnostic_path && r.img_dim == 1u &&
+                            !r.in_mip_tail && live_rtt != g_rtt.end() &&
                             live_rtt->second.has_uniform_color && live_rtt->second.w &&
                             live_rtt->second.h &&
                             prosper::frontend::rtt_sampled_extent_compatible(
