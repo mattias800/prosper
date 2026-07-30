@@ -2456,13 +2456,25 @@ std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item)
     using prosper::gpu::ResourceClass;
     if (item.cpu_fast_path == ComputeCpuFastPath::None) return std::nullopt;
     if (item.cpu_fast_path != ComputeCpuFastPath::FillSgprUvec4 ||
-        !item.resources || item.user_sgprs.size() < 8 ||
+        !item.resources || item.resources->resources.size() != 1 ||
+        item.user_sgprs.size() != 8 || !item.recompile_config_available ||
+        !item.recompile_config.tgid_x_en || item.recompile_config.tgid_y_en ||
+        item.recompile_config.tgid_z_en ||
         item.launch.local_x != 64 || item.launch.local_y != 1 || item.launch.local_z != 1 ||
-        !item.launch.groups_x || !item.launch.groups_y || !item.launch.groups_z)
+        !item.launch.groups_x || item.launch.groups_y != 1 || item.launch.groups_z != 1 ||
+        item.launch.threads_y != 1 || item.launch.threads_z != 1)
         return std::nullopt;
 
     const prosper::gpu::ShaderResource* resource = item.resources->by_binding(2);
-    if (!resource || !resource->size || resource->cls != ResourceClass::ConstantBuffer)
+    // The matched MUBUF instruction uses idxen with the direct V# in s[0:3]. Its element address and
+    // store conversion therefore still depend on the live descriptor: only the observed 16-byte,
+    // four-dword contract is equivalent to the raw record writes below. Similar shaders bound to a
+    // different descriptor must retain the normal translator/backend semantics.
+    if (!resource || !resource->size || resource->cls != ResourceClass::ConstantBuffer ||
+        resource->sgpr_base != 0 || item.resources->by_sgpr_base(0) != resource ||
+        resource->stride != 16 ||
+        resource->num_components != 4 ||
+        prosper::gpu::data_format_bytes(resource->format) != sizeof(uint32_t))
         return std::nullopt;
 
     const uint64_t dispatched_records =

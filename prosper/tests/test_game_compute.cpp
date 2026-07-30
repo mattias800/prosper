@@ -467,6 +467,7 @@ int main() {
     item.user_sgprs = config.user_sgprs;
     item.resources = std::make_shared<ShaderResourceTable>(rt);
     item.launch.threads_x = records;
+    item.launch.threads_y = item.launch.threads_z = 1;
     item.launch.local_x = 64;
     item.launch.groups_x = 3;
     item.launch.local_y = item.launch.local_z = 1;
@@ -475,6 +476,8 @@ int main() {
     item.dispatch_index = 7;
     item.submit_no = 11;
     item.command_order = 70;
+    item.recompile_config = config;
+    item.recompile_config_available = true;
     CHECK(prosper::frontend::execute_live_compute_items({item}),
           "production live backend executes the game kernel");
     CHECK(result.size() == launched_records * 4, "compute resource retains its padded declared size");
@@ -502,8 +505,14 @@ int main() {
     std::fill(result.begin(), result.end(), 0xddddddddu);
     ComputeItem cpu_fill_item = item;
     cpu_fill_item.cpu_fast_path = ComputeCpuFastPath::FillSgprUvec4;
+    uint32_t cpu_fill_write_notifications = 0;
+    set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+        if (addr == buffer.gpu_addr && size == buffer.size)
+            ++cpu_fill_write_notifications;
+    });
     CHECK(prosper::frontend::execute_live_compute_items({cpu_fill_item}),
           "exact buffer-fill program executes through the CPU fast path");
+    set_guest_gpu_write_observer({});
     bool cpu_fill_matches = true;
     for (uint32_t record = 0; record < records && cpu_fill_matches; ++record)
         for (uint32_t component = 0; component < 4; ++component)
@@ -512,8 +521,43 @@ int main() {
     for (uint32_t record = records; record < launched_records; ++record)
         for (uint32_t component = 0; component < 4; ++component)
             cpu_fill_padding_untouched &= result[record * 4 + component] == 0xddddddddu;
-    CHECK(cpu_fill_matches && cpu_fill_padding_untouched,
-          "CPU buffer fill matches Vulkan output and preserves padded invocations");
+    CHECK(cpu_fill_matches && cpu_fill_padding_untouched &&
+              cpu_fill_write_notifications == 1,
+          "CPU fill matches Vulkan, preserves padded lanes, and invalidates the declared range");
+
+    ShaderResourceTable narrow_stride_rt = rt;
+    narrow_stride_rt.resources[0].stride = 8;
+    const std::vector<uint32_t> narrow_stride_spirv = recompile_compute(
+        code, std::size(code), &narrow_stride_rt, config);
+    CHECK(!narrow_stride_spirv.empty(), "alternate-stride fill kernel recompiles");
+    if (!narrow_stride_spirv.empty()) {
+        std::fill(result.begin(), result.end(), 0xabababab);
+        ComputeItem narrow_stride_item = cpu_fill_item;
+        narrow_stride_item.spirv = narrow_stride_spirv;
+        narrow_stride_item.resources =
+            std::make_shared<ShaderResourceTable>(narrow_stride_rt);
+        CHECK(prosper::frontend::execute_live_compute_items({narrow_stride_item}),
+              "noncanonical fill descriptor falls back to Vulkan");
+        CHECK(result[300] == 0xabababab,
+              "CPU fast path does not replace the descriptor's eight-byte stride semantics");
+    }
+
+    ComputeShaderConfig extra_user_config = config;
+    extra_user_config.user_sgprs.push_back(0);
+    const std::vector<uint32_t> extra_user_spirv = recompile_compute(
+        code, std::size(code), &rt, extra_user_config);
+    CHECK(!extra_user_spirv.empty(), "alternate user-SGPR fill kernel recompiles");
+    if (!extra_user_spirv.empty()) {
+        std::fill(result.begin(), result.end(), 0xcdcdcdcdu);
+        ComputeItem extra_user_item = cpu_fill_item;
+        extra_user_item.spirv = extra_user_spirv;
+        extra_user_item.user_sgprs = extra_user_config.user_sgprs;
+        extra_user_item.recompile_config = extra_user_config;
+        CHECK(prosper::frontend::execute_live_compute_items({extra_user_item}),
+              "shifted TGID input fill falls back to Vulkan");
+        CHECK(result[100 * 4] == 0xcdcdcdcdu,
+              "CPU fast path requires TGID.x to occupy the shader's exact s8 input");
+    }
 
     uint32_t unchanged_write_notifications = 0;
     set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
