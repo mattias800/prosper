@@ -162,6 +162,10 @@ and extract one with `--dump-failed-shader FAILURE:STAGE PATH`. Selection is
 intentionally bounded to the consumer and an optional
 immediate predecessor. Explicit-depth `.prgbundle` capture provides bounded recursive cross-submit closure;
 automatic present-to-producer selection remains #595.
+After a translator change, use `gpu_replay --retry-failed-stage FAILURE:STAGE` for one retained shader or
+`--retry-failed-chain FAILURE` for a captured split vertex prolog/main pair. These offline paths reuse the exact
+captured resource table and report whether the current production recompiler now produces SPIR-V, without a
+guest boot or Vulkan replay.
 Timeline version 6 retains the version-5 sliding graphics-target window plus full-run aggregate lifetime metadata
 when a detailed capture is requested. `PROSPER_GPU_TIMELINE_HISTORY=N` raises the window to at most 65536.
 Producer records identify the latest overlapping prior submit/draw/PM4 order, earliest observed graphics

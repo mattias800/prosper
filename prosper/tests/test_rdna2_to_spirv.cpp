@@ -2388,6 +2388,46 @@ int main() {
     printf("  kernel43 mismatches=%u (out[5]=%g expect=10)\n", bad43, got43.size()==N?got43[5]:-1);
     CHECK(got43.size()==N && bad43==0, "recompiled kernel 43 (counted loop sum 0..4) computes 10");
 
+    // Kernel 43a: one ordinary uniform if immediately before a counted loop. Astro Bot's NGG culling
+    // shader uses this composition in its setup; the two constructs were individually supported, but
+    // the counted-loop prelude previously admitted only if/else. Exercise both PHI inputs by changing
+    // the constant comparison: the taken form seeds sum=7, while the skipped form retains sum=0.
+    const uint32_t code43a_taken[] = {
+        0xBE800383u, 0xBE810385u, 0xBF0A0100u, 0x7E020280u, 0xBF840001u, 0x7E020287u,
+        0xB0020005u, 0xBE800380u, 0xBF0A0200u, 0xBF840003u, 0x4A020200u, 0x81008100u,
+        0xBF82FFFBu, 0x7E000D01u, 0xBF810000u,
+    };
+    const uint32_t code43a_skipped[] = {
+        0xBE800385u, 0xBE810383u, 0xBF0A0100u, 0x7E020280u, 0xBF840001u, 0x7E020287u,
+        0xB0020005u, 0xBE800380u, 0xBF0A0200u, 0xBF840003u, 0x4A020200u, 0x81008100u,
+        0xBF82FFFBu, 0x7E000D01u, 0xBF810000u,
+    };
+    const auto spv43a_taken = recompile_valu(
+        code43a_taken, std::size(code43a_taken), 0, 0);
+    const auto spv43a_skipped = recompile_valu(
+        code43a_skipped, std::size(code43a_skipped), 0, 0);
+    CHECK(!spv43a_taken.empty() && !spv43a_skipped.empty(),
+          "recompiled kernel 43a (one-arm pre-loop if + counted loop) -> SPIR-V");
+    const auto got43a_taken = prosper::test::run_compute(spv43a_taken, in43, N, N);
+    const auto got43a_skipped = prosper::test::run_compute(spv43a_skipped, in43, N, N);
+    uint32_t bad43a = 0;
+    for (uint32_t i = 0; i < N && got43a_taken.size() == N && got43a_skipped.size() == N; ++i)
+        if (got43a_taken[i] != 17.0f || got43a_skipped[i] != 10.0f) ++bad43a;
+    CHECK(got43a_taken.size() == N && got43a_skipped.size() == N && bad43a == 0,
+          "kernel 43a merges taken/skipped pre-loop values into the counted loop exactly");
+
+    // Kernel 43b: a pre-loop conditional that jumps over the complete counted loop to s_endpgm.
+    // The prelude CFG scan uses the loop header as an artificial end marker, so it must preserve the
+    // early-out classification and reject rather than silently execute the loop on both outcomes.
+    const uint32_t code43b[] = {
+        0xBE800385u, 0xBE810383u, 0xBF0A0100u, 0xBF840009u, 0xB0020005u,
+        0xBE800380u, 0x7E020280u, 0xBF0A0200u, 0xBF840003u, 0x4A020200u,
+        0x81008100u, 0xBF82FFFBu, 0x7E000D01u, 0xBF810000u,
+    };
+    const auto spv43b = recompile_valu(code43b, std::size(code43b), 0, 0);
+    CHECK(spv43b.empty(),
+          "kernel 43b rejects a pre-loop early-out that skips the counted loop");
+
     // Kernel 44: a value advanced in the CONDITION region and read after the loop. s0 is incremented by
     //   10 at the header (which runs on the exiting iteration too), so hardware yields 40, not the phi's
     //   back-edge value 30. Regression guard for the condition-region-vs-body merge-value distinction.

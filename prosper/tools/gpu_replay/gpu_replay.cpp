@@ -64,6 +64,7 @@ void usage(const char* argv0) {
                          "[--dump-realized-shader DRAW:vs|vs-main|fs PATH] "
                          "[--override-compute-spv N PATH] "
                          "[--dump-failed-shader FAILURE:STAGE PATH] "
+                         "[--retry-failed-chain FAILURE] "
                          "[--retry-failed-stage FAILURE:STAGE] "
                          "[--dump-compute-resource N:BINDING PATH] "
                          "[--legacy-htile-before-stencil] "
@@ -1376,7 +1377,7 @@ int main(int argc, char** argv) {
     std::string compute_override_spec, compute_override_path;
     std::string compute_resource_spec, compute_resource_path;
     std::string failed_shader_spec, failed_shader_path;
-    std::string retry_failed_stage_spec;
+    std::string retry_failed_chain_spec, retry_failed_stage_spec;
     std::string realized_shader_spec, realized_shader_path;
     std::string rtt_seed_path;
     std::string graph_json_path, prepend_path;
@@ -1507,6 +1508,8 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--dump-failed-shader" && i + 2 < argc) {
             failed_shader_spec = argv[++i]; failed_shader_path = argv[++i];
         }
+        else if (std::string(argv[i]) == "--retry-failed-chain" && i + 1 < argc)
+            retry_failed_chain_spec = argv[++i];
         else if (std::string(argv[i]) == "--retry-failed-stage" && i + 1 < argc)
             retry_failed_stage_spec = argv[++i];
         else positional.push_back(argv[i]);
@@ -1523,6 +1526,7 @@ int main(int argc, char** argv) {
             !realized_shader_spec.empty() ||
             !compute_override_spec.empty() ||
             !compute_resource_spec.empty() || !failed_shader_spec.empty() ||
+            !retry_failed_chain_spec.empty() ||
             !prepend_path.empty() || !draw_steps_prefix.empty()) {
             usage(argv[0]); return 2;
         }
@@ -1972,6 +1976,59 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[gpureplay] dumped failed shader %s (%zu bytes) to %s\n",
                      failed_shader_spec.c_str(), bytes, failed_shader_path.c_str());
         if (positional.size() == 1 && !inspect) return 0;
+    }
+    if (!retry_failed_chain_spec.empty()) {
+        char* failure_end = nullptr;
+        const long failure_index = std::strtol(
+            retry_failed_chain_spec.c_str(), &failure_end, 0);
+        if (!failure_end || *failure_end || failure_index < 0 ||
+            static_cast<size_t>(failure_index) >= replay.failure_diagnostics.size()) {
+            std::fprintf(stderr, "gpu_replay: invalid failed-chain selector %s\n",
+                         retry_failed_chain_spec.c_str());
+            return 2;
+        }
+        const auto& failure = replay.failure_diagnostics[static_cast<size_t>(failure_index)];
+        if (failure.stages.size() < 2 ||
+            failure.stages[0].stage != prosper::gpu::ShaderProgramStage::Vertex ||
+            failure.stages[1].stage != prosper::gpu::ShaderProgramStage::Vertex) {
+            std::fprintf(stderr,
+                         "gpu_replay: failure %s does not retain a split vertex chain\n",
+                         retry_failed_chain_spec.c_str());
+            return 2;
+        }
+        const auto& prolog_stage = failure.stages[0];
+        const auto& main_stage = failure.stages[1];
+        if (prolog_stage.raw_shader_index >= replay.raw_shader_versions.size() ||
+            main_stage.raw_shader_index >= replay.raw_shader_versions.size()) {
+            std::fprintf(stderr,
+                         "gpu_replay: failed chain %s has no captured raw streams\n",
+                         retry_failed_chain_spec.c_str());
+            return 2;
+        }
+        if (prolog_stage.resource_table_present != prolog_stage.resource_table.present ||
+            prolog_stage.resource_count != prolog_stage.resource_table.resources.size()) {
+            std::fprintf(stderr,
+                         "gpu_replay: failed chain %s lacks exact resource metadata "
+                         "(capture predates v35)\n", retry_failed_chain_spec.c_str());
+            return 2;
+        }
+        prosper::gpu::ShaderResourceTable table;
+        table.resources.reserve(prolog_stage.resource_table.resources.size());
+        for (const auto& captured : prolog_stage.resource_table.resources)
+            table.resources.push_back(captured.resource);
+        const auto& prolog = replay.raw_shader_versions[prolog_stage.raw_shader_index];
+        const auto& main = replay.raw_shader_versions[main_stage.raw_shader_index];
+        const prosper::gpu::ShaderResourceTable* resources =
+            prolog_stage.resource_table.present ? &table : nullptr;
+        const std::vector<uint32_t> spirv = prosper::gpu::recompile_vertex_chain(
+            prolog.words.data(), prolog.words.size(), main.words.data(), main.words.size(),
+            resources);
+        std::fprintf(stderr,
+                     "[retry-failed-chain] %s %s resources=%zu spirv-dwords=%zu\n",
+                     retry_failed_chain_spec.c_str(),
+                     spirv.empty() ? "rejected" : "recompiled", table.resources.size(),
+                     spirv.size());
+        if (positional.size() == 1 && !inspect) return spirv.empty() ? 1 : 0;
     }
     if (!retry_failed_stage_spec.empty()) {
         const size_t colon = retry_failed_stage_spec.find(':');
