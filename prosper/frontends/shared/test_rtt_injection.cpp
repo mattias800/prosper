@@ -6,6 +6,7 @@
 
 using prosper::frontend::inject_rtt_pixels;
 using prosper::frontend::exact_rtt_snapshot_borrowable;
+using prosper::frontend::RttInjectionCache;
 
 static int failures = 0;
 #define CHECK(cond) do { if (!(cond)) { \
@@ -62,10 +63,30 @@ int main() {
     };
     CHECK(odd_scaled == odd_expected);
 
+    // A submit-scoped cache returns the immutable producer itself for exact views and one shared
+    // nearest-scaled materialization for every repeated consumer of the same version and shape.
+    auto shared_source = std::make_shared<const std::vector<uint8_t>>(rgba_source);
+    RttInjectionCache cache;
+    CHECK(cache.materialize(shared_source, 2, 2, 2, 2, 4) == shared_source);
+    auto cached_scaled = cache.materialize(shared_source, 4, 4, 2, 2, 4);
+    auto repeated_scaled = cache.materialize(shared_source, 4, 4, 2, 2, 4);
+    CHECK(cached_scaled && cached_scaled == repeated_scaled &&
+          cached_scaled->data() == repeated_scaled->data() &&
+          *cached_scaled == rgba_expected && cache.size() == 1);
+    auto different_shape = cache.materialize(shared_source, 3, 3, 2, 2, 4);
+    CHECK(different_shape && *different_shape == odd_expected &&
+          different_shape != cached_scaled && cache.size() == 2);
+    auto equal_new_version = std::make_shared<const std::vector<uint8_t>>(rgba_source);
+    auto new_version_scaled = cache.materialize(equal_new_version, 4, 4, 2, 2, 4);
+    CHECK(new_version_scaled && *new_version_scaled == rgba_expected &&
+          new_version_scaled != cached_scaled && cache.size() == 3);
+
     std::vector<uint8_t> malformed(7), fallback_bytes = {0xaa, 0xbb, 0xcc, 0xdd};
     consumer = fallback_bytes;
     CHECK(!inject_rtt_pixels(consumer, 1, 1, malformed, 1, 1, 8));
     CHECK(consumer == fallback_bytes); // rejection preserves the caller's guest-decode fallback buffer
+    CHECK(!cache.materialize(
+        std::make_shared<const std::vector<uint8_t>>(malformed), 1, 1, 1, 1, 8));
 
     if (!failures) std::printf("rtt_injection: OK\n");
     return failures ? 1 : 0;
