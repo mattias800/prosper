@@ -1680,34 +1680,44 @@ int main(int argc, char** argv) {
                 prosper::tools::replay_operation_index_for_draw(replay, n);
             const long long operation_label = operation_index == SIZE_MAX
                 ? -1 : static_cast<long long>(operation_index);
-            if (it.vs_raw_shader_index < replay.raw_shader_versions.size()) {
-                const auto& raw = replay.raw_shader_versions[it.vs_raw_shader_index];
-                const auto* pixel_inputs = it.has_pixel_inputs ? &it.pixel_inputs : nullptr;
-                const auto* system_inputs = it.has_system_inputs ? &it.system_inputs : nullptr;
-                bool xfb_in_geometry = false;
-                if (it.fs_raw_shader_index < replay.raw_shader_versions.size()) {
-                    const auto& fragment = replay.raw_shader_versions[it.fs_raw_shader_index];
-                    const auto interpolation = prosper::gpu::fragment_interpolation_layout(
-                        fragment.words.data(), fragment.words.size(), system_inputs, pixel_inputs);
-                    if (interpolation.valid && interpolation.requires_geometry &&
-                        it.ps.topology >= 3u && it.ps.topology <= 5u) {
-                        auto geometry = prosper::gpu::recompile_interpolation_geometry(
-                            interpolation, true);
-                        if (!geometry.empty()) {
-                            it.gs = std::move(geometry);
-                            xfb_in_geometry = true;
-                        }
-                    }
+            const auto* pixel_inputs = it.has_pixel_inputs ? &it.pixel_inputs : nullptr;
+            const auto* system_inputs = it.has_system_inputs ? &it.system_inputs : nullptr;
+            std::vector<uint32_t> rebuilt_geometry;
+            if (it.fs_raw_shader_index < replay.raw_shader_versions.size()) {
+                const auto& fragment = replay.raw_shader_versions[it.fs_raw_shader_index];
+                const auto interpolation = prosper::gpu::fragment_interpolation_layout(
+                    fragment.words.data(), fragment.words.size(), system_inputs, pixel_inputs);
+                if (interpolation.valid && interpolation.requires_geometry &&
+                    it.ps.topology >= 3u && it.ps.topology <= 5u) {
+                    rebuilt_geometry = prosper::gpu::recompile_interpolation_geometry(
+                        interpolation, true);
                 }
-                // Transform feedback is sourced from the last pre-rasterization stage. A generated
-                // interpolation GS therefore has to carry the XFB decorations; decorating only the VS
-                // renders real primitives but leaves the counter at zero.
-                if (!xfb_in_geometry && !it.gs.empty()) {
+            }
+            const bool has_raw_vertex =
+                it.vs_raw_shader_index < replay.raw_shader_versions.size();
+            const auto probe_stage = prosper::tools::select_geometry_probe_stage(
+                !rebuilt_geometry.empty(), !it.gs.empty(), has_raw_vertex);
+            if (probe_stage == prosper::tools::GeometryProbeStage::Unsupported) {
+                if (!it.gs.empty()) {
                     std::fprintf(stderr,
                                  "[geom-probe] draw %llu: cannot rebuild its geometry stage for xfb\n",
                                  draw_label);
-                    return 2;
+                } else {
+                    std::fprintf(stderr, "[geom-probe] draw %llu: no captured raw VS stream "
+                                         "(capsule predates v19 or source was unreadable)\n",
+                                         draw_label);
                 }
+                return 2;
+            }
+            if (probe_stage == prosper::tools::GeometryProbeStage::GeneratedGeometry) {
+                it.gs = std::move(rebuilt_geometry);
+                std::fprintf(stderr,
+                             "[geom-probe] draw=%llu item=%zu operation=%lld reused stored VS "
+                             "with xfb in GS (%zu VS words, %zu GS words, lds=%u dwords)\n",
+                             draw_label, item_index, operation_label, it.vs_words().size(),
+                             it.gs.size(), it.vertex_lds_dwords);
+            } else {
+                const auto& raw = replay.raw_shader_versions[it.vs_raw_shader_index];
                 std::vector<uint32_t> xfb;
                 const bool linked =
                     it.vs_chain_raw_shader_index < replay.raw_shader_versions.size();
@@ -1716,29 +1726,24 @@ int main(int argc, char** argv) {
                         replay.raw_shader_versions[it.vs_chain_raw_shader_index];
                     xfb = prosper::gpu::recompile_vertex_chain(
                         raw.words.data(), raw.words.size(), main.words.data(), main.words.size(),
-                        it.vrt.get(), pixel_inputs, !xfb_in_geometry,
-                        it.vertex_lds_dwords);
+                        it.vrt.get(), pixel_inputs, true, it.vertex_lds_dwords);
                 } else {
                     xfb = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
-                                                         it.vrt.get(), pixel_inputs,
-                                                         !xfb_in_geometry,
+                                                         it.vrt.get(), pixel_inputs, true,
                                                          it.vertex_lds_dwords);
                 }
-                if (!xfb.empty()) {
-                    it.set_vs(std::move(xfb));
-                    std::fprintf(stderr,
-                                 "[geom-probe] draw=%llu item=%zu operation=%lld VS%s re-recompiled "
-                                 "with xfb in %s (%zu VS words, %zu GS words, lds=%u dwords)\n",
-                                 draw_label, item_index, operation_label,
-                                 linked ? "+main" : "", xfb_in_geometry ? "GS" : "VS",
-                                 it.vs.size(), it.gs.size(), it.vertex_lds_dwords);
-                } else {
+                if (xfb.empty()) {
                     std::fprintf(stderr, "[geom-probe] draw %llu: xfb re-recompile produced no VS "
-                                         "(no raw stream / unsupported)\n", draw_label);
+                                         "(unsupported raw stream)\n", draw_label);
+                    return 2;
                 }
-            } else {
-                std::fprintf(stderr, "[geom-probe] draw %llu: no captured raw VS stream "
-                                     "(capsule predates v19)\n", draw_label);
+                it.set_vs(std::move(xfb));
+                std::fprintf(stderr,
+                             "[geom-probe] draw=%llu item=%zu operation=%lld VS%s re-recompiled "
+                             "with xfb in VS (%zu VS words, 0 GS words, lds=%u dwords)\n",
+                             draw_label, item_index, operation_label,
+                             linked ? "+main" : "", it.vs_words().size(),
+                             it.vertex_lds_dwords);
             }
         } else {
             std::fprintf(stderr, "[geom-probe] unrealized semantic draw %llu\n", draw_label);

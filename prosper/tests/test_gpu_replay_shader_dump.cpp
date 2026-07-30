@@ -36,6 +36,18 @@ int main() {
               !gpu::parse_diagnostic_draw_id("18446744073709551616", diagnostic_draw),
           "geometry probe rejects partial, signed, and overflowing draw IDs");
 
+    CHECK(tools::select_geometry_probe_stage(true, true, false) ==
+              tools::GeometryProbeStage::GeneratedGeometry,
+          "rebuilt generated geometry owns probe capture without a raw VS");
+    CHECK(tools::select_geometry_probe_stage(false, false, true) ==
+              tools::GeometryProbeStage::Vertex,
+          "VS-only geometry probe instruments a captured raw vertex stream");
+    CHECK(tools::select_geometry_probe_stage(false, false, false) ==
+              tools::GeometryProbeStage::Unsupported &&
+              tools::select_geometry_probe_stage(false, true, true) ==
+                  tools::GeometryProbeStage::Unsupported,
+          "geometry probe rejects a missing raw VS and an unrebuildable existing GS");
+
     uint64_t draw_first = 0, draw_last = 0;
     CHECK(gpu::parse_diagnostic_draw_range("0x7:013", draw_first, draw_last) &&
               draw_first == 7 && draw_last == 11 &&

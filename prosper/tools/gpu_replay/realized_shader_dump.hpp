@@ -20,6 +20,23 @@ struct RecompiledShaderView {
     bool shared = false;
 };
 
+enum class GeometryProbeStage {
+    Unsupported,
+    Vertex,
+    GeneratedGeometry,
+};
+
+// Transform feedback must be owned by the final pre-rasterization stage. A successfully rebuilt
+// generated GS can reuse the stored VS; otherwise a VS-only draw needs a captured raw VS so replay
+// can instrument it. Existing geometry that replay cannot rebuild must remain fail-closed.
+inline GeometryProbeStage select_geometry_probe_stage(bool rebuilt_generated_geometry,
+                                                       bool has_existing_geometry,
+                                                       bool has_raw_vertex) {
+    if (rebuilt_generated_geometry) return GeometryProbeStage::GeneratedGeometry;
+    if (has_existing_geometry || !has_raw_vertex) return GeometryProbeStage::Unsupported;
+    return GeometryProbeStage::Vertex;
+}
+
 inline RecompiledShaderView recompiled_shader_view(const gpu::DrawItem& draw,
                                                     bool vertex) {
     return vertex ? RecompiledShaderView{&draw.vs_words(), static_cast<bool>(draw.vs_shared)}

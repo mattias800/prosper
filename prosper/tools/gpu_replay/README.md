@@ -187,7 +187,7 @@ Works on both `gpu_replay` and the live app because it lives in the shared rende
 
 ```bash
 PROSPER_GEOM_PROBE=4 ./build-linux/gpu_replay /tmp/submit.prgcap /tmp/out.bmp
-# [geom-probe] draw=4 item=2 operation=19 VS re-recompiled with xfb in GS (1700 VS words, 676 GS words)
+# [geom-probe] draw=4 item=2 operation=19 reused stored VS with xfb in GS (1700 VS words, 676 GS words)
 # [geom-probe] draw=4 verts=1024 finite=1024 on-screen=0 clipped=1024 (offscreen=1023 w<=0=1 nan/inf=0)
 # [geom-probe]   clip-bbox x[-4.86,0] y[-1.14,3.81] z[0,0] w[0,1] -> ALL-VERTS-OUTSIDE-CLIP-CUBE(...)
 # [geom-probe]   v0 = (-2.9, -0.771, 0, 1) ...
@@ -208,9 +208,9 @@ owns *where the geometry is* — a large full-screen quad can have every vertex 
 rasterize, so "all verts clipped" is not "renders nothing"; the bbox tells them apart.
 
 Mechanics: on a capsule (stored SPIR-V) gpu_replay resolves semantic draw N to its compact item, then
-recompiles that draw's raw RDNA2 vertex program and decorates the **last pre-rasterization stage** for XFB.
-That is normally the VS. If explicit fragment interpolation inserted Prosper's generated GS, gpu_replay
-rebuilds that GS with XFB output instead; Vulkan sources transform feedback only from the final such stage.
+decorates the **last pre-rasterization stage** for XFB. That is normally a recompiled raw RDNA2 VS. If explicit
+fragment interpolation inserted Prosper's generated GS, gpu_replay rebuilds that GS with XFB output and
+reuses the stored VS instead; Vulkan sources transform feedback only from the final such stage.
 A v19+ capsule is sufficient for an ordinary vertex shader; v31+ additionally retains a separately-installed
 NGG main stage and its graphics-LDS allocation, allowing linked prolog+main programs to be probed faithfully.
 Existing guest geometry stages cannot yet be rebuilt and are rejected visibly. The live app follows the same
