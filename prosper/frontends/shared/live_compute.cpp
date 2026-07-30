@@ -5860,6 +5860,10 @@ uint64_t live_compute_sampled_image_upload_skips() {
     return g_sampled_image_upload_skips.load(std::memory_order_relaxed);
 }
 
+uint64_t live_compute_cpu_fill_dispatches() {
+    return g_cpu_fill_dispatches.load(std::memory_order_relaxed);
+}
+
 uint64_t live_compute_storage_result_snapshot_bytes() {
     return g_live_compute_context ? g_live_compute_context->storage_result_snapshot_bytes : 0;
 }

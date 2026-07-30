@@ -510,6 +510,8 @@ int main() {
         if (addr == buffer.gpu_addr && size == buffer.size)
             ++cpu_fill_write_notifications;
     });
+    const uint64_t cpu_fills_before =
+        prosper::frontend::live_compute_cpu_fill_dispatches();
     CHECK(prosper::frontend::execute_live_compute_items({cpu_fill_item}),
           "exact buffer-fill program executes through the CPU fast path");
     set_guest_gpu_write_observer({});
@@ -522,7 +524,9 @@ int main() {
         for (uint32_t component = 0; component < 4; ++component)
             cpu_fill_padding_untouched &= result[record * 4 + component] == 0xddddddddu;
     CHECK(cpu_fill_matches && cpu_fill_padding_untouched &&
-              cpu_fill_write_notifications == 1,
+              cpu_fill_write_notifications == 1 &&
+              prosper::frontend::live_compute_cpu_fill_dispatches() ==
+                  cpu_fills_before + 1,
           "CPU fill matches Vulkan, preserves padded lanes, and invalidates the declared range");
 
     ShaderResourceTable narrow_stride_rt = rt;
@@ -536,9 +540,13 @@ int main() {
         narrow_stride_item.spirv = narrow_stride_spirv;
         narrow_stride_item.resources =
             std::make_shared<ShaderResourceTable>(narrow_stride_rt);
+        const uint64_t narrow_stride_fills_before =
+            prosper::frontend::live_compute_cpu_fill_dispatches();
         CHECK(prosper::frontend::execute_live_compute_items({narrow_stride_item}),
               "noncanonical fill descriptor falls back to Vulkan");
-        CHECK(result[300] == 0xabababab,
+        CHECK(result[300] == 0xabababab &&
+                  prosper::frontend::live_compute_cpu_fill_dispatches() ==
+                      narrow_stride_fills_before,
               "CPU fast path does not replace the descriptor's eight-byte stride semantics");
     }
 
@@ -553,9 +561,13 @@ int main() {
         extra_user_item.spirv = extra_user_spirv;
         extra_user_item.user_sgprs = extra_user_config.user_sgprs;
         extra_user_item.recompile_config = extra_user_config;
+        const uint64_t extra_user_fills_before =
+            prosper::frontend::live_compute_cpu_fill_dispatches();
         CHECK(prosper::frontend::execute_live_compute_items({extra_user_item}),
               "shifted TGID input fill falls back to Vulkan");
-        CHECK(result[100 * 4] == 0xcdcdcdcdu,
+        CHECK(result[100 * 4] == 0xcdcdcdcdu &&
+                  prosper::frontend::live_compute_cpu_fill_dispatches() ==
+                      extra_user_fills_before,
               "CPU fast path requires TGID.x to occupy the shader's exact s8 input");
     }
 
