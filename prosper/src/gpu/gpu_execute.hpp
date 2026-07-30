@@ -316,6 +316,16 @@ struct ComputeLaunchDimensions {
 // they are already hardware/Vulkan workgroup counts. Zero local-size registers fall back to one.
 ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& dispatch);
 
+// A small set of exact, structurally recognized compute programs can execute directly against
+// their guest backing. Classification is based on the raw RDNA2 instruction stream, never a title
+// address; an unrecognized or partially matching program always uses the ordinary Vulkan backend.
+enum class ComputeCpuFastPath : uint8_t {
+    None,
+    FillSgprUvec4,
+};
+
+ComputeCpuFastPath classify_compute_cpu_fast_path(const uint32_t* code, size_t dwords);
+
 // Read the exact bound compute program from a dispatch's retained register snapshot, falling back to
 // the submit state for hand-built records without a snapshot. Capture selectors use this before DMA-
 // ordered realization, so a target program remains discoverable even when the pre-realized list is empty.
@@ -332,6 +342,7 @@ struct ComputeItem {
     uint64_t submit_no = 0;
     uint64_t command_order = 0;
     uint32_t required_subgroup_size = 0;
+    ComputeCpuFastPath cpu_fast_path = ComputeCpuFastPath::None;
     // Capture v39 retains the raw compute program and every semantic launch/recompiler input. The
     // stored SPIR-V remains the default replay artifact; --recompile-raw may rebuild it with the
     // current translator and replay device's optional format/subgroup capabilities.

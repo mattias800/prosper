@@ -3455,6 +3455,22 @@ ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& d) {
     return out;
 }
 
+ComputeCpuFastPath classify_compute_cpu_fast_path(const uint32_t* code, size_t dwords) {
+    // Compiler-generated 16-byte buffer fill:
+    //   record = (tgid.x << 6) + tid.x; buffer[record] = {s4, s5, s6, s7}
+    // This exact stream is used by Dead Cells and very frequently by Astro Bot. Keep the match
+    // byte-exact so a different address calculation, descriptor, component mask, or predicate can
+    // never be mistaken for a fill.
+    static constexpr uint32_t kFillSgprUvec4[] = {
+        0xd7460004u, 0x04010c08u, 0x7e000204u, 0x7e020205u, 0x7e040206u,
+        0x7e060207u, 0xe01c2000u, 0x80000004u, 0xbf810000u,
+    };
+    if (code && dwords >= std::size(kFillSgprUvec4) &&
+        std::equal(std::begin(kFillSgprUvec4), std::end(kFillSgprUvec4), code))
+        return ComputeCpuFastPath::FillSgprUvec4;
+    return ComputeCpuFastPath::None;
+}
+
 uint64_t compute_dispatch_code_addr(const GpuState& submit, const GpuState::Dispatch& dispatch) {
     namespace P = prosper::agc::Pm4;
     const GpuState& state = dispatch.state ? *dispatch.state : submit;
@@ -3842,6 +3858,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
             (const uint32_t*)(uintptr_t)code_addr, 0x10000, table.get(), config);
         item.user_sgprs = config.user_sgprs;
         item.required_subgroup_size = config.native_subgroup_size;
+        item.cpu_fast_path = classify_compute_cpu_fast_path(
+            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)), shader_dwords);
         item.recompile_config = config;
         // Capture-bound SPIR-V deliberately uses the device-independent storage path, but v39 raw
         // replay needs the capability mask that a normal live dispatch would have used.

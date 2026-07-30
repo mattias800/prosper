@@ -26,6 +26,17 @@ constexpr bool compute_image_cache_default_eligible(
     return bytes >= compute_image_cache_default_minimum_bytes(image_class);
 }
 
+// Keep enough persistent image residency for modern multi-pass workloads without claiming an
+// unreasonable share of small discrete GPUs. The 512 MiB historical floor remains appropriate for
+// a 4 GiB heap, while larger devices contribute one eighth of their local heap up to 2 GiB. An
+// explicit PROSPER_COMPUTE_IMAGE_CACHE_MB value still overrides this production default.
+constexpr uint64_t compute_image_cache_default_limit_bytes(uint64_t device_local_bytes) {
+    constexpr uint64_t floor = 512ull * 1024ull * 1024ull;
+    constexpr uint64_t ceiling = 2048ull * 1024ull * 1024ull;
+    const uint64_t scaled = device_local_bytes / 8ull;
+    return scaled < floor ? floor : (scaled > ceiling ? ceiling : scaled);
+}
+
 // Pack one raw float32 channel to UNORM8 using the storage-image conversion contract. Kept public
 // so the optimized scalar conversion can be checked directly against the previous lround path.
 uint8_t storage_pack_unorm8(uint32_t float_bits);
