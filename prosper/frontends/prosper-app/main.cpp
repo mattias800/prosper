@@ -33,6 +33,9 @@
 #include "game_path.hpp"                 // dropped/picked path -> app0 root + open action, pure seam
 #include "game_library.hpp"              // scan a games dir -> titles + metadata, pure seam
 #include "app_config.hpp"                // persisted settings (games_dir), pure seam
+#ifdef PROSPER_HAVE_LIBRARY_UI
+#include "library_ui.hpp"                // the ImGui library grid drawn while no game is running
+#endif
 #ifdef PROSPER_HAVE_LIVE_RENDERER
 #include "live_renderer.hpp"           // shared DrawItem->Vulkan compositor (register_live_renderer)
 #endif
@@ -261,7 +264,11 @@ bool create_swapchain(Vk& vk, uint32_t w, uint32_t h,
     VkSwapchainCreateInfoKHR si{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     si.surface = vk.surface; si.minImageCount = imgCount; si.imageFormat = vk.scFormat;
     si.imageColorSpace = cs; si.imageExtent = vk.scExtent; si.imageArrayLayers = 1;
-    si.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;   // we blit into the swapchain image
+    // TRANSFER_DST for the game path, which BLITS finished frames in; COLOR_ATTACHMENT so the library
+    // view (#1471) can render into the same images through a real render pass. Without the attachment
+    // bit its framebuffers are invalid and every draw is silently dropped — the render pass still
+    // appears to clear, which makes it look like a UI bug rather than a swapchain one.
+    si.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     si.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     si.preTransform = caps.currentTransform;
     si.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -947,13 +954,16 @@ static void picked_folder_cb(void* /*userdata*/, const char* const* filelist, in
     g_picked_path = filelist[0];
 }
 
-static void open_folder_picker(SDL_Window* win) {
+// Returns true when this call actually opened a dialog, so a caller can arm per-request state only
+// when its request is the one outstanding.
+static bool open_folder_picker(SDL_Window* win) {
     {
         std::lock_guard<std::mutex> lock(g_picked_mutex);
-        if (g_picker_open) return;   // one dialog at a time
+        if (g_picker_open) return false;   // one dialog at a time
         g_picker_open = true;
     }
     SDL_ShowOpenFolderDialog(picked_folder_cb, nullptr, win, nullptr, /*allow_many=*/false);
+    return true;
 }
 
 // Take the path this process was started from. Each platform has its own authoritative answer;
@@ -1139,7 +1149,7 @@ int main(int argc, char** argv) {
     // persisted setting. Resolved before anything opens a window so --list-games stays headless.
     const prosper::frontend::AppConfig appConfig = load_app_config();
     const char* gamesDirEnv = getenv("PROSPER_GAMES_DIR");
-    const std::string gamesDir = prosper::frontend::resolve_games_dir(
+    std::string gamesDir = prosper::frontend::resolve_games_dir(
         gamesDirFlag, gamesDirEnv ? gamesDirEnv : "", appConfig);
 
     // --list-games: print the library as plain text and exit, with no window, no Vulkan and no guest.
@@ -1307,6 +1317,36 @@ int main(int argc, char** argv) {
     bool fullscreenRequested = (initialWindowFlags & SDL_WINDOW_FULLSCREEN) != 0;
     windowControls.set_app_focus((initialWindowFlags & SDL_WINDOW_INPUT_FOCUS) != 0);
 
+#ifdef PROSPER_HAVE_LIBRARY_UI
+    // The library replaces the empty idle window. Only meaningful when this run has no game of its own
+    // and is not feeding a test pattern; a failure to bring it up is not fatal — the flat idle colour
+    // remains, so a driver that cannot host the UI costs the user a library, not the app.
+    prosper::frontend::LibraryUi libraryUi;
+    std::string libraryStatus;
+    // True while a picker opened from the library's own button is outstanding: its answer is a games
+    // DIRECTORY to remember, not a title to boot.
+    bool libraryBrowsePending = false;
+    const bool wantLibrary = !testPattern && dump.empty();
+    bool libraryHasGames = false;
+    auto rescan_library = [&]() {
+        if (!libraryUi.ready()) return;
+        std::vector<prosper::frontend::GameEntry> found;
+        if (!gamesDir.empty())
+            found = prosper::frontend::scan_game_library(gamesDir, host_path_probe(), host_library_io());
+        libraryHasGames = !found.empty();
+        libraryUi.set_games(std::move(found), gamesDir);
+    };
+    if (wantLibrary) {
+        if (libraryUi.init(win, vk.instance, vk.phys, vk.device, vk.qfamily, vk.queue, vk.swapchain,
+                           vk.scFormat, vk.scImages, vk.scExtent)) {
+            rescan_library();
+            fprintf(stderr, "[app] library view ready.\n");
+        } else {
+            fprintf(stderr, "[app] library view unavailable; the window stays on the idle colour.\n");
+        }
+    }
+#endif
+
     // Open a title the user handed the window — a dropped folder, or the folder picker's result
     // (#1469). argv never comes through here; it booted before the window existed.
     const prosper::frontend::GamePathProbe pathProbe = host_path_probe();
@@ -1368,6 +1408,14 @@ int main(int argc, char** argv) {
             }
             title = window_title_for(root, false);
             SDL_SetWindowTitle(win, title.c_str());
+#ifdef PROSPER_HAVE_LIBRARY_UI
+            // Hand the swapchain back before the guest's first frame: from here the game present path
+            // owns it, and two presenters acquiring the same images would fight.
+            if (libraryUi.ready()) {
+                fprintf(stderr, "[app] library view closed; presenting the game.\n");
+                libraryUi.shutdown();
+            }
+#endif
             return true;
         }
         }
@@ -1376,7 +1424,16 @@ int main(int argc, char** argv) {
 
     // A launch that was not told what to show would otherwise be a dead end for anyone who did not
     // arrive through a command line.
-    if (prosper::frontend::should_pick_at_startup(pick)) {
+    bool offerPicker = prosper::frontend::should_pick_at_startup(pick);
+#ifdef PROSPER_HAVE_LIBRARY_UI
+    // The library already shows a way in, so a modal dialog on top of it would be noise. Only fall back
+    // to the picker when it has nothing to offer.
+    if (offerPicker && libraryUi.ready() && libraryHasGames) {
+        offerPicker = false;
+        fprintf(stderr, "[app] library has titles; not opening the startup picker.\n");
+    }
+#endif
+    if (offerPicker) {
         fprintf(stderr, "[app] no game given; opening the folder picker.\n");
         open_folder_picker(win);
     }
@@ -1385,6 +1442,10 @@ int main(int argc, char** argv) {
         openedThisBatch = rejectedThisBatch = false;
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+#ifdef PROSPER_HAVE_LIBRARY_UI
+            // Only while the library owns the screen: once a guest boots, every key belongs to it.
+            if (libraryUi.ready() && !g_guest_started && libraryUi.handle_event(ev)) continue;
+#endif
             if (ev.type == SDL_EVENT_QUIT) running = false;
             else if (ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
                      ev.window.windowID == appWindowId) {
@@ -1516,7 +1577,39 @@ int main(int argc, char** argv) {
         // picking again is exactly how the user recovers (it relaunches into a fresh process).
         {
             std::string picked;
-            { std::lock_guard<std::mutex> lock(g_picked_mutex); picked.swap(g_picked_path); }
+            bool pickerStillOpen = false;
+            // One critical section: the callback takes the same mutex, so it runs strictly before or
+            // strictly after this, and the "empty path but closed dialog" state cannot be observed
+            // while an answer is in flight.
+            {
+                std::lock_guard<std::mutex> lock(g_picked_mutex);
+                picked.swap(g_picked_path);
+                pickerStillOpen = g_picker_open;
+            }
+#ifdef PROSPER_HAVE_LIBRARY_UI
+            // The dialog closed without an answer (cancelled, or it failed to open): disarm, or the
+            // flag would still be set when some later, unrelated pick arrives.
+            if (libraryBrowsePending && picked.empty() && !pickerStillOpen)
+                libraryBrowsePending = false;
+            // The library asked for this folder, so its answer names a games DIRECTORY to remember, not
+            // a title to boot. Without this the result went to open_game(), which resolves an app0 root
+            // and therefore always rejected a folder-of-folders with "That is not a PS5 game".
+            if (!picked.empty() && libraryBrowsePending) {
+                libraryBrowsePending = false;
+                if (!host_path_probe().is_dir(picked)) {
+                    libraryStatus = "That is not a folder.";
+                } else {
+                    prosper::frontend::AppConfig cfg = load_app_config();
+                    cfg.games_dir = prosper::frontend::strip_trailing_separators(picked);
+                    gamesDir = cfg.games_dir;
+                    libraryStatus = save_app_config(cfg) ? std::string()
+                                                        : "Could not save the games folder setting.";
+                    fprintf(stderr, "[app] games directory set to %s\n", gamesDir.c_str());
+                    rescan_library();
+                }
+                picked.clear();
+            }
+#endif
             if (!picked.empty() && !testPattern) {
                 if (g_guest_started)
                     fprintf(stderr, "[app] ignoring the folder picker's answer: a game started first.\n");
@@ -1565,6 +1658,13 @@ int main(int argc, char** argv) {
                 break;
             }
             swapchainDirty = false;
+#ifdef PROSPER_HAVE_LIBRARY_UI
+            if (libraryUi.ready() &&
+                !libraryUi.recreate_swapchain(vk.swapchain, vk.scFormat, vk.scImages, vk.scExtent)) {
+                fprintf(stderr, "[app] library view lost its swapchain; falling back to the idle colour.\n");
+                libraryUi.shutdown();
+            }
+#endif
         }
         const auto loopNow = std::chrono::steady_clock::now();
         if (timedDumpPending && loopNow >= nextTimedDump) {
@@ -1581,13 +1681,42 @@ int main(int argc, char** argv) {
                 timedDumpPending = false;
         }
 
-        // No game yet and no test pattern: nothing is producing frames, so paint the window a flat
-        // colour instead of leaving it on undefined swapchain contents while it waits (#1469).
-        // present_frame blits to the whole swapchain extent, so a 4x4 source fills any window size.
+        // No game yet and no test pattern: nothing is producing frames. Draw the library so the window
+        // is a way IN rather than a dead end (#1471), and fall back to a flat colour when the UI is
+        // unavailable so the window is never left on undefined swapchain contents (#1469).
         // present_frame_seq() counts every frame handed to the present layer, so the moment anything
         // publishes one — a game opened here, or an external producer — the real path takes over.
         // These frames deliberately do not count toward --frames: that gate asserts real content.
         if (!testPattern && !g_guest_started && gpu::present_frame_seq() == 0) {
+#ifdef PROSPER_HAVE_LIBRARY_UI
+            if (libraryUi.ready()) {
+                const prosper::frontend::LibraryAction act = libraryUi.render_frame(libraryStatus);
+                if (libraryUi.needs_recreate()) {
+                    libraryUi.clear_needs_recreate();
+                    swapchainDirty = true;   // serviced at the top of the next iteration
+                }
+                switch (act.kind) {
+                case prosper::frontend::LibraryAction::Kind::open:
+                    // Straight through the same start_guest() path argv, the drop target and the
+                    // picker all use — the library chooses a title, it does not boot one differently.
+                    if (!open_game(act.app0_root)) libraryStatus = "Could not start that game.";
+                    break;
+                case prosper::frontend::LibraryAction::Kind::browse:
+                    // Arm only when this request is the one that opened the dialog: otherwise a browse
+                    // raised while another picker is already up would claim that picker's answer.
+                    if (open_folder_picker(win)) libraryBrowsePending = true;
+                    break;
+                case prosper::frontend::LibraryAction::Kind::quit:
+                    running = false;
+                    break;
+                case prosper::frontend::LibraryAction::Kind::set_games_dir:
+                case prosper::frontend::LibraryAction::Kind::none:
+                    break;
+                }
+                if (!running) break;
+                continue;
+            }
+#endif
             static const uint8_t kIdlePixel[4] = {0x1e, 0x1e, 0x1e, 0xff};
             static uint8_t kIdleFrame[4 * 4 * 4];
             for (size_t i = 0; i < sizeof kIdleFrame; i++) kIdleFrame[i] = kIdlePixel[i % 4];
@@ -1754,6 +1883,11 @@ int main(int argc, char** argv) {
         std::_Exit(exitCode);
     }
 
+#ifdef PROSPER_HAVE_LIBRARY_UI
+    // Before SDL_Quit: ImGui's SDL3 backend frees cursors and closes gamepads on shutdown, and the
+    // destructor would otherwise run after SDL had already torn those down.
+    libraryUi.shutdown();
+#endif
     vkDeviceWaitIdle(vk.device);
     SDL_DestroyWindow(win); SDL_Quit();
     return exitCode;

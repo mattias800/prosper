@@ -174,8 +174,39 @@ which fails on dumps that declare the default first: the first match is then def
 (PPSA15319) read as "DER KÜHNE KNAPPE". The same function drives the window title, so that was wrong
 there too.
 
-Stage 2 vendors Dear ImGui under `third_party/` (frontend-only) and draws the grid and a settings view on
-top of this data.
+### Stage 2: the view
+
+Dear ImGui (`third_party/imgui`, MIT) and stb_image (`third_party/stb`, public domain) are vendored
+**frontend-only** — `prosper_core` links neither, so the arrow above is unchanged and deleting
+`frontends/` still leaves CI unaffected. `library_ui.{hpp,cpp}` draws the grid; `library_nav.hpp` holds
+the selection rules and is pure and unit-tested, so the grid's behaviour is covered without a window.
+
+Decisions worth knowing:
+
+- **The library renders through the app's existing device and swapchain**, adding only a render pass and
+  per-image framebuffers. No second device, no second window.
+- **It owns its own command buffer, semaphores and fence** and does its own acquire/present, rather than
+  threading a second mode through `present_frame`. The two never run at once — the library *is* the idle
+  state and is torn down the instant a guest boots (one game per launch, #352) — so keeping the game
+  present path byte-identical was worth more than sharing sync objects.
+- **The swapchain is now created with `VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT` as well as
+  `TRANSFER_DST`.** The game path only ever *blits* into swapchain images, so the attachment bit was
+  absent; without it every framebuffer built from those images is invalid and each draw is silently
+  dropped. The render pass still appears to clear, which makes it look like a UI bug rather than a
+  swapchain one — Vulkan validation names it immediately
+  (`VUID-VkFramebufferCreateInfo-pAttachments-00877`).
+- **ImGui's own keyboard/gamepad nav is deliberately off.** Selection is driven by `library_nav.hpp`, and
+  running both means the arrow keys move a widget focus as well as the selection, and Enter activates
+  whatever widget that focus landed on instead of launching the highlighted game. A consequence worth
+  knowing: turning off `NavEnableGamepad` also silences the SDL3 backend's gamepad feed, so
+  `ImGuiKey_Gamepad*` is never set. Controller navigation therefore needs the pad read directly *and*
+  `SDL_INIT_GAMEPAD` initialized while the library is alive — neither is true today (the pad backend
+  initializes it inside `start_guest`), so the library is keyboard/mouse only.
+- **`CheckVkResultFn` is always set.** ImGui's Vulkan backend silently ignores every `VkResult`
+  otherwise, so a failed pipeline or descriptor allocation would present only as a window that draws
+  nothing.
+- **Failure is never fatal.** If the UI cannot be created the app logs it and falls back to the flat idle
+  colour; a driver that cannot host the library costs the user a library, not the app.
 
 ## The Vulkan-context decision: two contexts, one shared CPU frame
 
