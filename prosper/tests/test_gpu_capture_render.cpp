@@ -469,6 +469,54 @@ int main() {
                   "unchanged Float32 texture skips its next narrow/decode/upload callback");
             CHECK(!first_float.empty() && first_float == reused_float,
                   "persistent Float32 reuse preserves the native RGBA16F sampling result");
+
+            // Graphics lowers a sampled 2D array to its base slice today. The descriptor address is
+            // the layer allocation base, while layer_mip_offset selects the level that must be
+            // decoded. Exercise both the offset and the persistent decoded/uploaded reuse contract.
+            float* array_base = reinterpret_cast<float*>(source_va + 0x2000);
+            float* array_selected = reinterpret_cast<float*>(source_va + 0x2100);
+            const float base_values[16] = {
+                0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 1.0f,
+                0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 1.0f,
+            };
+            std::memcpy(array_base, base_values, sizeof(base_values));
+            std::memcpy(array_selected, float_values, sizeof(float_values));
+            DrawItem array_draw = cached_float_draw;
+            array_draw.color0_base = 0xd90000;
+            auto array_table = std::make_shared<ShaderResourceTable>(*array_draw.prt);
+            ShaderResource& array_resource = array_table->resources[0];
+            array_resource.gpu_addr = reinterpret_cast<uint64_t>(array_base);
+            array_resource.size = 4u * 0x1000u;
+            array_resource.img_dim = 5;
+            array_resource.depth = 4;
+            array_resource.layer_stride_bytes = 0x1000;
+            array_resource.layer_mip_offset_bytes = 0x100;
+            array_draw.prt = std::move(array_table);
+
+            const std::vector<uint8_t> first_array =
+                render_submit_items({array_draw}, W, H);
+            const auto first_array_stats = prosper::test::backend_texture_upload_stats();
+            const std::vector<uint8_t> reused_array =
+                render_submit_items({array_draw}, W, H);
+            const auto reused_array_stats = prosper::test::backend_texture_upload_stats();
+            bool array_selected_level =
+                first_array.size() == static_cast<size_t>(W) * H * 4;
+            if (array_selected_level) {
+                const uint8_t* center =
+                    &first_array[(static_cast<size_t>(H / 2) * W + W / 2) * 4];
+                array_selected_level = center[0] >= 120 && center[0] <= 136 &&
+                    center[1] >= 56 && center[1] <= 72 &&
+                    center[2] >= 24 && center[2] <= 40 && center[3] > 240;
+            }
+            CHECK(array_selected_level,
+                  "2D-array base-slice decode reads the selected mip offset, not allocation base");
+            CHECK(first_array_stats.persistent_misses == 1 &&
+                      first_array_stats.unique_uploads == 1 &&
+                      reused_array_stats.persistent_hits == 1 &&
+                      reused_array_stats.unique_uploads == 0,
+                  "unchanged 2D-array base slice reuses its decoded and uploaded image");
+            CHECK(!first_array.empty() && first_array == reused_array,
+                  "2D-array base-slice cache preserves the selected pixels");
             CHECK(unmap(source_va, source_mapping_size, 0, 0, 0, 0) == 0,
                   "persistent BC test unmaps its guest source");
         }
@@ -963,12 +1011,22 @@ int main() {
               "an ordinary supported guest 2D texture uses the decoded-texture cache");
         CHECK(texture_decode_cache_candidate(false, false, false, 2u, true, true),
               "a supported guest 3D volume uses the decoded-texture cache");
+        CHECK(texture_decode_cache_candidate(false, false, false, 5u, true, true),
+              "a supported guest 2D-array base slice uses the decoded-texture cache");
         CHECK(!texture_decode_cache_candidate(false, false, false, 3u, true, true),
               "a cube texture stays on its layer-aware decode path");
         CHECK(!texture_decode_cache_candidate(false, true, false, 1u, true, true),
               "a retained sampled-depth image bypasses guest-byte decode-cache work");
         CHECK(!texture_decode_cache_candidate(true, false, false, 1u, true, true),
               "a retained color image bypasses guest-byte decode-cache work");
+
+        using prosper::frontend::texture_decode_source_address;
+        CHECK(texture_decode_source_address(0x100000u, 5u, false, 0x24000u) == 0x124000u,
+              "a 2D-array base slice decodes from its selected mip offset");
+        CHECK(texture_decode_source_address(0x100000u, 5u, true, 0x24000u) == 0x100000u,
+              "a packed 2D-array mip tail retains its shared block base");
+        CHECK(texture_decode_source_address(0x100000u, 1u, false, 0x24000u) == 0x100000u,
+              "an ordinary 2D texture keeps its descriptor base address");
 
         using prosper::frontend::texture_source_snapshot_can_follow_watch;
         CHECK(texture_source_snapshot_can_follow_watch(false, false, true, 4096u, 4096u),

@@ -32,13 +32,22 @@ size_t texture_decode_cache_limit_bytes(const char* override_mib,
 // Decide whether guest bytes are the authoritative source for a sampled-texture decode. Retained
 // color and depth targets are already represented by Vulkan images and must bypass CPU decode-cache
 // validation; captured host backing, cube textures, and non-texture resources follow their dedicated
-// paths. Supported 3D volume inputs are pure guest-byte decodes and may be retained like 2D inputs.
+// paths. Supported 3D volume inputs and the graphics backend's base-slice 2D-array view are pure
+// guest-byte decodes and may be retained like ordinary 2D inputs.
 bool texture_decode_cache_candidate(bool has_live_color_target,
                                     bool has_live_depth_target,
                                     bool has_captured_host_data,
                                     uint32_t image_dimension,
                                     bool is_sampled_texture,
                                     bool format_supported);
+
+// Graphics currently lowers sampled 2D arrays to a 2D base-slice image. Array descriptors retain
+// the allocation base plus the selected mip's per-layer offset, so CPU decode must begin at that
+// offset (except for packed mip tails, whose coordinates are relative to the shared block base).
+uint64_t texture_decode_source_address(uint64_t gpu_address,
+                                       uint32_t image_dimension,
+                                       bool in_mip_tail,
+                                       uint32_t layer_mip_offset_bytes);
 
 // Once an exact source has been validated while a working write watch is armed, the retained encoded
 // copy is redundant: Unchanged permits reuse, while Dirty/Unknown conservatively forces a re-decode.
