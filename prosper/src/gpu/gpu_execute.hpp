@@ -195,12 +195,13 @@ struct DynFetch {
 // consumer via by_srt_offset(imm) — so `key` here is exactly that immediate, and build_stage_table
 // turns each use into a ShaderResource with srt_offset = key.
 struct SrtUse {
-    int kind = 0;                    // 0 = texture (t8, + s4 sampler when resolved), 1 = constant buffer (v4)
+    int kind = 0;                    // 0 = texture, 1 = constant buffer, 2 = BVH buffer
     uint32_t key = 0;                // the s_load immediate byte offset (== emit_alu's sreg_srt tag);
                                      // 0xFFFFFFFF = key-less (direct entry V#, register-SOFFSET, or
                                      // negative-imm load; resolve by the exact instruction pc instead)
     std::array<uint32_t, 8> t8{};    // T# dwords as loaded (kind 0)
     std::array<uint32_t, 4> v4{};    // V# dwords as loaded (kind 1)
+    std::array<uint32_t, 4> bvh4{};  // BVH descriptor dwords live at IMAGE_BVH_INTERSECT_RAY (kind 2)
     uint32_t instruction_format = UINT32_MAX; // MTBUF BUF_FMT override for kind 1
     bool has_samp = false;
     std::array<uint32_t, 4> s4{};    // paired S# dwords (kind 0, when the SSAMP load also resolved)

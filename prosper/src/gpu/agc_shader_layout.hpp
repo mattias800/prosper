@@ -120,6 +120,21 @@ struct DecodedBufferDescriptor {
 // Decode a 4-dword V# (RDNA2/Gen5 buffer resource). Pure; exposed for reuse + testing.
 DecodedBufferDescriptor decode_buffer_descriptor(const uint32_t v[4]);
 
+// A decoded GFX10 BVH resource descriptor (4 dwords). Unlike an image T#, IMAGE_BVH_INTERSECT_RAY
+// consumes a compact descriptor whose base is expressed in 256-byte units and whose size is a
+// 42-bit, 64-byte-unit count-minus-one. TYPE=8 identifies the BVH descriptor class.
+struct DecodedBvhDescriptor {
+    uint64_t base = 0;
+    uint64_t size_bytes = 0;
+    uint8_t type = 0;
+    bool triangle_return_mode = false;
+    bool box_node_64b = false;
+    bool sort_enabled = false;
+};
+
+// Decode a 4-dword GFX10 BVH descriptor. Pure; exposed for reuse + testing.
+DecodedBvhDescriptor decode_bvh_descriptor(const uint32_t v[4]);
+
 // A decoded image resource descriptor (T#, 8 dwords / 256-bit). Layout = Kyty ShaderTextureResource
 // Gen5 getters (Base40/Width5/Height5/Format/TileMode). `base` is the byte address of the texel data
 // in unified guest memory. `tile_mode` 0 = linear (no detiling needed); non-zero = GPU-tiled. GFX10

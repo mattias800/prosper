@@ -642,6 +642,46 @@ int main() {
           direct_uses[0].s4[0] == seed5d[8] && direct_uses[0].s4[3] == seed5d[11],
           "direct user-SGPR T#/S# dwords are preserved");
 
+    // Astro Bot's world-map kernel uses IMAGE_BVH_INTERSECT_RAY with a compact four-dword BVH
+    // descriptor in s[16:19]. It must not be mistaken for an eight-dword texture descriptor.
+    alignas(256) static uint32_t astro_bvh_backing[1024]{};
+    const uint64_t astro_bvh_base = reinterpret_cast<uint64_t>(astro_bvh_backing);
+    const uint32_t astro_bvh_seed[4] = {
+        static_cast<uint32_t>(astro_bvh_base >> 8),
+        static_cast<uint32_t>((astro_bvh_base >> 40) & 0xFFu),
+        63u,                         // (63 + 1) * 64 = 4096 bytes
+        0x81000000u,                // TYPE=8, TRIANGLE_RETURN_MODE=1
+    };
+    const uint32_t astro_bvh_intersect[] = {
+        0xf1989f07u, 0x00040303u, 0x43440d3fu, 0x46424140u, 0x00004847u,
+        0xbf810000u,
+    };
+    const DecodedBvhDescriptor decoded_bvh = decode_bvh_descriptor(astro_bvh_seed);
+    CHECK(decoded_bvh.base == astro_bvh_base && decoded_bvh.size_bytes == sizeof(astro_bvh_backing) &&
+              decoded_bvh.type == 8u && decoded_bvh.triangle_return_mode &&
+              !decoded_bvh.box_node_64b && !decoded_bvh.sort_enabled,
+          "GFX10 BVH descriptor decodes its 256-byte base, 64-byte count and flags");
+    std::vector<SrtUse> astro_bvh_uses;
+    resolve_dynamic_fetch(astro_bvh_intersect, std::size(astro_bvh_intersect),
+                          astro_bvh_seed, std::size(astro_bvh_seed), 16, &astro_bvh_uses);
+    CHECK(astro_bvh_uses.size() == 1 && astro_bvh_uses[0].kind == 2 &&
+              astro_bvh_uses[0].use_pc == 0 && astro_bvh_uses[0].bvh4[0] == astro_bvh_seed[0] &&
+              astro_bvh_uses[0].bvh4[3] == astro_bvh_seed[3],
+          "Astro IMAGE_BVH_INTERSECT_RAY publishes its live four-word BVH descriptor by pc");
+    std::array<uint32_t, 20> astro_compute_seed{};
+    std::copy(std::begin(astro_bvh_seed), std::end(astro_bvh_seed),
+              astro_compute_seed.begin() + 16);
+    ShaderResourceTable astro_bvh_table;
+    add_compute_buffer_resources(astro_bvh_table, astro_bvh_intersect,
+                                 std::size(astro_bvh_intersect), astro_compute_seed.data(),
+                                 astro_compute_seed.size());
+    CHECK(astro_bvh_table.resources.size() == 1 &&
+              astro_bvh_table.resources[0].cls == ResourceClass::ConstantBuffer &&
+              astro_bvh_table.resources[0].gpu_addr == astro_bvh_base &&
+              astro_bvh_table.resources[0].size == sizeof(astro_bvh_backing) &&
+              astro_bvh_table.resources[0].fetch_pc == 0,
+          "Astro BVH bytes materialize as the instruction-scoped read-only compute buffer");
+
     // Astro Bot's live visibility packet consumes a direct R32_UINT T# in s[0:7]. Opcode 0x0f is
     // IMAGE_ATOMIC_SWAP, so its instruction-scoped resource must be materialized as a storage image
     // even though the packet's unused SSAMP field aliases s0.

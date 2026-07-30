@@ -5261,6 +5261,111 @@ int main() {
               "#590: partially-overlapping loops remain REJECTED (unstructured region)");
     }
 
+    // Astro Bot's exact RTIP 1.1 IMAGE_BVH_INTERSECT_RAY lowering, executed on real Vulkan. The
+    // first fixture intersects child 0 of an FP32 box node and misses the other three. The second
+    // uses triangle node type 1 (V1,V3,V2), which catches the compressed-pair vertex mapping as well
+    // as the mode-1 numerator/denominator result contract.
+    {
+        const uint32_t bvh_code[] = {
+            0xf1989f07u, 0x00040303u, 0x43440d3fu, 0x46424140u, 0x00004847u,
+            0xbf810000u,
+        };
+        ShaderResourceTable bvh_rt;
+        ShaderResource bvh{};
+        bvh.cls = ResourceClass::ConstantBuffer;
+        bvh.format = DataFormat::Uint32;
+        bvh.num_components = 1;
+        bvh.binding = 2;
+        bvh.size = 128;
+        bvh.fetch_pc = 0;
+        bvh_rt.resources.push_back(bvh);
+
+        constexpr uint32_t lanes = 64;
+        constexpr uint32_t inputs_per_lane = 73;
+        std::vector<float> bvh_inputs(lanes * inputs_per_lane, 0.0f);
+        auto set_input_bits = [&](uint32_t lane, uint32_t vgpr, uint32_t bits) {
+            bvh_inputs[lane * inputs_per_lane + vgpr] = std::bit_cast<float>(bits);
+        };
+        auto set_ray = [&](uint32_t lane, uint32_t node, float ox, float oy, float oz) {
+            set_input_bits(lane, 3, node);
+            bvh_inputs[lane * inputs_per_lane + 63] = 100.0f; // ray extent
+            bvh_inputs[lane * inputs_per_lane + 13] = ox;
+            bvh_inputs[lane * inputs_per_lane + 68] = oy;
+            bvh_inputs[lane * inputs_per_lane + 67] = oz;
+            bvh_inputs[lane * inputs_per_lane + 64] = 0.0f;
+            bvh_inputs[lane * inputs_per_lane + 65] = 0.0f;
+            bvh_inputs[lane * inputs_per_lane + 66] = 1.0f;
+            bvh_inputs[lane * inputs_per_lane + 70] = std::numeric_limits<float>::infinity();
+            bvh_inputs[lane * inputs_per_lane + 71] = std::numeric_limits<float>::infinity();
+            bvh_inputs[lane * inputs_per_lane + 72] = 1.0f;
+        };
+        for (uint32_t lane = 0; lane < lanes; ++lane) set_ray(lane, 5u, 0.0f, 0.0f, -5.0f);
+
+        std::vector<uint32_t> box_words(32, 0u);
+        box_words[0] = 0x100u; box_words[1] = 0x200u;
+        box_words[2] = 0x300u; box_words[3] = 0x400u;
+        for (uint32_t child = 0; child < 4; ++child) {
+            const float lo = child == 0 ? -1.0f : 10.0f + static_cast<float>(child);
+            const float hi = child == 0 ?  1.0f : 11.0f + static_cast<float>(child);
+            const uint32_t base = 4u + child * 6u;
+            box_words[base + 0] = bits_of(lo); box_words[base + 1] = bits_of(lo);
+            box_words[base + 2] = bits_of(lo); box_words[base + 3] = bits_of(hi);
+            box_words[base + 4] = bits_of(hi); box_words[base + 5] = bits_of(hi);
+        }
+        const uint32_t box_expect[4] = {0x100u, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+        bool box_ok = true;
+        for (uint32_t component = 0; component < 4; ++component) {
+            const std::vector<uint32_t> module = recompile_valu(
+                bvh_code, std::size(bvh_code), inputs_per_lane, 3u + component, &bvh_rt);
+            const std::vector<float> output = prosper::test::run_compute(
+                module, bvh_inputs, lanes, lanes, box_words);
+            box_ok &= output.size() == lanes;
+            for (uint32_t lane = 0; lane < output.size(); ++lane)
+                box_ok &= bits_of(output[lane]) == box_expect[component];
+        }
+        CHECK(box_ok, "IMAGE_BVH_INTERSECT_RAY returns the four unsorted FP32-box child hits");
+
+        // RTIP 1.1 conservatively grows the far edge by six 2^-24 increments. Make the
+        // X near edge one float ULP beyond the Y far edge: an exact slab comparison misses,
+        // while the architectural interval growth retains the edge-touching child.
+        for (uint32_t lane = 0; lane < lanes; ++lane) {
+            set_ray(lane, 5u, 0.0f, 0.0f, 0.0f);
+            bvh_inputs[lane * inputs_per_lane + 64] = 1.0f;
+            bvh_inputs[lane * inputs_per_lane + 65] = 1.0f;
+            bvh_inputs[lane * inputs_per_lane + 66] = 1.0f;
+            bvh_inputs[lane * inputs_per_lane + 70] = 1.0f;
+            bvh_inputs[lane * inputs_per_lane + 71] = 1.0f;
+            bvh_inputs[lane * inputs_per_lane + 72] = 1.0f;
+        }
+        box_words[4] = 0x3f800001u; box_words[5] = bits_of(0.0f);
+        box_words[6] = bits_of(0.0f); box_words[7] = bits_of(2.0f);
+        box_words[8] = bits_of(1.0f); box_words[9] = bits_of(2.0f);
+        const std::vector<uint32_t> edge_module = recompile_valu(
+            bvh_code, std::size(bvh_code), inputs_per_lane, 3, &bvh_rt);
+        const std::vector<float> edge_output = prosper::test::run_compute(
+            edge_module, bvh_inputs, lanes, lanes, box_words);
+        bool edge_ok = edge_output.size() == lanes;
+        for (uint32_t lane = 0; lane < edge_output.size(); ++lane)
+            edge_ok &= bits_of(edge_output[lane]) == 0x100u;
+        CHECK(edge_ok, "IMAGE_BVH_INTERSECT_RAY conservatively retains edge-touching boxes");
+
+        std::vector<uint32_t> tri_words(32, 0u);
+        tri_words[0] = bits_of(9.0f); tri_words[1] = bits_of(9.0f); tri_words[2] = bits_of(9.0f);
+        tri_words[3] = bits_of(0.0f); tri_words[4] = bits_of(0.0f); tri_words[5] = bits_of(0.0f); // V1
+        tri_words[6] = bits_of(0.0f); tri_words[7] = bits_of(1.0f); tri_words[8] = bits_of(0.0f); // V2
+        tri_words[9] = bits_of(1.0f); tri_words[10] = bits_of(0.0f); tri_words[11] = bits_of(0.0f); // V3
+        tri_words[15] = 0x00000900u; // type-1 I=vertex1, J=vertex2
+        for (uint32_t lane = 0; lane < lanes; ++lane) set_ray(lane, 1u, 0.25f, 0.25f, -1.0f);
+        const std::vector<uint32_t> tri_module = recompile_valu(
+            bvh_code, std::size(bvh_code), inputs_per_lane, 3, &bvh_rt);
+        const std::vector<float> tri_output = prosper::test::run_compute(
+            tri_module, bvh_inputs, lanes, lanes, tri_words);
+        bool tri_ok = tri_output.size() == lanes;
+        for (uint32_t lane = 0; lane < tri_output.size(); ++lane)
+            tri_ok &= bits_of(tri_output[lane]) == bits_of(-1.0f);
+        CHECK(tri_ok, "IMAGE_BVH_INTERSECT_RAY type-1 triangle returns its exact t numerator");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

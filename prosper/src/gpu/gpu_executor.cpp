@@ -2223,6 +2223,51 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 break;
             }
             case Rdna2Format::MIMG: {
+                // IMAGE_BVH_INTERSECT_RAY consumes a four-dword BVH descriptor, not an eight-dword
+                // image T#. Preserve the words live at this exact instruction and materialize the
+                // acceleration-structure bytes as a raw read-only SSBO for software lowering.
+                if (in.opcode == 0xE6u) {
+                    if (srt_uses) {
+                        const int bbase = in.src[1].value;
+                        std::array<uint32_t, 4> live_bvh{};
+                        bool live_known = valid_reg(bbase) && valid_reg(bbase + 3);
+                        for (int k = 0; live_known && k < 4; ++k)
+                            live_known &= known(bbase + k, live_bvh[(size_t)k]);
+                        const bool snapshot_provenance = valid_reg(bbase) &&
+                            descr_known.test((size_t)bbase);
+                        const bool seed_provenance = !snapshot_provenance &&
+                            (untouched_seed_range(bbase, 4) ||
+                             consecutive_seed_copy_range(bbase, 4));
+                        const DecodedBvhDescriptor d = live_known
+                            ? decode_bvh_descriptor(live_bvh.data()) : DecodedBvhDescriptor{};
+                        const bool plausible = live_known && (snapshot_provenance || seed_provenance) &&
+                            d.type == 8u && d.base > 0x10000u && d.size_bytes != 0;
+                        if (trc) {
+                            fprintf(stderr,
+                                    "[dyntrace] BVH pc=%u srsrc=s%d snapshot=%d seed=%d bvh=",
+                                    in.pc, bbase, snapshot_provenance, seed_provenance);
+                            if (plausible) {
+                                for (uint32_t word : live_bvh) fprintf(stderr, "%08x ", word);
+                                fprintf(stderr, "-> base=0x%llx size=0x%llx type=%u tri_mode=%u",
+                                        (unsigned long long)d.base,
+                                        (unsigned long long)d.size_bytes, d.type,
+                                        d.triangle_return_mode);
+                            } else {
+                                fprintf(stderr, "<unknown>");
+                            }
+                            fputc('\n', stderr);
+                        }
+                        if (plausible) {
+                            SrtUse u;
+                            u.kind = 2;
+                            u.key = 0xFFFFFFFFu;
+                            u.bvh4 = live_bvh;
+                            u.use_pc = in.pc;
+                            srt_uses->push_back(u);
+                        }
+                    }
+                    break;
+                }
                 // Descriptor-table use (#294): an image op's SRSRC (src[1]) is an 8-dword T#; if it was
                 // snapshotted from a table load, report it as a Texture use — with the paired SSAMP
                 // (src[2]) S# when that 4-dword load also resolved. VGPR-only dest: no SGPR state.
@@ -2742,6 +2787,33 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
 
     std::set<uint64_t> seen;
     for (const auto& u : srt_uses) {
+        if (u.kind == 2) {
+            const DecodedBvhDescriptor d = decode_bvh_descriptor(u.bvh4.data());
+            if (d.type != 8u || d.base <= 0x10000u || d.size_bytes == 0 ||
+                d.size_bytes > 0x10000000u || d.size_bytes > UINT32_MAX ||
+                !d.triangle_return_mode || d.box_node_64b || d.sort_enabled)
+                continue;
+            const uint64_t dk = 0x8000000200000000ull | u.use_pc;
+            if (!seen.insert(dk).second) continue;
+            bool mapped = false;
+            for (auto& r0 : table.resources) {
+                if (r0.cls != ResourceClass::ConstantBuffer || r0.gpu_addr != d.base ||
+                    r0.size != static_cast<uint32_t>(d.size_bytes))
+                    continue;
+                if (r0.fetch_pc == 0xFFFFFFFFu) r0.fetch_pc = u.use_pc;
+                if (r0.fetch_pc == u.use_pc) { mapped = true; break; }
+            }
+            if (mapped) continue;
+            ShaderResource r;
+            r.cls = ResourceClass::ConstantBuffer;
+            r.format = DataFormat::Uint32;
+            r.num_components = 1;
+            r.gpu_addr = d.base;
+            r.size = static_cast<uint32_t>(d.size_bytes);
+            r.fetch_pc = u.use_pc;
+            table.resources.push_back(r);
+            continue;
+        }
         if (u.kind != 1) continue;
         if (u.use_pc == proven_linear_store_pc) continue;
         if (u.instruction_format != UINT32_MAX && ((u.v4[3] >> 12) & 0x7Fu) == 0)
@@ -3914,7 +3986,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                          "t8=%08x:%08x:%08x:%08x:%08x:%08x:%08x:%08x\n",
                                          u.key, u.use_pc, u.t8[0], u.t8[1], u.t8[2], u.t8[3],
                                          u.t8[4], u.t8[5], u.t8[6], u.t8[7]);
-                        } else {
+                        } else if (u.kind == 1) {
                             const DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
                             std::fprintf(stderr,
                                          "[dynfail]     BUF(v4) key=0x%x use_pc=%u "
@@ -3923,6 +3995,17 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                          u.key, u.use_pc, u.v4[0], u.v4[1], u.v4[2], u.v4[3],
                                          (unsigned long long)d.base, d.stride, d.num_records,
                                          d.size_bytes, u.required_size);
+                        } else {
+                            const DecodedBvhDescriptor d = decode_bvh_descriptor(u.bvh4.data());
+                            std::fprintf(stderr,
+                                         "[dynfail]     BVH(bvh4) use_pc=%u "
+                                         "bvh4=%08x:%08x:%08x:%08x base=0x%llx size=%llu "
+                                         "type=%u tri_mode=%u box64=%u sort=%u\n",
+                                         u.use_pc, u.bvh4[0], u.bvh4[1], u.bvh4[2], u.bvh4[3],
+                                         (unsigned long long)d.base,
+                                         (unsigned long long)d.size_bytes, d.type,
+                                         (unsigned)d.triangle_return_mode,
+                                         (unsigned)d.box_node_64b, (unsigned)d.sort_enabled);
                         }
                     }
                 }
@@ -4011,7 +4094,8 @@ struct OrderedGpustateCaptureTrace {
 static OrderedSubmitResult execute_ordered_gpustate(
     const GpuState& st, uint32_t width, uint32_t height, uint64_t submit_no,
     const LiveRenderFn& render, const LiveComputeFn& compute,
-    OrderedGpustateCaptureTrace* capture_trace = nullptr);
+    OrderedGpustateCaptureTrace* capture_trace = nullptr,
+    const std::vector<DrawItem>* eager_draws = nullptr);
 
 bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
     if (st.dma_copies.empty() && (!g_compute || st.dispatches.empty())) return false;
@@ -5014,7 +5098,8 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                                                      uint32_t height, uint64_t submit_no,
                                                      const LiveRenderFn& render,
                                                      const LiveComputeFn& compute,
-                                                     OrderedGpustateCaptureTrace* capture_trace) {
+                                                     OrderedGpustateCaptureTrace* capture_trace,
+                                                     const std::vector<DrawItem>* eager_draws) {
     GuestGpuWriteSubmitScope guest_gpu_write_scope;
     if (st.dma_execution_rejected) {
         static std::atomic<int> warned{0};
@@ -5043,6 +5128,11 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     std::stable_sort(executable.begin(), executable.end(), [](const auto& a, const auto& b) {
         return a.command_order < b.command_order;
     });
+
+    std::unordered_map<size_t, size_t> eager_draw_by_index;
+    if (eager_draws)
+        for (size_t i = 0; i < eager_draws->size(); ++i)
+            eager_draw_by_index[static_cast<size_t>((*eager_draws)[i].draw_index)] = i;
 
     size_t total_spans = 0;
     bool in_draw_span = false;
@@ -5090,7 +5180,18 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     break;
                 }
                 DrawItem item;
-                if (realize_retained_draw(st, operation.index, scale_x, scale_y, item)) {
+                bool realized = false;
+                if (eager_draws) {
+                    const auto found = eager_draw_by_index.find(operation.index);
+                    if (found != eager_draw_by_index.end()) {
+                        item = (*eager_draws)[found->second];
+                        realized = true;
+                    }
+                } else {
+                    realized = realize_retained_draw(
+                        st, operation.index, scale_x, scale_y, item);
+                }
+                if (realized) {
                     if (capture_trace) capture_trace->draws.push_back(item);
                     span.push_back(std::move(item));
                 }
@@ -5403,10 +5504,13 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
                                          [](const auto& draw) { return draw.indirect; }) ||
                               std::any_of(st.dispatches.begin(), st.dispatches.end(),
                                          [](const auto& dispatch) { return dispatch.indirect; });
-    const bool needs_ordered_realization = has_ordered_dma || has_indirect;
-    // DMA and indirect consumers must be realized at their ordered position below. Pre-realizing
-    // would snapshot bytes before an earlier copy or compute shader updates their backing.
-    std::vector<DrawItem> draws = !needs_ordered_realization && g_live && width && height
+    const bool needs_ordered_realization = has_ordered_dma || has_indirect || !st.dispatches.empty();
+    // Draws without DMA/indirect arguments remain safe to prepare in parallel. Compute resources,
+    // however, are always realized at their ordered position: a preceding dispatch in the same
+    // submit can write a pointer or descriptor consumed by the next dispatch (Astro Bot's BVH root
+    // is one such dependency). Pre-realizing every compute snapshots stale guest bytes.
+    const bool can_eagerly_realize_draws = !has_ordered_dma && !has_indirect;
+    std::vector<DrawItem> draws = can_eagerly_realize_draws && g_live && width && height
         ? realize_gpustate_draws(st, 0x10000, sx, sy, nullptr, true)
         : std::vector<DrawItem>{};
     const ShaderRecompileCacheStats shader_after = timing_enabled
@@ -5431,13 +5535,14 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     auto pending_capture = begin_requested_gpu_capture(
         draws, computes, operations, width, height, &st, submit_no,
         static_cast<uint64_t>(st.draws.size()), nullptr,
-        /*defer_materialization=*/has_indirect);
+        /*defer_materialization=*/needs_ordered_realization);
     snapshot_pending_gpu_capture_compute_gds(
         pending_capture.get(), g_compute_gds.data(), g_compute_gds.size());
     OrderedGpustateCaptureTrace capture_trace;
     OrderedSubmitResult result = needs_ordered_realization
         ? execute_ordered_gpustate(st, width, height, submit_no, g_live, g_compute,
-                                   pending_capture ? &capture_trace : nullptr)
+                                   pending_capture ? &capture_trace : nullptr,
+                                   can_eagerly_realize_draws ? &draws : nullptr)
         : execute_ordered_items(operations, draws, computes, g_live, g_compute, width, height);
     const auto timing_backend_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     const std::vector<uint8_t>& px = result.frame.bytes();

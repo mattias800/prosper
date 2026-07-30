@@ -1,6 +1,7 @@
 // test_rdna2_spirv_struct -- structural checks for RDNA2->SPIR-V output that do not require Vulkan.
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include "../src/gpu/shader_resources.hpp"
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <iterator>
@@ -1845,6 +1846,49 @@ int main() {
         return 1;
     }
     printf("  [ok]   compute atomic-buffer view rejects compressed and mip-tail images\n");
+
+    // Astro Bot's world-map traversal kernel uses the RTIP 1.1 BVH instruction with eleven NSA
+    // address operands. It is lowered to ordinary SSBO loads and scalar ALU, so this remains usable
+    // on Vulkan devices without a ray-query feature. Keep the gate exact: accepting a nearby MIMG
+    // flag combination would silently assign the wrong hardware intersection contract.
+    const uint32_t cs_bvh_intersect[] = {
+        0xf1989f07u, 0x00040303u, 0x43440d3fu, 0x46424140u, 0x00004847u,
+        0xbf810000u,
+    };
+    uint32_t bvh_node_words[32]{};
+    ShaderResourceTable rt_bvh;
+    { ShaderResource bvh{}; bvh.cls = ResourceClass::ConstantBuffer;
+      bvh.format = DataFormat::Uint32; bvh.num_components = 1;
+      bvh.binding = 4; bvh.size = sizeof(bvh_node_words); bvh.fetch_pc = 0;
+      bvh.host_data = reinterpret_cast<uint8_t*>(bvh_node_words);
+      bvh.host_data_size = sizeof(bvh_node_words); rt_bvh.resources.push_back(bvh); }
+    ComputeShaderConfig bvh_config;
+    bvh_config.local_x = 1;
+    const std::vector<uint32_t> bvh_spv = recompile_compute(
+        cs_bvh_intersect, std::size(cs_bvh_intersect), &rt_bvh, bvh_config);
+    const DescriptorValidationReport bvh_report = validate_spirv_descriptor_interface(
+        bvh_spv, &rt_bvh, 0, SpirvShaderStage::Compute, false);
+    if (bvh_spv.empty() || !bvh_report.ok() || bvh_report.descriptors.size() != 1 ||
+        bvh_report.descriptors[0].kind != SpirvDescriptorKind::StorageBuffer ||
+        !has_opcode(bvh_spv, 61u) || !has_opcode(bvh_spv, 129u) ||
+        !has_opcode(bvh_spv, 133u) || !has_opcode(bvh_spv, 169u)) {
+        printf("  [FAIL] IMAGE_BVH_INTERSECT_RAY lacks its SSBO/ALU lowering\n");
+        return 1;
+    }
+    if (!recompile_compute(cs_bvh_intersect, std::size(cs_bvh_intersect),
+                           nullptr, bvh_config).empty()) {
+        printf("  [FAIL] IMAGE_BVH_INTERSECT_RAY was accepted without its BVH bytes\n");
+        return 1;
+    }
+    uint32_t unsupported_bvh[std::size(cs_bvh_intersect)];
+    std::copy(std::begin(cs_bvh_intersect), std::end(cs_bvh_intersect), unsupported_bvh);
+    unsupported_bvh[0] &= ~(1u << 15); // R128=0 has a different destination contract.
+    if (!recompile_compute(unsupported_bvh, std::size(unsupported_bvh),
+                           &rt_bvh, bvh_config).empty()) {
+        printf("  [FAIL] unverified IMAGE_BVH_INTERSECT_RAY flags were accepted\n");
+        return 1;
+    }
+    printf("  [ok]   Astro IMAGE_BVH_INTERSECT_RAY lowers through a bounded BVH SSBO\n");
 
     // Astro Bot's visibility kernel sanitizes a generated coordinate with an explicit-SDST
     // v_cmp_class_f32 SDWA (mask 3 = sNaN|qNaN), followed by v_cndmask reading s[8:9]. Rejecting
