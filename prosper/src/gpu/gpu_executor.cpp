@@ -3754,7 +3754,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
             std::vector<Rdna2Inst> decoded;
             rdna2_walk(reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
                        shader_dwords, decoded);
-            native_multiwave_wave_work = compute_shader_prefers_native_multiwave(decoded);
+            native_multiwave_wave_work = compute_shader_prefers_native_multiwave(
+                decoded, reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+                shader_dwords);
             const bool uses_gds = std::any_of(decoded.begin(), decoded.end(), [](const auto& in) {
                 return in.fmt == Rdna2Format::DS && in.ds_gds && in.opcode == 0x0d;
             });

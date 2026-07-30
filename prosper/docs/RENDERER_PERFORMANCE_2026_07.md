@@ -1246,8 +1246,9 @@ after submit 100:
 
 The default remains conservative and title-independent: multi-wave workgroups are admitted
 automatically only when the decoded shader contains the canonical MBCNT low/high pair or at least four
-VCC/EXEC scalar branches alongside a guest workgroup barrier, where repeated scratch-emulated
-scans/votes justify the exact subgroup shell.
+VCC/EXEC branches accepted as top-level regions by the structured compute emitter alongside top-level
+guest workgroup barriers. That structural proof guarantees portable lowering really emits the repeated
+scratch-emulated votes which justify the exact subgroup shell; raw branch opcodes alone do not qualify.
 Other multi-wave shapes still require `PROSPER_NATIVE_COMPUTE_MULTIWAVE=1`, and
 `PROSPER_NO_NATIVE_COMPUTE_SUBGROUP=1` remains the complete portable control. A default-policy run
 selected subgroup64 for both heavy programs, presented 265 frames, and produced no renderer or dispatch

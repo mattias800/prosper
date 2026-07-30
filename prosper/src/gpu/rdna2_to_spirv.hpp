@@ -225,13 +225,14 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                         const ShaderResourceTable* rt,
                                         const ComputeShaderConfig& config);
 
-// True when the program contains enough wave work to justify an exact multi-wave subgroup shell:
-// either the canonical low/high MBCNT pair, or at least four VCC/EXEC scalar branches in a shader
-// containing a guest workgroup barrier. Portable compute lowers these through synchronized workgroup
-// scratch; native compute uses subgroup scans/votes. This deliberately conservative structural signal
-// is independent of title and shader address.
+// True when the program contains enough proven wave work to justify an exact multi-wave subgroup
+// shell: either the canonical low/high MBCNT pair, or at least four VCC/EXEC branches accepted by the
+// structured compute emitter in a shader containing only top-level guest workgroup barriers. Portable
+// compute lowers those operations through synchronized workgroup scratch; native compute uses subgroup
+// scans/votes. This deliberately conservative structural signal is independent of title and address.
 bool compute_shader_prefers_native_multiwave(const uint32_t* code, size_t dwords);
-bool compute_shader_prefers_native_multiwave(const std::vector<Rdna2Inst>& instructions);
+bool compute_shader_prefers_native_multiwave(const std::vector<Rdna2Inst>& instructions,
+                                             const uint32_t* code, size_t dwords);
 
 // DPP/permlane operations are native subgroup shuffles: quad permutations need four contiguous
 // lanes, row operations need 16, and PERMLANEX16 needs a paired 32-lane row. The backend rejects

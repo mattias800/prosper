@@ -11559,33 +11559,65 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     return b.finish();
 }
 
-bool compute_shader_prefers_native_multiwave(const std::vector<Rdna2Inst>& ins) {
+bool compute_shader_prefers_native_multiwave(const std::vector<Rdna2Inst>& ins,
+                                             const uint32_t* code, size_t dwords) {
     bool low = false;
     bool high = false;
     bool guest_barrier = false;
-    uint32_t wave_branches = 0;
     for (const Rdna2Inst& in : ins) {
         if (in.is_end) break;
         if (in.fmt == Rdna2Format::VOP3) {
             low |= in.opcode == 0x365;
             high |= in.opcode == 0x366;
         }
-        if (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x06 && in.opcode <= 0x09)
-            ++wave_branches;
         guest_barrier |= in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a;
         if (low && high) return true;
     }
-    // Four raw wave branches plus a real workgroup barrier are intentionally required: simple
-    // if/loop shapes may be lowered per invocation without scratch, while barrier-separated,
-    // branch-dense structured shaders repeatedly pay for exact guest-wave votes. This keeps the
-    // default narrower than the all-multi-wave experiment.
-    return guest_barrier && wave_branches >= 4;
+    if (!guest_barrier || !code) return false;
+
+    // Mirror the conservative, acyclic subset of emit_body's structured-compute admission. Counting
+    // raw VCC/EXEC opcodes is insufficient: kill-mask branches may be safely linearized, loop exits
+    // are owned by another emitter, and rejected CFGs never reach guest_wave_any. Requiring the same
+    // accepted ForwardIf regions proves that portable lowering really emits two scratch barriers per
+    // counted vote and that exact-subgroup lowering removes them. Loops deliberately stay behind the
+    // explicit experiment until their additional compute guards are shared with this analysis.
+    auto safe = safe_execz_branches(ins);
+    for (uint32_t pc : waterfall_branches(ins)) safe.insert(pc);
+    const std::vector<DivLoop> loops = detect_divergent_loops(ins, safe, /*fragment*/false);
+    if (!loops.empty()) return false;
+
+    bool rejected = false;
+    const std::vector<ForwardIf> branches = detect_forward_ifs(
+        ins, /*allow_vcc*/false, code, dwords, &safe, nullptr, &rejected,
+        /*compute_wave_branches*/true);
+    if (rejected) return false;
+
+    auto top_level_pc = [&](uint32_t pc) {
+        for (const ForwardIf& parent : branches) {
+            const uint32_t parent_end = parent.has_else ? parent.merge_pc : parent.target_pc;
+            if (parent.branch_pc < pc && pc < parent_end) return false;
+        }
+        return true;
+    };
+    const bool barriers_are_top_level = std::all_of(ins.begin(), ins.end(), [&](const Rdna2Inst& in) {
+        return in.fmt != Rdna2Format::SOPP || in.opcode != 0x0a || top_level_pc(in.pc);
+    });
+    if (!barriers_are_top_level) return false;
+
+    size_t structured_wave_votes = 0;
+    for (const ForwardIf& branch : branches) {
+        if (!branch.on_exec && !branch.on_vcc) continue;
+        if (!top_level_pc(branch.branch_pc)) return false;
+        ++structured_wave_votes;
+    }
+    // Four proven scratch-emulated votes keep the default narrower than the all-multi-wave experiment.
+    return structured_wave_votes >= 4;
 }
 
 bool compute_shader_prefers_native_multiwave(const uint32_t* code, size_t dwords) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
-    return compute_shader_prefers_native_multiwave(ins);
+    return compute_shader_prefers_native_multiwave(ins, code, dwords);
 }
 
 // See FlatLoadInfo / analyze_flat_loads in the header (#1171). A `base + offset` flat address VGPR pair
