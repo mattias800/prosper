@@ -1852,6 +1852,7 @@ struct BoundBuffer {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     size_t alias_of = SIZE_MAX;         // exact guest range sharing an earlier storage buffer
     size_t bytes = 0;                   // Vulkan buffer bytes (may be a detiled image view)
+    size_t guest_bytes = 0;             // physical guest backing (may exceed logical image bytes)
     bool writable = false;              // reflected OpStore/writing-atomic reachability
     bool atomic_image = false;           // R32_UINT StorageImage exposed as a linear atomic SSBO
     bool persistent = false;
@@ -2560,12 +2561,29 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
 
     do {
         std::vector<VkDescriptorSetLayoutBinding> layout_bindings(descriptors.size());
+        bool buffer_setup_failure_reported = false;
+        auto skip_buffer = [&](uint32_t binding, const ShaderResource* resource,
+                               const char* why) {
+            buffer_setup_failure_reported = true;
+            if (!trace) return;
+            std::fprintf(stderr,
+                         "[compute]   buffer setup failed binding=%u addr=0x%llx size=%u: %s\n",
+                         binding,
+                         (unsigned long long)(resource ? resource->gpu_addr : 0),
+                         resource ? resource->size : 0, why);
+        };
         for (size_t i = 0; i < descriptors.size(); i++) {
             const ShaderResource* resource = item.resources->by_binding(descriptors[i].binding);
             if (!resource || !resource->size ||
                 ((!resource->host_data || resource->host_data_size < resource->size) &&
-                 !guest_readable(resource->gpu_addr, resource->size))) break;
+                 !guest_readable(resource->gpu_addr, resource->size))) {
+                skip_buffer(descriptors[i].binding, resource,
+                            !resource ? "missing resource" :
+                            !resource->size ? "empty resource" : "unreadable backing");
+                break;
+            }
             buffers[i].resource = resource;
+            buffers[i].guest_bytes = resource->size;
             buffers[i].writable = descriptors[i].writable;
             buffers[i].atomic_image = descriptors[i].atomic_access &&
                 resource->cls == ResourceClass::StorageImage &&
@@ -2586,8 +2604,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (linear_image_bytes > UINT32_MAX ||
                     (!resource->tile_mode && resource->linear_row_pitch_bytes &&
                      resource->linear_row_pitch_bytes < tight_pitch) ||
-                    !guest_image_bytes || guest_image_bytes > resource->size)
+                    !guest_image_bytes || guest_image_bytes > UINT32_MAX) {
+                    skip_buffer(descriptors[i].binding, resource,
+                                "invalid atomic-image buffer layout");
                     break;
+                }
+                if ((!resource->host_data || resource->host_data_size < guest_image_bytes) &&
+                    !guest_readable(resource->gpu_addr,
+                                    static_cast<uint32_t>(guest_image_bytes))) {
+                    skip_buffer(descriptors[i].binding, resource,
+                                "unreadable atomic-image physical backing");
+                    break;
+                }
+                buffers[i].guest_bytes = guest_image_bytes;
             }
             buffers[i].bytes = buffers[i].atomic_image
                 ? static_cast<size_t>(linear_image_bytes) : resource->size;
@@ -2597,6 +2626,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     prior->size != resource->size ||
                     buffers[j].atomic_image != buffers[i].atomic_image ||
                     buffers[j].bytes != buffers[i].bytes ||
+                    buffers[j].guest_bytes != buffers[i].guest_bytes ||
                     prior->host_data != resource->host_data ||
                     prior->host_data_size != resource->host_data_size)
                     continue;
@@ -2608,7 +2638,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 break;
             }
             if (buffers[i].alias_of == SIZE_MAX) {
-                const uint8_t* source = resource_bytes(resource);
+                const uint8_t* source = buffers[i].atomic_image
+                    ? resource_bytes_for(resource, buffers[i].guest_bytes)
+                    : resource_bytes(resource);
                 if (buffers[i].atomic_image) {
                     buffers[i].linear_seed.resize(buffers[i].bytes);
                     if (resource->tile_mode) {
@@ -2652,19 +2684,30 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     // Keep one canonical representation transfer-source capable from allocation.
                     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-                    if (vkCreateBuffer(ctx.device, &bci, nullptr, &buffers[i].buffer) != VK_SUCCESS)
+                    if (!vk_ok(vkCreateBuffer(ctx.device, &bci, nullptr, &buffers[i].buffer),
+                               "buffer-create"))
                         break;
                     VkMemoryRequirements requirements{};
                     vkGetBufferMemoryRequirements(ctx.device, buffers[i].buffer, &requirements);
                     const uint32_t memory_type = ctx.host_memory_type(requirements.memoryTypeBits);
-                    if (memory_type == UINT32_MAX) break;
+                    if (memory_type == UINT32_MAX) {
+                        skip_buffer(descriptors[i].binding, resource,
+                                    "no host-visible memory type");
+                        break;
+                    }
                     buffers[i].memory = ctx.allocate_memory(requirements.size, memory_type, true);
-                    if (!buffers[i].memory) break;
-                    if (vkBindBufferMemory(ctx.device, buffers[i].buffer, buffers[i].memory, 0) !=
-                        VK_SUCCESS)
+                    if (!buffers[i].memory) {
+                        skip_buffer(descriptors[i].binding, resource,
+                                    "host-visible memory allocation failed");
+                        break;
+                    }
+                    if (!vk_ok(vkBindBufferMemory(ctx.device, buffers[i].buffer,
+                                                  buffers[i].memory, 0),
+                               "buffer-bind"))
                         break;
                     void* mapped = nullptr;
-                    if (ctx.map_memory(buffers[i].memory, 0, buffers[i].bytes, &mapped) != VK_SUCCESS)
+                    if (!vk_ok(ctx.map_memory(buffers[i].memory, 0, buffers[i].bytes, &mapped),
+                               "buffer-map"))
                         break;
                     // Pooled host-visible allocations retain their previous contents. Compare them
                     // with current guest memory before uploading: any mutation takes the exact copy.
@@ -2698,7 +2741,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     buffer.cache_key, buffer.resource->size, buffer.result_baseline);
         bool buffers_ready = true;
         for (const auto& buffer : buffers) buffers_ready &= buffer.resource && buffer.memory;
-        if (!buffers_ready) break;
+        if (!buffers_ready) {
+            if (trace && !buffer_setup_failure_reported) {
+                for (size_t i = 0; i < buffers.size(); ++i) {
+                    if (buffers[i].resource && buffers[i].memory) continue;
+                    skip_buffer(descriptors[i].binding, buffers[i].resource,
+                                "binding was not prepared");
+                    break;
+                }
+            }
+            break;
+        }
         setup_buffers_ms = std::chrono::duration<double, std::milli>(
             ComputeClock::now() - setup_validate_start).count() - setup_validate_ms;
 
@@ -5034,7 +5087,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 readback_ok = false;
                 break;
             }
-            uint8_t* destination = resource_bytes(buffer.resource);
+            uint8_t* destination = buffer.atomic_image
+                ? resource_bytes_for(buffer.resource, buffer.guest_bytes)
+                : resource_bytes(buffer.resource);
             const auto* result = static_cast<const uint8_t*>(mapped);
             if (buffer.atomic_image) {
                 if (trace) {
@@ -5044,7 +5099,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
                 if (!buffer.resource->host_data && buffer.resource->gpu_addr)
                     prosper::host::guest_write_watch_notify_host_write(
-                        buffer.resource->gpu_addr, buffer.resource->size);
+                        buffer.resource->gpu_addr, buffer.guest_bytes);
                 if (buffer.resource->tile_mode) {
                     tile_surface(destination, result,
                                  buffer.resource->width, buffer.resource->height,
@@ -5059,10 +5114,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
                 ctx.unmap_memory(buffer.memory);
                 if (buffer.resource->gpu_addr)
-                    notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.resource->size);
+                    notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.guest_bytes);
                 if (!buffer.resource->host_data && writer_provenance_enabled())
                     record_guest_write(GuestWriterKind::ComputeBuffer,
-                                       buffer.resource->gpu_addr, buffer.resource->size,
+                                       buffer.resource->gpu_addr, buffer.guest_bytes,
                                        item.submit_no, item.dispatch_index,
                                        item.command_order, item.code_addr);
                 continue;
