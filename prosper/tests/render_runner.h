@@ -3428,6 +3428,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkDeviceSize bytes = 0;
         uint64_t last_use = 0;
         uint64_t content_version = 0;
+        bool content_valid = true;
         std::unordered_map<TextureBindingKey, PersistentTextureBinding,
                            TextureBindingKeyHash> bindings;
     };
@@ -4108,6 +4109,27 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             persistent_textures_enabled &&
                             r.persistent_texture_id) {
                             auto cached = persistent_texture_images.find(persistent_key);
+                            // A failed queued upload may have left this owned allocation in an
+                            // unknown layout with undefined contents. The failure callback cannot
+                            // destroy it while an indeterminate submission might still be in flight;
+                            // a later usable backend call can safely retire it before rebuilding.
+                            if (cached != persistent_texture_images.end() &&
+                                !cached->second.content_valid) {
+                                for (const auto& [key, binding] : cached->second.bindings) {
+                                    (void)key;
+                                    if (binding.sampler)
+                                        vkDestroySampler(dev, binding.sampler, nullptr);
+                                    if (binding.view)
+                                        vkDestroyImageView(dev, binding.view, nullptr);
+                                }
+                                if (cached->second.image)
+                                    vkDestroyImage(dev, cached->second.image, nullptr);
+                                if (cached->second.memory)
+                                    vkFreeMemory(dev, cached->second.memory, nullptr);
+                                persistent_texture_bytes -= cached->second.bytes;
+                                persistent_texture_images.erase(cached);
+                                cached = persistent_texture_images.end();
+                            }
                             if (cached != persistent_texture_images.end()) {
                                 cached->second.last_use = texture_generation;
                                 upload.image = cached->second.image;
@@ -4126,7 +4148,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                             auto found = persistent_texture_images.find(
                                                 persistent_key);
                                             if (found != persistent_texture_images.end())
-                                                found->second.content_version = 0;
+                                                found->second.content_valid = false;
                                         });
                                     ++persistent_texture_misses;
                                 } else {
@@ -5566,8 +5588,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             persistent_texture_bytes <= persistent_texture_limit - upload.image_bytes) {
             auto [cached, inserted] = persistent_texture_images.emplace(
                 key, PersistentTextureImage{upload.image, upload.memory, upload.image_bytes,
-                                            texture_generation, upload.persistent_version});
+                                            texture_generation, upload.persistent_version, true});
             if (inserted) {
+                active_submission.add_failure_cleanup([key]() {
+                    auto found = persistent_texture_images.find(key);
+                    if (found != persistent_texture_images.end())
+                        found->second.content_valid = false;
+                });
                 persistent_texture_bytes += upload.image_bytes;
                 upload.image = VK_NULL_HANDLE;
                 upload.memory = VK_NULL_HANDLE;

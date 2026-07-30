@@ -205,6 +205,31 @@ int main() {
         prosper::test::BackendDraw draw;
         draw.vs = vert; draw.fs = frag; draw.R = {resource}; draw.vcount = 3;
 
+        // A first upload is published to the persistent map while its command buffer is merely
+        // queued, so a discarded batch must invalidate that speculative image. Retrying the same
+        // version must upload again rather than sampling undefined contents as an exact-version hit.
+        prosper::test::FrameResource failed_resource = resource;
+        failed_resource.persistent_texture_id = 0x70200000000000f1ull;
+        failed_resource.persistent_texture_version = 1;
+        prosper::test::BackendDraw failed_draw = draw;
+        failed_draw.R = {failed_resource};
+        constexpr uint64_t failed_target_id = 0x75900000000000f1ull;
+        prosper::test::BackendColorTarget failed_target{failed_target_id, false, false};
+        prosper::test::BackendSubmissionBatch failed_batch;
+        const std::vector<uint8_t> failed_pending = prosper::test::render_draws_rgba(
+            {failed_draw}, W, H, nullptr, nullptr, false, &failed_target,
+            nullptr, nullptr, nullptr, &failed_batch, false);
+        failed_batch.discard();
+        failed_batch.complete();
+        const std::vector<uint8_t> failed_retry = prosper::test::render_draws_rgba(
+            {failed_draw}, W, H);
+        const auto failed_retry_stats = prosper::test::backend_texture_upload_stats();
+        CHECK(failed_pending.empty() && !failed_batch.pending() &&
+                  failed_retry_stats.persistent_misses == 1 &&
+                  failed_retry_stats.unique_uploads == 1 && !failed_retry.empty(),
+              "a discarded first versioned upload is rebuilt before reuse");
+        prosper::test::invalidate_persistent_color_target(failed_target_id);
+
         std::vector<uint8_t> first = prosper::test::render_draws_rgba({draw}, W, H);
         const auto first_stats = prosper::test::backend_texture_upload_stats();
         std::vector<uint8_t> reused = prosper::test::render_draws_rgba({draw}, W, H);

@@ -253,6 +253,16 @@ std::vector<uint8_t> inspection_rgba8(const std::vector<uint8_t>& pixels,
         }
         return rgba;
     }
+    if (format == VK_FORMAT_R8G8_UNORM && pixels.size() == texels * 2) {
+        std::vector<uint8_t> rgba(texels * 4);
+        for (size_t texel = 0; texel < texels; ++texel) {
+            rgba[texel * 4 + 0] = pixels[texel * 2 + 0];
+            rgba[texel * 4 + 1] = pixels[texel * 2 + 1];
+            rgba[texel * 4 + 2] = 0;
+            rgba[texel * 4 + 3] = 255;
+        }
+        return rgba;
+    }
     // R16G16B16A16_UNORM: 16-bit fixed-point per channel -> 8-bit (high byte). Without this, a 64-bit
     // UNORM color target (a common non-float HDR/deep surface) inspected to black regardless of content,
     // which is misleading for RTT diagnostics.
