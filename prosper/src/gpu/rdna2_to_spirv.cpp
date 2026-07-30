@@ -3737,6 +3737,12 @@ uint32_t vgpr_write_count(const Rdna2Inst& in) {
         case Rdna2Format::VOP2: case Rdna2Format::VOP3P:
             return 1;
         case Rdna2Format::VOP3:
+            // v_readlane_b32 (0x360) encodes its destination in VDST but writes an SGPR, exactly like
+            // v_readfirstlane_b32 above; every other consumer of the decode already models it that way
+            // (loop_written_regs / sgpr_write_count). Counting it as a VGPR write made a readlane whose
+            // destination SGPR number collides with a scalar-spill VGPR number look like an ordinary
+            // clobber of that spill slot, which rejected DQ VII's title grading kernel (#1483).
+            if (in.opcode == 0x360) return 0;
             // 64-bit VGPR results: v_mad_u64_u32 (0x176), v_mad_i64_i32 (0x177), v_div_scale_f64
             // (0x16E) — ISA opcodes 374/375/366 (the latter two are unimplemented in emit_alu but
             // must count correctly the day they land).

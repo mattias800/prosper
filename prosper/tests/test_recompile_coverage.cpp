@@ -648,6 +648,27 @@ int main() {
                               sizeof(compute_cfg_dispatch_recycled_lane[0]),
                           0, 0, &dispatch_rt).empty(),
           "the compute CFG dispatcher preserves a recycled scalar/mask spill lane");
+    // v_readlane_b32 encodes its destination SGPR in VDST, so its register number lives in the SCALAR
+    // file. DQ VII's title grading kernel reloads a v28 spill slot long after an unrelated
+    // `v_readlane_b32 s28, v28, 9`; counting that readlane as a VGPR write made the spill array look
+    // clobbered and rejected the reload as `invalidated-vgpr-lane-slot`, skipping the dispatch and
+    // collapsing the title composite to black (#1483). Same shape here: the colliding readlane
+    // (s19 <- v19) precedes the legitimate v19[37] reload the exec restore consumes.
+    const uint32_t compute_cfg_dispatch_readlane_sgpr_collision[] = {
+        0xBE800380u, 0x7E000280u, 0x7E020300u,
+        0xD7610013u, 0x00014A7Eu, 0xD7610013u, 0x0001507Fu,   // v19[37:40] = EXEC
+        0xD7600013u, 0x00014B13u,                             // v_readlane_b32 s19, v19, 37
+        0xD760000Eu, 0x00014B13u, 0xD760000Fu, 0x00015113u, 0xBEFE040Eu,
+        0xE00C2000u, 0x80020400u, 0x7DB900F9u, 0x86050007u,
+        0x7D020200u, 0xBF860006u, 0xBF0A8204u, 0x360000FDu, 0xBF840001u,
+        0x81008100u, 0x81008100u, 0xBF82FFF4u,
+        0xBF810000u,
+    };
+    CHECK(!recompile_valu(compute_cfg_dispatch_readlane_sgpr_collision,
+                          sizeof(compute_cfg_dispatch_readlane_sgpr_collision) /
+                              sizeof(compute_cfg_dispatch_readlane_sgpr_collision[0]),
+                          0, 0, &dispatch_rt).empty(),
+          "a v_readlane destination SGPR number does not invalidate the same-numbered spill VGPR");
     // An ordinary VGPR write invalidates the compile-time v_writelane spill lifetime. Crossing a
     // dispatcher block must preserve that tombstone; reconstructing the slot as scalar zero would
     // incorrectly make the later v_readlane valid again.
