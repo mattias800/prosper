@@ -1269,11 +1269,11 @@ inline void init_persistent_color_target_device_budget(
 // Sampled images and color targets are independent residency pools. A large immutable source can
 // legitimately approach one GiB by itself (for example a maximum-size block-compressed atlas after
 // expansion), so the historical fixed 1 GiB image budget can continuously evict the rest of a hot
-// set. Keep small GPUs at that old bound while allowing capable devices up to 2 GiB. Unlike an
+// set. Keep small GPUs at that old bound while allowing capable devices up to 4 GiB. Unlike an
 // allocation, this is only a ceiling; memory is committed on exact-version cache insertion.
 inline VkDeviceSize persistent_texture_cache_budget_for_heap(VkDeviceSize heap) {
     constexpr VkDeviceSize min_bytes = 1024ull * 1024ull * 1024ull;
-    constexpr VkDeviceSize max_bytes = 2048ull * 1024ull * 1024ull;
+    constexpr VkDeviceSize max_bytes = 4096ull * 1024ull * 1024ull;
     return std::clamp<VkDeviceSize>(heap / 8u, min_bytes, max_bytes);
 }
 
