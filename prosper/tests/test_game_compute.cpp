@@ -170,19 +170,26 @@ int main() {
 
     using prosper::frontend::direct_sampled_rtt_compatible;
     CHECK(direct_sampled_rtt_compatible(DataFormat::Unorm8, 4,
-                                        LiveTargetPixelFormat::Rgba8Unorm) &&
+                                        LiveTargetPixelFormat::Rgba8Unorm, false) &&
           direct_sampled_rtt_compatible(DataFormat::Float16, 4,
-                                        LiveTargetPixelFormat::Rgba16Float) &&
+                                        LiveTargetPixelFormat::Rgba16Float, false) &&
           direct_sampled_rtt_compatible(DataFormat::Float10_11_11, 3,
-                                        LiveTargetPixelFormat::R11G11B10Float),
+                                        LiveTargetPixelFormat::R11G11B10Float, false),
           "renderer RTT direct bind accepts exact RGBA8, RGBA16F, and R11G11B10 views");
     CHECK(!direct_sampled_rtt_compatible(DataFormat::Float16, 4,
-                                         LiveTargetPixelFormat::Rgba8Unorm) &&
+                                         LiveTargetPixelFormat::Rgba8Unorm, true) &&
           !direct_sampled_rtt_compatible(DataFormat::Unorm8, 4,
-                                         LiveTargetPixelFormat::Rgba16Float) &&
+                                         LiveTargetPixelFormat::Rgba16Float, true) &&
           !direct_sampled_rtt_compatible(DataFormat::Float16, 2,
-                                         LiveTargetPixelFormat::Rgba16Float),
+                                         LiveTargetPixelFormat::Rgba16Float, true),
           "renderer RTT direct bind rejects format conversion and component aliases");
+    CHECK(direct_sampled_rtt_compatible(DataFormat::Unorm16, 4,
+                                        LiveTargetPixelFormat::Rgba8Unorm, true) &&
+          !direct_sampled_rtt_compatible(DataFormat::Unorm16, 4,
+                                         LiveTargetPixelFormat::Rgba8Unorm, false) &&
+          !direct_sampled_rtt_compatible(DataFormat::Unorm16, 2,
+                                         LiveTargetPixelFormat::Rgba8Unorm, true),
+          "normalized-only RGBA16-UNORM sampling may reuse RGBA8 without widening texels");
     // A renderer-owned target is stored canonically as RGBA8 or RGBA16F, while a later compute
     // descriptor can alias it as packed R11G11B10. Reconstruct the descriptor-visible words rather
     // than sampling stale guest backing or dropping the dispatch.
