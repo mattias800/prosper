@@ -9857,6 +9857,31 @@ bool emit_cfg_state_machine(
                           : in.opcode == 0x09;                // 0 >= mask
     };
 
+    // A Wave32 B32 logical writes SCC=any(result mask). The ordinary lane-local emitter poisons
+    // that SCC because it cannot reduce a guest wave by itself. Inside an exact native dispatcher,
+    // however, every lane reaches the same switch case and an immediately consuming SCC branch can
+    // use one exact subgroup vote. Restrict the vote to the last architectural SCC writer before
+    // the branch; generated traversal kernels often chain several mask intersections and only the
+    // final result is live, so voting after every intermediate AND would add needless hot-loop work.
+    auto b32_mask_logical_opcode = [](uint32_t opcode) {
+        return opcode == 0x0e || opcode == 0x10 || opcode == 0x12 ||
+               opcode == 0x14 || opcode == 0x16 || opcode == 0x18 ||
+               opcode == 0x1a || opcode == 0x1c;
+    };
+    std::unordered_set<uint32_t> native_b32_mask_scc_vote_pcs;
+    if (b.native_subgroup_size && proven_wave32_masks) {
+        for (size_t i = 0; i + 1 < ins.size(); ++i) {
+            const Rdna2Inst& producer = ins[i];
+            const Rdna2Inst& consumer = ins[i + 1];
+            if (producer.fmt == Rdna2Format::SOP2 &&
+                b32_mask_logical_opcode(producer.opcode) &&
+                consumer.fmt == Rdna2Format::SOPP &&
+                (consumer.opcode == 0x04 || consumer.opcode == 0x05) &&
+                producer.pc + producer.len_dwords == consumer.pc)
+                native_b32_mask_scc_vote_pcs.insert(producer.pc);
+        }
+    }
+
     // Split at every branch target/fallthrough and around every cross-lane operation. Case values are
     // dense block indices, not guest PCs. A cross-lane op must end its block so the common synchronized
     // phase can publish its result before any invocation advances to the following guest instruction.
@@ -10662,6 +10687,13 @@ bool emit_cfg_state_machine(
                         std::fprintf(stderr, "[cfg-recompile-reject] pc=%u fmt=%d op=0x%x\n",
                                      in.pc, static_cast<int>(in.fmt), in.opcode);
                     return false;
+                }
+                if (!state.scc && native_b32_mask_scc_vote_pcs.contains(in.pc)) {
+                    const auto result = state.sreg_bool.find(in.dst.value);
+                    if (result == state.sreg_bool.end() ||
+                        !state.sreg_bool_b32.contains(in.dst.value))
+                        return reject_cfg(in.pc, "missing-b32-mask-scc-source");
+                    state.scc = b.native_wave_any(result->second);
                 }
             }
             const bool last = member + 1 == dispatch_blocks[dispatch].size();
