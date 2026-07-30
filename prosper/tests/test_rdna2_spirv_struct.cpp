@@ -538,6 +538,29 @@ int main() {
     }
     printf("  [ok]   Wave32 mask-branch proof does not cross control-flow joins\n");
 
+    // Reduced Astro world-map PS PC9..33 preamble: s64 is a saved mask before a real EXECZ
+    // conditional. The fall-through arm refines it with an explicit VOPC mask and immediately votes
+    // through SCC. Provenance on that arm is valid even though the EXECZ target bypasses the block.
+    const uint32_t wave32_mask_through_execz_fallthrough[] = {
+        0xbec0037eu,                         // pc0: s_mov_b32 s64, exec_lo
+        0x7c220b31u,                         // pc1: v_cmpx_lt_f32 vcc, v49, v5
+        0xbf880004u,                         // pc2: s_cbranch_execz -> merge at PC7
+        0x7c0862f9u, 0x0686eb25u,            // pc3: v_cmp_lt_f32_sdwa vcc_hi, s37, v49
+        0x8a406b40u,                         // pc5: s_andn2_b32 s64, s64, vcc_hi
+        0xbf840001u,                         // pc6: s_cbranch_scc0 -> terminal tail
+        0xbf810000u,                         // pc7: merge
+    };
+    bool found_fallthrough_vote = false;
+    for (uint32_t pc : mask_test_branches_for_test(
+             wave32_mask_through_execz_fallthrough,
+             std::size(wave32_mask_through_execz_fallthrough), true))
+        if (pc == 6) found_fallthrough_vote = true;
+    if (!found_fallthrough_vote) {
+        printf("  [FAIL] valid fall-through Wave32 mask provenance was lost at EXECZ\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 mask proof preserves valid conditional fall-through provenance\n");
+
     // The same live shader selects EXEC_LO or an empty mask into VCC_HI from an ordinary scalar
     // comparison. This is s_cselect_b32's mask-domain form, not a scalar integer selection.
     const uint32_t wave32_fragment_b32_cselect[] = {
@@ -1623,6 +1646,34 @@ int main() {
         return 1;
     }
     printf("  [ok]   Float16x4 vertex fetch handles a runtime SOFFSET\n");
+
+    // Astro's world-map VS uses the same arbitrary byte-address shape for a three-component SNORM16
+    // attribute. Its stride is dword-aligned, but the shader-computed SOFFSET can select either half
+    // of a dword, and a component beginning at byte three must join the following dword.
+    const uint32_t vs_fetch_snorm16x3_soffset[] = {
+        0xb0040002u,                         // s_movk_i32 s4, 2
+        0xe0082000u, 0x04000405u,            // buffer_load_format_xyz v[4:6], v5, s[0:3], s4 idxen
+        0x7e0e02f2u,                         // v_mov_b32 v7, 1.0
+        0xf80008cfu, 0x07060504u,            // exp pos0 v4,v5,v6,v7
+        0xbf810000u,
+    };
+    ShaderResourceTable rt_snorm16x3;
+    ShaderResource vb_snorm16x3{};
+    vb_snorm16x3.cls = ResourceClass::VertexBuffer;
+    vb_snorm16x3.format = DataFormat::Snorm16;
+    vb_snorm16x3.num_components = 3;
+    vb_snorm16x3.binding = 6;
+    vb_snorm16x3.stride = 28;
+    vb_snorm16x3.fetch_pc = 1;
+    vb_snorm16x3.fetch_index_mode = VertexFetchIndexMode::Shader;
+    rt_snorm16x3.resources.push_back(vb_snorm16x3);
+    const auto snorm16x3_spv = recompile_vertex(
+        vs_fetch_snorm16x3_soffset, std::size(vs_fetch_snorm16x3_soffset), &rt_snorm16x3);
+    if (snorm16x3_spv.empty() || snorm16x3_spv[0] != 0x07230203u) {
+        printf("  [FAIL] SNORM16x3 vertex fetch with runtime SOFFSET did not recompile\n");
+        return 1;
+    }
+    printf("  [ok]   SNORM16x3 vertex fetch handles a runtime SOFFSET\n");
 
     // image_sample LOD mode per execution model (#151): OpImageSampleImplicitLod is only legal in
     // the Fragment execution model — the compute and vertex shells have no derivatives, so an
