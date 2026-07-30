@@ -140,6 +140,12 @@ bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
 // readback fails after dispatch, exercising retained-image invalidation without a Vulkan fault.
 void live_compute_fail_next_storage_readback_for_test();
 
+// Deterministic setup/ownership failure injection for the storage-result fallback regression. The
+// pair models a transient compare-pipeline failure followed by a cache-capacity failure without
+// relying on driver behavior.
+void live_compute_force_next_image_result_host_fallback_for_test();
+void live_compute_fail_next_image_result_buffer_retain_for_test();
+
 // Register the synchronous Vulkan compute backend used by AGC submit processing.
 void register_live_compute();
 

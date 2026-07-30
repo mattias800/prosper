@@ -170,6 +170,8 @@ namespace {
 std::atomic<uint64_t> g_buffer_gpu_result_skips{0};
 std::atomic<uint64_t> g_compute_storage_transfer_seeds{0};
 std::atomic<bool> g_fail_next_storage_readback_for_test{false};
+std::atomic<bool> g_force_next_image_result_host_fallback_for_test{false};
+std::atomic<bool> g_fail_next_image_result_buffer_retain_for_test{false};
 
 VkFormat native_storage_vk_format(prosper::gpu::DataFormat format, uint32_t components) {
     using prosper::gpu::DataFormat;
@@ -1858,6 +1860,15 @@ struct VulkanComputeContext {
         if (found == image_cache.end()) return false;
         CachedComputeImage& cached = found->second;
         if (cached.result_buffer) return false;
+        // This staging buffer contains the current dispatch result. Once the caller chooses it as
+        // the replacement baseline, an older host fallback is no longer authoritative even when
+        // ownership fails (for example because every cache entry is pinned). Leaving that fallback
+        // behind could let a later A result match stale A after failed result B remained in guest
+        // memory, incorrectly suppressing the required A writeback.
+        std::vector<uint8_t>().swap(cached.result_snapshot);
+        if (g_fail_next_image_result_buffer_retain_for_test.exchange(
+                false, std::memory_order_acq_rel))
+            return false;
         if (!make_image_cache_room(allocation_bytes)) return false;
         cached.result_buffer = buffer;
         cached.result_memory = memory;
@@ -1867,8 +1878,6 @@ struct VulkanComputeContext {
         image_cache_bytes += allocation_bytes;
         buffer = VK_NULL_HANDLE;
         memory = VK_NULL_HANDLE;
-        cached.result_snapshot.clear();
-        cached.result_snapshot.shrink_to_fit();
         return true;
     }
 
@@ -6018,12 +6027,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
                 // An aligned exact result is retained as the staging buffer immediately below.
                 // Copying it into a host vector first only to clear that vector after ownership
-                // transfer is pure churn (66.4 MiB for a native 4K RGBA16F target). If GPU baseline
-                // setup fails, omitting this optional optimization remains fail-safe: the next
-                // dispatch simply takes the ordinary writeback path.
+                // transfer is pure churn (66.4 MiB for a native 4K RGBA16F target). Unavailable GPU
+                // setup keeps the exact current host fallback; a failed ownership attempt invalidates
+                // any older fallback so the next dispatch takes the ordinary writeback path.
+                const bool force_host_result_fallback =
+                    bi.persistent && !bi.result_baseline && bi.exact_result_bytes &&
+                    !(bi.exact_result_bytes & 15u) &&
+                    g_force_next_image_result_host_fallback_for_test.exchange(
+                        false, std::memory_order_acq_rel);
                 retain_gpu_result_baseline = bi.persistent && !bi.result_baseline &&
                     bi.exact_result_bytes && !(bi.exact_result_bytes & 15u) &&
-                    ctx.prepare_compare_pipeline();
+                    !force_host_result_fallback && ctx.prepare_compare_pipeline();
                 if (bi.persistent && !retain_gpu_result_baseline)
                     ctx.remember_cached_image_result(
                         bi.cache_key, native_texels,
@@ -6262,6 +6276,14 @@ bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
 
 void live_compute_fail_next_storage_readback_for_test() {
     g_fail_next_storage_readback_for_test.store(true, std::memory_order_release);
+}
+
+void live_compute_force_next_image_result_host_fallback_for_test() {
+    g_force_next_image_result_host_fallback_for_test.store(true, std::memory_order_release);
+}
+
+void live_compute_fail_next_image_result_buffer_retain_for_test() {
+    g_fail_next_image_result_buffer_retain_for_test.store(true, std::memory_order_release);
 }
 
 void storage_pack_unorm8_range(const uint32_t* channels, uint32_t components,

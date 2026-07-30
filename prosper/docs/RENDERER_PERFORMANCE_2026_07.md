@@ -1465,11 +1465,12 @@ already captured each exact guest source before transfer, but `retain_image` cop
 again instead of adopting it.
 
 Two generic lifetime fixes remove those copies. A cold proven-full write-only guest target at least
-16 MiB defers its source snapshot until that exact cache identity actually repeats; the old seed is
-unobservable, and a later external guest write still forces ordinary exact repair before an identical
+16 MiB defers its source snapshot until a later use actually needs exact source authority; the old seed
+is unobservable, and a later external guest write still forces ordinary exact repair before an identical
 GPU result may skip writeback. An aligned exact storage result also goes directly into its retained GPU
 comparison buffer instead of first filling a host vector that the successful ownership transfer
-immediately clears. Separately, sampled-image admission now moves its already-snapshotted source into
+immediately clears. If that ownership transfer fails, any older host result fallback is invalidated so
+it cannot suppress a later changed writeback. Separately, sampled-image admission now moves its already-snapshotted source into
 the cache. Small, partial/readable, replay-owned, failed-recovery, and non-GPU-comparable paths retain
 their prior snapshots. `PROSPER_COLD_STORAGE_SNAPSHOT_MIN_MB` tunes the cold crossover, while
 `PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1` remains the complete storage-source control.
@@ -1490,6 +1491,12 @@ progression sanity check. Both normal and disabled adaptive production-backend v
 the failure-repair, external-mutation, direct-import, partial-write, and raw-volume contracts. Timing now
 also attributes map, result preparation, guest-watch, notification, cache, and host result-fallback
 snapshot costs, so later cache churn cannot hide inside the aggregate writeback phase again.
+
+The production-backend suite also runs a reduced cold target with the real crossover set to zero. It
+proves first admission omits the source copy, the first invalidated repeat repairs and establishes exact
+authority, an external mutation forces writeback, and the disable switch preserves immediate snapshots.
+An alternating A/B/A regression injects GPU-baseline ownership failure after B and proves an older host A
+fallback cannot leave B in guest memory when A returns.
 
 ## Next renderer step
 
