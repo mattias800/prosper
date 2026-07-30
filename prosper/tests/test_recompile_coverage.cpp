@@ -502,9 +502,9 @@ int main() {
     std::vector<uint32_t> compute_cfg_dispatch_saved_mask_not_boundary = {
         0xBE94037Eu, // s_mov_b32 s20, exec_lo (complete Wave32 mask)
         0xBE950714u, // s_not_b32 s21, s20
-        0xBF070000u, // s_cmp_lg_u32 s0, s0 (false, but creates a conditional CFG edge)
+        0xBF060000u, // s_cmp_eq_u32 s0, s0 (true; creates a conditional CFG edge)
         0xBF850001u, // s_cbranch_scc1 +1 -> consumer
-        0xBE960380u, // unreachable s_mov_b32 s22, 0
+        0xBF800000u, // unreachable s_nop 0 fallthrough arm
         0xBEFE0315u, // s_mov_b32 exec_lo, s21 (mask-only consumer)
     };
     compute_cfg_dispatch_saved_mask_not_boundary.insert(
