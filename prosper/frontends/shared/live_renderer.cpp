@@ -2461,6 +2461,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // RTT (#167): if this texture's base is a color target we rendered into, inject those
                         // pixels (nearest-scaled to tw x th) instead of reading empty guest memory.
                         bool rtt_hit = false;
+                        // Why a sampled resource never consulted the renderer-owned RTT cache. Without
+                        // this, a draw that reads a target prosper rendered but takes the guest-decode
+                        // path instead is invisible in the log: no "sample tex" line is emitted at all,
+                        // and the draw silently samples empty guest memory.
+                        if (rtt_log && (fr.is_storage_image || !rtt_on || is_volume || r.in_mip_tail))
+                            fprintf(stderr,
+                                    "[rtt] sample tex addr=0x%llx %ux%u fmt=%u -> RTT PATH SKIPPED "
+                                    "(storage=%d rtt_on=%d volume=%d mip_tail=%d)\n",
+                                    (unsigned long long)r.gpu_addr, tw, th, (unsigned)r.format,
+                                    (int)fr.is_storage_image, (int)rtt_on, (int)is_volume,
+                                    (int)r.in_mip_tail);
                         if (!fr.is_storage_image && rtt_on && !is_volume && !r.in_mip_tail) {
                             auto rit = g_rtt.find(sampled_source_addr);
                             if (rit != g_rtt.end() && rit->second.w && rit->second.h && rit->second.rgba &&
