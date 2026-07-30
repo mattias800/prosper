@@ -606,6 +606,34 @@ int main() {
     native_cfg17d1.local_x = 64;
     native_cfg17d1.wave_size = 32;
     native_cfg17d1.native_subgroup_size = 32;
+    // Astro's traversal combines three VOPC masks, then immediately branches on the SCC written by
+    // the final B32 AND. Keep the irreducible dispatcher tail from kernel 17d and prove that this
+    // exact native path adds one (and only one) subgroup vote for the live final intersection.
+    std::vector<uint32_t> code17d1s = {
+        0xbe9b037eu,              // s_mov_b32 s27, exec_lo
+        0x7d8a0a15u,              // v_cmp_* vcc, s21, v5
+        0x7d8a0af9u, 0x0686eb19u, // v_cmp_* s107, s25, v5
+        0x7d8a0af9u, 0x06869c1au, // v_cmp_* s28, s26, v5
+        0x876a6a1bu,              // s_and_b32 vcc_lo, s27, vcc_lo
+        0x876a6b6au,              // s_and_b32 vcc_lo, vcc_lo, vcc_hi
+        0x876a1c6au,              // s_and_b32 vcc_lo, vcc_lo, s28
+        0xbf840001u,              // s_cbranch_scc0 +1
+        0xbf800000u,              // fallthrough work
+    };
+    code17d1s.insert(code17d1s.end(), std::begin(code17d), std::end(code17d));
+    const std::vector<uint32_t> native_spv17d32 = recompile_compute(
+        code17d, std::size(code17d), nullptr, native_cfg17d1);
+    const std::vector<uint32_t> native_spv17d1s = recompile_compute(
+        code17d1s.data(), code17d1s.size(), nullptr, native_cfg17d1);
+    CHECK(!native_spv17d32.empty() && !native_spv17d1s.empty() &&
+              count_spirv_opcode(native_spv17d1s, 335) ==
+                  count_spirv_opcode(native_spv17d32, 335) + 1,
+          "Wave32 mask SCC branch emits only the final live subgroup-any vote");
+    ComputeShaderConfig portable_cfg17d1s = native_cfg17d1;
+    portable_cfg17d1s.native_subgroup_size = 0;
+    CHECK(recompile_compute(code17d1s.data(), code17d1s.size(), nullptr,
+                            portable_cfg17d1s).empty(),
+          "Wave32 mask SCC branch rejects without an exact native subgroup contract");
     const std::vector<uint32_t> native_spv17d1 = recompile_compute(
         code17d1, std::size(code17d1), &rt17d1, native_cfg17d1);
     CHECK(!native_spv17d1.empty() && count_spirv_opcode(native_spv17d1, 349) >= 2 &&
