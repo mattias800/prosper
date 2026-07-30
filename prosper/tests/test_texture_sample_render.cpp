@@ -327,6 +327,65 @@ int main() {
                   sampled_stats.sampled_hits == 1,
               "GPU-resident target sampling matches CPU readback+upload byte-for-byte");
 
+        // Exercise the generic compute-image borrow carried by FrameResource. Reuse this exact
+        // backend-owned image as a convenient fixture, but address it only through the opaque
+        // borrowed-image fields: the backend must build a view/sampler, preserve the owner's layout,
+        // retain the lease through completion, and never destroy the borrowed VkImage.
+        auto* borrowed_fixture = prosper::test::find_persistent_color_target(
+            target_id, W, H, VK_FORMAT_R8G8B8A8_UNORM);
+        prosper::test::FrameResource borrowed_resource = cpu_resource;
+        borrowed_resource.tex_rgba = nullptr;
+        borrowed_resource.persistent_render_target_id = 0;
+        borrowed_resource.borrowed_compute_image =
+            borrowed_fixture ? static_cast<void*>(borrowed_fixture->image) : nullptr;
+        borrowed_resource.borrowed_compute_device =
+            static_cast<void*>(prosper::test::render_vk_ctx().dev);
+        borrowed_resource.borrowed_compute_image_layout = borrowed_fixture
+            ? static_cast<uint32_t>(borrowed_fixture->layout) : 0u;
+        borrowed_resource.borrowed_compute_image_lease = std::make_shared<int>(1);
+        prosper::test::BackendDraw borrowed_sample = cpu_sample;
+        borrowed_sample.R = {borrowed_resource};
+        std::vector<uint8_t> borrowed_resident = prosper::test::render_draws_rgba(
+            {borrowed_sample}, W, H);
+        std::vector<uint8_t> borrowed_followup = prosper::test::render_draws_rgba(
+            {gpu_sample}, W, H);
+        CHECK(borrowed_fixture && borrowed_resident == cpu_roundtrip &&
+                  borrowed_followup == cpu_roundtrip,
+              "borrowed compute-image sampling preserves pixels, owner layout, and image lifetime");
+
+        // A live renderer span can retain resources while later target passes are still being
+        // recorded into the same queue batch. Drop every caller-owned lease reference before the
+        // fence: only the backend cleanup scope may keep the borrowed VkImage pinned at that point.
+        bool pending_lease_released = false;
+        prosper::test::FrameResource pending_borrow = borrowed_resource;
+        pending_borrow.borrowed_compute_image_lease = std::shared_ptr<void>(
+            new int(1), [&](void* allocation) {
+                pending_lease_released = true;
+                delete static_cast<int*>(allocation);
+            });
+        prosper::test::BackendDraw pending_sample = cpu_sample;
+        pending_sample.R = {pending_borrow};
+        constexpr uint64_t pending_target_id = 0x7590000000000002ull;
+        prosper::test::BackendColorTarget pending_target{
+            pending_target_id, false, false};
+        prosper::test::BackendSubmissionBatch pending_batch;
+        const std::vector<uint8_t> pending_result = prosper::test::render_draws_rgba(
+            {pending_sample}, W, H, nullptr, nullptr, false, &pending_target,
+            nullptr, nullptr, nullptr, &pending_batch, false);
+        pending_borrow.borrowed_compute_image_lease.reset();
+        pending_sample.R.clear();
+        CHECK(pending_result.empty() && pending_batch.pending() && !pending_lease_released,
+              "pending graphics submission retains the borrowed compute-image lease");
+        const prosper::test::BackendSubmissionBatchResult pending_submit =
+            pending_batch.submit_and_wait(
+                prosper::test::render_vk_ctx().dev,
+                prosper::test::render_vk_ctx().queue, false);
+        pending_batch.complete();
+        CHECK(pending_submit.submit_result == VK_SUCCESS &&
+                  pending_submit.wait_result == VK_SUCCESS && pending_lease_released,
+              "borrowed compute-image lease releases only after graphics completion");
+        prosper::test::invalidate_persistent_color_target(pending_target_id);
+
         // Multiple ordered target calls may record into one queue submission. The producer returns no
         // CPU pixels; the consumer samples that not-yet-submitted target, then its requested readback
         // flushes both command buffers behind one fence.
@@ -529,7 +588,78 @@ int main() {
             const auto gpu_sample_stats = prosper::test::backend_color_target_stats();
             CHECK(gpu_sample_stats.sampled_hits == 1 && gpu_sampled == cpu_sampled,
                   "GPU-resident FP16 target sampling matches native CPU RTT round-trip");
+
+            auto* borrowed_fp16_fixture = prosper::test::find_persistent_color_target(
+                fp16_target_id, W, H, VK_FORMAT_R16G16B16A16_SFLOAT);
+            prosper::test::FrameResource borrowed_fp16_resource = fp16_resource;
+            borrowed_fp16_resource.tex_rgba = nullptr;
+            borrowed_fp16_resource.borrowed_compute_image = borrowed_fp16_fixture
+                ? static_cast<void*>(borrowed_fp16_fixture->image) : nullptr;
+            borrowed_fp16_resource.borrowed_compute_device =
+                static_cast<void*>(prosper::test::render_vk_ctx().dev);
+            borrowed_fp16_resource.borrowed_compute_image_layout = borrowed_fp16_fixture
+                ? static_cast<uint32_t>(borrowed_fp16_fixture->layout) : 0u;
+            borrowed_fp16_resource.borrowed_compute_image_lease = std::make_shared<int>(1);
+            consumer.R = {borrowed_fp16_resource};
+            const std::vector<uint8_t> borrowed_fp16_sampled =
+                prosper::test::render_draws_rgba({consumer}, W, H);
+            consumer.R = {gpu_fp16_resource};
+            const std::vector<uint8_t> borrowed_fp16_followup =
+                prosper::test::render_draws_rgba({consumer}, W, H);
+            CHECK(borrowed_fp16_fixture && borrowed_fp16_sampled == cpu_sampled &&
+                      borrowed_fp16_followup == cpu_sampled,
+                  "borrowed native FP16 image preserves HDR sampling, layout, and lifetime");
             prosper::test::invalidate_persistent_color_target(fp16_target_id);
+
+            ResolvedPipelineState r11_state = fp16_state;
+            r11_state.color0_format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+            producer.ps = &r11_state;
+            constexpr uint64_t r11_target_id = 0x7590000000000011ull;
+            prosper::test::BackendColorTarget r11_target{
+                r11_target_id, false, true, VK_FORMAT_B10G11R11_UFLOAT_PACK32};
+            const std::vector<uint8_t> r11_native = prosper::test::render_draws_rgba(
+                {producer}, W, H, nullptr, nullptr, false, &r11_target);
+            prosper::test::FrameResource r11_resource;
+            r11_resource.binding = 4; r11_resource.set = 1;
+            r11_resource.tex_rgba = r11_native.data();
+            r11_resource.tw = W; r11_resource.th = H;
+            r11_resource.texture_format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+            consumer.R = {r11_resource};
+            const std::vector<uint8_t> r11_cpu_sampled =
+                prosper::test::render_draws_rgba({consumer}, W, H);
+
+            prosper::test::FrameResource gpu_r11_resource = r11_resource;
+            gpu_r11_resource.tex_rgba = nullptr;
+            gpu_r11_resource.persistent_render_target_id = r11_target_id;
+            consumer.R = {gpu_r11_resource};
+            const std::vector<uint8_t> r11_gpu_sampled =
+                prosper::test::render_draws_rgba({consumer}, W, H);
+
+            auto* borrowed_r11_fixture = prosper::test::find_persistent_color_target(
+                r11_target_id, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+            prosper::test::FrameResource borrowed_r11_resource = r11_resource;
+            borrowed_r11_resource.tex_rgba = nullptr;
+            borrowed_r11_resource.borrowed_compute_image = borrowed_r11_fixture
+                ? static_cast<void*>(borrowed_r11_fixture->image) : nullptr;
+            borrowed_r11_resource.borrowed_compute_device =
+                static_cast<void*>(prosper::test::render_vk_ctx().dev);
+            borrowed_r11_resource.borrowed_compute_image_layout = borrowed_r11_fixture
+                ? static_cast<uint32_t>(borrowed_r11_fixture->layout) : 0u;
+            borrowed_r11_resource.borrowed_compute_image_lease = std::make_shared<int>(1);
+            consumer.R = {borrowed_r11_resource};
+            const std::vector<uint8_t> r11_borrowed_sampled =
+                prosper::test::render_draws_rgba({consumer}, W, H);
+            consumer.R = {gpu_r11_resource};
+            const std::vector<uint8_t> r11_borrowed_followup =
+                prosper::test::render_draws_rgba({consumer}, W, H);
+            CHECK(r11_native.size() == static_cast<size_t>(W) * H * 4 &&
+                      center_red(r11_cpu_sampled) >= 126 &&
+                      center_red(r11_cpu_sampled) <= 129 &&
+                      r11_gpu_sampled == r11_cpu_sampled && borrowed_r11_fixture &&
+                      r11_borrowed_sampled == r11_cpu_sampled &&
+                      r11_borrowed_followup == r11_cpu_sampled,
+                  "borrowed native R11G11B10 image preserves HDR sampling, layout, and lifetime");
+            prosper::test::invalidate_persistent_color_target(r11_target_id);
         }
     }
 
@@ -805,19 +935,45 @@ int main() {
         bool speculative_state_valid = true;
         bool prior_cleanup_ran = false;
         bool later_cleanup_ran = false;
+        bool borrowed_lease_released = false;
+        bool late_borrowed_lease_released = false;
+        auto borrowed_lease = std::shared_ptr<void>(
+            new int(1),
+            [&](void* ptr) {
+                borrowed_lease_released = true;
+                delete static_cast<int*>(ptr);
+            });
         CHECK(!prosper::test::backend_has_unproven_submission(),
               "completed test submissions leave the global lifetime guard clear");
-        prosper::test::BackendSubmissionBatch abandoned_batch;
-        abandoned_batch.enqueue(VK_NULL_HANDLE);
-        abandoned_batch.add_failure_cleanup([&]() { speculative_state_valid = false; });
-        abandoned_batch.add_cleanup([&]() { prior_cleanup_ran = true; });
-        abandoned_batch.abandon_pending_resources();
-        abandoned_batch.add_cleanup([&]() { later_cleanup_ran = true; });
-        abandoned_batch.complete();
-        CHECK(!abandoned_batch.pending() && abandoned_batch.retains_pending_resources() &&
-                  prosper::test::backend_has_unproven_submission() &&
-                  !speculative_state_valid && !prior_cleanup_ran && !later_cleanup_ran,
-              "pending submission globally protects prior and later resources");
+        {
+            prosper::test::BackendSubmissionBatch abandoned_batch;
+            abandoned_batch.enqueue(VK_NULL_HANDLE);
+            abandoned_batch.add_failure_cleanup([&]() { speculative_state_valid = false; });
+            abandoned_batch.add_cleanup([&, lease = borrowed_lease]() {
+                (void)lease;
+                prior_cleanup_ran = true;
+            });
+            borrowed_lease.reset();
+            abandoned_batch.abandon_pending_resources();
+            auto late_borrowed_lease = std::shared_ptr<void>(
+                new int(2),
+                [&](void* ptr) {
+                    late_borrowed_lease_released = true;
+                    delete static_cast<int*>(ptr);
+                });
+            abandoned_batch.add_cleanup([&, lease = late_borrowed_lease]() {
+                (void)lease;
+                later_cleanup_ran = true;
+            });
+            late_borrowed_lease.reset();
+            abandoned_batch.complete();
+            CHECK(!abandoned_batch.pending() && abandoned_batch.retains_pending_resources() &&
+                      prosper::test::backend_has_unproven_submission() &&
+                      !speculative_state_valid && !prior_cleanup_ran && !later_cleanup_ran,
+                  "pending submission globally retains prior and late resources");
+        }
+        CHECK(!borrowed_lease_released && !late_borrowed_lease_released,
+              "borrowed leases survive destruction of an abandoned submission batch");
         const std::vector<uint8_t> blocked = prosper::test::render_triangle_rgba(
             vert, lzf, W, H, nullptr, nullptr, nullptr, &td);
         CHECK(blocked.empty(),

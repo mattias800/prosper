@@ -147,6 +147,14 @@ struct FrameResource {
     // depth image directly — prosper never writes rendered depth back to guest memory, so there
     // is no CPU fallback; an invalidated/missing surface falls through to the guest-byte decode.
     uint64_t persistent_depth_target_id = 0;
+    // Exact typed-storage result borrowed from the live compute cache. The image and device handles
+    // are opaque here only at the frontend boundary; this Vulkan backend verifies the device,
+    // transitions from `borrowed_image_layout` for sampling, restores that layout afterward, and
+    // retains the lease until the submission has completed.
+    void* borrowed_compute_image = nullptr;
+    void* borrowed_compute_device = nullptr;
+    uint32_t borrowed_compute_image_layout = 0;
+    std::shared_ptr<void> borrowed_compute_image_lease;
     const uint32_t* buffer_words_data() const {
         return dwords_view && dwords_view_count
             ? dwords_view : (dwords.empty() ? nullptr : dwords.data());
@@ -156,7 +164,7 @@ struct FrameResource {
     }
     bool is_texture() const {
         return tex_rgba != nullptr || persistent_render_target_id != 0 ||
-               persistent_depth_target_id != 0;
+               persistent_depth_target_id != 0 || borrowed_compute_image != nullptr;
     }
 };
 
@@ -946,8 +954,14 @@ public:
     }
 
     void add_cleanup(std::function<void()> cleanup) {
-        if (!pending_resources_abandoned_)
+        if (!pending_resources_abandoned_) {
             cleanups_.push_back(std::move(cleanup));
+            return;
+        }
+        // Some resources are bundled only after submission diagnostics finish. If completion was
+        // already found indeterminate, destroying this late closure would release those resources
+        // (including borrowed-image leases) while the submitted command may still use them.
+        (void)new std::function<void()>(std::move(cleanup));
     }
 
     // Persistent attachment state is updated speculatively so later command buffers in the same
@@ -964,14 +978,20 @@ public:
     }
 
     // Completion could not be proven after a successful submit. Invalidate speculative state, but
-    // never invoke cleanup callbacks for work Vulkan may still own. The sticky flag also rejects
-    // callbacks registered later in the current renderer call (registration follows diagnostics).
+    // never invoke or destroy cleanup callbacks for work Vulkan may still own. Besides Vulkan
+    // handles, their captures can contain ownership tokens for resources borrowed from another
+    // cache. Keep the complete closure set alive until process teardown; a normal static owner is
+    // unsuitable because its destructor could run while a lost device still owns the submission.
+    // The sticky flag also rejects callbacks registered later in the current renderer call
+    // (registration follows diagnostics).
     void abandon_pending_resources() {
         commands_.clear();
         finish_persistent_state(false);
         pending_resources_abandoned_ = true;
         backend_mark_unproven_submission();
-        cleanups_.clear();
+        if (!cleanups_.empty()) {
+            (void)new std::vector<std::function<void()>>(std::move(cleanups_));
+        }
     }
 
     BackendSubmissionBatchResult submit_and_wait(VkDevice dev, VkQueue queue,
@@ -1039,8 +1059,9 @@ public:
             finish_persistent_state(state == BackendSubmissionState::Complete);
         } else {
             // Neither wait proved completion, so every command buffer and object captured by its
-            // cleanup may still be in use. Drop the callbacks without invoking them; leaking these
-            // one-shot resources is the only valid last-resort action on an effectively lost device.
+            // cleanup may still be in use. Retain the callbacks without invoking or destroying
+            // them; leaking these one-shot resources and any borrowed ownership tokens they hold
+            // is the only valid last-resort action on an effectively lost device.
             abandon_pending_resources();
         }
         return result;
@@ -3216,6 +3237,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     struct TextureUploadKey {
         const uint8_t* pixels = nullptr;
         uint64_t render_target_id = 0;
+        void* borrowed_compute_image = nullptr;
         uint32_t width = 0, height = 0, depth = 1;
         uint32_t img_dim = 1;
         uint32_t mip_levels = 1;   // effective uploaded chain length (#1272)
@@ -3223,6 +3245,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         bool storage_image = false;
         bool operator==(const TextureUploadKey& other) const {
             return pixels == other.pixels && render_target_id == other.render_target_id &&
+                   borrowed_compute_image == other.borrowed_compute_image &&
                    width == other.width && height == other.height && depth == other.depth &&
                    img_dim == other.img_dim && mip_levels == other.mip_levels &&
                    format == other.format && storage_image == other.storage_image;
@@ -3232,6 +3255,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         size_t operator()(const TextureUploadKey& key) const {
             size_t h = std::hash<const uint8_t*>{}(key.pixels);
             h ^= std::hash<uint64_t>{}(key.render_target_id) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            h ^= std::hash<void*>{}(key.borrowed_compute_image) +
+                 0x9e3779b9u + (h << 6) + (h >> 2);
             h ^= static_cast<size_t>(key.width) + 0x9e3779b9u + (h << 6) + (h >> 2);
             h ^= static_cast<size_t>(key.height) + 0x9e3779b9u + (h << 6) + (h >> 2);
             h ^= static_cast<size_t>(key.depth) + 0x9e3779b9u + (h << 6) + (h >> 2);
@@ -3252,6 +3277,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkDeviceSize image_bytes = 0;
         bool persistent_hit = false;
         bool borrowed_target = false;
+        bool borrowed_compute = false;
+        VkImageLayout borrowed_compute_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        std::shared_ptr<void> borrowed_compute_lease;
         // Sampled depth bridge (#1275): image borrowed from the persistent DS cache. The view uses
         // the DEPTH aspect of ds_format, and the call transitions the image DS-attachment ->
         // shader-read around its passes.
@@ -3908,6 +3936,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         r.tex_rgba,
                         r.persistent_render_target_id ? r.persistent_render_target_id
                                                       : r.persistent_depth_target_id,
+                        r.borrowed_compute_image,
                         r.tw, r.th, r.td, r.img_dim,
                         tex_mip_levels, backend_color_format(r.texture_format), r.is_storage_image};
                     size_t upload_index = SIZE_MAX;
@@ -3922,12 +3951,25 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         upload.key = texture_key;
                         if (share_texture_uploads) texture_upload_indices.emplace(texture_key, upload_index);
 
+                        if (!r.is_storage_image && r.borrowed_compute_image &&
+                            r.borrowed_compute_device == static_cast<void*>(dev) &&
+                            r.borrowed_compute_image_layout !=
+                                static_cast<uint32_t>(VK_IMAGE_LAYOUT_UNDEFINED) &&
+                            r.borrowed_compute_image_lease) {
+                            upload.image = static_cast<VkImage>(r.borrowed_compute_image);
+                            upload.borrowed_compute = true;
+                            upload.borrowed_compute_layout = static_cast<VkImageLayout>(
+                                r.borrowed_compute_image_layout);
+                            upload.borrowed_compute_lease = r.borrowed_compute_image_lease;
+                        }
+
                         const bool target_feedback =
                             (persistent_color &&
                              r.persistent_render_target_id == color_target->persistent_id) ||
                             (persistent_color1 &&
                              r.persistent_render_target_id == color_target->persistent_id1);
-                        if (!r.is_storage_image && persistent_color_targets_enabled && !target_feedback &&
+                        if (!upload.borrowed_compute && !r.is_storage_image &&
+                            persistent_color_targets_enabled && !target_feedback &&
                             r.persistent_render_target_id && r.img_dim == 1) {
                             if (auto* target = find_persistent_color_target(
                                     r.persistent_render_target_id, r.tw, r.th,
@@ -3943,7 +3985,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         // into a persistent DS image (never written back to guest memory). Bind
                         // that image's depth aspect directly. The pass's own DS attachment must
                         // not be borrowed as a sampled input (feedback) — cached_ds identifies it.
-                        if (!upload.image && !upload.borrowed_target && !r.is_storage_image &&
+                        if (!upload.image && !upload.borrowed_target && !upload.borrowed_compute &&
+                            !r.is_storage_image &&
                             r.persistent_depth_target_id && r.img_dim == 1) {
                             const PersistentDsSampled sampled_ds = find_persistent_ds_sampled(
                                 r.persistent_depth_target_id, r.tw, r.th);
@@ -3963,7 +4006,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         const PersistentTextureKey persistent_key{
                             r.persistent_texture_id, r.tw, r.th, r.td, r.img_dim,
                             texture_key.mip_levels, backend_color_format(r.texture_format)};
-                        if (!r.is_storage_image && !upload.borrowed_target && !upload.borrowed_ds &&
+                        if (!r.is_storage_image && !upload.borrowed_target &&
+                            !upload.borrowed_compute && !upload.borrowed_ds &&
                             persistent_textures_enabled &&
                             r.persistent_texture_id) {
                             auto cached = persistent_texture_images.find(persistent_key);
@@ -3978,7 +4022,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             }
                         }
 
-                        if (!upload.persistent_hit && !upload.borrowed_target && !upload.borrowed_ds) {
+                        if (!upload.persistent_hit && !upload.borrowed_target &&
+                            !upload.borrowed_compute && !upload.borrowed_ds) {
                             VkImageCreateInfo tci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
                             const bool texture_3d = r.img_dim == 2;
                             tci.imageType = texture_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
@@ -4919,6 +4964,33 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                              VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &b1);
     }
+    // Compute-owned typed storage results rest in GENERAL. Borrow each exact image once per call,
+    // make the completed compute/transfer writes visible to graphics sampling, and restore GENERAL
+    // after the pass so the compute cache's layout contract remains true.
+    std::vector<std::pair<VkImage, VkImageLayout>> borrowed_compute_images;
+    for (const SharedTextureUpload& upload : texture_uploads) {
+        if (!upload.borrowed_compute || !upload.image) continue;
+        if (std::any_of(borrowed_compute_images.begin(), borrowed_compute_images.end(),
+                        [&](const auto& entry) { return entry.first == upload.image; }))
+            continue;
+        borrowed_compute_images.push_back({upload.image, upload.borrowed_compute_layout});
+        VkImageMemoryBarrier to_sampled{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        to_sampled.oldLayout = upload.borrowed_compute_layout;
+        to_sampled.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        to_sampled.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                   VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        to_sampled.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        to_sampled.srcQueueFamilyIndex = to_sampled.dstQueueFamilyIndex =
+            VK_QUEUE_FAMILY_IGNORED;
+        to_sampled.image = upload.image;
+        to_sampled.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &to_sampled);
+    }
     // Same-pass depth feedback (#1186): make prior attachment writes visible to the shader and
     // enter the layout declared by both the sampled descriptor and this render pass. The render
     // pass returns the image to DEPTH_STENCIL_ATTACHMENT_OPTIMAL at the end, preserving the cache
@@ -5211,6 +5283,23 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                                  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &to_ds);
+    }
+    for (const auto& [borrowed, saved_layout] : borrowed_compute_images) {
+        VkImageMemoryBarrier restore{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        restore.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        restore.newLayout = saved_layout;
+        restore.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        restore.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        restore.srcQueueFamilyIndex = restore.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        restore.image = borrowed;
+        restore.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &restore);
     }
     // A writable graphics storage image is architecturally guest memory, not a callback-local
     // texture. Copy its final texels back through the upload's coherent staging allocation before
@@ -5824,7 +5913,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 release_render_host_buffer(dev, arena.buffer);
             for (auto& upload : texture_uploads) {
                 if (upload.image && !upload.persistent_hit && !upload.borrowed_target &&
-                    !upload.borrowed_ds)
+                    !upload.borrowed_compute && !upload.borrowed_ds)
                     vkDestroyImage(dev, upload.image, nullptr);
                 if (upload.memory) {
                     if (upload.direct_memory) vkFreeMemory(dev, upload.memory, nullptr);
