@@ -144,9 +144,13 @@ points is worth more than pre-filtering the list.
 ### The library view
 
 With a games directory set, launching with no game shows a grid of cover art instead of an empty
-window. Arrow keys (or a controller D-pad) move the selection, Enter/Space/Cross opens the highlighted
-title, clicking a cover opens it directly, and **Change folder…** picks a different games directory and
-remembers it. Esc quits.
+window. Arrow keys move the selection, Enter/Space opens the highlighted title, clicking a cover opens it
+directly, and **Change folder...** picks a different games directory and remembers it. Esc quits. With no
+directory set yet, the window explains that and offers the same folder picker on Enter or a click.
+
+Keyboard and mouse only for now — **controller navigation is not implemented** (tracked separately).
+Nothing initializes SDL's gamepad subsystem while the library is up: the pad backend does that inside
+the guest boot, by which point the library is gone.
 
 Cover art is each dump's `sce_sys/icon0.png`. A title whose icon is missing or undecodable still appears
 as a launchable button labelled with its content id — what matters is that it is bootable, not that it

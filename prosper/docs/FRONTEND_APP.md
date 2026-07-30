@@ -197,7 +197,11 @@ Decisions worth knowing:
   (`VUID-VkFramebufferCreateInfo-pAttachments-00877`).
 - **ImGui's own keyboard/gamepad nav is deliberately off.** Selection is driven by `library_nav.hpp`, and
   running both means the arrow keys move a widget focus as well as the selection, and Enter activates
-  whatever widget that focus landed on instead of launching the highlighted game.
+  whatever widget that focus landed on instead of launching the highlighted game. A consequence worth
+  knowing: turning off `NavEnableGamepad` also silences the SDL3 backend's gamepad feed, so
+  `ImGuiKey_Gamepad*` is never set. Controller navigation therefore needs the pad read directly *and*
+  `SDL_INIT_GAMEPAD` initialized while the library is alive — neither is true today (the pad backend
+  initializes it inside `start_guest`), so the library is keyboard/mouse only.
 - **`CheckVkResultFn` is always set.** ImGui's Vulkan backend silently ignores every `VkResult`
   otherwise, so a failed pipeline or descriptor allocation would present only as a window that draws
   nothing.

@@ -954,13 +954,22 @@ static void picked_folder_cb(void* /*userdata*/, const char* const* filelist, in
     g_picked_path = filelist[0];
 }
 
-static void open_folder_picker(SDL_Window* win) {
+// Returns true when this call actually opened a dialog, so a caller can arm per-request state only
+// when its request is the one outstanding.
+static bool open_folder_picker(SDL_Window* win) {
     {
         std::lock_guard<std::mutex> lock(g_picked_mutex);
-        if (g_picker_open) return;   // one dialog at a time
+        if (g_picker_open) return false;   // one dialog at a time
         g_picker_open = true;
     }
     SDL_ShowOpenFolderDialog(picked_folder_cb, nullptr, win, nullptr, /*allow_many=*/false);
+    return true;
+}
+
+// Whether a folder dialog is still outstanding.
+static bool folder_picker_open() {
+    std::lock_guard<std::mutex> lock(g_picked_mutex);
+    return g_picker_open;
 }
 
 // Take the path this process was started from. Each platform has its own authoritative answer;
@@ -1576,6 +1585,10 @@ int main(int argc, char** argv) {
             std::string picked;
             { std::lock_guard<std::mutex> lock(g_picked_mutex); picked.swap(g_picked_path); }
 #ifdef PROSPER_HAVE_LIBRARY_UI
+            // The dialog closed without an answer (cancelled, or it failed to open): disarm, or the
+            // flag would still be set when some later, unrelated pick arrives.
+            if (libraryBrowsePending && picked.empty() && !folder_picker_open())
+                libraryBrowsePending = false;
             // The library asked for this folder, so its answer names a games DIRECTORY to remember, not
             // a title to boot. Without this the result went to open_game(), which resolves an app0 root
             // and therefore always rejected a folder-of-folders with "That is not a PS5 game".
@@ -1687,8 +1700,9 @@ int main(int argc, char** argv) {
                     if (!open_game(act.app0_root)) libraryStatus = "Could not start that game.";
                     break;
                 case prosper::frontend::LibraryAction::Kind::browse:
-                    libraryBrowsePending = true;
-                    open_folder_picker(win);
+                    // Arm only when this request is the one that opened the dialog: otherwise a browse
+                    // raised while another picker is already up would claim that picker's answer.
+                    if (open_folder_picker(win)) libraryBrowsePending = true;
                     break;
                 case prosper::frontend::LibraryAction::Kind::quit:
                     running = false;

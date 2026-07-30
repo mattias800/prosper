@@ -51,34 +51,6 @@ void imgui_vk_result(VkResult r) {
 
 } // namespace
 
-// One frame's worth of freshly-pressed pad inputs. Edges only: holding a direction must not sweep the
-// whole library, matching how the keyboard repeat is handled by ImGui::IsKeyPressed.
-LibraryUi::PadEdge LibraryUi::poll_pad_edges() {
-    PadEdge edge;
-    bool down[PadEdge::kCount] = {};
-    int count = 0;
-    SDL_JoystickID* pads = SDL_GetGamepads(&count);
-    if (pads) {
-        for (int i = 0; i < count; i++) {
-            SDL_Gamepad* pad = SDL_GetGamepadFromID(pads[i]);
-            if (!pad) continue;   // not opened by us; the app's pad backend owns the guest's device
-            down[0] = down[0] || SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_LEFT);
-            down[1] = down[1] || SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_RIGHT);
-            down[2] = down[2] || SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_UP);
-            down[3] = down[3] || SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
-            down[4] = down[4] || SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_SOUTH);   // Cross
-        }
-        SDL_free(pads);
-    }
-    edge.left    = down[0] && !padDown_[0];
-    edge.right   = down[1] && !padDown_[1];
-    edge.up      = down[2] && !padDown_[2];
-    edge.down    = down[3] && !padDown_[3];
-    edge.confirm = down[4] && !padDown_[4];
-    for (int i = 0; i < PadEdge::kCount; i++) padDown_[i] = down[i];
-    return edge;
-}
-
 LibraryUi::~LibraryUi() { shutdown(); }
 
 bool LibraryUi::init(SDL_Window* window, VkInstance instance, VkPhysicalDevice phys, VkDevice device,
@@ -480,10 +452,9 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
         ImGui::Spacing();
         // Keyboard-reachable too: ImGui's own nav is off (it fights the grid rules), so without this
         // the only way out of the empty state would be the mouse or a drop.
-        const PadEdge pad = poll_pad_edges();
         if (ImGui::Button("Choose folder...") ||
             ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter) ||
-            ImGui::IsKeyPressed(ImGuiKey_Space) || pad.confirm)
+            ImGui::IsKeyPressed(ImGuiKey_Space))
             action.kind = LibraryAction::Kind::browse;
         ImGui::SameLine();
         ImGui::TextDisabled("or press Enter, or drop a game folder on this window");
@@ -494,14 +465,15 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
 
         // Keyboard/controller selection. ImGui's own nav does not know about the grid, so movement is
         // decided by the unit-tested rules and the scroll follows the selection.
-        // ImGui nav is off (see init), which also silences the SDL3 backend's gamepad feed — so the
-        // pad is polled directly here rather than through ImGuiKey_Gamepad*, which would never be set.
-        const PadEdge pad = poll_pad_edges();
+        // Keyboard only. Controller navigation is NOT implemented: ImGui's gamepad nav is off (it
+        // fights these rules), and nothing initialises SDL's gamepad subsystem while the library is
+        // alive — the pad backend does that inside start_guest, by which point the library is gone.
+        // Tracked separately rather than shipped as code that cannot fire.
         LibraryNavKey key = LibraryNavKey::none;
-        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) || pad.left)   key = LibraryNavKey::left;
-        else if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) || pad.right) key = LibraryNavKey::right;
-        else if (ImGui::IsKeyPressed(ImGuiKey_UpArrow) || pad.up)  key = LibraryNavKey::up;
-        else if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) || pad.down) key = LibraryNavKey::down;
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow))       key = LibraryNavKey::left;
+        else if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) key = LibraryNavKey::right;
+        else if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))    key = LibraryNavKey::up;
+        else if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))  key = LibraryNavKey::down;
         else if (ImGui::IsKeyPressed(ImGuiKey_Home))     key = LibraryNavKey::home;
         else if (ImGui::IsKeyPressed(ImGuiKey_End))      key = LibraryNavKey::end;
         else if (ImGui::IsKeyPressed(ImGuiKey_PageUp))   key = LibraryNavKey::page_up;
@@ -513,7 +485,7 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
         firstRow_ = library_scroll_row_for(selected_, columns, rowsPerPage, firstRow_);
 
         if (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter) ||
-            ImGui::IsKeyPressed(ImGuiKey_Space) || pad.confirm) {
+            ImGui::IsKeyPressed(ImGuiKey_Space)) {
             action.kind = LibraryAction::Kind::open;
             action.app0_root = games_[static_cast<size_t>(selected_)].app0_root;
         }
@@ -585,10 +557,16 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
     // Split by whether an image was actually acquired, NOT by success-vs-failure. These three leave
     // acquireSem_ untouched, so returning is clean:
     if (acq == VK_ERROR_OUT_OF_DATE_KHR || acq == VK_TIMEOUT || acq == VK_NOT_READY) {
-        needsRecreate_ = (acq == VK_ERROR_OUT_OF_DATE_KHR);
+        needsRecreate_ |= (acq == VK_ERROR_OUT_OF_DATE_KHR);   // sticky: never clobber a pending request
         return action;
     }
-    if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) return action;   // hard error: nothing signalled
+    if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) {
+        // Device or surface lost. Nothing was signalled, but returning straight into a loop with no
+        // wait anywhere would spin a core, so stop drawing and let the app fall back.
+        fprintf(stderr, "[library] acquire failed (%d); closing the library view\n", (int)acq);
+        ready_ = false;
+        return action;
+    }
     // From here an image WAS acquired and acquireSem_ WILL be signalled, so every path below has to
     // consume it. VK_SUBOPTIMAL_KHR is a SUCCESS code — dropping this frame would leave the semaphore
     // signalled, so the next acquire would reuse a signalled semaphore and the wait/signal pairing
