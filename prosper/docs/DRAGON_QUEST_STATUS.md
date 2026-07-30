@@ -1,6 +1,6 @@
 # Dragon Quest VII Reimagined (`PPSA17942`) — title-screen status
 
-**Status as of 2026-07-30.** The game boots, composites its studio splashes correctly, and reaches a
+**Status as of 2026-07-31.** The game boots, composites its studio splashes correctly, and reaches a
 state where it renders a complete UE4 frame (base pass, shadow atlas, lighting, bloom pyramid, tonemap)
 every submit — but the presented frame is **pure black**. Bring-up ladder rung: **1 (real graphics:
 splashes)**. Rung 2 (title screen rendered) is **not** reached.
@@ -142,6 +142,99 @@ resolution gap (#282), not a missing opcode. A skipped exposure/grading producer
 of exactly this symptom (see the Messenger LUT precedent in CLAUDE.md), so resolve this dispatch's
 descriptors before looking anywhere else for the exposure error.
 
+## Superseded analysis — read this before trusting the sections above
+
+The two "defect" sections above were written on 2026-07-30 from a capsule taken on a **pre-#1483**
+build. Measurement has since contradicted parts of them. Keep them for the reproduction recipe and the
+diagnostics inventory; do not treat their conclusions as current.
+
+**Withdrawn: "the final Slate quad (draw 95) blacks the screen."** Its fragment shader was dumped
+(`PROSPER_SHADER_DUMP_SUCCESS`, raw hash `71e10841003bafd3`, 440 bytes, 76 instructions) and read:
+
+```
+pc=0024  image_sample  dmask=0xf -> v0          # samples RGBA
+pc=0101  v_med3_f32    v3, -2.0, v0, 1.0        # clamp the sampled value
+pc=0104  v_mul_f32     v0, s18, v3              # times a uniform scalar
+pc=0105  v_cvt_pkrtz_f16_f32 v0, v2, v0         # alpha = high half of the COMPR export
+```
+
+Exported alpha is `s18 * clamp(sampled)`. The surface it samples decodes to all zeros, so
+`med3(-2.0, 0, 1.0) == 0`, alpha is 0, and under its `SRC_ALPHA`/`ONE_MINUS_SRC_ALPHA` blend the draw is
+a **no-op**. It cannot be blacking the frame.
+
+**Withdrawn: "the 4K composite underneath is over-exposed."** Same provenance, not re-measured on a
+current build.
+
+## What is actually established (measured, current)
+
+- **The black frame is a faithful presentation, not a renderer loss.** `PROSPER_DUMP_PERSISTENT=1` over a
+  full route reports `scanout=HIT` on *every* present — the cache entry is found, extent and format match
+  — and `rgb_nonblack=0` throughout the black window. Cross-checked against the passes: the scanout pass
+  in that window reports `px_nonzero=8294400`, exactly `3840*2160`, i.e. one non-zero byte per pixel =
+  **alpha only**. The presented PNGs measure `max=0` at full resolution. The guest's own composite is
+  producing black RGB and prosper presents it correctly. **Search inside the composite, not in
+  presentation.**
+- **The tonemap source has real content.** The pass writing draw 92's source reports
+  `px_nonzero=11321053` of 33,177,600, 200-300 times per run. Draw 92 replaces (`blend=0`) with it.
+- **Draw 95's source has no writer at all.** `PROSPER_PROVENANCE_DIM=3840x2160` reports, for every
+  address in the rotating family it samples:
+  `no recorded color/compute/DMA/WRITE_DATA overlap for [0x…,+0x7e9000)`. Nothing prosper tracks fills
+  them, and they miss the RTT cache, so they decode from guest memory. Note `0x7e9000` = 8,294,400 =
+  exactly `3840*2160`, i.e. one byte per pixel, which does not match a 4-byte view of that extent and is
+  worth checking on its own.
+
+## Eliminated — do not re-run these
+
+- **The depth-only-pass RTT clobber is not the cause.** It is a real defect (#1510) and it is real for
+  other titles too, but fixing it does not fix this. Three variants were built and measured; all three
+  made offline replay of a captured title frame produce a `(u, v, u)` colour ramp instead of the previous
+  black, i.e. worse. PR #1513 was closed for that reason.
+- **Not a colour-disabled scanout pass**: zero scanout passes are affected by that guard.
+- **Not a missing or mismatched scanout cache entry**: `scanout=HIT` on every present.
+- **Not an RTT-cache bypass of the tonemap source**: the `RTT PATH SKIPPED` diagnostic added by this
+  change shows only shadow-atlas mip-tail levels and one 32x32 volume taking the guest-decode path.
+- **Not movie/USM playback**: the frame is a fully rendered UE4 scene and no AvPlayer activity
+  accompanies the transition.
+- **Not the `no-effect` draws**: all 22 have `cwm=0` with no depth or stencil write.
+
+## Open question for the next investigator
+
+Why does draw 92 — a full-viewport replace (`blend=0`, `mask=0xf`) from a source that demonstrably holds
+11.3M non-zero bytes — leave the scanout with alpha only? Everything downstream (draws 94, 95) is then
+irrelevant, because the pass as a whole never carries colour.
+
+A secondary, separable question: what actually produces the `(u, v, u)` ramp seen when the #1510 fix is
+applied? Measured as `R = B = x/width`, `G = y/height`. It is **not** the diagnostic clear (that is a flat
+`(0,0,1,1)` blue, `render_runner.h`), not `PROSPER_TESTTEX` (`(u, v, checker)`, and the var was unset) and
+not descriptor poison mode (also unset). Bisecting it offline with
+`gpu_replay --draw-steps --draw-steps-every 1` on a captured frame is the cheapest way to identify it.
+
+## Blocker on the tooling you will want to use
+
+**#1505 blocks capture and replay on master.** `live_gpu_targets` is disabled by every capture/diagnostic
+switch (`live_renderer.cpp`, the `PROSPER_GPU_CAPTURE` / `PROSPER_GPU_TIMELINE_CAPTURE` /
+`PROSPER_RTTLOG` / `PROSPER_DUMP_DRAWSTEPS` / `PROSPER_RESOURCE_HASH_DIM` / `PROSPER_TARGET_STEP_HASH_DIM`
+list), and the CPU RTT path it falls back to reads out of bounds and SIGSEGVs a few seconds into
+rendering. Plain runs are unaffected and hide it.
+
+Add **`PROSPER_NO_RTT_SNAPSHOT_BORROW=1`** to every capture or diagnostic run. That is sufficient for
+`PROSPER_RTTLOG` and the timeline capture, but **not** for `PROSPER_TARGET_STEP_HASH_DIM`, which still
+faults — there is a second out-of-bounds path on that side.
+
+## Methodology traps this investigation actually fell into
+
+1. **Distinct-colour counts are not a content metric here.** prosper's `(u, v, u)` ramp scores **10,775
+   distinct colours** on a 160x90 thumbnail; the genuine title sky/ocean frame scores **3,842**. A smooth
+   gradient has a unique value in nearly every pixel, so "more colours" reads as "richer content". Open
+   the image. Reserve the metrics for detecting *collapse* (1 colour, `max=0`), which is what the
+   `tools/snapshot` guards are calibrated for.
+2. **Frame-sequence before/after tables are confounded by run timing jitter.** Which game state each
+   sampled frame lands on moves between runs, so a brighter frame at the same index is not evidence.
+3. **Submit indices and guest addresses are both run-local.** Correlate only *within* one run. An
+   analysis that matched a `PROSPER_RTTLOG` window from one run against addresses from another produced a
+   confident and wrong conclusion.
+4. **`bash -n` proves syntax, not semantics** — it cannot see an unquoted expansion that word-splits.
+
 ## What has been fixed
 
 - **#1411** — Gen5 virtual interpolant registers (`0x10000000+n` → `SPI_PS_INPUT_CNTL_0..31`). Fixed
@@ -163,10 +256,14 @@ descriptors before looking anywhere else for the exposure error.
 | which draw blacks the frame | offline capsule + `gpu_replay --draw-steps … --draw-steps-every 1` |
 | renderer-owned target contents | `PROSPER_RTTLOG=1` with `PROSPER_RTTLOG_MIN_SUBMIT`/`_MAX_SUBMIT` |
 | a target's cached bytes | `gpu_replay --dump-rtt-seed ADDR PATH` |
+| why a sampled target took the guest-decode path | `PROSPER_RTTLOG=1` -> `RTT PATH SKIPPED (storage=/rtt_on=/volume=/mip_tail=)` |
+| what the presented frame actually holds | `PROSPER_DUMP_PERSISTENT=1` -> `[persist] present: … scanout=HIT/MISS rgb_nonblack=N` |
+| who writes a surface (colour, compute, DMA, WRITE_DATA) | `PROSPER_PROVENANCE_DIM=WxH` |
+| a successful shader's raw RDNA2 + SPIR-V | `PROSPER_SHADER_DUMP_SUCCESS=DIR` (**create DIR first**) + `shader_inspect` |
 
 ## Do not restart
 
 - The "mostly white" title composition (#1373) — fixed by #1411; the current symptom is black.
-- Movie/USM playback as the black-screen cause: the frame is a fully rendered UE4 scene, not a video
-  surface, and no AvPlayer activity accompanies the transition.
-- The `no-effect` draws in the captured frame: all 22 have `cwm=0` with no depth or stencil write.
+- Everything in the **Eliminated** section above.
+- The two withdrawn conclusions in **Superseded analysis** — in particular, do not re-derive "draw 95
+  blacks the frame"; its shader has been read and it is a no-op with the texels it receives.
