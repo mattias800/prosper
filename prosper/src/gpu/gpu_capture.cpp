@@ -926,7 +926,6 @@ bool validate_compute_recompile_state(const GpuCapturedCompute& compute,
         return true;
     }
     const ComputeShaderConfig& config = compute.recompile_config;
-    constexpr uint32_t kNativeStorageFormatMask = (1u << 10) - 1u;
     const bool subgroup_valid = config.native_subgroup_size == 0 ||
         config.native_subgroup_size == 32 || config.native_subgroup_size == 64;
     if ((compute.required_subgroup_size != 0 && compute.required_subgroup_size != 32 &&
@@ -944,7 +943,7 @@ bool validate_compute_recompile_state(const GpuCapturedCompute& compute,
         config.tidig_comp_cnt > 3 || config.lds_bytes > 65536 ||
         (config.lds_bytes & 511u) ||
         config.native_subgroup_size != compute.required_subgroup_size ||
-        (config.native_storage_format_support & ~kNativeStorageFormatMask)) {
+        (config.native_storage_format_support & ~kNativeStorageFormatSupportMask)) {
         error = "invalid compute recompile state";
         return false;
     }

@@ -500,11 +500,6 @@ struct AtomicStats {
 AtomicStats& stats() { static AtomicStats* value = new AtomicStats; return *value; }
 inline void bump(std::atomic<uint64_t>& c) { c.fetch_add(1, std::memory_order_relaxed); }
 
-const AliasRange* alias_at(const WatchState& w, uint64_t addr) {
-    for (const AliasRange& a : w.aliases)
-        if (addr >= a.addr && addr < a.addr + a.size) return &a;
-    return nullptr;
-}
 // Does any recorded alias overlap [begin, end)? O(alias ranges). Lets the notify hooks skip the O(watched
 // pages) purge on the common path: a fresh VA (no reuse) or a non-dmem munmap (every guest heap free).
 bool va_range_has_alias(const WatchState& w, uint64_t begin, uint64_t end) {
@@ -512,17 +507,6 @@ bool va_range_has_alias(const WatchState& w, uint64_t begin, uint64_t end) {
         if (a.addr < end && a.addr + a.size > begin) return true;
     return false;
 }
-// All guest VAs currently mapping `phys` (page-granular). Returns false (leaving `out` empty) if the
-// page is unmapped or any alias is inaccessible (PROT_NONE) -> caller falls back to Unknown.
-bool collect_aliases(const WatchState& w, uint64_t phys, std::vector<PageAlias>& out) {
-    for (const AliasRange& a : w.aliases) {
-        if (phys < a.phys || phys + kPage > a.phys + a.size) continue;
-        if (a.prot == 0) return false;                    // PROT_NONE alias: cannot safely protect
-        out.push_back({a.addr + (phys - a.phys), a.prot});
-    }
-    return !out.empty();
-}
-
 struct ProtectionRun {
     uint64_t addr = 0;
     uint64_t size = 0;
@@ -693,17 +677,75 @@ GuestWriteWatch GuestWriteWatch::create(uint64_t addr, uint64_t size) {
     }
     std::lock_guard lock(w.mutex);
 
-    // First pass: resolve every guest page to a physical page whose full alias set is known. Any gap
-    // (non-dmem heap, PROT_NONE alias, unmapped) aborts to Unknown WITHOUT touching protections.
-    struct Resolved { uint64_t phys; std::vector<PageAlias> aliases; };
+    // Resolve the watched VA pages and every physical alias in linear passes over the mapping table.
+    // The old implementation called alias_at() and collect_aliases() for every 4 KiB page; registering
+    // a 16 MiB video volume therefore rescanned the complete guest mapping table about eight thousand
+    // times. Astro Bot could spend longer creating that watch than rendering the whole intro.
+    //
+    // Any gap (non-dmem heap, PROT_NONE alias, or partial physical alias) still aborts to Unknown
+    // before changing protections. Keep one Resolved entry per watched VA page so duplicate aliases
+    // preserve the existing registration/reference-count contract.
+    struct Resolved { uint64_t phys; };
     std::vector<Resolved> resolved;
+    resolved.reserve(static_cast<size_t>(watch_bytes / kPage));
+
+    std::vector<const AliasRange*> va_aliases;
+    for (const AliasRange& alias : w.aliases) {
+        if (alias.addr < end && alias.addr + alias.size > begin)
+            va_aliases.push_back(&alias);
+    }
+    std::sort(va_aliases.begin(), va_aliases.end(),
+              [](const AliasRange* a, const AliasRange* b) {
+                  return a->addr < b->addr;
+              });
+    size_t va_alias_index = 0;
     for (uint64_t va = begin; va < end; va += kPage) {
-        const AliasRange* a = alias_at(w, va);
-        if (!a) { bump(stats().create_no_mapping); return {}; }
-        const uint64_t phys = a->phys + (va - a->addr);
-        std::vector<PageAlias> al;
-        if (!collect_aliases(w, phys, al)) { bump(stats().create_incomplete_aliases); return {}; }
-        resolved.push_back({phys, std::move(al)});
+        while (va_alias_index < va_aliases.size() &&
+               va_aliases[va_alias_index]->addr + va_aliases[va_alias_index]->size <= va)
+            ++va_alias_index;
+        if (va_alias_index == va_aliases.size() ||
+            va < va_aliases[va_alias_index]->addr) {
+            bump(stats().create_no_mapping);
+            return {};
+        }
+        const AliasRange& alias = *va_aliases[va_alias_index];
+        resolved.push_back({alias.phys + (va - alias.addr)});
+    }
+
+    std::vector<uint64_t> watched_phys;
+    watched_phys.reserve(resolved.size());
+    for (const Resolved& page : resolved) watched_phys.push_back(page.phys);
+    std::sort(watched_phys.begin(), watched_phys.end());
+    watched_phys.erase(std::unique(watched_phys.begin(), watched_phys.end()),
+                       watched_phys.end());
+
+    struct PhysicalAliases {
+        std::vector<PageAlias> aliases;
+        bool inaccessible = false;
+    };
+    std::unordered_map<uint64_t, PhysicalAliases> aliases_by_phys;
+    aliases_by_phys.reserve(watched_phys.size());
+    for (const AliasRange& alias : w.aliases) {
+        const uint64_t alias_phys_end = alias.phys + alias.size;
+        auto physical = std::lower_bound(watched_phys.begin(), watched_phys.end(), alias.phys);
+        while (physical != watched_phys.end() && *physical < alias_phys_end) {
+            const uint64_t page_phys = *physical++;
+            if (page_phys > UINT64_MAX - kPage || page_phys + kPage > alias_phys_end)
+                continue;
+            PhysicalAliases& set = aliases_by_phys[page_phys];
+            if (alias.prot == 0)
+                set.inaccessible = true;
+            else
+                set.aliases.push_back({alias.addr + (page_phys - alias.phys), alias.prot});
+        }
+    }
+    for (uint64_t phys : watched_phys) {
+        const auto found = aliases_by_phys.find(phys);
+        if (found == aliases_by_phys.end() || found->second.inaccessible ||
+            found->second.aliases.empty()) {
+            bump(stats().create_incomplete_aliases);
+            return {};
+        }
     }
 
     // Second pass: get-or-create the WatchedPage per phys, arm newly-referenced pages, build the reg.
@@ -717,7 +759,8 @@ GuestWriteWatch GuestWriteWatch::create(uint64_t addr, uint64_t size) {
         WatchedPage* page;
         if (it == w.pages_by_phys.end()) {
             auto up = std::make_unique<WatchedPage>();
-            up->phys = r.phys; up->aliases = std::move(r.aliases);
+            up->phys = r.phys;
+            up->aliases = std::move(aliases_by_phys[r.phys].aliases);
             page = up.get();
             w.pages_by_phys.emplace(r.phys, std::move(up));
             for (const PageAlias& al : page->aliases) w.pages_by_addr[al.addr & ~(kPage - 1)] = page;
@@ -824,8 +867,8 @@ void guest_write_watch_notify_direct_mapping_added(uint64_t addr, uint64_t size,
     const uint64_t begin = addr & ~(kPage - 1);
     const uint64_t end = (addr + size + kPage - 1) & ~(kPage - 1);
     // VA-reuse safety: only if this VA range still carries stale coverage (rare: a MAP_FIXED reuse of a VA
-    // never unmapped) do we purge it and its topology before recording the new alias, so alias_at() can't
-    // resolve to the old phys. The common fresh-VA path skips the O(watched pages) scan.
+    // never unmapped) do we purge it and its topology before recording the new alias, so a later watch
+    // cannot resolve to the old phys. The common fresh-VA path skips the O(watched pages) scan.
     if (va_range_has_alias(w, begin, end)) purge_va_range_locked(w, begin, end, /*remove_topology=*/true);
     w.aliases.push_back({addr, size, phys, protection});
 

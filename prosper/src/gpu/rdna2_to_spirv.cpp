@@ -8571,6 +8571,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // image+sampler). Other opcodes / NSA / gradient / compare variants are rejected (deferred).
             if (!allow_smem || !rt) { ok = false; return true; }
             const uint32_t SQ_DIM_2D = 1u;
+            const uint32_t SQ_DIM_3D = 2u;
             auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
 
             // IMAGE_BVH_INTERSECT_RAY (GFX10 opcode 0xe6) has an image encoding but consumes a
@@ -8841,10 +8842,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 const bool ordinary_2d = res->img_dim == 1 && res->depth == 1 &&
                                          !res->depth_compare;
-                const bool native_float = ordinary_2d && native_float_storage_image_supported(
-                    res->format, components, res->srgb,
-                    (b.native_storage_format_support &
-                     native_storage_format_support_bit(res->format, components)) != 0);
+                const bool ordinary_3d = in.mimg_dim == SQ_DIM_3D && res->img_dim == 2 &&
+                                         res->depth && !arrayed && !ms &&
+                                         !res->depth_compare;
+                const uint32_t native_support_bit = ordinary_3d
+                    ? native_storage_3d_format_support_bit(res->format, components)
+                    : native_storage_format_support_bit(res->format, components);
+                const bool native_float = (ordinary_2d || ordinary_3d) &&
+                    native_float_storage_image_supported(
+                        res->format, components, res->srgb,
+                        (b.native_storage_format_support & native_support_bit) != 0);
                 const bool packed_r11 = !native_float && b.packed_r11_storage && ordinary_2d &&
                     !arrayed && !ms && !is_atomic &&
                     res->format == DataFormat::Float10_11_11 && components == 3;

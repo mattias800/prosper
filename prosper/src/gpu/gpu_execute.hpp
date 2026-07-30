@@ -638,8 +638,9 @@ struct SharedVulkanContext {
     uint32_t max_compute_workgroup_subgroups = 0;
     uint32_t max_compute_workgroup_size_x = 0;
     uint32_t max_compute_workgroup_invocations = 0;
-    // Vulkan-independent mask from native_storage_format_support_bit(). The renderer queries
-    // optimal-tiling STORAGE_IMAGE support before publishing its physical device.
+    // Vulkan-independent mask from native_storage_format_support_bit() and its 3D counterpart. The
+    // renderer queries dimension-specific optimal-tiling STORAGE_IMAGE support before publishing
+    // its physical device.
     uint32_t native_storage_format_support = 0;
     bool compute_queue_supported = false;
     // Present unification (#1270): when present_capable, prosper-app may create its window surface on

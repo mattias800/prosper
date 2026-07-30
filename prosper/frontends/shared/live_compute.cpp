@@ -168,6 +168,7 @@ bool direct_sampled_rtt_compatible(prosper::gpu::DataFormat format, uint32_t com
 namespace {
 
 std::atomic<uint64_t> g_buffer_gpu_result_skips{0};
+std::atomic<uint64_t> g_compute_storage_transfer_seeds{0};
 std::atomic<bool> g_fail_next_storage_readback_for_test{false};
 
 VkFormat native_storage_vk_format(prosper::gpu::DataFormat format, uint32_t components) {
@@ -198,17 +199,22 @@ VkFormat native_storage_vk_format(prosper::gpu::DataFormat format, uint32_t comp
 }
 
 bool native_storage_image_create_supported(VkPhysicalDevice physical, VkFormat format,
-                                           uint32_t width, uint32_t height,
+                                           VkImageType image_type, uint32_t width,
+                                           uint32_t height, uint32_t depth,
+                                           uint32_t array_layers,
                                            VkImageUsageFlags extra_usage = 0) {
-    if (!physical || format == VK_FORMAT_UNDEFINED || !width || !height) return false;
+    if (!physical || format == VK_FORMAT_UNDEFINED || !width || !height || !depth ||
+        !array_layers)
+        return false;
     const VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT |
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | extra_usage;
     VkImageFormatProperties properties{};
     return vkGetPhysicalDeviceImageFormatProperties(
-               physical, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+               physical, format, image_type, VK_IMAGE_TILING_OPTIMAL,
                usage, 0, &properties) == VK_SUCCESS &&
            width <= properties.maxExtent.width && height <= properties.maxExtent.height &&
-           properties.maxExtent.depth >= 1 && properties.maxArrayLayers >= 1;
+           depth <= properties.maxExtent.depth &&
+           array_layers <= properties.maxArrayLayers;
 }
 
 // Storage images use an RGBA32_UINT interchange surface so format conversion remains bit-exact on
@@ -686,6 +692,8 @@ struct CachedComputeImage {
     // dispatch can leave the old guest mirror valid while making the Vulkan result unknowable.
     prosper::gpu::GuestGpuWriteSnapshot graphics_export_snapshot;
     bool graphics_export_valid = false;
+    prosper::gpu::GuestGpuWriteSnapshot compute_transfer_snapshot;
+    bool compute_transfer_valid = false;
     std::vector<uint8_t> source_snapshot;
     // Exact row-major bytes produced by the last storage dispatch. Full-overwrite post-processes
     // commonly reproduce the same large target on successive frames. Retaining the result lets a
@@ -821,6 +829,12 @@ size_t compute_write_watch_promotion_budget_bytes() {
 bool adaptive_storage_result_validation_enabled() {
     static const bool enabled =
         std::getenv("PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION") == nullptr;
+    return enabled;
+}
+
+bool native_3d_transfer_enabled() {
+    static const bool enabled =
+        std::getenv("PROSPER_NO_NATIVE_3D_COMPUTE_TRANSFER") == nullptr;
     return enabled;
 }
 
@@ -1559,13 +1573,16 @@ struct VulkanComputeContext {
             // submit leaves this false, so the next use refreshes instead of skipping stale pixels.
             cached.content_valid = false;
             cached.graphics_export_valid = false;
+            cached.compute_transfer_valid = false;
         }
         return true;
     }
 
     void invalidate_cached_image_export(const ComputeImageCacheKey& key) {
         const auto found = image_cache.find(key);
-        if (found != image_cache.end()) found->second.graphics_export_valid = false;
+        if (found == image_cache.end()) return;
+        found->second.graphics_export_valid = false;
+        found->second.compute_transfer_valid = false;
     }
 
     void authorize_cached_image_export(const ComputeImageCacheKey& key) {
@@ -1574,6 +1591,14 @@ struct VulkanComputeContext {
             return;
         found->second.graphics_export_snapshot = prosper::gpu::guest_gpu_write_snapshot();
         found->second.graphics_export_valid = true;
+    }
+
+    void authorize_cached_image_compute_transfer(const ComputeImageCacheKey& key) {
+        const auto found = image_cache.find(key);
+        if (found == image_cache.end() || !found->second.content_valid || !found->second.image)
+            return;
+        found->second.compute_transfer_snapshot = prosper::gpu::guest_gpu_write_snapshot();
+        found->second.compute_transfer_valid = true;
     }
 
     bool borrow_cached_image_for_graphics(const ComputeImageCacheKey& key,
@@ -1589,6 +1614,43 @@ struct VulkanComputeContext {
         const bool watch_unchanged = !submit_unchanged && cached.write_watch &&
             cached.write_watch.query() == prosper::host::GuestWriteWatchQuery::Unchanged;
         if (!submit_unchanged && !watch_unchanged) return false;
+        cached.last_use = ++image_cache_clock;
+        ++cached.pins;
+        image = cached.image;
+        return true;
+    }
+
+    bool borrow_cached_image_for_compute_transfer(const ComputeImageCacheKey& key,
+                                                  VkImage& image, bool trace = false) {
+        const auto found = image_cache.find(key);
+        if (found == image_cache.end()) {
+            if (trace) std::fprintf(stderr, "[compute]   native 3D transfer miss: no storage cache\n");
+            return false;
+        }
+        CachedComputeImage& cached = found->second;
+        if (!cached.compute_transfer_valid || !cached.content_valid || !cached.image) {
+            if (trace)
+                std::fprintf(stderr,
+                             "[compute]   native 3D transfer miss: export=%u content=%u image=%u\n",
+                             cached.compute_transfer_valid ? 1u : 0u,
+                             cached.content_valid ? 1u : 0u, cached.image ? 1u : 0u);
+            return false;
+        }
+        const prosper::gpu::GuestGpuWriteQuery submit_query =
+            prosper::gpu::guest_gpu_writes_since(cached.compute_transfer_snapshot,
+                                                  key.gpu_addr, key.guest_bytes);
+        const bool submit_unchanged =
+            submit_query == prosper::gpu::GuestGpuWriteQuery::Unchanged;
+        const bool watch_unchanged = !submit_unchanged && cached.write_watch &&
+            cached.write_watch.query() == prosper::host::GuestWriteWatchQuery::Unchanged;
+        if (!submit_unchanged && !watch_unchanged) {
+            if (trace)
+                std::fprintf(stderr,
+                             "[compute]   native 3D transfer miss: submit-query=%u watch=%u\n",
+                             static_cast<unsigned>(submit_query),
+                             cached.write_watch ? 1u : 0u);
+            return false;
+        }
         cached.last_use = ++image_cache_clock;
         ++cached.pins;
         image = cached.image;
@@ -1626,6 +1688,7 @@ struct VulkanComputeContext {
         CachedComputeImage& cached = found->second;
         cached.content_valid = false;
         cached.graphics_export_valid = false;
+        cached.compute_transfer_valid = false;
         cached.write_watch.reset();
         if (!cached.source_snapshot.empty())
             std::vector<uint8_t>().swap(cached.source_snapshot);
@@ -1636,10 +1699,24 @@ struct VulkanComputeContext {
         cached.validation_result = false;
     }
 
+    void validate_cached_image_source_from_compute_transfer(
+        const ComputeImageCacheKey& key) {
+        const auto found = image_cache.find(key);
+        if (found == image_cache.end()) return;
+        CachedComputeImage& cached = found->second;
+        cached.content_valid = true;
+        cached.validation_snapshot = prosper::gpu::guest_gpu_write_snapshot();
+        cached.write_watch_stable_validations = 0;
+        cached.write_watch.reset();
+        if (!cached.source_snapshot.empty())
+            std::vector<uint8_t>().swap(cached.source_snapshot);
+    }
+
     void validate_cached_image_source(const ComputeImageCacheKey& key,
                                       const uint8_t* current_source = nullptr,
                                       bool result_unchanged = false,
-                                      bool source_snapshot_required = true) {
+                                      bool source_snapshot_required = true,
+                                      bool compute_transfer_watch = false) {
         auto found = image_cache.find(key);
         if (found == image_cache.end()) return;
         CachedComputeImage& cached = found->second;
@@ -1683,7 +1760,15 @@ struct VulkanComputeContext {
         // queries walk one record per host page and were slower than memcmp for Plucky's stable
         // post-process targets. A repeated result keeps one collision-free baseline; an identical
         // GPU skip never reaches this function, so that baseline is not recopied.
-        cached.write_watch.reset();
+        if (compute_transfer_watch) {
+            if (cached.write_watch && !cached.write_watch.rearm())
+                cached.write_watch.reset();
+            if (!cached.write_watch)
+                cached.write_watch = prosper::host::GuestWriteWatch::create(
+                    key.gpu_addr, key.guest_bytes);
+        } else {
+            cached.write_watch.reset();
+        }
         if (!source_was_valid) {
             // A failed dispatch/readback may have advanced the retained GPU result while leaving
             // guest memory at the old baseline. The successful repair must replace that invalidated
@@ -2045,6 +2130,12 @@ struct BoundImage {
     size_t compare_flag_index = SIZE_MAX;
     bool gpu_result_unchanged = false;
     ComputeImageCacheKey cache_key{};
+    // A prior native storage result can seed the sampled cache with a device-local copy. It remains
+    // a distinct image because a dispatch may sample the old guest value while writing a new value
+    // to the same address; binding one VkImage for both would introduce an in-dispatch data race.
+    VkImage compute_transfer_seed = VK_NULL_HANDLE;
+    ComputeImageCacheKey compute_transfer_seed_key{};
+    bool compute_transfer_seed_borrowed = false;
     std::vector<uint8_t> cache_source_snapshot; // first-use source captured before the transfer
     bool seed_skip = false;             // #1122: write-only full-coverage storage image; no seed needed
     bool poison_verify = false;         // #1122: proving frame -- seed poison, prove full coverage
@@ -2768,6 +2859,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (images[i].alias_of != SIZE_MAX) continue;
             if (images[i].sampler) vkDestroySampler(ctx.device, images[i].sampler, nullptr);
             if (images[i].view) vkDestroyImageView(ctx.device, images[i].view, nullptr);
+            if (images[i].compute_transfer_seed_borrowed)
+                ctx.release_cached_image(images[i].compute_transfer_seed_key);
             if (images[i].persistent) {
                 // A failed submit/readback can leave the retained VkImage and its exact-result
                 // baseline newer than guest memory. Force the retry to upload and publish again;
@@ -3047,14 +3140,21 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 r->format == DataFormat::Float10_11_11 && descriptor_components == 3;
             const bool ordinary_2d_storage = r->img_dim == 1 && r->depth == 1 &&
                                              !r->depth_compare;
+            const bool ordinary_3d_storage = r->img_dim == 2 && r->depth &&
+                                             !r->depth_compare;
+            const VkImageType native_storage_type = ordinary_3d_storage
+                ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
             // vkGetPhysicalDeviceImageFormatProperties is a driver query, not a cheap metadata
             // lookup. Sampled and raw-uvec4 descriptors cannot take this typed-storage path, so do
             // not repeat that query for every one of their per-frame bindings.
             const bool native_storage_supported = spirv_native_storage &&
                 native_float_storage_image_supported(
                     r->format, descriptor_components, r->srgb,
-                    ordinary_2d_storage && native_storage_image_create_supported(
-                        ctx.physical, native_storage_format, r->width, r->height));
+                    (ordinary_2d_storage || ordinary_3d_storage) &&
+                        native_storage_image_create_supported(
+                            ctx.physical, native_storage_format, native_storage_type,
+                            r->width, r->height,
+                            ordinary_3d_storage ? r->depth : 1u, 1u));
             if (spirv_native_storage && !native_storage_supported) {
                 skip_image(r, "compiled typed storage format is unsupported by this device");
                 break;
@@ -3063,9 +3163,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // if this replay device supports the optional typed format, while a live module is only
             // emitted as float after the frontend's physical-device feature query.
             bi.native_float_storage = spirv_native_storage;
-            bi.graphics_sampled_usage = bi.native_float_storage &&
+            bi.graphics_sampled_usage = bi.native_float_storage && ordinary_2d_storage &&
                 native_storage_image_create_supported(
-                    ctx.physical, native_storage_format, r->width, r->height,
+                    ctx.physical, native_storage_format, VK_IMAGE_TYPE_2D,
+                    r->width, r->height, 1u, 1u,
                     VK_IMAGE_USAGE_SAMPLED_BIT);
             if (trace)
                 std::fprintf(stderr,
@@ -3609,12 +3710,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // R32 image to RGBA32F every dispatch. Three-channel optimal images are not universally
             // supported, so retain the portable four-channel expansion for that uncommon case.
             const bool sampled_float32_native = sampled_float32 && sampled_components != 3;
-            // Imported renderer-owned RGBA16F is already the exact native sampled representation.
-            // Guest-backed FP16 retains the historical RGBA8 conversion: native RG16F sampling is
-            // exact, but was measured 7x slower in Astro Bot's full-resolution composite on RADV.
-            const bool sampled_float16_native = !bi.storage && bi.imported &&
-                                                r->format == DataFormat::Float16 &&
-                                                sampled_components == 4;
+            // Renderer imports and compute 3D RGBA16F textures can use their exact native sampled
+            // representation. Narrowing a volume to RGBA8 discarded its HDR range and prevented a
+            // retained native storage result from seeding the next ping-pong sample on the GPU.
+            // Ordinary guest-backed 2D FP16 keeps its historical RGBA8 conversion: native RGBA16F
+            // sampling was measured 7x slower in Astro Bot's full-resolution composite on RADV.
+            const bool sampled_float16_native = !bi.storage &&
+                r->format == DataFormat::Float16 && sampled_components == 4 &&
+                (bi.imported || dim_3d);
             const bool sampled_unorm8x2 = !bi.storage && r->format == DataFormat::Unorm8 &&
                                           sampled_components == 2;
             const bool sampled_unorm16_native = !bi.storage && r->format == DataFormat::Unorm16 &&
@@ -3854,9 +3957,36 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         r->mip_tail_x, r->mip_tail_y,
                         static_cast<uint32_t>(image_format), bi.storage, r->in_mip_tail,
                         r->srgb, r->depth_compare};
+                    // A native typed 3D storage result is byte- and format-identical to the sampled
+                    // upload that follows it. Borrow that retained result only as a TRANSFER source:
+                    // the sampled cache remains a separate image so a read/modify/write dispatch can
+                    // sample the old volume while producing its replacement at the same guest address.
+                    const VkFormat native_format =
+                        native_storage_vk_format(r->format, sampled_components);
+                    if (dim_3d && !r->host_data && native_format == image_format &&
+                        adaptive_storage_result_validation_enabled() &&
+                        native_3d_transfer_enabled()) {
+                        const ComputeImageCacheKey storage_key = storage_image_cache_key(
+                            *r, static_cast<uint32_t>(sampled_guest_need), native_format);
+                        if (ctx.borrow_cached_image_for_compute_transfer(
+                                storage_key, bi.compute_transfer_seed, trace)) {
+                            bi.compute_transfer_seed_key = storage_key;
+                            bi.compute_transfer_seed_borrowed = true;
+                            g_compute_storage_transfer_seeds.fetch_add(
+                                1, std::memory_order_relaxed);
+                            if (trace)
+                                std::fprintf(stderr,
+                                             "[compute]   sampled 3D binding=%u addr=0x%llx "
+                                             "seeded from retained native storage image\n",
+                                             bi.binding,
+                                             (unsigned long long)r->gpu_addr);
+                        }
+                    }
                     bi.persistent = ctx.acquire_cached_image(
-                        bi.cache_key, sampled_guest_source, image_validation_epoch,
-                        bi.image, bi.memory, bi.upload_skipped);
+                        bi.cache_key,
+                        bi.compute_transfer_seed_borrowed ? nullptr : sampled_guest_source,
+                        image_validation_epoch, bi.image, bi.memory, bi.upload_skipped,
+                        !bi.compute_transfer_seed_borrowed);
                     if (bi.persistent && bi.upload_skipped)
                         g_sampled_image_upload_skips.fetch_add(1, std::memory_order_relaxed);
                     if (trace && bi.persistent)
@@ -3865,7 +3995,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      "addr=0x%llx guest=%zu upload-skipped=%u\n",
                                      bi.binding, (unsigned long long)r->gpu_addr,
                                      sampled_guest_need, bi.upload_skipped ? 1u : 0u);
-                    if (!bi.persistent)
+                    if (!bi.persistent && !bi.compute_transfer_seed_borrowed)
                         bi.cache_source_snapshot.assign(
                             sampled_guest_source,
                             sampled_guest_source + sampled_guest_need);
@@ -3877,11 +4007,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // here -- an extra 132 MiB CPU pass for Astro Bot's 4K RGBA32 storage representation.
             ScopedMappedMemory upload_mapping(ctx);
             const size_t upload_size = (bi.imported || bi.seed_skip ||
-                                        bi.seed_from_imported != SIZE_MAX)
+                                        bi.seed_from_imported != SIZE_MAX ||
+                                        bi.compute_transfer_seed_borrowed)
                 ? size_t{0} : (size_t)sbytes;
             // A retained storage image still needs a fresh destination for its post-dispatch
             // transfer. Only a read-only sampled cache hit can omit staging altogether.
-            if (!bi.imported && (bi.storage || !(bi.persistent && bi.upload_skipped))) {
+            if (!bi.imported &&
+                (bi.storage || (!bi.compute_transfer_seed_borrowed &&
+                                !(bi.persistent && bi.upload_skipped)))) {
                 VkBufferCreateInfo sci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
                 sci.size = sbytes;
                 sci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -3900,6 +4033,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
                 upload_mapping.memory = staging_memory[i];
                 if (!bi.seed_skip && bi.seed_from_imported == SIZE_MAX &&
+                    !bi.compute_transfer_seed_borrowed &&
                     !(bi.persistent && bi.upload_skipped) &&
                     !vk_ok(ctx.map_memory(staging_memory[i], 0, sbytes,
                                           &upload_mapping.data), "image-staging-map")) {
@@ -4295,7 +4429,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 } else {
                     const size_t need = sampled_guest_need;
                     const uint8_t* src = sampled_guest_source;
-                    if (!bi.upload_skipped && bpb) {                 // BCn: (block-detile ->) decode
+                    const bool needs_sampled_upload = !bi.upload_skipped &&
+                        !bi.compute_transfer_seed_borrowed;
+                    if (needs_sampled_upload && bpb) {               // BCn: (block-detile ->) decode
                         const uint32_t bw = (r->width + 3) / 4, bh = (r->height + 3) / 4;
                         const size_t linear_slice = static_cast<size_t>(bw) * bh * bpb;
                         const uint32_t layers = sampled_layers;
@@ -4350,7 +4486,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             }
                         }
                         if (!images_ready) break;
-                    } else if (!bi.upload_skipped) {
+                    } else if (needs_sampled_upload) {
                         const uint32_t bpt = r11g11b10 ? 4u : cb * nc;
                         const size_t linear_bytes = static_cast<size_t>(volume_texels) * bpt;
                         std::unique_ptr<uint8_t[]> linear;
@@ -4441,7 +4577,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             sampled_unorm8x2 || sampled_unorm16_native ||
                             sampled_uint8_native || sampled_uint16_native ||
                             sampled_uint32_native || sampled_float32_native ||
-                            sampled_depth) {                            // Native sampled texels
+                            sampled_float16_native || sampled_depth) {  // Native sampled texels
                             std::memcpy(upload, sampled_source, linear_bytes);
                         } else if (f32) {                           // Native float channels + default fill
                             parallel_compute_texels(texels, linear_bytes + texels * 16u,
@@ -4941,6 +5077,69 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      1, &to_general);
                 continue;
             }
+            if (bi.compute_transfer_seed_borrowed) {
+                VkImageMemoryBarrier source_to_copy{
+                    VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                source_to_copy.srcAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                    VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                    VK_ACCESS_TRANSFER_WRITE_BIT;
+                source_to_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                source_to_copy.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                source_to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                source_to_copy.srcQueueFamilyIndex = source_to_copy.dstQueueFamilyIndex =
+                    VK_QUEUE_FAMILY_IGNORED;
+                source_to_copy.image = bi.compute_transfer_seed;
+                source_to_copy.subresourceRange = {
+                    VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, bi.array_layers};
+                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                                     nullptr, 1, &source_to_copy);
+
+                VkImageMemoryBarrier target_to_copy{
+                    VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                target_to_copy.srcAccessMask = bi.persistent
+                    ? VK_ACCESS_SHADER_READ_BIT : 0u;
+                target_to_copy.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                target_to_copy.oldLayout = bi.persistent
+                    ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+                target_to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                target_to_copy.srcQueueFamilyIndex = target_to_copy.dstQueueFamilyIndex =
+                    VK_QUEUE_FAMILY_IGNORED;
+                target_to_copy.image = bi.image;
+                target_to_copy.subresourceRange = {
+                    VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, bi.array_layers};
+                vkCmdPipelineBarrier(command,
+                                     bi.persistent ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                                                   : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                                     nullptr, 1, &target_to_copy);
+
+                VkImageCopy copy{};
+                copy.srcSubresource = {
+                    VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, bi.array_layers};
+                copy.dstSubresource = copy.srcSubresource;
+                copy.extent = {r->width,
+                               bi.stacked_cube ? r->height * 6u : r->height,
+                               bi.array_layers > 1 ? 1u : bi.texel_depth};
+                vkCmdCopyImage(command, bi.compute_transfer_seed,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               bi.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+                VkImageMemoryBarrier ready[2]{source_to_copy, target_to_copy};
+                ready[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                ready[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                         VK_ACCESS_SHADER_WRITE_BIT;
+                ready[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                ready[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                ready[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                ready[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                ready[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                ready[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
+                                     0, nullptr, 2, ready);
+                continue;
+            }
             if (bi.seed_from_imported != SIZE_MAX) {
                 const BoundImage& source = images[bi.seed_from_imported];
                 VkImageMemoryBarrier source_to_copy{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -5303,8 +5502,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 });
             if (replaced_by_storage) continue;
             if (image.persistent) {
-                if (!image.upload_skipped)
-                    ctx.validate_cached_image_source(image.cache_key);
+                if (!image.upload_skipped) {
+                    if (image.compute_transfer_seed_borrowed)
+                        ctx.validate_cached_image_source_from_compute_transfer(
+                            image.cache_key);
+                    else
+                        ctx.validate_cached_image_source(image.cache_key);
+                }
             } else if (image.image && image.memory && image.allocation_bytes &&
                        ctx.retain_image(image.cache_key, image.image, image.memory,
                                         image.allocation_bytes,
@@ -5726,7 +5930,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     // target needs no source snapshot; the first repeated result retains one exact
                     // baseline, and subsequent identical GPU skips do not recopy it.
                     ctx.validate_cached_image_source(
-                        bi.cache_key, destination, bi.gpu_result_unchanged, !bi.seed_skip);
+                        bi.cache_key, destination, bi.gpu_result_unchanged, !bi.seed_skip,
+                        bi.seed_skip && bi.native_float_storage && r->img_dim == 2 &&
+                            native_3d_transfer_enabled());
                 } else if (bi.image && bi.memory && bi.allocation_bytes &&
                            ctx.retain_image(bi.cache_key, bi.image, bi.memory,
                                             bi.allocation_bytes, destination)) {
@@ -5764,12 +5970,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (!readback_ok) break;
         const auto writeback_publish_start = ComputeClock::now();
         // Every storage image is back in GENERAL, all exact guest writebacks/notifications have
-        // completed, and a failed dispatch cannot reach here. Publish only retained native results;
-        // raw interchange images are never descriptor-compatible with a graphics sampled view.
+        // completed, and a failed dispatch cannot reach here. Native results may seed a later
+        // sampled cache with a device-local copy; only 2D images created with SAMPLED usage may also
+        // be exported directly to graphics. Raw interchange images are compatible with neither.
         for (const BoundImage& image : images) {
-            if (image.storage && image.native_float_storage && image.graphics_sampled_usage &&
-                image.alias_of == SIZE_MAX &&
-                image.cache_candidate && image.persistent)
+            if (!image.storage || !image.native_float_storage ||
+                image.alias_of != SIZE_MAX || !image.cache_candidate || !image.persistent)
+                continue;
+            ctx.authorize_cached_image_compute_transfer(image.cache_key);
+            if (image.graphics_sampled_usage)
                 ctx.authorize_cached_image_export(image.cache_key);
         }
         writeback_publish_ms = std::chrono::duration<double, std::milli>(
@@ -5906,6 +6115,22 @@ uint64_t live_compute_buffer_gpu_result_skips() {
 
 uint64_t live_compute_sampled_image_upload_skips() {
     return g_sampled_image_upload_skips.load(std::memory_order_relaxed);
+}
+
+uint64_t live_compute_storage_transfer_seeds() {
+    return g_compute_storage_transfer_seeds.load(std::memory_order_relaxed);
+}
+
+bool live_compute_native_storage_3d_supported(prosper::gpu::DataFormat format,
+                                              uint32_t components,
+                                              uint32_t width, uint32_t height,
+                                              uint32_t depth) {
+    VulkanComputeContext* context = g_live_compute_context;
+    if (!context || !context->physical) return false;
+    const VkFormat native_format = native_storage_vk_format(format, components);
+    return native_storage_image_create_supported(
+        context->physical, native_format, VK_IMAGE_TYPE_3D,
+        width, height, depth, 1u);
 }
 
 uint64_t live_compute_cpu_fill_dispatches() {
@@ -6087,13 +6312,15 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
                          (unsigned long long)pool.discarded);
             std::fprintf(stderr,
                          "[render-timing] compute_image_source snapshots=%llu %.1f MiB "
-                         "storage_results=%llu %.1f MiB\n",
+                         "storage_results=%llu %.1f MiB gpu_transfer_seeds=%llu\n",
                          (unsigned long long)context.image_source_snapshot_copies,
                          static_cast<double>(context.image_source_snapshot_bytes) /
                              (1024.0 * 1024.0),
                          (unsigned long long)context.storage_result_snapshot_copies,
                          static_cast<double>(context.storage_result_snapshot_bytes) /
-                             (1024.0 * 1024.0));
+                             (1024.0 * 1024.0),
+                         (unsigned long long)g_compute_storage_transfer_seeds.load(
+                             std::memory_order_relaxed));
             std::fprintf(stderr,
                          "[render-window] compute calls=%llu dispatches=%.1f avg_ms=%.2f\n",
                          (unsigned long long)window.calls,
