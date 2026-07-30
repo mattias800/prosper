@@ -3581,9 +3581,10 @@ bool instruction_may_change_exec(const Rdna2Inst& in) {
     if (in.fmt == Rdna2Format::VOPC && vopc_is_cmpx(in.opcode)) return true;
     // saveexec writes EXEC implicitly while its explicit destination receives the previous mask.
     if (in.fmt == Rdna2Format::SOP1 &&
-        (in.opcode == 0x24 || in.opcode == 0x25 || in.opcode == 0x28 ||
-         in.opcode == 0x37 || in.opcode == 0x3c || in.opcode == 0x40 ||
-         in.opcode == 0x44)) return true;
+        ((in.opcode >= 0x24 && in.opcode <= 0x2b) ||
+         in.opcode == 0x37 || in.opcode == 0x38 ||
+         in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44))
+        return true;
     auto is_exec = [](const Operand& operand) {
         return (operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special) &&
                (operand.value == 126 || operand.value == 127);
