@@ -99,6 +99,9 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
 // Monotonic diagnostic count of writable-buffer results whose exact GPU comparison avoided a host
 // mapping/scan. Exposed so the production-backend test can prove that optimization path executes.
 uint64_t live_compute_buffer_gpu_result_skips();
+// Monotonic diagnostic count of retained sampled-image hits whose validated source omitted upload.
+// Capture/replay tests use this to prove residency without relying on timing-sensitive assertions.
+uint64_t live_compute_sampled_image_upload_skips();
 
 // Deterministic failure injection for the storage-image recovery regression test. The next storage
 // readback fails after dispatch, exercising retained-image invalidation without a Vulkan fault.
