@@ -3998,7 +3998,9 @@ bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
     // deliberately does not consume an armed interactive request when semantic_draw_count is zero.
     std::unique_ptr<PendingGpuCapture> pending_capture;
     std::vector<SubmitOperation> capture_operations;
-    const bool can_defer_capture = st.dma_copies.empty();
+    const bool can_defer_capture = std::any_of(
+        st.dispatches.begin(), st.dispatches.end(),
+        [](const GpuState::Dispatch& dispatch) { return dispatch.indirect; });
     if (const char* capture_path = std::getenv("PROSPER_GPU_CAPTURE");
         capture_path && *capture_path) {
         capture_operations = plan_submit_operations(st);
@@ -4006,6 +4008,8 @@ bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
             {}, {}, capture_operations, present_width(), present_height(), &st, submit_no,
             static_cast<uint64_t>(st.draws.size()), nullptr, can_defer_capture);
     }
+    snapshot_pending_gpu_capture_compute_gds(
+        pending_capture.get(), g_compute_gds.data(), g_compute_gds.size());
     OrderedGpustateCaptureTrace capture_trace;
     const OrderedSubmitResult result = execute_ordered_gpustate(
         st, 0, 0, submit_no, {}, g_compute,
@@ -4809,7 +4813,7 @@ std::vector<DrawItem> realize_gpustate_draws_parallel(
 }
 
 namespace {
-enum class RetainedSubmitKind : uint8_t { Draw, Dispatch, DmaCopy, MemoryEffect };
+enum class RetainedSubmitKind : uint8_t { Draw, Dispatch, DmaCopy, ParserStall, MemoryEffect };
 struct RetainedSubmitOperation {
     RetainedSubmitKind kind;
     size_t index;
@@ -4992,7 +4996,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     }
     std::vector<RetainedSubmitOperation> executable;
     executable.reserve(st.draws.size() + st.dispatches.size() + st.dma_copies.size() +
-                       st.ordered_memory_effects.size());
+                       st.parser_stalls.size() + st.ordered_memory_effects.size());
     for (size_t i = 0; i < st.draws.size(); ++i)
         if (retained_draw_selected(st, i))
             executable.push_back({RetainedSubmitKind::Draw, i, st.draws[i].command_order});
@@ -5000,6 +5004,9 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
         executable.push_back({RetainedSubmitKind::Dispatch, i, st.dispatches[i].command_order});
     for (size_t i = 0; i < st.dma_copies.size(); ++i)
         executable.push_back({RetainedSubmitKind::DmaCopy, i, st.dma_copies[i].command_order});
+    for (size_t i = 0; i < st.parser_stalls.size(); ++i)
+        executable.push_back({RetainedSubmitKind::ParserStall, i,
+                              st.parser_stalls[i].command_order});
     for (size_t i = 0; i < st.ordered_memory_effects.size(); ++i)
         executable.push_back({RetainedSubmitKind::MemoryEffect, i,
                               st.ordered_memory_effects[i].cmd.stream_order});
@@ -5022,6 +5029,8 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     const float scale_x = full_width ? static_cast<float>(width) / full_width : 1.0f;
     const float scale_y = full_height ? static_cast<float>(height) / full_height : 1.0f;
     OrderedSubmitResult result;
+    bool producer_epoch_ok = true;
+    bool indirect_dependencies_ok = true;
     bool final_callback_sent = false;
     std::vector<DrawItem> span;
     auto flush_span = [&](bool authoritative_readback = false) {
@@ -5041,6 +5050,15 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
         switch (operation.kind) {
             case RetainedSubmitKind::Draw: {
                 if (!render) break;
+                if (st.draws[operation.index].indirect &&
+                    (!indirect_dependencies_ok || !producer_epoch_ok)) {
+                    if (capture_trace) {
+                        capture_trace->failures.push_back({
+                            SubmitOperationKind::Draw, operation.index,
+                            operation.command_order, RealizationFailureReason::Unknown});
+                    }
+                    break;
+                }
                 DrawItem item;
                 if (realize_retained_draw(st, operation.index, scale_x, scale_y, item)) {
                     if (capture_trace) capture_trace->draws.push_back(item);
@@ -5050,16 +5068,46 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
             }
             case RetainedSubmitKind::Dispatch: {
                 flush_span();
-                if (!compute) break;
+                const bool indirect = st.dispatches[operation.index].indirect;
+                if (indirect && (!indirect_dependencies_ok || !producer_epoch_ok)) {
+                    if (capture_trace) {
+                        capture_trace->failures.push_back({
+                            SubmitOperationKind::Dispatch, operation.index,
+                            operation.command_order, RealizationFailureReason::Unknown});
+                    }
+                    producer_epoch_ok = false;
+                    break;
+                }
+                if (!compute) {
+                    if (capture_trace) {
+                        capture_trace->failures.push_back({
+                            SubmitOperationKind::Dispatch, operation.index,
+                            operation.command_order, RealizationFailureReason::Unknown});
+                    }
+                    producer_epoch_ok = false;
+                    break;
+                }
                 ComputeItem item;
                 OperationRealizationFailure failure;
                 if (realize_retained_compute(
                         st, operation.index, submit_no, item,
                         capture_trace ? &failure : nullptr)) {
-                    if (capture_trace) capture_trace->computes.push_back(item);
-                    result.compute_executed |= compute({std::move(item)});
+                    const bool executed = capture_trace
+                        ? compute({item}) : compute({std::move(item)});
+                    if (capture_trace && executed)
+                        capture_trace->computes.push_back(std::move(item));
+                    if (capture_trace && !executed) {
+                        capture_trace->failures.push_back({
+                            SubmitOperationKind::Dispatch, operation.index,
+                            operation.command_order, RealizationFailureReason::Unknown});
+                    }
+                    result.compute_executed |= executed;
+                    producer_epoch_ok &= executed;
                 } else if (capture_trace && failure.reason != RealizationFailureReason::None) {
                     capture_trace->failures.push_back(std::move(failure));
+                    producer_epoch_ok = false;
+                } else {
+                    producer_epoch_ok = false;
                 }
                 break;
             }
@@ -5075,13 +5123,22 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                         std::fprintf(stderr,
                                      "[agc] DMA_DATA live-target source range invalid: src=0x%llx bytes=%u\n",
                                      static_cast<unsigned long long>(copy.src), copy.bytes);
+                    producer_epoch_ok = false;
                     break;
                 }
-                execute_ordered_dma_copy(
+                const bool executed = execute_ordered_dma_copy(
                     copy, source_result == LiveTargetByteReadResult::Success
                               ? current_source.data() : nullptr);
+                producer_epoch_ok &= executed;
                 break;
             }
+            case RetainedSubmitKind::ParserStall:
+                flush_span();
+                // Once an argument-producing epoch fails, a later empty/redundant stall cannot
+                // make the stale bytes trustworthy again. Keep the submit poisoned until it ends.
+                indirect_dependencies_ok &= producer_epoch_ok;
+                producer_epoch_ok = true;
+                break;
             case RetainedSubmitKind::MemoryEffect:
                 flush_span();
                 execute_ordered_memory_effect(st.ordered_memory_effects[operation.index]);
@@ -5345,6 +5402,8 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
         draws, computes, operations, width, height, &st, submit_no,
         static_cast<uint64_t>(st.draws.size()), nullptr,
         /*defer_materialization=*/has_indirect);
+    snapshot_pending_gpu_capture_compute_gds(
+        pending_capture.get(), g_compute_gds.data(), g_compute_gds.size());
     OrderedGpustateCaptureTrace capture_trace;
     OrderedSubmitResult result = needs_ordered_realization
         ? execute_ordered_gpustate(st, width, height, submit_no, g_live, g_compute,

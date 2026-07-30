@@ -678,6 +678,42 @@ int main() {
         {SubmitOperationKind::Dispatch, 10, 10},
         {SubmitOperationKind::Dispatch, 20, 20},
     };
+    // Deferred runtime capture finishes after the backend mutates this shared table. Its replay
+    // input must nevertheless be the pre-submit GDS bytes, paired with the exact realized compute
+    // list obtained after execution.
+    constexpr uint32_t kGdsPreSubmitSentinel = 0x10293847u;
+    constexpr uint32_t kGdsPostSubmitSentinel = 0xfedcba98u;
+    std::memcpy(gds_initial.data(), &kGdsPreSubmitSentinel,
+                sizeof(kGdsPreSubmitSentinel));
+    auto deferred_gds_pending = std::make_unique<PendingGpuCapture>();
+    deferred_gds_pending->materialized = false;
+    deferred_gds_pending->path = "/tmp/prosper_deferred_gds_capture.prgcap";
+    snapshot_pending_gpu_capture_compute_gds(
+        deferred_gds_pending.get(), gds_initial.data(), gds_initial.size());
+    std::memcpy(gds_initial.data(), &kGdsPostSubmitSentinel,
+                sizeof(kGdsPostSubmitSentinel));
+    const std::vector<DrawItem> deferred_gds_draws;
+    const std::vector<ComputeItem> deferred_gds_computes = {gds_first, gds_second};
+    CHECK(finish_requested_gpu_capture(
+              std::move(deferred_gds_pending), {}, gds_error, &deferred_gds_draws,
+              &deferred_gds_computes, &gds_operations),
+          "deferred capture writes exact compute operations with snapshotted GDS input");
+    GpuCaptureFile deferred_gds_capture;
+    GpuReplayFrame deferred_gds_replay;
+    const bool deferred_gds_reopened = read_gpu_capture(
+        "/tmp/prosper_deferred_gds_capture.prgcap", deferred_gds_capture, gds_error) &&
+        materialize_gpu_replay(deferred_gds_capture, deferred_gds_replay, gds_error);
+    const uint32_t* deferred_gds_words = deferred_gds_reopened &&
+        !deferred_gds_replay.computes.empty() &&
+        deferred_gds_replay.computes[0].resources &&
+        !deferred_gds_replay.computes[0].resources->resources.empty()
+            ? reinterpret_cast<const uint32_t*>(
+                  deferred_gds_replay.computes[0].resources->resources[0].host_data)
+            : nullptr;
+    CHECK(deferred_gds_words && deferred_gds_words[0] == kGdsPreSubmitSentinel,
+          "deferred capture replay restores pre-submit persistent GDS, not post-submit bytes");
+    std::remove("/tmp/prosper_deferred_gds_capture.prgcap");
+    gds_initial.fill(0);
     CHECK(capture_submit_items({}, {gds_first, gds_second}, gds_operations, gds_metadata,
                                [](uint64_t, uint8_t*, size_t) { return size_t{0}; },
                                gds_capture, gds_error),

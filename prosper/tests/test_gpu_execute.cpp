@@ -9,6 +9,7 @@
 #include "../src/gpu/vk_translate.hpp"
 #include "../src/host/guest_write_watch.hpp"
 #include "render_runner.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -654,6 +655,12 @@ int main() {
         ordered.dma_copies.push_back({
             reinterpret_cast<uint64_t>(consumed_args),
             reinterpret_cast<uint64_t>(generated_args), sizeof(consumed_args), 0, 100, 0});
+        const std::filesystem::path capture_path =
+            std::filesystem::temp_directory_path() /
+            "prosper_dma_indirect_draw_capture.prgcap";
+        std::error_code capture_filesystem_error;
+        std::filesystem::remove(capture_path, capture_filesystem_error);
+        request_interactive_gpu_capture(capture_path.string());
         std::vector<uint32_t> submitted_indices;
         uint32_t submitted_instances = 0;
         int32_t submitted_vertex_offset = 0;
@@ -673,6 +680,87 @@ int main() {
               submitted_instances == 2 && submitted_vertex_offset == 7 &&
               submitted_raw_count == 3,
               "indexed indirect arguments resolve lazily after their ordered producer");
+        GpuCaptureFile indirect_capture;
+        GpuReplayFrame indirect_replay;
+        std::string indirect_capture_error;
+        const bool captured = read_gpu_capture(
+            capture_path.string(), indirect_capture, indirect_capture_error);
+        const bool destination_was_zero = captured && indirect_capture.dma_copies.size() == 1 &&
+            indirect_capture.dma_copies[0].destination_blob_index <
+                indirect_capture.blobs.size() && [&] {
+                    const auto& dma = indirect_capture.dma_copies[0];
+                    const auto& blob = indirect_capture.blobs[dma.destination_blob_index];
+                    if (dma.destination_blob_offset + sizeof(consumed_args) > blob.bytes.size())
+                        return false;
+                    return std::all_of(
+                        blob.bytes.begin() + static_cast<ptrdiff_t>(dma.destination_blob_offset),
+                        blob.bytes.begin() + static_cast<ptrdiff_t>(
+                            dma.destination_blob_offset + sizeof(consumed_args)),
+                        [](uint8_t value) { return value == 0; });
+                }();
+        CHECK(captured && indirect_capture.draws.size() == 1 &&
+                  indirect_capture.draws[0].raw_draw_count == 3 &&
+                  indirect_capture.draws[0].instance_count == 2 &&
+                  indirect_capture.draws[0].vertex_offset == 7 &&
+                  indirect_capture.dma_copies.size() == 1 && destination_was_zero &&
+                  materialize_gpu_replay(indirect_capture, indirect_replay,
+                                         indirect_capture_error) &&
+                  indirect_replay.items.size() == 1 &&
+                  indirect_replay.items[0].raw_draw_count == 3 &&
+                  indirect_replay.items[0].instance_count == 2 &&
+                  indirect_replay.items[0].vertex_offset == 7,
+              "deferred capture combines exact post-DMA indirect draw fields with pre-submit bytes");
+        std::filesystem::remove(capture_path, capture_filesystem_error);
+    }
+
+    // A parser stall makes later indirect packets depend on every producer in the preceding epoch.
+    // Valid stale argument bytes must never leak through when that producer failed: doing so can
+    // turn last frame's plausible counts into a real backend draw.
+    for (bool failed_dma : {false, true}) {
+        alignas(4) uint32_t stale_args[5] = {3, 1, 0, 0, 0};
+        uint16_t stale_indices[3] = {0, 1, 2};
+        uint8_t dma_destination = 0;
+        GpuState dependent = st;
+        dependent.index_type = 0;
+        dependent.draws.clear();
+        dependent.dispatches.clear();
+        dependent.dma_copies.clear();
+        dependent.parser_stalls.clear();
+        dependent.ordered_memory_effects.clear();
+        if (failed_dma) {
+            dependent.dma_copies.push_back({
+                reinterpret_cast<uint64_t>(&dma_destination), 0xdead00000000ull,
+                1, 0, 50, 0});
+        } else {
+            GpuState::Dispatch failed_dispatch;
+            failed_dispatch.threads_x = failed_dispatch.threads_y =
+                failed_dispatch.threads_z = 1;
+            failed_dispatch.command_order = 50;
+            dependent.dispatches.push_back(failed_dispatch);
+        }
+        dependent.parser_stalls.push_back({100});
+        dependent.parser_stalls.push_back({110});
+        GpuState::Draw dependent_draw;
+        dependent_draw.indexed = true;
+        dependent_draw.index_base = reinterpret_cast<uint64_t>(stale_indices);
+        dependent_draw.indirect = true;
+        dependent_draw.indirect_args_addr = reinterpret_cast<uint64_t>(stale_args);
+        dependent_draw.command_order = 150;
+        dependent.draws.push_back(dependent_draw);
+        uint32_t backend_draws = 0;
+        set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+            backend_draws += static_cast<uint32_t>(items.size());
+            return RenderedFrame{};
+        });
+        set_submit_compute([](const std::vector<ComputeItem>&) { return true; });
+        execute_ordered_and_present(dependent, W, H, failed_dma ? 80 : 79,
+                                    /*publish=*/false);
+        set_submit_renderer({});
+        set_submit_compute({});
+        CHECK(backend_draws == 0,
+              failed_dma
+                  ? "failed DMA producer poisons the stalled indirect consumer"
+                  : "failed compute realization poisons the stalled indirect consumer");
     }
 
     // Compute-only and DMA-only submissions bypass presentation, but an environment capture aimed

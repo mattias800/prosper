@@ -1084,7 +1084,7 @@ static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
     wake_on_label(c.dd_dst);
 }
 
-void execute_ordered_dma_copy(const GpuState::DmaCopy& copy,
+bool execute_ordered_dma_copy(const GpuState::DmaCopy& copy,
                               const uint8_t* authoritative_source) {
     Pm4Command c{};
     c.kind = Pm4Command::Kind::DmaData;
@@ -1094,7 +1094,10 @@ void execute_ordered_dma_copy(const GpuState::DmaCopy& copy,
     c.dd_sels = copy.sels;
     c.dd_valid = true;
     c.stream_order = copy.command_order;
+    const bool executable = !eop_writes_disabled() &&
+        dma_data_form(c, authoritative_source != nullptr) != DmaDataForm::Invalid;
     honor_dma_data(c, copy.packet_addr, authoritative_source);
+    return executable;
 }
 
 // Honor a WRITE_DATA packet: copy the inline dwords to the destination address (same synchronous timing).
@@ -2074,9 +2077,7 @@ void GpuState::apply(const Pm4Command& c) {
             }
             break;
         case K::StallCommandBufferParser:
-            // The semantic packet is itself an ordering point. The ordered executor completes any
-            // preceding compute batch before it reaches a later indirect consumer, so no additional
-            // folded-state mutation is necessary here.
+            parser_stalls.push_back({command_order});
             break;
         case K::DrawIndexOffset: {
             // Gen5 indexed draw (issue #232). Uses the bound index base + count; DrawIndexOffset's own

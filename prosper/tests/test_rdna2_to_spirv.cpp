@@ -1740,9 +1740,14 @@ int main() {
         compute_gds_write, std::size(compute_gds_write), &compute_gds_table,
         compute_gds_config);
     CHECK(!compute_gds_spv.empty(), "compute GDS ds_write_b32 recompiles to SPIR-V");
-    CHECK(validate_spirv_descriptor_interface(
-              compute_gds_spv, &compute_gds_table, 0, SpirvShaderStage::Compute, false).ok(),
-          "compute GDS module binds the persistent backend-owned buffer");
+    const DescriptorValidationReport compute_gds_report = validate_spirv_descriptor_interface(
+        compute_gds_spv, &compute_gds_table, 0, SpirvShaderStage::Compute, false);
+    const SpirvDescriptorBinding* compute_gds_binding = find_spirv_descriptor_binding(
+        compute_gds_report, 0, kComputeInternalGdsBinding);
+    CHECK(compute_gds_report.ok() && compute_gds_binding &&
+              compute_gds_binding->kind == SpirvDescriptorKind::StorageBuffer &&
+              compute_gds_binding->writable,
+          "compute GDS module reflects its writable persistent storage-buffer binding");
 
     // Astro Bot's indirect-argument producer uses device-global append counters. Routing this exact
     // GDS form through workgroup LDS made every dispatch begin with undefined counter values and
@@ -1758,10 +1763,17 @@ int main() {
         compute_gds_config);
     CHECK(!compute_gds_append_spv.empty(),
           "compute GDS ds_append recompiles to SPIR-V");
-    CHECK(validate_spirv_descriptor_interface(
-              compute_gds_append_spv, &compute_gds_table, 0,
-              SpirvShaderStage::Compute, false).ok(),
-          "compute GDS ds_append binds the persistent backend-owned buffer");
+    const DescriptorValidationReport compute_gds_append_report =
+        validate_spirv_descriptor_interface(
+            compute_gds_append_spv, &compute_gds_table, 0,
+            SpirvShaderStage::Compute, false);
+    const SpirvDescriptorBinding* compute_gds_append_binding = find_spirv_descriptor_binding(
+        compute_gds_append_report, 0, kComputeInternalGdsBinding);
+    CHECK(compute_gds_append_report.ok() && compute_gds_append_binding &&
+              compute_gds_append_binding->kind == SpirvDescriptorKind::StorageBuffer &&
+              compute_gds_append_binding->readable && compute_gds_append_binding->writable &&
+              compute_gds_append_binding->atomic_access,
+          "compute GDS ds_append reflects a read/write atomic persistent buffer contract");
 
     // Kernel 32b5: ordinary LDS DS_APPEND. Initialize the LDS counter to 10, narrow EXEC to
     // the first 32 lanes, then append. Hardware performs one atomic +32 and broadcasts old=10 only

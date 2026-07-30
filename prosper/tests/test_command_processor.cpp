@@ -385,6 +385,10 @@ int main() {
                   indirect_state.draws[0].command_order <
                       indirect_state.dispatches[0].command_order,
                   "indirect operations retain PM4 stream order");
+            CHECK(indirect_state.parser_stalls.size() == 1 &&
+                  indirect_state.parser_stalls[0].command_order <
+                      indirect_state.draws[0].command_order,
+                  "parser visibility barrier remains in the ordered submit timeline");
         }
     }
 

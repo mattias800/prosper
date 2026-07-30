@@ -98,6 +98,13 @@ struct GpuState {
         uint64_t packet_addr = 0;
     };
     std::vector<DmaCopy> dma_copies;
+    // StallCommandBufferParser is the visibility boundary between argument producers and later
+    // indirect consumers. Retain it in the ordered timeline: folding it away loses the only proof
+    // that a failed compute/DMA producer must poison the dependent indirect packet.
+    struct ParserStall {
+        uint64_t command_order = 0;
+    };
+    std::vector<ParserStall> parser_stalls;
     // Some PM4 consumers (indirect register arrays, waits, and jump/predication memory) are still
     // folded eagerly. If one follows a retained DMA, or WAIT_DEFER owns either copy dependency,
     // executing the submit would consume stale bytes. Preserve the DMA record for diagnostics and
@@ -187,8 +194,9 @@ private:
 
 // Execute one retained address-backed DMA_DATA operation at its ordered submit position.
 // Re-validates the destination and either the raw guest source or a bounded authoritative renderer
-// snapshot immediately before the byte copy, then notifies renderer caches.
-void execute_ordered_dma_copy(const GpuState::DmaCopy& copy,
+// snapshot immediately before the byte copy, then notifies renderer caches. Returns whether the
+// copy passed its final mappedness/form validation and was eligible to execute.
+bool execute_ordered_dma_copy(const GpuState::DmaCopy& copy,
                               const uint8_t* authoritative_source = nullptr);
 // Execute a retained post-DMA memory effect through the same mappedness, generation, freelist, and
 // label-wakeup guards as the legacy completion path, then invalidate renderer-owned guest caches.
