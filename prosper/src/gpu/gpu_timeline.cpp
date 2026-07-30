@@ -1388,16 +1388,21 @@ void log_timeline_mrt_draw(const GpuState& draw_state, uint64_t submit_no,
     };
     const bool has_target_mask = draw_state.cx.count(P::CB_TARGET_MASK) != 0;
     const bool has_shader_mask = draw_state.cx.count(P::CB_SHADER_MASK) != 0;
+    const bool has_color_control = draw_state.cx.count(P::CB_COLOR_CONTROL) != 0;
     const uint32_t target_mask = has_target_mask ? read(P::CB_TARGET_MASK) : 0xffffffffu;
-    const uint32_t shader_mask = read(P::CB_SHADER_MASK);
+    const uint32_t shader_mask = has_shader_mask ? read(P::CB_SHADER_MASK) : 0xffffffffu;
+    const uint32_t color_control = read(P::CB_COLOR_CONTROL);
+    const uint32_t color_mode = PM4_FIELD(color_control, CB_COLOR_CONTROL, MODE);
 
     std::fprintf(stderr,
                  "[timeline-mrt] submit=%llu draw=%zu order=%llu target-mask=%08x%s "
-                 "shader-mask=%08x%s",
+                 "shader-mask=%08x%s color-control=%08x%s mode=%u%s",
                  static_cast<unsigned long long>(submit_no), draw_index,
                  static_cast<unsigned long long>(command_order), target_mask,
                  has_target_mask ? "" : "(default)", shader_mask,
-                 has_shader_mask ? "" : "(absent)");
+                 has_shader_mask ? "" : "(default)", color_control,
+                 has_color_control ? "" : "(absent)", color_mode,
+                 has_color_control ? "" : "(legacy-normal)");
     for (uint32_t slot = 0; slot < 8; ++slot) {
         constexpr uint32_t kColorRegisterStride = 0xf;
         const uint32_t base_reg = P::CB_COLOR0_BASE + slot * kColorRegisterStride;
