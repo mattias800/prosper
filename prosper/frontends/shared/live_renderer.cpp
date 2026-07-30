@@ -1268,6 +1268,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     const auto resource_timing_start = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
                     bool resource_rtt_hit = false;
+                    bool resource_compute_image_hit = false;
                     bool resource_local_reuse = false;
                     bool resource_persistent_hit = false;
                     bool resource_persistent_submit_reuse = false;
@@ -1684,12 +1685,51 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const size_t persistent_source_size = persistent_dcc_fast_clear
                             ? sampled_dcc_metadata.size() : persistent_base_source_size;
                         resource_texture_source_bytes = persistent_source_size;
+                        // A successful typed-storage compute dispatch may still own this exact
+                        // sampled image on the shared Vulkan device. Prefer that image only for the
+                        // two native formats the graphics backend preserves today. The compute cache
+                        // independently requires the complete descriptor key plus a current-submit
+                        // journal or page-watch proof; a miss falls through to the existing exact
+                        // guest-byte decode/cache path.
+                        prosper::frontend::LiveComputeImageImport compute_image_import;
+                        VkFormat compute_image_format = VK_FORMAT_UNDEFINED;
+                        if (r.format == prosper::gpu::DataFormat::Float16 &&
+                            r.num_components == 4)
+                            compute_image_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+                        else if (r.format == prosper::gpu::DataFormat::Float10_11_11 &&
+                                 r.num_components == 3)
+                            compute_image_format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+                        const bool compute_image_candidate =
+                            !getenv("PROSPER_NO_DIRECT_COMPUTE_IMAGE_BIND") &&
+                            !has_live_rtt && !has_ds_live && r.cls == RC::Texture &&
+                            r.img_dim == 1u && r.depth == 1u && !r.in_mip_tail &&
+                            r.declared_mip_levels == 1u && !r.srgb &&
+                            !r.depth_compare && !r.host_data &&
+                            persistent_source_size &&
+                            (!r.compression_enabled || persistent_dcc_uncompressed) &&
+                            compute_image_format != VK_FORMAT_UNDEFINED;
+                        if (compute_image_candidate &&
+                            prosper::frontend::import_live_compute_storage_image(
+                                r, persistent_source_size, compute_image_import)) {
+                            const prosper::test::RenderVkCtx& render_context =
+                                prosper::test::render_vk_ctx();
+                            resource_compute_image_hit = compute_image_import.valid() &&
+                                compute_image_import.native_format ==
+                                    static_cast<uint32_t>(compute_image_format) &&
+                                compute_image_import.width == tw &&
+                                compute_image_import.height == th &&
+                                compute_image_import.depth == 1u && render_context.ok &&
+                                compute_image_import.device ==
+                                    static_cast<void*>(render_context.dev);
+                            if (!resource_compute_image_hit) compute_image_import = {};
+                        }
                         auto copy_persistent_source = [&](uint8_t* dst, size_t bytes) {
                             return persistent_dcc_fast_clear
                                 ? copy_dcc_metadata(dst, bytes)
                                 : copy_resource(dst, r.gpu_addr, bytes);
                         };
-                        const bool persistent_cache_eligible = !fr.is_storage_image &&
+                        const bool persistent_cache_eligible = !resource_compute_image_hit &&
+                            !fr.is_storage_image &&
                             !getenv("PROSPER_NO_TEXTURE_DECODE_CACHE") &&
                             (!r.compression_enabled || persistent_dcc_uncompressed ||
                              persistent_dcc_fast_clear) &&
@@ -1729,8 +1769,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // to (R,0,0,1) and must retain the real descriptor swizzle, so the two facts differ.
                         bool narrow_done = false;
                         bool narrow_decode_done = false;
-                        auto reused = has_live_rtt ? decoded_textures.end()
-                                                   : decoded_textures.find(decode_key);
+                        auto reused = (has_live_rtt || resource_compute_image_hit)
+                            ? decoded_textures.end() : decoded_textures.find(decode_key);
                         DecodedTexture persistent_reuse;
                         const DecodedTexture* decoded_reuse = reused != decoded_textures.end()
                             ? &reused->second : nullptr;
@@ -1959,6 +1999,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                         tw, th, r.img_dim, (unsigned)r.format,
                                         has_gpu_live_rtt          ? "gpu-bind"
                                         : has_cpu_live_rtt        ? "cpu-rtt"
+                                        : resource_compute_image_hit ? "compute-bind"
                                         : decoded_reuse           ? "decode-cache"
                                                                   : "decode",
                                         live_rtt != g_rtt.end() ? live_rtt->second.w : 0,
@@ -1984,6 +2025,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             fr.td = 1; fr.img_dim = r.img_dim;
                             fr.texture_format = live_rtt->second.format;
                             resource_rtt_hit = true;
+                        } else if (resource_compute_image_hit) {
+                            fr.borrowed_compute_image = compute_image_import.image;
+                            fr.borrowed_compute_device = compute_image_import.device;
+                            fr.borrowed_compute_image_layout = compute_image_import.layout;
+                            fr.borrowed_compute_image_lease =
+                                std::move(compute_image_import.lease);
+                            fr.tw = compute_image_import.width;
+                            fr.th = compute_image_import.height;
+                            fr.td = compute_image_import.depth;
+                            fr.img_dim = r.img_dim;
+                            fr.texture_format = compute_image_format;
                         } else if (has_ds_live) {
                             fr.persistent_depth_target_id = r.gpu_addr;
                             fr.tw = sampled_ds.width;
@@ -3003,7 +3055,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 }
                             }
                         }
-                        if (!resource_rtt_hit && !has_live_rtt)
+                        if (!resource_rtt_hit && !resource_compute_image_hit && !has_live_rtt)
                             decoded_textures.emplace(
                                 decode_key, DecodedTexture{fr.tex_rgba, fr.th, narrow_done,
                                                           fr.persistent_texture_id});
@@ -3256,14 +3308,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 mode && strcmp(mode, "detail") == 0 &&
                                 static_cast<uint64_t>(g_this_submit) >= detail_min_submit) {
                                 static uint64_t detail_lines = 0;
-                                if ((elapsed >= 0.5 || resource_persistent_invalidation) &&
+                                if ((elapsed >= 0.5 || resource_persistent_invalidation ||
+                                     resource_compute_image_hit) &&
                                     detail_lines++ < 250) {
                                     const char* cache_state = resource_rtt_hit ? "rtt" :
+                                        (resource_compute_image_hit ? "compute-image" :
                                         (resource_local_reuse ? "local" :
                                         (resource_persistent_submit_reuse ? "persistent-submit" :
                                         (resource_persistent_hit ? "persistent-hit" :
                                         (resource_persistent_invalidation ? "persistent-invalid" :
-                                        (resource_persistent_miss ? "persistent-miss" : "uncached")))));
+                                        (resource_persistent_miss ? "persistent-miss" : "uncached"))))));
                                     auto submit_query_name = [](int query) {
                                         switch (query) {
                                             case static_cast<int>(

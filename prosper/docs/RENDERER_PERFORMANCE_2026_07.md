@@ -1319,6 +1319,50 @@ skips already avoid guest-write notification, so they are deliberately unaffecte
 trace instead keeps the disabled texture-watch and incomplete guest-range cases below as the active Plucky
 bottleneck.
 
+## Plucky direct compute-image sampling prototype (issue #1477)
+
+The remaining large sampled-texture spikes had an exact GPU authority that the renderer did not consume.
+A successful typed-storage compute dispatch already retained its native Vulkan image on the graphics
+device, then mirrored the same result into tiled guest memory. A later graphics span nevertheless validated,
+detiled, and uploaded those guest bytes again. The observed full-resolution outputs are 33,423,360-byte
+R11G11B10 and 66,846,720-byte RGBA16F surfaces; cold or invalidated fallback references have taken roughly
+64-90 ms to materialize.
+
+The issue #1477 prototype publishes only successful native typed-storage results created with sampled usage.
+The graphics import reconstructs the complete compute-cache identity and borrows the image only while the
+current-submit GPU-write journal or a clean cross-submit page watch proves that no later architectural writer
+overlapped its guest mirror. Every attempted storage dispatch revokes the previous authority before command
+recording, and only complete dispatch/writeback/layout success republishes it. A shared lease pins the cache
+entry until the graphics fence cleanup; graphics transitions the borrowed image from `GENERAL` to shader-read
+and restores `GENERAL` without destroying the image. Raw-uvec4 interchange images, replay `host_data`, depth,
+sRGB, mip-tail/array/volume views, and DCC surfaces without an exact all-`0xff` uncompressed proof remain on
+the existing path. `PROSPER_NO_DIRECT_COMPUTE_IMAGE_BIND=1` is the control switch.
+
+Focused production-backend coverage proves cross-submit watch authorization, rejects an import after an
+architectural GPU/DMA write dirties the watched guest range, and holds the lease through submission cleanup.
+The renderer execution test compares borrowed native FP16 and R11G11B10 images against the existing CPU
+readback/upload route byte for byte, then samples the owner again to prove its layout and lifetime were
+restored. Restoring the fallback importer or omitting either native-format bridge makes those tests fail.
+
+A 135-second full-resolution, normal-cadence Plucky route exercised the bridge on the real 4K outputs. The
+explicit detail log reached its 250-line cap with direct hits; individual frontend resource decisions took
+approximately 0.00-0.11 ms and copied or validated zero guest bytes. At submit 1,100, cumulative texture
+resource construction was 8.22 ms per submit with the bridge and 9.20 ms in the sequential disabled control;
+cumulative frontend time was 34.49 versus 35.04 ms. The enabled run produced a clean native 3840x2160 Play
+Style screenshot and completed 1,508 presents, versus 1,367 in the control. The scheduled control screenshot
+landed ten guest presents earlier during the menu's black fade, so it is not a pixel oracle and the route
+progression difference is supporting evidence rather than a standalone FPS claim. GPU replay cannot exercise
+this temporal residency boundary because replay resources intentionally own `host_data`; the production tests,
+live disable switch, and the unchanged replay fallback divide that verification responsibility explicitly.
+
+After merging current master, a fresh 140-second exact-head A/B repeated the result with identical build,
+route, full-resolution, audio, input, and timing settings. The enabled run logged 250 direct decisions,
+including a 3840x2160 RGBA16F result at 0.09 ms, and reached 2,220 presents; the single-switch disabled run
+logged no direct decisions and reached 2,040. Their final 25-submit texture-resource windows were 6.45 ms and
+10.62 ms respectively. Both native 3840x2160 checkpoints were visually clean. They armed at the same guest
+present (1,058) but asynchronous readback completed on different later presents and captured different menu
+states, so they remain independent correctness/progression evidence rather than a pixel-equality oracle.
+
 ## Next renderer step
 
 Capture a fresh v38 rolling temporal window on current code around the Plucky title/gameplay transition. It
