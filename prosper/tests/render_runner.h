@@ -972,14 +972,20 @@ public:
     }
 
     // Completion could not be proven after a successful submit. Invalidate speculative state, but
-    // never invoke cleanup callbacks for work Vulkan may still own. The sticky flag also rejects
-    // callbacks registered later in the current renderer call (registration follows diagnostics).
+    // never invoke or destroy cleanup callbacks for work Vulkan may still own. Besides Vulkan
+    // handles, their captures can contain ownership tokens for resources borrowed from another
+    // cache. Keep the complete closure set alive until process teardown; a normal static owner is
+    // unsuitable because its destructor could run while a lost device still owns the submission.
+    // The sticky flag also rejects callbacks registered later in the current renderer call
+    // (registration follows diagnostics).
     void abandon_pending_resources() {
         commands_.clear();
         finish_persistent_state(false);
         pending_resources_abandoned_ = true;
         backend_mark_unproven_submission();
-        cleanups_.clear();
+        if (!cleanups_.empty()) {
+            (void)new std::vector<std::function<void()>>(std::move(cleanups_));
+        }
     }
 
     BackendSubmissionBatchResult submit_and_wait(VkDevice dev, VkQueue queue,
@@ -1047,8 +1053,9 @@ public:
             finish_persistent_state(state == BackendSubmissionState::Complete);
         } else {
             // Neither wait proved completion, so every command buffer and object captured by its
-            // cleanup may still be in use. Drop the callbacks without invoking them; leaking these
-            // one-shot resources is the only valid last-resort action on an effectively lost device.
+            // cleanup may still be in use. Retain the callbacks without invoking or destroying
+            // them; leaking these one-shot resources and any borrowed ownership tokens they hold
+            // is the only valid last-resort action on an effectively lost device.
             abandon_pending_resources();
         }
         return result;

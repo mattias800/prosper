@@ -935,19 +935,31 @@ int main() {
         bool speculative_state_valid = true;
         bool prior_cleanup_ran = false;
         bool later_cleanup_ran = false;
+        bool borrowed_lease_released = false;
+        auto borrowed_lease = std::shared_ptr<void>(
+            new int(1),
+            [&](void* ptr) {
+                borrowed_lease_released = true;
+                delete static_cast<int*>(ptr);
+            });
         CHECK(!prosper::test::backend_has_unproven_submission(),
               "completed test submissions leave the global lifetime guard clear");
         prosper::test::BackendSubmissionBatch abandoned_batch;
         abandoned_batch.enqueue(VK_NULL_HANDLE);
         abandoned_batch.add_failure_cleanup([&]() { speculative_state_valid = false; });
-        abandoned_batch.add_cleanup([&]() { prior_cleanup_ran = true; });
+        abandoned_batch.add_cleanup([&, lease = borrowed_lease]() {
+            (void)lease;
+            prior_cleanup_ran = true;
+        });
+        borrowed_lease.reset();
         abandoned_batch.abandon_pending_resources();
         abandoned_batch.add_cleanup([&]() { later_cleanup_ran = true; });
         abandoned_batch.complete();
         CHECK(!abandoned_batch.pending() && abandoned_batch.retains_pending_resources() &&
                   prosper::test::backend_has_unproven_submission() &&
-                  !speculative_state_valid && !prior_cleanup_ran && !later_cleanup_ran,
-              "pending submission globally protects prior and later resources");
+                  !speculative_state_valid && !prior_cleanup_ran && !later_cleanup_ran &&
+                  !borrowed_lease_released,
+              "pending submission globally retains prior resources and borrowed leases");
         const std::vector<uint8_t> blocked = prosper::test::render_triangle_rgba(
             vert, lzf, W, H, nullptr, nullptr, nullptr, &td);
         CHECK(blocked.empty(),
