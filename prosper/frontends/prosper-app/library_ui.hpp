@@ -77,6 +77,16 @@ public:
     LibraryAction render_frame(const std::string& status);
 
 private:
+    // Freshly-pressed pad inputs for one frame. ImGui's gamepad nav is off (it fights the grid rules),
+    // which also silences its gamepad feed, so the pad is read directly.
+    struct PadEdge {
+        static constexpr int kCount = 5;
+        bool left = false, right = false, up = false, down = false, confirm = false;
+    };
+    PadEdge poll_pad_edges();
+    // Consume an acquired-but-unusable frame's semaphore instead of stranding it signalled.
+    void discard_acquired_frame();
+
     bool create_render_target(VkFormat format, const std::vector<VkImage>& images, VkExtent2D extent);
     void destroy_render_target();
     // Decode icon0.png and upload it. Returns VK_NULL_HANDLE on any failure; the grid then draws a
@@ -118,7 +128,17 @@ private:
     int                    selected_  = 0;
     int                    firstRow_  = 0;
     bool                   ready_     = false;
-    bool                   imguiInit_ = false;
+    bool                   imguiCtx_   = false;   // unwound independently so a part-failed init leaks nothing
+    bool                   sdlInit_    = false;
+    bool                   vulkanInit_ = false;
+    bool                   padDown_[PadEdge::kCount] = {};
+public:
+    // Set when the swapchain went out of date (acquire or present said so). The app clears it by
+    // recreating; without this a swapchain invalidated with no resize event leaves the view dead.
+    bool needs_recreate() const { return needsRecreate_; }
+    void clear_needs_recreate() { needsRecreate_ = false; }
+private:
+    bool                   needsRecreate_ = false;
 };
 
 } // namespace prosper::frontend

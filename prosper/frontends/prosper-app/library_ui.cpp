@@ -51,6 +51,34 @@ void imgui_vk_result(VkResult r) {
 
 } // namespace
 
+// One frame's worth of freshly-pressed pad inputs. Edges only: holding a direction must not sweep the
+// whole library, matching how the keyboard repeat is handled by ImGui::IsKeyPressed.
+LibraryUi::PadEdge LibraryUi::poll_pad_edges() {
+    PadEdge edge;
+    bool down[PadEdge::kCount] = {};
+    int count = 0;
+    SDL_JoystickID* pads = SDL_GetGamepads(&count);
+    if (pads) {
+        for (int i = 0; i < count; i++) {
+            SDL_Gamepad* pad = SDL_GetGamepadFromID(pads[i]);
+            if (!pad) continue;   // not opened by us; the app's pad backend owns the guest's device
+            down[0] = down[0] || SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_LEFT);
+            down[1] = down[1] || SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_RIGHT);
+            down[2] = down[2] || SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_UP);
+            down[3] = down[3] || SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
+            down[4] = down[4] || SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_SOUTH);   // Cross
+        }
+        SDL_free(pads);
+    }
+    edge.left    = down[0] && !padDown_[0];
+    edge.right   = down[1] && !padDown_[1];
+    edge.up      = down[2] && !padDown_[2];
+    edge.down    = down[3] && !padDown_[3];
+    edge.confirm = down[4] && !padDown_[4];
+    for (int i = 0; i < PadEdge::kCount; i++) padDown_[i] = down[i];
+    return edge;
+}
+
 LibraryUi::~LibraryUi() { shutdown(); }
 
 bool LibraryUi::init(SDL_Window* window, VkInstance instance, VkPhysicalDevice phys, VkDevice device,
@@ -103,6 +131,7 @@ bool LibraryUi::init(SDL_Window* window, VkInstance instance, VkPhysicalDevice p
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    imguiCtx_ = true;   // set immediately: shutdown() must destroy the context even if a backend fails
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;   // no imgui.ini beside the binary: the app has its own settings file
     // ImGui's own keyboard/gamepad nav is deliberately NOT enabled: this screen drives selection with
@@ -113,6 +142,7 @@ bool LibraryUi::init(SDL_Window* window, VkInstance instance, VkPhysicalDevice p
     ImGui::StyleColorsDark();
 
     if (!ImGui_ImplSDL3_InitForVulkan(window_)) { fprintf(stderr, "[library] SDL3 backend init failed\n"); shutdown(); return false; }
+    sdlInit_ = true;
     ImGui_ImplVulkan_InitInfo vi{};
     vi.Instance = instance;
     vi.PhysicalDevice = phys_;
@@ -126,7 +156,7 @@ bool LibraryUi::init(SDL_Window* window, VkInstance instance, VkPhysicalDevice p
     vi.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     vi.CheckVkResultFn = imgui_vk_result;
     if (!ImGui_ImplVulkan_Init(&vi)) { fprintf(stderr, "[library] Vulkan backend init failed\n"); shutdown(); return false; }
-    imguiInit_ = true;
+    vulkanInit_ = true;
     ready_ = true;
     return true;
 }
@@ -204,12 +234,11 @@ bool LibraryUi::recreate_swapchain(VkSwapchainKHR swapchain, VkFormat format,
 void LibraryUi::shutdown() {
     if (device_) vkDeviceWaitIdle(device_);
     destroy_covers();
-    if (imguiInit_) {
-        ImGui_ImplVulkan_Shutdown();
-        ImGui_ImplSDL3_Shutdown();
-        ImGui::DestroyContext();
-        imguiInit_ = false;
-    }
+    // Each step is separately conditional: a failure part-way through init must still unwind whatever
+    // was created, and shutdown() is called from those failure paths.
+    if (vulkanInit_) { ImGui_ImplVulkan_Shutdown(); vulkanInit_ = false; }
+    if (sdlInit_)    { ImGui_ImplSDL3_Shutdown();   sdlInit_ = false; }
+    if (imguiCtx_)   { ImGui::DestroyContext();     imguiCtx_ = false; }
     destroy_render_target();
     if (renderPass_) { vkDestroyRenderPass(device_, renderPass_, nullptr); renderPass_ = VK_NULL_HANDLE; }
     if (sampler_)    { vkDestroySampler(device_, sampler_, nullptr);       sampler_ = VK_NULL_HANDLE; }
@@ -400,6 +429,22 @@ VkDescriptorSet LibraryUi::cover_for(const GameEntry& game) {
     return cover.set;
 }
 
+// Consume an already-signalled acquire semaphore without drawing. Used when an image was acquired but
+// cannot be rendered to; leaving the semaphore signalled would corrupt every later frame's pairing.
+void LibraryUi::discard_acquired_frame() {
+    vkResetFences(device_, 1, &inFlight_);
+    vkResetCommandBuffer(cmd_, 0);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd_, &bi);
+    vkEndCommandBuffer(cmd_);
+    const VkPipelineStageFlags wait = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkSubmitInfo su{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    su.waitSemaphoreCount = 1; su.pWaitSemaphores = &acquireSem_; su.pWaitDstStageMask = &wait;
+    su.commandBufferCount = 1; su.pCommandBuffers = &cmd_;
+    if (vkQueueSubmit(queue_, 1, &su, inFlight_) != VK_SUCCESS) ready_ = false;
+}
+
 LibraryAction LibraryUi::render_frame(const std::string& status) {
     LibraryAction action;
     if (!ready_) return action;
@@ -427,15 +472,21 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
         ImGui::Spacing();
         if (gamesDir_.empty()) {
             ImGui::TextWrapped("No games folder is set yet. Choose the folder that holds your PS5 game "
-                               "directories — the ones containing eboot.bin and sce_sys.");
+                               "directories - the ones containing eboot.bin and sce_sys.");
         } else {
             ImGui::TextWrapped("No PS5 games found in this folder. Each game is its own directory "
                                "containing eboot.bin and sce_sys.");
         }
         ImGui::Spacing();
-        if (ImGui::Button("Choose folder...")) action.kind = LibraryAction::Kind::browse;
+        // Keyboard-reachable too: ImGui's own nav is off (it fights the grid rules), so without this
+        // the only way out of the empty state would be the mouse or a drop.
+        const PadEdge pad = poll_pad_edges();
+        if (ImGui::Button("Choose folder...") ||
+            ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter) ||
+            ImGui::IsKeyPressed(ImGuiKey_Space) || pad.confirm)
+            action.kind = LibraryAction::Kind::browse;
         ImGui::SameLine();
-        ImGui::TextDisabled("or drop a game folder on this window");
+        ImGui::TextDisabled("or press Enter, or drop a game folder on this window");
     } else {
         const float avail = ImGui::GetContentRegionAvail().x;
         const int columns = library_columns_for_width(avail, kCellWidth);
@@ -443,11 +494,14 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
 
         // Keyboard/controller selection. ImGui's own nav does not know about the grid, so movement is
         // decided by the unit-tested rules and the scroll follows the selection.
+        // ImGui nav is off (see init), which also silences the SDL3 backend's gamepad feed — so the
+        // pad is polled directly here rather than through ImGuiKey_Gamepad*, which would never be set.
+        const PadEdge pad = poll_pad_edges();
         LibraryNavKey key = LibraryNavKey::none;
-        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) || ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft))   key = LibraryNavKey::left;
-        else if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) || ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight)) key = LibraryNavKey::right;
-        else if (ImGui::IsKeyPressed(ImGuiKey_UpArrow) || ImGui::IsKeyPressed(ImGuiKey_GamepadDpadUp))  key = LibraryNavKey::up;
-        else if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) || ImGui::IsKeyPressed(ImGuiKey_GamepadDpadDown)) key = LibraryNavKey::down;
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) || pad.left)   key = LibraryNavKey::left;
+        else if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) || pad.right) key = LibraryNavKey::right;
+        else if (ImGui::IsKeyPressed(ImGuiKey_UpArrow) || pad.up)  key = LibraryNavKey::up;
+        else if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) || pad.down) key = LibraryNavKey::down;
         else if (ImGui::IsKeyPressed(ImGuiKey_Home))     key = LibraryNavKey::home;
         else if (ImGui::IsKeyPressed(ImGuiKey_End))      key = LibraryNavKey::end;
         else if (ImGui::IsKeyPressed(ImGuiKey_PageUp))   key = LibraryNavKey::page_up;
@@ -459,12 +513,16 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
         firstRow_ = library_scroll_row_for(selected_, columns, rowsPerPage, firstRow_);
 
         if (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter) ||
-            ImGui::IsKeyPressed(ImGuiKey_Space) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown)) {
+            ImGui::IsKeyPressed(ImGuiKey_Space) || pad.confirm) {
             action.kind = LibraryAction::Kind::open;
             action.app0_root = games_[static_cast<size_t>(selected_)].app0_root;
         }
 
         ImGui::BeginChild("grid", ImVec2(0, gridHeight), false);
+        // Apply the computed scroll, but only when a key moved the selection: doing it every frame
+        // would fight the mouse wheel. Without this the selection can move below the visible rows —
+        // the pure test covers library_scroll_row_for, only this line makes it reach the screen.
+        if (key != LibraryNavKey::none) ImGui::SetScrollY(static_cast<float>(firstRow_) * kCellHeight);
         for (int i = 0; i < count; i++) {
             if (i % columns != 0) ImGui::SameLine();
             ImGui::BeginGroup();
@@ -524,13 +582,25 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
     uint32_t imageIndex = 0;
     const VkResult acq = vkAcquireNextImageKHR(device_, swapchain_, 100ull * 1000 * 1000,
                                                acquireSem_, VK_NULL_HANDLE, &imageIndex);
-    if (acq == VK_ERROR_OUT_OF_DATE_KHR || acq == VK_SUBOPTIMAL_KHR || acq == VK_TIMEOUT ||
-        acq == VK_NOT_READY || imageIndex >= framebuffers_.size()) {
-        // The app recreates the swapchain on its own signal; skipping a frame here is harmless because
-        // the library redraws continuously.
+    // Split by whether an image was actually acquired, NOT by success-vs-failure. These three leave
+    // acquireSem_ untouched, so returning is clean:
+    if (acq == VK_ERROR_OUT_OF_DATE_KHR || acq == VK_TIMEOUT || acq == VK_NOT_READY) {
+        needsRecreate_ = (acq == VK_ERROR_OUT_OF_DATE_KHR);
         return action;
     }
-    if (acq != VK_SUCCESS) return action;
+    if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) return action;   // hard error: nothing signalled
+    // From here an image WAS acquired and acquireSem_ WILL be signalled, so every path below has to
+    // consume it. VK_SUBOPTIMAL_KHR is a SUCCESS code — dropping this frame would leave the semaphore
+    // signalled, so the next acquire would reuse a signalled semaphore and the wait/signal pairing
+    // would be permanently off by one. Present it and ask the app to recreate afterwards.
+    if (acq == VK_SUBOPTIMAL_KHR) needsRecreate_ = true;
+    if (imageIndex >= framebuffers_.size()) {
+        // Stale framebuffers (the swapchain changed under us). The image is already acquired, so drain
+        // the semaphore with an empty submit rather than stranding it, then ask for a rebuild.
+        discard_acquired_frame();
+        needsRecreate_ = true;
+        return action;
+    }
     vkResetFences(device_, 1, &inFlight_);
     vkResetCommandBuffer(cmd_, 0);
 
@@ -554,13 +624,20 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
     su.waitSemaphoreCount = 1;   su.pWaitSemaphores = &acquireSem_;  su.pWaitDstStageMask = &wait;
     su.commandBufferCount = 1;   su.pCommandBuffers = &cmd_;
     su.signalSemaphoreCount = 1; su.pSignalSemaphores = &renderSem_;
-    if (vkQueueSubmit(queue_, 1, &su, inFlight_) != VK_SUCCESS) return action;
+    if (vkQueueSubmit(queue_, 1, &su, inFlight_) != VK_SUCCESS) {
+        // inFlight_ was just reset and nothing will signal it, so the next frame's infinite wait would
+        // hang the event loop. Stop drawing instead; the app falls back to the flat idle colour.
+        fprintf(stderr, "[library] submit failed; closing the library view\n");
+        ready_ = false;
+        return action;
+    }
 
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &renderSem_;
     pi.swapchainCount = 1;     pi.pSwapchains = &swapchain_;
     pi.pImageIndices = &imageIndex;
-    vkQueuePresentKHR(queue_, &pi);
+    const VkResult pres = vkQueuePresentKHR(queue_, &pi);
+    if (pres == VK_ERROR_OUT_OF_DATE_KHR || pres == VK_SUBOPTIMAL_KHR) needsRecreate_ = true;
     return action;
 }
 

@@ -1320,12 +1320,17 @@ int main(int argc, char** argv) {
     // remains, so a driver that cannot host the UI costs the user a library, not the app.
     prosper::frontend::LibraryUi libraryUi;
     std::string libraryStatus;
+    // True while a picker opened from the library's own button is outstanding: its answer is a games
+    // DIRECTORY to remember, not a title to boot.
+    bool libraryBrowsePending = false;
     const bool wantLibrary = !testPattern && dump.empty();
+    bool libraryHasGames = false;
     auto rescan_library = [&]() {
         if (!libraryUi.ready()) return;
         std::vector<prosper::frontend::GameEntry> found;
         if (!gamesDir.empty())
             found = prosper::frontend::scan_game_library(gamesDir, host_path_probe(), host_library_io());
+        libraryHasGames = !found.empty();
         libraryUi.set_games(std::move(found), gamesDir);
     };
     if (wantLibrary) {
@@ -1414,10 +1419,18 @@ int main(int argc, char** argv) {
         return false;
     };
 
-
     // A launch that was not told what to show would otherwise be a dead end for anyone who did not
     // arrive through a command line.
-    if (prosper::frontend::should_pick_at_startup(pick)) {
+    bool offerPicker = prosper::frontend::should_pick_at_startup(pick);
+#ifdef PROSPER_HAVE_LIBRARY_UI
+    // The library already shows a way in, so a modal dialog on top of it would be noise. Only fall back
+    // to the picker when it has nothing to offer.
+    if (offerPicker && libraryUi.ready() && libraryHasGames) {
+        offerPicker = false;
+        fprintf(stderr, "[app] library has titles; not opening the startup picker.\n");
+    }
+#endif
+    if (offerPicker) {
         fprintf(stderr, "[app] no game given; opening the folder picker.\n");
         open_folder_picker(win);
     }
@@ -1562,6 +1575,26 @@ int main(int argc, char** argv) {
         {
             std::string picked;
             { std::lock_guard<std::mutex> lock(g_picked_mutex); picked.swap(g_picked_path); }
+#ifdef PROSPER_HAVE_LIBRARY_UI
+            // The library asked for this folder, so its answer names a games DIRECTORY to remember, not
+            // a title to boot. Without this the result went to open_game(), which resolves an app0 root
+            // and therefore always rejected a folder-of-folders with "That is not a PS5 game".
+            if (!picked.empty() && libraryBrowsePending) {
+                libraryBrowsePending = false;
+                if (!host_path_probe().is_dir(picked)) {
+                    libraryStatus = "That is not a folder.";
+                } else {
+                    prosper::frontend::AppConfig cfg = load_app_config();
+                    cfg.games_dir = prosper::frontend::strip_trailing_separators(picked);
+                    gamesDir = cfg.games_dir;
+                    libraryStatus = save_app_config(cfg) ? std::string()
+                                                        : "Could not save the games folder setting.";
+                    fprintf(stderr, "[app] games directory set to %s\n", gamesDir.c_str());
+                    rescan_library();
+                }
+                picked.clear();
+            }
+#endif
             if (!picked.empty() && !testPattern) {
                 if (g_guest_started)
                     fprintf(stderr, "[app] ignoring the folder picker's answer: a game started first.\n");
@@ -1643,6 +1676,10 @@ int main(int argc, char** argv) {
 #ifdef PROSPER_HAVE_LIBRARY_UI
             if (libraryUi.ready()) {
                 const prosper::frontend::LibraryAction act = libraryUi.render_frame(libraryStatus);
+                if (libraryUi.needs_recreate()) {
+                    libraryUi.clear_needs_recreate();
+                    swapchainDirty = true;   // serviced at the top of the next iteration
+                }
                 switch (act.kind) {
                 case prosper::frontend::LibraryAction::Kind::open:
                     // Straight through the same start_guest() path argv, the drop target and the
@@ -1650,6 +1687,7 @@ int main(int argc, char** argv) {
                     if (!open_game(act.app0_root)) libraryStatus = "Could not start that game.";
                     break;
                 case prosper::frontend::LibraryAction::Kind::browse:
+                    libraryBrowsePending = true;
                     open_folder_picker(win);
                     break;
                 case prosper::frontend::LibraryAction::Kind::quit:
@@ -1829,6 +1867,11 @@ int main(int argc, char** argv) {
         std::_Exit(exitCode);
     }
 
+#ifdef PROSPER_HAVE_LIBRARY_UI
+    // Before SDL_Quit: ImGui's SDL3 backend frees cursors and closes gamepads on shutdown, and the
+    // destructor would otherwise run after SDL had already torn those down.
+    libraryUi.shutdown();
+#endif
     vkDeviceWaitIdle(vk.device);
     SDL_DestroyWindow(win); SDL_Quit();
     return exitCode;
