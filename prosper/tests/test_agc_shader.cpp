@@ -632,8 +632,8 @@ int main() {
           "persistent realization workers survive repeated batch generations");
 
     // An attempted parallel batch can correctly produce no items. That must not be mistaken for
-    // "parallel disabled" and replay all draws serially. Each no-effect draw reaches both already-warm
-    // shader cache entries once; a serial retry would double this exact hit count.
+    // "parallel disabled" and replay all draws serially. Proven no-effect draws must also be rejected
+    // before either already-warm shader cache is consulted.
     prosper::gpu::GpuState filtered_state = parallel_state;
     filtered_state.cx[P::CB_TARGET_MASK] = 0;
     const auto filtered_parallel_before = prosper::gpu::parallel_draw_realization_stats();
@@ -644,9 +644,8 @@ int main() {
     const auto filtered_parallel_after = prosper::gpu::parallel_draw_realization_stats();
     CHECK(filtered_draws.empty() &&
               filtered_parallel_after.batches == filtered_parallel_before.batches + 1 &&
-              filtered_shader_after.hits ==
-                  filtered_shader_before.hits + filtered_state.draws.size() * 2,
-          "all-filtered parallel batch is not retried through the serial path");
+              filtered_shader_after.hits == filtered_shader_before.hits,
+          "all-filtered parallel batch rejects no-effect draws before shader realization");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
