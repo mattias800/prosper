@@ -378,7 +378,8 @@ std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
                                                        const PixelSystemInputMapping* system_inputs = nullptr,
                                                        uint64_t* cache_identity = nullptr,
                                                        bool fragment_wave32 = false,
-                                                       uint32_t vertex_lds_dwords = 0);
+                                                       uint32_t vertex_lds_dwords = 0,
+                                                       bool vertex_capture_position = false);
 SharedShaderWords recompile_graphics_shader_cached_shared(
     ShaderProgramStage stage, const uint32_t* code, size_t dwords,
     const ShaderResourceTable* resources = nullptr,
@@ -386,7 +387,8 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     const PixelSystemInputMapping* system_inputs = nullptr,
     uint64_t* cache_identity = nullptr,
     bool fragment_wave32 = false,
-    uint32_t vertex_lds_dwords = 0);
+    uint32_t vertex_lds_dwords = 0,
+    bool vertex_capture_position = false);
 // Compute uses the same bounded content-addressed cache as graphics. Launch geometry that changes
 // generated SPIR-V participates in the key; per-dispatch push-constant values deliberately do not.
 std::vector<uint32_t> recompile_compute_shader_cached(
@@ -398,7 +400,8 @@ SharedShaderWords recompile_vertex_chain_cached_shared(
     const ShaderResourceTable* resources = nullptr,
     const PixelInputMapping* pixel_inputs = nullptr,
     uint64_t* cache_identity = nullptr,
-    uint32_t vertex_lds_dwords = 0);
+    uint32_t vertex_lds_dwords = 0,
+    bool capture_position = false);
 ShaderRecompileCacheStats shader_recompile_cache_stats();
 void clear_shader_recompile_cache();
 
@@ -941,6 +944,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     const FragmentInterpolationLayout interpolation = fragment_interpolation_layout_cached(
         reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.ps_addr)),
         max_shader_dwords, system_input_ptr, pixel_input_ptr);
+    const bool capture_vertex_position = getenv("PROSPER_GEOM_PROBE") != nullptr &&
+                                         !interpolation.requires_geometry;
     uint64_t vs_identity = 0, fs_identity = 0;
     SharedShaderWords vs_shared, fs_shared;
     std::vector<uint32_t> vs, fs;
@@ -949,12 +954,13 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             vs_shared = recompile_vertex_chain_cached_shared(
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)), vertex_dwords,
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(chain_addr)), chain_dwords,
-                vrt.get(), pixel_input_ptr, &vs_identity, vertex_lds_dwords);
+                vrt.get(), pixel_input_ptr, &vs_identity, vertex_lds_dwords,
+                capture_vertex_position);
         else
             vs_shared = recompile_graphics_shader_cached_shared(
                 ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
                 max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity,
-                false, vertex_lds_dwords);
+                false, vertex_lds_dwords, capture_vertex_position);
         fs_shared = recompile_graphics_shader_cached_shared(
             ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
             max_shader_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
@@ -964,13 +970,14 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             const SharedShaderWords linked = recompile_vertex_chain_cached_shared(
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)), vertex_dwords,
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(chain_addr)), chain_dwords,
-                vrt.get(), pixel_input_ptr, &vs_identity, vertex_lds_dwords);
+                vrt.get(), pixel_input_ptr, &vs_identity, vertex_lds_dwords,
+                capture_vertex_position);
             if (linked) vs = *linked;
         } else {
             vs = recompile_graphics_shader_cached(
                 ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
                 max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity,
-                false, vertex_lds_dwords);
+                false, vertex_lds_dwords, capture_vertex_position);
         }
         fs = recompile_graphics_shader_cached(
             ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
@@ -1013,7 +1020,9 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         // provide the three AMD vertex parameters and remain fail-visible.
         const bool triangle_topology = resolved_pipeline.topology >= 3u &&
                                        resolved_pipeline.topology <= 5u;
-        if (triangle_topology) gs = recompile_interpolation_geometry(interpolation);
+        if (triangle_topology)
+            gs = recompile_interpolation_geometry(
+                interpolation, getenv("PROSPER_GEOM_PROBE") != nullptr);
     }
     if (phase_timing) {
         const auto shader_done = std::chrono::steady_clock::now();

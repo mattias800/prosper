@@ -2374,12 +2374,13 @@ struct SpirvCompute {
     // Descriptor-free geometry pass-through used when a fragment program asks for AMD's explicit
     // P0/P10/P20 vertex parameters on a Vulkan device without a barycentric/vertex-parameter
     // extension. Input assembly has already decomposed lists/strips/fans into triangles here.
-    std::vector<uint32_t> build_interpolation_geometry(const FragmentInterpolationLayout& layout) {
+    std::vector<uint32_t> build_interpolation_geometry(
+            const FragmentInterpolationLayout& layout, bool capture_geometry_position) {
         if (!layout.requires_geometry || !layout.valid) return {};
 
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
         t_v4f = id();
-        const uint32_t t_per_vertex = id();
+        const uint32_t t_input_per_vertex = id(), t_output_per_vertex = id();
         const uint32_t c_three = id();
         const uint32_t t_input_positions = id(), t_input_varyings = id();
         const uint32_t ptr_in_positions = id(), ptr_in_varyings = id();
@@ -2405,6 +2406,7 @@ struct SpirvCompute {
 
         put(caps, Op_Capability, {Cap_Shader});
         put(caps, Op_Capability, {Cap_Geometry});
+        if (capture_geometry_position) put(caps, Op_Capability, {Cap_TransformFeedback});
         { std::vector<uint32_t> operands{glsl}; pstr(operands, "GLSL.std.450");
           putv(extimp, Op_ExtInstImport, operands); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
@@ -2412,9 +2414,17 @@ struct SpirvCompute {
         put(exec, Op_ExecutionMode, {f_main, EM_Triangles});
         put(exec, Op_ExecutionMode, {f_main, EM_OutputTriangleStrip});
         put(exec, Op_ExecutionMode, {f_main, EM_OutputVertices, 3});
+        if (capture_geometry_position) put(exec, Op_ExecutionMode, {f_main, EM_Xfb});
 
-        put(deco, Op_MemberDecorate, {t_per_vertex, 0, Dec_BuiltIn, BI_Position});
-        put(deco, Op_Decorate, {t_per_vertex, Dec_Block});
+        put(deco, Op_MemberDecorate, {t_input_per_vertex, 0, Dec_BuiltIn, BI_Position});
+        put(deco, Op_Decorate, {t_input_per_vertex, Dec_Block});
+        put(deco, Op_MemberDecorate, {t_output_per_vertex, 0, Dec_BuiltIn, BI_Position});
+        put(deco, Op_Decorate, {t_output_per_vertex, Dec_Block});
+        if (capture_geometry_position) {
+            put(deco, Op_MemberDecorate, {t_output_per_vertex, 0, Dec_XfbBuffer, 0});
+            put(deco, Op_MemberDecorate, {t_output_per_vertex, 0, Dec_XfbStride, 16});
+            put(deco, Op_MemberDecorate, {t_output_per_vertex, 0, Dec_Offset, 0});
+        }
         for (uint32_t attr = 0; attr < 32; ++attr) {
             if (attribute_inputs[attr]) {
                 put(deco, Op_Decorate, {attribute_inputs[attr], Dec_Location, attr});
@@ -2451,14 +2461,15 @@ struct SpirvCompute {
         put(types, Op_TypeInt, {t_i32, 32, 1});
         put(types, Op_TypeBool, {t_bool});
         put(types, Op_TypeVector, {t_v4f, t_f32, 4});
-        put(types, Op_TypeStruct, {t_per_vertex, t_v4f});
+        put(types, Op_TypeStruct, {t_input_per_vertex, t_v4f});
+        put(types, Op_TypeStruct, {t_output_per_vertex, t_v4f});
         put(types, Op_Constant, {t_u32, c_three, 3});
-        put(types, Op_TypeArray, {t_input_positions, t_per_vertex, c_three});
+        put(types, Op_TypeArray, {t_input_positions, t_input_per_vertex, c_three});
         put(types, Op_TypeArray, {t_input_varyings, t_v4f, c_three});
         put(types, Op_TypePointer, {ptr_in_positions, SC_Input, t_input_positions});
         put(types, Op_TypePointer, {ptr_in_varyings, SC_Input, t_input_varyings});
         put(types, Op_TypePointer, {ptr_in_v4f, SC_Input, t_v4f});
-        put(types, Op_TypePointer, {ptr_out_position, SC_Output, t_per_vertex});
+        put(types, Op_TypePointer, {ptr_out_position, SC_Output, t_output_per_vertex});
         put(types, Op_TypePointer, {ptr_out_v4f, SC_Output, t_v4f});
         put(types, Op_Variable, {ptr_in_positions, input_position, SC_Input});
         put(types, Op_Variable, {ptr_out_position, output_position, SC_Output});
@@ -2693,9 +2704,9 @@ FragmentInterpolationLayout fragment_interpolation_layout(
 }
 
 std::vector<uint32_t> recompile_interpolation_geometry(
-        const FragmentInterpolationLayout& layout) {
+        const FragmentInterpolationLayout& layout, bool capture_position) {
     SpirvCompute builder;
-    return builder.build_interpolation_geometry(layout);
+    return builder.build_interpolation_geometry(layout, capture_position);
 }
 
 // Machine state during recompilation: the VGPR and SGPR files (VGPR/SGPR number -> current SSA bits

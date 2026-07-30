@@ -87,6 +87,23 @@ bool has_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
     return false;
 }
 
+// Whether an instruction's zero-based operand has the requested literal value.
+bool has_instruction_operand(const std::vector<uint32_t>& spv, uint32_t opcode,
+                             uint32_t operand_index, uint32_t value) {
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t word = spv[i];
+        const uint32_t op = word & 0xffffu;
+        const uint32_t wc = word >> 16u;
+        if (wc == 0 || i + wc > spv.size()) return false;
+        if (op == opcode && wc > operand_index + 1u &&
+            spv[i + 1u + operand_index] == value)
+            return true;
+        i += wc;
+    }
+    return false;
+}
+
 bool has_select_with_false_constant(const std::vector<uint32_t>& spv, uint32_t literal) {
     constexpr uint32_t OpConstant = 43, OpSelect = 169;
     std::unordered_set<uint32_t> matching_constants;
@@ -2072,6 +2089,24 @@ int main() {
         return 1;
     }
     printf("  [ok]   mixed P0+smooth interpolation generates coefficient pass-through SPIR-V\n");
+
+    // Transform feedback must decorate the final pre-rasterization stage. When interpolation needs
+    // the generated GS, decorating only the VS produces real pixels but writes zero probe vertices.
+    const std::vector<uint32_t> mixed_xfb_gs =
+        recompile_interpolation_geometry(mixed_layout, true);
+    constexpr uint32_t OpCapability = 17, OpExecutionMode = 16, OpMemberDecorate = 72;
+    constexpr uint32_t CapTransformFeedback = 53, ExecutionModeXfb = 11;
+    constexpr uint32_t DecOffset = 35, DecXfbBuffer = 36, DecXfbStride = 37;
+    if (mixed_xfb_gs.empty() ||
+        !has_instruction_operand(mixed_xfb_gs, OpCapability, 0, CapTransformFeedback) ||
+        !has_instruction_operand(mixed_xfb_gs, OpExecutionMode, 1, ExecutionModeXfb) ||
+        !has_instruction_operand(mixed_xfb_gs, OpMemberDecorate, 2, DecXfbBuffer) ||
+        !has_instruction_operand(mixed_xfb_gs, OpMemberDecorate, 2, DecXfbStride) ||
+        !has_instruction_operand(mixed_xfb_gs, OpMemberDecorate, 2, DecOffset)) {
+        printf("  [FAIL] generated interpolation geometry does not own transform-feedback output\n");
+        return 1;
+    }
+    printf("  [ok]   generated interpolation geometry can capture its final positions\n");
 
     // Explicit P10/P20/P0 values are the three AMD parameters used by Astro Bot's rejected title
     // composite PS. All three fragment inputs are Flat outputs of the generated geometry stage.
