@@ -20,6 +20,7 @@
 #include "gpu/gpu_timeline.hpp"        // request_interactive_capture_bundle (F9 whole-frame grab)
 #include "capture_schedule.hpp"        // exact host-frame screenshot calibration trigger
 #include "present_blit.hpp"           // GPU scanout handoff: acquire/release the renderer's front image
+#include "present_blit_policy.hpp"    // reject stale CPU/GPU representations of guest flips
 #include "host/lifecycle.hpp"          // frontend-owned stop/pause gates
 #include "host/boot_program.hpp"       // boot_program (shared guest-boot path, also used by boot_trace)
 #include "host/exec_image.hpp"         // run_entry
@@ -1271,6 +1272,8 @@ int main(int argc, char** argv) {
     auto lastFrameProgress = loopStarted;
     auto nextTimedDump = loopStarted + std::chrono::milliseconds(timedDumpMs);
     uint64_t shown = 0, lastFrameSeq = ~0ull, patFrame = 0;
+    bool havePresentedGuestFlip = false;
+    uint64_t lastPresentedGuestFlip = 0;
     int gpuPrevSlot = -1;   // #1270: the GPU scanout slot presented last frame (released after its read)
     unsigned timedDumpCount = 0;
     // Interactive frame grab (F9): base output dir + a per-session counter; when a grab was armed we
@@ -1756,6 +1759,11 @@ int main(int argc, char** argv) {
             // GPU present (#1270): blit the renderer's front-buffer image straight to the swapchain.
             prosper::frontend::GpuScanoutFrame gf;
             if (prosper::frontend::present_blit_acquire(gf)) {
+                if (!prosper::frontend::present_source_is_newer(
+                        havePresentedGuestFlip, lastPresentedGuestFlip, gf.frame_seq)) {
+                    prosper::frontend::present_blit_release(gf.slot);
+                    continue;
+                }
                 bool grabReady = false;
                 PresentAttempt attempt = present_frame_gpu(
                     vk, gf, gpuPrevSlot, !pendingGrabScreenshot.empty(), grabReady);
@@ -1770,6 +1778,8 @@ int main(int argc, char** argv) {
                     running = false;
                 } else {
                     shown++; lastFrameProgress = std::chrono::steady_clock::now();
+                    havePresentedGuestFlip = true;
+                    lastPresentedGuestFlip = gf.frame_seq;
                     static auto t0 = std::chrono::steady_clock::now(); static uint64_t mark = 0;
                     if (shown - mark >= 60) {
                         auto now = std::chrono::steady_clock::now();
@@ -1788,13 +1798,27 @@ int main(int argc, char** argv) {
                 gpu::PresentFrameLease cf;
                 if (gpu::present_acquire_rendered_frame(cf) && cf.width && cf.height && cf.rgba &&
                     cf.rgba->size() == (size_t)cf.width * cf.height * 4) {
+                    if (!prosper::frontend::present_source_is_newer(
+                            havePresentedGuestFlip, lastPresentedGuestFlip,
+                            cf.guest_present_count)) {
+                        // Consume this CPU publication even though it is stale. Otherwise every
+                        // GPU acquire gap would redisplay the same old fallback indefinitely.
+                        lastFrameSeq = cf.frame_seq;
+                        continue;
+                    }
                     PresentAttempt a = present_frame(vk, cf.rgba->data(), cf.width, cf.height);
                     if (gpuPrevSlot >= 0) { prosper::frontend::present_blit_release(gpuPrevSlot); gpuPrevSlot = -1; }
                     if (a == PresentAttempt::out_of_date) swapchainDirty = true;
                     else if (a == PresentAttempt::skipped) std::this_thread::sleep_for(std::chrono::milliseconds(4));
                     else if (a == PresentAttempt::failed) running = false;
-                    else { lastFrameSeq = cf.frame_seq; shown++; lastFrameProgress = std::chrono::steady_clock::now();
-                           flushGrabScreenshot(cf.rgba->data(), cf.width, cf.height); }
+                    else {
+                        lastFrameSeq = cf.frame_seq;
+                        shown++;
+                        lastFrameProgress = std::chrono::steady_clock::now();
+                        havePresentedGuestFlip = true;
+                        lastPresentedGuestFlip = cf.guest_present_count;
+                        flushGrabScreenshot(cf.rgba->data(), cf.width, cf.height);
+                    }
                 } else {
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 }

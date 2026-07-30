@@ -71,6 +71,7 @@ struct PresentSnapshot {
 // storage remains valid after a newer frame is published or present_reset() is called.
 struct PresentFrameLease {
     uint64_t frame_seq = 0;
+    uint64_t guest_present_count = 0; // guest flip represented by this renderer publication
     uint32_t width = 0;
     uint32_t height = 0;
     std::shared_ptr<const std::vector<uint8_t>> rgba;

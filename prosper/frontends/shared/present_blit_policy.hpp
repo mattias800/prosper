@@ -23,4 +23,13 @@ constexpr bool present_blit_has_new_flip(uint64_t last_published_flip,
            last_published_flip != current_flip;
 }
 
+// GPU scanout images and CPU readback fallbacks are produced by different paths, but both carry
+// the guest flip that they represent. Never let an older fallback replace a frame that has already
+// reached the window; equal identities are duplicate representations of the same guest frame.
+constexpr bool present_source_is_newer(bool have_presented_source,
+                                       uint64_t last_presented_flip,
+                                       uint64_t candidate_flip) {
+    return !have_presented_source || candidate_flip > last_presented_flip;
+}
+
 } // namespace prosper::frontend

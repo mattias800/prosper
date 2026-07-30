@@ -193,13 +193,21 @@ int main() {
           lease.rgba->data() == shared_data,
           "shared rendered publication preserves allocation identity without copying");
     const uint64_t leased_seq = lease.frame_seq;
+    const uint64_t leased_present_count = lease.guest_present_count;
+    CHECK(leased_present_count == gpu::present_count(),
+          "rendered-frame lease records the guest flip it represents");
     std::vector<uint8_t> replacement(FB_BYTES, 0x5A);
+    flip(handle, 0, 0, 0, 0, 0);
     gpu::present_write_frame(replacement.data(), W, H);
     CHECK(lease.frame_seq == leased_seq && lease.rgba->data() == shared_data &&
-          *lease.rgba == rendered,
+          lease.guest_present_count == leased_present_count && *lease.rgba == rendered,
           "rendered-frame lease remains valid after a newer publication");
+    gpu::PresentFrameLease replacement_lease;
+    CHECK(gpu::present_acquire_rendered_frame(replacement_lease) &&
+          replacement_lease.guest_present_count == gpu::present_count() &&
+          replacement_lease.guest_present_count > lease.guest_present_count,
+          "newer rendered publication records its newer guest flip");
     // The rendered frame wins over the raw guest buffer even across flips.
-    flip(handle, 0, 0, 0, 0, 0);
     gpu::present_readback(out.data(), out.size());
     CHECK(memcmp(out.data(), replacement.data(), FB_BYTES) == 0,
           "latest rendered frame takes precedence over the flipped guest buffer");
