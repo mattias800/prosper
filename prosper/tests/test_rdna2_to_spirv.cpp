@@ -585,6 +585,58 @@ int main() {
     CHECK(has_spirv_local_size(native_spv17d, 64, 1, 1),
           "multidimensional guest wave flattens Vulkan LocalSize X for full subgroups");
 
+    // Kernel 17d1: Astro's Wave32 BVH traversal turns a VOPC predicate into the first matching
+    // lane with s_ff1_i32_b32, then immediately uses VCC_LO as ordinary scalar data. The first
+    // subgroup has one match at lane 5; the second subgroup is empty and must return -1. Store the
+    // scalar result from every invocation so real Vulkan execution checks the complete reduction.
+    const uint32_t code17d1[] = {
+        0xbe800385u,              // s_mov_b32 s0, 5
+        0x7d840000u,              // v_cmp_eq_u32 vcc, s0, v0
+        0xbeea136au,              // s_ff1_i32_b32 vcc_lo, vcc_lo (exact live destination/source)
+        0x7e02026au,              // v_mov_b32 v1, vcc_lo (scalar-data lifetime)
+        0xe0702000u, 0x80020100u, // buffer_store_dword v1, v0, s[8:11] idxen
+        0xbf810000u,
+    };
+    ShaderResourceTable rt17d1;
+    { ShaderResource dst{}; dst.cls = ResourceClass::ConstantBuffer;
+      dst.format = DataFormat::Uint32; dst.num_components = 1;
+      dst.binding = 3; dst.stride = 4; dst.sgpr_base = 8;
+      rt17d1.resources.push_back(dst); }
+    ComputeShaderConfig native_cfg17d1;
+    native_cfg17d1.local_x = 64;
+    native_cfg17d1.wave_size = 32;
+    native_cfg17d1.native_subgroup_size = 32;
+    const std::vector<uint32_t> native_spv17d1 = recompile_compute(
+        code17d1, std::size(code17d1), &rt17d1, native_cfg17d1);
+    CHECK(!native_spv17d1.empty() && count_spirv_opcode(native_spv17d1, 349) >= 2 &&
+              count_spirv_opcode(native_spv17d1, 335) >= 1,
+          "Wave32 s_ff1_i32_b32 lowers to an exact first-active subgroup reduction");
+    ComputeShaderConfig portable_cfg17d1 = native_cfg17d1;
+    portable_cfg17d1.native_subgroup_size = 0;
+    CHECK(recompile_compute(code17d1, std::size(code17d1), &rt17d1,
+                            portable_cfg17d1).empty(),
+          "s_ff1_i32_b32 rejects without an exact 32-lane subgroup contract");
+    const auto subgroup17d1 = prosper::test::default_compute_subgroup_properties();
+    const bool can_execute17d1 = subgroup17d1.size == 32 &&
+        (subgroup17d1.stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (subgroup17d1.operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) &&
+        (subgroup17d1.operations & VK_SUBGROUP_FEATURE_VOTE_BIT);
+    if (can_execute17d1) {
+        std::vector<uint32_t> initial17d1(64, 0u), got17d1;
+        prosper::test::run_compute(native_spv17d1, std::vector<float>(64, 0.0f),
+                                   64, 64, {}, initial17d1, &got17d1);
+        uint32_t bad17d1 = 0;
+        for (uint32_t lane = 0; lane < 64 && got17d1.size() == 64; ++lane) {
+            const uint32_t expected = lane < 32 ? 5u : 0xffffffffu;
+            bad17d1 += got17d1[lane] != expected;
+        }
+        CHECK(got17d1.size() == 64 && bad17d1 == 0,
+              "Wave32 s_ff1 returns lane 5 for a hit and -1 for an empty mask");
+    } else {
+        std::printf("  [skip] s_ff1 execution: host default subgroup is %u or lacks vote/arithmetic\n",
+                    subgroup17d1.size);
+    }
+
     // Kernel 17d2: Astro's mask-priority sequence compares a VOPC-produced SGPR pair against zero,
     // then uses that wave-uniform SCC in s_cselect_b64.  Keep the irreducible prefix so this exercises
     // the generic dispatcher.  Wave 0's mask is empty and selects all lanes; wave 1 has one set bit in

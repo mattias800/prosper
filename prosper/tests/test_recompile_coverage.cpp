@@ -433,6 +433,19 @@ int main() {
                              compute_cfg_dispatch_vcc_gt_zero.size(), &dispatch_rt,
                              wave32_dispatch_config).empty(),
           "the complex dispatcher preserves Wave32 VCC_LO > 0 scalar mask semantics");
+    std::vector<uint32_t> compute_cfg_dispatch_ff1 = {
+        0xBE800385u, // s_mov_b32 s0, 5
+        0x7D840000u, // v_cmp_eq_u32 vcc, s0, v0
+        0xBEEA136Au, // s_ff1_i32_b32 vcc_lo, vcc_lo
+        0x7E04026Au, // v_mov_b32 v2, vcc_lo (consume the scalar-data result)
+    };
+    compute_cfg_dispatch_ff1.insert(
+        compute_cfg_dispatch_ff1.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_ff1.data(),
+                             compute_cfg_dispatch_ff1.size(), &dispatch_rt,
+                             wave32_dispatch_config).empty(),
+          "the complex dispatcher lowers exact Wave32 s_ff1 mask reduction to scalar data");
     // A physical VCC half may hold ordinary scalar data before a later block starts a mask lifetime
     // in the same word. Block discovery must not retroactively reinterpret the earlier comparison as
     // a wave vote after the B32 dataflow learns about that later lifetime (Astro world-map PC436).
