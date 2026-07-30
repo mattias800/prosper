@@ -3998,9 +3998,12 @@ bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
     // deliberately does not consume an armed interactive request when semantic_draw_count is zero.
     std::unique_ptr<PendingGpuCapture> pending_capture;
     std::vector<SubmitOperation> capture_operations;
-    const bool can_defer_capture = std::any_of(
+    const bool has_indirect_dispatch = std::any_of(
         st.dispatches.begin(), st.dispatches.end(),
         [](const GpuState::Dispatch& dispatch) { return dispatch.indirect; });
+    // Preserve the established exact-trace path for ordinary no-DMA compute submits, and extend it
+    // to DMA-backed indirect consumers whose arguments cannot be realized until after the copy.
+    const bool can_defer_capture = st.dma_copies.empty() || has_indirect_dispatch;
     if (const char* capture_path = std::getenv("PROSPER_GPU_CAPTURE");
         capture_path && *capture_path) {
         capture_operations = plan_submit_operations(st);

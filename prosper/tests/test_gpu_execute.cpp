@@ -7,6 +7,7 @@
 #include "../src/gpu/videoout_present.hpp"
 #include "../src/gpu/pm4_registers.hpp"
 #include "../src/gpu/vk_translate.hpp"
+#include "../src/hle/dispatch.hpp"
 #include "../src/host/guest_write_watch.hpp"
 #include "render_runner.h"
 #include <algorithm>
@@ -42,6 +43,7 @@ alignas(256) static const uint32_t kPs[] = {
 alignas(256) static const uint32_t kDccPs[] = {
     0x7E000280u, 0xF8001803u, 0x00000000u, 0xBF810000u,
 };
+alignas(256) static const uint32_t kNoopCs[] = {0xBF810000u};
 static void set_pgm(GpuState& st, uint32_t lo_off, uint32_t hi_off, const void* p) {
     uint64_t a = (uint64_t)(uintptr_t)p;
     st.sh[lo_off] = (uint32_t)((a >> 8) & 0xFFFFFFFFu);
@@ -50,6 +52,7 @@ static void set_pgm(GpuState& st, uint32_t lo_off, uint32_t hi_off, const void* 
 
 int main() {
     printf("== test_gpu_execute ==\n");
+    prosper::register_agc_hle();
     const uint32_t W = 64, H = 64;
 
     uint64_t occurrence = 0;
@@ -763,16 +766,35 @@ int main() {
                   : "failed compute realization poisons the stalled indirect consumer");
     }
 
-    // Compute-only and DMA-only submissions bypass presentation, but an environment capture aimed
-    // at an unsupported compute program must still retain that semantic submit.  Exercise the
-    // non-render hook with an ordered DMA operation here; the compute selector/failure closure is
-    // covered by test_gpu_capture's semantic-dispatch cases.
+    // Compute-only submissions bypass presentation. Their capture must remain deferred even without
+    // DMA so finish receives the exact realized/executed compute rather than eagerly materializing
+    // the intentionally empty pre-execution lists as an unrealized operation.
     {
-        uint32_t source = 0x13579BDFu, destination = 0;
+        auto create_shader = prosper::Hle::lookup("f3dg2CSgRKY");
+        ShaderReg compute_registers[2] = {
+            {P::COMPUTE_PGM_LO, 0}, {P::COMPUTE_PGM_HI, 0},
+        };
+        AgcShaderHeader compute_header{};
+        compute_header.file_header = 0x34333231u;
+        compute_header.version = 0x18;
+        compute_header.sh_registers = compute_registers;
+        compute_header.shader_size = sizeof(kNoopCs);
+        compute_header.type = 0;
+        compute_header.num_sh_registers = 2;
+        void* registered_shader = nullptr;
+        CHECK(create_shader &&
+                  create_shader(reinterpret_cast<uint64_t>(&registered_shader),
+                                reinterpret_cast<uint64_t>(&compute_header),
+                                reinterpret_cast<uint64_t>(kNoopCs), 0, 0, 0) == 0 &&
+                  registered_shader == &compute_header,
+              "register a descriptor-free compute shader for non-render capture");
         GpuState nonrender;
-        nonrender.dma_copies.push_back({
-            reinterpret_cast<uint64_t>(&destination), reinterpret_cast<uint64_t>(&source),
-            sizeof(source), 0, 17, 0});
+        nonrender.sh[P::COMPUTE_PGM_LO] = compute_registers[0].value;
+        nonrender.sh[P::COMPUTE_PGM_HI] = compute_registers[1].value;
+        GpuState::Dispatch direct_dispatch;
+        direct_dispatch.threads_x = direct_dispatch.threads_y = direct_dispatch.threads_z = 1;
+        direct_dispatch.command_order = 17;
+        nonrender.dispatches.push_back(direct_dispatch);
         const std::filesystem::path path =
             std::filesystem::temp_directory_path() / "prosper_nonrender_submit_capture.prgcap";
         std::error_code filesystem_error;
@@ -784,7 +806,13 @@ int main() {
         setenv("PROSPER_GPU_CAPTURE", path.string().c_str(), 1);
         setenv("PROSPER_GPU_CAPTURE_METADATA_ONLY", "1", 1);
 #endif
+        uint32_t compute_calls = 0;
+        set_submit_compute([&](const std::vector<ComputeItem>& items) {
+            compute_calls += static_cast<uint32_t>(items.size());
+            return !items.empty();
+        });
         const bool executed = execute_nonrender_submit_work(nonrender, 1441);
+        set_submit_compute({});
 #ifdef _WIN32
         _putenv_s("PROSPER_GPU_CAPTURE", "");
         _putenv_s("PROSPER_GPU_CAPTURE_METADATA_ONLY", "");
@@ -794,13 +822,14 @@ int main() {
 #endif
         GpuCaptureFile captured;
         std::string capture_error;
-        CHECK(executed && destination == source &&
+        CHECK(executed && compute_calls == 1 &&
                   read_gpu_capture(path.string(), captured, capture_error) &&
-                  captured.metadata.submit_index == 1441 && captured.dma_copies.size() == 1 &&
-                  captured.operations.size() == 1 &&
-                  captured.operations[0].kind == SubmitOperationKind::DmaCopy &&
+                  captured.metadata.submit_index == 1441 && captured.computes.size() == 1 &&
+                  captured.computes[0].code_addr == reinterpret_cast<uint64_t>(kNoopCs) &&
+                  captured.operations.size() == 1 && captured.operations[0].realized &&
+                  captured.operations[0].kind == SubmitOperationKind::Dispatch &&
                   !captured.expected_output_valid,
-              "environment capture retains a non-render submit without inventing an output oracle");
+              "environment capture retains the exact executed direct-compute submit");
         std::filesystem::remove(path, filesystem_error);
     }
 

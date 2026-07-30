@@ -49,7 +49,7 @@ struct GpuState {
     // SetIndexType; 0 = 16-bit, 1 = 32-bit). The executor fetches indexed data and renders with
     // vkCmdDrawIndexed (#64).
     struct Draw {
-        uint32_t index_count;
+        uint32_t index_count = 0;
         uint32_t instance_count = 1;
         std::shared_ptr<const GpuState> state;
         bool     indexed = false;

@@ -366,6 +366,7 @@ int main() {
                   "graphics and compute indirect bases retain independently");
             CHECK(indirect_state.draws.size() == 1 && indirect_state.draws[0].indirect &&
                   indirect_state.draws[0].indexed &&
+                  indirect_state.draws[0].index_count == 0 &&
                   indirect_state.draws[0].index_base == reinterpret_cast<uint64_t>(indices) &&
                   indirect_state.draws[0].indirect_args_addr ==
                       reinterpret_cast<uint64_t>(graphics_args) + 4 &&
