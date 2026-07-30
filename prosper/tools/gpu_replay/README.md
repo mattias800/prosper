@@ -350,6 +350,10 @@ stage is fault-safely read once, content-deduplicated, capped at 64 KiB, and sto
 `s_endpgm`/unknown instruction or the cap. Total failed-stage data is capped at 64 MiB, diagnostics cannot
 outnumber semantic operations, and every reference/hash is validated while reading. Captures v1-v6 remain
 readable and print `failure-diagnostics: unavailable (capture predates v7)` rather than inventing evidence.
+An indirect compute dispatch whose argument producer failed remains explicitly unrealized with an unknown/zero
+launch, but current runtime capture enriches that failure from its retained register snapshot so the exact raw
+compute program and descriptor metadata remain inspectable and dumpable. It does not invent the missing launch
+specialization; failed-compute retry still requires a later capture whose dispatch arguments were resolved.
 
 `--retry-failed-stage FAILURE:STAGE` reruns one retained stage through the current recompiler with its exact
 captured resource table. For split vertex programs, `--retry-failed-chain FAILURE` instead reconstructs the

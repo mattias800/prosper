@@ -3331,6 +3331,69 @@ bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
         failures.insert(failures.end(),
                         std::make_move_iterator(compute_failures.begin()),
                         std::make_move_iterator(compute_failures.end()));
+    } else if (semantic_state && exact_failures) {
+        // Argument resolution can fail before execute_ordered_gpustate has enough information to
+        // append an exact OperationRealizationFailure. Add those missing dispatch records here,
+        // before capture_submit_items would otherwise synthesize a permanently empty Unknown.
+        for (size_t index = 0; index < semantic_state->dispatches.size(); ++index) {
+            const GpuState::Dispatch& dispatch = semantic_state->dispatches[index];
+            const bool captured_operation = operations.empty() || std::any_of(
+                operations.begin(), operations.end(), [&](const SubmitOperation& operation) {
+                    return operation.kind == SubmitOperationKind::Dispatch &&
+                           operation.index == index &&
+                           operation.command_order == dispatch.command_order;
+                });
+            if (!captured_operation) continue;
+            const bool realized = std::any_of(
+                computes.begin(), computes.end(), [&](const ComputeItem& item) {
+                    return item.dispatch_index == index &&
+                           item.command_order == dispatch.command_order;
+                });
+            const bool diagnosed = std::any_of(
+                failures.begin(), failures.end(), [&](const OperationRealizationFailure& failure) {
+                    return failure.kind == SubmitOperationKind::Dispatch &&
+                           failure.index == index &&
+                           failure.command_order == dispatch.command_order;
+                });
+            if (realized || diagnosed) continue;
+            OperationRealizationFailure failure;
+            failure.kind = SubmitOperationKind::Dispatch;
+            failure.index = index;
+            failure.command_order = dispatch.command_order;
+            failure.reason = RealizationFailureReason::Unknown;
+            failure.compute_launch = resolve_compute_launch(dispatch);
+            failures.push_back(std::move(failure));
+        }
+        // Ordered execution can reject an indirect dispatch before shader realization when an
+        // earlier producer leaves its argument buffer unreadable or empty. The exact trace owns the
+        // operation outcome and launch facts, but its Unknown failure then has no stage at all. Use
+        // the retained pre-submit register snapshot only to recover the shader diagnostic: this does
+        // not resolve the arguments, mark the operation realized, or execute GPU work. Keeping the
+        // raw program/resource metadata makes a COMPUTE_ADDR-selected capsule useful for offline
+        // inspection even when the missing producer is the very bug under investigation.
+        for (auto& failure : failures) {
+            if (failure.kind != SubmitOperationKind::Dispatch || !failure.stages.empty() ||
+                failure.index >= semantic_state->dispatches.size())
+                continue;
+            const GpuState::Dispatch& dispatch = semantic_state->dispatches[failure.index];
+            GpuState diagnostic_state = dispatch.state ? *dispatch.state : *semantic_state;
+            diagnostic_state.dispatches.clear();
+            diagnostic_state.dispatches.push_back(dispatch);
+            std::vector<OperationRealizationFailure> semantic_failures;
+            std::vector<ComputeItem> semantic_items = realize_compute_dispatches(
+                diagnostic_state, metadata.submit_index, &semantic_failures);
+            if (!semantic_items.empty()) {
+                ShaderRealizationDiagnostic stage;
+                stage.stage = ShaderProgramStage::Compute;
+                stage.program_addr = semantic_items.front().code_addr;
+                stage.resources = semantic_items.front().resources;
+                stage.recompiled = !semantic_items.front().spirv.empty();
+                failure.stages.push_back(std::move(stage));
+            } else if (!semantic_failures.empty() &&
+                       !semantic_failures.front().stages.empty()) {
+                failure.stages = std::move(semantic_failures.front().stages);
+            }
+        }
     }
     const std::vector<ComputeItem> snapshot_computes =
         with_pending_gds_snapshot(pending, computes);

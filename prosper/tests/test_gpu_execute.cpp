@@ -832,6 +832,55 @@ int main() {
               "environment capture retains the exact executed direct-compute submit");
         std::filesystem::remove(path, filesystem_error);
 
+        // A failed producer can leave an indirect dispatch's argument buffer empty before the
+        // selected operation is reached. The exact ordered trace correctly keeps that dispatch
+        // unrealized, but capture must still retain the program from its semantic register snapshot
+        // so the shader can be dumped and inspected without another title boot.
+        alignas(4) uint32_t unavailable_indirect_args[3] = {};
+        GpuState unresolved = nonrender;
+        unresolved.dispatches.clear();
+        GpuState::Dispatch unresolved_dispatch;
+        unresolved_dispatch.indirect = true;
+        unresolved_dispatch.indirect_args_addr =
+            reinterpret_cast<uint64_t>(unavailable_indirect_args);
+        unresolved_dispatch.command_order = 19;
+        unresolved.dispatches.push_back(unresolved_dispatch);
+        const std::vector<SubmitOperation> unresolved_operations = {
+            {SubmitOperationKind::Dispatch, 0, unresolved_dispatch.command_order},
+        };
+        auto unresolved_pending = std::make_unique<PendingGpuCapture>();
+        unresolved_pending->materialized = false;
+        unresolved_pending->path = path.string();
+        unresolved_pending->capture.metadata.submit_index = 1442;
+        const std::vector<DrawItem> no_draws;
+        const std::vector<ComputeItem> no_computes;
+        // Argument resolution failed before the ordered trace could populate the exact failure
+        // list. Capture must create and enrich the missing dispatch diagnostic itself.
+        const std::vector<OperationRealizationFailure> unresolved_failures;
+        const bool unresolved_written = finish_requested_gpu_capture(
+            std::move(unresolved_pending), {}, capture_error, &no_draws, &no_computes,
+            &unresolved_operations, &unresolved, &unresolved_failures);
+        GpuCaptureFile unresolved_capture;
+        const bool unresolved_read = unresolved_written &&
+            read_gpu_capture(path.string(), unresolved_capture, capture_error);
+        const GpuCapturedStageDiagnostic* unresolved_stage = unresolved_read &&
+            unresolved_capture.failure_diagnostics.size() == 1 &&
+            unresolved_capture.failure_diagnostics[0].stages.size() == 1
+                ? &unresolved_capture.failure_diagnostics[0].stages[0] : nullptr;
+        CHECK(unresolved_stage && unresolved_capture.computes.empty() &&
+                  unresolved_capture.operations.size() == 1 &&
+                  !unresolved_capture.operations[0].realized &&
+                  unresolved_capture.failure_diagnostics[0].reason ==
+                      RealizationFailureReason::Unknown &&
+                  unresolved_stage->stage == ShaderProgramStage::Compute &&
+                  unresolved_stage->program_addr == reinterpret_cast<uint64_t>(kNoopCs) &&
+                  unresolved_stage->raw_shader_index <
+                      unresolved_capture.raw_shader_versions.size() &&
+                  unresolved_capture.raw_shader_versions[unresolved_stage->raw_shader_index].words ==
+                      std::vector<uint32_t>(std::begin(kNoopCs), std::end(kNoopCs)),
+              "deferred capture retains the shader for an unresolved indirect dispatch");
+        std::filesystem::remove(path, filesystem_error);
+
         // Vulkan guarantees only 65,535 workgroups per axis, but real devices may advertise more
         // (RADV exposes UINT32_MAX in X). Astro Bot emits indirect 1D dispatches above the portable
         // minimum during world-map loading, after already using a 131,072-group direct dispatch.
