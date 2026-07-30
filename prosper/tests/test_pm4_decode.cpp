@@ -41,11 +41,17 @@ int main() {
     auto setcx_direct = Hle::lookup("LHFXRrlTPD8"); // SetCxRegisterDirect (#395 F5)
     auto setsh_direct = Hle::lookup("pFLArOT53+w"); // SetShRegisterDirect (#395 F5)
     auto setuc_direct = Hle::lookup("w4-d0n60hdo"); // SetUcRegisterDirect (#395 F5)
+    auto set_indirect_base = Hle::lookup("RmaJwLtc8rY"); // SetBaseIndirectArgs
+    auto stall_parser = Hle::lookup("u2T2DiA5hRI");      // StallCommandBufferParser
+    auto draw_indirect = Hle::lookup("t1vNu082-jM");     // DrawIndexIndirect
+    auto dispatch_indirect = Hle::lookup("CtB+A9-VxO0"); // DispatchIndirect
     CHECK(reset && idx && setcx && p_add && p_adr && draw && drawi && evt && push && pop && instances &&
-          setcx_direct && setsh_direct && setuc_direct,
+          setcx_direct && setsh_direct && setuc_direct && set_indirect_base && stall_parser &&
+          draw_indirect && dispatch_indirect,
           "AGC Dcb builders registered");
     if (!(reset && idx && setcx && p_add && p_adr && draw && drawi && evt && push && pop && instances &&
-          setcx_direct && setsh_direct && setuc_direct)) {
+          setcx_direct && setsh_direct && setuc_direct && set_indirect_base && stall_parser &&
+          draw_indirect && dispatch_indirect)) {
         printf("== FAIL ==\n"); return 1;
     }
 
@@ -73,6 +79,11 @@ int main() {
     draw(D, /*index_count*/ 0x1234, /*modifier*/ 0x1122334455667788ull, 0, 0, 0);
     drawi(D, /*index_count*/ 0x0600, /*indices*/ 0xDEAD0000BEEF0040ull, /*modifier*/ 0x40000000ull, 0, 0);
     evt(D, /*event_type*/ 0x42, /*address*/ 0x1400ABCD00ull, 0, 0, 0);
+    set_indirect_base(D, /*graphics*/ 0, 0x123456789ABC0000ull, 0, 0, 0);
+    stall_parser(D, 0, 0, 0, 0, 0);
+    draw_indirect(D, /*byte_offset*/ 0x40, /*modifier*/ 0x80000000ull, 0, 0, 0);
+    set_indirect_base(D, /*compute*/ 1, 0xFEDCBA9876540000ull, 0, 0, 0);
+    dispatch_indirect(D, /*byte_offset*/ 0x80, /*modifier*/ 1, 0, 0, 0);
     pop(D, 0, 0, 0, 0, 0);
 
     size_t used_dw = (size_t)(dcb.cursor_up - dcb.bottom);
@@ -81,8 +92,8 @@ int main() {
     std::vector<Pm4Command> ops;
     size_t consumed = decode_pm4(buffer, 256, ops);   // pass full buffer; decoder stops at the zero tail
     CHECK(consumed == used_dw, "decoder consumed exactly the built dwords (stops at zero pad)");
-    CHECK(ops.size() == 12, "decoded 12 packets");
-    if (ops.size() != 12) { printf("== FAIL: got %zu packets ==\n", ops.size()); return 1; }
+    CHECK(ops.size() == 17, "decoded 17 packets");
+    if (ops.size() != 17) { printf("== FAIL: got %zu packets ==\n", ops.size()); return 1; }
 
     using K = Pm4Command::Kind;
     CHECK(ops[0].kind == K::PushMarker && ops[0].marker_label &&
@@ -126,7 +137,20 @@ int main() {
     // Address-carrying EVENT_WRITE (#132): the widened packet now round-trips its destination
     // address (was discarded, so an address-carrying event lost its write target).
     CHECK(ops[10].event_addr == 0x1400ABCD00ull, "op10 EventWrite address round-trips (was dropped)");
-    CHECK(ops[11].kind == K::PopMarker, "op11 = PopMarker");
+    CHECK(ops[11].kind == K::SetBaseIndirectArgs && ops[11].indirect_shader_type == 0 &&
+          ops[11].indirect_base == 0x123456789ABC0000ull,
+          "op11 = graphics indirect argument base");
+    CHECK(ops[12].kind == K::StallCommandBufferParser, "op12 = parser visibility barrier");
+    CHECK(ops[13].kind == K::DrawIndexIndirect && ops[13].indirect_offset == 0x40 &&
+          ops[13].di_modifier == 0x80000000ull,
+          "op13 = indexed indirect draw offset/modifier");
+    CHECK(ops[14].kind == K::SetBaseIndirectArgs && ops[14].indirect_shader_type == 1 &&
+          ops[14].indirect_base == 0xFEDCBA9876540000ull,
+          "op14 = compute indirect argument base");
+    CHECK(ops[15].kind == K::DispatchIndirect && ops[15].indirect_offset == 0x80 &&
+          ops[15].dispatch_modifier == 1,
+          "op15 = indirect dispatch offset/modifier");
+    CHECK(ops[16].kind == K::PopMarker, "op16 = PopMarker");
 
     // Every decoded packet's len must match its header, and the payload pointer must be in-buffer.
     bool spans_ok = true;
