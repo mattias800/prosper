@@ -3,7 +3,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <memory>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace prosper::frontend {
@@ -120,5 +124,69 @@ inline bool inject_rtt_pixels(std::vector<uint8_t>& dst, uint32_t dst_w, uint32_
     }
     return true;
 }
+
+// One immutable producer snapshot is commonly bound through the same scaled view by many draws and
+// bindings in a submit. Materialize each (snapshot identity, source shape, destination shape,
+// bytes-per-pixel) only once. The retained source owner prevents allocator address reuse from aliasing
+// a live key; the retained output lets FrameResource copies and the backend's raw-pointer upload key
+// share the bytes.
+class RttInjectionCache {
+public:
+    std::shared_ptr<const std::vector<uint8_t>> materialize(
+        std::shared_ptr<const std::vector<uint8_t>> source,
+        uint32_t dst_w, uint32_t dst_h, uint32_t src_w, uint32_t src_h,
+        uint32_t bytes_per_pixel) {
+        if (!source) return {};
+        if (exact_rtt_snapshot_borrowable(
+                dst_w, dst_h, src_w, src_h, bytes_per_pixel, source->size()))
+            return source;
+
+        const Key key{source.get(), dst_w, dst_h, src_w, src_h, bytes_per_pixel};
+        auto found = entries_.find(key);
+        if (found != entries_.end()) return found->second.pixels;
+
+        auto mutable_pixels = std::make_shared<std::vector<uint8_t>>();
+        if (!inject_rtt_pixels(*mutable_pixels, dst_w, dst_h, *source,
+                               src_w, src_h, bytes_per_pixel))
+            return {};
+        std::shared_ptr<const std::vector<uint8_t>> pixels = std::move(mutable_pixels);
+        entries_.emplace(key, Entry{std::move(source), pixels});
+        return pixels;
+    }
+
+    size_t size() const { return entries_.size(); }
+
+private:
+    struct Key {
+        const std::vector<uint8_t>* source = nullptr;
+        uint32_t dst_w = 0, dst_h = 0, src_w = 0, src_h = 0, bytes_per_pixel = 0;
+
+        bool operator==(const Key& other) const {
+            return source == other.source && dst_w == other.dst_w && dst_h == other.dst_h &&
+                src_w == other.src_w && src_h == other.src_h &&
+                bytes_per_pixel == other.bytes_per_pixel;
+        }
+    };
+
+    struct KeyHash {
+        size_t operator()(const Key& key) const {
+            size_t hash = std::hash<const void*>{}(key.source);
+            auto mix = [&](uint32_t value) {
+                hash ^= std::hash<uint32_t>{}(value) + 0x9e3779b9u +
+                    (hash << 6u) + (hash >> 2u);
+            };
+            mix(key.dst_w); mix(key.dst_h); mix(key.src_w); mix(key.src_h);
+            mix(key.bytes_per_pixel);
+            return hash;
+        }
+    };
+
+    struct Entry {
+        std::shared_ptr<const std::vector<uint8_t>> source;
+        std::shared_ptr<const std::vector<uint8_t>> pixels;
+    };
+
+    std::unordered_map<Key, Entry, KeyHash> entries_;
+};
 
 } // namespace prosper::frontend

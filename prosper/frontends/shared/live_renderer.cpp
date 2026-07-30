@@ -1248,6 +1248,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     target_step_w = target_step_h = 0;
             const size_t target_step_min_draws = getenv("PROSPER_TARGET_STEP_HASH_MIN_DRAWS")
                 ? std::max<long>(2, atol(getenv("PROSPER_TARGET_STEP_HASH_MIN_DRAWS"))) : 2;
+            prosper::frontend::RttInjectionCache rtt_injection_cache;
             // Build one draw's set-tagged resources from its VS (set 0) + PS (set 1) tables — read the
             // bytes from 1:1-mapped guest memory, detile textures. (Each constant/vertex buffer + texture
             // gets its own binding; the recompiler declared a storage buffer / image sampler at each.)
@@ -1468,11 +1469,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 prosper::test::backend_color_bytes_per_pixel(
                                     prosper::test::backend_color_format(live_rtt->second.format)),
                                 live_rtt->second.rgba->size());
-                        static const bool borrow_exact_cpu_rtt =
+                        static const bool retain_cpu_rtt_snapshots =
                             getenv("PROSPER_NO_RTT_SNAPSHOT_BORROW") == nullptr;
                         // Pixel-mutating/inspection diagnostics intentionally retain their owned
-                        // scratch copy. The normal exact-extent path can borrow the immutable RTT
-                        // snapshot and avoid copying it into texstore before the backend upload.
+                        // scratch copy. Normal consumers retain exact immutable snapshots directly
+                        // and share each scaled materialization within this submit callback.
                         static const bool cpu_rtt_copy_diagnostics =
                             getenv("PROSPER_DUMP_SAMPLED_RTT") || getenv("PROSPER_DUMP_RAWTEX") ||
                             getenv("PROSPER_GFXLOG") || getenv("PROSPER_RESOURCE_HASH_DIM") ||
@@ -1480,10 +1481,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             getenv("PROSPER_TESTLUT") || getenv("PROSPER_TESTLUT32") ||
                             getenv("PROSPER_DUMP_TEX") || getenv("PROSPER_DUMP_ATLAS") ||
                             getenv("PROSPER_KILL_RING");
-                        const bool borrow_cpu_live_rtt = has_cpu_live_rtt &&
-                            borrow_exact_cpu_rtt && !cpu_rtt_copy_diagnostics &&
-                            prosper::frontend::exact_rtt_snapshot_borrowable(
-                                tw, th, live_rtt->second.w, live_rtt->second.h,
+                        // Match the established CPU injection gate below. Cube descriptors and
+                        // mismatched 2D views can also retain identical materialized bytes; 3D
+                        // volumes, storage images, and mip tails remain on their specialized paths.
+                        const bool retain_cpu_live_rtt = retain_cpu_rtt_snapshots &&
+                            !cpu_rtt_copy_diagnostics && !fr.is_storage_image &&
+                            r.img_dim != 2u && !r.in_mip_tail && live_rtt != g_rtt.end() &&
+                            live_rtt->second.w && live_rtt->second.h && live_rtt->second.rgba &&
+                            prosper::frontend::live_rtt_cpu_snapshot_matches(
+                                live_rtt->second.w, live_rtt->second.h,
                                 prosper::test::backend_color_bytes_per_pixel(
                                     live_rtt->second.format),
                                 live_rtt->second.rgba->size());
@@ -2237,7 +2243,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         size_t linear_source_prefix_size = 0;
                         if (texstore_used == texstore.size()) texstore.emplace_back();
                         std::vector<uint8_t>& texture_pixels = texstore[texstore_used++];
-                        if (borrow_cpu_live_rtt) texture_pixels.clear();
+                        if (retain_cpu_live_rtt) texture_pixels.clear();
                         else texture_pixels.resize(nb);
                         auto copy_linear_padded_rows = [&](uint8_t* dst, size_t dst_row) {
                             size_t total = 0;
@@ -2298,9 +2304,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 !rit->second.rgba->empty()) {
                                 const RttSurf& s = rit->second;
                                 const uint32_t rtt_bpp = prosper::test::backend_color_bytes_per_pixel(s.format);
-                                if (borrow_cpu_live_rtt) {
-                                    fr.tex_rgba_owner = s.rgba;
-                                    fr.tex_rgba = s.rgba->data();
+                                if (retain_cpu_live_rtt &&
+                                    (fr.tex_rgba_owner = rtt_injection_cache.materialize(
+                                         s.rgba, tw, th, s.w, s.h, rtt_bpp))) {
+                                    fr.tex_rgba = fr.tex_rgba_owner->data();
                                     fr.texture_format = s.format;
                                     rtt_hit = true;
                                     resource_rtt_hit = true;
