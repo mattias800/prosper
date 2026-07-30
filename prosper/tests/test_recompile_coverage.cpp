@@ -368,10 +368,13 @@ int main() {
     compute_cfg_dispatch_created_b32.insert(
         compute_cfg_dispatch_created_b32.end(), compute_cfg_dispatch,
         compute_cfg_dispatch + std::size(compute_cfg_dispatch));
-    CHECK(recompile_compute(compute_cfg_dispatch_created_b32.data(),
-                            compute_cfg_dispatch_created_b32.size(), &dispatch_rt,
-                            wave32_dispatch_config).empty(),
-          "a dispatcher rejects B32 aliases of mask pairs produced inside its CFG");
+    // The generic dispatcher now carries an unambiguous one-word mask domain at every basic-block
+    // boundary. This formerly-negative fixture is the smallest compute regression for the same
+    // dataflow used by Astro's complex Wave32 fragment shader.
+    CHECK(!recompile_compute(compute_cfg_dispatch_created_b32.data(),
+                             compute_cfg_dispatch_created_b32.size(), &dispatch_rt,
+                             wave32_dispatch_config).empty(),
+          "a dispatcher preserves B32 aliases of masks produced inside its CFG");
     // The dispatcher includes branch-target/fallthrough blocks even when no entry path can reach
     // them. This dead block overwrites half of direct V# s[8:11] and then targets the live entry;
     // provenance at the reachable fetch must not include a write hardware can never execute.
@@ -450,6 +453,26 @@ int main() {
                               sizeof(compute_cfg_dispatch_recycled_lane[0]),
                           0, 0, &dispatch_rt).empty(),
           "the compute CFG dispatcher preserves a recycled scalar/mask spill lane");
+    // An ordinary VGPR write invalidates the compile-time v_writelane spill lifetime. Crossing a
+    // dispatcher block must preserve that tombstone; reconstructing the slot as scalar zero would
+    // incorrectly make the later v_readlane valid again.
+    const uint32_t compute_cfg_dispatch_invalidated_lane[] = {
+        0xBE800381u, 0x7E000280u, 0x7E020300u,
+        0xD7610013u, 0x00014A00u,                   // v19[37] = s0
+        0x7E260280u, 0xBF820000u,                   // v19 = 0; next block
+        0xD7600002u, 0x00014B13u,                   // invalid s2 = v19[37]
+        0xD7610013u, 0x00014A7Eu, 0xD7610013u, 0x0001507Fu,
+        0xD760000Eu, 0x00014B13u, 0xD760000Fu, 0x00015113u, 0xBEFE040Eu,
+        0xE00C2000u, 0x80020400u, 0x7DB900F9u, 0x86050007u,
+        0x7D020200u, 0xBF860006u, 0xBF0A8204u, 0x360000FDu, 0xBF840001u,
+        0x81008100u, 0x81008100u, 0xBF82FFF4u,
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(compute_cfg_dispatch_invalidated_lane,
+                         sizeof(compute_cfg_dispatch_invalidated_lane) /
+                             sizeof(compute_cfg_dispatch_invalidated_lane[0]),
+                         0, 0, &dispatch_rt).empty(),
+          "the compute CFG dispatcher preserves an invalidated spill tombstone");
     // Ordinary LDS effects do not require workgroup-uniform control flow. Keep the same dispatcher
     // shape, but make the inner SCC arm conditionally execute a ds_write_b32 before the back-edge.
     // (A barrier remains forbidden below; only the blanket rejection of raw DS is being relaxed.)

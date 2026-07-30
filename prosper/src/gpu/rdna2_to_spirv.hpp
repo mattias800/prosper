@@ -245,12 +245,22 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
 // mode from SPI_PS_IN_CONTROL.PS_W32_EN.
 std::vector<uint32_t> recompile_fragment_wave32_for_test(
     const uint32_t* code, size_t dwords);
+// Test hook for the byte-exact legacy capture exception: it must select one coherent Wave32
+// contract, not Wave32 masks inside a Wave64 native subgroup.
+uint32_t fragment_effective_wave_size_for_test(uint32_t requested_wave_size,
+                                               size_t program_dwords,
+                                               uint64_t program_hash);
 
 // Recompiled fragment wave operations use native Vulkan subgroup instructions and therefore require
-// an exact 64-lane subgroup. Returns zero for ordinary modules and 64 for that explicit contract.
+// an exact guest-wave subgroup. Returns zero for ordinary modules and 32/64 for that contract.
 uint32_t fragment_spirv_required_subgroup_size(const std::vector<uint32_t>& spirv);
 inline constexpr uint32_t kFragmentSubgroupVote = 1u << 0;
 inline constexpr uint32_t kFragmentSubgroupArithmetic = 1u << 1;
+inline constexpr uint32_t kFragmentSubgroupShuffle = 1u << 2;
+inline constexpr bool fragment_subgroup_features_supported(uint32_t required,
+                                                           uint32_t supported) {
+    return (required & ~supported) == 0;
+}
 // Capability requirements encoded in a fragment module, independent of the host graphics API's bit
 // values. The backend maps these to VkSubgroupFeatureFlagBits before accepting a wave64 pipeline.
 uint32_t fragment_spirv_required_subgroup_features(const std::vector<uint32_t>& spirv);
@@ -345,5 +355,7 @@ FlatLoadAnalysis analyze_flat_loads(const uint32_t* code, size_t dwords, uint32_
 // backward branch that jumps to at-or-before it — must NOT appear here, so detect_divergent_loops claims
 // it and emit_divloop reconstructs the structured loop; a plain guard-to-end/if execz still does.
 std::vector<uint32_t> safe_execz_branches_for_test(const uint32_t* code, size_t dwords);
+std::vector<uint32_t> mask_test_branches_for_test(const uint32_t* code, size_t dwords,
+                                                  bool wave32);
 
 } // namespace prosper::gpu
